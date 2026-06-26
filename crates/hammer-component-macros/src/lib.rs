@@ -597,10 +597,7 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
     let attrs = item.attrs;
     let vis = item.vis;
     let ident = item.ident;
-    let node_name = LitStr::new(
-        &to_snake_case(&ident.to_string()).replace('_', "-"),
-        ident.span(),
-    );
+    let node_name = LitStr::new(&graph_node_name_from_ident(&ident), ident.span());
     let generics = item.generics;
     let fields = item.fields;
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
@@ -947,6 +944,29 @@ fn parse_node_field_attrs(attrs: &mut Vec<Attribute>) -> Result<NodeFieldArgs> {
     Ok(node_args)
 }
 
+fn parse_variant_next_name(attrs: &mut Vec<Attribute>) -> Result<Option<String>> {
+    let mut retained = Vec::with_capacity(attrs.len());
+    let mut next_name = None;
+    for attr in attrs.drain(..) {
+        if !attr.path().is_ident("next") {
+            retained.push(attr);
+            continue;
+        }
+        if next_name.is_some() {
+            return Err(Error::new(
+                attr.span(),
+                "duplicate `next` variant attribute",
+            ));
+        }
+        let lit = attr
+            .parse_args::<LitStr>()
+            .map_err(|_| Error::new(attr.span(), "#[next(...)] expects a single string literal"))?;
+        next_name = Some(lit.value());
+    }
+    *attrs = retained;
+    Ok(next_name)
+}
+
 fn expand_node_next(item: ItemEnum) -> Result<TokenStream2> {
     if !item.generics.params.is_empty() || item.generics.where_clause.is_some() {
         return Err(Error::new(
@@ -984,13 +1004,14 @@ fn expand_node_next(item: ItemEnum) -> Result<TokenStream2> {
             ));
         }
 
-        let variant_attrs = variant.attrs;
+        let mut variant_attrs = variant.attrs;
         let variant_ident = variant.ident;
         let node_param = format_ident!("{}_node", to_snake_case(&variant_ident.to_string()));
-        next_names.push(LitStr::new(
-            &default_next_node_name(&variant_ident),
-            variant_ident.span(),
-        ));
+        let next_name = match parse_variant_next_name(&mut variant_attrs)? {
+            Some(name) => name,
+            None => to_snake_case(&variant_ident.to_string()),
+        };
+        next_names.push(LitStr::new(&next_name, variant_ident.span()));
         variant_defs.push(quote! {
             #(#variant_attrs)*
             #variant_ident
@@ -1043,18 +1064,12 @@ fn expand_node_next(item: ItemEnum) -> Result<TokenStream2> {
     })
 }
 
-fn default_next_node_name(variant: &Ident) -> String {
-    match variant.to_string().as_str() {
-        "Lookup" => "ip-lookup-node".to_string(),
-        "Output" => "tcp-output-node".to_string(),
-        "Punt" => "drop-node".to_string(),
-        "Listen" => "tcp-listen-node".to_string(),
-        "RcvProcess" => "tcp-rcv-process-node".to_string(),
-        "SynSent" => "tcp-syn-sent-node".to_string(),
-        "Established" => "tcp-established-node".to_string(),
-        "Reset" => "tcp-reset-node".to_string(),
-        other => format!("{}-node", to_snake_case(other)),
-    }
+fn graph_node_name_from_ident(ident: &Ident) -> String {
+    let snake = to_snake_case(&ident.to_string()).replace('_', "-");
+    snake
+        .strip_suffix("-node")
+        .map(|s| s.to_string())
+        .unwrap_or(snake)
 }
 
 fn to_snake_case(input: &str) -> String {
@@ -1080,6 +1095,7 @@ enum GraphRegisterKind {
     Internal,
     Driver,
     Handoff,
+    TcpInput,
 }
 
 struct GraphNodeArgs {
@@ -1115,11 +1131,12 @@ impl Parse for GraphNodeArgs {
                         "internal" => GraphRegisterKind::Internal,
                         "driver" => GraphRegisterKind::Driver,
                         "handoff" => GraphRegisterKind::Handoff,
+                        "tcp_input" => GraphRegisterKind::TcpInput,
                         other => {
                             return Err(Error::new(
                                 kind.span(),
                                 format!(
-                                    "unknown graph register kind `{other}`; expected `internal`, `driver`, or `handoff`"
+                                    "unknown graph register kind `{other}`; expected `internal`, `driver`, `handoff`, or `tcp_input`"
                                 ),
                             ));
                         }
@@ -1200,6 +1217,7 @@ fn effective_register_kind(args: &GraphNodeArgs, item: &Item) -> GraphRegisterKi
     match args.register {
         GraphRegisterKind::Handoff => GraphRegisterKind::Handoff,
         GraphRegisterKind::Driver => GraphRegisterKind::Driver,
+        GraphRegisterKind::TcpInput => GraphRegisterKind::TcpInput,
         GraphRegisterKind::Internal => node_role_from_item(item)
             .map(|role| match role {
                 NodeRole::Internal => GraphRegisterKind::Internal,
@@ -1212,7 +1230,7 @@ fn effective_register_kind(args: &GraphNodeArgs, item: &Item) -> GraphRegisterKi
 fn graph_node_kind_expr(register: GraphRegisterKind) -> TokenStream2 {
     match register {
         GraphRegisterKind::Driver => quote!(::hammer_adapter::NodeKind::Driver),
-        GraphRegisterKind::Internal | GraphRegisterKind::Handoff => {
+        GraphRegisterKind::Internal | GraphRegisterKind::Handoff | GraphRegisterKind::TcpInput => {
             quote!(::hammer_adapter::NodeKind::Internal)
         }
     }
@@ -1223,8 +1241,9 @@ fn graph_register_body(
     register: GraphRegisterKind,
     next: Option<&Path>,
 ) -> TokenStream2 {
+    // `register = tcp_input` is only meaningful for congestion-typed graph nodes.
     match (next, register) {
-        (Some(next), GraphRegisterKind::Internal) => quote! {
+        (Some(next), GraphRegisterKind::Internal | GraphRegisterKind::TcpInput) => quote! {
             runtime.nodes().try_register_internal_with_next_names(
                 #ident::new([::hammer_adapter::NodeId::new(0); #next::COUNT]),
                 &#next::NEXT_NAMES,
@@ -1245,27 +1264,39 @@ fn graph_register_body(
         (_, GraphRegisterKind::Driver) => quote! {
             runtime.nodes().try_register_driver(#ident::new()?)
         },
-        (None, GraphRegisterKind::Internal) => quote! {
+        (None, GraphRegisterKind::Internal | GraphRegisterKind::TcpInput) => quote! {
             runtime.nodes().try_register_internal(#ident::new())
         },
     }
 }
 
-fn graph_register_congestion_body(next: Option<&Path>) -> Result<TokenStream2> {
-    next.ok_or_else(|| {
+fn graph_register_congestion_body(
+    ident: &Ident,
+    next: Option<&Path>,
+    register: GraphRegisterKind,
+) -> Result<TokenStream2> {
+    let next = next.ok_or_else(|| {
         Error::new(
             Span::call_site(),
             "congestion-controller graph nodes require `next = ...`",
         )
     })?;
-    Ok(quote! {
-        crate::with_tcp_cc!(|C| {
-            let main = crate::transport::tcp::TCP_MAIN.get().ok_or_else(|| {
-                ::hammer_core::error::CoreError::internal("tcp main not initialized")
-            })?;
-            main.register_node::<C>(runtime, worker)
+    if matches!(register, GraphRegisterKind::TcpInput) {
+        Ok(quote! {
+            crate::with_congestion!(|C| {
+                crate::transport::tcp::register_tcp_input_graph_node::<C>(runtime, worker)
+            })
         })
-    })
+    } else {
+        Ok(quote! {
+            crate::with_congestion!(|C| {
+                runtime.nodes().try_register_internal_with_next_names(
+                    #ident::<C>::new([::hammer_adapter::NodeId::new(0); #next::COUNT]),
+                    &#next::NEXT_NAMES,
+                )
+            })
+        })
+    }
 }
 
 /// Registers a struct as a graph node via linkme `NodeEntry`.
@@ -1315,7 +1346,7 @@ fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<T
 
     let init_body = if let Item::Struct(item_struct) = &item {
         if struct_has_congestion_type_param(item_struct) {
-            graph_register_congestion_body(args.next.as_ref())?
+            graph_register_congestion_body(ident, args.next.as_ref(), register)?
         } else {
             graph_register_body(ident, register, args.next.as_ref())
         }
@@ -1416,6 +1447,34 @@ mod tests {
         assert!(
             !expanded.contains("node_name"),
             "plain node should not store instance node name: {expanded}"
+        );
+    }
+
+    #[test]
+    fn node_next_reads_next_attr_for_names() {
+        let item = syn::parse_str::<ItemEnum>(
+            r#"
+            pub enum SampleNext {
+                #[next("custom-node")]
+                Custom,
+                Fallback,
+            }
+            "#,
+        )
+        .expect("parse enum");
+        let expanded = expand_node_next(item).expect("expand node_next").to_string();
+
+        assert!(
+            expanded.contains(r#""custom-node""#),
+            "expected explicit next name: {expanded}"
+        );
+        assert!(
+            expanded.contains(r#""fallback""#),
+            "expected snake-case fallback name: {expanded}"
+        );
+        assert!(
+            !expanded.contains("# [next"),
+            "next attr must be stripped from emitted variants: {expanded}"
         );
     }
 }

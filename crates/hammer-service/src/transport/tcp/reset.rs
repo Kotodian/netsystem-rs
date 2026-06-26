@@ -11,9 +11,14 @@ use hammer_core::protocol::tcp::{
 #[hammer_component_macros::node_next]
 pub enum TcpResetNext {
     Drop,
+    #[next("ip-lookup")]
     Lookup,
 }
 
+#[hammer_component_macros::graph_node(
+    graph = service,
+    next = TcpResetNext,
+)]
 #[derive(Clone, Copy)]
 #[hammer_component_macros::node(role = internal, next = TcpResetNext)]
 pub struct TcpResetNode {

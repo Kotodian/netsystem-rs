@@ -262,7 +262,7 @@ fn ip_lookup_node_uses_ipv4_mtrie_longest_prefix_match() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].input_node, lookup);
     assert_eq!(records[0].entries.len(), 1);
-    assert_eq!(records[0].entries[0].node_name, Some("ip-lookup-node"));
+    assert_eq!(records[0].entries[0].node_name, Some("ip-lookup"));
     assert_eq!(
         IpLookupTrace::decode(&records[0].entries[0].payload_bytes).expect("ip lookup trace"),
         IpLookupTrace {
@@ -686,7 +686,7 @@ fn adjacency_rewrite_node_prepends_rewrite_and_sets_egress_interface() {
     assert_eq!(records[0].entries.len(), 1);
     assert_eq!(
         records[0].entries[0].node_name,
-        Some("adjacency-rewrite-node")
+        Some("adjacency-rewrite")
     );
     assert_eq!(
         AdjacencyRewriteTrace::decode(&records[0].entries[0].payload_bytes)

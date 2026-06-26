@@ -13,16 +13,6 @@ use crate::net::ip::parse_ip_packet;
 
 use crate::interface::InterfaceControlHandle;
 
-#[cfg(feature = "inbound-tun")]
-mod fd_io;
-#[cfg(feature = "inbound-tun")]
-mod open;
-
-#[cfg(feature = "inbound-tun")]
-pub use fd_io::{TunFdIo, TunFdPacketFormat, TunFdSendResult};
-#[cfg(feature = "inbound-tun")]
-pub use open::{RealTunOpen, RealTunOpenOptions};
-
 const DEFAULT_TUN_RECV_BATCH: usize = 256;
 const ETHERNET_HEADER_LEN: usize = 14;
 const ETHERTYPE_IP4: u16 = 0x0800;
@@ -168,16 +158,12 @@ pub trait TunPacketSink {
 #[doc(hidden)]
 pub enum TunInputBackend {
     Memory(MemoryTunInput),
-    #[cfg(feature = "inbound-tun")]
-    Real(RealTunInput<TunFdIo>),
     Scripted(RealTunInput<ScriptedTunIo>),
 }
 
 #[doc(hidden)]
 pub enum TunOutputBackend {
     Memory(MemoryTunOutput),
-    #[cfg(feature = "inbound-tun")]
-    Real(RealTunOutput<TunFdIo>),
     Scripted(RealTunOutput<ScriptedTunIo>),
 }
 
@@ -203,8 +189,6 @@ impl TunInputBackend {
     ) -> CoreResult<usize> {
         match self {
             Self::Memory(input) => input.recv_frame(runtime, frame, interface_id, mode, max),
-            #[cfg(feature = "inbound-tun")]
-            Self::Real(input) => input.recv_frame(runtime, frame, interface_id, mode, max),
             Self::Scripted(input) => input.recv_frame(runtime, frame, interface_id, mode, max),
         }
     }
@@ -220,8 +204,6 @@ impl TunOutputBackend {
     ) -> CoreResult<usize> {
         match self {
             Self::Memory(output) => output.send_frame(runtime, frame, mode),
-            #[cfg(feature = "inbound-tun")]
-            Self::Real(output) => output.send_frame(runtime, frame, mode),
             Self::Scripted(output) => output.send_frame(runtime, frame, mode),
         }
     }
@@ -238,22 +220,6 @@ impl IntoTunOutputBackend for MemoryTunOutput {
     #[inline]
     fn into_tun_output_backend(self) -> TunOutputBackend {
         TunOutputBackend::Memory(self)
-    }
-}
-
-#[cfg(feature = "inbound-tun")]
-impl IntoTunInputBackend for RealTunInput<TunFdIo> {
-    #[inline]
-    fn into_tun_input_backend(self) -> TunInputBackend {
-        TunInputBackend::Real(self)
-    }
-}
-
-#[cfg(feature = "inbound-tun")]
-impl IntoTunOutputBackend for RealTunOutput<TunFdIo> {
-    #[inline]
-    fn into_tun_output_backend(self) -> TunOutputBackend {
-        TunOutputBackend::Real(self)
     }
 }
 
@@ -485,52 +451,6 @@ pub trait TunBufferIo {
             return Ok(TunBufferSendResult::Complete);
         }
         self.try_send_buffer(segments.first().copied().unwrap_or_default(), offset)
-    }
-}
-
-#[cfg(feature = "inbound-tun")]
-impl TunBufferIo for TunFdIo {
-    #[inline]
-    fn try_recv_buffer(&mut self, buffer: &mut [u8]) -> CoreResult<Option<usize>> {
-        TunFdIo::try_recv_buffer(self, buffer)
-    }
-
-    #[inline]
-    fn max_recv_len(&self) -> Option<usize> {
-        Some(TunFdIo::mtu(self))
-    }
-
-    #[inline]
-    fn try_send_buffer(&mut self, packet: &[u8], offset: usize) -> CoreResult<TunBufferSendResult> {
-        map_tun_fd_send_result(TunFdIo::try_send_buffer(self, packet, offset)?)
-    }
-
-    #[inline]
-    fn try_send_buffers(
-        &mut self,
-        segments: &[&[u8]],
-        offset: usize,
-        total_len: usize,
-    ) -> CoreResult<TunBufferSendResult> {
-        if segments.len() <= 1 {
-            return self.try_send_buffer(segments.first().copied().unwrap_or_default(), offset);
-        }
-        if offset >= total_len {
-            return Ok(TunBufferSendResult::Complete);
-        }
-        map_tun_fd_send_result(TunFdIo::try_send_buffers(
-            self, segments, offset, total_len,
-        )?)
-    }
-}
-
-#[cfg(feature = "inbound-tun")]
-#[inline]
-fn map_tun_fd_send_result(result: TunFdSendResult) -> CoreResult<TunBufferSendResult> {
-    match result {
-        TunFdSendResult::Complete => Ok(TunBufferSendResult::Complete),
-        TunFdSendResult::Partial(offset) => Ok(TunBufferSendResult::Partial(offset)),
-        TunFdSendResult::Backpressure => Ok(TunBufferSendResult::Backpressure),
     }
 }
 
@@ -1244,7 +1164,7 @@ impl TunInputDriverNode {
         });
         let runtime_data = main.runtime_data(slot).expect("TUN input runtime data");
         Self {
-            node_name: "tun-input-driver-node",
+            node_name: "tun-input-driver",
             main,
             slot,
             runtime_data,
@@ -1417,7 +1337,7 @@ impl TunOutputDriverNode {
         });
         let runtime_data = main.runtime_data(slot).expect("TUN output runtime data");
         Self {
-            node_name: "tun-output-driver-node",
+            node_name: "tun-output-driver",
             main,
             slot,
             runtime_data,

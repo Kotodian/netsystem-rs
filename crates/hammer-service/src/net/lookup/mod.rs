@@ -10,6 +10,7 @@ use hammer_adapter::{
     NodeRuntimeData, PacketTrace, SecondaryOpaque, TapEthernetMetadata, TraceFormatter,
     add_packet_trace, unlikely,
 };
+use hammer_core::config::RouteAction;
 use hammer_core::error::{CoreError, CoreResult, HammerResult};
 use hammer_core::forwarding::{
     Adjacency as CoreAdjacency, DpoId as CoreDpoId, FibEntry as CoreFibEntry,
@@ -276,6 +277,30 @@ impl IpLookupControlPlane {
     }
 }
 
+pub(crate) fn assemble_ip_lookup_node(
+    runtime: &hammer_adapter::NodeRuntime,
+    _worker_id: usize,
+    _: &(),
+) -> CoreResult<NodeId> {
+    let drop = crate::packet_graph::graph_node(runtime, "drop")?;
+    let mut builder = FibTableBuilder::new(drop);
+    crate::packet_graph::with_boot(|boot| {
+        for route in boot.routes.iter() {
+            if let RouteAction::Drop = route
+                .action()
+                .map_err(|err| CoreError::internal(err.to_string()))?
+            {
+                builder.add_drop_route(route.prefix);
+            }
+        }
+        runtime.try_register_internal(IpLookupControlPlane::new(builder.build()).node())
+    })
+}
+
+#[hammer_component_macros::graph_node(
+    graph = service,
+    assemble = crate::net::lookup::assemble_ip_lookup_node,
+)]
 #[hammer_component_macros::node]
 pub struct IpLookupNode {
     #[node(default = register_ip_lookup_runtime(table.clone()))]

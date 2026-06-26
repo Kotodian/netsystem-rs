@@ -137,6 +137,12 @@ impl TcpInputControlPlane {
     }
 }
 
+#[hammer_component_macros::graph_node(
+    graph = service,
+    name = "tcp-input",
+    next = TcpInputNext,
+    register = tcp_input,
+)]
 #[hammer_component_macros::node(role = internal, next = TcpInputNext)]
 pub struct TcpInputNode<C: CongestionController + 'static> {
     #[node(default = register_tcp_input_runtime(snapshot.clone()))]

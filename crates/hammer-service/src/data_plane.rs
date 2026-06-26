@@ -16,11 +16,14 @@ use hammer_runtime::DataPlaneBarrierHandle;
 
 use crate::trace::codec::put_usize;
 
+#[hammer_component_macros::graph_node(
+    graph = service,
+)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DropNode;
 
 impl DropNode {
-    pub const NODE_NAME: &'static str = "drop-node";
+    pub const NODE_NAME: &'static str = "drop";
 
     #[inline]
     pub fn new() -> Self {
@@ -28,11 +31,15 @@ impl DropNode {
     }
 }
 
+#[hammer_component_macros::graph_node(
+    graph = service,
+    register = handoff,
+)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HandoffNode;
 
 impl HandoffNode {
-    pub const NODE_NAME: &'static str = "handoff-node";
+    pub const NODE_NAME: &'static str = "handoff";
 
     #[inline]
     pub fn new() -> Self {

@@ -12,10 +12,16 @@ use crate::transport::congestion::CongestionController;
 
 #[hammer_component_macros::node_next]
 pub enum TcpSynSentNext {
+    #[next("tcp-output")]
     Output,
     Drop,
 }
 
+#[hammer_component_macros::graph_node(
+    graph = service,
+    name = "tcp-syn-sent",
+    next = TcpSynSentNext,
+)]
 #[hammer_component_macros::node(role = internal, next = TcpSynSentNext)]
 pub struct TcpSynSentNode<C: CongestionController + 'static> {
     session_queue: TcpQueue<C>,

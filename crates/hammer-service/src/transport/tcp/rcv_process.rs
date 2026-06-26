@@ -15,10 +15,16 @@ use super::{
 
 #[hammer_component_macros::node_next]
 pub enum TcpRcvProcessNext {
+    #[next("tcp-output")]
     Output,
     Drop,
 }
 
+#[hammer_component_macros::graph_node(
+    graph = service,
+    name = "tcp-rcv-process",
+    next = TcpRcvProcessNext,
+)]
 #[hammer_component_macros::node(role = internal, next = TcpRcvProcessNext)]
 pub struct TcpRcvProcessNode<C: CongestionController + 'static> {
     session_queue: TcpQueue<C>,

@@ -16,10 +16,16 @@ use crate::transport::congestion::CongestionController;
 
 #[hammer_component_macros::node_next]
 pub enum TcpEstablishedNext {
+    #[next("tcp-output")]
     Output,
     Drop,
 }
 
+#[hammer_component_macros::graph_node(
+    graph = service,
+    name = "tcp-established",
+    next = TcpEstablishedNext,
+)]
 #[hammer_component_macros::node(role = internal, next = TcpEstablishedNext)]
 pub struct TcpEstablishedNode<C: CongestionController + 'static> {
     session_queue: TcpQueue<C>,

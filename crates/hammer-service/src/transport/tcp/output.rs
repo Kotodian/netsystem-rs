@@ -16,9 +16,14 @@ pub const TCP_FLAG_ACK: u8 = 0x10;
 #[hammer_component_macros::node_next]
 pub enum TcpOutputNext {
     Drop,
+    #[next("ip-lookup")]
     Lookup,
 }
 
+#[hammer_component_macros::graph_node(
+    graph = service,
+    next = TcpOutputNext,
+)]
 #[derive(Clone, Copy)]
 pub struct TcpOutputNode {
     next: [NodeId; TcpOutputNext::COUNT],
@@ -26,7 +31,7 @@ pub struct TcpOutputNode {
 }
 
 impl TcpOutputNode {
-    pub const NODE_NAME: &'static str = "tcp-output-node";
+    pub const NODE_NAME: &'static str = "tcp-output";
 
     #[inline]
     pub fn new(next: [NodeId; TcpOutputNext::COUNT]) -> Self {

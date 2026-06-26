@@ -5,67 +5,39 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
-use hammer_adapter::{DataWorkerId, NodeHandle, NodeState};
+use hammer_adapter::{DataWorkerId, NodeHandle};
 use hammer_control::{
     CertificateProviderManager, CertificateStore, ConnectionManager, NetworkManager, PauseManager,
     ServiceManager,
 };
-use hammer_core::config::{self, Options, TraceOptions};
+use hammer_core::config::{self, Trace};
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::lifecycle::{ALL_STAGES, LIFECYCLE_ORDER};
 use hammer_core::log::{DiscardWriter, Factory, LogWriter, Logger};
 use hammer_core::registry::RuntimeRegistry;
 use hammer_infra::map::FlatHashTable;
-#[cfg(feature = "endpoint")]
-use hammer_runtime::EndpointManager;
-#[cfg(test)]
-use hammer_runtime::adapter::NodeErrorCounters;
-#[cfg(feature = "probe")]
-use hammer_runtime::adapter::ProbeProtocolComponent;
-use hammer_runtime::adapter::node::NodeRuntimeStatsRow;
-#[cfg(feature = "endpoint")]
-use hammer_runtime::adapter::{EndpointManager as _, InboundManager as _};
 use hammer_runtime::adapter::{
-    Lifecycle, NetworkManager as _, NodeId, PlatformInterface, ProbeReport, TraceControlPlane,
+    Lifecycle, NetworkManager as _, NodeId, PlatformInterface, TraceControlPlane,
     TraceRecordSink,
 };
 use hammer_runtime::app::AppContext;
-#[cfg(feature = "endpoint")]
-use hammer_runtime::endpoints::EndpointOutboundAdapter;
-use hammer_runtime::spawn::{DataPlaneExecutor, DataRuntime, DataRuntimeContext};
+use hammer_runtime::spawn::{DataRuntime, DataRuntimeContext};
 use hammer_runtime::{
     ControlEventSubscriptionHandle, ControlThread, ControlThreadHandle, ControlTimerHandle,
-    EventSubscriberBuilder, InboundManager, MetricSample, MetricsRegistry, OutboundManager,
+    EventSubscriberBuilder, MetricSample, MetricsRegistry,
 };
 use std::time::Duration;
 
-#[cfg(feature = "probe")]
-use crate::ProbeManager;
 use crate::app::AppHost;
-use crate::data_plane::{DropNode, HandoffNode};
-use crate::net::{FibTableBuilder, IpLookupControlPlane};
-use crate::session::SessionQueueNode;
-use crate::session::node::SessionQueueHandle;
-use crate::session::runtime::dispatch_registered_session_queue_once_at;
-use crate::transport::congestion::BbrController;
+use crate::packet_graph;
 use crate::transport::tcp::lookup::{
     TcpIpv4ListenerAddress, TcpIpv6ListenerAddress, TcpListenerAddress, TcpListenerLookupAccess,
     TcpLookupId, TcpLookupSnapshot, TcpLookupValue, TcpV4ListenerKey, TcpV6ListenerKey,
 };
-use crate::transport::tcp::{
-    TcpEstablishedNext, TcpEstablishedNode, TcpInputControlPlane, TcpInputNext, TcpListenNext,
-    TcpListenNode, TcpOutputNext, TcpOutputNode, TcpRcvProcessNext, TcpRcvProcessNode,
-    TcpResetNext, TcpResetNode, TcpSessionDriver, TcpSynSentNext, TcpSynSentNode,
-};
+use crate::transport::tcp::TcpInputControlPlane;
 use hammer_core::protocol::tcp::TcpCapabilities;
 
 const CONTROL_THREAD_STACK_SIZE: usize = 512 * 1024;
-const DATA_WORKER_THREADS: usize = 2;
-const SERVICE_HANDOFF_HANDLE: NodeHandle = NodeHandle::new(1);
-// Data workers initialize the packet graph plus worker-local TCP/session
-// runtime state on the worker thread before entering the reactor loop.
-const DATA_WORKER_STACK_SIZE: usize = 2 * 1024 * 1024;
-const DATA_MAX_BLOCKING_THREADS: usize = 4;
 const METRICS_LOG_INTERVAL: Duration = Duration::from_secs(30);
 const TRACE_DRAIN_INTERVAL: Duration = Duration::from_secs(1);
 /// Time budget for the control thread to drain queued logs and emit a
@@ -75,14 +47,10 @@ const TRACE_DRAIN_INTERVAL: Duration = Duration::from_secs(1);
 /// feel stuck on the FFI side.
 const CONTROL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Time budget the data-plane runtime gets to abort in-flight tasks
-/// during `close()`. Data tasks (TCP/UDP forwarders, probe tasks) are
-/// expected to drop fast once their lifecycles are closed; tasks still
-/// running past this deadline are forcibly aborted by the runtime.
+/// during `close()`. Data tasks (TCP/UDP forwarders) are expected to drop fast
+/// once their lifecycles are closed; tasks still running past this deadline are
+/// forcibly aborted by the runtime.
 const DATA_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
-/// Slack added on top of an inner async timeout when bouncing it through
-/// the control thread, so the inner future has a chance to time out
-/// cleanly and report a result before the outer wait gives up.
-const CONTROL_ASYNC_BUFFER: Duration = Duration::from_secs(5);
 
 fn debug_assert_lifecycle_order(lifecycles: &[Arc<dyn Lifecycle>]) {
     let mut previous = None;
@@ -122,20 +90,12 @@ struct ServiceInner {
     control_handle: Option<Arc<ControlThreadHandle>>,
     control_thread: Option<JoinHandle<()>>,
     trace_drain_timer: Option<ControlTimerHandle>,
-    runtime_dump_timer: Option<ControlTimerHandle>,
     event_subscriptions: Vec<ControlEventSubscriptionHandle>,
     metrics: Arc<MetricsRegistry>,
-    _trace: TraceControlPlane,
-    _platform: Arc<dyn PlatformInterface>,
-    _registry: Arc<RuntimeRegistry>,
+    registry: Arc<RuntimeRegistry>,
     lifecycles: Vec<Arc<dyn Lifecycle>>,
     pause: Arc<PauseManager>,
     network: Arc<NetworkManager>,
-    outbound: Arc<OutboundManager>,
-    #[cfg(feature = "endpoint")]
-    endpoint: Arc<EndpointManager>,
-    #[cfg(feature = "probe")]
-    probe: Arc<ProbeManager>,
     /// Data-plane runtime that hosts every business future spawned via
     /// `hammer_runtime::spawn::spawn`. Held in `Option` so `finish_close` can
     /// `take()` and consume it via `Runtime::shutdown_timeout` to bound
@@ -144,9 +104,7 @@ struct ServiceInner {
     data_runtime: Option<DataRuntime>,
     data_context: DataRuntimeContext,
     app_context: AppContext,
-    #[cfg_attr(not(test), allow(dead_code))]
     tcp_listener_control: RuntimeTcpListenerControlHandle,
-    _options: Options,
 }
 
 #[derive(Clone)]
@@ -399,24 +357,25 @@ impl RuntimeService {
         writer: Arc<dyn LogWriter>,
         build_event_subscribers: EventSubscriberBuilder,
     ) -> HammerResult<Arc<Self>> {
-        let options = config::parse_config(config_content)?;
+        let config = config::parse_config(config_content)?;
         let metrics = MetricsRegistry::new();
-        let trace = TraceControlPlane::new(options.trace.record_capacity);
+        let trace = TraceControlPlane::new(config.trace.record_capacity);
         let base_time = Instant::now();
-        // Data-plane runtime: multiple fixed data threads, each with its own
-        // current-thread reactor and thread-local packet buffer pool. Futures
-        // spawned onto a data thread are not work-stolen by another data
-        // thread, so a stream can keep buffer indices local to its worker.
-        let data_runtime = DataRuntime::new(
-            DATA_WORKER_THREADS,
-            "hammer-data",
-            DATA_WORKER_STACK_SIZE,
-            DATA_MAX_BLOCKING_THREADS,
-        )?;
+        let worker = &config.worker;
+        let data_runtime = DataRuntime::from_config(worker, "hammer-data")?;
         let data_context = data_runtime.context();
-        let app_context = AppContext::with_ring_capacity(data_context.clone(), 256);
-        install_service_packet_graph_on_workers(&data_context)?;
-        let writer: Arc<dyn LogWriter> = if options.log.disabled {
+        let app_context =
+            AppContext::with_ring_capacity(data_context.clone(), worker.app_ring.capacity);
+        let listener_state = RuntimeTcpListenerControlState::new()?;
+        packet_graph::install_service_graph(
+            &data_context,
+            config.network.tcp.congestion,
+            config.network.tcp.mss,
+            listener_state.tcp_control.clone(),
+            NodeHandle::new(worker.handoff.node_handle),
+            Arc::from(config.network.route.clone().into_boxed_slice()),
+        )?;
+        let writer: Arc<dyn LogWriter> = if config.log.disabled {
             Arc::new(DiscardWriter)
         } else {
             writer
@@ -426,7 +385,7 @@ impl RuntimeService {
             writer,
             Arc::clone(&metrics),
             METRICS_LOG_INTERVAL,
-            options.log.level,
+            config.log.level,
         );
         let control_thread = match spawn_control_thread(control_loop) {
             Ok(handle) => handle,
@@ -438,16 +397,14 @@ impl RuntimeService {
                 return Err(err);
             }
         };
-        let tcp_listener_control =
-            RuntimeTcpListenerControlHandle::new(RuntimeTcpListenerControlState::new()?);
+        let tcp_listener_control = RuntimeTcpListenerControlHandle::new(listener_state);
         let writer: Arc<dyn LogWriter> = Arc::clone(&control_handle) as Arc<dyn LogWriter>;
-        let log_factory = Factory::new_with_min_level(base_time, writer, options.log.level);
-        let trace_enabled_with_inputs = trace_worker_control(&options.trace);
-        let packet_graph = ServicePacketGraphDeclarations::default();
-        trace.publish_options(&options.trace, |name| packet_graph.resolve(name))?;
+        let log_factory = Factory::new_with_min_level(base_time, writer, config.log.level);
+        let trace_enabled_with_inputs = trace_worker_control(&config.trace);
+        trace.publish_options(&config.trace, packet_graph::resolve_graph_node)?;
         data_context.set_trace_control_on_workers(
             trace_enabled_with_inputs.then(|| trace.handle()),
-            options.trace.packet_capacity,
+            config.trace.packet_capacity,
         )?;
         let event_subscriptions = build_event_subscribers(
             new_logger(&log_factory, "control-event"),
@@ -465,75 +422,33 @@ impl RuntimeService {
             &log_factory,
             "certificate-provider",
         )));
-        #[cfg(feature = "endpoint")]
-        let endpoint = Arc::new(EndpointManager::from_options_with_platform_and_control(
-            new_logger(&log_factory, "endpoint"),
-            &options.endpoints,
-            Arc::clone(&platform),
-            Arc::clone(&control_handle),
-        )?);
         let connection = Arc::new(ConnectionManager::new());
         let network = NetworkManager::with_platform(
             new_logger(&log_factory, "network"),
-            options.route.auto_detect_interface,
+            false,
             Arc::clone(&platform),
             Arc::clone(&pause),
             Arc::clone(&connection),
         );
-        let outbound = Arc::new(
-            OutboundManager::from_options_with_platform_metrics_and_control(
-                new_logger(&log_factory, "outbound"),
-                options.route.final_.clone(),
-                &options.outbounds,
-                Arc::clone(&platform),
-                Arc::clone(&metrics),
-                Arc::clone(&control_handle),
-            )?,
-        );
-        // Auto-register an `EndpointOutboundAdapter` for every declared
-        // endpoint so endpoint-backed egress stays reachable through the
-        // same outbound lookup path as the rest of the dataplane.
-        #[cfg(feature = "endpoint")]
-        register_endpoint_outbound_adapters(&outbound, &endpoint, &log_factory)?;
-        let inbound = Arc::new(InboundManager::from_options_with_runtime_and_metrics(
-            new_logger(&log_factory, "inbound"),
-            &options.inbounds,
-            Arc::clone(&outbound),
-            Arc::clone(&platform),
-            Arc::clone(&metrics),
-        )?);
         let service_mgr = Arc::new(ServiceManager::new(new_logger(&log_factory, "service")));
 
         registry.set::<CertificateStore>(Arc::clone(&cert_store));
         registry.set::<CertificateProviderManager>(Arc::clone(&cert_provider));
-        #[cfg(feature = "endpoint")]
-        registry.set::<EndpointManager>(Arc::clone(&endpoint));
         registry.set::<NetworkManager>(Arc::clone(&network));
-        registry.set::<OutboundManager>(Arc::clone(&outbound));
-        registry.set::<InboundManager>(Arc::clone(&inbound));
         registry.set::<ServiceManager>(Arc::clone(&service_mgr));
         registry.set::<ConnectionManager>(Arc::clone(&connection));
         registry.set::<PauseManager>(Arc::clone(&pause));
         registry.set::<MetricsRegistry>(Arc::clone(&metrics));
 
-        let mut lifecycles: Vec<Arc<dyn Lifecycle>> = vec![
+        let lifecycles: Vec<Arc<dyn Lifecycle>> = vec![
             cert_store as Arc<dyn Lifecycle>,
             cert_provider as Arc<dyn Lifecycle>,
-        ];
-        #[cfg(feature = "endpoint")]
-        lifecycles.push(Arc::clone(&endpoint) as Arc<dyn Lifecycle>);
-        lifecycles.extend([
             Arc::clone(&network) as Arc<dyn Lifecycle>,
-            Arc::clone(&outbound) as Arc<dyn Lifecycle>,
-            inbound as Arc<dyn Lifecycle>,
             service_mgr as Arc<dyn Lifecycle>,
             connection as Arc<dyn Lifecycle>,
-        ]);
+        ];
 
         debug_assert_lifecycle_order(&lifecycles);
-
-        #[cfg(feature = "probe")]
-        let probe = Arc::new(ProbeManager::new(Arc::clone(&outbound)));
 
         let trace_drain_timer = if trace_enabled_with_inputs {
             Some(schedule_trace_drain(
@@ -545,24 +460,6 @@ impl RuntimeService {
         } else {
             None
         };
-        let runtime_dump_timer = if options.runtime.enabled {
-            match schedule_runtime_dump(
-                Arc::clone(&control_handle),
-                data_context.clone(),
-                options.runtime.interval,
-                new_logger(&log_factory, "runtime-control"),
-            ) {
-                Ok(timer) => Some(timer),
-                Err(err) => {
-                    if let Some(timer) = &trace_drain_timer {
-                        timer.cancel_timeout(CONTROL_SHUTDOWN_TIMEOUT);
-                    }
-                    return Err(err);
-                }
-            }
-        } else {
-            None
-        };
 
         Ok(Arc::new(Self {
             inner: Arc::new(Mutex::new(ServiceInner {
@@ -571,25 +468,16 @@ impl RuntimeService {
                 control_handle: Some(control_handle),
                 control_thread: Some(control_thread),
                 trace_drain_timer,
-                runtime_dump_timer,
                 event_subscriptions,
                 metrics,
-                _trace: trace,
-                _platform: platform,
-                _registry: registry,
+                registry,
                 lifecycles,
                 pause,
                 network,
-                outbound,
-                #[cfg(feature = "endpoint")]
-                endpoint,
-                #[cfg(feature = "probe")]
-                probe,
                 data_runtime: Some(data_runtime),
                 data_context,
                 app_context,
                 tcp_listener_control,
-                _options: options,
             })),
         }))
     }
@@ -630,38 +518,6 @@ impl RuntimeService {
                 .tcp_listener_control
                 .close_tcp_listener_on_control(listener)
         })?
-    }
-
-    /// Run a one-shot latency probe to every registered outbound's probe endpoint
-    /// and return one report per outbound (order matches
-    /// `OutboundManager::list()`). `protocol` selects the probe
-    /// implementation (V1 only `"icmp"`); `timeout` applies per
-    /// outbound, not to the batch.
-    ///
-    /// Probe failures (timeout, connection refused, unsupported
-    /// network) live inside each `ProbeReport.result` so the caller
-    /// always sees the full outbound list. Only invalid arguments
-    /// (unknown protocol) bubble up as `Err`.
-    #[cfg(feature = "probe")]
-    pub fn probe_outbounds(
-        &self,
-        protocol: &str,
-        timeout: Duration,
-    ) -> HammerResult<Vec<ProbeReport>> {
-        let protocol = protocol.to_owned();
-        let outer_timeout = timeout.saturating_add(CONTROL_ASYNC_BUFFER);
-        self.control_async_call(outer_timeout, move |inner, data, done| {
-            let probe = build_probe_protocol(&protocol)?;
-            if inner.state == ServiceState::Closed {
-                return Err(HammerError::service_closed());
-            }
-            let batch = inner.probe.prepare_all(probe);
-            data.execute(async move {
-                let reports = batch.run(timeout).await;
-                let _ = done.send(Ok(reports));
-            });
-            Ok(())
-        })
     }
 
     pub fn start(&self) -> HammerResult<()> {
@@ -709,14 +565,6 @@ impl RuntimeService {
                 return;
             }
             inner.network.reset_network();
-            // Drop cached outbound clients alongside the inbound reset. Without this, sing-box-style
-            // `InterfaceUpdated` semantics never reach our outbounds, so a
-            // stale cached_client survives every network reset and the next
-            // dial blocks on the dead QUIC connection's max_idle_timeout.
-            inner.outbound.reset_network();
-            #[cfg(feature = "endpoint")]
-            inner.endpoint.reset_network();
-            inner.outbound.ensure_connected();
         });
     }
 
@@ -760,7 +608,7 @@ impl RuntimeService {
                 return Err(HammerError::service_closed());
             }
 
-            inner._registry.set::<T>(Arc::clone(&host));
+            inner.registry.set::<T>(Arc::clone(&host));
             let lifecycle = host as Arc<dyn Lifecycle>;
             if inner.state == ServiceState::Running {
                 start_lifecycle_now(&lifecycle)?;
@@ -808,32 +656,6 @@ impl RuntimeService {
         })
     }
 
-    fn control_async_call<R>(
-        &self,
-        timeout: Duration,
-        f: impl FnOnce(
-            &mut ServiceInner,
-            DataPlaneExecutor,
-            std::sync::mpsc::Sender<HammerResult<R>>,
-        ) -> HammerResult<()>
-        + Send
-        + 'static,
-    ) -> HammerResult<R>
-    where
-        R: Send + 'static,
-    {
-        let control_handle = self
-            .control_handle()
-            .ok_or_else(HammerError::service_closed)?;
-        let inner = Arc::clone(&self.inner);
-        control_handle.call_async(timeout, move |done| {
-            let mut inner = inner.lock().expect("service mutex poisoned");
-            let _dispatch_guard = tracing::dispatcher::set_default(inner.log_factory.dispatch());
-            let data = inner.data_context.executor();
-            f(&mut inner, data, done)
-        })
-    }
-
     fn control_handle(&self) -> Option<Arc<ControlThreadHandle>> {
         self.inner
             .lock()
@@ -854,169 +676,8 @@ fn worker_id(worker: usize) -> HammerResult<DataWorkerId> {
         .map_err(|_| HammerError::internal(format!("worker index {worker} does not fit into u32")))
 }
 
-fn trace_worker_control(options: &TraceOptions) -> bool {
-    options.enabled && !options.inputs.is_empty()
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ServicePacketGraphDeclarations;
-
-impl Default for ServicePacketGraphDeclarations {
-    #[inline]
-    fn default() -> Self {
-        Self
-    }
-}
-
-impl ServicePacketGraphDeclarations {
-    fn resolve(&self, name: &str) -> Option<NodeId> {
-        SERVICE_PACKET_GRAPH_NODES
-            .iter()
-            .position(|node| *node == name)
-            .and_then(|slot| u32::try_from(slot).ok())
-            .map(NodeId::new)
-    }
-}
-
-const SERVICE_PACKET_GRAPH_NODES: &[&str] = &[
-    "session-queue",
-    "handoff-node",
-    "tun-input-driver-node",
-    "ip-input-node",
-    "route-match-node",
-    "ip-lookup-node",
-    "adjacency-rewrite-node",
-    "ip-local-node",
-    "tcp-input-node",
-    "tcp-listen-node",
-    "tcp-rcv-process-node",
-    "tcp-syn-sent-node",
-    "tcp-established-node",
-    "tcp-reset-node",
-    "tcp-output-node",
-    "ip-receive-node",
-    "ip-reassembly-node",
-    "icmp-echo-request-node",
-    "icmp-error-node",
-    "interface-output-node",
-    "tun-output-driver-node",
-    "drop-node",
-];
-
-fn install_service_packet_graph_on_workers(data_context: &DataRuntimeContext) -> HammerResult<()> {
-    let tcp_control = RuntimeTcpListenerControlState::new()?.tcp_control;
-    data_context
-        .install_on_workers(move |worker, runtime| {
-            let worker = worker_id(worker)?;
-            let drop = runtime
-                .nodes()
-                .try_register_internal(DropNode::new())
-                .map_err(HammerError::from)?;
-            runtime
-                .nodes()
-                .register_internal_with_handle(SERVICE_HANDOFF_HANDLE, HandoffNode::new())
-                .map_err(HammerError::from)?;
-            let lookup = runtime
-                .nodes()
-                .try_register_internal(
-                    IpLookupControlPlane::new(FibTableBuilder::new(drop).build()).node(),
-                )
-                .map_err(HammerError::from)?;
-            let session_queue_node = SessionQueueNode::new().map_err(HammerError::from)?;
-            let mut worker_state =
-                crate::transport::tcp::lookup::TcpWorkerOwnedState::new(worker);
-            crate::transport::tcp::lookup::set_tcp_worker_state(&mut worker_state);
-            let queue = crate::session::node::register_session_queue(TcpSessionDriver::<
-                BbrController,
-            >::new(
-                worker,
-                runtime.packet_buffers().clone(),
-            ))
-            .map_err(HammerError::from)?;
-            let session_queue = SessionQueueHandle::<
-                crate::session::runtime::SessionDriverRuntime<
-                    crate::transport::tcp::TcpConnection<BbrController>,
-                >,
-            >::new(queue.runtime_data());
-            let tcp_output = runtime
-                .nodes()
-                .try_register_internal(TcpOutputNode::new(TcpOutputNext::nodes(drop, lookup)))
-                .map_err(HammerError::from)?;
-            let tcp_reset = runtime
-                .nodes()
-                .try_register_internal(TcpResetNode::new(TcpResetNext::nodes(drop, lookup)))
-                .map_err(HammerError::from)?;
-            let tcp_established = runtime
-                .nodes()
-                .try_register_internal(TcpEstablishedNode::new(
-                    queue,
-                    TcpEstablishedNext::nodes(tcp_output, drop),
-                ))
-                .map_err(HammerError::from)?;
-            let tcp_rcv_process = runtime
-                .nodes()
-                .try_register_internal(TcpRcvProcessNode::new(
-                    queue,
-                    TcpRcvProcessNext::nodes(tcp_output, drop),
-                ))
-                .map_err(HammerError::from)?;
-            let tcp_syn_sent = runtime
-                .nodes()
-                .try_register_internal(TcpSynSentNode::new(
-                    queue,
-                    TcpSynSentNext::nodes(tcp_output, drop),
-                ))
-                .map_err(HammerError::from)?;
-            let tcp_listen = runtime
-                .nodes()
-                .try_register_internal(TcpListenNode::new(
-                    tcp_control.clone(),
-                    queue,
-                    TcpListenNext::nodes(tcp_output, tcp_established, drop),
-                ))
-                .map_err(HammerError::from)?;
-            let tcp_input = runtime
-                .nodes()
-                .try_register_internal(tcp_control.node::<BbrController>(
-                    TcpInputNext::nodes(
-                        drop,
-                        drop,
-                        tcp_listen,
-                        tcp_rcv_process,
-                        tcp_syn_sent,
-                        tcp_established,
-                        tcp_reset,
-                    ),
-                    Some(queue),
-                    Some((SERVICE_HANDOFF_HANDLE, worker)),
-                ))
-                .map_err(HammerError::from)?;
-            let _tcp_input = tcp_input;
-            let node = runtime
-                .nodes()
-                .try_register_driver(session_queue_node.clone())
-                .map_err(HammerError::from)?;
-            session_queue_node
-                .attach_queue(
-                    session_queue,
-                    tcp_output.into(),
-                    dispatch_registered_session_queue_once_at::<
-                        crate::transport::tcp::TcpConnection<BbrController>,
-                    >,
-                )
-                .map_err(HammerError::from)?;
-            runtime
-                .nodes()
-                .set_node_state(node, NodeState::Polling)
-                .map_err(HammerError::from)?;
-            Ok::<(), HammerError>(())
-        })
-        .and_then(|results| {
-            for result in results {
-                result?;
-            }
-            Ok(())
-        })
+fn trace_worker_control(trace: &Trace) -> bool {
+    trace.enabled && !trace.inputs.is_empty()
 }
 
 fn schedule_trace_drain(
@@ -1037,110 +698,6 @@ fn schedule_trace_drain(
             }
         }
     })
-}
-
-fn schedule_runtime_dump(
-    control_handle: Arc<ControlThreadHandle>,
-    data_context: DataRuntimeContext,
-    interval: Duration,
-    logger: Logger,
-) -> HammerResult<ControlTimerHandle> {
-    control_handle.schedule_interval(interval, interval, move || {
-        let data_context = data_context.clone();
-        let logger = logger.clone();
-        async move {
-            match data_context.runtime_stats_on_workers_async().await {
-                Ok(stats) => {
-                    for line in render_runtime_stats_lines(&stats) {
-                        logger.debug(line);
-                    }
-                }
-                Err(err) => logger.warn(format!("dump node runtime stats: {err}")),
-            }
-        }
-    })
-}
-
-fn render_runtime_stats_lines(stats: &[(usize, Vec<NodeRuntimeStatsRow>)]) -> Vec<String> {
-    let mut lines = Vec::new();
-    for (worker, rows) in stats {
-        lines.push(format!(
-            "show runtime worker={worker} Name State Calls Vectors Suspends AvgNs Vectors/Call MaxNs"
-        ));
-        let mut rows = rows.iter().filter(|row| row.calls > 0).collect::<Vec<_>>();
-        rows.sort_by(|a, b| compare_runtime_rows(a, b));
-        for row in rows {
-            lines.push(format_runtime_stats_row(*worker, row));
-        }
-    }
-    lines
-}
-
-fn format_runtime_stats_row(worker: usize, row: &NodeRuntimeStatsRow) -> String {
-    let avg_ns = if row.vectors > 0 {
-        row.total_elapsed_ns / row.vectors
-    } else if row.calls > 0 {
-        row.total_elapsed_ns / row.calls
-    } else {
-        0
-    };
-    let vectors_per_call = if row.calls > 0 {
-        format!("{:.2}", row.vectors as f64 / row.calls as f64)
-    } else {
-        "0.00".to_owned()
-    };
-    format!(
-        "show runtime worker={} {:<32} {:<5} {:>10} {:>10} {:>8} {:>10} {:>12} {:>10}",
-        worker,
-        runtime_row_name(row),
-        "active",
-        row.calls,
-        row.vectors,
-        row.suspends,
-        avg_ns,
-        vectors_per_call,
-        row.max_elapsed_ns,
-    )
-}
-
-fn runtime_row_name(row: &NodeRuntimeStatsRow) -> String {
-    row.node_name
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| format!("node-{}", row.node_id.slot()))
-}
-
-fn compare_runtime_rows(a: &NodeRuntimeStatsRow, b: &NodeRuntimeStatsRow) -> std::cmp::Ordering {
-    match (a.node_name, b.node_name) {
-        (Some(a_name), Some(b_name)) => a_name
-            .cmp(b_name)
-            .then_with(|| a.node_id.slot().cmp(&b.node_id.slot())),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => a.node_id.slot().cmp(&b.node_id.slot()),
-    }
-}
-
-/// Wraps every declared `Endpoint` in an `EndpointOutboundAdapter` and
-/// registers it into the `OutboundManager` under the endpoint's id. This
-/// keeps endpoint-backed egress reachable through the same `outbound.get(...)`
-/// path used by every other transport.
-///
-/// Must run after the user's `[[outbounds]]` are loaded so duplicate-id
-/// validation lines up with the parse-time `validate_unique_ids` check.
-#[cfg(feature = "endpoint")]
-fn register_endpoint_outbound_adapters(
-    outbound: &Arc<OutboundManager>,
-    endpoint: &Arc<EndpointManager>,
-    log_factory: &Arc<Factory>,
-) -> HammerResult<()> {
-    for component in endpoint.list() {
-        let id = component.meta().id().to_owned();
-        let logger = new_logger(log_factory, &format!("endpoint-outbound/{id}"));
-        let adapter =
-            EndpointOutboundAdapter::arc(logger, id.clone(), Arc::clone(component.runtime()));
-        outbound.register_outbound(adapter)?;
-    }
-    Ok(())
 }
 
 fn start_inner(inner: &mut ServiceInner) -> HammerResult<()> {
@@ -1231,16 +788,6 @@ fn finish_close(
             .take()
     };
     if let Some(timer) = trace_drain_timer {
-        timer.cancel_timeout(CONTROL_SHUTDOWN_TIMEOUT);
-    }
-    let runtime_dump_timer = {
-        inner
-            .lock()
-            .expect("service mutex poisoned")
-            .runtime_dump_timer
-            .take()
-    };
-    if let Some(timer) = runtime_dump_timer {
         timer.cancel_timeout(CONTROL_SHUTDOWN_TIMEOUT);
     }
     let control_handle = {
@@ -1373,11 +920,6 @@ fn combine_close_error(result: HammerResult<()>, message: impl Into<String>) -> 
     }
 }
 
-#[cfg(feature = "probe")]
-fn build_probe_protocol(protocol: &str) -> HammerResult<ProbeProtocolComponent> {
-    crate::ProbeProtocolFactorySet::standard().build(protocol)
-}
-
 #[cfg(test)]
 impl RuntimeService {
     fn tcp_listener_control_snapshot_for_test(&self) -> RuntimeTcpListenerControlSnapshot {
@@ -1394,65 +936,10 @@ mod tests {
     use hammer_runtime::spawn::with_data_plane_buffers;
     use std::net::Ipv4Addr;
     use std::net::SocketAddr;
-    use std::panic::{self, PanicHookInfo};
-    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     struct NoopPlatform;
-
-    fn wait_for(timeout: Duration, mut ready: impl FnMut() -> bool) {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if ready() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(ready(), "condition was not satisfied before timeout");
-    }
-
-    fn panic_capture_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    fn panic_message(info: &PanicHookInfo<'_>) -> String {
-        if let Some(message) = info.payload().downcast_ref::<&str>() {
-            return (*message).to_owned();
-        }
-        if let Some(message) = info.payload().downcast_ref::<String>() {
-            return message.clone();
-        }
-        format!("{info}")
-    }
-
-    fn capture_panics<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
-        let _guard = panic_capture_lock()
-            .lock()
-            .expect("panic capture lock poisoned");
-        let messages = Arc::new(Mutex::new(Vec::new()));
-        let captured = Arc::clone(&messages);
-        let previous = panic::take_hook();
-        panic::set_hook(Box::new(move |info| {
-            captured
-                .lock()
-                .expect("captured panic messages poisoned")
-                .push(panic_message(info));
-        }));
-        let result = f();
-        panic::set_hook(previous);
-        let messages = match Arc::try_unwrap(messages) {
-            Ok(messages) => messages
-                .into_inner()
-                .expect("captured panic messages poisoned"),
-            Err(messages) => messages
-                .lock()
-                .expect("captured panic messages poisoned")
-                .clone(),
-        };
-        (result, messages)
-    }
 
     impl PlatformInterface for NoopPlatform {
         fn open_tun(&self, _options: hammer_runtime::adapter::TunOptions) -> HammerResult<i32> {
@@ -1526,22 +1013,6 @@ mod tests {
 [log]
 level = "debug"
 
-[tun]
-interface_name = "utun"
-address = ["172.19.0.1/30"]
-route_address = ["0.0.0.0/0"]
-auto_route = false
-strict_route = true
-mtu = 1400
-stack = "disabled"
-
-[[outbounds]]
-type = "block"
-id = "block"
-
-[route]
-final = "block"
-
 {extra}
 "#
         )
@@ -1562,15 +1033,6 @@ final = "block"
             .lock()
             .expect("service mutex poisoned")
             .trace_drain_timer
-            .is_some()
-    }
-
-    fn has_runtime_dump_timer(service: &RuntimeService) -> bool {
-        service
-            .inner
-            .lock()
-            .expect("service mutex poisoned")
-            .runtime_dump_timer
             .is_some()
     }
 
@@ -1602,26 +1064,26 @@ final = "block"
 
     #[test]
     fn trace_worker_control_is_only_installed_for_enabled_inputs() {
-        let mut options = TraceOptions {
+        let mut trace = Trace {
             enabled: false,
             record_capacity: 8,
             packet_capacity: 4,
-            inputs: vec![config::TraceInputOptions {
-                node: "tun-input-driver-node".to_owned(),
+            inputs: vec![config::TraceInput {
+                node: "tun-input-driver".to_owned(),
                 count: 1,
             }],
         };
-        assert!(!trace_worker_control(&options));
+        assert!(!trace_worker_control(&trace));
 
-        options.enabled = true;
-        options.inputs.clear();
-        assert!(!trace_worker_control(&options));
+        trace.enabled = true;
+        trace.inputs.clear();
+        assert!(!trace_worker_control(&trace));
 
-        options.inputs.push(config::TraceInputOptions {
-            node: "tun-input-driver-node".to_owned(),
+        trace.inputs.push(config::TraceInput {
+            node: "tun-input-driver".to_owned(),
             count: 1,
         });
-        assert!(trace_worker_control(&options));
+        assert!(trace_worker_control(&trace));
     }
 
     #[test]
@@ -1631,7 +1093,7 @@ final = "block"
 enabled = false
 
 [[trace.inputs]]
-node = "tun-input-driver-node"
+node = "tun-input-driver"
 count = 1
 "#,
         );
@@ -1648,108 +1110,15 @@ enabled = true
     }
 
     #[test]
-    fn runtime_dump_timer_is_only_installed_when_enabled() {
-        let disabled = new_test_service("");
-        assert!(!has_runtime_dump_timer(&disabled));
-        disabled.close().expect("close disabled runtime service");
-
-        let enabled = new_test_service(
-            r#"[runtime]
-enabled = true
-interval = "5s"
-"#,
-        );
-        assert!(has_runtime_dump_timer(&enabled));
-        enabled.close().expect("close enabled runtime service");
-        assert!(!has_runtime_dump_timer(&enabled));
-    }
-
-    #[test]
-    fn runtime_stats_rendering_filters_idle_nodes_and_formats_vpp_columns() {
-        let lines = render_runtime_stats_lines(&[
-            (
-                1,
-                vec![
-                    NodeRuntimeStatsRow {
-                        node_id: NodeId::new(0),
-                        node_name: Some("idle-node"),
-                        error_counters: NodeErrorCounters::default(),
-                        calls: 0,
-                        vectors: 0,
-                        suspends: 0,
-                        total_elapsed_ns: 0,
-                        max_elapsed_ns: 0,
-                    },
-                    NodeRuntimeStatsRow {
-                        node_id: NodeId::new(2),
-                        node_name: Some("ip-input-node"),
-                        error_counters: NodeErrorCounters::default(),
-                        calls: 2,
-                        vectors: 5,
-                        suspends: 0,
-                        total_elapsed_ns: 50,
-                        max_elapsed_ns: 30,
-                    },
-                    NodeRuntimeStatsRow {
-                        node_id: NodeId::new(10),
-                        node_name: None,
-                        error_counters: NodeErrorCounters::default(),
-                        calls: 1,
-                        vectors: 1,
-                        suspends: 0,
-                        total_elapsed_ns: 1,
-                        max_elapsed_ns: 1,
-                    },
-                    NodeRuntimeStatsRow {
-                        node_id: NodeId::new(2),
-                        node_name: None,
-                        error_counters: NodeErrorCounters::default(),
-                        calls: 1,
-                        vectors: 1,
-                        suspends: 0,
-                        total_elapsed_ns: 1,
-                        max_elapsed_ns: 1,
-                    },
-                ],
-            ),
-            (2, Vec::new()),
-        ]);
-
-        assert_eq!(lines.len(), 5);
-        assert!(
-            lines[0].contains("Name State Calls Vectors Suspends AvgNs Vectors/Call MaxNs"),
-            "{lines:?}"
-        );
-        assert!(!lines.iter().any(|line| line.contains("idle-node")));
-        assert!(lines[1].contains("ip-input-node"), "{lines:?}");
-        assert!(lines[1].contains("active"), "{lines:?}");
-        assert!(lines[1].contains("         2"), "{lines:?}");
-        assert!(lines[1].contains("         5"), "{lines:?}");
-        assert!(
-            lines[4].contains(
-                "show runtime worker=2 Name State Calls Vectors Suspends AvgNs Vectors/Call MaxNs"
-            ),
-            "{lines:?}"
-        );
-        assert!(lines[1].contains("        10"), "{lines:?}");
-        assert!(lines[1].contains("        2.50"), "{lines:?}");
-        assert!(lines[1].contains("        30"), "{lines:?}");
-        assert!(lines[2].contains("node-2"), "{lines:?}");
-        assert!(lines[3].contains("node-10"), "{lines:?}");
-    }
-
-    #[test]
     fn service_packet_graph_resolves_tcp_nodes() {
-        let graph = ServicePacketGraphDeclarations::default();
-
-        assert!(graph.resolve("session-queue").is_some());
-        assert!(graph.resolve("handoff-node").is_some());
-        assert!(graph.resolve("tcp-input-node").is_some());
-        assert!(graph.resolve("tcp-listen-node").is_some());
-        assert!(graph.resolve("tcp-rcv-process-node").is_some());
-        assert!(graph.resolve("tcp-syn-sent-node").is_some());
-        assert!(graph.resolve("tcp-established-node").is_some());
-        assert!(graph.resolve("tcp-reset-node").is_some());
+        assert!(packet_graph::resolve_graph_node("session-queue").is_some());
+        assert!(packet_graph::resolve_graph_node("handoff").is_some());
+        assert!(packet_graph::resolve_graph_node("tcp-input").is_some());
+        assert!(packet_graph::resolve_graph_node("tcp-listen").is_some());
+        assert!(packet_graph::resolve_graph_node("tcp-rcv-process").is_some());
+        assert!(packet_graph::resolve_graph_node("tcp-syn-sent").is_some());
+        assert!(packet_graph::resolve_graph_node("tcp-established").is_some());
+        assert!(packet_graph::resolve_graph_node("tcp-reset").is_some());
     }
 
     #[test]
@@ -1768,7 +1137,7 @@ interval = "5s"
             .runtime_stats_on_workers()
             .expect("snapshot data worker nodes");
 
-        assert_eq!(stats.len(), DATA_WORKER_THREADS);
+        assert_eq!(stats.len(), hammer_core::config::Worker::default().count);
         for (worker, rows) in stats {
             assert!(
                 rows.iter()

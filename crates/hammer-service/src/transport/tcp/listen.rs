@@ -23,11 +23,18 @@ const TCP_LISTENER_BACKLOG: usize = 128;
 
 #[hammer_component_macros::node_next]
 pub enum TcpListenNext {
+    #[next("tcp-output")]
     Output,
+    #[next("tcp-established")]
     Established,
     Drop,
 }
 
+#[hammer_component_macros::graph_node(
+    graph = service,
+    name = "tcp-listen",
+    next = TcpListenNext,
+)]
 #[hammer_component_macros::node(role = internal, next = TcpListenNext)]
 pub struct TcpListenNode<C: CongestionController + 'static> {
     control: TcpInputControlPlane,

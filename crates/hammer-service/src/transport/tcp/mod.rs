@@ -1,6 +1,8 @@
 pub use hammer_core::protocol::tcp::{TcpInputFlags, TcpSeq, TcpState};
 
-use hammer_adapter::{BufferPacketCursor, DataPlaneRuntime, DataWorkerId, SecondaryOpaque};
+use std::sync::OnceLock;
+
+use hammer_adapter::{BufferPacketCursor, DataPlaneRuntime, DataWorkerId, NodeId, SecondaryOpaque};
 use hammer_core::error::{CoreError, CoreResult};
 #[cfg(test)]
 use hammer_core::protocol::tcp::{TcpCapabilities, TcpFastOpenCookie};
@@ -46,6 +48,32 @@ pub use recovery::{TcpRecoveryAck, TcpRecoveryState};
 pub use reset::{TcpResetNext, TcpResetNode};
 use segment::TcpSegment;
 pub use syn_sent::{TcpSynSentNext, TcpSynSentNode};
+
+pub struct TcpMain;
+
+impl TcpMain {
+    pub fn register_tcp_input<C: CongestionController + 'static>(
+        &self,
+        _runtime: &DataPlaneRuntime,
+        _worker: usize,
+    ) -> CoreResult<NodeId> {
+        Err(CoreError::internal(
+            "tcp main register_tcp_input not implemented yet",
+        ))
+    }
+}
+
+pub static TCP_MAIN: OnceLock<TcpMain> = OnceLock::new();
+
+pub fn register_tcp_input_graph_node<C: CongestionController + 'static>(
+    runtime: &DataPlaneRuntime,
+    worker: usize,
+) -> CoreResult<NodeId> {
+    TCP_MAIN
+        .get()
+        .ok_or_else(|| CoreError::internal("tcp main not initialized"))?
+        .register_tcp_input::<C>(runtime, worker)
+}
 
 #[cfg(test)]
 pub(crate) use lookup::set_tcp_worker_state;
@@ -498,11 +526,17 @@ where
 #[hammer_component_macros::node_next]
 pub enum TcpInputNext {
     Drop,
+    #[next("drop")]
     Punt,
+    #[next("tcp-listen")]
     Listen,
+    #[next("tcp-rcv-process")]
     RcvProcess,
+    #[next("tcp-syn-sent")]
     SynSent,
+    #[next("tcp-established")]
     Established,
+    #[next("tcp-reset")]
     Reset,
 }
 
