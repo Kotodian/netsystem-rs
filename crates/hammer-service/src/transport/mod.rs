@@ -32,6 +32,11 @@ pub fn init(reg: &RuntimeRegistry) -> HammerResult<()> {
     Ok(())
 }
 
+#[linkme::distributed_slice(crate::packet_graph::CONTROL_INITS)]
+fn init_transport(reg: &RuntimeRegistry) -> HammerResult<()> {
+    init(reg)
+}
+
 /// Config → CC controller type. Single transport-layer dispatch point.
 #[macro_export]
 macro_rules! with_congestion {
