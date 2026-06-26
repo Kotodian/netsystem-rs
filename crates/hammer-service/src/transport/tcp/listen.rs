@@ -671,8 +671,13 @@ mod tests {
     fn install_listener_runtime(
         runtime: &DataPlaneRuntime,
     ) -> (NodeId, TcpQueue<BbrController>, Arc<Mutex<CaptureState>>) {
-        let mut owner = TcpWorkerOwnedState::new(DataWorkerId::new(0));
-        super::set_tcp_worker_state(&mut owner);
+        // The TLS worker-state slot holds a raw pointer (see
+        // `lookup::set_tcp_worker_state`). A stack local would dangle once this
+        // helper returns, so leak a heap allocation to give the state a stable
+        // address that stays valid for the whole test.
+        let owner: &'static mut TcpWorkerOwnedState =
+            Box::leak(Box::new(TcpWorkerOwnedState::new(DataWorkerId::new(0))));
+        super::set_tcp_worker_state(owner);
         let handle =
             crate::session::node::register_session_queue(TcpSessionDriver::<BbrController>::new(
                 DataWorkerId::new(0),
