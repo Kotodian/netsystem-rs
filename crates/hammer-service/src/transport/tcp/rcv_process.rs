@@ -110,7 +110,6 @@ where
 {
     let packet = parse_tcp_packet(runtime, index)?;
     let mut release_input = true;
-    let mut complete_connected = None;
     let result: CoreResult<_> = {
         let mut queue = session_queue.borrow_mut()?;
         let session_id =
@@ -143,14 +142,11 @@ where
         if ack_advanced && queue.app().pending_send_len(session_id)?.is_some() {
             queue.mark_ready(session_id);
         }
-        if established {
-            complete_connected = queue.session_app_op(session_id);
-        }
         if established_with_payload {
             {
                 let mut buffer = runtime.packet_buffers().get_buffer_mut(index)?;
                 buffer.advance(packet.payload_offset as isize)?;
-                buffer.truncate_chain(packet.payload_len)?;
+                buffer.truncate(packet.payload_len)?;
             }
             let enqueue = queue.enqueue_rx(session_id, index, 0, false)?;
             if enqueue.delivered_len != 0 {
@@ -185,8 +181,8 @@ where
             now,
         )?;
         publish_tcp_connection(&mut queue, session_id)?;
-        if let Some(op) = complete_connected.take() {
-            queue.app().complete_connected(op)?;
+        if established {
+            queue.app().connected(session_id)?;
         }
         Ok(control)
     };

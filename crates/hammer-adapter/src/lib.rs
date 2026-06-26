@@ -15,9 +15,8 @@ pub use buffer::{
     BUFFER_CACHE_LINE_SIZE, Buffer, BufferBatchMut, BufferFlags, BufferFrame, BufferFrameBatch,
     BufferFrameBatchCursor, BufferFrameBatchIndices, BufferFramePairBatch,
     BufferFramePairBatchCursor, BufferFrameQuadBatch, BufferFrameQuadBatchCursor, BufferIndex,
-    BufferNodeError, BufferPacketCursor, BufferPool, BufferPoolArena, BufferRef, BufferRefMut,
-    DataPlaneBuffers, DataPlaneRuntime, FrameIndex, FramePool, FrameRef, FrameRefMut,
-    PooledBufferFrame,
+    BufferNodeError, BufferPacketCursor, BufferPool, BufferPoolArena, DataPlaneBuffers,
+    DataPlaneRuntime, FrameIndex, FramePool, FrameRef, FrameRefMut, PooledBufferFrame,
 };
 pub use hammer_core::lifecycle::{
     ALL_STAGES, LIFECYCLE_ORDER, Lifecycle, LifecycleService, StartStage,

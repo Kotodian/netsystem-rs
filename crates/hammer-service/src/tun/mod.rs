@@ -871,16 +871,15 @@ where
         runtime: &DataPlaneRuntime,
         pending: TunPendingTx,
     ) -> CoreResult<TunBufferSendResult> {
-        runtime.with_current_chain_io_segments(pending.index, |segments, total_len| {
-            if pending.offset > total_len {
-                return Err(CoreError::internal("TUN TX offset exceeds packet length"));
-            }
-            if pending.offset == total_len {
-                return Ok(TunBufferSendResult::Complete);
-            }
-            self.io
-                .try_send_buffers(segments, pending.offset, total_len)
-        })
+        let packet = runtime.copy_packet(pending.index)?;
+        let total_len = packet.len();
+        if pending.offset > total_len {
+            return Err(CoreError::internal("TUN TX offset exceeds packet length"));
+        }
+        if pending.offset == total_len {
+            return Ok(TunBufferSendResult::Complete);
+        }
+        self.io.try_send_buffer(&packet, pending.offset)
     }
 }
 
@@ -1666,7 +1665,7 @@ fn tun_output_packet(
     index: hammer_adapter::BufferIndex,
     mode: TunDriverMode,
 ) -> CoreResult<Vec<u8>> {
-    let packet = runtime.copy_current_chain(index)?;
+    let packet = runtime.copy_packet(index)?;
     if !mode.is_tap() {
         return Ok(packet);
     }

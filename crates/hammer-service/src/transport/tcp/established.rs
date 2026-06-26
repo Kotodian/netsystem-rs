@@ -156,7 +156,7 @@ where
             {
                 let mut buffer = runtime.packet_buffers().get_buffer_mut(index)?;
                 buffer.advance(packet.payload_offset.saturating_add(trim) as isize)?;
-                buffer.truncate_chain(accepted_len)?;
+                buffer.truncate(accepted_len)?;
             }
             let enqueue = queue.enqueue_rx(session_id, index, offset, false)?;
             let connection = queue
@@ -204,7 +204,7 @@ where
                 hammer_core::protocol::tcp::TcpCapabilities::default(),
             ));
         }
-        let has_pending_tx = queue.app().pending_send_head(session_id).is_some();
+        let has_pending_tx = queue.app().has_pending_send(session_id);
         let connection: *const crate::transport::tcp::TcpConnection<C> =
             queue
                 .session(session_id)

@@ -33,7 +33,7 @@ Use Rust 2024 conventions and rustfmt defaults: 4-space indentation, `snake_case
 
 When working on VPP-related refactors in this repository:
 - Always research and reference VPP for dataplane, session, transport, and TCP design decisions before proposing or changing architecture.
-- Treat VPP as a semantic and ownership reference, not as a 1:1 API, data-structure, or naming template. Hammer's app/session boundary is io_uring-style (`AppRingHandle`, SQE, CQE), so do not replace it with VPP `svm_fifo` shapes or names.
+- Treat VPP as a semantic and ownership reference, not as a 1:1 API, data-structure, or naming template. Hammer's app/session boundary is VPP-style session FIFO + message queue (`svm_fifo`/`svm_msg_q`) semantics; do not reintroduce io_uring-style `AppRing`, SQE, CQE, submission, or completion surfaces for dataplane app/session exchange.
 - Use data structures from the `hammer-infra` crate by default. If `hammer-infra` lacks a required generic API, add the API there instead of falling back to `std` or creating local one-off utilities.
 - Reuse existing APIs before adding new wrappers, helpers, or types. Add new API surface only when reuse is not technically viable. When a missing capability is shared by multiple use cases, add one generic primitive at the owning layer instead of adding per-feature APIs. Any new type or API in non-trivial VPP/TCP work must state the final result, explain why existing surfaces cannot satisfy the need, and receive explicit user approval before implementation.
 - Utility or tool types must remain generic and must not contain business concepts. Business state names must describe the domain state directly; do not use names such as `Cursor`, `Helper`, or `Util` for business records.

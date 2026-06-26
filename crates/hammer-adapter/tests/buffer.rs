@@ -172,7 +172,7 @@ fn buffer_header_and_packet_data_start_cacheline_aligned() {
 
     {
         let buffer = pool.get(buffer).expect("buffer ref");
-        assert_eq!(buffer.buffer_ptr() as usize % 64, 0);
+        assert_eq!(std::ptr::from_ref(&*buffer) as usize % 64, 0);
         assert_eq!(buffer.current().as_ptr() as usize % 64, 0);
     }
 
@@ -241,7 +241,7 @@ fn append_beyond_one_slot_creates_and_frees_chain() {
 
     pool.append(buffer, b"7890abcdef").expect("append chain");
 
-    assert!(pool.is_chained(buffer).expect("buffer is chained"));
+    assert!(pool.next_buffer(buffer).expect("buffer next").is_some());
     assert_eq!(
         pool.copy_packet(buffer).expect("chained packet"),
         b"1234567890abcdef"
@@ -259,7 +259,7 @@ fn alloc_with_bytes_beyond_one_slot_creates_chain() {
         .alloc_index_with_bytes(b"abcdefghijkl")
         .expect("alloc chained buffer");
 
-    assert!(pool.is_chained(buffer).expect("buffer is chained"));
+    assert!(pool.next_buffer(buffer).expect("buffer next").is_some());
     assert_eq!(
         pool.copy_packet(buffer).expect("chained packet"),
         b"abcdefghijkl"
@@ -269,7 +269,7 @@ fn alloc_with_bytes_beyond_one_slot_creates_chain() {
 }
 
 #[test]
-fn buffer_chain_can_detach_and_append_existing_chain_without_copying_payload() {
+fn buffer_chain_can_detach_and_chain_buffer_without_copying_payload() {
     let pool = BufferPool::with_capacity(8, 8);
     let head = pool.alloc_index_with_bytes(b"head").expect("alloc head");
     let tail = pool
@@ -277,12 +277,12 @@ fn buffer_chain_can_detach_and_append_existing_chain_without_copying_payload() {
         .expect("alloc tail chain");
     let tail_ptr = pool.current_ptr(tail).expect("tail ptr") as usize;
 
-    pool.append_existing_chain(head, tail)
+    pool.chain_buffer(head, tail)
         .expect("append existing chain");
 
-    assert!(pool.is_chained(head).expect("head is chained"));
+    assert!(pool.next_buffer(head).expect("head next").is_some());
     assert_eq!(
-        pool.copy_current_chain(head).expect("combined chain"),
+        pool.copy_packet(head).expect("combined chain"),
         b"headtaildata"
     );
     assert_eq!(
@@ -293,49 +293,12 @@ fn buffer_chain_can_detach_and_append_existing_chain_without_copying_payload() {
     let detached = pool.detach_next(head).expect("detach next");
 
     assert_eq!(detached, Some(tail));
-    assert!(!pool.is_chained(head).expect("head detached"));
-    assert_eq!(pool.copy_current_chain(head).expect("head packet"), b"head");
-    assert_eq!(
-        pool.copy_current_chain(tail).expect("tail packet"),
-        b"taildata"
-    );
+    assert!(pool.next_buffer(head).expect("head detached").is_none());
+    assert_eq!(pool.copy_packet(head).expect("head packet"), b"head");
+    assert_eq!(pool.copy_packet(tail).expect("tail packet"), b"taildata");
 
     pool.free_index(head);
     pool.free_index(tail);
-    assert_eq!(pool.in_use(), 0);
-}
-
-#[test]
-fn buffer_chain_io_segments_expose_full_chain_without_copying_or_mutation() {
-    let pool = BufferPool::with_capacity(4, 8);
-    let packet = pool
-        .alloc_index_with_bytes(b"abcdefghijkl")
-        .expect("alloc chained packet");
-
-    let (segments, total_len) = pool
-        .with_current_chain_io_segments(packet, |segments, total_len| {
-            Ok((
-                segments
-                    .iter()
-                    .map(|segment| segment.to_vec())
-                    .collect::<Vec<_>>(),
-                total_len,
-            ))
-        })
-        .expect("io segments");
-    assert_eq!(total_len, 12);
-    assert_eq!(
-        segments,
-        vec![b"abcd".to_vec(), b"efgh".to_vec(), b"ijkl".to_vec()]
-    );
-    assert_eq!(
-        pool.copy_current_chain(packet)
-            .expect("packet remains unchanged"),
-        b"abcdefghijkl"
-    );
-    assert_eq!(pool.in_use(), 3);
-
-    pool.free_index(packet);
     assert_eq!(pool.in_use(), 0);
 }
 
@@ -354,7 +317,7 @@ fn attach_clone_keeps_tail_alive_until_both_chains_are_freed() {
         .expect("attach clone");
 
     assert_eq!(
-        pool.copy_current_chain(output_head).expect("output chain"),
+        pool.copy_packet(output_head).expect("output chain"),
         b"headtaildata"
     );
     assert_eq!(
@@ -367,7 +330,7 @@ fn attach_clone_keeps_tail_alive_until_both_chains_are_freed() {
     pool.free_index(output_head);
 
     assert_eq!(
-        pool.copy_current_chain(session_tail)
+        pool.copy_packet(session_tail)
             .expect("tail survives output free"),
         b"taildata"
     );
@@ -396,8 +359,7 @@ fn freeing_head_with_attached_clone_does_not_free_session_tail() {
     pool.free_index(output_head);
 
     assert_eq!(
-        pool.copy_current_chain(session_tail)
-            .expect("tail survives"),
+        pool.copy_packet(session_tail).expect("tail survives"),
         b"payload"
     );
     assert_eq!(pool.in_use(), 1);
@@ -422,7 +384,7 @@ fn freeing_original_tail_after_output_head_returns_storage_once() {
     pool.free_index(session_tail);
 
     assert_eq!(
-        pool.copy_current_chain(output_head)
+        pool.copy_packet(output_head)
             .expect("head keeps tail alive"),
         b"headpayload"
     );
@@ -490,12 +452,11 @@ fn shared_tail_rejects_payload_mutation_but_allows_independent_header_views() {
     pool.advance(output_head, 2)
         .expect("advance cloned header view");
     assert_eq!(
-        pool.copy_current_chain(output_head)
-            .expect("cloned view advanced"),
+        pool.copy_packet(output_head).expect("cloned view advanced"),
         b"adpayload"
     );
     assert_eq!(
-        pool.copy_current_chain(session_tail)
+        pool.copy_packet(session_tail)
             .expect("original view intact"),
         b"payload"
     );
@@ -521,21 +482,17 @@ fn shared_tail_rejects_chain_link_mutation_but_allows_clone_head_truncate() {
         .alloc_index_with_bytes(b"tail")
         .expect("alloc extra tail");
 
-    assert!(
-        pool.append_existing_chain(session_tail, extra_tail)
-            .is_err()
-    );
-    pool.truncate_chain(output_head, 4)
+    assert!(pool.chain_buffer(session_tail, extra_tail).is_err());
+    pool.truncate_current(output_head, 4)
         .expect("truncate clone head only");
 
     assert_eq!(
-        pool.copy_current_chain(output_head)
-            .expect("clone view trimmed"),
+        pool.copy_packet(output_head).expect("clone view trimmed"),
         b"head"
     );
 
     assert_eq!(
-        pool.copy_current_chain(session_tail)
+        pool.copy_packet(session_tail)
             .expect("tail chain unchanged"),
         b"abcdefgh"
     );
@@ -543,27 +500,6 @@ fn shared_tail_rejects_chain_link_mutation_but_allows_clone_head_truncate() {
     pool.free_index(extra_tail);
     pool.free_index(output_head);
     pool.free_index(session_tail);
-}
-
-fn buffer_chain_truncate_current_chain_frees_tail_beyond_limit() {
-    let pool = BufferPool::with_capacity(4, 8);
-    let packet = pool
-        .alloc_index_with_bytes(b"abcdefghijkl")
-        .expect("alloc chained packet");
-
-    assert_eq!(pool.in_use(), 3);
-
-    pool.truncate_chain(packet, 6).expect("truncate chain");
-
-    assert!(pool.is_chained(packet).expect("packet still chained"));
-    assert_eq!(
-        pool.copy_current_chain(packet).expect("truncated packet"),
-        b"abcdef"
-    );
-    assert_eq!(pool.in_use(), 2);
-
-    pool.free_index(packet);
-    assert_eq!(pool.in_use(), 0);
 }
 
 #[test]
@@ -581,7 +517,7 @@ fn buffer_advance_can_discard_prefix_across_chain_segments() {
     drop(buffer);
 
     assert_eq!(
-        pool.copy_current_chain(packet).expect("remaining packet"),
+        pool.copy_packet(packet).expect("remaining packet"),
         b"ghijkl"
     );
 
@@ -599,8 +535,8 @@ fn buffer_pool_reports_single_segment_and_chained_packets() {
         .alloc_index_with_bytes(b"abcdefghij")
         .expect("alloc chained buffer");
 
-    assert!(!pool.is_chained(single).expect("single chain state"));
-    assert!(pool.is_chained(chained).expect("chained state"));
+    assert!(pool.next_buffer(single).expect("single next").is_none());
+    assert!(pool.next_buffer(chained).expect("chained next").is_some());
     assert_eq!(pool.copy_current(single).expect("single current"), b"abc");
     assert_eq!(pool.copy_packet(single).expect("single packet"), b"abc");
     assert_eq!(
@@ -691,7 +627,7 @@ fn buffer_pool_rejects_index_from_another_runtime() {
     assert_ne!(first_index.pool_id(), second_index.pool_id());
     assert!(second_pool.get(first_index).is_err());
     assert!(second_pool.copy_packet(first_index).is_err());
-    assert!(second_pool.is_chained(first_index).is_err());
+    assert!(second_pool.next_buffer(first_index).is_err());
 
     first_pool.free_index(first_index);
     second_pool.free_index(second_index);
@@ -802,12 +738,11 @@ fn buffer_frame_reset_does_not_free_buffers() {
     assert!(frame.is_empty());
     assert_eq!(pool.in_use(), 2);
     assert_eq!(
-        pool.copy_current_chain(first)
-            .expect("first buffer remains live"),
+        pool.copy_packet(first).expect("first buffer remains live"),
         b"one"
     );
     assert_eq!(
-        pool.copy_current_chain(second)
+        pool.copy_packet(second)
             .expect("second buffer remains live"),
         b"two"
     );
@@ -873,12 +808,12 @@ fn buffer_frame_drain_indices_preserves_order_without_freeing() {
     assert_eq!(pool.in_use(), 2);
     assert_eq!(drained, vec![first, second]);
     assert_eq!(
-        pool.copy_current_chain(drained[0])
+        pool.copy_packet(drained[0])
             .expect("first buffer remains live"),
         b"first"
     );
     assert_eq!(
-        pool.copy_current_chain(drained[1])
+        pool.copy_packet(drained[1])
             .expect("second buffer remains live"),
         b"second"
     );

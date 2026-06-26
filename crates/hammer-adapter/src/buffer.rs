@@ -29,7 +29,6 @@ use crate::trace::{DataPlaneTrace, PacketTrace, TraceControlHandle};
 pub const DEFAULT_BUFFER_FRAME_CAPACITY: usize = 256;
 pub const DEFAULT_BUFFER_FRAME_POOL_SIZE: usize = 64;
 pub const BUFFER_CACHE_LINE_SIZE: usize = 64;
-pub const CURRENT_CHAIN_IO_SEGMENT_CAPACITY: usize = 64;
 pub const DEFAULT_PACKET_HEADROOM: usize = 256;
 
 /// Number of free slots moved between the per-thread cache and the arena free
@@ -446,6 +445,40 @@ impl Buffer {
         }
         self.set_current_len(self.current_len() + len)?;
         Ok(())
+    }
+
+    #[inline]
+    pub fn truncate(&mut self, len: usize) -> CoreResult<()> {
+        if len > self.current_len() {
+            return Err(CoreError::internal(
+                "buffer truncate extends current length",
+            ));
+        }
+        self.set_current_len(len)
+    }
+
+    #[inline]
+    pub fn advance(&mut self, displacement: isize) -> CoreResult<()> {
+        if displacement == 0 {
+            return Ok(());
+        }
+        if displacement < 0 {
+            let rewind = displacement.unsigned_abs();
+            if rewind > self.current_data() {
+                return Err(CoreError::internal("buffer rewind exceeds headroom"));
+            }
+            self.set_current_data(self.current_data() - rewind)?;
+            self.set_current_len(self.current_len() + rewind)?;
+            return Ok(());
+        }
+
+        let len = usize::try_from(displacement)
+            .map_err(|_| CoreError::internal("buffer advance displacement overflow"))?;
+        if len > self.current_len() {
+            return Err(CoreError::internal("buffer advance exceeds current length"));
+        }
+        self.set_current_data(self.current_data() + len)?;
+        self.set_current_len(self.current_len() - len)
     }
 
     #[inline]
@@ -914,12 +947,12 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    pub fn get_buffer(&self, index: BufferIndex) -> CoreResult<BufferRef<'_>> {
+    pub fn get_buffer(&self, index: BufferIndex) -> CoreResult<Ref<'_, Buffer>> {
         self.buffers.get(index)
     }
 
     #[inline]
-    pub fn get_buffer_mut(&self, index: BufferIndex) -> CoreResult<BufferRefMut<'_>> {
+    pub fn get_buffer_mut(&self, index: BufferIndex) -> CoreResult<RefMut<'_, Buffer>> {
         self.buffers.get_mut(index)
     }
 
@@ -946,11 +979,6 @@ impl DataPlaneBuffers {
     #[inline]
     pub fn current_len(&self, index: BufferIndex) -> CoreResult<usize> {
         self.buffers.current_len(index)
-    }
-
-    #[inline]
-    pub fn total_len_not_including_first(&self, index: BufferIndex) -> CoreResult<usize> {
-        self.buffers.total_len_not_including_first(index)
     }
 
     #[inline]
@@ -1013,16 +1041,6 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    pub fn append_existing_chain(&self, head: BufferIndex, tail: BufferIndex) -> CoreResult<()> {
-        self.buffers.append_existing_chain(head, tail)
-    }
-
-    #[inline]
-    pub fn truncate_chain(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
-        self.buffers.truncate_chain(index, len)
-    }
-
-    #[inline]
     pub fn current(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
         self.buffers.current(index)
     }
@@ -1033,27 +1051,8 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    pub fn is_chained(&self, index: BufferIndex) -> CoreResult<bool> {
-        self.buffers.is_chained(index)
-    }
-
-    #[inline]
     pub fn copy_packet(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
         self.buffers.copy_packet(index)
-    }
-
-    #[inline]
-    pub fn copy_current_chain(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
-        self.buffers.copy_current_chain(index)
-    }
-
-    #[inline]
-    pub fn with_current_chain_io_segments<R>(
-        &self,
-        index: BufferIndex,
-        f: impl FnOnce(&[&[u8]], usize) -> CoreResult<R>,
-    ) -> CoreResult<R> {
-        self.buffers.with_current_chain_io_segments(index, f)
     }
 }
 
@@ -1669,23 +1668,29 @@ impl BufferPool {
     }
 
     #[inline]
-    pub fn get(&self, index: BufferIndex) -> CoreResult<BufferRef<'_>> {
+    pub fn get(&self, index: BufferIndex) -> CoreResult<Ref<'_, Buffer>> {
         let guard = self.arena.inner.borrow();
         guard.buffer(index)?;
-        Ok(BufferRef { guard, index })
+        Ok(Ref::map(guard, |pool| {
+            pool.buffer(index)
+                .expect("buffer index was validated before mapping")
+        }))
     }
 
     #[inline]
-    pub fn get_mut(&self, index: BufferIndex) -> CoreResult<BufferRefMut<'_>> {
+    pub fn get_mut(&self, index: BufferIndex) -> CoreResult<RefMut<'_, Buffer>> {
         let mut guard = self.arena.inner.borrow_mut();
         guard.ensure_writable(index)?;
         guard.buffer_mut(index)?;
-        let thread_cache = self.thread_cache.borrow_mut();
-        Ok(BufferRefMut {
-            guard,
-            thread_cache,
-            index,
-        })
+        Ok(RefMut::map(guard, |pool| {
+            pool.buffer_mut(index)
+                .expect("buffer index was validated before mapping")
+        }))
+    }
+
+    #[inline]
+    pub fn next_buffer(&self, index: BufferIndex) -> CoreResult<Option<BufferIndex>> {
+        self.arena.inner.borrow().next_buffer(index)
     }
 
     #[inline]
@@ -1708,16 +1713,6 @@ impl BufferPool {
     #[inline]
     pub fn current_len(&self, index: BufferIndex) -> CoreResult<usize> {
         Ok(self.arena.inner.borrow().buffer(index)?.current_len())
-    }
-
-    #[inline]
-    pub fn total_len_not_including_first(&self, index: BufferIndex) -> CoreResult<usize> {
-        Ok(self
-            .arena
-            .inner
-            .borrow()
-            .buffer(index)?
-            .total_len_not_including_first())
     }
 
     #[inline]
@@ -1814,20 +1809,8 @@ impl BufferPool {
     }
 
     #[inline]
-    pub fn append_existing_chain(&self, head: BufferIndex, tail: BufferIndex) -> CoreResult<()> {
-        self.arena
-            .inner
-            .borrow_mut()
-            .append_existing_chain(head, tail)
-    }
-
-    #[inline]
-    pub fn truncate_chain(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
-        let mut cache = self.thread_cache.borrow_mut();
-        self.arena
-            .inner
-            .borrow_mut()
-            .truncate_chain(&mut cache, index, len)
+    pub fn chain_buffer(&self, head: BufferIndex, tail: BufferIndex) -> CoreResult<()> {
+        self.arena.inner.borrow_mut().chain_buffer(head, tail)
     }
 
     #[inline]
@@ -1849,35 +1832,13 @@ impl BufferPool {
     }
 
     #[inline]
-    pub fn is_chained(&self, index: BufferIndex) -> CoreResult<bool> {
-        Ok(self.arena.inner.borrow().next_buffer(index)?.is_some())
-    }
-
-    #[inline]
     pub fn copy_packet(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
         let inner = self.arena.inner.borrow();
         let buffer = inner.buffer(index)?;
         if inner.next_buffer(index)?.is_none() {
             return Ok(buffer.current().iter().copied().collect());
         }
-        inner.copy_current_chain(index)
-    }
-
-    #[inline]
-    pub fn copy_current_chain(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
-        self.arena.inner.borrow().copy_current_chain(index)
-    }
-
-    #[inline]
-    pub fn with_current_chain_io_segments<R>(
-        &self,
-        index: BufferIndex,
-        f: impl FnOnce(&[&[u8]], usize) -> CoreResult<R>,
-    ) -> CoreResult<R> {
-        self.arena
-            .inner
-            .borrow()
-            .with_current_chain_io_segments(index, f)
+        inner.copy_packet(index)
     }
 }
 
@@ -2723,7 +2684,7 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn copy_current_chain(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
+    fn copy_packet(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
         let mut bytes = Vec::new();
         let mut next = Some(index);
         while let Some(index) = next {
@@ -2732,35 +2693,6 @@ impl BufferPoolInner {
             next = self.next_buffer(index)?;
         }
         Ok(bytes)
-    }
-
-    #[inline]
-    fn with_current_chain_io_segments<R>(
-        &self,
-        index: BufferIndex,
-        f: impl FnOnce(&[&[u8]], usize) -> CoreResult<R>,
-    ) -> CoreResult<R> {
-        let first = self.buffer(index)?;
-        let total_len = first
-            .current_len()
-            .checked_add(first.total_len_not_including_first())
-            .ok_or_else(|| CoreError::internal("buffer chain length overflow"))?;
-        let empty: &[u8] = &[];
-        let mut segments = [empty; CURRENT_CHAIN_IO_SEGMENT_CAPACITY];
-        let mut segment_count = 0usize;
-        let mut next = Some(index);
-        while let Some(index) = next {
-            if segment_count == CURRENT_CHAIN_IO_SEGMENT_CAPACITY {
-                return Err(CoreError::internal(
-                    "buffer chain exceeds single TUN writev segment capacity",
-                ));
-            }
-            let buffer = self.buffer(index)?;
-            segments[segment_count] = buffer.current();
-            segment_count += 1;
-            next = self.next_buffer(index)?;
-        }
-        f(&segments[..segment_count], total_len)
     }
 
     #[inline]
@@ -2807,7 +2739,7 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn append_existing_chain(&mut self, head: BufferIndex, tail: BufferIndex) -> CoreResult<()> {
+    fn chain_buffer(&mut self, head: BufferIndex, tail: BufferIndex) -> CoreResult<()> {
         self.ensure_header_exclusive(head)?;
         self.buffer(tail)?;
         let mut current = head;
@@ -2820,40 +2752,6 @@ impl BufferPoolInner {
             current_buffer.set_next_buffer(Some(tail));
         }
         self.refresh_chain_lengths(head)
-    }
-
-    #[inline]
-    fn truncate_chain(
-        &mut self,
-        cache: &mut BufferThreadCache,
-        index: BufferIndex,
-        len: usize,
-    ) -> CoreResult<()> {
-        let mut remaining = len;
-        let mut current = Some(index);
-        while let Some(current_index) = current {
-            self.ensure_header_exclusive(current_index)?;
-            let current_len = self.buffer(current_index)?.current_len();
-            if remaining > current_len {
-                remaining -= current_len;
-                current = self.next_buffer(current_index)?;
-                continue;
-            }
-
-            let tail = {
-                let buffer = self.buffer_mut(current_index)?;
-                buffer.set_current_len(remaining)?;
-                let tail_slot = buffer.take_next_buffer_slot();
-                buffer.set_total_len_not_including_first(0)?;
-                tail_slot
-            };
-            let tail = tail.and_then(|slot| self.index_from_slot(slot));
-            if let Some(tail) = tail {
-                self.free_chain(cache, tail);
-            }
-            return self.refresh_chain_lengths(index);
-        }
-        Err(CoreError::internal("buffer chain truncate exceeds length"))
     }
 
     #[inline]
@@ -4104,153 +4002,6 @@ impl BufferBatchMut<'_> {
     }
 }
 
-pub struct BufferRef<'pool> {
-    guard: Ref<'pool, BufferPoolInner>,
-    index: BufferIndex,
-}
-
-impl Deref for BufferRef<'_> {
-    type Target = Buffer;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        self.guard
-            .buffer(self.index)
-            .expect("buffer ref points to valid buffer")
-    }
-}
-
-impl BufferRef<'_> {
-    #[inline]
-    pub fn prefetch_header(&self) {
-        let buffer = self
-            .guard
-            .buffer(self.index)
-            .expect("buffer ref points to valid buffer");
-        prefetch_buffer_header(buffer);
-    }
-
-    #[inline]
-    pub fn prefetch_read(&self) {
-        let buffer = self
-            .guard
-            .buffer(self.index)
-            .expect("buffer ref points to valid buffer");
-        prefetch_buffer_header(buffer);
-        prefetch_buffer_cacheline1(buffer);
-        prefetch_buffer_data(buffer);
-    }
-
-    #[inline]
-    pub fn prefetch_write(&self) {
-        let buffer = self
-            .guard
-            .buffer(self.index)
-            .expect("buffer ref points to valid buffer");
-        prefetch_buffer_header_write(buffer);
-        prefetch_buffer_cacheline1_write(buffer);
-        prefetch_buffer_data_write(buffer);
-    }
-
-    #[inline]
-    pub fn buffer_ptr(&self) -> *const Buffer {
-        self.guard
-            .buffer(self.index)
-            .expect("buffer ref points to valid buffer") as *const Buffer
-    }
-
-    #[inline]
-    pub fn node_error(&self) -> Option<BufferNodeError> {
-        self.guard
-            .buffer(self.index)
-            .expect("buffer ref points to valid buffer")
-            .node_error_code()
-            .map(|code| BufferNodeError::new(crate::NodeId::new(0), code))
-    }
-
-    #[inline]
-    pub fn next_buffer(&self) -> Option<BufferIndex> {
-        self.guard
-            .next_buffer(self.index)
-            .expect("buffer ref points to valid buffer")
-    }
-}
-
-pub struct BufferRefMut<'pool> {
-    guard: RefMut<'pool, BufferPoolInner>,
-    thread_cache: RefMut<'pool, BufferThreadCache>,
-    index: BufferIndex,
-}
-
-impl Deref for BufferRefMut<'_> {
-    type Target = Buffer;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        self.guard
-            .buffer(self.index)
-            .expect("buffer ref points to valid buffer")
-    }
-}
-
-impl DerefMut for BufferRefMut<'_> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.guard
-            .ensure_header_exclusive(self.index)
-            .expect("buffer ref mut requires exclusive header ownership");
-        self.guard
-            .buffer_mut(self.index)
-            .expect("buffer ref points to valid buffer")
-    }
-}
-
-impl BufferRefMut<'_> {
-    #[inline]
-    pub fn prepend(&mut self, bytes: &[u8]) -> CoreResult<()> {
-        self.deref_mut().prepend(bytes)
-    }
-
-    #[inline]
-    pub fn attach_clone(&mut self, tail: BufferIndex) -> CoreResult<()> {
-        let _ = &self.thread_cache;
-        self.guard.attach_clone(self.index, tail)
-    }
-
-    #[inline]
-    pub fn advance(&mut self, displacement: isize) -> CoreResult<()> {
-        self.guard.advance(self.index, displacement)
-    }
-
-    #[inline]
-    pub fn truncate_chain(&mut self, len: usize) -> CoreResult<()> {
-        self.guard
-            .truncate_chain(&mut self.thread_cache, self.index, len)
-    }
-
-    #[inline]
-    pub fn append(&mut self, bytes: &[u8]) -> CoreResult<()> {
-        self.guard
-            .append_chain(&mut self.thread_cache, self.index, bytes)
-    }
-
-    #[inline]
-    pub fn node_error(&self) -> Option<BufferNodeError> {
-        self.guard
-            .buffer(self.index)
-            .expect("buffer ref points to valid buffer")
-            .node_error_code()
-            .map(|code| BufferNodeError::new(crate::NodeId::new(0), code))
-    }
-
-    #[inline]
-    pub fn next_buffer(&self) -> Option<BufferIndex> {
-        self.guard
-            .next_buffer(self.index)
-            .expect("buffer ref points to valid buffer")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::DataPlaneRuntime;
@@ -4266,11 +4017,8 @@ mod tests {
         let buffer = runtime.get_buffer(index).expect("buffer");
         assert_eq!(buffer.current_len(), 4);
         assert_eq!(buffer.total_len_not_including_first(), 5);
-        assert_eq!(runtime.copy_current_chain(index).expect("packet").len(), 9);
-        assert_eq!(
-            &runtime.copy_current_chain(index).expect("packet")[4..],
-            b"hello"
-        );
+        assert_eq!(runtime.copy_packet(index).expect("packet").len(), 9);
+        assert_eq!(&runtime.copy_packet(index).expect("packet")[4..], b"hello");
     }
 
     use super::{Buffer, BufferFlags, BufferPool, BufferPoolInner, BufferThreadCache};
@@ -4432,7 +4180,7 @@ mod tests {
         let pool = fresh_pool(32, 16);
         let payload = vec![0xABu8; 96]; // spans 3 slots of 32
         let head = pool.alloc_index_with_bytes(&payload).expect("chain alloc");
-        assert!(pool.is_chained(head).unwrap());
+        assert!(pool.next_buffer(head).unwrap().is_some());
         let copied = pool.copy_packet(head).expect("copy chain");
         assert_eq!(copied, payload);
         pool.free_index(head);

@@ -84,7 +84,7 @@ fn capture_process(
         .frame_lens
         .push(frame.pending_len());
     for index in frame.drain_pending() {
-        let packet = runtime.copy_current_chain(index)?;
+        let packet = runtime.copy_packet(index)?;
         let node_error = runtime.node_error(index)?;
         let mut state = state
             .lock()

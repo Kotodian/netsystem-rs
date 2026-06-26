@@ -10,7 +10,7 @@ use hammer_infra::map::FlatHashTable;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::rbtree::RbTree;
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
-use hammer_runtime::app::AppOpId;
+use hammer_runtime::app::{AppSessionConfig, with_current_app_worker};
 
 use crate::session::{
     SessionAppRuntime, SessionId, SessionQueueHandle, SessionQueueNext, SessionReadyQueue,
@@ -433,7 +433,7 @@ struct SessionDriverRuntimeCore<S> {
 
 struct SessionDriverRuntimeAppState {
     app: SessionAppRuntime,
-    app_ops: FlatHashTable<u64, AppOpId>,
+    app_session_config: AppSessionConfig,
 }
 
 pub(crate) struct SessionDriverRuntime<S> {
@@ -517,6 +517,15 @@ where
 impl<S> SessionDriverRuntime<S> {
     #[inline]
     pub(crate) fn new(worker: DataWorkerId, buffers: DataPlaneBuffers) -> Self {
+        Self::with_app_session_config(worker, buffers, AppSessionConfig::default())
+    }
+
+    #[inline]
+    pub(crate) fn with_app_session_config(
+        worker: DataWorkerId,
+        buffers: DataPlaneBuffers,
+        app_session_config: AppSessionConfig,
+    ) -> Self {
         let app = SessionAppRuntime::new(buffers.clone());
         Self {
             runtime: CachePadded::new(SessionDriverRuntimeCore {
@@ -529,7 +538,7 @@ impl<S> SessionDriverRuntime<S> {
             }),
             app_state: CachePadded::new(SessionDriverRuntimeAppState {
                 app,
-                app_ops: FlatHashTable::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
+                app_session_config,
             }),
         }
     }
@@ -565,7 +574,13 @@ impl<S> SessionDriverRuntime<S> {
             .entries
             .insert_with(|index| f.build(SessionId::from(index)))
             .ok_or_else(|| CoreError::internal("session pool capacity exhausted"))?;
-        Ok(SessionId::from(index))
+        let session_id = SessionId::from(index);
+        let app_session = with_current_app_worker(self.worker().slot() as usize, |worker| {
+            worker.attach_session(session_id.get() as u32, self.app_state.app_session_config)
+        })
+        .map_err(CoreError::from)?;
+        self.app_state.app.attach_session(session_id, app_session);
+        Ok(session_id)
     }
 
     #[inline]
@@ -594,9 +609,9 @@ impl<S> SessionDriverRuntime<S> {
     pub(crate) fn remove_session(&mut self, id: SessionId) -> Option<S> {
         self.runtime.pending_closes.take(id);
         self.app_state.app.free_pending_send(id);
+        let _ = self.app_state.app.detach_session(id);
         self.release_session_rx(id);
         let removed = self.runtime.entries.remove(id.pool_index())?;
-        let _ = self.app_state.app_ops.remove(&id.get());
         Some(removed)
     }
 
@@ -604,15 +619,8 @@ impl<S> SessionDriverRuntime<S> {
         if self.session(id).is_none() {
             return Ok(None);
         }
-        if let Some(op) = self.app_state.app_ops.lookup(&id.get()) {
-            self.app_state.app.complete_closed(op)?;
-        }
+        self.app_state.app.closed(id)?;
         Ok(self.remove_session(id))
-    }
-
-    #[inline]
-    pub(crate) fn session_app_op(&self, id: SessionId) -> Option<AppOpId> {
-        self.app_state.app_ops.lookup(&id.get())
     }
 
     #[inline]
@@ -669,21 +677,15 @@ impl<S> SessionDriverRuntime<S> {
     }
 
     pub(crate) fn poll_app(&mut self) -> CoreResult<()> {
-        self.app_state.app.drain_submissions()?;
-        let mut ready_tx = hammer_infra::vec::Vec::new();
-        self.app_state.app.take_ready_tx_sessions(&mut ready_tx);
+        self.app_state.app.poll_tx_fifo_ready()?;
+        let ready_tx = self.app_state.app.take_ready_tx_sessions();
         for session_id in ready_tx {
             self.mark_ready(session_id);
         }
-        let mut ready = hammer_infra::vec::Vec::new();
-        self.app_state.app.take_ready_sessions(&mut ready);
+        let ready = self.app_state.app.take_ready_sessions();
         for session_id in ready {
             self.flush_session_rx(session_id)?;
             self.mark_ready(session_id);
-        }
-        for close in self.app_state.app.take_drained_closes() {
-            self.runtime.pending_closes.mark_ready(close.session_id());
-            self.mark_ready(close.session_id());
         }
         Ok(())
     }
@@ -715,10 +717,12 @@ impl<S> SessionDriverRuntime<S> {
                 index
             }
         };
-        let len = buffers
-            .current_len(index)?
-            .checked_add(buffers.total_len_not_including_first(index)?)
+        let buffer = buffers.get_buffer(index)?;
+        let len = buffer
+            .current_len()
+            .checked_add(buffer.total_len_not_including_first())
             .ok_or_else(|| CoreError::internal("session rx chain length overflow"))?;
+        drop(buffer);
         let len = u32::try_from(len)
             .map_err(|_| CoreError::internal("session rx buffer length exceeds u32"))?;
         let entry = SessionRxBuffer {
@@ -742,9 +746,6 @@ impl<S> SessionDriverRuntime<S> {
         let Some(index) = self.runtime.rx_index.lookup(&key) else {
             return Ok(());
         };
-        let Some(op) = self.app_state.app_ops.lookup(&key) else {
-            return Ok(());
-        };
         let buffers = self.runtime.buffers.clone();
         loop {
             let current = {
@@ -761,12 +762,10 @@ impl<S> SessionDriverRuntime<S> {
             if current.offset != 0 {
                 break;
             }
-            let consumed = self.app_state.app.complete_recv(
-                op,
-                buffers.clone(),
-                current.index,
-                current.fin,
-            )?;
+            let consumed =
+                self.app_state
+                    .app
+                    .enqueue_rx(session_id, buffers.clone(), current.index)?;
             if !consumed {
                 break;
             }
@@ -854,7 +853,7 @@ unsafe fn session_queue_context<S>(
     session_id: SessionId,
 ) -> crate::session::protocol::SessionQueueControlContext {
     let driver = unsafe { &mut *driver };
-    let has_pending_send = driver.app_state.app.pending_send_head(session_id).is_some();
+    let has_pending_send = driver.app_state.app.has_pending_send(session_id);
     crate::session::protocol::SessionQueueControlContext::new(
         &mut driver.runtime.sessions.timers as *mut _,
         &mut driver.runtime.sessions.ready as *mut _,
@@ -926,21 +925,10 @@ where
                 continue;
             }
         }
-        #[allow(clippy::never_loop)]
         loop {
-            let Some(tx_head) = driver.app_state.app.pending_send_head(session_id) else {
+            let Some(total_len) = driver.app_state.app.pending_send_len(session_id)? else {
                 break;
             };
-            let total_len = driver
-                .buffers()
-                .current_len(tx_head)?
-                .checked_add(
-                    driver
-                        .runtime
-                        .buffers
-                        .total_len_not_including_first(tx_head)?,
-                )
-                .ok_or_else(|| CoreError::internal("session tx chain length overflow"))?;
             let tx_offset = {
                 let driver = driver as *mut SessionDriverRuntime<S>;
                 unsafe {
@@ -977,43 +965,12 @@ where
             }
 
             let index = driver.runtime.buffers.alloc_index()?;
-            let append_result = (|| {
-                let mut skip = tx_offset;
-                let mut remaining = payload_len;
-                let mut current = Some(tx_head);
-                while remaining != 0 {
-                    let current_index = current
-                        .ok_or_else(|| CoreError::internal("session tx chain ended early"))?;
-                    let (segment_len, copy_ptr, copy_len, next) = {
-                        let buffer = driver.runtime.buffers.get_buffer(current_index)?;
-                        let segment_len = buffer.current_len();
-                        if skip >= segment_len {
-                            (segment_len, std::ptr::null(), 0, buffer.next_buffer())
-                        } else {
-                            let take = remaining.min(segment_len - skip);
-                            (
-                                segment_len,
-                                unsafe { buffer.current_ptr().add(skip) },
-                                take,
-                                buffer.next_buffer(),
-                            )
-                        }
-                    };
-                    if copy_len != 0 {
-                        // SAFETY: source bytes remain valid for the duration of this
-                        // copy because session TX ownership stays in the source chain.
-                        let bytes = unsafe { std::slice::from_raw_parts(copy_ptr, copy_len) };
-                        driver.runtime.buffers.append(index, bytes)?;
-                        remaining -= copy_len;
-                        skip = 0;
-                    } else {
-                        skip -= segment_len;
-                    }
-                    current = next;
-                }
-                Ok(())
-            })();
-            if let Err(error) = append_result {
+            if let Err(error) =
+                driver
+                    .app_state
+                    .app
+                    .copy_tx_to_buffer(session_id, tx_offset, payload_len, index)
+            {
                 driver.runtime.buffers.free_index(index);
                 return Err(error);
             }
@@ -1314,7 +1271,7 @@ mod tests {
         };
         let mut state = state.lock().expect("capture state");
         for index in frame.drain_pending() {
-            let packet = runtime.copy_current_chain(index)?;
+            let packet = runtime.copy_packet(index)?;
             state.packets.push(packet.to_vec());
             runtime.free_index(index);
         }
@@ -1628,7 +1585,7 @@ mod tests {
         assert_eq!(overlap_entry.len, 4);
         assert_eq!(
             buffers
-                .copy_current_chain(overlap_entry.index)
+                .copy_packet(overlap_entry.index)
                 .expect("trimmed overlap payload"),
             b"ghij"
         );
@@ -1681,7 +1638,7 @@ mod tests {
         assert_eq!(successor_entry.len, 2);
         assert_eq!(
             buffers
-                .copy_current_chain(successor_entry.index)
+                .copy_packet(successor_entry.index)
                 .expect("trimmed successor payload"),
             b"ij"
         );

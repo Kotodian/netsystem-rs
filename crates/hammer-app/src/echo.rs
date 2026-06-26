@@ -1,13 +1,27 @@
-use hammer_core::error::{HammerError, HammerResult};
+use hammer_core::error::HammerResult;
 
-use crate::AppOp;
+use crate::AppSession;
 
-const NOT_WIRED: &str = "vpp app boundary not wired (C2)";
-
-pub async fn echo_once(_op: &AppOp) -> HammerResult<()> {
-    Err(HammerError::internal(NOT_WIRED))
+pub fn echo_once(session: &AppSession, scratch: &mut [u8]) -> HammerResult<usize> {
+    let read = session.recv_bytes(scratch);
+    if read == 0 {
+        return Ok(0);
+    }
+    Ok(session.send_bytes(&scratch[..read]))
 }
 
-pub async fn run_echo_loop(_op: &AppOp, _iterations: usize) -> HammerResult<()> {
-    Err(HammerError::internal(NOT_WIRED))
+pub fn run_echo_loop(
+    session: &AppSession,
+    scratch: &mut [u8],
+    iterations: usize,
+) -> HammerResult<usize> {
+    let mut total = 0;
+    for _ in 0..iterations {
+        let wrote = echo_once(session, scratch)?;
+        if wrote == 0 {
+            break;
+        }
+        total += wrote;
+    }
+    Ok(total)
 }

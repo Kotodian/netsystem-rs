@@ -367,16 +367,19 @@ impl RuntimeService {
         let worker = &config.worker;
         let data_runtime = DataRuntime::from_config(worker, "hammer-data")?;
         let data_context = data_runtime.context();
-        let app_context =
-            AppContext::with_ring_capacity(data_context.clone(), worker.app_ring.capacity);
+        let app_context = AppContext::new(
+            data_context.clone(),
+            hammer_runtime::app::AppSessionConfig::new(
+                worker.app_session.fifo_capacity,
+                worker.app_session.evt_q_capacity,
+            ),
+        );
         let registry = RuntimeRegistry::new();
         registry.set::<config::Config>(Arc::new(config.clone()));
         packet_graph::init_control_planes(&registry)?;
         let listener_state = RuntimeTcpListenerControlState::new()?;
         let handoff_node_handle = NodeHandle::new(worker.handoff.node_handle);
-        let worker_app_context = app_context.clone();
         let worker_graph_nodes = data_context.install_on_workers(move |worker, runtime| {
-            hammer_runtime::app::set_current_app_context(worker_app_context.clone());
             let runtime = runtime
                 .clone()
                 .with_handoff_node_handle(handoff_node_handle);

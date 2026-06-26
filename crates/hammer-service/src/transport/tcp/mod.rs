@@ -649,7 +649,6 @@ mod tests {
     use hammer_core::protocol::tcp::{
         TcpCapabilities, TcpConnectionId, TcpPacket, TcpSackBlock, TcpSegmentFlags, TcpSeq,
     };
-    use hammer_runtime::app::AppOpId;
 
     use super::*;
     use crate::session::SessionId;
@@ -724,7 +723,7 @@ mod tests {
         };
         let mut state = state.lock().expect("capture state");
         for index in frame.drain_pending() {
-            let packet = runtime.copy_current_chain(index)?;
+            let packet = runtime.copy_packet(index)?;
             state.packets.push(packet.to_vec());
             runtime.free_index(index);
         }
@@ -843,7 +842,7 @@ mod tests {
                 .advance(packet.payload_offset as isize)
                 .expect("advance payload");
             buffer
-                .truncate_chain(packet.payload_len)
+                .truncate(packet.payload_len)
                 .expect("truncate payload");
         }
         let enqueue = driver

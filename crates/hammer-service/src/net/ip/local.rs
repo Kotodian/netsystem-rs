@@ -697,7 +697,7 @@ fn packet_bytes(runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<Ve
     let buffer = runtime.get_buffer(index)?;
     let packet_len = buffer.current_len() + buffer.total_len_not_including_first();
     drop(buffer);
-    let mut packet = runtime.copy_current_chain(index)?;
+    let mut packet = runtime.copy_packet(index)?;
     if packet.len() > packet_len {
         packet.truncate(packet_len);
     }

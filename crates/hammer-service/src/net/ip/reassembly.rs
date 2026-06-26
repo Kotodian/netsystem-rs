@@ -906,15 +906,12 @@ impl ReassemblyContext {
         for fragment in fragments.iter().copied() {
             if fragment.index == complete {
                 let mut buffer = runtime.get_buffer_mut(complete)?;
-                buffer.truncate_chain(fragment.header_len + (fragment.end - fragment.start))?;
+                buffer.truncate(fragment.header_len + (fragment.end - fragment.start))?;
             } else {
                 trim_fragment_payload_chain(runtime, fragment)?;
-                runtime.append_existing_chain(complete, fragment.index)?;
+                runtime.buffers().chain_buffer(complete, fragment.index)?;
             }
         }
-        runtime
-            .get_buffer_mut(complete)?
-            .truncate_chain(total_len)?;
         {
             let mut buffer = runtime.get_buffer_mut(complete)?;
             let header = buffer.current();
@@ -975,18 +972,12 @@ impl ReassemblyContext {
                 drop(buffer);
                 runtime
                     .get_buffer_mut(complete)?
-                    .truncate_chain(IPV6_HEADER_LEN + (fragment.end - fragment.start))?;
+                    .truncate(IPV6_HEADER_LEN + (fragment.end - fragment.start))?;
             } else {
                 trim_fragment_payload_chain(runtime, fragment)?;
-                runtime.append_existing_chain(complete, fragment.index)?;
+                runtime.buffers().chain_buffer(complete, fragment.index)?;
             }
         }
-        let total_len = IPV6_HEADER_LEN
-            .checked_add(payload_len)
-            .ok_or_else(|| CoreError::internal("IPv6 reassembled length overflow"))?;
-        runtime
-            .get_buffer_mut(complete)?
-            .truncate_chain(total_len)?;
         Ok(ReassemblyInsert::Reassembled(complete))
     }
 
@@ -1051,7 +1042,7 @@ fn trim_fragment_payload_chain(
     let payload_len = fragment.end - fragment.start;
     let mut buffer = runtime.get_buffer_mut(fragment.index)?;
     buffer.advance(fragment.header_len as isize)?;
-    buffer.truncate_chain(payload_len)
+    buffer.truncate(payload_len)
 }
 
 #[inline(always)]

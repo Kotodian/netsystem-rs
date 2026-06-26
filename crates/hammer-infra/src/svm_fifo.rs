@@ -38,6 +38,7 @@ pub struct SvmFifo {
     // otherwise share a line with the `Slice` {ptr,len,cap} both sides load
     // on every enqueue/peek.
     want_notification: CachePadded<AtomicBool>,
+    want_deq_notification: CachePadded<AtomicBool>,
     data: Slice<u8>,
 }
 
@@ -53,6 +54,7 @@ impl SvmFifo {
             head: CachePadded::new(AtomicU32::new(0)),
             tail: CachePadded::new(AtomicU32::new(0)),
             want_notification: CachePadded::new(AtomicBool::new(false)),
+            want_deq_notification: CachePadded::new(AtomicBool::new(false)),
             data: Slice::from_elem(capacity as usize, 0u8),
         })
     }
@@ -167,6 +169,37 @@ impl SvmFifo {
     }
 
     #[inline]
+    pub fn peek_slices<R>(
+        &self,
+        offset: usize,
+        len: usize,
+        f: impl FnOnce(&[u8], &[u8]) -> R,
+    ) -> Option<R> {
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire);
+        let available = tail.wrapping_sub(head) as usize;
+        if offset >= available {
+            return None;
+        }
+
+        let to_read = len.min(available - offset);
+        if to_read == 0 {
+            return Some(f(&[], &[]));
+        }
+
+        let cap = self.capacity as usize;
+        let read_pos = head.wrapping_add(offset as u32);
+        let read_idx = (read_pos & self.mask) as usize;
+        let first_len = (cap - read_idx).min(to_read);
+        let second_len = to_read - first_len;
+        let data = self.data.as_slice();
+        Some(f(
+            &data[read_idx..read_idx + first_len],
+            &data[..second_len],
+        ))
+    }
+
+    #[inline]
     pub fn dequeue_drop(&self, len: usize) -> usize {
         let head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Acquire);
@@ -188,6 +221,16 @@ impl SvmFifo {
     #[inline]
     pub fn clear_notification(&self) {
         self.want_notification.store(false, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn want_deq_notification(&self) {
+        self.want_deq_notification.store(true, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn clear_deq_notification(&self) {
+        self.want_deq_notification.store(false, Ordering::Release);
     }
 
     #[inline]
@@ -220,10 +263,21 @@ impl SvmFifo {
         }
     }
 
+    #[inline]
+    pub fn needs_deq_notification(&self, dropped: usize) -> bool {
+        if dropped == 0 {
+            return false;
+        }
+        self.want_deq_notification
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
     pub fn clear(&self) {
         self.head.store(0, Ordering::Relaxed);
         self.tail.store(0, Ordering::Relaxed);
         self.want_notification.store(false, Ordering::Relaxed);
+        self.want_deq_notification.store(false, Ordering::Relaxed);
     }
 }
 
@@ -292,6 +346,21 @@ mod tests {
 
         fifo.want_notification();
         assert!(!fifo.should_signal(fifo.enqueue(&[3])));
+    }
+
+    #[test]
+    fn needs_deq_notification_when_requested() {
+        let fifo = SvmFifo::with_capacity(8).unwrap();
+        assert_eq!(fifo.enqueue(&[1, 2, 3, 4]), 4);
+        assert!(!fifo.needs_deq_notification(fifo.dequeue_drop(1)));
+
+        fifo.want_deq_notification();
+        assert!(fifo.needs_deq_notification(fifo.dequeue_drop(1)));
+        assert!(!fifo.needs_deq_notification(fifo.dequeue_drop(1)));
+
+        fifo.want_deq_notification();
+        assert!(!fifo.needs_deq_notification(0));
+        assert!(fifo.needs_deq_notification(fifo.dequeue_drop(1)));
     }
 
     #[test]

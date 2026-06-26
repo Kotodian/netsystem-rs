@@ -615,7 +615,7 @@ impl<T: Copy> LockFreeRing<T> {
     /// mask`. ABA is bounded by u32 space (capacity - 1): a producer that
     /// stalled through `u32::MAX` wraps would observe a stale `head` and CAS
     /// loop until it reloads the current value. With batch sizes and producer
-    /// counts in the app-ring regime this wrap is effectively unreachable;
+    /// counts in the expected shared-queue regime this wrap is effectively unreachable;
     /// callers must not enqueue more than `u32::MAX` items over the lifetime of
     /// a single ring without a wrap-aware cursor (documented assumption).
     #[inline]

@@ -275,22 +275,6 @@ impl TcpSegment {
         Ok(segment)
     }
 
-    #[cfg(test)]
-    pub(crate) fn read_from_buffer_ref(
-        buffer: &hammer_adapter::BufferRef<'_>,
-    ) -> Result<Self, TcpError> {
-        let mut segment: Self = buffer
-            .opaque()
-            .read::<TcpSegmentHeaderOpaque>()
-            .try_into()?;
-        segment.apply_secondary_opaque(buffer.opaque2().read::<TcpSegmentSackOpaque>());
-        segment.ip_ecn = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) }
-            .ip()
-            .ip_ecn()
-            .map(Into::into);
-        Ok(segment)
-    }
-
     #[inline]
     fn primary_opaque(&self) -> TcpSegmentHeaderOpaque {
         let mut capabilities = 0u8;
@@ -614,9 +598,8 @@ mod tests {
         segment
             .write_to_buffer(runtime.packet_buffers(), index)
             .expect("write segment");
-        let restored =
-            TcpSegment::read_from_buffer_ref(&runtime.get_buffer(index).expect("buffer"))
-                .expect("read segment");
+        let restored = TcpSegment::read_from_buffer(&runtime.get_buffer(index).expect("buffer"))
+            .expect("read segment");
 
         let mut header = [0u8; 64];
         let written = restored.write_header(&mut header).expect("write header");
@@ -651,9 +634,8 @@ mod tests {
         segment
             .write_to_buffer(runtime.packet_buffers(), index)
             .expect("write segment");
-        let restored =
-            TcpSegment::read_from_buffer_ref(&runtime.get_buffer(index).expect("buffer"))
-                .expect("read segment");
+        let restored = TcpSegment::read_from_buffer(&runtime.get_buffer(index).expect("buffer"))
+            .expect("read segment");
 
         let mut header = [0u8; 64];
         let written = restored.write_header(&mut header).expect("write header");

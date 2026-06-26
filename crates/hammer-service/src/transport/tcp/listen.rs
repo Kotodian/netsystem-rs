@@ -271,15 +271,6 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::{Arc, Mutex, OnceLock};
 
-    use hammer_adapter::{
-        BufferFrame, DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeId, NodeProcessFn,
-        NodeRegistration, NodeResult, NodeRuntimeData,
-    };
-    use hammer_core::error::{CoreError, CoreResult};
-    use hammer_core::protocol::tcp::{TcpCapabilities, TcpFastOpenCookie};
-    use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
-    use hammer_runtime::app::AppOpId;
-
     use super::*;
     use crate::data_plane::DropNode;
     use crate::transport::congestion::BbrController;
@@ -293,6 +284,13 @@ mod tests {
         TCP_FLAG_ACK, TCP_FLAG_SYN, TcpEstablishedNext, TcpEstablishedNode, TcpInputNext,
         TcpSessionDriver,
     };
+    use hammer_adapter::{
+        BufferFrame, DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeId, NodeProcessFn,
+        NodeRegistration, NodeResult, NodeRuntimeData,
+    };
+    use hammer_core::error::{CoreError, CoreResult};
+    use hammer_core::protocol::tcp::{TcpCapabilities, TcpFastOpenCookie};
+    use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 
     const LOCAL_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
     const REMOTE_IP: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 20);
@@ -371,7 +369,7 @@ mod tests {
         };
         let mut state = state.lock().expect("capture state");
         for index in frame.drain_pending() {
-            let packet = runtime.copy_current_chain(index)?;
+            let packet = runtime.copy_packet(index)?;
             state.packets.push(packet.to_vec());
             runtime.free_index(index);
         }
@@ -1081,13 +1079,11 @@ where
             )?
         };
         publish_tcp_connection(queue, session_id)?;
-        if let Some(op) = queue.session_app_op(session_id) {
-            queue.app().complete_connected(op)?;
-        }
+        queue.app().connected(session_id)?;
         {
             let mut buffer = runtime.packet_buffers().get_buffer_mut(index)?;
             buffer.advance(packet.payload_offset as isize)?;
-            buffer.truncate_chain(packet.payload_len)?;
+            buffer.truncate(packet.payload_len)?;
         }
         let enqueue = queue.enqueue_rx(session_id, index, 0, false)?;
         if enqueue.delivered_len != 0 {

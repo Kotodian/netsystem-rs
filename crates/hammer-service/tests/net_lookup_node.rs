@@ -142,7 +142,7 @@ fn sink_process(
         .frame_lens
         .push(frame.pending_len());
     for buffer in frame.drain_pending() {
-        let payload = runtime.copy_current_chain(buffer)?;
+        let payload = runtime.copy_packet(buffer)?;
         let (egress_interface, forwarding) = {
             let buffer_ref = runtime.get_buffer(buffer)?;
             let network = unsafe { transmute::<_, &NetworkOpaque>(buffer_ref.opaque()) };
@@ -1054,8 +1054,7 @@ fn alloc_packet_with_headroom(
     packet: &[u8],
 ) -> hammer_adapter::BufferIndex {
     let index = runtime.alloc_index().expect("alloc packet with headroom");
-    let mut buffer = runtime.get_buffer_mut(index).expect("buffer");
-    buffer.append(packet).expect("append packet bytes");
+    runtime.append(index, packet).expect("append packet bytes");
     index
 }
 

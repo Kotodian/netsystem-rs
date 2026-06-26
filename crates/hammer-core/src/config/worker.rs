@@ -1,7 +1,7 @@
 //! `[worker]` config section: dataplane worker thread model + CPU/scheduler/NUMA.
 //!
 //! Main thread does not run packets. Worker threads run the packet graph.
-//! The `app` runtime (app session / app ring) runs on its own core, distinct
+//! The `app` runtime (app session FIFO/message queue) runs on its own core, distinct
 //! from both the main (control) core and the worker (dataplane) cores — the
 //! three are independent, mirroring VPP's separation of main-core, worker
 //! cores, and any control/app work that must not contend with packet processing.
@@ -35,8 +35,9 @@ const BUFFER_FRAME_CAPACITY: usize = 256;
 const BUFFER_FRAME_POOL_SIZE: usize = 64;
 // hammer-adapter/src/handoff.rs (DataPlaneHandoff::new(workers, cap))
 const HANDOFF_QUEUE_CAPACITY: usize = 1_024;
-// hammer-service/src/service.rs AppContext::with_ring_capacity(.., 256)
-const APP_RING_CAPACITY: usize = 256;
+// hammer-runtime/src/app/session.rs AppSessionConfig::DEFAULT
+const APP_SESSION_FIFO_CAPACITY: usize = 64 * 1024;
+const APP_SESSION_EVENT_QUEUE_CAPACITY: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
@@ -47,12 +48,14 @@ pub struct Worker {
     pub stack_size: usize,
     /// Tokio blocking thread pool cap for the worker runtime.
     pub max_blocking_threads: usize,
-    /// Idle poll slice: how long a worker parks when no packets are pending.
-    #[serde(with = "humantime_serde")]
+    /// VPP-style poll interval: how long a worker parks when no packets are
+    /// pending. `idle_slice` is kept as the serialized field for existing
+    /// configs; `poll_interval` is accepted as an input alias.
+    #[serde(with = "humantime_serde", alias = "poll_interval")]
     pub idle_slice: Duration,
     pub buffer: WorkerBuffer,
     pub handoff: WorkerHandoff,
-    pub app_ring: WorkerAppRing,
+    pub app_session: WorkerAppSession,
     /// CPU pinning. Linux only; absent on macOS/iOS (XNU has no thread
     /// affinity). The three cores are independent: `main_core` runs the
     /// control thread, `app_core` runs the app session/ring runtime, and
@@ -76,7 +79,7 @@ impl Default for Worker {
             idle_slice: WORKER_IDLE_SLICE,
             buffer: WorkerBuffer::default(),
             handoff: WorkerHandoff::default(),
-            app_ring: WorkerAppRing::default(),
+            app_session: WorkerAppSession::default(),
             #[cfg(target_os = "linux")]
             cpu: WorkerCpu::default(),
             scheduler: WorkerScheduler::default(),
@@ -104,7 +107,7 @@ impl Worker {
         }
         self.buffer.validate()?;
         self.handoff.validate()?;
-        self.app_ring.validate()?;
+        self.app_session.validate()?;
         #[cfg(target_os = "linux")]
         {
             self.cpu.validate(self.count)?;
@@ -197,24 +200,32 @@ impl WorkerHandoff {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
-pub struct WorkerAppRing {
-    /// App ring capacity (`AppContext::with_ring_capacity(.., cap)`).
-    pub capacity: usize,
+pub struct WorkerAppSession {
+    /// Per-session RX/TX FIFO capacity.
+    pub fifo_capacity: usize,
+    /// Usable event queue entries per session.
+    pub evt_q_capacity: usize,
 }
 
-impl Default for WorkerAppRing {
+impl Default for WorkerAppSession {
     fn default() -> Self {
         Self {
-            capacity: APP_RING_CAPACITY,
+            fifo_capacity: APP_SESSION_FIFO_CAPACITY,
+            evt_q_capacity: APP_SESSION_EVENT_QUEUE_CAPACITY,
         }
     }
 }
 
-impl WorkerAppRing {
+impl WorkerAppSession {
     fn validate(&self) -> HammerResult<()> {
-        if self.capacity == 0 {
+        if self.fifo_capacity == 0 {
             return Err(HammerError::config_validation(
-                "worker.app_ring.capacity must be non-zero",
+                "worker.app_session.fifo_capacity must be non-zero",
+            ));
+        }
+        if self.evt_q_capacity == 0 {
+            return Err(HammerError::config_validation(
+                "worker.app_session.evt_q_capacity must be non-zero",
             ));
         }
         Ok(())
@@ -223,14 +234,14 @@ impl WorkerAppRing {
 
 /// CPU pinning (Linux only). The three core slots are independent:
 /// `main_core` runs the control thread (no packets), `app_core` runs the app
-/// session/ring runtime, and `worker_cores` run the dataplane packet graph.
+/// session FIFO/message queue runtime, and `worker_cores` run the dataplane packet graph.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct WorkerCpu {
     /// Core for the control (main) thread. Does not run packets.
     pub main_core: Option<usize>,
-    /// Core for the app session/ring runtime. Independent of worker cores.
+    /// Core for the app session FIFO/message queue runtime. Independent of worker cores.
     pub app_core: Option<usize>,
     /// Cores for dataplane worker threads. When empty, the runtime pins
     /// workers automatically (skipping main/app cores). When set, its length
@@ -402,7 +413,11 @@ mod tests {
         assert_eq!(worker.buffer.frame_capacity, BUFFER_FRAME_CAPACITY);
         assert_eq!(worker.buffer.frame_pool_size, BUFFER_FRAME_POOL_SIZE);
         assert_eq!(worker.handoff.queue_capacity, HANDOFF_QUEUE_CAPACITY);
-        assert_eq!(worker.app_ring.capacity, APP_RING_CAPACITY);
+        assert_eq!(worker.app_session.fifo_capacity, APP_SESSION_FIFO_CAPACITY);
+        assert_eq!(
+            worker.app_session.evt_q_capacity,
+            APP_SESSION_EVENT_QUEUE_CAPACITY
+        );
     }
 
     #[test]
@@ -410,6 +425,18 @@ mod tests {
         let worker: Worker = toml::from_str("count = 4\n").expect("parse");
         assert_eq!(worker.count, 4);
         assert_eq!(worker.stack_size, WORKER_STACK_SIZE);
+    }
+
+    #[test]
+    fn parse_worker_idle_slice() {
+        let worker: Worker = toml::from_str(r#"idle_slice = "25ms""#).expect("parse");
+        assert_eq!(worker.idle_slice, Duration::from_millis(25));
+    }
+
+    #[test]
+    fn parse_worker_poll_interval_alias() {
+        let worker: Worker = toml::from_str(r#"poll_interval = "25ms""#).expect("parse");
+        assert_eq!(worker.idle_slice, Duration::from_millis(25));
     }
 
     #[test]

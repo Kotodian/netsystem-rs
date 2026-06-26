@@ -108,7 +108,6 @@ where
     let packet = parse_tcp_packet(runtime, index)?;
     let mut release_input = true;
     let mut tx_index = None;
-    let mut complete_connected = None;
     let result = {
         let mut queue = session_queue.borrow_mut()?;
         let session_id =
@@ -133,9 +132,6 @@ where
                     && packet.payload_len != 0,
             )
         };
-        if established {
-            complete_connected = queue.session_app_op(session_id);
-        }
         if acked_tx_len != 0 {
             queue.release_tx_up_to(session_id, acked_tx_len as usize)?;
         }
@@ -151,7 +147,7 @@ where
             {
                 let mut buffer = runtime.packet_buffers().get_buffer_mut(index)?;
                 buffer.advance(packet.payload_offset as isize)?;
-                buffer.truncate_chain(packet.payload_len)?;
+                buffer.truncate(packet.payload_len)?;
             }
             let enqueue = queue.enqueue_rx(session_id, index, 0, false)?;
             if enqueue.delivered_len != 0 {
@@ -160,8 +156,8 @@ where
             release_input = false;
         };
         publish_tcp_connection(&mut queue, session_id)?;
-        if let Some(op) = complete_connected.take() {
-            queue.app().complete_connected(op)?;
+        if established {
+            queue.app().connected(session_id)?;
         }
         if let Some(segment) = control {
             let allocated = runtime.packet_buffers().alloc_index()?;
@@ -196,10 +192,6 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::{Arc, Mutex, OnceLock};
 
-    use hammer_adapter::{BufferPacketCursor, DataWorkerId, InternalNode, NodeId};
-    use hammer_core::error::CoreError;
-    use hammer_runtime::app::AppOpId;
-
     use crate::data_plane::DropNode;
     use crate::transport::congestion::BbrController;
     use crate::transport::tcp::input::TcpInputControlPlane;
@@ -209,6 +201,8 @@ mod tests {
         TcpInputNext, TcpQueue, TcpSessionDriver, TcpWorkerOwnedState, connect_tcp_session,
         set_tcp_worker_state,
     };
+    use hammer_adapter::{BufferPacketCursor, DataWorkerId, InternalNode, NodeId};
+    use hammer_core::error::CoreError;
 
     use super::*;
 
@@ -284,7 +278,7 @@ mod tests {
             )
         };
         for index in frame.drain_pending() {
-            let packet = runtime.copy_current_chain(index)?;
+            let packet = runtime.copy_packet(index)?;
             state
                 .lock()
                 .map_err(|_| CoreError::internal("capture poisoned"))?

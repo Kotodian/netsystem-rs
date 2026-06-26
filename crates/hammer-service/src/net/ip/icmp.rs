@@ -860,7 +860,7 @@ fn next_node_for_index(
     index: BufferIndex,
     snapshot: &IcmpInputSnapshot,
 ) -> CoreResult<NodeId> {
-    let packet = runtime.copy_current_chain(index)?;
+    let packet = runtime.copy_packet(index)?;
     let packet = packet.as_ref();
     let parsed = match parse_ip_packet_with_chain_len(packet, 0) {
         Ok(parsed) => parsed,
@@ -1032,7 +1032,7 @@ fn next_node_for_echo_request_index(
     index: BufferIndex,
     next: [NodeId; IcmpEchoRequestNext::COUNT],
 ) -> CoreResult<NodeId> {
-    let packet = runtime.copy_current_chain(index)?;
+    let packet = runtime.copy_packet(index)?;
     match build_echo_reply(packet.as_ref()) {
         Ok(generated) => {
             let generated_len = generated.packet.len();
@@ -1135,7 +1135,7 @@ fn next_node_for_icmp_error_index(
         )?;
         return Ok(resolved);
     };
-    let original = runtime.copy_current_chain(index)?;
+    let original = runtime.copy_packet(index)?;
     match build_icmp_error_packet(original.as_ref(), metadata, local_source) {
         Ok(generated) => {
             let generated_len = generated.packet.len();
@@ -1183,9 +1183,8 @@ fn replace_current_chain(
     index: BufferIndex,
     packet: &[u8],
 ) -> CoreResult<()> {
-    let mut buffer = runtime.get_buffer_mut(index)?;
-    buffer.truncate_chain(0)?;
-    buffer.append(packet)
+    runtime.truncate_current(index, 0)?;
+    runtime.append(index, packet)
 }
 
 #[inline(always)]

@@ -119,11 +119,11 @@ fn tcp_reset_next_for_index(
     drop_next: NodeId,
     lookup_next: NodeId,
 ) -> CoreResult<NodeId> {
-    let packet = runtime.copy_current_chain(index)?;
+    let packet = runtime.copy_packet(index)?;
     let cursor = tcp_reset_packet_cursor(runtime.get_buffer(index)?.packet_cursor());
     let reply_len = {
         let mut buffer = runtime.get_buffer_mut(index)?;
-        buffer.truncate_chain(0)?;
+        buffer.truncate(0)?;
         let writable = buffer.writable_tail_mut();
         let Some(reply_len) = tcp_reset_reply_from_current_packet(writable, &packet, cursor) else {
             return Ok(drop_next);
@@ -250,20 +250,14 @@ mod tests {
         );
         assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
 
-        let packet = runtime.copy_current_chain(index).expect("rewritten packet");
+        let packet = runtime.copy_packet(index).expect("rewritten packet");
         let cursor = runtime.get_buffer(index).expect("buffer").packet_cursor();
         let reply_tcp = etherparse::TcpSlice::from_slice(&packet[20..]).expect("parse reply");
         assert_eq!(cursor.packet_len(), packet.len());
         assert_eq!(cursor.network_header_offset(), 0);
         assert_eq!(cursor.transport_header_offset(), 20);
         assert_eq!(cursor.transport_payload_offset(), 40);
-        assert!(
-            runtime
-                .get_buffer(index)
-                .expect("buffer")
-                .node_error()
-                .is_none()
-        );
+        assert!(runtime.node_error(index).expect("node error").is_none());
         assert!(reply_tcp.rst());
         assert_eq!(reply_tcp.sequence_number(), 9_000);
     }
