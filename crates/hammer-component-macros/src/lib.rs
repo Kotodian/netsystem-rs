@@ -1217,16 +1217,15 @@ fn node_role_from_item(item: &Item) -> Option<NodeRole> {
 
 fn effective_register_kind(args: &GraphNodeArgs, item: &Item) -> GraphRegisterKind {
     match args.register {
-        GraphRegisterKind::Handoff => GraphRegisterKind::Handoff,
-        GraphRegisterKind::Driver => GraphRegisterKind::Driver,
-        GraphRegisterKind::TcpInput => GraphRegisterKind::TcpInput,
-        GraphRegisterKind::IpLookup => GraphRegisterKind::IpLookup,
+        // Only the default `Internal` needs inference from the `#[node]` role;
+        // any explicit `register = ...` is used as-is.
         GraphRegisterKind::Internal => node_role_from_item(item)
             .map(|role| match role {
                 NodeRole::Internal => GraphRegisterKind::Internal,
                 NodeRole::Driver => GraphRegisterKind::Driver,
             })
             .unwrap_or(GraphRegisterKind::Internal),
+        other => other,
     }
 }
 
