@@ -5,7 +5,8 @@ mod ring;
 
 pub use context::{
     AppContext, AppRecvFuture, AppRuntime, AppTaskContext, AppWorkerContext,
-    AppWorkerLocalExecutor, current_app_context, set_current_app_context,
+    AppWorkerLocalExecutor, clear_current_app_context, current_app_context,
+    set_current_app_context,
 };
 pub use data::{AppDataAddr, AppDataArea, AppDataAreaConfig};
 pub use layout::{AppRingExport, AppRingIpcReservation, AppRingLayout, AppRingMemoryKind};

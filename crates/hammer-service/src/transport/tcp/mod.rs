@@ -844,6 +844,15 @@ mod tests {
                 .expect("data runtime");
         let app_context = AppContext::with_ring_capacity(data_runtime.context(), 8);
         hammer_runtime::app::set_current_app_context(app_context.clone());
+        struct AppContextGuard;
+        impl Drop for AppContextGuard {
+            fn drop(&mut self) {
+                hammer_runtime::app::clear_current_app_context();
+            }
+        }
+        let app_context_guard = AppContextGuard;
+        let _ = &app_context_guard;
+
         let runtime = DataPlaneRuntime::with_capacities(2048, 32, 8, 8)
             .with_handoff_node_handle(NodeHandle::new(1));
         let graph_nodes = [

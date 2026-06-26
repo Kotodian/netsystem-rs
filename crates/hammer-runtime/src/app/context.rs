@@ -487,6 +487,11 @@ pub fn set_current_app_context(ctx: AppContext) {
 }
 
 #[inline]
+pub fn clear_current_app_context() {
+    CURRENT_APP_CONTEXT.with(|slot| *slot.borrow_mut() = None);
+}
+
+#[inline]
 pub fn current_app_context() -> Option<AppContext> {
     CURRENT_APP_CONTEXT.with(|slot| slot.borrow().clone())
 }
