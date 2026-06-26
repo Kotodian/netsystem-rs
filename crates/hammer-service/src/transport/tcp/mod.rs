@@ -1,9 +1,12 @@
 pub use hammer_core::protocol::tcp::{TcpInputFlags, TcpSeq, TcpState};
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
-use hammer_adapter::{BufferPacketCursor, DataPlaneRuntime, DataWorkerId, NodeId, SecondaryOpaque};
-use hammer_core::error::{CoreError, CoreResult};
+use hammer_adapter::{
+    BufferPacketCursor, DataPlaneRuntime, DataWorkerId, NodeId, NodeRuntimeData, SecondaryOpaque,
+};
+use hammer_core::error::{CoreError, CoreResult, HammerError, HammerResult};
+use hammer_core::registry::RuntimeRegistry;
 #[cfg(test)]
 use hammer_core::protocol::tcp::{TcpCapabilities, TcpFastOpenCookie};
 use hammer_core::protocol::tcp::{TcpControlPacketParseError, TcpError};
@@ -49,21 +52,84 @@ pub use reset::{TcpResetNext, TcpResetNode};
 use segment::TcpSegment;
 pub use syn_sent::{TcpSynSentNext, TcpSynSentNode};
 
-pub struct TcpMain;
+pub(crate) use lookup::set_tcp_worker_state;
+pub(crate) use lookup::{TcpWorkerOwnedState, tcp_worker_state, tcp_worker_state_mut};
+
+pub(crate) type TcpSessionDriver<C> = SessionDriverRuntime<TcpConnection<C>>;
+pub(crate) type TcpQueue<C> = SessionQueueHandle<TcpSessionDriver<C>>;
+
+pub struct TcpMain {
+    control: TcpInputControlPlane,
+    worker_queues: Mutex<Vec<Option<NodeRuntimeData>>>,
+}
 
 impl TcpMain {
+    pub fn new() -> Self {
+        Self {
+            control: TcpInputControlPlane::new(),
+            worker_queues: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn control(&self) -> &TcpInputControlPlane {
+        &self.control
+    }
+
     pub fn register_tcp_input<C: CongestionController + 'static>(
         &self,
-        _runtime: &DataPlaneRuntime,
-        _worker: usize,
+        rt: &DataPlaneRuntime,
+        worker: usize,
     ) -> CoreResult<NodeId> {
-        Err(CoreError::internal(
-            "tcp main register_tcp_input not implemented yet",
-        ))
+        let worker_id = DataWorkerId::new(
+            u32::try_from(worker)
+                .map_err(|_| CoreError::internal("worker index does not fit into u32"))?,
+        );
+
+        let mut worker_state_tls = TcpWorkerOwnedState::new(worker_id);
+        set_tcp_worker_state(&mut worker_state_tls);
+
+        let runtime_data = {
+            let mut guards = self
+                .worker_queues
+                .lock()
+                .map_err(|_| CoreError::internal("tcp worker queues lock poisoned"))?;
+            if guards.len() <= worker {
+                guards.resize_with(worker + 1, || None);
+            }
+            if guards[worker].is_none() {
+                let queue = crate::session::node::register_session_queue(
+                    TcpSessionDriver::<C>::new(worker_id, rt.packet_buffers().clone()),
+                )?;
+                guards[worker] = Some(queue.runtime_data());
+            }
+            guards[worker]
+                .ok_or_else(|| CoreError::internal("session queue runtime_data missing"))?
+        };
+
+        let queue = TcpQueue::<C>::new(runtime_data);
+        let handoff = rt.handoff_node_handle()?;
+        let next = [NodeId::new(0); TcpInputNext::COUNT];
+        let node = self
+            .control
+            .node::<C>(next, Some(queue), Some((handoff, worker_id)));
+        rt.nodes()
+            .try_register_internal_with_next_names(node, &TcpInputNext::NEXT_NAMES)
     }
 }
 
 pub static TCP_MAIN: OnceLock<TcpMain> = OnceLock::new();
+
+pub fn init(_reg: &RuntimeRegistry) -> HammerResult<()> {
+    TCP_MAIN
+        .set(TcpMain::new())
+        .map_err(|_| HammerError::internal("tcp main already initialized"))?;
+    Ok(())
+}
+
+#[linkme::distributed_slice(crate::packet_graph::CONTROL_INITS)]
+fn init_tcp(reg: &RuntimeRegistry) -> HammerResult<()> {
+    init(reg)
+}
 
 pub fn register_tcp_input_graph_node<C: CongestionController + 'static>(
     runtime: &DataPlaneRuntime,
@@ -74,13 +140,6 @@ pub fn register_tcp_input_graph_node<C: CongestionController + 'static>(
         .ok_or_else(|| CoreError::internal("tcp main not initialized"))?
         .register_tcp_input::<C>(runtime, worker)
 }
-
-#[cfg(test)]
-pub(crate) use lookup::set_tcp_worker_state;
-pub(crate) use lookup::{TcpWorkerOwnedState, tcp_worker_state, tcp_worker_state_mut};
-
-pub(crate) type TcpSessionDriver<C> = SessionDriverRuntime<TcpConnection<C>>;
-pub(crate) type TcpQueue<C> = SessionQueueHandle<TcpSessionDriver<C>>;
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TcpNodeError {
@@ -1393,7 +1452,10 @@ mod tests {
         let (segment, _) = connection
             .receive_established(&packet)
             .expect("receive peer fin");
-        assert!(segment.is_some(), "expected ack segment for in-sequence fin");
+        assert!(
+            segment.is_some(),
+            "expected ack segment for in-sequence fin"
+        );
         assert_eq!(connection.state(), TcpState::CloseWait);
         assert_eq!(connection.rcv_nxt(), rcv_nxt.wrapping_add(1));
     }
