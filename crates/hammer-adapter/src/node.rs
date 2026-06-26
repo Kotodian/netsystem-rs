@@ -436,6 +436,10 @@ impl NodeRegistration {
 }
 
 /// A statically-registered graph node (VPP `vlib_node_registration_t`).
+///
+/// `Copy` so linkme `distributed_slice` `[..]` catch-all can collect struct
+/// literals emitted by `#[graph_node]` across crates.
+#[derive(Clone, Copy)]
 pub struct NodeEntry {
     pub registration: NodeRegistration,
     pub kind: NodeKind,
