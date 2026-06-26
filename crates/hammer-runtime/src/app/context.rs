@@ -413,6 +413,15 @@ impl AppRuntime {
         self.ring.next_completion().await
     }
 
+    /// Pop up to `out.len()` completion descriptors in a single batched
+    /// sweep. Used by app async loops that want to drain multiple completions
+    /// per poll instead of one `next_completion().await` per item. Returns
+    /// the number of descriptors written into `out`.
+    #[inline]
+    pub fn pop_completion_descriptors(&self, out: &mut [AppCqeDescriptor]) -> usize {
+        self.ring.pop_completion_batch(out)
+    }
+
     #[inline]
     pub async fn complete_recv_buffer(
         &self,

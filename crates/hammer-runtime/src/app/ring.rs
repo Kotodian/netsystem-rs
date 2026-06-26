@@ -9,7 +9,9 @@ use hammer_adapter::{BufferIndex, DataPlaneBuffers};
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_infra::descriptor::Descriptor;
 use hammer_infra::map::FlatHashTable;
-use hammer_infra::ring::{CompletionDescriptor, LockFreeRing, RingEntry, SubmissionDescriptor};
+use hammer_infra::ring::{
+    CompletionDescriptor, LockFreeRing, RingEntry, RingError, SubmissionDescriptor,
+};
 use hammer_infra::vec::Vec;
 
 use crate::app::data::{AppDataAddr, AppDataArea, AppDataAreaConfig};
@@ -416,7 +418,7 @@ impl Drop for AppSendData {
     fn drop(&mut self) {
         if let Some(data) = self.data.take() {
             let _ = self.data_area.release(data);
-            let _ = self.free_chunks.enqueue_sp(data.chunk());
+            let _ = self.free_chunks.enqueue(data.chunk());
         }
     }
 }
@@ -458,6 +460,26 @@ impl AppRingWaker {
         };
         if replace {
             self.waker = Some(cx.waker().clone());
+        }
+    }
+
+    /// Take the registered waker out, leaving the slot empty. Used by the
+    /// batch push path to defer the wake until the batch is fully enqueued.
+    /// A concurrent `register` may store a fresh waker after `take_waker`
+    /// returns; the batch path must `set_waker` to preserve that waker.
+    #[inline]
+    fn take_waker(&mut self) -> Option<Waker> {
+        self.waker.take()
+    }
+
+    /// Restore a waker that was previously taken via `take_waker`. If a new
+    /// waker was registered in the meantime (i.e. `self.waker` is `Some`),
+    /// the supplied waker is dropped in favour of the freshly registered one
+    /// to avoid a missed wake.
+    #[inline]
+    fn set_waker(&mut self, waker: Option<Waker>) {
+        if self.waker.is_none() {
+            self.waker = waker;
         }
     }
 }
@@ -565,7 +587,7 @@ impl AppRingHandle {
         );
         for chunk in 0..data_chunk_count {
             free_chunks
-                .enqueue_sp(chunk as u32)
+                .enqueue(chunk as u32)
                 .map_err(|_| HammerError::internal("app fill ring initialization failed"))?;
         }
         Ok(Self {
@@ -608,14 +630,14 @@ impl AppRingHandle {
     pub fn alloc_data_for_bytes(&self, bytes: &[u8]) -> HammerResult<AppDataAddr> {
         let chunk = self
             .free_chunks
-            .dequeue_sc()
+            .dequeue()
             .ok_or_else(|| HammerError::internal("app data area is full"))?;
         let addr = self.data_area.alloc_chunk(chunk)?;
         match self.data_area.write(addr, bytes) {
             Ok(addr) => Ok(addr),
             Err(err) => {
                 let _ = self.data_area.release(addr);
-                let _ = self.free_chunks.enqueue_sp(chunk);
+                let _ = self.free_chunks.enqueue(chunk);
                 Err(err)
             }
         }
@@ -629,14 +651,14 @@ impl AppRingHandle {
     ) -> HammerResult<AppDataAddr> {
         let chunk = self
             .free_chunks
-            .dequeue_sc()
+            .dequeue()
             .ok_or_else(|| HammerError::internal("app data area is full"))?;
         let addr = self.data_area.alloc_chunk(chunk)?;
         match self.data_area.copy_from_buffer(addr, buffers, index) {
             Ok(addr) => Ok(addr),
             Err(err) => {
                 let _ = self.data_area.release(addr);
-                let _ = self.free_chunks.enqueue_sp(chunk);
+                let _ = self.free_chunks.enqueue(chunk);
                 Err(err)
             }
         }
@@ -651,7 +673,7 @@ impl AppRingHandle {
     pub fn release_data(&self, addr: AppDataAddr) -> HammerResult<()> {
         self.data_area.release(addr)?;
         self.free_chunks
-            .enqueue_sp(addr.chunk())
+            .enqueue(addr.chunk())
             .map_err(|_| HammerError::internal("app free chunk ring is full"))
     }
 
@@ -660,7 +682,7 @@ impl AppRingHandle {
         let source = send.data()?;
         let chunk = self
             .free_chunks
-            .dequeue_sc()
+            .dequeue()
             .ok_or_else(|| HammerError::internal("app data area is full"))?;
         let addr = self.data_area.alloc_chunk(chunk)?;
         match self
@@ -670,7 +692,7 @@ impl AppRingHandle {
             Ok(addr) => Ok(addr),
             Err(err) => {
                 let _ = self.data_area.release(addr);
-                let _ = self.free_chunks.enqueue_sp(chunk);
+                let _ = self.free_chunks.enqueue(chunk);
                 Err(err)
             }
         }
@@ -705,7 +727,7 @@ impl AppRingHandle {
 
     #[inline]
     pub fn pop_submission(&self) -> Option<AppSqe> {
-        let descriptor = self.submissions.dequeue_sc()?;
+        let descriptor = self.submissions.dequeue()?;
         Some(sqe_from_descriptor(descriptor, self))
     }
 
@@ -723,8 +745,88 @@ impl AppRingHandle {
 
     #[inline]
     pub fn pop_completion(&self) -> Option<AppCqe> {
-        let descriptor = self.completions.dequeue_sc()?;
+        let descriptor = self.completions.dequeue()?;
         Some(AppCqe::from((descriptor, self.clone())))
+    }
+
+    /// Push a batch of submission descriptors using `enqueue_batch` style.
+    /// The session driver is woken at most once at the end of the batch
+    /// (deferred wake) instead of once per descriptor, which is the
+    /// io_uring-style amortised wake pattern. Returns the number of
+    /// descriptors successfully enqueued. The remaining descriptors (from
+    /// `pushed..`) did not fit and the caller owns cleanup for any
+    /// `AppSqeData::Send { data }` payload in the leftover slice.
+    ///
+    /// Single-element `try_push_submission` / `try_push_submission_descriptor`
+    /// keep the existing immediate-wake semantics so legacy async paths see
+    /// no behaviour change.
+    #[inline]
+    pub fn try_push_submission_batch(
+        &self,
+        descriptors: &[AppSqeDescriptor],
+    ) -> Result<usize, RingError<AppSqeDescriptor>> {
+        if descriptors.is_empty() {
+            return Ok(0);
+        }
+        // Defer the wake: pull the waker out so we can wake once at the end
+        // without intermediate wakes. A concurrent `register` may store a
+        // fresh waker mid-batch; `set_waker` below preserves that one.
+        let deferred_waker = self.submission_waker.borrow_mut().take_waker();
+        let mut pushed = 0_usize;
+        let mut batch_full: Option<AppSqeDescriptor> = None;
+        {
+            let mut pending_registry = self.pending_submissions.borrow_mut();
+            while pushed < descriptors.len() {
+                let descriptor = descriptors[pushed];
+                match self.submissions.enqueue(descriptor) {
+                    Ok(()) => {
+                        pending_registry.record_descriptor(descriptor);
+                        pushed += 1;
+                    }
+                    Err(RingError::Full(descriptor)) => {
+                        batch_full = Some(descriptor);
+                        break;
+                    }
+                    Err(RingError::InvalidCapacity) => {
+                        // Unreachable for an already-constructed ring.
+                        batch_full = Some(descriptor);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(waker) = deferred_waker {
+            // Wake once for the whole batch. If `pushed > 0` a downstream
+            // consumer should observe new entries; if `pushed == 0` the
+            // wake is a no-op (no new entries, but no harm in waking a
+            // poll that will re-Pending).
+            if pushed > 0 {
+                waker.wake();
+            } else {
+                // Re-register the waker so a future push can wake it.
+                self.submission_waker.borrow_mut().set_waker(Some(waker));
+            }
+        }
+        match batch_full {
+            Some(descriptor) => Err(RingError::Full(descriptor)),
+            None => Ok(pushed),
+        }
+    }
+
+    /// Pop up to `out.len()` completion descriptors in one batch using
+    /// `dequeue_batch` (which prefetches the next slot). Returns the number
+    /// of descriptors written into `out`.
+    #[inline]
+    pub fn pop_completion_batch(&self, out: &mut [AppCqeDescriptor]) -> usize {
+        self.completions.dequeue_batch(out)
+    }
+
+    /// Pop up to `out.len()` submission descriptors in one batch using
+    /// `dequeue_batch`. Used by the session driver to drain SQ entries with
+    /// one prefetch-fused sweep instead of one atomic dequeue per descriptor.
+    #[inline]
+    pub fn pop_submission_batch(&self, out: &mut [AppSqeDescriptor]) -> usize {
+        self.submissions.dequeue_batch(out)
     }
 
     #[inline]
@@ -742,7 +844,7 @@ impl AppRingHandle {
     #[inline]
     pub fn try_push_submission_descriptor(&self, sqe: AppSqeDescriptor) -> HammerResult<()> {
         self.submissions
-            .enqueue_sp(sqe)
+            .enqueue(sqe)
             .map_err(|_| HammerError::internal("app submission descriptor ring full"))?;
         self.submission_waker.borrow_mut().wake();
         self.pending_submissions.borrow_mut().record_descriptor(sqe);
@@ -769,7 +871,7 @@ impl AppRingHandle {
     #[inline]
     pub fn try_push_completion_descriptor(&self, cqe: AppCqeDescriptor) -> HammerResult<()> {
         self.completions
-            .enqueue_sp(cqe)
+            .enqueue(cqe)
             .map_err(|_| HammerError::internal("app completion descriptor ring full"))?;
         self.completion_waker.borrow_mut().wake();
         Ok(())
@@ -842,7 +944,7 @@ impl AppRingHandle {
 
     #[inline]
     pub fn pop_submission_descriptor(&self) -> Option<AppSqeDescriptor> {
-        self.submissions.dequeue_sc()
+        self.submissions.dequeue()
     }
 
     #[inline]
@@ -897,11 +999,11 @@ impl AppRingHandle {
         &self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<AppSqeDescriptor>> {
-        if let Some(descriptor) = self.submissions.dequeue_sc() {
+        if let Some(descriptor) = self.submissions.dequeue() {
             return Poll::Ready(Some(descriptor));
         }
         self.submission_waker.borrow_mut().register(cx);
-        if let Some(descriptor) = self.submissions.dequeue_sc() {
+        if let Some(descriptor) = self.submissions.dequeue() {
             self.submission_waker.borrow_mut().waker = None;
             Poll::Ready(Some(descriptor))
         } else {
@@ -914,11 +1016,11 @@ impl AppRingHandle {
         &self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<AppCqeDescriptor>> {
-        if let Some(descriptor) = self.completions.dequeue_sc() {
+        if let Some(descriptor) = self.completions.dequeue() {
             return Poll::Ready(Some(descriptor));
         }
         self.completion_waker.borrow_mut().register(cx);
-        if let Some(descriptor) = self.completions.dequeue_sc() {
+        if let Some(descriptor) = self.completions.dequeue() {
             self.completion_waker.borrow_mut().waker = None;
             Poll::Ready(Some(descriptor))
         } else {
@@ -979,7 +1081,7 @@ impl AppRingHandle {
 fn drain_submission_descriptors(ring: &AppRingHandle, max: usize) -> Vec<AppSqeDescriptor> {
     let mut drained = Vec::new();
     for _ in 0..max {
-        let Some(value) = ring.submissions.dequeue_sc() else {
+        let Some(value) = ring.submissions.dequeue() else {
             break;
         };
         drained.push(value);
@@ -991,7 +1093,7 @@ fn drain_submission_descriptors(ring: &AppRingHandle, max: usize) -> Vec<AppSqeD
 fn drain_completion_descriptors(ring: &AppRingHandle, max: usize) -> Vec<AppCqeDescriptor> {
     let mut drained = Vec::new();
     for _ in 0..max {
-        let Some(value) = ring.completions.dequeue_sc() else {
+        let Some(value) = ring.completions.dequeue() else {
             break;
         };
         drained.push(value);
@@ -1229,7 +1331,7 @@ impl AppSendData {
     pub fn release(mut self) {
         if let Some(data) = self.data.take() {
             let _ = self.data_area.release(data);
-            let _ = self.free_chunks.enqueue_sp(data.chunk());
+            let _ = self.free_chunks.enqueue(data.chunk());
         }
     }
 }

@@ -124,8 +124,20 @@ impl SessionAppRuntime {
         let Some(ring) = self.control.ring.clone() else {
             return Ok(());
         };
-        while let Some(descriptor) = ring.pop_submission_descriptor() {
-            self.handle_submission_descriptor(descriptor)?;
+        // Drain in batches of 64 to amortise atomic head/tail traffic on the
+        // MPMC submission ring. The buffer lives on the stack so we avoid
+        // per-iteration allocation. `pop_submission_batch` issues L1
+        // prefetches for the next slot inside `LockFreeRing::dequeue_batch`.
+        let mut batch: [AppSqeDescriptor; 64] =
+            [AppSqeDescriptor::new(AppOpcode::Nop, None, AppObjectRef::None, AppSqeData::Nop); 64];
+        loop {
+            let taken = ring.pop_submission_batch(&mut batch);
+            if taken == 0 {
+                break;
+            }
+            for descriptor in batch[..taken].iter().copied() {
+                self.handle_submission_descriptor(descriptor)?;
+            }
         }
         Ok(())
     }

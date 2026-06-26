@@ -1165,3 +1165,258 @@ fn non_owner_worker_does_not_own_foreign_op_runtime() {
 
     data_runtime.shutdown_timeout(Duration::from_secs(1));
 }
+
+#[test]
+fn app_ring_handle_drains_completions_in_batch_with_prefetch() {
+    let ring = AppRingHandle::new(16, 16);
+    let op = AppOpId::new(4242);
+
+    // Push a few completions, then drain them with pop_completion_batch.
+    for index in 0..5u32 {
+        let descriptor = AppCqeDescriptor::new(
+            Some(AppUserData::new(index as u64)),
+            index as i32,
+            AppCqeFlags::NONE,
+            AppObjectRef::Operation(op),
+            AppCqeData::Connected,
+        );
+        ring.try_push_completion_descriptor(descriptor)
+            .expect("push connected cqe");
+    }
+
+    let mut out: [AppCqeDescriptor; 8] = [AppCqeDescriptor::new(
+        None,
+        0,
+        AppCqeFlags::NONE,
+        AppObjectRef::None,
+        AppCqeData::None,
+    ); 8];
+    let taken = ring.pop_completion_batch(&mut out);
+    assert_eq!(taken, 5);
+    for (index, descriptor) in out[..taken].iter().enumerate() {
+        assert_eq!(
+            descriptor.user_data(),
+            Some(AppUserData::new(index as u64))
+        );
+        assert_eq!(descriptor.payload(), AppCqeData::Connected);
+    }
+
+    // Drain again — ring is empty, batch returns 0.
+    let again = ring.pop_completion_batch(&mut out);
+    assert_eq!(again, 0);
+}
+
+#[test]
+fn app_ring_handle_pushes_submission_batch_and_drains_it() {
+    let ring = AppRingHandle::new(16, 16);
+    let op = AppOpId::new(5252);
+    let _ = op;
+
+    let descriptors: [AppSqeDescriptor; 4] = [
+        AppSqeDescriptor::new(
+            AppOpcode::Nop,
+            Some(AppUserData::new(0)),
+            AppObjectRef::None,
+            AppSqeData::Nop,
+        ),
+        AppSqeDescriptor::new(
+            AppOpcode::Nop,
+            Some(AppUserData::new(1)),
+            AppObjectRef::None,
+            AppSqeData::Nop,
+        ),
+        AppSqeDescriptor::new(
+            AppOpcode::Nop,
+            Some(AppUserData::new(2)),
+            AppObjectRef::None,
+            AppSqeData::Nop,
+        ),
+        AppSqeDescriptor::new(
+            AppOpcode::Nop,
+            Some(AppUserData::new(3)),
+            AppObjectRef::None,
+            AppSqeData::Nop,
+        ),
+    ];
+    let pushed = ring
+        .try_push_submission_batch(&descriptors)
+        .expect("batch push");
+    assert_eq!(pushed, 4);
+
+    let mut out: [AppSqeDescriptor; 8] =
+        [AppSqeDescriptor::new(AppOpcode::Nop, None, AppObjectRef::None, AppSqeData::Nop); 8];
+    let taken = ring.pop_submission_batch(&mut out);
+    assert_eq!(taken, 4);
+    for (index, descriptor) in out[..taken].iter().enumerate() {
+        assert_eq!(descriptor.opcode(), AppOpcode::Nop);
+        assert_eq!(
+            descriptor.user_data(),
+            Some(AppUserData::new(index as u64))
+        );
+    }
+
+    // Drain again — ring is empty.
+    let again = ring.pop_submission_batch(&mut out);
+    assert_eq!(again, 0);
+}
+
+#[test]
+fn app_ring_handle_submission_batch_stops_at_full() {
+    // AppRingHandle::new rounds capacity up to (capacity+1).next_power_of_two
+    // and reserves one slot, so request the smallest capacity that yields a
+    // usable capacity of 3 (ring_size 4, mask 3). With 6 descriptors only 3
+    // fit and the 4th is returned in the Full error.
+    let ring = AppRingHandle::for_tests(2, 2);
+
+    // Sanity: single push works and reports the expected slack.
+    let probe = AppSqeDescriptor::new(
+        AppOpcode::Nop,
+        Some(AppUserData::new(99)),
+        AppObjectRef::None,
+        AppSqeData::Nop,
+    );
+    ring.try_push_submission_descriptor(probe)
+        .expect("single push works");
+    let drained = ring.pop_submission_descriptor().expect("drain probe");
+    assert_eq!(drained.user_data(), Some(AppUserData::new(99)));
+
+    let descriptors: [AppSqeDescriptor; 6] = [
+        AppSqeDescriptor::new(
+            AppOpcode::Nop,
+            Some(AppUserData::new(0)),
+            AppObjectRef::None,
+            AppSqeData::Nop,
+        ),
+        AppSqeDescriptor::new(
+            AppOpcode::Nop,
+            Some(AppUserData::new(1)),
+            AppObjectRef::None,
+            AppSqeData::Nop,
+        ),
+        AppSqeDescriptor::new(
+            AppOpcode::Nop,
+            Some(AppUserData::new(2)),
+            AppObjectRef::None,
+            AppSqeData::Nop,
+        ),
+        AppSqeDescriptor::new(
+            AppOpcode::Nop,
+            Some(AppUserData::new(3)),
+            AppObjectRef::None,
+            AppSqeData::Nop,
+        ),
+        AppSqeDescriptor::new(
+            AppOpcode::Nop,
+            Some(AppUserData::new(4)),
+            AppObjectRef::None,
+            AppSqeData::Nop,
+        ),
+        AppSqeDescriptor::new(
+            AppOpcode::Nop,
+            Some(AppUserData::new(5)),
+            AppObjectRef::None,
+            AppSqeData::Nop,
+        ),
+    ];
+    let result = ring.try_push_submission_batch(&descriptors);
+    match result {
+        Ok(n) => panic!("expected Full, got Ok({n})"),
+        Err(hammer_infra::ring::RingError::Full(descriptor)) => {
+            // ring_size_for_capacity(2) = 4 → usable capacity 3, so the 4th
+            // descriptor (user_data 3) is bounced back.
+            assert_eq!(
+                descriptor.user_data(),
+                Some(AppUserData::new(3)),
+                "the first non-fitting descriptor must be returned"
+            );
+        }
+        Err(other) => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn app_ring_completion_queue_supports_multi_thread_listeners() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::thread;
+
+    // The completion ring is single-producer (session/transport) and
+    // multi-consumer (multiple app worker threads listening). `AppRingHandle`
+    // itself is single-threaded (Rc wakers), so this test drives the raw
+    // `LockFreeRing<AppCqeDescriptor>` that backs the CQ to verify the MPMC
+    // primitive supports concurrent listeners safely.
+    const COMPLETIONS: u64 = 4_000;
+    const LISTENERS: usize = 4;
+
+    let ring = Arc::new(
+        hammer_infra::ring::LockFreeRing::<AppCqeDescriptor>::with_capacity(1024).expect("cq ring"),
+    );
+    let op = AppOpId::new(7777);
+    let consumed = Arc::new(AtomicU64::new(0));
+
+    let producer_ring = Arc::clone(&ring);
+    let producer = thread::Builder::new()
+        .name("cq-multi-prod".into())
+        .spawn(move || {
+            for index in 0..COMPLETIONS {
+                let descriptor = AppCqeDescriptor::new(
+                    Some(AppUserData::new(index)),
+                    index as i32,
+                    AppCqeFlags::NONE,
+                    AppObjectRef::Operation(op),
+                    AppCqeData::Connected,
+                );
+                while producer_ring.enqueue(descriptor).is_err() {
+                    std::hint::spin_loop();
+                }
+            }
+        })
+        .expect("cq producer spawn");
+
+    let mut listeners = Vec::new();
+    for listener_index in 0..LISTENERS {
+        let ring = Arc::clone(&ring);
+        let consumed = Arc::clone(&consumed);
+        let handle = thread::Builder::new()
+            .name(format!("cq-multi-listener-{listener_index}"))
+            .spawn(move || {
+                let mut seen: Vec<u64> = Vec::new();
+                loop {
+                    let mut batch: [AppCqeDescriptor; 16] = [AppCqeDescriptor::new(
+                        None,
+                        0,
+                        AppCqeFlags::NONE,
+                        AppObjectRef::None,
+                        AppCqeData::None,
+                    ); 16];
+                    let taken = ring.dequeue_batch(&mut batch);
+                    if taken == 0 {
+                        if consumed.load(AtomicOrdering::Acquire) == COMPLETIONS {
+                            break;
+                        }
+                        std::hint::spin_loop();
+                        continue;
+                    }
+                    for descriptor in batch[..taken].iter() {
+                        seen.push(descriptor.user_data().map(|u| u.value()).unwrap_or(0));
+                        consumed.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                }
+                seen
+            })
+            .expect("listener spawn");
+        listeners.push(handle);
+    }
+
+    producer.join().expect("cq producer join");
+    let mut all: Vec<u64> = Vec::new();
+    for handle in listeners {
+        all.extend(handle.join().expect("listener join"));
+    }
+
+    assert_eq!(consumed.load(AtomicOrdering::Acquire), COMPLETIONS);
+    assert_eq!(all.len() as u64, COMPLETIONS, "no loss / no duplication");
+    all.sort_unstable();
+    let expected: Vec<u64> = (0..COMPLETIONS).collect();
+    assert_eq!(all, expected);
+}
