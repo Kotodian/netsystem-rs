@@ -1,27 +1,41 @@
 use std::cell::RefCell;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use hammer_adapter::{BufferIndex, DataPlaneBuffers};
 use hammer_core::error::{HammerError, HammerResult};
+use hammer_infra::descriptor::Descriptor;
 use hammer_infra::map::FlatHashTable;
-use hammer_infra::vec::Vec;
 
-use crate::app::data::AppDataAddr;
-use crate::app::ring::{
-    AppCompletionEntry, AppCqe, AppCqeDescriptor, AppObjectRef, AppOpId, AppRecv, AppRingHandle,
-    AppSend, AppSendData, AppSqe, AppSqeData, AppSqeDescriptor, AppSubmissionEntry,
-};
+use crate::app::session::AppSessionConfig;
 use crate::spawn::{DataLocalJoinHandle, DataRuntimeContext, spawn_local};
+
+pub enum AppOpTag {}
+pub type AppOpId = Descriptor<AppOpTag>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AppUserData(u64);
+
+impl AppUserData {
+    #[inline]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[inline]
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
 
 static NEXT_APP_CONTEXT_ID: AtomicUsize = AtomicUsize::new(1);
 const CLOSED_OWNER_WORKER: usize = usize::MAX;
+const NOT_WIRED: &str = "vpp app boundary not wired (C2)";
 
 thread_local! {
-    static APP_WORKER_RINGS: RefCell<AppWorkerRingRegistry> =
-        RefCell::new(AppWorkerRingRegistry::new());
     static CURRENT_APP_CONTEXT: RefCell<Option<AppContext>> = const { RefCell::new(None) };
 }
 
@@ -29,7 +43,7 @@ thread_local! {
 pub struct AppContext {
     id: usize,
     data_context: DataRuntimeContext,
-    ring_capacity: usize,
+    app_session_config: AppSessionConfig,
     op_owners: Arc<Mutex<FlatHashTable<u64, usize>>>,
 }
 
@@ -39,39 +53,19 @@ impl AppContext {
         Self {
             id: next_app_context_id(),
             data_context,
-            ring_capacity,
+            app_session_config: AppSessionConfig::new(64 * 1024, ring_capacity.max(4)),
             op_owners: Arc::new(Mutex::new(FlatHashTable::new())),
         }
     }
 
     #[inline]
-    pub fn worker_ring(&self) -> AppRingHandle {
-        worker_app_ring(self.id, self.ring_capacity)
+    pub fn app_session_config(&self) -> AppSessionConfig {
+        let _ = self.id;
+        self.app_session_config
     }
 
-    pub async fn send_on_op(&self, op: AppOpId, send: AppSend) -> HammerResult<()> {
-        if self.current_worker_owns_op(op) {
-            let ring = self.local_ring_for_op(op)?;
-            return AppRuntime { op, ring }.send(send).await;
-        }
-
-        let send: AppSendData = send.try_into()?;
-        let owner_worker = self.owner_for_op(op)?;
-        let app_context_id = self.id;
-        let ring_capacity = self.ring_capacity;
-        self.data_context
-            .call_local_on_worker(owner_worker, move || async move {
-                let ring = worker_app_ring(app_context_id, ring_capacity);
-                let data = ring.copy_data_from_send(&send)?;
-                send.release();
-                ring.try_push_submission_descriptor(AppSqeDescriptor::new(
-                    crate::app::ring::AppOpcode::Send,
-                    None,
-                    AppObjectRef::Operation(op),
-                    AppSqeData::Send { data },
-                ))
-            })
-            .await?
+    pub async fn send_on_op(&self, _op: AppOpId) -> HammerResult<()> {
+        Err(HammerError::internal(NOT_WIRED))
     }
 
     pub async fn spawn_on_op<F, Fut, T>(
@@ -86,15 +80,9 @@ impl AppContext {
         T: Send + 'static,
     {
         self.register_op_owner(op, owner_worker)?;
-        let app_context_id = self.id;
-        let ring_capacity = self.ring_capacity;
         self.data_context
             .call_local_on_worker(owner_worker, move || async move {
-                let worker = AppWorkerContext {
-                    owner_worker,
-                    op,
-                    ring: worker_app_ring(app_context_id, ring_capacity),
-                };
+                let worker = AppWorkerContext { owner_worker, op };
                 f(worker).await
             })
             .await
@@ -111,15 +99,9 @@ impl AppContext {
         Fut: Future<Output = ()> + 'static,
     {
         self.register_op_owner(op, owner_worker)?;
-        let app_context_id = self.id;
-        let ring_capacity = self.ring_capacity;
         self.data_context
             .spawn_local_on_worker(owner_worker, move || async move {
-                let worker = AppWorkerContext {
-                    owner_worker,
-                    op,
-                    ring: worker_app_ring(app_context_id, ring_capacity),
-                };
+                let worker = AppWorkerContext { owner_worker, op };
                 f(worker).await;
             })
     }
@@ -142,57 +124,19 @@ impl AppContext {
     }
 
     #[inline]
-    fn local_ring_for_op(&self, op: AppOpId) -> HammerResult<AppRingHandle> {
-        let owner_worker = self.owner_for_op(op)?;
-        let current_worker = self.current_worker_index()?;
-        if current_worker != owner_worker {
-            return Err(HammerError::internal(format!(
-                "app op {} is owned by worker {owner_worker}, not worker {current_worker}",
-                op.value()
-            )));
-        }
-        Ok(worker_app_ring(self.id, self.ring_capacity))
-    }
-
-    #[inline]
     pub fn try_complete_recv_buffer(
         &self,
-        op: AppOpId,
-        buffers: DataPlaneBuffers,
-        index: BufferIndex,
-        fin: bool,
+        _op: AppOpId,
+        _buffers: DataPlaneBuffers,
+        _index: BufferIndex,
+        _fin: bool,
     ) -> HammerResult<()> {
-        let ring = self.local_ring_for_op(op)?;
-        let _ = ring.try_complete_recv_buffer(op, buffers, index, fin)?;
-        Ok(())
+        Err(HammerError::internal(NOT_WIRED))
     }
 
     #[inline]
-    pub fn try_complete_closed_op(&self, op: AppOpId) -> HammerResult<bool> {
-        let Some(owner_worker) = self.registered_op_owner(op)? else {
-            return Ok(false);
-        };
-        if self.current_worker_index().ok() == Some(owner_worker) {
-            let ring = self.local_ring_for_op(op)?;
-            ring.try_push_completion(AppCqe::closed(None, Some(op)))?;
-        } else {
-            let app_context_id = self.id;
-            let ring_capacity = self.ring_capacity;
-            self.data_context
-                .call_blocking_on_worker(owner_worker, move || {
-                    worker_app_ring(app_context_id, ring_capacity)
-                        .try_push_completion(AppCqe::closed(None, Some(op)))
-                })?;
-        }
-        self.unregister_op_owner(op)?;
-        Ok(true)
-    }
-
-    #[inline]
-    fn current_worker_index(&self) -> HammerResult<usize> {
-        self.data_context.current_worker_index().ok_or_else(|| {
-            HammerError::internal("local app op lookup requires a data worker thread")
-        })
+    pub fn try_complete_closed_op(&self, _op: AppOpId) -> HammerResult<bool> {
+        Err(HammerError::internal(NOT_WIRED))
     }
 
     fn validate_owner_worker(&self, owner_worker: usize) -> HammerResult<()> {
@@ -237,15 +181,6 @@ impl AppContext {
         Ok(())
     }
 
-    fn unregister_op_owner(&self, op: AppOpId) -> HammerResult<()> {
-        let mut owners = self
-            .op_owners
-            .lock()
-            .map_err(|_| HammerError::internal("app op owner map poisoned"))?;
-        owners.insert(op.value(), CLOSED_OWNER_WORKER);
-        Ok(())
-    }
-
     fn registered_op_owner(&self, op: AppOpId) -> HammerResult<Option<usize>> {
         let owners = self
             .op_owners
@@ -261,7 +196,6 @@ impl AppContext {
 pub struct AppWorkerContext {
     owner_worker: usize,
     op: AppOpId,
-    ring: AppRingHandle,
 }
 
 impl AppWorkerContext {
@@ -277,10 +211,7 @@ impl AppWorkerContext {
 
     #[inline]
     pub fn runtime(&self) -> AppRuntime {
-        AppRuntime {
-            op: self.op,
-            ring: self.ring.clone(),
-        }
+        AppRuntime { op: self.op }
     }
 
     #[inline]
@@ -297,154 +228,41 @@ impl AppWorkerContext {
 #[derive(Clone)]
 pub struct AppRuntime {
     op: AppOpId,
-    ring: AppRingHandle,
 }
 
 impl AppRuntime {
     #[inline]
     pub fn recv(&self) -> AppRecvFuture {
-        let submit = self
-            .ring
-            .try_push_submission_descriptor(AppSqeDescriptor::new(
-                crate::app::ring::AppOpcode::Recv,
-                None,
-                AppObjectRef::Operation(self.op),
-                AppSqeData::Recv { max_len: u32::MAX },
-            ));
-        AppRecvFuture {
-            ring: self.ring.clone(),
-            submit: Some(submit),
-        }
+        AppRecvFuture { op: self.op }
     }
 
     #[inline]
-    pub async fn send(&self, send: AppSend) -> HammerResult<()> {
-        self.ring
-            .try_push_submission(AppSqe::send(None, self.op, send))
-    }
-
-    #[inline]
-    pub fn send_from_bytes(&self, bytes: &[u8]) -> HammerResult<AppSend> {
-        let data = self.ring.alloc_data_for_bytes(bytes)?;
-        Ok(self.ring.send_from_data(data))
+    pub async fn send(&self, _bytes: &[u8]) -> HammerResult<()> {
+        Err(HammerError::internal(NOT_WIRED))
     }
 
     #[inline]
     pub async fn shutdown(&self) -> HammerResult<()> {
-        self.ring
-            .try_push_submission_descriptor(AppSqeDescriptor::new(
-                crate::app::ring::AppOpcode::Close,
-                None,
-                AppObjectRef::Operation(self.op),
-                AppSqeData::Close,
-            ))
-    }
-
-    #[inline]
-    pub fn try_push_submission_descriptor(&self, sqe: AppSqeDescriptor) -> HammerResult<()> {
-        self.ring.try_push_submission_descriptor(sqe)
-    }
-
-    #[inline]
-    pub fn try_push_submission(&self, sqe: AppSqe) -> HammerResult<()> {
-        self.ring.try_push_submission(sqe)
-    }
-
-    #[inline]
-    pub fn try_push_submission_entry(&self, entry: AppSubmissionEntry) -> HammerResult<()> {
-        self.ring.try_push_submission_entry(entry)
-    }
-
-    #[inline]
-    pub async fn next_submission_entry(&self) -> Option<AppSubmissionEntry> {
-        self.ring.next_submission_entry().await
-    }
-
-    #[inline]
-    pub fn try_pop_submission_entry(&self) -> Option<AppSubmissionEntry> {
-        self.ring.pop_submission_entry()
-    }
-
-    #[inline]
-    pub async fn next_submission_descriptor(&self) -> Option<AppSqeDescriptor> {
-        self.ring.next_submission_descriptor().await
-    }
-
-    #[inline]
-    pub fn try_pop_submission_descriptor(&self) -> Option<AppSqeDescriptor> {
-        self.ring.pop_submission_descriptor()
-    }
-
-    #[inline]
-    pub async fn next_send(&self) -> Option<AppSend> {
-        self.ring
-            .next_submission()
-            .await
-            .and_then(AppSqe::into_send)
-    }
-
-    #[inline]
-    pub fn read_data(&self, data: AppDataAddr) -> HammerResult<Vec<u8>> {
-        self.ring.read_data(data)
-    }
-
-    #[inline]
-    pub fn try_push_completion_descriptor(&self, cqe: AppCqeDescriptor) -> HammerResult<()> {
-        self.ring.try_push_completion_descriptor(cqe)
-    }
-
-    #[inline]
-    pub fn try_push_completion_entry(&self, entry: AppCompletionEntry) -> HammerResult<()> {
-        self.ring.try_push_completion_entry(entry)
-    }
-
-    #[inline]
-    pub async fn next_completion_entry(&self) -> Option<AppCompletionEntry> {
-        self.ring.next_completion_entry().await
-    }
-
-    #[inline]
-    pub async fn next_completion_descriptor(&self) -> Option<AppCqeDescriptor> {
-        self.ring.next_completion_descriptor().await
-    }
-
-    #[inline]
-    pub async fn next_completion(&self) -> Option<AppCqe> {
-        self.ring.next_completion().await
-    }
-
-    /// Pop up to `out.len()` completion descriptors in a single batched
-    /// sweep. Used by app async loops that want to drain multiple completions
-    /// per poll instead of one `next_completion().await` per item. Returns
-    /// the number of descriptors written into `out`.
-    #[inline]
-    pub fn pop_completion_descriptors(&self, out: &mut [AppCqeDescriptor]) -> usize {
-        self.ring.pop_completion_batch(out)
+        Err(HammerError::internal(NOT_WIRED))
     }
 
     #[inline]
     pub async fn complete_recv_buffer(
         &self,
-        buffers: DataPlaneBuffers,
-        index: BufferIndex,
+        _buffers: DataPlaneBuffers,
+        _index: BufferIndex,
     ) -> HammerResult<()> {
-        let _ = self
-            .ring
-            .try_complete_recv_buffer(self.op, buffers, index, false)?;
-        Ok(())
+        Err(HammerError::internal(NOT_WIRED))
     }
 
     #[inline]
     pub async fn complete_recv_buffer_with_fin(
         &self,
-        buffers: DataPlaneBuffers,
-        index: BufferIndex,
-        fin: bool,
+        _buffers: DataPlaneBuffers,
+        _index: BufferIndex,
+        _fin: bool,
     ) -> HammerResult<()> {
-        let _ = self
-            .ring
-            .try_complete_recv_buffer(self.op, buffers, index, fin)?;
-        Ok(())
+        Err(HammerError::internal(NOT_WIRED))
     }
 }
 
@@ -452,42 +270,21 @@ pub type AppTaskContext = AppWorkerContext;
 pub type AppWorkerLocalExecutor = ();
 
 pub struct AppRecvFuture {
-    ring: crate::app::ring::AppRingHandle,
-    submit: Option<HammerResult<()>>,
+    op: AppOpId,
 }
 
 impl Future for AppRecvFuture {
-    type Output = HammerResult<AppRecv>;
+    type Output = HammerResult<Vec<u8>>;
 
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        if let Some(submit) = this.submit.take() {
-            submit?;
-        }
-        match this.ring.poll_next_completion(cx) {
-            Poll::Ready(Some(cqe)) => Poll::Ready(
-                cqe.into_recv()
-                    .ok_or_else(|| HammerError::internal("expected recv cqe")),
-            ),
-            Poll::Ready(None) => Poll::Ready(Err(HammerError::internal(
-                "app completion ring closed while waiting for recv cqe",
-            ))),
-            Poll::Pending => Poll::Pending,
-        }
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let _ = self.op;
+        Poll::Pending
     }
 }
 
 #[inline]
 fn next_app_context_id() -> usize {
     NEXT_APP_CONTEXT_ID.fetch_add(1, Ordering::Relaxed)
-}
-
-#[inline]
-fn worker_app_ring(app_context_id: usize, ring_capacity: usize) -> AppRingHandle {
-    APP_WORKER_RINGS.with(|slot| {
-        slot.borrow_mut()
-            .get_or_insert(app_context_id as u64, ring_capacity)
-    })
 }
 
 #[inline]
@@ -503,34 +300,4 @@ pub fn clear_current_app_context() {
 #[inline]
 pub fn current_app_context() -> Option<AppContext> {
     CURRENT_APP_CONTEXT.with(|slot| slot.borrow().clone())
-}
-
-struct AppWorkerRingRegistry {
-    index_by_context: FlatHashTable<u64, usize>,
-    rings: Vec<AppRingHandle>,
-}
-
-impl AppWorkerRingRegistry {
-    #[inline]
-    fn new() -> Self {
-        Self {
-            index_by_context: FlatHashTable::new(),
-            rings: Vec::new(),
-        }
-    }
-
-    #[inline]
-    fn get_or_insert(&mut self, key: u64, ring_capacity: usize) -> AppRingHandle {
-        if let Some(index) = self.index_by_context.lookup(&key)
-            && let Some(ring) = self.rings.get(index).cloned()
-        {
-            return ring;
-        }
-
-        let index = self.rings.len();
-        let ring = AppRingHandle::new(ring_capacity, ring_capacity);
-        self.rings.push(ring.clone());
-        self.index_by_context.insert(key, index);
-        ring
-    }
 }

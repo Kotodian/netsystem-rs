@@ -34,13 +34,20 @@ impl FlatHashKey for u16 {
     }
 }
 
+impl FlatHashKey for usize {
+    #[inline(always)]
+    fn hash_key(self) -> usize {
+        splitmix64(self as u64) as usize
+    }
+}
+
 #[derive(Debug, Clone)]
-pub struct FlatHashTable<K: FlatHashKey, V: Copy> {
+pub struct FlatHashTable<K: FlatHashKey, V: Clone> {
     buckets: Slice<FlatHashBucket<K, V>>,
     len: usize,
 }
 
-impl<K: FlatHashKey, V: Copy> FlatHashTable<K, V> {
+impl<K: FlatHashKey, V: Clone> FlatHashTable<K, V> {
     #[inline]
     pub fn new() -> Self {
         Self::with_capacity(1)
@@ -81,9 +88,9 @@ impl<K: FlatHashKey, V: Copy> FlatHashTable<K, V> {
     pub fn remove(&mut self, key: &K) -> Option<V> {
         let mut slot = self.slot(*key);
         loop {
-            match self.buckets[slot].entry {
+            match &self.buckets[slot].entry {
                 Some(entry) if entry.key == *key => {
-                    let value = entry.value;
+                    let value = entry.value.clone();
                     self.buckets[slot].entry = None;
                     self.len -= 1;
                     self.reinsert_cluster_after_removed_slot(slot);
@@ -110,7 +117,38 @@ impl<K: FlatHashKey, V: Copy> FlatHashTable<K, V> {
 
     #[inline(always)]
     pub fn lookup(&self, key: &K) -> Option<V> {
-        self.get(key).copied()
+        self.get(key).cloned()
+    }
+
+    #[inline]
+    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        let mut slot = self.slot(*key);
+        loop {
+            let matches = matches!(
+                self.buckets[slot].entry.as_ref(),
+                Some(entry) if entry.key == *key
+            );
+            if matches {
+                return self.buckets[slot]
+                    .entry
+                    .as_mut()
+                    .map(|entry| &mut entry.value);
+            }
+            match self.buckets[slot].entry.as_ref() {
+                Some(_) => slot = self.next_slot(slot),
+                None => return None,
+            }
+        }
+    }
+
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = (K, V)> + '_ {
+        self.buckets.iter().filter_map(|bucket| {
+            bucket
+                .entry
+                .as_ref()
+                .map(|entry| (entry.key, entry.value.clone()))
+        })
     }
 
     #[inline(always)]
@@ -154,8 +192,8 @@ impl<K: FlatHashKey, V: Copy> FlatHashTable<K, V> {
             Slice::from_elem(next_capacity, FlatHashBucket::empty()),
         );
         self.len = 0;
-        for bucket in old_buckets.iter().copied() {
-            if let Some(entry) = bucket.entry {
+        for bucket in old_buckets.iter() {
+            if let Some(entry) = bucket.entry.clone() {
                 self.insert_key_value(entry.key, entry.value);
             }
         }
@@ -166,7 +204,7 @@ impl<K: FlatHashKey, V: Copy> FlatHashTable<K, V> {
         let mut slot = self.slot(key);
         loop {
             let bucket = &mut self.buckets[slot];
-            match bucket.entry {
+            match &bucket.entry {
                 Some(entry) if entry.key == key => {
                     bucket.entry = Some(FlatHashEntry { key, value });
                     return false;
@@ -184,7 +222,7 @@ impl<K: FlatHashKey, V: Copy> FlatHashTable<K, V> {
     #[inline]
     fn reinsert_cluster_after_removed_slot(&mut self, removed_slot: usize) {
         let mut slot = self.next_slot(removed_slot);
-        while let Some(entry) = self.buckets[slot].entry {
+        while let Some(entry) = self.buckets[slot].entry.clone() {
             self.buckets[slot].entry = None;
             self.len -= 1;
             self.insert_key_value(entry.key, entry.value);
@@ -203,29 +241,27 @@ impl<K: FlatHashKey, V: Copy> FlatHashTable<K, V> {
     }
 }
 
-impl<K: FlatHashKey, V: Copy> Default for FlatHashTable<K, V> {
+impl<K: FlatHashKey, V: Clone> Default for FlatHashTable<K, V> {
     #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-#[repr(C)]
-struct FlatHashBucket<K: FlatHashKey, V: Copy> {
+#[derive(Debug, Clone)]
+struct FlatHashBucket<K: FlatHashKey, V: Clone> {
     entry: Option<FlatHashEntry<K, V>>,
 }
 
-impl<K: FlatHashKey, V: Copy> FlatHashBucket<K, V> {
+impl<K: FlatHashKey, V: Clone> FlatHashBucket<K, V> {
     #[inline(always)]
     const fn empty() -> Self {
         Self { entry: None }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-#[repr(C)]
-struct FlatHashEntry<K: FlatHashKey, V: Copy> {
+#[derive(Debug, Clone)]
+struct FlatHashEntry<K: FlatHashKey, V: Clone> {
     key: K,
     value: V,
 }

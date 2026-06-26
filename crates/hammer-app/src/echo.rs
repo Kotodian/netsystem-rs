@@ -1,15 +1,13 @@
-use hammer_core::error::HammerResult;
+use hammer_core::error::{HammerError, HammerResult};
 
 use crate::AppOp;
 
-pub async fn echo_once(op: &AppOp) -> HammerResult<()> {
-    let recv = op.recv().await?;
-    op.send(recv.into_send()).await
+const NOT_WIRED: &str = "vpp app boundary not wired (C2)";
+
+pub async fn echo_once(_op: &AppOp) -> HammerResult<()> {
+    Err(HammerError::internal(NOT_WIRED))
 }
 
-pub async fn run_echo_loop(op: &AppOp, iterations: usize) -> HammerResult<()> {
-    for _ in 0..iterations {
-        echo_once(op).await?;
-    }
-    Ok(())
+pub async fn run_echo_loop(_op: &AppOp, _iterations: usize) -> HammerResult<()> {
+    Err(HammerError::internal(NOT_WIRED))
 }

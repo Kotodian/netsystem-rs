@@ -10,7 +10,7 @@ use hammer_infra::map::FlatHashTable;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::rbtree::RbTree;
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
-use hammer_runtime::app::{AppOpId, AppRingHandle};
+use hammer_runtime::app::AppOpId;
 
 use crate::session::{
     SessionAppRuntime, SessionId, SessionQueueHandle, SessionQueueNext, SessionReadyQueue,
@@ -517,10 +517,7 @@ where
 impl<S> SessionDriverRuntime<S> {
     #[inline]
     pub(crate) fn new(worker: DataWorkerId, buffers: DataPlaneBuffers) -> Self {
-        let mut app = SessionAppRuntime::new(buffers.clone());
-        if let Some(app_context) = hammer_runtime::app::current_app_context() {
-            app.set_ring(app_context.worker_ring());
-        }
+        let app = SessionAppRuntime::new(buffers.clone());
         Self {
             runtime: CachePadded::new(SessionDriverRuntimeCore {
                 sessions: WorkerSessionRuntime::new(worker),
@@ -599,9 +596,7 @@ impl<S> SessionDriverRuntime<S> {
         self.app_state.app.free_pending_send(id);
         self.release_session_rx(id);
         let removed = self.runtime.entries.remove(id.pool_index())?;
-        if let Some(op) = self.app_state.app_ops.remove(&id.get()) {
-            self.app_state.app.unbind_ring(op);
-        }
+        let _ = self.app_state.app_ops.remove(&id.get());
         Some(removed)
     }
 
@@ -613,22 +608,6 @@ impl<S> SessionDriverRuntime<S> {
             self.app_state.app.complete_closed(op)?;
         }
         Ok(self.remove_session(id))
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn bind_session_app_ring(
-        &mut self,
-        id: SessionId,
-        op: AppOpId,
-        ring: AppRingHandle,
-    ) -> bool {
-        if self.session(id).is_none() {
-            return false;
-        }
-        self.app_state.app_ops.insert(id.get(), op);
-        self.app_state.app.bind_ring(id, op, ring);
-        true
     }
 
     #[inline]
@@ -1114,13 +1093,11 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex, OnceLock};
 
+    use crate::session::protocol::SessionQueueControlContext;
     use hammer_adapter::{
         BufferFrame, InternalNode, Node, NodeId, NodeProcessFn, NodeRegistration, NodeResult,
         NodeRuntimeData,
     };
-    use hammer_runtime::app::{AppRingHandle, AppSendData, AppSqe};
-
-    use crate::session::protocol::SessionQueueControlContext;
 
     fn infra_vec<T>(items: impl IntoIterator<Item = T>) -> hammer_infra::vec::Vec<T> {
         let mut values = hammer_infra::vec::Vec::new();
@@ -1540,112 +1517,6 @@ mod tests {
     }
 
     #[test]
-    fn enqueue_rx_keeps_ordered_delivery_and_preserves_ooo_offsets() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
-        let buffers = runtime.packet_buffers();
-        let mut driver = SessionDriverRuntime::new(DataWorkerId::new(0), buffers.clone());
-        let session_id = driver.insert_session(FakeTxProtocol::default());
-        let op = AppOpId::new(7);
-        let ring = AppRingHandle::with_data_area(8, 8, 256, 8).expect("ring");
-        assert!(driver.bind_session_app_ring(session_id, op, ring.clone()));
-
-        let future = buffers.alloc_index().expect("future buffer");
-        buffers.append(future, b"cdef").expect("future payload");
-        let future_enqueue = driver
-            .enqueue_rx(session_id, future, 2, false)
-            .expect("enqueue future");
-        assert_eq!(future_enqueue.delivered_len, 0);
-        assert_eq!(future_enqueue.newest_ooo_start, Some(2));
-        assert_eq!(future_enqueue.newest_ooo_len, 4);
-
-        let head = buffers.alloc_index().expect("head buffer");
-        buffers.append(head, b"ab").expect("head payload");
-        let head_enqueue = driver
-            .enqueue_rx(session_id, head, 0, false)
-            .expect("enqueue head");
-        assert_eq!(head_enqueue.delivered_len, 6);
-        assert_eq!(head_enqueue.newest_ooo_start, None);
-        assert_eq!(head_enqueue.newest_ooo_len, 0);
-
-        let rx_index = driver
-            .runtime
-            .rx_index
-            .lookup(&session_id.get())
-            .expect("rx queue present");
-        let queue = driver.runtime.rx.get(rx_index).expect("rx queue");
-        assert_eq!(queue.len(), 2);
-        assert_eq!(queue.delivered.len(), 2);
-        assert_eq!(queue.delivered.get(0).expect("head slot").offset, 0);
-        assert_eq!(queue.delivered.get(0).expect("head slot").len, 2);
-        assert_eq!(queue.delivered.get(1).expect("future slot").offset, 0);
-        assert_eq!(queue.delivered.get(1).expect("future slot").len, 4);
-
-        ring.push_test_submission(AppSqe::recv(None, op, 64))
-            .expect("queue recv submission");
-        driver.flush_session_rx(session_id).expect("flush rx");
-        let completions = ring.take_test_completions(4);
-        assert_eq!(completions.len(), 1);
-
-        let rx_index = driver
-            .runtime
-            .rx_index
-            .lookup(&session_id.get())
-            .expect("rx queue still present after one recv completion");
-        let queue = driver.runtime.rx.get(rx_index).expect("rx queue");
-        assert_eq!(queue.len(), 1);
-        assert_eq!(queue.front().expect("remaining slot").offset, 0);
-        assert_eq!(queue.front().expect("remaining slot").len, 4);
-
-        ring.push_test_submission(AppSqe::recv(None, op, 64))
-            .expect("queue second recv submission");
-        driver
-            .flush_session_rx(session_id)
-            .expect("flush remaining rx");
-        let completions = ring.take_test_completions(4);
-        assert_eq!(completions.len(), 1);
-        assert!(driver.runtime.rx_index.lookup(&session_id.get()).is_none());
-    }
-
-    #[test]
-    fn release_tx_up_to_advances_session_tx_chain() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
-        let buffers = runtime.packet_buffers();
-        let mut driver = SessionDriverRuntime::new(DataWorkerId::new(0), buffers.clone());
-        let session_id = driver.insert_session(FakeTxProtocol::default());
-        let ring = AppRingHandle::with_data_area(8, 8, 256, 8).expect("ring");
-        let send: AppSendData = ring
-            .send_from_data(ring.alloc_data_for_bytes(b"abcdefgh").expect("data"))
-            .try_into()
-            .expect("transfer");
-        driver.app_mut().push_pending_send(session_id, send);
-
-        let first = driver
-            .app()
-            .pending_send_head(session_id)
-            .expect("session tx head");
-
-        driver
-            .release_tx_up_to(session_id, 2)
-            .expect("release partial");
-
-        assert_eq!(driver.app().pending_send_head(session_id), Some(first));
-        assert_eq!(
-            buffers.copy_current_chain(first).expect("remaining first"),
-            b"cdefgh"
-        );
-
-        driver
-            .release_tx_up_to(session_id, 2)
-            .expect("release rest of first");
-
-        assert_eq!(driver.app().pending_send_head(session_id), Some(first));
-        assert_eq!(
-            buffers.copy_current_chain(first).expect("second intact"),
-            b"efgh"
-        );
-    }
-
-    #[test]
     fn session_rx_queue_inserts_future_segments_by_offset_order() {
         let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
         let buffers = runtime.packet_buffers();
@@ -1856,58 +1727,6 @@ mod tests {
     }
 
     #[test]
-    fn session_tx_copies_app_send_and_commits_progress() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
-        let buffers = runtime.packet_buffers();
-        let mut driver = SessionDriverRuntime::new(DataWorkerId::new(0), buffers.clone());
-        let session_id = driver.insert_session(FakeTxProtocol::default());
-        let ring = AppRingHandle::with_data_area(8, 8, 256, 8).expect("ring");
-        let send: AppSendData = ring
-            .send_from_data(ring.alloc_data_for_bytes(b"abcdef").expect("data"))
-            .try_into()
-            .expect("transfer");
-        driver.app_mut().push_pending_send(session_id, send);
-        driver.mark_ready(session_id);
-
-        let capture = Arc::new(Mutex::new(CaptureState::default()));
-        let output_node = runtime
-            .nodes()
-            .register_internal(CaptureNode::new(Arc::clone(&capture)));
-        let next: crate::session::SessionQueueNext = output_node.into();
-        let mut output = crate::session::node::SessionQueueOutput::default();
-        let mut step = driver.poll_once_for_ticks(0).expect("poll");
-
-        dispatch_session_queue_pending(
-            &runtime,
-            &mut driver,
-            next,
-            &mut output,
-            &mut step,
-            Instant::now(),
-        )
-        .expect("dispatch");
-
-        let protocol = driver.session(session_id).expect("protocol state");
-        assert_eq!(protocol.prepared, 4);
-        assert_eq!(protocol.committed, 4);
-        assert_eq!(protocol.canceled, 0);
-        assert!(driver.has_session_tx(session_id));
-        assert_eq!(
-            driver
-                .app()
-                .pending_send_len(session_id)
-                .expect("pending len"),
-            Some(6)
-        );
-
-        output.schedule(&runtime).expect("schedule output");
-        assert_eq!(runtime.run_ready_nodes().expect("run output"), 1);
-        let packets = &capture.lock().expect("capture").packets;
-        assert_eq!(packets.len(), 1);
-        assert_eq!(packets[0].as_slice(), b"abcd");
-    }
-
-    #[test]
     fn session_tx_does_not_call_transport_when_app_has_no_pending_send() {
         let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
         let buffers = runtime.packet_buffers();
@@ -1933,43 +1752,5 @@ mod tests {
         assert_eq!(protocol.committed, 0);
         assert_eq!(protocol.canceled, 0);
         assert!(!driver.has_session_tx(session_id));
-    }
-
-    #[test]
-    fn session_tx_keeps_pending_send_when_transport_has_no_capacity() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
-        let buffers = runtime.packet_buffers();
-        let mut driver = SessionDriverRuntime::new(DataWorkerId::new(0), buffers.clone());
-        let session_id = driver.insert_session(NoTxPayloadProtocol);
-        let ring = AppRingHandle::with_data_area(8, 8, 256, 8).expect("ring");
-        let send: AppSendData = ring
-            .send_from_data(ring.alloc_data_for_bytes(b"pending").expect("data"))
-            .try_into()
-            .expect("transfer");
-        driver.app_mut().push_pending_send(session_id, send);
-        driver.mark_ready(session_id);
-
-        let next: crate::session::SessionQueueNext = NodeId::new(9).into();
-        let mut output = crate::session::node::SessionQueueOutput::default();
-        let mut step = driver.poll_once_for_ticks(0).expect("poll");
-
-        dispatch_session_queue_pending(
-            &runtime,
-            &mut driver,
-            next,
-            &mut output,
-            &mut step,
-            Instant::now(),
-        )
-        .expect("dispatch without capacity");
-
-        assert!(driver.has_session_tx(session_id));
-        assert_eq!(
-            driver
-                .app()
-                .pending_send_len(session_id)
-                .expect("pending len"),
-            Some(7)
-        );
     }
 }

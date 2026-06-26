@@ -986,8 +986,6 @@ impl RuntimeService {
 mod tests {
     use super::*;
     use hammer_core::StartStage;
-    use hammer_runtime::app::AppOpId;
-    use hammer_runtime::spawn::with_data_plane_buffers;
     use std::net::Ipv4Addr;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1193,56 +1191,6 @@ enabled = true
             );
         }
 
-        service.close().expect("close service");
-    }
-
-    #[test]
-    fn runtime_service_app_context_runs_app_op_on_service_data_workers() {
-        let service = new_test_service("");
-        let app = service.app_context();
-        let op = AppOpId::new(3);
-
-        let result = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("driver runtime")
-            .block_on(async {
-                app.spawn_on_op(op, 1, move |worker| async move {
-                    let recv_future = worker.runtime().recv();
-                    let recv_sqe = worker
-                        .runtime()
-                        .next_submission_descriptor()
-                        .await
-                        .expect("recv sqe descriptor");
-                    let runtime = with_data_plane_buffers(Clone::clone);
-                    let index = runtime
-                        .alloc_index_with_bytes(b"service-app-context")
-                        .expect("alloc buffer");
-                    worker
-                        .runtime()
-                        .complete_recv_buffer(runtime.clone(), index)
-                        .await
-                        .expect("complete recv");
-                    assert_eq!(recv_sqe.opcode(), hammer_runtime::app::AppOpcode::Recv);
-                    let recv = recv_future.await.expect("recv app payload");
-                    let payload = recv.copy_current().expect("payload copy");
-                    recv.release();
-                    (
-                        worker.owner_worker(),
-                        std::thread::current()
-                            .name()
-                            .map(ToOwned::to_owned)
-                            .unwrap_or_default(),
-                        payload,
-                    )
-                })
-                .await
-                .expect("spawn app op")
-            });
-
-        assert_eq!(result.0, 1);
-        assert!(result.1.contains("hammer-data-1"), "thread={}", result.1);
-        assert_eq!(result.2, b"service-app-context");
         service.close().expect("close service");
     }
 

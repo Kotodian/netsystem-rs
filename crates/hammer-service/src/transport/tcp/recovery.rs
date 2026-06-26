@@ -2471,7 +2471,7 @@ mod tests {
             "hammer_runtime::app::",
             "BbrController",
             "TcpCongestionController",
-            "AppRingHandle",
+            "SessionAppBoundary",
             "SessionId",
         ];
 

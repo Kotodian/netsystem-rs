@@ -1,90 +1,82 @@
-use std::mem;
-
 use hammer_infra::align::{CACHE_LINE, align_up};
-use hammer_infra::ring::LockFreeRingSlot;
-
-use crate::app::ring::{AppCqeDescriptor, AppSqeDescriptor};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AppRingMemoryKind {
+pub enum FifoSegmentMemoryKind {
     ProcessLocal,
     SharedMemory,
 }
 
+/// Offset layout for a future mmap-backed `FifoSegment` (Stage F). C1 only
+/// defines the layout record; nothing allocates from it yet. The record is
+/// offset-based and pointer-free so the same struct will describe both the
+/// in-process heap variant and the cross-process mmap variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct AppRingLayout {
-    submission_ring_offset: usize,
-    completion_ring_offset: usize,
-    fill_ring_offset: usize,
-    data_area_offset: usize,
+pub struct FifoSegmentLayout {
+    rx_fifo_offset: usize,
+    rx_fifo_bytes: usize,
+    tx_fifo_offset: usize,
+    tx_fifo_bytes: usize,
+    evt_q_offset: usize,
+    evt_q_bytes: usize,
     cacheline_size: usize,
-    submission_ring_bytes: usize,
-    completion_ring_bytes: usize,
-    fill_ring_bytes: usize,
-    submission_capacity: usize,
-    completion_capacity: usize,
-    data_chunk_size: usize,
-    data_chunk_count: usize,
+    fifo_capacity: usize,
+    evt_q_capacity: usize,
 }
 
-impl AppRingLayout {
-    pub fn new(
-        submission_capacity: usize,
-        completion_capacity: usize,
-        data_chunk_size: usize,
-        data_chunk_count: usize,
-    ) -> Self {
-        let submission_ring_size = ring_size_for_capacity(submission_capacity);
-        let completion_ring_size = ring_size_for_capacity(completion_capacity);
-        let fill_ring_size = ring_size_for_capacity(data_chunk_count);
-        let submission_ring_bytes = mem::size_of::<LockFreeRingSlot<AppSqeDescriptor>>()
-            .checked_mul(submission_ring_size)
-            .expect("submission ring layout overflow");
-        let completion_ring_bytes = mem::size_of::<LockFreeRingSlot<AppCqeDescriptor>>()
-            .checked_mul(completion_ring_size)
-            .expect("completion ring layout overflow");
-        let fill_ring_bytes = mem::size_of::<LockFreeRingSlot<u32>>()
-            .checked_mul(fill_ring_size)
-            .expect("fill ring layout overflow");
-        let submission_ring_offset = 0;
-        let completion_ring_offset =
-            align_up(submission_ring_offset + submission_ring_bytes, CACHE_LINE);
-        let fill_ring_offset = align_up(completion_ring_offset + completion_ring_bytes, CACHE_LINE);
-        let data_area_offset = align_up(fill_ring_offset + fill_ring_bytes, CACHE_LINE);
+impl FifoSegmentLayout {
+    pub fn new(fifo_capacity: usize, evt_q_capacity: usize) -> Self {
+        // Stage F will compute exact byte sizes from SvmFifo/SvmMsgQ `repr(C)`
+        // footprints. For C1 we use placeholder rounded sizes so the layout
+        // record exists and is usable in tests; Stage F replaces these with
+        // `size_of::<SvmFifo>()`/`size_of::<SvmMsgQ>()` once those types are
+        // `#[repr(C)]` and mmap-friendly.
+        let rx_fifo_bytes = align_up(128, CACHE_LINE);
+        let tx_fifo_bytes = align_up(128, CACHE_LINE);
+        let evt_q_bytes = align_up(128, CACHE_LINE);
+        let rx_fifo_offset = 0;
+        let tx_fifo_offset = align_up(rx_fifo_offset + rx_fifo_bytes, CACHE_LINE);
+        let evt_q_offset = align_up(tx_fifo_offset + tx_fifo_bytes, CACHE_LINE);
         Self {
-            submission_ring_offset,
-            completion_ring_offset,
-            fill_ring_offset,
-            data_area_offset,
+            rx_fifo_offset,
+            rx_fifo_bytes,
+            tx_fifo_offset,
+            tx_fifo_bytes,
+            evt_q_offset,
+            evt_q_bytes,
             cacheline_size: CACHE_LINE,
-            submission_ring_bytes,
-            completion_ring_bytes,
-            fill_ring_bytes,
-            submission_capacity,
-            completion_capacity,
-            data_chunk_size,
-            data_chunk_count,
+            fifo_capacity,
+            evt_q_capacity,
         }
     }
 
     #[inline]
-    pub const fn submission_ring_offset(self) -> usize {
-        self.submission_ring_offset
+    pub const fn rx_fifo_offset(self) -> usize {
+        self.rx_fifo_offset
     }
 
     #[inline]
-    pub const fn completion_ring_offset(self) -> usize {
-        self.completion_ring_offset
+    pub const fn rx_fifo_bytes(self) -> usize {
+        self.rx_fifo_bytes
     }
 
     #[inline]
-    pub const fn fill_ring_offset(self) -> usize {
-        self.fill_ring_offset
+    pub const fn tx_fifo_offset(self) -> usize {
+        self.tx_fifo_offset
     }
 
     #[inline]
-    pub const fn data_area_offset(self) -> usize {
-        self.data_area_offset
+    pub const fn tx_fifo_bytes(self) -> usize {
+        self.tx_fifo_bytes
+    }
+
+    #[inline]
+    pub const fn evt_q_offset(self) -> usize {
+        self.evt_q_offset
+    }
+
+    #[inline]
+    pub const fn evt_q_bytes(self) -> usize {
+        self.evt_q_bytes
     }
 
     #[inline]
@@ -93,181 +85,37 @@ impl AppRingLayout {
     }
 
     #[inline]
-    pub const fn submission_ring_bytes(self) -> usize {
-        self.submission_ring_bytes
+    pub const fn fifo_capacity(self) -> usize {
+        self.fifo_capacity
     }
 
     #[inline]
-    pub const fn completion_ring_bytes(self) -> usize {
-        self.completion_ring_bytes
+    pub const fn evt_q_capacity(self) -> usize {
+        self.evt_q_capacity
     }
 
+    /// Total segment bytes from origin to end of evt_q region.
     #[inline]
-    pub const fn fill_ring_bytes(self) -> usize {
-        self.fill_ring_bytes
-    }
-
-    #[inline]
-    pub const fn submission_capacity(self) -> usize {
-        self.submission_capacity
-    }
-
-    #[inline]
-    pub const fn completion_capacity(self) -> usize {
-        self.completion_capacity
-    }
-
-    #[inline]
-    pub const fn data_chunk_size(self) -> usize {
-        self.data_chunk_size
-    }
-
-    #[inline]
-    pub const fn data_chunk_count(self) -> usize {
-        self.data_chunk_count
+    pub const fn total_bytes(self) -> usize {
+        self.evt_q_offset + self.evt_q_bytes
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct AppRingExport {
-    memory_kind: AppRingMemoryKind,
-    layout: AppRingLayout,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl AppRingExport {
-    #[inline]
-    pub const fn new(memory_kind: AppRingMemoryKind, layout: AppRingLayout) -> Self {
-        Self {
-            memory_kind,
-            layout,
-        }
-    }
-
-    #[inline]
-    pub const fn memory_kind(self) -> AppRingMemoryKind {
-        self.memory_kind
-    }
-
-    #[inline]
-    pub const fn layout(self) -> AppRingLayout {
-        self.layout
-    }
-
-    #[inline]
-    pub const fn submission_ring_offset(self) -> usize {
-        self.layout.submission_ring_offset()
-    }
-
-    #[inline]
-    pub const fn completion_ring_offset(self) -> usize {
-        self.layout.completion_ring_offset()
-    }
-
-    #[inline]
-    pub const fn fill_ring_offset(self) -> usize {
-        self.layout.fill_ring_offset()
-    }
-
-    #[inline]
-    pub const fn data_area_offset(self) -> usize {
-        self.layout.data_area_offset()
-    }
-
-    #[inline]
-    pub const fn cacheline_size(self) -> usize {
-        self.layout.cacheline_size()
-    }
-
-    #[inline]
-    pub const fn submission_ring_bytes(self) -> usize {
-        self.layout.submission_ring_bytes()
-    }
-
-    #[inline]
-    pub const fn completion_ring_bytes(self) -> usize {
-        self.layout.completion_ring_bytes()
-    }
-
-    #[inline]
-    pub const fn fill_ring_bytes(self) -> usize {
-        self.layout.fill_ring_bytes()
-    }
-
-    #[inline]
-    pub const fn submission_capacity(self) -> usize {
-        self.layout.submission_capacity()
-    }
-
-    #[inline]
-    pub const fn completion_capacity(self) -> usize {
-        self.layout.completion_capacity()
-    }
-
-    #[inline]
-    pub const fn data_chunk_size(self) -> usize {
-        self.layout.data_chunk_size()
-    }
-
-    #[inline]
-    pub const fn data_chunk_count(self) -> usize {
-        self.layout.data_chunk_count()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct AppRingIpcReservation {
-    page_size: usize,
-    producer_consumer_page_count: usize,
-    export: AppRingExport,
-}
-
-impl AppRingIpcReservation {
-    pub fn new(
-        page_size: usize,
-        producer_consumer_page_count: usize,
-        submission_capacity: usize,
-        completion_capacity: usize,
-        data_chunk_size: usize,
-        data_chunk_count: usize,
-    ) -> Self {
-        let layout = AppRingLayout::new(
-            submission_capacity,
-            completion_capacity,
-            data_chunk_size,
-            data_chunk_count,
+    #[test]
+    fn fifo_segment_layout_orders_regions_and_aligns_to_cacheline() {
+        let layout = FifoSegmentLayout::new(64 * 1024, 16);
+        assert_eq!(layout.rx_fifo_offset(), 0);
+        assert!(layout.tx_fifo_offset() > layout.rx_fifo_offset());
+        assert_eq!(layout.tx_fifo_offset() % CACHE_LINE, 0);
+        assert!(layout.evt_q_offset() > layout.tx_fifo_offset());
+        assert_eq!(layout.evt_q_offset() % CACHE_LINE, 0);
+        assert_eq!(
+            layout.total_bytes(),
+            layout.evt_q_offset() + layout.evt_q_bytes()
         );
-        Self {
-            page_size,
-            producer_consumer_page_count,
-            export: AppRingExport::new(AppRingMemoryKind::SharedMemory, layout),
-        }
     }
-
-    #[inline]
-    pub const fn page_size(self) -> usize {
-        self.page_size
-    }
-
-    #[inline]
-    pub const fn producer_consumer_page_count(self) -> usize {
-        self.producer_consumer_page_count
-    }
-
-    #[inline]
-    pub const fn memory_kind(self) -> AppRingMemoryKind {
-        self.export.memory_kind()
-    }
-
-    #[inline]
-    pub const fn export(self) -> AppRingExport {
-        self.export
-    }
-}
-
-#[inline]
-pub fn ring_size_for_capacity(capacity: usize) -> usize {
-    capacity
-        .checked_add(1)
-        .and_then(usize::checked_next_power_of_two)
-        .expect("app ring size overflow")
 }

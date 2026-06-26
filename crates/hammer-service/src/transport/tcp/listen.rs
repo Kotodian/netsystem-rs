@@ -278,7 +278,7 @@ mod tests {
     use hammer_core::error::{CoreError, CoreResult};
     use hammer_core::protocol::tcp::{TcpCapabilities, TcpFastOpenCookie};
     use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
-    use hammer_runtime::app::{AppCqeKind, AppOpId, AppSqe};
+    use hammer_runtime::app::AppOpId;
 
     use super::*;
     use crate::data_plane::DropNode;
@@ -498,73 +498,6 @@ mod tests {
             crate::transport::tcp::TcpState::Established
         );
         assert_eq!(connection.rcv_nxt(), CLIENT_ISN + 6);
-    }
-
-    #[test]
-    fn passive_tfo_syn_data_creates_session_and_enqueues_payload() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
-        let (input, handle, output_state) = install_listener_runtime(&runtime);
-        let ring = hammer_runtime::app::AppRingHandle::with_data_area(8, 8, 256, 8).expect("ring");
-        let op = AppOpId::new(11);
-
-        {
-            let mut queue = handle.borrow_mut().expect("tcp queue");
-            let cookie = tcp_worker_state_mut().fast_open_cookie_for_listener(
-                LISTENER_ID,
-                local_addr(),
-                remote_addr(None),
-            );
-            send_packet(
-                &runtime,
-                input,
-                syn_packet_with_payload_and_cookie(remote_addr(None), CLIENT_ISN, b"hello", cookie),
-            );
-        }
-        assert!(runtime.run_ready_nodes().expect("run passive tfo syn") >= 1);
-        if output_state.lock().expect("capture").packets.is_empty() {
-            assert!(runtime.run_ready_nodes().expect("run passive tfo output") >= 1);
-        }
-
-        let session_id = {
-            let mut queue = handle.borrow_mut().expect("tcp queue");
-            let route = tcp_worker_state()
-                .session_route_by_tuple(local_addr(), remote_addr(None))
-                .expect("tfo session route");
-            assert!(queue.bind_session_app_ring(route.0, op, ring.clone()));
-            assert!(!tcp_worker_state_mut().has_listener_pending(local_addr(), remote_addr(None)));
-            let connection = queue.session(route.0).expect("tcp session");
-            assert_eq!(connection.state(), crate::transport::tcp::TcpState::SynRcvd);
-            assert_eq!(connection.rcv_nxt(), CLIENT_ISN + 6);
-            route.0
-        };
-
-        ring.push_test_submission(AppSqe::recv(None, op, 64))
-            .expect("queue recv");
-        {
-            let mut queue = handle.borrow_mut().expect("tcp queue");
-            queue
-                .flush_session_rx(session_id)
-                .expect("flush session rx");
-        }
-        let completions = ring.take_test_completions(4);
-        assert_eq!(completions.len(), 1);
-        match completions
-            .into_iter()
-            .next()
-            .expect("recv completion")
-            .kind()
-        {
-            AppCqeKind::Recv { recv, .. } => {
-                assert_eq!(recv.copy_current().expect("recv payload"), b"hello");
-            }
-            other => panic!("expected recv completion, got {other:?}"),
-        }
-
-        let packets = output_state.lock().expect("capture");
-        assert_eq!(packets.packets.len(), 1);
-        let syn_ack = &packets.packets[0];
-        assert_eq!(tcp_flags(syn_ack), TCP_FLAG_SYN | TCP_FLAG_ACK);
-        assert_eq!(tcp_acknowledgment(syn_ack), CLIENT_ISN + 6);
     }
 
     #[test]
