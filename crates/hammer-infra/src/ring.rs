@@ -525,7 +525,8 @@ impl fmt::Debug for LockFreeRingCursors {
     }
 }
 
-struct LockFreeRingSlot<T> {
+#[repr(C, align(64))]
+pub struct LockFreeRingSlot<T> {
     value: UnsafeCell<MaybeUninit<T>>,
 }
 

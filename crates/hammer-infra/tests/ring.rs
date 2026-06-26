@@ -2,7 +2,7 @@ use crossbeam_utils::CachePadded;
 use hammer_infra::align::CACHE_LINE;
 use hammer_infra::ring::{
     CompletionDescriptor, IndexedRing, LocalRing, LockFreeRing, LockFreeRingCursors,
-    LockFreeRingHeadTail, RingEntry, RingError, SubmissionDescriptor,
+    LockFreeRingHeadTail, LockFreeRingSlot, RingEntry, RingError, SubmissionDescriptor,
 };
 
 #[test]
@@ -295,6 +295,13 @@ fn lock_free_ring_rejects_non_power_of_two_size() {
         LockFreeRing::<u64>::with_capacity(3),
         Err(RingError::InvalidCapacity)
     ));
+}
+
+#[test]
+fn lock_free_ring_slot_is_cacheline_aligned() {
+    assert!(std::mem::size_of::<LockFreeRingSlot<u64>>() >= CACHE_LINE);
+    assert_eq!(std::mem::size_of::<LockFreeRingSlot<u64>>() % CACHE_LINE, 0);
+    assert_eq!(std::mem::align_of::<LockFreeRingSlot<u64>>(), CACHE_LINE);
 }
 
 #[test]

@@ -68,6 +68,7 @@ impl AppDataAddr {
     }
 }
 
+#[repr(C, align(64))]
 struct AppDataChunk {
     generation: AtomicU32,
     len: AtomicU32,
@@ -409,6 +410,12 @@ fn ranges_overlap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_data_chunk_is_cacheline_aligned() {
+        assert_eq!(std::mem::size_of::<AppDataChunk>() % CACHE_LINE, 0);
+        assert_eq!(std::mem::align_of::<AppDataChunk>(), CACHE_LINE);
+    }
 
     #[test]
     fn app_data_addr_with_len_keeps_chunk_identity() {

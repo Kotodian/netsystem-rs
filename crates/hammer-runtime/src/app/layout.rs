@@ -1,6 +1,7 @@
 use std::mem;
 
 use hammer_infra::align::{CACHE_LINE, align_up};
+use hammer_infra::ring::LockFreeRingSlot;
 
 use crate::app::ring::{AppCqeDescriptor, AppSqeDescriptor};
 
@@ -36,13 +37,13 @@ impl AppRingLayout {
         let submission_ring_size = ring_size_for_capacity(submission_capacity);
         let completion_ring_size = ring_size_for_capacity(completion_capacity);
         let fill_ring_size = ring_size_for_capacity(data_chunk_count);
-        let submission_ring_bytes = mem::size_of::<AppSqeDescriptor>()
+        let submission_ring_bytes = mem::size_of::<LockFreeRingSlot<AppSqeDescriptor>>()
             .checked_mul(submission_ring_size)
             .expect("submission ring layout overflow");
-        let completion_ring_bytes = mem::size_of::<AppCqeDescriptor>()
+        let completion_ring_bytes = mem::size_of::<LockFreeRingSlot<AppCqeDescriptor>>()
             .checked_mul(completion_ring_size)
             .expect("completion ring layout overflow");
-        let fill_ring_bytes = mem::size_of::<u32>()
+        let fill_ring_bytes = mem::size_of::<LockFreeRingSlot<u32>>()
             .checked_mul(fill_ring_size)
             .expect("fill ring layout overflow");
         let submission_ring_offset = 0;
