@@ -4,66 +4,32 @@ use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{
     Attribute, Error, Expr, ExprPath, Field, Fields, FieldsNamed, GenericParam, Generics, Ident,
-    Item, ItemEnum, ItemStruct, LitStr, Path, Result, Token, Type, bracketed, parenthesized,
-    parse_macro_input, parse_quote, spanned::Spanned,
+    Item, ItemEnum, ItemStruct, LitStr, Meta, Path, Result, Token, Type, TypeParamBound, bracketed,
+    parenthesized, parse_macro_input, parse_quote, spanned::Spanned,
 };
 
 #[derive(Clone, Copy)]
 enum ComponentKind {
-    Outbound,
-    Inbound,
-    Endpoint,
-    Probe,
     Event,
 }
 
 impl ComponentKind {
     fn parse(ident: &Ident) -> Result<Self> {
         match ident.to_string().as_str() {
-            "outbound" => Ok(Self::Outbound),
-            "inbound" => Ok(Self::Inbound),
-            "endpoint" => Ok(Self::Endpoint),
-            "probe" => Ok(Self::Probe),
             "event" => Ok(Self::Event),
             other => Err(Error::new(
                 ident.span(),
-                format!(
-                    "unknown component kind `{other}`; expected outbound, inbound, endpoint, probe, or event"
-                ),
+                format!("unknown component kind `{other}`; expected event"),
             )),
         }
     }
 
     fn trait_path(self) -> TokenStream2 {
-        match self {
-            Self::Outbound => quote!(crate::component_registry::OutboundComponentDeclaration),
-            Self::Inbound => quote!(crate::component_registry::InboundComponentDeclaration),
-            Self::Endpoint => quote!(crate::component_registry::EndpointComponentDeclaration),
-            Self::Probe => quote!(crate::component_registry::ProbeComponentDeclaration),
-            Self::Event => quote!(crate::component_registry::EventSubscriberComponentDeclaration),
-        }
-    }
-
-    fn has_instance_metadata(self) -> bool {
-        matches!(self, Self::Outbound | Self::Inbound | Self::Endpoint)
-    }
-
-    fn has_network_metadata(self) -> bool {
-        matches!(self, Self::Outbound | Self::Endpoint)
-    }
-
-    fn has_dependency_metadata(self) -> bool {
-        matches!(self, Self::Outbound | Self::Endpoint)
+        quote!(crate::component_registry::EventSubscriberComponentDeclaration)
     }
 
     fn kind_name(self) -> &'static str {
-        match self {
-            Self::Outbound => "outbound",
-            Self::Inbound => "inbound",
-            Self::Endpoint => "endpoint",
-            Self::Probe => "probe",
-            Self::Event => "event",
-        }
+        "event"
     }
 }
 
@@ -71,9 +37,6 @@ struct ComponentArgs {
     kind: ComponentKind,
     name: LitStr,
     builder: ExprPath,
-    id: Option<Ident>,
-    networks: Option<Ident>,
-    dependencies: Option<Ident>,
     metrics: Option<(LitStr, LitStr)>,
     runtime: Option<Type>,
 }
@@ -308,9 +271,6 @@ impl Parse for ComponentArgs {
 
         let mut name = None;
         let mut builder = None;
-        let mut id = None;
-        let mut networks = None;
-        let mut dependencies = None;
         let mut metrics = None;
         let mut runtime = None;
         while input.parse::<Option<Token![,]>>()?.is_some() {
@@ -331,24 +291,6 @@ impl Parse for ComponentArgs {
                         return Err(Error::new(key.span(), "duplicate `builder` argument"));
                     }
                     builder = Some(input.parse()?);
-                }
-                "id" => {
-                    if id.is_some() {
-                        return Err(Error::new(key.span(), "duplicate `id` argument"));
-                    }
-                    id = Some(input.parse()?);
-                }
-                "networks" => {
-                    if networks.is_some() {
-                        return Err(Error::new(key.span(), "duplicate `networks` argument"));
-                    }
-                    networks = Some(input.parse()?);
-                }
-                "dependencies" => {
-                    if dependencies.is_some() {
-                        return Err(Error::new(key.span(), "duplicate `dependencies` argument"));
-                    }
-                    dependencies = Some(input.parse()?);
                 }
                 "metrics" => {
                     if metrics.is_some() {
@@ -371,7 +313,7 @@ impl Parse for ComponentArgs {
                     return Err(Error::new(
                         key.span(),
                         format!(
-                            "unknown argument `{other}`; expected `name`, `builder`, `id`, `networks`, `dependencies`, `metrics`, or `runtime`"
+                            "unknown argument `{other}`; expected `name`, `builder`, `metrics`, or `runtime`"
                         ),
                     ));
                 }
@@ -386,9 +328,6 @@ impl Parse for ComponentArgs {
             kind,
             name,
             builder,
-            id,
-            networks,
-            dependencies,
             metrics,
             runtime,
         })
@@ -400,8 +339,8 @@ impl Parse for ComponentArgs {
 /// Example:
 ///
 /// ```ignore
-/// #[hammer_component_macros::hammer_component(outbound, name = "direct", builder = build_outbound)]
-/// pub struct DirectOutbound { ... }
+/// #[hammer_component_macros::hammer_component(event, name = "metrics", builder = build_metrics_subscriber)]
+/// struct MetricsEventSubscriber;
 /// ```
 #[proc_macro_attribute]
 pub fn hammer_component(args: TokenStream, input: TokenStream) -> TokenStream {
@@ -433,31 +372,10 @@ pub fn hammer_component(args: TokenStream, input: TokenStream) -> TokenStream {
     let name = args.name.clone();
     let meta_name = args.name.clone();
     let builder = args.builder;
-    let id = args
-        .id
-        .unwrap_or_else(|| Ident::new("id", Span::call_site()));
-    let networks = args
-        .networks
-        .unwrap_or_else(|| Ident::new("networks", Span::call_site()));
-    let dependencies = args
-        .dependencies
-        .unwrap_or_else(|| Ident::new("dependencies", Span::call_site()));
 
-    let id_value = if kind.has_instance_metadata() {
-        quote!(self.#id.clone())
-    } else {
-        quote!(#meta_name.to_owned())
-    };
-    let networks_value = if kind.has_network_metadata() {
-        quote!(self.#networks.clone())
-    } else {
-        quote!(Vec::new())
-    };
-    let dependencies_value = if kind.has_dependency_metadata() {
-        quote!(self.#dependencies.clone())
-    } else {
-        quote!(Vec::new())
-    };
+    let id_value = quote!(#meta_name.to_owned());
+    let networks_value = quote!(Vec::new());
+    let dependencies_value = quote!(Vec::new());
     let metrics_value = if let Some((module, component_type)) = args.metrics {
         quote!(Some(::hammer_adapter::ComponentMetricsMeta {
             module: #module,
@@ -478,88 +396,17 @@ pub fn hammer_component(args: TokenStream, input: TokenStream) -> TokenStream {
         quote!(impl #impl_generics #trait_path for #declaration_ty #where_clause)
     };
 
-    let declaration_impl = match kind {
-        ComponentKind::Outbound => quote! {
-            #declaration_impl_head {
-                const TYPE_NAME: &'static str = #name;
+    let declaration_impl = quote! {
+        #declaration_impl_head {
+            const TYPE_NAME: &'static str = #name;
 
-                fn build(
-                    logger: ::hammer_core::log::Logger,
-                    id: String,
-                    kind: &::hammer_core::config::OutboundKind,
-                    protector: crate::socket_protector::SocketProtector,
-                    control_handle: Option<::std::sync::Arc<crate::ControlThreadHandle>>,
-                ) -> ::hammer_core::error::HammerResult<::hammer_adapter::outbound::OutboundComponent> {
-                    let runtime: ::std::sync::Arc<#declaration_ty> = #builder(logger, id, kind, protector, control_handle)?;
-                    let meta = ::hammer_adapter::ComponentMetadata::component_meta(runtime.as_ref());
-                    let runtime: ::std::sync::Arc<dyn ::hammer_adapter::Outbound> = runtime;
-                    Ok(::hammer_adapter::RuntimeComponent::new(meta, runtime))
-                }
+            fn build(
+                logger: ::hammer_core::log::Logger,
+                control_handle: ::std::sync::Arc<crate::ControlThreadHandle>,
+            ) -> ::hammer_core::error::HammerResult<::std::vec::Vec<crate::ControlEventSubscriptionHandle>> {
+                #builder(logger, control_handle)
             }
-        },
-        ComponentKind::Inbound => quote! {
-            #declaration_impl_head {
-                const TYPE_NAME: &'static str = #name;
-
-                #[allow(clippy::too_many_arguments)]
-                fn build(
-                    id: String,
-                    logger: ::hammer_core::log::Logger,
-                    kind: &::hammer_core::config::InboundKind,
-                    outbound: Option<::std::sync::Arc<crate::OutboundManager>>,
-                    platform: Option<::std::sync::Arc<dyn ::hammer_adapter::PlatformInterface>>,
-                    metrics: ::std::sync::Arc<::hammer_core::metrics::MetricsRegistry>,
-                ) -> ::hammer_core::error::HammerResult<::hammer_adapter::inbound::InboundComponent> {
-                    let runtime: ::std::sync::Arc<#declaration_ty> = #builder(
-                        id, logger, kind, outbound, platform, metrics
-                    )?;
-                    let meta = ::hammer_adapter::ComponentMetadata::component_meta(runtime.as_ref());
-                    let runtime: ::std::sync::Arc<dyn ::hammer_adapter::Inbound> = runtime;
-                    Ok(::hammer_adapter::RuntimeComponent::new(meta, runtime))
-                }
-            }
-        },
-        ComponentKind::Endpoint => quote! {
-            #declaration_impl_head {
-                const TYPE_NAME: &'static str = #name;
-
-                fn build(
-                    logger: ::hammer_core::log::Logger,
-                    option: &::hammer_core::config::Endpoint,
-                    platform: Option<::std::sync::Arc<dyn ::hammer_adapter::PlatformInterface>>,
-                    control_handle: Option<::std::sync::Arc<crate::ControlThreadHandle>>,
-                ) -> ::hammer_core::error::HammerResult<::hammer_adapter::EndpointComponent> {
-                    let runtime: ::std::sync::Arc<#declaration_ty> = #builder(logger, option, platform, control_handle)?;
-                    let meta = ::hammer_adapter::ComponentMetadata::component_meta(runtime.as_ref());
-                    let endpoint: ::std::sync::Arc<dyn ::hammer_adapter::Endpoint> = runtime;
-                    Ok(::hammer_adapter::RuntimeComponent::new(meta, endpoint))
-                }
-            }
-        },
-        ComponentKind::Probe => quote! {
-            #declaration_impl_head {
-                const TYPE_NAME: &'static str = #name;
-
-                fn build() -> ::hammer_adapter::probe::ProbeProtocolComponent {
-                    let runtime: ::std::sync::Arc<#declaration_ty> = #builder();
-                    let meta = ::hammer_adapter::ComponentMetadata::component_meta(runtime.as_ref());
-                    let runtime: ::std::sync::Arc<dyn ::hammer_adapter::ProbeProtocol> = runtime;
-                    ::hammer_adapter::RuntimeComponent::new(meta, runtime)
-                }
-            }
-        },
-        ComponentKind::Event => quote! {
-            #declaration_impl_head {
-                const TYPE_NAME: &'static str = #name;
-
-                fn build(
-                    logger: ::hammer_core::log::Logger,
-                    control_handle: ::std::sync::Arc<crate::ControlThreadHandle>,
-                ) -> ::hammer_core::error::HammerResult<::std::vec::Vec<crate::ControlEventSubscriptionHandle>> {
-                    #builder(logger, control_handle)
-                }
-            }
-        },
+        }
     };
 
     quote! {
@@ -1121,6 +968,8 @@ fn expand_node_next(item: ItemEnum) -> Result<TokenStream2> {
     let mut variant_idents = Vec::with_capacity(item.variants.len());
     let mut node_params = Vec::with_capacity(item.variants.len());
 
+    let mut next_names = Vec::with_capacity(item.variants.len());
+
     for variant in item.variants {
         if !matches!(variant.fields, Fields::Unit) {
             return Err(Error::new(
@@ -1138,6 +987,10 @@ fn expand_node_next(item: ItemEnum) -> Result<TokenStream2> {
         let variant_attrs = variant.attrs;
         let variant_ident = variant.ident;
         let node_param = format_ident!("{}_node", to_snake_case(&variant_ident.to_string()));
+        next_names.push(LitStr::new(
+            &default_next_node_name(&variant_ident),
+            variant_ident.span(),
+        ));
         variant_defs.push(quote! {
             #(#variant_attrs)*
             #variant_ident
@@ -1157,6 +1010,7 @@ fn expand_node_next(item: ItemEnum) -> Result<TokenStream2> {
 
         impl #ident {
             pub const COUNT: usize = #count;
+            pub const NEXT_NAMES: [&'static str; Self::COUNT] = [#(#next_names),*];
             pub const VARIANTS: [Self; Self::COUNT] = [
                 #(Self::#variant_idents),*
             ];
@@ -1189,6 +1043,20 @@ fn expand_node_next(item: ItemEnum) -> Result<TokenStream2> {
     })
 }
 
+fn default_next_node_name(variant: &Ident) -> String {
+    match variant.to_string().as_str() {
+        "Lookup" => "ip-lookup-node".to_string(),
+        "Output" => "tcp-output-node".to_string(),
+        "Punt" => "drop-node".to_string(),
+        "Listen" => "tcp-listen-node".to_string(),
+        "RcvProcess" => "tcp-rcv-process-node".to_string(),
+        "SynSent" => "tcp-syn-sent-node".to_string(),
+        "Established" => "tcp-established-node".to_string(),
+        "Reset" => "tcp-reset-node".to_string(),
+        other => format!("{}-node", to_snake_case(other)),
+    }
+}
+
 fn to_snake_case(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
     let mut previous_was_lower_or_digit = false;
@@ -1205,6 +1073,280 @@ fn to_snake_case(input: &str) -> String {
         }
     }
     output
+}
+
+#[derive(Clone, Copy)]
+enum GraphRegisterKind {
+    Internal,
+    Driver,
+    Handoff,
+}
+
+struct GraphNodeArgs {
+    graph: Ident,
+    name: Option<LitStr>,
+    register: GraphRegisterKind,
+    next: Option<Path>,
+}
+
+impl Default for GraphNodeArgs {
+    fn default() -> Self {
+        Self {
+            graph: Ident::new("_", Span::call_site()),
+            name: None,
+            register: GraphRegisterKind::Internal,
+            next: None,
+        }
+    }
+}
+
+impl Parse for GraphNodeArgs {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let mut args = GraphNodeArgs::default();
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            match key.to_string().as_str() {
+                "graph" => args.graph = input.parse()?,
+                "name" => args.name = Some(input.parse()?),
+                "register" => {
+                    let kind: Ident = input.parse()?;
+                    args.register = match kind.to_string().as_str() {
+                        "internal" => GraphRegisterKind::Internal,
+                        "driver" => GraphRegisterKind::Driver,
+                        "handoff" => GraphRegisterKind::Handoff,
+                        other => {
+                            return Err(Error::new(
+                                kind.span(),
+                                format!(
+                                    "unknown graph register kind `{other}`; expected `internal`, `driver`, or `handoff`"
+                                ),
+                            ));
+                        }
+                    };
+                }
+                "next" => args.next = Some(input.parse()?),
+                other => {
+                    return Err(Error::new(
+                        key.span(),
+                        format!(
+                            "unknown `graph_node` argument `{other}`; expected `graph`, `name`, `register`, or `next`"
+                        ),
+                    ));
+                }
+            }
+            if input.parse::<Option<Token![,]>>()?.is_none() {
+                break;
+            }
+        }
+        if args.graph == Ident::new("_", Span::call_site()) {
+            return Err(Error::new(Span::call_site(), "missing `graph` argument"));
+        }
+        Ok(args)
+    }
+}
+
+fn graph_slice_path(graph: &Ident) -> Path {
+    let slice = format_ident!("{}_GRAPH_NODES", graph.to_string().to_ascii_uppercase());
+    parse_quote!(crate::packet_graph::#slice)
+}
+
+fn graph_node_registration(name: &TokenStream2, next: Option<&Path>) -> TokenStream2 {
+    match next {
+        Some(next) => quote!(::hammer_adapter::NodeRegistration::next(#name, #next::COUNT)),
+        None => quote!(::hammer_adapter::NodeRegistration::next(#name, 0)),
+    }
+}
+
+fn struct_has_congestion_type_param(item: &ItemStruct) -> bool {
+    item.generics.type_params().any(|param| {
+        param.bounds.iter().any(|bound| {
+            let TypeParamBound::Trait(bound) = bound else {
+                return false;
+            };
+            bound
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "CongestionController")
+        })
+    })
+}
+
+fn node_role_from_item(item: &Item) -> Option<NodeRole> {
+    let Item::Struct(item_struct) = item else {
+        return None;
+    };
+    for attr in &item_struct.attrs {
+        if !attr
+            .path()
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "node")
+        {
+            continue;
+        }
+        let Meta::List(meta) = &attr.meta else {
+            continue;
+        };
+        if let Ok(args) = syn::parse2::<NodeArgs>(meta.tokens.clone()) {
+            return args.role;
+        }
+    }
+    None
+}
+
+fn effective_register_kind(args: &GraphNodeArgs, item: &Item) -> GraphRegisterKind {
+    match args.register {
+        GraphRegisterKind::Handoff => GraphRegisterKind::Handoff,
+        GraphRegisterKind::Driver => GraphRegisterKind::Driver,
+        GraphRegisterKind::Internal => node_role_from_item(item)
+            .map(|role| match role {
+                NodeRole::Internal => GraphRegisterKind::Internal,
+                NodeRole::Driver => GraphRegisterKind::Driver,
+            })
+            .unwrap_or(GraphRegisterKind::Internal),
+    }
+}
+
+fn graph_node_kind_expr(register: GraphRegisterKind) -> TokenStream2 {
+    match register {
+        GraphRegisterKind::Driver => quote!(::hammer_adapter::NodeKind::Driver),
+        GraphRegisterKind::Internal | GraphRegisterKind::Handoff => {
+            quote!(::hammer_adapter::NodeKind::Internal)
+        }
+    }
+}
+
+fn graph_register_body(
+    ident: &Ident,
+    register: GraphRegisterKind,
+    next: Option<&Path>,
+) -> TokenStream2 {
+    match (next, register) {
+        (Some(next), GraphRegisterKind::Internal) => quote! {
+            runtime.nodes().try_register_internal_with_next_names(
+                #ident::new([::hammer_adapter::NodeId::new(0); #next::COUNT]),
+                &#next::NEXT_NAMES,
+            )
+        },
+        (Some(next), GraphRegisterKind::Driver) => quote! {
+            runtime.nodes().try_register_driver_with_next_names(
+                #ident::new([::hammer_adapter::NodeId::new(0); #next::COUNT]),
+                &#next::NEXT_NAMES,
+            )
+        },
+        (_, GraphRegisterKind::Handoff) => quote! {
+            runtime.nodes().register_internal_with_handle(
+                runtime.handoff_node_handle()?,
+                #ident::new(),
+            )
+        },
+        (_, GraphRegisterKind::Driver) => quote! {
+            runtime.nodes().try_register_driver(#ident::new()?)
+        },
+        (None, GraphRegisterKind::Internal) => quote! {
+            runtime.nodes().try_register_internal(#ident::new())
+        },
+    }
+}
+
+fn graph_register_congestion_body(next: Option<&Path>) -> Result<TokenStream2> {
+    next.ok_or_else(|| {
+        Error::new(
+            Span::call_site(),
+            "congestion-controller graph nodes require `next = ...`",
+        )
+    })?;
+    Ok(quote! {
+        crate::with_tcp_cc!(|C| {
+            let main = crate::transport::tcp::TCP_MAIN.get().ok_or_else(|| {
+                ::hammer_core::error::CoreError::internal("tcp main not initialized")
+            })?;
+            main.register_node::<C>(runtime, worker)
+        })
+    })
+}
+
+/// Registers a struct as a graph node via linkme `NodeEntry`.
+///
+/// Each `#[graph_node]` emits a hidden init function and a distributed-slice
+/// static that `DataPlaneRuntime::init_graph` walks to register nodes.
+/// ```ignore
+/// #[hammer_component_macros::graph_node(graph = service)]
+/// pub struct DropNode;
+/// ```
+#[proc_macro_attribute]
+pub fn graph_node(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as GraphNodeArgs);
+    let item = parse_macro_input!(input as Item);
+    let ident = match item {
+        Item::Struct(ref item) => item.ident.clone(),
+        _ => {
+            return Error::new(
+                item.span(),
+                "`graph_node` can only be attached to a struct",
+            )
+            .to_compile_error()
+            .into();
+        }
+    };
+    expand_graph_node(args, &ident, item)
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
+fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<TokenStream2> {
+    let graph_slice = graph_slice_path(&args.graph);
+    let init_ident = format_ident!("__{}_graph_init_{}", args.graph, ident);
+    let static_ident = format_ident!(
+        "__{}_GRAPH_NODE_{}",
+        args.graph.to_string().to_ascii_uppercase(),
+        ident
+    );
+    let register = effective_register_kind(&args, &item);
+    let node_kind = graph_node_kind_expr(register);
+    let node_name = if let Some(name) = &args.name {
+        quote!(#name)
+    } else {
+        quote!(#ident::NODE_NAME)
+    };
+    let node_registration = graph_node_registration(&node_name, args.next.as_ref());
+
+    let init_body = if let Item::Struct(item_struct) = &item {
+        if struct_has_congestion_type_param(item_struct) {
+            graph_register_congestion_body(args.next.as_ref())?
+        } else {
+            graph_register_body(ident, register, args.next.as_ref())
+        }
+    } else {
+        graph_register_body(ident, register, args.next.as_ref())
+    };
+
+    let worker_param = if matches!(register, GraphRegisterKind::Handoff) {
+        quote!(_worker: usize)
+    } else {
+        quote!(worker: usize)
+    };
+
+    Ok(quote! {
+        #item
+
+        #[doc(hidden)]
+        fn #init_ident(
+            runtime: &::hammer_adapter::DataPlaneRuntime,
+            #worker_param,
+        ) -> ::hammer_core::error::CoreResult<::hammer_adapter::NodeId> {
+            #init_body
+        }
+
+        #[::linkme::distributed_slice(#graph_slice)]
+        static #static_ident: ::hammer_adapter::NodeEntry = ::hammer_adapter::NodeEntry {
+            registration: #node_registration,
+            kind: #node_kind,
+            init: #init_ident,
+        };
+    })
 }
 
 #[cfg(test)]
