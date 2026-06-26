@@ -4,8 +4,8 @@ use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{
     Attribute, Error, Expr, ExprPath, Field, Fields, FieldsNamed, GenericParam, Generics, Ident,
-    Item, ItemEnum, ItemStruct, LitStr, Meta, Path, Result, Token, Type, TypeParamBound, bracketed,
-    parenthesized, parse_macro_input, parse_quote, spanned::Spanned,
+    Item, ItemEnum, ItemStruct, LitStr, Path, Result, Token, Type, bracketed, parenthesized,
+    parse_macro_input, parse_quote, spanned::Spanned,
 };
 
 #[derive(Clone, Copy)]
@@ -1090,19 +1090,15 @@ fn to_snake_case(input: &str) -> String {
     output
 }
 
-#[derive(Clone, Copy)]
-enum GraphRegisterKind {
-    Internal,
-    Driver,
-    Handoff,
-    TcpInput,
-    IpLookup,
-}
-
 struct GraphNodeArgs {
     graph: Ident,
+    /// User-supplied init function: `fn(&DataPlaneRuntime, usize) -> CoreResult<NodeId>`.
+    /// The macro does not generate the init body; it only references this fn in the
+    /// `NodeEntry`. The fn reads its own subsystem's `*_MAIN` global (or registers
+    /// directly) — the macro never knows protocol details.
+    init: Option<Path>,
+    kind: Option<Ident>,
     name: Option<LitStr>,
-    register: GraphRegisterKind,
     next: Option<Path>,
 }
 
@@ -1110,8 +1106,9 @@ impl Default for GraphNodeArgs {
     fn default() -> Self {
         Self {
             graph: Ident::new("_", Span::call_site()),
+            init: None,
+            kind: None,
             name: None,
-            register: GraphRegisterKind::Internal,
             next: None,
         }
     }
@@ -1125,31 +1122,28 @@ impl Parse for GraphNodeArgs {
             input.parse::<Token![=]>()?;
             match key.to_string().as_str() {
                 "graph" => args.graph = input.parse()?,
-                "name" => args.name = Some(input.parse()?),
-                "register" => {
+                "init" => args.init = Some(input.parse()?),
+                "kind" => {
                     let kind: Ident = input.parse()?;
-                    args.register = match kind.to_string().as_str() {
-                        "internal" => GraphRegisterKind::Internal,
-                        "driver" => GraphRegisterKind::Driver,
-                        "handoff" => GraphRegisterKind::Handoff,
-                        "tcp_input" => GraphRegisterKind::TcpInput,
-                        "ip_lookup" => GraphRegisterKind::IpLookup,
+                    args.kind = Some(match kind.to_string().as_str() {
+                        "internal" | "driver" | "handoff" => kind,
                         other => {
                             return Err(Error::new(
                                 kind.span(),
                                 format!(
-                                    "unknown graph register kind `{other}`; expected `internal`, `driver`, `handoff`, `tcp_input`, or `ip_lookup`"
+                                    "unknown graph node kind `{other}`; expected `internal`, `driver`, or `handoff`"
                                 ),
                             ));
                         }
-                    };
+                    });
                 }
+                "name" => args.name = Some(input.parse()?),
                 "next" => args.next = Some(input.parse()?),
                 other => {
                     return Err(Error::new(
                         key.span(),
                         format!(
-                            "unknown `graph_node` argument `{other}`; expected `graph`, `name`, `register`, or `next`"
+                            "unknown `graph_node` argument `{other}`; expected `graph`, `init`, `kind`, `name`, or `next`"
                         ),
                     ));
                 }
@@ -1160,6 +1154,12 @@ impl Parse for GraphNodeArgs {
         }
         if args.graph == Ident::new("_", Span::call_site()) {
             return Err(Error::new(Span::call_site(), "missing `graph` argument"));
+        }
+        if args.init.is_none() {
+            return Err(Error::new(
+                Span::call_site(),
+                "missing `init` argument (path to a `fn(&DataPlaneRuntime, usize) -> CoreResult<NodeId>`)",
+            ));
         }
         Ok(args)
     }
@@ -1177,141 +1177,34 @@ fn graph_node_registration(name: &TokenStream2, next: Option<&Path>) -> TokenStr
     }
 }
 
-fn struct_has_congestion_type_param(item: &ItemStruct) -> bool {
-    item.generics.type_params().any(|param| {
-        param.bounds.iter().any(|bound| {
-            let TypeParamBound::Trait(bound) = bound else {
-                return false;
-            };
-            bound
-                .path
-                .segments
-                .last()
-                .is_some_and(|segment| segment.ident == "CongestionController")
-        })
-    })
-}
-
-fn node_role_from_item(item: &Item) -> Option<NodeRole> {
-    let Item::Struct(item_struct) = item else {
-        return None;
-    };
-    for attr in &item_struct.attrs {
-        if !attr
-            .path()
-            .segments
-            .last()
-            .is_some_and(|segment| segment.ident == "node")
-        {
-            continue;
+fn graph_node_kind_expr(kind: Option<&Ident>) -> TokenStream2 {
+    match kind.map(|k| k.to_string()).as_deref() {
+        Some("driver") => quote!(::hammer_adapter::NodeKind::Driver),
+        // `internal` and `handoff` are both `NodeKind::Internal`; handoff nodes
+        // register with a handle inside their own init fn, the kind stays Internal.
+        Some("internal") | Some("handoff") | None => {
+            quote!(::hammer_adapter::NodeKind::Internal)
         }
-        let Meta::List(meta) = &attr.meta else {
-            continue;
-        };
-        if let Ok(args) = syn::parse2::<NodeArgs>(meta.tokens.clone()) {
-            return args.role;
-        }
-    }
-    None
-}
-
-fn effective_register_kind(args: &GraphNodeArgs, item: &Item) -> GraphRegisterKind {
-    match args.register {
-        // Only the default `Internal` needs inference from the `#[node]` role;
-        // any explicit `register = ...` is used as-is.
-        GraphRegisterKind::Internal => node_role_from_item(item)
-            .map(|role| match role {
-                NodeRole::Internal => GraphRegisterKind::Internal,
-                NodeRole::Driver => GraphRegisterKind::Driver,
-            })
-            .unwrap_or(GraphRegisterKind::Internal),
-        other => other,
-    }
-}
-
-fn graph_node_kind_expr(register: GraphRegisterKind) -> TokenStream2 {
-    match register {
-        GraphRegisterKind::Driver => quote!(::hammer_adapter::NodeKind::Driver),
-        GraphRegisterKind::Internal
-        | GraphRegisterKind::Handoff
-        | GraphRegisterKind::TcpInput
-        | GraphRegisterKind::IpLookup => quote!(::hammer_adapter::NodeKind::Internal),
-    }
-}
-
-fn graph_register_body(
-    ident: &Ident,
-    register: GraphRegisterKind,
-    next: Option<&Path>,
-) -> TokenStream2 {
-    // `register = tcp_input` is only meaningful for congestion-typed graph nodes.
-    match (next, register) {
-        (_, GraphRegisterKind::IpLookup) => quote! {
-            crate::net::lookup::register_ip_lookup_graph_node(runtime, worker)
+        Some(other) => quote! {
+            compile_error!(concat!("unknown graph node kind: ", #other))
         },
-        (Some(next), GraphRegisterKind::Internal | GraphRegisterKind::TcpInput) => quote! {
-            runtime.nodes().try_register_internal_with_next_names(
-                #ident::new([::hammer_adapter::NodeId::new(0); #next::COUNT]),
-                &#next::NEXT_NAMES,
-            )
-        },
-        (Some(next), GraphRegisterKind::Driver) => quote! {
-            runtime.nodes().try_register_driver_with_next_names(
-                #ident::new([::hammer_adapter::NodeId::new(0); #next::COUNT]),
-                &#next::NEXT_NAMES,
-            )
-        },
-        (_, GraphRegisterKind::Handoff) => quote! {
-            runtime.nodes().register_internal_with_handle(
-                runtime.handoff_node_handle()?,
-                #ident::new(),
-            )
-        },
-        (_, GraphRegisterKind::Driver) => quote! {
-            runtime.nodes().try_register_driver(#ident::new()?)
-        },
-        (None, GraphRegisterKind::Internal | GraphRegisterKind::TcpInput) => quote! {
-            runtime.nodes().try_register_internal(#ident::new())
-        },
-    }
-}
-
-fn graph_register_congestion_body(
-    ident: &Ident,
-    next: Option<&Path>,
-    register: GraphRegisterKind,
-) -> Result<TokenStream2> {
-    let next = next.ok_or_else(|| {
-        Error::new(
-            Span::call_site(),
-            "congestion-controller graph nodes require `next = ...`",
-        )
-    })?;
-    if matches!(register, GraphRegisterKind::TcpInput) {
-        Ok(quote! {
-            crate::with_congestion!(|C| {
-                crate::transport::tcp::register_tcp_input_graph_node::<C>(runtime, worker)
-            })
-        })
-    } else {
-        Ok(quote! {
-            crate::with_congestion!(|C| {
-                runtime.nodes().try_register_internal_with_next_names(
-                    #ident::<C>::new([::hammer_adapter::NodeId::new(0); #next::COUNT]),
-                    &#next::NEXT_NAMES,
-                )
-            })
-        })
     }
 }
 
 /// Registers a struct as a graph node via linkme `NodeEntry`.
 ///
-/// Each `#[graph_node]` emits a hidden init function and a distributed-slice
-/// static that `DataPlaneRuntime::init_graph` walks to register nodes.
+/// Emits a `NodeEntry` collected into the `{graph}_GRAPH_NODES` linkme slice.
+/// The node's init function is supplied by `init = path` and must have the
+/// signature `fn(&DataPlaneRuntime, usize) -> CoreResult<NodeId>`; the macro
+/// does not generate the init body. The init fn reads its own subsystem's
+/// `*_MAIN` global (or registers the node directly) — the macro never knows
+/// protocol details, so new transports (e.g. quic) plug in without touching
+/// the macro. `DataPlaneRuntime::init_graph` walks the slice and calls each
+/// `init`; `resolve_named_next_nodes` then resolves next-node names (VPP
+/// `vlib_node_main_init`).
 /// ```ignore
-/// #[hammer_component_macros::graph_node(graph = service)]
-/// pub struct DropNode;
+/// #[hammer_component_macros::graph_node(graph = service, init = my::register_foo)]
+/// pub struct FooNode;
 /// ```
 #[proc_macro_attribute]
 pub fn graph_node(args: TokenStream, input: TokenStream) -> TokenStream {
@@ -1332,53 +1225,38 @@ pub fn graph_node(args: TokenStream, input: TokenStream) -> TokenStream {
 
 fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<TokenStream2> {
     let graph_slice = graph_slice_path(&args.graph);
-    let init_ident = format_ident!("__{}_graph_init_{}", args.graph, ident);
     let static_ident = format_ident!(
         "__{}_GRAPH_NODE_{}",
         args.graph.to_string().to_ascii_uppercase(),
         ident
     );
-    let register = effective_register_kind(&args, &item);
-    let node_kind = graph_node_kind_expr(register);
+    let node_kind = graph_node_kind_expr(args.kind.as_ref());
     let node_name = if let Some(name) = &args.name {
         quote!(#name)
     } else {
         quote!(#ident::NODE_NAME)
     };
     let node_registration = graph_node_registration(&node_name, args.next.as_ref());
+    // `init` is validated as present in `Parse for GraphNodeArgs`.
+    let init = args
+        .init
+        .as_ref()
+        .expect("graph_node `init` argument validated in parse");
 
-    let init_body = if let Item::Struct(item_struct) = &item {
-        if struct_has_congestion_type_param(item_struct) {
-            graph_register_congestion_body(ident, args.next.as_ref(), register)?
-        } else {
-            graph_register_body(ident, register, args.next.as_ref())
-        }
-    } else {
-        graph_register_body(ident, register, args.next.as_ref())
-    };
-
-    let worker_param = if matches!(register, GraphRegisterKind::Handoff) {
-        quote!(_worker: usize)
-    } else {
-        quote!(worker: usize)
-    };
-
+    // The macro only emits the `NodeEntry` shell + linkme collection. The init
+    // function is supplied by the node (`init = path`); it owns its subsystem
+    // dependencies (`*_MAIN` globals) and the macro knows nothing about them.
+    // This is VPP `VLIB_REGISTER_NODE`: registration is declarative, the node
+    // function is the node's own; graph wiring is resolved later by
+    // `init_graph` + `resolve_named_next_nodes` (`vlib_node_main_init`).
     Ok(quote! {
         #item
-
-        #[doc(hidden)]
-        fn #init_ident(
-            runtime: &::hammer_adapter::DataPlaneRuntime,
-            #worker_param,
-        ) -> ::hammer_core::error::CoreResult<::hammer_adapter::NodeId> {
-            #init_body
-        }
 
         #[::linkme::distributed_slice(#graph_slice)]
         static #static_ident: ::hammer_adapter::NodeEntry = ::hammer_adapter::NodeEntry {
             registration: #node_registration,
             kind: #node_kind,
-            init: #init_ident,
+            init: #init,
         };
     })
 }

@@ -446,15 +446,6 @@ pub struct NodeEntry {
     pub init: fn(&DataPlaneRuntime, usize) -> CoreResult<NodeId>,
 }
 
-/// A graph node knows how to initialize itself into a `DataPlaneRuntime`.
-///
-/// Implementations read their own subsystem's `*_MAIN` global (set by the
-/// control-plane init phase) and call the main's node-construction method.
-/// The graph layer never passes dependencies.
-pub trait GraphNode {
-    fn init(runtime: &DataPlaneRuntime, worker: usize) -> CoreResult<NodeId>;
-}
-
 #[derive(Debug, Clone, Copy)]
 pub enum NoopNode {}
 
@@ -816,11 +807,8 @@ impl NodeRuntimeInner {
                 self.node_trace_formatters[id.0 as usize] = trace_formatter;
                 if let Some(next_names) = next_names {
                     self.next_nodes[id.0 as usize] = vec![None; next_count];
-                    self.pending_next_names[id.0 as usize] = next_names
-                        .iter()
-                        .copied()
-                        .map(Some)
-                        .collect();
+                    self.pending_next_names[id.0 as usize] =
+                        next_names.iter().copied().map(Some).collect();
                 } else {
                     self.next_nodes[id.0 as usize] = initial_nexts
                         .iter()
@@ -878,11 +866,10 @@ impl NodeRuntimeInner {
                 let Some(name) = self.pending_next_names[slot][index] else {
                     continue;
                 };
-                let target = self
-                    .declared_nodes
-                    .get(name)
-                    .copied()
-                    .ok_or_else(|| CoreError::internal(format!("unknown next node `{name}`")))?;
+                let target =
+                    self.declared_nodes.get(name).copied().ok_or_else(|| {
+                        CoreError::internal(format!("unknown next node `{name}`"))
+                    })?;
                 self.validate_node(target)?;
                 self.next_nodes[slot][index] = Some(target);
             }
