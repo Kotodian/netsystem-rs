@@ -591,6 +591,114 @@ fn node_descriptor_exposes_public_snapshot_accessors() {
     );
 }
 
+#[test]
+fn node_by_name_returns_registered_id_and_none_for_unknown() {
+    let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 2);
+    let drop = runtime.nodes().register_internal(DescriptorNode::plain(
+        count_process,
+        NodeRuntimeData::empty(),
+    ));
+    let named = runtime.nodes().register_internal(DescriptorNode::next(
+        "contract-drop",
+        count_process,
+        NodeRuntimeData::empty(),
+        [drop, drop],
+    ));
+
+    assert_eq!(runtime.node_by_name("contract-drop"), Some(named));
+    assert_eq!(runtime.node_by_name("does-not-exist"), None);
+}
+
+#[test]
+fn set_node_next_slot_redirects_existing_next_slot() {
+    let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 2);
+    let initial = runtime.nodes().register_internal(DescriptorNode::plain(
+        count_process,
+        NodeRuntimeData::empty(),
+    ));
+    let redirect = runtime.nodes().register_internal(DescriptorNode::plain(
+        count_process,
+        NodeRuntimeData::empty(),
+    ));
+    let owner = runtime.nodes().register_internal(DescriptorNode::next(
+        "contract-owner",
+        count_process,
+        NodeRuntimeData::empty(),
+        [initial, initial],
+    ));
+
+    assert_eq!(
+        runtime
+            .nodes()
+            .node_next_slot(owner, TestNext::Default as usize)
+            .unwrap(),
+        initial
+    );
+
+    runtime
+        .nodes()
+        .set_node_next_slot(owner, TestNext::Default as usize, redirect)
+        .expect("redirect next slot");
+
+    assert_eq!(
+        runtime
+            .nodes()
+            .node_next_slot(owner, TestNext::Default as usize)
+            .unwrap(),
+        redirect
+    );
+}
+
+#[test]
+fn try_register_descriptor_registers_erased_descriptor() {
+    let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 2);
+    let drop = runtime.nodes().register_internal(DescriptorNode::plain(
+        count_process,
+        NodeRuntimeData::empty(),
+    ));
+    let nexts = [drop, drop];
+    let descriptor = NodeDescriptor::new(
+        count_process,
+        NodeRuntimeData::from_words([7, 0, 0, 0]),
+        NodeRegistration::next("erased-owner", TestNext::COUNT),
+        &nexts,
+        None,
+    );
+
+    let id = runtime
+        .nodes()
+        .try_register_descriptor(NodeKind::Internal, descriptor)
+        .expect("register erased descriptor");
+
+    assert_eq!(runtime.node_by_name("erased-owner"), Some(id));
+    assert_eq!(
+        runtime
+            .nodes()
+            .node_next_slot(id, TestNext::Default as usize)
+            .unwrap(),
+        drop
+    );
+}
+
+#[test]
+fn try_register_descriptor_rejects_next_count_mismatch() {
+    let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 2);
+    let empty_nexts: &[NodeId] = &[];
+    let descriptor = NodeDescriptor::new(
+        count_process,
+        NodeRuntimeData::empty(),
+        NodeRegistration::next("erased-bad", TestNext::COUNT),
+        empty_nexts,
+        None,
+    );
+
+    let err = runtime
+        .nodes()
+        .try_register_descriptor(NodeKind::Internal, descriptor)
+        .expect_err("initial next count mismatch must fail");
+    assert!(err.to_string().contains("node initial next count mismatch"));
+}
+
 fn push_packet(runtime: &DataPlaneRuntime, frame: hammer_adapter::FrameIndex, payload: &[u8]) {
     let buffer = runtime
         .alloc_index_with_bytes(payload)

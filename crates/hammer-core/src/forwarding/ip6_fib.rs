@@ -74,6 +74,16 @@ impl<V: Copy> Ip6PrefixHashTable<V> {
     pub fn bucket_count(&self) -> usize {
         self.routes.bucket_count()
     }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.routes.len()
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.routes.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

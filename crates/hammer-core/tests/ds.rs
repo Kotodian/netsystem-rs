@@ -1,5 +1,5 @@
 use hammer_core::ds::{
-    FlatHashTable, Mtrie, MtrieEntry, PackedMtrie, PackedMtrieValue, PrefixLengthSearchOrder,
+    FlatHashTable, MtrieEntry, PackedMtrie, PackedMtrieValue, PrefixLengthSearchOrder,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,26 +28,6 @@ impl PackedMtrieValue for Next {
 }
 
 #[test]
-fn mtrie_is_generic_over_u32_keys_and_cacheline_aligned() {
-    let trie = Mtrie::from_entries([
-        MtrieEntry::new(0, 0, [0x11; 32]),
-        MtrieEntry::new(u32::from_be_bytes([198, 51, 100, 0]), 24, [0x22; 32]),
-    ]);
-
-    assert_eq!(
-        trie.lookup(u32::from_be_bytes([203, 0, 113, 7])),
-        Some([0x11; 32])
-    );
-    assert_eq!(
-        trie.lookup(u32::from_be_bytes([198, 51, 100, 42])),
-        Some([0x22; 32])
-    );
-    assert_eq!(trie.root_alignment(), 64);
-    assert_eq!(trie.root_addr() % 64, 0);
-    assert_eq!(trie.ply_addr(0).expect("ply") % 64, 0);
-}
-
-#[test]
 fn packed_mtrie_stores_leaf_encoded_values_for_hot_paths() {
     let trie = PackedMtrie::from_entries([
         MtrieEntry::new(0, 0, Next::Drop),
@@ -62,6 +42,9 @@ fn packed_mtrie_stores_leaf_encoded_values_for_hot_paths() {
         trie.lookup(u32::from_be_bytes([198, 51, 100, 42])),
         Some(Next::Forward)
     );
+    assert_eq!(trie.root_alignment(), 64);
+    assert_eq!(trie.root_addr() % 64, 0);
+    assert_eq!(trie.ply_addr(0).expect("ply") % 64, 0);
 }
 
 #[test]

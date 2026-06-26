@@ -1,7 +1,6 @@
 use crate::ds::prefetch::prefetch_read_l1;
 
 use super::dpo::{AdjacencyIndex, DpoId, DpoProto};
-use super::ip4_mtrie::Ip4MtrieValue;
 
 pub const LOAD_BALANCE_INLINE_BUCKETS: usize = 4;
 
@@ -22,18 +21,6 @@ impl LoadBalanceIndex {
     #[inline(always)]
     pub const fn slot(self) -> usize {
         self.0 as usize
-    }
-}
-
-impl Ip4MtrieValue for LoadBalanceIndex {
-    #[inline(always)]
-    fn into_leaf_value(self) -> u32 {
-        self.0
-    }
-
-    #[inline(always)]
-    fn from_leaf_value(value: u32) -> Self {
-        Self(value)
     }
 }
 

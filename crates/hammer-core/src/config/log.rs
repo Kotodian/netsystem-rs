@@ -1,36 +1,33 @@
-//! `[log]` config section: parsed Raw form, runtime Options, and the
-//! conversion from one to the other.
+//! `[log]` config section: logging policy. Single-layer schema.
 
 use crate::log::Level;
 
-use super::raw_struct_with_default_check;
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Log {
+    /// Minimum log level, for example `debug`, `info`, or `warn`.
+    pub level: Level,
+    /// Log output target from the user config.
+    pub output: String,
+    /// Whether log lines should include timestamps.
+    pub timestamp: bool,
+    /// Whether logging is disabled entirely.
+    pub disabled: bool,
+}
 
-raw_struct_with_default_check! {
-    pub struct RawLogConfig {
-        /// Minimum log level, for example `debug`, `info`, or `warn`.
-        pub level: Option<Level> => "Option::is_none",
-        /// Log output target from the user config.
-        pub output: String => "String::is_empty",
-        /// Whether log lines should include timestamps.
-        pub timestamp: Option<bool> => "Option::is_none",
-        /// Whether logging is disabled entirely.
-        pub disabled: Option<bool> => "Option::is_none",
+impl Default for Log {
+    fn default() -> Self {
+        Self {
+            level: Level::default(),
+            output: "stderr".to_owned(),
+            timestamp: false,
+            disabled: false,
+        }
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct LogOptions {
-    pub disabled: bool,
-    pub level: Level,
-    pub output: String,
-    pub timestamp: bool,
-}
-
-pub(super) fn build_log_options(raw: RawLogConfig) -> LogOptions {
-    LogOptions {
-        disabled: raw.disabled.unwrap_or(false),
-        level: raw.level.unwrap_or_default(),
-        output: raw.output,
-        timestamp: raw.timestamp.unwrap_or(false),
+impl Log {
+    pub fn is_default(&self) -> bool {
+        *self == Log::default()
     }
 }

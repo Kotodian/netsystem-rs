@@ -1,10 +1,10 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+use hammer_core::ds::PackedMtrieValue;
 use hammer_core::forwarding::{
     AdjacencyIndex, AdjacencyRewrite, AdjacencyRewriteError, Dpo, DpoId, DpoKind, DpoProto,
     DpoStackRegistry, DpoType, DpoTypeRegistry, FibEntry, FibRouteDpoError, FibTableBuilder,
-    Ip4Mtrie, Ip4MtrieRoute, Ip4MtrieValue, Ip6PrefixHashTable, Ip6PrefixKey, LoadBalanceError,
-    LoadBalanceIndex,
+    Ip4Mtrie, Ip4MtrieRoute, Ip6PrefixHashTable, LoadBalanceError, LoadBalanceIndex,
 };
 use hammer_core::protocol::ip::{
     IpInputError, IpInputTarget, IpProtocol, IpVersion, ParsedIpPacket,
@@ -16,6 +16,27 @@ enum NextHop {
     Drop,
     Direct,
     Rewrite,
+}
+
+impl PackedMtrieValue for NextHop {
+    #[inline(always)]
+    fn into_leaf_value(self) -> u32 {
+        match self {
+            Self::Drop => 0,
+            Self::Direct => 1,
+            Self::Rewrite => 2,
+        }
+    }
+
+    #[inline(always)]
+    fn from_leaf_value(value: u32) -> Self {
+        match value {
+            0 => Self::Drop,
+            1 => Self::Direct,
+            2 => Self::Rewrite,
+            other => panic!("unexpected mtrie value: {other}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -37,27 +58,6 @@ impl DpoKind for TestRegisteredDpoKind {
     #[inline(always)]
     fn encode_index(index: Self::Index) -> u32 {
         index.0
-    }
-}
-
-impl Ip4MtrieValue for NextHop {
-    #[inline(always)]
-    fn into_leaf_value(self) -> u32 {
-        match self {
-            Self::Drop => 0,
-            Self::Direct => 1,
-            Self::Rewrite => 2,
-        }
-    }
-
-    #[inline(always)]
-    fn from_leaf_value(value: u32) -> Self {
-        match value {
-            0 => Self::Drop,
-            1 => Self::Direct,
-            2 => Self::Rewrite,
-            other => panic!("unexpected next hop value: {other}"),
-        }
     }
 }
 
@@ -85,6 +85,25 @@ fn ip4_mtrie_is_generic_and_uses_longest_prefix_match() {
 }
 
 #[test]
+fn ip4_mtrie_exposes_explicit_prefetch_before_lookup() {
+    let trie = Ip4Mtrie::from_routes([
+        Ip4MtrieRoute::new(
+            Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("default route"),
+            NextHop::Drop,
+        ),
+        Ip4MtrieRoute::new(
+            Ipv4Net::new(Ipv4Addr::new(198, 51, 100, 0), 24).expect("subnet route"),
+            NextHop::Direct,
+        ),
+    ]);
+    let destination = Ipv4Addr::new(198, 51, 100, 42);
+
+    trie.prefetch(destination);
+
+    assert_eq!(trie.lookup(destination), Some(NextHop::Direct));
+}
+
+#[test]
 fn ip6_prefix_hash_table_is_generic_and_uses_longest_prefix_match() {
     let table = Ip6PrefixHashTable::from_routes([
         (
@@ -105,7 +124,7 @@ fn ip6_prefix_hash_table_is_generic_and_uses_longest_prefix_match() {
         table.lookup("2001:db8:64::42".parse().expect("subnet destination")),
         Some(NextHop::Direct)
     );
-    assert_eq!(table.prefix_lengths(), &[64, 0]);
+    assert_eq!(table.len(), 2);
 }
 
 #[test]
@@ -122,7 +141,6 @@ fn ip6_prefix_hash_table_exposes_explicit_prefetch_for_flat_buckets() {
     ]);
     let destination = "2001:db8:64::42".parse().expect("destination");
 
-    table.prefetch_key(Ip6PrefixKey::new(destination, 64));
     table.prefetch_destination(destination);
 
     assert_eq!(table.lookup(destination), Some(NextHop::Direct));

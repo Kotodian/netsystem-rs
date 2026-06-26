@@ -1,3 +1,5 @@
+//! IPv4 FIB backed by the VPP-aligned `PackedMtrie` (16-8-8 stride).
+
 use std::net::Ipv4Addr;
 
 use ipnet::Ipv4Net;

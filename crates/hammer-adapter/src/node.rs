@@ -960,6 +960,28 @@ impl NodeRuntime {
         )
     }
 
+    /// Type-erased node registration entry point.
+    ///
+    /// Registers an already-constructed `NodeDescriptor` under the given
+    /// `NodeKind`. This is the erased counterpart to `try_register_internal<N>`
+    /// / `register_driver<N>`: it lets a `NodeFactory` (see `hammer-runtime`)
+    /// register a node without the concrete `N: InternalNode`/`DriverNode`
+    /// type being known at the call site, mirroring VPP's `vlib_node_t`
+    /// registration where every node is stored as a type-erased record.
+    ///
+    /// The descriptor's `initial_nexts` must satisfy the contract enforced by
+    /// `register_descriptor`: for `NodeRegistration::Next { next_count, .. }`
+    /// its length must equal `next_count` (use placeholder `NodeId`s when edges
+    /// are resolved later by name via `set_node_next_slot`).
+    #[inline]
+    pub fn try_register_descriptor(
+        &self,
+        kind: NodeKind,
+        descriptor: NodeDescriptor<'_>,
+    ) -> CoreResult<NodeId> {
+        self.register_descriptor(kind, descriptor)
+    }
+
     fn register_descriptor(
         &self,
         kind: NodeKind,

@@ -12,6 +12,7 @@ mod component_registry;
 mod control_thread;
 mod data_plane;
 pub mod endpoints;
+pub mod graph;
 pub mod inbounds;
 mod macros;
 pub mod outbounds;
