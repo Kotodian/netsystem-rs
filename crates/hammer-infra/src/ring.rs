@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use crossbeam_utils::CachePadded;
 
 use crate::boxed::Slice;
+use crate::prefetch::prefetch_read_l1;
 use crate::vec::Vec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -576,14 +577,14 @@ impl<T: Copy> LockFreeRing<T> {
     #[inline]
     pub fn available_to_read(&self) -> usize {
         let prod_tail = self.cursors.producer.tail.load(Ordering::Acquire);
-        let cons_head = self.cursors.consumer.head.load(Ordering::Relaxed);
+        let cons_head = self.cursors.consumer.head.load(Ordering::Acquire);
         prod_tail.wrapping_sub(cons_head) as usize
     }
 
     #[inline]
     pub fn available_to_write(&self) -> usize {
         let cons_tail = self.cursors.consumer.tail.load(Ordering::Acquire);
-        let prod_head = self.cursors.producer.head.load(Ordering::Relaxed);
+        let prod_head = self.cursors.producer.head.load(Ordering::Acquire);
         self.mask.wrapping_add(cons_tail).wrapping_sub(prod_head) as usize
     }
 
@@ -597,56 +598,161 @@ impl<T: Copy> LockFreeRing<T> {
         self.available_to_write() == 0
     }
 
+    /// Multi-producer enqueue.
+    ///
+    /// DPDK MP/MC CAS algorithm: a producer atomically reserves a slot by CASing
+    /// `producer.head` forward, writes the value, then waits for its turn
+    /// (`producer.tail == reserved_head`) before publishing `producer.tail`
+    /// with Release ordering. The Release publish pairs with the Acquire load
+    /// of `producer.tail` in `dequeue`, so the slot write is visible to
+    /// consumers before they observe the new tail.
+    ///
+    /// `T: Copy` guarantees slot reads do not leave ownership behind, so the
+    /// slot is logically vacant once `consumer.tail` advances past it.
+    ///
+    /// `head`/`tail` are wrapping `u32` counters; the slot index is `head &
+    /// mask`. ABA is bounded by u32 space (capacity - 1): a producer that
+    /// stalled through `u32::MAX` wraps would observe a stale `head` and CAS
+    /// loop until it reloads the current value. With batch sizes and producer
+    /// counts in the app-ring regime this wrap is effectively unreachable;
+    /// callers must not enqueue more than `u32::MAX` items over the lifetime of
+    /// a single ring without a wrap-aware cursor (documented assumption).
     #[inline]
-    pub fn enqueue_sp(&self, value: T) -> Result<(), RingError<T>> {
-        let prod_head = self.cursors.producer.head.load(Ordering::Relaxed);
-        let cons_tail = self.cursors.consumer.tail.load(Ordering::Acquire);
-        let free_entries = self.mask.wrapping_add(cons_tail).wrapping_sub(prod_head);
-        if free_entries == 0 {
-            return Err(RingError::Full(value));
+    pub fn enqueue(&self, value: T) -> Result<(), RingError<T>> {
+        let prod_head = loop {
+            let head = self.cursors.producer.head.load(Ordering::Acquire);
+            let cons_tail = self.cursors.consumer.tail.load(Ordering::Acquire);
+            let free = self.mask.wrapping_add(cons_tail).wrapping_sub(head);
+            if free == 0 {
+                return Err(RingError::Full(value));
+            }
+            let next = head.wrapping_add(1);
+            match self.cursors.producer.head.compare_exchange_weak(
+                head,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break head,
+                Err(_) => std::hint::spin_loop(),
+            }
+        };
+
+        let slot = (prod_head & self.mask) as usize;
+        // SAFETY: `prod_head & mask` selects a slot inside the power-of-two
+        // table. The CAS above reserved this slot exclusively for this
+        // producer until `producer.tail` is published below. No other producer
+        // writes to it and no consumer reads it until the Release store of
+        // `producer.tail` pairs with their Acquire load.
+        unsafe {
+            (*self.slots[slot].value.get()).write(value);
         }
 
-        let prod_next = prod_head.wrapping_add(1);
-        self.cursors
-            .producer
-            .head
-            .store(prod_next, Ordering::Relaxed);
-        let slot = (prod_head & self.mask) as usize;
-        // SAFETY: This is the single-producer API. `free_entries > 0` reserves
-        // the slot indexed by the current producer head until producer tail is
-        // published below. The slot is inside the power-of-two ring table.
-        unsafe { (*self.slots[slot].value.get()).write(value) };
+        // Wait for prior producers to publish their tail so we preserve
+        // FIFO order: only the producer whose reserved head matches the
+        // current tail may publish. Other producers may still be writing
+        // their slots; we must not overtake them or a consumer could read
+        // an uninitialised slot between our publish and theirs.
+        while self.cursors.producer.tail.load(Ordering::Acquire) != prod_head {
+            std::hint::spin_loop();
+        }
         self.cursors
             .producer
             .tail
-            .store(prod_next, Ordering::Release);
+            .store(prod_head.wrapping_add(1), Ordering::Release);
         Ok(())
     }
 
+    /// Multi-consumer dequeue.
+    ///
+    /// Symmetric to `enqueue`: a consumer CASes `consumer.head` forward to
+    /// reserve a slot, reads the value (Acquire load of `producer.tail` proves
+    /// the slot was published), waits for its turn, then publishes
+    /// `consumer.tail` with Release ordering so producers observe the freed
+    /// slot in order.
     #[inline]
-    pub fn dequeue_sc(&self) -> Option<T> {
-        let cons_head = self.cursors.consumer.head.load(Ordering::Relaxed);
-        let prod_tail = self.cursors.producer.tail.load(Ordering::Acquire);
-        let entries = prod_tail.wrapping_sub(cons_head);
-        if entries == 0 {
-            return None;
-        }
+    pub fn dequeue(&self) -> Option<T> {
+        let cons_head = loop {
+            let head = self.cursors.consumer.head.load(Ordering::Acquire);
+            let prod_tail = self.cursors.producer.tail.load(Ordering::Acquire);
+            let entries = prod_tail.wrapping_sub(head);
+            if entries == 0 {
+                return None;
+            }
+            let next = head.wrapping_add(1);
+            match self.cursors.consumer.head.compare_exchange_weak(
+                head,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break head,
+                Err(_) => std::hint::spin_loop(),
+            }
+        };
 
-        let cons_next = cons_head.wrapping_add(1);
-        self.cursors
-            .consumer
-            .head
-            .store(cons_next, Ordering::Relaxed);
         let slot = (cons_head & self.mask) as usize;
-        // SAFETY: This is the single-consumer API. `entries > 0` proves the
-        // producer published this slot before the acquire load of producer
-        // tail. `T: Copy`, so reading does not leave ownership to drop.
+        // Prefetch is unnecessary for a single dequeue; batch loops issue
+        // ahead-of-touch prefetches instead.
+        // SAFETY: `cons_head & mask` selects a slot inside the table. The
+        // Acquire load of `producer.tail` above observed `prod_tail >
+        // cons_head`, which pairs with the Release store in `enqueue` that
+        // followed the slot write. `T: Copy` means reading does not leave
+        // ownership to drop.
         let value = unsafe { (*self.slots[slot].value.get()).assume_init_read() };
+
+        while self.cursors.consumer.tail.load(Ordering::Acquire) != cons_head {
+            std::hint::spin_loop();
+        }
         self.cursors
             .consumer
             .tail
-            .store(cons_next, Ordering::Release);
+            .store(cons_head.wrapping_add(1), Ordering::Release);
         Some(value)
+    }
+
+    /// Dequeue up to `out.len()` items into `out`, stopping when the ring is
+    /// empty. Issues an L1 prefetch for the next slot before each read so the
+    /// cacheline is warm by the time the load executes. Returns the number of
+    /// items moved into `out`.
+    #[inline]
+    pub fn dequeue_batch(&self, out: &mut [T]) -> usize {
+        let mut count = 0;
+        while count < out.len() {
+            // Prefetch the slot we are about to read. `available_to_read` is
+            // a hint; if it under-reports (consumer head advanced after the
+            // load) the prefetch targets a slot that may be re-used, which is
+            // benign for a read hint.
+            if self.available_to_read() == 0 {
+                break;
+            }
+            let next_head = self.cursors.consumer.head.load(Ordering::Acquire);
+            let next_slot = (next_head & self.mask) as usize;
+            // Prefetch is a read hint and never dereferences for side effects;
+            // targeting a slot that may be re-used (consumer head advanced
+            // after the load) is benign for a read hint.
+            prefetch_read_l1(self.slots[next_slot].value.get() as *const _);
+            let Some(value) = self.dequeue() else {
+                break;
+            };
+            out[count] = value;
+            count += 1;
+        }
+        count
+    }
+
+    /// Enqueue up to `values.len()` items from `values`, stopping at the first
+    /// `RingError::Full`. Returns the number of items successfully enqueued.
+    #[inline]
+    pub fn enqueue_batch(&self, values: &[T]) -> usize {
+        let mut count = 0;
+        while count < values.len() {
+            if let Err(RingError::Full(_)) = self.enqueue(values[count]) {
+                break;
+            }
+            count += 1;
+        }
+        count
     }
 }
 
