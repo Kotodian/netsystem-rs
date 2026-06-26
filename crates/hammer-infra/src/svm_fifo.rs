@@ -28,15 +28,15 @@ impl std::error::Error for SvmFifoError {}
 
 #[repr(C)]
 pub struct SvmFifoCursors {
-    head: AtomicU32,
-    tail: AtomicU32,
+    head: CachePadded<AtomicU32>,
+    tail: CachePadded<AtomicU32>,
 }
 
 impl SvmFifoCursors {
     const fn new() -> Self {
         Self {
-            head: AtomicU32::new(0),
-            tail: AtomicU32::new(0),
+            head: CachePadded::new(AtomicU32::new(0)),
+            tail: CachePadded::new(AtomicU32::new(0)),
         }
     }
 }
@@ -44,7 +44,7 @@ impl SvmFifoCursors {
 pub struct SvmFifo {
     mask: u32,
     capacity: u32,
-    cursors: CachePadded<SvmFifoCursors>,
+    cursors: SvmFifoCursors,
     want_notification: AtomicBool,
     data: Slice<u8>,
 }
@@ -58,7 +58,7 @@ impl SvmFifo {
         Ok(Self {
             mask: capacity - 1,
             capacity,
-            cursors: CachePadded::new(SvmFifoCursors::new()),
+            cursors: SvmFifoCursors::new(),
             want_notification: AtomicBool::new(false),
             data: Slice::from_elem(capacity as usize, 0u8),
         })
@@ -200,17 +200,29 @@ impl SvmFifo {
         if wrote == 0 {
             return false;
         }
-        if !self.want_notification.load(Ordering::Acquire) {
-            return false;
-        }
         let tail = self.cursors.tail.load(Ordering::Acquire);
         let tail_before = tail.wrapping_sub(wrote as u32);
         let head = self.cursors.head.load(Ordering::Acquire);
         if head != tail_before {
             return false;
         }
-        self.want_notification.store(false, Ordering::Release);
-        true
+
+        // Empty→non-empty this enqueue. Claim `want_notification` with CAS so a
+        // concurrent `want_notification()` after our transition check cannot be
+        // wiped by an unconditional store (missed wakeup). If CAS fails because
+        // want was false, re-load; if the consumer re-set want, retry the claim.
+        loop {
+            if self
+                .want_notification
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+            if !self.want_notification.load(Ordering::Acquire) {
+                return false;
+            }
+        }
     }
 
     pub fn clear(&self) {
@@ -285,6 +297,33 @@ mod tests {
 
         fifo.want_notification();
         assert!(!fifo.should_signal(fifo.enqueue(&[3])));
+    }
+
+    #[test]
+    fn should_signal_concurrent_want_notification() {
+        use std::sync::atomic::AtomicBool;
+
+        let fifo = Arc::new(SvmFifo::with_capacity(8).unwrap());
+        let toggler_fifo = Arc::clone(&fifo);
+        let stop = Arc::new(AtomicBool::new(false));
+
+        fifo.want_notification();
+
+        let stop_flag = Arc::clone(&stop);
+        let toggler = thread::spawn(move || {
+            while !stop_flag.load(Ordering::Acquire) {
+                toggler_fifo.want_notification();
+                thread::yield_now();
+            }
+        });
+
+        assert!(fifo.is_empty());
+        let wrote = fifo.enqueue(&[42]);
+        assert_eq!(wrote, 1);
+        assert!(fifo.should_signal(wrote));
+
+        stop.store(true, Ordering::Release);
+        toggler.join().unwrap();
     }
 
     #[test]
