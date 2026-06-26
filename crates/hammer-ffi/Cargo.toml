@@ -12,17 +12,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 # `cli` feature of uniffi does not get unified into the iOS staticlib build.
 
 [features]
-# Default is the iOS NetExt baseline: TUN inbound, the outbounds the route
-# engine always reaches for, and outbound probing.
-default = [
-    "hammer-service/inbound-tun",
-    "hammer-service/outbound-block",
-    "hammer-service/probe",
-]
-# Generic endpoint config/service wiring; required by endpoint-style protocols.
-endpoint = ["hammer-service/endpoint"]
-# WireGuard endpoint stack. Opt-in.
-wireguard = ["endpoint", "hammer-core/wireguard", "hammer-service/endpoint-wireguard"]
+default = []
 [dependencies]
 hammer-core = { path = "../hammer-core" }
 hammer-adapter = { path = "../hammer-adapter" }

@@ -1,27 +1,27 @@
 use hammer_adapter::{
-    DataPlaneRuntime, Node, NodeId, NodeProcessFn, NodeResult, NodeRuntimeData,
+    DataPlaneRuntime, InternalNode, Node, NodeId, NodeKind, NodeProcessFn, NodeRegistration,
+    NodeResult, NodeRuntimeData,
 };
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_runtime::graph::{GraphSpec, NodeCtx, NodeRegistry, PacketGraphAssembler};
+use hammer_runtime::graph::Graph;
 
 #[hammer_component_macros::node_next]
 enum TestNext {
     Drop,
-    #[allow(dead_code)]
-    Lookup,
 }
 
-#[hammer_component_macros::node(role = internal)]
+#[derive(Clone, Copy)]
 struct DropNode;
+
+impl DropNode {
+    #[inline]
+    fn new() -> Self {
+        Self
+    }
+}
 
 #[hammer_component_macros::node(role = internal, next = TestNext)]
 struct TestOutputNode;
-
-/// Service-defined dependency bag for the test graph. The graph layer is
-/// generic over `D` and never names its fields; the test reads them directly.
-struct TestDeps {
-    runtime_data_seed: u64,
-}
 
 fn noop_process(
     _runtime: &DataPlaneRuntime,
@@ -50,6 +50,13 @@ impl Node for DropNode {
     }
 }
 
+impl InternalNode for DropNode {
+    #[inline]
+    fn node_registration(&self) -> NodeRegistration {
+        NodeRegistration::next("drop-node", 0)
+    }
+}
+
 impl Node for TestOutputNode {
     #[inline(always)]
     fn process(
@@ -69,40 +76,69 @@ impl Node for TestOutputNode {
     }
 }
 
-fn build_drop(ctx: &NodeCtx<'_, TestDeps>) -> CoreResult<NodeId> {
-    // Touch the dependency bag to prove the typed `D` path works end-to-end.
-    let _seed = ctx.deps().runtime_data_seed;
-    let _ = _seed;
-    ctx.runtime().try_register_internal(DropNode::new())
+fn init_drop(runtime: &hammer_adapter::NodeRuntime, _: usize, _: &()) -> CoreResult<NodeId> {
+    runtime.try_register_internal(DropNode::new())
 }
 
-fn build_test_output(ctx: &NodeCtx<'_, TestDeps>) -> CoreResult<NodeId> {
-    let drop = ctx.node("drop-node")?;
-    let next = TestNext::nodes(drop, drop);
-    ctx.runtime().try_register_internal(TestOutputNode::new(next))
+fn init_test_output(runtime: &hammer_adapter::NodeRuntime, _: usize, _: &()) -> CoreResult<NodeId> {
+    runtime.try_register_internal_with_next_names(
+        TestOutputNode::new([NodeId::new(0); TestNext::COUNT]),
+        &TestNext::NEXT_NAMES,
+    )
+}
+
+static TEST_GRAPH_NODES: [(
+    NodeRegistration,
+    NodeKind,
+    fn(&hammer_adapter::NodeRuntime, usize, &()) -> CoreResult<NodeId>,
+    Option<fn(&hammer_adapter::NodeRuntime, usize, &()) -> CoreResult<()>>,
+); 2] = [
+    (
+        NodeRegistration::next("drop-node", 0),
+        NodeKind::Internal,
+        init_drop,
+        None,
+    ),
+    (
+        NodeRegistration::next("test-output-node", TestNext::COUNT),
+        NodeKind::Internal,
+        init_test_output,
+        None,
+    ),
+];
+
+fn graph_node_slot(
+    graph_nodes: &[(
+        NodeRegistration,
+        NodeKind,
+        fn(&hammer_adapter::NodeRuntime, usize, &()) -> CoreResult<NodeId>,
+        Option<fn(&hammer_adapter::NodeRuntime, usize, &()) -> CoreResult<()>>,
+    )],
+    name: &str,
+) -> Option<NodeId> {
+    graph_nodes
+        .iter()
+        .position(|(registration, ..)| match registration {
+            NodeRegistration::Next {
+                name: node_name, ..
+            }
+            | NodeRegistration::Sibling {
+                name: node_name, ..
+            } => *node_name == name,
+            NodeRegistration::Plain => false,
+        })
+        .and_then(|slot| u32::try_from(slot).ok())
+        .map(NodeId::new)
 }
 
 #[test]
-fn assembler_registers_nodes_in_dependency_order() {
+fn graph_init_resolves_named_next_edges() {
     let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 2);
-    let mut registry: NodeRegistry<TestDeps> = NodeRegistry::new();
-    registry
-        .register("drop-node", build_drop)
-        .expect("register drop");
-    registry
-        .register("test-output-node", build_test_output)
-        .expect("register test-output");
+    let graph = Graph::new(&TEST_GRAPH_NODES);
+    graph.init(runtime.nodes(), 0, &()).expect("init");
 
-    let spec = GraphSpec::from_names(["drop-node", "test-output-node"]);
-    let assembler = PacketGraphAssembler::new(&registry, spec);
-    let deps = TestDeps {
-        runtime_data_seed: 42,
-    };
-    let graph = assembler
-        .assemble_on(runtime.nodes(), 0, &deps)
-        .expect("assemble");
-
-    let [drop_id, out_id] = [graph.nodes[0], graph.nodes[1]];
+    let drop_id = graph.node("drop-node").expect("drop");
+    let out_id = graph.node("test-output-node").expect("output");
     assert_eq!(runtime.node_by_name("test-output-node"), Some(out_id));
     assert_eq!(
         runtime
@@ -113,21 +149,75 @@ fn assembler_registers_nodes_in_dependency_order() {
     );
 }
 
+static REVERSE_GRAPH_NODES: [(
+    NodeRegistration,
+    NodeKind,
+    fn(&hammer_adapter::NodeRuntime, usize, &()) -> CoreResult<NodeId>,
+    Option<fn(&hammer_adapter::NodeRuntime, usize, &()) -> CoreResult<()>>,
+); 2] = [
+    (
+        NodeRegistration::next("test-output-node", TestNext::COUNT),
+        NodeKind::Internal,
+        init_test_output,
+        None,
+    ),
+    (
+        NodeRegistration::next("drop-node", 0),
+        NodeKind::Internal,
+        init_drop,
+        None,
+    ),
+];
+
 #[test]
-fn node_registry_rejects_duplicate_name() {
-    let mut registry: NodeRegistry<TestDeps> = NodeRegistry::new();
-    registry
-        .register("dup-node", build_drop)
-        .expect("first register");
-    let err = registry
-        .register("dup-node", build_drop)
-        .expect_err("duplicate must fail");
-    assert!(err.to_string().contains("node builder already registered"));
+fn graph_init_allows_reverse_registration_order() {
+    let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 2);
+    let graph = Graph::new(&REVERSE_GRAPH_NODES);
+    graph
+        .init(runtime.nodes(), 0, &())
+        .expect("init reverse order");
+    assert!(runtime.node_by_name("test-output-node").is_some());
 }
 
 #[test]
-fn node_registry_errors_on_unknown_name() {
-    let registry: NodeRegistry<TestDeps> = NodeRegistry::new();
-    let err = registry.get("nope").expect_err("unknown must fail");
-    assert!(err.to_string().contains("node builder not registered"));
+fn graph_register_supports_dynamic_nodes() {
+    let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 2);
+    let graph = Graph::<()>::new(&[]);
+    graph
+        .register(
+            NodeRegistration::next("drop-node", 0),
+            NodeKind::Internal,
+            init_drop,
+            None,
+        )
+        .expect("register");
+    graph.init(runtime.nodes(), 0, &()).expect("init");
+    assert!(graph.node("drop-node").is_some());
+}
+
+#[test]
+fn graph_register_rejects_duplicate_name() {
+    let graph = Graph::<()>::new(&TEST_GRAPH_NODES);
+    let err = graph
+        .register(
+            NodeRegistration::next("drop-node", 0),
+            NodeKind::Internal,
+            init_drop,
+            None,
+        )
+        .expect_err("duplicate");
+    assert!(err.to_string().contains("already registered"));
+}
+
+#[test]
+fn graph_node_maps_registration_name_to_slot_id() {
+    assert_eq!(
+        graph_node_slot(&TEST_GRAPH_NODES, "drop-node"),
+        Some(NodeId::new(0))
+    );
+    assert_eq!(
+        graph_node_slot(&TEST_GRAPH_NODES, "test-output-node"),
+        Some(NodeId::new(1))
+    );
+    assert!(graph_node_slot(&TEST_GRAPH_NODES, "missing").is_none());
 }

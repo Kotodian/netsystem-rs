@@ -752,9 +752,7 @@ impl TcpRecoveryState {
             cursor = next;
         }
         if self.recovery_active && total_acked_bytes != 0 {
-            self.recovery_delivered = self
-                .recovery_delivered
-                .saturating_add(total_acked_bytes);
+            self.recovery_delivered = self.recovery_delivered.saturating_add(total_acked_bytes);
         }
         if any_acked {
             congestion.on_end_acks(
@@ -1083,11 +1081,7 @@ impl TcpRecoveryState {
     /// never create holes above `snd_una` — so trimming at `acknowledgment` is
     /// equivalent to a full rebuild. SACK ops still call `rebuild_scoreboard`
     /// (which is where sacked-sample removal creates/merges holes).
-    fn advance_scoreboard_for_ack(
-        &mut self,
-        acknowledgment: TcpSeq,
-        max_datagram_size: u32,
-    ) {
+    fn advance_scoreboard_for_ack(&mut self, acknowledgment: TcpSeq, max_datagram_size: u32) {
         self.scoreboard.high_sacked = self.scoreboard.high_sacked.max(acknowledgment);
         // Match rebuild_scoreboard, which resets high_rxt to the cumulative ACK
         // on every scoreboard update (take_rack_retransmit raises it again when
@@ -1143,9 +1137,7 @@ impl TcpRecoveryState {
         if let Some(head) = self.sample_head {
             let first = self.sent_sample(head);
             if first.sequence > acknowledgment && acknowledgment < self.scoreboard.high_sacked {
-                let leading_end = first
-                    .sequence
-                    .min(self.scoreboard.high_sacked);
+                let leading_end = first.sequence.min(self.scoreboard.high_sacked);
                 match self.scoreboard.holes.get_mut(&acknowledgment) {
                     Some(hole) => {
                         if hole.end < leading_end {
@@ -2354,8 +2346,8 @@ mod tests {
         );
 
         // earliest must still reflect sample 1's real deadline (now+50ms), not the phantom now+33ms.
-        let expected = first_earliest
-            .map(|d| d.saturating_duration_since(now + Duration::from_millis(31)));
+        let expected =
+            first_earliest.map(|d| d.saturating_duration_since(now + Duration::from_millis(31)));
         assert_eq!(
             recovery.rack_timeout(now + Duration::from_millis(31)),
             expected,
@@ -2398,10 +2390,7 @@ mod tests {
             ack(2_000, now + Duration::from_millis(50), 40),
             &mut controller,
         );
-        assert_eq!(
-            recovery.rack_timeout(now + Duration::from_millis(50)),
-            None
-        );
+        assert_eq!(recovery.rack_timeout(now + Duration::from_millis(50)), None);
     }
 
     #[test]
@@ -2445,11 +2434,7 @@ mod tests {
             }],
             &mut controller,
         );
-        assert_rack_matches_scan(
-            &recovery,
-            now + Duration::from_millis(30),
-            "after sack",
-        );
+        assert_rack_matches_scan(&recovery, now + Duration::from_millis(30), "after sack");
 
         recovery.on_rack_timeout(
             now + Duration::from_millis(60),
@@ -2473,11 +2458,7 @@ mod tests {
             ack(2_000, now + Duration::from_millis(70), 40),
             &mut controller,
         );
-        assert_rack_matches_scan(
-            &recovery,
-            now + Duration::from_millis(70),
-            "after ack",
-        );
+        assert_rack_matches_scan(&recovery, now + Duration::from_millis(70), "after ack");
     }
 
     #[test]
@@ -2580,7 +2561,11 @@ mod tests {
             &mut controller,
         );
         assert_eq!(
-            controller.acked.iter().map(|p| p.packet_number).collect::<Vec<_>>(),
+            controller
+                .acked
+                .iter()
+                .map(|p| p.packet_number)
+                .collect::<Vec<_>>(),
             vec![1, 2],
             "cumulative ack must deliver segments in ascending order"
         );
@@ -2640,7 +2625,10 @@ mod tests {
         );
         assert!(controller.acked.is_empty());
         assert!(controller.acked_bytes_in_flight.is_empty());
-        assert_eq!(controller.end_acks, 0, "no-op ack must not fire on_end_acks");
+        assert_eq!(
+            controller.end_acks, 0,
+            "no-op ack must not fire on_end_acks"
+        );
         assert_eq!(recovery.bytes_in_flight(), 500);
         assert_eq!(
             recovery.recovery_delivered_for_test(),
@@ -2679,9 +2667,7 @@ mod tests {
             .find("pub fn on_ack<")
             .expect("on_ack definition");
         let on_ack_body = &module_body[on_ack_start..];
-        let on_ack_end = on_ack_body
-            .find("    }\n")
-            .expect("on_ack closing brace");
+        let on_ack_end = on_ack_body.find("    }\n").expect("on_ack closing brace");
         let on_ack_body = &on_ack_body[..on_ack_end];
         assert!(
             !on_ack_body.contains("take_acked_segments"),
@@ -2700,9 +2686,9 @@ mod tests {
             "scoreboard key collection must use the inline ScoreboardKeyCollector"
         );
         for fn_name in ["fn advance_scoreboard_for_ack", "fn update_scoreboard_loss"] {
-            let fn_start = module_body.find(fn_name).unwrap_or_else(|| {
-                panic!("{fn_name} not found in recovery.rs module body")
-            });
+            let fn_start = module_body
+                .find(fn_name)
+                .unwrap_or_else(|| panic!("{fn_name} not found in recovery.rs module body"));
             let fn_body = &module_body[fn_start..];
             // Find the next top-level `    fn ` or `}` at column 4 to bound the body.
             let fn_end = fn_body[1..]
@@ -2743,7 +2729,10 @@ mod tests {
         c.for_each(|k| out.push(u32::from(k)));
         assert_eq!(out.len(), SCOREBOARD_KEY_INLINE_CAP);
         assert_eq!(out[0], 2_000);
-        assert_eq!(out[SCOREBOARD_KEY_INLINE_CAP - 1], 2_000 + (SCOREBOARD_KEY_INLINE_CAP - 1) as u32);
+        assert_eq!(
+            out[SCOREBOARD_KEY_INLINE_CAP - 1],
+            2_000 + (SCOREBOARD_KEY_INLINE_CAP - 1) as u32
+        );
 
         // Overflow: spilled keys appear after inline keys, in insertion order.
         let mut c = ScoreboardKeyCollector::new();
@@ -2754,7 +2743,11 @@ mod tests {
         c.for_each(|k| out.push(u32::from(k)));
         assert_eq!(out.len(), SCOREBOARD_KEY_INLINE_CAP + 4);
         for i in 0..out.len() {
-            assert_eq!(out[i], 3_000 + i as u32, "overflow must preserve order at {i}");
+            assert_eq!(
+                out[i],
+                3_000 + i as u32,
+                "overflow must preserve order at {i}"
+            );
         }
 
         // Reverse iteration honors overflow-then-inline with correct ordering.
@@ -2788,7 +2781,14 @@ mod tests {
         const N: u32 = (SCOREBOARD_KEY_INLINE_CAP as u32) * 2 + 2; // 18 samples
         for i in 0..N {
             let seq = 1_000 + i * SEG;
-            record_sent_for_test(&mut recovery, i as PacketNumber + 1, seq, seq + SEG, SEG, now + Duration::from_millis(i as u64));
+            record_sent_for_test(
+                &mut recovery,
+                i as PacketNumber + 1,
+                seq,
+                seq + SEG,
+                SEG,
+                now + Duration::from_millis(i as u64),
+            );
         }
 
         // SACK every even-indexed segment to create gaps; ack_floor stays at 1000.
@@ -2828,7 +2828,10 @@ mod tests {
         // top 3 holes). Verify lost_bytes reflects lost sample bytes by checking
         // that lost_bytes > 0 and matches a full sample scan.
         let snap = recovery.scoreboard_snapshot();
-        assert!(snap.lost_bytes > 0, "loss marking must fire on oversized hole set");
+        assert!(
+            snap.lost_bytes > 0,
+            "loss marking must fire on oversized hole set"
+        );
 
         // Cross-check: scoreboard `lost_bytes` must equal the sum of outstanding
         // sample bytes flagged `lost` (the unified per-sample loss path). This
@@ -2910,8 +2913,22 @@ mod tests {
                         let seq = next_seq;
                         next_seq = next_seq.saturating_add(SEG);
                         let pn = ((seq / SEG) as u64).max(1) as PacketNumber;
-                        record_sent_for_test(&mut live, pn, seq, seq + SEG, SEG, now + Duration::from_millis(step));
-                        record_sent_for_test(&mut oracle, pn, seq, seq + SEG, SEG, now + Duration::from_millis(step));
+                        record_sent_for_test(
+                            &mut live,
+                            pn,
+                            seq,
+                            seq + SEG,
+                            SEG,
+                            now + Duration::from_millis(step),
+                        );
+                        record_sent_for_test(
+                            &mut oracle,
+                            pn,
+                            seq,
+                            seq + SEG,
+                            SEG,
+                            now + Duration::from_millis(step),
+                        );
                     }
                     1 => {
                         // Cumulative TCP ACK is monotonic non-decreasing: only
@@ -2968,13 +2985,17 @@ mod tests {
                 // `clears` intentionally differs: the incremental path must clear
                 // less often than the full-rebuild oracle.
                 assert_eq!(
-                    live_snap.holes, oracle_snap.holes,
+                    live_snap.holes,
+                    oracle_snap.holes,
                     "seq {sequence} step {step}: holes diverged\n\
                      live={:?}\noracle={:?}\n\
                      live_samples={live_samples:?}\noracle_samples={oracle_samples:?}\n\
                      ack_floor={} high_sacked_live={} high_sacked_oracle={}",
-                    live_snap.holes, oracle_snap.holes,
-                    u32::from(live.ack_floor), live_snap.high_sacked, oracle_snap.high_sacked,
+                    live_snap.holes,
+                    oracle_snap.holes,
+                    u32::from(live.ack_floor),
+                    live_snap.high_sacked,
+                    oracle_snap.high_sacked,
                 );
                 assert_eq!(
                     live_snap.high_sacked, oracle_snap.high_sacked,
@@ -2985,12 +3006,15 @@ mod tests {
                     "seq {sequence} step {step}: high_rxt diverged",
                 );
                 assert_eq!(
-                    live_snap.lost_bytes, oracle_snap.lost_bytes,
+                    live_snap.lost_bytes,
+                    oracle_snap.lost_bytes,
                     "seq {sequence} step {step}: lost_bytes diverged (live={} oracle={})\n\
                      live_samples={live_samples:?}\noracle_samples={oracle_samples:?}\n\
                      live_holes={:?}\noracle_holes={:?}",
-                    live_snap.lost_bytes, oracle_snap.lost_bytes,
-                    live_snap.holes, oracle_snap.holes,
+                    live_snap.lost_bytes,
+                    oracle_snap.lost_bytes,
+                    live_snap.holes,
+                    oracle_snap.holes,
                 );
                 assert_eq!(
                     live_samples, oracle_samples,

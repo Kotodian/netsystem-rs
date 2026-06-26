@@ -1,48 +1,5 @@
 use std::collections::HashMap;
 
-#[cfg(any(feature = "outbound-block"))]
-pub(crate) trait OutboundComponentDeclaration {
-    const TYPE_NAME: &'static str;
-
-    fn build(
-        logger: hammer_core::log::Logger,
-        id: String,
-        kind: &hammer_core::config::OutboundKind,
-        protector: crate::socket_protector::SocketProtector,
-        control_handle: Option<std::sync::Arc<crate::ControlThreadHandle>>,
-    ) -> hammer_core::error::HammerResult<hammer_adapter::outbound::OutboundComponent>;
-}
-
-#[cfg(any(feature = "outbound-block"))]
-pub(crate) fn register_outbound_component<C>(
-    builders: &mut HashMap<&'static str, crate::outbounds::OutboundBuilder>,
-) where
-    C: OutboundComponentDeclaration,
-{
-    builders.insert(C::TYPE_NAME, C::build);
-}
-
-#[cfg(feature = "endpoint-wireguard")]
-pub(crate) trait EndpointComponentDeclaration {
-    const TYPE_NAME: &'static str;
-
-    fn build(
-        logger: hammer_core::log::Logger,
-        option: &hammer_core::config::Endpoint,
-        platform: Option<std::sync::Arc<dyn hammer_adapter::PlatformInterface>>,
-        control_handle: Option<std::sync::Arc<crate::ControlThreadHandle>>,
-    ) -> hammer_core::error::HammerResult<hammer_adapter::EndpointComponent>;
-}
-
-#[cfg(feature = "endpoint-wireguard")]
-pub(crate) fn register_endpoint_component<C>(
-    builders: &mut HashMap<&'static str, crate::endpoints::EndpointBuilder>,
-) where
-    C: EndpointComponentDeclaration,
-{
-    builders.insert(C::TYPE_NAME, C::build);
-}
-
 pub trait EventSubscriberComponentDeclaration {
     const TYPE_NAME: &'static str;
 
@@ -60,20 +17,14 @@ pub fn register_event_subscriber_component<C>(
     builders.insert(C::TYPE_NAME, C::build);
 }
 
-#[cfg(any(test, feature = "outbound-block", feature = "endpoint-wireguard",))]
+#[cfg(any(test))]
 macro_rules! register_components {
-    (outbound, $builders:expr, [$($component:path),* $(,)?]) => {
-        $(crate::component_registry::register_outbound_component::<$component>($builders);)*
-    };
-    (endpoint, $builders:expr, [$($component:path),* $(,)?]) => {
-        $(crate::component_registry::register_endpoint_component::<$component>($builders);)*
-    };
     (event, $builders:expr, [$($component:path),* $(,)?]) => {
         $(crate::component_registry::register_event_subscriber_component::<$component>($builders);)*
     };
 }
 
-#[cfg(any(feature = "outbound-block", feature = "endpoint-wireguard",))]
+#[cfg(test)]
 pub(crate) use register_components;
 
 #[cfg(test)]

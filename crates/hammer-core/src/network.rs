@@ -1,7 +1,7 @@
 use std::fmt;
 use std::net::IpAddr;
 
-/// Mirror of Go's `network` enum used by Outbound.Network() / Listen* paths.
+/// Network family used by dial/listen paths.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Deserialize, serde::Serialize,
 )]

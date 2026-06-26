@@ -43,13 +43,15 @@ macro_rules! with_congestion {
     (|$cc:ident| $body:expr) => {{
         match crate::transport::TRANSPORT_MAIN
             .get()
-            .ok_or_else(|| ::hammer_core::error::CoreError::internal("transport main not initialized"))?
+            .ok_or_else(|| {
+                ::hammer_core::error::CoreError::internal("transport main not initialized")
+            })?
             .congestion()
         {
-            ::hammer_core::config::network::CongestionController::Bbr => {{
+            ::hammer_core::config::network::CongestionController::Bbr => {
                 type $cc = $crate::transport::congestion::BbrController;
                 $body
-            }}
+            }
         }
     }};
 }

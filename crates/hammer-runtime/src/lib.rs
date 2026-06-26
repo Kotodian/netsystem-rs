@@ -12,12 +12,12 @@ mod component_registry;
 mod control_thread;
 mod data_plane;
 pub mod graph;
-mod numa;
-mod worker_thread;
 mod macros;
+mod numa;
 pub mod protocol;
 mod socket_protector;
 pub mod spawn;
+mod worker_thread;
 
 pub use component_registry::{
     EventSubscriberComponentDeclaration, register_event_subscriber_component,

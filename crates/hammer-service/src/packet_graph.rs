@@ -29,8 +29,12 @@ mod tests {
             .filter_map(|e| e.registration.name())
             .collect();
         for want in [
-            "drop", "handoff", "ip-lookup", "tcp-input",
-            "tcp-listen", "session-queue",
+            "drop",
+            "handoff",
+            "ip-lookup",
+            "tcp-input",
+            "tcp-listen",
+            "session-queue",
         ] {
             assert!(names.iter().any(|n| *n == want), "missing {want}");
         }

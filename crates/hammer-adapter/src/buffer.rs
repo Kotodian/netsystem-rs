@@ -789,8 +789,7 @@ impl DataPlaneBuffers {
     #[inline]
     pub fn free_index(&self, index: BufferIndex) {
         let mut cache = self.buffers.thread_cache.borrow_mut();
-        self
-            .buffers
+        self.buffers
             .arena
             .inner
             .borrow_mut()
@@ -1056,7 +1055,6 @@ impl DataPlaneBuffers {
     ) -> CoreResult<R> {
         self.buffers.with_current_chain_io_segments(index, f)
     }
-
 }
 
 impl DataPlaneRuntime {
@@ -2664,9 +2662,7 @@ impl BufferPoolInner {
             return;
         }
         if self.in_use_delta > 0 {
-            self.in_use = self
-                .in_use
-                .saturating_add(self.in_use_delta as usize);
+            self.in_use = self.in_use.saturating_add(self.in_use_delta as usize);
         } else {
             let dec = self.in_use_delta.unsigned_abs() as usize;
             self.in_use = self.in_use.saturating_sub(dec);
@@ -4359,11 +4355,13 @@ mod tests {
             let mut guard = pool.arena.inner.borrow_mut();
             let entry = guard.slots.get_mut(index.slot() as usize).unwrap();
             entry.buffer.set_trace_handle(42);
-            assert!(!entry
-                .buffer
-                .cacheline0
-                .flags
-                .contains(BufferFlags::SLOT_CLEAN));
+            assert!(
+                !entry
+                    .buffer
+                    .cacheline0
+                    .flags
+                    .contains(BufferFlags::SLOT_CLEAN)
+            );
         }
         pool.free_index(index);
     }

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crossbeam_queue::SegQueue;
-use hammer_core::config::TraceOptions;
+use hammer_core::config::Trace;
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::log::Logger;
 use hammer_infra::map::FlatHashTable;
@@ -212,7 +212,7 @@ impl TraceControlPlane {
 
     pub fn publish_options(
         &self,
-        options: &TraceOptions,
+        options: &Trace,
         resolve_node: impl Fn(&str) -> Option<NodeId>,
     ) -> CoreResult<u64> {
         let mut inputs = Vec::with_capacity(options.inputs.len());

@@ -576,10 +576,7 @@ where
                 let rto = self.retransmit_timeout().retransmit_timeout();
                 let base_ticks = (rto.as_millis() / 10).max(1) as u64;
                 let shift = u32::from(self.cacheline1.persist_attempts.min(9));
-                let cap_ticks = TCP_MAX_RETRANSMIT_TIMEOUT
-                    .as_millis()
-                    .div_ceil(10)
-                    .max(1) as u64;
+                let cap_ticks = TCP_MAX_RETRANSMIT_TIMEOUT.as_millis().div_ceil(10).max(1) as u64;
                 let ticks = base_ticks
                     .checked_shl(shift)
                     .unwrap_or(u64::MAX)
@@ -1033,7 +1030,13 @@ where
         } else {
             TcpSegmentFlags::SYN | TcpSegmentFlags::ACK
         };
-        Ok(Some(self.control_segment(local, remote, flags, None, local_capabilities)))
+        Ok(Some(self.control_segment(
+            local,
+            remote,
+            flags,
+            None,
+            local_capabilities,
+        )))
     }
 
     pub(crate) fn receive_open_reply(
@@ -1530,10 +1533,7 @@ where
         Ok((None, timers))
     }
 
-    fn receive_fin_in_established(
-        &mut self,
-        packet: &TcpPacket,
-    ) -> CoreResult<Option<TcpSegment>> {
+    fn receive_fin_in_established(&mut self, packet: &TcpPacket) -> CoreResult<Option<TcpSegment>> {
         if packet.flags.contains(TcpSegmentFlags::FIN)
             && packet.sequence.advance(packet.payload_len as u32) == self.rcv_nxt
         {
@@ -3689,10 +3689,7 @@ mod tests {
         for _ in 0..15 {
             let _ = connection.on_tcp_timer_expiry(TCP_TIMER_PERSIST, TcpCapabilities::default());
         }
-        let capped_ticks: u64 = TCP_MAX_RETRANSMIT_TIMEOUT
-            .as_millis()
-            .div_ceil(10)
-            .max(1) as u64;
+        let capped_ticks: u64 = TCP_MAX_RETRANSMIT_TIMEOUT.as_millis().div_ceil(10).max(1) as u64;
         assert_eq!(
             connection.timer_ticks(TCP_TIMER_PERSIST, now),
             Some(capped_ticks),

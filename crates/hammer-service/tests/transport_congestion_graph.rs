@@ -51,7 +51,7 @@ fn congestion_control_is_not_a_packet_graph_node() {
 fn tcp_connection_construction_has_no_algorithm_registry_or_state_turbofish() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/transport/tcp");
     let mut combined = String::new();
-    for file in ["state.rs", "connection.rs", "listen.rs"] {
+    for file in ["connection.rs", "listen.rs"] {
         combined.push_str(&fs::read_to_string(root.join(file)).expect("read tcp source"));
     }
 

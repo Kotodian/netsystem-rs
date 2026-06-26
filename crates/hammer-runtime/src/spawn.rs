@@ -39,9 +39,11 @@ use std::time::{Duration, Instant};
 
 use hammer_adapter::node::NodeRuntimeStatsRow;
 use hammer_adapter::{DataPlaneBuffers, TraceControlHandle, TraceRecordSink};
+use hammer_core::config::Worker;
 use hammer_core::log::Logger;
 
 use crate::data_plane::{RuntimeDataPlaneRuntime, new_worker_runtime};
+use crate::worker_thread::apply_worker_thread_setup;
 use hammer_adapter::DataPlaneRuntime;
 use hammer_core::error::{HammerError, HammerResult};
 use tokio::runtime::Handle;
@@ -125,16 +127,22 @@ tokio::task_local! {
 thread_local! {
     static THREAD_DATA_CONTEXT: RefCell<Vec<DataRuntimeContext>> = const { RefCell::new(Vec::new()) };
     static CURRENT_DATA_WORKER: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
-    static DATA_PLANE_RUNTIME: RuntimeDataPlaneRuntime =
-        new_worker_runtime(DATA_BUFFER_SLOT_CAPACITY, DATA_BUFFER_SLOTS);
+    static DATA_PLANE_RUNTIME: RefCell<Option<RuntimeDataPlaneRuntime>> =
+        const { RefCell::new(None) };
+    static DATA_WORKER_IDLE_SLICE: Cell<Duration> =
+        const { Cell::new(Duration::from_millis(1)) };
     static DATA_LOCAL_TASKS: RefCell<VecDeque<Rc<DataLocalTask>>> =
         const { RefCell::new(VecDeque::new()) };
     static DATA_LOCAL_DRIVER_WAKER: RefCell<Option<Waker>> = const { RefCell::new(None) };
 }
 
-const DATA_BUFFER_SLOT_CAPACITY: usize = 2048;
-const DATA_BUFFER_SLOTS: usize = 4096;
-const DATA_WORKER_IDLE_SLICE: Duration = Duration::from_millis(1);
+fn init_data_plane_runtime(slot_capacity: usize, slots: usize) {
+    DATA_PLANE_RUNTIME.with(|runtime| {
+        if runtime.borrow().is_none() {
+            *runtime.borrow_mut() = Some(new_worker_runtime(slot_capacity, slots));
+        }
+    });
+}
 
 #[derive(Clone, Default)]
 struct DataRemoteLocalQueue {
@@ -149,11 +157,32 @@ impl DataRuntime {
         thread_stack_size: usize,
         max_blocking_threads: usize,
     ) -> HammerResult<Self> {
-        if worker_threads == 0 {
+        let mut worker = Worker::default();
+        worker.count = worker_threads;
+        worker.stack_size = thread_stack_size;
+        worker.max_blocking_threads = max_blocking_threads;
+        Self::from_config(&worker, thread_name)
+    }
+
+    pub fn from_config(worker: &Worker, thread_name: &str) -> HammerResult<Self> {
+        worker.validate().map_err(HammerError::from)?;
+        Self::spawn_workers(worker, thread_name)
+    }
+
+    fn spawn_workers(worker: &Worker, thread_name: &str) -> HammerResult<Self> {
+        if worker.count == 0 {
             return Err(HammerError::internal(
                 "data runtime must have at least one worker thread",
             ));
         }
+
+        let worker_threads = worker.count;
+        let thread_stack_size = worker.stack_size;
+        let max_blocking_threads = worker.max_blocking_threads;
+        let buffer_slot_bytes = worker.buffer.slot_bytes;
+        let buffer_slots = worker.buffer.slots_per_numa;
+        let idle_slice = worker.idle_slice;
+        let worker_config = worker.clone();
 
         let context_id = next_data_runtime_context_id();
         let barrier = Arc::new(DataPlaneBarrierState::new(worker_threads));
@@ -164,6 +193,7 @@ impl DataRuntime {
             let worker_barrier = Arc::clone(&barrier);
             let remote_local = DataRemoteLocalQueue::default();
             let worker_remote_local = remote_local.clone();
+            let worker_config = worker_config.clone();
             let (handle_tx, handle_rx) = std::sync::mpsc::channel::<Result<Handle, String>>();
             let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -172,6 +202,9 @@ impl DataRuntime {
                 .stack_size(thread_stack_size);
             let join = builder
                 .spawn(move || {
+                    apply_worker_thread_setup(&worker_config, index);
+                    DATA_WORKER_IDLE_SLICE.with(|slot| slot.set(idle_slice));
+                    init_data_plane_runtime(buffer_slot_bytes, buffer_slots);
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .max_blocking_threads(max_blocking_threads)
                         .enable_all()
@@ -191,6 +224,7 @@ impl DataRuntime {
                             DATA_LOCAL_TASKS.with(|tasks| tasks.borrow_mut().clear());
                             DATA_LOCAL_DRIVER_WAKER.with(|waker| waker.borrow_mut().take());
                             CURRENT_DATA_WORKER.with(|slot| slot.set(None));
+                            DATA_PLANE_RUNTIME.with(|slot| *slot.borrow_mut() = None);
                         }
                         Err(err) => {
                             let _ = handle_tx.send(Err(format!(
@@ -392,7 +426,7 @@ impl DataRuntimeContext {
         F: Fn(usize, &DataPlaneRuntime) -> R + Send + Sync + 'static,
         R: Send + 'static,
     {
-        self.for_each_worker(move |worker| DATA_PLANE_RUNTIME.with(|runtime| f(worker, runtime)))
+        self.for_each_worker(move |worker| with_data_plane_runtime(|runtime| f(worker, runtime)))
     }
 
     pub fn set_trace_control_on_workers(
@@ -402,7 +436,7 @@ impl DataRuntimeContext {
     ) -> HammerResult<()> {
         let _ = packet_capacity;
         self.for_each_worker(move |_| {
-            DATA_PLANE_RUNTIME.with(|runtime| {
+            with_data_plane_runtime(|runtime| {
                 runtime.set_trace_control(control.clone(), 0);
             });
         })
@@ -425,8 +459,9 @@ impl DataRuntimeContext {
 
     pub fn runtime_stats_on_workers(&self) -> HammerResult<Vec<(usize, Vec<NodeRuntimeStatsRow>)>> {
         self.for_each_worker(move |worker| {
-            DATA_PLANE_RUNTIME
-                .with(|runtime| (worker, runtime.nodes().node_runtime_stats_snapshot()))
+            with_data_plane_runtime(|runtime| {
+                (worker, runtime.nodes().node_runtime_stats_snapshot())
+            })
         })
     }
 
@@ -441,8 +476,9 @@ impl DataRuntimeContext {
                 worker
                     .handle
                     .spawn(TASK_DATA_CONTEXT.scope(context, async move {
-                        let rows = DATA_PLANE_RUNTIME
-                            .with(|runtime| runtime.nodes().node_runtime_stats_snapshot());
+                        let rows = with_data_plane_runtime(|runtime| {
+                            runtime.nodes().node_runtime_stats_snapshot()
+                        });
                         let _ = tx.send((index, rows));
                     })),
             );
@@ -1214,7 +1250,8 @@ fn run_data_worker_loop(
         drive_tokio_worker_once(runtime, local_progress);
 
         if !local_progress {
-            thread::park_timeout(DATA_WORKER_IDLE_SLICE);
+            let idle_slice = DATA_WORKER_IDLE_SLICE.with(|slot| slot.get());
+            thread::park_timeout(idle_slice);
         }
     }
 }
@@ -1256,8 +1293,9 @@ fn drive_tokio_worker_once(runtime: &tokio::runtime::Runtime, local_progress: bo
         return;
     }
 
+    let idle_slice = DATA_WORKER_IDLE_SLICE.with(|slot| slot.get());
     runtime.block_on(async {
-        tokio::time::sleep(DATA_WORKER_IDLE_SLICE).await;
+        tokio::time::sleep(idle_slice).await;
     });
 }
 
@@ -1389,11 +1427,16 @@ pub async fn yield_local_now() {
 }
 
 pub(crate) fn with_data_plane_runtime<R>(f: impl FnOnce(&RuntimeDataPlaneRuntime) -> R) -> R {
-    DATA_PLANE_RUNTIME.with(f)
+    DATA_PLANE_RUNTIME.with(|runtime| {
+        f(runtime
+            .borrow()
+            .as_ref()
+            .expect("data plane runtime not initialized on worker thread"))
+    })
 }
 
 pub fn with_data_plane_buffers<R>(f: impl FnOnce(&DataPlaneBuffers) -> R) -> R {
-    DATA_PLANE_RUNTIME.with(|runtime| f(runtime.packet_buffers()))
+    with_data_plane_runtime(|runtime| f(runtime.packet_buffers()))
 }
 
 fn current_data_context() -> Option<DataRuntimeContext> {
@@ -1608,7 +1651,7 @@ mod tests {
             .expect("set trace control");
         let marks = context
             .for_each_worker(|_| {
-                DATA_PLANE_RUNTIME.with(|runtime| {
+                with_data_plane_runtime(|runtime| {
                     let index = runtime
                         .alloc_index_with_bytes(b"packet")
                         .expect("alloc packet");
@@ -1720,7 +1763,7 @@ mod tests {
 
         context
             .for_each_worker(|_| {
-                DATA_PLANE_RUNTIME.with(|runtime| {
+                with_data_plane_runtime(|runtime| {
                     let node = runtime.nodes().register_driver(PollingDriverNode);
                     runtime
                         .nodes()

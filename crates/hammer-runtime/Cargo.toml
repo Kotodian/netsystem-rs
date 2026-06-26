@@ -9,26 +9,8 @@ name = "hammer_runtime"
 
 [features]
 default = []
-# Enables runtime ICMP probe support used by hammer-service probe orchestration.
-# Off-by-default users (slim builds without diagnostic UI) can drop it.
-probe = ["dep:socket2"]
-outbound-block = []
-# Enables the generic L3 endpoint domain (Endpoint trait, manager, packet-loop
-# fast path). Concrete endpoint protocols opt into this parent feature.
-endpoint = ["hammer-core/wireguard", "dep:etherparse", "dep:arc-swap", "dep:smoltcp"]
-# Enables the WireGuard endpoint module. Pulls in the matching config feature
-# in hammer-core. Off by default to keep the iOS xcframework slim.
-endpoint-wireguard = [
-    "endpoint",
-    "dep:boringtun",
-    "dep:socket2",
-]
-endpoint-amneziawg = [
-    "endpoint-wireguard",
-    "hammer-core/amneziawg",
-    "boringtun/amneziawg",
-    "dep:rand",
-]
+linux-platform = []
+apple-platform = []
 
 [dependencies]
 hammer-core = { path = "../hammer-core" }
@@ -36,18 +18,17 @@ hammer-adapter = { path = "../hammer-adapter" }
 hammer-infra = { path = "../hammer-infra" }
 hammer-component-macros = { path = "../hammer-component-macros" }
 async-trait = { workspace = true }
-boringtun = { workspace = true, optional = true }
 bytes = { workspace = true }
-etherparse = { workspace = true, optional = true }
-arc-swap = { workspace = true, optional = true }
-smoltcp = { workspace = true, optional = true }
-rand = { workspace = true, optional = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }
 metrics-derive = { workspace = true }
-socket2 = { workspace = true, optional = true }
 ipnet = { workspace = true }
+libc = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+core_affinity = { workspace = true }
+thread-priority = { workspace = true }
 
 [dev-dependencies]
 hammer-control = { path = "../hammer-control" }

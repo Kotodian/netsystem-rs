@@ -60,9 +60,7 @@ fn bench_alloc_free_batch256(c: &mut Criterion) {
                     |pool| {
                         let mut indices = std::vec::Vec::with_capacity(batch);
                         for _ in 0..batch {
-                            indices.push(
-                                pool.alloc_index_with_bytes(&payload).expect("alloc"),
-                            );
+                            indices.push(pool.alloc_index_with_bytes(&payload).expect("alloc"));
                         }
                         for index in indices {
                             pool.free_index(index);

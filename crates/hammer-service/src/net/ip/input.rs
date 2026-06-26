@@ -10,7 +10,7 @@ use hammer_core::error::{CoreError, CoreResult};
 
 use crate::data_plane::{FeatureArcSpec, FeatureArcStartHandle, set_buffer_node_error_code};
 use crate::net::ip::{
-    IpInputError, IpInputTarget, IpProtocol, IpVersion, ParsedIpPacket, network_for_protocol,
+    IpInputError, IpInputTarget, IpProtocol, IpVersion, network_for_protocol,
     parse_ip_packet_with_chain_len,
 };
 use crate::trace::codec::{

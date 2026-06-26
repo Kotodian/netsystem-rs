@@ -7,30 +7,14 @@ publish.workspace = true
 [lib]
 name = "hammer_service"
 
-[[example]]
-name = "host-ping"
-path = "examples/tun/host_ping.rs"
-required-features = ["inbound-tun"]
-
 [features]
-default = [
-    "inbound-tun",
-    "outbound-block",
-    "probe",
-]
-probe = ["hammer-runtime/probe"]
-inbound-tun = ["dep:libc"]
-outbound-block = ["hammer-runtime/outbound-block"]
-endpoint = ["hammer-runtime/endpoint"]
-endpoint-wireguard = ["hammer-runtime/endpoint-wireguard"]
-endpoint-amneziawg = ["hammer-runtime/endpoint-amneziawg"]
+default = []
 
 [dependencies]
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
 bitflags = "2.10"
 crossbeam-utils = { workspace = true }
-bytes = { workspace = true, optional = true }
 hammer-core = { path = "../hammer-core" }
 hammer-control = { path = "../hammer-control" }
 hammer-adapter = { path = "../hammer-adapter" }
@@ -42,8 +26,8 @@ nom = { workspace = true }
 etherparse = { workspace = true }
 tokio = { workspace = true, features = ["signal"] }
 tracing = { workspace = true }
-libc = { workspace = true, optional = true }
 smoltcp = { workspace = true }
 thiserror = { workspace = true }
+linkme = { workspace = true }
 
 [dev-dependencies]

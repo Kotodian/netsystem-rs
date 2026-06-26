@@ -14,10 +14,8 @@ default = []
 # require it explicitly. Do not enable both linux-platform and apple-platform.
 linux-platform = []
 apple-platform = []
-# Enables the WireGuard peer state machine + config schema (`[[endpoints]]`
-# with `type = "wireguard"`). The runtime endpoint component has its own
-# `endpoint-wireguard` feature; this one carries the protocol primitives
-# (boringtun `Tunn`, peer struct, `WIREGUARD_OVERHEAD`) the runtime relies on.
+# Enables the WireGuard peer state machine and protocol primitives
+# (`boringtun` `Tunn`, peer struct, `WIREGUARD_OVERHEAD`).
 wireguard = ["dep:bytes", "dep:boringtun", "dep:serde_with", "serde_with/base64"]
 amneziawg = ["wireguard", "boringtun/amneziawg"]
 

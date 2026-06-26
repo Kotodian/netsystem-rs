@@ -5,8 +5,7 @@ pub mod data_plane;
 mod event_subscribers;
 pub mod interface;
 pub mod net;
-#[cfg(feature = "probe")]
-mod probe;
+mod packet_graph;
 mod service;
 pub mod session;
 mod trace;
@@ -18,8 +17,5 @@ pub mod adapter {
 }
 
 pub use hammer_core::error::{HammerError, HammerResult};
-pub use hammer_runtime::OutboundManager;
 pub use hammer_runtime::RuntimePlatform;
-#[cfg(feature = "probe")]
-pub use probe::{IcmpOutboundProbe, ProbeManager, ProbeProtocolFactorySet};
 pub use service::RuntimeService;

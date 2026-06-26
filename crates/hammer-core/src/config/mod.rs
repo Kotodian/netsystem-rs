@@ -23,7 +23,12 @@ pub use log::Log;
 pub use network::Network;
 pub use route::{Route, RouteAction, Via};
 pub use trace::{Trace, TraceInput};
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub use worker::QosClass;
 pub use worker::Worker;
+pub use worker::WorkerScheduler;
+#[cfg(target_os = "linux")]
+pub use worker::{SchedulerPolicy, WorkerCpu, WorkerNuma};
 
 /// String constants shared across the config layer and the runtime.
 pub mod constants {

@@ -118,23 +118,7 @@ interface HammerService {
   boolean need_wifi_state();
   void update_wifi_state();
 
-  // V1 protocol must be "icmp"; per-outbound timeout.
-  // Order of returned reports matches the configured outbound list.
-  [Throws=HammerError]
-  sequence<HammerProbeReport> probe_outbounds(
-    string protocol,
-    u64 timeout_ms
-  );
-
   sequence<HammerMetricSample> metrics();
-};
-
-dictionary HammerProbeReport {
-  string outbound_id;
-  string protocol;
-  boolean ok;
-  u64 latency_ms;
-  string error;
 };
 
 dictionary HammerMetricLabel {

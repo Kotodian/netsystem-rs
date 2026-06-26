@@ -6,9 +6,7 @@ use hammer_adapter::DataWorkerId;
 use hammer_core::protocol::tcp::{TcpConnectionId, TcpState};
 use hammer_service::transport::congestion::{BbrController, CongestionController};
 use hammer_service::transport::tcp::connection::TcpConnection;
-use hammer_service::transport::tcp::{
-    DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TcpInputNext,
-};
+use hammer_service::transport::tcp::{DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TcpInputNext};
 
 fn connection(connection_id: TcpConnectionId, local_port: u16) -> TcpConnection<BbrController> {
     let local: SocketAddr = format!("192.0.2.10:{local_port}")

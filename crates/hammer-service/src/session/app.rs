@@ -461,16 +461,18 @@ mod tests {
         let session_id = SessionId::new(1);
 
         app.push_pending_send(session_id, send);
-        assert!(!app
-            .release_pending_send_bytes(session_id, 4)
-            .expect("partial"));
+        assert!(
+            !app.release_pending_send_bytes(session_id, 4)
+                .expect("partial")
+        );
         assert_eq!(
             app.pending_send_len(session_id).expect("pending len"),
             Some(2)
         );
-        assert!(app
-            .release_pending_send_bytes(session_id, 2)
-            .expect("finish"));
+        assert!(
+            app.release_pending_send_bytes(session_id, 2)
+                .expect("finish")
+        );
         assert!(!app.has_pending_send(session_id));
     }
 }

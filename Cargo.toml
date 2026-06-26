@@ -68,6 +68,8 @@ boringtun = { version = "0.7", default-features = false }
 lru = { version = "0.18", default-features = false }
 ipnet = { version = "2", features = ["serde"] }
 libc = "0.2"
+core_affinity = "0.8"
+thread-priority = "1.2"
 # Fast non-cryptographic hasher for internal HashMaps. Used by the ipstack
 # actor to keep `tcp_bridges` / `udp_bridges` lookups out of the SipHasher
 # path (~1.6% CPU on the wg hot path under sustained video).
@@ -76,6 +78,7 @@ uniffi = "0.31"
 indoc = "2.0"
 rcgen = "0.14"
 criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
+linkme = "0.3"
 
 [patch.crates-io]
 boringtun = { path = "third_party/boringtun" }

@@ -293,10 +293,7 @@ fn interface_output_dispatches_to_registered_tx_node() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].input_node, output_node);
     assert_eq!(records[0].entries.len(), 2);
-    assert_eq!(
-        records[0].entries[0].node_name,
-        Some("interface-output")
-    );
+    assert_eq!(records[0].entries[0].node_name, Some("interface-output"));
     assert_eq!(
         InterfaceOutputTrace::decode(&records[0].entries[0].payload_bytes)
             .expect("interface output trace"),
@@ -307,10 +304,7 @@ fn interface_output_dispatches_to_registered_tx_node() {
             next: Some(tx),
         }
     );
-    assert_eq!(
-        records[0].entries[1].node_name,
-        Some("tun-output-driver")
-    );
+    assert_eq!(records[0].entries[1].node_name, Some("tun-output-driver"));
     assert_eq!(
         TunOutputTrace::decode(&records[0].entries[1].payload_bytes).expect("tun output trace"),
         TunOutputTrace {

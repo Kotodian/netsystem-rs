@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use hammer_core::log::LogWriter;
 use hammer_service::RuntimeService;
@@ -7,20 +6,6 @@ use hammer_service::RuntimeService;
 use crate::HammerPlatform;
 use crate::error::HammerError;
 use crate::platform::{PlatformAdapter, PlatformLogWriter};
-
-/// FFI-friendly latency probe report (one per outbound).
-///
-/// `ok=true` means the probe completed within `timeout_ms` and
-/// `latency_ms` carries the measured RTT. `ok=false` carries the
-/// transport error in `error` and `latency_ms=0`.
-#[derive(Debug, Clone)]
-pub struct HammerProbeReport {
-    pub outbound_id: String,
-    pub protocol: String,
-    pub ok: bool,
-    pub latency_ms: u64,
-    pub error: String,
-}
 
 #[derive(Debug, Clone)]
 pub struct HammerMetricLabel {
@@ -84,49 +69,12 @@ impl HammerService {
         self.inner.update_wifi_state();
     }
 
-    pub fn probe_outbounds(
-        &self,
-        protocol: String,
-        timeout_ms: u64,
-    ) -> Result<Vec<HammerProbeReport>, HammerError> {
-        let timeout = Duration::from_millis(timeout_ms);
-        let reports = self
-            .inner
-            .probe_outbounds(&protocol, timeout)
-            .map_err(HammerError::from)?;
-        Ok(reports.into_iter().map(probe_report_to_ffi).collect())
-    }
-
     pub fn metrics(&self) -> Vec<HammerMetricSample> {
         self.inner
             .metrics_snapshot()
             .into_iter()
             .map(Into::into)
             .collect()
-    }
-}
-
-fn probe_report_to_ffi(report: hammer_service::adapter::ProbeReport) -> HammerProbeReport {
-    let hammer_service::adapter::ProbeReport {
-        outbound_id,
-        protocol,
-        result,
-    } = report;
-    match result {
-        Ok(elapsed) => HammerProbeReport {
-            outbound_id,
-            protocol,
-            ok: true,
-            latency_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
-            error: String::new(),
-        },
-        Err(err) => HammerProbeReport {
-            outbound_id,
-            protocol,
-            ok: false,
-            latency_ms: 0,
-            error: err.to_string(),
-        },
     }
 }
 
