@@ -1,24 +1,8 @@
-//! Config-driven packet-graph assembly (VPP `vlib` semantics).
+//! VPP `vlib_node_main` node registration entry + graph-node trait.
 //!
-//! Mirrors VPP's node-graph construction at the level the current adapter
-//! registration surface supports: a process-global, name-keyed inventory of
-//! node builders (`NodeRegistry<D>`, akin to
-//! `vlib_global_main_t.node_registrations` populated by `VLIB_REGISTER_NODE`),
-//! and per-worker assembly (`PacketGraphAssembler`) that invokes the selected
-//! builders in dependency order on each `DataPlaneRuntime`. Each builder
-//! resolves its own next edges by name against nodes registered earlier in
-//! the same pass.
-//!
-//! `D` is the service-defined dependency bag carried through assembly. The
-//! graph layer is generic over `D` and never names its fields — no trait
-//! object, no `dyn Any`.
-//!
-//! Config selects which *registered* node types participate per graph; it
-//! never defines new node types (VPP invariant). Feature arcs remain owned by
-//! the existing `FeatureArcControl` abstraction in `hammer-service`.
+//! Node metadata is collected by linkme into `NodeEntry` slices (VPP
+//! `VLIB_REGISTER_NODE`). `DataPlaneRuntime::init_graph` walks them and calls
+//! `GraphNode::init`; `NodeRuntime::resolve_named_next_nodes` links by name
+//! (VPP `vlib_node_main_init`).
 
-pub mod assembler;
-pub mod registry;
-
-pub use assembler::{AssembledGraph, GraphSpec, PacketGraphAssembler};
-pub use registry::{NodeBuilder, NodeCtx, NodeRegistry};
+pub use hammer_adapter::{GraphNode, NodeEntry};

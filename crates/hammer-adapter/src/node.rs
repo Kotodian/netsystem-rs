@@ -417,12 +417,12 @@ pub enum NodeRegistration {
 
 impl NodeRegistration {
     #[inline]
-    pub fn next(name: &'static str, next_count: usize) -> Self {
+    pub const fn next(name: &'static str, next_count: usize) -> Self {
         Self::Next { name, next_count }
     }
 
     #[inline]
-    pub fn sibling_of(name: &'static str, sibling_of: &'static str) -> Self {
+    pub const fn sibling_of(name: &'static str, sibling_of: &'static str) -> Self {
         Self::Sibling { name, sibling_of }
     }
 
@@ -433,6 +433,22 @@ impl NodeRegistration {
             Self::Next { name, .. } | Self::Sibling { name, .. } => Some(name),
         }
     }
+}
+
+/// A statically-registered graph node (VPP `vlib_node_registration_t`).
+pub struct NodeEntry {
+    pub registration: NodeRegistration,
+    pub kind: NodeKind,
+    pub init: fn(&DataPlaneRuntime, usize) -> CoreResult<NodeId>,
+}
+
+/// A graph node knows how to initialize itself into a `DataPlaneRuntime`.
+///
+/// Implementations read their own subsystem's `*_MAIN` global (set by the
+/// control-plane init phase) and call the main's node-construction method.
+/// The graph layer never passes dependencies.
+pub trait GraphNode {
+    fn init(runtime: &DataPlaneRuntime, worker: usize) -> CoreResult<NodeId>;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -602,6 +618,8 @@ struct NodeRuntimeInner {
     node_names: Vec<Option<&'static str>>,
     node_trace_formatters: Vec<Option<TraceFormatter>>,
     next_nodes: Vec<Vec<Option<NodeId>>>,
+    pending_next_names: Vec<Vec<Option<&'static str>>>,
+    sibling_owners: Vec<Option<NodeId>>,
     siblings: Vec<Vec<NodeId>>,
 }
 
@@ -705,6 +723,8 @@ impl NodeRuntimeInner {
         self.node_names.push(None);
         self.node_trace_formatters.push(None);
         self.next_nodes.push(Vec::new());
+        self.pending_next_names.push(Vec::new());
+        self.sibling_owners.push(None);
         self.siblings.push(Vec::new());
         id
     }
@@ -730,13 +750,30 @@ impl NodeRuntimeInner {
         registration: NodeRegistration,
         initial_nexts: &[NodeId],
         trace_formatter: Option<TraceFormatter>,
-        _handle: Option<NodeHandle>,
+        handle: Option<NodeHandle>,
+        next_names: Option<&[&'static str]>,
     ) -> CoreResult<NodeId> {
         if initial_nexts.len() > MAX_NODE_NEXT_FRAMES {
             return Err(CoreError::internal("node next frame capacity exceeded"));
         }
-        for next in initial_nexts.iter().copied() {
-            self.validate_node(next)?;
+        if let Some(next_names) = next_names {
+            if !initial_nexts.is_empty() {
+                return Err(CoreError::internal(
+                    "named next registration cannot also supply resolved initial next nodes",
+                ));
+            }
+            let NodeRegistration::Next { next_count, .. } = registration else {
+                return Err(CoreError::internal(
+                    "named next registration requires a declared next node",
+                ));
+            };
+            if next_names.len() != next_count {
+                return Err(CoreError::internal("node named next count mismatch"));
+            }
+        } else {
+            for next in initial_nexts.iter().copied() {
+                self.validate_node(next)?;
+            }
         }
         if matches!(registration, NodeRegistration::Plain) && !initial_nexts.is_empty() {
             return Err(CoreError::internal(
@@ -748,7 +785,8 @@ impl NodeRuntimeInner {
                 "node sibling cannot declare initial next nodes",
             ));
         }
-        if let NodeRegistration::Next { next_count, .. } = registration
+        if next_names.is_none()
+            && let NodeRegistration::Next { next_count, .. } = registration
             && next_count != initial_nexts.len()
         {
             return Err(CoreError::internal("node initial next count mismatch"));
@@ -763,19 +801,34 @@ impl NodeRuntimeInner {
             NodeRegistration::Plain => {
                 let id = self.push_function_node(kind, process, runtime_data);
                 self.node_trace_formatters[id.0 as usize] = trace_formatter;
+                if let Some(handle) = handle {
+                    self.handles.insert(handle, id);
+                }
                 Ok(id)
             }
             NodeRegistration::Next { name, next_count } => {
                 let id = self.push_function_node(kind, process, runtime_data);
                 self.node_names[id.0 as usize] = Some(name);
                 self.node_trace_formatters[id.0 as usize] = trace_formatter;
-                self.next_nodes[id.0 as usize] = initial_nexts
-                    .iter()
-                    .copied()
-                    .map(Some)
-                    .take(next_count)
-                    .collect();
+                if let Some(next_names) = next_names {
+                    self.next_nodes[id.0 as usize] = vec![None; next_count];
+                    self.pending_next_names[id.0 as usize] = next_names
+                        .iter()
+                        .copied()
+                        .map(Some)
+                        .collect();
+                } else {
+                    self.next_nodes[id.0 as usize] = initial_nexts
+                        .iter()
+                        .copied()
+                        .map(Some)
+                        .take(next_count)
+                        .collect();
+                }
                 self.declared_nodes.insert(name, id);
+                if let Some(handle) = handle {
+                    self.handles.insert(handle, id);
+                }
                 Ok(id)
             }
             NodeRegistration::Sibling { name, sibling_of } => {
@@ -793,6 +846,7 @@ impl NodeRuntimeInner {
                 self.node_names[id.0 as usize] = Some(name);
                 self.node_trace_formatters[id.0 as usize] = trace_formatter;
                 self.next_nodes[id.0 as usize] = owner_nexts;
+                self.sibling_owners[id.0 as usize] = Some(owner);
                 let mut group = self.siblings[owner.0 as usize].clone();
                 group.push(owner);
                 for sibling in group.iter().copied() {
@@ -800,9 +854,45 @@ impl NodeRuntimeInner {
                     self.siblings[id.0 as usize].push(sibling);
                 }
                 self.declared_nodes.insert(name, id);
+                if let Some(handle) = handle {
+                    self.handles.insert(handle, id);
+                }
                 Ok(id)
             }
         }
+    }
+
+    fn resolve_named_next_nodes(&mut self) -> CoreResult<()> {
+        for slot in 0..self.nodes.len() {
+            if self.pending_next_names[slot].is_empty() {
+                continue;
+            }
+            if self.pending_next_names[slot].len() != self.next_nodes[slot].len() {
+                return Err(CoreError::internal("pending next name slot mismatch"));
+            }
+            for index in 0..self.pending_next_names[slot].len() {
+                let Some(name) = self.pending_next_names[slot][index] else {
+                    continue;
+                };
+                let target = self
+                    .declared_nodes
+                    .get(name)
+                    .copied()
+                    .ok_or_else(|| CoreError::internal(format!("unknown next node `{name}`")))?;
+                self.validate_node(target)?;
+                self.next_nodes[slot][index] = Some(target);
+            }
+            self.pending_next_names[slot].clear();
+        }
+
+        for slot in 0..self.nodes.len() {
+            let Some(owner) = self.sibling_owners[slot] else {
+                continue;
+            };
+            self.next_nodes[slot] = self.next_nodes[owner.0 as usize].clone();
+        }
+
+        Ok(())
     }
 
     fn validate_node(&self, node: NodeId) -> CoreResult<()> {
@@ -883,6 +973,8 @@ impl Default for NodeRuntime {
                 node_names: Vec::new(),
                 node_trace_formatters: Vec::new(),
                 next_nodes: Vec::new(),
+                pending_next_names: Vec::new(),
+                sibling_owners: Vec::new(),
                 siblings: Vec::new(),
             })),
             readiness: Rc::new(NodeReadiness::default()),
@@ -1015,8 +1107,8 @@ impl NodeRuntime {
             descriptor.initial_nexts,
             descriptor.trace_formatter,
             Some(handle),
+            None,
         )?;
-        inner.handles.insert(handle, id);
         Ok(id)
     }
 
@@ -1038,7 +1130,60 @@ impl NodeRuntime {
             initial_nexts,
             trace_formatter,
             None,
+            None,
         )
+    }
+
+    /// Register an internal node whose next edges are resolved by name in
+    /// [`Self::resolve_named_next_nodes`] (VPP `vlib_node_main_init` analogue).
+    pub fn try_register_internal_with_next_names<N>(
+        &self,
+        node: N,
+        next_names: &[&'static str],
+    ) -> CoreResult<NodeId>
+    where
+        N: InternalNode + Node,
+    {
+        let mut inner = self.inner.borrow_mut();
+        inner.register_function_declared(
+            NodeKind::Internal,
+            node.node_process(),
+            node.node_runtime_data()?,
+            InternalNode::node_registration(&node),
+            &[],
+            node.node_trace_formatter(),
+            None,
+            Some(next_names),
+        )
+    }
+
+    /// Register a driver node whose next edges are resolved by name in
+    /// [`Self::resolve_named_next_nodes`].
+    pub fn try_register_driver_with_next_names<N>(
+        &self,
+        node: N,
+        next_names: &[&'static str],
+    ) -> CoreResult<NodeId>
+    where
+        N: DriverNode + Node,
+    {
+        let mut inner = self.inner.borrow_mut();
+        inner.register_function_declared(
+            NodeKind::Driver,
+            node.node_process(),
+            node.node_runtime_data()?,
+            DriverNode::node_registration(&node),
+            &[],
+            node.node_trace_formatter(),
+            None,
+            Some(next_names),
+        )
+    }
+
+    /// Resolve pending next-node names into `NodeId`s after all graph nodes
+    /// are registered (VPP `vlib_node_main_init` name-resolution pass).
+    pub fn resolve_named_next_nodes(&self) -> CoreResult<()> {
+        self.inner.borrow_mut().resolve_named_next_nodes()
     }
 
     #[inline]
