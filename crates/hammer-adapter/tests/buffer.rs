@@ -146,7 +146,7 @@ fn buffer_batch_mut_processes_multiple_buffers_under_one_borrow() {
 }
 
 #[test]
-fn buffer_batch_mut_exposes_direct_buffer_refs() {
+fn buffer_batch_mut_exposes_direct_buffer_borrows() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_buffer_capacity(32, 1);
     let index = runtime
         .alloc_index_with_bytes(b"alpha")
@@ -171,7 +171,7 @@ fn buffer_header_and_packet_data_start_cacheline_aligned() {
         .expect("alloc buffer");
 
     {
-        let buffer = pool.get(buffer).expect("buffer ref");
+        let buffer = pool.get(buffer).expect("buffer");
         assert_eq!(std::ptr::from_ref(&*buffer) as usize % 64, 0);
         assert_eq!(buffer.current().as_ptr() as usize % 64, 0);
     }
@@ -186,10 +186,10 @@ fn buffer_exposes_vpp_style_current_pointer_and_advance() {
         .alloc_index_with_bytes(b"network-transport")
         .expect("alloc buffer");
     {
-        let buffer_ref = runtime.get_buffer(buffer).expect("buffer ref");
-        assert_eq!(buffer_ref.current_data(), 0);
-        assert_eq!(buffer_ref.current_len(), b"network-transport".len());
-        assert_eq!(unsafe { *buffer_ref.current_ptr() }, b'n');
+        let buffer = runtime.get_buffer(buffer).expect("buffer");
+        assert_eq!(buffer.current_data(), 0);
+        assert_eq!(buffer.current_len(), b"network-transport".len());
+        assert_eq!(unsafe { *buffer.current_ptr() }, b'n');
     }
 
     runtime
@@ -198,12 +198,12 @@ fn buffer_exposes_vpp_style_current_pointer_and_advance() {
         .expect("advance");
 
     {
-        let mut buffer_ref = runtime.get_buffer_mut(buffer).expect("buffer ref mut");
-        assert_eq!(buffer_ref.current_data(), b"network-".len());
-        assert_eq!(buffer_ref.current_len(), b"transport".len());
-        assert_eq!(unsafe { *buffer_ref.current_ptr() }, b't');
+        let mut buffer = runtime.get_buffer_mut(buffer).expect("buffer mut");
+        assert_eq!(buffer.current_data(), b"network-".len());
+        assert_eq!(buffer.current_len(), b"transport".len());
+        assert_eq!(unsafe { *buffer.current_ptr() }, b't');
         unsafe {
-            *buffer_ref.current_mut_ptr() = b'T';
+            *buffer.current_mut_ptr() = b'T';
         }
     }
 
@@ -511,7 +511,7 @@ fn buffer_advance_can_discard_prefix_across_chain_segments() {
 
     pool.advance(packet, 6).expect("advance across chain");
 
-    let buffer = pool.get(packet).expect("buffer ref");
+    let buffer = pool.get(packet).expect("buffer");
     assert_eq!(buffer.current_len(), 0);
     assert_eq!(buffer.total_len_not_including_first(), 6);
     drop(buffer);

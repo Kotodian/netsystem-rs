@@ -210,7 +210,7 @@ These APIs are internal workspace APIs, not public OS-socket emulation.
 - `bind`, `listen`, UDP port registration, and listener/socket destruction are control-plane operations exposed through `AppControl`, not `AppSqe`.
 - `accept`, `recv`, and `recv_from` remain dataplane operations because they act on already-created listeners/sockets/flows.
 - recv-side payload delivery is zero-copy in v1: CQEs carry buffer identity/lease metadata, and app code reads payload through a borrowed buffer view backed by the existing data-plane buffer arena.
-- new app/runtime payload APIs must use `BufferIndex`, `BufferRef`, `current_ptr`, `current_len`, or a runtime-owned lease wrapper around them; do not copy payload into `Vec<u8>` just to hand it to the app layer.
+- new app/runtime payload APIs must use `BufferIndex`, borrowed `Buffer` access, `current_ptr`, `current_len`, or a runtime-owned lease wrapper around them; do not copy payload into `Vec<u8>` just to hand it to the app layer.
 - send-side fast path should accept borrowed slices when possible; copying into fresh app-owned `Vec<u8>` is not the default contract.
 - `AppBufferLease` must remain owner-worker-local and define when the underlying `BufferIndex` is released or returned after app consumption.
 - Generic ring queue/cursor/slot data structures live in `hammer_infra::ring`; `hammer-runtime` only defines app-specific SQE/CQE semantics and worker ownership rules on top.

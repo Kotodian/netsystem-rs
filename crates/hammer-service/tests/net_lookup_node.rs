@@ -144,9 +144,9 @@ fn sink_process(
     for buffer in frame.drain_pending() {
         let payload = runtime.copy_packet(buffer)?;
         let (egress_interface, forwarding) = {
-            let buffer_ref = runtime.get_buffer(buffer)?;
-            let network = unsafe { transmute::<_, &NetworkOpaque>(buffer_ref.opaque()) };
-            let opaque = unsafe { transmute::<_, &LookupTestOpaque>(buffer_ref.opaque2()) };
+            let buffer = runtime.get_buffer(buffer)?;
+            let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
+            let opaque = unsafe { transmute::<_, &LookupTestOpaque>(buffer.opaque2()) };
             (
                 Some(network.sw_if_index[1]).filter(|value| *value != 0),
                 opaque.forwarding,

@@ -232,10 +232,11 @@ index 060dd0a1..dd142b12 100644
      }
  
      #[inline]
-     pub fn get(&self, index: BufferIndex) -> CoreResult<BufferRef<'_>> {
+     pub fn get(&self, index: BufferIndex) -> CoreResult<Ref<'_, Buffer>> {
          let guard = self.arena.inner.borrow();
          guard.buffer(index)?;
-         Ok(BufferRef { guard, index })
+         Ref::filter_map(guard, |pool| pool.buffer(index).ok())
+             .map_err(|_| CoreError::internal("buffer index is invalid"))
      }
  
 @@ -2290,41 +2310,89 @@ impl BufferPoolInner {

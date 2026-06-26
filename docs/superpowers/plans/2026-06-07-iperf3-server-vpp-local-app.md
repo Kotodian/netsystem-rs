@@ -681,13 +681,13 @@ fn mark_listener_accept(
 }
 ```
 
-If the current buffer accessors do not expose `packet_buffer_header_mut()`, add the smallest `BufferRefMut` helper required for opaque writes and cover it with a packet-buffer test.
+If the current buffer accessors do not expose opaque mutation through `Buffer`, add the smallest direct `Buffer` method required for opaque writes and cover it with a packet-buffer test.
 
 - [ ] **Step 5: Add/adjust packet-buffer helper tests if needed**
 
 ```rust
 #[test]
-fn buffer_ref_mut_can_write_primary_opaque_payload() {
+fn buffer_can_write_primary_opaque_payload() {
     let runtime = hammer_adapter::DataPlaneRuntime::with_capacities(128, 4, 4, 1);
     let index = runtime
         .alloc_index_with_bytes(hammer_adapter::RouteMetadata::default(), b"opaque")
@@ -706,7 +706,7 @@ fn buffer_ref_mut_can_write_primary_opaque_payload() {
         });
     }
 
-    let buffer = runtime.get_buffer(index).expect("buffer ref");
+    let buffer = runtime.get_buffer(index).expect("buffer");
     assert_eq!(
         buffer.read_primary_opaque::<TcpLocalDeliveryOpaque>().connection_id,
         2

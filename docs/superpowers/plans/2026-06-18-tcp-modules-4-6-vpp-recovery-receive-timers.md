@@ -24,8 +24,8 @@
 - `crates/hammer-adapter/src/buffer.rs`
   - Buffer already has VPP-like header fields: `current_data`, `current_len`, `flags`, `next_buffer`, and `total_len_not_including_first`.
   - Buffer allocation already reserves default headroom in `alloc_slot`.
-  - `BufferRefMut` already exposes `writable_tail_mut` and `commit_writable_tail`.
-  - `prepend`, `append_existing_chain`, `truncate_chain`, `advance`, and chain metadata already exist.
+  - Buffer access must stay as direct borrowed `Buffer` / `Buffer` mutable access; do not introduce a dedicated wrapper type.
+  - `prepend`, `advance`, and VPP-style chain metadata already exist on buffer ownership layers.
 
 - `crates/hammer-service/src/transport/tcp/session.rs`
   - `TcpSessionProtocol` stores `segments: Pool<TcpSegment>` and `segment_index: FlatHashTable<u128, PoolIndex>`.
@@ -514,7 +514,7 @@ Required result:
 
 - `push_pending_send` returns `CoreResult<()>`.
 - It allocates dataplane buffers from the existing buffer pool.
-- It copies app bytes directly into `BufferRefMut::writable_tail_mut`.
+- It copies app bytes directly through the borrowed `Buffer` mutable tail.
 - It commits bytes with `commit_writable_tail`.
 - It chains buffers with existing generic chain operations.
 - It releases `AppSendData` once session owns the copied bytes.
