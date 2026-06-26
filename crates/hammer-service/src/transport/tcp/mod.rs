@@ -1,9 +1,9 @@
 pub use hammer_core::protocol::tcp::{TcpInputFlags, TcpSeq, TcpState};
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use hammer_adapter::{
-    BufferPacketCursor, DataPlaneRuntime, DataWorkerId, NodeId, NodeRuntimeData, SecondaryOpaque,
+    BufferPacketCursor, DataPlaneRuntime, DataWorkerId, NodeId, SecondaryOpaque,
 };
 use hammer_core::error::{CoreError, CoreResult, HammerError, HammerResult};
 use hammer_core::registry::RuntimeRegistry;
@@ -52,6 +52,7 @@ pub use reset::{TcpResetNext, TcpResetNode};
 use segment::TcpSegment;
 pub use syn_sent::{TcpSynSentNext, TcpSynSentNode};
 
+#[cfg(test)]
 pub(crate) use lookup::set_tcp_worker_state;
 pub(crate) use lookup::{TcpWorkerOwnedState, tcp_worker_state, tcp_worker_state_mut};
 
@@ -60,14 +61,12 @@ pub(crate) type TcpQueue<C> = SessionQueueHandle<TcpSessionDriver<C>>;
 
 pub struct TcpMain {
     control: TcpInputControlPlane,
-    worker_queues: Mutex<Vec<Option<NodeRuntimeData>>>,
 }
 
 impl TcpMain {
     pub fn new() -> Self {
         Self {
             control: TcpInputControlPlane::new(),
-            worker_queues: Mutex::new(Vec::new()),
         }
     }
 
@@ -75,6 +74,13 @@ impl TcpMain {
         &self.control
     }
 
+    /// Build and register this worker's `TcpInputNode<C>`.
+    ///
+    /// Per-worker state (TCP owned state + the session-queue runtime data)
+    /// lives in the worker thread's `TcpWorkerOwnedState` TLS, set up when the
+    /// worker starts — never shared across workers, so no synchronization is
+    /// needed. `TcpMain` itself only holds the cross-worker control plane
+    /// (`TcpInputControlPlane`, internally `Arc<ArcSwap>`).
     pub fn register_tcp_input<C: CongestionController + 'static>(
         &self,
         rt: &DataPlaneRuntime,
@@ -85,25 +91,17 @@ impl TcpMain {
                 .map_err(|_| CoreError::internal("worker index does not fit into u32"))?,
         );
 
-        let mut worker_state_tls = TcpWorkerOwnedState::new(worker_id);
-        set_tcp_worker_state(&mut worker_state_tls);
+        let worker_state = tcp_worker_state_mut();
 
-        let runtime_data = {
-            let mut guards = self
-                .worker_queues
-                .lock()
-                .map_err(|_| CoreError::internal("tcp worker queues lock poisoned"))?;
-            if guards.len() <= worker {
-                guards.resize_with(worker + 1, || None);
-            }
-            if guards[worker].is_none() {
-                let queue = crate::session::node::register_session_queue(
-                    TcpSessionDriver::<C>::new(worker_id, rt.packet_buffers().clone()),
-                )?;
-                guards[worker] = Some(queue.runtime_data());
-            }
-            guards[worker]
-                .ok_or_else(|| CoreError::internal("session queue runtime_data missing"))?
+        let runtime_data = if let Some(data) = worker_state.queue_runtime_data() {
+            data
+        } else {
+            let queue = crate::session::node::register_session_queue(
+                TcpSessionDriver::<C>::new(worker_id, rt.packet_buffers().clone()),
+            )?;
+            let data = queue.runtime_data();
+            worker_state.set_queue_runtime_data(data);
+            data
         };
 
         let queue = TcpQueue::<C>::new(runtime_data);

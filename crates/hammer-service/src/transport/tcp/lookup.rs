@@ -6,7 +6,7 @@ use std::ops::{Deref, DerefMut};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossbeam_utils::CachePadded;
-use hammer_adapter::DataWorkerId;
+use hammer_adapter::{DataWorkerId, NodeRuntimeData};
 use hammer_core::protocol::tcp::{
     TcpCapabilities, TcpConnectionId, TcpFastOpenCookie, TcpTimestampOption,
 };
@@ -989,6 +989,10 @@ pub struct TcpWorkerOwnedStateCacheline0 {
     pending: TcpPendingRouteIndex,
     #[cfg(test)]
     next_iss: u32,
+    /// Per-worker session-queue runtime data for the TCP input node's
+    /// `TcpQueue<C>`. Owned by the worker thread (this TLS); never shared
+    /// across workers, so no synchronization is needed.
+    queue_runtime_data: Option<NodeRuntimeData>,
 }
 
 #[derive(Debug)]
@@ -1037,6 +1041,7 @@ impl TcpWorkerOwnedState {
                 pending: TcpPendingRouteIndex::empty(),
                 #[cfg(test)]
                 next_iss: 81_000,
+                queue_runtime_data: None,
             }),
             cacheline1: CachePadded::new(TcpWorkerOwnedStateCacheline1 {
                 fast_open_cache: Vec::new(),
@@ -1052,6 +1057,20 @@ impl TcpWorkerOwnedState {
     #[inline]
     pub(crate) fn owner_worker(&self) -> DataWorkerId {
         self.owner_worker
+    }
+
+    /// Per-worker TCP session-queue runtime data, set once by
+    /// `TcpMain::register_tcp_input` when it first builds the worker's
+    /// `TcpQueue<C>`. Read back on subsequent registrations of the same
+    /// worker's TCP input node. Worker-local, no locking.
+    #[inline]
+    pub(crate) fn queue_runtime_data(&self) -> Option<NodeRuntimeData> {
+        self.queue_runtime_data
+    }
+
+    #[inline]
+    pub(crate) fn set_queue_runtime_data(&mut self, data: NodeRuntimeData) {
+        self.queue_runtime_data = Some(data);
     }
 
     #[cfg(test)]
