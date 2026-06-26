@@ -18,6 +18,7 @@ use crate::trace::codec::put_usize;
 
 #[hammer_component_macros::graph_node(
     graph = service,
+    init = crate::data_plane::register_drop,
 )]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DropNode;
@@ -33,7 +34,7 @@ impl DropNode {
 
 #[hammer_component_macros::graph_node(
     graph = service,
-    register = handoff,
+    init = crate::data_plane::register_handoff,
 )]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HandoffNode;
@@ -45,6 +46,16 @@ impl HandoffNode {
     pub fn new() -> Self {
         Self
     }
+}
+
+pub fn register_drop(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+    runtime.nodes().try_register_internal(DropNode)
+}
+
+pub fn register_handoff(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+    runtime
+        .nodes()
+        .register_internal_with_handle(runtime.handoff_node_handle()?, HandoffNode)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -719,7 +730,10 @@ impl<A: FeatureArcSpec> FeatureArcState<A> {
         let feature_order = self.feature_order.clone();
         let mut chains = HashMap::with_capacity(self.enabled.len());
         for (interface_index, enabled) in &self.enabled {
-            let enabled = enabled.iter().map(|enabled| enabled.id).collect::<HashSet<_>>();
+            let enabled = enabled
+                .iter()
+                .map(|enabled| enabled.id)
+                .collect::<HashSet<_>>();
             let chain_features = feature_order
                 .iter()
                 .copied()

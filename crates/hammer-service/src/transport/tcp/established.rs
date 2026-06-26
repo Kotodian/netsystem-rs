@@ -2,14 +2,14 @@ use hammer_adapter::{
     BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeId, NodeNextFrames, NodeProcessFn,
     NodeResult, NodeRuntimeData,
 };
-use hammer_core::error::CoreResult;
+use hammer_core::error::{CoreError, CoreResult};
 
 use super::segment::parse_tcp_packet;
 use super::tcp_worker_state_mut;
 use super::{
-    TCP_TIMER_DELAYED_ACK, TCP_TIMER_KEEP_ALIVE, TCP_TIMER_PACING, TCP_TIMER_PERSIST,
+    TCP_MAIN, TCP_TIMER_DELAYED_ACK, TCP_TIMER_KEEP_ALIVE, TCP_TIMER_PACING, TCP_TIMER_PERSIST,
     TCP_TIMER_RACK, TCP_TIMER_RETRANSMIT, TCP_TIMER_TLP, TcpNodeError, TcpQueue,
-    TcpWorkerOwnedState, read_session_id,
+    TcpWorkerOwnedState, ensure_tcp_session_queue, read_session_id,
 };
 use crate::session::protocol::SessionQueueControlContext;
 use crate::transport::congestion::CongestionController;
@@ -23,12 +23,27 @@ pub enum TcpEstablishedNext {
 
 #[hammer_component_macros::graph_node(
     graph = service,
+    init = crate::transport::tcp::established::register_tcp_established,
     name = "tcp-established",
     next = TcpEstablishedNext,
 )]
 #[hammer_component_macros::node(role = internal, next = TcpEstablishedNext)]
 pub struct TcpEstablishedNode<C: CongestionController + 'static> {
     session_queue: TcpQueue<C>,
+}
+
+pub fn register_tcp_established(runtime: &DataPlaneRuntime, worker: usize) -> CoreResult<NodeId> {
+    crate::with_congestion!(|C| {
+        let queue_data = ensure_tcp_session_queue::<C>(runtime, worker)?;
+        let queue = TcpQueue::<C>::new(queue_data);
+        TCP_MAIN
+            .get()
+            .ok_or_else(|| CoreError::internal("tcp main not initialized"))?;
+        runtime.nodes().try_register_internal_with_next_names(
+            TcpEstablishedNode::<C>::new(queue, [NodeId::new(0); TcpEstablishedNext::COUNT]),
+            &TcpEstablishedNext::NEXT_NAMES,
+        )
+    })
 }
 
 impl<C> Node for TcpEstablishedNode<C>

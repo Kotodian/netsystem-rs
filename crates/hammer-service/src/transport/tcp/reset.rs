@@ -17,6 +17,7 @@ pub enum TcpResetNext {
 
 #[hammer_component_macros::graph_node(
     graph = service,
+    init = crate::transport::tcp::reset::register_tcp_reset,
     next = TcpResetNext,
 )]
 #[derive(Clone, Copy)]
@@ -24,6 +25,13 @@ pub enum TcpResetNext {
 pub struct TcpResetNode {
     #[node(default)]
     cached_next: Option<NodeId>,
+}
+
+pub fn register_tcp_reset(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+    runtime.nodes().try_register_internal_with_next_names(
+        TcpResetNode::new([NodeId::new(0); TcpResetNext::COUNT]),
+        &TcpResetNext::NEXT_NAMES,
+    )
 }
 
 impl Node for TcpResetNode {

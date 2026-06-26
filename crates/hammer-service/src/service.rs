@@ -17,8 +17,7 @@ use hammer_core::log::{DiscardWriter, Factory, LogWriter, Logger};
 use hammer_core::registry::RuntimeRegistry;
 use hammer_infra::map::FlatHashTable;
 use hammer_runtime::adapter::{
-    Lifecycle, NetworkManager as _, NodeId, PlatformInterface, TraceControlPlane,
-    TraceRecordSink,
+    Lifecycle, NetworkManager as _, PlatformInterface, TraceControlPlane, TraceRecordSink,
 };
 use hammer_runtime::app::AppContext;
 use hammer_runtime::spawn::{DataRuntime, DataRuntimeContext};
@@ -30,11 +29,11 @@ use std::time::Duration;
 
 use crate::app::AppHost;
 use crate::packet_graph;
+use crate::transport::tcp::TcpInputControlPlane;
 use crate::transport::tcp::lookup::{
     TcpIpv4ListenerAddress, TcpIpv6ListenerAddress, TcpListenerAddress, TcpListenerLookupAccess,
     TcpLookupId, TcpLookupSnapshot, TcpLookupValue, TcpV4ListenerKey, TcpV6ListenerKey,
 };
-use crate::transport::tcp::TcpInputControlPlane;
 use hammer_core::protocol::tcp::TcpCapabilities;
 
 const CONTROL_THREAD_STACK_SIZE: usize = 512 * 1024;
@@ -170,7 +169,11 @@ struct RuntimeTcpListenerSnapshot {
 
 impl RuntimeTcpListenerControlState {
     fn new() -> HammerResult<Self> {
-        let tcp_control = TcpInputControlPlane::new();
+        let tcp_control = crate::transport::tcp::TCP_MAIN
+            .get()
+            .ok_or_else(|| HammerError::internal("tcp main not initialized"))?
+            .control()
+            .clone();
 
         Ok(Self {
             next_tcp_lookup_id: 1,
@@ -366,15 +369,36 @@ impl RuntimeService {
         let data_context = data_runtime.context();
         let app_context =
             AppContext::with_ring_capacity(data_context.clone(), worker.app_ring.capacity);
+        let registry = RuntimeRegistry::new();
+        registry.set::<config::Config>(Arc::new(config.clone()));
+        packet_graph::init_control_planes(&registry)?;
         let listener_state = RuntimeTcpListenerControlState::new()?;
-        packet_graph::install_service_graph(
-            &data_context,
-            config.network.tcp.congestion,
-            config.network.tcp.mss,
-            listener_state.tcp_control.clone(),
-            NodeHandle::new(worker.handoff.node_handle),
-            Arc::from(config.network.route.clone().into_boxed_slice()),
-        )?;
+        let handoff_node_handle = NodeHandle::new(worker.handoff.node_handle);
+        let worker_graph_nodes = data_context.install_on_workers(move |worker, runtime| {
+            let runtime = runtime
+                .clone()
+                .with_handoff_node_handle(handoff_node_handle);
+            runtime.init_graph(worker, &crate::packet_graph::SERVICE_GRAPH_NODES)?;
+            crate::transport::tcp::wire_worker_graph(&runtime, worker)?;
+            Ok::<_, hammer_core::error::CoreError>(
+                crate::packet_graph::SERVICE_GRAPH_NODES
+                    .iter()
+                    .filter_map(|entry| {
+                        entry
+                            .registration
+                            .name()
+                            .and_then(|name| runtime.node_by_name(name).map(|id| (name, id)))
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })?;
+        let mut graph_node_ids = Vec::new();
+        for nodes in worker_graph_nodes {
+            let nodes = nodes.map_err(HammerError::from)?;
+            if graph_node_ids.is_empty() {
+                graph_node_ids = nodes;
+            }
+        }
         let writer: Arc<dyn LogWriter> = if config.log.disabled {
             Arc::new(DiscardWriter)
         } else {
@@ -401,7 +425,11 @@ impl RuntimeService {
         let writer: Arc<dyn LogWriter> = Arc::clone(&control_handle) as Arc<dyn LogWriter>;
         let log_factory = Factory::new_with_min_level(base_time, writer, config.log.level);
         let trace_enabled_with_inputs = trace_worker_control(&config.trace);
-        trace.publish_options(&config.trace, packet_graph::resolve_graph_node)?;
+        trace.publish_options(&config.trace, |name| {
+            graph_node_ids
+                .iter()
+                .find_map(|(node_name, id)| (*node_name == name).then_some(*id))
+        })?;
         data_context.set_trace_control_on_workers(
             trace_enabled_with_inputs.then(|| trace.handle()),
             config.trace.packet_capacity,
@@ -410,8 +438,6 @@ impl RuntimeService {
             new_logger(&log_factory, "control-event"),
             Arc::clone(&control_handle),
         )?;
-
-        let registry = RuntimeRegistry::new();
         let pause = Arc::new(PauseManager::new());
 
         let cert_store = Arc::new(CertificateStore::new(
@@ -698,6 +724,32 @@ fn schedule_trace_drain(
             }
         }
     })
+}
+
+#[cfg(test)]
+fn assert_service_graph_tcp_nodes_declared() {
+    let names: Vec<&'static str> = packet_graph::SERVICE_GRAPH_NODES
+        .iter()
+        .filter_map(|entry| entry.registration.name())
+        .collect();
+    for want in [
+        "session-queue",
+        "handoff",
+        "tcp-input",
+        "tcp-listen",
+        "tcp-rcv-process",
+        "tcp-syn-sent",
+        "tcp-established",
+        "tcp-reset",
+    ] {
+        assert!(names.iter().any(|name| *name == want), "missing {want}");
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn service_packet_graph_resolves_tcp_nodes() {
+    assert_service_graph_tcp_nodes_declared();
 }
 
 fn start_inner(inner: &mut ServiceInner) -> HammerResult<()> {
@@ -1111,14 +1163,7 @@ enabled = true
 
     #[test]
     fn service_packet_graph_resolves_tcp_nodes() {
-        assert!(packet_graph::resolve_graph_node("session-queue").is_some());
-        assert!(packet_graph::resolve_graph_node("handoff").is_some());
-        assert!(packet_graph::resolve_graph_node("tcp-input").is_some());
-        assert!(packet_graph::resolve_graph_node("tcp-listen").is_some());
-        assert!(packet_graph::resolve_graph_node("tcp-rcv-process").is_some());
-        assert!(packet_graph::resolve_graph_node("tcp-syn-sent").is_some());
-        assert!(packet_graph::resolve_graph_node("tcp-established").is_some());
-        assert!(packet_graph::resolve_graph_node("tcp-reset").is_some());
+        assert_service_graph_tcp_nodes_declared();
     }
 
     #[test]

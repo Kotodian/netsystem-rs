@@ -2,11 +2,11 @@ use hammer_adapter::{
     BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeId, NodeNextFrames, NodeProcessFn,
     NodeResult, NodeRuntimeData,
 };
-use hammer_core::error::CoreResult;
+use hammer_core::error::{CoreError, CoreResult};
 
 use super::publish_tcp_connection;
 use super::segment::parse_tcp_packet;
-use super::{TcpNodeError, TcpQueue, read_session_id};
+use super::{TCP_MAIN, TcpNodeError, TcpQueue, ensure_tcp_session_queue, read_session_id};
 use super::{tcp_worker_state, tcp_worker_state_mut};
 use crate::transport::congestion::CongestionController;
 
@@ -19,12 +19,27 @@ pub enum TcpSynSentNext {
 
 #[hammer_component_macros::graph_node(
     graph = service,
+    init = crate::transport::tcp::syn_sent::register_tcp_syn_sent,
     name = "tcp-syn-sent",
     next = TcpSynSentNext,
 )]
 #[hammer_component_macros::node(role = internal, next = TcpSynSentNext)]
 pub struct TcpSynSentNode<C: CongestionController + 'static> {
     session_queue: TcpQueue<C>,
+}
+
+pub fn register_tcp_syn_sent(runtime: &DataPlaneRuntime, worker: usize) -> CoreResult<NodeId> {
+    crate::with_congestion!(|C| {
+        let queue_data = ensure_tcp_session_queue::<C>(runtime, worker)?;
+        let queue = TcpQueue::<C>::new(queue_data);
+        TCP_MAIN
+            .get()
+            .ok_or_else(|| CoreError::internal("tcp main not initialized"))?;
+        runtime.nodes().try_register_internal_with_next_names(
+            TcpSynSentNode::<C>::new(queue, [NodeId::new(0); TcpSynSentNext::COUNT]),
+            &TcpSynSentNext::NEXT_NAMES,
+        )
+    })
 }
 
 impl<C> Node for TcpSynSentNode<C>

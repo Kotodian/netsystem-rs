@@ -3,19 +3,23 @@ pub use hammer_core::protocol::tcp::{TcpInputFlags, TcpSeq, TcpState};
 use std::sync::OnceLock;
 
 use hammer_adapter::{
-    BufferPacketCursor, DataPlaneRuntime, DataWorkerId, NodeId, SecondaryOpaque,
+    BufferPacketCursor, DataPlaneRuntime, DataWorkerId, NodeId, NodeRuntimeData, NodeState,
+    SecondaryOpaque,
 };
 use hammer_core::error::{CoreError, CoreResult, HammerError, HammerResult};
-use hammer_core::registry::RuntimeRegistry;
 #[cfg(test)]
 use hammer_core::protocol::tcp::{TcpCapabilities, TcpFastOpenCookie};
 use hammer_core::protocol::tcp::{TcpControlPacketParseError, TcpError};
+use hammer_core::registry::RuntimeRegistry;
 use thiserror::Error;
 
 use crate::session::{
-    SessionId, SessionQueueHandle, SessionQueueNext, node::SessionQueueOutput,
-    protocol::SessionQueueControlContext, runtime::SessionDriverRuntime,
+    SessionId, SessionQueueHandle, SessionQueueNext,
+    node::{SessionQueueNode, SessionQueueOutput},
+    protocol::SessionQueueControlContext,
+    runtime::SessionDriverRuntime,
     runtime::SessionQueueProtocol,
+    runtime::dispatch_registered_session_queue_once_at,
 };
 use crate::transport::congestion::CongestionController;
 
@@ -91,19 +95,7 @@ impl TcpMain {
                 .map_err(|_| CoreError::internal("worker index does not fit into u32"))?,
         );
 
-        let worker_state = tcp_worker_state_mut();
-
-        let runtime_data = if let Some(data) = worker_state.queue_runtime_data() {
-            data
-        } else {
-            let queue = crate::session::node::register_session_queue(
-                TcpSessionDriver::<C>::new(worker_id, rt.packet_buffers().clone()),
-            )?;
-            let data = queue.runtime_data();
-            worker_state.set_queue_runtime_data(data);
-            data
-        };
-
+        let runtime_data = ensure_tcp_session_queue::<C>(rt, worker)?;
         let queue = TcpQueue::<C>::new(runtime_data);
         let handoff = rt.handoff_node_handle()?;
         let next = [NodeId::new(0); TcpInputNext::COUNT];
@@ -113,6 +105,27 @@ impl TcpMain {
         rt.nodes()
             .try_register_internal_with_next_names(node, &TcpInputNext::NEXT_NAMES)
     }
+}
+
+pub(crate) fn ensure_tcp_session_queue<C: CongestionController + 'static>(
+    rt: &DataPlaneRuntime,
+    worker: usize,
+) -> CoreResult<NodeRuntimeData> {
+    if let Some(data) = tcp_worker_state().queue_runtime_data() {
+        return Ok(data);
+    }
+
+    let worker_id = DataWorkerId::new(
+        u32::try_from(worker)
+            .map_err(|_| CoreError::internal("worker index does not fit into u32"))?,
+    );
+    let queue = crate::session::node::register_session_queue(TcpSessionDriver::<C>::new(
+        worker_id,
+        rt.packet_buffers().clone(),
+    ))?;
+    let data = queue.runtime_data();
+    tcp_worker_state_mut().set_queue_runtime_data(data);
+    Ok(data)
 }
 
 pub static TCP_MAIN: OnceLock<TcpMain> = OnceLock::new();
@@ -129,14 +142,38 @@ fn init_tcp(reg: &RuntimeRegistry) -> HammerResult<()> {
     init(reg)
 }
 
-pub fn register_tcp_input_graph_node<C: CongestionController + 'static>(
-    runtime: &DataPlaneRuntime,
-    worker: usize,
-) -> CoreResult<NodeId> {
-    TCP_MAIN
-        .get()
-        .ok_or_else(|| CoreError::internal("tcp main not initialized"))?
-        .register_tcp_input::<C>(runtime, worker)
+pub fn register_tcp_input(runtime: &DataPlaneRuntime, worker: usize) -> CoreResult<NodeId> {
+    crate::with_congestion!(|C| {
+        TCP_MAIN
+            .get()
+            .ok_or_else(|| CoreError::internal("tcp main not initialized"))?
+            .register_tcp_input::<C>(runtime, worker)
+    })
+}
+
+pub fn wire_worker_graph(runtime: &DataPlaneRuntime, worker: usize) -> CoreResult<()> {
+    crate::with_congestion!(|C| {
+        let queue_data = ensure_tcp_session_queue::<C>(runtime, worker)?;
+        let queue = TcpQueue::<C>::new(queue_data);
+        let session_queue = runtime
+            .nodes()
+            .node_by_name("session-queue")
+            .ok_or_else(|| CoreError::internal("session-queue not registered"))?;
+        let tcp_output = runtime
+            .nodes()
+            .node_by_name("tcp-output")
+            .ok_or_else(|| CoreError::internal("tcp-output not registered"))?;
+        SessionQueueNode::attach_queue_by_runtime_data(
+            SessionQueueNode::registered_runtime_data()?,
+            queue,
+            tcp_output.into(),
+            dispatch_registered_session_queue_once_at::<TcpConnection<C>>,
+        )?;
+        runtime
+            .nodes()
+            .set_node_state(session_queue, NodeState::Polling)?;
+        Ok(())
+    })
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]

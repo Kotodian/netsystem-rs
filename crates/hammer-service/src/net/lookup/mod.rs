@@ -332,19 +332,17 @@ fn init_ip(reg: &RuntimeRegistry) -> HammerResult<()> {
     init(reg)
 }
 
-/// Free-fn entry point emitted by the `#[graph_node]` macro for
-/// `register = ip_lookup` nodes. Routes to `IP_MAIN`.
-pub fn register_ip_lookup_graph_node(
-    runtime: &DataPlaneRuntime,
-    _worker: usize,
-) -> CoreResult<NodeId> {
+pub fn register_ip_lookup(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
     IP_MAIN
         .get()
         .ok_or_else(|| CoreError::internal("ip main not initialized"))?
         .register_node(runtime)
 }
 
-#[hammer_component_macros::graph_node(graph = service, register = ip_lookup)]
+#[hammer_component_macros::graph_node(
+    graph = service,
+    init = crate::net::lookup::register_ip_lookup
+)]
 #[hammer_component_macros::node]
 pub struct IpLookupNode {
     #[node(default = register_ip_lookup_runtime(table.clone()))]

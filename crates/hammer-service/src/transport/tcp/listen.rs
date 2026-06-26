@@ -11,8 +11,8 @@ use hammer_infra::vec::Vec;
 use super::connection::TcpConnection;
 use super::segment::{TcpSegment, parse_tcp_packet};
 use super::{
-    TcpInputControlPlane, TcpInputNext, TcpQueue, publish_tcp_connection, tcp_worker_state_mut,
-    write_session_route_opaque,
+    TCP_MAIN, TcpInputControlPlane, TcpInputNext, TcpQueue, ensure_tcp_session_queue,
+    publish_tcp_connection, tcp_worker_state_mut, write_session_route_opaque,
 };
 #[cfg(test)]
 use super::{set_tcp_worker_state, tcp_worker_state};
@@ -32,6 +32,7 @@ pub enum TcpListenNext {
 
 #[hammer_component_macros::graph_node(
     graph = service,
+    init = crate::transport::tcp::listen::register_tcp_listen,
     name = "tcp-listen",
     next = TcpListenNext,
 )]
@@ -41,6 +42,22 @@ pub struct TcpListenNode<C: CongestionController + 'static> {
     session_queue: TcpQueue<C>,
     #[node(default = Cell::new(None))]
     control_slot: Cell<Option<usize>>,
+}
+
+pub fn register_tcp_listen(runtime: &DataPlaneRuntime, worker: usize) -> CoreResult<NodeId> {
+    crate::with_congestion!(|C| {
+        let queue_data = ensure_tcp_session_queue::<C>(runtime, worker)?;
+        let queue = TcpQueue::<C>::new(queue_data);
+        let control = TCP_MAIN
+            .get()
+            .ok_or_else(|| CoreError::internal("tcp main not initialized"))?
+            .control()
+            .clone();
+        runtime.nodes().try_register_internal_with_next_names(
+            TcpListenNode::<C>::new(control, queue, [NodeId::new(0); TcpListenNext::COUNT]),
+            &TcpListenNext::NEXT_NAMES,
+        )
+    })
 }
 
 thread_local! {

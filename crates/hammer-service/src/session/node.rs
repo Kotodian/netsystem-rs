@@ -1,4 +1,4 @@
-use std::cell::{RefCell, RefMut};
+use std::cell::{Cell, RefCell, RefMut};
 use std::fmt;
 use std::marker::PhantomData;
 use std::time::Instant;
@@ -112,6 +112,12 @@ struct SessionQueueAttachment {
     dispatch: SessionQueueDispatchFn,
 }
 
+#[hammer_component_macros::graph_node(
+    graph = service,
+    init = crate::session::node::register_session_queue_node,
+    name = "session-queue",
+    kind = driver,
+)]
 #[derive(Clone)]
 pub struct SessionQueueNode {
     runtime_data: NodeRuntimeData,
@@ -120,6 +126,15 @@ pub struct SessionQueueNode {
 thread_local! {
     static SESSION_QUEUE_NODES: RefCell<hammer_infra::vec::Vec<hammer_infra::vec::Vec<SessionQueueAttachment>>> =
         const { RefCell::new(hammer_infra::vec::Vec::new()) };
+    static SESSION_QUEUE_NODE_RUNTIME_DATA: Cell<Option<NodeRuntimeData>> = const { Cell::new(None) };
+}
+
+pub fn register_session_queue_node(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+    let node = SessionQueueNode::new()?;
+    let runtime_data = node.runtime_data;
+    let id = runtime.nodes().try_register_driver(node)?;
+    SESSION_QUEUE_NODE_RUNTIME_DATA.with(|data| data.set(Some(runtime_data)));
+    Ok(id)
 }
 
 impl SessionQueueNode {
@@ -133,13 +148,13 @@ impl SessionQueueNode {
         })
     }
 
-    pub(crate) fn attach_queue<Q>(
-        &self,
+    pub(crate) fn attach_queue_by_runtime_data<Q>(
+        runtime_data: NodeRuntimeData,
         handle: SessionQueueHandle<Q>,
         output_next: SessionQueueNext,
         dispatch: SessionQueueDispatchFn,
     ) -> CoreResult<()> {
-        let slot = self.runtime_data.usize_word(0)?;
+        let slot = runtime_data.usize_word(0)?;
         SESSION_QUEUE_NODES.with(|nodes| {
             let mut nodes = nodes
                 .try_borrow_mut()
@@ -154,6 +169,12 @@ impl SessionQueueNode {
             });
             Ok(())
         })
+    }
+
+    pub(crate) fn registered_runtime_data() -> CoreResult<NodeRuntimeData> {
+        SESSION_QUEUE_NODE_RUNTIME_DATA
+            .with(|data| data.get())
+            .ok_or_else(|| CoreError::internal("session queue node not registered"))
     }
 }
 

@@ -22,6 +22,7 @@ pub enum TcpOutputNext {
 
 #[hammer_component_macros::graph_node(
     graph = service,
+    init = crate::transport::tcp::output::register_tcp_output,
     next = TcpOutputNext,
 )]
 #[derive(Clone, Copy)]
@@ -40,6 +41,13 @@ impl TcpOutputNode {
             cached_next: None,
         }
     }
+}
+
+pub fn register_tcp_output(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+    runtime.nodes().try_register_internal_with_next_names(
+        TcpOutputNode::new([NodeId::new(0); TcpOutputNext::COUNT]),
+        &TcpOutputNext::NEXT_NAMES,
+    )
 }
 
 impl Node for TcpOutputNode {
