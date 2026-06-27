@@ -12,7 +12,7 @@ pub mod prefetch;
 pub mod rbtree;
 pub mod ring;
 pub mod fifo;
+pub mod msg_queue;
 pub mod segment;
-pub mod svm_msg_q;
 pub mod timer_wheel;
 pub mod vec;
