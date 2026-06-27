@@ -1,12 +1,10 @@
 use hammer_adapter::{
-    BufferBatchMut, BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeId,
+    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeId, NodeNextFrames,
     NodeProcessFn, NodeResult, NodeRuntimeData,
 };
 use hammer_core::error::CoreResult;
-use hammer_core::protocol::tcp::{
-    TcpError, TcpResetError, TcpResetPacketCursor, tcp_reset_network_header_len,
-    tcp_reset_reply_from_current_packet,
-};
+use hammer_core::protocol::tcp::{TcpError, TcpSegmentFlags, tcp_header};
+use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 
 #[hammer_component_macros::node_next]
 pub enum TcpResetNext {
@@ -42,16 +40,7 @@ impl Node for TcpResetNode {
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         let next = Self::runtime_nexts(runtime)?;
-        hammer_adapter::node_process_cached!(
-            self,
-            tcp_reset_process_frame(
-                runtime,
-                frame,
-                next[TcpResetNext::Drop as usize],
-                next[TcpResetNext::Lookup as usize],
-                self.cached_next,
-            )
-        )
+        tcp_reset_process_frame(runtime, frame, next)
     }
 
     #[inline]
@@ -71,45 +60,85 @@ fn tcp_reset_process(
     frame: &mut BufferFrame,
 ) -> CoreResult<NodeResult> {
     let next = TcpResetNode::runtime_nexts(runtime)?;
-    hammer_adapter::node_process_static!(tcp_reset_process_frame(
-        runtime,
-        frame,
-        next[TcpResetNext::Drop as usize],
-        next[TcpResetNext::Lookup as usize],
-        None,
-    ))
+    tcp_reset_process_frame(runtime, frame, next)
 }
 
 fn tcp_reset_process_frame(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
-    drop_next: NodeId,
-    lookup_next: NodeId,
-    cached_next: Option<NodeId>,
-) -> CoreResult<(NodeResult, Option<NodeId>)> {
-    hammer_adapter::node_route_frame_result!(
-        cached_next,
-        runtime,
-        frame,
-        prefetch_tcp_reset,
-        |_, indices, nexts| {
-            for (offset, index) in indices.iter().copied().enumerate() {
-                nexts[offset] = Some(tcp_reset_next_for_index(
-                    runtime,
-                    index,
-                    drop_next,
-                    lookup_next,
-                )?);
-            }
-            Ok(())
-        }
-    )
+    next: [NodeId; TcpResetNext::COUNT],
+) -> CoreResult<NodeResult> {
+    let drop_next = next[TcpResetNext::Drop as usize];
+    let lookup_next = next[TcpResetNext::Lookup as usize];
+    let mut next_frames = NodeNextFrames::default();
+    let indices = frame.pending_indices();
+    let len = indices.len();
+    let mut read = 0usize;
+    while read + 4 <= len {
+        prefetch_tcp_reset(runtime, &indices[read..read + 4]);
+        tcp_reset_enqueue_index(
+            runtime,
+            indices[read],
+            drop_next,
+            lookup_next,
+            &mut next_frames,
+        )?;
+        tcp_reset_enqueue_index(
+            runtime,
+            indices[read + 1],
+            drop_next,
+            lookup_next,
+            &mut next_frames,
+        )?;
+        tcp_reset_enqueue_index(
+            runtime,
+            indices[read + 2],
+            drop_next,
+            lookup_next,
+            &mut next_frames,
+        )?;
+        tcp_reset_enqueue_index(
+            runtime,
+            indices[read + 3],
+            drop_next,
+            lookup_next,
+            &mut next_frames,
+        )?;
+        read += 4;
+    }
+    if read + 2 <= len {
+        prefetch_tcp_reset(runtime, &indices[read..read + 2]);
+        tcp_reset_enqueue_index(
+            runtime,
+            indices[read],
+            drop_next,
+            lookup_next,
+            &mut next_frames,
+        )?;
+        tcp_reset_enqueue_index(
+            runtime,
+            indices[read + 1],
+            drop_next,
+            lookup_next,
+            &mut next_frames,
+        )?;
+        read += 2;
+    }
+    while read < len {
+        let index = indices[read];
+        prefetch_tcp_reset(runtime, &indices[read..read + 1]);
+        tcp_reset_enqueue_index(runtime, index, drop_next, lookup_next, &mut next_frames)?;
+        read += 1;
+    }
+    next_frames.finish(runtime, frame)
 }
 
 #[inline(always)]
-fn prefetch_tcp_reset(batch: &mut BufferBatchMut<'_>, indices: &[BufferIndex]) {
-    for index in indices.iter().copied() {
-        batch.prefetch_read(index);
+fn prefetch_tcp_reset(runtime: &DataPlaneRuntime, indices: &[BufferIndex]) {
+    let mut read = 0usize;
+    while read < indices.len() {
+        runtime.prefetch_read(indices[read]);
+        read += 1;
     }
 }
 
@@ -119,32 +148,365 @@ fn tcp_reset_next_for_index(
     drop_next: NodeId,
     lookup_next: NodeId,
 ) -> CoreResult<NodeId> {
-    let packet = runtime.copy_packet(index)?;
-    let cursor = tcp_reset_packet_cursor(runtime.get_buffer(index)?.packet_cursor());
-    let reply_len = {
-        let mut buffer = runtime.get_buffer_mut(index)?;
-        buffer.truncate(0)?;
-        let writable = buffer.writable_tail_mut();
-        let Some(reply_len) = tcp_reset_reply_from_current_packet(writable, &packet, cursor) else {
-            return Ok(drop_next);
-        };
-        buffer.commit_writable_tail(reply_len)?;
-        reply_len
+    let reset = {
+        let buffer = runtime.get_buffer(index)?;
+        tcp_reset_prepare_from_current(
+            buffer.current(),
+            unsafe { std::mem::transmute::<_, &crate::net::NetworkOpaque>(buffer.opaque()) }
+                .packet_cursor(),
+        )
+    };
+    let Some(reply_len) = tcp_reset_write_reply(runtime, index, reset)? else {
+        return Ok(drop_next);
     };
     refresh_reset_metadata(runtime, index, reply_len)?;
     Ok(lookup_next)
 }
 
-#[inline]
-fn tcp_reset_packet_cursor(cursor: BufferPacketCursor) -> TcpResetPacketCursor {
-    TcpResetPacketCursor {
-        packet_len: cursor.packet_len(),
-        network_header_offset: cursor.network_header_offset(),
-        network_header_len: cursor.network_header_len(),
-        transport_header_offset: cursor.transport_header_offset(),
-        transport_header_len: cursor.transport_header_len(),
-        transport_payload_offset: cursor.transport_payload_offset(),
+#[inline(always)]
+fn tcp_reset_enqueue_index(
+    runtime: &DataPlaneRuntime,
+    index: BufferIndex,
+    drop_next: NodeId,
+    lookup_next: NodeId,
+    next_frames: &mut NodeNextFrames,
+) -> CoreResult<()> {
+    let next = tcp_reset_next_for_index(runtime, index, drop_next, lookup_next)?;
+    hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, next, index)
+}
+
+#[inline(always)]
+fn tcp_reset_write_reply(
+    runtime: &DataPlaneRuntime,
+    index: BufferIndex,
+    reset: Option<([u8; 16], [u8; 16], u16, u16, u32, u32, u8, u8)>,
+) -> CoreResult<Option<usize>> {
+    let Some((
+        source,
+        destination,
+        source_port,
+        destination_port,
+        sequence,
+        acknowledgment,
+        flags,
+        version,
+    )) = reset
+    else {
+        return Ok(None);
+    };
+    let reply_len = {
+        let mut buffer = runtime.get_buffer_mut(index)?;
+        buffer.truncate(0)?;
+        let writable = buffer.writable_tail_mut();
+        let Some(reply_len) = tcp_reset_write_current_reply(
+            writable,
+            source,
+            destination,
+            source_port,
+            destination_port,
+            sequence,
+            acknowledgment,
+            flags,
+            version,
+        ) else {
+            return Ok(None);
+        };
+        buffer.commit_writable_tail(reply_len)?;
+        reply_len
+    };
+    Ok(Some(reply_len))
+}
+
+#[inline(always)]
+fn tcp_reset_prepare_from_current(
+    packet: &[u8],
+    cursor: BufferPacketCursor,
+) -> Option<([u8; 16], [u8; 16], u16, u16, u32, u32, u8, u8)> {
+    let available_len = packet.len().min(cursor.packet_len());
+    if cursor.transport_header_offset() > available_len
+        || cursor.transport_payload_offset() > available_len
+        || cursor.network_header_offset() > available_len
+    {
+        return None;
     }
+    let version = packet.get(cursor.network_header_offset()).copied()? >> 4;
+    let tcp_bytes = packet.get(cursor.transport_header_offset()..available_len)?;
+    let tcp = tcp_header(tcp_bytes).ok()?;
+    let tcp_header_len = tcp.header_len();
+    if cursor.transport_payload_offset()
+        != cursor
+            .transport_header_offset()
+            .checked_add(tcp_header_len)?
+    {
+        return None;
+    }
+    let flags = tcp.flags();
+    if flags.contains(TcpSegmentFlags::RST) {
+        return None;
+    }
+    let payload_len = available_len.checked_sub(cursor.transport_payload_offset())?;
+    let sequence_len = u32::try_from(
+        payload_len
+            .checked_add(usize::from(flags.contains(TcpSegmentFlags::SYN)))?
+            .checked_add(usize::from(flags.contains(TcpSegmentFlags::FIN)))?,
+    )
+    .ok()?;
+    let (response_sequence, response_acknowledgment, response_flags) =
+        if flags.contains(TcpSegmentFlags::ACK) {
+            (tcp.acknowledgment_number(), 0, 0x04)
+        } else {
+            (
+                0,
+                tcp.sequence_number().wrapping_add(sequence_len),
+                0x04 | 0x10,
+            )
+        };
+    let mut source = [0u8; 16];
+    let mut destination = [0u8; 16];
+    match version {
+        4 => {
+            if cursor.network_header_len() < 20
+                || cursor
+                    .network_header_offset()
+                    .checked_add(cursor.network_header_len())?
+                    > available_len
+                || usize::from(packet.get(cursor.network_header_offset())? & 0x0f) * 4 < 20
+            {
+                return None;
+            }
+            read_bytes(
+                packet.get(
+                    cursor.network_header_offset() + 16..cursor.network_header_offset() + 20,
+                )?,
+                &mut source[..4],
+            );
+            read_bytes(
+                packet.get(
+                    cursor.network_header_offset() + 12..cursor.network_header_offset() + 16,
+                )?,
+                &mut destination[..4],
+            );
+        }
+        6 => {
+            if cursor.network_header_len() < 40
+                || cursor
+                    .network_header_offset()
+                    .checked_add(cursor.network_header_len())?
+                    > available_len
+            {
+                return None;
+            }
+            read_bytes(
+                packet.get(
+                    cursor.network_header_offset() + 24..cursor.network_header_offset() + 40,
+                )?,
+                &mut source,
+            );
+            read_bytes(
+                packet
+                    .get(cursor.network_header_offset() + 8..cursor.network_header_offset() + 24)?,
+                &mut destination,
+            );
+        }
+        _ => return None,
+    }
+    Some((
+        source,
+        destination,
+        tcp.destination_port(),
+        tcp.source_port(),
+        response_sequence,
+        response_acknowledgment,
+        response_flags,
+        version,
+    ))
+}
+
+#[inline(always)]
+fn tcp_reset_write_current_reply(
+    output: &mut [u8],
+    source: [u8; 16],
+    destination: [u8; 16],
+    source_port: u16,
+    destination_port: u16,
+    sequence: u32,
+    acknowledgment: u32,
+    flags: u8,
+    version: u8,
+) -> Option<usize> {
+    match version {
+        4 => tcp_reset_write_ipv4_reply(
+            output,
+            source,
+            destination,
+            source_port,
+            destination_port,
+            sequence,
+            acknowledgment,
+            flags,
+        ),
+        6 => tcp_reset_write_ipv6_reply(
+            output,
+            source,
+            destination,
+            source_port,
+            destination_port,
+            sequence,
+            acknowledgment,
+            flags,
+        ),
+        _ => None,
+    }
+}
+
+fn tcp_reset_write_ipv4_reply(
+    output: &mut [u8],
+    source: [u8; 16],
+    destination: [u8; 16],
+    source_port: u16,
+    destination_port: u16,
+    sequence: u32,
+    acknowledgment: u32,
+    flags: u8,
+) -> Option<usize> {
+    const IPV4_HEADER_LEN: usize = 20;
+    const TCP_HEADER_LEN: usize = 20;
+    let total_len = IPV4_HEADER_LEN + TCP_HEADER_LEN;
+    let reset = output.get_mut(..total_len)?;
+    reset.fill(0);
+    reset[0] = 0x45;
+    write_be_u16(reset, 2, total_len as u16);
+    reset[8] = 64;
+    reset[9] = 6;
+    write_bytes(reset, 12, &source[..4]);
+    write_bytes(reset, 16, &destination[..4]);
+    tcp_reset_write_tcp_header(
+        &mut reset[IPV4_HEADER_LEN..],
+        source_port,
+        destination_port,
+        sequence,
+        acknowledgment,
+        flags,
+    )?;
+    let tcp_len_bytes = be_u16(TCP_HEADER_LEN as u16);
+    let tcp_checksum = internet_checksum_parts(&[
+        &source[..4],
+        &destination[..4],
+        &[0, 6],
+        &tcp_len_bytes,
+        &reset[IPV4_HEADER_LEN..],
+    ]);
+    write_be_u16(reset, 36, tcp_checksum);
+    let ip_checksum = internet_checksum(&reset[..IPV4_HEADER_LEN]);
+    write_be_u16(reset, 10, ip_checksum);
+    Some(total_len)
+}
+
+fn tcp_reset_write_ipv6_reply(
+    output: &mut [u8],
+    source: [u8; 16],
+    destination: [u8; 16],
+    source_port: u16,
+    destination_port: u16,
+    sequence: u32,
+    acknowledgment: u32,
+    flags: u8,
+) -> Option<usize> {
+    const IPV6_HEADER_LEN: usize = 40;
+    const TCP_HEADER_LEN: usize = 20;
+    let total_len = IPV6_HEADER_LEN + TCP_HEADER_LEN;
+    let reset = output.get_mut(..total_len)?;
+    reset.fill(0);
+    reset[0] = 0x60;
+    write_be_u16(reset, 4, TCP_HEADER_LEN as u16);
+    reset[6] = 6;
+    reset[7] = 64;
+    write_bytes(reset, 8, &source);
+    write_bytes(reset, 24, &destination);
+    tcp_reset_write_tcp_header(
+        &mut reset[IPV6_HEADER_LEN..],
+        source_port,
+        destination_port,
+        sequence,
+        acknowledgment,
+        flags,
+    )?;
+    let tcp_len_bytes = be_u32(TCP_HEADER_LEN as u32);
+    let tcp_checksum = internet_checksum_parts(&[
+        &source,
+        &destination,
+        &tcp_len_bytes,
+        &[0, 0, 0, 6],
+        &reset[IPV6_HEADER_LEN..],
+    ]);
+    write_be_u16(reset, 56, tcp_checksum);
+    Some(total_len)
+}
+
+#[inline(always)]
+fn tcp_reset_write_tcp_header(
+    output: &mut [u8],
+    source_port: u16,
+    destination_port: u16,
+    sequence: u32,
+    acknowledgment: u32,
+    flags: u8,
+) -> Option<()> {
+    let header = output.get_mut(..20)?;
+    write_be_u16(header, 0, source_port);
+    write_be_u16(header, 2, destination_port);
+    write_be_u32(header, 4, sequence);
+    write_be_u32(header, 8, acknowledgment);
+    header[12] = 0x50;
+    header[13] = flags;
+    Some(())
+}
+
+#[inline(always)]
+fn write_bytes(output: &mut [u8], offset: usize, bytes: &[u8]) {
+    let mut index = 0usize;
+    while index < bytes.len() {
+        output[offset + index] = bytes[index];
+        index += 1;
+    }
+}
+
+#[inline(always)]
+fn read_bytes(input: &[u8], output: &mut [u8]) {
+    let mut index = 0usize;
+    while index < input.len() {
+        output[index] = input[index];
+        index += 1;
+    }
+}
+
+#[inline(always)]
+fn write_be_u16(output: &mut [u8], offset: usize, value: u16) {
+    output[offset] = (value >> 8) as u8;
+    output[offset + 1] = value as u8;
+}
+
+#[inline(always)]
+fn write_be_u32(output: &mut [u8], offset: usize, value: u32) {
+    output[offset] = (value >> 24) as u8;
+    output[offset + 1] = (value >> 16) as u8;
+    output[offset + 2] = (value >> 8) as u8;
+    output[offset + 3] = value as u8;
+}
+
+#[inline(always)]
+fn be_u16(value: u16) -> [u8; 2] {
+    [(value >> 8) as u8, value as u8]
+}
+
+#[inline(always)]
+fn be_u32(value: u32) -> [u8; 4] {
+    [
+        (value >> 24) as u8,
+        (value >> 16) as u8,
+        (value >> 8) as u8,
+        value as u8,
+    ]
 }
 
 fn refresh_reset_metadata(
@@ -155,17 +517,20 @@ fn refresh_reset_metadata(
     const TCP_HEADER_LEN: usize = 20;
 
     let mut buffer = runtime.get_buffer_mut(index)?;
-    let network_header_len = tcp_reset_network_header_len(buffer.current())
-        .ok_or(TcpResetError::UnsupportedIpVersion)
-        .map_err(TcpError::from)?;
+    let network_header_len = match buffer.current().first().copied().map(|byte| byte >> 4) {
+        Some(4) => 20,
+        Some(6) => 40,
+        _ => return Err(TcpError::SegmentInvalid.into()),
+    };
     buffer.clear_node_error();
-    buffer.set_packet_cursor(
-        BufferPacketCursor::new()
-            .with_packet_len(packet_len)
-            .with_network_header(0, network_header_len)
-            .with_transport_header(network_header_len, TCP_HEADER_LEN)
-            .with_transport_payload_offset(network_header_len + TCP_HEADER_LEN),
-    );
+    unsafe { std::mem::transmute::<_, &mut crate::net::NetworkOpaque>(buffer.opaque_mut()) }
+        .set_packet_cursor(
+            BufferPacketCursor::new()
+                .with_packet_len(packet_len)
+                .with_network_header(0, network_header_len)
+                .with_transport_header(network_header_len, TCP_HEADER_LEN)
+                .with_transport_payload_offset(network_header_len + TCP_HEADER_LEN),
+        );
     Ok(())
 }
 
@@ -173,7 +538,7 @@ fn refresh_reset_metadata(
 mod tests {
     use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 
-    use hammer_adapter::{BufferNodeError, InternalNode, NodeRegistration};
+    use hammer_adapter::{BufferNodeError, InternalNode};
 
     use super::*;
 
@@ -199,14 +564,7 @@ mod tests {
         }
     }
 
-    impl InternalNode for BlackholeNode {
-        fn node_registration(&self) -> NodeRegistration
-        where
-            Self: Sized,
-        {
-            NodeRegistration::next("tcp-reset-test-blackhole", 0)
-        }
-    }
+    impl InternalNode for BlackholeNode {}
 
     fn blackhole_process(
         _: &DataPlaneRuntime,
@@ -231,11 +589,11 @@ mod tests {
             .expect("alloc packet");
         {
             let mut buffer = runtime.get_buffer_mut(index).expect("buffer");
-            buffer.set_packet_cursor(buffer_packet_cursor(40));
-            let error = runtime
-                .record_current_node_error(7)
-                .expect("record current node error");
-            buffer.set_node_error(BufferNodeError::new(NodeId::new(0), error));
+            unsafe {
+                std::mem::transmute::<_, &mut crate::net::NetworkOpaque>(buffer.opaque_mut())
+            }
+            .set_packet_cursor(buffer_packet_cursor(40));
+            buffer.set_node_error(BufferNodeError::new(NodeId::new(0), 7));
         }
         runtime
             .get_frame_mut(frame)
@@ -250,8 +608,11 @@ mod tests {
         );
         assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
 
-        let packet = runtime.copy_packet(index).expect("rewritten packet");
-        let cursor = runtime.get_buffer(index).expect("buffer").packet_cursor();
+        let buffer = runtime.get_buffer(index).expect("buffer");
+        let packet = buffer.current();
+        let cursor =
+            unsafe { std::mem::transmute::<_, &crate::net::NetworkOpaque>(buffer.opaque()) }
+                .packet_cursor();
         let reply_tcp = etherparse::TcpSlice::from_slice(&packet[20..]).expect("parse reply");
         assert_eq!(cursor.packet_len(), packet.len());
         assert_eq!(cursor.network_header_offset(), 0);
@@ -275,25 +636,25 @@ mod tests {
         let total_len = u16::try_from(packet_len).expect("packet length fits");
         let mut packet = vec![0u8; packet_len];
         packet[0] = 0x45;
-        packet[2..4].copy_from_slice(&total_len.to_be_bytes());
+        write_be_u16(&mut packet, 2, total_len);
         packet[8] = 64;
         packet[9] = 6;
-        packet[12..16].copy_from_slice(&[192, 0, 2, 1]);
-        packet[16..20].copy_from_slice(&[198, 51, 100, 2]);
-        packet[20..22].copy_from_slice(&50_000u16.to_be_bytes());
-        packet[22..24].copy_from_slice(&80u16.to_be_bytes());
-        packet[24..28].copy_from_slice(&sequence.to_be_bytes());
-        packet[28..32].copy_from_slice(&acknowledgment.to_be_bytes());
+        write_bytes(&mut packet, 12, &[192, 0, 2, 1]);
+        write_bytes(&mut packet, 16, &[198, 51, 100, 2]);
+        write_be_u16(&mut packet, 20, 50_000);
+        write_be_u16(&mut packet, 22, 80);
+        write_be_u32(&mut packet, 24, sequence);
+        write_be_u32(&mut packet, 28, acknowledgment);
         packet[32] = 0x50;
         packet[33] = flags;
-        packet[34..36].copy_from_slice(&4096u16.to_be_bytes());
+        write_be_u16(&mut packet, 34, 4096);
         if !payload.is_empty() {
-            packet[40..40 + payload.len()].copy_from_slice(payload);
+            write_bytes(&mut packet, 40, payload);
         }
         let tcp_checksum = ipv4_l4_checksum([192, 0, 2, 1], [198, 51, 100, 2], 6, &packet[20..]);
-        packet[36..38].copy_from_slice(&tcp_checksum.to_be_bytes());
+        write_be_u16(&mut packet, 36, tcp_checksum);
         let ip_checksum = internet_checksum(&packet[..20]);
-        packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
+        write_be_u16(&mut packet, 10, ip_checksum);
         packet
     }
 
@@ -303,12 +664,7 @@ mod tests {
         protocol: u8,
         segment: &[u8],
     ) -> u16 {
-        internet_checksum_parts(&[
-            &source,
-            &destination,
-            &[0, protocol],
-            &(segment.len() as u16).to_be_bytes(),
-            segment,
-        ])
+        let segment_len = be_u16(segment.len() as u16);
+        internet_checksum_parts(&[&source, &destination, &[0, protocol], &segment_len, segment])
     }
 }

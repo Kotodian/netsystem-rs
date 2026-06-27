@@ -188,3 +188,58 @@ fn input_path_session_slot_prefetch_is_wired() {
         "SessionDriverRuntime must expose the prefetch_session pass-through"
     );
 }
+
+fn assert_tcp_state_node_uses_frame_discipline(path: &str, node: &str) {
+    let source = read_tcp_source(path);
+    assert!(
+        !source.contains(concat!("node_rewrite", "_frame!")),
+        "{node} still uses scalar node_rewrite_frame! macro"
+    );
+    assert!(
+        source.contains("frame.pending_indices()"),
+        "{node} does not read BufferIndex values from frame.pending_indices()"
+    );
+    assert!(
+        source.contains("runtime.prefetch_header"),
+        "{node} does not prefetch buffer headers across frame chunks"
+    );
+    assert!(
+        source.contains("NodeNextFrames"),
+        "{node} does not write next frames through NodeNextFrames"
+    );
+    assert!(
+        source.contains("NodeResult::drop"),
+        "{node} does not consume the input frame via NodeResult::drop()"
+    );
+}
+
+#[test]
+fn tcp_established_uses_frame_discipline_not_rewrite_macro() {
+    assert_tcp_state_node_uses_frame_discipline(
+        "src/transport/tcp/established.rs",
+        "tcp-established",
+    );
+}
+
+#[test]
+fn tcp_listen_uses_frame_discipline_not_rewrite_macro() {
+    let source = read_tcp_source("src/transport/tcp/listen.rs");
+    assert_tcp_state_node_uses_frame_discipline("src/transport/tcp/listen.rs", "tcp-listen");
+    assert!(
+        source.contains("tcp_established"),
+        "tcp-listen does not forward accepted payload to tcp-established next frame"
+    );
+}
+
+#[test]
+fn tcp_syn_sent_uses_frame_discipline_not_rewrite_macro() {
+    assert_tcp_state_node_uses_frame_discipline("src/transport/tcp/syn_sent.rs", "tcp-syn-sent");
+}
+
+#[test]
+fn tcp_rcv_process_uses_frame_discipline_not_rewrite_macro() {
+    assert_tcp_state_node_uses_frame_discipline(
+        "src/transport/tcp/rcv_process.rs",
+        "tcp-rcv-process",
+    );
+}

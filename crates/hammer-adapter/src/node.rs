@@ -15,52 +15,7 @@ pub mod next;
 
 pub const MAX_NODE_NEXT_FRAMES: usize = 16;
 
-pub use next::{
-    NodeNext, NodeNextEnqueue, NodeNextFrames, NodeNextStorage, NodeNextVectorEnqueue,
-    NodeVectorDispatch, default_prefetch_indices,
-};
-
-#[macro_export]
-macro_rules! node_process_cached {
-    ($node:expr, $process:expr $(, $after:block )? ) => {{
-        let (result, cached_next) = $process?;
-        $(
-            $after
-        )?
-        $node.cached_next = cached_next;
-        Ok(result)
-    }};
-}
-
-#[macro_export]
-macro_rules! node_process_static {
-    ($process:expr $(, $after:block )? ) => {{
-        let (result, _) = $process?;
-        $(
-            $after
-        )?
-        Ok(result)
-    }};
-}
-
-#[macro_export]
-macro_rules! node_rewrite_frame {
-    ($runtime:expr, $frame:expr, $drop_next:expr, |$index:ident, $next_frames:ident| $body:expr $(,)?) => {{
-        let mut $next_frames = $crate::node::NodeNextFrames::default();
-        $frame.rewrite_indices_batched(
-            $runtime.preferred_frame_batch_width(),
-            |$index| match $body {
-                Ok(()) => Ok(None),
-                Err(_) => {
-                    $next_frames.enqueue($runtime, $drop_next, $index)?;
-                    Ok(None)
-                }
-            },
-        )?;
-        $next_frames.schedule($runtime)?;
-        Ok($crate::node::NodeResult::drop())
-    }};
-}
+pub use next::{NodeNext, NodeNextFrames, NodeNextStorage, default_prefetch_indices};
 
 #[macro_export]
 macro_rules! node_rewrite_frame_current {
@@ -87,77 +42,30 @@ macro_rules! node_rewrite_frame_current {
 }
 
 #[macro_export]
-macro_rules! node_route_frame_cached {
-    ($node:expr, $runtime:expr, $frame:expr, $prefetch:expr, $route:expr $(, $after:block )? ) => {{
-        $crate::node_process_cached!(
-            $node,
-            $crate::node::NodeVectorDispatch::new($node.cached_next)
-                .route_frame($runtime, $frame, $prefetch, $route)
-            $(, $after )?
-        )
+macro_rules! validate_buffer_enqueue_x1 {
+    ($runtime:expr, $next_frames:expr, $next0:expr, $index0:expr $(,)?) => {{ $next_frames.enqueue($runtime, $next0, $index0) }};
+}
+
+#[macro_export]
+macro_rules! validate_buffer_enqueue_x2 {
+    ($runtime:expr, $next_frames:expr, $next0:expr, $index0:expr, $next1:expr, $index1:expr $(,)?) => {{
+        $crate::validate_buffer_enqueue_x1!($runtime, $next_frames, $next0, $index0)?;
+        $crate::validate_buffer_enqueue_x1!($runtime, $next_frames, $next1, $index1)
     }};
 }
 
 #[macro_export]
-macro_rules! node_route_frame_static {
-    ($cached_next:expr, $runtime:expr, $frame:expr, $prefetch:expr, $route:expr $(, $after:block )? ) => {{
-        $crate::node_process_static!(
-            $crate::node::NodeVectorDispatch::new($cached_next)
-                .route_frame($runtime, $frame, $prefetch, $route)
-            $(, $after )?
-        )
-    }};
-}
-
-#[macro_export]
-macro_rules! node_route_frame_index_cached {
-    ($node:expr, $runtime:expr, $frame:expr, $route:expr $(, $after:block )? ) => {{
-        $crate::node_process_cached!(
-            $node,
-            $crate::node::NodeVectorDispatch::new($node.cached_next)
-                .route_frame_index($runtime, $frame, $route)
-            $(, $after )?
-        )
-    }};
-}
-
-#[macro_export]
-macro_rules! node_route_frame_index_static {
-    ($cached_next:expr, $runtime:expr, $frame:expr, $route:expr $(, $after:block )? ) => {{
-        $crate::node_process_static!(
-            $crate::node::NodeVectorDispatch::new($cached_next)
-                .route_frame_index($runtime, $frame, $route)
-            $(, $after )?
-        )
-    }};
-}
-
-#[macro_export]
-macro_rules! node_route_frame_result {
-    ($cached_next:expr, $runtime:expr, $frame:expr, $prefetch:expr, $route:expr) => {{
-        $crate::node::NodeVectorDispatch::new($cached_next)
-            .route_frame($runtime, $frame, $prefetch, $route)
-    }};
-}
-
-#[macro_export]
-macro_rules! node_route_frame_index_result {
-    ($cached_next:expr, $runtime:expr, $frame:expr, $route:expr) => {{
-        $crate::node::NodeVectorDispatch::new($cached_next)
-            .route_frame_index($runtime, $frame, $route)
-    }};
-}
-
-#[macro_export]
-macro_rules! node_route_frame_index_cache_slot {
-    ($cached_next:expr, $runtime:expr, $frame:expr, $route:expr $(, $after:block )? ) => {{
-        let (result, next_cache) =
-            $crate::node_route_frame_index_result!(*$cached_next, $runtime, $frame, $route)?;
-        $(
-            $after
-        )?
-        *$cached_next = next_cache;
-        Ok(result)
+macro_rules! validate_buffer_enqueue_x4 {
+    ($runtime:expr, $next_frames:expr,
+     $next0:expr, $index0:expr,
+     $next1:expr, $index1:expr,
+     $next2:expr, $index2:expr,
+     $next3:expr, $index3:expr
+     $(,)?) => {{
+        $crate::validate_buffer_enqueue_x1!($runtime, $next_frames, $next0, $index0)?;
+        $crate::validate_buffer_enqueue_x1!($runtime, $next_frames, $next1, $index1)?;
+        $crate::validate_buffer_enqueue_x1!($runtime, $next_frames, $next2, $index2)?;
+        $crate::validate_buffer_enqueue_x1!($runtime, $next_frames, $next3, $index3)
     }};
 }
 
@@ -502,8 +410,9 @@ impl NodeResult {
 
     pub fn try_next_frames(next: impl IntoIterator<Item = NextFrame>) -> CoreResult<Self> {
         let mut result = Self::drop();
-        for next in next {
-            result.push(next)?;
+        let mut next = next.into_iter();
+        while let Some(item) = next.next() {
+            result.push(item)?;
         }
         Ok(result)
     }
@@ -766,8 +675,10 @@ impl NodeRuntimeInner {
                 return Err(CoreError::internal("node named next count mismatch"));
             }
         } else {
-            for next in initial_nexts.iter().copied() {
-                self.validate_node(next)?;
+            let mut index = 0usize;
+            while index < initial_nexts.len() {
+                self.validate_node(initial_nexts[index])?;
+                index += 1;
             }
         }
         if matches!(registration, NodeRegistration::Plain) && !initial_nexts.is_empty() {
@@ -841,9 +752,12 @@ impl NodeRuntimeInner {
                 self.sibling_owners[id.0 as usize] = Some(owner);
                 let mut group = self.siblings[owner.0 as usize].clone();
                 group.push(owner);
-                for sibling in group.iter().copied() {
+                let mut sibling_index = 0usize;
+                while sibling_index < group.len() {
+                    let sibling = group[sibling_index];
                     self.siblings[sibling.0 as usize].push(id);
                     self.siblings[id.0 as usize].push(sibling);
+                    sibling_index += 1;
                 }
                 self.declared_nodes.insert(name, id);
                 if let Some(handle) = handle {
@@ -855,15 +769,19 @@ impl NodeRuntimeInner {
     }
 
     fn resolve_named_next_nodes(&mut self) -> CoreResult<()> {
-        for slot in 0..self.nodes.len() {
+        let mut slot = 0usize;
+        while slot < self.nodes.len() {
             if self.pending_next_names[slot].is_empty() {
+                slot += 1;
                 continue;
             }
             if self.pending_next_names[slot].len() != self.next_nodes[slot].len() {
                 return Err(CoreError::internal("pending next name slot mismatch"));
             }
-            for index in 0..self.pending_next_names[slot].len() {
+            let mut index = 0usize;
+            while index < self.pending_next_names[slot].len() {
                 let Some(name) = self.pending_next_names[slot][index] else {
+                    index += 1;
                     continue;
                 };
                 let target =
@@ -872,15 +790,20 @@ impl NodeRuntimeInner {
                     })?;
                 self.validate_node(target)?;
                 self.next_nodes[slot][index] = Some(target);
+                index += 1;
             }
             self.pending_next_names[slot].clear();
+            slot += 1;
         }
 
-        for slot in 0..self.nodes.len() {
+        let mut slot = 0usize;
+        while slot < self.nodes.len() {
             let Some(owner) = self.sibling_owners[slot] else {
+                slot += 1;
                 continue;
             };
             self.next_nodes[slot] = self.next_nodes[owner.0 as usize].clone();
+            slot += 1;
         }
 
         Ok(())
@@ -1235,13 +1158,16 @@ impl NodeRuntime {
     pub fn polling_driver_nodes(&self) -> CoreResult<std::vec::Vec<NodeId>> {
         let inner = self.inner.borrow();
         let mut nodes = std::vec::Vec::new();
-        for (slot, node) in inner.nodes.iter().enumerate() {
+        let mut slot = 0usize;
+        while slot < inner.nodes.len() {
+            let node = &inner.nodes[slot];
             if node.kind == NodeKind::Driver && inner.node_states[slot] == NodeState::Polling {
                 let id = u32::try_from(slot)
                     .map(NodeId::new)
                     .map_err(|_| CoreError::internal("node id overflow"))?;
                 nodes.push(id);
             }
+            slot += 1;
         }
         Ok(nodes)
     }
@@ -1373,9 +1299,11 @@ impl NodeRuntime {
         if node_nexts.len() != COUNT {
             return Err(CoreError::internal("node next count mismatch"));
         }
-        for (slot, next) in node_nexts.iter().enumerate() {
-            nexts[slot] =
-                next.ok_or_else(|| CoreError::internal("node next slot is not registered"))?;
+        let mut slot = 0usize;
+        while slot < COUNT {
+            nexts[slot] = node_nexts[slot]
+                .ok_or_else(|| CoreError::internal("node next slot is not registered"))?;
+            slot += 1;
         }
         Ok(nexts)
     }
@@ -1514,8 +1442,10 @@ impl NodeRuntime {
         result: NodeResult,
     ) -> CoreResult<()> {
         let mut current_frame = Some(current_frame);
-        for offset in 0..result.len {
+        let mut offset = 0usize;
+        while offset < result.len {
             let Some(next) = result.next[offset] else {
+                offset += 1;
                 continue;
             };
             match next {
@@ -1580,6 +1510,7 @@ impl NodeRuntime {
                     }
                 },
             }
+            offset += 1;
         }
 
         if let Some(frame) = current_frame {
@@ -1593,13 +1524,12 @@ impl NodeRuntime {
         result: &NodeResult,
         start: usize,
     ) {
-        for next in result.next[start..result.len]
-            .iter()
-            .filter_map(|next| *next)
-        {
-            if let NextFrame::Frame { frame, .. } = next {
+        let mut offset = start;
+        while offset < result.len {
+            if let Some(NextFrame::Frame { frame, .. }) = result.next[offset] {
                 let _ = runtime.free_frame_index(frame);
             }
+            offset += 1;
         }
     }
 
@@ -1677,7 +1607,8 @@ mod tests {
         _data: NodeRuntimeData,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        for buffer in frame.drain_pending() {
+        let mut pending = frame.drain_pending();
+        while let Some(buffer) = pending.next() {
             runtime.free_index(buffer);
         }
         Ok(NodeResult::drop())

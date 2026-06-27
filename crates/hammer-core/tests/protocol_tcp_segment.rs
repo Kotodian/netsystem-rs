@@ -1,6 +1,7 @@
+use hammer_core::error::CoreError;
 use hammer_core::protocol::tcp::{
-    TcpCapabilities, TcpSackBlock, TcpSegmentFlags, TcpSegmentHeader, TcpSegmentParseError, TcpSeq,
-    tcp_options_from_bytes, write_tcp_segment_header,
+    TcpCapabilities, TcpError, TcpSackBlock, TcpSegmentFlags, TcpSegmentHeader, TcpSeq,
+    TcpWireHeader, tcp_header, tcp_options_from_bytes, write_tcp_segment_header,
 };
 
 #[test]
@@ -40,20 +41,16 @@ fn core_tcp_segment_parses_and_writes_ns_flag() {
 #[test]
 fn core_tcp_segment_rejects_short_header_and_bad_data_offset() {
     assert_eq!(
-        etherparse::TcpSlice::from_slice(&[0; 19])
-            .map(|_| ())
-            .map_err(map_tcp_parse_error),
-        Err(TcpSegmentParseError::ShortHeader)
+        tcp_header(&[0u8; 19]).map(TcpWireHeader::header_len),
+        Err(TcpError::SegmentInvalid)
     );
 
     let mut bytes = tcp_segment(&[], &[]);
     bytes[12] = 4 << 4;
 
     assert_eq!(
-        etherparse::TcpSlice::from_slice(&bytes)
-            .map(|_| ())
-            .map_err(map_tcp_parse_error),
-        Err(TcpSegmentParseError::BadDataOffset)
+        tcp_header(&bytes).map(TcpWireHeader::header_len),
+        Err(TcpError::SegmentInvalid)
     );
 }
 
@@ -133,7 +130,7 @@ fn tcp_segment(options: &[u8], payload: &[u8]) -> Vec<u8> {
 fn write_ack_for_test(
     output: &mut [u8],
     sack_blocks: &[TcpSackBlock],
-) -> Result<usize, hammer_core::error::CoreError> {
+) -> Result<usize, CoreError> {
     write_header_for_test(output, TcpSegmentFlags::ACK, sack_blocks)
 }
 
@@ -141,7 +138,7 @@ fn write_header_for_test(
     output: &mut [u8],
     flags: TcpSegmentFlags,
     sack_blocks: &[TcpSackBlock],
-) -> Result<usize, hammer_core::error::CoreError> {
+) -> Result<usize, CoreError> {
     Ok(write_tcp_segment_header(
         output,
         TcpSegmentHeader {
@@ -157,13 +154,4 @@ fn write_header_for_test(
         },
         Some(sack_blocks),
     )?)
-}
-
-fn map_tcp_parse_error(error: etherparse::err::tcp::HeaderSliceError) -> TcpSegmentParseError {
-    match error {
-        etherparse::err::tcp::HeaderSliceError::Len(_) => TcpSegmentParseError::ShortHeader,
-        etherparse::err::tcp::HeaderSliceError::Content(
-            etherparse::err::tcp::HeaderError::DataOffsetTooSmall { .. },
-        ) => TcpSegmentParseError::BadDataOffset,
-    }
 }

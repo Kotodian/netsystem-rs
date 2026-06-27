@@ -9,13 +9,15 @@ use hammer_core::protocol::tcp::{TcpConnectionId, TcpError, TcpPacket, TcpSegmen
 use hammer_infra::vec::Vec;
 
 use super::connection::TcpConnection;
-use super::segment::{TcpSegment, parse_tcp_packet};
+use super::segment::{TcpSegment, tcp_packet};
 use super::{
     TCP_MAIN, TcpInputControlPlane, TcpInputNext, TcpQueue, ensure_tcp_session_queue,
     publish_tcp_connection, tcp_worker_state_mut, write_session_route_opaque,
 };
 #[cfg(test)]
 use super::{set_tcp_worker_state, tcp_worker_state};
+#[cfg(test)]
+use crate::net::NetworkOpaque;
 use crate::session::SessionId;
 use crate::transport::congestion::CongestionController;
 
@@ -49,7 +51,8 @@ pub fn register_tcp_listen(runtime: &DataPlaneRuntime, worker: usize) -> CoreRes
         let queue_data = ensure_tcp_session_queue::<C>(runtime, worker)?;
         let queue = TcpQueue::<C>::new(queue_data);
         let control = TCP_MAIN
-            .get()
+            .load()
+            .as_deref()
             .ok_or_else(|| CoreError::internal("tcp main not initialized"))?
             .control()
             .clone();
@@ -174,8 +177,134 @@ where
     let tcp_output = next[TcpListenNext::Output as usize];
     let tcp_established = next[TcpListenNext::Established as usize];
     let drop_next = next[TcpListenNext::Drop as usize];
-    hammer_adapter::node_rewrite_frame!(runtime, frame, drop_next, |index, next_frames| {
-        tcp_listen_index(
+    let mut next_frames = NodeNextFrames::default();
+    let indices = frame.pending_indices();
+    let len = indices.len();
+    let mut read = 0usize;
+    while read + 4 <= len {
+        runtime.prefetch_header(indices[read]);
+        runtime.prefetch_header(indices[read + 1]);
+        runtime.prefetch_header(indices[read + 2]);
+        runtime.prefetch_header(indices[read + 3]);
+        if tcp_listen_index(
+            runtime,
+            indices[read],
+            control,
+            session_queue,
+            tcp_output,
+            tcp_established,
+            &mut next_frames,
+        )
+        .is_err()
+        {
+            hammer_adapter::validate_buffer_enqueue_x1!(
+                runtime,
+                next_frames,
+                drop_next,
+                indices[read]
+            )?;
+        }
+        if tcp_listen_index(
+            runtime,
+            indices[read + 1],
+            control,
+            session_queue,
+            tcp_output,
+            tcp_established,
+            &mut next_frames,
+        )
+        .is_err()
+        {
+            hammer_adapter::validate_buffer_enqueue_x1!(
+                runtime,
+                next_frames,
+                drop_next,
+                indices[read + 1]
+            )?;
+        }
+        if tcp_listen_index(
+            runtime,
+            indices[read + 2],
+            control,
+            session_queue,
+            tcp_output,
+            tcp_established,
+            &mut next_frames,
+        )
+        .is_err()
+        {
+            hammer_adapter::validate_buffer_enqueue_x1!(
+                runtime,
+                next_frames,
+                drop_next,
+                indices[read + 2]
+            )?;
+        }
+        if tcp_listen_index(
+            runtime,
+            indices[read + 3],
+            control,
+            session_queue,
+            tcp_output,
+            tcp_established,
+            &mut next_frames,
+        )
+        .is_err()
+        {
+            hammer_adapter::validate_buffer_enqueue_x1!(
+                runtime,
+                next_frames,
+                drop_next,
+                indices[read + 3]
+            )?;
+        }
+        read += 4;
+    }
+    if read + 2 <= len {
+        runtime.prefetch_header(indices[read]);
+        runtime.prefetch_header(indices[read + 1]);
+        if tcp_listen_index(
+            runtime,
+            indices[read],
+            control,
+            session_queue,
+            tcp_output,
+            tcp_established,
+            &mut next_frames,
+        )
+        .is_err()
+        {
+            hammer_adapter::validate_buffer_enqueue_x1!(
+                runtime,
+                next_frames,
+                drop_next,
+                indices[read]
+            )?;
+        }
+        if tcp_listen_index(
+            runtime,
+            indices[read + 1],
+            control,
+            session_queue,
+            tcp_output,
+            tcp_established,
+            &mut next_frames,
+        )
+        .is_err()
+        {
+            hammer_adapter::validate_buffer_enqueue_x1!(
+                runtime,
+                next_frames,
+                drop_next,
+                indices[read + 1]
+            )?;
+        }
+        read += 2;
+    }
+    while read < len {
+        let index = indices[read];
+        runtime.prefetch_header(index);
+        if tcp_listen_index(
             runtime,
             index,
             control,
@@ -184,7 +313,13 @@ where
             tcp_established,
             &mut next_frames,
         )
-    })
+        .is_err()
+        {
+            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, drop_next, index)?;
+        }
+        read += 1;
+    }
+    next_frames.finish(runtime, frame)
 }
 
 fn tcp_listen_index<C>(
@@ -199,7 +334,7 @@ fn tcp_listen_index<C>(
 where
     C: CongestionController + 'static,
 {
-    let packet = parse_tcp_packet(runtime, index)?;
+    let packet = tcp_packet(runtime, index)?;
     let mut release_input = true;
     let listener = control
         .lookup_listener(packet.local)
@@ -218,8 +353,8 @@ where
         )?;
         established_session = session_id;
         if let Some(segment) = control {
-            let allocated = runtime.packet_buffers().alloc_index()?;
-            if let Err(error) = segment.write_to_buffer(runtime.packet_buffers(), allocated) {
+            let allocated = runtime.buffers().alloc_index()?;
+            if let Err(error) = segment.write_to_buffer(runtime.buffers(), allocated) {
                 runtime.free_index(allocated);
                 return Err(error);
             }
@@ -235,7 +370,9 @@ where
     }
 
     if let Some(tx_index) = tx_index.take() {
-        if let Err(error) = next_frames.enqueue(runtime, tcp_output, tx_index) {
+        if let Err(error) =
+            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, tcp_output, tx_index)
+        {
             runtime.free_index(tx_index);
             return Err(error);
         }
@@ -254,7 +391,12 @@ where
                 TcpInputNext::Established,
             );
             drop(buffer);
-            if let Err(error) = next_frames.enqueue(runtime, tcp_established, index) {
+            if let Err(error) = hammer_adapter::validate_buffer_enqueue_x1!(
+                runtime,
+                next_frames,
+                tcp_established,
+                index
+            ) {
                 return Err(error);
             }
             release_input = false;
@@ -368,9 +510,10 @@ mod tests {
             )
         };
         let mut state = state.lock().expect("capture state");
-        for index in frame.drain_pending() {
-            let packet = runtime.copy_packet(index)?;
-            state.packets.push(packet.to_vec());
+        let mut pending = frame.drain_pending();
+        while let Some(index) = pending.next() {
+            let packet = runtime.get_buffer(index)?.current().to_vec();
+            state.packets.push(packet);
             runtime.free_index(index);
         }
         Ok(NodeResult::drop())
@@ -676,12 +819,10 @@ mod tests {
         let owner: &'static mut TcpWorkerOwnedState =
             Box::leak(Box::new(TcpWorkerOwnedState::new(DataWorkerId::new(0))));
         super::set_tcp_worker_state(owner);
-        let handle =
-            crate::session::node::register_session_queue(TcpSessionDriver::<BbrController>::new(
-                DataWorkerId::new(0),
-                runtime.packet_buffers().clone(),
-            ))
-            .expect("register queue");
+        let handle = crate::session::node::register_session_queue(
+            TcpSessionDriver::<BbrController>::new(DataWorkerId::new(0), runtime.buffers().clone()),
+        )
+        .expect("register queue");
         owner.insert_listener::<TcpIpv4ListenerAddress>(
             TcpV4ListenerKey::new(0, LOCAL_IP, LOCAL_PORT),
             LISTENER_ID,
@@ -724,10 +865,12 @@ mod tests {
         let frame = runtime.alloc_frame_index().expect("frame");
         let buffer = runtime.alloc_index_with_bytes(&packet).expect("packet");
         let cursor = tcp_control_cursor(&packet).expect("cursor");
-        runtime
-            .get_buffer_mut(buffer)
-            .expect("buffer mut")
-            .set_packet_cursor(cursor);
+        let mut data_buffer = runtime.get_buffer_mut(buffer).expect("buffer mut");
+        let network = unsafe { std::mem::transmute::<_, &mut NetworkOpaque>(data_buffer.opaque_mut()) };
+        network.set_packet_cursor(cursor);
+        let ip_version = (packet[0] >> 4) as u8;
+        network.ip_mut().set_ip_version(Some(ip_version));
+        network.ip_mut().set_ip_protocol(Some(6));
         runtime
             .get_frame_mut(frame)
             .expect("frame mut")
@@ -846,26 +989,26 @@ mod tests {
                 let total_len = u16::try_from(packet_len).map_err(|_| TcpError::Length)?;
                 let mut packet = std::vec![0u8; packet_len];
                 packet[0] = 0x45;
-                packet[2..4].copy_from_slice(&total_len.to_be_bytes());
+                write_be_u16(&mut packet, 2, total_len);
                 packet[8] = 64;
                 packet[9] = 6;
-                packet[12..16].copy_from_slice(&local_ip.octets());
-                packet[16..20].copy_from_slice(&remote_ip.octets());
-                packet[20..20 + tcp_header_len].copy_from_slice(&tcp[..tcp_header_len]);
+                write_bytes(&mut packet, 12, &local_ip.octets());
+                write_bytes(&mut packet, 16, &remote_ip.octets());
+                write_bytes(&mut packet, 20, &tcp[..tcp_header_len]);
                 if !payload.is_empty() {
-                    packet[20 + tcp_header_len..20 + tcp_header_len + payload.len()]
-                        .copy_from_slice(payload);
+                    write_bytes(&mut packet, 20 + tcp_header_len, payload);
                 }
+                let tcp_len_bytes = be_u16(packet_len as u16 - 20);
                 let tcp_checksum = internet_checksum_parts(&[
                     &local_ip.octets(),
                     &remote_ip.octets(),
                     &[0, 6],
-                    &(packet_len as u16 - 20).to_be_bytes(),
+                    &tcp_len_bytes,
                     &packet[20..],
                 ]);
-                packet[36..38].copy_from_slice(&tcp_checksum.to_be_bytes());
+                write_be_u16(&mut packet, 36, tcp_checksum);
                 let ip_checksum = internet_checksum(&packet[..20]);
-                packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
+                write_be_u16(&mut packet, 10, ip_checksum);
                 Ok(packet)
             }
             (IpAddr::V6(local_ip), IpAddr::V6(remote_ip)) => {
@@ -873,28 +1016,54 @@ mod tests {
                 let payload_len = u16::try_from(tcp_len).map_err(|_| TcpError::Length)?;
                 let mut packet = std::vec![0u8; packet_len];
                 packet[0] = 0x60;
-                packet[4..6].copy_from_slice(&payload_len.to_be_bytes());
+                write_be_u16(&mut packet, 4, payload_len);
                 packet[6] = 6;
                 packet[7] = 64;
-                packet[8..24].copy_from_slice(&local_ip.octets());
-                packet[24..40].copy_from_slice(&remote_ip.octets());
-                packet[40..40 + tcp_header_len].copy_from_slice(&tcp[..tcp_header_len]);
+                write_bytes(&mut packet, 8, &local_ip.octets());
+                write_bytes(&mut packet, 24, &remote_ip.octets());
+                write_bytes(&mut packet, 40, &tcp[..tcp_header_len]);
                 if !payload.is_empty() {
-                    packet[40 + tcp_header_len..40 + tcp_header_len + payload.len()]
-                        .copy_from_slice(payload);
+                    write_bytes(&mut packet, 40 + tcp_header_len, payload);
                 }
+                let tcp_len_bytes = be_u32(tcp_len as u32);
                 let tcp_checksum = internet_checksum_parts(&[
                     &local_ip.octets(),
                     &remote_ip.octets(),
-                    &(tcp_len as u32).to_be_bytes(),
+                    &tcp_len_bytes,
                     &[0, 0, 0, 6],
                     &packet[40..],
                 ]);
-                packet[56..58].copy_from_slice(&tcp_checksum.to_be_bytes());
+                write_be_u16(&mut packet, 56, tcp_checksum);
                 Ok(packet)
             }
             _ => Err(TcpError::SegmentInvalid),
         }
+    }
+
+    fn write_bytes(output: &mut [u8], offset: usize, bytes: &[u8]) {
+        let mut index = 0usize;
+        while index < bytes.len() {
+            output[offset + index] = bytes[index];
+            index += 1;
+        }
+    }
+
+    fn write_be_u16(output: &mut [u8], offset: usize, value: u16) {
+        output[offset] = (value >> 8) as u8;
+        output[offset + 1] = value as u8;
+    }
+
+    fn be_u16(value: u16) -> [u8; 2] {
+        [(value >> 8) as u8, value as u8]
+    }
+
+    fn be_u32(value: u32) -> [u8; 4] {
+        [
+            (value >> 24) as u8,
+            (value >> 16) as u8,
+            (value >> 8) as u8,
+            value as u8,
+        ]
     }
 
     fn tcp_sequence(packet: &[u8]) -> u32 {
@@ -1081,7 +1250,7 @@ where
         publish_tcp_connection(queue, session_id)?;
         queue.app().connected(session_id)?;
         {
-            let mut buffer = runtime.packet_buffers().get_buffer_mut(index)?;
+            let mut buffer = runtime.buffers().get_buffer_mut(index)?;
             buffer.advance(packet.payload_offset as isize)?;
             buffer.truncate(packet.payload_len)?;
         }

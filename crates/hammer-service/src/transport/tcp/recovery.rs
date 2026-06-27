@@ -65,36 +65,47 @@ impl ScoreboardKeyCollector {
         }
         buf.push(key);
         // Inline contents have been moved into the heap Vec; reset the inline
-        // view so `for_each`/`for_each_rev` do not visit them twice.
+        // view so drain operations do not visit them twice.
         self.len = 0;
         self.overflow = Some(buf);
     }
 
-    /// Visit every collected key in insertion order.
     #[inline]
-    fn for_each(mut self, mut f: impl FnMut(TcpSeq)) {
-        for i in 0..self.len {
-            f(self.inline[i]);
-        }
-        if let Some(buf) = self.overflow.take() {
-            for key in buf {
-                f(key);
+    fn pop_front(&mut self) -> Option<TcpSeq> {
+        if self.len != 0 {
+            let key = self.inline[0];
+            let mut index = 1usize;
+            while index < self.len {
+                self.inline[index - 1] = self.inline[index];
+                index += 1;
             }
+            self.len -= 1;
+            return Some(key);
         }
+        let buf = self.overflow.as_mut()?;
+        if buf.is_empty() {
+            self.overflow = None;
+            return None;
+        }
+        Some(buf.remove(0))
     }
 
-    /// Visit collected keys in reverse insertion order (used by
-    /// `update_scoreboard_loss`'s descending decision pass).
     #[inline]
-    fn for_each_rev(mut self, mut f: impl FnMut(TcpSeq)) {
-        if let Some(buf) = self.overflow.take() {
-            for key in buf.iter().rev() {
-                f(*key);
+    fn pop_back(&mut self) -> Option<TcpSeq> {
+        if let Some(buf) = self.overflow.as_mut() {
+            if let Some(key) = buf.pop() {
+                if buf.is_empty() {
+                    self.overflow = None;
+                }
+                return Some(key);
             }
+            self.overflow = None;
         }
-        for i in (0..self.len).rev() {
-            f(self.inline[i]);
+        if self.len == 0 {
+            return None;
         }
+        self.len -= 1;
+        Some(self.inline[self.len])
     }
 }
 
@@ -1097,9 +1108,9 @@ impl TcpRecoveryState {
             for (start, _) in self.scoreboard.holes.iter() {
                 keys.push(*start);
             }
-            keys.for_each(|start| {
+            while let Some(start) = keys.pop_front() {
                 self.scoreboard.holes.remove(&start);
-            });
+            }
             self.refresh_lost_bytes();
             self.rack_rescan_earliest();
             return;
@@ -1116,9 +1127,9 @@ impl TcpRecoveryState {
                 to_trim = Some((*start, hole.end, hole.lost));
             }
         }
-        to_remove.for_each(|start| {
+        while let Some(start) = to_remove.pop_front() {
             self.scoreboard.holes.remove(&start);
-        });
+        }
         if let Some((old_start, end, lost)) = to_trim {
             self.scoreboard.holes.remove(&old_start);
             let _ = self
@@ -1191,9 +1202,9 @@ impl TcpRecoveryState {
         let mut sacked_ahead: u32 = 0;
         let mut blocks_ahead: u32 = 0;
         let mut higher_start: Option<TcpSeq> = None;
-        hole_starts.for_each_rev(|start| {
+        while let Some(start) = hole_starts.pop_back() {
             let Some(hole) = self.scoreboard.holes.get(&start).copied() else {
-                return;
+                continue;
             };
             let should_mark_lost = blocks_ahead >= reorder_limit || sacked_ahead > byte_threshold;
             let hole_end = hole.end;
@@ -1215,7 +1226,7 @@ impl TcpRecoveryState {
                 blocks_ahead = blocks_ahead.saturating_add(1);
             }
             higher_start = Some(start);
-        });
+        }
         self.refresh_lost_bytes();
     }
 
@@ -2718,7 +2729,9 @@ mod tests {
             c.push(TcpSeq::from(1_000 + i));
         }
         let mut out = std::vec::Vec::new();
-        c.for_each(|k| out.push(u32::from(k)));
+        while let Some(k) = c.pop_front() {
+            out.push(u32::from(k));
+        }
         assert_eq!(out, vec![1_000, 1_001, 1_002, 1_003, 1_004]);
 
         // At cap exactly: still inline.
@@ -2727,7 +2740,9 @@ mod tests {
             c.push(TcpSeq::from(2_000 + i));
         }
         let mut out = std::vec::Vec::new();
-        c.for_each(|k| out.push(u32::from(k)));
+        while let Some(k) = c.pop_front() {
+            out.push(u32::from(k));
+        }
         assert_eq!(out.len(), SCOREBOARD_KEY_INLINE_CAP);
         assert_eq!(out[0], 2_000);
         assert_eq!(
@@ -2741,7 +2756,9 @@ mod tests {
             c.push(TcpSeq::from(3_000 + i));
         }
         let mut out = std::vec::Vec::new();
-        c.for_each(|k| out.push(u32::from(k)));
+        while let Some(k) = c.pop_front() {
+            out.push(u32::from(k));
+        }
         assert_eq!(out.len(), SCOREBOARD_KEY_INLINE_CAP + 4);
         for i in 0..out.len() {
             assert_eq!(
@@ -2757,7 +2774,9 @@ mod tests {
             c.push(TcpSeq::from(4_000 + i));
         }
         let mut out = std::vec::Vec::new();
-        c.for_each_rev(|k| out.push(u32::from(k)));
+        while let Some(k) = c.pop_back() {
+            out.push(u32::from(k));
+        }
         let total = SCOREBOARD_KEY_INLINE_CAP + 2;
         assert_eq!(out.len(), total);
         for i in 0..total {

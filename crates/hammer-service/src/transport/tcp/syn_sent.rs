@@ -2,10 +2,11 @@ use hammer_adapter::{
     BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeId, NodeNextFrames, NodeProcessFn,
     NodeResult, NodeRuntimeData,
 };
+
 use hammer_core::error::{CoreError, CoreResult};
 
 use super::publish_tcp_connection;
-use super::segment::parse_tcp_packet;
+use super::segment::tcp_packet;
 use super::{TCP_MAIN, TcpNodeError, TcpQueue, ensure_tcp_session_queue, read_session_id};
 use super::{tcp_worker_state, tcp_worker_state_mut};
 use crate::transport::congestion::CongestionController;
@@ -33,7 +34,8 @@ pub fn register_tcp_syn_sent(runtime: &DataPlaneRuntime, worker: usize) -> CoreR
         let queue_data = ensure_tcp_session_queue::<C>(runtime, worker)?;
         let queue = TcpQueue::<C>::new(queue_data);
         TCP_MAIN
-            .get()
+            .load()
+            .as_deref()
             .ok_or_else(|| CoreError::internal("tcp main not initialized"))?;
         runtime.nodes().try_register_internal_with_next_names(
             TcpSynSentNode::<C>::new(queue, [NodeId::new(0); TcpSynSentNext::COUNT]),
@@ -90,9 +92,80 @@ where
 {
     let tcp_output = next[TcpSynSentNext::Output as usize];
     let drop_next = next[TcpSynSentNext::Drop as usize];
-    hammer_adapter::node_rewrite_frame!(runtime, frame, drop_next, |index, next_frames| {
-        tcp_syn_sent_index(runtime, index, session_queue, tcp_output, &mut next_frames)
-    })
+    let mut next_frames = NodeNextFrames::default();
+    let indices = frame.pending_indices();
+    let len = indices.len();
+    let mut read = 0usize;
+    while read + 4 <= len {
+        prefetch_tcp_syn_sent(runtime, &indices[read..read + 4]);
+        tcp_syn_sent_enqueue_index(
+            runtime,
+            indices[read],
+            session_queue,
+            tcp_output,
+            drop_next,
+            &mut next_frames,
+        )?;
+        tcp_syn_sent_enqueue_index(
+            runtime,
+            indices[read + 1],
+            session_queue,
+            tcp_output,
+            drop_next,
+            &mut next_frames,
+        )?;
+        tcp_syn_sent_enqueue_index(
+            runtime,
+            indices[read + 2],
+            session_queue,
+            tcp_output,
+            drop_next,
+            &mut next_frames,
+        )?;
+        tcp_syn_sent_enqueue_index(
+            runtime,
+            indices[read + 3],
+            session_queue,
+            tcp_output,
+            drop_next,
+            &mut next_frames,
+        )?;
+        read += 4;
+    }
+    if read + 2 <= len {
+        prefetch_tcp_syn_sent(runtime, &indices[read..read + 2]);
+        tcp_syn_sent_enqueue_index(
+            runtime,
+            indices[read],
+            session_queue,
+            tcp_output,
+            drop_next,
+            &mut next_frames,
+        )?;
+        tcp_syn_sent_enqueue_index(
+            runtime,
+            indices[read + 1],
+            session_queue,
+            tcp_output,
+            drop_next,
+            &mut next_frames,
+        )?;
+        read += 2;
+    }
+    while read < len {
+        let index = indices[read];
+        prefetch_tcp_syn_sent(runtime, &indices[read..read + 1]);
+        tcp_syn_sent_enqueue_index(
+            runtime,
+            index,
+            session_queue,
+            tcp_output,
+            drop_next,
+            &mut next_frames,
+        )?;
+        read += 1;
+    }
+    next_frames.finish(runtime, frame)
 }
 
 fn tcp_syn_sent_index<C>(
@@ -105,7 +178,7 @@ fn tcp_syn_sent_index<C>(
 where
     C: CongestionController + 'static,
 {
-    let packet = parse_tcp_packet(runtime, index)?;
+    let packet = tcp_packet(runtime, index)?;
     let mut release_input = true;
     let mut tx_index = None;
     let result = {
@@ -145,7 +218,7 @@ where
         }
         if established_with_payload {
             {
-                let mut buffer = runtime.packet_buffers().get_buffer_mut(index)?;
+                let mut buffer = runtime.buffers().get_buffer_mut(index)?;
                 buffer.advance(packet.payload_offset as isize)?;
                 buffer.truncate(packet.payload_len)?;
             }
@@ -160,8 +233,8 @@ where
             queue.app().connected(session_id)?;
         }
         if let Some(segment) = control {
-            let allocated = runtime.packet_buffers().alloc_index()?;
-            if let Err(error) = segment.write_to_buffer(runtime.packet_buffers(), allocated) {
+            let allocated = runtime.buffers().alloc_index()?;
+            if let Err(error) = segment.write_to_buffer(runtime.buffers(), allocated) {
                 runtime.free_index(allocated);
                 return Err(error);
             }
@@ -187,12 +260,41 @@ where
     Ok(())
 }
 
+#[inline(always)]
+fn prefetch_tcp_syn_sent(runtime: &DataPlaneRuntime, indices: &[BufferIndex]) {
+    let mut read = 0usize;
+    while read < indices.len() {
+        runtime.prefetch_header(indices[read]);
+        read += 1;
+    }
+}
+
+#[inline(always)]
+fn tcp_syn_sent_enqueue_index<C>(
+    runtime: &DataPlaneRuntime,
+    index: BufferIndex,
+    session_queue: TcpQueue<C>,
+    tcp_output: NodeId,
+    drop_next: NodeId,
+    next_frames: &mut NodeNextFrames,
+) -> CoreResult<()>
+where
+    C: CongestionController + 'static,
+{
+    if tcp_syn_sent_index(runtime, index, session_queue, tcp_output, next_frames).is_err() {
+        hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, drop_next, index)
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::{Arc, Mutex, OnceLock};
 
     use crate::data_plane::DropNode;
+    use crate::net::NetworkOpaque;
     use crate::transport::congestion::BbrController;
     use crate::transport::tcp::input::TcpInputControlPlane;
     use crate::transport::tcp::lookup::TcpLookupSnapshot;
@@ -277,13 +379,14 @@ mod tests {
                     .ok_or_else(|| CoreError::internal("capture state missing"))?,
             )
         };
-        for index in frame.drain_pending() {
-            let packet = runtime.copy_packet(index)?;
+        let mut pending = frame.drain_pending();
+        while let Some(index) = pending.next() {
+            let packet = runtime.get_buffer(index)?.current().to_vec();
             state
                 .lock()
                 .map_err(|_| CoreError::internal("capture poisoned"))?
                 .packets
-                .push(packet.into_iter().collect());
+                .push(packet);
             runtime.free_index(index);
         }
         Ok(NodeResult::drop())
@@ -344,9 +447,8 @@ mod tests {
         let header_len = ((*packet.first().expect("IPv4 header") & 0x0f) as usize) * 4;
         let packet_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
         let tcp_header_len = ((packet[header_len + 12] >> 4) as usize) * 4;
-        runtime
-            .get_buffer_mut(buffer)
-            .expect("buffer mut")
+        let mut buffer = runtime.get_buffer_mut(buffer).expect("buffer mut");
+        unsafe { std::mem::transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }
             .set_packet_cursor(
                 BufferPacketCursor::new()
                     .with_packet_len(packet_len)
@@ -400,7 +502,7 @@ mod tests {
             flags,
         );
         let checksum = ipv4_l4_checksum(source, destination, 6, &packet[20..]);
-        packet[36..38].copy_from_slice(&checksum.to_be_bytes());
+        write_be_u16(&mut packet, 36, checksum);
         update_ipv4_header_checksum(&mut packet);
         packet
     }
@@ -414,11 +516,11 @@ mod tests {
         let total_len = 20 + payload_len;
         let mut packet = vec![0u8; total_len];
         packet[0] = 0x45;
-        packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        write_be_u16(&mut packet, 2, total_len as u16);
         packet[8] = 64;
         packet[9] = protocol;
-        packet[12..16].copy_from_slice(&source.octets());
-        packet[16..20].copy_from_slice(&destination.octets());
+        write_bytes(&mut packet, 12, &source.octets());
+        write_bytes(&mut packet, 16, &destination.octets());
         packet
     }
 
@@ -430,13 +532,13 @@ mod tests {
         acknowledgment: u32,
         flags: u8,
     ) {
-        segment[0..2].copy_from_slice(&source_port.to_be_bytes());
-        segment[2..4].copy_from_slice(&destination_port.to_be_bytes());
-        segment[4..8].copy_from_slice(&sequence.to_be_bytes());
-        segment[8..12].copy_from_slice(&acknowledgment.to_be_bytes());
+        write_be_u16(segment, 0, source_port);
+        write_be_u16(segment, 2, destination_port);
+        write_be_u32(segment, 4, sequence);
+        write_be_u32(segment, 8, acknowledgment);
         segment[12] = 0x50;
         segment[13] = flags;
-        segment[14..16].copy_from_slice(&u16::MAX.to_be_bytes());
+        write_be_u16(segment, 14, u16::MAX);
     }
 
     fn ipv4_l4_checksum(
@@ -445,11 +547,12 @@ mod tests {
         protocol: u8,
         segment: &[u8],
     ) -> u16 {
+        let segment_len = be_u16(segment.len() as u16);
         internet_checksum_parts(&[
             &source.octets(),
             &destination.octets(),
             &[0, protocol],
-            &(segment.len() as u16).to_be_bytes(),
+            &segment_len,
             segment,
         ])
     }
@@ -458,7 +561,31 @@ mod tests {
         packet[10] = 0;
         packet[11] = 0;
         let checksum = internet_checksum(&packet[..20]);
-        packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+        write_be_u16(packet, 10, checksum);
+    }
+
+    fn write_bytes(output: &mut [u8], offset: usize, bytes: &[u8]) {
+        let mut index = 0usize;
+        while index < bytes.len() {
+            output[offset + index] = bytes[index];
+            index += 1;
+        }
+    }
+
+    fn write_be_u16(output: &mut [u8], offset: usize, value: u16) {
+        output[offset] = (value >> 8) as u8;
+        output[offset + 1] = value as u8;
+    }
+
+    fn write_be_u32(output: &mut [u8], offset: usize, value: u32) {
+        output[offset] = (value >> 24) as u8;
+        output[offset + 1] = (value >> 16) as u8;
+        output[offset + 2] = (value >> 8) as u8;
+        output[offset + 3] = value as u8;
+    }
+
+    fn be_u16(value: u16) -> [u8; 2] {
+        [(value >> 8) as u8, value as u8]
     }
 
     fn internet_checksum(bytes: &[u8]) -> u16 {

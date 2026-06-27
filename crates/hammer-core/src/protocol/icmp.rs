@@ -3,7 +3,46 @@ use std::num::NonZeroU64;
 
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 
-use super::ip::{IpProtocol, IpVersion, parse_ip_packet_with_chain_len};
+use super::ip::{IpProtocol, IpVersion, parse_ip_header};
+use super::wire::read_header;
+
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+pub struct IcmpHeader {
+    icmp_type: u8,
+    code: u8,
+    checksum: [u8; 2],
+}
+
+impl IcmpHeader {
+    #[inline(always)]
+    pub const fn icmp_type(self) -> u8 {
+        self.icmp_type
+    }
+
+    #[inline(always)]
+    pub const fn code(self) -> u8 {
+        self.code
+    }
+
+    #[inline(always)]
+    pub fn checksum(self) -> u16 {
+        u16::from_be_bytes(self.checksum)
+    }
+}
+
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+struct Ipv4FragmentWord {
+    flags_fragment: [u8; 2],
+}
+
+impl Ipv4FragmentWord {
+    #[inline(always)]
+    fn fragment_offset(self) -> u16 {
+        u16::from_be_bytes(self.flags_fragment) & 0x1fff
+    }
+}
 
 const ICMP_ECHO_HEADER_LEN: usize = 8;
 const ICMP4_ECHO_REPLY: u8 = 0;
@@ -123,8 +162,7 @@ pub struct IcmpGeneratedPacket {
 }
 
 pub fn build_echo_reply(packet: &[u8]) -> Result<IcmpGeneratedPacket, IcmpBuildError> {
-    let parsed =
-        parse_ip_packet_with_chain_len(packet, 0).map_err(|_| IcmpBuildError::BadLength)?;
+    let parsed = parse_ip_header(packet).map_err(|_| IcmpBuildError::BadLength)?;
     let packet = packet
         .get(..parsed.packet_len)
         .ok_or(IcmpBuildError::BadLength)?;
@@ -134,12 +172,14 @@ pub fn build_echo_reply(packet: &[u8]) -> Result<IcmpGeneratedPacket, IcmpBuildE
         return Err(IcmpBuildError::BadLength);
     }
     let icmp = &packet[icmp_offset..parsed.packet_len];
+    let icmp_header =
+        read_header::<IcmpHeader>(packet, icmp_offset).map_err(|_| IcmpBuildError::BadLength)?;
     match (parsed.version, parsed.protocol) {
         (IpVersion::V4, IpProtocol::Icmpv4) => {
-            if icmp[0] != ICMP4_ECHO_REQUEST {
+            if icmp_header.icmp_type() != ICMP4_ECHO_REQUEST {
                 return Err(IcmpBuildError::WrongType);
             }
-            if icmp[1] != 0 {
+            if icmp_header.code() != 0 {
                 return Err(IcmpBuildError::BadCode);
             }
             if internet_checksum(icmp) != 0 {
@@ -163,10 +203,10 @@ pub fn build_echo_reply(packet: &[u8]) -> Result<IcmpGeneratedPacket, IcmpBuildE
             })
         }
         (IpVersion::V6, IpProtocol::Icmpv6) => {
-            if icmp[0] != ICMP6_ECHO_REQUEST {
+            if icmp_header.icmp_type() != ICMP6_ECHO_REQUEST {
                 return Err(IcmpBuildError::WrongType);
             }
-            if icmp[1] != 0 {
+            if icmp_header.code() != 0 {
                 return Err(IcmpBuildError::BadCode);
             }
             if icmpv6_checksum(packet, icmp_offset, parsed.packet_len)? != 0 {
@@ -197,8 +237,7 @@ pub fn build_icmp_error_packet(
     metadata: IcmpErrorMetadata,
     local_source: IpAddr,
 ) -> Result<IcmpGeneratedPacket, IcmpBuildError> {
-    let parsed =
-        parse_ip_packet_with_chain_len(original, 0).map_err(|_| IcmpBuildError::BadLength)?;
+    let parsed = parse_ip_header(original).map_err(|_| IcmpBuildError::BadLength)?;
     let original = original
         .get(..parsed.packet_len)
         .ok_or(IcmpBuildError::BadLength)?;
@@ -312,22 +351,19 @@ fn should_suppress_icmp_error(original: &[u8], parsed: &super::ip::ParsedIpPacke
 
 #[inline(always)]
 fn icmp_error_type_should_suppress(original: &[u8], parsed: &super::ip::ParsedIpPacket) -> bool {
-    let Some(icmp_type) = original.get(parsed.transport_header_offset).copied() else {
+    let Ok(header) = read_header::<IcmpHeader>(original, parsed.transport_header_offset) else {
         return true;
     };
     match parsed.protocol {
-        IpProtocol::Icmpv4 => matches!(icmp_type, 3 | 4 | 5 | 11 | 12),
-        IpProtocol::Icmpv6 => icmp_type < 128,
+        IpProtocol::Icmpv4 => matches!(header.icmp_type(), 3 | 4 | 5 | 11 | 12),
+        IpProtocol::Icmpv6 => header.icmp_type() < 128,
         _ => false,
     }
 }
 
 #[inline(always)]
 fn ipv4_fragment_offset(packet: &[u8]) -> u16 {
-    let Some(fragment) = packet.get(6..8) else {
-        return 0;
-    };
-    u16::from_be_bytes([fragment[0], fragment[1]]) & 0x1fff
+    read_header::<Ipv4FragmentWord>(packet, 6).map_or(0, Ipv4FragmentWord::fragment_offset)
 }
 
 #[inline(always)]

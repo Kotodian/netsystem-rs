@@ -2,22 +2,22 @@ use hammer_core::error::HammerResult;
 
 use crate::AppSession;
 
-pub fn echo_once(session: &AppSession, scratch: &mut [u8]) -> HammerResult<usize> {
-    let read = session.recv_bytes(scratch);
+pub async fn echo_once(session: &AppSession, scratch: &mut [u8]) -> HammerResult<usize> {
+    let read = session.recv(scratch).await;
     if read == 0 {
         return Ok(0);
     }
-    Ok(session.send_bytes(&scratch[..read]))
+    session.send_all(&scratch[..read]).await
 }
 
-pub fn run_echo_loop(
+pub async fn run_echo_loop(
     session: &AppSession,
     scratch: &mut [u8],
     iterations: usize,
 ) -> HammerResult<usize> {
     let mut total = 0;
     for _ in 0..iterations {
-        let wrote = echo_once(session, scratch)?;
+        let wrote = echo_once(session, scratch).await?;
         if wrote == 0 {
             break;
         }

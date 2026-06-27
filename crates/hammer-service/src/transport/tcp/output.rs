@@ -1,11 +1,9 @@
 use hammer_adapter::{
-    BufferBatchMut, BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId,
+    BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId, NodeNextFrames,
     NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData,
 };
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::protocol::tcp::TcpSeq;
-
-use super::segment::TcpSegment;
+use hammer_core::protocol::tcp::tcp_header;
 
 pub const DEFAULT_TCP_OUTPUT_PAYLOAD_LEN: usize = 1_440;
 pub const TCP_FLAG_FIN: u8 = 0x01;
@@ -57,16 +55,7 @@ impl Node for TcpOutputNode {
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        hammer_adapter::node_process_cached!(
-            self,
-            tcp_output_node_process_frame(
-                runtime,
-                frame,
-                self.next[TcpOutputNext::Lookup as usize],
-                self.next[TcpOutputNext::Drop as usize],
-                self.cached_next,
-            )
-        )
+        tcp_output_node_process_frame(runtime, frame, self.next)
     }
 
     #[inline]
@@ -111,69 +100,79 @@ fn tcp_output_node_process(
             .nodes()
             .node_next_slot(current, TcpOutputNext::Lookup as usize)?,
     ];
-    hammer_adapter::node_process_static!(tcp_output_node_process_frame(
-        runtime,
-        frame,
-        next[TcpOutputNext::Lookup as usize],
-        next[TcpOutputNext::Drop as usize],
-        None,
-    ))
+    tcp_output_node_process_frame(runtime, frame, next)
 }
 
 fn tcp_output_node_process_frame(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
+    next: [NodeId; TcpOutputNext::COUNT],
+) -> CoreResult<NodeResult> {
+    let lookup = next[TcpOutputNext::Lookup as usize];
+    let drop = next[TcpOutputNext::Drop as usize];
+    let mut next_frames = NodeNextFrames::default();
+    let indices = frame.pending_indices();
+    let len = indices.len();
+    let mut read = 0usize;
+    while read + 4 <= len {
+        prefetch_tcp_output(runtime, &indices[read..read + 4]);
+        tcp_output_enqueue_index(runtime, indices[read], lookup, drop, &mut next_frames)?;
+        tcp_output_enqueue_index(runtime, indices[read + 1], lookup, drop, &mut next_frames)?;
+        tcp_output_enqueue_index(runtime, indices[read + 2], lookup, drop, &mut next_frames)?;
+        tcp_output_enqueue_index(runtime, indices[read + 3], lookup, drop, &mut next_frames)?;
+        read += 4;
+    }
+    if read + 2 <= len {
+        prefetch_tcp_output(runtime, &indices[read..read + 2]);
+        tcp_output_enqueue_index(runtime, indices[read], lookup, drop, &mut next_frames)?;
+        tcp_output_enqueue_index(runtime, indices[read + 1], lookup, drop, &mut next_frames)?;
+        read += 2;
+    }
+    while read < len {
+        let index = indices[read];
+        prefetch_tcp_output(runtime, &indices[read..read + 1]);
+        tcp_output_enqueue_index(runtime, index, lookup, drop, &mut next_frames)?;
+        read += 1;
+    }
+    next_frames.finish(runtime, frame)
+}
+
+#[inline(always)]
+fn tcp_output_enqueue_index(
+    runtime: &DataPlaneRuntime,
+    index: BufferIndex,
     lookup: NodeId,
     drop: NodeId,
-    cached_next: Option<NodeId>,
-) -> CoreResult<(NodeResult, Option<NodeId>)> {
-    hammer_adapter::node_route_frame_result!(
-        cached_next,
-        runtime,
-        frame,
-        prefetch_tcp_output,
-        |batch, indices, nexts| {
-            for (offset, index) in indices.iter().copied().enumerate() {
-                nexts[offset] = Some(tcp_output_next_for_index(batch, index, lookup, drop)?);
-            }
-            Ok(())
-        }
-    )
+    next_frames: &mut NodeNextFrames,
+) -> CoreResult<()> {
+    let next = tcp_output_next_for_index(runtime, index, lookup, drop)?;
+    hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, next, index)
 }
 
 fn tcp_output_next_for_index(
-    batch: &mut BufferBatchMut<'_>,
+    runtime: &DataPlaneRuntime,
     index: BufferIndex,
     lookup: NodeId,
     drop: NodeId,
 ) -> CoreResult<NodeId> {
-    let buffer = batch.buffer_mut(index)?;
-    let Ok(segment) = TcpSegment::read_from_buffer(&buffer) else {
-        return Ok(drop);
-    };
-    let header = match buffer.prepend_mut(segment.header_len()) {
-        Ok(header) => header,
-        Err(_) => return Ok(drop),
-    };
-    if segment.write_header(header).is_err() {
+    let buffer = runtime.get_buffer_mut(index)?;
+    let header = buffer.current();
+    if tcp_header(header).is_err() {
         return Ok(drop);
     }
     Ok(lookup)
 }
 
 #[inline(always)]
-fn prefetch_tcp_output(batch: &mut BufferBatchMut<'_>, indices: &[BufferIndex]) {
-    // `BufferBatchMut::prefetch_write` already issues L1-write prefetches for
-    // the output buffer's opaque cacheline (`prefetch_buffer_header_write`,
-    // cacheline0) and opaque2 cacheline (`prefetch_buffer_cacheline1_write`,
-    // cacheline1), plus the data cacheline. The TCP output node only touches
-    // header/opaque state on these buffers, so an additional L2-read prefetch
-    // of the same opaque cachelines here would be redundant with the existing
-    // L1-write prefetch. No extra prefetch is added on this path; if a future
-    // caller needs to warm opaque state earlier (e.g. L2 ahead of a deep
-    // pipeline), extend `BufferBatchMut` rather than duplicating here.
-    for index in indices.iter().copied() {
-        batch.prefetch_write(index);
+fn prefetch_tcp_output(runtime: &DataPlaneRuntime, indices: &[BufferIndex]) {
+    // `prefetch_write` already issues L1-write prefetches for the output
+    // buffer's opaque cachelines and data cacheline. The TCP output node only
+    // touches header/opaque state on these buffers, so an additional L2-read
+    // prefetch of the same opaque cachelines here would be redundant.
+    let mut read = 0usize;
+    while read < indices.len() {
+        runtime.prefetch_read(indices[read]);
+        read += 1;
     }
 }
 
@@ -227,13 +226,16 @@ pub const fn tcp_output_sequence_len(flags: u8, payload_len: usize) -> u32 {
 
 #[inline]
 pub fn tcp_output_next_sequence(sequence: u32, sequence_len: u32) -> u32 {
-    TcpSeq::from(sequence).advance(sequence_len).raw()
+    let sequence: hammer_core::protocol::tcp::TcpSeq = sequence.into();
+    sequence.advance(sequence_len).raw()
 }
 
 #[inline]
 fn tcp_inflight_sequence_len(snd_una: u32, snd_nxt: u32) -> u32 {
     if snd_una != 0 && snd_nxt != 0 {
-        TcpSeq::from(snd_una).distance_to(TcpSeq::from(snd_nxt))
+        let snd_una: hammer_core::protocol::tcp::TcpSeq = snd_una.into();
+        let snd_nxt: hammer_core::protocol::tcp::TcpSeq = snd_nxt.into();
+        snd_una.distance_to(snd_nxt)
     } else {
         0
     }
@@ -308,7 +310,8 @@ mod tests {
                     .ok_or_else(|| CoreError::internal("capture state missing"))?,
             )
         };
-        for index in frame.drain_pending() {
+        let mut pending = frame.drain_pending();
+        while let Some(index) = pending.next() {
             let packet = runtime.get_buffer(index)?.current().to_vec();
             state
                 .lock()
@@ -371,12 +374,12 @@ mod tests {
     }
 
     #[test]
-    fn tcp_output_prepends_segment_header_and_routes_lookup() {
+    fn tcp_output_routes_tcp_buffers_to_lookup() {
         let (runtime, lookup_state, drop_state, output) = output_graph();
         let index = runtime.alloc_index().expect("buffer");
-        runtime.append(index, b"hello").expect("payload");
+        runtime.buffers().append(index, b"hello").expect("payload");
         test_segment(5)
-            .write_to_buffer(runtime.packet_buffers(), index)
+            .write_to_buffer(runtime.buffers(), index)
             .expect("write segment");
 
         send_to_output(&runtime, output, index);
@@ -386,47 +389,21 @@ mod tests {
         let packets = &lookup_state.lock().unwrap().packets;
         assert_eq!(packets.len(), 1);
         let packet = &packets[0];
-        assert_eq!(&packet[0..2], &50000u16.to_be_bytes());
-        assert_eq!(&packet[2..4], &443u16.to_be_bytes());
-        assert_eq!(&packet[4..8], &100u32.to_be_bytes());
-        assert_eq!(&packet[8..12], &200u32.to_be_bytes());
+        assert_eq!(&packet[0..2], &[0xc3, 0x50]);
+        assert_eq!(&packet[2..4], &[0x01, 0xbb]);
+        assert_eq!(&packet[4..8], &[0, 0, 0, 100]);
+        assert_eq!(&packet[8..12], &[0, 0, 0, 200]);
         assert_eq!(packet[12] >> 4, 5);
         assert_eq!(packet[13] & TCP_FLAG_ACK, TCP_FLAG_ACK);
         assert_eq!(packet[13] & TCP_FLAG_PSH, TCP_FLAG_PSH);
-        assert_eq!(&packet[14..16], &4096u16.to_be_bytes());
+        assert_eq!(&packet[14..16], &[0x10, 0x00]);
         assert_eq!(&packet[20..], b"hello");
     }
 
     #[test]
-    fn tcp_output_missing_intent_routes_drop() {
+    fn tcp_output_non_tcp_buffer_routes_drop() {
         let (runtime, lookup_state, drop_state, output) = output_graph();
         let index = runtime.alloc_index_with_bytes(b"hello").expect("buffer");
-
-        send_to_output(&runtime, output, index);
-        assert_eq!(runtime.run_ready_nodes().expect("run output"), 2);
-
-        assert!(lookup_state.lock().unwrap().packets.is_empty());
-        assert_eq!(drop_state.lock().unwrap().packets.len(), 1);
-    }
-
-    #[test]
-    fn tcp_output_routes_drop_when_prepend_fails() {
-        let runtime = DataPlaneRuntime::with_capacities(24, 16, 8, 8);
-        let lookup_state = Arc::new(Mutex::new(CaptureState::default()));
-        let drop_state = Arc::new(Mutex::new(CaptureState::default()));
-        let lookup = runtime
-            .nodes()
-            .register_internal(CaptureNode::new(Arc::clone(&lookup_state)));
-        let drop = runtime
-            .nodes()
-            .register_internal(CaptureNode::new(Arc::clone(&drop_state)));
-        let output = runtime
-            .nodes()
-            .register_internal(TcpOutputNode::new(TcpOutputNext::nodes(drop, lookup)));
-        let index = runtime.alloc_index_with_bytes(b"hello").expect("buffer");
-        test_segment(5)
-            .write_to_buffer(runtime.packet_buffers(), index)
-            .expect("write segment");
 
         send_to_output(&runtime, output, index);
         assert_eq!(runtime.run_ready_nodes().expect("run output"), 2);

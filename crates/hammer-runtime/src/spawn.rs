@@ -1239,6 +1239,7 @@ fn run_data_worker_loop(
     DATA_LOCAL_DRIVER_WAKER.with(|slot| {
         *slot.borrow_mut() = Some(worker_waker.clone());
     });
+    let mut next_polling_driver_at = Instant::now();
 
     loop {
         match shutdown_rx.try_recv() {
@@ -1246,7 +1247,13 @@ fn run_data_worker_loop(
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
         }
 
-        let local_progress = poll_data_worker_once(worker, barrier, remote_local, &worker_waker);
+        let local_progress = poll_data_worker_once(
+            worker,
+            barrier,
+            remote_local,
+            &worker_waker,
+            &mut next_polling_driver_at,
+        );
         drive_tokio_worker_once(runtime, local_progress);
 
         if !local_progress {
@@ -1261,6 +1268,7 @@ fn poll_data_worker_once(
     barrier: &Arc<DataPlaneBarrierState>,
     remote_local: &DataRemoteLocalQueue,
     worker_waker: &Waker,
+    next_polling_driver_at: &mut Instant,
 ) -> bool {
     let mut cx = Context::from_waker(worker_waker);
     DATA_LOCAL_DRIVER_WAKER.with(|slot| {
@@ -1270,14 +1278,20 @@ fn poll_data_worker_once(
         return false;
     }
 
-    let mut progressed =
-        match with_data_plane_runtime(|runtime| runtime.schedule_polling_driver_nodes()) {
-            Ok(scheduled) => scheduled > 0,
-            Err(err) => {
-                tracing::debug!("data plane polling driver scheduler failed: {err}");
-                false
-            }
-        };
+    let now = Instant::now();
+    let mut progressed = false;
+    if now >= *next_polling_driver_at {
+        let poll_interval = DATA_WORKER_IDLE_SLICE.with(|slot| slot.get());
+        *next_polling_driver_at = now + poll_interval;
+        progressed =
+            match with_data_plane_runtime(|runtime| runtime.schedule_polling_driver_nodes()) {
+                Ok(scheduled) => scheduled > 0,
+                Err(err) => {
+                    tracing::debug!("data plane polling driver scheduler failed: {err}");
+                    false
+                }
+            };
+    }
     progressed |= poll_remote_local_tasks(remote_local);
     progressed |= poll_data_plane_nodes(&mut cx);
     progressed |= poll_data_local_tasks(&mut cx);
@@ -1436,7 +1450,7 @@ pub(crate) fn with_data_plane_runtime<R>(f: impl FnOnce(&RuntimeDataPlaneRuntime
 }
 
 pub fn with_data_plane_buffers<R>(f: impl FnOnce(&DataPlaneBuffers) -> R) -> R {
-    with_data_plane_runtime(|runtime| f(runtime.packet_buffers()))
+    with_data_plane_runtime(|runtime| f(runtime.buffers()))
 }
 
 fn current_data_context() -> Option<DataRuntimeContext> {
@@ -1754,11 +1768,18 @@ mod tests {
     }
 
     #[test]
-    fn data_worker_busy_loops_polling_driver_from_worker_loop() {
+    fn data_worker_polls_driver_from_worker_loop_at_interval() {
         let _guard = test_lock();
         POLLING_DRIVER_CALLS.store(0, Ordering::SeqCst);
+        let worker = Worker {
+            count: 1,
+            stack_size: 512 * 1024,
+            max_blocking_threads: 2,
+            idle_slice: Duration::from_millis(25),
+            ..Worker::default()
+        };
         let data_runtime =
-            DataRuntime::new(1, "spawn-test-poll-driver", 512 * 1024, 2).expect("data runtime");
+            DataRuntime::from_config(&worker, "spawn-test-poll-driver").expect("data runtime");
         let context = data_runtime.context();
 
         context
@@ -1773,7 +1794,7 @@ mod tests {
             })
             .expect("register polling driver on worker");
 
-        let deadline = StdInstant::now() + Duration::from_secs(1);
+        let deadline = StdInstant::now() + Duration::from_millis(300);
         while StdInstant::now() < deadline {
             if POLLING_DRIVER_CALLS.load(Ordering::SeqCst) >= 3 {
                 data_runtime.shutdown_timeout(Duration::from_secs(1));
@@ -1786,7 +1807,7 @@ mod tests {
         data_runtime.shutdown_timeout(Duration::from_secs(1));
         assert!(
             calls >= 3,
-            "polling driver should keep running in the data worker loop; calls={calls}"
+            "polling driver should keep running at the worker poll interval; calls={calls}"
         );
     }
 
@@ -1819,8 +1840,10 @@ mod tests {
                             .unwrap_or_default();
                         let payload = with_data_plane_runtime(|runtime| {
                             let payload = runtime
-                                .copy_current(buffer.2)
-                                .expect("copy local data buffer");
+                                .get_buffer(buffer.2)
+                                .expect("local data buffer")
+                                .current()
+                                .to_vec();
                             runtime.free_index(buffer.2);
                             payload
                         });
@@ -1877,8 +1900,10 @@ mod tests {
                             .unwrap_or_default();
                         let payload = with_data_plane_runtime(|runtime| {
                             let payload = runtime
-                                .copy_current(buffer)
-                                .expect("copy current local data buffer");
+                                .get_buffer(buffer)
+                                .expect("current local data buffer")
+                                .current()
+                                .to_vec();
                             runtime.free_index(buffer);
                             payload
                         });
@@ -1979,8 +2004,10 @@ mod tests {
                             .next()
                             .expect("pending buffer");
                         let payload = consumer_runtime
-                            .copy_current(buffer)
-                            .expect("copy pending buffer");
+                            .get_buffer(buffer)
+                            .expect("pending buffer")
+                            .current()
+                            .to_vec();
                         consumer_runtime.free_index(buffer);
                         (before_thread, after_thread, payload)
                     });

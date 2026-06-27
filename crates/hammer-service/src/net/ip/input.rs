@@ -2,17 +2,17 @@ use std::mem::transmute;
 use std::sync::{Mutex, OnceLock};
 
 use hammer_adapter::{
-    BufferBatchMut, BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, IpEcnCodepoint,
-    Node, NodeId, NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
-    TraceFormatter, add_packet_trace, unlikely,
+    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeId, NodeNextFrames,
+    NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace, TraceFormatter,
+    add_packet_trace, unlikely,
 };
 use hammer_core::error::{CoreError, CoreResult};
 
 use crate::data_plane::{FeatureArcSpec, FeatureArcStartHandle, set_buffer_node_error_code};
 use crate::net::ip::{
-    IpInputError, IpInputTarget, IpProtocol, IpVersion, network_for_protocol,
-    parse_ip_packet_with_chain_len,
+    IpInputError, IpInputTarget, IpProtocol, IpVersion, network_for_protocol, parse_ip_header,
 };
+use crate::net::{IpEcnCodepoint, NetworkOpaque};
 use crate::trace::codec::{
     TraceDecodeCursor, put_node, put_option_ip_input_error, put_option_ip_input_target,
     put_option_ip_protocol, put_option_ip_version, put_usize,
@@ -35,15 +35,8 @@ pub enum IpInputNext {
 
 #[hammer_component_macros::node(role = internal, next = IpInputNext, start_arc = A)]
 pub struct IpInputNode<A: FeatureArcSpec = IpUnicastArc> {
-    #[node(default = register_ip_input_runtime())]
+    #[node(default = register_ip_input_runtime(None))]
     runtime_data: NodeRuntimeData,
-    #[node(default)]
-    cached_next: Option<NodeId>,
-}
-
-#[derive(Clone)]
-struct IpInputRuntime {
-    feature_arc: Option<FeatureArcStartHandle>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,70 +92,9 @@ where
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        let Some(first) = frame.pending_indices().first().copied() else {
-            return Ok(NodeResult::drop());
-        };
         let next = Self::runtime_nexts(runtime)?;
         let feature_arc = self.feature_arc.as_ref().map(|arc| arc.start_handle());
-        let indices = frame.pending_indices();
-        let width = frame_batch_width(runtime);
-        let mut last_next = None;
-        let cached_next = self.cached_next;
-        let mut traces = std::vec::Vec::new();
-        let first_next = if let Some(cached_next) = cached_next {
-            cached_next
-        } else {
-            let mut batch = runtime.buffer_batch_mut();
-            prefetch_range_with_batch(&mut batch, indices, 0, width);
-            let first_next = next_node_for_index_with_batch(
-                runtime,
-                &mut batch,
-                first,
-                next,
-                feature_arc.as_ref(),
-                &mut traces,
-            )?;
-            last_next = Some(first_next);
-            first_next
-        };
-        let mut first_chunk = true;
-        hammer_adapter::node_route_frame_cached!(
-            self,
-            runtime,
-            frame,
-            |batch, indices| {
-                prefetch_indices_with_batch(batch, indices);
-            },
-            |batch, indices, nexts| {
-                let start_offset = if first_chunk {
-                    first_chunk = false;
-                    if cached_next.is_none() {
-                        nexts[0] = Some(first_next);
-                        1
-                    } else {
-                        0
-                    }
-                } else {
-                    0
-                };
-                next_nodes_for_indices_with_batch(
-                    runtime,
-                    batch,
-                    indices,
-                    nexts,
-                    start_offset,
-                    next,
-                    feature_arc.as_ref(),
-                    &mut last_next,
-                    &mut traces,
-                )
-            },
-            {
-                for (index, trace) in traces {
-                    add_packet_trace!(runtime, index, trace)?;
-                }
-            }
-        )
+        ip_input_process_frame(runtime, frame, next, feature_arc.as_ref())
     }
 
     #[inline]
@@ -171,103 +103,115 @@ where
     }
 
     #[inline]
-    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
-        sync_ip_input_runtime(
-            self.runtime_data,
-            self.feature_arc.as_ref().map(|arc| arc.start_handle()),
-        )?;
-        Ok(self.runtime_data)
-    }
-
-    #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
         Some(format_ip_input_trace)
     }
+
+    #[inline]
+    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        let feature_arc = self.feature_arc.as_ref().map(|arc| arc.start_handle());
+        sync_ip_input_runtime(self.runtime_data, feature_arc)?;
+        Ok(self.runtime_data)
+    }
 }
 
-fn ip_input_process<A>(
+#[inline(always)]
+fn ip_input_process_frame(
     runtime: &DataPlaneRuntime,
-    data: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> CoreResult<NodeResult>
-where
-    A: FeatureArcSpec,
-{
-    let Some(first) = frame.pending_indices().first().copied() else {
-        return Ok(NodeResult::drop());
-    };
-    let next = IpInputNode::<A>::runtime_nexts(runtime)?;
-    let state = ip_input_runtime(data)?;
-    let feature_arc = state.feature_arc.as_ref();
+    next: [NodeId; IpInputNext::COUNT],
+    feature_arc: Option<&FeatureArcStartHandle>,
+) -> CoreResult<NodeResult> {
     let indices = frame.pending_indices();
-    let width = frame_batch_width(runtime);
-    let cached_next: Option<NodeId> = None;
-    let mut traces = std::vec::Vec::new();
-    let first_next = {
-        let mut batch = runtime.buffer_batch_mut();
-        prefetch_range_with_batch(&mut batch, indices, 0, width);
-        let first_next = next_node_for_index_with_batch(
-            runtime,
-            &mut batch,
-            first,
-            next,
-            feature_arc,
-            &mut traces,
-        )?;
-        first_next
-    };
-    let mut last_next = Some(first_next);
-    let mut first_chunk = true;
-    hammer_adapter::node_route_frame_static!(
-        Some(first_next),
-        runtime,
-        frame,
-        |batch, indices| {
-            prefetch_indices_with_batch(batch, indices);
-        },
-        |batch, indices, nexts| {
-            let start_offset = if first_chunk {
-                first_chunk = false;
-                if cached_next.is_none() {
-                    nexts[0] = Some(first_next);
-                    1
-                } else {
-                    0
-                }
-            } else {
-                0
-            };
-            next_nodes_for_indices_with_batch(
-                runtime,
-                batch,
-                indices,
-                nexts,
-                start_offset,
-                next,
-                feature_arc,
-                &mut last_next,
-                &mut traces,
-            )
-        },
-        {
-            for (index, trace) in traces {
-                add_packet_trace!(runtime, index, trace)?;
-            }
+    let mut next_frames = NodeNextFrames::default();
+    let mut read = 0usize;
+    let len = indices.len();
+    while read + 4 <= len {
+        if read + 4 < len {
+            runtime.prefetch_header(indices[read + 4]);
         }
-    )
+        if read + 5 < len {
+            runtime.prefetch_header(indices[read + 5]);
+        }
+        if read + 6 < len {
+            runtime.prefetch_header(indices[read + 6]);
+        }
+        if read + 7 < len {
+            runtime.prefetch_header(indices[read + 7]);
+        }
+        let index0 = indices[read];
+        let index1 = indices[read + 1];
+        let index2 = indices[read + 2];
+        let index3 = indices[read + 3];
+        runtime.prefetch_read(index0);
+        runtime.prefetch_read(index1);
+        runtime.prefetch_read(index2);
+        runtime.prefetch_read(index3);
+        let node0 = next_node_for_index(runtime, index0, next, feature_arc)?;
+        next_frames.enqueue(runtime, node0, index0)?;
+        let node1 = next_node_for_index(runtime, index1, next, feature_arc)?;
+        next_frames.enqueue(runtime, node1, index1)?;
+        let node2 = next_node_for_index(runtime, index2, next, feature_arc)?;
+        next_frames.enqueue(runtime, node2, index2)?;
+        let node3 = next_node_for_index(runtime, index3, next, feature_arc)?;
+        next_frames.enqueue(runtime, node3, index3)?;
+        read += 4;
+    }
+    if read + 2 <= len {
+        if read + 2 < len {
+            runtime.prefetch_header(indices[read + 2]);
+        }
+        if read + 3 < len {
+            runtime.prefetch_header(indices[read + 3]);
+        }
+        let index0 = indices[read];
+        let index1 = indices[read + 1];
+        runtime.prefetch_read(index0);
+        runtime.prefetch_read(index1);
+        let node0 = next_node_for_index(runtime, index0, next, feature_arc)?;
+        next_frames.enqueue(runtime, node0, index0)?;
+        let node1 = next_node_for_index(runtime, index1, next, feature_arc)?;
+        next_frames.enqueue(runtime, node1, index1)?;
+        read += 2;
+    }
+    while read < len {
+        if read + 1 < len {
+            runtime.prefetch_header(indices[read + 1]);
+        }
+        let index0 = indices[read];
+        runtime.prefetch_read(index0);
+        let node0 = next_node_for_index(runtime, index0, next, feature_arc)?;
+        next_frames.enqueue(runtime, node0, index0)?;
+        read += 1;
+    }
+    next_frames.finish(runtime, frame)
 }
 
-fn ip_input_runtimes() -> &'static Mutex<Vec<IpInputRuntime>> {
-    static RUNTIMES: OnceLock<Mutex<Vec<IpInputRuntime>>> = OnceLock::new();
-    RUNTIMES.get_or_init(|| Mutex::new(Vec::new()))
+/// Per-instance state held in the global IP input registry. Mirrors the
+/// `OnceLock<Mutex<Vec<...>>>` + `NodeRuntimeData::from_usize` pattern used by
+/// the sibling migrated nodes (`IpLookupNode`, `IcmpInputNode`,
+/// `InterfaceOutputNode`): word 0 of [`NodeRuntimeData`] is the registry slot.
+///
+/// `feature_arc` is `None` at construction (`FeatureArcStartSlot::new()` is
+/// empty) and synced from `self.feature_arc` in [`Node::node_runtime_data`]
+/// when the descriptor is built, so a `set_feature_arc` call made before
+/// registration is captured.
+#[derive(Clone)]
+struct IpInputRuntime {
+    feature_arc: Option<FeatureArcStartHandle>,
 }
 
-fn register_ip_input_runtime() -> NodeRuntimeData {
+fn ip_input_runtimes() -> &'static Mutex<hammer_infra::vec::Vec<IpInputRuntime>> {
+    static RUNTIMES: OnceLock<Mutex<hammer_infra::vec::Vec<IpInputRuntime>>> = OnceLock::new();
+    RUNTIMES.get_or_init(|| Mutex::new(hammer_infra::vec::Vec::new()))
+}
+
+fn register_ip_input_runtime(feature_arc: Option<FeatureArcStartHandle>) -> NodeRuntimeData {
     let mut runtimes = ip_input_runtimes()
         .lock()
         .expect("IP input runtime registry poisoned");
     let slot = runtimes.len();
-    runtimes.push(IpInputRuntime { feature_arc: None });
+    runtimes.push(IpInputRuntime { feature_arc });
     NodeRuntimeData::from_usize(slot).expect("IP input runtime slot overflow")
 }
 
@@ -296,63 +240,35 @@ fn ip_input_runtime(data: NodeRuntimeData) -> CoreResult<IpInputRuntime> {
         .ok_or_else(|| CoreError::internal("IP input runtime slot is invalid"))
 }
 
-#[inline(always)]
-fn prefetch_index_with_batch(batch: &mut BufferBatchMut<'_>, index: BufferIndex) {
-    batch.prefetch_header(index);
-}
-
-#[inline(always)]
-fn prefetch_range_with_batch(
-    batch: &mut BufferBatchMut<'_>,
-    indices: &[BufferIndex],
-    offset: usize,
-    width: usize,
-) {
-    if offset >= indices.len() {
-        return;
-    }
-    let end = (offset + width).min(indices.len());
-    for index in indices[offset..end].iter().copied() {
-        prefetch_index_with_batch(batch, index);
-    }
-}
-
-#[inline(always)]
-fn prefetch_indices_with_batch(batch: &mut BufferBatchMut<'_>, indices: &[BufferIndex]) {
-    for index in indices.iter().copied() {
-        prefetch_index_with_batch(batch, index);
-    }
-}
-
-#[inline(always)]
-fn frame_batch_width(runtime: &DataPlaneRuntime) -> usize {
-    match runtime.preferred_frame_batch_width() {
-        hammer_adapter::FrameBatchWidth::Quad => 4,
-        hammer_adapter::FrameBatchWidth::Pair => 2,
-    }
-}
-
-#[inline(always)]
-fn next_node_for_index_with_batch(
+fn ip_input_process<A: FeatureArcSpec>(
     runtime: &DataPlaneRuntime,
-    batch: &mut BufferBatchMut<'_>,
+    data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> CoreResult<NodeResult> {
+    let state = ip_input_runtime(data)?;
+    let next = IpInputNode::<A>::runtime_nexts(runtime)?;
+    let feature_arc = state.feature_arc.as_ref();
+    ip_input_process_frame(runtime, frame, next, feature_arc)
+}
+
+#[inline(always)]
+fn next_node_for_index(
+    runtime: &DataPlaneRuntime,
     index: BufferIndex,
     next: [NodeId; IpInputNext::COUNT],
     feature_arc: Option<&FeatureArcStartHandle>,
-    traces: &mut std::vec::Vec<(BufferIndex, IpInputTrace)>,
 ) -> CoreResult<NodeId> {
     let (trace, parsed, _) = {
-        let buffer = batch.buffer_mut(index)?;
+        let mut buffer = runtime.get_buffer_mut(index)?;
         let traced = buffer.trace_handle().is_some();
-        match parse_ip_packet_with_chain_len(
-            buffer.current(),
-            buffer.total_len_not_including_first(),
-        ) {
+        match parse_ip_header(buffer.current()) {
             Err(_) => {
-                set_buffer_node_error_code(runtime, buffer, IpInputError::BadLength.code())?;
+                set_buffer_node_error_code(runtime, &mut buffer, IpInputError::BadLength.code())?;
                 let resolved = NodeNextStorage::next(&next, IpInputNext::Drop);
+                drop(buffer);
                 if unlikely(traced) {
-                    traces.push((
+                    add_packet_trace!(
+                        runtime,
                         index,
                         IpInputTrace {
                             version: None,
@@ -362,7 +278,7 @@ fn next_node_for_index_with_batch(
                             packet_len: 0,
                             next: resolved,
                         },
-                    ));
+                    )?;
                 }
                 return Ok(resolved);
             }
@@ -370,7 +286,7 @@ fn next_node_for_index_with_batch(
                 if parsed.input_error == IpInputError::None {
                     buffer.clear_node_error();
                 } else {
-                    set_buffer_node_error_code(runtime, buffer, parsed.input_error.code())?;
+                    set_buffer_node_error_code(runtime, &mut buffer, parsed.input_error.code())?;
                 }
                 let network = network_for_protocol(parsed.protocol);
                 let cursor = if network.is_some() {
@@ -390,35 +306,17 @@ fn next_node_for_index_with_batch(
                 } else {
                     BufferPacketCursor::new()
                 };
-                buffer.set_packet_cursor(cursor);
+                unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }
+                    .set_packet_cursor(cursor);
                 let ip_ecn = ip_ecn_from_packet(buffer.current(), parsed.version);
-                unsafe {
-                    transmute::<
-                        &mut hammer_adapter::PrimaryOpaque,
-                        &mut hammer_adapter::NetworkOpaque,
-                    >(buffer.opaque_mut())
-                }
-                .ip_mut()
-                .set_ip_ecn(ip_ecn.map(|codepoint| codepoint as u8));
-                unsafe {
-                    transmute::<
-                        &mut hammer_adapter::PrimaryOpaque,
-                        &mut hammer_adapter::NetworkOpaque,
-                    >(buffer.opaque_mut())
-                }
-                .ip_mut()
-                .set_ip_version(Some(match parsed.version {
+                let ip =
+                    unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }.ip_mut();
+                ip.set_ip_ecn(ip_ecn.map(|codepoint| codepoint as u8));
+                ip.set_ip_version(Some(match parsed.version {
                     IpVersion::V4 => 4,
                     IpVersion::V6 => 6,
                 }));
-                unsafe {
-                    transmute::<
-                        &mut hammer_adapter::PrimaryOpaque,
-                        &mut hammer_adapter::NetworkOpaque,
-                    >(buffer.opaque_mut())
-                }
-                .ip_mut()
-                .set_ip_protocol(Some(match parsed.protocol {
+                ip.set_ip_protocol(Some(match parsed.protocol {
                     IpProtocol::Icmpv4 => 1,
                     IpProtocol::Tcp => 6,
                     IpProtocol::Udp => 17,
@@ -426,18 +324,14 @@ fn next_node_for_index_with_batch(
                     IpProtocol::Other(value) => value,
                 }));
                 (
-                    if unlikely(traced) {
-                        Some(IpInputTrace {
-                            version: Some(parsed.version),
-                            protocol: Some(parsed.protocol),
-                            input_target: Some(parsed.input_target),
-                            input_error: Some(parsed.input_error),
-                            packet_len: parsed.packet_len,
-                            next: NodeNextStorage::next(&next, IpInputNext::Drop),
-                        })
-                    } else {
-                        None
-                    },
+                    traced.then_some(IpInputTrace {
+                        version: Some(parsed.version),
+                        protocol: Some(parsed.protocol),
+                        input_target: Some(parsed.input_target),
+                        input_error: Some(parsed.input_error),
+                        packet_len: parsed.packet_len,
+                        next: NodeNextStorage::next(&next, IpInputNext::Drop),
+                    }),
                     parsed,
                     network,
                 )
@@ -452,13 +346,8 @@ fn next_node_for_index_with_batch(
             let default_next = NodeNextStorage::next(&next, IpInputNext::Lookup);
             if let Some(arc) = feature_arc {
                 let Some(interface_index) = ({
-                    let buffer = batch.buffer(index)?;
-                    let network = unsafe {
-                        std::mem::transmute::<
-                            &hammer_adapter::PrimaryOpaque,
-                            &hammer_adapter::NetworkOpaque,
-                        >(buffer.opaque())
-                    };
+                    let buffer = runtime.get_buffer(index)?;
+                    let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
                     let interface_index = network.sw_if_index[0];
                     (interface_index != 0).then_some(interface_index)
                 }) else {
@@ -476,13 +365,14 @@ fn next_node_for_index_with_batch(
         IpInputTarget::Reassembly => NodeNextStorage::next(&next, IpInputNext::Reassembly),
     };
     if let Some(trace) = trace {
-        traces.push((
+        add_packet_trace!(
+            runtime,
             index,
             IpInputTrace {
                 next: resolved,
                 ..trace
             },
-        ));
+        )?;
     }
     Ok(resolved)
 }
@@ -504,25 +394,4 @@ fn ip_ecn_from_packet(packet: &[u8], version: IpVersion) -> Option<IpEcnCodepoin
         3 => Some(IpEcnCodepoint::Ce),
         _ => None,
     }
-}
-
-#[inline(always)]
-fn next_nodes_for_indices_with_batch(
-    runtime: &DataPlaneRuntime,
-    batch: &mut BufferBatchMut<'_>,
-    indices: &[BufferIndex],
-    nexts: &mut [Option<NodeId>; 4],
-    start_offset: usize,
-    next: [NodeId; IpInputNext::COUNT],
-    feature_arc: Option<&FeatureArcStartHandle>,
-    last_next: &mut Option<NodeId>,
-    traces: &mut std::vec::Vec<(BufferIndex, IpInputTrace)>,
-) -> CoreResult<()> {
-    for (offset, index) in indices.iter().copied().enumerate().skip(start_offset) {
-        let node =
-            next_node_for_index_with_batch(runtime, batch, index, next, feature_arc, traces)?;
-        nexts[offset] = Some(node);
-        *last_next = Some(node);
-    }
-    Ok(())
 }

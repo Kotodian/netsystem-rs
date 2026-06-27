@@ -6,7 +6,7 @@ use hammer_core::error::{CoreError, CoreResult};
 
 use crate::transport::congestion::CongestionController;
 
-use super::segment::parse_tcp_packet;
+use super::segment::tcp_packet;
 use super::{
     TCP_MAIN, TCP_TIMER_DELAYED_ACK, TCP_TIMER_KEEP_ALIVE, TCP_TIMER_PACING, TCP_TIMER_PERSIST,
     TCP_TIMER_RACK, TCP_TIMER_RETRANSMIT, TCP_TIMER_TIME_WAIT, TCP_TIMER_TLP, TcpNodeError,
@@ -36,7 +36,8 @@ pub fn register_tcp_rcv_process(runtime: &DataPlaneRuntime, worker: usize) -> Co
         let queue_data = ensure_tcp_session_queue::<C>(runtime, worker)?;
         let queue = TcpQueue::<C>::new(queue_data);
         TCP_MAIN
-            .get()
+            .load()
+            .as_deref()
             .ok_or_else(|| CoreError::internal("tcp main not initialized"))?;
         runtime.nodes().try_register_internal_with_next_names(
             TcpRcvProcessNode::<C>::new(queue, [NodeId::new(0); TcpRcvProcessNext::COUNT]),
@@ -93,9 +94,131 @@ where
 {
     let tcp_output = next[TcpRcvProcessNext::Output as usize];
     let drop_next = next[TcpRcvProcessNext::Drop as usize];
-    hammer_adapter::node_rewrite_frame!(runtime, frame, drop_next, |index, next_frames| {
-        tcp_rcv_process_index(runtime, index, session_queue, tcp_output, &mut next_frames)
-    })
+    let mut next_frames = NodeNextFrames::default();
+    let indices = frame.pending_indices();
+    let len = indices.len();
+    let mut read = 0usize;
+    while read + 4 <= len {
+        runtime.prefetch_header(indices[read]);
+        runtime.prefetch_header(indices[read + 1]);
+        runtime.prefetch_header(indices[read + 2]);
+        runtime.prefetch_header(indices[read + 3]);
+        if tcp_rcv_process_index(
+            runtime,
+            indices[read],
+            session_queue,
+            tcp_output,
+            &mut next_frames,
+        )
+        .is_err()
+        {
+            hammer_adapter::validate_buffer_enqueue_x1!(
+                runtime,
+                next_frames,
+                drop_next,
+                indices[read]
+            )?;
+        }
+        if tcp_rcv_process_index(
+            runtime,
+            indices[read + 1],
+            session_queue,
+            tcp_output,
+            &mut next_frames,
+        )
+        .is_err()
+        {
+            hammer_adapter::validate_buffer_enqueue_x1!(
+                runtime,
+                next_frames,
+                drop_next,
+                indices[read + 1]
+            )?;
+        }
+        if tcp_rcv_process_index(
+            runtime,
+            indices[read + 2],
+            session_queue,
+            tcp_output,
+            &mut next_frames,
+        )
+        .is_err()
+        {
+            hammer_adapter::validate_buffer_enqueue_x1!(
+                runtime,
+                next_frames,
+                drop_next,
+                indices[read + 2]
+            )?;
+        }
+        if tcp_rcv_process_index(
+            runtime,
+            indices[read + 3],
+            session_queue,
+            tcp_output,
+            &mut next_frames,
+        )
+        .is_err()
+        {
+            hammer_adapter::validate_buffer_enqueue_x1!(
+                runtime,
+                next_frames,
+                drop_next,
+                indices[read + 3]
+            )?;
+        }
+        read += 4;
+    }
+    if read + 2 <= len {
+        runtime.prefetch_header(indices[read]);
+        runtime.prefetch_header(indices[read + 1]);
+        if tcp_rcv_process_index(
+            runtime,
+            indices[read],
+            session_queue,
+            tcp_output,
+            &mut next_frames,
+        )
+        .is_err()
+        {
+            hammer_adapter::validate_buffer_enqueue_x1!(
+                runtime,
+                next_frames,
+                drop_next,
+                indices[read]
+            )?;
+        }
+        if tcp_rcv_process_index(
+            runtime,
+            indices[read + 1],
+            session_queue,
+            tcp_output,
+            &mut next_frames,
+        )
+        .is_err()
+        {
+            hammer_adapter::validate_buffer_enqueue_x1!(
+                runtime,
+                next_frames,
+                drop_next,
+                indices[read + 1]
+            )?;
+        }
+        read += 2;
+    }
+    while read < len {
+        let index = indices[read];
+        runtime.prefetch_header(index);
+        if tcp_rcv_process_index(runtime, index, session_queue, tcp_output, &mut next_frames)
+            .is_err()
+        {
+            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, drop_next, index)?;
+        }
+        read += 1;
+    }
+    frame.clear();
+    next_frames.schedule(runtime)?;
+    Ok(NodeResult::drop())
 }
 
 fn tcp_rcv_process_index<C>(
@@ -108,7 +231,7 @@ fn tcp_rcv_process_index<C>(
 where
     C: CongestionController + 'static,
 {
-    let packet = parse_tcp_packet(runtime, index)?;
+    let packet = tcp_packet(runtime, index)?;
     let mut release_input = true;
     let result: CoreResult<_> = {
         let mut queue = session_queue.borrow_mut()?;
@@ -144,7 +267,7 @@ where
         }
         if established_with_payload {
             {
-                let mut buffer = runtime.packet_buffers().get_buffer_mut(index)?;
+                let mut buffer = runtime.buffers().get_buffer_mut(index)?;
                 buffer.advance(packet.payload_offset as isize)?;
                 buffer.truncate(packet.payload_len)?;
             }
@@ -188,8 +311,8 @@ where
     };
     let control = result?;
     if let Some(segment) = control {
-        let allocated = runtime.packet_buffers().alloc_index()?;
-        if let Err(error) = segment.write_to_buffer(runtime.packet_buffers(), allocated) {
+        let allocated = runtime.buffers().alloc_index()?;
+        if let Err(error) = segment.write_to_buffer(runtime.buffers(), allocated) {
             runtime.free_index(allocated);
             return Err(error);
         }

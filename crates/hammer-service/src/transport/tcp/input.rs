@@ -1,32 +1,31 @@
 use std::cell::RefCell;
-use std::mem::size_of;
+use std::mem::{size_of, transmute};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use crate::data_plane::set_buffer_node_error_code;
-use crate::net::ip::{IpInputError, IpProtocol, IpVersion, parse_ip_packet_with_chain_len};
+use crate::net::ip::{IpProtocol, IpVersion};
 use crate::trace::codec::{
     TraceDecodeCursor, put_node, put_option_ip_protocol, put_option_ip_version, put_option_u16,
     put_u16,
 };
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    BufferBatchMut, BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, DataWorkerId,
-    Node, NodeHandle, NodeId, NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData,
-    PacketTrace, SecondaryOpaque, TraceFormatter, add_packet_trace,
+    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, DataWorkerId, Node, NodeHandle,
+    NodeId, NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
+    SecondaryOpaque, TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
-use hammer_core::protocol::tcp::{TcpError, TcpInputFlags, TcpSegmentFlags};
-use hammer_infra::vec::Vec;
+use hammer_core::protocol::tcp::{TcpError, TcpInputFlags, TcpSegmentFlags, tcp_header};
 
 use super::lookup::{
     TcpIpv4ListenerAddress, TcpIpv6ListenerAddress, TcpLookupSnapshot, TcpLookupValue,
     TcpV4ListenerKey, TcpV6ListenerKey,
 };
-use super::segment::{parse_tcp_wire_header, tcp_wire_flags};
 use super::{TcpInputNext, TcpQueue, write_session_route_opaque};
 use super::{tcp_worker_state, tcp_worker_state_mut};
+use crate::net::NetworkOpaque;
 use crate::session::SessionId;
 use crate::transport::congestion::CongestionController;
 
@@ -154,8 +153,6 @@ pub struct TcpInputNode<C: CongestionController + 'static> {
     handoff_worker: Option<DataWorkerId>,
     #[node(default)]
     session_queue: Option<TcpQueue<C>>,
-    #[node(default)]
-    cached_next: Option<NodeId>,
 }
 
 impl<C> Node for TcpInputNode<C>
@@ -170,40 +167,14 @@ where
     ) -> CoreResult<NodeResult> {
         let snapshot = self.snapshot.load();
         let next = Self::runtime_nexts(runtime)?;
-        let mut traces = Vec::new();
-        let mut handoffs = Vec::new();
-        hammer_adapter::node_route_frame_cached!(
-            self,
+        tcp_input_process_frame(
             runtime,
             frame,
-            |batch, indices| prefetch_tcp_input(batch, indices, &snapshot, self.session_queue),
-            |batch, indices, nexts| {
-                for (offset, index) in indices.iter().copied().enumerate() {
-                    let parsed = parse_tcp_input_buffer(batch.buffer(index)?)?;
-                    nexts[offset] = next_node_for_index_with_batch(
-                        runtime,
-                        batch,
-                        index,
-                        parsed,
-                        &snapshot,
-                        &next,
-                        self.handoff,
-                        self.handoff_worker,
-                        self.session_queue,
-                        &mut traces,
-                        &mut handoffs,
-                    )?;
-                }
-                Ok(())
-            },
-            {
-                for (worker, target, index) in handoffs {
-                    runtime.handoff_index(worker, target, index)?;
-                }
-                for (index, trace) in traces {
-                    add_packet_trace!(runtime, index, trace)?;
-                }
-            }
+            &snapshot,
+            &next,
+            self.handoff,
+            self.handoff_worker,
+            self.session_queue,
         )
     }
 
@@ -303,45 +274,148 @@ where
     let snapshot = state.snapshot.load();
     let next = TcpInputNode::<C>::runtime_nexts(runtime)?;
     let session_queue = state.session_queue.map(TcpQueue::<C>::new);
-    let mut traces = Vec::new();
-    let mut handoffs = Vec::new();
-    hammer_adapter::node_route_frame_static!(
-        None,
+    tcp_input_process_frame(
         runtime,
         frame,
-        |batch, indices| prefetch_tcp_input(batch, indices, &snapshot, session_queue),
-        |batch, indices, nexts| {
-            for (offset, index) in indices.iter().copied().enumerate() {
-                let parsed = parse_tcp_input_buffer(batch.buffer(index)?)?;
-                nexts[offset] = next_node_for_index_with_batch(
-                    runtime,
-                    batch,
-                    index,
-                    parsed,
-                    &snapshot,
-                    &next,
-                    state.handoff,
-                    state.handoff_worker,
-                    session_queue,
-                    &mut traces,
-                    &mut handoffs,
-                )?;
-            }
-            Ok(())
-        },
-        {
-            for (worker, target, index) in handoffs {
-                runtime.handoff_index(worker, target, index)?;
-            }
-            for (index, trace) in traces {
-                add_packet_trace!(runtime, index, trace)?;
-            }
-        }
+        &snapshot,
+        &next,
+        state.handoff,
+        state.handoff_worker,
+        session_queue,
+    )
+}
+
+fn tcp_input_process_frame<C>(
+    runtime: &DataPlaneRuntime,
+    frame: &mut BufferFrame,
+    snapshot: &TcpLookupSnapshot,
+    next: &[NodeId; TcpInputNext::COUNT],
+    handoff: Option<NodeHandle>,
+    handoff_worker: Option<DataWorkerId>,
+    session_queue: Option<TcpQueue<C>>,
+) -> CoreResult<NodeResult>
+where
+    C: CongestionController + 'static,
+{
+    let indices = frame.pending_indices();
+    let mut next_frames = hammer_adapter::NodeNextFrames::default();
+    let mut read = 0usize;
+    while read + 4 <= indices.len() {
+        prefetch_tcp_input(runtime, &indices[read..read + 4], snapshot, session_queue);
+        tcp_input_enqueue_index(
+            runtime,
+            indices[read],
+            snapshot,
+            next,
+            handoff,
+            handoff_worker,
+            session_queue,
+            &mut next_frames,
+        )?;
+        tcp_input_enqueue_index(
+            runtime,
+            indices[read + 1],
+            snapshot,
+            next,
+            handoff,
+            handoff_worker,
+            session_queue,
+            &mut next_frames,
+        )?;
+        tcp_input_enqueue_index(
+            runtime,
+            indices[read + 2],
+            snapshot,
+            next,
+            handoff,
+            handoff_worker,
+            session_queue,
+            &mut next_frames,
+        )?;
+        tcp_input_enqueue_index(
+            runtime,
+            indices[read + 3],
+            snapshot,
+            next,
+            handoff,
+            handoff_worker,
+            session_queue,
+            &mut next_frames,
+        )?;
+        read += 4;
+    }
+    if read + 2 <= indices.len() {
+        prefetch_tcp_input(runtime, &indices[read..read + 2], snapshot, session_queue);
+        tcp_input_enqueue_index(
+            runtime,
+            indices[read],
+            snapshot,
+            next,
+            handoff,
+            handoff_worker,
+            session_queue,
+            &mut next_frames,
+        )?;
+        tcp_input_enqueue_index(
+            runtime,
+            indices[read + 1],
+            snapshot,
+            next,
+            handoff,
+            handoff_worker,
+            session_queue,
+            &mut next_frames,
+        )?;
+        read += 2;
+    }
+    while read < indices.len() {
+        let index = indices[read];
+        prefetch_tcp_input(runtime, &indices[read..read + 1], snapshot, session_queue);
+        tcp_input_enqueue_index(
+            runtime,
+            index,
+            snapshot,
+            next,
+            handoff,
+            handoff_worker,
+            session_queue,
+            &mut next_frames,
+        )?;
+        read += 1;
+    }
+    next_frames.finish(runtime, frame)
+}
+
+#[inline(always)]
+fn tcp_input_next_for_index<C>(
+    runtime: &DataPlaneRuntime,
+    index: BufferIndex,
+    snapshot: &TcpLookupSnapshot,
+    next: &[NodeId; TcpInputNext::COUNT],
+    handoff: Option<NodeHandle>,
+    handoff_worker: Option<DataWorkerId>,
+    session_queue: Option<TcpQueue<C>>,
+) -> CoreResult<Option<NodeId>>
+where
+    C: CongestionController + 'static,
+{
+    let buffer = runtime.get_buffer(index)?;
+    let parsed = tcp_input_buffer(&buffer)?;
+    drop(buffer);
+    next_node_for_index_with_runtime(
+        runtime,
+        index,
+        parsed,
+        snapshot,
+        next,
+        handoff,
+        handoff_worker,
+        session_queue,
     )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TcpInputParseError {
+enum TcpInputError {
     BadLength,
     WrongProtocol {
         version: IpVersion,
@@ -350,32 +424,25 @@ enum TcpInputParseError {
 }
 
 #[inline(always)]
-fn next_node_for_index_with_batch<C>(
+fn next_node_for_index_with_runtime<C>(
     runtime: &DataPlaneRuntime,
-    batch: &mut BufferBatchMut<'_>,
     index: BufferIndex,
-    parsed: Result<
-        (IpVersion, IpProtocol, SocketAddr, SocketAddr, TcpInputFlags),
-        TcpInputParseError,
-    >,
+    parsed: Result<(IpVersion, IpProtocol, SocketAddr, SocketAddr, TcpInputFlags), TcpInputError>,
     snapshot: &TcpLookupSnapshot,
     next: &[NodeId; TcpInputNext::COUNT],
     handoff: Option<NodeHandle>,
     handoff_worker: Option<DataWorkerId>,
     session_queue: Option<TcpQueue<C>>,
-    traces: &mut Vec<(BufferIndex, TcpInputTrace)>,
-    handoffs: &mut Vec<(DataWorkerId, NodeHandle, BufferIndex)>,
 ) -> CoreResult<Option<NodeId>>
 where
     C: CongestionController + 'static,
 {
-    let traced = batch.buffer(index)?.trace_handle().is_some();
+    let traced = runtime.get_buffer(index)?.trace_handle().is_some();
     let (version, protocol, local, remote, flags) = match parsed {
         Ok(parsed) => parsed,
-        Err(TcpInputParseError::BadLength) => {
-            return resolve_error_next_with_batch(
+        Err(TcpInputError::BadLength) => {
+            return resolve_error_next_with_runtime(
                 runtime,
-                batch,
                 index,
                 next,
                 TcpInputNext::Drop,
@@ -384,13 +451,11 @@ where
                 None,
                 0,
                 traced,
-                traces,
             );
         }
-        Err(TcpInputParseError::WrongProtocol { version, protocol }) => {
-            return resolve_error_next_with_batch(
+        Err(TcpInputError::WrongProtocol { version, protocol }) => {
+            return resolve_error_next_with_runtime(
                 runtime,
-                batch,
                 index,
                 next,
                 TcpInputNext::Drop,
@@ -399,7 +464,6 @@ where
                 Some(protocol),
                 0,
                 traced,
-                traces,
             );
         }
     };
@@ -411,22 +475,23 @@ where
     if let Some((session_id, owner, session_next)) = session_route {
         let resolved = NodeNextStorage::next(next, session_next);
         {
-            let buffer = batch.buffer_mut(index)?;
+            let mut buffer = runtime.get_buffer_mut(index)?;
             buffer.clear_node_error();
             write_session_route_opaque(buffer.opaque2_mut(), session_id, owner, session_next);
             if let (Some(_), Some(current_worker)) = (handoff, handoff_worker)
                 && owner != current_worker
             {
                 buffer.set_current_config(resolved);
-                buffer.set_handoff_source_worker(current_worker);
+                unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }
+                    .set_handoff_source_worker(Some(current_worker.slot() as u16));
             }
         }
         if let (Some(target), Some(current_worker)) = (handoff, handoff_worker)
             && owner != current_worker
         {
-            handoffs.push((owner, target, index));
             if traced {
-                traces.push((
+                add_packet_trace!(
+                    runtime,
                     index,
                     TcpInputTrace {
                         version: Some(version),
@@ -437,11 +502,13 @@ where
                         error: None,
                         next: resolved,
                     },
-                ));
+                )?;
             }
+            runtime.handoff_index(owner, target, index)?;
             return Ok(None);
         }
         return resolve_success_next_with_trace(
+            runtime,
             index,
             next,
             session_next,
@@ -451,17 +518,17 @@ where
             destination_port,
             u16::from(flags.bits()),
             traced,
-            traces,
         );
     }
 
     if listener_pending {
         {
-            let buffer = batch.buffer_mut(index)?;
+            let mut buffer = runtime.get_buffer_mut(index)?;
             buffer.clear_node_error();
             buffer.opaque2_mut().clear();
         }
         return resolve_success_next_with_trace(
+            runtime,
             index,
             next,
             TcpInputNext::Listen,
@@ -471,16 +538,14 @@ where
             destination_port,
             u16::from(flags.bits()),
             traced,
-            traces,
         );
     }
 
     let lookup = lookup_for_packet(snapshot, local, remote);
     let (listener_next, listener_error) = tcp_listener_input_entry(flags);
     if let Some(error) = listener_error {
-        return resolve_error_next_with_batch(
+        return resolve_error_next_with_runtime(
             runtime,
-            batch,
             index,
             next,
             listener_next,
@@ -489,13 +554,11 @@ where
             Some(protocol),
             u16::from(flags.bits()),
             traced,
-            traces,
         );
     }
     let Some(_listener) = lookup else {
-        return resolve_error_next_with_batch(
+        return resolve_error_next_with_runtime(
             runtime,
-            batch,
             index,
             next,
             TcpInputNext::Punt,
@@ -504,15 +567,15 @@ where
             Some(protocol),
             u16::from(flags.bits()),
             traced,
-            traces,
         );
     };
     {
-        let buffer = batch.buffer_mut(index)?;
+        let mut buffer = runtime.get_buffer_mut(index)?;
         buffer.clear_node_error();
         buffer.opaque2_mut().clear();
     }
     resolve_success_next_with_trace(
+        runtime,
         index,
         next,
         listener_next,
@@ -522,12 +585,12 @@ where
         destination_port,
         u16::from(flags.bits()),
         traced,
-        traces,
     )
 }
 
 #[inline(always)]
 fn resolve_success_next_with_trace(
+    runtime: &DataPlaneRuntime,
     index: BufferIndex,
     next: &[NodeId; TcpInputNext::COUNT],
     next_key: TcpInputNext,
@@ -537,11 +600,11 @@ fn resolve_success_next_with_trace(
     destination_port: u16,
     flags: u16,
     traced: bool,
-    traces: &mut Vec<(BufferIndex, TcpInputTrace)>,
 ) -> CoreResult<Option<NodeId>> {
     let resolved = NodeNextStorage::next(next, next_key);
     if traced {
-        traces.push((
+        add_packet_trace!(
+            runtime,
             index,
             TcpInputTrace {
                 version: Some(version),
@@ -552,15 +615,14 @@ fn resolve_success_next_with_trace(
                 error: None,
                 next: resolved,
             },
-        ));
+        )?;
     }
     Ok(Some(resolved))
 }
 
 #[inline(always)]
-fn resolve_error_next_with_batch(
+fn resolve_error_next_with_runtime(
     runtime: &DataPlaneRuntime,
-    batch: &mut BufferBatchMut<'_>,
     index: BufferIndex,
     next: &[NodeId; TcpInputNext::COUNT],
     next_key: TcpInputNext,
@@ -569,15 +631,15 @@ fn resolve_error_next_with_batch(
     protocol: Option<IpProtocol>,
     flags: u16,
     traced: bool,
-    traces: &mut Vec<(BufferIndex, TcpInputTrace)>,
 ) -> CoreResult<Option<NodeId>> {
     {
-        let buffer = batch.buffer_mut(index)?;
-        set_buffer_node_error_code(runtime, buffer, error as u16)?;
+        let mut buffer = runtime.get_buffer_mut(index)?;
+        set_buffer_node_error_code(runtime, &mut buffer, error as u16)?;
     }
     let resolved = NodeNextStorage::next(next, next_key);
     if traced {
-        traces.push((
+        add_packet_trace!(
+            runtime,
             index,
             TcpInputTrace {
                 version,
@@ -588,7 +650,7 @@ fn resolve_error_next_with_batch(
                 error: Some(error as u16),
                 next: resolved,
             },
-        ));
+        )?;
     }
     Ok(Some(resolved))
 }
@@ -636,6 +698,7 @@ fn tcp_listener_input_entry(flags: TcpInputFlags) -> (TcpInputNext, Option<TcpEr
 
 #[cfg(test)]
 mod tests {
+    use std::mem::transmute;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
 
@@ -647,6 +710,7 @@ mod tests {
     use hammer_core::error::CoreResult;
     use hammer_core::protocol::tcp::TcpConnectionId;
 
+    use crate::net::NetworkOpaque;
     use crate::transport::congestion::BbrController;
     use crate::transport::tcp::lookup::TcpLookupSnapshot;
     use crate::transport::tcp::{
@@ -800,7 +864,7 @@ mod tests {
         let mut worker_state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
         set_tcp_worker_state(&mut worker_state);
         let handle = crate::session::node::register_session_queue(
-            TcpSessionDriver::<BbrController>::new(worker, runtime.packet_buffers().clone()),
+            TcpSessionDriver::<BbrController>::new(worker, runtime.buffers().clone()),
         )
         .expect("register tcp queue");
         let local_port = 50_077;
@@ -883,12 +947,20 @@ mod tests {
         assert!(runtime.schedule_frame(node, frame).expect("schedule"));
         assert!(runtime.run_ready_nodes().expect("run input") >= 1);
 
-        assert_eq!(runtime.current_config(index).expect("handoff next"), reset);
         assert_eq!(
             runtime
-                .handoff_source_worker(index)
-                .expect("handoff source"),
-            Some(DataWorkerId::new(0))
+                .buffers()
+                .current_config(index)
+                .expect("handoff next"),
+            reset
+        );
+        assert_eq!(
+            {
+                let buffer = runtime.get_buffer(index).expect("buffer");
+                let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
+                network.handoff_source_worker()
+            },
+            Some(0)
         );
     }
 
@@ -952,7 +1024,7 @@ mod tests {
         );
         {
             let mut driver =
-                TcpSessionDriver::<BbrController>::new(owner, runtime.packet_buffers().clone());
+                TcpSessionDriver::<BbrController>::new(owner, runtime.buffers().clone());
             let session_id = driver
                 .insert_session_with_id(|_| connection.clone())
                 .expect("insert session");
@@ -998,20 +1070,33 @@ mod tests {
     ) -> std::vec::Vec<u8> {
         let mut packet = std::vec![0u8; 40];
         packet[0] = 0x45;
-        packet[2..4].copy_from_slice(&40u16.to_be_bytes());
+        write_be_u16(&mut packet, 2, 40);
         packet[8] = 64;
         packet[9] = 6;
-        packet[12..16].copy_from_slice(&source.octets());
-        packet[16..20].copy_from_slice(&destination.octets());
-        packet[20..22].copy_from_slice(&source_port.to_be_bytes());
-        packet[22..24].copy_from_slice(&destination_port.to_be_bytes());
+        write_bytes(&mut packet, 12, &source.octets());
+        write_bytes(&mut packet, 16, &destination.octets());
+        write_be_u16(&mut packet, 20, source_port);
+        write_be_u16(&mut packet, 22, destination_port);
         packet[32] = 0x50;
         packet[33] = TcpInputFlags::ACK.bits();
         let tcp_checksum = ipv4_l4_checksum(source, destination, 6, &packet[20..]);
-        packet[36..38].copy_from_slice(&tcp_checksum.to_be_bytes());
+        write_be_u16(&mut packet, 36, tcp_checksum);
         let ip_checksum = internet_checksum(&packet[..20]);
-        packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
+        write_be_u16(&mut packet, 10, ip_checksum);
         packet
+    }
+
+    fn write_bytes(output: &mut [u8], offset: usize, bytes: &[u8]) {
+        let mut index = 0usize;
+        while index < bytes.len() {
+            output[offset + index] = bytes[index];
+            index += 1;
+        }
+    }
+
+    fn write_be_u16(output: &mut [u8], offset: usize, value: u16) {
+        output[offset] = (value >> 8) as u8;
+        output[offset + 1] = value as u8;
     }
 
     fn ipv4_l4_checksum(
@@ -1020,13 +1105,18 @@ mod tests {
         protocol: u8,
         segment: &[u8],
     ) -> u16 {
+        let segment_len = be_u16(segment.len() as u16);
         internet_checksum_parts(&[
             &source.octets(),
             &destination.octets(),
             &[0, protocol],
-            &(segment.len() as u16).to_be_bytes(),
+            &segment_len,
             segment,
         ])
+    }
+
+    fn be_u16(value: u16) -> [u8; 2] {
+        [(value >> 8) as u8, value as u8]
     }
 
     fn internet_checksum(bytes: &[u8]) -> u16 {
@@ -1088,16 +1178,17 @@ mod tests {
         packet: &[u8],
     ) {
         let header_len = ((*packet.first().expect("IPv4 header") & 0x0f) as usize) * 4;
-        runtime
-            .get_buffer_mut(buffer)
-            .expect("buffer mut")
-            .set_packet_cursor(
-                hammer_adapter::BufferPacketCursor::new()
-                    .with_packet_len(packet.len())
-                    .with_network_header(0, header_len)
-                    .with_transport_header(header_len, 20)
-                    .with_transport_payload_offset(header_len + 20),
-            );
+        let mut buffer = runtime.get_buffer_mut(buffer).expect("buffer mut");
+        let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+        network.set_packet_cursor(
+            hammer_adapter::BufferPacketCursor::new()
+                .with_packet_len(packet.len())
+                .with_network_header(0, header_len)
+                .with_transport_header(header_len, 20)
+                .with_transport_payload_offset(header_len + 20),
+        );
+        network.ip_mut().set_ip_version(Some(4));
+        network.ip_mut().set_ip_protocol(Some(6));
     }
 }
 
@@ -1115,80 +1206,121 @@ pub(crate) fn stamp_session_route_for_test(
 }
 
 #[inline(always)]
-fn parse_tcp_input_buffer(
+fn tcp_input_buffer(
     buffer: &hammer_adapter::Buffer,
-) -> CoreResult<
-    Result<(IpVersion, IpProtocol, SocketAddr, SocketAddr, TcpInputFlags), TcpInputParseError>,
-> {
-    parse_tcp_input_parts(
-        buffer.current(),
-        buffer.total_len_not_including_first(),
-        buffer.packet_cursor(),
-    )
+) -> CoreResult<Result<(IpVersion, IpProtocol, SocketAddr, SocketAddr, TcpInputFlags), TcpInputError>>
+{
+    tcp_input_parts(buffer.current(), unsafe {
+        transmute::<_, &NetworkOpaque>(buffer.opaque())
+    })
 }
 
 #[inline(always)]
-fn prefetch_tcp_input(
-    batch: &mut BufferBatchMut<'_>,
+fn prefetch_tcp_input<C>(
+    runtime: &DataPlaneRuntime,
     indices: &[BufferIndex],
     lookup: &TcpLookupSnapshot,
-    session_queue: Option<TcpQueue<impl CongestionController + 'static>>,
-) {
-    for index in indices.iter().copied() {
-        batch.prefetch_read(index);
-        let _ = batch.with_buffer(index, |buffer| {
-            prefetch_lookup_for_buffer(lookup, buffer);
-            prefetch_session_route_for_buffer(session_queue, buffer);
-        });
+    session_queue: Option<TcpQueue<C>>,
+) where
+    C: CongestionController + 'static,
+{
+    let mut read = 0usize;
+    while read < indices.len() {
+        let index = indices[read];
+        runtime.prefetch_read(index);
+        if let Ok(buffer) = runtime.get_buffer(index) {
+            prefetch_lookup_for_buffer(lookup, &buffer);
+            prefetch_session_route_for_buffer(session_queue, &buffer);
+        }
+        read += 1;
     }
 }
 
 #[inline(always)]
-fn parse_tcp_input_parts(
+fn tcp_input_parts(
     current: &[u8],
-    total_len_not_including_first: usize,
-    cursor: BufferPacketCursor,
-) -> CoreResult<
-    Result<(IpVersion, IpProtocol, SocketAddr, SocketAddr, TcpInputFlags), TcpInputParseError>,
-> {
-    let parsed = match parse_ip_packet_with_chain_len(current, total_len_not_including_first) {
-        Ok(parsed) => parsed,
-        Err(_) => return Ok(Err(TcpInputParseError::BadLength)),
+    network: &NetworkOpaque,
+) -> CoreResult<Result<(IpVersion, IpProtocol, SocketAddr, SocketAddr, TcpInputFlags), TcpInputError>>
+{
+    let cursor = network.packet_cursor();
+    let Some((version, protocol)) = ip_facts(network) else {
+        return Ok(Err(TcpInputError::BadLength));
     };
-    if parsed.protocol != IpProtocol::Tcp {
-        return Ok(Err(TcpInputParseError::WrongProtocol {
-            version: parsed.version,
-            protocol: parsed.protocol,
-        }));
+    if protocol != IpProtocol::Tcp {
+        return Ok(Err(TcpInputError::WrongProtocol { version, protocol }));
     }
-    if parsed.input_error != IpInputError::None || !valid_tcp_cursor(cursor) {
-        return Ok(Err(TcpInputParseError::BadLength));
+    if !valid_tcp_cursor(cursor) {
+        return Ok(Err(TcpInputError::BadLength));
     }
-    let first_len = current.len().min(parsed.packet_len);
+    let first_len = current.len().min(cursor.packet_len());
     let Some(packet) = current.get(..first_len) else {
-        return Ok(Err(TcpInputParseError::BadLength));
+        return Ok(Err(TcpInputError::BadLength));
     };
-    let source_ip = source_ip(parsed.version, packet)?;
-    let destination_ip = destination_ip(parsed.version, packet)?;
+    let Some(network_header) = packet
+        .get(cursor.network_header_offset()..cursor.transport_header_offset().min(packet.len()))
+    else {
+        return Ok(Err(TcpInputError::BadLength));
+    };
+    let source_ip = source_ip(version, network_header)?;
+    let destination_ip = destination_ip(version, network_header)?;
     let Some(transport) = packet.get(cursor.transport_header_offset()..first_len) else {
-        return Ok(Err(TcpInputParseError::BadLength));
+        return Ok(Err(TcpInputError::BadLength));
     };
-    let segment = match parse_tcp_wire_header(transport) {
+    let segment = match tcp_header(transport) {
         Ok(segment) => segment,
-        Err(_) => return Ok(Err(TcpInputParseError::BadLength)),
+        Err(_) => return Ok(Err(TcpInputError::BadLength)),
     };
     Ok(Ok((
-        parsed.version,
-        parsed.protocol,
+        version,
+        protocol,
         SocketAddr::new(destination_ip, segment.destination_port()),
         SocketAddr::new(source_ip, segment.source_port()),
-        tcp_input_flags(tcp_wire_flags(segment)),
+        tcp_input_flags(segment.flags()),
     )))
+}
+
+#[inline(always)]
+fn tcp_input_enqueue_index<C>(
+    runtime: &DataPlaneRuntime,
+    index: BufferIndex,
+    snapshot: &TcpLookupSnapshot,
+    next: &[NodeId; TcpInputNext::COUNT],
+    handoff: Option<NodeHandle>,
+    handoff_worker: Option<DataWorkerId>,
+    session_queue: Option<TcpQueue<C>>,
+    next_frames: &mut hammer_adapter::NodeNextFrames,
+) -> CoreResult<()>
+where
+    C: CongestionController + 'static,
+{
+    if let Some(node) = tcp_input_next_for_index(
+        runtime,
+        index,
+        snapshot,
+        next,
+        handoff,
+        handoff_worker,
+        session_queue,
+    )? {
+        hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, node, index)
+    } else {
+        Ok(())
+    }
 }
 
 #[inline(always)]
 fn valid_tcp_cursor(cursor: BufferPacketCursor) -> bool {
     cursor.packet_len() >= cursor.transport_header_offset()
+}
+
+#[inline(always)]
+fn ip_facts(network: &NetworkOpaque) -> Option<(IpVersion, IpProtocol)> {
+    let version = match network.ip().ip_version()? {
+        4 => IpVersion::V4,
+        6 => IpVersion::V6,
+        _ => return None,
+    };
+    Some((version, IpProtocol::from(network.ip().ip_protocol()?)))
 }
 
 #[inline(always)]
@@ -1278,7 +1410,8 @@ fn lookup_for_packet(
 
 #[inline(always)]
 fn prefetch_lookup_for_buffer(snapshot: &TcpLookupSnapshot, buffer: &hammer_adapter::Buffer) {
-    let cursor = buffer.packet_cursor();
+    let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
+    let cursor = network.packet_cursor();
     if !valid_tcp_cursor(cursor) {
         return;
     }
@@ -1288,20 +1421,46 @@ fn prefetch_lookup_for_buffer(snapshot: &TcpLookupSnapshot, buffer: &hammer_adap
         return;
     };
     let destination_port = tcp_destination_port(buffer);
-    match packet.first().map(|first| first >> 4) {
-        Some(4) if packet.len() >= 20 => {
-            let local_addr = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+    let Some((version, _)) = ip_facts(network) else {
+        return;
+    };
+    let Some(network_header) = packet
+        .get(cursor.network_header_offset()..cursor.transport_header_offset().min(packet.len()))
+    else {
+        return;
+    };
+    match version {
+        IpVersion::V4 if network_header.len() >= 20 => {
+            let local_addr = Ipv4Addr::new(
+                network_header[16],
+                network_header[17],
+                network_header[18],
+                network_header[19],
+            );
             snapshot.prefetch_listener::<TcpIpv4ListenerAddress>(TcpV4ListenerKey::new(
                 0,
                 local_addr,
                 destination_port,
             ));
         }
-        Some(6) if packet.len() >= 40 => {
+        IpVersion::V6 if network_header.len() >= 40 => {
             let local_addr = Ipv6Addr::from([
-                packet[24], packet[25], packet[26], packet[27], packet[28], packet[29], packet[30],
-                packet[31], packet[32], packet[33], packet[34], packet[35], packet[36], packet[37],
-                packet[38], packet[39],
+                network_header[24],
+                network_header[25],
+                network_header[26],
+                network_header[27],
+                network_header[28],
+                network_header[29],
+                network_header[30],
+                network_header[31],
+                network_header[32],
+                network_header[33],
+                network_header[34],
+                network_header[35],
+                network_header[36],
+                network_header[37],
+                network_header[38],
+                network_header[39],
             ]);
             snapshot.prefetch_listener::<TcpIpv6ListenerAddress>(TcpV6ListenerKey::new(
                 0,
@@ -1323,7 +1482,8 @@ fn prefetch_session_route_for_buffer<C>(
     let Some(_) = session_queue else {
         return;
     };
-    let cursor = buffer.packet_cursor();
+    let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
+    let cursor = network.packet_cursor();
     if !valid_tcp_cursor(cursor) {
         return;
     }
@@ -1332,27 +1492,19 @@ fn prefetch_session_route_for_buffer<C>(
     let Some(packet) = current.get(..packet_len) else {
         return;
     };
-    let (source_ip, destination_ip) = match packet.first().map(|first| first >> 4) {
-        Some(4) if packet.len() >= 20 => (
-            IpAddr::V4(Ipv4Addr::new(
-                packet[12], packet[13], packet[14], packet[15],
-            )),
-            IpAddr::V4(Ipv4Addr::new(
-                packet[16], packet[17], packet[18], packet[19],
-            )),
-        ),
-        Some(6) if packet.len() >= 40 => (
-            IpAddr::V6(Ipv6Addr::from([
-                packet[8], packet[9], packet[10], packet[11], packet[12], packet[13], packet[14],
-                packet[15], packet[16], packet[17], packet[18], packet[19], packet[20], packet[21],
-                packet[22], packet[23],
-            ])),
-            IpAddr::V6(Ipv6Addr::from([
-                packet[24], packet[25], packet[26], packet[27], packet[28], packet[29], packet[30],
-                packet[31], packet[32], packet[33], packet[34], packet[35], packet[36], packet[37],
-                packet[38], packet[39],
-            ])),
-        ),
+    let Some((version, _)) = ip_facts(network) else {
+        return;
+    };
+    let Some(network_header) = packet
+        .get(cursor.network_header_offset()..cursor.transport_header_offset().min(packet.len()))
+    else {
+        return;
+    };
+    let (source_ip, destination_ip) = match (
+        source_ip(version, network_header),
+        destination_ip(version, network_header),
+    ) {
+        (Ok(source_ip), Ok(destination_ip)) => (source_ip, destination_ip),
         _ => return,
     };
     let local = SocketAddr::new(destination_ip, tcp_destination_port(buffer));
@@ -1362,7 +1514,9 @@ fn prefetch_session_route_for_buffer<C>(
 
 #[inline(always)]
 fn tcp_source_port(buffer: &hammer_adapter::Buffer) -> u16 {
-    let transport = buffer.packet_cursor().transport_header_offset();
+    let transport = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) }
+        .packet_cursor()
+        .transport_header_offset();
     let current = buffer.current();
     current
         .get(transport..transport + 2)
@@ -1372,7 +1526,9 @@ fn tcp_source_port(buffer: &hammer_adapter::Buffer) -> u16 {
 
 #[inline(always)]
 fn tcp_destination_port(buffer: &hammer_adapter::Buffer) -> u16 {
-    let transport = buffer.packet_cursor().transport_header_offset();
+    let transport = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) }
+        .packet_cursor()
+        .transport_header_offset();
     let current = buffer.current();
     current
         .get(transport + 2..transport + 4)

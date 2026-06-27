@@ -4,7 +4,7 @@ use std::mem::transmute;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, NetworkOpaque, Node, NodeId,
+    BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId, NodeNextFrames,
     NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData, PacketTrace, TraceFormatter,
     add_packet_trace,
 };
@@ -16,7 +16,7 @@ use hammer_runtime::DataPlaneBarrierHandle;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 
 use crate::data_plane::set_index_node_error_code;
-use crate::net::{DpoId, DpoProto, FibTableBuilder, FibTableHandle};
+use crate::net::{DpoId, DpoProto, FibTableBuilder, FibTableHandle, NetworkOpaque};
 use crate::trace::codec::{TraceDecodeCursor, put_option_node, put_option_u16, put_option_u32};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -822,8 +822,6 @@ pub struct InterfaceOutputNode {
     #[node(default = register_interface_output_runtime(output.clone()))]
     runtime_data: NodeRuntimeData,
     output: InterfaceOutputHandle,
-    #[node(default)]
-    cached_next: Option<NodeId>,
 }
 
 impl InterfaceOutputNode {
@@ -833,9 +831,11 @@ impl InterfaceOutputNode {
         runtime: &DataPlaneRuntime,
         index: BufferIndex,
     ) -> CoreResult<Option<NodeId>> {
-        let buffer = runtime.get_buffer(index)?;
-        let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
-        let interface_index = network.sw_if_index[1];
+        let interface_index = {
+            let buffer = runtime.get_buffer(index)?;
+            let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
+            network.sw_if_index[1]
+        };
         if interface_index == 0 {
             set_index_node_error_code(
                 runtime,
@@ -895,9 +895,7 @@ impl Node for InterfaceOutputNode {
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        hammer_adapter::node_route_frame_index_cached!(self, runtime, frame, |index| {
-            Self::tx_for_index(&self.output, runtime, index)
-        })
+        interface_output_process_frame(runtime, frame, &self.output)
     }
 
     #[inline]
@@ -961,7 +959,76 @@ fn interface_output_process(
     frame: &mut BufferFrame,
 ) -> CoreResult<NodeResult> {
     let state = interface_output_runtime(data)?;
-    hammer_adapter::node_route_frame_index_static!(None, runtime, frame, |index| {
-        InterfaceOutputNode::tx_for_index(&state.output, runtime, index)
-    })
+    interface_output_process_frame(runtime, frame, &state.output)
+}
+
+#[inline(always)]
+fn interface_output_process_frame(
+    runtime: &DataPlaneRuntime,
+    frame: &mut BufferFrame,
+    output: &InterfaceOutputHandle,
+) -> CoreResult<NodeResult> {
+    let mut next_frames = NodeNextFrames::default();
+    let indices = frame.pending_indices();
+    let len = indices.len();
+    let mut read = 0usize;
+    while read + 4 <= len {
+        if read + 4 < len {
+            runtime.prefetch_header(indices[read + 4]);
+        }
+        if read + 5 < len {
+            runtime.prefetch_header(indices[read + 5]);
+        }
+        if read + 6 < len {
+            runtime.prefetch_header(indices[read + 6]);
+        }
+        if read + 7 < len {
+            runtime.prefetch_header(indices[read + 7]);
+        }
+        let index0 = indices[read];
+        let index1 = indices[read + 1];
+        let index2 = indices[read + 2];
+        let index3 = indices[read + 3];
+        if let Some(next0) = InterfaceOutputNode::tx_for_index(output, runtime, index0)? {
+            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, next0, index0)?;
+        }
+        if let Some(next1) = InterfaceOutputNode::tx_for_index(output, runtime, index1)? {
+            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, next1, index1)?;
+        }
+        if let Some(next2) = InterfaceOutputNode::tx_for_index(output, runtime, index2)? {
+            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, next2, index2)?;
+        }
+        if let Some(next3) = InterfaceOutputNode::tx_for_index(output, runtime, index3)? {
+            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, next3, index3)?;
+        }
+        read += 4;
+    }
+    if read + 2 <= len {
+        if read + 2 < len {
+            runtime.prefetch_header(indices[read + 2]);
+        }
+        if read + 3 < len {
+            runtime.prefetch_header(indices[read + 3]);
+        }
+        let index0 = indices[read];
+        let index1 = indices[read + 1];
+        if let Some(next0) = InterfaceOutputNode::tx_for_index(output, runtime, index0)? {
+            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, next0, index0)?;
+        }
+        if let Some(next1) = InterfaceOutputNode::tx_for_index(output, runtime, index1)? {
+            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, next1, index1)?;
+        }
+        read += 2;
+    }
+    while read < len {
+        if read + 1 < len {
+            runtime.prefetch_header(indices[read + 1]);
+        }
+        let index0 = indices[read];
+        if let Some(next0) = InterfaceOutputNode::tx_for_index(output, runtime, index0)? {
+            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, next0, index0)?;
+        }
+        read += 1;
+    }
+    next_frames.finish(runtime, frame)
 }

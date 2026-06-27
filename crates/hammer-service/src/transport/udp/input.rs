@@ -1,17 +1,20 @@
 use std::mem::{size_of, transmute};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeId, NodeNextStorage, NodeProcessFn,
-    NodeResult, NodeRuntimeData, PacketTrace, SecondaryOpaque, TraceFormatter, add_packet_trace,
+    BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeId, NodeNextFrames, NodeNextStorage,
+    NodeResult, PacketTrace, SecondaryOpaque, TraceFormatter, add_packet_trace,
 };
-use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::error::CoreResult;
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
+use hammer_core::protocol::transport::UdpHeader;
+use hammer_core::protocol::wire::read_header;
 use hammer_infra::boxed::Slice;
 
 use crate::data_plane::set_index_node_error_code;
-use crate::net::ip::{IpInputError, IpProtocol, IpVersion, parse_ip_packet_with_chain_len};
+use crate::net::NetworkOpaque;
+use crate::net::ip::{IpProtocol, IpVersion};
 use crate::trace::codec::{
     TraceDecodeCursor, put_node, put_option_ip_protocol, put_option_ip_version, put_option_u16,
 };
@@ -221,11 +224,7 @@ impl UdpInputSnapshotHandle {
 
 #[hammer_component_macros::node(role = internal, next = UdpInputNext)]
 pub struct UdpInputNode {
-    #[node(default = register_udp_input_runtime(snapshot.clone()))]
-    runtime_data: NodeRuntimeData,
     snapshot: UdpInputSnapshotHandle,
-    #[node(default)]
-    cached_next: Option<NodeId>,
 }
 
 impl Node for UdpInputNode {
@@ -237,105 +236,85 @@ impl Node for UdpInputNode {
     ) -> CoreResult<NodeResult> {
         let snapshot = self.snapshot.load();
         let next = Self::runtime_nexts(runtime)?;
-        hammer_adapter::node_route_frame_index_cached!(self, runtime, frame, |index| {
-            next_node_for_index(runtime, index, &snapshot, &next)
-        })
+        udp_input_process_frame(runtime, frame, &snapshot, &next)
     }
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
         Some(format_udp_input_trace)
     }
-
-    #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        udp_input_process
-    }
-
-    #[inline]
-    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
-        Ok(self.runtime_data)
-    }
 }
 
-#[derive(Clone)]
-struct UdpInputRuntime {
-    snapshot: UdpInputSnapshotHandle,
-}
-
-fn udp_input_runtimes() -> &'static Mutex<Vec<UdpInputRuntime>> {
-    static RUNTIMES: OnceLock<Mutex<Vec<UdpInputRuntime>>> = OnceLock::new();
-    RUNTIMES.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-fn register_udp_input_runtime(snapshot: UdpInputSnapshotHandle) -> NodeRuntimeData {
-    let mut runtimes = udp_input_runtimes()
-        .lock()
-        .expect("UDP input runtime registry poisoned");
-    let slot = runtimes.len();
-    runtimes.push(UdpInputRuntime { snapshot });
-    NodeRuntimeData::from_usize(slot).expect("UDP input runtime slot overflow")
-}
-
-fn udp_input_runtime(data: NodeRuntimeData) -> CoreResult<UdpInputRuntime> {
-    let slot = data.usize_word(0)?;
-    udp_input_runtimes()
-        .lock()
-        .map_err(|_| CoreError::internal("UDP input runtime registry poisoned"))?
-        .get(slot)
-        .cloned()
-        .ok_or_else(|| CoreError::internal("UDP input runtime slot is invalid"))
-}
-
-fn udp_input_process(
+#[inline(always)]
+fn udp_input_process_frame(
     runtime: &DataPlaneRuntime,
-    data: NodeRuntimeData,
     frame: &mut BufferFrame,
+    snapshot: &UdpInputSnapshot,
+    next: &[NodeId; UdpInputNext::COUNT],
 ) -> CoreResult<NodeResult> {
-    let state = udp_input_runtime(data)?;
-    let snapshot = state.snapshot.load();
-    let next = UdpInputNode::runtime_nexts(runtime)?;
-    hammer_adapter::node_route_frame_index_static!(None, runtime, frame, |index| {
-        next_node_for_index(runtime, index, &snapshot, &next)
-    })
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ParsedUdpInput {
-    version: IpVersion,
-    protocol: IpProtocol,
-    source_port: u16,
-    destination_port: u16,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct UdpInputTraceContext {
-    version: Option<IpVersion>,
-    protocol: Option<IpProtocol>,
-    source_port: Option<u16>,
-    destination_port: Option<u16>,
-}
-
-impl UdpInputTraceContext {
-    #[inline(always)]
-    const fn empty() -> Self {
-        Self {
-            version: None,
-            protocol: None,
-            source_port: None,
-            destination_port: None,
+    let mut next_frames = NodeNextFrames::default();
+    let indices = frame.pending_indices();
+    let len = indices.len();
+    let mut read = 0usize;
+    while read + 4 <= len {
+        if read + 4 < len {
+            runtime.prefetch_header(indices[read + 4]);
         }
-    }
-
-    #[inline(always)]
-    const fn protocol(version: IpVersion, protocol: IpProtocol) -> Self {
-        Self {
-            version: Some(version),
-            protocol: Some(protocol),
-            source_port: None,
-            destination_port: None,
+        if read + 5 < len {
+            runtime.prefetch_header(indices[read + 5]);
         }
+        if read + 6 < len {
+            runtime.prefetch_header(indices[read + 6]);
+        }
+        if read + 7 < len {
+            runtime.prefetch_header(indices[read + 7]);
+        }
+        let index0 = indices[read];
+        let index1 = indices[read + 1];
+        let index2 = indices[read + 2];
+        let index3 = indices[read + 3];
+        if let Some(next0) = next_node_for_index(runtime, index0, snapshot, next)? {
+            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, next0, index0)?;
+        }
+        if let Some(next1) = next_node_for_index(runtime, index1, snapshot, next)? {
+            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, next1, index1)?;
+        }
+        if let Some(next2) = next_node_for_index(runtime, index2, snapshot, next)? {
+            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, next2, index2)?;
+        }
+        if let Some(next3) = next_node_for_index(runtime, index3, snapshot, next)? {
+            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, next3, index3)?;
+        }
+        read += 4;
     }
+    if read + 2 <= len {
+        if read + 2 < len {
+            runtime.prefetch_header(indices[read + 2]);
+        }
+        if read + 3 < len {
+            runtime.prefetch_header(indices[read + 3]);
+        }
+        let index0 = indices[read];
+        let index1 = indices[read + 1];
+        if let Some(next0) = next_node_for_index(runtime, index0, snapshot, next)? {
+            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, next0, index0)?;
+        }
+        if let Some(next1) = next_node_for_index(runtime, index1, snapshot, next)? {
+            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, next1, index1)?;
+        }
+        read += 2;
+    }
+    while read < len {
+        if read + 1 < len {
+            runtime.prefetch_header(indices[read + 1]);
+        }
+        let index0 = indices[read];
+        if let Some(next0) = next_node_for_index(runtime, index0, snapshot, next)? {
+            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, next0, index0)?;
+        }
+        read += 1;
+    }
+    next_frames.finish(runtime, frame)
 }
 
 #[inline(always)]
@@ -345,39 +324,125 @@ fn next_node_for_index(
     snapshot: &UdpInputSnapshot,
     next: &[NodeId; UdpInputNext::COUNT],
 ) -> CoreResult<Option<NodeId>> {
-    let parsed = match parse_udp_input(runtime, index)? {
-        Ok(parsed) => parsed,
-        Err(UdpInputParseError::BadLength) => {
-            return resolve_drop_error(
-                runtime,
-                index,
-                next,
-                UdpInputError::BadLength,
-                UdpInputTraceContext::empty(),
-            );
-        }
-        Err(UdpInputParseError::WrongProtocol { version, protocol }) => {
+    let (version, protocol, source_port, destination_port) = {
+        let buffer = runtime.get_buffer(index)?;
+        let current = buffer.current();
+        let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
+        let cursor = network.packet_cursor();
+        let ip = network.ip();
+        let version = match ip.ip_version() {
+            Some(4) => IpVersion::V4,
+            Some(6) => IpVersion::V6,
+            _ => {
+                drop(buffer);
+                return resolve_drop_error(
+                    runtime,
+                    index,
+                    next,
+                    UdpInputError::BadLength,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+            }
+        };
+        let protocol = match ip.ip_protocol() {
+            Some(17) => IpProtocol::Udp,
+            Some(1) => IpProtocol::Icmpv4,
+            Some(6) => IpProtocol::Tcp,
+            Some(58) => IpProtocol::Icmpv6,
+            Some(value) => IpProtocol::Other(value),
+            None => {
+                drop(buffer);
+                return resolve_drop_error(
+                    runtime,
+                    index,
+                    next,
+                    UdpInputError::BadLength,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+            }
+        };
+        if protocol != IpProtocol::Udp {
+            drop(buffer);
             return resolve_drop_error(
                 runtime,
                 index,
                 next,
                 UdpInputError::WrongProtocol,
-                UdpInputTraceContext::protocol(version, protocol),
+                Some(version),
+                Some(protocol),
+                None,
+                None,
             );
         }
+        if !valid_udp_cursor(cursor) {
+            drop(buffer);
+            return resolve_drop_error(
+                runtime,
+                index,
+                next,
+                UdpInputError::BadLength,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+
+        let header = match read_header::<UdpHeader>(current, cursor.transport_header_offset()) {
+            Ok(header) => header,
+            Err(_) => {
+                drop(buffer);
+                return resolve_drop_error(
+                    runtime,
+                    index,
+                    next,
+                    UdpInputError::BadLength,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+            }
+        };
+        let source_port = header.source_port();
+        let destination_port = header.destination_port();
+        if !valid_udp_len(
+            cursor.transport_header_offset(),
+            cursor.packet_len(),
+            header.length(),
+        ) {
+            drop(buffer);
+            return resolve_drop_error(
+                runtime,
+                index,
+                next,
+                UdpInputError::BadLength,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        (version, protocol, source_port, destination_port)
     };
 
-    match snapshot.action(parsed.destination_port) {
+    match snapshot.action(destination_port) {
         UdpPortAction::Dispatch(node) => {
             clear_success_metadata(runtime, index)?;
             add_packet_trace!(
                 runtime,
                 index,
                 UdpInputTrace {
-                    version: Some(parsed.version),
-                    protocol: Some(parsed.protocol),
-                    source_port: Some(parsed.source_port),
-                    destination_port: Some(parsed.destination_port),
+                    version: Some(version),
+                    protocol: Some(protocol),
+                    source_port: Some(source_port),
+                    destination_port: Some(destination_port),
                     error: None,
                     next: node,
                 },
@@ -391,17 +456,26 @@ fn next_node_for_index(
                 runtime,
                 index,
                 UdpInputTrace {
-                    version: Some(parsed.version),
-                    protocol: Some(parsed.protocol),
-                    source_port: Some(parsed.source_port),
-                    destination_port: Some(parsed.destination_port),
+                    version: Some(version),
+                    protocol: Some(protocol),
+                    source_port: Some(source_port),
+                    destination_port: Some(destination_port),
                     error: None,
                     next: resolved,
                 },
             )?;
             Ok(Some(resolved))
         }
-        UdpPortAction::IcmpError => resolve_unknown_port(runtime, index, next, parsed, snapshot),
+        UdpPortAction::IcmpError => resolve_unknown_port(
+            runtime,
+            index,
+            next,
+            snapshot,
+            version,
+            protocol,
+            source_port,
+            destination_port,
+        ),
     }
 }
 
@@ -411,7 +485,10 @@ fn resolve_drop_error(
     index: BufferIndex,
     next: &[NodeId; UdpInputNext::COUNT],
     error: UdpInputError,
-    trace: UdpInputTraceContext,
+    version: Option<IpVersion>,
+    protocol: Option<IpProtocol>,
+    source_port: Option<u16>,
+    destination_port: Option<u16>,
 ) -> CoreResult<Option<NodeId>> {
     set_index_node_error_code(runtime, index, error.code())?;
     let resolved = NodeNextStorage::next(next, UdpInputNext::Drop);
@@ -419,10 +496,10 @@ fn resolve_drop_error(
         runtime,
         index,
         UdpInputTrace {
-            version: trace.version,
-            protocol: trace.protocol,
-            source_port: trace.source_port,
-            destination_port: trace.destination_port,
+            version,
+            protocol,
+            source_port,
+            destination_port,
             error: Some(error.code()),
             next: resolved,
         },
@@ -435,22 +512,25 @@ fn resolve_unknown_port(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
     next: &[NodeId; UdpInputNext::COUNT],
-    parsed: ParsedUdpInput,
     snapshot: &UdpInputSnapshot,
+    version: IpVersion,
+    protocol: IpProtocol,
+    source_port: u16,
+    destination_port: u16,
 ) -> CoreResult<Option<NodeId>> {
     set_index_node_error_code(runtime, index, UdpInputError::UnknownPort.code())?;
     let mut buffer = runtime.get_buffer_mut(index)?;
     let opaque = unsafe { transmute::<_, &mut IcmpErrorOpaque>(buffer.opaque2_mut()) };
-    opaque.icmp_error = port_unreachable_metadata(parsed.version);
+    opaque.icmp_error = port_unreachable_metadata(version);
     let resolved = NodeNextStorage::next(snapshot, UdpInputNextKey::IcmpError(next));
     add_packet_trace!(
         runtime,
         index,
         UdpInputTrace {
-            version: Some(parsed.version),
-            protocol: Some(parsed.protocol),
-            source_port: Some(parsed.source_port),
-            destination_port: Some(parsed.destination_port),
+            version: Some(version),
+            protocol: Some(protocol),
+            source_port: Some(source_port),
+            destination_port: Some(destination_port),
             error: Some(UdpInputError::UnknownPort.code()),
             next: resolved,
         },
@@ -467,80 +547,11 @@ fn clear_success_metadata(runtime: &DataPlaneRuntime, index: BufferIndex) -> Cor
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UdpInputParseError {
-    BadLength,
-    WrongProtocol {
-        version: IpVersion,
-        protocol: IpProtocol,
-    },
-}
-
 #[inline(always)]
-fn parse_udp_input(
-    runtime: &DataPlaneRuntime,
-    index: BufferIndex,
-) -> CoreResult<Result<ParsedUdpInput, UdpInputParseError>> {
-    let (version, protocol, source_port, destination_port) = {
-        let buffer = runtime.get_buffer(index)?;
-        let current = buffer.current();
-        let cursor = buffer.packet_cursor();
-        let parsed =
-            match parse_ip_packet_with_chain_len(current, buffer.total_len_not_including_first()) {
-                Ok(parsed) => parsed,
-                Err(_) => return Ok(Err(UdpInputParseError::BadLength)),
-            };
-        if parsed.protocol != IpProtocol::Udp {
-            return Ok(Err(UdpInputParseError::WrongProtocol {
-                version: parsed.version,
-                protocol: parsed.protocol,
-            }));
-        }
-        if parsed.input_error != IpInputError::None
-            || !valid_udp_cursor(parsed.packet_len, parsed.transport_header_offset, cursor)
-        {
-            return Ok(Err(UdpInputParseError::BadLength));
-        }
-
-        let Some(header) = current.get(
-            cursor.transport_header_offset()..cursor.transport_header_offset() + UDP_HEADER_LEN,
-        ) else {
-            return Ok(Err(UdpInputParseError::BadLength));
-        };
-        let source_port = u16::from_be_bytes([header[0], header[1]]);
-        let destination_port = u16::from_be_bytes([header[2], header[3]]);
-        let udp_len = u16::from_be_bytes([header[4], header[5]]) as usize;
-        if !valid_udp_len(
-            cursor.transport_header_offset(),
-            cursor.packet_len(),
-            udp_len,
-        ) {
-            return Ok(Err(UdpInputParseError::BadLength));
-        }
-        (
-            parsed.version,
-            parsed.protocol,
-            source_port,
-            destination_port,
-        )
-    };
-
-    Ok(Ok(ParsedUdpInput {
-        version,
-        protocol,
-        source_port,
-        destination_port,
-    }))
-}
-
-#[inline(always)]
-fn valid_udp_cursor(
-    packet_len: usize,
-    transport_header_offset: usize,
-    cursor: hammer_adapter::BufferPacketCursor,
-) -> bool {
-    cursor.packet_len() == packet_len
-        && cursor.transport_header_offset() == transport_header_offset
+fn valid_udp_cursor(cursor: hammer_adapter::BufferPacketCursor) -> bool {
+    let transport_header_offset = cursor.transport_header_offset();
+    let packet_len = cursor.packet_len();
+    cursor.packet_len() != 0
         && cursor.transport_header_len() >= UDP_HEADER_LEN
         && cursor.transport_payload_offset() >= transport_header_offset + UDP_HEADER_LEN
         && transport_header_offset

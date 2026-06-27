@@ -286,7 +286,7 @@ fn schedule_empty_frame_runs_driver_without_packet_vectors() {
     assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 1);
 
     assert_eq!(calls_for(21), 1);
-    assert_eq!(runtime.packet_buffers().frames_in_use(), 0);
+    assert_eq!(runtime.buffers().frames_in_use(), 0);
 }
 
 #[test]
@@ -363,7 +363,7 @@ fn interrupt_pending_coalesces_empty_driver_dispatch() {
     assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 1);
     assert_eq!(calls_for(31), 1);
     assert_eq!(runtime.nodes().pending_len(), 0);
-    assert_eq!(runtime.packet_buffers().frames_in_use(), 0);
+    assert_eq!(runtime.buffers().frames_in_use(), 0);
 }
 
 #[test]
@@ -408,7 +408,7 @@ fn disabled_node_skips_already_queued_empty_frame() {
 
     assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 0);
     assert_eq!(calls_for(41), 0);
-    assert_eq!(runtime.packet_buffers().frames_in_use(), 0);
+    assert_eq!(runtime.buffers().frames_in_use(), 0);
 }
 
 #[test]

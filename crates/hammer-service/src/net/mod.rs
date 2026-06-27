@@ -1,5 +1,6 @@
 pub mod ip;
 mod lookup;
+mod opaque;
 
 pub use ip::{
     IcmpEchoRequestNext, IcmpEchoRequestNode, IcmpEchoRequestTrace, IcmpErrorNext, IcmpErrorNode,
@@ -17,3 +18,11 @@ pub use lookup::{
     FibTableHandle, IpLookupControlPlane, IpLookupNode, IpLookupTrace, LoadBalance,
     LoadBalanceError, LoadBalanceIndex,
 };
+
+pub(crate) use lookup::wire_ip_lookup_drop;
+pub use opaque::{ForwardingMetadata, IpEcnCodepoint, NetworkOpaque, TapEthernetMetadata};
+
+#[cfg(test)]
+pub(crate) fn reset_ip_main_for_test() {
+    lookup::reset_for_test();
+}

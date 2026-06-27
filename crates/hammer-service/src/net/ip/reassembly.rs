@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::mem::transmute;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -17,9 +18,10 @@ use crate::trace::codec::{
     TraceDecodeCursor, put_option_ip_fragment_key, put_option_node, put_option_u32, put_u8, put_u32,
 };
 
+use crate::net::NetworkOpaque;
 use crate::net::ip::{
-    IpFragmentKey, IpProtocol, IpVersion, ParsedIpFragment, network_for_protocol,
-    parse_ip_fragment_with_chain_len, parse_ip_packet_with_chain_len,
+    IpFragmentKey, IpProtocol, IpVersion, ParsedIpFragment, ip_header, network_for_protocol,
+    parse_ip_fragment_with_chain_len,
 };
 
 const IPV4_HEADER_MIN_LEN: usize = 20;
@@ -573,10 +575,12 @@ impl IpReassemblyRuntime {
         if fragment.payload_offset != 0 {
             return Ok(None);
         }
-        if fragment.payload_offset == 0
-            && let Some(worker) = runtime.handoff_source_worker(index)?
-        {
-            return Ok(Some(worker));
+        if fragment.payload_offset == 0 {
+            let buffer = runtime.get_buffer(index)?;
+            let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
+            if let Some(worker) = network.handoff_source_worker() {
+                return Ok(Some(DataWorkerId::new(u32::from(worker))));
+            }
         }
         Ok(Some(self.current_worker()))
     }
@@ -1015,8 +1019,8 @@ enum ReassemblyInsert {
 #[inline(always)]
 fn refresh_metadata(runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<()> {
     let buffer = runtime.get_buffer(index)?;
-    let parsed =
-        parse_ip_packet_with_chain_len(buffer.current(), buffer.total_len_not_including_first())?;
+    let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
+    let parsed = ip_header(buffer.current(), network.packet_cursor())?;
     drop(buffer);
     match network_for_protocol(parsed.protocol) {
         Some(_) => Ok(()),

@@ -2,6 +2,37 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::ds::FlatHashKey;
 
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+pub struct UdpHeader {
+    source_port: [u8; 2],
+    destination_port: [u8; 2],
+    length: [u8; 2],
+    checksum: [u8; 2],
+}
+
+impl UdpHeader {
+    #[inline(always)]
+    pub fn source_port(self) -> u16 {
+        u16::from_be_bytes(self.source_port)
+    }
+
+    #[inline(always)]
+    pub fn destination_port(self) -> u16 {
+        u16::from_be_bytes(self.destination_port)
+    }
+
+    #[inline(always)]
+    pub fn length(self) -> usize {
+        usize::from(u16::from_be_bytes(self.length))
+    }
+
+    #[inline(always)]
+    pub fn checksum(self) -> u16 {
+        u16::from_be_bytes(self.checksum)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TransportConnectionKey<A = IpAddr> {
     scope_id: u32,

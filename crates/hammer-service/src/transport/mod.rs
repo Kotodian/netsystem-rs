@@ -1,7 +1,8 @@
-use std::sync::OnceLock;
+use std::sync::Arc;
 
+use arc_swap::ArcSwapOption;
 use hammer_core::config::network::CongestionController;
-use hammer_core::error::{HammerError, HammerResult};
+use hammer_core::error::HammerResult;
 use hammer_core::registry::RuntimeRegistry;
 
 pub mod congestion;
@@ -22,13 +23,22 @@ impl TransportMain {
     }
 }
 
-pub static TRANSPORT_MAIN: OnceLock<TransportMain> = OnceLock::new();
+// VPP alignment: `transport_main_t transport_main;` is a file-scope global in
+// VPP's `transport.c`; nodes read it via `&transport_main` (lock-free direct
+// deref). `transport_init` fills it once and `vlib_test_cleanup` resets it
+// between tests. The Rust mirror is a `pub static ArcSwapOption<TransportMain>`:
+// `.load()` is lock-free on the hot path, and `store(None)` makes it resettable
+// for test isolation — neither of which `OnceLock` provides.
+pub static TRANSPORT_MAIN: ArcSwapOption<TransportMain> = ArcSwapOption::const_empty();
+
+#[cfg(test)]
+pub(crate) fn reset_for_test() {
+    TRANSPORT_MAIN.store(None);
+}
 
 pub fn init(reg: &RuntimeRegistry) -> HammerResult<()> {
     let config = reg.require::<hammer_core::config::Config>()?;
-    TRANSPORT_MAIN
-        .set(TransportMain::new(config.network.tcp.congestion))
-        .map_err(|_| HammerError::internal("transport main already initialized"))?;
+    TRANSPORT_MAIN.store(Some(Arc::new(TransportMain::new(config.network.tcp.congestion))));
     Ok(())
 }
 
@@ -42,7 +52,8 @@ fn init_transport(reg: &RuntimeRegistry) -> HammerResult<()> {
 macro_rules! with_congestion {
     (|$cc:ident| $body:expr) => {{
         match crate::transport::TRANSPORT_MAIN
-            .get()
+            .load()
+            .as_deref()
             .ok_or_else(|| {
                 ::hammer_core::error::CoreError::internal("transport main not initialized")
             })?

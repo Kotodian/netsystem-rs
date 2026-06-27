@@ -1,10 +1,8 @@
 use core::mem::{align_of, size_of, transmute};
 
-use crate::BufferPacketCursor;
+use hammer_adapter::{BufferPacketCursor, PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES};
 use hammer_core::forwarding::DpoType;
 pub use hammer_core::protocol::ip_ecn::IpEcnCodepoint;
-
-use super::opaque::{PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TapEthernetMetadata {
@@ -44,53 +42,6 @@ pub struct ForwardingMetadata {
     pub bucket_index: u16,
     pub dpo_type: DpoType,
     pub dpo_index: u32,
-}
-
-#[derive(Clone, Copy)]
-#[repr(C, align(8))]
-union NetworkPayloadStorage {
-    words64: [u64; 3],
-    words32: [u32; 6],
-    bytes: [u8; 24],
-}
-
-#[derive(Clone, Copy)]
-#[repr(C, align(8))]
-pub struct NetworkPayloadOpaque {
-    storage: NetworkPayloadStorage,
-}
-
-impl NetworkPayloadOpaque {
-    #[inline]
-    pub fn clear(&mut self) {
-        self.storage = NetworkPayloadStorage { words64: [0; 3] };
-    }
-
-    #[inline]
-    pub fn write<P: Copy>(&mut self, payload: P) {
-        const {
-            assert!(size_of::<P>() == size_of::<NetworkPayloadOpaque>());
-            assert!(align_of::<P>() <= align_of::<NetworkPayloadOpaque>());
-        }
-        unsafe { (self as *mut Self).cast::<P>().write(payload) };
-    }
-
-    #[inline]
-    pub fn read<P: Copy>(&self) -> P {
-        const {
-            assert!(size_of::<P>() == size_of::<NetworkPayloadOpaque>());
-            assert!(align_of::<P>() <= align_of::<NetworkPayloadOpaque>());
-        }
-        unsafe { (self as *const Self).cast::<P>().read() }
-    }
-}
-
-impl Default for NetworkPayloadOpaque {
-    fn default() -> Self {
-        Self {
-            storage: NetworkPayloadStorage { words64: [0; 3] },
-        }
-    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -170,24 +121,17 @@ impl NetworkIpOpaque {
 
     #[inline]
     pub fn ip_ecn(&self) -> Option<u8> {
-        if self.ip_ecn_valid == 0 {
-            None
-        } else {
-            Some(self.ip_ecn)
-        }
+        (self.ip_ecn_valid != 0).then_some(self.ip_ecn)
     }
 
     #[inline]
     pub fn set_ip_ecn(&mut self, ecn: Option<u8>) {
-        match ecn {
-            Some(value) => {
-                self.ip_ecn = value;
-                self.ip_ecn_valid = 1;
-            }
-            None => {
-                self.ip_ecn = 0;
-                self.ip_ecn_valid = 0;
-            }
+        if let Some(value) = ecn {
+            self.ip_ecn = value;
+            self.ip_ecn_valid = 1;
+        } else {
+            self.ip_ecn = 0;
+            self.ip_ecn_valid = 0;
         }
     }
 }
@@ -221,22 +165,11 @@ impl NetworkReassemblyOpaque {
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub union NetworkOpaqueOverlay {
-    pub payload: NetworkPayloadOpaque,
-    pub ip: NetworkIpOpaque,
-    pub reass: NetworkReassemblyOpaque,
+    ip: NetworkIpOpaque,
+    reass: NetworkReassemblyOpaque,
 }
 
 impl NetworkOpaqueOverlay {
-    #[inline]
-    pub fn payload(&self) -> &NetworkPayloadOpaque {
-        unsafe { transmute::<&NetworkOpaqueOverlay, &NetworkPayloadOpaque>(self) }
-    }
-
-    #[inline]
-    pub fn payload_mut(&mut self) -> &mut NetworkPayloadOpaque {
-        unsafe { transmute::<&mut NetworkOpaqueOverlay, &mut NetworkPayloadOpaque>(self) }
-    }
-
     #[inline]
     pub fn ip(&self) -> &NetworkIpOpaque {
         unsafe { transmute::<&NetworkOpaqueOverlay, &NetworkIpOpaque>(self) }
@@ -261,7 +194,7 @@ impl NetworkOpaqueOverlay {
 impl Default for NetworkOpaqueOverlay {
     fn default() -> Self {
         Self {
-            payload: NetworkPayloadOpaque::default(),
+            ip: NetworkIpOpaque::default(),
         }
     }
 }
@@ -296,16 +229,6 @@ impl Default for NetworkOpaque {
 }
 
 impl NetworkOpaque {
-    #[inline]
-    pub fn payload(&self) -> &NetworkPayloadOpaque {
-        self.overlay.payload()
-    }
-
-    #[inline]
-    pub fn payload_mut(&mut self) -> &mut NetworkPayloadOpaque {
-        self.overlay.payload_mut()
-    }
-
     #[inline]
     pub fn ip(&self) -> &NetworkIpOpaque {
         self.overlay.ip()
@@ -344,14 +267,24 @@ impl NetworkOpaque {
 
     #[inline]
     pub fn set_packet_cursor(&mut self, cursor: BufferPacketCursor) {
-        self.l3_hdr_offset = cursor.network_header_offset as i16;
-        self.l4_hdr_offset = cursor.transport_header_offset as i16;
+        self.l3_hdr_offset = i16::try_from(cursor.network_header_offset())
+            .expect("network header offset exceeds i16");
+        self.l4_hdr_offset = i16::try_from(cursor.transport_header_offset())
+            .expect("transport header offset exceeds i16");
 
         let ip = self.ip_mut();
-        ip.set_packet_len(cursor.packet_len);
-        ip.set_network_header_len(cursor.network_header_len);
-        ip.set_transport_header_len(cursor.transport_header_len);
-        ip.set_transport_payload_offset(cursor.transport_payload_offset);
+        ip.set_packet_len(u32::try_from(cursor.packet_len()).expect("packet length exceeds u32"));
+        ip.set_network_header_len(
+            u16::try_from(cursor.network_header_len()).expect("network header length exceeds u16"),
+        );
+        ip.set_transport_header_len(
+            u16::try_from(cursor.transport_header_len())
+                .expect("transport header length exceeds u16"),
+        );
+        ip.set_transport_payload_offset(
+            u16::try_from(cursor.transport_payload_offset())
+                .expect("transport payload offset exceeds u16"),
+        );
     }
 
     #[inline]

@@ -2,7 +2,6 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use hammer_core::protocol::ip::{
     IpFragmentKey, parse_ip_fragment, parse_ip_fragment_with_chain_len,
-    parse_ip_packet_with_chain_len,
 };
 
 #[test]
@@ -65,17 +64,6 @@ fn parse_ipv6_fragment_accepts_payload_spanning_buffer_chain() {
             identification: 0x0102_0304,
         }
     );
-}
-
-#[test]
-fn parse_ipv6_packet_rejects_short_chained_packet() {
-    let packet = ipv6_udp_packet(
-        Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 1),
-        Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 2),
-        b"payload",
-    );
-
-    assert!(parse_ip_packet_with_chain_len(&packet[..40], packet.len() - 41).is_err());
 }
 
 fn ipv4_udp_packet(source: [u8; 4], destination: [u8; 4], payload: &[u8]) -> Vec<u8> {

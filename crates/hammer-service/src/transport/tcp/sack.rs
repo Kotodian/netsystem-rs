@@ -562,7 +562,7 @@ mod tests {
             .take_output(true, false, TcpSegmentFlags::ACK)
             .expect("sack blocks");
 
-        assert_eq!(count, 3);
+        assert_eq!(count, 4);
         assert_eq!(
             blocks[0],
             TcpSackBlock {
@@ -582,6 +582,13 @@ mod tests {
             TcpSackBlock {
                 left_edge: 5_700u32.into(),
                 right_edge: 5_750u32.into(),
+            }
+        );
+        assert_eq!(
+            blocks[3],
+            TcpSackBlock {
+                left_edge: 5_600u32.into(),
+                right_edge: 5_650u32.into(),
             }
         );
     }

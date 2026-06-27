@@ -4,24 +4,25 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, InternalNode, NetworkOpaque,
-    Node, NodeId, NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
-    SecondaryOpaque, TraceFormatter, add_packet_trace,
+    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, InternalNode, Node, NodeId,
+    NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace, SecondaryOpaque,
+    TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::{
-    IcmpBuildError, IcmpErrorFamily, IcmpErrorMetadata, IcmpGeneratedPacket, build_echo_reply,
-    build_icmp_error_packet,
+    IcmpBuildError, IcmpErrorFamily, IcmpErrorMetadata, IcmpGeneratedPacket, IcmpHeader,
+    build_echo_reply, build_icmp_error_packet,
 };
-use hammer_infra::vec::Vec;
+use hammer_core::protocol::wire::read_header;
 
 use crate::data_plane::set_index_node_error_code;
+use crate::net::NetworkOpaque;
 use crate::trace::codec::{
     TraceDecodeCursor, put_node, put_option_icmp_error_family, put_option_ip_version,
     put_option_u16, put_option_u32, put_option_usize, put_u8,
 };
 
-use super::{IpProtocol, IpVersion, parse_ip_packet_with_chain_len};
+use super::{IpInputError, IpProtocol, IpVersion, ip_header};
 
 const ICMP_HEADER_MIN_LEN: usize = 4;
 const ICMP_ECHO_HEADER_LEN: usize = 8;
@@ -593,8 +594,6 @@ pub struct IcmpInputNode {
     #[node(default = register_icmp_input_runtime(snapshot.clone()))]
     runtime_data: NodeRuntimeData,
     snapshot: IcmpInputSnapshotHandle,
-    #[node(default)]
-    cached_next: Option<NodeId>,
 }
 
 impl Node for IcmpInputNode {
@@ -605,9 +604,7 @@ impl Node for IcmpInputNode {
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         let snapshot = self.snapshot.load();
-        hammer_adapter::node_route_frame_index_cached!(self, runtime, frame, |index| Ok(Some(
-            next_node_for_index(runtime, index, &snapshot)?
-        )))
+        icmp_input_process_frame(runtime, frame, &snapshot)
     }
 
     #[inline]
@@ -635,10 +632,7 @@ pub enum IcmpEchoRequestNext {
 }
 
 #[hammer_component_macros::node(role = internal, next = IcmpEchoRequestNext)]
-pub struct IcmpEchoRequestNode {
-    #[node(default)]
-    cached_next: Option<NodeId>,
-}
+pub struct IcmpEchoRequestNode;
 
 impl Node for IcmpEchoRequestNode {
     #[inline(always)]
@@ -648,9 +642,7 @@ impl Node for IcmpEchoRequestNode {
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         let next = Self::runtime_nexts(runtime)?;
-        hammer_adapter::node_route_frame_index_cached!(self, runtime, frame, |index| Ok(Some(
-            next_node_for_echo_request_index(runtime, index, next)?
-        )))
+        icmp_echo_request_process_frame(runtime, frame, next)
     }
 
     #[inline]
@@ -700,9 +692,7 @@ fn icmp_input_process(
 ) -> CoreResult<NodeResult> {
     let state = icmp_input_runtime(data)?;
     let snapshot = state.snapshot.load();
-    hammer_adapter::node_route_frame_index_static!(None, runtime, frame, |index| Ok(Some(
-        next_node_for_index(runtime, index, &snapshot)?
-    )))
+    icmp_input_process_frame(runtime, frame, &snapshot)
 }
 
 fn icmp_echo_request_process(
@@ -711,9 +701,7 @@ fn icmp_echo_request_process(
     frame: &mut BufferFrame,
 ) -> CoreResult<NodeResult> {
     let next = IcmpEchoRequestNode::runtime_nexts(runtime)?;
-    hammer_adapter::node_route_frame_index_static!(None, runtime, frame, |index| Ok(Some(
-        next_node_for_echo_request_index(runtime, index, next)?
-    )))
+    icmp_echo_request_process_frame(runtime, frame, next)
 }
 
 #[hammer_component_macros::node_next]
@@ -728,8 +716,6 @@ pub struct IcmpErrorNode {
     runtime_data: NodeRuntimeData,
     #[node(default)]
     source_table: Option<IcmpErrorSourceTableHandle>,
-    #[node(default)]
-    cached_next: Option<NodeId>,
 }
 
 impl IcmpErrorNode {
@@ -754,17 +740,8 @@ impl Node for IcmpErrorNode {
             .source_table
             .as_ref()
             .map(IcmpErrorSourceTableHandle::load);
-        hammer_adapter::node_route_frame_index_cached!(self, runtime, frame, |index| {
-            let source_table = source_table
-                .as_ref()
-                .map(|source_table| source_table.as_ref());
-            Ok(Some(next_node_for_icmp_error_index(
-                runtime,
-                index,
-                next,
-                source_table,
-            )?))
-        })
+        let source_table = source_table.as_deref().map(|arc| &**arc);
+        icmp_error_process_frame(runtime, frame, next, source_table)
     }
 
     #[inline]
@@ -841,17 +818,273 @@ fn icmp_error_process(
         .source_table
         .as_ref()
         .map(IcmpErrorSourceTableHandle::load);
-    hammer_adapter::node_route_frame_index_static!(None, runtime, frame, |index| {
-        let source_table = source_table
-            .as_ref()
-            .map(|source_table| source_table.as_ref());
-        Ok(Some(next_node_for_icmp_error_index(
+    let source_table = source_table.as_deref().map(|arc| &**arc);
+    icmp_error_process_frame(runtime, frame, next, source_table)
+}
+
+fn icmp_input_process_frame(
+    runtime: &DataPlaneRuntime,
+    frame: &mut BufferFrame,
+    snapshot: &IcmpInputSnapshot,
+) -> CoreResult<NodeResult> {
+    let indices = frame.pending_indices();
+    let mut next_frames = hammer_adapter::NodeNextFrames::default();
+    let mut read = 0usize;
+    let len = indices.len();
+    while read + 4 <= len {
+        if read + 4 < len {
+            runtime.prefetch_header(indices[read + 4]);
+        }
+        if read + 5 < len {
+            runtime.prefetch_header(indices[read + 5]);
+        }
+        if read + 6 < len {
+            runtime.prefetch_header(indices[read + 6]);
+        }
+        if read + 7 < len {
+            runtime.prefetch_header(indices[read + 7]);
+        }
+        let index0 = indices[read];
+        let index1 = indices[read + 1];
+        let index2 = indices[read + 2];
+        let index3 = indices[read + 3];
+        runtime.prefetch_read(index0);
+        runtime.prefetch_read(index1);
+        runtime.prefetch_read(index2);
+        runtime.prefetch_read(index3);
+        next_frames.enqueue(
             runtime,
-            index,
-            next,
-            source_table,
-        )?))
-    })
+            next_node_for_index(runtime, index0, snapshot)?,
+            index0,
+        )?;
+        next_frames.enqueue(
+            runtime,
+            next_node_for_index(runtime, index1, snapshot)?,
+            index1,
+        )?;
+        next_frames.enqueue(
+            runtime,
+            next_node_for_index(runtime, index2, snapshot)?,
+            index2,
+        )?;
+        next_frames.enqueue(
+            runtime,
+            next_node_for_index(runtime, index3, snapshot)?,
+            index3,
+        )?;
+        read += 4;
+    }
+    if read + 2 <= len {
+        if read + 2 < len {
+            runtime.prefetch_header(indices[read + 2]);
+        }
+        if read + 3 < len {
+            runtime.prefetch_header(indices[read + 3]);
+        }
+        let index0 = indices[read];
+        let index1 = indices[read + 1];
+        runtime.prefetch_read(index0);
+        runtime.prefetch_read(index1);
+        next_frames.enqueue(
+            runtime,
+            next_node_for_index(runtime, index0, snapshot)?,
+            index0,
+        )?;
+        next_frames.enqueue(
+            runtime,
+            next_node_for_index(runtime, index1, snapshot)?,
+            index1,
+        )?;
+        read += 2;
+    }
+    while read < len {
+        if read + 1 < len {
+            runtime.prefetch_header(indices[read + 1]);
+        }
+        let index = indices[read];
+        runtime.prefetch_read(index);
+        let node = next_node_for_index(runtime, index, snapshot)?;
+        next_frames.enqueue(runtime, node, index)?;
+        read += 1;
+    }
+    next_frames.finish(runtime, frame)
+}
+
+fn icmp_echo_request_process_frame(
+    runtime: &DataPlaneRuntime,
+    frame: &mut BufferFrame,
+    next: [NodeId; IcmpEchoRequestNext::COUNT],
+) -> CoreResult<NodeResult> {
+    let indices = frame.pending_indices();
+    let mut next_frames = hammer_adapter::NodeNextFrames::default();
+    let mut read = 0usize;
+    let len = indices.len();
+    while read + 4 <= len {
+        if read + 4 < len {
+            runtime.prefetch_header(indices[read + 4]);
+        }
+        if read + 5 < len {
+            runtime.prefetch_header(indices[read + 5]);
+        }
+        if read + 6 < len {
+            runtime.prefetch_header(indices[read + 6]);
+        }
+        if read + 7 < len {
+            runtime.prefetch_header(indices[read + 7]);
+        }
+        let index0 = indices[read];
+        let index1 = indices[read + 1];
+        let index2 = indices[read + 2];
+        let index3 = indices[read + 3];
+        runtime.prefetch_read(index0);
+        runtime.prefetch_read(index1);
+        runtime.prefetch_read(index2);
+        runtime.prefetch_read(index3);
+        next_frames.enqueue(
+            runtime,
+            next_node_for_echo_request_index(runtime, index0, next)?,
+            index0,
+        )?;
+        next_frames.enqueue(
+            runtime,
+            next_node_for_echo_request_index(runtime, index1, next)?,
+            index1,
+        )?;
+        next_frames.enqueue(
+            runtime,
+            next_node_for_echo_request_index(runtime, index2, next)?,
+            index2,
+        )?;
+        next_frames.enqueue(
+            runtime,
+            next_node_for_echo_request_index(runtime, index3, next)?,
+            index3,
+        )?;
+        read += 4;
+    }
+    if read + 2 <= len {
+        if read + 2 < len {
+            runtime.prefetch_header(indices[read + 2]);
+        }
+        if read + 3 < len {
+            runtime.prefetch_header(indices[read + 3]);
+        }
+        let index0 = indices[read];
+        let index1 = indices[read + 1];
+        runtime.prefetch_read(index0);
+        runtime.prefetch_read(index1);
+        next_frames.enqueue(
+            runtime,
+            next_node_for_echo_request_index(runtime, index0, next)?,
+            index0,
+        )?;
+        next_frames.enqueue(
+            runtime,
+            next_node_for_echo_request_index(runtime, index1, next)?,
+            index1,
+        )?;
+        read += 2;
+    }
+    while read < len {
+        if read + 1 < len {
+            runtime.prefetch_header(indices[read + 1]);
+        }
+        let index = indices[read];
+        runtime.prefetch_read(index);
+        let node = next_node_for_echo_request_index(runtime, index, next)?;
+        next_frames.enqueue(runtime, node, index)?;
+        read += 1;
+    }
+    next_frames.finish(runtime, frame)
+}
+
+fn icmp_error_process_frame(
+    runtime: &DataPlaneRuntime,
+    frame: &mut BufferFrame,
+    next: [NodeId; IcmpErrorNext::COUNT],
+    source_table: Option<&IcmpErrorSourceSnapshot>,
+) -> CoreResult<NodeResult> {
+    let indices = frame.pending_indices();
+    let mut next_frames = hammer_adapter::NodeNextFrames::default();
+    let mut read = 0usize;
+    let len = indices.len();
+    while read + 4 <= len {
+        if read + 4 < len {
+            runtime.prefetch_header(indices[read + 4]);
+        }
+        if read + 5 < len {
+            runtime.prefetch_header(indices[read + 5]);
+        }
+        if read + 6 < len {
+            runtime.prefetch_header(indices[read + 6]);
+        }
+        if read + 7 < len {
+            runtime.prefetch_header(indices[read + 7]);
+        }
+        let index0 = indices[read];
+        let index1 = indices[read + 1];
+        let index2 = indices[read + 2];
+        let index3 = indices[read + 3];
+        runtime.prefetch_read(index0);
+        runtime.prefetch_read(index1);
+        runtime.prefetch_read(index2);
+        runtime.prefetch_read(index3);
+        next_frames.enqueue(
+            runtime,
+            next_node_for_icmp_error_index(runtime, index0, next, source_table)?,
+            index0,
+        )?;
+        next_frames.enqueue(
+            runtime,
+            next_node_for_icmp_error_index(runtime, index1, next, source_table)?,
+            index1,
+        )?;
+        next_frames.enqueue(
+            runtime,
+            next_node_for_icmp_error_index(runtime, index2, next, source_table)?,
+            index2,
+        )?;
+        next_frames.enqueue(
+            runtime,
+            next_node_for_icmp_error_index(runtime, index3, next, source_table)?,
+            index3,
+        )?;
+        read += 4;
+    }
+    if read + 2 <= len {
+        if read + 2 < len {
+            runtime.prefetch_header(indices[read + 2]);
+        }
+        if read + 3 < len {
+            runtime.prefetch_header(indices[read + 3]);
+        }
+        let index0 = indices[read];
+        let index1 = indices[read + 1];
+        runtime.prefetch_read(index0);
+        runtime.prefetch_read(index1);
+        next_frames.enqueue(
+            runtime,
+            next_node_for_icmp_error_index(runtime, index0, next, source_table)?,
+            index0,
+        )?;
+        next_frames.enqueue(
+            runtime,
+            next_node_for_icmp_error_index(runtime, index1, next, source_table)?,
+            index1,
+        )?;
+        read += 2;
+    }
+    while read < len {
+        if read + 1 < len {
+            runtime.prefetch_header(indices[read + 1]);
+        }
+        let index = indices[read];
+        runtime.prefetch_read(index);
+        let node = next_node_for_icmp_error_index(runtime, index, next, source_table)?;
+        next_frames.enqueue(runtime, node, index)?;
+        read += 1;
+    }
+    next_frames.finish(runtime, frame)
 }
 
 #[inline(always)]
@@ -860,11 +1093,13 @@ fn next_node_for_index(
     index: BufferIndex,
     snapshot: &IcmpInputSnapshot,
 ) -> CoreResult<NodeId> {
-    let packet = runtime.copy_packet(index)?;
-    let packet = packet.as_ref();
-    let parsed = match parse_ip_packet_with_chain_len(packet, 0) {
+    let buffer = runtime.get_buffer(index)?;
+    let current = buffer.current();
+    let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
+    let parsed = match ip_header(current, network.packet_cursor()) {
         Ok(parsed) => parsed,
         Err(_) => {
+            drop(buffer);
             let error = IcmpInputError::BadLength.code();
             set_index_node_error_code(runtime, index, error)?;
             let next = snapshot.default_next(IpVersion::V4);
@@ -884,9 +1119,27 @@ fn next_node_for_index(
     };
     let version = parsed.version;
     let default_next = snapshot.default_next(version);
+    if parsed.input_error != IpInputError::None {
+        drop(buffer);
+        let error = IcmpInputError::BadLength.code();
+        set_index_node_error_code(runtime, index, error)?;
+        add_packet_trace!(
+            runtime,
+            index,
+            IcmpInputTrace {
+                version: Some(version),
+                icmp_type: None,
+                code: None,
+                error: Some(error),
+                next: default_next,
+            },
+        )?;
+        return Ok(default_next);
+    }
     match parsed.protocol {
         IpProtocol::Icmpv4 | IpProtocol::Icmpv6 => {}
         IpProtocol::Tcp | IpProtocol::Udp | IpProtocol::Other(_) => {
+            drop(buffer);
             let error = IcmpInputError::WrongProtocol.code();
             set_index_node_error_code(runtime, index, error)?;
             add_packet_trace!(
@@ -903,7 +1156,10 @@ fn next_node_for_index(
             return Ok(default_next);
         }
     }
-    let Some(icmp) = packet.get(parsed.transport_header_offset..parsed.packet_len) else {
+    let Some(icmp) =
+        current.get(parsed.transport_header_offset..parsed.packet_len.min(current.len()))
+    else {
+        drop(buffer);
         let error = IcmpInputError::BadLength.code();
         set_index_node_error_code(runtime, index, error)?;
         add_packet_trace!(
@@ -919,7 +1175,28 @@ fn next_node_for_index(
         )?;
         return Ok(default_next);
     };
+    let header = match read_header::<IcmpHeader>(current, parsed.transport_header_offset) {
+        Ok(header) => header,
+        Err(_) => {
+            drop(buffer);
+            let error = IcmpInputError::BadLength.code();
+            set_index_node_error_code(runtime, index, error)?;
+            add_packet_trace!(
+                runtime,
+                index,
+                IcmpInputTrace {
+                    version: Some(version),
+                    icmp_type: None,
+                    code: None,
+                    error: Some(error),
+                    next: default_next,
+                },
+            )?;
+            return Ok(default_next);
+        }
+    };
     if icmp.len() < ICMP_HEADER_MIN_LEN {
+        drop(buffer);
         let error = IcmpInputError::BadLength.code();
         set_index_node_error_code(runtime, index, error)?;
         add_packet_trace!(
@@ -936,10 +1213,11 @@ fn next_node_for_index(
         return Ok(default_next);
     }
 
-    let icmp_type = icmp[0];
-    let code = icmp[1];
+    let icmp_type = header.icmp_type();
+    let code = header.code();
     let key = IcmpInputKey { version, icmp_type };
     if snapshot.next_for_type(version, icmp_type).is_none() {
+        drop(buffer);
         let error = IcmpInputError::UnknownType.code();
         set_index_node_error_code(runtime, index, error)?;
         let next = NodeNextStorage::next(snapshot, key);
@@ -958,6 +1236,7 @@ fn next_node_for_index(
     }
     let spec = snapshot.spec(version, icmp_type);
     if code > spec.max_code {
+        drop(buffer);
         let error = IcmpInputError::BadCode.code();
         set_index_node_error_code(runtime, index, error)?;
         add_packet_trace!(
@@ -974,6 +1253,7 @@ fn next_node_for_index(
         return Ok(default_next);
     }
     if icmp.len() < spec.min_len {
+        drop(buffer);
         let error = IcmpInputError::TooShort.code();
         set_index_node_error_code(runtime, index, error)?;
         add_packet_trace!(
@@ -990,10 +1270,11 @@ fn next_node_for_index(
         return Ok(default_next);
     }
     if version == IpVersion::V6
-        && packet
+        && current
             .get(7)
             .is_some_and(|hop_limit| *hop_limit < spec.min_hop_limit)
     {
+        drop(buffer);
         let error = IcmpInputError::HopLimit.code();
         set_index_node_error_code(runtime, index, error)?;
         add_packet_trace!(
@@ -1010,6 +1291,7 @@ fn next_node_for_index(
         return Ok(default_next);
     }
 
+    drop(buffer);
     runtime.get_buffer_mut(index)?.clear_node_error();
     let next = NodeNextStorage::next(snapshot, key);
     add_packet_trace!(
@@ -1032,11 +1314,17 @@ fn next_node_for_echo_request_index(
     index: BufferIndex,
     next: [NodeId; IcmpEchoRequestNext::COUNT],
 ) -> CoreResult<NodeId> {
-    let packet = runtime.copy_packet(index)?;
+    let packet = collect_current_chain_for_icmp_generation(runtime, index)?;
     match build_echo_reply(packet.as_ref()) {
         Ok(generated) => {
             let generated_len = generated.packet.len();
-            replace_current_chain(runtime, index, &generated.packet)?;
+            {
+                let mut buffer = runtime.get_buffer_mut(index)?;
+                buffer.truncate(0)?;
+                let dst = buffer.writable_tail_mut();
+                dst[..generated.packet.len()].copy_from_slice(&generated.packet);
+                buffer.commit_writable_tail(generated.packet.len())?;
+            }
             refresh_generated_icmp_metadata(runtime, index, &generated)?;
             let resolved = NodeNextStorage::next(&next, IcmpEchoRequestNext::Lookup);
             add_packet_trace!(
@@ -1135,11 +1423,17 @@ fn next_node_for_icmp_error_index(
         )?;
         return Ok(resolved);
     };
-    let original = runtime.copy_packet(index)?;
+    let original = collect_current_chain_for_icmp_generation(runtime, index)?;
     match build_icmp_error_packet(original.as_ref(), metadata, local_source) {
         Ok(generated) => {
             let generated_len = generated.packet.len();
-            replace_current_chain(runtime, index, &generated.packet)?;
+            {
+                let mut buffer = runtime.get_buffer_mut(index)?;
+                buffer.truncate(0)?;
+                let dst = buffer.writable_tail_mut();
+                dst[..generated.packet.len()].copy_from_slice(&generated.packet);
+                buffer.commit_writable_tail(generated.packet.len())?;
+            }
             refresh_generated_icmp_metadata(runtime, index, &generated)?;
             let resolved = NodeNextStorage::next(&next, IcmpErrorNext::Lookup);
             add_packet_trace!(
@@ -1178,13 +1472,17 @@ fn next_node_for_icmp_error_index(
 }
 
 #[inline(always)]
-fn replace_current_chain(
+fn collect_current_chain_for_icmp_generation(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
-    packet: &[u8],
-) -> CoreResult<()> {
-    runtime.truncate_current(index, 0)?;
-    runtime.append(index, packet)
+) -> CoreResult<hammer_infra::vec::Vec<u8>> {
+    let mut bytes = hammer_infra::vec::Vec::new();
+    let mut chain = runtime.chain(index);
+    while let Some(buffer) = chain.next() {
+        let buffer = buffer?;
+        bytes.extend_from_copy_slice(buffer.current());
+    }
+    Ok(bytes)
 }
 
 #[inline(always)]
@@ -1196,7 +1494,7 @@ fn refresh_generated_icmp_metadata(
     let mut buffer = runtime.get_buffer_mut(index)?;
     let packet_len = generated.packet.len();
     buffer.clear_node_error();
-    buffer.set_packet_cursor(
+    unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }.set_packet_cursor(
         BufferPacketCursor::new()
             .with_packet_len(packet_len)
             .with_network_header(0, generated.network_header_len)

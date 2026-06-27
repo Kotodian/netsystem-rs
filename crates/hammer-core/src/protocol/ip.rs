@@ -1,7 +1,7 @@
-use std::mem::{size_of, transmute};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::error::{CoreError, CoreResult};
+use crate::protocol::wire::read_header;
 use hammer_infra::checksum::internet_checksum;
 
 const IPV4_HEADER_MIN_LEN: usize = 20;
@@ -113,7 +113,7 @@ pub enum IpFragmentKey {
 
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
-struct Ipv4Header {
+pub struct Ipv4Header {
     version_ihl: u8,
     dscp_ecn: u8,
     total_len: [u8; 2],
@@ -128,44 +128,49 @@ struct Ipv4Header {
 
 impl Ipv4Header {
     #[inline(always)]
-    fn version(self) -> u8 {
+    pub fn version(self) -> u8 {
         self.version_ihl >> 4
     }
 
     #[inline(always)]
-    fn header_len(self) -> usize {
+    pub fn header_len(self) -> usize {
         usize::from(self.version_ihl & 0x0f) * 4
     }
 
     #[inline(always)]
-    fn total_len(self) -> usize {
+    pub fn total_len(self) -> usize {
         usize::from(u16::from_be_bytes(self.total_len))
     }
 
     #[inline(always)]
-    fn identification(self) -> u16 {
+    pub fn identification(self) -> u16 {
         u16::from_be_bytes(self.identification)
     }
 
     #[inline(always)]
-    fn flags_fragment(self) -> u16 {
+    pub fn flags_fragment(self) -> u16 {
         u16::from_be_bytes(self.flags_fragment)
     }
 
     #[inline(always)]
-    fn source(self) -> Ipv4Addr {
+    pub fn protocol(self) -> u8 {
+        self.protocol
+    }
+
+    #[inline(always)]
+    pub fn source(self) -> Ipv4Addr {
         Ipv4Addr::from(self.source)
     }
 
     #[inline(always)]
-    fn destination(self) -> Ipv4Addr {
+    pub fn destination(self) -> Ipv4Addr {
         Ipv4Addr::from(self.destination)
     }
 }
 
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
-struct Ipv6Header {
+pub struct Ipv6Header {
     version_traffic_flow: [u8; 4],
     payload_len: [u8; 2],
     next_header: u8,
@@ -176,29 +181,34 @@ struct Ipv6Header {
 
 impl Ipv6Header {
     #[inline(always)]
-    fn version(self) -> u8 {
+    pub fn version(self) -> u8 {
         self.version_traffic_flow[0] >> 4
     }
 
     #[inline(always)]
-    fn payload_len(self) -> usize {
+    pub fn payload_len(self) -> usize {
         usize::from(u16::from_be_bytes(self.payload_len))
     }
 
     #[inline(always)]
-    fn source(self) -> Ipv6Addr {
+    pub fn next_protocol(self) -> u8 {
+        self.next_header
+    }
+
+    #[inline(always)]
+    pub fn source(self) -> Ipv6Addr {
         Ipv6Addr::from(self.source)
     }
 
     #[inline(always)]
-    fn destination(self) -> Ipv6Addr {
+    pub fn destination(self) -> Ipv6Addr {
         Ipv6Addr::from(self.destination)
     }
 }
 
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
-struct Ipv6FragmentHeader {
+pub struct Ipv6FragmentHeader {
     next_header: u8,
     reserved: u8,
     offset_more: [u8; 2],
@@ -207,31 +217,28 @@ struct Ipv6FragmentHeader {
 
 impl Ipv6FragmentHeader {
     #[inline(always)]
-    fn offset_more(self) -> u16 {
+    pub fn next_protocol(self) -> u8 {
+        self.next_header
+    }
+
+    #[inline(always)]
+    pub fn offset_more(self) -> u16 {
         u16::from_be_bytes(self.offset_more)
     }
 
     #[inline(always)]
-    fn identification(self) -> u32 {
+    pub fn identification(self) -> u32 {
         u32::from_be_bytes(self.identification)
     }
 }
 
-pub fn parse_ip_packet(packet: &[u8]) -> CoreResult<ParsedIpPacket> {
-    parse_ip_packet_with_chain_len(packet, 0)
-}
-
-pub fn parse_ip_packet_with_chain_len(
-    packet: &[u8],
-    tail_len: usize,
-) -> CoreResult<ParsedIpPacket> {
+pub fn parse_ip_header(packet: &[u8]) -> CoreResult<ParsedIpPacket> {
     let Some(first) = packet.first().copied() else {
         return Err(CoreError::internal("empty IP packet"));
     };
-    let chain_len = packet.len().saturating_add(tail_len);
     match first >> 4 {
-        4 => parse_ipv4_packet_header(packet, chain_len),
-        6 => parse_ipv6_packet_header(packet, chain_len),
+        4 => parse_ipv4_packet_header(packet),
+        6 => parse_ipv6_packet_header(packet),
         other => Err(CoreError::internal(format!(
             "unsupported IP version: {other}"
         ))),
@@ -260,9 +267,9 @@ pub fn parse_ip_fragment_with_chain_len(
 }
 
 #[inline(always)]
-fn parse_ipv4_packet_header(packet: &[u8], chain_len: usize) -> CoreResult<ParsedIpPacket> {
-    let header = transmute_packed::<Ipv4Header>(packet, 0)
-        .ok_or_else(|| CoreError::internal("ipv4 header is too short"))?;
+fn parse_ipv4_packet_header(packet: &[u8]) -> CoreResult<ParsedIpPacket> {
+    let header = read_header::<Ipv4Header>(packet, 0)
+        .map_err(|_| CoreError::internal("ipv4 header is too short"))?;
     if header.version() != 4 {
         return Err(CoreError::internal("invalid ipv4 version"));
     }
@@ -272,7 +279,7 @@ fn parse_ipv4_packet_header(packet: &[u8], chain_len: usize) -> CoreResult<Parse
     }
 
     let total_len = header.total_len();
-    if total_len < ihl || total_len > chain_len {
+    if total_len < ihl {
         return Err(CoreError::internal("invalid ipv4 packet length"));
     }
 
@@ -321,8 +328,8 @@ fn parse_ipv4_packet_header(packet: &[u8], chain_len: usize) -> CoreResult<Parse
 
 #[inline(always)]
 fn parse_ipv4_fragment(packet: &[u8], chain_len: usize) -> CoreResult<ParsedIpFragment> {
-    let header = transmute_packed::<Ipv4Header>(packet, 0)
-        .ok_or_else(|| CoreError::internal("ipv4 fragment header is too short"))?;
+    let header = read_header::<Ipv4Header>(packet, 0)
+        .map_err(|_| CoreError::internal("ipv4 fragment header is too short"))?;
     if header.version() != 4 {
         return Err(CoreError::internal("invalid ipv4 version"));
     }
@@ -360,9 +367,9 @@ fn parse_ipv4_fragment(packet: &[u8], chain_len: usize) -> CoreResult<ParsedIpFr
 }
 
 #[inline(always)]
-fn parse_ipv6_packet_header(packet: &[u8], chain_len: usize) -> CoreResult<ParsedIpPacket> {
-    let header = transmute_packed::<Ipv6Header>(packet, 0)
-        .ok_or_else(|| CoreError::internal("ipv6 header is too short"))?;
+fn parse_ipv6_packet_header(packet: &[u8]) -> CoreResult<ParsedIpPacket> {
+    let header = read_header::<Ipv6Header>(packet, 0)
+        .map_err(|_| CoreError::internal("ipv6 header is too short"))?;
     if header.version() != 6 {
         return Err(CoreError::internal("invalid ipv6 version"));
     }
@@ -374,9 +381,6 @@ fn parse_ipv6_packet_header(packet: &[u8], chain_len: usize) -> CoreResult<Parse
     let total_len = IPV6_HEADER_LEN
         .checked_add(payload_len)
         .ok_or_else(|| CoreError::internal("ipv6 payload length overflow"))?;
-    if total_len > chain_len {
-        return Err(CoreError::internal("invalid ipv6 packet length"));
-    }
 
     let source = header.source();
     let destination = header.destination();
@@ -385,8 +389,8 @@ fn parse_ipv6_packet_header(packet: &[u8], chain_len: usize) -> CoreResult<Parse
             if payload_len < IPV6_FRAGMENT_HEADER_LEN {
                 return Err(CoreError::internal("ipv6 fragment header is truncated"));
             }
-            let fragment = transmute_packed::<Ipv6FragmentHeader>(packet, IPV6_HEADER_LEN)
-                .ok_or_else(|| CoreError::internal("ipv6 fragment header is missing"))?;
+            let fragment = read_header::<Ipv6FragmentHeader>(packet, IPV6_HEADER_LEN)
+                .map_err(|_| CoreError::internal("ipv6 fragment header is missing"))?;
             (
                 fragment.next_header,
                 if header.hop_limit < 1 {
@@ -441,8 +445,8 @@ fn parse_ipv6_packet_header(packet: &[u8], chain_len: usize) -> CoreResult<Parse
 
 #[inline(always)]
 fn parse_ipv6_fragment(packet: &[u8], chain_len: usize) -> CoreResult<ParsedIpFragment> {
-    let header = transmute_packed::<Ipv6Header>(packet, 0)
-        .ok_or_else(|| CoreError::internal("ipv6 header is too short"))?;
+    let header = read_header::<Ipv6Header>(packet, 0)
+        .map_err(|_| CoreError::internal("ipv6 header is too short"))?;
     if header.version() != 6 {
         return Err(CoreError::internal("invalid ipv6 version"));
     }
@@ -464,8 +468,8 @@ fn parse_ipv6_fragment(packet: &[u8], chain_len: usize) -> CoreResult<ParsedIpFr
         return Err(CoreError::internal("ipv6 packet is not fragmented"));
     }
 
-    let fragment = transmute_packed::<Ipv6FragmentHeader>(packet, IPV6_HEADER_LEN)
-        .ok_or_else(|| CoreError::internal("ipv6 fragment header is missing"))?;
+    let fragment = read_header::<Ipv6FragmentHeader>(packet, IPV6_HEADER_LEN)
+        .map_err(|_| CoreError::internal("ipv6 fragment header is missing"))?;
     let offset_more = fragment.offset_more();
     let payload_len = payload_len - IPV6_FRAGMENT_HEADER_LEN;
     let payload_offset = usize::from(offset_more >> 3) * 8;
@@ -487,15 +491,4 @@ fn parse_ipv6_fragment(packet: &[u8], chain_len: usize) -> CoreResult<ParsedIpFr
         more_fragments,
         header_len: IPV6_HEADER_LEN + IPV6_FRAGMENT_HEADER_LEN,
     })
-}
-
-#[inline(always)]
-fn transmute_packed<T>(packet: &[u8], offset: usize) -> Option<T>
-where
-    T: Copy,
-{
-    let end = offset.checked_add(size_of::<T>())?;
-    let _ = packet.get(offset..end)?;
-    let ptr = unsafe { transmute::<_, *const T>(packet.as_ptr().add(offset)) };
-    Some(unsafe { ptr.read_unaligned() })
 }

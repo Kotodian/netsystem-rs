@@ -1,17 +1,21 @@
+use std::cell::Ref;
+use std::marker::PhantomData;
 use std::mem::transmute;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, DriverNode, FrameIndex, NetworkOpaque, Node, NodeId,
-    NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData, PacketTrace, SecondaryOpaque,
-    TapEthernetMetadata, TraceFormatter, add_packet_trace, unlikely,
+    Buffer, BufferFrame, BufferIndex, DataPlaneRuntime, DriverNode, Node, NodeId, NodeProcessFn,
+    NodeRegistration, NodeResult, NodeRuntimeData, PacketTrace, SecondaryOpaque, TraceFormatter,
+    add_packet_trace, unlikely,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::vec::Vec;
 
-use crate::net::ip::parse_ip_packet;
-
+pub use crate::device::{
+    DeviceEventSource as TunDeviceEventSource, DeviceMain, DeviceRuntimeSlot, DriverScheduleMode,
+};
 use crate::interface::InterfaceControlHandle;
+use crate::net::{NetworkOpaque, TapEthernetMetadata};
 
 const DEFAULT_TUN_RECV_BATCH: usize = 256;
 const ETHERNET_HEADER_LEN: usize = 14;
@@ -26,114 +30,6 @@ struct TunOpaque {
 }
 
 const _: () = assert!(core::mem::size_of::<TunOpaque>() <= core::mem::size_of::<SecondaryOpaque>());
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DriverScheduleMode {
-    Poll,
-    Interrupt,
-    Adaptive,
-}
-
-#[derive(Clone)]
-pub struct DeviceMain {
-    inner: Arc<Mutex<DeviceMainInner>>,
-}
-
-#[derive(Default)]
-struct DeviceMainInner {
-    rx_queues: Vec<RxQueue>,
-    tx_queues: Vec<TxQueue>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct RxQueue {
-    input_node: NodeId,
-    mode: DriverScheduleMode,
-    interrupt_pending: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct TxQueue {
-    output_node: NodeId,
-}
-
-impl Default for DeviceMain {
-    #[inline]
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl DeviceMain {
-    #[inline]
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(DeviceMainInner::default())),
-        }
-    }
-
-    pub fn register_rx_queue(&self, input_node: NodeId, mode: DriverScheduleMode) -> u32 {
-        let mut inner = self.inner.lock().expect("device main poisoned");
-        let index = inner.rx_queues.len() as u32;
-        inner.rx_queues.push(RxQueue {
-            input_node,
-            mode,
-            interrupt_pending: false,
-        });
-        index
-    }
-
-    pub fn register_tx_queue(&self, output_node: NodeId) -> u32 {
-        let mut inner = self.inner.lock().expect("device main poisoned");
-        let index = inner.tx_queues.len() as u32;
-        inner.tx_queues.push(TxQueue { output_node });
-        index
-    }
-
-    pub fn mark_rx_interrupt_pending(&self, rx_queue: u32) -> CoreResult<NodeId> {
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| CoreError::internal("device main poisoned"))?;
-        let queue = inner
-            .rx_queues
-            .get_mut(rx_queue as usize)
-            .ok_or_else(|| CoreError::internal("device RX queue is not registered"))?;
-        queue.interrupt_pending = true;
-        Ok(queue.input_node)
-    }
-
-    pub fn consume_rx_interrupt_pending(&self, rx_queue: u32) -> CoreResult<bool> {
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| CoreError::internal("device main poisoned"))?;
-        let queue = inner
-            .rx_queues
-            .get_mut(rx_queue as usize)
-            .ok_or_else(|| CoreError::internal("device RX queue is not registered"))?;
-        match queue.mode {
-            DriverScheduleMode::Poll => Ok(true),
-            DriverScheduleMode::Interrupt | DriverScheduleMode::Adaptive => {
-                let pending = queue.interrupt_pending;
-                queue.interrupt_pending = false;
-                Ok(pending)
-            }
-        }
-    }
-
-    pub fn tx_node(&self, tx_queue: u32) -> CoreResult<NodeId> {
-        let inner = self
-            .inner
-            .lock()
-            .map_err(|_| CoreError::internal("device main poisoned"))?;
-        inner
-            .tx_queues
-            .get(tx_queue as usize)
-            .map(|queue| queue.output_node)
-            .ok_or_else(|| CoreError::internal("device TX queue is not registered"))
-    }
-}
 
 pub trait TunPacketSource {
     fn recv_frame(
@@ -155,29 +51,49 @@ pub trait TunPacketSink {
     ) -> CoreResult<usize>;
 }
 
-#[doc(hidden)]
-pub enum TunInputBackend {
-    Memory(MemoryTunInput),
-    Scripted(RealTunInput<ScriptedTunIo>),
+/// Direction marker + dispatch trait for TUN driver nodes. Implemented by the
+/// per-direction runtime structs (`TunInputRuntime` / `TunOutputRuntime`), which
+/// double as the type parameter on `TunDriverNode<R>` / `TunBackend<R>` /
+/// `IntoTunBackend<R>`. This collapses the prior `TunInput*` / `TunOutput*`
+/// duplicated type pairs into a single generic family keyed by the runtime type.
+pub trait TunDriverDirection: Send {
+    /// Node name used in `NodeRegistration::next`.
+    const NODE_NAME: &'static str;
+
+    /// Number of initial next-node slots carried on the driver node descriptor
+    /// (1 for input, 0 for output).
+    const NEXT_COUNT: usize;
+
+    /// Memory-backed backend variant for this direction.
+    type MemoryBackend;
+
+    /// Scripted (real-IO) backend variant for this direction.
+    type RealBackend;
+
+    /// Trace formatter for this direction's packet trace.
+    fn trace_formatter() -> TraceFormatter;
+
+    /// Dataplane process entry point. Recovered from `NodeRuntimeData` by
+    /// `tun_driver_process::<R>` and invoked on the per-slot runtime state.
+    fn process(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult>;
 }
 
 #[doc(hidden)]
-pub enum TunOutputBackend {
-    Memory(MemoryTunOutput),
-    Scripted(RealTunOutput<ScriptedTunIo>),
+pub enum TunBackend<R: TunDriverDirection> {
+    Memory(R::MemoryBackend),
+    Scripted(R::RealBackend),
 }
 
 #[doc(hidden)]
-pub trait IntoTunInputBackend {
-    fn into_tun_input_backend(self) -> TunInputBackend;
+pub trait IntoTunBackend<R: TunDriverDirection> {
+    fn into_tun_backend(self) -> TunBackend<R>;
 }
 
-#[doc(hidden)]
-pub trait IntoTunOutputBackend {
-    fn into_tun_output_backend(self) -> TunOutputBackend;
-}
-
-impl TunInputBackend {
+impl TunBackend<TunInputRuntime> {
     #[inline]
     fn recv_frame(
         &mut self,
@@ -194,7 +110,7 @@ impl TunInputBackend {
     }
 }
 
-impl TunOutputBackend {
+impl TunBackend<TunOutputRuntime> {
     #[inline]
     fn send_frame(
         &mut self,
@@ -209,52 +125,62 @@ impl TunOutputBackend {
     }
 }
 
-impl IntoTunInputBackend for MemoryTunInput {
+impl IntoTunBackend<TunInputRuntime> for MemoryTunInput {
     #[inline]
-    fn into_tun_input_backend(self) -> TunInputBackend {
-        TunInputBackend::Memory(self)
+    fn into_tun_backend(self) -> TunBackend<TunInputRuntime> {
+        TunBackend::Memory(self)
     }
 }
 
-impl IntoTunOutputBackend for MemoryTunOutput {
+impl IntoTunBackend<TunOutputRuntime> for MemoryTunOutput {
     #[inline]
-    fn into_tun_output_backend(self) -> TunOutputBackend {
-        TunOutputBackend::Memory(self)
+    fn into_tun_backend(self) -> TunBackend<TunOutputRuntime> {
+        TunBackend::Memory(self)
     }
 }
 
-impl IntoTunInputBackend for RealTunInput<ScriptedTunIo> {
+impl IntoTunBackend<TunInputRuntime> for RealTunInput<ScriptedTunIo> {
     #[inline]
-    fn into_tun_input_backend(self) -> TunInputBackend {
-        TunInputBackend::Scripted(self)
+    fn into_tun_backend(self) -> TunBackend<TunInputRuntime> {
+        TunBackend::Scripted(self)
     }
 }
 
-impl IntoTunOutputBackend for RealTunOutput<ScriptedTunIo> {
+impl IntoTunBackend<TunOutputRuntime> for RealTunOutput<ScriptedTunIo> {
     #[inline]
-    fn into_tun_output_backend(self) -> TunOutputBackend {
-        TunOutputBackend::Scripted(self)
+    fn into_tun_backend(self) -> TunBackend<TunOutputRuntime> {
+        TunBackend::Scripted(self)
     }
 }
 
-struct TunInputRuntime {
-    input: TunInputBackend,
+pub struct TunInputRuntime {
+    input: TunBackend<TunInputRuntime>,
     interface_id: String,
     interface_index: Option<u32>,
     interface_control: Option<InterfaceControlHandle>,
-    device_main: Option<DeviceMain>,
+    device_main: Option<Arc<DeviceMain>>,
     rx_queue: Option<u32>,
     next: NodeId,
     max_batch: usize,
     mode: TunDriverMode,
 }
 
-struct TunOutputRuntime {
-    output: TunOutputBackend,
+pub struct TunOutputRuntime {
+    output: TunBackend<TunOutputRuntime>,
     mode: TunDriverMode,
 }
 
-impl TunInputRuntime {
+impl TunDriverDirection for TunInputRuntime {
+    const NODE_NAME: &'static str = "tun-input-driver";
+    const NEXT_COUNT: usize = 1;
+    type MemoryBackend = MemoryTunInput;
+    type RealBackend = RealTunInput<ScriptedTunIo>;
+
+    #[inline]
+    fn trace_formatter() -> TraceFormatter {
+        format_tun_input_trace
+    }
+
     fn process(
         &mut self,
         runtime: &DataPlaneRuntime,
@@ -272,26 +198,156 @@ impl TunInputRuntime {
                 .recv_frame(runtime, frame, &self.interface_id, self.mode, max_batch)?;
         let interface_index = self.ingress_interface_index()?;
         if let Some(interface_index) = interface_index {
-            for index in frame.pending_indices()[first_new..].iter().copied() {
-                let mut buffer = runtime.get_buffer_mut(index)?;
+            let indices = frame.pending_indices();
+            let mut read = first_new;
+            let len = indices.len();
+            while read + 4 <= len {
+                let index0 = indices[read];
+                let index1 = indices[read + 1];
+                let index2 = indices[read + 2];
+                let index3 = indices[read + 3];
+                {
+                    let mut buffer = runtime.get_buffer_mut(index0)?;
+                    let network =
+                        unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+                    network.sw_if_index[0] = interface_index;
+                }
+                {
+                    let mut buffer = runtime.get_buffer_mut(index1)?;
+                    let network =
+                        unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+                    network.sw_if_index[0] = interface_index;
+                }
+                {
+                    let mut buffer = runtime.get_buffer_mut(index2)?;
+                    let network =
+                        unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+                    network.sw_if_index[0] = interface_index;
+                }
+                {
+                    let mut buffer = runtime.get_buffer_mut(index3)?;
+                    let network =
+                        unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+                    network.sw_if_index[0] = interface_index;
+                }
+                read += 4;
+            }
+            if read + 2 <= len {
+                let index0 = indices[read];
+                let index1 = indices[read + 1];
+                {
+                    let mut buffer = runtime.get_buffer_mut(index0)?;
+                    let network =
+                        unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+                    network.sw_if_index[0] = interface_index;
+                }
+                {
+                    let mut buffer = runtime.get_buffer_mut(index1)?;
+                    let network =
+                        unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+                    network.sw_if_index[0] = interface_index;
+                }
+                read += 2;
+            }
+            while read < len {
+                let index0 = indices[read];
+                let mut buffer = runtime.get_buffer_mut(index0)?;
                 let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
                 network.sw_if_index[0] = interface_index;
+                read += 1;
             }
         }
         if let Some(current_node) = runtime.current_node()
             && unlikely(runtime.may_mark_trace(current_node))
         {
-            for index in frame.pending_indices()[first_new..].iter().copied() {
-                runtime.try_mark_trace(current_node, index)?;
+            let indices = frame.pending_indices();
+            let mut read = first_new;
+            let len = indices.len();
+            while read + 4 <= len {
+                let index0 = indices[read];
+                let index1 = indices[read + 1];
+                let index2 = indices[read + 2];
+                let index3 = indices[read + 3];
+                runtime.try_mark_trace(current_node, index0)?;
                 add_packet_trace!(
                     runtime,
-                    index,
+                    index0,
+                    TunInputTrace {
+                        interface_index,
+                        mode: self.mode,
+                        received
+                    }
+                )?;
+                runtime.try_mark_trace(current_node, index1)?;
+                add_packet_trace!(
+                    runtime,
+                    index1,
+                    TunInputTrace {
+                        interface_index,
+                        mode: self.mode,
+                        received
+                    }
+                )?;
+                runtime.try_mark_trace(current_node, index2)?;
+                add_packet_trace!(
+                    runtime,
+                    index2,
+                    TunInputTrace {
+                        interface_index,
+                        mode: self.mode,
+                        received
+                    }
+                )?;
+                runtime.try_mark_trace(current_node, index3)?;
+                add_packet_trace!(
+                    runtime,
+                    index3,
+                    TunInputTrace {
+                        interface_index,
+                        mode: self.mode,
+                        received
+                    }
+                )?;
+                read += 4;
+            }
+            if read + 2 <= len {
+                let index0 = indices[read];
+                let index1 = indices[read + 1];
+                runtime.try_mark_trace(current_node, index0)?;
+                add_packet_trace!(
+                    runtime,
+                    index0,
+                    TunInputTrace {
+                        interface_index,
+                        mode: self.mode,
+                        received
+                    }
+                )?;
+                runtime.try_mark_trace(current_node, index1)?;
+                add_packet_trace!(
+                    runtime,
+                    index1,
+                    TunInputTrace {
+                        interface_index,
+                        mode: self.mode,
+                        received
+                    }
+                )?;
+                read += 2;
+            }
+            while read < len {
+                let index0 = indices[read];
+                runtime.try_mark_trace(current_node, index0)?;
+                add_packet_trace!(
+                    runtime,
+                    index0,
                     TunInputTrace {
                         interface_index,
                         mode: self.mode,
                         received,
                     },
                 )?;
+                read += 1;
             }
         }
         if frame.has_pending() {
@@ -300,7 +356,9 @@ impl TunInputRuntime {
             Ok(NodeResult::drop())
         }
     }
+}
 
+impl TunInputRuntime {
     #[inline]
     fn ingress_interface_index(&self) -> CoreResult<Option<u32>> {
         if let Some(interface_control) = &self.interface_control {
@@ -318,112 +376,120 @@ impl TunInputRuntime {
     }
 }
 
-impl TunOutputRuntime {
+impl TunDriverDirection for TunOutputRuntime {
+    const NODE_NAME: &'static str = "tun-output-driver";
+    const NEXT_COUNT: usize = 0;
+    type MemoryBackend = MemoryTunOutput;
+    type RealBackend = RealTunOutput<ScriptedTunIo>;
+
+    #[inline]
+    fn trace_formatter() -> TraceFormatter {
+        format_tun_output_trace
+    }
+
     fn process(
         &mut self,
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         let pending = frame.pending_len();
-        for index in frame.pending_indices().iter().copied() {
+        let indices = frame.pending_indices();
+        let len = indices.len();
+        let mut read = 0usize;
+        while read + 4 <= len {
+            if read + 4 < len {
+                runtime.prefetch_header(indices[read + 4]);
+            }
+            if read + 5 < len {
+                runtime.prefetch_header(indices[read + 5]);
+            }
+            if read + 6 < len {
+                runtime.prefetch_header(indices[read + 6]);
+            }
+            if read + 7 < len {
+                runtime.prefetch_header(indices[read + 7]);
+            }
             add_packet_trace!(
                 runtime,
-                index,
+                indices[read],
                 TunOutputTrace {
                     mode: self.mode,
                     pending,
                 },
             )?;
+            add_packet_trace!(
+                runtime,
+                indices[read + 1],
+                TunOutputTrace {
+                    mode: self.mode,
+                    pending,
+                },
+            )?;
+            add_packet_trace!(
+                runtime,
+                indices[read + 2],
+                TunOutputTrace {
+                    mode: self.mode,
+                    pending,
+                },
+            )?;
+            add_packet_trace!(
+                runtime,
+                indices[read + 3],
+                TunOutputTrace {
+                    mode: self.mode,
+                    pending,
+                },
+            )?;
+            read += 4;
+        }
+        if read + 2 <= len {
+            if read + 2 < len {
+                runtime.prefetch_header(indices[read + 2]);
+            }
+            if read + 3 < len {
+                runtime.prefetch_header(indices[read + 3]);
+            }
+            add_packet_trace!(
+                runtime,
+                indices[read],
+                TunOutputTrace {
+                    mode: self.mode,
+                    pending,
+                },
+            )?;
+            add_packet_trace!(
+                runtime,
+                indices[read + 1],
+                TunOutputTrace {
+                    mode: self.mode,
+                    pending,
+                },
+            )?;
+            read += 2;
+        }
+        while read < len {
+            if read + 1 < len {
+                runtime.prefetch_header(indices[read + 1]);
+            }
+            add_packet_trace!(
+                runtime,
+                indices[read],
+                TunOutputTrace {
+                    mode: self.mode,
+                    pending,
+                },
+            )?;
+            read += 1;
         }
         self.output.send_frame(runtime, frame, self.mode)?;
         Ok(NodeResult::drop())
     }
 }
 
-#[derive(Clone)]
-pub struct TunMain {
-    id: usize,
-    inner: Arc<Mutex<TunMainInner>>,
-}
-
-struct TunMainInner {
-    inputs: Vec<TunInputRuntime>,
-    outputs: Vec<TunOutputRuntime>,
-}
-
-impl Default for TunMain {
-    #[inline]
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl TunMain {
-    #[inline]
-    pub fn new() -> Self {
-        let inner = Arc::new(Mutex::new(TunMainInner {
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-        }));
-        let mut mains = tun_mains().lock().expect("tun main registry poisoned");
-        let id = mains.len();
-        mains.push(Arc::clone(&inner));
-        Self { id, inner }
-    }
-
-    #[inline]
-    fn default_main() -> Self {
-        static DEFAULT: OnceLock<TunMain> = OnceLock::new();
-        DEFAULT.get_or_init(TunMain::new).clone()
-    }
-
-    #[inline]
-    fn register_input(&self, input: TunInputRuntime) -> usize {
-        let mut inner = self.inner.lock().expect("tun main poisoned");
-        let slot = inner.inputs.len();
-        inner.inputs.push(input);
-        slot
-    }
-
-    #[inline]
-    fn register_output(&self, output: TunOutputRuntime) -> usize {
-        let mut inner = self.inner.lock().expect("tun main poisoned");
-        let slot = inner.outputs.len();
-        inner.outputs.push(output);
-        slot
-    }
-
-    fn inner_for_runtime_data(data: NodeRuntimeData) -> CoreResult<Arc<Mutex<TunMainInner>>> {
-        let main_id = data.usize_word(0)?;
-        let mains = tun_mains()
-            .lock()
-            .map_err(|_| CoreError::internal("tun main registry poisoned"))?;
-        mains
-            .get(main_id)
-            .cloned()
-            .ok_or_else(|| CoreError::internal("TUN main runtime data is invalid"))
-    }
-
-    #[inline]
-    fn runtime_data(&self, slot: usize) -> CoreResult<NodeRuntimeData> {
-        Ok(NodeRuntimeData::from_words([
-            u64::try_from(self.id).map_err(|_| CoreError::internal("TUN main id overflow"))?,
-            u64::try_from(slot).map_err(|_| CoreError::internal("TUN node slot overflow"))?,
-            0,
-            0,
-        ]))
-    }
-}
-
-fn tun_mains() -> &'static Mutex<Vec<Arc<Mutex<TunMainInner>>>> {
-    static MAINS: OnceLock<Mutex<Vec<Arc<Mutex<TunMainInner>>>>> = OnceLock::new();
-    MAINS.get_or_init(|| Mutex::new(Vec::new()))
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TunBufferSendResult {
     Complete,
-    Partial(usize),
     Backpressure,
 }
 
@@ -434,23 +500,11 @@ pub trait TunBufferIo {
         None
     }
 
-    fn try_send_buffer(&mut self, packet: &[u8], offset: usize) -> CoreResult<TunBufferSendResult>;
+    fn try_send_buffers(&mut self, segments: &[&[u8]]) -> CoreResult<TunBufferSendResult>;
 
-    fn try_send_buffers(
-        &mut self,
-        segments: &[&[u8]],
-        offset: usize,
-        total_len: usize,
-    ) -> CoreResult<TunBufferSendResult> {
-        if segments.len() > 1 {
-            return Err(CoreError::internal(
-                "chained TUN TX requires vectored IO support",
-            ));
-        }
-        if offset >= total_len {
-            return Ok(TunBufferSendResult::Complete);
-        }
-        self.try_send_buffer(segments.first().copied().unwrap_or_default(), offset)
+    #[inline]
+    fn try_send_buffer(&mut self, packet: &[u8]) -> CoreResult<TunBufferSendResult> {
+        self.try_send_buffers(&[packet])
     }
 }
 
@@ -491,20 +545,7 @@ where
         }
         let mut received = 0usize;
         while received < max {
-            let index = runtime.alloc_index()?;
-            let len = match self.recv_into_buffer(runtime, index) {
-                Ok(Some(len)) => len,
-                Ok(None) => {
-                    runtime.free_index(index);
-                    break;
-                }
-                Err(err) => {
-                    runtime.free_index(index);
-                    return Err(err);
-                }
-            };
-            if len == 0 {
-                runtime.free_index(index);
+            let Some(index) = self.recv_into_buffer(runtime)? else {
                 break;
             };
             self.set_l3_metadata(runtime, index, interface_id)?;
@@ -522,38 +563,37 @@ impl<I> RealTunInput<I>
 where
     I: TunBufferIo,
 {
-    fn recv_into_buffer(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        index: hammer_adapter::BufferIndex,
-    ) -> CoreResult<Option<usize>> {
+    fn recv_into_buffer(&mut self, runtime: &DataPlaneRuntime) -> CoreResult<Option<BufferIndex>> {
+        let index = runtime.alloc_index()?;
         let mut buffer = runtime.get_buffer_mut(index)?;
         let dst = buffer.writable_tail_mut();
         let dst_len = dst.len();
         let Some(len) = self.io.try_recv_buffer(dst)? else {
+            drop(buffer);
+            runtime.free_index(index);
             return Ok(None);
         };
+        if len == 0 {
+            drop(buffer);
+            runtime.free_index(index);
+            return Ok(None);
+        }
         if len == dst_len && self.io.max_recv_len().is_none_or(|max| dst_len < max) {
-            return Err(CoreError::internal(
-                "TUN packet filled receive buffer; possible truncation",
-            ));
+            drop(buffer);
+            runtime.free_index(index);
+            return Ok(None);
         }
         buffer.commit_writable_tail(len)?;
-        Ok(Some(len))
+        drop(buffer);
+        Ok(Some(index))
     }
 
     fn set_l3_metadata(
         &self,
-        runtime: &DataPlaneRuntime,
-        index: hammer_adapter::BufferIndex,
+        _: &DataPlaneRuntime,
+        _: hammer_adapter::BufferIndex,
         _: &str,
     ) -> CoreResult<()> {
-        let buffer = runtime.get_buffer(index)?;
-        if parse_ip_packet(buffer.current()).is_err() {
-            return Err(CoreError::internal(
-                "received TUN packet has invalid IP header",
-            ));
-        }
         Ok(())
     }
 }
@@ -561,7 +601,6 @@ where
 #[derive(Clone, Copy)]
 struct TunPendingTx {
     index: hammer_adapter::BufferIndex,
-    offset: usize,
 }
 
 struct TunPendingTxRing {
@@ -607,14 +646,6 @@ impl TunPendingTxRing {
             return None;
         }
         self.slots[self.head]
-    }
-
-    #[inline]
-    fn front_mut(&mut self) -> Option<&mut TunPendingTx> {
-        if self.len == 0 {
-            return None;
-        }
-        self.slots[self.head].as_mut()
     }
 
     fn push_back(&mut self, pending: TunPendingTx) -> CoreResult<()> {
@@ -732,27 +763,13 @@ impl TunBufferIo for ScriptedTunIo {
         Ok(Some(len))
     }
 
-    fn try_send_buffer(&mut self, packet: &[u8], offset: usize) -> CoreResult<TunBufferSendResult> {
-        self.record_send(&[packet], offset, packet.len())
-    }
-
-    fn try_send_buffers(
-        &mut self,
-        segments: &[&[u8]],
-        offset: usize,
-        total_len: usize,
-    ) -> CoreResult<TunBufferSendResult> {
-        self.record_send(segments, offset, total_len)
+    fn try_send_buffers(&mut self, segments: &[&[u8]]) -> CoreResult<TunBufferSendResult> {
+        self.record_send(segments)
     }
 }
 
 impl ScriptedTunIo {
-    fn record_send(
-        &mut self,
-        segments: &[&[u8]],
-        offset: usize,
-        total_len: usize,
-    ) -> CoreResult<TunBufferSendResult> {
+    fn record_send(&mut self, segments: &[&[u8]]) -> CoreResult<TunBufferSendResult> {
         let mut inner = self.inner.lock().expect("scripted TUN IO poisoned");
         inner.send_calls += 1;
         let result = if inner.send_result_head < inner.send_results.len() {
@@ -763,39 +780,15 @@ impl ScriptedTunIo {
             TunBufferSendResult::Complete
         };
         inner.sent_segment_counts.push(segments.len());
-        match result {
-            TunBufferSendResult::Complete => {
-                let mut sent = Vec::with_capacity(total_len.saturating_sub(offset));
-                extend_segments_from_offset(&mut sent, segments, offset, total_len);
-                inner.sent.push(sent);
+        if matches!(result, TunBufferSendResult::Complete) {
+            let total_len: usize = segments.iter().map(|segment| segment.len()).sum();
+            let mut sent = Vec::with_capacity(total_len);
+            for segment in segments {
+                sent.extend_from_slice(segment);
             }
-            TunBufferSendResult::Partial(next_offset) => {
-                let take = next_offset.saturating_sub(offset).min(total_len - offset);
-                let mut sent = Vec::with_capacity(take);
-                extend_segments_from_offset(&mut sent, segments, offset, offset + take);
-                inner.sent.push(sent);
-            }
-            TunBufferSendResult::Backpressure => {}
+            inner.sent.push(sent);
         }
         Ok(result)
-    }
-}
-
-fn extend_segments_from_offset(
-    out: &mut Vec<u8>,
-    segments: &[&[u8]],
-    offset: usize,
-    end_offset: usize,
-) {
-    let mut base = 0usize;
-    for segment in segments {
-        let end = base + segment.len();
-        if offset < end && base < end_offset {
-            let start_in_segment = offset.saturating_sub(base);
-            let end_in_segment = (end_offset - base).min(segment.len());
-            out.extend_from_slice(&segment[start_in_segment..end_in_segment]);
-        }
-        base = end;
     }
 }
 
@@ -844,20 +837,6 @@ where
                     runtime.free_index(pending.index);
                     completed += 1;
                 }
-                Ok(TunBufferSendResult::Partial(offset)) => {
-                    let total_len = packet_total_len(runtime, pending.index)?;
-                    validate_tun_tx_partial(pending.offset, offset, total_len)?;
-                    if offset == total_len {
-                        self.pending_tx.pop_front();
-                        runtime.free_index(pending.index);
-                        completed += 1;
-                        continue;
-                    }
-                    if let Some(head) = self.pending_tx.front_mut() {
-                        head.offset = offset;
-                    }
-                    break;
-                }
                 Ok(TunBufferSendResult::Backpressure) => break,
                 Err(err) => return Err(err),
             }
@@ -871,15 +850,22 @@ where
         runtime: &DataPlaneRuntime,
         pending: TunPendingTx,
     ) -> CoreResult<TunBufferSendResult> {
-        let packet = runtime.copy_packet(pending.index)?;
-        let total_len = packet.len();
-        if pending.offset > total_len {
-            return Err(CoreError::internal("TUN TX offset exceeds packet length"));
+        let mut refs: Vec<Ref<'_, Buffer>> = Vec::with_capacity(4);
+        let mut chain = runtime.chain(pending.index);
+        while let Some(buffer) = chain.next() {
+            refs.push(buffer?);
         }
-        if pending.offset == total_len {
-            return Ok(TunBufferSendResult::Complete);
+        drop(chain);
+        if refs.len() <= 1 {
+            return self
+                .io
+                .try_send_buffer(refs.first().map(|buffer| buffer.current()).unwrap_or(&[]));
         }
-        self.io.try_send_buffer(&packet, pending.offset)
+        let mut segments: Vec<&[u8]> = Vec::with_capacity(refs.len());
+        for buffer in &refs {
+            segments.push(buffer.current());
+        }
+        self.io.try_send_buffers(&segments)
     }
 }
 
@@ -905,8 +891,7 @@ where
             return Err(CoreError::internal("real TUN TX ring full"));
         }
         for index in frame.drain_pending() {
-            self.pending_tx
-                .push_back(TunPendingTx { index, offset: 0 })?;
+            self.pending_tx.push_back(TunPendingTx { index })?;
         }
         self.drain_pending_tx(runtime, mode)?;
         Ok(batch_len)
@@ -925,67 +910,6 @@ fn packet_total_len(
         .ok_or_else(|| CoreError::internal("TUN TX packet length overflow"))
 }
 
-#[inline]
-fn validate_tun_tx_partial(previous: usize, next: usize, total_len: usize) -> CoreResult<()> {
-    if next <= previous {
-        return Err(CoreError::internal(format!(
-            "non-advancing TUN TX partial offset: {next} <= {previous}"
-        )));
-    }
-    if next > total_len {
-        return Err(CoreError::internal(format!(
-            "TUN TX partial offset exceeds packet length: {next} > {total_len}"
-        )));
-    }
-    Ok(())
-}
-
-#[derive(Clone)]
-pub struct TunDeviceEventSource {
-    device_main: DeviceMain,
-    rx_queue: Option<u32>,
-    tx_queue: Option<u32>,
-}
-
-impl TunDeviceEventSource {
-    #[inline]
-    pub fn new(device_main: DeviceMain, rx_queue: Option<u32>, tx_queue: Option<u32>) -> Self {
-        Self {
-            device_main,
-            rx_queue,
-            tx_queue,
-        }
-    }
-
-    #[inline]
-    pub fn input(device_main: DeviceMain, rx_queue: u32) -> Self {
-        Self::new(device_main, Some(rx_queue), None)
-    }
-
-    #[inline]
-    pub fn output(device_main: DeviceMain, tx_queue: u32) -> Self {
-        Self::new(device_main, None, Some(tx_queue))
-    }
-
-    #[inline]
-    pub fn schedule_readable(&self, runtime: &DataPlaneRuntime) -> CoreResult<()> {
-        let rx_queue = self
-            .rx_queue
-            .ok_or_else(|| CoreError::internal("TUN device RX queue is not configured"))?;
-        let input = self.device_main.mark_rx_interrupt_pending(rx_queue)?;
-        schedule_empty_driver_frame(runtime, input)
-    }
-
-    #[inline]
-    pub fn schedule_writable(&self, runtime: &DataPlaneRuntime) -> CoreResult<()> {
-        let tx_queue = self
-            .tx_queue
-            .ok_or_else(|| CoreError::internal("TUN device TX queue is not configured"))?;
-        let output = self.device_main.tx_node(tx_queue)?;
-        schedule_empty_driver_frame(runtime, output)
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TunDriverMode {
     Tun,
@@ -1001,27 +925,6 @@ impl TunDriverMode {
     #[inline(always)]
     pub const fn is_tap(self) -> bool {
         matches!(self, Self::Tap)
-    }
-}
-
-#[inline]
-fn schedule_empty_driver_frame(runtime: &DataPlaneRuntime, node: NodeId) -> CoreResult<()> {
-    let frame = runtime.alloc_frame_index()?;
-    schedule_allocated_driver_frame(runtime, node, frame)
-}
-
-#[inline]
-fn schedule_allocated_driver_frame(
-    runtime: &DataPlaneRuntime,
-    node: NodeId,
-    frame: FrameIndex,
-) -> CoreResult<()> {
-    match runtime.schedule_driver_frame(node, frame) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            let _ = runtime.free_frame_index(frame);
-            Err(err)
-        }
     }
 }
 
@@ -1122,20 +1025,104 @@ fn decode_tun_driver_mode(value: u8) -> Option<TunDriverMode> {
     }
 }
 
+/// TUN device-class state holder. Bundles the input/output per-instance runtime
+/// registries (`DeviceRuntimeSlot<T>`) used by `TunInputDriverNode` /
+/// `TunOutputDriverNode` to recover their per-slot state from `NodeRuntimeData`.
+///
+/// This is the TUN-specific companion to `DeviceMain` (the queue registry): the
+/// `DeviceMain` maps RX/TX queue indices to input/output node ids + schedule
+/// mode, while `TunMain` holds the per-slot `TunInputRuntime` / `TunOutputRuntime`
+/// state that the driver node process functions mutate.
+///
+/// # Synchronization
+///
+/// Inherits `DeviceRuntimeSlot`'s lock-free dataplane + barrier-gated control
+/// plane contract. `with_input_mut` / `with_output_mut` are control-plane
+/// accessors: callers must hold the runtime data-plane barrier if the runtime is
+/// dispatching; pre-registration builder chains are single-threaded and need no
+/// barrier.
 #[derive(Clone)]
-pub struct TunInputDriverNode {
+pub struct TunMain {
+    input_slot: Arc<DeviceRuntimeSlot<TunInputRuntime>>,
+    output_slot: Arc<DeviceRuntimeSlot<TunOutputRuntime>>,
+}
+
+impl Default for TunMain {
+    #[inline]
+    fn default() -> Self {
+        Self::default_main()
+    }
+}
+
+impl TunMain {
+    #[inline]
+    pub fn default_main() -> Self {
+        Self {
+            input_slot: DeviceRuntimeSlot::new(),
+            output_slot: DeviceRuntimeSlot::new(),
+        }
+    }
+
+    #[inline]
+    pub fn register_input(&self, input: TunInputRuntime) -> usize {
+        self.input_slot.register(input)
+    }
+
+    #[inline]
+    pub fn register_output(&self, output: TunOutputRuntime) -> usize {
+        self.output_slot.register(output)
+    }
+
+    #[inline]
+    pub fn input_runtime_data(&self, slot: usize) -> CoreResult<NodeRuntimeData> {
+        self.input_slot.runtime_data(slot)
+    }
+
+    #[inline]
+    pub fn output_runtime_data(&self, slot: usize) -> CoreResult<NodeRuntimeData> {
+        self.output_slot.runtime_data(slot)
+    }
+
+    #[inline]
+    pub fn with_input_mut<R>(&self, slot: usize, f: impl FnOnce(&mut TunInputRuntime) -> R) -> R {
+        self.input_slot.with_mut(slot, f)
+    }
+
+    #[inline]
+    pub fn with_output_mut<R>(&self, slot: usize, f: impl FnOnce(&mut TunOutputRuntime) -> R) -> R {
+        self.output_slot.with_mut(slot, f)
+    }
+}
+
+/// Generic TUN driver node, parameterized by the per-direction runtime type
+/// (`TunInputRuntime` or `TunOutputRuntime`), which acts as the
+/// `TunDriverDirection` marker. Collapses the prior `TunInputDriverNode` /
+/// `TunOutputDriverNode` duplicate pair into one struct + direction-specific
+/// constructor/builder impl blocks. The `next: Option<NodeId>` field carries
+/// the input's single next node id (`Some`) and is `None` for output.
+#[derive(Clone)]
+pub struct TunDriverNode<R: TunDriverDirection> {
     node_name: &'static str,
     main: TunMain,
     slot: usize,
     runtime_data: NodeRuntimeData,
-    next: NodeId,
+    next: Option<NodeId>,
+    _dir: PhantomData<R>,
 }
 
-impl TunInputDriverNode {
+impl<R: TunDriverDirection> TunDriverNode<R> {
+    #[inline]
+    pub fn with_node_name(mut self, node_name: &'static str) -> Self {
+        self.node_name = node_name;
+        self
+    }
+}
+
+impl TunDriverNode<TunInputRuntime> {
     #[inline]
     pub fn new<I>(input: I, interface_id: impl Into<String>, next: NodeId) -> Self
     where
-        I: IntoTunInputBackend,
+        I: IntoTunBackend<TunInputRuntime>,
     {
         Self::new_with_main(TunMain::default_main(), input, interface_id, next)
     }
@@ -1148,10 +1135,10 @@ impl TunInputDriverNode {
         next: NodeId,
     ) -> Self
     where
-        I: IntoTunInputBackend,
+        I: IntoTunBackend<TunInputRuntime>,
     {
         let slot = main.register_input(TunInputRuntime {
-            input: input.into_tun_input_backend(),
+            input: input.into_tun_backend(),
             interface_id: interface_id.into(),
             interface_index: None,
             interface_control: None,
@@ -1161,166 +1148,81 @@ impl TunInputDriverNode {
             max_batch: DEFAULT_TUN_RECV_BATCH,
             mode: TunDriverMode::Tun,
         });
-        let runtime_data = main.runtime_data(slot).expect("TUN input runtime data");
+        let runtime_data = main
+            .input_runtime_data(slot)
+            .expect("TUN input runtime data");
         Self {
-            node_name: "tun-input-driver",
+            node_name: <TunInputRuntime as TunDriverDirection>::NODE_NAME,
             main,
             slot,
             runtime_data,
-            next,
+            next: Some(next),
+            _dir: PhantomData,
         }
     }
 
     #[inline]
     pub fn with_interface_index(self, interface_index: u32) -> Self {
-        let mut inner = self.main.inner.lock().expect("tun main poisoned");
-        inner
-            .inputs
-            .get_mut(self.slot)
-            .expect("TUN input runtime slot")
-            .interface_index = Some(interface_index);
-        drop(inner);
+        self.main.with_input_mut(self.slot, |input| {
+            input.interface_index = Some(interface_index)
+        });
         self
     }
 
     #[inline]
     pub fn with_interface_control(self, interface_control: InterfaceControlHandle) -> Self {
-        let mut inner = self.main.inner.lock().expect("tun main poisoned");
-        inner
-            .inputs
-            .get_mut(self.slot)
-            .expect("TUN input runtime slot")
-            .interface_control = Some(interface_control);
-        drop(inner);
+        self.main.with_input_mut(self.slot, |input| {
+            input.interface_control = Some(interface_control)
+        });
         self
     }
 
     #[inline]
-    pub fn with_rx_queue(self, device_main: DeviceMain, rx_queue: u32) -> Self {
-        let mut inner = self.main.inner.lock().expect("tun main poisoned");
-        let input = inner
-            .inputs
-            .get_mut(self.slot)
-            .expect("TUN input runtime slot");
-        input.device_main = Some(device_main);
-        input.rx_queue = Some(rx_queue);
-        drop(inner);
+    pub fn with_rx_queue(self, device_main: Arc<DeviceMain>, rx_queue: u32) -> Self {
+        self.main.with_input_mut(self.slot, |input| {
+            input.device_main = Some(device_main);
+            input.rx_queue = Some(rx_queue);
+        });
         self
     }
 
-    pub fn bind_rx_queue(&self, device_main: DeviceMain, rx_queue: u32) -> CoreResult<()> {
-        let mut inner = self
-            .main
-            .inner
-            .lock()
-            .map_err(|_| CoreError::internal("tun main poisoned"))?;
-        let input = inner
-            .inputs
-            .get_mut(self.slot)
-            .ok_or_else(|| CoreError::internal("TUN input runtime slot is invalid"))?;
-        input.device_main = Some(device_main);
-        input.rx_queue = Some(rx_queue);
+    pub fn bind_rx_queue(&self, device_main: Arc<DeviceMain>, rx_queue: u32) -> CoreResult<()> {
+        // Control-plane: caller must hold the runtime data-plane barrier if the
+        // runtime is dispatching. Pre-registration setup is single-threaded.
+        self.main.with_input_mut(self.slot, |input| {
+            input.device_main = Some(device_main);
+            input.rx_queue = Some(rx_queue);
+        });
         Ok(())
     }
 
     #[inline]
     pub fn with_max_batch(self, max_batch: usize) -> Self {
-        let mut inner = self.main.inner.lock().expect("tun main poisoned");
-        inner
-            .inputs
-            .get_mut(self.slot)
-            .expect("TUN input runtime slot")
-            .max_batch = max_batch;
-        drop(inner);
+        self.main
+            .with_input_mut(self.slot, |input| input.max_batch = max_batch);
         self
     }
 
     #[inline]
     pub fn with_tap(self, tap: bool) -> Self {
-        let mut inner = self.main.inner.lock().expect("tun main poisoned");
-        inner
-            .inputs
-            .get_mut(self.slot)
-            .expect("TUN input runtime slot")
-            .mode = TunDriverMode::from_tap(tap);
-        drop(inner);
+        self.main
+            .with_input_mut(self.slot, |input| input.mode = TunDriverMode::from_tap(tap));
         self
     }
 
     #[inline]
     pub fn with_mode(self, mode: TunDriverMode) -> Self {
-        let mut inner = self.main.inner.lock().expect("tun main poisoned");
-        inner
-            .inputs
-            .get_mut(self.slot)
-            .expect("TUN input runtime slot")
-            .mode = mode;
-        drop(inner);
-        self
-    }
-
-    #[inline]
-    pub fn with_node_name(mut self, node_name: &'static str) -> Self {
-        self.node_name = node_name;
+        self.main
+            .with_input_mut(self.slot, |input| input.mode = mode);
         self
     }
 }
 
-impl Node for TunInputDriverNode {
-    #[inline(always)]
-    fn process(
-        &mut self,
-        _runtime: &DataPlaneRuntime,
-        _frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        Err(CoreError::internal(
-            "TUN input driver must run through its descriptor process function",
-        ))
-    }
-
-    #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        tun_input_driver_process
-    }
-
-    #[inline]
-    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
-        Ok(self.runtime_data)
-    }
-
-    #[inline]
-    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_tun_input_trace)
-    }
-}
-
-impl DriverNode for TunInputDriverNode {
-    #[inline]
-    fn node_registration(&self) -> NodeRegistration
-    where
-        Self: Sized,
-    {
-        NodeRegistration::next(self.node_name, 1)
-    }
-
-    #[inline]
-    fn node_initial_nexts(&self) -> &[NodeId] {
-        std::slice::from_ref(&self.next)
-    }
-}
-
-pub struct TunOutputDriverNode {
-    node_name: &'static str,
-    main: TunMain,
-    slot: usize,
-    runtime_data: NodeRuntimeData,
-}
-
-impl TunOutputDriverNode {
+impl TunDriverNode<TunOutputRuntime> {
     #[inline]
     pub fn new<O>(output: O) -> Self
     where
-        O: IntoTunOutputBackend,
+        O: IntoTunBackend<TunOutputRuntime>,
     {
         Self::new_with_main(TunMain::default_main(), output)
     }
@@ -1328,53 +1230,42 @@ impl TunOutputDriverNode {
     #[inline]
     pub fn new_with_main<O>(main: TunMain, output: O) -> Self
     where
-        O: IntoTunOutputBackend,
+        O: IntoTunBackend<TunOutputRuntime>,
     {
         let slot = main.register_output(TunOutputRuntime {
-            output: output.into_tun_output_backend(),
+            output: output.into_tun_backend(),
             mode: TunDriverMode::Tun,
         });
-        let runtime_data = main.runtime_data(slot).expect("TUN output runtime data");
+        let runtime_data = main
+            .output_runtime_data(slot)
+            .expect("TUN output runtime data");
         Self {
-            node_name: "tun-output-driver",
+            node_name: <TunOutputRuntime as TunDriverDirection>::NODE_NAME,
             main,
             slot,
             runtime_data,
+            next: None,
+            _dir: PhantomData,
         }
     }
 
     #[inline]
     pub fn with_tap(self, tap: bool) -> Self {
-        let mut inner = self.main.inner.lock().expect("tun main poisoned");
-        inner
-            .outputs
-            .get_mut(self.slot)
-            .expect("TUN output runtime slot")
-            .mode = TunDriverMode::from_tap(tap);
-        drop(inner);
+        self.main.with_output_mut(self.slot, |output| {
+            output.mode = TunDriverMode::from_tap(tap)
+        });
         self
     }
 
     #[inline]
     pub fn with_mode(self, mode: TunDriverMode) -> Self {
-        let mut inner = self.main.inner.lock().expect("tun main poisoned");
-        inner
-            .outputs
-            .get_mut(self.slot)
-            .expect("TUN output runtime slot")
-            .mode = mode;
-        drop(inner);
-        self
-    }
-
-    #[inline]
-    pub fn with_node_name(mut self, node_name: &'static str) -> Self {
-        self.node_name = node_name;
+        self.main
+            .with_output_mut(self.slot, |output| output.mode = mode);
         self
     }
 }
 
-impl Node for TunOutputDriverNode {
+impl<R: TunDriverDirection> Node for TunDriverNode<R> {
     #[inline(always)]
     fn process(
         &mut self,
@@ -1382,13 +1273,13 @@ impl Node for TunOutputDriverNode {
         _frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         Err(CoreError::internal(
-            "TUN output driver must run through its descriptor process function",
+            "TUN driver must run through its descriptor process function",
         ))
     }
 
     #[inline]
     fn node_process(&self) -> NodeProcessFn {
-        tun_output_driver_process
+        tun_driver_process::<R>
     }
 
     #[inline]
@@ -1398,53 +1289,39 @@ impl Node for TunOutputDriverNode {
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_tun_output_trace)
+        Some(R::trace_formatter())
     }
 }
 
-impl DriverNode for TunOutputDriverNode {
+impl<R: TunDriverDirection> DriverNode for TunDriverNode<R> {
     #[inline]
     fn node_registration(&self) -> NodeRegistration
     where
         Self: Sized,
     {
-        NodeRegistration::next(self.node_name, 0)
+        NodeRegistration::next(self.node_name, R::NEXT_COUNT)
+    }
+
+    #[inline]
+    fn node_initial_nexts(&self) -> &[NodeId] {
+        match self.next.as_ref() {
+            Some(next) => std::slice::from_ref(next),
+            None => &[],
+        }
     }
 }
 
-fn tun_input_driver_process(
+fn tun_driver_process<R: TunDriverDirection>(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> CoreResult<NodeResult> {
-    let slot = data.usize_word(1)?;
-    let inner = TunMain::inner_for_runtime_data(data)?;
-    let mut inner = inner
-        .lock()
-        .map_err(|_| CoreError::internal("tun main poisoned"))?;
-    let input = inner
-        .inputs
-        .get_mut(slot)
-        .ok_or_else(|| CoreError::internal("TUN input runtime slot is invalid"))?;
-    input.process(runtime, frame)
+    let r = DeviceRuntimeSlot::<R>::borrow_for_runtime_data(data)?;
+    r.process(runtime, frame)
 }
 
-fn tun_output_driver_process(
-    runtime: &DataPlaneRuntime,
-    data: NodeRuntimeData,
-    frame: &mut BufferFrame,
-) -> CoreResult<NodeResult> {
-    let slot = data.usize_word(1)?;
-    let inner = TunMain::inner_for_runtime_data(data)?;
-    let mut inner = inner
-        .lock()
-        .map_err(|_| CoreError::internal("tun main poisoned"))?;
-    let output = inner
-        .outputs
-        .get_mut(slot)
-        .ok_or_else(|| CoreError::internal("TUN output runtime slot is invalid"))?;
-    output.process(runtime, frame)
-}
+pub type TunInputDriverNode = TunDriverNode<TunInputRuntime>;
+pub type TunOutputDriverNode = TunDriverNode<TunOutputRuntime>;
 
 #[derive(Clone, Default)]
 pub struct MemoryTunDevice {
@@ -1575,37 +1452,97 @@ impl TunPacketSink for MemoryTunOutput {
         if batch_len != 0 {
             inner.output_batch_sizes.push(batch_len);
         }
-        let mut processed = 0usize;
-        let mut send_result = Ok(());
-        {
-            let mut cursor = frame.batch_cursor(runtime.preferred_frame_batch_width());
-            cursor.prefetch_next(runtime);
-            'send: while let Some(batch) = cursor.next() {
-                cursor.prefetch_next(runtime);
-                for index in batch.indices() {
-                    let packet = tun_output_packet(runtime, index, mode);
-                    runtime.free_index(index);
-                    processed += 1;
-                    match packet {
-                        Ok(packet) => inner.output.push(packet),
-                        Err(err) => {
-                            send_result = Err(err);
-                            break 'send;
-                        }
-                    }
-                }
+        let indices = frame.pending_indices();
+        let len = indices.len();
+        let mut read = 0usize;
+        while read + 4 <= len {
+            if read + 4 < len {
+                runtime.prefetch_header(indices[read + 4]);
             }
+            if read + 5 < len {
+                runtime.prefetch_header(indices[read + 5]);
+            }
+            if read + 6 < len {
+                runtime.prefetch_header(indices[read + 6]);
+            }
+            if read + 7 < len {
+                runtime.prefetch_header(indices[read + 7]);
+            }
+            let index0 = indices[read];
+            let index1 = indices[read + 1];
+            let index2 = indices[read + 2];
+            let index3 = indices[read + 3];
+            memory_tun_output_index(runtime, &mut inner.output, index0, mode)?;
+            memory_tun_output_index(runtime, &mut inner.output, index1, mode)?;
+            memory_tun_output_index(runtime, &mut inner.output, index2, mode)?;
+            memory_tun_output_index(runtime, &mut inner.output, index3, mode)?;
+            read += 4;
         }
-        if let Err(err) = send_result {
-            for index in frame.pending_indices()[processed..].iter().copied() {
-                runtime.free_index(index);
+        if read + 2 <= len {
+            if read + 2 < len {
+                runtime.prefetch_header(indices[read + 2]);
             }
-            frame.clear();
-            return Err(err);
+            if read + 3 < len {
+                runtime.prefetch_header(indices[read + 3]);
+            }
+            let index0 = indices[read];
+            let index1 = indices[read + 1];
+            memory_tun_output_index(runtime, &mut inner.output, index0, mode)?;
+            memory_tun_output_index(runtime, &mut inner.output, index1, mode)?;
+            read += 2;
+        }
+        while read < len {
+            if read + 1 < len {
+                runtime.prefetch_header(indices[read + 1]);
+            }
+            let index0 = indices[read];
+            memory_tun_output_index(runtime, &mut inner.output, index0, mode)?;
+            read += 1;
         }
         frame.clear();
         Ok(batch_len)
     }
+}
+
+fn memory_tun_output_index(
+    runtime: &DataPlaneRuntime,
+    output: &mut Vec<Vec<u8>>,
+    index: BufferIndex,
+    mode: TunDriverMode,
+) -> CoreResult<()> {
+    let mut tap_header = None;
+    {
+        let buffer = runtime.get_buffer(index)?;
+        if mode.is_tap() {
+            let opaque = unsafe { transmute::<_, &TunOpaque>(buffer.opaque2()) };
+            if let Some(tap) = opaque.tap_ethernet
+                && !tap.header_present
+            {
+                tap_header = Some(tap.header());
+            }
+        }
+    }
+    let payload_len = packet_total_len(runtime, index)?;
+    let capacity = payload_len
+        .checked_add(if tap_header.is_some() {
+            ETHERNET_HEADER_LEN
+        } else {
+            0
+        })
+        .ok_or_else(|| CoreError::internal("memory TAP packet length overflow"))?;
+    let mut packet = Vec::with_capacity(capacity);
+    if let Some(header) = tap_header {
+        packet.extend_from_slice(&header);
+    }
+    let mut chain = runtime.chain(index);
+    while let Some(buffer) = chain.next() {
+        let buffer = buffer?;
+        packet.extend_from_slice(buffer.current());
+    }
+    drop(chain);
+    runtime.free_index(index);
+    output.push(packet);
+    Ok(())
 }
 
 #[inline]
@@ -1619,14 +1556,20 @@ fn push_packet_to_frame(
     let Some((packet, tap_ethernet)) = packet_for_mode(mode, packet) else {
         return Ok(false);
     };
-    let index = runtime.alloc_index_with_bytes(packet)?;
-    let mut buffer = runtime.get_buffer_mut(index)?;
-    if parse_ip_packet(packet).is_err() {
-        runtime.free_index(index);
-        return Ok(false);
+    let index = runtime.alloc_index()?;
+    {
+        let mut buffer = runtime.get_buffer_mut(index)?;
+        let dst = buffer.writable_tail_mut();
+        if packet.len() > dst.len() {
+            drop(buffer);
+            runtime.free_index(index);
+            return Err(CoreError::internal("TUN packet exceeds buffer capacity"));
+        }
+        dst[..packet.len()].copy_from_slice(packet);
+        buffer.commit_writable_tail(packet.len())?;
+        let opaque = unsafe { transmute::<_, &mut TunOpaque>(buffer.opaque2_mut()) };
+        opaque.tap_ethernet = tap_ethernet;
     }
-    let opaque = unsafe { transmute::<_, &mut TunOpaque>(buffer.opaque2_mut()) };
-    opaque.tap_ethernet = tap_ethernet;
     if let Err(err) = frame.push_index(index) {
         runtime.free_index(index);
         return Err(err);
@@ -1657,28 +1600,4 @@ fn packet_for_mode(
         &packet[ETHERNET_HEADER_LEN..],
         Some(TapEthernetMetadata::new(destination, source, ethertype)),
     ))
-}
-
-#[inline]
-fn tun_output_packet(
-    runtime: &DataPlaneRuntime,
-    index: hammer_adapter::BufferIndex,
-    mode: TunDriverMode,
-) -> CoreResult<Vec<u8>> {
-    let packet = runtime.copy_packet(index)?;
-    if !mode.is_tap() {
-        return Ok(packet);
-    }
-    let buffer = runtime.get_buffer(index)?;
-    let opaque = unsafe { transmute::<_, &TunOpaque>(buffer.opaque2()) };
-    let Some(tap) = opaque.tap_ethernet else {
-        return Ok(packet);
-    };
-    if tap.header_present {
-        return Ok(packet);
-    }
-    let mut frame = Vec::with_capacity(ETHERNET_HEADER_LEN + packet.len());
-    frame.extend_from_slice(&tap.header());
-    frame.extend_from_slice(&packet);
-    Ok(frame)
 }

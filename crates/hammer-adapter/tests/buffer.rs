@@ -10,6 +10,8 @@ use hammer_adapter::{
     BufferPool, BufferPoolArena, DataPlaneBuffers, DataPlaneHandoff, DataPlaneInstructionSet,
     DataPlaneRuntime, DataWorkerId, FrameBatchWidth,
 };
+use hammer_core::error::CoreResult;
+use hammer_infra::vec::Vec;
 
 #[derive(Default)]
 struct WakeCounter {
@@ -26,6 +28,23 @@ impl Wake for WakeCounter {
     }
 }
 
+fn chain_bytes(pool: &BufferPool, index: BufferIndex) -> CoreResult<Vec<u8>> {
+    let mut out = Vec::new();
+    for buffer in pool.chain(index) {
+        out.extend_from_slice(buffer?.current());
+    }
+    Ok(out)
+}
+
+fn chain_len(pool: &BufferPool, index: BufferIndex) -> CoreResult<usize> {
+    let mut len = 0usize;
+    for buffer in pool.chain(index) {
+        let _ = buffer?;
+        len += 1;
+    }
+    Ok(len)
+}
+
 #[test]
 fn buffer_header_keeps_hot_metadata_in_first_cacheline() {
     assert_eq!(align_of::<hammer_adapter::Buffer>(), 64);
@@ -40,7 +59,7 @@ fn buffer_pool_free_index_releases_slot_for_reuse_with_new_generation() {
         .expect("alloc first buffer");
     assert_eq!(pool.in_use(), 1);
     assert_eq!(
-        pool.copy_current(first_index).expect("first current"),
+        pool.get(first_index).expect("first current").current(),
         b"hello"
     );
     pool.free_index(first_index);
@@ -55,7 +74,7 @@ fn buffer_pool_free_index_releases_slot_for_reuse_with_new_generation() {
     assert_ne!(second_index.generation(), first_index.generation());
     assert!(pool.get(first_index).is_err());
     assert_eq!(
-        pool.copy_current(second_index).expect("second current"),
+        pool.get(second_index).expect("second current").current(),
         b"world"
     );
     pool.free_index(second_index);
@@ -70,25 +89,25 @@ fn buffer_cursor_headroom_and_append_manage_current_bytes() {
 
     pool.advance(buffer, 3).expect("advance current");
     assert_eq!(
-        pool.copy_current(buffer).expect("advanced current"),
+        pool.get(buffer).expect("advanced current").current(),
         b"load"
     );
 
     pool.prepend(buffer, b"pre").expect("prepend into headroom");
     assert_eq!(
-        pool.copy_current(buffer).expect("prepended current"),
+        pool.get(buffer).expect("prepended current").current(),
         b"preload"
     );
 
     pool.append(buffer, b"-tail").expect("append current");
     assert_eq!(
-        pool.copy_packet(buffer).expect("appended packet"),
+        chain_bytes(&pool, buffer).expect("appended buffer"),
         b"preload-tail"
     );
 
     pool.truncate_current(buffer, 7).expect("truncate current");
     assert_eq!(
-        pool.copy_current(buffer).expect("truncated current"),
+        pool.get(buffer).expect("truncated current").current(),
         b"preload"
     );
     pool.free_index(buffer);
@@ -103,14 +122,14 @@ fn empty_buffer_allocation_reserves_default_packet_headroom() {
     pool.prepend(buffer, b"header").expect("prepend header");
 
     assert_eq!(
-        pool.copy_current(buffer).expect("prepended packet"),
+        pool.get(buffer).expect("prepended packet").current(),
         b"headerpayload"
     );
     pool.free_index(buffer);
 }
 
 #[test]
-fn buffer_batch_mut_processes_multiple_buffers_under_one_borrow() {
+fn runtime_get_buffer_mut_processes_multiple_buffers_sequentially() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_buffer_capacity(32, 2);
     let first = runtime
         .alloc_index_with_bytes(b"alpha")
@@ -120,25 +139,25 @@ fn buffer_batch_mut_processes_multiple_buffers_under_one_borrow() {
         .expect("alloc second buffer");
 
     {
-        let mut batch = runtime.buffer_batch_mut();
-        batch
-            .with_buffer_mut(first, |buffer| {
-                buffer.current_mut()[0] = b'A';
-            })
-            .expect("mutate first buffer");
-        batch
-            .with_buffer_mut(second, |buffer| {
-                buffer.current_mut()[0] = b'B';
-            })
-            .expect("mutate second buffer");
+        runtime
+            .get_buffer_mut(first)
+            .expect("first buffer mut")
+            .current_mut()[0] = b'A';
+        runtime
+            .get_buffer_mut(second)
+            .expect("second buffer mut")
+            .current_mut()[0] = b'B';
     }
 
     assert_eq!(
-        runtime.copy_current(first).expect("first current"),
+        runtime.get_buffer(first).expect("first current").current(),
         b"Alpha"
     );
     assert_eq!(
-        runtime.copy_current(second).expect("second current"),
+        runtime
+            .get_buffer(second)
+            .expect("second current")
+            .current(),
         b"Bravo"
     );
     runtime.free_index(first);
@@ -146,19 +165,27 @@ fn buffer_batch_mut_processes_multiple_buffers_under_one_borrow() {
 }
 
 #[test]
-fn buffer_batch_mut_exposes_direct_buffer_borrows() {
+fn runtime_get_buffer_exposes_direct_buffer_borrows() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_buffer_capacity(32, 1);
     let index = runtime
         .alloc_index_with_bytes(b"alpha")
         .expect("alloc buffer");
 
     {
-        let mut batch = runtime.buffer_batch_mut();
-        assert_eq!(batch.buffer(index).expect("buffer").current(), b"alpha");
-        batch.buffer_mut(index).expect("buffer mut").current_mut()[0] = b'A';
+        assert_eq!(
+            runtime.get_buffer(index).expect("buffer").current(),
+            b"alpha"
+        );
+        runtime
+            .get_buffer_mut(index)
+            .expect("buffer mut")
+            .current_mut()[0] = b'A';
     }
 
-    assert_eq!(runtime.copy_current(index).expect("current"), b"Alpha");
+    assert_eq!(
+        runtime.get_buffer(index).expect("current").current(),
+        b"Alpha"
+    );
     runtime.free_index(index);
     assert_eq!(runtime.in_use_buffers(), 0);
 }
@@ -193,7 +220,7 @@ fn buffer_exposes_vpp_style_current_pointer_and_advance() {
     }
 
     runtime
-        .packet_buffers()
+        .buffers()
         .advance(buffer, b"network-".len() as isize)
         .expect("advance");
 
@@ -207,29 +234,27 @@ fn buffer_exposes_vpp_style_current_pointer_and_advance() {
         }
     }
 
-    assert_eq!(runtime.copy_current(buffer).expect("current"), b"Transport");
+    assert_eq!(
+        runtime.get_buffer(buffer).expect("current").current(),
+        b"Transport"
+    );
     runtime.free_index(buffer);
 }
 
 #[test]
-fn buffer_packet_cursor_lives_in_buffer_control_area() {
-    let pool = BufferPool::with_capacity(128, 1);
-    let buffer = pool
-        .alloc_index_with_bytes(b"packet")
-        .expect("alloc buffer");
+fn buffer_packet_cursor_records_header_offsets() {
     let cursor = BufferPacketCursor::new()
         .with_packet_len(64)
         .with_network_header(0, 20)
         .with_transport_header(20, 8)
         .with_transport_payload_offset(28);
 
-    pool.get_mut(buffer)
-        .expect("buffer mut")
-        .set_packet_cursor(cursor);
-
-    assert_eq!(pool.packet_cursor(buffer).expect("read cursor"), cursor);
-
-    pool.free_index(buffer);
+    assert_eq!(cursor.packet_len(), 64);
+    assert_eq!(cursor.network_header_offset(), 0);
+    assert_eq!(cursor.network_header_len(), 20);
+    assert_eq!(cursor.transport_header_offset(), 20);
+    assert_eq!(cursor.transport_header_len(), 8);
+    assert_eq!(cursor.transport_payload_offset(), 28);
 }
 
 #[test]
@@ -241,9 +266,9 @@ fn append_beyond_one_slot_creates_and_frees_chain() {
 
     pool.append(buffer, b"7890abcdef").expect("append chain");
 
-    assert!(pool.next_buffer(buffer).expect("buffer next").is_some());
+    assert!(chain_len(&pool, buffer).expect("chain len") > 1);
     assert_eq!(
-        pool.copy_packet(buffer).expect("chained packet"),
+        chain_bytes(&pool, buffer).expect("chained buffer"),
         b"1234567890abcdef"
     );
     assert!(pool.in_use() > 1);
@@ -259,9 +284,9 @@ fn alloc_with_bytes_beyond_one_slot_creates_chain() {
         .alloc_index_with_bytes(b"abcdefghijkl")
         .expect("alloc chained buffer");
 
-    assert!(pool.next_buffer(buffer).expect("buffer next").is_some());
+    assert!(chain_len(&pool, buffer).expect("chain len") > 1);
     assert_eq!(
-        pool.copy_packet(buffer).expect("chained packet"),
+        chain_bytes(&pool, buffer).expect("chained buffer"),
         b"abcdefghijkl"
     );
     assert_eq!(pool.in_use(), 3);
@@ -269,7 +294,7 @@ fn alloc_with_bytes_beyond_one_slot_creates_chain() {
 }
 
 #[test]
-fn buffer_chain_can_detach_and_chain_buffer_without_copying_payload() {
+fn buffer_chain_buffer_links_existing_chain_without_copying_payload() {
     let pool = BufferPool::with_capacity(8, 8);
     let head = pool.alloc_index_with_bytes(b"head").expect("alloc head");
     let tail = pool
@@ -280,9 +305,9 @@ fn buffer_chain_can_detach_and_chain_buffer_without_copying_payload() {
     pool.chain_buffer(head, tail)
         .expect("append existing chain");
 
-    assert!(pool.next_buffer(head).expect("head next").is_some());
+    assert!(chain_len(&pool, head).expect("chain len") > 1);
     assert_eq!(
-        pool.copy_packet(head).expect("combined chain"),
+        chain_bytes(&pool, head).expect("combined chain"),
         b"headtaildata"
     );
     assert_eq!(
@@ -290,15 +315,7 @@ fn buffer_chain_can_detach_and_chain_buffer_without_copying_payload() {
         tail_ptr
     );
 
-    let detached = pool.detach_next(head).expect("detach next");
-
-    assert_eq!(detached, Some(tail));
-    assert!(pool.next_buffer(head).expect("head detached").is_none());
-    assert_eq!(pool.copy_packet(head).expect("head packet"), b"head");
-    assert_eq!(pool.copy_packet(tail).expect("tail packet"), b"taildata");
-
     pool.free_index(head);
-    pool.free_index(tail);
     assert_eq!(pool.in_use(), 0);
 }
 
@@ -317,7 +334,7 @@ fn attach_clone_keeps_tail_alive_until_both_chains_are_freed() {
         .expect("attach clone");
 
     assert_eq!(
-        pool.copy_packet(output_head).expect("output chain"),
+        chain_bytes(&pool, output_head).expect("output chain"),
         b"headtaildata"
     );
     assert_eq!(
@@ -330,8 +347,7 @@ fn attach_clone_keeps_tail_alive_until_both_chains_are_freed() {
     pool.free_index(output_head);
 
     assert_eq!(
-        pool.copy_packet(session_tail)
-            .expect("tail survives output free"),
+        chain_bytes(&pool, session_tail).expect("tail survives output free"),
         b"taildata"
     );
     assert_eq!(
@@ -359,7 +375,7 @@ fn freeing_head_with_attached_clone_does_not_free_session_tail() {
     pool.free_index(output_head);
 
     assert_eq!(
-        pool.copy_packet(session_tail).expect("tail survives"),
+        chain_bytes(&pool, session_tail).expect("tail survives"),
         b"payload"
     );
     assert_eq!(pool.in_use(), 1);
@@ -384,8 +400,7 @@ fn freeing_original_tail_after_output_head_returns_storage_once() {
     pool.free_index(session_tail);
 
     assert_eq!(
-        pool.copy_packet(output_head)
-            .expect("head keeps tail alive"),
+        chain_bytes(&pool, output_head).expect("head keeps tail alive"),
         b"headpayload"
     );
     assert_eq!(pool.in_use(), 2);
@@ -452,12 +467,11 @@ fn shared_tail_rejects_payload_mutation_but_allows_independent_header_views() {
     pool.advance(output_head, 2)
         .expect("advance cloned header view");
     assert_eq!(
-        pool.copy_packet(output_head).expect("cloned view advanced"),
+        chain_bytes(&pool, output_head).expect("cloned view advanced"),
         b"adpayload"
     );
     assert_eq!(
-        pool.copy_packet(session_tail)
-            .expect("original view intact"),
+        chain_bytes(&pool, session_tail).expect("original view intact"),
         b"payload"
     );
 
@@ -487,13 +501,12 @@ fn shared_tail_rejects_chain_link_mutation_but_allows_clone_head_truncate() {
         .expect("truncate clone head only");
 
     assert_eq!(
-        pool.copy_packet(output_head).expect("clone view trimmed"),
+        chain_bytes(&pool, output_head).expect("clone view trimmed"),
         b"head"
     );
 
     assert_eq!(
-        pool.copy_packet(session_tail)
-            .expect("tail chain unchanged"),
+        chain_bytes(&pool, session_tail).expect("tail chain unchanged"),
         b"abcdefgh"
     );
 
@@ -507,7 +520,7 @@ fn buffer_advance_can_discard_prefix_across_chain_segments() {
     let pool = BufferPool::with_capacity(4, 8);
     let packet = pool
         .alloc_index_with_bytes(b"abcdefghijkl")
-        .expect("alloc chained packet");
+        .expect("alloc chained buffer");
 
     pool.advance(packet, 6).expect("advance across chain");
 
@@ -517,7 +530,7 @@ fn buffer_advance_can_discard_prefix_across_chain_segments() {
     drop(buffer);
 
     assert_eq!(
-        pool.copy_packet(packet).expect("remaining packet"),
+        chain_bytes(&pool, packet).expect("remaining buffer"),
         b"ghijkl"
     );
 
@@ -535,16 +548,16 @@ fn buffer_pool_reports_single_segment_and_chained_packets() {
         .alloc_index_with_bytes(b"abcdefghij")
         .expect("alloc chained buffer");
 
-    assert!(pool.next_buffer(single).expect("single next").is_none());
-    assert!(pool.next_buffer(chained).expect("chained next").is_some());
-    assert_eq!(pool.copy_current(single).expect("single current"), b"abc");
-    assert_eq!(pool.copy_packet(single).expect("single packet"), b"abc");
+    assert_eq!(chain_len(&pool, single).expect("single chain len"), 1);
+    assert!(chain_len(&pool, chained).expect("chained chain len") > 1);
+    assert_eq!(pool.get(single).expect("single current").current(), b"abc");
+    assert_eq!(chain_bytes(&pool, single).expect("single buffer"), b"abc");
     assert_eq!(
-        pool.copy_current(chained).expect("chained current"),
+        pool.get(chained).expect("chained current").current(),
         b"abcd"
     );
     assert_eq!(
-        pool.copy_packet(chained).expect("chained packet"),
+        chain_bytes(&pool, chained).expect("chained buffer"),
         b"abcdefghij"
     );
 
@@ -626,8 +639,14 @@ fn buffer_pool_rejects_index_from_another_runtime() {
     assert_eq!(first_index.generation(), second_index.generation());
     assert_ne!(first_index.pool_id(), second_index.pool_id());
     assert!(second_pool.get(first_index).is_err());
-    assert!(second_pool.copy_packet(first_index).is_err());
-    assert!(second_pool.next_buffer(first_index).is_err());
+    assert!(chain_bytes(&second_pool, first_index).is_err());
+    assert!(
+        second_pool
+            .chain(first_index)
+            .next()
+            .expect("first chain item")
+            .is_err()
+    );
 
     first_pool.free_index(first_index);
     second_pool.free_index(second_index);
@@ -719,7 +738,7 @@ fn legacy_handoff_constructor_uses_first_runtime_buffer_arena() {
 #[test]
 fn buffer_frame_reset_does_not_free_buffers() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
-    let pool = runtime.buffers();
+    let pool = runtime.buffers().buffers();
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let first = pool
         .alloc_index_with_bytes(b"one")
@@ -738,12 +757,11 @@ fn buffer_frame_reset_does_not_free_buffers() {
     assert!(frame.is_empty());
     assert_eq!(pool.in_use(), 2);
     assert_eq!(
-        pool.copy_packet(first).expect("first buffer remains live"),
+        chain_bytes(&pool, first).expect("first buffer remains live"),
         b"one"
     );
     assert_eq!(
-        pool.copy_packet(second)
-            .expect("second buffer remains live"),
+        chain_bytes(&pool, second).expect("second buffer remains live"),
         b"two"
     );
 
@@ -757,7 +775,7 @@ fn buffer_frame_reset_does_not_free_buffers() {
 #[test]
 fn buffer_pool_free_frame_releases_all_indices_and_reuses_frame() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
-    let pool = runtime.buffers();
+    let pool = runtime.buffers().buffers();
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let first = pool
         .alloc_index_with_bytes(b"one")
@@ -791,7 +809,7 @@ fn buffer_pool_free_frame_releases_all_indices_and_reuses_frame() {
 #[test]
 fn buffer_frame_drain_indices_preserves_order_without_freeing() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
-    let pool = runtime.buffers();
+    let pool = runtime.buffers().buffers();
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let first = pool
         .alloc_index_with_bytes(b"first")
@@ -808,13 +826,11 @@ fn buffer_frame_drain_indices_preserves_order_without_freeing() {
     assert_eq!(pool.in_use(), 2);
     assert_eq!(drained, vec![first, second]);
     assert_eq!(
-        pool.copy_packet(drained[0])
-            .expect("first buffer remains live"),
+        chain_bytes(&pool, drained[0]).expect("first buffer remains live"),
         b"first"
     );
     assert_eq!(
-        pool.copy_packet(drained[1])
-            .expect("second buffer remains live"),
+        chain_bytes(&pool, drained[1]).expect("second buffer remains live"),
         b"second"
     );
 
@@ -830,7 +846,7 @@ fn buffer_frame_drain_indices_preserves_order_without_freeing() {
 #[test]
 fn buffer_frame_tracks_pending_indices_until_drained() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
-    let pool = runtime.buffers();
+    let pool = runtime.buffers().buffers();
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let first = pool
         .alloc_index_with_bytes(b"first")
@@ -867,7 +883,7 @@ fn buffer_frame_tracks_pending_indices_until_drained() {
 #[test]
 fn buffer_frame_pending_future_wakes_when_index_is_pushed() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 2, 1, 1);
-    let pool = runtime.buffers();
+    let pool = runtime.buffers().buffers();
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let index = pool
         .alloc_index_with_bytes(b"packet")
@@ -900,7 +916,7 @@ fn buffer_frame_pending_future_wakes_when_index_is_pushed() {
 #[test]
 fn buffer_frame_push_indices_batches_one_wake() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
-    let pool = runtime.buffers();
+    let pool = runtime.buffers().buffers();
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let first = pool
         .alloc_index_with_bytes(b"first")
@@ -934,7 +950,7 @@ fn buffer_frame_push_indices_batches_one_wake() {
 #[test]
 fn buffer_frame_pair_batch_cursor_splits_into_pairs_then_tail() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 8, 8, 1);
-    let pool = runtime.buffers();
+    let pool = runtime.buffers().buffers();
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let indices = (0..5)
         .map(|value| {
@@ -966,7 +982,7 @@ fn buffer_frame_pair_batch_cursor_splits_into_pairs_then_tail() {
 #[test]
 fn buffer_frame_quad_batch_cursor_splits_into_quad_pair_then_tail() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 8, 8, 1);
-    let pool = runtime.buffers();
+    let pool = runtime.buffers().buffers();
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let indices = (0..7)
         .map(|value| {
@@ -1099,7 +1115,7 @@ fn buffer_frame_batch_dispatch_uses_runtime_preferred_width() {
 #[test]
 fn buffer_frame_pending_future_observes_reset_before_processing() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 2, 1, 1);
-    let pool = runtime.buffers();
+    let pool = runtime.buffers().buffers();
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let first = pool
         .alloc_index_with_bytes(b"first")
@@ -1142,7 +1158,7 @@ fn buffer_frame_pending_future_observes_reset_before_processing() {
 #[test]
 fn buffer_frame_push_index_respects_preallocated_capacity() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 1, 1);
-    let pool = runtime.buffers();
+    let pool = runtime.buffers().buffers();
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let first = pool
         .alloc_index_with_bytes(b"first")
@@ -1195,8 +1211,8 @@ fn data_plane_runtime_allocates_frame_indices_from_reusable_pool() {
 
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
-    assert!(runtime.copy_packet(first).is_err());
-    assert!(runtime.copy_packet(second).is_err());
+    assert!(chain_bytes(runtime.buffers().buffers(), first).is_err());
+    assert!(chain_bytes(runtime.buffers().buffers(), second).is_err());
 
     let reused_frame_index = runtime.alloc_frame_index().expect("reuse pooled frame");
     assert_eq!(reused_frame_index.slot(), frame_index.slot());
@@ -1264,7 +1280,7 @@ fn data_plane_runtime_checks_out_pooled_frame_for_packet_interfaces() {
 
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
-    assert!(runtime.copy_packet(buffer).is_err());
+    assert!(chain_bytes(runtime.buffers().buffers(), buffer).is_err());
 
     let reused_frame = runtime.alloc_pooled_frame().expect("reuse pooled frame");
     assert_eq!(reused_frame.index().slot(), frame_index.slot());

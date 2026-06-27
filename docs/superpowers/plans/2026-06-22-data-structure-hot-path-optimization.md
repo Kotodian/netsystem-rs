@@ -580,9 +580,7 @@ Expected: 若 cursor/header 过大则 FAIL；否则后面的 tcp prefetch 测试
 #[repr(C, align(64))]
 pub struct Buffer {
     // cacheline0: routing/header/chain hot state
-    metadata: RouteMetadata,
     opaque: PrimaryOpaque,
-    opaque2: SecondaryOpaque,
     packet_cursor: BufferPacketCursor,
     flags: BufferFlags,
     ref_count: usize,
@@ -590,6 +588,8 @@ pub struct Buffer {
     current_len: usize,
     data_len: usize,
     next_buffer: Option<BufferIndex>,
+    // cacheline1: trace/chain tail length/secondary opaque
+    opaque2: SecondaryOpaque,
     total_len_not_including_first: usize,
     // colder fields follow
     node_error: Option<BufferNodeError>,
@@ -680,7 +680,7 @@ Expected: 全部 PASS；不要求在本任务里引入 benchmark 基建。
 ```markdown
 ## 执行结果
 
-- `RouteMetadata`、`PacketMetadataOpaque`、`route_metadata` 已从 `crates/` 源码树移除；`dns`、`direct`、`hysteria2`、`vless`、`proxy inbound`、`tls` 相关源码入口也已删除，仅保留与当前 VPP dataplane 对齐的 `tun` 路径。
+- 旧的路由元数据结构和非 VPP dataplane 路径已从 `crates/` 源码树移除，仅保留与当前 VPP dataplane 对齐的 `tun` 路径。
 - `PacketBufferCacheline0` / `PacketBufferCacheline1` 已固定为 64-byte 对齐布局；`Buffer` 也已保持 64-byte 对齐，并通过 `packet_buffer` / `buffer` 测试覆盖布局约束。
 - buffer prefetch 已按 header/data 分层落地：`prefetch_header()` 只预取 cacheline0，`prefetch_read()` 顺序预取 cacheline0、cacheline1 和当前 data，语义对齐 VPP 的 header/data prefetch 分层。
 - `FlatHashTable` 已支持 `clear()` 并在 ready/session 索引中复用容量；`Pool` 已改为用 `Bitmap` 管理 free slot，`hammer-infra` 也已新增通用 `RbTree`。

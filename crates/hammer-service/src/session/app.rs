@@ -3,6 +3,7 @@ use std::sync::Arc;
 use hammer_adapter::{BufferIndex, DataPlaneBuffers};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::map::FlatHashTable;
+use hammer_infra::ring::LockFreeRing;
 use hammer_infra::svm_msg_q::SessionEvtType;
 use hammer_infra::vec::Vec;
 use hammer_runtime::app::AppSession;
@@ -13,28 +14,38 @@ use crate::session::{SessionId, SessionReadyQueue};
 pub struct SessionAppRuntime {
     buffers: DataPlaneBuffers,
     sessions: FlatHashTable<u64, Arc<AppSession>>,
-    ready_tx: SessionReadyQueue,
-    ready_rx: SessionReadyQueue,
+    sessions_by_index: Vec<Option<SessionId>>,
+    tx_evt_q: Arc<LockFreeRing<u32>>,
 }
 
 impl SessionAppRuntime {
     #[inline]
-    pub fn new(buffers: DataPlaneBuffers) -> Self {
+    pub fn new(
+        session_capacity: usize,
+        buffers: DataPlaneBuffers,
+        tx_evt_q: Arc<LockFreeRing<u32>>,
+    ) -> Self {
         Self {
             buffers,
             sessions: FlatHashTable::new(),
-            ready_tx: SessionReadyQueue::new(),
-            ready_rx: SessionReadyQueue::new(),
+            sessions_by_index: Vec::from_elem_copy(session_capacity, None),
+            tx_evt_q,
         }
     }
 
     pub(crate) fn attach_session(&mut self, session_id: SessionId, session: Arc<AppSession>) {
         self.sessions.insert(session_id.get(), session);
+        let slot = session_id.pool_index().slot() as usize;
+        if let Some(entry) = self.sessions_by_index.get_mut(slot) {
+            *entry = Some(session_id);
+        }
     }
 
     pub(crate) fn detach_session(&mut self, session_id: SessionId) -> Option<Arc<AppSession>> {
-        self.ready_tx.take(session_id);
-        self.ready_rx.take(session_id);
+        let slot = session_id.pool_index().slot() as usize;
+        if let Some(entry) = self.sessions_by_index.get_mut(slot) {
+            *entry = None;
+        }
         self.sessions.remove(&session_id.get())
     }
 
@@ -54,24 +65,6 @@ impl SessionAppRuntime {
         session
             .push_event(SessionEvtType::Close)
             .map_err(CoreError::from)
-    }
-
-    pub(crate) fn mark_tx_ready(&mut self, session_id: SessionId) {
-        self.ready_tx.mark_ready(session_id);
-    }
-
-    pub(crate) fn mark_rx_ready(&mut self, session_id: SessionId) {
-        self.ready_rx.mark_ready(session_id);
-    }
-
-    pub fn poll_tx_fifo_ready(&mut self) -> CoreResult<()> {
-        for (key, session) in self.sessions.iter() {
-            let session_id = SessionId::from_raw(key);
-            if session.tx_fifo().max_dequeue() != 0 {
-                self.ready_tx.mark_ready(session_id);
-            }
-        }
-        Ok(())
     }
 
     pub(crate) fn release_pending_send_bytes(
@@ -139,15 +132,13 @@ impl SessionAppRuntime {
         };
         let mut total = 0usize;
         let mut wrote = 0usize;
-        let mut current = Some(index);
-        while let Some(current_index) = current {
-            let buffer = buffers.get_buffer(current_index)?;
+        for buffer in buffers.chain(index) {
+            let buffer = buffer?;
             let chunk = buffer.current();
             total += chunk.len();
             if wrote == total - chunk.len() {
                 wrote += session.enqueue_rx(chunk).map_err(CoreError::from)?;
             }
-            current = buffers.buffers().next_buffer(current_index)?;
         }
         buffers.free_index(index);
         Ok(wrote == total)
@@ -159,18 +150,43 @@ impl SessionAppRuntime {
         }
     }
 
-    pub(crate) fn take_ready_tx_sessions(&mut self) -> Vec<SessionId> {
-        self.ready_tx.take_ready_sessions()
-    }
-
-    pub(crate) fn take_ready_sessions(&mut self) -> Vec<SessionId> {
-        self.ready_rx.take_ready_sessions()
+    pub(crate) fn drain_tx_events_to(&self, ready: &mut SessionReadyQueue) -> usize {
+        let mut scheduled = 0usize;
+        let mut batch = [0u32; 64];
+        loop {
+            let count = self.tx_evt_q.dequeue_batch(&mut batch);
+            if count == 0 {
+                break;
+            }
+            for session_index in batch[..count].iter().copied() {
+                let Some(Some(session_id)) = self.sessions_by_index.get(session_index as usize)
+                else {
+                    continue;
+                };
+                let Some(session) = self.sessions.lookup(&session_id.get()) else {
+                    continue;
+                };
+                session.clear_tx_event();
+                ready.mark_ready(*session_id);
+                scheduled += 1;
+            }
+            if count < batch.len() {
+                break;
+            }
+        }
+        scheduled
     }
 }
 
 impl Default for SessionAppRuntime {
     #[inline]
     fn default() -> Self {
-        Self::new(DataPlaneBuffers::with_buffer_capacity(2048, 1))
+        let tx_evt_q =
+            Arc::new(LockFreeRing::with_capacity(2048).expect("default tx event queue capacity"));
+        Self::new(
+            1024,
+            DataPlaneBuffers::with_buffer_capacity(2048, 1),
+            tx_evt_q,
+        )
     }
 }

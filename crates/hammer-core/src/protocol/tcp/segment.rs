@@ -1,9 +1,8 @@
-use std::mem::transmute;
-
 use super::{
     TcpCapabilities, TcpError, TcpFastOpenCookie, TcpSackBlock, TcpSegmentFlags, TcpTimestampOption,
 };
-use thiserror::Error;
+use crate::protocol::wire::{header_mut_ptr, read_header};
+use std::mem::size_of;
 
 const TCP_HEADER_MIN_LEN: usize = 20;
 const TCP_OPTION_EOL: u8 = 0;
@@ -13,7 +12,8 @@ const TCP_OPTION_SACK_BLOCK_BYTES: usize = 8;
 const TCP_MAX_SACK_BLOCKS: usize = 4;
 
 #[repr(C, packed)]
-struct TcpWireHeader {
+#[derive(Clone, Copy)]
+pub struct TcpWireHeader {
     source_port: [u8; 2],
     destination_port: [u8; 2],
     sequence_number: [u8; 4],
@@ -24,67 +24,106 @@ struct TcpWireHeader {
     urgent_pointer: [u8; 2],
 }
 
-#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-pub enum TcpSegmentParseError {
-    #[error("tcp packet has invalid IP header")]
-    InvalidIpHeader,
-    #[error("packet is not TCP")]
-    WrongProtocol,
-    #[error("tcp packet length is invalid")]
-    InvalidPacketLength,
-    #[error("tcp transport header is missing")]
-    MissingTransportHeader,
-    #[error("tcp payload offset overflow")]
-    PayloadOffsetOverflow,
-    #[error("tcp payload offset exceeds packet length")]
-    PayloadOffsetExceedsPacketLength,
-    #[error("tcp segment intent is missing")]
-    MissingIntent,
-    #[error("missing IPv4 source")]
-    MissingIpv4Source,
-    #[error("missing IPv6 source")]
-    MissingIpv6Source,
-    #[error("invalid IPv6 source length")]
-    InvalidIpv6SourceLength,
-    #[error("missing IPv4 destination")]
-    MissingIpv4Destination,
-    #[error("missing IPv6 destination")]
-    MissingIpv6Destination,
-    #[error("invalid IPv6 destination length")]
-    InvalidIpv6DestinationLength,
-    #[error("tcp segment is invalid")]
-    InvalidSegment,
-    #[error("tcp segment is invalid")]
-    ShortHeader,
-    #[error("tcp segment is invalid")]
-    BadDataOffset,
-    #[error("tcp segment is invalid")]
-    InvalidSlice,
+impl TcpWireHeader {
+    #[inline(always)]
+    pub fn header_len(self) -> usize {
+        usize::from(self.data_offset_reserved_flags[0] >> 4) * 4
+    }
+
+    #[inline(always)]
+    pub fn source_port(self) -> u16 {
+        u16::from_be_bytes(self.source_port)
+    }
+
+    #[inline(always)]
+    pub fn destination_port(self) -> u16 {
+        u16::from_be_bytes(self.destination_port)
+    }
+
+    #[inline(always)]
+    pub fn sequence_number(self) -> u32 {
+        u32::from_be_bytes(self.sequence_number)
+    }
+
+    #[inline(always)]
+    pub fn acknowledgment_number(self) -> u32 {
+        u32::from_be_bytes(self.acknowledgment_number)
+    }
+
+    #[inline(always)]
+    pub fn advertised_window(self) -> u16 {
+        u16::from_be_bytes(self.advertised_window)
+    }
+
+    #[inline(always)]
+    pub fn flags(self) -> TcpSegmentFlags {
+        let first = self.data_offset_reserved_flags[0];
+        let second = self.data_offset_reserved_flags[1];
+        let mut flags = TcpSegmentFlags::empty();
+        flags.set(TcpSegmentFlags::NS, first & 0x01 != 0);
+        flags.set(TcpSegmentFlags::FIN, second & 0x01 != 0);
+        flags.set(TcpSegmentFlags::SYN, second & 0x02 != 0);
+        flags.set(TcpSegmentFlags::RST, second & 0x04 != 0);
+        flags.set(TcpSegmentFlags::PSH, second & 0x08 != 0);
+        flags.set(TcpSegmentFlags::ACK, second & 0x10 != 0);
+        flags.set(TcpSegmentFlags::URG, second & 0x20 != 0);
+        flags.set(TcpSegmentFlags::ECE, second & 0x40 != 0);
+        flags.set(TcpSegmentFlags::CWR, second & 0x80 != 0);
+        flags
+    }
+
+    #[inline(always)]
+    fn set_source_port(&mut self, value: u16) {
+        self.source_port = [(value >> 8) as u8, value as u8];
+    }
+
+    #[inline(always)]
+    fn set_destination_port(&mut self, value: u16) {
+        self.destination_port = [(value >> 8) as u8, value as u8];
+    }
+
+    #[inline(always)]
+    fn set_sequence_number(&mut self, value: u32) {
+        self.sequence_number = [
+            (value >> 24) as u8,
+            (value >> 16) as u8,
+            (value >> 8) as u8,
+            value as u8,
+        ];
+    }
+
+    #[inline(always)]
+    fn set_acknowledgment_number(&mut self, value: u32) {
+        self.acknowledgment_number = [
+            (value >> 24) as u8,
+            (value >> 16) as u8,
+            (value >> 8) as u8,
+            value as u8,
+        ];
+    }
+
+    #[inline(always)]
+    fn set_data_offset_flags(&mut self, value: u16) {
+        self.data_offset_reserved_flags = [(value >> 8) as u8, value as u8];
+    }
+
+    #[inline(always)]
+    fn set_advertised_window(&mut self, value: u16) {
+        self.advertised_window = [(value >> 8) as u8, value as u8];
+    }
 }
 
-impl From<TcpSegmentParseError> for TcpError {
-    #[inline]
-    fn from(error: TcpSegmentParseError) -> Self {
-        match error {
-            TcpSegmentParseError::WrongProtocol => TcpError::Dispatch,
-            TcpSegmentParseError::MissingIntent => TcpError::Dispatch,
-            TcpSegmentParseError::InvalidIpHeader
-            | TcpSegmentParseError::InvalidPacketLength
-            | TcpSegmentParseError::MissingTransportHeader
-            | TcpSegmentParseError::PayloadOffsetOverflow
-            | TcpSegmentParseError::PayloadOffsetExceedsPacketLength
-            | TcpSegmentParseError::MissingIpv4Source
-            | TcpSegmentParseError::MissingIpv6Source
-            | TcpSegmentParseError::InvalidIpv6SourceLength
-            | TcpSegmentParseError::MissingIpv4Destination
-            | TcpSegmentParseError::MissingIpv6Destination
-            | TcpSegmentParseError::InvalidIpv6DestinationLength
-            | TcpSegmentParseError::InvalidSegment
-            | TcpSegmentParseError::ShortHeader
-            | TcpSegmentParseError::BadDataOffset
-            | TcpSegmentParseError::InvalidSlice => TcpError::SegmentInvalid,
-        }
+#[inline]
+pub fn tcp_header(packet: &[u8]) -> Result<TcpWireHeader, TcpError> {
+    let header = read_header::<TcpWireHeader>(packet, 0).map_err(|_| TcpError::SegmentInvalid)?;
+    let header_len = header.header_len();
+    if header_len < size_of::<TcpWireHeader>() {
+        return Err(TcpError::SegmentInvalid);
     }
+    if packet.get(..header_len).is_none() {
+        return Err(TcpError::SegmentInvalid);
+    }
+    Ok(header)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,12 +150,12 @@ pub fn write_tcp_segment_header(
     }
     output[..header_len].fill(0);
     let wire = tcp_wire_header_mut(output);
-    wire.source_port = header.source_port.to_be_bytes();
-    wire.destination_port = header.destination_port.to_be_bytes();
-    wire.sequence_number = header.sequence_number.to_be_bytes();
-    wire.acknowledgment_number = header.acknowledgment_number.to_be_bytes();
-    wire.data_offset_reserved_flags = tcp_data_offset_flags(header_len, header.flags).to_be_bytes();
-    wire.advertised_window = header.advertised_window.to_be_bytes();
+    wire.set_source_port(header.source_port);
+    wire.set_destination_port(header.destination_port);
+    wire.set_sequence_number(header.sequence_number);
+    wire.set_acknowledgment_number(header.acknowledgment_number);
+    wire.set_data_offset_flags(tcp_data_offset_flags(header_len, header.flags));
+    wire.set_advertised_window(header.advertised_window);
     let options = &mut output[TCP_HEADER_MIN_LEN..header_len];
     write_tcp_options(options, header, sack_blocks);
     Ok(header_len)
@@ -132,9 +171,11 @@ pub fn tcp_segment_header_len(
 
 #[inline(always)]
 fn tcp_wire_header_mut(output: &mut [u8]) -> &mut TcpWireHeader {
-    // SAFETY: caller guarantees `output` has at least `TCP_HEADER_MIN_LEN`
-    // bytes. `TcpWireHeader` is packed, so alignment is 1.
-    unsafe { &mut *transmute::<_, *mut TcpWireHeader>(output.as_mut_ptr()) }
+    let ptr = header_mut_ptr::<TcpWireHeader>(output, 0).expect("tcp header length checked");
+    // SAFETY: `header_mut_ptr` checked the header range, and `TcpWireHeader`
+    // contains only byte arrays so field access cannot create unaligned
+    // references to multi-byte fields.
+    unsafe { &mut *ptr }
 }
 
 #[inline(always)]
@@ -191,29 +232,23 @@ fn write_tcp_options(
     let mut written = 0usize;
     if header.flags.contains(TcpSegmentFlags::SYN) {
         if let Some(max_segment_size) = header.capabilities.max_segment_size {
-            output[written..written + 2].copy_from_slice(&[
-                super::options::TCP_OPTION_MSS_VALUE,
-                super::options::TCP_OPTION_MSS_LEN_VALUE as u8,
-            ]);
-            output[written + 2..written + 4].copy_from_slice(&max_segment_size.to_be_bytes());
+            output[written] = super::options::TCP_OPTION_MSS_VALUE;
+            output[written + 1] = super::options::TCP_OPTION_MSS_LEN_VALUE as u8;
+            write_be_u16(output, written + 2, max_segment_size);
             written += 4;
         }
         if let Some(window_scale) = header.capabilities.window_scale {
-            output[written..written + 4].copy_from_slice(&[
-                super::options::TCP_OPTION_NOP_VALUE,
-                super::options::TCP_OPTION_WINDOW_SCALE_VALUE,
-                super::options::TCP_OPTION_WINDOW_SCALE_LEN_VALUE as u8,
-                window_scale.min(super::options::TCP_MAX_WINDOW_SCALE_VALUE),
-            ]);
+            output[written] = super::options::TCP_OPTION_NOP_VALUE;
+            output[written + 1] = super::options::TCP_OPTION_WINDOW_SCALE_VALUE;
+            output[written + 2] = super::options::TCP_OPTION_WINDOW_SCALE_LEN_VALUE as u8;
+            output[written + 3] = window_scale.min(super::options::TCP_MAX_WINDOW_SCALE_VALUE);
             written += 4;
         }
         if header.capabilities.sack {
-            output[written..written + 4].copy_from_slice(&[
-                super::options::TCP_OPTION_NOP_VALUE,
-                super::options::TCP_OPTION_NOP_VALUE,
-                super::options::TCP_OPTION_SACK_PERMITTED_VALUE,
-                super::options::TCP_OPTION_SACK_PERMITTED_LEN_VALUE as u8,
-            ]);
+            output[written] = super::options::TCP_OPTION_NOP_VALUE;
+            output[written + 1] = super::options::TCP_OPTION_NOP_VALUE;
+            output[written + 2] = super::options::TCP_OPTION_SACK_PERMITTED_VALUE;
+            output[written + 3] = super::options::TCP_OPTION_SACK_PERMITTED_LEN_VALUE as u8;
             written += 4;
         }
         if header.capabilities.timestamps {
@@ -225,15 +260,17 @@ fn write_tcp_options(
                 .map_or(&[][..], TcpFastOpenCookie::as_slice);
             output[written] = super::options::TCP_OPTION_FAST_OPEN_VALUE;
             output[written + 1] = (2 + cookie.len()) as u8;
-            output[written + 2..written + 2 + cookie.len()].copy_from_slice(cookie);
+            let mut index = 0usize;
+            while index < cookie.len() {
+                output[written + 2 + index] = cookie[index];
+                index += 1;
+            }
             written += 2 + cookie.len();
         }
         if header.capabilities.accurate_ecn {
-            output[written..written + 3].copy_from_slice(&[
-                super::options::TCP_OPTION_NOP_VALUE,
-                super::options::TCP_OPTION_ACCURATE_ECN_ORDER_0_VALUE,
-                2,
-            ]);
+            output[written] = super::options::TCP_OPTION_NOP_VALUE;
+            output[written + 1] = super::options::TCP_OPTION_ACCURATE_ECN_ORDER_0_VALUE;
+            output[written + 2] = 2;
             written += 3;
         }
     } else if header.flags.contains(TcpSegmentFlags::ACK) {
@@ -243,18 +280,14 @@ fn write_tcp_options(
         if let Some(sack_blocks) = sack_blocks {
             let limited_sack_len = sack_blocks.len().min(TCP_MAX_SACK_BLOCKS);
             if limited_sack_len != 0 {
-                output[written..written + 4].copy_from_slice(&[
-                    TCP_OPTION_NOP,
-                    TCP_OPTION_NOP,
-                    TCP_OPTION_SACK,
-                    (2 + limited_sack_len * TCP_OPTION_SACK_BLOCK_BYTES) as u8,
-                ]);
+                output[written] = TCP_OPTION_NOP;
+                output[written + 1] = TCP_OPTION_NOP;
+                output[written + 2] = TCP_OPTION_SACK;
+                output[written + 3] = (2 + limited_sack_len * TCP_OPTION_SACK_BLOCK_BYTES) as u8;
                 written += 4;
                 for block in &sack_blocks[..limited_sack_len] {
-                    output[written..written + 4]
-                        .copy_from_slice(&u32::from(block.left_edge).to_be_bytes());
-                    output[written + 4..written + 8]
-                        .copy_from_slice(&u32::from(block.right_edge).to_be_bytes());
+                    write_be_u32(output, written, u32::from(block.left_edge));
+                    write_be_u32(output, written + 4, u32::from(block.right_edge));
                     written += TCP_OPTION_SACK_BLOCK_BYTES;
                 }
             }
@@ -270,15 +303,27 @@ fn write_tcp_timestamp_option(
     timestamp: Option<TcpTimestampOption>,
 ) -> usize {
     let timestamp = timestamp.unwrap_or(TcpTimestampOption { tsval: 0, tsecr: 0 });
-    output[offset..offset + 4].copy_from_slice(&[
-        super::options::TCP_OPTION_NOP_VALUE,
-        super::options::TCP_OPTION_NOP_VALUE,
-        super::options::TCP_OPTION_TIMESTAMPS_VALUE,
-        super::options::TCP_OPTION_TIMESTAMPS_LEN_VALUE as u8,
-    ]);
-    output[offset + 4..offset + 8].copy_from_slice(&timestamp.tsval.to_be_bytes());
-    output[offset + 8..offset + 12].copy_from_slice(&timestamp.tsecr.to_be_bytes());
+    output[offset] = super::options::TCP_OPTION_NOP_VALUE;
+    output[offset + 1] = super::options::TCP_OPTION_NOP_VALUE;
+    output[offset + 2] = super::options::TCP_OPTION_TIMESTAMPS_VALUE;
+    output[offset + 3] = super::options::TCP_OPTION_TIMESTAMPS_LEN_VALUE as u8;
+    write_be_u32(output, offset + 4, timestamp.tsval);
+    write_be_u32(output, offset + 8, timestamp.tsecr);
     offset + 12
+}
+
+#[inline(always)]
+fn write_be_u16(output: &mut [u8], offset: usize, value: u16) {
+    output[offset] = (value >> 8) as u8;
+    output[offset + 1] = value as u8;
+}
+
+#[inline(always)]
+fn write_be_u32(output: &mut [u8], offset: usize, value: u32) {
+    output[offset] = (value >> 24) as u8;
+    output[offset + 1] = (value >> 16) as u8;
+    output[offset + 2] = (value >> 8) as u8;
+    output[offset + 3] = value as u8;
 }
 
 #[inline]

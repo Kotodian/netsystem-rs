@@ -211,9 +211,8 @@ impl DriverNode for SessionQueueNode {
 fn session_queue_node_process(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
-    frame: &mut BufferFrame,
+    _: &mut BufferFrame,
 ) -> CoreResult<NodeResult> {
-    frame.clear();
     let slot = data.usize_word(0)?;
     let attachments = SESSION_QUEUE_NODES.with(|nodes| {
         let nodes = nodes

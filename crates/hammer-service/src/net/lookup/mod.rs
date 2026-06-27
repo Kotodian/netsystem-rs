@@ -4,14 +4,14 @@ use std::mem::{size_of, transmute};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use arc_swap::ArcSwapOption;
 use hammer_adapter::{
-    BufferBatchMut, BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime,
-    ForwardingMetadata, InternalNode, Node, NodeId, NodeProcessFn, NodeRegistration, NodeResult,
-    NodeRuntimeData, PacketTrace, SecondaryOpaque, TapEthernetMetadata, TraceFormatter,
-    add_packet_trace, unlikely,
+    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, InternalNode, Node, NodeId,
+    NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData, PacketTrace, SecondaryOpaque,
+    TraceFormatter, add_packet_trace, unlikely,
 };
 use hammer_core::config::{Config, Route, RouteAction};
-use hammer_core::error::{CoreError, CoreResult, HammerError, HammerResult};
+use hammer_core::error::{CoreError, CoreResult, HammerResult};
 use hammer_core::forwarding::{
     Adjacency as CoreAdjacency, DpoId as CoreDpoId, FibEntry as CoreFibEntry,
     FibLookupResult as CoreFibLookupResult, FibTable as CoreFibTable,
@@ -22,13 +22,12 @@ pub use hammer_core::forwarding::{
     FibRouteDpoError, LoadBalanceError, LoadBalanceIndex,
 };
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
-use hammer_core::protocol::ip::{
-    IpProtocol, IpVersion, ParsedIpPacket, parse_ip_packet_with_chain_len,
-};
+use hammer_core::protocol::ip::{IpProtocol, IpVersion, ParsedIpPacket};
 use hammer_core::registry::RuntimeRegistry;
 use hammer_runtime::{ControlThreadHandle, DataPlaneBarrierHandle};
 
 use crate::data_plane::set_index_node_error_code;
+use crate::net::{ForwardingMetadata, NetworkOpaque, TapEthernetMetadata};
 use crate::trace::codec::{
     TraceDecodeCursor, put_node, put_option_dpo_type, put_option_node, put_option_u16,
     put_option_u32, put_u32, put_usize,
@@ -280,28 +279,33 @@ impl IpLookupControlPlane {
 
 /// IP-lookup subsystem control-plane main (VPP `ip_main_t`).
 ///
-/// Owns the static routes read from config. The FIB table itself is built
-/// per-worker at registration time, because the `drop` next-node id is only
-/// known once the `drop` node has registered (resolved by name at that point).
+/// Owns the static routes read from config. The FIB table is built in two
+/// phases so that graph registration is order-independent:
+///   1. `register_node` runs inside `DataPlaneRuntime::init_graph` as the
+///      `ip-lookup` init fn. linkme `SERVICE_GRAPH_NODES` section order is
+///      non-deterministic per build, so the `drop` node may not be registered
+///      yet at this point. The node is therefore registered with a placeholder
+///      table whose `drop` next-node id is [`DROP_PLACEHOLDER`].
+///   2. `wire_drop` runs after `init_graph` has registered every node, resolves
+///      `drop` by name, rebuilds the real FIB table, and swaps it into every
+///      per-worker `IpLookupNode` handle via `FibTableHandle::replace_after_barrier`.
+/// No packet flows between the two phases (graph setup completes before the
+/// data plane starts), so the placeholder never reaches the hot path.
 pub struct IpMain {
     routes: Arc<[Route]>,
 }
+
+/// Sentinel `drop` next-node id used by [`IpMain::register_node`] when the real
+/// `drop` node is not registered yet. Replaced by [`IpMain::wire_drop`] before
+/// any packet is processed.
+const DROP_PLACEHOLDER: NodeId = NodeId::new(u32::MAX);
 
 impl IpMain {
     pub fn new(routes: Arc<[Route]>) -> Self {
         Self { routes }
     }
 
-    /// Build and register this worker's `IpLookupNode`.
-    ///
-    /// `drop` is resolved by name from the already-registered `drop` node.
-    /// `IpLookupNode` is not congestion-typed, so this is plain (no
-    /// `with_congestion!`).
-    pub fn register_node(&self, rt: &DataPlaneRuntime) -> CoreResult<NodeId> {
-        let drop = rt
-            .nodes()
-            .node_by_name("drop")
-            .ok_or_else(|| CoreError::internal("drop node not registered"))?;
+    fn build_table(&self, drop: NodeId) -> CoreResult<FibTable> {
         let mut builder = FibTableBuilder::new(drop);
         for route in self.routes.iter() {
             if let RouteAction::Drop = route
@@ -311,19 +315,50 @@ impl IpMain {
                 builder.add_drop_route(route.prefix);
             }
         }
-        let node = IpLookupControlPlane::new(builder.build()).node();
+        Ok(builder.build())
+    }
+
+    /// Build and register this worker's `IpLookupNode` with a placeholder
+    /// FIB table. The real table is installed by [`wire_drop`] after every
+    /// graph node has registered. `IpLookupNode` is not congestion-typed, so
+    /// this is plain (no `with_congestion!`).
+    pub fn register_node(&self, rt: &DataPlaneRuntime) -> CoreResult<NodeId> {
+        let placeholder = self.build_table(DROP_PLACEHOLDER)?;
+        let node = IpLookupControlPlane::new(placeholder).node();
         rt.nodes().try_register_internal(node)
+    }
+
+    /// Resolve the `drop` node by name and install the real FIB table on every
+    /// per-worker `IpLookupNode` handle. Must run after `init_graph` has
+    /// registered all nodes, so registration order across the linkme slice does
+    /// not matter.
+    pub fn wire_drop(&self, rt: &DataPlaneRuntime) -> CoreResult<()> {
+        let drop = rt
+            .nodes()
+            .node_by_name("drop")
+            .ok_or_else(|| CoreError::internal("drop node not registered"))?;
+        let table = self.build_table(drop)?;
+        let runtimes = lookup_runtimes()
+            .lock()
+            .map_err(|_| CoreError::internal("IP lookup runtime registry poisoned"))?;
+        for runtime in runtimes.iter() {
+            runtime.table.replace_after_barrier(table.clone());
+        }
+        Ok(())
     }
 }
 
-pub static IP_MAIN: OnceLock<IpMain> = OnceLock::new();
+pub static IP_MAIN: ArcSwapOption<IpMain> = ArcSwapOption::const_empty();
+
+#[cfg(test)]
+pub(crate) fn reset_for_test() {
+    IP_MAIN.store(None);
+}
 
 pub fn init(reg: &RuntimeRegistry) -> HammerResult<()> {
     let config = reg.require::<Config>()?;
     let routes = Arc::from(config.network.route.clone().into_boxed_slice());
-    IP_MAIN
-        .set(IpMain::new(routes))
-        .map_err(|_| HammerError::internal("ip main already initialized"))?;
+    IP_MAIN.store(Some(Arc::new(IpMain::new(routes))));
     Ok(())
 }
 
@@ -334,9 +369,21 @@ fn init_ip(reg: &RuntimeRegistry) -> HammerResult<()> {
 
 pub fn register_ip_lookup(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
     IP_MAIN
-        .get()
+        .load()
+        .as_deref()
         .ok_or_else(|| CoreError::internal("ip main not initialized"))?
         .register_node(runtime)
+}
+
+/// Resolve the `drop` next-node and install the real FIB table on every
+/// per-worker `IpLookupNode`. Call after `DataPlaneRuntime::init_graph` has
+/// registered all graph nodes for this worker.
+pub fn wire_ip_lookup_drop(runtime: &DataPlaneRuntime) -> CoreResult<()> {
+    IP_MAIN
+        .load()
+        .as_deref()
+        .ok_or_else(|| CoreError::internal("ip main not initialized"))?
+        .wire_drop(runtime)
 }
 
 #[hammer_component_macros::graph_node(
@@ -348,25 +395,18 @@ pub struct IpLookupNode {
     #[node(default = register_ip_lookup_runtime(table.clone()))]
     runtime_data: NodeRuntimeData,
     table: FibTableHandle,
-    #[node(default)]
-    cached_next: Option<NodeId>,
 }
 
 impl IpLookupNode {
     #[inline(always)]
-    fn prefetch_buffer_with_batch(batch: &mut BufferBatchMut<'_>, index: BufferIndex) {
-        batch.prefetch_header(index);
-    }
-
-    #[inline(always)]
     fn cached_packet_for_index(
-        batch: &mut BufferBatchMut<'_>,
+        runtime: &DataPlaneRuntime,
         index: BufferIndex,
     ) -> Option<ParsedIpPacket> {
-        let buffer = batch.buffer(index).ok()?;
+        let buffer = runtime.get_buffer(index).ok()?;
         packet_from_cached_metadata(
-            unsafe { transmute::<_, &hammer_adapter::NetworkOpaque>(buffer.opaque()) },
-            buffer.packet_cursor(),
+            unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) },
+            unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) }.packet_cursor(),
             buffer.current_ptr(),
             buffer.current_len(),
             buffer.total_len_not_including_first(),
@@ -374,46 +414,28 @@ impl IpLookupNode {
     }
 
     #[inline(always)]
-    fn prefetch_lookup_with_batch(
-        batch: &mut BufferBatchMut<'_>,
+    fn process_index(
+        runtime: &DataPlaneRuntime,
         table: &FibTable,
         index: BufferIndex,
-    ) {
-        let Some(parsed) = Self::cached_packet_for_index(batch, index) else {
-            return;
-        };
-        table.prefetch_packet(&parsed);
-    }
-
-    #[inline(always)]
-    fn process_index_with_batch(
-        batch: &mut BufferBatchMut<'_>,
-        table: &FibTable,
-        index: BufferIndex,
-        traces: &mut std::vec::Vec<(BufferIndex, IpLookupTrace)>,
     ) -> CoreResult<NodeId> {
-        let parsed = Self::cached_packet_for_index(batch, index);
+        let parsed = Self::cached_packet_for_index(runtime, index);
         let (traced, parsed) = {
-            let buffer = batch.buffer(index)?;
+            let buffer = runtime.get_buffer(index)?;
             let traced = buffer.trace_handle().is_some();
-            let parsed = parsed.or_else(|| {
-                parse_ip_packet_with_chain_len(
-                    buffer.current(),
-                    buffer.total_len_not_including_first(),
-                )
-                .ok()
-            });
             (traced, parsed)
         };
         let parsed = match parsed {
             Some(parsed) => parsed,
             None => {
-                let buffer = batch.buffer_mut(index)?;
+                let mut buffer = runtime.get_buffer_mut(index)?;
                 let opaque = unsafe { transmute::<_, &mut LookupOpaque>(buffer.opaque2_mut()) };
                 opaque.forwarding = None;
                 let next = table.drop_next();
+                drop(buffer);
                 if unlikely(traced) {
-                    traces.push((
+                    add_packet_trace!(
+                        runtime,
                         index,
                         IpLookupTrace {
                             fib_index: 0,
@@ -425,7 +447,7 @@ impl IpLookupNode {
                             dpo_index: None,
                             next,
                         },
-                    ));
+                    )?;
                 }
                 return Ok(next);
             }
@@ -433,7 +455,7 @@ impl IpLookupNode {
         let result = table
             .lookup_packet(&parsed)
             .unwrap_or_else(|| FibLookupResult::terminal(table.drop_dpo(parsed.version)));
-        let buffer = batch.buffer_mut(index)?;
+        let mut buffer = runtime.get_buffer_mut(index)?;
         let opaque = unsafe { transmute::<_, &mut LookupOpaque>(buffer.opaque2_mut()) };
         opaque.forwarding = Some(ForwardingMetadata {
             fib_index: 0,
@@ -444,8 +466,10 @@ impl IpLookupNode {
             dpo_type: result.dpo.kind(),
             dpo_index: result.dpo.forwarding_index(),
         });
+        drop(buffer);
         if unlikely(traced) {
-            traces.push((
+            add_packet_trace!(
+                runtime,
                 index,
                 IpLookupTrace {
                     fib_index: 0,
@@ -457,61 +481,258 @@ impl IpLookupNode {
                     dpo_index: Some(result.dpo.forwarding_index()),
                     next: result.dpo.next(),
                 },
-            ));
+            )?;
         }
         Ok(result.dpo.next())
     }
+}
 
-    #[inline(always)]
-    fn prefetch_lookup_range_with_batch(
-        batch: &mut BufferBatchMut<'_>,
-        table: &FibTable,
-        indices: &[BufferIndex],
-        offset: usize,
-        width: usize,
-    ) {
-        if offset >= indices.len() {
-            return;
+macro_rules! process_lookup_batch {
+    ($runtime:expr, $table:expr, $next_frames:expr, $indices:expr, $read:ident, 4) => {{
+        if $read + 4 < $indices.len() {
+            $runtime.prefetch_header($indices[$read + 4]);
         }
-        let end = (offset + width).min(indices.len());
-        for index in indices[offset..end].iter().copied() {
-            Self::prefetch_lookup_with_batch(batch, table, index);
+        if $read + 5 < $indices.len() {
+            $runtime.prefetch_header($indices[$read + 5]);
         }
-    }
+        if $read + 6 < $indices.len() {
+            $runtime.prefetch_header($indices[$read + 6]);
+        }
+        if $read + 7 < $indices.len() {
+            $runtime.prefetch_header($indices[$read + 7]);
+        }
+        let index0 = $indices[$read];
+        let index1 = $indices[$read + 1];
+        let index2 = $indices[$read + 2];
+        let index3 = $indices[$read + 3];
+        $runtime.prefetch_read(index0);
+        $runtime.prefetch_read(index1);
+        $runtime.prefetch_read(index2);
+        $runtime.prefetch_read(index3);
+        if let Some(parsed) = IpLookupNode::cached_packet_for_index($runtime, index0) {
+            $table.prefetch_packet(&parsed);
+        }
+        if let Some(parsed) = IpLookupNode::cached_packet_for_index($runtime, index1) {
+            $table.prefetch_packet(&parsed);
+        }
+        if let Some(parsed) = IpLookupNode::cached_packet_for_index($runtime, index2) {
+            $table.prefetch_packet(&parsed);
+        }
+        if let Some(parsed) = IpLookupNode::cached_packet_for_index($runtime, index3) {
+            $table.prefetch_packet(&parsed);
+        }
+        $next_frames.enqueue(
+            $runtime,
+            IpLookupNode::process_index($runtime, $table, index0)?,
+            index0,
+        )?;
+        $next_frames.enqueue(
+            $runtime,
+            IpLookupNode::process_index($runtime, $table, index1)?,
+            index1,
+        )?;
+        $next_frames.enqueue(
+            $runtime,
+            IpLookupNode::process_index($runtime, $table, index2)?,
+            index2,
+        )?;
+        $next_frames.enqueue(
+            $runtime,
+            IpLookupNode::process_index($runtime, $table, index3)?,
+            index3,
+        )?;
+        $read += 4;
+    }};
+    ($runtime:expr, $table:expr, $next_frames:expr, $indices:expr, $read:ident, 2) => {{
+        if $read + 2 < $indices.len() {
+            $runtime.prefetch_header($indices[$read + 2]);
+        }
+        if $read + 3 < $indices.len() {
+            $runtime.prefetch_header($indices[$read + 3]);
+        }
+        let index0 = $indices[$read];
+        let index1 = $indices[$read + 1];
+        $runtime.prefetch_read(index0);
+        $runtime.prefetch_read(index1);
+        if let Some(parsed) = IpLookupNode::cached_packet_for_index($runtime, index0) {
+            $table.prefetch_packet(&parsed);
+        }
+        if let Some(parsed) = IpLookupNode::cached_packet_for_index($runtime, index1) {
+            $table.prefetch_packet(&parsed);
+        }
+        $next_frames.enqueue(
+            $runtime,
+            IpLookupNode::process_index($runtime, $table, index0)?,
+            index0,
+        )?;
+        $next_frames.enqueue(
+            $runtime,
+            IpLookupNode::process_index($runtime, $table, index1)?,
+            index1,
+        )?;
+        $read += 2;
+    }};
+    ($runtime:expr, $table:expr, $next_frames:expr, $indices:expr, $read:ident, 1) => {{
+        if $read + 1 < $indices.len() {
+            $runtime.prefetch_header($indices[$read + 1]);
+        }
+        let index = $indices[$read];
+        $runtime.prefetch_read(index);
+        if let Some(parsed) = IpLookupNode::cached_packet_for_index($runtime, index) {
+            $table.prefetch_packet(&parsed);
+        }
+        $next_frames.enqueue(
+            $runtime,
+            IpLookupNode::process_index($runtime, $table, index)?,
+            index,
+        )?;
+        $read += 1;
+    }};
+}
 
-    #[inline(always)]
-    fn prefetch_buffer_range_with_batch(
-        batch: &mut BufferBatchMut<'_>,
-        indices: &[BufferIndex],
-        offset: usize,
-        width: usize,
-    ) {
-        if offset >= indices.len() {
-            return;
+macro_rules! process_adjacency_rewrite_batch {
+    ($runtime:expr, $table:expr, $next_frames:expr, $indices:expr, $read:ident, 4) => {{
+        if $read + 4 < $indices.len() {
+            $runtime.prefetch_header($indices[$read + 4]);
         }
-        let end = (offset + width).min(indices.len());
-        for index in indices[offset..end].iter().copied() {
-            Self::prefetch_buffer_with_batch(batch, index);
+        if $read + 5 < $indices.len() {
+            $runtime.prefetch_header($indices[$read + 5]);
         }
-    }
-
-    #[inline(always)]
-    fn prefetch_buffer_indices_with_batch(batch: &mut BufferBatchMut<'_>, indices: &[BufferIndex]) {
-        for index in indices.iter().copied() {
-            Self::prefetch_buffer_with_batch(batch, index);
+        if $read + 6 < $indices.len() {
+            $runtime.prefetch_header($indices[$read + 6]);
         }
-    }
-
-    #[inline(always)]
-    fn prefetch_lookup_indices_with_batch(
-        batch: &mut BufferBatchMut<'_>,
-        table: &FibTable,
-        indices: &[BufferIndex],
-    ) {
-        for index in indices.iter().copied() {
-            Self::prefetch_lookup_with_batch(batch, table, index);
+        if $read + 7 < $indices.len() {
+            $runtime.prefetch_header($indices[$read + 7]);
         }
-    }
+        let index0 = $indices[$read];
+        let index1 = $indices[$read + 1];
+        let index2 = $indices[$read + 2];
+        let index3 = $indices[$read + 3];
+        $runtime.prefetch_write(index0);
+        $runtime.prefetch_write(index1);
+        $runtime.prefetch_write(index2);
+        $runtime.prefetch_write(index3);
+        let next0 = AdjacencyRewriteNode::next_for_index($table, $runtime, index0)?;
+        let next1 = AdjacencyRewriteNode::next_for_index($table, $runtime, index1)?;
+        let next2 = AdjacencyRewriteNode::next_for_index($table, $runtime, index2)?;
+        let next3 = AdjacencyRewriteNode::next_for_index($table, $runtime, index3)?;
+        match (next0, next1, next2, next3) {
+            (Some(next0), Some(next1), Some(next2), Some(next3)) => {
+                hammer_adapter::validate_buffer_enqueue_x4!(
+                    $runtime,
+                    $next_frames,
+                    next0,
+                    index0,
+                    next1,
+                    index1,
+                    next2,
+                    index2,
+                    next3,
+                    index3
+                )?;
+            }
+            (Some(next0), Some(next1), Some(next2), None) => {
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next0, index0)?;
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next1, index1)?;
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next2, index2)?;
+            }
+            (Some(next0), Some(next1), None, Some(next3)) => {
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next0, index0)?;
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next1, index1)?;
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next3, index3)?;
+            }
+            (Some(next0), Some(next1), None, None) => {
+                hammer_adapter::validate_buffer_enqueue_x2!(
+                    $runtime,
+                    $next_frames,
+                    next0,
+                    index0,
+                    next1,
+                    index1
+                )?;
+            }
+            (Some(next0), None, Some(next2), Some(next3)) => {
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next0, index0)?;
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next2, index2)?;
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next3, index3)?;
+            }
+            (Some(next0), None, Some(next2), None) => {
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next0, index0)?;
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next2, index2)?;
+            }
+            (Some(next0), None, None, Some(next3)) => {
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next0, index0)?;
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next3, index3)?;
+            }
+            (Some(next0), None, None, None) => {
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next0, index0)?;
+            }
+            (None, Some(next1), Some(next2), Some(next3)) => {
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next1, index1)?;
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next2, index2)?;
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next3, index3)?;
+            }
+            (None, Some(next1), Some(next2), None) => {
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next1, index1)?;
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next2, index2)?;
+            }
+            (None, Some(next1), None, Some(next3)) => {
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next1, index1)?;
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next3, index3)?;
+            }
+            (None, Some(next1), None, None) => {
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next1, index1)?;
+            }
+            (None, None, Some(next2), Some(next3)) => {
+                hammer_adapter::validate_buffer_enqueue_x2!(
+                    $runtime,
+                    $next_frames,
+                    next2,
+                    index2,
+                    next3,
+                    index3
+                )?;
+            }
+            (None, None, Some(next2), None) => {
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next2, index2)?;
+            }
+            (None, None, None, Some(next3)) => {
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next3, index3)?;
+            }
+            (None, None, None, None) => {}
+        }
+        $read += 4;
+    }};
+    ($runtime:expr, $table:expr, $next_frames:expr, $indices:expr, $read:ident, 2) => {{
+        if $read + 2 < $indices.len() {
+            $runtime.prefetch_header($indices[$read + 2]);
+        }
+        if $read + 3 < $indices.len() {
+            $runtime.prefetch_header($indices[$read + 3]);
+        }
+        let index0 = $indices[$read];
+        let index1 = $indices[$read + 1];
+        $runtime.prefetch_write(index0);
+        $runtime.prefetch_write(index1);
+        if let Some(node) = AdjacencyRewriteNode::next_for_index($table, $runtime, index0)? {
+            hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, node, index0)?;
+        }
+        if let Some(node) = AdjacencyRewriteNode::next_for_index($table, $runtime, index1)? {
+            hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, node, index1)?;
+        }
+        $read += 2;
+    }};
+    ($runtime:expr, $table:expr, $next_frames:expr, $indices:expr, $read:ident, 1) => {{
+        if $read + 1 < $indices.len() {
+            $runtime.prefetch_header($indices[$read + 1]);
+        }
+        let index = $indices[$read];
+        $runtime.prefetch_write(index);
+        if let Some(node) = AdjacencyRewriteNode::next_for_index($table, $runtime, index)? {
+            hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, node, index)?;
+        }
+        $read += 1;
+    }};
 }
 
 impl Node for IpLookupNode {
@@ -522,51 +743,7 @@ impl Node for IpLookupNode {
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         let table = self.table.table();
-        let indices = frame.pending_indices();
-        let Some(first) = indices.first().copied() else {
-            return Ok(NodeResult::drop());
-        };
-        let width = frame_batch_width(runtime);
-        let mut traces = std::vec::Vec::new();
-        let first_next = {
-            let mut batch = runtime.buffer_batch_mut();
-            Self::prefetch_buffer_range_with_batch(&mut batch, indices, 0, width);
-            Self::prefetch_lookup_range_with_batch(&mut batch, &table, indices, 0, width);
-            Self::process_index_with_batch(&mut batch, &table, first, &mut traces)?
-        };
-        let mut first_chunk = true;
-        hammer_adapter::node_route_frame_cached!(
-            self,
-            runtime,
-            frame,
-            |batch, indices| {
-                Self::prefetch_buffer_indices_with_batch(batch, indices);
-                Self::prefetch_lookup_indices_with_batch(batch, &table, indices);
-            },
-            |batch, indices, nexts| {
-                let start_offset = if first_chunk {
-                    first_chunk = false;
-                    nexts[0] = Some(first_next);
-                    1
-                } else {
-                    0
-                };
-                for (offset, index) in indices.iter().copied().enumerate().skip(start_offset) {
-                    nexts[offset] = Some(Self::process_index_with_batch(
-                        batch,
-                        &table,
-                        index,
-                        &mut traces,
-                    )?);
-                }
-                Ok(())
-            },
-            {
-                for (index, trace) in traces {
-                    add_packet_trace!(runtime, index, trace)?;
-                }
-            }
-        )
+        ip_lookup_process_frame(runtime, frame, &table)
     }
 
     #[inline]
@@ -618,8 +795,6 @@ pub struct AdjacencyRewriteNode {
     #[node(default = register_adjacency_rewrite_runtime(table.clone()))]
     runtime_data: NodeRuntimeData,
     table: FibTableHandle,
-    #[node(default)]
-    cached_next: Option<NodeId>,
 }
 
 impl AdjacencyRewriteNode {
@@ -719,9 +894,7 @@ impl Node for AdjacencyRewriteNode {
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        hammer_adapter::node_route_frame_index_cached!(self, runtime, frame, |index| {
-            Self::next_for_index(&self.table, runtime, index)
-        })
+        adjacency_rewrite_process_frame(runtime, frame, &self.table)
     }
 
     #[inline]
@@ -815,51 +988,28 @@ fn ip_lookup_process(
 ) -> CoreResult<NodeResult> {
     let state = ip_lookup_runtime(data)?;
     let table = state.table.table();
+    ip_lookup_process_frame(runtime, frame, &table)
+}
+
+fn ip_lookup_process_frame(
+    runtime: &DataPlaneRuntime,
+    frame: &mut BufferFrame,
+    table: &FibTable,
+) -> CoreResult<NodeResult> {
     let indices = frame.pending_indices();
-    let Some(first) = indices.first().copied() else {
-        return Ok(NodeResult::drop());
-    };
-    let width = frame_batch_width(runtime);
-    let mut traces = std::vec::Vec::new();
-    let first_next = {
-        let mut batch = runtime.buffer_batch_mut();
-        IpLookupNode::prefetch_buffer_range_with_batch(&mut batch, indices, 0, width);
-        IpLookupNode::prefetch_lookup_range_with_batch(&mut batch, &table, indices, 0, width);
-        IpLookupNode::process_index_with_batch(&mut batch, &table, first, &mut traces)?
-    };
-    let mut first_chunk = true;
-    hammer_adapter::node_route_frame_static!(
-        Some(first_next),
-        runtime,
-        frame,
-        |batch, indices| {
-            IpLookupNode::prefetch_buffer_indices_with_batch(batch, indices);
-            IpLookupNode::prefetch_lookup_indices_with_batch(batch, &table, indices);
-        },
-        |batch, indices, nexts| {
-            let start_offset = if first_chunk {
-                first_chunk = false;
-                nexts[0] = Some(first_next);
-                1
-            } else {
-                0
-            };
-            for (offset, index) in indices.iter().copied().enumerate().skip(start_offset) {
-                nexts[offset] = Some(IpLookupNode::process_index_with_batch(
-                    batch,
-                    &table,
-                    index,
-                    &mut traces,
-                )?);
-            }
-            Ok(())
-        },
-        {
-            for (index, trace) in traces {
-                add_packet_trace!(runtime, index, trace)?;
-            }
-        }
-    )
+    let mut next_frames = hammer_adapter::NodeNextFrames::default();
+    let mut read = 0usize;
+    let len = indices.len();
+    while read + 4 <= len {
+        process_lookup_batch!(runtime, table, next_frames, indices, read, 4);
+    }
+    if read + 2 <= len {
+        process_lookup_batch!(runtime, table, next_frames, indices, read, 2);
+    }
+    while read < len {
+        process_lookup_batch!(runtime, table, next_frames, indices, read, 1);
+    }
+    next_frames.finish(runtime, frame)
 }
 
 fn adjacency_rewrite_process(
@@ -868,9 +1018,28 @@ fn adjacency_rewrite_process(
     frame: &mut BufferFrame,
 ) -> CoreResult<NodeResult> {
     let state = adjacency_rewrite_runtime(data)?;
-    hammer_adapter::node_route_frame_index_static!(None, runtime, frame, |index| {
-        AdjacencyRewriteNode::next_for_index(&state.table, runtime, index)
-    })
+    adjacency_rewrite_process_frame(runtime, frame, &state.table)
+}
+
+fn adjacency_rewrite_process_frame(
+    runtime: &DataPlaneRuntime,
+    frame: &mut BufferFrame,
+    table: &FibTableHandle,
+) -> CoreResult<NodeResult> {
+    let indices = frame.pending_indices();
+    let mut next_frames = hammer_adapter::NodeNextFrames::default();
+    let mut read = 0usize;
+    let len = indices.len();
+    while read + 4 <= len {
+        process_adjacency_rewrite_batch!(runtime, table, next_frames, indices, read, 4);
+    }
+    if read + 2 <= len {
+        process_adjacency_rewrite_batch!(runtime, table, next_frames, indices, read, 2);
+    }
+    while read < len {
+        process_adjacency_rewrite_batch!(runtime, table, next_frames, indices, read, 1);
+    }
+    next_frames.finish(runtime, frame)
 }
 
 #[inline(always)]
@@ -889,11 +1058,11 @@ fn apply_adjacency_rewrite(
         buffer.current_mut()[..rewrite.len()].copy_from_slice(rewrite);
     }
     if !rewrite.is_empty() {
-        let cursor = buffer.packet_cursor();
-        buffer.set_packet_cursor(shift_packet_cursor(cursor, rewrite.len()));
+        let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+        network.set_packet_cursor(shift_packet_cursor(network.packet_cursor(), rewrite.len()));
     }
-    unsafe { transmute::<_, &mut hammer_adapter::NetworkOpaque>(buffer.opaque_mut()) }
-        .sw_if_index[1] = adjacency.egress_interface.unwrap_or(0);
+    unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }.sw_if_index[1] =
+        adjacency.egress_interface.unwrap_or(0);
     if !rewrite.is_empty() {
         let opaque = unsafe { transmute::<_, &mut LookupOpaque>(buffer.opaque2_mut()) };
         opaque.tap_ethernet = None;
@@ -920,16 +1089,8 @@ fn shift_packet_cursor(cursor: BufferPacketCursor, delta: usize) -> BufferPacket
 }
 
 #[inline(always)]
-fn frame_batch_width(runtime: &DataPlaneRuntime) -> usize {
-    match runtime.preferred_frame_batch_width() {
-        hammer_adapter::FrameBatchWidth::Quad => 4,
-        hammer_adapter::FrameBatchWidth::Pair => 2,
-    }
-}
-
-#[inline(always)]
 fn packet_from_cached_metadata(
-    network: &hammer_adapter::NetworkOpaque,
+    network: &NetworkOpaque,
     cursor: BufferPacketCursor,
     current_ptr: *const u8,
     current_len: usize,

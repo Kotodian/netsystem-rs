@@ -496,6 +496,12 @@ where
         tcp_effective_output_payload_len(self.negotiated_options().send_max_segment_size)
     }
 
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn pacing_ready(&self) -> bool {
+        self.pacing_ready
+    }
+
     #[inline]
     fn output_capabilities(&self) -> TcpCapabilities {
         let negotiated = self.negotiated_options();
@@ -1851,14 +1857,8 @@ where
             return None;
         }
         self.timer_reset(timer_id);
-        match (self.state, timer_id) {
-            (TcpState::SynSent, _)
-            | (TcpState::Established, _)
-            | (TcpState::FinWait1, TCP_TIMER_RETRANSMIT)
-            | (TcpState::Closing, TCP_TIMER_RETRANSMIT)
-            | (TcpState::LastAck, TCP_TIMER_RETRANSMIT)
-            | (TcpState::TimeWait, _) => {}
-            _ => return None,
+        if !self.timer_dispatch_pending(timer_id) {
+            return None;
         }
         match timer_id {
             TCP_TIMER_RETRANSMIT => self.on_retransmit_timer_expiry(local_capabilities),
@@ -1870,6 +1870,21 @@ where
             TCP_TIMER_TIME_WAIT => self.on_time_wait_timer_expiry(),
             TCP_TIMER_PACING => self.on_pacing_timer_expiry(),
             _ => None,
+        }
+    }
+
+    /// Dispatch gate: the connection owns timer dispatch and only forwards the
+    /// exact `timer_id` supplied by the runtime. Returns whether the pending
+    /// timer may be dispatched in the current state.
+    fn timer_dispatch_pending(&self, timer_id: u32) -> bool {
+        match (self.state, timer_id) {
+            (TcpState::SynSent, _)
+            | (TcpState::Established, _)
+            | (TcpState::FinWait1, TCP_TIMER_RETRANSMIT)
+            | (TcpState::Closing, TCP_TIMER_RETRANSMIT)
+            | (TcpState::LastAck, TCP_TIMER_RETRANSMIT)
+            | (TcpState::TimeWait, _) => true,
+            _ => false,
         }
     }
 
@@ -2626,12 +2641,12 @@ mod tests {
 
         let _ = connection.on_tcp_ready(true, TcpCapabilities::default());
 
-        let segment = connection
-            .on_tcp_timer_expiry(TCP_TIMER_PACING, TcpCapabilities::default())
-            .expect("pacing expiry should request a tx dispatch");
+        let pacing_segment =
+            connection.on_tcp_timer_expiry(TCP_TIMER_PACING, TcpCapabilities::default());
+        assert!(pacing_segment.is_none());
 
         assert!(connection.timer_is_active(TCP_TIMER_PACING));
-        assert_eq!(segment.payload_len(), connection.output_payload_len());
+        assert!(connection.pacing_ready());
     }
 
     #[test]
@@ -3706,5 +3721,227 @@ mod tests {
             Some(maxed_base_ticks),
             "persist backoff resets when the window opens"
         );
+    }
+
+    use crate::session::SessionId;
+    use crate::session::runtime::SessionDriverRuntime;
+    use crate::transport::tcp::closing_session_for_test;
+
+    fn peer_fin_packet(
+        local: SocketAddr,
+        remote: SocketAddr,
+        rcv_nxt: u32,
+        snd_nxt: u32,
+    ) -> TcpPacket {
+        TcpPacket {
+            local: remote,
+            remote: local,
+            sequence: rcv_nxt.into(),
+            acknowledgment: Some(snd_nxt.into()),
+            advertised_window: u16::MAX,
+            flags: TcpSegmentFlags::FIN | TcpSegmentFlags::ACK,
+            capabilities: TcpCapabilities::default(),
+            sack_blocks: hammer_infra::vec::Vec::new(),
+            timestamp: None,
+            fast_open_cookie: None,
+            ip_ecn: None,
+            payload_offset: 0,
+            payload_len: 0,
+        }
+    }
+
+    fn drive_fin_ack_to_time_wait<C>(
+        driver: &mut SessionDriverRuntime<TcpConnection<C>>,
+        session_id: SessionId,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) where
+        C: CongestionController + 'static,
+    {
+        {
+            let connection = driver.session_mut(session_id).expect("connection");
+            connection.on_session_close();
+            let _ = connection.on_tcp_ready(false, TcpCapabilities::default());
+        }
+        let (rcv_nxt, snd_nxt) = {
+            let connection = driver.session(session_id).expect("connection");
+            (connection.rcv_nxt(), connection.snd_nxt())
+        };
+        let packet = TcpPacket {
+            local: remote,
+            remote: local,
+            sequence: rcv_nxt.into(),
+            acknowledgment: Some(snd_nxt.into()),
+            advertised_window: u16::MAX,
+            flags: TcpSegmentFlags::FIN | TcpSegmentFlags::ACK,
+            capabilities: TcpCapabilities::default(),
+            sack_blocks: hammer_infra::vec::Vec::new(),
+            timestamp: None,
+            fast_open_cookie: None,
+            ip_ecn: None,
+            payload_offset: 0,
+            payload_len: 0,
+        };
+        let (keep_mask, now) = {
+            let connection = driver.session_mut(session_id).expect("connection");
+            let _ = connection
+                .receive_close_side(&packet)
+                .expect("receive fin ack");
+            (connection.active_timer_mask(), std::time::Instant::now())
+        };
+        let session = session_id.pool_index();
+        let connection: *const TcpConnection<C> =
+            driver.session(session_id).expect("connection") as *const _;
+        crate::session::protocol::refresh_tcp_timers(
+            driver.timers_mut(),
+            unsafe { &*connection },
+            session,
+            keep_mask,
+            now,
+        )
+        .expect("sync time wait timer");
+    }
+
+    fn enter_close_wait_for_passive_close_test(
+        driver: &mut SessionDriverRuntime<TcpConnection<BbrController>>,
+        session_id: SessionId,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) {
+        let (rcv_nxt, snd_nxt) = {
+            let connection = driver.session(session_id).expect("connection");
+            (connection.rcv_nxt(), connection.snd_nxt())
+        };
+        let packet = peer_fin_packet(local, remote, rcv_nxt, snd_nxt);
+        let connection = driver.session_mut(session_id).expect("connection");
+        let (segment, _) = connection
+            .receive_established(&packet)
+            .expect("receive peer fin");
+        assert!(
+            segment.is_some(),
+            "expected ack segment for in-sequence fin"
+        );
+        assert_eq!(connection.state(), TcpState::CloseWait);
+        assert_eq!(connection.rcv_nxt(), rcv_nxt.wrapping_add(1));
+    }
+
+    #[test]
+    fn tcp_passive_close_fin_in_established_enters_close_wait_and_acks() {
+        let (mut driver, session_id, local, remote) = closing_session_for_test::<BbrController>();
+
+        let (rcv_nxt, snd_nxt) = {
+            let connection = driver.session(session_id).expect("connection");
+            (connection.rcv_nxt(), connection.snd_nxt())
+        };
+        let packet = peer_fin_packet(local, remote, rcv_nxt, snd_nxt);
+        let connection = driver.session_mut(session_id).expect("connection");
+        let (segment, _) = connection
+            .receive_established(&packet)
+            .expect("receive peer fin");
+
+        let segment = segment.expect("ack segment");
+        let mut header = [0u8; 64];
+        let header_len = segment.write_header(&mut header).expect("write header");
+        let parsed = etherparse::TcpSlice::from_slice(&header[..header_len]).expect("parse tcp");
+        assert!(parsed.ack());
+        assert!(!parsed.fin());
+
+        assert_eq!(connection.state(), TcpState::CloseWait);
+        assert_eq!(connection.rcv_nxt(), rcv_nxt.wrapping_add(1));
+    }
+
+    #[test]
+    fn tcp_passive_close_local_close_after_peer_fin_enters_last_ack() {
+        let (mut driver, session_id, local, remote) = closing_session_for_test::<BbrController>();
+
+        enter_close_wait_for_passive_close_test(&mut driver, session_id, local, remote);
+
+        let connection = driver.session_mut(session_id).expect("connection");
+        connection.on_session_close();
+        assert_eq!(connection.state(), TcpState::LastAck);
+    }
+
+    #[test]
+    fn tcp_passive_close_peer_ack_final_fin_closes() {
+        let (mut driver, session_id, local, remote) = closing_session_for_test::<BbrController>();
+
+        enter_close_wait_for_passive_close_test(&mut driver, session_id, local, remote);
+
+        let connection = driver.session_mut(session_id).expect("connection");
+        connection.on_session_close();
+        assert_eq!(connection.state(), TcpState::LastAck);
+
+        let snd_nxt = connection.snd_nxt();
+        let ack_packet = TcpPacket {
+            local: remote,
+            remote: local,
+            sequence: connection.rcv_nxt().into(),
+            acknowledgment: Some(snd_nxt.into()),
+            advertised_window: u16::MAX,
+            flags: TcpSegmentFlags::ACK,
+            capabilities: TcpCapabilities::default(),
+            sack_blocks: hammer_infra::vec::Vec::new(),
+            timestamp: None,
+            fast_open_cookie: None,
+            ip_ecn: None,
+            payload_offset: 0,
+            payload_len: 0,
+        };
+        connection
+            .receive_close_side(&ack_packet)
+            .expect("receive final ack");
+        assert_eq!(connection.state(), TcpState::Closed);
+    }
+
+    #[test]
+    fn tcp_fin_path_enters_time_wait_and_retains_session_until_expiry() {
+        let (mut driver, session_id, local, remote) = closing_session_for_test::<BbrController>();
+
+        drive_fin_ack_to_time_wait(&mut driver, session_id, local, remote);
+
+        let connection = driver.session(session_id).expect("session");
+        assert_eq!(connection.state(), TcpState::TimeWait);
+        assert!(connection.timer_is_active(TCP_TIMER_TIME_WAIT));
+    }
+
+    #[test]
+    fn tcp_time_wait_duplicate_fin_reacks_and_rearms_timer() {
+        let (mut driver, session_id, local, remote) = closing_session_for_test::<BbrController>();
+
+        drive_fin_ack_to_time_wait(&mut driver, session_id, local, remote);
+
+        let (rcv_nxt, snd_nxt) = {
+            let connection = driver.session(session_id).expect("connection");
+            (connection.rcv_nxt(), connection.snd_nxt())
+        };
+        let duplicate_fin = TcpPacket {
+            local: remote,
+            remote: local,
+            sequence: rcv_nxt.into(),
+            acknowledgment: Some(snd_nxt.into()),
+            advertised_window: u16::MAX,
+            flags: TcpSegmentFlags::FIN | TcpSegmentFlags::ACK,
+            capabilities: TcpCapabilities::default(),
+            sack_blocks: hammer_infra::vec::Vec::new(),
+            timestamp: None,
+            fast_open_cookie: None,
+            ip_ecn: None,
+            payload_offset: 0,
+            payload_len: 0,
+        };
+        let segment = driver
+            .session_mut(session_id)
+            .expect("connection")
+            .receive_close_side(&duplicate_fin)
+            .expect("receive duplicate fin")
+            .expect("ack segment");
+        let mut header = [0u8; 64];
+        let header_len = segment.write_header(&mut header).expect("write header");
+        let parsed = etherparse::TcpSlice::from_slice(&header[..header_len]).expect("parse tcp");
+
+        assert!(parsed.ack());
+        let connection = driver.session(session_id).expect("session");
+        assert_eq!(connection.state(), TcpState::TimeWait);
+        assert!(connection.timer_is_active(TCP_TIMER_TIME_WAIT));
     }
 }

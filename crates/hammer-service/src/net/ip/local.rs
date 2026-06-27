@@ -1,19 +1,24 @@
+use std::mem::transmute;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeId, NodeNextStorage,
-    NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace, TraceFormatter, add_packet_trace,
+    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeId, NodeNextFrames,
+    NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace, TraceFormatter,
+    add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::protocol::icmp::IcmpHeader;
+use hammer_core::protocol::tcp::TcpWireHeader;
+use hammer_core::protocol::transport::UdpHeader;
+use hammer_core::protocol::wire::read_header;
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 
 use crate::data_plane::{FeatureArcStartHandle, set_index_node_error_code};
-use crate::net::{DpoType, FibLookupResult, FibTableHandle};
+use crate::net::{DpoType, FibLookupResult, FibTableHandle, NetworkOpaque};
 
-use super::parse_ip_packet_with_chain_len;
-use super::{IpInputError, IpInputTarget, IpProtocol, IpVersion, ParsedIpPacket};
+use super::{IpInputError, IpInputTarget, IpProtocol, IpVersion, ParsedIpPacket, ip_header};
 use crate::trace::codec::{
     TraceDecodeCursor, put_node, put_option_ip_protocol, put_option_ip_version, put_option_u16,
     put_u8, put_usize,
@@ -272,20 +277,16 @@ impl IpLocalStateHandle {
 
 #[hammer_component_macros::node(role = internal, next = IpLocalNext, start_arc = IpLocalArc)]
 pub struct IpLocalNode {
-    #[node(default = register_ip_local_runtime(state.clone()))]
+    #[node(default = register_ip_local_runtime(state.clone(), None))]
     runtime_data: NodeRuntimeData,
     state: IpLocalStateHandle,
-    #[node(default)]
-    cached_next: Option<NodeId>,
 }
 
 #[hammer_component_macros::node(role = internal, sibling_of = IpLocalNode, start_arc = IpLocalArc)]
 pub struct IpReceiveNode {
-    #[node(default = register_ip_local_runtime(state.clone()))]
+    #[node(default = register_ip_local_runtime(state.clone(), None))]
     runtime_data: NodeRuntimeData,
     state: IpLocalStateHandle,
-    #[node(default)]
-    cached_next: Option<NodeId>,
 }
 
 impl Node for IpLocalNode {
@@ -305,7 +306,6 @@ impl Node for IpLocalNode {
             next,
             LocalStage::Head,
             feature_arc.as_ref(),
-            &mut self.cached_next,
         )
     }
 
@@ -321,10 +321,8 @@ impl Node for IpLocalNode {
 
     #[inline]
     fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
-        sync_ip_local_runtime(
-            self.runtime_data,
-            self.feature_arc.as_ref().map(|arc| arc.start_handle()),
-        )?;
+        let feature_arc = self.feature_arc.as_ref().map(|arc| arc.start_handle());
+        sync_ip_local_runtime(self.runtime_data, self.state.clone(), feature_arc)?;
         Ok(self.runtime_data)
     }
 }
@@ -346,7 +344,6 @@ impl Node for IpReceiveNode {
             next,
             LocalStage::Receive,
             feature_arc.as_ref(),
-            &mut self.cached_next,
         )
     }
 
@@ -362,39 +359,46 @@ impl Node for IpReceiveNode {
 
     #[inline]
     fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
-        sync_ip_local_runtime(
-            self.runtime_data,
-            self.feature_arc.as_ref().map(|arc| arc.start_handle()),
-        )?;
+        let feature_arc = self.feature_arc.as_ref().map(|arc| arc.start_handle());
+        sync_ip_local_runtime(self.runtime_data, self.state.clone(), feature_arc)?;
         Ok(self.runtime_data)
     }
 }
 
+/// Per-instance state held in the global IP-local registry and shared by
+/// `IpLocalNode` (Head stage) and `IpReceiveNode` (Receive stage). The stage
+/// is a fixed constant per node and passed by each node's process fn, so the
+/// registry only stores the `IpLocalStateHandle` + feature-arc start handle.
+///
+/// Mirrors the `OnceLock<Mutex<Vec<...>>>` + `NodeRuntimeData::from_usize`
+/// pattern used by the sibling migrated nodes (`IpLookupNode`, `IcmpInputNode`,
+/// `InterfaceOutputNode`): word 0 of [`NodeRuntimeData`] is the registry slot.
 #[derive(Clone)]
 struct IpLocalRuntime {
     state: IpLocalStateHandle,
     feature_arc: Option<FeatureArcStartHandle>,
 }
 
-fn ip_local_runtimes() -> &'static Mutex<Vec<IpLocalRuntime>> {
-    static RUNTIMES: OnceLock<Mutex<Vec<IpLocalRuntime>>> = OnceLock::new();
-    RUNTIMES.get_or_init(|| Mutex::new(Vec::new()))
+fn ip_local_runtimes() -> &'static Mutex<hammer_infra::vec::Vec<IpLocalRuntime>> {
+    static RUNTIMES: OnceLock<Mutex<hammer_infra::vec::Vec<IpLocalRuntime>>> = OnceLock::new();
+    RUNTIMES.get_or_init(|| Mutex::new(hammer_infra::vec::Vec::new()))
 }
 
-fn register_ip_local_runtime(state: IpLocalStateHandle) -> NodeRuntimeData {
+fn register_ip_local_runtime(
+    state: IpLocalStateHandle,
+    feature_arc: Option<FeatureArcStartHandle>,
+) -> NodeRuntimeData {
     let mut runtimes = ip_local_runtimes()
         .lock()
         .expect("IP local runtime registry poisoned");
     let slot = runtimes.len();
-    runtimes.push(IpLocalRuntime {
-        state,
-        feature_arc: None,
-    });
+    runtimes.push(IpLocalRuntime { state, feature_arc });
     NodeRuntimeData::from_usize(slot).expect("IP local runtime slot overflow")
 }
 
 fn sync_ip_local_runtime(
     data: NodeRuntimeData,
+    state: IpLocalStateHandle,
     feature_arc: Option<FeatureArcStartHandle>,
 ) -> CoreResult<()> {
     let slot = data.usize_word(0)?;
@@ -404,6 +408,7 @@ fn sync_ip_local_runtime(
     let runtime = runtimes
         .get_mut(slot)
         .ok_or_else(|| CoreError::internal("IP local runtime slot is invalid"))?;
+    runtime.state = state;
     runtime.feature_arc = feature_arc;
     Ok(())
 }
@@ -424,17 +429,16 @@ fn ip_local_process(
     frame: &mut BufferFrame,
 ) -> CoreResult<NodeResult> {
     let state = ip_local_runtime(data)?;
-    let feature_arc = state.feature_arc.clone();
-    let state = state.state.load();
-    let mut cached_next = None;
+    let snapshot = state.state.load();
+    let next = IpLocalNode::runtime_nexts(runtime)?;
+    let feature_arc = state.feature_arc.as_ref();
     process_frame(
         runtime,
         frame,
-        &state,
-        IpLocalNode::runtime_nexts(runtime)?,
+        &snapshot,
+        next,
         LocalStage::Head,
-        feature_arc.as_ref(),
-        &mut cached_next,
+        feature_arc,
     )
 }
 
@@ -444,17 +448,16 @@ fn ip_receive_process(
     frame: &mut BufferFrame,
 ) -> CoreResult<NodeResult> {
     let state = ip_local_runtime(data)?;
-    let feature_arc = state.feature_arc.clone();
-    let state = state.state.load();
-    let mut cached_next = None;
+    let snapshot = state.state.load();
+    let next = IpReceiveNode::runtime_nexts(runtime)?;
+    let feature_arc = state.feature_arc.as_ref();
     process_frame(
         runtime,
         frame,
-        &state,
-        IpReceiveNode::runtime_nexts(runtime)?,
+        &snapshot,
+        next,
         LocalStage::Receive,
-        feature_arc.as_ref(),
-        &mut cached_next,
+        feature_arc,
     )
 }
 
@@ -487,18 +490,77 @@ fn process_frame(
     next: [NodeId; IpLocalNext::COUNT],
     stage: LocalStage,
     feature_arc: Option<&FeatureArcStartHandle>,
-    cached_next: &mut Option<NodeId>,
 ) -> CoreResult<NodeResult> {
-    hammer_adapter::node_route_frame_index_cache_slot!(cached_next, runtime, frame, |index| {
-        Ok(Some(process_index(
+    let indices = frame.pending_indices();
+    let len = indices.len();
+    let mut next_frames = NodeNextFrames::default();
+    let mut read = 0usize;
+    while read + 4 <= len {
+        if read + 4 < len {
+            runtime.prefetch_header(indices[read + 4]);
+        }
+        if read + 5 < len {
+            runtime.prefetch_header(indices[read + 5]);
+        }
+        if read + 6 < len {
+            runtime.prefetch_header(indices[read + 6]);
+        }
+        if read + 7 < len {
+            runtime.prefetch_header(indices[read + 7]);
+        }
+        let index0 = indices[read];
+        let index1 = indices[read + 1];
+        let index2 = indices[read + 2];
+        let index3 = indices[read + 3];
+        let node0 = process_index(runtime, index0, state, &next, stage, feature_arc)?;
+        let node1 = process_index(runtime, index1, state, &next, stage, feature_arc)?;
+        let node2 = process_index(runtime, index2, state, &next, stage, feature_arc)?;
+        let node3 = process_index(runtime, index3, state, &next, stage, feature_arc)?;
+        hammer_adapter::validate_buffer_enqueue_x4!(
             runtime,
-            index,
-            state,
-            &next,
-            stage,
-            feature_arc,
-        )?))
-    })
+            next_frames,
+            node0,
+            index0,
+            node1,
+            index1,
+            node2,
+            index2,
+            node3,
+            index3
+        )?;
+        read += 4;
+    }
+    if read + 2 <= len {
+        if read + 2 < len {
+            runtime.prefetch_header(indices[read + 2]);
+        }
+        if read + 3 < len {
+            runtime.prefetch_header(indices[read + 3]);
+        }
+        let index0 = indices[read];
+        let index1 = indices[read + 1];
+        let node0 = process_index(runtime, index0, state, &next, stage, feature_arc)?;
+        let node1 = process_index(runtime, index1, state, &next, stage, feature_arc)?;
+        hammer_adapter::validate_buffer_enqueue_x2!(
+            runtime,
+            next_frames,
+            node0,
+            index0,
+            node1,
+            index1
+        )?;
+        read += 2;
+    }
+    while read < len {
+        if read + 1 < len {
+            runtime.prefetch_header(indices[read + 1]);
+        }
+        let index0 = indices[read];
+        let node0 = process_index(runtime, index0, state, &next, stage, feature_arc)?;
+        hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, node0, index0)?;
+        read += 1;
+    }
+    next_frames.finish(runtime, frame)
 }
 
 #[inline(always)]
@@ -510,10 +572,13 @@ fn process_index(
     stage: LocalStage,
     feature_arc: Option<&FeatureArcStartHandle>,
 ) -> CoreResult<NodeId> {
-    let packet = packet_bytes(runtime, index)?;
-    let parsed = match parse_ip_packet_with_chain_len(&packet, 0) {
+    let buffer = runtime.get_buffer(index)?;
+    let current = buffer.current();
+    let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
+    let parsed = match ip_header(current, network.packet_cursor()) {
         Ok(parsed) => parsed,
         Err(_) => {
+            drop(buffer);
             set_index_node_error_code(runtime, index, IpLocalError::BadLength.code())?;
             let resolved = state.drop_next(next);
             add_packet_trace!(
@@ -534,6 +599,7 @@ fn process_index(
     match parsed.input_target {
         IpInputTarget::Drop | IpInputTarget::IcmpError | IpInputTarget::Options => {
             let error = error_for_input(parsed.input_error).code();
+            drop(buffer);
             set_index_node_error_code(runtime, index, error)?;
             let resolved = state.drop_next(next);
             add_packet_trace!(
@@ -551,6 +617,7 @@ fn process_index(
             return Ok(resolved);
         }
         IpInputTarget::Reassembly => {
+            drop(buffer);
             refresh_basic_metadata(runtime, index, &parsed, None)?;
             let resolved = state.reassembly_next(next);
             add_packet_trace!(
@@ -570,12 +637,14 @@ fn process_index(
         IpInputTarget::Punt | IpInputTarget::Lookup | IpInputTarget::LookupMulticast => {}
     }
 
-    let packet = packet
-        .get(..parsed.packet_len)
+    let first_len = current.len().min(parsed.packet_len);
+    let packet = current
+        .get(..first_len)
         .ok_or_else(|| CoreError::internal("invalid local packet length"))?;
     let transport = match packet.get(parsed.transport_header_offset..parsed.packet_len) {
         Some(transport) => transport,
         None => {
+            drop(buffer);
             set_index_node_error_code(runtime, index, IpLocalError::BadLength.code())?;
             let resolved = state.drop_next(next);
             add_packet_trace!(
@@ -597,6 +666,7 @@ fn process_index(
     let transport_len = match validate_transport(packet, transport, &parsed, stage) {
         Ok(transport_len) => transport_len,
         Err(error) => {
+            drop(buffer);
             set_index_node_error_code(runtime, index, error.code())?;
             let resolved = state.drop_next(next);
             add_packet_trace!(
@@ -614,6 +684,7 @@ fn process_index(
             return Ok(resolved);
         }
     };
+    drop(buffer);
     refresh_basic_metadata(runtime, index, &parsed, transport_len)?;
 
     if stage.is_head_of_feature_arc() {
@@ -638,12 +709,7 @@ fn process_index(
             let next = state.protocol_next(next, parsed.protocol);
             let interface_index = {
                 let buffer = runtime.get_buffer(index)?;
-                let network = unsafe {
-                    std::mem::transmute::<
-                        &hammer_adapter::PrimaryOpaque,
-                        &hammer_adapter::NetworkOpaque,
-                    >(buffer.opaque())
-                };
+                let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
                 network.sw_if_index[0]
             };
             let resolved = if interface_index == 0 {
@@ -693,18 +759,6 @@ fn process_index(
 }
 
 #[inline(always)]
-fn packet_bytes(runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<Vec<u8>> {
-    let buffer = runtime.get_buffer(index)?;
-    let packet_len = buffer.current_len() + buffer.total_len_not_including_first();
-    drop(buffer);
-    let mut packet = runtime.copy_packet(index)?;
-    if packet.len() > packet_len {
-        packet.truncate(packet_len);
-    }
-    Ok(packet.into_iter().collect())
-}
-
-#[inline(always)]
 fn validate_transport(
     packet: &[u8],
     transport: &[u8],
@@ -722,10 +776,12 @@ fn validate_transport(
             Ok(Some(header_len))
         }
         IpProtocol::Udp => {
-            let datagram_len = udp_datagram_len(transport)?;
+            let header = read_header::<UdpHeader>(transport, 0)
+                .map_err(|_| IpLocalError::BadTransportHeader)?;
+            let datagram_len = udp_datagram_len(transport, header)?;
             let datagram = &transport[..datagram_len];
             if stage.is_head_of_feature_arc() {
-                let checksum = u16::from_be_bytes([transport[6], transport[7]]);
+                let checksum = header.checksum();
                 match parsed.version {
                     IpVersion::V4 if checksum == 0 => {}
                     IpVersion::V6 if checksum == 0 => return Err(IpLocalError::BadChecksum),
@@ -738,18 +794,16 @@ fn validate_transport(
             Ok(Some(UDP_HEADER_LEN))
         }
         IpProtocol::Icmpv4 => {
-            if transport.len() < ICMP_HEADER_MIN_LEN {
-                return Err(IpLocalError::BadTransportHeader);
-            }
+            read_header::<IcmpHeader>(transport, 0)
+                .map_err(|_| IpLocalError::BadTransportHeader)?;
             if matches!(stage, LocalStage::Head) && internet_checksum(transport) != 0 {
                 return Err(IpLocalError::BadChecksum);
             }
             Ok(Some(ICMP_HEADER_MIN_LEN))
         }
         IpProtocol::Icmpv6 => {
-            if transport.len() < ICMP_HEADER_MIN_LEN {
-                return Err(IpLocalError::BadTransportHeader);
-            }
+            read_header::<IcmpHeader>(transport, 0)
+                .map_err(|_| IpLocalError::BadTransportHeader)?;
             if matches!(stage, LocalStage::Head)
                 && l4_checksum(packet, parsed, IP_PROTOCOL_ICMP6, transport) != 0
             {
@@ -763,10 +817,9 @@ fn validate_transport(
 
 #[inline(always)]
 fn tcp_header_len(transport: &[u8]) -> Result<usize, IpLocalError> {
-    if transport.len() < TCP_HEADER_MIN_LEN {
-        return Err(IpLocalError::BadTransportHeader);
-    }
-    let header_len = ((transport[12] >> 4) as usize) * 4;
+    let header =
+        read_header::<TcpWireHeader>(transport, 0).map_err(|_| IpLocalError::BadTransportHeader)?;
+    let header_len = header.header_len();
     if header_len < TCP_HEADER_MIN_LEN || transport.len() < header_len {
         return Err(IpLocalError::BadTransportHeader);
     }
@@ -774,11 +827,8 @@ fn tcp_header_len(transport: &[u8]) -> Result<usize, IpLocalError> {
 }
 
 #[inline(always)]
-fn udp_datagram_len(transport: &[u8]) -> Result<usize, IpLocalError> {
-    if transport.len() < UDP_HEADER_LEN {
-        return Err(IpLocalError::BadTransportHeader);
-    }
-    let len = u16::from_be_bytes([transport[4], transport[5]]) as usize;
+fn udp_datagram_len(transport: &[u8], header: UdpHeader) -> Result<usize, IpLocalError> {
+    let len = header.length();
     if len < UDP_HEADER_LEN || transport.len() < len {
         return Err(IpLocalError::BadTransportHeader);
     }
@@ -794,7 +844,7 @@ fn refresh_basic_metadata(
 ) -> CoreResult<()> {
     let mut buffer = runtime.get_buffer_mut(index)?;
     let transport_header_len = transport_header_len.unwrap_or_default();
-    buffer.set_packet_cursor(
+    unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }.set_packet_cursor(
         BufferPacketCursor::new()
             .with_packet_len(parsed.packet_len)
             .with_network_header(parsed.network_header_offset, parsed.network_header_len)

@@ -1,14 +1,9 @@
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::vec::Vec;
 
-use crate::buffer::{
-    BufferBatchMut, BufferFrame, BufferIndex, DataPlaneRuntime, FrameIndex, PooledBufferFrame,
-};
-use crate::instruction_set::FrameBatchWidth;
+use crate::buffer::{BufferFrame, BufferIndex, DataPlaneRuntime, FrameIndex};
 
 use super::{MAX_NODE_NEXT_FRAMES, NodeId, NodeResult};
-
-const NODE_VECTOR_DISPATCH_UNSET: NodeId = NodeId::new(u32::MAX);
 
 pub trait NodeNext: Copy + Eq {
     const COUNT: usize;
@@ -37,36 +32,41 @@ impl NodeNextStorage<()> for NodeId {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Per-dispatch next-frame accumulator. Mirrors VPP `vlib_frame_queue` coupling
+/// between a node's current frame and the frames it hands to successor nodes.
+///
+/// The first distinct next node enqueued becomes the **current-frame reuse
+/// target**: its buffer indices stay in the node's current frame (recorded in
+/// `current_indices`) instead of allocating a fresh frame. Enqueues to any
+/// other next node allocate a frame from the runtime frame pool as before.
+///
+/// Two terminal methods consume the accumulator:
+///
+/// - [`Self::finish`] is the node-process path. It clears the current frame,
+///   writes `current_indices` back into it, schedules the freshly allocated
+///   frames, and returns a [`NodeResult`] that forwards the current frame to
+///   the reuse target via [`NextFrame::Current`]. This is the VPP
+///   `vlib_put_next_frame` same-next reuse: with a single next, no frame is
+///   allocated and the current frame is handed directly to the successor.
+///
+/// - [`Self::schedule`] is the path used when there is no current frame to
+///   reuse (session-queue output, `node_rewrite_frame!` / `node_rewrite_frame_current!`
+///   macros). It allocates a frame for `current_indices` and schedules every
+///   staged frame itself, returning `()`.
+///
+/// # Synchronization
+///
+/// Single-threaded per node dispatch: each `NodeNextFrames` is constructed
+/// inside a node process call and consumed before the call returns.
+#[derive(Debug)]
 pub struct NodeNextFrames {
     nodes: [Option<NodeId>; MAX_NODE_NEXT_FRAMES],
     frames: [Option<FrameIndex>; MAX_NODE_NEXT_FRAMES],
     len: usize,
-}
-
-#[derive(Debug)]
-struct NodeNextOwnedFrames {
-    nodes: [Option<NodeId>; MAX_NODE_NEXT_FRAMES],
-    frames: [Option<PooledBufferFrame>; MAX_NODE_NEXT_FRAMES],
-    len: usize,
-}
-
-#[derive(Debug)]
-pub struct NodeNextEnqueue {
-    speculative_node: NodeId,
-    split: NodeNextOwnedFrames,
-}
-
-#[derive(Debug)]
-pub struct NodeNextVectorEnqueue {
-    cached_next: NodeId,
-    frames: NodeNextOwnedFrames,
-}
-
-#[derive(Debug)]
-pub struct NodeVectorDispatch {
-    cached_next: Option<NodeId>,
-    frames: NodeNextOwnedFrames,
+    cached_next_node: Option<NodeId>,
+    cached_next_offset: usize,
+    current_node: Option<NodeId>,
+    current_indices: Vec<BufferIndex>,
 }
 
 impl Default for NodeNextFrames {
@@ -76,1239 +76,21 @@ impl Default for NodeNextFrames {
             nodes: [None; MAX_NODE_NEXT_FRAMES],
             frames: [None; MAX_NODE_NEXT_FRAMES],
             len: 0,
+            cached_next_node: None,
+            cached_next_offset: 0,
+            current_node: None,
+            current_indices: Vec::new(),
         }
-    }
-}
-
-impl Default for NodeNextOwnedFrames {
-    #[inline]
-    fn default() -> Self {
-        Self {
-            nodes: [None; MAX_NODE_NEXT_FRAMES],
-            frames: std::array::from_fn(|_| None),
-            len: 0,
-        }
-    }
-}
-
-impl NodeNextEnqueue {
-    #[inline]
-    pub fn new(speculative_node: NodeId) -> Self {
-        Self {
-            speculative_node,
-            split: NodeNextOwnedFrames::default(),
-        }
-    }
-
-    #[inline(always)]
-    pub fn validate_frame(
-        mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-        mut next_for_index: impl FnMut(BufferIndex) -> CoreResult<NodeId>,
-    ) -> CoreResult<NodeResult> {
-        let speculative_node = self.speculative_node;
-        let width = runtime.preferred_frame_batch_width();
-        self.validate_frame_with_width(runtime, frame, width, |index| {
-            let node = next_for_index(index)?;
-            Ok(node)
-        })?;
-        self.finish(runtime, frame, speculative_node)
-    }
-
-    #[inline(always)]
-    pub fn validate_frame_with_first_next(
-        mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-        first_index: BufferIndex,
-        first_next: NodeId,
-        mut next_for_index: impl FnMut(BufferIndex) -> CoreResult<NodeId>,
-    ) -> CoreResult<NodeResult> {
-        let speculative_node = self.speculative_node;
-        let width = runtime.preferred_frame_batch_width();
-        let mut first_seen = false;
-        self.validate_frame_with_width(runtime, frame, width, |index| {
-            if !first_seen && index == first_index {
-                first_seen = true;
-                return Ok(first_next);
-            }
-            next_for_index(index)
-        })?;
-        self.finish(runtime, frame, speculative_node)
-    }
-
-    #[inline(always)]
-    pub fn validate_frame_with_first_next_and_prefetch(
-        mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-        first_index: BufferIndex,
-        first_next: NodeId,
-        mut prefetch_index: impl FnMut(BufferIndex),
-        mut next_for_index: impl FnMut(BufferIndex) -> CoreResult<NodeId>,
-    ) -> CoreResult<NodeResult> {
-        let speculative_node = self.speculative_node;
-        let width = runtime.preferred_frame_batch_width();
-        let mut first_seen = false;
-        self.validate_frame_with_width_and_prefetch(
-            runtime,
-            frame,
-            width,
-            |index| prefetch_index(index),
-            |index| {
-                if !first_seen && index == first_index {
-                    first_seen = true;
-                    return Ok(first_next);
-                }
-                next_for_index(index)
-            },
-        )?;
-        self.finish(runtime, frame, speculative_node)
-    }
-
-    #[inline(always)]
-    pub fn validate_frame_with_first_next_and_buffer_batch_prefetch(
-        mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-        first_index: BufferIndex,
-        first_next: NodeId,
-        mut prefetch_index: impl FnMut(&mut BufferBatchMut<'_>, BufferIndex),
-        mut next_for_index: impl FnMut(&mut BufferBatchMut<'_>, BufferIndex) -> CoreResult<NodeId>,
-    ) -> CoreResult<NodeResult> {
-        let speculative_node = self.speculative_node;
-        let width = runtime.preferred_frame_batch_width();
-        let mut first_seen = false;
-        self.validate_frame_with_width_and_buffer_batch_prefetch(
-            runtime,
-            frame,
-            width,
-            |batch, index| prefetch_index(batch, index),
-            |batch, index| {
-                if !first_seen && index == first_index {
-                    first_seen = true;
-                    return Ok(first_next);
-                }
-                next_for_index(batch, index)
-            },
-        )?;
-        self.finish(runtime, frame, speculative_node)
-    }
-
-    #[inline(always)]
-    pub fn validate_frame_with_width(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-        width: FrameBatchWidth,
-        mut next_for_index: impl FnMut(BufferIndex) -> CoreResult<NodeId>,
-    ) -> CoreResult<()> {
-        let speculative_node = self.speculative_node;
-        let result = frame.retain_indices_batched(width, |index| {
-            let node = next_for_index(index)?;
-            if node == speculative_node {
-                Ok(true)
-            } else {
-                self.split.enqueue(runtime, node, index)?;
-                Ok(false)
-            }
-        });
-        if crate::unlikely(result.is_err()) {
-            self.split.free(runtime);
-        }
-        result
-    }
-
-    #[inline(always)]
-    pub fn validate_frame_with_nexts(
-        mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-        nexts: &[NodeId],
-    ) -> CoreResult<NodeResult> {
-        let speculative_node = self.speculative_node;
-        let width = runtime.preferred_frame_batch_width();
-        self.validate_frame_with_nexts_and_width(runtime, frame, width, nexts)?;
-        self.finish(runtime, frame, speculative_node)
-    }
-
-    #[inline(always)]
-    pub fn validate_frame_with_nexts_and_width(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-        width: FrameBatchWidth,
-        nexts: &[NodeId],
-    ) -> CoreResult<()> {
-        let speculative_node = self.speculative_node;
-        if nexts.len() != frame.pending_len() {
-            return Err(CoreError::internal("node next decision count mismatch"));
-        }
-        let mut offset = 0usize;
-        let result = frame.retain_indices_batched(width, |index| {
-            let node = nexts[offset];
-            offset += 1;
-            if node == speculative_node {
-                Ok(true)
-            } else {
-                self.split.enqueue(runtime, node, index)?;
-                Ok(false)
-            }
-        });
-        if crate::unlikely(result.is_err()) {
-            self.split.free(runtime);
-        }
-        result
-    }
-
-    #[inline(always)]
-    pub fn validate_frame_with_width_and_prefetch(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-        width: FrameBatchWidth,
-        mut prefetch_index: impl FnMut(BufferIndex),
-        mut next_for_index: impl FnMut(BufferIndex) -> CoreResult<NodeId>,
-    ) -> CoreResult<()> {
-        let speculative_node = self.speculative_node;
-        let result = frame.retain_indices_batched_with_prefetch(
-            width,
-            |index| prefetch_index(index),
-            |index| {
-                let node = next_for_index(index)?;
-                if node == speculative_node {
-                    Ok(true)
-                } else {
-                    self.split.enqueue(runtime, node, index)?;
-                    Ok(false)
-                }
-            },
-        );
-        if crate::unlikely(result.is_err()) {
-            self.split.free(runtime);
-        }
-        result
-    }
-
-    #[inline(always)]
-    pub fn validate_frame_with_width_and_buffer_batch_prefetch(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-        width: FrameBatchWidth,
-        mut prefetch_index: impl FnMut(&mut BufferBatchMut<'_>, BufferIndex),
-        mut next_for_index: impl FnMut(&mut BufferBatchMut<'_>, BufferIndex) -> CoreResult<NodeId>,
-    ) -> CoreResult<()> {
-        let speculative_node = self.speculative_node;
-        let mut batch = runtime.buffer_batch_mut();
-        let result = frame.buffer_node_inline(
-            width,
-            &mut batch,
-            |batch, index| prefetch_index(batch, index),
-            |batch, index| {
-                let node = next_for_index(batch, index)?;
-                if node == speculative_node {
-                    Ok(true)
-                } else {
-                    self.split.enqueue(runtime, node, index)?;
-                    Ok(false)
-                }
-            },
-        );
-        drop(batch);
-        if crate::unlikely(result.is_err()) {
-            self.split.free(runtime);
-        }
-        result
-    }
-
-    #[inline(always)]
-    pub fn validate_frame_with_buffer_batch_chunks(
-        mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-        mut prefetch_indices: impl FnMut(&mut BufferBatchMut<'_>, &[BufferIndex]),
-        mut nexts_for_indices: impl FnMut(
-            &mut BufferBatchMut<'_>,
-            &[BufferIndex],
-            &mut [NodeId; 4],
-        ) -> CoreResult<()>,
-    ) -> CoreResult<NodeResult> {
-        let speculative_node = self.speculative_node;
-        let width = runtime.preferred_frame_batch_width();
-        let mut batch = runtime.buffer_batch_mut();
-        let result = frame.buffer_node_inline_chunks(
-            width,
-            &mut batch,
-            |batch, indices| prefetch_indices(batch, indices),
-            |batch, indices, keep| {
-                let mut nexts = [speculative_node; 4];
-                nexts_for_indices(batch, indices, &mut nexts)?;
-                for offset in 0..indices.len() {
-                    let node = nexts[offset];
-                    if node != speculative_node {
-                        keep[offset] = false;
-                        self.split.enqueue(runtime, node, indices[offset])?;
-                    }
-                }
-                Ok(())
-            },
-        );
-        drop(batch);
-        if crate::unlikely(result.is_err()) {
-            self.split.free(runtime);
-        }
-        result?;
-        self.finish(runtime, frame, speculative_node)
-    }
-
-    #[inline(always)]
-    fn finish(
-        self,
-        runtime: &DataPlaneRuntime,
-        frame: &BufferFrame,
-        speculative_node: NodeId,
-    ) -> CoreResult<NodeResult> {
-        self.split.schedule(runtime)?;
-        if frame.has_pending() {
-            Ok(NodeResult::next_current(speculative_node))
-        } else {
-            Ok(NodeResult::drop())
-        }
-    }
-}
-
-impl NodeNextVectorEnqueue {
-    #[inline]
-    pub fn new(cached_next: NodeId) -> Self {
-        Self {
-            cached_next,
-            frames: NodeNextOwnedFrames::default(),
-        }
-    }
-
-    #[inline(always)]
-    pub fn enqueue_frame_with_buffer_batch_chunks(
-        mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-        mut prefetch_indices: impl FnMut(&mut BufferBatchMut<'_>, &[BufferIndex]),
-        mut nexts_for_indices: impl FnMut(
-            &mut BufferBatchMut<'_>,
-            &[BufferIndex],
-            &mut [NodeId; 4],
-        ) -> CoreResult<()>,
-    ) -> CoreResult<(NodeResult, NodeId)> {
-        let mut current_next = self.cached_next;
-        let width = runtime.preferred_frame_batch_width();
-        let mut batch = runtime.buffer_batch_mut();
-        let result = match width {
-            FrameBatchWidth::Quad => self.enqueue_frame_quad_chunks(
-                runtime,
-                frame,
-                &mut batch,
-                &mut current_next,
-                &mut prefetch_indices,
-                &mut nexts_for_indices,
-            ),
-            FrameBatchWidth::Pair => self.enqueue_frame_pair_chunks(
-                runtime,
-                frame,
-                &mut batch,
-                &mut current_next,
-                &mut prefetch_indices,
-                &mut nexts_for_indices,
-            ),
-        };
-        drop(batch);
-
-        if crate::unlikely(result.is_err()) {
-            self.frames.free(runtime);
-        }
-        result?;
-
-        frame.clear();
-        self.frames.schedule(runtime)?;
-        Ok((NodeResult::drop(), current_next))
-    }
-
-    #[inline(always)]
-    fn enqueue_frame_quad_chunks(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &BufferFrame,
-        batch: &mut BufferBatchMut<'_>,
-        current_next: &mut NodeId,
-        prefetch_indices: &mut impl FnMut(&mut BufferBatchMut<'_>, &[BufferIndex]),
-        nexts_for_indices: &mut impl FnMut(
-            &mut BufferBatchMut<'_>,
-            &[BufferIndex],
-            &mut [NodeId; 4],
-        ) -> CoreResult<()>,
-    ) -> CoreResult<()> {
-        let indices = frame.pending_indices();
-        let len = indices.len();
-        let mut read = 0usize;
-        while read + 4 <= len {
-            Self::prefetch_range(batch, indices, read + 4, 4, prefetch_indices);
-            let chunk = [
-                indices[read],
-                indices[read + 1],
-                indices[read + 2],
-                indices[read + 3],
-            ];
-            self.enqueue_chunk(runtime, &chunk, batch, current_next, nexts_for_indices)?;
-            read += 4;
-        }
-        if read + 2 <= len {
-            Self::prefetch_range(batch, indices, read + 2, 2, prefetch_indices);
-            let chunk = [indices[read], indices[read + 1]];
-            self.enqueue_chunk(runtime, &chunk, batch, current_next, nexts_for_indices)?;
-            read += 2;
-        }
-        while read < len {
-            let chunk = [indices[read]];
-            self.enqueue_chunk(runtime, &chunk, batch, current_next, nexts_for_indices)?;
-            read += 1;
-        }
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn enqueue_frame_pair_chunks(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &BufferFrame,
-        batch: &mut BufferBatchMut<'_>,
-        current_next: &mut NodeId,
-        prefetch_indices: &mut impl FnMut(&mut BufferBatchMut<'_>, &[BufferIndex]),
-        nexts_for_indices: &mut impl FnMut(
-            &mut BufferBatchMut<'_>,
-            &[BufferIndex],
-            &mut [NodeId; 4],
-        ) -> CoreResult<()>,
-    ) -> CoreResult<()> {
-        let indices = frame.pending_indices();
-        let len = indices.len();
-        let mut read = 0usize;
-        while read + 2 <= len {
-            Self::prefetch_range(batch, indices, read + 2, 2, prefetch_indices);
-            let chunk = [indices[read], indices[read + 1]];
-            self.enqueue_chunk(runtime, &chunk, batch, current_next, nexts_for_indices)?;
-            read += 2;
-        }
-        if read < len {
-            let chunk = [indices[read]];
-            self.enqueue_chunk(runtime, &chunk, batch, current_next, nexts_for_indices)?;
-        }
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn enqueue_chunk<const N: usize>(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        indices: &[BufferIndex; N],
-        batch: &mut BufferBatchMut<'_>,
-        current_next: &mut NodeId,
-        nexts_for_indices: &mut impl FnMut(
-            &mut BufferBatchMut<'_>,
-            &[BufferIndex],
-            &mut [NodeId; 4],
-        ) -> CoreResult<()>,
-    ) -> CoreResult<()> {
-        let mut nexts = [*current_next; 4];
-        nexts_for_indices(batch, indices, &mut nexts)?;
-
-        let first = nexts[0];
-        let all_same = (1..N).all(|offset| nexts[offset] == first);
-        if all_same {
-            self.frames
-                .enqueue_indices(runtime, first, indices.iter().copied())?;
-            *current_next = first;
-            return Ok(());
-        }
-
-        for offset in 0..N {
-            self.frames
-                .enqueue(runtime, nexts[offset], indices[offset])?;
-        }
-        if N == 1 || nexts[N - 2] == nexts[N - 1] {
-            *current_next = nexts[N - 1];
-        }
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn prefetch_range(
-        batch: &mut BufferBatchMut<'_>,
-        indices: &[BufferIndex],
-        offset: usize,
-        width: usize,
-        prefetch_indices: &mut impl FnMut(&mut BufferBatchMut<'_>, &[BufferIndex]),
-    ) {
-        if crate::unlikely(offset >= indices.len()) {
-            return;
-        }
-        let end = (offset + width).min(indices.len());
-        prefetch_indices(batch, &indices[offset..end]);
-    }
-}
-
-impl NodeVectorDispatch {
-    #[inline]
-    pub fn new(cached_next: Option<NodeId>) -> Self {
-        Self {
-            cached_next,
-            frames: NodeNextOwnedFrames::default(),
-        }
-    }
-
-    #[inline(always)]
-    pub fn route_frame(
-        mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-        mut prefetch_indices: impl FnMut(&mut BufferBatchMut<'_>, &[BufferIndex]),
-        mut route_chunk: impl FnMut(
-            &mut BufferBatchMut<'_>,
-            &[BufferIndex],
-            &mut [Option<NodeId>; 4],
-        ) -> CoreResult<()>,
-    ) -> CoreResult<(NodeResult, Option<NodeId>)> {
-        // `route_chunk` may inspect or mutate packet contents/metadata while filling decisions,
-        // but ownership stays with this dispatcher until the callback returns. On error we only
-        // commit the written prefix and roll back any staged next frames for the remaining tail.
-        let mut cached_next = self.cached_next;
-        let mut current_frame_next = self.cached_next;
-        let mut current_frame_indices = Vec::with_capacity(frame.pending_len());
-        let mut processed = 0usize;
-        let width = runtime.preferred_frame_batch_width();
-        let result = match width {
-            FrameBatchWidth::Quad => self.route_frame_quad_main(
-                runtime,
-                frame,
-                &mut cached_next,
-                &mut current_frame_next,
-                &mut current_frame_indices,
-                &mut processed,
-                &mut prefetch_indices,
-                &mut route_chunk,
-            ),
-            FrameBatchWidth::Pair => self.route_frame_pair_main(
-                runtime,
-                frame,
-                &mut cached_next,
-                &mut current_frame_next,
-                &mut current_frame_indices,
-                &mut processed,
-                &mut prefetch_indices,
-                &mut route_chunk,
-            ),
-        };
-
-        if crate::unlikely(result.is_err()) {
-            Self::restore_current_frame_error(
-                runtime,
-                frame,
-                processed,
-                &mut current_frame_indices,
-            )?;
-            self.frames.free(runtime);
-        }
-        result?;
-
-        Self::restore_current_frame_success(frame, processed, &mut current_frame_indices)?;
-
-        let result = if frame.has_pending() {
-            let node = current_frame_next
-                .ok_or_else(|| CoreError::internal("current frame next is missing"))?;
-            if let Err(err) = runtime.nodes().node_name(node) {
-                Self::release_current_and_staged_frames(runtime, frame, &mut self.frames);
-                return Err(err);
-            }
-            NodeResult::next_current(node)
-        } else {
-            NodeResult::drop()
-        };
-
-        if let Err(err) = self.frames.schedule(runtime) {
-            runtime.free_frame(frame);
-            return Err(err);
-        }
-
-        Ok((result, cached_next))
-    }
-
-    #[inline(always)]
-    pub fn route_frame_prefetch(
-        self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-        route_chunk: impl FnMut(
-            &mut BufferBatchMut<'_>,
-            &[BufferIndex],
-            &mut [Option<NodeId>; 4],
-        ) -> CoreResult<()>,
-    ) -> CoreResult<(NodeResult, Option<NodeId>)> {
-        self.route_frame(runtime, frame, default_prefetch_indices, route_chunk)
-    }
-
-    #[inline(always)]
-    pub fn route_frame_map(
-        self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-        mut route_index: impl FnMut(&mut BufferBatchMut<'_>, BufferIndex) -> CoreResult<Option<NodeId>>,
-    ) -> CoreResult<(NodeResult, Option<NodeId>)> {
-        self.route_frame_prefetch(runtime, frame, |batch, indices, nexts| {
-            for (offset, index) in indices.iter().copied().enumerate() {
-                nexts[offset] = route_index(batch, index)?;
-            }
-            Ok(())
-        })
-    }
-
-    #[inline(always)]
-    pub fn route_frame_index(
-        mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-        mut route_index: impl FnMut(BufferIndex) -> CoreResult<Option<NodeId>>,
-    ) -> CoreResult<(NodeResult, Option<NodeId>)> {
-        let mut cached_next = self.cached_next;
-        let mut current_frame_next = self.cached_next;
-        let mut current_frame_indices = Vec::with_capacity(frame.pending_len());
-        let mut processed = 0usize;
-        let width = runtime.preferred_frame_batch_width();
-        let result = match width {
-            FrameBatchWidth::Quad => self.route_frame_index_quad_main(
-                runtime,
-                frame,
-                &mut cached_next,
-                &mut current_frame_next,
-                &mut current_frame_indices,
-                &mut processed,
-                &mut route_index,
-            ),
-            FrameBatchWidth::Pair => self.route_frame_index_pair_main(
-                runtime,
-                frame,
-                &mut cached_next,
-                &mut current_frame_next,
-                &mut current_frame_indices,
-                &mut processed,
-                &mut route_index,
-            ),
-        };
-
-        if crate::unlikely(result.is_err()) {
-            Self::restore_current_frame_error(
-                runtime,
-                frame,
-                processed,
-                &mut current_frame_indices,
-            )?;
-            self.frames.free(runtime);
-        }
-        result?;
-
-        Self::restore_current_frame_success(frame, processed, &mut current_frame_indices)?;
-
-        let result = if frame.has_pending() {
-            let node = current_frame_next
-                .ok_or_else(|| CoreError::internal("current frame next is missing"))?;
-            if let Err(err) = runtime.nodes().node_name(node) {
-                Self::release_current_and_staged_frames(runtime, frame, &mut self.frames);
-                return Err(err);
-            }
-            NodeResult::next_current(node)
-        } else {
-            NodeResult::drop()
-        };
-
-        if let Err(err) = self.frames.schedule(runtime) {
-            runtime.free_frame(frame);
-            return Err(err);
-        }
-
-        Ok((result, cached_next))
-    }
-
-    #[inline(always)]
-    fn route_frame_quad_main(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &BufferFrame,
-        cached_next: &mut Option<NodeId>,
-        current_frame_next: &mut Option<NodeId>,
-        current_frame_indices: &mut Vec<BufferIndex>,
-        processed: &mut usize,
-        prefetch_indices: &mut impl FnMut(&mut BufferBatchMut<'_>, &[BufferIndex]),
-        route_chunk: &mut impl FnMut(
-            &mut BufferBatchMut<'_>,
-            &[BufferIndex],
-            &mut [Option<NodeId>; 4],
-        ) -> CoreResult<()>,
-    ) -> CoreResult<()> {
-        let indices = frame.pending_indices();
-        let len = indices.len();
-        let mut read = 0usize;
-        while read + 4 <= len {
-            Self::prefetch_range(runtime, indices, read + 4, 4, prefetch_indices);
-            let chunk = [
-                indices[read],
-                indices[read + 1],
-                indices[read + 2],
-                indices[read + 3],
-            ];
-            self.dispatch_chunk(
-                runtime,
-                &chunk,
-                cached_next,
-                current_frame_next,
-                current_frame_indices,
-                processed,
-                route_chunk,
-            )?;
-            read += 4;
-        }
-        self.route_frame_pair_tail(
-            runtime,
-            indices,
-            read,
-            cached_next,
-            current_frame_next,
-            current_frame_indices,
-            processed,
-            prefetch_indices,
-            route_chunk,
-        )
-    }
-
-    #[inline(always)]
-    fn route_frame_pair_tail(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        indices: &[BufferIndex],
-        mut read: usize,
-        cached_next: &mut Option<NodeId>,
-        current_frame_next: &mut Option<NodeId>,
-        current_frame_indices: &mut Vec<BufferIndex>,
-        processed: &mut usize,
-        prefetch_indices: &mut impl FnMut(&mut BufferBatchMut<'_>, &[BufferIndex]),
-        route_chunk: &mut impl FnMut(
-            &mut BufferBatchMut<'_>,
-            &[BufferIndex],
-            &mut [Option<NodeId>; 4],
-        ) -> CoreResult<()>,
-    ) -> CoreResult<()> {
-        if read + 2 <= indices.len() {
-            Self::prefetch_range(runtime, indices, read + 2, 2, prefetch_indices);
-            let chunk = [indices[read], indices[read + 1]];
-            self.dispatch_chunk(
-                runtime,
-                &chunk,
-                cached_next,
-                current_frame_next,
-                current_frame_indices,
-                processed,
-                route_chunk,
-            )?;
-            read += 2;
-        }
-        self.route_frame_scalar_tail(
-            runtime,
-            indices,
-            read,
-            cached_next,
-            current_frame_next,
-            current_frame_indices,
-            processed,
-            route_chunk,
-        )
-    }
-
-    #[inline(always)]
-    fn route_frame_index_quad_main(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &BufferFrame,
-        cached_next: &mut Option<NodeId>,
-        current_frame_next: &mut Option<NodeId>,
-        current_frame_indices: &mut Vec<BufferIndex>,
-        processed: &mut usize,
-        route_index: &mut impl FnMut(BufferIndex) -> CoreResult<Option<NodeId>>,
-    ) -> CoreResult<()> {
-        let indices = frame.pending_indices();
-        let len = indices.len();
-        let mut read = 0usize;
-        while read + 4 <= len {
-            Self::prefetch_range(runtime, indices, read + 4, 4, &mut default_prefetch_indices);
-            let chunk = [
-                indices[read],
-                indices[read + 1],
-                indices[read + 2],
-                indices[read + 3],
-            ];
-            self.dispatch_index_chunk(
-                runtime,
-                &chunk,
-                cached_next,
-                current_frame_next,
-                current_frame_indices,
-                processed,
-                route_index,
-            )?;
-            read += 4;
-        }
-        self.route_frame_index_pair_tail(
-            runtime,
-            indices,
-            read,
-            cached_next,
-            current_frame_next,
-            current_frame_indices,
-            processed,
-            route_index,
-        )
-    }
-
-    #[inline(always)]
-    fn route_frame_index_pair_tail(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        indices: &[BufferIndex],
-        mut read: usize,
-        cached_next: &mut Option<NodeId>,
-        current_frame_next: &mut Option<NodeId>,
-        current_frame_indices: &mut Vec<BufferIndex>,
-        processed: &mut usize,
-        route_index: &mut impl FnMut(BufferIndex) -> CoreResult<Option<NodeId>>,
-    ) -> CoreResult<()> {
-        if read + 2 <= indices.len() {
-            Self::prefetch_range(runtime, indices, read + 2, 2, &mut default_prefetch_indices);
-            let chunk = [indices[read], indices[read + 1]];
-            self.dispatch_index_chunk(
-                runtime,
-                &chunk,
-                cached_next,
-                current_frame_next,
-                current_frame_indices,
-                processed,
-                route_index,
-            )?;
-            read += 2;
-        }
-        self.route_frame_index_scalar_tail(
-            runtime,
-            indices,
-            read,
-            cached_next,
-            current_frame_next,
-            current_frame_indices,
-            processed,
-            route_index,
-        )
-    }
-
-    #[inline(always)]
-    fn route_frame_index_pair_main(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &BufferFrame,
-        cached_next: &mut Option<NodeId>,
-        current_frame_next: &mut Option<NodeId>,
-        current_frame_indices: &mut Vec<BufferIndex>,
-        processed: &mut usize,
-        route_index: &mut impl FnMut(BufferIndex) -> CoreResult<Option<NodeId>>,
-    ) -> CoreResult<()> {
-        let indices = frame.pending_indices();
-        let mut read = 0usize;
-        while read + 2 <= indices.len() {
-            Self::prefetch_range(runtime, indices, read + 2, 2, &mut default_prefetch_indices);
-            let chunk = [indices[read], indices[read + 1]];
-            self.dispatch_index_chunk(
-                runtime,
-                &chunk,
-                cached_next,
-                current_frame_next,
-                current_frame_indices,
-                processed,
-                route_index,
-            )?;
-            read += 2;
-        }
-        self.route_frame_index_scalar_tail(
-            runtime,
-            indices,
-            read,
-            cached_next,
-            current_frame_next,
-            current_frame_indices,
-            processed,
-            route_index,
-        )
-    }
-
-    #[inline(always)]
-    fn route_frame_pair_main(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &BufferFrame,
-        cached_next: &mut Option<NodeId>,
-        current_frame_next: &mut Option<NodeId>,
-        current_frame_indices: &mut Vec<BufferIndex>,
-        processed: &mut usize,
-        prefetch_indices: &mut impl FnMut(&mut BufferBatchMut<'_>, &[BufferIndex]),
-        route_chunk: &mut impl FnMut(
-            &mut BufferBatchMut<'_>,
-            &[BufferIndex],
-            &mut [Option<NodeId>; 4],
-        ) -> CoreResult<()>,
-    ) -> CoreResult<()> {
-        let indices = frame.pending_indices();
-        let mut read = 0usize;
-        while read + 2 <= indices.len() {
-            Self::prefetch_range(runtime, indices, read + 2, 2, prefetch_indices);
-            let chunk = [indices[read], indices[read + 1]];
-            self.dispatch_chunk(
-                runtime,
-                &chunk,
-                cached_next,
-                current_frame_next,
-                current_frame_indices,
-                processed,
-                route_chunk,
-            )?;
-            read += 2;
-        }
-        self.route_frame_scalar_tail(
-            runtime,
-            indices,
-            read,
-            cached_next,
-            current_frame_next,
-            current_frame_indices,
-            processed,
-            route_chunk,
-        )
-    }
-
-    #[inline(always)]
-    fn route_frame_scalar_tail(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        indices: &[BufferIndex],
-        read: usize,
-        cached_next: &mut Option<NodeId>,
-        current_frame_next: &mut Option<NodeId>,
-        current_frame_indices: &mut Vec<BufferIndex>,
-        processed: &mut usize,
-        route_chunk: &mut impl FnMut(
-            &mut BufferBatchMut<'_>,
-            &[BufferIndex],
-            &mut [Option<NodeId>; 4],
-        ) -> CoreResult<()>,
-    ) -> CoreResult<()> {
-        if read < indices.len() {
-            let chunk = [indices[read]];
-            self.dispatch_chunk(
-                runtime,
-                &chunk,
-                cached_next,
-                current_frame_next,
-                current_frame_indices,
-                processed,
-                route_chunk,
-            )?;
-        }
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn route_frame_index_scalar_tail(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        indices: &[BufferIndex],
-        read: usize,
-        cached_next: &mut Option<NodeId>,
-        current_frame_next: &mut Option<NodeId>,
-        current_frame_indices: &mut Vec<BufferIndex>,
-        processed: &mut usize,
-        route_index: &mut impl FnMut(BufferIndex) -> CoreResult<Option<NodeId>>,
-    ) -> CoreResult<()> {
-        if read < indices.len() {
-            let chunk = [indices[read]];
-            self.dispatch_index_chunk(
-                runtime,
-                &chunk,
-                cached_next,
-                current_frame_next,
-                current_frame_indices,
-                processed,
-                route_index,
-            )?;
-        }
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn dispatch_chunk<const N: usize>(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        indices: &[BufferIndex; N],
-        cached_next: &mut Option<NodeId>,
-        current_frame_next: &mut Option<NodeId>,
-        current_frame_indices: &mut Vec<BufferIndex>,
-        processed: &mut usize,
-        route_chunk: &mut impl FnMut(
-            &mut BufferBatchMut<'_>,
-            &[BufferIndex],
-            &mut [Option<NodeId>; 4],
-        ) -> CoreResult<()>,
-    ) -> CoreResult<()> {
-        let mut nexts = [Some(NODE_VECTOR_DISPATCH_UNSET); 4];
-        let mut batch = runtime.buffer_batch_mut();
-        let route = route_chunk(&mut batch, indices, &mut nexts);
-        drop(batch);
-        if let Err(err) = route {
-            let committed = Self::committed_prefix_len(&nexts, N);
-            self.commit_next_runs(
-                runtime,
-                &indices[..committed],
-                &nexts[..committed],
-                cached_next,
-                current_frame_next,
-                current_frame_indices,
-                processed,
-            )?;
-            return Err(err);
-        }
-        Self::validate_active_nexts(&nexts, N)?;
-
-        self.commit_next_runs(
-            runtime,
-            indices,
-            &nexts[..N],
-            cached_next,
-            current_frame_next,
-            current_frame_indices,
-            processed,
-        )
-    }
-
-    #[inline(always)]
-    fn dispatch_index_chunk<const N: usize>(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        indices: &[BufferIndex; N],
-        cached_next: &mut Option<NodeId>,
-        current_frame_next: &mut Option<NodeId>,
-        current_frame_indices: &mut Vec<BufferIndex>,
-        processed: &mut usize,
-        route_index: &mut impl FnMut(BufferIndex) -> CoreResult<Option<NodeId>>,
-    ) -> CoreResult<()> {
-        let mut nexts = [None; 4];
-        for offset in 0..N {
-            match route_index(indices[offset]) {
-                Ok(next) => nexts[offset] = next,
-                Err(err) => {
-                    self.commit_next_runs(
-                        runtime,
-                        &indices[..offset],
-                        &nexts[..offset],
-                        cached_next,
-                        current_frame_next,
-                        current_frame_indices,
-                        processed,
-                    )?;
-                    return Err(err);
-                }
-            }
-        }
-        self.commit_next_runs(
-            runtime,
-            indices,
-            &nexts[..N],
-            cached_next,
-            current_frame_next,
-            current_frame_indices,
-            processed,
-        )
-    }
-
-    #[inline(always)]
-    fn commit_next_runs(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        indices: &[BufferIndex],
-        nexts: &[Option<NodeId>],
-        cached_next: &mut Option<NodeId>,
-        current_frame_next: &mut Option<NodeId>,
-        current_frame_indices: &mut Vec<BufferIndex>,
-        processed: &mut usize,
-    ) -> CoreResult<()> {
-        if indices.is_empty() {
-            return Ok(());
-        }
-        let mut run_node = nexts[0];
-        let mut run_start = 0usize;
-        for offset in 1..=indices.len() {
-            let next = if offset < indices.len() {
-                nexts[offset]
-            } else {
-                None
-            };
-            if offset == indices.len() || next != run_node {
-                self.commit_next_run(
-                    runtime,
-                    &indices[run_start..offset],
-                    run_node,
-                    cached_next,
-                    current_frame_next,
-                    current_frame_indices,
-                )?;
-                *processed += offset - run_start;
-                run_start = offset;
-                run_node = next;
-            }
-        }
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn commit_next_run(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        indices: &[BufferIndex],
-        node: Option<NodeId>,
-        cached_next: &mut Option<NodeId>,
-        current_frame_next: &mut Option<NodeId>,
-        current_frame_indices: &mut Vec<BufferIndex>,
-    ) -> CoreResult<()> {
-        if crate::unlikely(node.is_none()) {
-            return Ok(());
-        }
-        let node = node.expect("checked node");
-
-        let keep_current = match current_frame_next {
-            Some(current) => *current == node,
-            None => {
-                *current_frame_next = Some(node);
-                true
-            }
-        };
-
-        if keep_current {
-            for index in indices.iter().copied() {
-                current_frame_indices.push(index);
-            }
-        } else {
-            self.frames
-                .enqueue_indices(runtime, node, indices.iter().copied())?;
-        }
-        *cached_next = Some(node);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn restore_current_frame_success(
-        frame: &mut BufferFrame,
-        processed: usize,
-        current_frame_indices: &mut Vec<BufferIndex>,
-    ) -> CoreResult<()> {
-        {
-            let pending = frame.pending_indices();
-            for index in pending[processed.min(pending.len())..].iter().copied() {
-                current_frame_indices.push(index);
-            }
-        }
-
-        frame.clear();
-        frame.push_indices(current_frame_indices.iter().copied())?;
-        current_frame_indices.clear();
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn restore_current_frame_error(
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-        processed: usize,
-        current_frame_indices: &mut Vec<BufferIndex>,
-    ) -> CoreResult<()> {
-        if current_frame_indices.is_empty() {
-            frame.discard_prefix(processed);
-            return Ok(());
-        }
-
-        let mut tail = Vec::with_capacity(frame.pending_len().saturating_sub(processed));
-        {
-            let pending = frame.pending_indices();
-            for index in pending[processed.min(pending.len())..].iter().copied() {
-                tail.push(index);
-            }
-        }
-
-        for index in current_frame_indices.drain(..) {
-            runtime.free_index(index);
-        }
-
-        frame.clear();
-        frame.push_indices(tail.into_iter())
-    }
-
-    #[inline(always)]
-    fn release_current_and_staged_frames(
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-        staged_frames: &mut NodeNextOwnedFrames,
-    ) {
-        runtime.free_frame(frame);
-        staged_frames.free(runtime);
-    }
-
-    #[inline(always)]
-    fn prefetch_range(
-        runtime: &DataPlaneRuntime,
-        indices: &[BufferIndex],
-        offset: usize,
-        width: usize,
-        prefetch_indices: &mut impl FnMut(&mut BufferBatchMut<'_>, &[BufferIndex]),
-    ) {
-        if crate::unlikely(offset >= indices.len()) {
-            return;
-        }
-        let end = (offset + width).min(indices.len());
-        let mut batch = runtime.buffer_batch_mut();
-        prefetch_indices(&mut batch, &indices[offset..end]);
-    }
-
-    #[inline(always)]
-    fn validate_active_nexts(nexts: &[Option<NodeId>; 4], len: usize) -> CoreResult<()> {
-        for next in nexts.iter().take(len) {
-            if crate::unlikely(*next == Some(NODE_VECTOR_DISPATCH_UNSET)) {
-                return Err(CoreError::internal("node route decision is missing"));
-            }
-        }
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn committed_prefix_len(nexts: &[Option<NodeId>; 4], len: usize) -> usize {
-        nexts[..len]
-            .iter()
-            .position(|next| *next == Some(NODE_VECTOR_DISPATCH_UNSET))
-            .unwrap_or(len)
     }
 }
 
 #[inline(always)]
-pub fn default_prefetch_indices(batch: &mut BufferBatchMut<'_>, indices: &[BufferIndex]) {
-    for index in indices {
-        batch.prefetch_header(*index);
+pub fn default_prefetch_indices(runtime: &DataPlaneRuntime, indices: &[BufferIndex]) {
+    let mut read = 0usize;
+    let len = indices.len();
+    while read < len {
+        runtime.prefetch_header(indices[read]);
+        read += 1;
     }
 }
 
@@ -1320,6 +102,17 @@ impl NodeNextFrames {
         node: NodeId,
         index: BufferIndex,
     ) -> CoreResult<()> {
+        if let Some(current) = self.current_node
+            && current == node
+        {
+            self.current_indices.push(index);
+            return Ok(());
+        }
+        if self.current_node.is_none() {
+            self.current_node = Some(node);
+            self.current_indices.push(index);
+            return Ok(());
+        }
         let (frame_index, offset, created) = self.frame_for_enqueue(runtime, node)?;
         let result = runtime.get_frame_mut(frame_index)?.push_index(index);
         if crate::unlikely(result.is_err()) && created {
@@ -1335,6 +128,21 @@ impl NodeNextFrames {
         node: NodeId,
         indices: impl IntoIterator<Item = BufferIndex>,
     ) -> CoreResult<()> {
+        if let Some(current) = self.current_node
+            && current == node
+        {
+            for index in indices {
+                self.current_indices.push(index);
+            }
+            return Ok(());
+        }
+        if self.current_node.is_none() {
+            self.current_node = Some(node);
+            for index in indices {
+                self.current_indices.push(index);
+            }
+            return Ok(());
+        }
         let (frame_index, offset, created) = self.frame_for_enqueue(runtime, node)?;
         let result = runtime.get_frame_mut(frame_index)?.push_indices(indices);
         if crate::unlikely(result.is_err()) && created {
@@ -1357,9 +165,111 @@ impl NodeNextFrames {
         self.enqueue(runtime, node, index)
     }
 
+    /// Node-process terminal: write the current-frame reuse indices back into
+    /// `frame`, schedule every other staged frame, and return a [`NodeResult`]
+    /// that forwards the current frame to the reuse target.
+    ///
+    /// On error the staged frames are released and `frame` is freed via
+    /// `runtime.free_frame` so the caller does not need to clean up.
+    #[inline]
+    pub fn finish(
+        mut self,
+        runtime: &DataPlaneRuntime,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        frame.clear();
+        if !self.current_indices.is_empty() {
+            // The current frame's capacity is at least `pending_len()` at
+            // dispatch start and `current_indices` is a subset of those
+            // indices, so the push cannot overflow.
+            frame.push_indices(self.current_indices.iter().copied())?;
+        }
+
+        if let Err(err) = self.schedule_staged(runtime) {
+            runtime.free_frame(frame);
+            return Err(err);
+        }
+
+        let result = match (self.current_node, frame.has_pending()) {
+            (Some(node), true) => NodeResult::next_current(node),
+            _ => NodeResult::drop(),
+        };
+        Ok(result)
+    }
+
+    /// Driver / macro terminal: allocate a frame for the current-frame reuse
+    /// indices (there is no current frame to hand off), schedule every staged
+    /// frame, and return `()`.
     #[inline]
     pub fn schedule(mut self, runtime: &DataPlaneRuntime) -> CoreResult<()> {
-        for offset in 0..self.len {
+        if let Some(node) = self.current_node
+            && !self.current_indices.is_empty()
+        {
+            let frame_index = runtime.alloc_frame_index()?;
+            if let Err(err) = runtime
+                .get_frame_mut(frame_index)?
+                .push_indices(self.current_indices.iter().copied())
+            {
+                let _ = runtime.free_frame_index(frame_index);
+                self.free(runtime);
+                return Err(err);
+            }
+            if self.len == MAX_NODE_NEXT_FRAMES {
+                let _ = runtime.free_frame_index(frame_index);
+                self.free(runtime);
+                return Err(CoreError::internal("node next frame capacity exceeded"));
+            }
+            let offset = self.len;
+            self.nodes[offset] = Some(node);
+            self.frames[offset] = Some(frame_index);
+            self.len += 1;
+            self.cached_next_node = Some(node);
+            self.cached_next_offset = offset;
+        }
+        self.schedule_staged(runtime)?;
+        Ok(())
+    }
+
+    #[inline]
+    pub fn free(&mut self, runtime: &DataPlaneRuntime) {
+        self.free_from(runtime, 0);
+    }
+
+    #[inline]
+    fn frame_for_enqueue(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        node: NodeId,
+    ) -> CoreResult<(FrameIndex, usize, bool)> {
+        if self.cached_next_node == Some(node)
+            && let Some(frame) = self.frame(self.cached_next_offset).ok()
+        {
+            return Ok((frame, self.cached_next_offset, false));
+        }
+        if let Some(offset) = self.position(node) {
+            self.cached_next_node = Some(node);
+            self.cached_next_offset = offset;
+            return self.frame(offset).map(|frame| (frame, offset, false));
+        }
+        if self.len == MAX_NODE_NEXT_FRAMES {
+            return Err(CoreError::internal("node next frame capacity exceeded"));
+        }
+        let offset = self.len;
+        self.nodes[offset] = Some(node);
+        self.frames[offset] = Some(runtime.alloc_frame_index()?);
+        self.len += 1;
+        self.cached_next_node = Some(node);
+        self.cached_next_offset = offset;
+        self.frame(offset).map(|frame| (frame, offset, true))
+    }
+
+    /// Schedule every freshly allocated frame in `self.nodes` / `self.frames`.
+    /// Used by both [`Self::finish`] and [`Self::schedule`]; neither keeps a
+    /// borrow on the runtime's frame pool past this call.
+    #[inline]
+    fn schedule_staged(&mut self, runtime: &DataPlaneRuntime) -> CoreResult<()> {
+        let mut offset = 0usize;
+        while offset < self.len {
             let node = match self.node(offset) {
                 Ok(node) => node,
                 Err(err) => {
@@ -1385,33 +295,12 @@ impl NodeNextFrames {
                     return Err(err);
                 }
             }
+            offset += 1;
         }
         self.len = 0;
+        self.cached_next_node = None;
+        self.cached_next_offset = 0;
         Ok(())
-    }
-
-    #[inline]
-    pub fn free(&mut self, runtime: &DataPlaneRuntime) {
-        self.free_from(runtime, 0);
-    }
-
-    #[inline]
-    fn frame_for_enqueue(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        node: NodeId,
-    ) -> CoreResult<(FrameIndex, usize, bool)> {
-        if let Some(offset) = self.position(node) {
-            return self.frame(offset).map(|frame| (frame, offset, false));
-        }
-        if self.len == MAX_NODE_NEXT_FRAMES {
-            return Err(CoreError::internal("node next frame capacity exceeded"));
-        }
-        let offset = self.len;
-        self.nodes[offset] = Some(node);
-        self.frames[offset] = Some(runtime.alloc_frame_index()?);
-        self.len += 1;
-        self.frame(offset).map(|frame| (frame, offset, true))
     }
 
     #[inline]
@@ -1441,135 +330,28 @@ impl NodeNextFrames {
 
     #[inline]
     fn position(&self, node: NodeId) -> Option<usize> {
-        self.nodes[..self.len]
-            .iter()
-            .position(|candidate| *candidate == Some(node))
+        let mut offset = 0usize;
+        while offset < self.len {
+            if self.nodes[offset] == Some(node) {
+                return Some(offset);
+            }
+            offset += 1;
+        }
+        None
     }
 
     #[inline]
     fn free_from(&mut self, runtime: &DataPlaneRuntime, start: usize) {
-        for offset in start..self.len {
+        let mut offset = start;
+        while offset < self.len {
             self.nodes[offset] = None;
             if let Some(frame) = self.frames[offset].take() {
                 let _ = runtime.free_frame_index(frame);
             }
+            offset += 1;
         }
         self.len = start.min(self.len);
-    }
-}
-
-impl NodeNextOwnedFrames {
-    #[inline]
-    fn enqueue(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        node: NodeId,
-        index: BufferIndex,
-    ) -> CoreResult<()> {
-        self.frame_for_mut(runtime, node)?.push_index(index)
-    }
-
-    #[inline]
-    fn enqueue_indices(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        node: NodeId,
-        indices: impl IntoIterator<Item = BufferIndex>,
-    ) -> CoreResult<()> {
-        self.frame_for_mut(runtime, node)?.push_indices(indices)
-    }
-
-    #[inline]
-    fn schedule(mut self, runtime: &DataPlaneRuntime) -> CoreResult<()> {
-        for offset in 0..self.len {
-            let node = match self.node(offset) {
-                Ok(node) => node,
-                Err(err) => {
-                    self.free_from(runtime, offset);
-                    return Err(err);
-                }
-            };
-            let frame = match self.take_frame(offset) {
-                Ok(frame) => frame,
-                Err(err) => {
-                    self.free_from(runtime, offset + 1);
-                    return Err(err);
-                }
-            };
-            if let Err(err) = runtime.schedule_pooled_frame(node, frame) {
-                self.free_from(runtime, offset + 1);
-                return Err(err);
-            }
-        }
-        self.len = 0;
-        Ok(())
-    }
-
-    #[inline]
-    fn free(&mut self, runtime: &DataPlaneRuntime) {
-        self.free_from(runtime, 0);
-    }
-
-    #[inline]
-    fn frame_for_mut(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        node: NodeId,
-    ) -> CoreResult<&mut BufferFrame> {
-        if let Some(offset) = self.position(node) {
-            return self.frame_mut(offset);
-        }
-        if self.len == MAX_NODE_NEXT_FRAMES {
-            return Err(CoreError::internal("node next frame capacity exceeded"));
-        }
-        let offset = self.len;
-        self.nodes[offset] = Some(node);
-        self.frames[offset] = Some(runtime.alloc_pooled_frame()?);
-        self.len += 1;
-        self.frame_mut(offset)
-    }
-
-    #[inline]
-    fn node(&self, offset: usize) -> CoreResult<NodeId> {
-        self.nodes
-            .get(offset)
-            .and_then(|node| *node)
-            .ok_or_else(|| CoreError::internal("node next entry is missing"))
-    }
-
-    #[inline]
-    fn frame_mut(&mut self, offset: usize) -> CoreResult<&mut BufferFrame> {
-        self.frames
-            .get_mut(offset)
-            .and_then(Option::as_mut)
-            .map(|frame| &mut **frame)
-            .ok_or_else(|| CoreError::internal("node next frame is missing"))
-    }
-
-    #[inline]
-    fn take_frame(&mut self, offset: usize) -> CoreResult<PooledBufferFrame> {
-        self.nodes[offset] = None;
-        self.frames
-            .get_mut(offset)
-            .and_then(|frame| frame.take())
-            .ok_or_else(|| CoreError::internal("node next frame is missing"))
-    }
-
-    #[inline]
-    fn position(&self, node: NodeId) -> Option<usize> {
-        self.nodes[..self.len]
-            .iter()
-            .position(|candidate| *candidate == Some(node))
-    }
-
-    #[inline]
-    fn free_from(&mut self, runtime: &DataPlaneRuntime, start: usize) {
-        for offset in start..self.len {
-            self.nodes[offset] = None;
-            if let Some(frame) = self.frames[offset].take() {
-                let _ = runtime.release_pooled_frame(frame);
-            }
-        }
-        self.len = start.min(self.len);
+        self.cached_next_node = None;
+        self.cached_next_offset = 0;
     }
 }

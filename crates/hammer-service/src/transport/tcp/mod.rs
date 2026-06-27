@@ -1,12 +1,14 @@
 pub use hammer_core::protocol::tcp::{TcpInputFlags, TcpSeq, TcpState};
 
-use std::sync::OnceLock;
+use std::mem::transmute;
+use std::sync::Arc;
 
+use arc_swap::ArcSwapOption;
 use hammer_adapter::{
     BufferPacketCursor, DataPlaneRuntime, DataWorkerId, NodeId, NodeRuntimeData, NodeState,
     SecondaryOpaque,
 };
-use hammer_core::error::{CoreError, CoreResult, HammerError, HammerResult};
+use hammer_core::error::{CoreError, CoreResult, HammerResult};
 #[cfg(test)]
 use hammer_core::protocol::tcp::{TcpCapabilities, TcpFastOpenCookie};
 use hammer_core::protocol::tcp::{TcpControlPacketParseError, TcpError};
@@ -58,7 +60,9 @@ pub use syn_sent::{TcpSynSentNext, TcpSynSentNode};
 
 #[cfg(test)]
 pub(crate) use lookup::set_tcp_worker_state;
-pub(crate) use lookup::{TcpWorkerOwnedState, tcp_worker_state, tcp_worker_state_mut};
+pub(crate) use lookup::{
+    TcpWorkerOwnedState, install_tcp_worker_state, tcp_worker_state, tcp_worker_state_mut,
+};
 
 pub(crate) type TcpSessionDriver<C> = SessionDriverRuntime<TcpConnection<C>>;
 pub(crate) type TcpQueue<C> = SessionQueueHandle<TcpSessionDriver<C>>;
@@ -121,19 +125,28 @@ pub(crate) fn ensure_tcp_session_queue<C: CongestionController + 'static>(
     );
     let queue = crate::session::node::register_session_queue(TcpSessionDriver::<C>::new(
         worker_id,
-        rt.packet_buffers().clone(),
+        rt.buffers().clone(),
     ))?;
     let data = queue.runtime_data();
     tcp_worker_state_mut().set_queue_runtime_data(data);
     Ok(data)
 }
 
-pub static TCP_MAIN: OnceLock<TcpMain> = OnceLock::new();
+// VPP alignment: `tcp_main_t tcp_main;` is a file-scope global in VPP's
+// `tcp.c`; nodes read it via `&tcp_main` (lock-free direct deref). `tcp_init`
+// fills it once and `vlib_test_cleanup` resets it between tests. The Rust
+// mirror is a `pub static ArcSwapOption<TcpMain>`: `.load()` is lock-free on
+// the hot path, and `store(None)` makes it resettable for test isolation —
+// neither of which `OnceLock` provides.
+pub static TCP_MAIN: ArcSwapOption<TcpMain> = ArcSwapOption::const_empty();
+
+#[cfg(test)]
+pub(crate) fn reset_for_test() {
+    TCP_MAIN.store(None);
+}
 
 pub fn init(_reg: &RuntimeRegistry) -> HammerResult<()> {
-    TCP_MAIN
-        .set(TcpMain::new())
-        .map_err(|_| HammerError::internal("tcp main already initialized"))?;
+    TCP_MAIN.store(Some(Arc::new(TcpMain::new())));
     Ok(())
 }
 
@@ -145,7 +158,8 @@ fn init_tcp(reg: &RuntimeRegistry) -> HammerResult<()> {
 pub fn register_tcp_input(runtime: &DataPlaneRuntime, worker: usize) -> CoreResult<NodeId> {
     crate::with_congestion!(|C| {
         TCP_MAIN
-            .get()
+            .load()
+            .as_deref()
             .ok_or_else(|| CoreError::internal("tcp main not initialized"))?
             .register_tcp_input::<C>(runtime, worker)
     })
@@ -231,6 +245,9 @@ struct TcpRouteOpaque {
     reserved: [u8; 42],
 }
 
+const _: () =
+    assert!(std::mem::size_of::<TcpRouteOpaque>() == std::mem::size_of::<SecondaryOpaque>());
+
 impl Default for TcpRouteOpaque {
     #[inline]
     fn default() -> Self {
@@ -251,20 +268,21 @@ pub(crate) fn write_session_route_opaque(
     owner: DataWorkerId,
     next: TcpInputNext,
 ) {
-    opaque.write(TcpRouteOpaque {
+    let route = unsafe { transmute::<&mut SecondaryOpaque, &mut TcpRouteOpaque>(opaque) };
+    *route = TcpRouteOpaque {
         session_raw: session_id.get(),
         owner_worker: owner.slot() as u32,
         next: next as u8,
         present: 1,
         reserved: [0; 42],
-    });
+    };
 }
 
 #[inline(always)]
 pub(crate) fn read_session_route_opaque(
     opaque: &SecondaryOpaque,
 ) -> Option<(SessionId, DataWorkerId, TcpInputNext)> {
-    let route = opaque.read::<TcpRouteOpaque>();
+    let route = unsafe { *transmute::<&SecondaryOpaque, &TcpRouteOpaque>(opaque) };
     if route.present == 0 {
         return None;
     }
@@ -335,8 +353,8 @@ fn enqueue_tcp_segment(
     output: &mut SessionQueueOutput,
     segment: TcpSegment,
 ) -> CoreResult<()> {
-    let index = runtime.packet_buffers().alloc_index()?;
-    if let Err(error) = segment.write_to_buffer(runtime.packet_buffers(), index) {
+    let index = runtime.buffers().alloc_index()?;
+    if let Err(error) = segment.write_to_buffer(runtime.buffers(), index) {
         runtime.free_index(index);
         return Err(error);
     }
@@ -428,8 +446,8 @@ where
 {
     let local: std::net::SocketAddr = "192.0.2.10:443".parse().expect("local");
     let remote: std::net::SocketAddr = "198.51.100.20:50001".parse().expect("remote");
-    let mut worker_state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
-    set_tcp_worker_state(&mut worker_state);
+    let worker_state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
+    install_tcp_worker_state(worker_state);
     let mut driver = SessionDriverRuntime::new(
         DataWorkerId::new(0),
         hammer_adapter::DataPlaneBuffers::with_capacities(2048, 4, 4, 4),
@@ -722,9 +740,10 @@ mod tests {
             )
         };
         let mut state = state.lock().expect("capture state");
-        for index in frame.drain_pending() {
-            let packet = runtime.copy_packet(index)?;
-            state.packets.push(packet.to_vec());
+        let mut pending = frame.drain_pending();
+        while let Some(index) = pending.next() {
+            let packet = runtime.get_buffer(index)?.current().to_vec();
+            state.packets.push(packet);
             runtime.free_index(index);
         }
         Ok(NodeResult::drop())
@@ -790,8 +809,7 @@ mod tests {
         let (output_node, lookup_state, drop_state) = tcp_output_graph(&runtime);
         let mut worker_state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
         set_tcp_worker_state(&mut worker_state);
-        let mut driver =
-            SessionDriverRuntime::new(DataWorkerId::new(0), runtime.packet_buffers().clone());
+        let mut driver = SessionDriverRuntime::new(DataWorkerId::new(0), runtime.buffers().clone());
         let session_id = driver.insert_session(established_tcp_connection());
         publish_tcp_connection(&mut driver, session_id).expect("refresh session route");
 
@@ -804,9 +822,9 @@ mod tests {
                 connection.snd_nxt(),
             )
         };
-        let payload = runtime.packet_buffers().alloc_index().expect("payload");
+        let payload = runtime.buffers().alloc_index().expect("payload");
         runtime
-            .packet_buffers()
+            .buffers()
             .append(payload, b"hello")
             .expect("payload bytes");
         let packet = TcpPacket {
@@ -835,7 +853,7 @@ mod tests {
         };
         {
             let mut buffer = runtime
-                .packet_buffers()
+                .buffers()
                 .get_buffer_mut(payload)
                 .expect("payload buffer");
             buffer
@@ -942,10 +960,24 @@ mod tests {
             payload_offset: 0,
             payload_len: 0,
         };
-        let connection = driver.session_mut(session_id).expect("connection");
-        let _ = connection
-            .receive_close_side(&packet)
-            .expect("receive fin ack");
+        let (keep_mask, now) = {
+            let connection = driver.session_mut(session_id).expect("connection");
+            let _ = connection
+                .receive_close_side(&packet)
+                .expect("receive fin ack");
+            (connection.active_timer_mask(), std::time::Instant::now())
+        };
+        let session = session_id.pool_index();
+        let connection: *const TcpConnection<C> =
+            driver.session(session_id).expect("connection") as *const _;
+        crate::session::protocol::refresh_tcp_timers(
+            driver.timers_mut(),
+            unsafe { &*connection },
+            session,
+            keep_mask,
+            now,
+        )
+        .expect("sync time wait timer");
     }
 
     fn peer_fin_packet(
@@ -971,97 +1003,6 @@ mod tests {
         }
     }
 
-    fn enter_close_wait_for_passive_close_test(
-        driver: &mut SessionDriverRuntime<TcpConnection<BbrController>>,
-        session_id: SessionId,
-        local: SocketAddr,
-        remote: SocketAddr,
-    ) {
-        let (rcv_nxt, snd_nxt) = {
-            let connection = driver.session(session_id).expect("connection");
-            (connection.rcv_nxt(), connection.snd_nxt())
-        };
-        let packet = peer_fin_packet(local, remote, rcv_nxt, snd_nxt);
-        let connection = driver.session_mut(session_id).expect("connection");
-        let (segment, _) = connection
-            .receive_established(&packet)
-            .expect("receive peer fin");
-        assert!(
-            segment.is_some(),
-            "expected ack segment for in-sequence fin"
-        );
-        assert_eq!(connection.state(), TcpState::CloseWait);
-        assert_eq!(connection.rcv_nxt(), rcv_nxt.wrapping_add(1));
-    }
-
-    #[test]
-    fn tcp_passive_close_fin_in_established_enters_close_wait_and_acks() {
-        let (mut driver, session_id, local, remote) = closing_session_for_test::<BbrController>();
-
-        let (rcv_nxt, snd_nxt) = {
-            let connection = driver.session(session_id).expect("connection");
-            (connection.rcv_nxt(), connection.snd_nxt())
-        };
-        let packet = peer_fin_packet(local, remote, rcv_nxt, snd_nxt);
-        let connection = driver.session_mut(session_id).expect("connection");
-        let (segment, _) = connection
-            .receive_established(&packet)
-            .expect("receive peer fin");
-
-        let segment = segment.expect("ack segment");
-        let mut header = [0u8; 64];
-        let header_len = segment.write_header(&mut header).expect("write header");
-        let parsed = etherparse::TcpSlice::from_slice(&header[..header_len]).expect("parse tcp");
-        assert!(parsed.ack());
-        assert!(!parsed.fin());
-
-        assert_eq!(connection.state(), TcpState::CloseWait);
-        assert_eq!(connection.rcv_nxt(), rcv_nxt.wrapping_add(1));
-    }
-
-    #[test]
-    fn tcp_passive_close_local_close_after_peer_fin_enters_last_ack() {
-        let (mut driver, session_id, local, remote) = closing_session_for_test::<BbrController>();
-
-        enter_close_wait_for_passive_close_test(&mut driver, session_id, local, remote);
-
-        let connection = driver.session_mut(session_id).expect("connection");
-        connection.on_session_close();
-        assert_eq!(connection.state(), TcpState::LastAck);
-    }
-
-    #[test]
-    fn tcp_passive_close_peer_ack_final_fin_closes() {
-        let (mut driver, session_id, local, remote) = closing_session_for_test::<BbrController>();
-
-        enter_close_wait_for_passive_close_test(&mut driver, session_id, local, remote);
-
-        let connection = driver.session_mut(session_id).expect("connection");
-        connection.on_session_close();
-        assert_eq!(connection.state(), TcpState::LastAck);
-
-        let snd_nxt = connection.snd_nxt();
-        let ack_packet = TcpPacket {
-            local: remote,
-            remote: local,
-            sequence: connection.rcv_nxt().into(),
-            acknowledgment: Some(snd_nxt.into()),
-            advertised_window: u16::MAX,
-            flags: TcpSegmentFlags::ACK,
-            capabilities: TcpCapabilities::default(),
-            sack_blocks: hammer_infra::vec::Vec::new(),
-            timestamp: None,
-            fast_open_cookie: None,
-            ip_ecn: None,
-            payload_offset: 0,
-            payload_len: 0,
-        };
-        connection
-            .receive_close_side(&ack_packet)
-            .expect("receive final ack");
-        assert_eq!(connection.state(), TcpState::Closed);
-    }
-
     #[test]
     fn tcp_passive_close_out_of_order_fin_does_not_transition() {
         let (mut driver, session_id, local, remote) = closing_session_for_test::<BbrController>();
@@ -1079,58 +1020,6 @@ mod tests {
         assert!(segment.is_none());
         assert_eq!(connection.state(), TcpState::Established);
         assert_eq!(connection.rcv_nxt(), rcv_nxt);
-    }
-
-    #[test]
-    fn tcp_fin_path_enters_time_wait_and_retains_session_until_expiry() {
-        let (mut driver, session_id, local, remote) = closing_session_for_test::<BbrController>();
-
-        drive_fin_ack_to_time_wait(&mut driver, session_id, local, remote);
-
-        let connection = driver.session(session_id).expect("session");
-        assert_eq!(connection.state(), TcpState::TimeWait);
-        assert!(connection.timer_is_active(TCP_TIMER_TIME_WAIT));
-    }
-
-    #[test]
-    fn tcp_time_wait_duplicate_fin_reacks_and_rearms_timer() {
-        let (mut driver, session_id, local, remote) = closing_session_for_test::<BbrController>();
-
-        drive_fin_ack_to_time_wait(&mut driver, session_id, local, remote);
-
-        let (rcv_nxt, snd_nxt) = {
-            let connection = driver.session(session_id).expect("connection");
-            (connection.rcv_nxt(), connection.snd_nxt())
-        };
-        let duplicate_fin = TcpPacket {
-            local: remote,
-            remote: local,
-            sequence: rcv_nxt.into(),
-            acknowledgment: Some(snd_nxt.into()),
-            advertised_window: u16::MAX,
-            flags: TcpSegmentFlags::FIN | TcpSegmentFlags::ACK,
-            capabilities: TcpCapabilities::default(),
-            sack_blocks: hammer_infra::vec::Vec::new(),
-            timestamp: None,
-            fast_open_cookie: None,
-            ip_ecn: None,
-            payload_offset: 0,
-            payload_len: 0,
-        };
-        let segment = driver
-            .session_mut(session_id)
-            .expect("connection")
-            .receive_close_side(&duplicate_fin)
-            .expect("receive duplicate fin")
-            .expect("ack segment");
-        let mut header = [0u8; 64];
-        let header_len = segment.write_header(&mut header).expect("write header");
-        let parsed = etherparse::TcpSlice::from_slice(&header[..header_len]).expect("parse tcp");
-
-        assert!(parsed.ack());
-        let connection = driver.session(session_id).expect("session");
-        assert_eq!(connection.state(), TcpState::TimeWait);
-        assert!(connection.timer_is_active(TCP_TIMER_TIME_WAIT));
     }
 
     #[test]

@@ -2,9 +2,7 @@ use std::mem::transmute;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
-use hammer_adapter::{
-    DataPlaneRuntime, NetworkOpaque, TraceControlPlane, TraceInputPolicy, TracePolicy,
-};
+use hammer_adapter::{DataPlaneRuntime, TraceControlPlane, TraceInputPolicy, TracePolicy};
 use hammer_runtime::spawn::DataRuntime;
 use hammer_service::interface::{
     InterfaceConnectedRouteControl, InterfaceControlPlane, InterfaceMtu, InterfaceMtuKind,
@@ -12,9 +10,9 @@ use hammer_service::interface::{
 };
 use hammer_service::net::{
     AdjacencyRewriteNode, DpoType, FibTableBuilder, IpLocalControlPlane, IpLocalNext,
-    IpLookupControlPlane,
+    IpLookupControlPlane, NetworkOpaque,
 };
-use hammer_service::tun::{MemoryTunDevice, TunOutputDriverNode, TunOutputTrace};
+use hammer_service::tun::{MemoryTunDevice, TunMain, TunOutputDriverNode, TunOutputTrace};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 
 #[test]
@@ -188,6 +186,20 @@ fn interface_address_publish_installs_receive_route_in_fib() {
     let index = runtime
         .alloc_index_with_bytes(&packet)
         .expect("alloc packet");
+    {
+        let mut buffer = runtime.get_buffer_mut(index).expect("buffer mut");
+        let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+        network.set_packet_cursor(
+            hammer_adapter::BufferPacketCursor::new()
+                .with_packet_len(packet.len())
+                .with_network_header(0, 20)
+                .with_transport_header(20, 8)
+                .with_transport_payload_offset(28),
+        );
+        let ip = network.ip_mut();
+        ip.set_ip_version(Some(4));
+        ip.set_ip_protocol(Some(59));
+    }
     runtime
         .get_frame_mut(frame)
         .expect("mutate frame")
@@ -243,9 +255,13 @@ fn interface_address_publish_installs_receive_route_in_fib() {
 fn interface_output_dispatches_to_registered_tx_node() {
     let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
     let output_device = MemoryTunDevice::new();
+    let tun_main = TunMain::default_main();
     let tx = runtime
         .nodes()
-        .register_driver(TunOutputDriverNode::new(output_device.output()));
+        .register_driver(TunOutputDriverNode::new_with_main(
+            tun_main.clone(),
+            output_device.output(),
+        ));
     let output_control = InterfaceOutputControlPlane::new();
     output_control.register_tx(7, tx).expect("register tx node");
     let output_node = runtime.nodes().register_internal(output_control.node());
@@ -356,6 +372,27 @@ fn interface_output_tx_updates_run_through_configured_runtime_data_plane_barrier
 
     assert_eq!(barrier.sync_count(), 2);
     data_runtime.shutdown_timeout(Duration::from_secs(1));
+}
+
+#[test]
+fn interface_output_and_tun_output_avoid_packet_copy_shortcuts() {
+    let interface_source =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/interface.rs"))
+            .expect("read interface source");
+    let tun_source =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/tun/mod.rs"))
+            .expect("read TUN source");
+
+    for forbidden in ["chain_bytes", "copy_packet", "batch_cursor"] {
+        assert!(
+            !interface_source.contains(forbidden),
+            "interface-output must not use {forbidden}"
+        );
+        assert!(
+            !tun_source.contains(forbidden),
+            "TUN output must not use {forbidden}"
+        );
+    }
 }
 
 fn push_packet_with_egress(

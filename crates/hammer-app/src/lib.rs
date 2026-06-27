@@ -6,8 +6,9 @@ pub mod udp;
 
 use std::sync::Arc;
 
+use hammer_core::error::HammerResult;
 use hammer_runtime::app as runtime_app;
-pub use hammer_runtime::app::{AppSession, AppSessionConfig};
+pub use hammer_runtime::app::{AppSession, AppSessionConfig, SessionHandle};
 pub use hammer_runtime::spawn::DataRuntimeContext;
 
 #[derive(Clone)]
@@ -34,8 +35,16 @@ impl AppContext {
     }
 
     #[inline]
-    pub fn session(&self, session_index: u32) -> Option<Arc<AppSession>> {
-        runtime_app::current_app_session(session_index)
+    pub fn session(&self, handle: SessionHandle) -> HammerResult<Option<Arc<AppSession>>> {
+        self.inner.session(handle)
+    }
+
+    #[inline]
+    pub async fn session_async(
+        &self,
+        handle: SessionHandle,
+    ) -> HammerResult<Option<Arc<AppSession>>> {
+        self.inner.session_async(handle).await
     }
 }
 
@@ -66,8 +75,16 @@ impl App {
     }
 
     #[inline]
-    pub fn session(&self, session_index: u32) -> Option<Arc<AppSession>> {
-        self.context.session(session_index)
+    pub fn session(&self, handle: SessionHandle) -> HammerResult<Option<Arc<AppSession>>> {
+        self.context.session(handle)
+    }
+
+    #[inline]
+    pub async fn session_async(
+        &self,
+        handle: SessionHandle,
+    ) -> HammerResult<Option<Arc<AppSession>>> {
+        self.context.session_async(handle).await
     }
 }
 

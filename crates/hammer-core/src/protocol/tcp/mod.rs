@@ -13,12 +13,8 @@ pub use options::{
     ParsedTcpOptions, TcpSackBlock, TcpTimestampOption, tcp_capabilities_from_options,
     tcp_options_from_bytes,
 };
-pub use reset::{
-    TcpResetError, TcpResetPacketCursor, tcp_reset_network_header_len,
-    tcp_reset_remote_reply_addrs, tcp_reset_reply_from_current_packet,
-};
 pub use segment::{
-    TcpSegmentHeader, TcpSegmentParseError, tcp_segment_header_len, write_tcp_segment_header,
+    TcpSegmentHeader, TcpWireHeader, tcp_header, tcp_segment_header_len, write_tcp_segment_header,
 };
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -208,7 +204,11 @@ impl TryFrom<&[u8]> for TcpFastOpenCookie {
             bytes: [0; Self::MAX_LEN],
             len: value.len() as u8,
         };
-        cookie.bytes[..value.len()].copy_from_slice(value);
+        let mut index = 0usize;
+        while index < value.len() {
+            cookie.bytes[index] = value[index];
+            index += 1;
+        }
         Ok(cookie)
     }
 }
@@ -407,65 +407,6 @@ pub struct TcpNegotiatedOptions {
     pub ecn: bool,
     pub accurate_ecn: bool,
     pub fast_open: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TcpHandshakeObservation {
-    pub flags: u16,
-    pub sequence: u32,
-    pub acknowledgment: Option<u32>,
-    pub advertised_window: u32,
-    pub next_sequence: u32,
-    pub capabilities: TcpCapabilities,
-}
-
-impl TcpHandshakeObservation {
-    #[inline]
-    pub const fn new(
-        flags: u16,
-        sequence: u32,
-        acknowledgment: Option<u32>,
-        advertised_window: u32,
-        next_sequence: u32,
-    ) -> Self {
-        Self {
-            flags,
-            sequence,
-            acknowledgment,
-            advertised_window,
-            next_sequence,
-            capabilities: TcpCapabilities {
-                max_segment_size: None,
-                window_scale: None,
-                sack: false,
-                timestamps: false,
-                ecn: false,
-                accurate_ecn: false,
-                fast_open: false,
-            },
-        }
-    }
-
-    #[inline]
-    pub const fn with_capabilities(mut self, capabilities: TcpCapabilities) -> Self {
-        self.capabilities = capabilities;
-        self
-    }
-
-    #[inline]
-    pub const fn syn(self) -> bool {
-        self.flags & TcpSegmentFlags::SYN.bits() != 0
-    }
-
-    #[inline]
-    pub const fn ack(self) -> bool {
-        self.flags & TcpSegmentFlags::ACK.bits() != 0
-    }
-
-    #[inline]
-    pub const fn fin(self) -> bool {
-        self.flags & TcpSegmentFlags::FIN.bits() != 0
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

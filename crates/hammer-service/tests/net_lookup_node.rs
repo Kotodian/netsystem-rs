@@ -3,19 +3,19 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, ForwardingMetadata, InternalNode, NetworkOpaque, Node,
-    NodeProcessFn, NodeResult, NodeRuntimeData, SecondaryOpaque, TraceControlPlane,
-    TraceInputPolicy, TracePolicy,
+    BufferFrame, DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
+    SecondaryOpaque, TraceControlPlane, TraceInputPolicy, TracePolicy,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::forwarding::AdjacencyRewrite;
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
+use hammer_infra::vec::Vec as InfraVec;
 use hammer_runtime::spawn::DataRuntime;
 use hammer_service::data_plane::DropNode;
 use hammer_service::net::{
     AdjacencyRewriteNode, AdjacencyRewriteTrace, Dpo, DpoId, DpoProto, DpoType, FibTableBuilder,
-    IpInputNext, IpInputNode, IpLocalControlPlane, IpLocalNext, IpLookupControlPlane,
-    IpLookupTrace, IpUnicastArc,
+    ForwardingMetadata, IpInputNext, IpInputNode, IpLocalControlPlane, IpLocalNext,
+    IpLookupControlPlane, IpLookupTrace, IpUnicastArc, NetworkOpaque, TapEthernetMetadata,
 };
 use ipnet::{Ipv4Net, Ipv6Net};
 use std::mem::transmute;
@@ -23,7 +23,7 @@ use std::mem::transmute;
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct LookupTestOpaque {
-    _tap_ethernet: Option<hammer_adapter::TapEthernetMetadata>,
+    _tap_ethernet: Option<TapEthernetMetadata>,
     _icmp_error: Option<IcmpErrorMetadata>,
     forwarding: Option<ForwardingMetadata>,
 }
@@ -41,6 +41,17 @@ struct SinkState {
 
 struct SinkNode {
     runtime_data: NodeRuntimeData,
+}
+
+fn chain_bytes(
+    runtime: &DataPlaneRuntime,
+    index: hammer_adapter::BufferIndex,
+) -> CoreResult<InfraVec<u8>> {
+    let mut bytes = InfraVec::new();
+    for buffer in runtime.buffers().chain(index) {
+        bytes.extend_from_slice(buffer?.current());
+    }
+    Ok(bytes)
 }
 
 impl SinkNode {
@@ -142,7 +153,7 @@ fn sink_process(
         .frame_lens
         .push(frame.pending_len());
     for buffer in frame.drain_pending() {
-        let payload = runtime.copy_packet(buffer)?;
+        let payload = chain_bytes(runtime, buffer)?;
         let (egress_interface, forwarding) = {
             let buffer = runtime.get_buffer(buffer)?;
             let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
@@ -649,7 +660,7 @@ fn adjacency_rewrite_node_prepends_rewrite_and_sets_egress_interface() {
             dpo_type: DpoType::ADJACENCY,
             dpo_index: adjacency.get(),
         });
-        buffer.set_packet_cursor(
+        unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }.set_packet_cursor(
             hammer_adapter::BufferPacketCursor::new()
                 .with_packet_len(packet.len())
                 .with_network_header(0, 20)
@@ -741,7 +752,7 @@ fn adjacency_rewrite_node_prepends_rewrite_when_packet_has_headroom() {
             dpo_type: DpoType::ADJACENCY,
             dpo_index: adjacency.get(),
         });
-        buffer.set_packet_cursor(
+        unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }.set_packet_cursor(
             hammer_adapter::BufferPacketCursor::new()
                 .with_packet_len(packet.len())
                 .with_network_header(0, 20)
@@ -1042,6 +1053,7 @@ fn push_packet(runtime: &DataPlaneRuntime, frame: hammer_adapter::FrameIndex, pa
     let index = runtime
         .alloc_index_with_bytes(packet)
         .expect("alloc packet");
+    set_lookup_cursor(runtime, index, packet);
     runtime
         .get_frame_mut(frame)
         .expect("mutate frame")
@@ -1054,7 +1066,10 @@ fn alloc_packet_with_headroom(
     packet: &[u8],
 ) -> hammer_adapter::BufferIndex {
     let index = runtime.alloc_index().expect("alloc packet with headroom");
-    runtime.append(index, packet).expect("append packet bytes");
+    runtime
+        .buffers()
+        .append(index, packet)
+        .expect("append packet bytes");
     index
 }
 
@@ -1070,11 +1085,38 @@ fn push_marked_packet(
     runtime
         .try_mark_trace(trace_input, index)
         .expect("mark packet");
+    set_lookup_cursor(runtime, index, packet);
     runtime
         .get_frame_mut(frame)
         .expect("mutate frame")
         .push_index(index)
         .expect("push packet");
+}
+
+fn set_lookup_cursor(
+    runtime: &DataPlaneRuntime,
+    index: hammer_adapter::BufferIndex,
+    packet: &[u8],
+) {
+    let Some(first) = packet.first().copied() else {
+        return;
+    };
+    let (version, protocol, network_len, transport_offset) = match first >> 4 {
+        4 => (4u8, packet[9], usize::from(first & 0x0f) * 4, usize::from(first & 0x0f) * 4),
+        6 => (6u8, packet[6], 40, 40),
+        _ => return,
+    };
+    let cursor = hammer_adapter::BufferPacketCursor::new()
+        .with_packet_len(packet.len())
+        .with_network_header(0, network_len)
+        .with_transport_header(transport_offset, 8)
+        .with_transport_payload_offset(transport_offset + 8);
+    let mut buffer = runtime.get_buffer_mut(index).expect("buffer mut");
+    let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+    network.set_packet_cursor(cursor);
+    let ip = network.ip_mut();
+    ip.set_ip_version(Some(version));
+    ip.set_ip_protocol(Some(protocol));
 }
 
 fn assert_payloads(state: &Arc<Mutex<SinkState>>, expected_payloads: &[&[u8]]) {

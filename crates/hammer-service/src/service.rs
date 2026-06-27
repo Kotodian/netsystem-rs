@@ -1,7 +1,7 @@
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
@@ -170,7 +170,8 @@ struct RuntimeTcpListenerSnapshot {
 impl RuntimeTcpListenerControlState {
     fn new() -> HammerResult<Self> {
         let tcp_control = crate::transport::tcp::TCP_MAIN
-            .get()
+            .load()
+            .as_deref()
             .ok_or_else(|| HammerError::internal("tcp main not initialized"))?
             .control()
             .clone();
@@ -383,7 +384,15 @@ impl RuntimeService {
             let runtime = runtime
                 .clone()
                 .with_handoff_node_handle(handoff_node_handle);
+            let worker_id = DataWorkerId::new(
+                u32::try_from(worker)
+                    .map_err(|_| hammer_core::error::CoreError::internal("worker index does not fit into u32"))?,
+            );
+            crate::transport::tcp::install_tcp_worker_state(
+                crate::transport::tcp::TcpWorkerOwnedState::new(worker_id),
+            );
             runtime.init_graph(worker, &crate::packet_graph::SERVICE_GRAPH_NODES)?;
+            crate::net::wire_ip_lookup_drop(&runtime)?;
             crate::transport::tcp::wire_worker_graph(&runtime, worker)?;
             Ok::<_, hammer_core::error::CoreError>(
                 crate::packet_graph::SERVICE_GRAPH_NODES
@@ -1073,13 +1082,36 @@ level = "debug"
         )
     }
 
-    fn new_test_service(trace: &str) -> Arc<RuntimeService> {
-        RuntimeService::new(
+    fn new_test_service(trace: &str) -> TestService {
+        let guard = SERVICE_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        crate::reset_subsystem_mains_for_test();
+        let service = RuntimeService::new(
             &minimal_config(trace),
             Arc::new(NoopPlatform),
             Arc::new(DiscardWriter),
         )
-        .expect("test service should build")
+        .expect("test service should build");
+        TestService {
+            service,
+            _guard: guard,
+        }
+    }
+
+    static SERVICE_TEST_GUARD: Mutex<()> = Mutex::new(());
+
+    struct TestService {
+        service: Arc<RuntimeService>,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl std::ops::Deref for TestService {
+        type Target = RuntimeService;
+
+        fn deref(&self) -> &RuntimeService {
+            &self.service
+        }
     }
 
     fn has_trace_drain_timer(service: &RuntimeService) -> bool {
@@ -1143,24 +1175,26 @@ level = "debug"
 
     #[test]
     fn trace_drain_timer_is_only_installed_for_enabled_inputs() {
-        let disabled = new_test_service(
-            r#"[trace]
+        {
+            let disabled = new_test_service(
+                r#"[trace]
 enabled = false
 
 [[trace.inputs]]
 node = "tun-input-driver"
 count = 1
 "#,
-        );
-        assert!(!has_trace_drain_timer(&disabled));
-        disabled.close().expect("close disabled trace service");
+            );
+            assert!(!has_trace_drain_timer(&disabled.service));
+            disabled.close().expect("close disabled trace service");
+        }
 
         let empty = new_test_service(
             r#"[trace]
 enabled = true
 "#,
         );
-        assert!(!has_trace_drain_timer(&empty));
+        assert!(!has_trace_drain_timer(&empty.service));
         empty.close().expect("close empty trace service");
     }
 

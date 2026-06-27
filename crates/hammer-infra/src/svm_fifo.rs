@@ -39,6 +39,7 @@ pub struct SvmFifo {
     // on every enqueue/peek.
     want_notification: CachePadded<AtomicBool>,
     want_deq_notification: CachePadded<AtomicBool>,
+    has_event: CachePadded<AtomicBool>,
     data: Slice<u8>,
 }
 
@@ -55,6 +56,7 @@ impl SvmFifo {
             tail: CachePadded::new(AtomicU32::new(0)),
             want_notification: CachePadded::new(AtomicBool::new(false)),
             want_deq_notification: CachePadded::new(AtomicBool::new(false)),
+            has_event: CachePadded::new(AtomicBool::new(false)),
             data: Slice::from_elem(capacity as usize, 0u8),
         })
     }
@@ -214,6 +216,21 @@ impl SvmFifo {
     }
 
     #[inline]
+    pub fn has_event(&self) -> bool {
+        self.has_event.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn set_event(&self) -> bool {
+        !self.has_event.swap(true, Ordering::Release)
+    }
+
+    #[inline]
+    pub fn unset_event(&self) {
+        self.has_event.swap(false, Ordering::Acquire);
+    }
+
+    #[inline]
     pub fn want_notification(&self) {
         self.want_notification.store(true, Ordering::Release);
     }
@@ -278,6 +295,7 @@ impl SvmFifo {
         self.tail.store(0, Ordering::Relaxed);
         self.want_notification.store(false, Ordering::Relaxed);
         self.want_deq_notification.store(false, Ordering::Relaxed);
+        self.has_event.store(false, Ordering::Relaxed);
     }
 }
 

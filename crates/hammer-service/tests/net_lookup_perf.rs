@@ -6,13 +6,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneInstructionSet, DataPlaneRuntime, ForwardingMetadata, InternalNode, Node,
-    NodeProcessFn, NodeResult, NodeRuntimeData, SecondaryOpaque,
+    BufferFrame, DataPlaneInstructionSet, DataPlaneRuntime, InternalNode, Node, NodeProcessFn,
+    NodeResult, NodeRuntimeData, SecondaryOpaque,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_service::data_plane::DropNode;
 use hammer_service::net::{
-    DpoProto, FibTableBuilder, IpInputNext, IpInputNode, IpLookupControlPlane, IpUnicastArc,
+    DpoProto, FibTableBuilder, ForwardingMetadata, IpInputNext, IpInputNode, IpLookupControlPlane,
+    IpUnicastArc, TapEthernetMetadata,
 };
 use ipnet::{Ipv4Net, Ipv6Net};
 
@@ -24,7 +25,7 @@ static PERF_PROBE_LOCK: Mutex<()> = Mutex::new(());
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct LookupPerfOpaque {
-    _tap_ethernet: Option<hammer_adapter::TapEthernetMetadata>,
+    _tap_ethernet: Option<TapEthernetMetadata>,
     _icmp_error: Option<hammer_core::protocol::icmp::IcmpErrorMetadata>,
     forwarding: Option<ForwardingMetadata>,
 }

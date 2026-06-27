@@ -6,17 +6,18 @@ pub mod handoff;
 pub mod instruction_set;
 pub mod network;
 pub mod node;
-pub mod packet_buffer;
 pub mod platform;
 pub mod service;
 pub mod trace;
 
 pub use buffer::{
-    BUFFER_CACHE_LINE_SIZE, Buffer, BufferBatchMut, BufferFlags, BufferFrame, BufferFrameBatch,
-    BufferFrameBatchCursor, BufferFrameBatchIndices, BufferFramePairBatch,
-    BufferFramePairBatchCursor, BufferFrameQuadBatch, BufferFrameQuadBatchCursor, BufferIndex,
-    BufferNodeError, BufferPacketCursor, BufferPool, BufferPoolArena, DataPlaneBuffers,
-    DataPlaneRuntime, FrameIndex, FramePool, FrameRef, FrameRefMut, PooledBufferFrame,
+    BUFFER_CACHE_LINE_SIZE, BUFFER_INVALID_INDEX, Buffer, BufferFlags, BufferFrame,
+    BufferFrameBatch, BufferFrameBatchCursor, BufferFrameBatchIndices, BufferFramePairBatch,
+    BufferFramePairBatchCursor, BufferFrameQuadBatch, BufferFrameQuadBatchCursor,
+    BufferHeaderCacheline0, BufferHeaderCacheline1, BufferIndex, BufferNodeError,
+    BufferPacketCursor, BufferPool, BufferPoolArena, DataPlaneBuffers, DataPlaneRuntime,
+    FrameIndex, FramePool, FrameRef, FrameRefMut, PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES,
+    PooledBufferFrame, PrimaryOpaque, SecondaryOpaque,
 };
 pub use hammer_core::lifecycle::{
     ALL_STAGES, LIFECYCLE_ORDER, Lifecycle, LifecycleService, StartStage,
@@ -37,16 +38,9 @@ pub use connection::{ConnectionHandle, ConnectionManager};
 pub use network::NetworkManager;
 pub use node::{
     DriverNode, InternalNode, NextFrame, Node, NodeDescriptor, NodeEntry, NodeErrorCounters,
-    NodeHandle, NodeId, NodeKind, NodeNext, NodeNextEnqueue, NodeNextFrames, NodeNextStorage,
-    NodeNextVectorEnqueue, NodeProcessFn, NodeRegistration, NodeResult, NodeRuntime,
-    NodeRuntimeData, NodeRuntimeReady, NodeState, NodeVectorDispatch, NoopNode,
-    default_prefetch_indices,
-};
-pub use packet_buffer::{
-    ForwardingMetadata, IpEcnCodepoint, NetworkOpaque, NetworkPayloadOpaque,
-    PACKET_BUFFER_INVALID_INDEX, PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES,
-    PacketBufferCacheline0, PacketBufferCacheline1, PacketBufferFlags, PrimaryOpaque,
-    SecondaryOpaque, TapEthernetMetadata,
+    NodeHandle, NodeId, NodeKind, NodeNext, NodeNextFrames, NodeNextStorage, NodeProcessFn,
+    NodeRegistration, NodeResult, NodeRuntime, NodeRuntimeData, NodeRuntimeReady, NodeState,
+    NoopNode, default_prefetch_indices,
 };
 pub use platform::{
     DefaultInterfaceUpdateListener, NetworkInterface, PlatformInterface, TunOptions, WifiState,

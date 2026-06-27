@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    Buffer, BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId, NodeProcessFn,
-    NodeRegistration, NodeResult, PacketTrace, TraceFormatter, add_packet_trace,
+    Buffer, BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId, NodeNextFrames,
+    NodeProcessFn, NodeRegistration, NodeResult, PacketTrace, TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_runtime::DataPlaneBarrierHandle;
@@ -120,20 +120,87 @@ fn drop_node_process(
 ) -> CoreResult<NodeResult> {
     let dropped = frame.pending_len();
     let mut first_error = None;
-    {
-        let mut cursor = frame.batch_cursor(runtime.preferred_frame_batch_width());
-        cursor.prefetch_next(runtime);
-        while let Some(batch) = cursor.next() {
-            cursor.prefetch_next(runtime);
-            for index in batch.indices() {
-                if first_error.is_none()
-                    && let Err(err) = add_packet_trace!(runtime, index, DropTrace { dropped })
-                {
-                    first_error = Some(err);
-                }
-                runtime.free_index(index);
-            }
+    let indices = frame.pending_indices();
+    let len = indices.len();
+    let mut read = 0usize;
+    while read + 4 <= len {
+        if read + 4 < len {
+            runtime.prefetch_header(indices[read + 4]);
         }
+        if read + 5 < len {
+            runtime.prefetch_header(indices[read + 5]);
+        }
+        if read + 6 < len {
+            runtime.prefetch_header(indices[read + 6]);
+        }
+        if read + 7 < len {
+            runtime.prefetch_header(indices[read + 7]);
+        }
+        let index0 = indices[read];
+        let index1 = indices[read + 1];
+        let index2 = indices[read + 2];
+        let index3 = indices[read + 3];
+        if first_error.is_none()
+            && let Err(err) = add_packet_trace!(runtime, index0, DropTrace { dropped })
+        {
+            first_error = Some(err);
+        }
+        runtime.free_index(index0);
+        if first_error.is_none()
+            && let Err(err) = add_packet_trace!(runtime, index1, DropTrace { dropped })
+        {
+            first_error = Some(err);
+        }
+        runtime.free_index(index1);
+        if first_error.is_none()
+            && let Err(err) = add_packet_trace!(runtime, index2, DropTrace { dropped })
+        {
+            first_error = Some(err);
+        }
+        runtime.free_index(index2);
+        if first_error.is_none()
+            && let Err(err) = add_packet_trace!(runtime, index3, DropTrace { dropped })
+        {
+            first_error = Some(err);
+        }
+        runtime.free_index(index3);
+        read += 4;
+    }
+    if read + 2 <= len {
+        if read + 2 < len {
+            runtime.prefetch_header(indices[read + 2]);
+        }
+        if read + 3 < len {
+            runtime.prefetch_header(indices[read + 3]);
+        }
+        let index0 = indices[read];
+        let index1 = indices[read + 1];
+        if first_error.is_none()
+            && let Err(err) = add_packet_trace!(runtime, index0, DropTrace { dropped })
+        {
+            first_error = Some(err);
+        }
+        runtime.free_index(index0);
+        if first_error.is_none()
+            && let Err(err) = add_packet_trace!(runtime, index1, DropTrace { dropped })
+        {
+            first_error = Some(err);
+        }
+        runtime.free_index(index1);
+        read += 2;
+    }
+    while read < len {
+        if read + 1 < len {
+            runtime.prefetch_header(indices[read + 1]);
+        }
+        let index0 = indices[read];
+        if first_error.is_none()
+            && let Err(err) = add_packet_trace!(runtime, index0, DropTrace { dropped })
+        {
+            first_error = Some(err);
+        }
+        runtime.free_index(index0);
+        read += 1;
     }
     frame.clear();
     if let Some(err) = first_error {
@@ -230,8 +297,9 @@ mod tests {
             .alloc_index_with_bytes(b"handoff")
             .expect("alloc packet");
         runtime
-            .set_current_config(packet, sink)
-            .expect("store handoff next");
+            .get_buffer_mut(packet)
+            .expect("store handoff next buffer")
+            .set_current_config(sink);
         runtime
             .get_frame_mut(frame)
             .expect("mutate frame")
@@ -501,7 +569,7 @@ pub fn next_feature_node_for_index(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
 ) -> CoreResult<NodeId> {
-    Ok(runtime.current_config(index)?)
+    runtime.current_config(index)
 }
 
 #[inline(always)]
@@ -509,9 +577,74 @@ pub fn next_feature_frame(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
 ) -> CoreResult<NodeResult> {
-    hammer_adapter::node_route_frame_index_static!(None, runtime, frame, |index| Ok(Some(
-        next_feature_node_for_index(runtime, index)?
-    )))
+    let mut next_frames = NodeNextFrames::default();
+    let indices = frame.pending_indices();
+    let len = indices.len();
+    let mut read = 0usize;
+    while read + 4 <= len {
+        if read + 4 < len {
+            runtime.prefetch_header(indices[read + 4]);
+        }
+        if read + 5 < len {
+            runtime.prefetch_header(indices[read + 5]);
+        }
+        if read + 6 < len {
+            runtime.prefetch_header(indices[read + 6]);
+        }
+        if read + 7 < len {
+            runtime.prefetch_header(indices[read + 7]);
+        }
+        let index0 = indices[read];
+        let index1 = indices[read + 1];
+        let index2 = indices[read + 2];
+        let index3 = indices[read + 3];
+        hammer_adapter::validate_buffer_enqueue_x4!(
+            runtime,
+            next_frames,
+            next_feature_node_for_index(runtime, index0)?,
+            index0,
+            next_feature_node_for_index(runtime, index1)?,
+            index1,
+            next_feature_node_for_index(runtime, index2)?,
+            index2,
+            next_feature_node_for_index(runtime, index3)?,
+            index3,
+        )?;
+        read += 4;
+    }
+    if read + 2 <= len {
+        if read + 2 < len {
+            runtime.prefetch_header(indices[read + 2]);
+        }
+        if read + 3 < len {
+            runtime.prefetch_header(indices[read + 3]);
+        }
+        let index0 = indices[read];
+        let index1 = indices[read + 1];
+        hammer_adapter::validate_buffer_enqueue_x2!(
+            runtime,
+            next_frames,
+            next_feature_node_for_index(runtime, index0)?,
+            index0,
+            next_feature_node_for_index(runtime, index1)?,
+            index1,
+        )?;
+        read += 2;
+    }
+    while read < len {
+        if read + 1 < len {
+            runtime.prefetch_header(indices[read + 1]);
+        }
+        let index0 = indices[read];
+        hammer_adapter::validate_buffer_enqueue_x1!(
+            runtime,
+            next_frames,
+            next_feature_node_for_index(runtime, index0)?,
+            index0,
+        )?;
+        read += 1;
+    }
+    next_frames.finish(runtime, frame)
 }
 
 #[inline(always)]

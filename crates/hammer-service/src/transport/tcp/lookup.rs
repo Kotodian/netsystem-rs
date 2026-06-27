@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -23,10 +23,26 @@ pub type TcpLookupId = u32;
 
 thread_local! {
     static TCP_WORKER_STATE: Cell<*mut TcpWorkerOwnedState> = const { Cell::new(std::ptr::null_mut()) };
+    static TCP_WORKER_STATE_OWNER: RefCell<Option<Box<TcpWorkerOwnedState>>> = const { RefCell::new(None) };
 }
 
 pub(crate) fn set_tcp_worker_state(state: &mut TcpWorkerOwnedState) {
     TCP_WORKER_STATE.with(|cell| cell.set(state as *mut _));
+}
+
+// VPP alignment: `vlib_worker_threads` set up `vlib_per_thread_main` at worker
+// thread entry before the worker's first frame dispatch. `install_tcp_worker_state`
+// is the Rust mirror: it moves a `TcpWorkerOwnedState` into per-thread ownership
+// (so the box is dropped when the worker thread exits) and points
+// `TCP_WORKER_STATE` at it. Must be called on the worker thread before any
+// graph-wiring reads `tcp_worker_state()` (e.g. `init_graph` / `wire_worker_graph`).
+pub(crate) fn install_tcp_worker_state(state: TcpWorkerOwnedState) {
+    let mut boxed = Box::new(state);
+    let ptr: *mut TcpWorkerOwnedState = &mut *boxed;
+    TCP_WORKER_STATE_OWNER.with(|slot| {
+        *slot.borrow_mut() = Some(boxed);
+    });
+    TCP_WORKER_STATE.with(|cell| cell.set(ptr));
 }
 
 pub(crate) fn tcp_worker_state() -> &'static TcpWorkerOwnedState {
@@ -391,6 +407,7 @@ impl TcpListenerPendingTable {
             return false;
         }
         entry.created_epoch = epoch;
+        self.push_epoch_bucket(epoch, index);
         true
     }
 
@@ -1652,9 +1669,13 @@ fn build_fast_open_cookie(
 ) -> TcpFastOpenCookie {
     let mut bytes = [0u8; TCP_FAST_OPEN_COOKIE_LEN];
     bytes[0] = TCP_FAST_OPEN_COOKIE_VERSION;
-    bytes[1..TCP_FAST_OPEN_COOKIE_TAG_OFFSET].copy_from_slice(&epoch.to_be_bytes());
+    write_be_u32(&mut bytes, 1, epoch);
     let tag = fast_open_cookie_tag(secret, listener_id, local, remote, epoch);
-    bytes[TCP_FAST_OPEN_COOKIE_TAG_OFFSET..].copy_from_slice(&tag[..TCP_FAST_OPEN_COOKIE_TAG_LEN]);
+    write_bytes(
+        &mut bytes,
+        TCP_FAST_OPEN_COOKIE_TAG_OFFSET,
+        &tag[..TCP_FAST_OPEN_COOKIE_TAG_LEN],
+    );
     bytes.into()
 }
 
@@ -1668,9 +1689,38 @@ fn fast_open_cookie_tag(
     let first = fast_open_cookie_tag_word(secret, listener_id, local, remote, epoch, 0);
     let second = fast_open_cookie_tag_word(secret, listener_id, local, remote, epoch, 1);
     let mut tag = [0u8; 16];
-    tag[..8].copy_from_slice(&first.to_be_bytes());
-    tag[8..].copy_from_slice(&second.to_be_bytes());
+    write_be_u64(&mut tag, 0, first);
+    write_be_u64(&mut tag, 8, second);
     tag
+}
+
+#[inline(always)]
+fn write_bytes(output: &mut [u8], offset: usize, bytes: &[u8]) {
+    let mut index = 0usize;
+    while index < bytes.len() {
+        output[offset + index] = bytes[index];
+        index += 1;
+    }
+}
+
+#[inline(always)]
+fn write_be_u32(output: &mut [u8], offset: usize, value: u32) {
+    output[offset] = (value >> 24) as u8;
+    output[offset + 1] = (value >> 16) as u8;
+    output[offset + 2] = (value >> 8) as u8;
+    output[offset + 3] = value as u8;
+}
+
+#[inline(always)]
+fn write_be_u64(output: &mut [u8], offset: usize, value: u64) {
+    output[offset] = (value >> 56) as u8;
+    output[offset + 1] = (value >> 48) as u8;
+    output[offset + 2] = (value >> 40) as u8;
+    output[offset + 3] = (value >> 32) as u8;
+    output[offset + 4] = (value >> 24) as u8;
+    output[offset + 5] = (value >> 16) as u8;
+    output[offset + 6] = (value >> 8) as u8;
+    output[offset + 7] = value as u8;
 }
 
 fn fast_open_cookie_tag_word(
@@ -1727,7 +1777,7 @@ fn hash_socket_addr(hasher: &mut impl Hasher, addr: SocketAddr) {
 
 #[cfg(test)]
 mod tests {
-    use super::TcpWorkerOwnedState;
+    use super::{TcpWorkerOwnedState, write_bytes};
     use hammer_adapter::DataWorkerId;
     use hammer_core::protocol::tcp::{TcpCapabilities, TcpFastOpenCookie};
     use std::net::{Ipv4Addr, SocketAddr};
@@ -1759,7 +1809,7 @@ mod tests {
         let (local, remote) = socket_pair();
         let cookie = state.fast_open_cookie_for_listener_in_epoch(7, local, remote, 42);
         let mut bytes = [0u8; TcpFastOpenCookie::MAX_LEN];
-        bytes.copy_from_slice(cookie.as_slice());
+        write_bytes(&mut bytes, 0, cookie.as_slice());
         bytes[15] ^= 0x5a;
         let cookie: TcpFastOpenCookie = bytes.into();
 

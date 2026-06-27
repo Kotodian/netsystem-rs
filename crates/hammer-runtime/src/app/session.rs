@@ -2,8 +2,12 @@ use std::fmt;
 use std::sync::Arc;
 
 use hammer_core::error::{HammerError, HammerResult};
+use hammer_infra::ring::LockFreeRing;
 use hammer_infra::svm_fifo::SvmFifo;
 use hammer_infra::svm_msg_q::{SessionEvt, SessionEvtType, SvmMsgQ};
+use tokio::sync::Notify;
+
+use crate::app::SessionHandle;
 
 /// VPP-style app/session object: per-session byte FIFOs plus event queue.
 ///
@@ -16,11 +20,19 @@ pub struct AppSession {
     rx_fifo: Arc<SvmFifo>,
     tx_fifo: Arc<SvmFifo>,
     evt_q: Arc<SvmMsgQ>,
-    session_index: u32,
+    rx_readable: Notify,
+    tx_writable: Notify,
+    evt_readable: Notify,
+    handle: SessionHandle,
+    tx_evt_q: Arc<LockFreeRing<u32>>,
 }
 
 impl AppSession {
-    pub fn new(config: AppSessionConfig, session_index: u32) -> HammerResult<Self> {
+    pub(crate) fn new(
+        config: AppSessionConfig,
+        handle: SessionHandle,
+        tx_evt_q: Arc<LockFreeRing<u32>>,
+    ) -> HammerResult<Self> {
         let rx_fifo = Arc::new(
             SvmFifo::with_capacity(config.fifo_capacity)
                 .map_err(|_| HammerError::internal("invalid rx fifo capacity"))?,
@@ -45,13 +57,22 @@ impl AppSession {
             rx_fifo,
             tx_fifo,
             evt_q,
-            session_index,
+            rx_readable: Notify::new(),
+            tx_writable: Notify::new(),
+            evt_readable: Notify::new(),
+            handle,
+            tx_evt_q,
         })
     }
 
     #[inline]
     pub const fn session_index(&self) -> u32 {
-        self.session_index
+        self.handle.session_index()
+    }
+
+    #[inline]
+    pub const fn session_handle(&self) -> SessionHandle {
+        self.handle
     }
 
     /// Transport side: FIFO into which received bytes are copied.
@@ -76,8 +97,32 @@ impl AppSession {
     /// number of bytes accepted (may be < `bytes.len()` if fifo full; caller
     /// retries or backpressures).
     #[inline]
-    pub fn send_bytes(&self, bytes: &[u8]) -> usize {
-        self.tx_fifo.enqueue(bytes)
+    pub fn send_bytes(&self, bytes: &[u8]) -> HammerResult<usize> {
+        let wrote = self.tx_fifo.enqueue(bytes);
+        self.notify_tx_event(wrote)?;
+        Ok(wrote)
+    }
+
+    /// App-side async send. Applies FIFO backpressure and completes only after
+    /// every byte in `bytes` has entered the session-owned TX FIFO.
+    pub async fn send_all(&self, bytes: &[u8]) -> HammerResult<usize> {
+        let mut written = 0usize;
+        while written < bytes.len() {
+            let accepted = self.send_bytes(&bytes[written..])?;
+            if accepted != 0 {
+                written += accepted;
+                continue;
+            }
+            self.want_tx_notification();
+            let notified = self.tx_writable.notified();
+            if self.tx_fifo.max_enqueue() != 0 {
+                self.clear_tx_notification();
+                continue;
+            }
+            notified.await;
+            self.clear_tx_notification();
+        }
+        Ok(written)
     }
 
     /// App-side convenience: copy received bytes out (transport → app). Returns
@@ -86,6 +131,26 @@ impl AppSession {
     #[inline]
     pub fn recv_bytes(&self, out: &mut [u8]) -> usize {
         self.rx_fifo.peek(0, out.len(), out)
+    }
+
+    /// App-side async receive. Waits until RX FIFO has data, copies up to
+    /// `out.len()` bytes, and consumes exactly the copied bytes.
+    pub async fn recv(&self, out: &mut [u8]) -> usize {
+        loop {
+            let read = self.rx_fifo.peek(0, out.len(), out);
+            if read != 0 || out.is_empty() {
+                self.rx_fifo.dequeue_drop(read);
+                return read;
+            }
+            self.want_rx_notification();
+            let notified = self.rx_readable.notified();
+            if self.rx_fifo.max_dequeue() != 0 {
+                self.clear_rx_notification();
+                continue;
+            }
+            notified.await;
+            self.clear_rx_notification();
+        }
     }
 
     /// App-side convenience: drop `len` bytes from the head of `rx_fifo` after
@@ -102,6 +167,20 @@ impl AppSession {
         self.evt_q.dequeue_batch(out)
     }
 
+    /// App-side async event receive. Waits for the next session event.
+    pub async fn next_event(&self) -> SessionEvt {
+        loop {
+            if let Some(evt) = self.evt_q.dequeue() {
+                return evt;
+            }
+            let notified = self.evt_readable.notified();
+            if let Some(evt) = self.evt_q.dequeue() {
+                return evt;
+            }
+            notified.await;
+        }
+    }
+
     /// App-side convenience: read the edge-triggered signal flag. Returns true
     /// if a producer signalled since the last read.
     #[inline]
@@ -115,10 +194,12 @@ impl AppSession {
     pub fn push_event(&self, evt_type: SessionEvtType) -> HammerResult<()> {
         self.evt_q
             .enqueue(SessionEvt {
-                session_index: self.session_index,
+                session_index: self.handle.session_index(),
                 evt_type,
             })
-            .map_err(|_| HammerError::internal("app session evt_q full"))
+            .map_err(|_| HammerError::internal("app session evt_q full"))?;
+        self.evt_readable.notify_waiters();
+        Ok(())
     }
 
     /// Transport-side convenience: enqueue received bytes and emit a
@@ -129,6 +210,9 @@ impl AppSession {
     #[inline]
     pub fn enqueue_rx(&self, bytes: &[u8]) -> HammerResult<usize> {
         let wrote = self.rx_fifo.enqueue(bytes);
+        if wrote > 0 {
+            self.rx_readable.notify_waiters();
+        }
         if wrote > 0 && self.rx_fifo.should_signal(wrote) {
             self.push_event(SessionEvtType::RxEnq)?;
         }
@@ -140,10 +224,30 @@ impl AppSession {
     #[inline]
     pub fn drop_tx_acked(&self, len: usize) -> HammerResult<usize> {
         let dropped = self.tx_fifo.dequeue_drop(len);
+        if dropped > 0 {
+            self.tx_writable.notify_waiters();
+        }
         if dropped > 0 && self.tx_fifo.needs_deq_notification(dropped) {
             self.push_event(SessionEvtType::TxDeq)?;
         }
         Ok(dropped)
+    }
+
+    #[inline]
+    pub fn clear_tx_event(&self) {
+        self.tx_fifo.unset_event();
+    }
+
+    #[inline]
+    fn notify_tx_event(&self, wrote: usize) -> HammerResult<()> {
+        if wrote == 0 || !self.tx_fifo.set_event() {
+            return Ok(());
+        }
+        if self.tx_evt_q.enqueue(self.handle.session_index()).is_err() {
+            self.tx_fifo.unset_event();
+            return Err(HammerError::internal("session tx event queue full"));
+        }
+        Ok(())
     }
 
     /// App-side: ask the runtime to wake the app when the fifo transitions
@@ -175,13 +279,17 @@ impl AppSession {
         self.rx_fifo.clear();
         self.tx_fifo.clear();
         self.evt_q.clear();
+        self.rx_readable.notify_waiters();
+        self.tx_writable.notify_waiters();
+        self.evt_readable.notify_waiters();
     }
 }
 
 impl fmt::Debug for AppSession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AppSession")
-            .field("session_index", &self.session_index)
+            .field("session_index", &self.handle.session_index())
+            .field("worker_index", &self.handle.worker_index())
             .finish_non_exhaustive()
     }
 }
@@ -221,10 +329,17 @@ impl Default for AppSessionConfig {
 mod tests {
     use super::*;
 
+    fn new_session(config: AppSessionConfig, session_index: u32) -> AppSession {
+        let handle = SessionHandle::new(session_index, 0);
+        let queue =
+            Arc::new(LockFreeRing::with_capacity(8).expect("test session tx event queue capacity"));
+        AppSession::new(config, handle, queue).expect("session")
+    }
+
     #[test]
     fn app_session_send_recv_round_trips() {
-        let session = AppSession::new(AppSessionConfig::new(64, 4), 1).expect("session");
-        assert_eq!(session.send_bytes(b"hello"), 5);
+        let session = new_session(AppSessionConfig::new(64, 4), 1);
+        assert_eq!(session.send_bytes(b"hello").expect("send"), 5);
         let mut tx_out = [0u8; 8];
         assert_eq!(session.tx_fifo().peek(0, 8, &mut tx_out), 5);
         assert_eq!(&tx_out[..5], b"hello");
@@ -239,7 +354,7 @@ mod tests {
 
     #[test]
     fn app_session_enqueue_rx_emits_edge_triggered_signal() {
-        let session = AppSession::new(AppSessionConfig::new(64, 4), 1).expect("session");
+        let session = new_session(AppSessionConfig::new(64, 4), 1);
         session.want_rx_notification();
         assert_eq!(session.enqueue_rx(b"abc").expect("enqueue rx"), 3);
         assert!(session.read_signal());
@@ -250,7 +365,7 @@ mod tests {
 
     #[test]
     fn app_session_enqueue_rx_emits_rx_event_when_requested() {
-        let session = AppSession::new(AppSessionConfig::new(64, 4), 1).expect("session");
+        let session = new_session(AppSessionConfig::new(64, 4), 1);
         assert_eq!(session.enqueue_rx(b"abc").expect("enqueue rx"), 3);
         assert_eq!(
             session.poll_events(&mut [SessionEvt {
@@ -283,7 +398,7 @@ mod tests {
 
     #[test]
     fn app_session_push_event_round_trips() {
-        let session = AppSession::new(AppSessionConfig::new(64, 4), 1).expect("session");
+        let session = new_session(AppSessionConfig::new(64, 4), 1);
         session
             .push_event(SessionEvtType::Connect)
             .expect("push connect");
@@ -298,8 +413,8 @@ mod tests {
 
     #[test]
     fn app_session_drop_tx_acked_advances_tx_fifo() {
-        let session = AppSession::new(AppSessionConfig::new(64, 4), 1).expect("session");
-        assert_eq!(session.send_bytes(b"abcdef"), 6);
+        let session = new_session(AppSessionConfig::new(64, 4), 1);
+        assert_eq!(session.send_bytes(b"abcdef").expect("send"), 6);
         assert_eq!(session.drop_tx_acked(3).expect("drop tx"), 3);
         assert_eq!(session.tx_fifo().max_dequeue(), 3);
         let mut out = [0u8; 6];
@@ -309,8 +424,8 @@ mod tests {
 
     #[test]
     fn app_session_drop_tx_acked_emits_dequeue_notification() {
-        let session = AppSession::new(AppSessionConfig::new(8, 4), 1).expect("session");
-        assert_eq!(session.send_bytes(b"abcdefgh"), 8);
+        let session = new_session(AppSessionConfig::new(8, 4), 1);
+        assert_eq!(session.send_bytes(b"abcdefgh").expect("send"), 8);
         assert!(session.tx_fifo().is_full());
 
         assert_eq!(session.drop_tx_acked(1).expect("drop tx"), 1);
@@ -333,8 +448,8 @@ mod tests {
 
     #[test]
     fn app_session_clear_resets_all() {
-        let session = AppSession::new(AppSessionConfig::new(64, 4), 1).expect("session");
-        session.send_bytes(b"x");
+        let session = new_session(AppSessionConfig::new(64, 4), 1);
+        session.send_bytes(b"x").expect("send");
         session.enqueue_rx(b"y").expect("enqueue rx");
         session
             .push_event(SessionEvtType::Close)
@@ -351,12 +466,16 @@ mod tests {
 
     #[test]
     fn app_session_rejects_invalid_fifo_capacity() {
-        assert!(AppSession::new(AppSessionConfig::new(3, 4), 0).is_err());
+        let queue =
+            Arc::new(LockFreeRing::with_capacity(8).expect("test session tx event queue capacity"));
+        assert!(
+            AppSession::new(AppSessionConfig::new(3, 4), SessionHandle::new(0, 0), queue).is_err()
+        );
     }
 
     #[test]
     fn app_session_evt_q_capacity_holds_requested_count() {
-        let session = AppSession::new(AppSessionConfig::new(64, 3), 1).expect("session");
+        let session = new_session(AppSessionConfig::new(64, 3), 1);
         for _ in 0..3 {
             session
                 .push_event(SessionEvtType::Connect)

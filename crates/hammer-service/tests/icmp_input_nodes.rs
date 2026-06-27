@@ -5,9 +5,14 @@ use hammer_adapter::{
     BufferFrame, BufferNodeError, DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult,
     NodeRuntimeData, TraceControlPlane, TraceInputPolicy, TracePolicy,
 };
+use hammer_adapter::BufferPacketCursor;
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
-use hammer_service::net::{IcmpInputControlPlane, IcmpInputError, IcmpInputTrace, IpVersion};
+use hammer_infra::vec::Vec as InfraVec;
+use hammer_service::net::{
+    IcmpInputControlPlane, IcmpInputError, IcmpInputTrace, IpVersion, NetworkOpaque,
+};
+use std::mem::transmute;
 
 #[derive(Default)]
 struct CaptureState {
@@ -58,6 +63,17 @@ impl Node for CaptureNode {
 
 impl InternalNode for CaptureNode {}
 
+fn chain_bytes(
+    runtime: &DataPlaneRuntime,
+    index: hammer_adapter::BufferIndex,
+) -> CoreResult<InfraVec<u8>> {
+    let mut bytes = InfraVec::new();
+    for buffer in runtime.buffers().chain(index) {
+        bytes.extend_from_slice(buffer?.current());
+    }
+    Ok(bytes)
+}
+
 fn capture_states() -> &'static Mutex<Vec<Arc<Mutex<CaptureState>>>> {
     static STATES: OnceLock<Mutex<Vec<Arc<Mutex<CaptureState>>>>> = OnceLock::new();
     STATES.get_or_init(|| Mutex::new(Vec::new()))
@@ -84,7 +100,7 @@ fn capture_process(
         .frame_lens
         .push(frame.pending_len());
     for index in frame.drain_pending() {
-        let packet = runtime.copy_packet(index)?;
+        let packet = chain_bytes(runtime, index)?;
         let node_error = runtime.node_error(index)?;
         let mut state = state
             .lock()
@@ -237,6 +253,7 @@ fn push_packet(runtime: &DataPlaneRuntime, frame: hammer_adapter::FrameIndex, pa
     let buffer = runtime
         .alloc_index_with_bytes(packet)
         .expect("alloc packet");
+    set_ip_cursor(runtime, buffer, packet);
     runtime
         .get_frame_mut(frame)
         .expect("mutate frame")
@@ -256,11 +273,36 @@ fn push_marked_packet(
     runtime
         .try_mark_trace(trace_input, buffer)
         .expect("mark packet");
+    set_ip_cursor(runtime, buffer, packet);
     runtime
         .get_frame_mut(frame)
         .expect("mutate frame")
         .push_index(buffer)
         .expect("push packet");
+}
+
+fn set_ip_cursor(runtime: &DataPlaneRuntime, index: hammer_adapter::BufferIndex, packet: &[u8]) {
+    let Some(first) = packet.first().copied() else {
+        return;
+    };
+    let cursor = match first >> 4 {
+        4 => {
+            let ihl = usize::from(first & 0x0f) * 4;
+            BufferPacketCursor::new()
+                .with_packet_len(packet.len())
+                .with_network_header(0, ihl)
+                .with_transport_header(ihl, 8)
+                .with_transport_payload_offset(ihl + 8)
+        }
+        6 => BufferPacketCursor::new()
+            .with_packet_len(packet.len())
+            .with_network_header(0, 40)
+            .with_transport_header(40, 8)
+            .with_transport_payload_offset(48),
+        _ => return,
+    };
+    let mut buffer = runtime.get_buffer_mut(index).expect("buffer");
+    unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }.set_packet_cursor(cursor);
 }
 
 fn ipv4_icmp_packet(icmp_type: u8, code: u8, payload: &[u8]) -> Vec<u8> {
