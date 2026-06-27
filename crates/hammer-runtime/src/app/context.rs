@@ -1,6 +1,8 @@
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use hammer_core::error::HammerResult;
+use hammer_infra::segment::Segment;
 
 use crate::app::application::with_current_app_worker;
 use crate::app::handle::SessionHandle;
@@ -8,17 +10,21 @@ use crate::app::session::{AppSession, AppSessionConfig};
 use crate::spawn::DataRuntimeContext;
 
 #[derive(Clone)]
-pub struct AppContext {
+pub struct AppContext<S: Segment> {
     data_context: DataRuntimeContext,
     app_session_config: AppSessionConfig,
+    _phantom: PhantomData<S>,
 }
 
-impl AppContext {
+use hammer_infra::segment::Local;
+
+impl AppContext<Local> {
     #[inline]
     pub fn new(data_context: DataRuntimeContext, app_session_config: AppSessionConfig) -> Self {
         Self {
             data_context,
             app_session_config,
+            _phantom: PhantomData,
         }
     }
 
@@ -32,7 +38,10 @@ impl AppContext {
         self.data_context.worker_count()
     }
 
-    pub fn session(&self, handle: SessionHandle) -> HammerResult<Option<Arc<AppSession>>> {
+    pub fn session(
+        &self,
+        handle: SessionHandle,
+    ) -> HammerResult<Option<Arc<AppSession<Local>>>> {
         let worker = handle.worker_index() as usize;
         if worker >= self.data_context.worker_count() {
             return Ok(None);
@@ -52,7 +61,7 @@ impl AppContext {
     pub async fn session_async(
         &self,
         handle: SessionHandle,
-    ) -> HammerResult<Option<Arc<AppSession>>> {
+    ) -> HammerResult<Option<Arc<AppSession<Local>>>> {
         let worker = handle.worker_index() as usize;
         if worker >= self.data_context.worker_count() {
             return Ok(None);

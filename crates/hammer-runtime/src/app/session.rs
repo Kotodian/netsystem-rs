@@ -4,8 +4,7 @@ use std::sync::Arc;
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_infra::fifo::Fifo;
 use hammer_infra::msg_queue::{MsgQueue, SessionEvt, SessionEvtType};
-use hammer_infra::ring::LockFreeRing;
-use hammer_infra::segment::Local;
+use hammer_infra::segment::Segment;
 use tokio::sync::Notify;
 
 use crate::app::SessionHandle;
@@ -17,23 +16,21 @@ use crate::app::SessionHandle;
 ///          network; app peeks + dequeue_drops after consuming).
 ///   tx_fifo: app → transport  (app enqueues bytes to send; transport peeks
 ///          at the read window and dequeue_drops on ACK).
-pub struct AppSession {
-    rx_fifo: Arc<Fifo<Local>>,
-    tx_fifo: Arc<Fifo<Local>>,
-    evt_q: Arc<MsgQueue<Local>>,
+pub struct AppSession<S: Segment> {
+    rx_fifo: Arc<Fifo<S>>,
+    tx_fifo: Arc<Fifo<S>>,
+    evt_q: Arc<MsgQueue<S>>,
+    tx_evt_q: Arc<MsgQueue<S>>,
     rx_readable: Notify,
     tx_writable: Notify,
     evt_readable: Notify,
     handle: SessionHandle,
-    tx_evt_q: Arc<LockFreeRing<u32>>,
 }
 
-impl AppSession {
-    pub(crate) fn new(
-        config: AppSessionConfig,
-        handle: SessionHandle,
-        tx_evt_q: Arc<LockFreeRing<u32>>,
-    ) -> HammerResult<Self> {
+use hammer_infra::segment::Local;
+
+impl AppSession<Local> {
+    pub fn local(config: AppSessionConfig, handle: SessionHandle) -> HammerResult<Self> {
         let rx_fifo = Arc::new(
             Fifo::<Local>::with_capacity(config.fifo_capacity)
                 .map_err(|_| HammerError::internal("invalid rx fifo capacity"))?,
@@ -42,9 +39,6 @@ impl AppSession {
             Fifo::<Local>::with_capacity(config.fifo_capacity)
                 .map_err(|_| HammerError::internal("invalid tx fifo capacity"))?,
         );
-        // MsgQueue::with_capacity(N) uses a power-of-two ring and holds N-1
-        // events (one slot reserved). Request enough ring slots for
-        // `evt_q_capacity` usable events, then round up.
         let ring_slots = config
             .evt_q_capacity
             .checked_add(1)
@@ -54,18 +48,24 @@ impl AppSession {
             MsgQueue::<Local>::with_capacity(ring_size)
                 .map_err(|_| HammerError::internal("invalid app session evt_q capacity"))?,
         );
+        let tx_evt_q = Arc::new(
+            MsgQueue::<Local>::with_capacity(64)
+                .map_err(|_| HammerError::internal("invalid app session tx_evt_q capacity"))?,
+        );
         Ok(Self {
             rx_fifo,
             tx_fifo,
             evt_q,
+            tx_evt_q,
             rx_readable: Notify::new(),
             tx_writable: Notify::new(),
             evt_readable: Notify::new(),
             handle,
-            tx_evt_q,
         })
     }
+}
 
+impl<S: Segment> AppSession<S> {
     #[inline]
     pub const fn session_index(&self) -> u32 {
         self.handle.session_index()
@@ -78,19 +78,19 @@ impl AppSession {
 
     /// Transport side: FIFO into which received bytes are copied.
     #[inline]
-    pub fn rx_fifo(&self) -> &Arc<Fifo<Local>> {
+    pub fn rx_fifo(&self) -> &Arc<Fifo<S>> {
         &self.rx_fifo
     }
 
     /// Transport side: FIFO from which send bytes are peeked.
     #[inline]
-    pub fn tx_fifo(&self) -> &Arc<Fifo<Local>> {
+    pub fn tx_fifo(&self) -> &Arc<Fifo<S>> {
         &self.tx_fifo
     }
 
     /// Both sides: shared event queue for this session.
     #[inline]
-    pub fn evt_q(&self) -> &Arc<MsgQueue<Local>> {
+    pub fn evt_q(&self) -> &Arc<MsgQueue<S>> {
         &self.evt_q
     }
 
@@ -244,7 +244,14 @@ impl AppSession {
         if wrote == 0 || !self.tx_fifo.set_event() {
             return Ok(());
         }
-        if self.tx_evt_q.enqueue(self.handle.session_index()).is_err() {
+        if self
+            .tx_evt_q
+            .enqueue(SessionEvt {
+                session_index: self.handle.session_index(),
+                evt_type: SessionEvtType::TxDeq,
+            })
+            .is_err()
+        {
             self.tx_fifo.unset_event();
             return Err(HammerError::internal("session tx event queue full"));
         }
@@ -286,7 +293,7 @@ impl AppSession {
     }
 }
 
-impl fmt::Debug for AppSession {
+impl<S: Segment> fmt::Debug for AppSession<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AppSession")
             .field("session_index", &self.handle.session_index())
@@ -329,12 +336,11 @@ impl Default for AppSessionConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hammer_infra::segment::Local;
 
-    fn new_session(config: AppSessionConfig, session_index: u32) -> AppSession {
+    fn new_session(config: AppSessionConfig, session_index: u32) -> AppSession<Local> {
         let handle = SessionHandle::new(session_index, 0);
-        let queue =
-            Arc::new(LockFreeRing::with_capacity(8).expect("test session tx event queue capacity"));
-        AppSession::new(config, handle, queue).expect("session")
+        AppSession::<Local>::local(config, handle).expect("session")
     }
 
     #[test]
@@ -467,10 +473,9 @@ mod tests {
 
     #[test]
     fn app_session_rejects_invalid_fifo_capacity() {
-        let queue =
-            Arc::new(LockFreeRing::with_capacity(8).expect("test session tx event queue capacity"));
         assert!(
-            AppSession::new(AppSessionConfig::new(3, 4), SessionHandle::new(0, 0), queue).is_err()
+            AppSession::<Local>::local(AppSessionConfig::new(3, 4), SessionHandle::new(0, 0))
+                .is_err()
         );
     }
 
