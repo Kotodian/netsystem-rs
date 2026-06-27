@@ -4,7 +4,7 @@ use hammer_adapter::{BufferIndex, DataPlaneBuffers};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::map::FlatHashTable;
 use hammer_infra::ring::LockFreeRing;
-use hammer_infra::svm_msg_q::SessionEvtType;
+use hammer_infra::msg_queue::SessionEvtType;
 use hammer_infra::vec::Vec;
 use hammer_runtime::app::AppSession;
 
@@ -105,7 +105,7 @@ impl SessionAppRuntime {
             .ok_or_else(|| CoreError::internal("app session is missing"))?;
         let written = session
             .tx_fifo()
-            .peek_slices(tx_offset, payload_len, |first, second| {
+            .peek_segments(tx_offset, payload_len, |first, second| {
                 if !first.is_empty() {
                     self.buffers.append(index, first)?;
                 }

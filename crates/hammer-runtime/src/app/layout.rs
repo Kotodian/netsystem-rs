@@ -25,11 +25,11 @@ pub struct FifoSegmentLayout {
 
 impl FifoSegmentLayout {
     pub fn new(fifo_capacity: usize, evt_q_capacity: usize) -> Self {
-        // Stage F will compute exact byte sizes from SvmFifo/SvmMsgQ `repr(C)`
+        // Stage F will compute exact byte sizes from Fifo/MsgQueue `#[repr(C)]`
         // footprints. For C1 we use placeholder rounded sizes so the layout
         // record exists and is usable in tests; Stage F replaces these with
-        // `size_of::<SvmFifo>()`/`size_of::<SvmMsgQ>()` once those types are
-        // `#[repr(C)]` and mmap-friendly.
+        // `size_of::<Fifo<Local>>()`/`size_of::<MsgQueue<Local>>()` once those
+        // types are mmap-friendly.
         let rx_fifo_bytes = align_up(128, CACHE_LINE);
         let tx_fifo_bytes = align_up(128, CACHE_LINE);
         let evt_q_bytes = align_up(128, CACHE_LINE);

@@ -2,7 +2,7 @@ use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use crate::segment::Segment;
+use crate::segment::{Local, Segment};
 
 #[repr(C)]
 struct Chunk {
@@ -525,8 +525,27 @@ impl<S: Segment> Fifo<S> {
         *self.ooo.lock().unwrap() = Vec::new();
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.max_dequeue() == 0
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.max_enqueue() == 0
+    }
+
     pub fn segment_fd(&self) -> Option<RawFd> {
         self.seg.fd()
+    }
+}
+
+impl Fifo<Local> {
+    /// Convenience constructor: creates a heap-backed [`Fifo`] with the given
+    /// chunk capacity. The underlying `Local` segment is sized to hold
+    /// `capacity` chunks plus the header.
+    pub fn with_capacity(capacity: usize) -> Result<Self, FifoError> {
+        let chunk_data_size = capacity.min(4096);
+        let seg = Local::new(size_of::<FifoHeader>() + capacity * (size_of::<Chunk>() + chunk_data_size));
+        Self::new(seg, capacity)
     }
 }
 

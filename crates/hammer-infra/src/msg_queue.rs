@@ -1,7 +1,7 @@
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use crate::segment::Segment;
+use crate::segment::{Local, Segment};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
@@ -215,6 +215,10 @@ impl<S: Segment> MsgQueue<S> {
         self.signal_read
     }
 
+    pub fn read_signal(&self) -> bool {
+        self.drain()
+    }
+
     pub fn clear(&self) {
         while self.dequeue().is_some() {}
         if let Some(fd) = self.signal_read {
@@ -222,6 +226,14 @@ impl<S: Segment> MsgQueue<S> {
             while unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) } > 0 {}
         }
         self.signal_atomic.store(false, Ordering::Relaxed);
+    }
+}
+
+impl MsgQueue<Local> {
+    pub fn with_capacity(capacity: usize) -> Result<Self, MsgQueueError> {
+        let seg =
+            Local::new(size_of::<MsgQueueHeader>() + capacity * size_of::<SessionEvt>() + 64);
+        Self::new(seg, capacity, false)
     }
 }
 

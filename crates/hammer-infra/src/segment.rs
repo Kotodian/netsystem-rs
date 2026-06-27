@@ -19,15 +19,24 @@ pub struct Local {
 struct LocalInner {
     buf: Box<[u8]>,
     bump: AtomicU64,
+    base_offset: u64,
 }
 
 impl Local {
+    /// Create a heap-backed segment with at least `size` usable bytes.
+    /// The base address is aligned to 64 bytes (cache line).
     pub fn new(size: usize) -> Self {
-        let buf = vec![0u8; size].into_boxed_slice();
+        let extra = 64usize;
+        let total = size.checked_add(extra).expect("Local segment size overflow");
+        let mut buf = vec![0u8; total].into_boxed_slice();
+        let base_raw = buf.as_mut_ptr() as usize;
+        let base_aligned = align_up(base_raw, 64);
+        let base_offset = (base_aligned - base_raw) as u64;
         Self {
             inner: Arc::new(LocalInner {
                 buf,
                 bump: AtomicU64::new(0),
+                base_offset,
             }),
         }
     }
@@ -43,18 +52,20 @@ impl Clone for Local {
 
 impl Segment for Local {
     fn base(&self) -> *mut u8 {
-        self.inner.buf.as_ptr() as *mut u8
+        unsafe { self.inner.buf.as_ptr().add(self.inner.base_offset as usize) as *mut u8 }
     }
 
     fn alloc(&self, bytes: usize, align: usize) -> u64 {
-        let size = self.inner.buf.len();
+        let total = self.inner.buf.len();
+        let bo = self.inner.base_offset;
         loop {
             let current = self.inner.bump.load(Ordering::Relaxed);
             let aligned = align_up(current as usize, align) as u64;
             let next = aligned + bytes as u64;
-            if next > size as u64 {
+            if bo + next > total as u64 {
                 panic!(
-                    "Local segment exhausted: requested {bytes} at {aligned}, size {size}"
+                    "Local segment exhausted: requested {bytes} at {aligned}, size {}",
+                    total - bo as usize
                 );
             }
             if self

@@ -2,9 +2,10 @@ use std::fmt;
 use std::sync::Arc;
 
 use hammer_core::error::{HammerError, HammerResult};
+use hammer_infra::fifo::Fifo;
+use hammer_infra::msg_queue::{MsgQueue, SessionEvt, SessionEvtType};
 use hammer_infra::ring::LockFreeRing;
-use hammer_infra::svm_fifo::SvmFifo;
-use hammer_infra::svm_msg_q::{SessionEvt, SessionEvtType, SvmMsgQ};
+use hammer_infra::segment::Local;
 use tokio::sync::Notify;
 
 use crate::app::SessionHandle;
@@ -17,9 +18,9 @@ use crate::app::SessionHandle;
 ///   tx_fifo: app → transport  (app enqueues bytes to send; transport peeks
 ///          at the read window and dequeue_drops on ACK).
 pub struct AppSession {
-    rx_fifo: Arc<SvmFifo>,
-    tx_fifo: Arc<SvmFifo>,
-    evt_q: Arc<SvmMsgQ>,
+    rx_fifo: Arc<Fifo<Local>>,
+    tx_fifo: Arc<Fifo<Local>>,
+    evt_q: Arc<MsgQueue<Local>>,
     rx_readable: Notify,
     tx_writable: Notify,
     evt_readable: Notify,
@@ -34,23 +35,23 @@ impl AppSession {
         tx_evt_q: Arc<LockFreeRing<u32>>,
     ) -> HammerResult<Self> {
         let rx_fifo = Arc::new(
-            SvmFifo::with_capacity(config.fifo_capacity)
+            Fifo::<Local>::with_capacity(config.fifo_capacity)
                 .map_err(|_| HammerError::internal("invalid rx fifo capacity"))?,
         );
         let tx_fifo = Arc::new(
-            SvmFifo::with_capacity(config.fifo_capacity)
+            Fifo::<Local>::with_capacity(config.fifo_capacity)
                 .map_err(|_| HammerError::internal("invalid tx fifo capacity"))?,
         );
-        // SvmMsgQ::with_capacity(N) uses LockFreeRing, which requires a power-of-two
-        // size and holds N-1 events (one slot reserved). Request enough ring slots
-        // for `evt_q_capacity` usable events, then round up to the next power of two.
+        // MsgQueue::with_capacity(N) uses a power-of-two ring and holds N-1
+        // events (one slot reserved). Request enough ring slots for
+        // `evt_q_capacity` usable events, then round up.
         let ring_slots = config
             .evt_q_capacity
             .checked_add(1)
             .ok_or_else(|| HammerError::internal("app session evt_q capacity overflow"))?;
         let ring_size = ring_slots.next_power_of_two().max(2);
         let evt_q = Arc::new(
-            SvmMsgQ::with_capacity(ring_size)
+            MsgQueue::<Local>::with_capacity(ring_size)
                 .map_err(|_| HammerError::internal("invalid app session evt_q capacity"))?,
         );
         Ok(Self {
@@ -77,19 +78,19 @@ impl AppSession {
 
     /// Transport side: FIFO into which received bytes are copied.
     #[inline]
-    pub fn rx_fifo(&self) -> &Arc<SvmFifo> {
+    pub fn rx_fifo(&self) -> &Arc<Fifo<Local>> {
         &self.rx_fifo
     }
 
     /// Transport side: FIFO from which send bytes are peeked.
     #[inline]
-    pub fn tx_fifo(&self) -> &Arc<SvmFifo> {
+    pub fn tx_fifo(&self) -> &Arc<Fifo<Local>> {
         &self.tx_fifo
     }
 
     /// Both sides: shared event queue for this session.
     #[inline]
-    pub fn evt_q(&self) -> &Arc<SvmMsgQ> {
+    pub fn evt_q(&self) -> &Arc<MsgQueue<Local>> {
         &self.evt_q
     }
 
