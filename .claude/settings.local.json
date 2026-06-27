@@ -29,7 +29,17 @@
       "Bash(git -C /Users/linqiankai/rust/src/github.com/Kotodian/hammer-ios-rs log --oneline -10)",
       "Bash(awk 'NR>=900 && NR<=1135 && \\(/^#\\\\[cfg\\\\\\(test\\\\\\)\\\\]/ || /^mod tests/ || /^    fn / || /^    #\\\\[test\\\\]/\\)' /Users/linqiankai/rust/src/github.com/Kotodian/hammer-ios-rs/crates/hammer-service/src/transport/tcp/mod.rs)",
       "Bash(awk -F: '$2 ~ /test|tests/ || $1 > 2400')",
-      "Bash(awk '/fn control_segment/,/^    }/' /Users/linqiankai/rust/src/github.com/Kotodian/hammer-ios-rs/crates/hammer-service/src/transport/tcp/connection.rs)"
+      "Bash(awk '/fn control_segment/,/^    }/' /Users/linqiankai/rust/src/github.com/Kotodian/hammer-ios-rs/crates/hammer-service/src/transport/tcp/connection.rs)",
+      "Bash(awk '/forward_default_process/{print NR\": \"$0}')",
+      "Bash(awk '/^pub struct BufferPool \\\\{/,/^}/')",
+      "Bash(awk '/^pub struct BufferThreadCache|^struct BufferThreadCache \\\\{/,/^}/')",
+      "Bash(awk '/^pub struct BufferFrame \\\\{/,/^}/')",
+      "Bash(awk '/impl BufferPool \\\\{/,/^impl [A-Z]/')",
+      "Read(//Users/linqiankai/.cc-switch/skills/subagent-driven-development/**)",
+      "Read(//Users/linqiankai/.cc-switch/skills/subagent-driven-development/scripts/**)",
+      "Bash(git rev-parse *)",
+      "Bash(cat \"$\\(git rev-parse --git-path sdd\\)/progress.md\")",
+      "Bash(git stash *)"
     ]
   }
 }

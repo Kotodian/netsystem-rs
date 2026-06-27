@@ -1,4 +1,4 @@
-use hammer_infra::fifo::FifoQueue;
+use hammer_infra::fifo_queue::FifoQueue;
 
 use crate::session::SessionId;
 

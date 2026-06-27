@@ -6,7 +6,7 @@ use hammer_adapter::{
     BufferIndex, DataPlaneBuffers, DataPlaneRuntime, DataWorkerId, NodeRuntimeData,
 };
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_infra::fifo::FifoQueue;
+use hammer_infra::fifo_queue::FifoQueue;
 use hammer_infra::map::FlatHashTable;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::rbtree::RbTree;

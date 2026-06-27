@@ -3,7 +3,7 @@ pub mod bitmap;
 pub mod boxed;
 pub mod checksum;
 pub mod descriptor;
-pub mod fifo;
+pub mod fifo_queue;
 pub mod hint;
 pub mod map;
 pub mod mtrie;

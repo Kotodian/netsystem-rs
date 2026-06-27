@@ -1,4 +1,4 @@
-use hammer_infra::fifo::FifoQueue;
+use hammer_infra::fifo_queue::FifoQueue;
 
 #[test]
 fn fifo_queue_pops_in_insert_order() {
