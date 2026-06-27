@@ -174,7 +174,14 @@ impl Segment for Svm {
 
     fn alloc(&self, bytes: usize, align: usize) -> u64 {
         let mut free_list = self.inner.free_list.lock().expect("free_list mutex");
-        if let Some(idx) = free_list.iter().position(|(_, sz)| *sz >= bytes) {
+        let best_idx = free_list
+            .iter()
+            .enumerate()
+            .filter(|(_, (off, _))| (*off as usize) % align == 0)
+            .filter(|(_, (_, sz))| *sz >= bytes)
+            .min_by_key(|(_, (_, sz))| *sz)
+            .map(|(idx, _)| idx);
+        if let Some(idx) = best_idx {
             let (off, _) = free_list.swap_remove(idx);
             drop(free_list);
             return off;
