@@ -1,121 +1,56 @@
-use hammer_infra::align::{CACHE_LINE, align_up};
+use hammer_infra::align::align_up;
+use hammer_infra::segment::Segment;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum FifoSegmentMemoryKind {
-    ProcessLocal,
-    SharedMemory,
+/// Offsets for the four session queues within a shared segment.
+/// These are filled in by the dataplane when it pre-allocates session
+/// resources, then sent to the app process via SCM_RIGHTS.
+pub struct SessionOffsets {
+    pub rx_fifo_off: u64,
+    pub tx_fifo_off: u64,
+    pub evt_q_off: u64,
+    pub tx_evt_q_off: u64,
 }
 
-/// Offset layout for a future mmap-backed `FifoSegment` (Stage F). C1 only
-/// defines the layout record; nothing allocates from it yet. The record is
-/// offset-based and pointer-free so the same struct will describe both the
-/// in-process heap variant and the cross-process mmap variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct FifoSegmentLayout {
-    rx_fifo_offset: usize,
-    rx_fifo_bytes: usize,
-    tx_fifo_offset: usize,
-    tx_fifo_bytes: usize,
-    evt_q_offset: usize,
-    evt_q_bytes: usize,
-    cacheline_size: usize,
-    fifo_capacity: usize,
-    evt_q_capacity: usize,
-}
+impl SessionOffsets {
+    /// Pre-allocate all four session queues in `seg` and return their offsets.
+    /// `fifo_capacity` is the chunk count; `evt_q_capacity` is the desired
+    /// usable event count (one extra slot is reserved for the ring protocol).
+    pub fn allocate<S: Segment>(seg: &S, fifo_chunks: u32, evt_q_capacity: usize) -> Self {
+        let chunk_data_size = (fifo_chunks as usize).min(4096);
+        let per_chunk = 16 + chunk_data_size;
+        let fifo_total = align_up(192 + fifo_chunks as usize * per_chunk, 64);
+        let evt_q_ring = evt_q_capacity.saturating_add(1).next_power_of_two().max(2);
+        let msgq_total = align_up(16 + evt_q_ring * 8, 64);
 
-impl FifoSegmentLayout {
-    pub fn new(fifo_capacity: usize, evt_q_capacity: usize) -> Self {
-        // Stage F will compute exact byte sizes from Fifo/MsgQueue `#[repr(C)]`
-        // footprints. For C1 we use placeholder rounded sizes so the layout
-        // record exists and is usable in tests; Stage F replaces these with
-        // `size_of::<Fifo<Local>>()`/`size_of::<MsgQueue<Local>>()` once those
-        // types are mmap-friendly.
-        let rx_fifo_bytes = align_up(128, CACHE_LINE);
-        let tx_fifo_bytes = align_up(128, CACHE_LINE);
-        let evt_q_bytes = align_up(128, CACHE_LINE);
-        let rx_fifo_offset = 0;
-        let tx_fifo_offset = align_up(rx_fifo_offset + rx_fifo_bytes, CACHE_LINE);
-        let evt_q_offset = align_up(tx_fifo_offset + tx_fifo_bytes, CACHE_LINE);
-        Self {
-            rx_fifo_offset,
-            rx_fifo_bytes,
-            tx_fifo_offset,
-            tx_fifo_bytes,
-            evt_q_offset,
-            evt_q_bytes,
-            cacheline_size: CACHE_LINE,
-            fifo_capacity,
-            evt_q_capacity,
-        }
-    }
-
-    #[inline]
-    pub const fn rx_fifo_offset(self) -> usize {
-        self.rx_fifo_offset
-    }
-
-    #[inline]
-    pub const fn rx_fifo_bytes(self) -> usize {
-        self.rx_fifo_bytes
-    }
-
-    #[inline]
-    pub const fn tx_fifo_offset(self) -> usize {
-        self.tx_fifo_offset
-    }
-
-    #[inline]
-    pub const fn tx_fifo_bytes(self) -> usize {
-        self.tx_fifo_bytes
-    }
-
-    #[inline]
-    pub const fn evt_q_offset(self) -> usize {
-        self.evt_q_offset
-    }
-
-    #[inline]
-    pub const fn evt_q_bytes(self) -> usize {
-        self.evt_q_bytes
-    }
-
-    #[inline]
-    pub const fn cacheline_size(self) -> usize {
-        self.cacheline_size
-    }
-
-    #[inline]
-    pub const fn fifo_capacity(self) -> usize {
-        self.fifo_capacity
-    }
-
-    #[inline]
-    pub const fn evt_q_capacity(self) -> usize {
-        self.evt_q_capacity
-    }
-
-    /// Total segment bytes from origin to end of evt_q region.
-    #[inline]
-    pub const fn total_bytes(self) -> usize {
-        self.evt_q_offset + self.evt_q_bytes
+        let rx_fifo_off = seg.alloc(fifo_total, 64);
+        let tx_fifo_off = seg.alloc(fifo_total, 64);
+        let evt_q_off = seg.alloc(msgq_total, 64);
+        let tx_evt_q_off = seg.alloc(msgq_total, 64);
+        Self { rx_fifo_off, tx_fifo_off, evt_q_off, tx_evt_q_off }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hammer_infra::segment::Local;
 
     #[test]
-    fn fifo_segment_layout_orders_regions_and_aligns_to_cacheline() {
-        let layout = FifoSegmentLayout::new(64 * 1024, 16);
-        assert_eq!(layout.rx_fifo_offset(), 0);
-        assert!(layout.tx_fifo_offset() > layout.rx_fifo_offset());
-        assert_eq!(layout.tx_fifo_offset() % CACHE_LINE, 0);
-        assert!(layout.evt_q_offset() > layout.tx_fifo_offset());
-        assert_eq!(layout.evt_q_offset() % CACHE_LINE, 0);
-        assert_eq!(
-            layout.total_bytes(),
-            layout.evt_q_offset() + layout.evt_q_bytes()
-        );
+    fn session_offsets_allocates_all_four_queues() {
+        let seg = Local::new(1024 * 1024);
+        let offs = SessionOffsets::allocate(&seg, 32, 16);
+        assert!(offs.rx_fifo_off < offs.tx_fifo_off);
+        assert!(offs.tx_fifo_off < offs.evt_q_off);
+        assert!(offs.evt_q_off < offs.tx_evt_q_off);
+    }
+
+    #[test]
+    fn session_offsets_offsets_are_cachelined() {
+        let seg = Local::new(1024 * 1024);
+        let offs = SessionOffsets::allocate(&seg, 64, 32);
+        assert_eq!(offs.rx_fifo_off % 64, 0);
+        assert_eq!(offs.tx_fifo_off % 64, 0);
+        assert_eq!(offs.evt_q_off % 64, 0);
+        assert_eq!(offs.tx_evt_q_off % 64, 0);
     }
 }

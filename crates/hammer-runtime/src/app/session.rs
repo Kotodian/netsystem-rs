@@ -7,7 +7,10 @@ use hammer_infra::msg_queue::{MsgQueue, SessionEvt, SessionEvtType};
 use hammer_infra::segment::Segment;
 use tokio::sync::Notify;
 
+use std::os::fd::RawFd;
+
 use crate::app::SessionHandle;
+use crate::app::SessionOffsets;
 
 /// VPP-style app/session object: per-session byte FIFOs plus event queue.
 ///
@@ -76,6 +79,48 @@ impl<S: Segment> AppSession<S> {
         self.handle
     }
 
+    /// Reconstruct an app session from a pre-allocated shared segment.
+    /// Called by AttachClient (app process) after receiving offsets over
+    /// the Unix socket. The segment must already contain valid Fifo/MsgQueue
+    /// headers at the given offsets; the signal fds must be open for reading.
+    ///
+    /// # Safety
+    /// Caller must guarantee the segment is valid and the offsets point to
+    /// correctly initialised queue headers.
+    pub unsafe fn from_segment(
+        handle: SessionHandle,
+        seg: &S,
+        offsets: &SessionOffsets,
+        evt_q_read: Option<RawFd>,
+        evt_q_write: Option<RawFd>,
+        tx_evt_q_read: Option<RawFd>,
+        tx_evt_q_write: Option<RawFd>,
+    ) -> Self {
+        Self {
+            rx_fifo: Arc::new(unsafe {
+                Fifo::from_shared(seg.clone(), offsets.rx_fifo_off)
+            }),
+            tx_fifo: Arc::new(unsafe {
+                Fifo::from_shared(seg.clone(), offsets.tx_fifo_off)
+            }),
+            evt_q: Arc::new(unsafe {
+                MsgQueue::from_shared(seg.clone(), offsets.evt_q_off, evt_q_read, evt_q_write)
+            }),
+            tx_evt_q: Arc::new(unsafe {
+                MsgQueue::from_shared(
+                    seg.clone(),
+                    offsets.tx_evt_q_off,
+                    tx_evt_q_read,
+                    tx_evt_q_write,
+                )
+            }),
+            rx_readable: Notify::new(),
+            tx_writable: Notify::new(),
+            evt_readable: Notify::new(),
+            handle,
+        }
+    }
+
     /// Transport side: FIFO into which received bytes are copied.
     #[inline]
     pub fn rx_fifo(&self) -> &Arc<Fifo<S>> {
@@ -92,6 +137,13 @@ impl<S: Segment> AppSession<S> {
     #[inline]
     pub fn evt_q(&self) -> &Arc<MsgQueue<S>> {
         &self.evt_q
+    }
+
+    /// Accessor for the transport-side tx event queue consumer.
+    /// Used by SessionAppRuntime to drain tx completion events.
+    #[inline]
+    pub fn tx_evt_q(&self) -> &Arc<MsgQueue<S>> {
+        &self.tx_evt_q
     }
 
     /// App-side convenience: enqueue bytes to send (app → transport). Returns

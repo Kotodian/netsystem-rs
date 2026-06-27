@@ -8,6 +8,7 @@ pub mod adapter {
 pub use hammer_core::error::{HammerError, HammerResult};
 
 pub mod app;
+pub mod attach;
 mod component_registry;
 mod control_thread;
 mod data_plane;
