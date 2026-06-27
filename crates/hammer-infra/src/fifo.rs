@@ -1,6 +1,5 @@
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Mutex;
 
 use crate::segment::{Local, Segment};
 
@@ -33,11 +32,6 @@ pub struct FifoHeader {
     _pad2: [u8; 64 - (8 + 4)],
 }
 
-struct OooRange {
-    start: u32,
-    length: u32,
-}
-
 #[derive(Debug)]
 pub enum FifoError {
     InvalidCapacity,
@@ -47,7 +41,6 @@ pub struct Fifo<S: Segment> {
     seg: S,
     base: *mut u8,
     hdr: *mut FifoHeader,
-    ooo: Mutex<Vec<OooRange>>,
 }
 
 unsafe impl<S: Segment> Send for Fifo<S> {}
@@ -95,12 +88,7 @@ impl<S: Segment> Fifo<S> {
                 },
             );
         }
-        Ok(Self {
-            seg,
-            base,
-            hdr,
-            ooo: Mutex::new(Vec::new()),
-        })
+        Ok(Self { seg, base, hdr })
     }
 
     #[inline]
@@ -387,8 +375,6 @@ impl<S: Segment> Fifo<S> {
             let cur_tail = (*hdr).tail.load(Ordering::Relaxed);
             let new_tail = cur_tail.max(offset + written as u32);
             (*hdr).tail.store(new_tail, Ordering::Release);
-            let mut ranges = self.ooo.lock().unwrap();
-            insert_ooo_range(&mut ranges, offset, written as u32);
             written
         }
     }
@@ -398,21 +384,7 @@ impl<S: Segment> Fifo<S> {
         unsafe {
             let head = (*hdr).head.load(Ordering::Relaxed);
             let tail = (*hdr).tail.load(Ordering::Acquire);
-            let ranges = self.ooo.lock().unwrap();
-            if ranges.is_empty() {
-                return tail.wrapping_sub(head) as usize;
-            }
-            let mut pos = head;
-            let mut total = 0u32;
-            for range in ranges.iter() {
-                if range.start == pos {
-                    total += range.length;
-                    pos = range.start + range.length;
-                } else if range.start > pos {
-                    break;
-                }
-            }
-            total as usize
+            tail.wrapping_sub(head) as usize
         }
     }
 
@@ -522,7 +494,6 @@ impl<S: Segment> Fifo<S> {
             (*hdr).want_deq_ntf.store(0, Ordering::Relaxed);
             (*hdr).has_event.store(0, Ordering::Relaxed);
         }
-        *self.ooo.lock().unwrap() = Vec::new();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -536,6 +507,15 @@ impl<S: Segment> Fifo<S> {
     pub fn segment_fd(&self) -> Option<RawFd> {
         self.seg.fd()
     }
+
+    /// Reconstruct a [`Fifo`] from a shared-memory segment at the given
+    /// header offset. The caller must guarantee that the segment contains a
+    /// valid, initialised `FifoHeader` at `hdr_offset`.
+    pub unsafe fn from_shared(seg: S, hdr_offset: u64) -> Self {
+        let base = seg.base();
+        let hdr = unsafe { base.add(hdr_offset as usize) as *mut FifoHeader };
+        Self { seg, base, hdr }
+    }
 }
 
 impl Fifo<Local> {
@@ -547,47 +527,6 @@ impl Fifo<Local> {
         let seg = Local::new(size_of::<FifoHeader>() + capacity * (size_of::<Chunk>() + chunk_data_size));
         Self::new(seg, capacity)
     }
-}
-
-fn insert_ooo_range(ranges: &mut Vec<OooRange>, start: u32, length: u32) {
-    if length == 0 {
-        return;
-    }
-    let end = start + length;
-    let mut i = 0usize;
-    while i < ranges.len() {
-        let r = &ranges[i];
-        let r_end = r.start + r.length;
-        if end < r.start {
-            ranges.insert(i, OooRange { start, length });
-            return;
-        }
-        if start <= r_end && end >= r.start {
-            let new_start = start.min(r.start);
-            let new_end = end.max(r_end);
-            ranges[i] = OooRange {
-                start: new_start,
-                length: new_end - new_start,
-            };
-            while i + 1 < ranges.len() {
-                let next = &ranges[i + 1];
-                let next_end = next.start + next.length;
-                if new_end >= next.start {
-                    let merged_end = new_end.max(next_end);
-                    ranges[i] = OooRange {
-                        start: new_start,
-                        length: merged_end - new_start,
-                    };
-                    ranges.remove(i + 1);
-                } else {
-                    break;
-                }
-            }
-            return;
-        }
-        i += 1;
-    }
-    ranges.push(OooRange { start, length });
 }
 
 #[cfg(test)]
@@ -633,12 +572,10 @@ mod tests {
     }
 
     #[test]
-    fn enqueue_at_ooo_then_fill_gap() {
+    fn enqueue_at_writes_at_offset() {
         let f = fifo(1 << 16);
         assert_eq!(f.enqueue_at(4, b"world"), 5);
-        assert_eq!(f.max_dequeue(), 0);
         assert_eq!(f.enqueue_at(0, b"hell"), 4);
-        assert_eq!(f.max_dequeue(), 9);
         let mut buf = [0u8; 16];
         assert_eq!(f.peek(0, 9, &mut buf), 9);
         assert_eq!(&buf[..9], b"hellworld");
