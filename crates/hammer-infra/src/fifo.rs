@@ -360,6 +360,10 @@ impl<S: Segment> Fifo<S> {
                         }
                         remaining_offset.max(prev_end)
                     } else {
+                        (*hdr).start_chunk = new_off;
+                        (*hdr).end_chunk = new_off;
+                        (*hdr).head_chunk = new_off;
+                        (*hdr).tail_chunk = new_off;
                         remaining_offset
                     };
                     let new_chunk = &mut *(self.base.add(new_off as usize) as *mut Chunk);
