@@ -225,6 +225,17 @@ impl<S: Segment> MsgQueue<S> {
     }
 }
 
+impl<S: Segment> Drop for MsgQueue<S> {
+    fn drop(&mut self) {
+        if let Some(fd) = self.signal_read {
+            unsafe { libc::close(fd); }
+        }
+        if let Some(fd) = self.signal_write {
+            unsafe { libc::close(fd); }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
