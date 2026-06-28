@@ -53,11 +53,10 @@ pub fn start_workers(engine: &mut Engine) -> HammerResult<()> {
     Ok(())
 }
 
-fn worker_main(_idx: u32, engine: Engine) {
-    // TODO(C4): call engine.runtime.init_graph(worker=idx as usize, entries)
-    //           and enter engine_main_loop
-    // engine.runtime.init_graph(worker as usize, &[]);
-    // engine_main_loop(&engine);
+fn worker_main(_: u32, engine: Engine) {
+    // TODO(C4): replace stub loop with engine_main_loop(&engine)
+    // engine_init_graph(&engine.runtime, idx) must also be called
+    // before entering the loop.
     let wait = engine.wait_at_barrier;
     let workers = engine.workers_at_barrier;
     loop {
