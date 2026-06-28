@@ -1310,6 +1310,12 @@ pub async fn yield_local_now() {
     YieldLocal { yielded: false }.await
 }
 
+pub(crate) fn set_data_plane_runtime(runtime: RuntimeDataPlaneRuntime) {
+    DATA_PLANE_RUNTIME.with(|slot| {
+        *slot.borrow_mut() = Some(runtime);
+    });
+}
+
 pub(crate) fn with_data_plane_runtime<R>(f: impl FnOnce(&RuntimeDataPlaneRuntime) -> R) -> R {
     DATA_PLANE_RUNTIME.with(|runtime| {
         f(runtime

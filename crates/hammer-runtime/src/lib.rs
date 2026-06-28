@@ -24,6 +24,7 @@ mod numa;
 pub mod protocol;
 mod socket_protector;
 pub mod spawn;
+pub mod start_workers;
 mod worker_thread;
 
 pub use component_registry::{
