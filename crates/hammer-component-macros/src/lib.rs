@@ -1424,8 +1424,8 @@ pub fn init_function(args: TokenStream, input: TokenStream) -> TokenStream {
     let expanded = quote! {
         #fn_item
 
-        #[::linkme::distributed_slice(::hammer_core::init::INIT_FUNCTIONS)]
-        static #static_ident: ::hammer_core::init::InitFunction = ::hammer_core::init::InitFunction {
+        #[::linkme::distributed_slice(::hammer_runtime::init::INIT_FUNCTIONS)]
+        static #static_ident: ::hammer_runtime::init::InitFunction = ::hammer_runtime::init::InitFunction {
             name: #name,
             runs_before: &[#(#runs_before),*],
             runs_after: &[#(#runs_after),*],
@@ -1451,16 +1451,16 @@ pub fn config_function(args: TokenStream, input: TokenStream) -> TokenStream {
     let early = args.early;
     let static_ident = init_function_static_name(&name);
     let slice = if early {
-        quote!(::hammer_core::init::EARLY_CONFIG_FUNCTIONS)
+        quote!(::hammer_runtime::init::EARLY_CONFIG_FUNCTIONS)
     } else {
-        quote!(::hammer_core::init::CONFIG_FUNCTIONS)
+        quote!(::hammer_runtime::init::CONFIG_FUNCTIONS)
     };
 
     let expanded = quote! {
         #fn_item
 
         #[::linkme::distributed_slice(#slice)]
-        static #static_ident: ::hammer_core::init::ConfigFunction = ::hammer_core::init::ConfigFunction {
+        static #static_ident: ::hammer_runtime::init::ConfigFunction = ::hammer_runtime::init::ConfigFunction {
             name: #name,
             func: #fn_name,
         };
@@ -1471,7 +1471,8 @@ pub fn config_function(args: TokenStream, input: TokenStream) -> TokenStream {
 /// Shorthand for `#[config_function(name = "...", early = true)]`.
 #[proc_macro_attribute]
 pub fn early_config_function(args: TokenStream, input: TokenStream) -> TokenStream {
-    let attr: proc_macro2::TokenStream = quote!(name = #args, early = true);
+    let args: proc_macro2::TokenStream = args.into();
+    let attr = quote!(name = #args, early = true);
     config_function(attr.into(), input)
 }
 
@@ -1496,8 +1497,8 @@ pub fn main_loop_enter_function(args: TokenStream, input: TokenStream) -> TokenS
     let expanded = quote! {
         #fn_item
 
-        #[::linkme::distributed_slice(::hammer_core::init::MAIN_LOOP_ENTER_FUNCTIONS)]
-        static #static_ident: ::hammer_core::init::InitFunction = ::hammer_core::init::InitFunction {
+        #[::linkme::distributed_slice(::hammer_runtime::init::MAIN_LOOP_ENTER_FUNCTIONS)]
+        static #static_ident: ::hammer_runtime::init::InitFunction = ::hammer_runtime::init::InitFunction {
             name: stringify!(#fn_name),
             runs_before: &[],
             runs_after: &[],
@@ -1522,8 +1523,8 @@ pub fn main_loop_exit_function(args: TokenStream, input: TokenStream) -> TokenSt
     let expanded = quote! {
         #fn_item
 
-        #[::linkme::distributed_slice(::hammer_core::init::MAIN_LOOP_EXIT_FUNCTIONS)]
-        static #static_ident: ::hammer_core::init::InitFunction = ::hammer_core::init::InitFunction {
+        #[::linkme::distributed_slice(::hammer_runtime::init::MAIN_LOOP_EXIT_FUNCTIONS)]
+        static #static_ident: ::hammer_runtime::init::InitFunction = ::hammer_runtime::init::InitFunction {
             name: stringify!(#fn_name),
             runs_before: &[],
             runs_after: &[],
@@ -1552,8 +1553,8 @@ pub fn worker_init_function(args: TokenStream, input: TokenStream) -> TokenStrea
     let expanded = quote! {
         #fn_item
 
-        #[::linkme::distributed_slice(::hammer_core::init::WORKER_INIT_FUNCTIONS)]
-        static #static_ident: ::hammer_core::init::InitFunction = ::hammer_core::init::InitFunction {
+        #[::linkme::distributed_slice(::hammer_runtime::init::WORKER_INIT_FUNCTIONS)]
+        static #static_ident: ::hammer_runtime::init::InitFunction = ::hammer_runtime::init::InitFunction {
             name: #name,
             runs_before: &[],
             runs_after: &[#(#runs_after),*],

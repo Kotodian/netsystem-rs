@@ -1,6 +1,9 @@
 // Re-export adapter types so the macros don't need fully-qualified paths and
 // downstream call sites can `use hammer_runtime::adapter::Lifecycle` if they
 // prefer the runtime crate's namespace.
+pub mod engine;
+pub mod init;
+
 pub mod adapter {
     pub use hammer_adapter::*;
 }

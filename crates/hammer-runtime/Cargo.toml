@@ -17,6 +17,10 @@ hammer-core = { path = "../hammer-core" }
 hammer-adapter = { path = "../hammer-adapter" }
 hammer-infra = { path = "../hammer-infra" }
 hammer-component-macros = { path = "../hammer-component-macros" }
+linkme = { workspace = true }
+petgraph = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true }
