@@ -93,8 +93,8 @@ impl EnginePool {
 mod tests {
     use super::*;
     use hammer_adapter::DataPlaneRuntime;
-    use std::sync::Arc;
     use hammer_core::registry::RuntimeRegistry;
+    use std::sync::Arc;
 
     fn test_engine() -> Engine {
         Engine::new(
@@ -117,20 +117,31 @@ mod tests {
         let main = test_engine();
         let worker = main.spawn(1);
         assert!(Arc::ptr_eq(&main.wait_at_barrier, &worker.wait_at_barrier));
-        assert!(Arc::ptr_eq(&main.workers_at_barrier, &worker.workers_at_barrier));
+        assert!(Arc::ptr_eq(
+            &main.workers_at_barrier,
+            &worker.workers_at_barrier
+        ));
     }
 
     #[test]
     fn spawn_resets_loop_count_and_exit_flag() {
         let main = test_engine();
-        main.main_loop_count.store(42, std::sync::atomic::Ordering::Relaxed);
-        main.main_loop_exit_now.store(true, std::sync::atomic::Ordering::Relaxed);
+        main.main_loop_count
+            .store(42, std::sync::atomic::Ordering::Relaxed);
+        main.main_loop_exit_now
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let worker = main.spawn(1);
         assert_eq!(
-            worker.main_loop_count.load(std::sync::atomic::Ordering::Relaxed),
+            worker
+                .main_loop_count
+                .load(std::sync::atomic::Ordering::Relaxed),
             0
         );
-        assert!(!worker.main_loop_exit_now.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            !worker
+                .main_loop_exit_now
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
 
     #[test]

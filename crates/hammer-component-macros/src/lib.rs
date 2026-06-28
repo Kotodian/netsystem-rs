@@ -1286,9 +1286,14 @@ impl Parse for InitFnArgs {
                 }
                 "runs_before" => runs_before = parse_litstr_array(input)?,
                 "runs_after" => runs_after = parse_litstr_array(input)?,
-                other => return Err(Error::new(key.span(), format!(
-                    "unknown argument `{other}`; expected `name`, `runs_before`, or `runs_after`"
-                ))),
+                other => {
+                    return Err(Error::new(
+                        key.span(),
+                        format!(
+                            "unknown argument `{other}`; expected `name`, `runs_before`, or `runs_after`"
+                        ),
+                    ));
+                }
             }
             if input.parse::<Option<Token![,]>>()?.is_none() {
                 break;
@@ -1332,9 +1337,12 @@ impl Parse for ConfigFnArgs {
                         _ => return Err(Error::new(v.span(), "expected `true` or `false`")),
                     });
                 }
-                other => return Err(Error::new(key.span(), format!(
-                    "unknown argument `{other}`; expected `name` or `early`"
-                ))),
+                other => {
+                    return Err(Error::new(
+                        key.span(),
+                        format!("unknown argument `{other}`; expected `name` or `early`"),
+                    ));
+                }
             }
             if input.parse::<Option<Token![,]>>()?.is_none() {
                 break;
@@ -1367,9 +1375,12 @@ impl Parse for WorkerInitFnArgs {
                     name = Some(input.parse()?);
                 }
                 "runs_after" => runs_after = parse_litstr_array(input)?,
-                other => return Err(Error::new(key.span(), format!(
-                    "unknown argument `{other}`; expected `name` or `runs_after`"
-                ))),
+                other => {
+                    return Err(Error::new(
+                        key.span(),
+                        format!("unknown argument `{other}`; expected `name` or `runs_after`"),
+                    ));
+                }
             }
             if input.parse::<Option<Token![,]>>()?.is_none() {
                 break;
@@ -1399,7 +1410,13 @@ fn init_function_static_name(fn_name: &LitStr) -> Ident {
     let name_str = fn_name.value();
     let sanitized: String = name_str
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     format_ident!("__INIT_FN_{}", sanitized.to_ascii_uppercase())
 }
@@ -1486,9 +1503,12 @@ pub fn early_config_function(args: TokenStream, input: TokenStream) -> TokenStre
 #[proc_macro_attribute]
 pub fn main_loop_enter_function(args: TokenStream, input: TokenStream) -> TokenStream {
     if !args.is_empty() {
-        return Error::new(Span::call_site(), "`main_loop_enter_function` does not accept arguments")
-            .to_compile_error()
-            .into();
+        return Error::new(
+            Span::call_site(),
+            "`main_loop_enter_function` does not accept arguments",
+        )
+        .to_compile_error()
+        .into();
     }
     let fn_item = parse_macro_input!(input as syn::ItemFn);
     let fn_name = &fn_item.sig.ident;
@@ -1512,9 +1532,12 @@ pub fn main_loop_enter_function(args: TokenStream, input: TokenStream) -> TokenS
 #[proc_macro_attribute]
 pub fn main_loop_exit_function(args: TokenStream, input: TokenStream) -> TokenStream {
     if !args.is_empty() {
-        return Error::new(Span::call_site(), "`main_loop_exit_function` does not accept arguments")
-            .to_compile_error()
-            .into();
+        return Error::new(
+            Span::call_site(),
+            "`main_loop_exit_function` does not accept arguments",
+        )
+        .to_compile_error()
+        .into();
     }
     let fn_item = parse_macro_input!(input as syn::ItemFn);
     let fn_name = &fn_item.sig.ident;

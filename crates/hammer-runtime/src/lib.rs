@@ -16,6 +16,7 @@ pub mod attach;
 mod component_registry;
 mod control_thread;
 mod data_plane;
+pub use data_plane::new_worker_runtime;
 pub mod graph;
 mod macros;
 mod numa;

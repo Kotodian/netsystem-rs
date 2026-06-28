@@ -378,7 +378,7 @@ impl RuntimeService<Local> {
         let registry = RuntimeRegistry::new();
         registry.set::<config::Config>(Arc::new(config.clone()));
         let mut engine = hammer_runtime::Engine::new(
-            hammer_adapter::DataPlaneRuntime::with_buffer_capacity(
+            hammer_runtime::new_worker_runtime(
                 worker.buffer.slot_bytes,
                 worker.buffer.slots_per_numa,
             ),

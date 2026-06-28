@@ -10,7 +10,10 @@ pub enum InitError {
     #[error("duplicate function name `{0}`")]
     DuplicateName(&'static str),
     #[error("`{name}` references unregistered dependency `{dep}`")]
-    UnresolvedDependency { name: &'static str, dep: &'static str },
+    UnresolvedDependency {
+        name: &'static str,
+        dep: &'static str,
+    },
     #[error("dependency cycle: {cycle}")]
     Cycle { cycle: String },
 }
@@ -23,8 +26,12 @@ impl From<InitError> for CoreError {
 
 pub trait Ordered {
     fn name(&self) -> &'static str;
-    fn runs_before(&self) -> &'static [&'static str] { &[] }
-    fn runs_after(&self) -> &'static [&'static str] { &[] }
+    fn runs_before(&self) -> &'static [&'static str] {
+        &[]
+    }
+    fn runs_after(&self) -> &'static [&'static str] {
+        &[]
+    }
 }
 
 pub struct InitFunction {
@@ -35,9 +42,15 @@ pub struct InitFunction {
 }
 
 impl Ordered for InitFunction {
-    fn name(&self) -> &'static str { self.name }
-    fn runs_before(&self) -> &'static [&'static str] { self.runs_before }
-    fn runs_after(&self) -> &'static [&'static str] { self.runs_after }
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    fn runs_before(&self) -> &'static [&'static str] {
+        self.runs_before
+    }
+    fn runs_after(&self) -> &'static [&'static str] {
+        self.runs_after
+    }
 }
 
 pub struct ConfigFunction {
@@ -46,7 +59,9 @@ pub struct ConfigFunction {
 }
 
 impl Ordered for ConfigFunction {
-    fn name(&self) -> &'static str { self.name }
+    fn name(&self) -> &'static str {
+        self.name
+    }
 }
 
 #[linkme::distributed_slice]
@@ -93,16 +108,18 @@ pub fn topological_order<T: Ordered>(items: &[T]) -> Result<Vec<usize>, InitErro
         }
         for before in item.runs_before() {
             if !graph.contains_node(*before) {
-                return Err(InitError::UnresolvedDependency { name: n, dep: *before });
+                return Err(InitError::UnresolvedDependency {
+                    name: n,
+                    dep: *before,
+                });
             }
             graph.add_edge(n, *before, ());
         }
     }
 
-    let ordered = toposort(&graph, None)
-        .map_err(|cycle| InitError::Cycle {
-            cycle: cycle.node_id().to_string(),
-        })?;
+    let ordered = toposort(&graph, None).map_err(|cycle| InitError::Cycle {
+        cycle: cycle.node_id().to_string(),
+    })?;
 
     let mut result = Vec::with_capacity(items.len());
     for name in ordered {
@@ -166,7 +183,11 @@ mod tests {
     use super::*;
 
     fn mock(
-        specs: &[(&'static str, &'static [&'static str], &'static [&'static str])],
+        specs: &[(
+            &'static str,
+            &'static [&'static str],
+            &'static [&'static str],
+        )],
     ) -> Vec<InitFunction> {
         specs
             .iter()
@@ -193,7 +214,10 @@ mod tests {
         let err = topological_order(&fns).expect_err("must fail");
         assert!(matches!(
             err,
-            InitError::UnresolvedDependency { name: "a", dep: "ghost" }
+            InitError::UnresolvedDependency {
+                name: "a",
+                dep: "ghost"
+            }
         ));
     }
 
