@@ -105,3 +105,40 @@ pub(crate) fn engine_main_loop(
 /// Dispatch main-loop callbacks. Currently a no-op — hook for future
 /// per-iteration callback registration.
 pub(crate) fn dispatch_main_loop_callbacks() {}
+
+#[cfg(test)]
+mod tests {
+    use crate::engine::Engine;
+    use crate::spawn::DataRemoteLocalQueue;
+    use hammer_adapter::DataPlaneRuntime;
+    use hammer_core::registry::RuntimeRegistry;
+
+    #[test]
+    fn engine_main_loop_exits_on_flag() {
+        let rt = DataPlaneRuntime::with_buffer_capacity(64, 4);
+        crate::spawn::set_data_plane_runtime(rt.clone());
+
+        let engine = Engine::new(rt, RuntimeRegistry::new());
+        engine
+            .main_loop_exit_now
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime for test");
+
+        let remote_local = DataRemoteLocalQueue::default();
+        remote_local.attach_current_thread();
+
+        let start = std::time::Instant::now();
+        let status = super::engine_main_loop(&engine, &tokio_rt, &remote_local);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "engine_main_loop should exit quickly when main_loop_exit_now is set, took {elapsed:?}"
+        );
+        assert_eq!(status, 0);
+    }
+}
