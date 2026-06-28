@@ -387,6 +387,8 @@ impl RuntimeService<Local> {
         hammer_runtime::init::run_init_functions(&mut engine)?;
         let listener_state = RuntimeTcpListenerControlState::new()?;
         let handoff_node_handle = NodeHandle::new(worker.handoff.node_handle);
+        let _ = crate::packet_graph::WORKER_HANDOFF_NODE_HANDLE.set(handoff_node_handle);
+
         let worker_graph_nodes = data_context.install_on_workers(move |worker, runtime| {
             let runtime = runtime
                 .clone()

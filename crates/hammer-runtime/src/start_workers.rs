@@ -58,7 +58,9 @@ pub fn start_workers(engine: &mut Engine) -> HammerResult<()> {
     Ok(())
 }
 
-fn worker_main(idx: u32, engine: Engine) {
+fn worker_main(idx: u32, mut engine: Engine) {
+    let _ = crate::init::run_worker_init_functions(&mut engine);
+
     let tokio_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
