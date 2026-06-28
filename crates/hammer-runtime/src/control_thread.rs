@@ -3,8 +3,8 @@ mod timer;
 
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -354,14 +354,12 @@ impl ControlThreadHandle {
         }
     }
 
-    pub fn set_barrier_arcs(
-        &self,
-        wait: Arc<AtomicU32>,
-        workers: Arc<AtomicU32>,
-        n_workers: u32,
-    ) {
-        *self.barrier_state.lock().expect("barrier_state lock") =
-            Some(BarrierArcs { wait, workers, n_workers });
+    pub fn set_barrier_arcs(&self, wait: Arc<AtomicU32>, workers: Arc<AtomicU32>, n_workers: u32) {
+        *self.barrier_state.lock().expect("barrier_state lock") = Some(BarrierArcs {
+            wait,
+            workers,
+            n_workers,
+        });
     }
 
     pub fn control_call_with_barrier<R>(
@@ -374,9 +372,7 @@ impl ControlThreadHandle {
         let (wait, workers, n_workers) = {
             let guard = self.barrier_state.lock().expect("barrier_state lock");
             let s = guard.as_ref().ok_or_else(|| {
-                HammerError::internal(
-                    "control_call_with_barrier: barrier not configured",
-                )
+                HammerError::internal("control_call_with_barrier: barrier not configured")
             })?;
             (Arc::clone(&s.wait), Arc::clone(&s.workers), s.n_workers)
         };

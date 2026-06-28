@@ -94,7 +94,8 @@ pub fn engine_main_loop(
 
         // Step 9: Exit check
         if engine.main_loop_exit_now.load(Ordering::Relaxed) {
-            let status = *engine.main_loop_exit_status
+            let status = *engine
+                .main_loop_exit_status
                 .lock()
                 .expect("engine_main_loop: poisoned exit status mutex");
             return status;

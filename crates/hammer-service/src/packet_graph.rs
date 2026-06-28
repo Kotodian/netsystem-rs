@@ -17,9 +17,7 @@ pub static SERVICE_GRAPH_NODES: [NodeEntry] = [..];
 #[worker_init_function(name = "install_worker_graph")]
 pub fn install_worker_graph(engine: &mut Engine) -> HammerResult<()> {
     let handle = *WORKER_HANDOFF_NODE_HANDLE.get().ok_or_else(|| {
-        hammer_core::error::CoreError::internal(
-            "install_worker_graph: handoff node handle not set",
-        )
+        hammer_core::error::CoreError::internal("install_worker_graph: handoff node handle not set")
     })?;
 
     engine.runtime = engine.runtime.clone().with_handoff_node_handle(handle);

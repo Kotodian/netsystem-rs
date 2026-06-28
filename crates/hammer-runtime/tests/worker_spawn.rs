@@ -30,9 +30,8 @@ fn worker_spawn_engine_main_loop_exits() {
                 .expect("build tokio runtime");
 
             engine.main_loop_exit_now.store(true, Ordering::Relaxed);
-            let status = hammer_runtime::main_loop::engine_main_loop(
-                &engine, &tokio_rt, &remote_local,
-            );
+            let status =
+                hammer_runtime::main_loop::engine_main_loop(&engine, &tokio_rt, &remote_local);
             assert_eq!(0, status, "worker {idx} exit status");
         });
         handles.push(handle);

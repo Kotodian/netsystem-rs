@@ -94,7 +94,7 @@ impl MacosKqueueWakeup {
         // another thread to wake the worker.
         let mut change = libc::kevent {
             ident: 1,
-            filter: libc::EVFILT_USER as i16,
+            filter: libc::EVFILT_USER,
             flags: libc::EV_ADD | libc::EV_CLEAR | libc::EV_RECEIPT,
             fflags: 0,
             data: 0,
@@ -130,7 +130,7 @@ impl WakeupFd for MacosKqueueWakeup {
     fn wake(&self) {
         let ev = libc::kevent {
             ident: self.ident,
-            filter: libc::EVFILT_USER as i16,
+            filter: libc::EVFILT_USER,
             flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT,
             fflags: libc::NOTE_TRIGGER | libc::NOTE_FFNOP,
             data: 0,
@@ -148,7 +148,7 @@ impl WakeupFd for MacosKqueueWakeup {
     fn consume(&self) {
         let ev = libc::kevent {
             ident: self.ident,
-            filter: libc::EVFILT_USER as i16,
+            filter: libc::EVFILT_USER,
             flags: libc::EV_ADD | libc::EV_CLEAR,
             fflags: 0,
             data: 0,
