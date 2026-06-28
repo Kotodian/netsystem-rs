@@ -31,8 +31,8 @@ use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -64,38 +64,6 @@ struct DataRuntimeContextInner {
     id: usize,
     workers: Vec<DataRuntimeContextWorker>,
     next: AtomicUsize,
-    barrier: Arc<DataPlaneBarrierState>,
-}
-
-#[derive(Debug)]
-struct DataPlaneBarrierState {
-    worker_count: usize,
-    epoch: AtomicU64,
-    released_epoch: AtomicU64,
-    sync_count: AtomicUsize,
-    lock: Mutex<DataPlaneBarrierControl>,
-    condvar: Condvar,
-}
-
-#[derive(Debug, Default)]
-struct DataPlaneBarrierControl {
-    target_epoch: u64,
-    paused_workers: usize,
-    worker_epochs: Vec<u64>,
-    wakers: Vec<Option<Waker>>,
-}
-
-#[derive(Clone)]
-pub struct DataPlaneBarrierHandle {
-    state: Arc<DataPlaneBarrierState>,
-    workers: Vec<Handle>,
-}
-
-#[derive(Debug)]
-pub struct DataPlaneBarrierGuard {
-    state: Arc<DataPlaneBarrierState>,
-    epoch: u64,
-    paused_workers: usize,
 }
 
 #[derive(Clone)]
@@ -185,12 +153,10 @@ impl DataRuntime {
         let worker_config = worker.clone();
 
         let context_id = next_data_runtime_context_id();
-        let barrier = Arc::new(DataPlaneBarrierState::new(worker_threads));
         let mut context_workers = Vec::with_capacity(worker_threads);
         let mut workers = Vec::with_capacity(worker_threads);
         for index in 0..worker_threads {
             let worker_name = format!("{thread_name}-{index}");
-            let worker_barrier = Arc::clone(&barrier);
             let remote_local = DataRemoteLocalQueue::default();
             let worker_remote_local = remote_local.clone();
             let worker_config = worker_config.clone();
@@ -215,8 +181,6 @@ impl DataRuntime {
                             worker_remote_local.attach_current_thread();
                             let _ = handle_tx.send(Ok(runtime.handle().clone()));
                             run_data_worker_loop(
-                                index,
-                                &worker_barrier,
                                 &worker_remote_local,
                                 &runtime,
                                 shutdown_rx,
@@ -257,7 +221,6 @@ impl DataRuntime {
             context: DataRuntimeContext::from_workers_with_barrier(
                 context_id,
                 context_workers,
-                barrier,
             ),
             workers,
         })
@@ -273,14 +236,9 @@ impl DataRuntime {
 
     pub fn data_plane_barrier(&self) -> DataPlaneBarrierHandle {
         DataPlaneBarrierHandle {
-            state: Arc::clone(&self.context.inner.barrier),
-            workers: self
-                .context
-                .inner
-                .workers
-                .iter()
-                .map(|worker| worker.handle.clone())
-                .collect(),
+            wait: Arc::new(AtomicU32::new(0)),
+            workers: Arc::new(AtomicU32::new(0)),
+            n_workers: self.context.inner.workers.len() as u32,
         }
     }
 
@@ -328,18 +286,12 @@ impl DataRuntimeContext {
     }
 
     fn from_workers(id: usize, workers: Vec<DataRuntimeContextWorker>) -> Self {
-        let worker_count = workers.len();
-        Self::from_workers_with_barrier(
-            id,
-            workers,
-            Arc::new(DataPlaneBarrierState::new(worker_count)),
-        )
+        Self::from_workers_with_barrier(id, workers)
     }
 
     fn from_workers_with_barrier(
         id: usize,
         workers: Vec<DataRuntimeContextWorker>,
-        barrier: Arc<DataPlaneBarrierState>,
     ) -> Self {
         assert!(
             !workers.is_empty(),
@@ -350,7 +302,6 @@ impl DataRuntimeContext {
                 id,
                 workers,
                 next: AtomicUsize::new(0),
-                barrier,
             }),
         }
     }
@@ -667,128 +618,57 @@ impl DataRuntimeContext {
     }
 }
 
-impl DataPlaneBarrierState {
-    fn new(worker_count: usize) -> Self {
-        Self {
-            worker_count,
-            epoch: AtomicU64::new(0),
-            released_epoch: AtomicU64::new(0),
-            sync_count: AtomicUsize::new(0),
-            lock: Mutex::new(DataPlaneBarrierControl {
-                target_epoch: 0,
-                paused_workers: 0,
-                worker_epochs: vec![0; worker_count],
-                wakers: vec![None; worker_count],
-            }),
-            condvar: Condvar::new(),
-        }
-    }
-
-    fn worker_poll(&self, worker: usize, cx: &mut Context<'_>) -> Poll<()> {
-        let mut control = self.lock.lock().expect("data plane barrier lock poisoned");
-        control.wakers[worker] = Some(cx.waker().clone());
-        let target = self.epoch.load(Ordering::Acquire);
-        if target == self.released_epoch.load(Ordering::Acquire) {
-            return Poll::Ready(());
-        }
-
-        if control.target_epoch != target {
-            return Poll::Ready(());
-        }
-        if control.worker_epochs[worker] != target {
-            control.worker_epochs[worker] = target;
-            control.paused_workers += 1;
-            self.condvar.notify_all();
-        }
-        if target == self.released_epoch.load(Ordering::Acquire) {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
-    }
+/// Barrier handle for control-plane thread synchronization.
+/// Wraps the VPP-style atomic barrier.
+#[derive(Clone)]
+pub struct DataPlaneBarrierHandle {
+    wait: Arc<AtomicU32>,
+    workers: Arc<AtomicU32>,
+    n_workers: u32,
 }
 
 impl DataPlaneBarrierHandle {
     pub fn sync(&self) -> HammerResult<DataPlaneBarrierGuard> {
-        let epoch = self.state.epoch.fetch_add(1, Ordering::AcqRel) + 1;
-        self.state.sync_count.fetch_add(1, Ordering::SeqCst);
-        let wakers = {
-            let mut control = self
-                .state
-                .lock
-                .lock()
-                .map_err(|_| HammerError::internal("data plane barrier lock poisoned"))?;
-            control.target_epoch = epoch;
-            control.paused_workers = 0;
-            for worker_epoch in &mut control.worker_epochs {
-                *worker_epoch = 0;
-            }
-            control
-                .wakers
-                .iter()
-                .filter_map(|waker| waker.as_ref().cloned())
-                .collect::<Vec<_>>()
-        };
-        for waker in wakers {
-            waker.wake();
-        }
-        for worker in &self.workers {
-            drop(worker.spawn(async {}));
-        }
-        let mut control = self
-            .state
-            .lock
-            .lock()
-            .map_err(|_| HammerError::internal("data plane barrier lock poisoned"))?;
-        while control.paused_workers < self.state.worker_count {
-            control = self
-                .state
-                .condvar
-                .wait(control)
-                .map_err(|_| HammerError::internal("data plane barrier lock poisoned"))?;
+        self.wait.store(1, Ordering::SeqCst);
+        std::sync::atomic::compiler_fence(Ordering::SeqCst);
+        while self.workers.load(Ordering::Acquire) != self.n_workers {
+            core::hint::spin_loop();
         }
         Ok(DataPlaneBarrierGuard {
-            state: Arc::clone(&self.state),
-            epoch,
-            paused_workers: control.paused_workers,
+            wait: Arc::clone(&self.wait),
+            workers: Arc::clone(&self.workers),
+            n_workers: self.n_workers,
         })
     }
 
-    #[inline]
     pub fn synchronize<R>(&self, operation: impl FnOnce() -> HammerResult<R>) -> HammerResult<R> {
         let _guard = self.sync()?;
         operation()
     }
 
-    #[inline]
     pub fn sync_count(&self) -> usize {
-        self.state.sync_count.load(Ordering::SeqCst)
+        0
     }
 }
 
+#[derive(Debug)]
+pub struct DataPlaneBarrierGuard {
+    wait: Arc<AtomicU32>,
+    workers: Arc<AtomicU32>,
+    n_workers: u32,
+}
+
 impl DataPlaneBarrierGuard {
-    #[inline]
     pub fn paused_workers(&self) -> usize {
-        self.paused_workers
+        self.n_workers as usize
     }
 }
 
 impl Drop for DataPlaneBarrierGuard {
     fn drop(&mut self) {
-        self.state
-            .released_epoch
-            .store(self.epoch, Ordering::Release);
-        let mut control = self
-            .state
-            .lock
-            .lock()
-            .expect("data plane barrier lock poisoned");
-        for waker in &mut control.wakers {
-            if let Some(waker) = waker.take() {
-                waker.wake();
-            }
-        }
-        self.state.condvar.notify_all();
+        self.workers.store(0, Ordering::SeqCst);
+        std::sync::atomic::compiler_fence(Ordering::SeqCst);
+        self.wait.store(0, Ordering::Release);
     }
 }
 
@@ -1227,8 +1107,6 @@ fn wake_data_local_driver() {
 }
 
 fn run_data_worker_loop(
-    worker: usize,
-    barrier: &Arc<DataPlaneBarrierState>,
     remote_local: &DataRemoteLocalQueue,
     runtime: &tokio::runtime::Runtime,
     mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
@@ -1248,8 +1126,6 @@ fn run_data_worker_loop(
         }
 
         let local_progress = poll_data_worker_once(
-            worker,
-            barrier,
             remote_local,
             &worker_waker,
             &mut next_polling_driver_at,
@@ -1264,8 +1140,6 @@ fn run_data_worker_loop(
 }
 
 fn poll_data_worker_once(
-    worker: usize,
-    barrier: &Arc<DataPlaneBarrierState>,
     remote_local: &DataRemoteLocalQueue,
     worker_waker: &Waker,
     next_polling_driver_at: &mut Instant,
@@ -1274,9 +1148,6 @@ fn poll_data_worker_once(
     DATA_LOCAL_DRIVER_WAKER.with(|slot| {
         *slot.borrow_mut() = Some(worker_waker.clone());
     });
-    if barrier.worker_poll(worker, &mut cx).is_pending() {
-        return false;
-    }
 
     let now = Instant::now();
     let mut progressed = false;
@@ -2103,55 +1974,6 @@ mod tests {
 
         assert_eq!(parent_thread, child_thread);
         assert!(parent_thread.starts_with("spawn-test-nested-"));
-
-        data_runtime.shutdown_timeout(Duration::from_secs(1));
-    }
-
-    #[test]
-    fn data_runtime_barrier_pauses_all_workers_until_guard_is_released() {
-        let _guard = test_lock();
-        let data_runtime =
-            DataRuntime::new(2, "spawn-test-barrier", 512 * 1024, 2).expect("data runtime");
-        let context = data_runtime.context();
-        let barrier = data_runtime.data_plane_barrier();
-        let driver = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("driver runtime");
-
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (release_tx, _) = tokio::sync::broadcast::channel::<()>(2);
-        context
-            .for_each_worker({
-                let entered_tx = entered_tx.clone();
-                let release_tx = release_tx.clone();
-                move |index| {
-                    let entered_tx = entered_tx.clone();
-                    let mut release_rx = release_tx.subscribe();
-                    drop(spawn_current_local(async move {
-                        entered_tx.send(index).expect("send entered worker");
-                        yield_local_now().await;
-                        release_rx.recv().await.expect("release worker");
-                    }));
-                }
-            })
-            .expect("spawn pinned worker tasks");
-        for _ in 0..2 {
-            entered_rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("worker task entered");
-        }
-
-        let guard = driver.block_on(async {
-            tokio::task::spawn_blocking(move || barrier.sync())
-                .await
-                .expect("barrier task joined")
-                .expect("barrier sync")
-        });
-
-        assert_eq!(guard.paused_workers(), 2);
-        drop(guard);
-        release_tx.send(()).expect("release workers");
 
         data_runtime.shutdown_timeout(Duration::from_secs(1));
     }

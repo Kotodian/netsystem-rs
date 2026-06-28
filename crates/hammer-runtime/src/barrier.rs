@@ -1,0 +1,166 @@
+use core::hint::spin_loop;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+
+/// RAII guard that releases the barrier when dropped.
+/// The control thread holds this while mutating shared state.
+#[must_use]
+pub struct BarrierGuard {
+    wait: Arc<AtomicU32>,
+    workers: Arc<AtomicU32>,
+}
+
+impl BarrierGuard {
+    fn new(wait: &Arc<AtomicU32>, workers: &Arc<AtomicU32>) -> Self {
+        Self {
+            wait: Arc::clone(wait),
+            workers: Arc::clone(workers),
+        }
+    }
+}
+
+impl Drop for BarrierGuard {
+    fn drop(&mut self) {
+        self.workers.store(0, Ordering::SeqCst);
+        std::sync::atomic::compiler_fence(Ordering::SeqCst);
+        self.wait.store(0, Ordering::Release);
+    }
+}
+
+/// Synchronize all workers: set the wait flag, then spin until all workers
+/// have acknowledged. Returns a guard that releases the barrier on drop.
+///
+/// Memory ordering mirrors VPP threads.c:296 barrier_check:
+/// - wait_at_barrier: release-store (main), acquire-load (workers)
+/// - workers_at_barrier: fetch_add Release (workers), load Acquire (main)
+pub fn barrier_sync(
+    wait: &Arc<AtomicU32>,
+    workers: &Arc<AtomicU32>,
+    n_workers: u32,
+) -> BarrierGuard {
+    wait.store(1, Ordering::SeqCst);
+    std::sync::atomic::compiler_fence(Ordering::SeqCst);
+    while workers.load(Ordering::Acquire) != n_workers {
+        spin_loop();
+    }
+    BarrierGuard::new(wait, workers)
+}
+
+/// Called by workers in their main loop. If the wait flag is set,
+/// acknowledge and spin until released.
+pub fn barrier_check(wait: &AtomicU32, workers: &AtomicU32) {
+    if wait.load(Ordering::Acquire) > 0 {
+        workers.fetch_add(1, Ordering::Release);
+        while wait.load(Ordering::Acquire) > 0 {
+            spin_loop();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn barrier_check_arms_worker() {
+        let wait = Arc::new(AtomicU32::new(0));
+        let workers = Arc::new(AtomicU32::new(0));
+        let flag = Arc::new(AtomicBool::new(false));
+
+        let wait_c = Arc::clone(&wait);
+        let workers_c = Arc::clone(&workers);
+        let flag_c = Arc::clone(&flag);
+
+        let (tx, rx) = mpsc::channel();
+
+        let worker = thread::spawn(move || {
+            rx.recv().unwrap();
+            barrier_check(&wait_c, &workers_c);
+            flag_c.store(true, Ordering::Release);
+        });
+
+        wait.store(1, Ordering::SeqCst);
+        std::sync::atomic::compiler_fence(Ordering::SeqCst);
+        tx.send(()).unwrap();
+
+        while workers.load(Ordering::Acquire) != 1 {
+            spin_loop();
+        }
+
+        assert!(!flag.load(Ordering::Acquire));
+
+        workers.store(0, Ordering::SeqCst);
+        std::sync::atomic::compiler_fence(Ordering::SeqCst);
+        wait.store(0, Ordering::Release);
+
+        worker.join().unwrap();
+        assert!(flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn barrier_sync_guards_workers() {
+        let wait = Arc::new(AtomicU32::new(0));
+        let workers = Arc::new(AtomicU32::new(0));
+
+        let wait_c = Arc::clone(&wait);
+        let workers_c = Arc::clone(&workers);
+
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            barrier_check(&wait_c, &workers_c);
+        });
+
+        let guard = barrier_sync(&wait, &workers, 1);
+        assert!(workers.load(Ordering::Acquire) >= 1);
+        drop(guard);
+
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn barrier_concurrent_workers() {
+        let n = 4;
+        let wait = Arc::new(AtomicU32::new(0));
+        let workers_at_barrier = Arc::new(AtomicU32::new(0));
+        let counter = Arc::new(AtomicU32::new(0));
+        let barrier_armed = Arc::new(AtomicBool::new(false));
+
+        let mut handles = Vec::new();
+        for _ in 0..n {
+            let w = Arc::clone(&wait);
+            let wk = Arc::clone(&workers_at_barrier);
+            let c = Arc::clone(&counter);
+            let armed = Arc::clone(&barrier_armed);
+            handles.push(thread::spawn(move || {
+                while !armed.load(Ordering::Acquire) {
+                    spin_loop();
+                }
+                barrier_check(&w, &wk);
+                c.fetch_add(1, Ordering::Relaxed);
+            }));
+        }
+
+        wait.store(1, Ordering::SeqCst);
+        std::sync::atomic::compiler_fence(Ordering::SeqCst);
+        barrier_armed.store(true, Ordering::Release);
+
+        while workers_at_barrier.load(Ordering::Acquire) != n as u32 {
+            spin_loop();
+        }
+
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+
+        workers_at_barrier.store(0, Ordering::SeqCst);
+        std::sync::atomic::compiler_fence(Ordering::SeqCst);
+        wait.store(0, Ordering::Release);
+
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(counter.load(Ordering::Acquire), n as u32);
+    }
+}

@@ -3,6 +3,7 @@
 // prefer the runtime crate's namespace.
 pub mod engine;
 pub use engine::{Engine, EnginePool};
+pub mod barrier;
 pub mod init;
 
 pub mod adapter {
