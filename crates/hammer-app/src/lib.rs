@@ -1,26 +1,29 @@
 //! Application-facing access to Hammer's VPP-shaped app/session boundary.
 
+pub mod attach;
 pub mod echo;
+pub mod remote_session;
 pub mod tcp;
 pub mod udp;
 
 use std::sync::Arc;
 
 use hammer_core::error::HammerResult;
+use hammer_infra::segment::Local;
 use hammer_runtime::app as runtime_app;
 pub use hammer_runtime::app::{AppSession, AppSessionConfig, SessionHandle};
 pub use hammer_runtime::spawn::DataRuntimeContext;
 
 #[derive(Clone)]
 pub struct AppContext {
-    inner: runtime_app::AppContext,
+    inner: runtime_app::AppContext<Local>,
 }
 
 impl AppContext {
     #[inline]
     pub fn new(data_context: DataRuntimeContext, app_session_config: AppSessionConfig) -> Self {
         Self {
-            inner: runtime_app::AppContext::new(data_context, app_session_config),
+            inner: runtime_app::AppContext::<Local>::new(data_context, app_session_config),
         }
     }
 
@@ -35,7 +38,7 @@ impl AppContext {
     }
 
     #[inline]
-    pub fn session(&self, handle: SessionHandle) -> HammerResult<Option<Arc<AppSession>>> {
+    pub fn session(&self, handle: SessionHandle) -> HammerResult<Option<Arc<AppSession<Local>>>> {
         self.inner.session(handle)
     }
 
@@ -43,7 +46,7 @@ impl AppContext {
     pub async fn session_async(
         &self,
         handle: SessionHandle,
-    ) -> HammerResult<Option<Arc<AppSession>>> {
+    ) -> HammerResult<Option<Arc<AppSession<Local>>>> {
         self.inner.session_async(handle).await
     }
 }
@@ -75,7 +78,7 @@ impl App {
     }
 
     #[inline]
-    pub fn session(&self, handle: SessionHandle) -> HammerResult<Option<Arc<AppSession>>> {
+    pub fn session(&self, handle: SessionHandle) -> HammerResult<Option<Arc<AppSession<Local>>>> {
         self.context.session(handle)
     }
 
@@ -83,7 +86,7 @@ impl App {
     pub async fn session_async(
         &self,
         handle: SessionHandle,
-    ) -> HammerResult<Option<Arc<AppSession>>> {
+    ) -> HammerResult<Option<Arc<AppSession<Local>>>> {
         self.context.session_async(handle).await
     }
 }

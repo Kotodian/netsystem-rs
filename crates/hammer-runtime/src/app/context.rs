@@ -38,10 +38,7 @@ impl AppContext<Local> {
         self.data_context.worker_count()
     }
 
-    pub fn session(
-        &self,
-        handle: SessionHandle,
-    ) -> HammerResult<Option<Arc<AppSession<Local>>>> {
+    pub fn session(&self, handle: SessionHandle) -> HammerResult<Option<Arc<AppSession<Local>>>> {
         let worker = handle.worker_index() as usize;
         if worker >= self.data_context.worker_count() {
             return Ok(None);

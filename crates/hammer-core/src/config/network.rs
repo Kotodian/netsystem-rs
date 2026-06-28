@@ -317,6 +317,20 @@ impl Keepalive {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
+pub enum SessionBackend {
+    Local,
+    #[serde(rename = "svm")]
+    Svm,
+}
+
+impl Default for SessionBackend {
+    fn default() -> Self {
+        Self::Local
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum CongestionController {
     Bbr,
 }
@@ -391,6 +405,8 @@ impl Reassembly {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Session {
+    #[serde(default)]
+    pub backend: SessionBackend,
     #[serde(with = "humantime_serde")]
     pub timer_tick: Duration,
     pub pool_capacity: usize,
@@ -403,6 +419,7 @@ pub struct Session {
 impl Default for Session {
     fn default() -> Self {
         Self {
+            backend: SessionBackend::default(),
             timer_tick: SESSION_TIMER_TICK,
             pool_capacity: SESSION_POOL_CAPACITY,
             ready_queue_capacity: READY_QUEUE_CAPACITY,

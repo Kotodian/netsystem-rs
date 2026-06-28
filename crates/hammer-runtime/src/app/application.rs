@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_infra::map::FlatHashTable;
+use hammer_infra::msg_queue::MsgQueue;
 use hammer_infra::segment::Segment;
 
 use crate::app::handle::SessionHandle;
@@ -76,6 +77,32 @@ impl AppWorker<Local> {
             )));
         }
         let session = Arc::new(AppSession::<Local>::local(config, handle)?);
+        self.sessions.insert(handle.raw(), Arc::clone(&session));
+        Ok(session)
+    }
+
+    /// In-process variant that joins the shared runtime-side TX event queue
+    /// owned by `SessionAppRuntime` instead of creating a private per-session
+    /// queue.  The dataplane drains all sessions' TX events from this single
+    /// shared `MsgQueue` via `SessionAppRuntime::drain_tx_events_to`.
+    pub fn attach_session_local_with_runtime_tx(
+        &mut self,
+        handle: SessionHandle,
+        config: AppSessionConfig,
+        runtime_tx_evt_q: Arc<MsgQueue<Local>>,
+    ) -> HammerResult<Arc<AppSession<Local>>> {
+        if self.sessions.lookup(&handle.raw()).is_some() {
+            return Err(HammerError::internal(format!(
+                "app worker {} already has session {}",
+                self.worker_index,
+                handle.raw()
+            )));
+        }
+        let session = Arc::new(AppSession::<Local>::local_with_runtime_tx(
+            config,
+            handle,
+            runtime_tx_evt_q,
+        )?);
         self.sessions.insert(handle.raw(), Arc::clone(&session));
         Ok(session)
     }

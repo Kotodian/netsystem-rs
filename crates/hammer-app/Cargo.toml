@@ -12,6 +12,5 @@ hammer-adapter = { path = "../hammer-adapter" }
 hammer-core = { path = "../hammer-core" }
 hammer-infra = { path = "../hammer-infra" }
 hammer-runtime = { path = "../hammer-runtime" }
-
-[dev-dependencies]
+libc = { workspace = true }
 tokio = { workspace = true }

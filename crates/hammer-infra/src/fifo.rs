@@ -41,6 +41,7 @@ pub struct Fifo<S: Segment> {
     seg: S,
     base: *mut u8,
     hdr: *mut FifoHeader,
+    hdr_off: u64,
 }
 
 unsafe impl<S: Segment> Send for Fifo<S> {}
@@ -88,7 +89,72 @@ impl<S: Segment> Fifo<S> {
                 },
             );
         }
-        Ok(Self { seg, base, hdr })
+        Ok(Self {
+            seg,
+            base,
+            hdr,
+            hdr_off,
+        })
+    }
+
+    /// Initialise a [`Fifo`] header at a pre-allocated offset in `seg`.
+    /// The caller must guarantee that `seg` has `sizeof(FifoHeader) +
+    /// CHUNK_HEADER_SIZE + capacity` bytes available at `hdr_offset` and
+    /// that no other [`Fifo`] uses the same region.
+    pub unsafe fn init_at(seg: S, hdr_offset: u64, capacity: usize) -> Result<Self, FifoError> {
+        if capacity < 2 || !capacity.is_power_of_two() {
+            return Err(FifoError::InvalidCapacity);
+        }
+        let base = seg.base();
+        let hdr = unsafe { base.add(hdr_offset as usize) as *mut FifoHeader };
+        let chunk_size = capacity.min(4096) as u32;
+        let chunk_off = hdr_offset + std::mem::size_of::<FifoHeader>() as u64;
+        unsafe {
+            std::ptr::write(
+                hdr,
+                FifoHeader {
+                    start_chunk: chunk_off,
+                    end_chunk: chunk_off,
+                    size: capacity as u32,
+                    min_alloc: chunk_size,
+                    has_event: AtomicU32::new(0),
+                    want_ntf: AtomicU32::new(0),
+                    want_deq_ntf: AtomicU32::new(0),
+                    has_deq_ntf: AtomicU32::new(0),
+                    deq_thresh: AtomicU32::new(0),
+                    _pad0: [0; 64 - (8 + 8 + 4 + 4 + 4 + 4 + 4 + 4 + 4)],
+                    head_chunk: chunk_off,
+                    head: AtomicU32::new(0),
+                    _pad1: [0; 64 - (8 + 4)],
+                    tail_chunk: chunk_off,
+                    tail: AtomicU32::new(0),
+                    _pad2: [0; 64 - (8 + 4)],
+                },
+            );
+            let chunk = base.add(chunk_off as usize) as *mut Chunk;
+            std::ptr::write(
+                chunk,
+                Chunk {
+                    start_byte: 0,
+                    length: 0,
+                    next: AtomicU64::new(0),
+                },
+            );
+        }
+        Ok(Self {
+            seg,
+            base,
+            hdr,
+            hdr_off: hdr_offset,
+        })
+    }
+
+    /// Offset of the [`FifoHeader`] within the backing [`Segment`].
+    /// Used by `from_shared` to reconstruct the same FIFO in another
+    /// process that shares the segment.
+    #[inline]
+    pub fn hdr_offset(&self) -> u64 {
+        self.hdr_off
     }
 
     #[inline]
@@ -113,7 +179,14 @@ impl<S: Segment> Fifo<S> {
             if chunk_off == 0 {
                 let new_off = self.seg.alloc(CHUNK_HEADER_SIZE + chunk_data_size, 64);
                 let new_chunk = &mut *(self.base.add(new_off as usize) as *mut Chunk);
-                std::ptr::write(new_chunk, Chunk { start_byte: 0, length: 0, next: AtomicU64::new(0) });
+                std::ptr::write(
+                    new_chunk,
+                    Chunk {
+                        start_byte: 0,
+                        length: 0,
+                        next: AtomicU64::new(0),
+                    },
+                );
                 (*hdr).start_chunk = new_off;
                 (*hdr).end_chunk = new_off;
                 (*hdr).head_chunk = new_off;
@@ -139,9 +212,7 @@ impl<S: Segment> Fifo<S> {
                 if remaining == 0 {
                     break;
                 }
-                let new_off = self
-                    .seg
-                    .alloc(CHUNK_HEADER_SIZE + chunk_data_size, 64);
+                let new_off = self.seg.alloc(CHUNK_HEADER_SIZE + chunk_data_size, 64);
                 let new_start_byte = chunk.start_byte + chunk.length;
                 let new_chunk = &mut *(self.base.add(new_off as usize) as *mut Chunk);
                 std::ptr::write(
@@ -234,7 +305,8 @@ impl<S: Segment> Fifo<S> {
                     let chunk_avail = (chunk_end - logical_pos) as usize;
                     let first_len = to_read.min(chunk_avail);
                     let first_slice = std::slice::from_raw_parts(
-                        self.base.add(chunk_off as usize + CHUNK_HEADER_SIZE + data_off),
+                        self.base
+                            .add(chunk_off as usize + CHUNK_HEADER_SIZE + data_off),
                         first_len,
                     );
                     if first_len == to_read {
@@ -323,7 +395,11 @@ impl<S: Segment> Fifo<S> {
                     let data_off = (remaining_offset - chunk.start_byte) as usize;
                     let chunk_avail = chunk_data_size - data_off;
                     let to_write = remaining_src.len().min(chunk_avail);
-                    std::ptr::copy_nonoverlapping(remaining_src.as_ptr(), data_ptr.add(data_off), to_write);
+                    std::ptr::copy_nonoverlapping(
+                        remaining_src.as_ptr(),
+                        data_ptr.add(data_off),
+                        to_write,
+                    );
                     let new_used = data_off + to_write;
                     if new_used > chunk.length as usize {
                         chunk.length = new_used as u32;
@@ -514,7 +590,12 @@ impl<S: Segment> Fifo<S> {
     pub unsafe fn from_shared(seg: S, hdr_offset: u64) -> Self {
         let base = seg.base();
         let hdr = unsafe { base.add(hdr_offset as usize) as *mut FifoHeader };
-        Self { seg, base, hdr }
+        Self {
+            seg,
+            base,
+            hdr,
+            hdr_off: hdr_offset,
+        }
     }
 }
 
@@ -524,7 +605,8 @@ impl Fifo<Local> {
     /// `capacity` chunks plus the header.
     pub fn with_capacity(capacity: usize) -> Result<Self, FifoError> {
         let chunk_data_size = capacity.min(4096);
-        let seg = Local::new(size_of::<FifoHeader>() + capacity * (size_of::<Chunk>() + chunk_data_size));
+        let seg =
+            Local::new(size_of::<FifoHeader>() + capacity * (size_of::<Chunk>() + chunk_data_size));
         Self::new(seg, capacity)
     }
 }

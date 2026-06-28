@@ -1102,7 +1102,12 @@ fn set_lookup_cursor(
         return;
     };
     let (version, protocol, network_len, transport_offset) = match first >> 4 {
-        4 => (4u8, packet[9], usize::from(first & 0x0f) * 4, usize::from(first & 0x0f) * 4),
+        4 => (
+            4u8,
+            packet[9],
+            usize::from(first & 0x0f) * 4,
+            usize::from(first & 0x0f) * 4,
+        ),
         6 => (6u8, packet[6], 40, 40),
         _ => return,
     };

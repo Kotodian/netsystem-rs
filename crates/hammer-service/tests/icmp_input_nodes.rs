@@ -1,11 +1,11 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use hammer_adapter::BufferPacketCursor;
 use hammer_adapter::{
     BufferFrame, BufferNodeError, DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult,
     NodeRuntimeData, TraceControlPlane, TraceInputPolicy, TracePolicy,
 };
-use hammer_adapter::BufferPacketCursor;
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 use hammer_infra::vec::Vec as InfraVec;

@@ -866,7 +866,8 @@ mod tests {
         let buffer = runtime.alloc_index_with_bytes(&packet).expect("packet");
         let cursor = tcp_control_cursor(&packet).expect("cursor");
         let mut data_buffer = runtime.get_buffer_mut(buffer).expect("buffer mut");
-        let network = unsafe { std::mem::transmute::<_, &mut NetworkOpaque>(data_buffer.opaque_mut()) };
+        let network =
+            unsafe { std::mem::transmute::<_, &mut NetworkOpaque>(data_buffer.opaque_mut()) };
         network.set_packet_cursor(cursor);
         let ip_version = (packet[0] >> 4) as u8;
         network.ip_mut().set_ip_version(Some(ip_version));

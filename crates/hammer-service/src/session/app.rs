@@ -1,29 +1,40 @@
+use std::fmt;
 use std::sync::Arc;
 
 use hammer_adapter::{BufferIndex, DataPlaneBuffers};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::map::FlatHashTable;
-use hammer_infra::ring::LockFreeRing;
-use hammer_infra::msg_queue::SessionEvtType;
+use hammer_infra::msg_queue::{MsgQueue, SessionEvt, SessionEvtType};
+use hammer_infra::segment::{Local, Segment};
 use hammer_infra::vec::Vec;
 use hammer_runtime::app::AppSession;
 
 use crate::session::{SessionId, SessionReadyQueue};
 
-#[derive(Debug)]
-pub struct SessionAppRuntime {
+pub struct SessionAppRuntime<S: Segment> {
     buffers: DataPlaneBuffers,
-    sessions: FlatHashTable<u64, Arc<AppSession>>,
+    sessions: FlatHashTable<u64, Arc<AppSession<S>>>,
     sessions_by_index: Vec<Option<SessionId>>,
-    tx_evt_q: Arc<LockFreeRing<u32>>,
+    tx_evt_q: Arc<MsgQueue<S>>,
 }
 
-impl SessionAppRuntime {
+impl<S: Segment> fmt::Debug for SessionAppRuntime<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionAppRuntime")
+            .field("buffers", &self.buffers)
+            .field("sessions", &self.sessions)
+            .field("sessions_by_index", &self.sessions_by_index)
+            .field("msg_queue_slots", &self.sessions_by_index.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S: Segment> SessionAppRuntime<S> {
     #[inline]
     pub fn new(
         session_capacity: usize,
         buffers: DataPlaneBuffers,
-        tx_evt_q: Arc<LockFreeRing<u32>>,
+        tx_evt_q: Arc<MsgQueue<S>>,
     ) -> Self {
         Self {
             buffers,
@@ -33,7 +44,15 @@ impl SessionAppRuntime {
         }
     }
 
-    pub(crate) fn attach_session(&mut self, session_id: SessionId, session: Arc<AppSession>) {
+    /// Shared runtime-side TX event queue.  Every app session created via
+    /// `attach_session_local_with_runtime_tx` shares this same queue, so the
+    /// dataplane side can drain all sessions' TX events from one ring.
+    #[inline]
+    pub(crate) fn tx_evt_q(&self) -> &Arc<MsgQueue<S>> {
+        &self.tx_evt_q
+    }
+
+    pub(crate) fn attach_session(&mut self, session_id: SessionId, session: Arc<AppSession<S>>) {
         self.sessions.insert(session_id.get(), session);
         let slot = session_id.pool_index().slot() as usize;
         if let Some(entry) = self.sessions_by_index.get_mut(slot) {
@@ -41,7 +60,7 @@ impl SessionAppRuntime {
         }
     }
 
-    pub(crate) fn detach_session(&mut self, session_id: SessionId) -> Option<Arc<AppSession>> {
+    pub(crate) fn detach_session(&mut self, session_id: SessionId) -> Option<Arc<AppSession<S>>> {
         let slot = session_id.pool_index().slot() as usize;
         if let Some(entry) = self.sessions_by_index.get_mut(slot) {
             *entry = None;
@@ -152,14 +171,18 @@ impl SessionAppRuntime {
 
     pub(crate) fn drain_tx_events_to(&self, ready: &mut SessionReadyQueue) -> usize {
         let mut scheduled = 0usize;
-        let mut batch = [0u32; 64];
+        let mut batch = [SessionEvt {
+            session_index: 0,
+            evt_type: SessionEvtType::Connect,
+        }; 64];
         loop {
+            self.tx_evt_q.drain();
             let count = self.tx_evt_q.dequeue_batch(&mut batch);
             if count == 0 {
                 break;
             }
-            for session_index in batch[..count].iter().copied() {
-                let Some(Some(session_id)) = self.sessions_by_index.get(session_index as usize)
+            for evt in batch[..count].iter() {
+                let Some(Some(session_id)) = self.sessions_by_index.get(evt.session_index as usize)
                 else {
                     continue;
                 };
@@ -178,11 +201,12 @@ impl SessionAppRuntime {
     }
 }
 
-impl Default for SessionAppRuntime {
+impl SessionAppRuntime<Local> {
     #[inline]
-    fn default() -> Self {
-        let tx_evt_q =
-            Arc::new(LockFreeRing::with_capacity(2048).expect("default tx event queue capacity"));
+    pub fn default_local() -> Self {
+        let tx_evt_q = Arc::new(
+            MsgQueue::<Local>::with_capacity(2048).expect("default tx event queue capacity"),
+        );
         Self::new(
             1024,
             DataPlaneBuffers::with_buffer_capacity(2048, 1),

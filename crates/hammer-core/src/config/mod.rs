@@ -20,7 +20,7 @@ pub mod worker;
 
 pub use loader::{load_config, parse_config};
 pub use log::Log;
-pub use network::Network;
+pub use network::{Network, SessionBackend};
 pub use route::{Route, RouteAction, Via};
 pub use trace::{Trace, TraceInput};
 #[cfg(any(target_os = "macos", target_os = "ios"))]

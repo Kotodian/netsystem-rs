@@ -167,26 +167,28 @@ pub fn register_tcp_input(runtime: &DataPlaneRuntime, worker: usize) -> CoreResu
 
 pub fn wire_worker_graph(runtime: &DataPlaneRuntime, worker: usize) -> CoreResult<()> {
     crate::with_congestion!(|C| {
-        let queue_data = ensure_tcp_session_queue::<C>(runtime, worker)?;
-        let queue = TcpQueue::<C>::new(queue_data);
-        let session_queue = runtime
-            .nodes()
-            .node_by_name("session-queue")
-            .ok_or_else(|| CoreError::internal("session-queue not registered"))?;
-        let tcp_output = runtime
-            .nodes()
-            .node_by_name("tcp-output")
-            .ok_or_else(|| CoreError::internal("tcp-output not registered"))?;
-        SessionQueueNode::attach_queue_by_runtime_data(
-            SessionQueueNode::registered_runtime_data()?,
-            queue,
-            tcp_output.into(),
-            dispatch_registered_session_queue_once_at::<TcpConnection<C>>,
-        )?;
-        runtime
-            .nodes()
-            .set_node_state(session_queue, NodeState::Polling)?;
-        Ok(())
+        crate::with_segment!(|Seg| {
+            let queue_data = ensure_tcp_session_queue::<C>(runtime, worker)?;
+            let queue = TcpQueue::<C>::new(queue_data);
+            let session_queue = runtime
+                .nodes()
+                .node_by_name("session-queue")
+                .ok_or_else(|| CoreError::internal("session-queue not registered"))?;
+            let tcp_output = runtime
+                .nodes()
+                .node_by_name("tcp-output")
+                .ok_or_else(|| CoreError::internal("tcp-output not registered"))?;
+            SessionQueueNode::attach_queue_by_runtime_data(
+                SessionQueueNode::registered_runtime_data()?,
+                queue,
+                tcp_output.into(),
+                dispatch_registered_session_queue_once_at::<TcpConnection<C>, Seg>,
+            )?;
+            runtime
+                .nodes()
+                .set_node_state(session_queue, NodeState::Polling)?;
+            Ok(())
+        })
     })
 }
 

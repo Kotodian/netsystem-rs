@@ -8,9 +8,10 @@ use hammer_adapter::{
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::fifo_queue::FifoQueue;
 use hammer_infra::map::FlatHashTable;
+use hammer_infra::msg_queue::MsgQueue;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::rbtree::RbTree;
-use hammer_infra::ring::LockFreeRing;
+use hammer_infra::segment::{Local, Segment};
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
 use hammer_runtime::app::{AppContext, AppSessionConfig, SessionHandle, with_current_app_worker};
 
@@ -425,25 +426,24 @@ impl WorkerSessionRuntime {
     }
 }
 
-struct SessionDriverRuntimeCore<S> {
+struct SessionDriverRuntimeCore<St> {
     sessions: WorkerSessionRuntime,
-    entries: Pool<S>,
+    entries: Pool<St>,
     buffers: DataPlaneBuffers,
     rx: Pool<SessionRxQueue>,
     rx_index: FlatHashTable<u64, PoolIndex>,
     pending_closes: SessionReadyQueue,
 }
 
-struct SessionDriverRuntimeAppState {
-    app: SessionAppRuntime,
-    app_context: Option<AppContext>,
+struct SessionDriverRuntimeAppState<Seg: Segment> {
+    app: SessionAppRuntime<Seg>,
+    app_context: Option<AppContext<Seg>>,
     app_session_config: AppSessionConfig,
-    tx_evt_q: Arc<LockFreeRing<u32>>,
 }
 
-pub(crate) struct SessionDriverRuntime<S> {
-    runtime: CachePadded<SessionDriverRuntimeCore<S>>,
-    app_state: CachePadded<SessionDriverRuntimeAppState>,
+pub(crate) struct SessionDriverRuntime<St, Seg: Segment = Local> {
+    runtime: CachePadded<SessionDriverRuntimeCore<St>>,
+    app_state: CachePadded<SessionDriverRuntimeAppState<Seg>>,
 }
 
 pub(crate) trait SessionQueueProtocol: Sized {
@@ -505,24 +505,27 @@ pub(crate) trait SessionQueueProtocol: Sized {
     fn on_close(&mut self, context: &mut crate::session::protocol::SessionQueueControlContext);
 }
 
-pub(crate) trait SessionStateFactory<S> {
-    fn build(self, session_id: SessionId) -> S;
+pub(crate) trait SessionStateFactory<T> {
+    fn build(self, session_id: SessionId) -> T;
 }
 
-impl<S, F> SessionStateFactory<S> for F
+impl<T, F> SessionStateFactory<T> for F
 where
-    F: FnOnce(SessionId) -> S,
+    F: FnOnce(SessionId) -> T,
 {
     #[inline]
-    fn build(self, session_id: SessionId) -> S {
+    fn build(self, session_id: SessionId) -> T {
         self(session_id)
     }
 }
 
-impl<S> SessionDriverRuntime<S> {
+impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
     #[inline]
-    pub(crate) fn new(worker: DataWorkerId, buffers: DataPlaneBuffers) -> Self {
-        Self::with_app_session_config(worker, buffers, AppSessionConfig::default())
+    pub(crate) fn new(worker: DataWorkerId, buffers: DataPlaneBuffers) -> Self
+    where
+        Seg: Default,
+    {
+        Self::with_app_session_config(worker, buffers, AppSessionConfig::default(), Seg::default())
     }
 
     #[inline]
@@ -530,16 +533,13 @@ impl<S> SessionDriverRuntime<S> {
         worker: DataWorkerId,
         buffers: DataPlaneBuffers,
         app_session_config: AppSessionConfig,
+        seg: Seg,
     ) -> Self {
         let tx_evt_q = Arc::new(
-            LockFreeRing::with_capacity(DEFAULT_SESSION_TX_EVENT_CAPACITY)
+            MsgQueue::<Seg>::new(seg, DEFAULT_SESSION_TX_EVENT_CAPACITY, false)
                 .expect("session tx event queue capacity is valid"),
         );
-        let app = SessionAppRuntime::new(
-            DEFAULT_SESSION_POOL_CAPACITY,
-            buffers.clone(),
-            tx_evt_q.clone(),
-        );
+        let app = SessionAppRuntime::new(DEFAULT_SESSION_POOL_CAPACITY, buffers.clone(), tx_evt_q);
         Self {
             runtime: CachePadded::new(SessionDriverRuntimeCore {
                 sessions: WorkerSessionRuntime::new(worker),
@@ -553,21 +553,8 @@ impl<S> SessionDriverRuntime<S> {
                 app,
                 app_context: None,
                 app_session_config,
-                tx_evt_q,
             }),
         }
-    }
-
-    #[inline]
-    pub(crate) fn with_app_context(
-        worker: DataWorkerId,
-        buffers: DataPlaneBuffers,
-        app_context: AppContext,
-    ) -> Self {
-        let mut driver =
-            Self::with_app_session_config(worker, buffers, app_context.app_session_config());
-        driver.app_state.app_context = Some(app_context);
-        driver
     }
 
     #[inline]
@@ -582,7 +569,7 @@ impl<S> SessionDriverRuntime<S> {
 
     #[inline]
     #[cfg(test)]
-    pub(crate) fn insert_session(&mut self, state: S) -> SessionId {
+    pub(crate) fn insert_session(&mut self, state: St) -> SessionId {
         let index = self
             .runtime
             .entries
@@ -592,56 +579,12 @@ impl<S> SessionDriverRuntime<S> {
     }
 
     #[inline]
-    pub(crate) fn insert_session_with_id<F>(&mut self, f: F) -> CoreResult<SessionId>
-    where
-        F: SessionStateFactory<S>,
-    {
-        let index = self
-            .runtime
-            .entries
-            .insert_with(|index| f.build(SessionId::from(index)))
-            .ok_or_else(|| CoreError::internal("session pool capacity exhausted"))?;
-        let session_id = SessionId::from(index);
-        let handle =
-            SessionHandle::new(session_id.pool_index().slot(), self.worker().slot() as u32);
-        let app_session = if let Some(app_context) = &self.app_state.app_context {
-            match app_context.session(handle) {
-                Ok(Some(session)) => session,
-                Ok(None) => {
-                    let _ = self.runtime.entries.remove(index);
-                    return Err(CoreError::internal("app session is missing"));
-                }
-                Err(error) => {
-                    let _ = self.runtime.entries.remove(index);
-                    return Err(CoreError::from(error));
-                }
-            }
-        } else {
-            match with_current_app_worker(self.worker().slot() as usize, |worker| {
-                worker.attach_session(
-                    handle,
-                    self.app_state.app_session_config,
-                    self.app_state.tx_evt_q.clone(),
-                )
-            }) {
-                Ok(session) => session,
-                Err(error) => {
-                    let _ = self.runtime.entries.remove(index);
-                    return Err(CoreError::from(error));
-                }
-            }
-        };
-        self.app_state.app.attach_session(session_id, app_session);
-        Ok(session_id)
-    }
-
-    #[inline]
-    pub(crate) fn session(&self, id: SessionId) -> Option<&S> {
+    pub(crate) fn session(&self, id: SessionId) -> Option<&St> {
         self.runtime.entries.get(id.pool_index())
     }
 
     #[inline]
-    pub(crate) fn session_mut(&mut self, id: SessionId) -> Option<&mut S> {
+    pub(crate) fn session_mut(&mut self, id: SessionId) -> Option<&mut St> {
         self.runtime.entries.get_mut(id.pool_index())
     }
 
@@ -658,7 +601,7 @@ impl<S> SessionDriverRuntime<S> {
         self.runtime.entries.prefetch_slot(id.pool_index());
     }
 
-    pub(crate) fn remove_session(&mut self, id: SessionId) -> Option<S> {
+    pub(crate) fn remove_session(&mut self, id: SessionId) -> Option<St> {
         self.runtime.pending_closes.take(id);
         self.app_state.app.free_pending_send(id);
         let _ = self.app_state.app.detach_session(id);
@@ -671,7 +614,7 @@ impl<S> SessionDriverRuntime<S> {
         Some(removed)
     }
 
-    pub(crate) fn close_session(&mut self, id: SessionId) -> CoreResult<Option<S>> {
+    pub(crate) fn close_session(&mut self, id: SessionId) -> CoreResult<Option<St>> {
         if self.session(id).is_none() {
             return Ok(None);
         }
@@ -680,13 +623,13 @@ impl<S> SessionDriverRuntime<S> {
     }
 
     #[inline]
-    pub(crate) fn app(&self) -> &SessionAppRuntime {
+    pub(crate) fn app(&self) -> &SessionAppRuntime<Seg> {
         &self.app_state.app
     }
 
     #[inline]
     #[cfg(test)]
-    pub(crate) fn app_mut(&mut self) -> &mut SessionAppRuntime {
+    pub(crate) fn app_mut(&mut self) -> &mut SessionAppRuntime<Seg> {
         &mut self.app_state.app
     }
 
@@ -849,15 +792,77 @@ impl<S> SessionDriverRuntime<S> {
     }
 }
 
+impl<St> SessionDriverRuntime<St, Local> {
+    #[inline]
+    pub(crate) fn with_app_context(
+        worker: DataWorkerId,
+        buffers: DataPlaneBuffers,
+        app_context: AppContext<Local>,
+    ) -> Self {
+        let mut driver = Self::with_app_session_config(
+            worker,
+            buffers,
+            app_context.app_session_config(),
+            Local::default(),
+        );
+        driver.app_state.app_context = Some(app_context);
+        driver
+    }
+
+    #[inline]
+    pub(crate) fn insert_session_with_id<F>(&mut self, f: F) -> CoreResult<SessionId>
+    where
+        F: SessionStateFactory<St>,
+    {
+        let index = self
+            .runtime
+            .entries
+            .insert_with(|index| f.build(SessionId::from(index)))
+            .ok_or_else(|| CoreError::internal("session pool capacity exhausted"))?;
+        let session_id = SessionId::from(index);
+        let handle =
+            SessionHandle::new(session_id.pool_index().slot(), self.worker().slot() as u32);
+        let app_session = if let Some(app_context) = &self.app_state.app_context {
+            match app_context.session(handle) {
+                Ok(Some(session)) => session,
+                Ok(None) => {
+                    let _ = self.runtime.entries.remove(index);
+                    return Err(CoreError::internal("app session is missing"));
+                }
+                Err(error) => {
+                    let _ = self.runtime.entries.remove(index);
+                    return Err(CoreError::from(error));
+                }
+            }
+        } else {
+            match with_current_app_worker(self.worker().slot() as usize, |worker| {
+                worker.attach_session_local_with_runtime_tx(
+                    handle,
+                    self.app_state.app_session_config,
+                    self.app_state.app.tx_evt_q().clone(),
+                )
+            }) {
+                Ok(session) => session,
+                Err(error) => {
+                    let _ = self.runtime.entries.remove(index);
+                    return Err(CoreError::from(error));
+                }
+            }
+        };
+        self.app_state.app.attach_session(session_id, app_session);
+        Ok(session_id)
+    }
+}
+
 #[cfg(test)]
-pub(crate) fn dispatch_session_queue_for_ticks<S>(
+pub(crate) fn dispatch_session_queue_for_ticks<St, Seg: Segment>(
     runtime: &DataPlaneRuntime,
-    driver: &mut SessionDriverRuntime<S>,
+    driver: &mut SessionDriverRuntime<St, Seg>,
     timer_ticks: u32,
     output_next: crate::session::SessionQueueNext,
 ) -> CoreResult<SessionQueueStep>
 where
-    S: SessionQueueProtocol,
+    St: SessionQueueProtocol,
 {
     let mut step = driver.poll_once_for_ticks(timer_ticks)?;
     let now = Instant::now();
@@ -867,22 +872,22 @@ where
     Ok(step)
 }
 
-pub(crate) fn dispatch_session_queue_once_at<S>(
+pub(crate) fn dispatch_session_queue_once_at<St, Seg: Segment>(
     runtime: &DataPlaneRuntime,
-    driver: &mut SessionDriverRuntime<S>,
+    driver: &mut SessionDriverRuntime<St, Seg>,
     now: Instant,
     output_next: crate::session::SessionQueueNext,
     output: &mut crate::session::node::SessionQueueOutput,
 ) -> CoreResult<SessionQueueStep>
 where
-    S: SessionQueueProtocol,
+    St: SessionQueueProtocol,
 {
     let mut step = driver.poll_once_at(now)?;
     dispatch_session_queue_pending(runtime, driver, output_next, output, &mut step, now)?;
     Ok(step)
 }
 
-pub(crate) fn dispatch_registered_session_queue_once_at<S>(
+pub(crate) fn dispatch_registered_session_queue_once_at<St, Seg: Segment>(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     output_next: SessionQueueNext,
@@ -890,15 +895,15 @@ pub(crate) fn dispatch_registered_session_queue_once_at<S>(
     output: &mut crate::session::node::SessionQueueOutput,
 ) -> CoreResult<()>
 where
-    S: SessionQueueProtocol + 'static,
+    St: SessionQueueProtocol + 'static,
 {
-    let mut driver = SessionQueueHandle::<SessionDriverRuntime<S>>::new(data).borrow_mut()?;
+    let mut driver = SessionQueueHandle::<SessionDriverRuntime<St, Seg>>::new(data).borrow_mut()?;
     dispatch_session_queue_once_at(runtime, &mut driver, now, output_next, output)?;
     Ok(())
 }
 
-unsafe fn session_queue_context<S>(
-    driver: *mut SessionDriverRuntime<S>,
+unsafe fn session_queue_context<St, Seg: Segment>(
+    driver: *mut SessionDriverRuntime<St, Seg>,
     session_id: SessionId,
 ) -> crate::session::protocol::SessionQueueControlContext {
     let driver = unsafe { &mut *driver };
@@ -912,16 +917,16 @@ unsafe fn session_queue_context<S>(
     )
 }
 
-pub(crate) fn dispatch_session_queue_pending<S>(
+pub(crate) fn dispatch_session_queue_pending<St, Seg: Segment>(
     runtime: &DataPlaneRuntime,
-    driver: &mut SessionDriverRuntime<S>,
+    driver: &mut SessionDriverRuntime<St, Seg>,
     output_next: crate::session::SessionQueueNext,
     output: &mut crate::session::node::SessionQueueOutput,
     step: &mut SessionQueueStep,
     now: Instant,
 ) -> CoreResult<()>
 where
-    S: SessionQueueProtocol,
+    St: SessionQueueProtocol,
 {
     driver.poll_app()?;
     let expired_timer_count = driver.runtime.sessions.pending_timers.len();
@@ -929,7 +934,7 @@ where
         let Some(expired_timer) = driver.runtime.sessions.pending_timers.pop_front() else {
             break;
         };
-        let driver = driver as *mut SessionDriverRuntime<S>;
+        let driver = driver as *mut SessionDriverRuntime<St, Seg>;
         // SAFETY: same disjoint-access argument as above.
         unsafe {
             let state = (*driver)
@@ -959,7 +964,7 @@ where
             continue;
         }
         let close_requested = driver.take_close_request(session_id);
-        let driver_ptr = driver as *mut SessionDriverRuntime<S>;
+        let driver_ptr = driver as *mut SessionDriverRuntime<St, Seg>;
         // SAFETY: same disjoint-access argument as above.
         unsafe {
             let state = (*driver_ptr)
@@ -984,7 +989,7 @@ where
                 break;
             };
             let tx_offset = {
-                let driver = driver as *mut SessionDriverRuntime<S>;
+                let driver = driver as *mut SessionDriverRuntime<St, Seg>;
                 unsafe {
                     let state = (*driver)
                         .session(session_id)
@@ -1000,7 +1005,7 @@ where
             }
             let pending_len = total_len.saturating_sub(tx_offset);
             let payload_len = {
-                let driver = driver as *mut SessionDriverRuntime<S>;
+                let driver = driver as *mut SessionDriverRuntime<St, Seg>;
                 // SAFETY: `state` and `context` access disjoint parts of the same
                 // session queue: the state lives in `entries`, while the context
                 // exposes runtime sidecar resources.
@@ -1030,7 +1035,7 @@ where
             }
 
             {
-                let driver = driver as *mut SessionDriverRuntime<S>;
+                let driver = driver as *mut SessionDriverRuntime<St, Seg>;
                 // SAFETY: same reasoning as above; the current session state and
                 // runtime sidecars are accessed together to execute one transport
                 // callback.
@@ -1049,7 +1054,7 @@ where
             }
 
             if let Err(err) = output.enqueue(runtime, output_next.node(), index) {
-                let driver = driver as *mut SessionDriverRuntime<S>;
+                let driver = driver as *mut SessionDriverRuntime<St, Seg>;
                 // SAFETY: same disjoint-access argument as above.
                 unsafe {
                     let state = (*driver)
@@ -1063,7 +1068,7 @@ where
             }
 
             let commit_result = {
-                let driver = driver as *mut SessionDriverRuntime<S>;
+                let driver = driver as *mut SessionDriverRuntime<St, Seg>;
                 // SAFETY: same disjoint-access argument as above.
                 unsafe {
                     let state = (*driver)
@@ -1074,7 +1079,7 @@ where
                 }
             };
             if let Err(err) = commit_result {
-                let driver = driver as *mut SessionDriverRuntime<S>;
+                let driver = driver as *mut SessionDriverRuntime<St, Seg>;
                 // SAFETY: same disjoint-access argument as above.
                 unsafe {
                     let state = (*driver)
@@ -1539,7 +1544,10 @@ mod tests {
     fn session_rx_queue_inserts_future_segments_by_offset_order() {
         let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
         let buffers = runtime.buffers();
-        let mut driver = SessionDriverRuntime::new(DataWorkerId::new(0), buffers.clone());
+        let mut driver = SessionDriverRuntime::<FakeTxProtocol, Local>::new(
+            DataWorkerId::new(0),
+            buffers.clone(),
+        );
         let session_id = driver.insert_session(FakeTxProtocol::default());
 
         let later = buffers.alloc_index().expect("later buffer");
@@ -1573,7 +1581,10 @@ mod tests {
     fn session_rx_queue_duplicate_covered_segment_is_discarded() {
         let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
         let buffers = runtime.buffers();
-        let mut driver = SessionDriverRuntime::new(DataWorkerId::new(0), buffers.clone());
+        let mut driver = SessionDriverRuntime::<FakeTxProtocol, Local>::new(
+            DataWorkerId::new(0),
+            buffers.clone(),
+        );
         let session_id = driver.insert_session(FakeTxProtocol::default());
 
         let original = buffers.alloc_index().expect("original buffer");
@@ -1606,7 +1617,10 @@ mod tests {
     fn session_rx_queue_overlap_trims_new_segment_against_predecessor() {
         let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
         let buffers = runtime.buffers();
-        let mut driver = SessionDriverRuntime::new(DataWorkerId::new(0), buffers.clone());
+        let mut driver = SessionDriverRuntime::<FakeTxProtocol, Local>::new(
+            DataWorkerId::new(0),
+            buffers.clone(),
+        );
         let session_id = driver.insert_session(FakeTxProtocol::default());
 
         let first = buffers.alloc_index().expect("first buffer");
@@ -1655,7 +1669,10 @@ mod tests {
     fn session_rx_queue_overlap_trims_existing_successor_and_rekeys_tree() {
         let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
         let buffers = runtime.buffers();
-        let mut driver = SessionDriverRuntime::new(DataWorkerId::new(0), buffers.clone());
+        let mut driver = SessionDriverRuntime::<FakeTxProtocol, Local>::new(
+            DataWorkerId::new(0),
+            buffers.clone(),
+        );
         let session_id = driver.insert_session(FakeTxProtocol::default());
 
         let successor = buffers.alloc_index().expect("successor buffer");
@@ -1706,7 +1723,10 @@ mod tests {
     fn session_rx_queue_gap_close_promotes_contiguous_ooo_segments() {
         let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
         let buffers = runtime.buffers();
-        let mut driver = SessionDriverRuntime::new(DataWorkerId::new(0), buffers.clone());
+        let mut driver = SessionDriverRuntime::<FakeTxProtocol, Local>::new(
+            DataWorkerId::new(0),
+            buffers.clone(),
+        );
         let session_id = driver.insert_session(FakeTxProtocol::default());
 
         let future = buffers.alloc_index().expect("future buffer");
@@ -1745,7 +1765,10 @@ mod tests {
     fn session_tx_does_not_call_transport_when_app_has_no_pending_send() {
         let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
         let buffers = runtime.buffers();
-        let mut driver = SessionDriverRuntime::new(DataWorkerId::new(0), buffers.clone());
+        let mut driver = SessionDriverRuntime::<FakeTxProtocol, Local>::new(
+            DataWorkerId::new(0),
+            buffers.clone(),
+        );
         let session_id = driver.insert_session(FakeTxProtocol::default());
         driver.mark_ready(session_id);
         let next: crate::session::SessionQueueNext = NodeId::new(9).into();

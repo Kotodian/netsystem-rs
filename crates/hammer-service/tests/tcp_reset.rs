@@ -204,19 +204,20 @@ fn schedule_packet(runtime: &DataPlaneRuntime, reset: NodeId, packet: &[u8]) {
         .expect("mutate frame")
         .push_index(index)
         .expect("push packet");
-    runtime.schedule_frame(reset, frame).expect("schedule reset");
+    runtime
+        .schedule_frame(reset, frame)
+        .expect("schedule reset");
 }
 
 fn set_tcp_cursor(runtime: &DataPlaneRuntime, index: BufferIndex, packet_len: usize) {
     let mut buffer = runtime.get_buffer_mut(index).expect("buffer");
-    unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }
-        .set_packet_cursor(
-            BufferPacketCursor::new()
-                .with_packet_len(packet_len)
-                .with_network_header(0, 20)
-                .with_transport_header(20, 20)
-                .with_transport_payload_offset(40),
-        );
+    unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }.set_packet_cursor(
+        BufferPacketCursor::new()
+            .with_packet_len(packet_len)
+            .with_network_header(0, 20)
+            .with_transport_header(20, 20)
+            .with_transport_payload_offset(40),
+    );
 }
 
 fn ipv4_tcp_packet(flags: u8, sequence: u32, acknowledgment: u32, payload: &[u8]) -> Vec<u8> {

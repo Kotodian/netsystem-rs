@@ -27,7 +27,9 @@ impl Local {
     /// The base address is aligned to 64 bytes (cache line).
     pub fn new(size: usize) -> Self {
         let extra = 64usize;
-        let total = size.checked_add(extra).expect("Local segment size overflow");
+        let total = size
+            .checked_add(extra)
+            .expect("Local segment size overflow");
         let mut buf = vec![0u8; total].into_boxed_slice();
         let base_raw = buf.as_mut_ptr() as usize;
         let base_aligned = align_up(base_raw, 64);
@@ -39,6 +41,12 @@ impl Local {
                 base_offset,
             }),
         }
+    }
+}
+
+impl Default for Local {
+    fn default() -> Self {
+        Self::new(65536)
     }
 }
 
@@ -107,8 +115,8 @@ struct SvmInner {
 impl Svm {
     #[cfg(target_os = "linux")]
     pub fn create(name: &str, size: usize) -> Result<Self, io::Error> {
-        let c_name =
-            std::ffi::CString::new(name).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name contains nul"))?;
+        let c_name = std::ffi::CString::new(name)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name contains nul"))?;
         let fd = unsafe { libc::syscall(libc::SYS_memfd_create, c_name.as_ptr(), 0) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
@@ -116,7 +124,9 @@ impl Svm {
         let fd = fd as RawFd;
         let ret = unsafe { libc::ftruncate(fd, size as libc::off_t) };
         if ret != 0 {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
             return Err(io::Error::last_os_error());
         }
         Self::mmap_shared(fd, size, true)
@@ -130,10 +140,14 @@ impl Svm {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        unsafe { libc::shm_unlink(c_name.as_ptr()); }
+        unsafe {
+            libc::shm_unlink(c_name.as_ptr());
+        }
         let ret = unsafe { libc::ftruncate(fd, size as libc::off_t) };
         if ret != 0 {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
             return Err(io::Error::last_os_error());
         }
         Self::mmap_shared(fd, size, true)
@@ -317,7 +331,9 @@ mod tests {
     fn svm_cross_process_via_fd() {
         let seg = Svm::create("hammer_test_fork", 4096).expect("create");
         let off = seg.alloc(8, 1);
-        unsafe { std::ptr::write_bytes(seg.base().add(off as usize), 0x42, 8); }
+        unsafe {
+            std::ptr::write_bytes(seg.base().add(off as usize), 0x42, 8);
+        }
         let fd = seg.fd().unwrap();
         let pid = unsafe { libc::fork() };
         if pid == 0 {
@@ -326,7 +342,9 @@ mod tests {
             std::process::exit(if val == 0x42 { 0 } else { 1 });
         }
         let mut status = 0;
-        unsafe { libc::waitpid(pid, &mut status, 0); }
+        unsafe {
+            libc::waitpid(pid, &mut status, 0);
+        }
         assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
     }
 }

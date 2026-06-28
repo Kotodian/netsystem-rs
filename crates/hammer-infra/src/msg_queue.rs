@@ -99,6 +99,39 @@ impl<S: Segment> MsgQueue<S> {
         })
     }
 
+    /// Initialise a [`MsgQueue`] header at a pre-allocated offset in `seg`.
+    /// The caller must guarantee that `seg` has `sizeof(MsgQueueHeader) +
+    /// capacity * sizeof(SessionEvt)` bytes available at `hdr_offset`.
+    /// Signal fds must be set up separately (e.g. via `from_shared` for the
+    /// remote side, or by wrapping the returned queue).
+    pub unsafe fn init_at(seg: S, hdr_offset: u64, capacity: usize) -> Result<Self, MsgQueueError> {
+        if capacity < 2 || !capacity.is_power_of_two() {
+            return Err(MsgQueueError::InvalidCapacity);
+        }
+        let base = seg.base();
+        let hdr = unsafe { base.add(hdr_offset as usize) as *mut MsgQueueHeader };
+        unsafe {
+            std::ptr::write(
+                hdr,
+                MsgQueueHeader {
+                    head: AtomicU32::new(0),
+                    tail: AtomicU32::new(0),
+                    size: capacity as u32,
+                    mask: (capacity - 1) as u32,
+                },
+            );
+        }
+        Ok(Self {
+            seg,
+            base,
+            hdr,
+            hdr_off: hdr_offset,
+            signal_read: None,
+            signal_write: None,
+            signal_atomic: AtomicBool::new(false),
+        })
+    }
+
     pub unsafe fn from_shared(
         seg: S,
         offset: u64,
@@ -215,6 +248,16 @@ impl<S: Segment> MsgQueue<S> {
         self.signal_read
     }
 
+    pub fn write_fd(&self) -> Option<RawFd> {
+        self.signal_write
+    }
+
+    /// Offset of the [`MsgQueueHeader`] within the backing [`Segment`].
+    #[inline]
+    pub fn hdr_offset(&self) -> u64 {
+        self.hdr_off
+    }
+
     pub fn read_signal(&self) -> bool {
         self.drain()
     }
@@ -231,8 +274,7 @@ impl<S: Segment> MsgQueue<S> {
 
 impl MsgQueue<Local> {
     pub fn with_capacity(capacity: usize) -> Result<Self, MsgQueueError> {
-        let seg =
-            Local::new(size_of::<MsgQueueHeader>() + capacity * size_of::<SessionEvt>() + 64);
+        let seg = Local::new(size_of::<MsgQueueHeader>() + capacity * size_of::<SessionEvt>() + 64);
         Self::new(seg, capacity, false)
     }
 }
@@ -240,10 +282,14 @@ impl MsgQueue<Local> {
 impl<S: Segment> Drop for MsgQueue<S> {
     fn drop(&mut self) {
         if let Some(fd) = self.signal_read {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
         }
         if let Some(fd) = self.signal_write {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
         }
     }
 }

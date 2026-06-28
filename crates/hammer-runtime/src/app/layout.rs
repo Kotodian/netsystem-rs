@@ -26,7 +26,12 @@ impl SessionOffsets {
         let tx_fifo_off = seg.alloc(fifo_total, 64);
         let evt_q_off = seg.alloc(msgq_total, 64);
         let tx_evt_q_off = seg.alloc(msgq_total, 64);
-        Self { rx_fifo_off, tx_fifo_off, evt_q_off, tx_evt_q_off }
+        Self {
+            rx_fifo_off,
+            tx_fifo_off,
+            evt_q_off,
+            tx_evt_q_off,
+        }
     }
 }
 

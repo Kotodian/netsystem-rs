@@ -66,6 +66,44 @@ impl AppSession<Local> {
             handle,
         })
     }
+
+    /// In-process variant that uses a shared runtime-side TX event queue
+    /// instead of creating a private per-session queue. The shared queue
+    /// is owned by `SessionAppRuntime` so the dataplane side can drain
+    /// all TX events from a single ring.
+    pub fn local_with_runtime_tx(
+        config: AppSessionConfig,
+        handle: SessionHandle,
+        runtime_tx_evt_q: Arc<MsgQueue<Local>>,
+    ) -> HammerResult<Self> {
+        let rx_fifo = Arc::new(
+            Fifo::<Local>::with_capacity(config.fifo_capacity)
+                .map_err(|_| HammerError::internal("invalid rx fifo capacity"))?,
+        );
+        let tx_fifo = Arc::new(
+            Fifo::<Local>::with_capacity(config.fifo_capacity)
+                .map_err(|_| HammerError::internal("invalid tx fifo capacity"))?,
+        );
+        let ring_slots = config
+            .evt_q_capacity
+            .checked_add(1)
+            .ok_or_else(|| HammerError::internal("app session evt_q capacity overflow"))?;
+        let ring_size = ring_slots.next_power_of_two().max(2);
+        let evt_q = Arc::new(
+            MsgQueue::<Local>::with_capacity(ring_size)
+                .map_err(|_| HammerError::internal("invalid app session evt_q capacity"))?,
+        );
+        Ok(Self {
+            rx_fifo,
+            tx_fifo,
+            evt_q,
+            tx_evt_q: runtime_tx_evt_q,
+            rx_readable: Notify::new(),
+            tx_writable: Notify::new(),
+            evt_readable: Notify::new(),
+            handle,
+        })
+    }
 }
 
 impl<S: Segment> AppSession<S> {
@@ -97,12 +135,8 @@ impl<S: Segment> AppSession<S> {
         tx_evt_q_write: Option<RawFd>,
     ) -> Self {
         Self {
-            rx_fifo: Arc::new(unsafe {
-                Fifo::from_shared(seg.clone(), offsets.rx_fifo_off)
-            }),
-            tx_fifo: Arc::new(unsafe {
-                Fifo::from_shared(seg.clone(), offsets.tx_fifo_off)
-            }),
+            rx_fifo: Arc::new(unsafe { Fifo::from_shared(seg.clone(), offsets.rx_fifo_off) }),
+            tx_fifo: Arc::new(unsafe { Fifo::from_shared(seg.clone(), offsets.tx_fifo_off) }),
             evt_q: Arc::new(unsafe {
                 MsgQueue::from_shared(seg.clone(), offsets.evt_q_off, evt_q_read, evt_q_write)
             }),

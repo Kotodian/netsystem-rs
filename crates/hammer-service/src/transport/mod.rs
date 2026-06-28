@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
+use std::sync::OnceLock;
+
 use arc_swap::ArcSwapOption;
+use hammer_core::config::SessionBackend;
 use hammer_core::config::network::CongestionController;
 use hammer_core::error::HammerResult;
 use hammer_core::registry::RuntimeRegistry;
@@ -11,15 +14,23 @@ pub mod udp;
 
 pub struct TransportMain {
     congestion: CongestionController,
+    session_backend: SessionBackend,
 }
 
 impl TransportMain {
-    pub fn new(congestion: CongestionController) -> Self {
-        Self { congestion }
+    pub fn new(congestion: CongestionController, session_backend: SessionBackend) -> Self {
+        Self {
+            congestion,
+            session_backend,
+        }
     }
 
     pub fn congestion(&self) -> CongestionController {
         self.congestion
+    }
+
+    pub fn session_backend(&self) -> SessionBackend {
+        self.session_backend
     }
 }
 
@@ -31,6 +42,14 @@ impl TransportMain {
 // for test isolation — neither of which `OnceLock` provides.
 pub static TRANSPORT_MAIN: ArcSwapOption<TransportMain> = ArcSwapOption::const_empty();
 
+/// Convenience accessor for the config-level session backend enum.
+pub fn session_backend() -> Option<SessionBackend> {
+    TRANSPORT_MAIN
+        .load()
+        .as_deref()
+        .map(|m| m.session_backend())
+}
+
 #[cfg(test)]
 pub(crate) fn reset_for_test() {
     TRANSPORT_MAIN.store(None);
@@ -38,7 +57,10 @@ pub(crate) fn reset_for_test() {
 
 pub fn init(reg: &RuntimeRegistry) -> HammerResult<()> {
     let config = reg.require::<hammer_core::config::Config>()?;
-    TRANSPORT_MAIN.store(Some(Arc::new(TransportMain::new(config.network.tcp.congestion))));
+    TRANSPORT_MAIN.store(Some(Arc::new(TransportMain::new(
+        config.network.tcp.congestion,
+        config.network.session.backend,
+    ))));
     Ok(())
 }
 
@@ -61,6 +83,30 @@ macro_rules! with_congestion {
         {
             ::hammer_core::config::network::CongestionController::Bbr => {
                 type $cc = $crate::transport::congestion::BbrController;
+                $body
+            }
+        }
+    }};
+}
+
+/// Config → segment type dispatch point.
+#[macro_export]
+macro_rules! with_segment {
+    (|$seg:ident| $body:expr) => {{
+        match crate::transport::TRANSPORT_MAIN
+            .load()
+            .as_deref()
+            .ok_or_else(|| {
+                ::hammer_core::error::CoreError::internal("transport main not initialized")
+            })?
+            .session_backend()
+        {
+            ::hammer_core::config::SessionBackend::Local => {
+                type $seg = ::hammer_infra::segment::Local;
+                $body
+            }
+            ::hammer_core::config::SessionBackend::Svm => {
+                type $seg = ::hammer_infra::segment::Svm;
                 $body
             }
         }

@@ -1967,9 +1967,8 @@ impl BufferPool {
             current = pool.next_buffer(current_index)?;
         }
 
-        let cut_buffer = cut_buffer.ok_or_else(|| {
-            CoreError::internal("buffer truncate extends current length")
-        })?;
+        let cut_buffer = cut_buffer
+            .ok_or_else(|| CoreError::internal("buffer truncate extends current length"))?;
         if cut_buffer != index {
             pool.ensure_header_exclusive(cut_buffer)?;
         }
@@ -1977,17 +1976,20 @@ impl BufferPool {
         let head_current_len = pool.buffer(index)?.current_len();
         let head_had_next = pool.next_buffer(index)?.is_some();
 
-        pool.buffer_mut(cut_buffer)?.set_current_len(cut_remainder)?;
+        pool.buffer_mut(cut_buffer)?
+            .set_current_len(cut_remainder)?;
 
         if cut_buffer == index {
             if head_had_next {
                 pool.buffer_mut(index)?.set_next_buffer(None);
-                pool.buffer_mut(index)?.set_total_len_not_including_first(0)?;
+                pool.buffer_mut(index)?
+                    .set_total_len_not_including_first(0)?;
             }
         } else {
             pool.buffer_mut(cut_buffer)?.set_next_buffer(None);
             let new_total_tail = len - head_current_len;
-            pool.buffer_mut(index)?.set_total_len_not_including_first(new_total_tail)?;
+            pool.buffer_mut(index)?
+                .set_total_len_not_including_first(new_total_tail)?;
         }
         Ok(())
     }
