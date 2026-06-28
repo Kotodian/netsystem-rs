@@ -2,6 +2,7 @@
 // downstream call sites can `use hammer_runtime::adapter::Lifecycle` if they
 // prefer the runtime crate's namespace.
 pub mod engine;
+pub use engine::{Engine, EnginePool};
 pub mod init;
 
 pub mod adapter {
