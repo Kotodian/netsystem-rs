@@ -16,6 +16,7 @@ crossbeam-queue = { workspace = true }
 crossbeam-utils = { workspace = true }
 ipnet = { workspace = true }
 tokio = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

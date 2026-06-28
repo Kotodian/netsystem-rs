@@ -9,6 +9,7 @@ pub mod node;
 pub mod platform;
 pub mod service;
 pub mod trace;
+pub mod wakeup;
 
 pub use buffer::{
     BUFFER_CACHE_LINE_SIZE, BUFFER_INVALID_INDEX, Buffer, BufferFlags, BufferFrame,
