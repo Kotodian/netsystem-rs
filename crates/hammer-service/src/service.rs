@@ -443,6 +443,15 @@ impl RuntimeService<Local> {
                 return Err(err);
             }
         };
+        if let Some((wait, workers, n_workers)) =
+            hammer_runtime::start_workers::WORKER_BARRIER_ARCS.get()
+        {
+            control_handle.set_barrier_arcs(
+                Arc::clone(wait),
+                Arc::clone(workers),
+                *n_workers,
+            );
+        }
         let tcp_listener_control = RuntimeTcpListenerControlHandle::new(listener_state);
         let writer: Arc<dyn LogWriter> = Arc::clone(&control_handle) as Arc<dyn LogWriter>;
         let log_factory = Factory::new_with_min_level(base_time, writer, config.log.level);

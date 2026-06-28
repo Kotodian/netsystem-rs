@@ -9,7 +9,7 @@ use hammer_core::error::HammerResult;
 
 pub const WORKER_COUNT: u32 = 2;
 
-pub(crate) static WORKER_BARRIER_ARCS: OnceLock<(Arc<AtomicU32>, Arc<AtomicU32>, u32)> =
+pub static WORKER_BARRIER_ARCS: OnceLock<(Arc<AtomicU32>, Arc<AtomicU32>, u32)> =
     OnceLock::new();
 
 pub fn start_workers(engine: &mut Engine) -> HammerResult<()> {
