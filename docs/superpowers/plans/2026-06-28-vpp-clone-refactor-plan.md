@@ -223,18 +223,74 @@ pub enum IpcReply {
 - [ ] B10. Run `cargo test -p hammer-core` (init framework tests), then `cargo test --workspace`. All existing tests must still pass (`tcp_control_plane.rs`, etc.), possibly with the migration dual-path.
 - [ ] B11. `cargo fmt --all && cargo clippy --workspace --all-targets`.
 
-## Phase C — Worker Fork + vlib Main Loop + Barrier
+## Phase C — Atomic Barrier + WakeupFd + engine_main_loop + Worker Fork
 
-- [ ] C1. `hammer-adapter`: implement `WakeupFd` trait + `LinuxEventfdWakeup` (cfg linux: `eventfd(EFD_NONBLOCK|EFD_CLOEXEC)`, `wake` writes 8 bytes, `consume` reads) and `MacosKqueueWakeup` (cfg macos: `kqueue()`, register `EVFILT_USER` ident, `wake` posts `kevent(NOTE_TRIGGER|NOTE_FFUNEPOCH` bump), `consume` is a no-op clear via `EV_CLEAR`). Add platform-agnostic factory `WakeupFd::new()`.
-- [ ] C2. Implement barrier atomics in `EngineMain`: `wait_at_barrier: Arc<AtomicU32>`, `workers_at_barrier: Arc<AtomicU32>`. All workers share the same `Arc` pair (allocated once in `start_workers`). Document the memory ordering contract inline (mirror VPP `threads.c:296`).
-- [ ] C3. Implement `start_workers` registered as `#[main_loop_enter_function(name="start_workers")]`. Body: allocate shared barrier `Arc`s, for each worker 1..n: `fork_worker(idx)`, set `wait_at_barrier`/`workers_at_barrier` arcs, `pthread_create` on assigned core (Linux `pthread_setaffinity_np` per `cpu` config; macOS QoS class), entry `vlib_worker_thread_bootstrap_fn`. After all spawned, run `WORKER_INIT_FUNCTIONS` topo-sorted on each worker, then `num_workers_change` callbacks.
-- [ ] C4. Implement `engine_main_loop(vm: &Arc<EngineMain>) -> i32` (the vlib-style fixed-schedule loop): each iteration: (1) `barrier_check` (if `*wait_at_barrier==1`, `workers_at_barrier.fetch_add(1, Release)` then spin acquire until `*wait_at_barrier==0`); (2) flush pending RPC + drain handoff queues; (3) main-loop callbacks; (4) `file_poll` on worker-local epoll/kqueue (input fds, `wakeup_fd`, msg-queue eventfds); (5) dispatch polling-state nodes per `nodes_by_type`; (6) dispatch interrupt nodes (bitset scan); (7) dispatch timing-wheel-fired sched nodes; (8) drain `pending_frames`; advance timers; `main_loop_count += 1`; (9) if `main_loop_exit_now` → return.
-- [ ] C5. Implement ControlThread barrier coordination methods: `barrier_sync()` (set `*wait_at_barrier=1`, spin until `*workers_at_barrier==n`), `barrier_release()` (set `*workers_at_barrier=0; *wait_at_barrier=0`). Wire to the existing `control_call`/`control_blocking_call` path so non-mp-safe control-plane mutations take the barrier.
-- [ ] C6. Replace `data_context.install_on_workers(...)` + per-worker `init_graph(worker, ...)` with the `fork_worker`+`start_workers` path. Delete the old install path.
-- [ ] C7. Add unit test `barrier_single_worker`: spawn 1 worker, sync barrier from control, mutate shared state, release, verify worker resumed. Add `barrier_multi_worker` with 4 workers.
-- [ ] C8. Add integration test replacing `tcp_control_plane.rs` worker-spawn path — verify it still passes after the fork migration.
-- [ ] C9. `cargo test --workspace`. Resolve any breakage from the worker-spawn path change.
-- [ ] C10. `cargo fmt --all && cargo clippy --workspace --all-targets`.
+**Design constraints (per user approval):**
+- VPP-style atomic barrier `(wait_at_barrier / workers_at_barrier Arc<AtomicU32>)` — delete `DataPlaneBarrierState`/`Handle`/`Guard`/`Control` from spawn.rs entirely
+- `WakeupFd` factory returns `impl WakeupFd` (no `Box<dyn>`, no enum dispatch) — one concrete `Wakeup` per target via cfg
+- RAII `BarrierGuard` with plain `Drop` release — no `Held`/`Released` type-state ceremony
+- `fork_worker` = per-thread `DataPlaneRuntime::with_buffer_capacity(...)` + `init_graph()` — fresh construction, NOT Rc-clone-and-send (DataPlaneRuntime is !Send)
+- `engine_main_loop` in vlib fixed-schedule step order (main.c:1442-1693); tokio reactor driven as step #4 — existing transport/session futures keep working
+- No `WorkerIdx` newtype, no `WorkerSpawnError` enum — `u32`, `HammerError::internal`
+- `#[must_use]` on `BarrierGuard`
+- `thiserror` for `WakeupFdError` only; runtime errors reuse `HammerError::internal`
+- No `unwrap`/`expect` outside bootstrap paths; no `_underscore` bindings
+- `&T` borrows throughout `barrier_check`/`engine_main_loop`; no clones in the loop
+- `!Send` `DataPlaneRuntime` stays thread-local via existing `DATA_PLANE_RUNTIME` pattern
+
+**Memory ordering (VPP threads.c:296 barrier_check):**
+- `wait_at_barrier` release-store by main, acquire-load by workers
+- `workers_at_barrier` `fetch_add(1, Release)` by workers, `load(Acquire)` by main
+- Both use `SeqCst` where VPP uses `__sync_synchronize` (full barrier)
+
+- [ ] C1. New files:
+  - `crates/hammer-adapter/src/wakeup.rs`: `WakeupFd` trait (`wake`, `consume`, `raw_fd`), `cfg(target_os = "linux") LinuxEventfdWakeup` (eventfd EFD_NONBLOCK|EFD_CLOEXEC), `cfg(target_os = "macos") MacosKqueueWakeup` (kqueue + EVFILT_USER ident, wake via kevent NOTE_TRIGGER, EV_CLEAR for consume), platform-generic `WakeupFd::new() -> io::Result<impl WakeupFd>` factory. `thiserror`-derived `WakeupFdError`. Unit test `wakeup_self_roundtrip`: create wakeup, wake, consume, assert no spurious wake.
+  - Add `pub mod wakeup;` to `hammer-adapter/src/lib.rs`.
+- [ ] C2. New files:
+  - `crates/hammer-runtime/src/barrier.rs`: `BarrierGuard(Arc<AtomicU32>, Arc<AtomicU32>)` with `#[must_use]`. Static fn `barrier_sync(wait: &AtomicU32, workers: &AtomicU32, n_workers: u32) -> BarrierGuard`. Drop: `barrier_release(wait, workers)`. Module fns: `fn barrier_check(wait: &AtomicU32, workers: &AtomicU32)` — if `wait.load(Acquire) > 0`, `workers.fetch_add(1, Release)`, spin `while wait.load(Acquire) > 0 { spin_loop_hint() }`. Doc comment cites VPP threads.c:296.
+  - Delete from `crates/hammer-runtime/src/spawn.rs`: `DataPlaneBarrierState` struct, `BarrierStateHandle`, `BarrierGuard`, `BarrierControl`, and the barrier initialization block in `SpawnContext` (lines ~70-99 and ~670-793). Remove `barrier` field from `SpawnContext`.
+  - Unit tests: `barrier_sync_barrier_check_roundtrip` (AtomicBool flag protected by barrier, single mock worker thread), `barrier_concurrent_workers` (4 threads, all must reach barrier before any proceeds).
+  - Add `pub mod barrier;` to `hammer-runtime/src/lib.rs`.
+- [ ] C3. New file `crates/hammer-runtime/src/start_workers.rs`:
+  - `#[init_function(name = "start_workers")] fn start_workers(vm: &EngineMain) -> Result<()>`.
+  - Allocate `Arc<AtomicU32>` pair for barrier.
+  - For each worker index 1..n: call `DataPlaneRuntime::with_buffer_capacity(...)`, `let engine = DataPlaneRuntime::new_engine(barrier.clone())`, store arcs in shared vec. Spawn OS thread via `std::thread::Builder` with name `hammer-worker-{idx}`, entry `worker_main(idx, engine, wait_arc, workers_arc)`.
+  - `fn worker_main(idx: u32, engine: Engine, wait: Arc<AtomicU32>, workers: Arc<AtomicU32>)`: install DataPlaneRuntime into thread-local, call `init_graph(worker=idx, ...)`, call `engine_main_loop(&engine)`.
+  - Add `pub mod start_workers;` to `hammer-runtime/src/lib.rs`.
+  - Target is vlib-style fork: fresh DataPlaneRuntime, NOT clone-and-send of the main-thread's Rc<RefCell> graph state.
+- [ ] C4. New file `crates/hammer-runtime/src/main_loop.rs`:
+  - `fn engine_main_loop(engine: &Engine) -> i32`: vlib fixed-schedule per iteration:
+    (1) `barrier::barrier_check(&engine.wait_at_barrier, &engine.workers_at_barrier)`
+    (2) flush pending RPC + drain handoff queues (existing `drain_handoffs()`)
+    (3) main-loop callbacks (currently no-op; hook for future)
+    (4) tokio reactor tick: `DATA_PLANE_RUNTIME.with(|r| r.tokio_handle.borrow().as_ref().map(|h| h.try_current()))` — drive existing transport/session futures
+    (5) dispatch polling-state nodes per `nodes_by_type` (existing dispatching)
+    (6) dispatch interrupt nodes (bitset scan via existing `interrupt_node_mask`)
+    (7) dispatch timer nodes (timing wheel pop)
+    (8) drain `pending_frames`, advance timers, `main_loop_count += 1`
+    (9) if `main_loop_exit_now` → return exit status
+  - Keep existing `tun_read_callback` / `tun_write_callback` or integrate into step (4) file_poll if epoll/kqueue is present.
+  - Reference: VPP `main.c:1442-1693` step order.
+- [ ] C5. Modify `crates/hammer-runtime/src/control_thread.rs`:
+  - Add `fn control_call_with_barrier<R>(&self, n_workers: u32, f: impl FnOnce() -> R) -> R`.
+  - Body: `let _guard = barrier::barrier_sync(&wait, &workers, n_workers); f()`. Guard drop releases barrier.
+  - Keep existing `control_call` for mp-safe reads (no barrier needed).
+  - Wire the ControlThread's barrier arcs to those created in `start_workers`.
+- [ ] C6. Modify `crates/hammer-service/src/packet_graph.rs`:
+  - Add `#[worker_init_function(name = "install_worker_graph")] fn install_worker_graph(vm: &EngineMain)`.
+  - Move body of `service.rs:390-414` closure `install_on_workers` into this function.
+  - Delete `install_on_workers` closure from `crates/hammer-service/src/service.rs`.
+  - This must compile so `start_workers` can call it.
+- [ ] C7. Unit tests:
+  - `barrier_single_worker`: spawn 1 worker thread running a loop that calls `barrier_check` each iteration. Control thread calls `barrier_sync` -> `barrier_release`. Verify worker flag toggled.
+  - `barrier_multi_worker`: 4 workers, all must reach barrier before any continues.
+  - `engine_main_loop_exits_on_flag`: spawn worker with `main_loop_exit_now=true`, verify loop returns quickly.
+  - `wakeup_self_roundtrip` (for C1, if not already added in C1).
+- [ ] C8. Integration test `crates/hammer-runtime/tests/worker_spawn.rs`:
+  - Start N workers via `start_workers`, verify they enter engine_main_loop. Use `control_call_with_barrier` to mutate a shared AtomicU32, verify all workers observe the new value after barrier release.
+  - Alternatively, validate via spying on `main_loop_count`.
+- [ ] C9. `cargo test --workspace` — all existing tests (tcp_control_plane, session lifecycles, transport) must still pass. Resolve any breakage.
+- [ ] C10. `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings`. This is the pre-merge gate.
 
 ## Phase D — IPC + Binary + Lifecycle Re-attach
 
