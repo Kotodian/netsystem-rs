@@ -113,7 +113,7 @@ fn init_data_plane_runtime(slot_capacity: usize, slots: usize) {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct DataRemoteLocalQueue {
+pub struct DataRemoteLocalQueue {
     tasks: Arc<Mutex<VecDeque<RemoteDataLocalTask>>>,
     thread: Arc<Mutex<Option<thread::Thread>>>,
 }
@@ -662,7 +662,7 @@ impl Drop for DataPlaneBarrierGuard {
 }
 
 impl DataRemoteLocalQueue {
-    pub(crate) fn attach_current_thread(&self) {
+    pub fn attach_current_thread(&self) {
         *self
             .thread
             .lock()
@@ -1304,7 +1304,7 @@ pub async fn yield_local_now() {
     YieldLocal { yielded: false }.await
 }
 
-pub(crate) fn set_data_plane_runtime(runtime: RuntimeDataPlaneRuntime) {
+pub fn set_data_plane_runtime(runtime: RuntimeDataPlaneRuntime) {
     DATA_PLANE_RUNTIME.with(|slot| {
         *slot.borrow_mut() = Some(runtime);
     });

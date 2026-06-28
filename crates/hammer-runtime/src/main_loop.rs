@@ -21,7 +21,7 @@ use crate::spawn::{DATA_LOCAL_DRIVER_WAKER, DATA_WORKER_IDLE_SLICE, with_data_pl
 /// 7. Dispatch timer nodes (no timer wheel in data-plane yet)
 /// 8. Advance timers, increment main_loop_count
 /// 9. Exit if main_loop_exit_now
-pub(crate) fn engine_main_loop(
+pub fn engine_main_loop(
     engine: &Engine,
     runtime: &tokio::runtime::Runtime,
     remote_local: &spawn::DataRemoteLocalQueue,
