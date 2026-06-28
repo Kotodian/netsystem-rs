@@ -1,0 +1,21 @@
+[package]
+name = "hammer"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "hammer"
+path = "src/main.rs"
+
+[dependencies]
+hammer-runtime = { path = "../hammer-runtime" }
+hammer-ipc = { path = "../hammer-ipc" }
+hammer-service = { path = "../hammer-service" }
+hammer-control = { path = "../hammer-control" }
+hammer-core = { path = "../hammer-core" }
+clap = { workspace = true, features = ["derive"] }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

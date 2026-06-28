@@ -9,8 +9,9 @@ members = [
     "crates/hammer-runtime",
     "crates/hammer-service",
     "crates/hammer-app",
-    "crates/hammer-ffi",
-    "crates/hammer-uniffi-bindgen",
+    "crates/hammer-ipc",
+    "crates/hammer",
+    "crates/hammerctl",
 ]
 exclude = [
     "third_party/boringtun",
@@ -21,21 +22,11 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
-# Size-optimised release profile for the hammer-ffi static library that ships
-# inside the iOS xcframework. fat LTO + single CGU enables cross-crate dead
-# code elimination; opt-level "z" + strip drops another large slice without
-# noticeable runtime cost for a network proxy workload.
 [profile.release]
-lto = "fat"
-codegen-units = 1
-panic = "abort"
-strip = "symbols"
-opt-level = "z"
+lto = "thin"
+codegen-units = 16
+opt-level = 3
 
-# Profiling-friendly variant: same codegen as release but keeps line-table
-# debuginfo so iOS Instruments can symbolicate Rust frames. Build via
-# `PROFILE=release-perf ./scripts/build-xcframework.sh`. Not the default — the
-# binary is ~30-50% larger because of the line tables.
 [profile.release-perf]
 inherits = "release"
 debug = "line-tables-only"
@@ -51,7 +42,7 @@ nom = "8"
 thiserror = "2.0"
 async-trait = "0.1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std", "fmt", "env-filter"] }
 metrics = "0.24"
 metrics-derive = "0.1"
 humantime-serde = "1.1"
@@ -70,15 +61,14 @@ ipnet = { version = "2", features = ["serde"] }
 libc = "0.2"
 core_affinity = "0.8"
 thread-priority = "1.2"
-# Fast non-cryptographic hasher for internal HashMaps. Used by the ipstack
-# actor to keep `tcp_bridges` / `udp_bridges` lookups out of the SipHasher
-# path (~1.6% CPU on the wg hot path under sustained video).
 rustc-hash = "2"
-uniffi = "0.31"
 indoc = "2.0"
 rcgen = "0.14"
 criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
 linkme = "0.3"
+petgraph = "0.6"
+clap = "4"
+bincode = "1"
 
 [patch.crates-io]
 boringtun = { path = "third_party/boringtun" }

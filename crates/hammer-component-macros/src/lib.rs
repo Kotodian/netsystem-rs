@@ -1261,6 +1261,308 @@ fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<T
     })
 }
 
+// ── Init / Config function macros (VPP VLIB_INIT_FUNCTION / VLIB_CONFIG_FUNCTION) ──
+
+struct InitFnArgs {
+    name: LitStr,
+    runs_before: Vec<LitStr>,
+    runs_after: Vec<LitStr>,
+}
+
+impl Parse for InitFnArgs {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let mut name = None;
+        let mut runs_before = Vec::new();
+        let mut runs_after = Vec::new();
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            match key.to_string().as_str() {
+                "name" => {
+                    if name.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `name` argument"));
+                    }
+                    name = Some(input.parse()?);
+                }
+                "runs_before" => runs_before = parse_litstr_array(input)?,
+                "runs_after" => runs_after = parse_litstr_array(input)?,
+                other => return Err(Error::new(key.span(), format!(
+                    "unknown argument `{other}`; expected `name`, `runs_before`, or `runs_after`"
+                ))),
+            }
+            if input.parse::<Option<Token![,]>>()?.is_none() {
+                break;
+            }
+        }
+        Ok(Self {
+            name: name.ok_or_else(|| Error::new(Span::call_site(), "missing `name` argument"))?,
+            runs_before,
+            runs_after,
+        })
+    }
+}
+
+struct ConfigFnArgs {
+    name: LitStr,
+    early: bool,
+}
+
+impl Parse for ConfigFnArgs {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let mut name = None;
+        let mut early = None;
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            match key.to_string().as_str() {
+                "name" => {
+                    if name.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `name` argument"));
+                    }
+                    name = Some(input.parse()?);
+                }
+                "early" => {
+                    if early.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `early` argument"));
+                    }
+                    let v: Ident = input.parse()?;
+                    early = Some(match v.to_string().as_str() {
+                        "true" => true,
+                        "false" => false,
+                        _ => return Err(Error::new(v.span(), "expected `true` or `false`")),
+                    });
+                }
+                other => return Err(Error::new(key.span(), format!(
+                    "unknown argument `{other}`; expected `name` or `early`"
+                ))),
+            }
+            if input.parse::<Option<Token![,]>>()?.is_none() {
+                break;
+            }
+        }
+        Ok(Self {
+            name: name.ok_or_else(|| Error::new(Span::call_site(), "missing `name` argument"))?,
+            early: early.unwrap_or(false),
+        })
+    }
+}
+
+struct WorkerInitFnArgs {
+    name: LitStr,
+    runs_after: Vec<LitStr>,
+}
+
+impl Parse for WorkerInitFnArgs {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let mut name = None;
+        let mut runs_after = Vec::new();
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            match key.to_string().as_str() {
+                "name" => {
+                    if name.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `name` argument"));
+                    }
+                    name = Some(input.parse()?);
+                }
+                "runs_after" => runs_after = parse_litstr_array(input)?,
+                other => return Err(Error::new(key.span(), format!(
+                    "unknown argument `{other}`; expected `name` or `runs_after`"
+                ))),
+            }
+            if input.parse::<Option<Token![,]>>()?.is_none() {
+                break;
+            }
+        }
+        Ok(Self {
+            name: name.ok_or_else(|| Error::new(Span::call_site(), "missing `name` argument"))?,
+            runs_after,
+        })
+    }
+}
+
+fn parse_litstr_array(input: ParseStream<'_>) -> Result<Vec<LitStr>> {
+    let content;
+    bracketed!(content in input);
+    let mut values = Vec::new();
+    while !content.is_empty() {
+        values.push(content.parse()?);
+        if content.parse::<Option<Token![,]>>()?.is_none() {
+            break;
+        }
+    }
+    Ok(values)
+}
+
+fn init_function_static_name(fn_name: &LitStr) -> Ident {
+    let name_str = fn_name.value();
+    let sanitized: String = name_str
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    format_ident!("__INIT_FN_{}", sanitized.to_ascii_uppercase())
+}
+
+/// Registers a function as an init function in the topologically-sorted init chain.
+///
+/// Example:
+/// ```ignore
+/// #[init_function(name = "tcp_init", runs_after = ["buffer_main_init"], runs_before = ["session_init"])]
+/// fn tcp_init(vm: &mut EngineMain) -> Result<()> { ... }
+/// ```
+#[proc_macro_attribute]
+pub fn init_function(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as InitFnArgs);
+    let fn_item = parse_macro_input!(input as syn::ItemFn);
+    let fn_name = &fn_item.sig.ident;
+    let name = args.name;
+    let runs_before = args.runs_before;
+    let runs_after = args.runs_after;
+    let static_ident = init_function_static_name(&name);
+
+    let expanded = quote! {
+        #fn_item
+
+        #[::linkme::distributed_slice(::hammer_core::init::INIT_FUNCTIONS)]
+        static #static_ident: ::hammer_core::init::InitFunction = ::hammer_core::init::InitFunction {
+            name: #name,
+            runs_before: &[#(#runs_before),*],
+            runs_after: &[#(#runs_after),*],
+            func: #fn_name,
+        };
+    };
+    expanded.into()
+}
+
+/// Registers a function as a config function for TOML block dispatching.
+///
+/// Example:
+/// ```ignore
+/// #[config_function(name = "tcp", early = false)]
+/// fn tcp_config(vm: &mut EngineMain, input: &toml::Value) -> Result<()> { ... }
+/// ```
+#[proc_macro_attribute]
+pub fn config_function(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as ConfigFnArgs);
+    let fn_item = parse_macro_input!(input as syn::ItemFn);
+    let fn_name = &fn_item.sig.ident;
+    let name = args.name;
+    let early = args.early;
+    let static_ident = init_function_static_name(&name);
+    let slice = if early {
+        quote!(::hammer_core::init::EARLY_CONFIG_FUNCTIONS)
+    } else {
+        quote!(::hammer_core::init::CONFIG_FUNCTIONS)
+    };
+
+    let expanded = quote! {
+        #fn_item
+
+        #[::linkme::distributed_slice(#slice)]
+        static #static_ident: ::hammer_core::init::ConfigFunction = ::hammer_core::init::ConfigFunction {
+            name: #name,
+            func: #fn_name,
+        };
+    };
+    expanded.into()
+}
+
+/// Shorthand for `#[config_function(name = "...", early = true)]`.
+#[proc_macro_attribute]
+pub fn early_config_function(args: TokenStream, input: TokenStream) -> TokenStream {
+    let attr: proc_macro2::TokenStream = quote!(name = #args, early = true);
+    config_function(attr.into(), input)
+}
+
+/// Registers a function to run at main-loop-enter time (e.g., `start_workers`).
+///
+/// Example:
+/// ```ignore
+/// #[main_loop_enter_function]
+/// fn start_workers(vm: &mut EngineMain) -> Result<()> { ... }
+/// ```
+#[proc_macro_attribute]
+pub fn main_loop_enter_function(args: TokenStream, input: TokenStream) -> TokenStream {
+    if !args.is_empty() {
+        return Error::new(Span::call_site(), "`main_loop_enter_function` does not accept arguments")
+            .to_compile_error()
+            .into();
+    }
+    let fn_item = parse_macro_input!(input as syn::ItemFn);
+    let fn_name = &fn_item.sig.ident;
+    let static_ident = format_ident!("__MAIN_LOOP_ENTER_{}", fn_name);
+
+    let expanded = quote! {
+        #fn_item
+
+        #[::linkme::distributed_slice(::hammer_core::init::MAIN_LOOP_ENTER_FUNCTIONS)]
+        static #static_ident: ::hammer_core::init::InitFunction = ::hammer_core::init::InitFunction {
+            name: stringify!(#fn_name),
+            runs_before: &[],
+            runs_after: &[],
+            func: #fn_name,
+        };
+    };
+    expanded.into()
+}
+
+/// Registers a function to run at main-loop-exit time.
+#[proc_macro_attribute]
+pub fn main_loop_exit_function(args: TokenStream, input: TokenStream) -> TokenStream {
+    if !args.is_empty() {
+        return Error::new(Span::call_site(), "`main_loop_exit_function` does not accept arguments")
+            .to_compile_error()
+            .into();
+    }
+    let fn_item = parse_macro_input!(input as syn::ItemFn);
+    let fn_name = &fn_item.sig.ident;
+    let static_ident = format_ident!("__MAIN_LOOP_EXIT_{}", fn_name);
+
+    let expanded = quote! {
+        #fn_item
+
+        #[::linkme::distributed_slice(::hammer_core::init::MAIN_LOOP_EXIT_FUNCTIONS)]
+        static #static_ident: ::hammer_core::init::InitFunction = ::hammer_core::init::InitFunction {
+            name: stringify!(#fn_name),
+            runs_before: &[],
+            runs_after: &[],
+            func: #fn_name,
+        };
+    };
+    expanded.into()
+}
+
+/// Registers a per-worker init function in the topologically-sorted worker init chain.
+///
+/// Example:
+/// ```ignore
+/// #[worker_init_function(name = "tcp_worker_init", runs_after = ["generic_worker_init"])]
+/// fn tcp_worker_init(vm: &mut EngineMain) -> Result<()> { ... }
+/// ```
+#[proc_macro_attribute]
+pub fn worker_init_function(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as WorkerInitFnArgs);
+    let fn_item = parse_macro_input!(input as syn::ItemFn);
+    let fn_name = &fn_item.sig.ident;
+    let name = args.name;
+    let runs_after = args.runs_after;
+    let static_ident = init_function_static_name(&name);
+
+    let expanded = quote! {
+        #fn_item
+
+        #[::linkme::distributed_slice(::hammer_core::init::WORKER_INIT_FUNCTIONS)]
+        static #static_ident: ::hammer_core::init::InitFunction = ::hammer_core::init::InitFunction {
+            name: #name,
+            runs_before: &[],
+            runs_after: &[#(#runs_after),*],
+            func: #fn_name,
+        };
+    };
+    expanded.into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

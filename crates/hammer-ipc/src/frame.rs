@@ -1,0 +1,53 @@
+//! Message framing: [u32 BE length][payload]
+//! Error types for the IPC layer.
+
+use std::io::{Read, Write};
+
+const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024; // 16 MB
+const MAX_FRAME_SIZE_STR: &str = "16 MB";
+
+/// IPC protocol error.
+#[derive(Debug, thiserror::Error)]
+pub enum IpcError {
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("frame too large: {0} bytes (max {MAX_FRAME_SIZE_STR})")]
+    FrameTooLarge(usize),
+    #[error("bincode error: {0}")]
+    Bincode(String),
+    #[error("connection closed")]
+    ConnectionClosed,
+}
+
+impl From<bincode::Error> for IpcError {
+    fn from(e: bincode::Error) -> Self {
+        IpcError::Bincode(e.to_string())
+    }
+}
+
+/// Read a length-prefixed frame from the stream.
+/// Frame format: [4 bytes BE u32 length][payload]
+pub fn read_frame<R: Read>(stream: &mut R) -> Result<Vec<u8>, IpcError> {
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf)?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME_SIZE {
+        return Err(IpcError::FrameTooLarge(len));
+    }
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload)?;
+    Ok(payload)
+}
+
+/// Write a length-prefixed frame to the stream.
+/// Frame format: [4 bytes BE u32 length][payload]
+pub fn write_frame<W: Write>(stream: &mut W, payload: &[u8]) -> Result<(), IpcError> {
+    let len = payload.len();
+    if len > MAX_FRAME_SIZE {
+        return Err(IpcError::FrameTooLarge(len));
+    }
+    stream.write_all(&(len as u32).to_be_bytes())?;
+    stream.write_all(payload)?;
+    stream.flush()?;
+    Ok(())
+}

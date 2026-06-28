@@ -16,6 +16,7 @@ use hammer_core::lifecycle::{ALL_STAGES, LIFECYCLE_ORDER};
 use hammer_core::log::{DiscardWriter, Factory, LogWriter, Logger};
 use hammer_core::registry::RuntimeRegistry;
 use hammer_infra::map::FlatHashTable;
+use hammer_infra::segment::{Local, Segment};
 use hammer_runtime::adapter::{
     Lifecycle, NetworkManager as _, PlatformInterface, TraceControlPlane, TraceRecordSink,
 };
@@ -79,11 +80,11 @@ enum ServiceState {
     Closed,
 }
 
-pub struct RuntimeService {
-    inner: Arc<Mutex<ServiceInner>>,
+pub struct RuntimeService<S: Segment = Local> {
+    inner: Arc<Mutex<ServiceInner<S>>>,
 }
 
-struct ServiceInner {
+struct ServiceInner<S: Segment> {
     state: ServiceState,
     log_factory: Arc<Factory>,
     control_handle: Option<Arc<ControlThreadHandle>>,
@@ -102,7 +103,7 @@ struct ServiceInner {
     /// already happened or the runtime was never installed.
     data_runtime: Option<DataRuntime>,
     data_context: DataRuntimeContext,
-    app_context: AppContext,
+    app_context: AppContext<S>,
     tcp_listener_control: RuntimeTcpListenerControlHandle,
 }
 
@@ -341,7 +342,7 @@ impl RuntimeTcpListenerControlHandle {
     }
 }
 
-impl RuntimeService {
+impl RuntimeService<Local> {
     pub fn new(
         config_content: &str,
         platform: Arc<dyn PlatformInterface>,
@@ -384,10 +385,9 @@ impl RuntimeService {
             let runtime = runtime
                 .clone()
                 .with_handoff_node_handle(handoff_node_handle);
-            let worker_id = DataWorkerId::new(
-                u32::try_from(worker)
-                    .map_err(|_| hammer_core::error::CoreError::internal("worker index does not fit into u32"))?,
-            );
+            let worker_id = DataWorkerId::new(u32::try_from(worker).map_err(|_| {
+                hammer_core::error::CoreError::internal("worker index does not fit into u32")
+            })?);
             crate::transport::tcp::install_tcp_worker_state(
                 crate::transport::tcp::TcpWorkerOwnedState::new(worker_id),
             );
@@ -521,9 +521,11 @@ impl RuntimeService {
             })),
         }))
     }
+}
 
+impl<S: Segment> RuntimeService<S> {
     #[inline]
-    pub fn app_context(&self) -> AppContext {
+    pub fn app_context(&self) -> AppContext<S> {
         self.inner
             .lock()
             .expect("service mutex poisoned")
@@ -660,7 +662,7 @@ impl RuntimeService {
 
     fn control_call<R>(
         &self,
-        f: impl FnOnce(&mut ServiceInner) -> R + Send + 'static,
+        f: impl FnOnce(&mut ServiceInner<S>) -> R + Send + 'static,
     ) -> HammerResult<R>
     where
         R: Send + 'static,
@@ -679,7 +681,7 @@ impl RuntimeService {
 
     fn control_blocking_call<R>(
         &self,
-        f: impl FnOnce(&mut ServiceInner) -> R + Send + 'static,
+        f: impl FnOnce(&mut ServiceInner<S>) -> R + Send + 'static,
     ) -> HammerResult<R>
     where
         R: Send + 'static,
@@ -766,7 +768,7 @@ fn service_packet_graph_resolves_tcp_nodes() {
     assert_service_graph_tcp_nodes_declared();
 }
 
-fn start_inner(inner: &mut ServiceInner) -> HammerResult<()> {
+fn start_inner<S: Segment>(inner: &mut ServiceInner<S>) -> HammerResult<()> {
     match inner.state {
         ServiceState::Closed => return Err(HammerError::service_closed()),
         ServiceState::Running => return Ok(()),
@@ -793,7 +795,7 @@ fn start_inner(inner: &mut ServiceInner) -> HammerResult<()> {
     Ok(())
 }
 
-fn close_inner(inner: &mut ServiceInner) -> HammerResult<()> {
+fn close_inner<S: Segment>(inner: &mut ServiceInner<S>) -> HammerResult<()> {
     if inner.state == ServiceState::Closed {
         Ok(())
     } else {
@@ -825,8 +827,8 @@ fn start_lifecycle_now(lifecycle: &Arc<dyn Lifecycle>) -> HammerResult<()> {
     Ok(())
 }
 
-fn finish_close(
-    inner: &Arc<Mutex<ServiceInner>>,
+fn finish_close<S: Segment>(
+    inner: &Arc<Mutex<ServiceInner<S>>>,
     close_result: HammerResult<()>,
 ) -> HammerResult<()> {
     // Lifecycles have already been closed on hammer-main, so worker-owned tasks
@@ -987,7 +989,7 @@ fn combine_close_error(result: HammerResult<()>, message: impl Into<String>) -> 
 }
 
 #[cfg(test)]
-impl RuntimeService {
+impl RuntimeService<Local> {
     fn tcp_listener_control_snapshot_for_test(&self) -> RuntimeTcpListenerControlSnapshot {
         self.control_call(|inner| inner.tcp_listener_control.snapshot_for_test_on_control())
             .expect("snapshot runtime tcp listener control")
@@ -1102,14 +1104,14 @@ level = "debug"
     static SERVICE_TEST_GUARD: Mutex<()> = Mutex::new(());
 
     struct TestService {
-        service: Arc<RuntimeService>,
+        service: Arc<RuntimeService<Local>>,
         _guard: MutexGuard<'static, ()>,
     }
 
     impl std::ops::Deref for TestService {
-        type Target = RuntimeService;
+        type Target = RuntimeService<Local>;
 
-        fn deref(&self) -> &RuntimeService {
+        fn deref(&self) -> &RuntimeService<Local> {
             &self.service
         }
     }

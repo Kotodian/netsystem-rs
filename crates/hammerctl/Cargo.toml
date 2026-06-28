@@ -1,0 +1,14 @@
+[package]
+name = "hammerctl"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "hammerctl"
+path = "src/main.rs"
+
+[dependencies]
+hammer-ipc = { path = "../hammer-ipc" }
+clap = { workspace = true, features = ["derive"] }
+bincode = { workspace = true }
