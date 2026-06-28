@@ -3,7 +3,8 @@ mod timer;
 
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Mutex;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -41,6 +42,12 @@ const CONTROL_EVENT_QUEUE_CAPACITY: usize = 4096;
 /// waiting for the lifecycle operation to finish.
 pub const DEFAULT_CONTROL_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
+struct BarrierArcs {
+    wait: Arc<AtomicU32>,
+    workers: Arc<AtomicU32>,
+    n_workers: u32,
+}
+
 pub struct ControlThreadHandle {
     event_tx: Sender<ControlEvent>,
     command_tx: UnboundedSender<ControlCommand>,
@@ -48,6 +55,7 @@ pub struct ControlThreadHandle {
     next_timer_id: std::sync::atomic::AtomicU64,
     next_event_subscription_id: std::sync::atomic::AtomicU64,
     dropped_events: MetricCounter,
+    barrier_state: Mutex<Option<BarrierArcs>>,
 }
 
 impl ControlThreadHandle {
@@ -63,6 +71,7 @@ impl ControlThreadHandle {
             next_timer_id: std::sync::atomic::AtomicU64::new(1),
             next_event_subscription_id: std::sync::atomic::AtomicU64::new(1),
             dropped_events,
+            barrier_state: Mutex::new(None),
         })
     }
 
@@ -343,6 +352,39 @@ impl ControlThreadHandle {
                 Err(HammerError::internal("control async command canceled"))
             }
         }
+    }
+
+    pub fn set_barrier_arcs(
+        &self,
+        wait: Arc<AtomicU32>,
+        workers: Arc<AtomicU32>,
+        n_workers: u32,
+    ) {
+        *self.barrier_state.lock().expect("barrier_state lock") =
+            Some(BarrierArcs { wait, workers, n_workers });
+    }
+
+    pub fn control_call_with_barrier<R>(
+        &self,
+        f: impl FnOnce() -> R + Send + 'static,
+    ) -> HammerResult<R>
+    where
+        R: Send + 'static,
+    {
+        let (wait, workers, n_workers) = {
+            let guard = self.barrier_state.lock().expect("barrier_state lock");
+            let s = guard.as_ref().ok_or_else(|| {
+                HammerError::internal(
+                    "control_call_with_barrier: barrier not configured",
+                )
+            })?;
+            (Arc::clone(&s.wait), Arc::clone(&s.workers), s.n_workers)
+        };
+
+        self.call_blocking(move || {
+            let _guard = crate::barrier::barrier_sync(&wait, &workers, n_workers);
+            f()
+        })
     }
 }
 

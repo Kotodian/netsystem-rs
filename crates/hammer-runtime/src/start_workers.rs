@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicU32};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 use crate::data_plane::new_worker_runtime;
@@ -9,10 +9,16 @@ use hammer_core::error::HammerResult;
 
 pub const WORKER_COUNT: u32 = 2;
 
+pub(crate) static WORKER_BARRIER_ARCS: OnceLock<(Arc<AtomicU32>, Arc<AtomicU32>, u32)> =
+    OnceLock::new();
+
 pub fn start_workers(engine: &mut Engine) -> HammerResult<()> {
     let wait = Arc::new(AtomicU32::new(0));
     let workers = Arc::new(AtomicU32::new(0));
+    let n_workers = WORKER_COUNT;
     let registry = Arc::clone(&engine.registry);
+
+    let _ = WORKER_BARRIER_ARCS.set((Arc::clone(&wait), Arc::clone(&workers), n_workers));
 
     engine.wait_at_barrier = Arc::clone(&wait);
     engine.workers_at_barrier = Arc::clone(&workers);
