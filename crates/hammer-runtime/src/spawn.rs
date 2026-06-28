@@ -646,6 +646,7 @@ impl DataPlaneBarrierHandle {
         operation()
     }
 
+    #[doc(hidden)]
     pub fn sync_count(&self) -> usize {
         0
     }
@@ -666,9 +667,7 @@ impl DataPlaneBarrierGuard {
 
 impl Drop for DataPlaneBarrierGuard {
     fn drop(&mut self) {
-        self.workers.store(0, Ordering::SeqCst);
-        std::sync::atomic::compiler_fence(Ordering::SeqCst);
-        self.wait.store(0, Ordering::Release);
+        crate::barrier::barrier_release(&self.wait, &self.workers);
     }
 }
 

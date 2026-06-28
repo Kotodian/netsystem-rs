@@ -5,25 +5,25 @@ use std::sync::Arc;
 /// RAII guard that releases the barrier when dropped.
 /// The control thread holds this while mutating shared state.
 #[must_use]
-pub struct BarrierGuard {
-    wait: Arc<AtomicU32>,
-    workers: Arc<AtomicU32>,
-}
+pub struct BarrierGuard(Arc<AtomicU32>, Arc<AtomicU32>);
 
 impl BarrierGuard {
     fn new(wait: &Arc<AtomicU32>, workers: &Arc<AtomicU32>) -> Self {
-        Self {
-            wait: Arc::clone(wait),
-            workers: Arc::clone(workers),
-        }
+        BarrierGuard(Arc::clone(wait), Arc::clone(workers))
     }
+}
+
+/// Release workers from the barrier. Called by BarrierGuard::drop and
+/// DataPlaneBarrierGuard::drop.
+pub fn barrier_release(wait: &AtomicU32, workers: &AtomicU32) {
+    workers.store(0, Ordering::SeqCst);
+    std::sync::atomic::compiler_fence(Ordering::SeqCst);
+    wait.store(0, Ordering::Release);
 }
 
 impl Drop for BarrierGuard {
     fn drop(&mut self) {
-        self.workers.store(0, Ordering::SeqCst);
-        std::sync::atomic::compiler_fence(Ordering::SeqCst);
-        self.wait.store(0, Ordering::Release);
+        barrier_release(&self.0, &self.1);
     }
 }
 
