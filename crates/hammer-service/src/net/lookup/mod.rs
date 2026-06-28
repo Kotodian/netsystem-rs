@@ -362,9 +362,9 @@ pub fn init(reg: &RuntimeRegistry) -> HammerResult<()> {
     Ok(())
 }
 
-#[linkme::distributed_slice(crate::packet_graph::CONTROL_INITS)]
-fn init_ip(reg: &RuntimeRegistry) -> HammerResult<()> {
-    init(reg)
+#[hammer_component_macros::init_function(name = "ip_init", runs_after = ["transport_init", "tcp_init"])]
+fn init_ip(engine: &mut hammer_runtime::Engine) -> HammerResult<()> {
+    init(&engine.registry)
 }
 
 pub fn register_ip_lookup(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {

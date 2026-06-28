@@ -64,8 +64,9 @@ pub fn init(reg: &RuntimeRegistry) -> HammerResult<()> {
     Ok(())
 }
 
-#[linkme::distributed_slice(crate::packet_graph::CONTROL_INITS)]
-fn init_transport(reg: &RuntimeRegistry) -> HammerResult<()> {
+#[hammer_component_macros::init_function(name = "transport_init")]
+fn init_transport(engine: &mut hammer_runtime::Engine) -> HammerResult<()> {
+    let reg = &engine.registry;
     init(reg)
 }
 

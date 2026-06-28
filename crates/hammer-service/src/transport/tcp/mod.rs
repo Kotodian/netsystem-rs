@@ -150,9 +150,9 @@ pub fn init(_reg: &RuntimeRegistry) -> HammerResult<()> {
     Ok(())
 }
 
-#[linkme::distributed_slice(crate::packet_graph::CONTROL_INITS)]
-fn init_tcp(reg: &RuntimeRegistry) -> HammerResult<()> {
-    init(reg)
+#[hammer_component_macros::init_function(name = "tcp_init")]
+fn init_tcp(engine: &mut hammer_runtime::Engine) -> HammerResult<()> {
+    init(&engine.registry)
 }
 
 pub fn register_tcp_input(runtime: &DataPlaneRuntime, worker: usize) -> CoreResult<NodeId> {

@@ -1,22 +1,10 @@
-//! Service packet graph: linkme `SERVICE_GRAPH_NODES` + control-plane init
-//! registry. No Boot, no TLS, no free assemble functions.
+//! Service packet graph: linkme `SERVICE_GRAPH_NODES` for graph registration.
+//! Control-plane init migrated to `#[init_function]` in the init system.
 
 use hammer_adapter::NodeEntry;
-use hammer_core::error::HammerResult;
-use hammer_core::registry::RuntimeRegistry;
 
 #[linkme::distributed_slice]
 pub static SERVICE_GRAPH_NODES: [NodeEntry] = [..];
-
-#[linkme::distributed_slice]
-pub static CONTROL_INITS: [fn(&RuntimeRegistry) -> HammerResult<()>] = [..];
-
-pub fn init_control_planes(reg: &RuntimeRegistry) -> HammerResult<()> {
-    for init in CONTROL_INITS {
-        init(reg)?;
-    }
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {

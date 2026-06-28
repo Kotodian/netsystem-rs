@@ -29,7 +29,6 @@ use hammer_runtime::{
 use std::time::Duration;
 
 use crate::app::AppHost;
-use crate::packet_graph;
 use crate::transport::tcp::TcpInputControlPlane;
 use crate::transport::tcp::lookup::{
     TcpIpv4ListenerAddress, TcpIpv6ListenerAddress, TcpListenerAddress, TcpListenerLookupAccess,
@@ -378,7 +377,14 @@ impl RuntimeService<Local> {
         );
         let registry = RuntimeRegistry::new();
         registry.set::<config::Config>(Arc::new(config.clone()));
-        packet_graph::init_control_planes(&registry)?;
+        let mut engine = hammer_runtime::Engine::new(
+            hammer_adapter::DataPlaneRuntime::with_buffer_capacity(
+                worker.buffer.slot_bytes,
+                worker.buffer.slots_per_numa,
+            ),
+            Arc::clone(&registry),
+        );
+        hammer_runtime::init::run_init_functions(&mut engine)?;
         let listener_state = RuntimeTcpListenerControlState::new()?;
         let handoff_node_handle = NodeHandle::new(worker.handoff.node_handle);
         let worker_graph_nodes = data_context.install_on_workers(move |worker, runtime| {
@@ -744,7 +750,7 @@ fn schedule_trace_drain(
 
 #[cfg(test)]
 fn assert_service_graph_tcp_nodes_declared() {
-    let names: Vec<&'static str> = packet_graph::SERVICE_GRAPH_NODES
+    let names: Vec<&'static str> = crate::packet_graph::SERVICE_GRAPH_NODES
         .iter()
         .filter_map(|entry| entry.registration.name())
         .collect();
