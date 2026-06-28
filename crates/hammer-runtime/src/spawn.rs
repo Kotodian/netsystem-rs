@@ -97,11 +97,11 @@ thread_local! {
     static CURRENT_DATA_WORKER: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
     static DATA_PLANE_RUNTIME: RefCell<Option<RuntimeDataPlaneRuntime>> =
         const { RefCell::new(None) };
-    static DATA_WORKER_IDLE_SLICE: Cell<Duration> =
+    pub(crate) static DATA_WORKER_IDLE_SLICE: Cell<Duration> =
         const { Cell::new(Duration::from_millis(1)) };
     static DATA_LOCAL_TASKS: RefCell<VecDeque<Rc<DataLocalTask>>> =
         const { RefCell::new(VecDeque::new()) };
-    static DATA_LOCAL_DRIVER_WAKER: RefCell<Option<Waker>> = const { RefCell::new(None) };
+    pub(crate) static DATA_LOCAL_DRIVER_WAKER: RefCell<Option<Waker>> = const { RefCell::new(None) };
 }
 
 fn init_data_plane_runtime(slot_capacity: usize, slots: usize) {
@@ -113,7 +113,7 @@ fn init_data_plane_runtime(slot_capacity: usize, slots: usize) {
 }
 
 #[derive(Clone, Default)]
-struct DataRemoteLocalQueue {
+pub(crate) struct DataRemoteLocalQueue {
     tasks: Arc<Mutex<VecDeque<RemoteDataLocalTask>>>,
     thread: Arc<Mutex<Option<thread::Thread>>>,
 }
@@ -180,11 +180,7 @@ impl DataRuntime {
                             CURRENT_DATA_WORKER.with(|slot| slot.set(Some((context_id, index))));
                             worker_remote_local.attach_current_thread();
                             let _ = handle_tx.send(Ok(runtime.handle().clone()));
-                            run_data_worker_loop(
-                                &worker_remote_local,
-                                &runtime,
-                                shutdown_rx,
-                            );
+                            run_data_worker_loop(&worker_remote_local, &runtime, shutdown_rx);
                             DATA_LOCAL_TASKS.with(|tasks| tasks.borrow_mut().clear());
                             DATA_LOCAL_DRIVER_WAKER.with(|waker| waker.borrow_mut().take());
                             CURRENT_DATA_WORKER.with(|slot| slot.set(None));
@@ -218,10 +214,7 @@ impl DataRuntime {
         }
 
         Ok(Self {
-            context: DataRuntimeContext::from_workers_with_barrier(
-                context_id,
-                context_workers,
-            ),
+            context: DataRuntimeContext::from_workers_with_barrier(context_id, context_workers),
             workers,
         })
     }
@@ -289,10 +282,7 @@ impl DataRuntimeContext {
         Self::from_workers_with_barrier(id, workers)
     }
 
-    fn from_workers_with_barrier(
-        id: usize,
-        workers: Vec<DataRuntimeContextWorker>,
-    ) -> Self {
+    fn from_workers_with_barrier(id: usize, workers: Vec<DataRuntimeContextWorker>) -> Self {
         assert!(
             !workers.is_empty(),
             "data runtime context requires at least one worker"
@@ -672,7 +662,7 @@ impl Drop for DataPlaneBarrierGuard {
 }
 
 impl DataRemoteLocalQueue {
-    fn attach_current_thread(&self) {
+    pub(crate) fn attach_current_thread(&self) {
         *self
             .thread
             .lock()
@@ -695,7 +685,7 @@ impl DataRemoteLocalQueue {
         }
     }
 
-    fn drain(&self) -> VecDeque<RemoteDataLocalTask> {
+    pub(crate) fn drain(&self) -> VecDeque<RemoteDataLocalTask> {
         let mut tasks = self.tasks.lock().expect("remote local queue poisoned");
         std::mem::take(&mut *tasks)
     }
@@ -713,8 +703,8 @@ impl DataPlaneExecutor {
 }
 
 #[derive(Debug)]
-struct DataWorkerThreadWake {
-    thread: thread::Thread,
+pub(crate) struct DataWorkerThreadWake {
+    pub(crate) thread: thread::Thread,
 }
 
 impl Wake for DataWorkerThreadWake {
@@ -1047,7 +1037,14 @@ impl fmt::Display for DataLocalJoinError {
 
 impl Error for DataLocalJoinError {}
 
-fn poll_data_local_tasks(cx: &mut Context<'_>) -> bool {
+pub(crate) fn cleanup_thread_local() {
+    DATA_LOCAL_TASKS.with(|tasks| tasks.borrow_mut().clear());
+    DATA_LOCAL_DRIVER_WAKER.with(|waker| waker.borrow_mut().take());
+    CURRENT_DATA_WORKER.with(|slot| slot.set(None));
+    DATA_PLANE_RUNTIME.with(|slot| *slot.borrow_mut() = None);
+}
+
+pub(crate) fn poll_data_local_tasks(cx: &mut Context<'_>) -> bool {
     let initial_len = DATA_LOCAL_TASKS.with(|queue| queue.borrow().len());
     let mut progressed = false;
     for _ in 0..initial_len {
@@ -1062,7 +1059,7 @@ fn poll_data_local_tasks(cx: &mut Context<'_>) -> bool {
     progressed
 }
 
-fn poll_remote_local_tasks(queue: &DataRemoteLocalQueue) -> bool {
+pub(crate) fn poll_remote_local_tasks(queue: &DataRemoteLocalQueue) -> bool {
     let mut progressed = false;
     for task in queue.drain() {
         progressed = true;
@@ -1124,11 +1121,8 @@ fn run_data_worker_loop(
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
         }
 
-        let local_progress = poll_data_worker_once(
-            remote_local,
-            &worker_waker,
-            &mut next_polling_driver_at,
-        );
+        let local_progress =
+            poll_data_worker_once(remote_local, &worker_waker, &mut next_polling_driver_at);
         drive_tokio_worker_once(runtime, local_progress);
 
         if !local_progress {

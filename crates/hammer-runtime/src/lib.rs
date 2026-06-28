@@ -5,6 +5,7 @@ pub mod engine;
 pub use engine::{Engine, EnginePool};
 pub mod barrier;
 pub mod init;
+pub mod main_loop;
 
 pub mod adapter {
     pub use hammer_adapter::*;

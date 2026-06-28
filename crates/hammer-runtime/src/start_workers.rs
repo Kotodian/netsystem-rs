@@ -2,7 +2,6 @@ use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::barrier;
 use crate::data_plane::new_worker_runtime;
 use crate::engine::Engine;
 use crate::spawn;
@@ -53,22 +52,20 @@ pub fn start_workers(engine: &mut Engine) -> HammerResult<()> {
     Ok(())
 }
 
-fn worker_main(_: u32, engine: Engine) {
-    // TODO(C4): replace stub loop with engine_main_loop(&engine)
-    // engine_init_graph(&engine.runtime, idx) must also be called
-    // before entering the loop.
-    let wait = engine.wait_at_barrier;
-    let workers = engine.workers_at_barrier;
-    loop {
-        barrier::barrier_check(&wait, &workers);
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        if engine
-            .main_loop_exit_now
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            break;
-        }
-    }
+fn worker_main(idx: u32, engine: Engine) {
+    let tokio_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build per-worker tokio runtime");
+
+    let remote_local = spawn::DataRemoteLocalQueue::default();
+    remote_local.attach_current_thread();
+
+    let exit_status = crate::main_loop::engine_main_loop(&engine, &tokio_rt, &remote_local);
+
+    spawn::cleanup_thread_local();
+
+    tracing::debug!("worker {idx} exited with status {exit_status}");
 }
 
 #[::linkme::distributed_slice(crate::init::INIT_FUNCTIONS)]
