@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::task::{Context, Waker};
+use std::task::Context;
 use std::thread;
 use std::time::Instant;
 
@@ -30,14 +30,13 @@ pub(crate) fn engine_main_loop(
     let workers = &engine.workers_at_barrier;
     let idle_slice = DATA_WORKER_IDLE_SLICE.with(|s| s.get());
 
-    let worker_waker: Waker = Arc::new(spawn::DataWorkerThreadWake {
+    let worker_waker = Arc::new(spawn::DataWorkerThreadWake {
         thread: thread::current(),
     })
     .into();
-    let waker: Waker = worker_waker.clone();
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(&worker_waker);
     DATA_LOCAL_DRIVER_WAKER.with(|slot| {
-        *slot.borrow_mut() = Some(worker_waker);
+        *slot.borrow_mut() = Some(worker_waker.clone());
     });
 
     let mut last_poll_drivers_at = Instant::now();
@@ -59,6 +58,7 @@ pub(crate) fn engine_main_loop(
         });
 
         // Step 3: Main-loop callbacks (reserved for future hooks)
+        dispatch_main_loop_callbacks();
 
         // Step 4: Tokio reactor tick
         if progress {
@@ -87,13 +87,21 @@ pub(crate) fn engine_main_loop(
 
         // Step 7: Dispatch timer nodes (no data-plane timer wheel yet)
 
-        // Step 8: Advance timers, increment loop count
+        // Step 8: Advance timers — deferred (no data-plane timer wheel yet).
+        // VPP dispatches timer-wheel-expired sched nodes here.
+        // Increment loop count.
         engine.main_loop_count.fetch_add(1, Ordering::Relaxed);
 
         // Step 9: Exit check
         if engine.main_loop_exit_now.load(Ordering::Relaxed) {
-            let status = *engine.main_loop_exit_status.lock().unwrap();
+            let status = *engine.main_loop_exit_status
+                .lock()
+                .expect("engine_main_loop: poisoned exit status mutex");
             return status;
         }
     }
 }
+
+/// Dispatch main-loop callbacks. Currently a no-op — hook for future
+/// per-iteration callback registration.
+pub(crate) fn dispatch_main_loop_callbacks() {}
