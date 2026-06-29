@@ -56,11 +56,7 @@ impl SinkNode {
 
 impl Node for SinkNode {
     #[inline(always)]
-    fn process(
-        &mut self,
-        _runtime: &DataPlaneRuntime,
-        _frame: &mut BufferFrame,
-    ) -> NodeResult {
+    fn process(&mut self, _runtime: &DataPlaneRuntime, _frame: &mut BufferFrame) -> NodeResult {
         NodeResult::drop()
     }
 
@@ -88,9 +84,7 @@ fn sink_process(
     frame: &mut BufferFrame,
 ) -> NodeResult {
     let counters = {
-        let states = sink_states()
-            .lock()
-            .expect("sink state registry poisoned");
+        let states = sink_states().lock().expect("sink state registry poisoned");
         Arc::clone(
             states
                 .get(data.usize_word(0).expect("usize word 0"))

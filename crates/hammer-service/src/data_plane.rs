@@ -92,11 +92,7 @@ fn format_drop_trace(bytes: &[u8]) -> String {
 
 impl Node for DropNode {
     #[inline(always)]
-    fn process(
-        &mut self,
-        _runtime: &DataPlaneRuntime,
-        _frame: &mut BufferFrame,
-    ) -> NodeResult {
+    fn process(&mut self, _runtime: &DataPlaneRuntime, _frame: &mut BufferFrame) -> NodeResult {
         NodeResult::drop()
     }
 
@@ -187,11 +183,7 @@ impl InternalNode for DropNode {
 
 impl Node for HandoffNode {
     #[inline(always)]
-    fn process(
-        &mut self,
-        _runtime: &DataPlaneRuntime,
-        _frame: &mut BufferFrame,
-    ) -> NodeResult {
+    fn process(&mut self, _runtime: &DataPlaneRuntime, _frame: &mut BufferFrame) -> NodeResult {
         NodeResult::drop()
     }
 
@@ -527,18 +519,14 @@ impl FeatureArcStartHandle {
 }
 
 #[inline(always)]
-pub fn next_feature_node_for_index(
-    runtime: &DataPlaneRuntime,
-    index: BufferIndex,
-) -> NodeId {
-    runtime.current_config(index).expect("buffer must have a current config")
+pub fn next_feature_node_for_index(runtime: &DataPlaneRuntime, index: BufferIndex) -> NodeId {
+    runtime
+        .current_config(index)
+        .expect("buffer must have a current config")
 }
 
 #[inline(always)]
-pub fn next_feature_frame(
-    runtime: &DataPlaneRuntime,
-    frame: &mut BufferFrame,
-) -> NodeResult {
+pub fn next_feature_frame(runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
     let mut next_frames = NodeNextFrames::default();
     let indices = frame.pending_indices();
     let len = indices.len();

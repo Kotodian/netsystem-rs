@@ -160,11 +160,7 @@ where
     C: CongestionController + 'static,
 {
     #[inline(always)]
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-    ) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
         let snapshot = self.snapshot.load();
         let next = match Self::runtime_nexts(runtime) {
             Ok(next) => next,
@@ -730,11 +726,7 @@ mod tests {
     struct BlackholeNode;
 
     impl Node for BlackholeNode {
-        fn process(
-            &mut self,
-            _runtime: &DataPlaneRuntime,
-            frame: &mut BufferFrame,
-        ) -> NodeResult {
+        fn process(&mut self, _runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
             frame.drain_pending();
             NodeResult::drop()
         }
@@ -1298,8 +1290,7 @@ fn tcp_input_enqueue_index<C>(
     handoff_worker: Option<DataWorkerId>,
     session_queue: Option<TcpQueue<C>>,
     next_frames: &mut hammer_adapter::NodeNextFrames,
-)
-where
+) where
     C: CongestionController + 'static,
 {
     let node = match tcp_input_next_for_index(

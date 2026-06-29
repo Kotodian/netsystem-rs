@@ -52,11 +52,7 @@ where
     C: CongestionController + 'static,
 {
     #[inline(always)]
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-    ) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
         let next = match Self::runtime_nexts(runtime) {
             Ok(next) => next,
             Err(_) => return NodeResult::drop(),
@@ -243,8 +239,11 @@ where
     let mut tx_segment = None;
     let result = {
         let mut queue = session_queue.borrow_mut()?;
-        let session_id =
-            read_session_id(runtime, index)?.ok_or(TcpNodeError::EstablishedSessionRouteMissing)?;
+        let session_id = read_session_id(runtime, index)?.ok_or_else(|| {
+            let _ = runtime
+                .record_current_node_error(TcpNodeError::EstablishedSessionRouteMissing.code());
+            TcpNodeError::EstablishedSessionRouteMissing
+        })?;
         // Warm the session pool slot cacheline before the `session_mut`
         // borrow; the `receive_established`/`accept_payload` work below gives
         // the prefetch lead time.
@@ -257,9 +256,11 @@ where
             accepted_sequence,
             duplicate_payload,
         ) = {
-            let connection = queue
-                .session_mut(session_id)
-                .ok_or(TcpNodeError::EstablishedSessionMissing)?;
+            let connection = queue.session_mut(session_id).ok_or_else(|| {
+                let _ = runtime
+                    .record_current_node_error(TcpNodeError::EstablishedSessionMissing.code());
+                TcpNodeError::EstablishedSessionMissing
+            })?;
             let previous_snd_una = connection.snd_una();
             let (control, _) = connection.receive_established(&packet)?;
             let accept_payload = connection.accept_payload(&packet);
@@ -288,9 +289,11 @@ where
                 buffer.truncate(accepted_len)?;
             }
             let enqueue = queue.enqueue_rx(session_id, index, offset, false)?;
-            let connection = queue
-                .session_mut(session_id)
-                .ok_or(TcpNodeError::EstablishedSessionMissing)?;
+            let connection = queue.session_mut(session_id).ok_or_else(|| {
+                let _ = runtime
+                    .record_current_node_error(TcpNodeError::EstablishedSessionMissing.code());
+                TcpNodeError::EstablishedSessionMissing
+            })?;
             connection.receive_payload(
                 accepted_sequence,
                 trim as u32,
@@ -312,9 +315,11 @@ where
             }
             release_input = false;
         } else if duplicate_payload {
-            let connection = queue
-                .session_mut(session_id)
-                .ok_or(TcpNodeError::EstablishedSessionMissing)?;
+            let connection = queue.session_mut(session_id).ok_or_else(|| {
+                let _ = runtime
+                    .record_current_node_error(TcpNodeError::EstablishedSessionMissing.code());
+                TcpNodeError::EstablishedSessionMissing
+            })?;
             let sequence = packet.sequence;
             let end_sequence = sequence.advance(packet.payload_len as u32);
             connection.observe_duplicate_payload(sequence, end_sequence);
@@ -322,9 +327,11 @@ where
         }
 
         if immediate_ack {
-            let connection = queue
-                .session_mut(session_id)
-                .ok_or(TcpNodeError::EstablishedSessionMissing)?;
+            let connection = queue.session_mut(session_id).ok_or_else(|| {
+                let _ = runtime
+                    .record_current_node_error(TcpNodeError::EstablishedSessionMissing.code());
+                TcpNodeError::EstablishedSessionMissing
+            })?;
             tx_segment = Some(connection.control_segment(
                 packet.local,
                 packet.remote,
@@ -335,9 +342,11 @@ where
         }
         let has_pending_tx = queue.app().has_pending_send(session_id);
         let connection: *const crate::transport::tcp::TcpConnection<C> =
-            queue
-                .session(session_id)
-                .ok_or(TcpNodeError::EstablishedSessionMissing)? as *const _;
+            queue.session(session_id).ok_or_else(|| {
+                let _ = runtime
+                    .record_current_node_error(TcpNodeError::EstablishedSessionMissing.code());
+                TcpNodeError::EstablishedSessionMissing
+            })? as *const _;
         let mut context = SessionQueueControlContext::new(
             queue.timers_mut() as *mut _,
             queue.ready_mut_ptr(),
@@ -360,9 +369,11 @@ where
             | (1u16 << TCP_TIMER_KEEP_ALIVE)
             | (1u16 << TCP_TIMER_PACING);
         context.refresh_tcp_timers(connection, ESTABLISHED_TIMER_KEEP_MASK, now)?;
-        let connection = queue
-            .session(session_id)
-            .ok_or(TcpNodeError::EstablishedSessionMissing)? as *const _;
+        let connection = queue.session(session_id).ok_or_else(|| {
+            let _ =
+                runtime.record_current_node_error(TcpNodeError::EstablishedSessionMissing.code());
+            TcpNodeError::EstablishedSessionMissing
+        })? as *const _;
         let protocol = tcp_worker_state_mut() as *mut TcpWorkerOwnedState;
         if unsafe { (*protocol).publish_connection(session_id, &*connection) } {
             let _ = queue.close_session(session_id)?;

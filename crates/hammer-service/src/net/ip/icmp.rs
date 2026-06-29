@@ -598,11 +598,7 @@ pub struct IcmpInputNode {
 
 impl Node for IcmpInputNode {
     #[inline(always)]
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-    ) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
         let snapshot = self.snapshot.load();
         icmp_input_process_frame(runtime, frame, &snapshot).unwrap_or_else(|_| NodeResult::drop())
     }
@@ -636,11 +632,7 @@ pub struct IcmpEchoRequestNode;
 
 impl Node for IcmpEchoRequestNode {
     #[inline(always)]
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-    ) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
         let next = match Self::runtime_nexts(runtime) {
             Ok(next) => next,
             Err(_) => return NodeResult::drop(),
@@ -739,11 +731,7 @@ impl IcmpErrorNode {
 
 impl Node for IcmpErrorNode {
     #[inline(always)]
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-    ) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
         let next = match Self::runtime_nexts(runtime) {
             Ok(next) => next,
             Err(_) => return NodeResult::drop(),
@@ -847,12 +835,16 @@ fn icmp_input_process_frame(
     frame: &mut BufferFrame,
     snapshot: &IcmpInputSnapshot,
 ) -> CoreResult<NodeResult> {
-    Ok(hammer_adapter::vlib_process_frame!(runtime, frame, |index, _nf| {
-        match next_node_for_index(runtime, index, snapshot) {
-            Ok(node) => node,
-            Err(_) => snapshot.default_next(IpVersion::V4),
+    Ok(hammer_adapter::process_frame!(
+        runtime,
+        frame,
+        |index, _nf| {
+            match next_node_for_index(runtime, index, snapshot) {
+                Ok(node) => node,
+                Err(_) => snapshot.default_next(IpVersion::V4),
+            }
         }
-    }))
+    ))
 }
 
 fn icmp_echo_request_process_frame(
@@ -860,12 +852,16 @@ fn icmp_echo_request_process_frame(
     frame: &mut BufferFrame,
     next: [NodeId; IcmpEchoRequestNext::COUNT],
 ) -> CoreResult<NodeResult> {
-    Ok(hammer_adapter::vlib_process_frame!(runtime, frame, |index, _nf| {
-        match next_node_for_echo_request_index(runtime, index, next) {
-            Ok(node) => node,
-            Err(_) => NodeNextStorage::next(&next, IcmpEchoRequestNext::Drop),
+    Ok(hammer_adapter::process_frame!(
+        runtime,
+        frame,
+        |index, _nf| {
+            match next_node_for_echo_request_index(runtime, index, next) {
+                Ok(node) => node,
+                Err(_) => NodeNextStorage::next(&next, IcmpEchoRequestNext::Drop),
+            }
         }
-    }))
+    ))
 }
 
 fn icmp_error_process_frame(
@@ -874,12 +870,16 @@ fn icmp_error_process_frame(
     next: [NodeId; IcmpErrorNext::COUNT],
     source_table: Option<&IcmpErrorSourceSnapshot>,
 ) -> CoreResult<NodeResult> {
-    Ok(hammer_adapter::vlib_process_frame!(runtime, frame, |index, _nf| {
-        match next_node_for_icmp_error_index(runtime, index, next, source_table) {
-            Ok(node) => node,
-            Err(_) => NodeNextStorage::next(&next, IcmpErrorNext::Drop),
+    Ok(hammer_adapter::process_frame!(
+        runtime,
+        frame,
+        |index, _nf| {
+            match next_node_for_icmp_error_index(runtime, index, next, source_table) {
+                Ok(node) => node,
+                Err(_) => NodeNextStorage::next(&next, IcmpErrorNext::Drop),
+            }
         }
-    }))
+    ))
 }
 
 #[inline(always)]

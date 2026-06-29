@@ -49,11 +49,7 @@ where
     C: CongestionController + 'static,
 {
     #[inline(always)]
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-    ) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
         let next = match Self::runtime_nexts(runtime) {
             Ok(next) => next,
             Err(_) => return NodeResult::drop(),
@@ -189,15 +185,20 @@ where
     let mut tx_index = None;
     let result = {
         let mut queue = session_queue.borrow_mut()?;
-        let session_id =
-            read_session_id(runtime, index)?.ok_or(TcpNodeError::SynSentSessionRouteMissing)?;
+        let session_id = read_session_id(runtime, index)?.ok_or_else(|| {
+            let _ =
+                runtime.record_current_node_error(TcpNodeError::SynSentSessionRouteMissing.code());
+            TcpNodeError::SynSentSessionRouteMissing
+        })?;
         let (control, acked_tx_len, established, established_with_payload) = {
             let local_capabilities = tcp_worker_state()
                 .pending_open_capabilities(session_id)
                 .unwrap_or_default();
-            let connection = queue
-                .session_mut(session_id)
-                .ok_or(TcpNodeError::SynSentSessionMissing)?;
+            let connection = queue.session_mut(session_id).ok_or_else(|| {
+                let _ =
+                    runtime.record_current_node_error(TcpNodeError::SynSentSessionMissing.code());
+                TcpNodeError::SynSentSessionMissing
+            })?;
             let previous_snd_una = connection.snd_una();
             let previous_state = connection.state();
             let control = connection.receive_open_reply(&packet, local_capabilities)?;
@@ -280,8 +281,7 @@ fn tcp_syn_sent_enqueue_index<C>(
     tcp_output: NodeId,
     drop_next: NodeId,
     next_frames: &mut NodeNextFrames,
-)
-where
+) where
     C: CongestionController + 'static,
 {
     if tcp_syn_sent_index(runtime, index, session_queue, tcp_output, next_frames).is_err() {
@@ -339,11 +339,7 @@ mod tests {
     }
 
     impl Node for CaptureNode {
-        fn process(
-            &mut self,
-            _runtime: &DataPlaneRuntime,
-            _frame: &mut BufferFrame,
-        ) -> NodeResult {
+        fn process(&mut self, _runtime: &DataPlaneRuntime, _frame: &mut BufferFrame) -> NodeResult {
             NodeResult::drop()
         }
 

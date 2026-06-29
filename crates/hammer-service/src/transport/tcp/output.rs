@@ -5,6 +5,7 @@ use hammer_adapter::{
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::tcp_header;
 
+use super::TcpOutputError;
 pub const DEFAULT_TCP_OUTPUT_PAYLOAD_LEN: usize = 1_440;
 pub const TCP_FLAG_FIN: u8 = 0x01;
 pub const TCP_FLAG_SYN: u8 = 0x02;
@@ -50,11 +51,7 @@ pub fn register_tcp_output(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<N
 
 impl Node for TcpOutputNode {
     #[inline(always)]
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-    ) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
         tcp_output_node_process_frame(runtime, frame, self.next)
     }
 
@@ -94,11 +91,17 @@ fn tcp_output_node_process(
         None => return NodeResult::drop(),
     };
     let next = [
-        match runtime.nodes().node_next_slot(current, TcpOutputNext::Drop as usize) {
+        match runtime
+            .nodes()
+            .node_next_slot(current, TcpOutputNext::Drop as usize)
+        {
             Ok(slot) => slot,
             Err(_) => return NodeResult::drop(),
         },
-        match runtime.nodes().node_next_slot(current, TcpOutputNext::Lookup as usize) {
+        match runtime
+            .nodes()
+            .node_next_slot(current, TcpOutputNext::Lookup as usize)
+        {
             Ok(slot) => slot,
             Err(_) => return NodeResult::drop(),
         },
@@ -113,7 +116,7 @@ fn tcp_output_node_process_frame(
 ) -> NodeResult {
     let lookup = next[TcpOutputNext::Lookup as usize];
     let drop = next[TcpOutputNext::Drop as usize];
-    hammer_adapter::vlib_process_frame!(runtime, frame, |index, _nf| {
+    hammer_adapter::process_frame!(runtime, frame, |index, _nf| {
         tcp_output_next_for_index(runtime, index, lookup, drop).unwrap_or(drop)
     })
 }
@@ -127,6 +130,7 @@ fn tcp_output_next_for_index(
     let buffer = runtime.get_buffer_mut(index)?;
     let header = buffer.current();
     if tcp_header(header).is_err() {
+        let _ = runtime.record_current_node_error(TcpOutputError::NoTcpHeader.code());
         return Ok(drop);
     }
     Ok(lookup)

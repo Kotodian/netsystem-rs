@@ -51,11 +51,7 @@ where
     C: CongestionController + 'static,
 {
     #[inline(always)]
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-    ) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
         let next = match Self::runtime_nexts(runtime) {
             Ok(next) => next,
             Err(_) => return NodeResult::drop(),
@@ -241,16 +237,21 @@ where
     let mut release_input = true;
     let result: CoreResult<_> = {
         let mut queue = session_queue.borrow_mut()?;
-        let session_id =
-            read_session_id(runtime, index)?.ok_or(TcpNodeError::RcvProcessSessionRouteMissing)?;
+        let session_id = read_session_id(runtime, index)?.ok_or_else(|| {
+            let _ = runtime
+                .record_current_node_error(TcpNodeError::RcvProcessSessionRouteMissing.code());
+            TcpNodeError::RcvProcessSessionRouteMissing
+        })?;
         // Warm the session pool slot cacheline before the `session_mut`
         // borrow; the `receive_close_side` work below gives the prefetch
         // lead time.
         queue.prefetch_session(session_id);
         let (control, ack_advanced, acked_tx_len, established, established_with_payload) = {
-            let connection = queue
-                .session_mut(session_id)
-                .ok_or(TcpNodeError::RcvProcessSessionMissing)?;
+            let connection = queue.session_mut(session_id).ok_or_else(|| {
+                let _ = runtime
+                    .record_current_node_error(TcpNodeError::RcvProcessSessionMissing.code());
+                TcpNodeError::RcvProcessSessionMissing
+            })?;
             let previous_state = connection.state();
             let previous_snd_una = connection.snd_una();
             let control = connection.receive_close_side(&packet)?;
@@ -293,9 +294,11 @@ where
             | (1u16 << TCP_TIMER_TIME_WAIT);
         let now = std::time::Instant::now();
         let connection: *const crate::transport::tcp::TcpConnection<C> =
-            queue
-                .session(session_id)
-                .ok_or(TcpNodeError::RcvProcessSessionMissing)? as *const _;
+            queue.session(session_id).ok_or_else(|| {
+                let _ = runtime
+                    .record_current_node_error(TcpNodeError::RcvProcessSessionMissing.code());
+                TcpNodeError::RcvProcessSessionMissing
+            })? as *const _;
         let connection = unsafe { &*connection };
         // Prior per-site predicate was `(timer_mask & bit) != 0 ||
         // timer_is_active(id)`, i.e. keep_mask = timer_mask | active.

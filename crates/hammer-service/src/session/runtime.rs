@@ -15,10 +15,10 @@ use hammer_infra::segment::{Local, Segment};
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
 use hammer_runtime::app::{AppContext, AppSessionConfig, SessionHandle, with_current_app_worker};
 
+use crate::session::protocol::SessionQueueControlContext;
 use crate::session::{
     SessionAppRuntime, SessionId, SessionQueueHandle, SessionQueueNext, SessionReadyQueue,
 };
-use crate::session::protocol::SessionQueueControlContext;
 
 const DEFAULT_SESSION_TIMER_TICK: Duration = Duration::from_millis(10);
 const DEFAULT_SESSION_POOL_CAPACITY: usize = 1024;
@@ -695,10 +695,10 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
         _: bool,
     ) -> CoreResult<SessionRxEnqueue> {
         if offset == 0 {
-            let wrote = self
-                .app_state
-                .app
-                .copy_rx_from_buffer(session_id, &self.runtime.buffers, index)?;
+            let wrote =
+                self.app_state
+                    .app
+                    .copy_rx_from_buffer(session_id, &self.runtime.buffers, index)?;
             if wrote != 0 {
                 self.runtime.buffers.free_index(index);
                 return Ok(SessionRxEnqueue {
@@ -1007,13 +1007,7 @@ where
         let driver_ptr = driver as *mut SessionDriverRuntime<St, Seg>;
         let close_current = unsafe {
             with_session_state(driver_ptr, session_id, |state, context| {
-                state.handle_ready_session(
-                    runtime,
-                    context,
-                    close_requested,
-                    output_next,
-                    output,
-                )
+                state.handle_ready_session(runtime, context, close_requested, output_next, output)
             })?
         };
         if close_current {

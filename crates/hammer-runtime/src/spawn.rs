@@ -1359,11 +1359,7 @@ mod tests {
     struct PollingDriverNode;
 
     impl Node for PollingDriverNode {
-        fn process(
-            &mut self,
-            _runtime: &DataPlaneRuntime,
-            frame: &mut BufferFrame,
-        ) -> NodeResult {
+        fn process(&mut self, _runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
             frame.clear();
             NodeResult::drop()
         }

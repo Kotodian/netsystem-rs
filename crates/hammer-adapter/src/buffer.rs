@@ -1490,6 +1490,18 @@ impl DataPlaneRuntime {
         self.nodes.node_error_count(node, code)
     }
 
+    pub fn snapshot_node_errors(&self, node: NodeId) -> Vec<(u16, u64)> {
+        let mut out = Vec::new();
+        for code in 1..256u16 {
+            if let Ok(count) = self.node_error_count(node, code) {
+                if count > 0 {
+                    out.push((code, count));
+                }
+            }
+        }
+        out
+    }
+
     #[inline]
     pub fn instruction_set(&self) -> DataPlaneInstructionSet {
         self.buffers.instruction_set()
@@ -3601,8 +3613,6 @@ impl BufferFrame {
         self.finish_retain(write);
         Ok(())
     }
-
-
 
     #[inline(always)]
     fn retain_indices_quad_with_prefetch(

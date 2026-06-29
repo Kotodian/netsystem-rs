@@ -69,12 +69,7 @@ pub fn default_prefetch_indices(runtime: &DataPlaneRuntime, indices: &[BufferInd
 
 impl NodeNextFrames {
     #[inline]
-    pub fn enqueue(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        node: NodeId,
-        index: BufferIndex,
-    ) {
+    pub fn enqueue(&mut self, runtime: &DataPlaneRuntime, node: NodeId, index: BufferIndex) {
         if let Some(current) = self.current_node
             && current == node
         {
@@ -149,11 +144,7 @@ impl NodeNextFrames {
     /// On schedule error the current frame is freed and `NodeResult::drop()` is
     /// returned.
     #[inline]
-    pub fn finish(
-        mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-    ) -> NodeResult {
+    pub fn finish(mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
         frame.clear();
         if !self.current_indices.is_empty() {
             let _ = frame.push_indices(self.current_indices.iter().copied());
@@ -241,7 +232,11 @@ impl NodeNextFrames {
         self.len += 1;
         self.cached_next_node = Some(node);
         self.cached_next_offset = offset;
-        (self.frame(offset).expect("just-allocated frame"), offset, true)
+        (
+            self.frame(offset).expect("just-allocated frame"),
+            offset,
+            true,
+        )
     }
 
     /// Schedule every freshly allocated frame in `self.nodes` / `self.frames`.

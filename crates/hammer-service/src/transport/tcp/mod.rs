@@ -193,7 +193,8 @@ pub fn wire_worker_graph(runtime: &DataPlaneRuntime, worker: usize) -> CoreResul
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TcpNodeError {
+#[repr(u16)]
+pub enum TcpNodeError {
     #[error("invalid connection")]
     SessionMissing,
     #[error("invalid connection")]
@@ -212,6 +213,37 @@ pub(crate) enum TcpNodeError {
     TimerUpdateFailed,
     #[error("dispatch error")]
     TxOffsetOverflow,
+    #[error("bad TCP checksum")]
+    BadChecksum,
+    #[error("RST received")]
+    ResetReceived,
+    #[error("bad segment")]
+    BadSegment,
+    #[error("no listener")]
+    NoListener,
+    #[error("connection create failed")]
+    ConnectionCreate,
+    #[error("RACK timeout")]
+    RackTimeout,
+    #[error("TLP probe")]
+    TlpProbe,
+    #[error("retransmit")]
+    Retransmit,
+    #[error("pacing limited")]
+    PacingLimited,
+    #[error("persist timer")]
+    PersistTimer,
+    #[error("BBR congestion")]
+    BbrCongestion,
+    #[error("bad window")]
+    BadWindow,
+}
+
+impl TcpNodeError {
+    #[inline(always)]
+    pub const fn code(self) -> u16 {
+        self as u16
+    }
 }
 
 impl From<TcpNodeError> for TcpError {
@@ -224,8 +256,20 @@ impl From<TcpNodeError> for TcpError {
             | TcpNodeError::RcvProcessSessionMissing
             | TcpNodeError::RcvProcessSessionRouteMissing
             | TcpNodeError::SynSentSessionMissing
-            | TcpNodeError::SynSentSessionRouteMissing => TcpError::InvalidConnection,
-            TcpNodeError::TimerUpdateFailed | TcpNodeError::TxOffsetOverflow => TcpError::Dispatch,
+            | TcpNodeError::SynSentSessionRouteMissing
+            | TcpNodeError::ConnectionCreate => TcpError::InvalidConnection,
+            TcpNodeError::TimerUpdateFailed
+            | TcpNodeError::TxOffsetOverflow
+            | TcpNodeError::RackTimeout
+            | TcpNodeError::TlpProbe
+            | TcpNodeError::Retransmit
+            | TcpNodeError::PacingLimited
+            | TcpNodeError::PersistTimer
+            | TcpNodeError::BbrCongestion => TcpError::Dispatch,
+            TcpNodeError::BadChecksum | TcpNodeError::BadSegment => TcpError::SegmentInvalid,
+            TcpNodeError::ResetReceived => TcpError::ConnectionClosed,
+            TcpNodeError::NoListener => TcpError::NoListener,
+            TcpNodeError::BadWindow => TcpError::RcvWnd,
         }
     }
 }
@@ -234,6 +278,34 @@ impl From<TcpNodeError> for CoreError {
     #[inline]
     fn from(error: TcpNodeError) -> Self {
         TcpError::from(error).into()
+    }
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum TcpOutputError {
+    #[error("not a TCP header")]
+    NoTcpHeader,
+}
+
+impl TcpOutputError {
+    #[inline(always)]
+    pub const fn code(self) -> u16 {
+        self as u16
+    }
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum TcpResetError {
+    #[error("bad TCP header")]
+    BadTcpHeader,
+}
+
+impl TcpResetError {
+    #[inline(always)]
+    pub const fn code(self) -> u16 {
+        self as u16
     }
 }
 

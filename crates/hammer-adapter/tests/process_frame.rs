@@ -1,6 +1,10 @@
-use hammer_adapter::{vlib_process_frame, DataPlaneRuntime, NodeId};
+use hammer_adapter::{DataPlaneRuntime, NodeId, process_frame};
 
-fn push_packet(runtime: &DataPlaneRuntime, frame_index: hammer_adapter::FrameIndex, payload: &[u8]) {
+fn push_packet(
+    runtime: &DataPlaneRuntime,
+    frame_index: hammer_adapter::FrameIndex,
+    payload: &[u8],
+) {
     let buffer = runtime
         .alloc_index_with_bytes(payload)
         .expect("alloc packet");
@@ -12,7 +16,7 @@ fn push_packet(runtime: &DataPlaneRuntime, frame_index: hammer_adapter::FrameInd
 }
 
 #[test]
-fn vlib_process_processes_all_indices_in_order() {
+fn process_frame_processes_all_indices_in_order() {
     let runtime = DataPlaneRuntime::with_buffer_capacity(2048, 4096);
     let frame_index = runtime.alloc_frame_index().expect("alloc frame");
     let frame = frame_index;
@@ -23,7 +27,7 @@ fn vlib_process_processes_all_indices_in_order() {
     let drop_next = NodeId::new(0);
     runtime
         .with_frame_mut(frame, |frame| {
-            let result = vlib_process_frame!(&runtime, frame, |index, _nf| {
+            let result = process_frame!(&runtime, frame, |index, _nf| {
                 processed.push(index);
                 drop_next
             });

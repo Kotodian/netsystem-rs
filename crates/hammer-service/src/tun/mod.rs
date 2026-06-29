@@ -75,11 +75,7 @@ pub trait TunDriverDirection: Send {
 
     /// Dataplane process entry point. Recovered from `NodeRuntimeData` by
     /// `tun_driver_process::<R>` and invoked on the per-slot runtime state.
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-    ) -> NodeResult;
+    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult;
 }
 
 #[doc(hidden)]
@@ -181,11 +177,7 @@ impl TunDriverDirection for TunInputRuntime {
         format_tun_input_trace
     }
 
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-    ) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
         if let (Some(device_main), Some(rx_queue)) = (&self.device_main, self.rx_queue)
             && !match device_main.consume_rx_interrupt_pending(rx_queue) {
                 Ok(pending) => pending,
@@ -196,13 +188,14 @@ impl TunDriverDirection for TunInputRuntime {
         }
         let max_batch = self.max_batch.min(frame.remaining_capacity());
         let first_new = frame.pending_len();
-        let received = match self
-            .input
-            .recv_frame(runtime, frame, &self.interface_id, self.mode, max_batch)
-        {
-            Ok(received) => received,
-            Err(_) => return NodeResult::drop(),
-        };
+        let received =
+            match self
+                .input
+                .recv_frame(runtime, frame, &self.interface_id, self.mode, max_batch)
+            {
+                Ok(received) => received,
+                Err(_) => return NodeResult::drop(),
+            };
         let interface_index = match self.ingress_interface_index() {
             Ok(index) => index,
             Err(_) => return NodeResult::drop(),
@@ -256,7 +249,8 @@ impl TunDriverDirection for TunInputRuntime {
             while read < len {
                 let index0 = indices[read];
                 if let Ok(mut buffer) = runtime.get_buffer_mut(index0) {
-                    let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+                    let network =
+                        unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
                     network.sw_if_index[0] = interface_index;
                 }
                 read += 1;
@@ -392,11 +386,7 @@ impl TunDriverDirection for TunOutputRuntime {
         format_tun_output_trace
     }
 
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-    ) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
         let pending = frame.pending_len();
         let indices = frame.pending_indices();
         let len = indices.len();
@@ -1272,11 +1262,7 @@ impl TunDriverNode<TunOutputRuntime> {
 
 impl<R: TunDriverDirection> Node for TunDriverNode<R> {
     #[inline(always)]
-    fn process(
-        &mut self,
-        _runtime: &DataPlaneRuntime,
-        _frame: &mut BufferFrame,
-    ) -> NodeResult {
+    fn process(&mut self, _runtime: &DataPlaneRuntime, _frame: &mut BufferFrame) -> NodeResult {
         NodeResult::drop()
     }
 

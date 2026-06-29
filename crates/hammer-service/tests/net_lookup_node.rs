@@ -43,10 +43,7 @@ struct SinkNode {
     runtime_data: NodeRuntimeData,
 }
 
-fn chain_bytes(
-    runtime: &DataPlaneRuntime,
-    index: hammer_adapter::BufferIndex,
-) -> InfraVec<u8> {
+fn chain_bytes(runtime: &DataPlaneRuntime, index: hammer_adapter::BufferIndex) -> InfraVec<u8> {
     let mut bytes = InfraVec::new();
     for buffer in runtime.buffers().chain(index) {
         bytes.extend_from_slice(buffer.expect("chain buffer").current());
@@ -67,11 +64,7 @@ impl SinkNode {
 
 impl Node for SinkNode {
     #[inline(always)]
-    fn process(
-        &mut self,
-        _runtime: &DataPlaneRuntime,
-        _frame: &mut BufferFrame,
-    ) -> NodeResult {
+    fn process(&mut self, _runtime: &DataPlaneRuntime, _frame: &mut BufferFrame) -> NodeResult {
         NodeResult::drop()
     }
 
@@ -102,11 +95,7 @@ impl CorruptCurrentHeaderNode {
 
 impl Node for CorruptCurrentHeaderNode {
     #[inline(always)]
-    fn process(
-        &mut self,
-        _runtime: &DataPlaneRuntime,
-        _frame: &mut BufferFrame,
-    ) -> NodeResult {
+    fn process(&mut self, _runtime: &DataPlaneRuntime, _frame: &mut BufferFrame) -> NodeResult {
         NodeResult::drop()
     }
 
@@ -134,9 +123,7 @@ fn sink_process(
     frame: &mut BufferFrame,
 ) -> NodeResult {
     let state = {
-        let states = sink_states()
-            .lock()
-            .expect("sink state registry poisoned");
+        let states = sink_states().lock().expect("sink state registry poisoned");
         Arc::clone(
             states
                 .get(data.usize_word(0).expect("usize word 0"))
@@ -160,9 +147,7 @@ fn sink_process(
             )
         };
         runtime.free_index(buffer);
-        let mut state = state
-            .lock()
-            .expect("sink state poisoned");
+        let mut state = state.lock().expect("sink state poisoned");
         state.forwarding.push(forwarding);
         state.egress_interfaces.push(egress_interface);
         state.payloads.push(payload);
@@ -176,10 +161,12 @@ fn corrupt_current_header_process(
     frame: &mut BufferFrame,
 ) -> NodeResult {
     for index in frame.pending_indices().iter().copied() {
-        runtime.get_buffer_mut(index).expect("get buffer mut").current_mut()[0] = 0;
+        runtime
+            .get_buffer_mut(index)
+            .expect("get buffer mut")
+            .current_mut()[0] = 0;
     }
-    let slot = u32::try_from(data.word(0))
-        .expect("corrupt next node id overflow");
+    let slot = u32::try_from(data.word(0)).expect("corrupt next node id overflow");
     NodeResult::next_current(hammer_adapter::NodeId::new(slot))
 }
 

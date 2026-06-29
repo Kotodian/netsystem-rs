@@ -310,7 +310,7 @@ impl IpReassemblyRuntime {
                         owner_worker: None,
                         next: Some(drop_next),
                     },
-                    );
+                );
                 return self.emit_output(runtime, next_frames, current_next, drop_next, index);
             }
         };
@@ -631,11 +631,7 @@ impl IpReassemblyDirectory {
 
 impl Node for IpReassemblyNode {
     #[inline(always)]
-    fn process(
-        &mut self,
-        _runtime: &DataPlaneRuntime,
-        _frame: &mut BufferFrame,
-    ) -> NodeResult {
+    fn process(&mut self, _runtime: &DataPlaneRuntime, _frame: &mut BufferFrame) -> NodeResult {
         NodeResult::drop()
     }
 

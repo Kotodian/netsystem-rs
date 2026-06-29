@@ -63,9 +63,7 @@ fn capture_process(
     frame: &mut BufferFrame,
 ) -> NodeResult {
     let state = {
-        let states = capture_states()
-            .lock()
-            .expect("capture state registry");
+        let states = capture_states().lock().expect("capture state registry");
         Arc::clone(
             states
                 .get(data.usize_word(0).expect("capture state slot"))
@@ -78,11 +76,7 @@ fn capture_process(
             .expect("capture buffer")
             .current()
             .to_vec();
-        state
-            .lock()
-            .expect("capture state")
-            .packets
-            .push(packet);
+        state.lock().expect("capture state").packets.push(packet);
         runtime.free_index(index);
     }
     NodeResult::drop()

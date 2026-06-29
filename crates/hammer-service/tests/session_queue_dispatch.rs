@@ -5,11 +5,11 @@ use hammer_adapter::{BufferIndex, DataPlaneRuntime, DataWorkerId, NodeId};
 use hammer_core::error::CoreResult;
 use hammer_infra::segment::Local;
 use hammer_runtime::app::{AppSession, AppSessionConfig, SessionHandle};
+use hammer_service::session::SessionQueueNext;
+use hammer_service::session::protocol::SessionQueueControlContext;
 use hammer_service::session::runtime::{
     SessionDriverRuntime, SessionQueueProtocol, dispatch_session_queue_for_ticks,
 };
-use hammer_service::session::SessionQueueNext;
-use hammer_service::session::protocol::SessionQueueControlContext;
 
 #[derive(Default)]
 struct TestTxProtocol {
@@ -91,10 +91,8 @@ fn session_tx_dispatch_sends_multiple_segments_up_to_budget() {
     // output.schedule can push all indices into one frame.
     let runtime = DataPlaneRuntime::with_capacities(2048, 64, 64, 8);
     let buffers = runtime.buffers();
-    let mut driver = SessionDriverRuntime::<TestTxProtocol, Local>::new(
-        DataWorkerId::new(0),
-        buffers.clone(),
-    );
+    let mut driver =
+        SessionDriverRuntime::<TestTxProtocol, Local>::new(DataWorkerId::new(0), buffers.clone());
     let session_id = driver.insert_session(TestTxProtocol::default());
 
     let app_session = Arc::new(

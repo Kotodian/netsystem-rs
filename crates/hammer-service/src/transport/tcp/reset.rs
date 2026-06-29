@@ -34,11 +34,7 @@ pub fn register_tcp_reset(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<No
 
 impl Node for TcpResetNode {
     #[inline(always)]
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-    ) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
         let next = match Self::runtime_nexts(runtime) {
             Ok(next) => next,
             Err(_) => return NodeResult::drop(),
@@ -76,7 +72,7 @@ fn tcp_reset_process_frame(
 ) -> NodeResult {
     let drop_next = next[TcpResetNext::Drop as usize];
     let lookup_next = next[TcpResetNext::Lookup as usize];
-    hammer_adapter::vlib_process_frame!(runtime, frame, |index, _nf| {
+    hammer_adapter::process_frame!(runtime, frame, |index, _nf| {
         tcp_reset_next_for_index(runtime, index, drop_next, lookup_next).unwrap_or(drop_next)
     })
 }
@@ -469,16 +465,13 @@ mod tests {
     use hammer_adapter::{BufferNodeError, InternalNode};
 
     use super::*;
+    use crate::transport::tcp::TcpResetError;
 
     #[derive(Clone, Copy)]
     struct BlackholeNode;
 
     impl Node for BlackholeNode {
-        fn process(
-            &mut self,
-            _runtime: &DataPlaneRuntime,
-            frame: &mut BufferFrame,
-        ) -> NodeResult {
+        fn process(&mut self, _runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
             frame.drain_pending();
             NodeResult::drop()
         }
@@ -521,7 +514,9 @@ mod tests {
                 std::mem::transmute::<_, &mut crate::net::NetworkOpaque>(buffer.opaque_mut())
             }
             .set_packet_cursor(buffer_packet_cursor(40));
-            buffer.set_node_error(BufferNodeError::new(NodeId::new(0), 7));
+            let code = TcpResetError::BadTcpHeader.code();
+            buffer.set_node_error(BufferNodeError::new(NodeId::new(0), code));
+            let _ = runtime.record_current_node_error(code);
         }
         runtime
             .get_frame_mut(frame)

@@ -413,13 +413,13 @@ impl IpLookupNode {
     }
 
     #[inline(always)]
-    fn process_index(
-        runtime: &DataPlaneRuntime,
-        table: &FibTable,
-        index: BufferIndex,
-    ) -> NodeId {
+    fn process_index(runtime: &DataPlaneRuntime, table: &FibTable, index: BufferIndex) -> NodeId {
         let parsed = Self::cached_packet_for_index(runtime, index);
-        let traced = runtime.get_buffer(index).expect("buffer").trace_handle().is_some();
+        let traced = runtime
+            .get_buffer(index)
+            .expect("buffer")
+            .trace_handle()
+            .is_some();
         let parsed = match parsed {
             Some(parsed) => parsed,
             None => {
@@ -629,11 +629,7 @@ macro_rules! process_adjacency_rewrite_batch {
 
 impl Node for IpLookupNode {
     #[inline(always)]
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-    ) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
         let table = self.table.table();
         ip_lookup_process_frame(runtime, frame, &table)
     }
@@ -706,7 +702,8 @@ impl AdjacencyRewriteNode {
                 runtime,
                 index,
                 AdjacencyRewriteNodeError::MissingForwarding.code(),
-            ).ok();
+            )
+            .ok();
             let _ = add_packet_trace!(
                 runtime,
                 index,
@@ -722,7 +719,8 @@ impl AdjacencyRewriteNode {
             return None;
         };
         if forwarding.dpo_type != DpoType::ADJACENCY {
-            set_index_node_error_code(runtime, index, AdjacencyRewriteNodeError::WrongDpo.code()).ok();
+            set_index_node_error_code(runtime, index, AdjacencyRewriteNodeError::WrongDpo.code())
+                .ok();
             let _ = add_packet_trace!(
                 runtime,
                 index,
@@ -745,7 +743,8 @@ impl AdjacencyRewriteNode {
                 runtime,
                 index,
                 AdjacencyRewriteNodeError::MissingAdjacency.code(),
-            ).ok();
+            )
+            .ok();
             let _ = add_packet_trace!(
                 runtime,
                 index,
@@ -781,11 +780,7 @@ impl AdjacencyRewriteNode {
 
 impl Node for AdjacencyRewriteNode {
     #[inline(always)]
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-    ) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
         adjacency_rewrite_process_frame(runtime, frame, &self.table)
     }
 
@@ -888,7 +883,7 @@ fn ip_lookup_process_frame(
     frame: &mut BufferFrame,
     table: &FibTable,
 ) -> NodeResult {
-    hammer_adapter::vlib_process_frame!(runtime, frame, |index, _nf| {
+    hammer_adapter::process_frame!(runtime, frame, |index, _nf| {
         IpLookupNode::process_index(runtime, table, index)
     })
 }

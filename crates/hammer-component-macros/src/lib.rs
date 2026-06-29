@@ -1175,13 +1175,19 @@ impl Parse for GraphNodeArgs {
                         }
                         "sibling_of" => {
                             if args.sibling_of.is_some() {
-                                return Err(Error::new(key.span(), "duplicate `sibling_of` argument"));
+                                return Err(Error::new(
+                                    key.span(),
+                                    "duplicate `sibling_of` argument",
+                                ));
                             }
                             args.sibling_of = Some(input.parse()?);
                         }
                         "start_arc" => {
                             if args.start_arc.is_some() {
-                                return Err(Error::new(key.span(), "duplicate `start_arc` argument"));
+                                return Err(Error::new(
+                                    key.span(),
+                                    "duplicate `start_arc` argument",
+                                ));
                             }
                             args.start_arc = Some(input.parse()?);
                         }

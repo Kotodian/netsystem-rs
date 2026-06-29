@@ -11,7 +11,7 @@ use hammer_infra::vec::Vec;
 use super::connection::TcpConnection;
 use super::segment::{TcpSegment, tcp_packet};
 use super::{
-    TCP_MAIN, TcpInputControlPlane, TcpInputNext, TcpQueue, ensure_tcp_session_queue,
+    TCP_MAIN, TcpInputControlPlane, TcpInputNext, TcpNodeError, TcpQueue, ensure_tcp_session_queue,
     publish_tcp_connection, tcp_worker_state_mut, write_session_route_opaque,
 };
 #[cfg(test)]
@@ -124,11 +124,7 @@ where
     C: CongestionController + 'static,
 {
     #[inline(always)]
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-    ) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
         let next = match Self::runtime_nexts(runtime) {
             Ok(next) => next,
             Err(_) => return NodeResult::drop(),
@@ -345,9 +341,10 @@ where
 {
     let packet = tcp_packet(runtime, index)?;
     let mut release_input = true;
-    let listener = control
-        .lookup_listener(packet.local)
-        .ok_or(TcpError::NoListener)?;
+    let listener = control.lookup_listener(packet.local).ok_or_else(|| {
+        let _ = runtime.record_current_node_error(TcpNodeError::NoListener.code());
+        TcpError::NoListener
+    })?;
     let mut tx_index = None;
     let established_session;
     let result = {
@@ -464,11 +461,7 @@ mod tests {
     }
 
     impl Node for CaptureNode {
-        fn process(
-            &mut self,
-            _runtime: &DataPlaneRuntime,
-            _frame: &mut BufferFrame,
-        ) -> NodeResult {
+        fn process(&mut self, _runtime: &DataPlaneRuntime, _frame: &mut BufferFrame) -> NodeResult {
             NodeResult::drop()
         }
 

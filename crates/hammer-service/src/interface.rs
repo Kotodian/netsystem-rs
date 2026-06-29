@@ -888,11 +888,7 @@ impl InterfaceOutputNode {
 
 impl Node for InterfaceOutputNode {
     #[inline(always)]
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-    ) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
         interface_output_process_frame(runtime, frame, &self.output)
     }
 
@@ -973,7 +969,7 @@ fn interface_output_process_frame(
         .nodes()
         .node_by_name("drop")
         .expect("interface_output_process_frame: drop node not registered");
-    hammer_adapter::vlib_process_frame!(runtime, frame, |index, _nf| {
+    hammer_adapter::process_frame!(runtime, frame, |index, _nf| {
         match InterfaceOutputNode::tx_for_index(output, runtime, index, drop_next) {
             Ok(node) => node,
             Err(_) => drop_next,

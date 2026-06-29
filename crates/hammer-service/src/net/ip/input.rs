@@ -87,11 +87,7 @@ where
     A: FeatureArcSpec,
 {
     #[inline(always)]
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-    ) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
         let next = match Self::runtime_nexts(runtime) {
             Ok(next) => next,
             Err(_) => return NodeResult::drop(),
@@ -125,7 +121,7 @@ fn ip_input_process_frame(
     next: [NodeId; IpInputNext::COUNT],
     feature_arc: Option<&FeatureArcStartHandle>,
 ) -> NodeResult {
-    hammer_adapter::vlib_process_frame!(runtime, frame, |index, _nf| {
+    hammer_adapter::process_frame!(runtime, frame, |index, _nf| {
         match next_node_for_index(runtime, index, next, feature_arc) {
             Ok(node) => node,
             Err(_) => NodeNextStorage::next(&next, IpInputNext::Drop),

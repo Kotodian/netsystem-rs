@@ -72,7 +72,7 @@ macro_rules! validate_buffer_enqueue_x4 {
 }
 
 #[macro_export]
-macro_rules! vlib_process_frame {
+macro_rules! process_frame {
     (
         $runtime:expr,
         $frame:expr,
@@ -99,10 +99,42 @@ macro_rules! vlib_process_frame {
                     if read + 7 < len {
                         $runtime.prefetch_header(indices[read + 7]);
                     }
-                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
-                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
-                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
-                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                    $nf.enqueue(
+                        $runtime,
+                        {
+                            let $index = indices[read];
+                            $body
+                        },
+                        indices[read],
+                    );
+                    read += 1;
+                    $nf.enqueue(
+                        $runtime,
+                        {
+                            let $index = indices[read];
+                            $body
+                        },
+                        indices[read],
+                    );
+                    read += 1;
+                    $nf.enqueue(
+                        $runtime,
+                        {
+                            let $index = indices[read];
+                            $body
+                        },
+                        indices[read],
+                    );
+                    read += 1;
+                    $nf.enqueue(
+                        $runtime,
+                        {
+                            let $index = indices[read];
+                            $body
+                        },
+                        indices[read],
+                    );
+                    read += 1;
                 }
                 if read + 2 <= len {
                     if read + 2 < len {
@@ -111,14 +143,38 @@ macro_rules! vlib_process_frame {
                     if read + 3 < len {
                         $runtime.prefetch_header(indices[read + 3]);
                     }
-                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
-                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                    $nf.enqueue(
+                        $runtime,
+                        {
+                            let $index = indices[read];
+                            $body
+                        },
+                        indices[read],
+                    );
+                    read += 1;
+                    $nf.enqueue(
+                        $runtime,
+                        {
+                            let $index = indices[read];
+                            $body
+                        },
+                        indices[read],
+                    );
+                    read += 1;
                 }
                 while read < len {
                     if read + 1 < len {
                         $runtime.prefetch_header(indices[read + 1]);
                     }
-                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                    $nf.enqueue(
+                        $runtime,
+                        {
+                            let $index = indices[read];
+                            $body
+                        },
+                        indices[read],
+                    );
+                    read += 1;
                 }
             }
             $crate::instruction_set::FrameBatchWidth::Pair => {
@@ -129,14 +185,38 @@ macro_rules! vlib_process_frame {
                     if read + 3 < len {
                         $runtime.prefetch_header(indices[read + 3]);
                     }
-                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
-                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                    $nf.enqueue(
+                        $runtime,
+                        {
+                            let $index = indices[read];
+                            $body
+                        },
+                        indices[read],
+                    );
+                    read += 1;
+                    $nf.enqueue(
+                        $runtime,
+                        {
+                            let $index = indices[read];
+                            $body
+                        },
+                        indices[read],
+                    );
+                    read += 1;
                 }
                 while read < len {
                     if read + 1 < len {
                         $runtime.prefetch_header(indices[read + 1]);
                     }
-                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                    $nf.enqueue(
+                        $runtime,
+                        {
+                            let $index = indices[read];
+                            $body
+                        },
+                        indices[read],
+                    );
+                    read += 1;
                 }
             }
             $crate::instruction_set::FrameBatchWidth::Octo => {
@@ -165,14 +245,78 @@ macro_rules! vlib_process_frame {
                     if read + 15 < len {
                         $runtime.prefetch_header(indices[read + 15]);
                     }
-                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
-                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
-                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
-                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
-                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
-                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
-                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
-                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                    $nf.enqueue(
+                        $runtime,
+                        {
+                            let $index = indices[read];
+                            $body
+                        },
+                        indices[read],
+                    );
+                    read += 1;
+                    $nf.enqueue(
+                        $runtime,
+                        {
+                            let $index = indices[read];
+                            $body
+                        },
+                        indices[read],
+                    );
+                    read += 1;
+                    $nf.enqueue(
+                        $runtime,
+                        {
+                            let $index = indices[read];
+                            $body
+                        },
+                        indices[read],
+                    );
+                    read += 1;
+                    $nf.enqueue(
+                        $runtime,
+                        {
+                            let $index = indices[read];
+                            $body
+                        },
+                        indices[read],
+                    );
+                    read += 1;
+                    $nf.enqueue(
+                        $runtime,
+                        {
+                            let $index = indices[read];
+                            $body
+                        },
+                        indices[read],
+                    );
+                    read += 1;
+                    $nf.enqueue(
+                        $runtime,
+                        {
+                            let $index = indices[read];
+                            $body
+                        },
+                        indices[read],
+                    );
+                    read += 1;
+                    $nf.enqueue(
+                        $runtime,
+                        {
+                            let $index = indices[read];
+                            $body
+                        },
+                        indices[read],
+                    );
+                    read += 1;
+                    $nf.enqueue(
+                        $runtime,
+                        {
+                            let $index = indices[read];
+                            $body
+                        },
+                        indices[read],
+                    );
+                    read += 1;
                 }
                 while read + 4 <= len {
                     if read + 4 < len {
@@ -187,10 +331,42 @@ macro_rules! vlib_process_frame {
                     if read + 7 < len {
                         $runtime.prefetch_header(indices[read + 7]);
                     }
-                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
-                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
-                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
-                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                    $nf.enqueue(
+                        $runtime,
+                        {
+                            let $index = indices[read];
+                            $body
+                        },
+                        indices[read],
+                    );
+                    read += 1;
+                    $nf.enqueue(
+                        $runtime,
+                        {
+                            let $index = indices[read];
+                            $body
+                        },
+                        indices[read],
+                    );
+                    read += 1;
+                    $nf.enqueue(
+                        $runtime,
+                        {
+                            let $index = indices[read];
+                            $body
+                        },
+                        indices[read],
+                    );
+                    read += 1;
+                    $nf.enqueue(
+                        $runtime,
+                        {
+                            let $index = indices[read];
+                            $body
+                        },
+                        indices[read],
+                    );
+                    read += 1;
                 }
                 if read + 2 <= len {
                     if read + 2 < len {
@@ -199,14 +375,38 @@ macro_rules! vlib_process_frame {
                     if read + 3 < len {
                         $runtime.prefetch_header(indices[read + 3]);
                     }
-                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
-                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                    $nf.enqueue(
+                        $runtime,
+                        {
+                            let $index = indices[read];
+                            $body
+                        },
+                        indices[read],
+                    );
+                    read += 1;
+                    $nf.enqueue(
+                        $runtime,
+                        {
+                            let $index = indices[read];
+                            $body
+                        },
+                        indices[read],
+                    );
+                    read += 1;
                 }
                 while read < len {
                     if read + 1 < len {
                         $runtime.prefetch_header(indices[read + 1]);
                     }
-                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                    $nf.enqueue(
+                        $runtime,
+                        {
+                            let $index = indices[read];
+                            $body
+                        },
+                        indices[read],
+                    );
+                    read += 1;
                 }
             }
         }
@@ -240,11 +440,7 @@ impl NodeHandle {
 }
 
 pub trait Node {
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-    ) -> NodeResult;
+    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult;
 
     #[inline]
     fn node_process(&self) -> NodeProcessFn {
@@ -342,8 +538,7 @@ impl NodeRuntimeData {
     }
 }
 
-pub type NodeProcessFn =
-    fn(&DataPlaneRuntime, NodeRuntimeData, &mut BufferFrame) -> NodeResult;
+pub type NodeProcessFn = fn(&DataPlaneRuntime, NodeRuntimeData, &mut BufferFrame) -> NodeResult;
 
 #[derive(Debug, Clone, Copy)]
 pub struct NodeDescriptor<'a> {
@@ -505,11 +700,7 @@ pub enum NoopNode {}
 
 impl Node for NoopNode {
     #[inline(always)]
-    fn process(
-        &mut self,
-        _runtime: &DataPlaneRuntime,
-        _frame: &mut BufferFrame,
-    ) -> NodeResult {
+    fn process(&mut self, _runtime: &DataPlaneRuntime, _frame: &mut BufferFrame) -> NodeResult {
         match *self {}
     }
 }
@@ -700,11 +891,7 @@ impl std::fmt::Debug for NodeRuntimeSlot {
 
 impl NodeRuntimeSlot {
     #[inline]
-    fn dispatch(
-        self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-    ) -> NodeResult {
+    fn dispatch(self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
         (self.process)(runtime, self.runtime_data, frame)
     }
 }
@@ -1716,11 +1903,7 @@ mod tests {
     struct StatsNode;
 
     impl Node for StatsNode {
-        fn process(
-            &mut self,
-            _runtime: &DataPlaneRuntime,
-            _frame: &mut BufferFrame,
-        ) -> NodeResult {
+        fn process(&mut self, _runtime: &DataPlaneRuntime, _frame: &mut BufferFrame) -> NodeResult {
             NodeResult::drop()
         }
 

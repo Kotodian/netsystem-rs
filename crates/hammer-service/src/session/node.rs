@@ -9,6 +9,7 @@ use hammer_adapter::{
 };
 use hammer_core::error::{CoreError, CoreResult};
 
+use crate::session::SessionQueueError;
 #[derive(PartialEq, Eq)]
 pub struct SessionQueueHandle<Q> {
     runtime_data: NodeRuntimeData,
@@ -90,12 +91,7 @@ pub struct SessionQueueOutput {
 
 impl SessionQueueOutput {
     #[inline]
-    pub fn enqueue(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        node: NodeId,
-        index: BufferIndex,
-    ) {
+    pub fn enqueue(&mut self, runtime: &DataPlaneRuntime, node: NodeId, index: BufferIndex) {
         self.frames.enqueue(runtime, node, index)
     }
 
@@ -179,11 +175,7 @@ impl SessionQueueNode {
 }
 
 impl Node for SessionQueueNode {
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-    ) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
         session_queue_node_process(runtime, self.runtime_data, frame)
     }
 
@@ -235,6 +227,7 @@ fn session_queue_node_process(
         )
         .is_err()
         {
+            let _ = runtime.record_current_node_error(SessionQueueError::DispatchFailed.code());
             output.schedule(runtime);
             return NodeResult::drop();
         }

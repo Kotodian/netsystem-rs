@@ -291,11 +291,7 @@ pub struct IpReceiveNode {
 
 impl Node for IpLocalNode {
     #[inline(always)]
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-    ) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
         let state = self.state.load();
         let feature_arc = self.feature_arc.as_ref().map(|arc| arc.start_handle());
         let next = match Self::runtime_nexts(runtime) {
@@ -333,11 +329,7 @@ impl Node for IpLocalNode {
 
 impl Node for IpReceiveNode {
     #[inline(always)]
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-    ) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
         let state = self.state.load();
         let feature_arc = self.feature_arc.as_ref().map(|arc| arc.start_handle());
         let next = match Self::runtime_nexts(runtime) {
@@ -513,12 +505,16 @@ fn process_frame(
     stage: LocalStage,
     feature_arc: Option<&FeatureArcStartHandle>,
 ) -> CoreResult<NodeResult> {
-    Ok(hammer_adapter::vlib_process_frame!(runtime, frame, |index, _nf| {
-        match process_index(runtime, index, state, &next, stage, feature_arc) {
-            Ok(node) => node,
-            Err(_) => state.drop_next(&next),
+    Ok(hammer_adapter::process_frame!(
+        runtime,
+        frame,
+        |index, _nf| {
+            match process_index(runtime, index, state, &next, stage, feature_arc) {
+                Ok(node) => node,
+                Err(_) => state.drop_next(&next),
+            }
         }
-    }))
+    ))
 }
 
 #[inline(always)]

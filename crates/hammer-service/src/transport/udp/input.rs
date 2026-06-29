@@ -229,11 +229,7 @@ pub struct UdpInputNode {
 
 impl Node for UdpInputNode {
     #[inline(always)]
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-    ) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
         let snapshot = self.snapshot.load();
         let next = match Self::runtime_nexts(runtime) {
             Ok(next) => next,
@@ -255,7 +251,7 @@ fn udp_input_process_frame(
     snapshot: &UdpInputSnapshot,
     next: &[NodeId; UdpInputNext::COUNT],
 ) -> NodeResult {
-    hammer_adapter::vlib_process_frame!(runtime, frame, |index, _nf| {
+    hammer_adapter::process_frame!(runtime, frame, |index, _nf| {
         match next_node_for_index(runtime, index, snapshot, next) {
             Ok(Some(node)) => node,
             _ => NodeNextStorage::next(next, UdpInputNext::Drop),
