@@ -30,7 +30,7 @@ pub fn start_workers(engine: &mut Engine) -> HammerResult<()> {
         thread::Builder::new()
             .name(format!("hammer-worker-{idx}"))
             .spawn(move || {
-                let rt = new_worker_runtime(2048, 256);
+                let rt = new_worker_runtime(&hammer_core::config::Config::default());
                 spawn::set_data_plane_runtime(rt.clone());
 
                 let engine = Engine {

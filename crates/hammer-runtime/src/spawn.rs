@@ -103,10 +103,10 @@ thread_local! {
     pub(crate) static DATA_LOCAL_DRIVER_WAKER: RefCell<Option<Waker>> = const { RefCell::new(None) };
 }
 
-fn init_data_plane_runtime(slot_capacity: usize, slots: usize) {
+fn init_data_plane_runtime(config: &hammer_core::config::Config) {
     DATA_PLANE_RUNTIME.with(|runtime| {
         if runtime.borrow().is_none() {
-            *runtime.borrow_mut() = Some(new_worker_runtime(slot_capacity, slots));
+            *runtime.borrow_mut() = Some(new_worker_runtime(config));
         }
     });
 }
@@ -146,8 +146,6 @@ impl DataRuntime {
         let worker_threads = worker.count;
         let thread_stack_size = worker.stack_size;
         let max_blocking_threads = worker.max_blocking_threads;
-        let buffer_slot_bytes = worker.buffer.slot_bytes;
-        let buffer_slots = worker.buffer.slots_per_numa;
         let idle_slice = worker.idle_slice;
         let worker_config = worker.clone();
 
@@ -169,7 +167,11 @@ impl DataRuntime {
                 .spawn(move || {
                     apply_worker_thread_setup(&worker_config, index);
                     DATA_WORKER_IDLE_SLICE.with(|slot| slot.set(idle_slice));
-                    init_data_plane_runtime(buffer_slot_bytes, buffer_slots);
+                    let config = hammer_core::config::Config {
+                        worker: worker_config.clone(),
+                        ..hammer_core::config::Config::default()
+                    };
+                    init_data_plane_runtime(&config);
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .max_blocking_threads(max_blocking_threads)
                         .enable_all()

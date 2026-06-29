@@ -32,10 +32,7 @@ fn main() {
     let registry = Arc::new(RuntimeRegistry::new());
     registry.set::<Config>(Arc::new(config.clone()));
 
-    let runtime = new_worker_runtime(
-        config.worker.buffer.slot_bytes,
-        config.worker.buffer.slots_per_numa,
-    );
+    let runtime = new_worker_runtime(&config);
     let engine = Engine::new(runtime, Arc::clone(&registry));
     let mut pool = EnginePool::new(engine);
 
