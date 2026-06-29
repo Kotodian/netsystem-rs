@@ -1,52 +1,89 @@
-//! hammer - cross-platform VPP clone daemon
+//! hammer — VPP-clone daemon
 
-use clap::Parser;
-use tracing_subscriber::EnvFilter;
+use std::net::SocketAddr;
+use std::sync::Arc;
 
-#[derive(Parser, Debug)]
-#[command(name = "hammer", version, about = "hammer - cross-platform VPP clone")]
-struct Args {
-    /// Path to TOML startup config
-    #[arg(short = 'c', long = "config")]
-    config: Option<String>,
+use hammer_core::config::Config;
+use hammer_core::registry::RuntimeRegistry;
+use hammer_runtime::engine::{Engine, EnginePool};
+use hammer_runtime::new_worker_runtime;
 
-    /// Run as daemon (background)
-    #[arg(long = "daemon")]
-    daemon: bool,
-
-    /// Interactive mode (CLI on stdin)
-    #[arg(short = 'i', long = "interactive")]
-    interactive: bool,
-
-    /// IPC socket path
-    #[arg(long = "sock", default_value = "/run/hammer.sock")]
-    sock: String,
-
-    /// Log level (trace, debug, info, warn, error)
-    #[arg(long = "log-level", default_value = "info")]
-    log_level: String,
-
-    /// Print version and exit
-    #[arg(short = 'v', long = "version")]
-    version: bool,
-}
+mod ipc_handlers;
+mod ipc_loop;
 
 fn main() {
-    let args = Args::parse();
-
-    if args.version {
-        println!("hammer {}", env!("CARGO_PKG_VERSION"));
-        return;
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        eprintln!("Usage: hammer <config.toml>");
+        std::process::exit(1);
     }
 
-    // Initialize tracing
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let config_path = &args[1];
+    let config_content = std::fs::read_to_string(config_path).unwrap_or_else(|e| {
+        eprintln!("Failed to read config {config_path}: {e}");
+        std::process::exit(1);
+    });
 
-    tracing::info!("hammer starting (stub)");
-    println!(
-        "hammer: stub - config={:?}, daemon={}, sock={}",
-        args.config, args.daemon, args.sock
+    let config: Config = hammer_core::config::parse_config(&config_content).unwrap_or_else(|e| {
+        eprintln!("Failed to parse config: {e}");
+        std::process::exit(1);
+    });
+
+    let registry = Arc::new(RuntimeRegistry::new());
+    registry.set::<Config>(Arc::new(config.clone()));
+
+    let runtime = new_worker_runtime(
+        config.worker.buffer.slot_bytes,
+        config.worker.buffer.slots_per_numa,
     );
+    let engine = Engine::new(runtime, Arc::clone(&registry));
+    let mut pool = EnginePool::new(engine);
+
+    let listener = bind_ipc_socket();
+    pool.set_ipc_listener(listener);
+
+    let pool_engine = pool.main_engine_mut();
+    EnginePool::main_loop_enter(pool_engine).unwrap_or_else(|e| {
+        eprintln!("main_loop_enter failed: {e}");
+        std::process::exit(1);
+    });
+
+    let listener = pool.take_ipc_listener().expect("IPC listener configured");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("build tokio runtime");
+
+    tracing::info!("hammer started");
+
+    rt.block_on(async {
+        ipc_loop::clnt_loop(listener).await;
+    });
+
+    let pool_engine = pool.main_engine();
+    EnginePool::main_loop_exit(pool_engine);
+    pool.close();
+    Engine::uninstall_current();
+}
+
+fn bind_ipc_socket() -> tokio::net::TcpListener {
+    let addr = std::env::var("HAMMER_IPC_ADDR").unwrap_or_else(|_| "127.0.0.1:7299".to_string());
+    let sock_addr: SocketAddr = addr.parse().unwrap_or_else(|e| {
+        eprintln!("Invalid IPC address {addr}: {e}");
+        std::process::exit(1);
+    });
+    let listener = std::net::TcpListener::bind(sock_addr).unwrap_or_else(|e| {
+        eprintln!("Failed to bind IPC {sock_addr}: {e}");
+        std::process::exit(1);
+    });
+    listener.set_nonblocking(true).unwrap_or_else(|e| {
+        eprintln!("Failed to set nonblocking: {e}");
+        std::process::exit(1);
+    });
+    tokio::net::TcpListener::from_std(listener).unwrap_or_else(|e| {
+        eprintln!("Failed to create tokio listener: {e}");
+        std::process::exit(1);
+    })
 }

@@ -12,3 +12,5 @@ path = "src/main.rs"
 hammer-ipc = { path = "../hammer-ipc" }
 clap = { workspace = true, features = ["derive"] }
 bincode = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt"] }
+hex = "0.4"

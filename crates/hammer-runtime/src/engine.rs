@@ -1,8 +1,14 @@
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, Mutex};
 
 use hammer_adapter::DataPlaneRuntime;
+use hammer_core::error::HammerResult;
 use hammer_core::registry::RuntimeRegistry;
+
+thread_local! {
+    static CURRENT_ENGINE: RefCell<Option<*mut Engine>> = const { RefCell::new(None) };
+}
 
 #[repr(align(64))]
 pub struct Engine {
@@ -45,6 +51,31 @@ impl Engine {
             main_loop_exit_status: Mutex::new(0),
         }
     }
+
+    pub fn install_current(&mut self) {
+        CURRENT_ENGINE.with(|cell| {
+            *cell.borrow_mut() = Some(self as *mut Engine);
+        });
+    }
+
+    pub fn with_current<F, R>(f: F) -> Option<R>
+    where
+        F: FnOnce(&mut Engine) -> R,
+    {
+        CURRENT_ENGINE.with(|cell| {
+            let ptr = *cell.borrow();
+            ptr.map(|p| {
+                let engine = unsafe { &mut *p };
+                f(engine)
+            })
+        })
+    }
+
+    pub fn uninstall_current() {
+        CURRENT_ENGINE.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+    }
 }
 
 pub struct EnginePool {
@@ -53,6 +84,7 @@ pub struct EnginePool {
     pub exec_path: String,
     pub argv: Vec<String>,
     pub startup_config: String,
+    ipc_listener: Option<tokio::net::TcpListener>,
 }
 
 impl EnginePool {
@@ -65,6 +97,7 @@ impl EnginePool {
             exec_path: String::new(),
             argv: Vec::new(),
             startup_config: String::new(),
+            ipc_listener: None,
         }
     }
 
@@ -86,6 +119,33 @@ impl EnginePool {
 
     pub fn engine_mut(&mut self, index: usize) -> Option<&mut Engine> {
         self.engines.get_mut(index)
+    }
+
+    pub fn set_ipc_listener(&mut self, listener: tokio::net::TcpListener) {
+        self.ipc_listener = Some(listener);
+    }
+
+    pub fn take_ipc_listener(&mut self) -> Option<tokio::net::TcpListener> {
+        self.ipc_listener.take()
+    }
+
+    pub fn main_loop_enter(engine: &mut Engine) -> HammerResult<()> {
+        engine.install_current();
+        crate::init::run_init_functions(engine)?;
+        crate::start_workers::start_workers(engine)?;
+        Ok(())
+    }
+
+    pub fn main_loop_exit(engine: &Engine) {
+        engine
+            .main_loop_exit_now
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn close(&mut self) {
+        if let Some(listener) = self.ipc_listener.take() {
+            drop(listener);
+        }
     }
 }
 
@@ -151,5 +211,21 @@ mod tests {
         assert_eq!(pool.worker_count(), 0);
         assert!(pool.engine(0).is_some());
         assert!(pool.engine(1).is_none());
+    }
+
+    #[test]
+    fn with_current_engine() {
+        let mut engine = test_engine();
+        engine.install_current();
+
+        let result = Engine::with_current(|e| {
+            e.thread_index = 42;
+            e.thread_index
+        });
+        assert_eq!(result, Some(42));
+
+        Engine::uninstall_current();
+        let result = Engine::with_current(|_| true);
+        assert_eq!(result, None);
     }
 }

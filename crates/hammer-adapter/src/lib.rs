@@ -20,9 +20,6 @@ pub use buffer::{
     FrameIndex, FramePool, FrameRef, FrameRefMut, PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES,
     PooledBufferFrame, PrimaryOpaque, SecondaryOpaque,
 };
-pub use hammer_core::lifecycle::{
-    ALL_STAGES, LIFECYCLE_ORDER, Lifecycle, LifecycleService, StartStage,
-};
 pub use hammer_core::protocol::icmp::IcmpErrorMetadata;
 pub use hammer_core::{Network, SocksAddr};
 pub use hammer_infra::hint::unlikely;
@@ -31,11 +28,11 @@ pub use instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
 
 // Re-exports used by the runtime crate so it doesn't have to know which
 // sub-module each trait lives in.
-pub use certificate::{CertificateProviderManager, CertificateProviderService, CertificateStore};
+pub use certificate::CertificateProviderService;
 pub use component::{
     AsAnyComponent, ComponentMeta, ComponentMetadata, ComponentMetricsMeta, RuntimeComponent,
 };
-pub use connection::{ConnectionHandle, ConnectionManager};
+pub use connection::ConnectionHandle;
 pub use network::NetworkManager;
 pub use node::{
     DriverNode, InternalNode, NextFrame, Node, NodeDescriptor, NodeEntry, NodeErrorCounters,
@@ -46,7 +43,7 @@ pub use node::{
 pub use platform::{
     DefaultInterfaceUpdateListener, NetworkInterface, PlatformInterface, TunOptions, WifiState,
 };
-pub use service::ServiceManager;
+
 pub use trace::{
     PacketTrace, TraceControlHandle, TraceControlPlane, TraceEntry, TraceFormatter,
     TraceInputPolicy, TracePolicy, TraceRecord, TraceRecordSink,

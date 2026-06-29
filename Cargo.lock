@@ -667,12 +667,14 @@ dependencies = [
 name = "hammer"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "clap",
- "hammer-control",
+ "hammer-component-macros",
  "hammer-core",
  "hammer-ipc",
  "hammer-runtime",
  "hammer-service",
+ "linkme",
  "tokio",
  "toml",
  "tracing",
@@ -717,16 +719,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hammer-control"
-version = "0.1.0"
-dependencies = [
- "hammer-adapter",
- "hammer-core",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "hammer-core"
 version = "0.1.0"
 dependencies = [
@@ -765,9 +757,12 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "hammer-core",
+ "hammer-runtime",
  "libc",
+ "linkme",
  "serde",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -779,7 +774,6 @@ dependencies = [
  "core_affinity",
  "hammer-adapter",
  "hammer-component-macros",
- "hammer-control",
  "hammer-core",
  "hammer-infra",
  "indoc",
@@ -807,7 +801,6 @@ dependencies = [
  "etherparse",
  "hammer-adapter",
  "hammer-component-macros",
- "hammer-control",
  "hammer-core",
  "hammer-infra",
  "hammer-runtime",
@@ -827,6 +820,8 @@ dependencies = [
  "bincode",
  "clap",
  "hammer-ipc",
+ "hex",
+ "tokio",
 ]
 
 [[package]]

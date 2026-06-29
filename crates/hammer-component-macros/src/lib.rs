@@ -1687,3 +1687,53 @@ mod tests {
         );
     }
 }
+
+struct IpcHandlerAttrArgs {
+    name: String,
+}
+
+impl Parse for IpcHandlerAttrArgs {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let name_ident: Ident = input.parse()?;
+        if name_ident != "name" {
+            return Err(Error::new(name_ident.span(), "expected `name`"));
+        }
+        let _eq_token: Token![=] = input.parse()?;
+        let name: LitStr = input.parse()?;
+        Ok(Self { name: name.value() })
+    }
+}
+
+/// Attribute macro for registering an IPC handler function.
+///
+/// # Usage
+///
+/// ```ignore
+/// #[hammer_component_macros::ipc_handler(name = "ping")]
+/// fn handle_ping(engine: &mut Engine, request: &[u8]) -> Vec<u8> {
+///     // ...
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn ipc_handler(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(attr as IpcHandlerAttrArgs);
+    let input = parse_macro_input!(item as syn::ItemFn);
+    let name = &args.name;
+    let fn_name = &input.sig.ident;
+    let vis = &input.vis;
+    let sig = &input.sig;
+    let block = &input.block;
+    let static_name = format_ident!("__IPC_HANDLER_{}", fn_name);
+
+    let expanded = quote! {
+        #vis #sig
+        #block
+
+        #[::linkme::distributed_slice(::hammer_ipc::IPC_HANDLERS)]
+        static #static_name: ::hammer_ipc::IpcHandler = ::hammer_ipc::IpcHandler {
+            name: #name,
+            handler: #fn_name,
+        };
+    };
+    TokenStream::from(expanded)
+}

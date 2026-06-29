@@ -3,7 +3,6 @@ extern crate self as hammer_service;
 pub mod app;
 pub mod data_plane;
 pub mod device;
-mod event_subscribers;
 pub mod interface;
 pub mod net;
 mod packet_graph;
@@ -19,7 +18,6 @@ pub mod adapter {
 
 pub use hammer_core::error::{HammerError, HammerResult};
 pub use hammer_runtime::RuntimePlatform;
-pub use service::RuntimeService;
 
 #[cfg(test)]
 pub(crate) fn reset_subsystem_mains_for_test() {

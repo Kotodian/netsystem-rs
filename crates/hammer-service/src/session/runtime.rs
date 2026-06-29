@@ -984,6 +984,7 @@ where
                 continue;
             }
         }
+        #[allow(clippy::never_loop)]
         loop {
             let Some(total_len) = driver.app_state.app.pending_send_len(session_id)? else {
                 break;

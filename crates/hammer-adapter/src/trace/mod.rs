@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use crossbeam_queue::SegQueue;
 use hammer_core::config::Trace;
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::log::Logger;
+
 use hammer_infra::map::FlatHashTable;
 use hammer_infra::vec::Vec;
 
@@ -430,20 +430,9 @@ impl TraceControlHandle {
 
 impl TraceRecordSink {
     pub fn drain_completed(&self) -> usize {
-        self.drain_completed_inner(None)
-    }
-
-    pub fn drain_completed_with_logger(&self, logger: &Logger) -> usize {
-        self.drain_completed_inner(Some(logger))
-    }
-
-    fn drain_completed_inner(&self, logger: Option<&Logger>) -> usize {
         let mut drained = 0usize;
         while let Some(record) = self.inner.completed.pop() {
             self.inner.completed_len.fetch_sub(1, Ordering::AcqRel);
-            if let Some(logger) = logger {
-                logger.debug(format_trace_record(&record));
-            }
             let mut state = self
                 .inner
                 .state

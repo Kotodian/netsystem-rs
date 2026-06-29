@@ -15,12 +15,11 @@ pub use hammer_core::error::{HammerError, HammerResult};
 
 pub mod app;
 pub mod attach;
-mod component_registry;
 mod control_thread;
 mod data_plane;
 pub use data_plane::new_worker_runtime;
 pub mod graph;
-mod macros;
+
 mod numa;
 pub mod protocol;
 mod socket_protector;
@@ -28,13 +27,7 @@ pub mod spawn;
 pub mod start_workers;
 mod worker_thread;
 
-pub use component_registry::{
-    EventSubscriberComponentDeclaration, register_event_subscriber_component,
-};
-pub use control_thread::{
-    ControlEvent, ControlEventArgs, ControlEventFilter, ControlEventSubscriptionHandle,
-    ControlThread, ControlThreadHandle, ControlTimerHandle, EventSubscriberBuilder, LogEventArgs,
-};
+pub use control_thread::{ControlThread, ControlThreadHandle, ControlTimerHandle};
 pub use hammer_core::{
     MetricCounter, MetricGauge, MetricKind, MetricLabel, MetricSample, MetricsRegistry,
     MetricsScope,

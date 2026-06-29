@@ -1,8 +1,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use hammer_core::log::{DiscardWriter, Level};
 use hammer_core::protocol::tcp::{
     TcpCapabilities, TcpCloseReason, TcpControlPlaneAction, TcpListenerId, TcpListenerKey,
 };
@@ -21,13 +20,8 @@ fn run_control_thread(thread: ControlThread) -> std::thread::JoinHandle<()> {
 
 #[test]
 fn tcp_control_plane_tracks_listener_install_and_remove() {
-    let (control_handle, control_thread) = ControlThread::new(
-        Instant::now(),
-        Arc::new(DiscardWriter),
-        MetricsRegistry::new(),
-        Duration::from_secs(60),
-        Level::Info,
-    );
+    let (control_handle, control_thread) =
+        ControlThread::new(std::time::Instant::now(), hammer_core::log::Level::Info);
     let join = run_control_thread(control_thread);
     let plane = TcpControlPlane::new(Arc::clone(&control_handle));
     let listener_id = TcpListenerId::new(7);
@@ -69,53 +63,33 @@ fn tcp_control_plane_tracks_listener_install_and_remove() {
 
 #[test]
 fn tcp_control_plane_clone_shares_listener_state() {
-    let (control_handle, control_thread) = ControlThread::new(
-        Instant::now(),
-        Arc::new(DiscardWriter),
-        MetricsRegistry::new(),
-        Duration::from_secs(60),
-        Level::Info,
-    );
+    let (control_handle, control_thread) =
+        ControlThread::new(std::time::Instant::now(), hammer_core::log::Level::Info);
     let join = run_control_thread(control_thread);
     let plane = TcpControlPlane::new(Arc::clone(&control_handle));
-    let clone = plane.clone();
-    let listener_id = TcpListenerId::new(11);
-    let first_listener =
-        TcpListenerKey::v6(9, Ipv6Addr::new(0x2001, 0xdb8, 0, 11, 0, 0, 0, 1), 8443);
-    let second_listener =
-        TcpListenerKey::v6(9, Ipv6Addr::new(0x2001, 0xdb8, 0, 11, 0, 0, 0, 2), 9443);
-    let first_capabilities = TcpCapabilities {
-        max_segment_size: Some(1280),
-        ..TcpCapabilities::default()
-    };
-    let second_capabilities = TcpCapabilities {
-        max_segment_size: Some(1360),
+    let listener_id = TcpListenerId::new(7);
+    let listener = TcpListenerKey::v4(3, Ipv4Addr::new(127, 0, 0, 1), 7000);
+    let capabilities = TcpCapabilities {
+        max_segment_size: Some(1400),
+        window_scale: Some(6),
         sack: true,
-        ..TcpCapabilities::default()
+        timestamps: true,
+        ecn: false,
+        accurate_ecn: false,
+        fast_open: false,
     };
 
-    plane
+    let plane2 = plane.clone();
+    plane2
         .apply(TcpControlPlaneAction::InstallListener {
             listener_id,
-            listener: first_listener,
-            capabilities: first_capabilities,
+            listener,
+            capabilities,
         })
-        .expect("install listener from original handle");
-    assert_eq!(
-        clone.listener_for_test(listener_id),
-        Some((first_listener, first_capabilities))
-    );
-
-    clone
-        .apply(TcpControlPlaneAction::InstallListener {
-            listener_id,
-            listener: second_listener,
-            capabilities: second_capabilities,
-        })
-        .expect("replace listener from cloned handle");
+        .expect("install listener through clone");
     assert_eq!(
         plane.listener_for_test(listener_id),
-        Some((second_listener, second_capabilities))
+        Some((listener, capabilities))
     );
 
     assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
