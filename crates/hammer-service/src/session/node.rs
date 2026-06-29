@@ -84,13 +84,13 @@ pub(crate) type SessionQueueDispatchFn = fn(
 ) -> CoreResult<()>;
 
 #[derive(Default)]
-pub(crate) struct SessionQueueOutput {
+pub struct SessionQueueOutput {
     frames: NodeNextFrames,
 }
 
 impl SessionQueueOutput {
     #[inline]
-    pub(crate) fn enqueue(
+    pub fn enqueue(
         &mut self,
         runtime: &DataPlaneRuntime,
         node: NodeId,
@@ -100,7 +100,7 @@ impl SessionQueueOutput {
     }
 
     #[inline]
-    pub(crate) fn schedule(self, runtime: &DataPlaneRuntime) {
+    pub fn schedule(self, runtime: &DataPlaneRuntime) {
         self.frames.schedule(runtime)
     }
 }
@@ -217,21 +217,15 @@ fn session_queue_node_process(
         Ok(slot) => slot,
         Err(_) => return NodeResult::drop(),
     };
-    let attachments = match SESSION_QUEUE_NODES.with(|nodes| {
-        let nodes = nodes
-            .try_borrow()
-            .map_err(|_| CoreError::internal("session queue nodes borrowed"))?;
-        let node = nodes
-            .get(slot)
-            .ok_or_else(|| CoreError::internal("session queue node slot is invalid"))?;
-        Ok::<_, CoreError>(node.clone())
-    }) {
-        Ok(attachments) => attachments,
-        Err(_) => return NodeResult::drop(),
-    };
     let now = Instant::now();
     let mut output = SessionQueueOutput::default();
-    for attachment in attachments {
+    let mut index = 0usize;
+    loop {
+        let attachment = SESSION_QUEUE_NODES.with(|nodes| {
+            let nodes = nodes.try_borrow().ok()?;
+            nodes.get(slot)?.get(index).copied()
+        });
+        let Some(attachment) = attachment else { break };
         if (attachment.dispatch)(
             runtime,
             attachment.runtime_data,
@@ -244,6 +238,7 @@ fn session_queue_node_process(
             output.schedule(runtime);
             return NodeResult::drop();
         }
+        index += 1;
     }
     output.schedule(runtime);
     NodeResult::drop()

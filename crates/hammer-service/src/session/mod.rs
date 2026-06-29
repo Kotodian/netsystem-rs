@@ -3,7 +3,7 @@ pub mod id;
 pub mod node;
 pub mod protocol;
 pub mod ready;
-pub(crate) mod runtime;
+pub mod runtime;
 
 pub use app::SessionAppRuntime;
 pub use id::SessionId;

@@ -48,11 +48,11 @@ impl<S: Segment> SessionAppRuntime<S> {
     /// `attach_session_local_with_runtime_tx` shares this same queue, so the
     /// dataplane side can drain all sessions' TX events from one ring.
     #[inline]
-    pub(crate) fn tx_evt_q(&self) -> &Arc<MsgQueue<S>> {
+    pub fn tx_evt_q(&self) -> &Arc<MsgQueue<S>> {
         &self.tx_evt_q
     }
 
-    pub(crate) fn attach_session(&mut self, session_id: SessionId, session: Arc<AppSession<S>>) {
+    pub fn attach_session(&mut self, session_id: SessionId, session: Arc<AppSession<S>>) {
         self.sessions.insert(session_id.get(), session);
         let slot = session_id.pool_index().slot() as usize;
         if let Some(entry) = self.sessions_by_index.get_mut(slot) {
@@ -98,7 +98,7 @@ impl<S: Segment> SessionAppRuntime<S> {
         Ok(dropped != 0)
     }
 
-    pub(crate) fn pending_send_len(&self, session_id: SessionId) -> CoreResult<Option<usize>> {
+    pub fn pending_send_len(&self, session_id: SessionId) -> CoreResult<Option<usize>> {
         Ok(self
             .sessions
             .lookup(&session_id.get())
@@ -161,6 +161,28 @@ impl<S: Segment> SessionAppRuntime<S> {
         }
         buffers.free_index(index);
         Ok(wrote == total)
+    }
+
+    pub(crate) fn copy_rx_from_buffer(
+        &self,
+        session_id: SessionId,
+        buffers: &DataPlaneBuffers,
+        index: BufferIndex,
+    ) -> CoreResult<usize> {
+        let Some(session) = self.sessions.lookup(&session_id.get()) else {
+            return Ok(0);
+        };
+        let mut total = 0usize;
+        let mut wrote = 0usize;
+        for buffer in buffers.chain(index) {
+            let buffer = buffer?;
+            let chunk = buffer.current();
+            total += chunk.len();
+            if wrote == total - chunk.len() {
+                wrote += session.enqueue_rx(chunk).map_err(CoreError::from)?;
+            }
+        }
+        Ok(wrote)
     }
 
     pub(crate) fn free_pending_send(&mut self, session_id: SessionId) {

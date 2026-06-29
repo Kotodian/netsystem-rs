@@ -57,17 +57,17 @@ where
     Ok(())
 }
 
-pub(crate) struct SessionQueueControlContext {
+pub struct SessionQueueControlContext {
     timer_wheel: *mut TimerWheel1t2w2048sl<u32>,
     ready: *mut SessionReadyQueue,
     buffers: *const DataPlaneBuffers,
     current_session_id: SessionId,
-    has_pending_tx: bool,
+    has_pending_tx: std::cell::Cell<bool>,
 }
 
 impl SessionQueueControlContext {
     #[inline]
-    pub(crate) fn new(
+    pub fn new(
         timer_wheel: *mut TimerWheel1t2w2048sl<u32>,
         ready: *mut SessionReadyQueue,
         buffers: *const DataPlaneBuffers,
@@ -79,17 +79,17 @@ impl SessionQueueControlContext {
             ready,
             buffers,
             current_session_id,
-            has_pending_tx,
+            has_pending_tx: std::cell::Cell::new(has_pending_tx),
         }
     }
 
     #[inline]
-    pub(crate) fn buffers(&self) -> &DataPlaneBuffers {
+    pub fn buffers(&self) -> &DataPlaneBuffers {
         unsafe { &*self.buffers }
     }
 
     #[inline]
-    pub(crate) fn timer_wheel(&mut self) -> &mut TimerWheel1t2w2048sl<u32> {
+    pub fn timer_wheel(&mut self) -> &mut TimerWheel1t2w2048sl<u32> {
         unsafe { &mut *self.timer_wheel }
     }
 
@@ -99,7 +99,7 @@ impl SessionQueueControlContext {
     /// context's timer wheel and session slot. See that fn for the
     /// cancel/update semantics and the `keep_mask` contract.
     #[inline]
-    pub(crate) fn refresh_tcp_timers<C>(
+    pub fn refresh_tcp_timers<C>(
         &mut self,
         conn: &TcpConnection<C>,
         keep_mask: u16,
@@ -119,7 +119,7 @@ impl SessionQueueControlContext {
     }
 
     #[inline]
-    pub(crate) fn mark_ready(&mut self) {
+    pub fn mark_ready(&mut self) {
         if self.ready.is_null() {
             return;
         }
@@ -127,12 +127,17 @@ impl SessionQueueControlContext {
     }
 
     #[inline]
-    pub(crate) const fn session_id(&self) -> SessionId {
+    pub const fn session_id(&self) -> SessionId {
         self.current_session_id
     }
 
     #[inline]
-    pub(crate) const fn has_pending_tx(&self) -> bool {
-        self.has_pending_tx
+    pub fn has_pending_tx(&self) -> bool {
+        self.has_pending_tx.get()
+    }
+
+    #[inline]
+    pub fn refresh_has_pending_tx(&self, value: bool) {
+        self.has_pending_tx.set(value);
     }
 }
