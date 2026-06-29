@@ -23,8 +23,8 @@ pub enum TcpSynSentNext {
     init = crate::transport::tcp::syn_sent::register_tcp_syn_sent,
     name = "tcp-syn-sent",
     next = TcpSynSentNext,
+    role = internal,
 )]
-#[hammer_component_macros::node(role = internal, next = TcpSynSentNext)]
 pub struct TcpSynSentNode<C: CongestionController + 'static> {
     session_queue: TcpQueue<C>,
 }

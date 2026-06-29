@@ -141,8 +141,8 @@ impl TcpInputControlPlane {
     name = "tcp-input",
     next = TcpInputNext,
     init = crate::transport::tcp::register_tcp_input,
+    role = internal,
 )]
-#[hammer_component_macros::node(role = internal, next = TcpInputNext)]
 pub struct TcpInputNode<C: CongestionController + 'static> {
     #[node(default = register_tcp_input_runtime(snapshot.clone()))]
     runtime_data: NodeRuntimeData,

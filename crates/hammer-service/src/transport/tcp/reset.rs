@@ -17,9 +17,9 @@ pub enum TcpResetNext {
     graph = service,
     init = crate::transport::tcp::reset::register_tcp_reset,
     next = TcpResetNext,
+    role = internal,
 )]
 #[derive(Clone, Copy)]
-#[hammer_component_macros::node(role = internal, next = TcpResetNext)]
 pub struct TcpResetNode {
     #[node(default)]
     cached_next: Option<NodeId>,

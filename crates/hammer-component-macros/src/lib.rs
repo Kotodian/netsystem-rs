@@ -1100,6 +1100,10 @@ struct GraphNodeArgs {
     kind: Option<Ident>,
     name: Option<LitStr>,
     next: Option<Path>,
+    role: Option<NodeRole>,
+    next_node: bool,
+    sibling_of: Option<Path>,
+    start_arc: Option<Path>,
 }
 
 impl Default for GraphNodeArgs {
@@ -1110,6 +1114,10 @@ impl Default for GraphNodeArgs {
             kind: None,
             name: None,
             next: None,
+            role: None,
+            next_node: false,
+            sibling_of: None,
+            start_arc: None,
         }
     }
 }
@@ -1119,33 +1127,73 @@ impl Parse for GraphNodeArgs {
         let mut args = GraphNodeArgs::default();
         while !input.is_empty() {
             let key: Ident = input.parse()?;
-            input.parse::<Token![=]>()?;
             match key.to_string().as_str() {
-                "graph" => args.graph = input.parse()?,
-                "init" => args.init = Some(input.parse()?),
-                "kind" => {
-                    let kind: Ident = input.parse()?;
-                    args.kind = Some(match kind.to_string().as_str() {
-                        "internal" | "driver" | "handoff" => kind,
+                "next_node" => {
+                    if args.next_node {
+                        return Err(Error::new(key.span(), "duplicate `next_node` argument"));
+                    }
+                    args.next_node = true;
+                }
+                _ => {
+                    input.parse::<Token![=]>()?;
+                    match key.to_string().as_str() {
+                        "graph" => args.graph = input.parse()?,
+                        "init" => args.init = Some(input.parse()?),
+                        "kind" => {
+                            let kind: Ident = input.parse()?;
+                            args.kind = Some(match kind.to_string().as_str() {
+                                "internal" | "driver" | "handoff" => kind,
+                                other => {
+                                    return Err(Error::new(
+                                        kind.span(),
+                                        format!(
+                                            "unknown graph node kind `{other}`; expected `internal`, `driver`, or `handoff`"
+                                        ),
+                                    ));
+                                }
+                            });
+                        }
+                        "name" => args.name = Some(input.parse()?),
+                        "next" => args.next = Some(input.parse()?),
+                        "role" => {
+                            if args.role.is_some() {
+                                return Err(Error::new(key.span(), "duplicate `role` argument"));
+                            }
+                            let role: Ident = input.parse()?;
+                            args.role = Some(match role.to_string().as_str() {
+                                "internal" => NodeRole::Internal,
+                                "driver" => NodeRole::Driver,
+                                other => {
+                                    return Err(Error::new(
+                                        role.span(),
+                                        format!(
+                                            "unknown node role `{other}`; expected `internal` or `driver`"
+                                        ),
+                                    ));
+                                }
+                            });
+                        }
+                        "sibling_of" => {
+                            if args.sibling_of.is_some() {
+                                return Err(Error::new(key.span(), "duplicate `sibling_of` argument"));
+                            }
+                            args.sibling_of = Some(input.parse()?);
+                        }
+                        "start_arc" => {
+                            if args.start_arc.is_some() {
+                                return Err(Error::new(key.span(), "duplicate `start_arc` argument"));
+                            }
+                            args.start_arc = Some(input.parse()?);
+                        }
                         other => {
                             return Err(Error::new(
-                                kind.span(),
+                                key.span(),
                                 format!(
-                                    "unknown graph node kind `{other}`; expected `internal`, `driver`, or `handoff`"
+                                    "unknown `graph_node` argument `{other}`; expected `graph`, `init`, `kind`, `name`, `next`, `role`, `next_node`, `sibling_of`, or `start_arc`"
                                 ),
                             ));
                         }
-                    });
-                }
-                "name" => args.name = Some(input.parse()?),
-                "next" => args.next = Some(input.parse()?),
-                other => {
-                    return Err(Error::new(
-                        key.span(),
-                        format!(
-                            "unknown `graph_node` argument `{other}`; expected `graph`, `init`, `kind`, `name`, or `next`"
-                        ),
-                    ));
+                    }
                 }
             }
             if input.parse::<Option<Token![,]>>()?.is_none() {
@@ -1159,6 +1207,24 @@ impl Parse for GraphNodeArgs {
             return Err(Error::new(
                 Span::call_site(),
                 "missing `init` argument (path to a `fn(&DataPlaneRuntime, usize) -> CoreResult<NodeId>`)",
+            ));
+        }
+        if args.next.is_some() && args.next_node {
+            return Err(Error::new(
+                Span::call_site(),
+                "`next` and `next_node` are mutually exclusive",
+            ));
+        }
+        if args.next.is_some() && args.sibling_of.is_some() {
+            return Err(Error::new(
+                Span::call_site(),
+                "`next` and `sibling_of` are mutually exclusive",
+            ));
+        }
+        if args.next_node && args.sibling_of.is_some() {
+            return Err(Error::new(
+                Span::call_site(),
+                "`next_node` and `sibling_of` are mutually exclusive",
             ));
         }
         Ok(args)
@@ -1237,28 +1303,64 @@ fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<T
         quote!(#ident::NODE_NAME)
     };
     let node_registration = graph_node_registration(&node_name, args.next.as_ref());
-    // `init` is validated as present in `Parse for GraphNodeArgs`.
     let init = args
         .init
         .as_ref()
         .expect("graph_node `init` argument validated in parse");
 
-    // The macro only emits the `NodeEntry` shell + linkme collection. The init
-    // function is supplied by the node (`init = path`); it owns its subsystem
-    // dependencies (`*_MAIN` globals) and the macro knows nothing about them.
-    // This is VPP `VLIB_REGISTER_NODE`: registration is declarative, the node
-    // function is the node's own; graph wiring is resolved later by
-    // `init_graph` + `resolve_named_next_nodes` (`vlib_node_main_init`).
-    Ok(quote! {
-        #item
-
+    let registration = quote! {
         #[::linkme::distributed_slice(#graph_slice)]
         static #static_ident: ::hammer_adapter::NodeEntry = ::hammer_adapter::NodeEntry {
             registration: #node_registration,
             kind: #node_kind,
             init: #init,
         };
-    })
+    };
+
+    // Node expansion is triggered when node-specific args (role, next_node, etc.)
+    // are present in #[graph_node(...)], or when struct fields carry #[node(default)]
+    // field-level attrs (enabling callers to drop standalone #[node]).
+    let has_field_node_attr = match &item {
+        Item::Struct(s) => s
+            .fields
+            .iter()
+            .any(|f| f.attrs.iter().any(|a| a.path().is_ident("node"))),
+        _ => false,
+    };
+    let needs_node_expansion = args.role.is_some()
+        || args.next_node
+        || args.sibling_of.is_some()
+        || args.start_arc.is_some()
+        || has_field_node_attr;
+
+    if needs_node_expansion {
+        let struct_item = match item {
+            Item::Struct(s) => s,
+            _ => {
+                return Err(Error::new(
+                    Span::call_site(),
+                    "graph_node with node args requires a struct",
+                ));
+            }
+        };
+        let node_args = NodeArgs {
+            next: args.next.clone(),
+            next_node: args.next_node,
+            sibling_of: args.sibling_of.clone(),
+            role: args.role,
+            start_arc: args.start_arc.clone(),
+        };
+        let node_output = expand_node(node_args, struct_item)?;
+        Ok(quote! {
+            #node_output
+            #registration
+        })
+    } else {
+        Ok(quote! {
+            #item
+            #registration
+        })
+    }
 }
 
 // ── Init / Config function macros (VPP VLIB_INIT_FUNCTION / VLIB_CONFIG_FUNCTION) ──

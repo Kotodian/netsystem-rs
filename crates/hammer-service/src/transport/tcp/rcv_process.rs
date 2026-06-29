@@ -25,8 +25,8 @@ pub enum TcpRcvProcessNext {
     init = crate::transport::tcp::rcv_process::register_tcp_rcv_process,
     name = "tcp-rcv-process",
     next = TcpRcvProcessNext,
+    role = internal,
 )]
-#[hammer_component_macros::node(role = internal, next = TcpRcvProcessNext)]
 pub struct TcpRcvProcessNode<C: CongestionController + 'static> {
     session_queue: TcpQueue<C>,
 }

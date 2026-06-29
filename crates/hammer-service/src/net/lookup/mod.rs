@@ -390,7 +390,6 @@ pub fn wire_ip_lookup_drop(runtime: &DataPlaneRuntime) -> CoreResult<()> {
     graph = service,
     init = crate::net::lookup::register_ip_lookup
 )]
-#[hammer_component_macros::node]
 pub struct IpLookupNode {
     #[node(default = register_ip_lookup_runtime(table.clone()))]
     runtime_data: NodeRuntimeData,

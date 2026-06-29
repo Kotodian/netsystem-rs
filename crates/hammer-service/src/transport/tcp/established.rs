@@ -26,8 +26,8 @@ pub enum TcpEstablishedNext {
     init = crate::transport::tcp::established::register_tcp_established,
     name = "tcp-established",
     next = TcpEstablishedNext,
+    role = internal,
 )]
-#[hammer_component_macros::node(role = internal, next = TcpEstablishedNext)]
 pub struct TcpEstablishedNode<C: CongestionController + 'static> {
     session_queue: TcpQueue<C>,
 }

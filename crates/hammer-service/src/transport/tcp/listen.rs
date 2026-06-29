@@ -37,8 +37,8 @@ pub enum TcpListenNext {
     init = crate::transport::tcp::listen::register_tcp_listen,
     name = "tcp-listen",
     next = TcpListenNext,
+    role = internal,
 )]
-#[hammer_component_macros::node(role = internal, next = TcpListenNext)]
 pub struct TcpListenNode<C: CongestionController + 'static> {
     control: TcpInputControlPlane,
     session_queue: TcpQueue<C>,
