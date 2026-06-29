@@ -91,8 +91,11 @@ where
         &mut self,
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        let next = Self::runtime_nexts(runtime)?;
+    ) -> NodeResult {
+        let next = match Self::runtime_nexts(runtime) {
+            Ok(next) => next,
+            Err(_) => return NodeResult::drop(),
+        };
         let feature_arc = self.feature_arc.as_ref().map(|arc| arc.start_handle());
         ip_input_process_frame(runtime, frame, next, feature_arc.as_ref())
     }
@@ -121,70 +124,13 @@ fn ip_input_process_frame(
     frame: &mut BufferFrame,
     next: [NodeId; IpInputNext::COUNT],
     feature_arc: Option<&FeatureArcStartHandle>,
-) -> CoreResult<NodeResult> {
-    let indices = frame.pending_indices();
-    let mut next_frames = NodeNextFrames::default();
-    let mut read = 0usize;
-    let len = indices.len();
-    while read + 4 <= len {
-        if read + 4 < len {
-            runtime.prefetch_header(indices[read + 4]);
+) -> NodeResult {
+    hammer_adapter::vlib_process_frame!(runtime, frame, |index, _nf| {
+        match next_node_for_index(runtime, index, next, feature_arc) {
+            Ok(node) => node,
+            Err(_) => NodeNextStorage::next(&next, IpInputNext::Drop),
         }
-        if read + 5 < len {
-            runtime.prefetch_header(indices[read + 5]);
-        }
-        if read + 6 < len {
-            runtime.prefetch_header(indices[read + 6]);
-        }
-        if read + 7 < len {
-            runtime.prefetch_header(indices[read + 7]);
-        }
-        let index0 = indices[read];
-        let index1 = indices[read + 1];
-        let index2 = indices[read + 2];
-        let index3 = indices[read + 3];
-        runtime.prefetch_read(index0);
-        runtime.prefetch_read(index1);
-        runtime.prefetch_read(index2);
-        runtime.prefetch_read(index3);
-        let node0 = next_node_for_index(runtime, index0, next, feature_arc)?;
-        next_frames.enqueue(runtime, node0, index0)?;
-        let node1 = next_node_for_index(runtime, index1, next, feature_arc)?;
-        next_frames.enqueue(runtime, node1, index1)?;
-        let node2 = next_node_for_index(runtime, index2, next, feature_arc)?;
-        next_frames.enqueue(runtime, node2, index2)?;
-        let node3 = next_node_for_index(runtime, index3, next, feature_arc)?;
-        next_frames.enqueue(runtime, node3, index3)?;
-        read += 4;
-    }
-    if read + 2 <= len {
-        if read + 2 < len {
-            runtime.prefetch_header(indices[read + 2]);
-        }
-        if read + 3 < len {
-            runtime.prefetch_header(indices[read + 3]);
-        }
-        let index0 = indices[read];
-        let index1 = indices[read + 1];
-        runtime.prefetch_read(index0);
-        runtime.prefetch_read(index1);
-        let node0 = next_node_for_index(runtime, index0, next, feature_arc)?;
-        next_frames.enqueue(runtime, node0, index0)?;
-        let node1 = next_node_for_index(runtime, index1, next, feature_arc)?;
-        next_frames.enqueue(runtime, node1, index1)?;
-        read += 2;
-    }
-    while read < len {
-        if read + 1 < len {
-            runtime.prefetch_header(indices[read + 1]);
-        }
-        let index0 = indices[read];
-        runtime.prefetch_read(index0);
-        let node0 = next_node_for_index(runtime, index0, next, feature_arc)?;
-        next_frames.enqueue(runtime, node0, index0)?;
-        read += 1;
-    }
-    next_frames.finish(runtime, frame)
+    })
 }
 
 /// Per-instance state held in the global IP input registry. Mirrors the
@@ -244,9 +190,15 @@ fn ip_input_process<A: FeatureArcSpec>(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> CoreResult<NodeResult> {
-    let state = ip_input_runtime(data)?;
-    let next = IpInputNode::<A>::runtime_nexts(runtime)?;
+) -> NodeResult {
+    let state = match ip_input_runtime(data) {
+        Ok(state) => state,
+        Err(_) => return NodeResult::drop(),
+    };
+    let next = match IpInputNode::<A>::runtime_nexts(runtime) {
+        Ok(next) => next,
+        Err(_) => return NodeResult::drop(),
+    };
     let feature_arc = state.feature_arc.as_ref();
     ip_input_process_frame(runtime, frame, next, feature_arc)
 }
@@ -267,7 +219,7 @@ fn next_node_for_index(
                 let resolved = NodeNextStorage::next(&next, IpInputNext::Drop);
                 drop(buffer);
                 if unlikely(traced) {
-                    add_packet_trace!(
+                    let _ = add_packet_trace!(
                         runtime,
                         index,
                         IpInputTrace {
@@ -278,7 +230,7 @@ fn next_node_for_index(
                             packet_len: 0,
                             next: resolved,
                         },
-                    )?;
+                    );
                 }
                 return Ok(resolved);
             }
@@ -365,14 +317,14 @@ fn next_node_for_index(
         IpInputTarget::Reassembly => NodeNextStorage::next(&next, IpInputNext::Reassembly),
     };
     if let Some(trace) = trace {
-        add_packet_trace!(
+        let _ = add_packet_trace!(
             runtime,
             index,
             IpInputTrace {
                 next: resolved,
                 ..trace
             },
-        )?;
+        );
     }
     Ok(resolved)
 }

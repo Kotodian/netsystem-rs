@@ -360,10 +360,7 @@ fn enqueue_tcp_segment(
         runtime.free_index(index);
         return Err(error);
     }
-    if let Err(error) = output.enqueue(runtime, output_next.node(), index) {
-        runtime.free_index(index);
-        return Err(error);
-    }
+    output.enqueue(runtime, output_next.node(), index);
     Ok(())
 }
 
@@ -698,10 +695,8 @@ mod tests {
     }
 
     impl Node for CaptureNode {
-        fn process(&mut self, _: &DataPlaneRuntime, _: &mut BufferFrame) -> CoreResult<NodeResult> {
-            Err(CoreError::internal(
-                "capture node must use descriptor process",
-            ))
+        fn process(&mut self, _: &DataPlaneRuntime, _: &mut BufferFrame) -> NodeResult {
+            NodeResult::drop()
         }
 
         fn node_process(&self) -> NodeProcessFn {
@@ -731,24 +726,29 @@ mod tests {
         runtime: &DataPlaneRuntime,
         data: NodeRuntimeData,
         frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        let slot = data.usize_word(0)?;
+    ) -> NodeResult {
+        let slot = match data.usize_word(0) {
+            Ok(s) => s,
+            Err(_) => return NodeResult::drop(),
+        };
         let state = {
             let states = capture_states().lock().expect("capture registry");
-            Arc::clone(
-                states
-                    .get(slot)
-                    .ok_or_else(|| CoreError::internal("capture slot is invalid"))?,
-            )
+            match states.get(slot) {
+                Some(s) => Arc::clone(s),
+                None => return NodeResult::drop(),
+            }
         };
         let mut state = state.lock().expect("capture state");
         let mut pending = frame.drain_pending();
         while let Some(index) = pending.next() {
-            let packet = runtime.get_buffer(index)?.current().to_vec();
+            let packet = match runtime.get_buffer(index) {
+                Ok(buf) => buf.current().to_vec(),
+                Err(_) => return NodeResult::drop(),
+            };
             state.packets.push(packet);
             runtime.free_index(index);
         }
-        Ok(NodeResult::drop())
+        NodeResult::drop()
     }
 
     fn tcp_output_graph(

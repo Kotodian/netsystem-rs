@@ -1,6 +1,6 @@
 use hammer_adapter::{
-    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeId, NodeNextFrames,
-    NodeProcessFn, NodeResult, NodeRuntimeData,
+    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeId, NodeProcessFn,
+    NodeResult, NodeRuntimeData,
 };
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::{TcpError, TcpSegmentFlags, tcp_header};
@@ -38,8 +38,11 @@ impl Node for TcpResetNode {
         &mut self,
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        let next = Self::runtime_nexts(runtime)?;
+    ) -> NodeResult {
+        let next = match Self::runtime_nexts(runtime) {
+            Ok(next) => next,
+            Err(_) => return NodeResult::drop(),
+        };
         tcp_reset_process_frame(runtime, frame, next)
     }
 
@@ -58,8 +61,11 @@ fn tcp_reset_process(
     runtime: &DataPlaneRuntime,
     _: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> CoreResult<NodeResult> {
-    let next = TcpResetNode::runtime_nexts(runtime)?;
+) -> NodeResult {
+    let next = match TcpResetNode::runtime_nexts(runtime) {
+        Ok(next) => next,
+        Err(_) => return NodeResult::drop(),
+    };
     tcp_reset_process_frame(runtime, frame, next)
 }
 
@@ -67,81 +73,15 @@ fn tcp_reset_process_frame(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
     next: [NodeId; TcpResetNext::COUNT],
-) -> CoreResult<NodeResult> {
+) -> NodeResult {
     let drop_next = next[TcpResetNext::Drop as usize];
     let lookup_next = next[TcpResetNext::Lookup as usize];
-    let mut next_frames = NodeNextFrames::default();
-    let indices = frame.pending_indices();
-    let len = indices.len();
-    let mut read = 0usize;
-    while read + 4 <= len {
-        prefetch_tcp_reset(runtime, &indices[read..read + 4]);
-        tcp_reset_enqueue_index(
-            runtime,
-            indices[read],
-            drop_next,
-            lookup_next,
-            &mut next_frames,
-        )?;
-        tcp_reset_enqueue_index(
-            runtime,
-            indices[read + 1],
-            drop_next,
-            lookup_next,
-            &mut next_frames,
-        )?;
-        tcp_reset_enqueue_index(
-            runtime,
-            indices[read + 2],
-            drop_next,
-            lookup_next,
-            &mut next_frames,
-        )?;
-        tcp_reset_enqueue_index(
-            runtime,
-            indices[read + 3],
-            drop_next,
-            lookup_next,
-            &mut next_frames,
-        )?;
-        read += 4;
-    }
-    if read + 2 <= len {
-        prefetch_tcp_reset(runtime, &indices[read..read + 2]);
-        tcp_reset_enqueue_index(
-            runtime,
-            indices[read],
-            drop_next,
-            lookup_next,
-            &mut next_frames,
-        )?;
-        tcp_reset_enqueue_index(
-            runtime,
-            indices[read + 1],
-            drop_next,
-            lookup_next,
-            &mut next_frames,
-        )?;
-        read += 2;
-    }
-    while read < len {
-        let index = indices[read];
-        prefetch_tcp_reset(runtime, &indices[read..read + 1]);
-        tcp_reset_enqueue_index(runtime, index, drop_next, lookup_next, &mut next_frames)?;
-        read += 1;
-    }
-    next_frames.finish(runtime, frame)
+    hammer_adapter::vlib_process_frame!(runtime, frame, |index, _nf| {
+        tcp_reset_next_for_index(runtime, index, drop_next, lookup_next).unwrap_or(drop_next)
+    })
 }
 
 #[inline(always)]
-fn prefetch_tcp_reset(runtime: &DataPlaneRuntime, indices: &[BufferIndex]) {
-    let mut read = 0usize;
-    while read < indices.len() {
-        runtime.prefetch_read(indices[read]);
-        read += 1;
-    }
-}
-
 fn tcp_reset_next_for_index(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
@@ -161,18 +101,6 @@ fn tcp_reset_next_for_index(
     };
     refresh_reset_metadata(runtime, index, reply_len)?;
     Ok(lookup_next)
-}
-
-#[inline(always)]
-fn tcp_reset_enqueue_index(
-    runtime: &DataPlaneRuntime,
-    index: BufferIndex,
-    drop_next: NodeId,
-    lookup_next: NodeId,
-    next_frames: &mut NodeNextFrames,
-) -> CoreResult<()> {
-    let next = tcp_reset_next_for_index(runtime, index, drop_next, lookup_next)?;
-    hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, next, index)
 }
 
 #[inline(always)]
@@ -550,9 +478,9 @@ mod tests {
             &mut self,
             _runtime: &DataPlaneRuntime,
             frame: &mut BufferFrame,
-        ) -> CoreResult<NodeResult> {
+        ) -> NodeResult {
             frame.drain_pending();
-            Ok(NodeResult::drop())
+            NodeResult::drop()
         }
 
         fn node_process(&self) -> NodeProcessFn {
@@ -570,9 +498,9 @@ mod tests {
         _: &DataPlaneRuntime,
         _: NodeRuntimeData,
         frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
+    ) -> NodeResult {
         frame.drain_pending();
-        Ok(NodeResult::drop())
+        NodeResult::drop()
     }
 
     #[test]

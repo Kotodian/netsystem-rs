@@ -95,12 +95,12 @@ impl SessionQueueOutput {
         runtime: &DataPlaneRuntime,
         node: NodeId,
         index: BufferIndex,
-    ) -> CoreResult<()> {
+    ) {
         self.frames.enqueue(runtime, node, index)
     }
 
     #[inline]
-    pub(crate) fn schedule(self, runtime: &DataPlaneRuntime) -> CoreResult<()> {
+    pub(crate) fn schedule(self, runtime: &DataPlaneRuntime) {
         self.frames.schedule(runtime)
     }
 }
@@ -183,7 +183,7 @@ impl Node for SessionQueueNode {
         &mut self,
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
+    ) -> NodeResult {
         session_queue_node_process(runtime, self.runtime_data, frame)
     }
 
@@ -212,9 +212,12 @@ fn session_queue_node_process(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     _: &mut BufferFrame,
-) -> CoreResult<NodeResult> {
-    let slot = data.usize_word(0)?;
-    let attachments = SESSION_QUEUE_NODES.with(|nodes| {
+) -> NodeResult {
+    let slot = match data.usize_word(0) {
+        Ok(slot) => slot,
+        Err(_) => return NodeResult::drop(),
+    };
+    let attachments = match SESSION_QUEUE_NODES.with(|nodes| {
         let nodes = nodes
             .try_borrow()
             .map_err(|_| CoreError::internal("session queue nodes borrowed"))?;
@@ -222,20 +225,28 @@ fn session_queue_node_process(
             .get(slot)
             .ok_or_else(|| CoreError::internal("session queue node slot is invalid"))?;
         Ok::<_, CoreError>(node.clone())
-    })?;
+    }) {
+        Ok(attachments) => attachments,
+        Err(_) => return NodeResult::drop(),
+    };
     let now = Instant::now();
     let mut output = SessionQueueOutput::default();
     for attachment in attachments {
-        (attachment.dispatch)(
+        if (attachment.dispatch)(
             runtime,
             attachment.runtime_data,
             attachment.output_next,
             now,
             &mut output,
-        )?;
+        )
+        .is_err()
+        {
+            output.schedule(runtime);
+            return NodeResult::drop();
+        }
     }
-    output.schedule(runtime)?;
-    Ok(NodeResult::drop())
+    output.schedule(runtime);
+    NodeResult::drop()
 }
 
 pub(crate) fn register_session_queue<Q: 'static>(queue: Q) -> CoreResult<SessionQueueHandle<Q>> {

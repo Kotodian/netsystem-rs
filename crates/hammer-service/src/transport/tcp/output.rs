@@ -1,8 +1,8 @@
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId, NodeNextFrames,
-    NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData,
+    BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId, NodeProcessFn,
+    NodeRegistration, NodeResult, NodeRuntimeData,
 };
-use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::tcp_header;
 
 pub const DEFAULT_TCP_OUTPUT_PAYLOAD_LEN: usize = 1_440;
@@ -54,7 +54,7 @@ impl Node for TcpOutputNode {
         &mut self,
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
+    ) -> NodeResult {
         tcp_output_node_process_frame(runtime, frame, self.next)
     }
 
@@ -88,17 +88,20 @@ fn tcp_output_node_process(
     runtime: &DataPlaneRuntime,
     _: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> CoreResult<NodeResult> {
-    let current = runtime
-        .current_node()
-        .ok_or_else(|| CoreError::internal("tcp output missing current node"))?;
+) -> NodeResult {
+    let current = match runtime.current_node() {
+        Some(node) => node,
+        None => return NodeResult::drop(),
+    };
     let next = [
-        runtime
-            .nodes()
-            .node_next_slot(current, TcpOutputNext::Drop as usize)?,
-        runtime
-            .nodes()
-            .node_next_slot(current, TcpOutputNext::Lookup as usize)?,
+        match runtime.nodes().node_next_slot(current, TcpOutputNext::Drop as usize) {
+            Ok(slot) => slot,
+            Err(_) => return NodeResult::drop(),
+        },
+        match runtime.nodes().node_next_slot(current, TcpOutputNext::Lookup as usize) {
+            Ok(slot) => slot,
+            Err(_) => return NodeResult::drop(),
+        },
     ];
     tcp_output_node_process_frame(runtime, frame, next)
 }
@@ -107,46 +110,12 @@ fn tcp_output_node_process_frame(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
     next: [NodeId; TcpOutputNext::COUNT],
-) -> CoreResult<NodeResult> {
+) -> NodeResult {
     let lookup = next[TcpOutputNext::Lookup as usize];
     let drop = next[TcpOutputNext::Drop as usize];
-    let mut next_frames = NodeNextFrames::default();
-    let indices = frame.pending_indices();
-    let len = indices.len();
-    let mut read = 0usize;
-    while read + 4 <= len {
-        prefetch_tcp_output(runtime, &indices[read..read + 4]);
-        tcp_output_enqueue_index(runtime, indices[read], lookup, drop, &mut next_frames)?;
-        tcp_output_enqueue_index(runtime, indices[read + 1], lookup, drop, &mut next_frames)?;
-        tcp_output_enqueue_index(runtime, indices[read + 2], lookup, drop, &mut next_frames)?;
-        tcp_output_enqueue_index(runtime, indices[read + 3], lookup, drop, &mut next_frames)?;
-        read += 4;
-    }
-    if read + 2 <= len {
-        prefetch_tcp_output(runtime, &indices[read..read + 2]);
-        tcp_output_enqueue_index(runtime, indices[read], lookup, drop, &mut next_frames)?;
-        tcp_output_enqueue_index(runtime, indices[read + 1], lookup, drop, &mut next_frames)?;
-        read += 2;
-    }
-    while read < len {
-        let index = indices[read];
-        prefetch_tcp_output(runtime, &indices[read..read + 1]);
-        tcp_output_enqueue_index(runtime, index, lookup, drop, &mut next_frames)?;
-        read += 1;
-    }
-    next_frames.finish(runtime, frame)
-}
-
-#[inline(always)]
-fn tcp_output_enqueue_index(
-    runtime: &DataPlaneRuntime,
-    index: BufferIndex,
-    lookup: NodeId,
-    drop: NodeId,
-    next_frames: &mut NodeNextFrames,
-) -> CoreResult<()> {
-    let next = tcp_output_next_for_index(runtime, index, lookup, drop)?;
-    hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, next, index)
+    hammer_adapter::vlib_process_frame!(runtime, frame, |index, _nf| {
+        tcp_output_next_for_index(runtime, index, lookup, drop).unwrap_or(drop)
+    })
 }
 
 fn tcp_output_next_for_index(
@@ -161,19 +130,6 @@ fn tcp_output_next_for_index(
         return Ok(drop);
     }
     Ok(lookup)
-}
-
-#[inline(always)]
-fn prefetch_tcp_output(runtime: &DataPlaneRuntime, indices: &[BufferIndex]) {
-    // `prefetch_write` already issues L1-write prefetches for the output
-    // buffer's opaque cachelines and data cacheline. The TCP output node only
-    // touches header/opaque state on these buffers, so an additional L2-read
-    // prefetch of the same opaque cachelines here would be redundant.
-    let mut read = 0usize;
-    while read < indices.len() {
-        runtime.prefetch_read(indices[read]);
-        read += 1;
-    }
 }
 
 #[inline]
@@ -273,10 +229,8 @@ mod tests {
     }
 
     impl Node for CaptureNode {
-        fn process(&mut self, _: &DataPlaneRuntime, _: &mut BufferFrame) -> CoreResult<NodeResult> {
-            Err(CoreError::internal(
-                "capture node must use descriptor process",
-            ))
+        fn process(&mut self, _: &DataPlaneRuntime, _: &mut BufferFrame) -> NodeResult {
+            NodeResult::drop()
         }
 
         fn node_process(&self) -> NodeProcessFn {
@@ -299,28 +253,31 @@ mod tests {
         runtime: &DataPlaneRuntime,
         data: NodeRuntimeData,
         frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        let state = {
-            let states = capture_states()
-                .lock()
-                .map_err(|_| CoreError::internal("capture registry poisoned"))?;
-            Arc::clone(
-                states
-                    .get(data.usize_word(0)?)
-                    .ok_or_else(|| CoreError::internal("capture state missing"))?,
-            )
+    ) -> NodeResult {
+        let slot = match data.usize_word(0) {
+            Ok(s) => s,
+            Err(_) => return NodeResult::drop(),
+        };
+        let state = match capture_states().lock() {
+            Ok(states) => match states.get(slot) {
+                Some(s) => Arc::clone(s),
+                None => return NodeResult::drop(),
+            },
+            Err(_) => return NodeResult::drop(),
         };
         let mut pending = frame.drain_pending();
         while let Some(index) = pending.next() {
-            let packet = runtime.get_buffer(index)?.current().to_vec();
-            state
-                .lock()
-                .map_err(|_| CoreError::internal("capture poisoned"))?
-                .packets
-                .push(packet);
+            let packet = match runtime.get_buffer(index) {
+                Ok(buf) => buf.current().to_vec(),
+                Err(_) => return NodeResult::drop(),
+            };
+            match state.lock() {
+                Ok(mut guard) => guard.packets.push(packet),
+                Err(_) => return NodeResult::drop(),
+            }
             runtime.free_index(index);
         }
-        Ok(NodeResult::drop())
+        NodeResult::drop()
     }
 
     fn output_graph() -> (

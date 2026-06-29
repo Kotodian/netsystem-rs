@@ -1363,9 +1363,9 @@ mod tests {
             &mut self,
             _runtime: &DataPlaneRuntime,
             frame: &mut BufferFrame,
-        ) -> hammer_core::error::CoreResult<NodeResult> {
+        ) -> NodeResult {
             frame.clear();
-            Ok(NodeResult::drop())
+            NodeResult::drop()
         }
 
         fn node_process(&self) -> NodeProcessFn {
@@ -1383,10 +1383,10 @@ mod tests {
         _runtime: &DataPlaneRuntime,
         _data: NodeRuntimeData,
         frame: &mut BufferFrame,
-    ) -> hammer_core::error::CoreResult<NodeResult> {
+    ) -> NodeResult {
         POLLING_DRIVER_CALLS.fetch_add(1, Ordering::SeqCst);
         frame.clear();
-        Ok(NodeResult::drop())
+        NodeResult::drop()
     }
 
     #[test]

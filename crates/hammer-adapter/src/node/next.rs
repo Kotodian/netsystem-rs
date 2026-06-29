@@ -1,4 +1,3 @@
-use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::vec::Vec;
 
 use crate::buffer::{BufferFrame, BufferIndex, DataPlaneRuntime, FrameIndex};
@@ -32,32 +31,6 @@ impl NodeNextStorage<()> for NodeId {
     }
 }
 
-/// Per-dispatch next-frame accumulator. Mirrors VPP `vlib_frame_queue` coupling
-/// between a node's current frame and the frames it hands to successor nodes.
-///
-/// The first distinct next node enqueued becomes the **current-frame reuse
-/// target**: its buffer indices stay in the node's current frame (recorded in
-/// `current_indices`) instead of allocating a fresh frame. Enqueues to any
-/// other next node allocate a frame from the runtime frame pool as before.
-///
-/// Two terminal methods consume the accumulator:
-///
-/// - [`Self::finish`] is the node-process path. It clears the current frame,
-///   writes `current_indices` back into it, schedules the freshly allocated
-///   frames, and returns a [`NodeResult`] that forwards the current frame to
-///   the reuse target via [`NextFrame::Current`]. This is the VPP
-///   `vlib_put_next_frame` same-next reuse: with a single next, no frame is
-///   allocated and the current frame is handed directly to the successor.
-///
-/// - [`Self::schedule`] is the path used when there is no current frame to
-///   reuse (session-queue output, `node_rewrite_frame!` / `node_rewrite_frame_current!`
-///   macros). It allocates a frame for `current_indices` and schedules every
-///   staged frame itself, returning `()`.
-///
-/// # Synchronization
-///
-/// Single-threaded per node dispatch: each `NodeNextFrames` is constructed
-/// inside a node process call and consumed before the call returns.
 #[derive(Debug)]
 pub struct NodeNextFrames {
     nodes: [Option<NodeId>; MAX_NODE_NEXT_FRAMES],
@@ -101,24 +74,26 @@ impl NodeNextFrames {
         runtime: &DataPlaneRuntime,
         node: NodeId,
         index: BufferIndex,
-    ) -> CoreResult<()> {
+    ) {
         if let Some(current) = self.current_node
             && current == node
         {
             self.current_indices.push(index);
-            return Ok(());
+            return;
         }
         if self.current_node.is_none() {
             self.current_node = Some(node);
             self.current_indices.push(index);
-            return Ok(());
+            return;
         }
-        let (frame_index, offset, created) = self.frame_for_enqueue(runtime, node)?;
-        let result = runtime.get_frame_mut(frame_index)?.push_index(index);
+        let (frame_index, offset, created) = self.frame_for_enqueue(runtime, node);
+        let mut frame = runtime
+            .get_frame_mut(frame_index)
+            .expect("next enqueue frame mut");
+        let result = frame.push_index(index);
         if crate::unlikely(result.is_err()) && created {
             self.free_from(runtime, offset);
         }
-        result
     }
 
     #[inline]
@@ -127,28 +102,30 @@ impl NodeNextFrames {
         runtime: &DataPlaneRuntime,
         node: NodeId,
         indices: impl IntoIterator<Item = BufferIndex>,
-    ) -> CoreResult<()> {
+    ) {
         if let Some(current) = self.current_node
             && current == node
         {
             for index in indices {
                 self.current_indices.push(index);
             }
-            return Ok(());
+            return;
         }
         if self.current_node.is_none() {
             self.current_node = Some(node);
             for index in indices {
                 self.current_indices.push(index);
             }
-            return Ok(());
+            return;
         }
-        let (frame_index, offset, created) = self.frame_for_enqueue(runtime, node)?;
-        let result = runtime.get_frame_mut(frame_index)?.push_indices(indices);
+        let (frame_index, offset, created) = self.frame_for_enqueue(runtime, node);
+        let mut frame = runtime
+            .get_frame_mut(frame_index)
+            .expect("next enqueue indices frame mut");
+        let result = frame.push_indices(indices);
         if crate::unlikely(result.is_err()) && created {
             self.free_from(runtime, offset);
         }
-        result
     }
 
     #[inline]
@@ -157,67 +134,68 @@ impl NodeNextFrames {
         runtime: &DataPlaneRuntime,
         index: BufferIndex,
         node: Option<NodeId>,
-    ) -> CoreResult<()> {
+    ) {
         let Some(node) = node else {
             runtime.free_index(index);
-            return Ok(());
+            return;
         };
         self.enqueue(runtime, node, index)
     }
 
-    /// Node-process terminal: write the current-frame reuse indices back into
-    /// `frame`, schedule every other staged frame, and return a [`NodeResult`]
-    /// that forwards the current frame to the reuse target.
+    /// Node-process terminal. Clears the current frame, writes
+    /// `current_indices` back, schedules every other staged frame, and returns
+    /// a [`NodeResult`] that forwards the current frame to the reuse target.
     ///
-    /// On error the staged frames are released and `frame` is freed via
-    /// `runtime.free_frame` so the caller does not need to clean up.
+    /// On schedule error the current frame is freed and `NodeResult::drop()` is
+    /// returned.
     #[inline]
     pub fn finish(
         mut self,
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
+    ) -> NodeResult {
         frame.clear();
         if !self.current_indices.is_empty() {
-            // The current frame's capacity is at least `pending_len()` at
-            // dispatch start and `current_indices` is a subset of those
-            // indices, so the push cannot overflow.
-            frame.push_indices(self.current_indices.iter().copied())?;
+            let _ = frame.push_indices(self.current_indices.iter().copied());
         }
 
-        if let Err(err) = self.schedule_staged(runtime) {
+        if !self.schedule_staged(runtime) {
             runtime.free_frame(frame);
-            return Err(err);
+            return NodeResult::drop();
         }
 
-        let result = match (self.current_node, frame.has_pending()) {
+        match (self.current_node, frame.has_pending()) {
             (Some(node), true) => NodeResult::next_current(node),
             _ => NodeResult::drop(),
-        };
-        Ok(result)
+        }
     }
 
-    /// Driver / macro terminal: allocate a frame for the current-frame reuse
-    /// indices (there is no current frame to hand off), schedule every staged
-    /// frame, and return `()`.
+    /// Driver / macro terminal. Allocates a frame for the current-frame reuse
+    /// indices (there is no current frame to hand off), schedules every staged
+    /// frame, and returns `()`.
     #[inline]
-    pub fn schedule(mut self, runtime: &DataPlaneRuntime) -> CoreResult<()> {
+    pub fn schedule(mut self, runtime: &DataPlaneRuntime) {
         if let Some(node) = self.current_node
             && !self.current_indices.is_empty()
         {
-            let frame_index = runtime.alloc_frame_index()?;
-            if let Err(err) = runtime
-                .get_frame_mut(frame_index)?
+            let frame_index = runtime
+                .alloc_frame_index()
+                .expect("schedule alloc frame index");
+            let mut frame = runtime
+                .get_frame_mut(frame_index)
+                .expect("schedule frame mut");
+            if frame
                 .push_indices(self.current_indices.iter().copied())
+                .is_err()
             {
                 let _ = runtime.free_frame_index(frame_index);
                 self.free(runtime);
-                return Err(err);
+                return;
             }
             if self.len == MAX_NODE_NEXT_FRAMES {
                 let _ = runtime.free_frame_index(frame_index);
                 self.free(runtime);
-                return Err(CoreError::internal("node next frame capacity exceeded"));
+                return;
             }
             let offset = self.len;
             self.nodes[offset] = Some(node);
@@ -226,8 +204,7 @@ impl NodeNextFrames {
             self.cached_next_node = Some(node);
             self.cached_next_offset = offset;
         }
-        self.schedule_staged(runtime)?;
-        Ok(())
+        self.schedule_staged(runtime);
     }
 
     #[inline]
@@ -240,59 +217,51 @@ impl NodeNextFrames {
         &mut self,
         runtime: &DataPlaneRuntime,
         node: NodeId,
-    ) -> CoreResult<(FrameIndex, usize, bool)> {
+    ) -> (FrameIndex, usize, bool) {
         if self.cached_next_node == Some(node)
-            && let Some(frame) = self.frame(self.cached_next_offset).ok()
+            && let Some(frame) = self.frame(self.cached_next_offset)
         {
-            return Ok((frame, self.cached_next_offset, false));
+            return (frame, self.cached_next_offset, false);
         }
         if let Some(offset) = self.position(node) {
             self.cached_next_node = Some(node);
             self.cached_next_offset = offset;
-            return self.frame(offset).map(|frame| (frame, offset, false));
+            return (self.frame(offset).expect("existing frame"), offset, false);
         }
         if self.len == MAX_NODE_NEXT_FRAMES {
-            return Err(CoreError::internal("node next frame capacity exceeded"));
+            panic!("node next frame capacity exceeded");
         }
         let offset = self.len;
         self.nodes[offset] = Some(node);
-        self.frames[offset] = Some(runtime.alloc_frame_index()?);
+        self.frames[offset] = Some(
+            runtime
+                .alloc_frame_index()
+                .expect("frame for enqueue alloc"),
+        );
         self.len += 1;
         self.cached_next_node = Some(node);
         self.cached_next_offset = offset;
-        self.frame(offset).map(|frame| (frame, offset, true))
+        (self.frame(offset).expect("just-allocated frame"), offset, true)
     }
 
     /// Schedule every freshly allocated frame in `self.nodes` / `self.frames`.
-    /// Used by both [`Self::finish`] and [`Self::schedule`]; neither keeps a
-    /// borrow on the runtime's frame pool past this call.
+    /// Returns `true` if all frames were scheduled, `false` if any error
+    /// occurred (partially scheduled frames are left in the runtime queue).
     #[inline]
-    fn schedule_staged(&mut self, runtime: &DataPlaneRuntime) -> CoreResult<()> {
+    fn schedule_staged(&mut self, runtime: &DataPlaneRuntime) -> bool {
         let mut offset = 0usize;
         while offset < self.len {
-            let node = match self.node(offset) {
-                Ok(node) => node,
-                Err(err) => {
-                    self.free_from(runtime, offset);
-                    return Err(err);
-                }
-            };
-            let frame_index = match self.take_frame(offset) {
-                Ok(frame) => frame,
-                Err(err) => {
-                    self.free_from(runtime, offset + 1);
-                    return Err(err);
-                }
-            };
+            let node = self.node(offset);
+            let frame_index = self.take_frame(offset);
             match runtime.schedule_frame(node, frame_index) {
                 Ok(true) => {}
                 Ok(false) => {
-                    runtime.free_frame_index(frame_index)?;
+                    let _ = runtime.free_frame_index(frame_index);
                 }
-                Err(err) => {
+                Err(_) => {
                     let _ = runtime.free_frame_index(frame_index);
                     self.free_from(runtime, offset + 1);
-                    return Err(err);
+                    return false;
                 }
             }
             offset += 1;
@@ -300,32 +269,29 @@ impl NodeNextFrames {
         self.len = 0;
         self.cached_next_node = None;
         self.cached_next_offset = 0;
-        Ok(())
+        true
     }
 
     #[inline]
-    fn node(&self, offset: usize) -> CoreResult<NodeId> {
+    fn node(&self, offset: usize) -> NodeId {
         self.nodes
             .get(offset)
             .and_then(|node| *node)
-            .ok_or_else(|| CoreError::internal("node next entry is missing"))
+            .expect("node next entry is missing")
     }
 
     #[inline]
-    fn frame(&self, offset: usize) -> CoreResult<FrameIndex> {
-        self.frames
-            .get(offset)
-            .and_then(|frame| *frame)
-            .ok_or_else(|| CoreError::internal("node next frame is missing"))
+    fn frame(&self, offset: usize) -> Option<FrameIndex> {
+        self.frames.get(offset).and_then(|frame| *frame)
     }
 
     #[inline]
-    fn take_frame(&mut self, offset: usize) -> CoreResult<FrameIndex> {
+    fn take_frame(&mut self, offset: usize) -> FrameIndex {
         self.nodes[offset] = None;
         self.frames
             .get_mut(offset)
             .and_then(|frame| frame.take())
-            .ok_or_else(|| CoreError::internal("node next frame is missing"))
+            .expect("node next frame is missing")
     }
 
     #[inline]

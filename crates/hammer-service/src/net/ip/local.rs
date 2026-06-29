@@ -295,10 +295,13 @@ impl Node for IpLocalNode {
         &mut self,
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
+    ) -> NodeResult {
         let state = self.state.load();
         let feature_arc = self.feature_arc.as_ref().map(|arc| arc.start_handle());
-        let next = Self::runtime_nexts(runtime)?;
+        let next = match Self::runtime_nexts(runtime) {
+            Ok(next) => next,
+            Err(_) => return NodeResult::drop(),
+        };
         process_frame(
             runtime,
             frame,
@@ -307,6 +310,7 @@ impl Node for IpLocalNode {
             LocalStage::Head,
             feature_arc.as_ref(),
         )
+        .unwrap_or_else(|_| NodeResult::drop())
     }
 
     #[inline]
@@ -333,10 +337,13 @@ impl Node for IpReceiveNode {
         &mut self,
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
+    ) -> NodeResult {
         let state = self.state.load();
         let feature_arc = self.feature_arc.as_ref().map(|arc| arc.start_handle());
-        let next = Self::runtime_nexts(runtime)?;
+        let next = match Self::runtime_nexts(runtime) {
+            Ok(next) => next,
+            Err(_) => return NodeResult::drop(),
+        };
         process_frame(
             runtime,
             frame,
@@ -345,6 +352,7 @@ impl Node for IpReceiveNode {
             LocalStage::Receive,
             feature_arc.as_ref(),
         )
+        .unwrap_or_else(|_| NodeResult::drop())
     }
 
     #[inline]
@@ -427,10 +435,16 @@ fn ip_local_process(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> CoreResult<NodeResult> {
-    let state = ip_local_runtime(data)?;
+) -> NodeResult {
+    let state = match ip_local_runtime(data) {
+        Ok(state) => state,
+        Err(_) => return NodeResult::drop(),
+    };
     let snapshot = state.state.load();
-    let next = IpLocalNode::runtime_nexts(runtime)?;
+    let next = match IpLocalNode::runtime_nexts(runtime) {
+        Ok(next) => next,
+        Err(_) => return NodeResult::drop(),
+    };
     let feature_arc = state.feature_arc.as_ref();
     process_frame(
         runtime,
@@ -440,16 +454,23 @@ fn ip_local_process(
         LocalStage::Head,
         feature_arc,
     )
+    .unwrap_or_else(|_| NodeResult::drop())
 }
 
 fn ip_receive_process(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> CoreResult<NodeResult> {
-    let state = ip_local_runtime(data)?;
+) -> NodeResult {
+    let state = match ip_local_runtime(data) {
+        Ok(state) => state,
+        Err(_) => return NodeResult::drop(),
+    };
     let snapshot = state.state.load();
-    let next = IpReceiveNode::runtime_nexts(runtime)?;
+    let next = match IpReceiveNode::runtime_nexts(runtime) {
+        Ok(next) => next,
+        Err(_) => return NodeResult::drop(),
+    };
     let feature_arc = state.feature_arc.as_ref();
     process_frame(
         runtime,
@@ -459,6 +480,7 @@ fn ip_receive_process(
         LocalStage::Receive,
         feature_arc,
     )
+    .unwrap_or_else(|_| NodeResult::drop())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -491,76 +513,12 @@ fn process_frame(
     stage: LocalStage,
     feature_arc: Option<&FeatureArcStartHandle>,
 ) -> CoreResult<NodeResult> {
-    let indices = frame.pending_indices();
-    let len = indices.len();
-    let mut next_frames = NodeNextFrames::default();
-    let mut read = 0usize;
-    while read + 4 <= len {
-        if read + 4 < len {
-            runtime.prefetch_header(indices[read + 4]);
+    Ok(hammer_adapter::vlib_process_frame!(runtime, frame, |index, _nf| {
+        match process_index(runtime, index, state, &next, stage, feature_arc) {
+            Ok(node) => node,
+            Err(_) => state.drop_next(&next),
         }
-        if read + 5 < len {
-            runtime.prefetch_header(indices[read + 5]);
-        }
-        if read + 6 < len {
-            runtime.prefetch_header(indices[read + 6]);
-        }
-        if read + 7 < len {
-            runtime.prefetch_header(indices[read + 7]);
-        }
-        let index0 = indices[read];
-        let index1 = indices[read + 1];
-        let index2 = indices[read + 2];
-        let index3 = indices[read + 3];
-        let node0 = process_index(runtime, index0, state, &next, stage, feature_arc)?;
-        let node1 = process_index(runtime, index1, state, &next, stage, feature_arc)?;
-        let node2 = process_index(runtime, index2, state, &next, stage, feature_arc)?;
-        let node3 = process_index(runtime, index3, state, &next, stage, feature_arc)?;
-        hammer_adapter::validate_buffer_enqueue_x4!(
-            runtime,
-            next_frames,
-            node0,
-            index0,
-            node1,
-            index1,
-            node2,
-            index2,
-            node3,
-            index3
-        )?;
-        read += 4;
-    }
-    if read + 2 <= len {
-        if read + 2 < len {
-            runtime.prefetch_header(indices[read + 2]);
-        }
-        if read + 3 < len {
-            runtime.prefetch_header(indices[read + 3]);
-        }
-        let index0 = indices[read];
-        let index1 = indices[read + 1];
-        let node0 = process_index(runtime, index0, state, &next, stage, feature_arc)?;
-        let node1 = process_index(runtime, index1, state, &next, stage, feature_arc)?;
-        hammer_adapter::validate_buffer_enqueue_x2!(
-            runtime,
-            next_frames,
-            node0,
-            index0,
-            node1,
-            index1
-        )?;
-        read += 2;
-    }
-    while read < len {
-        if read + 1 < len {
-            runtime.prefetch_header(indices[read + 1]);
-        }
-        let index0 = indices[read];
-        let node0 = process_index(runtime, index0, state, &next, stage, feature_arc)?;
-        hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, node0, index0)?;
-        read += 1;
-    }
-    next_frames.finish(runtime, frame)
+    }))
 }
 
 #[inline(always)]
@@ -581,7 +539,7 @@ fn process_index(
             drop(buffer);
             set_index_node_error_code(runtime, index, IpLocalError::BadLength.code())?;
             let resolved = state.drop_next(next);
-            add_packet_trace!(
+            let _ = add_packet_trace!(
                 runtime,
                 index,
                 IpLocalTrace {
@@ -592,7 +550,7 @@ fn process_index(
                     error: Some(IpLocalError::BadLength.code()),
                     next: resolved,
                 },
-            )?;
+            );
             return Ok(resolved);
         }
     };
@@ -602,7 +560,7 @@ fn process_index(
             drop(buffer);
             set_index_node_error_code(runtime, index, error)?;
             let resolved = state.drop_next(next);
-            add_packet_trace!(
+            let _ = add_packet_trace!(
                 runtime,
                 index,
                 IpLocalTrace {
@@ -613,14 +571,14 @@ fn process_index(
                     error: Some(error),
                     next: resolved,
                 },
-            )?;
+            );
             return Ok(resolved);
         }
         IpInputTarget::Reassembly => {
             drop(buffer);
             refresh_basic_metadata(runtime, index, &parsed, None)?;
             let resolved = state.reassembly_next(next);
-            add_packet_trace!(
+            let _ = add_packet_trace!(
                 runtime,
                 index,
                 IpLocalTrace {
@@ -631,7 +589,7 @@ fn process_index(
                     error: None,
                     next: resolved,
                 },
-            )?;
+            );
             return Ok(resolved);
         }
         IpInputTarget::Punt | IpInputTarget::Lookup | IpInputTarget::LookupMulticast => {}
@@ -647,7 +605,7 @@ fn process_index(
             drop(buffer);
             set_index_node_error_code(runtime, index, IpLocalError::BadLength.code())?;
             let resolved = state.drop_next(next);
-            add_packet_trace!(
+            let _ = add_packet_trace!(
                 runtime,
                 index,
                 IpLocalTrace {
@@ -658,7 +616,7 @@ fn process_index(
                     error: Some(IpLocalError::BadLength.code()),
                     next: resolved,
                 },
-            )?;
+            );
             return Ok(resolved);
         }
     };
@@ -669,7 +627,7 @@ fn process_index(
             drop(buffer);
             set_index_node_error_code(runtime, index, error.code())?;
             let resolved = state.drop_next(next);
-            add_packet_trace!(
+            let _ = add_packet_trace!(
                 runtime,
                 index,
                 IpLocalTrace {
@@ -680,7 +638,7 @@ fn process_index(
                     error: Some(error.code()),
                     next: resolved,
                 },
-            )?;
+            );
             return Ok(resolved);
         }
     };
@@ -691,7 +649,7 @@ fn process_index(
         if !source_check_passes(state, &parsed) {
             set_index_node_error_code(runtime, index, IpLocalError::SourceCheckFailed.code())?;
             let resolved = state.drop_next(next);
-            add_packet_trace!(
+            let _ = add_packet_trace!(
                 runtime,
                 index,
                 IpLocalTrace {
@@ -702,7 +660,7 @@ fn process_index(
                     error: Some(IpLocalError::SourceCheckFailed.code()),
                     next: resolved,
                 },
-            )?;
+            );
             return Ok(resolved);
         }
         if let Some(feature_arc) = feature_arc {
@@ -717,7 +675,7 @@ fn process_index(
             } else {
                 feature_arc.start_for_interface_or(interface_index, next)
             };
-            add_packet_trace!(
+            let _ = add_packet_trace!(
                 runtime,
                 index,
                 IpLocalTrace {
@@ -728,7 +686,7 @@ fn process_index(
                     error: None,
                     next: resolved,
                 },
-            )?;
+            );
             return Ok(resolved);
         }
     }
@@ -743,7 +701,7 @@ fn process_index(
         } else {
             None
         };
-    add_packet_trace!(
+    let _ = add_packet_trace!(
         runtime,
         index,
         IpLocalTrace {
@@ -754,7 +712,7 @@ fn process_index(
             error,
             next: resolved,
         },
-    )?;
+    );
     Ok(resolved)
 }
 

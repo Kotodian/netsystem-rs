@@ -417,23 +417,19 @@ impl IpLookupNode {
         runtime: &DataPlaneRuntime,
         table: &FibTable,
         index: BufferIndex,
-    ) -> CoreResult<NodeId> {
+    ) -> NodeId {
         let parsed = Self::cached_packet_for_index(runtime, index);
-        let (traced, parsed) = {
-            let buffer = runtime.get_buffer(index)?;
-            let traced = buffer.trace_handle().is_some();
-            (traced, parsed)
-        };
+        let traced = runtime.get_buffer(index).expect("buffer").trace_handle().is_some();
         let parsed = match parsed {
             Some(parsed) => parsed,
             None => {
-                let mut buffer = runtime.get_buffer_mut(index)?;
+                let mut buffer = runtime.get_buffer_mut(index).expect("buffer mut");
                 let opaque = unsafe { transmute::<_, &mut LookupOpaque>(buffer.opaque2_mut()) };
                 opaque.forwarding = None;
                 let next = table.drop_next();
                 drop(buffer);
                 if unlikely(traced) {
-                    add_packet_trace!(
+                    let _ = add_packet_trace!(
                         runtime,
                         index,
                         IpLookupTrace {
@@ -446,15 +442,15 @@ impl IpLookupNode {
                             dpo_index: None,
                             next,
                         },
-                    )?;
+                    );
                 }
-                return Ok(next);
+                return next;
             }
         };
         let result = table
             .lookup_packet(&parsed)
             .unwrap_or_else(|| FibLookupResult::terminal(table.drop_dpo(parsed.version)));
-        let mut buffer = runtime.get_buffer_mut(index)?;
+        let mut buffer = runtime.get_buffer_mut(index).expect("buffer mut");
         let opaque = unsafe { transmute::<_, &mut LookupOpaque>(buffer.opaque2_mut()) };
         opaque.forwarding = Some(ForwardingMetadata {
             fib_index: 0,
@@ -467,7 +463,7 @@ impl IpLookupNode {
         });
         drop(buffer);
         if unlikely(traced) {
-            add_packet_trace!(
+            let _ = add_packet_trace!(
                 runtime,
                 index,
                 IpLookupTrace {
@@ -480,113 +476,10 @@ impl IpLookupNode {
                     dpo_index: Some(result.dpo.forwarding_index()),
                     next: result.dpo.next(),
                 },
-            )?;
+            );
         }
-        Ok(result.dpo.next())
+        result.dpo.next()
     }
-}
-
-macro_rules! process_lookup_batch {
-    ($runtime:expr, $table:expr, $next_frames:expr, $indices:expr, $read:ident, 4) => {{
-        if $read + 4 < $indices.len() {
-            $runtime.prefetch_header($indices[$read + 4]);
-        }
-        if $read + 5 < $indices.len() {
-            $runtime.prefetch_header($indices[$read + 5]);
-        }
-        if $read + 6 < $indices.len() {
-            $runtime.prefetch_header($indices[$read + 6]);
-        }
-        if $read + 7 < $indices.len() {
-            $runtime.prefetch_header($indices[$read + 7]);
-        }
-        let index0 = $indices[$read];
-        let index1 = $indices[$read + 1];
-        let index2 = $indices[$read + 2];
-        let index3 = $indices[$read + 3];
-        $runtime.prefetch_read(index0);
-        $runtime.prefetch_read(index1);
-        $runtime.prefetch_read(index2);
-        $runtime.prefetch_read(index3);
-        if let Some(parsed) = IpLookupNode::cached_packet_for_index($runtime, index0) {
-            $table.prefetch_packet(&parsed);
-        }
-        if let Some(parsed) = IpLookupNode::cached_packet_for_index($runtime, index1) {
-            $table.prefetch_packet(&parsed);
-        }
-        if let Some(parsed) = IpLookupNode::cached_packet_for_index($runtime, index2) {
-            $table.prefetch_packet(&parsed);
-        }
-        if let Some(parsed) = IpLookupNode::cached_packet_for_index($runtime, index3) {
-            $table.prefetch_packet(&parsed);
-        }
-        $next_frames.enqueue(
-            $runtime,
-            IpLookupNode::process_index($runtime, $table, index0)?,
-            index0,
-        )?;
-        $next_frames.enqueue(
-            $runtime,
-            IpLookupNode::process_index($runtime, $table, index1)?,
-            index1,
-        )?;
-        $next_frames.enqueue(
-            $runtime,
-            IpLookupNode::process_index($runtime, $table, index2)?,
-            index2,
-        )?;
-        $next_frames.enqueue(
-            $runtime,
-            IpLookupNode::process_index($runtime, $table, index3)?,
-            index3,
-        )?;
-        $read += 4;
-    }};
-    ($runtime:expr, $table:expr, $next_frames:expr, $indices:expr, $read:ident, 2) => {{
-        if $read + 2 < $indices.len() {
-            $runtime.prefetch_header($indices[$read + 2]);
-        }
-        if $read + 3 < $indices.len() {
-            $runtime.prefetch_header($indices[$read + 3]);
-        }
-        let index0 = $indices[$read];
-        let index1 = $indices[$read + 1];
-        $runtime.prefetch_read(index0);
-        $runtime.prefetch_read(index1);
-        if let Some(parsed) = IpLookupNode::cached_packet_for_index($runtime, index0) {
-            $table.prefetch_packet(&parsed);
-        }
-        if let Some(parsed) = IpLookupNode::cached_packet_for_index($runtime, index1) {
-            $table.prefetch_packet(&parsed);
-        }
-        $next_frames.enqueue(
-            $runtime,
-            IpLookupNode::process_index($runtime, $table, index0)?,
-            index0,
-        )?;
-        $next_frames.enqueue(
-            $runtime,
-            IpLookupNode::process_index($runtime, $table, index1)?,
-            index1,
-        )?;
-        $read += 2;
-    }};
-    ($runtime:expr, $table:expr, $next_frames:expr, $indices:expr, $read:ident, 1) => {{
-        if $read + 1 < $indices.len() {
-            $runtime.prefetch_header($indices[$read + 1]);
-        }
-        let index = $indices[$read];
-        $runtime.prefetch_read(index);
-        if let Some(parsed) = IpLookupNode::cached_packet_for_index($runtime, index) {
-            $table.prefetch_packet(&parsed);
-        }
-        $next_frames.enqueue(
-            $runtime,
-            IpLookupNode::process_index($runtime, $table, index)?,
-            index,
-        )?;
-        $read += 1;
-    }};
 }
 
 macro_rules! process_adjacency_rewrite_batch {
@@ -611,10 +504,10 @@ macro_rules! process_adjacency_rewrite_batch {
         $runtime.prefetch_write(index1);
         $runtime.prefetch_write(index2);
         $runtime.prefetch_write(index3);
-        let next0 = AdjacencyRewriteNode::next_for_index($table, $runtime, index0)?;
-        let next1 = AdjacencyRewriteNode::next_for_index($table, $runtime, index1)?;
-        let next2 = AdjacencyRewriteNode::next_for_index($table, $runtime, index2)?;
-        let next3 = AdjacencyRewriteNode::next_for_index($table, $runtime, index3)?;
+        let next0 = AdjacencyRewriteNode::next_for_index($table, $runtime, index0);
+        let next1 = AdjacencyRewriteNode::next_for_index($table, $runtime, index1);
+        let next2 = AdjacencyRewriteNode::next_for_index($table, $runtime, index2);
+        let next3 = AdjacencyRewriteNode::next_for_index($table, $runtime, index3);
         match (next0, next1, next2, next3) {
             (Some(next0), Some(next1), Some(next2), Some(next3)) => {
                 hammer_adapter::validate_buffer_enqueue_x4!(
@@ -628,17 +521,17 @@ macro_rules! process_adjacency_rewrite_batch {
                     index2,
                     next3,
                     index3
-                )?;
+                );
             }
             (Some(next0), Some(next1), Some(next2), None) => {
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next0, index0)?;
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next1, index1)?;
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next2, index2)?;
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next0, index0);
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next1, index1);
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next2, index2);
             }
             (Some(next0), Some(next1), None, Some(next3)) => {
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next0, index0)?;
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next1, index1)?;
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next3, index3)?;
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next0, index0);
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next1, index1);
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next3, index3);
             }
             (Some(next0), Some(next1), None, None) => {
                 hammer_adapter::validate_buffer_enqueue_x2!(
@@ -648,39 +541,39 @@ macro_rules! process_adjacency_rewrite_batch {
                     index0,
                     next1,
                     index1
-                )?;
+                );
             }
             (Some(next0), None, Some(next2), Some(next3)) => {
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next0, index0)?;
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next2, index2)?;
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next3, index3)?;
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next0, index0);
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next2, index2);
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next3, index3);
             }
             (Some(next0), None, Some(next2), None) => {
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next0, index0)?;
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next2, index2)?;
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next0, index0);
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next2, index2);
             }
             (Some(next0), None, None, Some(next3)) => {
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next0, index0)?;
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next3, index3)?;
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next0, index0);
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next3, index3);
             }
             (Some(next0), None, None, None) => {
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next0, index0)?;
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next0, index0);
             }
             (None, Some(next1), Some(next2), Some(next3)) => {
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next1, index1)?;
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next2, index2)?;
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next3, index3)?;
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next1, index1);
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next2, index2);
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next3, index3);
             }
             (None, Some(next1), Some(next2), None) => {
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next1, index1)?;
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next2, index2)?;
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next1, index1);
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next2, index2);
             }
             (None, Some(next1), None, Some(next3)) => {
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next1, index1)?;
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next3, index3)?;
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next1, index1);
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next3, index3);
             }
             (None, Some(next1), None, None) => {
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next1, index1)?;
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next1, index1);
             }
             (None, None, Some(next2), Some(next3)) => {
                 hammer_adapter::validate_buffer_enqueue_x2!(
@@ -690,13 +583,13 @@ macro_rules! process_adjacency_rewrite_batch {
                     index2,
                     next3,
                     index3
-                )?;
+                );
             }
             (None, None, Some(next2), None) => {
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next2, index2)?;
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next2, index2);
             }
             (None, None, None, Some(next3)) => {
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next3, index3)?;
+                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next3, index3);
             }
             (None, None, None, None) => {}
         }
@@ -713,11 +606,11 @@ macro_rules! process_adjacency_rewrite_batch {
         let index1 = $indices[$read + 1];
         $runtime.prefetch_write(index0);
         $runtime.prefetch_write(index1);
-        if let Some(node) = AdjacencyRewriteNode::next_for_index($table, $runtime, index0)? {
-            hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, node, index0)?;
+        if let Some(node) = AdjacencyRewriteNode::next_for_index($table, $runtime, index0) {
+            hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, node, index0);
         }
-        if let Some(node) = AdjacencyRewriteNode::next_for_index($table, $runtime, index1)? {
-            hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, node, index1)?;
+        if let Some(node) = AdjacencyRewriteNode::next_for_index($table, $runtime, index1) {
+            hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, node, index1);
         }
         $read += 2;
     }};
@@ -727,8 +620,8 @@ macro_rules! process_adjacency_rewrite_batch {
         }
         let index = $indices[$read];
         $runtime.prefetch_write(index);
-        if let Some(node) = AdjacencyRewriteNode::next_for_index($table, $runtime, index)? {
-            hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, node, index)?;
+        if let Some(node) = AdjacencyRewriteNode::next_for_index($table, $runtime, index) {
+            hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, node, index);
         }
         $read += 1;
     }};
@@ -740,7 +633,7 @@ impl Node for IpLookupNode {
         &mut self,
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
+    ) -> NodeResult {
         let table = self.table.table();
         ip_lookup_process_frame(runtime, frame, &table)
     }
@@ -802,9 +695,9 @@ impl AdjacencyRewriteNode {
         table: &FibTableHandle,
         runtime: &DataPlaneRuntime,
         index: BufferIndex,
-    ) -> CoreResult<Option<NodeId>> {
+    ) -> Option<NodeId> {
         let forwarding = {
-            let buffer = runtime.get_buffer(index)?;
+            let buffer = runtime.get_buffer(index).expect("buffer");
             let opaque = unsafe { transmute::<_, &LookupOpaque>(buffer.opaque2()) };
             opaque.forwarding
         };
@@ -813,8 +706,8 @@ impl AdjacencyRewriteNode {
                 runtime,
                 index,
                 AdjacencyRewriteNodeError::MissingForwarding.code(),
-            )?;
-            add_packet_trace!(
+            ).ok();
+            let _ = add_packet_trace!(
                 runtime,
                 index,
                 AdjacencyRewriteTrace {
@@ -824,13 +717,13 @@ impl AdjacencyRewriteNode {
                     error: Some(AdjacencyRewriteNodeError::MissingForwarding.code()),
                     next: None,
                 },
-            )?;
+            );
             runtime.free_index(index);
-            return Ok(None);
+            return None;
         };
         if forwarding.dpo_type != DpoType::ADJACENCY {
-            set_index_node_error_code(runtime, index, AdjacencyRewriteNodeError::WrongDpo.code())?;
-            add_packet_trace!(
+            set_index_node_error_code(runtime, index, AdjacencyRewriteNodeError::WrongDpo.code()).ok();
+            let _ = add_packet_trace!(
                 runtime,
                 index,
                 AdjacencyRewriteTrace {
@@ -840,9 +733,9 @@ impl AdjacencyRewriteNode {
                     error: Some(AdjacencyRewriteNodeError::WrongDpo.code()),
                     next: None,
                 },
-            )?;
+            );
             runtime.free_index(index);
-            return Ok(None);
+            return None;
         }
         let Some(adjacency) = table
             .table()
@@ -852,8 +745,8 @@ impl AdjacencyRewriteNode {
                 runtime,
                 index,
                 AdjacencyRewriteNodeError::MissingAdjacency.code(),
-            )?;
-            add_packet_trace!(
+            ).ok();
+            let _ = add_packet_trace!(
                 runtime,
                 index,
                 AdjacencyRewriteTrace {
@@ -863,15 +756,15 @@ impl AdjacencyRewriteNode {
                     error: Some(AdjacencyRewriteNodeError::MissingAdjacency.code()),
                     next: None,
                 },
-            )?;
+            );
             runtime.free_index(index);
-            return Ok(None);
+            return None;
         };
         let rewrite_len = adjacency.rewrite.as_slice().len();
         let egress_interface = adjacency.egress_interface;
         let next = adjacency.next;
-        apply_adjacency_rewrite(runtime, index, adjacency)?;
-        add_packet_trace!(
+        apply_adjacency_rewrite(runtime, index, adjacency).expect("adjacency rewrite");
+        let _ = add_packet_trace!(
             runtime,
             index,
             AdjacencyRewriteTrace {
@@ -881,8 +774,8 @@ impl AdjacencyRewriteNode {
                 error: None,
                 next: Some(next),
             },
-        )?;
-        Ok(Some(next))
+        );
+        Some(next)
     }
 }
 
@@ -892,7 +785,7 @@ impl Node for AdjacencyRewriteNode {
         &mut self,
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
+    ) -> NodeResult {
         adjacency_rewrite_process_frame(runtime, frame, &self.table)
     }
 
@@ -984,8 +877,8 @@ fn ip_lookup_process(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> CoreResult<NodeResult> {
-    let state = ip_lookup_runtime(data)?;
+) -> NodeResult {
+    let state = ip_lookup_runtime(data).expect("ip lookup runtime");
     let table = state.table.table();
     ip_lookup_process_frame(runtime, frame, &table)
 }
@@ -994,29 +887,18 @@ fn ip_lookup_process_frame(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
     table: &FibTable,
-) -> CoreResult<NodeResult> {
-    let indices = frame.pending_indices();
-    let mut next_frames = hammer_adapter::NodeNextFrames::default();
-    let mut read = 0usize;
-    let len = indices.len();
-    while read + 4 <= len {
-        process_lookup_batch!(runtime, table, next_frames, indices, read, 4);
-    }
-    if read + 2 <= len {
-        process_lookup_batch!(runtime, table, next_frames, indices, read, 2);
-    }
-    while read < len {
-        process_lookup_batch!(runtime, table, next_frames, indices, read, 1);
-    }
-    next_frames.finish(runtime, frame)
+) -> NodeResult {
+    hammer_adapter::vlib_process_frame!(runtime, frame, |index, _nf| {
+        IpLookupNode::process_index(runtime, table, index)
+    })
 }
 
 fn adjacency_rewrite_process(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> CoreResult<NodeResult> {
-    let state = adjacency_rewrite_runtime(data)?;
+) -> NodeResult {
+    let state = adjacency_rewrite_runtime(data).expect("adjacency rewrite runtime");
     adjacency_rewrite_process_frame(runtime, frame, &state.table)
 }
 
@@ -1024,7 +906,7 @@ fn adjacency_rewrite_process_frame(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
     table: &FibTableHandle,
-) -> CoreResult<NodeResult> {
+) -> NodeResult {
     let indices = frame.pending_indices();
     let mut next_frames = hammer_adapter::NodeNextFrames::default();
     let mut read = 0usize;

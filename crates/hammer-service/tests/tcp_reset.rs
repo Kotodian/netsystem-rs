@@ -35,10 +35,8 @@ impl CaptureNode {
 
 impl Node for CaptureNode {
     #[inline(always)]
-    fn process(&mut self, _: &DataPlaneRuntime, _: &mut BufferFrame) -> CoreResult<NodeResult> {
-        Err(CoreError::internal(
-            "capture node must run through descriptor process",
-        ))
+    fn process(&mut self, _: &DataPlaneRuntime, _: &mut BufferFrame) -> NodeResult {
+        NodeResult::drop()
     }
 
     #[inline]
@@ -63,27 +61,31 @@ fn capture_process(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> CoreResult<NodeResult> {
+) -> NodeResult {
     let state = {
         let states = capture_states()
             .lock()
-            .map_err(|_| CoreError::internal("capture state registry poisoned"))?;
+            .expect("capture state registry");
         Arc::clone(
             states
-                .get(data.usize_word(0)?)
-                .ok_or_else(|| CoreError::internal("capture state slot is invalid"))?,
+                .get(data.usize_word(0).expect("capture state slot"))
+                .expect("capture state slot is invalid"),
         )
     };
     for index in frame.drain_pending() {
-        let packet = runtime.get_buffer(index)?.current().to_vec();
+        let packet = runtime
+            .get_buffer(index)
+            .expect("capture buffer")
+            .current()
+            .to_vec();
         state
             .lock()
-            .map_err(|_| CoreError::internal("capture state poisoned"))?
+            .expect("capture state")
             .packets
             .push(packet);
         runtime.free_index(index);
     }
-    Ok(NodeResult::drop())
+    NodeResult::drop()
 }
 
 #[test]

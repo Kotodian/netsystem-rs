@@ -106,10 +106,8 @@ impl Node for DescriptorNode {
         &mut self,
         _runtime: &DataPlaneRuntime,
         _frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        Err(CoreError::internal(
-            "descriptor test nodes must run through their function slot",
-        ))
+    ) -> NodeResult {
+        NodeResult::drop()
     }
 
     #[inline]
@@ -170,8 +168,8 @@ impl Node for ProcessOnlyNode {
         &mut self,
         _runtime: &DataPlaneRuntime,
         _frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        Ok(NodeResult::drop())
+    ) -> NodeResult {
+        NodeResult::drop()
     }
 }
 
@@ -181,23 +179,33 @@ fn count_process(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> CoreResult<NodeResult> {
-    NODE_CALLS_BY_WORD[data.usize_word(0)?].fetch_add(1, Ordering::SeqCst);
+) -> NodeResult {
+    let word = match data.usize_word(0) {
+        Ok(w) => w,
+        Err(_) => return NodeResult::drop(),
+    };
+    NODE_CALLS_BY_WORD[word].fetch_add(1, Ordering::SeqCst);
     for buffer in frame.drain_pending() {
         runtime.free_index(buffer);
     }
-    Ok(NodeResult::drop())
+    NodeResult::drop()
 }
 
 fn forward_default_process(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     _frame: &mut BufferFrame,
-) -> CoreResult<NodeResult> {
-    NODE_CALLS_BY_WORD[data.usize_word(0)?].fetch_add(1, Ordering::SeqCst);
-    Ok(NodeResult::next_current(
-        runtime.current_node_next(TestNext::Default)?,
-    ))
+) -> NodeResult {
+    let word = match data.usize_word(0) {
+        Ok(w) => w,
+        Err(_) => return NodeResult::drop(),
+    };
+    NODE_CALLS_BY_WORD[word].fetch_add(1, Ordering::SeqCst);
+    let next = match runtime.current_node_next(TestNext::Default) {
+        Ok(n) => n,
+        Err(_) => return NodeResult::drop(),
+    };
+    NodeResult::next_current(next)
 }
 
 fn trace_formatter(bytes: &[u8]) -> String {
@@ -462,21 +470,18 @@ fn descriptor_registration_keeps_name_next_slots_trace_and_siblings() {
 }
 
 #[test]
-fn default_node_process_path_registers_but_fails_explicitly_at_dispatch() {
+fn default_node_process_path_registers_and_drops_gracefully() {
     let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 2);
     let node = runtime.nodes().register_internal(ProcessOnlyNode);
     let frame = runtime.alloc_frame_index().expect("alloc frame");
     push_packet(&runtime, frame, b"packet");
 
     assert!(runtime.schedule_frame(node, frame).expect("schedule"));
-    let err = runtime
+    let result = runtime
         .run_ready_nodes()
-        .expect_err("default node process must fail explicitly");
+        .expect("default node process must succeed");
 
-    assert!(
-        err.to_string()
-            .contains("descriptor is missing a packet process function")
-    );
+    assert_eq!(result, 1);
 }
 
 #[test]
@@ -571,12 +576,11 @@ fn node_descriptor_exposes_public_snapshot_accessors() {
 
     let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 2);
     let frame = runtime.alloc_frame_index().expect("alloc frame");
-    runtime
+    let _ = runtime
         .with_frame_mut(frame, |frame| {
             descriptor.process()(&runtime, descriptor.runtime_data(), frame)
         })
-        .expect("get frame")
-        .expect("process through descriptor function");
+        .expect("get frame");
 
     assert_eq!(calls_for(99), 1);
     assert_eq!(descriptor.runtime_data().word(0), 99);

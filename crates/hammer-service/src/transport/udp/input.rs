@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeId, NodeNextFrames, NodeNextStorage,
-    NodeResult, PacketTrace, SecondaryOpaque, TraceFormatter, add_packet_trace,
+    BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeId, NodeNextStorage, NodeResult,
+    PacketTrace, SecondaryOpaque, TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
@@ -233,9 +233,12 @@ impl Node for UdpInputNode {
         &mut self,
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
+    ) -> NodeResult {
         let snapshot = self.snapshot.load();
-        let next = Self::runtime_nexts(runtime)?;
+        let next = match Self::runtime_nexts(runtime) {
+            Ok(next) => next,
+            Err(_) => return NodeResult::drop(),
+        };
         udp_input_process_frame(runtime, frame, &snapshot, &next)
     }
 
@@ -251,70 +254,13 @@ fn udp_input_process_frame(
     frame: &mut BufferFrame,
     snapshot: &UdpInputSnapshot,
     next: &[NodeId; UdpInputNext::COUNT],
-) -> CoreResult<NodeResult> {
-    let mut next_frames = NodeNextFrames::default();
-    let indices = frame.pending_indices();
-    let len = indices.len();
-    let mut read = 0usize;
-    while read + 4 <= len {
-        if read + 4 < len {
-            runtime.prefetch_header(indices[read + 4]);
+) -> NodeResult {
+    hammer_adapter::vlib_process_frame!(runtime, frame, |index, _nf| {
+        match next_node_for_index(runtime, index, snapshot, next) {
+            Ok(Some(node)) => node,
+            _ => NodeNextStorage::next(next, UdpInputNext::Drop),
         }
-        if read + 5 < len {
-            runtime.prefetch_header(indices[read + 5]);
-        }
-        if read + 6 < len {
-            runtime.prefetch_header(indices[read + 6]);
-        }
-        if read + 7 < len {
-            runtime.prefetch_header(indices[read + 7]);
-        }
-        let index0 = indices[read];
-        let index1 = indices[read + 1];
-        let index2 = indices[read + 2];
-        let index3 = indices[read + 3];
-        if let Some(next0) = next_node_for_index(runtime, index0, snapshot, next)? {
-            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, next0, index0)?;
-        }
-        if let Some(next1) = next_node_for_index(runtime, index1, snapshot, next)? {
-            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, next1, index1)?;
-        }
-        if let Some(next2) = next_node_for_index(runtime, index2, snapshot, next)? {
-            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, next2, index2)?;
-        }
-        if let Some(next3) = next_node_for_index(runtime, index3, snapshot, next)? {
-            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, next3, index3)?;
-        }
-        read += 4;
-    }
-    if read + 2 <= len {
-        if read + 2 < len {
-            runtime.prefetch_header(indices[read + 2]);
-        }
-        if read + 3 < len {
-            runtime.prefetch_header(indices[read + 3]);
-        }
-        let index0 = indices[read];
-        let index1 = indices[read + 1];
-        if let Some(next0) = next_node_for_index(runtime, index0, snapshot, next)? {
-            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, next0, index0)?;
-        }
-        if let Some(next1) = next_node_for_index(runtime, index1, snapshot, next)? {
-            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, next1, index1)?;
-        }
-        read += 2;
-    }
-    while read < len {
-        if read + 1 < len {
-            runtime.prefetch_header(indices[read + 1]);
-        }
-        let index0 = indices[read];
-        if let Some(next0) = next_node_for_index(runtime, index0, snapshot, next)? {
-            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, next0, index0)?;
-        }
-        read += 1;
-    }
-    next_frames.finish(runtime, frame)
+    })
 }
 
 #[inline(always)]

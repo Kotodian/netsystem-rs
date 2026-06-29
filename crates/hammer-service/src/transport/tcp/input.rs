@@ -164,9 +164,12 @@ where
         &mut self,
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
+    ) -> NodeResult {
         let snapshot = self.snapshot.load();
-        let next = Self::runtime_nexts(runtime)?;
+        let next = match Self::runtime_nexts(runtime) {
+            Ok(next) => next,
+            Err(_) => return NodeResult::drop(),
+        };
         tcp_input_process_frame(
             runtime,
             frame,
@@ -266,13 +269,19 @@ fn tcp_input_process<C>(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> CoreResult<NodeResult>
+) -> NodeResult
 where
     C: CongestionController + 'static,
 {
-    let state = tcp_input_runtime(data)?;
+    let state = match tcp_input_runtime(data) {
+        Ok(state) => state,
+        Err(_) => return NodeResult::drop(),
+    };
     let snapshot = state.snapshot.load();
-    let next = TcpInputNode::<C>::runtime_nexts(runtime)?;
+    let next = match TcpInputNode::<C>::runtime_nexts(runtime) {
+        Ok(next) => next,
+        Err(_) => return NodeResult::drop(),
+    };
     let session_queue = state.session_queue.map(TcpQueue::<C>::new);
     tcp_input_process_frame(
         runtime,
@@ -293,7 +302,7 @@ fn tcp_input_process_frame<C>(
     handoff: Option<NodeHandle>,
     handoff_worker: Option<DataWorkerId>,
     session_queue: Option<TcpQueue<C>>,
-) -> CoreResult<NodeResult>
+) -> NodeResult
 where
     C: CongestionController + 'static,
 {
@@ -311,7 +320,7 @@ where
             handoff_worker,
             session_queue,
             &mut next_frames,
-        )?;
+        );
         tcp_input_enqueue_index(
             runtime,
             indices[read + 1],
@@ -321,7 +330,7 @@ where
             handoff_worker,
             session_queue,
             &mut next_frames,
-        )?;
+        );
         tcp_input_enqueue_index(
             runtime,
             indices[read + 2],
@@ -331,7 +340,7 @@ where
             handoff_worker,
             session_queue,
             &mut next_frames,
-        )?;
+        );
         tcp_input_enqueue_index(
             runtime,
             indices[read + 3],
@@ -341,7 +350,7 @@ where
             handoff_worker,
             session_queue,
             &mut next_frames,
-        )?;
+        );
         read += 4;
     }
     if read + 2 <= indices.len() {
@@ -355,7 +364,7 @@ where
             handoff_worker,
             session_queue,
             &mut next_frames,
-        )?;
+        );
         tcp_input_enqueue_index(
             runtime,
             indices[read + 1],
@@ -365,7 +374,7 @@ where
             handoff_worker,
             session_queue,
             &mut next_frames,
-        )?;
+        );
         read += 2;
     }
     while read < indices.len() {
@@ -380,7 +389,7 @@ where
             handoff_worker,
             session_queue,
             &mut next_frames,
-        )?;
+        );
         read += 1;
     }
     next_frames.finish(runtime, frame)
@@ -725,9 +734,9 @@ mod tests {
             &mut self,
             _runtime: &DataPlaneRuntime,
             frame: &mut BufferFrame,
-        ) -> CoreResult<NodeResult> {
+        ) -> NodeResult {
             frame.drain_pending();
-            Ok(NodeResult::drop())
+            NodeResult::drop()
         }
 
         fn node_process(&self) -> NodeProcessFn {
@@ -745,9 +754,9 @@ mod tests {
         _: &DataPlaneRuntime,
         _: NodeRuntimeData,
         frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
+    ) -> NodeResult {
         frame.drain_pending();
-        Ok(NodeResult::drop())
+        NodeResult::drop()
     }
 
     macro_rules! register_tcp_input_test_nexts {
@@ -1289,11 +1298,11 @@ fn tcp_input_enqueue_index<C>(
     handoff_worker: Option<DataWorkerId>,
     session_queue: Option<TcpQueue<C>>,
     next_frames: &mut hammer_adapter::NodeNextFrames,
-) -> CoreResult<()>
+)
 where
     C: CongestionController + 'static,
 {
-    if let Some(node) = tcp_input_next_for_index(
+    let node = match tcp_input_next_for_index(
         runtime,
         index,
         snapshot,
@@ -1301,10 +1310,12 @@ where
         handoff,
         handoff_worker,
         session_queue,
-    )? {
+    ) {
+        Ok(node) => node,
+        Err(_) => return,
+    };
+    if let Some(node) = node {
         hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, node, index)
-    } else {
-        Ok(())
     }
 }
 

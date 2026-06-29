@@ -79,7 +79,7 @@ pub trait TunDriverDirection: Send {
         &mut self,
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult>;
+    ) -> NodeResult;
 }
 
 #[doc(hidden)]
@@ -185,18 +185,28 @@ impl TunDriverDirection for TunInputRuntime {
         &mut self,
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
+    ) -> NodeResult {
         if let (Some(device_main), Some(rx_queue)) = (&self.device_main, self.rx_queue)
-            && !device_main.consume_rx_interrupt_pending(rx_queue)?
+            && !match device_main.consume_rx_interrupt_pending(rx_queue) {
+                Ok(pending) => pending,
+                Err(_) => return NodeResult::drop(),
+            }
         {
-            return Ok(NodeResult::drop());
+            return NodeResult::drop();
         }
         let max_batch = self.max_batch.min(frame.remaining_capacity());
         let first_new = frame.pending_len();
-        let received =
-            self.input
-                .recv_frame(runtime, frame, &self.interface_id, self.mode, max_batch)?;
-        let interface_index = self.ingress_interface_index()?;
+        let received = match self
+            .input
+            .recv_frame(runtime, frame, &self.interface_id, self.mode, max_batch)
+        {
+            Ok(received) => received,
+            Err(_) => return NodeResult::drop(),
+        };
+        let interface_index = match self.ingress_interface_index() {
+            Ok(index) => index,
+            Err(_) => return NodeResult::drop(),
+        };
         if let Some(interface_index) = interface_index {
             let indices = frame.pending_indices();
             let mut read = first_new;
@@ -206,26 +216,22 @@ impl TunDriverDirection for TunInputRuntime {
                 let index1 = indices[read + 1];
                 let index2 = indices[read + 2];
                 let index3 = indices[read + 3];
-                {
-                    let mut buffer = runtime.get_buffer_mut(index0)?;
+                if let Ok(mut buffer) = runtime.get_buffer_mut(index0) {
                     let network =
                         unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
                     network.sw_if_index[0] = interface_index;
                 }
-                {
-                    let mut buffer = runtime.get_buffer_mut(index1)?;
+                if let Ok(mut buffer) = runtime.get_buffer_mut(index1) {
                     let network =
                         unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
                     network.sw_if_index[0] = interface_index;
                 }
-                {
-                    let mut buffer = runtime.get_buffer_mut(index2)?;
+                if let Ok(mut buffer) = runtime.get_buffer_mut(index2) {
                     let network =
                         unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
                     network.sw_if_index[0] = interface_index;
                 }
-                {
-                    let mut buffer = runtime.get_buffer_mut(index3)?;
+                if let Ok(mut buffer) = runtime.get_buffer_mut(index3) {
                     let network =
                         unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
                     network.sw_if_index[0] = interface_index;
@@ -235,14 +241,12 @@ impl TunDriverDirection for TunInputRuntime {
             if read + 2 <= len {
                 let index0 = indices[read];
                 let index1 = indices[read + 1];
-                {
-                    let mut buffer = runtime.get_buffer_mut(index0)?;
+                if let Ok(mut buffer) = runtime.get_buffer_mut(index0) {
                     let network =
                         unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
                     network.sw_if_index[0] = interface_index;
                 }
-                {
-                    let mut buffer = runtime.get_buffer_mut(index1)?;
+                if let Ok(mut buffer) = runtime.get_buffer_mut(index1) {
                     let network =
                         unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
                     network.sw_if_index[0] = interface_index;
@@ -251,9 +255,10 @@ impl TunDriverDirection for TunInputRuntime {
             }
             while read < len {
                 let index0 = indices[read];
-                let mut buffer = runtime.get_buffer_mut(index0)?;
-                let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
-                network.sw_if_index[0] = interface_index;
+                if let Ok(mut buffer) = runtime.get_buffer_mut(index0) {
+                    let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+                    network.sw_if_index[0] = interface_index;
+                }
                 read += 1;
             }
         }
@@ -268,8 +273,8 @@ impl TunDriverDirection for TunInputRuntime {
                 let index1 = indices[read + 1];
                 let index2 = indices[read + 2];
                 let index3 = indices[read + 3];
-                runtime.try_mark_trace(current_node, index0)?;
-                add_packet_trace!(
+                let _ = runtime.try_mark_trace(current_node, index0);
+                let _ = add_packet_trace!(
                     runtime,
                     index0,
                     TunInputTrace {
@@ -277,9 +282,9 @@ impl TunDriverDirection for TunInputRuntime {
                         mode: self.mode,
                         received
                     }
-                )?;
-                runtime.try_mark_trace(current_node, index1)?;
-                add_packet_trace!(
+                );
+                let _ = runtime.try_mark_trace(current_node, index1);
+                let _ = add_packet_trace!(
                     runtime,
                     index1,
                     TunInputTrace {
@@ -287,9 +292,9 @@ impl TunDriverDirection for TunInputRuntime {
                         mode: self.mode,
                         received
                     }
-                )?;
-                runtime.try_mark_trace(current_node, index2)?;
-                add_packet_trace!(
+                );
+                let _ = runtime.try_mark_trace(current_node, index2);
+                let _ = add_packet_trace!(
                     runtime,
                     index2,
                     TunInputTrace {
@@ -297,9 +302,9 @@ impl TunDriverDirection for TunInputRuntime {
                         mode: self.mode,
                         received
                     }
-                )?;
-                runtime.try_mark_trace(current_node, index3)?;
-                add_packet_trace!(
+                );
+                let _ = runtime.try_mark_trace(current_node, index3);
+                let _ = add_packet_trace!(
                     runtime,
                     index3,
                     TunInputTrace {
@@ -307,14 +312,14 @@ impl TunDriverDirection for TunInputRuntime {
                         mode: self.mode,
                         received
                     }
-                )?;
+                );
                 read += 4;
             }
             if read + 2 <= len {
                 let index0 = indices[read];
                 let index1 = indices[read + 1];
-                runtime.try_mark_trace(current_node, index0)?;
-                add_packet_trace!(
+                let _ = runtime.try_mark_trace(current_node, index0);
+                let _ = add_packet_trace!(
                     runtime,
                     index0,
                     TunInputTrace {
@@ -322,9 +327,9 @@ impl TunDriverDirection for TunInputRuntime {
                         mode: self.mode,
                         received
                     }
-                )?;
-                runtime.try_mark_trace(current_node, index1)?;
-                add_packet_trace!(
+                );
+                let _ = runtime.try_mark_trace(current_node, index1);
+                let _ = add_packet_trace!(
                     runtime,
                     index1,
                     TunInputTrace {
@@ -332,13 +337,13 @@ impl TunDriverDirection for TunInputRuntime {
                         mode: self.mode,
                         received
                     }
-                )?;
+                );
                 read += 2;
             }
             while read < len {
                 let index0 = indices[read];
-                runtime.try_mark_trace(current_node, index0)?;
-                add_packet_trace!(
+                let _ = runtime.try_mark_trace(current_node, index0);
+                let _ = add_packet_trace!(
                     runtime,
                     index0,
                     TunInputTrace {
@@ -346,14 +351,14 @@ impl TunDriverDirection for TunInputRuntime {
                         mode: self.mode,
                         received,
                     },
-                )?;
+                );
                 read += 1;
             }
         }
         if frame.has_pending() {
-            Ok(NodeResult::next_current(self.next))
+            NodeResult::next_current(self.next)
         } else {
-            Ok(NodeResult::drop())
+            NodeResult::drop()
         }
     }
 }
@@ -391,7 +396,7 @@ impl TunDriverDirection for TunOutputRuntime {
         &mut self,
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
+    ) -> NodeResult {
         let pending = frame.pending_len();
         let indices = frame.pending_indices();
         let len = indices.len();
@@ -409,38 +414,38 @@ impl TunDriverDirection for TunOutputRuntime {
             if read + 7 < len {
                 runtime.prefetch_header(indices[read + 7]);
             }
-            add_packet_trace!(
+            let _ = add_packet_trace!(
                 runtime,
                 indices[read],
                 TunOutputTrace {
                     mode: self.mode,
                     pending,
                 },
-            )?;
-            add_packet_trace!(
+            );
+            let _ = add_packet_trace!(
                 runtime,
                 indices[read + 1],
                 TunOutputTrace {
                     mode: self.mode,
                     pending,
                 },
-            )?;
-            add_packet_trace!(
+            );
+            let _ = add_packet_trace!(
                 runtime,
                 indices[read + 2],
                 TunOutputTrace {
                     mode: self.mode,
                     pending,
                 },
-            )?;
-            add_packet_trace!(
+            );
+            let _ = add_packet_trace!(
                 runtime,
                 indices[read + 3],
                 TunOutputTrace {
                     mode: self.mode,
                     pending,
                 },
-            )?;
+            );
             read += 4;
         }
         if read + 2 <= len {
@@ -450,40 +455,40 @@ impl TunDriverDirection for TunOutputRuntime {
             if read + 3 < len {
                 runtime.prefetch_header(indices[read + 3]);
             }
-            add_packet_trace!(
+            let _ = add_packet_trace!(
                 runtime,
                 indices[read],
                 TunOutputTrace {
                     mode: self.mode,
                     pending,
                 },
-            )?;
-            add_packet_trace!(
+            );
+            let _ = add_packet_trace!(
                 runtime,
                 indices[read + 1],
                 TunOutputTrace {
                     mode: self.mode,
                     pending,
                 },
-            )?;
+            );
             read += 2;
         }
         while read < len {
             if read + 1 < len {
                 runtime.prefetch_header(indices[read + 1]);
             }
-            add_packet_trace!(
+            let _ = add_packet_trace!(
                 runtime,
                 indices[read],
                 TunOutputTrace {
                     mode: self.mode,
                     pending,
                 },
-            )?;
+            );
             read += 1;
         }
-        self.output.send_frame(runtime, frame, self.mode)?;
-        Ok(NodeResult::drop())
+        let _ = self.output.send_frame(runtime, frame, self.mode);
+        NodeResult::drop()
     }
 }
 
@@ -1271,10 +1276,8 @@ impl<R: TunDriverDirection> Node for TunDriverNode<R> {
         &mut self,
         _runtime: &DataPlaneRuntime,
         _frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        Err(CoreError::internal(
-            "TUN driver must run through its descriptor process function",
-        ))
+    ) -> NodeResult {
+        NodeResult::drop()
     }
 
     #[inline]
@@ -1315,8 +1318,11 @@ fn tun_driver_process<R: TunDriverDirection>(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> CoreResult<NodeResult> {
-    let r = DeviceRuntimeSlot::<R>::borrow_for_runtime_data(data)?;
+) -> NodeResult {
+    let r = match DeviceRuntimeSlot::<R>::borrow_for_runtime_data(data) {
+        Ok(r) => r,
+        Err(_) => return NodeResult::drop(),
+    };
     r.process(runtime, frame)
 }
 

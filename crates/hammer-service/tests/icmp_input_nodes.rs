@@ -44,10 +44,8 @@ impl Node for CaptureNode {
         &mut self,
         _runtime: &DataPlaneRuntime,
         _frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        Err(CoreError::internal(
-            "capture node must run through descriptor process",
-        ))
+    ) -> NodeResult {
+        NodeResult::drop()
     }
 
     #[inline]
@@ -83,33 +81,41 @@ fn capture_process(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> CoreResult<NodeResult> {
-    let state = {
-        let states = capture_states()
-            .lock()
-            .map_err(|_| CoreError::internal("capture state registry poisoned"))?;
-        Arc::clone(
-            states
-                .get(data.usize_word(0)?)
-                .ok_or_else(|| CoreError::internal("capture state slot is invalid"))?,
-        )
+) -> NodeResult {
+    let slot = match data.usize_word(0) {
+        Ok(s) => s,
+        Err(_) => return NodeResult::drop(),
     };
-    state
-        .lock()
-        .map_err(|_| CoreError::internal("capture state poisoned"))?
-        .frame_lens
-        .push(frame.pending_len());
+    let state = match capture_states().lock() {
+        Ok(states) => match states.get(slot) {
+            Some(s) => Arc::clone(s),
+            None => return NodeResult::drop(),
+        },
+        Err(_) => return NodeResult::drop(),
+    };
+    match state.lock() {
+        Ok(mut guard) => guard.frame_lens.push(frame.pending_len()),
+        Err(_) => return NodeResult::drop(),
+    }
     for index in frame.drain_pending() {
-        let packet = chain_bytes(runtime, index)?;
-        let node_error = runtime.node_error(index)?;
-        let mut state = state
-            .lock()
-            .map_err(|_| CoreError::internal("capture state poisoned"))?;
-        state.packets.push(packet.into_iter().collect());
-        state.node_errors.push(node_error);
+        let packet = match chain_bytes(runtime, index) {
+            Ok(bytes) => bytes,
+            Err(_) => return NodeResult::drop(),
+        };
+        let node_error = match runtime.node_error(index) {
+            Ok(err) => err,
+            Err(_) => return NodeResult::drop(),
+        };
+        match state.lock() {
+            Ok(mut guard) => {
+                guard.packets.push(packet.into_iter().collect());
+                guard.node_errors.push(node_error);
+            }
+            Err(_) => return NodeResult::drop(),
+        }
         runtime.free_index(index);
     }
-    Ok(NodeResult::drop())
+    NodeResult::drop()
 }
 
 #[test]

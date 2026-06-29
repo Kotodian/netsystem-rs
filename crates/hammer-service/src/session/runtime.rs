@@ -868,7 +868,7 @@ where
     let now = Instant::now();
     let mut output = crate::session::node::SessionQueueOutput::default();
     dispatch_session_queue_pending(runtime, driver, output_next, &mut output, &mut step, now)?;
-    output.schedule(runtime)?;
+    output.schedule(runtime);
     Ok(step)
 }
 
@@ -1054,19 +1054,7 @@ where
                 }
             }
 
-            if let Err(err) = output.enqueue(runtime, output_next.node(), index) {
-                let driver = driver as *mut SessionDriverRuntime<St, Seg>;
-                // SAFETY: same disjoint-access argument as above.
-                unsafe {
-                    let state = (*driver)
-                        .session_mut(session_id)
-                        .ok_or_else(|| CoreError::internal("session is missing"))?;
-                    let mut context = session_queue_context(driver, session_id);
-                    state.cancel_tx(&mut context, index);
-                    (&(*driver).runtime).buffers.free_index(index);
-                }
-                return Err(err);
-            }
+            output.enqueue(runtime, output_next.node(), index);
 
             let commit_result = {
                 let driver = driver as *mut SessionDriverRuntime<St, Seg>;
@@ -1301,10 +1289,8 @@ mod tests {
     }
 
     impl Node for CaptureNode {
-        fn process(&mut self, _: &DataPlaneRuntime, _: &mut BufferFrame) -> CoreResult<NodeResult> {
-            Err(CoreError::internal(
-                "capture node must use descriptor process",
-            ))
+        fn process(&mut self, _: &DataPlaneRuntime, _: &mut BufferFrame) -> NodeResult {
+            NodeResult::drop()
         }
 
         fn node_process(&self) -> NodeProcessFn {
@@ -1345,23 +1331,28 @@ mod tests {
         runtime: &DataPlaneRuntime,
         data: NodeRuntimeData,
         frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        let slot = data.usize_word(0)?;
+    ) -> NodeResult {
+        let slot = match data.usize_word(0) {
+            Ok(s) => s,
+            Err(_) => return NodeResult::drop(),
+        };
         let state = {
             let states = capture_states().lock().expect("capture registry");
-            Arc::clone(
-                states
-                    .get(slot)
-                    .ok_or_else(|| CoreError::internal("capture slot is invalid"))?,
-            )
+            match states.get(slot) {
+                Some(s) => Arc::clone(s),
+                None => return NodeResult::drop(),
+            }
         };
         let mut state = state.lock().expect("capture state");
         for index in frame.drain_pending() {
-            let packet = chain_bytes(runtime.buffers(), index)?;
+            let packet = match chain_bytes(runtime.buffers(), index) {
+                Ok(bytes) => bytes,
+                Err(_) => return NodeResult::drop(),
+            };
             state.packets.push(packet.to_vec());
             runtime.free_index(index);
         }
-        Ok(NodeResult::drop())
+        NodeResult::drop()
     }
 
     #[test]

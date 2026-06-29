@@ -9,7 +9,7 @@ use hammer_adapter::{
     BufferFrame, DataPlaneInstructionSet, DataPlaneRuntime, InternalNode, Node, NodeProcessFn,
     NodeResult, NodeRuntimeData, SecondaryOpaque,
 };
-use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::error::CoreResult;
 use hammer_service::data_plane::DropNode;
 use hammer_service::net::{
     DpoProto, FibTableBuilder, ForwardingMetadata, IpInputNext, IpInputNode, IpLookupControlPlane,
@@ -60,10 +60,8 @@ impl Node for SinkNode {
         &mut self,
         _runtime: &DataPlaneRuntime,
         _frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        Err(CoreError::internal(
-            "sink node must run through descriptor process",
-        ))
+    ) -> NodeResult {
+        NodeResult::drop()
     }
 
     #[inline]
@@ -88,21 +86,21 @@ fn sink_process(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> CoreResult<NodeResult> {
+) -> NodeResult {
     let counters = {
         let states = sink_states()
             .lock()
-            .map_err(|_| CoreError::internal("sink state registry poisoned"))?;
+            .expect("sink state registry poisoned");
         Arc::clone(
             states
-                .get(data.usize_word(0)?)
-                .ok_or_else(|| CoreError::internal("sink state slot is invalid"))?,
+                .get(data.usize_word(0).expect("usize word 0"))
+                .expect("sink state slot is invalid"),
         )
     };
     let mut packets = 0usize;
     let mut checksum = 0u64;
     for index in frame.drain_pending() {
-        let buffer = runtime.get_buffer(index)?;
+        let buffer = runtime.get_buffer(index).expect("get buffer");
         let opaque = unsafe { transmute::<_, &LookupPerfOpaque>(buffer.opaque2()) };
         if let Some(forwarding) = opaque.forwarding {
             checksum = checksum.wrapping_add(u64::from(forwarding.load_balance_index));
@@ -118,7 +116,7 @@ fn sink_process(
             Some(current.wrapping_add(checksum))
         })
         .ok();
-    Ok(NodeResult::drop())
+    NodeResult::drop()
 }
 
 #[derive(Debug, Clone, Copy)]

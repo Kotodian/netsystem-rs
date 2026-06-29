@@ -96,10 +96,8 @@ impl Node for DropNode {
         &mut self,
         _runtime: &DataPlaneRuntime,
         _frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        Err(CoreError::internal(
-            "drop node must run through descriptor process",
-        ))
+    ) -> NodeResult {
+        NodeResult::drop()
     }
 
     #[inline]
@@ -117,9 +115,8 @@ fn drop_node_process(
     runtime: &DataPlaneRuntime,
     _data: hammer_adapter::node::NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> CoreResult<NodeResult> {
+) -> NodeResult {
     let dropped = frame.pending_len();
-    let mut first_error = None;
     let indices = frame.pending_indices();
     let len = indices.len();
     let mut read = 0usize;
@@ -140,29 +137,13 @@ fn drop_node_process(
         let index1 = indices[read + 1];
         let index2 = indices[read + 2];
         let index3 = indices[read + 3];
-        if first_error.is_none()
-            && let Err(err) = add_packet_trace!(runtime, index0, DropTrace { dropped })
-        {
-            first_error = Some(err);
-        }
+        let _ = add_packet_trace!(runtime, index0, DropTrace { dropped });
         runtime.free_index(index0);
-        if first_error.is_none()
-            && let Err(err) = add_packet_trace!(runtime, index1, DropTrace { dropped })
-        {
-            first_error = Some(err);
-        }
+        let _ = add_packet_trace!(runtime, index1, DropTrace { dropped });
         runtime.free_index(index1);
-        if first_error.is_none()
-            && let Err(err) = add_packet_trace!(runtime, index2, DropTrace { dropped })
-        {
-            first_error = Some(err);
-        }
+        let _ = add_packet_trace!(runtime, index2, DropTrace { dropped });
         runtime.free_index(index2);
-        if first_error.is_none()
-            && let Err(err) = add_packet_trace!(runtime, index3, DropTrace { dropped })
-        {
-            first_error = Some(err);
-        }
+        let _ = add_packet_trace!(runtime, index3, DropTrace { dropped });
         runtime.free_index(index3);
         read += 4;
     }
@@ -175,17 +156,9 @@ fn drop_node_process(
         }
         let index0 = indices[read];
         let index1 = indices[read + 1];
-        if first_error.is_none()
-            && let Err(err) = add_packet_trace!(runtime, index0, DropTrace { dropped })
-        {
-            first_error = Some(err);
-        }
+        let _ = add_packet_trace!(runtime, index0, DropTrace { dropped });
         runtime.free_index(index0);
-        if first_error.is_none()
-            && let Err(err) = add_packet_trace!(runtime, index1, DropTrace { dropped })
-        {
-            first_error = Some(err);
-        }
+        let _ = add_packet_trace!(runtime, index1, DropTrace { dropped });
         runtime.free_index(index1);
         read += 2;
     }
@@ -194,19 +167,12 @@ fn drop_node_process(
             runtime.prefetch_header(indices[read + 1]);
         }
         let index0 = indices[read];
-        if first_error.is_none()
-            && let Err(err) = add_packet_trace!(runtime, index0, DropTrace { dropped })
-        {
-            first_error = Some(err);
-        }
+        let _ = add_packet_trace!(runtime, index0, DropTrace { dropped });
         runtime.free_index(index0);
         read += 1;
     }
     frame.clear();
-    if let Some(err) = first_error {
-        return Err(err);
-    }
-    Ok(NodeResult::drop())
+    NodeResult::drop()
 }
 
 impl InternalNode for DropNode {
@@ -225,10 +191,8 @@ impl Node for HandoffNode {
         &mut self,
         _runtime: &DataPlaneRuntime,
         _frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        Err(CoreError::internal(
-            "handoff node must run through descriptor process",
-        ))
+    ) -> NodeResult {
+        NodeResult::drop()
     }
 
     #[inline]
@@ -241,7 +205,7 @@ fn handoff_node_process(
     runtime: &DataPlaneRuntime,
     _data: hammer_adapter::node::NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> CoreResult<NodeResult> {
+) -> NodeResult {
     next_feature_frame(runtime, frame)
 }
 
@@ -275,14 +239,12 @@ mod tests {
         runtime.free_index(stale);
         let _ = drop;
 
-        let err = drop_node_process(
+        let _result = drop_node_process(
             &runtime,
             hammer_adapter::NodeRuntimeData::empty(),
             &mut frame,
-        )
-        .expect_err("stale packet should fail trace check");
+        );
 
-        assert_eq!(err.to_string(), "buffer slot is free");
         assert!(!frame.has_pending());
         assert_eq!(runtime.in_use_buffers(), 0);
     }
@@ -568,15 +530,15 @@ impl FeatureArcStartHandle {
 pub fn next_feature_node_for_index(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
-) -> CoreResult<NodeId> {
-    runtime.current_config(index)
+) -> NodeId {
+    runtime.current_config(index).expect("buffer must have a current config")
 }
 
 #[inline(always)]
 pub fn next_feature_frame(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
-) -> CoreResult<NodeResult> {
+) -> NodeResult {
     let mut next_frames = NodeNextFrames::default();
     let indices = frame.pending_indices();
     let len = indices.len();
@@ -601,15 +563,15 @@ pub fn next_feature_frame(
         hammer_adapter::validate_buffer_enqueue_x4!(
             runtime,
             next_frames,
-            next_feature_node_for_index(runtime, index0)?,
+            next_feature_node_for_index(runtime, index0),
             index0,
-            next_feature_node_for_index(runtime, index1)?,
+            next_feature_node_for_index(runtime, index1),
             index1,
-            next_feature_node_for_index(runtime, index2)?,
+            next_feature_node_for_index(runtime, index2),
             index2,
-            next_feature_node_for_index(runtime, index3)?,
+            next_feature_node_for_index(runtime, index3),
             index3,
-        )?;
+        );
         read += 4;
     }
     if read + 2 <= len {
@@ -624,11 +586,11 @@ pub fn next_feature_frame(
         hammer_adapter::validate_buffer_enqueue_x2!(
             runtime,
             next_frames,
-            next_feature_node_for_index(runtime, index0)?,
+            next_feature_node_for_index(runtime, index0),
             index0,
-            next_feature_node_for_index(runtime, index1)?,
+            next_feature_node_for_index(runtime, index1),
             index1,
-        )?;
+        );
         read += 2;
     }
     while read < len {
@@ -639,9 +601,9 @@ pub fn next_feature_frame(
         hammer_adapter::validate_buffer_enqueue_x1!(
             runtime,
             next_frames,
-            next_feature_node_for_index(runtime, index0)?,
+            next_feature_node_for_index(runtime, index0),
             index0,
-        )?;
+        );
         read += 1;
     }
     next_frames.finish(runtime, frame)

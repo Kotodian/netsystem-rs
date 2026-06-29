@@ -56,8 +56,11 @@ where
         &mut self,
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        let next = Self::runtime_nexts(runtime)?;
+    ) -> NodeResult {
+        let next = match Self::runtime_nexts(runtime) {
+            Ok(next) => next,
+            Err(_) => return NodeResult::drop(),
+        };
         tcp_established_frame(runtime, frame, self.session_queue, next)
     }
 
@@ -76,11 +79,14 @@ fn tcp_established_process<C>(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> CoreResult<NodeResult>
+) -> NodeResult
 where
     C: CongestionController + 'static,
 {
-    let next = TcpEstablishedNode::<C>::runtime_nexts(runtime)?;
+    let next = match TcpEstablishedNode::<C>::runtime_nexts(runtime) {
+        Ok(next) => next,
+        Err(_) => return NodeResult::drop(),
+    };
     tcp_established_frame::<C>(runtime, frame, TcpQueue::<C>::new(data), next)
 }
 
@@ -89,7 +95,7 @@ fn tcp_established_frame<C>(
     frame: &mut BufferFrame,
     session_queue: TcpQueue<C>,
     next: [NodeId; TcpEstablishedNext::COUNT],
-) -> CoreResult<NodeResult>
+) -> NodeResult
 where
     C: CongestionController + 'static,
 {
@@ -118,7 +124,7 @@ where
                 next_frames,
                 drop_next,
                 indices[read]
-            )?;
+            );
         }
         if tcp_established_index(
             runtime,
@@ -134,7 +140,7 @@ where
                 next_frames,
                 drop_next,
                 indices[read + 1]
-            )?;
+            );
         }
         if tcp_established_index(
             runtime,
@@ -150,7 +156,7 @@ where
                 next_frames,
                 drop_next,
                 indices[read + 2]
-            )?;
+            );
         }
         if tcp_established_index(
             runtime,
@@ -166,7 +172,7 @@ where
                 next_frames,
                 drop_next,
                 indices[read + 3]
-            )?;
+            );
         }
         read += 4;
     }
@@ -187,7 +193,7 @@ where
                 next_frames,
                 drop_next,
                 indices[read]
-            )?;
+            );
         }
         if tcp_established_index(
             runtime,
@@ -203,7 +209,7 @@ where
                 next_frames,
                 drop_next,
                 indices[read + 1]
-            )?;
+            );
         }
         read += 2;
     }
@@ -213,13 +219,13 @@ where
         if tcp_established_index(runtime, index, session_queue, tcp_output, &mut next_frames)
             .is_err()
         {
-            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, drop_next, index)?;
+            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, drop_next, index);
         }
         read += 1;
     }
     frame.clear();
-    next_frames.schedule(runtime)?;
-    Ok(NodeResult::drop())
+    next_frames.schedule(runtime);
+    NodeResult::drop()
 }
 
 fn tcp_established_index<C>(
@@ -375,12 +381,7 @@ where
             runtime.free_index(allocated);
             return Err(error);
         }
-        if let Err(error) =
-            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, tcp_output, allocated)
-        {
-            runtime.free_index(allocated);
-            return Err(error);
-        }
+        hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, tcp_output, allocated);
     }
     if release_input {
         runtime.free_index(index);

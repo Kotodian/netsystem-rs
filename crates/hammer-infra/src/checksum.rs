@@ -47,6 +47,58 @@ fn finish_checksum(mut sum: u64) -> u16 {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn accumulate_avx512(bytes: &[u8]) -> u64 {
+    use core::arch::x86_64::{
+        __m512i, _mm512_add_epi32, _mm512_loadu_si512, _mm512_or_si512, _mm512_setzero_si512,
+        _mm512_slli_epi16, _mm512_srli_epi16, _mm512_storeu_si512, _mm512_unpackhi_epi16,
+        _mm512_unpacklo_epi16,
+    };
+
+    let mut sum = _mm512_setzero_si512();
+    let mut index = 0usize;
+    while index + 64 <= bytes.len() {
+        let vector = _mm512_loadu_si512(bytes.as_ptr().add(index).cast::<__m512i>());
+        let swapped = _mm512_or_si512(_mm512_slli_epi16(vector, 8), _mm512_srli_epi16(vector, 8));
+        let zero = _mm512_setzero_si512();
+        sum = _mm512_add_epi32(sum, _mm512_unpacklo_epi16(swapped, zero));
+        sum = _mm512_add_epi32(sum, _mm512_unpackhi_epi16(swapped, zero));
+        index += 64;
+    }
+    let mut lanes = [0u32; 16];
+    _mm512_storeu_si512(lanes.as_mut_ptr().cast::<__m512i>(), sum);
+    let mut total = lanes.into_iter().map(u64::from).sum::<u64>();
+    total = total.wrapping_add(accumulate_u64_words(&bytes[index..]));
+    total
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn accumulate_avx2(bytes: &[u8]) -> u64 {
+    use core::arch::x86_64::{
+        __m256i, _mm256_add_epi32, _mm256_loadu_si256, _mm256_or_si256, _mm256_setzero_si256,
+        _mm256_slli_epi16, _mm256_srli_epi16, _mm256_storeu_si256, _mm256_unpackhi_epi16,
+        _mm256_unpacklo_epi16,
+    };
+
+    let mut sum = _mm256_setzero_si256();
+    let mut index = 0usize;
+    while index + 32 <= bytes.len() {
+        let vector = _mm256_loadu_si256(bytes.as_ptr().add(index).cast::<__m256i>());
+        let swapped = _mm256_or_si256(_mm256_slli_epi16(vector, 8), _mm256_srli_epi16(vector, 8));
+        let zero = _mm256_setzero_si256();
+        sum = _mm256_add_epi32(sum, _mm256_unpacklo_epi16(swapped, zero));
+        sum = _mm256_add_epi32(sum, _mm256_unpackhi_epi16(swapped, zero));
+        index += 32;
+    }
+    let mut lanes = [0u32; 8];
+    _mm256_storeu_si256(lanes.as_mut_ptr().cast::<__m256i>(), sum);
+    let mut total = lanes.into_iter().map(u64::from).sum::<u64>();
+    total = total.wrapping_add(accumulate_u64_words(&bytes[index..]));
+    total
+}
+
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn accumulate_even_words(bytes: &[u8]) -> u64 {
     use core::arch::x86_64::{
@@ -54,22 +106,28 @@ fn accumulate_even_words(bytes: &[u8]) -> u64 {
         _mm_srli_epi16, _mm_storeu_si128, _mm_unpackhi_epi16, _mm_unpacklo_epi16,
     };
 
-    unsafe {
-        let mut sum = _mm_setzero_si128();
-        let mut index = 0usize;
-        while index + 16 <= bytes.len() {
-            let vector = _mm_loadu_si128(bytes.as_ptr().add(index).cast::<__m128i>());
-            let swapped = _mm_or_si128(_mm_slli_epi16(vector, 8), _mm_srli_epi16(vector, 8));
-            let zero = _mm_setzero_si128();
-            sum = _mm_add_epi32(sum, _mm_unpacklo_epi16(swapped, zero));
-            sum = _mm_add_epi32(sum, _mm_unpackhi_epi16(swapped, zero));
-            index += 16;
+    if is_x86_feature_detected!("avx512f") {
+        unsafe { accumulate_avx512(bytes) }
+    } else if is_x86_feature_detected!("avx2") {
+        unsafe { accumulate_avx2(bytes) }
+    } else {
+        unsafe {
+            let mut sum = _mm_setzero_si128();
+            let mut index = 0usize;
+            while index + 16 <= bytes.len() {
+                let vector = _mm_loadu_si128(bytes.as_ptr().add(index).cast::<__m128i>());
+                let swapped = _mm_or_si128(_mm_slli_epi16(vector, 8), _mm_srli_epi16(vector, 8));
+                let zero = _mm_setzero_si128();
+                sum = _mm_add_epi32(sum, _mm_unpacklo_epi16(swapped, zero));
+                sum = _mm_add_epi32(sum, _mm_unpackhi_epi16(swapped, zero));
+                index += 16;
+            }
+            let mut lanes = [0u32; 4];
+            _mm_storeu_si128(lanes.as_mut_ptr().cast::<__m128i>(), sum);
+            let mut total = lanes.into_iter().map(u64::from).sum::<u64>();
+            total = total.wrapping_add(accumulate_u64_words(&bytes[index..]));
+            total
         }
-        let mut lanes = [0u32; 4];
-        _mm_storeu_si128(lanes.as_mut_ptr().cast::<__m128i>(), sum);
-        let mut total = lanes.into_iter().map(u64::from).sum::<u64>();
-        total = total.wrapping_add(accumulate_u64_words(&bytes[index..]));
-        total
     }
 }
 

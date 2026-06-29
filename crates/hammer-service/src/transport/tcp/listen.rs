@@ -128,8 +128,11 @@ where
         &mut self,
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        let next = Self::runtime_nexts(runtime)?;
+    ) -> NodeResult {
+        let next = match Self::runtime_nexts(runtime) {
+            Ok(next) => next,
+            Err(_) => return NodeResult::drop(),
+        };
         tcp_listen_process_frame(runtime, frame, &self.control, self.session_queue, next)
     }
 
@@ -148,12 +151,18 @@ fn tcp_listen_process<C>(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> CoreResult<NodeResult>
+) -> NodeResult
 where
     C: CongestionController + 'static,
 {
-    let next = TcpListenNode::<C>::runtime_nexts(runtime)?;
-    let control = tcp_listen_control(data)?;
+    let next = match TcpListenNode::<C>::runtime_nexts(runtime) {
+        Ok(next) => next,
+        Err(_) => return NodeResult::drop(),
+    };
+    let control = match tcp_listen_control(data) {
+        Ok(c) => c,
+        Err(_) => return NodeResult::drop(),
+    };
     tcp_listen_process_frame::<C>(
         runtime,
         frame,
@@ -170,7 +179,7 @@ fn tcp_listen_process_frame<C>(
     control: &TcpInputControlPlane,
     session_queue: TcpQueue<C>,
     next: [NodeId; TcpListenNext::COUNT],
-) -> CoreResult<NodeResult>
+) -> NodeResult
 where
     C: CongestionController + 'static,
 {
@@ -202,7 +211,7 @@ where
                 next_frames,
                 drop_next,
                 indices[read]
-            )?;
+            );
         }
         if tcp_listen_index(
             runtime,
@@ -220,7 +229,7 @@ where
                 next_frames,
                 drop_next,
                 indices[read + 1]
-            )?;
+            );
         }
         if tcp_listen_index(
             runtime,
@@ -238,7 +247,7 @@ where
                 next_frames,
                 drop_next,
                 indices[read + 2]
-            )?;
+            );
         }
         if tcp_listen_index(
             runtime,
@@ -256,7 +265,7 @@ where
                 next_frames,
                 drop_next,
                 indices[read + 3]
-            )?;
+            );
         }
         read += 4;
     }
@@ -279,7 +288,7 @@ where
                 next_frames,
                 drop_next,
                 indices[read]
-            )?;
+            );
         }
         if tcp_listen_index(
             runtime,
@@ -297,7 +306,7 @@ where
                 next_frames,
                 drop_next,
                 indices[read + 1]
-            )?;
+            );
         }
         read += 2;
     }
@@ -315,7 +324,7 @@ where
         )
         .is_err()
         {
-            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, drop_next, index)?;
+            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, drop_next, index);
         }
         read += 1;
     }
@@ -370,12 +379,7 @@ where
     }
 
     if let Some(tx_index) = tx_index.take() {
-        if let Err(error) =
-            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, tcp_output, tx_index)
-        {
-            runtime.free_index(tx_index);
-            return Err(error);
-        }
+        hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, tcp_output, tx_index);
     }
     if let Some(session_id) = established_session
         && packet.payload_len != 0
@@ -391,14 +395,12 @@ where
                 TcpInputNext::Established,
             );
             drop(buffer);
-            if let Err(error) = hammer_adapter::validate_buffer_enqueue_x1!(
+            hammer_adapter::validate_buffer_enqueue_x1!(
                 runtime,
                 next_frames,
                 tcp_established,
                 index
-            ) {
-                return Err(error);
-            }
+            );
             release_input = false;
         }
     }
@@ -466,10 +468,8 @@ mod tests {
             &mut self,
             _runtime: &DataPlaneRuntime,
             _frame: &mut BufferFrame,
-        ) -> CoreResult<NodeResult> {
-            Err(CoreError::internal(
-                "capture node must use descriptor process",
-            ))
+        ) -> NodeResult {
+            NodeResult::drop()
         }
 
         fn node_process(&self) -> NodeProcessFn {
@@ -499,24 +499,29 @@ mod tests {
         runtime: &DataPlaneRuntime,
         data: NodeRuntimeData,
         frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        let slot = data.usize_word(0)?;
+    ) -> NodeResult {
+        let slot = match data.usize_word(0) {
+            Ok(s) => s,
+            Err(_) => return NodeResult::drop(),
+        };
         let state = {
             let states = capture_states().lock().expect("capture registry");
-            Arc::clone(
-                states
-                    .get(slot)
-                    .ok_or_else(|| CoreError::internal("capture slot is invalid"))?,
-            )
+            match states.get(slot) {
+                Some(s) => Arc::clone(s),
+                None => return NodeResult::drop(),
+            }
         };
         let mut state = state.lock().expect("capture state");
         let mut pending = frame.drain_pending();
         while let Some(index) = pending.next() {
-            let packet = runtime.get_buffer(index)?.current().to_vec();
+            let packet = match runtime.get_buffer(index) {
+                Ok(buf) => buf.current().to_vec(),
+                Err(_) => return NodeResult::drop(),
+            };
             state.packets.push(packet);
             runtime.free_index(index);
         }
-        Ok(NodeResult::drop())
+        NodeResult::drop()
     }
 
     #[test]

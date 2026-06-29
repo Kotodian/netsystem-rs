@@ -6,7 +6,7 @@ use hammer_adapter::{
     BufferFrame, DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
     SecondaryOpaque, TraceControlPlane, TraceInputPolicy, TracePolicy,
 };
-use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::error::CoreResult;
 use hammer_core::forwarding::AdjacencyRewrite;
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
 use hammer_infra::vec::Vec as InfraVec;
@@ -46,12 +46,12 @@ struct SinkNode {
 fn chain_bytes(
     runtime: &DataPlaneRuntime,
     index: hammer_adapter::BufferIndex,
-) -> CoreResult<InfraVec<u8>> {
+) -> InfraVec<u8> {
     let mut bytes = InfraVec::new();
     for buffer in runtime.buffers().chain(index) {
-        bytes.extend_from_slice(buffer?.current());
+        bytes.extend_from_slice(buffer.expect("chain buffer").current());
     }
-    Ok(bytes)
+    bytes
 }
 
 impl SinkNode {
@@ -71,10 +71,8 @@ impl Node for SinkNode {
         &mut self,
         _runtime: &DataPlaneRuntime,
         _frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        Err(CoreError::internal(
-            "sink node must run through descriptor process",
-        ))
+    ) -> NodeResult {
+        NodeResult::drop()
     }
 
     #[inline]
@@ -108,10 +106,8 @@ impl Node for CorruptCurrentHeaderNode {
         &mut self,
         _runtime: &DataPlaneRuntime,
         _frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        Err(CoreError::internal(
-            "corrupt current header node must run through descriptor process",
-        ))
+    ) -> NodeResult {
+        NodeResult::drop()
     }
 
     #[inline]
@@ -136,26 +132,26 @@ fn sink_process(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> CoreResult<NodeResult> {
+) -> NodeResult {
     let state = {
         let states = sink_states()
             .lock()
-            .map_err(|_| CoreError::internal("sink state registry poisoned"))?;
+            .expect("sink state registry poisoned");
         Arc::clone(
             states
-                .get(data.usize_word(0)?)
-                .ok_or_else(|| CoreError::internal("sink state slot is invalid"))?,
+                .get(data.usize_word(0).expect("usize word 0"))
+                .expect("sink state slot is invalid"),
         )
     };
     state
         .lock()
-        .map_err(|_| CoreError::internal("sink state poisoned"))?
+        .expect("sink state poisoned")
         .frame_lens
         .push(frame.pending_len());
     for buffer in frame.drain_pending() {
-        let payload = chain_bytes(runtime, buffer)?;
+        let payload = chain_bytes(runtime, buffer);
         let (egress_interface, forwarding) = {
-            let buffer = runtime.get_buffer(buffer)?;
+            let buffer = runtime.get_buffer(buffer).expect("get buffer");
             let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
             let opaque = unsafe { transmute::<_, &LookupTestOpaque>(buffer.opaque2()) };
             (
@@ -166,25 +162,25 @@ fn sink_process(
         runtime.free_index(buffer);
         let mut state = state
             .lock()
-            .map_err(|_| CoreError::internal("sink state poisoned"))?;
+            .expect("sink state poisoned");
         state.forwarding.push(forwarding);
         state.egress_interfaces.push(egress_interface);
         state.payloads.push(payload);
     }
-    Ok(NodeResult::drop())
+    NodeResult::drop()
 }
 
 fn corrupt_current_header_process(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> CoreResult<NodeResult> {
+) -> NodeResult {
     for index in frame.pending_indices().iter().copied() {
-        runtime.get_buffer_mut(index)?.current_mut()[0] = 0;
+        runtime.get_buffer_mut(index).expect("get buffer mut").current_mut()[0] = 0;
     }
     let slot = u32::try_from(data.word(0))
-        .map_err(|_| CoreError::internal("corrupt next node id overflow"))?;
-    Ok(NodeResult::next_current(hammer_adapter::NodeId::new(slot)))
+        .expect("corrupt next node id overflow");
+    NodeResult::next_current(hammer_adapter::NodeId::new(slot))
 }
 
 fn assert_internal_node<I>(node: &I)

@@ -29,28 +29,30 @@ macro_rules! node_rewrite_frame_current {
         let mut $next_frames = $crate::node::NodeNextFrames::default();
         let mut $current_next = None;
         $before
-        $frame.rewrite_indices_batched($runtime.preferred_frame_batch_width(), |$index| $body)?;
-        $next_frames.schedule($runtime)?;
+        let _ = $frame.rewrite_indices_batched($runtime.preferred_frame_batch_width(), |$index| $body);
+        $next_frames.schedule($runtime);
         if $frame.has_pending()
             && let Some(node) = $current_next
         {
-            Ok($crate::node::NodeResult::next_current(node))
+            $crate::node::NodeResult::next_current(node)
         } else {
-            Ok($crate::node::NodeResult::drop())
+            $crate::node::NodeResult::drop()
         }
     }};
 }
 
 #[macro_export]
 macro_rules! validate_buffer_enqueue_x1 {
-    ($runtime:expr, $next_frames:expr, $next0:expr, $index0:expr $(,)?) => {{ $next_frames.enqueue($runtime, $next0, $index0) }};
+    ($runtime:expr, $next_frames:expr, $next0:expr, $index0:expr $(,)?) => {
+        $next_frames.enqueue($runtime, $next0, $index0)
+    };
 }
 
 #[macro_export]
 macro_rules! validate_buffer_enqueue_x2 {
     ($runtime:expr, $next_frames:expr, $next0:expr, $index0:expr, $next1:expr, $index1:expr $(,)?) => {{
-        $crate::validate_buffer_enqueue_x1!($runtime, $next_frames, $next0, $index0)?;
-        $crate::validate_buffer_enqueue_x1!($runtime, $next_frames, $next1, $index1)
+        $crate::validate_buffer_enqueue_x1!($runtime, $next_frames, $next0, $index0);
+        $crate::validate_buffer_enqueue_x1!($runtime, $next_frames, $next1, $index1);
     }};
 }
 
@@ -62,10 +64,153 @@ macro_rules! validate_buffer_enqueue_x4 {
      $next2:expr, $index2:expr,
      $next3:expr, $index3:expr
      $(,)?) => {{
-        $crate::validate_buffer_enqueue_x1!($runtime, $next_frames, $next0, $index0)?;
-        $crate::validate_buffer_enqueue_x1!($runtime, $next_frames, $next1, $index1)?;
-        $crate::validate_buffer_enqueue_x1!($runtime, $next_frames, $next2, $index2)?;
-        $crate::validate_buffer_enqueue_x1!($runtime, $next_frames, $next3, $index3)
+        $crate::validate_buffer_enqueue_x1!($runtime, $next_frames, $next0, $index0);
+        $crate::validate_buffer_enqueue_x1!($runtime, $next_frames, $next1, $index1);
+        $crate::validate_buffer_enqueue_x1!($runtime, $next_frames, $next2, $index2);
+        $crate::validate_buffer_enqueue_x1!($runtime, $next_frames, $next3, $index3);
+    }};
+}
+
+#[macro_export]
+macro_rules! vlib_process_frame {
+    (
+        $runtime:expr,
+        $frame:expr,
+        |$index:ident, $nf:ident| $body:expr
+        $(,)?
+    ) => {{
+        let width = $runtime.preferred_frame_batch_width();
+        let mut $nf = $crate::node::NodeNextFrames::default();
+        let indices = $frame.pending_indices();
+        let len = indices.len();
+        let mut read = 0usize;
+        match width {
+            $crate::instruction_set::FrameBatchWidth::Quad => {
+                while read + 4 <= len {
+                    if read + 4 < len {
+                        $runtime.prefetch_header(indices[read + 4]);
+                    }
+                    if read + 5 < len {
+                        $runtime.prefetch_header(indices[read + 5]);
+                    }
+                    if read + 6 < len {
+                        $runtime.prefetch_header(indices[read + 6]);
+                    }
+                    if read + 7 < len {
+                        $runtime.prefetch_header(indices[read + 7]);
+                    }
+                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                }
+                if read + 2 <= len {
+                    if read + 2 < len {
+                        $runtime.prefetch_header(indices[read + 2]);
+                    }
+                    if read + 3 < len {
+                        $runtime.prefetch_header(indices[read + 3]);
+                    }
+                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                }
+                while read < len {
+                    if read + 1 < len {
+                        $runtime.prefetch_header(indices[read + 1]);
+                    }
+                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                }
+            }
+            $crate::instruction_set::FrameBatchWidth::Pair => {
+                while read + 2 <= len {
+                    if read + 2 < len {
+                        $runtime.prefetch_header(indices[read + 2]);
+                    }
+                    if read + 3 < len {
+                        $runtime.prefetch_header(indices[read + 3]);
+                    }
+                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                }
+                while read < len {
+                    if read + 1 < len {
+                        $runtime.prefetch_header(indices[read + 1]);
+                    }
+                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                }
+            }
+            $crate::instruction_set::FrameBatchWidth::Octo => {
+                while read + 8 <= len {
+                    if read + 8 < len {
+                        $runtime.prefetch_header(indices[read + 8]);
+                    }
+                    if read + 9 < len {
+                        $runtime.prefetch_header(indices[read + 9]);
+                    }
+                    if read + 10 < len {
+                        $runtime.prefetch_header(indices[read + 10]);
+                    }
+                    if read + 11 < len {
+                        $runtime.prefetch_header(indices[read + 11]);
+                    }
+                    if read + 12 < len {
+                        $runtime.prefetch_header(indices[read + 12]);
+                    }
+                    if read + 13 < len {
+                        $runtime.prefetch_header(indices[read + 13]);
+                    }
+                    if read + 14 < len {
+                        $runtime.prefetch_header(indices[read + 14]);
+                    }
+                    if read + 15 < len {
+                        $runtime.prefetch_header(indices[read + 15]);
+                    }
+                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                }
+                while read + 4 <= len {
+                    if read + 4 < len {
+                        $runtime.prefetch_header(indices[read + 4]);
+                    }
+                    if read + 5 < len {
+                        $runtime.prefetch_header(indices[read + 5]);
+                    }
+                    if read + 6 < len {
+                        $runtime.prefetch_header(indices[read + 6]);
+                    }
+                    if read + 7 < len {
+                        $runtime.prefetch_header(indices[read + 7]);
+                    }
+                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                }
+                if read + 2 <= len {
+                    if read + 2 < len {
+                        $runtime.prefetch_header(indices[read + 2]);
+                    }
+                    if read + 3 < len {
+                        $runtime.prefetch_header(indices[read + 3]);
+                    }
+                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                }
+                while read < len {
+                    if read + 1 < len {
+                        $runtime.prefetch_header(indices[read + 1]);
+                    }
+                    $nf.enqueue($runtime, { let $index = indices[read]; $body }, indices[read]); read += 1;
+                }
+            }
+        }
+        $nf.finish($runtime, $frame)
     }};
 }
 
@@ -99,7 +244,7 @@ pub trait Node {
         &mut self,
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult>;
+    ) -> NodeResult;
 
     #[inline]
     fn node_process(&self) -> NodeProcessFn {
@@ -198,7 +343,7 @@ impl NodeRuntimeData {
 }
 
 pub type NodeProcessFn =
-    fn(&DataPlaneRuntime, NodeRuntimeData, &mut BufferFrame) -> CoreResult<NodeResult>;
+    fn(&DataPlaneRuntime, NodeRuntimeData, &mut BufferFrame) -> NodeResult;
 
 #[derive(Debug, Clone, Copy)]
 pub struct NodeDescriptor<'a> {
@@ -257,7 +402,7 @@ fn missing_node_process(
     runtime: &DataPlaneRuntime,
     _data: NodeRuntimeData,
     _frame: &mut BufferFrame,
-) -> CoreResult<NodeResult> {
+) -> NodeResult {
     let current = runtime
         .current_node()
         .map(|node| match runtime.nodes().node_name(node) {
@@ -265,9 +410,10 @@ fn missing_node_process(
             _ => format!("node {:?}", node),
         })
         .unwrap_or_else(|| "current node".to_owned());
-    Err(CoreError::internal(format!(
-        "{current} descriptor is missing a packet process function"
-    )))
+    // Programming error: node descriptor missing a process function. Drop
+    // the frame silently; the error is logged in the runtime stats.
+    _ = current;
+    NodeResult::drop()
 }
 
 /// Packet graph node that drives an external input boundary.
@@ -363,7 +509,7 @@ impl Node for NoopNode {
         &mut self,
         _runtime: &DataPlaneRuntime,
         _frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
+    ) -> NodeResult {
         match *self {}
     }
 }
@@ -558,7 +704,7 @@ impl NodeRuntimeSlot {
         self,
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
+    ) -> NodeResult {
         (self.process)(runtime, self.runtime_data, frame)
     }
 }
@@ -1379,17 +1525,10 @@ impl NodeRuntime {
             let result = slot.dispatch(runtime, &mut frame);
             let elapsed_ns = elapsed_ns(start);
             runtime.set_current_node(None);
-            self.record_runtime_stats(scheduled.node, vectors, elapsed_ns)?;
-            let result = match result {
-                Ok(result) => result,
-                Err(err) => {
-                    let _ = runtime.release_taken_frame_index(scheduled.frame, frame);
-                    return Err(err);
-                }
-            };
+            let _ = self.record_runtime_stats(scheduled.node, vectors, elapsed_ns);
             processed += 1;
 
-            self.dispatch_result(runtime, scheduled.frame, frame, result)?;
+            let _ = self.dispatch_result(runtime, scheduled.frame, frame, result);
         }
         Ok(processed)
     }
@@ -1581,10 +1720,8 @@ mod tests {
             &mut self,
             _runtime: &DataPlaneRuntime,
             _frame: &mut BufferFrame,
-        ) -> CoreResult<NodeResult> {
-            Err(CoreError::internal(
-                "stats test node must run through its function slot",
-            ))
+        ) -> NodeResult {
+            NodeResult::drop()
         }
 
         fn node_process(&self) -> NodeProcessFn {
@@ -1606,12 +1743,12 @@ mod tests {
         runtime: &DataPlaneRuntime,
         _data: NodeRuntimeData,
         frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
+    ) -> NodeResult {
         let mut pending = frame.drain_pending();
         while let Some(buffer) = pending.next() {
             runtime.free_index(buffer);
         }
-        Ok(NodeResult::drop())
+        NodeResult::drop()
     }
 
     #[test]

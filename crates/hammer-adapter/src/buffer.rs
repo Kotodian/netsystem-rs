@@ -12,6 +12,7 @@ use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::{
     boxed::Slice,
     prefetch::{prefetch_read_l1, prefetch_read_l2, prefetch_write_l1},
+    simd::movemask_4,
     vec::Vec,
 };
 
@@ -3137,6 +3138,120 @@ impl FrameReadiness {
     }
 }
 
+macro_rules! retain_ladder {
+    ($read:ident, $write:ident, $len:ident, 2, $step:expr) => {
+        while $read + 2 <= $len {
+            $step(0)?;
+            $step(1)?;
+            $read += 2;
+        }
+        if $read < $len {
+            $step(0)?;
+            $read += 1;
+        }
+    };
+    ($read:ident, $write:ident, $len:ident, 4, $step:expr) => {
+        while $read + 4 <= $len {
+            $step(0)?;
+            $step(1)?;
+            $step(2)?;
+            $step(3)?;
+            $read += 4;
+        }
+        retain_ladder!($read, $write, $len, 2, $step);
+    };
+}
+
+macro_rules! retain_ladder_prefetch {
+    ($self:expr, $read:ident, $write:ident, $len:ident, $prefetch:ident, 2, $step:expr) => {
+        while $read + 2 <= $len {
+            $self.prefetch_indices($read + 2, 2, $prefetch);
+            $step(0)?;
+            $step(1)?;
+            $read += 2;
+        }
+        if $read < $len {
+            $step(0)?;
+            $read += 1;
+        }
+    };
+    ($self:expr, $read:ident, $write:ident, $len:ident, $prefetch:ident, 4, $step:expr) => {
+        while $read + 4 <= $len {
+            $self.prefetch_indices($read + 4, 4, $prefetch);
+            $step(0)?;
+            $step(1)?;
+            $step(2)?;
+            $step(3)?;
+            $read += 4;
+        }
+        retain_ladder_prefetch!($self, $read, $write, $len, $prefetch, 2, $step);
+    };
+}
+
+macro_rules! retain_ladder_state_prefetch {
+    ($self:expr, $read:ident, $write:ident, $len:ident, $state:ident, $prefetch:ident, 2, $step:expr) => {
+        while $read + 2 <= $len {
+            $self.prefetch_indices_state($read + 2, 2, $state, $prefetch);
+            $step(0)?;
+            $step(1)?;
+            $read += 2;
+        }
+        if $read < $len {
+            $step(0)?;
+            $read += 1;
+        }
+    };
+    ($self:expr, $read:ident, $write:ident, $len:ident, $state:ident, $prefetch:ident, 4, $step:expr) => {
+        while $read + 4 <= $len {
+            $self.prefetch_indices_state($read + 4, 4, $state, $prefetch);
+            $step(0)?;
+            $step(1)?;
+            $step(2)?;
+            $step(3)?;
+            $read += 4;
+        }
+        retain_ladder_state_prefetch!($self, $read, $write, $len, $state, $prefetch, 2, $step);
+    };
+}
+
+macro_rules! rewrite_ladder {
+    ($read:ident, $write:ident, $len:ident, 2, $step:expr) => {
+        while $read + 2 <= $len {
+            $step(0)?;
+            $step(1)?;
+            $read += 2;
+        }
+        if $read < $len {
+            $step(0)?;
+            $read += 1;
+        }
+    };
+    ($read:ident, $write:ident, $len:ident, 4, $step:expr) => {
+        while $read + 4 <= $len {
+            $step(0)?;
+            $step(1)?;
+            $step(2)?;
+            $step(3)?;
+            $read += 4;
+        }
+        rewrite_ladder!($read, $write, $len, 2, $step);
+    };
+    ($read:ident, $write:ident, $len:ident, 8, $step:expr) => {
+        while $read + 8 <= $len {
+            $step(0)?;
+            $step(1)?;
+            $step(2)?;
+            $step(3)?;
+            $step(4)?;
+            $step(5)?;
+            $step(6)?;
+            $step(7)?;
+            $read += 8;
+        }
+        rewrite_ladder!($read, $write, $len, 4, $step);
+    };
+}
+
 impl BufferFrame {
     #[inline]
     fn with_capacity(capacity: usize) -> Self {
@@ -3332,9 +3447,9 @@ impl BufferFrame {
         mut keep: impl FnMut(BufferIndex) -> CoreResult<bool>,
     ) -> CoreResult<()> {
         match width {
+            FrameBatchWidth::Octo => self.retain_indices_octo(&mut keep),
             FrameBatchWidth::Quad => self.retain_indices_quad(&mut keep),
             FrameBatchWidth::Pair => self.retain_indices_pair(&mut keep),
-            FrameBatchWidth::Octo => self.retain_indices_quad(&mut keep),
         }
     }
 
@@ -3436,7 +3551,7 @@ impl BufferFrame {
         match width {
             FrameBatchWidth::Quad => self.rewrite_indices_quad(&mut rewrite),
             FrameBatchWidth::Pair => self.rewrite_indices_pair(&mut rewrite),
-            FrameBatchWidth::Octo => self.rewrite_indices_quad(&mut rewrite),
+            FrameBatchWidth::Octo => self.rewrite_indices_octo(&mut rewrite),
         }
     }
 
@@ -3449,10 +3564,29 @@ impl BufferFrame {
         let mut read = 0usize;
         let mut write = 0usize;
         while read + 4 <= len {
-            self.retain_one(read, &mut write, keep)?;
-            self.retain_one(read + 1, &mut write, keep)?;
-            self.retain_one(read + 2, &mut write, keep)?;
-            self.retain_one(read + 3, &mut write, keep)?;
+            let chunk = [
+                self.indices[read],
+                self.indices[read + 1],
+                self.indices[read + 2],
+                self.indices[read + 3],
+            ];
+            let mask = movemask_4([
+                keep(chunk[0])?,
+                keep(chunk[1])?,
+                keep(chunk[2])?,
+                keep(chunk[3])?,
+            ]);
+            if mask == 0b1111 && write == read {
+                write += 4;
+            } else {
+                let mut m = mask;
+                while m != 0 {
+                    let lsb = m.trailing_zeros();
+                    self.indices[write] = chunk[lsb as usize];
+                    write += 1;
+                    m &= m - 1;
+                }
+            }
             read += 4;
         }
         if read + 2 <= len {
@@ -3468,6 +3602,8 @@ impl BufferFrame {
         Ok(())
     }
 
+
+
     #[inline(always)]
     fn retain_indices_quad_with_prefetch(
         &mut self,
@@ -3477,24 +3613,9 @@ impl BufferFrame {
         let len = self.indices.len();
         let mut read = 0usize;
         let mut write = 0usize;
-        while read + 4 <= len {
-            self.prefetch_indices(read + 4, 4, prefetch);
-            self.retain_one(read, &mut write, keep)?;
-            self.retain_one(read + 1, &mut write, keep)?;
-            self.retain_one(read + 2, &mut write, keep)?;
-            self.retain_one(read + 3, &mut write, keep)?;
-            read += 4;
-        }
-        if read + 2 <= len {
-            self.prefetch_indices(read + 2, 2, prefetch);
-            self.retain_one(read, &mut write, keep)?;
-            self.retain_one(read + 1, &mut write, keep)?;
-            read += 2;
-        }
-        while read < len {
-            self.retain_one(read, &mut write, keep)?;
-            read += 1;
-        }
+        retain_ladder_prefetch!(self, read, write, len, prefetch, 4, |offset| {
+            self.retain_one(read + offset, &mut write, keep)
+        });
         self.finish_retain(write);
         Ok(())
     }
@@ -3507,13 +3628,95 @@ impl BufferFrame {
         let len = self.indices.len();
         let mut read = 0usize;
         let mut write = 0usize;
-        while read + 2 <= len {
+        retain_ladder!(read, write, len, 2, |offset| {
+            self.retain_one(read + offset, &mut write, keep)
+        });
+        self.finish_retain(write);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn retain_indices_octo(
+        &mut self,
+        keep: &mut impl FnMut(BufferIndex) -> CoreResult<bool>,
+    ) -> CoreResult<()> {
+        let len = self.indices.len();
+        let mut read = 0usize;
+        let mut write = 0usize;
+        while read + 8 <= len {
+            let chunk = [
+                self.indices[read],
+                self.indices[read + 1],
+                self.indices[read + 2],
+                self.indices[read + 3],
+                self.indices[read + 4],
+                self.indices[read + 5],
+                self.indices[read + 6],
+                self.indices[read + 7],
+            ];
+            let k0 = keep(chunk[0])?;
+            let k1 = keep(chunk[1])?;
+            let k2 = keep(chunk[2])?;
+            let k3 = keep(chunk[3])?;
+            let k4 = keep(chunk[4])?;
+            let k5 = keep(chunk[5])?;
+            let k6 = keep(chunk[6])?;
+            let k7 = keep(chunk[7])?;
+            let mask = (k0 as u8)
+                | ((k1 as u8) << 1)
+                | ((k2 as u8) << 2)
+                | ((k3 as u8) << 3)
+                | ((k4 as u8) << 4)
+                | ((k5 as u8) << 5)
+                | ((k6 as u8) << 6)
+                | ((k7 as u8) << 7);
+            if mask == 0xff && write == read {
+                write += 8;
+            } else {
+                let mut m = mask;
+                while m != 0 {
+                    let lsb = m.trailing_zeros();
+                    self.indices[write] = chunk[lsb as usize];
+                    write += 1;
+                    m &= m - 1;
+                }
+            }
+            read += 8;
+        }
+        if read + 4 <= len {
+            let chunk = [
+                self.indices[read],
+                self.indices[read + 1],
+                self.indices[read + 2],
+                self.indices[read + 3],
+            ];
+            let mask = movemask_4([
+                keep(chunk[0])?,
+                keep(chunk[1])?,
+                keep(chunk[2])?,
+                keep(chunk[3])?,
+            ]);
+            if mask == 0b1111 && write == read {
+                write += 4;
+            } else {
+                let mut m = mask;
+                while m != 0 {
+                    let lsb = m.trailing_zeros();
+                    self.indices[write] = chunk[lsb as usize];
+                    write += 1;
+                    m &= m - 1;
+                }
+            }
+            read += 4;
+        }
+        if read + 2 <= len {
             self.retain_one(read, &mut write, keep)?;
             self.retain_one(read + 1, &mut write, keep)?;
             read += 2;
         }
-        if read < len {
+        while read < len {
             self.retain_one(read, &mut write, keep)?;
+            read += 1;
         }
         self.finish_retain(write);
         Ok(())
@@ -3528,15 +3731,9 @@ impl BufferFrame {
         let len = self.indices.len();
         let mut read = 0usize;
         let mut write = 0usize;
-        while read + 2 <= len {
-            self.prefetch_indices(read + 2, 2, prefetch);
-            self.retain_one(read, &mut write, keep)?;
-            self.retain_one(read + 1, &mut write, keep)?;
-            read += 2;
-        }
-        if read < len {
-            self.retain_one(read, &mut write, keep)?;
-        }
+        retain_ladder_prefetch!(self, read, write, len, prefetch, 2, |offset| {
+            self.retain_one(read + offset, &mut write, keep)
+        });
         self.finish_retain(write);
         Ok(())
     }
@@ -3551,24 +3748,9 @@ impl BufferFrame {
         let len = self.indices.len();
         let mut read = 0usize;
         let mut write = 0usize;
-        while read + 4 <= len {
-            self.prefetch_indices_state(read + 4, 4, state, prefetch);
-            self.retain_one_state(read, &mut write, state, keep)?;
-            self.retain_one_state(read + 1, &mut write, state, keep)?;
-            self.retain_one_state(read + 2, &mut write, state, keep)?;
-            self.retain_one_state(read + 3, &mut write, state, keep)?;
-            read += 4;
-        }
-        if read + 2 <= len {
-            self.prefetch_indices_state(read + 2, 2, state, prefetch);
-            self.retain_one_state(read, &mut write, state, keep)?;
-            self.retain_one_state(read + 1, &mut write, state, keep)?;
-            read += 2;
-        }
-        while read < len {
-            self.retain_one_state(read, &mut write, state, keep)?;
-            read += 1;
-        }
+        retain_ladder_state_prefetch!(self, read, write, len, state, prefetch, 4, |offset| {
+            self.retain_one_state(read + offset, &mut write, state, keep)
+        });
         self.finish_retain(write);
         Ok(())
     }
@@ -3583,15 +3765,9 @@ impl BufferFrame {
         let len = self.indices.len();
         let mut read = 0usize;
         let mut write = 0usize;
-        while read + 2 <= len {
-            self.prefetch_indices_state(read + 2, 2, state, prefetch);
-            self.retain_one_state(read, &mut write, state, keep)?;
-            self.retain_one_state(read + 1, &mut write, state, keep)?;
-            read += 2;
-        }
-        if read < len {
-            self.retain_one_state(read, &mut write, state, keep)?;
-        }
+        retain_ladder_state_prefetch!(self, read, write, len, state, prefetch, 2, |offset| {
+            self.retain_one_state(read + offset, &mut write, state, keep)
+        });
         self.finish_retain(write);
         Ok(())
     }
@@ -3606,24 +3782,9 @@ impl BufferFrame {
         let len = self.indices.len();
         let mut read = 0usize;
         let mut write = None;
-        while read + 4 <= len {
-            self.prefetch_indices_state(read + 4, 4, state, prefetch);
-            self.retain_one_state_lazy(read, &mut write, state, keep)?;
-            self.retain_one_state_lazy(read + 1, &mut write, state, keep)?;
-            self.retain_one_state_lazy(read + 2, &mut write, state, keep)?;
-            self.retain_one_state_lazy(read + 3, &mut write, state, keep)?;
-            read += 4;
-        }
-        if read + 2 <= len {
-            self.prefetch_indices_state(read + 2, 2, state, prefetch);
-            self.retain_one_state_lazy(read, &mut write, state, keep)?;
-            self.retain_one_state_lazy(read + 1, &mut write, state, keep)?;
-            read += 2;
-        }
-        while read < len {
-            self.retain_one_state_lazy(read, &mut write, state, keep)?;
-            read += 1;
-        }
+        retain_ladder_state_prefetch!(self, read, write, len, state, prefetch, 4, |offset| {
+            self.retain_one_state_lazy(read + offset, &mut write, state, keep)
+        });
         self.finish_retain_lazy(write);
         Ok(())
     }
@@ -3638,15 +3799,9 @@ impl BufferFrame {
         let len = self.indices.len();
         let mut read = 0usize;
         let mut write = None;
-        while read + 2 <= len {
-            self.prefetch_indices_state(read + 2, 2, state, prefetch);
-            self.retain_one_state_lazy(read, &mut write, state, keep)?;
-            self.retain_one_state_lazy(read + 1, &mut write, state, keep)?;
-            read += 2;
-        }
-        if read < len {
-            self.retain_one_state_lazy(read, &mut write, state, keep)?;
-        }
+        retain_ladder_state_prefetch!(self, read, write, len, state, prefetch, 2, |offset| {
+            self.retain_one_state_lazy(read + offset, &mut write, state, keep)
+        });
         self.finish_retain_lazy(write);
         Ok(())
     }
@@ -3719,22 +3874,24 @@ impl BufferFrame {
         let len = self.indices.len();
         let mut read = 0usize;
         let mut write = 0usize;
-        while read + 4 <= len {
-            self.rewrite_one(read, &mut write, rewrite)?;
-            self.rewrite_one(read + 1, &mut write, rewrite)?;
-            self.rewrite_one(read + 2, &mut write, rewrite)?;
-            self.rewrite_one(read + 3, &mut write, rewrite)?;
-            read += 4;
-        }
-        if read + 2 <= len {
-            self.rewrite_one(read, &mut write, rewrite)?;
-            self.rewrite_one(read + 1, &mut write, rewrite)?;
-            read += 2;
-        }
-        while read < len {
-            self.rewrite_one(read, &mut write, rewrite)?;
-            read += 1;
-        }
+        rewrite_ladder!(read, write, len, 4, |offset| {
+            self.rewrite_one(read + offset, &mut write, rewrite)
+        });
+        self.finish_retain(write);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn rewrite_indices_octo(
+        &mut self,
+        rewrite: &mut impl FnMut(BufferIndex) -> CoreResult<Option<BufferIndex>>,
+    ) -> CoreResult<()> {
+        let len = self.indices.len();
+        let mut read = 0usize;
+        let mut write = 0usize;
+        rewrite_ladder!(read, write, len, 8, |offset| {
+            self.rewrite_one(read + offset, &mut write, rewrite)
+        });
         self.finish_retain(write);
         Ok(())
     }
@@ -3747,14 +3904,9 @@ impl BufferFrame {
         let len = self.indices.len();
         let mut read = 0usize;
         let mut write = 0usize;
-        while read + 2 <= len {
-            self.rewrite_one(read, &mut write, rewrite)?;
-            self.rewrite_one(read + 1, &mut write, rewrite)?;
-            read += 2;
-        }
-        if read < len {
-            self.rewrite_one(read, &mut write, rewrite)?;
-        }
+        rewrite_ladder!(read, write, len, 2, |offset| {
+            self.rewrite_one(read + offset, &mut write, rewrite)
+        });
         self.finish_retain(write);
         Ok(())
     }
