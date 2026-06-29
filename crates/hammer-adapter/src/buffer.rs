@@ -4025,7 +4025,7 @@ impl Iterator for BufferFrameBatchCursor<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         let remaining = self.indices.len().saturating_sub(self.offset);
         match self.width {
-            FrameBatchWidth::Quad if remaining >= 4 => {
+            FrameBatchWidth::Octo | FrameBatchWidth::Quad if remaining >= 4 => {
                 let batch = BufferFrameBatch::Quad([
                     self.indices[self.offset],
                     self.indices[self.offset + 1],
