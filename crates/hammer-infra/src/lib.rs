@@ -14,5 +14,6 @@ pub mod prefetch;
 pub mod rbtree;
 pub mod ring;
 pub mod segment;
+pub mod simd;
 pub mod timer_wheel;
 pub mod vec;
