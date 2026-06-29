@@ -597,6 +597,10 @@ fn instruction_set_selects_preferred_frame_batch_width() {
         DataPlaneInstructionSet::Neon.preferred_frame_batch_width(),
         FrameBatchWidth::Quad
     );
+    assert_eq!(
+        DataPlaneInstructionSet::Avx512.preferred_frame_batch_width(),
+        FrameBatchWidth::Octo
+    );
 }
 
 #[test]

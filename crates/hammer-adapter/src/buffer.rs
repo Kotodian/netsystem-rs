@@ -3334,6 +3334,7 @@ impl BufferFrame {
         match width {
             FrameBatchWidth::Quad => self.retain_indices_quad(&mut keep),
             FrameBatchWidth::Pair => self.retain_indices_pair(&mut keep),
+            FrameBatchWidth::Octo => self.retain_indices_quad(&mut keep),
         }
     }
 
@@ -3350,6 +3351,9 @@ impl BufferFrame {
             }
             FrameBatchWidth::Pair => {
                 self.retain_indices_pair_with_prefetch(&mut prefetch, &mut keep)
+            }
+            FrameBatchWidth::Octo => {
+                self.retain_indices_quad_with_prefetch(&mut prefetch, &mut keep)
             }
         }
     }
@@ -3369,6 +3373,9 @@ impl BufferFrame {
             FrameBatchWidth::Pair => {
                 self.retain_indices_pair_with_prefetch_state(state, &mut prefetch, &mut keep)
             }
+            FrameBatchWidth::Octo => {
+                self.retain_indices_quad_with_prefetch_state(state, &mut prefetch, &mut keep)
+            }
         }
     }
 
@@ -3386,6 +3393,9 @@ impl BufferFrame {
             }
             FrameBatchWidth::Pair => {
                 self.retain_indices_pair_with_prefetch_state_lazy(state, &mut prefetch, &mut keep)
+            }
+            FrameBatchWidth::Octo => {
+                self.retain_indices_quad_with_prefetch_state_lazy(state, &mut prefetch, &mut keep)
             }
         }
     }
@@ -3409,6 +3419,11 @@ impl BufferFrame {
                 &mut prefetch,
                 &mut keep_chunk,
             ),
+            FrameBatchWidth::Octo => self.retain_indices_quad_with_prefetch_state_lazy_chunks(
+                state,
+                &mut prefetch,
+                &mut keep_chunk,
+            ),
         }
     }
 
@@ -3421,6 +3436,7 @@ impl BufferFrame {
         match width {
             FrameBatchWidth::Quad => self.rewrite_indices_quad(&mut rewrite),
             FrameBatchWidth::Pair => self.rewrite_indices_pair(&mut rewrite),
+            FrameBatchWidth::Octo => self.rewrite_indices_quad(&mut rewrite),
         }
     }
 
@@ -3992,6 +4008,7 @@ impl BufferFrameBatchCursor<'_> {
     #[inline]
     pub fn prefetch_next(&self, runtime: &DataPlaneRuntime) {
         let width = match self.width {
+            FrameBatchWidth::Octo => 8,
             FrameBatchWidth::Quad => 4,
             FrameBatchWidth::Pair => 2,
         };
