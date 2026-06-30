@@ -4,11 +4,28 @@ use std::sync::Arc;
 
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_infra::map::FlatHashTable;
-use hammer_infra::msg_queue::MsgQueue;
+use hammer_infra::msg_queue::{MsgQueue, SessionEvt};
 use hammer_infra::segment::Segment;
+use tokio::sync::Notify;
 
 use crate::app::handle::SessionHandle;
 use crate::app::session::{AppSession, AppSessionConfig};
+
+struct SessionNotify {
+    rx_readable: Notify,
+    tx_writable: Notify,
+    evt_readable: Notify,
+}
+
+impl SessionNotify {
+    fn new() -> Self {
+        Self {
+            rx_readable: Notify::new(),
+            tx_writable: Notify::new(),
+            evt_readable: Notify::new(),
+        }
+    }
+}
 
 /// VPP `application` per-worker state: app sessions owned by one app worker,
 /// plus the worker-level event queue poll loop.
@@ -17,6 +34,7 @@ use crate::app::session::{AppSession, AppSessionConfig};
 pub struct AppWorker<S: Segment> {
     worker_index: usize,
     sessions: FlatHashTable<u64, Arc<AppSession<S>>>,
+    notifies: FlatHashTable<u64, Arc<SessionNotify>>,
 }
 
 impl<S: Segment> AppWorker<S> {
@@ -24,6 +42,7 @@ impl<S: Segment> AppWorker<S> {
         Self {
             worker_index,
             sessions: FlatHashTable::new(),
+            notifies: FlatHashTable::new(),
         }
     }
 
@@ -40,7 +59,15 @@ impl<S: Segment> AppWorker<S> {
 
     /// Remove a session. Mirrors VPP `app_worker_del_session`.
     pub fn detach_session(&mut self, handle: SessionHandle) -> Option<Arc<AppSession<S>>> {
+        self.notifies.remove(&handle.raw());
         self.sessions.remove(&handle.raw())
+    }
+
+    /// Convenience: look up the per-session notify table entry. Returned as
+    /// `Arc<SessionNotify>` so callers can await `rx_readable` / `tx_writable`
+    /// / `evt_readable` without holding a borrow on the worker.
+    pub fn notify_entry(&self, handle: SessionHandle) -> Option<Arc<SessionNotify>> {
+        self.notifies.lookup(&handle.raw())
     }
 
     /// Number of sessions currently attached.
@@ -76,8 +103,19 @@ impl AppWorker<Local> {
                 handle.raw()
             )));
         }
-        let session = Arc::new(AppSession::<Local>::local(config, handle)?);
+        let tx_evt_q = Arc::new(
+            MsgQueue::<Local>::with_capacity(64)
+                .map_err(|_| HammerError::internal("invalid tx_evt_q capacity"))?,
+        );
+        let session = Arc::new(AppSession::<Local>::new_in_segment(
+            Local::default(),
+            config,
+            handle,
+            tx_evt_q,
+        )?);
         self.sessions.insert(handle.raw(), Arc::clone(&session));
+        self.notifies
+            .insert(handle.raw(), Arc::new(SessionNotify::new()));
         Ok(session)
     }
 
@@ -98,13 +136,84 @@ impl AppWorker<Local> {
                 handle.raw()
             )));
         }
-        let session = Arc::new(AppSession::<Local>::local_with_runtime_tx(
+        let session = Arc::new(AppSession::<Local>::new_in_segment(
+            Local::default(),
             config,
             handle,
             runtime_tx_evt_q,
         )?);
         self.sessions.insert(handle.raw(), Arc::clone(&session));
+        self.notifies
+            .insert(handle.raw(), Arc::new(SessionNotify::new()));
         Ok(session)
+    }
+
+    /// App-side async send via worker. Applies FIFO backpressure and completes
+    /// only after every byte has entered the session-owned TX FIFO.
+    pub async fn send_all(&self, handle: SessionHandle, bytes: &[u8]) -> HammerResult<usize> {
+        let session = self
+            .sessions
+            .lookup(&handle.raw())
+            .ok_or_else(|| HammerError::internal("app session not found"))?;
+        let notify = self.notify_entry(handle);
+        let mut written = 0usize;
+        while written < bytes.len() {
+            let accepted = session.send_bytes(&bytes[written..])?;
+            if accepted != 0 {
+                written += accepted;
+                continue;
+            }
+            session.want_tx_notification();
+            if session.tx_fifo().max_enqueue() != 0 {
+                session.clear_tx_notification();
+                continue;
+            }
+            if let Some(ref n) = notify {
+                n.tx_writable.notified().await;
+            }
+            session.clear_tx_notification();
+        }
+        Ok(written)
+    }
+
+    /// App-side async receive via worker. Waits until RX FIFO has data.
+    pub async fn recv(&self, handle: SessionHandle, out: &mut [u8]) -> usize {
+        let Some(session) = self.sessions.lookup(&handle.raw()) else {
+            return 0;
+        };
+        let notify = self.notify_entry(handle);
+        loop {
+            let read = session.rx_fifo().peek(0, out.len(), out);
+            if read != 0 || out.is_empty() {
+                session.rx_fifo().dequeue_drop(read);
+                return read;
+            }
+            session.want_rx_notification();
+            if session.rx_fifo().max_dequeue() != 0 {
+                session.clear_rx_notification();
+                continue;
+            }
+            match notify {
+                Some(ref n) => n.rx_readable.notified().await,
+                None => return 0,
+            }
+            session.clear_rx_notification();
+        }
+    }
+
+    /// App-side async event receive via worker.
+    pub async fn next_event(&self, handle: SessionHandle) -> Option<SessionEvt> {
+        let session = self.sessions.lookup(&handle.raw())?;
+        let notify = self.notify_entry(handle);
+        loop {
+            if let Some(evt) = session.evt_q().dequeue() {
+                return Some(evt);
+            }
+            match notify {
+                Some(ref n) => n.evt_readable.notified().await,
+                None => return None,
+            }
+        }
     }
 }
 

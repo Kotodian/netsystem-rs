@@ -140,29 +140,6 @@ impl<S: Segment> SessionAppRuntime<S> {
         Ok(())
     }
 
-    pub(crate) fn enqueue_rx(
-        &self,
-        session_id: SessionId,
-        buffers: DataPlaneBuffers,
-        index: BufferIndex,
-    ) -> CoreResult<bool> {
-        let Some(session) = self.sessions.lookup(&session_id.get()) else {
-            return Ok(false);
-        };
-        let mut total = 0usize;
-        let mut wrote = 0usize;
-        for buffer in buffers.chain(index) {
-            let buffer = buffer?;
-            let chunk = buffer.current();
-            total += chunk.len();
-            if wrote == total - chunk.len() {
-                wrote += session.enqueue_rx(chunk).map_err(CoreError::from)?;
-            }
-        }
-        buffers.free_index(index);
-        Ok(wrote == total)
-    }
-
     pub(crate) fn copy_rx_from_buffer(
         &self,
         session_id: SessionId,
@@ -183,6 +160,30 @@ impl<S: Segment> SessionAppRuntime<S> {
             }
         }
         Ok(wrote)
+    }
+
+    pub(crate) fn copy_rx_from_buffer_ooo(
+        &self,
+        session_id: SessionId,
+        buffers: &DataPlaneBuffers,
+        index: BufferIndex,
+        offset: u32,
+    ) -> CoreResult<(u32, Option<u32>, u32)> {
+        let Some(session) = self.sessions.lookup(&session_id.get()) else {
+            buffers.free_index(index);
+            return Ok((0, None, 0));
+        };
+        let mut bytes = Vec::new();
+        for buf in buffers.chain(index) {
+            let buf = buf?;
+            bytes.extend_from_slice(buf.current());
+        }
+        buffers.free_index(index);
+        let result = session
+            .rx_fifo()
+            .enqueue_ooo(offset, &bytes)
+            .map_err(|_| CoreError::internal("ooo enqueue failed"))?;
+        Ok((result.delivered, Some(offset), bytes.len() as u32))
     }
 
     pub(crate) fn free_pending_send(&mut self, session_id: SessionId) {

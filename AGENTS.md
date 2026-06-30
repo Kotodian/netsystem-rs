@@ -1,33 +1,68 @@
 # Repository Guidelines
 
+## Project Overview
+
+Hammer is a VPP-style high-performance network data plane framework written in Rust. It originated as an iOS NetworkExtension VPN engine and has evolved into a general-purpose packet-processing framework modeled on VPP's node/graph/session architecture, with a standalone daemon and CLI in addition to the iOS FFI path.
+
+The framework centers on a **packet graph runtime**: data-plane work is organized into graph nodes processing frames of buffers, worker-owned state, lock-free hot paths, and VPP-style barrier synchronization between control and data planes.
+
 ## Project Structure & Module Organization
 
-This Rust workspace implements an iOS NetworkExtension VPN engine. Crates live in `crates/`:
+Workspace root: `crates/`. Dependency direction is strictly one-way to avoid cycles: `hammer → {hammer-runtime, hammer-service, hammer-ipc, hammer-core, hammer-component-macros}`, `hammer-app → {hammer-runtime, hammer-adapter, hammer-core, hammer-infra}`, `hammer-service → {hammer-runtime, hammer-core, hammer-adapter, hammer-infra, hammer-component-macros}`, `hammer-adapter → {hammer-core, hammer-infra}`, `hammer-ipc → {hammer-core, hammer-runtime}`, `hammer-runtime → {hammer-adapter, hammer-core, hammer-component-macros}`, `hammer-infra → (external only)`, `hammer-core → hammer-infra`.
 
-- `hammer-core`: shared config schema, errors, lifecycle, metrics, logs, and network primitives.
-- `hammer-adapter`: cross-crate traits and platform contracts.
-- `hammer-component-macros`: proc macros for runtime registration.
-- `hammer-runtime`: routing, TUN handling, endpoint/outbound runtime, and service orchestration.
-- `hammer-ffi`: UniFFI-facing service API and `src/hammer.udl`.
-- `hammer-uniffi-bindgen`: binding generation helper binary.
+| crate | role |
+|---|---|
+| `hammer-infra` | Bottom-layer infrastructure — lock-free data structures and memory primitives (cache-aligned). FIFO with OOO delivery, `Pool<T>` with generation counters, `TimerWheel1t2w2048sl`, `FlatHashTable`, `RbTree`, `Segment` (Local heap / Svm shared-memory mmap), internet checksum, SIMD primitives, ring buffers. Analogous to VPP's `vppinfra`. |
+| `hammer-core` | Base types — config schema (TOML, multi-file `include`), errors, lifecycle, metrics, log, network primitives, forwarding (DPO/FIB/mtrie/load-balance), protocol wire types (IP/ICMP/TCP options & segment, optional WireGuard). Zero business logic. |
+| `hammer-adapter` | Cross-crate contract layer — inbound/outbound/endpoint traits, platform interface, data-plane buffer/node/handoff abstractions. Decouples implementation from FFI/runtime callers. |
+| `hammer-component-macros` | Proc macros: `#[graph_node]`, `#[init_function]`, `#[worker_init_function]` for declarative packet-graph node registration via `linkme` distributed slices. |
+| `hammer-runtime` | Runtime engine — worker thread spawning, engine main loop with VPP fixed-schedule step order, barrier synchronization (`control_call_with_barrier`), `RuntimeRegistry` (typed service registry), session/app handle types. |
+| `hammer-service` | Network stack — the largest crate. Interface management, IP input/forward/reassembly, ICMP, TCP (full state machine incl. BBR congestion control, SACK, recovery, TIME_WAIT, keep-alive, ECN, persist, PMTU), UDP, session layer (L5 app/session boundary with SVM FIFO + message queue), TUN/TAP device driver, packet graph registration. Analogous to VPP's `vnet`. |
+| `hammer-app` | Application-plane interface — app/session boundary for local and cross-process (shared-memory) sessions. `AttachClient` (Unix socket + SCM_RIGHTS), `RemoteAppSession` (tokio AsyncFd). Echo helpers for testing. |
+| `hammer-ipc` | Daemon ↔ CLI IPC protocol — length-prefixed frame format, request/reply message types, `#[ipc_handler]` registration via `linkme`, sync `IpcClient`. |
+| `hammer` | Daemon binary (analogous to VPP's `vpp`). Loads TOML config, initializes runtime engine + worker graph, binds IPC TCP socket (default `127.0.0.1:7299`, overridable via `HAMMER_IPC_ADDR`), runs the data-plane main loop. |
+| `hammerctl` | CLI control tool (analogous to `vppctl`). Subcommands: `Pause`, `Wake`, `ResetNetwork`, `Shutdown`, `Status`, `Send` (raw handler dispatch). |
 
-Integration tests live in crate-local `tests/` directories, for example `crates/hammer-runtime/tests/`. Patched dependencies live under `third_party/`. Generated iOS output goes to `dist/ios/`.
+Patched dependencies live under `third_party/` (currently `boringtun`, patched via `[patch.crates.io]`). Generated iOS output goes to `dist/ios/`. Design docs live in `docs/superpowers/` (`specs/` for architecture specs, `plans/` for dated implementation plans, `sdd/` for task execution tracking).
 
 ## Build, Test, and Development Commands
 
-- `cargo build --workspace`: build all workspace crates.
-- `cargo test --workspace`: run all Rust tests.
-- `cargo test -p hammer-runtime`: run tests for one crate.
-- `cargo fmt --all`: format the workspace with rustfmt.
-- `cargo clippy --workspace --all-targets`: run lint checks.
-- `make ios-lib` or `make xcframework`: build the iOS `Hammer.xcframework` and Swift glue.
-- `make clean-ios-lib`: remove generated iOS artifacts from `dist/ios/`.
+```bash
+cargo build --workspace              # build all crates
+cargo build --workspace --release    # release build (thin LTO)
+cargo test --workspace               # run all Rust tests
+cargo test -p hammer-runtime         # run tests for one crate
+cargo fmt --all                      # format with rustfmt
+cargo fmt --all -- --check           # check formatting without writing
+cargo clippy --workspace --all-targets  # lint
 
-For profiling-friendly iOS builds, use `PROFILE=release-perf ./scripts/build-xcframework.sh`.
+make build        # = cargo build --workspace
+make build-release
+make run          # cargo run -p hammer -- -c startup.toml
+make ctl          # cargo run -p hammerctl --
+make test         # cargo test --workspace
+make clippy
+make fmt
+make clean
+```
+
+For iOS packaging (when the FFI/xcframework path is restored):
+```bash
+make xcframework                    # or: ./scripts/build-xcframework.sh
+PROFILE=release-perf make xcframework   # Instruments-friendly (line-tables debuginfo, no strip)
+FEATURES=wireguard make xcframework     # enable optional protocols
+make clean-ios-lib                  # rm -rf dist/ios
+```
 
 ## Coding Style & Naming Conventions
 
-Use Rust 2024 conventions and rustfmt defaults: 4-space indentation, `snake_case` for modules/functions, `PascalCase` for types and traits, and `SCREAMING_SNAKE_CASE` for constants. Keep dependency direction consistent: `hammer-ffi -> hammer-runtime -> {hammer-adapter, hammer-core}` and `hammer-adapter -> hammer-core`. Group modules by protocol or subsystem, matching paths such as `src/transport/tcp/` and `src/config/`.
+Use Rust 2024 conventions and rustfmt defaults: 4-space indentation, `snake_case` for modules/functions, `PascalCase` for types and traits, and `SCREAMING_SNAKE_CASE` for constants. Keep dependency direction consistent (see graph above). Group modules by protocol or subsystem, matching paths such as `src/transport/tcp/` and `src/config/`.
+
+### Rust-specific rules
+
+- Do **not** introduce underscore-prefixed variable names such as `_value`. If a parameter or pattern slot is intentionally unused, use the bare `_` pattern. If a local binding is unused, delete it and the work that produced it.
+- Enforce architectural boundaries with visibility, traits, and narrow re-exports instead of comments or convention.
+- Non-trivial designs must document the layer isolation contract: what each layer may call, what it must not call, which APIs cross the boundary, and which commands verify the boundary.
 
 ## VPP Refactor Principles
 
@@ -37,9 +72,6 @@ When working on VPP-related refactors in this repository:
 - Use data structures from the `hammer-infra` crate by default. If `hammer-infra` lacks a required generic API, add the API there instead of falling back to `std` or creating local one-off utilities.
 - Reuse existing APIs before adding new wrappers, helpers, or types. Add new API surface only when reuse is not technically viable. When a missing capability is shared by multiple use cases, add one generic primitive at the owning layer instead of adding per-feature APIs. Any new type or API in non-trivial VPP/TCP work must state the final result, explain why existing surfaces cannot satisfy the need, and receive explicit user approval before implementation.
 - Utility or tool types must remain generic and must not contain business concepts. Business state names must describe the domain state directly; do not use names such as `Cursor`, `Helper`, or `Util` for business records.
-- Do not introduce underscore-prefixed variable names such as `_value`. If a parameter or pattern slot is intentionally unused, use the bare `_` pattern. If a local binding is unused, delete it and the work that produced it.
-- Enforce Rust architectural boundaries with visibility, traits, and narrow re-exports instead of comments or convention.
-- Non-trivial Rust designs must document the layer isolation contract: what each layer may call, what it must not call, which APIs cross the boundary, and which commands verify the boundary.
 
 ### Hammer/VPP TCP Standards
 
@@ -60,14 +92,23 @@ For TCP, session, dataplane buffer, and recovery work:
 
 ## Testing Guidelines
 
-Add integration tests near the crate whose behavior changes. Use descriptive file names like `service_lifecycle.rs`, `config_parse.rs`, or `tcp_output.rs`. Prefer focused tests for config parsing, lifecycle behavior, routing, and protocol edge cases. Run `cargo test --workspace` before a PR; use `cargo test -p <crate>` while iterating.
+Add integration tests near the crate whose behavior changes. Test files live in crate-local `tests/` directories (e.g. `crates/hammer-runtime/tests/`, `crates/hammer-core/tests/`). Use descriptive file names like `service_lifecycle.rs`, `config_parse.rs`, `tcp_output.rs`, or `fifo_ooo.rs`. Prefer focused tests for config parsing, lifecycle behavior, routing, TCP protocol edge cases, and data-structure correctness.
+
+The project follows a TDD rhythm (RED → GREEN → commit) documented in `docs/superpowers/plans/`. Run `cargo test --workspace` before a PR; use `cargo test -p <crate>` while iterating.
 
 ## Commit & Pull Request Guidelines
 
-Recent commits use scoped messages such as `hammer-runtime(Feat): add proxy inbounds` and `wireguard(Feat): scaffold amneziawg 2.0 feature`. Follow `<scope>(<Type>): <imperative summary>`, with types like `Feat`, `Fix`, `Refactor`, `Debug`, or `docs`.
+Recent commits use scoped messages such as `hammer-runtime(Feat): per-node error counters` and `hammer-infra(Feat): add SIMD primitives`. Follow `<scope>(<Type>): <imperative summary>`, with types like `Feat`, `Fix`, `Refactor`, `Debug`, `Test`, or `docs`.
 
 PRs should include a behavior summary, affected crates, test commands run, and any iOS packaging impact. Link related issues when available. Include generated artifact notes only when Swift/iOS output changes.
 
 ## Security & Configuration Tips
 
 Do not commit real VPN credentials, server addresses, certificates, or generated framework output. Keep example TOML values synthetic, and document feature flags when enabling optional protocols such as WireGuard.
+
+## Documentation
+
+- `docs/superpowers/specs/` — architecture design specs (node-next traits, shared app ingress registry, timer wheel, TCP complete echo design, TCP worker driver node, L5 app session layer).
+- `docs/superpowers/plans/` — dated implementation plans with checkboxes, file maps, and public-interface additions.
+- `docs/superpowers/sdd/` — per-task execution tracking (progress, briefs, reports, review diffs).
+- `README.md` — high-level architecture overview (note: predates the VPP-clone refactor; the FFI/xcframework sections describe the iOS path, while the daemon/CLI path is newer).

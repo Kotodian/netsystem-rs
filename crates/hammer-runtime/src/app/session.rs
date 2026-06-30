@@ -5,7 +5,6 @@ use hammer_core::error::{HammerError, HammerResult};
 use hammer_infra::fifo::Fifo;
 use hammer_infra::msg_queue::{MsgQueue, SessionEvt, SessionEvtType};
 use hammer_infra::segment::Segment;
-use tokio::sync::Notify;
 
 use std::os::fd::RawFd;
 
@@ -24,22 +23,27 @@ pub struct AppSession<S: Segment> {
     tx_fifo: Arc<Fifo<S>>,
     evt_q: Arc<MsgQueue<S>>,
     tx_evt_q: Arc<MsgQueue<S>>,
-    rx_readable: Notify,
-    tx_writable: Notify,
-    evt_readable: Notify,
     handle: SessionHandle,
 }
 
 use hammer_infra::segment::Local;
 
-impl AppSession<Local> {
-    pub fn local(config: AppSessionConfig, handle: SessionHandle) -> HammerResult<Self> {
+impl<S: Segment> AppSession<S> {
+    pub fn new_in_segment(
+        seg: S,
+        config: AppSessionConfig,
+        handle: SessionHandle,
+        tx_evt_q: Arc<MsgQueue<S>>,
+    ) -> HammerResult<Self>
+    where
+        S: Clone,
+    {
         let rx_fifo = Arc::new(
-            Fifo::<Local>::with_capacity(config.fifo_capacity)
+            Fifo::<S>::new(seg.clone(), config.fifo_capacity)
                 .map_err(|_| HammerError::internal("invalid rx fifo capacity"))?,
         );
         let tx_fifo = Arc::new(
-            Fifo::<Local>::with_capacity(config.fifo_capacity)
+            Fifo::<S>::new(seg.clone(), config.fifo_capacity)
                 .map_err(|_| HammerError::internal("invalid tx fifo capacity"))?,
         );
         let ring_slots = config
@@ -48,65 +52,17 @@ impl AppSession<Local> {
             .ok_or_else(|| HammerError::internal("app session evt_q capacity overflow"))?;
         let ring_size = ring_slots.next_power_of_two().max(2);
         let evt_q = Arc::new(
-            MsgQueue::<Local>::with_capacity(ring_size)
+            MsgQueue::<S>::new(seg, ring_size)
                 .map_err(|_| HammerError::internal("invalid app session evt_q capacity"))?,
-        );
-        let tx_evt_q = Arc::new(
-            MsgQueue::<Local>::with_capacity(64)
-                .map_err(|_| HammerError::internal("invalid app session tx_evt_q capacity"))?,
         );
         Ok(Self {
             rx_fifo,
             tx_fifo,
             evt_q,
             tx_evt_q,
-            rx_readable: Notify::new(),
-            tx_writable: Notify::new(),
-            evt_readable: Notify::new(),
             handle,
         })
     }
-
-    /// In-process variant that uses a shared runtime-side TX event queue
-    /// instead of creating a private per-session queue. The shared queue
-    /// is owned by `SessionAppRuntime` so the dataplane side can drain
-    /// all TX events from a single ring.
-    pub fn local_with_runtime_tx(
-        config: AppSessionConfig,
-        handle: SessionHandle,
-        runtime_tx_evt_q: Arc<MsgQueue<Local>>,
-    ) -> HammerResult<Self> {
-        let rx_fifo = Arc::new(
-            Fifo::<Local>::with_capacity(config.fifo_capacity)
-                .map_err(|_| HammerError::internal("invalid rx fifo capacity"))?,
-        );
-        let tx_fifo = Arc::new(
-            Fifo::<Local>::with_capacity(config.fifo_capacity)
-                .map_err(|_| HammerError::internal("invalid tx fifo capacity"))?,
-        );
-        let ring_slots = config
-            .evt_q_capacity
-            .checked_add(1)
-            .ok_or_else(|| HammerError::internal("app session evt_q capacity overflow"))?;
-        let ring_size = ring_slots.next_power_of_two().max(2);
-        let evt_q = Arc::new(
-            MsgQueue::<Local>::with_capacity(ring_size)
-                .map_err(|_| HammerError::internal("invalid app session evt_q capacity"))?,
-        );
-        Ok(Self {
-            rx_fifo,
-            tx_fifo,
-            evt_q,
-            tx_evt_q: runtime_tx_evt_q,
-            rx_readable: Notify::new(),
-            tx_writable: Notify::new(),
-            evt_readable: Notify::new(),
-            handle,
-        })
-    }
-}
-
-impl<S: Segment> AppSession<S> {
     #[inline]
     pub const fn session_index(&self) -> u32 {
         self.handle.session_index()
@@ -148,9 +104,6 @@ impl<S: Segment> AppSession<S> {
                     tx_evt_q_write,
                 )
             }),
-            rx_readable: Notify::new(),
-            tx_writable: Notify::new(),
-            evt_readable: Notify::new(),
             handle,
         }
     }
@@ -190,54 +143,12 @@ impl<S: Segment> AppSession<S> {
         Ok(wrote)
     }
 
-    /// App-side async send. Applies FIFO backpressure and completes only after
-    /// every byte in `bytes` has entered the session-owned TX FIFO.
-    pub async fn send_all(&self, bytes: &[u8]) -> HammerResult<usize> {
-        let mut written = 0usize;
-        while written < bytes.len() {
-            let accepted = self.send_bytes(&bytes[written..])?;
-            if accepted != 0 {
-                written += accepted;
-                continue;
-            }
-            self.want_tx_notification();
-            let notified = self.tx_writable.notified();
-            if self.tx_fifo.max_enqueue() != 0 {
-                self.clear_tx_notification();
-                continue;
-            }
-            notified.await;
-            self.clear_tx_notification();
-        }
-        Ok(written)
-    }
-
     /// App-side convenience: copy received bytes out (transport → app). Returns
     /// number of bytes copied into `out`; caller calls `consume_rx` after
     /// processing.
     #[inline]
     pub fn recv_bytes(&self, out: &mut [u8]) -> usize {
         self.rx_fifo.peek(0, out.len(), out)
-    }
-
-    /// App-side async receive. Waits until RX FIFO has data, copies up to
-    /// `out.len()` bytes, and consumes exactly the copied bytes.
-    pub async fn recv(&self, out: &mut [u8]) -> usize {
-        loop {
-            let read = self.rx_fifo.peek(0, out.len(), out);
-            if read != 0 || out.is_empty() {
-                self.rx_fifo.dequeue_drop(read);
-                return read;
-            }
-            self.want_rx_notification();
-            let notified = self.rx_readable.notified();
-            if self.rx_fifo.max_dequeue() != 0 {
-                self.clear_rx_notification();
-                continue;
-            }
-            notified.await;
-            self.clear_rx_notification();
-        }
     }
 
     /// App-side convenience: drop `len` bytes from the head of `rx_fifo` after
@@ -252,20 +163,6 @@ impl<S: Segment> AppSession<S> {
     #[inline]
     pub fn poll_events(&self, out: &mut [SessionEvt]) -> usize {
         self.evt_q.dequeue_batch(out)
-    }
-
-    /// App-side async event receive. Waits for the next session event.
-    pub async fn next_event(&self) -> SessionEvt {
-        loop {
-            if let Some(evt) = self.evt_q.dequeue() {
-                return evt;
-            }
-            let notified = self.evt_readable.notified();
-            if let Some(evt) = self.evt_q.dequeue() {
-                return evt;
-            }
-            notified.await;
-        }
     }
 
     /// App-side convenience: read the edge-triggered signal flag. Returns true
@@ -285,7 +182,6 @@ impl<S: Segment> AppSession<S> {
                 evt_type,
             })
             .map_err(|_| HammerError::internal("app session evt_q full"))?;
-        self.evt_readable.notify_waiters();
         Ok(())
     }
 
@@ -297,9 +193,6 @@ impl<S: Segment> AppSession<S> {
     #[inline]
     pub fn enqueue_rx(&self, bytes: &[u8]) -> HammerResult<usize> {
         let wrote = self.rx_fifo.enqueue(bytes);
-        if wrote > 0 {
-            self.rx_readable.notify_waiters();
-        }
         if wrote > 0 && self.rx_fifo.should_signal(wrote) {
             self.push_event(SessionEvtType::RxEnq)?;
         }
@@ -311,9 +204,6 @@ impl<S: Segment> AppSession<S> {
     #[inline]
     pub fn drop_tx_acked(&self, len: usize) -> HammerResult<usize> {
         let dropped = self.tx_fifo.dequeue_drop(len);
-        if dropped > 0 {
-            self.tx_writable.notify_waiters();
-        }
         if dropped > 0 && self.tx_fifo.needs_deq_notification(dropped) {
             self.push_event(SessionEvtType::TxDeq)?;
         }
@@ -373,9 +263,6 @@ impl<S: Segment> AppSession<S> {
         self.rx_fifo.clear();
         self.tx_fifo.clear();
         self.evt_q.clear();
-        self.rx_readable.notify_waiters();
-        self.tx_writable.notify_waiters();
-        self.evt_readable.notify_waiters();
     }
 }
 
@@ -426,7 +313,9 @@ mod tests {
 
     fn new_session(config: AppSessionConfig, session_index: u32) -> AppSession<Local> {
         let handle = SessionHandle::new(session_index, 0);
-        AppSession::<Local>::local(config, handle).expect("session")
+        let tx_evt_q = Arc::new(MsgQueue::<Local>::with_capacity(64).expect("tx_evt_q"));
+        AppSession::<Local>::new_in_segment(Local::default(), config, handle, tx_evt_q)
+            .expect("session")
     }
 
     #[test]
@@ -559,9 +448,15 @@ mod tests {
 
     #[test]
     fn app_session_rejects_invalid_fifo_capacity() {
+        let tx_evt_q = Arc::new(MsgQueue::<Local>::with_capacity(64).expect("tx_evt_q"));
         assert!(
-            AppSession::<Local>::local(AppSessionConfig::new(3, 4), SessionHandle::new(0, 0))
-                .is_err()
+            AppSession::<Local>::new_in_segment(
+                Local::default(),
+                AppSessionConfig::new(3, 4),
+                SessionHandle::new(0, 0),
+                tx_evt_q,
+            )
+            .is_err()
         );
     }
 

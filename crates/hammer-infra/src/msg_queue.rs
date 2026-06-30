@@ -48,7 +48,7 @@ unsafe impl<S: Segment> Send for MsgQueue<S> {}
 unsafe impl<S: Segment> Sync for MsgQueue<S> {}
 
 impl<S: Segment> MsgQueue<S> {
-    pub fn new(seg: S, capacity: usize, cross_process: bool) -> Result<Self, MsgQueueError> {
+    pub fn new(seg: S, capacity: usize) -> Result<Self, MsgQueueError> {
         if capacity < 2 || !capacity.is_power_of_two() {
             return Err(MsgQueueError::InvalidCapacity);
         }
@@ -68,33 +68,13 @@ impl<S: Segment> MsgQueue<S> {
                 },
             );
         }
-        let (signal_read, signal_write) = if cross_process {
-            let mut fds = [0i32; 2];
-            let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
-            if ret != 0 {
-                return Err(MsgQueueError::InvalidCapacity);
-            }
-            for fd in fds {
-                let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-                unsafe {
-                    libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-                }
-                let fdflags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-                unsafe {
-                    libc::fcntl(fd, libc::F_SETFD, fdflags | libc::FD_CLOEXEC);
-                }
-            }
-            (Some(fds[0]), Some(fds[1]))
-        } else {
-            (None, None)
-        };
         Ok(Self {
             seg,
             base,
             hdr,
             hdr_off,
-            signal_read,
-            signal_write,
+            signal_read: None,
+            signal_write: None,
             signal_atomic: AtomicBool::new(false),
         })
     }
@@ -275,7 +255,7 @@ impl<S: Segment> MsgQueue<S> {
 impl MsgQueue<Local> {
     pub fn with_capacity(capacity: usize) -> Result<Self, MsgQueueError> {
         let seg = Local::new(size_of::<MsgQueueHeader>() + capacity * size_of::<SessionEvt>() + 64);
-        Self::new(seg, capacity, false)
+        Self::new(seg, capacity)
     }
 }
 
@@ -317,7 +297,7 @@ mod tests {
     #[test]
     fn enqueue_dequeue_roundtrip_in_process() {
         let seg = Local::new(4096);
-        let q = MsgQueue::<Local>::new(seg, 8, false).expect("msgq");
+        let q = MsgQueue::<Local>::new(seg, 8).expect("msgq");
         let sent = evt(42, SessionEvtType::RxEnq);
         q.enqueue(sent).expect("enqueue");
         assert_eq!(q.dequeue(), Some(sent));
@@ -327,7 +307,7 @@ mod tests {
     #[test]
     fn enqueue_batch_fires_once() {
         let seg = Local::new(4096);
-        let q = MsgQueue::<Local>::new(seg, 8, false).expect("msgq");
+        let q = MsgQueue::<Local>::new(seg, 8).expect("msgq");
         let batch = [evt(1, RxEnq), evt(2, TxDeq), evt(3, Connect)];
         assert_eq!(q.enqueue_batch(&batch), 3);
         assert_eq!(q.dequeue(), Some(batch[0]));
@@ -338,7 +318,7 @@ mod tests {
     #[test]
     fn full_returns_evt() {
         let seg = Local::new(4096);
-        let q = MsgQueue::<Local>::new(seg, 2, false).expect("msgq");
+        let q = MsgQueue::<Local>::new(seg, 2).expect("msgq");
         assert!(q.enqueue(evt(1, RxEnq)).is_ok());
         assert!(q.enqueue(evt(2, RxEnq)).is_err());
     }
@@ -346,7 +326,7 @@ mod tests {
     #[test]
     fn in_process_signal_has_no_fd() {
         let seg = Local::new(4096);
-        let q = MsgQueue::<Local>::new(seg, 4, false).expect("msgq");
+        let q = MsgQueue::<Local>::new(seg, 4).expect("msgq");
         assert!(q.read_fd().is_none());
         assert!(!q.drain());
         q.fire();
@@ -357,7 +337,7 @@ mod tests {
     #[test]
     fn cross_process_signal_has_fd() {
         let seg = Local::new(4096);
-        let q = MsgQueue::<Local>::new(seg, 4, true).expect("msgq");
+        let q = MsgQueue::<Local>::new(seg, 4).expect("msgq");
         assert!(q.read_fd().is_some());
         assert!(!q.drain());
         q.fire();
@@ -367,7 +347,7 @@ mod tests {
     #[test]
     fn cross_process_signal_wakes_thread() {
         let seg = Local::new(4096);
-        let q = std::sync::Arc::new(MsgQueue::<Local>::new(seg, 4, true).expect("msgq"));
+        let q = std::sync::Arc::new(MsgQueue::<Local>::new(seg, 4).expect("msgq"));
         let wq = std::sync::Arc::clone(&q);
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let dc = std::sync::Arc::clone(&done);

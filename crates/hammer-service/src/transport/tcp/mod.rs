@@ -884,7 +884,9 @@ mod tests {
         let mut worker_state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
         set_tcp_worker_state(&mut worker_state);
         let mut driver = SessionDriverRuntime::new(DataWorkerId::new(0), runtime.buffers().clone());
-        let session_id = driver.insert_session(established_tcp_connection());
+        let session_id = driver
+            .insert_session_with_id(|_| established_tcp_connection())
+            .expect("insert session");
         publish_tcp_connection(&mut driver, session_id).expect("refresh session route");
 
         let (local, remote, sequence, acknowledgment) = {

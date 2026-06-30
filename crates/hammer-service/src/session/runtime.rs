@@ -7,10 +7,9 @@ use hammer_adapter::{
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::fifo_queue::FifoQueue;
-use hammer_infra::map::FlatHashTable;
 use hammer_infra::msg_queue::MsgQueue;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
-use hammer_infra::rbtree::RbTree;
+
 use hammer_infra::segment::{Local, Segment};
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
 use hammer_runtime::app::{AppContext, AppSessionConfig, SessionHandle, with_current_app_worker};
@@ -32,305 +31,11 @@ struct ExpiredTimer {
     timer_id: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SessionRxBuffer {
-    pub(crate) index: BufferIndex,
-    pub(crate) offset: u32,
-    pub(crate) len: u32,
-    pub(crate) fin: bool,
-}
-
-#[derive(Debug)]
-pub(crate) struct SessionRxQueue {
-    delivered: FifoQueue<SessionRxBuffer>,
-    ooo_base: u32,
-    ooo_entries: Pool<SessionRxBuffer>,
-    ooo_index: RbTree<u32, PoolIndex>,
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SessionRxEnqueue {
     pub(crate) delivered_len: u32,
     pub(crate) newest_ooo_start: Option<u32>,
     pub(crate) newest_ooo_len: u32,
-}
-
-impl SessionRxQueue {
-    const DEFAULT_OOO_CAPACITY: usize = 8;
-
-    #[inline]
-    fn new() -> Self {
-        Self {
-            delivered: FifoQueue::new(),
-            ooo_base: 0,
-            ooo_entries: Pool::with_capacity(Self::DEFAULT_OOO_CAPACITY),
-            ooo_index: RbTree::with_capacity(Self::DEFAULT_OOO_CAPACITY),
-        }
-    }
-
-    #[inline]
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.delivered.len() + self.ooo_entries.len()
-    }
-
-    #[inline]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.delivered.is_empty() && self.ooo_entries.is_empty()
-    }
-
-    #[inline]
-    pub(crate) fn front(&self) -> Option<&SessionRxBuffer> {
-        self.delivered.front()
-    }
-
-    #[inline]
-    pub(crate) fn pop_front(&mut self) -> Option<SessionRxBuffer> {
-        self.delivered.pop_front()
-    }
-
-    fn first_ooo_relative(&self) -> Option<(u32, u32)> {
-        let (offset, entry_index) = self
-            .ooo_index
-            .first()
-            .map(|(offset, entry_index)| (*offset, *entry_index))?;
-        let entry = self
-            .ooo_entries
-            .get(entry_index)
-            .expect("session rx OOO entry index is valid");
-        Some((
-            offset
-                .checked_sub(self.ooo_base)
-                .expect("session rx OOO offset should not precede base"),
-            entry.len,
-        ))
-    }
-
-    fn first_ooo_at_or_after(&self, offset: u32) -> Option<(u32, PoolIndex)> {
-        if let Some(entry_index) = self.ooo_index.get(&offset).copied() {
-            return Some((offset, entry_index));
-        }
-        if offset == 0 {
-            return self
-                .ooo_index
-                .first()
-                .map(|(key, entry_index)| (*key, *entry_index));
-        }
-        self.ooo_index
-            .successor(&(offset - 1))
-            .map(|(key, entry_index)| (*key, *entry_index))
-    }
-
-    fn remove_ooo_entry(&mut self, offset: u32, entry_index: PoolIndex) -> SessionRxBuffer {
-        let removed = self
-            .ooo_index
-            .remove(&offset)
-            .expect("session rx OOO tree entry should exist");
-        debug_assert_eq!(removed, entry_index);
-        self.ooo_entries
-            .remove(entry_index)
-            .expect("session rx OOO pool entry should exist")
-    }
-
-    fn insert_ooo(
-        &mut self,
-        buffers: &DataPlaneBuffers,
-        mut entry: SessionRxBuffer,
-    ) -> CoreResult<SessionRxEnqueue> {
-        let mut start = self
-            .ooo_base
-            .checked_add(entry.offset)
-            .ok_or_else(|| CoreError::internal("session rx OOO start offset overflow"))?;
-        let mut end = start
-            .checked_add(entry.len)
-            .ok_or_else(|| CoreError::internal("session rx OOO end offset overflow"))?;
-
-        if let Some((_, predecessor_index)) = self
-            .ooo_index
-            .predecessor(&start)
-            .map(|(key, entry_index)| (*key, *entry_index))
-        {
-            let predecessor = self
-                .ooo_entries
-                .get(predecessor_index)
-                .expect("session rx predecessor entry is valid");
-            let predecessor_end = predecessor
-                .offset
-                .checked_add(predecessor.len)
-                .ok_or_else(|| CoreError::internal("session rx predecessor end offset overflow"))?;
-            if predecessor_end >= end {
-                buffers.free_index(entry.index);
-                return Ok(SessionRxEnqueue::default());
-            }
-            if predecessor_end > start {
-                let trim = predecessor_end - start;
-                let mut buffer = buffers.get_buffer_mut(entry.index)?;
-                buffer.advance(
-                    isize::try_from(usize::try_from(trim).map_err(|_| {
-                        CoreError::internal("session rx predecessor trim exceeds usize")
-                    })?)
-                    .map_err(|_| {
-                        CoreError::internal("session rx predecessor trim exceeds isize")
-                    })?,
-                )?;
-                start = predecessor_end;
-                entry.len = entry.len.saturating_sub(trim);
-                entry.offset = start;
-            }
-        }
-
-        end = start
-            .checked_add(entry.len)
-            .ok_or_else(|| CoreError::internal("session rx OOO end offset overflow"))?;
-        if start >= end {
-            buffers.free_index(entry.index);
-            return Ok(SessionRxEnqueue::default());
-        }
-
-        let mut candidate = self.first_ooo_at_or_after(start);
-        while let Some((candidate_offset, candidate_index)) = candidate {
-            if candidate_offset > end {
-                break;
-            }
-            let candidate_entry = self
-                .ooo_entries
-                .get(candidate_index)
-                .expect("session rx OOO candidate entry is valid");
-            let candidate_end = candidate_entry
-                .offset
-                .checked_add(candidate_entry.len)
-                .ok_or_else(|| {
-                    CoreError::internal("session rx OOO candidate end offset overflow")
-                })?;
-            if candidate_offset == start && candidate_end >= end {
-                buffers.free_index(entry.index);
-                return Ok(SessionRxEnqueue::default());
-            }
-            if candidate_end <= end {
-                let removed = self.remove_ooo_entry(candidate_offset, candidate_index);
-                buffers.free_index(removed.index);
-                candidate = self
-                    .ooo_index
-                    .successor(&candidate_offset)
-                    .map(|(key, entry_index)| (*key, *entry_index));
-                continue;
-            }
-            if candidate_offset < end {
-                let trim = end - candidate_offset;
-                let current = self
-                    .ooo_entries
-                    .get_mut(candidate_index)
-                    .expect("session rx OOO candidate entry is valid");
-                let mut buffer = buffers.get_buffer_mut(current.index)?;
-                buffer.advance(
-                    isize::try_from(usize::try_from(trim).map_err(|_| {
-                        CoreError::internal("session rx OOO successor trim exceeds usize")
-                    })?)
-                    .map_err(|_| {
-                        CoreError::internal("session rx OOO successor trim exceeds isize")
-                    })?,
-                )?;
-                current.offset = end;
-                current.len = current.len.saturating_sub(trim);
-                let _ = self
-                    .ooo_index
-                    .remove(&candidate_offset)
-                    .expect("session rx OOO candidate key should exist");
-                self.ooo_index.insert(end, candidate_index);
-            }
-            break;
-        }
-
-        entry.offset = start;
-        let entry_index = self
-            .ooo_entries
-            .insert(entry)
-            .expect("session rx OOO entry pool exhausted");
-        self.ooo_index.insert(start, entry_index);
-        let newest_ooo_start = start
-            .checked_sub(self.ooo_base)
-            .ok_or_else(|| CoreError::internal("session rx OOO start underflow"))?;
-        Ok(SessionRxEnqueue {
-            delivered_len: 0,
-            newest_ooo_start: Some(newest_ooo_start),
-            newest_ooo_len: end - start,
-        })
-    }
-
-    fn insert_head(
-        &mut self,
-        buffers: &DataPlaneBuffers,
-        mut entry: SessionRxBuffer,
-    ) -> CoreResult<SessionRxEnqueue> {
-        let base = self.ooo_base;
-        let mut delivered_len = entry.len;
-        entry.offset = 0;
-        self.delivered.push_back(entry);
-
-        while let Some((candidate_offset, candidate_index)) = self
-            .ooo_index
-            .first()
-            .map(|(key, entry_index)| (*key, *entry_index))
-        {
-            let boundary = base
-                .checked_add(delivered_len)
-                .ok_or_else(|| CoreError::internal("session rx contiguous boundary overflow"))?;
-            if candidate_offset > boundary {
-                break;
-            }
-            let mut candidate = self.remove_ooo_entry(candidate_offset, candidate_index);
-            let candidate_end = candidate.offset.checked_add(candidate.len).ok_or_else(|| {
-                CoreError::internal("session rx OOO candidate end offset overflow")
-            })?;
-            if candidate_end <= boundary {
-                buffers.free_index(candidate.index);
-                continue;
-            }
-            if candidate.offset < boundary {
-                let trim = boundary - candidate.offset;
-                let mut buffer = buffers.get_buffer_mut(candidate.index)?;
-                buffer.advance(
-                    isize::try_from(usize::try_from(trim).map_err(|_| {
-                        CoreError::internal("session rx contiguous trim exceeds usize")
-                    })?)
-                    .map_err(|_| CoreError::internal("session rx contiguous trim exceeds isize"))?,
-                )?;
-                candidate.offset = boundary;
-                candidate.len = candidate.len.saturating_sub(trim);
-            }
-            delivered_len = candidate
-                .offset
-                .checked_add(candidate.len)
-                .and_then(|end| end.checked_sub(base))
-                .ok_or_else(|| CoreError::internal("session rx delivered length overflow"))?;
-            candidate.offset = 0;
-            self.delivered.push_back(candidate);
-        }
-
-        self.ooo_base = base
-            .checked_add(delivered_len)
-            .ok_or_else(|| CoreError::internal("session rx OOO base overflow"))?;
-        let (newest_ooo_start, newest_ooo_len) = self.first_ooo_relative().unwrap_or((0, 0));
-        Ok(SessionRxEnqueue {
-            delivered_len,
-            newest_ooo_start: (newest_ooo_len != 0).then_some(newest_ooo_start),
-            newest_ooo_len,
-        })
-    }
-
-    fn free_all(mut self, buffers: &DataPlaneBuffers) {
-        while let Some(buffer) = self.delivered.pop_front() {
-            buffers.free_index(buffer.index);
-        }
-        while let Some((offset, entry_index)) = self
-            .ooo_index
-            .first()
-            .map(|(key, entry_index)| (*key, *entry_index))
-        {
-            let removed = self.remove_ooo_entry(offset, entry_index);
-            buffers.free_index(removed.index);
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -432,8 +137,6 @@ struct SessionDriverRuntimeCore<St> {
     sessions: WorkerSessionRuntime,
     entries: Pool<St>,
     buffers: DataPlaneBuffers,
-    rx: Pool<SessionRxQueue>,
-    rx_index: FlatHashTable<u64, PoolIndex>,
     pending_closes: SessionReadyQueue,
 }
 
@@ -538,7 +241,7 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
         seg: Seg,
     ) -> Self {
         let tx_evt_q = Arc::new(
-            MsgQueue::<Seg>::new(seg, DEFAULT_SESSION_TX_EVENT_CAPACITY, false)
+            MsgQueue::<Seg>::new(seg, DEFAULT_SESSION_TX_EVENT_CAPACITY)
                 .expect("session tx event queue capacity is valid"),
         );
         let app = SessionAppRuntime::new(DEFAULT_SESSION_POOL_CAPACITY, buffers.clone(), tx_evt_q);
@@ -547,8 +250,7 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
                 sessions: WorkerSessionRuntime::new(worker),
                 entries: Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
                 buffers,
-                rx: Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
-                rx_index: FlatHashTable::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
+
                 pending_closes: SessionReadyQueue::new(),
             }),
             app_state: CachePadded::new(SessionDriverRuntimeAppState {
@@ -610,7 +312,6 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
         with_current_app_worker(self.worker().slot() as usize, |worker| {
             let _ = worker.detach_session(handle);
         });
-        self.release_session_rx(id);
         let removed = self.runtime.entries.remove(id.pool_index())?;
         Some(removed)
     }
@@ -664,16 +365,6 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
         Ok(())
     }
 
-    fn release_session_rx(&mut self, session_id: SessionId) {
-        let Some(index) = self.runtime.rx_index.remove(&session_id.get()) else {
-            return;
-        };
-        let Some(queue) = self.runtime.rx.remove(index) else {
-            return;
-        };
-        queue.free_all(&self.runtime.buffers);
-    }
-
     pub(crate) fn poll_app(&mut self) -> CoreResult<()> {
         self.app_state
             .app
@@ -688,104 +379,35 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
 
     #[inline]
     pub(crate) fn enqueue_rx(
-        &mut self,
+        &self,
         session_id: SessionId,
         index: BufferIndex,
         offset: u32,
         _: bool,
     ) -> CoreResult<SessionRxEnqueue> {
+        let buffers = &self.runtime.buffers;
         if offset == 0 {
-            let wrote =
-                self.app_state
-                    .app
-                    .copy_rx_from_buffer(session_id, &self.runtime.buffers, index)?;
-            if wrote != 0 {
-                self.runtime.buffers.free_index(index);
-                return Ok(SessionRxEnqueue {
-                    delivered_len: wrote as u32,
-                    ..Default::default()
-                });
-            }
+            let wrote = self
+                .app_state
+                .app
+                .copy_rx_from_buffer(session_id, buffers, index)?;
+            buffers.free_index(index);
+            Ok(SessionRxEnqueue {
+                delivered_len: wrote as u32,
+                newest_ooo_start: None,
+                newest_ooo_len: 0,
+            })
+        } else {
+            let (delivered, ooo_start, ooo_len) = self
+                .app_state
+                .app
+                .copy_rx_from_buffer_ooo(session_id, buffers, index, offset)?;
+            Ok(SessionRxEnqueue {
+                delivered_len: delivered,
+                newest_ooo_start: ooo_start,
+                newest_ooo_len: ooo_len,
+            })
         }
-        let key = session_id.get();
-        let runtime = &mut *self.runtime;
-        let buffers = runtime.buffers.clone();
-        let rx_index = match runtime.rx_index.lookup(&key) {
-            Some(index) => index,
-            None => {
-                let index = runtime
-                    .rx
-                    .insert(SessionRxQueue::new())
-                    .expect("session rx queue pool exhausted");
-                runtime.rx_index.insert(key, index);
-                index
-            }
-        };
-        let buffer = buffers.get_buffer(index)?;
-        let len = buffer
-            .current_len()
-            .checked_add(buffer.total_len_not_including_first())
-            .ok_or_else(|| CoreError::internal("session rx chain length overflow"))?;
-        drop(buffer);
-        let len = u32::try_from(len)
-            .map_err(|_| CoreError::internal("session rx buffer length exceeds u32"))?;
-        let entry = SessionRxBuffer {
-            index,
-            offset,
-            len,
-            fin: false,
-        };
-        let queue = runtime
-            .rx
-            .get_mut(rx_index)
-            .ok_or_else(|| CoreError::internal("session rx queue index is invalid"))?;
-        if offset == 0 {
-            return queue.insert_head(&buffers, entry);
-        }
-        queue.insert_ooo(&buffers, entry)
-    }
-
-    pub(crate) fn flush_session_rx(&mut self, session_id: SessionId) -> CoreResult<()> {
-        let key = session_id.get();
-        let Some(index) = self.runtime.rx_index.lookup(&key) else {
-            return Ok(());
-        };
-        let buffers = self.runtime.buffers.clone();
-        loop {
-            let current = {
-                let queue = self
-                    .runtime
-                    .rx
-                    .get_mut(index)
-                    .ok_or_else(|| CoreError::internal("session rx queue index is invalid"))?;
-                queue.front().copied()
-            };
-            let Some(current) = current else {
-                break;
-            };
-            if current.offset != 0 {
-                break;
-            }
-            let consumed =
-                self.app_state
-                    .app
-                    .enqueue_rx(session_id, buffers.clone(), current.index)?;
-            if !consumed {
-                break;
-            }
-            let queue = self
-                .runtime
-                .rx
-                .get_mut(index)
-                .ok_or_else(|| CoreError::internal("session rx queue index is invalid"))?;
-            let _ = queue
-                .pop_front()
-                .ok_or_else(|| CoreError::internal("session rx buffer is missing"))?;
-            if queue.is_empty() {
-                break;
-            }
-        }
-        Ok(())
     }
 
     pub fn poll_once_for_ticks(&mut self, timer_ticks: u32) -> CoreResult<SessionQueueStep> {
@@ -1548,227 +1170,6 @@ mod tests {
             .expect("second poll");
         assert_eq!(second.expired_timers, 1);
         assert_next_pending_timer(&mut runtime, session_id, timer_id);
-    }
-
-    #[test]
-    fn session_rx_queue_inserts_future_segments_by_offset_order() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
-        let buffers = runtime.buffers();
-        let mut driver = SessionDriverRuntime::<FakeTxProtocol, Local>::new(
-            DataWorkerId::new(0),
-            buffers.clone(),
-        );
-        let session_id = driver.insert_session(FakeTxProtocol::default());
-
-        let later = buffers.alloc_index().expect("later buffer");
-        buffers.append(later, b"ef").expect("later payload");
-        let later_enqueue = driver
-            .enqueue_rx(session_id, later, 4, false)
-            .expect("enqueue later future");
-        assert_eq!(later_enqueue.newest_ooo_start, Some(4));
-        assert_eq!(later_enqueue.newest_ooo_len, 2);
-
-        let earlier = buffers.alloc_index().expect("earlier buffer");
-        buffers.append(earlier, b"cd").expect("earlier payload");
-        let earlier_enqueue = driver
-            .enqueue_rx(session_id, earlier, 2, false)
-            .expect("enqueue earlier future");
-        assert_eq!(earlier_enqueue.newest_ooo_start, Some(2));
-        assert_eq!(earlier_enqueue.newest_ooo_len, 2);
-
-        let rx_index = driver
-            .runtime
-            .rx_index
-            .lookup(&session_id.get())
-            .expect("rx queue present");
-        let queue = driver.runtime.rx.get(rx_index).expect("rx queue");
-        let ooo_offsets: std::vec::Vec<_> =
-            queue.ooo_index.iter().map(|(offset, _)| *offset).collect();
-        assert_eq!(ooo_offsets, vec![2, 4]);
-    }
-
-    #[test]
-    fn session_rx_queue_duplicate_covered_segment_is_discarded() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
-        let buffers = runtime.buffers();
-        let mut driver = SessionDriverRuntime::<FakeTxProtocol, Local>::new(
-            DataWorkerId::new(0),
-            buffers.clone(),
-        );
-        let session_id = driver.insert_session(FakeTxProtocol::default());
-
-        let original = buffers.alloc_index().expect("original buffer");
-        buffers.append(original, b"cdef").expect("original payload");
-        let original_enqueue = driver
-            .enqueue_rx(session_id, original, 2, false)
-            .expect("enqueue original");
-        assert_eq!(original_enqueue.newest_ooo_start, Some(2));
-        assert_eq!(original_enqueue.newest_ooo_len, 4);
-
-        let duplicate = buffers.alloc_index().expect("duplicate buffer");
-        buffers.append(duplicate, b"de").expect("duplicate payload");
-        let duplicate_enqueue = driver
-            .enqueue_rx(session_id, duplicate, 3, false)
-            .expect("enqueue covered duplicate");
-        assert_eq!(duplicate_enqueue, SessionRxEnqueue::default());
-
-        let rx_index = driver
-            .runtime
-            .rx_index
-            .lookup(&session_id.get())
-            .expect("rx queue present");
-        let queue = driver.runtime.rx.get(rx_index).expect("rx queue");
-        assert_eq!(queue.delivered.len(), 0);
-        assert_eq!(queue.ooo_entries.len(), 1);
-        assert_eq!(queue.first_ooo_relative(), Some((2, 4)));
-    }
-
-    #[test]
-    fn session_rx_queue_overlap_trims_new_segment_against_predecessor() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
-        let buffers = runtime.buffers();
-        let mut driver = SessionDriverRuntime::<FakeTxProtocol, Local>::new(
-            DataWorkerId::new(0),
-            buffers.clone(),
-        );
-        let session_id = driver.insert_session(FakeTxProtocol::default());
-
-        let first = buffers.alloc_index().expect("first buffer");
-        buffers.append(first, b"cdef").expect("first payload");
-        let first_enqueue = driver
-            .enqueue_rx(session_id, first, 2, false)
-            .expect("enqueue first future");
-        assert_eq!(first_enqueue.newest_ooo_start, Some(2));
-        assert_eq!(first_enqueue.newest_ooo_len, 4);
-
-        let overlap = buffers.alloc_index().expect("overlap buffer");
-        buffers.append(overlap, b"efghij").expect("overlap payload");
-        let overlap_enqueue = driver
-            .enqueue_rx(session_id, overlap, 4, false)
-            .expect("enqueue overlap future");
-        assert_eq!(overlap_enqueue.newest_ooo_start, Some(6));
-        assert_eq!(overlap_enqueue.newest_ooo_len, 4);
-
-        let rx_index = driver
-            .runtime
-            .rx_index
-            .lookup(&session_id.get())
-            .expect("rx queue present");
-        let queue = driver.runtime.rx.get(rx_index).expect("rx queue");
-        let ooo_offsets: std::vec::Vec<_> =
-            queue.ooo_index.iter().map(|(offset, _)| *offset).collect();
-        assert_eq!(ooo_offsets, vec![2, 6]);
-
-        let overlap_index = *queue
-            .ooo_index
-            .get(&6)
-            .expect("trimmed overlap entry should be reinserted at new offset");
-        let overlap_entry = queue
-            .ooo_entries
-            .get(overlap_index)
-            .expect("trimmed overlap entry");
-        assert_eq!(overlap_entry.offset, 6);
-        assert_eq!(overlap_entry.len, 4);
-        assert_eq!(
-            chain_bytes(buffers, overlap_entry.index).expect("trimmed overlap payload"),
-            b"ghij"
-        );
-    }
-
-    #[test]
-    fn session_rx_queue_overlap_trims_existing_successor_and_rekeys_tree() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
-        let buffers = runtime.buffers();
-        let mut driver = SessionDriverRuntime::<FakeTxProtocol, Local>::new(
-            DataWorkerId::new(0),
-            buffers.clone(),
-        );
-        let session_id = driver.insert_session(FakeTxProtocol::default());
-
-        let successor = buffers.alloc_index().expect("successor buffer");
-        buffers
-            .append(successor, b"ghij")
-            .expect("successor payload");
-        let successor_enqueue = driver
-            .enqueue_rx(session_id, successor, 6, false)
-            .expect("enqueue successor future");
-        assert_eq!(successor_enqueue.newest_ooo_start, Some(6));
-        assert_eq!(successor_enqueue.newest_ooo_len, 4);
-
-        let overlap = buffers.alloc_index().expect("overlap buffer");
-        buffers.append(overlap, b"cdefgh").expect("overlap payload");
-        let overlap_enqueue = driver
-            .enqueue_rx(session_id, overlap, 2, false)
-            .expect("enqueue overlap future");
-        assert_eq!(overlap_enqueue.newest_ooo_start, Some(2));
-        assert_eq!(overlap_enqueue.newest_ooo_len, 6);
-
-        let rx_index = driver
-            .runtime
-            .rx_index
-            .lookup(&session_id.get())
-            .expect("rx queue present");
-        let queue = driver.runtime.rx.get(rx_index).expect("rx queue");
-        let ooo_offsets: std::vec::Vec<_> =
-            queue.ooo_index.iter().map(|(offset, _)| *offset).collect();
-        assert_eq!(ooo_offsets, vec![2, 8]);
-
-        let successor_index = *queue
-            .ooo_index
-            .get(&8)
-            .expect("trimmed successor should be rekeyed");
-        let successor_entry = queue
-            .ooo_entries
-            .get(successor_index)
-            .expect("trimmed successor entry");
-        assert_eq!(successor_entry.offset, 8);
-        assert_eq!(successor_entry.len, 2);
-        assert_eq!(
-            chain_bytes(buffers, successor_entry.index).expect("trimmed successor payload"),
-            b"ij"
-        );
-    }
-
-    #[test]
-    fn session_rx_queue_gap_close_promotes_contiguous_ooo_segments() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
-        let buffers = runtime.buffers();
-        let mut driver = SessionDriverRuntime::<FakeTxProtocol, Local>::new(
-            DataWorkerId::new(0),
-            buffers.clone(),
-        );
-        let session_id = driver.insert_session(FakeTxProtocol::default());
-
-        let future = buffers.alloc_index().expect("future buffer");
-        buffers.append(future, b"late").expect("future payload");
-        let future_enqueue = driver
-            .enqueue_rx(session_id, future, 4, false)
-            .expect("enqueue future");
-        assert_eq!(future_enqueue.newest_ooo_start, Some(4));
-        assert_eq!(future_enqueue.newest_ooo_len, 4);
-
-        let gap_closer = buffers.alloc_index().expect("gap closer buffer");
-        buffers
-            .append(gap_closer, b"gap-")
-            .expect("gap closer payload");
-        let gap_close_enqueue = driver
-            .enqueue_rx(session_id, gap_closer, 0, false)
-            .expect("enqueue gap closer");
-        assert_eq!(gap_close_enqueue.delivered_len, 8);
-        assert_eq!(gap_close_enqueue.newest_ooo_start, None);
-        assert_eq!(gap_close_enqueue.newest_ooo_len, 0);
-
-        let rx_index = driver
-            .runtime
-            .rx_index
-            .lookup(&session_id.get())
-            .expect("rx queue present");
-        let queue = driver.runtime.rx.get(rx_index).expect("rx queue");
-        assert_eq!(queue.delivered.len(), 2);
-        assert_eq!(queue.ooo_entries.len(), 0);
-        assert_eq!(queue.ooo_index.len(), 0);
-        assert_eq!(queue.delivered.get(0).expect("head slot").len, 4);
-        assert_eq!(queue.delivered.get(1).expect("promoted slot").len, 4);
     }
 
     #[test]

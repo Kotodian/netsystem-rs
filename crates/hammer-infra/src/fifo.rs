@@ -1,6 +1,9 @@
+use std::cell::UnsafeCell;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use crate::pool::{Index as PoolIndex, Pool};
+use crate::rbtree::RbTree;
 use crate::segment::{Local, Segment};
 
 #[repr(C)]
@@ -8,6 +11,7 @@ struct Chunk {
     start_byte: u32,
     length: u32,
     next: AtomicU64,
+    refcount: AtomicU32,
 }
 
 const CHUNK_HEADER_SIZE: usize = std::mem::size_of::<Chunk>();
@@ -37,11 +41,34 @@ pub enum FifoError {
     InvalidCapacity,
 }
 
+pub struct OooResult {
+    pub delivered: u32,
+}
+
+struct OooSegment {
+    offset: u32,
+    len: u32,
+}
+
+struct OooBookkeeping {
+    base: u32,
+    entries: Pool<OooSegment>,
+    index: RbTree<u32, PoolIndex>,
+}
+
+impl OooBookkeeping {
+    fn remove_ooo_entry(&mut self, offset: u32) -> Option<OooSegment> {
+        let idx = self.index.remove(&offset)?;
+        self.entries.remove(idx)
+    }
+}
+
 pub struct Fifo<S: Segment> {
     seg: S,
     base: *mut u8,
     hdr: *mut FifoHeader,
     hdr_off: u64,
+    ooo: UnsafeCell<Option<Box<OooBookkeeping>>>,
 }
 
 unsafe impl<S: Segment> Send for Fifo<S> {}
@@ -86,6 +113,7 @@ impl<S: Segment> Fifo<S> {
                     start_byte: 0,
                     length: 0,
                     next: AtomicU64::new(0),
+                    refcount: AtomicU32::new(1),
                 },
             );
         }
@@ -94,6 +122,7 @@ impl<S: Segment> Fifo<S> {
             base,
             hdr,
             hdr_off,
+            ooo: UnsafeCell::new(None),
         })
     }
 
@@ -138,6 +167,7 @@ impl<S: Segment> Fifo<S> {
                     start_byte: 0,
                     length: 0,
                     next: AtomicU64::new(0),
+                    refcount: AtomicU32::new(1),
                 },
             );
         }
@@ -146,6 +176,7 @@ impl<S: Segment> Fifo<S> {
             base,
             hdr,
             hdr_off: hdr_offset,
+            ooo: UnsafeCell::new(None),
         })
     }
 
@@ -185,6 +216,7 @@ impl<S: Segment> Fifo<S> {
                         start_byte: 0,
                         length: 0,
                         next: AtomicU64::new(0),
+                        refcount: AtomicU32::new(1),
                     },
                 );
                 (*hdr).start_chunk = new_off;
@@ -221,6 +253,7 @@ impl<S: Segment> Fifo<S> {
                         start_byte: new_start_byte,
                         length: 0,
                         next: AtomicU64::new(0),
+                        refcount: AtomicU32::new(1),
                     },
                 );
                 chunk.next.store(new_off, Ordering::Release);
@@ -349,8 +382,11 @@ impl<S: Segment> Fifo<S> {
                 let chunk = &*(self.base.add(chunk_off as usize) as *mut Chunk);
                 if new_head >= chunk.start_byte + chunk.length {
                     let next_off = chunk.next.load(Ordering::Acquire);
-                    self.seg
-                        .free(chunk_off, CHUNK_HEADER_SIZE + (*hdr).min_alloc as usize);
+                    let prev = chunk.refcount.fetch_sub(1, Ordering::Relaxed);
+                    if prev == 1 {
+                        self.seg
+                            .free(chunk_off, CHUNK_HEADER_SIZE + (*hdr).min_alloc as usize);
+                    }
                     (*hdr).head_chunk = next_off;
                     chunk_off = next_off;
                     if next_off == 0 {
@@ -437,6 +473,7 @@ impl<S: Segment> Fifo<S> {
                             start_byte,
                             length: 0,
                             next: AtomicU64::new(0),
+                            refcount: AtomicU32::new(1),
                         },
                     );
                     chunk_off = new_off;
@@ -561,14 +598,47 @@ impl<S: Segment> Fifo<S> {
         }
     }
 
+    #[inline]
+    pub fn deq_threshold(&self) -> u32 {
+        unsafe { (*self.hdr).deq_thresh.load(Ordering::Relaxed) }
+    }
+
+    #[inline]
+    pub fn has_deq_notification(&self) -> bool {
+        unsafe { (*self.hdr).has_deq_ntf.load(Ordering::Acquire) != 0 }
+    }
+
+    #[inline]
+    pub fn clear_deq_notification_flag(&self) {
+        unsafe {
+            (*self.hdr).has_deq_ntf.store(0, Ordering::Release);
+        }
+    }
+
     pub fn clear(&self) {
         let hdr = self.hdr;
         unsafe {
+            let mut chunk_off = (*hdr).head_chunk;
+            while chunk_off != 0 {
+                let chunk = &*(self.base.add(chunk_off as usize) as *mut Chunk);
+                let next_off = chunk.next.load(Ordering::Acquire);
+                let prev = chunk.refcount.fetch_sub(1, Ordering::Relaxed);
+                if prev == 1 {
+                    self.seg
+                        .free(chunk_off, CHUNK_HEADER_SIZE + (*hdr).min_alloc as usize);
+                }
+                chunk_off = next_off;
+            }
             (*hdr).head.store(0, Ordering::Relaxed);
             (*hdr).tail.store(0, Ordering::Relaxed);
+            (*hdr).start_chunk = 0;
+            (*hdr).end_chunk = 0;
+            (*hdr).head_chunk = 0;
+            (*hdr).tail_chunk = 0;
+            (*hdr).has_event.store(0, Ordering::Relaxed);
             (*hdr).want_ntf.store(0, Ordering::Relaxed);
             (*hdr).want_deq_ntf.store(0, Ordering::Relaxed);
-            (*hdr).has_event.store(0, Ordering::Relaxed);
+            (*hdr).has_deq_ntf.store(0, Ordering::Relaxed);
         }
     }
 
@@ -595,6 +665,156 @@ impl<S: Segment> Fifo<S> {
             base,
             hdr,
             hdr_off: hdr_offset,
+            ooo: UnsafeCell::new(None),
+        }
+    }
+}
+
+impl<S: Segment> Fifo<S> {
+    pub fn enable_ooo(&mut self) {
+        *self.ooo.get_mut() = Some(Box::new(OooBookkeeping {
+            base: 0,
+            entries: Pool::with_capacity(8),
+            index: RbTree::with_capacity(8),
+        }));
+    }
+
+    pub fn enqueue_ooo(&self, offset: u32, src: &[u8]) -> Result<OooResult, ()> {
+        let ooo = unsafe { &mut *self.ooo.get() };
+        let bk = ooo.as_mut().ok_or(())?;
+
+        let abs_pos = bk.base.wrapping_add(offset);
+        let written = self.enqueue_at(abs_pos, src);
+        if written == 0 {
+            return Ok(OooResult { delivered: 0 });
+        }
+
+        let seg_end_full = abs_pos.wrapping_add(written as u32);
+        let mut seg_start = abs_pos;
+
+        // Predecessor check
+        let pred_info = bk
+            .index
+            .predecessor(&seg_start)
+            .and_then(|(_, &idx)| bk.entries.get(idx))
+            .map(|s| {
+                let end = s.offset.wrapping_add(s.len);
+                (end, end >= seg_end_full, end > seg_start)
+            });
+
+        if let Some((pred_end, skip, overlap)) = pred_info {
+            if skip {
+                return Ok(OooResult { delivered: 0 });
+            }
+            if overlap {
+                seg_start = pred_end;
+            }
+        }
+
+        if seg_start >= seg_end_full {
+            return Ok(OooResult { delivered: 0 });
+        }
+
+        // Successor walk: remove or trim overlapping segments
+        loop {
+            let succ_info =
+                bk.index
+                    .successor(&(seg_start.wrapping_sub(1)))
+                    .and_then(|(k, &idx)| {
+                        if *k < seg_end_full {
+                            bk.entries
+                                .get(idx)
+                                .map(|s| (*k, s.offset.wrapping_add(s.len)))
+                        } else {
+                            None
+                        }
+                    });
+
+            let (succ_key, succ_end) = match succ_info {
+                Some(info) => info,
+                None => break,
+            };
+
+            if succ_end <= seg_end_full {
+                bk.remove_ooo_entry(succ_key);
+            } else {
+                bk.remove_ooo_entry(succ_key);
+                let new_key = seg_end_full;
+                let new_len = succ_end.wrapping_sub(new_key);
+                if new_len > 0 {
+                    let new_idx = bk
+                        .entries
+                        .insert(OooSegment {
+                            offset: new_key,
+                            len: new_len,
+                        })
+                        .expect("ooo pool exhausted");
+                    bk.index.insert(new_key, new_idx);
+                }
+                break;
+            }
+        }
+
+        // Insert our segment
+        let seg_len = seg_end_full.wrapping_sub(seg_start);
+        let idx = bk
+            .entries
+            .insert(OooSegment {
+                offset: seg_start,
+                len: seg_len,
+            })
+            .expect("ooo pool exhausted");
+        bk.index.insert(seg_start, idx);
+
+        // Contiguous check
+        let delivered = if seg_start == bk.base {
+            Self::promote_contiguous_inner(bk)
+        } else {
+            0
+        };
+
+        Ok(OooResult { delivered })
+    }
+
+    fn promote_contiguous_inner(bk: &mut OooBookkeeping) -> u32 {
+        let mut delivered: u32 = 0;
+        loop {
+            let first = bk.index.first().map(|(&k, &v)| (k, v));
+            match first {
+                Some((first_key, first_idx)) if first_key == bk.base => {
+                    let seg = bk.entries.remove(first_idx).expect("ooo entry exists");
+                    bk.index.remove(&first_key);
+                    bk.base = bk.base.wrapping_add(seg.len);
+                    delivered = delivered.wrapping_add(seg.len);
+                }
+                _ => break,
+            }
+        }
+        delivered
+    }
+
+    pub fn promote_contiguous(&self) -> u32 {
+        let ooo = unsafe { &mut *self.ooo.get() };
+        match ooo.as_mut() {
+            Some(bk) => Self::promote_contiguous_inner(bk),
+            None => 0,
+        }
+    }
+
+    pub fn ooo_head(&self) -> Option<(u32, u32)> {
+        let ooo = unsafe { &*self.ooo.get() };
+        let bk = ooo.as_ref()?;
+        let (&first_key, &first_idx) = bk.index.first()?;
+        let seg = bk.entries.get(first_idx)?;
+        let relative = first_key.wrapping_sub(bk.base);
+        Some((relative, seg.len))
+    }
+
+    pub fn ooo_enqueued(&self) -> usize {
+        let ooo = unsafe { &*self.ooo.get() };
+        match ooo.as_ref() {
+            Some(bk) => bk.entries.len(),
+            None => 0,
         }
     }
 }
