@@ -224,6 +224,16 @@ impl<S: Segment> MsgQueue<S> {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        // SAFETY: `self.hdr` points to a valid `MsgQueueHeader` in shared
+        // memory for the lifetime of `self`, guaranteed by `Segment::map`.
+        let head = unsafe { (*self.hdr).head.load(Ordering::Acquire) };
+        // SAFETY: Same invariant as above; `head` and `tail` share the same
+        // header allocation and are both valid for the lifetime of `self`.
+        let tail = unsafe { (*self.hdr).tail.load(Ordering::Acquire) };
+        head == tail
+    }
+
     pub fn read_fd(&self) -> Option<RawFd> {
         self.signal_read
     }

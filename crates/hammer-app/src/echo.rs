@@ -3,22 +3,23 @@ use hammer_infra::segment::Local;
 
 use crate::AppSession;
 
-pub async fn echo_once(session: &AppSession<Local>, scratch: &mut [u8]) -> HammerResult<usize> {
-    let read = session.recv(scratch).await;
+pub fn echo_once(session: &AppSession<Local>, scratch: &mut [u8]) -> HammerResult<usize> {
+    let read = session.recv_bytes(scratch);
     if read == 0 {
         return Ok(0);
     }
-    session.send_all(&scratch[..read]).await
+    session.consume_rx(read);
+    session.send_bytes(&scratch[..read])
 }
 
-pub async fn run_echo_loop(
+pub fn run_echo_loop(
     session: &AppSession<Local>,
     scratch: &mut [u8],
     iterations: usize,
 ) -> HammerResult<usize> {
     let mut total = 0;
     for _ in 0..iterations {
-        let wrote = echo_once(session, scratch).await?;
+        let wrote = echo_once(session, scratch)?;
         if wrote == 0 {
             break;
         }

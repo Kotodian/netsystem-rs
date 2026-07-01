@@ -118,7 +118,7 @@ impl RemoteAppSession {
                     break;
                 }
             }
-            if self.session.evt_q().dequeue().is_some() {
+            if !self.session.evt_q().is_empty() {
                 return;
             }
         }
