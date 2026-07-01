@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::fmt;
 use std::sync::Arc;
+use std::task::Waker;
 
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_infra::map::FlatHashTable;
@@ -68,6 +69,26 @@ impl<S: Segment> AppWorker<S> {
     /// / `evt_readable` without holding a borrow on the worker.
     pub fn notify_entry(&self, handle: SessionHandle) -> Option<Arc<SessionNotify>> {
         self.notifies.lookup(&handle.raw())
+    }
+
+    pub fn wake_rx(&self, handle: SessionHandle) {
+        if let Some(notify) = self.notify_entry(handle) {
+            notify.rx_readable.notify_waiters();
+            notify.evt_readable.notify_waiters();
+        }
+    }
+
+    pub fn wake_tx(&self, handle: SessionHandle) {
+        if let Some(notify) = self.notify_entry(handle) {
+            notify.tx_writable.notify_waiters();
+            notify.evt_readable.notify_waiters();
+        }
+    }
+
+    pub fn wake_evt(&self, handle: SessionHandle) {
+        if let Some(notify) = self.notify_entry(handle) {
+            notify.evt_readable.notify_waiters();
+        }
     }
 
     /// Number of sessions currently attached.
@@ -168,10 +189,22 @@ impl AppWorker<Local> {
                 session.clear_tx_notification();
                 continue;
             }
-            if let Some(ref n) = notify {
-                n.tx_writable.notified().await;
+            let notified = notify.as_ref().map(|n| n.tx_writable.notified());
+            match notified {
+                Some(fut) => {
+                    tokio::pin!(fut);
+                    let _ = fut
+                        .as_mut()
+                        .poll(&mut std::task::Context::from_waker(Waker::noop()));
+                    if session.tx_fifo().max_enqueue() != 0 {
+                        session.clear_tx_notification();
+                        continue;
+                    }
+                    fut.await;
+                    session.clear_tx_notification();
+                }
+                None => return Ok(written),
             }
-            session.clear_tx_notification();
         }
         Ok(written)
     }
@@ -193,11 +226,22 @@ impl AppWorker<Local> {
                 session.clear_rx_notification();
                 continue;
             }
-            match notify {
-                Some(ref n) => n.rx_readable.notified().await,
+            let notified = notify.as_ref().map(|n| n.rx_readable.notified());
+            match notified {
+                Some(fut) => {
+                    tokio::pin!(fut);
+                    let _ = fut
+                        .as_mut()
+                        .poll(&mut std::task::Context::from_waker(Waker::noop()));
+                    if session.rx_fifo().max_dequeue() != 0 {
+                        session.clear_rx_notification();
+                        continue;
+                    }
+                    fut.await;
+                    session.clear_rx_notification();
+                }
                 None => return 0,
             }
-            session.clear_rx_notification();
         }
     }
 
@@ -209,8 +253,18 @@ impl AppWorker<Local> {
             if let Some(evt) = session.evt_q().dequeue() {
                 return Some(evt);
             }
-            match notify {
-                Some(ref n) => n.evt_readable.notified().await,
+            let notified = notify.as_ref().map(|n| n.evt_readable.notified());
+            match notified {
+                Some(fut) => {
+                    tokio::pin!(fut);
+                    let _ = fut
+                        .as_mut()
+                        .poll(&mut std::task::Context::from_waker(Waker::noop()));
+                    if session.evt_q().dequeue().is_some() {
+                        continue;
+                    }
+                    fut.await;
+                }
                 None => return None,
             }
         }

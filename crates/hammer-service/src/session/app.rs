@@ -72,18 +72,28 @@ impl<S: Segment> SessionAppRuntime<S> {
         let Some(session) = self.sessions.lookup(&session_id.get()) else {
             return Ok(());
         };
+        let handle = session.session_handle();
         session
             .push_event(SessionEvtType::Connect)
-            .map_err(CoreError::from)
+            .map_err(CoreError::from)?;
+        hammer_runtime::app::with_current_app_worker(handle.worker_index() as usize, |worker| {
+            worker.wake_evt(handle);
+        });
+        Ok(())
     }
 
     pub(crate) fn closed(&self, session_id: SessionId) -> CoreResult<()> {
         let Some(session) = self.sessions.lookup(&session_id.get()) else {
             return Ok(());
         };
+        let handle = session.session_handle();
         session
             .push_event(SessionEvtType::Close)
-            .map_err(CoreError::from)
+            .map_err(CoreError::from)?;
+        hammer_runtime::app::with_current_app_worker(handle.worker_index() as usize, |worker| {
+            worker.wake_evt(handle);
+        });
+        Ok(())
     }
 
     pub(crate) fn release_pending_send_bytes(
@@ -94,7 +104,13 @@ impl<S: Segment> SessionAppRuntime<S> {
         let Some(session) = self.sessions.lookup(&session_id.get()) else {
             return Ok(false);
         };
+        let handle = session.session_handle();
         let dropped = session.drop_tx_acked(len).map_err(CoreError::from)?;
+        if dropped != 0 {
+            hammer_runtime::app::with_current_app_worker(handle.worker_index() as usize, |worker| {
+                worker.wake_tx(handle);
+            });
+        }
         Ok(dropped != 0)
     }
 
@@ -152,19 +168,34 @@ impl<S: Segment> SessionAppRuntime<S> {
         buffers: &DataPlaneBuffers,
         index: BufferIndex,
     ) -> CoreResult<usize> {
-        let Some(session) = self.sessions.lookup(&session_id.get()) else {
-            return Ok(0);
-        };
-        let mut total = 0usize;
-        let mut wrote = 0usize;
-        for buffer in buffers.chain(index) {
-            let buffer = buffer?;
-            let chunk = buffer.current();
-            total += chunk.len();
-            if wrote == total - chunk.len() {
-                wrote += session.enqueue_rx(chunk).map_err(CoreError::from)?;
+        let handle = self.sessions.lookup(&session_id.get()).map(|s| s.session_handle());
+        let wrote = match handle {
+            Some(h) => {
+                let Some(session) = self.sessions.lookup(&session_id.get()) else {
+                    return Ok(0);
+                };
+                let mut total = 0usize;
+                let mut wrote = 0usize;
+                for buffer in buffers.chain(index) {
+                    let buffer = buffer?;
+                    let chunk = buffer.current();
+                    total += chunk.len();
+                    if wrote == total - chunk.len() {
+                        wrote += session.enqueue_rx(chunk).map_err(CoreError::from)?;
+                    }
+                }
+                if wrote > 0 {
+                    hammer_runtime::app::with_current_app_worker(
+                        h.worker_index() as usize,
+                        |worker| {
+                            worker.wake_rx(h);
+                        },
+                    );
+                }
+                wrote
             }
-        }
+            None => 0,
+        };
         Ok(wrote)
     }
 
