@@ -99,6 +99,8 @@ impl Segment for Local {
 unsafe impl Send for Local {}
 unsafe impl Sync for Local {}
 
+static SVM_DEFAULT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 pub struct Svm {
     inner: Arc<SvmInner>,
 }
@@ -181,6 +183,24 @@ impl Svm {
                 owned,
             }),
         })
+    }
+}
+
+impl Default for Svm {
+    fn default() -> Self {
+        let pid = std::process::id();
+        let counter = SVM_DEFAULT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let name = format!("hammer-{pid}-{counter}");
+        let size = 256 * 1024 * 1024;
+        Self::create(&name, size).unwrap_or_else(|e| {
+            panic!("Svm::default: failed to create shared memory segment: {e}")
+        })
+    }
+}
+
+impl Svm {
+    pub fn size(&self) -> usize {
+        self.inner.size
     }
 }
 
@@ -324,6 +344,16 @@ mod tests {
         seg.free(off1, 4096);
         let off2 = seg.alloc(4096, 64);
         assert_eq!(off1, off2);
+    }
+
+    #[test]
+    fn svm_default_creates_valid_segment() {
+        let seg = Svm::default();
+        assert!(seg.size() > 0);
+        assert!(seg.fd().is_some());
+        let off = seg.alloc(128, 64);
+        assert_eq!(off % 64, 0);
+        assert!((off as usize) < seg.size());
     }
 
     #[test]
