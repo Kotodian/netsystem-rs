@@ -70,3 +70,37 @@ fn session_app_runtime_local_has_static_dispatch() {
         "SessionAppRuntime must have seg field"
     );
 }
+
+#[test]
+fn insert_session_with_id_is_generic_over_segment() {
+    let runtime_source = include_str!("../src/session/runtime.rs");
+
+    let fn_pos = runtime_source
+        .find("fn insert_session_with_id")
+        .expect("insert_session_with_id must be defined");
+    let preceding = &runtime_source[..fn_pos];
+    let last_impl = preceding
+        .rfind("impl<")
+        .expect("insert_session_with_id must live inside an impl block");
+    let impl_block = &preceding[last_impl..];
+    assert!(
+        impl_block.contains("Seg: Segment") || impl_block.contains("Seg,"),
+        "insert_session_with_id must be in a generic Seg impl block, not a Local-only block; got impl header: {impl_block:?}"
+    );
+    assert!(
+        runtime_source.contains("create_app_session"),
+        "insert_session_with_id must call SessionAppRuntime::create_app_session"
+    );
+    assert!(
+        !runtime_source.contains("Box<dyn"),
+        "SessionDriverRuntime must not use Box<dyn>"
+    );
+    assert!(
+        !runtime_source.contains("SessionBackendOps"),
+        "SessionDriverRuntime must not reference SessionBackendOps trait"
+    );
+    assert!(
+        runtime_source.contains("new_svm"),
+        "Svm path needs a new_svm constructor"
+    );
+}

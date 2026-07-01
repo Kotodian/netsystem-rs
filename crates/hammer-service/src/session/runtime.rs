@@ -10,10 +10,11 @@ use hammer_infra::fifo_queue::FifoQueue;
 use hammer_infra::msg_queue::MsgQueue;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 
-use hammer_infra::segment::{Local, Segment};
+use hammer_infra::segment::{Local, Segment, Svm};
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
 use hammer_runtime::app::{AppContext, AppSessionConfig, SessionHandle, with_current_app_worker};
 
+use crate::session::app::SessionAppRuntimeCreate;
 use crate::session::protocol::SessionQueueControlContext;
 use crate::session::{
     SessionAppRuntime, SessionId, SessionQueueHandle, SessionQueueNext, SessionReadyQueue,
@@ -144,7 +145,8 @@ struct SessionDriverRuntimeCore<St> {
 
 struct SessionDriverRuntimeAppState<Seg: Segment> {
     app: SessionAppRuntime<Seg>,
-    app_context: Option<AppContext<Seg>>,
+    #[allow(dead_code)]
+    app_context: Option<AppContext<Local>>,
     app_session_config: AppSessionConfig,
 }
 
@@ -228,29 +230,23 @@ where
 
 impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
     #[inline]
-    pub fn new(worker: DataWorkerId, buffers: DataPlaneBuffers) -> Self
-    where
-        Seg: Default,
-    {
-        Self::with_app_session_config(worker, buffers, AppSessionConfig::default(), Seg::default())
-    }
-
-    #[inline]
     pub(crate) fn with_app_session_config(
         worker: DataWorkerId,
         buffers: DataPlaneBuffers,
         app_session_config: AppSessionConfig,
         seg: Seg,
+        worker_index: usize,
     ) -> Self {
         let tx_evt_q = Arc::new(
             MsgQueue::<Seg>::new(seg.clone(), DEFAULT_SESSION_TX_EVENT_CAPACITY)
-                .expect("session tx event queue capacity is valid"),
+                .map_err(|e| CoreError::internal(format!("tx_evt_q: {e:?}")))
+                .expect("tx_evt_q allocation"),
         );
         let app = SessionAppRuntime::new(
             DEFAULT_SESSION_POOL_CAPACITY,
             buffers.clone(),
             tx_evt_q,
-            worker.slot(),
+            worker_index,
             seg,
         );
         Self {
@@ -317,7 +313,7 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
         self.app_state.app.free_pending_send(id);
         let _ = self.app_state.app.detach_session(id);
         let handle = SessionHandle::new(id.pool_index().slot(), self.worker().slot() as u32);
-        with_current_app_worker(self.worker().slot() as usize, |worker| {
+        with_current_app_worker(self.worker().slot(), |worker| {
             let _ = worker.detach_session(handle);
         });
         let removed = self.runtime.entries.remove(id.pool_index())?;
@@ -440,7 +436,49 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
     }
 }
 
+impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
+    #[inline]
+    pub(crate) fn insert_session_with_id<F>(&mut self, f: F) -> CoreResult<SessionId>
+    where
+        F: SessionStateFactory<St>,
+        SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
+    {
+        let index = self
+            .runtime
+            .entries
+            .insert_with(|index| f.build(SessionId::from(index)))
+            .ok_or_else(|| CoreError::internal("session pool capacity exhausted"))?;
+        let session_id = SessionId::from(index);
+        let handle =
+            SessionHandle::new(session_id.pool_index().slot(), self.worker().slot() as u32);
+        let app_session = match self.app_state.app.create_app_session(
+            handle,
+            self.app_state.app_session_config,
+            self.app_state.app.tx_evt_q().clone(),
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                let _ = self.runtime.entries.remove(index);
+                return Err(error);
+            }
+        };
+        self.app_state.app.attach_session(session_id, app_session);
+        Ok(session_id)
+    }
+}
+
 impl<St> SessionDriverRuntime<St, Local> {
+    #[inline]
+    pub fn new(worker: DataWorkerId, buffers: DataPlaneBuffers) -> Self {
+        Self::with_app_session_config(
+            worker,
+            buffers,
+            AppSessionConfig::default(),
+            Local::default(),
+            worker.slot(),
+        )
+    }
+
     #[inline]
     pub(crate) fn with_app_context(
         worker: DataWorkerId,
@@ -452,53 +490,27 @@ impl<St> SessionDriverRuntime<St, Local> {
             buffers,
             app_context.app_session_config(),
             Local::default(),
+            worker.slot(),
         );
         driver.app_state.app_context = Some(app_context);
         driver
     }
+}
 
+impl<St> SessionDriverRuntime<St, Svm> {
     #[inline]
-    pub(crate) fn insert_session_with_id<F>(&mut self, f: F) -> CoreResult<SessionId>
-    where
-        F: SessionStateFactory<St>,
-    {
-        let index = self
-            .runtime
-            .entries
-            .insert_with(|index| f.build(SessionId::from(index)))
-            .ok_or_else(|| CoreError::internal("session pool capacity exhausted"))?;
-        let session_id = SessionId::from(index);
-        let handle =
-            SessionHandle::new(session_id.pool_index().slot(), self.worker().slot() as u32);
-        let app_session = if let Some(app_context) = &self.app_state.app_context {
-            match app_context.session(handle) {
-                Ok(Some(session)) => session,
-                Ok(None) => {
-                    let _ = self.runtime.entries.remove(index);
-                    return Err(CoreError::internal("app session is missing"));
-                }
-                Err(error) => {
-                    let _ = self.runtime.entries.remove(index);
-                    return Err(CoreError::from(error));
-                }
-            }
-        } else {
-            match with_current_app_worker(self.worker().slot() as usize, |worker| {
-                worker.attach_session_local_with_runtime_tx(
-                    handle,
-                    self.app_state.app_session_config,
-                    self.app_state.app.tx_evt_q().clone(),
-                )
-            }) {
-                Ok(session) => session,
-                Err(error) => {
-                    let _ = self.runtime.entries.remove(index);
-                    return Err(CoreError::from(error));
-                }
-            }
-        };
-        self.app_state.app.attach_session(session_id, app_session);
-        Ok(session_id)
+    pub(crate) fn new_svm(
+        worker: DataWorkerId,
+        buffers: DataPlaneBuffers,
+        app_session_config: AppSessionConfig,
+    ) -> Self {
+        Self::with_app_session_config(
+            worker,
+            buffers,
+            app_session_config,
+            Svm::default(),
+            worker.slot(),
+        )
     }
 }
 

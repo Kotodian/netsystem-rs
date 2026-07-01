@@ -114,9 +114,12 @@ impl<S: Segment> SessionAppRuntime<S> {
         let handle = session.session_handle();
         let dropped = session.drop_tx_acked(len).map_err(CoreError::from)?;
         if dropped != 0 {
-            hammer_runtime::app::with_current_app_worker(handle.worker_index() as usize, |worker| {
-                worker.wake_tx(handle);
-            });
+            hammer_runtime::app::with_current_app_worker(
+                handle.worker_index() as usize,
+                |worker| {
+                    worker.wake_tx(handle);
+                },
+            );
         }
         Ok(dropped != 0)
     }
@@ -175,7 +178,10 @@ impl<S: Segment> SessionAppRuntime<S> {
         buffers: &DataPlaneBuffers,
         index: BufferIndex,
     ) -> CoreResult<usize> {
-        let handle = self.sessions.lookup(&session_id.get()).map(|s| s.session_handle());
+        let handle = self
+            .sessions
+            .lookup(&session_id.get())
+            .map(|s| s.session_handle());
         let wrote = match handle {
             Some(h) => {
                 let Some(session) = self.sessions.lookup(&session_id.get()) else {
@@ -291,19 +297,6 @@ impl SessionAppRuntime<Local> {
         )
     }
 
-    pub(crate) fn create_app_session(
-        &self,
-        handle: hammer_runtime::app::SessionHandle,
-        config: hammer_runtime::app::AppSessionConfig,
-        tx_evt_q: Arc<MsgQueue<Local>>,
-    ) -> CoreResult<Arc<AppSession<Local>>> {
-        hammer_runtime::app::with_current_app_worker(self.worker_index, |worker| {
-            worker
-                .attach_session_local_with_runtime_tx(handle, config, tx_evt_q)
-                .map_err(CoreError::from)
-        })
-    }
-
     fn notify_rx(&self, session: &AppSession<Local>) {
         let handle = session.session_handle();
         hammer_runtime::app::with_current_app_worker(self.worker_index, |w| w.wake_rx(handle));
@@ -321,7 +314,45 @@ impl SessionAppRuntime<Local> {
 }
 
 impl SessionAppRuntime<Svm> {
-    pub(crate) fn create_app_session(
+    fn notify_rx(&self, session: &AppSession<Svm>) {
+        session.evt_q().fire();
+    }
+
+    fn notify_tx(&self, session: &AppSession<Svm>) {
+        session.tx_evt_q().fire();
+    }
+
+    fn notify_evt(&self, session: &AppSession<Svm>) {
+        session.evt_q().fire();
+    }
+}
+
+pub trait SessionAppRuntimeCreate<S: Segment> {
+    fn create_app_session(
+        &self,
+        handle: hammer_runtime::app::SessionHandle,
+        config: hammer_runtime::app::AppSessionConfig,
+        tx_evt_q: Arc<MsgQueue<S>>,
+    ) -> CoreResult<Arc<AppSession<S>>>;
+}
+
+impl SessionAppRuntimeCreate<Local> for SessionAppRuntime<Local> {
+    fn create_app_session(
+        &self,
+        handle: hammer_runtime::app::SessionHandle,
+        config: hammer_runtime::app::AppSessionConfig,
+        tx_evt_q: Arc<MsgQueue<Local>>,
+    ) -> CoreResult<Arc<AppSession<Local>>> {
+        hammer_runtime::app::with_current_app_worker(self.worker_index, |worker| {
+            worker
+                .attach_session_local_with_runtime_tx(handle, config, tx_evt_q)
+                .map_err(CoreError::from)
+        })
+    }
+}
+
+impl SessionAppRuntimeCreate<Svm> for SessionAppRuntime<Svm> {
+    fn create_app_session(
         &self,
         handle: hammer_runtime::app::SessionHandle,
         config: hammer_runtime::app::AppSessionConfig,
@@ -349,17 +380,5 @@ impl SessionAppRuntime<Svm> {
             rx_fifo, tx_fifo, evt_q, tx_evt_q, handle,
         ));
         Ok(session)
-    }
-
-    fn notify_rx(&self, session: &AppSession<Svm>) {
-        session.evt_q().fire();
-    }
-
-    fn notify_tx(&self, session: &AppSession<Svm>) {
-        session.tx_evt_q().fire();
-    }
-
-    fn notify_evt(&self, session: &AppSession<Svm>) {
-        session.evt_q().fire();
     }
 }
