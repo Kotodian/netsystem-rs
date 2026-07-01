@@ -123,7 +123,8 @@ impl Svm {
             }
             return Err(io::Error::last_os_error());
         }
-        let region = SvmRegion::from_fd(fd, size).ok_or_else(|| io::Error::last_os_error())?;
+        let region =
+            SvmRegion::from_fd_owned(fd, size, true).ok_or_else(|| io::Error::last_os_error())?;
         Ok(Self { region })
     }
 
@@ -145,7 +146,8 @@ impl Svm {
             }
             return Err(io::Error::last_os_error());
         }
-        let region = SvmRegion::from_fd(fd, size).ok_or_else(|| io::Error::last_os_error())?;
+        let region =
+            SvmRegion::from_fd_owned(fd, size, true).ok_or_else(|| io::Error::last_os_error())?;
         Ok(Self { region })
     }
 
@@ -297,5 +299,20 @@ mod tests {
             libc::waitpid(pid, &mut status, 0);
         }
         assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+    }
+
+    #[test]
+    fn svm_create_closes_its_fd_on_drop() {
+        let svm = Svm::default();
+        let fd = svm.fd().expect("Svm exposes its fd");
+        drop(svm);
+        unsafe {
+            let r = libc::fcntl(fd, libc::F_GETFL);
+            assert!(r < 0, "fd must be closed after Svm drop");
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EBADF)
+            );
+        }
     }
 }

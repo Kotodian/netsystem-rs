@@ -52,6 +52,13 @@ impl SvmRegion {
 
     /// Attach to an existing shared-memory region by fd (does not own the fd).
     pub fn from_fd(fd: RawFd, size: usize) -> Option<SvmRegion> {
+        Self::from_fd_owned(fd, size, false)
+    }
+
+    /// Attach to an existing shared-memory region by fd. When `owned` is true,
+    /// the fd is closed in `SvmRegionInner::drop`; otherwise the caller keeps
+    /// ownership.
+    pub fn from_fd_owned(fd: RawFd, size: usize, owned: bool) -> Option<SvmRegion> {
         let page = page_size();
         let total = align_up(size, page);
         unsafe {
@@ -73,7 +80,7 @@ impl SvmRegion {
                     fd,
                     bump: AtomicU64::new(0),
                     free_list: Mutex::new(Vec::new()),
-                    owned: false,
+                    owned,
                 }),
             })
         }
