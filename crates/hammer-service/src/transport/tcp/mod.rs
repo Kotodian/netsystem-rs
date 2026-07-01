@@ -130,23 +130,25 @@ pub(crate) fn ensure_tcp_session_queue<C: CongestionController + 'static>(
     let runtime_data = match backend {
         hammer_core::config::SessionBackend::Local => {
             type Seg = hammer_infra::segment::Local;
-            let queue = crate::session::node::register_session_queue(
-                SessionDriverRuntime::<TcpConnection<C>, Seg>::new(
-                    worker_id,
-                    rt.buffers().clone(),
-                )
-            )?;
+            let queue = crate::session::node::register_session_queue(SessionDriverRuntime::<
+                TcpConnection<C>,
+                Seg,
+            >::new(
+                worker_id,
+                rt.buffers().clone(),
+            ))?;
             queue.runtime_data()
         }
         hammer_core::config::SessionBackend::Svm => {
             type Seg = hammer_infra::segment::Svm;
-            let queue = crate::session::node::register_session_queue(
-                SessionDriverRuntime::<TcpConnection<C>, Seg>::new_svm(
-                    worker_id,
-                    rt.buffers().clone(),
-                    hammer_runtime::app::AppSessionConfig::default(),
-                )
-            )?;
+            let queue = crate::session::node::register_session_queue(SessionDriverRuntime::<
+                TcpConnection<C>,
+                Seg,
+            >::new_svm(
+                worker_id,
+                rt.buffers().clone(),
+                hammer_runtime::app::AppSessionConfig::default(),
+            ))?;
             queue.runtime_data()
         }
     };

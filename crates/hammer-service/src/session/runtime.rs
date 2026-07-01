@@ -364,11 +364,7 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
         self.app_state.app.rx_available_len(session_id)
     }
 
-    pub(crate) fn release_tx_up_to(
-        &mut self,
-        session_id: SessionId,
-        bytes: usize,
-    ) -> CoreResult<()>
+    pub(crate) fn release_tx_up_to(&mut self, session_id: SessionId, bytes: usize) -> CoreResult<()>
     where
         SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
     {

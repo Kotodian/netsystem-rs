@@ -192,9 +192,8 @@ impl Default for Svm {
         let counter = SVM_DEFAULT_COUNTER.fetch_add(1, Ordering::Relaxed);
         let name = format!("hammer-{pid}-{counter}");
         let size = 256 * 1024 * 1024;
-        Self::create(&name, size).unwrap_or_else(|e| {
-            panic!("Svm::default: failed to create shared memory segment: {e}")
-        })
+        Self::create(&name, size)
+            .unwrap_or_else(|e| panic!("Svm::default: failed to create shared memory segment: {e}"))
     }
 }
 

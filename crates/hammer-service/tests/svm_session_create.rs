@@ -9,11 +9,8 @@ fn svm_session_create_and_fifo_round_trip() {
     let config = AppSessionConfig::new(128, 16);
     let handle = SessionHandle::new(0, 0);
 
-    let offsets = SessionOffsets::allocate(
-        &seg,
-        config.fifo_capacity as u32,
-        config.evt_q_capacity,
-    );
+    let offsets =
+        SessionOffsets::allocate(&seg, config.fifo_capacity as u32, config.evt_q_capacity);
 
     unsafe {
         Fifo::<Svm>::init_at(seg.clone(), offsets.rx_fifo_off, config.fifo_capacity)
@@ -27,15 +24,12 @@ fn svm_session_create_and_fifo_round_trip() {
         .next_power_of_two()
         .max(2);
     unsafe {
-        MsgQueue::<Svm>::init_at(seg.clone(), offsets.evt_q_off, evt_q_ring)
-            .expect("init evt_q");
-        MsgQueue::<Svm>::init_at(seg.clone(), offsets.tx_evt_q_off, 64)
-            .expect("init tx_evt_q");
+        MsgQueue::<Svm>::init_at(seg.clone(), offsets.evt_q_off, evt_q_ring).expect("init evt_q");
+        MsgQueue::<Svm>::init_at(seg.clone(), offsets.tx_evt_q_off, 64).expect("init tx_evt_q");
     }
 
-    let session = unsafe {
-        AppSession::<Svm>::from_segment(handle, &seg, &offsets, None, None, None, None)
-    };
+    let session =
+        unsafe { AppSession::<Svm>::from_segment(handle, &seg, &offsets, None, None, None, None) };
 
     let written = session.rx_fifo().enqueue(b"hello");
     assert_eq!(written, 5);
@@ -51,16 +45,10 @@ fn svm_segment_supports_multiple_sessions() {
     let seg = Svm::default();
     let config = AppSessionConfig::new(64, 8);
 
-    let offsets1 = SessionOffsets::allocate(
-        &seg,
-        config.fifo_capacity as u32,
-        config.evt_q_capacity,
-    );
-    let offsets2 = SessionOffsets::allocate(
-        &seg,
-        config.fifo_capacity as u32,
-        config.evt_q_capacity,
-    );
+    let offsets1 =
+        SessionOffsets::allocate(&seg, config.fifo_capacity as u32, config.evt_q_capacity);
+    let offsets2 =
+        SessionOffsets::allocate(&seg, config.fifo_capacity as u32, config.evt_q_capacity);
 
     assert_ne!(offsets1.rx_fifo_off, offsets2.rx_fifo_off);
     assert!(offsets2.rx_fifo_off > offsets1.tx_evt_q_off);
