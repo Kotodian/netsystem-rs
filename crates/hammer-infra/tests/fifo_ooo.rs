@@ -23,7 +23,7 @@ fn ooo_promote_contiguous_gap_not_filled() {
 
     f.enqueue_ooo(10, b"hello").unwrap();
 
-    f.enqueue_at(0, b"hello");
+    f.enqueue(b"hello");
     assert_eq!(f.promote_contiguous(), 0);
 }
 
@@ -34,7 +34,7 @@ fn ooo_promote_contiguous_gap_filled() {
 
     f.enqueue_ooo(10, b"hello").unwrap();
 
-    f.enqueue_at(0, b"hello");
+    f.enqueue(b"hello");
 
     let result = f.enqueue_ooo(0, b"hellohello").unwrap();
     assert!(result.delivered > 0);

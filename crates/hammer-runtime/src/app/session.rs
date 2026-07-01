@@ -38,10 +38,10 @@ impl<S: Segment> AppSession<S> {
     where
         S: Clone,
     {
-        let rx_fifo = Arc::new(
-            Fifo::<S>::new(seg.clone(), config.fifo_capacity)
-                .map_err(|_| HammerError::internal("invalid rx fifo capacity"))?,
-        );
+        let mut rx_fifo = Fifo::<S>::new(seg.clone(), config.fifo_capacity)
+            .map_err(|_| HammerError::internal("invalid rx fifo capacity"))?;
+        rx_fifo.enable_ooo();
+        let rx_fifo = Arc::new(rx_fifo);
         let tx_fifo = Arc::new(
             Fifo::<S>::new(seg.clone(), config.fifo_capacity)
                 .map_err(|_| HammerError::internal("invalid tx fifo capacity"))?,
@@ -469,5 +469,16 @@ mod tests {
                 .expect("push connect");
         }
         assert!(session.push_event(SessionEvtType::Connect).is_err());
+    }
+
+    #[test]
+    fn app_session_rx_fifo_supports_ooo_enqueue() {
+        let session = new_session(AppSessionConfig::new(64, 4), 1);
+        let result = session
+            .rx_fifo()
+            .enqueue_ooo(5, b"world")
+            .expect("rx fifo should support ooo");
+        assert_eq!(result.delivered, 0);
+        assert_eq!(session.rx_fifo().max_dequeue(), 0);
     }
 }
