@@ -7,6 +7,27 @@
 /// 8-byte free sentinel — VPP's `0xFEEDFACE8BADF00D`.
 pub const FREE_U64: u64 = 0xFEEDFACE_8BADF00D;
 
+/// Trait for value types that have a distinct "free" sentinel.
+///
+/// `Bihash` stores `V` inline in each slot and needs a way to mark a slot
+/// as free without overwriting the caller's value. Phase 1 only requires
+/// this for `u64`; the sentinel is `FREE_U64`. Phase 2 can add more impls
+/// (e.g. for `u32` or composite types).
+pub trait BihashFree: Copy + Eq {
+    /// Returns the canonical free-sentinel value for this type.
+    fn free_sentinel() -> Self;
+    /// Returns `true` when `self` equals the free sentinel.
+    fn is_free_value(&self) -> bool {
+        *self == Self::free_sentinel()
+    }
+}
+
+impl BihashFree for u64 {
+    fn free_sentinel() -> u64 {
+        FREE_U64
+    }
+}
+
 /// A single (key, value) pair.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub struct Kv<K, V> {
@@ -46,12 +67,12 @@ pub struct ValuePage<K, V, const KVP: usize> {
     slots: [Kv<K, V>; KVP],
 }
 
-impl<K: Copy + Default, V: Copy + Default, const KVP: usize> ValuePage<K, V, KVP> {
+impl<K: Copy + Default, V: Copy + Default + BihashFree, const KVP: usize> ValuePage<K, V, KVP> {
     pub fn new() -> Self {
         Self {
             slots: core::array::from_fn(|_| Kv {
                 key: K::default(),
-                value: V::default(),
+                value: V::free_sentinel(),
             }),
         }
     }
@@ -94,7 +115,9 @@ impl ValuePage<u64, u64, 4> {
     }
 }
 
-impl<K: Copy + Default, V: Copy + Default, const KVP: usize> Default for ValuePage<K, V, KVP> {
+impl<K: Copy + Default, V: Copy + Default + BihashFree, const KVP: usize> Default
+    for ValuePage<K, V, KVP>
+{
     fn default() -> Self {
         Self::new()
     }

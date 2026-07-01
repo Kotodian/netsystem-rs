@@ -5,16 +5,17 @@
 //! bucket-for-bucket but uses const generics for template instantiation
 //! instead of the C preprocessor.
 
-pub mod key;
-pub mod bucket;
-pub mod value;
 pub mod alloc;
+pub mod bucket;
+pub mod key;
 pub mod ops;
+pub mod split;
+pub mod value;
 
-pub use key::BihashKey;
-pub use bucket::Bucket;
-pub use value::{Kv, ValuePage, FREE_U64};
 pub use alloc::{PageAlloc, PageId};
+pub use bucket::Bucket;
+pub use key::BihashKey;
+pub use value::{BihashFree, FREE_U64, Kv, ValuePage};
 
 /// A bounded-index extensible hash table.
 ///
@@ -31,7 +32,9 @@ pub struct Bihash<K: BihashKey, V: Copy + Eq, const KVP: usize> {
     log2_nbuckets: u8,
 }
 
-impl<K: BihashKey + Default, V: Copy + Eq + Default, const KVP: usize> Bihash<K, V, KVP> {
+impl<K: BihashKey + Default, V: Copy + Eq + Default + BihashFree, const KVP: usize>
+    Bihash<K, V, KVP>
+{
     /// Create a bihash with at least `nbuckets` buckets. `nbuckets` is
     /// rounded up to the next power of two; `log2_nbuckets` is stored and
     /// used to select bucket indices from hash bits.

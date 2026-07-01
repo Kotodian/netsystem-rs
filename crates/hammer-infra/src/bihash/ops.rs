@@ -1,8 +1,10 @@
 //! Hot-path operations: lookup.
 
-use crate::bihash::{Bihash, BihashKey, Bucket, Kv, PageId};
+use crate::bihash::{Bihash, BihashFree, BihashKey, Bucket, Kv, PageId};
 
-impl<K: BihashKey + Default, V: Copy + Eq + Default, const KVP: usize> Bihash<K, V, KVP> {
+impl<K: BihashKey + Default, V: Copy + Eq + Default + BihashFree, const KVP: usize>
+    Bihash<K, V, KVP>
+{
     /// Read-only lookup. Phase 1 is `&self`-bound (exclusive-borrow model,
     /// same as `FlatHashTable::lookup` today).
     #[inline(always)]
@@ -44,8 +46,7 @@ impl<K: BihashKey + Default, V: Copy + Eq + Default, const KVP: usize> Bihash<K,
             let cur = PageId(first_page.0 + rel);
             let page = self.pages.get(cur);
             for kv in page.slots() {
-                // Skip free slots.
-                if kv.value == V::default() {
+                if kv_slot_is_free(kv) {
                     continue;
                 }
                 if K::key_eq(kv.key, key) {
@@ -57,17 +58,16 @@ impl<K: BihashKey + Default, V: Copy + Eq + Default, const KVP: usize> Bihash<K,
     }
 }
 
-/// Helper for generic-V free detection — checks if a KV slot is free.
-/// Phase 1 uses `V::default()`. Phase 2 will use a sentinel trait.
+/// Helper for generic-V free detection — checks if a KV slot is free via
+/// the `BihashFree` trait's sentinel (e.g. `FREE_U64` for `u64`).
 #[inline(always)]
-fn kv_slot_is_free<K, V>(kv: &Kv<K, V>) -> bool
-where
-    V: Copy + Eq + Default,
-{
-    kv.value == V::default()
+pub(super) fn kv_slot_is_free<K, V: BihashFree>(kv: &Kv<K, V>) -> bool {
+    kv.value.is_free_value()
 }
 
-impl<K: BihashKey + Default, V: Copy + Eq + Default, const KVP: usize> Bihash<K, V, KVP> {
+impl<K: BihashKey + Default, V: Copy + Eq + Default + BihashFree, const KVP: usize>
+    Bihash<K, V, KVP>
+{
     /// Insert or overwrite a key. VPP semantics: `is_add=1` (always overwrite).
     pub fn insert(&mut self, key: K, value: V) {
         let hash = key.hash();
@@ -78,17 +78,16 @@ impl<K: BihashKey + Default, V: Copy + Eq + Default, const KVP: usize> Bihash<K,
             let page_id = self.pages.alloc_single(0);
             let page = self.pages.get_mut(page_id);
             page.slots_mut()[0] = Kv { key, value };
-            self.buckets[bucket_idx as usize] = Bucket::pack(
-                page_id.0 as u64, 0, 1, 0, false, false,
-            );
+            self.buckets[bucket_idx as usize] =
+                Bucket::pack(page_id.0 as u64, 0, 1, 0, false, false);
             self.len += 1;
             return;
         }
 
         let page_id = PageId(bucket.offset() as u32);
         let log2_pages = bucket.log2_pages();
-        let page_offset = ((hash >> (self.log2_nbuckets as u32)) as u32)
-            & ((1u32 << log2_pages) - 1);
+        let page_offset =
+            ((hash >> (self.log2_nbuckets as u32)) as u32) & ((1u32 << log2_pages) - 1);
         let target = PageId(page_id.0 + page_offset);
         let page = self.pages.get_mut(target);
 
@@ -120,12 +119,5 @@ impl<K: BihashKey + Default, V: Copy + Eq + Default, const KVP: usize> Bihash<K,
         }
 
         self.split_and_rehash(bucket_idx, key, value);
-    }
-}
-
-impl<K: BihashKey + Default, V: Copy + Eq + Default, const KVP: usize> Bihash<K, V, KVP> {
-    #[allow(unused_variables)]
-    fn split_and_rehash(&mut self, bucket_idx: u32, key: K, value: V) {
-        unimplemented!("Task 6: bucket split on overflow");
     }
 }

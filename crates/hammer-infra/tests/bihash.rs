@@ -79,8 +79,8 @@ fn bucket_refcnt_max_is_8191() {
 
 // ── ValuePage / Kv / FREE_U64 ──────────────────────────────────────────
 
-use hammer_infra::bihash::value::{Kv, ValuePage, FREE_U64};
 use hammer_infra::bihash::alloc::PageAlloc;
+use hammer_infra::bihash::value::{FREE_U64, Kv, ValuePage};
 
 #[test]
 fn kv_u64_mark_free_sets_sentinel_in_value() {
@@ -110,12 +110,9 @@ fn kv_u64_new_is_free_by_default() {
 }
 
 #[test]
-fn value_page_4_fresh_new_has_zero_free_count_until_marked() {
-    let mut page = ValuePage::<u64, u64, 4>::new();
-    // Generic new() uses V::default() (0 for u64), not FREE_U64.
-    assert_eq!(page.free_count(), 0);
-    // After marking all slots free, the sentinel is present.
-    page.slots_mut().iter_mut().for_each(|kv| kv.mark_free());
+fn value_page_4_fresh_new_has_all_free_count() {
+    let page = ValuePage::<u64, u64, 4>::new();
+    // new() initializes all slots with the free sentinel (FREE_U64).
     assert_eq!(page.free_count(), 4);
     assert!(page.is_all_free());
 }
@@ -176,8 +173,7 @@ fn bihash_insert_overwrite_replaces_value_without_growing_len() {
 #[test]
 fn bihash_insert_distinct_keys_that_hash_to_same_bucket() {
     // 1000 distinct keys in an 8-bucket table — collisions guaranteed.
-    // NOTE: If this test panics with "Task 6: bucket split on overflow",
-    // that means a page filled up — expected for this task. Task 6 fixes it.
+    // The bihash must split the overfull bucket and rehash all entries.
     // Use KVP=4 so each page holds 4 entries, forcing overflow quickly.
     let mut t: Bihash<u64, u64, 4> = Bihash::new(8);
     for k in 0..1000u64 {
@@ -187,4 +183,30 @@ fn bihash_insert_distinct_keys_that_hash_to_same_bucket() {
         assert_eq!(t.lookup(&k), Some(k * 3), "key {k} missing after insert");
     }
     assert_eq!(t.len(), 1000);
+}
+
+#[test]
+fn bihash_split_preserves_lookup_for_many_keys() {
+    let mut t: Bihash<u64, u64, 2> = Bihash::new(8);
+    for k in 0..500u64 {
+        t.insert(k, k ^ 0xabcd);
+    }
+    for k in 0..500u64 {
+        assert_eq!(t.lookup(&k), Some(k ^ 0xabcd), "key {k} missing post-split");
+    }
+    assert_eq!(t.len(), 500);
+}
+
+#[test]
+fn bihash_split_handles_many_collisions() {
+    // With KVP=2 and nbuckets=4, each bucket holds only 2 entries per page.
+    // Inserting 100 keys forces multiple splits per bucket.
+    let mut t: Bihash<u64, u64, 2> = Bihash::new(4);
+    for k in 0..100u64 {
+        t.insert(k, k * 10);
+    }
+    for k in 0..100u64 {
+        assert_eq!(t.lookup(&k), Some(k * 10), "key {k} missing");
+    }
+    assert_eq!(t.len(), 100);
 }

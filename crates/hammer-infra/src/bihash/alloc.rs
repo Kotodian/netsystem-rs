@@ -4,7 +4,7 @@
 //! allocations).  Multi-page allocations will be added when bucket
 //! expansion is implemented.
 
-use crate::bihash::value::ValuePage;
+use crate::bihash::value::{BihashFree, ValuePage};
 
 /// Identifies a page (or a contiguous run of 2^log2_pages pages starting at
 /// this id). Page IDs are 1-indexed; id 0 is reserved for "no page" state.
@@ -40,7 +40,7 @@ pub struct PageAlloc<K, V: Copy, const KVP: usize> {
     live: usize,
 }
 
-impl<K: Copy + Default, V: Copy + Default, const KVP: usize> PageAlloc<K, V, KVP> {
+impl<K: Copy + Default, V: Copy + Default + BihashFree, const KVP: usize> PageAlloc<K, V, KVP> {
     pub fn new() -> Self {
         Self {
             pages: Vec::new(),
@@ -52,10 +52,7 @@ impl<K: Copy + Default, V: Copy + Default, const KVP: usize> PageAlloc<K, V, KVP
     /// Allocate a single free page (log2_pages = 0). If the freelist is
     /// empty, pushes a new page onto `pages` and returns its id.
     pub fn alloc_single(&mut self, log2_pages: u8) -> PageId {
-        debug_assert_eq!(
-            log2_pages, 0,
-            "Phase 1 supports only log2_pages == 0"
-        );
+        debug_assert_eq!(log2_pages, 0, "Phase 1 supports only log2_pages == 0");
         if let Some(id) = self.freelists[0].pop() {
             self.pages[id.index()] = ValuePage::new();
             self.live += 1;
@@ -73,6 +70,18 @@ impl<K: Copy + Default, V: Copy + Default, const KVP: usize> PageAlloc<K, V, KVP
         debug_assert!(!id.is_none());
         self.freelists[0].push(id);
         self.live -= 1;
+    }
+
+    /// Allocate a fresh page by pushing onto `pages` (bypassing the freelist).
+    ///
+    /// Unlike `alloc_single`, this guarantees the returned `PageId` is the
+    /// next consecutive slot in `pages`. `split_and_rehash` uses this to
+    /// ensure the new page run is contiguous so the lookup's `first_id + rel`
+    /// addressing stays correct.
+    pub fn alloc_fresh(&mut self) -> PageId {
+        self.pages.push(ValuePage::new());
+        self.live += 1;
+        PageId::from_index(self.pages.len() - 1)
     }
 
     /// Number of live (allocated, not freed) pages.
@@ -94,7 +103,9 @@ impl<K: Copy + Default, V: Copy + Default, const KVP: usize> PageAlloc<K, V, KVP
     }
 }
 
-impl<K: Copy + Default, V: Copy + Default, const KVP: usize> Default for PageAlloc<K, V, KVP> {
+impl<K: Copy + Default, V: Copy + Default + BihashFree, const KVP: usize> Default
+    for PageAlloc<K, V, KVP>
+{
     fn default() -> Self {
         Self::new()
     }
