@@ -1,6 +1,6 @@
-//! Hot-path operations: lookup.
+//! Hot-path operations: lookup, insert, remove, clear.
 
-use crate::bihash::{Bihash, BihashFree, BihashKey, Bucket, Kv, PageId};
+use crate::bihash::{Bihash, BihashFree, BihashKey, Bucket, Kv, PageAlloc, PageId};
 
 impl<K: BihashKey + Default, V: Copy + Eq + Default + BihashFree, const KVP: usize>
     Bihash<K, V, KVP>
@@ -119,5 +119,62 @@ impl<K: BihashKey + Default, V: Copy + Eq + Default + BihashFree, const KVP: usi
         }
 
         self.split_and_rehash(bucket_idx, key, value);
+    }
+
+    /// Remove a key from the table. Returns `true` if the key was found and
+    /// removed, `false` if it was absent.
+    pub fn remove(&mut self, key: &K) -> bool {
+        let hash = key.hash();
+        let bucket_idx = (hash as u32) & (self.nbuckets - 1);
+        let bucket = self.buckets[bucket_idx as usize];
+        if bucket.is_empty() {
+            return false;
+        }
+        let page_id = PageId(bucket.offset() as u32);
+        let log2_pages = bucket.log2_pages();
+        let linear = bucket.is_linear_search();
+        let page_offset = if linear {
+            0u32
+        } else {
+            ((hash >> (self.log2_nbuckets as u32)) as u32) & ((1u32 << log2_pages) - 1)
+        };
+        let limit = if linear { 1u32 << log2_pages } else { 1 };
+
+        for rel in 0..limit {
+            let cur = PageId(page_id.0 + page_offset + rel);
+            let page = self.pages.get_mut(cur);
+            for slot in page.slots_mut() {
+                if slot.value.is_free_value() {
+                    continue;
+                }
+                if K::key_eq(slot.key, *key) {
+                    slot.value = V::free_sentinel();
+                    if !linear {
+                        self.buckets[bucket_idx as usize] = Bucket::pack(
+                            page_id.0 as u64,
+                            log2_pages,
+                            bucket.refcnt() - 1,
+                            bucket.generation().wrapping_add(1) & 0x1F,
+                            false,
+                            false,
+                        );
+                    }
+                    self.len -= 1;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Remove all entries from the table. Resets every bucket to empty and
+    /// drops every page back to the allocator by replacing `PageAlloc` with a
+    /// fresh instance. The table is left usable for further inserts.
+    pub fn clear(&mut self) {
+        for b in self.buckets.iter_mut() {
+            *b = Bucket::empty();
+        }
+        self.pages = PageAlloc::new();
+        self.len = 0;
     }
 }

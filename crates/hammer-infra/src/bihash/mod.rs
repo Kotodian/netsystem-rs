@@ -7,14 +7,18 @@
 
 pub mod alloc;
 pub mod bucket;
+pub mod iter;
 pub mod key;
 pub mod ops;
 pub mod split;
+pub mod template;
 pub mod value;
 
 pub use alloc::{PageAlloc, PageId};
 pub use bucket::Bucket;
+pub use iter::BihashIter;
 pub use key::BihashKey;
+pub use template::{Bihash8x8, Bihash16x8, Bihash24x8, Bihash48x8};
 pub use value::{BihashFree, FREE_U64, Kv, ValuePage};
 
 /// A bounded-index extensible hash table.
@@ -66,5 +70,28 @@ impl<K: BihashKey + Default, V: Copy + Eq + Default + BihashFree, const KVP: usi
     #[inline]
     pub fn nbuckets(&self) -> u32 {
         self.nbuckets
+    }
+
+    /// Internal: shared access to the bucket array. Used by the iterator
+    /// (`crate::bihash::iter`).
+    #[inline]
+    pub(crate) fn buckets(&self) -> &[Bucket] {
+        &self.buckets
+    }
+
+    /// Internal: shared access to the page allocator. Used by the iterator
+    /// (`crate::bihash::iter`).
+    #[inline]
+    pub(crate) fn pages(&self) -> &PageAlloc<K, V, KVP> {
+        &self.pages
+    }
+
+    /// Snapshot-style iterator over `(&K, &V)` pairs. Iteration order is
+    /// bucket index order, then page index order within a bucket, then slot
+    /// index order within a page — i.e. deterministic but not insertion
+    /// order. Free slots are skipped.
+    #[inline]
+    pub fn iter(&self) -> BihashIter<'_, K, V, KVP> {
+        BihashIter::new(self)
     }
 }

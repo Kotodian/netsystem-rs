@@ -1,5 +1,5 @@
 use hammer_infra::bihash::bucket::Bucket;
-use hammer_infra::bihash::{Bihash, BihashKey};
+use hammer_infra::bihash::{Bihash, Bihash8x8, BihashKey};
 
 #[test]
 fn bihash_key_u64_hashes_deterministically() {
@@ -209,4 +209,75 @@ fn bihash_split_handles_many_collisions() {
         assert_eq!(t.lookup(&k), Some(k * 10), "key {k} missing");
     }
     assert_eq!(t.len(), 100);
+}
+
+#[test]
+fn bihash_remove_existing_key() {
+    let mut t: Bihash<u64, u64, 7> = Bihash::new(16);
+    t.insert(1, 100);
+    t.insert(2, 200);
+    assert!(t.remove(&1));
+    assert_eq!(t.lookup(&1), None);
+    assert_eq!(t.lookup(&2), Some(200));
+    assert_eq!(t.len(), 1);
+}
+
+#[test]
+fn bihash_remove_missing_key_returns_false() {
+    let mut t: Bihash<u64, u64, 7> = Bihash::new(16);
+    t.insert(1, 100);
+    assert!(!t.remove(&999));
+    assert_eq!(t.len(), 1);
+}
+
+#[test]
+fn bihash_remove_all_entries_returns_bucket_to_empty() {
+    let mut t: Bihash<u64, u64, 7> = Bihash::new(16);
+    t.insert(1, 100);
+    t.insert(2, 200);
+    t.remove(&1);
+    t.remove(&2);
+    assert!(t.is_empty());
+    assert_eq!(t.lookup(&1), None);
+    assert_eq!(t.lookup(&2), None);
+}
+
+#[test]
+fn bihash_clear_drops_len_to_zero() {
+    let mut t: Bihash<u64, u64, 4> = Bihash::new(4);
+    for k in 0..100u64 {
+        t.insert(k, k);
+    }
+    t.clear();
+    assert!(t.is_empty());
+    for k in 0..100u64 {
+        assert_eq!(t.lookup(&k), None);
+    }
+    t.insert(7, 77);
+    assert_eq!(t.lookup(&7), Some(77));
+}
+
+#[test]
+fn bihash_8x8_alias_compiles() {
+    let t: Bihash8x8<u64> = Bihash::new(16);
+    assert_eq!(t.nbuckets(), 16);
+}
+
+#[test]
+fn bihash_iter_empty_table_yields_nothing() {
+    let t: Bihash<u64, u64, 7> = Bihash::new(16);
+    assert_eq!(t.iter().count(), 0);
+}
+
+#[test]
+fn bihash_iter_after_inserts_yields_correct_count() {
+    let mut t: Bihash<u64, u64, 7> = Bihash::new(16);
+    t.insert(1, 10);
+    t.insert(2, 20);
+    t.insert(3, 30);
+    let pairs: Vec<(u64, u64)> = t.iter().map(|(&k, &v)| (k, v)).collect();
+    assert_eq!(pairs.len(), 3);
+    assert!(pairs.contains(&(1, 10)));
+    assert!(pairs.contains(&(2, 20)));
+    assert!(pairs.contains(&(3, 30)));
 }

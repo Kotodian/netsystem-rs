@@ -2,6 +2,7 @@ use crate::boxed::Slice;
 use crate::prefetch::prefetch_read_l1;
 use crate::vec::Vec;
 
+#[deprecated(since = "0.1.0", note = "use hammer_infra::bihash::BihashKey instead")]
 pub trait FlatHashKey: Copy + Eq {
     fn hash_key(self) -> usize;
 }
@@ -42,6 +43,7 @@ impl FlatHashKey for usize {
 }
 
 #[derive(Debug, Clone)]
+#[deprecated(since = "0.1.0", note = "use hammer_infra::bihash::Bihash instead")]
 pub struct FlatHashTable<K: FlatHashKey, V: Clone> {
     buckets: Slice<FlatHashBucket<K, V>>,
     len: usize,

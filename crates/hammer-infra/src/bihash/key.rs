@@ -66,6 +66,33 @@ impl BihashKey for u128 {
     }
 }
 
+impl BihashKey for [u64; 3] {
+    #[inline(always)]
+    fn hash(self) -> u64 {
+        hash_words(&self)
+    }
+    #[inline(always)]
+    fn key_eq(self, other: Self) -> bool {
+        self[0] == other[0] && self[1] == other[1] && self[2] == other[2]
+    }
+}
+
+impl BihashKey for [u64; 6] {
+    #[inline(always)]
+    fn hash(self) -> u64 {
+        hash_words(&self)
+    }
+    #[inline(always)]
+    fn key_eq(self, other: Self) -> bool {
+        self[0] == other[0]
+            && self[1] == other[1]
+            && self[2] == other[2]
+            && self[3] == other[3]
+            && self[4] == other[4]
+            && self[5] == other[5]
+    }
+}
+
 /// XOR-fold helper used by composite keys.
 #[inline(always)]
 pub fn hash_words(words: &[u64]) -> u64 {
