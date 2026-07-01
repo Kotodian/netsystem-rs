@@ -104,3 +104,25 @@ fn insert_session_with_id_is_generic_over_segment() {
         "Svm path needs a new_svm constructor"
     );
 }
+
+#[test]
+fn session_app_runtime_has_local_and_svm_impl_blocks() {
+    let app_source = include_str!("../src/session/app.rs");
+
+    assert!(
+        app_source.contains("impl SessionAppRuntime<Local>"),
+        "SessionAppRuntime must have a Local impl block with notify methods"
+    );
+    assert!(
+        app_source.contains("impl SessionAppRuntime<Svm>"),
+        "SessionAppRuntime must have an Svm impl block with notify methods"
+    );
+    assert!(
+        app_source.contains(".fire()"),
+        "SessionAppRuntime<Svm> must use fire() for wake calls"
+    );
+    assert!(
+        !app_source.contains("Box<dyn"),
+        "app.rs must not use Box<dyn>"
+    );
+}

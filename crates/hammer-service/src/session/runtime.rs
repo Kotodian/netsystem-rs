@@ -320,7 +320,10 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
         Some(removed)
     }
 
-    pub(crate) fn close_session(&mut self, id: SessionId) -> CoreResult<Option<St>> {
+    pub(crate) fn close_session(&mut self, id: SessionId) -> CoreResult<Option<St>>
+    where
+        SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
+    {
         if self.session(id).is_none() {
             return Ok(None);
         }
@@ -365,7 +368,10 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
         &mut self,
         session_id: SessionId,
         bytes: usize,
-    ) -> CoreResult<()> {
+    ) -> CoreResult<()>
+    where
+        SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
+    {
         let _ = self
             .app_state
             .app
@@ -392,7 +398,10 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
         index: BufferIndex,
         offset: u32,
         _: bool,
-    ) -> CoreResult<SessionRxEnqueue> {
+    ) -> CoreResult<SessionRxEnqueue>
+    where
+        SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
+    {
         let buffers = &self.runtime.buffers;
         if offset == 0 {
             let wrote = self
@@ -522,6 +531,7 @@ pub fn dispatch_session_queue_for_ticks<St, Seg: Segment>(
 ) -> CoreResult<SessionQueueStep>
 where
     St: SessionQueueProtocol,
+    SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let mut step = driver.poll_once_for_ticks(timer_ticks)?;
     let now = Instant::now();
@@ -540,6 +550,7 @@ pub(crate) fn dispatch_session_queue_once_at<St, Seg: Segment>(
 ) -> CoreResult<SessionQueueStep>
 where
     St: SessionQueueProtocol,
+    SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let mut step = driver.poll_once_at(now)?;
     dispatch_session_queue_pending(runtime, driver, output_next, output, &mut step, now)?;
@@ -555,6 +566,7 @@ pub(crate) fn dispatch_registered_session_queue_once_at<St, Seg: Segment>(
 ) -> CoreResult<()>
 where
     St: SessionQueueProtocol + 'static,
+    SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let mut driver = SessionQueueHandle::<SessionDriverRuntime<St, Seg>>::new(data).borrow_mut()?;
     dispatch_session_queue_once_at(runtime, &mut driver, now, output_next, output)?;
@@ -611,6 +623,7 @@ pub fn dispatch_session_queue_pending<St, Seg: Segment>(
 ) -> CoreResult<()>
 where
     St: SessionQueueProtocol,
+    SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     driver.poll_app()?;
     let expired_timer_count = driver.runtime.sessions.pending_timers.len();
