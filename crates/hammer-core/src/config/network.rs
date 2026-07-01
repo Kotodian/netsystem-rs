@@ -407,6 +407,8 @@ impl Reassembly {
 pub struct Session {
     #[serde(default)]
     pub backend: SessionBackend,
+    #[serde(default)]
+    pub attach_socket_path: Option<String>,
     #[serde(with = "humantime_serde")]
     pub timer_tick: Duration,
     pub pool_capacity: usize,
@@ -420,6 +422,7 @@ impl Default for Session {
     fn default() -> Self {
         Self {
             backend: SessionBackend::default(),
+            attach_socket_path: None,
             timer_tick: SESSION_TIMER_TICK,
             pool_capacity: SESSION_POOL_CAPACITY,
             ready_queue_capacity: READY_QUEUE_CAPACITY,
@@ -704,6 +707,20 @@ mod tests {
         "#;
         let err = parse_inner(input).validate().expect_err("reject");
         assert!(err.to_string().contains("duplicate network.interface name"));
+    }
+
+    #[test]
+    fn session_config_parses_attach_socket_path() {
+        let toml = r#"
+            backend = "svm"
+            attach_socket_path = "/tmp/hammer-attach.sock"
+        "#;
+        let config: super::Session = toml::from_str(toml).unwrap();
+        assert_eq!(config.backend, super::SessionBackend::Svm);
+        assert_eq!(
+            config.attach_socket_path.as_deref(),
+            Some("/tmp/hammer-attach.sock")
+        );
     }
 
     #[test]
