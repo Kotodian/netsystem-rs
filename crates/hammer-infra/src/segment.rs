@@ -1,9 +1,10 @@
 use std::io;
 use std::os::fd::RawFd;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 
 use crate::align::align_up;
+use crate::svm_region::SvmRegion;
 
 pub trait Segment: Send + Sync + Clone + 'static {
     fn base(&self) -> *mut u8;
@@ -102,16 +103,7 @@ unsafe impl Sync for Local {}
 static SVM_DEFAULT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct Svm {
-    inner: Arc<SvmInner>,
-}
-
-struct SvmInner {
-    base: *mut u8,
-    size: usize,
-    fd: RawFd,
-    bump: AtomicU64,
-    free_list: Mutex<Vec<(u64, usize)>>,
-    owned: bool,
+    region: SvmRegion,
 }
 
 impl Svm {
@@ -131,7 +123,8 @@ impl Svm {
             }
             return Err(io::Error::last_os_error());
         }
-        Self::mmap_shared(fd, size, true)
+        let region = SvmRegion::from_fd(fd, size).ok_or_else(|| io::Error::last_os_error())?;
+        Ok(Self { region })
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -152,37 +145,14 @@ impl Svm {
             }
             return Err(io::Error::last_os_error());
         }
-        Self::mmap_shared(fd, size, true)
+        let region = SvmRegion::from_fd(fd, size).ok_or_else(|| io::Error::last_os_error())?;
+        Ok(Self { region })
     }
 
     pub fn from_fd(fd: RawFd, size: usize) -> Result<Self, io::Error> {
-        Self::mmap_shared(fd, size, false)
-    }
-
-    fn mmap_shared(fd: RawFd, size: usize, owned: bool) -> Result<Self, io::Error> {
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            )
-        };
-        if ptr == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Self {
-            inner: Arc::new(SvmInner {
-                base: ptr as *mut u8,
-                size,
-                fd,
-                bump: AtomicU64::new(0),
-                free_list: Mutex::new(Vec::new()),
-                owned,
-            }),
-        })
+        SvmRegion::from_fd(fd, size)
+            .map(|region| Self { region })
+            .ok_or_else(io::Error::last_os_error)
     }
 }
 
@@ -199,83 +169,35 @@ impl Default for Svm {
 
 impl Svm {
     pub fn size(&self) -> usize {
-        self.inner.size
+        self.region.size()
     }
 }
 
 impl Clone for Svm {
     fn clone(&self) -> Self {
         Self {
-            inner: Arc::clone(&self.inner),
+            region: self.region.clone(),
         }
     }
 }
 
 impl Segment for Svm {
     fn base(&self) -> *mut u8 {
-        self.inner.base
+        self.region.base()
     }
 
     fn alloc(&self, bytes: usize, align: usize) -> u64 {
-        let mut free_list = self.inner.free_list.lock().expect("free_list mutex");
-        let best_idx = free_list
-            .iter()
-            .enumerate()
-            .filter(|(_, (off, _))| (*off as usize) % align == 0)
-            .filter(|(_, (_, sz))| *sz >= bytes)
-            .min_by_key(|(_, (_, sz))| *sz)
-            .map(|(idx, _)| idx);
-        if let Some(idx) = best_idx {
-            let (off, _) = free_list.swap_remove(idx);
-            drop(free_list);
-            return off;
-        }
-        drop(free_list);
-        let size = self.inner.size;
-        loop {
-            let current = self.inner.bump.load(Ordering::Relaxed);
-            let aligned = align_up(current as usize, align) as u64;
-            let next = aligned + bytes as u64;
-            if next > size as u64 {
-                panic!("Svm segment exhausted");
-            }
-            if self
-                .inner
-                .bump
-                .compare_exchange(current, next, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                return aligned;
-            }
-        }
+        self.region.alloc(bytes, align)
     }
 
     fn free(&self, offset: u64, bytes: usize) {
-        self.inner
-            .free_list
-            .lock()
-            .expect("free_list mutex")
-            .push((offset, bytes));
+        self.region.free(offset, bytes);
     }
 
     fn fd(&self) -> Option<RawFd> {
-        Some(self.inner.fd)
+        Some(self.region.fd())
     }
 }
-
-impl Drop for SvmInner {
-    fn drop(&mut self) {
-        unsafe {
-            libc::munmap(self.base as *mut libc::c_void, self.size);
-            if self.owned {
-                libc::close(self.fd);
-            }
-        }
-    }
-}
-
-unsafe impl Send for SvmInner {}
-unsafe impl Sync for SvmInner {}
 
 unsafe impl Send for Svm {}
 unsafe impl Sync for Svm {}
