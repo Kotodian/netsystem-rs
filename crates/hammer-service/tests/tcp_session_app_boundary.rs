@@ -41,3 +41,32 @@ fn tcp_receive_window_is_refreshed_from_session_rx_fifo_capacity() {
         "established RX path must refresh advertised window from session RX capacity"
     );
 }
+
+#[test]
+fn session_app_runtime_local_has_static_dispatch() {
+    let app_source = include_str!("../src/session/app.rs");
+    assert!(
+        app_source.contains("impl SessionAppRuntime<Local>"),
+        "SessionAppRuntime must have a Local impl block"
+    );
+    assert!(
+        app_source.contains("impl SessionAppRuntime<Svm>"),
+        "SessionAppRuntime must have an Svm impl block"
+    );
+    assert!(
+        !app_source.contains("SessionBackendOps"),
+        "SessionAppRuntime must not use SessionBackendOps trait"
+    );
+    assert!(
+        !app_source.contains("Box<dyn"),
+        "SessionAppRuntime must not use Box<dyn>"
+    );
+    assert!(
+        app_source.contains("worker_index: usize"),
+        "SessionAppRuntime must have worker_index field"
+    );
+    assert!(
+        app_source.contains("seg: S"),
+        "SessionAppRuntime must have seg field"
+    );
+}

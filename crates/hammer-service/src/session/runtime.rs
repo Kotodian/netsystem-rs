@@ -243,10 +243,16 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
         seg: Seg,
     ) -> Self {
         let tx_evt_q = Arc::new(
-            MsgQueue::<Seg>::new(seg, DEFAULT_SESSION_TX_EVENT_CAPACITY)
+            MsgQueue::<Seg>::new(seg.clone(), DEFAULT_SESSION_TX_EVENT_CAPACITY)
                 .expect("session tx event queue capacity is valid"),
         );
-        let app = SessionAppRuntime::new(DEFAULT_SESSION_POOL_CAPACITY, buffers.clone(), tx_evt_q);
+        let app = SessionAppRuntime::new(
+            DEFAULT_SESSION_POOL_CAPACITY,
+            buffers.clone(),
+            tx_evt_q,
+            worker.slot(),
+            seg,
+        );
         Self {
             runtime: CachePadded::new(SessionDriverRuntimeCore {
                 sessions: WorkerSessionRuntime::new(worker),

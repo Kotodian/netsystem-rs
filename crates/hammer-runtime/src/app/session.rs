@@ -1,12 +1,11 @@
 use std::fmt;
+use std::os::fd::RawFd;
 use std::sync::Arc;
 
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_infra::fifo::Fifo;
 use hammer_infra::msg_queue::{MsgQueue, SessionEvt, SessionEvtType};
 use hammer_infra::segment::Segment;
-
-use std::os::fd::RawFd;
 
 use crate::app::SessionHandle;
 use crate::app::SessionOffsets;
@@ -26,9 +25,26 @@ pub struct AppSession<S: Segment> {
     handle: SessionHandle,
 }
 
-use hammer_infra::segment::Local;
-
 impl<S: Segment> AppSession<S> {
+    /// Construct an `AppSession` from pre-created FIFOs and MsgQueues.
+    /// Used by `SessionAppRuntime<Svm>::create_app_session` to assemble a session
+    /// from individually allocated shared-memory queues.
+    pub fn from_parts(
+        rx_fifo: Arc<Fifo<S>>,
+        tx_fifo: Arc<Fifo<S>>,
+        evt_q: Arc<MsgQueue<S>>,
+        tx_evt_q: Arc<MsgQueue<S>>,
+        handle: SessionHandle,
+    ) -> Self {
+        Self {
+            rx_fifo,
+            tx_fifo,
+            evt_q,
+            tx_evt_q,
+            handle,
+        }
+    }
+
     pub fn new_in_segment(
         seg: S,
         config: AppSessionConfig,

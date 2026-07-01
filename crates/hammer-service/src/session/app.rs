@@ -3,9 +3,10 @@ use std::sync::Arc;
 
 use hammer_adapter::{BufferIndex, DataPlaneBuffers};
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_infra::fifo::Fifo;
 use hammer_infra::map::FlatHashTable;
 use hammer_infra::msg_queue::{MsgQueue, SessionEvt, SessionEvtType};
-use hammer_infra::segment::{Local, Segment};
+use hammer_infra::segment::{Local, Segment, Svm};
 use hammer_infra::vec::Vec;
 use hammer_runtime::app::AppSession;
 
@@ -16,6 +17,8 @@ pub struct SessionAppRuntime<S: Segment> {
     sessions: FlatHashTable<u64, Arc<AppSession<S>>>,
     sessions_by_index: Vec<Option<SessionId>>,
     tx_evt_q: Arc<MsgQueue<S>>,
+    worker_index: usize,
+    seg: S,
 }
 
 impl<S: Segment> fmt::Debug for SessionAppRuntime<S> {
@@ -35,12 +38,16 @@ impl<S: Segment> SessionAppRuntime<S> {
         session_capacity: usize,
         buffers: DataPlaneBuffers,
         tx_evt_q: Arc<MsgQueue<S>>,
+        worker_index: usize,
+        seg: S,
     ) -> Self {
         Self {
             buffers,
             sessions: FlatHashTable::new(),
             sessions_by_index: Vec::from_elem_copy(session_capacity, None),
             tx_evt_q,
+            worker_index,
+            seg,
         }
     }
 
@@ -279,6 +286,80 @@ impl SessionAppRuntime<Local> {
             1024,
             DataPlaneBuffers::with_buffer_capacity(2048, 1),
             tx_evt_q,
+            0,
+            Local::default(),
         )
+    }
+
+    pub(crate) fn create_app_session(
+        &self,
+        handle: hammer_runtime::app::SessionHandle,
+        config: hammer_runtime::app::AppSessionConfig,
+        tx_evt_q: Arc<MsgQueue<Local>>,
+    ) -> CoreResult<Arc<AppSession<Local>>> {
+        hammer_runtime::app::with_current_app_worker(self.worker_index, |worker| {
+            worker
+                .attach_session_local_with_runtime_tx(handle, config, tx_evt_q)
+                .map_err(CoreError::from)
+        })
+    }
+
+    fn notify_rx(&self, session: &AppSession<Local>) {
+        let handle = session.session_handle();
+        hammer_runtime::app::with_current_app_worker(self.worker_index, |w| w.wake_rx(handle));
+    }
+
+    fn notify_tx(&self, session: &AppSession<Local>) {
+        let handle = session.session_handle();
+        hammer_runtime::app::with_current_app_worker(self.worker_index, |w| w.wake_tx(handle));
+    }
+
+    fn notify_evt(&self, session: &AppSession<Local>) {
+        let handle = session.session_handle();
+        hammer_runtime::app::with_current_app_worker(self.worker_index, |w| w.wake_evt(handle));
+    }
+}
+
+impl SessionAppRuntime<Svm> {
+    pub(crate) fn create_app_session(
+        &self,
+        handle: hammer_runtime::app::SessionHandle,
+        config: hammer_runtime::app::AppSessionConfig,
+        tx_evt_q: Arc<MsgQueue<Svm>>,
+    ) -> CoreResult<Arc<AppSession<Svm>>> {
+        let rx_fifo = Arc::new(
+            Fifo::<Svm>::new(self.seg.clone(), config.fifo_capacity)
+                .map_err(|e| CoreError::internal(format!("svm rx fifo: {e:?}")))?,
+        );
+        let tx_fifo = Arc::new(
+            Fifo::<Svm>::new(self.seg.clone(), config.fifo_capacity)
+                .map_err(|e| CoreError::internal(format!("svm tx fifo: {e:?}")))?,
+        );
+        let evt_q_ring = config
+            .evt_q_capacity
+            .saturating_add(1)
+            .next_power_of_two()
+            .max(2);
+        let evt_q = Arc::new(
+            MsgQueue::<Svm>::new(self.seg.clone(), evt_q_ring)
+                .map_err(|e| CoreError::internal(format!("svm evt_q: {e:?}")))?,
+        );
+
+        let session = Arc::new(AppSession::<Svm>::from_parts(
+            rx_fifo, tx_fifo, evt_q, tx_evt_q, handle,
+        ));
+        Ok(session)
+    }
+
+    fn notify_rx(&self, session: &AppSession<Svm>) {
+        session.evt_q().fire();
+    }
+
+    fn notify_tx(&self, session: &AppSession<Svm>) {
+        session.tx_evt_q().fire();
+    }
+
+    fn notify_evt(&self, session: &AppSession<Svm>) {
+        session.evt_q().fire();
     }
 }
