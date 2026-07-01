@@ -16,9 +16,9 @@ pub use key::BihashKey;
 ///           fits in a single cache line for performance. See `template.rs` for
 ///           recommended values per `(K, V)` pair.
 pub struct Bihash<K: BihashKey, V: Copy + Eq, const KVP: usize> {
-    buckets: Vec<Bucket>,                    // Task 2: `Bucket` struct
-    pages: Vec<ValuePage<K, V, KVP>>,         // Task 3
-    freelists: [Vec<u32>; 32],                // Task 3: page free list keyed by log2_pages
+    buckets: Vec<Bucket>,             // Task 2: `Bucket` struct
+    pages: Vec<ValuePage<K, V, KVP>>, // Task 3
+    freelists: [Vec<u32>; 32],        // Task 3: page free list keyed by log2_pages
     len: usize,
     nbuckets: u32,
     log2_nbuckets: u8,
@@ -26,15 +26,9 @@ pub struct Bihash<K: BihashKey, V: Copy + Eq, const KVP: usize> {
     _val: core::marker::PhantomData<V>,
 }
 
-// Stub types — replaced in Tasks 2 and 3.
-#[derive(Clone, Copy, Default)]
-#[repr(transparent)]
-pub struct Bucket(u64);
+pub mod bucket;
+pub use bucket::Bucket;
 
-impl Bucket {
-    /// Sentinel value for an empty bucket.
-    const EMPTY: u64 = u64::MAX;
-}
 struct ValuePage<K, V, const KVP: usize>(core::marker::PhantomData<(K, V)>);
 
 impl<K: BihashKey, V: Copy + Eq, const KVP: usize> Bihash<K, V, KVP> {
@@ -48,7 +42,7 @@ impl<K: BihashKey, V: Copy + Eq, const KVP: usize> Bihash<K, V, KVP> {
         let actual_buckets = nbuckets.next_power_of_two();
         let log2 = actual_buckets.trailing_zeros() as u8;
         Self {
-            buckets: vec![Bucket(Bucket::EMPTY); actual_buckets as usize],
+            buckets: vec![Bucket::empty(); actual_buckets as usize],
             pages: Vec::new(),
             freelists: core::array::from_fn(|_| Vec::new()),
             len: 0,

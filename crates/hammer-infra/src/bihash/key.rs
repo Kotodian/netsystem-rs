@@ -12,30 +12,46 @@ pub trait BihashKey: Copy + Eq {
 
 impl BihashKey for u64 {
     #[inline(always)]
-    fn hash(self) -> u64 { splitmix64(self) }
+    fn hash(self) -> u64 {
+        splitmix64(self)
+    }
     #[inline(always)]
-    fn key_eq(self, other: Self) -> bool { self == other }
+    fn key_eq(self, other: Self) -> bool {
+        self == other
+    }
 }
 
 impl BihashKey for u32 {
     #[inline(always)]
-    fn hash(self) -> u64 { splitmix64(u64::from(self)) }
+    fn hash(self) -> u64 {
+        splitmix64(u64::from(self))
+    }
     #[inline(always)]
-    fn key_eq(self, other: Self) -> bool { self == other }
+    fn key_eq(self, other: Self) -> bool {
+        self == other
+    }
 }
 
 impl BihashKey for u16 {
     #[inline(always)]
-    fn hash(self) -> u64 { splitmix64(u64::from(self)) }
+    fn hash(self) -> u64 {
+        splitmix64(u64::from(self))
+    }
     #[inline(always)]
-    fn key_eq(self, other: Self) -> bool { self == other }
+    fn key_eq(self, other: Self) -> bool {
+        self == other
+    }
 }
 
 impl BihashKey for usize {
     #[inline(always)]
-    fn hash(self) -> u64 { splitmix64(self as u64) }
+    fn hash(self) -> u64 {
+        splitmix64(self as u64)
+    }
     #[inline(always)]
-    fn key_eq(self, other: Self) -> bool { self == other }
+    fn key_eq(self, other: Self) -> bool {
+        self == other
+    }
 }
 
 impl BihashKey for u128 {
@@ -45,7 +61,9 @@ impl BihashKey for u128 {
         splitmix64(folded)
     }
     #[inline(always)]
-    fn key_eq(self, other: Self) -> bool { self == other }
+    fn key_eq(self, other: Self) -> bool {
+        self == other
+    }
 }
 
 /// XOR-fold helper used by composite keys.
