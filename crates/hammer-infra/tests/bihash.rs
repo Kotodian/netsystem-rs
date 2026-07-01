@@ -150,3 +150,41 @@ fn bihash_lookup_miss_on_empty_table() {
     let t: Bihash<u64, u64, 7> = Bihash::new(16);
     assert_eq!(t.lookup(&42), None);
 }
+
+#[test]
+fn bihash_insert_then_lookup_returns_value() {
+    let mut t: Bihash<u64, u64, 7> = Bihash::new(16);
+    t.insert(1, 100);
+    t.insert(2, 200);
+    t.insert(3, 300);
+    assert_eq!(t.lookup(&1), Some(100));
+    assert_eq!(t.lookup(&2), Some(200));
+    assert_eq!(t.lookup(&3), Some(300));
+    assert_eq!(t.lookup(&4), None);
+    assert_eq!(t.len(), 3);
+}
+
+#[test]
+fn bihash_insert_overwrite_replaces_value_without_growing_len() {
+    let mut t: Bihash<u64, u64, 7> = Bihash::new(8);
+    t.insert(7, 1);
+    t.insert(7, 2);
+    assert_eq!(t.lookup(&7), Some(2));
+    assert_eq!(t.len(), 1);
+}
+
+#[test]
+fn bihash_insert_distinct_keys_that_hash_to_same_bucket() {
+    // 1000 distinct keys in an 8-bucket table — collisions guaranteed.
+    // NOTE: If this test panics with "Task 6: bucket split on overflow",
+    // that means a page filled up — expected for this task. Task 6 fixes it.
+    // Use KVP=4 so each page holds 4 entries, forcing overflow quickly.
+    let mut t: Bihash<u64, u64, 4> = Bihash::new(8);
+    for k in 0..1000u64 {
+        t.insert(k, k * 3);
+    }
+    for k in 0..1000u64 {
+        assert_eq!(t.lookup(&k), Some(k * 3), "key {k} missing after insert");
+    }
+    assert_eq!(t.len(), 1000);
+}
