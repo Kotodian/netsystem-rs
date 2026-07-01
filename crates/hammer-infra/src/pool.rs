@@ -1,10 +1,12 @@
-use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
+use std::alloc::{Layout, handle_alloc_error};
 use std::fmt;
 use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
+use std::sync::Arc;
 
 use crate::align::{self, CACHE_LINE};
 use crate::bitmap::Bitmap;
+use crate::heap::{Heap, HeapLocal};
 use crate::vec::Vec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -39,6 +41,10 @@ pub struct Pool<T, const ALIGN: usize = CACHE_LINE> {
     free: Vec<u32>,
     free_bitmap: Bitmap,
     generations: Vec<u32>,
+    /// Heap that allocated the backing slab. Retained so `Drop` can route the
+    /// slab dealloc through the same `Heap` (e.g. `HeapSvm::dealloc` returns
+    /// the offset to the shared-memory region, not `std::alloc::dealloc`).
+    heap: Arc<dyn Heap>,
     _marker: PhantomData<T>,
 }
 
@@ -46,8 +52,19 @@ unsafe impl<T: Send, const ALIGN: usize> Send for Pool<T, ALIGN> {}
 unsafe impl<T: Sync, const ALIGN: usize> Sync for Pool<T, ALIGN> {}
 
 impl<T, const ALIGN: usize> Pool<T, ALIGN> {
+    /// Allocates the backing slab from the global allocator (`HeapLocal`).
+    /// Equivalent to `with_capacity_in(capacity, Arc::new(HeapLocal::new(0)))`.
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_capacity_in(capacity, Arc::new(HeapLocal::new(0)))
+    }
+
+    /// Allocates the backing slab from the provided `heap` and retains the
+    /// heap handle so that `Drop` can dealloc through the same allocator
+    /// (`HeapSvm` dealloc returns the offset to the shared-memory region,
+    /// `HeapLocal` dealloc hands the slab back to the global allocator).
+    #[inline]
+    pub fn with_capacity_in(capacity: usize, heap: Arc<dyn Heap>) -> Self {
         let stride = align::slot_stride::<T, ALIGN>();
         let layout = if capacity == 0 {
             None
@@ -62,12 +79,13 @@ impl<T, const ALIGN: usize> Pool<T, ALIGN> {
         };
         let ptr = match layout {
             Some(layout) => {
-                // SAFETY: `layout` is valid and non-zero-sized by construction.
-                let ptr = unsafe { alloc(layout) };
-                match NonNull::new(ptr) {
-                    Some(ptr) => ptr,
-                    None => handle_alloc_error(layout),
-                }
+                let ptr = heap
+                    .alloc(layout)
+                    .unwrap_or_else(|| handle_alloc_error(layout));
+                // Zero the slab so freelist/bitmap walk assumptions hold and
+                // `iter` / `remove` never read uninitialised bytes.
+                unsafe { ptr::write_bytes(ptr.as_ptr(), 0, layout.size()) };
+                ptr
             }
             None => NonNull::dangling(),
         };
@@ -89,6 +107,7 @@ impl<T, const ALIGN: usize> Pool<T, ALIGN> {
             free,
             free_bitmap,
             generations: (0..capacity).map(|_| 0).collect(),
+            heap,
             _marker: PhantomData,
         }
     }
@@ -233,7 +252,9 @@ impl<T, const ALIGN: usize> Drop for Pool<T, ALIGN> {
             }
         }
         if let Some(layout) = self.layout {
-            unsafe { dealloc(self.ptr.as_ptr(), layout) };
+            // SAFETY: `layout` matches the one passed to `self.heap.alloc` in
+            // `with_capacity_in`, and `self.ptr` was returned by that call.
+            unsafe { self.heap.dealloc(self.ptr, layout) };
         }
     }
 }
