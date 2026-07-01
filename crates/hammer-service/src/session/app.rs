@@ -173,17 +173,25 @@ impl<S: Segment> SessionAppRuntime<S> {
             buffers.free_index(index);
             return Ok((0, None, 0));
         };
-        let mut bytes = Vec::new();
+        let mut total_len = 0u32;
+        let mut delivered = 0u32;
         for buf in buffers.chain(index) {
             let buf = buf?;
-            bytes.extend_from_slice(buf.current());
+            let current = buf.current();
+            let chunk_offset = offset
+                .checked_add(total_len)
+                .ok_or_else(|| CoreError::internal("ooo rx offset overflow"))?;
+            let result = session
+                .rx_fifo()
+                .enqueue_ooo(chunk_offset, current)
+                .map_err(|_| CoreError::internal("ooo enqueue failed"))?;
+            delivered = delivered.wrapping_add(result.delivered);
+            total_len = total_len
+                .checked_add(current.len() as u32)
+                .ok_or_else(|| CoreError::internal("ooo rx buffer length overflow"))?;
         }
         buffers.free_index(index);
-        let result = session
-            .rx_fifo()
-            .enqueue_ooo(offset, &bytes)
-            .map_err(|_| CoreError::internal("ooo enqueue failed"))?;
-        Ok((result.delivered, Some(offset), bytes.len() as u32))
+        Ok((delivered, Some(offset), total_len))
     }
 
     pub(crate) fn free_pending_send(&mut self, session_id: SessionId) {
