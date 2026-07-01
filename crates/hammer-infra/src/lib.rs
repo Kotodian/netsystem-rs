@@ -1,4 +1,5 @@
 pub mod align;
+pub mod bihash;
 pub mod bitmap;
 pub mod boxed;
 pub mod checksum;
