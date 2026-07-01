@@ -316,6 +316,14 @@ where
             if enqueue.accepted_len != accepted_len as u32 {
                 immediate_ack = true;
             }
+            if let Some(available) = queue.rx_available_len(session_id) {
+                let connection = queue.session_mut(session_id).ok_or_else(|| {
+                    let _ = runtime
+                        .record_current_node_error(TcpNodeError::EstablishedSessionMissing.code());
+                    TcpNodeError::EstablishedSessionMissing
+                })?;
+                connection.set_rcv_wnd(available);
+            }
             release_input = false;
         } else if duplicate_payload {
             let connection = queue.session_mut(session_id).ok_or_else(|| {

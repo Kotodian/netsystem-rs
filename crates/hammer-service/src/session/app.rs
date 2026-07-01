@@ -106,6 +106,12 @@ impl<S: Segment> SessionAppRuntime<S> {
             .filter(|len| *len != 0))
     }
 
+    pub(crate) fn rx_available_len(&self, session_id: SessionId) -> Option<usize> {
+        self.sessions
+            .lookup(&session_id.get())
+            .map(|session| session.rx_fifo().max_enqueue())
+    }
+
     #[inline]
     pub(crate) fn has_pending_send(&self, session_id: SessionId) -> bool {
         self.pending_send_len(session_id).ok().flatten().is_some()

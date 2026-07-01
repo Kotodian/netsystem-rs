@@ -461,6 +461,10 @@ where
         self.rcv_wnd
     }
 
+    pub(crate) fn set_rcv_wnd(&mut self, available: usize) {
+        self.rcv_wnd = u32::try_from(available).unwrap_or(u32::MAX);
+    }
+
     #[inline]
     pub fn close_reason(&self) -> Option<TcpCloseReason> {
         self.cacheline1.close_reason

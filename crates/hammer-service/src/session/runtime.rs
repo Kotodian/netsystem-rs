@@ -355,6 +355,10 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
         self.app_state.app.has_pending_send(session_id)
     }
 
+    pub(crate) fn rx_available_len(&self, session_id: SessionId) -> Option<usize> {
+        self.app_state.app.rx_available_len(session_id)
+    }
+
     pub(crate) fn release_tx_up_to(
         &mut self,
         session_id: SessionId,
