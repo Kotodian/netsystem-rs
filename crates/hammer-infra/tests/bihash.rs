@@ -144,3 +144,9 @@ fn page_alloc_free_reuses_page_id_lifo() {
     assert_eq!(p1, p2);
     assert_eq!(a.live_pages(), 1);
 }
+
+#[test]
+fn bihash_lookup_miss_on_empty_table() {
+    let t: Bihash<u64, u64, 7> = Bihash::new(16);
+    assert_eq!(t.lookup(&42), None);
+}

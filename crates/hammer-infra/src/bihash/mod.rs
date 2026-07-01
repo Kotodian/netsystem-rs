@@ -9,6 +9,7 @@ pub mod key;
 pub mod bucket;
 pub mod value;
 pub mod alloc;
+pub mod ops;
 
 pub use key::BihashKey;
 pub use bucket::Bucket;
