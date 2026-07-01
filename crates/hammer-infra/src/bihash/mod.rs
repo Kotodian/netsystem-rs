@@ -6,7 +6,14 @@
 //! instead of the C preprocessor.
 
 pub mod key;
+pub mod bucket;
+pub mod value;
+pub mod alloc;
+
 pub use key::BihashKey;
+pub use bucket::Bucket;
+pub use value::{Kv, ValuePage, FREE_U64};
+pub use alloc::{PageAlloc, PageId};
 
 /// A bounded-index extensible hash table.
 ///
@@ -16,22 +23,14 @@ pub use key::BihashKey;
 ///           fits in a single cache line for performance. See `template.rs` for
 ///           recommended values per `(K, V)` pair.
 pub struct Bihash<K: BihashKey, V: Copy + Eq, const KVP: usize> {
-    buckets: Vec<Bucket>,             // Task 2: `Bucket` struct
-    pages: Vec<ValuePage<K, V, KVP>>, // Task 3
-    freelists: [Vec<u32>; 32],        // Task 3: page free list keyed by log2_pages
+    buckets: Vec<Bucket>,
+    pages: PageAlloc<K, V, KVP>,
     len: usize,
     nbuckets: u32,
     log2_nbuckets: u8,
-    _key: core::marker::PhantomData<K>,
-    _val: core::marker::PhantomData<V>,
 }
 
-pub mod bucket;
-pub use bucket::Bucket;
-
-struct ValuePage<K, V, const KVP: usize>(core::marker::PhantomData<(K, V)>);
-
-impl<K: BihashKey, V: Copy + Eq, const KVP: usize> Bihash<K, V, KVP> {
+impl<K: BihashKey + Default, V: Copy + Eq + Default, const KVP: usize> Bihash<K, V, KVP> {
     /// Create a bihash with at least `nbuckets` buckets. `nbuckets` is
     /// rounded up to the next power of two; `log2_nbuckets` is stored and
     /// used to select bucket indices from hash bits.
@@ -43,13 +42,10 @@ impl<K: BihashKey, V: Copy + Eq, const KVP: usize> Bihash<K, V, KVP> {
         let log2 = actual_buckets.trailing_zeros() as u8;
         Self {
             buckets: vec![Bucket::empty(); actual_buckets as usize],
-            pages: Vec::new(),
-            freelists: core::array::from_fn(|_| Vec::new()),
+            pages: PageAlloc::new(),
             len: 0,
             nbuckets: actual_buckets,
             log2_nbuckets: log2,
-            _key: core::marker::PhantomData,
-            _val: core::marker::PhantomData,
         }
     }
 
