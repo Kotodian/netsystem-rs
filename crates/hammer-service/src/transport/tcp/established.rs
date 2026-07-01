@@ -313,6 +313,9 @@ where
             if enqueue.delivered_len != 0 {
                 queue.mark_ready(session_id);
             }
+            if enqueue.accepted_len != accepted_len as u32 {
+                immediate_ack = true;
+            }
             release_input = false;
         } else if duplicate_payload {
             let connection = queue.session_mut(session_id).ok_or_else(|| {

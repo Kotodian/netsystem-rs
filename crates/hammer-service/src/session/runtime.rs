@@ -33,9 +33,11 @@ struct ExpiredTimer {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SessionRxEnqueue {
+    pub(crate) accepted_len: u32,
     pub(crate) delivered_len: u32,
     pub(crate) newest_ooo_start: Option<u32>,
     pub(crate) newest_ooo_len: u32,
+    pub(crate) fifo_full: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -393,9 +395,11 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
                 .copy_rx_from_buffer(session_id, buffers, index)?;
             buffers.free_index(index);
             Ok(SessionRxEnqueue {
+                accepted_len: wrote as u32,
                 delivered_len: wrote as u32,
                 newest_ooo_start: None,
                 newest_ooo_len: 0,
+                fifo_full: wrote == 0,
             })
         } else {
             let (delivered, ooo_start, ooo_len) = self
@@ -403,9 +407,11 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
                 .app
                 .copy_rx_from_buffer_ooo(session_id, buffers, index, offset)?;
             Ok(SessionRxEnqueue {
+                accepted_len: ooo_len,
                 delivered_len: delivered,
                 newest_ooo_start: ooo_start,
                 newest_ooo_len: ooo_len,
+                fifo_full: ooo_len == 0,
             })
         }
     }
