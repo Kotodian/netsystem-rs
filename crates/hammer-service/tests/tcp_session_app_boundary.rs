@@ -126,3 +126,17 @@ fn session_app_runtime_has_local_and_svm_impl_blocks() {
         "app.rs must not use Box<dyn>"
     );
 }
+
+#[test]
+fn ensure_tcp_session_queue_dispatches_to_svm() {
+    let tcp_mod_source = include_str!("../src/transport/tcp/mod.rs");
+
+    assert!(
+        tcp_mod_source.contains("new_svm"),
+        "ensure_tcp_session_queue must use new_svm() for Svm backend"
+    );
+    assert!(
+        tcp_mod_source.contains("new("),
+        "ensure_tcp_session_queue must use new() for Local backend"
+    );
+}

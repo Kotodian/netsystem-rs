@@ -123,13 +123,36 @@ pub(crate) fn ensure_tcp_session_queue<C: CongestionController + 'static>(
         u32::try_from(worker)
             .map_err(|_| CoreError::internal("worker index does not fit into u32"))?,
     );
-    let queue = crate::session::node::register_session_queue(TcpSessionDriver::<C>::new(
-        worker_id,
-        rt.buffers().clone(),
-    ))?;
-    let data = queue.runtime_data();
-    tcp_worker_state_mut().set_queue_runtime_data(data);
-    Ok(data)
+
+    let backend = crate::transport::session_backend()
+        .ok_or_else(|| CoreError::internal("transport main not initialized"))?;
+
+    let runtime_data = match backend {
+        hammer_core::config::SessionBackend::Local => {
+            type Seg = hammer_infra::segment::Local;
+            let queue = crate::session::node::register_session_queue(
+                SessionDriverRuntime::<TcpConnection<C>, Seg>::new(
+                    worker_id,
+                    rt.buffers().clone(),
+                )
+            )?;
+            queue.runtime_data()
+        }
+        hammer_core::config::SessionBackend::Svm => {
+            type Seg = hammer_infra::segment::Svm;
+            let queue = crate::session::node::register_session_queue(
+                SessionDriverRuntime::<TcpConnection<C>, Seg>::new_svm(
+                    worker_id,
+                    rt.buffers().clone(),
+                    hammer_runtime::app::AppSessionConfig::default(),
+                )
+            )?;
+            queue.runtime_data()
+        }
+    };
+
+    tcp_worker_state_mut().set_queue_runtime_data(runtime_data);
+    Ok(runtime_data)
 }
 
 // VPP alignment: `tcp_main_t tcp_main;` is a file-scope global in VPP's
