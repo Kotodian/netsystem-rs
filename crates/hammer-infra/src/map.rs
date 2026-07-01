@@ -1,4 +1,7 @@
+use std::sync::Arc;
+
 use crate::boxed::Slice;
+use crate::heap::Heap;
 use crate::prefetch::prefetch_read_l1;
 use crate::vec::Vec;
 
@@ -42,11 +45,19 @@ impl FlatHashKey for usize {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[deprecated(since = "0.1.0", note = "use hammer_infra::bihash::Bihash instead")]
 pub struct FlatHashTable<K: FlatHashKey, V: Clone> {
     buckets: Slice<FlatHashBucket<K, V>>,
     len: usize,
+    /// Heap that allocated the bucket storage. Retained so the `grow`
+    /// path can re-allocate a larger bucket slice from the same `Heap`
+    /// (the SVM vtable's `dealloc` returns the offset to the
+    /// shared-memory region; the Local vtable's `dealloc` hands the
+    /// storage back to the global allocator). `Heap` deliberately
+    /// does not implement `Debug`, so the struct's `Debug` impl is
+    /// hand-rolled below to match the pre-derive output.
+    heap: Arc<Heap>,
 }
 
 impl<K: FlatHashKey, V: Clone> FlatHashTable<K, V> {
@@ -62,10 +73,23 @@ impl<K: FlatHashKey, V: Clone> FlatHashTable<K, V> {
 
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_capacity_in(capacity, Arc::new(Heap::local(0)))
+    }
+
+    /// Allocates the bucket storage from the provided `heap`. The
+    /// `Slice<Bucket>` is constructed via `Slice::from_elem_in`, so
+    /// `Drop` will dealloc the buckets through the same `Heap` (SVM
+    /// region or local). The `heap` is also retained for the `grow`
+    /// path so a rehash re-allocates a larger bucket slice from the
+    /// same `Heap`.
+    #[inline]
+    pub fn with_capacity_in(capacity: usize, heap: Arc<Heap>) -> Self {
         let capacity = capacity.next_power_of_two().max(1);
+        let buckets = Slice::from_elem_in(capacity, FlatHashBucket::empty(), heap.clone());
         Self {
-            buckets: Slice::from_elem(capacity, FlatHashBucket::empty()),
+            buckets,
             len: 0,
+            heap,
         }
     }
 
@@ -189,10 +213,12 @@ impl<K: FlatHashKey, V: Clone> FlatHashTable<K, V> {
     #[inline]
     fn grow(&mut self) {
         let next_capacity = self.buckets.len() * 2;
-        let old_buckets = std::mem::replace(
-            &mut self.buckets,
-            Slice::from_elem(next_capacity, FlatHashBucket::empty()),
-        );
+        // The new bucket slice must come from the same Heap that owns
+        // the existing slice; otherwise a later `Drop` would dealloc
+        // the new slice through a foreign allocator.
+        let new_buckets =
+            Slice::from_elem_in(next_capacity, FlatHashBucket::empty(), self.heap.clone());
+        let old_buckets = std::mem::replace(&mut self.buckets, new_buckets);
         self.len = 0;
         for bucket in old_buckets.iter() {
             if let Some(entry) = bucket.entry.clone() {
@@ -247,6 +273,17 @@ impl<K: FlatHashKey, V: Clone> Default for FlatHashTable<K, V> {
     #[inline]
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<K: FlatHashKey + core::fmt::Debug, V: Clone + core::fmt::Debug> core::fmt::Debug
+    for FlatHashTable<K, V>
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FlatHashTable")
+            .field("len", &self.len)
+            .field("buckets", &self.buckets)
+            .finish()
     }
 }
 

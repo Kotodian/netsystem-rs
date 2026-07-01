@@ -1,16 +1,22 @@
-use std::alloc::{alloc, dealloc, handle_alloc_error};
+use std::alloc::handle_alloc_error;
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::ptr::{self, NonNull};
+use std::sync::Arc;
 
 use crate::align::{self, CACHE_LINE};
+use crate::heap::Heap;
 
 pub struct Slice<T, const ALIGN: usize = CACHE_LINE> {
     ptr: NonNull<T>,
     len: usize,
     cap: usize,
+    /// Heap that allocated the backing storage. Retained so `Drop` can
+    /// route the dealloc through the same `Heap`. `None` is only valid
+    /// when `cap == 0`; the allocating constructors always populate it.
+    heap: Option<Arc<Heap>>,
     _marker: PhantomData<T>,
 }
 
@@ -24,6 +30,7 @@ impl<T, const ALIGN: usize> Slice<T, ALIGN> {
             ptr: NonNull::dangling(),
             len: 0,
             cap: 0,
+            heap: None,
             _marker: PhantomData,
         }
     }
@@ -33,15 +40,27 @@ impl<T, const ALIGN: usize> Slice<T, ALIGN> {
     where
         T: Clone,
     {
+        Self::from_elem_in(len, value, Arc::new(Heap::local(0)))
+    }
+
+    /// Allocates `len` slots of `T` from the provided `heap` and
+    /// initialises every slot to `value.clone()`. The `heap` is retained
+    /// so `Drop` deallocs through the same `Heap` (SVM region or local).
+    #[inline]
+    pub fn from_elem_in(len: usize, value: T, heap: Arc<Heap>) -> Self
+    where
+        T: Clone,
+    {
         if len == 0 {
             return Self::new();
         }
 
-        let ptr = allocate::<T, ALIGN>(len);
+        let ptr = allocate_in::<T, ALIGN>(len, &heap);
         let mut guard = InitGuard::<T, ALIGN> {
             ptr,
             initialized: 0,
             cap: len,
+            heap: heap.clone(),
         };
         for index in 0..len {
             // SAFETY: `ptr` points to `len` writable slots and `index < len`.
@@ -54,6 +73,7 @@ impl<T, const ALIGN: usize> Slice<T, ALIGN> {
             ptr,
             len,
             cap: len,
+            heap: Some(heap),
             _marker: PhantomData,
         }
     }
@@ -65,11 +85,13 @@ impl<T, const ALIGN: usize> Slice<T, ALIGN> {
         }
 
         let cap = len;
-        let ptr = allocate::<T, ALIGN>(cap);
+        let heap = Arc::new(Heap::local(0));
+        let ptr = allocate_in::<T, ALIGN>(cap, &heap);
         let mut guard = InitGuard::<T, ALIGN> {
             ptr,
             initialized: 0,
             cap,
+            heap: heap.clone(),
         };
         for index in 0..len {
             // SAFETY: `ptr` points to `cap` writable slots and `index < cap`.
@@ -83,6 +105,7 @@ impl<T, const ALIGN: usize> Slice<T, ALIGN> {
             ptr,
             len,
             cap,
+            heap: Some(heap),
             _marker: PhantomData,
         }
     }
@@ -125,12 +148,22 @@ impl<T, const ALIGN: usize> Slice<T, ALIGN> {
         align::allocation_align::<T, ALIGN>()
     }
 
+    /// # Safety
+    /// `ptr` must have been returned by `heap.alloc` (or `allocate_in`)
+    /// with the layout matching `cap` slots of `T`; `heap` must be the
+    /// same `Heap` that produced `ptr`.
     #[inline]
-    pub(crate) unsafe fn from_raw_parts(ptr: NonNull<T>, len: usize, cap: usize) -> Self {
+    pub(crate) unsafe fn from_raw_parts(
+        ptr: NonNull<T>,
+        len: usize,
+        cap: usize,
+        heap: Arc<Heap>,
+    ) -> Self {
         Self {
             ptr,
             len,
             cap,
+            heap: Some(heap),
             _marker: PhantomData,
         }
     }
@@ -158,9 +191,15 @@ impl<T: fmt::Debug, const ALIGN: usize> fmt::Debug for Slice<T, ALIGN> {
 
 impl<T, const ALIGN: usize> Drop for Slice<T, ALIGN> {
     fn drop(&mut self) {
+        if self.cap == 0 {
+            return;
+        }
+        let Some(heap) = self.heap.as_ref() else {
+            return;
+        };
         unsafe {
             ptr::drop_in_place(std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len));
-            deallocate::<T, ALIGN>(self.ptr, self.cap);
+            deallocate_in::<T, ALIGN>(self.ptr, self.cap, heap);
         }
     }
 }
@@ -194,6 +233,7 @@ struct InitGuard<T, const ALIGN: usize> {
     ptr: NonNull<T>,
     initialized: usize,
     cap: usize,
+    heap: Arc<Heap>,
 }
 
 impl<T, const ALIGN: usize> Drop for InitGuard<T, ALIGN> {
@@ -203,32 +243,34 @@ impl<T, const ALIGN: usize> Drop for InitGuard<T, ALIGN> {
                 self.ptr.as_ptr(),
                 self.initialized,
             ));
-            deallocate::<T, ALIGN>(self.ptr, self.cap);
+            deallocate_in::<T, ALIGN>(self.ptr, self.cap, &self.heap);
         }
     }
 }
 
 #[inline]
-pub(crate) fn allocate<T, const ALIGN: usize>(capacity: usize) -> NonNull<T> {
+pub(crate) fn allocate_in<T, const ALIGN: usize>(capacity: usize, heap: &Heap) -> NonNull<T> {
     if capacity == 0 {
         return NonNull::dangling();
     }
     let layout = align::array_layout::<T, ALIGN>(capacity);
-    // SAFETY: `layout` is valid and non-zero-sized by construction.
-    let ptr = unsafe { alloc(layout) };
-    match NonNull::new(ptr.cast::<T>()) {
-        Some(ptr) => ptr,
-        None => handle_alloc_error(layout),
-    }
+    let ptr = heap
+        .alloc(layout)
+        .unwrap_or_else(|| handle_alloc_error(layout));
+    NonNull::new(ptr.as_ptr().cast::<T>()).expect("Heap::alloc returned null")
 }
 
 #[inline]
-pub(crate) unsafe fn deallocate<T, const ALIGN: usize>(ptr: NonNull<T>, capacity: usize) {
+pub(crate) unsafe fn deallocate_in<T, const ALIGN: usize>(
+    ptr: NonNull<T>,
+    capacity: usize,
+    heap: &Heap,
+) {
     if capacity == 0 {
         return;
     }
     let layout = align::array_layout::<T, ALIGN>(capacity);
-    // SAFETY: Callers pass the same pointer/capacity pair returned by
-    // `allocate`.
-    unsafe { dealloc(ptr.as_ptr().cast::<u8>(), layout) };
+    let raw = ptr.as_ptr().cast::<u8>();
+    let nn = NonNull::new(raw).expect("Heap::dealloc received null");
+    unsafe { heap.dealloc(nn, layout) };
 }
