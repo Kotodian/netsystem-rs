@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::align::{self, CACHE_LINE};
 use crate::bitmap::Bitmap;
-use crate::heap::{Heap, HeapLocal};
+use crate::heap::Heap;
 use crate::vec::Vec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -42,9 +42,10 @@ pub struct Pool<T, const ALIGN: usize = CACHE_LINE> {
     free_bitmap: Bitmap,
     generations: Vec<u32>,
     /// Heap that allocated the backing slab. Retained so `Drop` can route the
-    /// slab dealloc through the same `Heap` (e.g. `HeapSvm::dealloc` returns
-    /// the offset to the shared-memory region, not `std::alloc::dealloc`).
-    heap: Arc<dyn Heap>,
+    /// slab dealloc through the same `Heap` (e.g. the SVM vtable's `dealloc`
+    /// returns the offset to the shared-memory region; the Local vtable's
+    /// `dealloc` calls `std::alloc::dealloc`).
+    heap: Arc<Heap>,
     _marker: PhantomData<T>,
 }
 
@@ -52,19 +53,20 @@ unsafe impl<T: Send, const ALIGN: usize> Send for Pool<T, ALIGN> {}
 unsafe impl<T: Sync, const ALIGN: usize> Sync for Pool<T, ALIGN> {}
 
 impl<T, const ALIGN: usize> Pool<T, ALIGN> {
-    /// Allocates the backing slab from the global allocator (`HeapLocal`).
-    /// Equivalent to `with_capacity_in(capacity, Arc::new(HeapLocal::new(0)))`.
+    /// Allocates the backing slab from the global allocator (`Heap::local`).
+    /// Equivalent to `with_capacity_in(capacity, Arc::new(Heap::local(0)))`.
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
-        Self::with_capacity_in(capacity, Arc::new(HeapLocal::new(0)))
+        Self::with_capacity_in(capacity, Arc::new(Heap::local(0)))
     }
 
     /// Allocates the backing slab from the provided `heap` and retains the
     /// heap handle so that `Drop` can dealloc through the same allocator
-    /// (`HeapSvm` dealloc returns the offset to the shared-memory region,
-    /// `HeapLocal` dealloc hands the slab back to the global allocator).
+    /// (the SVM vtable's `dealloc` returns the offset to the shared-memory
+    /// region; the Local vtable's `dealloc` hands the slab back to the
+    /// global allocator).
     #[inline]
-    pub fn with_capacity_in(capacity: usize, heap: Arc<dyn Heap>) -> Self {
+    pub fn with_capacity_in(capacity: usize, heap: Arc<Heap>) -> Self {
         let stride = align::slot_stride::<T, ALIGN>();
         let layout = if capacity == 0 {
             None

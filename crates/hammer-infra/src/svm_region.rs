@@ -98,6 +98,20 @@ impl SvmRegion {
         self.inner.fd
     }
 
+    /// Current bump-pointer offset. Read-only; no side effects.
+    pub fn bump_depth(&self) -> u64 {
+        self.inner.bump.load(Ordering::Relaxed)
+    }
+
+    /// Number of entries in the LIFO free list.
+    pub fn freelist_len(&self) -> usize {
+        self.inner
+            .free_list
+            .lock()
+            .expect("svm_region free_list")
+            .len()
+    }
+
     /// Best-fit search of the LIFO free list; on miss, bump-allocates.
     /// Returns `u64::MAX` on OOM. The returned offset is `align`-aligned
     /// and satisfies `offset + bytes <= base + size`.
