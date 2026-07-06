@@ -28,6 +28,7 @@ use spinning_top::{
 
 use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HandoffIndices};
 use crate::instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
+use crate::memory::{HAMMER_MAX_NUMA_NODES, StaticNumaTable};
 use crate::node::{NodeEntry, NodeHandle, NodeId, NodeNext, NodeRuntime};
 use crate::trace::{DataPlaneTrace, PacketTrace, TraceControlHandle};
 
@@ -989,10 +990,19 @@ impl BufferThreadCache {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BufferPool {
     arena: BufferPoolArena,
     thread_cache: Rc<RefCell<BufferThreadCache>>,
+}
+
+impl Clone for BufferPool {
+    fn clone(&self) -> Self {
+        Self {
+            arena: self.arena.clone(),
+            thread_cache: Rc::clone(&self.thread_cache),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1021,9 +1031,11 @@ pub struct PooledBufferFrame {
     frame: BufferFrame,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DataPlaneBuffers {
-    buffers: BufferPool,
+    buffer_pools: StaticNumaTable<BufferPool, HAMMER_MAX_NUMA_NODES>,
+    active_numa_node: u32,
+    thread_index: u32,
     frames: FramePool,
     frame_capacity: usize,
     frame_slots: usize,
@@ -1041,12 +1053,37 @@ pub struct DataPlaneRuntime {
     active_numa_node: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct DataPlaneRuntimeWorkerSeed {
-    buffer_arena: BufferPoolArena,
+    buffer_arenas: StaticNumaTable<BufferPoolArena, HAMMER_MAX_NUMA_NODES>,
     frame_capacity: usize,
     frame_slots: usize,
     instruction_set: DataPlaneInstructionSet,
+    handoff: Option<DataPlaneHandoffWorker>,
+    handoff_node_handle: Option<NodeHandle>,
+}
+
+impl fmt::Debug for DataPlaneBuffers {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DataPlaneBuffers")
+            .field("active_numa_node", &self.active_numa_node)
+            .field("thread_index", &self.thread_index)
+            .field("frame_capacity", &self.frame_capacity)
+            .field("frame_slots", &self.frame_slots)
+            .field("instruction_set", &self.instruction_set)
+            .finish()
+    }
+}
+
+impl fmt::Debug for DataPlaneRuntimeWorkerSeed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DataPlaneRuntimeWorkerSeed")
+            .field("frame_capacity", &self.frame_capacity)
+            .field("frame_slots", &self.frame_slots)
+            .field("instruction_set", &self.instruction_set)
+            .field("handoff_node_handle", &self.handoff_node_handle)
+            .finish()
+    }
 }
 
 impl Clone for DataPlaneRuntime {
@@ -1064,14 +1101,21 @@ impl Clone for DataPlaneRuntime {
 
 impl DataPlaneRuntimeWorkerSeed {
     #[inline]
-    fn clone_for_worker(&self, _: u32, numa_node: u32) -> DataPlaneRuntime {
-        let mut runtime = DataPlaneRuntime::with_buffer_arena_and_frame_capacity(
-            self.buffer_arena.clone(),
+    fn clone_for_worker(&self, thread_index: u32, numa_node: u32) -> DataPlaneRuntime {
+        let mut runtime = DataPlaneRuntime::with_worker_buffer_arenas_and_frame_capacity(
+            self.buffer_arenas.clone(),
             self.frame_capacity,
             self.frame_slots,
             self.instruction_set,
+            thread_index,
+            numa_node,
         );
-        runtime.active_numa_node = numa_node;
+        runtime.handoff = self.handoff.clone();
+        runtime.handoff_node_handle = self.handoff_node_handle;
+        if let Some(handoff) = runtime.handoff.clone() {
+            runtime.buffers = runtime.buffers.with_handoff(handoff);
+            runtime.active_numa_node = runtime.buffers.active_numa_node();
+        }
         runtime
     }
 }
@@ -1090,6 +1134,22 @@ fn next_frame_pool_id() -> u64 {
 }
 
 impl DataPlaneBuffers {
+    #[inline]
+    pub fn with_numa_buffer_capacity(
+        slot_capacity: usize,
+        slots_per_numa: usize,
+        numa_nodes: &[u32],
+    ) -> Self {
+        Self::with_numa_capacities_and_instruction_set(
+            slot_capacity,
+            slots_per_numa,
+            DEFAULT_BUFFER_FRAME_CAPACITY,
+            DEFAULT_BUFFER_FRAME_POOL_SIZE,
+            numa_nodes,
+            DataPlaneInstructionSet::native(),
+        )
+    }
+
     #[inline]
     pub fn with_buffer_capacity(slot_capacity: usize, slots: usize) -> Self {
         Self::with_capacities_and_instruction_set(
@@ -1140,11 +1200,16 @@ impl DataPlaneBuffers {
         frame_slots: usize,
         instruction_set: DataPlaneInstructionSet,
     ) -> Self {
-        Self::with_buffer_arena_and_frame_capacity(
-            BufferPoolArena::with_capacity(buffer_slot_capacity, buffer_slots),
+        Self::with_buffer_arenas_and_frame_capacity(
+            Self::single_numa_buffer_arenas(BufferPoolArena::with_capacity(
+                buffer_slot_capacity,
+                buffer_slots,
+            )),
             frame_capacity,
             frame_slots,
             instruction_set,
+            0,
+            0,
         )
     }
 
@@ -1155,8 +1220,73 @@ impl DataPlaneBuffers {
         frame_slots: usize,
         instruction_set: DataPlaneInstructionSet,
     ) -> Self {
+        Self::with_buffer_arenas_and_frame_capacity(
+            Self::single_numa_buffer_arenas(buffer_arena),
+            frame_capacity,
+            frame_slots,
+            instruction_set,
+            0,
+            0,
+        )
+    }
+
+    #[inline]
+    fn with_numa_capacities_and_instruction_set(
+        buffer_slot_capacity: usize,
+        buffer_slots_per_numa: usize,
+        frame_capacity: usize,
+        frame_slots: usize,
+        numa_nodes: &[u32],
+        instruction_set: DataPlaneInstructionSet,
+    ) -> Self {
+        let mut buffer_arenas = StaticNumaTable::new();
+        let configured_numa_nodes = if numa_nodes.is_empty() {
+            &[0][..]
+        } else {
+            numa_nodes
+        };
+        for &numa_node in configured_numa_nodes {
+            let heap = Arc::new(Heap::local(numa_node));
+            buffer_arenas
+                .insert(
+                    numa_node,
+                    BufferPoolArena::with_capacity_in(
+                        buffer_slot_capacity,
+                        buffer_slots_per_numa,
+                        heap,
+                    ),
+                )
+                .expect("NUMA node must fit static buffer arena table");
+        }
+        let active_numa_node = if let Some(&first_numa_node) = configured_numa_nodes.first() {
+            first_numa_node
+        } else {
+            0
+        };
+        Self::with_buffer_arenas_and_frame_capacity(
+            buffer_arenas,
+            frame_capacity,
+            frame_slots,
+            instruction_set,
+            0,
+            active_numa_node,
+        )
+    }
+
+    #[inline]
+    fn with_buffer_arenas_and_frame_capacity(
+        buffer_arenas: StaticNumaTable<BufferPoolArena, HAMMER_MAX_NUMA_NODES>,
+        frame_capacity: usize,
+        frame_slots: usize,
+        instruction_set: DataPlaneInstructionSet,
+        thread_index: u32,
+        requested_numa_node: u32,
+    ) -> Self {
+        let active_numa_node = Self::resolve_numa_node(&buffer_arenas, requested_numa_node);
         Self {
-            buffers: BufferPool::with_arena(buffer_arena),
+            buffer_pools: Self::buffer_pools_from_arenas(&buffer_arenas),
+            active_numa_node,
+            thread_index,
             frames: FramePool::with_capacity(frame_capacity, frame_slots),
             frame_capacity,
             frame_slots,
@@ -1166,25 +1296,74 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    pub(crate) fn clone_for_worker(&self, _: u32, _: u32) -> Self {
-        Self::with_buffer_arena_and_frame_capacity(
-            self.buffers.arena(),
+    fn with_worker_buffer_arenas_and_frame_capacity(
+        buffer_arenas: StaticNumaTable<BufferPoolArena, HAMMER_MAX_NUMA_NODES>,
+        frame_capacity: usize,
+        frame_slots: usize,
+        instruction_set: DataPlaneInstructionSet,
+        thread_index: u32,
+        requested_numa_node: u32,
+    ) -> Self {
+        let active_numa_node = Self::resolve_numa_node(&buffer_arenas, requested_numa_node);
+        Self {
+            buffer_pools: Self::worker_buffer_pools_from_arenas(&buffer_arenas),
+            active_numa_node,
+            thread_index,
+            frames: FramePool::with_capacity(frame_capacity, frame_slots),
+            frame_capacity,
+            frame_slots,
+            instruction_set,
+            trace: DataPlaneTrace::default(),
+        }
+    }
+
+    #[inline]
+    pub fn clone_for_worker(&self, thread_index: u32, numa_node: u32) -> Self {
+        Self::with_worker_buffer_arenas_and_frame_capacity(
+            self.buffer_arenas(),
             self.frame_capacity,
             self.frame_slots,
             self.instruction_set,
+            thread_index,
+            numa_node,
         )
     }
 
     #[inline]
     fn with_handoff(mut self, handoff: DataPlaneHandoffWorker) -> Self {
-        self.buffers =
-            BufferPool::with_arena(handoff.set_or_get_buffer_arena(self.buffers.arena()));
+        let Some(configured_arena) = handoff.configured_buffer_arena() else {
+            return self;
+        };
+        let active_numa_node = self.active_numa_node;
+        let mut buffer_pools = StaticNumaTable::new();
+        for index in 0..HAMMER_MAX_NUMA_NODES {
+            let numa_node = u32::try_from(index).expect("static NUMA node index fits in u32");
+            let Some(pool) = self.buffer_pools.get(numa_node).cloned() else {
+                continue;
+            };
+            let pool = if numa_node == active_numa_node {
+                BufferPool::with_arena(configured_arena.clone())
+            } else {
+                pool
+            };
+            buffer_pools
+                .insert(numa_node, pool)
+                .expect("buffer pool NUMA node must fit static table");
+        }
+        self.buffer_pools = buffer_pools;
         self
     }
 
     #[inline]
     pub fn buffers(&self) -> &BufferPool {
-        &self.buffers
+        self.buffer_pools
+            .get(self.active_numa_node)
+            .expect("active NUMA buffer pool must exist")
+    }
+
+    #[inline]
+    pub fn active_numa_node(&self) -> u32 {
+        self.active_numa_node
     }
 
     #[inline]
@@ -1209,12 +1388,12 @@ impl DataPlaneBuffers {
 
     #[inline]
     pub fn in_use_buffers(&self) -> usize {
-        self.buffers.in_use()
+        self.buffers().in_use()
     }
 
     #[inline]
     pub fn cached_free_buffers(&self) -> usize {
-        self.buffers.cached_free_len()
+        self.buffers().cached_free_len()
     }
 
     #[inline]
@@ -1224,18 +1403,19 @@ impl DataPlaneBuffers {
 
     #[inline]
     pub fn alloc_index(&self) -> CoreResult<BufferIndex> {
-        self.buffers.alloc_index()
+        self.buffers().alloc_index()
     }
 
     #[inline]
     pub fn alloc_index_with_bytes(&self, bytes: &[u8]) -> CoreResult<BufferIndex> {
-        self.buffers.alloc_index_with_bytes(bytes)
+        self.buffers().alloc_index_with_bytes(bytes)
     }
 
     #[inline]
     pub fn free_index(&self, index: BufferIndex) {
-        let mut cache = self.buffers.thread_cache.borrow_mut();
-        self.buffers
+        let buffers = self.buffers();
+        let mut cache = buffers.thread_cache.borrow_mut();
+        buffers
             .arena
             .inner
             .write()
@@ -1244,27 +1424,27 @@ impl DataPlaneBuffers {
 
     #[inline]
     pub fn attach_clone(&self, head: BufferIndex, tail: BufferIndex) -> CoreResult<()> {
-        self.buffers.attach_clone(head, tail)
+        self.buffers().attach_clone(head, tail)
     }
 
     #[inline]
     pub fn chain_buffer(&self, head: BufferIndex, tail: BufferIndex) -> CoreResult<()> {
-        self.buffers.chain_buffer(head, tail)
+        self.buffers().chain_buffer(head, tail)
     }
 
     #[inline]
     pub fn prefetch_header(&self, index: BufferIndex) {
-        self.buffers.prefetch_header(index);
+        self.buffers().prefetch_header(index);
     }
 
     #[inline]
     pub fn prefetch_read(&self, index: BufferIndex) {
-        self.buffers.prefetch_read(index);
+        self.buffers().prefetch_read(index);
     }
 
     #[inline]
     pub fn prefetch_write(&self, index: BufferIndex) {
-        self.buffers.prefetch_write(index);
+        self.buffers().prefetch_write(index);
     }
 
     #[inline]
@@ -1311,7 +1491,7 @@ impl DataPlaneBuffers {
     pub fn free_frame_index(&self, index: FrameIndex) -> CoreResult<()> {
         let mut frame = self.frames.take_index(index)?;
         self.free_frame(&mut frame);
-        self.frames.free_taken_index(&self.buffers, index, frame)
+        self.frames.free_taken_index(self.buffers(), index, frame)
     }
 
     #[inline]
@@ -1320,7 +1500,7 @@ impl DataPlaneBuffers {
         match self.frames.take_index(index) {
             Ok(frame) => Ok(PooledBufferFrame { index, frame }),
             Err(err) => {
-                let _ = self.frames.free_index(&self.buffers, index);
+                let _ = self.frames.free_index(self.buffers(), index);
                 Err(err)
             }
         }
@@ -1331,7 +1511,7 @@ impl DataPlaneBuffers {
         let PooledBufferFrame { index, frame } = frame;
         let mut frame = frame;
         self.free_frame(&mut frame);
-        self.frames.free_taken_index(&self.buffers, index, frame)
+        self.frames.free_taken_index(self.buffers(), index, frame)
     }
 
     #[inline]
@@ -1366,17 +1546,17 @@ impl DataPlaneBuffers {
     ) -> CoreResult<()> {
         let mut frame = frame;
         self.free_frame(&mut frame);
-        self.frames.free_taken_index(&self.buffers, index, frame)
+        self.frames.free_taken_index(self.buffers(), index, frame)
     }
 
     #[inline]
     pub fn get_buffer(&self, index: BufferIndex) -> CoreResult<BufferRef<'_>> {
-        self.buffers.get(index)
+        self.buffers().get(index)
     }
 
     #[inline]
     pub fn get_buffer_mut(&self, index: BufferIndex) -> CoreResult<BufferRefMut<'_>> {
-        self.buffers.get_mut(index)
+        self.buffers().get_mut(index)
     }
 
     #[inline]
@@ -1384,32 +1564,120 @@ impl DataPlaneBuffers {
         &self,
         index: BufferIndex,
     ) -> impl Iterator<Item = CoreResult<BufferRef<'_>>> + '_ {
-        self.buffers.chain(index)
+        self.buffers().chain(index)
     }
 
     #[inline]
     pub fn node_error_code(&self, index: BufferIndex) -> CoreResult<Option<u16>> {
-        self.buffers.node_error_code(index)
+        self.buffers().node_error_code(index)
     }
 
     #[inline]
     pub fn current_config(&self, index: BufferIndex) -> CoreResult<crate::NodeId> {
-        self.buffers.current_config(index)
+        self.buffers().current_config(index)
     }
 
     #[inline]
     pub fn set_current_config(&self, index: BufferIndex, next: crate::NodeId) -> CoreResult<()> {
-        self.buffers.set_current_config(index, next)
+        self.buffers().set_current_config(index, next)
     }
 
     #[inline]
     pub fn advance(&self, index: BufferIndex, displacement: isize) -> CoreResult<()> {
-        self.buffers.advance(index, displacement)
+        self.buffers().advance(index, displacement)
     }
 
     #[inline]
     pub fn append(&self, index: BufferIndex, bytes: &[u8]) -> CoreResult<()> {
-        self.buffers.append(index, bytes)
+        self.buffers().append(index, bytes)
+    }
+
+    #[inline]
+    fn single_numa_buffer_arenas(
+        buffer_arena: BufferPoolArena,
+    ) -> StaticNumaTable<BufferPoolArena, HAMMER_MAX_NUMA_NODES> {
+        Self::single_numa_buffer_arenas_for_node(buffer_arena, 0)
+    }
+
+    #[inline]
+    fn single_numa_buffer_arenas_for_node(
+        buffer_arena: BufferPoolArena,
+        numa_node: u32,
+    ) -> StaticNumaTable<BufferPoolArena, HAMMER_MAX_NUMA_NODES> {
+        let mut buffer_arenas = StaticNumaTable::new();
+        buffer_arenas
+            .insert(numa_node, buffer_arena)
+            .expect("NUMA node must fit static buffer arena table");
+        buffer_arenas
+    }
+
+    #[inline]
+    fn buffer_pools_from_arenas(
+        buffer_arenas: &StaticNumaTable<BufferPoolArena, HAMMER_MAX_NUMA_NODES>,
+    ) -> StaticNumaTable<BufferPool, HAMMER_MAX_NUMA_NODES> {
+        let mut buffer_pools = StaticNumaTable::new();
+        for index in 0..HAMMER_MAX_NUMA_NODES {
+            let numa_node = u32::try_from(index).expect("static NUMA node index fits in u32");
+            let Some(arena) = buffer_arenas.get(numa_node).cloned() else {
+                continue;
+            };
+            buffer_pools
+                .insert(numa_node, BufferPool::with_arena(arena))
+                .expect("buffer pool NUMA node must fit static table");
+        }
+        buffer_pools
+    }
+
+    #[inline]
+    fn worker_buffer_pools_from_arenas(
+        buffer_arenas: &StaticNumaTable<BufferPoolArena, HAMMER_MAX_NUMA_NODES>,
+    ) -> StaticNumaTable<BufferPool, HAMMER_MAX_NUMA_NODES> {
+        let mut buffer_pools = StaticNumaTable::new();
+        for index in 0..HAMMER_MAX_NUMA_NODES {
+            let numa_node = u32::try_from(index).expect("static NUMA node index fits in u32");
+            let Some(arena) = buffer_arenas.get(numa_node).cloned() else {
+                continue;
+            };
+            buffer_pools
+                .insert(numa_node, BufferPool::with_worker_arena(arena))
+                .expect("buffer pool NUMA node must fit static table");
+        }
+        buffer_pools
+    }
+
+    #[inline]
+    fn buffer_arenas(&self) -> StaticNumaTable<BufferPoolArena, HAMMER_MAX_NUMA_NODES> {
+        let mut buffer_arenas = StaticNumaTable::new();
+        for index in 0..HAMMER_MAX_NUMA_NODES {
+            let numa_node = u32::try_from(index).expect("static NUMA node index fits in u32");
+            let Some(pool) = self.buffer_pools.get(numa_node) else {
+                continue;
+            };
+            buffer_arenas
+                .insert(numa_node, pool.arena())
+                .expect("buffer arena NUMA node must fit static table");
+        }
+        buffer_arenas
+    }
+
+    #[inline]
+    fn resolve_numa_node(
+        buffer_arenas: &StaticNumaTable<BufferPoolArena, HAMMER_MAX_NUMA_NODES>,
+        requested_numa_node: u32,
+    ) -> u32 {
+        if buffer_arenas.get(requested_numa_node).is_some() {
+            return requested_numa_node;
+        }
+        if buffer_arenas.get(0).is_some() {
+            return 0;
+        }
+        for index in 0..HAMMER_MAX_NUMA_NODES {
+            let numa_node = u32::try_from(index).expect("static NUMA node index fits in u32");
+            if buffer_arenas.get(numa_node).is_some() {
+                return numa_node;
+            }
+        }
+        0
     }
 }
 
@@ -1430,6 +1698,22 @@ impl DataPlaneRuntime {
             slots,
             DEFAULT_BUFFER_FRAME_CAPACITY,
             DEFAULT_BUFFER_FRAME_POOL_SIZE,
+            DataPlaneInstructionSet::native(),
+        )
+    }
+
+    #[inline]
+    pub fn with_numa_buffer_capacity(
+        slot_capacity: usize,
+        slots_per_numa: usize,
+        numa_nodes: &[u32],
+    ) -> Self {
+        Self::with_numa_capacities_and_instruction_set(
+            slot_capacity,
+            slots_per_numa,
+            DEFAULT_BUFFER_FRAME_CAPACITY,
+            DEFAULT_BUFFER_FRAME_POOL_SIZE,
+            numa_nodes,
             DataPlaneInstructionSet::native(),
         )
     }
@@ -1473,11 +1757,16 @@ impl DataPlaneRuntime {
         frame_slots: usize,
         instruction_set: DataPlaneInstructionSet,
     ) -> Self {
-        Self::with_buffer_arena_and_frame_capacity(
-            BufferPoolArena::with_capacity(buffer_slot_capacity, buffer_slots),
+        Self::with_buffer_arenas_and_frame_capacity(
+            DataPlaneBuffers::single_numa_buffer_arenas(BufferPoolArena::with_capacity(
+                buffer_slot_capacity,
+                buffer_slots,
+            )),
             frame_capacity,
             frame_slots,
             instruction_set,
+            0,
+            0,
         )
     }
 
@@ -1488,18 +1777,94 @@ impl DataPlaneRuntime {
         frame_slots: usize,
         instruction_set: DataPlaneInstructionSet,
     ) -> Self {
+        Self::with_buffer_arenas_and_frame_capacity(
+            DataPlaneBuffers::single_numa_buffer_arenas(buffer_arena),
+            frame_capacity,
+            frame_slots,
+            instruction_set,
+            0,
+            0,
+        )
+    }
+
+    #[inline]
+    fn with_numa_capacities_and_instruction_set(
+        buffer_slot_capacity: usize,
+        buffer_slots_per_numa: usize,
+        frame_capacity: usize,
+        frame_slots: usize,
+        numa_nodes: &[u32],
+        instruction_set: DataPlaneInstructionSet,
+    ) -> Self {
+        let buffers = DataPlaneBuffers::with_numa_capacities_and_instruction_set(
+            buffer_slot_capacity,
+            buffer_slots_per_numa,
+            frame_capacity,
+            frame_slots,
+            numa_nodes,
+            instruction_set,
+        );
         Self {
-            buffers: DataPlaneBuffers::with_buffer_arena_and_frame_capacity(
-                buffer_arena,
-                frame_capacity,
-                frame_slots,
-                instruction_set,
-            ),
+            active_numa_node: buffers.active_numa_node(),
+            buffers,
             nodes: NodeRuntime::default(),
             current_node: Rc::new(Cell::new(None)),
             handoff: None,
             handoff_node_handle: None,
-            active_numa_node: 0,
+        }
+    }
+
+    #[inline]
+    fn with_buffer_arenas_and_frame_capacity(
+        buffer_arenas: StaticNumaTable<BufferPoolArena, HAMMER_MAX_NUMA_NODES>,
+        frame_capacity: usize,
+        frame_slots: usize,
+        instruction_set: DataPlaneInstructionSet,
+        thread_index: u32,
+        requested_numa_node: u32,
+    ) -> Self {
+        let buffers = DataPlaneBuffers::with_buffer_arenas_and_frame_capacity(
+            buffer_arenas,
+            frame_capacity,
+            frame_slots,
+            instruction_set,
+            thread_index,
+            requested_numa_node,
+        );
+        Self {
+            active_numa_node: buffers.active_numa_node(),
+            buffers,
+            nodes: NodeRuntime::default(),
+            current_node: Rc::new(Cell::new(None)),
+            handoff: None,
+            handoff_node_handle: None,
+        }
+    }
+
+    #[inline]
+    fn with_worker_buffer_arenas_and_frame_capacity(
+        buffer_arenas: StaticNumaTable<BufferPoolArena, HAMMER_MAX_NUMA_NODES>,
+        frame_capacity: usize,
+        frame_slots: usize,
+        instruction_set: DataPlaneInstructionSet,
+        thread_index: u32,
+        requested_numa_node: u32,
+    ) -> Self {
+        let buffers = DataPlaneBuffers::with_worker_buffer_arenas_and_frame_capacity(
+            buffer_arenas,
+            frame_capacity,
+            frame_slots,
+            instruction_set,
+            thread_index,
+            requested_numa_node,
+        );
+        Self {
+            active_numa_node: buffers.active_numa_node(),
+            buffers,
+            nodes: NodeRuntime::default(),
+            current_node: Rc::new(Cell::new(None)),
+            handoff: None,
+            handoff_node_handle: None,
         }
     }
 
@@ -1510,40 +1875,37 @@ impl DataPlaneRuntime {
         frame_slots: usize,
         numa_node: u32,
     ) -> Self {
-        let mut runtime = Self::with_buffer_arena_and_frame_capacity(
-            arena,
+        Self::with_buffer_arenas_and_frame_capacity(
+            DataPlaneBuffers::single_numa_buffer_arenas_for_node(arena, numa_node),
             frame_capacity,
             frame_slots,
             DataPlaneInstructionSet::native(),
-        );
-        runtime.active_numa_node = numa_node;
-        runtime
+            0,
+            numa_node,
+        )
+    }
+
+    #[inline]
+    fn seed_for_worker(&self) -> DataPlaneRuntimeWorkerSeed {
+        DataPlaneRuntimeWorkerSeed {
+            buffer_arenas: self.buffers.buffer_arenas(),
+            frame_capacity: self.buffers.frame_capacity,
+            frame_slots: self.buffers.frame_slots,
+            instruction_set: self.buffers.instruction_set,
+            handoff: self.handoff.clone(),
+            handoff_node_handle: self.handoff_node_handle,
+        }
     }
 
     #[inline]
     pub fn clone_for_worker(&self, thread_index: u32, numa_node: u32) -> Self {
-        let mut runtime = Self {
-            buffers: self.buffers.clone_for_worker(thread_index, numa_node),
-            nodes: NodeRuntime::default(),
-            current_node: Rc::new(Cell::new(None)),
-            handoff: self.handoff.clone(),
-            handoff_node_handle: self.handoff_node_handle,
-            active_numa_node: numa_node,
-        };
-        if let Some(handoff) = runtime.handoff.clone() {
-            runtime.buffers = runtime.buffers.with_handoff(handoff);
-        }
-        runtime
+        self.seed_for_worker()
+            .clone_for_worker(thread_index, numa_node)
     }
 
     #[inline]
     pub fn worker_seed(&self) -> impl Fn(u32, u32) -> DataPlaneRuntime + Send + 'static {
-        let seed = DataPlaneRuntimeWorkerSeed {
-            buffer_arena: self.buffers.buffers.arena(),
-            frame_capacity: self.buffers.frame_capacity,
-            frame_slots: self.buffers.frame_slots,
-            instruction_set: self.buffers.instruction_set,
-        };
+        let seed = self.seed_for_worker();
         move |thread_index, numa_node| seed.clone_for_worker(thread_index, numa_node)
     }
 
@@ -1585,11 +1947,15 @@ impl DataPlaneRuntime {
         instruction_set: DataPlaneInstructionSet,
     ) -> Self {
         debug_assert_eq!(worker, handoff.worker());
-        let runtime = Self::with_buffer_arena_and_frame_capacity(
-            handoff.buffer_arena(),
+        let arena = handoff.buffer_arena();
+        let numa_node = arena.heap_numa_node();
+        let runtime = Self::with_buffer_arenas_and_frame_capacity(
+            DataPlaneBuffers::single_numa_buffer_arenas_for_node(arena, numa_node),
             frame_capacity,
             frame_slots,
             instruction_set,
+            0,
+            numa_node,
         );
         Self::with_handoff(runtime, worker, handoff)
     }
@@ -2168,6 +2534,11 @@ impl BufferPoolArena {
     pub fn pool_id(&self) -> u64 {
         self.inner.read().pool_id
     }
+
+    #[inline]
+    pub fn heap_numa_node(&self) -> u32 {
+        self.inner.read().region.numa_node()
+    }
 }
 
 impl BufferPool {
@@ -2185,6 +2556,14 @@ impl BufferPool {
     }
 
     #[inline]
+    fn with_worker_arena(arena: BufferPoolArena) -> Self {
+        Self {
+            arena,
+            thread_cache: Rc::new(RefCell::new(BufferThreadCache::new())),
+        }
+    }
+
+    #[inline]
     pub fn arena(&self) -> BufferPoolArena {
         self.arena.clone()
     }
@@ -2192,6 +2571,11 @@ impl BufferPool {
     #[inline]
     pub fn pool_id(&self) -> u64 {
         self.arena.pool_id()
+    }
+
+    #[inline]
+    pub fn heap_numa_node(&self) -> u32 {
+        self.arena.heap_numa_node()
     }
 
     #[inline]

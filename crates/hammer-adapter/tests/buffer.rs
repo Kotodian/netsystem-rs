@@ -779,7 +779,7 @@ fn handoff_workers_share_buffer_arena_and_keep_per_worker_free_cache() {
 }
 
 #[test]
-fn legacy_handoff_constructor_uses_first_runtime_buffer_arena() {
+fn queue_only_handoff_constructor_keeps_runtime_buffer_arenas_separate() {
     let handoff = DataPlaneHandoff::new(2, 4);
     let first: DataPlaneRuntime = DataPlaneRuntime::with_handoff(
         DataPlaneRuntime::with_capacities(8, 4, 2, 2),
@@ -799,9 +799,9 @@ fn legacy_handoff_constructor_uses_first_runtime_buffer_arena() {
         .alloc_index_with_bytes(b"two")
         .expect("alloc second worker buffer");
 
-    assert_eq!(first_buffer.pool_id(), second_buffer.pool_id());
-    assert_eq!(first.in_use_buffers(), 2);
-    assert_eq!(second.in_use_buffers(), 2);
+    assert_ne!(first_buffer.pool_id(), second_buffer.pool_id());
+    assert_eq!(first.in_use_buffers(), 1);
+    assert_eq!(second.in_use_buffers(), 1);
 
     first.free_index(first_buffer);
     second.free_index(second_buffer);

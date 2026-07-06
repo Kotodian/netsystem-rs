@@ -1,5 +1,4 @@
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crossbeam_queue::ArrayQueue;
 use hammer_core::error::{CoreError, CoreResult};
@@ -24,19 +23,19 @@ impl DataWorkerId {
 
 #[derive(Debug, Clone)]
 pub struct DataPlaneHandoff {
-    inner: Rc<DataPlaneHandoffInner>,
+    inner: Arc<DataPlaneHandoffInner>,
 }
 
 #[derive(Debug)]
 struct DataPlaneHandoffInner {
     queues: Vec<ArrayQueue<HandoffFrame>>,
-    buffer_arena: RefCell<Option<BufferPoolArena>>,
+    buffer_arena: Option<BufferPoolArena>,
 }
 
 #[derive(Debug, Clone)]
 pub struct DataPlaneHandoffWorker {
     worker: DataWorkerId,
-    inner: Rc<DataPlaneHandoffInner>,
+    inner: Arc<DataPlaneHandoffInner>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,11 +54,11 @@ impl DataPlaneHandoff {
     #[inline]
     pub fn new(workers: usize, queue_capacity: usize) -> Self {
         Self {
-            inner: Rc::new(DataPlaneHandoffInner {
+            inner: Arc::new(DataPlaneHandoffInner {
                 queues: (0..workers)
                     .map(|_| ArrayQueue::new(queue_capacity))
                     .collect(),
-                buffer_arena: RefCell::new(None),
+                buffer_arena: None,
             }),
         }
     }
@@ -71,11 +70,11 @@ impl DataPlaneHandoff {
         buffer_arena: BufferPoolArena,
     ) -> Self {
         Self {
-            inner: Rc::new(DataPlaneHandoffInner {
+            inner: Arc::new(DataPlaneHandoffInner {
                 queues: (0..workers)
                     .map(|_| ArrayQueue::new(queue_capacity))
                     .collect(),
-                buffer_arena: RefCell::new(Some(buffer_arena)),
+                buffer_arena: Some(buffer_arena),
             }),
         }
     }
@@ -84,7 +83,7 @@ impl DataPlaneHandoff {
     pub fn worker(&self, worker: DataWorkerId) -> DataPlaneHandoffWorker {
         DataPlaneHandoffWorker {
             worker,
-            inner: Rc::clone(&self.inner),
+            inner: Arc::clone(&self.inner),
         }
     }
 
@@ -92,7 +91,6 @@ impl DataPlaneHandoff {
     pub fn buffer_arena(&self) -> BufferPoolArena {
         self.inner
             .buffer_arena
-            .borrow()
             .as_ref()
             .expect("data plane handoff buffer arena is not configured")
             .clone()
@@ -109,20 +107,14 @@ impl DataPlaneHandoffWorker {
     pub(crate) fn buffer_arena(&self) -> BufferPoolArena {
         self.inner
             .buffer_arena
-            .borrow()
             .as_ref()
             .expect("data plane handoff buffer arena is not configured")
             .clone()
     }
 
     #[inline]
-    pub(crate) fn set_or_get_buffer_arena(&self, arena: BufferPoolArena) -> BufferPoolArena {
-        let mut configured = self.inner.buffer_arena.borrow_mut();
-        if let Some(configured) = configured.as_ref() {
-            return configured.clone();
-        }
-        *configured = Some(arena.clone());
-        arena
+    pub(crate) fn configured_buffer_arena(&self) -> Option<BufferPoolArena> {
+        self.inner.buffer_arena.clone()
     }
 
     #[inline]

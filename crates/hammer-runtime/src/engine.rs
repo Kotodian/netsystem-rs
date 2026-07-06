@@ -10,6 +10,13 @@ thread_local! {
     static CURRENT_ENGINE: RefCell<Option<*mut Engine>> = const { RefCell::new(None) };
 }
 
+pub(crate) struct EngineWorkerSeed<F> {
+    runtime_seed: F,
+    registry: Arc<RuntimeRegistry>,
+    wait_at_barrier: Arc<AtomicU32>,
+    workers_at_barrier: Arc<AtomicU32>,
+}
+
 #[repr(align(64))]
 pub struct Engine {
     pub thread_index: u32,
@@ -24,6 +31,28 @@ pub struct Engine {
 }
 
 impl Engine {
+    #[inline]
+    fn worker_with_runtime(
+        runtime: DataPlaneRuntime,
+        registry: Arc<RuntimeRegistry>,
+        wait_at_barrier: Arc<AtomicU32>,
+        workers_at_barrier: Arc<AtomicU32>,
+        index: u32,
+        numa_node: u32,
+    ) -> Self {
+        Self {
+            thread_index: index,
+            numa_node,
+            main_loop_count: AtomicU32::new(0),
+            runtime,
+            registry,
+            wait_at_barrier,
+            workers_at_barrier,
+            main_loop_exit_now: AtomicBool::new(false),
+            main_loop_exit_status: Mutex::new(0),
+        }
+    }
+
     pub fn new(runtime: DataPlaneRuntime, registry: Arc<RuntimeRegistry>) -> Self {
         Self {
             thread_index: 0,
@@ -39,16 +68,28 @@ impl Engine {
     }
 
     pub fn spawn(&self, index: u32) -> Self {
-        Self {
-            thread_index: index,
-            numa_node: self.numa_node,
-            main_loop_count: AtomicU32::new(0),
-            runtime: self.runtime.clone_for_worker(index, self.numa_node),
+        self.spawn_on_numa(index, self.numa_node)
+    }
+
+    pub fn spawn_on_numa(&self, index: u32, numa_node: u32) -> Self {
+        Self::worker_with_runtime(
+            self.runtime.clone_for_worker(index, numa_node),
+            Arc::clone(&self.registry),
+            Arc::clone(&self.wait_at_barrier),
+            Arc::clone(&self.workers_at_barrier),
+            index,
+            numa_node,
+        )
+    }
+
+    pub(crate) fn worker_seed(
+        &self,
+    ) -> EngineWorkerSeed<impl Fn(u32, u32) -> DataPlaneRuntime + Send + 'static> {
+        EngineWorkerSeed {
+            runtime_seed: self.runtime.worker_seed(),
             registry: Arc::clone(&self.registry),
             wait_at_barrier: Arc::clone(&self.wait_at_barrier),
             workers_at_barrier: Arc::clone(&self.workers_at_barrier),
-            main_loop_exit_now: AtomicBool::new(false),
-            main_loop_exit_status: Mutex::new(0),
         }
     }
 
@@ -75,6 +116,23 @@ impl Engine {
         CURRENT_ENGINE.with(|cell| {
             *cell.borrow_mut() = None;
         });
+    }
+}
+
+impl<F> EngineWorkerSeed<F>
+where
+    F: Fn(u32, u32) -> DataPlaneRuntime + Send + 'static,
+{
+    #[inline]
+    pub(crate) fn spawn_on_numa(&self, index: u32, numa_node: u32) -> Engine {
+        Engine::worker_with_runtime(
+            (self.runtime_seed)(index, numa_node),
+            Arc::clone(&self.registry),
+            Arc::clone(&self.wait_at_barrier),
+            Arc::clone(&self.workers_at_barrier),
+            index,
+            numa_node,
+        )
     }
 }
 
