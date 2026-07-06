@@ -269,8 +269,7 @@ mod tests {
             },
             Err(_) => return NodeResult::drop(),
         };
-        let mut pending = frame.drain_pending();
-        while let Some(index) = pending.next() {
+        for &index in frame.pending_indices() {
             let packet = match runtime.get_buffer(index) {
                 Ok(buf) => buf.current().to_vec(),
                 Err(_) => return NodeResult::drop(),
@@ -279,7 +278,6 @@ mod tests {
                 Ok(mut guard) => guard.packets.push(packet),
                 Err(_) => return NodeResult::drop(),
             }
-            runtime.free_index(index);
         }
         NodeResult::drop()
     }

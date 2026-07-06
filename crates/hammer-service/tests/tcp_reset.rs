@@ -70,14 +70,13 @@ fn capture_process(
                 .expect("capture state slot is invalid"),
         )
     };
-    for index in frame.drain_pending() {
+    for index in frame.pending_indices().iter().copied() {
         let packet = runtime
             .get_buffer(index)
             .expect("capture buffer")
             .current()
             .to_vec();
         state.lock().expect("capture state").packets.push(packet);
-        runtime.free_index(index);
     }
     NodeResult::drop()
 }

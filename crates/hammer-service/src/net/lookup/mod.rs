@@ -508,91 +508,10 @@ macro_rules! process_adjacency_rewrite_batch {
         let next1 = AdjacencyRewriteNode::next_for_index($table, $runtime, index1);
         let next2 = AdjacencyRewriteNode::next_for_index($table, $runtime, index2);
         let next3 = AdjacencyRewriteNode::next_for_index($table, $runtime, index3);
-        match (next0, next1, next2, next3) {
-            (Some(next0), Some(next1), Some(next2), Some(next3)) => {
-                hammer_adapter::validate_buffer_enqueue_x4!(
-                    $runtime,
-                    $next_frames,
-                    next0,
-                    index0,
-                    next1,
-                    index1,
-                    next2,
-                    index2,
-                    next3,
-                    index3
-                );
-            }
-            (Some(next0), Some(next1), Some(next2), None) => {
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next0, index0);
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next1, index1);
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next2, index2);
-            }
-            (Some(next0), Some(next1), None, Some(next3)) => {
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next0, index0);
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next1, index1);
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next3, index3);
-            }
-            (Some(next0), Some(next1), None, None) => {
-                hammer_adapter::validate_buffer_enqueue_x2!(
-                    $runtime,
-                    $next_frames,
-                    next0,
-                    index0,
-                    next1,
-                    index1
-                );
-            }
-            (Some(next0), None, Some(next2), Some(next3)) => {
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next0, index0);
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next2, index2);
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next3, index3);
-            }
-            (Some(next0), None, Some(next2), None) => {
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next0, index0);
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next2, index2);
-            }
-            (Some(next0), None, None, Some(next3)) => {
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next0, index0);
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next3, index3);
-            }
-            (Some(next0), None, None, None) => {
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next0, index0);
-            }
-            (None, Some(next1), Some(next2), Some(next3)) => {
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next1, index1);
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next2, index2);
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next3, index3);
-            }
-            (None, Some(next1), Some(next2), None) => {
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next1, index1);
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next2, index2);
-            }
-            (None, Some(next1), None, Some(next3)) => {
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next1, index1);
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next3, index3);
-            }
-            (None, Some(next1), None, None) => {
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next1, index1);
-            }
-            (None, None, Some(next2), Some(next3)) => {
-                hammer_adapter::validate_buffer_enqueue_x2!(
-                    $runtime,
-                    $next_frames,
-                    next2,
-                    index2,
-                    next3,
-                    index3
-                );
-            }
-            (None, None, Some(next2), None) => {
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next2, index2);
-            }
-            (None, None, None, Some(next3)) => {
-                hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, next3, index3);
-            }
-            (None, None, None, None) => {}
-        }
+        $next_frames.enqueue_optional($runtime, index0, next0);
+        $next_frames.enqueue_optional($runtime, index1, next1);
+        $next_frames.enqueue_optional($runtime, index2, next2);
+        $next_frames.enqueue_optional($runtime, index3, next3);
         $read += 4;
     }};
     ($runtime:expr, $table:expr, $next_frames:expr, $indices:expr, $read:ident, 2) => {{
@@ -606,12 +525,10 @@ macro_rules! process_adjacency_rewrite_batch {
         let index1 = $indices[$read + 1];
         $runtime.prefetch_write(index0);
         $runtime.prefetch_write(index1);
-        if let Some(node) = AdjacencyRewriteNode::next_for_index($table, $runtime, index0) {
-            hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, node, index0);
-        }
-        if let Some(node) = AdjacencyRewriteNode::next_for_index($table, $runtime, index1) {
-            hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, node, index1);
-        }
+        let next0 = AdjacencyRewriteNode::next_for_index($table, $runtime, index0);
+        let next1 = AdjacencyRewriteNode::next_for_index($table, $runtime, index1);
+        $next_frames.enqueue_optional($runtime, index0, next0);
+        $next_frames.enqueue_optional($runtime, index1, next1);
         $read += 2;
     }};
     ($runtime:expr, $table:expr, $next_frames:expr, $indices:expr, $read:ident, 1) => {{
@@ -620,9 +537,8 @@ macro_rules! process_adjacency_rewrite_batch {
         }
         let index = $indices[$read];
         $runtime.prefetch_write(index);
-        if let Some(node) = AdjacencyRewriteNode::next_for_index($table, $runtime, index) {
-            hammer_adapter::validate_buffer_enqueue_x1!($runtime, $next_frames, node, index);
-        }
+        let next = AdjacencyRewriteNode::next_for_index($table, $runtime, index);
+        $next_frames.enqueue_optional($runtime, index, next);
         $read += 1;
     }};
 }
@@ -715,7 +631,6 @@ impl AdjacencyRewriteNode {
                     next: None,
                 },
             );
-            runtime.free_index(index);
             return None;
         };
         if forwarding.dpo_type != DpoType::ADJACENCY {
@@ -732,7 +647,6 @@ impl AdjacencyRewriteNode {
                     next: None,
                 },
             );
-            runtime.free_index(index);
             return None;
         }
         let Some(adjacency) = table
@@ -756,7 +670,6 @@ impl AdjacencyRewriteNode {
                     next: None,
                 },
             );
-            runtime.free_index(index);
             return None;
         };
         let rewrite_len = adjacency.rewrite.as_slice().len();

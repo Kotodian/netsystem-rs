@@ -198,7 +198,7 @@ mod tests {
         let frame = target.pop().expect("handoff frame");
         assert_eq!(frame.target, node);
         assert!(matches!(frame.indices, HandoffIndices::Single(value) if value == index));
-
-        runtime.free_index(index);
+        let mut cleanup = runtime.alloc_frame().expect("cleanup frame");
+        cleanup.push_index(index).expect("cleanup push");
     }
 }

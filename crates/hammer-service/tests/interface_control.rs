@@ -250,6 +250,9 @@ fn interface_address_publish_installs_receive_route_in_fib() {
 #[test]
 fn interface_output_dispatches_to_registered_tx_node() {
     let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
+    let _ = runtime
+        .nodes()
+        .register_internal(hammer_service::data_plane::DropNode::new());
     let output_device = MemoryTunDevice::new();
     let tun_main = TunMain::default_main();
     let tx = runtime
@@ -323,6 +326,9 @@ fn interface_output_dispatches_to_registered_tx_node() {
 #[test]
 fn interface_output_drops_missing_egress_or_tx_mapping() {
     let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
+    let _ = runtime
+        .nodes()
+        .register_internal(hammer_service::data_plane::DropNode::new());
     let output_device = MemoryTunDevice::new();
     let output_control = InterfaceOutputControlPlane::new();
     let output_node = runtime.nodes().register_internal(output_control.node());
@@ -332,7 +338,7 @@ fn interface_output_drops_missing_egress_or_tx_mapping() {
 
     runtime.submit_frame(frame, output_node).expect("schedule");
 
-    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 1);
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert!(output_device.drain_output().is_empty());
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);

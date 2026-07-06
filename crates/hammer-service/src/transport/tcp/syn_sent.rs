@@ -181,8 +181,9 @@ where
     C: CongestionController + 'static,
 {
     let packet = tcp_packet(runtime, index)?;
-    let mut release_input = true;
-    let mut tx_index = None;
+    let mut input_owner = runtime.alloc_frame()?;
+    input_owner.push_index(index)?;
+    let mut tx_frame = None;
     let result = {
         let mut queue = session_queue.borrow_mut()?;
         let session_id = read_session_id(runtime, index)?.ok_or_else(|| {
@@ -213,7 +214,7 @@ where
             )
         };
         if acked_tx_len != 0 {
-            queue.release_tx_up_to(session_id, acked_tx_len as usize)?;
+            queue.ack_tx_up_to(session_id, acked_tx_len as usize)?;
         }
         if let Some(cookie) = packet.fast_open_cookie.filter(|cookie| !cookie.is_empty()) {
             tcp_worker_state_mut().remember_fast_open_cookie(
@@ -233,33 +234,25 @@ where
             if enqueue.delivered_len != 0 {
                 queue.mark_ready(session_id);
             }
-            release_input = false;
         };
         publish_tcp_connection(&mut queue, session_id)?;
         if established {
             queue.app().connected(session_id)?;
         }
         if let Some(segment) = control {
+            let mut owner = runtime.alloc_frame()?;
             let allocated = runtime.buffers().alloc_index()?;
-            if let Err(error) = segment.write_to_buffer(runtime.buffers(), allocated) {
-                runtime.free_index(allocated);
-                return Err(error);
-            }
-            tx_index = Some(allocated);
+            owner.push_index(allocated)?;
+            segment.write_to_buffer(runtime.buffers(), allocated)?;
+            tx_frame = Some(owner);
         }
         Ok(())
     };
     if let Err(error) = result {
-        if let Some(tx_index) = tx_index.take() {
-            runtime.free_index(tx_index);
-        }
         return Err(error);
     }
-    if let Some(tx_index) = tx_index.take() {
-        next_frames.enqueue(runtime, tcp_output, tx_index);
-    }
-    if release_input {
-        runtime.free_index(index);
+    if let Some(mut tx_frame) = tx_frame.take() {
+        next_frames.enqueue_indices(runtime, tcp_output, tx_frame.drain_pending());
     }
     Ok(())
 }
@@ -377,8 +370,7 @@ mod tests {
             }
             Err(_) => return NodeResult::drop(),
         };
-        let mut pending = frame.drain_pending();
-        while let Some(index) = pending.next() {
+        for &index in frame.pending_indices() {
             let packet = match runtime.get_buffer(index) {
                 Ok(buffer) => buffer.current().to_vec(),
                 Err(_) => continue,
@@ -387,7 +379,6 @@ mod tests {
                 Ok(mut state) => state.packets.push(packet),
                 Err(_) => continue,
             }
-            runtime.free_index(index);
         }
         NodeResult::drop()
     }

@@ -340,12 +340,13 @@ where
     C: CongestionController + 'static,
 {
     let packet = tcp_packet(runtime, index)?;
-    let mut release_input = true;
+    let mut input_owner = runtime.alloc_frame()?;
+    input_owner.push_index(index)?;
     let listener = control.lookup_listener(packet.local).ok_or_else(|| {
         let _ = runtime.record_current_node_error(TcpNodeError::NoListener.code());
         TcpError::NoListener
     })?;
-    let mut tx_index = None;
+    let mut tx_frame = None;
     let established_session;
     let result = {
         let mut queue = session_queue.borrow_mut()?;
@@ -359,30 +360,25 @@ where
         )?;
         established_session = session_id;
         if let Some(segment) = control {
+            let mut owner = runtime.alloc_frame()?;
             let allocated = runtime.buffers().alloc_index()?;
-            if let Err(error) = segment.write_to_buffer(runtime.buffers(), allocated) {
-                runtime.free_index(allocated);
-                return Err(error);
-            }
-            tx_index = Some(allocated);
+            owner.push_index(allocated)?;
+            segment.write_to_buffer(runtime.buffers(), allocated)?;
+            tx_frame = Some(owner);
         }
         Ok(())
     };
     if let Err(error) = result {
-        if let Some(tx_index) = tx_index.take() {
-            runtime.free_index(tx_index);
-        }
         return Err(error);
     }
 
-    if let Some(tx_index) = tx_index.take() {
-        hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, tcp_output, tx_index);
+    if let Some(mut tx_frame) = tx_frame.take() {
+        next_frames.enqueue_indices(runtime, tcp_output, tx_frame.drain_pending());
     }
     if let Some(session_id) = established_session
         && packet.payload_len != 0
     {
         if packet.flags == TcpSegmentFlags::SYN {
-            release_input = false;
         } else {
             let mut buffer = runtime.get_buffer_mut(index)?;
             write_session_route_opaque(
@@ -392,17 +388,8 @@ where
                 TcpInputNext::Established,
             );
             drop(buffer);
-            hammer_adapter::validate_buffer_enqueue_x1!(
-                runtime,
-                next_frames,
-                tcp_established,
-                index
-            );
-            release_input = false;
+            next_frames.enqueue_indices(runtime, tcp_established, input_owner.drain_pending());
         }
-    }
-    if release_input {
-        runtime.free_index(index);
     }
     Ok(())
 }
@@ -505,14 +492,12 @@ mod tests {
             }
         };
         let mut state = state.lock().expect("capture state");
-        let mut pending = frame.drain_pending();
-        while let Some(index) = pending.next() {
+        for &index in frame.pending_indices() {
             let packet = match runtime.get_buffer(index) {
                 Ok(buf) => buf.current().to_vec(),
                 Err(_) => return NodeResult::drop(),
             };
             state.packets.push(packet);
-            runtime.free_index(index);
         }
         NodeResult::drop()
     }

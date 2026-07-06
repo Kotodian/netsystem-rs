@@ -247,7 +247,7 @@ impl IpReassemblyRuntime {
         let expired_len = expired.len();
         for key in expired {
             if let Some(context) = self.contexts.remove(&key) {
-                context.free(runtime);
+                context.drop_fragments(runtime);
             }
             if let Some(handoff) = &self.handoff {
                 handoff.directory.remove(key);
@@ -991,9 +991,16 @@ impl ReassemblyContext {
     }
 
     #[inline]
-    fn free(self, runtime: &DataPlaneRuntime) {
+    fn drop_fragments(self, runtime: &DataPlaneRuntime) {
+        let mut owner = runtime.alloc_frame().expect("reassembly free frame");
         for fragment in self.fragments {
-            runtime.free_index(fragment.index);
+            if owner.push_index(fragment.index).is_err() {
+                drop(owner);
+                owner = runtime.alloc_frame().expect("reassembly free frame");
+                owner
+                    .push_index(fragment.index)
+                    .expect("reassembly free push");
+            }
         }
     }
 }

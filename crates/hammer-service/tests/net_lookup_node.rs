@@ -135,7 +135,7 @@ fn sink_process(
         .expect("sink state poisoned")
         .frame_lens
         .push(frame.pending_len());
-    for buffer in frame.drain_pending() {
+    for buffer in frame.pending_indices().iter().copied() {
         let payload = chain_bytes(runtime, buffer);
         let (egress_interface, forwarding) = {
             let buffer = runtime.get_buffer(buffer).expect("get buffer");
@@ -146,7 +146,6 @@ fn sink_process(
                 opaque.forwarding,
             )
         };
-        runtime.free_index(buffer);
         let mut state = state.lock().expect("sink state poisoned");
         state.forwarding.push(forwarding);
         state.egress_interfaces.push(egress_interface);

@@ -234,7 +234,8 @@ where
     C: CongestionController + 'static,
 {
     let packet = tcp_packet(runtime, index)?;
-    let mut release_input = true;
+    let mut input_owner = runtime.alloc_frame()?;
+    input_owner.push_index(index)?;
     let result: CoreResult<_> = {
         let mut queue = session_queue.borrow_mut()?;
         let session_id = read_session_id(runtime, index)?.ok_or_else(|| {
@@ -267,7 +268,7 @@ where
             )
         };
         if acked_tx_len != 0 {
-            queue.release_tx_up_to(session_id, acked_tx_len as usize)?;
+            queue.ack_tx_up_to(session_id, acked_tx_len as usize)?;
         }
         if ack_advanced && queue.app().pending_send_len(session_id)?.is_some() {
             queue.mark_ready(session_id);
@@ -282,7 +283,6 @@ where
             if enqueue.delivered_len != 0 {
                 queue.mark_ready(session_id);
             }
-            release_input = false;
         }
         let timer_mask = (1u16 << TCP_TIMER_RETRANSMIT)
             | (1u16 << TCP_TIMER_RACK)
@@ -320,15 +320,11 @@ where
     };
     let control = result?;
     if let Some(segment) = control {
+        let mut owner = runtime.alloc_frame()?;
         let allocated = runtime.buffers().alloc_index()?;
-        if let Err(error) = segment.write_to_buffer(runtime.buffers(), allocated) {
-            runtime.free_index(allocated);
-            return Err(error);
-        }
-        next_frames.enqueue(runtime, tcp_output, allocated);
-    }
-    if release_input {
-        runtime.free_index(index);
+        owner.push_index(allocated)?;
+        segment.write_to_buffer(runtime.buffers(), allocated)?;
+        next_frames.enqueue_indices(runtime, tcp_output, owner.drain_pending());
     }
     Ok(())
 }

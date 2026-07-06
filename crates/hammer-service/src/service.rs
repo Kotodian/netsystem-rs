@@ -249,10 +249,12 @@ fn worker_id(worker: usize) -> HammerResult<DataWorkerId> {
 mod tests {
     use super::*;
     use crate::transport::tcp::lookup::TcpV4ListenerKey;
+    use hammer_core::registry::RuntimeRegistry;
     use std::net::Ipv4Addr;
 
     fn tcp_main_for_test() {
-        crate::transport::tcp::reset_for_test();
+        crate::reset_subsystem_mains_for_test();
+        crate::transport::tcp::init(&RuntimeRegistry::new()).expect("init tcp main");
     }
 
     #[test]

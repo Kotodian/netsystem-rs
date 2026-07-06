@@ -93,7 +93,7 @@ fn capture_process(
         Ok(mut guard) => guard.frame_lens.push(frame.pending_len()),
         Err(_) => return NodeResult::drop(),
     }
-    for index in frame.drain_pending() {
+    for index in frame.pending_indices().iter().copied() {
         let packet = match chain_bytes(runtime, index) {
             Ok(bytes) => bytes,
             Err(_) => return NodeResult::drop(),
@@ -109,7 +109,6 @@ fn capture_process(
             }
             Err(_) => return NodeResult::drop(),
         }
-        runtime.free_index(index);
     }
     NodeResult::drop()
 }

@@ -93,7 +93,7 @@ fn sink_process(
     };
     let mut packets = 0usize;
     let mut checksum = 0u64;
-    for index in frame.drain_pending() {
+    for index in frame.pending_indices().iter().copied() {
         let buffer = runtime.get_buffer(index).expect("get buffer");
         let opaque = unsafe { transmute::<_, &LookupPerfOpaque>(buffer.opaque2()) };
         if let Some(forwarding) = opaque.forwarding {
@@ -101,7 +101,6 @@ fn sink_process(
             checksum = checksum.wrapping_add(u64::from(forwarding.bucket_index));
         }
         packets += 1;
-        runtime.free_index(index);
     }
     counters.packets.fetch_add(packets, Ordering::Relaxed);
     counters

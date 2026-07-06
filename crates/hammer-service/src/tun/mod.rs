@@ -542,9 +542,14 @@ where
             let Some(index) = self.recv_into_buffer(runtime)? else {
                 break;
             };
-            self.set_l3_metadata(runtime, index, interface_id)?;
+            if let Err(err) = self.set_l3_metadata(runtime, index, interface_id) {
+                let mut owner = runtime.alloc_frame()?;
+                owner.push_index(index)?;
+                return Err(err);
+            }
             if let Err(err) = frame.push_index(index) {
-                runtime.free_index(index);
+                let mut owner = runtime.alloc_frame()?;
+                owner.push_index(index)?;
                 return Err(err);
             }
             received += 1;
@@ -564,17 +569,20 @@ where
         let dst_len = dst.len();
         let Some(len) = self.io.try_recv_buffer(dst)? else {
             drop(buffer);
-            runtime.free_index(index);
+            let mut owner = runtime.alloc_frame()?;
+            owner.push_index(index)?;
             return Ok(None);
         };
         if len == 0 {
             drop(buffer);
-            runtime.free_index(index);
+            let mut owner = runtime.alloc_frame()?;
+            owner.push_index(index)?;
             return Ok(None);
         }
         if len == dst_len && self.io.max_recv_len().is_none_or(|max| dst_len < max) {
             drop(buffer);
-            runtime.free_index(index);
+            let mut owner = runtime.alloc_frame()?;
+            owner.push_index(index)?;
             return Ok(None);
         }
         buffer.commit_writable_tail(len)?;
@@ -828,7 +836,8 @@ where
             match send_result {
                 Ok(TunBufferSendResult::Complete) => {
                     self.pending_tx.pop_front();
-                    runtime.free_index(pending.index);
+                    let mut owner = runtime.alloc_frame()?;
+                    owner.push_index(pending.index)?;
                     completed += 1;
                 }
                 Ok(TunBufferSendResult::Backpressure) => break,
@@ -875,13 +884,11 @@ where
         mode: TunDriverMode,
     ) -> CoreResult<usize> {
         if mode.is_tap() {
-            runtime.free_frame(frame);
             return Err(CoreError::internal("real TUN driver only supports L3 TUN"));
         }
         let batch_len = frame.pending_len();
         self.drain_pending_tx(runtime, mode)?;
         if self.pending_tx.len().saturating_add(batch_len) > self.tx_ring_capacity {
-            runtime.free_frame(frame);
             return Err(CoreError::internal("real TUN TX ring full"));
         }
         for index in frame.drain_pending() {
@@ -1501,6 +1508,8 @@ fn memory_tun_output_index(
     index: BufferIndex,
     mode: TunDriverMode,
 ) -> CoreResult<()> {
+    let mut owner = runtime.alloc_frame()?;
+    owner.push_index(index)?;
     let mut tap_header = None;
     {
         let buffer = runtime.get_buffer(index)?;
@@ -1531,7 +1540,6 @@ fn memory_tun_output_index(
         packet.extend_from_slice(buffer.current());
     }
     drop(chain);
-    runtime.free_index(index);
     output.push(packet);
     Ok(())
 }
@@ -1547,13 +1555,13 @@ fn push_packet_to_frame(
     let Some((packet, tap_ethernet)) = packet_for_mode(mode, packet) else {
         return Ok(false);
     };
+    let mut owner = runtime.alloc_frame()?;
     let index = runtime.alloc_index()?;
+    owner.push_index(index)?;
     {
         let mut buffer = runtime.get_buffer_mut(index)?;
         let dst = buffer.writable_tail_mut();
         if packet.len() > dst.len() {
-            drop(buffer);
-            runtime.free_index(index);
             return Err(CoreError::internal("TUN packet exceeds buffer capacity"));
         }
         dst[..packet.len()].copy_from_slice(packet);
@@ -1561,10 +1569,7 @@ fn push_packet_to_frame(
         let opaque = unsafe { transmute::<_, &mut TunOpaque>(buffer.opaque2_mut()) };
         opaque.tap_ethernet = tap_ethernet;
     }
-    if let Err(err) = frame.push_index(index) {
-        runtime.free_index(index);
-        return Err(err);
-    }
+    frame.push_indices(owner.drain_pending())?;
     Ok(true)
 }
 

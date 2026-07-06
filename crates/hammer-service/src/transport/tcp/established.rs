@@ -235,7 +235,8 @@ where
     C: CongestionController + 'static,
 {
     let packet = tcp_packet(runtime, index)?;
-    let mut release_input = true;
+    let mut input_owner = runtime.alloc_frame()?;
+    input_owner.push_index(index)?;
     let mut tx_segment = None;
     let result = {
         let mut queue = session_queue.borrow_mut()?;
@@ -275,7 +276,7 @@ where
             )
         };
         if acked_tx_len != 0 {
-            queue.release_tx_up_to(session_id, acked_tx_len as usize)?;
+            queue.ack_tx_up_to(session_id, acked_tx_len as usize)?;
         }
         if ack_advanced && queue.app().pending_send_len(session_id)?.is_some() {
             queue.mark_ready(session_id);
@@ -324,7 +325,6 @@ where
                 })?;
                 connection.set_rcv_wnd(available);
             }
-            release_input = false;
         } else if duplicate_payload {
             let connection = queue.session_mut(session_id).ok_or_else(|| {
                 let _ = runtime
@@ -398,15 +398,11 @@ where
         return Err(error);
     }
     if let Some(segment) = tx_segment.take() {
+        let mut owner = runtime.alloc_frame()?;
         let allocated = runtime.buffers().alloc_index()?;
-        if let Err(error) = segment.write_to_buffer(runtime.buffers(), allocated) {
-            runtime.free_index(allocated);
-            return Err(error);
-        }
-        hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, tcp_output, allocated);
-    }
-    if release_input {
-        runtime.free_index(index);
+        owner.push_index(allocated)?;
+        segment.write_to_buffer(runtime.buffers(), allocated)?;
+        next_frames.enqueue_indices(runtime, tcp_output, owner.drain_pending());
     }
     Ok(())
 }

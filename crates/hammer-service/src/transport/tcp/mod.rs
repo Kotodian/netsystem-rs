@@ -452,12 +452,13 @@ fn enqueue_tcp_segment(
     output: &mut SessionQueueOutput,
     segment: TcpSegment,
 ) -> CoreResult<()> {
+    let mut owner = runtime.alloc_frame()?;
     let index = runtime.buffers().alloc_index()?;
-    if let Err(error) = segment.write_to_buffer(runtime.buffers(), index) {
-        runtime.free_index(index);
-        return Err(error);
+    owner.push_index(index)?;
+    segment.write_to_buffer(runtime.buffers(), index)?;
+    for index in owner.drain_pending() {
+        output.enqueue(runtime, output_next.node(), index);
     }
-    output.enqueue(runtime, output_next.node(), index);
     Ok(())
 }
 
@@ -836,14 +837,12 @@ mod tests {
             }
         };
         let mut state = state.lock().expect("capture state");
-        let mut pending = frame.drain_pending();
-        while let Some(index) = pending.next() {
+        for &index in frame.pending_indices() {
             let packet = match runtime.get_buffer(index) {
                 Ok(buf) => buf.current().to_vec(),
                 Err(_) => return NodeResult::drop(),
             };
             state.packets.push(packet);
-            runtime.free_index(index);
         }
         NodeResult::drop()
     }

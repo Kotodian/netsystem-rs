@@ -96,7 +96,8 @@ fn session_tx_dispatch_sends_multiple_segments_up_to_budget() {
     let session_id = driver.insert_session(TestTxProtocol::default());
 
     let app_session = Arc::new(
-        AppSession::<Local>::local_with_runtime_tx(
+        AppSession::<Local>::new_in_segment(
+            Local::default(),
             AppSessionConfig::new(256, 64),
             SessionHandle::new(session_id.pool_index().slot() as u32, 0),
             driver.app().tx_evt_q().clone(),

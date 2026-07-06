@@ -364,14 +364,14 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
         self.app_state.app.rx_available_len(session_id)
     }
 
-    pub(crate) fn release_tx_up_to(&mut self, session_id: SessionId, bytes: usize) -> CoreResult<()>
+    pub(crate) fn ack_tx_up_to(&mut self, session_id: SessionId, bytes: usize) -> CoreResult<()>
     where
         SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
     {
         let _ = self
             .app_state
             .app
-            .release_pending_send_bytes(session_id, bytes)?;
+            .ack_pending_send_bytes(session_id, bytes)?;
         Ok(())
     }
 
@@ -400,11 +400,12 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
     {
         let buffers = &self.runtime.buffers;
         if offset == 0 {
+            let mut owner = buffers.alloc_frame()?;
+            owner.push_index(index)?;
             let wrote = self
                 .app_state
                 .app
                 .copy_rx_from_buffer(session_id, buffers, index)?;
-            buffers.free_index(index);
             Ok(SessionRxEnqueue {
                 accepted_len: wrote as u32,
                 delivered_len: wrote as u32,
@@ -713,14 +714,15 @@ where
                 break;
             }
 
+            let mut owner = driver.runtime.buffers.alloc_frame()?;
             let index = driver.runtime.buffers.alloc_index()?;
+            owner.push_index(index)?;
             if let Err(error) =
                 driver
                     .app_state
                     .app
                     .copy_tx_to_buffer(session_id, tx_offset, payload_len, index)
             {
-                driver.runtime.buffers.free_index(index);
                 return Err(error);
             }
 
@@ -729,15 +731,13 @@ where
                 unsafe {
                     with_session_state(driver_ptr, session_id, |state, context| {
                         state.prepare_tx(context, index, tx_offset, payload_len, now)
-                    })
-                    .or_else(|err| {
-                        driver.runtime.buffers.free_index(index);
-                        Err(err)
                     })?
                 };
             }
 
-            output.enqueue(runtime, output_next.node(), index);
+            for index in owner.drain_pending() {
+                output.enqueue(runtime, output_next.node(), index);
+            }
 
             let commit_result = {
                 let driver_ptr = driver as *mut SessionDriverRuntime<St, Seg>;
@@ -1021,13 +1021,12 @@ mod tests {
             }
         };
         let mut state = state.lock().expect("capture state");
-        for index in frame.drain_pending() {
+        for &index in frame.pending_indices() {
             let packet = match chain_bytes(runtime.buffers(), index) {
                 Ok(bytes) => bytes,
                 Err(_) => return NodeResult::drop(),
             };
             state.packets.push(packet.to_vec());
-            runtime.free_index(index);
         }
         NodeResult::drop()
     }

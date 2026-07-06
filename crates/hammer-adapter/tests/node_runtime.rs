@@ -7,6 +7,13 @@ use hammer_adapter::{
 };
 use hammer_core::error::CoreResult;
 
+macro_rules! drop_owned_index {
+    ($owner:expr, $index:expr) => {{
+        let mut frame = ($owner).alloc_frame().expect("cleanup frame");
+        frame.push_index($index).expect("cleanup push index");
+    }};
+}
+
 static NODE_CALLS_BY_WORD: [AtomicU64; 128] = [const { AtomicU64::new(0) }; 128];
 
 fn reset_calls(word: u64) {
@@ -178,7 +185,7 @@ fn count_process(
     };
     NODE_CALLS_BY_WORD[word].fetch_add(1, Ordering::SeqCst);
     for buffer in frame.drain_pending() {
-        runtime.free_index(buffer);
+        drop_owned_index!(&runtime, buffer);
     }
     NodeResult::drop()
 }

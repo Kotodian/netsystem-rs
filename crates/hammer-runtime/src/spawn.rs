@@ -74,6 +74,8 @@ struct DataRuntimeContextWorker {
 pub struct DataRuntime {
     context: DataRuntimeContext,
     workers: Vec<DataRuntimeWorker>,
+    wait_at_barrier: Arc<AtomicU32>,
+    workers_at_barrier: Arc<AtomicU32>,
 }
 
 struct DataRuntimeWorker {
@@ -150,6 +152,8 @@ impl DataRuntime {
         let worker_config = worker.clone();
 
         let context_id = next_data_runtime_context_id();
+        let wait_at_barrier = Arc::new(AtomicU32::new(0));
+        let workers_at_barrier = Arc::new(AtomicU32::new(0));
         let mut context_workers = Vec::with_capacity(worker_threads);
         let mut workers = Vec::with_capacity(worker_threads);
         for index in 0..worker_threads {
@@ -157,6 +161,8 @@ impl DataRuntime {
             let remote_local = DataRemoteLocalQueue::default();
             let worker_remote_local = remote_local.clone();
             let worker_config = worker_config.clone();
+            let worker_wait_at_barrier = Arc::clone(&wait_at_barrier);
+            let worker_workers_at_barrier = Arc::clone(&workers_at_barrier);
             let (handle_tx, handle_rx) = std::sync::mpsc::channel::<Result<Handle, String>>();
             let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -181,7 +187,13 @@ impl DataRuntime {
                             CURRENT_DATA_WORKER.with(|slot| slot.set(Some((context_id, index))));
                             worker_remote_local.attach_current_thread();
                             let _ = handle_tx.send(Ok(runtime.handle().clone()));
-                            run_data_worker_loop(&worker_remote_local, &runtime, shutdown_rx);
+                            run_data_worker_loop(
+                                &worker_remote_local,
+                                &runtime,
+                                shutdown_rx,
+                                &worker_wait_at_barrier,
+                                &worker_workers_at_barrier,
+                            );
                             DATA_LOCAL_TASKS.with(|tasks| tasks.borrow_mut().clear());
                             DATA_LOCAL_DRIVER_WAKER.with(|waker| waker.borrow_mut().take());
                             CURRENT_DATA_WORKER.with(|slot| slot.set(None));
@@ -217,6 +229,8 @@ impl DataRuntime {
         Ok(Self {
             context: DataRuntimeContext::from_workers_with_barrier(context_id, context_workers),
             workers,
+            wait_at_barrier,
+            workers_at_barrier,
         })
     }
 
@@ -230,8 +244,9 @@ impl DataRuntime {
 
     pub fn data_plane_barrier(&self) -> DataPlaneBarrierHandle {
         DataPlaneBarrierHandle {
-            wait: Arc::new(AtomicU32::new(0)),
-            workers: Arc::new(AtomicU32::new(0)),
+            wait: Arc::clone(&self.wait_at_barrier),
+            workers: Arc::clone(&self.workers_at_barrier),
+            sync_count: Arc::new(AtomicUsize::new(0)),
             n_workers: self.context.inner.workers.len() as u32,
         }
     }
@@ -606,6 +621,7 @@ impl DataRuntimeContext {
 pub struct DataPlaneBarrierHandle {
     wait: Arc<AtomicU32>,
     workers: Arc<AtomicU32>,
+    sync_count: Arc<AtomicUsize>,
     n_workers: u32,
 }
 
@@ -616,6 +632,7 @@ impl DataPlaneBarrierHandle {
         while self.workers.load(Ordering::Acquire) != self.n_workers {
             core::hint::spin_loop();
         }
+        self.sync_count.fetch_add(1, Ordering::Relaxed);
         Ok(DataPlaneBarrierGuard {
             wait: Arc::clone(&self.wait),
             workers: Arc::clone(&self.workers),
@@ -630,7 +647,7 @@ impl DataPlaneBarrierHandle {
 
     #[doc(hidden)]
     pub fn sync_count(&self) -> usize {
-        0
+        self.sync_count.load(Ordering::Relaxed)
     }
 }
 
@@ -1098,6 +1115,8 @@ fn run_data_worker_loop(
     remote_local: &DataRemoteLocalQueue,
     runtime: &tokio::runtime::Runtime,
     mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    wait_at_barrier: &AtomicU32,
+    workers_at_barrier: &AtomicU32,
 ) {
     let worker_waker = Waker::from(Arc::new(DataWorkerThreadWake {
         thread: thread::current(),
@@ -1113,8 +1132,13 @@ fn run_data_worker_loop(
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
         }
 
-        let local_progress =
-            poll_data_worker_once(remote_local, &worker_waker, &mut next_polling_driver_at);
+        let local_progress = poll_data_worker_once(
+            remote_local,
+            &worker_waker,
+            &mut next_polling_driver_at,
+            wait_at_barrier,
+            workers_at_barrier,
+        );
         drive_tokio_worker_once(runtime, local_progress);
 
         if !local_progress {
@@ -1128,11 +1152,15 @@ fn poll_data_worker_once(
     remote_local: &DataRemoteLocalQueue,
     worker_waker: &Waker,
     next_polling_driver_at: &mut Instant,
+    wait_at_barrier: &AtomicU32,
+    workers_at_barrier: &AtomicU32,
 ) -> bool {
     let mut cx = Context::from_waker(worker_waker);
     DATA_LOCAL_DRIVER_WAKER.with(|slot| {
         *slot.borrow_mut() = Some(worker_waker.clone());
     });
+
+    crate::barrier::barrier_check(wait_at_barrier, workers_at_barrier);
 
     let now = Instant::now();
     let mut progressed = false;
@@ -1468,7 +1496,8 @@ mod tests {
                         .alloc_index_with_bytes(b"packet")
                         .expect("alloc data buffer");
                     let during = runtime.in_use_buffers();
-                    runtime.free_index(index);
+                    let mut owner = runtime.alloc_frame().expect("cleanup frame");
+                    owner.push_index(index).expect("cleanup push");
                     (before, during)
                 });
                 let after = with_data_plane_runtime(|runtime| runtime.in_use_buffers());
@@ -1520,7 +1549,8 @@ mod tests {
                         .expect("buffer")
                         .trace_handle()
                         .is_some();
-                    runtime.free_index(index);
+                    let mut owner = runtime.alloc_frame().expect("cleanup frame");
+                    owner.push_index(index).expect("cleanup push");
                     marked
                 })
             })
@@ -1632,7 +1662,9 @@ mod tests {
                                 .alloc_index_with_bytes(b"packet")
                                 .expect("alloc local data buffer");
                             let during = runtime.in_use_buffers();
-                            (before, during, buffer)
+                            let mut owner = runtime.alloc_frame().expect("local owner");
+                            owner.push_index(buffer).expect("local push");
+                            (before, during, owner)
                         });
                         yield_local_now().await;
                         let thread_after = thread::current()
@@ -1641,13 +1673,13 @@ mod tests {
                             .unwrap_or_default();
                         let payload = with_data_plane_runtime(|runtime| {
                             let payload = runtime
-                                .get_buffer(buffer.2)
+                                .get_buffer(buffer.2.pending_indices()[0])
                                 .expect("local data buffer")
                                 .current()
                                 .to_vec();
-                            runtime.free_index(buffer.2);
                             payload
                         });
+                        drop(buffer.2);
                         let after = with_data_plane_runtime(|runtime| runtime.in_use_buffers());
                         (
                             thread_before,
@@ -1690,9 +1722,12 @@ mod tests {
                             .map(ToOwned::to_owned)
                             .unwrap_or_default();
                         let buffer = with_data_plane_runtime(|runtime| {
-                            runtime
+                            let index = runtime
                                 .alloc_index_with_bytes(b"packet")
-                                .expect("alloc local data buffer")
+                                .expect("alloc local data buffer");
+                            let mut owner = runtime.alloc_frame().expect("local owner");
+                            owner.push_index(index).expect("local push");
+                            owner
                         });
                         yield_local_now().await;
                         let thread_after = thread::current()
@@ -1701,13 +1736,13 @@ mod tests {
                             .unwrap_or_default();
                         let payload = with_data_plane_runtime(|runtime| {
                             let payload = runtime
-                                .get_buffer(buffer)
+                                .get_buffer(buffer.pending_indices()[0])
                                 .expect("current local data buffer")
                                 .current()
                                 .to_vec();
-                            runtime.free_index(buffer);
                             payload
                         });
+                        drop(buffer);
                         (thread_before, thread_after, payload)
                     });
                     join.await.expect("current local task joined")
@@ -1798,17 +1833,12 @@ mod tests {
                             .name()
                             .map(ToOwned::to_owned)
                             .unwrap_or_default();
-                        let buffer = consumer_frame
-                            .borrow_mut()
-                            .drain_pending()
-                            .next()
-                            .expect("pending buffer");
+                        let buffer = consumer_frame.borrow().pending_indices()[0];
                         let payload = consumer_runtime
                             .get_buffer(buffer)
                             .expect("pending buffer")
                             .current()
                             .to_vec();
-                        consumer_runtime.free_index(buffer);
                         (before_thread, after_thread, payload)
                     });
                     let producer_frame = std::rc::Rc::clone(&frame);

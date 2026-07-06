@@ -130,7 +130,10 @@ impl NodeNextFrames {
         node: Option<NodeId>,
     ) {
         let Some(node) = node else {
-            runtime.free_index(index);
+            let mut frame = runtime.alloc_frame().expect("drop enqueue optional frame");
+            frame
+                .push_index(index)
+                .expect("drop enqueue optional push index");
             return;
         };
         self.enqueue(runtime, node, index)
@@ -140,8 +143,8 @@ impl NodeNextFrames {
     /// `current_indices` back, schedules every other staged frame, and returns
     /// a [`NodeResult`] that forwards the current frame to the reuse target.
     ///
-    /// On schedule error the current frame is freed and `NodeResult::drop()` is
-    /// returned.
+    /// On schedule error the current frame remains caller-owned and
+    /// `NodeResult::drop()` is returned.
     #[inline]
     pub fn finish(mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
         frame.clear();
@@ -150,7 +153,6 @@ impl NodeNextFrames {
         }
 
         if !self.schedule_staged(runtime) {
-            runtime.free_frame(frame);
             return NodeResult::drop();
         }
 
@@ -173,11 +175,11 @@ impl NodeNextFrames {
                 .push_indices(self.current_indices.iter().copied())
                 .is_err()
             {
-                self.free(runtime);
+                self.drop_staged(runtime);
                 return;
             }
             if self.len == MAX_NODE_NEXT_FRAMES {
-                self.free(runtime);
+                self.drop_staged(runtime);
                 return;
             }
             let offset = self.len;
@@ -191,8 +193,14 @@ impl NodeNextFrames {
     }
 
     #[inline]
-    pub fn free(&mut self, runtime: &DataPlaneRuntime) {
-        let _ = runtime;
+    pub fn drop_staged(&mut self, runtime: &DataPlaneRuntime) {
+        if !self.current_indices.is_empty() {
+            let mut frame = runtime.alloc_frame().expect("free current indices frame");
+            frame
+                .push_indices(self.current_indices.drain(..))
+                .expect("free current indices push");
+            self.current_node = None;
+        }
         self.free_from(0);
     }
 

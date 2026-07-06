@@ -1846,14 +1846,11 @@ mod tests {
     }
 
     fn stats_function_node(
-        runtime: &DataPlaneRuntime,
+        _: &DataPlaneRuntime,
         _data: NodeRuntimeData,
         frame: &mut BufferFrame,
     ) -> NodeResult {
-        let mut pending = frame.drain_pending();
-        while let Some(buffer) = pending.next() {
-            runtime.free_index(buffer);
-        }
+        let _ = frame.pending_indices();
         NodeResult::drop()
     }
 

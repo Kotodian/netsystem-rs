@@ -1465,7 +1465,7 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    pub fn free_index(&self, index: BufferIndex) {
+    fn free_index(&self, index: BufferIndex) {
         let buffers = self.buffers();
         let mut cache = buffers.thread_cache.borrow_mut();
         buffers
@@ -1501,7 +1501,7 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    pub fn free_frame(&self, frame: &mut BufferFrame) {
+    fn free_frame(&self, frame: &mut BufferFrame) {
         for index in frame.drain_indices() {
             self.free_index(index);
         }
@@ -1509,8 +1509,11 @@ impl DataPlaneBuffers {
 
     #[inline]
     fn drop_owned_frame(&self, index: FrameIndex, frame: BufferFrame) {
+        let mut frame = frame;
+        self.free_frame(&mut frame);
+        frame.reset_for_pool_reuse();
         self.frames
-            .free_taken_index(self.buffers(), index, frame)
+            .return_taken_index(index, frame)
             .expect("owned frame must return to its originating pool");
     }
 
@@ -1973,7 +1976,7 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    pub fn free_index(&self, index: BufferIndex) {
+    fn free_index(&self, index: BufferIndex) {
         self.buffers.free_index(index);
     }
 
@@ -2003,11 +2006,6 @@ impl DataPlaneRuntime {
     #[inline]
     pub fn current_config(&self, index: BufferIndex) -> CoreResult<crate::NodeId> {
         self.buffers.current_config(index)
-    }
-
-    #[inline]
-    pub fn free_frame(&self, frame: &mut BufferFrame) {
-        self.buffers.free_frame(frame);
     }
 
     #[inline]
@@ -2514,7 +2512,7 @@ impl BufferPool {
     }
 
     #[inline]
-    pub fn free_index(&self, index: BufferIndex) {
+    fn free_index(&self, index: BufferIndex) {
         let mut cache = self.thread_cache.borrow_mut();
         self.arena.inner.write().free_chain(&mut cache, index);
     }
@@ -2545,7 +2543,7 @@ impl BufferPool {
     }
 
     #[inline]
-    pub fn free_frame(&self, frame: &mut BufferFrame) {
+    fn free_frame(&self, frame: &mut BufferFrame) {
         let mut cache = self.thread_cache.borrow_mut();
         let mut pool = self.arena.inner.write();
         for index in frame.drain_indices() {
@@ -2767,14 +2765,7 @@ impl FramePool {
     }
 
     #[inline]
-    fn free_taken_index(
-        &self,
-        buffers: &BufferPool,
-        index: FrameIndex,
-        mut frame: BufferFrame,
-    ) -> CoreResult<()> {
-        buffers.free_frame(&mut frame);
-        frame.reset_for_pool_reuse();
+    fn return_taken_index(&self, index: FrameIndex, frame: BufferFrame) -> CoreResult<()> {
         self.inner
             .borrow_mut()
             .return_frame_and_release(index, frame)

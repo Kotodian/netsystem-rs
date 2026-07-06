@@ -13,6 +13,76 @@ use hammer_adapter::{
 use hammer_core::error::CoreResult;
 use hammer_infra::vec::Vec;
 
+trait CleanupOwner {
+    fn drop_index_owned(&self, index: BufferIndex);
+    fn drop_frame_owned(&self, frame: &mut BufferFrame);
+}
+
+fn pool_cleanup_buffers(pool: &BufferPool, frame_capacity: usize) -> DataPlaneBuffers {
+    DataPlaneBuffers::with_buffer_arena_and_frame_capacity(
+        pool.arena(),
+        frame_capacity.max(1),
+        1,
+        DataPlaneInstructionSet::native(),
+    )
+}
+
+impl CleanupOwner for BufferPool {
+    fn drop_index_owned(&self, index: BufferIndex) {
+        let buffers = pool_cleanup_buffers(self, 1);
+        let mut frame = buffers.alloc_frame().expect("cleanup frame");
+        frame.push_index(index).expect("cleanup push index");
+    }
+
+    fn drop_frame_owned(&self, frame: &mut BufferFrame) {
+        let buffers = pool_cleanup_buffers(self, frame.capacity());
+        let mut cleanup = buffers.alloc_frame().expect("cleanup frame");
+        cleanup
+            .push_indices(frame.drain_pending())
+            .expect("cleanup push indices");
+    }
+}
+
+impl CleanupOwner for DataPlaneBuffers {
+    fn drop_index_owned(&self, index: BufferIndex) {
+        let mut frame = self.alloc_frame().expect("cleanup frame");
+        frame.push_index(index).expect("cleanup push index");
+    }
+
+    fn drop_frame_owned(&self, frame: &mut BufferFrame) {
+        let mut cleanup = self.alloc_frame().expect("cleanup frame");
+        cleanup
+            .push_indices(frame.drain_pending())
+            .expect("cleanup push indices");
+    }
+}
+
+impl CleanupOwner for DataPlaneRuntime {
+    fn drop_index_owned(&self, index: BufferIndex) {
+        let mut frame = self.alloc_frame().expect("cleanup frame");
+        frame.push_index(index).expect("cleanup push index");
+    }
+
+    fn drop_frame_owned(&self, frame: &mut BufferFrame) {
+        let mut cleanup = self.alloc_frame().expect("cleanup frame");
+        cleanup
+            .push_indices(frame.drain_pending())
+            .expect("cleanup push indices");
+    }
+}
+
+macro_rules! drop_owned_index {
+    ($owner:expr, $index:expr) => {{
+        ($owner).drop_index_owned($index);
+    }};
+}
+
+macro_rules! drop_owned_frame {
+    ($owner:expr, $frame:expr) => {{
+        ($owner).drop_frame_owned(&mut $frame);
+    }};
+}
+
 #[derive(Default)]
 struct WakeCounter {
     wakes: AtomicUsize,
@@ -53,20 +123,25 @@ fn buffer_header_keeps_hot_metadata_in_first_cacheline() {
 
 #[test]
 fn buffer_pool_free_index_releases_slot_for_reuse_with_new_generation() {
-    let pool = BufferPool::with_capacity(128, 1);
-    let first_index = pool
+    let buffers = DataPlaneBuffers::with_buffer_capacity(128, 1);
+    let pool = buffers.buffers();
+    let first_index = buffers
         .alloc_index_with_bytes(b"hello")
         .expect("alloc first buffer");
-    assert_eq!(pool.in_use(), 1);
+    assert_eq!(buffers.in_use_buffers(), 1);
     assert_eq!(
         pool.get(first_index).expect("first current").current(),
         b"hello"
     );
-    pool.free_index(first_index);
+    let mut first_frame = buffers.alloc_frame().expect("first cleanup frame");
+    first_frame
+        .push_index(first_index)
+        .expect("push first cleanup index");
+    drop(first_frame);
 
-    assert_eq!(pool.in_use(), 0);
+    assert_eq!(buffers.in_use_buffers(), 0);
 
-    let second_index = pool
+    let second_index = buffers
         .alloc_index_with_bytes(b"world")
         .expect("alloc second buffer");
 
@@ -77,7 +152,11 @@ fn buffer_pool_free_index_releases_slot_for_reuse_with_new_generation() {
         pool.get(second_index).expect("second current").current(),
         b"world"
     );
-    pool.free_index(second_index);
+    let mut second_frame = buffers.alloc_frame().expect("second cleanup frame");
+    second_frame
+        .push_index(second_index)
+        .expect("push second cleanup index");
+    drop(second_frame);
 }
 
 #[test]
@@ -110,7 +189,7 @@ fn buffer_cursor_headroom_and_append_manage_current_bytes() {
         pool.get(buffer).expect("truncated current").current(),
         b"preload"
     );
-    pool.free_index(buffer);
+    drop_owned_index!(&pool, buffer);
 }
 
 #[test]
@@ -125,7 +204,7 @@ fn empty_buffer_allocation_reserves_default_packet_headroom() {
         pool.get(buffer).expect("prepended packet").current(),
         b"headerpayload"
     );
-    pool.free_index(buffer);
+    drop_owned_index!(&pool, buffer);
 }
 
 #[test]
@@ -160,8 +239,8 @@ fn runtime_get_buffer_mut_processes_multiple_buffers_sequentially() {
             .current(),
         b"Bravo"
     );
-    runtime.free_index(first);
-    runtime.free_index(second);
+    drop_owned_index!(&runtime, first);
+    drop_owned_index!(&runtime, second);
 }
 
 #[test]
@@ -186,7 +265,7 @@ fn runtime_get_buffer_exposes_direct_buffer_borrows() {
         runtime.get_buffer(index).expect("current").current(),
         b"Alpha"
     );
-    runtime.free_index(index);
+    drop_owned_index!(&runtime, index);
     assert_eq!(runtime.in_use_buffers(), 0);
 }
 
@@ -272,7 +351,7 @@ fn buffer_header_and_packet_data_start_cacheline_aligned() {
         assert_eq!(buffer.current().as_ptr() as usize % 64, 0);
     }
 
-    pool.free_index(buffer);
+    drop_owned_index!(&pool, buffer);
 }
 
 #[test]
@@ -307,7 +386,7 @@ fn buffer_exposes_vpp_style_current_pointer_and_advance() {
         runtime.get_buffer(buffer).expect("current").current(),
         b"Transport"
     );
-    runtime.free_index(buffer);
+    drop_owned_index!(&runtime, buffer);
 }
 
 #[test]
@@ -342,7 +421,7 @@ fn append_beyond_one_slot_creates_and_frees_chain() {
     );
     assert!(pool.in_use() > 1);
 
-    pool.free_index(buffer);
+    drop_owned_index!(&pool, buffer);
     assert_eq!(pool.in_use(), 0);
 }
 
@@ -359,7 +438,7 @@ fn alloc_with_bytes_beyond_one_slot_creates_chain() {
         b"abcdefghijkl"
     );
     assert_eq!(pool.in_use(), 3);
-    pool.free_index(buffer);
+    drop_owned_index!(&pool, buffer);
 }
 
 #[test]
@@ -384,7 +463,7 @@ fn buffer_chain_buffer_links_existing_chain_without_copying_payload() {
         tail_ptr
     );
 
-    pool.free_index(head);
+    drop_owned_index!(&pool, head);
     assert_eq!(pool.in_use(), 0);
 }
 
@@ -413,7 +492,7 @@ fn attach_clone_keeps_tail_alive_until_both_chains_are_freed() {
     );
     assert_eq!(pool.in_use(), 2);
 
-    pool.free_index(output_head);
+    drop_owned_index!(&pool, output_head);
 
     assert_eq!(
         chain_bytes(&pool, session_tail).expect("tail survives output free"),
@@ -425,7 +504,7 @@ fn attach_clone_keeps_tail_alive_until_both_chains_are_freed() {
     );
     assert_eq!(pool.in_use(), 1);
 
-    pool.free_index(session_tail);
+    drop_owned_index!(&pool, session_tail);
     assert_eq!(pool.in_use(), 0);
 }
 
@@ -441,7 +520,7 @@ fn freeing_head_with_attached_clone_does_not_free_session_tail() {
     pool.attach_clone(output_head, session_tail)
         .expect("attach clone");
 
-    pool.free_index(output_head);
+    drop_owned_index!(&pool, output_head);
 
     assert_eq!(
         chain_bytes(&pool, session_tail).expect("tail survives"),
@@ -449,7 +528,7 @@ fn freeing_head_with_attached_clone_does_not_free_session_tail() {
     );
     assert_eq!(pool.in_use(), 1);
 
-    pool.free_index(session_tail);
+    drop_owned_index!(&pool, session_tail);
     assert_eq!(pool.in_use(), 0);
 }
 
@@ -466,7 +545,7 @@ fn freeing_original_tail_after_output_head_returns_storage_once() {
     pool.attach_clone(output_head, session_tail)
         .expect("attach clone");
 
-    pool.free_index(session_tail);
+    drop_owned_index!(&pool, session_tail);
 
     assert_eq!(
         chain_bytes(&pool, output_head).expect("head keeps tail alive"),
@@ -474,14 +553,14 @@ fn freeing_original_tail_after_output_head_returns_storage_once() {
     );
     assert_eq!(pool.in_use(), 2);
 
-    pool.free_index(output_head);
+    drop_owned_index!(&pool, output_head);
     assert_eq!(pool.in_use(), 0);
 
     let reused = pool
         .alloc_index_with_bytes(b"reuse")
         .expect("reuse freed storage");
     assert_eq!(pool.in_use(), 1);
-    pool.free_index(reused);
+    drop_owned_index!(&pool, reused);
     assert_eq!(pool.in_use(), 0);
 }
 
@@ -503,7 +582,7 @@ fn freeing_cloned_head_keeps_shared_tail_trace_mark_live() {
         .attach_clone(output_head, session_tail)
         .expect("attach clone");
 
-    buffers.free_index(output_head);
+    drop_owned_index!(&buffers, output_head);
 
     assert_eq!(
         buffers
@@ -513,7 +592,7 @@ fn freeing_cloned_head_keeps_shared_tail_trace_mark_live() {
         Some(7)
     );
 
-    buffers.free_index(session_tail);
+    drop_owned_index!(&buffers, session_tail);
 }
 
 #[test]
@@ -544,8 +623,8 @@ fn shared_tail_rejects_payload_mutation_but_allows_independent_header_views() {
         b"payload"
     );
 
-    pool.free_index(output_head);
-    pool.free_index(session_tail);
+    drop_owned_index!(&pool, output_head);
+    drop_owned_index!(&pool, session_tail);
 }
 
 #[test]
@@ -579,9 +658,9 @@ fn shared_tail_rejects_chain_link_mutation_but_allows_clone_head_truncate() {
         b"abcdefgh"
     );
 
-    pool.free_index(extra_tail);
-    pool.free_index(output_head);
-    pool.free_index(session_tail);
+    drop_owned_index!(&pool, extra_tail);
+    drop_owned_index!(&pool, output_head);
+    drop_owned_index!(&pool, session_tail);
 }
 
 #[test]
@@ -603,7 +682,7 @@ fn buffer_advance_can_discard_prefix_across_chain_segments() {
         b"ghijkl"
     );
 
-    pool.free_index(packet);
+    drop_owned_index!(&pool, packet);
     assert_eq!(pool.in_use(), 0);
 }
 
@@ -630,8 +709,8 @@ fn buffer_pool_reports_single_segment_and_chained_packets() {
         b"abcdefghij"
     );
 
-    pool.free_index(single);
-    pool.free_index(chained);
+    drop_owned_index!(&pool, single);
+    drop_owned_index!(&pool, chained);
 }
 
 #[test]
@@ -642,7 +721,7 @@ fn buffer_pool_prefetch_read_is_best_effort_for_live_and_stale_indices() {
         .expect("alloc chained buffer");
 
     pool.prefetch_read(buffer);
-    pool.free_index(buffer);
+    drop_owned_index!(&pool, buffer);
     pool.prefetch_read(buffer);
 
     assert_eq!(pool.in_use(), 0);
@@ -721,8 +800,8 @@ fn buffer_pool_rejects_index_from_another_runtime() {
             .is_err()
     );
 
-    first_pool.free_index(first_index);
-    second_pool.free_index(second_index);
+    drop_owned_index!(&first_pool, first_index);
+    drop_owned_index!(&second_pool, second_index);
 }
 
 #[test]
@@ -755,8 +834,8 @@ fn handoff_workers_share_buffer_arena_and_keep_per_worker_free_cache() {
     assert_eq!(first.in_use_buffers(), 2);
     assert_eq!(second.in_use_buffers(), 2);
 
-    first.free_index(first_buffer);
-    second.free_index(second_buffer);
+    drop_owned_index!(&first, first_buffer);
+    drop_owned_index!(&second, second_buffer);
 
     assert!(first.cached_free_buffers() >= 1);
     assert!(second.cached_free_buffers() >= 1);
@@ -774,8 +853,8 @@ fn handoff_workers_share_buffer_arena_and_keep_per_worker_free_cache() {
     assert_ne!(first_reused.generation(), first_buffer.generation());
     assert_ne!(second_reused.generation(), second_buffer.generation());
 
-    first.free_index(first_reused);
-    second.free_index(second_reused);
+    drop_owned_index!(&first, first_reused);
+    drop_owned_index!(&second, second_reused);
 }
 
 #[test]
@@ -803,8 +882,8 @@ fn queue_only_handoff_constructor_keeps_runtime_buffer_arenas_separate() {
     assert_eq!(first.in_use_buffers(), 1);
     assert_eq!(second.in_use_buffers(), 1);
 
-    first.free_index(first_buffer);
-    second.free_index(second_buffer);
+    drop_owned_index!(&first, first_buffer);
+    drop_owned_index!(&second, second_buffer);
     assert_eq!(first.in_use_buffers(), 0);
 }
 
@@ -839,8 +918,8 @@ fn buffer_frame_reset_does_not_free_buffers() {
     );
 
     drop(frame);
-    pool.free_index(first);
-    pool.free_index(second);
+    drop_owned_index!(&pool, first);
+    drop_owned_index!(&pool, second);
 }
 
 #[test]
@@ -858,7 +937,7 @@ fn buffer_pool_free_frame_releases_all_indices_and_reuses_frame() {
     frame.push_index(second).expect("push second frame index");
     let capacity = frame.capacity();
 
-    pool.free_frame(&mut frame);
+    drop_owned_frame!(&pool, frame);
 
     assert!(frame.is_empty());
     assert_eq!(frame.capacity(), capacity);
@@ -871,7 +950,7 @@ fn buffer_pool_free_frame_releases_all_indices_and_reuses_frame() {
         .expect("alloc after free_frame");
     frame.push_index(next).expect("reuse frame allocation");
     assert_eq!(frame.indices(), &[next]);
-    pool.free_frame(&mut frame);
+    drop_owned_frame!(&pool, frame);
     drop(frame);
 }
 
@@ -904,7 +983,7 @@ fn buffer_frame_drain_indices_preserves_order_without_freeing() {
     );
 
     for index in drained {
-        pool.free_index(index);
+        drop_owned_index!(&pool, index);
     }
     drop(frame);
     assert_eq!(pool.in_use(), 0);
@@ -939,7 +1018,7 @@ fn buffer_frame_tracks_pending_indices_until_drained() {
     assert_eq!(pool.in_use(), 2);
 
     for index in drained {
-        pool.free_index(index);
+        drop_owned_index!(&pool, index);
     }
     drop(frame);
     assert_eq!(pool.in_use(), 0);
@@ -972,7 +1051,7 @@ fn buffer_frame_pending_future_wakes_when_index_is_pushed() {
         Poll::Ready(())
     ));
 
-    pool.free_frame(&mut frame);
+    drop_owned_frame!(&pool, frame);
     drop(frame);
 }
 
@@ -1004,7 +1083,7 @@ fn buffer_frame_push_indices_batches_one_wake() {
     assert_eq!(wake_counter.wakes.load(Ordering::SeqCst), 1);
     assert_eq!(frame.pending_indices(), &[first, second]);
 
-    pool.free_frame(&mut frame);
+    drop_owned_frame!(&pool, frame);
     drop(frame);
 }
 
@@ -1034,7 +1113,7 @@ fn buffer_frame_pair_batch_cursor_splits_into_pairs_then_tail() {
         ]
     );
 
-    pool.free_frame(&mut frame);
+    drop_owned_frame!(&pool, frame);
     drop(frame);
 }
 
@@ -1064,7 +1143,7 @@ fn buffer_frame_quad_batch_cursor_splits_into_quad_pair_then_tail() {
         ]
     );
 
-    pool.free_frame(&mut frame);
+    drop_owned_frame!(&pool, frame);
     drop(frame);
 }
 
@@ -1104,8 +1183,8 @@ fn buffer_frame_batch_cursor_uses_requested_width() {
         ]
     );
 
-    runtime.free_frame(&mut frame);
     drop(frame);
+    assert_eq!(runtime.in_use_buffers(), 0);
 }
 
 #[test]
@@ -1155,10 +1234,10 @@ fn buffer_frame_batch_dispatch_uses_runtime_preferred_width() {
     assert_eq!(quad_seen, quad_indices);
     assert_eq!(pair_seen, pair_indices);
 
-    quad_runtime.free_frame(&mut quad_frame);
-    pair_runtime.free_frame(&mut pair_frame);
     drop(quad_frame);
     drop(pair_frame);
+    assert_eq!(quad_runtime.in_use_buffers(), 0);
+    assert_eq!(pair_runtime.in_use_buffers(), 0);
 }
 
 #[test]
@@ -1190,7 +1269,7 @@ fn buffer_frame_pending_future_observes_reset_before_processing() {
         Poll::Pending
     ));
 
-    pool.free_index(first);
+    drop_owned_index!(&pool, first);
     frame.push_index(second).expect("push second frame index");
     assert_eq!(wake_counter.wakes.load(Ordering::SeqCst), 2);
     assert!(matches!(
@@ -1198,7 +1277,7 @@ fn buffer_frame_pending_future_observes_reset_before_processing() {
         Poll::Ready(())
     ));
 
-    pool.free_frame(&mut frame);
+    drop_owned_frame!(&pool, frame);
     drop(frame);
 }
 
@@ -1219,9 +1298,9 @@ fn buffer_frame_push_index_respects_preallocated_capacity() {
     assert_eq!(frame.indices(), &[first]);
     assert_eq!(pool.in_use(), 2);
 
-    pool.free_frame(&mut frame);
+    drop_owned_frame!(&pool, frame);
     drop(frame);
-    pool.free_index(second);
+    drop_owned_index!(&pool, second);
 }
 
 #[test]
@@ -1329,9 +1408,9 @@ fn buffer_frame_lazy_state_retain_compacts_after_first_drop() {
     assert_eq!(frame.indices(), &[indices[0], indices[2], indices[4]]);
     assert!(prefetched > 0);
 
-    runtime.free_index(indices[1]);
-    runtime.free_index(indices[3]);
     drop(frame);
+    drop_owned_index!(&runtime, indices[1]);
+    drop_owned_index!(&runtime, indices[3]);
     assert_eq!(runtime.in_use_buffers(), 0);
 }
 

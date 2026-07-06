@@ -103,7 +103,7 @@ impl<S: Segment> SessionAppRuntime<S> {
         Ok(())
     }
 
-    pub(crate) fn release_pending_send_bytes(
+    pub(crate) fn ack_pending_send_bytes(
         &mut self,
         session_id: SessionId,
         len: usize,
@@ -214,8 +214,9 @@ impl<S: Segment> SessionAppRuntime<S> {
         index: BufferIndex,
         offset: u32,
     ) -> CoreResult<(u32, Option<u32>, u32)> {
+        let mut owner = buffers.alloc_frame()?;
+        owner.push_index(index)?;
         let Some(session) = self.sessions.lookup(&session_id.get()) else {
-            buffers.free_index(index);
             return Ok((0, None, 0));
         };
         let mut total_len = 0u32;
@@ -235,7 +236,6 @@ impl<S: Segment> SessionAppRuntime<S> {
                 .checked_add(current.len() as u32)
                 .ok_or_else(|| CoreError::internal("ooo rx buffer length overflow"))?;
         }
-        buffers.free_index(index);
         Ok((delivered, Some(offset), total_len))
     }
 

@@ -134,13 +134,9 @@ fn drop_node_process(
         let index2 = indices[read + 2];
         let index3 = indices[read + 3];
         let _ = add_packet_trace!(runtime, index0, DropTrace { dropped });
-        runtime.free_index(index0);
         let _ = add_packet_trace!(runtime, index1, DropTrace { dropped });
-        runtime.free_index(index1);
         let _ = add_packet_trace!(runtime, index2, DropTrace { dropped });
-        runtime.free_index(index2);
         let _ = add_packet_trace!(runtime, index3, DropTrace { dropped });
-        runtime.free_index(index3);
         read += 4;
     }
     if read + 2 <= len {
@@ -153,9 +149,7 @@ fn drop_node_process(
         let index0 = indices[read];
         let index1 = indices[read + 1];
         let _ = add_packet_trace!(runtime, index0, DropTrace { dropped });
-        runtime.free_index(index0);
         let _ = add_packet_trace!(runtime, index1, DropTrace { dropped });
-        runtime.free_index(index1);
         read += 2;
     }
     while read < len {
@@ -164,10 +158,8 @@ fn drop_node_process(
         }
         let index0 = indices[read];
         let _ = add_packet_trace!(runtime, index0, DropTrace { dropped });
-        runtime.free_index(index0);
         read += 1;
     }
-    frame.clear();
     NodeResult::drop()
 }
 
@@ -216,20 +208,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn drop_node_clears_frame_after_trace_error_following_freed_packet() {
+    fn drop_node_releases_owned_buffers_when_owner_drops_after_processing() {
         let runtime = DataPlaneRuntime::with_capacities(64, 4, 2, 4);
-        let drop = runtime.nodes().register_internal(DropNode::new());
+        let drop_node = runtime.nodes().register_internal(DropNode::new());
         let mut frame = runtime.alloc_frame().expect("alloc frame");
         let first = runtime
             .alloc_index_with_bytes(b"first")
             .expect("alloc first");
-        let stale = runtime
-            .alloc_index_with_bytes(b"stale")
-            .expect("alloc stale");
+        let second = runtime
+            .alloc_index_with_bytes(b"second")
+            .expect("alloc second");
         frame.push_index(first).expect("push first");
-        frame.push_index(stale).expect("push stale");
-        runtime.free_index(stale);
-        let _ = drop;
+        frame.push_index(second).expect("push second");
+        let _ = drop_node;
 
         let _result = drop_node_process(
             &runtime,
@@ -237,7 +228,8 @@ mod tests {
             &mut frame,
         );
 
-        assert!(!frame.has_pending());
+        assert!(frame.has_pending());
+        drop(frame);
         assert_eq!(runtime.in_use_buffers(), 0);
     }
 

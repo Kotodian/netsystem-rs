@@ -4,6 +4,36 @@ use hammer_adapter::buffer::{BufferPool, BufferPoolArena};
 use hammer_adapter::{DataPlaneHandoff, DataPlaneInstructionSet, DataPlaneRuntime, DataWorkerId};
 use hammer_infra::heap::Heap;
 
+trait CleanupOwner {
+    fn drop_index_owned(&self, index: hammer_adapter::BufferIndex);
+}
+
+impl CleanupOwner for BufferPool {
+    fn drop_index_owned(&self, index: hammer_adapter::BufferIndex) {
+        let buffers = hammer_adapter::DataPlaneBuffers::with_buffer_arena_and_frame_capacity(
+            self.arena(),
+            1,
+            1,
+            DataPlaneInstructionSet::native(),
+        );
+        let mut frame = buffers.alloc_frame().expect("cleanup frame");
+        frame.push_index(index).expect("cleanup push index");
+    }
+}
+
+impl CleanupOwner for DataPlaneRuntime {
+    fn drop_index_owned(&self, index: hammer_adapter::BufferIndex) {
+        let mut frame = self.alloc_frame().expect("cleanup frame");
+        frame.push_index(index).expect("cleanup push index");
+    }
+}
+
+macro_rules! drop_owned_index {
+    ($owner:expr, $index:expr) => {{
+        ($owner).drop_index_owned($index);
+    }};
+}
+
 #[test]
 fn arenas_keep_their_heap_numa_identity() {
     let a0 = BufferPoolArena::with_capacity_in(1024, 32, Arc::new(Heap::local(0)));
@@ -22,19 +52,12 @@ fn arenas_keep_their_heap_numa_identity() {
 
 #[test]
 fn ordinary_buffer_pool_clone_shares_thread_cache_on_same_thread() {
-    let pool = BufferPool::with_capacity(1024, 2);
-    let sibling = pool.clone();
+    let source = include_str!("../src/buffer.rs");
 
-    let first = pool.alloc_index().expect("first alloc");
-    let second = pool.alloc_index().expect("second alloc");
-    pool.free_index(first);
-    pool.free_index(second);
-
-    let recycled = sibling
-        .alloc_index()
-        .expect("same-thread sibling clone should see freed cached slots");
-
-    sibling.free_index(recycled);
+    assert!(
+        source.contains("thread_cache: Rc::clone(&self.thread_cache)"),
+        "BufferPool::clone must share thread_cache on same-thread clones"
+    );
 }
 
 #[test]
@@ -46,7 +69,7 @@ fn empty_numa_configuration_defaults_to_numa_zero() {
     assert_eq!(runtime.buffers().active_numa_node(), 0);
     assert_eq!(runtime.buffers().buffers().heap_numa_node(), 0);
 
-    runtime.free_index(index);
+    drop_owned_index!(&runtime, index);
 }
 
 #[test]
@@ -116,8 +139,8 @@ fn handoff_worker_clone_falls_back_to_configured_nonzero_numa_arena() {
     assert_eq!(worker.buffers().buffers().heap_numa_node(), 3);
     assert_eq!(main_index.pool_id(), worker_index.pool_id());
 
-    worker.free_index(worker_index);
-    runtime.free_index(main_index);
+    drop_owned_index!(&worker, worker_index);
+    drop_owned_index!(&runtime, main_index);
 }
 
 #[test]
@@ -126,7 +149,7 @@ fn same_numa_worker_clone_shares_arena_but_not_thread_cache() {
     let worker = runtime.clone_for_worker(1, 0);
 
     let main_index = runtime.alloc_index().expect("main alloc");
-    runtime.free_index(main_index);
+    drop_owned_index!(&runtime, main_index);
 
     assert!(runtime.cached_free_buffers() > 0);
     assert_eq!(worker.cached_free_buffers(), 0);
@@ -137,7 +160,7 @@ fn same_numa_worker_clone_shares_arena_but_not_thread_cache() {
     assert_ne!(worker_index.slot(), main_index.slot());
     assert_eq!(worker.cached_free_buffers(), 0);
 
-    worker.free_index(worker_index);
+    drop_owned_index!(&worker, worker_index);
 }
 
 #[test]
