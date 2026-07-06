@@ -43,7 +43,7 @@ impl Engine {
             thread_index: index,
             numa_node: self.numa_node,
             main_loop_count: AtomicU32::new(0),
-            runtime: self.runtime.clone(),
+            runtime: self.runtime.clone_for_worker(index, self.numa_node),
             registry: Arc::clone(&self.registry),
             wait_at_barrier: Arc::clone(&self.wait_at_barrier),
             workers_at_barrier: Arc::clone(&self.workers_at_barrier),
@@ -132,7 +132,6 @@ impl EnginePool {
     pub fn main_loop_enter(engine: &mut Engine) -> HammerResult<()> {
         engine.install_current();
         crate::init::run_init_functions(engine)?;
-        crate::start_workers::start_workers(engine)?;
         Ok(())
     }
 

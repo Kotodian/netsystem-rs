@@ -1,10 +1,9 @@
-use std::cell::Ref;
 use std::marker::PhantomData;
 use std::mem::transmute;
 use std::sync::{Arc, Mutex};
 
 use hammer_adapter::{
-    Buffer, BufferFrame, BufferIndex, DataPlaneRuntime, DriverNode, Node, NodeId, NodeProcessFn,
+    BufferFrame, BufferIndex, BufferRef, DataPlaneRuntime, DriverNode, Node, NodeId, NodeProcessFn,
     NodeRegistration, NodeResult, NodeRuntimeData, PacketTrace, SecondaryOpaque, TraceFormatter,
     add_packet_trace, unlikely,
 };
@@ -845,7 +844,7 @@ where
         runtime: &DataPlaneRuntime,
         pending: TunPendingTx,
     ) -> CoreResult<TunBufferSendResult> {
-        let mut refs: Vec<Ref<'_, Buffer>> = Vec::with_capacity(4);
+        let mut refs: Vec<BufferRef<'_>> = Vec::with_capacity(4);
         let mut chain = runtime.chain(pending.index);
         while let Some(buffer) = chain.next() {
             refs.push(buffer?);

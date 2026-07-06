@@ -2,7 +2,6 @@ use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
-use crate::data_plane::new_worker_runtime;
 use crate::engine::Engine;
 use crate::spawn;
 use hammer_core::error::HammerResult;
@@ -26,16 +25,18 @@ pub fn start_workers(engine: &mut Engine) -> HammerResult<()> {
         let wait = Arc::clone(&wait);
         let workers = Arc::clone(&workers);
         let registry = Arc::clone(&registry);
+        let worker_numa_node = engine.numa_node;
+        let runtime_seed = engine.runtime.worker_seed();
 
         thread::Builder::new()
             .name(format!("hammer-worker-{idx}"))
             .spawn(move || {
-                let rt = new_worker_runtime(&hammer_core::config::Config::default());
+                let rt = runtime_seed(idx, worker_numa_node);
                 spawn::set_data_plane_runtime(rt.clone());
 
                 let engine = Engine {
                     thread_index: idx,
-                    numa_node: 0,
+                    numa_node: worker_numa_node,
                     main_loop_count: AtomicU32::new(0),
                     runtime: rt,
                     registry,

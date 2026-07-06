@@ -1,3 +1,5 @@
+extern crate self as hammer_runtime;
+
 // Re-export adapter types so the macros don't need fully-qualified paths and
 // downstream call sites can `use hammer_runtime::adapter::Lifecycle` if they
 // prefer the runtime crate's namespace.
@@ -6,6 +8,7 @@ pub use engine::{Engine, EnginePool};
 pub mod barrier;
 pub mod init;
 pub mod main_loop;
+pub mod memory;
 
 pub mod adapter {
     pub use hammer_adapter::*;

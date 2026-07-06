@@ -17,6 +17,7 @@ crossbeam-utils = { workspace = true }
 ipnet = { workspace = true }
 tokio = { workspace = true }
 libc = { workspace = true }
+spinning_top = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

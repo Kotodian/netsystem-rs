@@ -4,6 +4,7 @@ pub mod component;
 pub mod connection;
 pub mod handoff;
 pub mod instruction_set;
+pub mod memory;
 pub mod network;
 pub mod node;
 pub mod platform;
@@ -16,9 +17,9 @@ pub use buffer::{
     BufferFrameBatch, BufferFrameBatchCursor, BufferFrameBatchIndices, BufferFramePairBatch,
     BufferFramePairBatchCursor, BufferFrameQuadBatch, BufferFrameQuadBatchCursor,
     BufferHeaderCacheline0, BufferHeaderCacheline1, BufferIndex, BufferNodeError,
-    BufferPacketCursor, BufferPool, BufferPoolArena, DataPlaneBuffers, DataPlaneRuntime,
-    FrameIndex, FramePool, FrameRef, FrameRefMut, PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES,
-    PooledBufferFrame, PrimaryOpaque, SecondaryOpaque,
+    BufferPacketCursor, BufferPool, BufferPoolArena, BufferRef, BufferRefMut, DataPlaneBuffers,
+    DataPlaneRuntime, FrameIndex, FramePool, FrameRef, FrameRefMut, PRIMARY_OPAQUE_ALIGN,
+    PRIMARY_OPAQUE_BYTES, PooledBufferFrame, PrimaryOpaque, SecondaryOpaque,
 };
 pub use hammer_core::protocol::icmp::IcmpErrorMetadata;
 pub use hammer_core::{Network, SocksAddr};

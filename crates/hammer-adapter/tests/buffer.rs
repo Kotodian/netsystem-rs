@@ -1,5 +1,4 @@
 use std::future::Future;
-use std::cell::RefMut;
 use std::mem::{align_of, size_of};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -8,8 +7,8 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use hammer_adapter::{
     BufferFrame, BufferFramePairBatch, BufferFrameQuadBatch, BufferIndex, BufferPacketCursor,
-    BufferPool, BufferPoolArena, DataPlaneBuffers, DataPlaneHandoff, DataPlaneInstructionSet,
-    DataPlaneRuntime, DataWorkerId, FrameBatchWidth,
+    BufferPool, BufferPoolArena, BufferRefMut, DataPlaneBuffers, DataPlaneHandoff,
+    DataPlaneInstructionSet, DataPlaneRuntime, DataWorkerId, FrameBatchWidth,
 };
 use hammer_core::error::CoreResult;
 use hammer_infra::vec::Vec;
@@ -192,18 +191,18 @@ fn runtime_get_buffer_exposes_direct_buffer_borrows() {
 }
 
 #[test]
-fn public_mut_buffer_accessors_keep_refmut_shape() {
+fn public_mut_buffer_accessors_keep_buffer_refmut_shape() {
     fn assert_pool_shape<'a>(
         pool: &'a BufferPool,
         index: BufferIndex,
-    ) -> CoreResult<RefMut<'a, hammer_adapter::Buffer>> {
+    ) -> CoreResult<BufferRefMut<'a>> {
         pool.get_mut(index)
     }
 
     fn assert_runtime_shape<'a>(
         runtime: &'a DataPlaneRuntime,
         index: BufferIndex,
-    ) -> CoreResult<RefMut<'a, hammer_adapter::Buffer>> {
+    ) -> CoreResult<BufferRefMut<'a>> {
         runtime.get_buffer_mut(index)
     }
 
@@ -245,7 +244,8 @@ fn append_after_truncating_pre_data_current_window_keeps_bytes_coherent() {
         .expect("prepend into pre-data headroom");
     pool.truncate_current(index, 16)
         .expect("truncate current within pre-data");
-    pool.append(index, &[0xBB]).expect("append from pre-data tail");
+    pool.append(index, &[0xBB])
+        .expect("append from pre-data tail");
 
     let buffer = pool.get(index).expect("buffer");
     let mut expected = [0xAA; 17];
