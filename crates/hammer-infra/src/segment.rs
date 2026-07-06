@@ -1,7 +1,7 @@
 use std::io;
 use std::os::fd::RawFd;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::align::align_up;
 use crate::svm_region::SvmRegion;
@@ -124,7 +124,7 @@ impl Svm {
             return Err(io::Error::last_os_error());
         }
         let region =
-            SvmRegion::from_fd_owned(fd, size, true).ok_or_else(|| io::Error::last_os_error())?;
+            SvmRegion::from_created_fd_owned(fd, size).ok_or_else(|| io::Error::last_os_error())?;
         Ok(Self { region })
     }
 
@@ -147,7 +147,7 @@ impl Svm {
             return Err(io::Error::last_os_error());
         }
         let region =
-            SvmRegion::from_fd_owned(fd, size, true).ok_or_else(|| io::Error::last_os_error())?;
+            SvmRegion::from_created_fd_owned(fd, size).ok_or_else(|| io::Error::last_os_error())?;
         Ok(Self { region })
     }
 
@@ -193,7 +193,7 @@ impl Segment for Svm {
     }
 
     fn free(&self, offset: u64, bytes: usize) {
-        self.region.free(offset, bytes);
+        self.region.release_offset(offset, bytes);
     }
 
     fn fd(&self) -> Option<RawFd> {

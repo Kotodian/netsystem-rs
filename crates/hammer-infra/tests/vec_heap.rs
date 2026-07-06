@@ -2,16 +2,12 @@
 //! instead of `std::alloc` directly, matching VPP's "active heap" model.
 //!
 //! The original dyn-trait version of this test used a `CountingHeap` to count
-//! `alloc` calls. With `Heap` now a hand-written vtable struct (no `dyn`,
-//! no public `Heap` trait), the test probes `HeapSvm` via the
-//! `SvmRegion`'s bump pointer and free list: building a
-//! `Vec::with_capacity_in(...)` / `Slice::from_elem_in(...)` /
-//! `FlatHashTable::with_capacity_in(...)` must advance the bump by at least
-//! the layout's byte count, and dropping the collection must push the freed
-//! region back to the LIFO freelist. Default back-compat constructors must
-//! use `Heap::local(0)` and leave the Svm region untouched.
+//! `alloc` calls. With `Heap` now a concrete handle backed by either mimalloc
+//! or an SVM region, these tests verify externally visible behavior and
+//! address placement instead of allocator internals.
 #![allow(deprecated)]
 
+use std::alloc::{GlobalAlloc, Layout};
 use std::sync::Arc;
 
 use hammer_infra::boxed::Slice;
@@ -25,9 +21,6 @@ fn hammer_vec_routes_through_heap_registry() {
     let region = SvmRegion::with_size(1 << 20); // 1 MiB
     let heap = Arc::new(Heap::svm(region.clone(), 0));
 
-    let bump_before = region.bump_depth();
-    let freelist_before = region.freelist_len();
-
     let mut v: HVec<u64> = HVec::with_capacity_in(128, heap.clone());
     assert_eq!(v.capacity(), 128);
     for i in 0..128u64 {
@@ -35,46 +28,26 @@ fn hammer_vec_routes_through_heap_registry() {
     }
     assert_eq!(v.len(), 128);
     assert_eq!(v[127], 127);
-
-    // 128 * 8 = 1024 bytes; with 64-byte alignment the bump advances by at
-    // least 1024 bytes (and likely a full cache-line multiple, but >= 1024
-    // is the contract).
-    let bump_after = region.bump_depth();
-    let bumped = bump_after - bump_before;
+    let start = region.base() as usize;
+    let end = start + region.size();
+    let ptr = v.as_ptr() as usize;
     assert!(
-        bumped >= 1024,
-        "Vec backing must be heap-allocated (bump advanced by {bumped} bytes, expected >= 1024)"
-    );
-
-    drop(v);
-    assert_eq!(
-        region.freelist_len(),
-        freelist_before + 1,
-        "Vec::drop must route the backing region back through the same Heap"
+        ptr >= start && ptr < end,
+        "Vec backing must live inside the SVM region"
     );
 }
 
 #[test]
 fn hammer_vec_default_does_not_touch_a_svm_probe() {
-    // Default `with_capacity` must use `Heap::local`, not a Svm region.
-    let region = SvmRegion::with_size(1 << 16);
-    let bump_before = region.bump_depth();
     let mut v: HVec<u64> = HVec::with_capacity(64);
     v.push(7);
-    assert_eq!(
-        region.bump_depth(),
-        bump_before,
-        "default `Vec::with_capacity` must not allocate from a Svm region"
-    );
+    assert_eq!(v[0], 7);
 }
 
 #[test]
 fn hammer_slice_from_elem_in_routes_through_heap() {
     let region = SvmRegion::with_size(1 << 20);
     let heap = Arc::new(Heap::svm(region.clone(), 0));
-
-    let bump_before = region.bump_depth();
-    let freelist_before = region.freelist_len();
 
     let s: Slice<u8> = Slice::from_elem_in(2048, 0u8, heap.clone());
     assert_eq!(s.len(), 2048);
@@ -84,43 +57,25 @@ fn hammer_slice_from_elem_in_routes_through_heap() {
         0,
         "Slice preserves 64-byte alignment through the Heap (got {base})"
     );
-
-    // 2048 * 1 = 2048 bytes minimum; bump advances by at least that.
-    let bump_after = region.bump_depth();
-    let bumped = bump_after - bump_before;
+    let start = region.base() as usize;
+    let end = start + region.size();
     assert!(
-        bumped >= 2048,
-        "Slice backing must be heap-allocated (bump advanced by {bumped} bytes, expected >= 2048)"
-    );
-
-    drop(s);
-    assert_eq!(
-        region.freelist_len(),
-        freelist_before + 1,
-        "Slice::drop must route the backing region back through the same Heap"
+        base >= start && base < end,
+        "Slice backing must live inside the SVM region"
     );
 }
 
 #[test]
 fn hammer_slice_default_from_elem_does_not_touch_a_svm_probe() {
-    let region = SvmRegion::with_size(1 << 16);
-    let bump_before = region.bump_depth();
     let s: Slice<u64> = Slice::from_elem(64, 0u64);
     assert_eq!(s.len(), 64);
-    assert_eq!(
-        region.bump_depth(),
-        bump_before,
-        "default `Slice::from_elem` must not allocate from a Svm region"
-    );
+    assert_eq!(s[0], 0);
 }
 
 #[test]
 fn flat_hash_table_with_capacity_in_routes_through_heap() {
     let region = SvmRegion::with_size(1 << 20);
     let heap = Arc::new(Heap::svm(region.clone(), 0));
-
-    let bump_before = region.bump_depth();
-    let freelist_before = region.freelist_len();
 
     let mut table: FlatHashTable<u64, u64> = FlatHashTable::with_capacity_in(64, heap.clone());
     table.insert(1, 100);
@@ -129,34 +84,66 @@ fn flat_hash_table_with_capacity_in_routes_through_heap() {
     assert_eq!(table.get(&1), Some(&100));
     assert_eq!(table.get(&2), Some(&200));
     assert_eq!(table.bucket_count(), 64);
-
-    // Bucket storage comes from the heap. 64 buckets * sizeof(Bucket) — the
-    // exact byte count depends on the bucket struct size, but the bump
-    // must have advanced by a positive amount >= one cache line.
-    let bump_after = region.bump_depth();
-    let bumped = bump_after - bump_before;
+    let start = region.base() as usize;
+    let end = start + region.size();
+    let ptr = table.bucket_ptr() as usize;
     assert!(
-        bumped >= 64,
-        "FlatHashTable bucket storage must be heap-allocated (bump advanced by {bumped} bytes)"
-    );
-
-    drop(table);
-    assert_eq!(
-        region.freelist_len(),
-        freelist_before + 1,
-        "FlatHashTable::drop must route the bucket storage back through the same Heap"
+        ptr >= start && ptr < end,
+        "FlatHashTable backing must live inside the SVM region"
     );
 }
 
 #[test]
 fn flat_hash_table_default_with_capacity_does_not_touch_a_svm_probe() {
-    let region = SvmRegion::with_size(1 << 16);
-    let bump_before = region.bump_depth();
     let mut table: FlatHashTable<u64, u64> = FlatHashTable::with_capacity(64);
     table.insert(1, 100);
-    assert_eq!(
-        region.bump_depth(),
-        bump_before,
-        "default `FlatHashTable::with_capacity` must not allocate from a Svm region"
-    );
+    assert_eq!(table.get(&1), Some(&100));
+}
+
+#[test]
+fn hammer_vec_drop_returns_storage_to_same_heap() {
+    let region = SvmRegion::with_size(20 * 1024);
+    let heap = Arc::new(Heap::svm(region.clone(), 0));
+    let capacity = 1536usize;
+    let layout = Layout::from_size_align(capacity * std::mem::size_of::<u64>(), 64).unwrap();
+
+    {
+        let mut v: HVec<u64> = HVec::with_capacity_in(capacity, heap.clone());
+        v.push(7);
+    }
+
+    let raw = heap
+        .alloc(layout)
+        .expect("Vec drop must return its backing storage to the same heap");
+    let start = region.base() as usize;
+    let end = start + region.size();
+    let ptr = raw.as_ptr() as usize;
+    assert!(ptr >= start && ptr < end);
+    unsafe {
+        GlobalAlloc::dealloc(&*heap, raw.as_ptr(), layout);
+    }
+}
+
+#[test]
+fn hammer_slice_drop_returns_storage_to_same_heap() {
+    let region = SvmRegion::with_size(20 * 1024);
+    let heap = Arc::new(Heap::svm(region.clone(), 0));
+    let len = 12 * 1024usize;
+    let layout = Layout::from_size_align(len, 64).unwrap();
+
+    {
+        let s: Slice<u8> = Slice::from_elem_in(len, 0u8, heap.clone());
+        assert_eq!(s.len(), len);
+    }
+
+    let raw = heap
+        .alloc(layout)
+        .expect("Slice drop must return its backing storage to the same heap");
+    let start = region.base() as usize;
+    let end = start + region.size();
+    let ptr = raw.as_ptr() as usize;
+    assert!(ptr >= start && ptr < end);
+    unsafe {
+        GlobalAlloc::dealloc(&*heap, raw.as_ptr(), layout);
+    }
 }

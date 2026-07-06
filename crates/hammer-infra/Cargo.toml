@@ -10,3 +10,6 @@ name = "hammer_infra"
 [dependencies]
 crossbeam-utils = { workspace = true }
 libc = { workspace = true }
+mimalloc = { workspace = true }
+spinning_top = { workspace = true }
+talc = { workspace = true }

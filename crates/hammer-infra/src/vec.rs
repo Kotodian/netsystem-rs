@@ -1,4 +1,4 @@
-use std::alloc::handle_alloc_error;
+use std::alloc::{GlobalAlloc, handle_alloc_error};
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem;
@@ -313,8 +313,7 @@ impl<T, const ALIGN: usize> RawVec<T, ALIGN> {
         if old_cap > 0 {
             let old_layout = align::array_layout::<T, ALIGN>(old_cap);
             let raw = self.ptr.as_ptr().cast::<u8>();
-            let nn = NonNull::new(raw).expect("Heap::dealloc received null");
-            unsafe { heap.dealloc(nn, old_layout) };
+            unsafe { GlobalAlloc::dealloc(&*heap, raw, old_layout) };
         }
         self.ptr = next_ptr;
         self.cap = next_capacity;
@@ -436,8 +435,7 @@ impl<T, const ALIGN: usize> Drop for RawIntoIter<T, ALIGN> {
             if let Some(heap) = self.heap.as_ref() {
                 let layout = align::array_layout::<T, ALIGN>(self.cap);
                 let raw = self.ptr.as_ptr().cast::<u8>();
-                let nn = NonNull::new(raw).expect("Heap::dealloc received null");
-                unsafe { heap.dealloc(nn, layout) };
+                unsafe { GlobalAlloc::dealloc(&**heap, raw, layout) };
             }
         }
     }
@@ -529,8 +527,7 @@ impl<T, const ALIGN: usize> Drop for RawVec<T, ALIGN> {
             if let Some(heap) = self.heap.as_ref() {
                 let layout = align::array_layout::<T, ALIGN>(self.cap);
                 let raw = self.ptr.as_ptr().cast::<u8>();
-                let nn = NonNull::new(raw).expect("Heap::dealloc received null");
-                unsafe { heap.dealloc(nn, layout) };
+                unsafe { GlobalAlloc::dealloc(&**heap, raw, layout) };
             }
         }
     }

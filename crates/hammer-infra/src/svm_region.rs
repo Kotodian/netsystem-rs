@@ -1,11 +1,26 @@
-//! Reusable shared-memory region: memfd/shm_open mmap backing + bump allocator
-//! with a LIFO best-fit free list. Owned by `Svm` segments and `HeapSvm` heaps.
+//! Shared-memory region backed by `memfd_create`/`shm_open` and optionally
+//! claimed as an owner allocator with Talc.
+
+use std::alloc::{GlobalAlloc, Layout};
 use std::ffi::CString;
+use std::mem;
 use std::os::fd::RawFd;
+use std::ptr::NonNull;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+
+use talc::source::Manual;
 
 use crate::align::align_up;
+
+const SVM_OFFSET_ALIGN: usize = 64;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct OffsetAllocHeader {
+    raw_offset: u64,
+    layout_align: usize,
+}
 
 pub struct SvmRegion {
     inner: Arc<SvmRegionInner>,
@@ -15,9 +30,8 @@ struct SvmRegionInner {
     base: *mut u8,
     size: usize,
     fd: RawFd,
-    bump: AtomicU64,
-    free_list: Mutex<Vec<(u64, usize)>>,
-    owned: bool,
+    allocator: Option<talc::TalcLock<spinning_top::RawSpinlock, talc::source::Manual>>,
+    fd_owned: bool,
 }
 
 unsafe impl Send for SvmRegionInner {}
@@ -32,151 +46,303 @@ impl Clone for SvmRegion {
 }
 
 impl SvmRegion {
-    /// Create a new owned shared-memory region of at least `size` bytes.
-    /// On Linux this uses `memfd_create`; elsewhere it uses `shm_open`.
     pub fn with_size(size: usize) -> SvmRegion {
-        let page = page_size();
-        let total = align_up(size, page);
-        let (base, fd, owned) = unsafe { alloc_region(total) };
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        assert!(
+            page > 0,
+            "sysconf(_SC_PAGESIZE) must return a positive page size"
+        );
+        let total = align_up(size, page as usize);
+        let counter = SVM_REGION_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+
+        #[cfg(target_os = "linux")]
+        let (base, fd, fd_owned) = {
+            let name = CString::new(format!("hammer-region-{pid}-{counter}"))
+                .expect("generated memfd name contains no nul");
+            let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+            if fd < 0 {
+                panic!(
+                    "SvmRegion::with_size: memfd_create failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+
+            let result = unsafe { libc::ftruncate(fd, total as libc::off_t) };
+            if result != 0 {
+                let error = std::io::Error::last_os_error();
+                unsafe { libc::close(fd) };
+                panic!("SvmRegion::with_size: ftruncate failed: {error}");
+            }
+
+            let base = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    total,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                )
+            };
+            if base == libc::MAP_FAILED {
+                let error = std::io::Error::last_os_error();
+                unsafe { libc::close(fd) };
+                panic!("SvmRegion::with_size: mmap failed: {error}");
+            }
+
+            (base.cast::<u8>(), fd, true)
+        };
+
+        #[cfg(not(target_os = "linux"))]
+        let (base, fd, fd_owned) = {
+            let name = CString::new(format!("/hammer-region-{pid}-{counter}"))
+                .expect("generated shm name contains no nul");
+            let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600) };
+            if fd < 0 {
+                panic!(
+                    "SvmRegion::with_size: shm_open failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            unsafe { libc::shm_unlink(name.as_ptr()) };
+
+            let result = unsafe { libc::ftruncate(fd, total as libc::off_t) };
+            if result != 0 {
+                let error = std::io::Error::last_os_error();
+                unsafe { libc::close(fd) };
+                panic!("SvmRegion::with_size: ftruncate failed: {error}");
+            }
+
+            let base = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    total,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                )
+            };
+            if base == libc::MAP_FAILED {
+                let error = std::io::Error::last_os_error();
+                unsafe { libc::close(fd) };
+                panic!("SvmRegion::with_size: mmap failed: {error}");
+            }
+
+            (base.cast::<u8>(), fd, true)
+        };
+
+        let allocator = match Self::claim_allocator(base, total) {
+            Some(allocator) => Some(allocator),
+            None => {
+                unsafe {
+                    libc::munmap(base.cast::<libc::c_void>(), total);
+                    libc::close(fd);
+                }
+                panic!("SvmRegion::with_size: Talc failed to claim mapped memory");
+            }
+        };
+
         SvmRegion {
             inner: Arc::new(SvmRegionInner {
                 base,
                 size: total,
                 fd,
-                bump: AtomicU64::new(0),
-                free_list: Mutex::new(Vec::new()),
-                owned,
+                allocator,
+                fd_owned,
             }),
         }
     }
 
-    /// Attach to an existing shared-memory region by fd (does not own the fd).
     pub fn from_fd(fd: RawFd, size: usize) -> Option<SvmRegion> {
         Self::from_fd_owned(fd, size, false)
     }
 
-    /// Attach to an existing shared-memory region by fd. When `owned` is true,
-    /// the fd is closed in `SvmRegionInner::drop`; otherwise the caller keeps
-    /// ownership.
-    pub fn from_fd_owned(fd: RawFd, size: usize, owned: bool) -> Option<SvmRegion> {
-        let page = page_size();
-        let total = align_up(size, page);
-        unsafe {
-            let base = libc::mmap(
+    pub(crate) fn from_fd_owned(fd: RawFd, size: usize, fd_owned: bool) -> Option<SvmRegion> {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        assert!(
+            page > 0,
+            "sysconf(_SC_PAGESIZE) must return a positive page size"
+        );
+        let total = align_up(size, page as usize);
+        let base = unsafe {
+            libc::mmap(
                 std::ptr::null_mut(),
                 total,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED,
                 fd,
                 0,
-            );
-            if base == libc::MAP_FAILED {
-                return None;
+            )
+        };
+        if base == libc::MAP_FAILED {
+            if fd_owned {
+                unsafe { libc::close(fd) };
             }
-            Some(SvmRegion {
-                inner: Arc::new(SvmRegionInner {
-                    base: base as *mut u8,
-                    size: total,
-                    fd,
-                    bump: AtomicU64::new(0),
-                    free_list: Mutex::new(Vec::new()),
-                    owned,
-                }),
-            })
+            return None;
         }
+
+        Some(SvmRegion {
+            inner: Arc::new(SvmRegionInner {
+                base: base.cast::<u8>(),
+                size: total,
+                fd,
+                allocator: None,
+                fd_owned,
+            }),
+        })
     }
 
+    pub(crate) fn from_created_fd_owned(fd: RawFd, size: usize) -> Option<SvmRegion> {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        assert!(
+            page > 0,
+            "sysconf(_SC_PAGESIZE) must return a positive page size"
+        );
+        let total = align_up(size, page as usize);
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                total,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            unsafe { libc::close(fd) };
+            return None;
+        }
+        let base = base.cast::<u8>();
+        let allocator = match Self::claim_allocator(base, total) {
+            Some(allocator) => Some(allocator),
+            None => {
+                unsafe {
+                    libc::munmap(base.cast::<libc::c_void>(), total);
+                    libc::close(fd);
+                }
+                return None;
+            }
+        };
+
+        Some(SvmRegion {
+            inner: Arc::new(SvmRegionInner {
+                base,
+                size: total,
+                fd,
+                allocator,
+                fd_owned: true,
+            }),
+        })
+    }
+
+    #[inline]
     pub fn base(&self) -> *mut u8 {
         self.inner.base
     }
 
+    #[inline]
     pub fn size(&self) -> usize {
         self.inner.size
     }
 
+    #[inline]
     pub fn fd(&self) -> RawFd {
         self.inner.fd
     }
 
-    /// Current bump-pointer offset. Read-only; no side effects.
-    pub fn bump_depth(&self) -> u64 {
-        self.inner.bump.load(Ordering::Relaxed)
+    #[inline]
+    pub(crate) fn is_allocation_owner(&self) -> bool {
+        self.inner.allocator.is_some()
     }
 
-    /// Number of entries in the LIFO free list.
-    pub fn freelist_len(&self) -> usize {
-        self.inner
-            .free_list
-            .lock()
-            .expect("svm_region free_list")
-            .len()
-    }
-
-    /// Best-fit search of the LIFO free list; on miss, bump-allocates.
-    /// Returns `u64::MAX` on OOM. The returned offset is `align`-aligned
-    /// and satisfies `offset + bytes <= base + size`.
     pub fn alloc(&self, bytes: usize, align: usize) -> u64 {
-        // 1. Try free list (best-fit by smallest remaining sliver).
-        let mut fl = self.inner.free_list.lock().expect("svm_region free_list");
-        let mut best: Option<(usize, u64)> = None;
-        for (i, &(off, sz)) in fl.iter().enumerate() {
-            if sz < bytes {
-                continue;
-            }
-            let aligned = align_up(off as usize, align);
-            let pad = aligned - off as usize;
-            let end = match aligned.checked_add(bytes) {
-                Some(v) => v,
-                None => continue,
-            };
-            if end > off as usize + sz {
-                continue;
-            }
-            let tail = (sz - pad - bytes) as u64;
-            match best {
-                None => best = Some((i, tail)),
-                Some((_, t)) if tail < t => best = Some((i, tail)),
-                _ => {}
-            }
+        if !self.is_allocation_owner() {
+            return u64::MAX;
         }
-        if let Some((i, _)) = best {
-            let (off, sz) = fl.swap_remove(i);
-            let aligned = align_up(off as usize, align);
-            let pad = aligned - off as usize;
-            if pad + bytes < sz {
-                fl.push(((aligned + bytes) as u64, sz - pad - bytes));
-            }
-            return aligned as u64;
+        if bytes == 0 || !align.is_power_of_two() {
+            return u64::MAX;
         }
-        drop(fl);
-        // 2. Bump.
-        let size = self.inner.size;
-        loop {
-            let current = self.inner.bump.load(Ordering::Relaxed);
-            let aligned = align_up(current as usize, align) as u64;
-            let next = aligned + bytes as u64;
-            if next > size as u64 {
-                return u64::MAX;
-            }
-            if self
-                .inner
-                .bump
-                .compare_exchange(current, next, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                return aligned;
-            }
+        let Some((layout, layout_align)) = offset_alloc_layout(bytes, align) else {
+            return u64::MAX;
+        };
+        self.alloc_layout(layout)
+            .and_then(|raw_ptr| {
+                let user_ptr = user_ptr_from_raw(raw_ptr, layout_align)?;
+                let raw_offset = self.ptr_to_offset(raw_ptr)?;
+                unsafe {
+                    write_offset_alloc_header(user_ptr, raw_offset, layout_align);
+                }
+                Some(user_ptr)
+            })
+            .and_then(|ptr| self.ptr_to_offset(ptr))
+            .unwrap_or(u64::MAX)
+    }
+
+    pub(crate) fn alloc_layout(&self, layout: Layout) -> Option<NonNull<u8>> {
+        let allocator = self.inner.allocator.as_ref()?;
+        let ptr = unsafe { GlobalAlloc::alloc(allocator, layout) };
+        NonNull::new(ptr)
+    }
+
+    pub(crate) unsafe fn dealloc_layout(&self, ptr: NonNull<u8>, layout: Layout) {
+        let Some(allocator) = self.inner.allocator.as_ref() else {
+            panic!("attached SVM mapping does not own allocator state");
+        };
+        unsafe {
+            GlobalAlloc::dealloc(allocator, ptr.as_ptr(), layout);
         }
     }
 
-    /// Push `(offset, bytes)` to the LIFO free list. No coalescing — VPP/hammer
-    /// semantics match existing `SvmInner` behavior.
-    pub fn free(&self, offset: u64, bytes: usize) {
-        self.inner
-            .free_list
-            .lock()
-            .expect("svm_region free_list")
-            .push((offset, bytes));
+    pub(crate) fn release_offset(&self, offset: u64, bytes: usize) {
+        if bytes == 0 || !self.is_allocation_owner() {
+            return;
+        }
+        let Some(user_ptr) = self.offset_to_ptr(offset) else {
+            return;
+        };
+        let header = unsafe { read_offset_alloc_header(user_ptr) };
+        let Some((layout, _)) = offset_alloc_layout(bytes, header.layout_align) else {
+            return;
+        };
+        let Some(ptr) = self.offset_to_ptr(header.raw_offset) else {
+            return;
+        };
+        unsafe {
+            self.dealloc_layout(ptr, layout);
+        }
+    }
+
+    fn ptr_to_offset(&self, ptr: NonNull<u8>) -> Option<u64> {
+        let base = self.inner.base as usize;
+        let end = base.checked_add(self.inner.size)?;
+        let ptr = ptr.as_ptr() as usize;
+        if ptr < base || ptr > end {
+            return None;
+        }
+        Some((ptr - base) as u64)
+    }
+
+    fn offset_to_ptr(&self, offset: u64) -> Option<NonNull<u8>> {
+        let offset = usize::try_from(offset).ok()?;
+        if offset >= self.inner.size {
+            return None;
+        }
+        NonNull::new(unsafe { self.inner.base.add(offset) })
+    }
+
+    fn claim_allocator(
+        base: *mut u8,
+        total: usize,
+    ) -> Option<talc::TalcLock<spinning_top::RawSpinlock, talc::source::Manual>> {
+        let allocator =
+            talc::TalcLock::<spinning_top::RawSpinlock, talc::source::Manual>::new(Manual);
+        unsafe {
+            allocator.lock().claim(base, total)?;
+        }
+        Some(allocator)
     }
 }
 
@@ -190,89 +356,63 @@ impl Drop for SvmRegionInner {
     fn drop(&mut self) {
         unsafe {
             if !self.base.is_null() {
-                libc::munmap(self.base as *mut libc::c_void, self.size);
+                libc::munmap(self.base.cast::<libc::c_void>(), self.size);
             }
-            if self.owned {
+            if self.fd_owned {
                 libc::close(self.fd);
             }
         }
     }
 }
 
-fn page_size() -> usize {
-    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
-}
-
 static SVM_REGION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-unsafe fn alloc_region(total: usize) -> (*mut u8, RawFd, bool) {
-    let counter = SVM_REGION_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    #[cfg(target_os = "linux")]
-    {
-        let name = CString::new(format!("hammer-region-{pid}-{counter}")).unwrap();
-        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
-        if fd < 0 {
-            panic!(
-                "SvmRegion alloc_region: memfd_create failed: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        let ret = unsafe { libc::ftruncate(fd, total as libc::off_t) };
-        if ret != 0 {
-            let e = std::io::Error::last_os_error();
-            unsafe { libc::close(fd) };
-            panic!("SvmRegion alloc_region: ftruncate failed: {e}");
-        }
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                total,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            )
-        };
-        if base == libc::MAP_FAILED {
-            let e = std::io::Error::last_os_error();
-            unsafe { libc::close(fd) };
-            panic!("SvmRegion alloc_region: mmap failed: {e}");
-        }
-        (base as *mut u8, fd, true)
+#[inline]
+fn offset_alloc_layout(bytes: usize, align: usize) -> Option<(Layout, usize)> {
+    let layout_align = SVM_OFFSET_ALIGN
+        .max(align)
+        .max(mem::align_of::<OffsetAllocHeader>());
+    let size = bytes
+        .checked_add(mem::size_of::<OffsetAllocHeader>())?
+        .checked_add(layout_align.checked_sub(1)?)?;
+    Layout::from_size_align(size, layout_align)
+        .ok()
+        .map(|layout| (layout, layout_align))
+}
+
+#[inline]
+fn user_ptr_from_raw(raw_ptr: NonNull<u8>, layout_align: usize) -> Option<NonNull<u8>> {
+    let base = raw_ptr.as_ptr() as usize;
+    let user = align_up(
+        base.checked_add(mem::size_of::<OffsetAllocHeader>())?,
+        layout_align,
+    );
+    NonNull::new(user as *mut u8)
+}
+
+#[inline]
+unsafe fn write_offset_alloc_header(user_ptr: NonNull<u8>, raw_offset: u64, layout_align: usize) {
+    let header_ptr = unsafe {
+        user_ptr
+            .as_ptr()
+            .sub(mem::size_of::<OffsetAllocHeader>())
+            .cast::<OffsetAllocHeader>()
+    };
+    unsafe {
+        header_ptr.write(OffsetAllocHeader {
+            raw_offset,
+            layout_align,
+        });
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let name = CString::new(format!("/hammer-region-{pid}-{counter}")).unwrap();
-        let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600) };
-        if fd < 0 {
-            panic!(
-                "SvmRegion alloc_region: shm_open failed: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        unsafe { libc::shm_unlink(name.as_ptr()) };
-        let ret = unsafe { libc::ftruncate(fd, total as libc::off_t) };
-        if ret != 0 {
-            let e = std::io::Error::last_os_error();
-            unsafe { libc::close(fd) };
-            panic!("SvmRegion alloc_region: ftruncate failed: {e}");
-        }
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                total,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            )
-        };
-        if base == libc::MAP_FAILED {
-            let e = std::io::Error::last_os_error();
-            unsafe { libc::close(fd) };
-            panic!("SvmRegion alloc_region: mmap failed: {e}");
-        }
-        (base as *mut u8, fd, true)
-    }
+}
+
+#[inline]
+unsafe fn read_offset_alloc_header(user_ptr: NonNull<u8>) -> OffsetAllocHeader {
+    let header_ptr = unsafe {
+        user_ptr
+            .as_ptr()
+            .sub(mem::size_of::<OffsetAllocHeader>())
+            .cast::<OffsetAllocHeader>()
+    };
+    unsafe { header_ptr.read() }
 }

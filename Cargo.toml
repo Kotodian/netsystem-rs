@@ -68,6 +68,9 @@ linkme = "0.3"
 petgraph = "0.6"
 clap = "4"
 bincode = "1"
+mimalloc = { version = "0.1", default-features = false }
+talc = { version = "5.0.4", default-features = false }
+spinning_top = "0.3"
 
 [patch.crates-io]
 boringtun = { path = "third_party/boringtun" }

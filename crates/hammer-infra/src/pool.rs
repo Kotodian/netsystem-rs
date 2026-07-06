@@ -1,4 +1,4 @@
-use std::alloc::{Layout, handle_alloc_error};
+use std::alloc::{GlobalAlloc, Layout, handle_alloc_error};
 use std::fmt;
 use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
@@ -256,7 +256,7 @@ impl<T, const ALIGN: usize> Drop for Pool<T, ALIGN> {
         if let Some(layout) = self.layout {
             // SAFETY: `layout` matches the one passed to `self.heap.alloc` in
             // `with_capacity_in`, and `self.ptr` was returned by that call.
-            unsafe { self.heap.dealloc(self.ptr, layout) };
+            unsafe { GlobalAlloc::dealloc(&*self.heap, self.ptr.as_ptr(), layout) };
         }
     }
 }

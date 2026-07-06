@@ -1,4 +1,4 @@
-use std::alloc::handle_alloc_error;
+use std::alloc::{GlobalAlloc, handle_alloc_error};
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem;
@@ -271,6 +271,5 @@ pub(crate) unsafe fn deallocate_in<T, const ALIGN: usize>(
     }
     let layout = align::array_layout::<T, ALIGN>(capacity);
     let raw = ptr.as_ptr().cast::<u8>();
-    let nn = NonNull::new(raw).expect("Heap::dealloc received null");
-    unsafe { heap.dealloc(nn, layout) };
+    unsafe { GlobalAlloc::dealloc(heap, raw, layout) };
 }
