@@ -1,9 +1,10 @@
 use core::alloc::{GlobalAlloc, Layout};
+use core::marker::PhantomData;
 use core::mem;
 use core::ptr::{self, NonNull};
 use core::slice;
 use core::sync::atomic::{AtomicU64, Ordering};
-use std::cell::{Cell, Ref, RefCell, RefMut};
+use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
@@ -1021,14 +1022,19 @@ struct FramePoolInner {
 }
 
 #[derive(Debug, Clone)]
-pub struct FramePool {
+pub(crate) struct FramePool {
     inner: Rc<RefCell<FramePoolInner>>,
 }
 
-#[derive(Debug)]
-pub struct PooledBufferFrame {
+pub enum Next {}
+
+pub enum Pending {}
+
+pub struct Frame<State> {
+    owner: DataPlaneBuffers,
     index: FrameIndex,
-    frame: BufferFrame,
+    frame: Option<BufferFrame>,
+    state: PhantomData<State>,
 }
 
 #[derive(Clone)]
@@ -1131,6 +1137,58 @@ fn next_buffer_pool_id() -> u64 {
 #[inline]
 fn next_frame_pool_id() -> u64 {
     NEXT_FRAME_POOL_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+impl<State> Frame<State> {
+    #[inline]
+    pub fn index(&self) -> FrameIndex {
+        self.index
+    }
+
+    #[inline]
+    fn take_inner(
+        &mut self,
+        consumed_message: &'static str,
+    ) -> (DataPlaneBuffers, FrameIndex, BufferFrame) {
+        let frame = self.frame.take().expect(consumed_message);
+        let owner = self.owner.clone();
+        let index = self.index;
+        (owner, index, frame)
+    }
+}
+
+impl Frame<Next> {
+    #[inline]
+    fn take_for_submit(mut self, next: NodeId) -> Frame<Pending> {
+        let (owner, index, mut frame) = self.take_inner("next frame already consumed");
+        frame.set_next_node(next);
+        Frame {
+            owner,
+            index,
+            frame: Some(frame),
+            state: PhantomData,
+        }
+    }
+}
+
+impl From<Frame<Pending>> for Frame<Next> {
+    fn from(mut pending: Frame<Pending>) -> Self {
+        let (owner, index, frame) = pending.take_inner("pending frame already consumed");
+        Self {
+            owner,
+            index,
+            frame: Some(frame),
+            state: PhantomData,
+        }
+    }
+}
+
+impl<State> Drop for Frame<State> {
+    fn drop(&mut self) {
+        if let Some(frame) = self.frame.take() {
+            self.owner.drop_owned_frame(self.index, frame);
+        }
+    }
 }
 
 impl DataPlaneBuffers {
@@ -1367,11 +1425,6 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    pub fn frames(&self) -> &FramePool {
-        &self.frames
-    }
-
-    #[inline]
     pub fn instruction_set(&self) -> DataPlaneInstructionSet {
         self.instruction_set
     }
@@ -1455,98 +1508,27 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    pub fn alloc_frame_index(&self) -> CoreResult<FrameIndex> {
-        self.frames.alloc_index()
+    fn drop_owned_frame(&self, index: FrameIndex, frame: BufferFrame) {
+        self.frames
+            .free_taken_index(self.buffers(), index, frame)
+            .expect("owned frame must return to its originating pool");
     }
 
     #[inline]
-    pub fn with_frame<R>(
-        &self,
-        index: FrameIndex,
-        f: impl FnOnce(&BufferFrame) -> R,
-    ) -> CoreResult<R> {
-        self.frames.with_frame(index, f)
-    }
-
-    #[inline]
-    pub fn get_frame(&self, index: FrameIndex) -> CoreResult<FrameRef<'_>> {
-        self.frames.get(index)
-    }
-
-    #[inline]
-    pub fn get_frame_mut(&self, index: FrameIndex) -> CoreResult<FrameRefMut<'_>> {
-        self.frames.get_mut(index)
-    }
-
-    #[inline]
-    pub fn with_frame_mut<R>(
-        &self,
-        index: FrameIndex,
-        f: impl FnOnce(&mut BufferFrame) -> R,
-    ) -> CoreResult<R> {
-        self.frames.with_frame_mut(index, f)
-    }
-
-    #[inline]
-    pub fn free_frame_index(&self, index: FrameIndex) -> CoreResult<()> {
-        let mut frame = self.frames.take_index(index)?;
-        self.free_frame(&mut frame);
-        self.frames.free_taken_index(self.buffers(), index, frame)
-    }
-
-    #[inline]
-    pub fn alloc_pooled_frame(&self) -> CoreResult<PooledBufferFrame> {
+    pub fn alloc_frame(&self) -> CoreResult<Frame<Next>> {
         let index = self.frames.alloc_index()?;
         match self.frames.take_index(index) {
-            Ok(frame) => Ok(PooledBufferFrame { index, frame }),
+            Ok(frame) => Ok(Frame {
+                owner: self.clone(),
+                index,
+                frame: Some(frame),
+                state: PhantomData::<Next>,
+            }),
             Err(err) => {
                 let _ = self.frames.free_index(self.buffers(), index);
                 Err(err)
             }
         }
-    }
-
-    #[inline]
-    pub fn release_pooled_frame(&self, frame: PooledBufferFrame) -> CoreResult<()> {
-        let PooledBufferFrame { index, frame } = frame;
-        let mut frame = frame;
-        self.free_frame(&mut frame);
-        self.frames.free_taken_index(self.buffers(), index, frame)
-    }
-
-    #[inline]
-    pub(crate) fn return_pooled_frame_for_schedule(
-        &self,
-        frame: PooledBufferFrame,
-    ) -> CoreResult<FrameIndex> {
-        let PooledBufferFrame { index, frame } = frame;
-        self.frames.return_taken_index(index, frame)?;
-        Ok(index)
-    }
-
-    #[inline]
-    pub(crate) fn take_frame_index(&self, index: FrameIndex) -> CoreResult<BufferFrame> {
-        self.frames.take_index(index)
-    }
-
-    #[inline]
-    pub(crate) fn return_taken_frame_index(
-        &self,
-        index: FrameIndex,
-        frame: BufferFrame,
-    ) -> CoreResult<()> {
-        self.frames.return_taken_index(index, frame)
-    }
-
-    #[inline]
-    pub(crate) fn release_taken_frame_index(
-        &self,
-        index: FrameIndex,
-        frame: BufferFrame,
-    ) -> CoreResult<()> {
-        let mut frame = frame;
-        self.free_frame(&mut frame);
-        self.frames.free_taken_index(self.buffers(), index, frame)
     }
 
     #[inline]
@@ -2029,51 +2011,22 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    pub fn alloc_frame_index(&self) -> CoreResult<FrameIndex> {
-        self.buffers.alloc_frame_index()
+    pub fn alloc_frame(&self) -> CoreResult<Frame<Next>> {
+        self.buffers.alloc_frame()
     }
 
     #[inline]
-    pub fn with_frame<R>(
-        &self,
-        index: FrameIndex,
-        f: impl FnOnce(&BufferFrame) -> R,
-    ) -> CoreResult<R> {
-        self.buffers.with_frame(index, f)
+    pub fn submit_frame(&self, frame: Frame<Next>, next: NodeId) -> CoreResult<()> {
+        if !frame.has_pending() {
+            return Ok(());
+        }
+        self.nodes
+            .schedule_frame(next, frame.take_for_submit(next), false)
     }
 
     #[inline]
-    pub fn get_frame(&self, index: FrameIndex) -> CoreResult<FrameRef<'_>> {
-        self.buffers.get_frame(index)
-    }
-
-    #[inline]
-    pub fn get_frame_mut(&self, index: FrameIndex) -> CoreResult<FrameRefMut<'_>> {
-        self.buffers.get_frame_mut(index)
-    }
-
-    #[inline]
-    pub fn with_frame_mut<R>(
-        &self,
-        index: FrameIndex,
-        f: impl FnOnce(&mut BufferFrame) -> R,
-    ) -> CoreResult<R> {
-        self.buffers.with_frame_mut(index, f)
-    }
-
-    #[inline]
-    pub fn free_frame_index(&self, index: FrameIndex) -> CoreResult<()> {
-        self.buffers.free_frame_index(index)
-    }
-
-    #[inline]
-    pub fn alloc_pooled_frame(&self) -> CoreResult<PooledBufferFrame> {
-        self.buffers.alloc_pooled_frame()
-    }
-
-    #[inline]
-    pub fn release_pooled_frame(&self, frame: PooledBufferFrame) -> CoreResult<()> {
-        self.buffers.release_pooled_frame(frame)
+    pub fn take_pending_frame(&self) -> CoreResult<Option<Frame<Pending>>> {
+        Ok(self.nodes.take_scheduled_frame())
     }
 
     #[inline]
@@ -2223,53 +2176,9 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    pub fn schedule_frame(&self, node: NodeId, frame: FrameIndex) -> CoreResult<bool> {
-        if !self.get_frame(frame)?.has_pending() {
-            return Ok(false);
-        }
-        self.get_frame_mut(frame)?.set_next_node(node);
-        self.nodes.schedule_frame(node, frame, false)?;
-        Ok(true)
-    }
-
-    #[inline]
-    pub(crate) fn schedule_pooled_frame(
-        &self,
-        node: NodeId,
-        frame: PooledBufferFrame,
-    ) -> CoreResult<()> {
-        let frame_index = self.buffers.return_pooled_frame_for_schedule(frame)?;
-        match self.schedule_frame(node, frame_index) {
-            Ok(true) => Ok(()),
-            Ok(false) => self.free_frame_index(frame_index),
-            Err(err) => {
-                let _ = self.free_frame_index(frame_index);
-                Err(err)
-            }
-        }
-    }
-
-    #[inline]
-    pub fn schedule_driver_frame(&self, node: NodeId, frame: FrameIndex) -> CoreResult<()> {
-        self.get_frame_mut(frame)?.set_next_node(node);
-        self.nodes.schedule_frame(node, frame, true)
-    }
-
-    #[inline]
     pub fn schedule_empty_frame(&self, node: NodeId) -> CoreResult<()> {
-        let frame = self.alloc_frame_index()?;
-        if let Err(err) = self
-            .get_frame_mut(frame)
-            .map(|mut frame_ref| frame_ref.set_next_node(node))
-        {
-            let _ = self.free_frame_index(frame);
-            return Err(err);
-        }
-        if let Err(err) = self.nodes.schedule_frame(node, frame, true) {
-            let _ = self.free_frame_index(frame);
-            return Err(err);
-        }
-        Ok(())
+        self.nodes
+            .schedule_frame(node, self.alloc_frame()?.take_for_submit(node), true)
     }
 
     #[inline]
@@ -2313,24 +2222,17 @@ impl DataPlaneRuntime {
                     return Err(err);
                 }
             };
-            let frame = match self.alloc_frame_index() {
+            let mut frame = match self.alloc_frame() {
                 Ok(frame) => frame,
                 Err(err) => {
                     self.free_handoff_indices(handoff_frame.indices);
                     return Err(err);
                 }
             };
-            {
-                let mut frame_ref = self.get_frame_mut(frame)?;
-                if let Err(err) = self.push_handoff_indices(&mut frame_ref, handoff_frame.indices) {
-                    drop(frame_ref);
-                    let _ = self.free_frame_index(frame);
-                    return Err(err);
-                }
+            if let Err(err) = self.push_handoff_indices(&mut frame, handoff_frame.indices) {
+                return Err(err);
             }
-            if !self.schedule_frame(node, frame)? {
-                self.free_frame_index(frame)?;
-            }
+            self.submit_frame(frame, node)?;
         }
         Ok(())
     }
@@ -2338,7 +2240,7 @@ impl DataPlaneRuntime {
     #[inline]
     fn push_handoff_indices(
         &self,
-        frame: &mut FrameRefMut<'_>,
+        frame: &mut Frame<Next>,
         indices: HandoffIndices,
     ) -> CoreResult<()> {
         match indices {
@@ -2420,29 +2322,6 @@ impl DataPlaneRuntime {
         };
         handoff.ensure_enqueue_capacity(worker)?;
         handoff.enqueue_index(worker, target, index)
-    }
-
-    #[inline]
-    pub(crate) fn take_frame_index(&self, index: FrameIndex) -> CoreResult<BufferFrame> {
-        self.buffers.take_frame_index(index)
-    }
-
-    #[inline]
-    pub(crate) fn return_taken_frame_index(
-        &self,
-        index: FrameIndex,
-        frame: BufferFrame,
-    ) -> CoreResult<()> {
-        self.buffers.return_taken_frame_index(index, frame)
-    }
-
-    #[inline]
-    pub(crate) fn release_taken_frame_index(
-        &self,
-        index: FrameIndex,
-        frame: BufferFrame,
-    ) -> CoreResult<()> {
-        self.buffers.release_taken_frame_index(index, frame)
     }
 }
 
@@ -2701,11 +2580,6 @@ impl BufferPool {
     }
 
     #[inline]
-    fn next_buffer(&self, index: BufferIndex) -> CoreResult<Option<BufferIndex>> {
-        self.arena.inner.read().next_buffer(index)
-    }
-
-    #[inline]
     pub fn chain(
         &self,
         index: BufferIndex,
@@ -2846,7 +2720,7 @@ impl BufferPool {
 
 impl FramePool {
     #[inline]
-    pub fn with_capacity(frame_capacity: usize, slots: usize) -> Self {
+    fn with_capacity(frame_capacity: usize, slots: usize) -> Self {
         let available = (0..slots)
             .rev()
             .map(|slot| u32::try_from(slot).expect("frame slot index fits u32"))
@@ -2869,53 +2743,17 @@ impl FramePool {
     }
 
     #[inline]
-    pub fn in_use(&self) -> usize {
+    fn in_use(&self) -> usize {
         self.inner.borrow().in_use
     }
 
     #[inline]
-    pub fn alloc_index(&self) -> CoreResult<FrameIndex> {
+    fn alloc_index(&self) -> CoreResult<FrameIndex> {
         self.inner.borrow_mut().alloc_index()
     }
 
     #[inline]
-    pub fn with_frame<R>(
-        &self,
-        index: FrameIndex,
-        f: impl FnOnce(&BufferFrame) -> R,
-    ) -> CoreResult<R> {
-        let pool = self.inner.borrow();
-        let frame = pool.frame(index)?;
-        Ok(f(frame))
-    }
-
-    #[inline]
-    pub fn get(&self, index: FrameIndex) -> CoreResult<FrameRef<'_>> {
-        let guard = self.inner.borrow();
-        guard.frame(index)?;
-        Ok(FrameRef { guard, index })
-    }
-
-    #[inline]
-    pub fn get_mut(&self, index: FrameIndex) -> CoreResult<FrameRefMut<'_>> {
-        let mut guard = self.inner.borrow_mut();
-        guard.frame_mut(index)?;
-        Ok(FrameRefMut { guard, index })
-    }
-
-    #[inline]
-    pub fn with_frame_mut<R>(
-        &self,
-        index: FrameIndex,
-        f: impl FnOnce(&mut BufferFrame) -> R,
-    ) -> CoreResult<R> {
-        let mut pool = self.inner.borrow_mut();
-        let frame = pool.frame_mut(index)?;
-        Ok(f(frame))
-    }
-
-    #[inline]
-    pub fn free_index(&self, buffers: &BufferPool, index: FrameIndex) -> CoreResult<()> {
+    fn free_index(&self, buffers: &BufferPool, index: FrameIndex) -> CoreResult<()> {
         let mut pool = self.inner.borrow_mut();
         let frame = pool.frame_mut(index)?;
         buffers.free_frame(frame);
@@ -2924,12 +2762,12 @@ impl FramePool {
     }
 
     #[inline]
-    pub fn take_index(&self, index: FrameIndex) -> CoreResult<BufferFrame> {
+    fn take_index(&self, index: FrameIndex) -> CoreResult<BufferFrame> {
         self.inner.borrow_mut().take_frame(index)
     }
 
     #[inline]
-    pub fn free_taken_index(
+    fn free_taken_index(
         &self,
         buffers: &BufferPool,
         index: FrameIndex,
@@ -2940,11 +2778,6 @@ impl FramePool {
         self.inner
             .borrow_mut()
             .return_frame_and_release(index, frame)
-    }
-
-    #[inline]
-    pub fn return_taken_index(&self, index: FrameIndex, frame: BufferFrame) -> CoreResult<()> {
-        self.inner.borrow_mut().return_frame(index, frame)
     }
 }
 
@@ -2980,25 +2813,6 @@ impl FramePoolInner {
             return Err(CoreError::internal("frame index belongs to another pool"));
         }
         Ok(())
-    }
-
-    #[inline]
-    fn frame(&self, index: FrameIndex) -> CoreResult<&BufferFrame> {
-        self.validate_index(index)?;
-        let entry = self
-            .slots
-            .get(index.slot as usize)
-            .ok_or_else(|| CoreError::internal("frame slot out of bounds"))?;
-        if entry.generation != index.generation {
-            return Err(CoreError::internal("stale frame index"));
-        }
-        if !entry.allocated {
-            return Err(CoreError::internal("frame slot is free"));
-        }
-        entry
-            .frame
-            .as_ref()
-            .ok_or_else(|| CoreError::internal("frame slot is checked out"))
     }
 
     #[inline]
@@ -3086,46 +2900,33 @@ impl FramePoolInner {
         self.available.push(index.slot);
         Ok(())
     }
-
-    #[inline]
-    fn return_frame(&mut self, index: FrameIndex, frame: BufferFrame) -> CoreResult<()> {
-        self.validate_index(index)?;
-        let entry = self
-            .slots
-            .get_mut(index.slot as usize)
-            .ok_or_else(|| CoreError::internal("frame slot out of bounds"))?;
-        if entry.generation != index.generation {
-            return Err(CoreError::internal("stale frame index"));
-        }
-        if !entry.allocated {
-            return Err(CoreError::internal("frame slot is free"));
-        }
-        if entry.frame.is_some() {
-            return Err(CoreError::internal("frame slot already has a frame"));
-        }
-        entry.frame = Some(frame);
-        Ok(())
-    }
 }
 
-impl PooledBufferFrame {
-    #[inline]
-    pub fn index(&self) -> FrameIndex {
-        self.index
-    }
-}
-
-impl Deref for PooledBufferFrame {
+impl Deref for Frame<Next> {
     type Target = BufferFrame;
 
     fn deref(&self) -> &Self::Target {
-        &self.frame
+        self.frame.as_ref().expect("next frame already consumed")
     }
 }
 
-impl DerefMut for PooledBufferFrame {
+impl DerefMut for Frame<Next> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.frame
+        self.frame.as_mut().expect("next frame already consumed")
+    }
+}
+
+impl Deref for Frame<Pending> {
+    type Target = BufferFrame;
+
+    fn deref(&self) -> &Self::Target {
+        self.frame.as_ref().expect("pending frame already consumed")
+    }
+}
+
+impl DerefMut for Frame<Pending> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.frame.as_mut().expect("pending frame already consumed")
     }
 }
 
@@ -5165,71 +4966,6 @@ impl Future for BufferFramePending {
     }
 }
 
-pub struct FrameRef<'pool> {
-    guard: Ref<'pool, FramePoolInner>,
-    index: FrameIndex,
-}
-
-impl FrameRef<'_> {
-    #[inline]
-    pub fn has_pending(&self) -> bool {
-        self.guard
-            .frame(self.index)
-            .expect("frame ref points to valid frame")
-            .has_pending()
-    }
-
-    #[inline]
-    pub fn pending_len(&self) -> usize {
-        self.guard
-            .frame(self.index)
-            .expect("frame ref points to valid frame")
-            .pending_len()
-    }
-}
-
-pub struct FrameRefMut<'pool> {
-    guard: RefMut<'pool, FramePoolInner>,
-    index: FrameIndex,
-}
-
-impl FrameRefMut<'_> {
-    #[inline]
-    pub fn push_index(&mut self, index: BufferIndex) -> CoreResult<()> {
-        self.guard
-            .frame_mut(self.index)
-            .expect("frame ref points to valid frame")
-            .push_index(index)
-    }
-
-    #[inline]
-    pub fn push_indices(
-        &mut self,
-        indices: impl IntoIterator<Item = BufferIndex>,
-    ) -> CoreResult<()> {
-        self.guard
-            .frame_mut(self.index)
-            .expect("frame ref points to valid frame")
-            .push_indices(indices)
-    }
-
-    #[inline]
-    pub fn has_pending(&self) -> bool {
-        self.guard
-            .frame(self.index)
-            .expect("frame ref points to valid frame")
-            .has_pending()
-    }
-
-    #[inline]
-    pub fn set_next_node(&mut self, node: NodeId) {
-        self.guard
-            .frame_mut(self.index)
-            .expect("frame ref points to valid frame")
-            .set_next_node(node);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{BufferIndex, BufferPool, DataPlaneRuntime};
@@ -5238,13 +4974,9 @@ mod tests {
 
     fn chain_bytes(pool: &BufferPool, index: BufferIndex) -> CoreResult<Vec<u8>> {
         let mut out = Vec::new();
-        let mut next = Some(index);
-        while let Some(current) = next {
-            {
-                let buffer = pool.get(current)?;
-                out.extend_from_slice(buffer.current());
-            }
-            next = pool.next_buffer(current)?;
+        for buffer in pool.chain(index) {
+            let buffer = buffer?;
+            out.extend_from_slice(buffer.current());
         }
         Ok(out)
     }
@@ -5421,7 +5153,7 @@ mod tests {
         let pool = fresh_pool(32, 16);
         let payload = vec![0xABu8; 96]; // spans 3 slots of 32
         let head = pool.alloc_index_with_bytes(&payload).expect("chain alloc");
-        assert!(pool.next_buffer(head).unwrap().is_some());
+        assert!(pool.chain(head).take(2).count() > 1);
         let copied = chain_bytes(&pool, head).expect("read chain");
         assert_eq!(copied, payload);
         pool.free_index(head);

@@ -1,7 +1,7 @@
 use std::io;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::align::align_up;
 use crate::svm_region::SvmRegion;

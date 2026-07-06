@@ -190,19 +190,13 @@ fn reset_graph() -> (
 }
 
 fn schedule_packet(runtime: &DataPlaneRuntime, reset: NodeId, packet: &[u8]) {
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     let index = runtime
         .alloc_index_with_bytes(packet)
         .expect("alloc packet");
     set_tcp_cursor(runtime, index, packet.len());
-    runtime
-        .get_frame_mut(frame)
-        .expect("mutate frame")
-        .push_index(index)
-        .expect("push packet");
-    runtime
-        .schedule_frame(reset, frame)
-        .expect("schedule reset");
+    frame.push_index(index).expect("push packet");
+    runtime.submit_frame(frame, reset).expect("schedule reset");
 }
 
 fn set_tcp_cursor(runtime: &DataPlaneRuntime, index: BufferIndex, packet_len: usize) {

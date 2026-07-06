@@ -41,13 +41,9 @@ fn bad_tcp_header_increments_tcp_output_counter() {
     let code = TcpOutputError::NoTcpHeader.code();
     let before = runtime.node_error_count(output, code).unwrap_or(0);
     let index = runtime.alloc_index_with_bytes(b"hello").expect("buffer");
-    let frame = runtime.alloc_frame_index().expect("frame");
-    runtime
-        .get_frame_mut(frame)
-        .expect("frame")
-        .push_index(index)
-        .expect("push");
-    assert!(runtime.schedule_frame(output, frame).expect("schedule"));
+    let mut frame = runtime.alloc_frame().expect("frame");
+    frame.push_index(index).expect("push");
+    runtime.submit_frame(frame, output).expect("schedule");
     let _ = runtime.run_ready_nodes().expect("run");
     let after = runtime.node_error_count(output, code).unwrap_or(0);
     assert_eq!(

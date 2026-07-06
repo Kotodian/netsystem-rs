@@ -219,7 +219,7 @@ mod tests {
     fn drop_node_clears_frame_after_trace_error_following_freed_packet() {
         let runtime = DataPlaneRuntime::with_capacities(64, 4, 2, 4);
         let drop = runtime.nodes().register_internal(DropNode::new());
-        let mut frame = runtime.alloc_pooled_frame().expect("alloc frame");
+        let mut frame = runtime.alloc_frame().expect("alloc frame");
         let first = runtime
             .alloc_index_with_bytes(b"first")
             .expect("alloc first");
@@ -246,7 +246,7 @@ mod tests {
         let runtime = DataPlaneRuntime::with_capacities(64, 4, 2, 4);
         let sink = runtime.nodes().register_internal(DropNode::new());
         let handoff = runtime.nodes().register_internal(HandoffNode::new());
-        let frame = runtime.alloc_frame_index().expect("alloc frame");
+        let mut frame = runtime.alloc_frame().expect("alloc frame");
         let packet = runtime
             .alloc_index_with_bytes(b"handoff")
             .expect("alloc packet");
@@ -254,13 +254,9 @@ mod tests {
             .get_buffer_mut(packet)
             .expect("store handoff next buffer")
             .set_current_config(sink);
-        runtime
-            .get_frame_mut(frame)
-            .expect("mutate frame")
-            .push_index(packet)
-            .expect("push packet");
+        frame.push_index(packet).expect("push packet");
 
-        assert!(runtime.schedule_frame(handoff, frame).expect("schedule"));
+        runtime.submit_frame(frame, handoff).expect("submit");
 
         assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
         assert_eq!(runtime.frames_in_use(), 0);

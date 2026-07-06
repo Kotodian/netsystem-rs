@@ -860,7 +860,7 @@ mod tests {
     }
 
     fn send_packet(runtime: &DataPlaneRuntime, node: NodeId, packet: std::vec::Vec<u8>) {
-        let frame = runtime.alloc_frame_index().expect("frame");
+        let mut frame = runtime.alloc_frame().expect("frame");
         let buffer = runtime.alloc_index_with_bytes(&packet).expect("packet");
         let cursor = tcp_control_cursor(&packet).expect("cursor");
         let mut data_buffer = runtime.get_buffer_mut(buffer).expect("buffer mut");
@@ -870,12 +870,8 @@ mod tests {
         let ip_version = (packet[0] >> 4) as u8;
         network.ip_mut().set_ip_version(Some(ip_version));
         network.ip_mut().set_ip_protocol(Some(6));
-        runtime
-            .get_frame_mut(frame)
-            .expect("frame mut")
-            .push_index(buffer)
-            .expect("push packet");
-        assert!(runtime.schedule_frame(node, frame).expect("schedule"));
+        frame.push_index(buffer).expect("push packet");
+        runtime.submit_frame(frame, node).expect("submit");
     }
 
     fn syn_packet() -> std::vec::Vec<u8> {

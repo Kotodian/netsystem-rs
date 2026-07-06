@@ -5,7 +5,7 @@ use hammer_adapter::{
     NodeId, NodeKind, NodeNext, NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData,
     NodeState, TraceFormatter,
 };
-use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::error::CoreResult;
 
 static NODE_CALLS_BY_WORD: [AtomicU64; 128] = [const { AtomicU64::new(0) }; 128];
 
@@ -212,10 +212,10 @@ fn register_internal_uses_descriptor_function_and_runtime_data() {
         count_process,
         NodeRuntimeData::from_words([42, 0, 0, 0]),
     ));
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
-    push_packet(&runtime, frame, b"packet");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    push_packet(&runtime, &mut frame, b"packet");
 
-    assert!(runtime.schedule_frame(node, frame).expect("schedule"));
+    runtime.submit_frame(frame, node).expect("submit");
     assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 1);
 
     assert_eq!(calls_for(42), 1);
@@ -230,10 +230,10 @@ fn register_driver_preserves_old_spelling_for_descriptor_nodes() {
         count_process,
         NodeRuntimeData::from_words([7, 0, 0, 0]),
     ));
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
-    push_packet(&runtime, frame, b"packet");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    push_packet(&runtime, &mut frame, b"packet");
 
-    assert!(runtime.schedule_frame(node, frame).expect("schedule"));
+    runtime.submit_frame(frame, node).expect("submit");
     assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 1);
 
     assert_eq!(calls_for(7), 1);
@@ -465,10 +465,10 @@ fn descriptor_registration_keeps_name_next_slots_trace_and_siblings() {
 fn default_node_process_path_registers_and_drops_gracefully() {
     let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 2);
     let node = runtime.nodes().register_internal(ProcessOnlyNode);
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
-    push_packet(&runtime, frame, b"packet");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    push_packet(&runtime, &mut frame, b"packet");
 
-    assert!(runtime.schedule_frame(node, frame).expect("schedule"));
+    runtime.submit_frame(frame, node).expect("submit");
     let result = runtime
         .run_ready_nodes()
         .expect("default node process must succeed");
@@ -496,10 +496,10 @@ fn descriptor_next_node_runs_with_runtime_resolved_next_slot() {
         NodeRuntimeData::from_words([17, 0, 0, 0]),
         [default, alternate],
     ));
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
-    push_packet(&runtime, frame, b"packet");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    push_packet(&runtime, &mut frame, b"packet");
 
-    assert!(runtime.schedule_frame(owner, frame).expect("schedule"));
+    runtime.submit_frame(frame, owner).expect("submit");
     assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 2);
 
     assert_eq!(calls_for(17), 1);
@@ -567,12 +567,8 @@ fn node_descriptor_exposes_public_snapshot_accessors() {
     );
 
     let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 2);
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
-    let _ = runtime
-        .with_frame_mut(frame, |frame| {
-            descriptor.process()(&runtime, descriptor.runtime_data(), frame)
-        })
-        .expect("get frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    let _ = descriptor.process()(&runtime, descriptor.runtime_data(), &mut frame);
 
     assert_eq!(calls_for(99), 1);
     assert_eq!(descriptor.runtime_data().word(0), 99);
@@ -695,13 +691,9 @@ fn try_register_descriptor_rejects_next_count_mismatch() {
     assert!(err.to_string().contains("node initial next count mismatch"));
 }
 
-fn push_packet(runtime: &DataPlaneRuntime, frame: hammer_adapter::FrameIndex, payload: &[u8]) {
+fn push_packet(runtime: &DataPlaneRuntime, frame: &mut BufferFrame, payload: &[u8]) {
     let buffer = runtime
         .alloc_index_with_bytes(payload)
         .expect("alloc packet");
-    runtime
-        .get_frame_mut(frame)
-        .expect("get frame")
-        .push_index(buffer)
-        .expect("push packet");
+    frame.push_index(buffer).expect("push packet");
 }

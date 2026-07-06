@@ -181,7 +181,7 @@ fn interface_address_publish_installs_receive_route_in_fib() {
 
     control.add_address(tun0, address).expect("add address");
 
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     let packet = ipv4_packet([10, 255, 0, 2], [10, 255, 0, 1], b"receive");
     let index = runtime
         .alloc_index_with_bytes(&packet)
@@ -200,13 +200,9 @@ fn interface_address_publish_installs_receive_route_in_fib() {
         ip.set_ip_version(Some(4));
         ip.set_ip_protocol(Some(59));
     }
-    runtime
-        .get_frame_mut(frame)
-        .expect("mutate frame")
-        .push_index(index)
-        .expect("push packet");
+    frame.push_index(index).expect("push packet");
 
-    assert!(runtime.schedule_frame(lookup, frame).expect("schedule"));
+    runtime.submit_frame(frame, lookup).expect("schedule");
     assert!(runtime.run_ready_nodes().expect("run nodes") >= 2);
     let stats = runtime.nodes().node_runtime_stats_snapshot();
     assert_eq!(
@@ -277,7 +273,7 @@ fn interface_output_dispatches_to_registered_tx_node() {
         .into(),
     });
     runtime.set_trace_control(Some(trace.handle()), 4);
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     let packet = ipv4_packet([10, 0, 0, 1], [198, 51, 100, 7], b"interface-output");
     let index = runtime
         .alloc_index_with_bytes(&packet)
@@ -290,17 +286,9 @@ fn interface_output_dispatches_to_registered_tx_node() {
     runtime
         .try_mark_trace(output_node, index)
         .expect("mark packet");
-    runtime
-        .get_frame_mut(frame)
-        .expect("mutate frame")
-        .push_index(index)
-        .expect("push packet");
+    frame.push_index(index).expect("push packet");
 
-    assert!(
-        runtime
-            .schedule_frame(output_node, frame)
-            .expect("schedule")
-    );
+    runtime.submit_frame(frame, output_node).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert_eq!(output_device.drain_output(), vec![packet]);
@@ -338,15 +326,11 @@ fn interface_output_drops_missing_egress_or_tx_mapping() {
     let output_device = MemoryTunDevice::new();
     let output_control = InterfaceOutputControlPlane::new();
     let output_node = runtime.nodes().register_internal(output_control.node());
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
-    push_packet_with_egress(&runtime, frame, None, b"no-egress");
-    push_packet_with_egress(&runtime, frame, Some(99), b"no-tx");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    push_packet_with_egress(&runtime, &mut frame, None, b"no-egress");
+    push_packet_with_egress(&runtime, &mut frame, Some(99), b"no-tx");
 
-    assert!(
-        runtime
-            .schedule_frame(output_node, frame)
-            .expect("schedule")
-    );
+    runtime.submit_frame(frame, output_node).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 1);
     assert!(output_device.drain_output().is_empty());
@@ -397,7 +381,7 @@ fn interface_output_and_tun_output_avoid_packet_copy_shortcuts() {
 
 fn push_packet_with_egress(
     runtime: &DataPlaneRuntime,
-    frame: hammer_adapter::FrameIndex,
+    frame: &mut hammer_adapter::BufferFrame,
     egress_interface: Option<u32>,
     payload: &[u8],
 ) {
@@ -410,11 +394,7 @@ fn push_packet_with_egress(
         let opaque = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
         opaque.sw_if_index[1] = egress_interface;
     }
-    runtime
-        .get_frame_mut(frame)
-        .expect("mutate frame")
-        .push_index(index)
-        .expect("push packet");
+    frame.push_index(index).expect("push packet");
 }
 
 fn ipv4_packet(source: [u8; 4], destination: [u8; 4], payload: &[u8]) -> Vec<u8> {

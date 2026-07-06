@@ -18,8 +18,8 @@ pub use buffer::{
     BufferFramePairBatchCursor, BufferFrameQuadBatch, BufferFrameQuadBatchCursor,
     BufferHeaderCacheline0, BufferHeaderCacheline1, BufferIndex, BufferNodeError,
     BufferPacketCursor, BufferPool, BufferPoolArena, BufferRef, BufferRefMut, DataPlaneBuffers,
-    DataPlaneRuntime, FrameIndex, FramePool, FrameRef, FrameRefMut, PRIMARY_OPAQUE_ALIGN,
-    PRIMARY_OPAQUE_BYTES, PooledBufferFrame, PrimaryOpaque, SecondaryOpaque,
+    DataPlaneRuntime, FrameIndex, PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES, PrimaryOpaque,
+    SecondaryOpaque,
 };
 pub use hammer_core::protocol::icmp::IcmpErrorMetadata;
 pub use hammer_core::{Network, SocksAddr};

@@ -428,15 +428,11 @@ mod tests {
     }
 
     fn send_packet(runtime: &DataPlaneRuntime, node: NodeId, packet: std::vec::Vec<u8>) {
-        let frame = runtime.alloc_frame_index().expect("frame");
+        let mut frame = runtime.alloc_frame().expect("frame");
         let buffer = runtime.alloc_index_with_bytes(&packet).expect("packet");
         stamp_tcp_cursor(runtime, buffer, &packet);
-        runtime
-            .get_frame_mut(frame)
-            .expect("frame mut")
-            .push_index(buffer)
-            .expect("push packet");
-        assert!(runtime.schedule_frame(node, frame).expect("schedule"));
+        frame.push_index(buffer).expect("push packet");
+        runtime.submit_frame(frame, node).expect("submit");
     }
 
     fn stamp_tcp_cursor(

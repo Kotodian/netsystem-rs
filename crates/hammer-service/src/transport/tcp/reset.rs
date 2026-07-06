@@ -504,7 +504,7 @@ mod tests {
         let reset = runtime
             .nodes()
             .register_internal(TcpResetNode::new(TcpResetNext::nodes(drop, lookup)));
-        let frame = runtime.alloc_frame_index().expect("alloc frame");
+        let mut frame = runtime.alloc_frame().expect("alloc frame");
         let index = runtime
             .alloc_index_with_bytes(&ipv4_tcp_packet(0x10, 1_000, 9_000, &[]))
             .expect("alloc packet");
@@ -518,17 +518,9 @@ mod tests {
             buffer.set_node_error(BufferNodeError::new(NodeId::new(0), code));
             let _ = runtime.record_current_node_error(code);
         }
-        runtime
-            .get_frame_mut(frame)
-            .expect("frame")
-            .push_index(index)
-            .expect("push index");
+        frame.push_index(index).expect("push index");
 
-        assert!(
-            runtime
-                .schedule_frame(reset, frame)
-                .expect("schedule reset")
-        );
+        runtime.submit_frame(frame, reset).expect("submit reset");
         assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
 
         let buffer = runtime.get_buffer(index).expect("buffer");

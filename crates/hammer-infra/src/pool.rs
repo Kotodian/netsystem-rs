@@ -1,4 +1,4 @@
-use std::alloc::{handle_alloc_error, GlobalAlloc, Layout};
+use std::alloc::{GlobalAlloc, Layout, handle_alloc_error};
 use std::fmt;
 use std::marker::PhantomData;
 use std::ptr::{self, NonNull};

@@ -812,7 +812,7 @@ fn queue_only_handoff_constructor_keeps_runtime_buffer_arenas_separate() {
 fn buffer_frame_reset_does_not_free_buffers() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
     let pool = runtime.buffers().buffers();
-    let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     let first = pool
         .alloc_index_with_bytes(b"one")
         .expect("alloc first frame buffer");
@@ -838,9 +838,7 @@ fn buffer_frame_reset_does_not_free_buffers() {
         b"two"
     );
 
-    runtime
-        .release_pooled_frame(frame)
-        .expect("release pooled frame");
+    drop(frame);
     pool.free_index(first);
     pool.free_index(second);
 }
@@ -849,7 +847,7 @@ fn buffer_frame_reset_does_not_free_buffers() {
 fn buffer_pool_free_frame_releases_all_indices_and_reuses_frame() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
     let pool = runtime.buffers().buffers();
-    let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     let first = pool
         .alloc_index_with_bytes(b"one")
         .expect("alloc first frame buffer");
@@ -874,16 +872,14 @@ fn buffer_pool_free_frame_releases_all_indices_and_reuses_frame() {
     frame.push_index(next).expect("reuse frame allocation");
     assert_eq!(frame.indices(), &[next]);
     pool.free_frame(&mut frame);
-    runtime
-        .release_pooled_frame(frame)
-        .expect("release pooled frame");
+    drop(frame);
 }
 
 #[test]
 fn buffer_frame_drain_indices_preserves_order_without_freeing() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
     let pool = runtime.buffers().buffers();
-    let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     let first = pool
         .alloc_index_with_bytes(b"first")
         .expect("alloc first frame buffer");
@@ -910,9 +906,7 @@ fn buffer_frame_drain_indices_preserves_order_without_freeing() {
     for index in drained {
         pool.free_index(index);
     }
-    runtime
-        .release_pooled_frame(frame)
-        .expect("release pooled frame");
+    drop(frame);
     assert_eq!(pool.in_use(), 0);
 }
 
@@ -920,7 +914,7 @@ fn buffer_frame_drain_indices_preserves_order_without_freeing() {
 fn buffer_frame_tracks_pending_indices_until_drained() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
     let pool = runtime.buffers().buffers();
-    let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     let first = pool
         .alloc_index_with_bytes(b"first")
         .expect("alloc first frame buffer");
@@ -947,9 +941,7 @@ fn buffer_frame_tracks_pending_indices_until_drained() {
     for index in drained {
         pool.free_index(index);
     }
-    runtime
-        .release_pooled_frame(frame)
-        .expect("release pooled frame");
+    drop(frame);
     assert_eq!(pool.in_use(), 0);
 }
 
@@ -957,7 +949,7 @@ fn buffer_frame_tracks_pending_indices_until_drained() {
 fn buffer_frame_pending_future_wakes_when_index_is_pushed() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 2, 1, 1);
     let pool = runtime.buffers().buffers();
-    let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     let index = pool
         .alloc_index_with_bytes(b"packet")
         .expect("alloc frame buffer");
@@ -981,16 +973,14 @@ fn buffer_frame_pending_future_wakes_when_index_is_pushed() {
     ));
 
     pool.free_frame(&mut frame);
-    runtime
-        .release_pooled_frame(frame)
-        .expect("release pooled frame");
+    drop(frame);
 }
 
 #[test]
 fn buffer_frame_push_indices_batches_one_wake() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
     let pool = runtime.buffers().buffers();
-    let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     let first = pool
         .alloc_index_with_bytes(b"first")
         .expect("alloc first frame buffer");
@@ -1015,16 +1005,14 @@ fn buffer_frame_push_indices_batches_one_wake() {
     assert_eq!(frame.pending_indices(), &[first, second]);
 
     pool.free_frame(&mut frame);
-    runtime
-        .release_pooled_frame(frame)
-        .expect("release pooled frame");
+    drop(frame);
 }
 
 #[test]
 fn buffer_frame_pair_batch_cursor_splits_into_pairs_then_tail() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 8, 8, 1);
     let pool = runtime.buffers().buffers();
-    let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     let indices = (0..5)
         .map(|value| {
             pool.alloc_index_with_bytes(&[value])
@@ -1047,16 +1035,14 @@ fn buffer_frame_pair_batch_cursor_splits_into_pairs_then_tail() {
     );
 
     pool.free_frame(&mut frame);
-    runtime
-        .release_pooled_frame(frame)
-        .expect("release pooled frame");
+    drop(frame);
 }
 
 #[test]
 fn buffer_frame_quad_batch_cursor_splits_into_quad_pair_then_tail() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 8, 8, 1);
     let pool = runtime.buffers().buffers();
-    let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     let indices = (0..7)
         .map(|value| {
             pool.alloc_index_with_bytes(&[value])
@@ -1079,28 +1065,24 @@ fn buffer_frame_quad_batch_cursor_splits_into_quad_pair_then_tail() {
     );
 
     pool.free_frame(&mut frame);
-    runtime
-        .release_pooled_frame(frame)
-        .expect("release pooled frame");
+    drop(frame);
 }
 
 #[test]
 fn buffer_frame_batch_cursors_are_empty_for_empty_frame() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 2, 8, 1);
-    let frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
+    let frame = runtime.alloc_frame().expect("alloc frame");
 
     assert_eq!(frame.pair_batch_cursor().next(), None);
     assert_eq!(frame.quad_batch_cursor().next(), None);
 
-    runtime
-        .release_pooled_frame(frame)
-        .expect("release pooled frame");
+    drop(frame);
 }
 
 #[test]
 fn buffer_frame_batch_cursor_uses_requested_width() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 8, 8, 1);
-    let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     let indices = push_numbered_indices(&runtime, &mut frame, 5);
 
     let quad_batches = frame
@@ -1123,9 +1105,7 @@ fn buffer_frame_batch_cursor_uses_requested_width() {
     );
 
     runtime.free_frame(&mut frame);
-    runtime
-        .release_pooled_frame(frame)
-        .expect("release pooled frame");
+    drop(frame);
 }
 
 #[test]
@@ -1144,8 +1124,8 @@ fn buffer_frame_batch_dispatch_uses_runtime_preferred_width() {
         1,
         DataPlaneInstructionSet::Scalar,
     );
-    let mut quad_frame = quad_runtime.alloc_pooled_frame().expect("quad frame");
-    let mut pair_frame = pair_runtime.alloc_pooled_frame().expect("pair frame");
+    let mut quad_frame = quad_runtime.alloc_frame().expect("quad frame");
+    let mut pair_frame = pair_runtime.alloc_frame().expect("pair frame");
     let quad_indices = push_numbered_indices(&quad_runtime, &mut quad_frame, 7);
     let pair_indices = push_numbered_indices(&pair_runtime, &mut pair_frame, 5);
 
@@ -1177,19 +1157,15 @@ fn buffer_frame_batch_dispatch_uses_runtime_preferred_width() {
 
     quad_runtime.free_frame(&mut quad_frame);
     pair_runtime.free_frame(&mut pair_frame);
-    quad_runtime
-        .release_pooled_frame(quad_frame)
-        .expect("release quad frame");
-    pair_runtime
-        .release_pooled_frame(pair_frame)
-        .expect("release pair frame");
+    drop(quad_frame);
+    drop(pair_frame);
 }
 
 #[test]
 fn buffer_frame_pending_future_observes_reset_before_processing() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 2, 1, 1);
     let pool = runtime.buffers().buffers();
-    let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     let first = pool
         .alloc_index_with_bytes(b"first")
         .expect("alloc first frame buffer");
@@ -1223,16 +1199,14 @@ fn buffer_frame_pending_future_observes_reset_before_processing() {
     ));
 
     pool.free_frame(&mut frame);
-    runtime
-        .release_pooled_frame(frame)
-        .expect("release pooled frame");
+    drop(frame);
 }
 
 #[test]
 fn buffer_frame_push_index_respects_preallocated_capacity() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 1, 1);
     let pool = runtime.buffers().buffers();
-    let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     let first = pool
         .alloc_index_with_bytes(b"first")
         .expect("alloc first frame buffer");
@@ -1246,16 +1220,15 @@ fn buffer_frame_push_index_respects_preallocated_capacity() {
     assert_eq!(pool.in_use(), 2);
 
     pool.free_frame(&mut frame);
-    runtime
-        .release_pooled_frame(frame)
-        .expect("release pooled frame");
+    drop(frame);
     pool.free_index(second);
 }
 
 #[test]
 fn data_plane_runtime_allocates_frame_indices_from_reusable_pool() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
-    let frame_index = runtime.alloc_frame_index().expect("alloc pooled frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    let frame_index = frame.index();
     let first = runtime
         .alloc_index_with_bytes(b"one")
         .expect("alloc first buffer");
@@ -1263,49 +1236,34 @@ fn data_plane_runtime_allocates_frame_indices_from_reusable_pool() {
         .alloc_index_with_bytes(b"two")
         .expect("alloc second buffer");
 
-    runtime
-        .with_frame_mut(frame_index, |frame| frame.push_indices([first, second]))
-        .expect("mutate frame")
+    frame
+        .push_indices([first, second])
         .expect("push frame indices");
 
     assert_eq!(runtime.frames_in_use(), 1);
     assert_eq!(runtime.in_use_buffers(), 2);
-    assert!(runtime.alloc_frame_index().is_err());
-    assert_eq!(
-        runtime
-            .with_frame(frame_index, |frame| frame.indices().to_vec())
-            .expect("read frame"),
-        vec![first, second]
-    );
+    assert!(runtime.alloc_frame().is_err());
+    assert_eq!(frame.indices(), &[first, second]);
 
-    runtime
-        .free_frame_index(frame_index)
-        .expect("free pooled frame");
+    drop(frame);
 
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
     assert!(chain_bytes(runtime.buffers().buffers(), first).is_err());
     assert!(chain_bytes(runtime.buffers().buffers(), second).is_err());
 
-    let reused_frame_index = runtime.alloc_frame_index().expect("reuse pooled frame");
+    let reused_frame = runtime.alloc_frame().expect("reuse frame");
+    let reused_frame_index = reused_frame.index();
     assert_eq!(reused_frame_index.slot(), frame_index.slot());
     assert_ne!(reused_frame_index.generation(), frame_index.generation());
-    assert!(runtime.with_frame(frame_index, |_| ()).is_err());
-    assert!(
-        runtime
-            .with_frame(reused_frame_index, |frame| frame.is_empty())
-            .expect("read reused frame")
-    );
-
-    runtime
-        .free_frame_index(reused_frame_index)
-        .expect("free reused frame");
+    assert!(reused_frame.is_empty());
+    drop(reused_frame);
 }
 
 #[test]
 fn frame_ref_mut_push_indices_batches_into_pooled_frame() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
-    let frame_index = runtime.alloc_frame_index().expect("alloc pooled frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     let first = runtime
         .alloc_index_with_bytes(b"one")
         .expect("alloc first buffer");
@@ -1313,29 +1271,19 @@ fn frame_ref_mut_push_indices_batches_into_pooled_frame() {
         .alloc_index_with_bytes(b"two")
         .expect("alloc second buffer");
 
-    {
-        let mut frame = runtime.get_frame_mut(frame_index).expect("frame ref mut");
-        frame
-            .push_indices([first, second])
-            .expect("push frame indices");
-    }
+    frame
+        .push_indices([first, second])
+        .expect("push frame indices");
 
-    assert_eq!(
-        runtime
-            .with_frame(frame_index, |frame| frame.indices().to_vec())
-            .expect("read frame"),
-        vec![first, second]
-    );
-    runtime
-        .free_frame_index(frame_index)
-        .expect("free pooled frame");
+    assert_eq!(frame.indices(), &[first, second]);
+    drop(frame);
     assert_eq!(runtime.in_use_buffers(), 0);
 }
 
 #[test]
 fn data_plane_runtime_checks_out_pooled_frame_for_packet_interfaces() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
-    let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     let frame_index = frame.index();
     let buffer = runtime
         .alloc_index_with_bytes(b"pkt")
@@ -1344,30 +1292,26 @@ fn data_plane_runtime_checks_out_pooled_frame_for_packet_interfaces() {
     frame.push_index(buffer).expect("push packet buffer");
 
     assert_eq!(runtime.frames_in_use(), 1);
-    assert!(runtime.alloc_pooled_frame().is_err());
+    assert!(runtime.alloc_frame().is_err());
     assert_eq!(frame.indices(), &[buffer]);
 
-    runtime
-        .release_pooled_frame(frame)
-        .expect("release pooled frame");
+    drop(frame);
 
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
     assert!(chain_bytes(runtime.buffers().buffers(), buffer).is_err());
 
-    let reused_frame = runtime.alloc_pooled_frame().expect("reuse pooled frame");
+    let reused_frame = runtime.alloc_frame().expect("reuse frame");
     assert_eq!(reused_frame.index().slot(), frame_index.slot());
     assert_ne!(reused_frame.index().generation(), frame_index.generation());
     assert!(reused_frame.is_empty());
-    runtime
-        .release_pooled_frame(reused_frame)
-        .expect("release reused pooled frame");
+    drop(reused_frame);
 }
 
 #[test]
 fn buffer_frame_lazy_state_retain_compacts_after_first_drop() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 8, 8, 1);
-    let mut frame = runtime.alloc_pooled_frame().expect("alloc frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     let indices = push_numbered_indices(&runtime, &mut frame, 5);
     let mut prefetched = 0usize;
 
@@ -1387,9 +1331,7 @@ fn buffer_frame_lazy_state_retain_compacts_after_first_drop() {
 
     runtime.free_index(indices[1]);
     runtime.free_index(indices[3]);
-    runtime
-        .release_pooled_frame(frame)
-        .expect("release retained frame");
+    drop(frame);
     assert_eq!(runtime.in_use_buffers(), 0);
 }
 

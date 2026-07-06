@@ -221,25 +221,25 @@ fn ip_lookup_node_uses_ipv4_mtrie_longest_prefix_match() {
     });
     runtime.set_trace_control(Some(trace.handle()), 4);
 
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     push_marked_packet(
         &runtime,
-        frame,
+        &mut frame,
         lookup,
         &ipv4_udp_packet([10, 0, 0, 1], 10_001, [203, 0, 113, 7], 53, b"default"),
     );
     push_packet(
         &runtime,
-        frame,
+        &mut frame,
         &ipv4_udp_packet([10, 0, 0, 1], 10_002, [198, 51, 100, 7], 53, b"specific"),
     );
     push_packet(
         &runtime,
-        frame,
+        &mut frame,
         &ipv4_udp_packet([10, 0, 0, 1], 10_003, [198, 51, 100, 42], 53, b"host"),
     );
 
-    assert!(runtime.schedule_frame(lookup, frame).expect("schedule"));
+    runtime.submit_frame(frame, lookup).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 4);
     assert_payloads(&default_state, &[b"default".as_slice()]);
@@ -289,24 +289,24 @@ fn ip_lookup_vector_enqueue_batches_same_next_in_one_output_frame() {
     let lookup = runtime
         .nodes()
         .register_internal(IpLookupControlPlane::new(builder.build()).node());
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     push_packet(
         &runtime,
-        frame,
+        &mut frame,
         &ipv4_udp_packet([10, 0, 0, 1], 10_011, [203, 0, 113, 1], 53, b"one"),
     );
     push_packet(
         &runtime,
-        frame,
+        &mut frame,
         &ipv4_udp_packet([10, 0, 0, 1], 10_012, [203, 0, 113, 2], 53, b"two"),
     );
     push_packet(
         &runtime,
-        frame,
+        &mut frame,
         &ipv4_udp_packet([10, 0, 0, 1], 10_013, [203, 0, 113, 3], 53, b"three"),
     );
 
-    assert!(runtime.schedule_frame(lookup, frame).expect("schedule"));
+    runtime.submit_frame(frame, lookup).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert_payloads(
@@ -334,19 +334,19 @@ fn ip_lookup_vector_enqueue_reuses_current_frame_for_same_next() {
     let lookup = runtime
         .nodes()
         .register_internal(IpLookupControlPlane::new(builder.build()).node());
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     push_packet(
         &runtime,
-        frame,
+        &mut frame,
         &ipv4_udp_packet([10, 0, 0, 1], 10_021, [203, 0, 113, 1], 53, b"one"),
     );
     push_packet(
         &runtime,
-        frame,
+        &mut frame,
         &ipv4_udp_packet([10, 0, 0, 1], 10_022, [203, 0, 113, 2], 53, b"two"),
     );
 
-    assert!(runtime.schedule_frame(lookup, frame).expect("schedule"));
+    runtime.submit_frame(frame, lookup).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert_payloads(&state, &[b"one".as_slice(), b"two".as_slice()]);
@@ -387,24 +387,24 @@ fn ip_lookup_node_uses_ipv6_hash_prefix_order() {
         .nodes()
         .register_internal(IpLookupControlPlane::new(builder.build()).node());
 
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     push_packet(
         &runtime,
-        frame,
+        &mut frame,
         &ipv6_udp_packet("2001:db8::1", 20_001, "2001:db8:ffff::1", 53, b"default"),
     );
     push_packet(
         &runtime,
-        frame,
+        &mut frame,
         &ipv6_udp_packet("2001:db8::1", 20_002, "2001:db8:64::7", 53, b"subnet"),
     );
     push_packet(
         &runtime,
-        frame,
+        &mut frame,
         &ipv6_udp_packet("2001:db8::1", 20_003, "2001:db8:64::42", 53, b"host"),
     );
 
-    assert!(runtime.schedule_frame(lookup, frame).expect("schedule"));
+    runtime.submit_frame(frame, lookup).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 4);
     assert_payloads(&default_state, &[b"default".as_slice()]);
@@ -422,14 +422,14 @@ fn ip_lookup_node_sends_miss_to_drop_dpo() {
     let lookup = runtime
         .nodes()
         .register_internal(IpLookupControlPlane::new(FibTableBuilder::new(drop).build()).node());
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     push_packet(
         &runtime,
-        frame,
+        &mut frame,
         &ipv4_udp_packet([10, 0, 0, 1], 30_001, [198, 51, 100, 7], 53, b"miss"),
     );
 
-    assert!(runtime.schedule_frame(lookup, frame).expect("schedule"));
+    runtime.submit_frame(frame, lookup).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert_eq!(runtime.frames_in_use(), 0);
@@ -458,14 +458,14 @@ fn ip_lookup_node_routes_receive_dpo_to_local_next() {
     let lookup = runtime
         .nodes()
         .register_internal(IpLookupControlPlane::new(builder.build()).node());
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     push_packet(
         &runtime,
-        frame,
+        &mut frame,
         &ipv4_udp_packet([10, 0, 0, 1], 30_011, [192, 0, 2, 10], 53, b"receive"),
     );
 
-    assert!(runtime.schedule_frame(lookup, frame).expect("schedule"));
+    runtime.submit_frame(frame, lookup).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 3);
     assert_payloads(&state, &[b"receive".as_slice()]);
@@ -498,14 +498,14 @@ fn ip_lookup_node_routes_direct_receive_dpo_to_local_next() {
     let lookup = runtime
         .nodes()
         .register_internal(IpLookupControlPlane::new(builder.build()).node());
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     push_packet(
         &runtime,
-        frame,
+        &mut frame,
         &ipv4_udp_packet([10, 0, 0, 1], 30_012, [192, 0, 2, 11], 53, b"direct"),
     );
 
-    assert!(runtime.schedule_frame(lookup, frame).expect("schedule"));
+    runtime.submit_frame(frame, lookup).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 3);
     assert_payloads(&state, &[b"direct".as_slice()]);
@@ -537,14 +537,14 @@ fn ip_lookup_node_routes_stacked_dpo_with_parent_identity() {
     let lookup = runtime
         .nodes()
         .register_internal(IpLookupControlPlane::new(builder.build()).node());
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     push_packet(
         &runtime,
-        frame,
+        &mut frame,
         &ipv4_udp_packet([10, 0, 0, 1], 30_012, [192, 0, 2, 20], 53, b"stack"),
     );
 
-    assert!(runtime.schedule_frame(lookup, frame).expect("schedule"));
+    runtime.submit_frame(frame, lookup).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert_payloads(&state, &[b"stack".as_slice()]);
@@ -575,14 +575,14 @@ fn ip_lookup_node_routes_custom_dpo_to_custom_next() {
     let lookup = runtime
         .nodes()
         .register_internal(IpLookupControlPlane::new(builder.build()).node());
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     push_packet(
         &runtime,
-        frame,
+        &mut frame,
         &ipv4_udp_packet([10, 0, 0, 1], 30_013, [192, 0, 2, 30], 53, b"custom"),
     );
 
-    assert!(runtime.schedule_frame(lookup, frame).expect("schedule"));
+    runtime.submit_frame(frame, lookup).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert_payloads(&state, &[b"custom".as_slice()]);
@@ -625,7 +625,7 @@ fn adjacency_rewrite_node_prepends_rewrite_and_sets_egress_interface() {
         .into(),
     });
     runtime.set_trace_control(Some(trace.handle()), 4);
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     let packet = ipv4_udp_packet([10, 0, 0, 1], 30_014, [192, 0, 2, 30], 53, b"rewrite");
     let index = alloc_packet_with_headroom(&runtime, &packet);
     runtime
@@ -651,17 +651,9 @@ fn adjacency_rewrite_node_prepends_rewrite_and_sets_egress_interface() {
                 .with_transport_payload_offset(28),
         );
     }
-    runtime
-        .get_frame_mut(frame)
-        .expect("mutate frame")
-        .push_index(index)
-        .expect("push packet");
+    frame.push_index(index).expect("push packet");
 
-    assert!(
-        runtime
-            .schedule_frame(rewrite_node, frame)
-            .expect("schedule")
-    );
+    runtime.submit_frame(frame, rewrite_node).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     let state_ref = state.lock().unwrap();
@@ -714,7 +706,7 @@ fn adjacency_rewrite_node_prepends_rewrite_when_packet_has_headroom() {
     let rewrite_node = runtime
         .nodes()
         .register_internal(AdjacencyRewriteNode::new(control.table_handle()));
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     let packet = ipv4_udp_packet(
         [10, 0, 0, 1],
         30_114,
@@ -743,17 +735,9 @@ fn adjacency_rewrite_node_prepends_rewrite_when_packet_has_headroom() {
                 .with_transport_payload_offset(28),
         );
     }
-    runtime
-        .get_frame_mut(frame)
-        .expect("mutate frame")
-        .push_index(index)
-        .expect("push packet");
+    frame.push_index(index).expect("push packet");
 
-    assert!(
-        runtime
-            .schedule_frame(rewrite_node, frame)
-            .expect("schedule")
-    );
+    runtime.submit_frame(frame, rewrite_node).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     let state_ref = state.lock().unwrap();
@@ -774,10 +758,10 @@ fn adjacency_rewrite_node_drops_missing_forwarding_and_missing_adjacency() {
     let rewrite_node = runtime
         .nodes()
         .register_internal(AdjacencyRewriteNode::new(control.table_handle()));
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     push_packet(
         &runtime,
-        frame,
+        &mut frame,
         &ipv4_udp_packet([10, 0, 0, 1], 30_015, [192, 0, 2, 31], 53, b"missing-meta"),
     );
     let missing_adjacency = runtime
@@ -804,17 +788,11 @@ fn adjacency_rewrite_node_drops_missing_forwarding_and_missing_adjacency() {
             dpo_index: 99,
         });
     }
-    runtime
-        .get_frame_mut(frame)
-        .expect("mutate frame")
+    frame
         .push_index(missing_adjacency)
         .expect("push missing adjacency");
 
-    assert!(
-        runtime
-            .schedule_frame(rewrite_node, frame)
-            .expect("schedule")
-    );
+    runtime.submit_frame(frame, rewrite_node).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 1);
     assert_eq!(runtime.frames_in_use(), 0);
@@ -839,17 +817,13 @@ fn ip_lookup_control_plane_publish_replaces_forwarding_table() {
     let control = IpLookupControlPlane::new(first_builder.build());
     let lookup = runtime.nodes().register_internal(control.node());
 
-    let first_frame = runtime.alloc_frame_index().expect("alloc first frame");
+    let mut first_frame = runtime.alloc_frame().expect("alloc first frame");
     push_packet(
         &runtime,
-        first_frame,
+        &mut first_frame,
         &ipv4_udp_packet([10, 0, 0, 1], 50_001, [203, 0, 113, 1], 53, b"first"),
     );
-    assert!(
-        runtime
-            .schedule_frame(lookup, first_frame)
-            .expect("schedule")
-    );
+    runtime.submit_frame(first_frame, lookup).expect("schedule");
     assert_eq!(runtime.run_ready_nodes().expect("run first"), 2);
     assert_payloads(&first_state, &[b"first".as_slice()]);
 
@@ -861,17 +835,15 @@ fn ip_lookup_control_plane_publish_replaces_forwarding_table() {
     );
     control.publish(second_builder.build()).expect("publish");
 
-    let second_frame = runtime.alloc_frame_index().expect("alloc second frame");
+    let mut second_frame = runtime.alloc_frame().expect("alloc second frame");
     push_packet(
         &runtime,
-        second_frame,
+        &mut second_frame,
         &ipv4_udp_packet([10, 0, 0, 1], 50_002, [203, 0, 113, 2], 53, b"second"),
     );
-    assert!(
-        runtime
-            .schedule_frame(lookup, second_frame)
-            .expect("schedule")
-    );
+    runtime
+        .submit_frame(second_frame, lookup)
+        .expect("schedule");
     assert_eq!(runtime.run_ready_nodes().expect("run second"), 2);
     assert_payloads(&second_state, &[b"second".as_slice()]);
     assert_eq!(runtime.frames_in_use(), 0);
@@ -916,14 +888,14 @@ fn ip_input_to_lookup_graph_routes_packet_by_fib() {
         .register_internal(IpInputNode::<IpUnicastArc>::new(IpInputNext::nodes(
             drop, drop, drop, lookup, drop, drop, drop,
         )));
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     push_packet(
         &runtime,
-        frame,
+        &mut frame,
         &ipv4_udp_packet([10, 0, 0, 1], 40_001, [198, 51, 100, 17], 853, b"graph"),
     );
 
-    assert!(runtime.schedule_frame(input, frame).expect("schedule"));
+    runtime.submit_frame(frame, input).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 3);
     assert_payloads(&state, &[b"graph".as_slice()]);
@@ -943,24 +915,24 @@ fn ip_input_batches_lookup_packets_into_one_scheduled_next_frame() {
         .register_internal(IpInputNode::<IpUnicastArc>::new(IpInputNext::nodes(
             drop, drop, drop, sink, drop, drop, drop,
         )));
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     push_packet(
         &runtime,
-        frame,
+        &mut frame,
         &ipv4_udp_packet([10, 0, 0, 1], 41_001, [198, 51, 100, 17], 853, b"one"),
     );
     push_packet(
         &runtime,
-        frame,
+        &mut frame,
         &ipv4_udp_packet([10, 0, 0, 1], 41_002, [198, 51, 100, 18], 853, b"two"),
     );
     push_packet(
         &runtime,
-        frame,
+        &mut frame,
         &ipv4_udp_packet([10, 0, 0, 1], 41_003, [198, 51, 100, 19], 853, b"three"),
     );
 
-    assert!(runtime.schedule_frame(input, frame).expect("schedule"));
+    runtime.submit_frame(frame, input).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert_payloads(
@@ -995,14 +967,14 @@ fn ip_lookup_uses_ip_input_cursor_without_reparsing_current_header() {
         .register_internal(IpInputNode::<IpUnicastArc>::new(IpInputNext::nodes(
             drop, drop, drop, corrupt, drop, drop, drop,
         )));
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
     push_packet(
         &runtime,
-        frame,
+        &mut frame,
         &ipv4_udp_packet([10, 0, 0, 1], 40_011, [198, 51, 100, 17], 853, b"cursor"),
     );
 
-    assert!(runtime.schedule_frame(input, frame).expect("schedule"));
+    runtime.submit_frame(frame, input).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 4);
     {
@@ -1032,16 +1004,12 @@ fn add_single_path(
     builder.add_single_path_load_balance(proto, node)
 }
 
-fn push_packet(runtime: &DataPlaneRuntime, frame: hammer_adapter::FrameIndex, packet: &[u8]) {
+fn push_packet(runtime: &DataPlaneRuntime, frame: &mut BufferFrame, packet: &[u8]) {
     let index = runtime
         .alloc_index_with_bytes(packet)
         .expect("alloc packet");
     set_lookup_cursor(runtime, index, packet);
-    runtime
-        .get_frame_mut(frame)
-        .expect("mutate frame")
-        .push_index(index)
-        .expect("push packet");
+    frame.push_index(index).expect("push packet");
 }
 
 fn alloc_packet_with_headroom(
@@ -1058,7 +1026,7 @@ fn alloc_packet_with_headroom(
 
 fn push_marked_packet(
     runtime: &DataPlaneRuntime,
-    frame: hammer_adapter::FrameIndex,
+    frame: &mut BufferFrame,
     trace_input: hammer_adapter::NodeId,
     packet: &[u8],
 ) {
@@ -1069,11 +1037,7 @@ fn push_marked_packet(
         .try_mark_trace(trace_input, index)
         .expect("mark packet");
     set_lookup_cursor(runtime, index, packet);
-    runtime
-        .get_frame_mut(frame)
-        .expect("mutate frame")
-        .push_index(index)
-        .expect("push packet");
+    frame.push_index(index).expect("push packet");
 }
 
 fn set_lookup_cursor(

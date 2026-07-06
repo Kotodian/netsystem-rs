@@ -920,7 +920,7 @@ mod tests {
         let mut worker_state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
         set_tcp_worker_state(&mut worker_state);
         let handle = install_tcp_session(&runtime, DataWorkerId::new(1), 50_066);
-        let frame = runtime.alloc_frame_index().expect("alloc frame");
+        let mut frame = runtime.alloc_frame().expect("alloc frame");
         let packet = tcp_packet(
             Ipv4Addr::new(198, 51, 100, 50_066u16 as u8),
             443,
@@ -931,11 +931,7 @@ mod tests {
             .alloc_index_with_bytes(&packet)
             .expect("alloc packet");
         stamp_tcp_cursor(&runtime, index, &packet);
-        runtime
-            .get_frame_mut(frame)
-            .expect("frame mut")
-            .push_index(index)
-            .expect("push packet");
+        frame.push_index(index).expect("push packet");
 
         let control = TcpInputControlPlane::new();
         let (_, _, _, _, _, reset, nexts) = register_tcp_input_test_nexts!(runtime);
@@ -945,7 +941,7 @@ mod tests {
             Some((HANDOFF_HANDLE, DataWorkerId::new(0))),
         ));
 
-        assert!(runtime.schedule_frame(node, frame).expect("schedule"));
+        runtime.submit_frame(frame, node).expect("submit");
         assert!(runtime.run_ready_nodes().expect("run input") >= 1);
 
         assert_eq!(
@@ -982,19 +978,15 @@ mod tests {
             .alloc_index_with_bytes(&packet)
             .expect("alloc packet");
         stamp_tcp_cursor(&runtime, index, &packet);
-        let frame = runtime.alloc_frame_index().expect("frame");
-        runtime
-            .get_frame_mut(frame)
-            .expect("frame mut")
-            .push_index(index)
-            .expect("push packet");
+        let mut frame = runtime.alloc_frame().expect("frame");
+        frame.push_index(index).expect("push packet");
         let control = TcpInputControlPlane::new();
         let (_, _, _, _, _, _, nexts) = register_tcp_input_test_nexts!(runtime);
         let node = runtime
             .nodes()
             .register_internal(control.node(nexts, Some(handle), None));
 
-        assert!(runtime.schedule_frame(node, frame).expect("schedule"));
+        runtime.submit_frame(frame, node).expect("submit");
         assert!(runtime.run_ready_nodes().expect("run input") >= 1);
 
         assert_eq!(

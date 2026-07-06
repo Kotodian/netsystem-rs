@@ -306,13 +306,9 @@ mod tests {
     }
 
     fn send_to_output(runtime: &DataPlaneRuntime, output: NodeId, index: BufferIndex) {
-        let frame = runtime.alloc_frame_index().expect("frame");
-        runtime
-            .get_frame_mut(frame)
-            .expect("frame mut")
-            .push_index(index)
-            .expect("push index");
-        assert!(runtime.schedule_frame(output, frame).expect("schedule"));
+        let mut frame = runtime.alloc_frame().expect("frame");
+        frame.push_index(index).expect("push index");
+        runtime.submit_frame(frame, output).expect("submit");
     }
 
     fn test_segment(payload_len: usize) -> TcpSegment {

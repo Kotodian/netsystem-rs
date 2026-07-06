@@ -1780,9 +1780,8 @@ mod tests {
             spawn(async {
                 spawn_local(|| async {
                     let runtime = with_data_plane_buffers(Clone::clone);
-                    let frame = std::rc::Rc::new(RefCell::new(
-                        runtime.alloc_pooled_frame().expect("alloc pooled frame"),
-                    ));
+                    let frame =
+                        std::rc::Rc::new(RefCell::new(runtime.alloc_frame().expect("alloc frame")));
                     let index = runtime
                         .alloc_index_with_bytes(b"packet")
                         .expect("alloc data buffer");
@@ -1822,12 +1821,11 @@ mod tests {
                     });
                     producer.await.expect("producer joined");
                     let result = consumer.await.expect("consumer joined");
-                    let frame = std::rc::Rc::try_unwrap(frame)
-                        .expect("frame has no remaining references")
-                        .into_inner();
-                    runtime
-                        .release_pooled_frame(frame)
-                        .expect("release pooled frame");
+                    let frame = match std::rc::Rc::try_unwrap(frame) {
+                        Ok(frame) => frame.into_inner(),
+                        Err(_) => panic!("frame has remaining references"),
+                    };
+                    drop(frame);
                     result
                 })
                 .await

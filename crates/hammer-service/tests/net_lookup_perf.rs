@@ -257,15 +257,12 @@ fn measure_packet_scalar(scenario: Scenario) -> ProbeStats {
     let started = Instant::now();
     for _ in 0..FRAME_ROUNDS {
         for packet in packets_by_frame.iter() {
-            let frame = runtime.alloc_frame_index().expect("alloc frame");
-            {
-                let mut frame_ref = runtime.get_frame_mut(frame).expect("mutate frame");
-                let index = runtime
-                    .alloc_index_with_bytes(packet)
-                    .expect("alloc packet");
-                frame_ref.push_index(index).expect("push packet");
-            }
-            assert!(runtime.schedule_frame(lookup, frame).expect("schedule"));
+            let mut frame = runtime.alloc_frame().expect("alloc frame");
+            let index = runtime
+                .alloc_index_with_bytes(packet)
+                .expect("alloc packet");
+            frame.push_index(index).expect("push packet");
+            runtime.submit_frame(frame, lookup).expect("schedule");
             black_box(runtime.run_ready_nodes().expect("run nodes"));
             debug_assert_eq!(runtime.in_use_buffers(), 0);
         }
@@ -293,17 +290,14 @@ fn measure_lookup(scenario: Scenario, instruction_set: DataPlaneInstructionSet) 
 
     let started = Instant::now();
     for _ in 0..FRAME_ROUNDS {
-        let frame = runtime.alloc_frame_index().expect("alloc frame");
-        {
-            let mut frame_ref = runtime.get_frame_mut(frame).expect("mutate frame");
-            for packet in packets_by_frame.iter() {
-                let index = runtime
-                    .alloc_index_with_bytes(packet)
-                    .expect("alloc packet");
-                frame_ref.push_index(index).expect("push packet");
-            }
+        let mut frame = runtime.alloc_frame().expect("alloc frame");
+        for packet in packets_by_frame.iter() {
+            let index = runtime
+                .alloc_index_with_bytes(packet)
+                .expect("alloc packet");
+            frame.push_index(index).expect("push packet");
         }
-        assert!(runtime.schedule_frame(lookup, frame).expect("schedule"));
+        runtime.submit_frame(frame, lookup).expect("schedule");
         black_box(runtime.run_ready_nodes().expect("run nodes"));
         debug_assert_eq!(runtime.in_use_buffers(), 0);
     }
@@ -333,17 +327,14 @@ fn measure_input_lookup(
 
     let started = Instant::now();
     for _ in 0..FRAME_ROUNDS {
-        let frame = runtime.alloc_frame_index().expect("alloc frame");
-        {
-            let mut frame_ref = runtime.get_frame_mut(frame).expect("mutate frame");
-            for packet in packets_by_frame.iter() {
-                let index = runtime
-                    .alloc_index_with_bytes(packet)
-                    .expect("alloc packet");
-                frame_ref.push_index(index).expect("push packet");
-            }
+        let mut frame = runtime.alloc_frame().expect("alloc frame");
+        for packet in packets_by_frame.iter() {
+            let index = runtime
+                .alloc_index_with_bytes(packet)
+                .expect("alloc packet");
+            frame.push_index(index).expect("push packet");
         }
-        assert!(runtime.schedule_frame(input, frame).expect("schedule"));
+        runtime.submit_frame(frame, input).expect("schedule");
         black_box(runtime.run_ready_nodes().expect("run nodes"));
         debug_assert_eq!(runtime.in_use_buffers(), 0);
     }

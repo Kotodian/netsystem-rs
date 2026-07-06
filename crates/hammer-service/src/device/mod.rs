@@ -368,10 +368,5 @@ pub trait DeviceClass: Send + Sync {
 
 #[inline]
 fn schedule_empty_driver_frame(runtime: &DataPlaneRuntime, node: NodeId) -> CoreResult<()> {
-    let frame = runtime.alloc_frame_index()?;
-    if let Err(err) = runtime.schedule_driver_frame(node, frame) {
-        let _ = runtime.free_frame_index(frame);
-        return Err(err);
-    }
-    Ok(())
+    runtime.schedule_empty_frame(node)
 }

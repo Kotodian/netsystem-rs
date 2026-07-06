@@ -143,10 +143,10 @@ fn icmp_input_dispatches_ipv4_echo_request_by_type() {
     });
     runtime.set_trace_control(Some(trace_control.handle()), 2);
     let packet = ipv4_icmp_packet(8, 0, b"echo4");
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
-    push_marked_packet(&runtime, frame, icmp_input, &packet);
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    push_marked_packet(&runtime, &mut frame, icmp_input, &packet);
 
-    assert!(runtime.schedule_frame(icmp_input, frame).expect("schedule"));
+    runtime.submit_frame(frame, icmp_input).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert_eq!(echo_state.lock().unwrap().packets, vec![packet]);
@@ -180,10 +180,10 @@ fn icmp_input_dispatches_ipv6_echo_request_by_type() {
         .expect("register echo request");
     let icmp_input = runtime.nodes().register_internal(control.node());
     let packet = ipv6_icmp_packet(128, 0, b"echo6");
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
-    push_packet(&runtime, frame, &packet);
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    push_packet(&runtime, &mut frame, &packet);
 
-    assert!(runtime.schedule_frame(icmp_input, frame).expect("schedule"));
+    runtime.submit_frame(frame, icmp_input).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert_eq!(echo_state.lock().unwrap().packets, vec![packet]);
@@ -201,10 +201,10 @@ fn icmp_input_sends_unknown_ipv4_type_to_default_next() {
     let control = IcmpInputControlPlane::new(punt);
     let icmp_input = runtime.nodes().register_internal(control.node());
     let packet = ipv4_icmp_packet(13, 0, b"timestamp");
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
-    push_packet(&runtime, frame, &packet);
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    push_packet(&runtime, &mut frame, &packet);
 
-    assert!(runtime.schedule_frame(icmp_input, frame).expect("schedule"));
+    runtime.submit_frame(frame, icmp_input).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert_eq!(punt_state.lock().unwrap().packets, vec![packet]);
@@ -234,10 +234,10 @@ fn icmp_input_rejects_ipv6_echo_request_with_nonzero_code() {
         .expect("register echo request");
     let icmp_input = runtime.nodes().register_internal(control.node());
     let packet = ipv6_icmp_packet(128, 1, b"bad-code");
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
-    push_packet(&runtime, frame, &packet);
+    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    push_packet(&runtime, &mut frame, &packet);
 
-    assert!(runtime.schedule_frame(icmp_input, frame).expect("schedule"));
+    runtime.submit_frame(frame, icmp_input).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert!(echo_state.lock().unwrap().packets.is_empty());
@@ -251,21 +251,17 @@ fn icmp_input_rejects_ipv6_echo_request_with_nonzero_code() {
     );
 }
 
-fn push_packet(runtime: &DataPlaneRuntime, frame: hammer_adapter::FrameIndex, packet: &[u8]) {
+fn push_packet(runtime: &DataPlaneRuntime, frame: &mut BufferFrame, packet: &[u8]) {
     let buffer = runtime
         .alloc_index_with_bytes(packet)
         .expect("alloc packet");
     set_ip_cursor(runtime, buffer, packet);
-    runtime
-        .get_frame_mut(frame)
-        .expect("mutate frame")
-        .push_index(buffer)
-        .expect("push packet");
+    frame.push_index(buffer).expect("push packet");
 }
 
 fn push_marked_packet(
     runtime: &DataPlaneRuntime,
-    frame: hammer_adapter::FrameIndex,
+    frame: &mut BufferFrame,
     trace_input: hammer_adapter::NodeId,
     packet: &[u8],
 ) {
@@ -276,11 +272,7 @@ fn push_marked_packet(
         .try_mark_trace(trace_input, buffer)
         .expect("mark packet");
     set_ip_cursor(runtime, buffer, packet);
-    runtime
-        .get_frame_mut(frame)
-        .expect("mutate frame")
-        .push_index(buffer)
-        .expect("push packet");
+    frame.push_index(buffer).expect("push packet");
 }
 
 fn set_ip_cursor(runtime: &DataPlaneRuntime, index: hammer_adapter::BufferIndex, packet: &[u8]) {

@@ -1,6 +1,6 @@
 use hammer_infra::vec::Vec;
 
-use crate::buffer::{BufferFrame, BufferIndex, DataPlaneRuntime, FrameIndex};
+use crate::buffer::{BufferFrame, BufferIndex, DataPlaneRuntime, Frame, Next};
 
 use super::{MAX_NODE_NEXT_FRAMES, NodeId, NodeResult};
 
@@ -31,10 +31,9 @@ impl NodeNextStorage<()> for NodeId {
     }
 }
 
-#[derive(Debug)]
 pub struct NodeNextFrames {
     nodes: [Option<NodeId>; MAX_NODE_NEXT_FRAMES],
-    frames: [Option<FrameIndex>; MAX_NODE_NEXT_FRAMES],
+    frames: [Option<Frame<Next>>; MAX_NODE_NEXT_FRAMES],
     len: usize,
     cached_next_node: Option<NodeId>,
     cached_next_offset: usize,
@@ -47,7 +46,7 @@ impl Default for NodeNextFrames {
     fn default() -> Self {
         Self {
             nodes: [None; MAX_NODE_NEXT_FRAMES],
-            frames: [None; MAX_NODE_NEXT_FRAMES],
+            frames: std::array::from_fn(|_| None),
             len: 0,
             cached_next_node: None,
             cached_next_offset: 0,
@@ -81,13 +80,13 @@ impl NodeNextFrames {
             self.current_indices.push(index);
             return;
         }
-        let (frame_index, offset, created) = self.frame_for_enqueue(runtime, node);
-        let mut frame = runtime
-            .get_frame_mut(frame_index)
+        let (offset, created) = self.frame_for_enqueue(runtime, node);
+        let frame = self.frames[offset]
+            .as_mut()
             .expect("next enqueue frame mut");
         let result = frame.push_index(index);
         if crate::unlikely(result.is_err()) && created {
-            self.free_from(runtime, offset);
+            self.free_from(offset);
         }
     }
 
@@ -113,13 +112,13 @@ impl NodeNextFrames {
             }
             return;
         }
-        let (frame_index, offset, created) = self.frame_for_enqueue(runtime, node);
-        let mut frame = runtime
-            .get_frame_mut(frame_index)
+        let (offset, created) = self.frame_for_enqueue(runtime, node);
+        let frame = self.frames[offset]
+            .as_mut()
             .expect("next enqueue indices frame mut");
         let result = frame.push_indices(indices);
         if crate::unlikely(result.is_err()) && created {
-            self.free_from(runtime, offset);
+            self.free_from(offset);
         }
     }
 
@@ -169,28 +168,21 @@ impl NodeNextFrames {
         if let Some(node) = self.current_node
             && !self.current_indices.is_empty()
         {
-            let frame_index = runtime
-                .alloc_frame_index()
-                .expect("schedule alloc frame index");
-            let mut frame = runtime
-                .get_frame_mut(frame_index)
-                .expect("schedule frame mut");
+            let mut frame = runtime.alloc_frame().expect("schedule alloc frame");
             if frame
                 .push_indices(self.current_indices.iter().copied())
                 .is_err()
             {
-                let _ = runtime.free_frame_index(frame_index);
                 self.free(runtime);
                 return;
             }
             if self.len == MAX_NODE_NEXT_FRAMES {
-                let _ = runtime.free_frame_index(frame_index);
                 self.free(runtime);
                 return;
             }
             let offset = self.len;
             self.nodes[offset] = Some(node);
-            self.frames[offset] = Some(frame_index);
+            self.frames[offset] = Some(frame);
             self.len += 1;
             self.cached_next_node = Some(node);
             self.cached_next_offset = offset;
@@ -200,43 +192,30 @@ impl NodeNextFrames {
 
     #[inline]
     pub fn free(&mut self, runtime: &DataPlaneRuntime) {
-        self.free_from(runtime, 0);
+        let _ = runtime;
+        self.free_from(0);
     }
 
     #[inline]
-    fn frame_for_enqueue(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        node: NodeId,
-    ) -> (FrameIndex, usize, bool) {
-        if self.cached_next_node == Some(node)
-            && let Some(frame) = self.frame(self.cached_next_offset)
-        {
-            return (frame, self.cached_next_offset, false);
+    fn frame_for_enqueue(&mut self, runtime: &DataPlaneRuntime, node: NodeId) -> (usize, bool) {
+        if self.cached_next_node == Some(node) && self.frames[self.cached_next_offset].is_some() {
+            return (self.cached_next_offset, false);
         }
         if let Some(offset) = self.position(node) {
             self.cached_next_node = Some(node);
             self.cached_next_offset = offset;
-            return (self.frame(offset).expect("existing frame"), offset, false);
+            return (offset, false);
         }
         if self.len == MAX_NODE_NEXT_FRAMES {
             panic!("node next frame capacity exceeded");
         }
         let offset = self.len;
         self.nodes[offset] = Some(node);
-        self.frames[offset] = Some(
-            runtime
-                .alloc_frame_index()
-                .expect("frame for enqueue alloc"),
-        );
+        self.frames[offset] = Some(runtime.alloc_frame().expect("frame for enqueue alloc"));
         self.len += 1;
         self.cached_next_node = Some(node);
         self.cached_next_offset = offset;
-        (
-            self.frame(offset).expect("just-allocated frame"),
-            offset,
-            true,
-        )
+        (offset, true)
     }
 
     /// Schedule every freshly allocated frame in `self.nodes` / `self.frames`.
@@ -247,17 +226,10 @@ impl NodeNextFrames {
         let mut offset = 0usize;
         while offset < self.len {
             let node = self.node(offset);
-            let frame_index = self.take_frame(offset);
-            match runtime.schedule_frame(node, frame_index) {
-                Ok(true) => {}
-                Ok(false) => {
-                    let _ = runtime.free_frame_index(frame_index);
-                }
-                Err(_) => {
-                    let _ = runtime.free_frame_index(frame_index);
-                    self.free_from(runtime, offset + 1);
-                    return false;
-                }
+            let frame = self.take_frame(offset);
+            if runtime.submit_frame(frame, node).is_err() {
+                self.free_from(offset + 1);
+                return false;
             }
             offset += 1;
         }
@@ -276,12 +248,7 @@ impl NodeNextFrames {
     }
 
     #[inline]
-    fn frame(&self, offset: usize) -> Option<FrameIndex> {
-        self.frames.get(offset).and_then(|frame| *frame)
-    }
-
-    #[inline]
-    fn take_frame(&mut self, offset: usize) -> FrameIndex {
+    fn take_frame(&mut self, offset: usize) -> Frame<Next> {
         self.nodes[offset] = None;
         self.frames
             .get_mut(offset)
@@ -302,13 +269,11 @@ impl NodeNextFrames {
     }
 
     #[inline]
-    fn free_from(&mut self, runtime: &DataPlaneRuntime, start: usize) {
+    fn free_from(&mut self, start: usize) {
         let mut offset = start;
         while offset < self.len {
             self.nodes[offset] = None;
-            if let Some(frame) = self.frames[offset].take() {
-                let _ = runtime.free_frame_index(frame);
-            }
+            let _ = self.frames[offset].take();
             offset += 1;
         }
         self.len = start.min(self.len);

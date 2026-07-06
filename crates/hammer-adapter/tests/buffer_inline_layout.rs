@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use hammer_adapter::buffer::{
-    BufferPool, BufferPoolArena, BUFFER_THREAD_CACHE_BATCH, BUFFER_THREAD_CACHE_HIGH_WATER,
+    BUFFER_THREAD_CACHE_BATCH, BUFFER_THREAD_CACHE_HIGH_WATER, BufferPool, BufferPoolArena,
     DEFAULT_PRE_DATA_SIZE, buffer_data_offset,
 };
 use hammer_infra::heap::Heap;

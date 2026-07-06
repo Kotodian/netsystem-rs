@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use hammer_core::error::{CoreError, CoreResult};
 
-use crate::buffer::{BufferFrame, DataPlaneRuntime, FrameIndex};
+use crate::buffer::{BufferFrame, DataPlaneRuntime, Frame, Next, Pending};
 use crate::trace::TraceFormatter;
 
 pub mod next;
@@ -705,13 +705,11 @@ impl Node for NoopNode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NextFrame {
     Current(NodeId),
-    Frame { node: NodeId, frame: FrameIndex },
+    Frame { node: NodeId, frame: Frame<Next> },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeResult {
     next: [Option<NextFrame>; MAX_NODE_NEXT_FRAMES],
     len: usize,
@@ -726,7 +724,7 @@ impl Default for NodeResult {
 impl NodeResult {
     pub fn drop() -> Self {
         Self {
-            next: [None; MAX_NODE_NEXT_FRAMES],
+            next: std::array::from_fn(|_| None),
             len: 0,
         }
     }
@@ -738,7 +736,7 @@ impl NodeResult {
         result
     }
 
-    pub fn next_frame(node: NodeId, frame: FrameIndex) -> Self {
+    pub fn next_frame(node: NodeId, frame: Frame<Next>) -> Self {
         let mut result = Self::drop();
         result.next[0] = Some(NextFrame::Frame { node, frame });
         result.len = 1;
@@ -767,8 +765,14 @@ impl NodeResult {
         self.len == 0
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = NextFrame> + '_ {
-        self.next[..self.len].iter().filter_map(|next| *next)
+    pub fn iter(&self) -> impl Iterator<Item = &NextFrame> + '_ {
+        self.next[..self.len]
+            .iter()
+            .filter_map(|next| next.as_ref())
+    }
+
+    fn take(&mut self, offset: usize) -> Option<NextFrame> {
+        self.next.get_mut(offset).and_then(Option::take)
     }
 }
 
@@ -937,10 +941,9 @@ impl NodeErrorCounters {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
 struct ScheduledFrame {
     node: NodeId,
-    frame: FrameIndex,
+    frame: Frame<Pending>,
     allow_empty: bool,
 }
 
@@ -1676,7 +1679,7 @@ impl NodeRuntime {
     pub(crate) fn schedule_frame(
         &self,
         node: NodeId,
-        frame: FrameIndex,
+        frame: Frame<Pending>,
         allow_empty: bool,
     ) -> CoreResult<()> {
         self.validate_node(node)?;
@@ -1692,30 +1695,32 @@ impl NodeRuntime {
     pub(crate) fn run_ready_function_nodes(&self, runtime: &DataPlaneRuntime) -> CoreResult<usize> {
         let mut processed = 0usize;
         while let Some(scheduled) = self.pop_scheduled() {
-            let slot = self.runtime_slot(scheduled.node)?;
-            let mut frame = runtime.take_frame_index(scheduled.frame)?;
-            if self.node_state(scheduled.node)? == NodeState::Disabled {
-                self.clear_interrupt_pending(scheduled.node)?;
-                runtime.release_taken_frame_index(scheduled.frame, frame)?;
+            let ScheduledFrame {
+                node,
+                mut frame,
+                allow_empty,
+            } = scheduled;
+            let slot = self.runtime_slot(node)?;
+            if self.node_state(node)? == NodeState::Disabled {
+                self.clear_interrupt_pending(node)?;
                 continue;
             }
-            if !scheduled.allow_empty && !frame.has_pending() {
-                runtime.release_taken_frame_index(scheduled.frame, frame)?;
+            if !allow_empty && !frame.has_pending() {
                 continue;
             }
-            self.clear_interrupt_pending(scheduled.node)?;
+            self.clear_interrupt_pending(node)?;
 
             frame.clear_next_node();
-            runtime.set_current_node(Some(scheduled.node));
+            runtime.set_current_node(Some(node));
             let vectors = frame.pending_len();
             let start = Instant::now();
             let result = slot.dispatch(runtime, &mut frame);
             let elapsed_ns = elapsed_ns(start);
             runtime.set_current_node(None);
-            let _ = self.record_runtime_stats(scheduled.node, vectors, elapsed_ns);
+            let _ = self.record_runtime_stats(node, vectors, elapsed_ns);
             processed += 1;
 
-            let _ = self.dispatch_result(runtime, scheduled.frame, frame, result);
+            let _ = self.dispatch_result(runtime, frame, result);
         }
         Ok(processed)
     }
@@ -1760,123 +1765,41 @@ impl NodeRuntime {
         scheduled
     }
 
+    pub(crate) fn take_scheduled_frame(&self) -> Option<Frame<Pending>> {
+        self.pop_scheduled().map(|scheduled| scheduled.frame)
+    }
+
     fn dispatch_result(
         &self,
         runtime: &DataPlaneRuntime,
-        current_index: FrameIndex,
-        current_frame: BufferFrame,
-        result: NodeResult,
+        current_frame: Frame<Pending>,
+        mut result: NodeResult,
     ) -> CoreResult<()> {
         let mut current_frame = Some(current_frame);
         let mut offset = 0usize;
         while offset < result.len {
-            let Some(next) = result.next[offset] else {
+            let Some(next) = result.take(offset) else {
                 offset += 1;
                 continue;
             };
             match next {
                 NextFrame::Current(node) => {
-                    let Some(mut frame) = current_frame.take() else {
-                        Self::release_remaining_next_frames_on_dispatch_error(
-                            runtime,
-                            &result,
-                            offset + 1,
-                        );
+                    let Some(frame) = current_frame.take() else {
                         return Err(CoreError::internal(
                             "current frame cannot be forwarded more than once",
                         ));
                     };
                     if frame.has_pending() {
-                        if let Err(err) = self.validate_node(node) {
-                            let _ = runtime.release_taken_frame_index(current_index, frame);
-                            Self::release_remaining_next_frames_on_dispatch_error(
-                                runtime,
-                                &result,
-                                offset + 1,
-                            );
-                            return Err(err);
-                        }
-                        frame.set_next_node(node);
-                        runtime.return_taken_frame_index(current_index, frame)?;
-                        self.schedule_frame(node, current_index, false)?;
-                    } else {
-                        runtime.release_taken_frame_index(current_index, frame)?;
+                        runtime.submit_frame(frame.into(), node)?;
                     }
                 }
-                NextFrame::Frame { node, frame } => match runtime.schedule_frame(node, frame) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        if let Err(err) = runtime.free_frame_index(frame) {
-                            Self::release_current_frame_on_dispatch_error(
-                                runtime,
-                                current_index,
-                                &mut current_frame,
-                            );
-                            Self::release_remaining_next_frames_on_dispatch_error(
-                                runtime,
-                                &result,
-                                offset + 1,
-                            );
-                            return Err(err);
-                        }
-                    }
-                    Err(err) => {
-                        Self::release_next_frame_and_current_on_dispatch_error(
-                            runtime,
-                            current_index,
-                            &mut current_frame,
-                            frame,
-                        );
-                        Self::release_remaining_next_frames_on_dispatch_error(
-                            runtime,
-                            &result,
-                            offset + 1,
-                        );
-                        return Err(err);
-                    }
-                },
+                NextFrame::Frame { node, frame } => {
+                    runtime.submit_frame(frame, node)?;
+                }
             }
             offset += 1;
-        }
-
-        if let Some(frame) = current_frame {
-            runtime.release_taken_frame_index(current_index, frame)?;
         }
         Ok(())
-    }
-
-    fn release_remaining_next_frames_on_dispatch_error(
-        runtime: &DataPlaneRuntime,
-        result: &NodeResult,
-        start: usize,
-    ) {
-        let mut offset = start;
-        while offset < result.len {
-            if let Some(NextFrame::Frame { frame, .. }) = result.next[offset] {
-                let _ = runtime.free_frame_index(frame);
-            }
-            offset += 1;
-        }
-    }
-
-    fn release_current_frame_on_dispatch_error(
-        runtime: &DataPlaneRuntime,
-        current_index: FrameIndex,
-        current_frame: &mut Option<BufferFrame>,
-    ) {
-        if let Some(frame) = current_frame.take() {
-            let _ = runtime.release_taken_frame_index(current_index, frame);
-        }
-    }
-
-    fn release_next_frame_and_current_on_dispatch_error(
-        runtime: &DataPlaneRuntime,
-        current_index: FrameIndex,
-        current_frame: &mut Option<BufferFrame>,
-        next_frame: FrameIndex,
-    ) {
-        let _ = runtime.free_frame_index(next_frame);
-        Self::release_current_frame_on_dispatch_error(runtime, current_index, current_frame);
     }
 }
 
@@ -1939,11 +1862,11 @@ mod tests {
         let runtime = DataPlaneRuntime::with_capacities(16, 8, 4, 2);
         let node = runtime.nodes().register_internal(StatsNode);
 
-        let frame = runtime.alloc_frame_index().expect("alloc frame");
-        push_packet(&runtime, frame, b"one");
-        push_packet(&runtime, frame, b"two");
+        let mut frame = runtime.alloc_frame().expect("alloc frame");
+        push_packet(&runtime, &mut frame, b"one");
+        push_packet(&runtime, &mut frame, b"two");
 
-        assert!(runtime.schedule_frame(node, frame).expect("schedule"));
+        runtime.submit_frame(frame, node).expect("submit");
         runtime
             .nodes()
             .increment_node_error(node, 7)
@@ -1962,14 +1885,10 @@ mod tests {
         assert!(row.total_elapsed_ns >= row.max_elapsed_ns);
     }
 
-    fn push_packet(runtime: &DataPlaneRuntime, frame: FrameIndex, payload: &[u8]) {
+    fn push_packet(runtime: &DataPlaneRuntime, frame: &mut BufferFrame, payload: &[u8]) {
         let buffer = runtime
             .alloc_index_with_bytes(payload)
             .expect("alloc packet");
-        runtime
-            .get_frame_mut(frame)
-            .expect("get frame")
-            .push_index(buffer)
-            .expect("push packet");
+        frame.push_index(buffer).expect("push packet");
     }
 }
