@@ -179,7 +179,36 @@ impl<T, const ALIGN: usize> Default for Slice<T, ALIGN> {
 impl<T: Clone, const ALIGN: usize> Clone for Slice<T, ALIGN> {
     #[inline]
     fn clone(&self) -> Self {
-        self.as_slice().iter().cloned().collect()
+        if self.len == 0 {
+            return Self::new();
+        }
+
+        let heap = self
+            .heap
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(Heap::local(0)));
+        let ptr = allocate_in::<T, ALIGN>(self.cap, &heap);
+        let mut guard = InitGuard::<T, ALIGN> {
+            ptr,
+            initialized: 0,
+            cap: self.cap,
+            heap: heap.clone(),
+        };
+
+        for (index, value) in self.as_slice().iter().enumerate() {
+            unsafe { ptr.as_ptr().add(index).write(value.clone()) };
+            guard.initialized += 1;
+        }
+        mem::forget(guard);
+
+        Self {
+            ptr,
+            len: self.len,
+            cap: self.cap,
+            heap: Some(heap),
+            _marker: PhantomData,
+        }
     }
 }
 

@@ -1,4 +1,4 @@
-use std::alloc::{GlobalAlloc, Layout, handle_alloc_error};
+use std::alloc::{handle_alloc_error, GlobalAlloc, Layout};
 use std::fmt;
 use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use crate::align::{self, CACHE_LINE};
 use crate::bitmap::Bitmap;
+use crate::boxed::Slice;
 use crate::heap::Heap;
-use crate::vec::Vec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Index {
@@ -38,9 +38,10 @@ pub struct Pool<T, const ALIGN: usize = CACHE_LINE> {
     len: usize,
     stride: usize,
     layout: Option<Layout>,
-    free: Vec<u32>,
+    free: Slice<u32>,
+    free_len: usize,
     free_bitmap: Bitmap,
-    generations: Vec<u32>,
+    generations: Slice<u32>,
     /// Heap that allocated the backing slab. Retained so `Drop` can route the
     /// slab dealloc through the same `Heap` (e.g. the SVM vtable's `dealloc`
     /// returns the offset to the shared-memory region; the Local vtable's
@@ -91,14 +92,15 @@ impl<T, const ALIGN: usize> Pool<T, ALIGN> {
             }
             None => NonNull::dangling(),
         };
-        let free = (0..capacity)
-            .rev()
-            .map(|slot| u32::try_from(slot).expect("pool slot index fits u32"))
-            .collect::<Vec<_>>();
+        let mut free = Slice::from_elem_in(capacity, 0u32, heap.clone());
+        for (offset, slot) in (0..capacity).rev().enumerate() {
+            free[offset] = u32::try_from(slot).expect("pool slot index fits u32");
+        }
         let mut free_bitmap = Bitmap::with_capacity(capacity);
         for slot in 0..capacity {
             free_bitmap.set(slot);
         }
+        let generations = Slice::from_elem_in(capacity, 0u32, heap.clone());
 
         Self {
             ptr,
@@ -107,8 +109,9 @@ impl<T, const ALIGN: usize> Pool<T, ALIGN> {
             stride,
             layout,
             free,
+            free_len: capacity,
             free_bitmap,
-            generations: (0..capacity).map(|_| 0).collect(),
+            generations,
             heap,
             _marker: PhantomData,
         }
@@ -131,7 +134,7 @@ impl<T, const ALIGN: usize> Pool<T, ALIGN> {
 
     #[inline]
     pub fn insert(&mut self, value: T) -> Option<Index> {
-        let slot = self.free.pop()?;
+        let slot = self.pop_free_slot()?;
         let slot_index = slot as usize;
         debug_assert!(self.free_bitmap.is_set(slot_index));
         let generation = self.generations[slot_index].wrapping_add(1).max(1);
@@ -144,7 +147,7 @@ impl<T, const ALIGN: usize> Pool<T, ALIGN> {
 
     #[inline]
     pub fn insert_with(&mut self, f: impl FnOnce(Index) -> T) -> Option<Index> {
-        let slot = self.free.pop()?;
+        let slot = self.pop_free_slot()?;
         let slot_index = slot as usize;
         debug_assert!(self.free_bitmap.is_set(slot_index));
         let generation = self.generations[slot_index].wrapping_add(1).max(1);
@@ -172,7 +175,7 @@ impl<T, const ALIGN: usize> Pool<T, ALIGN> {
     pub fn remove(&mut self, index: Index) -> Option<T> {
         let slot = self.validate(index)?;
         self.free_bitmap.set(slot);
-        self.free.push(slot as u32);
+        self.push_free_slot(slot as u32);
         self.len -= 1;
         Some(unsafe { self.slot_ptr_unchecked(slot).read() })
     }
@@ -214,6 +217,22 @@ impl<T, const ALIGN: usize> Pool<T, ALIGN> {
             && !self.free_bitmap.is_set(slot)
             && self.generations[slot] == index.generation)
             .then_some(slot)
+    }
+
+    #[inline]
+    fn pop_free_slot(&mut self) -> Option<u32> {
+        if self.free_len == 0 {
+            return None;
+        }
+        self.free_len -= 1;
+        Some(self.free[self.free_len])
+    }
+
+    #[inline]
+    fn push_free_slot(&mut self, slot: u32) {
+        debug_assert!(self.free_len < self.free.len());
+        self.free[self.free_len] = slot;
+        self.free_len += 1;
     }
 
     #[inline(always)]
