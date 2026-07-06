@@ -1,16 +1,21 @@
+use core::alloc::{GlobalAlloc, Layout};
+use core::mem;
+use core::ptr::{self, NonNull};
+use core::slice;
+use core::sync::atomic::{AtomicU64, Ordering};
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::fmt;
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
-use crossbeam_utils::CachePadded;
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::{
-    boxed::Slice,
+    align::align_up,
+    heap::Heap,
     prefetch::{prefetch_read_l1, prefetch_read_l2, prefetch_write_l1},
     simd::movemask_4,
     vec::Vec,
@@ -25,6 +30,7 @@ pub const DEFAULT_BUFFER_FRAME_CAPACITY: usize = 256;
 pub const DEFAULT_BUFFER_FRAME_POOL_SIZE: usize = 64;
 pub const BUFFER_CACHE_LINE_SIZE: usize = 64;
 pub const DEFAULT_PACKET_HEADROOM: usize = 256;
+pub const DEFAULT_PRE_DATA_SIZE: usize = 128;
 pub const BUFFER_INVALID_INDEX: u32 = u32::MAX;
 
 /// Number of free slots moved between the per-thread cache and the arena free
@@ -34,7 +40,7 @@ pub const BUFFER_THREAD_CACHE_BATCH: usize = 32;
 /// High-water mark at which the thread cache returns a batch back to the
 /// arena free list, preventing unbounded cache growth and keeping arena free
 /// list non-empty for other consumers.
-pub const BUFFER_THREAD_CACHE_HIGH_WATER: usize = 64;
+pub const BUFFER_THREAD_CACHE_HIGH_WATER: usize = 512;
 /// `in_use` is folded from the lazy `in_use_delta` counter once its absolute
 /// value exceeds this threshold or when the count is read.
 pub const BUFFER_IN_USE_FOLD_THRESHOLD: i32 = 64;
@@ -47,8 +53,8 @@ pub union PrimaryOpaque {
     bytes: [u8; 40],
 }
 
-pub const PRIMARY_OPAQUE_BYTES: usize = core::mem::size_of::<PrimaryOpaque>();
-pub const PRIMARY_OPAQUE_ALIGN: usize = core::mem::align_of::<PrimaryOpaque>();
+pub const PRIMARY_OPAQUE_BYTES: usize = mem::size_of::<PrimaryOpaque>();
+pub const PRIMARY_OPAQUE_ALIGN: usize = mem::align_of::<PrimaryOpaque>();
 
 impl PrimaryOpaque {
     #[inline]
@@ -107,6 +113,10 @@ impl fmt::Debug for SecondaryOpaque {
 pub struct BufferFlags(u32);
 
 impl BufferFlags {
+    const PUBLIC_MASK: u32 = (1 << 4) - 1;
+    const PRIVATE_CAPACITY_SHIFT: u32 = 4;
+    const PRIVATE_CAPACITY_MASK: u32 = !Self::PUBLIC_MASK;
+
     pub const NEXT_PRESENT: Self = Self(1 << 0);
     pub const TOTAL_LENGTH_VALID: Self = Self(1 << 1);
     pub const TRACED: Self = Self(1 << 2);
@@ -124,27 +134,51 @@ impl BufferFlags {
 
     #[inline]
     pub const fn bits(self) -> u32 {
-        self.0
+        self.0 & Self::PUBLIC_MASK
     }
 
     #[inline]
     pub const fn from_bits(bits: u32) -> Self {
-        Self(bits)
+        Self(bits & Self::PUBLIC_MASK)
     }
 
     #[inline]
     pub const fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
+        self.bits() & other.bits() == other.bits()
     }
 
     #[inline]
     pub fn insert(&mut self, other: Self) {
-        self.0 |= other.0;
+        self.0 = (self.0 & Self::PRIVATE_CAPACITY_MASK) | (self.bits() | other.bits());
     }
 
     #[inline]
     pub fn remove(&mut self, other: Self) {
-        self.0 &= !other.0;
+        self.0 = (self.0 & Self::PRIVATE_CAPACITY_MASK) | (self.bits() & !other.bits());
+    }
+
+    #[inline]
+    const fn with_private_data_capacity(self, data_capacity: usize) -> Self {
+        let max_capacity = Self::max_private_data_capacity();
+        let capped = if data_capacity > max_capacity {
+            max_capacity
+        } else {
+            data_capacity
+        };
+        Self(
+            self.bits()
+                | ((capped as u32) << Self::PRIVATE_CAPACITY_SHIFT),
+        )
+    }
+
+    #[inline]
+    const fn private_data_capacity(self) -> usize {
+        ((self.0 & Self::PRIVATE_CAPACITY_MASK) >> Self::PRIVATE_CAPACITY_SHIFT) as usize
+    }
+
+    #[inline]
+    const fn max_private_data_capacity() -> usize {
+        (u32::MAX >> Self::PRIVATE_CAPACITY_SHIFT) as usize
     }
 }
 
@@ -351,65 +385,56 @@ impl BufferNodeError {
 pub struct Buffer {
     cacheline0: BufferHeaderCacheline0,
     cacheline1: BufferHeaderCacheline1,
-    storage: Slice<u8>,
 }
 
-const _: () = assert!(std::mem::align_of::<Buffer>() == BUFFER_CACHE_LINE_SIZE);
+const _: () = assert!(mem::align_of::<Buffer>() == BUFFER_CACHE_LINE_SIZE);
+const _: () = assert!(mem::size_of::<Buffer>() == BUFFER_CACHE_LINE_SIZE * 2);
+
+#[inline]
+pub const fn buffer_data_offset() -> usize {
+    mem::size_of::<Buffer>() + DEFAULT_PRE_DATA_SIZE
+}
 
 impl Buffer {
     #[inline]
-    fn with_slot_capacity(slot_capacity: usize) -> Self {
-        let storage = Slice::from_elem(slot_capacity, 0);
-        let mut cacheline0 = BufferHeaderCacheline0::default();
-        cacheline0.flags.insert(BufferFlags::SLOT_CLEAN);
-        Self {
-            cacheline0,
-            cacheline1: BufferHeaderCacheline1::default(),
-            storage,
-        }
-    }
-
-    #[inline]
-    fn reset(&mut self, bytes: &[u8]) -> CoreResult<()> {
-        if bytes.len() > self.storage.len() {
+    fn reset(&mut self, data_size: usize, bytes: &[u8]) -> CoreResult<()> {
+        if bytes.len() > data_size {
             return Err(CoreError::internal(format!(
                 "buffer bytes exceed slot capacity: {} > {}",
                 bytes.len(),
-                self.storage.len()
+                data_size
             )));
         }
-        let headroom = 0usize;
         let current_len = u16::try_from(bytes.len())
             .map_err(|_| CoreError::internal("buffer length exceeds u16"))?;
         self.cacheline0 = BufferHeaderCacheline0::default();
-        self.cacheline0.current_data = i16::try_from(headroom)
-            .map_err(|_| CoreError::internal("buffer current_data exceeds i16"))?;
+        self.cacheline0.current_data = 0;
         self.cacheline0.current_length = current_len;
         self.cacheline0.ref_count = 1;
+        self.set_data_capacity(data_size);
         self.cacheline0.flags.insert(BufferFlags::SLOT_CLEAN);
         self.cacheline1 = BufferHeaderCacheline1::default();
-        let start = headroom;
-        let end = start + bytes.len();
-        self.storage.as_mut_slice()[start..end].copy_from_slice(bytes);
+        self.data_region_mut(data_size)[..bytes.len()].copy_from_slice(bytes);
         Ok(())
     }
 
     #[inline]
-    fn reset_for_free(&mut self) {
+    fn reset_for_free(&mut self, data_size: usize) {
         self.cacheline0 = BufferHeaderCacheline0::default();
+        self.set_data_capacity(data_size);
         self.cacheline0.flags.insert(BufferFlags::SLOT_CLEAN);
         self.cacheline1 = BufferHeaderCacheline1::default();
     }
 
     #[inline]
-    fn reset_empty(&mut self, headroom: usize) -> CoreResult<()> {
-        if headroom > self.storage.len() {
+    fn reset_empty(&mut self, data_size: usize, headroom: usize) -> CoreResult<()> {
+        if headroom > data_size {
             return Err(CoreError::internal("buffer headroom exceeds slot capacity"));
         }
         self.cacheline0 = BufferHeaderCacheline0::default();
-        self.cacheline0.current_data = i16::try_from(headroom)
-            .map_err(|_| CoreError::internal("buffer current_data exceeds i16"))?;
+        self.set_current_data_offset(isize::try_from(headroom).expect("headroom fits isize"))?;
         self.cacheline0.ref_count = 1;
+        self.set_data_capacity(data_size);
         self.cacheline0.flags.insert(BufferFlags::SLOT_CLEAN);
         self.cacheline1 = BufferHeaderCacheline1::default();
         Ok(())
@@ -420,14 +445,18 @@ impl Buffer {
     /// already zeroed from the previous free. Returns the headroom/length pair
     /// the alloc fast path needs.
     #[inline]
-    fn reset_empty_fast(&mut self, headroom: usize) -> CoreResult<()> {
-        if headroom > self.storage.len() {
+    fn reset_empty_fast(
+        &mut self,
+        data_size: usize,
+        headroom: usize,
+    ) -> CoreResult<()> {
+        if headroom > data_size {
             return Err(CoreError::internal("buffer headroom exceeds slot capacity"));
         }
         self.cacheline0 = BufferHeaderCacheline0::default();
-        self.cacheline0.current_data = i16::try_from(headroom)
-            .map_err(|_| CoreError::internal("buffer current_data exceeds i16"))?;
+        self.set_current_data_offset(isize::try_from(headroom).expect("headroom fits isize"))?;
         self.cacheline0.ref_count = 1;
+        self.set_data_capacity(data_size);
         self.cacheline0.flags.insert(BufferFlags::SLOT_CLEAN);
         Ok(())
     }
@@ -436,8 +465,9 @@ impl Buffer {
     /// SLOT_CLEAN set); cacheline1 is left untouched because it is already
     /// zeroed when SLOT_CLEAN was set on the slot.
     #[inline]
-    fn reset_for_free_fast(&mut self) {
+    fn reset_for_free_fast(&mut self, data_size: usize) {
         self.cacheline0 = BufferHeaderCacheline0::default();
+        self.set_data_capacity(data_size);
         self.cacheline0.flags.insert(BufferFlags::SLOT_CLEAN);
     }
 
@@ -516,13 +546,17 @@ impl Buffer {
 
     #[inline]
     pub fn flags(&self) -> BufferFlags {
-        self.cacheline0.flags
+        BufferFlags::from_bits(self.cacheline0.flags.bits())
+    }
+
+    #[inline]
+    pub fn current_data_offset(&self) -> i16 {
+        self.cacheline0.current_data
     }
 
     #[inline]
     pub fn current_data(&self) -> usize {
-        usize::try_from(self.cacheline0.current_data)
-            .expect("buffer current_data must remain non-negative")
+        usize::try_from(self.current_data_offset()).unwrap_or(0)
     }
 
     #[inline]
@@ -549,32 +583,50 @@ impl Buffer {
 
     #[inline]
     pub fn current(&self) -> &[u8] {
-        let start = self.current_data();
-        let end = start + self.current_len();
-        &self.storage.as_slice()[start..end]
+        let len = self.current_len();
+        // SAFETY: `current_ptr` is computed from the inline slot backing owned
+        // by the arena, and `current_len` is maintained within slot bounds by
+        // the pool mutation paths.
+        unsafe { slice::from_raw_parts(self.current_ptr(), len) }
     }
 
     #[inline]
     pub fn current_ptr(&self) -> *const u8 {
-        self.current().as_ptr()
+        // SAFETY: the slot layout is `[Buffer][pre_data][data]`; the current
+        // window is always kept within that inline backing.
+        unsafe {
+            self.as_bytes_ptr()
+                .add(self.current_start_offset_from_header())
+        }
     }
 
     #[inline]
     pub fn current_mut(&mut self) -> &mut [u8] {
-        let start = self.current_data();
-        let end = start + self.current_len();
-        &mut self.storage.as_mut_slice()[start..end]
+        let len = self.current_len();
+        // SAFETY: see `current`; the mutable borrow of `self` guarantees unique
+        // access to the current window.
+        unsafe {
+            slice::from_raw_parts_mut(
+                self.as_mut_bytes_ptr()
+                    .add(self.current_start_offset_from_header()),
+                len,
+            )
+        }
     }
 
     #[inline]
     pub fn writable_tail_mut(&mut self) -> &mut [u8] {
-        let start = self.current_data() + self.current_len();
-        &mut self.storage.as_mut_slice()[start..]
+        let data_size = self.data_capacity();
+        let start = self.current_end_offset_from_header();
+        let len = self.available_tail_with_data_size(data_size);
+        let writable_start = mem::size_of::<Buffer>();
+        let offset = start - writable_start;
+        &mut self.slot_writable_region_mut(data_size)[offset..offset + len]
     }
 
     #[inline]
     pub fn commit_writable_tail(&mut self, len: usize) -> CoreResult<()> {
-        if len > self.available_tail() {
+        if len > self.available_tail_with_data_size(self.data_capacity()) {
             return Err(CoreError::internal("buffer commit exceeds writable tail"));
         }
         self.set_current_len(self.current_len() + len)?;
@@ -598,10 +650,12 @@ impl Buffer {
         }
         if displacement < 0 {
             let rewind = displacement.unsigned_abs();
-            if rewind > self.current_data() {
+            if rewind > self.available_headroom() {
                 return Err(CoreError::internal("buffer rewind exceeds headroom"));
             }
-            self.set_current_data(self.current_data() - rewind)?;
+            let new_offset = isize::from(self.current_data_offset())
+                - isize::try_from(rewind).expect("rewind fits isize");
+            self.set_current_data_offset(new_offset)?;
             self.set_current_len(self.current_len() + rewind)?;
             return Ok(());
         }
@@ -611,13 +665,20 @@ impl Buffer {
         if len > self.current_len() {
             return Err(CoreError::internal("buffer advance exceeds current length"));
         }
-        self.set_current_data(self.current_data() + len)?;
+        let new_offset =
+            isize::from(self.current_data_offset()) + isize::try_from(len).expect("len fits isize");
+        self.set_current_data_offset(new_offset)?;
         self.set_current_len(self.current_len() - len)
     }
 
     #[inline]
     pub fn current_mut_ptr(&mut self) -> *mut u8 {
-        self.current_mut().as_mut_ptr()
+        // SAFETY: the slot layout is `[Buffer][pre_data][data]`; the current
+        // window is always kept within that inline backing.
+        unsafe {
+            self.as_mut_bytes_ptr()
+                .add(self.current_start_offset_from_header())
+        }
     }
 
     #[inline]
@@ -628,40 +689,59 @@ impl Buffer {
 
     #[inline]
     pub fn prepend_mut(&mut self, len: usize) -> CoreResult<&mut [u8]> {
-        let current_data = self.current_data();
-        if len > current_data {
+        if len > self.available_headroom() {
             return Err(CoreError::internal("buffer prepend exceeds headroom"));
         }
-        let start = current_data - len;
-        self.set_current_data(start)?;
+        let current_start = self.current_start_offset_from_header();
+        let start = current_start - len;
+        let offset_from_data = isize::try_from(start).expect("slot offset fits isize")
+            - isize::try_from(buffer_data_offset()).expect("buffer data offset fits isize");
+        self.set_current_data_offset(offset_from_data)?;
         self.set_current_len(self.current_len() + len)?;
-        Ok(&mut self.storage.as_mut_slice()[start..current_data])
+        // SAFETY: `start..current_start` lies within the inline pre_data/data
+        // range and the mutable borrow of `self` guarantees uniqueness.
+        unsafe {
+            Ok(slice::from_raw_parts_mut(
+                self.as_mut_bytes_ptr().add(start),
+                len,
+            ))
+        }
     }
 
     #[inline]
-    fn available_tail(&self) -> usize {
-        self.storage
+    fn available_tail_with_data_size(&self, data_size: usize) -> usize {
+        self.data_end_offset_from_header(data_size)
+            .saturating_sub(self.current_end_offset_from_header())
+    }
+
+    #[inline]
+    fn append_in_place(&mut self, data_size: usize, bytes: &[u8]) -> usize {
+        let take = bytes
             .len()
-            .saturating_sub(self.current_data() + self.current_len())
-    }
-
-    #[inline]
-    fn append_in_place(&mut self, bytes: &[u8]) -> usize {
-        let take = bytes.len().min(self.available_tail());
+            .min(self.available_tail_with_data_size(data_size));
         if take == 0 {
             return 0;
         }
-        let start = self.current_data() + self.current_len();
+        let start = self.current_end_offset_from_header();
         let end = start + take;
-        self.storage.as_mut_slice()[start..end].copy_from_slice(&bytes[..take]);
+        let writable_start = mem::size_of::<Buffer>();
+        self.slot_writable_region_mut(data_size)[start - writable_start..end - writable_start]
+            .copy_from_slice(&bytes[..take]);
         self.set_current_len(self.current_len() + take)
             .expect("buffer append keeps current length within u16");
         take
     }
 
     #[inline]
-    fn set_current_data(&mut self, len: usize) -> CoreResult<()> {
-        self.cacheline0.current_data = i16::try_from(len)
+    fn set_current_data_offset(&mut self, offset: isize) -> CoreResult<()> {
+        let lower_bound =
+            -isize::try_from(DEFAULT_PRE_DATA_SIZE).expect("default pre-data size fits isize");
+        if offset < lower_bound {
+            return Err(CoreError::internal(
+                "buffer current_data exceeds pre-data headroom",
+            ));
+        }
+        self.cacheline0.current_data = i16::try_from(offset)
             .map_err(|_| CoreError::internal("buffer current_data exceeds i16"))?;
         Ok(())
     }
@@ -671,6 +751,16 @@ impl Buffer {
         self.cacheline0.current_length = u16::try_from(len)
             .map_err(|_| CoreError::internal("buffer current_length exceeds u16"))?;
         Ok(())
+    }
+
+    #[inline]
+    fn set_data_capacity(&mut self, data_size: usize) {
+        self.cacheline0.flags = self.cacheline0.flags.with_private_data_capacity(data_size);
+    }
+
+    #[inline]
+    fn data_capacity(&self) -> usize {
+        self.cacheline0.flags.private_data_capacity()
     }
 
     #[inline]
@@ -690,23 +780,126 @@ impl Buffer {
             .map_err(|_| CoreError::internal("buffer chain tail length exceeds u32"))?;
         Ok(())
     }
+
+    #[inline]
+    fn as_bytes_ptr(&self) -> *const u8 {
+        ptr::from_ref(self).cast::<u8>()
+    }
+
+    #[inline]
+    fn as_mut_bytes_ptr(&mut self) -> *mut u8 {
+        ptr::from_mut(self).cast::<u8>()
+    }
+
+    #[inline]
+    fn current_start_offset_from_header(&self) -> usize {
+        let offset = isize::try_from(buffer_data_offset()).expect("buffer data offset fits isize")
+            + isize::from(self.current_data_offset());
+        usize::try_from(offset).expect("buffer current start underflowed header")
+    }
+
+    #[inline]
+    fn current_end_offset_from_header(&self) -> usize {
+        self.current_start_offset_from_header() + self.current_len()
+    }
+
+    #[inline]
+    fn data_end_offset_from_header(&self, data_size: usize) -> usize {
+        buffer_data_offset() + data_size
+    }
+
+    #[inline]
+    fn slot_writable_end_offset_from_header(&self, data_size: usize) -> usize {
+        mem::size_of::<Buffer>() + DEFAULT_PRE_DATA_SIZE + data_size
+    }
+
+    #[inline]
+    fn available_headroom(&self) -> usize {
+        self.current_start_offset_from_header()
+            .saturating_sub(mem::size_of::<Buffer>())
+    }
+
+    #[inline]
+    fn data_region_mut(&mut self, data_size: usize) -> &mut [u8] {
+        // SAFETY: the inline data region begins at `buffer_data_offset()` and
+        // spans exactly `data_size` bytes in the owning arena slot.
+        unsafe {
+            slice::from_raw_parts_mut(self.as_mut_bytes_ptr().add(buffer_data_offset()), data_size)
+        }
+    }
+
+    #[inline]
+    fn slot_writable_region_mut(&mut self, data_size: usize) -> &mut [u8] {
+        // SAFETY: the writable inline slot backing begins immediately after the
+        // header and spans the full `[pre_data][data]` capacity for the slot.
+        unsafe {
+            slice::from_raw_parts_mut(
+                self.as_mut_bytes_ptr().add(mem::size_of::<Buffer>()),
+                self.slot_writable_end_offset_from_header(data_size) - mem::size_of::<Buffer>(),
+            )
+        }
+    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default, Clone, Copy)]
 struct BufferSlot {
     generation: u32,
     allocated: bool,
-    buffer: Buffer,
 }
 
-#[derive(Debug)]
 struct BufferPoolInner {
     pool_id: u64,
     slot_capacity: usize,
-    slots: Vec<CachePadded<BufferSlot>>,
-    free: Vec<u32>,
+    slot_stride: usize,
+    region: Arc<Heap>,
+    region_base: NonNull<u8>,
+    region_layout: Layout,
+    region_size: usize,
+    metadata_heap: Arc<Heap>,
+    metadata_base: NonNull<u8>,
+    metadata_layout: Layout,
+    slot_states: NonNull<BufferSlot>,
+    available_stack: NonNull<u32>,
+    available_len: usize,
+    total_slots: usize,
     in_use: usize,
     in_use_delta: i32,
+}
+
+impl fmt::Debug for BufferPoolInner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BufferPoolInner")
+            .field("pool_id", &self.pool_id)
+            .field("slot_capacity", &self.slot_capacity)
+            .field("slot_stride", &self.slot_stride)
+            .field("region_base", &self.region_base)
+            .field("region_size", &self.region_size)
+            .field("metadata_base", &self.metadata_base)
+            .field("available_len", &self.available_len)
+            .field("total_slots", &self.total_slots)
+            .field("in_use", &self.in_use)
+            .field("in_use_delta", &self.in_use_delta)
+            .finish()
+    }
+}
+
+impl Drop for BufferPoolInner {
+    fn drop(&mut self) {
+        // SAFETY: `region_base` came from `self.region.alloc(self.region_layout)`
+        // during arena construction and has not been deallocated yet.
+        unsafe {
+            GlobalAlloc::dealloc(&*self.region, self.region_base.as_ptr(), self.region_layout)
+        };
+        // SAFETY: `metadata_base` came from `self.metadata_heap.alloc` during
+        // arena construction and is paired with `metadata_layout`.
+        unsafe {
+            GlobalAlloc::dealloc(
+                &*self.metadata_heap,
+                self.metadata_base.as_ptr(),
+                self.metadata_layout,
+            )
+        };
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -716,20 +909,46 @@ pub struct BufferPoolArena {
 
 #[derive(Debug, Clone)]
 pub struct BufferThreadCache {
-    free: Vec<u32>,
+    cached_slots: [u32; BUFFER_THREAD_CACHE_HIGH_WATER],
+    len: usize,
 }
 
 impl BufferThreadCache {
     #[inline]
     fn new() -> Self {
         Self {
-            free: Vec::with_capacity(BUFFER_THREAD_CACHE_HIGH_WATER),
+            cached_slots: [0; BUFFER_THREAD_CACHE_HIGH_WATER],
+            len: 0,
         }
     }
 
     #[inline]
     pub fn cached_free_len(&self) -> usize {
-        self.free.len()
+        self.len
+    }
+
+    #[inline]
+    fn push(&mut self, slot: u32) {
+        debug_assert!(self.len < BUFFER_THREAD_CACHE_HIGH_WATER);
+        self.cached_slots[self.len] = slot;
+        self.len += 1;
+    }
+
+    #[inline]
+    fn pop(&mut self) -> Option<u32> {
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        Some(self.cached_slots[self.len])
+    }
+
+    #[inline]
+    fn last(&self) -> Option<u32> {
+        if self.len == 0 {
+            return None;
+        }
+        Some(self.cached_slots[self.len - 1])
     }
 }
 
@@ -750,7 +969,7 @@ struct FrameSlot {
 struct FramePoolInner {
     pool_id: u64,
     slots: Vec<FrameSlot>,
-    free: Vec<u32>,
+    available: Vec<u32>,
     in_use: usize,
 }
 
@@ -1739,25 +1958,78 @@ impl DataPlaneRuntime {
 impl BufferPoolArena {
     #[inline]
     pub fn with_capacity(slot_capacity: usize, slots: usize) -> Self {
-        let free = (0..slots)
-            .rev()
-            .map(|slot| u32::try_from(slot).expect("buffer slot index fits u32"))
-            .collect();
-        let slots = (0..slots)
-            .map(|_| {
-                CachePadded::new(BufferSlot {
-                    generation: 0,
-                    allocated: false,
-                    buffer: Buffer::with_slot_capacity(slot_capacity),
-                })
-            })
-            .collect();
+        Self::with_capacity_in(slot_capacity, slots, Arc::new(Heap::local(0)))
+    }
+
+    #[inline]
+    pub fn with_capacity_in(slot_capacity: usize, slots: usize, heap: Arc<Heap>) -> Self {
+        assert!(slot_capacity > 0, "buffer slot capacity must be non-zero");
+        assert!(slots > 0, "buffer pool must contain at least one usable slot");
+
+        let total_slots = slots
+            .checked_add(1)
+            .expect("buffer arena slot count overflow");
+        let slot_stride = align_up(
+            buffer_data_offset()
+                .checked_add(slot_capacity)
+                .expect("buffer slot size overflow"),
+            BUFFER_CACHE_LINE_SIZE,
+        );
+        let region_size = slot_stride
+            .checked_mul(total_slots)
+            .expect("buffer arena size overflow");
+        let region_layout = Layout::from_size_align(region_size, BUFFER_CACHE_LINE_SIZE)
+            .expect("buffer arena layout");
+        let region_base = heap
+            .alloc(region_layout)
+            .expect("buffer arena heap allocation");
+        unsafe {
+            ptr::write_bytes(region_base.as_ptr(), 0, region_layout.size());
+        }
+
+        let slot_state_bytes = mem::size_of::<BufferSlot>()
+            .checked_mul(total_slots)
+            .expect("buffer metadata slot state overflow");
+        let available_bytes = mem::size_of::<u32>()
+            .checked_mul(slots)
+            .expect("buffer metadata availability overflow");
+        let available_offset = align_up(slot_state_bytes, mem::align_of::<u32>());
+        let metadata_size = available_offset
+            .checked_add(available_bytes)
+            .expect("buffer metadata size overflow");
+        let metadata_layout = Layout::from_size_align(metadata_size, BUFFER_CACHE_LINE_SIZE)
+            .expect("buffer metadata layout");
+        let metadata_base = heap
+            .alloc(metadata_layout)
+            .expect("buffer metadata heap allocation");
+        unsafe {
+            ptr::write_bytes(metadata_base.as_ptr(), 0, metadata_layout.size());
+        }
+        let slot_states = metadata_base.cast::<BufferSlot>();
+        let available_stack = unsafe {
+            NonNull::new_unchecked(metadata_base.as_ptr().add(available_offset).cast::<u32>())
+        };
+        for i in 0..slots {
+            let slot = u32::try_from(total_slots - i - 1).expect("buffer slot fits u32");
+            unsafe { available_stack.as_ptr().add(i).write(slot) };
+        }
+
         Self {
             inner: Rc::new(RefCell::new(BufferPoolInner {
                 pool_id: next_buffer_pool_id(),
                 slot_capacity,
-                slots,
-                free,
+                slot_stride,
+                region: Arc::clone(&heap),
+                region_base,
+                region_layout,
+                region_size,
+                metadata_heap: heap,
+                metadata_base,
+                metadata_layout,
+                slot_states,
+                available_stack,
+                available_len: slots,
+                total_slots,
                 in_use: 0,
                 in_use_delta: 0,
             })),
@@ -1792,6 +2064,36 @@ impl BufferPool {
     #[inline]
     pub fn pool_id(&self) -> u64 {
         self.arena.pool_id()
+    }
+
+    #[inline]
+    pub fn slot_stride(&self) -> usize {
+        self.arena.inner.borrow().slot_stride
+    }
+
+    #[inline]
+    pub fn base_ptr(&self) -> *const u8 {
+        self.arena.inner.borrow().region_base.as_ptr()
+    }
+
+    #[inline]
+    pub fn buffer_raw_ptr(&self, slot: u32) -> *const Buffer {
+        self.arena
+            .inner
+            .borrow()
+            .buffer_raw_ptr(slot)
+            .expect("buffer slot must be in bounds")
+            .cast_const()
+    }
+
+    #[inline]
+    pub fn data_raw_ptr(&self, slot: u32) -> *const u8 {
+        self.arena
+            .inner
+            .borrow()
+            .data_raw_ptr(slot)
+            .expect("buffer slot must be in bounds")
+            .cast_const()
     }
 
     #[inline]
@@ -2027,7 +2329,7 @@ impl BufferPool {
 impl FramePool {
     #[inline]
     pub fn with_capacity(frame_capacity: usize, slots: usize) -> Self {
-        let free = (0..slots)
+        let available = (0..slots)
             .rev()
             .map(|slot| u32::try_from(slot).expect("frame slot index fits u32"))
             .collect();
@@ -2042,7 +2344,7 @@ impl FramePool {
             inner: Rc::new(RefCell::new(FramePoolInner {
                 pool_id: next_frame_pool_id(),
                 slots,
-                free,
+                available,
                 in_use: 0,
             })),
         }
@@ -2132,7 +2434,7 @@ impl FramePoolInner {
     #[inline]
     fn alloc_index(&mut self) -> CoreResult<FrameIndex> {
         let slot = self
-            .free
+            .available
             .pop()
             .ok_or_else(|| CoreError::internal("frame pool exhausted"))?;
         let entry = self
@@ -2236,7 +2538,7 @@ impl FramePoolInner {
         }
         entry.allocated = false;
         self.in_use = self.in_use.saturating_sub(1);
-        self.free.push(index.slot);
+        self.available.push(index.slot);
         Ok(())
     }
 
@@ -2263,7 +2565,7 @@ impl FramePoolInner {
         entry.frame = Some(frame);
         entry.allocated = false;
         self.in_use = self.in_use.saturating_sub(1);
-        self.free.push(index.slot);
+        self.available.push(index.slot);
         Ok(())
     }
 
@@ -2311,6 +2613,100 @@ impl DerefMut for PooledBufferFrame {
 
 impl BufferPoolInner {
     #[inline]
+    fn slot_index(&self, slot: u32) -> CoreResult<usize> {
+        let slot = usize::try_from(slot).expect("buffer slot index fits usize");
+        if slot >= self.total_slots {
+            return Err(CoreError::internal("buffer slot out of bounds"));
+        }
+        Ok(slot)
+    }
+
+    #[inline]
+    fn slot_offset(&self, slot: u32) -> CoreResult<usize> {
+        let slot = self.slot_index(slot)?;
+        slot.checked_mul(self.slot_stride)
+            .ok_or_else(|| CoreError::internal("buffer slot offset overflow"))
+    }
+
+    #[inline]
+    fn slot_state(&self, slot: u32) -> CoreResult<&BufferSlot> {
+        let slot = self.slot_index(slot)?;
+        // SAFETY: `slot_states` points to `total_slots` contiguous `BufferSlot`
+        // records allocated during arena construction.
+        Ok(unsafe { &*self.slot_states.as_ptr().add(slot) })
+    }
+
+    #[inline]
+    fn slot_state_mut(&mut self, slot: u32) -> CoreResult<&mut BufferSlot> {
+        let slot = self.slot_index(slot)?;
+        // SAFETY: the mutable borrow of `self` guarantees unique access to the
+        // raw metadata block.
+        Ok(unsafe { &mut *self.slot_states.as_ptr().add(slot) })
+    }
+
+    #[inline]
+    fn pop_available_slot(&mut self) -> Option<u32> {
+        if self.available_len == 0 {
+            return None;
+        }
+        self.available_len -= 1;
+        // SAFETY: `available_len` always tracks initialized stack entries in
+        // `available_stack`.
+        Some(unsafe { self.available_stack.as_ptr().add(self.available_len).read() })
+    }
+
+    #[inline]
+    fn push_available_slot(&mut self, slot: u32) {
+        debug_assert_ne!(slot, 0);
+        debug_assert!(self.available_len < self.total_slots - 1);
+        // SAFETY: `available_len < total_slots - 1` and slot 0 is never
+        // inserted, so the raw availability stack has spare initialized
+        // capacity.
+        unsafe {
+            self.available_stack
+                .as_ptr()
+                .add(self.available_len)
+                .write(slot);
+        }
+        self.available_len += 1;
+    }
+
+    #[inline]
+    fn buffer_raw_ptr(&self, slot: u32) -> CoreResult<*mut Buffer> {
+        let offset = self.slot_offset(slot)?;
+        // SAFETY: `offset` is validated to land within the arena region and
+        // each slot begins with an inline `Buffer` header.
+        Ok(unsafe { self.region_base.as_ptr().add(offset).cast::<Buffer>() })
+    }
+
+    #[inline]
+    fn data_raw_ptr(&self, slot: u32) -> CoreResult<*mut u8> {
+        let offset = self
+            .slot_offset(slot)?
+            .checked_add(buffer_data_offset())
+            .ok_or_else(|| CoreError::internal("buffer data pointer overflow"))?;
+        // SAFETY: `offset` points at the inline data block within the validated
+        // arena slot.
+        Ok(unsafe { self.region_base.as_ptr().add(offset) })
+    }
+
+    #[inline]
+    fn buffer_at_slot(&self, slot: u32) -> CoreResult<&Buffer> {
+        let ptr = self.buffer_raw_ptr(slot)?;
+        // SAFETY: the slot layout guarantees that `ptr` addresses a live inline
+        // `Buffer` header for the lifetime of `&self`.
+        Ok(unsafe { &*ptr })
+    }
+
+    #[inline]
+    fn buffer_at_slot_mut(&mut self, slot: u32) -> CoreResult<&mut Buffer> {
+        let ptr = self.buffer_raw_ptr(slot)?;
+        // SAFETY: the mutable borrow of `self` guarantees unique access to the
+        // slot's inline `Buffer` header.
+        Ok(unsafe { &mut *ptr })
+    }
+
+    #[inline]
     fn index_from_slot(&self, slot: u32) -> Option<BufferIndex> {
         Some(BufferIndex {
             pool_id: self.pool_id,
@@ -2321,11 +2717,7 @@ impl BufferPoolInner {
 
     #[inline]
     fn next_buffer_generation(&self, slot: u32) -> Option<u32> {
-        let slot = slot as usize;
-        if slot >= self.slots.len() {
-            return None;
-        }
-        let entry = &self.slots[slot];
+        let entry = self.slot_state(slot).ok()?;
         entry.allocated.then_some(entry.generation)
     }
 
@@ -2346,12 +2738,14 @@ impl BufferPoolInner {
         if displacement < 0 {
             let rewind = displacement.unsigned_abs();
             let buffer = self.buffer(index)?;
-            if rewind > buffer.current_data() {
+            if rewind > buffer.available_headroom() {
                 return Err(CoreError::internal("buffer rewind exceeds headroom"));
             }
             self.ensure_header_exclusive(index)?;
             let buffer = self.buffer_mut(index)?;
-            buffer.set_current_data(buffer.current_data() - rewind)?;
+            let new_offset = isize::from(buffer.current_data_offset())
+                - isize::try_from(rewind).expect("rewind fits isize");
+            buffer.set_current_data_offset(new_offset)?;
             buffer.set_current_len(buffer.current_len() + rewind)?;
             return Ok(());
         }
@@ -2366,7 +2760,9 @@ impl BufferPoolInner {
             }
             self.ensure_header_exclusive(index)?;
             let buffer = self.buffer_mut(index)?;
-            buffer.set_current_data(buffer.current_data() + len)?;
+            let new_offset = isize::from(buffer.current_data_offset())
+                + isize::try_from(len).expect("len fits isize");
+            buffer.set_current_data_offset(new_offset)?;
             buffer.set_current_len(buffer.current_len() - len)?;
             return Ok(());
         }
@@ -2402,7 +2798,9 @@ impl BufferPoolInner {
         for current_index in touched.iter().copied() {
             let buffer = self.buffer_mut(current_index)?;
             let consume = remaining.min(buffer.current_len());
-            buffer.set_current_data(buffer.current_data() + consume)?;
+            let new_offset = isize::from(buffer.current_data_offset())
+                + isize::try_from(consume).expect("consume fits isize");
+            buffer.set_current_data_offset(new_offset)?;
             buffer.set_current_len(buffer.current_len() - consume)?;
             remaining -= consume;
             if remaining == 0 {
@@ -2461,8 +2859,7 @@ impl BufferPoolInner {
         if self.slot_capacity == 0 {
             return Err(CoreError::internal("buffer slot capacity must be nonzero"));
         }
-        let headroom = DEFAULT_PACKET_HEADROOM.min(self.slot_capacity);
-        self.alloc_slot_empty_fast(cache, headroom)
+        self.alloc_slot_empty_fast(cache, 0)
     }
 
     #[inline]
@@ -2478,39 +2875,44 @@ impl BufferPoolInner {
                 self.slot_capacity
             )));
         }
-        self.alloc_slot_with(cache, |buffer| buffer.reset(bytes))
+        self.alloc_slot_with(cache, |buffer, data_size| buffer.reset(data_size, bytes))
     }
 
     #[inline]
     fn alloc_slot_with(
         &mut self,
         cache: &mut BufferThreadCache,
-        reset: impl FnOnce(&mut Buffer) -> CoreResult<()>,
+        reset: impl FnOnce(&mut Buffer, usize) -> CoreResult<()>,
     ) -> CoreResult<BufferIndex> {
-        let slot = match cache.free.pop() {
+        let slot = match cache.pop() {
             Some(slot) => slot,
             None => {
                 self.refill_cache_batch(cache);
                 cache
-                    .free
                     .pop()
                     .ok_or_else(|| CoreError::internal("buffer pool exhausted"))?
             }
         };
         let generation = {
-            let entry = self
-                .slots
-                .get_mut(slot as usize)
-                .ok_or_else(|| CoreError::internal("buffer slot out of bounds"))?;
+            let entry = self.slot_state_mut(slot)?;
             entry.generation = entry.generation.wrapping_add(1).max(1);
-            if let Err(error) = reset(&mut entry.buffer) {
-                entry.allocated = false;
-                cache.free.push(slot);
-                return Err(error);
-            }
-            entry.allocated = true;
             entry.generation
         };
+        let reset_result = {
+            let data_size = self.slot_capacity;
+            let buffer = self.buffer_at_slot_mut(slot)?;
+            reset(buffer, data_size)
+        };
+        if let Err(error) = reset_result {
+            self.slot_state_mut(slot)
+                .expect("buffer slot metadata remains valid")
+                .allocated = false;
+            cache.push(slot);
+            return Err(error);
+        }
+        self.slot_state_mut(slot)
+            .expect("buffer slot metadata remains valid")
+            .allocated = true;
         self.bump_in_use();
         self.prefetch_next_cached_slot(cache);
         Ok(BufferIndex {
@@ -2529,40 +2931,44 @@ impl BufferPoolInner {
         cache: &mut BufferThreadCache,
         headroom: usize,
     ) -> CoreResult<BufferIndex> {
-        let slot = match cache.free.pop() {
+        let slot = match cache.pop() {
             Some(slot) => slot,
             None => {
                 self.refill_cache_batch(cache);
                 cache
-                    .free
                     .pop()
                     .ok_or_else(|| CoreError::internal("buffer pool exhausted"))?
             }
         };
         let generation = {
-            let entry = self
-                .slots
-                .get_mut(slot as usize)
-                .ok_or_else(|| CoreError::internal("buffer slot out of bounds"))?;
+            let entry = self.slot_state_mut(slot)?;
             entry.generation = entry.generation.wrapping_add(1).max(1);
-            let clean = entry
-                .buffer
-                .cacheline0
-                .flags
-                .contains(BufferFlags::SLOT_CLEAN);
-            let reset_result = if clean {
-                entry.buffer.reset_empty_fast(headroom)
-            } else {
-                entry.buffer.reset_empty(headroom)
-            };
-            if let Err(error) = reset_result {
-                entry.allocated = false;
-                cache.free.push(slot);
-                return Err(error);
-            }
-            entry.allocated = true;
             entry.generation
         };
+        let clean = self
+            .buffer_at_slot(slot)?
+            .cacheline0
+            .flags
+            .contains(BufferFlags::SLOT_CLEAN);
+        let reset_result = {
+            let data_size = self.slot_capacity;
+            let buffer = self.buffer_at_slot_mut(slot)?;
+            if clean {
+                buffer.reset_empty_fast(data_size, headroom)
+            } else {
+                buffer.reset_empty(data_size, headroom)
+            }
+        };
+        if let Err(error) = reset_result {
+            self.slot_state_mut(slot)
+                .expect("buffer slot metadata remains valid")
+                .allocated = false;
+            cache.push(slot);
+            return Err(error);
+        }
+        self.slot_state_mut(slot)
+            .expect("buffer slot metadata remains valid")
+            .allocated = true;
         self.bump_in_use();
         self.prefetch_next_cached_slot(cache);
         Ok(BufferIndex {
@@ -2583,33 +2989,29 @@ impl BufferPoolInner {
     #[inline]
     fn buffer(&self, index: BufferIndex) -> CoreResult<&Buffer> {
         self.validate_pool_index(index)?;
-        let entry = self
-            .slots
-            .get(index.slot as usize)
-            .ok_or_else(|| CoreError::internal("buffer slot out of bounds"))?;
+        let entry = self.slot_state(index.slot)?;
         if entry.generation != index.generation {
             return Err(CoreError::internal("stale buffer index"));
         }
         if !entry.allocated {
             return Err(CoreError::internal("buffer slot is free"));
         }
-        Ok(&entry.buffer)
+        self.buffer_at_slot(index.slot)
     }
 
     #[inline]
     fn buffer_mut(&mut self, index: BufferIndex) -> CoreResult<&mut Buffer> {
         self.validate_pool_index(index)?;
-        let entry = self
-            .slots
-            .get_mut(index.slot as usize)
-            .ok_or_else(|| CoreError::internal("buffer slot out of bounds"))?;
-        if entry.generation != index.generation {
-            return Err(CoreError::internal("stale buffer index"));
+        {
+            let entry = self.slot_state(index.slot)?;
+            if entry.generation != index.generation {
+                return Err(CoreError::internal("stale buffer index"));
+            }
+            if !entry.allocated {
+                return Err(CoreError::internal("buffer slot is free"));
+            }
         }
-        if !entry.allocated {
-            return Err(CoreError::internal("buffer slot is free"));
-        }
-        Ok(&mut entry.buffer)
+        self.buffer_at_slot_mut(index.slot)
     }
 
     #[inline]
@@ -2673,9 +3075,9 @@ impl BufferPoolInner {
             if index.pool_id != self.pool_id {
                 return;
             }
-            let slot = index.slot as usize;
+            let slot = index.slot;
             let (next_slot, ref_count, clean, trace_handle) = {
-                let Some(entry) = self.slots.get(slot) else {
+                let Ok(entry) = self.slot_state(slot) else {
                     return;
                 };
                 if entry.generation != index.generation {
@@ -2685,22 +3087,20 @@ impl BufferPoolInner {
                     next = None;
                     continue;
                 }
+                let Ok(buffer) = self.buffer_at_slot(index.slot) else {
+                    return;
+                };
                 (
-                    entry.buffer.next_buffer_slot(),
-                    entry.buffer.ref_count(),
-                    entry
-                        .buffer
-                        .cacheline0
-                        .flags
-                        .contains(BufferFlags::SLOT_CLEAN),
-                    entry.buffer.cacheline1.trace_handle,
+                    buffer.next_buffer_slot(),
+                    buffer.ref_count(),
+                    buffer.cacheline0.flags.contains(BufferFlags::SLOT_CLEAN),
+                    buffer.cacheline1.trace_handle,
                 )
             };
 
             if ref_count > 1 {
-                if let Some(entry) = self.slots.get_mut(slot) {
-                    entry.buffer.cacheline0.ref_count =
-                        entry.buffer.cacheline0.ref_count.saturating_sub(1);
+                if let Ok(buffer) = self.buffer_at_slot_mut(index.slot) {
+                    buffer.cacheline0.ref_count = buffer.cacheline0.ref_count.saturating_sub(1);
                 }
                 next = next_slot.and_then(|slot| self.index_from_slot(slot));
                 continue;
@@ -2710,9 +3110,17 @@ impl BufferPoolInner {
             // so no trace finalisation is needed and cacheline1 is already
             // zeroed, letting us skip the second cacheline write on free.
             if clean {
+                let slot_capacity = self.slot_capacity;
                 {
-                    let entry = self.slots.get_mut(slot).expect("buffer slot remains valid");
-                    entry.buffer.reset_for_free_fast();
+                    let buffer = self
+                        .buffer_at_slot_mut(index.slot)
+                        .expect("buffer slot remains valid");
+                    buffer.reset_for_free_fast(slot_capacity);
+                }
+                {
+                    let entry = self
+                        .slot_state_mut(slot)
+                        .expect("buffer slot metadata remains valid");
                     entry.allocated = false;
                 }
                 self.dec_in_use();
@@ -2728,11 +3136,19 @@ impl BufferPoolInner {
             if trace_handle != 0 {
                 release_trace(trace_handle);
             }
+            let slot_capacity = self.slot_capacity;
             {
-                let entry = self.slots.get_mut(slot).expect("buffer slot remains valid");
-                entry.buffer.cacheline1.trace_handle = 0;
+                let buffer = self
+                    .buffer_at_slot_mut(index.slot)
+                    .expect("buffer slot remains valid");
+                buffer.cacheline1.trace_handle = 0;
+                buffer.reset_for_free(slot_capacity);
+            }
+            {
+                let entry = self
+                    .slot_state_mut(slot)
+                    .expect("buffer slot metadata remains valid");
                 entry.allocated = false;
-                entry.buffer.reset_for_free();
             }
             self.dec_in_use();
             self.push_cache_slot(cache, index.slot);
@@ -2745,10 +3161,10 @@ impl BufferPoolInner {
     /// past its preallocated capacity.
     #[inline]
     fn push_cache_slot(&mut self, cache: &mut BufferThreadCache, slot: u32) {
-        if cache.free.len() >= BUFFER_THREAD_CACHE_HIGH_WATER {
+        if cache.len >= BUFFER_THREAD_CACHE_HIGH_WATER {
             self.return_cache_batch(cache);
         }
-        cache.free.push(slot);
+        cache.push(slot);
     }
 
     /// Move up to `BUFFER_THREAD_CACHE_BATCH` slots from the arena free list
@@ -2759,7 +3175,7 @@ impl BufferPoolInner {
     #[cold]
     #[inline(never)]
     fn refill_cache_batch(&mut self, cache: &mut BufferThreadCache) {
-        let arena_free = self.free.len();
+        let arena_free = self.available_len;
         if arena_free == 0 {
             return;
         }
@@ -2767,11 +3183,11 @@ impl BufferPoolInner {
         // more than half of what is currently free.
         let max_grab = BUFFER_THREAD_CACHE_BATCH.min(arena_free / 2 + arena_free % 2);
         let mut moved = 0usize;
-        while moved < max_grab && cache.free.len() < BUFFER_THREAD_CACHE_HIGH_WATER {
-            let Some(slot) = self.free.pop() else {
+        while moved < max_grab && cache.len < BUFFER_THREAD_CACHE_HIGH_WATER {
+            let Some(slot) = self.pop_available_slot() else {
                 break;
             };
-            cache.free.push(slot);
+            cache.push(slot);
             moved += 1;
         }
     }
@@ -2782,11 +3198,11 @@ impl BufferPoolInner {
     #[inline(never)]
     fn return_cache_batch(&mut self, cache: &mut BufferThreadCache) {
         let mut moved = 0usize;
-        while moved < BUFFER_THREAD_CACHE_BATCH && cache.free.len() > BUFFER_THREAD_CACHE_BATCH {
-            let Some(slot) = cache.free.pop() else {
+        while moved < BUFFER_THREAD_CACHE_BATCH && cache.len > BUFFER_THREAD_CACHE_BATCH {
+            let Some(slot) = cache.pop() else {
                 break;
             };
-            self.free.push(slot);
+            self.push_available_slot(slot);
             moved += 1;
         }
     }
@@ -2825,10 +3241,10 @@ impl BufferPoolInner {
     /// header lands in L2 (and is promoted to L1 by the time it is touched).
     #[inline]
     fn prefetch_next_cached_slot(&self, cache: &BufferThreadCache) {
-        if let Some(&next_slot) = cache.free.last()
-            && let Some(entry) = self.slots.get(next_slot as usize)
+        if let Some(next_slot) = cache.last()
+            && let Ok(buffer) = self.buffer_at_slot(next_slot)
         {
-            prefetch_read_l2(std::ptr::from_ref(&entry.buffer.cacheline0).cast::<u8>());
+            prefetch_read_l2(ptr::from_ref(&buffer.cacheline0).cast::<u8>());
         }
     }
 
@@ -2836,8 +3252,8 @@ impl BufferPoolInner {
     /// generation/ref_count reads hit a warm line.
     #[inline]
     fn prefetch_chain_next(&self, slot: u32) {
-        if let Some(entry) = self.slots.get(slot as usize) {
-            prefetch_read_l2(std::ptr::from_ref(&entry.buffer.cacheline0).cast::<u8>());
+        if let Ok(buffer) = self.buffer_at_slot(slot) {
+            prefetch_read_l2(ptr::from_ref(&buffer.cacheline0).cast::<u8>());
         }
     }
 
@@ -2895,12 +3311,13 @@ impl BufferPoolInner {
         }
         let appended_after_first = tail != index;
         let original_tail_len = self.buffer(index)?.total_len_not_including_first();
+        let slot_capacity = self.slot_capacity;
 
-        let taken = self.buffer_mut(tail)?.append_in_place(bytes);
+        let taken = self.buffer_mut(tail)?.append_in_place(slot_capacity, bytes);
         let mut added_tail_len = if appended_after_first { taken } else { 0 };
         let mut remaining = &bytes[taken..];
         while !remaining.is_empty() {
-            let take = remaining.len().min(self.slot_capacity);
+            let take = remaining.len().min(slot_capacity);
             let next = self.alloc_slot(cache, &remaining[..take])?;
             {
                 let tail_buffer = self.buffer_mut(tail)?;
@@ -2948,22 +3365,22 @@ impl BufferPoolInner {
 
 #[inline(always)]
 fn prefetch_buffer_header(buffer: &Buffer) {
-    prefetch_read_l1(std::ptr::from_ref(&buffer.cacheline0).cast::<u8>());
+    prefetch_read_l1(ptr::from_ref(&buffer.cacheline0).cast::<u8>());
 }
 
 #[inline(always)]
 fn prefetch_buffer_header_write(buffer: &Buffer) {
-    prefetch_write_l1(std::ptr::from_ref(&buffer.cacheline0).cast::<u8>());
+    prefetch_write_l1(ptr::from_ref(&buffer.cacheline0).cast::<u8>());
 }
 
 #[inline(always)]
 fn prefetch_buffer_cacheline1(buffer: &Buffer) {
-    prefetch_read_l1(std::ptr::from_ref(&buffer.cacheline1).cast::<u8>());
+    prefetch_read_l1(ptr::from_ref(&buffer.cacheline1).cast::<u8>());
 }
 
 #[inline(always)]
 fn prefetch_buffer_cacheline1_write(buffer: &Buffer) {
-    prefetch_write_l1(std::ptr::from_ref(&buffer.cacheline1).cast::<u8>());
+    prefetch_write_l1(ptr::from_ref(&buffer.cacheline1).cast::<u8>());
 }
 
 #[inline(always)]
@@ -3398,7 +3815,7 @@ impl BufferFrame {
     }
 
     #[inline]
-    pub fn iter_indices(&self) -> std::slice::Iter<'_, BufferIndex> {
+    pub fn iter_indices(&self) -> slice::Iter<'_, BufferIndex> {
         self.indices.iter()
     }
 
@@ -4326,8 +4743,9 @@ mod tests {
             .expect("rewind into headroom");
 
         let buffer = runtime.get_buffer(index).expect("buffer");
-        assert_eq!(buffer.current_len(), 4);
-        assert_eq!(buffer.total_len_not_including_first(), 5);
+        assert_eq!(buffer.current_data_offset(), -4);
+        assert_eq!(buffer.current_len(), 9);
+        assert_eq!(buffer.total_len_not_including_first(), 0);
         let packet = chain_bytes(runtime.buffers().buffers(), index).expect("packet");
         assert_eq!(packet.len(), 9);
         assert_eq!(&packet[4..], b"hello");
@@ -4346,13 +4764,9 @@ mod tests {
         // After a clean alloc the slot must be marked clean (cacheline1 zeroed).
         {
             let inner = pool.arena.inner.borrow();
-            let entry = inner.slots.get(index.slot() as usize).unwrap();
+            let buffer = inner.buffer_at_slot(index.slot()).unwrap();
             assert!(
-                entry
-                    .buffer
-                    .cacheline0
-                    .flags
-                    .contains(BufferFlags::SLOT_CLEAN),
+                buffer.cacheline0.flags.contains(BufferFlags::SLOT_CLEAN),
                 "alloc must mark slot clean"
             );
         }
@@ -4361,13 +4775,9 @@ mod tests {
         // alloc fast path can skip the cacheline1 reset.
         {
             let inner = pool.arena.inner.borrow();
-            let entry = inner.slots.get(index.slot() as usize).unwrap();
+            let buffer = inner.buffer_at_slot(index.slot()).unwrap();
             assert!(
-                entry
-                    .buffer
-                    .cacheline0
-                    .flags
-                    .contains(BufferFlags::SLOT_CLEAN),
+                buffer.cacheline0.flags.contains(BufferFlags::SLOT_CLEAN),
                 "free fast path must keep slot clean"
             );
         }
@@ -4380,30 +4790,22 @@ mod tests {
         // Mutating a cacheline1 field must drop the clean invariant.
         {
             let mut guard = pool.arena.inner.borrow_mut();
-            let entry = guard.slots.get_mut(index.slot() as usize).unwrap();
-            entry.buffer.set_total_len_not_including_first(7).unwrap();
+            let buffer = guard.buffer_at_slot_mut(index.slot()).unwrap();
+            buffer.set_total_len_not_including_first(7).unwrap();
             assert!(
-                !entry
-                    .buffer
-                    .cacheline0
-                    .flags
-                    .contains(BufferFlags::SLOT_CLEAN),
+                !buffer.cacheline0.flags.contains(BufferFlags::SLOT_CLEAN),
                 "cacheline1 mutator must clear SLOT_CLEAN"
             );
         }
         pool.free_index(index);
         // The free slow path must rebuild the clean invariant.
         let inner = pool.arena.inner.borrow();
-        let entry = inner.slots.get(index.slot() as usize).unwrap();
+        let buffer = inner.buffer_at_slot(index.slot()).unwrap();
         assert!(
-            entry
-                .buffer
-                .cacheline0
-                .flags
-                .contains(BufferFlags::SLOT_CLEAN),
+            buffer.cacheline0.flags.contains(BufferFlags::SLOT_CLEAN),
             "free slow path must restore SLOT_CLEAN"
         );
-        assert_eq!(entry.buffer.cacheline1.total_length_not_including_first, 0);
+        assert_eq!(buffer.cacheline1.total_length_not_including_first, 0);
     }
 
     #[test]
@@ -4412,15 +4814,9 @@ mod tests {
         let index = pool.alloc_index().expect("alloc");
         {
             let mut guard = pool.arena.inner.borrow_mut();
-            let entry = guard.slots.get_mut(index.slot() as usize).unwrap();
-            entry.buffer.set_trace_handle(42);
-            assert!(
-                !entry
-                    .buffer
-                    .cacheline0
-                    .flags
-                    .contains(BufferFlags::SLOT_CLEAN)
-            );
+            let buffer = guard.buffer_at_slot_mut(index.slot()).unwrap();
+            buffer.set_trace_handle(42);
+            assert!(!buffer.cacheline0.flags.contains(BufferFlags::SLOT_CLEAN));
         }
         pool.free_index(index);
     }
@@ -4482,8 +4878,21 @@ mod tests {
         // keeps the slot allocated (slow path).
         pool.free_index(head);
         let inner = pool.arena.inner.borrow();
-        let tail_entry = inner.slots.get(tail.slot() as usize).unwrap();
+        let tail_entry = inner.slot_state(tail.slot()).expect("tail slot state");
         assert!(tail_entry.allocated, "shared tail must remain allocated");
+    }
+
+    #[test]
+    fn current_data_reports_negative_offsets_without_panicking() {
+        let pool = fresh_pool(64, 4);
+        let index = pool.alloc_index().expect("alloc");
+        pool.append(index, b"hello").expect("append payload");
+        pool.advance(index, -4).expect("rewind into headroom");
+
+        let buffer = pool.get(index).expect("buffer");
+        assert_eq!(buffer.current_data_offset(), -4);
+        assert_eq!(buffer.current_data(), 0);
+        assert_eq!(pool.current_data(index).expect("pool current_data"), 0);
     }
 
     #[test]
@@ -4505,16 +4914,12 @@ mod tests {
             .alloc_index_with_bytes(b"payload")
             .expect("alloc with bytes");
         let inner = pool.arena.inner.borrow();
-        let entry = inner.slots.get(index.slot() as usize).unwrap();
+        let buffer = inner.buffer_at_slot(index.slot()).unwrap();
         assert!(
-            entry
-                .buffer
-                .cacheline0
-                .flags
-                .contains(BufferFlags::SLOT_CLEAN),
+            buffer.cacheline0.flags.contains(BufferFlags::SLOT_CLEAN),
             "reset(bytes) must set SLOT_CLEAN"
         );
-        assert_eq!(entry.buffer.current_len(), 7);
+        assert_eq!(buffer.current_len(), 7);
     }
 
     #[test]
@@ -4525,10 +4930,9 @@ mod tests {
     #[test]
     fn thread_cache_capacity_preallocated() {
         let cache = BufferThreadCache::new();
-        // The cache starts empty but preallocated to the high-water mark so
-        // release pushes never trigger a Vec grow on the hot path.
+        let _: &[u32; super::BUFFER_THREAD_CACHE_HIGH_WATER] = &cache.cached_slots;
         assert_eq!(cache.cached_free_len(), 0);
-        assert!(cache.free.capacity() >= super::BUFFER_THREAD_CACHE_HIGH_WATER);
+        assert_eq!(cache.len, 0);
     }
 
     #[test]

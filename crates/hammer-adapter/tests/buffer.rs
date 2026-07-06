@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::cell::RefMut;
 use std::mem::{align_of, size_of};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -188,6 +189,74 @@ fn runtime_get_buffer_exposes_direct_buffer_borrows() {
     );
     runtime.free_index(index);
     assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn public_mut_buffer_accessors_keep_refmut_shape() {
+    fn assert_pool_shape<'a>(
+        pool: &'a BufferPool,
+        index: BufferIndex,
+    ) -> CoreResult<RefMut<'a, hammer_adapter::Buffer>> {
+        pool.get_mut(index)
+    }
+
+    fn assert_runtime_shape<'a>(
+        runtime: &'a DataPlaneRuntime,
+        index: BufferIndex,
+    ) -> CoreResult<RefMut<'a, hammer_adapter::Buffer>> {
+        runtime.get_buffer_mut(index)
+    }
+
+    let pool = BufferPool::with_capacity(32, 1);
+    let index = pool.alloc_index().expect("alloc buffer");
+    let runtime = DataPlaneRuntime::with_buffer_capacity(32, 1);
+    let runtime_index = runtime.alloc_index().expect("alloc runtime buffer");
+
+    let _ = assert_pool_shape(&pool, index).expect("pool mut borrow");
+    let _ = assert_runtime_shape(&runtime, runtime_index).expect("runtime mut borrow");
+}
+
+#[test]
+fn public_refmut_tail_api_respects_inline_slot_capacity() {
+    let pool = BufferPool::with_capacity(16, 1);
+    let index = pool
+        .alloc_index_with_bytes(b"abcd")
+        .expect("alloc buffer with bytes");
+
+    {
+        let mut buffer = pool.get_mut(index).expect("mutable buffer");
+        let tail = buffer.writable_tail_mut();
+        assert_eq!(tail.len(), 12);
+        tail[..3].copy_from_slice(b"xyz");
+        buffer
+            .commit_writable_tail(3)
+            .expect("commit within remaining slot capacity");
+        assert_eq!(buffer.current(), b"abcdxyz");
+        assert!(buffer.commit_writable_tail(10).is_err());
+    }
+}
+
+#[test]
+fn append_after_truncating_pre_data_current_window_keeps_bytes_coherent() {
+    let pool = BufferPool::with_capacity(16, 2);
+    let index = pool.alloc_index().expect("alloc empty buffer");
+
+    pool.prepend(index, &[0xAA; 32])
+        .expect("prepend into pre-data headroom");
+    pool.truncate_current(index, 16)
+        .expect("truncate current within pre-data");
+    pool.append(index, &[0xBB]).expect("append from pre-data tail");
+
+    let buffer = pool.get(index).expect("buffer");
+    let mut expected = [0xAA; 17];
+    expected[16] = 0xBB;
+    assert_eq!(buffer.current_data_offset(), -32);
+    assert_eq!(buffer.current_len(), 17);
+    assert_eq!(buffer.current(), &expected);
+    assert_eq!(
+        buffer.current_ptr() as usize + buffer.current_len(),
+        pool.data_raw_ptr(index.slot()) as usize - 15
+    );
 }
 
 #[test]
