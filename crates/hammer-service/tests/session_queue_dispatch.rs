@@ -39,6 +39,9 @@ struct TestTxProtocol {
     send_params_calls: usize,
     push_header_calls: usize,
     pushed_batches: std::vec::Vec<std::vec::Vec<(usize, usize)>>,
+    snd_space: Option<usize>,
+    send_goal_size: usize,
+    flags: TransportSendFlags,
     runtime: DataPlaneRuntime,
     events: Arc<Mutex<std::vec::Vec<&'static str>>>,
 }
@@ -50,6 +53,9 @@ impl Default for TestTxProtocol {
             send_params_calls: 0,
             push_header_calls: 0,
             pushed_batches: std::vec::Vec::new(),
+            snd_space: None,
+            send_goal_size: 4,
+            flags: TransportSendFlags::default(),
             runtime: test_runtime_configured(2048, 64, 64, 8),
             events: Arc::new(Mutex::new(std::vec::Vec::new())),
         }
@@ -87,10 +93,10 @@ impl SessionQueueProtocol for TestTxProtocol {
     ) -> CoreResult<TransportSendParams> {
         self.send_params_calls += 1;
         Ok(TransportSendParams {
-            snd_space: pending_len,
+            snd_space: self.snd_space.unwrap_or(pending_len),
             tx_offset: self.offset,
-            send_goal_size: 4,
-            flags: TransportSendFlags::default(),
+            send_goal_size: self.send_goal_size,
+            flags: self.flags,
         })
     }
 
@@ -284,4 +290,97 @@ fn session_tx_dispatch_commits_batch_before_graph_visibility() {
         *events.lock().expect("events"),
         vec!["transport_commit", "graph_visible"]
     );
+}
+
+#[test]
+fn session_tx_deschedules_without_push_header_when_send_space_is_zero() {
+    let runtime = test_runtime_configured(2048, 64, 64, 8);
+    let buffers = runtime.buffers();
+    let capture_state = Arc::new(Mutex::new(CaptureState::default()));
+    let mut driver = SessionDriverRuntime::<TestTxProtocol, Local>::new(
+        DataWorkerId::new(0),
+        buffers.clone(),
+    );
+    let session_id = driver.insert_session(TestTxProtocol {
+        runtime: runtime.clone(),
+        snd_space: Some(0),
+        flags: TransportSendFlags::DESCHED,
+        ..TestTxProtocol::default()
+    });
+
+    let app_session = Arc::new(
+        AppSession::<Local>::new_in_segment(
+            Local::default(),
+            AppSessionConfig::new(256, 64),
+            SessionHandle::new(session_id.pool_index().slot() as u32, 0),
+            driver.app().tx_evt_q().clone(),
+        )
+        .expect("create app session"),
+    );
+
+    app_session
+        .send_bytes(&[0xABu8; 8])
+        .expect("send pending payload");
+
+    driver.app_mut().attach_session(session_id, app_session);
+    driver.mark_ready(session_id);
+
+    let next: SessionQueueNext = runtime
+        .nodes()
+        .register_internal(CaptureNode::new(Arc::clone(&capture_state)))
+        .into();
+    dispatch_session_queue_for_ticks(&runtime, &mut driver, 0, next)
+        .expect("dispatch session queue");
+    let _ = runtime.run_ready_nodes().expect("run capture node");
+
+    let protocol = driver.session(session_id).expect("protocol state");
+    assert_eq!(protocol.send_params_calls, 1);
+    assert_eq!(protocol.push_header_calls, 0);
+    let capture = capture_state.lock().expect("capture state");
+    assert!(capture.packets.is_empty());
+}
+
+#[test]
+fn session_tx_packetizes_by_send_goal_size_without_gso_metadata() {
+    let runtime = test_runtime_configured(2048, 64, 64, 8);
+    let buffers = runtime.buffers();
+    let capture_state = Arc::new(Mutex::new(CaptureState::default()));
+    let mut driver = SessionDriverRuntime::<TestTxProtocol, Local>::new(
+        DataWorkerId::new(0),
+        buffers.clone(),
+    );
+    let session_id = driver.insert_session(TestTxProtocol {
+        runtime: runtime.clone(),
+        send_goal_size: 12,
+        ..TestTxProtocol::default()
+    });
+
+    let app_session = Arc::new(
+        AppSession::<Local>::new_in_segment(
+            Local::default(),
+            AppSessionConfig::new(256, 64),
+            SessionHandle::new(session_id.pool_index().slot() as u32, 0),
+            driver.app().tx_evt_q().clone(),
+        )
+        .expect("create app session"),
+    );
+
+    app_session
+        .send_bytes(&[0xABu8; 24])
+        .expect("send pending payload");
+
+    driver.app_mut().attach_session(session_id, app_session);
+    driver.mark_ready(session_id);
+
+    let next: SessionQueueNext = runtime
+        .nodes()
+        .register_internal(CaptureNode::new(Arc::clone(&capture_state)))
+        .into();
+    dispatch_session_queue_for_ticks(&runtime, &mut driver, 0, next)
+        .expect("dispatch session queue");
+
+    let protocol = driver.session(session_id).expect("protocol state");
+    assert_eq!(protocol.send_params_calls, 1);
+    assert_eq!(protocol.push_header_calls, 1);
+    assert_eq!(protocol.pushed_batches, vec![vec![(0, 12), (12, 12)]]);
 }

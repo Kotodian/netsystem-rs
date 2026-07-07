@@ -641,7 +641,7 @@ where
         Ok(TransportSendParams {
             snd_space,
             tx_offset,
-            send_goal_size: self.output_payload_len(),
+            send_goal_size: self.send_goal_size(),
             flags: TransportSendFlags::default(),
         })
     }

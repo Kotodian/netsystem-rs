@@ -3,7 +3,9 @@ use std::ops::{Deref, DerefMut};
 use std::time::{Duration, Instant};
 
 use super::TcpInputNext;
-use super::output::{DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, tcp_effective_output_payload_len};
+use super::output::{
+    DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, tcp_effective_output_payload_len, tcp_send_goal_size,
+};
 use super::recovery::{TcpRecoveryAck, TcpRecoveryState};
 use super::sack::TcpSackState;
 use super::segment::TcpSegment;
@@ -498,6 +500,11 @@ where
     #[inline]
     pub fn output_payload_len(&self) -> usize {
         tcp_effective_output_payload_len(self.negotiated_options().send_max_segment_size)
+    }
+
+    #[inline]
+    pub fn send_goal_size(&self) -> usize {
+        tcp_send_goal_size(self.negotiated_options().send_max_segment_size)
     }
 
     #[cfg(test)]

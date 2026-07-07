@@ -703,6 +703,8 @@ where
                 })?
             }
         };
+        let transport_desched = params.flags.contains(TransportSendFlags::DESCHED);
+        let transport_postpone = params.flags.contains(TransportSendFlags::POSTPONE);
         if params.tx_offset > total_len {
             return Err(CoreError::internal(
                 "session tx offset exceeds chain length",
@@ -758,7 +760,8 @@ where
 
         let pending_len = total_len.saturating_sub(batch_offset);
         if pending_len > 0 {
-            requeue = true;
+            requeue =
+                !(params.snd_space == 0 && transport_desched && !transport_postpone);
         }
         if requeue {
             driver.mark_ready(session_id);
@@ -1243,7 +1246,7 @@ mod tests {
     }
 
     #[test]
-    fn session_tx_requeues_remaining_data_even_with_transport_desched_flag() {
+    fn session_tx_desched_flag_leaves_session_unqueued_when_send_space_is_zero() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
                 buffers: hammer_adapter::DataPlaneBufferConfig {
@@ -1294,6 +1297,66 @@ mod tests {
             Instant::now(),
         )
         .expect("dispatch partial tx");
+
+        let protocol = driver.session(session_id).expect("protocol state");
+        assert_eq!(protocol.send_params_calls, 1);
+        assert_eq!(protocol.push_header_calls, 0);
+        assert!(driver.has_session_tx(session_id));
+        assert!(driver.take_ready_sessions().is_empty());
+    }
+
+    #[test]
+    fn session_tx_postpone_flag_requeues_remaining_data_when_send_space_is_zero() {
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 2048,
+                    buffer_slots: 16,
+                    frame_capacity: 8,
+                    frame_slots: 8,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
+        let buffers = runtime.buffers();
+        let mut driver = SessionDriverRuntime::<FakeTxProtocol, Local>::new(
+            DataWorkerId::new(0),
+            buffers.clone(),
+        );
+        let session_id = driver.insert_session(FakeTxProtocol {
+            snd_space: Some(0),
+            send_goal_size: 4,
+            flags: TransportSendFlags::POSTPONE,
+            ..FakeTxProtocol::default()
+        });
+
+        let app_session = Arc::new(
+            AppSession::<Local>::new_in_segment(
+                Local::default(),
+                AppSessionConfig::new(256, 64),
+                SessionHandle::new(session_id.pool_index().slot() as u32, 0),
+                driver.app().tx_evt_q().clone(),
+            )
+            .expect("create app session"),
+        );
+        app_session
+            .send_bytes(&[0xABu8; 8])
+            .expect("send tx payload");
+
+        driver.app_mut().attach_session(session_id, app_session);
+        driver.mark_ready(session_id);
+        let next: crate::session::SessionQueueNext = NodeId::new(9).into();
+        let mut output = crate::session::node::SessionQueueOutput::default();
+        let mut step = driver.poll_once_for_ticks(0).expect("poll");
+
+        dispatch_session_queue_pending(
+            &runtime,
+            &mut driver,
+            next,
+            &mut output,
+            &mut step,
+            Instant::now(),
+        )
+        .expect("dispatch postponed tx");
 
         let protocol = driver.session(session_id).expect("protocol state");
         assert_eq!(protocol.send_params_calls, 1);

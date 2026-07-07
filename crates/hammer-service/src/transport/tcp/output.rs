@@ -152,6 +152,11 @@ pub const fn tcp_effective_output_payload_len(peer_max_segment_size: Option<u16>
 }
 
 #[inline]
+pub const fn tcp_send_goal_size(peer_max_segment_size: Option<u16>) -> usize {
+    tcp_effective_output_payload_len(peer_max_segment_size)
+}
+
+#[inline]
 pub fn tcp_available_send_window(
     snd_una: u32,
     snd_nxt: u32,
