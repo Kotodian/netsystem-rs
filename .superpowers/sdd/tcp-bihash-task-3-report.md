@@ -88,4 +88,29 @@
 
 ## Concerns
 
-- None for this task. The remaining `TransportConnectionKey<IpAddr>` flat-hash compatibility in `crates/hammer-core/src/protocol/transport.rs` is the expected temporary compatibility noted in the task brief.
+- None for this task.
+
+## Reviewer fix
+
+- Removed the remaining `impl hammer_infra::map::FlatHashKey for TransportConnectionKey<IpAddr>` from `crates/hammer-core/src/protocol/transport.rs`.
+- Kept the `TransportConnectionKey<IpAddr>::from_socket_addrs` helper and the IPv4/IPv6 `BihashKey` implementations intact.
+- Did not add any replacement wrapper types, compatibility tables, raw key plumbing, or test-only APIs.
+
+## Verification
+
+- `cargo test -p hammer-infra --test bihash -- --nocapture`
+  - passed
+- `cargo test -p hammer-core --test protocol_tcp -- --nocapture`
+  - passed
+- `cargo test -p hammer-service transport::tcp::lookup -- --nocapture`
+  - passed (`21 passed; 0 failed`)
+- `cargo test -p hammer-service transport::tcp::input -- --nocapture`
+  - passed (`7 passed; 0 failed`)
+- `cargo check -p hammer-service`
+  - passed
+- `cargo fmt --all -- --check`
+  - passed
+- `rg "FlatHashTable|FlatHashKey" crates/hammer-service/src/transport/tcp/lookup.rs crates/hammer-core/src/protocol/transport.rs`
+  - no output
+- `rg "TcpBihashKey|TcpV4RouteKey|TcpV6RouteKey|std::vec::Vec|pub trait .*Free" crates/hammer-service/src/transport/tcp/lookup.rs crates/hammer-core/src/protocol/transport.rs crates/hammer-infra/src/bihash`
+  - no output
