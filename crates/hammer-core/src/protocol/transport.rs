@@ -187,39 +187,30 @@ impl BihashKey for TransportConnectionKey<Ipv6Addr> {
     }
 }
 
-impl hammer_infra::map::FlatHashKey for TransportConnectionKey<Ipv4Addr> {
-    #[inline(always)]
-    fn hash_key(self) -> usize {
-        self.hash() as usize
-    }
-}
-
-impl hammer_infra::map::FlatHashKey for TransportConnectionKey<Ipv6Addr> {
-    #[inline(always)]
-    fn hash_key(self) -> usize {
-        self.hash() as usize
-    }
-}
-
 impl hammer_infra::map::FlatHashKey for TransportConnectionKey<IpAddr> {
     #[inline(always)]
     fn hash_key(self) -> usize {
         match (self.local_addr, self.remote_addr) {
-            (IpAddr::V4(local_addr), IpAddr::V4(remote_addr)) => TransportConnectionKey::new(
-                self.scope_id,
-                local_addr,
-                self.local_port(),
-                remote_addr,
-                self.remote_port(),
-            )
-            .hash_key(),
-            (IpAddr::V6(local_addr), IpAddr::V6(remote_addr)) => hash_words(&[
-                1,
-                fold_u128(u128::from(local_addr)),
-                fold_u128(u128::from(remote_addr)),
-                u64::from(self.scope_id),
-                u64::from(self.ports),
-            ]) as usize,
+            (IpAddr::V4(local_addr), IpAddr::V4(remote_addr)) => {
+                TransportConnectionKey::new(
+                    self.scope_id,
+                    local_addr,
+                    self.local_port(),
+                    remote_addr,
+                    self.remote_port(),
+                )
+                .hash() as usize
+            }
+            (IpAddr::V6(local_addr), IpAddr::V6(remote_addr)) => {
+                TransportConnectionKey::new(
+                    self.scope_id,
+                    local_addr,
+                    self.local_port(),
+                    remote_addr,
+                    self.remote_port(),
+                )
+                .hash() as usize
+            }
             _ => hash_words(&[2, u64::from(self.scope_id), u64::from(self.ports)]) as usize,
         }
     }

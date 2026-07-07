@@ -1,6 +1,5 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use hammer_core::ds::FlatHashTable;
 use hammer_core::protocol::tcp::{
     TcpCapabilities, TcpCloseReason, TcpControlPlaneAction, TcpListenerId, TcpListenerKey, TcpSeq,
     TcpV6ListenerKey, TcpWorkerEvent,
@@ -55,8 +54,8 @@ fn tcp_connection_keys_reverse_direction_and_hash_for_lookup_tables() {
         54_321,
     );
     let reversed = key.reverse();
-    let mut table = FlatHashTable::new();
-    table.insert(key, 17u32);
+    let mut table: Bihash<TransportConnectionKey<Ipv4Addr>, 3> = Bihash::new(8);
+    table.insert(key, 17u64);
 
     assert_eq!(table.lookup(&key), Some(17));
     assert_eq!(table.lookup(&reversed), None);

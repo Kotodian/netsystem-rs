@@ -102,3 +102,24 @@
 
 - The earlier `node`-before-declaration compile error no longer appears in focused `hammer-service` verification.
 - No additional code paths were changed for Task 2.
+
+## Reviewer follow-up fix
+
+- Removed the legacy `FlatHashKey` impls for `TransportConnectionKey<Ipv4Addr>` and `TransportConnectionKey<Ipv6Addr>` from `crates/hammer-core/src/protocol/transport.rs`.
+- Kept only the `TransportConnectionKey<IpAddr>` flat-hash compatibility shim for the existing `FlatHashTable<TransportConnectionKey, ...>` users that Task 3 has not migrated yet.
+- Updated the remaining `TransportConnectionKey<IpAddr>::hash_key` implementation to call the existing bihash hash behavior on temporary typed keys instead of delegating to removed typed flat-hash impls.
+- Adjusted `crates/hammer-core/tests/protocol_tcp.rs` so the transport-key lookup assertion uses `Bihash`, matching the new contract after the typed flat-hash impls were removed.
+
+### Verification
+
+- `cargo test -p hammer-core --test protocol_tcp -- --nocapture`
+  - Passed.
+  - Result: `5 passed; 0 failed`
+- `cargo test -p hammer-service --lib tcp_listener_key_works_as_bihash_key -- --nocapture`
+  - Passed.
+  - Result: `1 passed; 0 failed`
+- `cargo test -p hammer-service --lib pool_index_bihash_value_round_trip -- --nocapture`
+  - Passed.
+  - Result: `1 passed; 0 failed`
+- `rg "impl hammer_infra::map::FlatHashKey for TransportConnectionKey<Ipv4Addr>|impl hammer_infra::map::FlatHashKey for TransportConnectionKey<Ipv6Addr>" crates/hammer-core/src/protocol/transport.rs`
+  - No matches, as expected.
