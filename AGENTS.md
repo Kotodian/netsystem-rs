@@ -6,6 +6,20 @@ Hammer is a VPP-style high-performance network data plane framework written in R
 
 The framework centers on a **packet graph runtime**: data-plane work is organized into graph nodes processing frames of buffers, worker-owned state, lock-free hot paths, and VPP-style barrier synchronization between control and data planes.
 
+## Agent skills
+
+### Issue tracker
+
+Issues and PRDs are tracked in GitHub Issues for `Kotodian/hammer-ios-rs`; external PRs are not a triage request surface by default. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the default role labels: `bug`, `enhancement`, `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This is a single-context repo: read root `CONTEXT.md` and relevant ADRs under `docs/adr/`. See `docs/agents/domain.md`.
+
 ## Project Structure & Module Organization
 
 Workspace root: `crates/`. Dependency direction is strictly one-way to avoid cycles: `hammer → {hammer-runtime, hammer-service, hammer-ipc, hammer-core, hammer-component-macros}`, `hammer-app → {hammer-runtime, hammer-adapter, hammer-core, hammer-infra}`, `hammer-service → {hammer-runtime, hammer-core, hammer-adapter, hammer-infra, hammer-component-macros}`, `hammer-adapter → {hammer-core, hammer-infra}`, `hammer-ipc → {hammer-core, hammer-runtime}`, `hammer-runtime → {hammer-adapter, hammer-core, hammer-component-macros}`, `hammer-infra → (external only)`, `hammer-core → hammer-infra`.
