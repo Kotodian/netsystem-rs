@@ -3,13 +3,13 @@ use std::ops::{Deref, DerefMut};
 use std::time::{Duration, Instant};
 
 use super::TcpInputNext;
+use super::TcpNodeError;
 use super::output::{
     DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, tcp_effective_output_payload_len, tcp_send_goal_size,
 };
 use super::recovery::{TcpRecoveryAck, TcpRecoveryState};
 use super::sack::TcpSackState;
 use super::segment::TcpSegment;
-use super::TcpNodeError;
 use crate::transport::congestion::CongestionController;
 use crossbeam_utils::CachePadded;
 use hammer_adapter::DataWorkerId;

@@ -2,9 +2,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneBufferConfig, DataPlaneBuffers, DataPlaneRuntime,
-    DataPlaneRuntimeConfig, DataWorkerId, InternalNode, Node, NodeProcessFn, NodeRegistration,
-    NodeResult, NodeRuntimeData,
+    BufferFrame, DataPlaneBufferConfig, DataPlaneBuffers, DataPlaneRuntime, DataPlaneRuntimeConfig,
+    DataWorkerId, InternalNode, Node, NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData,
 };
 use hammer_core::error::CoreResult;
 use hammer_infra::segment::Local;
@@ -107,10 +106,7 @@ impl SessionQueueProtocol for TestTxProtocol {
         _: Instant,
     ) -> CoreResult<()> {
         let _ = self.runtime.run_ready_nodes()?;
-        self.events
-            .lock()
-            .expect("events")
-            .push("transport_commit");
+        self.events.lock().expect("events").push("transport_commit");
         self.push_header_calls += 1;
         self.pushed_batches.push(
             batch
@@ -217,11 +213,7 @@ fn capture_process(
         }
     };
     let mut state = state.lock().expect("capture state");
-    state
-        .events
-        .lock()
-        .expect("events")
-        .push("graph_visible");
+    state.events.lock().expect("events").push("graph_visible");
     for &index in frame.pending_indices() {
         let packet = match chain_bytes(runtime.buffers(), index) {
             Ok(bytes) => bytes,
@@ -243,10 +235,8 @@ fn session_tx_dispatch_commits_batch_before_graph_visibility() {
         packets: std::vec::Vec::new(),
         events: Arc::clone(&events),
     }));
-    let mut driver = SessionDriverRuntime::<TestTxProtocol, Local>::new(
-        DataWorkerId::new(0),
-        buffers.clone(),
-    );
+    let mut driver =
+        SessionDriverRuntime::<TestTxProtocol, Local>::new(DataWorkerId::new(0), buffers.clone());
     let session_id = driver.insert_session(TestTxProtocol {
         runtime: runtime.clone(),
         events: Arc::clone(&events),
@@ -297,10 +287,8 @@ fn session_tx_deschedules_without_push_header_when_send_space_is_zero() {
     let runtime = test_runtime_configured(2048, 64, 64, 8);
     let buffers = runtime.buffers();
     let capture_state = Arc::new(Mutex::new(CaptureState::default()));
-    let mut driver = SessionDriverRuntime::<TestTxProtocol, Local>::new(
-        DataWorkerId::new(0),
-        buffers.clone(),
-    );
+    let mut driver =
+        SessionDriverRuntime::<TestTxProtocol, Local>::new(DataWorkerId::new(0), buffers.clone());
     let session_id = driver.insert_session(TestTxProtocol {
         runtime: runtime.clone(),
         snd_space: Some(0),
@@ -345,10 +333,8 @@ fn session_tx_packetizes_by_send_goal_size_without_gso_metadata() {
     let runtime = test_runtime_configured(2048, 64, 64, 8);
     let buffers = runtime.buffers();
     let capture_state = Arc::new(Mutex::new(CaptureState::default()));
-    let mut driver = SessionDriverRuntime::<TestTxProtocol, Local>::new(
-        DataWorkerId::new(0),
-        buffers.clone(),
-    );
+    let mut driver =
+        SessionDriverRuntime::<TestTxProtocol, Local>::new(DataWorkerId::new(0), buffers.clone());
     let session_id = driver.insert_session(TestTxProtocol {
         runtime: runtime.clone(),
         send_goal_size: 12,

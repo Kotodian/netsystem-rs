@@ -528,8 +528,9 @@ mod tests {
         let mut state = state.lock().expect("capture state");
         for index in frame.pending_indices().iter().copied() {
             let buffer = runtime.get_buffer(index).expect("capture buffer");
-            let cursor = unsafe { std::mem::transmute::<_, &crate::net::NetworkOpaque>(buffer.opaque()) }
-                .packet_cursor();
+            let cursor =
+                unsafe { std::mem::transmute::<_, &crate::net::NetworkOpaque>(buffer.opaque()) }
+                    .packet_cursor();
             state.packets.push(buffer.current().to_vec());
             state.cursors.push(cursor);
             state

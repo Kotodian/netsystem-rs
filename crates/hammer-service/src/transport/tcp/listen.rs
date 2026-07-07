@@ -395,6 +395,15 @@ mod tests {
         }
     }
 
+    fn drain_ready_nodes(runtime: &DataPlaneRuntime, context: &str) {
+        for _ in 0..3 {
+            if runtime.run_ready_nodes().expect(context) == 0 {
+                return;
+            }
+        }
+        panic!("{context}: graph still had ready nodes after drain budget");
+    }
+
     #[test]
     fn initial_syn_emits_cookie_syn_ack_without_creating_session_route() {
         let runtime =
@@ -680,12 +689,7 @@ mod tests {
         let _ = runtime
             .run_ready_nodes()
             .expect("run overflow listener syn");
-        run_until_captured(
-            &runtime,
-            &output_state,
-            TCP_LISTENER_BACKLOG,
-            "run overflow listener syn output",
-        );
+        drain_ready_nodes(&runtime, "drain overflow listener syn output");
 
         let packets = output_state.lock().expect("capture");
         assert_eq!(packets.packets.len(), TCP_LISTENER_BACKLOG);

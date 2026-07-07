@@ -43,8 +43,7 @@ pub use connection::{
     TCP_INITIAL_RETRANSMIT_TIMEOUT, TCP_MAX_RETRANSMIT_TIMEOUT, TCP_MIN_RETRANSMIT_TIMEOUT,
     TCP_TIMER_COUNT, TCP_TIMER_DELAYED_ACK, TCP_TIMER_KEEP_ALIVE, TCP_TIMER_PACING,
     TCP_TIMER_PERSIST, TCP_TIMER_RACK, TCP_TIMER_RETRANSMIT, TCP_TIMER_TIME_WAIT, TCP_TIMER_TLP,
-    TcpConnection,
-    TcpRetransmitTimeoutState,
+    TcpConnection, TcpRetransmitTimeoutState,
 };
 pub(crate) use connection::{sync_all_tcp_timers, sync_tcp_timer};
 pub use established::{TcpEstablishedNext, TcpEstablishedNode};
@@ -710,12 +709,7 @@ where
             }
         }
         let session = context.session_id().pool_index();
-        sync_all_tcp_timers(
-            context.timer_wheel(),
-            self,
-            session,
-            now,
-        )?;
+        sync_all_tcp_timers(context.timer_wheel(), self, session, now)?;
         if emitted == 0 && !context.has_pending_tx() && self.has_pending_sack_output() {
             context.mark_ready();
         }
@@ -999,10 +993,7 @@ mod tests {
         driver.app_mut().attach_session(session_id, app_session);
         driver.mark_ready(session_id);
 
-        let initial_snd_nxt = driver
-            .session(session_id)
-            .expect("connection")
-            .snd_nxt();
+        let initial_snd_nxt = driver.session(session_id).expect("connection").snd_nxt();
 
         let next: crate::session::SessionQueueNext = output_node.into();
         let dispatched =
@@ -1261,13 +1252,8 @@ mod tests {
         let session = session_id.pool_index();
         let connection: *const TcpConnection<C> =
             driver.session(session_id).expect("connection") as *const _;
-        sync_all_tcp_timers(
-            driver.timers_mut(),
-            unsafe { &*connection },
-            session,
-            now,
-        )
-        .expect("sync time wait timer");
+        sync_all_tcp_timers(driver.timers_mut(), unsafe { &*connection }, session, now)
+            .expect("sync time wait timer");
     }
 
     fn peer_fin_packet(

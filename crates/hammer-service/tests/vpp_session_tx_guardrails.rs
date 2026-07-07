@@ -14,7 +14,11 @@ fn session_tx_external_seam_does_not_expose_prepare_cancel_commit() {
 
 #[test]
 fn session_runtime_does_not_scan_tcp_timer_masks() {
-    let source = read_source("src/session/protocol.rs");
+    let source = [
+        read_source("src/session/runtime.rs"),
+        read_source("src/session/protocol.rs"),
+    ]
+    .join("\n");
 
     assert!(!source.contains("TCP_TIMER_COUNT"));
     assert!(!source.contains("active_timer_mask"));
@@ -36,9 +40,10 @@ fn session_runtime_does_not_refresh_tcp_timers_or_construct_tcp_output_intent() 
 
 #[test]
 fn session_runtime_only_consumes_send_goal_size_for_gso_shaping() {
-    let source = read_source("src/session/runtime.rs");
+    let runtime = read_source("src/session/runtime.rs");
+    let source = [runtime.clone(), read_source("src/session/protocol.rs")].join("\n");
 
-    assert!(source.contains("send_goal_size"));
+    assert!(runtime.contains("send_goal_size"));
     assert!(!source.contains("gso_size"));
     assert!(!source.contains("gso_type"));
     assert!(!source.contains("VNET_BUFFER_F_GSO"));

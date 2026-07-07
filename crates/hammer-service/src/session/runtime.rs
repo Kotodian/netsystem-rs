@@ -760,8 +760,7 @@ where
 
         let pending_len = total_len.saturating_sub(batch_offset);
         if pending_len > 0 {
-            requeue =
-                !(params.snd_space == 0 && transport_desched && !transport_postpone);
+            requeue = !(params.snd_space == 0 && transport_desched && !transport_postpone);
         }
         if requeue {
             driver.mark_ready(session_id);
