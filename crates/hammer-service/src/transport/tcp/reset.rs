@@ -460,6 +460,8 @@ fn refresh_reset_metadata(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex, OnceLock};
+
     use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 
     use hammer_adapter::{BufferNodeError, InternalNode};
@@ -467,30 +469,73 @@ mod tests {
     use super::*;
     use crate::transport::tcp::TcpResetError;
 
-    #[derive(Clone, Copy)]
-    struct BlackholeNode;
+    #[derive(Default)]
+    struct CaptureState {
+        packets: std::vec::Vec<std::vec::Vec<u8>>,
+        cursors: std::vec::Vec<hammer_adapter::BufferPacketCursor>,
+        node_errors: std::vec::Vec<Option<BufferNodeError>>,
+    }
 
-    impl Node for BlackholeNode {
+    struct CaptureNode {
+        runtime_data: NodeRuntimeData,
+    }
+
+    impl CaptureNode {
+        fn new(state: Arc<Mutex<CaptureState>>) -> Self {
+            let mut states = capture_states().lock().expect("capture registry");
+            let slot = states.len();
+            states.push(state);
+            Self {
+                runtime_data: NodeRuntimeData::from_usize(slot).expect("capture slot"),
+            }
+        }
+    }
+
+    impl Node for CaptureNode {
         fn process(&mut self, _runtime: &DataPlaneRuntime, _: &mut BufferFrame) -> NodeResult {
             NodeResult::drop()
         }
 
         fn node_process(&self) -> NodeProcessFn {
-            blackhole_process
+            capture_process
         }
 
         fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
-            Ok(NodeRuntimeData::default())
+            Ok(self.runtime_data)
         }
     }
 
-    impl InternalNode for BlackholeNode {}
+    impl InternalNode for CaptureNode {}
 
-    fn blackhole_process(
-        _: &DataPlaneRuntime,
-        _: NodeRuntimeData,
-        _: &mut BufferFrame,
+    fn capture_states() -> &'static Mutex<std::vec::Vec<Arc<Mutex<CaptureState>>>> {
+        static STATES: OnceLock<Mutex<std::vec::Vec<Arc<Mutex<CaptureState>>>>> = OnceLock::new();
+        STATES.get_or_init(|| Mutex::new(std::vec::Vec::new()))
+    }
+
+    fn capture_process(
+        runtime: &DataPlaneRuntime,
+        data: NodeRuntimeData,
+        frame: &mut BufferFrame,
     ) -> NodeResult {
+        let state = {
+            let states = capture_states().lock().expect("capture registry");
+            Arc::clone(
+                states
+                    .get(data.usize_word(0).expect("capture slot"))
+                    .expect("capture slot is invalid"),
+            )
+        };
+        let mut state = state.lock().expect("capture state");
+        for index in frame.pending_indices().iter().copied() {
+            let buffer = runtime.get_buffer(index).expect("capture buffer");
+            let cursor = unsafe { std::mem::transmute::<_, &crate::net::NetworkOpaque>(buffer.opaque()) }
+                .packet_cursor();
+            state.packets.push(buffer.current().to_vec());
+            state.cursors.push(cursor);
+            state
+                .node_errors
+                .push(runtime.node_error(index).expect("node error"));
+        }
         NodeResult::drop()
     }
 
@@ -506,11 +551,17 @@ mod tests {
                     ..hammer_adapter::DataPlaneBufferConfig::default()
                 },
             });
-        let drop = runtime.nodes().register_internal(BlackholeNode);
-        let lookup = runtime.nodes().register_internal(BlackholeNode);
+        let drop_state = Arc::new(Mutex::new(CaptureState::default()));
+        let lookup_state = Arc::new(Mutex::new(CaptureState::default()));
+        let drop_node = runtime
+            .nodes()
+            .register_internal(CaptureNode::new(Arc::clone(&drop_state)));
+        let lookup = runtime
+            .nodes()
+            .register_internal(CaptureNode::new(Arc::clone(&lookup_state)));
         let reset = runtime
             .nodes()
-            .register_internal(TcpResetNode::new(TcpResetNext::nodes(drop, lookup)));
+            .register_internal(TcpResetNode::new(TcpResetNext::nodes(drop_node, lookup)));
         let mut frame = runtime
             .buffers()
             .get_next_frame(reset)
@@ -533,17 +584,20 @@ mod tests {
         runtime.put_next_frame(frame).expect("put reset");
         assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
 
-        let buffer = runtime.get_buffer(index).expect("buffer");
-        let packet = buffer.current();
-        let cursor =
-            unsafe { std::mem::transmute::<_, &crate::net::NetworkOpaque>(buffer.opaque()) }
-                .packet_cursor();
+        let drop_packets = drop_state.lock().expect("drop capture");
+        assert!(drop_packets.packets.is_empty());
+        std::mem::drop(drop_packets);
+
+        let lookup_packets = lookup_state.lock().expect("lookup capture");
+        assert_eq!(lookup_packets.packets.len(), 1);
+        let packet = &lookup_packets.packets[0];
+        let cursor = lookup_packets.cursors[0];
         let reply_tcp = etherparse::TcpSlice::from_slice(&packet[20..]).expect("parse reply");
         assert_eq!(cursor.packet_len(), packet.len());
         assert_eq!(cursor.network_header_offset(), 0);
         assert_eq!(cursor.transport_header_offset(), 20);
         assert_eq!(cursor.transport_payload_offset(), 40);
-        assert!(runtime.node_error(index).expect("node error").is_none());
+        assert!(lookup_packets.node_errors[0].is_none());
         assert!(reply_tcp.rst());
         assert_eq!(reply_tcp.sequence_number(), 9_000);
     }

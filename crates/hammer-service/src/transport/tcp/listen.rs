@@ -378,6 +378,23 @@ mod tests {
         NodeResult::drop()
     }
 
+    fn run_until_captured(
+        runtime: &DataPlaneRuntime,
+        output_state: &Arc<Mutex<CaptureState>>,
+        expected_packets: usize,
+        context: &str,
+    ) {
+        let mut attempts = 0usize;
+        while output_state.lock().expect("capture").packets.len() < expected_packets {
+            attempts += 1;
+            assert!(
+                attempts <= 3,
+                "{context}: expected {expected_packets} captured packets"
+            );
+            assert!(runtime.run_ready_nodes().expect(context) >= 1);
+        }
+    }
+
     #[test]
     fn initial_syn_emits_cookie_syn_ack_without_creating_session_route() {
         let runtime =
@@ -630,9 +647,9 @@ mod tests {
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
                 buffers: hammer_adapter::DataPlaneBufferConfig {
                     buffer_slot_capacity: 4096,
-                    buffer_slots: 16,
+                    buffer_slots: 256,
                     frame_capacity: 8,
-                    frame_slots: 8,
+                    frame_slots: 32,
                     ..hammer_adapter::DataPlaneBufferConfig::default()
                 },
             });
@@ -646,7 +663,12 @@ mod tests {
                 syn_packet_from(remote, CLIENT_ISN + offset as u32),
             );
             let _ = runtime.run_ready_nodes().expect("run listener syn");
-            let _ = runtime.run_ready_nodes().expect("run listener syn output");
+            run_until_captured(
+                &runtime,
+                &output_state,
+                offset + 1,
+                "run listener syn output",
+            );
         }
 
         let overflow_remote = remote_addr(Some(REMOTE_PORT + TCP_LISTENER_BACKLOG as u16));
@@ -658,9 +680,12 @@ mod tests {
         let _ = runtime
             .run_ready_nodes()
             .expect("run overflow listener syn");
-        let _ = runtime
-            .run_ready_nodes()
-            .expect("run overflow listener syn output");
+        run_until_captured(
+            &runtime,
+            &output_state,
+            TCP_LISTENER_BACKLOG,
+            "run overflow listener syn output",
+        );
 
         let packets = output_state.lock().expect("capture");
         assert_eq!(packets.packets.len(), TCP_LISTENER_BACKLOG);
@@ -684,9 +709,9 @@ mod tests {
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
                 buffers: hammer_adapter::DataPlaneBufferConfig {
                     buffer_slot_capacity: 4096,
-                    buffer_slots: 16,
+                    buffer_slots: 256,
                     frame_capacity: 8,
-                    frame_slots: 8,
+                    frame_slots: 32,
                     ..hammer_adapter::DataPlaneBufferConfig::default()
                 },
             });
@@ -700,7 +725,12 @@ mod tests {
                 syn_packet_from(remote, CLIENT_ISN + offset as u32),
             );
             let _ = runtime.run_ready_nodes().expect("run listener syn");
-            let _ = runtime.run_ready_nodes().expect("run listener syn output");
+            run_until_captured(
+                &runtime,
+                &output_state,
+                offset + 1,
+                "run listener syn output",
+            );
         }
 
         let tfo_remote = remote_addr(Some(REMOTE_PORT + TCP_LISTENER_BACKLOG as u16 + 1));
@@ -723,9 +753,12 @@ mod tests {
             );
         }
         assert!(runtime.run_ready_nodes().expect("run passive tfo syn") >= 1);
-        if output_state.lock().expect("capture").packets.len() < TCP_LISTENER_BACKLOG + 1 {
-            assert!(runtime.run_ready_nodes().expect("run passive tfo output") >= 1);
-        }
+        run_until_captured(
+            &runtime,
+            &output_state,
+            TCP_LISTENER_BACKLOG + 1,
+            "run passive tfo output",
+        );
 
         let mut queue = handle.borrow_mut().expect("tcp queue");
         assert_eq!(

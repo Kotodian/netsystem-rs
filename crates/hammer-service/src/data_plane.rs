@@ -259,10 +259,6 @@ mod tests {
             });
         let sink = runtime.nodes().register_internal(DropNode::new());
         let handoff = runtime.nodes().register_internal(HandoffNode::new());
-        let mut frame = runtime
-            .buffers()
-            .get_next_frame(hammer_adapter::NodeId::new(0))
-            .expect("alloc frame");
         let packet = runtime
             .alloc_index_with_bytes(b"handoff")
             .expect("alloc packet");
@@ -270,7 +266,6 @@ mod tests {
             .get_buffer_mut(packet)
             .expect("store handoff next buffer")
             .set_current_config(sink);
-        frame.push_index(packet).expect("push packet");
 
         let mut handoff_frame = runtime
             .buffers()
