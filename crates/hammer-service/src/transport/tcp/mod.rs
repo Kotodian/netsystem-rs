@@ -669,11 +669,13 @@ where
         let local_capabilities = tcp_worker_state()
             .pending_open_capabilities(context.session_id())
             .unwrap_or_default();
+        let mut candidate = self.clone();
         for entry in batch {
-            let segment = self.tx_segment(entry.payload_len, local_capabilities)?;
+            let segment = candidate.tx_segment(entry.payload_len, local_capabilities)?;
             segment.write_to_buffer(context.buffers(), entry.index)?;
-            let _ = self.commit_payload_tx(entry.payload_len, now)?;
+            let _ = candidate.commit_payload_tx(entry.payload_len, now)?;
         }
+        *self = candidate;
         let session = context.session_id().pool_index();
         sync_all_tcp_timers(
             context.timer_wheel(),
@@ -1018,6 +1020,141 @@ mod tests {
         let packets = &lookup_state.lock().expect("lookup").packets;
         assert_eq!(packets.len(), 1);
         assert_eq!(tcp_segment_payload(&packets[0]), payload);
+    }
+
+    #[test]
+    fn tcp_push_header_rolls_back_transport_state_when_batch_fails() {
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 2048,
+                    buffer_slots: 32,
+                    frame_capacity: 8,
+                    frame_slots: 8,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
+        let mut worker_state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
+        set_tcp_worker_state(&mut worker_state);
+        let mut driver = SessionDriverRuntime::new(DataWorkerId::new(0), runtime.buffers().clone());
+        let session_id = driver
+            .insert_session_with_id(|_| established_tcp_connection())
+            .expect("insert session");
+        publish_tcp_connection(&mut driver, session_id).expect("refresh session route");
+
+        let first = runtime.buffers().alloc_index().expect("first buffer");
+        let second = runtime.buffers().alloc_index().expect("second buffer");
+        let batch = [
+            TxBatchBuffer {
+                index: first,
+                tx_offset: 0,
+                payload_len: 1,
+            },
+            TxBatchBuffer {
+                index: second,
+                tx_offset: 1,
+                payload_len: usize::MAX,
+            },
+        ];
+
+        let (initial_snd_nxt, retransmit_active) = {
+            let connection = driver.session(session_id).expect("connection");
+            (
+                connection.snd_nxt(),
+                connection.timer_is_active(TCP_TIMER_RETRANSMIT),
+            )
+        };
+
+        let timer_wheel = driver.timers_mut() as *mut _;
+        let ready = driver.ready_mut_ptr();
+        let buffers = driver.buffers() as *const _;
+        let mut context =
+            SessionQueueControlContext::new(timer_wheel, ready, buffers, session_id, false);
+
+        let error = driver
+            .session_mut(session_id)
+            .expect("connection")
+            .push_header(&mut context, &batch, Instant::now())
+            .expect_err("batch should fail");
+        assert_eq!(error.to_string(), TcpError::Dispatch.to_string());
+
+        let connection = driver.session(session_id).expect("connection");
+        assert_eq!(connection.snd_nxt(), initial_snd_nxt);
+        assert_eq!(
+            connection.timer_is_active(TCP_TIMER_RETRANSMIT),
+            retransmit_active
+        );
+    }
+
+    #[test]
+    fn tcp_normal_tx_dispatches_multiple_goal_sized_buffers() {
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 2048,
+                    buffer_slots: 32,
+                    frame_capacity: 8,
+                    frame_slots: 8,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
+        let (output_node, lookup_state, drop_state) = tcp_output_graph(&runtime);
+        let mut worker_state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
+        set_tcp_worker_state(&mut worker_state);
+        let mut driver = SessionDriverRuntime::new(DataWorkerId::new(0), runtime.buffers().clone());
+        let session_id = driver
+            .insert_session_with_id(|_| established_tcp_connection())
+            .expect("insert session");
+        publish_tcp_connection(&mut driver, session_id).expect("refresh session route");
+
+        let send_goal_size = driver
+            .session(session_id)
+            .expect("connection")
+            .send_goal_size();
+        let payload = vec![0x5a; send_goal_size * 2];
+        let fifo_capacity = (payload.len() * 2).next_power_of_two().max(256);
+        let app_session = Arc::new(
+            hammer_runtime::app::AppSession::new_in_segment(
+                hammer_infra::segment::Local::default(),
+                hammer_runtime::app::AppSessionConfig::new(fifo_capacity, 64),
+                hammer_runtime::app::SessionHandle::new(session_id.pool_index().slot() as u32, 0),
+                driver.app().tx_evt_q().clone(),
+            )
+            .expect("create app session"),
+        );
+        app_session.send_bytes(&payload).expect("send tx payload");
+        driver.app_mut().attach_session(session_id, app_session);
+        driver.mark_ready(session_id);
+
+        let initial_snd_nxt = driver.session(session_id).expect("connection").snd_nxt();
+        let next: crate::session::SessionQueueNext = output_node.into();
+        let dispatched =
+            dispatch_session_queue_for_ticks(&runtime, &mut driver, 0, next).expect("dispatch tx");
+        assert!(dispatched.ready_sessions >= 1);
+        let _ = runtime.run_ready_nodes().expect("run tcp output");
+
+        assert!(drop_state.lock().expect("drop").packets.is_empty());
+        let packets = &lookup_state.lock().expect("lookup").packets;
+        assert!(
+            packets.len() >= 2,
+            "expected at least two packets, got {}",
+            packets.len()
+        );
+        assert_eq!(tcp_segment_payload(&packets[0]).len(), send_goal_size);
+        assert_eq!(tcp_segment_payload(&packets[1]).len(), send_goal_size);
+
+        let connection = driver.session(session_id).expect("connection");
+        assert_eq!(
+            connection.snd_nxt(),
+            initial_snd_nxt.wrapping_add((send_goal_size * 2) as u32)
+        );
+        assert_eq!(
+            driver
+                .app()
+                .pending_send_len(session_id)
+                .expect("pending send len"),
+            Some(payload.len())
+        );
     }
 
     #[test]

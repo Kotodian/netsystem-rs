@@ -3,6 +3,16 @@ fn read_source(path: &str) -> String {
         .unwrap_or_else(|err| panic!("read {path}: {err}"))
 }
 
+fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    let start = source
+        .find(start)
+        .unwrap_or_else(|| panic!("missing source start marker: {start}"));
+    let end = source[start..]
+        .find(end)
+        .unwrap_or_else(|| panic!("missing source end marker: {end}"));
+    &source[start..start + end]
+}
+
 #[test]
 fn session_tx_external_seam_does_not_expose_prepare_cancel_commit() {
     let source = read_source("src/session/runtime.rs");
@@ -48,4 +58,13 @@ fn session_runtime_only_consumes_send_goal_size_for_gso_shaping() {
     assert!(!source.contains("gso_type"));
     assert!(!source.contains("VNET_BUFFER_F_GSO"));
     assert!(!source.contains("offload_metadata"));
+}
+
+#[test]
+fn tcp_push_header_does_not_allocate_std_vec_for_batch_commit() {
+    let source = read_source("src/transport/tcp/mod.rs");
+    let push_header = source_between(&source, "    fn push_header(", "    fn custom_tx(");
+
+    assert!(!push_header.contains("std::vec::Vec::with_capacity"));
+    assert!(!push_header.contains("std::vec!"));
 }

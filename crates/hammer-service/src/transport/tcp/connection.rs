@@ -1264,7 +1264,6 @@ where
         if self.state != TcpState::Established {
             return 0;
         }
-        let mss = self.output_payload_len();
         let bytes_in_flight = self.bytes_in_flight_cached;
         let peer_remaining = self.snd_wnd.saturating_sub(bytes_in_flight) as usize;
         let cc_remaining = if let Some(recovery_remaining) = self
@@ -1277,11 +1276,17 @@ where
                 .congestion_window()
                 .saturating_sub(bytes_in_flight) as usize
         };
-        let allowed = pending_len.min(mss).min(peer_remaining).min(cc_remaining);
+        let allowed = pending_len.min(peer_remaining).min(cc_remaining);
         if allowed == 0 {
             return 0;
         }
-        if !self.pacing_ready && self.congestion.next_send_delay(allowed as u32).is_some() {
+        let pacing_probe_len = allowed.min(self.send_goal_size());
+        if !self.pacing_ready
+            && self
+                .congestion
+                .next_send_delay(pacing_probe_len as u32)
+                .is_some()
+        {
             return 0;
         }
         allowed
