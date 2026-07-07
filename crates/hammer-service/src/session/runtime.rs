@@ -732,10 +732,12 @@ where
 
                 let index = driver.runtime.buffers.alloc_index()?;
                 owner.push_index(index)?;
-                driver
-                    .app_state
-                    .app
-                    .copy_tx_to_buffer(session_id, batch_offset, payload_len, index)?;
+                driver.app_state.app.copy_tx_to_buffer(
+                    session_id,
+                    batch_offset,
+                    payload_len,
+                    index,
+                )?;
                 batch.push(TxBatchBuffer {
                     index,
                     tx_offset: batch_offset,
@@ -755,11 +757,7 @@ where
         }
 
         let pending_len = total_len.saturating_sub(batch_offset);
-        if pending_len > 0
-            && !params
-                .flags
-                .intersects(TransportSendFlags::DESCHED | TransportSendFlags::POSTPONE)
-        {
+        if pending_len > 0 {
             requeue = true;
         }
         if requeue {
@@ -779,6 +777,7 @@ mod tests {
         BufferFrame, InternalNode, Node, NodeId, NodeProcessFn, NodeRegistration, NodeResult,
         NodeRuntimeData,
     };
+    use hammer_runtime::app::AppSession;
 
     fn infra_vec<T>(items: impl IntoIterator<Item = T>) -> hammer_infra::vec::Vec<T> {
         let mut values = hammer_infra::vec::Vec::new();
@@ -808,6 +807,9 @@ mod tests {
         send_params_calls: usize,
         push_header_calls: usize,
         custom_tx_calls: usize,
+        snd_space: Option<usize>,
+        send_goal_size: usize,
+        flags: TransportSendFlags,
     }
 
     impl SessionQueueProtocol for FakeTxProtocol {
@@ -841,10 +843,10 @@ mod tests {
         ) -> CoreResult<TransportSendParams> {
             self.send_params_calls += 1;
             Ok(TransportSendParams {
-                snd_space: pending_len,
+                snd_space: self.snd_space.unwrap_or(pending_len),
                 tx_offset: 0,
-                send_goal_size: 4,
-                flags: TransportSendFlags::default(),
+                send_goal_size: self.send_goal_size.max(1),
+                flags: self.flags,
             })
         }
 
@@ -1238,5 +1240,65 @@ mod tests {
         assert_eq!(protocol.push_header_calls, 0);
         assert_eq!(protocol.custom_tx_calls, 0);
         assert!(!driver.has_session_tx(session_id));
+    }
+
+    #[test]
+    fn session_tx_requeues_remaining_data_even_with_transport_desched_flag() {
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 2048,
+                    buffer_slots: 16,
+                    frame_capacity: 8,
+                    frame_slots: 8,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
+        let buffers = runtime.buffers();
+        let mut driver = SessionDriverRuntime::<FakeTxProtocol, Local>::new(
+            DataWorkerId::new(0),
+            buffers.clone(),
+        );
+        let session_id = driver.insert_session(FakeTxProtocol {
+            snd_space: Some(0),
+            send_goal_size: 4,
+            flags: TransportSendFlags::DESCHED,
+            ..FakeTxProtocol::default()
+        });
+
+        let app_session = Arc::new(
+            AppSession::<Local>::new_in_segment(
+                Local::default(),
+                AppSessionConfig::new(256, 64),
+                SessionHandle::new(session_id.pool_index().slot() as u32, 0),
+                driver.app().tx_evt_q().clone(),
+            )
+            .expect("create app session"),
+        );
+        app_session
+            .send_bytes(&[0xABu8; 8])
+            .expect("send tx payload");
+
+        driver.app_mut().attach_session(session_id, app_session);
+        driver.mark_ready(session_id);
+        let next: crate::session::SessionQueueNext = NodeId::new(9).into();
+        let mut output = crate::session::node::SessionQueueOutput::default();
+        let mut step = driver.poll_once_for_ticks(0).expect("poll");
+
+        dispatch_session_queue_pending(
+            &runtime,
+            &mut driver,
+            next,
+            &mut output,
+            &mut step,
+            Instant::now(),
+        )
+        .expect("dispatch partial tx");
+
+        let protocol = driver.session(session_id).expect("protocol state");
+        assert_eq!(protocol.send_params_calls, 1);
+        assert_eq!(protocol.push_header_calls, 0);
+        assert!(driver.has_session_tx(session_id));
+        assert_eq!(driver.take_ready_sessions(), infra_vec([session_id]));
     }
 }
