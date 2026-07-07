@@ -4,6 +4,7 @@ use core::mem;
 use core::ptr::{self, NonNull};
 use core::slice;
 use core::sync::atomic::{AtomicU64, Ordering};
+use std::alloc::handle_alloc_error;
 use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::future::Future;
@@ -13,13 +14,13 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
-use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::error::{CoreError, CoreResult, DataPlaneError};
 use hammer_infra::{
     align::align_up,
+    boxed::Slice,
     heap::Heap,
     prefetch::{prefetch_read_l1, prefetch_read_l2, prefetch_write_l1},
     simd::movemask_4,
-    vec::Vec,
 };
 use spinning_top::{
     RawRwSpinlock, RwSpinlock,
@@ -27,7 +28,7 @@ use spinning_top::{
     relax::Spin,
 };
 
-use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HandoffIndices};
+use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HANDOFF_SLOT_CAPACITY, HandoffSlot};
 use crate::instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
 use crate::memory::{HAMMER_MAX_NUMA_NODES, StaticNumaTable};
 use crate::node::{NodeEntry, NodeHandle, NodeId, NodeNext, NodeRuntime};
@@ -849,6 +850,7 @@ struct BufferSlot {
 
 struct BufferPoolInner {
     pool_id: u64,
+    numa_node: u32,
     slot_capacity: usize,
     slot_stride: usize,
     region: Arc<Heap>,
@@ -1016,8 +1018,9 @@ struct FrameSlot {
 #[derive(Debug)]
 struct FramePoolInner {
     pool_id: u64,
-    slots: Vec<FrameSlot>,
-    available: Vec<u32>,
+    slots: Slice<FrameSlot>,
+    available: Slice<u32>,
+    available_len: usize,
     in_use: usize,
 }
 
@@ -1026,15 +1029,49 @@ pub(crate) struct FramePool {
     inner: Rc<RefCell<FramePoolInner>>,
 }
 
-pub enum Next {}
+pub struct Next {
+    owner: DataPlaneBuffers,
+    index: FrameIndex,
+    next: NodeId,
+    frame: Option<BufferFrame>,
+}
 
-pub enum Pending {}
-
-pub struct Frame<State> {
+pub struct Pending {
     owner: DataPlaneBuffers,
     index: FrameIndex,
     frame: Option<BufferFrame>,
-    state: PhantomData<State>,
+}
+
+pub struct Frame<State> {
+    state: State,
+}
+
+#[derive(Debug, Clone)]
+pub struct DataPlaneBufferConfig {
+    pub buffer_slot_capacity: usize,
+    pub buffer_slots: usize,
+    pub frame_capacity: usize,
+    pub frame_slots: usize,
+    pub instruction_set: DataPlaneInstructionSet,
+    pub numa_nodes: &'static [u32],
+    pub thread_index: u32,
+    pub active_numa_node: u32,
+}
+
+impl Default for DataPlaneBufferConfig {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            buffer_slot_capacity: BUFFER_CACHE_LINE_SIZE,
+            buffer_slots: 1024,
+            frame_capacity: DEFAULT_BUFFER_FRAME_CAPACITY,
+            frame_slots: DEFAULT_BUFFER_FRAME_POOL_SIZE,
+            instruction_set: DataPlaneInstructionSet::native(),
+            numa_nodes: &[0],
+            thread_index: 0,
+            active_numa_node: 0,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1047,6 +1084,11 @@ pub struct DataPlaneBuffers {
     frame_slots: usize,
     instruction_set: DataPlaneInstructionSet,
     trace: DataPlaneTrace,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DataPlaneRuntimeConfig {
+    pub buffers: DataPlaneBufferConfig,
 }
 
 #[derive(Debug)]
@@ -1092,6 +1134,40 @@ impl fmt::Debug for DataPlaneRuntimeWorkerSeed {
     }
 }
 
+struct HandoffSlotGuard<'runtime> {
+    runtime: &'runtime DataPlaneRuntime,
+    slot: Option<HandoffSlot>,
+}
+
+impl<'runtime> HandoffSlotGuard<'runtime> {
+    #[inline]
+    fn new(runtime: &'runtime DataPlaneRuntime, slot: HandoffSlot) -> Self {
+        Self {
+            runtime,
+            slot: Some(slot),
+        }
+    }
+
+    #[inline]
+    fn push_into_frame(&mut self, frame: &mut Frame<Next>) -> CoreResult<()> {
+        match self.slot.as_ref() {
+            Some(slot) => frame.push_indices(slot.iter())?,
+            None => return Ok(()),
+        }
+        self.slot = None;
+        Ok(())
+    }
+}
+
+impl Drop for HandoffSlotGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            self.runtime.drop_handoff_slot_owned(slot);
+        }
+    }
+}
+
 impl Clone for DataPlaneRuntime {
     fn clone(&self) -> Self {
         Self {
@@ -1108,7 +1184,7 @@ impl Clone for DataPlaneRuntime {
 impl DataPlaneRuntimeWorkerSeed {
     #[inline]
     fn clone_for_worker(&self, thread_index: u32, numa_node: u32) -> DataPlaneRuntime {
-        let mut runtime = DataPlaneRuntime::with_worker_buffer_arenas_and_frame_capacity(
+        let mut runtime = DataPlaneRuntime::from_worker_buffer_arenas(
             self.buffer_arenas.clone(),
             self.frame_capacity,
             self.frame_slots,
@@ -1119,7 +1195,7 @@ impl DataPlaneRuntimeWorkerSeed {
         runtime.handoff = self.handoff.clone();
         runtime.handoff_node_handle = self.handoff_node_handle;
         if let Some(handoff) = runtime.handoff.clone() {
-            runtime.buffers = runtime.buffers.with_handoff(handoff);
+            runtime.buffers = runtime.buffers.attach_handoff_worker(handoff);
             runtime.active_numa_node = runtime.buffers.active_numa_node();
         }
         runtime
@@ -1139,51 +1215,66 @@ fn next_frame_pool_id() -> u64 {
     NEXT_FRAME_POOL_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-impl<State> Frame<State> {
-    #[inline]
-    pub fn index(&self) -> FrameIndex {
-        self.index
-    }
-
-    #[inline]
-    fn take_inner(
-        &mut self,
-        consumed_message: &'static str,
-    ) -> (DataPlaneBuffers, FrameIndex, BufferFrame) {
-        let frame = self.frame.take().expect(consumed_message);
-        let owner = self.owner.clone();
-        let index = self.index;
-        (owner, index, frame)
-    }
-}
-
 impl Frame<Next> {
     #[inline]
-    fn take_for_submit(mut self, next: NodeId) -> Frame<Pending> {
-        let (owner, index, mut frame) = self.take_inner("next frame already consumed");
-        frame.set_next_node(next);
-        Frame {
-            owner,
-            index,
-            frame: Some(frame),
-            state: PhantomData,
+    fn frame(&self) -> &BufferFrame {
+        match self.state.frame.as_ref() {
+            Some(frame) => frame,
+            None => abort_checked_out_frame(),
+        }
+    }
+
+    #[inline]
+    fn frame_mut(&mut self) -> &mut BufferFrame {
+        match self.state.frame.as_mut() {
+            Some(frame) => frame,
+            None => abort_checked_out_frame(),
+        }
+    }
+
+    #[inline]
+    pub fn index(&self) -> FrameIndex {
+        self.state.index
+    }
+}
+
+impl Frame<Pending> {
+    #[inline]
+    fn frame(&self) -> &BufferFrame {
+        match self.state.frame.as_ref() {
+            Some(frame) => frame,
+            None => abort_checked_out_frame(),
+        }
+    }
+
+    #[inline]
+    fn frame_mut(&mut self) -> &mut BufferFrame {
+        match self.state.frame.as_mut() {
+            Some(frame) => frame,
+            None => abort_checked_out_frame(),
+        }
+    }
+
+    #[inline]
+    pub fn index(&self) -> FrameIndex {
+        self.state.index
+    }
+}
+
+#[cold]
+fn abort_checked_out_frame() -> ! {
+    std::process::abort()
+}
+
+impl Drop for Next {
+    fn drop(&mut self) {
+        if let Some(frame) = self.frame.take() {
+            self.owner.drop_owned_frame(self.index, frame);
         }
     }
 }
 
-impl From<Frame<Pending>> for Frame<Next> {
-    fn from(mut pending: Frame<Pending>) -> Self {
-        let (owner, index, frame) = pending.take_inner("pending frame already consumed");
-        Self {
-            owner,
-            index,
-            frame: Some(frame),
-            state: PhantomData,
-        }
-    }
-}
-
-impl<State> Drop for Frame<State> {
+impl Drop for Pending {
     fn drop(&mut self) {
         if let Some(frame) = self.frame.take() {
             self.owner.drop_owned_frame(self.index, frame);
@@ -1193,146 +1284,44 @@ impl<State> Drop for Frame<State> {
 
 impl DataPlaneBuffers {
     #[inline]
-    pub fn with_numa_buffer_capacity(
-        slot_capacity: usize,
-        slots_per_numa: usize,
-        numa_nodes: &[u32],
-    ) -> Self {
-        Self::with_numa_capacities_and_instruction_set(
-            slot_capacity,
-            slots_per_numa,
-            DEFAULT_BUFFER_FRAME_CAPACITY,
-            DEFAULT_BUFFER_FRAME_POOL_SIZE,
-            numa_nodes,
-            DataPlaneInstructionSet::native(),
-        )
+    pub fn new(config: DataPlaneBufferConfig) -> Self {
+        Self::from_numa_config(config)
     }
 
     #[inline]
-    pub fn with_buffer_capacity(slot_capacity: usize, slots: usize) -> Self {
-        Self::with_capacities_and_instruction_set(
-            slot_capacity,
-            slots,
-            DEFAULT_BUFFER_FRAME_CAPACITY,
-            DEFAULT_BUFFER_FRAME_POOL_SIZE,
-            DataPlaneInstructionSet::native(),
-        )
-    }
-
-    #[inline]
-    pub fn with_capacities(
-        buffer_slot_capacity: usize,
-        buffer_slots: usize,
-        frame_capacity: usize,
-        frame_slots: usize,
-    ) -> Self {
-        Self::with_capacities_and_instruction_set(
-            buffer_slot_capacity,
-            buffer_slots,
-            frame_capacity,
-            frame_slots,
-            DataPlaneInstructionSet::native(),
-        )
-    }
-
-    #[inline]
-    pub fn with_buffer_capacity_and_instruction_set(
-        slot_capacity: usize,
-        slots: usize,
-        instruction_set: DataPlaneInstructionSet,
-    ) -> Self {
-        Self::with_capacities_and_instruction_set(
-            slot_capacity,
-            slots,
-            DEFAULT_BUFFER_FRAME_CAPACITY,
-            DEFAULT_BUFFER_FRAME_POOL_SIZE,
-            instruction_set,
-        )
-    }
-
-    #[inline]
-    pub fn with_capacities_and_instruction_set(
-        buffer_slot_capacity: usize,
-        buffer_slots: usize,
-        frame_capacity: usize,
-        frame_slots: usize,
-        instruction_set: DataPlaneInstructionSet,
-    ) -> Self {
-        Self::with_buffer_arenas_and_frame_capacity(
-            Self::single_numa_buffer_arenas(BufferPoolArena::with_capacity(
-                buffer_slot_capacity,
-                buffer_slots,
-            )),
-            frame_capacity,
-            frame_slots,
-            instruction_set,
-            0,
-            0,
-        )
-    }
-
-    #[inline]
-    pub fn with_buffer_arena_and_frame_capacity(
-        buffer_arena: BufferPoolArena,
-        frame_capacity: usize,
-        frame_slots: usize,
-        instruction_set: DataPlaneInstructionSet,
-    ) -> Self {
-        Self::with_buffer_arenas_and_frame_capacity(
-            Self::single_numa_buffer_arenas(buffer_arena),
-            frame_capacity,
-            frame_slots,
-            instruction_set,
-            0,
-            0,
-        )
-    }
-
-    #[inline]
-    fn with_numa_capacities_and_instruction_set(
-        buffer_slot_capacity: usize,
-        buffer_slots_per_numa: usize,
-        frame_capacity: usize,
-        frame_slots: usize,
-        numa_nodes: &[u32],
-        instruction_set: DataPlaneInstructionSet,
-    ) -> Self {
+    fn from_numa_config(config: DataPlaneBufferConfig) -> Self {
         let mut buffer_arenas = StaticNumaTable::new();
-        let configured_numa_nodes = if numa_nodes.is_empty() {
+        let configured_numa_nodes = if config.numa_nodes.is_empty() {
             &[0][..]
         } else {
-            numa_nodes
+            config.numa_nodes
         };
         for &numa_node in configured_numa_nodes {
-            let heap = Arc::new(Heap::local(numa_node));
-            buffer_arenas
-                .insert(
+            let heap = Arc::new(Heap::local());
+            let inserted = buffer_arenas.insert(
+                numa_node,
+                BufferPoolArena::with_capacity_in(
+                    config.buffer_slot_capacity,
+                    config.buffer_slots,
+                    heap,
                     numa_node,
-                    BufferPoolArena::with_capacity_in(
-                        buffer_slot_capacity,
-                        buffer_slots_per_numa,
-                        heap,
-                    ),
-                )
-                .expect("NUMA node must fit static buffer arena table");
+                ),
+            );
+            debug_assert!(inserted.is_ok());
         }
-        let active_numa_node = if let Some(&first_numa_node) = configured_numa_nodes.first() {
-            first_numa_node
-        } else {
-            0
-        };
-        Self::with_buffer_arenas_and_frame_capacity(
+        let active_numa_node = Self::resolve_numa_node(&buffer_arenas, config.active_numa_node);
+        Self::from_buffer_arenas(
             buffer_arenas,
-            frame_capacity,
-            frame_slots,
-            instruction_set,
-            0,
+            config.frame_capacity,
+            config.frame_slots,
+            config.instruction_set,
+            config.thread_index,
             active_numa_node,
         )
     }
 
     #[inline]
-    fn with_buffer_arenas_and_frame_capacity(
+    fn from_buffer_arenas(
         buffer_arenas: StaticNumaTable<BufferPoolArena, HAMMER_MAX_NUMA_NODES>,
         frame_capacity: usize,
         frame_slots: usize,
@@ -1354,7 +1343,7 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    fn with_worker_buffer_arenas_and_frame_capacity(
+    fn from_worker_buffer_arenas(
         buffer_arenas: StaticNumaTable<BufferPoolArena, HAMMER_MAX_NUMA_NODES>,
         frame_capacity: usize,
         frame_slots: usize,
@@ -1377,7 +1366,7 @@ impl DataPlaneBuffers {
 
     #[inline]
     pub fn clone_for_worker(&self, thread_index: u32, numa_node: u32) -> Self {
-        Self::with_worker_buffer_arenas_and_frame_capacity(
+        Self::from_worker_buffer_arenas(
             self.buffer_arenas(),
             self.frame_capacity,
             self.frame_slots,
@@ -1388,35 +1377,36 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    fn with_handoff(mut self, handoff: DataPlaneHandoffWorker) -> Self {
+    fn attach_handoff_worker(mut self, handoff: DataPlaneHandoffWorker) -> Self {
         let Some(configured_arena) = handoff.configured_buffer_arena() else {
             return self;
         };
-        let active_numa_node = self.active_numa_node;
+        let active_numa_node = configured_arena.numa_node();
         let mut buffer_pools = StaticNumaTable::new();
         for index in 0..HAMMER_MAX_NUMA_NODES {
-            let numa_node = u32::try_from(index).expect("static NUMA node index fits in u32");
+            let numa_node = index as u32;
+            if numa_node == active_numa_node {
+                continue;
+            }
             let Some(pool) = self.buffer_pools.get(numa_node).cloned() else {
                 continue;
             };
-            let pool = if numa_node == active_numa_node {
-                BufferPool::with_arena(configured_arena.clone())
-            } else {
-                pool
-            };
-            buffer_pools
-                .insert(numa_node, pool)
-                .expect("buffer pool NUMA node must fit static table");
+            let inserted = buffer_pools.insert(numa_node, pool);
+            debug_assert!(inserted.is_ok());
         }
+        let inserted =
+            buffer_pools.insert(active_numa_node, BufferPool::with_arena(configured_arena));
+        debug_assert!(inserted.is_ok());
         self.buffer_pools = buffer_pools;
+        self.active_numa_node = active_numa_node;
         self
     }
 
     #[inline]
-    pub fn buffers(&self) -> &BufferPool {
+    pub fn try_buffers(&self) -> CoreResult<&BufferPool> {
         self.buffer_pools
             .get(self.active_numa_node)
-            .expect("active NUMA buffer pool must exist")
+            .ok_or(DataPlaneError::ActiveNumaBufferPoolMissing.into())
     }
 
     #[inline]
@@ -1441,12 +1431,14 @@ impl DataPlaneBuffers {
 
     #[inline]
     pub fn in_use_buffers(&self) -> usize {
-        self.buffers().in_use()
+        self.try_buffers().map(BufferPool::in_use).unwrap_or(0)
     }
 
     #[inline]
     pub fn cached_free_buffers(&self) -> usize {
-        self.buffers().cached_free_len()
+        self.try_buffers()
+            .map(BufferPool::cached_free_len)
+            .unwrap_or(0)
     }
 
     #[inline]
@@ -1456,17 +1448,19 @@ impl DataPlaneBuffers {
 
     #[inline]
     pub fn alloc_index(&self) -> CoreResult<BufferIndex> {
-        self.buffers().alloc_index()
+        self.try_buffers()?.alloc_index()
     }
 
     #[inline]
     pub fn alloc_index_with_bytes(&self, bytes: &[u8]) -> CoreResult<BufferIndex> {
-        self.buffers().alloc_index_with_bytes(bytes)
+        self.try_buffers()?.alloc_index_with_bytes(bytes)
     }
 
     #[inline]
-    fn free_index(&self, index: BufferIndex) {
-        let buffers = self.buffers();
+    fn drop_index_owned(&self, index: BufferIndex) {
+        let Ok(buffers) = self.try_buffers() else {
+            return;
+        };
         let mut cache = buffers.thread_cache.borrow_mut();
         buffers
             .arena
@@ -1477,123 +1471,114 @@ impl DataPlaneBuffers {
 
     #[inline]
     pub fn attach_clone(&self, head: BufferIndex, tail: BufferIndex) -> CoreResult<()> {
-        self.buffers().attach_clone(head, tail)
+        self.try_buffers()?.attach_clone(head, tail)
     }
 
     #[inline]
     pub fn chain_buffer(&self, head: BufferIndex, tail: BufferIndex) -> CoreResult<()> {
-        self.buffers().chain_buffer(head, tail)
+        self.try_buffers()?.chain_buffer(head, tail)
     }
 
     #[inline]
     pub fn prefetch_header(&self, index: BufferIndex) {
-        self.buffers().prefetch_header(index);
+        if let Ok(buffers) = self.try_buffers() {
+            buffers.prefetch_header(index);
+        }
     }
 
     #[inline]
     pub fn prefetch_read(&self, index: BufferIndex) {
-        self.buffers().prefetch_read(index);
+        if let Ok(buffers) = self.try_buffers() {
+            buffers.prefetch_read(index);
+        }
     }
 
     #[inline]
     pub fn prefetch_write(&self, index: BufferIndex) {
-        self.buffers().prefetch_write(index);
+        if let Ok(buffers) = self.try_buffers() {
+            buffers.prefetch_write(index);
+        }
     }
 
     #[inline]
-    fn free_frame(&self, frame: &mut BufferFrame) {
+    fn drop_frame_indices(&self, frame: &mut BufferFrame) {
         for index in frame.drain_indices() {
-            self.free_index(index);
+            self.drop_index_owned(index);
         }
     }
 
     #[inline]
     fn drop_owned_frame(&self, index: FrameIndex, frame: BufferFrame) {
         let mut frame = frame;
-        self.free_frame(&mut frame);
+        self.drop_frame_indices(&mut frame);
         frame.reset_for_pool_reuse();
-        self.frames
-            .return_taken_index(index, frame)
-            .expect("owned frame must return to its originating pool");
+        let _ = self.frames.return_taken_index(index, frame);
     }
 
     #[inline]
-    pub fn alloc_frame(&self) -> CoreResult<Frame<Next>> {
+    fn alloc_frame(&self) -> CoreResult<(FrameIndex, BufferFrame)> {
         let index = self.frames.alloc_index()?;
         match self.frames.take_index(index) {
-            Ok(frame) => Ok(Frame {
-                owner: self.clone(),
-                index,
-                frame: Some(frame),
-                state: PhantomData::<Next>,
-            }),
+            Ok(frame) => Ok((index, frame)),
             Err(err) => {
-                let _ = self.frames.free_index(self.buffers(), index);
+                let buffers = self.try_buffers()?;
+                let _ = self.frames.return_index(buffers, index);
                 Err(err)
             }
         }
     }
 
     #[inline]
+    pub fn get_next_frame(&self, next: NodeId) -> CoreResult<Frame<Next>> {
+        let (index, frame) = self.alloc_frame()?;
+        Ok(Frame {
+            state: Next {
+                owner: self.clone(),
+                index,
+                next,
+                frame: Some(frame),
+            },
+        })
+    }
+
+    #[inline]
     pub fn get_buffer(&self, index: BufferIndex) -> CoreResult<BufferRef<'_>> {
-        self.buffers().get(index)
+        self.try_buffers()?.get(index)
     }
 
     #[inline]
     pub fn get_buffer_mut(&self, index: BufferIndex) -> CoreResult<BufferRefMut<'_>> {
-        self.buffers().get_mut(index)
+        self.try_buffers()?.get_mut(index)
     }
 
     #[inline]
-    pub fn chain(
-        &self,
-        index: BufferIndex,
-    ) -> impl Iterator<Item = CoreResult<BufferRef<'_>>> + '_ {
-        self.buffers().chain(index)
+    pub fn chain(&self, index: BufferIndex) -> DataPlaneBufferChain<'_> {
+        DataPlaneBufferChain::new(self.try_buffers(), index)
     }
 
     #[inline]
     pub fn node_error_code(&self, index: BufferIndex) -> CoreResult<Option<u16>> {
-        self.buffers().node_error_code(index)
+        self.try_buffers()?.node_error_code(index)
     }
 
     #[inline]
     pub fn current_config(&self, index: BufferIndex) -> CoreResult<crate::NodeId> {
-        self.buffers().current_config(index)
+        self.try_buffers()?.current_config(index)
     }
 
     #[inline]
     pub fn set_current_config(&self, index: BufferIndex, next: crate::NodeId) -> CoreResult<()> {
-        self.buffers().set_current_config(index, next)
+        self.try_buffers()?.set_current_config(index, next)
     }
 
     #[inline]
     pub fn advance(&self, index: BufferIndex, displacement: isize) -> CoreResult<()> {
-        self.buffers().advance(index, displacement)
+        self.try_buffers()?.advance(index, displacement)
     }
 
     #[inline]
     pub fn append(&self, index: BufferIndex, bytes: &[u8]) -> CoreResult<()> {
-        self.buffers().append(index, bytes)
-    }
-
-    #[inline]
-    fn single_numa_buffer_arenas(
-        buffer_arena: BufferPoolArena,
-    ) -> StaticNumaTable<BufferPoolArena, HAMMER_MAX_NUMA_NODES> {
-        Self::single_numa_buffer_arenas_for_node(buffer_arena, 0)
-    }
-
-    #[inline]
-    fn single_numa_buffer_arenas_for_node(
-        buffer_arena: BufferPoolArena,
-        numa_node: u32,
-    ) -> StaticNumaTable<BufferPoolArena, HAMMER_MAX_NUMA_NODES> {
-        let mut buffer_arenas = StaticNumaTable::new();
-        buffer_arenas
-            .insert(numa_node, buffer_arena)
-            .expect("NUMA node must fit static buffer arena table");
-        buffer_arenas
+        self.try_buffers()?.append(index, bytes)
     }
 
     #[inline]
@@ -1602,13 +1587,12 @@ impl DataPlaneBuffers {
     ) -> StaticNumaTable<BufferPool, HAMMER_MAX_NUMA_NODES> {
         let mut buffer_pools = StaticNumaTable::new();
         for index in 0..HAMMER_MAX_NUMA_NODES {
-            let numa_node = u32::try_from(index).expect("static NUMA node index fits in u32");
+            let numa_node = index as u32;
             let Some(arena) = buffer_arenas.get(numa_node).cloned() else {
                 continue;
             };
-            buffer_pools
-                .insert(numa_node, BufferPool::with_arena(arena))
-                .expect("buffer pool NUMA node must fit static table");
+            let inserted = buffer_pools.insert(numa_node, BufferPool::with_arena(arena));
+            debug_assert!(inserted.is_ok());
         }
         buffer_pools
     }
@@ -1619,13 +1603,12 @@ impl DataPlaneBuffers {
     ) -> StaticNumaTable<BufferPool, HAMMER_MAX_NUMA_NODES> {
         let mut buffer_pools = StaticNumaTable::new();
         for index in 0..HAMMER_MAX_NUMA_NODES {
-            let numa_node = u32::try_from(index).expect("static NUMA node index fits in u32");
+            let numa_node = index as u32;
             let Some(arena) = buffer_arenas.get(numa_node).cloned() else {
                 continue;
             };
-            buffer_pools
-                .insert(numa_node, BufferPool::with_worker_arena(arena))
-                .expect("buffer pool NUMA node must fit static table");
+            let inserted = buffer_pools.insert(numa_node, BufferPool::with_worker_arena(arena));
+            debug_assert!(inserted.is_ok());
         }
         buffer_pools
     }
@@ -1634,13 +1617,12 @@ impl DataPlaneBuffers {
     fn buffer_arenas(&self) -> StaticNumaTable<BufferPoolArena, HAMMER_MAX_NUMA_NODES> {
         let mut buffer_arenas = StaticNumaTable::new();
         for index in 0..HAMMER_MAX_NUMA_NODES {
-            let numa_node = u32::try_from(index).expect("static NUMA node index fits in u32");
+            let numa_node = index as u32;
             let Some(pool) = self.buffer_pools.get(numa_node) else {
                 continue;
             };
-            buffer_arenas
-                .insert(numa_node, pool.arena())
-                .expect("buffer arena NUMA node must fit static table");
+            let inserted = buffer_arenas.insert(numa_node, pool.arena());
+            debug_assert!(inserted.is_ok());
         }
         buffer_arenas
     }
@@ -1657,7 +1639,7 @@ impl DataPlaneBuffers {
             return 0;
         }
         for index in 0..HAMMER_MAX_NUMA_NODES {
-            let numa_node = u32::try_from(index).expect("static NUMA node index fits in u32");
+            let numa_node = index as u32;
             if buffer_arenas.get(numa_node).is_some() {
                 return numa_node;
             }
@@ -1677,118 +1659,13 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    pub fn with_buffer_capacity(slot_capacity: usize, slots: usize) -> Self {
-        Self::with_capacities_and_instruction_set(
-            slot_capacity,
-            slots,
-            DEFAULT_BUFFER_FRAME_CAPACITY,
-            DEFAULT_BUFFER_FRAME_POOL_SIZE,
-            DataPlaneInstructionSet::native(),
-        )
+    pub fn new(config: DataPlaneRuntimeConfig) -> Self {
+        let buffers = DataPlaneBuffers::new(config.buffers);
+        Self::from_buffers(buffers)
     }
 
     #[inline]
-    pub fn with_numa_buffer_capacity(
-        slot_capacity: usize,
-        slots_per_numa: usize,
-        numa_nodes: &[u32],
-    ) -> Self {
-        Self::with_numa_capacities_and_instruction_set(
-            slot_capacity,
-            slots_per_numa,
-            DEFAULT_BUFFER_FRAME_CAPACITY,
-            DEFAULT_BUFFER_FRAME_POOL_SIZE,
-            numa_nodes,
-            DataPlaneInstructionSet::native(),
-        )
-    }
-
-    #[inline]
-    pub fn with_capacities(
-        buffer_slot_capacity: usize,
-        buffer_slots: usize,
-        frame_capacity: usize,
-        frame_slots: usize,
-    ) -> Self {
-        Self::with_capacities_and_instruction_set(
-            buffer_slot_capacity,
-            buffer_slots,
-            frame_capacity,
-            frame_slots,
-            DataPlaneInstructionSet::native(),
-        )
-    }
-
-    #[inline]
-    pub fn with_buffer_capacity_and_instruction_set(
-        slot_capacity: usize,
-        slots: usize,
-        instruction_set: DataPlaneInstructionSet,
-    ) -> Self {
-        Self::with_capacities_and_instruction_set(
-            slot_capacity,
-            slots,
-            DEFAULT_BUFFER_FRAME_CAPACITY,
-            DEFAULT_BUFFER_FRAME_POOL_SIZE,
-            instruction_set,
-        )
-    }
-
-    #[inline]
-    pub fn with_capacities_and_instruction_set(
-        buffer_slot_capacity: usize,
-        buffer_slots: usize,
-        frame_capacity: usize,
-        frame_slots: usize,
-        instruction_set: DataPlaneInstructionSet,
-    ) -> Self {
-        Self::with_buffer_arenas_and_frame_capacity(
-            DataPlaneBuffers::single_numa_buffer_arenas(BufferPoolArena::with_capacity(
-                buffer_slot_capacity,
-                buffer_slots,
-            )),
-            frame_capacity,
-            frame_slots,
-            instruction_set,
-            0,
-            0,
-        )
-    }
-
-    #[inline]
-    pub fn with_buffer_arena_and_frame_capacity(
-        buffer_arena: BufferPoolArena,
-        frame_capacity: usize,
-        frame_slots: usize,
-        instruction_set: DataPlaneInstructionSet,
-    ) -> Self {
-        Self::with_buffer_arenas_and_frame_capacity(
-            DataPlaneBuffers::single_numa_buffer_arenas(buffer_arena),
-            frame_capacity,
-            frame_slots,
-            instruction_set,
-            0,
-            0,
-        )
-    }
-
-    #[inline]
-    fn with_numa_capacities_and_instruction_set(
-        buffer_slot_capacity: usize,
-        buffer_slots_per_numa: usize,
-        frame_capacity: usize,
-        frame_slots: usize,
-        numa_nodes: &[u32],
-        instruction_set: DataPlaneInstructionSet,
-    ) -> Self {
-        let buffers = DataPlaneBuffers::with_numa_capacities_and_instruction_set(
-            buffer_slot_capacity,
-            buffer_slots_per_numa,
-            frame_capacity,
-            frame_slots,
-            numa_nodes,
-            instruction_set,
-        );
+    fn from_buffers(buffers: DataPlaneBuffers) -> Self {
         Self {
             active_numa_node: buffers.active_numa_node(),
             buffers,
@@ -1800,7 +1677,7 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    fn with_buffer_arenas_and_frame_capacity(
+    fn from_worker_buffer_arenas(
         buffer_arenas: StaticNumaTable<BufferPoolArena, HAMMER_MAX_NUMA_NODES>,
         frame_capacity: usize,
         frame_slots: usize,
@@ -1808,7 +1685,7 @@ impl DataPlaneRuntime {
         thread_index: u32,
         requested_numa_node: u32,
     ) -> Self {
-        let buffers = DataPlaneBuffers::with_buffer_arenas_and_frame_capacity(
+        let buffers = DataPlaneBuffers::from_worker_buffer_arenas(
             buffer_arenas,
             frame_capacity,
             frame_slots,
@@ -1816,58 +1693,7 @@ impl DataPlaneRuntime {
             thread_index,
             requested_numa_node,
         );
-        Self {
-            active_numa_node: buffers.active_numa_node(),
-            buffers,
-            nodes: NodeRuntime::default(),
-            current_node: Rc::new(Cell::new(None)),
-            handoff: None,
-            handoff_node_handle: None,
-        }
-    }
-
-    #[inline]
-    fn with_worker_buffer_arenas_and_frame_capacity(
-        buffer_arenas: StaticNumaTable<BufferPoolArena, HAMMER_MAX_NUMA_NODES>,
-        frame_capacity: usize,
-        frame_slots: usize,
-        instruction_set: DataPlaneInstructionSet,
-        thread_index: u32,
-        requested_numa_node: u32,
-    ) -> Self {
-        let buffers = DataPlaneBuffers::with_worker_buffer_arenas_and_frame_capacity(
-            buffer_arenas,
-            frame_capacity,
-            frame_slots,
-            instruction_set,
-            thread_index,
-            requested_numa_node,
-        );
-        Self {
-            active_numa_node: buffers.active_numa_node(),
-            buffers,
-            nodes: NodeRuntime::default(),
-            current_node: Rc::new(Cell::new(None)),
-            handoff: None,
-            handoff_node_handle: None,
-        }
-    }
-
-    #[inline]
-    pub(crate) fn with_static_buffer_arena(
-        arena: BufferPoolArena,
-        frame_capacity: usize,
-        frame_slots: usize,
-        numa_node: u32,
-    ) -> Self {
-        Self::with_buffer_arenas_and_frame_capacity(
-            DataPlaneBuffers::single_numa_buffer_arenas_for_node(arena, numa_node),
-            frame_capacity,
-            frame_slots,
-            DataPlaneInstructionSet::native(),
-            0,
-            numa_node,
-        )
+        Self::from_buffers(buffers)
     }
 
     #[inline]
@@ -1895,54 +1721,32 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    pub fn with_handoff(
+    pub fn attach_handoff_worker(
         mut runtime: Self,
         worker: DataWorkerId,
         handoff: DataPlaneHandoffWorker,
     ) -> Self {
         debug_assert_eq!(worker, handoff.worker());
-        runtime.buffers = runtime.buffers.with_handoff(handoff.clone());
+        runtime.buffers = runtime.buffers.attach_handoff_worker(handoff.clone());
+        runtime.active_numa_node = runtime.buffers.active_numa_node();
         runtime.handoff = Some(handoff);
         runtime
     }
 
     #[inline]
-    pub fn with_handoff_node_handle(mut self, handle: NodeHandle) -> Self {
+    pub fn set_handoff_node_handle(&mut self, handle: NodeHandle) {
         self.handoff_node_handle = Some(handle);
-        self
     }
 
     #[inline]
     pub fn handoff_node_handle(&self) -> CoreResult<NodeHandle> {
         self.handoff_node_handle
-            .ok_or_else(|| CoreError::internal("data plane handoff node handle is not configured"))
+            .ok_or(DataPlaneError::HandoffNodeHandleMissing.into())
     }
 
     #[inline]
     pub fn active_numa_node(&self) -> u32 {
         self.active_numa_node
-    }
-
-    #[inline]
-    pub fn with_handoff_capacities(
-        worker: DataWorkerId,
-        handoff: DataPlaneHandoffWorker,
-        frame_capacity: usize,
-        frame_slots: usize,
-        instruction_set: DataPlaneInstructionSet,
-    ) -> Self {
-        debug_assert_eq!(worker, handoff.worker());
-        let arena = handoff.buffer_arena();
-        let numa_node = arena.heap_numa_node();
-        let runtime = Self::with_buffer_arenas_and_frame_capacity(
-            DataPlaneBuffers::single_numa_buffer_arenas_for_node(arena, numa_node),
-            frame_capacity,
-            frame_slots,
-            instruction_set,
-            0,
-            numa_node,
-        );
-        Self::with_handoff(runtime, worker, handoff)
     }
 
     #[inline]
@@ -1976,8 +1780,8 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    fn free_index(&self, index: BufferIndex) {
-        self.buffers.free_index(index);
+    fn drop_index_owned(&self, index: BufferIndex) {
+        self.buffers.drop_index_owned(index);
     }
 
     #[inline]
@@ -2009,22 +1813,24 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    pub fn alloc_frame(&self) -> CoreResult<Frame<Next>> {
-        self.buffers.alloc_frame()
-    }
-
-    #[inline]
-    pub fn submit_frame(&self, frame: Frame<Next>, next: NodeId) -> CoreResult<()> {
-        if !frame.has_pending() {
+    pub fn put_next_frame(&self, mut frame: Frame<Next>) -> CoreResult<()> {
+        let next = frame.state.next;
+        let frame_inner = frame
+            .state
+            .frame
+            .take()
+            .ok_or(DataPlaneError::FrameSlotCheckedOut)?;
+        let pending = Frame {
+            state: Pending {
+                owner: frame.state.owner.clone(),
+                index: frame.state.index,
+                frame: Some(frame_inner),
+            },
+        };
+        if !pending.has_pending() {
             return Ok(());
         }
-        self.nodes
-            .schedule_frame(next, frame.take_for_submit(next), false)
-    }
-
-    #[inline]
-    pub fn take_pending_frame(&self) -> CoreResult<Option<Frame<Pending>>> {
-        Ok(self.nodes.take_scheduled_frame())
+        self.nodes.schedule_frame(next, pending, false)
     }
 
     #[inline]
@@ -2151,18 +1957,6 @@ impl DataPlaneRuntime {
         self.nodes.node_error_count(node, code)
     }
 
-    pub fn snapshot_node_errors(&self, node: NodeId) -> Vec<(u16, u64)> {
-        let mut out = Vec::new();
-        for code in 1..256u16 {
-            if let Ok(count) = self.node_error_count(node, code) {
-                if count > 0 {
-                    out.push((code, count));
-                }
-            }
-        }
-        out
-    }
-
     #[inline]
     pub fn instruction_set(&self) -> DataPlaneInstructionSet {
         self.buffers.instruction_set()
@@ -2175,8 +1969,20 @@ impl DataPlaneRuntime {
 
     #[inline]
     pub fn schedule_empty_frame(&self, node: NodeId) -> CoreResult<()> {
-        self.nodes
-            .schedule_frame(node, self.alloc_frame()?.take_for_submit(node), true)
+        let mut frame = self.buffers.get_next_frame(node)?;
+        let frame_inner = frame
+            .state
+            .frame
+            .take()
+            .ok_or(DataPlaneError::FrameSlotCheckedOut)?;
+        let pending = Frame {
+            state: Pending {
+                owner: frame.state.owner.clone(),
+                index: frame.state.index,
+                frame: Some(frame_inner),
+            },
+        };
+        self.nodes.schedule_frame(node, pending, true)
     }
 
     #[inline]
@@ -2213,62 +2019,19 @@ impl DataPlaneRuntime {
             return Ok(());
         };
         while let Some(handoff_frame) = handoff.pop() {
-            let node = match self.nodes.node_for_handle(handoff_frame.target) {
-                Ok(node) => node,
-                Err(err) => {
-                    self.free_handoff_indices(handoff_frame.indices);
-                    return Err(err);
-                }
-            };
-            let mut frame = match self.alloc_frame() {
-                Ok(frame) => frame,
-                Err(err) => {
-                    self.free_handoff_indices(handoff_frame.indices);
-                    return Err(err);
-                }
-            };
-            if let Err(err) = self.push_handoff_indices(&mut frame, handoff_frame.indices) {
-                return Err(err);
-            }
-            self.submit_frame(frame, node)?;
+            let mut slot = HandoffSlotGuard::new(self, handoff_frame.slot);
+            let node = self.nodes.node_for_handle(handoff_frame.target)?;
+            let mut frame = self.buffers.get_next_frame(node)?;
+            slot.push_into_frame(&mut frame)?;
+            self.put_next_frame(frame)?;
         }
         Ok(())
     }
 
     #[inline]
-    fn push_handoff_indices(
-        &self,
-        frame: &mut Frame<Next>,
-        indices: HandoffIndices,
-    ) -> CoreResult<()> {
-        match indices {
-            HandoffIndices::Single(index) => {
-                if let Err(err) = frame.push_index(index) {
-                    self.free_index(index);
-                    return Err(err);
-                }
-            }
-            HandoffIndices::Batch(indices) => {
-                if let Err(err) = frame.push_indices(indices.iter().copied()) {
-                    for index in indices {
-                        self.free_index(index);
-                    }
-                    return Err(err);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[inline]
-    fn free_handoff_indices(&self, indices: HandoffIndices) {
-        match indices {
-            HandoffIndices::Single(index) => self.free_index(index),
-            HandoffIndices::Batch(indices) => {
-                for index in indices {
-                    self.free_index(index);
-                }
-            }
+    fn drop_handoff_slot_owned(&self, slot: HandoffSlot) {
+        for index in slot.iter() {
+            self.drop_index_owned(index);
         }
     }
 
@@ -2280,14 +2043,26 @@ impl DataPlaneRuntime {
         frame: &mut BufferFrame,
     ) -> CoreResult<()> {
         let Some(handoff) = &self.handoff else {
-            return Err(CoreError::internal("data plane handoff is not configured"));
+            return Err(DataPlaneError::HandoffNotConfigured.into());
         };
-        handoff.ensure_enqueue_capacity(worker)?;
-        let indices = frame.drain_pending().collect::<Vec<_>>();
-        if indices.is_empty() {
+        let pending = frame.pending_indices().len();
+        if pending == 0 {
             return Ok(());
         }
-        handoff.enqueue(worker, target, indices)
+        let slots = pending.div_ceil(HANDOFF_SLOT_CAPACITY);
+        handoff.ensure_enqueue_slots(worker, slots)?;
+        while !frame.pending_indices().is_empty() {
+            let slot = HandoffSlot::from_prefix(frame.pending_indices());
+            let slot_len = slot.len();
+            match handoff.enqueue_slot(worker, target, slot) {
+                Ok(()) => frame.discard_prefix(slot_len),
+                Err(err) => {
+                    let (error, _) = err.into_parts();
+                    return Err(error.into());
+                }
+            }
+        }
+        Ok(())
     }
 
     #[inline]
@@ -2298,14 +2073,32 @@ impl DataPlaneRuntime {
         indices: impl IntoIterator<Item = BufferIndex>,
     ) -> CoreResult<()> {
         let Some(handoff) = &self.handoff else {
-            return Err(CoreError::internal("data plane handoff is not configured"));
+            return Err(DataPlaneError::HandoffNotConfigured.into());
         };
-        handoff.ensure_enqueue_capacity(worker)?;
-        let indices = indices.into_iter().collect::<Vec<_>>();
-        if indices.is_empty() {
-            return Ok(());
+        let mut indices = indices.into_iter();
+        if let (_, Some(upper)) = indices.size_hint() {
+            if upper == 0 {
+                return Ok(());
+            }
+            handoff.ensure_enqueue_slots(worker, upper.div_ceil(HANDOFF_SLOT_CAPACITY))?;
         }
-        handoff.enqueue(worker, target, indices)
+        let mut slot = HandoffSlot::new();
+        while let Some(index) = indices.next() {
+            if !slot.push(index) {
+                self.enqueue_handoff_slot_or_drop_rest(
+                    handoff,
+                    worker,
+                    target,
+                    slot,
+                    &mut indices,
+                )?;
+                slot = HandoffSlot::single(index);
+            }
+        }
+        if !slot.is_empty() {
+            self.enqueue_handoff_slot_or_drop_rest(handoff, worker, target, slot, &mut indices)?;
+        }
+        Ok(())
     }
 
     #[inline]
@@ -2316,21 +2109,57 @@ impl DataPlaneRuntime {
         index: BufferIndex,
     ) -> CoreResult<()> {
         let Some(handoff) = &self.handoff else {
-            return Err(CoreError::internal("data plane handoff is not configured"));
+            return Err(DataPlaneError::HandoffNotConfigured.into());
         };
-        handoff.ensure_enqueue_capacity(worker)?;
-        handoff.enqueue_index(worker, target, index)
+        handoff.ensure_enqueue_slots(worker, 1)?;
+        match handoff.enqueue_index(worker, target, index) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let (error, slot) = err.into_parts();
+                let guard = HandoffSlotGuard::new(self, slot);
+                drop(guard);
+                Err(error.into())
+            }
+        }
+    }
+
+    #[inline]
+    fn enqueue_handoff_slot_or_drop_rest(
+        &self,
+        handoff: &DataPlaneHandoffWorker,
+        worker: DataWorkerId,
+        target: NodeHandle,
+        slot: HandoffSlot,
+        rest: &mut impl Iterator<Item = BufferIndex>,
+    ) -> CoreResult<()> {
+        match handoff.enqueue_slot(worker, target, slot) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let (error, slot) = err.into_parts();
+                let guard = HandoffSlotGuard::new(self, slot);
+                drop(guard);
+                for index in rest {
+                    self.drop_index_owned(index);
+                }
+                Err(error.into())
+            }
+        }
     }
 }
 
 impl BufferPoolArena {
     #[inline]
     pub fn with_capacity(slot_capacity: usize, slots: usize) -> Self {
-        Self::with_capacity_in(slot_capacity, slots, Arc::new(Heap::local(0)))
+        Self::with_capacity_in(slot_capacity, slots, Arc::new(Heap::local()), 0)
     }
 
     #[inline]
-    pub fn with_capacity_in(slot_capacity: usize, slots: usize, heap: Arc<Heap>) -> Self {
+    pub fn with_capacity_in(
+        slot_capacity: usize,
+        slots: usize,
+        heap: Arc<Heap>,
+        numa_node: u32,
+    ) -> Self {
         assert!(slot_capacity > 0, "buffer slot capacity must be non-zero");
         assert!(
             slots > 0,
@@ -2388,6 +2217,7 @@ impl BufferPoolArena {
         Self {
             inner: Arc::new(RwSpinlock::new(BufferPoolInner {
                 pool_id: next_buffer_pool_id(),
+                numa_node,
                 slot_capacity,
                 slot_stride,
                 region: Arc::clone(&heap),
@@ -2413,8 +2243,8 @@ impl BufferPoolArena {
     }
 
     #[inline]
-    pub fn heap_numa_node(&self) -> u32 {
-        self.inner.read().region.numa_node()
+    pub fn numa_node(&self) -> u32 {
+        self.inner.read().numa_node
     }
 }
 
@@ -2451,8 +2281,8 @@ impl BufferPool {
     }
 
     #[inline]
-    pub fn heap_numa_node(&self) -> u32 {
-        self.arena.heap_numa_node()
+    pub fn numa_node(&self) -> u32 {
+        self.arena.numa_node()
     }
 
     #[inline]
@@ -2512,12 +2342,6 @@ impl BufferPool {
     }
 
     #[inline]
-    fn free_index(&self, index: BufferIndex) {
-        let mut cache = self.thread_cache.borrow_mut();
-        self.arena.inner.write().free_chain(&mut cache, index);
-    }
-
-    #[inline]
     pub fn attach_clone(&self, head: BufferIndex, tail: BufferIndex) -> CoreResult<()> {
         self.arena.inner.write().attach_clone(head, tail)
     }
@@ -2543,7 +2367,7 @@ impl BufferPool {
     }
 
     #[inline]
-    fn free_frame(&self, frame: &mut BufferFrame) {
+    fn drop_frame_indices(&self, frame: &mut BufferFrame) {
         let mut cache = self.thread_cache.borrow_mut();
         let mut pool = self.arena.inner.write();
         for index in frame.drain_indices() {
@@ -2719,22 +2543,23 @@ impl BufferPool {
 impl FramePool {
     #[inline]
     fn with_capacity(frame_capacity: usize, slots: usize) -> Self {
-        let available = (0..slots)
-            .rev()
-            .map(|slot| u32::try_from(slot).expect("frame slot index fits u32"))
-            .collect();
-        let slots = (0..slots)
-            .map(|_| FrameSlot {
-                generation: 0,
-                allocated: false,
-                frame: Some(BufferFrame::with_capacity(frame_capacity)),
-            })
-            .collect();
+        let mut available = Slice::from_elem(slots, 0u32);
+        for offset in 0..slots {
+            available[offset] =
+                u32::try_from(slots - offset - 1).expect("frame slot index fits u32");
+        }
+        let slots = Slice::from_fn(slots, |_| FrameSlot {
+            generation: 0,
+            allocated: false,
+            frame: Some(BufferFrame::with_capacity(frame_capacity)),
+        });
+        let available_len = slots.len();
         Self {
             inner: Rc::new(RefCell::new(FramePoolInner {
                 pool_id: next_frame_pool_id(),
                 slots,
                 available,
+                available_len,
                 in_use: 0,
             })),
         }
@@ -2751,10 +2576,10 @@ impl FramePool {
     }
 
     #[inline]
-    fn free_index(&self, buffers: &BufferPool, index: FrameIndex) -> CoreResult<()> {
+    fn return_index(&self, buffers: &BufferPool, index: FrameIndex) -> CoreResult<()> {
         let mut pool = self.inner.borrow_mut();
         let frame = pool.frame_mut(index)?;
-        buffers.free_frame(frame);
+        buffers.drop_frame_indices(frame);
         frame.reset_for_pool_reuse();
         pool.release_index(index)
     }
@@ -2775,20 +2600,21 @@ impl FramePool {
 impl FramePoolInner {
     #[inline]
     fn alloc_index(&mut self) -> CoreResult<FrameIndex> {
-        let slot = self
-            .available
-            .pop()
-            .ok_or_else(|| CoreError::internal("frame pool exhausted"))?;
+        if self.available_len == 0 {
+            return Err(DataPlaneError::FramePoolExhausted.into());
+        }
+        self.available_len -= 1;
+        let slot = self.available[self.available_len];
         let entry = self
             .slots
             .get_mut(slot as usize)
-            .ok_or_else(|| CoreError::internal("frame slot out of bounds"))?;
+            .ok_or(DataPlaneError::FrameSlotOutOfBounds)?;
         entry.generation = entry.generation.wrapping_add(1).max(1);
         entry.allocated = true;
         let frame = entry
             .frame
             .as_mut()
-            .ok_or_else(|| CoreError::internal("frame slot is checked out"))?;
+            .ok_or(DataPlaneError::FrameSlotCheckedOut)?;
         frame.reset_for_pool_reuse();
         self.in_use += 1;
         Ok(FrameIndex {
@@ -2801,7 +2627,7 @@ impl FramePoolInner {
     #[inline]
     fn validate_index(&self, index: FrameIndex) -> CoreResult<()> {
         if index.pool_id != self.pool_id {
-            return Err(CoreError::internal("frame index belongs to another pool"));
+            return Err(DataPlaneError::FrameIndexForeign.into());
         }
         Ok(())
     }
@@ -2812,17 +2638,17 @@ impl FramePoolInner {
         let entry = self
             .slots
             .get_mut(index.slot as usize)
-            .ok_or_else(|| CoreError::internal("frame slot out of bounds"))?;
+            .ok_or(DataPlaneError::FrameSlotOutOfBounds)?;
         if entry.generation != index.generation {
-            return Err(CoreError::internal("stale frame index"));
+            return Err(DataPlaneError::StaleFrameIndex.into());
         }
         if !entry.allocated {
-            return Err(CoreError::internal("frame slot is free"));
+            return Err(DataPlaneError::FrameSlotFree.into());
         }
         entry
             .frame
             .as_mut()
-            .ok_or_else(|| CoreError::internal("frame slot is checked out"))
+            .ok_or(DataPlaneError::FrameSlotCheckedOut.into())
     }
 
     #[inline]
@@ -2831,17 +2657,17 @@ impl FramePoolInner {
         let entry = self
             .slots
             .get_mut(index.slot as usize)
-            .ok_or_else(|| CoreError::internal("frame slot out of bounds"))?;
+            .ok_or(DataPlaneError::FrameSlotOutOfBounds)?;
         if entry.generation != index.generation {
-            return Err(CoreError::internal("stale frame index"));
+            return Err(DataPlaneError::StaleFrameIndex.into());
         }
         if !entry.allocated {
-            return Err(CoreError::internal("frame slot is free"));
+            return Err(DataPlaneError::FrameSlotFree.into());
         }
         entry
             .frame
             .take()
-            .ok_or_else(|| CoreError::internal("frame slot is checked out"))
+            .ok_or(DataPlaneError::FrameSlotCheckedOut.into())
     }
 
     #[inline]
@@ -2849,19 +2675,23 @@ impl FramePoolInner {
         let entry = self
             .slots
             .get_mut(index.slot as usize)
-            .ok_or_else(|| CoreError::internal("frame slot out of bounds"))?;
+            .ok_or(DataPlaneError::FrameSlotOutOfBounds)?;
         if entry.generation != index.generation {
-            return Err(CoreError::internal("stale frame index"));
+            return Err(DataPlaneError::StaleFrameIndex.into());
         }
         if !entry.allocated {
-            return Err(CoreError::internal("frame slot is free"));
+            return Err(DataPlaneError::FrameSlotFree.into());
         }
         if entry.frame.is_none() {
-            return Err(CoreError::internal("frame slot is checked out"));
+            return Err(DataPlaneError::FrameSlotCheckedOut.into());
         }
         entry.allocated = false;
         self.in_use = self.in_use.saturating_sub(1);
-        self.available.push(index.slot);
+        if self.available_len == self.available.len() {
+            return Err(DataPlaneError::FramePoolAvailableOverflow.into());
+        }
+        self.available[self.available_len] = index.slot;
+        self.available_len += 1;
         Ok(())
     }
 
@@ -2875,20 +2705,24 @@ impl FramePoolInner {
         let entry = self
             .slots
             .get_mut(index.slot as usize)
-            .ok_or_else(|| CoreError::internal("frame slot out of bounds"))?;
+            .ok_or(DataPlaneError::FrameSlotOutOfBounds)?;
         if entry.generation != index.generation {
-            return Err(CoreError::internal("stale frame index"));
+            return Err(DataPlaneError::StaleFrameIndex.into());
         }
         if !entry.allocated {
-            return Err(CoreError::internal("frame slot is free"));
+            return Err(DataPlaneError::FrameSlotFree.into());
         }
         if entry.frame.is_some() {
-            return Err(CoreError::internal("frame slot already has a frame"));
+            return Err(DataPlaneError::FrameSlotAlreadyHasFrame.into());
         }
         entry.frame = Some(frame);
         entry.allocated = false;
         self.in_use = self.in_use.saturating_sub(1);
-        self.available.push(index.slot);
+        if self.available_len == self.available.len() {
+            return Err(DataPlaneError::FramePoolAvailableOverflow.into());
+        }
+        self.available[self.available_len] = index.slot;
+        self.available_len += 1;
         Ok(())
     }
 }
@@ -2897,13 +2731,13 @@ impl Deref for Frame<Next> {
     type Target = BufferFrame;
 
     fn deref(&self) -> &Self::Target {
-        self.frame.as_ref().expect("next frame already consumed")
+        self.frame()
     }
 }
 
 impl DerefMut for Frame<Next> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.frame.as_mut().expect("next frame already consumed")
+        self.frame_mut()
     }
 }
 
@@ -2911,13 +2745,13 @@ impl Deref for Frame<Pending> {
     type Target = BufferFrame;
 
     fn deref(&self) -> &Self::Target {
-        self.frame.as_ref().expect("pending frame already consumed")
+        self.frame()
     }
 }
 
 impl DerefMut for Frame<Pending> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.frame.as_mut().expect("pending frame already consumed")
+        self.frame_mut()
     }
 }
 
@@ -3088,14 +2922,12 @@ impl BufferPoolInner {
             return Err(CoreError::internal("buffer advance exceeds current length"));
         }
 
-        let mut touched = Vec::new();
         let mut remaining = len;
         let mut current = Some(index);
         while remaining != 0 {
             let current_index = current
                 .ok_or_else(|| CoreError::internal("buffer chain advance lost current segment"))?;
             let buffer = self.buffer(current_index)?;
-            touched.push(current_index);
             if remaining <= buffer.current_len() {
                 break;
             }
@@ -3103,12 +2935,26 @@ impl BufferPoolInner {
             current = self.next_buffer(current_index)?;
         }
 
-        for current_index in touched.iter().copied() {
+        let mut remaining = len;
+        let mut current = Some(index);
+        while remaining != 0 {
+            let current_index = current
+                .ok_or_else(|| CoreError::internal("buffer chain advance lost current segment"))?;
             self.ensure_header_exclusive(current_index)?;
+            let buffer = self.buffer(current_index)?;
+            if remaining <= buffer.current_len() {
+                break;
+            }
+            remaining -= buffer.current_len();
+            current = self.next_buffer(current_index)?;
         }
 
         let mut remaining = len;
-        for current_index in touched.iter().copied() {
+        let mut current = Some(index);
+        while remaining != 0 {
+            let current_index = current
+                .ok_or_else(|| CoreError::internal("buffer chain advance lost current segment"))?;
+            let next = self.next_buffer(current_index)?;
             let buffer = self.buffer_mut(current_index)?;
             let consume = remaining.min(buffer.current_len());
             let new_offset = isize::from(buffer.current_data_offset())
@@ -3119,6 +2965,7 @@ impl BufferPoolInner {
             if remaining == 0 {
                 break;
             }
+            current = next;
         }
 
         let remaining_total_len = original_total_len
@@ -3217,15 +3064,11 @@ impl BufferPoolInner {
             reset(buffer, data_size)
         };
         if let Err(error) = reset_result {
-            self.slot_state_mut(slot)
-                .expect("buffer slot metadata remains valid")
-                .allocated = false;
+            self.slot_state_mut(slot)?.allocated = false;
             cache.push(slot);
             return Err(error);
         }
-        self.slot_state_mut(slot)
-            .expect("buffer slot metadata remains valid")
-            .allocated = true;
+        self.slot_state_mut(slot)?.allocated = true;
         self.bump_in_use();
         self.prefetch_next_cached_slot(cache);
         Ok(BufferIndex {
@@ -3273,15 +3116,11 @@ impl BufferPoolInner {
             }
         };
         if let Err(error) = reset_result {
-            self.slot_state_mut(slot)
-                .expect("buffer slot metadata remains valid")
-                .allocated = false;
+            self.slot_state_mut(slot)?.allocated = false;
             cache.push(slot);
             return Err(error);
         }
-        self.slot_state_mut(slot)
-            .expect("buffer slot metadata remains valid")
-            .allocated = true;
+        self.slot_state_mut(slot)?.allocated = true;
         self.bump_in_use();
         self.prefetch_next_cached_slot(cache);
         Ok(BufferIndex {
@@ -3425,15 +3264,15 @@ impl BufferPoolInner {
             if clean {
                 let slot_capacity = self.slot_capacity;
                 {
-                    let buffer = self
-                        .buffer_at_slot_mut(index.slot)
-                        .expect("buffer slot remains valid");
+                    let Ok(buffer) = self.buffer_at_slot_mut(index.slot) else {
+                        return;
+                    };
                     buffer.reset_for_free_fast(slot_capacity);
                 }
                 {
-                    let entry = self
-                        .slot_state_mut(slot)
-                        .expect("buffer slot metadata remains valid");
+                    let Ok(entry) = self.slot_state_mut(slot) else {
+                        return;
+                    };
                     entry.allocated = false;
                 }
                 self.dec_in_use();
@@ -3451,16 +3290,16 @@ impl BufferPoolInner {
             }
             let slot_capacity = self.slot_capacity;
             {
-                let buffer = self
-                    .buffer_at_slot_mut(index.slot)
-                    .expect("buffer slot remains valid");
+                let Ok(buffer) = self.buffer_at_slot_mut(index.slot) else {
+                    return;
+                };
                 buffer.cacheline1.trace_handle = 0;
                 buffer.reset_for_free(slot_capacity);
             }
             {
-                let entry = self
-                    .slot_state_mut(slot)
-                    .expect("buffer slot metadata remains valid");
+                let Ok(entry) = self.slot_state_mut(slot) else {
+                    return;
+                };
                 entry.allocated = false;
             }
             self.dec_in_use();
@@ -3710,10 +3549,274 @@ fn prefetch_buffer_data_write(buffer: &Buffer) {
     }
 }
 
+pub(crate) struct BufferIndexList {
+    ptr: NonNull<BufferIndex>,
+    len: usize,
+    cap: usize,
+    heap: Arc<Heap>,
+}
+
+impl BufferIndexList {
+    #[inline]
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        let heap = Arc::new(Heap::local());
+        if capacity == 0 {
+            return Self {
+                ptr: NonNull::dangling(),
+                len: 0,
+                cap: 0,
+                heap,
+            };
+        }
+        let layout = frame_indices_layout(capacity);
+        let raw = heap
+            .alloc(layout)
+            .unwrap_or_else(|| handle_alloc_error(layout));
+        let ptr =
+            NonNull::new(raw.as_ptr().cast::<BufferIndex>()).expect("Heap::alloc returned null");
+        Self {
+            ptr,
+            len: 0,
+            cap: capacity,
+            heap,
+        }
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline(always)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.cap
+    }
+
+    #[inline(always)]
+    fn as_slice(&self) -> &[BufferIndex] {
+        unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+
+    #[inline(always)]
+    fn as_mut_slice(&mut self) -> &mut [BufferIndex] {
+        unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+
+    #[inline(always)]
+    pub(crate) fn try_push(&mut self, index: BufferIndex) -> bool {
+        if self.len == self.cap {
+            return false;
+        }
+        unsafe { self.ptr.as_ptr().add(self.len).write(index) };
+        self.len += 1;
+        true
+    }
+
+    #[inline(always)]
+    fn push(&mut self, index: BufferIndex) {
+        let pushed = self.try_push(index);
+        debug_assert!(pushed);
+    }
+
+    #[inline(always)]
+    pub(crate) fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    #[inline(always)]
+    fn truncate(&mut self, len: usize) {
+        if len < self.len {
+            self.len = len;
+        }
+    }
+
+    #[inline]
+    fn drain_all(&mut self) -> BufferFrameDrain<'_> {
+        let len = self.len;
+        self.len = 0;
+        BufferFrameDrain {
+            indices: self as *mut BufferIndexList,
+            current: 0,
+            end: len,
+            tail_start: len,
+            tail_len: 0,
+            state: PhantomData,
+        }
+    }
+
+    #[inline]
+    fn drain_prefix(&mut self, count: usize) -> BufferFrameDrain<'_> {
+        let count = count.min(self.len);
+        let old_len = self.len;
+        self.len = 0;
+        BufferFrameDrain {
+            indices: self as *mut BufferIndexList,
+            current: 0,
+            end: count,
+            tail_start: count,
+            tail_len: old_len - count,
+            state: PhantomData,
+        }
+    }
+}
+
+impl fmt::Debug for BufferIndexList {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.as_slice().fmt(f)
+    }
+}
+
+impl Drop for BufferIndexList {
+    #[inline]
+    fn drop(&mut self) {
+        if self.cap == 0 {
+            return;
+        }
+        let layout = frame_indices_layout(self.cap);
+        unsafe { GlobalAlloc::dealloc(&*self.heap, self.ptr.as_ptr().cast::<u8>(), layout) };
+    }
+}
+
+#[inline]
+fn frame_indices_layout(capacity: usize) -> Layout {
+    let bytes = mem::size_of::<BufferIndex>()
+        .checked_mul(capacity)
+        .expect("frame indices allocation size overflow")
+        .max(1);
+    Layout::from_size_align(bytes, BUFFER_CACHE_LINE_SIZE).expect("frame indices layout")
+}
+
+impl Deref for BufferIndexList {
+    type Target = [BufferIndex];
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl DerefMut for BufferIndexList {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.as_mut_slice()
+    }
+}
+
+pub struct BufferFrameDrain<'frame> {
+    indices: *mut BufferIndexList,
+    current: usize,
+    end: usize,
+    tail_start: usize,
+    tail_len: usize,
+    state: PhantomData<&'frame mut BufferIndexList>,
+}
+
+impl Iterator for BufferFrameDrain<'_> {
+    type Item = BufferIndex;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current == self.end {
+            return None;
+        }
+        let index = self.current;
+        self.current += 1;
+        Some(unsafe { (*self.indices).ptr.as_ptr().add(index).read() })
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.end - self.current;
+        (len, Some(len))
+    }
+}
+
+impl ExactSizeIterator for BufferFrameDrain<'_> {}
+
+impl Drop for BufferFrameDrain<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        if self.tail_len == 0 {
+            return;
+        }
+        unsafe {
+            let indices = &mut *self.indices;
+            ptr::copy(
+                indices.ptr.as_ptr().add(self.tail_start),
+                indices.ptr.as_ptr(),
+                self.tail_len,
+            );
+            indices.len += self.tail_len;
+        }
+    }
+}
+
+pub struct DataPlaneBufferChain<'pool> {
+    pool: Option<&'pool BufferPool>,
+    next: Option<BufferIndex>,
+    failed: bool,
+    error: Option<CoreError>,
+}
+
+impl<'pool> DataPlaneBufferChain<'pool> {
+    #[inline]
+    fn new(pool: CoreResult<&'pool BufferPool>, index: BufferIndex) -> Self {
+        match pool {
+            Ok(pool) => Self {
+                pool: Some(pool),
+                next: Some(index),
+                failed: false,
+                error: None,
+            },
+            Err(error) => Self {
+                pool: None,
+                next: None,
+                failed: false,
+                error: Some(error),
+            },
+        }
+    }
+}
+
+impl<'pool> Iterator for DataPlaneBufferChain<'pool> {
+    type Item = CoreResult<BufferRef<'pool>>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(error) = self.error.take() {
+            return Some(Err(error));
+        }
+        if self.failed {
+            return None;
+        }
+        let current = self.next?;
+        let pool = self.pool?;
+        let guard = pool.arena.inner.read();
+        self.next = match guard.next_buffer(current) {
+            Ok(next) => next,
+            Err(err) => {
+                self.failed = true;
+                return Some(Err(err));
+            }
+        };
+        Some(Ok(BufferRef {
+            guard: spinning_top::guard::RwSpinlockReadGuard::map(guard, |pool| {
+                pool.buffer(current)
+                    .expect("buffer index was validated before mapping")
+            }),
+        }))
+    }
+}
+
 #[derive(Debug)]
 pub struct BufferFrame {
-    indices: Vec<BufferIndex>,
-    next_node: Option<NodeId>,
+    indices: BufferIndexList,
     readiness: Rc<FrameReadiness>,
 }
 
@@ -3998,8 +4101,7 @@ impl BufferFrame {
     #[inline]
     fn with_capacity(capacity: usize) -> Self {
         Self {
-            indices: Vec::with_capacity(capacity),
-            next_node: None,
+            indices: BufferIndexList::with_capacity(capacity),
             readiness: Rc::new(FrameReadiness::default()),
         }
     }
@@ -4007,7 +4109,7 @@ impl BufferFrame {
     #[inline]
     pub fn push_index(&mut self, index: BufferIndex) -> CoreResult<()> {
         if self.indices.len() == self.indices.capacity() {
-            return Err(CoreError::internal("buffer frame capacity exceeded"));
+            return Err(DataPlaneError::BufferFrameCapacityExceeded.into());
         }
         self.indices.push(index);
         self.readiness.mark_pending();
@@ -4023,17 +4125,17 @@ impl BufferFrame {
         let (lower, upper) = indices.size_hint();
         if let Some(upper) = upper {
             if self.indices.len() + upper > self.indices.capacity() {
-                return Err(CoreError::internal("buffer frame capacity exceeded"));
+                return Err(DataPlaneError::BufferFrameCapacityExceeded.into());
             }
         } else if self.indices.len() + lower > self.indices.capacity() {
-            return Err(CoreError::internal("buffer frame capacity exceeded"));
+            return Err(DataPlaneError::BufferFrameCapacityExceeded.into());
         }
 
         let original_len = self.indices.len();
         for index in indices {
             if self.indices.len() == self.indices.capacity() {
                 self.indices.truncate(original_len);
-                return Err(CoreError::internal("buffer frame capacity exceeded"));
+                return Err(DataPlaneError::BufferFrameCapacityExceeded.into());
             }
             self.indices.push(index);
         }
@@ -4074,22 +4176,9 @@ impl BufferFrame {
     }
 
     #[inline]
-    pub fn reset(&mut self) {
-        self.indices.clear();
-        self.next_node = None;
-        self.readiness.clear_pending();
-    }
-
-    #[inline]
     fn reset_for_pool_reuse(&mut self) {
         self.indices.clear();
-        self.next_node = None;
         self.readiness.reset_for_pool_reuse();
-    }
-
-    #[inline]
-    pub fn clear(&mut self) {
-        self.reset();
     }
 
     #[inline]
@@ -4133,29 +4222,23 @@ impl BufferFrame {
     }
 
     #[inline]
-    pub fn drain_indices(&mut self) -> hammer_infra::vec::Drain<'_, BufferIndex> {
+    fn drain_indices(&mut self) -> BufferFrameDrain<'_> {
         self.readiness.clear_pending();
-        self.indices.drain(..)
+        self.indices.drain_all()
     }
 
     #[inline]
-    pub fn discard_prefix(&mut self, count: usize) {
+    fn discard_prefix(&mut self, count: usize) {
         if count == 0 {
             return;
         }
         let count = count.min(self.indices.len());
-        drop(self.indices.drain(..count));
+        drop(self.indices.drain_prefix(count));
         if self.indices.is_empty() {
             self.readiness.clear_pending();
         } else {
             self.readiness.mark_pending();
         }
-    }
-
-    #[inline]
-    pub fn drain_pending(&mut self) -> hammer_infra::vec::Drain<'_, BufferIndex> {
-        self.readiness.clear_pending();
-        self.indices.drain(..)
     }
 
     #[inline]
@@ -4254,33 +4337,6 @@ impl BufferFrame {
             FrameBatchWidth::Octo => {
                 self.retain_indices_quad_with_prefetch_state_lazy(state, &mut prefetch, &mut keep)
             }
-        }
-    }
-
-    #[inline(always)]
-    pub(crate) fn buffer_node_inline_chunks<S>(
-        &mut self,
-        width: FrameBatchWidth,
-        state: &mut S,
-        mut prefetch: impl FnMut(&mut S, &[BufferIndex]),
-        mut keep_chunk: impl FnMut(&mut S, &[BufferIndex], &mut [bool; 4]) -> CoreResult<()>,
-    ) -> CoreResult<()> {
-        match width {
-            FrameBatchWidth::Quad => self.retain_indices_quad_with_prefetch_state_lazy_chunks(
-                state,
-                &mut prefetch,
-                &mut keep_chunk,
-            ),
-            FrameBatchWidth::Pair => self.retain_indices_pair_with_prefetch_state_lazy_chunks(
-                state,
-                &mut prefetch,
-                &mut keep_chunk,
-            ),
-            FrameBatchWidth::Octo => self.retain_indices_quad_with_prefetch_state_lazy_chunks(
-                state,
-                &mut prefetch,
-                &mut keep_chunk,
-            ),
         }
     }
 
@@ -4547,66 +4603,6 @@ impl BufferFrame {
     }
 
     #[inline(always)]
-    fn retain_indices_quad_with_prefetch_state_lazy_chunks<S>(
-        &mut self,
-        state: &mut S,
-        prefetch: &mut impl FnMut(&mut S, &[BufferIndex]),
-        keep_chunk: &mut impl FnMut(&mut S, &[BufferIndex], &mut [bool; 4]) -> CoreResult<()>,
-    ) -> CoreResult<()> {
-        let len = self.indices.len();
-        let mut read = 0usize;
-        let mut write = None;
-        while read + 4 <= len {
-            self.prefetch_indices_state_chunk(read + 4, 4, state, prefetch);
-            let chunk = [
-                self.indices[read],
-                self.indices[read + 1],
-                self.indices[read + 2],
-                self.indices[read + 3],
-            ];
-            self.retain_chunk_state_lazy(read, chunk, &mut write, state, keep_chunk)?;
-            read += 4;
-        }
-        if read + 2 <= len {
-            self.prefetch_indices_state_chunk(read + 2, 2, state, prefetch);
-            let chunk = [self.indices[read], self.indices[read + 1]];
-            self.retain_chunk_state_lazy(read, chunk, &mut write, state, keep_chunk)?;
-            read += 2;
-        }
-        while read < len {
-            let chunk = [self.indices[read]];
-            self.retain_chunk_state_lazy(read, chunk, &mut write, state, keep_chunk)?;
-            read += 1;
-        }
-        self.finish_retain_lazy(write);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn retain_indices_pair_with_prefetch_state_lazy_chunks<S>(
-        &mut self,
-        state: &mut S,
-        prefetch: &mut impl FnMut(&mut S, &[BufferIndex]),
-        keep_chunk: &mut impl FnMut(&mut S, &[BufferIndex], &mut [bool; 4]) -> CoreResult<()>,
-    ) -> CoreResult<()> {
-        let len = self.indices.len();
-        let mut read = 0usize;
-        let mut write = None;
-        while read + 2 <= len {
-            self.prefetch_indices_state_chunk(read + 2, 2, state, prefetch);
-            let chunk = [self.indices[read], self.indices[read + 1]];
-            self.retain_chunk_state_lazy(read, chunk, &mut write, state, keep_chunk)?;
-            read += 2;
-        }
-        if read < len {
-            let chunk = [self.indices[read]];
-            self.retain_chunk_state_lazy(read, chunk, &mut write, state, keep_chunk)?;
-        }
-        self.finish_retain_lazy(write);
-        Ok(())
-    }
-
-    #[inline(always)]
     fn rewrite_indices_quad(
         &mut self,
         rewrite: &mut impl FnMut(BufferIndex) -> CoreResult<Option<BufferIndex>>,
@@ -4703,31 +4699,6 @@ impl BufferFrame {
     }
 
     #[inline(always)]
-    fn retain_chunk_state_lazy<S, const N: usize>(
-        &mut self,
-        read: usize,
-        chunk: [BufferIndex; N],
-        write: &mut Option<usize>,
-        state: &mut S,
-        keep_chunk: &mut impl FnMut(&mut S, &[BufferIndex], &mut [bool; 4]) -> CoreResult<()>,
-    ) -> CoreResult<()> {
-        let mut keep = [true; 4];
-        keep_chunk(state, &chunk, &mut keep)?;
-        for offset in 0..N {
-            let index = chunk[offset];
-            if keep[offset] {
-                if let Some(write) = write {
-                    self.indices[*write] = index;
-                    *write += 1;
-                }
-            } else if write.is_none() {
-                *write = Some(read + offset);
-            }
-        }
-        Ok(())
-    }
-
-    #[inline(always)]
     fn rewrite_one(
         &mut self,
         read: usize,
@@ -4770,20 +4741,6 @@ impl BufferFrame {
     }
 
     #[inline(always)]
-    fn prefetch_indices_state_chunk<S>(
-        &self,
-        offset: usize,
-        width: usize,
-        state: &mut S,
-        prefetch: &mut impl FnMut(&mut S, &[BufferIndex]),
-    ) {
-        let end = (offset + width).min(self.indices.len());
-        if offset < end {
-            prefetch(state, &self.indices[offset..end]);
-        }
-    }
-
-    #[inline(always)]
     fn finish_retain(&mut self, len: usize) {
         self.indices.truncate(len);
         if self.indices.is_empty() {
@@ -4805,21 +4762,6 @@ impl BufferFrame {
         BufferFramePending {
             readiness: Rc::clone(&self.readiness),
         }
-    }
-
-    #[inline]
-    pub fn next_node(&self) -> Option<NodeId> {
-        self.next_node
-    }
-
-    #[inline]
-    pub fn set_next_node(&mut self, node: NodeId) {
-        self.next_node = Some(node);
-    }
-
-    #[inline]
-    pub fn clear_next_node(&mut self) {
-        self.next_node = None;
     }
 }
 
@@ -4959,7 +4901,10 @@ impl Future for BufferFramePending {
 
 #[cfg(test)]
 mod tests {
-    use super::{BufferIndex, BufferPool, DataPlaneRuntime};
+    use super::{
+        BufferIndex, BufferPool, DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig,
+    };
+    use crate::handoff::{DataPlaneHandoff, DataWorkerId};
     use hammer_core::error::CoreResult;
     use hammer_infra::vec::Vec;
 
@@ -4974,7 +4919,15 @@ mod tests {
 
     #[test]
     fn advance_with_negative_displacement_rewinds_into_headroom() {
-        let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 4);
+        let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig {
+            buffers: DataPlaneBufferConfig {
+                buffer_slot_capacity: 64,
+                buffer_slots: 4,
+                frame_capacity: 4,
+                frame_slots: 4,
+                ..DataPlaneBufferConfig::default()
+            },
+        });
         let index = runtime.alloc_index().expect("alloc buffer");
         runtime
             .buffers()
@@ -4990,7 +4943,11 @@ mod tests {
         assert_eq!(buffer.current_data_offset(), -4);
         assert_eq!(buffer.current_len(), 9);
         assert_eq!(buffer.total_len_not_including_first(), 0);
-        let packet = chain_bytes(runtime.buffers().buffers(), index).expect("packet");
+        let packet = chain_bytes(
+            runtime.buffers().try_buffers().expect("active buffer pool"),
+            index,
+        )
+        .expect("packet");
         assert_eq!(packet.len(), 9);
         assert_eq!(&packet[4..], b"hello");
     }
@@ -4999,6 +4956,47 @@ mod tests {
 
     fn fresh_pool(slot_capacity: usize, slots: usize) -> BufferPool {
         BufferPool::with_capacity(slot_capacity, slots)
+    }
+
+    fn runtime_for_pool(pool: &BufferPool, frame_capacity: usize) -> DataPlaneRuntime {
+        let handoff =
+            DataPlaneHandoff::new_shared_buffer_arena(1, frame_capacity.max(1), pool.arena());
+        DataPlaneRuntime::attach_handoff_worker(
+            DataPlaneRuntime::new(DataPlaneRuntimeConfig {
+                buffers: DataPlaneBufferConfig {
+                    buffer_slot_capacity: 1,
+                    buffer_slots: 1,
+                    frame_capacity: frame_capacity.max(1),
+                    frame_slots: 1,
+                    ..DataPlaneBufferConfig::default()
+                },
+            }),
+            DataWorkerId::new(0),
+            handoff.worker(DataWorkerId::new(0)),
+        )
+    }
+
+    fn drop_pool_index(pool: &BufferPool, index: BufferIndex) {
+        let runtime = runtime_for_pool(pool, 1);
+        let mut frame = runtime
+            .buffers()
+            .get_next_frame(NodeId::new(0))
+            .expect("cleanup frame");
+        frame.push_index(index).expect("cleanup push index");
+    }
+
+    fn drop_pool_indices(pool: &BufferPool, indices: impl IntoIterator<Item = BufferIndex>) {
+        let mut indices = indices.into_iter();
+        let (lower, upper) = indices.size_hint();
+        let frame_capacity = upper.unwrap_or(lower).max(1);
+        let runtime = runtime_for_pool(pool, frame_capacity);
+        let mut frame = runtime
+            .buffers()
+            .get_next_frame(NodeId::new(0))
+            .expect("cleanup frame");
+        frame
+            .push_indices(&mut indices)
+            .expect("cleanup push indices");
     }
 
     #[test]
@@ -5014,7 +5012,7 @@ mod tests {
                 "alloc must mark slot clean"
             );
         }
-        pool.free_index(index);
+        drop_pool_index(&pool, index);
         // After a clean free the slot must still be marked clean so the next
         // alloc fast path can skip the cacheline1 reset.
         {
@@ -5041,7 +5039,7 @@ mod tests {
                 "cacheline1 mutator must clear SLOT_CLEAN"
             );
         }
-        pool.free_index(index);
+        drop_pool_index(&pool, index);
         // The free slow path must rebuild the clean invariant.
         let inner = pool.arena.inner.read();
         let buffer = inner.buffer_at_slot(index.slot()).unwrap();
@@ -5062,7 +5060,7 @@ mod tests {
             buffer.set_trace_handle(42);
             assert!(!buffer.cacheline0.flags.contains(BufferFlags::SLOT_CLEAN));
         }
-        pool.free_index(index);
+        drop_pool_index(&pool, index);
     }
 
     #[test]
@@ -5070,14 +5068,14 @@ mod tests {
         let pool = fresh_pool(64, 4);
         let first = pool.alloc_index().expect("alloc");
         let first_gen = first.generation();
-        pool.free_index(first);
+        drop_pool_index(&pool, first);
         let second = pool.alloc_index().expect("realloc same slot");
         assert_eq!(second.slot(), first.slot());
         assert_ne!(second.generation(), first_gen);
         // Stale index must be rejected.
         assert!(pool.get(first).is_err());
         assert!(pool.get(second).is_ok());
-        pool.free_index(second);
+        drop_pool_index(&pool, second);
     }
 
     #[test]
@@ -5092,22 +5090,20 @@ mod tests {
         let b = pool_b.alloc_index().expect("pool b alloc");
         assert_eq!(a.pool_id(), b.pool_id());
         assert_ne!(a.slot(), b.slot());
-        pool_a.free_index(a);
-        pool_b.free_index(b);
+        drop_pool_index(&pool_a, a);
+        drop_pool_index(&pool_b, b);
     }
 
     #[test]
     fn lazy_in_use_count_matches_synchronous_count() {
         let pool = fresh_pool(64, 8);
-        let mut indices = std::vec::Vec::new();
+        let mut indices = Vec::new();
         for _ in 0..5 {
             indices.push(pool.alloc_index().expect("alloc"));
         }
         // in_use() folds the lazy delta and returns the accurate count.
         assert_eq!(pool.in_use(), 5);
-        for index in indices.drain(..) {
-            pool.free_index(index);
-        }
+        drop_pool_indices(&pool, indices.drain(..));
         pool.arena.inner.write().fold_in_use();
         assert_eq!(pool.arena.inner.read().in_use, 0);
     }
@@ -5120,7 +5116,7 @@ mod tests {
         pool.attach_clone(head, tail).expect("attach clone");
         // tail now has ref_count == 2; freeing the chain drops one ref but
         // keeps the slot allocated (slow path).
-        pool.free_index(head);
+        drop_pool_index(&pool, head);
         let inner = pool.arena.inner.read();
         let tail_entry = inner.slot_state(tail.slot()).expect("tail slot state");
         assert!(tail_entry.allocated, "shared tail must remain allocated");
@@ -5142,12 +5138,12 @@ mod tests {
     #[test]
     fn chain_alloc_free_roundtrips() {
         let pool = fresh_pool(32, 16);
-        let payload = vec![0xABu8; 96]; // spans 3 slots of 32
+        let payload = [0xABu8; 96]; // spans 3 slots of 32
         let head = pool.alloc_index_with_bytes(&payload).expect("chain alloc");
         assert!(pool.chain(head).take(2).count() > 1);
         let copied = chain_bytes(&pool, head).expect("read chain");
-        assert_eq!(copied, payload);
-        pool.free_index(head);
+        assert_eq!(copied.as_slice(), payload.as_slice());
+        drop_pool_index(&pool, head);
         assert_eq!(pool.in_use(), 0);
     }
 
@@ -5190,14 +5186,12 @@ mod tests {
     #[test]
     fn alloc_then_free_many_keeps_in_use_consistent() -> CoreResult<()> {
         let pool = fresh_pool(64, 32);
-        let mut indices = std::vec::Vec::new();
+        let mut indices = Vec::new();
         for _ in 0..32 {
             indices.push(pool.alloc_index()?);
         }
         assert_eq!(pool.in_use(), 32);
-        for index in indices {
-            pool.free_index(index);
-        }
+        drop_pool_indices(&pool, indices);
         assert_eq!(pool.in_use(), 0);
         Ok(())
     }

@@ -3,9 +3,9 @@ use std::mem::transmute;
 use std::sync::{Arc, Mutex};
 
 use hammer_adapter::{
-    BufferFrame, BufferIndex, BufferRef, DataPlaneRuntime, DriverNode, Node, NodeId, NodeProcessFn,
-    NodeRegistration, NodeResult, NodeRuntimeData, PacketTrace, SecondaryOpaque, TraceFormatter,
-    add_packet_trace, unlikely,
+    BufferFrame, BufferIndex, BufferRef, DataPlaneRuntime, DriverNode, Frame, Next, Node, NodeId,
+    NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData, PacketTrace, SecondaryOpaque,
+    TraceFormatter, add_packet_trace, unlikely,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::vec::Vec;
@@ -348,11 +348,27 @@ impl TunDriverDirection for TunInputRuntime {
                 read += 1;
             }
         }
-        if frame.has_pending() {
-            NodeResult::next_current(self.next)
-        } else {
-            NodeResult::drop()
+        if !frame.has_pending() {
+            return NodeResult::drop();
         }
+        let mut next_frame = match runtime.buffers().get_next_frame(self.next) {
+            Ok(frame) => frame,
+            Err(_) => return NodeResult::drop(),
+        };
+        let width = runtime.preferred_frame_batch_width();
+        if frame
+            .retain_indices_batched(width, |index| {
+                next_frame.push_index(index)?;
+                Ok(false)
+            })
+            .is_err()
+        {
+            return NodeResult::drop();
+        }
+        if runtime.put_next_frame(next_frame).is_err() {
+            return NodeResult::drop();
+        }
+        NodeResult::drop()
     }
 }
 
@@ -386,6 +402,14 @@ impl TunDriverDirection for TunOutputRuntime {
     }
 
     fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
+        self.trace_frame(runtime, frame);
+        let _ = self.output.send_frame(runtime, frame, self.mode);
+        NodeResult::drop()
+    }
+}
+
+impl TunOutputRuntime {
+    fn trace_frame(&self, runtime: &DataPlaneRuntime, frame: &BufferFrame) {
         let pending = frame.pending_len();
         let indices = frame.pending_indices();
         let len = indices.len();
@@ -476,8 +500,6 @@ impl TunDriverDirection for TunOutputRuntime {
             );
             read += 1;
         }
-        let _ = self.output.send_frame(runtime, frame, self.mode);
-        NodeResult::drop()
     }
 }
 
@@ -538,18 +560,12 @@ where
             return Err(CoreError::internal("real TUN driver only supports L3 TUN"));
         }
         let mut received = 0usize;
+        let mut in_flight = runtime.buffers().get_next_frame(NodeId::new(0))?;
         while received < max {
-            let Some(index) = self.recv_into_buffer(runtime)? else {
+            let Some(index) = self.recv_into_frame(runtime, frame, &mut in_flight)? else {
                 break;
             };
             if let Err(err) = self.set_l3_metadata(runtime, index, interface_id) {
-                let mut owner = runtime.alloc_frame()?;
-                owner.push_index(index)?;
-                return Err(err);
-            }
-            if let Err(err) = frame.push_index(index) {
-                let mut owner = runtime.alloc_frame()?;
-                owner.push_index(index)?;
                 return Err(err);
             }
             received += 1;
@@ -562,32 +578,33 @@ impl<I> RealTunInput<I>
 where
     I: TunBufferIo,
 {
-    fn recv_into_buffer(&mut self, runtime: &DataPlaneRuntime) -> CoreResult<Option<BufferIndex>> {
+    fn recv_into_frame(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        frame: &mut BufferFrame,
+        in_flight: &mut Frame<Next>,
+    ) -> CoreResult<Option<BufferIndex>> {
         let index = runtime.alloc_index()?;
-        let mut buffer = runtime.get_buffer_mut(index)?;
-        let dst = buffer.writable_tail_mut();
-        let dst_len = dst.len();
-        let Some(len) = self.io.try_recv_buffer(dst)? else {
+        in_flight.push_index(index)?;
+        (|| -> CoreResult<Option<BufferIndex>> {
+            let mut buffer = runtime.get_buffer_mut(index)?;
+            let dst = buffer.writable_tail_mut();
+            let dst_len = dst.len();
+            let Some(len) = self.io.try_recv_buffer(dst)? else {
+                return Ok(None);
+            };
+            if len == 0 {
+                return Ok(None);
+            }
+            if len == dst_len && self.io.max_recv_len().is_none_or(|max| dst_len < max) {
+                return Ok(None);
+            }
+            buffer.commit_writable_tail(len)?;
             drop(buffer);
-            let mut owner = runtime.alloc_frame()?;
-            owner.push_index(index)?;
-            return Ok(None);
-        };
-        if len == 0 {
-            drop(buffer);
-            let mut owner = runtime.alloc_frame()?;
-            owner.push_index(index)?;
-            return Ok(None);
-        }
-        if len == dst_len && self.io.max_recv_len().is_none_or(|max| dst_len < max) {
-            drop(buffer);
-            let mut owner = runtime.alloc_frame()?;
-            owner.push_index(index)?;
-            return Ok(None);
-        }
-        buffer.commit_writable_tail(len)?;
-        drop(buffer);
-        Ok(Some(index))
+            frame.push_index(index)?;
+            in_flight.retain_indices(|candidate| Ok(candidate != index))?;
+            Ok(Some(index))
+        })()
     }
 
     fn set_l3_metadata(
@@ -600,84 +617,8 @@ where
     }
 }
 
-#[derive(Clone, Copy)]
-struct TunPendingTx {
-    index: hammer_adapter::BufferIndex,
-}
-
-struct TunPendingTxRing {
-    slots: Vec<Option<TunPendingTx>>,
-    head: usize,
-    len: usize,
-}
-
-impl TunPendingTxRing {
-    fn with_capacity(capacity: usize) -> Self {
-        let mut slots = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            slots.push(None);
-        }
-        Self {
-            slots,
-            head: 0,
-            len: 0,
-        }
-    }
-
-    #[inline]
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    #[inline]
-    fn capacity(&self) -> usize {
-        self.slots.len()
-    }
-
-    fn set_capacity(&mut self, capacity: usize) {
-        debug_assert!(
-            self.len == 0,
-            "TUN TX ring capacity is only changed before use"
-        );
-        *self = Self::with_capacity(capacity);
-    }
-
-    #[inline]
-    fn front(&self) -> Option<TunPendingTx> {
-        if self.len == 0 {
-            return None;
-        }
-        self.slots[self.head]
-    }
-
-    fn push_back(&mut self, pending: TunPendingTx) -> CoreResult<()> {
-        if self.len == self.capacity() {
-            return Err(CoreError::internal("real TUN TX ring full"));
-        }
-        let slot = (self.head + self.len) % self.capacity();
-        self.slots[slot] = Some(pending);
-        self.len += 1;
-        Ok(())
-    }
-
-    fn pop_front(&mut self) -> Option<TunPendingTx> {
-        if self.len == 0 {
-            return None;
-        }
-        let pending = self.slots[self.head].take();
-        self.head = (self.head + 1) % self.capacity();
-        self.len -= 1;
-        if self.len == 0 {
-            self.head = 0;
-        }
-        pending
-    }
-}
-
 pub struct RealTunOutput<I> {
     io: I,
-    pending_tx: TunPendingTxRing,
-    tx_ring_capacity: usize,
 }
 
 #[derive(Clone, Default)]
@@ -797,19 +738,7 @@ impl ScriptedTunIo {
 impl<I> RealTunOutput<I> {
     #[inline]
     pub fn new(io: I) -> Self {
-        Self {
-            io,
-            pending_tx: TunPendingTxRing::with_capacity(DEFAULT_TUN_RECV_BATCH),
-            tx_ring_capacity: DEFAULT_TUN_RECV_BATCH,
-        }
-    }
-
-    #[inline]
-    pub fn with_tx_ring_capacity(mut self, tx_ring_capacity: usize) -> Self {
-        let tx_ring_capacity = tx_ring_capacity.max(1);
-        self.tx_ring_capacity = tx_ring_capacity;
-        self.pending_tx.set_capacity(tx_ring_capacity);
-        self
+        Self { io }
     }
 
     #[inline]
@@ -822,39 +751,18 @@ impl<I> RealTunOutput<I>
 where
     I: TunBufferIo,
 {
-    fn drain_pending_tx(
+    #[inline]
+    fn try_send_index(
         &mut self,
         runtime: &DataPlaneRuntime,
+        index: BufferIndex,
         mode: TunDriverMode,
-    ) -> CoreResult<usize> {
+    ) -> CoreResult<TunBufferSendResult> {
         if mode.is_tap() {
             return Err(CoreError::internal("real TUN driver only supports L3 TUN"));
         }
-        let mut completed = 0usize;
-        while let Some(pending) = self.pending_tx.front() {
-            let send_result = self.try_send_pending_tx(runtime, pending);
-            match send_result {
-                Ok(TunBufferSendResult::Complete) => {
-                    self.pending_tx.pop_front();
-                    let mut owner = runtime.alloc_frame()?;
-                    owner.push_index(pending.index)?;
-                    completed += 1;
-                }
-                Ok(TunBufferSendResult::Backpressure) => break,
-                Err(err) => return Err(err),
-            }
-        }
-        Ok(completed)
-    }
-
-    #[inline]
-    fn try_send_pending_tx(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        pending: TunPendingTx,
-    ) -> CoreResult<TunBufferSendResult> {
         let mut refs: Vec<BufferRef<'_>> = Vec::with_capacity(4);
-        let mut chain = runtime.chain(pending.index);
+        let mut chain = runtime.chain(index);
         while let Some(buffer) = chain.next() {
             refs.push(buffer?);
         }
@@ -886,16 +794,18 @@ where
         if mode.is_tap() {
             return Err(CoreError::internal("real TUN driver only supports L3 TUN"));
         }
-        let batch_len = frame.pending_len();
-        self.drain_pending_tx(runtime, mode)?;
-        if self.pending_tx.len().saturating_add(batch_len) > self.tx_ring_capacity {
-            return Err(CoreError::internal("real TUN TX ring full"));
+        let mut sent = 0usize;
+        let indices = frame.pending_indices();
+        let len = indices.len();
+        let mut read = 0usize;
+        while read < len {
+            match self.try_send_index(runtime, indices[read], mode)? {
+                TunBufferSendResult::Complete => sent += 1,
+                TunBufferSendResult::Backpressure => break,
+            }
+            read += 1;
         }
-        for index in frame.drain_pending() {
-            self.pending_tx.push_back(TunPendingTx { index })?;
-        }
-        self.drain_pending_tx(runtime, mode)?;
-        Ok(batch_len)
+        Ok(sent)
     }
 }
 
@@ -1497,7 +1407,6 @@ impl TunPacketSink for MemoryTunOutput {
             memory_tun_output_index(runtime, &mut inner.output, index0, mode)?;
             read += 1;
         }
-        frame.clear();
         Ok(batch_len)
     }
 }
@@ -1508,8 +1417,6 @@ fn memory_tun_output_index(
     index: BufferIndex,
     mode: TunDriverMode,
 ) -> CoreResult<()> {
-    let mut owner = runtime.alloc_frame()?;
-    owner.push_index(index)?;
     let mut tap_header = None;
     {
         let buffer = runtime.get_buffer(index)?;
@@ -1555,9 +1462,8 @@ fn push_packet_to_frame(
     let Some((packet, tap_ethernet)) = packet_for_mode(mode, packet) else {
         return Ok(false);
     };
-    let mut owner = runtime.alloc_frame()?;
     let index = runtime.alloc_index()?;
-    owner.push_index(index)?;
+    frame.push_index(index)?;
     {
         let mut buffer = runtime.get_buffer_mut(index)?;
         let dst = buffer.writable_tail_mut();
@@ -1569,7 +1475,6 @@ fn push_packet_to_frame(
         let opaque = unsafe { transmute::<_, &mut TunOpaque>(buffer.opaque2_mut()) };
         opaque.tap_ethernet = tap_ethernet;
     }
-    frame.push_indices(owner.drain_pending())?;
     Ok(true)
 }
 

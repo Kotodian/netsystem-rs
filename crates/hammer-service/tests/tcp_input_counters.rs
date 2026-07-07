@@ -1,4 +1,7 @@
-use hammer_adapter::{DataPlaneRuntime, InternalNode, Node, NodeResult, NodeRuntimeData};
+use hammer_adapter::{
+    DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node,
+    NodeResult, NodeRuntimeData,
+};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::TcpSegmentFlags;
 use hammer_service::transport::tcp::{
@@ -6,6 +9,24 @@ use hammer_service::transport::tcp::{
     output::{TcpOutputNext, TcpOutputNode},
 };
 use std::sync::{Arc, Mutex, OnceLock};
+
+fn test_runtime_configured(
+    buffer_slot_capacity: usize,
+    buffer_slots: usize,
+    frame_capacity: usize,
+    frame_slots: usize,
+) -> DataPlaneRuntime {
+    let config = DataPlaneRuntimeConfig {
+        buffers: DataPlaneBufferConfig {
+            buffer_slot_capacity,
+            buffer_slots,
+            frame_capacity,
+            frame_slots,
+            ..DataPlaneBufferConfig::default()
+        },
+    };
+    DataPlaneRuntime::new(config)
+}
 
 struct BlackholeNode;
 
@@ -26,7 +47,7 @@ impl Node for BlackholeNode {
 impl InternalNode for BlackholeNode {}
 
 fn setup_output() -> (DataPlaneRuntime, hammer_adapter::NodeId) {
-    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let runtime = test_runtime_configured(2048, 16, 8, 8);
     let drop = runtime.nodes().register_internal(BlackholeNode);
     let lookup = runtime.nodes().register_internal(BlackholeNode);
     let output = runtime
@@ -41,9 +62,9 @@ fn bad_tcp_header_increments_tcp_output_counter() {
     let code = TcpOutputError::NoTcpHeader.code();
     let before = runtime.node_error_count(output, code).unwrap_or(0);
     let index = runtime.alloc_index_with_bytes(b"hello").expect("buffer");
-    let mut frame = runtime.alloc_frame().expect("frame");
+    let mut frame = runtime.buffers().get_next_frame(output).expect("frame");
     frame.push_index(index).expect("push");
-    runtime.submit_frame(frame, output).expect("schedule");
+    runtime.put_next_frame(frame).expect("schedule");
     let _ = runtime.run_ready_nodes().expect("run");
     let after = runtime.node_error_count(output, code).unwrap_or(0);
     assert_eq!(

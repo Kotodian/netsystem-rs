@@ -15,7 +15,7 @@ use hammer_infra::svm_region::SvmRegion;
 #[test]
 fn pool_with_capacity_in_routes_through_heap_svm() {
     let region = SvmRegion::with_size(1 << 20);
-    let heap = Arc::new(Heap::svm(region.clone(), 0));
+    let heap = Arc::new(Heap::svm_data(region.clone()).expect("owner region heap"));
 
     let mut pool: Pool<u64> = Pool::with_capacity_in(64, heap.clone());
     assert_eq!(pool.capacity(), 64);
@@ -44,7 +44,7 @@ fn pool_with_capacity_default_does_not_touch_a_svm_probe() {
 #[test]
 fn pool_drop_returns_storage_to_same_heap() {
     let region = SvmRegion::with_size(24 * 1024);
-    let heap = Arc::new(Heap::svm(region.clone(), 0));
+    let heap = Arc::new(Heap::svm_data(region.clone()).expect("owner region heap"));
     let capacity = 256usize;
     let layout = Layout::from_size_align(capacity * CACHE_LINE, CACHE_LINE).unwrap();
 

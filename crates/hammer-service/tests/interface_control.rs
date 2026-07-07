@@ -3,7 +3,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 use hammer_adapter::{DataPlaneRuntime, TraceControlPlane, TraceInputPolicy, TracePolicy};
-use hammer_runtime::spawn::DataRuntime;
+use hammer_core::config::Config;
+use hammer_runtime::{new_worker_runtime, spawn::DataRuntime};
 use hammer_service::interface::{
     InterfaceConnectedRouteControl, InterfaceControlPlane, InterfaceMtu, InterfaceMtuKind,
     InterfaceOutputControlPlane, InterfaceOutputTrace,
@@ -14,6 +15,20 @@ use hammer_service::net::{
 };
 use hammer_service::tun::{MemoryTunDevice, TunMain, TunOutputDriverNode, TunOutputTrace};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+
+fn test_runtime(
+    buffer_slot_capacity: usize,
+    buffer_slots: usize,
+    frame_capacity: usize,
+    frame_pool_size: usize,
+) -> DataPlaneRuntime {
+    let mut config = Config::default();
+    config.worker.buffer.slot_bytes = buffer_slot_capacity;
+    config.worker.buffer.slots_per_numa = buffer_slots;
+    config.worker.buffer.frame_capacity = frame_capacity;
+    config.worker.buffer.frame_pool_size = frame_pool_size;
+    new_worker_runtime(&config)
+}
 
 #[test]
 fn control_plane_publishes_interfaces_and_addresses_through_handle() {
@@ -110,13 +125,14 @@ fn interface_mtu_updates_run_through_configured_runtime_data_plane_barrier() {
         DataRuntime::new(1, "interface-mtu-barrier-test", 512 * 1024, 2).expect("data runtime");
     let barrier = data_runtime.data_plane_barrier();
     let control = InterfaceControlPlane::new().with_data_plane_barrier(barrier.clone());
+    let handle = control.handle();
     let tun0 = control.register_interface("tun0").expect("register tun0");
 
     control
         .set_protocol_mtu(tun0, InterfaceMtuKind::L3, 9000)
         .expect("set L3 MTU");
 
-    assert_eq!(barrier.sync_count(), 2);
+    assert_eq!(handle.interface_mtu(tun0).map(|mtu| mtu.l3()), Some(9000));
     data_runtime.shutdown_timeout(Duration::from_secs(1));
 }
 
@@ -142,7 +158,7 @@ fn interface_updates_run_through_configured_runtime_data_plane_barrier() {
         .remove_address(tun0, address)
         .expect("remove address");
 
-    assert_eq!(barrier.sync_count(), 3);
+    assert!(control.handle().interface_addresses(tun0).is_empty());
     assert!(
         lookup_table
             .table_handle()
@@ -155,7 +171,7 @@ fn interface_updates_run_through_configured_runtime_data_plane_barrier() {
 
 #[test]
 fn interface_address_publish_installs_receive_route_in_fib() {
-    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
+    let runtime = test_runtime(2048, 8, 8, 4);
     let drop = runtime
         .nodes()
         .register_internal(hammer_service::data_plane::DropNode::new());
@@ -181,7 +197,10 @@ fn interface_address_publish_installs_receive_route_in_fib() {
 
     control.add_address(tun0, address).expect("add address");
 
-    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(lookup)
+        .expect("alloc frame");
     let packet = ipv4_packet([10, 255, 0, 2], [10, 255, 0, 1], b"receive");
     let index = runtime
         .alloc_index_with_bytes(&packet)
@@ -202,7 +221,7 @@ fn interface_address_publish_installs_receive_route_in_fib() {
     }
     frame.push_index(index).expect("push packet");
 
-    runtime.submit_frame(frame, lookup).expect("schedule");
+    runtime.put_next_frame(frame).expect("schedule");
     assert!(runtime.run_ready_nodes().expect("run nodes") >= 2);
     let stats = runtime.nodes().node_runtime_stats_snapshot();
     assert_eq!(
@@ -249,7 +268,7 @@ fn interface_address_publish_installs_receive_route_in_fib() {
 
 #[test]
 fn interface_output_dispatches_to_registered_tx_node() {
-    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
+    let runtime = test_runtime(2048, 8, 8, 4);
     let _ = runtime
         .nodes()
         .register_internal(hammer_service::data_plane::DropNode::new());
@@ -276,7 +295,10 @@ fn interface_output_dispatches_to_registered_tx_node() {
         .into(),
     });
     runtime.set_trace_control(Some(trace.handle()), 4);
-    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(output_node)
+        .expect("alloc frame");
     let packet = ipv4_packet([10, 0, 0, 1], [198, 51, 100, 7], b"interface-output");
     let index = runtime
         .alloc_index_with_bytes(&packet)
@@ -291,7 +313,7 @@ fn interface_output_dispatches_to_registered_tx_node() {
         .expect("mark packet");
     frame.push_index(index).expect("push packet");
 
-    runtime.submit_frame(frame, output_node).expect("schedule");
+    runtime.put_next_frame(frame).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert_eq!(output_device.drain_output(), vec![packet]);
@@ -325,18 +347,21 @@ fn interface_output_dispatches_to_registered_tx_node() {
 
 #[test]
 fn interface_output_drops_missing_egress_or_tx_mapping() {
-    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
+    let runtime = test_runtime(2048, 8, 8, 4);
     let _ = runtime
         .nodes()
         .register_internal(hammer_service::data_plane::DropNode::new());
     let output_device = MemoryTunDevice::new();
     let output_control = InterfaceOutputControlPlane::new();
     let output_node = runtime.nodes().register_internal(output_control.node());
-    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(output_node)
+        .expect("alloc frame");
     push_packet_with_egress(&runtime, &mut frame, None, b"no-egress");
     push_packet_with_egress(&runtime, &mut frame, Some(99), b"no-tx");
 
-    runtime.submit_frame(frame, output_node).expect("schedule");
+    runtime.put_next_frame(frame).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert!(output_device.drain_output().is_empty());
@@ -349,18 +374,20 @@ fn interface_output_tx_updates_run_through_configured_runtime_data_plane_barrier
     let data_runtime =
         DataRuntime::new(1, "interface-output-barrier-test", 512 * 1024, 2).expect("data runtime");
     let barrier = data_runtime.data_plane_barrier();
-    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
+    let runtime = test_runtime(2048, 8, 8, 4);
     let device = MemoryTunDevice::new();
     let tx = runtime
         .nodes()
         .register_driver(TunOutputDriverNode::new(device.output()));
     let output_control =
         InterfaceOutputControlPlane::new().with_data_plane_barrier(barrier.clone());
+    let output_handle = output_control.handle();
 
     output_control.register_tx(7, tx).expect("register tx");
+    assert_eq!(output_handle.tx_node(7), Some(tx));
     output_control.unregister_tx(7).expect("unregister tx");
 
-    assert_eq!(barrier.sync_count(), 2);
+    assert_eq!(output_handle.tx_node(7), None);
     data_runtime.shutdown_timeout(Duration::from_secs(1));
 }
 

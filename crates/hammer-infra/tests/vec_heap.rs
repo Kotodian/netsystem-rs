@@ -17,9 +17,9 @@ use hammer_infra::svm_region::SvmRegion;
 use hammer_infra::vec::Vec as HVec;
 
 #[test]
-fn hammer_vec_routes_through_heap_registry() {
+fn hammer_vec_routes_through_heap_handle() {
     let region = SvmRegion::with_size(1 << 20); // 1 MiB
-    let heap = Arc::new(Heap::svm(region.clone(), 0));
+    let heap = Arc::new(Heap::svm_data(region.clone()).expect("owner region heap"));
 
     let mut v: HVec<u64> = HVec::with_capacity_in(128, heap.clone());
     assert_eq!(v.capacity(), 128);
@@ -47,7 +47,7 @@ fn hammer_vec_default_does_not_touch_a_svm_probe() {
 #[test]
 fn hammer_slice_from_elem_in_routes_through_heap() {
     let region = SvmRegion::with_size(1 << 20);
-    let heap = Arc::new(Heap::svm(region.clone(), 0));
+    let heap = Arc::new(Heap::svm_data(region.clone()).expect("owner region heap"));
 
     let s: Slice<u8> = Slice::from_elem_in(2048, 0u8, heap.clone());
     assert_eq!(s.len(), 2048);
@@ -75,7 +75,7 @@ fn hammer_slice_default_from_elem_does_not_touch_a_svm_probe() {
 #[test]
 fn flat_hash_table_with_capacity_in_routes_through_heap() {
     let region = SvmRegion::with_size(1 << 20);
-    let heap = Arc::new(Heap::svm(region.clone(), 0));
+    let heap = Arc::new(Heap::svm_data(region.clone()).expect("owner region heap"));
 
     let mut table: FlatHashTable<u64, u64> = FlatHashTable::with_capacity_in(64, heap.clone());
     table.insert(1, 100);
@@ -103,7 +103,7 @@ fn flat_hash_table_default_with_capacity_does_not_touch_a_svm_probe() {
 #[test]
 fn hammer_vec_drop_returns_storage_to_same_heap() {
     let region = SvmRegion::with_size(20 * 1024);
-    let heap = Arc::new(Heap::svm(region.clone(), 0));
+    let heap = Arc::new(Heap::svm_data(region.clone()).expect("owner region heap"));
     let capacity = 1536usize;
     let layout = Layout::from_size_align(capacity * std::mem::size_of::<u64>(), 64).unwrap();
 
@@ -127,7 +127,7 @@ fn hammer_vec_drop_returns_storage_to_same_heap() {
 #[test]
 fn hammer_slice_drop_returns_storage_to_same_heap() {
     let region = SvmRegion::with_size(20 * 1024);
-    let heap = Arc::new(Heap::svm(region.clone(), 0));
+    let heap = Arc::new(Heap::svm_data(region.clone()).expect("owner region heap"));
     let len = 12 * 1024usize;
     let layout = Layout::from_size_align(len, 64).unwrap();
 

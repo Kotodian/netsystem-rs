@@ -1059,7 +1059,7 @@ fn expand_node_next(item: ItemEnum) -> Result<TokenStream2> {
         }
 
         const _: () = {
-            assert!(#ident::COUNT <= ::hammer_adapter::node::MAX_NODE_NEXT_FRAMES);
+            assert!(#ident::COUNT <= ::hammer_adapter::node::MAX_NODE_NEXT_SLOTS);
         };
     })
 }

@@ -4,7 +4,7 @@ pub mod component;
 pub mod connection;
 pub mod handoff;
 pub mod instruction_set;
-pub mod memory;
+mod memory;
 pub mod network;
 pub mod node;
 pub mod platform;
@@ -17,8 +17,9 @@ pub use buffer::{
     BufferFrameBatch, BufferFrameBatchCursor, BufferFrameBatchIndices, BufferFramePairBatch,
     BufferFramePairBatchCursor, BufferFrameQuadBatch, BufferFrameQuadBatchCursor,
     BufferHeaderCacheline0, BufferHeaderCacheline1, BufferIndex, BufferNodeError,
-    BufferPacketCursor, BufferPool, BufferPoolArena, BufferRef, BufferRefMut, DataPlaneBuffers,
-    DataPlaneRuntime, FrameIndex, PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES, PrimaryOpaque,
+    BufferPacketCursor, BufferPool, BufferPoolArena, BufferRef, BufferRefMut,
+    DataPlaneBufferConfig, DataPlaneBuffers, DataPlaneRuntime, DataPlaneRuntimeConfig, Frame,
+    FrameIndex, Next, PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES, Pending, PrimaryOpaque,
     SecondaryOpaque,
 };
 pub use hammer_core::protocol::icmp::IcmpErrorMetadata;
@@ -36,10 +37,9 @@ pub use component::{
 pub use connection::ConnectionHandle;
 pub use network::NetworkManager;
 pub use node::{
-    DriverNode, InternalNode, NextFrame, Node, NodeDescriptor, NodeEntry, NodeErrorCounters,
-    NodeHandle, NodeId, NodeKind, NodeNext, NodeNextFrames, NodeNextStorage, NodeProcessFn,
-    NodeRegistration, NodeResult, NodeRuntime, NodeRuntimeData, NodeRuntimeReady, NodeState,
-    NoopNode, default_prefetch_indices,
+    DriverNode, InternalNode, Node, NodeDescriptor, NodeEntry, NodeErrorCounters, NodeHandle,
+    NodeId, NodeKind, NodeNext, NodeNextStorage, NodeProcessFn, NodeRegistration, NodeResult,
+    NodeRuntime, NodeRuntimeData, NodeRuntimeReady, NodeState, NoopNode, default_prefetch_indices,
 };
 pub use platform::{
     DefaultInterfaceUpdateListener, NetworkInterface, PlatformInterface, TunOptions, WifiState,

@@ -20,7 +20,7 @@ pub fn install_worker_graph(engine: &mut Engine) -> HammerResult<()> {
         hammer_core::error::CoreError::internal("install_worker_graph: handoff node handle not set")
     })?;
 
-    engine.runtime = engine.runtime.clone().with_handoff_node_handle(handle);
+    engine.runtime.set_handoff_node_handle(handle);
 
     let worker = engine.thread_index as usize;
     let worker_id = hammer_adapter::DataWorkerId::new(engine.thread_index);

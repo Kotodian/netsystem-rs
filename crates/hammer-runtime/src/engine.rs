@@ -210,14 +210,23 @@ impl EnginePool {
 mod tests {
     use super::*;
     use hammer_adapter::DataPlaneRuntime;
+    use hammer_adapter::buffer::{DataPlaneBufferConfig, DataPlaneRuntimeConfig};
     use hammer_core::registry::RuntimeRegistry;
     use std::sync::Arc;
 
+    fn test_runtime() -> DataPlaneRuntime {
+        let buffers = DataPlaneBufferConfig {
+            buffer_slot_capacity: 64,
+            buffer_slots: 16,
+            frame_capacity: 16,
+            frame_slots: 16,
+            ..DataPlaneBufferConfig::default()
+        };
+        DataPlaneRuntime::new(DataPlaneRuntimeConfig { buffers })
+    }
+
     fn test_engine() -> Engine {
-        Engine::new(
-            DataPlaneRuntime::with_buffer_capacity(64, 16),
-            RuntimeRegistry::new(),
-        )
+        Engine::new(test_runtime(), RuntimeRegistry::new())
     }
 
     #[test]

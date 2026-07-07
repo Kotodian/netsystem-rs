@@ -4,10 +4,23 @@ use std::thread;
 use std::time::Duration;
 
 use hammer_adapter::DataPlaneRuntime;
+use hammer_adapter::buffer::{DataPlaneBufferConfig, DataPlaneRuntimeConfig};
 use hammer_core::registry::RuntimeRegistry;
 use hammer_runtime::barrier;
 use hammer_runtime::engine::Engine;
 use hammer_runtime::spawn::DataRemoteLocalQueue;
+
+fn test_runtime(thread_index: u32) -> DataPlaneRuntime {
+    let buffers = DataPlaneBufferConfig {
+        buffer_slot_capacity: 64,
+        buffer_slots: 4,
+        frame_capacity: 16,
+        frame_slots: 4,
+        thread_index,
+        ..DataPlaneBufferConfig::default()
+    };
+    DataPlaneRuntime::new(DataPlaneRuntimeConfig { buffers })
+}
 
 #[test]
 fn worker_spawn_engine_main_loop_exits() {
@@ -16,7 +29,7 @@ fn worker_spawn_engine_main_loop_exits() {
 
     for idx in 0..n_workers {
         let handle = thread::spawn(move || {
-            let rt = DataPlaneRuntime::with_buffer_capacity(64, 4);
+            let rt = test_runtime(idx);
             hammer_runtime::spawn::set_data_plane_runtime(rt.clone());
             let mut engine = Engine::new(rt, RuntimeRegistry::new());
             engine.thread_index = idx;

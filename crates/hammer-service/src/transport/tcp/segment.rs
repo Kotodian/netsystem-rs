@@ -252,7 +252,16 @@ mod tests {
 
     #[test]
     fn transport_tcp_segment_write_to_buffer_prepends_sack_blocks() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 4, 4, 4);
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 2048,
+                    buffer_slots: 4,
+                    frame_capacity: 4,
+                    frame_slots: 4,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
         let index = runtime.alloc_index().expect("buffer");
         let local = "192.0.2.10:50000".parse().expect("local");
         let remote = "198.51.100.20:443".parse().expect("remote");
@@ -286,7 +295,16 @@ mod tests {
 
     #[test]
     fn transport_tcp_segment_write_to_buffer_prepends_fast_open_cookie() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 4, 4, 4);
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 2048,
+                    buffer_slots: 4,
+                    frame_capacity: 4,
+                    frame_slots: 4,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
         let index = runtime.alloc_index().expect("buffer");
         let local = "192.0.2.10:50000".parse().expect("local");
         let remote = "198.51.100.20:443".parse().expect("remote");

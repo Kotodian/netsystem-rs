@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use hammer_adapter::{
     BufferFrame, BufferIndex, DataPlaneRuntime, DataWorkerId, Node, NodeHandle, NodeId,
-    NodeNextFrames, NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
-    TraceFormatter, add_packet_trace,
+    NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace, TraceFormatter,
+    add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::checksum::internet_checksum;
@@ -234,7 +234,7 @@ impl IpReassemblyRuntime {
     }
 
     #[inline]
-    fn expire(&mut self, runtime: &DataPlaneRuntime, now: Instant) -> usize {
+    fn expire(&mut self, runtime: &DataPlaneRuntime, now: Instant) -> CoreResult<usize> {
         let timeout = self.timeout;
         let expired = self
             .contexts
@@ -247,13 +247,13 @@ impl IpReassemblyRuntime {
         let expired_len = expired.len();
         for key in expired {
             if let Some(context) = self.contexts.remove(&key) {
-                context.drop_fragments(runtime);
+                context.drop_fragments(runtime)?;
             }
             if let Some(handoff) = &self.handoff {
                 handoff.directory.remove(key);
             }
         }
-        expired_len
+        Ok(expired_len)
     }
 
     fn process_frame(
@@ -262,34 +262,24 @@ impl IpReassemblyRuntime {
         frame: &mut BufferFrame,
         next: [NodeId; IpReassemblyNext::COUNT],
         now: Instant,
-    ) -> CoreResult<NodeResult> {
-        Ok(hammer_adapter::node_rewrite_frame_current!(
-            runtime,
-            frame,
-            |next_frames, current_next| {
-                self.failed_keys.clear();
-            },
-            |index, next_frames, current_next| self.process_index(
-                runtime,
-                &mut next_frames,
-                &mut current_next,
-                next,
-                index,
-                now,
-            )
-        ))
+    ) -> NodeResult {
+        self.failed_keys.clear();
+        let width = runtime.preferred_frame_batch_width();
+        let _ = frame.rewrite_indices_batched(width, |index| {
+            let _ = self.process_index(runtime, next, index, now);
+            Ok(None)
+        });
+        NodeResult::drop()
     }
 
     #[inline]
     fn process_index(
         &mut self,
         runtime: &DataPlaneRuntime,
-        next_frames: &mut NodeNextFrames,
-        current_next: &mut Option<NodeId>,
         next: [NodeId; IpReassemblyNext::COUNT],
         index: BufferIndex,
         now: Instant,
-    ) -> CoreResult<Option<BufferIndex>> {
+    ) -> CoreResult<()> {
         let buffer = runtime.get_buffer(index)?;
         let current_worker = self.current_worker();
         let fragment = match parse_ip_fragment_with_chain_len(
@@ -311,7 +301,8 @@ impl IpReassemblyRuntime {
                         next: Some(drop_next),
                     },
                 );
-                return self.emit_output(runtime, next_frames, current_next, drop_next, index);
+                self.emit_output(runtime, drop_next, index)?;
+                return Ok(());
             }
         };
         drop(buffer);
@@ -330,8 +321,8 @@ impl IpReassemblyRuntime {
                     next: Some(drop_next),
                 },
             );
-            next_frames.enqueue(runtime, drop_next, index);
-            return Ok(None);
+            self.emit_output(runtime, drop_next, index)?;
+            return Ok(());
         }
         let fragment_first_worker = self.fragment_first_worker(runtime, index, fragment)?;
         if let Some(handoff) = &self.handoff {
@@ -349,7 +340,7 @@ impl IpReassemblyRuntime {
                     },
                 );
                 runtime.handoff_index(owner, handoff.reassembly, index)?;
-                return Ok(None);
+                return Ok(());
             }
         }
         if !self.contexts.contains_key(&key) {
@@ -366,7 +357,8 @@ impl IpReassemblyRuntime {
                         next: Some(drop_next),
                     },
                 );
-                return self.emit_output(runtime, next_frames, current_next, drop_next, index);
+                self.emit_output(runtime, drop_next, index)?;
+                return Ok(());
             }
             self.contexts.insert(
                 key,
@@ -436,7 +428,8 @@ impl IpReassemblyRuntime {
                     next: Some(drop_next),
                 },
             );
-            return self.emit_output(runtime, next_frames, current_next, drop_next, index);
+            self.emit_output(runtime, drop_next, index)?;
+            return Ok(());
         }
 
         if let Some(failed_index) = failed {
@@ -454,7 +447,7 @@ impl IpReassemblyRuntime {
                             next: Some(drop_node),
                         },
                     );
-                    next_frames.enqueue(runtime, drop_node, fragment.index);
+                    self.emit_output(runtime, drop_node, fragment.index)?;
                 }
             }
             let _ = add_packet_trace!(
@@ -468,14 +461,14 @@ impl IpReassemblyRuntime {
                     next: Some(drop_node),
                 },
             );
-            next_frames.enqueue(runtime, drop_node, failed_index);
+            self.emit_output(runtime, drop_node, failed_index)?;
             if !self.failed_keys.contains(&key) {
                 self.failed_keys.push(key);
             }
             if let Some(handoff) = &self.handoff {
                 handoff.directory.remove(key);
             }
-            return Ok(None);
+            return Ok(());
         }
 
         if let Some(index) = reassembled {
@@ -516,13 +509,8 @@ impl IpReassemblyRuntime {
                             next: Some(lookup_next),
                         },
                     );
-                    return self.emit_output(
-                        runtime,
-                        next_frames,
-                        current_next,
-                        lookup_next,
-                        index,
-                    );
+                    self.emit_output(runtime, lookup_next, index)?;
+                    return Ok(());
                 }
             } else {
                 let lookup_next = NodeNextStorage::next(&next, IpReassemblyNext::Lookup);
@@ -537,32 +525,23 @@ impl IpReassemblyRuntime {
                         next: Some(lookup_next),
                     },
                 );
-                return self.emit_output(runtime, next_frames, current_next, lookup_next, index);
+                self.emit_output(runtime, lookup_next, index)?;
+                return Ok(());
             }
         }
-        Ok(None)
+        Ok(())
     }
 
     #[inline(always)]
     fn emit_output(
         &self,
         runtime: &DataPlaneRuntime,
-        next_frames: &mut NodeNextFrames,
-        current_next: &mut Option<NodeId>,
         node: NodeId,
         index: BufferIndex,
-    ) -> CoreResult<Option<BufferIndex>> {
-        match *current_next {
-            Some(current) if current == node => Ok(Some(index)),
-            Some(_) => {
-                next_frames.enqueue(runtime, node, index);
-                Ok(None)
-            }
-            None => {
-                *current_next = Some(node);
-                Ok(Some(index))
-            }
-        }
+    ) -> CoreResult<()> {
+        let mut frame = runtime.buffers().get_next_frame(node)?;
+        frame.push_index(index)?;
+        runtime.put_next_frame(frame)
     }
 
     #[inline(always)]
@@ -749,7 +728,7 @@ fn expire_ip_reassembly_runtime(
     let state = runtimes
         .get_mut(slot)
         .ok_or_else(|| CoreError::internal("IP reassembly runtime slot is invalid"))?;
-    Ok(state.expire(runtime, now))
+    state.expire(runtime, now)
 }
 
 fn ip_reassembly_process(
@@ -766,7 +745,7 @@ fn ip_reassembly_process(
         let state = runtimes
             .get_mut(slot)
             .ok_or_else(|| CoreError::internal("IP reassembly runtime slot is invalid"))?;
-        state.process_frame(runtime, frame, next, Instant::now())
+        Ok(state.process_frame(runtime, frame, next, Instant::now()))
     })()
     .unwrap_or_else(|_| NodeResult::drop())
 }
@@ -991,17 +970,15 @@ impl ReassemblyContext {
     }
 
     #[inline]
-    fn drop_fragments(self, runtime: &DataPlaneRuntime) {
-        let mut owner = runtime.alloc_frame().expect("reassembly free frame");
+    fn drop_fragments(self, runtime: &DataPlaneRuntime) -> CoreResult<()> {
+        let mut owner = runtime.buffers().get_next_frame(NodeId::new(0))?;
         for fragment in self.fragments {
             if owner.push_index(fragment.index).is_err() {
-                drop(owner);
-                owner = runtime.alloc_frame().expect("reassembly free frame");
-                owner
-                    .push_index(fragment.index)
-                    .expect("reassembly free push");
+                owner = runtime.buffers().get_next_frame(NodeId::new(0))?;
+                owner.push_index(fragment.index)?;
             }
         }
+        Ok(())
     }
 }
 

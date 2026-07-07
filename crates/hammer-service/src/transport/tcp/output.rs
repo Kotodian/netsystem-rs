@@ -116,7 +116,7 @@ fn tcp_output_node_process_frame(
 ) -> NodeResult {
     let lookup = next[TcpOutputNext::Lookup as usize];
     let drop = next[TcpOutputNext::Drop as usize];
-    hammer_adapter::process_frame!(runtime, frame, |index, _nf| {
+    hammer_adapter::process_frame!(runtime, frame, |index| {
         tcp_output_next_for_index(runtime, index, lookup, drop).unwrap_or(drop)
     })
 }
@@ -288,7 +288,16 @@ mod tests {
         Arc<Mutex<CaptureState>>,
         NodeId,
     ) {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 2048,
+                    buffer_slots: 16,
+                    frame_capacity: 8,
+                    frame_slots: 8,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
         let lookup_state = Arc::new(Mutex::new(CaptureState::default()));
         let drop_state = Arc::new(Mutex::new(CaptureState::default()));
         let lookup = runtime
@@ -304,9 +313,9 @@ mod tests {
     }
 
     fn send_to_output(runtime: &DataPlaneRuntime, output: NodeId, index: BufferIndex) {
-        let mut frame = runtime.alloc_frame().expect("frame");
+        let mut frame = runtime.buffers().get_next_frame(output).expect("frame");
         frame.push_index(index).expect("push index");
-        runtime.submit_frame(frame, output).expect("submit");
+        runtime.put_next_frame(frame).expect("put next frame");
     }
 
     fn test_segment(payload_len: usize) -> TcpSegment {

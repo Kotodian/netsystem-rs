@@ -1,8 +1,66 @@
 use std::sync::Arc;
 
 use hammer_adapter::buffer::{BufferPool, BufferPoolArena};
-use hammer_adapter::{DataPlaneHandoff, DataPlaneInstructionSet, DataPlaneRuntime, DataWorkerId};
+use hammer_adapter::{
+    DataPlaneBufferConfig, DataPlaneBuffers, DataPlaneHandoff, DataPlaneInstructionSet,
+    DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, NodeId,
+};
 use hammer_infra::heap::Heap;
+
+fn runtime_config(
+    slot_capacity: usize,
+    slots: usize,
+    frame_capacity: usize,
+    frame_slots: usize,
+    instruction_set: DataPlaneInstructionSet,
+) -> DataPlaneRuntimeConfig {
+    DataPlaneRuntimeConfig {
+        buffers: DataPlaneBufferConfig {
+            buffer_slot_capacity: slot_capacity,
+            buffer_slots: slots,
+            frame_capacity,
+            frame_slots,
+            instruction_set,
+            ..DataPlaneBufferConfig::default()
+        },
+    }
+}
+
+fn runtime_with_numa(
+    slot_capacity: usize,
+    slots: usize,
+    numa_nodes: &'static [u32],
+) -> DataPlaneRuntime {
+    let config = DataPlaneRuntimeConfig {
+        buffers: DataPlaneBufferConfig {
+            buffer_slot_capacity: slot_capacity,
+            buffer_slots: slots,
+            numa_nodes,
+            ..DataPlaneBufferConfig::default()
+        },
+    };
+    DataPlaneRuntime::new(config)
+}
+
+fn runtime_with_handoff_arena(
+    arena: BufferPoolArena,
+    frame_capacity: usize,
+    frame_slots: usize,
+    instruction_set: DataPlaneInstructionSet,
+) -> DataPlaneRuntime {
+    let handoff = DataPlaneHandoff::new_shared_buffer_arena(1, frame_capacity.max(1), arena);
+    DataPlaneRuntime::attach_handoff_worker(
+        DataPlaneRuntime::new(runtime_config(
+            1,
+            1,
+            frame_capacity,
+            frame_slots,
+            instruction_set,
+        )),
+        DataWorkerId::new(0),
+        handoff.worker(DataWorkerId::new(0)),
+    )
+}
 
 trait CleanupOwner {
     fn drop_index_owned(&self, index: hammer_adapter::BufferIndex);
@@ -10,20 +68,22 @@ trait CleanupOwner {
 
 impl CleanupOwner for BufferPool {
     fn drop_index_owned(&self, index: hammer_adapter::BufferIndex) {
-        let buffers = hammer_adapter::DataPlaneBuffers::with_buffer_arena_and_frame_capacity(
-            self.arena(),
-            1,
-            1,
-            DataPlaneInstructionSet::native(),
-        );
-        let mut frame = buffers.alloc_frame().expect("cleanup frame");
+        let runtime =
+            runtime_with_handoff_arena(self.arena(), 1, 1, DataPlaneInstructionSet::native());
+        let mut frame = runtime
+            .buffers()
+            .get_next_frame(NodeId::new(0))
+            .expect("cleanup frame");
         frame.push_index(index).expect("cleanup push index");
     }
 }
 
 impl CleanupOwner for DataPlaneRuntime {
     fn drop_index_owned(&self, index: hammer_adapter::BufferIndex) {
-        let mut frame = self.alloc_frame().expect("cleanup frame");
+        let mut frame = self
+            .buffers()
+            .get_next_frame(NodeId::new(0))
+            .expect("cleanup frame");
         frame.push_index(index).expect("cleanup push index");
     }
 }
@@ -35,17 +95,17 @@ macro_rules! drop_owned_index {
 }
 
 #[test]
-fn arenas_keep_their_heap_numa_identity() {
-    let a0 = BufferPoolArena::with_capacity_in(1024, 32, Arc::new(Heap::local(0)));
-    let a1 = BufferPoolArena::with_capacity_in(1024, 32, Arc::new(Heap::local(1)));
+fn arenas_keep_their_arena_numa_identity() {
+    let a0 = BufferPoolArena::with_capacity_in(1024, 32, Arc::new(Heap::local()), 0);
+    let a1 = BufferPoolArena::with_capacity_in(1024, 32, Arc::new(Heap::local()), 1);
     let p0 = BufferPool::with_arena(a0);
     let p1 = BufferPool::with_arena(a1);
 
     let i0 = p0.alloc_index().expect("numa0 alloc");
     let i1 = p1.alloc_index().expect("numa1 alloc");
 
-    assert_eq!(p0.heap_numa_node(), 0);
-    assert_eq!(p1.heap_numa_node(), 1);
+    assert_eq!(p0.numa_node(), 0);
+    assert_eq!(p1.numa_node(), 1);
     assert_ne!(p0.pool_id(), p1.pool_id());
     assert_ne!(p0.buffer_raw_ptr(i0.slot()), p1.buffer_raw_ptr(i1.slot()));
 }
@@ -62,72 +122,120 @@ fn ordinary_buffer_pool_clone_shares_thread_cache_on_same_thread() {
 
 #[test]
 fn empty_numa_configuration_defaults_to_numa_zero() {
-    let runtime = DataPlaneRuntime::with_numa_buffer_capacity(1024, 16, &[]);
+    let runtime = runtime_with_numa(1024, 16, &[]);
     let index = runtime.alloc_index().expect("fallback alloc");
 
     assert_eq!(runtime.active_numa_node(), 0);
     assert_eq!(runtime.buffers().active_numa_node(), 0);
-    assert_eq!(runtime.buffers().buffers().heap_numa_node(), 0);
+    assert_eq!(
+        runtime
+            .buffers()
+            .try_buffers()
+            .expect("active buffer pool")
+            .numa_node(),
+        0
+    );
 
     drop_owned_index!(&runtime, index);
 }
 
 #[test]
-fn legacy_with_buffer_arena_constructor_keeps_active_numa_zero() {
-    let arena = BufferPoolArena::with_capacity_in(1024, 16, Arc::new(Heap::local(3)));
-    let buffers = hammer_adapter::DataPlaneBuffers::with_buffer_arena_and_frame_capacity(
-        arena.clone(),
-        4,
-        4,
-        DataPlaneInstructionSet::Scalar,
-    );
-    let runtime = DataPlaneRuntime::with_buffer_arena_and_frame_capacity(
-        arena,
-        4,
-        4,
-        DataPlaneInstructionSet::Scalar,
-    );
+fn config_constructor_resolves_active_numa_to_configured_node() {
+    let config = DataPlaneBufferConfig {
+        buffer_slot_capacity: 1024,
+        buffer_slots: 16,
+        frame_capacity: 4,
+        frame_slots: 4,
+        instruction_set: DataPlaneInstructionSet::Scalar,
+        numa_nodes: &[3],
+        active_numa_node: 0,
+        ..DataPlaneBufferConfig::default()
+    };
+    let buffers = DataPlaneBuffers::new(config);
+    let runtime = runtime_with_numa(1024, 16, &[3]);
 
-    assert_eq!(buffers.active_numa_node(), 0);
-    assert_eq!(buffers.buffers().heap_numa_node(), 3);
-    assert_eq!(runtime.active_numa_node(), 0);
-    assert_eq!(runtime.buffers().active_numa_node(), 0);
-    assert_eq!(runtime.buffers().buffers().heap_numa_node(), 3);
+    assert_eq!(buffers.active_numa_node(), 3);
+    assert_eq!(
+        buffers
+            .try_buffers()
+            .expect("active buffer pool")
+            .numa_node(),
+        3
+    );
+    assert_eq!(runtime.active_numa_node(), 3);
+    assert_eq!(runtime.buffers().active_numa_node(), 3);
+    assert_eq!(
+        runtime
+            .buffers()
+            .try_buffers()
+            .expect("active buffer pool")
+            .numa_node(),
+        3
+    );
+}
+
+#[test]
+fn handoff_arena_constructor_uses_arena_numa_identity() {
+    let arena = BufferPoolArena::with_capacity_in(1024, 16, Arc::new(Heap::local()), 3);
+    let runtime = runtime_with_handoff_arena(arena, 4, 4, DataPlaneInstructionSet::Scalar);
+    let buffers = runtime.buffers();
+
+    assert_eq!(buffers.active_numa_node(), 3);
+    assert_eq!(
+        buffers
+            .try_buffers()
+            .expect("active buffer pool")
+            .numa_node(),
+        3
+    );
+    assert_eq!(runtime.active_numa_node(), 3);
+    assert_eq!(runtime.buffers().active_numa_node(), 3);
+    assert_eq!(
+        runtime
+            .buffers()
+            .try_buffers()
+            .expect("active buffer pool")
+            .numa_node(),
+        3
+    );
 }
 
 #[test]
 fn handoff_capacities_preserve_handoff_arena_numa_identity() {
-    let handoff = DataPlaneHandoff::with_buffer_arena(
+    let handoff = DataPlaneHandoff::new_shared_buffer_arena(
         2,
         4,
-        BufferPoolArena::with_capacity_in(1024, 16, Arc::new(Heap::local(3))),
+        BufferPoolArena::with_capacity_in(1024, 16, Arc::new(Heap::local()), 3),
     );
-    let runtime = DataPlaneRuntime::with_handoff_capacities(
+    let runtime = DataPlaneRuntime::attach_handoff_worker(
+        DataPlaneRuntime::new(runtime_config(1, 1, 4, 4, DataPlaneInstructionSet::Scalar)),
         DataWorkerId::new(0),
         handoff.worker(DataWorkerId::new(0)),
-        4,
-        4,
-        DataPlaneInstructionSet::Scalar,
     );
 
     assert_eq!(runtime.active_numa_node(), 3);
     assert_eq!(runtime.buffers().active_numa_node(), 3);
-    assert_eq!(runtime.buffers().buffers().heap_numa_node(), 3);
+    assert_eq!(
+        runtime
+            .buffers()
+            .try_buffers()
+            .expect("active buffer pool")
+            .numa_node(),
+        3
+    );
 }
 
 #[test]
 fn handoff_worker_clone_falls_back_to_configured_nonzero_numa_arena() {
-    let handoff = DataPlaneHandoff::with_buffer_arena(
+    let handoff = DataPlaneHandoff::new_shared_buffer_arena(
         2,
         4,
-        BufferPoolArena::with_capacity_in(1024, 16, Arc::new(Heap::local(3))),
+        BufferPoolArena::with_capacity_in(1024, 16, Arc::new(Heap::local()), 3),
     );
-    let runtime = DataPlaneRuntime::with_handoff_capacities(
+    let runtime = DataPlaneRuntime::attach_handoff_worker(
+        DataPlaneRuntime::new(runtime_config(1, 1, 4, 4, DataPlaneInstructionSet::Scalar)),
         DataWorkerId::new(0),
         handoff.worker(DataWorkerId::new(0)),
-        4,
-        4,
-        DataPlaneInstructionSet::Scalar,
     );
 
     let worker = runtime.clone_for_worker(1, 1);
@@ -136,7 +244,14 @@ fn handoff_worker_clone_falls_back_to_configured_nonzero_numa_arena() {
 
     assert_eq!(worker.active_numa_node(), 3);
     assert_eq!(worker.buffers().active_numa_node(), 3);
-    assert_eq!(worker.buffers().buffers().heap_numa_node(), 3);
+    assert_eq!(
+        worker
+            .buffers()
+            .try_buffers()
+            .expect("active buffer pool")
+            .numa_node(),
+        3
+    );
     assert_eq!(main_index.pool_id(), worker_index.pool_id());
 
     drop_owned_index!(&worker, worker_index);
@@ -145,7 +260,7 @@ fn handoff_worker_clone_falls_back_to_configured_nonzero_numa_arena() {
 
 #[test]
 fn same_numa_worker_clone_shares_arena_but_not_thread_cache() {
-    let runtime = DataPlaneRuntime::with_numa_buffer_capacity(1024, 4, &[0]);
+    let runtime = runtime_with_numa(1024, 4, &[0]);
     let worker = runtime.clone_for_worker(1, 0);
 
     let main_index = runtime.alloc_index().expect("main alloc");

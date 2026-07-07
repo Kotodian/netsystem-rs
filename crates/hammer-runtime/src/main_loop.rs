@@ -112,11 +112,23 @@ mod tests {
     use crate::engine::Engine;
     use crate::spawn::DataRemoteLocalQueue;
     use hammer_adapter::DataPlaneRuntime;
+    use hammer_adapter::buffer::{DataPlaneBufferConfig, DataPlaneRuntimeConfig};
     use hammer_core::registry::RuntimeRegistry;
+
+    fn test_runtime() -> DataPlaneRuntime {
+        let buffers = DataPlaneBufferConfig {
+            buffer_slot_capacity: 64,
+            buffer_slots: 4,
+            frame_capacity: 16,
+            frame_slots: 4,
+            ..DataPlaneBufferConfig::default()
+        };
+        DataPlaneRuntime::new(DataPlaneRuntimeConfig { buffers })
+    }
 
     #[test]
     fn engine_main_loop_exits_on_flag() {
-        let rt = DataPlaneRuntime::with_buffer_capacity(64, 4);
+        let rt = test_runtime();
         crate::spawn::set_data_plane_runtime(rt.clone());
 
         let engine = Engine::new(rt, RuntimeRegistry::new());

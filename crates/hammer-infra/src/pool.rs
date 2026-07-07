@@ -55,10 +55,10 @@ unsafe impl<T: Sync, const ALIGN: usize> Sync for Pool<T, ALIGN> {}
 
 impl<T, const ALIGN: usize> Pool<T, ALIGN> {
     /// Allocates the backing slab from the global allocator (`Heap::local`).
-    /// Equivalent to `with_capacity_in(capacity, Arc::new(Heap::local(0)))`.
+    /// Equivalent to `with_capacity_in(capacity, Arc::new(Heap::local()))`.
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
-        Self::with_capacity_in(capacity, Arc::new(Heap::local(0)))
+        Self::with_capacity_in(capacity, Arc::new(Heap::local()))
     }
 
     /// Allocates the backing slab from the provided `heap` and retains the

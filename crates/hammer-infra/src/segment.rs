@@ -89,14 +89,13 @@ impl Segment for Local {
     }
 
     fn free(&self, _: u64, _: usize) {
-        // Local uses bump allocator; free is a no-op.
+        // Local uses bump allocation; offsets return when the segment drops.
     }
 
     fn fd(&self) -> Option<RawFd> {
         None
     }
 }
-
 unsafe impl Send for Local {}
 unsafe impl Sync for Local {}
 
@@ -200,7 +199,6 @@ impl Segment for Svm {
         Some(self.region.fd())
     }
 }
-
 unsafe impl Send for Svm {}
 unsafe impl Sync for Svm {}
 
@@ -254,15 +252,15 @@ mod tests {
     }
 
     #[test]
-    fn svm_alloc_aligned() {
+    fn svm_heap_returns_aligned_offset() {
         let seg = Svm::create("hammer_test_align", 4096).expect("create");
         let off = seg.alloc(128, 64);
         assert_eq!(off % 64, 0);
     }
 
     #[test]
-    fn svm_free_then_reuse() {
-        let seg = Svm::create("hammer_test_free", 4096).expect("create");
+    fn svm_release_then_reuse() {
+        let seg = Svm::create("hammer_test_release", 4096).expect("create");
         let off1 = seg.alloc(4096, 64);
         seg.free(off1, 4096);
         let off2 = seg.alloc(4096, 64);

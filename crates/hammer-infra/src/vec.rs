@@ -45,11 +45,11 @@ impl<T, const ALIGN: usize> RawVec<T, ALIGN> {
     }
 
     /// Back-compat: allocates the backing storage from the global
-    /// allocator via `Heap::local(0)`. Equivalent to
-    /// `with_capacity_in(capacity, Arc::new(Heap::local(0)))`.
+    /// allocator via `Heap::local()`. Equivalent to
+    /// `with_capacity_in(capacity, Arc::new(Heap::local()))`.
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
-        Self::with_capacity_in(capacity, Arc::new(Heap::local(0)))
+        Self::with_capacity_in(capacity, Arc::new(Heap::local()))
     }
 
     /// Allocates `capacity` slots of `T` from `heap` and stores the
@@ -273,10 +273,7 @@ impl<T, const ALIGN: usize> RawVec<T, ALIGN> {
         // Transfer the Heap handle so the Slice's `Drop` can dealloc
         // through the same vtable. `heap = None` only when `cap == 0`,
         // in which case the Slice's `Drop` is a no-op.
-        let heap = self
-            .heap
-            .clone()
-            .unwrap_or_else(|| Arc::new(Heap::local(0)));
+        let heap = self.heap.clone().unwrap_or_else(|| Arc::new(Heap::local()));
         self.ptr = NonNull::dangling();
         self.len = 0;
         self.cap = 0;
@@ -289,11 +286,11 @@ impl<T, const ALIGN: usize> RawVec<T, ALIGN> {
     fn grow_to(&mut self, next_capacity: usize) {
         // The new region must come from the same Heap that owns the
         // existing region, otherwise `Drop`'s dealloc would target a
-        // foreign allocator. Lazy-initialise to `Heap::local(0)` for
+        // foreign allocator. Lazy-initialise to `Heap::local()` for
         // the `RawVec::new()` (heap = None) entry path.
         let heap = self
             .heap
-            .get_or_insert_with(|| Arc::new(Heap::local(0)))
+            .get_or_insert_with(|| Arc::new(Heap::local()))
             .clone();
         let old_cap = self.cap;
         let next_layout = align::array_layout::<T, ALIGN>(next_capacity);

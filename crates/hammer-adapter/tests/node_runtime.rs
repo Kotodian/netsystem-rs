@@ -1,18 +1,12 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use hammer_adapter::buffer::{DataPlaneBufferConfig, DataPlaneRuntimeConfig};
 use hammer_adapter::{
     BufferFrame, DataPlaneRuntime, DriverNode, InternalNode, Node, NodeDescriptor, NodeHandle,
     NodeId, NodeKind, NodeNext, NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData,
-    NodeState, TraceFormatter,
+    NodeState, TraceFormatter, process_frame,
 };
 use hammer_core::error::CoreResult;
-
-macro_rules! drop_owned_index {
-    ($owner:expr, $index:expr) => {{
-        let mut frame = ($owner).alloc_frame().expect("cleanup frame");
-        frame.push_index($index).expect("cleanup push index");
-    }};
-}
 
 static NODE_CALLS_BY_WORD: [AtomicU64; 128] = [const { AtomicU64::new(0) }; 128];
 
@@ -22,6 +16,22 @@ fn reset_calls(word: u64) {
 
 fn calls_for(word: u64) -> u64 {
     NODE_CALLS_BY_WORD[word as usize].load(Ordering::SeqCst)
+}
+
+fn test_runtime(
+    buffer_slot_capacity: usize,
+    buffer_slots: usize,
+    frame_capacity: usize,
+    frame_pool_size: usize,
+) -> DataPlaneRuntime {
+    let buffers = DataPlaneBufferConfig {
+        buffer_slot_capacity,
+        buffer_slots,
+        frame_capacity,
+        frame_slots: frame_pool_size,
+        ..DataPlaneBufferConfig::default()
+    };
+    DataPlaneRuntime::new(DataPlaneRuntimeConfig { buffers })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -174,26 +184,19 @@ impl Node for ProcessOnlyNode {
 
 impl InternalNode for ProcessOnlyNode {}
 
-fn count_process(
-    runtime: &DataPlaneRuntime,
-    data: NodeRuntimeData,
-    frame: &mut BufferFrame,
-) -> NodeResult {
+fn count_process(_: &DataPlaneRuntime, data: NodeRuntimeData, _: &mut BufferFrame) -> NodeResult {
     let word = match data.usize_word(0) {
         Ok(w) => w,
         Err(_) => return NodeResult::drop(),
     };
     NODE_CALLS_BY_WORD[word].fetch_add(1, Ordering::SeqCst);
-    for buffer in frame.drain_pending() {
-        drop_owned_index!(&runtime, buffer);
-    }
     NodeResult::drop()
 }
 
 fn forward_default_process(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
-    _frame: &mut BufferFrame,
+    frame: &mut BufferFrame,
 ) -> NodeResult {
     let word = match data.usize_word(0) {
         Ok(w) => w,
@@ -204,7 +207,7 @@ fn forward_default_process(
         Ok(n) => n,
         Err(_) => return NodeResult::drop(),
     };
-    NodeResult::next_current(next)
+    process_frame!(runtime, frame, |_| next)
 }
 
 fn trace_formatter(bytes: &[u8]) -> String {
@@ -214,15 +217,15 @@ fn trace_formatter(bytes: &[u8]) -> String {
 #[test]
 fn register_internal_uses_descriptor_function_and_runtime_data() {
     reset_calls(42);
-    let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 2);
+    let runtime = test_runtime(64, 4, 4, 2);
     let node = runtime.nodes().register_internal(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::from_words([42, 0, 0, 0]),
     ));
-    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    let mut frame = runtime.buffers().get_next_frame(node).expect("alloc frame");
     push_packet(&runtime, &mut frame, b"packet");
 
-    runtime.submit_frame(frame, node).expect("submit");
+    runtime.put_next_frame(frame).expect("put next frame");
     assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 1);
 
     assert_eq!(calls_for(42), 1);
@@ -232,15 +235,15 @@ fn register_internal_uses_descriptor_function_and_runtime_data() {
 #[test]
 fn register_driver_preserves_old_spelling_for_descriptor_nodes() {
     reset_calls(7);
-    let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 2);
+    let runtime = test_runtime(64, 4, 4, 2);
     let node = runtime.nodes().register_driver(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::from_words([7, 0, 0, 0]),
     ));
-    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    let mut frame = runtime.buffers().get_next_frame(node).expect("alloc frame");
     push_packet(&runtime, &mut frame, b"packet");
 
-    runtime.submit_frame(frame, node).expect("submit");
+    runtime.put_next_frame(frame).expect("put next frame");
     assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 1);
 
     assert_eq!(calls_for(7), 1);
@@ -248,7 +251,7 @@ fn register_driver_preserves_old_spelling_for_descriptor_nodes() {
 
 #[test]
 fn runtime_exposes_node_kind_and_state() {
-    let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 2);
+    let runtime = test_runtime(64, 4, 4, 2);
     let internal = runtime.nodes().register_internal(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::empty(),
@@ -281,7 +284,7 @@ fn runtime_exposes_node_kind_and_state() {
 #[test]
 fn schedule_empty_frame_runs_driver_without_packet_vectors() {
     reset_calls(21);
-    let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 2);
+    let runtime = test_runtime(64, 4, 4, 2);
     let driver = runtime.nodes().register_driver(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::from_words([21, 0, 0, 0]),
@@ -302,7 +305,7 @@ fn schedule_polling_driver_nodes_schedules_only_polling_drivers() {
     reset_calls(32);
     reset_calls(33);
 
-    let runtime = DataPlaneRuntime::with_capacities(64, 8, 4, 8);
+    let runtime = test_runtime(64, 8, 4, 8);
     let polling_driver = runtime.nodes().register_driver(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::from_words([31, 0, 0, 0]),
@@ -345,7 +348,7 @@ fn schedule_polling_driver_nodes_schedules_only_polling_drivers() {
 #[test]
 fn interrupt_pending_coalesces_empty_driver_dispatch() {
     reset_calls(31);
-    let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 4);
+    let runtime = test_runtime(64, 4, 4, 4);
     let driver = runtime.nodes().register_driver(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::from_words([31, 0, 0, 0]),
@@ -365,18 +368,18 @@ fn interrupt_pending_coalesces_empty_driver_dispatch() {
             .set_node_interrupt_pending(driver)
             .expect("second interrupt coalesces")
     );
-    assert_eq!(runtime.nodes().pending_len(), 1);
+    assert!(runtime.nodes().has_pending());
 
     assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 1);
     assert_eq!(calls_for(31), 1);
-    assert_eq!(runtime.nodes().pending_len(), 0);
+    assert!(!runtime.nodes().has_pending());
     assert_eq!(runtime.buffers().frames_in_use(), 0);
 }
 
 #[test]
 fn disabled_driver_interrupt_does_not_schedule() {
     reset_calls(37);
-    let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 4);
+    let runtime = test_runtime(64, 4, 4, 4);
     let driver = runtime.nodes().register_driver(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::from_words([37, 0, 0, 0]),
@@ -391,7 +394,7 @@ fn disabled_driver_interrupt_does_not_schedule() {
             .set_node_interrupt_pending(driver)
             .expect("disabled interrupt is ignored")
     );
-    assert_eq!(runtime.nodes().pending_len(), 0);
+    assert!(!runtime.nodes().has_pending());
     assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 0);
     assert_eq!(calls_for(37), 0);
 }
@@ -399,7 +402,7 @@ fn disabled_driver_interrupt_does_not_schedule() {
 #[test]
 fn disabled_node_skips_already_queued_empty_frame() {
     reset_calls(41);
-    let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 4);
+    let runtime = test_runtime(64, 4, 4, 4);
     let driver = runtime.nodes().register_driver(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::from_words([41, 0, 0, 0]),
@@ -420,7 +423,7 @@ fn disabled_node_skips_already_queued_empty_frame() {
 
 #[test]
 fn descriptor_registration_keeps_name_next_slots_trace_and_siblings() {
-    let runtime = DataPlaneRuntime::with_capacities(64, 8, 8, 4);
+    let runtime = test_runtime(64, 8, 8, 4);
     let default = runtime.nodes().register_internal(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::empty(),
@@ -470,12 +473,12 @@ fn descriptor_registration_keeps_name_next_slots_trace_and_siblings() {
 
 #[test]
 fn default_node_process_path_registers_and_drops_gracefully() {
-    let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 2);
+    let runtime = test_runtime(64, 4, 4, 2);
     let node = runtime.nodes().register_internal(ProcessOnlyNode);
-    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    let mut frame = runtime.buffers().get_next_frame(node).expect("alloc frame");
     push_packet(&runtime, &mut frame, b"packet");
 
-    runtime.submit_frame(frame, node).expect("submit");
+    runtime.put_next_frame(frame).expect("put next frame");
     let result = runtime
         .run_ready_nodes()
         .expect("default node process must succeed");
@@ -488,7 +491,7 @@ fn descriptor_next_node_runs_with_runtime_resolved_next_slot() {
     reset_calls(11);
     reset_calls(13);
     reset_calls(17);
-    let runtime = DataPlaneRuntime::with_capacities(64, 8, 8, 4);
+    let runtime = test_runtime(64, 8, 8, 4);
     let default = runtime.nodes().register_internal(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::from_words([11, 0, 0, 0]),
@@ -503,10 +506,13 @@ fn descriptor_next_node_runs_with_runtime_resolved_next_slot() {
         NodeRuntimeData::from_words([17, 0, 0, 0]),
         [default, alternate],
     ));
-    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(owner)
+        .expect("alloc frame");
     push_packet(&runtime, &mut frame, b"packet");
 
-    runtime.submit_frame(frame, owner).expect("submit");
+    runtime.put_next_frame(frame).expect("put next frame");
     assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 2);
 
     assert_eq!(calls_for(17), 1);
@@ -516,7 +522,7 @@ fn descriptor_next_node_runs_with_runtime_resolved_next_slot() {
 
 #[test]
 fn descriptor_registration_validates_declared_next_shape() {
-    let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 2);
+    let runtime = test_runtime(64, 4, 4, 2);
     let next = runtime.nodes().register_internal(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::empty(),
@@ -541,7 +547,7 @@ fn descriptor_registration_validates_declared_next_shape() {
 #[test]
 fn descriptor_registration_with_handle_registers_handle_once() {
     const HANDLE: NodeHandle = NodeHandle::new(9);
-    let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 2);
+    let runtime = test_runtime(64, 4, 4, 2);
     let node = runtime
         .nodes()
         .register_internal_with_handle(
@@ -573,8 +579,11 @@ fn node_descriptor_exposes_public_snapshot_accessors() {
         Some(trace_formatter),
     );
 
-    let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 2);
-    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    let runtime = test_runtime(64, 4, 4, 2);
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(NodeId::new(0))
+        .expect("alloc frame");
     let _ = descriptor.process()(&runtime, descriptor.runtime_data(), &mut frame);
 
     assert_eq!(calls_for(99), 1);
@@ -592,7 +601,7 @@ fn node_descriptor_exposes_public_snapshot_accessors() {
 
 #[test]
 fn node_by_name_returns_registered_id_and_none_for_unknown() {
-    let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 2);
+    let runtime = test_runtime(64, 4, 4, 2);
     let drop = runtime.nodes().register_internal(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::empty(),
@@ -610,7 +619,7 @@ fn node_by_name_returns_registered_id_and_none_for_unknown() {
 
 #[test]
 fn set_node_next_slot_redirects_existing_next_slot() {
-    let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 2);
+    let runtime = test_runtime(64, 4, 4, 2);
     let initial = runtime.nodes().register_internal(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::empty(),
@@ -650,7 +659,7 @@ fn set_node_next_slot_redirects_existing_next_slot() {
 
 #[test]
 fn try_register_descriptor_registers_erased_descriptor() {
-    let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 2);
+    let runtime = test_runtime(64, 4, 4, 2);
     let drop = runtime.nodes().register_internal(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::empty(),
@@ -681,7 +690,7 @@ fn try_register_descriptor_registers_erased_descriptor() {
 
 #[test]
 fn try_register_descriptor_rejects_next_count_mismatch() {
-    let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 2);
+    let runtime = test_runtime(64, 4, 4, 2);
     let empty_nexts: &[NodeId] = &[];
     let descriptor = NodeDescriptor::new(
         count_process,

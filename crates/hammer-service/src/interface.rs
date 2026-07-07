@@ -969,7 +969,7 @@ fn interface_output_process_frame(
         .nodes()
         .node_by_name("drop")
         .expect("interface_output_process_frame: drop node not registered");
-    hammer_adapter::process_frame!(runtime, frame, |index, _nf| {
+    hammer_adapter::process_frame!(runtime, frame, |index| {
         match InterfaceOutputNode::tx_for_index(output, runtime, index, drop_next) {
             Ok(node) => node,
             Err(_) => drop_next,

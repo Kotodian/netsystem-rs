@@ -3,8 +3,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use hammer_adapter::BufferPacketCursor;
 use hammer_adapter::{
-    BufferFrame, BufferNodeError, DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult,
-    NodeRuntimeData, TraceControlPlane, TraceInputPolicy, TracePolicy,
+    BufferFrame, BufferNodeError, DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig,
+    InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData, TraceControlPlane,
+    TraceInputPolicy, TracePolicy,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
@@ -13,6 +14,24 @@ use hammer_service::net::{
     IcmpInputControlPlane, IcmpInputError, IcmpInputTrace, IpVersion, NetworkOpaque,
 };
 use std::mem::transmute;
+
+fn test_runtime_configured(
+    buffer_slot_capacity: usize,
+    buffer_slots: usize,
+    frame_capacity: usize,
+    frame_slots: usize,
+) -> DataPlaneRuntime {
+    let config = DataPlaneRuntimeConfig {
+        buffers: DataPlaneBufferConfig {
+            buffer_slot_capacity,
+            buffer_slots,
+            frame_capacity,
+            frame_slots,
+            ..DataPlaneBufferConfig::default()
+        },
+    };
+    DataPlaneRuntime::new(config)
+}
 
 #[derive(Default)]
 struct CaptureState {
@@ -115,7 +134,7 @@ fn capture_process(
 
 #[test]
 fn icmp_input_dispatches_ipv4_echo_request_by_type() {
-    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let runtime = test_runtime_configured(2048, 16, 8, 8);
     let echo_state = Arc::new(Mutex::new(CaptureState::default()));
     let punt_state = Arc::new(Mutex::new(CaptureState::default()));
     let echo = runtime
@@ -142,10 +161,13 @@ fn icmp_input_dispatches_ipv4_echo_request_by_type() {
     });
     runtime.set_trace_control(Some(trace_control.handle()), 2);
     let packet = ipv4_icmp_packet(8, 0, b"echo4");
-    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(icmp_input)
+        .expect("alloc frame");
     push_marked_packet(&runtime, &mut frame, icmp_input, &packet);
 
-    runtime.submit_frame(frame, icmp_input).expect("schedule");
+    runtime.put_next_frame(frame).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert_eq!(echo_state.lock().unwrap().packets, vec![packet]);
@@ -164,7 +186,7 @@ fn icmp_input_dispatches_ipv4_echo_request_by_type() {
 
 #[test]
 fn icmp_input_dispatches_ipv6_echo_request_by_type() {
-    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let runtime = test_runtime_configured(2048, 16, 8, 8);
     let echo_state = Arc::new(Mutex::new(CaptureState::default()));
     let punt_state = Arc::new(Mutex::new(CaptureState::default()));
     let echo = runtime
@@ -179,10 +201,13 @@ fn icmp_input_dispatches_ipv6_echo_request_by_type() {
         .expect("register echo request");
     let icmp_input = runtime.nodes().register_internal(control.node());
     let packet = ipv6_icmp_packet(128, 0, b"echo6");
-    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(icmp_input)
+        .expect("alloc frame");
     push_packet(&runtime, &mut frame, &packet);
 
-    runtime.submit_frame(frame, icmp_input).expect("schedule");
+    runtime.put_next_frame(frame).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert_eq!(echo_state.lock().unwrap().packets, vec![packet]);
@@ -192,7 +217,7 @@ fn icmp_input_dispatches_ipv6_echo_request_by_type() {
 
 #[test]
 fn icmp_input_sends_unknown_ipv4_type_to_default_next() {
-    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let runtime = test_runtime_configured(2048, 16, 8, 8);
     let punt_state = Arc::new(Mutex::new(CaptureState::default()));
     let punt = runtime
         .nodes()
@@ -200,10 +225,13 @@ fn icmp_input_sends_unknown_ipv4_type_to_default_next() {
     let control = IcmpInputControlPlane::new(punt);
     let icmp_input = runtime.nodes().register_internal(control.node());
     let packet = ipv4_icmp_packet(13, 0, b"timestamp");
-    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(icmp_input)
+        .expect("alloc frame");
     push_packet(&runtime, &mut frame, &packet);
 
-    runtime.submit_frame(frame, icmp_input).expect("schedule");
+    runtime.put_next_frame(frame).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert_eq!(punt_state.lock().unwrap().packets, vec![packet]);
@@ -218,7 +246,7 @@ fn icmp_input_sends_unknown_ipv4_type_to_default_next() {
 
 #[test]
 fn icmp_input_rejects_ipv6_echo_request_with_nonzero_code() {
-    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let runtime = test_runtime_configured(2048, 16, 8, 8);
     let echo_state = Arc::new(Mutex::new(CaptureState::default()));
     let punt_state = Arc::new(Mutex::new(CaptureState::default()));
     let echo = runtime
@@ -233,10 +261,13 @@ fn icmp_input_rejects_ipv6_echo_request_with_nonzero_code() {
         .expect("register echo request");
     let icmp_input = runtime.nodes().register_internal(control.node());
     let packet = ipv6_icmp_packet(128, 1, b"bad-code");
-    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(icmp_input)
+        .expect("alloc frame");
     push_packet(&runtime, &mut frame, &packet);
 
-    runtime.submit_frame(frame, icmp_input).expect("schedule");
+    runtime.put_next_frame(frame).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert!(echo_state.lock().unwrap().packets.is_empty());

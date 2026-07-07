@@ -482,67 +482,6 @@ impl IpLookupNode {
     }
 }
 
-macro_rules! process_adjacency_rewrite_batch {
-    ($runtime:expr, $table:expr, $next_frames:expr, $indices:expr, $read:ident, 4) => {{
-        if $read + 4 < $indices.len() {
-            $runtime.prefetch_header($indices[$read + 4]);
-        }
-        if $read + 5 < $indices.len() {
-            $runtime.prefetch_header($indices[$read + 5]);
-        }
-        if $read + 6 < $indices.len() {
-            $runtime.prefetch_header($indices[$read + 6]);
-        }
-        if $read + 7 < $indices.len() {
-            $runtime.prefetch_header($indices[$read + 7]);
-        }
-        let index0 = $indices[$read];
-        let index1 = $indices[$read + 1];
-        let index2 = $indices[$read + 2];
-        let index3 = $indices[$read + 3];
-        $runtime.prefetch_write(index0);
-        $runtime.prefetch_write(index1);
-        $runtime.prefetch_write(index2);
-        $runtime.prefetch_write(index3);
-        let next0 = AdjacencyRewriteNode::next_for_index($table, $runtime, index0);
-        let next1 = AdjacencyRewriteNode::next_for_index($table, $runtime, index1);
-        let next2 = AdjacencyRewriteNode::next_for_index($table, $runtime, index2);
-        let next3 = AdjacencyRewriteNode::next_for_index($table, $runtime, index3);
-        $next_frames.enqueue_optional($runtime, index0, next0);
-        $next_frames.enqueue_optional($runtime, index1, next1);
-        $next_frames.enqueue_optional($runtime, index2, next2);
-        $next_frames.enqueue_optional($runtime, index3, next3);
-        $read += 4;
-    }};
-    ($runtime:expr, $table:expr, $next_frames:expr, $indices:expr, $read:ident, 2) => {{
-        if $read + 2 < $indices.len() {
-            $runtime.prefetch_header($indices[$read + 2]);
-        }
-        if $read + 3 < $indices.len() {
-            $runtime.prefetch_header($indices[$read + 3]);
-        }
-        let index0 = $indices[$read];
-        let index1 = $indices[$read + 1];
-        $runtime.prefetch_write(index0);
-        $runtime.prefetch_write(index1);
-        let next0 = AdjacencyRewriteNode::next_for_index($table, $runtime, index0);
-        let next1 = AdjacencyRewriteNode::next_for_index($table, $runtime, index1);
-        $next_frames.enqueue_optional($runtime, index0, next0);
-        $next_frames.enqueue_optional($runtime, index1, next1);
-        $read += 2;
-    }};
-    ($runtime:expr, $table:expr, $next_frames:expr, $indices:expr, $read:ident, 1) => {{
-        if $read + 1 < $indices.len() {
-            $runtime.prefetch_header($indices[$read + 1]);
-        }
-        let index = $indices[$read];
-        $runtime.prefetch_write(index);
-        let next = AdjacencyRewriteNode::next_for_index($table, $runtime, index);
-        $next_frames.enqueue_optional($runtime, index, next);
-        $read += 1;
-    }};
-}
-
 impl Node for IpLookupNode {
     #[inline(always)]
     fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
@@ -796,7 +735,7 @@ fn ip_lookup_process_frame(
     frame: &mut BufferFrame,
     table: &FibTable,
 ) -> NodeResult {
-    hammer_adapter::process_frame!(runtime, frame, |index, _nf| {
+    hammer_adapter::process_frame!(runtime, frame, |index| {
         IpLookupNode::process_index(runtime, table, index)
     })
 }
@@ -815,20 +754,28 @@ fn adjacency_rewrite_process_frame(
     frame: &mut BufferFrame,
     table: &FibTableHandle,
 ) -> NodeResult {
-    let indices = frame.pending_indices();
-    let mut next_frames = hammer_adapter::NodeNextFrames::default();
-    let mut read = 0usize;
-    let len = indices.len();
-    while read + 4 <= len {
-        process_adjacency_rewrite_batch!(runtime, table, next_frames, indices, read, 4);
-    }
-    if read + 2 <= len {
-        process_adjacency_rewrite_batch!(runtime, table, next_frames, indices, read, 2);
-    }
-    while read < len {
-        process_adjacency_rewrite_batch!(runtime, table, next_frames, indices, read, 1);
-    }
-    next_frames.finish(runtime, frame)
+    let _ = frame.retain_indices_batched_with_prefetch(
+        runtime.preferred_frame_batch_width(),
+        |index| {
+            runtime.prefetch_header(index);
+            runtime.prefetch_write(index);
+        },
+        |index| {
+            let Some(next) = AdjacencyRewriteNode::next_for_index(table, runtime, index) else {
+                return Ok(true);
+            };
+            let mut next_frame = match runtime.buffers().get_next_frame(next) {
+                Ok(frame) => frame,
+                Err(_) => return Ok(true),
+            };
+            if next_frame.push_index(index).is_err() {
+                return Ok(true);
+            }
+            let _ = runtime.put_next_frame(next_frame);
+            Ok(false)
+        },
+    );
+    NodeResult::drop()
 }
 
 #[inline(always)]

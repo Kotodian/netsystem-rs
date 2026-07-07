@@ -40,7 +40,7 @@ impl<T, const ALIGN: usize> Slice<T, ALIGN> {
     where
         T: Clone,
     {
-        Self::from_elem_in(len, value, Arc::new(Heap::local(0)))
+        Self::from_elem_in(len, value, Arc::new(Heap::local()))
     }
 
     /// Allocates `len` slots of `T` from the provided `heap` and
@@ -85,7 +85,7 @@ impl<T, const ALIGN: usize> Slice<T, ALIGN> {
         }
 
         let cap = len;
-        let heap = Arc::new(Heap::local(0));
+        let heap = Arc::new(Heap::local());
         let ptr = allocate_in::<T, ALIGN>(cap, &heap);
         let mut guard = InitGuard::<T, ALIGN> {
             ptr,
@@ -187,7 +187,7 @@ impl<T: Clone, const ALIGN: usize> Clone for Slice<T, ALIGN> {
             .heap
             .as_ref()
             .cloned()
-            .unwrap_or_else(|| Arc::new(Heap::local(0)));
+            .unwrap_or_else(|| Arc::new(Heap::local()));
         let ptr = allocate_in::<T, ALIGN>(self.cap, &heap);
         let mut guard = InitGuard::<T, ALIGN> {
             ptr,

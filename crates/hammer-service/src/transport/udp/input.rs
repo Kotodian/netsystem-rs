@@ -251,7 +251,7 @@ fn udp_input_process_frame(
     snapshot: &UdpInputSnapshot,
     next: &[NodeId; UdpInputNext::COUNT],
 ) -> NodeResult {
-    hammer_adapter::process_frame!(runtime, frame, |index, _nf| {
+    hammer_adapter::process_frame!(runtime, frame, |index| {
         match next_node_for_index(runtime, index, snapshot, next) {
             Ok(Some(node)) => node,
             _ => NodeNextStorage::next(next, UdpInputNext::Drop),

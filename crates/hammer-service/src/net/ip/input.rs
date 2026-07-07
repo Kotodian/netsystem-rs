@@ -2,9 +2,9 @@ use std::mem::transmute;
 use std::sync::{Mutex, OnceLock};
 
 use hammer_adapter::{
-    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeId, NodeNextFrames,
-    NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace, TraceFormatter,
-    add_packet_trace, unlikely,
+    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeId, NodeNextStorage,
+    NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace, TraceFormatter, add_packet_trace,
+    unlikely,
 };
 use hammer_core::error::{CoreError, CoreResult};
 
@@ -121,7 +121,7 @@ fn ip_input_process_frame(
     next: [NodeId; IpInputNext::COUNT],
     feature_arc: Option<&FeatureArcStartHandle>,
 ) -> NodeResult {
-    hammer_adapter::process_frame!(runtime, frame, |index, _nf| {
+    hammer_adapter::process_frame!(runtime, frame, |index| {
         match next_node_for_index(runtime, index, next, feature_arc) {
             Ok(node) => node,
             Err(_) => NodeNextStorage::next(&next, IpInputNext::Drop),

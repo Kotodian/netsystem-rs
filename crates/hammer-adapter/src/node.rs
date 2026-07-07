@@ -1,416 +1,116 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
-use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::error::{CoreError, CoreResult, DataPlaneError};
+use hammer_infra::boxed::Slice;
 
-use crate::buffer::{BufferFrame, DataPlaneRuntime, Frame, Next, Pending};
+use crate::buffer::{BufferFrame, DataPlaneRuntime, Frame, Pending};
 use crate::trace::TraceFormatter;
 
 pub mod next;
 
-pub const MAX_NODE_NEXT_FRAMES: usize = 16;
+pub const MAX_NODE_NEXT_SLOTS: usize = 16;
+const DEFAULT_SCHEDULED_FRAME_QUEUE_CAPACITY: usize = 4096;
 
-pub use next::{NodeNext, NodeNextFrames, NodeNextStorage, default_prefetch_indices};
-
-#[macro_export]
-macro_rules! node_rewrite_frame_current {
-    (
-        $runtime:expr,
-        $frame:expr,
-        |$next_frames:ident, $current_next:ident| $before:block,
-        |$index:ident, $rewrite_next_frames:ident, $rewrite_current_next:ident| $body:expr
-        $(,)?
-    ) => {{
-        let mut $next_frames = $crate::node::NodeNextFrames::default();
-        let mut $current_next = None;
-        $before
-        let _ = $frame.rewrite_indices_batched($runtime.preferred_frame_batch_width(), |$index| $body);
-        $next_frames.schedule($runtime);
-        if $frame.has_pending()
-            && let Some(node) = $current_next
-        {
-            $crate::node::NodeResult::next_current(node)
-        } else {
-            $crate::node::NodeResult::drop()
-        }
-    }};
-}
-
-#[macro_export]
-macro_rules! validate_buffer_enqueue_x1 {
-    ($runtime:expr, $next_frames:expr, $next0:expr, $index0:expr $(,)?) => {
-        $next_frames.enqueue($runtime, $next0, $index0)
-    };
-}
-
-#[macro_export]
-macro_rules! validate_buffer_enqueue_x2 {
-    ($runtime:expr, $next_frames:expr, $next0:expr, $index0:expr, $next1:expr, $index1:expr $(,)?) => {{
-        $crate::validate_buffer_enqueue_x1!($runtime, $next_frames, $next0, $index0);
-        $crate::validate_buffer_enqueue_x1!($runtime, $next_frames, $next1, $index1);
-    }};
-}
-
-#[macro_export]
-macro_rules! validate_buffer_enqueue_x4 {
-    ($runtime:expr, $next_frames:expr,
-     $next0:expr, $index0:expr,
-     $next1:expr, $index1:expr,
-     $next2:expr, $index2:expr,
-     $next3:expr, $index3:expr
-     $(,)?) => {{
-        $crate::validate_buffer_enqueue_x1!($runtime, $next_frames, $next0, $index0);
-        $crate::validate_buffer_enqueue_x1!($runtime, $next_frames, $next1, $index1);
-        $crate::validate_buffer_enqueue_x1!($runtime, $next_frames, $next2, $index2);
-        $crate::validate_buffer_enqueue_x1!($runtime, $next_frames, $next3, $index3);
-    }};
-}
+pub use next::{NodeNext, NodeNextStorage, default_prefetch_indices};
 
 #[macro_export]
 macro_rules! process_frame {
     (
         $runtime:expr,
         $frame:expr,
-        |$index:ident, $nf:ident| $body:expr
+        |$index:pat_param| $body:expr
         $(,)?
     ) => {{
         let width = $runtime.preferred_frame_batch_width();
-        let mut $nf = $crate::node::NodeNextFrames::default();
-        let indices = $frame.pending_indices();
-        let len = indices.len();
-        let mut read = 0usize;
-        match width {
-            $crate::instruction_set::FrameBatchWidth::Quad => {
-                while read + 4 <= len {
-                    if read + 4 < len {
-                        $runtime.prefetch_header(indices[read + 4]);
+        let mut next_nodes: [Option<$crate::NodeId>; $crate::node::MAX_NODE_NEXT_SLOTS] =
+            [None; $crate::node::MAX_NODE_NEXT_SLOTS];
+        let mut next_frames: [Option<$crate::Frame<$crate::Next>>;
+            $crate::node::MAX_NODE_NEXT_SLOTS] = ::std::array::from_fn(|_| None);
+        let mut next_len = 0usize;
+        let mut cached_next = None;
+        let mut cached_offset = 0usize;
+        let mut enqueue_failed = false;
+
+        let _ = $frame.rewrite_indices_batched(width, |packet_index| {
+            if enqueue_failed {
+                return Ok(Some(packet_index));
+            }
+            let next = {
+                let $index = packet_index;
+                $body
+            };
+
+            let mut offset = None;
+            if cached_next == Some(next) && next_frames[cached_offset].is_some() {
+                offset = Some(cached_offset);
+            } else {
+                let mut scan = 0usize;
+                while scan < next_len {
+                    if next_nodes[scan] == Some(next) {
+                        offset = Some(scan);
+                        break;
                     }
-                    if read + 5 < len {
-                        $runtime.prefetch_header(indices[read + 5]);
-                    }
-                    if read + 6 < len {
-                        $runtime.prefetch_header(indices[read + 6]);
-                    }
-                    if read + 7 < len {
-                        $runtime.prefetch_header(indices[read + 7]);
-                    }
-                    $nf.enqueue(
-                        $runtime,
-                        {
-                            let $index = indices[read];
-                            $body
-                        },
-                        indices[read],
-                    );
-                    read += 1;
-                    $nf.enqueue(
-                        $runtime,
-                        {
-                            let $index = indices[read];
-                            $body
-                        },
-                        indices[read],
-                    );
-                    read += 1;
-                    $nf.enqueue(
-                        $runtime,
-                        {
-                            let $index = indices[read];
-                            $body
-                        },
-                        indices[read],
-                    );
-                    read += 1;
-                    $nf.enqueue(
-                        $runtime,
-                        {
-                            let $index = indices[read];
-                            $body
-                        },
-                        indices[read],
-                    );
-                    read += 1;
-                }
-                if read + 2 <= len {
-                    if read + 2 < len {
-                        $runtime.prefetch_header(indices[read + 2]);
-                    }
-                    if read + 3 < len {
-                        $runtime.prefetch_header(indices[read + 3]);
-                    }
-                    $nf.enqueue(
-                        $runtime,
-                        {
-                            let $index = indices[read];
-                            $body
-                        },
-                        indices[read],
-                    );
-                    read += 1;
-                    $nf.enqueue(
-                        $runtime,
-                        {
-                            let $index = indices[read];
-                            $body
-                        },
-                        indices[read],
-                    );
-                    read += 1;
-                }
-                while read < len {
-                    if read + 1 < len {
-                        $runtime.prefetch_header(indices[read + 1]);
-                    }
-                    $nf.enqueue(
-                        $runtime,
-                        {
-                            let $index = indices[read];
-                            $body
-                        },
-                        indices[read],
-                    );
-                    read += 1;
+                    scan += 1;
                 }
             }
-            $crate::instruction_set::FrameBatchWidth::Pair => {
-                while read + 2 <= len {
-                    if read + 2 < len {
-                        $runtime.prefetch_header(indices[read + 2]);
+
+            let offset = match offset {
+                Some(offset) => offset,
+                None => {
+                    if next_len == $crate::node::MAX_NODE_NEXT_SLOTS {
+                        enqueue_failed = true;
+                        return Ok(Some(packet_index));
                     }
-                    if read + 3 < len {
-                        $runtime.prefetch_header(indices[read + 3]);
+                    match $runtime.buffers().get_next_frame(next) {
+                        Ok(frame) => {
+                            let offset = next_len;
+                            next_nodes[offset] = Some(next);
+                            next_frames[offset] = Some(frame);
+                            next_len += 1;
+                            offset
+                        }
+                        Err(_) => {
+                            enqueue_failed = true;
+                            return Ok(Some(packet_index));
+                        }
                     }
-                    $nf.enqueue(
-                        $runtime,
-                        {
-                            let $index = indices[read];
-                            $body
-                        },
-                        indices[read],
-                    );
-                    read += 1;
-                    $nf.enqueue(
-                        $runtime,
-                        {
-                            let $index = indices[read];
-                            $body
-                        },
-                        indices[read],
-                    );
-                    read += 1;
                 }
-                while read < len {
-                    if read + 1 < len {
-                        $runtime.prefetch_header(indices[read + 1]);
+            };
+
+            cached_next = Some(next);
+            cached_offset = offset;
+
+            match next_frames[offset].as_mut() {
+                Some(frame) => {
+                    if frame.push_index(packet_index).is_ok() {
+                        Ok(None)
+                    } else {
+                        enqueue_failed = true;
+                        Ok(Some(packet_index))
                     }
-                    $nf.enqueue(
-                        $runtime,
-                        {
-                            let $index = indices[read];
-                            $body
-                        },
-                        indices[read],
-                    );
-                    read += 1;
                 }
-            }
-            $crate::instruction_set::FrameBatchWidth::Octo => {
-                while read + 8 <= len {
-                    if read + 8 < len {
-                        $runtime.prefetch_header(indices[read + 8]);
-                    }
-                    if read + 9 < len {
-                        $runtime.prefetch_header(indices[read + 9]);
-                    }
-                    if read + 10 < len {
-                        $runtime.prefetch_header(indices[read + 10]);
-                    }
-                    if read + 11 < len {
-                        $runtime.prefetch_header(indices[read + 11]);
-                    }
-                    if read + 12 < len {
-                        $runtime.prefetch_header(indices[read + 12]);
-                    }
-                    if read + 13 < len {
-                        $runtime.prefetch_header(indices[read + 13]);
-                    }
-                    if read + 14 < len {
-                        $runtime.prefetch_header(indices[read + 14]);
-                    }
-                    if read + 15 < len {
-                        $runtime.prefetch_header(indices[read + 15]);
-                    }
-                    $nf.enqueue(
-                        $runtime,
-                        {
-                            let $index = indices[read];
-                            $body
-                        },
-                        indices[read],
-                    );
-                    read += 1;
-                    $nf.enqueue(
-                        $runtime,
-                        {
-                            let $index = indices[read];
-                            $body
-                        },
-                        indices[read],
-                    );
-                    read += 1;
-                    $nf.enqueue(
-                        $runtime,
-                        {
-                            let $index = indices[read];
-                            $body
-                        },
-                        indices[read],
-                    );
-                    read += 1;
-                    $nf.enqueue(
-                        $runtime,
-                        {
-                            let $index = indices[read];
-                            $body
-                        },
-                        indices[read],
-                    );
-                    read += 1;
-                    $nf.enqueue(
-                        $runtime,
-                        {
-                            let $index = indices[read];
-                            $body
-                        },
-                        indices[read],
-                    );
-                    read += 1;
-                    $nf.enqueue(
-                        $runtime,
-                        {
-                            let $index = indices[read];
-                            $body
-                        },
-                        indices[read],
-                    );
-                    read += 1;
-                    $nf.enqueue(
-                        $runtime,
-                        {
-                            let $index = indices[read];
-                            $body
-                        },
-                        indices[read],
-                    );
-                    read += 1;
-                    $nf.enqueue(
-                        $runtime,
-                        {
-                            let $index = indices[read];
-                            $body
-                        },
-                        indices[read],
-                    );
-                    read += 1;
-                }
-                while read + 4 <= len {
-                    if read + 4 < len {
-                        $runtime.prefetch_header(indices[read + 4]);
-                    }
-                    if read + 5 < len {
-                        $runtime.prefetch_header(indices[read + 5]);
-                    }
-                    if read + 6 < len {
-                        $runtime.prefetch_header(indices[read + 6]);
-                    }
-                    if read + 7 < len {
-                        $runtime.prefetch_header(indices[read + 7]);
-                    }
-                    $nf.enqueue(
-                        $runtime,
-                        {
-                            let $index = indices[read];
-                            $body
-                        },
-                        indices[read],
-                    );
-                    read += 1;
-                    $nf.enqueue(
-                        $runtime,
-                        {
-                            let $index = indices[read];
-                            $body
-                        },
-                        indices[read],
-                    );
-                    read += 1;
-                    $nf.enqueue(
-                        $runtime,
-                        {
-                            let $index = indices[read];
-                            $body
-                        },
-                        indices[read],
-                    );
-                    read += 1;
-                    $nf.enqueue(
-                        $runtime,
-                        {
-                            let $index = indices[read];
-                            $body
-                        },
-                        indices[read],
-                    );
-                    read += 1;
-                }
-                if read + 2 <= len {
-                    if read + 2 < len {
-                        $runtime.prefetch_header(indices[read + 2]);
-                    }
-                    if read + 3 < len {
-                        $runtime.prefetch_header(indices[read + 3]);
-                    }
-                    $nf.enqueue(
-                        $runtime,
-                        {
-                            let $index = indices[read];
-                            $body
-                        },
-                        indices[read],
-                    );
-                    read += 1;
-                    $nf.enqueue(
-                        $runtime,
-                        {
-                            let $index = indices[read];
-                            $body
-                        },
-                        indices[read],
-                    );
-                    read += 1;
-                }
-                while read < len {
-                    if read + 1 < len {
-                        $runtime.prefetch_header(indices[read + 1]);
-                    }
-                    $nf.enqueue(
-                        $runtime,
-                        {
-                            let $index = indices[read];
-                            $body
-                        },
-                        indices[read],
-                    );
-                    read += 1;
+                None => {
+                    enqueue_failed = true;
+                    Ok(Some(packet_index))
                 }
             }
+        });
+
+        let mut offset = 0usize;
+        while offset < next_len {
+            if let Some(frame) = next_frames[offset].take() {
+                let _ = $runtime.put_next_frame(frame);
+            }
+            offset += 1;
         }
-        $nf.finish($runtime, $frame)
+
+        $crate::node::NodeResult::drop()
     }};
 }
 
@@ -705,15 +405,7 @@ impl Node for NoopNode {
     }
 }
 
-pub enum NextFrame {
-    Current(NodeId),
-    Frame { node: NodeId, frame: Frame<Next> },
-}
-
-pub struct NodeResult {
-    next: [Option<NextFrame>; MAX_NODE_NEXT_FRAMES],
-    len: usize,
-}
+pub struct NodeResult;
 
 impl Default for NodeResult {
     fn default() -> Self {
@@ -723,56 +415,7 @@ impl Default for NodeResult {
 
 impl NodeResult {
     pub fn drop() -> Self {
-        Self {
-            next: std::array::from_fn(|_| None),
-            len: 0,
-        }
-    }
-
-    pub fn next_current(node: NodeId) -> Self {
-        let mut result = Self::drop();
-        result.next[0] = Some(NextFrame::Current(node));
-        result.len = 1;
-        result
-    }
-
-    pub fn next_frame(node: NodeId, frame: Frame<Next>) -> Self {
-        let mut result = Self::drop();
-        result.next[0] = Some(NextFrame::Frame { node, frame });
-        result.len = 1;
-        result
-    }
-
-    pub fn try_next_frames(next: impl IntoIterator<Item = NextFrame>) -> CoreResult<Self> {
-        let mut result = Self::drop();
-        let mut next = next.into_iter();
-        while let Some(item) = next.next() {
-            result.push(item)?;
-        }
-        Ok(result)
-    }
-
-    pub fn push(&mut self, next: NextFrame) -> CoreResult<()> {
-        if self.len == MAX_NODE_NEXT_FRAMES {
-            return Err(CoreError::internal("node next frame capacity exceeded"));
-        }
-        self.next[self.len] = Some(next);
-        self.len += 1;
-        Ok(())
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = &NextFrame> + '_ {
-        self.next[..self.len]
-            .iter()
-            .filter_map(|next| next.as_ref())
-    }
-
-    fn take(&mut self, offset: usize) -> Option<NextFrame> {
-        self.next.get_mut(offset).and_then(Option::take)
+        Self
     }
 }
 
@@ -857,7 +500,7 @@ struct NodeRuntimeInner {
     error_ids: HashMap<u64, u16>,
     error_slots: Vec<crate::BufferNodeError>,
     runtime_stats: Vec<NodeRuntimeStats>,
-    queue: VecDeque<ScheduledFrame>,
+    queue: ScheduledFrameQueue,
     handles: HashMap<NodeHandle, NodeId>,
     declared_nodes: HashMap<&'static str, NodeId>,
     node_names: Vec<Option<&'static str>>,
@@ -895,8 +538,10 @@ impl std::fmt::Debug for NodeRuntimeSlot {
 
 impl NodeRuntimeSlot {
     #[inline]
-    fn dispatch(self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
-        (self.process)(runtime, self.runtime_data, frame)
+    fn dispatch(self, runtime: &DataPlaneRuntime, frame: Frame<Pending>) -> Frame<Pending> {
+        let mut frame = frame;
+        (self.process)(runtime, self.runtime_data, &mut frame);
+        frame
     }
 }
 
@@ -947,6 +592,73 @@ struct ScheduledFrame {
     allow_empty: bool,
 }
 
+struct ScheduledFrameQueue {
+    slots: Slice<Option<ScheduledFrame>>,
+    head: usize,
+    len: usize,
+}
+
+impl ScheduledFrameQueue {
+    #[inline]
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            slots: Slice::from_fn(capacity, |_| None),
+            head: 0,
+            len: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn capacity(&self) -> usize {
+        self.slots.len()
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline(always)]
+    fn is_full(&self) -> bool {
+        self.len == self.capacity()
+    }
+
+    #[inline]
+    fn push_back(&mut self, frame: ScheduledFrame) -> Result<(), ScheduledFrame> {
+        if self.is_full() {
+            return Err(frame);
+        }
+        let slot = if self.capacity() == 0 {
+            0
+        } else {
+            (self.head + self.len) % self.capacity()
+        };
+        self.slots[slot] = Some(frame);
+        self.len += 1;
+        Ok(())
+    }
+
+    #[inline]
+    fn pop_front(&mut self) -> Option<ScheduledFrame> {
+        if self.len == 0 {
+            return None;
+        }
+        let frame = self.slots[self.head].take();
+        self.len -= 1;
+        if self.len == 0 {
+            self.head = 0;
+        } else {
+            self.head = (self.head + 1) % self.capacity();
+        }
+        frame
+    }
+}
+
 impl NodeRuntimeInner {
     #[inline]
     fn error_key(node: NodeId, code: u16) -> u64 {
@@ -993,8 +705,8 @@ impl NodeRuntimeInner {
         handle: Option<NodeHandle>,
         next_names: Option<&[&'static str]>,
     ) -> CoreResult<NodeId> {
-        if initial_nexts.len() > MAX_NODE_NEXT_FRAMES {
-            return Err(CoreError::internal("node next frame capacity exceeded"));
+        if initial_nexts.len() > MAX_NODE_NEXT_SLOTS {
+            return Err(CoreError::internal("node next slot capacity exceeded"));
         }
         if let Some(next_names) = next_names {
             if !initial_nexts.is_empty() {
@@ -1187,8 +899,8 @@ impl NodeRuntimeInner {
             .get(node.0 as usize)
             .map(Vec::len)
             .ok_or_else(|| CoreError::internal("node id out of bounds"))?;
-        if slot >= MAX_NODE_NEXT_FRAMES {
-            return Err(CoreError::internal("node next frame capacity exceeded"));
+        if slot >= MAX_NODE_NEXT_SLOTS {
+            return Err(CoreError::internal("node next slot capacity exceeded"));
         }
         let mut group = self.siblings[node.0 as usize].clone();
         group.push(node);
@@ -1217,7 +929,7 @@ impl Default for NodeRuntime {
                 error_ids: HashMap::new(),
                 error_slots: Vec::new(),
                 runtime_stats: Vec::new(),
-                queue: VecDeque::new(),
+                queue: ScheduledFrameQueue::with_capacity(DEFAULT_SCHEDULED_FRAME_QUEUE_CAPACITY),
                 handles: HashMap::new(),
                 declared_nodes: HashMap::new(),
                 node_names: Vec::new(),
@@ -1446,10 +1158,6 @@ impl NodeRuntime {
             .ok_or_else(|| CoreError::internal("node handle is not registered"))
     }
 
-    pub fn pending_len(&self) -> usize {
-        self.inner.borrow().queue.len()
-    }
-
     pub fn node_runtime_stats_snapshot(&self) -> Vec<NodeRuntimeStatsRow> {
         let inner = self.inner.borrow();
         inner
@@ -1491,9 +1199,9 @@ impl NodeRuntime {
         Ok(inner.node_states[node.0 as usize])
     }
 
-    pub fn polling_driver_nodes(&self) -> CoreResult<std::vec::Vec<NodeId>> {
+    pub fn polling_driver_nodes(&self) -> CoreResult<hammer_infra::vec::Vec<NodeId>> {
         let inner = self.inner.borrow();
-        let mut nodes = std::vec::Vec::new();
+        let mut nodes = hammer_infra::vec::Vec::new();
         let mut slot = 0usize;
         while slot < inner.nodes.len() {
             let node = &inner.nodes[slot];
@@ -1683,11 +1391,15 @@ impl NodeRuntime {
         allow_empty: bool,
     ) -> CoreResult<()> {
         self.validate_node(node)?;
-        self.inner.borrow_mut().queue.push_back(ScheduledFrame {
-            node,
-            frame,
-            allow_empty,
-        });
+        self.inner
+            .borrow_mut()
+            .queue
+            .push_back(ScheduledFrame {
+                node,
+                frame,
+                allow_empty,
+            })
+            .map_err(|_| DataPlaneError::ScheduledFrameQueueExhausted)?;
         self.readiness.mark_pending();
         Ok(())
     }
@@ -1697,7 +1409,7 @@ impl NodeRuntime {
         while let Some(scheduled) = self.pop_scheduled() {
             let ScheduledFrame {
                 node,
-                mut frame,
+                frame,
                 allow_empty,
             } = scheduled;
             let slot = self.runtime_slot(node)?;
@@ -1710,17 +1422,15 @@ impl NodeRuntime {
             }
             self.clear_interrupt_pending(node)?;
 
-            frame.clear_next_node();
             runtime.set_current_node(Some(node));
             let vectors = frame.pending_len();
             let start = Instant::now();
-            let result = slot.dispatch(runtime, &mut frame);
+            let frame = slot.dispatch(runtime, frame);
             let elapsed_ns = elapsed_ns(start);
             runtime.set_current_node(None);
             let _ = self.record_runtime_stats(node, vectors, elapsed_ns);
             processed += 1;
-
-            let _ = self.dispatch_result(runtime, frame, result);
+            drop(frame);
         }
         Ok(processed)
     }
@@ -1763,43 +1473,6 @@ impl NodeRuntime {
             self.readiness.clear_pending();
         }
         scheduled
-    }
-
-    pub(crate) fn take_scheduled_frame(&self) -> Option<Frame<Pending>> {
-        self.pop_scheduled().map(|scheduled| scheduled.frame)
-    }
-
-    fn dispatch_result(
-        &self,
-        runtime: &DataPlaneRuntime,
-        current_frame: Frame<Pending>,
-        mut result: NodeResult,
-    ) -> CoreResult<()> {
-        let mut current_frame = Some(current_frame);
-        let mut offset = 0usize;
-        while offset < result.len {
-            let Some(next) = result.take(offset) else {
-                offset += 1;
-                continue;
-            };
-            match next {
-                NextFrame::Current(node) => {
-                    let Some(frame) = current_frame.take() else {
-                        return Err(CoreError::internal(
-                            "current frame cannot be forwarded more than once",
-                        ));
-                    };
-                    if frame.has_pending() {
-                        runtime.submit_frame(frame.into(), node)?;
-                    }
-                }
-                NextFrame::Frame { node, frame } => {
-                    runtime.submit_frame(frame, node)?;
-                }
-            }
-            offset += 1;
-        }
-        Ok(())
     }
 }
 
@@ -1856,14 +1529,22 @@ mod tests {
 
     #[test]
     fn function_node_runtime_stats_count_named_node_frames() {
-        let runtime = DataPlaneRuntime::with_capacities(16, 8, 4, 2);
+        let runtime = DataPlaneRuntime::new(crate::DataPlaneRuntimeConfig {
+            buffers: crate::DataPlaneBufferConfig {
+                buffer_slot_capacity: 16,
+                buffer_slots: 8,
+                frame_capacity: 4,
+                frame_slots: 2,
+                ..crate::DataPlaneBufferConfig::default()
+            },
+        });
         let node = runtime.nodes().register_internal(StatsNode);
 
-        let mut frame = runtime.alloc_frame().expect("alloc frame");
+        let mut frame = runtime.buffers().get_next_frame(node).expect("alloc frame");
         push_packet(&runtime, &mut frame, b"one");
         push_packet(&runtime, &mut frame, b"two");
 
-        runtime.submit_frame(frame, node).expect("submit");
+        runtime.put_next_frame(frame).expect("put next frame");
         runtime
             .nodes()
             .increment_node_error(node, 7)

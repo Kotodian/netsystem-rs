@@ -4,8 +4,9 @@ use std::marker::PhantomData;
 use std::time::Instant;
 
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, DriverNode, Node, NodeId, NodeNextFrames,
-    NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData,
+    BufferFrame, BufferIndex, DataPlaneRuntime, DriverNode, Node, NodeId, NodeProcessFn,
+    NodeRegistration, NodeResult, NodeRuntimeData,
+    buffer::{Frame, Next},
 };
 use hammer_core::error::{CoreError, CoreResult};
 
@@ -85,19 +86,34 @@ pub(crate) type SessionQueueDispatchFn = fn(
 ) -> CoreResult<()>;
 
 #[derive(Default)]
-pub struct SessionQueueOutput {
-    frames: NodeNextFrames,
-}
+pub struct SessionQueueOutput;
 
 impl SessionQueueOutput {
     #[inline]
-    pub fn enqueue(&mut self, runtime: &DataPlaneRuntime, node: NodeId, index: BufferIndex) {
-        self.frames.enqueue(runtime, node, index)
+    pub fn enqueue(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        node: NodeId,
+        index: BufferIndex,
+    ) -> CoreResult<()> {
+        let mut frame = runtime.buffers().get_next_frame(node)?;
+        frame.push_index(index)?;
+        runtime.put_next_frame(frame)
     }
 
     #[inline]
-    pub fn schedule(self, runtime: &DataPlaneRuntime) {
-        self.frames.schedule(runtime)
+    pub fn enqueue_frame(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        frame: Frame<Next>,
+    ) -> CoreResult<()> {
+        runtime.put_next_frame(frame)
+    }
+
+    #[inline]
+    pub fn schedule(self, runtime: &DataPlaneRuntime) -> CoreResult<()> {
+        let _ = runtime;
+        Ok(())
     }
 }
 
@@ -225,15 +241,20 @@ fn session_queue_node_process(
             now,
             &mut output,
         )
+        .map_err(CoreError::from)
+        .map_err(|err| {
+            let _ = runtime.record_current_node_error(SessionQueueError::DispatchFailed.code());
+            err
+        })
+        .and_then(|_| Ok(()))
         .is_err()
         {
-            let _ = runtime.record_current_node_error(SessionQueueError::DispatchFailed.code());
-            output.schedule(runtime);
+            let _ = output.schedule(runtime);
             return NodeResult::drop();
         }
         index += 1;
     }
-    output.schedule(runtime);
+    let _ = output.schedule(runtime);
     NodeResult::drop()
 }
 

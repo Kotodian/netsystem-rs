@@ -310,7 +310,7 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
 
     pub(crate) fn remove_session(&mut self, id: SessionId) -> Option<St> {
         self.runtime.pending_closes.take(id);
-        self.app_state.app.free_pending_send(id);
+        self.app_state.app.discard_all_tx_bytes_for_session(id);
         let _ = self.app_state.app.detach_session(id);
         let handle = SessionHandle::new(id.pool_index().slot(), self.worker().slot() as u32);
         with_current_app_worker(self.worker().slot(), |worker| {
@@ -371,7 +371,7 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
         let _ = self
             .app_state
             .app
-            .ack_pending_send_bytes(session_id, bytes)?;
+            .discard_acked_tx_bytes(session_id, bytes)?;
         Ok(())
     }
 
@@ -400,8 +400,6 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
     {
         let buffers = &self.runtime.buffers;
         if offset == 0 {
-            let mut owner = buffers.alloc_frame()?;
-            owner.push_index(index)?;
             let wrote = self
                 .app_state
                 .app
@@ -534,7 +532,7 @@ where
     let now = Instant::now();
     let mut output = crate::session::node::SessionQueueOutput::default();
     dispatch_session_queue_pending(runtime, driver, output_next, &mut output, &mut step, now)?;
-    output.schedule(runtime);
+    output.schedule(runtime)?;
     Ok(step)
 }
 
@@ -714,7 +712,7 @@ where
                 break;
             }
 
-            let mut owner = driver.runtime.buffers.alloc_frame()?;
+            let mut owner = driver.runtime.buffers.get_next_frame(output_next.node())?;
             let index = driver.runtime.buffers.alloc_index()?;
             owner.push_index(index)?;
             if let Err(error) =
@@ -735,9 +733,7 @@ where
                 };
             }
 
-            for index in owner.drain_pending() {
-                output.enqueue(runtime, output_next.node(), index);
-            }
+            output.enqueue_frame(runtime, owner)?;
 
             let commit_result = {
                 let driver_ptr = driver as *mut SessionDriverRuntime<St, Seg>;
@@ -1210,7 +1206,16 @@ mod tests {
 
     #[test]
     fn session_tx_does_not_call_transport_when_app_has_no_pending_send() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 2048,
+                    buffer_slots: 16,
+                    frame_capacity: 8,
+                    frame_slots: 8,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
         let buffers = runtime.buffers();
         let mut driver = SessionDriverRuntime::<FakeTxProtocol, Local>::new(
             DataWorkerId::new(0),

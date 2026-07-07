@@ -4,9 +4,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeId, NodeNextFrames,
-    NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace, TraceFormatter,
-    add_packet_trace,
+    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeId, NodeNextStorage,
+    NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace, TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::IcmpHeader;
@@ -306,7 +305,6 @@ impl Node for IpLocalNode {
             LocalStage::Head,
             feature_arc.as_ref(),
         )
-        .unwrap_or_else(|_| NodeResult::drop())
     }
 
     #[inline]
@@ -344,7 +342,6 @@ impl Node for IpReceiveNode {
             LocalStage::Receive,
             feature_arc.as_ref(),
         )
-        .unwrap_or_else(|_| NodeResult::drop())
     }
 
     #[inline]
@@ -446,7 +443,6 @@ fn ip_local_process(
         LocalStage::Head,
         feature_arc,
     )
-    .unwrap_or_else(|_| NodeResult::drop())
 }
 
 fn ip_receive_process(
@@ -472,7 +468,6 @@ fn ip_receive_process(
         LocalStage::Receive,
         feature_arc,
     )
-    .unwrap_or_else(|_| NodeResult::drop())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -504,17 +499,13 @@ fn process_frame(
     next: [NodeId; IpLocalNext::COUNT],
     stage: LocalStage,
     feature_arc: Option<&FeatureArcStartHandle>,
-) -> CoreResult<NodeResult> {
-    Ok(hammer_adapter::process_frame!(
-        runtime,
-        frame,
-        |index, _nf| {
-            match process_index(runtime, index, state, &next, stage, feature_arc) {
-                Ok(node) => node,
-                Err(_) => state.drop_next(&next),
-            }
+) -> NodeResult {
+    hammer_adapter::process_frame!(runtime, frame, |index| {
+        match process_index(runtime, index, state, &next, stage, feature_arc) {
+            Ok(node) => node,
+            Err(_) => state.drop_next(&next),
         }
-    ))
+    })
 }
 
 #[inline(always)]

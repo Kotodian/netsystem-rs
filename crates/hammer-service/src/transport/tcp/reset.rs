@@ -72,7 +72,7 @@ fn tcp_reset_process_frame(
 ) -> NodeResult {
     let drop_next = next[TcpResetNext::Drop as usize];
     let lookup_next = next[TcpResetNext::Lookup as usize];
-    hammer_adapter::process_frame!(runtime, frame, |index, _nf| {
+    hammer_adapter::process_frame!(runtime, frame, |index| {
         tcp_reset_next_for_index(runtime, index, drop_next, lookup_next).unwrap_or(drop_next)
     })
 }
@@ -471,8 +471,7 @@ mod tests {
     struct BlackholeNode;
 
     impl Node for BlackholeNode {
-        fn process(&mut self, _runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
-            frame.drain_pending();
+        fn process(&mut self, _runtime: &DataPlaneRuntime, _: &mut BufferFrame) -> NodeResult {
             NodeResult::drop()
         }
 
@@ -490,21 +489,32 @@ mod tests {
     fn blackhole_process(
         _: &DataPlaneRuntime,
         _: NodeRuntimeData,
-        frame: &mut BufferFrame,
+        _: &mut BufferFrame,
     ) -> NodeResult {
-        frame.drain_pending();
         NodeResult::drop()
     }
 
     #[test]
     fn tcp_reset_node_rewrites_buffer_and_routes_to_lookup() {
-        let runtime = DataPlaneRuntime::with_capacities(512, 8, 4, 4);
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 512,
+                    buffer_slots: 8,
+                    frame_capacity: 4,
+                    frame_slots: 4,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
         let drop = runtime.nodes().register_internal(BlackholeNode);
         let lookup = runtime.nodes().register_internal(BlackholeNode);
         let reset = runtime
             .nodes()
             .register_internal(TcpResetNode::new(TcpResetNext::nodes(drop, lookup)));
-        let mut frame = runtime.alloc_frame().expect("alloc frame");
+        let mut frame = runtime
+            .buffers()
+            .get_next_frame(reset)
+            .expect("alloc frame");
         let index = runtime
             .alloc_index_with_bytes(&ipv4_tcp_packet(0x10, 1_000, 9_000, &[]))
             .expect("alloc packet");
@@ -520,7 +530,7 @@ mod tests {
         }
         frame.push_index(index).expect("push index");
 
-        runtime.submit_frame(frame, reset).expect("submit reset");
+        runtime.put_next_frame(frame).expect("put reset");
         assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
 
         let buffer = runtime.get_buffer(index).expect("buffer");

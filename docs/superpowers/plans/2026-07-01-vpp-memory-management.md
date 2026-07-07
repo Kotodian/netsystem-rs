@@ -2,1105 +2,2329 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Port VPP's memory model into hammer so that the framework has (1) a Rust-native replaceable "main heap" with per-NUMA selection, (2) per-NUMA buffer pool backed by a single contiguous header‑+‑inline‑data region with O(1) index→pointer, and (3) a data-plane hot path that requires no explicit `free_*` calls — frames and buffers recycle through RAII guards and lockless per-thread caches — with `hammer-infra` and `hammer-adapter` fully adapted.
+**Goal:** Build Hammer's VPP-style memory model with a concrete explicit heap handle, inline buffer storage, NUMA-selected buffer pools, worker-local buffer caches, and frame ownership that drops resources automatically on the data-plane hot path.
 
-**Architecture:** A new `Heap` trait in `hammer-infra` (`HeapLocal`, `HeapSvm`) becomes the allocation backend for `Pool`/`Vec`/`Slice`, with a per-NUMA `HeapRegistry`. `buffer.rs::BufferPool*` is rewritten: each NUMA pool owns one contiguous region (from `Heap`) carved into fixed-stride slots laid out as `[BufferHeader | pre_data headroom | data]` in one chunk; `Buffer` no longer owns a per-instance `Slice<u8>`. Index→pointer is `region_base + slot * stride`. A `PooledBufferFrame` RAII guard replaces explicit `release_pooled_frame`/`free_frame`/`free_index` on the data-plane hot path; `free_*` survives as `pub(crate)` pool-internal reclaim only.
+**Architecture:** `hammer-infra::heap::Heap` is a concrete opaque handle (private vtable + retained backend state), constructed with `Heap::main()` / `Heap::local()` for Hammer's approved mature `mimalloc::MiMalloc` main-heap backend or `Heap::svm_data(region)` for owner-created shared-memory data regions, then passed around as `Arc<Heap>`. The private vtable uses Rust `GlobalAlloc`-shaped raw pointer callbacks (`alloc -> *mut u8`, `dealloc(ptr, layout)`) only to guarantee same-handle deallocation; this mirrors local VPP's opaque active-heap pointer model (`clib_mem_thread_main.active_heap`, `clib_mem_get_heap`, `clib_mem_set_heap`) without pretending that heaps are NUMA registries or porting VPP's dlmalloc mspace implementation. SVM support in this slice adapts only the owner-side data-heap subset: the owner mapping is `memfd`/`shm_open`/`mmap` backed and claimed by `talc::TalcLock<spinning_top::RawSpinlock, talc::source::Manual>`; region-heap/private-heap split and attach-side fixed-VA allocation remain out of scope. Memory initialization is registered through Hammer's existing static `linkme` init-function slices and materializes fixed buffer-pool tables before workers start; there is no runtime `Mutex`, `RwLock`, `OnceLock`, lazy global map, or hot-path lookup lock. `hammer-adapter::buffer::BufferPoolArena` owns one heap allocation, lays out each slot as `[Buffer header | 128 bytes pre-data | inline data]`, and resolves `BufferIndex.slot()` with `base + slot * stride`, Hammer's generational adaptation of VPP's buffer-memory index math. Data-plane ownership moves through Hammer RAII values `Frame<Next>` and `Frame<Pending>`; these are Rust owner wrappers around next/pending frame contents, not VPP ABI objects, and `Drop` owns packet/frame cleanup so callers outside `buffer.rs` get no lifetime function to call.
 
-**Tech Stack:** Rust 2024, `std::alloc::Layout`, `std::ptr::NonNull`, existing `hammer-infra` `Svm`/`Local` mmap plumbing, existing per-worker `BufferThreadCache` batch logic, `cargo test`/`clippy`/`cargo fmt --check`.
+**Tech Stack:** Rust 2024, `std::alloc::{GlobalAlloc, Layout}`, `mimalloc::MiMalloc`, `talc::{TalcLock, source::Manual}`, `spinning_top::RawSpinlock`, `std::ptr::NonNull`, `Arc<Heap>`, `libc::{memfd_create, shm_open, ftruncate, mmap, munmap, close}`, existing `SvmRegion`, existing `BufferThreadCache`, existing `FramePool`, targeted `cargo test -p ...`, `cargo fmt --all -- --check`, targeted `cargo clippy -p ... --all-targets`.
 
 ## Global Constraints
 
-- Rust 2024, `snake_case`/`PascalCase` per AGENTS.md; no `as any`-style `unsafe` escape hatches for type unsoundness — only raw-pointer arithmetic that is locally provable (cast of a `NonNull<u8>` from a region the pool owns and that always outlives the borrow).
-- Dependency direction unchanged: `hammer-infra` is the bottom layer; nothing in `hammer-infra` may reference `hammer-adapter` or higher.
-- No new business types in `hammer-infra` (utility-owned only, generic). `Heap` is a generic allocation primitive; no `Buffer`-or-node-specific surfaces live there.
-- Per VPP port contracts (from research): buffers identified by `(numa_node/pool_id, slot, generation)`; `current_data` is a **signed** `i16`; per-thread cache is the lockless fast alloc/free path; refcount via `AtomicU8` Relaxed; chains are singly-linked via `next_buffer` (a slot index) with `NEXT_PRESENT` flag.
-- "No manual free" means the **data-plane hot path** never calls `free_index`/`free_frame`/`release_pooled_frame` directly — it uses the `PooledBufferFrame`/`PooledBufferGuard` RAII whose `Drop` returns the frame and buffers to the per-thread cache. Pool/Vec keep their internal reclaim APIs (used by the guards and pool internals). Control-plane/long-lived struct cleanup still uses explicit `drop`/`clear`/`remove` at end-of-lifetime.
-- TDD strict: RED → GREEN → commit for every task. `cargo test -p hammer-infra` and `cargo test -p hammer-adapter` must be green after every task; `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets` clean at commit time.
-- Reuse before adding: reuse the existing `BufferThreadCache` (already per-worker, batch=32), `SvmInner` free-list, `RawVec` layout math; only add what reuse can't cover.
-- Per AGENTS.md no-type-explosion rule: every new public type/API added below has a stated "why not existing surface". No one-off buffer/runtime helpers — generic at the owning layer.
+- Do not model Heap as a Rust trait, a generic `H: Heap`, or a trait object. The only public heap handle is the concrete `hammer_infra::heap::Heap` shared as `Arc<Heap>`.
+- Do not use `dyn GlobalAlloc`, `dyn Allocator`, or `#[global_allocator]` for this work. `GlobalAlloc` is only the callback shape for the private `HeapVTable`; Hammer containers still retain an explicit `Arc<Heap>` and deallocate through the same handle.
+- Do not introduce `HeapLocal` or `HeapSvm` public types. Local and SVM allocation are constructors on the concrete handle: `Heap::main()`, `Heap::local()`, and `Heap::svm_data(SvmRegion)`. NUMA selection belongs to buffer-pool/runtime configuration, not the heap handle.
+- Do not hand-roll Hammer's main heap allocator. Hammer's main heap uses `mimalloc::MiMalloc`, a mature allocator that implements `GlobalAlloc`; this is a Hammer backend decision, while local VPP's main heap is `clib_mem_heap_t` backed by dlmalloc mspaces. Do not use `std::alloc::System` as the planned main-heap backend, do not port VPP's `mem_dlmalloc.c` or `heap.h` object-heap utilities into Hammer for this plan, and do not add `jemalloc`/`snmalloc`/`rpmalloc` without a separate approval item.
+- Do not use `std::vec::Vec`, `hammer_infra::vec::Vec`, or any Vec-backed helper for allocator metadata, NUMA buffer-pool registry state, buffer-pool metadata, or memory-initialization tables. Use fixed arrays, raw pointer allocations, or mature allocator-owned metadata. Do not hand-roll returned-span lists.
+- `hammer-infra` stays the bottom layer. It may expose generic allocation primitives, but it must not know about buffers, nodes, runtime, sessions, or transport.
+- Buffer/runtime APIs remain transport-neutral. Do not add TCP-specific allocation, headroom, copy, or rebuild helpers.
+- Buffer slots follow the VPP semantic shape from local `third_party/vpp/src/vlib/buffer.h`: signed `current_data: i16`, `NEXT_PRESENT` + `next_buffer` chain links, `ref_count: u8`, `buffer_pool_index: u8`, inline `pre_data`, inline `data[]`, per-worker cache allocation/return, and slot-to-pointer math through a pool-owned region.
+- The app/session/TCP boundary rules from AGENTS.md still apply: no payload-copy side channels after bytes enter session-owned storage, and no TCP-specific buffer ownership wrappers.
+- Automatic cleanup means runtime/service/node hot paths never call packet/frame lifetime functions directly. Packet/frame cleanup is triggered by owner `Drop`; the only low-level ownership hook stays private to `buffer.rs` and is called only from `Drop`.
+- Memory initialization must be static and no-lock: use `linkme` init-function registration plus fixed arrays/engine-owned tables. Do not use `Mutex`, `RwLock`, `OnceLock`, `LazyLock`, `get_or_init`, `thread_local!`, hash maps, or global mutable registries for heap/buffer initialization or NUMA buffer-pool lookup.
+- Do not keep compatibility parameters by naming them `_`, `_node`, `_next`, or similar. If a migration makes an argument obsolete, delete the argument from the function signature and update every caller in the same task.
+- Use the existing `hammer-infra` structures before adding new ones. Public API additions listed in this plan are the only approved additions for this memory-management slice.
+- TDD rhythm per task: write/adjust the named failing test, run it red, implement the minimum code, run it green, then commit.
+- All VPP references in this plan are from local source under `third_party/vpp`. Do not substitute remote VPP links unless the local tree is missing the needed file.
+- Before implementing any heap, SVM, buffer, NUMA, or cache task, re-read the specific `third_party/vpp` files named in the File Map and keep Hammer's design a semantic Rust adaptation of those local sources.
 
 ---
 
-### Task 1: Heap trait + HeapLocal + HeapSvm + SvmRegion primitive (hammer-infra)
+## File Map
+
+- `third_party/vpp/src/vppinfra/mem.h`: active heap state (`clib_mem_thread_main.active_heap`) and `clib_mem_get_heap` / `clib_mem_set_heap`.
+- `third_party/vpp/src/vppinfra/mem_dlmalloc.c`: VPP `clib_mem_heap_t` implementation over dlmalloc mspaces; this is the local VPP main-heap reference and is not being ported.
+- `third_party/vpp/src/vppinfra/heap.h`: VPP object/vector heap utility; this is not the `clib_mem_heap_t` main heap and is not being ported.
+- `third_party/vpp/src/svm/{svm.h,ssvm.h}`: SVM heap push/pop helpers that temporarily switch the active heap to shared-memory regions.
+- `third_party/vpp/src/svm/svm.c`: `MAP_FIXED` attach flow plus region/data heap creation with `clib_mem_create_heap(...)`.
+- `third_party/vpp/src/svm/ssvm.c`: fixed-VA attach behavior used to preserve shared heap pointer validity across processes.
+- `third_party/vpp/src/vlib/buffer.h`: `vlib_buffer_t`, `VLIB_BUFFER_PRE_DATA_SIZE`, `VLIB_BUFFER_POOL_PER_THREAD_CACHE_SZ`, `vlib_buffer_pool_t`, and `vlib_buffer_main_t`.
+- `third_party/vpp/src/vlib/buffer_funcs.h`: `vlib_get_buffer`, `vlib_buffer_alloc_from_pool`, `vlib_buffer_alloc_on_numa`, `vlib_buffer_pool_put`, and the C buffer-return path that Hammer wraps in Rust ownership.
+- `third_party/vpp/src/vlib/buffer.c`: `vlib_buffer_alloc_size`, `vlib_buffer_pool_create`, NUMA pool creation, and `default_buffer_pool_index_for_numa` initialization.
+- `third_party/vpp/src/vlib/main.h`: `vlib_main_t.thread_index` and `vlib_main_t.numa_node`.
+- `third_party/vpp/src/vlib/{init.h,init.c}`: static init registration and topologically ordered init/worker-init dispatch.
+- `third_party/vpp/src/vlib/threads.c`: worker `vlib_main_t` cloning, per-thread heap selection, and worker `thread_index` assignment.
+- `Cargo.toml`: workspace dependency entries for `mimalloc`, `talc`, and `spinning_top`.
+- `crates/hammer-infra/Cargo.toml`: direct allocator dependency.
+- `crates/hammer-infra/src/heap.rs`: concrete heap handle, private hand-written vtable, local/SVM constructors.
+- `crates/hammer-infra/src/svm_region.rs`: reusable mmap/memfd region with a Talc-backed owner allocator over the mapped span.
+- `crates/hammer-infra/src/{pool.rs,vec.rs,boxed.rs,map.rs}`: infra containers that retain `Arc<Heap>` and deallocate through the same handle.
+- `crates/hammer-runtime/src/memory.rs`: static no-lock memory initialization; any fixed NUMA table stays private to runtime/buffer internals and is not a public API.
+- `crates/hammer-adapter/src/buffer.rs`: inline buffer slot layout, buffer/frame pools, worker cache behavior, RAII frame ownership.
+- `crates/hammer-runtime/src/{init.rs,memory.rs}`: existing static init dispatch plus memory init function registered before `start_workers`.
+- `crates/hammer-adapter/src/{node.rs,node/next.rs,handoff.rs}`: packet graph ownership transfer sites that must carry frame owners instead of raw lifetime calls.
+- `crates/hammer-runtime/src/{engine.rs,start_workers.rs,spawn.rs}`: worker NUMA propagation and runtime-owned frame handoff call sites.
+- `crates/hammer-service/src/**`: service nodes that currently drop packets through direct lifetime calls and must switch to frame ownership/drop semantics.
+- `crates/hammer-infra/tests/{heap.rs,pool_heap.rs,slice_map_heap.rs}`: concrete heap and raw infra allocation tests.
+- `crates/hammer-adapter/tests/{buffer_inline_layout.rs,buffer_frame_guard.rs,buffer_per_numa.rs}`: buffer storage, RAII, and NUMA tests.
+- `crates/hammer-service/tests/frame_owner_cleanup_hot_path.rs`: source-level invariant that runtime/service/node hot paths rely on owner `Drop`.
+
+## Public API Approval Ledger
+
+Approved/required existing or new public APIs:
+
+- `pub struct Heap` in `hammer-infra`, with `Heap::main`, `Heap::local`, `Heap::svm_data`, `Heap::alloc`, `Heap::is_main_heap`, `Heap::region`, and `unsafe impl GlobalAlloc for Heap`. `HeapVTable` is a private implementation detail, not a public API. `Heap` does not expose a NUMA identity.
+- `pub enum HeapError` and `pub enum SvmRegionError` in `hammer-infra` for allocator construction and mmap/fd failures. Do not report allocator setup failures through ad hoc strings or panics in runtime initialization paths.
+- `pub struct SvmRegion` with `try_with_size`, `from_fd`, `from_fd_owned`, `base`, `size`, `fd`, and `alloc`. SVM deallocation is not a public API; it is reached only by the private `Heap` vtable's `dealloc` callback.
+- `Pool::with_capacity_in(capacity, Arc<Heap>)`, `Slice::from_elem_in(len, value, Arc<Heap>)`, and `FlatHashTable::with_capacity_in(capacity, Arc<Heap>)`.
+- `BufferPoolArena::with_capacity_in(slot_capacity, slots, Arc<Heap>, numa_node: u32)` and the existing back-compat `with_capacity(slot_capacity, slots)` local-heap constructor.
+- `BufferPool::{slot_stride, base_ptr, buffer_raw_ptr, data_raw_ptr}` for layout tests and diagnostics.
+- `buffer_data_offset() -> usize`, `DEFAULT_PRE_DATA_SIZE: usize = 128`, `BUFFER_THREAD_CACHE_BATCH: usize = 32`, and `BUFFER_THREAD_CACHE_HIGH_WATER: usize = 512`.
+- `pub(crate) const HAMMER_MAX_NUMA_NODES: usize = 32` if a shared const is required, matching local VPP's `VLIB_BUFFER_MAX_NUMA_NODES`. Do not expose a public NUMA table or memory manager type.
+- `DataPlaneBufferConfig` and `DataPlaneRuntimeConfig` as the single construction surface for `DataPlaneBuffers` / `DataPlaneRuntime`; all old `with_*` constructors are removed.
+- `hammer_runtime::memory::memory_init(engine: &mut Engine) -> HammerResult<()>`, registered as `#[init_function(name = "memory_init", runs_before = ["start_workers"])]`.
+- `DataPlaneRuntime::clone_for_worker(thread_index: u32, numa_node: u32) -> Self`, used by `Engine::spawn_on_numa`.
+- `Frame<Next>` and `Frame<Pending>` remain the public typed owner shapes. `Next` and `Pending` are concrete state bodies that directly own the frame fields; they are not marker types, do not use `PhantomData`, and do not delegate ownership to `FrameStorage` or `FrameOwner`.
+- `Frame<Next>` as Hammer's public RAII owner for next-frame contents already associated with a selected next arc, and `Frame<Pending>` as Hammer's scheduler-owned pending-frame RAII owner while a node is dispatching it. These are Rust ownership wrappers, not direct public equivalents of `vlib_next_frame_t` or `vlib_pending_frame_t`.
+- `DataPlaneBuffers::get_next_frame(next: NodeId) -> CoreResult<Frame<Next>>` and `DataPlaneRuntime::put_next_frame(frame: Frame<Next>) -> CoreResult<()>`, using VPP-inspired get/put terminology while keeping Hammer's existing `NodeId` graph model. There is no public pending-queue extraction API and no new pending-process callback type in this plan.
+- No public `Frame` state-conversion traits or helper methods are approved. `DataPlaneRuntime::put_next_frame` consumes `Frame<Next>` and constructs the scheduler-owned `Frame<Pending>` inside `buffer.rs` without exposing `FrameIndex`. There is no public `Frame<Pending> -> Frame<Next>` transition; a node that needs a fresh next-frame owner calls `DataPlaneBuffers::get_next_frame(next)`.
+
+Rejected APIs for this plan:
+
+- `pub trait Heap`, `HeapLocal`, `HeapSvm`, generic public `H: Heap` constructors, or any heap surface that requires dynamic dispatch through Rust trait objects.
+- Hand-written main-heap bin/slab/free-list allocators in Hammer, ports of VPP `heap.h` internals for local memory, or defaulting to an allocator crate through `#[global_allocator]`.
+- TCP-specific buffer allocation/lifetime helpers, TCP-specific headroom APIs, and single-buffer owner wrappers.
+- Public constructors for recovery/buffer accounting records that let non-owning code manufacture ownership.
+- Any initialization API that hides heap/buffer state behind `Mutex`, `RwLock`, `OnceLock`, `LazyLock`, `get_or_init`, `thread_local!`, or dynamic global maps.
+- Public manager/table/helper types such as `HeapRegistry`, `MemoryConfig`, `MemoryMain`, `StaticNumaTable`, pending-process callback aliases, `ScheduledFrameQueue`, `HandoffSlotGuard`, or `SegmentAllocOwner`. If a fixed table or guard is unavoidable, keep it private inside the owning module and do not expose it through `lib.rs`.
+- Public or private frame-owner helper types/traits such as `FrameStorage`, `FrameOwner`, or `FrameStateAccess`. `Frame<S>` plus concrete `Next` / `Pending` state bodies are enough.
+- Public packet/frame APIs named `free_*`, `release_*`, `reclaim_*`, or public region APIs named `free`; ownership must move into `Drop` or allocator `GlobalAlloc::dealloc` implementations instead.
+- Treating `SvmRegion::from_fd` as an allocation-owner heap. VPP supports attach-side `ssvm_mem_alloc` through a shared fixed-VA heap; this Hammer slice does not. If Hammer needs attach-side allocation, stop and write a separate VPP-compatible shared-heap design instead of extending this owner-only allocator.
+- Public `Frame<Next>` transfer helpers such as `append_to_frame` or `enqueue_to_next_frames`. Frame movement must use the approved Hammer RAII next-frame surfaces: `DataPlaneBuffers::get_next_frame(next)`, current-frame ownership during dispatch, and `DataPlaneRuntime::put_next_frame(frame)`.
+- Any public or private graph API named `submit_frame`; Hammer uses `put_next_frame` terminology for next-frame ownership.
+- `NodeNextFrames`, `NextFrame`, `NodeNextFrame`, `Current(NodeId)`, `NodeResult::next_frame`, `NodeResult::next_current`, or any equivalent staging/result-carrier API that returns next-frame ownership from a node. VPP nodes fill and put Next Frames while they run; dispatch results do not carry frames back to the scheduler.
+- `NodeResult::error`, `NodeResult::error(CoreError)`, or any equivalent attempt to turn graph dispatch outcomes into error propagation. If `NodeResult` remains in Hammer during this slice, it is only a dispatch outcome and must not carry frame ownership; broader node-error propagation requires a separate approved node-runtime plan.
+- Persisting `Frame<Pending>` outside scheduler-owned node dispatch, or making `Frame<Pending>` `Send` for TUN/background ownership, without a separate approved design.
+
+---
+
+## Local VPP Source Findings
+
+- Active heap: `third_party/vpp/src/vppinfra/mem.h` stores the current allocator as `clib_mem_thread_main.active_heap`; `clib_mem_get_heap()` lazily initializes it, and `clib_mem_set_heap(heap)` swaps the raw heap pointer and returns the previous one. Hammer therefore uses a concrete `Heap` handle with a vtable + payload pointer, not a Rust trait-object heap.
+- VPP main heap: `third_party/vpp/src/vppinfra/mem_dlmalloc.c` implements `clib_mem_heap_t` over dlmalloc mspaces. Hammer does not port that allocator; `mimalloc::MiMalloc` is the approved Hammer main-heap backend behind the same explicit `Heap` handle model.
+- VPP object heap utility: `third_party/vpp/src/vppinfra/heap.h` is an offset/handle object heap utility, not the `clib_mem_heap_t` main heap. It is not part of this Hammer main-heap plan.
+- Worker main heap: `third_party/vpp/src/vlib/threads.c` captures `clib_mem_get_heap()` as `main_heap`, optionally creates a worker `thread_mheap` with `clib_mem_create_heap`, and temporarily installs it through `clib_mem_set_heap` while cloning worker state. Hammer's adaptation is explicit `Arc<Heap>` retention by each owner that allocates memory; NUMA selection happens in buffer pools, not in heap identity.
+- SVM heap switching: `third_party/vpp/src/svm/svm.h` and `third_party/vpp/src/svm/ssvm.h` allocate inside shared-memory regions by saving the old heap, calling `clib_mem_set_heap(region_heap_or_data_heap)`, allocating, and restoring the old heap. Local `third_party/vpp/src/svm/svm.c` creates separate SVM region/private heap and data heap over mmap memory with `clib_mem_create_heap(...)`, and `svm.c` / `ssvm.c` remap attachers at fixed virtual addresses with `MAP_FIXED` so shared heap pointers remain valid. Hammer's current slice deliberately narrows this to the owner-created data-heap subset: `Heap::svm_data(SvmRegion)` is owner-only, `SvmRegion::from_fd` is offset access to already-laid-out objects, Hammer attach mappings do not preserve shared allocator pointer validity through a fixed-VA contract, and full attach-side allocation or separate SVM region-heap modeling is a separate unapproved design.
+- Buffer header/data layout: `third_party/vpp/src/vlib/buffer.h` defines `vlib_buffer_t` as a two-cacheline header plus cacheline-aligned headroom, `pre_data[VLIB_BUFFER_PRE_DATA_SIZE]`, and flexible `data[]`; it asserts pre-data is directly before packet data. Hammer's layout must keep `Buffer` as 128 bytes, then 128 bytes pre-data, then inline data.
+- Buffer current pointer: `vlib_buffer_get_current(b)` returns `b->data + b->current_data` and asserts `current_data >= -VLIB_BUFFER_PRE_DATA_SIZE`. Hammer's `Buffer::current_ptr()` must use exactly that signed-offset model.
+- Buffer pool identity: `vlib_buffer_pool_t` stores `index`, `numa_node`, `data_size`, `alloc_size`, `n_buffers`, `n_avail`, `buffers`, per-thread `threads`, and a `buffer_template`. Hammer keeps `pool_id + generation` for Rust stale-index safety, but the pool's slot metadata must stay separate from packet data.
+- Per-thread cache: `VLIB_BUFFER_POOL_PER_THREAD_CACHE_SZ` is 512. `vlib_buffer_alloc_from_pool` first consumes `bp->threads[vm->thread_index].cached_buffers`; on cache miss it refills from the pool availability vector, rounded in chunks of 32. `vlib_buffer_pool_put` fills the per-thread cache to 512 before spilling overflow back under the pool lock. Hammer's `BufferThreadCache` should use the same high-water size and refill/spill behavior.
+- NUMA selection: `vlib_buffer_alloc(vm, ...)` calls `vlib_buffer_alloc_on_numa(vm, ..., vm->numa_node)`, which uses `default_buffer_pool_index_for_numa[numa_node]` and then `vlib_buffer_alloc_from_pool`. Hammer worker clones must select the active buffer pool from `Engine.numa_node`.
+- Buffer pool creation: `vlib_buffer_pool_create` walks a single mapped memory range, computes `alloc_size = round_pow2(ext_hdr + sizeof(vlib_buffer_t) + data_size, VLIB_BUFFER_ALIGN)`, wastes at most one buffer only when needed so global buffer index 0 is never valid, writes `buffer_template`, and records buffer indices in `bp->buffers`. Hammer does not need VPP's global cacheline-index encoding, but it must preserve O(1) slot-to-pointer math and avoid per-buffer payload allocations. Do not describe this as a rule that every pool's slot 0 is reserved.
+- Next-frame dispatch: `third_party/vpp/src/vlib/node_funcs.h` defines `vlib_get_next_frame` / `vlib_put_next_frame`; `third_party/vpp/src/vlib/main.c::vlib_put_next_frame` turns a non-empty next frame into a `vlib_pending_frame_t`, and `dispatch_node` calls the node function for its processed-vector count. VPP's `vlib_next_frame_t` is a next-arc enqueue state tied to the current node runtime, and `vlib_pending_frame_t` is a scheduler queue entry; Hammer's `Frame<Next>` / `Frame<Pending>` are Rust RAII owner wrappers inspired by those states, not a direct public VPP state-machine clone. VPP nodes do not return next frames through a dispatch result, so Hammer must not model forwarding as `NodeResult::next_frame`, `NextFrame`, or `Current(NodeId)`.
+- Static initialization: `third_party/vpp/src/vlib/init.h` registers init functions through static constructor-linked records, and `third_party/vpp/src/vlib/init.c` sorts and dispatches them before workers run. Hammer already has the Rust equivalent in `hammer-runtime::init` through static `linkme` slices; memory init must use that path, not lazy globals.
+- Explicit VPP buffer-return path vs Rust RAII: VPP uses explicit C buffer put functions and drop nodes. Hammer's automatic-cleanup rule is a Rust ownership adaptation: packet/frame cleanup is owned by `Drop`, while runtime/service/node hot paths transfer or drop frame owners and never call direct lifetime helpers.
+
+---
+
+## Grill Session Scope Correction
+
+This section is binding for the current execution pass. It corrects the scope drift found during the grill-with-docs review and must be read before any implementation task.
+
+### Domain Model
+
+- `Heap`: Hammer's explicit allocator handle. It is a concrete public type, like VPP's opaque active heap pointer, and is never a Rust trait object. It does not carry public NUMA identity.
+- `HeapVTable`: a private implementation table inside `heap.rs`. It exists to route allocation/deallocation through the same concrete handle and must not appear in the public API ledger.
+- `Main heap`: Hammer's mature local allocator backend behind `Heap::main` / `Heap::local`. The approved backend is `mimalloc::MiMalloc`; this is not a port of VPP's dlmalloc mspace main heap and is not modeled as a per-NUMA heap table.
+- `SVM owner data region`: the process-created shared-memory mapping that owns the Talc allocator over its mapped bytes. This corresponds only to the owner-side SVM data-heap subset in this plan.
+- `SVM attached region`: a mapping of an existing fd used for offset access to already-laid-out objects. It is not an allocation owner in this plan because Hammer does not implement VPP's fixed-VA shared heap pointer-validity contract.
+- `BufferPoolArena`: one heap allocation containing all buffer slots for one buffer pool. A slot is `[Buffer header | pre_data | inline data]`; the pool records its NUMA node for selection by worker runtime.
+- `BufferIndex`: a generational index into a pool-owned slot. It is not an owner by itself.
+- `Frame<Next>`: Hammer's RAII owner for a next-frame payload already associated with one selected next arc. It is inspired by VPP next-frame get/put semantics, but it is not a public `vlib_next_frame_t` clone and it must not require an extra `NodeId` parameter when submitted.
+- `Frame<Pending>`: Hammer's scheduler-owned pending-frame RAII owner delivered to node dispatch. It must not be persisted outside dispatch or made `Send` in this plan.
+- `NodeResult`: graph-node dispatch outcome. It is not an error transport and not a carrier for Next Frames.
+
+### ADR Notes
+
+**ADR-1: Concrete heap handle, private vtable**
+
+Decision: expose only `pub struct Heap`; keep `HeapVTable` private.
+
+Reason: local VPP exposes opaque heap pointers and active-heap setters, not public allocator callback tables. Rust still needs same-handle deallocation, so Hammer uses a private vtable rather than `dyn Heap`, `dyn GlobalAlloc`, or generic `H: Heap`.
+
+Consequences:
+
+- `Heap::alloc` is the public allocation convenience.
+- Deallocation remains available through `unsafe impl GlobalAlloc for Heap` for owners that retained the handle.
+- No public `Heap::dealloc`, `HeapVTable`, `HeapLocal`, or `HeapSvm`.
+
+**ADR-2: Mature Hammer main heap, not VPP allocator port**
+
+Decision: use `mimalloc::MiMalloc` behind `Heap::main` / `Heap::local`.
+
+Reason: local VPP's main heap is `clib_mem_heap_t` over dlmalloc mspaces. Porting that allocator into Rust would be a separate allocator project and is not required to get Hammer's VPP-style explicit heap ownership. The semantic requirement here is explicit heap handles and same-handle deallocation, not byte-for-byte VPP allocator internals.
+
+Consequences:
+
+- Do not hand-roll bins, slabs, returned-span lists, or a local bump/free-list allocator for the main heap.
+- Do not use `std::alloc::System` or `#[global_allocator]`.
+- Do not describe `mimalloc` as VPP's Rust equivalent; describe it as Hammer's approved backend.
+
+**ADR-3: Owner-only SVM allocation**
+
+Decision: `Heap::svm_data(SvmRegion)` is valid only for the allocation-owner data mapping. `SvmRegion::from_fd` / `from_fd_owned` create attach mappings for offset access only.
+
+Reason: VPP attachers allocate from shared heaps only after fixed-VA remapping preserves allocator pointer validity. Hammer does not implement that fixed-VA shared heap contract in this slice.
+
+Consequences:
+
+- Full attach-side allocation requires a separate VPP-compatible shared-heap design.
+- Do not add top-level helpers named `svm_alloc`, `svm_dealloc`, or `alloc_region`.
+- Do not create hand-written SVM returned-span metadata.
+
+**ADR-4: Rust RAII adapts VPP explicit buffer return**
+
+Decision: runtime/service/node hot paths transfer frame ownership and let `Drop` return packets/frames.
+
+Reason: VPP C code explicitly calls buffer put/free paths. Hammer can encode the same ownership through Rust values, avoiding caller-side lifetime functions and double-owner bugs.
+
+Consequences:
+
+- Public packet/frame lifetime functions are rejected.
+- Public frame-transfer shortcuts are rejected unless separately approved.
+- The scheduler owns `Frame<Pending>` until dispatch; service code may not squirrel it away.
+
+### Current Tree Problems Found By Grill
+
+- **Resolved in cleanup pass:** `crates/hammer-adapter/src/node.rs` must not expose any pending-process callback alias or descriptor pending-process plumbing as public API. Pending frames are dispatched through the normal node `process(&mut BufferFrame)` path.
+- **Out of plan:** `crates/hammer-adapter/src/memory.rs` still exposes `MemoryConfig`, `MemoryMain`, and `StaticNumaTable`, and `DataPlaneBufferConfig` exposes the static NUMA table through a public field. Fixed tables must be private implementation details behind the config construction surface.
+- **Out of plan:** `crates/hammer-service/src/tun/mod.rs` stores `Frame<Pending>` in `TunPendingTx` and adds `unsafe impl Send`. This violates the scheduler-owned pending-frame model and needs a separate approved TUN/frame handoff design or rollback.
+- **Out of plan:** `Frame<Next>` / `Frame<Pending>` accessors in `crates/hammer-adapter/src/buffer.rs` still use `unreachable!()` after an owner is consumed. Data-plane owner access must be total over live owners or return a typed error; it must not rely on panic/unreachable/string sentinels.
+- **Out of plan:** `crates/hammer-service/src/session/node.rs::SessionQueueOutput::enqueue_frame` keeps an obsolete `NodeId` argument as `_`. A `Frame<Next>` already owns its selected next node; compatibility parameters must be deleted from signatures and call sites, not swallowed with `_`.
+- **Out of plan:** session queue dispatch failure accounting through `record_current_node_error` may be a reasonable node-runtime feature, but it is not part of this memory-management plan. Do not expand it into `NodeResult::error` here.
+- **Already cleaned up:** `NodeResult::error`, `NodeNextFrames`, `NextFrame`, `append_to_frame`, `submit_frame`, `SegmentAllocOwner`, `RawAllocation`, and `PooledBufferMut` are not present in current production code. Do not reintroduce them.
+
+### Correction Plan Before More Implementation
+
+- [x] Delete pending-process dispatch and route scheduled frames through normal node processing. Do not export a pending-process callback alias through `hammer-adapter/src/lib.rs`, descriptors, or public registration APIs.
+- [ ] Privatize or delete `MemoryConfig`, `MemoryMain`, and `StaticNumaTable`; `DataPlaneBufferConfig` must not expose a public fixed NUMA table field.
+- [ ] Delete obsolete compatibility parameters such as `_: NodeId` / `_node: NodeId` / `_next: NodeId` from migrated APIs and update all callers in the same task.
+- [ ] Keep `NodeResult` only as a dispatch outcome. Do not reintroduce `NodeResult::error`, `NodeResult::next_frame`, `NodeResult::next_current`, `NodeNextFrames`, `NextFrame`, `NodeNextFrame`, `Current(NodeId)`, `append_to_frame`, `enqueue_to_next_frames`, or any renamed staging/result-carrier equivalent.
+- [ ] Rework or roll back TUN pending-frame storage so `Frame<Pending>` is not persisted outside node dispatch and is not made `Send`.
+- [ ] Remove frame-owner accessor `unreachable!()` / `expect` / `unwrap` paths. Access over live owners must be structurally total, or the method must return a typed `DataPlaneError`.
+- [ ] Keep `BufferIndexList` as a raw internal frame-index list for now. The current binding decision is "raw memory for allocator/buffer metadata, no Vec-backed helper"; do not replace it with `std::vec::Vec` or `hammer_infra::vec::Vec` for this memory slice.
+- [ ] Treat node error propagation as a separate plan. This memory plan must not add `NodeResult::error(CoreError)` or change the graph result contract.
+- [ ] After cleanup, run only focused checks: `cargo check -p hammer-service`, `cargo test -p hammer-adapter --test buffer_frame_guard -- --nocapture`, and `cargo test -p hammer-service --test frame_owner_cleanup_hot_path -- --nocapture`. Do not run `cargo test --workspace` during this cleanup pass.
+
+---
+
+### Task 1: Lock In Concrete Heap Foundation
 
 **Files:**
-- Create: `crates/hammer-infra/src/heap.rs`
-- Create: `crates/hammer-infra/src/svm_region.rs`
-- Modify: `crates/hammer-infra/src/segment.rs` (refactor `Svm` to own `SvmRegion`)
-- Modify: `crates/hammer-infra/src/lib.rs:17` (add `pub mod heap;` and `pub mod svm_region;`)
+- Modify: `Cargo.toml`
+- Modify: `crates/hammer-infra/Cargo.toml`
+- Modify: `crates/hammer-infra/src/heap.rs`
+- Modify: `crates/hammer-infra/src/svm_region.rs`
+- Modify: `crates/hammer-infra/src/segment.rs`
+- Modify: `crates/hammer-infra/src/fifo.rs`
+- Modify: `crates/hammer-infra/src/bihash/{alloc.rs,split.rs}`
+- Modify: `crates/hammer-infra/src/lib.rs`
 - Test: `crates/hammer-infra/tests/heap.rs`
 
 **Interfaces:**
-- Consumes: existing `SvmInner` mmap/freelist logic in `segment.rs:104-275`.
-- Produces:
-  - `pub trait Heap: Send + Sync + 'static { fn alloc(&self, layout: Layout) -> Option<NonNull<u8>>; unsafe fn dealloc(&self, ptr: NonNull<u8>, layout: Layout); fn numa_node(&self) -> u32; }`
-  - `pub struct HeapLocal { numa_node: u32 }` — delegates to `std::alloc`.
-  - `pub struct HeapSvm { region: SvmRegion, numa_node: u32 }` — bump + LIFO-freelist over a shared region.
-  - `pub struct SvmRegion { inner: Arc<SvmRegionInner> }` with `alloc(bytes, align) -> u64 offset`, `free(offset, bytes)`, `base() -> *mut u8`, `size()`, `fd() -> Option<RawFd>`, `from_fd(...)`, `with_size(size) -> SvmRegion`, `Default`.
-  - `pub struct HeapRegistry { heaps: Vec<Arc<dyn Heap>> }` with `register(heap)`, `for_numa(numa) -> Option<Arc<dyn Heap>>`.
+- Consumes: existing `SvmRegion` mmap region.
+- Produces: concrete public `Heap`, private `HeapVTable`, `SvmRegion`, `mimalloc::MiMalloc` main-heap allocation, and no public heap trait.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write/adjust the failing heap test**
 
-Create `crates/hammer-infra/tests/heap.rs`:
+Ensure `crates/hammer-infra/tests/heap.rs` contains these API-shape checks in addition to allocation round trips:
 
 ```rust
-//! Tests for hammer-infra Heap abstraction + SvmRegion primitive.
-use std::alloc::Layout;
-use std::ptr::NonNull;
+use std::alloc::{GlobalAlloc, Layout};
+use std::sync::Arc;
 
-use hammer_infra::heap::{Heap, HeapLocal, HeapSvm, HeapRegistry};
+use hammer_infra::heap::Heap;
 use hammer_infra::svm_region::SvmRegion;
 
 #[test]
-fn heap_local_alloc_dealloc_round_trip() {
-    let heap = HeapLocal::new(0);
-    assert_eq!(heap.numa_node(), 0);
+fn heap_api_is_concrete_handle_only() {
+    let src = include_str!("../src/heap.rs");
+    for forbidden in [
+        "pub trait Heap",
+        "HeapLocal",
+        "HeapSvm",
+        "H: Heap",
+        "dyn GlobalAlloc",
+        "#[global_allocator]",
+        "std::alloc::Allocator",
+        "std::alloc::System",
+        "pub struct HeapRegistry",
+        "pub unsafe fn dealloc",
+        "pub fn numa_node",
+        "BumpMainHeap",
+        "MainHeapFreeList",
+        "pub fn free",
+        "pub fn freelist_len",
+        "fn local_alloc",
+        "fn local_dealloc",
+        "fn local_numa",
+        "fn svm_alloc",
+        "fn svm_dealloc",
+        "fn svm_numa",
+        "fn alloc_region",
+        "fn page_size",
+        "unreachable!",
+    ] {
+        assert!(
+            !src.contains(forbidden),
+            "heap.rs must not expose {forbidden}"
+        );
+    }
+    let trait_object_spell = format!("{} {}", "dyn", "Heap");
+    assert!(
+        !src.contains(&trait_object_spell),
+        "Heap must stay a concrete handle, not a trait object"
+    );
+}
+
+#[test]
+fn svm_region_uses_talc_not_private_span_lists() {
+    let src = include_str!("../src/svm_region.rs");
+    assert!(src.contains("talc::TalcLock"));
+    assert!(src.contains("source::Manual"));
+    for forbidden in [
+        format!("{}{}", "Returned", "Span"),
+        format!("{}{}", "returned", "_spans"),
+        format!("{}{}", "bump", "_depth"),
+        format!("SVM_{}{}", "RETURNED_SPAN", "_NODES"),
+        "std::vec::Vec".to_string(),
+        "hammer_infra::vec::Vec".to_string(),
+    ] {
+        assert!(
+            !src.contains(&forbidden),
+            "svm_region.rs must not hand-roll allocator metadata: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn heap_main_mimalloc_alloc_round_trip() {
+    let src = include_str!("../src/heap.rs");
+    assert!(src.contains("mimalloc::MiMalloc"));
+    assert!(!src.contains("#[global_allocator]"));
+
+    let heap = Heap::main();
+    assert!(heap.is_main_heap());
     let layout = Layout::from_size_align(128, 64).unwrap();
     let ptr = heap.alloc(layout).expect("alloc");
     unsafe {
         std::ptr::write_bytes(ptr.as_ptr(), 0xAB, layout.size());
-        heap.dealloc(ptr, layout);
+        GlobalAlloc::dealloc(&heap, ptr.as_ptr(), layout);
     }
-    assert_eq!(heap.numa_node(), 0);
 }
 
 #[test]
-fn heap_svm_alloc_reuse_and_free() {
-    let region = SvmRegion::with_size(1 << 20); // 1 MiB
-    let heap = HeapSvm::new(region, 1);
-    assert_eq!(heap.numa_node(), 1);
-    let layout = Layout::from_size_align(256, 64).unwrap();
-    let p1 = heap.alloc(layout).expect("first alloc");
-    unsafe { heap.dealloc(p1, layout); }
-    let p2 = heap.alloc(layout).expect("second alloc reuses free-list");
-    assert_eq!(p2, p1, "freed slot must be reused on next alloc");
-    unsafe { heap.dealloc(p2, layout); }
+fn heap_local_is_main_heap_alias() {
+    let heap = Heap::local();
+    assert!(heap.is_main_heap());
 }
 
 #[test]
-fn heap_registry_lookup_by_numa() {
-    let mut reg = HeapRegistry::new();
-    let l0 = std::sync::Arc::new(HeapLocal::new(0)) as std::sync::Arc<dyn Heap>;
-    let svm = std::sync::Arc::new(HeapSvm::new(SvmRegion::with_size(1 << 16), 1))
-        as std::sync::Arc<dyn Heap>;
-    assert!(reg.for_numa(5).is_none());
-    reg.register(l0); // numa 0
-    reg.register(svm); // numa 1
-    assert_eq!(reg.for_numa(0).unwrap().numa_node(), 0);
-    assert_eq!(reg.for_numa(1).unwrap().numa_node(), 1);
-    assert!(reg.for_numa(2).is_none());
+fn heap_svm_allocation_is_returned_by_drop() {
+    let region = SvmRegion::try_with_size(48 * 1024).expect("create SVM region");
+    let heap = Heap::svm_data(region.clone()).expect("create SVM data heap");
+    let layout = Layout::from_size_align(32 * 1024, 64).unwrap();
+    let start = region.base() as usize;
+    let end = start + region.size();
+
+    {
+        let ptr = heap.alloc(layout).expect("alloc");
+        let ptr_addr = ptr.as_ptr() as usize;
+        assert!(ptr_addr >= start, "allocation must start inside SVM region");
+        assert!(
+            ptr_addr + layout.size() <= end,
+            "allocation must end inside SVM region"
+        );
+        unsafe {
+            GlobalAlloc::dealloc(&heap, ptr.as_ptr(), layout);
+        }
+    }
+
+    {
+        let ptr = heap.alloc(layout).expect("alloc");
+        let ptr_addr = ptr.as_ptr() as usize;
+        assert!(ptr_addr >= start, "allocation must start inside SVM region");
+        assert!(
+            ptr_addr + layout.size() <= end,
+            "allocation must end inside SVM region"
+        );
+        unsafe {
+            std::ptr::write_bytes(ptr.as_ptr(), 0xCD, layout.size());
+            GlobalAlloc::dealloc(&heap, ptr.as_ptr(), layout);
+        }
+    }
 }
 
 #[test]
-fn svm_region_default_is_nonzero_and_aligned() {
-    let r = SvmRegion::default();
-    assert!(r.size() > 0);
-    let base = r.base();
-    assert_eq!(base as usize % 64, 0, "base must be 64-byte aligned");
-    let off = r.alloc(128, 64);
-    assert!(off != u64::MAX);
+fn heap_clone_shares_svm_region() {
+    let region = SvmRegion::try_with_size(1 << 16).expect("create SVM region");
+    let heap = Arc::new(Heap::svm_data(region).expect("create SVM data heap"));
+    let clone = heap.clone();
+    drop(heap);
+    assert!(clone.region().expect("clone keeps region alive").size() > 0);
 }
+
+#[test]
+fn svm_region_maps_fd_backed_shared_memory() {
+    let region = SvmRegion::try_with_size(4096).expect("create SVM region");
+    assert!(region.size() >= 4096);
+    assert!(region.fd() >= 0);
+
+    let offset = region.alloc(16, 8);
+    assert_ne!(offset, u64::MAX);
+    unsafe {
+        std::ptr::write_bytes(region.base().add(offset as usize), 0x5A, 16);
+    }
+
+    let attached = SvmRegion::from_fd(region.fd(), region.size()).expect("attach fd");
+    unsafe {
+        assert_eq!(*attached.base().add(offset as usize), 0x5A);
+    }
+}
+
+#[test]
+fn attached_svm_region_is_not_an_allocator_owner() {
+    let region = SvmRegion::try_with_size(4096).expect("create SVM region");
+    let attached = SvmRegion::from_fd(region.fd(), region.size()).expect("attach fd");
+
+    assert_eq!(
+        attached.alloc(16, 8),
+        u64::MAX,
+        "attached mappings can read/write existing offsets but cannot allocate"
+    );
+    assert!(
+        Heap::svm_data(attached).is_err(),
+        "attached mapping must not become an allocation-owner data heap"
+    );
+}
+
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 2: Run the heap test red**
 
 Run: `cargo test -p hammer-infra --test heap -- --nocapture`
-Expected: FAIL with `unresolved import hammer_infra::heap` / `unresolved module heap` / `cannot find type Heap in module`.
 
-- [ ] **Step 3: Create `SvmRegion` primitive**
+Expected before the fix: failure if the old trait-based API, `HeapLocal`, `HeapSvm`, generic `H: Heap`, `dyn GlobalAlloc`, `#[global_allocator]`, `std::alloc::Allocator`, `std::alloc::System`, any hand-written main-heap allocator text remains in `crates/hammer-infra/src/heap.rs`, or any private span-list allocator remains in `crates/hammer-infra/src/svm_region.rs`.
 
-Create `crates/hammer-infra/src/svm_region.rs`. Extract the mmap/memfd/free-list logic from `segment.rs` `SvmInner` into a reusable `SvmRegion`. Why a new type: today the mmap/freelist is duplicated inside `segment.rs::Svm`; both `Segment::Svm` and the new `HeapSvm` need the same backing, so the region must be one reusable primitive (AGENTS.md: "add one generic primitive at the owning layer").
+- [ ] **Step 3: Add mature main-heap backend dependency wiring**
+
+In workspace `Cargo.toml`, add the mature allocators as workspace dependencies:
+
+```toml
+mimalloc = { version = "0.1", default-features = false }
+talc = { version = "5", default-features = false }
+spinning_top = "0.3"
+```
+
+In `crates/hammer-infra/Cargo.toml`, add the direct dependency:
+
+```toml
+[dependencies]
+crossbeam-utils = { workspace = true }
+libc = { workspace = true }
+mimalloc = { workspace = true }
+talc = { workspace = true }
+spinning_top = { workspace = true }
+```
+
+Implementation requirements:
+
+- `mimalloc::MiMalloc` is the default and only planned main-heap backend in this task.
+- `talc` is the only planned SVM span allocator in this task. It manages caller-provided mapped memory through `source::Manual`; Hammer owns mmap/fd lifetime and Talc owns allocation bookkeeping for the owner mapping.
+- `spinning_top::RawSpinlock` is used only as Talc's allocator lock primitive. Do not use `std::sync::Mutex` for SVM allocator internals.
+- Do not install mimalloc as Rust's process-wide global allocator. Hammer selects it through the explicit `Heap` handle and private vtable only.
+- Do not add `jemalloc`, `snmalloc`, `rpmalloc`, or another allocator in this task. The point is to make the backend explicit and swappable without expanding the dependency surface.
+
+- [ ] **Step 4: Implement the concrete heap handle**
+
+In `crates/hammer-infra/src/heap.rs`, keep this public shape, then implement it with the concrete allocator body immediately below. `HeapVTable` is shown only to define the private implementation shape; it must not be public.
 
 ```rust
-//! Reusable shared-memory region: memfd/shm_open mmap backing + bump allocator
-//! with a LIFO best-fit free list. Owned by `Svm` segments and `HeapSvm` heaps.
+#[repr(C)]
+struct HeapVTable {
+    alloc: unsafe fn(*const (), Layout) -> *mut u8,
+    dealloc: unsafe fn(*const (), *mut u8, Layout),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeapError {
+    AttachedSvmRegion,
+}
+
+pub struct Heap {
+    vt: &'static HeapVTable,
+    data: Arc<HeapData>,
+}
+
+impl Heap {
+    pub fn main() -> Heap;
+    pub fn local() -> Heap;
+    pub fn svm_data(region: SvmRegion) -> Result<Heap, HeapError>;
+    pub fn alloc(&self, layout: Layout) -> Option<NonNull<u8>>;
+    pub fn is_main_heap(&self) -> bool;
+    pub fn region(&self) -> Option<&SvmRegion>;
+}
+
+```
+
+Implementation requirements:
+
+- `#[derive(Clone)]` or an explicit `Clone` implementation clones the retained `Arc<HeapData>`. Do not use `Arc::into_raw` / `Arc::from_raw` unless the implementation genuinely needs erased ownership; the public handle is already concrete.
+- Do not add a public `Heap::dealloc` method. Deallocation is reachable only through `GlobalAlloc for Heap`, and Hammer code uses that from owning container/arena `Drop` implementations.
+- `Heap::main()` calls `mimalloc::MiMalloc` directly through the private vtable. It must not call `std::alloc::alloc` or `std::alloc::System`, because either would hide the chosen main-heap backend.
+- `Heap::local()` remains as a thin alias for `Heap::main()` so existing local-heap call sites keep compiling while the actual backend becomes mature allocator-backed.
+- `Heap::svm_data(region)` returns `Err(HeapError::AttachedSvmRegion)` when passed an attached mapping. It must not assert, panic, or embed a string error.
+- The SVM vtable dealloc passes the allocation pointer and `Layout` to the crate-private Talc-backed SVM allocator path. It must not compute offsets into a hand-written returned-span list.
+
+Use this allocator body. The important part is that `HeapData`, `MAIN_VT`, and `SVM_VT` are private; backend logic lives inside the vtable definitions, not in a pile of top-level `svm_*` / `local_*` functions.
+
+```rust
+use std::alloc::{GlobalAlloc, Layout};
+use std::ptr::NonNull;
+use std::sync::Arc;
+
+use crate::svm_region::SvmRegion;
+
+enum HeapData {
+    Main,
+    SvmData { region: SvmRegion },
+}
+
+#[derive(Clone)]
+pub struct Heap {
+    vt: &'static HeapVTable,
+    data: Arc<HeapData>,
+}
+
+static MIMALLOC_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+impl Heap {
+    pub fn main() -> Heap {
+        Heap {
+            vt: &MAIN_VT,
+            data: Arc::new(HeapData::Main),
+        }
+    }
+
+    pub fn local() -> Heap {
+        Self::main()
+    }
+
+    pub fn svm_data(region: SvmRegion) -> Result<Heap, HeapError> {
+        if !region.is_allocation_owner() {
+            return Err(HeapError::AttachedSvmRegion);
+        }
+        Ok(Heap {
+            vt: &SVM_VT,
+            data: Arc::new(HeapData::SvmData { region }),
+        })
+    }
+
+    #[inline]
+    pub fn alloc(&self, layout: Layout) -> Option<NonNull<u8>> {
+        unsafe { NonNull::new((self.vt.alloc)(self.data_ptr(), layout)) }
+    }
+
+    pub fn is_main_heap(&self) -> bool {
+        matches!(self.data.as_ref(), HeapData::Main)
+    }
+
+    pub fn region(&self) -> Option<&SvmRegion> {
+        match self.data.as_ref() {
+            HeapData::SvmData { region } => Some(region),
+            HeapData::Main => None,
+        }
+    }
+
+    #[inline]
+    fn data_ptr(&self) -> *const () {
+        Arc::as_ptr(&self.data).cast::<()>()
+    }
+}
+
+unsafe impl GlobalAlloc for Heap {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        unsafe { (self.vt.alloc)(self.data_ptr(), layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { (self.vt.dealloc)(self.data_ptr(), ptr, layout) }
+    }
+}
+
+static MAIN_VT: HeapVTable = HeapVTable {
+    alloc: |_, layout| {
+        if layout.size() == 0 {
+            return layout.align() as *mut u8;
+        }
+        unsafe { GlobalAlloc::alloc(&MIMALLOC_ALLOC, layout) }
+    },
+    dealloc: |_, ptr, layout| {
+        if layout.size() == 0 {
+            return;
+        }
+        unsafe { GlobalAlloc::dealloc(&MIMALLOC_ALLOC, ptr, layout) }
+    },
+};
+
+static SVM_VT: HeapVTable = HeapVTable {
+    alloc: |data, layout| {
+        if layout.size() == 0 {
+            return layout.align() as *mut u8;
+        }
+        let HeapData::SvmData { region } = (unsafe { &*(data as *const HeapData) }) else {
+            return std::ptr::null_mut();
+        };
+        region
+            .alloc_layout(layout)
+            .map_or(std::ptr::null_mut(), NonNull::as_ptr)
+    },
+    dealloc: |data, ptr, layout| {
+        if layout.size() == 0 {
+            return;
+        }
+        let HeapData::SvmData { region } = (unsafe { &*(data as *const HeapData) }) else {
+            return;
+        };
+        if let Some(ptr) = NonNull::new(ptr) {
+            unsafe {
+                region.dealloc_layout(ptr, layout);
+            }
+        }
+    },
+};
+
+```
+
+Additional allocator requirements:
+
+- `Heap::main` and `Heap::local` allocate through the single mature `mimalloc::MiMalloc` main-heap backend. `Heap::svm_data` owns a cloned `SvmRegion` handle in `HeapData` so the mmap/fd lifetime follows the heap handle.
+- Zero-sized layouts return an aligned dangling pointer and deallocate as a no-op.
+- The SVM vtable's `dealloc` branch returns the pointer and `Layout` to `SvmRegion`'s Talc allocator. No caller outside allocator/container `Drop` code can trigger this directly.
+- Do not add top-level backend functions named `local_alloc`, `local_dealloc`, `local_numa`, `svm_alloc`, `svm_dealloc`, or `svm_numa`; keep backend behavior colocated with `MAIN_VT` and `SVM_VT`.
+
+- [ ] **Step 5: Implement the SVM region allocator**
+
+In `crates/hammer-infra/src/svm_region.rs`, implement the reusable SVM storage as fd-backed mmap memory plus a mature allocator over that mapped span. This is deliberately not a public heap type; it is the backing region used by `Heap::svm_data`.
+
+```rust
+use std::alloc::{GlobalAlloc, Layout};
 use std::ffi::CString;
 use std::os::fd::RawFd;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-#[cfg(target_os = "linux")]
-use libc::{c_int, c_void, memfd_create, mmap, munmap, sysconf, _SC_PAGESIZE,
-    MFD_CLOEXEC, MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE};
-#[cfg(not(target_os = "linux"))]
-use libc::{c_void, mmap, munmap, shm_open, shm_unlink, ftruncate,
-    O_CREAT, O_RDWR, S_IRUSR, S_IWUSR, MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE};
+use spinning_top::RawSpinlock;
+use talc::{source::Manual, TalcLock};
 
 use crate::align::align_up;
+
+type SvmAllocator = TalcLock<RawSpinlock, Manual>;
+
+#[derive(Debug)]
+pub enum SvmRegionError {
+    PageSizeUnavailable,
+    NameContainsNul,
+    MemfdCreate(std::io::Error),
+    ShmOpen(std::io::Error),
+    Ftruncate(std::io::Error),
+    Mmap(std::io::Error),
+    ClaimAllocator,
+}
 
 pub struct SvmRegion {
     inner: Arc<SvmRegionInner>,
 }
+
 struct SvmRegionInner {
     base: *mut u8,
     size: usize,
     fd: RawFd,
-    bump: AtomicU64,
-    free_list: Mutex<Vec<(u64, usize)>>,
     owned: bool,
+    allocator: Option<SvmAllocator>,
 }
 
 unsafe impl Send for SvmRegionInner {}
 unsafe impl Sync for SvmRegionInner {}
 
-impl SvmRegion {
-    pub fn with_size(size: usize) -> SvmRegion {
-        // Reuse the exact construction sequence currently in segment.rs::Svm::new.
-        // Linux: memfd_create("hammer-region", MFD_CLOEXEC) + mmap(MAP_SHARED, anon-ish).
-        // Other: shm_open("/hammer-region-<pid>", O_CREAT|O_RDWR) + ftruncate + mmap.
-        // Round size up to page size; align base to 64 bytes.
-        let page = page_size();
-        let total = align_up(size, page);
-        let (base, fd, owned) = unsafe { alloc_region(total) };
-        SvmRegion { inner: Arc::new(SvmRegionInner {
-            base, size: total, fd, bump: AtomicU64::new(0),
-            free_list: Mutex::new(Vec::new()), owned,
-        })}
-    }
+static SVM_REGION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    pub fn from_fd(fd: RawFd, size: usize) -> Option<SvmRegion> {
-        // Attach to an existing shared region (mirrors current Svm::from_fd).
-        let page = page_size();
-        let total = align_up(size, page);
-        unsafe {
-            let base = libc::mmap(std::ptr::null_mut(), total, PROT_READ|PROT_WRITE,
-                MAP_SHARED, fd, 0);
-            if base == MAP_FAILED { return None; }
-            Some(SvmRegion { inner: Arc::new(SvmRegionInner {
-                base: base as *mut u8, size: total, fd, bump: AtomicU64::new(0),
-                free_list: Mutex::new(Vec::new()), owned: false,
-            })})
+impl Clone for SvmRegion {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
         }
-    }
-
-    pub fn base(&self) -> *mut u8 { self.inner.base }
-    pub fn size(&self) -> usize { self.inner.size }
-    pub fn fd(&self) -> RawFd { self.inner.fd }
-
-    /// Bump-allocate with best-fit search of the LIFO free list; returns `u64::MAX` on OOM.
-    pub fn alloc(&self, bytes: usize, align: usize) -> u64 {
-        // 1. Try free list (LIFO best-fit): reuse the exact search loop from SvmInner::alloc.
-        let mut fl = self.inner.free_list.lock().unwrap();
-        let mut best: Option<usize> = None;
-        for (i, &(off, sz)) in fl.iter().enumerate() {
-            if sz >= bytes {
-                let aligned = align_up(off, align as u64);
-                let pad = aligned - off;
-                if aligned + bytes as u64 <= off + sz as u64 {
-                    if best.map(|b| (sz - (aligned_off_size(off, sz, align)) ) < Some(0)).unwrap_or(true) {
-                        best = Some(i);
-                    }
-                }
-            }
-        }
-        if let Some(i) = best {
-            let (off, sz) = fl.swap_remove(i);
-            let aligned = align_up(off, align as u64);
-            let pad = aligned - off;
-            if pad + bytes as u64 < sz as u64 {
-                fl.push((aligned + bytes as u64, sz as u64 - pad - bytes as u64));
-            }
-            return aligned;
-        }
-        // 2. Bump
-        let cur = self.inner.bump.fetch_add(align_up(bytes, align) as u64, Ordering::Relaxed);
-        let aligned = align_up(cur, align as u64);
-        if aligned + bytes as u64 > self.inner.size as u64 { return u64::MAX; }
-        aligned
-    }
-
-    pub fn free(&self, offset: u64, bytes: usize) {
-        self.inner.free_list.lock().unwrap().push((offset, bytes));
     }
 }
 
-impl Default for SvmRegion {
-    fn default() -> SvmRegion { SvmRegion::with_size(256 * 1024 * 1024) }
+impl SvmRegion {
+    pub fn try_with_size(size: usize) -> Result<SvmRegion, SvmRegionError> {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page <= 0 {
+            return Err(SvmRegionError::PageSizeUnavailable);
+        }
+        let total = align_up(size, page as usize);
+        let counter = SVM_REGION_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+
+        #[cfg(target_os = "linux")]
+        let (base, fd, owned) = {
+            let name = CString::new(format!("hammer-region-{pid}-{counter}"))
+                .map_err(|_| SvmRegionError::NameContainsNul)?;
+            let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+            if fd < 0 {
+                return Err(SvmRegionError::MemfdCreate(std::io::Error::last_os_error()));
+            }
+
+            let ret = unsafe { libc::ftruncate(fd, total as libc::off_t) };
+            if ret != 0 {
+                let error = std::io::Error::last_os_error();
+                unsafe { libc::close(fd) };
+                return Err(SvmRegionError::Ftruncate(error));
+            }
+
+            let base = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    total,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                )
+            };
+            if base == libc::MAP_FAILED {
+                let error = std::io::Error::last_os_error();
+                unsafe { libc::close(fd) };
+                return Err(SvmRegionError::Mmap(error));
+            }
+
+            (base.cast(), fd, true)
+        };
+
+        #[cfg(not(target_os = "linux"))]
+        let (base, fd, owned) = {
+            let name = CString::new(format!("/hammer-region-{pid}-{counter}"))
+                .map_err(|_| SvmRegionError::NameContainsNul)?;
+            let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600) };
+            if fd < 0 {
+                return Err(SvmRegionError::ShmOpen(std::io::Error::last_os_error()));
+            }
+            unsafe { libc::shm_unlink(name.as_ptr()) };
+
+            let ret = unsafe { libc::ftruncate(fd, total as libc::off_t) };
+            if ret != 0 {
+                let error = std::io::Error::last_os_error();
+                unsafe { libc::close(fd) };
+                return Err(SvmRegionError::Ftruncate(error));
+            }
+
+            let base = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    total,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                )
+            };
+            if base == libc::MAP_FAILED {
+                let error = std::io::Error::last_os_error();
+                unsafe { libc::close(fd) };
+                return Err(SvmRegionError::Mmap(error));
+            }
+
+            (base.cast(), fd, true)
+        };
+
+        let allocator = match Self::claim_allocator(base, total) {
+            Some(allocator) => Some(allocator),
+            None => {
+                unsafe {
+                    libc::munmap(base.cast(), total);
+                    libc::close(fd);
+                }
+                return Err(SvmRegionError::ClaimAllocator);
+            }
+        };
+
+        Ok(SvmRegion {
+            inner: Arc::new(SvmRegionInner {
+                base,
+                size: total,
+                fd,
+                owned,
+                allocator,
+            }),
+        })
+    }
+
+    pub fn from_fd(fd: RawFd, size: usize) -> Option<SvmRegion> {
+        Self::from_fd_owned(fd, size, false)
+    }
+
+    pub fn from_fd_owned(fd: RawFd, size: usize, owned: bool) -> Option<SvmRegion> {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        assert!(page > 0, "sysconf(_SC_PAGESIZE) must return a positive page size");
+        let total = align_up(size, page as usize);
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                total,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            if owned {
+                unsafe { libc::close(fd) };
+            }
+            return None;
+        }
+
+        Some(SvmRegion {
+            inner: Arc::new(SvmRegionInner {
+                base: base.cast(),
+                size: total,
+                fd,
+                owned,
+                allocator: None,
+            }),
+        })
+    }
+
+    pub(crate) fn from_created_fd_owned(fd: RawFd, size: usize) -> Option<SvmRegion> {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        assert!(page > 0, "sysconf(_SC_PAGESIZE) must return a positive page size");
+        let total = align_up(size, page as usize);
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                total,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            unsafe { libc::close(fd) };
+            return None;
+        }
+        let base = base.cast();
+        let allocator = match Self::claim_allocator(base, total) {
+            Some(allocator) => Some(allocator),
+            None => {
+                unsafe {
+                    libc::munmap(base.cast(), total);
+                    libc::close(fd);
+                }
+                return None;
+            }
+        };
+        Some(SvmRegion {
+            inner: Arc::new(SvmRegionInner {
+                base,
+                size: total,
+                fd,
+                owned: true,
+                allocator,
+            }),
+        })
+    }
+
+    pub fn base(&self) -> *mut u8 {
+        self.inner.base
+    }
+
+    pub fn size(&self) -> usize {
+        self.inner.size
+    }
+
+    pub fn fd(&self) -> RawFd {
+        self.inner.fd
+    }
+
+    pub(crate) fn is_allocation_owner(&self) -> bool {
+        self.inner.allocator.is_some()
+    }
+
+    pub fn alloc(&self, bytes: usize, align: usize) -> u64 {
+        if bytes == 0 {
+            return 0;
+        }
+        let Some(allocator) = self.inner.allocator.as_ref() else {
+            return u64::MAX;
+        };
+        let Ok(layout) = Layout::from_size_align(bytes, align) else {
+            return u64::MAX;
+        };
+        let ptr = unsafe { GlobalAlloc::alloc(allocator, layout) };
+        if ptr.is_null() {
+            return u64::MAX;
+        }
+        debug_assert!(self.contains(ptr, bytes));
+        (ptr as usize - self.inner.base as usize) as u64
+    }
+
+    pub(crate) fn alloc_layout(&self, layout: Layout) -> Option<NonNull<u8>> {
+        if layout.size() == 0 {
+            return NonNull::new(layout.align() as *mut u8);
+        }
+        let allocator = self.inner.allocator.as_ref()?;
+        let ptr = unsafe { GlobalAlloc::alloc(allocator, layout) };
+        NonNull::new(ptr)
+    }
+
+    pub(crate) unsafe fn dealloc_layout(&self, ptr: NonNull<u8>, layout: Layout) {
+        if layout.size() == 0 {
+            return;
+        }
+        debug_assert!(self.contains(ptr.as_ptr(), layout.size()));
+        let Some(allocator) = self.inner.allocator.as_ref() else {
+            return;
+        };
+        unsafe {
+            GlobalAlloc::dealloc(allocator, ptr.as_ptr(), layout);
+        }
+    }
+
+    fn contains(&self, ptr: *mut u8, bytes: usize) -> bool {
+        let start = self.inner.base as usize;
+        let end = start + self.inner.size;
+        let ptr = ptr as usize;
+        ptr >= start && ptr.checked_add(bytes).is_some_and(|end_ptr| end_ptr <= end)
+    }
+
+    fn claim_allocator(base: *mut u8, size: usize) -> Option<SvmAllocator> {
+        let mut allocator = TalcLock::<RawSpinlock, Manual>::new(Manual);
+        unsafe {
+            allocator
+                .get_mut()
+                .claim(base, size)
+                .ok()?;
+        }
+        Some(allocator)
+    }
 }
 
 impl Drop for SvmRegionInner {
     fn drop(&mut self) {
         unsafe {
             if !self.base.is_null() {
-                libc::munmap(self.base as *mut c_void, self.size);
+                libc::munmap(self.base.cast(), self.size);
             }
-            if self.owned { libc::close(self.fd); }
+            if self.owned {
+                libc::close(self.fd);
+            }
         }
     }
 }
 
-fn page_size() -> usize { unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize } }
-fn aligned_off_size(off: u64, _sz: usize, _align: usize) -> usize { 0 } // helper used by best-fit
-
-unsafe fn alloc_region(total: usize) -> (*mut u8, RawFd, bool) {
-    #[cfg(target_os = "linux")] {
-        let name = CString::new("hammer-region").unwrap();
-        let fd = memfd_create(name.as_ptr(), MFD_CLOEXEC);
-        libc::ftruncate(fd, total as i64);
-        let base = mmap(std::ptr::null_mut(), total, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-        (base as *mut u8, fd, true)
-    }
-    #[cfg(not(target_os = "linux"))] {
-        let name = CString::new(format!("hammer-region-{}", std::process::id())).unwrap();
-        let fd = shm_open(name.as_ptr(), O_CREAT|O_RDWR, S_IRUSR|S_IWUSR);
-        ftruncate(fd, total as i64);
-        shm_unlink(name.as_ptr());
-        let base = mmap(std::ptr::null_mut(), total, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-        (base as *mut u8, fd, true)
-    }
-}
 ```
-> Note for the worker: the free-list best-fit search above is the same algorithm in `segment.rs:219-251`. Replace the placeholder `aligned_off_size` with a proper min-remaining computation; keep the exact behavior the existing `SvmInner::alloc` test (`segment.rs:283-379`) asserts. Don't bikeshed the search heuristic — the existing one is reused verbatim in shape.
 
-- [ ] **Step 4: Refactor `Segment::Svm` to own `SvmRegion`**
+Implementation requirements:
 
-In `crates/hammer-infra/src/segment.rs`, replace the `SvmInner` struct with `SvmRegion`-backed `Svm`:
+- `SvmRegion::try_with_size` owns the platform split shown above directly: Linux uses `memfd_create + ftruncate + mmap`; other Unix targets use `shm_open + shm_unlink + ftruncate + mmap`. Do not add a top-level `alloc_region` helper.
+- Every fd-creation failure returns `SvmRegionError::{MemfdCreate|ShmOpen}(std::io::Error::last_os_error())`. Every failure after fd creation closes the fd before returning the typed error.
+- `try_with_size` creates the allocation-owner region and immediately calls `TalcLock::<RawSpinlock, Manual>::new(Manual)` plus `claim(base, total)` on the mapped span.
+- If Talc cannot claim the mapped span, `try_with_size` must `munmap`, `close`, and return `SvmRegionError::ClaimAllocator`; `from_created_fd_owned` must `munmap`, `close`, and return `None`.
+- `from_fd` / `from_fd_owned` create attach mappings only. They must not create a second allocator over the same shared memory. `alloc` on an attached mapping returns `u64::MAX`, and `Heap::svm_data` returns `Err(HeapError::AttachedSvmRegion)`.
+- This attach-only rule is a scoped non-VPP behavior. Local VPP attachers can allocate through `ssvm_mem_alloc`; Hammer attachers cannot in this plan.
+- `from_fd_owned(fd, size, owned=false)` must not close the caller-owned fd on `mmap` failure or `SvmRegion` drop. `try_with_size` and `from_created_fd_owned(fd, size)` must close the fd on `mmap` failure and after `munmap`.
+- `from_created_fd_owned` is crate-private and exists only for code that has just created/truncated a fresh fd-backed region and must install the owner allocator. It is not a caller-facing allocation API.
+- `alloc` constructs a `Layout` from `(bytes, align)`, delegates to Talc through `GlobalAlloc::alloc`, returns an offset from `base`, and returns `u64::MAX` on invalid layout, OOM, or attached mapping.
+- `dealloc_layout` is crate-private and is called only by the `Heap` vtable's `dealloc` callback. It delegates to Talc through `GlobalAlloc::dealloc` and returns immediately if called on an attached mapping.
+- Do not add SVM allocator state named `bump`, hand-written span node lists, side `mmap` metadata arrays, or `std::sync::Mutex` in `svm_region.rs`.
+- Do not add top-level helper functions named `alloc_region` or `page_size`; keep this allocation path visible inside `SvmRegion::try_with_size` / `from_fd_owned`.
+
+- [ ] **Step 6: Keep `Svm` as a thin `SvmRegion` wrapper without a public return path**
+
+`crates/hammer-infra/src/segment.rs` must remove the old direct return method from `Segment`; `Svm` delegates allocation and fd access to `SvmRegion` only:
+
 ```rust
-pub struct Svm { region: SvmRegion }
+pub trait Segment: Send + Sync + Clone + 'static {
+    fn base(&self) -> *mut u8;
+    fn alloc(&self, bytes: usize, align: usize) -> u64;
+    fn fd(&self) -> Option<RawFd>;
+}
+
+pub struct Svm {
+    region: SvmRegion,
+}
+
 impl Segment for Svm {
     fn base(&self) -> *mut u8 { self.region.base() }
     fn alloc(&self, bytes: usize, align: usize) -> u64 { self.region.alloc(bytes, align) }
-    fn free(&self, offset: u64, bytes: usize) { self.region.free(offset, bytes); }
     fn fd(&self) -> Option<RawFd> { Some(self.region.fd()) }
 }
 ```
-Delete the now-dead `SvmInner` mmap fields. Keep `Svm::with_size`/`default`/`from_fd` as thin wrappers over `SvmRegion`. Run existing segment tests: `cargo test -p hammer-infra segment -- --nocapture` → must still pass unchanged.
 
-- [ ] **Step 5: Create `Heap` trait + `HeapLocal` + `HeapSvm` + `HeapRegistry`**
+Any infra structure that previously called `Segment::free` must move ownership into its own `Drop` path and deallocate through the retained `Heap` handle. Do not add a replacement direct lifetime method to `Segment`, and do not add per-structure span caches.
 
-Create `crates/hammer-infra/src/heap.rs`:
+Implementation requirements:
+
+- `Svm::create` uses the crate-private `SvmRegion::from_created_fd_owned` after it creates/truncates a fresh named shared-memory fd, so the creator gets the Talc owner allocator.
+- `Svm::from_fd` remains attach-only and must not allocate from the mapped segment. It exists for consumers that read/write objects already laid out by the owner using offsets.
+- Tests that fork or attach through `Svm::from_fd` should verify shared bytes are visible, not that the attached side can allocate.
+
+- [ ] **Step 7: Run green and commit**
+
+Run:
+
+```bash
+cargo test -p hammer-infra --test heap -- --nocapture
+cargo test -p hammer-infra segment -- --nocapture
+cargo fmt --all -- --check
+```
+
+Expected: all commands pass.
+
+Commit:
+
+```bash
+git add Cargo.toml crates/hammer-infra/Cargo.toml \
+        crates/hammer-infra/src/heap.rs crates/hammer-infra/src/svm_region.rs \
+        crates/hammer-infra/src/segment.rs crates/hammer-infra/src/fifo.rs \
+        crates/hammer-infra/src/bihash/alloc.rs crates/hammer-infra/src/bihash/split.rs \
+        crates/hammer-infra/src/lib.rs \
+        crates/hammer-infra/tests/heap.rs
+git commit -m "hammer-infra(Feat): concrete per-numa Heap handle"
+```
+
+---
+
+### Task 2: Route Raw Infra Containers Through `Arc<Heap>`
+
+**Files:**
+- Modify: `crates/hammer-infra/src/pool.rs`
+- Modify: `crates/hammer-infra/src/boxed.rs`
+- Modify: `crates/hammer-infra/src/map.rs`
+- Test: `crates/hammer-infra/tests/pool_heap.rs`
+- Test: `crates/hammer-infra/tests/slice_map_heap.rs`
+
+**Interfaces:**
+- Consumes: concrete `Arc<Heap>` from Task 1.
+- Produces: heap-aware raw allocation constructors that retain the same `Arc<Heap>` for deallocation without using Vec-backed bookkeeping.
+
+- [ ] **Step 1: Write/adjust the failing container tests**
+
+`crates/hammer-infra/tests/pool_heap.rs` must prove `Pool<T>` allocates and deallocates through `Heap::svm_data`:
+
 ```rust
-//! VPP "main heap" abstraction: a replaceable, per-NUMA allocation backend.
-//! Pool/Vec/Slice draw from a Heap instead of calling std::alloc directly,
-//! matching VPP's "active heap" model (vppinfra/mem.h) without porting the
-//! slab/bin internals — that belongs to the global allocator, not the framework.
-use std::alloc::{alloc, dealloc, Layout};
-use std::ptr::NonNull;
 use std::sync::Arc;
 
-use crate::svm_region::SvmRegion;
-
-pub trait Heap: Send + Sync + 'static {
-    fn alloc(&self, layout: Layout) -> Option<NonNull<u8>>;
-    /// # Safety: `ptr` must have been returned by `self.alloc(layout)` and not
-    /// previously deallocated; `layout` must match the alloc call exactly.
-    unsafe fn dealloc(&self, ptr: NonNull<u8>, layout: Layout);
-    fn numa_node(&self) -> u32;
-}
-
-pub struct HeapLocal { numa: u32 }
-impl HeapLocal {
-    pub fn new(numa: u32) -> HeapLocal { HeapLocal { numa } }
-}
-impl Heap for HeapLocal {
-    fn alloc(&self, layout: Layout) -> Option<NonNull<u8>> {
-        unsafe { NonNull::new(alloc(layout)) }
-    }
-    unsafe fn dealloc(&self, ptr: NonNull<u8>, layout: Layout) { dealloc(ptr.as_ptr(), layout); }
-    fn numa_node(&self) -> u32 { self.numa }
-}
-
-pub struct HeapSvm { region: SvmRegion, numa: u32 }
-impl HeapSvm {
-    pub fn new(region: SvmRegion, numa: u32) -> HeapSvm { HeapSvm { region, numa } }
-    pub fn region(&self) -> &SvmRegion { &self.region }
-}
-impl Heap for HeapSvm {
-    fn alloc(&self, layout: Layout) -> Option<NonNull<u8>> {
-        let off = self.region.alloc(layout.size(), layout.align());
-        if off == u64::MAX { return None; }
-        let ptr = unsafe { self.region.base().add(off as usize) };
-        NonNull::new(ptr)
-    }
-    unsafe fn dealloc(&self, ptr: NonNull<u8>, layout: Layout) {
-        let base = self.region.base();
-        let off = (ptr.as_ptr() as usize - base as usize) as u64;
-        self.region.free(off, layout.size());
-    }
-    fn numa_node(&self) -> u32 { self.numa }
-}
-
-pub struct HeapRegistry { heaps: Vec<Arc<dyn Heap>> }
-impl HeapRegistry {
-    pub fn new() -> HeapRegistry { HeapRegistry { heaps: Vec::new() } }
-    pub fn register(&mut self, heap: Arc<dyn Heap>) -> &mut Self {
-        let n = heap.numa_node() as usize;
-        if self.heaps.len() <= n { self.heaps.resize(n + 1, Arc::new(HeapLocal::new(0))); }
-        self.heaps[n] = heap;
-        self
-    }
-    pub fn for_numa(&self, numa: u32) -> Option<Arc<dyn Heap>> {
-        self.heaps.get(numa as usize).cloned()
-    }
-}
-impl Default for HeapRegistry { fn default() -> Self { HeapRegistry::new() } }
-```
-
-In `crates/hammer-infra/src/lib.rs` add after line 17:
-```rust
-pub mod heap;
-pub mod svm_region;
-```
-
-- [ ] **Step 6: Run tests to verify green**
-
-Run: `cargo test -p hammer-infra --test heap -- --nocapture`
-Expected: PASS — all 4 heap tests green.
-Run: `cargo test -p hammer-infra segment -- --nocapture` → existing `Svm`/`Local` segment tests still PASS.
-Run: `cargo fmt --all -- --check && cargo clippy -p hammer-infra --all-targets` → clean.
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add crates/hammer-infra/src/heap.rs crates/hammer-infra/src/svm_region.rs \
-        crates/hammer-infra/src/segment.rs crates/hammer-infra/src/lib.rs \
-        crates/hammer-infra/tests/heap.rs
-git commit -m "hammer-infra(Feat): Heap trait + SvmRegion + per-numa HeapRegistry"
-```
-
----
-
-### Task 2: Pool<T> draws allocations from Heap (hammer-infra)
-
-**Files:**
-- Modify: `crates/hammer-infra/src/pool.rs:33-66` (constructor + raw alloc in `with_capacity`)
-- Test: `crates/hammer-infra/tests/pool_heap.rs`
-
-**Interfaces:**
-- Consumes: `Heap` trait from Task 1; existing `Pool<T>` raw `std::alloc::alloc` path (pool.rs:66).
-- Produces:
-  - `pub fn with_capacity_in(capacity: usize, heap: &dyn Heap) -> Pool<T, ALIGN>` (allocates slab through Heap).
-  - `pub fn with_capacity(capacity: usize) -> Pool<T, ALIGN>` retained for back-compat — falls back to `HeapLocal::new(0)`.
-
-- [ ] **Step 1: Write the failing test**
-
-`crates/hammer-infra/tests/pool_heap.rs`:
-```rust
-//! Pool must allocate its backing slab through a Heap, not std::alloc directly.
-use std::alloc::Layout;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-use hammer_infra::heap::{Heap, HeapLocal};
-use hammer_infra::pool::Pool;
-
-#[derive(Debug)]
-struct CountingHeap {
-    count: AtomicUsize,
-    numa: u32,
-}
-impl CountingHeap {
-    fn new(numa: u32) -> Self { CountingHeap { count: AtomicUsize::new(0), numa } }
-}
-impl Heap for CountingHeap {
-    fn alloc(&self, layout: Layout) -> Option<std::ptr::NonNull<u8>> {
-        self.count.fetch_add(1, Ordering::SeqCst);
-        let p = unsafe { std::alloc::alloc(layout) };
-        std::ptr::NonNull::new(p)
-    }
-    unsafe fn dealloc(&self, ptr: std::ptr::NonNull<u8>, layout: Layout) {
-        std::alloc::dealloc(ptr.as_ptr(), layout);
-    }
-    fn numa_node(&self) -> u32 { self.numa }
-}
-
-#[test]
-fn pool_with_capacity_in_routes_through_heap() {
-    let heap = CountingHeap::new(2);
-    let before = heap.count.load(Ordering::SeqCst);
-    let pool: Pool<u64> = Pool::with_capacity_in(64, &heap);
-    let after = heap.count.load(Ordering::SeqCst);
-    assert_eq!(after - before, 1, "Pool slab must come from the provided Heap");
-    assert_eq!(pool.capacity(), 64);
-    // Insert/remove still work end-to-end
-    let idx = pool.insert(42u64);
-    assert_eq!(pool.get(idx), Some(&42));
-}
-```
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `cargo test -p hammer-infra --test pool_heap -- --nocapture`
-Expected: FAIL `no function named with_capacity_in found`.
-
-- [ ] **Step 3: Wire Pool to Heap**
-
-In `crates/hammer-infra/src/pool.rs`, replace the `std::alloc::alloc` call in `with_capacity` with a pluggable `&dyn Heap`. Keep the original `with_capacity(cap)` as `with_capacity_in(cap, &HeapLocal::new(0))`. Add (matching the existing `Pool::with_capacity` signature at pool.rs:60):
-
-```rust
-use crate::heap::{Heap, HeapLocal};
-
-impl<T, const ALIGN: usize> Pool<T, ALIGN> {
-    pub fn with_capacity(capacity: usize) -> Pool<T, ALIGN> {
-        Self::with_capacity_in(capacity, &HeapLocal::new(0))
-    }
-
-    pub fn with_capacity_in(capacity: usize, heap: &dyn Heap) -> Pool<T, ALIGN> {
-        let stride = stride_of::<T>(ALIGN);
-        let total = stride.checked_mul(capacity).expect("pool size overflow");
-        let layout = Layout::from_size_align(total, ALIGN.max(std::mem::align_of::<T>())).unwrap();
-        let ptr = heap.alloc(layout).expect("pool heap OOM");
-        // Zero the slab so generational counters / free-bitmap layout is clean.
-        unsafe { std::ptr::write_bytes(ptr.as_ptr(), 0, total); }
-        let generations = vec_with_zeroed_capacity_in(capacity, heap);
-        let free_bitmap = Bitmap::with_capacity_in(capacity, heap);
-        let free = (0..capacity as u32).rev().collect();
-        Pool {
-            ptr, capacity, len: 0, stride,
-            layout: Some(layout),
-            free, free_bitmap, generations,
-            _marker: PhantomData,
-            _heap: Heap::as_ptr(heap), // optional: store the heap handle if Pool owns its slab's lifetime
-        }
-    }
-}
-```
-> The worker decides whether `Pool` keeps the `Heap` reference: simplest is to **not** retain it and call `dealloc` with the layout in `Drop` via `std::alloc::dealloc` (since `HeapLocal`/`HeapSvm` semantics only differ at alloc time for our use). But `HeapSvm`'s dealloc must call `SvmRegion::free`. Therefore `Pool` MUST store the `std::ptr::NonNull<()>` or `Arc<dyn Heap>` used to allocate. Worker: store `Arc<dyn Heap>` (cheap `Arc` clone) on `Pool` and use it in `Drop`. Document this in the struct.
-> Add helper `vec_with_zeroed_capacity_in` / `Bitmap::with_capacity_in` only if the existing `Vec`/`Bitmap` zero-init already calls `boxed::allocate` — if they do, leave them on the global allocator (Task 3 covers wiring `Vec`/`Slice` to Heap; Task 2's Pool stores only the slab's `Arc<dyn Heap>`). Keep the test green: the counting test asserts the **slab** goes through the heap (one alloc), not the ancillary `Vec`/`Bitmap`.
-
-- [ ] **Step 4: Run tests to verify green**
-
-Run: `cargo test -p hammer-infra --test pool_heap` → PASS.
-Run: `cargo test -p hammer-infra` → all existing pool tests (`pool.rs:250-295`) still PASS unchanged.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add crates/hammer-infra/src/pool.rs crates/hammer-infra/tests/pool_heap.rs
-git commit -m "hammer-infra(Feat): Pool<T> allocates slab through Heap"
-```
-
----
-
-### Task 3: Vec<T> / Slice<T> draw allocations from Heap (hammer-infra)
-
-**Files:**
-- Modify: `crates/hammer-infra/src/vec.rs:11-66` (`RawVec<T,ALIGN>::allocate`)
-- Modify: `crates/hammer-infra/src/boxed.rs:10-220` (`Slice::from_elem` / `boxed::allocate`)
-- Modify: `crates/hammer-infra/src/map.rs:47+` (`FlatHashTable::Slice` construction — accept optional Heap)
-- Test: `crates/hammer-infra/tests/vec_heap.rs`
-
-**Interfaces:**
-- Consumes: `Heap` (Task 1).
-- Produces:
-  - `pub struct RawVec<T, const ALIGN: usize = CACHE_LINE> { ptr, cap, heap: Option<NonNull<dyn Heap>> }` — back-compat path keeps `RawVec::with_capacity` using `HeapLocal::new(0)`; new `RawVec::with_capacity_in(cap, heap)`.
-  - `Slice<T>::from_elem_in(n, heap)` / `Slice::with_capacity_in(...)`.
-  - `FlatHashTable::with_capacity_in(cap, heap)`.
-
-- [ ] **Step 1: Write the failing test**
-
-`crates/hammer-infra/tests/vec_heap.rs`:
-```rust
-//! Both aligned Vec and Slice must route through a provided Heap.
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::alloc::Layout;
-use std::ptr::NonNull;
-
 use hammer_infra::heap::Heap;
-use hammer_infra::vec::Vec as HVec;
-use hammer_infra::boxed::Slice;
-
-struct CountingHeap { n: AtomicUsize, numa: u32 }
-impl CountingHeap { fn new(numa: u32) -> Self { CountingHeap { n: AtomicUsize::new(0), numa } } }
-impl Heap for CountingHeap {
-    fn alloc(&self, l: Layout) -> Option<NonNull<u8>> { self.n.fetch_add(1, Ordering::SeqCst); NonNull::new(unsafe { std::alloc::alloc(l) }) }
-    unsafe fn dealloc(&self, p: NonNull<u8>, l: Layout) { std::alloc::dealloc(p.as_ptr(), l) }
-    fn numa_node(&self) -> u32 { self.numa }
-}
+use hammer_infra::pool::Pool;
+use hammer_infra::svm_region::SvmRegion;
 
 #[test]
-fn hammer_vec_routes_through_heap() {
-    let h = CountingHeap::new(0);
-    let before = h.n.load(Ordering::SeqCst);
-    let mut v: HVec<u64> = HVec::with_capacity_in(128, &h);
-    let after = h.n.load(Ordering::SeqCst);
-    assert!(after > before, "Vec backing must be heap-allocated");
-    for i in 0..128u64 { v.push(i); }
-    assert_eq!(v[127], 127);
-}
+fn pool_with_capacity_in_routes_through_heap_svm() {
+    let region = SvmRegion::try_with_size(64 * 1024).expect("create SVM region");
+    let heap = Arc::new(Heap::svm_data(region).expect("create SVM data heap"));
 
-#[test]
-fn hammer_slice_routes_through_heap() {
-    let h = CountingHeap::new(1);
-    let before = h.n.load(Ordering::SeqCst);
-    let s: Slice<u8> = Slice::from_elem_in(2048, &h);
-    let after = h.n.load(Ordering::SeqCst);
-    assert!(after > before);
-    assert_eq!(s.len(), 2048);
-    assert_eq!(&s as *const _ as usize % 64, 0, "Slice preserves 64-byte alignment");
+    {
+        let mut pool: Pool<u64> = Pool::with_capacity_in(2048, heap.clone());
+        let index = pool.insert(42).expect("insert");
+        assert_eq!(pool.get(index), Some(&42));
+    }
+
+    {
+        let mut pool: Pool<u64> = Pool::with_capacity_in(2048, heap);
+        let index = pool.insert(7).expect("insert again");
+        assert_eq!(pool.get(index), Some(&7));
+    }
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `cargo test -p hammer-infra --test vec_heap` → FAIL `no function named with_capacity_in`.
-
-- [ ] **Step 3: Wire RawVec → Heap, then Slice → Heap**
-
-In `crates/hammer-infra/src/vec.rs`, change `RawVec::allocate` (currently around vec.rs:30-66 using `boxed::allocate`) to take an optional `&dyn Heap`:
+`crates/hammer-infra/tests/slice_map_heap.rs` must cover `Slice` and `FlatHashTable`:
 
 ```rust
-use crate::heap::{Heap, HeapLocal};
+#![allow(deprecated)]
 
-impl<T, const ALIGN: usize> RawVec<T, ALIGN> {
-    pub fn with_capacity(cap: usize) -> Self {
-        Self::with_capacity_in(cap, &HeapLocal::new(0))
-    }
-    pub fn with_capacity_in(cap: usize, heap: &dyn Heap) -> Self {
-        let layout = Layout::from_size_align(
-            cap * std::mem::size_of::<T>(),
-            ALIGN.max(std::mem::align_of::<T>()).max(64),
-        ).unwrap();
-        let ptr = heap.alloc(layout).expect("RawVec heap OOM");
-        unsafe { std::ptr::write_bytes(ptr.as_ptr(), 0, layout.size()); }
-        Self { ptr, cap, layout: Some(layout), _phantom: PhantomData, heap: HeapHandle::from(heap) }
+use std::sync::Arc;
+
+use hammer_infra::boxed::Slice;
+use hammer_infra::heap::Heap;
+use hammer_infra::map::FlatHashTable;
+use hammer_infra::svm_region::SvmRegion;
+
+#[test]
+fn slice_and_flat_hash_table_use_the_passed_heap() {
+    let region = SvmRegion::try_with_size(128 * 1024).expect("create SVM region");
+    let heap = Arc::new(Heap::svm_data(region).expect("create SVM data heap"));
+
+    let slice = Slice::from_elem_in(2048, 0u8, heap.clone());
+    let mut table: FlatHashTable<u64, u64> = FlatHashTable::with_capacity_in(64, heap);
+    table.insert(1, 100);
+
+    assert_eq!(slice.len(), 2048);
+    assert_eq!(table.get(&1), Some(&100));
+}
+
+#[test]
+fn infra_container_sources_do_not_reintroduce_heap_traits() {
+    for src in [
+        include_str!("../src/pool.rs"),
+        include_str!("../src/boxed.rs"),
+        include_str!("../src/map.rs"),
+    ] {
+        assert!(!src.contains("H: Heap"));
+        assert!(!src.contains("pub trait Heap"));
+        assert!(src.contains("Arc<Heap>") || src.contains("&Heap"));
     }
 }
 ```
-Add a `heap: HeapHandle` field to `RawVec` (`HeapHandle` = `Arc<dyn Heap>`; drop uses it instead of `std::alloc::dealloc`). Repeat the same `…_in(&dyn Heap)` constructor pattern for `Slice` in `crates/hammer-infra/src/boxed.rs` and for `FlatHashTable::with_capacity_in(cap, heap)` in `crates/hammer-infra/src/map.rs` (the `Slice` it owns is constructed via the new Heap-wired path). Avoid forcing all existing call sites to change: keep the back-compat `with_capacity(n)` constructors that pass through `HeapLocal::new(0)`.
 
-- [ ] **Step 4: Run tests to verify green**
+- [ ] **Step 2: Run tests red**
 
-Run: `cargo test -p hammer-infra --test vec_heap` → PASS.
-Run: `cargo test -p hammer-infra` → all existing infra tests PASS.
-
-- [ ] **Step 5: Commit**
+Run:
 
 ```bash
-git add crates/hammer-infra/src/vec.rs crates/hammer-infra/src/boxed.rs \
-        crates/hammer-infra/src/map.rs crates/hammer-infra/tests/vec_heap.rs
-git commit -m "hammer-infra(Feat): Vec/Slice/FlatHashTable allocate through Heap"
+cargo test -p hammer-infra --test pool_heap -- --nocapture
+cargo test -p hammer-infra --test slice_map_heap -- --nocapture
+```
+
+Expected before the fix: missing `*_in(..., Arc<Heap>)` constructors or source-shape failures.
+
+- [ ] **Step 3: Implement heap retention**
+
+Use these exact constructor signatures:
+
+```rust
+impl<T, const ALIGN: usize> Pool<T, ALIGN> {
+    pub fn with_capacity(capacity: usize) -> Self;
+    pub fn with_capacity_in(capacity: usize, heap: Arc<Heap>) -> Self;
+}
+
+impl<T, const ALIGN: usize> Slice<T, ALIGN> {
+    pub fn from_elem(len: usize, value: T) -> Self
+    where
+        T: Clone;
+
+    pub fn from_elem_in(len: usize, value: T, heap: Arc<Heap>) -> Self
+    where
+        T: Clone;
+}
+
+impl<K: FlatHashKey, V: Clone> FlatHashTable<K, V> {
+    pub fn with_capacity(capacity: usize) -> Self;
+    pub fn with_capacity_in(capacity: usize, heap: Arc<Heap>) -> Self;
+}
+```
+
+Implementation requirements:
+
+- Default constructors use `Arc::new(Heap::local())`.
+- Each container stores the allocation heap and deallocates through the same handle in `Drop`.
+- `Pool` free slots, `Slice` storage, and `FlatHashTable` buckets use raw pointer allocations from the retained heap. They must not use `std::vec::Vec` or `hammer_infra::vec::Vec` for bookkeeping.
+- `FlatHashTable::grow` allocates replacement bucket storage from the retained heap.
+
+- [ ] **Step 4: Run green and commit**
+
+Run:
+
+```bash
+cargo test -p hammer-infra --test pool_heap -- --nocapture
+cargo test -p hammer-infra --test slice_map_heap -- --nocapture
+cargo test -p hammer-infra
+cargo fmt --all -- --check
+```
+
+Expected: all commands pass.
+
+Commit:
+
+```bash
+git add crates/hammer-infra/src/pool.rs \
+        crates/hammer-infra/src/boxed.rs crates/hammer-infra/src/map.rs \
+        crates/hammer-infra/tests/pool_heap.rs crates/hammer-infra/tests/slice_map_heap.rs
+git commit -m "hammer-infra(Feat): containers allocate through concrete Heap"
 ```
 
 ---
 
-### Task 4: Buffer storage inline — rewrite `Buffer` + `BufferPoolArena` slot layout (hammer-adapter)
+### Task 3: Inline Buffer Slot Layout
 
 **Files:**
-- Modify: `crates/hammer-adapter/src/buffer.rs:140-440` (Buffer/Slice removal, new slot-layout math)
-- Modify: `crates/hammer-adapter/src/buffer.rs:695-760` (`BufferPoolInner` storage replaced by contiguous region)
-- Modify: `crates/hammer-adapter/src/buffer.rs:1741-1900` (`BufferPoolArena::with_capacity` rewrite)
+- Modify: `crates/hammer-adapter/src/buffer.rs`
 - Test: `crates/hammer-adapter/tests/buffer_inline_layout.rs`
 
 **Interfaces:**
-- Consumes: `Heap` (Task 1); existing `BufferHeaderCacheline0`/`Cacheline1` field layout (buffer.rs:140-300); existing `BufferThreadCache` (batch logic retained).
-- Produces:
-  - `Buffer` no longer owns `storage: Slice<u8>` — it is the header-only `#[repr(C, align(64))]` struct `{ cacheline0, cacheline1 }`.
-  - `pub const DEFAULT_PRE_DATA_SIZE: usize = 128;` (VPP `VLIB_BUFFER_PRE_DATA_SIZE`; existing headroom used for encapsulation rewrite).
-  - `BufferPoolArena` field `region: Box<dyn Heap>` (from Task 1) instead of `Vec<CachePadded<BufferSlot>>` with per-slot `Slice<u8>`.
-  - `fn slot_stride(&self) -> usize` = `align_up(size_of::<Buffer>() + DEFAULT_PRE_DATA_SIZE + data_size, CACHE_LINE)`.
-  - `fn buffer_at(&self, slot: u32) -> &Buffer` — `&*(base.add(slot * stride) as *const Buffer)`.
-  - `fn data_at(&self, slot: u32) -> &mut [u8]` — `slice::from_raw_parts_mut(base.add(slot*stride + offset_of_data), data_size)`.
-  - `pub const fn buffer_data_offset() -> usize { size_of::<Buffer>() + DEFAULT_PRE_DATA_SIZE }` — used by `current_data` to address `pre_data` (negative) or `data` (≥0).
+- Consumes: `Arc<Heap>` and `buffer_data_offset()`.
+- Produces: contiguous slot storage with `Buffer` headers and data in one heap allocation.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write/adjust the failing layout test**
 
-`crates/hammer-adapter/tests/buffer_inline_layout.rs`:
+Use this exact test file:
+
 ```rust
-//! Verify the new BufferPoolArena inline header+data layout: index→pointer is O(1)
-//! O(slot*stride), and the per-slot data is contiguous with the header.
-use hammer_adapter::buffer::{Buffer, BufferPool, BufferIndex, DEFAULT_PRE_DATA_SIZE};
+use std::sync::Arc;
+
+use hammer_adapter::buffer::{
+    BufferPool, BufferPoolArena, BUFFER_THREAD_CACHE_BATCH, BUFFER_THREAD_CACHE_HIGH_WATER,
+    DEFAULT_PRE_DATA_SIZE, buffer_data_offset,
+};
+use hammer_infra::heap::Heap;
+use hammer_infra::svm_region::SvmRegion;
 
 #[test]
 fn one_contiguous_region_header_and_data_inline() {
-    let pool = BufferPool::with_capacity(numa: 0, slots: 64, data_size: 2048);
-    let idx = pool.alloc_index().expect("alloc");
-    let buf = pool.get(idx);
-    assert_eq!(buf.current_length, 0);
-    // current_data points inside the inline data area as a signed offset.
-    buf.current_data = 0;
-    buf.current_length = 100;
-    let data = pool.data_at(idx.slot);
-    assert_eq!(data.len(), 2048);
-    data[..100].copy_from_slice(&[0xAB; 100]);
-    assert_eq!(&pool.data_at(idx.slot)[..100], &[0xABu8; 100]);
-    pool.free_index_via_cache(idx); // internal reclaim (Task 7 RAII exercises this)
+    let pool = BufferPool::with_capacity(2048, 64);
+    let index = pool.alloc_index().expect("alloc");
+
+    pool.append(index, &[0xAB; 100]).expect("append");
+
+    let buffer = pool.get(index).expect("buffer");
+    let header_ptr = std::ptr::from_ref(&*buffer) as usize;
+    let current_ptr = buffer.current_ptr() as usize;
+
+    assert_eq!(current_ptr - header_ptr, buffer_data_offset());
+    assert_eq!(buffer.current(), &[0xAB; 100]);
 }
 
 #[test]
 fn index_to_pointer_is_slot_times_stride() {
-    let stride = BufferPool::slot_stride_for(2048);
-    let p0 = pool.base().add(0 * stride);
-    let p5 = pool.base().add(5 * stride);
-    let got5 = pool.buffer_raw_ptr(5);
-    assert_eq!(got5, p5);
-    assert_eq!((got5 as usize - p0 as usize), 5 * stride);
+    let pool = BufferPool::with_capacity(2048, 8);
+    let stride = pool.slot_stride();
+    let base = pool.base_ptr() as usize;
+    let slot = 5u32;
+    let got = pool.buffer_raw_ptr(slot) as usize;
+
+    assert_eq!(got, base + slot as usize * stride);
+}
+
+#[test]
+fn global_buffer_index_zero_is_never_a_valid_allocation() {
+    let pool = BufferPool::with_capacity(2048, 8);
+    let first = pool.alloc_index().expect("first alloc");
+    assert_ne!(first.as_u64(), 0, "encoded BufferIndex zero must stay invalid");
+    assert_eq!(pool.buffer_raw_ptr(first.slot()) as usize, pool.base_ptr() as usize + first.slot() as usize * pool.slot_stride());
 }
 
 #[test]
 fn negative_current_data_points_into_pre_data_headroom() {
-    let pool = BufferPool::with_capacity(0, 32, 2048);
-    let idx = pool.alloc_index().unwrap();
-    let buf = pool.get_mut(idx);
-    buf.current_data = -32;
-    buf.current_length = 32;
-    let head = pool.pre_data_at(idx.slot);
-    assert_eq!(head.len(), DEFAULT_PRE_DATA_SIZE);
-    unsafe { std::ptr::write_bytes(head.as_mut_ptr().add(DEFAULT_PRE_DATA_SIZE - 32), 0x42, 32); }
-    assert_eq!(pool.current_slice(idx)[31], 0x42);
+    let pool = BufferPool::with_capacity(2048, 32);
+    let index = pool.alloc_index().expect("alloc");
+
+    pool.append(index, &[0u8; 32]).expect("append payload");
+    pool.prepend(index, &[0x42; 32]).expect("prepend header");
+
+    let buffer = pool.get(index).expect("buffer");
+    assert_eq!(buffer.current_data_offset(), -32);
+    assert_eq!(&buffer.current()[..32], &[0x42; 32]);
+    assert_eq!(
+        pool.data_raw_ptr(index.slot()) as usize - buffer.current_ptr() as usize,
+        32
+    );
+    assert_eq!(DEFAULT_PRE_DATA_SIZE, 128);
+}
+
+#[test]
+fn per_thread_cache_constants_match_local_vpp() {
+    assert_eq!(BUFFER_THREAD_CACHE_BATCH, 32);
+    assert_eq!(BUFFER_THREAD_CACHE_HIGH_WATER, 512);
+}
+
+#[test]
+fn arena_allocates_one_heap_region_and_returns_it_on_drop() {
+    let region = SvmRegion::try_with_size(1 << 20).expect("create SVM region");
+    let heap = Arc::new(Heap::svm_data(region.clone()).expect("create SVM data heap"));
+    let region_start = region.base() as usize;
+    let region_end = region_start + region.size();
+
+    {
+        let arena = BufferPoolArena::with_capacity_in(2048, 64, heap.clone(), 0);
+        let pool = BufferPool::with_arena(arena);
+        let base = pool.base_ptr() as usize;
+        assert_eq!(base % 64, 0);
+        assert!(base >= region_start);
+        assert!(base < region_end);
+
+        let first = pool.alloc_index().expect("alloc");
+        assert_eq!(
+            pool.buffer_raw_ptr(first.slot()) as usize,
+            base + first.slot() as usize * pool.slot_stride()
+        );
+    }
+
+    {
+        let arena = BufferPoolArena::with_capacity_in(2048, 64, heap, 0);
+        let pool = BufferPool::with_arena(arena);
+        let base = pool.base_ptr() as usize;
+        assert_eq!(base % 64, 0);
+        assert!(base >= region_start);
+        assert!(base < region_end);
+    }
 }
 ```
-> The above `pool.alloc_index_via_cache(...)` / `pool.current_slice(...)` etc. are illustrative of the public method shape you will create. Finalize exact names to match the symbols you produce in Step 3; the test must reference real symbols.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 2: Run the layout test red**
 
-Run: `cargo test -p hammer-adapter --test buffer_inline_layout` → FAIL `unresolved import / no method with_capacity(numa,...)`.
+Run: `cargo test -p hammer-adapter --test buffer_inline_layout -- --nocapture`
 
-- [ ] **Step 3: Rewrite Buffer + slot layout**
+Expected before the fix: missing raw pointer/stride accessors or old per-buffer `Slice<u8>` storage.
 
-In `crates/hammer-adapter/src/buffer.rs`:
+- [ ] **Step 3: Implement the slot layout**
 
-(a) Strip the `storage: Slice<u8>` field from `Buffer` (line ~349-354) — `Buffer` becomes:
+In `crates/hammer-adapter/src/buffer.rs`, use this storage model:
+
 ```rust
+pub const DEFAULT_PRE_DATA_SIZE: usize = 128;
+
 #[repr(C, align(64))]
 pub struct Buffer {
     cacheline0: BufferHeaderCacheline0,
     cacheline1: BufferHeaderCacheline1,
 }
-pub const DEFAULT_PRE_DATA_SIZE: usize = 128;
-impl Buffer {
-    /// Size of the header + pre_data block (data starts immediately after).
-    pub const HEADER_AND_HEADROOM: usize =
-        /* size_of::<Buffer>() */ 128 + DEFAULT_PRE_DATA_SIZE; // VPP uses 128B header
-}
-```
 
-(b) Replace `BufferPoolInner.slots: Vec<CachePadded<BufferSlot>>` (line 702-710) with a contiguous raw region:
-```rust
+pub const fn buffer_data_offset() -> usize {
+    core::mem::size_of::<Buffer>() + DEFAULT_PRE_DATA_SIZE
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct BufferSlot {
+    generation: u32,
+    allocated: bool,
+}
+
 struct BufferPoolInner {
     pool_id: u64,
-    numa_node: u32,
-    region: Arc<dyn Heap>,        // owns the contiguous backing (Local or Svm)
-    region_base: NonNull<u8>,
-    region_size: usize,
+    pool_registry_slot: u8,
+    slot_capacity: usize,
     slot_stride: usize,
-    data_size: usize,
-    n_slots: u32,
-    free: Mutex<Vec<u32>>,        // global freelist (pool-wide), spill target only
-    generations: Vec<u32>,        // one generation per slot
-    threads: Vec<BufferThreadCache>, // per-worker cache array, indexed by thread_index
+    numa_node: u32,
+    region: Arc<Heap>,
+    region_base: NonNull<u8>,
+    region_layout: Layout,
+    region_size: usize,
+    metadata_heap: Arc<Heap>,
+    metadata_base: NonNull<u8>,
+    metadata_layout: Layout,
+    slot_states: NonNull<BufferSlot>,
+    available_stack: NonNull<u32>,
+    available_len: usize,
+    total_slots: usize,
     in_use: usize,
+    in_use_delta: i32,
 }
 ```
-`BufferSlot` and its `Buffer` field are deleted — the `Buffer` no longer lives in a `Vec`; it lives **at** `region_base + slot*stride`. `generations` is still `Vec<u32>` but no per-slot allocated `Buffer` object.
 
-(c) `with_capacity(numa, slots, data_size)` allocates one region from `HeapRegistry`:
+The arena allocation itself must be one heap allocation, not one allocation per buffer:
+
 ```rust
-impl BufferPool {
-    pub fn with_capacity(numa: u32, slots: u32, data_size: usize) -> BufferPool {
-        let heap = registry.for_numa(numa).unwrap_or_else(|| Arc::new(HeapLocal::new(numa)));
-        let stride = align_up(Buffer::HEADER_AND_HEADROOM + data_size, CACHE_LINE);
-        let region_size = stride * slots as usize;
-        let layout = Layout::from_size_align(region_size, CACHE_LINE).unwrap();
-        let region_base = heap.alloc(layout).expect("buffer region OOM");
-        unsafe { std::ptr::write_bytes(region_base.as_ptr(), 0, region_size); }
-        BufferPool { inner: Rc::new(RefCell::new(BufferPoolInner {
-            pool_id: next_id(), numa_node: numa, region: heap,
-            region_base, region_size, slot_stride: stride, data_size, n_slots: slots,
-            free: Mutex::new((1..slots).collect()), // VPP: index 0 reserved as sentinel
-            generations: vec![1; slots as usize], threads: per_thread_caches(registry.thread_count()),
-            in_use: 0,
-        }))}
+pub struct BufferPoolArena {
+    inner: Rc<RefCell<BufferPoolInner>>,
+}
+
+impl BufferPoolArena {
+    pub fn with_capacity(slot_capacity: usize, slots: usize) -> Self {
+        Self::with_capacity_in(slot_capacity, slots, Arc::new(Heap::local()), 0)
     }
-    pub fn buffer_at(&self, slot: u32) -> &Buffer {
-        let inner = self.inner.borrow();
-        let off = (slot as usize) * inner.slot_stride;
-        unsafe { &*(inner.region_base.as_ptr().add(off) as *const Buffer) }
+
+    pub fn with_capacity_in(slot_capacity: usize, slots: usize, heap: Arc<Heap>, numa_node: u32) -> Self {
+        assert!(slot_capacity > 0, "buffer slot capacity must be non-zero");
+        assert!(slots > 0, "buffer pool must contain at least one usable slot");
+
+        let total_slots = slots;
+        let slot_stride = align_up(
+            buffer_data_offset()
+                .checked_add(slot_capacity)
+                .expect("buffer slot size overflow"),
+            BUFFER_CACHE_LINE_SIZE,
+        );
+        let region_size = slot_stride
+            .checked_mul(total_slots)
+            .expect("buffer arena size overflow");
+        let region_layout = Layout::from_size_align(region_size, BUFFER_CACHE_LINE_SIZE)
+            .expect("buffer arena layout");
+        let region_base = heap
+            .alloc(region_layout)
+            .expect("buffer arena heap allocation");
+
+        unsafe {
+            // The full arena is packet memory. Zero it once on creation so every
+            // slot starts with deterministic header/pre-data/data bytes.
+            ptr::write_bytes(region_base.as_ptr(), 0, region_layout.size());
+        }
+
+        let slot_state_bytes = core::mem::size_of::<BufferSlot>()
+            .checked_mul(total_slots)
+            .expect("buffer metadata slot state overflow");
+        let available_bytes = core::mem::size_of::<u32>()
+            .checked_mul(slots)
+            .expect("buffer metadata availability overflow");
+        let available_offset = align_up(slot_state_bytes, core::mem::align_of::<u32>());
+        let metadata_size = available_offset
+            .checked_add(available_bytes)
+            .expect("buffer metadata size overflow");
+        let metadata_layout = Layout::from_size_align(metadata_size, BUFFER_CACHE_LINE_SIZE)
+            .expect("buffer metadata layout");
+        let metadata_base = heap
+            .alloc(metadata_layout)
+            .expect("buffer metadata heap allocation");
+        unsafe {
+            ptr::write_bytes(metadata_base.as_ptr(), 0, metadata_layout.size());
+        }
+        let slot_states = metadata_base.cast::<BufferSlot>();
+        let available_stack = unsafe {
+            NonNull::new_unchecked(metadata_base.as_ptr().add(available_offset).cast::<u32>())
+        };
+        for i in 0..slots {
+            let slot = u32::try_from(total_slots - i - 1).expect("buffer slot fits u32");
+            unsafe { available_stack.as_ptr().add(i).write(slot) };
+        }
+
+        let pool_registry_slot = register_buffer_pool(slot_capacity);
+        Self {
+            inner: Rc::new(RefCell::new(BufferPoolInner {
+                pool_id: next_buffer_pool_id(),
+                pool_registry_slot,
+                slot_capacity,
+                slot_stride,
+                numa_node,
+                region: Arc::clone(&heap),
+                region_base,
+                region_layout,
+                region_size,
+                metadata_heap: heap,
+                metadata_base,
+                metadata_layout,
+                slot_states,
+                available_stack,
+                available_len: slots,
+                total_slots,
+                in_use: 0,
+                in_use_delta: 0,
+            })),
+        }
     }
-    pub fn buffer_at_mut(&self, slot: u32) -> &mut Buffer {
-        unsafe { &mut *(self.raw_ptr(slot) as *mut Buffer) }
-    }
-    pub fn data_at(&self, slot: u32) -> &mut [u8] {
-        let inner = self.inner.borrow();
-        let off = (slot as usize) * inner.slot_stride + Buffer::HEADER_AND_HEADROOM;
-        unsafe { std::slice::from_raw_parts_mut(inner.region_base.as_ptr().add(off), inner.data_size) }
-    }
-    pub fn pre_data_at(&self, slot: u32) -> &mut [u8] {
-        let off = (slot as usize) * inner.slot_stride + std::mem::size_of::<Buffer>();
-        unsafe { std::slice::from_raw_parts_mut(self.raw_ptr(slot), DEFAULT_PRE_DATA_SIZE) }
-    }
-    fn raw_ptr(&self, slot: u32) -> *mut u8 {
-        let inner = self.inner.borrow();
-        unsafe { inner.region_base.as_ptr().add((slot as usize) * inner.slot_stride) }
+}
+
+impl Drop for BufferPoolInner {
+    fn drop(&mut self) {
+        unregister_buffer_pool(self.pool_registry_slot);
+        unsafe {
+            std::alloc::GlobalAlloc::dealloc(
+                &*self.region,
+                self.region_base.as_ptr(),
+                self.region_layout,
+            );
+            std::alloc::GlobalAlloc::dealloc(
+                &*self.metadata_heap,
+                self.metadata_base.as_ptr(),
+                self.metadata_layout,
+            );
+        }
     }
 }
 ```
-> The worker resolves borrow-scope subtleties (`inner` borrow must outlive the returned reference through the pool's `Rc` lifetime — use `&self` borrows where the pool itself outlives callers, returning `&Buffer` tied to `&self`). The existing `attach_clone`/`ref_count`/`next_buffer` chain logic retains (already exercises `current_data`/`current_length`); only the storage access changes. Pool reuses existing `BufferThreadCache` unchanged.
 
-- [ ] **Step 4: Migrate existing `free_chain`/`get`/`alloc_index` to the new layout**
+Slot pointer math must be O(1) and must never allocate:
 
-In the functions at `buffer.rs:1810` (`alloc_index`), `buffer.rs:1824` (`free_index`), `buffer.rs:2660` (`free_chain`): replace every `slots[slot].buffer.*` access with `self.buffer_at(slot).*` and every `storage` access with `self.data_at(slot)`. The control/data flow of `free_chain` (decrement ref_count, only release to cache when reaching 0) stays identical — only storage addressing changes. Keep `buffer_pool_index` set to `numa_node` (VPP: buffer_pool_index).
+```rust
+impl BufferPoolInner {
+    #[inline]
+    fn slot_offset(&self, slot: u32) -> CoreResult<usize> {
+        let slot = usize::try_from(slot).expect("buffer slot index fits usize");
+        if slot >= self.total_slots {
+            return Err(DataPlaneError::BufferSlotOutOfBounds.into());
+        }
+        slot.checked_mul(self.slot_stride)
+            .ok_or(DataPlaneError::BufferSlotOffsetOverflow.into())
+    }
 
-- [ ] **Step 5: Run tests to verify green**
+    #[inline]
+    fn buffer_raw_ptr(&self, slot: u32) -> CoreResult<*mut Buffer> {
+        let offset = self.slot_offset(slot)?;
+        Ok(unsafe { self.region_base.as_ptr().add(offset).cast::<Buffer>() })
+    }
 
-Run: `cargo test -p hammer-adapter --test buffer_inline_layout` → PASS.
-Run: `cargo test -p hammer-adapter` → all existing buffer tests (`buffer.rs:4295-4556` inline, `tests/buffer.rs`, `tests/buffer_layout.rs`, benches) must compile and PASS, modulo expected breakage around removed `Buffer::storage` direct user access — fix call sites within hammer-adapter in this step (they all go through `buffer_at`).
+    #[inline]
+    fn data_raw_ptr(&self, slot: u32) -> CoreResult<*mut u8> {
+        let offset = self
+            .slot_offset(slot)?
+            .checked_add(buffer_data_offset())
+            .ok_or(DataPlaneError::BufferDataPointerOverflow.into())?;
+        Ok(unsafe { self.region_base.as_ptr().add(offset) })
+    }
 
-- [ ] **Step 6: Commit**
+    #[inline]
+    fn buffer_at_slot(&self, slot: u32) -> CoreResult<&Buffer> {
+        Ok(unsafe { &*self.buffer_raw_ptr(slot)? })
+    }
+
+    #[inline]
+    fn buffer_at_slot_mut(&mut self, slot: u32) -> CoreResult<&mut Buffer> {
+        Ok(unsafe { &mut *self.buffer_raw_ptr(slot)? })
+    }
+}
+```
+
+Implementation requirements:
+
+- `BufferPoolArena::with_capacity(slot_capacity, slots)` calls `BufferPoolArena::with_capacity_in(slot_capacity, slots, Arc::new(Heap::local()), 0)`.
+- The `slots` parameter is the number of usable buffers. Arena storage and metadata allocate exactly `slots` entries. Do not reserve every pool's slot 0; VPP wastes at most one buffer globally only to keep encoded buffer index zero invalid.
+- `BufferPoolArena::with_capacity_in` computes `slot_stride = align_up(buffer_data_offset() + slot_capacity, BUFFER_CACHE_LINE_SIZE)`.
+- `BufferPoolArena::with_capacity_in` computes `region_layout = Layout::from_size_align(slot_stride * slots, BUFFER_CACHE_LINE_SIZE)` and calls `heap.alloc(region_layout)` exactly once.
+- `BufferPoolInner` stores `region: Arc<Heap>`, `region_base`, `region_layout`, and `region_size`; no `Buffer` owns a `Vec`, `Slice`, `Box<[u8]>`, or separate payload allocation.
+- If Hammer's encoded `BufferIndex` format could make the first allocation encode to zero, solve that in `BufferIndex` encoding or first-pool initialization only. Do not impose a per-pool slot-zero sentinel.
+- `available` is initialized from `(0..slots).rev()` unless the first-pool/global-index-zero rule above requires skipping exactly one global buffer.
+- `BUFFER_THREAD_CACHE_BATCH` stays `32`, matching the rounded refill chunk in `vlib_buffer_alloc_from_pool`.
+- `BUFFER_THREAD_CACHE_HIGH_WATER` becomes `512`, matching `VLIB_BUFFER_POOL_PER_THREAD_CACHE_SZ` in local VPP.
+- `BufferPoolInner::alloc_slot_with` and `alloc_slot_empty_fast` must pop from the current worker's `BufferThreadCache` first. They may touch arena `available` only when the cache is empty.
+- `BufferPoolInner::refill_cache_batch` moves up to a 32-slot chunk from arena `available` into the current worker cache.
+- `BufferPoolInner::push_cache_slot` fills the current worker cache up to 512 before `return_cache_batch` spills overflow to arena `available`, matching `vlib_buffer_pool_put`.
+- `BufferPoolInner::buffer_raw_ptr(slot)` returns `region_base + slot * slot_stride` cast to `*mut Buffer`.
+- `BufferPoolInner::data_raw_ptr(slot)` returns `region_base + slot * slot_stride + buffer_data_offset()`.
+- `Buffer::current_ptr()` computes from the header pointer plus `buffer_data_offset()` plus signed `current_data`.
+- `Buffer::prepend` accepts negative `current_data` down to `-DEFAULT_PRE_DATA_SIZE`.
+- Add typed `DataPlaneError` variants needed by the layout implementation, including `BufferSlotOutOfBounds`, `BufferSlotOffsetOverflow`, and `BufferDataPointerOverflow`; do not use `CoreError::internal("...")` for these data-plane faults.
+- `Drop for BufferPoolInner` unregisters the pool and deallocates `region_base` / `metadata_base` through `std::alloc::GlobalAlloc::dealloc(&*self.region, ...)` and `std::alloc::GlobalAlloc::dealloc(&*self.metadata_heap, ...)`.
+- Per-slot metadata (`slots`, `available`, generation counters, cache lists) lives outside packet memory. Packet bytes live only in the heap-allocated arena region.
+
+- [ ] **Step 4: Run green and commit**
+
+Run:
+
+```bash
+cargo test -p hammer-adapter --test buffer_inline_layout -- --nocapture
+cargo test -p hammer-adapter buffer -- --nocapture
+cargo fmt --all -- --check
+```
+
+Expected: layout test passes, and existing buffer tests still pass.
+
+Commit:
 
 ```bash
 git add crates/hammer-adapter/src/buffer.rs crates/hammer-adapter/tests/buffer_inline_layout.rs
-git commit -m "hammer-adapter(Feat): BufferPoolArena single contiguous region + inline header/data"
+git commit -m "hammer-adapter(Feat): inline buffer slot storage"
 ```
 
 ---
 
-### Task 5: Per-NUMA buffer pool split + per-thread cache indexing (hammer-adapter, hammer-runtime)
+### Task 4: Add Static No-Lock Memory Initialization Without New Public Managers
 
 **Files:**
-- Modify: `crates/hammer-adapter/src/buffer.rs:1810-1900` (`alloc_index` selects pool by numa)
-- Modify: `crates/hammer-runtime/src/engine.rs:14-24` (Engine wires `numa_node` → pool)
-- Modify: `crates/hammer-runtime/src/data_plane.rs` (DataPlaneRuntime holds `Vec<BufferPool>` indexed by numa)
-- Modify: `crates/hammer-runtime/src/start_workers.rs:25-55` (worker passes `engine.numa_node`)
-- Test: `crates/hammer-adapter/tests/buffer_per_numa.rs`
+- Create: `crates/hammer-runtime/src/memory.rs`
+- Modify: `crates/hammer-runtime/src/lib.rs`
+- Modify: `crates/hammer-runtime/src/engine.rs`
+- Test: `crates/hammer-runtime/tests/memory_static_init.rs`
 
 **Interfaces:**
-- Consumes: Task 4's per-pool `numa_node`; `HeapRegistry::for_numa`; `Engine.numa_node` (engine.rs:16).
+- Consumes: existing `DataPlaneBufferConfig`, `DataPlaneRuntimeConfig`, `BufferPoolArena::with_capacity_in`, `Heap`, `Engine`, and the existing `hammer-runtime::init` static `linkme` slices.
 - Produces:
-  - `DataPlaneRuntime.buffers_per_numa: Vec<BufferPool>` — `buffers_per_numa[numa]` is the worker's pool.
-  - `BufferPool::alloc_index_on(this_thread_index: u32, numa: u32) -> Option<BufferIndex>` — selects the right NUMA pool and thread cache.
+  - `memory_init` registered in the static init chain before `start_workers`.
+  - private startup code that materializes fixed NUMA arenas directly into `DataPlaneRuntimeConfig`.
+  - No heap/buffer init path uses `Mutex`, `RwLock`, `OnceLock`, `LazyLock`, `get_or_init`, `thread_local!`, `HashMap`, or `BTreeMap`.
+  - No new public manager/table/config types.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing static-init test**
 
-`crates/hammer-adapter/tests/buffer_per_numa.rs`:
+Create `crates/hammer-runtime/tests/memory_static_init.rs`:
+
 ```rust
-//! Two NUMA pools must be physically separate regions and sit under their own caches.
-use hammer_adapter::buffer::{BufferPool, BufferIndex};
+use hammer_runtime::init::{topological_order, INIT_FUNCTIONS};
 
 #[test]
-fn pool_per_numa_is_independent() {
-    let p0 = BufferPool::with_capacity(numa: 0, slots: 32, data_size: 1024);
-    let p1 = BufferPool::with_capacity(numa: 1, slots: 32, data_size: 1024);
-    // Same slot index from different pools must refer to physically distinct memory.
-    let i0 = p0.alloc_index_on(thread: 0, numa: 0usize).unwrap();
-    let i1 = p1.alloc_index_on(thread: 0, numa: 1usize).unwrap();
-    assert_eq!(i0.pool_id, p0.pool_id());
-    assert_eq!(i1.pool_id, p1.pool_id());
-    assert_ne!(p0.buffer_raw(i0.slot), p1.buffer_raw(i1.slot));
+fn memory_init_sources_are_static_no_lock() {
+    let runtime_memory = include_str!("../src/memory.rs");
+    for forbidden in [
+        "Mutex",
+        "RwLock",
+        "OnceLock",
+        "LazyLock",
+        "get_or_init",
+        "thread_local!",
+        "HashMap",
+        "BTreeMap",
+        "pub struct MemoryConfig",
+        "pub struct MemoryMain",
+        "pub struct StaticNumaTable",
+        "pub struct HeapRegistry",
+    ] {
+        assert!(
+            !runtime_memory.contains(forbidden),
+            "crates/hammer-runtime/src/memory.rs must not use or expose {forbidden}"
+        );
+    }
 }
 
 #[test]
-fn worker_picks_local_numa_pool() {
-    let runtime = sim_runtime_with_numa(num_count: 2, threads_per_numa: 1);
-    let w0 = runtime.worker(thread_index: 0, numa_node: 0);
-    let w1 = runtime.worker(thread_index: 1, numa_node: 1);
-    let bi0 = w0.alloc_buffer().unwrap();
-    let bi1 = w1.alloc_buffer().unwrap();
-    assert_eq!(bi0.pool_id, runtime.pool_id_for_numa(0));
-    assert_eq!(bi1.pool_id, runtime.pool_id_for_numa(1));
+fn memory_init_is_registered_before_workers() {
+    let memory = INIT_FUNCTIONS
+        .iter()
+        .find(|f| f.name == "memory_init")
+        .expect("memory_init registration");
+    assert!(
+        memory.runs_before.contains(&"start_workers"),
+        "memory_init must run before worker threads are spawned"
+    );
+
+    let order = topological_order(&INIT_FUNCTIONS).expect("init order");
+    let memory_pos = order
+        .iter()
+        .position(|idx| INIT_FUNCTIONS[*idx].name == "memory_init")
+        .expect("memory_init in order");
+    let workers_pos = order
+        .iter()
+        .position(|idx| INIT_FUNCTIONS[*idx].name == "start_workers")
+        .expect("start_workers in order");
+    assert!(memory_pos < workers_pos);
 }
+
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 2: Run test red**
 
-Run: `cargo test -p hammer-adapter --test buffer_per_numa` → FAIL (no `alloc_index_on` / per-NUMA selection API).
+Run: `cargo test -p hammer-runtime --test memory_static_init -- --nocapture`
 
-- [ ] **Step 3: Implement per-NUMA split**
+Expected before the fix: missing `hammer_runtime::memory`, no `memory_init` static registration, or existing memory code exposes `MemoryConfig` / `MemoryMain` / `StaticNumaTable`.
 
-In `crates/hammer-runtime/src/data_plane.rs`, change `DataPlaneRuntime { buffers: BufferPool }` (data_plane.rs:769-774) to:
+- [ ] **Step 3: Implement private fixed startup materialization**
+
+Implementation requirements:
+
+- Delete any public `crates/hammer-adapter/src/memory.rs` module if it only exists to expose memory manager/table types.
+- Keep the fixed NUMA table representation private inside `crates/hammer-adapter/src/buffer.rs` or `crates/hammer-runtime/src/memory.rs`.
+- `memory_init` builds `DataPlaneRuntimeConfig { buffers: DataPlaneBufferConfig { ... } }` directly from existing engine/startup config values.
+- If this slice does not yet have full startup config plumbing, use constants private to `crates/hammer-runtime/src/memory.rs`; do not turn those constants into a public `MemoryConfig` type.
+- `DataPlaneBufferConfig { buffer_arenas: Some(...) }` remains the only runtime construction point for prebuilt arenas; do not add public helper constructors such as `DataPlaneBufferConfig::arena_table()`.
+- Do not export new public memory manager/table types through `hammer-adapter/src/lib.rs` or `hammer-runtime/src/lib.rs`.
+
+- [ ] **Step 4: Register memory init statically**
+
+Create `crates/hammer-runtime/src/memory.rs`. Keep arena-table construction behind the already-owned buffer module boundary; this snippet intentionally omits a new public helper constructor:
+
 ```rust
-pub struct DataPlaneRuntime {
-    buffers_per_numa: Vec<BufferPool>,    // indexed by numa_node
-    nodes: NodeRuntime,
-    current_node: Rc<Cell<Option<NodeId>>>,
-    handoff: Option<DataPlaneHandoffWorker>,
-    handoff_node_handle: Option<NodeHandle>,
-    heap_registry: HeapRegistry,          // the per-NUMA Heap set (from Task 1)
-}
-impl DataPlaneRuntime {
-    pub fn buffers_for(&self, numa: u32) -> &BufferPool { &self.buffers_per_numa[numa as usize] }
-}
-```
-`new_worker_runtime(config)` walks `config.buffer.numa_count` and creates one `BufferPool::with_capacity(numa, slots_per_numa, slot_bytes)` per NUMA, backed by `HeapRegistry.register(HeapSvm::new(SvmRegion::with_size(...), numa))` (Local fallback on non-Linux). `start_workers.rs:25-55` changes `engine.runtime.clone()` to `engine.runtime.clone()` (still shared) but worker allocation calls `self.runtime.buffers_for(self.numa_node)` so each thread physically pulls from its local region.
-
-Adjust `BufferPool::alloc_index_on(thread_index, numa)` to select `self.threads[thread_index]` as the cache and the global freelist inside `self` (which is already the right NUMA pool because the worker called `buffers_for(numa)`).
-
-- [ ] **Step 4: Run tests to verify green**
-
-Run: `cargo test -p hammer-adapter --test buffer_per_numa` → PASS.
-Run: `cargo test -p hammer-adapter --test buffer` (the existing 1343-line buffer suite) → all PASS. Particular attention: `buffer_pool_rejects_index_from_another_runtime` (existing) — now also asserts cross-NUMA rejection (since cross-numa indices come from different `pool_id`).
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add crates/hammer-adapter/src/buffer.rs crates/hammer-runtime/src/engine.rs \
-        crates/hammer-runtime/src/data_plane.rs crates/hammer-runtime/src/worker_thread.rs \
-        crates/hammer-runtime/src/start_workers.rs crates/hammer-adapter/tests/buffer_per_numa.rs
-git commit -m "hammer-runtime(Feat): per-NUMA buffer pool split + worker-local pool selection"
-```
-
----
-
-### Task 6: Ensure lockless per-thread cache correctness under per-NUMA split (hammer-adapter)
-
-**Files:**
-- Modify: `crates/hammer-adapter/src/buffer.rs:1700-1900` (`BufferThreadCache` hold/flush path)
-- Test: `crates/hammer-adapter/tests/buffer_cache_lockless.rs`
-
-**Interfaces:**
-- Consumes: existing `BufferThreadCache` (batch=32, line 33); existing tests in `tests/buffer.rs`.
-- Produces: `BufferThreadCache` is owned per `(numa_pool, thread_index)`; the cache uses **no lock**; the per-pool global freelist (`Mutex<Vec<u32>>`) is the only lock and is touched only on cache refill/flush-overflow (VPP `vlib_buffer_pool_put` behavior at buffer_funcs.h:436-473).
-
-- [ ] **Step 1: Write the failing test**
-
-`crates/hammer-adapter/tests/buffer_cache_lockless.rs`:
-```rust
-//! The hot alloc/free path must not contend on a global lock:
-//! cache hold + batch flush must dominate, freelist lock touched only on refill/overflow.
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::thread;
 
-use hammer_adapter::buffer::BufferPool;
+use hammer_adapter::{
+    BufferPoolArena, DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig,
+};
+use hammer_component_macros::init_function;
+use hammer_core::error::HammerResult;
+use hammer_infra::heap::Heap;
 
-#[test]
-fn many_thread_alloc_free_cluster_around_per_thread_cache() {
-    let pool = Arc::new(BufferPool::with_capacity(numa: 0, slots: 1 << 14, data_size: 1024));
-    let pool2 = pool.clone();
-    let lock_hits = Arc::new(AtomicUsize::new(0));
-    let mut joins = Vec::new();
-    for t in 0..8 {
-        let pool = pool2.clone();
-        let h = lock_hits.clone();
-        joins.push(thread::spawn(move || {
-            for _ in 0..1000 {
-                let idx = pool.alloc_index_on(t, 0usize).unwrap();
-                pool.free_via_cache(t, 0usize, idx);   // returns to THIS thread's cache
-            }
-            h
-        }));
-    }
-    for j in joins { let _ = j.join().unwrap(); }
-    // Assert: lock_hits read via a pool-supplied probe is small relative to 8000 ops,
-    // most allocations crossed no global freelist acquisition (cache self-served).
-    let observed_lock_calls = pool.global_freelist_acquires();
-    assert!(observed_lock_calls < 100, "expected lockless-cache dominance, got {observed_lock_calls} global freelist acquires");
-    assert_eq!(pool.in_use(), 0, "all buffers returned by Drop-equivalent cache free");
+use crate::engine::Engine;
+
+const DEFAULT_BUFFER_SLOT_CAPACITY: usize = 2048;
+const DEFAULT_BUFFER_SLOTS_PER_NUMA: usize = 4096;
+
+#[init_function(name = "memory_init", runs_before = ["start_workers"])]
+pub fn memory_init(engine: &mut Engine) -> HammerResult<()> {
+    let heap = Arc::new(Heap::local());
+    engine.runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig {
+        buffers: DataPlaneBufferConfig {
+            buffer_slot_capacity: DEFAULT_BUFFER_SLOT_CAPACITY,
+            buffer_slots: DEFAULT_BUFFER_SLOTS_PER_NUMA,
+            buffer_arenas: Some(private_single_numa_arena(
+                engine.numa_node,
+                BufferPoolArena::with_capacity_in(
+                    DEFAULT_BUFFER_SLOT_CAPACITY,
+                    DEFAULT_BUFFER_SLOTS_PER_NUMA,
+                    heap,
+                    engine.numa_node,
+                ),
+            )?),
+            thread_index: engine.thread_index,
+            active_numa_node: engine.numa_node,
+            ..DataPlaneBufferConfig::default()
+        },
+    });
+    Ok(())
 }
 ```
-> The `global_freelist_acquires()` counter is instrumentation you attach to `BufferPoolInner` for the test; remove it (or keep behind `#[cfg(test)]`) before commit. The intent is to prove the per-thread cache is the fast path and that cache-to-cache side-routes do not happen on the same worker.
 
-- [ ] **Step 2: Run test to verify it fails**
+Implementation requirements:
 
-Run: `cargo test -p hammer-adapter --test buffer_cache_lockless -- --nocapture` → FAIL.
+- Add `pub mod memory;` to `crates/hammer-runtime/src/lib.rs`.
+- Do not store startup memory state in a global. The runtime owns the resulting arena/heap handles.
+- Do not use `OnceLock`, `Mutex`, `RwLock`, `LazyLock`, or `thread_local!` in this module.
+- Keep `memory_init` ordered before `start_workers` so every worker clone observes an already-materialized runtime.
 
-- [ ] **Step 3: Implement / lock in the lockless path**
+- [ ] **Step 5: Run green and commit**
 
-`alloc_index_on(thread_index, numa)`:
-  1. `cache = &self.threads[thread_index]` (no lock — `thread_index` is unique per worker, no contention).
-  2. If `cache.len() >= 1`, pop the last index. (Lockless fast path.)
-  3. Else, drain cache is impossible — refill from `pool.free` (under `Mutex`) in a batch of `BUFFER_THREAD_CACHE_BATCH = 32` (already that constant at buffer.rs:33). Pop one, keep 31 in cache.
-`free_via_cache(thread_index, numa, idx)`:
-  1. If `cache.len() < BUFFER_THREAD_CACHE_HIGHWATER` (=64, line 37), push `idx` — lockless.
-  2. Else, lock `pool.free` once, spill the overflow to the global freelist in a batch.
-
-Instrumentation: add `acquires: AtomicUsize` on `BufferPoolInner` that is `fetch_add`-ed only at the Mutex-acquire branch (refill/overflow). Wire `global_freelist_acquires()` to read it under `#[cfg(test)]`.
-
-- [ ] **Step 4: Run tests to verify green**
-
-Run: `cargo test -p hammer-adapter --test buffer_cache_lockless` → PASS.
-Run: `cargo test -p hammer-adapter` → all buffer tests PASS.
-
-- [ ] **Step 5: Commit**
+Run:
 
 ```bash
-git add crates/hammer-adapter/src/buffer.rs crates/hammer-adapter/tests/buffer_cache_lockless.rs
-git commit -m "hammer-adapter(Fix): per-thread buffer cache lockless fast path + instrumentation"
+cargo test -p hammer-runtime --test memory_static_init -- --nocapture
+cargo test -p hammer-adapter buffer -- --nocapture
+cargo fmt --all -- --check
+```
+
+Expected: the static source-shape test passes, `memory_init` is registered before `start_workers`, and existing buffer tests still pass.
+
+Commit:
+
+```bash
+git add crates/hammer-runtime/src/memory.rs crates/hammer-runtime/src/lib.rs \
+        crates/hammer-runtime/src/engine.rs crates/hammer-runtime/tests/memory_static_init.rs
+git commit -m "hammer-runtime(Feat): initialize memory from static no-lock tables"
 ```
 
 ---
 
-### Task 7: `PooledBufferFrame` RAII guard — hot path drops without manual free (hammer-adapter)
+### Task 5: Per-NUMA Arena Selection Without Heap Trait Objects
 
 **Files:**
-- Modify: `crates/hammer-adapter/src/buffer.rs:2000-2400` (`PooledBufferFrame` + Drop)
-- Modify: `crates/hammer-adapter/src/buffer.rs:1824,1855,1036` (`free_index`/`free_frame`/`release_pooled_frame` become `pub(crate)`)
-- Test: `crates/hammer-adapter/tests/buffer_frame_guard.rs`
+- Modify: `crates/hammer-adapter/src/buffer.rs`
+- Modify: `crates/hammer-runtime/src/engine.rs`
+- Modify: `crates/hammer-runtime/src/start_workers.rs`
+- Test: `crates/hammer-adapter/tests/buffer_per_numa.rs`
+- Test: `crates/hammer-runtime/tests/engine_numa_runtime.rs`
 
 **Interfaces:**
-- Consumes: Tasks 4–6 pool/region APIs, `BufferThreadCache` (Task 6).
-- Produces:
-  - `pub struct PooledBufferFrame { pool: Rc<RefCell<...>>, frame_index: BufferFrameIndex, owned: bool }` -> impl `Deref<Target = BufferFrame>`, `DerefMut`, `Drop`.
-  - `pub fn alloc_pooled_frame(&self, n_buffers: usize, thread_index: u32, numa: u32) -> PooledBufferFrame` — atomically allocs the frame slot AND `n_buffers` buffer indices, batched through the per-thread cache so the allocations show up together in the frame.
-  - `Drop for PooledBufferFrame`: returns the frame slot to `FramePool` and `free_via_cache(thread_index, numa, idx)`s every buffer index back to the per-thread cache — **no global lock** in the common case.
+- Consumes: `BufferPoolArena::with_capacity_in(..., Arc<Heap>, numa_node)` and `Engine.numa_node`.
+- Produces: worker clones select a NUMA-local `BufferPool` while sharing node/runtime registries.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing adapter NUMA test**
 
-`crates/hammer-adapter/tests/buffer_frame_guard.rs`:
+Create `crates/hammer-adapter/tests/buffer_per_numa.rs`:
+
 ```rust
-//! No manual free: dropping the guard must fully recycle frame + buffers.
-use hammer_adapter::buffer::{DataPlaneBuffers, PooledBufferFrame};
+use std::sync::Arc;
+
+use hammer_adapter::buffer::{BufferPool, BufferPoolArena};
+use hammer_infra::heap::Heap;
 
 #[test]
-fn drop_returns_frame_and_buffers_without_explicit_free() {
-    let dpb = DataPlaneBuffers::test_default(numa: 1, threads: 2, slots: 1024);
-    let in_use_before = dpb.buffers_in_use();
-    {
-        let mut frame = dpb.alloc_pooled_frame(n_buffers: 16, thread_index: 0, numa: 1);
-        assert_eq!(frame.indices().len(), 16);
-        // ... simulate node processing that prepends headers;
-        // do NO free call — Drop handles it.
-        dpb.assert_buffers_accounted(16);
-    } // <-- Drop fires here
-    assert_eq!(dpb.buffers_in_use(), in_use_before, "all buffers must be recycled by guard Drop");
-    assert!(dpb.frame_pool_has_free_slot(), "frame slot must also be reclaimed");
-}
+fn arenas_keep_their_buffer_pool_numa_identity() {
+    let a0 = BufferPoolArena::with_capacity_in(1024, 32, Arc::new(Heap::local()), 0);
+    let a1 = BufferPoolArena::with_capacity_in(1024, 32, Arc::new(Heap::local()), 1);
+    let p0 = BufferPool::with_arena(a0);
+    let p1 = BufferPool::with_arena(a1);
 
-#[test]
-fn explicit_release_pooled_frame_is_not_callable_from_outside() {
-    // compile_fail-style: if `release_pooled_frame` is pub(crate), this test's attempt
-    // to call it must not type-check. Implemented via `trybuild` or just a doctest
-    // listing in the guard's doc comment; here we assert the public API exposes Drop only.
-    let dpb = DataPlaneBuffers::test_default(0, 1, 256);
-    let g = dpb.alloc_pooled_frame(4, 0, 0usize);
-    // There is NO `dpb.release_pooled_frame(g)` callable from this crate.
-    drop(g);
-    assert_eq!(dpb.buffers_in_use(), 0);
+    let i0 = p0.alloc_index().expect("numa0 alloc");
+    let i1 = p1.alloc_index().expect("numa1 alloc");
+
+    assert_eq!(p0.numa_node(), 0);
+    assert_eq!(p1.numa_node(), 1);
+    assert_ne!(p0.pool_id(), p1.pool_id());
+    assert_ne!(p0.buffer_raw_ptr(i0.slot()), p1.buffer_raw_ptr(i1.slot()));
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 2: Write the failing runtime NUMA clone test**
 
-Run: `cargo test -p hammer-adapter --test buffer_frame_guard` → FAIL (no `PooledBufferFrame`, `release_pooled_frame` still pub).
+Create `crates/hammer-runtime/tests/engine_numa_runtime.rs`:
 
-- [ ] **Step 3: Implement `PooledBufferFrame` and privatize the old free surface**
-
-In `crates/hammer-adapter/src/buffer.rs`:
 ```rust
-pub struct PooledBufferFrame {
-    pool: Rc<RefCell<DataPlaneBuffersInner>>,  // keep the Rc the existing code already uses
-    frame_index: BufferFrameIndex,
-    thread_index: u32,
-    numa: u32,
+use hammer_adapter::DataPlaneRuntime;
+use hammer_core::registry::RuntimeRegistry;
+use hammer_runtime::engine::Engine;
+
+#[test]
+fn spawned_engine_uses_worker_numa_runtime_view() {
+    let runtime = DataPlaneRuntime::new(runtime_config(2048, 64, &[0, 1]));
+    let mut main = Engine::new(runtime, RuntimeRegistry::new());
+    main.numa_node = 0;
+
+    let worker = main.spawn_on_numa(3, 1);
+
+    let main_index = main.runtime.alloc_index().expect("main alloc");
+    let worker_index = worker.runtime.alloc_index().expect("worker alloc");
+
+    assert_eq!(main.thread_index, 0);
+    assert_eq!(worker.thread_index, 3);
+    assert_eq!(worker.numa_node, 1);
+    assert_ne!(main_index.pool_id(), worker_index.pool_id());
+    assert_eq!(main.runtime.active_numa_node(), 0);
+    assert_eq!(worker.runtime.active_numa_node(), 1);
 }
-impl Deref for PooledBufferFrame { type Target = BufferFrame; /* return the borrowed frame */ }
-impl DerefMut for PooledBufferFrame { /* mut frame */ }
-impl Drop for PooledBufferFrame {
-    fn drop(&mut self) {
-        let inner = self.pool.borrow();
-        // First return buffers via the per-thread cache (lockless unless overflow).
-        let frame = inner.frames.get(self.frame_index);
-        for idx in frame.indices().iter() {
-            inner.buffers.free_via_cache(self.thread_index, self.numa, *idx);
-        }
-        // Then release the frame slot.
-        inner.frames.release_slot(self.frame_index);
-    }
+```
+
+- [ ] **Step 3: Run tests red**
+
+Run:
+
+```bash
+cargo test -p hammer-adapter --test buffer_per_numa -- --nocapture
+cargo test -p hammer-runtime --test engine_numa_runtime -- --nocapture
+```
+
+Expected before the fix: missing `with_capacity_in`, `numa_node`, config-driven NUMA construction, `spawn_on_numa`, `clone_for_worker`, or `active_numa_node`.
+
+- [ ] **Step 4: Implement NUMA-aware construction**
+
+Add these exact APIs:
+
+```rust
+impl BufferPoolArena {
+    pub fn with_capacity_in(slot_capacity: usize, slots: usize, heap: Arc<Heap>, numa_node: u32) -> Self;
+    pub fn numa_node(&self) -> u32;
+}
+
+impl BufferPool {
+    pub fn numa_node(&self) -> u32;
 }
 
 impl DataPlaneBuffers {
-    pub fn alloc_pooled_frame(&self, n_buffers: usize, thread_index: u32, numa: u32) -> PooledBufferFrame {
-        let mut inner = self.0.borrow_mut();
-        let fi = inner.frames.alloc_slot();
-        let frame = inner.frames.get_mut(fi);
-        frame.indices_mut().clear();
-        for _ in 0..n_buffers {
-            let bi = inner.buffers.alloc_index_on(thread_index, numa).expect("buffer alloc");
-            frame.indices_mut().push(bi);
-        }
-        PooledBufferFrame { pool: self.0.clone(), frame_index: fi, thread_index, numa }
-    }
+    pub fn new(config: DataPlaneBufferConfig) -> Self;
+    pub fn try_buffers(&self) -> CoreResult<&BufferPool>;
+    pub fn clone_for_worker(&self, thread_index: u32, numa_node: u32) -> Self;
+    pub fn active_numa_node(&self) -> u32;
+}
+
+impl DataPlaneRuntime {
+    pub fn new(config: DataPlaneRuntimeConfig) -> Self;
+    pub fn clone_for_worker(&self, thread_index: u32, numa_node: u32) -> Self;
+    pub fn active_numa_node(&self) -> u32;
 }
 ```
-Then change `pub fn release_pooled_frame` (buffer.rs:1036), `pub fn free_index` (buffer.rs:1824), `pub fn free_frame` (buffer.rs:1855), `pub fn free_frame_index` (buffer.rs:1017), `pub fn free_frame` (buffer.rs:977) to `pub(crate)`. (They are still used by `PooledBufferFrame::drop` and the existing `FramePool` internals, and by the bench `buffer_alloc_free.rs`.)
 
-- [ ] **Step 4: Run tests to verify green**
+Implementation requirements:
 
-Run: `cargo test -p hammer-adapter --test buffer_frame_guard` → PASS.
-Run: `cargo test -p hammer-adapter` → all existing buffer suites PASS. Where the existing suite calls `release_pooled_frame` / `free_frame` (these tests live in `tests/buffer.rs` and `buffer.rs:4295-4556`), update them to use `PooledBufferFrame` Drop. Don't delete the assertions; convert the call sites.
+- `DataPlaneBuffers` stores a private fixed NUMA array of `BufferPool` plus `active_numa_node: u32` and `thread_index: u32`.
+- `DataPlaneBuffers::try_buffers()` returns the active pool as `CoreResult<&BufferPool>`.
+- `DataPlaneBufferConfig` is the only public construction surface. Tests and callers must build `DataPlaneRuntimeConfig { buffers: DataPlaneBufferConfig { ... } }`; do not keep capacity-only compatibility constructors.
+- Add `Engine::spawn_on_numa(thread_index, numa_node)` and make worker startup use it so the runtime view is cloned after the worker NUMA node is known.
+- `Engine::spawn(index)` remains a compatibility wrapper that calls `spawn_on_numa(index, self.numa_node)` only for callers that intentionally inherit the current engine's NUMA node.
+- `start_workers.rs` computes each worker's NUMA node from worker placement/configuration (falling back to `numa::current_numa_node().unwrap_or(0)`) before cloning the runtime view. It must not clone a worker runtime with the main engine's NUMA node and patch the field afterward.
+- The per-thread cache remains inside each `BufferPool` handle. Cloning for a worker creates a fresh `BufferPool` handle per active arena so cache vectors remain worker-local while arenas remain shared.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Run green and commit**
+
+Run:
 
 ```bash
-git add crates/hammer-adapter/src/buffer.rs crates/hammer-adapter/tests/buffer_frame_guard.rs
-git commit -m "hammer-adapter(Feat): PooledBufferFrame RAII guard + privatize free surface"
+cargo test -p hammer-adapter --test buffer_per_numa -- --nocapture
+cargo test -p hammer-runtime --test engine_numa_runtime -- --nocapture
+cargo test -p hammer-adapter buffer -- --nocapture
+cargo fmt --all -- --check
+```
+
+Expected: all commands pass.
+
+Commit:
+
+```bash
+git add crates/hammer-adapter/src/buffer.rs crates/hammer-runtime/src/engine.rs \
+        crates/hammer-runtime/src/start_workers.rs \
+        crates/hammer-adapter/tests/buffer_per_numa.rs \
+        crates/hammer-runtime/tests/engine_numa_runtime.rs
+git commit -m "hammer-runtime(Feat): select worker-local NUMA buffer arenas"
 ```
 
 ---
 
-### Task 8: Adapt hammer-runtime + hammer-service hot path to the RAII guard (data plane "no manual free")
+### Task 6: Make Typed `Frame<State>` Owners the Only Hot-Path Lifetime Mechanism
 
 **Files:**
-- Modify: every `release_pooled_frame` / `free_frame` / `free_index` / `free_frame_index` call site in `crates/hammer-runtime/src/` and `crates/hammer-service/src/`
-- Test: `crates/hammer-service/tests/no_manual_free_in_hot_path.rs`
+- Modify: `crates/hammer-adapter/src/buffer.rs`
+- Test: `crates/hammer-adapter/tests/buffer_frame_guard.rs`
 
 **Interfaces:**
-- Consumes: `PooledBufferFrame` (Task 7); per-NUMA selection (Tasks 4–5).
-- Produces: zero `free_*` calls in runtime/service hot path. A new module-private helper `engine.alloc_pooled_frame(n_buffers)` returns `PooledBufferFrame`. Worker node-process bodies end with `frame` going out of scope and dropping.
+- Consumes: `DataPlaneBuffers`, `FramePool`, `BufferPool`, and Hammer's RAII owner naming chosen in this plan.
+- Produces:
+  - `Frame<Next>` owns next-frame contents before `put_next_frame`.
+  - `Frame<Pending>` owns a pending frame while a node is dispatching it.
+  - `Drop` on either owner returns contained buffers and the frame slot to their pools.
+  - Raw frame indices are scheduler-internal; callers do not receive an index they must later clean up.
 
-- [ ] **Step 1: Enumerate and write the failing test**
+- [ ] **Step 1: Write the failing guard test**
 
-Grep first to get exact call-site count:
-```bash
-grep -rn "release_pooled_frame\|free_frame_index\|free_frame\|free_index\b" \
-        crates/hammer-runtime/src crates/hammer-service/src
-```
-The test asserts the count is 0 in those directories (excluding pool-internal/pool-test helpers):
+Create `crates/hammer-adapter/tests/buffer_frame_guard.rs`:
 
-`crates/hammer-service/tests/no_manual_free_in_hot_path.rs`:
 ```rust
-//! Source-level invariant: runtime/service data plane never calls buffer free directly.
+use hammer_adapter::{
+    BufferFrame, DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig,
+    Frame, InternalNode, Next, Node, NodeId, NodeRegistration, NodeResult,
+    NodeRuntimeData, Pending,
+};
+
+fn test_runtime(slot_capacity: usize, slots: usize) -> DataPlaneRuntime {
+    DataPlaneRuntime::new(DataPlaneRuntimeConfig {
+        buffers: DataPlaneBufferConfig {
+            buffer_slot_capacity: slot_capacity,
+            buffer_slots: slots,
+            ..DataPlaneBufferConfig::default()
+        },
+    })
+}
+
 #[test]
-fn no_explicit_free_calls_in_runtime_or_service_dataplane() {
-    let pattern = regex::Regex::new(r"\b(release_pooled_frame|free_frame_index|free_index|free_frame)\b").unwrap();
-    for (path, src) in [
-        ("crates/hammer-runtime/src/engine.rs", include_str!("../src/engine.rs")),
-        // ...add each runtime/service source file the grep enumerated...
-    ] {
-        assert!(
-            !pattern.is_match(src),
-            "found explicit buffer free call in {path} — must use PooledBufferFrame Drop");
+fn dropping_frame_next_returns_buffers_and_frame_slot() {
+    let runtime = test_runtime(256, 128);
+    assert_eq!(runtime.in_use_buffers(), 0);
+    assert_eq!(runtime.frames_in_use(), 0);
+
+    {
+        let drop_node = runtime.nodes().register_internal(DropNode);
+        let mut frame = runtime
+            .buffers()
+            .get_next_frame(drop_node)
+            .expect("frame<next>");
+        for _ in 0..8 {
+            let index = runtime.alloc_index().expect("buffer");
+            frame.push_index(index).expect("push index");
+        }
+        assert_eq!(frame.len(), 8);
+        assert_eq!(runtime.in_use_buffers(), 8);
+        assert_eq!(runtime.frames_in_use(), 1);
+    }
+
+    assert_eq!(runtime.in_use_buffers(), 0);
+    assert_eq!(runtime.frames_in_use(), 0);
+}
+
+#[test]
+fn put_next_frame_transfers_cleanup_to_pending_owner() {
+    let runtime = test_runtime(256, 128);
+    let drop_node = runtime.nodes().register_internal(DropNode);
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(drop_node)
+        .expect("frame<next>");
+    let index = runtime.alloc_index().expect("buffer");
+    frame.push_index(index).expect("push index");
+
+    runtime.put_next_frame(frame).expect("put next frame");
+    assert_eq!(runtime.in_use_buffers(), 1);
+    assert_eq!(runtime.frames_in_use(), 1);
+
+    assert_eq!(runtime.run_ready_nodes().expect("run drop node"), 1);
+    assert_eq!(runtime.in_use_buffers(), 0);
+    assert_eq!(runtime.frames_in_use(), 0);
+}
+
+#[test]
+fn pending_frame_converts_to_next_with_into_trait() {
+    let runtime = test_runtime(256, 128);
+    let sink = runtime.nodes().register_internal(DropNode);
+    let forward = runtime.nodes().register_internal(ForwardPendingNode { target: sink });
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(forward)
+        .expect("frame<next>");
+    let index = runtime.alloc_index().expect("buffer");
+    frame.push_index(index).expect("push index");
+
+    runtime.put_next_frame(frame).expect("put next frame");
+    assert_eq!(runtime.run_ready_nodes().expect("run forwarded frame"), 2);
+    assert_eq!(runtime.in_use_buffers(), 0);
+    assert_eq!(runtime.frames_in_use(), 0);
+}
+```
+
+- [ ] **Step 2: Run test red**
+
+Run: `cargo test -p hammer-adapter --test buffer_frame_guard -- --nocapture`
+
+Expected before the fix: dropping `Frame<Next>` does not return resources to the pools, or `put_next_frame` is missing.
+
+- [ ] **Step 3: Implement RAII ownership**
+
+Make `Next` and `Pending` the concrete state bodies. Do not add marker states, `PhantomData`, `ManuallyDrop`, `FrameStorage`, or `FrameOwner`:
+
+```rust
+pub struct Frame<State> {
+    state: State,
+}
+
+pub struct Next {
+    owner: DataPlaneBuffers,
+    index: FrameIndex,
+    next: NodeId,
+    frame: Option<BufferFrame>,
+}
+
+pub struct Pending {
+    owner: DataPlaneBuffers,
+    index: FrameIndex,
+    frame: Option<BufferFrame>,
+}
+
+impl Frame<Next> {
+    pub fn index(&self) -> FrameIndex {
+        self.state.index
+    }
+}
+
+impl Drop for Next {
+    fn drop(&mut self) {
+        if let Some(frame) = self.frame.take() {
+            self.owner.drop_owned_frame(self.index, frame);
+        }
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        if let Some(frame) = self.frame.take() {
+            self.owner.drop_owned_frame(self.index, frame);
+        }
     }
 }
 ```
-(The full file list is whatever the grep returned; include each via `include_str!`.)
 
-- [ ] **Step 2: Run test to verify it fails**
+Implementation requirements:
 
-Run: `cargo test -p hammer-service --test no_manual_free_in_hot_path` → FAIL with the call-site paths.
+- `Frame<State>` does not implement `Drop`; `Drop` lives on the concrete state bodies `Next` and `Pending`.
+- `DataPlaneError` uses typed variants for ownership faults needed by the private implementation, such as `FrameSlotCheckedOut`. Do not report these with ad hoc strings.
+- Do not add `FrameStateAccess`, `FrameStorage`, `FrameOwner`, or any generic owner-access helper. Implement concrete `impl Frame<Next>` and `impl Frame<Pending>` methods directly.
+- `Frame<Next>` and `Frame<Pending>` may implement `Deref` / `DerefMut` to `BufferFrame` for node ergonomics; do not add separate public `frame()` / `frame_mut()` helpers.
+- Do not add public conversion traits or inherent conversion helpers such as `Frame<Pending>::into_next(next)` or `Frame<Next>::into_pending()`. The only `Next -> Pending` move is inline inside `DataPlaneRuntime::put_next_frame` / empty-frame scheduling.
+- `DataPlaneBuffers::get_next_frame(next)` fills `state: Next { owner: self.clone(), index, next, frame: Some(frame) }`.
+- `DataPlaneRuntime::put_next_frame(frame)` consumes `Frame<Next>`, reads the private `next` field, builds the scheduler-owned `Frame<Pending>` inside `buffer.rs`, schedules it, and returns `CoreResult<()>`. It must not take a separate `NodeId`.
+- There is no public pending-queue extraction API; pending frames are scheduler-owned until normal node dispatch receives them.
+- There is no `Frame<Pending> -> Frame<Next>` transition. During node processing, forwarding to another arc uses a fresh `Frame<Next>` from `get_next_frame(next)` and submits it with `put_next_frame`.
+- Do not implement `TryFrom` / `From` conversions between `Frame<Next>` and `Frame<Pending>` unless a later design explicitly approves a public conversion surface.
+- Remove the public scheduled-frame lifetime escape hatch; dropping the owner or consuming it into the scheduler is the only lifetime path.
+- Do not add public or crate-visible packet/frame `free_*`, `release_*`, `reclaim_*`, or `recycle_*` methods. If `buffer.rs` needs a helper to keep `Drop` readable, use one private `drop_owned_frame` function and call it only from `Drop for Next` / `Drop for Pending`.
 
-- [ ] **Step 3: Migrate call sites**
+- [ ] **Step 4: Run green and commit**
 
-For each call site, replace the (alloc frame / fill buffers / process / free frame or release_pooled_frame) sequence with `let frame = engine.alloc_pooled_frame(n_buffers); ... process ... ; drop(frame);` (often the trailing `drop` is by scope). Use `PooledBufferFrame`. Where the existing code used `free_index` on individual buffers within a partial-failure path (error punts), use `engine.return_buffer(idx)` (a thin `pub` wrapper around the pool-internal `free_via_cache`) — keep this to genuinely exceptional control paths.
-
-- [ ] **Step 4: Run tests to verify green**
-
-Run: `cargo test -p hammer-service --test no_manual_free_in_hot_path` → PASS.
-Run: `cargo test --workspace` → entire workspace green. Run: `cargo clippy --workspace --all-targets` clean.
-
-- [ ] **Step 5: Commit**
+Run:
 
 ```bash
-git add crates/hammer-runtime/src crates/hammer-service/src \
-        crates/hammer-service/tests/no_manual_free_in_hot_path.rs
-git commit -m "hammer-runtime(Docs/Refactor): data plane uses PooledBufferFrame Drop, no manual free"
+cargo test -p hammer-adapter --test buffer_frame_guard -- --nocapture
+cargo test -p hammer-adapter buffer -- --nocapture
+cargo fmt --all -- --check
 ```
+
+Expected: guard tests pass and existing frame-pool tests pass.
+
+Commit:
+
+```bash
+git add crates/hammer-adapter/src/buffer.rs crates/hammer-adapter/tests/buffer_frame_guard.rs
+git commit -m "hammer-adapter(Feat): typed frame states clean up on Drop"
+```
+
+---
+
+### Task 7: Migrate Runtime and Service Hot Paths To Drop-Owned Cleanup
+
+**Files:**
+- Modify: `crates/hammer-adapter/src/node.rs`
+- Modify: `crates/hammer-adapter/src/node/next.rs`
+- Modify: `crates/hammer-adapter/src/handoff.rs`
+- Modify: `crates/hammer-runtime/src/spawn.rs`
+- Modify: `crates/hammer-service/src/**/*.rs`
+- Test: `crates/hammer-service/tests/frame_owner_cleanup_hot_path.rs`
+
+**Interfaces:**
+- Consumes: `Frame<Next>`, `Frame<Pending>`, and `DataPlaneRuntime::put_next_frame`.
+- Produces:
+  - hot-path ownership is frame-scoped; packet/frame cleanup is only reachable through `buffer.rs` owner `Drop` implementations.
+
+- [ ] **Step 1: Write the source-level failing test**
+
+Create `crates/hammer-service/tests/frame_owner_cleanup_hot_path.rs`:
+
+```rust
+use std::fs;
+use std::path::{Path, PathBuf};
+
+fn forbidden_lifetime_tokens() -> &'static [&'static str] {
+    &[
+        ".free(",
+        ".free_index(",
+        ".free_frame(",
+        ".free_frame_index(",
+        "free_index(",
+        "free_frame(",
+        "free_frame_index(",
+        "release_pooled",
+        ".release_",
+        ".reclaim_",
+        ".recycle_",
+        "pub fn drop_owned_frame",
+        "NodeNextFrames",
+        "submit_frame(",
+        "NodeResult::next_frame",
+        "NodeResult::next_current",
+        "pub enum NextFrame",
+        "NextFrame::",
+        "Current(NodeId)",
+        "FrameOwnerConsumed",
+        "FrameStateAccess",
+        "_: NodeId",
+        "_node: NodeId",
+        "_next: NodeId",
+    ]
+}
+
+fn forbidden_public_surface_tokens() -> &'static [&'static str] {
+    &[
+        concat!("pub type Node", "Pending", "ProcessFn"),
+        "pub struct MemoryConfig",
+        "pub struct MemoryMain",
+        "pub struct StaticNumaTable",
+        "pub numa_nodes:",
+    ]
+}
+
+#[test]
+fn runtime_service_and_node_hot_paths_use_frame_owner_cleanup() {
+    let root = workspace_root();
+    let tokens = forbidden_lifetime_tokens();
+    let mut failures = String::new();
+    for dir in [
+        "crates/hammer-adapter/src",
+        "crates/hammer-runtime/src",
+        "crates/hammer-service/src",
+    ] {
+        visit_rust_files(&root.join(dir), &mut |path| {
+            if allowed_pool_internal(path) {
+                return;
+            }
+            let src = fs::read_to_string(path).expect("read source");
+            for token in tokens {
+                if src.contains(*token) {
+                    failures.push_str(&format!("{} contains {}\n", path.display(), token));
+                }
+            }
+        });
+    }
+    for dir in ["crates/hammer-adapter/src", "crates/hammer-runtime/src"] {
+        visit_rust_files(&root.join(dir), &mut |path| {
+            let src = fs::read_to_string(path).expect("read source");
+            for token in forbidden_public_surface_tokens() {
+                if src.contains(*token) {
+                    failures.push_str(&format!("{} exposes {}\n", path.display(), token));
+                }
+            }
+        });
+    }
+    let buffer_src = fs::read_to_string(root.join("crates/hammer-adapter/src/buffer.rs"))
+        .expect("read buffer.rs");
+    for forbidden in [
+        "pub fn drop_owned_frame",
+        "pub(crate) fn drop_owned_frame",
+        "trait FrameStateAccess",
+        "unreachable!()",
+        "pub fn free_",
+        "pub(crate) fn free_",
+        "pub fn release_",
+        "pub(crate) fn release_",
+        "pub fn reclaim_",
+        "pub(crate) fn reclaim_",
+        "pub fn recycle_",
+        "pub(crate) fn recycle_",
+    ] {
+        assert!(
+            !buffer_src.contains(forbidden),
+            "buffer.rs must not expose lifetime helper `{forbidden}`"
+        );
+    }
+    assert!(failures.is_empty(), "{failures}");
+}
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates")
+        .parent()
+        .expect("workspace")
+        .to_path_buf()
+}
+
+fn visit_rust_files(dir: &Path, f: &mut impl FnMut(&Path)) {
+    for entry in fs::read_dir(dir).expect("read dir") {
+        let entry = entry.expect("dir entry");
+        let path = entry.path();
+        if path.is_dir() {
+            visit_rust_files(&path, f);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            f(&path);
+        }
+    }
+}
+
+fn allowed_pool_internal(path: &Path) -> bool {
+    path.ends_with("crates/hammer-adapter/src/buffer.rs")
+}
+```
+
+- [ ] **Step 2: Run test red**
+
+Run: `cargo test -p hammer-service --test frame_owner_cleanup_hot_path -- --nocapture`
+
+Expected before the fix: failures listing current direct lifetime calls in adapter node code, runtime spawn tests/helpers, service session/tun/tcp/net paths.
+
+- [ ] **Step 3: Migrate ownership paths**
+
+Apply these replacement rules:
+
+- Delete every caller-side `free_index(...)`, `free_frame(...)`, `free_frame_index(...)`, `release_pooled_*`, and equivalent lifetime-call branch from adapter/runtime/service hot paths. Do not leave the old call in an `if false`, helper wrapper, compatibility shim, dead branch, or commented code.
+- Delete every caller-side `NodeNextFrames`, `submit_frame(...)`, `NodeResult::next_frame(...)`, `NodeResult::next_current(...)`, `NextFrame::{...}`, and `Current(NodeId)` forwarding carrier. Do not replace these with a renamed result carrier or private staging helper.
+- Delete migrated API compatibility parameters such as `_: NodeId`. If a `Frame<Next>` already owns the selected next node, the receiving function must not also accept a node argument.
+- Delete pending-process callback aliases, public memory manager/table types, and public NUMA table fields.
+- Where code allocates a frame, processes packet indices, and then calls a legacy lifetime helper, keep the `Frame<Next>` in scope and let `Drop` own the path where the frame is not passed to `put_next_frame`.
+- Where code sends work to a next node, call `runtime.put_next_frame(frame)` and do not use the frame afterward.
+- Where code currently handles individual indices during packet-drop paths, make those indices belong to the current `Frame<Next>`; do not call runtime lifetime helpers.
+- Where code allocates a single reply/output buffer, get a `Frame<Next>` for the selected next arc first, push the buffer into it, and either pass the frame to `put_next_frame` or let it drop.
+- Adapter internals may keep one private `drop_owned_frame` helper in `buffer.rs`; no other source file may call it, and it must not be `pub` or `pub(crate)`.
+
+Deletion requirements:
+
+- Caller code that existed only to sequence explicit frees must be removed, not renamed.
+- If a function's only purpose was explicit packet/frame release from non-`buffer.rs` code, delete the function and route ownership through `Frame<State>` instead.
+- If removing a caller makes a local variable, branch, return value, or test assertion obsolete, delete that obsolete code in the same task.
+
+The resulting hot-path shape must look like this:
+
+```rust
+let mut frame = runtime.buffers().get_next_frame(next)?;
+let index = runtime.alloc_index_with_bytes(packet_bytes)?;
+frame.push_index(index)?;
+
+if should_forward {
+    runtime.put_next_frame(frame)?;
+    return Ok(());
+}
+
+// No lifetime call here. The frame drops and owns `index`.
+Ok(())
+```
+
+- [ ] **Step 4: Make owner `Drop` the only public lifetime path**
+
+In `crates/hammer-adapter/src/buffer.rs`, remove every public packet/frame lifetime method matched by `forbidden_lifetime_tokens()` from `DataPlaneBuffers`, `DataPlaneRuntime`, and `BufferPool`. Do not replace them with differently named public helpers.
+
+Replacement rules:
+
+- Internal buffer-pool code may keep one private helper named `drop_owned_frame`.
+- Only `Drop for Next` and `Drop for Pending` may call `drop_owned_frame`.
+- External tests must use scoped owners and `drop(owner)`, not direct lifetime calls.
+- Task 7 is not complete if any caller outside `buffer.rs` still mentions deleted lifetime APIs or result-carrier forwarding APIs, even if the API itself has already been removed.
+
+- [ ] **Step 5: Run green and commit**
+
+Run:
+
+```bash
+cargo test -p hammer-service --test frame_owner_cleanup_hot_path -- --nocapture
+cargo check -p hammer-service
+cargo test -p hammer-adapter --test buffer_frame_guard -- --nocapture
+cargo fmt --all -- --check
+```
+
+Expected: no source-level hot-path lifetime calls outside `buffer.rs`, no result-carrier forwarding APIs remain, focused adapter/service checks pass, and formatting is clean.
+
+Commit:
+
+```bash
+git add crates/hammer-adapter/src crates/hammer-runtime/src crates/hammer-service/src \
+        crates/hammer-service/tests/frame_owner_cleanup_hot_path.rs
+git commit -m "hammer-service(Refactor): use typed frame ownership on hot paths"
+```
+
+---
+
+### Task 8: Final Audit and Focused Verification
+
+**Files:**
+- Modify: `docs/superpowers/plans/2026-07-01-vpp-memory-management.md` if execution notes need checkbox updates only.
+- No production code changes unless a preceding test exposes a missed direct lifetime call.
+
+**Interfaces:**
+- Consumes: Tasks 1-7.
+- Produces: verified focused test/clippy state and source-level invariants.
+
+- [ ] **Step 1: Run source-shape audits**
+
+Run:
+
+```bash
+rg -n "pub trait Heap|HeapLocal|HeapSvm|H: Heap|dyn GlobalAlloc|#\[global_allocator\]|std::alloc::Allocator|pub unsafe fn dealloc|pub fn numa_node|pub fn free|pub\\(crate\\) fn free|pub fn freelist_len|pub fn release_|pub\\(crate\\) fn release_|pub fn reclaim_|pub\\(crate\\) fn reclaim_|pub fn recycle_|pub\\(crate\\) fn recycle_|fn local_alloc|fn local_dealloc|fn local_numa|fn svm_alloc|fn svm_dealloc|fn svm_numa|fn alloc_region|fn page_size|HeapRegistry" crates/hammer-infra/src crates/hammer-adapter/src
+rg -n "ReturnedSpan|returned_spans|returned_nodes|return_span|bump_depth|std::sync::Mutex|std::vec::Vec|hammer_infra::vec::Vec|Vec<|panic!|unreachable!" crates/hammer-infra/src/svm_region.rs crates/hammer-infra/src/heap.rs
+rg -n "NodeNextFrames|NodeResult::error|NodeResult::next_frame|NodeResult::next_current|pub enum NextFrame|NextFrame::|Current\\(NodeId\\)|submit_frame|pub fn append_to_frame|pub fn enqueue_to_next_frames|unsafe impl Send for .*Frame|Frame<Pending>.*TunPendingTx|SegmentAllocOwner|FrameOwnerConsumed|FrameStateAccess|pub type Node.*Pending.*ProcessFn|pub struct MemoryConfig|pub struct MemoryMain|pub struct StaticNumaTable|pub numa_nodes:|_: NodeId|_node: NodeId|_next: NodeId" crates/hammer-adapter/src crates/hammer-runtime/src crates/hammer-service/src crates/hammer-infra/src
+cargo test -p hammer-service --test frame_owner_cleanup_hot_path -- --nocapture
+```
+
+Expected:
+
+- The three `rg` commands print no matches.
+- The test command passes, proving hot-path code reaches packet/frame cleanup only through owner `Drop`.
+
+- [ ] **Step 2: Run focused tests**
+
+Run:
+
+```bash
+cargo test -p hammer-infra --test heap -- --nocapture
+cargo test -p hammer-infra --test pool_heap -- --nocapture
+cargo test -p hammer-infra --test slice_map_heap -- --nocapture
+cargo test -p hammer-adapter --test buffer_inline_layout -- --nocapture
+cargo test -p hammer-adapter --test buffer_per_numa -- --nocapture
+cargo test -p hammer-adapter --test buffer_frame_guard -- --nocapture
+cargo test -p hammer-service --test frame_owner_cleanup_hot_path -- --nocapture
+```
+
+Expected: every command passes.
+
+- [ ] **Step 3: Run crate-level verification**
+
+Run:
+
+```bash
+cargo test -p hammer-infra --test heap -- --nocapture
+cargo test -p hammer-infra --test pool_heap -- --nocapture
+cargo test -p hammer-infra --test slice_map_heap -- --nocapture
+cargo test -p hammer-adapter --test buffer_inline_layout -- --nocapture
+cargo test -p hammer-adapter --test buffer_per_numa -- --nocapture
+cargo test -p hammer-adapter --test buffer_frame_guard -- --nocapture
+cargo test -p hammer-service --test frame_owner_cleanup_hot_path -- --nocapture
+cargo fmt --all -- --check
+cargo clippy -p hammer-infra --all-targets
+cargo clippy -p hammer-adapter --all-targets
+cargo clippy -p hammer-runtime --all-targets
+cargo clippy -p hammer-service --all-targets
+```
+
+Expected: every command passes.
+
+- [ ] **Step 4: Commit audit updates**
+
+If the only changes are checkbox updates in this plan:
+
+```bash
+git add docs/superpowers/plans/2026-07-01-vpp-memory-management.md
+git commit -m "docs(Plan): finalize VPP memory management execution checklist"
+```
+
+If code changed because the audit exposed a missed call site, commit with the affected crate scope instead of `docs`.
 
 ---
 
 ## Self-Review
 
-**1. Spec coverage** (against the 5 resolved design forks + the user's one-line request):
-- (a) Main heap → Task 1 (`Heap` + `HeapLocal`/`HeapSvm` + `HeapRegistry`); consumed in Tasks 2, 3, 4. ✓
-- (b) Buffer memory independent single-region inline → Task 4. ✓
-- (c) No manual free on data plane → Task 7 (RAII guard) drives Task 8 (hot-path migration). ✓
-- (d) Per-NUMA pool split → Task 5. ✓
-- (e) Adapt infra + adapter fully → Tasks 2, 3, 4; plus hot-path migration in Task 8. ✓
-- User's "其他代码适配" → covered by Tasks 5 + 8 wiring runtime/service.
+**Spec coverage:**
 
-**2. Placeholder scan**: No "TBD"/"implement later" remains. Some "the worker decides …" hedge notes exist (Task 2's `Arc<dyn Heap>` storage choice, Task 4's borrow-scope subtlety, Task 8's `return_buffer` wrapper) — these are real design micro-forks that surface during code-contact and that the worker is expected to resolve while keeping tests green; the plan's intent is observable, so they are not placeholders. The example `alloc_index_on`/`data_at`/`with_capacity(numa,...)` signatures are written out as the worker's contract.
+- Concrete heap, no trait-object heap design: Tasks 1-2.
+- Static no-lock initialization: Task 4.
+- VPP-style owner-created SVM data heap region and NUMA buffer-pool lookup: Tasks 1 and 5. Full VPP attach-side SVM allocation (`ssvm_mem_alloc` from an attached process), SVM region/private heap modeling, and per-NUMA heap identity are explicitly out of scope and must not be implied by this plan.
+- Infra containers use the heap and deallocate through the same handle: Task 2.
+- Buffer header + pre-data + payload live in one contiguous slot region: Task 3.
+- Signed `current_data` and 128-byte pre-data headroom: Task 3.
+- Per-worker cache remains the hot allocation/return path: Tasks 3, 5, and 6 preserve `BufferThreadCache`; Task 7 makes external cleanup Drop-owned.
+- Data-plane hot path no longer calls packet/frame lifetime helpers directly: Tasks 6-8.
+- Runtime/service adaptation included: Tasks 5 and 7.
 
-**3. Type consistency**: `Heap`, `HeapLocal`, `HeapSvm`, `HeapRegistry`, `SvmRegion`, `Pool::with_capacity_in`, `RawVec::with_capacity_in`, `Slice::from_elem_in`, `FlatHashTable::with_capacity_in` (Task 1–3) are referenced consistently across Tasks 4–8. The `PooledBufferFrame` (Task 7) is consumed by Task 8 with the same `alloc_pooled_frame(n_buffers, thread_index, numa)` signature. `Buffer::HEADER_AND_HEADROOM`, `DEFAULT_PRE_DATA_SIZE`, `slot_stride`, `buffer_at`, `data_at`, `pre_data_at`, `current_data` signed-offset (Tasks 4) match Task 5/6/7 references. The `with_capacity(numa, slots, data_size)` signature in Tasks 4–6 is the same symbol. `BuffersThreadCache`, `BUFFER_THREAD_CACHE_BATCH=32`, high-water=64 match the existing constants at buffer.rs:33/37 in all tasks.
+**Placeholder scan:**
 
-Gaps found and resolved inline: none beyond the noted worker-resolvable micro-forks.
+- No unresolved placeholder text is present.
+- Every new public API referenced by a later task is listed in the Public API Approval Ledger.
+- Every test command names an exact crate and test target.
 
----
+**Type consistency:**
+
+- Heap-bearing APIs consistently use `Arc<Heap>`.
+- Buffer layout APIs consistently use `slot_capacity`, `slots`, `slot_stride`, `buffer_data_offset`, `buffer_raw_ptr`, and `data_raw_ptr`.
+- Frame ownership consistently uses `Frame<Next>`, `Frame<Pending>`, `Drop`, and `put_next_frame`; public `TryFrom` / `From` frame-state conversions are not part of this surface.
+- Graph dispatch consistently uses Hammer RAII next-frame ownership inspired by VPP get/put semantics: no `NodeNextFrames`, no `NextFrame` result carrier, no `Current(NodeId)`, no `NodeResult::next_frame`, no `submit_frame`, and no compatibility `_ : NodeId` parameters.
 
 ## Execution Handoff
 
 Plan complete and saved to `docs/superpowers/plans/2026-07-01-vpp-memory-management.md`. Two execution options:
 
-**1. Subagent-Driven (recommended)** — I dispatch a fresh subagent per task with two-stage review, fast iteration.
+**1. Subagent-Driven (recommended)** - dispatch a fresh subagent per task, review between tasks, fast iteration.
 
-**2. Inline Execution** — Execute tasks in this session using executing-plans, batch execution with checkpoints.
-
-Which approach?
+**2. Inline Execution** - execute tasks in this session using executing-plans, batch execution with checkpoints.

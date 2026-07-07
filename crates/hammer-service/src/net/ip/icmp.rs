@@ -600,7 +600,7 @@ impl Node for IcmpInputNode {
     #[inline(always)]
     fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
         let snapshot = self.snapshot.load();
-        icmp_input_process_frame(runtime, frame, &snapshot).unwrap_or_else(|_| NodeResult::drop())
+        icmp_input_process_frame(runtime, frame, &snapshot)
     }
 
     #[inline]
@@ -637,7 +637,7 @@ impl Node for IcmpEchoRequestNode {
             Ok(next) => next,
             Err(_) => return NodeResult::drop(),
         };
-        icmp_echo_request_process_frame(runtime, frame, next).unwrap_or_else(|_| NodeResult::drop())
+        icmp_echo_request_process_frame(runtime, frame, next)
     }
 
     #[inline]
@@ -690,7 +690,7 @@ fn icmp_input_process(
         Err(_) => return NodeResult::drop(),
     };
     let snapshot = state.snapshot.load();
-    icmp_input_process_frame(runtime, frame, &snapshot).unwrap_or_else(|_| NodeResult::drop())
+    icmp_input_process_frame(runtime, frame, &snapshot)
 }
 
 fn icmp_echo_request_process(
@@ -702,7 +702,7 @@ fn icmp_echo_request_process(
         Ok(next) => next,
         Err(_) => return NodeResult::drop(),
     };
-    icmp_echo_request_process_frame(runtime, frame, next).unwrap_or_else(|_| NodeResult::drop())
+    icmp_echo_request_process_frame(runtime, frame, next)
 }
 
 #[hammer_component_macros::node_next]
@@ -742,7 +742,6 @@ impl Node for IcmpErrorNode {
             .map(IcmpErrorSourceTableHandle::load);
         let source_table = source_table.as_deref().map(|arc| &**arc);
         icmp_error_process_frame(runtime, frame, next, source_table)
-            .unwrap_or_else(|_| NodeResult::drop())
     }
 
     #[inline]
@@ -827,41 +826,32 @@ fn icmp_error_process(
         .map(IcmpErrorSourceTableHandle::load);
     let source_table = source_table.as_deref().map(|arc| &**arc);
     icmp_error_process_frame(runtime, frame, next, source_table)
-        .unwrap_or_else(|_| NodeResult::drop())
 }
 
 fn icmp_input_process_frame(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
     snapshot: &IcmpInputSnapshot,
-) -> CoreResult<NodeResult> {
-    Ok(hammer_adapter::process_frame!(
-        runtime,
-        frame,
-        |index, _nf| {
-            match next_node_for_index(runtime, index, snapshot) {
-                Ok(node) => node,
-                Err(_) => snapshot.default_next(IpVersion::V4),
-            }
+) -> NodeResult {
+    hammer_adapter::process_frame!(runtime, frame, |index| {
+        match next_node_for_index(runtime, index, snapshot) {
+            Ok(node) => node,
+            Err(_) => snapshot.default_next(IpVersion::V4),
         }
-    ))
+    })
 }
 
 fn icmp_echo_request_process_frame(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
     next: [NodeId; IcmpEchoRequestNext::COUNT],
-) -> CoreResult<NodeResult> {
-    Ok(hammer_adapter::process_frame!(
-        runtime,
-        frame,
-        |index, _nf| {
-            match next_node_for_echo_request_index(runtime, index, next) {
-                Ok(node) => node,
-                Err(_) => NodeNextStorage::next(&next, IcmpEchoRequestNext::Drop),
-            }
+) -> NodeResult {
+    hammer_adapter::process_frame!(runtime, frame, |index| {
+        match next_node_for_echo_request_index(runtime, index, next) {
+            Ok(node) => node,
+            Err(_) => NodeNextStorage::next(&next, IcmpEchoRequestNext::Drop),
         }
-    ))
+    })
 }
 
 fn icmp_error_process_frame(
@@ -869,17 +859,13 @@ fn icmp_error_process_frame(
     frame: &mut BufferFrame,
     next: [NodeId; IcmpErrorNext::COUNT],
     source_table: Option<&IcmpErrorSourceSnapshot>,
-) -> CoreResult<NodeResult> {
-    Ok(hammer_adapter::process_frame!(
-        runtime,
-        frame,
-        |index, _nf| {
-            match next_node_for_icmp_error_index(runtime, index, next, source_table) {
-                Ok(node) => node,
-                Err(_) => NodeNextStorage::next(&next, IcmpErrorNext::Drop),
-            }
+) -> NodeResult {
+    hammer_adapter::process_frame!(runtime, frame, |index| {
+        match next_node_for_icmp_error_index(runtime, index, next, source_table) {
+            Ok(node) => node,
+            Err(_) => NodeNextStorage::next(&next, IcmpErrorNext::Drop),
         }
-    ))
+    })
 }
 
 #[inline(always)]

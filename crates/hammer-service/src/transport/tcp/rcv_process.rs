@@ -1,6 +1,6 @@
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeId, NodeNextFrames, NodeProcessFn,
-    NodeResult, NodeRuntimeData,
+    BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeId, NodeProcessFn, NodeResult,
+    NodeRuntimeData,
 };
 use hammer_core::error::{CoreError, CoreResult};
 
@@ -96,130 +96,16 @@ where
 {
     let tcp_output = next[TcpRcvProcessNext::Output as usize];
     let drop_next = next[TcpRcvProcessNext::Drop as usize];
-    let mut next_frames = NodeNextFrames::default();
-    let indices = frame.pending_indices();
-    let len = indices.len();
-    let mut read = 0usize;
-    while read + 4 <= len {
-        runtime.prefetch_header(indices[read]);
-        runtime.prefetch_header(indices[read + 1]);
-        runtime.prefetch_header(indices[read + 2]);
-        runtime.prefetch_header(indices[read + 3]);
-        if tcp_rcv_process_index(
-            runtime,
-            indices[read],
-            session_queue,
-            tcp_output,
-            &mut next_frames,
-        )
-        .is_err()
+    let width = runtime.preferred_frame_batch_width();
+    let _ = frame.rewrite_indices_batched(width, |index| {
+        if tcp_rcv_process_index(runtime, index, session_queue, tcp_output).is_err()
+            && let Ok(mut drop_frame) = runtime.buffers().get_next_frame(drop_next)
+            && drop_frame.push_index(index).is_ok()
         {
-            hammer_adapter::validate_buffer_enqueue_x1!(
-                runtime,
-                next_frames,
-                drop_next,
-                indices[read]
-            );
+            let _ = runtime.put_next_frame(drop_frame);
         }
-        if tcp_rcv_process_index(
-            runtime,
-            indices[read + 1],
-            session_queue,
-            tcp_output,
-            &mut next_frames,
-        )
-        .is_err()
-        {
-            hammer_adapter::validate_buffer_enqueue_x1!(
-                runtime,
-                next_frames,
-                drop_next,
-                indices[read + 1]
-            );
-        }
-        if tcp_rcv_process_index(
-            runtime,
-            indices[read + 2],
-            session_queue,
-            tcp_output,
-            &mut next_frames,
-        )
-        .is_err()
-        {
-            hammer_adapter::validate_buffer_enqueue_x1!(
-                runtime,
-                next_frames,
-                drop_next,
-                indices[read + 2]
-            );
-        }
-        if tcp_rcv_process_index(
-            runtime,
-            indices[read + 3],
-            session_queue,
-            tcp_output,
-            &mut next_frames,
-        )
-        .is_err()
-        {
-            hammer_adapter::validate_buffer_enqueue_x1!(
-                runtime,
-                next_frames,
-                drop_next,
-                indices[read + 3]
-            );
-        }
-        read += 4;
-    }
-    if read + 2 <= len {
-        runtime.prefetch_header(indices[read]);
-        runtime.prefetch_header(indices[read + 1]);
-        if tcp_rcv_process_index(
-            runtime,
-            indices[read],
-            session_queue,
-            tcp_output,
-            &mut next_frames,
-        )
-        .is_err()
-        {
-            hammer_adapter::validate_buffer_enqueue_x1!(
-                runtime,
-                next_frames,
-                drop_next,
-                indices[read]
-            );
-        }
-        if tcp_rcv_process_index(
-            runtime,
-            indices[read + 1],
-            session_queue,
-            tcp_output,
-            &mut next_frames,
-        )
-        .is_err()
-        {
-            hammer_adapter::validate_buffer_enqueue_x1!(
-                runtime,
-                next_frames,
-                drop_next,
-                indices[read + 1]
-            );
-        }
-        read += 2;
-    }
-    while read < len {
-        let index = indices[read];
-        runtime.prefetch_header(index);
-        if tcp_rcv_process_index(runtime, index, session_queue, tcp_output, &mut next_frames)
-            .is_err()
-        {
-            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, drop_next, index);
-        }
-        read += 1;
-    }
-    frame.clear();
-    next_frames.schedule(runtime);
+        Ok(None)
+    });
     NodeResult::drop()
 }
 
@@ -228,14 +114,11 @@ fn tcp_rcv_process_index<C>(
     index: BufferIndex,
     session_queue: TcpQueue<C>,
     tcp_output: NodeId,
-    next_frames: &mut NodeNextFrames,
 ) -> CoreResult<()>
 where
     C: CongestionController + 'static,
 {
     let packet = tcp_packet(runtime, index)?;
-    let mut input_owner = runtime.alloc_frame()?;
-    input_owner.push_index(index)?;
     let result: CoreResult<_> = {
         let mut queue = session_queue.borrow_mut()?;
         let session_id = read_session_id(runtime, index)?.ok_or_else(|| {
@@ -320,11 +203,11 @@ where
     };
     let control = result?;
     if let Some(segment) = control {
-        let mut owner = runtime.alloc_frame()?;
+        let mut owner = runtime.buffers().get_next_frame(tcp_output)?;
         let allocated = runtime.buffers().alloc_index()?;
         owner.push_index(allocated)?;
         segment.write_to_buffer(runtime.buffers(), allocated)?;
-        next_frames.enqueue_indices(runtime, tcp_output, owner.drain_pending());
+        runtime.put_next_frame(owner)?;
     }
     Ok(())
 }

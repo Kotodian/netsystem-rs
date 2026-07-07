@@ -68,12 +68,12 @@ fn per_thread_cache_constants_match_local_vpp() {
 #[test]
 fn arena_allocates_one_heap_region_and_returns_it_on_drop() {
     let region = SvmRegion::with_size(1 << 20);
-    let heap = Arc::new(Heap::svm(region.clone(), 0));
+    let heap = Arc::new(Heap::svm_data(region.clone()).expect("owner region heap"));
     let region_start = region.base() as usize;
     let region_end = region_start + region.size();
 
     {
-        let arena = BufferPoolArena::with_capacity_in(2048, 64, heap.clone());
+        let arena = BufferPoolArena::with_capacity_in(2048, 64, heap.clone(), 0);
         let pool = BufferPool::with_arena(arena);
         let base = pool.base_ptr() as usize;
         assert_eq!(base % 64, 0);
@@ -88,7 +88,7 @@ fn arena_allocates_one_heap_region_and_returns_it_on_drop() {
     }
 
     {
-        let arena = BufferPoolArena::with_capacity_in(2048, 64, heap);
+        let arena = BufferPoolArena::with_capacity_in(2048, 64, heap, 0);
         let pool = BufferPool::with_arena(arena);
         let base = pool.base_ptr() as usize;
         assert_eq!(base % 64, 0);

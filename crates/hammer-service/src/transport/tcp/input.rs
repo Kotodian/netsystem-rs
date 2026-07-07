@@ -302,80 +302,9 @@ fn tcp_input_process_frame<C>(
 where
     C: CongestionController + 'static,
 {
-    let indices = frame.pending_indices();
-    let mut next_frames = hammer_adapter::NodeNextFrames::default();
-    let mut read = 0usize;
-    while read + 4 <= indices.len() {
-        prefetch_tcp_input(runtime, &indices[read..read + 4], snapshot, session_queue);
-        tcp_input_enqueue_index(
-            runtime,
-            indices[read],
-            snapshot,
-            next,
-            handoff,
-            handoff_worker,
-            session_queue,
-            &mut next_frames,
-        );
-        tcp_input_enqueue_index(
-            runtime,
-            indices[read + 1],
-            snapshot,
-            next,
-            handoff,
-            handoff_worker,
-            session_queue,
-            &mut next_frames,
-        );
-        tcp_input_enqueue_index(
-            runtime,
-            indices[read + 2],
-            snapshot,
-            next,
-            handoff,
-            handoff_worker,
-            session_queue,
-            &mut next_frames,
-        );
-        tcp_input_enqueue_index(
-            runtime,
-            indices[read + 3],
-            snapshot,
-            next,
-            handoff,
-            handoff_worker,
-            session_queue,
-            &mut next_frames,
-        );
-        read += 4;
-    }
-    if read + 2 <= indices.len() {
-        prefetch_tcp_input(runtime, &indices[read..read + 2], snapshot, session_queue);
-        tcp_input_enqueue_index(
-            runtime,
-            indices[read],
-            snapshot,
-            next,
-            handoff,
-            handoff_worker,
-            session_queue,
-            &mut next_frames,
-        );
-        tcp_input_enqueue_index(
-            runtime,
-            indices[read + 1],
-            snapshot,
-            next,
-            handoff,
-            handoff_worker,
-            session_queue,
-            &mut next_frames,
-        );
-        read += 2;
-    }
-    while read < indices.len() {
-        let index = indices[read];
-        prefetch_tcp_input(runtime, &indices[read..read + 1], snapshot, session_queue);
+    let width = runtime.preferred_frame_batch_width();
+    let _ = frame.rewrite_indices_batched(width, |index| {
+        prefetch_tcp_input(runtime, &[index], snapshot, session_queue);
         tcp_input_enqueue_index(
             runtime,
             index,
@@ -384,11 +313,10 @@ where
             handoff,
             handoff_worker,
             session_queue,
-            &mut next_frames,
-        );
-        read += 1;
-    }
-    next_frames.finish(runtime, frame)
+        )?;
+        Ok(None)
+    });
+    NodeResult::drop()
 }
 
 #[inline(always)]
@@ -726,8 +654,7 @@ mod tests {
     struct BlackholeNode;
 
     impl Node for BlackholeNode {
-        fn process(&mut self, _runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
-            frame.drain_pending();
+        fn process(&mut self, _runtime: &DataPlaneRuntime, _: &mut BufferFrame) -> NodeResult {
             NodeResult::drop()
         }
 
@@ -745,9 +672,8 @@ mod tests {
     fn blackhole_process(
         _: &DataPlaneRuntime,
         _: NodeRuntimeData,
-        frame: &mut BufferFrame,
+        _: &mut BufferFrame,
     ) -> NodeResult {
-        frame.drain_pending();
         NodeResult::drop()
     }
 
@@ -808,7 +734,16 @@ mod tests {
 
     #[test]
     fn tcp_input_routes_existing_established_tuple_to_established_node() {
-        let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 4);
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 64,
+                    buffer_slots: 4,
+                    frame_capacity: 4,
+                    frame_slots: 4,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
         let mut worker_state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
         set_tcp_worker_state(&mut worker_state);
         let handle = install_tcp_session(&runtime, DataWorkerId::new(0), 50_044);
@@ -834,7 +769,16 @@ mod tests {
 
     #[test]
     fn tcp_input_existing_session_entry_keeps_owner_for_handoff_decision() {
-        let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 4);
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 64,
+                    buffer_slots: 4,
+                    frame_capacity: 4,
+                    frame_slots: 4,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
         let mut worker_state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
         set_tcp_worker_state(&mut worker_state);
         let handle = install_tcp_session(&runtime, DataWorkerId::new(1), 50_055);
@@ -860,7 +804,16 @@ mod tests {
 
     #[test]
     fn tcp_input_routes_pending_syn_sent_tuple_to_syn_sent_node() {
-        let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 4);
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 64,
+                    buffer_slots: 4,
+                    frame_capacity: 4,
+                    frame_slots: 4,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
         let worker = DataWorkerId::new(0);
         let mut worker_state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
         set_tcp_worker_state(&mut worker_state);
@@ -912,15 +865,23 @@ mod tests {
         const HANDOFF_HANDLE: NodeHandle = NodeHandle::new(44);
 
         let handoff = DataPlaneHandoff::new(2, 8);
-        let runtime = DataPlaneRuntime::with_handoff(
-            DataPlaneRuntime::with_capacities(2048, 16, 8, 8),
+        let runtime = DataPlaneRuntime::attach_handoff_worker(
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 2048,
+                    buffer_slots: 16,
+                    frame_capacity: 8,
+                    frame_slots: 8,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            }),
             DataWorkerId::new(0),
             handoff.worker(DataWorkerId::new(0)),
         );
         let mut worker_state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
         set_tcp_worker_state(&mut worker_state);
         let handle = install_tcp_session(&runtime, DataWorkerId::new(1), 50_066);
-        let mut frame = runtime.alloc_frame().expect("alloc frame");
+        let mut frame = runtime.buffers().get_next_frame(node).expect("alloc frame");
         let packet = tcp_packet(
             Ipv4Addr::new(198, 51, 100, 50_066u16 as u8),
             443,
@@ -941,7 +902,7 @@ mod tests {
             Some((HANDOFF_HANDLE, DataWorkerId::new(0))),
         ));
 
-        runtime.submit_frame(frame, node).expect("submit");
+        runtime.put_next_frame(frame).expect("put next frame");
         assert!(runtime.run_ready_nodes().expect("run input") >= 1);
 
         assert_eq!(
@@ -963,7 +924,16 @@ mod tests {
 
     #[test]
     fn tcp_input_preserves_session_route_in_opaque_for_follow_on_nodes() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 2048,
+                    buffer_slots: 16,
+                    frame_capacity: 8,
+                    frame_slots: 8,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
         let mut worker_state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
         set_tcp_worker_state(&mut worker_state);
         let handle = install_tcp_session(&runtime, DataWorkerId::new(0), 50_088);
@@ -978,15 +948,15 @@ mod tests {
             .alloc_index_with_bytes(&packet)
             .expect("alloc packet");
         stamp_tcp_cursor(&runtime, index, &packet);
-        let mut frame = runtime.alloc_frame().expect("frame");
-        frame.push_index(index).expect("push packet");
         let control = TcpInputControlPlane::new();
         let (_, _, _, _, _, _, nexts) = register_tcp_input_test_nexts!(runtime);
         let node = runtime
             .nodes()
             .register_internal(control.node(nexts, Some(handle), None));
+        let mut frame = runtime.buffers().get_next_frame(node).expect("frame");
+        frame.push_index(index).expect("push packet");
 
-        runtime.submit_frame(frame, node).expect("submit");
+        runtime.put_next_frame(frame).expect("put next frame");
         assert!(runtime.run_ready_nodes().expect("run input") >= 1);
 
         assert_eq!(
@@ -1281,11 +1251,11 @@ fn tcp_input_enqueue_index<C>(
     handoff: Option<NodeHandle>,
     handoff_worker: Option<DataWorkerId>,
     session_queue: Option<TcpQueue<C>>,
-    next_frames: &mut hammer_adapter::NodeNextFrames,
-) where
+) -> CoreResult<()>
+where
     C: CongestionController + 'static,
 {
-    let node = match tcp_input_next_for_index(
+    let node = tcp_input_next_for_index(
         runtime,
         index,
         snapshot,
@@ -1293,13 +1263,13 @@ fn tcp_input_enqueue_index<C>(
         handoff,
         handoff_worker,
         session_queue,
-    ) {
-        Ok(node) => node,
-        Err(_) => return,
-    };
+    )?;
     if let Some(node) = node {
-        hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, node, index)
+        let mut frame = runtime.buffers().get_next_frame(node)?;
+        frame.push_index(index)?;
+        runtime.put_next_frame(frame)?;
     }
+    Ok(())
 }
 
 #[inline(always)]

@@ -246,7 +246,6 @@ impl DataRuntime {
         DataPlaneBarrierHandle {
             wait: Arc::clone(&self.wait_at_barrier),
             workers: Arc::clone(&self.workers_at_barrier),
-            sync_count: Arc::new(AtomicUsize::new(0)),
             n_workers: self.context.inner.workers.len() as u32,
         }
     }
@@ -621,7 +620,6 @@ impl DataRuntimeContext {
 pub struct DataPlaneBarrierHandle {
     wait: Arc<AtomicU32>,
     workers: Arc<AtomicU32>,
-    sync_count: Arc<AtomicUsize>,
     n_workers: u32,
 }
 
@@ -632,7 +630,6 @@ impl DataPlaneBarrierHandle {
         while self.workers.load(Ordering::Acquire) != self.n_workers {
             core::hint::spin_loop();
         }
-        self.sync_count.fetch_add(1, Ordering::Relaxed);
         Ok(DataPlaneBarrierGuard {
             wait: Arc::clone(&self.wait),
             workers: Arc::clone(&self.workers),
@@ -643,11 +640,6 @@ impl DataPlaneBarrierHandle {
     pub fn synchronize<R>(&self, operation: impl FnOnce() -> HammerResult<R>) -> HammerResult<R> {
         let _guard = self.sync()?;
         operation()
-    }
-
-    #[doc(hidden)]
-    pub fn sync_count(&self) -> usize {
-        self.sync_count.load(Ordering::Relaxed)
     }
 }
 
@@ -1387,8 +1379,7 @@ mod tests {
     struct PollingDriverNode;
 
     impl Node for PollingDriverNode {
-        fn process(&mut self, _runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
-            frame.clear();
+        fn process(&mut self, _runtime: &DataPlaneRuntime, _: &mut BufferFrame) -> NodeResult {
             NodeResult::drop()
         }
 
@@ -1406,10 +1397,9 @@ mod tests {
     fn polling_driver_process(
         _runtime: &DataPlaneRuntime,
         _data: NodeRuntimeData,
-        frame: &mut BufferFrame,
+        _: &mut BufferFrame,
     ) -> NodeResult {
         POLLING_DRIVER_CALLS.fetch_add(1, Ordering::SeqCst);
-        frame.clear();
         NodeResult::drop()
     }
 
@@ -1496,7 +1486,10 @@ mod tests {
                         .alloc_index_with_bytes(b"packet")
                         .expect("alloc data buffer");
                     let during = runtime.in_use_buffers();
-                    let mut owner = runtime.alloc_frame().expect("cleanup frame");
+                    let mut owner = runtime
+                        .buffers()
+                        .get_next_frame(hammer_adapter::NodeId::new(0))
+                        .expect("cleanup frame");
                     owner.push_index(index).expect("cleanup push");
                     (before, during)
                 });
@@ -1549,7 +1542,10 @@ mod tests {
                         .expect("buffer")
                         .trace_handle()
                         .is_some();
-                    let mut owner = runtime.alloc_frame().expect("cleanup frame");
+                    let mut owner = runtime
+                        .buffers()
+                        .get_next_frame(hammer_adapter::NodeId::new(0))
+                        .expect("cleanup frame");
                     owner.push_index(index).expect("cleanup push");
                     marked
                 })
@@ -1662,7 +1658,10 @@ mod tests {
                                 .alloc_index_with_bytes(b"packet")
                                 .expect("alloc local data buffer");
                             let during = runtime.in_use_buffers();
-                            let mut owner = runtime.alloc_frame().expect("local owner");
+                            let mut owner = runtime
+                                .buffers()
+                                .get_next_frame(hammer_adapter::NodeId::new(0))
+                                .expect("local owner");
                             owner.push_index(buffer).expect("local push");
                             (before, during, owner)
                         });
@@ -1725,7 +1724,10 @@ mod tests {
                             let index = runtime
                                 .alloc_index_with_bytes(b"packet")
                                 .expect("alloc local data buffer");
-                            let mut owner = runtime.alloc_frame().expect("local owner");
+                            let mut owner = runtime
+                                .buffers()
+                                .get_next_frame(hammer_adapter::NodeId::new(0))
+                                .expect("local owner");
                             owner.push_index(index).expect("local push");
                             owner
                         });
@@ -1815,8 +1817,11 @@ mod tests {
             spawn(async {
                 spawn_local(|| async {
                     let runtime = with_data_plane_buffers(Clone::clone);
-                    let frame =
-                        std::rc::Rc::new(RefCell::new(runtime.alloc_frame().expect("alloc frame")));
+                    let frame = std::rc::Rc::new(RefCell::new(
+                        runtime
+                            .get_next_frame(hammer_adapter::NodeId::new(0))
+                            .expect("alloc frame"),
+                    ));
                     let index = runtime
                         .alloc_index_with_bytes(b"packet")
                         .expect("alloc data buffer");

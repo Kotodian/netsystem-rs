@@ -1,10 +1,24 @@
 use hammer_adapter::DataPlaneRuntime;
+use hammer_adapter::buffer::{DataPlaneBufferConfig, DataPlaneRuntimeConfig};
 use hammer_core::registry::RuntimeRegistry;
 use hammer_runtime::engine::Engine;
 
+fn test_runtime() -> DataPlaneRuntime {
+    let buffers = DataPlaneBufferConfig {
+        buffer_slot_capacity: 2048,
+        buffer_slots: 64,
+        frame_capacity: 256,
+        frame_slots: 64,
+        numa_nodes: &[0, 1],
+        active_numa_node: 0,
+        ..DataPlaneBufferConfig::default()
+    };
+    DataPlaneRuntime::new(DataPlaneRuntimeConfig { buffers })
+}
+
 #[test]
 fn spawned_engine_uses_worker_numa_runtime_view() {
-    let runtime = DataPlaneRuntime::with_numa_buffer_capacity(2048, 64, &[0, 1]);
+    let runtime = test_runtime();
     let mut main = Engine::new(runtime, RuntimeRegistry::new());
     main.numa_node = 0;
 

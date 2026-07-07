@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    Buffer, BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId, NodeNextFrames,
-    NodeProcessFn, NodeRegistration, NodeResult, PacketTrace, TraceFormatter, add_packet_trace,
+    Buffer, BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId, NodeProcessFn,
+    NodeRegistration, NodeResult, PacketTrace, TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_runtime::DataPlaneBarrierHandle;
@@ -209,9 +209,21 @@ mod tests {
 
     #[test]
     fn drop_node_releases_owned_buffers_when_owner_drops_after_processing() {
-        let runtime = DataPlaneRuntime::with_capacities(64, 4, 2, 4);
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 64,
+                    buffer_slots: 4,
+                    frame_capacity: 2,
+                    frame_slots: 4,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
         let drop_node = runtime.nodes().register_internal(DropNode::new());
-        let mut frame = runtime.alloc_frame().expect("alloc frame");
+        let mut frame = runtime
+            .buffers()
+            .get_next_frame(hammer_adapter::NodeId::new(0))
+            .expect("alloc frame");
         let first = runtime
             .alloc_index_with_bytes(b"first")
             .expect("alloc first");
@@ -235,10 +247,22 @@ mod tests {
 
     #[test]
     fn handoff_node_routes_packet_to_metadata_selected_next() {
-        let runtime = DataPlaneRuntime::with_capacities(64, 4, 2, 4);
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 64,
+                    buffer_slots: 4,
+                    frame_capacity: 2,
+                    frame_slots: 4,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
         let sink = runtime.nodes().register_internal(DropNode::new());
         let handoff = runtime.nodes().register_internal(HandoffNode::new());
-        let mut frame = runtime.alloc_frame().expect("alloc frame");
+        let mut frame = runtime
+            .buffers()
+            .get_next_frame(hammer_adapter::NodeId::new(0))
+            .expect("alloc frame");
         let packet = runtime
             .alloc_index_with_bytes(b"handoff")
             .expect("alloc packet");
@@ -248,7 +272,14 @@ mod tests {
             .set_current_config(sink);
         frame.push_index(packet).expect("push packet");
 
-        runtime.submit_frame(frame, handoff).expect("submit");
+        let mut handoff_frame = runtime
+            .buffers()
+            .get_next_frame(handoff)
+            .expect("next frame");
+        handoff_frame.push_index(packet).expect("push packet");
+        runtime
+            .put_next_frame(handoff_frame)
+            .expect("put next frame");
 
         assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
         assert_eq!(runtime.frames_in_use(), 0);
@@ -515,74 +546,9 @@ pub fn next_feature_node_for_index(runtime: &DataPlaneRuntime, index: BufferInde
 
 #[inline(always)]
 pub fn next_feature_frame(runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
-    let mut next_frames = NodeNextFrames::default();
-    let indices = frame.pending_indices();
-    let len = indices.len();
-    let mut read = 0usize;
-    while read + 4 <= len {
-        if read + 4 < len {
-            runtime.prefetch_header(indices[read + 4]);
-        }
-        if read + 5 < len {
-            runtime.prefetch_header(indices[read + 5]);
-        }
-        if read + 6 < len {
-            runtime.prefetch_header(indices[read + 6]);
-        }
-        if read + 7 < len {
-            runtime.prefetch_header(indices[read + 7]);
-        }
-        let index0 = indices[read];
-        let index1 = indices[read + 1];
-        let index2 = indices[read + 2];
-        let index3 = indices[read + 3];
-        hammer_adapter::validate_buffer_enqueue_x4!(
-            runtime,
-            next_frames,
-            next_feature_node_for_index(runtime, index0),
-            index0,
-            next_feature_node_for_index(runtime, index1),
-            index1,
-            next_feature_node_for_index(runtime, index2),
-            index2,
-            next_feature_node_for_index(runtime, index3),
-            index3,
-        );
-        read += 4;
-    }
-    if read + 2 <= len {
-        if read + 2 < len {
-            runtime.prefetch_header(indices[read + 2]);
-        }
-        if read + 3 < len {
-            runtime.prefetch_header(indices[read + 3]);
-        }
-        let index0 = indices[read];
-        let index1 = indices[read + 1];
-        hammer_adapter::validate_buffer_enqueue_x2!(
-            runtime,
-            next_frames,
-            next_feature_node_for_index(runtime, index0),
-            index0,
-            next_feature_node_for_index(runtime, index1),
-            index1,
-        );
-        read += 2;
-    }
-    while read < len {
-        if read + 1 < len {
-            runtime.prefetch_header(indices[read + 1]);
-        }
-        let index0 = indices[read];
-        hammer_adapter::validate_buffer_enqueue_x1!(
-            runtime,
-            next_frames,
-            next_feature_node_for_index(runtime, index0),
-            index0,
-        );
-        read += 1;
-    }
-    next_frames.finish(runtime, frame)
+    hammer_adapter::process_frame!(runtime, frame, |index| {
+        next_feature_node_for_index(runtime, index)
+    })
 }
 
 #[inline(always)]

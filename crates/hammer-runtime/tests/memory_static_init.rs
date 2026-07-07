@@ -1,5 +1,20 @@
-use hammer_adapter::memory::{MemoryConfig, MemoryMain};
+use hammer_adapter::DataPlaneRuntime;
+use hammer_adapter::buffer::{DataPlaneBufferConfig, DataPlaneRuntimeConfig};
 use hammer_runtime::init::{INIT_FUNCTIONS, topological_order};
+
+fn runtime_config(numa_nodes: &'static [u32], active_numa_node: u32) -> DataPlaneRuntimeConfig {
+    DataPlaneRuntimeConfig {
+        buffers: DataPlaneBufferConfig {
+            buffer_slot_capacity: 2048,
+            buffer_slots: 64,
+            frame_capacity: 256,
+            frame_slots: 32,
+            numa_nodes,
+            active_numa_node,
+            ..DataPlaneBufferConfig::default()
+        },
+    }
+}
 
 #[test]
 fn memory_init_sources_are_static_no_lock() {
@@ -18,6 +33,9 @@ fn memory_init_sources_are_static_no_lock() {
             "thread_local!",
             "HashMap",
             "BTreeMap",
+            "pub struct MemoryConfig",
+            "pub struct MemoryMain",
+            "pub struct StaticNumaTable",
         ] {
             assert!(
                 !src.contains(forbidden),
@@ -63,7 +81,10 @@ fn start_workers_uses_static_memory_runtime_path() {
     );
     assert!(
         start_workers.contains("worker_seed")
-            && !start_workers.contains("DataPlaneRuntime::with_buffer_arena_and_frame_capacity"),
+            && !start_workers.contains(concat!(
+                "DataPlaneRuntime::with_",
+                "buffer_arena_and_frame_capacity"
+            )),
         "worker startup must derive worker runtimes from the initialized main runtime view"
     );
 }
@@ -83,15 +104,7 @@ fn task_4_visibility_surface_stays_narrow() {
 
 #[test]
 fn engine_spawn_uses_initialized_runtime_view_for_inherited_numa() {
-    let config = MemoryConfig {
-        numa_nodes: &[0],
-        buffer_slot_capacity: 2048,
-        buffer_slots_per_numa: 64,
-        frame_capacity: 256,
-        frame_slots: 32,
-    };
-    let memory = MemoryMain::from_static_config(config).expect("memory");
-    let main_runtime = memory.runtime(0, 0).expect("main runtime");
+    let main_runtime = DataPlaneRuntime::new(runtime_config(&[0], 0));
     let main =
         hammer_runtime::Engine::new(main_runtime, hammer_core::registry::RuntimeRegistry::new());
 
@@ -112,19 +125,11 @@ fn engine_spawn_uses_initialized_runtime_view_for_inherited_numa() {
 }
 
 #[test]
-fn memory_main_builds_per_numa_runtimes_without_global_lookup() {
-    let config = MemoryConfig {
-        numa_nodes: &[0, 1],
-        buffer_slot_capacity: 2048,
-        buffer_slots_per_numa: 64,
-        frame_capacity: 256,
-        frame_slots: 32,
-    };
-    let memory = MemoryMain::from_static_config(config).expect("memory");
-
-    let main = memory.runtime(0, 0).expect("numa0 runtime");
-    let worker_same_numa = memory.runtime(3, 0).expect("numa0 worker runtime");
-    let worker_other_numa = memory.runtime(4, 1).expect("numa1 worker runtime");
+fn runtime_config_builds_per_numa_worker_views_without_global_lookup() {
+    let runtime = DataPlaneRuntime::new(runtime_config(&[0, 1], 0));
+    let main = runtime.clone_for_worker(0, 0);
+    let worker_same_numa = runtime.clone_for_worker(3, 0);
+    let worker_other_numa = runtime.clone_for_worker(4, 1);
 
     assert_eq!(main.active_numa_node(), 0);
     assert_eq!(worker_same_numa.active_numa_node(), 0);

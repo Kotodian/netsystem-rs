@@ -1,6 +1,6 @@
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeId, NodeNextFrames, NodeProcessFn,
-    NodeResult, NodeRuntimeData,
+    BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeId, NodeProcessFn, NodeResult,
+    NodeRuntimeData,
 };
 
 use hammer_core::error::{CoreError, CoreResult};
@@ -94,80 +94,20 @@ where
 {
     let tcp_output = next[TcpSynSentNext::Output as usize];
     let drop_next = next[TcpSynSentNext::Drop as usize];
-    let mut next_frames = NodeNextFrames::default();
-    let indices = frame.pending_indices();
-    let len = indices.len();
-    let mut read = 0usize;
-    while read + 4 <= len {
-        prefetch_tcp_syn_sent(runtime, &indices[read..read + 4]);
-        tcp_syn_sent_enqueue_index(
-            runtime,
-            indices[read],
-            session_queue,
-            tcp_output,
-            drop_next,
-            &mut next_frames,
-        );
-        tcp_syn_sent_enqueue_index(
-            runtime,
-            indices[read + 1],
-            session_queue,
-            tcp_output,
-            drop_next,
-            &mut next_frames,
-        );
-        tcp_syn_sent_enqueue_index(
-            runtime,
-            indices[read + 2],
-            session_queue,
-            tcp_output,
-            drop_next,
-            &mut next_frames,
-        );
-        tcp_syn_sent_enqueue_index(
-            runtime,
-            indices[read + 3],
-            session_queue,
-            tcp_output,
-            drop_next,
-            &mut next_frames,
-        );
-        read += 4;
-    }
-    if read + 2 <= len {
-        prefetch_tcp_syn_sent(runtime, &indices[read..read + 2]);
-        tcp_syn_sent_enqueue_index(
-            runtime,
-            indices[read],
-            session_queue,
-            tcp_output,
-            drop_next,
-            &mut next_frames,
-        );
-        tcp_syn_sent_enqueue_index(
-            runtime,
-            indices[read + 1],
-            session_queue,
-            tcp_output,
-            drop_next,
-            &mut next_frames,
-        );
-        read += 2;
-    }
-    while read < len {
-        let index = indices[read];
-        prefetch_tcp_syn_sent(runtime, &indices[read..read + 1]);
-        tcp_syn_sent_enqueue_index(
-            runtime,
-            index,
-            session_queue,
-            tcp_output,
-            drop_next,
-            &mut next_frames,
-        );
-        read += 1;
-    }
-    next_frames.finish(runtime, frame)
+    let width = runtime.preferred_frame_batch_width();
+    let _ = frame.retain_indices_batched_with_prefetch(
+        width,
+        |index| prefetch_tcp_syn_sent(runtime, &[index]),
+        |index| {
+            tcp_syn_sent_enqueue_index(runtime, index, session_queue, tcp_output).or_else(|_| {
+                let mut frame = runtime.buffers().get_next_frame(drop_next)?;
+                frame.push_index(index)?;
+                runtime.put_next_frame(frame)?;
+                Ok(false)
+            })
+        },
+    );
+    NodeResult::drop()
 }
 
 fn tcp_syn_sent_index<C>(
@@ -175,15 +115,13 @@ fn tcp_syn_sent_index<C>(
     index: BufferIndex,
     session_queue: TcpQueue<C>,
     tcp_output: NodeId,
-    next_frames: &mut NodeNextFrames,
-) -> CoreResult<()>
+) -> CoreResult<bool>
 where
     C: CongestionController + 'static,
 {
     let packet = tcp_packet(runtime, index)?;
-    let mut input_owner = runtime.alloc_frame()?;
-    input_owner.push_index(index)?;
     let mut tx_frame = None;
+    let mut keep_current = true;
     let result = {
         let mut queue = session_queue.borrow_mut()?;
         let session_id = read_session_id(runtime, index)?.ok_or_else(|| {
@@ -234,13 +172,14 @@ where
             if enqueue.delivered_len != 0 {
                 queue.mark_ready(session_id);
             }
+            keep_current = false;
         };
         publish_tcp_connection(&mut queue, session_id)?;
         if established {
             queue.app().connected(session_id)?;
         }
         if let Some(segment) = control {
-            let mut owner = runtime.alloc_frame()?;
+            let mut owner = runtime.buffers().get_next_frame(tcp_output)?;
             let allocated = runtime.buffers().alloc_index()?;
             owner.push_index(allocated)?;
             segment.write_to_buffer(runtime.buffers(), allocated)?;
@@ -251,10 +190,10 @@ where
     if let Err(error) = result {
         return Err(error);
     }
-    if let Some(mut tx_frame) = tx_frame.take() {
-        next_frames.enqueue_indices(runtime, tcp_output, tx_frame.drain_pending());
+    if let Some(tx_frame) = tx_frame.take() {
+        runtime.put_next_frame(tx_frame)?;
     }
-    Ok(())
+    Ok(keep_current)
 }
 
 #[inline(always)]
@@ -272,13 +211,13 @@ fn tcp_syn_sent_enqueue_index<C>(
     index: BufferIndex,
     session_queue: TcpQueue<C>,
     tcp_output: NodeId,
-    drop_next: NodeId,
-    next_frames: &mut NodeNextFrames,
-) where
+) -> CoreResult<bool>
+where
     C: CongestionController + 'static,
 {
-    if tcp_syn_sent_index(runtime, index, session_queue, tcp_output, next_frames).is_err() {
-        hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, drop_next, index);
+    match tcp_syn_sent_index(runtime, index, session_queue, tcp_output) {
+        Ok(keep_current) => Ok(keep_current),
+        Err(error) => Err(error),
     }
 }
 
@@ -419,11 +358,11 @@ mod tests {
     }
 
     fn send_packet(runtime: &DataPlaneRuntime, node: NodeId, packet: std::vec::Vec<u8>) {
-        let mut frame = runtime.alloc_frame().expect("frame");
+        let mut frame = runtime.buffers().get_next_frame(node).expect("frame");
         let buffer = runtime.alloc_index_with_bytes(&packet).expect("packet");
         stamp_tcp_cursor(runtime, buffer, &packet);
         frame.push_index(buffer).expect("push packet");
-        runtime.submit_frame(frame, node).expect("submit");
+        runtime.put_next_frame(frame).expect("put next frame");
     }
 
     fn stamp_tcp_cursor(

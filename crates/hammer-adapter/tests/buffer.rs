@@ -7,79 +7,116 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use hammer_adapter::{
     BufferFrame, BufferFramePairBatch, BufferFrameQuadBatch, BufferIndex, BufferPacketCursor,
-    BufferPool, BufferPoolArena, BufferRefMut, DataPlaneBuffers, DataPlaneHandoff,
-    DataPlaneInstructionSet, DataPlaneRuntime, DataWorkerId, FrameBatchWidth,
+    BufferPool, BufferPoolArena, BufferRefMut, DataPlaneBufferConfig, DataPlaneBuffers,
+    DataPlaneHandoff, DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig,
+    DataWorkerId, Frame, FrameBatchWidth, Next, NodeId, Pending,
 };
 use hammer_core::error::CoreResult;
 use hammer_infra::vec::Vec;
 
 trait CleanupOwner {
     fn drop_index_owned(&self, index: BufferIndex);
-    fn drop_frame_owned(&self, frame: &mut BufferFrame);
 }
 
-fn pool_cleanup_buffers(pool: &BufferPool, frame_capacity: usize) -> DataPlaneBuffers {
-    DataPlaneBuffers::with_buffer_arena_and_frame_capacity(
-        pool.arena(),
-        frame_capacity.max(1),
-        1,
+fn test_buffers(buffer_slot_capacity: usize, buffer_slots: usize) -> DataPlaneBuffers {
+    DataPlaneBuffers::new(DataPlaneBufferConfig {
+        buffer_slot_capacity,
+        buffer_slots,
+        ..DataPlaneBufferConfig::default()
+    })
+}
+
+fn test_runtime(buffer_slot_capacity: usize, buffer_slots: usize) -> DataPlaneRuntime {
+    DataPlaneRuntime::new(DataPlaneRuntimeConfig {
+        buffers: DataPlaneBufferConfig {
+            buffer_slot_capacity,
+            buffer_slots,
+            ..DataPlaneBufferConfig::default()
+        },
+    })
+}
+
+fn test_runtime_configured(
+    buffer_slot_capacity: usize,
+    buffer_slots: usize,
+    frame_capacity: usize,
+    frame_slots: usize,
+) -> DataPlaneRuntime {
+    test_runtime_configured_instruction_set(
+        buffer_slot_capacity,
+        buffer_slots,
+        frame_capacity,
+        frame_slots,
         DataPlaneInstructionSet::native(),
+    )
+}
+
+fn test_runtime_configured_instruction_set(
+    buffer_slot_capacity: usize,
+    buffer_slots: usize,
+    frame_capacity: usize,
+    frame_slots: usize,
+    instruction_set: DataPlaneInstructionSet,
+) -> DataPlaneRuntime {
+    let config = DataPlaneRuntimeConfig {
+        buffers: DataPlaneBufferConfig {
+            buffer_slot_capacity,
+            buffer_slots,
+            frame_capacity,
+            frame_slots,
+            instruction_set,
+            ..DataPlaneBufferConfig::default()
+        },
+    };
+    DataPlaneRuntime::new(config)
+}
+
+fn pool_cleanup_runtime(pool: &BufferPool, frame_capacity: usize) -> DataPlaneRuntime {
+    let handoff = DataPlaneHandoff::new_shared_buffer_arena(1, frame_capacity.max(1), pool.arena());
+    DataPlaneRuntime::attach_handoff_worker(
+        test_runtime_configured_instruction_set(
+            1,
+            1,
+            frame_capacity.max(1),
+            1,
+            DataPlaneInstructionSet::native(),
+        ),
+        DataWorkerId::new(0),
+        handoff.worker(DataWorkerId::new(0)),
     )
 }
 
 impl CleanupOwner for BufferPool {
     fn drop_index_owned(&self, index: BufferIndex) {
-        let buffers = pool_cleanup_buffers(self, 1);
-        let mut frame = buffers.alloc_frame().expect("cleanup frame");
+        let runtime = pool_cleanup_runtime(self, 1);
+        let mut frame = runtime
+            .buffers()
+            .get_next_frame(NodeId::new(0))
+            .expect("cleanup frame");
         frame.push_index(index).expect("cleanup push index");
-    }
-
-    fn drop_frame_owned(&self, frame: &mut BufferFrame) {
-        let buffers = pool_cleanup_buffers(self, frame.capacity());
-        let mut cleanup = buffers.alloc_frame().expect("cleanup frame");
-        cleanup
-            .push_indices(frame.drain_pending())
-            .expect("cleanup push indices");
     }
 }
 
 impl CleanupOwner for DataPlaneBuffers {
     fn drop_index_owned(&self, index: BufferIndex) {
-        let mut frame = self.alloc_frame().expect("cleanup frame");
+        let mut frame = self.get_next_frame(NodeId::new(0)).expect("cleanup frame");
         frame.push_index(index).expect("cleanup push index");
-    }
-
-    fn drop_frame_owned(&self, frame: &mut BufferFrame) {
-        let mut cleanup = self.alloc_frame().expect("cleanup frame");
-        cleanup
-            .push_indices(frame.drain_pending())
-            .expect("cleanup push indices");
     }
 }
 
 impl CleanupOwner for DataPlaneRuntime {
     fn drop_index_owned(&self, index: BufferIndex) {
-        let mut frame = self.alloc_frame().expect("cleanup frame");
+        let mut frame = self
+            .buffers()
+            .get_next_frame(NodeId::new(0))
+            .expect("cleanup frame");
         frame.push_index(index).expect("cleanup push index");
-    }
-
-    fn drop_frame_owned(&self, frame: &mut BufferFrame) {
-        let mut cleanup = self.alloc_frame().expect("cleanup frame");
-        cleanup
-            .push_indices(frame.drain_pending())
-            .expect("cleanup push indices");
     }
 }
 
 macro_rules! drop_owned_index {
     ($owner:expr, $index:expr) => {{
         ($owner).drop_index_owned($index);
-    }};
-}
-
-macro_rules! drop_owned_frame {
-    ($owner:expr, $frame:expr) => {{
-        ($owner).drop_frame_owned(&mut $frame);
     }};
 }
 
@@ -122,9 +159,9 @@ fn buffer_header_keeps_hot_metadata_in_first_cacheline() {
 }
 
 #[test]
-fn buffer_pool_free_index_releases_slot_for_reuse_with_new_generation() {
-    let buffers = DataPlaneBuffers::with_buffer_capacity(128, 1);
-    let pool = buffers.buffers();
+fn buffer_pool_drop_index_releases_slot_for_reuse_with_new_generation() {
+    let buffers = test_buffers(128, 1);
+    let pool = buffers.try_buffers().expect("active buffer pool");
     let first_index = buffers
         .alloc_index_with_bytes(b"hello")
         .expect("alloc first buffer");
@@ -133,7 +170,9 @@ fn buffer_pool_free_index_releases_slot_for_reuse_with_new_generation() {
         pool.get(first_index).expect("first current").current(),
         b"hello"
     );
-    let mut first_frame = buffers.alloc_frame().expect("first cleanup frame");
+    let mut first_frame = buffers
+        .get_next_frame(NodeId::new(0))
+        .expect("first cleanup frame");
     first_frame
         .push_index(first_index)
         .expect("push first cleanup index");
@@ -152,7 +191,9 @@ fn buffer_pool_free_index_releases_slot_for_reuse_with_new_generation() {
         pool.get(second_index).expect("second current").current(),
         b"world"
     );
-    let mut second_frame = buffers.alloc_frame().expect("second cleanup frame");
+    let mut second_frame = buffers
+        .get_next_frame(NodeId::new(0))
+        .expect("second cleanup frame");
     second_frame
         .push_index(second_index)
         .expect("push second cleanup index");
@@ -161,7 +202,8 @@ fn buffer_pool_free_index_releases_slot_for_reuse_with_new_generation() {
 
 #[test]
 fn buffer_cursor_headroom_and_append_manage_current_bytes() {
-    let pool = BufferPool::with_capacity(16, 2);
+    let buffers = test_buffers(16, 2);
+    let pool = buffers.try_buffers().expect("active buffer pool");
     let buffer = pool
         .alloc_index_with_bytes(b"payload")
         .expect("alloc buffer");
@@ -194,7 +236,8 @@ fn buffer_cursor_headroom_and_append_manage_current_bytes() {
 
 #[test]
 fn empty_buffer_allocation_reserves_default_packet_headroom() {
-    let pool = BufferPool::with_capacity(512, 1);
+    let buffers = test_buffers(512, 1);
+    let pool = buffers.try_buffers().expect("active buffer pool");
     let buffer = pool.alloc_index().expect("alloc empty buffer");
 
     pool.append(buffer, b"payload").expect("append payload");
@@ -209,7 +252,7 @@ fn empty_buffer_allocation_reserves_default_packet_headroom() {
 
 #[test]
 fn runtime_get_buffer_mut_processes_multiple_buffers_sequentially() {
-    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_buffer_capacity(32, 2);
+    let runtime: DataPlaneRuntime = test_runtime(32, 2);
     let first = runtime
         .alloc_index_with_bytes(b"alpha")
         .expect("alloc first buffer");
@@ -245,7 +288,7 @@ fn runtime_get_buffer_mut_processes_multiple_buffers_sequentially() {
 
 #[test]
 fn runtime_get_buffer_exposes_direct_buffer_borrows() {
-    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_buffer_capacity(32, 1);
+    let runtime: DataPlaneRuntime = test_runtime(32, 1);
     let index = runtime
         .alloc_index_with_bytes(b"alpha")
         .expect("alloc buffer");
@@ -285,9 +328,10 @@ fn public_mut_buffer_accessors_keep_buffer_refmut_shape() {
         runtime.get_buffer_mut(index)
     }
 
-    let pool = BufferPool::with_capacity(32, 1);
+    let buffers = test_buffers(32, 1);
+    let pool = buffers.try_buffers().expect("active buffer pool");
     let index = pool.alloc_index().expect("alloc buffer");
-    let runtime = DataPlaneRuntime::with_buffer_capacity(32, 1);
+    let runtime = test_runtime(32, 1);
     let runtime_index = runtime.alloc_index().expect("alloc runtime buffer");
 
     let _ = assert_pool_shape(&pool, index).expect("pool mut borrow");
@@ -296,7 +340,8 @@ fn public_mut_buffer_accessors_keep_buffer_refmut_shape() {
 
 #[test]
 fn public_refmut_tail_api_respects_inline_slot_capacity() {
-    let pool = BufferPool::with_capacity(16, 1);
+    let buffers = test_buffers(16, 1);
+    let pool = buffers.try_buffers().expect("active buffer pool");
     let index = pool
         .alloc_index_with_bytes(b"abcd")
         .expect("alloc buffer with bytes");
@@ -316,7 +361,8 @@ fn public_refmut_tail_api_respects_inline_slot_capacity() {
 
 #[test]
 fn append_after_truncating_pre_data_current_window_keeps_bytes_coherent() {
-    let pool = BufferPool::with_capacity(16, 2);
+    let buffers = test_buffers(16, 2);
+    let pool = buffers.try_buffers().expect("active buffer pool");
     let index = pool.alloc_index().expect("alloc empty buffer");
 
     pool.prepend(index, &[0xAA; 32])
@@ -340,7 +386,8 @@ fn append_after_truncating_pre_data_current_window_keeps_bytes_coherent() {
 
 #[test]
 fn buffer_header_and_packet_data_start_cacheline_aligned() {
-    let pool = BufferPool::with_capacity(128, 1);
+    let buffers = test_buffers(128, 1);
+    let pool = buffers.try_buffers().expect("active buffer pool");
     let buffer = pool
         .alloc_index_with_bytes(b"packet")
         .expect("alloc buffer");
@@ -356,7 +403,7 @@ fn buffer_header_and_packet_data_start_cacheline_aligned() {
 
 #[test]
 fn buffer_exposes_vpp_style_current_pointer_and_advance() {
-    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(128, 1, 1, 1);
+    let runtime: DataPlaneRuntime = test_runtime_configured(128, 1, 1, 1);
     let buffer = runtime
         .alloc_index_with_bytes(b"network-transport")
         .expect("alloc buffer");
@@ -407,7 +454,8 @@ fn buffer_packet_cursor_records_header_offsets() {
 
 #[test]
 fn append_beyond_one_slot_creates_and_frees_chain() {
-    let pool = BufferPool::with_capacity(8, 4);
+    let buffers = test_buffers(8, 4);
+    let pool = buffers.try_buffers().expect("active buffer pool");
     let buffer = pool
         .alloc_index_with_bytes(b"123456")
         .expect("alloc buffer");
@@ -427,7 +475,8 @@ fn append_beyond_one_slot_creates_and_frees_chain() {
 
 #[test]
 fn alloc_with_bytes_beyond_one_slot_creates_chain() {
-    let pool = BufferPool::with_capacity(4, 4);
+    let buffers = test_buffers(4, 4);
+    let pool = buffers.try_buffers().expect("active buffer pool");
     let buffer = pool
         .alloc_index_with_bytes(b"abcdefghijkl")
         .expect("alloc chained buffer");
@@ -443,7 +492,8 @@ fn alloc_with_bytes_beyond_one_slot_creates_chain() {
 
 #[test]
 fn buffer_chain_buffer_links_existing_chain_without_copying_payload() {
-    let pool = BufferPool::with_capacity(8, 8);
+    let buffers = test_buffers(8, 8);
+    let pool = buffers.try_buffers().expect("active buffer pool");
     let head = pool.alloc_index_with_bytes(b"head").expect("alloc head");
     let tail = pool
         .alloc_index_with_bytes(b"taildata")
@@ -469,7 +519,8 @@ fn buffer_chain_buffer_links_existing_chain_without_copying_payload() {
 
 #[test]
 fn attach_clone_keeps_tail_alive_until_both_chains_are_freed() {
-    let pool = BufferPool::with_capacity(8, 8);
+    let buffers = test_buffers(8, 8);
+    let pool = buffers.try_buffers().expect("active buffer pool");
     let session_tail = pool
         .alloc_index_with_bytes(b"taildata")
         .expect("alloc session tail");
@@ -510,7 +561,8 @@ fn attach_clone_keeps_tail_alive_until_both_chains_are_freed() {
 
 #[test]
 fn freeing_head_with_attached_clone_does_not_free_session_tail() {
-    let pool = BufferPool::with_capacity(8, 8);
+    let buffers = test_buffers(8, 8);
+    let pool = buffers.try_buffers().expect("active buffer pool");
     let session_tail = pool
         .alloc_index_with_bytes(b"payload")
         .expect("alloc session tail");
@@ -534,7 +586,8 @@ fn freeing_head_with_attached_clone_does_not_free_session_tail() {
 
 #[test]
 fn freeing_original_tail_after_output_head_returns_storage_once() {
-    let pool = BufferPool::with_capacity(8, 8);
+    let buffers = test_buffers(8, 8);
+    let pool = buffers.try_buffers().expect("active buffer pool");
     let session_tail = pool
         .alloc_index_with_bytes(b"payload")
         .expect("alloc session tail");
@@ -566,7 +619,7 @@ fn freeing_original_tail_after_output_head_returns_storage_once() {
 
 #[test]
 fn freeing_cloned_head_keeps_shared_tail_trace_mark_live() {
-    let buffers = DataPlaneBuffers::with_buffer_capacity(8, 8);
+    let buffers = test_buffers(8, 8);
     let session_tail = buffers
         .alloc_index_with_bytes(b"payload")
         .expect("alloc session tail");
@@ -597,7 +650,8 @@ fn freeing_cloned_head_keeps_shared_tail_trace_mark_live() {
 
 #[test]
 fn shared_tail_rejects_payload_mutation_but_allows_independent_header_views() {
-    let pool = BufferPool::with_capacity(8, 8);
+    let buffers = test_buffers(8, 8);
+    let pool = buffers.try_buffers().expect("active buffer pool");
     let session_tail = pool
         .alloc_index_with_bytes(b"payload")
         .expect("alloc session tail");
@@ -629,7 +683,8 @@ fn shared_tail_rejects_payload_mutation_but_allows_independent_header_views() {
 
 #[test]
 fn shared_tail_rejects_chain_link_mutation_but_allows_clone_head_truncate() {
-    let pool = BufferPool::with_capacity(4, 8);
+    let buffers = test_buffers(4, 8);
+    let pool = buffers.try_buffers().expect("active buffer pool");
     let session_tail = pool
         .alloc_index_with_bytes(b"abcdefgh")
         .expect("alloc session tail");
@@ -665,7 +720,8 @@ fn shared_tail_rejects_chain_link_mutation_but_allows_clone_head_truncate() {
 
 #[test]
 fn buffer_advance_can_discard_prefix_across_chain_segments() {
-    let pool = BufferPool::with_capacity(4, 8);
+    let buffers = test_buffers(4, 8);
+    let pool = buffers.try_buffers().expect("active buffer pool");
     let packet = pool
         .alloc_index_with_bytes(b"abcdefghijkl")
         .expect("alloc chained buffer");
@@ -688,7 +744,8 @@ fn buffer_advance_can_discard_prefix_across_chain_segments() {
 
 #[test]
 fn buffer_pool_reports_single_segment_and_chained_packets() {
-    let pool = BufferPool::with_capacity(4, 8);
+    let buffers = test_buffers(4, 8);
+    let pool = buffers.try_buffers().expect("active buffer pool");
     let single = pool
         .alloc_index_with_bytes(b"abc")
         .expect("alloc single buffer");
@@ -715,7 +772,8 @@ fn buffer_pool_reports_single_segment_and_chained_packets() {
 
 #[test]
 fn buffer_pool_prefetch_read_is_best_effort_for_live_and_stale_indices() {
-    let pool = BufferPool::with_capacity(4, 4);
+    let buffers = test_buffers(4, 4);
+    let pool = buffers.try_buffers().expect("active buffer pool");
     let buffer = pool
         .alloc_index_with_bytes(b"abcdefgh")
         .expect("alloc chained buffer");
@@ -753,13 +811,8 @@ fn instruction_set_selects_preferred_frame_batch_width() {
 
 #[test]
 fn data_plane_runtime_can_use_explicit_instruction_set() {
-    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities_and_instruction_set(
-        8,
-        4,
-        2,
-        1,
-        DataPlaneInstructionSet::Avx2,
-    );
+    let runtime: DataPlaneRuntime =
+        test_runtime_configured_instruction_set(8, 4, 2, 1, DataPlaneInstructionSet::Avx2);
 
     assert_eq!(runtime.instruction_set(), DataPlaneInstructionSet::Avx2);
     assert_eq!(runtime.preferred_frame_batch_width(), FrameBatchWidth::Quad);
@@ -767,7 +820,7 @@ fn data_plane_runtime_can_use_explicit_instruction_set() {
 
 #[test]
 fn data_plane_runtime_defaults_to_native_instruction_set() {
-    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
+    let runtime: DataPlaneRuntime = test_runtime_configured(8, 4, 2, 1);
 
     assert_eq!(runtime.instruction_set(), DataPlaneInstructionSet::native());
     assert_eq!(
@@ -807,20 +860,16 @@ fn buffer_pool_rejects_index_from_another_runtime() {
 #[test]
 fn handoff_workers_share_buffer_arena_and_keep_per_worker_free_cache() {
     let arena = BufferPoolArena::with_capacity(8, 4);
-    let handoff = DataPlaneHandoff::with_buffer_arena(2, 4, arena);
-    let first: DataPlaneRuntime = DataPlaneRuntime::with_handoff_capacities(
+    let handoff = DataPlaneHandoff::new_shared_buffer_arena(2, 4, arena);
+    let first: DataPlaneRuntime = DataPlaneRuntime::attach_handoff_worker(
+        test_runtime_configured_instruction_set(8, 4, 2, 2, DataPlaneInstructionSet::Scalar),
         DataWorkerId::new(0),
         handoff.worker(DataWorkerId::new(0)),
-        2,
-        2,
-        DataPlaneInstructionSet::Scalar,
     );
-    let second: DataPlaneRuntime = DataPlaneRuntime::with_handoff_capacities(
+    let second: DataPlaneRuntime = DataPlaneRuntime::attach_handoff_worker(
+        test_runtime_configured_instruction_set(8, 4, 2, 2, DataPlaneInstructionSet::Scalar),
         DataWorkerId::new(1),
         handoff.worker(DataWorkerId::new(1)),
-        2,
-        2,
-        DataPlaneInstructionSet::Scalar,
     );
 
     let first_buffer = first
@@ -860,13 +909,13 @@ fn handoff_workers_share_buffer_arena_and_keep_per_worker_free_cache() {
 #[test]
 fn queue_only_handoff_constructor_keeps_runtime_buffer_arenas_separate() {
     let handoff = DataPlaneHandoff::new(2, 4);
-    let first: DataPlaneRuntime = DataPlaneRuntime::with_handoff(
-        DataPlaneRuntime::with_capacities(8, 4, 2, 2),
+    let first: DataPlaneRuntime = DataPlaneRuntime::attach_handoff_worker(
+        test_runtime_configured(8, 4, 2, 2),
         DataWorkerId::new(0),
         handoff.worker(DataWorkerId::new(0)),
     );
-    let second: DataPlaneRuntime = DataPlaneRuntime::with_handoff(
-        DataPlaneRuntime::with_capacities(8, 4, 2, 2),
+    let second: DataPlaneRuntime = DataPlaneRuntime::attach_handoff_worker(
+        test_runtime_configured(8, 4, 2, 2),
         DataWorkerId::new(1),
         handoff.worker(DataWorkerId::new(1)),
     );
@@ -888,10 +937,13 @@ fn queue_only_handoff_constructor_keeps_runtime_buffer_arenas_separate() {
 }
 
 #[test]
-fn buffer_frame_reset_does_not_free_buffers() {
-    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
-    let pool = runtime.buffers().buffers();
-    let mut frame = runtime.alloc_frame().expect("alloc frame");
+fn buffer_frame_owner_drop_frees_buffers() {
+    let runtime: DataPlaneRuntime = test_runtime_configured(8, 4, 2, 1);
+    let pool = runtime.buffers().try_buffers().expect("active buffer pool");
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(NodeId::new(0))
+        .expect("alloc frame");
     let first = pool
         .alloc_index_with_bytes(b"one")
         .expect("alloc first frame buffer");
@@ -904,29 +956,21 @@ fn buffer_frame_reset_does_not_free_buffers() {
     assert_eq!(frame.len(), 2);
     assert_eq!(pool.in_use(), 2);
 
-    frame.reset();
-
-    assert!(frame.is_empty());
-    assert_eq!(pool.in_use(), 2);
-    assert_eq!(
-        chain_bytes(&pool, first).expect("first buffer remains live"),
-        b"one"
-    );
-    assert_eq!(
-        chain_bytes(&pool, second).expect("second buffer remains live"),
-        b"two"
-    );
-
     drop(frame);
-    drop_owned_index!(&pool, first);
-    drop_owned_index!(&pool, second);
+    assert_eq!(pool.in_use(), 0);
+    assert!(pool.get(first).is_err());
+    assert!(pool.get(second).is_err());
 }
 
 #[test]
-fn buffer_pool_free_frame_releases_all_indices_and_reuses_frame() {
-    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
-    let pool = runtime.buffers().buffers();
-    let mut frame = runtime.alloc_frame().expect("alloc frame");
+fn buffer_pool_drop_frame_releases_all_indices_and_reuses_frame() {
+    let runtime: DataPlaneRuntime = test_runtime_configured(8, 4, 2, 1);
+    let pool = runtime.buffers().try_buffers().expect("active buffer pool");
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(NodeId::new(0))
+        .expect("alloc frame");
+    let frame_index = frame.index();
     let first = pool
         .alloc_index_with_bytes(b"one")
         .expect("alloc first frame buffer");
@@ -937,63 +981,36 @@ fn buffer_pool_free_frame_releases_all_indices_and_reuses_frame() {
     frame.push_index(second).expect("push second frame index");
     let capacity = frame.capacity();
 
-    drop_owned_frame!(&pool, frame);
+    drop(frame);
 
-    assert!(frame.is_empty());
-    assert_eq!(frame.capacity(), capacity);
     assert_eq!(pool.in_use(), 0);
     assert!(pool.get(first).is_err());
     assert!(pool.get(second).is_err());
 
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(NodeId::new(0))
+        .expect("reuse frame allocation");
+    assert_eq!(frame.index().slot(), frame_index.slot());
+    assert_ne!(frame.index().generation(), frame_index.generation());
+    assert!(frame.is_empty());
+    assert_eq!(frame.capacity(), capacity);
     let next = pool
         .alloc_index_with_bytes(b"next")
-        .expect("alloc after free_frame");
+        .expect("alloc after dropped frame");
     frame.push_index(next).expect("reuse frame allocation");
     assert_eq!(frame.indices(), &[next]);
-    drop_owned_frame!(&pool, frame);
     drop(frame);
 }
 
 #[test]
-fn buffer_frame_drain_indices_preserves_order_without_freeing() {
-    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
-    let pool = runtime.buffers().buffers();
-    let mut frame = runtime.alloc_frame().expect("alloc frame");
-    let first = pool
-        .alloc_index_with_bytes(b"first")
-        .expect("alloc first frame buffer");
-    let second = pool
-        .alloc_index_with_bytes(b"second")
-        .expect("alloc second frame buffer");
-    frame.push_index(first).expect("push first frame index");
-    frame.push_index(second).expect("push second frame index");
-
-    let drained = frame.drain_indices().collect::<Vec<_>>();
-
-    assert!(frame.is_empty());
-    assert_eq!(pool.in_use(), 2);
-    assert_eq!(drained, vec![first, second]);
-    assert_eq!(
-        chain_bytes(&pool, drained[0]).expect("first buffer remains live"),
-        b"first"
-    );
-    assert_eq!(
-        chain_bytes(&pool, drained[1]).expect("second buffer remains live"),
-        b"second"
-    );
-
-    for index in drained {
-        drop_owned_index!(&pool, index);
-    }
-    drop(frame);
-    assert_eq!(pool.in_use(), 0);
-}
-
-#[test]
-fn buffer_frame_tracks_pending_indices_until_drained() {
-    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
-    let pool = runtime.buffers().buffers();
-    let mut frame = runtime.alloc_frame().expect("alloc frame");
+fn buffer_frame_tracks_pending_indices_until_owner_drop() {
+    let runtime: DataPlaneRuntime = test_runtime_configured(8, 4, 2, 1);
+    let pool = runtime.buffers().try_buffers().expect("active buffer pool");
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(NodeId::new(0))
+        .expect("alloc frame");
     let first = pool
         .alloc_index_with_bytes(b"first")
         .expect("alloc first frame buffer");
@@ -1010,26 +1027,20 @@ fn buffer_frame_tracks_pending_indices_until_drained() {
     assert_eq!(frame.pending_len(), 2);
     assert_eq!(frame.pending_indices(), &[first, second]);
 
-    let drained = frame.drain_pending().collect::<Vec<_>>();
-
-    assert_eq!(drained, vec![first, second]);
-    assert!(!frame.has_pending());
-    assert_eq!(frame.pending_len(), 0);
     assert_eq!(pool.in_use(), 2);
 
-    for index in drained {
-        drop_owned_index!(&pool, index);
-    }
     drop(frame);
     assert_eq!(pool.in_use(), 0);
 }
 
 #[test]
 fn buffer_frame_pending_future_wakes_when_index_is_pushed() {
-    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 2, 1, 1);
-    let pool = runtime.buffers().buffers();
-    let mut frame = runtime.alloc_frame().expect("alloc frame");
-    let index = pool
+    let runtime: DataPlaneRuntime = test_runtime_configured(8, 2, 1, 1);
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(NodeId::new(0))
+        .expect("alloc frame");
+    let index = runtime
         .alloc_index_with_bytes(b"packet")
         .expect("alloc frame buffer");
     let wake_counter = Arc::new(WakeCounter::default());
@@ -1051,19 +1062,20 @@ fn buffer_frame_pending_future_wakes_when_index_is_pushed() {
         Poll::Ready(())
     ));
 
-    drop_owned_frame!(&pool, frame);
     drop(frame);
 }
 
 #[test]
 fn buffer_frame_push_indices_batches_one_wake() {
-    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
-    let pool = runtime.buffers().buffers();
-    let mut frame = runtime.alloc_frame().expect("alloc frame");
-    let first = pool
+    let runtime: DataPlaneRuntime = test_runtime_configured(8, 4, 2, 1);
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(NodeId::new(0))
+        .expect("alloc frame");
+    let first = runtime
         .alloc_index_with_bytes(b"first")
         .expect("alloc first frame buffer");
-    let second = pool
+    let second = runtime
         .alloc_index_with_bytes(b"second")
         .expect("alloc second frame buffer");
     let wake_counter = Arc::new(WakeCounter::default());
@@ -1083,15 +1095,17 @@ fn buffer_frame_push_indices_batches_one_wake() {
     assert_eq!(wake_counter.wakes.load(Ordering::SeqCst), 1);
     assert_eq!(frame.pending_indices(), &[first, second]);
 
-    drop_owned_frame!(&pool, frame);
     drop(frame);
 }
 
 #[test]
 fn buffer_frame_pair_batch_cursor_splits_into_pairs_then_tail() {
-    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 8, 8, 1);
-    let pool = runtime.buffers().buffers();
-    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    let runtime: DataPlaneRuntime = test_runtime_configured(8, 8, 8, 1);
+    let pool = runtime.buffers().try_buffers().expect("active buffer pool");
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(NodeId::new(0))
+        .expect("alloc frame");
     let indices = (0..5)
         .map(|value| {
             pool.alloc_index_with_bytes(&[value])
@@ -1113,15 +1127,17 @@ fn buffer_frame_pair_batch_cursor_splits_into_pairs_then_tail() {
         ]
     );
 
-    drop_owned_frame!(&pool, frame);
     drop(frame);
 }
 
 #[test]
 fn buffer_frame_quad_batch_cursor_splits_into_quad_pair_then_tail() {
-    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 8, 8, 1);
-    let pool = runtime.buffers().buffers();
-    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    let runtime: DataPlaneRuntime = test_runtime_configured(8, 8, 8, 1);
+    let pool = runtime.buffers().try_buffers().expect("active buffer pool");
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(NodeId::new(0))
+        .expect("alloc frame");
     let indices = (0..7)
         .map(|value| {
             pool.alloc_index_with_bytes(&[value])
@@ -1143,14 +1159,16 @@ fn buffer_frame_quad_batch_cursor_splits_into_quad_pair_then_tail() {
         ]
     );
 
-    drop_owned_frame!(&pool, frame);
     drop(frame);
 }
 
 #[test]
 fn buffer_frame_batch_cursors_are_empty_for_empty_frame() {
-    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 2, 8, 1);
-    let frame = runtime.alloc_frame().expect("alloc frame");
+    let runtime: DataPlaneRuntime = test_runtime_configured(8, 2, 8, 1);
+    let frame = runtime
+        .buffers()
+        .get_next_frame(NodeId::new(0))
+        .expect("alloc frame");
 
     assert_eq!(frame.pair_batch_cursor().next(), None);
     assert_eq!(frame.quad_batch_cursor().next(), None);
@@ -1160,8 +1178,11 @@ fn buffer_frame_batch_cursors_are_empty_for_empty_frame() {
 
 #[test]
 fn buffer_frame_batch_cursor_uses_requested_width() {
-    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 8, 8, 1);
-    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    let runtime: DataPlaneRuntime = test_runtime_configured(8, 8, 8, 1);
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(NodeId::new(0))
+        .expect("alloc frame");
     let indices = push_numbered_indices(&runtime, &mut frame, 5);
 
     let quad_batches = frame
@@ -1189,22 +1210,18 @@ fn buffer_frame_batch_cursor_uses_requested_width() {
 
 #[test]
 fn buffer_frame_batch_dispatch_uses_runtime_preferred_width() {
-    let quad_runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities_and_instruction_set(
-        8,
-        8,
-        8,
-        1,
-        DataPlaneInstructionSet::Avx2,
-    );
-    let pair_runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities_and_instruction_set(
-        8,
-        8,
-        8,
-        1,
-        DataPlaneInstructionSet::Scalar,
-    );
-    let mut quad_frame = quad_runtime.alloc_frame().expect("quad frame");
-    let mut pair_frame = pair_runtime.alloc_frame().expect("pair frame");
+    let quad_runtime: DataPlaneRuntime =
+        test_runtime_configured_instruction_set(8, 8, 8, 1, DataPlaneInstructionSet::Avx2);
+    let pair_runtime: DataPlaneRuntime =
+        test_runtime_configured_instruction_set(8, 8, 8, 1, DataPlaneInstructionSet::Scalar);
+    let mut quad_frame = quad_runtime
+        .buffers()
+        .get_next_frame(NodeId::new(0))
+        .expect("quad frame");
+    let mut pair_frame = pair_runtime
+        .buffers()
+        .get_next_frame(NodeId::new(0))
+        .expect("pair frame");
     let quad_indices = push_numbered_indices(&quad_runtime, &mut quad_frame, 7);
     let pair_indices = push_numbered_indices(&pair_runtime, &mut pair_frame, 5);
 
@@ -1241,51 +1258,13 @@ fn buffer_frame_batch_dispatch_uses_runtime_preferred_width() {
 }
 
 #[test]
-fn buffer_frame_pending_future_observes_reset_before_processing() {
-    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 2, 1, 1);
-    let pool = runtime.buffers().buffers();
-    let mut frame = runtime.alloc_frame().expect("alloc frame");
-    let first = pool
-        .alloc_index_with_bytes(b"first")
-        .expect("alloc first frame buffer");
-    let second = pool
-        .alloc_index_with_bytes(b"second")
-        .expect("alloc second frame buffer");
-    let wake_counter = Arc::new(WakeCounter::default());
-    let waker = Waker::from(Arc::clone(&wake_counter));
-    let mut context = Context::from_waker(&waker);
-    let mut pending = frame.pending();
-
-    assert!(matches!(
-        Pin::new(&mut pending).poll(&mut context),
-        Poll::Pending
-    ));
-    frame.push_index(first).expect("push first frame index");
-    assert_eq!(wake_counter.wakes.load(Ordering::SeqCst), 1);
-
-    frame.reset();
-    assert!(matches!(
-        Pin::new(&mut pending).poll(&mut context),
-        Poll::Pending
-    ));
-
-    drop_owned_index!(&pool, first);
-    frame.push_index(second).expect("push second frame index");
-    assert_eq!(wake_counter.wakes.load(Ordering::SeqCst), 2);
-    assert!(matches!(
-        Pin::new(&mut pending).poll(&mut context),
-        Poll::Ready(())
-    ));
-
-    drop_owned_frame!(&pool, frame);
-    drop(frame);
-}
-
-#[test]
 fn buffer_frame_push_index_respects_preallocated_capacity() {
-    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 1, 1);
-    let pool = runtime.buffers().buffers();
-    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    let runtime: DataPlaneRuntime = test_runtime_configured(8, 4, 1, 1);
+    let pool = runtime.buffers().try_buffers().expect("active buffer pool");
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(NodeId::new(0))
+        .expect("alloc frame");
     let first = pool
         .alloc_index_with_bytes(b"first")
         .expect("alloc first frame buffer");
@@ -1298,15 +1277,17 @@ fn buffer_frame_push_index_respects_preallocated_capacity() {
     assert_eq!(frame.indices(), &[first]);
     assert_eq!(pool.in_use(), 2);
 
-    drop_owned_frame!(&pool, frame);
     drop(frame);
     drop_owned_index!(&pool, second);
 }
 
 #[test]
 fn data_plane_runtime_allocates_frame_indices_from_reusable_pool() {
-    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
-    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    let runtime: DataPlaneRuntime = test_runtime_configured(8, 4, 2, 1);
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(NodeId::new(0))
+        .expect("alloc frame");
     let frame_index = frame.index();
     let first = runtime
         .alloc_index_with_bytes(b"one")
@@ -1321,17 +1302,32 @@ fn data_plane_runtime_allocates_frame_indices_from_reusable_pool() {
 
     assert_eq!(runtime.frames_in_use(), 1);
     assert_eq!(runtime.in_use_buffers(), 2);
-    assert!(runtime.alloc_frame().is_err());
+    assert!(runtime.buffers().get_next_frame(NodeId::new(0)).is_err());
     assert_eq!(frame.indices(), &[first, second]);
 
     drop(frame);
 
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
-    assert!(chain_bytes(runtime.buffers().buffers(), first).is_err());
-    assert!(chain_bytes(runtime.buffers().buffers(), second).is_err());
+    assert!(
+        chain_bytes(
+            runtime.buffers().try_buffers().expect("active buffer pool"),
+            first
+        )
+        .is_err()
+    );
+    assert!(
+        chain_bytes(
+            runtime.buffers().try_buffers().expect("active buffer pool"),
+            second
+        )
+        .is_err()
+    );
 
-    let reused_frame = runtime.alloc_frame().expect("reuse frame");
+    let reused_frame = runtime
+        .buffers()
+        .get_next_frame(NodeId::new(0))
+        .expect("reuse frame");
     let reused_frame_index = reused_frame.index();
     assert_eq!(reused_frame_index.slot(), frame_index.slot());
     assert_ne!(reused_frame_index.generation(), frame_index.generation());
@@ -1341,8 +1337,11 @@ fn data_plane_runtime_allocates_frame_indices_from_reusable_pool() {
 
 #[test]
 fn frame_ref_mut_push_indices_batches_into_pooled_frame() {
-    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
-    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    let runtime: DataPlaneRuntime = test_runtime_configured(8, 4, 2, 1);
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(NodeId::new(0))
+        .expect("alloc frame");
     let first = runtime
         .alloc_index_with_bytes(b"one")
         .expect("alloc first buffer");
@@ -1361,8 +1360,11 @@ fn frame_ref_mut_push_indices_batches_into_pooled_frame() {
 
 #[test]
 fn data_plane_runtime_checks_out_pooled_frame_for_packet_interfaces() {
-    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
-    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    let runtime: DataPlaneRuntime = test_runtime_configured(8, 4, 2, 1);
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(NodeId::new(0))
+        .expect("alloc frame");
     let frame_index = frame.index();
     let buffer = runtime
         .alloc_index_with_bytes(b"pkt")
@@ -1371,16 +1373,25 @@ fn data_plane_runtime_checks_out_pooled_frame_for_packet_interfaces() {
     frame.push_index(buffer).expect("push packet buffer");
 
     assert_eq!(runtime.frames_in_use(), 1);
-    assert!(runtime.alloc_frame().is_err());
+    assert!(runtime.buffers().get_next_frame(NodeId::new(0)).is_err());
     assert_eq!(frame.indices(), &[buffer]);
 
     drop(frame);
 
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
-    assert!(chain_bytes(runtime.buffers().buffers(), buffer).is_err());
+    assert!(
+        chain_bytes(
+            runtime.buffers().try_buffers().expect("active buffer pool"),
+            buffer
+        )
+        .is_err()
+    );
 
-    let reused_frame = runtime.alloc_frame().expect("reuse frame");
+    let reused_frame = runtime
+        .buffers()
+        .get_next_frame(NodeId::new(0))
+        .expect("reuse frame");
     assert_eq!(reused_frame.index().slot(), frame_index.slot());
     assert_ne!(reused_frame.index().generation(), frame_index.generation());
     assert!(reused_frame.is_empty());
@@ -1389,8 +1400,11 @@ fn data_plane_runtime_checks_out_pooled_frame_for_packet_interfaces() {
 
 #[test]
 fn buffer_frame_lazy_state_retain_compacts_after_first_drop() {
-    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 8, 8, 1);
-    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    let runtime: DataPlaneRuntime = test_runtime_configured(8, 8, 8, 1);
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(NodeId::new(0))
+        .expect("alloc frame");
     let indices = push_numbered_indices(&runtime, &mut frame, 5);
     let mut prefetched = 0usize;
 

@@ -1,3 +1,4 @@
+use hammer_adapter::buffer::{DataPlaneBufferConfig, DataPlaneRuntimeConfig};
 use hammer_adapter::{DataPlaneInstructionSet, DataPlaneRuntime};
 use hammer_core::config::Config;
 
@@ -5,14 +6,15 @@ pub(crate) type RuntimeDataPlaneRuntime = DataPlaneRuntime;
 
 pub fn new_worker_runtime(config: &Config) -> RuntimeDataPlaneRuntime {
     let buffer = &config.worker.buffer;
-    let instr_set = parse_instruction_set(&config.worker.instruction_set);
-    RuntimeDataPlaneRuntime::with_capacities_and_instruction_set(
-        buffer.slot_bytes,
-        buffer.slots_per_numa,
-        buffer.frame_capacity,
-        buffer.frame_pool_size,
-        instr_set,
-    )
+    let buffers = DataPlaneBufferConfig {
+        buffer_slot_capacity: buffer.slot_bytes,
+        buffer_slots: buffer.slots_per_numa,
+        frame_capacity: buffer.frame_capacity,
+        frame_slots: buffer.frame_pool_size,
+        instruction_set: parse_instruction_set(&config.worker.instruction_set),
+        ..DataPlaneBufferConfig::default()
+    };
+    RuntimeDataPlaneRuntime::new(DataPlaneRuntimeConfig { buffers })
 }
 
 fn parse_instruction_set(s: &str) -> DataPlaneInstructionSet {

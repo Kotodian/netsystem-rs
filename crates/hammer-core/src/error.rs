@@ -22,8 +22,71 @@ pub enum CoreError {
     #[error(transparent)]
     Tcp(#[from] crate::protocol::tcp::TcpError),
 
+    #[error(transparent)]
+    DataPlane(#[from] DataPlaneError),
+
     #[error("{message}")]
     Internal { message: String },
+}
+
+#[derive(Debug, Error)]
+pub enum DataPlaneError {
+    #[error("buffer frame capacity exceeded")]
+    BufferFrameCapacityExceeded,
+
+    #[error("frame pool exhausted")]
+    FramePoolExhausted,
+
+    #[error("frame slot out of bounds")]
+    FrameSlotOutOfBounds,
+
+    #[error("frame slot is checked out")]
+    FrameSlotCheckedOut,
+
+    #[error("frame index belongs to another pool")]
+    FrameIndexForeign,
+
+    #[error("stale frame index")]
+    StaleFrameIndex,
+
+    #[error("frame slot is free")]
+    FrameSlotFree,
+
+    #[error("frame slot already has a frame")]
+    FrameSlotAlreadyHasFrame,
+
+    #[error("frame pool available-list overflow")]
+    FramePoolAvailableOverflow,
+
+    #[error("scheduled frame queue exhausted")]
+    ScheduledFrameQueueExhausted,
+
+    #[error("data plane handoff target worker out of bounds")]
+    HandoffTargetWorkerOutOfBounds,
+
+    #[error("data plane handoff queue exhausted")]
+    HandoffQueueExhausted,
+
+    #[error("data plane handoff is not configured")]
+    HandoffNotConfigured,
+
+    #[error("data plane handoff node handle is not configured")]
+    HandoffNodeHandleMissing,
+
+    #[error("active NUMA buffer pool is missing")]
+    ActiveNumaBufferPoolMissing,
+
+    #[error("NUMA node {numa_node} does not fit usize")]
+    NumaNodeDoesNotFitUsize { numa_node: u32 },
+
+    #[error("NUMA node {numa_node} exceeds static memory table capacity {capacity}")]
+    NumaNodeExceedsStaticMemoryTable { numa_node: u32, capacity: usize },
+
+    #[error("duplicate NUMA memory entry for node {numa_node}")]
+    DuplicateNumaMemoryEntry { numa_node: u32 },
+
+    #[error("no static buffer arena configured for thread {thread_index} on NUMA node {numa_node}")]
+    StaticBufferArenaMissing { thread_index: u32, numa_node: u32 },
 }
 
 impl CoreError {

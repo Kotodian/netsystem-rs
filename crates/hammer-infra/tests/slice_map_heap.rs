@@ -10,7 +10,7 @@ use hammer_infra::svm_region::SvmRegion;
 #[test]
 fn slice_and_flat_hash_table_use_the_passed_heap() {
     let region = SvmRegion::with_size(128 * 1024);
-    let heap = Arc::new(Heap::svm(region.clone(), 0));
+    let heap = Arc::new(Heap::svm_data(region.clone()).expect("owner region heap"));
     let start = region.base() as usize;
     let end = start + region.size();
 
@@ -44,7 +44,7 @@ fn slice_and_flat_hash_table_use_the_passed_heap() {
 #[test]
 fn cloned_slice_stays_in_the_same_svm_region() {
     let region = SvmRegion::with_size(128 * 1024);
-    let heap = Arc::new(Heap::svm(region.clone(), 0));
+    let heap = Arc::new(Heap::svm_data(region.clone()).expect("owner region heap"));
     let start = region.base() as usize;
     let end = start + region.size();
 
@@ -65,7 +65,7 @@ fn cloned_slice_stays_in_the_same_svm_region() {
 #[test]
 fn cloned_flat_hash_table_buckets_stay_in_the_same_svm_region() {
     let region = SvmRegion::with_size(128 * 1024);
-    let heap = Arc::new(Heap::svm(region.clone(), 0));
+    let heap = Arc::new(Heap::svm_data(region.clone()).expect("owner region heap"));
     let start = region.base() as usize;
     let end = start + region.size();
 

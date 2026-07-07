@@ -2,13 +2,31 @@ use std::mem::transmute;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use hammer_adapter::{
-    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, InternalNode, Node, NodeId,
-    NodeProcessFn, NodeResult, NodeRuntimeData,
+    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneBufferConfig, DataPlaneRuntime,
+    DataPlaneRuntimeConfig, InternalNode, Node, NodeId, NodeProcessFn, NodeResult, NodeRuntimeData,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 use hammer_service::net::NetworkOpaque;
 use hammer_service::transport::tcp::{TcpResetNext, TcpResetNode};
+
+fn test_runtime_configured(
+    buffer_slot_capacity: usize,
+    buffer_slots: usize,
+    frame_capacity: usize,
+    frame_slots: usize,
+) -> DataPlaneRuntime {
+    let config = DataPlaneRuntimeConfig {
+        buffers: DataPlaneBufferConfig {
+            buffer_slot_capacity,
+            buffer_slots,
+            frame_capacity,
+            frame_slots,
+            ..DataPlaneBufferConfig::default()
+        },
+    };
+    DataPlaneRuntime::new(config)
+}
 
 #[derive(Default)]
 struct CaptureState {
@@ -173,7 +191,7 @@ fn reset_graph() -> (
     Arc<Mutex<CaptureState>>,
     Arc<Mutex<CaptureState>>,
 ) {
-    let runtime = DataPlaneRuntime::with_capacities(512, 8, 4, 4);
+    let runtime = test_runtime_configured(512, 8, 4, 4);
     let lookup_state = Arc::new(Mutex::new(CaptureState::default()));
     let drop_state = Arc::new(Mutex::new(CaptureState::default()));
     let drop = runtime
@@ -189,13 +207,16 @@ fn reset_graph() -> (
 }
 
 fn schedule_packet(runtime: &DataPlaneRuntime, reset: NodeId, packet: &[u8]) {
-    let mut frame = runtime.alloc_frame().expect("alloc frame");
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(reset)
+        .expect("alloc frame");
     let index = runtime
         .alloc_index_with_bytes(packet)
         .expect("alloc packet");
     set_tcp_cursor(runtime, index, packet.len());
     frame.push_index(index).expect("push packet");
-    runtime.submit_frame(frame, reset).expect("schedule reset");
+    runtime.put_next_frame(frame).expect("schedule reset");
 }
 
 fn set_tcp_cursor(runtime: &DataPlaneRuntime, index: BufferIndex, packet_len: usize) {

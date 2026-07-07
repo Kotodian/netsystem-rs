@@ -1,15 +1,36 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use hammer_adapter::{BufferIndex, DataPlaneRuntime, DataWorkerId, NodeId};
+use hammer_adapter::{
+    BufferIndex, DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId,
+};
 use hammer_core::error::CoreResult;
 use hammer_infra::segment::Local;
 use hammer_runtime::app::{AppSession, AppSessionConfig, SessionHandle};
+use hammer_service::data_plane::DropNode;
 use hammer_service::session::SessionQueueNext;
 use hammer_service::session::protocol::SessionQueueControlContext;
 use hammer_service::session::runtime::{
     SessionDriverRuntime, SessionQueueProtocol, dispatch_session_queue_for_ticks,
 };
+
+fn test_runtime_configured(
+    buffer_slot_capacity: usize,
+    buffer_slots: usize,
+    frame_capacity: usize,
+    frame_slots: usize,
+) -> DataPlaneRuntime {
+    let config = DataPlaneRuntimeConfig {
+        buffers: DataPlaneBufferConfig {
+            buffer_slot_capacity,
+            buffer_slots,
+            frame_capacity,
+            frame_slots,
+            ..DataPlaneBufferConfig::default()
+        },
+    };
+    DataPlaneRuntime::new(config)
+}
 
 #[derive(Default)]
 struct TestTxProtocol {
@@ -89,7 +110,7 @@ impl SessionQueueProtocol for TestTxProtocol {
 fn session_tx_dispatch_sends_multiple_segments_up_to_budget() {
     // frame_capacity must be >= DEFAULT_TX_DISPATCH_BUDGET (64) so that
     // output.schedule can push all indices into one frame.
-    let runtime = DataPlaneRuntime::with_capacities(2048, 64, 64, 8);
+    let runtime = test_runtime_configured(2048, 64, 64, 8);
     let buffers = runtime.buffers();
     let mut driver =
         SessionDriverRuntime::<TestTxProtocol, Local>::new(DataWorkerId::new(0), buffers.clone());
@@ -111,7 +132,7 @@ fn session_tx_dispatch_sends_multiple_segments_up_to_budget() {
     driver.app_mut().attach_session(session_id, app_session);
     driver.mark_ready(session_id);
 
-    let next: SessionQueueNext = NodeId::new(9).into();
+    let next: SessionQueueNext = runtime.nodes().register_internal(DropNode::new()).into();
     dispatch_session_queue_for_ticks(&runtime, &mut driver, 0, next)
         .expect("dispatch session queue");
 

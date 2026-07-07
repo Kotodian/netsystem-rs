@@ -19,7 +19,7 @@
 //! - Session: `session/runtime.rs::{DEFAULT_SESSION_TIMER_TICK,
 //!   DEFAULT_SESSION_POOL_CAPACITY,DEFAULT_OOO_CAPACITY}`,
 //!   `session/ready.rs::DEFAULT_READY_QUEUE_CAPACITY`,
-//!   `session/app.rs::{DEFAULT_APP_SESSION_CAPACITY,DataPlaneBuffers::with_buffer_capacity(2048,1)}`.
+//!   `session/app.rs::{DEFAULT_APP_SESSION_CAPACITY,DataPlaneBufferConfig defaults}`.
 //! - Interface: `interface.rs::InterfaceMtu`, `constants::DEFAULT_TUN_MTU`.
 
 use std::time::Duration;

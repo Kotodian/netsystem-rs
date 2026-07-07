@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneInstructionSet, DataPlaneRuntime, InternalNode, Node, NodeProcessFn,
-    NodeResult, NodeRuntimeData, SecondaryOpaque,
+    BufferFrame, DataPlaneBufferConfig, DataPlaneInstructionSet, DataPlaneRuntime,
+    DataPlaneRuntimeConfig, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
+    SecondaryOpaque,
 };
 use hammer_core::error::CoreResult;
 use hammer_service::data_plane::DropNode;
@@ -21,6 +22,26 @@ const FRAME_PACKETS: usize = 128;
 const FRAME_ROUNDS: usize = 512;
 const SAMPLE_COUNT: usize = 5;
 static PERF_PROBE_LOCK: Mutex<()> = Mutex::new(());
+
+fn test_runtime_configured_instruction_set(
+    buffer_slot_capacity: usize,
+    buffer_slots: usize,
+    frame_capacity: usize,
+    frame_slots: usize,
+    instruction_set: DataPlaneInstructionSet,
+) -> DataPlaneRuntime {
+    let config = DataPlaneRuntimeConfig {
+        buffers: DataPlaneBufferConfig {
+            buffer_slot_capacity,
+            buffer_slots,
+            frame_capacity,
+            frame_slots,
+            instruction_set,
+            ..DataPlaneBufferConfig::default()
+        },
+    };
+    DataPlaneRuntime::new(config)
+}
 
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
@@ -242,13 +263,8 @@ fn measure_input_lookup_samples(
 }
 
 fn measure_packet_scalar(scenario: Scenario) -> ProbeStats {
-    let runtime = DataPlaneRuntime::with_capacities_and_instruction_set(
-        2048,
-        1,
-        1,
-        2,
-        DataPlaneInstructionSet::Scalar,
-    );
+    let runtime =
+        test_runtime_configured_instruction_set(2048, 1, 1, 2, DataPlaneInstructionSet::Scalar);
     let counters = Arc::new(SinkCounters::default());
     let lookup = build_lookup(&runtime, scenario, &counters);
     let packets_by_frame = build_packets(scenario);
@@ -256,12 +272,15 @@ fn measure_packet_scalar(scenario: Scenario) -> ProbeStats {
     let started = Instant::now();
     for _ in 0..FRAME_ROUNDS {
         for packet in packets_by_frame.iter() {
-            let mut frame = runtime.alloc_frame().expect("alloc frame");
+            let mut frame = runtime
+                .buffers()
+                .get_next_frame(lookup)
+                .expect("alloc frame");
             let index = runtime
                 .alloc_index_with_bytes(packet)
                 .expect("alloc packet");
             frame.push_index(index).expect("push packet");
-            runtime.submit_frame(frame, lookup).expect("schedule");
+            runtime.put_next_frame(frame).expect("schedule");
             black_box(runtime.run_ready_nodes().expect("run nodes"));
             debug_assert_eq!(runtime.in_use_buffers(), 0);
         }
@@ -276,7 +295,7 @@ fn measure_packet_scalar(scenario: Scenario) -> ProbeStats {
 }
 
 fn measure_lookup(scenario: Scenario, instruction_set: DataPlaneInstructionSet) -> ProbeStats {
-    let runtime = DataPlaneRuntime::with_capacities_and_instruction_set(
+    let runtime = test_runtime_configured_instruction_set(
         2048,
         FRAME_PACKETS,
         FRAME_PACKETS,
@@ -289,14 +308,17 @@ fn measure_lookup(scenario: Scenario, instruction_set: DataPlaneInstructionSet) 
 
     let started = Instant::now();
     for _ in 0..FRAME_ROUNDS {
-        let mut frame = runtime.alloc_frame().expect("alloc frame");
+        let mut frame = runtime
+            .buffers()
+            .get_next_frame(lookup)
+            .expect("alloc frame");
         for packet in packets_by_frame.iter() {
             let index = runtime
                 .alloc_index_with_bytes(packet)
                 .expect("alloc packet");
             frame.push_index(index).expect("push packet");
         }
-        runtime.submit_frame(frame, lookup).expect("schedule");
+        runtime.put_next_frame(frame).expect("schedule");
         black_box(runtime.run_ready_nodes().expect("run nodes"));
         debug_assert_eq!(runtime.in_use_buffers(), 0);
     }
@@ -313,7 +335,7 @@ fn measure_input_lookup(
     scenario: Scenario,
     instruction_set: DataPlaneInstructionSet,
 ) -> ProbeStats {
-    let runtime = DataPlaneRuntime::with_capacities_and_instruction_set(
+    let runtime = test_runtime_configured_instruction_set(
         2048,
         FRAME_PACKETS,
         FRAME_PACKETS,
@@ -326,14 +348,17 @@ fn measure_input_lookup(
 
     let started = Instant::now();
     for _ in 0..FRAME_ROUNDS {
-        let mut frame = runtime.alloc_frame().expect("alloc frame");
+        let mut frame = runtime
+            .buffers()
+            .get_next_frame(input)
+            .expect("alloc frame");
         for packet in packets_by_frame.iter() {
             let index = runtime
                 .alloc_index_with_bytes(packet)
                 .expect("alloc packet");
             frame.push_index(index).expect("push packet");
         }
-        runtime.submit_frame(frame, input).expect("schedule");
+        runtime.put_next_frame(frame).expect("schedule");
         black_box(runtime.run_ready_nodes().expect("run nodes"));
         debug_assert_eq!(runtime.in_use_buffers(), 0);
     }

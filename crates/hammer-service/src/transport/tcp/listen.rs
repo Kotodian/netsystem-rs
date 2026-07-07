@@ -1,8 +1,8 @@
 use std::cell::{Cell, RefCell};
 
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeId, NodeNextFrames, NodeProcessFn,
-    NodeResult, NodeRuntimeData,
+    BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeId, NodeProcessFn, NodeResult,
+    NodeRuntimeData,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::{TcpConnectionId, TcpError, TcpPacket, TcpSegmentFlags, TcpSeq};
@@ -182,133 +182,8 @@ where
     let tcp_output = next[TcpListenNext::Output as usize];
     let tcp_established = next[TcpListenNext::Established as usize];
     let drop_next = next[TcpListenNext::Drop as usize];
-    let mut next_frames = NodeNextFrames::default();
-    let indices = frame.pending_indices();
-    let len = indices.len();
-    let mut read = 0usize;
-    while read + 4 <= len {
-        runtime.prefetch_header(indices[read]);
-        runtime.prefetch_header(indices[read + 1]);
-        runtime.prefetch_header(indices[read + 2]);
-        runtime.prefetch_header(indices[read + 3]);
-        if tcp_listen_index(
-            runtime,
-            indices[read],
-            control,
-            session_queue,
-            tcp_output,
-            tcp_established,
-            &mut next_frames,
-        )
-        .is_err()
-        {
-            hammer_adapter::validate_buffer_enqueue_x1!(
-                runtime,
-                next_frames,
-                drop_next,
-                indices[read]
-            );
-        }
-        if tcp_listen_index(
-            runtime,
-            indices[read + 1],
-            control,
-            session_queue,
-            tcp_output,
-            tcp_established,
-            &mut next_frames,
-        )
-        .is_err()
-        {
-            hammer_adapter::validate_buffer_enqueue_x1!(
-                runtime,
-                next_frames,
-                drop_next,
-                indices[read + 1]
-            );
-        }
-        if tcp_listen_index(
-            runtime,
-            indices[read + 2],
-            control,
-            session_queue,
-            tcp_output,
-            tcp_established,
-            &mut next_frames,
-        )
-        .is_err()
-        {
-            hammer_adapter::validate_buffer_enqueue_x1!(
-                runtime,
-                next_frames,
-                drop_next,
-                indices[read + 2]
-            );
-        }
-        if tcp_listen_index(
-            runtime,
-            indices[read + 3],
-            control,
-            session_queue,
-            tcp_output,
-            tcp_established,
-            &mut next_frames,
-        )
-        .is_err()
-        {
-            hammer_adapter::validate_buffer_enqueue_x1!(
-                runtime,
-                next_frames,
-                drop_next,
-                indices[read + 3]
-            );
-        }
-        read += 4;
-    }
-    if read + 2 <= len {
-        runtime.prefetch_header(indices[read]);
-        runtime.prefetch_header(indices[read + 1]);
-        if tcp_listen_index(
-            runtime,
-            indices[read],
-            control,
-            session_queue,
-            tcp_output,
-            tcp_established,
-            &mut next_frames,
-        )
-        .is_err()
-        {
-            hammer_adapter::validate_buffer_enqueue_x1!(
-                runtime,
-                next_frames,
-                drop_next,
-                indices[read]
-            );
-        }
-        if tcp_listen_index(
-            runtime,
-            indices[read + 1],
-            control,
-            session_queue,
-            tcp_output,
-            tcp_established,
-            &mut next_frames,
-        )
-        .is_err()
-        {
-            hammer_adapter::validate_buffer_enqueue_x1!(
-                runtime,
-                next_frames,
-                drop_next,
-                indices[read + 1]
-            );
-        }
-        read += 2;
-    }
-    while read < len {
-        let index = indices[read];
-        runtime.prefetch_header(index);
+    let width = runtime.preferred_frame_batch_width();
+    let _ = frame.rewrite_indices_batched(width, |index| {
         if tcp_listen_index(
             runtime,
             index,
@@ -316,15 +191,16 @@ where
             session_queue,
             tcp_output,
             tcp_established,
-            &mut next_frames,
         )
         .is_err()
+            && let Ok(mut drop_frame) = runtime.buffers().get_next_frame(drop_next)
+            && drop_frame.push_index(index).is_ok()
         {
-            hammer_adapter::validate_buffer_enqueue_x1!(runtime, next_frames, drop_next, index);
+            let _ = runtime.put_next_frame(drop_frame);
         }
-        read += 1;
-    }
-    next_frames.finish(runtime, frame)
+        Ok(None)
+    });
+    NodeResult::drop()
 }
 
 fn tcp_listen_index<C>(
@@ -334,14 +210,11 @@ fn tcp_listen_index<C>(
     session_queue: TcpQueue<C>,
     tcp_output: NodeId,
     tcp_established: NodeId,
-    next_frames: &mut NodeNextFrames,
 ) -> CoreResult<()>
 where
     C: CongestionController + 'static,
 {
     let packet = tcp_packet(runtime, index)?;
-    let mut input_owner = runtime.alloc_frame()?;
-    input_owner.push_index(index)?;
     let listener = control.lookup_listener(packet.local).ok_or_else(|| {
         let _ = runtime.record_current_node_error(TcpNodeError::NoListener.code());
         TcpError::NoListener
@@ -360,7 +233,7 @@ where
         )?;
         established_session = session_id;
         if let Some(segment) = control {
-            let mut owner = runtime.alloc_frame()?;
+            let mut owner = runtime.buffers().get_next_frame(tcp_output)?;
             let allocated = runtime.buffers().alloc_index()?;
             owner.push_index(allocated)?;
             segment.write_to_buffer(runtime.buffers(), allocated)?;
@@ -372,8 +245,8 @@ where
         return Err(error);
     }
 
-    if let Some(mut tx_frame) = tx_frame.take() {
-        next_frames.enqueue_indices(runtime, tcp_output, tx_frame.drain_pending());
+    if let Some(tx_frame) = tx_frame.take() {
+        runtime.put_next_frame(tx_frame)?;
     }
     if let Some(session_id) = established_session
         && packet.payload_len != 0
@@ -388,7 +261,10 @@ where
                 TcpInputNext::Established,
             );
             drop(buffer);
-            next_frames.enqueue_indices(runtime, tcp_established, input_owner.drain_pending());
+            let mut established_frame = runtime.buffers().get_next_frame(tcp_established)?;
+            established_frame.push_index(index)?;
+            runtime.put_next_frame(established_frame)?;
+            return Ok(());
         }
     }
     Ok(())
@@ -504,7 +380,16 @@ mod tests {
 
     #[test]
     fn initial_syn_emits_cookie_syn_ack_without_creating_session_route() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 2048,
+                    buffer_slots: 16,
+                    frame_capacity: 8,
+                    frame_slots: 8,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
         let (input, handle, output_state) = install_listener_runtime(&runtime);
 
         send_packet(&runtime, input, syn_packet());
@@ -530,7 +415,16 @@ mod tests {
 
     #[test]
     fn final_ack_creates_real_session_after_cookie_validation() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 2048,
+                    buffer_slots: 16,
+                    frame_capacity: 8,
+                    frame_slots: 8,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
         let (input, handle, output_state) = install_listener_runtime(&runtime);
 
         send_packet(&runtime, input, syn_packet());
@@ -563,7 +457,16 @@ mod tests {
 
     #[test]
     fn invalid_cookie_does_not_create_real_session_route() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 2048,
+                    buffer_slots: 16,
+                    frame_capacity: 8,
+                    frame_slots: 8,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
         let (input, handle, output_state) = install_listener_runtime(&runtime);
 
         send_packet(&runtime, input, syn_packet());
@@ -592,7 +495,16 @@ mod tests {
 
     #[test]
     fn final_ack_payload_is_not_folded_into_listener_syn_state() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 2048,
+                    buffer_slots: 16,
+                    frame_capacity: 8,
+                    frame_slots: 8,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
         let (input, handle, output_state) = install_listener_runtime(&runtime);
 
         send_packet(&runtime, input, syn_packet());
@@ -626,7 +538,16 @@ mod tests {
 
     #[test]
     fn passive_tfo_clears_existing_listener_pending_tuple() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 2048,
+                    buffer_slots: 16,
+                    frame_capacity: 8,
+                    frame_slots: 8,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
         let (input, handle, output_state) = install_listener_runtime(&runtime);
 
         send_packet(&runtime, input, syn_packet());
@@ -665,7 +586,16 @@ mod tests {
 
     #[test]
     fn passive_tfo_invalid_cookie_does_not_create_session() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 2048,
+                    buffer_slots: 16,
+                    frame_capacity: 8,
+                    frame_slots: 8,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
         let (input, handle, output_state) = install_listener_runtime(&runtime);
         let mut cookie_bytes = [0u8; TcpFastOpenCookie::MAX_LEN];
         cookie_bytes.fill(0xaa);
@@ -696,7 +626,16 @@ mod tests {
 
     #[test]
     fn backlog_full_rejects_new_listener_tuple() {
-        let runtime = DataPlaneRuntime::with_capacities(4096, 16, 8, 8);
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 4096,
+                    buffer_slots: 16,
+                    frame_capacity: 8,
+                    frame_slots: 8,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
         let (input, handle, output_state) = install_listener_runtime(&runtime);
 
         for offset in 0..TCP_LISTENER_BACKLOG {
@@ -741,7 +680,16 @@ mod tests {
 
     #[test]
     fn passive_tfo_valid_cookie_bypasses_listener_backlog() {
-        let runtime = DataPlaneRuntime::with_capacities(4096, 16, 8, 8);
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 4096,
+                    buffer_slots: 16,
+                    frame_capacity: 8,
+                    frame_slots: 8,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
         let (input, handle, output_state) = install_listener_runtime(&runtime);
 
         for offset in 0..TCP_LISTENER_BACKLOG {
@@ -845,7 +793,7 @@ mod tests {
     }
 
     fn send_packet(runtime: &DataPlaneRuntime, node: NodeId, packet: std::vec::Vec<u8>) {
-        let mut frame = runtime.alloc_frame().expect("frame");
+        let mut frame = runtime.buffers().get_next_frame(node).expect("frame");
         let buffer = runtime.alloc_index_with_bytes(&packet).expect("packet");
         let cursor = tcp_control_cursor(&packet).expect("cursor");
         let mut data_buffer = runtime.get_buffer_mut(buffer).expect("buffer mut");
@@ -856,7 +804,7 @@ mod tests {
         network.ip_mut().set_ip_version(Some(ip_version));
         network.ip_mut().set_ip_protocol(Some(6));
         frame.push_index(buffer).expect("push packet");
-        runtime.submit_frame(frame, node).expect("submit");
+        runtime.put_next_frame(frame).expect("put next frame");
     }
 
     fn syn_packet() -> std::vec::Vec<u8> {

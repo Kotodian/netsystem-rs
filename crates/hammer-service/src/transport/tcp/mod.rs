@@ -452,13 +452,11 @@ fn enqueue_tcp_segment(
     output: &mut SessionQueueOutput,
     segment: TcpSegment,
 ) -> CoreResult<()> {
-    let mut owner = runtime.alloc_frame()?;
+    let mut owner = runtime.buffers().get_next_frame(output_next.node())?;
     let index = runtime.buffers().alloc_index()?;
     owner.push_index(index)?;
     segment.write_to_buffer(runtime.buffers(), index)?;
-    for index in owner.drain_pending() {
-        output.enqueue(runtime, output_next.node(), index);
-    }
+    output.enqueue_frame(runtime, owner)?;
     Ok(())
 }
 
@@ -547,7 +545,17 @@ where
     install_tcp_worker_state(worker_state);
     let mut driver = SessionDriverRuntime::new(
         DataWorkerId::new(0),
-        hammer_adapter::DataPlaneBuffers::with_capacities(2048, 4, 4, 4),
+        hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffer_slot_capacity: 2048,
+                buffer_slots: 4,
+                frame_capacity: 4,
+                frame_slots: 4,
+                ..hammer_adapter::DataPlaneBufferConfig::default()
+            },
+        })
+        .buffers()
+        .clone(),
     );
     let session_id = driver
         .insert_session_with_id(|session_id: SessionId| {
@@ -903,7 +911,16 @@ mod tests {
 
     #[test]
     fn session_tcp_delayed_ack_timer_emits_ack_after_first_clean_payload() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 32, 8, 8);
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 2048,
+                    buffer_slots: 32,
+                    frame_capacity: 8,
+                    frame_slots: 8,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
         let (output_node, lookup_state, drop_state) = tcp_output_graph(&runtime);
         let mut worker_state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
         set_tcp_worker_state(&mut worker_state);
@@ -1124,7 +1141,16 @@ mod tests {
 
     #[test]
     fn tcp_time_wait_expiry_closes_session() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 2048,
+                    buffer_slots: 16,
+                    frame_capacity: 8,
+                    frame_slots: 8,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
         let (output_node, _, _) = tcp_output_graph(&runtime);
         let (mut driver, session_id, local, remote) = closing_session_for_test::<BbrController>();
 

@@ -12,6 +12,18 @@ use hammer_runtime::app::AppSession;
 
 use crate::session::{SessionId, SessionReadyQueue};
 
+#[derive(Debug, thiserror::Error)]
+enum SessionAppRuntimeError {
+    #[error("session TX event queue allocation failed")]
+    TxEventQueue,
+}
+
+impl From<SessionAppRuntimeError> for CoreError {
+    fn from(error: SessionAppRuntimeError) -> Self {
+        CoreError::lifecycle("session app", error.to_string())
+    }
+}
+
 pub struct SessionAppRuntime<S: Segment> {
     buffers: DataPlaneBuffers,
     sessions: FlatHashTable<u64, Arc<AppSession<S>>>,
@@ -103,7 +115,7 @@ impl<S: Segment> SessionAppRuntime<S> {
         Ok(())
     }
 
-    pub(crate) fn ack_pending_send_bytes(
+    pub(crate) fn discard_acked_tx_bytes(
         &mut self,
         session_id: SessionId,
         len: usize,
@@ -214,8 +226,6 @@ impl<S: Segment> SessionAppRuntime<S> {
         index: BufferIndex,
         offset: u32,
     ) -> CoreResult<(u32, Option<u32>, u32)> {
-        let mut owner = buffers.alloc_frame()?;
-        owner.push_index(index)?;
         let Some(session) = self.sessions.lookup(&session_id.get()) else {
             return Ok((0, None, 0));
         };
@@ -239,7 +249,7 @@ impl<S: Segment> SessionAppRuntime<S> {
         Ok((delivered, Some(offset), total_len))
     }
 
-    pub(crate) fn free_pending_send(&mut self, session_id: SessionId) {
+    pub(crate) fn discard_all_tx_bytes_for_session(&mut self, session_id: SessionId) {
         if let Some(session) = self.sessions.lookup(&session_id.get()) {
             let _ = session.drop_tx_acked(session.tx_fifo().max_dequeue());
         }
@@ -279,17 +289,25 @@ impl<S: Segment> SessionAppRuntime<S> {
 
 impl SessionAppRuntime<Local> {
     #[inline]
-    pub fn default_local() -> Self {
+    pub fn default_local() -> CoreResult<Self> {
         let tx_evt_q = Arc::new(
-            MsgQueue::<Local>::with_capacity(2048).expect("default tx event queue capacity"),
+            MsgQueue::<Local>::with_capacity(2048)
+                .map_err(|_| SessionAppRuntimeError::TxEventQueue)?,
         );
-        Self::new(
+        let mut config = hammer_core::config::Config::default();
+        config.worker.buffer.slot_bytes = 2048;
+        config.worker.buffer.slots_per_numa = 1;
+        config.worker.buffer.frame_capacity = hammer_adapter::buffer::DEFAULT_BUFFER_FRAME_CAPACITY;
+        config.worker.buffer.frame_pool_size =
+            hammer_adapter::buffer::DEFAULT_BUFFER_FRAME_POOL_SIZE;
+        let runtime = hammer_runtime::new_worker_runtime(&config);
+        Ok(Self::new(
             1024,
-            DataPlaneBuffers::with_buffer_capacity(2048, 1),
+            runtime.buffers().clone(),
             tx_evt_q,
             0,
             Local::default(),
-        )
+        ))
     }
 }
 

@@ -73,7 +73,7 @@ impl<K: FlatHashKey, V: Clone> FlatHashTable<K, V> {
 
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
-        Self::with_capacity_in(capacity, Arc::new(Heap::local(0)))
+        Self::with_capacity_in(capacity, Arc::new(Heap::local()))
     }
 
     /// Allocates the bucket storage from the provided `heap`. The
