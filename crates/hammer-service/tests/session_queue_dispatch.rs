@@ -378,9 +378,14 @@ fn session_tx_packetizes_by_send_goal_size_without_gso_metadata() {
         .into();
     dispatch_session_queue_for_ticks(&runtime, &mut driver, 0, next)
         .expect("dispatch session queue");
+    let _ = runtime.run_ready_nodes().expect("run capture node");
 
     let protocol = driver.session(session_id).expect("protocol state");
     assert_eq!(protocol.send_params_calls, 1);
     assert_eq!(protocol.push_header_calls, 1);
     assert_eq!(protocol.pushed_batches, vec![vec![(0, 12), (12, 12)]]);
+    let capture = capture_state.lock().expect("capture state");
+    assert_eq!(capture.packets.len(), 2);
+    assert_eq!(capture.packets[0].len(), 12);
+    assert_eq!(capture.packets[1].len(), 12);
 }
