@@ -167,14 +167,6 @@ where
                 queue.mark_ready(session_id);
             }
         }
-        let timer_mask = (1u16 << TCP_TIMER_RETRANSMIT)
-            | (1u16 << TCP_TIMER_RACK)
-            | (1u16 << TCP_TIMER_TLP)
-            | (1u16 << TCP_TIMER_DELAYED_ACK)
-            | (1u16 << TCP_TIMER_PERSIST)
-            | (1u16 << TCP_TIMER_KEEP_ALIVE)
-            | (1u16 << TCP_TIMER_PACING)
-            | (1u16 << TCP_TIMER_TIME_WAIT);
         let now = std::time::Instant::now();
         let connection: *const crate::transport::tcp::TcpConnection<C> =
             queue.session(session_id).ok_or_else(|| {
@@ -183,16 +175,10 @@ where
                 TcpNodeError::RcvProcessSessionMissing
             })? as *const _;
         let connection = unsafe { &*connection };
-        // Prior per-site predicate was `(timer_mask & bit) != 0 ||
-        // timer_is_active(id)`, i.e. keep_mask = timer_mask | active.
-        // `timer_ticks` self-gates on active, so an allowlisted-but-inactive
-        // timer yields `None` and is cancelled.
-        let keep_mask = timer_mask | connection.active_timer_mask();
-        crate::session::protocol::refresh_tcp_timers(
+        crate::transport::tcp::sync_all_tcp_timers(
             queue.timers_mut(),
             connection,
             session_id.pool_index(),
-            keep_mask,
             now,
         )?;
         publish_tcp_connection(&mut queue, session_id)?;

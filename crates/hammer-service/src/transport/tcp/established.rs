@@ -250,19 +250,12 @@ where
         );
         let now = std::time::Instant::now();
         let connection = unsafe { &*connection };
-        // Established-state timer allowlist excludes TIME_WAIT (only armed in
-        // TimeWait). `timer_ticks` self-gates on `timer_is_active`, so the
-        // bare allowlist is the correct keep-mask: an allowlisted-but-inactive
-        // timer yields `None` and is cancelled, matching the prior per-site
-        // gate.
-        const ESTABLISHED_TIMER_KEEP_MASK: u16 = (1u16 << TCP_TIMER_RETRANSMIT)
-            | (1u16 << TCP_TIMER_RACK)
-            | (1u16 << TCP_TIMER_TLP)
-            | (1u16 << TCP_TIMER_DELAYED_ACK)
-            | (1u16 << TCP_TIMER_PERSIST)
-            | (1u16 << TCP_TIMER_KEEP_ALIVE)
-            | (1u16 << TCP_TIMER_PACING);
-        context.refresh_tcp_timers(connection, ESTABLISHED_TIMER_KEEP_MASK, now)?;
+        crate::transport::tcp::sync_all_tcp_timers(
+            context.timer_wheel(),
+            connection,
+            session_id.pool_index(),
+            now,
+        )?;
         let connection = queue.session(session_id).ok_or_else(|| {
             let _ =
                 runtime.record_current_node_error(TcpNodeError::EstablishedSessionMissing.code());

@@ -225,6 +225,7 @@ pub struct TcpConnectionCacheline0 {
     state: TcpState,
     timers: TcpTimerState,
     pacing_ready: bool,
+    pending_control_output: Option<TcpSegment>,
     local: Option<SocketAddr>,
     remote: SocketAddr,
     iss: TcpSeq,
@@ -339,6 +340,21 @@ where
     }
 
     #[inline]
+    pub(crate) fn queue_pending_control_output(&mut self, segment: TcpSegment) {
+        self.pending_control_output = Some(segment);
+    }
+
+    #[inline]
+    pub(crate) fn take_pending_control_output(&mut self) -> Option<TcpSegment> {
+        self.pending_control_output.take()
+    }
+
+    #[inline]
+    pub(crate) fn has_pending_control_output(&self) -> bool {
+        self.pending_control_output.is_some()
+    }
+
+    #[inline]
     pub fn new(
         connection_id: Option<TcpConnectionId>,
         owner_worker: DataWorkerId,
@@ -351,6 +367,7 @@ where
                 state: TcpState::Closed,
                 timers: TcpTimerState::default(),
                 pacing_ready: false,
+                pending_control_output: None,
                 local,
                 remote,
                 iss: TcpSeq::from(0),
@@ -3786,21 +3803,20 @@ mod tests {
             payload_offset: 0,
             payload_len: 0,
         };
-        let (keep_mask, now) = {
+        let now = {
             let connection = driver.session_mut(session_id).expect("connection");
             let _ = connection
                 .receive_close_side(&packet)
                 .expect("receive fin ack");
-            (connection.active_timer_mask(), std::time::Instant::now())
+            std::time::Instant::now()
         };
         let session = session_id.pool_index();
         let connection: *const TcpConnection<C> =
             driver.session(session_id).expect("connection") as *const _;
-        crate::session::protocol::refresh_tcp_timers(
+        crate::transport::tcp::sync_all_tcp_timers(
             driver.timers_mut(),
             unsafe { &*connection },
             session,
-            keep_mask,
             now,
         )
         .expect("sync time wait timer");
