@@ -225,7 +225,6 @@ pub struct TcpConnectionCacheline0 {
     state: TcpState,
     timers: TcpTimerState,
     pacing_ready: bool,
-    pending_control_output: Option<TcpSegment>,
     local: Option<SocketAddr>,
     remote: SocketAddr,
     iss: TcpSeq,
@@ -340,21 +339,6 @@ where
     }
 
     #[inline]
-    pub(crate) fn queue_pending_control_output(&mut self, segment: TcpSegment) {
-        self.pending_control_output = Some(segment);
-    }
-
-    #[inline]
-    pub(crate) fn take_pending_control_output(&mut self) -> Option<TcpSegment> {
-        self.pending_control_output.take()
-    }
-
-    #[inline]
-    pub(crate) fn has_pending_control_output(&self) -> bool {
-        self.pending_control_output.is_some()
-    }
-
-    #[inline]
     pub fn new(
         connection_id: Option<TcpConnectionId>,
         owner_worker: DataWorkerId,
@@ -367,7 +351,6 @@ where
                 state: TcpState::Closed,
                 timers: TcpTimerState::default(),
                 pacing_ready: false,
-                pending_control_output: None,
                 local,
                 remote,
                 iss: TcpSeq::from(0),
