@@ -83,3 +83,22 @@
 - `hammer-service` unit-test verification is currently blocked by an unrelated pre-existing compile failure in `crates/hammer-service/src/transport/tcp/input.rs:884`:
   - `error[E0425]: cannot find value 'node' in this scope`
 - Because of that blocker, I could not produce a green `hammer-service` test run for the two new lookup tests from this task, even though the task-specific missing-trait and missing-helper errors are resolved.
+
+## Follow-up: compile blocker fix
+
+- Reordered the `tcp_input_handoffs_existing_session_to_owner_worker` test setup in `crates/hammer-service/src/transport/tcp/input.rs` so `node` is registered before `runtime.buffers().get_next_frame(node)` is called.
+- This matches the nearby working test pattern and removes the compile blocker without changing task logic.
+
+### Verification
+
+- `cargo test -p hammer-service --lib tcp_listener_key_works_as_bihash_key -- --nocapture`
+  - Passed.
+  - Result: `1 passed; 0 failed`
+- `cargo test -p hammer-service --lib pool_index_bihash_value_round_trip -- --nocapture`
+  - Passed.
+  - Result: `1 passed; 0 failed`
+
+### Current status
+
+- The earlier `node`-before-declaration compile error no longer appears in focused `hammer-service` verification.
+- No additional code paths were changed for Task 2.

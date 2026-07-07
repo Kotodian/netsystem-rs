@@ -881,7 +881,6 @@ mod tests {
         let mut worker_state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
         set_tcp_worker_state(&mut worker_state);
         let handle = install_tcp_session(&runtime, DataWorkerId::new(1), 50_066);
-        let mut frame = runtime.buffers().get_next_frame(node).expect("alloc frame");
         let packet = tcp_packet(
             Ipv4Addr::new(198, 51, 100, 50_066u16 as u8),
             443,
@@ -892,7 +891,6 @@ mod tests {
             .alloc_index_with_bytes(&packet)
             .expect("alloc packet");
         stamp_tcp_cursor(&runtime, index, &packet);
-        frame.push_index(index).expect("push packet");
 
         let control = TcpInputControlPlane::new();
         let (_, _, _, _, _, reset, nexts) = register_tcp_input_test_nexts!(runtime);
@@ -901,6 +899,8 @@ mod tests {
             Some(handle),
             Some((HANDOFF_HANDLE, DataWorkerId::new(0))),
         ));
+        let mut frame = runtime.buffers().get_next_frame(node).expect("alloc frame");
+        frame.push_index(index).expect("push packet");
 
         runtime.put_next_frame(frame).expect("put next frame");
         assert!(runtime.run_ready_nodes().expect("run input") >= 1);
