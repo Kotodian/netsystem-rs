@@ -1,13 +1,14 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use hammer_adapter::{
-    DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId,
+    BufferFrame, DataPlaneBufferConfig, DataPlaneBuffers, DataPlaneRuntime,
+    DataPlaneRuntimeConfig, DataWorkerId, InternalNode, Node, NodeProcessFn, NodeRegistration,
+    NodeResult, NodeRuntimeData,
 };
 use hammer_core::error::CoreResult;
 use hammer_infra::segment::Local;
 use hammer_runtime::app::{AppSession, AppSessionConfig, SessionHandle};
-use hammer_service::data_plane::DropNode;
 use hammer_service::session::SessionQueueNext;
 use hammer_service::session::protocol::SessionQueueControlContext;
 use hammer_service::session::runtime::{
@@ -33,12 +34,26 @@ fn test_runtime_configured(
     DataPlaneRuntime::new(config)
 }
 
-#[derive(Default)]
 struct TestTxProtocol {
     offset: usize,
     send_params_calls: usize,
     push_header_calls: usize,
     pushed_batches: std::vec::Vec<std::vec::Vec<(usize, usize)>>,
+    runtime: DataPlaneRuntime,
+    events: Arc<Mutex<std::vec::Vec<&'static str>>>,
+}
+
+impl Default for TestTxProtocol {
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            send_params_calls: 0,
+            push_header_calls: 0,
+            pushed_batches: std::vec::Vec::new(),
+            runtime: test_runtime_configured(2048, 64, 64, 8),
+            events: Arc::new(Mutex::new(std::vec::Vec::new())),
+        }
+    }
 }
 
 impl SessionQueueProtocol for TestTxProtocol {
@@ -85,6 +100,11 @@ impl SessionQueueProtocol for TestTxProtocol {
         batch: &[TxBatchBuffer],
         _: Instant,
     ) -> CoreResult<()> {
+        let _ = self.runtime.run_ready_nodes()?;
+        self.events
+            .lock()
+            .expect("events")
+            .push("transport_commit");
         self.push_header_calls += 1;
         self.pushed_batches.push(
             batch
@@ -114,15 +134,118 @@ impl SessionQueueProtocol for TestTxProtocol {
     fn on_close(&mut self, _: &mut SessionQueueControlContext) {}
 }
 
+#[derive(Default)]
+struct CaptureState {
+    packets: std::vec::Vec<std::vec::Vec<u8>>,
+    events: Arc<Mutex<std::vec::Vec<&'static str>>>,
+}
+
+struct CaptureNode {
+    runtime_data: NodeRuntimeData,
+}
+
+impl CaptureNode {
+    fn new(state: Arc<Mutex<CaptureState>>) -> Self {
+        let mut states = capture_states().lock().expect("capture registry");
+        let slot = states.len();
+        states.push(state);
+        Self {
+            runtime_data: NodeRuntimeData::from_usize(slot).expect("capture slot"),
+        }
+    }
+}
+
+impl Node for CaptureNode {
+    fn process(&mut self, _: &DataPlaneRuntime, _: &mut BufferFrame) -> NodeResult {
+        NodeResult::drop()
+    }
+
+    fn node_process(&self) -> NodeProcessFn {
+        capture_process
+    }
+
+    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        Ok(self.runtime_data)
+    }
+}
+
+impl InternalNode for CaptureNode {
+    fn node_registration(&self) -> NodeRegistration
+    where
+        Self: Sized,
+    {
+        NodeRegistration::Plain
+    }
+}
+
+fn capture_states() -> &'static Mutex<std::vec::Vec<Arc<Mutex<CaptureState>>>> {
+    static STATES: OnceLock<Mutex<std::vec::Vec<Arc<Mutex<CaptureState>>>>> = OnceLock::new();
+    STATES.get_or_init(|| Mutex::new(std::vec::Vec::new()))
+}
+
+fn chain_bytes(
+    buffers: &DataPlaneBuffers,
+    index: hammer_adapter::BufferIndex,
+) -> CoreResult<hammer_infra::vec::Vec<u8>> {
+    let mut bytes = hammer_infra::vec::Vec::new();
+    for buffer in buffers.chain(index) {
+        bytes.extend_from_slice(buffer?.current());
+    }
+    Ok(bytes)
+}
+
+fn capture_process(
+    runtime: &DataPlaneRuntime,
+    data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> NodeResult {
+    let slot = match data.usize_word(0) {
+        Ok(s) => s,
+        Err(_) => return NodeResult::drop(),
+    };
+    let state = {
+        let states = capture_states().lock().expect("capture registry");
+        match states.get(slot) {
+            Some(s) => Arc::clone(s),
+            None => return NodeResult::drop(),
+        }
+    };
+    let mut state = state.lock().expect("capture state");
+    state
+        .events
+        .lock()
+        .expect("events")
+        .push("graph_visible");
+    for &index in frame.pending_indices() {
+        let packet = match chain_bytes(runtime.buffers(), index) {
+            Ok(bytes) => bytes,
+            Err(_) => return NodeResult::drop(),
+        };
+        state.packets.push(packet.to_vec());
+    }
+    NodeResult::drop()
+}
+
 #[test]
 fn session_tx_dispatch_commits_batch_before_graph_visibility() {
     // frame_capacity must be >= DEFAULT_TX_DISPATCH_BUDGET (64) so that
     // output.schedule can push all indices into one frame.
     let runtime = test_runtime_configured(2048, 64, 64, 8);
     let buffers = runtime.buffers();
-    let mut driver =
-        SessionDriverRuntime::<TestTxProtocol, Local>::new(DataWorkerId::new(0), buffers.clone());
-    let session_id = driver.insert_session(TestTxProtocol::default());
+    let events = Arc::new(Mutex::new(std::vec::Vec::new()));
+    let capture_state = Arc::new(Mutex::new(CaptureState {
+        packets: std::vec::Vec::new(),
+        events: Arc::clone(&events),
+    }));
+    let mut driver = SessionDriverRuntime::<TestTxProtocol, Local>::new(
+        DataWorkerId::new(0),
+        buffers.clone(),
+    );
+    let session_id = driver.insert_session(TestTxProtocol {
+        runtime: runtime.clone(),
+        events: Arc::clone(&events),
+        ..TestTxProtocol::default()
+    });
 
     let app_session = Arc::new(
         AppSession::<Local>::new_in_segment(
@@ -140,9 +263,13 @@ fn session_tx_dispatch_commits_batch_before_graph_visibility() {
     driver.app_mut().attach_session(session_id, app_session);
     driver.mark_ready(session_id);
 
-    let next: SessionQueueNext = runtime.nodes().register_internal(DropNode::new()).into();
+    let next: SessionQueueNext = runtime
+        .nodes()
+        .register_internal(CaptureNode::new(Arc::clone(&capture_state)))
+        .into();
     dispatch_session_queue_for_ticks(&runtime, &mut driver, 0, next)
         .expect("dispatch session queue");
+    let _ = runtime.run_ready_nodes().expect("run capture node");
 
     let protocol = driver.session(session_id).expect("protocol state");
     assert_eq!(protocol.send_params_calls, 1);
@@ -150,5 +277,11 @@ fn session_tx_dispatch_commits_batch_before_graph_visibility() {
     assert_eq!(
         protocol.pushed_batches,
         vec![vec![(0, 4), (4, 4), (8, 4), (12, 4)]]
+    );
+    let capture = capture_state.lock().expect("capture state");
+    assert_eq!(capture.packets.len(), 4);
+    assert_eq!(
+        *events.lock().expect("events"),
+        vec!["transport_commit", "graph_visible"]
     );
 }

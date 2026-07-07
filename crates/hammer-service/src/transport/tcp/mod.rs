@@ -909,6 +909,71 @@ mod tests {
     }
 
     #[test]
+    fn session_tcp_normal_tx_commits_transport_state_before_ack_cleanup() {
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 2048,
+                    buffer_slots: 32,
+                    frame_capacity: 8,
+                    frame_slots: 8,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
+        let (output_node, lookup_state, drop_state) = tcp_output_graph(&runtime);
+        let mut worker_state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
+        set_tcp_worker_state(&mut worker_state);
+        let mut driver = SessionDriverRuntime::new(DataWorkerId::new(0), runtime.buffers().clone());
+        let session_id = driver
+            .insert_session_with_id(|_| established_tcp_connection())
+            .expect("insert session");
+        publish_tcp_connection(&mut driver, session_id).expect("refresh session route");
+
+        let app_session = Arc::new(
+            hammer_runtime::app::AppSession::new_in_segment(
+                hammer_infra::segment::Local::default(),
+                hammer_runtime::app::AppSessionConfig::new(256, 64),
+                hammer_runtime::app::SessionHandle::new(session_id.pool_index().slot() as u32, 0),
+                driver.app().tx_evt_q().clone(),
+            )
+            .expect("create app session"),
+        );
+        let payload = b"ping";
+        app_session.send_bytes(payload).expect("send tx payload");
+        driver.app_mut().attach_session(session_id, app_session);
+        driver.mark_ready(session_id);
+
+        let initial_snd_nxt = driver
+            .session(session_id)
+            .expect("connection")
+            .snd_nxt();
+
+        let next: crate::session::SessionQueueNext = output_node.into();
+        let dispatched =
+            dispatch_session_queue_for_ticks(&runtime, &mut driver, 0, next).expect("dispatch tx");
+        assert!(dispatched.ready_sessions >= 1);
+        let _ = runtime.run_ready_nodes().expect("run tcp output");
+
+        let connection = driver.session(session_id).expect("connection");
+        assert_eq!(
+            connection.snd_nxt(),
+            initial_snd_nxt.wrapping_add(payload.len() as u32)
+        );
+        assert_eq!(
+            driver
+                .app()
+                .pending_send_len(session_id)
+                .expect("pending send len"),
+            Some(payload.len())
+        );
+
+        assert!(drop_state.lock().expect("drop").packets.is_empty());
+        let packets = &lookup_state.lock().expect("lookup").packets;
+        assert_eq!(packets.len(), 1);
+        assert_eq!(tcp_segment_payload(&packets[0]), payload);
+    }
+
+    #[test]
     fn session_tcp_delayed_ack_timer_emits_ack_after_first_clean_payload() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
