@@ -107,7 +107,7 @@ fn bihash_prefetch_accepts_empty_and_present_keys() {
 // ── ValuePage / Kv / FREE_U64 ──────────────────────────────────────────
 
 use hammer_infra::bihash::alloc::PageAlloc;
-use hammer_infra::bihash::value::{Kv, ValuePage, FREE_U64};
+use hammer_infra::bihash::value::{FREE_U64, Kv, ValuePage};
 
 #[test]
 fn kv_u64_mark_free_sets_sentinel_in_value() {

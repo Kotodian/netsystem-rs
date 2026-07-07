@@ -11,8 +11,7 @@ use hammer_core::protocol::tcp::{
     TcpCapabilities, TcpConnectionId, TcpFastOpenCookie, TcpTimestampOption,
 };
 use hammer_core::protocol::transport::TransportConnectionKey;
-use hammer_infra::bihash::{BihashKey, FREE_U64};
-use hammer_infra::map::{FlatHashKey, FlatHashTable};
+use hammer_infra::bihash::{Bihash, BihashKey, FREE_U64};
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::vec::Vec;
 
@@ -58,19 +57,19 @@ pub(crate) fn tcp_worker_state_mut() -> &'static mut TcpWorkerOwnedState {
     unsafe { &mut *ptr }
 }
 
-#[derive(Debug)]
 struct TcpConnectionRouteIndex {
     entries: Pool<TcpConnectionRouteEntry>,
-    session_slots: FlatHashTable<u64, PoolIndex>,
-    connection_slots: FlatHashTable<u64, PoolIndex>,
-    tuple_slots: FlatHashTable<TransportConnectionKey, PoolIndex>,
+    session_slots: Bihash<u64, 7>,
+    connection_slots: Bihash<u64, 7>,
+    tuple_slots_v4: Bihash<TransportConnectionKey<Ipv4Addr>, 3>,
+    tuple_slots_v6: Bihash<TransportConnectionKey<Ipv6Addr>, 1>,
 }
 
-#[derive(Debug)]
 struct TcpPendingRouteIndex {
     entries: Pool<TcpPendingRouteEntry>,
-    session_slots: FlatHashTable<u64, PoolIndex>,
-    tuple_slots: FlatHashTable<TransportConnectionKey, PoolIndex>,
+    session_slots: Bihash<u64, 7>,
+    tuple_slots_v4: Bihash<TransportConnectionKey<Ipv4Addr>, 3>,
+    tuple_slots_v6: Bihash<TransportConnectionKey<Ipv6Addr>, 1>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,9 +113,31 @@ impl TcpConnectionRouteEntry {
     }
 
     #[inline]
-    fn tuple_key(self) -> Option<TransportConnectionKey> {
-        self.local
-            .and_then(|local| TransportConnectionKey::from_socket_addrs(0, local, self.remote))
+    fn tuple_key_v4(self) -> Option<TransportConnectionKey<Ipv4Addr>> {
+        match (self.local?, self.remote) {
+            (SocketAddr::V4(local), SocketAddr::V4(remote)) => Some(TransportConnectionKey::new(
+                0,
+                *local.ip(),
+                local.port(),
+                *remote.ip(),
+                remote.port(),
+            )),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn tuple_key_v6(self) -> Option<TransportConnectionKey<Ipv6Addr>> {
+        match (self.local?, self.remote) {
+            (SocketAddr::V6(local), SocketAddr::V6(remote)) => Some(TransportConnectionKey::new(
+                0,
+                *local.ip(),
+                local.port(),
+                *remote.ip(),
+                remote.port(),
+            )),
+            _ => None,
+        }
     }
 }
 
@@ -141,9 +162,31 @@ impl TcpPendingRouteEntry {
     }
 
     #[inline]
-    fn tuple_key(self) -> Option<TransportConnectionKey> {
-        self.local
-            .and_then(|local| TransportConnectionKey::from_socket_addrs(0, local, self.remote))
+    fn tuple_key_v4(self) -> Option<TransportConnectionKey<Ipv4Addr>> {
+        match (self.local?, self.remote) {
+            (SocketAddr::V4(local), SocketAddr::V4(remote)) => Some(TransportConnectionKey::new(
+                0,
+                *local.ip(),
+                local.port(),
+                *remote.ip(),
+                remote.port(),
+            )),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn tuple_key_v6(self) -> Option<TransportConnectionKey<Ipv6Addr>> {
+        match (self.local?, self.remote) {
+            (SocketAddr::V6(local), SocketAddr::V6(remote)) => Some(TransportConnectionKey::new(
+                0,
+                *local.ip(),
+                local.port(),
+                *remote.ip(),
+                remote.port(),
+            )),
+            _ => None,
+        }
     }
 }
 
@@ -210,11 +253,11 @@ fn pool_index_from_bihash_value(value: u64) -> PoolIndex {
     PoolIndex::new(value as u32, (value >> 32) as u32)
 }
 
-#[derive(Debug)]
 struct TcpListenerPendingTable {
     entries: Pool<TcpListenerPendingEntry>,
-    tuple_index: FlatHashTable<TransportConnectionKey, PoolIndex>,
-    listener_counts: FlatHashTable<TcpLookupId, usize>,
+    tuple_index_v4: Bihash<TransportConnectionKey<Ipv4Addr>, 3>,
+    tuple_index_v6: Bihash<TransportConnectionKey<Ipv6Addr>, 1>,
+    listener_counts: Bihash<u32, 5>,
     epoch_buckets: [Vec<PoolIndex>; TCP_LISTENER_PENDING_BUCKET_COUNT],
     bucket_epochs: [u32; TCP_LISTENER_PENDING_BUCKET_COUNT],
     pruned_epoch: Option<u32>,
@@ -225,8 +268,9 @@ impl Default for TcpListenerPendingTable {
     fn default() -> Self {
         Self {
             entries: Pool::with_capacity(TCP_LISTENER_PENDING_CAPACITY),
-            tuple_index: FlatHashTable::with_capacity(TCP_LISTENER_PENDING_CAPACITY),
-            listener_counts: FlatHashTable::new(),
+            tuple_index_v4: Bihash::new(TCP_LISTENER_PENDING_CAPACITY as u32),
+            tuple_index_v6: Bihash::new(TCP_LISTENER_PENDING_CAPACITY as u32),
+            listener_counts: Bihash::new(64),
             epoch_buckets: std::array::from_fn(|_| Vec::new()),
             bucket_epochs: [0; TCP_LISTENER_PENDING_BUCKET_COUNT],
             pruned_epoch: None,
@@ -249,11 +293,9 @@ impl TcpListenerPendingTable {
         current_epoch: u32,
     ) -> bool {
         self.prune(current_epoch);
-        let Some(key) = TransportConnectionKey::from_socket_addrs(0, local, remote) else {
-            return false;
-        };
-        if let Some(index) = self.tuple_index.lookup(&key) {
+        if let Some(index) = self.lookup_tuple_index(local, remote) {
             let Some(existing) = self.entries.get_mut(index) else {
+                self.remove_tuple_index(local, remote);
                 return false;
             };
             if existing.listener_id != listener_id {
@@ -270,7 +312,7 @@ impl TcpListenerPendingTable {
             return true;
         }
         let limit = backlog.max(1).min(TCP_LISTENER_BACKLOG_LIMIT);
-        let used = self.listener_counts.lookup(&listener_id).unwrap_or(0);
+        let used = self.listener_counts.lookup(&listener_id).unwrap_or(0) as usize;
         if used >= limit {
             return false;
         }
@@ -286,8 +328,11 @@ impl TcpListenerPendingTable {
         }) else {
             return false;
         };
-        self.tuple_index.insert(key, index);
-        self.listener_counts.insert(listener_id, used + 1);
+        if !self.insert_tuple_index(local, remote, index) {
+            let _ = self.entries.remove(index);
+            return false;
+        }
+        self.listener_counts.insert(listener_id, (used + 1) as u64);
         self.push_epoch_bucket(current_epoch, index);
         true
     }
@@ -301,8 +346,7 @@ impl TcpListenerPendingTable {
         current_epoch: u32,
     ) -> Option<(u32, u16, TcpCapabilities, Option<TcpTimestampOption>)> {
         self.prune(current_epoch);
-        let key = TransportConnectionKey::from_socket_addrs(0, local, remote)?;
-        let index = self.tuple_index.lookup(&key)?;
+        let index = self.lookup_tuple_index(local, remote)?;
         let entry = self.entries.get(index)?;
         if entry.listener_id != listener_id {
             return None;
@@ -318,27 +362,22 @@ impl TcpListenerPendingTable {
     #[inline]
     fn contains(&mut self, local: SocketAddr, remote: SocketAddr, current_epoch: u32) -> bool {
         self.prune(current_epoch);
-        let Some(key) = TransportConnectionKey::from_socket_addrs(0, local, remote) else {
-            return false;
-        };
-        self.tuple_index.lookup(&key).is_some()
+        self.lookup_tuple_index(local, remote).is_some()
     }
 
     #[inline]
     fn finish(&mut self, listener_id: TcpLookupId, local: SocketAddr, remote: SocketAddr) {
-        let Some(key) = TransportConnectionKey::from_socket_addrs(0, local, remote) else {
-            return;
-        };
-        let Some(index) = self.tuple_index.lookup(&key) else {
+        let Some(index) = self.lookup_tuple_index(local, remote) else {
             return;
         };
         let Some(entry) = self.entries.get(index) else {
+            self.remove_tuple_index(local, remote);
             return;
         };
         if entry.listener_id != listener_id {
             return;
         }
-        self.remove_index(index, key, listener_id);
+        self.remove_index(index, listener_id);
     }
 
     #[inline]
@@ -363,15 +402,10 @@ impl TcpListenerPendingTable {
                 if entry.created_epoch != bucket_epoch {
                     continue;
                 }
-                let Some(key) =
-                    TransportConnectionKey::from_socket_addrs(0, entry.local, entry.remote)
-                else {
-                    continue;
-                };
-                if self.tuple_index.lookup(&key) != Some(index) {
+                if self.lookup_tuple_index(entry.local, entry.remote) != Some(index) {
                     continue;
                 }
-                self.remove_index(index, key, entry.listener_id);
+                self.remove_index(index, entry.listener_id);
             }
         }
         self.pruned_epoch = Some(current_epoch);
@@ -380,16 +414,13 @@ impl TcpListenerPendingTable {
     #[cfg(test)]
     #[inline]
     fn entry_count(&self, listener_id: TcpLookupId) -> usize {
-        self.listener_counts.lookup(&listener_id).unwrap_or(0)
+        self.listener_counts.lookup(&listener_id).unwrap_or(0) as usize
     }
 
     #[cfg(test)]
     #[inline]
     fn has_entry(&self, listener_id: TcpLookupId, local: SocketAddr, remote: SocketAddr) -> bool {
-        let Some(key) = TransportConnectionKey::from_socket_addrs(0, local, remote) else {
-            return false;
-        };
-        let Some(index) = self.tuple_index.lookup(&key) else {
+        let Some(index) = self.lookup_tuple_index(local, remote) else {
             return false;
         };
         let Some(entry) = self.entries.get(index) else {
@@ -407,10 +438,7 @@ impl TcpListenerPendingTable {
         remote: SocketAddr,
         epoch: u32,
     ) -> bool {
-        let Some(key) = TransportConnectionKey::from_socket_addrs(0, local, remote) else {
-            return false;
-        };
-        let Some(index) = self.tuple_index.lookup(&key) else {
+        let Some(index) = self.lookup_tuple_index(local, remote) else {
             return false;
         };
         let Some(entry) = self.entries.get_mut(index) else {
@@ -436,13 +464,10 @@ impl TcpListenerPendingTable {
     }
 
     #[inline]
-    fn remove_index(
-        &mut self,
-        index: PoolIndex,
-        key: TransportConnectionKey,
-        listener_id: TcpLookupId,
-    ) {
-        self.tuple_index.remove(&key);
+    fn remove_index(&mut self, index: PoolIndex, listener_id: TcpLookupId) {
+        if let Some(entry) = self.entries.get(index).copied() {
+            self.remove_tuple_index(entry.local, entry.remote);
+        }
         let _ = self.entries.remove(index);
         if let Some(count) = self.listener_counts.lookup(&listener_id) {
             if count <= 1 {
@@ -464,21 +489,108 @@ impl TcpListenerPendingTable {
             if entry.created_epoch != bucket_epoch {
                 continue;
             }
-            let Some(key) = TransportConnectionKey::from_socket_addrs(0, entry.local, entry.remote)
-            else {
-                continue;
-            };
-            if self.tuple_index.lookup(&key) != Some(index) {
+            if self.lookup_tuple_index(entry.local, entry.remote) != Some(index) {
                 continue;
             }
-            self.remove_index(index, key, entry.listener_id);
+            self.remove_index(index, entry.listener_id);
+        }
+    }
+
+    #[inline]
+    fn lookup_tuple_index(&self, local: SocketAddr, remote: SocketAddr) -> Option<PoolIndex> {
+        match (local, remote) {
+            (SocketAddr::V4(local), SocketAddr::V4(remote)) => self
+                .tuple_index_v4
+                .lookup(&TransportConnectionKey::new(
+                    0,
+                    *local.ip(),
+                    local.port(),
+                    *remote.ip(),
+                    remote.port(),
+                ))
+                .map(pool_index_from_bihash_value),
+            (SocketAddr::V6(local), SocketAddr::V6(remote)) => self
+                .tuple_index_v6
+                .lookup(&TransportConnectionKey::new(
+                    0,
+                    *local.ip(),
+                    local.port(),
+                    *remote.ip(),
+                    remote.port(),
+                ))
+                .map(pool_index_from_bihash_value),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn insert_tuple_index(
+        &mut self,
+        local: SocketAddr,
+        remote: SocketAddr,
+        index: PoolIndex,
+    ) -> bool {
+        let value = pool_index_to_bihash_value(index);
+        match (local, remote) {
+            (SocketAddr::V4(local), SocketAddr::V4(remote)) => {
+                self.tuple_index_v4.insert(
+                    TransportConnectionKey::new(
+                        0,
+                        *local.ip(),
+                        local.port(),
+                        *remote.ip(),
+                        remote.port(),
+                    ),
+                    value,
+                );
+                true
+            }
+            (SocketAddr::V6(local), SocketAddr::V6(remote)) => {
+                self.tuple_index_v6.insert(
+                    TransportConnectionKey::new(
+                        0,
+                        *local.ip(),
+                        local.port(),
+                        *remote.ip(),
+                        remote.port(),
+                    ),
+                    value,
+                );
+                true
+            }
+            _ => false,
+        }
+    }
+
+    #[inline]
+    fn remove_tuple_index(&mut self, local: SocketAddr, remote: SocketAddr) {
+        match (local, remote) {
+            (SocketAddr::V4(local), SocketAddr::V4(remote)) => {
+                self.tuple_index_v4.remove(&TransportConnectionKey::new(
+                    0,
+                    *local.ip(),
+                    local.port(),
+                    *remote.ip(),
+                    remote.port(),
+                ));
+            }
+            (SocketAddr::V6(local), SocketAddr::V6(remote)) => {
+                self.tuple_index_v6.remove(&TransportConnectionKey::new(
+                    0,
+                    *local.ip(),
+                    local.port(),
+                    *remote.ip(),
+                    remote.port(),
+                ));
+            }
+            _ => {}
         }
     }
 }
 
 pub trait TcpListenerAddress: Copy + Eq {
     type Ip;
-    type Key: FlatHashKey + BihashKey + Default;
+    type Key: BihashKey + Default;
 
     fn key(scope_id: u32, local_addr: Self::Ip, local_port: u16) -> Self::Key;
 }
@@ -577,39 +689,56 @@ impl TcpV6ListenerKey {
     }
 }
 
-impl<A: TcpListenerAddress> FlatHashKey for TcpListenerKey<A> {
-    #[inline(always)]
-    fn hash_key(self) -> usize {
-        self.hash() as usize
-    }
-}
-
-#[derive(Debug, Clone)]
 pub struct TcpListenerTable<A: TcpListenerAddress> {
-    entries: FlatHashTable<A::Key, TcpLookupValue>,
+    values: Pool<TcpLookupValue>,
+    entries: Bihash<A::Key, 1>,
 }
 
 impl<A: TcpListenerAddress> TcpListenerTable<A> {
     #[inline]
     fn empty() -> Self {
         Self {
-            entries: FlatHashTable::new(),
+            values: Pool::with_capacity(64),
+            entries: Bihash::new(64),
         }
     }
 
     #[inline]
     pub fn lookup(&self, key: A::Key) -> Option<TcpLookupValue> {
-        self.entries.lookup(&key)
+        let index = pool_index_from_bihash_value(self.entries.lookup(&key)?);
+        self.values.get(index).copied()
     }
 
     #[inline]
     pub fn prefetch(&self, key: A::Key) {
-        self.entries.prefetch_key(&key);
+        self.entries.prefetch(&key);
     }
 
     #[inline]
     pub fn insert(&mut self, key: A::Key, value: TcpLookupValue) {
-        self.entries.insert(key, value);
+        if let Some(raw) = self.entries.lookup(&key) {
+            if let Some(slot) = self.values.get_mut(pool_index_from_bihash_value(raw)) {
+                *slot = value;
+                return;
+            }
+        }
+        let index = self
+            .values
+            .insert(value)
+            .expect("tcp listener lookup pool exhausted");
+        self.entries.insert(key, pool_index_to_bihash_value(index));
+    }
+}
+
+impl<A: TcpListenerAddress> Clone for TcpListenerTable<A> {
+    fn clone(&self) -> Self {
+        let mut cloned = Self::empty();
+        for (key, raw) in self.entries.iter() {
+            if let Some(value) = self.values.get(pool_index_from_bihash_value(*raw)).copied() {
+                cloned.insert(*key, value);
+            }
+        }
+        cloned
     }
 }
 
@@ -620,7 +749,7 @@ impl<A: TcpListenerAddress> Default for TcpListenerTable<A> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TcpListenerLookup {
     v4: TcpListenerTable<TcpIpv4ListenerAddress>,
     v6: TcpListenerTable<TcpIpv6ListenerAddress>,
@@ -663,7 +792,7 @@ impl Default for TcpListenerLookup {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TcpLookupSnapshot {
     listeners: TcpListenerLookup,
 }
@@ -745,9 +874,10 @@ impl TcpConnectionRouteIndex {
     pub fn empty() -> Self {
         Self {
             entries: Pool::with_capacity(1024),
-            session_slots: FlatHashTable::with_capacity(1024),
-            connection_slots: FlatHashTable::with_capacity(1024),
-            tuple_slots: FlatHashTable::with_capacity(1024),
+            session_slots: Bihash::new(1024),
+            connection_slots: Bihash::new(1024),
+            tuple_slots_v4: Bihash::new(1024),
+            tuple_slots_v6: Bihash::new(1024),
         }
     }
 
@@ -764,16 +894,23 @@ impl TcpConnectionRouteIndex {
         let entry =
             TcpConnectionRouteEntry::new(session_id, connection_id, local, remote, owner, next);
         let key = session_id.get();
-        if let Some(entry_index) = self.session_slots.lookup(&key) {
-            let old_entry = *self
-                .entries
-                .get(entry_index)
-                .expect("tcp connection route entry index is valid");
+        if let Some(raw) = self.session_slots.lookup(&key) {
+            let entry_index = pool_index_from_bihash_value(raw);
+            let Some(old_entry) = self.entries.get(entry_index).copied() else {
+                self.session_slots.remove(&key);
+                let entry_index = self
+                    .entries
+                    .insert(entry)
+                    .expect("tcp connection route entry pool exhausted");
+                self.index_entry(entry_index, entry);
+                return;
+            };
             self.unindex_entry(entry_index, old_entry);
-            *self
-                .entries
-                .get_mut(entry_index)
-                .expect("tcp connection route entry index is valid") = entry;
+            if let Some(slot) = self.entries.get_mut(entry_index) {
+                *slot = entry;
+            } else {
+                return;
+            }
             self.index_entry(entry_index, entry);
             return;
         }
@@ -786,53 +923,78 @@ impl TcpConnectionRouteIndex {
 
     #[inline]
     fn index_entry(&mut self, entry_index: PoolIndex, entry: TcpConnectionRouteEntry) {
-        self.session_slots
-            .insert(entry.session_id.get(), entry_index);
+        self.session_slots.insert(
+            entry.session_id.get(),
+            pool_index_to_bihash_value(entry_index),
+        );
         if let Some(connection_id) = entry.connection_id {
             self.connection_slots
-                .insert(connection_id.get(), entry_index);
+                .insert(connection_id.get(), pool_index_to_bihash_value(entry_index));
         }
-        if let Some(key) = entry.tuple_key() {
-            self.tuple_slots.insert(key, entry_index);
+        let value = pool_index_to_bihash_value(entry_index);
+        if let Some(key) = entry.tuple_key_v4() {
+            self.tuple_slots_v4.insert(key, value);
+        }
+        if let Some(key) = entry.tuple_key_v6() {
+            self.tuple_slots_v6.insert(key, value);
         }
     }
 
     #[inline]
     fn unindex_entry(&mut self, entry_index: PoolIndex, entry: TcpConnectionRouteEntry) {
-        if self.session_slots.lookup(&entry.session_id.get()) == Some(entry_index) {
+        let value = pool_index_to_bihash_value(entry_index);
+        if self.session_slots.lookup(&entry.session_id.get()) == Some(value) {
             self.session_slots.remove(&entry.session_id.get());
         }
         if let Some(connection_id) = entry.connection_id {
             let key = connection_id.get();
-            if self.connection_slots.lookup(&key) == Some(entry_index) {
+            if self.connection_slots.lookup(&key) == Some(value) {
                 self.connection_slots.remove(&key);
             }
         }
-        if let Some(key) = entry.tuple_key()
-            && self.tuple_slots.lookup(&key) == Some(entry_index)
+        if let Some(key) = entry.tuple_key_v4()
+            && self.tuple_slots_v4.lookup(&key) == Some(value)
         {
-            self.tuple_slots.remove(&key);
+            self.tuple_slots_v4.remove(&key);
+        }
+        if let Some(key) = entry.tuple_key_v6()
+            && self.tuple_slots_v6.lookup(&key) == Some(value)
+        {
+            self.tuple_slots_v6.remove(&key);
         }
     }
 
     #[cfg(test)]
     #[inline]
     fn lookup_by_connection_id(&self, connection_id: TcpConnectionId) -> Option<SessionId> {
-        let entry_index = self.connection_slots.lookup(&connection_id.get())?;
-        Some(
-            self.entries
-                .get(entry_index)
-                .expect("tcp connection route entry index is valid")
-                .session_id,
-        )
+        let entry_index =
+            pool_index_from_bihash_value(self.connection_slots.lookup(&connection_id.get())?);
+        self.entries.get(entry_index).map(|entry| entry.session_id)
     }
 
     #[inline]
     fn prefetch_tuple(&self, local: SocketAddr, remote: SocketAddr) {
-        let Some(key) = TransportConnectionKey::from_socket_addrs(0, local, remote) else {
-            return;
-        };
-        self.tuple_slots.prefetch_key(&key);
+        match (local, remote) {
+            (SocketAddr::V4(local), SocketAddr::V4(remote)) => {
+                self.tuple_slots_v4.prefetch(&TransportConnectionKey::new(
+                    0,
+                    *local.ip(),
+                    local.port(),
+                    *remote.ip(),
+                    remote.port(),
+                ))
+            }
+            (SocketAddr::V6(local), SocketAddr::V6(remote)) => {
+                self.tuple_slots_v6.prefetch(&TransportConnectionKey::new(
+                    0,
+                    *local.ip(),
+                    local.port(),
+                    *remote.ip(),
+                    remote.port(),
+                ))
+            }
+            _ => {}
+        }
     }
 
     #[inline]
@@ -841,32 +1003,44 @@ impl TcpConnectionRouteIndex {
         local: SocketAddr,
         remote: SocketAddr,
     ) -> Option<(SessionId, DataWorkerId, TcpInputNext)> {
-        let entry_index = self
-            .tuple_slots
-            .lookup(&TransportConnectionKey::from_socket_addrs(
-                0, local, remote,
-            )?)?;
-        let entry = self
-            .entries
-            .get(entry_index)
-            .expect("tcp connection route entry index is valid");
+        let entry_index = match (local, remote) {
+            (SocketAddr::V4(local), SocketAddr::V4(remote)) => {
+                self.tuple_slots_v4.lookup(&TransportConnectionKey::new(
+                    0,
+                    *local.ip(),
+                    local.port(),
+                    *remote.ip(),
+                    remote.port(),
+                ))
+            }
+            (SocketAddr::V6(local), SocketAddr::V6(remote)) => {
+                self.tuple_slots_v6.lookup(&TransportConnectionKey::new(
+                    0,
+                    *local.ip(),
+                    local.port(),
+                    *remote.ip(),
+                    remote.port(),
+                ))
+            }
+            _ => None,
+        }
+        .map(pool_index_from_bihash_value)?;
+        let entry = self.entries.get(entry_index)?;
         Some((entry.session_id, entry.owner, entry.next))
     }
 
     fn forget_session(&mut self, session_id: SessionId) {
         let key = session_id.get();
-        let Some(entry_index) = self.session_slots.lookup(&key) else {
+        let Some(raw) = self.session_slots.lookup(&key) else {
             return;
         };
-        let removed = *self
-            .entries
-            .get(entry_index)
-            .expect("tcp connection route entry index is valid");
+        let entry_index = pool_index_from_bihash_value(raw);
+        let Some(removed) = self.entries.get(entry_index).copied() else {
+            self.session_slots.remove(&key);
+            return;
+        };
         self.unindex_entry(entry_index, removed);
-        let _ = self
-            .entries
-            .remove(entry_index)
-            .expect("tcp connection route entry index is valid");
+        let _ = self.entries.remove(entry_index);
     }
 }
 
@@ -899,8 +1073,9 @@ impl TcpPendingRouteIndex {
     fn empty() -> Self {
         Self {
             entries: Pool::with_capacity(1024),
-            session_slots: FlatHashTable::with_capacity(1024),
-            tuple_slots: FlatHashTable::with_capacity(1024),
+            session_slots: Bihash::new(1024),
+            tuple_slots_v4: Bihash::new(1024),
+            tuple_slots_v6: Bihash::new(1024),
         }
     }
 
@@ -916,16 +1091,23 @@ impl TcpPendingRouteIndex {
     ) {
         let entry = TcpPendingRouteEntry::new(session_id, local, remote, owner, next, capabilities);
         let key = session_id.get();
-        if let Some(entry_index) = self.session_slots.lookup(&key) {
-            let old_entry = *self
-                .entries
-                .get(entry_index)
-                .expect("tcp pending route entry index is valid");
+        if let Some(raw) = self.session_slots.lookup(&key) {
+            let entry_index = pool_index_from_bihash_value(raw);
+            let Some(old_entry) = self.entries.get(entry_index).copied() else {
+                self.session_slots.remove(&key);
+                let entry_index = self
+                    .entries
+                    .insert(entry)
+                    .expect("tcp pending route entry pool exhausted");
+                self.index_entry(entry_index, entry);
+                return;
+            };
             self.unindex_entry(entry_index, old_entry);
-            *self
-                .entries
-                .get_mut(entry_index)
-                .expect("tcp pending route entry index is valid") = entry;
+            if let Some(slot) = self.entries.get_mut(entry_index) {
+                *slot = entry;
+            } else {
+                return;
+            }
             self.index_entry(entry_index, entry);
             return;
         }
@@ -938,22 +1120,34 @@ impl TcpPendingRouteIndex {
 
     #[inline]
     fn index_entry(&mut self, entry_index: PoolIndex, entry: TcpPendingRouteEntry) {
-        self.session_slots
-            .insert(entry.session_id.get(), entry_index);
-        if let Some(key) = entry.tuple_key() {
-            self.tuple_slots.insert(key, entry_index);
+        self.session_slots.insert(
+            entry.session_id.get(),
+            pool_index_to_bihash_value(entry_index),
+        );
+        let value = pool_index_to_bihash_value(entry_index);
+        if let Some(key) = entry.tuple_key_v4() {
+            self.tuple_slots_v4.insert(key, value);
+        }
+        if let Some(key) = entry.tuple_key_v6() {
+            self.tuple_slots_v6.insert(key, value);
         }
     }
 
     #[inline]
     fn unindex_entry(&mut self, entry_index: PoolIndex, entry: TcpPendingRouteEntry) {
-        if self.session_slots.lookup(&entry.session_id.get()) == Some(entry_index) {
+        let value = pool_index_to_bihash_value(entry_index);
+        if self.session_slots.lookup(&entry.session_id.get()) == Some(value) {
             self.session_slots.remove(&entry.session_id.get());
         }
-        if let Some(key) = entry.tuple_key()
-            && self.tuple_slots.lookup(&key) == Some(entry_index)
+        if let Some(key) = entry.tuple_key_v4()
+            && self.tuple_slots_v4.lookup(&key) == Some(value)
         {
-            self.tuple_slots.remove(&key);
+            self.tuple_slots_v4.remove(&key);
+        }
+        if let Some(key) = entry.tuple_key_v6()
+            && self.tuple_slots_v6.lookup(&key) == Some(value)
+        {
+            self.tuple_slots_v6.remove(&key);
         }
     }
 
@@ -962,51 +1156,78 @@ impl TcpPendingRouteIndex {
         local: SocketAddr,
         remote: SocketAddr,
     ) -> Option<(SessionId, DataWorkerId, TcpInputNext)> {
-        let entry_index = self
-            .tuple_slots
-            .lookup(&TransportConnectionKey::from_socket_addrs(
-                0, local, remote,
-            )?)?;
-        let entry = self
-            .entries
-            .get(entry_index)
-            .expect("tcp pending route entry index is valid");
+        let entry_index = match (local, remote) {
+            (SocketAddr::V4(local), SocketAddr::V4(remote)) => {
+                self.tuple_slots_v4.lookup(&TransportConnectionKey::new(
+                    0,
+                    *local.ip(),
+                    local.port(),
+                    *remote.ip(),
+                    remote.port(),
+                ))
+            }
+            (SocketAddr::V6(local), SocketAddr::V6(remote)) => {
+                self.tuple_slots_v6.lookup(&TransportConnectionKey::new(
+                    0,
+                    *local.ip(),
+                    local.port(),
+                    *remote.ip(),
+                    remote.port(),
+                ))
+            }
+            _ => None,
+        }
+        .map(pool_index_from_bihash_value)?;
+        let entry = self.entries.get(entry_index)?;
         Some((entry.session_id, entry.owner, entry.next))
     }
 
     #[inline]
     fn capabilities_by_session(&self, session_id: SessionId) -> Option<TcpCapabilities> {
-        let entry_index = self.session_slots.lookup(&session_id.get())?;
-        Some(
-            self.entries
-                .get(entry_index)
-                .expect("tcp pending route entry index is valid")
-                .capabilities,
-        )
+        let entry_index =
+            pool_index_from_bihash_value(self.session_slots.lookup(&session_id.get())?);
+        self.entries
+            .get(entry_index)
+            .map(|entry| entry.capabilities)
     }
 
     #[inline]
     fn prefetch_tuple(&self, local: SocketAddr, remote: SocketAddr) {
-        let Some(key) = TransportConnectionKey::from_socket_addrs(0, local, remote) else {
-            return;
-        };
-        self.tuple_slots.prefetch_key(&key);
+        match (local, remote) {
+            (SocketAddr::V4(local), SocketAddr::V4(remote)) => {
+                self.tuple_slots_v4.prefetch(&TransportConnectionKey::new(
+                    0,
+                    *local.ip(),
+                    local.port(),
+                    *remote.ip(),
+                    remote.port(),
+                ))
+            }
+            (SocketAddr::V6(local), SocketAddr::V6(remote)) => {
+                self.tuple_slots_v6.prefetch(&TransportConnectionKey::new(
+                    0,
+                    *local.ip(),
+                    local.port(),
+                    *remote.ip(),
+                    remote.port(),
+                ))
+            }
+            _ => {}
+        }
     }
 
     fn forget_session(&mut self, session_id: SessionId) {
         let key = session_id.get();
-        let Some(entry_index) = self.session_slots.lookup(&key) else {
+        let Some(raw) = self.session_slots.lookup(&key) else {
             return;
         };
-        let removed = *self
-            .entries
-            .get(entry_index)
-            .expect("tcp pending route entry index is valid");
+        let entry_index = pool_index_from_bihash_value(raw);
+        let Some(removed) = self.entries.get(entry_index).copied() else {
+            self.session_slots.remove(&key);
+            return;
+        };
         self.unindex_entry(entry_index, removed);
-        let _ = self
-            .entries
-            .remove(entry_index)
-            .expect("tcp pending route entry index is valid");
+        let _ = self.entries.remove(entry_index);
     }
 }
 
@@ -1034,7 +1255,6 @@ impl Clone for TcpPendingRouteIndex {
     }
 }
 
-#[derive(Debug)]
 pub struct TcpWorkerOwnedStateCacheline0 {
     #[cfg(test)]
     owner_worker: DataWorkerId,
@@ -1050,16 +1270,15 @@ pub struct TcpWorkerOwnedStateCacheline0 {
     queue_runtime_data: Option<NodeRuntimeData>,
 }
 
-#[derive(Debug)]
 struct TcpWorkerOwnedStateCacheline1 {
     fast_open_cache: Vec<TcpFastOpenCacheEntry>,
-    fast_open_cache_index: FlatHashTable<TransportConnectionKey, usize>,
+    fast_open_cache_index_v4: Bihash<TransportConnectionKey<Ipv4Addr>, 3>,
+    fast_open_cache_index_v6: Bihash<TransportConnectionKey<Ipv6Addr>, 1>,
     fast_open_secrets: Vec<TcpFastOpenSecret>,
     listener_pending: TcpListenerPendingTable,
     listener_cookie_secrets: Vec<TcpFastOpenSecret>,
 }
 
-#[derive(Debug)]
 pub struct TcpWorkerOwnedState {
     cacheline0: CachePadded<TcpWorkerOwnedStateCacheline0>,
     cacheline1: CachePadded<TcpWorkerOwnedStateCacheline1>,
@@ -1100,7 +1319,8 @@ impl TcpWorkerOwnedState {
             }),
             cacheline1: CachePadded::new(TcpWorkerOwnedStateCacheline1 {
                 fast_open_cache: Vec::new(),
-                fast_open_cache_index: FlatHashTable::new(),
+                fast_open_cache_index_v4: Bihash::new(64),
+                fast_open_cache_index_v6: Bihash::new(64),
                 fast_open_secrets: Vec::new(),
                 listener_pending: TcpListenerPendingTable::default(),
                 listener_cookie_secrets: Vec::new(),
@@ -1316,8 +1536,29 @@ impl TcpWorkerOwnedState {
         local: SocketAddr,
         remote: SocketAddr,
     ) -> Option<(TcpFastOpenCookie, Option<u16>)> {
-        let key = TransportConnectionKey::from_socket_addrs(0, local, remote)?;
-        let index = self.cacheline1.fast_open_cache_index.lookup(&key)?;
+        let index = match (local, remote) {
+            (SocketAddr::V4(local), SocketAddr::V4(remote)) => self
+                .cacheline1
+                .fast_open_cache_index_v4
+                .lookup(&TransportConnectionKey::new(
+                    0,
+                    *local.ip(),
+                    local.port(),
+                    *remote.ip(),
+                    remote.port(),
+                )),
+            (SocketAddr::V6(local), SocketAddr::V6(remote)) => self
+                .cacheline1
+                .fast_open_cache_index_v6
+                .lookup(&TransportConnectionKey::new(
+                    0,
+                    *local.ip(),
+                    local.port(),
+                    *remote.ip(),
+                    remote.port(),
+                )),
+            _ => None,
+        }? as usize;
         let entry = self.cacheline1.fast_open_cache.get(index)?;
         Some((entry.cookie, entry.max_segment_size))
     }
@@ -1329,10 +1570,31 @@ impl TcpWorkerOwnedState {
         cookie: TcpFastOpenCookie,
         max_segment_size: Option<u16>,
     ) {
-        let Some(key) = TransportConnectionKey::from_socket_addrs(0, local, remote) else {
-            return;
+        let existing_index = match (local, remote) {
+            (SocketAddr::V4(local), SocketAddr::V4(remote)) => self
+                .cacheline1
+                .fast_open_cache_index_v4
+                .lookup(&TransportConnectionKey::new(
+                    0,
+                    *local.ip(),
+                    local.port(),
+                    *remote.ip(),
+                    remote.port(),
+                )),
+            (SocketAddr::V6(local), SocketAddr::V6(remote)) => self
+                .cacheline1
+                .fast_open_cache_index_v6
+                .lookup(&TransportConnectionKey::new(
+                    0,
+                    *local.ip(),
+                    local.port(),
+                    *remote.ip(),
+                    remote.port(),
+                )),
+            _ => None,
         };
-        if let Some(index) = self.cacheline1.fast_open_cache_index.lookup(&key) {
+        if let Some(index) = existing_index {
+            let index = index as usize;
             if let Some(entry) = self.cacheline1.fast_open_cache.get_mut(index) {
                 entry.cookie = cookie;
                 entry.max_segment_size = max_segment_size;
@@ -1346,7 +1608,35 @@ impl TcpWorkerOwnedState {
             max_segment_size,
         });
         let index = self.cacheline1.fast_open_cache.len() - 1;
-        self.cacheline1.fast_open_cache_index.insert(key, index);
+        let value = index as u64;
+        debug_assert_ne!(value, FREE_U64);
+        match (local, remote) {
+            (SocketAddr::V4(local), SocketAddr::V4(remote)) => {
+                self.cacheline1.fast_open_cache_index_v4.insert(
+                    TransportConnectionKey::new(
+                        0,
+                        *local.ip(),
+                        local.port(),
+                        *remote.ip(),
+                        remote.port(),
+                    ),
+                    value,
+                );
+            }
+            (SocketAddr::V6(local), SocketAddr::V6(remote)) => {
+                self.cacheline1.fast_open_cache_index_v6.insert(
+                    TransportConnectionKey::new(
+                        0,
+                        *local.ip(),
+                        local.port(),
+                        *remote.ip(),
+                        remote.port(),
+                    ),
+                    value,
+                );
+            }
+            _ => {}
+        }
     }
 
     pub(crate) fn fast_open_cookie_for_listener(
@@ -1816,14 +2106,17 @@ fn hash_socket_addr(hasher: &mut impl Hasher, addr: SocketAddr) {
 #[cfg(test)]
 mod tests {
     use super::{
-        TcpV4ListenerKey, TcpWorkerOwnedState, pool_index_from_bihash_value,
+        TcpConnectionRouteIndex, TcpInputNext, TcpIpv4ListenerAddress, TcpListenerTable,
+        TcpLookupValue, TcpV4ListenerKey, TcpWorkerOwnedState, pool_index_from_bihash_value,
         pool_index_to_bihash_value, write_bytes,
     };
     use hammer_adapter::DataWorkerId;
     use hammer_core::protocol::tcp::{TcpCapabilities, TcpFastOpenCookie};
     use hammer_infra::bihash::Bihash;
     use hammer_infra::pool::Index as PoolIndex;
-    use std::net::{Ipv4Addr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    use crate::session::SessionId;
 
     fn worker_state() -> TcpWorkerOwnedState {
         TcpWorkerOwnedState::new(DataWorkerId::new(0))
@@ -1862,6 +2155,84 @@ mod tests {
         let cookie = state.fast_open_cookie_for_listener_in_epoch(7, local, remote, 42);
 
         assert!(state.validate_fast_open_cookie_in_epoch(7, local, remote, &cookie, 42));
+    }
+
+    #[test]
+    fn tcp_connection_route_index_bihash_keeps_v4_and_v6_routes() {
+        let mut index = TcpConnectionRouteIndex::empty();
+        let owner = DataWorkerId::new(0);
+        let v4_session = SessionId::from(PoolIndex::new(1, 1));
+        let v6_session = SessionId::from(PoolIndex::new(2, 1));
+        let v4_local = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 1000);
+        let v4_remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 2000);
+        let v6_local = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 1001);
+        let v6_remote = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 2001);
+
+        index.upsert(
+            v4_session,
+            None,
+            Some(v4_local),
+            v4_remote,
+            owner,
+            TcpInputNext::Established,
+        );
+        index.upsert(
+            v6_session,
+            None,
+            Some(v6_local),
+            v6_remote,
+            owner,
+            TcpInputNext::Established,
+        );
+
+        assert_eq!(
+            index.lookup_by_tuple(v4_local, v4_remote),
+            Some((v4_session, owner, TcpInputNext::Established))
+        );
+        assert_eq!(
+            index.lookup_by_tuple(v6_local, v6_remote),
+            Some((v6_session, owner, TcpInputNext::Established))
+        );
+    }
+
+    #[test]
+    fn tcp_listener_lookup_bihash_preserves_lookup_value() {
+        let key = TcpV4ListenerKey::new(0, Ipv4Addr::new(127, 0, 0, 1), 7300);
+        let value = TcpLookupValue {
+            id: 7,
+            owner_worker: DataWorkerId::new(2),
+            capabilities: TcpCapabilities {
+                max_segment_size: Some(1200),
+                window_scale: Some(4),
+                sack: true,
+                timestamps: true,
+                ecn: true,
+                accurate_ecn: false,
+                fast_open: true,
+            },
+        };
+        let mut table = TcpListenerTable::<TcpIpv4ListenerAddress>::empty();
+
+        table.insert(key, value);
+
+        assert_eq!(table.lookup(key), Some(value));
+    }
+
+    #[test]
+    fn tcp_fast_open_cache_bihash_updates_existing_tuple() {
+        let mut state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 50_000);
+        let first = TcpFastOpenCookie::try_from(&[1, 2, 3, 4][..]).expect("first cookie");
+        let second = TcpFastOpenCookie::try_from(&[5, 6, 7, 8][..]).expect("second cookie");
+
+        state.remember_fast_open_cookie(local, remote, first, Some(1200));
+        state.remember_fast_open_cookie(local, remote, second, Some(1300));
+
+        assert_eq!(
+            state.fast_open_cookie(local, remote),
+            Some((second, Some(1300)))
+        );
     }
 
     #[test]
@@ -1930,7 +2301,8 @@ mod tests {
 
         state.remember_fast_open_cookie(local, remote, cookie_a, Some(1_440));
         assert_eq!(state.cacheline1.fast_open_cache.len(), 1);
-        assert_eq!(state.cacheline1.fast_open_cache_index.len(), 1);
+        assert_eq!(state.cacheline1.fast_open_cache_index_v4.len(), 1);
+        assert_eq!(state.cacheline1.fast_open_cache_index_v6.len(), 0);
         assert_eq!(
             state.fast_open_cookie(local, remote),
             Some((cookie_a, Some(1_440)))
@@ -1938,7 +2310,8 @@ mod tests {
 
         state.remember_fast_open_cookie(local, remote, cookie_b, Some(1_460));
         assert_eq!(state.cacheline1.fast_open_cache.len(), 1);
-        assert_eq!(state.cacheline1.fast_open_cache_index.len(), 1);
+        assert_eq!(state.cacheline1.fast_open_cache_index_v4.len(), 1);
+        assert_eq!(state.cacheline1.fast_open_cache_index_v6.len(), 0);
         assert_eq!(
             state.fast_open_cookie(local, remote),
             Some((cookie_b, Some(1_460)))

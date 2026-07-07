@@ -633,7 +633,7 @@ fn tcp_listener_input_entry(flags: TcpInputFlags) -> (TcpInputNext, Option<TcpEr
 mod tests {
     use std::mem::transmute;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, OnceLock};
 
     use arc_swap::ArcSwap;
     use hammer_adapter::{
@@ -641,7 +641,7 @@ mod tests {
         NodeHandle, NodeProcessFn, NodeResult, NodeRuntimeData,
     };
     use hammer_core::error::CoreResult;
-    use hammer_core::protocol::tcp::TcpConnectionId;
+    use hammer_core::protocol::tcp::{TcpCapabilities, TcpConnectionId};
 
     use crate::net::NetworkOpaque;
     use crate::transport::congestion::BbrController;
@@ -677,9 +677,80 @@ mod tests {
         NodeResult::drop()
     }
 
+    struct SessionRouteProbeState {
+        seen: Option<SessionId>,
+    }
+
+    struct SessionRouteProbeNode {
+        runtime_data: NodeRuntimeData,
+    }
+
+    impl SessionRouteProbeNode {
+        fn new(state: Arc<Mutex<SessionRouteProbeState>>) -> Self {
+            let mut states = session_route_probe_states()
+                .lock()
+                .expect("session route probe registry");
+            let slot = states.len();
+            states.push(state);
+            Self {
+                runtime_data: NodeRuntimeData::from_usize(slot).expect("session route probe slot"),
+            }
+        }
+    }
+
+    impl Node for SessionRouteProbeNode {
+        fn process(&mut self, _: &DataPlaneRuntime, _: &mut BufferFrame) -> NodeResult {
+            NodeResult::drop()
+        }
+
+        fn node_process(&self) -> NodeProcessFn {
+            session_route_probe_process
+        }
+
+        fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+            Ok(self.runtime_data)
+        }
+    }
+
+    impl InternalNode for SessionRouteProbeNode {}
+
+    fn session_route_probe_states()
+    -> &'static Mutex<std::vec::Vec<Arc<Mutex<SessionRouteProbeState>>>> {
+        static STATES: OnceLock<Mutex<std::vec::Vec<Arc<Mutex<SessionRouteProbeState>>>>> =
+            OnceLock::new();
+        STATES.get_or_init(|| Mutex::new(std::vec::Vec::new()))
+    }
+
+    fn session_route_probe_process(
+        runtime: &DataPlaneRuntime,
+        data: NodeRuntimeData,
+        frame: &mut BufferFrame,
+    ) -> NodeResult {
+        let slot = match data.usize_word(0) {
+            Ok(slot) => slot,
+            Err(_) => return NodeResult::drop(),
+        };
+        let state = {
+            let states = session_route_probe_states()
+                .lock()
+                .expect("session route probe registry");
+            match states.get(slot) {
+                Some(state) => Arc::clone(state),
+                None => return NodeResult::drop(),
+            }
+        };
+        let mut state = state.lock().expect("session route probe state");
+        for &index in frame.pending_indices() {
+            state.seen =
+                crate::transport::tcp::read_session_id(runtime, index).expect("probe session id");
+        }
+        NodeResult::drop()
+    }
+
     macro_rules! register_tcp_input_test_nexts {
         ($runtime:expr) => {{
             let drop = $runtime.nodes().register_internal(BlackholeNode);
+            let punt = $runtime.nodes().register_internal(BlackholeNode);
             let listen = $runtime.nodes().register_internal(BlackholeNode);
             let rcv_process = $runtime.nodes().register_internal(BlackholeNode);
             let syn_sent = $runtime.nodes().register_internal(BlackholeNode);
@@ -687,6 +758,7 @@ mod tests {
             let reset = $runtime.nodes().register_internal(BlackholeNode);
             (
                 drop,
+                punt,
                 listen,
                 rcv_process,
                 syn_sent,
@@ -694,12 +766,12 @@ mod tests {
                 reset,
                 TcpInputNext::nodes(
                     drop,
+                    punt,
                     listen,
                     rcv_process,
                     syn_sent,
                     established,
                     reset,
-                    drop,
                 ),
             )
         }};
@@ -861,6 +933,51 @@ mod tests {
     }
 
     #[test]
+    fn tcp_input_reports_listener_pending_for_ack_tuple_without_session_route() {
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 64,
+                    buffer_slots: 4,
+                    frame_capacity: 4,
+                    frame_slots: 4,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
+        let worker = DataWorkerId::new(0);
+        let mut worker_state = TcpWorkerOwnedState::new(worker);
+        set_tcp_worker_state(&mut worker_state);
+        let handle = crate::session::node::register_session_queue(
+            TcpSessionDriver::<BbrController>::new(worker, runtime.buffers().clone()),
+        )
+        .expect("register tcp queue");
+        let local = parsed_local(50_081);
+        let remote = parsed_remote(50_081);
+
+        assert!(worker_state.begin_listener_pending(
+            7,
+            local,
+            remote,
+            100,
+            4_096,
+            TcpCapabilities::default(),
+            None,
+            1
+        ));
+
+        let (entry, listener_pending) = session_or_listener_pending_input_entry(
+            Some(handle),
+            local,
+            remote,
+            TcpInputFlags::ACK,
+        )
+        .expect("listener pending lookup");
+
+        assert_eq!(entry, None);
+        assert!(listener_pending);
+    }
+
+    #[test]
     fn tcp_input_handoffs_existing_session_to_owner_worker() {
         const HANDOFF_HANDLE: NodeHandle = NodeHandle::new(44);
 
@@ -893,7 +1010,7 @@ mod tests {
         stamp_tcp_cursor(&runtime, index, &packet);
 
         let control = TcpInputControlPlane::new();
-        let (_, _, _, _, _, reset, nexts) = register_tcp_input_test_nexts!(runtime);
+        let (_, _, _, _, _, established, _, nexts) = register_tcp_input_test_nexts!(runtime);
         let node = runtime.nodes().register_internal(control.node(
             nexts,
             Some(handle),
@@ -910,7 +1027,7 @@ mod tests {
                 .buffers()
                 .current_config(index)
                 .expect("handoff next"),
-            reset
+            established
         );
         assert_eq!(
             {
@@ -949,7 +1066,25 @@ mod tests {
             .expect("alloc packet");
         stamp_tcp_cursor(&runtime, index, &packet);
         let control = TcpInputControlPlane::new();
-        let (_, _, _, _, _, _, nexts) = register_tcp_input_test_nexts!(runtime);
+        let drop = runtime.nodes().register_internal(BlackholeNode);
+        let punt = runtime.nodes().register_internal(BlackholeNode);
+        let listen = runtime.nodes().register_internal(BlackholeNode);
+        let rcv_process = runtime.nodes().register_internal(BlackholeNode);
+        let syn_sent = runtime.nodes().register_internal(BlackholeNode);
+        let probe_state = Arc::new(Mutex::new(SessionRouteProbeState { seen: None }));
+        let established = runtime
+            .nodes()
+            .register_internal(SessionRouteProbeNode::new(Arc::clone(&probe_state)));
+        let reset = runtime.nodes().register_internal(BlackholeNode);
+        let nexts = TcpInputNext::nodes(
+            drop,
+            punt,
+            listen,
+            rcv_process,
+            syn_sent,
+            established,
+            reset,
+        );
         let node = runtime
             .nodes()
             .register_internal(control.node(nexts, Some(handle), None));
@@ -960,7 +1095,7 @@ mod tests {
         assert!(runtime.run_ready_nodes().expect("run input") >= 1);
 
         assert_eq!(
-            crate::transport::tcp::read_session_id(&runtime, index).expect("read session id"),
+            probe_state.lock().expect("session route probe").seen,
             Some(session_id)
         );
     }

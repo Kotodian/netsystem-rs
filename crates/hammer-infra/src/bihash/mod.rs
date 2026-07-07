@@ -20,8 +20,8 @@ pub use alloc::{PageAlloc, PageId};
 pub use bucket::Bucket;
 pub use iter::BihashIter;
 pub use key::BihashKey;
-pub use template::{Bihash16x8, Bihash24x8, Bihash48x8, Bihash8x8};
-pub use value::{Kv, ValuePage, FREE_U64};
+pub use template::{Bihash8x8, Bihash16x8, Bihash24x8, Bihash48x8};
+pub use value::{FREE_U64, Kv, ValuePage};
 
 use crate::boxed::Slice;
 use crate::heap::Heap;
