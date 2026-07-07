@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use hammer_infra::bihash::bucket::Bucket;
 use hammer_infra::bihash::{Bihash, Bihash8x8, BihashKey};
+use hammer_infra::heap::Heap;
 
 #[test]
 fn bihash_key_u64_hashes_deterministically() {
@@ -21,7 +24,7 @@ fn bihash_key_u64_eq_symmetric() {
 
 #[test]
 fn bihash_skeleton_constructs_with_zero_entries() {
-    let t: Bihash<u64, u64, 7> = Bihash::new(64);
+    let t: Bihash<u64, 7> = Bihash::new(64);
     assert_eq!(t.len(), 0);
     assert!(t.is_empty());
     assert_eq!(t.nbuckets(), 64);
@@ -77,10 +80,34 @@ fn bucket_refcnt_max_is_8191() {
     assert_eq!(b.refcnt(), 8191);
 }
 
+#[test]
+fn bihash_with_capacity_in_uses_supplied_heap_surface() {
+    let heap = Arc::new(Heap::main());
+    let mut table: Bihash<u64, 7> = Bihash::with_capacity_in(8, heap);
+
+    table.insert(10, 100);
+    table.insert(11, 110);
+
+    assert_eq!(table.nbuckets(), 8);
+    assert_eq!(table.lookup(&10), Some(100));
+    assert_eq!(table.lookup(&11), Some(110));
+}
+
+#[test]
+fn bihash_prefetch_accepts_empty_and_present_keys() {
+    let mut table: Bihash<u64, 7> = Bihash::new(8);
+
+    table.prefetch(&42);
+    table.insert(42, 420);
+    table.prefetch(&42);
+
+    assert_eq!(table.lookup(&42), Some(420));
+}
+
 // ── ValuePage / Kv / FREE_U64 ──────────────────────────────────────────
 
 use hammer_infra::bihash::alloc::PageAlloc;
-use hammer_infra::bihash::value::{FREE_U64, Kv, ValuePage};
+use hammer_infra::bihash::value::{Kv, ValuePage, FREE_U64};
 
 #[test]
 fn kv_u64_mark_free_sets_sentinel_in_value() {
@@ -105,13 +132,13 @@ fn kv_u64_is_free_ignores_non_sentinel_value() {
 
 #[test]
 fn kv_u64_new_is_free_by_default() {
-    let kv = Kv::<u64, u64>::empty();
+    let kv = Kv::<u64>::default();
     assert!(kv.is_free());
 }
 
 #[test]
 fn value_page_4_fresh_new_has_all_free_count() {
-    let page = ValuePage::<u64, u64, 4>::new();
+    let page = ValuePage::<u64, 4>::new();
     // new() initializes all slots with the free sentinel (FREE_U64).
     assert_eq!(page.free_count(), 4);
     assert!(page.is_all_free());
@@ -119,13 +146,13 @@ fn value_page_4_fresh_new_has_all_free_count() {
 
 #[test]
 fn value_page_7_capacity_matches_kvp_const() {
-    let page = ValuePage::<u64, u64, 7>::new();
+    let page = ValuePage::<u64, 7>::new();
     assert_eq!(page.capacity(), 7);
 }
 
 #[test]
 fn page_alloc_returns_distinct_page_ids() {
-    let mut a = PageAlloc::<u64, u64, 7>::new();
+    let mut a = PageAlloc::<u64, 7>::new();
     let p1 = a.alloc_single(0);
     let p2 = a.alloc_single(0);
     assert_ne!(p1, p2);
@@ -134,7 +161,7 @@ fn page_alloc_returns_distinct_page_ids() {
 
 #[test]
 fn page_alloc_free_reuses_page_id_lifo() {
-    let mut a = PageAlloc::<u64, u64, 7>::new();
+    let mut a = PageAlloc::<u64, 7>::new();
     let p1 = a.alloc_single(0);
     a.free(p1, 0);
     let p2 = a.alloc_single(0);
@@ -144,13 +171,13 @@ fn page_alloc_free_reuses_page_id_lifo() {
 
 #[test]
 fn bihash_lookup_miss_on_empty_table() {
-    let t: Bihash<u64, u64, 7> = Bihash::new(16);
+    let t: Bihash<u64, 7> = Bihash::new(16);
     assert_eq!(t.lookup(&42), None);
 }
 
 #[test]
 fn bihash_insert_then_lookup_returns_value() {
-    let mut t: Bihash<u64, u64, 7> = Bihash::new(16);
+    let mut t: Bihash<u64, 7> = Bihash::new(16);
     t.insert(1, 100);
     t.insert(2, 200);
     t.insert(3, 300);
@@ -163,7 +190,7 @@ fn bihash_insert_then_lookup_returns_value() {
 
 #[test]
 fn bihash_insert_overwrite_replaces_value_without_growing_len() {
-    let mut t: Bihash<u64, u64, 7> = Bihash::new(8);
+    let mut t: Bihash<u64, 7> = Bihash::new(8);
     t.insert(7, 1);
     t.insert(7, 2);
     assert_eq!(t.lookup(&7), Some(2));
@@ -175,7 +202,7 @@ fn bihash_insert_distinct_keys_that_hash_to_same_bucket() {
     // 1000 distinct keys in an 8-bucket table — collisions guaranteed.
     // The bihash must split the overfull bucket and rehash all entries.
     // Use KVP=4 so each page holds 4 entries, forcing overflow quickly.
-    let mut t: Bihash<u64, u64, 4> = Bihash::new(8);
+    let mut t: Bihash<u64, 4> = Bihash::new(8);
     for k in 0..1000u64 {
         t.insert(k, k * 3);
     }
@@ -187,7 +214,7 @@ fn bihash_insert_distinct_keys_that_hash_to_same_bucket() {
 
 #[test]
 fn bihash_split_preserves_lookup_for_many_keys() {
-    let mut t: Bihash<u64, u64, 2> = Bihash::new(8);
+    let mut t: Bihash<u64, 2> = Bihash::new(8);
     for k in 0..500u64 {
         t.insert(k, k ^ 0xabcd);
     }
@@ -201,7 +228,7 @@ fn bihash_split_preserves_lookup_for_many_keys() {
 fn bihash_split_handles_many_collisions() {
     // With KVP=2 and nbuckets=4, each bucket holds only 2 entries per page.
     // Inserting 100 keys forces multiple splits per bucket.
-    let mut t: Bihash<u64, u64, 2> = Bihash::new(4);
+    let mut t: Bihash<u64, 2> = Bihash::new(4);
     for k in 0..100u64 {
         t.insert(k, k * 10);
     }
@@ -213,7 +240,7 @@ fn bihash_split_handles_many_collisions() {
 
 #[test]
 fn bihash_remove_existing_key() {
-    let mut t: Bihash<u64, u64, 7> = Bihash::new(16);
+    let mut t: Bihash<u64, 7> = Bihash::new(16);
     t.insert(1, 100);
     t.insert(2, 200);
     assert!(t.remove(&1));
@@ -224,7 +251,7 @@ fn bihash_remove_existing_key() {
 
 #[test]
 fn bihash_remove_missing_key_returns_false() {
-    let mut t: Bihash<u64, u64, 7> = Bihash::new(16);
+    let mut t: Bihash<u64, 7> = Bihash::new(16);
     t.insert(1, 100);
     assert!(!t.remove(&999));
     assert_eq!(t.len(), 1);
@@ -232,7 +259,7 @@ fn bihash_remove_missing_key_returns_false() {
 
 #[test]
 fn bihash_remove_all_entries_returns_bucket_to_empty() {
-    let mut t: Bihash<u64, u64, 7> = Bihash::new(16);
+    let mut t: Bihash<u64, 7> = Bihash::new(16);
     t.insert(1, 100);
     t.insert(2, 200);
     t.remove(&1);
@@ -244,7 +271,7 @@ fn bihash_remove_all_entries_returns_bucket_to_empty() {
 
 #[test]
 fn bihash_clear_drops_len_to_zero() {
-    let mut t: Bihash<u64, u64, 4> = Bihash::new(4);
+    let mut t: Bihash<u64, 4> = Bihash::new(4);
     for k in 0..100u64 {
         t.insert(k, k);
     }
@@ -259,19 +286,19 @@ fn bihash_clear_drops_len_to_zero() {
 
 #[test]
 fn bihash_8x8_alias_compiles() {
-    let t: Bihash8x8<u64> = Bihash::new(16);
+    let t: Bihash8x8 = Bihash::new(16);
     assert_eq!(t.nbuckets(), 16);
 }
 
 #[test]
 fn bihash_iter_empty_table_yields_nothing() {
-    let t: Bihash<u64, u64, 7> = Bihash::new(16);
+    let t: Bihash<u64, 7> = Bihash::new(16);
     assert_eq!(t.iter().count(), 0);
 }
 
 #[test]
 fn bihash_iter_after_inserts_yields_correct_count() {
-    let mut t: Bihash<u64, u64, 7> = Bihash::new(16);
+    let mut t: Bihash<u64, 7> = Bihash::new(16);
     t.insert(1, 10);
     t.insert(2, 20);
     t.insert(3, 30);

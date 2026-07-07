@@ -1,21 +1,35 @@
 //! Hot-path operations: lookup, insert, remove, clear.
 
-use crate::bihash::{Bihash, BihashFree, BihashKey, Bucket, Kv, PageAlloc, PageId};
+use crate::bihash::{Bihash, BihashKey, Bucket, Kv, PageAlloc, PageId};
+use crate::prefetch::prefetch_read_l1;
 
-impl<K: BihashKey + Default, V: Copy + Eq + Default + BihashFree, const KVP: usize>
-    Bihash<K, V, KVP>
-{
+impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
+    #[inline(always)]
+    pub fn prefetch(&self, key: &K) {
+        self.prefetch_with_hash(key.hash());
+    }
+
+    #[inline(always)]
+    pub fn prefetch_with_hash(&self, hash: u64) {
+        if self.buckets.is_empty() {
+            return;
+        }
+        let bucket_idx = (hash as u32) & (self.nbuckets - 1);
+        let bucket_ptr = self.buckets.as_ptr().wrapping_add(bucket_idx as usize);
+        prefetch_read_l1(bucket_ptr);
+    }
+
     /// Read-only lookup. Phase 1 is `&self`-bound (exclusive-borrow model,
     /// same as `FlatHashTable::lookup` today).
     #[inline(always)]
-    pub fn lookup(&self, key: &K) -> Option<V> {
+    pub fn lookup(&self, key: &K) -> Option<u64> {
         self.lookup_with_hash(*key, key.hash())
     }
 
     /// Lookup with a precomputed hash. Useful when the same hash is reused
     /// across a prefetch + lookup pair on the hot path.
     #[inline(always)]
-    pub fn lookup_with_hash(&self, key: K, hash: u64) -> Option<V>
+    pub fn lookup_with_hash(&self, key: K, hash: u64) -> Option<u64>
     where
         K: Copy,
     {
@@ -58,18 +72,14 @@ impl<K: BihashKey + Default, V: Copy + Eq + Default + BihashFree, const KVP: usi
     }
 }
 
-/// Helper for generic-V free detection — checks if a KV slot is free via
-/// the `BihashFree` trait's sentinel (e.g. `FREE_U64` for `u64`).
 #[inline(always)]
-pub(super) fn kv_slot_is_free<K, V: BihashFree>(kv: &Kv<K, V>) -> bool {
-    kv.value.is_free_value()
+pub(super) fn kv_slot_is_free<K>(kv: &Kv<K>) -> bool {
+    kv.is_free()
 }
 
-impl<K: BihashKey + Default, V: Copy + Eq + Default + BihashFree, const KVP: usize>
-    Bihash<K, V, KVP>
-{
+impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
     /// Insert or overwrite a key. VPP semantics: `is_add=1` (always overwrite).
-    pub fn insert(&mut self, key: K, value: V) {
+    pub fn insert(&mut self, key: K, value: u64) {
         let hash = key.hash();
         let bucket_idx = (hash as u32) & (self.nbuckets - 1);
         let bucket = self.buckets[bucket_idx as usize];
@@ -144,11 +154,11 @@ impl<K: BihashKey + Default, V: Copy + Eq + Default + BihashFree, const KVP: usi
             let cur = PageId(page_id.0 + page_offset + rel);
             let page = self.pages.get_mut(cur);
             for slot in page.slots_mut() {
-                if slot.value.is_free_value() {
+                if slot.is_free() {
                     continue;
                 }
                 if K::key_eq(slot.key, *key) {
-                    slot.value = V::free_sentinel();
+                    slot.mark_free();
                     if !linear {
                         self.buckets[bucket_idx as usize] = Bucket::pack(
                             page_id.0 as u64,
@@ -171,10 +181,11 @@ impl<K: BihashKey + Default, V: Copy + Eq + Default + BihashFree, const KVP: usi
     /// drops every page back to the allocator by replacing `PageAlloc` with a
     /// fresh instance. The table is left usable for further inserts.
     pub fn clear(&mut self) {
-        for b in self.buckets.iter_mut() {
+        for b in self.buckets.as_mut_slice() {
             *b = Bucket::empty();
         }
-        self.pages = PageAlloc::new();
+        let heap = self.pages.heap();
+        self.pages = PageAlloc::new_in(heap);
         self.len = 0;
     }
 }

@@ -4,7 +4,11 @@
 //! allocations).  Multi-page allocations will be added when bucket
 //! expansion is implemented.
 
-use crate::bihash::value::{BihashFree, ValuePage};
+use std::sync::Arc;
+
+use crate::bihash::value::ValuePage;
+use crate::heap::Heap;
+use crate::vec::Vec;
 
 /// Identifies a page (or a contiguous run of 2^log2_pages pages starting at
 /// this id). Page IDs are 1-indexed; id 0 is reserved for "no page" state.
@@ -33,20 +37,31 @@ impl PageId {
 }
 
 /// Heap-backed page allocator with per-size-class LIFO freelists.
-pub struct PageAlloc<K, V: Copy, const KVP: usize> {
-    pages: Vec<ValuePage<K, V, KVP>>,
+pub struct PageAlloc<K, const KVP: usize> {
+    pages: Vec<ValuePage<K, KVP>>,
     /// `freelists[log2_pages]` is a LIFO stack of PageIds.
     freelists: [Vec<PageId>; 8],
+    heap: Arc<Heap>,
     live: usize,
 }
 
-impl<K: Copy + Default, V: Copy + Default + BihashFree, const KVP: usize> PageAlloc<K, V, KVP> {
+impl<K: Copy + Default, const KVP: usize> PageAlloc<K, KVP> {
     pub fn new() -> Self {
+        Self::new_in(Arc::new(Heap::local()))
+    }
+
+    pub fn new_in(heap: Arc<Heap>) -> Self {
         Self {
-            pages: Vec::new(),
-            freelists: Default::default(),
+            pages: Vec::with_capacity_in(0, heap.clone()),
+            freelists: core::array::from_fn(|_| Vec::with_capacity_in(0, heap.clone())),
+            heap,
             live: 0,
         }
+    }
+
+    #[inline]
+    pub(crate) fn heap(&self) -> Arc<Heap> {
+        self.heap.clone()
     }
 
     /// Allocate a single free page (log2_pages = 0). If the freelist is
@@ -92,20 +107,18 @@ impl<K: Copy + Default, V: Copy + Default + BihashFree, const KVP: usize> PageAl
 
     /// Get a shared reference to a page by its id.
     #[inline]
-    pub fn get(&self, id: PageId) -> &ValuePage<K, V, KVP> {
+    pub fn get(&self, id: PageId) -> &ValuePage<K, KVP> {
         &self.pages[id.index()]
     }
 
     /// Get an exclusive reference to a page by its id.
     #[inline]
-    pub fn get_mut(&mut self, id: PageId) -> &mut ValuePage<K, V, KVP> {
+    pub fn get_mut(&mut self, id: PageId) -> &mut ValuePage<K, KVP> {
         &mut self.pages[id.index()]
     }
 }
 
-impl<K: Copy + Default, V: Copy + Default + BihashFree, const KVP: usize> Default
-    for PageAlloc<K, V, KVP>
-{
+impl<K: Copy + Default, const KVP: usize> Default for PageAlloc<K, KVP> {
     fn default() -> Self {
         Self::new()
     }

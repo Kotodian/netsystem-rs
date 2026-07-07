@@ -1,24 +1,21 @@
 //! Snapshot-style iterator for `Bihash`.
 
 use crate::bihash::ops::kv_slot_is_free;
-use crate::bihash::value::BihashFree;
 use crate::bihash::{Bihash, BihashKey, PageId};
 
 /// A snapshot-style iterator that yields `(&K, &V)` pairs.
 ///
 /// Created by `Bihash::iter()`. The iterator traverses buckets and their
 /// page runs in index order. It returns references to live entries.
-pub struct BihashIter<'a, K: BihashKey, V: Copy + Eq + BihashFree, const KVP: usize> {
-    bihash: &'a Bihash<K, V, KVP>,
+pub struct BihashIter<'a, K: BihashKey, const KVP: usize> {
+    bihash: &'a Bihash<K, KVP>,
     bucket_idx: usize,
     page_rel: u32,
     slot_idx: usize,
 }
 
-impl<'a, K: BihashKey + Default, V: Copy + Eq + Default + BihashFree, const KVP: usize>
-    BihashIter<'a, K, V, KVP>
-{
-    pub(crate) fn new(bihash: &'a Bihash<K, V, KVP>) -> Self {
+impl<'a, K: BihashKey + Default, const KVP: usize> BihashIter<'a, K, KVP> {
+    pub(crate) fn new(bihash: &'a Bihash<K, KVP>) -> Self {
         Self {
             bihash,
             bucket_idx: 0,
@@ -28,10 +25,8 @@ impl<'a, K: BihashKey + Default, V: Copy + Eq + Default + BihashFree, const KVP:
     }
 }
 
-impl<'a, K: BihashKey + Default, V: Copy + Eq + Default + BihashFree, const KVP: usize> Iterator
-    for BihashIter<'a, K, V, KVP>
-{
-    type Item = (&'a K, &'a V);
+impl<'a, K: BihashKey + Default, const KVP: usize> Iterator for BihashIter<'a, K, KVP> {
+    type Item = (&'a K, &'a u64);
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.bucket_idx < self.bihash.nbuckets() as usize {

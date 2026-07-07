@@ -2,11 +2,10 @@
 //! `insert` is full.
 
 use crate::bihash::ops::kv_slot_is_free;
-use crate::bihash::{Bihash, BihashFree, BihashKey, Bucket, Kv, PageId};
+use crate::bihash::{Bihash, BihashKey, Bucket, Kv, PageId};
+use crate::vec::Vec;
 
-impl<K: BihashKey + Default, V: Copy + Eq + Default + BihashFree, const KVP: usize>
-    Bihash<K, V, KVP>
-{
+impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
     /// Split this bucket's page run: double the page count, rehash all existing
     /// entries using one extra hash bit, and insert the new (key, value).
     ///
@@ -15,14 +14,15 @@ impl<K: BihashKey + Default, V: Copy + Eq + Default + BihashFree, const KVP: usi
     /// bucket's current entries, releases the old page run, allocates a new
     /// page run with one more page, rehashes every entry using one extra
     /// hash bit, and finally places the new entry.
-    pub(super) fn split_and_rehash(&mut self, bucket_idx: u32, new_key: K, new_value: V) {
+    pub(super) fn split_and_rehash(&mut self, bucket_idx: u32, new_key: K, new_value: u64) {
         let bucket = self.buckets[bucket_idx as usize];
         let old_log2 = bucket.log2_pages();
         let new_log2 = old_log2 + 1;
         let page_id = PageId(bucket.offset() as u32);
 
         // Snapshot all current entries from this bucket before reallocating.
-        let mut working: Vec<Kv<K, V>> = Vec::new();
+        let heap = self.heap();
+        let mut working: Vec<Kv<K>> = Vec::with_capacity_in(0, heap.clone());
         let old_pages = 1u32 << old_log2;
         for rel in 0..old_pages {
             let cur = PageId(page_id.0 + rel);
@@ -62,7 +62,7 @@ impl<K: BihashKey + Default, V: Copy + Eq + Default + BihashFree, const KVP: usi
         // array.
         let new_count = 1u32 << actual_log2;
         let first_id = self.pages.alloc_fresh();
-        let mut page_ids: Vec<PageId> = Vec::with_capacity(new_count as usize);
+        let mut page_ids: Vec<PageId> = Vec::with_capacity_in(new_count as usize, heap);
         page_ids.push(first_id);
         for _ in 1..new_count {
             page_ids.push(self.pages.alloc_fresh());
@@ -114,7 +114,7 @@ impl<K: BihashKey + Default, V: Copy + Eq + Default + BihashFree, const KVP: usi
         page_ids: &[PageId],
         log2_pages: u8,
         key: K,
-        value: V,
+        value: u64,
         refcnt: &mut u16,
     ) -> bool {
         let hash = key.hash();
@@ -152,20 +152,6 @@ impl<K: BihashKey + Default, V: Copy + Eq + Default + BihashFree, const KVP: usi
             }
         }
 
-        // Every page in the run is full — the bucket needs another split.
-        // For Phase 1 this is a panic; Phase 2 can chain a recursive
-        // `split_and_rehash` here.
-        eprintln!(
-            "place_in_run PANIC: log2_pages={} page_ids.len={} refcnt={}",
-            log2_pages,
-            page_ids.len(),
-            refcnt
-        );
-        for (i, &pid) in page_ids.iter().enumerate() {
-            let page = self.pages.get(pid);
-            let free = page.slots().iter().filter(|kv| kv_slot_is_free(kv)).count();
-            eprintln!("  page[{}] = {:?}: free={}", i, pid, free);
-        }
-        panic!("place_in_run: all pages in run are full (log2_pages={log2_pages})");
+        panic!("bihash page run is full");
     }
 }
