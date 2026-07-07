@@ -3,4 +3,6 @@ target/
 /ios-demo
 /.worktrees
 /third_party/vpp
+.cursor/
+.omo/
 .DS_Store
