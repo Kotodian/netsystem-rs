@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use crate::ds::FlatHashKey;
+use hammer_infra::bihash::BihashKey;
 
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
@@ -95,6 +95,42 @@ impl<A: Copy> TransportConnectionKey<A> {
     }
 }
 
+impl Default for TransportConnectionKey<Ipv4Addr> {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            scope_id: 0,
+            local_addr: Ipv4Addr::UNSPECIFIED,
+            remote_addr: Ipv4Addr::UNSPECIFIED,
+            ports: 0,
+        }
+    }
+}
+
+impl Default for TransportConnectionKey<Ipv6Addr> {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            scope_id: 0,
+            local_addr: Ipv6Addr::UNSPECIFIED,
+            remote_addr: Ipv6Addr::UNSPECIFIED,
+            ports: 0,
+        }
+    }
+}
+
+impl Default for TransportConnectionKey<IpAddr> {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            scope_id: 0,
+            local_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            remote_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            ports: 0,
+        }
+    }
+}
+
 impl TransportConnectionKey<IpAddr> {
     #[inline]
     pub fn from_socket_addrs(scope_id: u32, local: SocketAddr, remote: SocketAddr) -> Option<Self> {
@@ -118,20 +154,25 @@ impl TransportConnectionKey<IpAddr> {
     }
 }
 
-impl FlatHashKey for TransportConnectionKey<Ipv4Addr> {
+impl BihashKey for TransportConnectionKey<Ipv4Addr> {
     #[inline(always)]
-    fn hash_key(self) -> usize {
+    fn hash(self) -> u64 {
         let packed = (u128::from(self.scope_id) << 96)
             | (u128::from(u32::from(self.local_addr)) << 64)
             | (u128::from(u32::from(self.remote_addr)) << 32)
             | u128::from(self.ports);
-        packed.hash_key()
+        splitmix64((packed ^ (packed >> 64)) as u64)
+    }
+
+    #[inline(always)]
+    fn key_eq(self, other: Self) -> bool {
+        self == other
     }
 }
 
-impl FlatHashKey for TransportConnectionKey<Ipv6Addr> {
+impl BihashKey for TransportConnectionKey<Ipv6Addr> {
     #[inline(always)]
-    fn hash_key(self) -> usize {
+    fn hash(self) -> u64 {
         hash_words(&[
             fold_u128(u128::from(self.local_addr)),
             fold_u128(u128::from(self.remote_addr)),
@@ -139,9 +180,28 @@ impl FlatHashKey for TransportConnectionKey<Ipv6Addr> {
             u64::from(self.ports),
         ])
     }
+
+    #[inline(always)]
+    fn key_eq(self, other: Self) -> bool {
+        self == other
+    }
 }
 
-impl FlatHashKey for TransportConnectionKey<IpAddr> {
+impl hammer_infra::map::FlatHashKey for TransportConnectionKey<Ipv4Addr> {
+    #[inline(always)]
+    fn hash_key(self) -> usize {
+        self.hash() as usize
+    }
+}
+
+impl hammer_infra::map::FlatHashKey for TransportConnectionKey<Ipv6Addr> {
+    #[inline(always)]
+    fn hash_key(self) -> usize {
+        self.hash() as usize
+    }
+}
+
+impl hammer_infra::map::FlatHashKey for TransportConnectionKey<IpAddr> {
     #[inline(always)]
     fn hash_key(self) -> usize {
         match (self.local_addr, self.remote_addr) {
@@ -159,8 +219,8 @@ impl FlatHashKey for TransportConnectionKey<IpAddr> {
                 fold_u128(u128::from(remote_addr)),
                 u64::from(self.scope_id),
                 u64::from(self.ports),
-            ]),
-            _ => hash_words(&[2, u64::from(self.scope_id), u64::from(self.ports)]),
+            ]) as usize,
+            _ => hash_words(&[2, u64::from(self.scope_id), u64::from(self.ports)]) as usize,
         }
     }
 }
@@ -171,13 +231,13 @@ fn fold_u128(value: u128) -> u64 {
 }
 
 #[inline(always)]
-fn hash_words(words: &[u64]) -> usize {
+fn hash_words(words: &[u64]) -> u64 {
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
     for word in words {
         state ^= splitmix64(*word ^ state);
         state = state.rotate_left(13);
     }
-    splitmix64(state) as usize
+    splitmix64(state)
 }
 
 #[inline(always)]

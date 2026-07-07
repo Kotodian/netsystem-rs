@@ -6,6 +6,7 @@ use hammer_core::protocol::tcp::{
     TcpV6ListenerKey, TcpWorkerEvent,
 };
 use hammer_core::protocol::transport::TransportConnectionKey;
+use hammer_infra::bihash::Bihash;
 
 #[test]
 fn tcp_seq_wraparound_order_and_advance_are_safe() {
@@ -16,6 +17,32 @@ fn tcp_seq_wraparound_order_and_advance_are_safe() {
     assert!(before_wrap < after_wrap);
     assert!(after_wrap > before_wrap);
     assert_eq!(before_wrap.distance_to(after_wrap), 8);
+}
+
+#[test]
+fn transport_connection_key_v4_works_as_bihash_key() {
+    let key = TransportConnectionKey::new(
+        0,
+        Ipv4Addr::new(10, 0, 0, 1),
+        1234,
+        Ipv4Addr::new(10, 0, 0, 2),
+        80,
+    );
+    let mut table: Bihash<TransportConnectionKey<Ipv4Addr>, 3> = Bihash::new(8);
+
+    table.insert(key, 99);
+
+    assert_eq!(table.lookup(&key), Some(99));
+}
+
+#[test]
+fn transport_connection_key_v6_works_as_bihash_key() {
+    let key = TransportConnectionKey::new(0, Ipv6Addr::LOCALHOST, 1234, Ipv6Addr::UNSPECIFIED, 443);
+    let mut table: Bihash<TransportConnectionKey<Ipv6Addr>, 1> = Bihash::new(8);
+
+    table.insert(key, 199);
+
+    assert_eq!(table.lookup(&key), Some(199));
 }
 
 #[test]

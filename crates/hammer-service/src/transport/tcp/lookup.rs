@@ -11,6 +11,7 @@ use hammer_core::protocol::tcp::{
     TcpCapabilities, TcpConnectionId, TcpFastOpenCookie, TcpTimestampOption,
 };
 use hammer_core::protocol::transport::TransportConnectionKey;
+use hammer_infra::bihash::{BihashKey, FREE_U64};
 use hammer_infra::map::{FlatHashKey, FlatHashTable};
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::vec::Vec;
@@ -196,6 +197,18 @@ const TCP_LISTENER_BACKLOG_LIMIT: usize = 128;
 const TCP_LISTENER_PENDING_BUCKET_COUNT: usize =
     TCP_LISTENER_PENDING_PREVIOUS_EPOCH_WINDOW as usize + 2;
 const TCP_LISTENER_PENDING_CAPACITY: usize = 1024;
+
+#[inline(always)]
+fn pool_index_to_bihash_value(index: PoolIndex) -> u64 {
+    let value = (u64::from(index.generation()) << 32) | u64::from(index.slot());
+    debug_assert_ne!(value, FREE_U64);
+    value
+}
+
+#[inline(always)]
+fn pool_index_from_bihash_value(value: u64) -> PoolIndex {
+    PoolIndex::new(value as u32, (value >> 32) as u32)
+}
 
 #[derive(Debug)]
 struct TcpListenerPendingTable {
@@ -465,12 +478,12 @@ impl TcpListenerPendingTable {
 
 pub trait TcpListenerAddress: Copy + Eq {
     type Ip;
-    type Key: FlatHashKey;
+    type Key: FlatHashKey + BihashKey + Default;
 
     fn key(scope_id: u32, local_addr: Self::Ip, local_port: u16) -> Self::Key;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct TcpIpv4ListenerAddress;
 
 impl TcpListenerAddress for TcpIpv4ListenerAddress {
@@ -489,7 +502,7 @@ impl TcpListenerAddress for TcpIpv4ListenerAddress {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct TcpIpv6ListenerAddress;
 
 impl TcpListenerAddress for TcpIpv6ListenerAddress {
@@ -525,6 +538,31 @@ impl<A: TcpListenerAddress> TcpListenerKey<A> {
     }
 }
 
+impl<A> Default for TcpListenerKey<A>
+where
+    A: TcpListenerAddress + Default,
+{
+    #[inline]
+    fn default() -> Self {
+        Self {
+            words: [0, 0],
+            address: A::default(),
+        }
+    }
+}
+
+impl<A: TcpListenerAddress> BihashKey for TcpListenerKey<A> {
+    #[inline(always)]
+    fn hash(self) -> u64 {
+        hash_words(&[fold_u128(self.words[0]), fold_u128(self.words[1])])
+    }
+
+    #[inline(always)]
+    fn key_eq(self, other: Self) -> bool {
+        self == other
+    }
+}
+
 impl TcpV4ListenerKey {
     #[inline]
     pub fn new(scope_id: u32, local_addr: Ipv4Addr, local_port: u16) -> Self {
@@ -542,7 +580,7 @@ impl TcpV6ListenerKey {
 impl<A: TcpListenerAddress> FlatHashKey for TcpListenerKey<A> {
     #[inline(always)]
     fn hash_key(self) -> usize {
-        hash_words(&[fold_u128(self.words[0]), fold_u128(self.words[1])])
+        self.hash() as usize
     }
 }
 
@@ -1593,13 +1631,13 @@ fn fold_u128(value: u128) -> u64 {
 }
 
 #[inline(always)]
-fn hash_words(words: &[u64]) -> usize {
+fn hash_words(words: &[u64]) -> u64 {
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
     for word in words {
         state ^= splitmix64(*word ^ state);
         state = state.rotate_left(13);
     }
-    splitmix64(state) as usize
+    splitmix64(state)
 }
 
 #[inline(always)]
@@ -1732,9 +1770,9 @@ fn fast_open_cookie_tag_word(
     discriminator: u64,
 ) -> u64 {
     let mut hasher = secret.build_hasher();
-    discriminator.hash(&mut hasher);
-    listener_id.hash(&mut hasher);
-    epoch.hash(&mut hasher);
+    Hash::hash(&discriminator, &mut hasher);
+    Hash::hash(&listener_id, &mut hasher);
+    Hash::hash(&epoch, &mut hasher);
     hash_socket_addr(&mut hasher, local);
     hash_socket_addr(&mut hasher, remote);
     hasher.finish()
@@ -1749,9 +1787,9 @@ fn listener_cookie_word(
     epoch: u32,
 ) -> u32 {
     let mut hasher = secret.build_hasher();
-    listener_id.hash(&mut hasher);
-    epoch.hash(&mut hasher);
-    client_sequence.hash(&mut hasher);
+    Hash::hash(&listener_id, &mut hasher);
+    Hash::hash(&epoch, &mut hasher);
+    Hash::hash(&client_sequence, &mut hasher);
     hash_socket_addr(&mut hasher, local);
     hash_socket_addr(&mut hasher, remote);
     let raw = hasher.finish() as u32;
@@ -1761,25 +1799,30 @@ fn listener_cookie_word(
 fn hash_socket_addr(hasher: &mut impl Hasher, addr: SocketAddr) {
     match addr {
         SocketAddr::V4(addr) => {
-            4u8.hash(hasher);
-            addr.ip().octets().hash(hasher);
-            addr.port().hash(hasher);
+            Hash::hash(&4u8, hasher);
+            Hash::hash(&addr.ip().octets(), hasher);
+            Hash::hash(&addr.port(), hasher);
         }
         SocketAddr::V6(addr) => {
-            6u8.hash(hasher);
-            addr.ip().octets().hash(hasher);
-            addr.port().hash(hasher);
-            addr.flowinfo().hash(hasher);
-            addr.scope_id().hash(hasher);
+            Hash::hash(&6u8, hasher);
+            Hash::hash(&addr.ip().octets(), hasher);
+            Hash::hash(&addr.port(), hasher);
+            Hash::hash(&addr.flowinfo(), hasher);
+            Hash::hash(&addr.scope_id(), hasher);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TcpWorkerOwnedState, write_bytes};
+    use super::{
+        TcpV4ListenerKey, TcpWorkerOwnedState, pool_index_from_bihash_value,
+        pool_index_to_bihash_value, write_bytes,
+    };
     use hammer_adapter::DataWorkerId;
     use hammer_core::protocol::tcp::{TcpCapabilities, TcpFastOpenCookie};
+    use hammer_infra::bihash::Bihash;
+    use hammer_infra::pool::Index as PoolIndex;
     use std::net::{Ipv4Addr, SocketAddr};
 
     fn worker_state() -> TcpWorkerOwnedState {
@@ -1791,6 +1834,24 @@ mod tests {
             SocketAddr::from((Ipv4Addr::new(192, 0, 2, 10), 443)),
             SocketAddr::from((Ipv4Addr::new(198, 51, 100, 20), 50_000)),
         )
+    }
+
+    #[test]
+    fn tcp_listener_key_works_as_bihash_key() {
+        let key = TcpV4ListenerKey::new(0, Ipv4Addr::new(127, 0, 0, 1), 7300);
+        let mut table: Bihash<TcpV4ListenerKey, 1> = Bihash::new(8);
+
+        table.insert(key, 77);
+
+        assert_eq!(table.lookup(&key), Some(77));
+    }
+
+    #[test]
+    fn pool_index_bihash_value_round_trip() {
+        let index = PoolIndex::new(17, 23);
+        let value = pool_index_to_bihash_value(index);
+
+        assert_eq!(pool_index_from_bihash_value(value), index);
     }
 
     #[test]
