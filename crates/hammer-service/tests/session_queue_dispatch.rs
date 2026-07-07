@@ -1,9 +1,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use hammer_adapter::{
-    BufferIndex, DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId,
-};
+use hammer_adapter::{DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId};
 use hammer_core::error::CoreResult;
 use hammer_infra::segment::Local;
 use hammer_runtime::app::{AppSession, AppSessionConfig, SessionHandle};
@@ -11,7 +9,8 @@ use hammer_service::data_plane::DropNode;
 use hammer_service::session::SessionQueueNext;
 use hammer_service::session::protocol::SessionQueueControlContext;
 use hammer_service::session::runtime::{
-    SessionDriverRuntime, SessionQueueProtocol, dispatch_session_queue_for_ticks,
+    SessionDriverRuntime, SessionQueueProtocol, TransportSendFlags, TransportSendParams,
+    TxBatchBuffer, dispatch_session_queue_for_ticks,
 };
 
 fn test_runtime_configured(
@@ -35,8 +34,9 @@ fn test_runtime_configured(
 #[derive(Default)]
 struct TestTxProtocol {
     offset: usize,
-    prepared: usize,
-    committed: usize,
+    send_params_calls: usize,
+    push_header_calls: usize,
+    pushed_batches: std::vec::Vec<std::vec::Vec<(usize, usize)>>,
 }
 
 impl SessionQueueProtocol for TestTxProtocol {
@@ -62,52 +62,58 @@ impl SessionQueueProtocol for TestTxProtocol {
         Ok(false)
     }
 
-    fn tx_offset(&self, _: &SessionQueueControlContext) -> CoreResult<usize> {
-        Ok(self.offset)
-    }
-
-    fn tx_payload_len(
+    fn send_params(
         &mut self,
         _: &mut SessionQueueControlContext,
-        _: usize,
         pending_len: usize,
         _: Instant,
-    ) -> CoreResult<usize> {
-        Ok(pending_len.min(4))
+    ) -> CoreResult<TransportSendParams> {
+        self.send_params_calls += 1;
+        Ok(TransportSendParams {
+            snd_space: pending_len,
+            tx_offset: self.offset,
+            send_goal_size: 4,
+            flags: TransportSendFlags::default(),
+        })
     }
 
-    fn prepare_tx(
+    fn push_header(
         &mut self,
         _: &mut SessionQueueControlContext,
-        _: BufferIndex,
+        batch: &[TxBatchBuffer],
+        _: Instant,
+    ) -> CoreResult<()> {
+        self.push_header_calls += 1;
+        self.pushed_batches.push(
+            batch
+                .iter()
+                .map(|entry| (entry.tx_offset, entry.payload_len))
+                .collect(),
+        );
+        self.offset = batch
+            .last()
+            .map(|entry| entry.tx_offset + entry.payload_len)
+            .unwrap_or(self.offset);
+        Ok(())
+    }
+
+    fn custom_tx(
+        &mut self,
+        _: &DataPlaneRuntime,
+        _: &mut SessionQueueControlContext,
+        _: SessionQueueNext,
+        _: &mut hammer_service::session::node::SessionQueueOutput,
         _: usize,
-        payload_len: usize,
         _: Instant,
-    ) -> CoreResult<()> {
-        self.prepared += payload_len;
-        Ok(())
-    }
-
-    fn cancel_tx(&mut self, _: &mut SessionQueueControlContext, _: BufferIndex) {}
-
-    fn commit_tx(
-        &mut self,
-        _: &mut SessionQueueControlContext,
-        _: BufferIndex,
-        tx_offset: usize,
-        payload_len: usize,
-        _: Instant,
-    ) -> CoreResult<()> {
-        self.committed += payload_len;
-        self.offset = tx_offset + payload_len;
-        Ok(())
+    ) -> CoreResult<usize> {
+        Ok(0)
     }
 
     fn on_close(&mut self, _: &mut SessionQueueControlContext) {}
 }
 
 #[test]
-fn session_tx_dispatch_sends_multiple_segments_up_to_budget() {
+fn session_tx_dispatch_commits_batch_before_graph_visibility() {
     // frame_capacity must be >= DEFAULT_TX_DISPATCH_BUDGET (64) so that
     // output.schedule can push all indices into one frame.
     let runtime = test_runtime_configured(2048, 64, 64, 8);
@@ -126,7 +132,7 @@ fn session_tx_dispatch_sends_multiple_segments_up_to_budget() {
         .expect("create app session"),
     );
 
-    let tx_data = [0xABu8; 100];
+    let tx_data = [0xABu8; 16];
     app_session.send_bytes(&tx_data).expect("send bytes");
 
     driver.app_mut().attach_session(session_id, app_session);
@@ -137,12 +143,10 @@ fn session_tx_dispatch_sends_multiple_segments_up_to_budget() {
         .expect("dispatch session queue");
 
     let protocol = driver.session(session_id).expect("protocol state");
+    assert_eq!(protocol.send_params_calls, 1);
+    assert_eq!(protocol.push_header_calls, 1);
     assert_eq!(
-        protocol.prepared, 100,
-        "expected 25 segments (4 bytes each) to be prepared"
-    );
-    assert_eq!(
-        protocol.committed, 100,
-        "expected 25 segments (4 bytes each) to be committed"
+        protocol.pushed_batches,
+        vec![vec![(0, 4), (4, 4), (8, 4), (12, 4)]]
     );
 }

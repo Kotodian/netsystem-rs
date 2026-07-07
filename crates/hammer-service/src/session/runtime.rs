@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use crossbeam_utils::CachePadded;
 use hammer_adapter::{
     BufferIndex, DataPlaneBuffers, DataPlaneRuntime, DataWorkerId, NodeRuntimeData,
+    buffer::{Frame, Next},
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::fifo_queue::FifoQueue;
@@ -155,6 +156,29 @@ pub struct SessionDriverRuntime<St, Seg: Segment = Local> {
     app_state: CachePadded<SessionDriverRuntimeAppState<Seg>>,
 }
 
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct TransportSendFlags: u8 {
+        const DESCHED = 1 << 0;
+        const POSTPONE = 1 << 1;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportSendParams {
+    pub snd_space: usize,
+    pub tx_offset: usize,
+    pub send_goal_size: usize,
+    pub flags: TransportSendFlags,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxBatchBuffer {
+    pub index: BufferIndex,
+    pub tx_offset: usize,
+    pub payload_len: usize,
+}
+
 pub trait SessionQueueProtocol: Sized {
     fn handle_expired_timer(
         &mut self,
@@ -174,42 +198,29 @@ pub trait SessionQueueProtocol: Sized {
         output: &mut crate::session::node::SessionQueueOutput,
     ) -> CoreResult<bool>;
 
-    fn tx_offset(
-        &self,
-        context: &crate::session::protocol::SessionQueueControlContext,
-    ) -> CoreResult<usize>;
-
-    fn tx_payload_len(
+    fn send_params(
         &mut self,
         context: &mut crate::session::protocol::SessionQueueControlContext,
-        tx_offset: usize,
         pending_len: usize,
         now: Instant,
+    ) -> CoreResult<TransportSendParams>;
+
+    fn push_header(
+        &mut self,
+        context: &mut crate::session::protocol::SessionQueueControlContext,
+        batch: &[TxBatchBuffer],
+        now: Instant,
+    ) -> CoreResult<()>;
+
+    fn custom_tx(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        context: &mut crate::session::protocol::SessionQueueControlContext,
+        output_next: crate::session::SessionQueueNext,
+        output: &mut crate::session::node::SessionQueueOutput,
+        max_burst: usize,
+        now: Instant,
     ) -> CoreResult<usize>;
-
-    fn prepare_tx(
-        &mut self,
-        context: &mut crate::session::protocol::SessionQueueControlContext,
-        index: BufferIndex,
-        tx_offset: usize,
-        payload_len: usize,
-        now: Instant,
-    ) -> CoreResult<()>;
-
-    fn cancel_tx(
-        &mut self,
-        context: &mut crate::session::protocol::SessionQueueControlContext,
-        index: BufferIndex,
-    );
-
-    fn commit_tx(
-        &mut self,
-        context: &mut crate::session::protocol::SessionQueueControlContext,
-        index: BufferIndex,
-        tx_offset: usize,
-        payload_len: usize,
-        now: Instant,
-    ) -> CoreResult<()>;
 
     fn on_close(&mut self, context: &mut crate::session::protocol::SessionQueueControlContext);
 }
@@ -680,86 +691,78 @@ where
             }
             continue;
         }
-        for _ in 0..DEFAULT_TX_DISPATCH_BUDGET {
-            let Some(total_len) = driver.app_state.app.pending_send_len(session_id)? else {
-                break;
-            };
-            let tx_offset = {
-                let driver_ptr = driver as *mut SessionDriverRuntime<St, Seg>;
-                unsafe {
-                    with_session_state(driver_ptr, session_id, |state, context| {
-                        state.tx_offset(context)
-                    })?
-                }
-            };
-            if tx_offset > total_len {
-                return Err(CoreError::internal(
-                    "session tx offset exceeds chain length",
-                ));
+        let mut requeue = false;
+        let Some(total_len) = driver.app_state.app.pending_send_len(session_id)? else {
+            continue;
+        };
+        let params = {
+            let driver_ptr = driver as *mut SessionDriverRuntime<St, Seg>;
+            unsafe {
+                with_session_state(driver_ptr, session_id, |state, context| {
+                    state.send_params(context, total_len, now)
+                })?
             }
-            let pending_len = total_len.saturating_sub(tx_offset);
-            let payload_len = {
-                let driver_ptr = driver as *mut SessionDriverRuntime<St, Seg>;
-                unsafe {
-                    with_session_state(driver_ptr, session_id, |state, context| {
-                        state
-                            .tx_payload_len(context, tx_offset, pending_len, now)
-                            .map(|len| len.min(pending_len))
-                    })?
-                }
-            };
-            if payload_len == 0 {
-                break;
-            }
+        };
+        if params.tx_offset > total_len {
+            return Err(CoreError::internal(
+                "session tx offset exceeds chain length",
+            ));
+        }
 
-            let mut owner = driver.runtime.buffers.get_next_frame(output_next.node())?;
-            let index = driver.runtime.buffers.alloc_index()?;
-            owner.push_index(index)?;
-            if let Err(error) =
+        let mut batch_offset = params.tx_offset;
+        let mut remaining_space = params.snd_space;
+        let pending_len = total_len.saturating_sub(batch_offset);
+        if pending_len != 0 && remaining_space != 0 && params.send_goal_size != 0 {
+            let mut owner: Frame<Next> =
+                driver.runtime.buffers.get_next_frame(output_next.node())?;
+            let batch_capacity = owner.remaining_capacity().min(DEFAULT_TX_DISPATCH_BUDGET);
+            let mut batch = hammer_infra::vec::Vec::with_capacity(batch_capacity);
+            while batch.len() < DEFAULT_TX_DISPATCH_BUDGET
+                && owner.remaining_capacity() > 0
+                && remaining_space > 0
+            {
+                let pending_len = total_len.saturating_sub(batch_offset);
+                if pending_len == 0 {
+                    break;
+                }
+                let payload_len = pending_len.min(remaining_space).min(params.send_goal_size);
+                if payload_len == 0 {
+                    break;
+                }
+
+                let index = driver.runtime.buffers.alloc_index()?;
+                owner.push_index(index)?;
                 driver
                     .app_state
                     .app
-                    .copy_tx_to_buffer(session_id, tx_offset, payload_len, index)
-            {
-                return Err(error);
+                    .copy_tx_to_buffer(session_id, batch_offset, payload_len, index)?;
+                batch.push(TxBatchBuffer {
+                    index,
+                    tx_offset: batch_offset,
+                    payload_len,
+                });
+                batch_offset += payload_len;
+                remaining_space -= payload_len;
             }
 
-            {
-                let driver_ptr = driver as *mut SessionDriverRuntime<St, Seg>;
-                unsafe {
-                    with_session_state(driver_ptr, session_id, |state, context| {
-                        state.prepare_tx(context, index, tx_offset, payload_len, now)
-                    })?
-                };
-            }
-
-            output.enqueue_frame(runtime, owner)?;
-
-            let commit_result = {
-                let driver_ptr = driver as *mut SessionDriverRuntime<St, Seg>;
-                unsafe {
-                    with_session_state(driver_ptr, session_id, |state, context| {
-                        state.commit_tx(context, index, tx_offset, payload_len, now)
-                    })
-                }
+            let driver_ptr = driver as *mut SessionDriverRuntime<St, Seg>;
+            unsafe {
+                with_session_state(driver_ptr, session_id, |state, context| {
+                    state.push_header(context, batch.as_slice(), now)
+                })?
             };
-            if let Err(err) = commit_result {
-                let driver_ptr = driver as *mut SessionDriverRuntime<St, Seg>;
-                unsafe {
-                    let _ = with_session_state(driver_ptr, session_id, |state, context| {
-                        state.cancel_tx(context, index);
-                        Ok(())
-                    });
-                }
-                return Err(err);
-            }
+            output.enqueue_frame(runtime, owner)?;
         }
-        let remaining = driver
-            .app_state
-            .app
-            .pending_send_len(session_id)?
-            .unwrap_or(0);
-        if remaining > 0 {
+
+        let pending_len = total_len.saturating_sub(batch_offset);
+        if pending_len > 0
+            && !params
+                .flags
+                .intersects(TransportSendFlags::DESCHED | TransportSendFlags::POSTPONE)
+        {
+            requeue = true;
+        }
+        if requeue {
             driver.mark_ready(session_id);
         }
     }
@@ -802,9 +805,9 @@ mod tests {
 
     #[derive(Default)]
     struct FakeTxProtocol {
-        prepared: usize,
-        committed: usize,
-        canceled: usize,
+        send_params_calls: usize,
+        push_header_calls: usize,
+        custom_tx_calls: usize,
     }
 
     impl SessionQueueProtocol for FakeTxProtocol {
@@ -830,46 +833,42 @@ mod tests {
             Ok(false)
         }
 
-        fn tx_offset(&self, _: &SessionQueueControlContext) -> CoreResult<usize> {
-            Ok(0)
-        }
-
-        fn tx_payload_len(
+        fn send_params(
             &mut self,
             _: &mut SessionQueueControlContext,
-            _: usize,
             pending_len: usize,
             _: Instant,
+        ) -> CoreResult<TransportSendParams> {
+            self.send_params_calls += 1;
+            Ok(TransportSendParams {
+                snd_space: pending_len,
+                tx_offset: 0,
+                send_goal_size: 4,
+                flags: TransportSendFlags::default(),
+            })
+        }
+
+        fn push_header(
+            &mut self,
+            _: &mut SessionQueueControlContext,
+            _: &[TxBatchBuffer],
+            _: Instant,
+        ) -> CoreResult<()> {
+            self.push_header_calls += 1;
+            Ok(())
+        }
+
+        fn custom_tx(
+            &mut self,
+            _: &DataPlaneRuntime,
+            _: &mut SessionQueueControlContext,
+            _: crate::session::SessionQueueNext,
+            _: &mut crate::session::node::SessionQueueOutput,
+            _: usize,
+            _: Instant,
         ) -> CoreResult<usize> {
-            Ok(pending_len.min(4))
-        }
-
-        fn prepare_tx(
-            &mut self,
-            _: &mut SessionQueueControlContext,
-            _: BufferIndex,
-            _: usize,
-            payload_len: usize,
-            _: Instant,
-        ) -> CoreResult<()> {
-            self.prepared += payload_len;
-            Ok(())
-        }
-
-        fn cancel_tx(&mut self, _: &mut SessionQueueControlContext, _: BufferIndex) {
-            self.canceled += 1;
-        }
-
-        fn commit_tx(
-            &mut self,
-            _: &mut SessionQueueControlContext,
-            _: BufferIndex,
-            _: usize,
-            payload_len: usize,
-            _: Instant,
-        ) -> CoreResult<()> {
-            self.committed += payload_len;
-            Ok(())
+            self.custom_tx_calls += 1;
+            Ok(0)
         }
 
         fn on_close(&mut self, _: &mut SessionQueueControlContext) {}
@@ -900,42 +899,39 @@ mod tests {
             Ok(false)
         }
 
-        fn tx_offset(&self, _: &SessionQueueControlContext) -> CoreResult<usize> {
-            Ok(0)
-        }
-
-        fn tx_payload_len(
+        fn send_params(
             &mut self,
             _: &mut SessionQueueControlContext,
             _: usize,
+            _: Instant,
+        ) -> CoreResult<TransportSendParams> {
+            Ok(TransportSendParams {
+                snd_space: 0,
+                tx_offset: 0,
+                send_goal_size: 4,
+                flags: TransportSendFlags::default(),
+            })
+        }
+
+        fn push_header(
+            &mut self,
+            _: &mut SessionQueueControlContext,
+            _: &[TxBatchBuffer],
+            _: Instant,
+        ) -> CoreResult<()> {
+            Err(CoreError::internal("transport tx push_header must not run"))
+        }
+
+        fn custom_tx(
+            &mut self,
+            _: &DataPlaneRuntime,
+            _: &mut SessionQueueControlContext,
+            _: crate::session::SessionQueueNext,
+            _: &mut crate::session::node::SessionQueueOutput,
             _: usize,
             _: Instant,
         ) -> CoreResult<usize> {
-            Ok(0)
-        }
-
-        fn prepare_tx(
-            &mut self,
-            _: &mut SessionQueueControlContext,
-            _: BufferIndex,
-            _: usize,
-            _: usize,
-            _: Instant,
-        ) -> CoreResult<()> {
-            Err(CoreError::internal("transport tx prepare must not run"))
-        }
-
-        fn cancel_tx(&mut self, _: &mut SessionQueueControlContext, _: BufferIndex) {}
-
-        fn commit_tx(
-            &mut self,
-            _: &mut SessionQueueControlContext,
-            _: BufferIndex,
-            _: usize,
-            _: usize,
-            _: Instant,
-        ) -> CoreResult<()> {
-            Err(CoreError::internal("transport tx commit must not run"))
+            Err(CoreError::internal("transport custom tx must not run"))
         }
 
         fn on_close(&mut self, _: &mut SessionQueueControlContext) {}
@@ -1238,9 +1234,9 @@ mod tests {
         .expect("dispatch without app tx");
 
         let protocol = driver.session(session_id).expect("protocol state");
-        assert_eq!(protocol.prepared, 0);
-        assert_eq!(protocol.committed, 0);
-        assert_eq!(protocol.canceled, 0);
+        assert_eq!(protocol.send_params_calls, 0);
+        assert_eq!(protocol.push_header_calls, 0);
+        assert_eq!(protocol.custom_tx_calls, 0);
         assert!(!driver.has_session_tx(session_id));
     }
 }

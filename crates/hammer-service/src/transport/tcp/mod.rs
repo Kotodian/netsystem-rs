@@ -20,7 +20,9 @@ use crate::session::{
     node::{SessionQueueNode, SessionQueueOutput},
     protocol::SessionQueueControlContext,
     runtime::SessionDriverRuntime,
-    runtime::SessionQueueProtocol,
+    runtime::{
+        SessionQueueProtocol, TransportSendFlags, TransportSendParams, TxBatchBuffer,
+    },
     runtime::dispatch_registered_session_queue_once_at,
 };
 use crate::transport::congestion::CongestionController;
@@ -578,14 +580,33 @@ impl<C> SessionQueueProtocol for TcpConnection<C>
 where
     C: CongestionController + 'static,
 {
-    fn tx_offset(&self, _: &SessionQueueControlContext) -> CoreResult<usize> {
+    fn send_params(
+        &mut self,
+        context: &mut SessionQueueControlContext,
+        pending_len: usize,
+        now: std::time::Instant,
+    ) -> CoreResult<TransportSendParams> {
         let start = if self.state() == TcpState::SynSent {
             self.iss()
         } else {
             self.snd_una()
         };
-        usize::try_from(TcpSeq::from(start).distance_to(self.tx_payload_sequence()))
-            .map_err(|_| TcpNodeError::TxOffsetOverflow.into())
+        let tx_offset = usize::try_from(TcpSeq::from(start).distance_to(self.tx_payload_sequence()))
+            .map_err(|_| TcpNodeError::TxOffsetOverflow)?;
+        let pending_len = pending_len.saturating_sub(tx_offset);
+        let snd_space = self.tx_payload_budget(
+            pending_len,
+            now,
+            tcp_worker_state()
+                .pending_open_capabilities(context.session_id())
+                .unwrap_or_default(),
+        );
+        Ok(TransportSendParams {
+            snd_space,
+            tx_offset,
+            send_goal_size: self.output_payload_len(),
+            flags: TransportSendFlags::default(),
+        })
     }
 
     fn handle_expired_timer(
@@ -680,57 +701,36 @@ where
         Ok(self.state() == TcpState::Closed)
     }
 
-    fn tx_payload_len(
+    fn push_header(
         &mut self,
         context: &mut SessionQueueControlContext,
-        _: usize,
-        pending_len: usize,
-        now: std::time::Instant,
-    ) -> CoreResult<usize> {
-        Ok(self.tx_payload_budget(
-            pending_len,
-            now,
-            tcp_worker_state()
-                .pending_open_capabilities(context.session_id())
-                .unwrap_or_default(),
-        ))
-    }
-
-    fn prepare_tx(
-        &mut self,
-        context: &mut SessionQueueControlContext,
-        index: hammer_adapter::BufferIndex,
-        _: usize,
-        payload_len: usize,
-        _: std::time::Instant,
-    ) -> CoreResult<()> {
-        let segment = self.tx_segment(
-            payload_len,
-            tcp_worker_state()
-                .pending_open_capabilities(context.session_id())
-                .unwrap_or_default(),
-        )?;
-        segment.write_to_buffer(context.buffers(), index)
-    }
-
-    fn cancel_tx(&mut self, _: &mut SessionQueueControlContext, _: hammer_adapter::BufferIndex) {}
-
-    fn commit_tx(
-        &mut self,
-        context: &mut SessionQueueControlContext,
-        _: hammer_adapter::BufferIndex,
-        _: usize,
-        payload_len: usize,
+        batch: &[TxBatchBuffer],
         now: std::time::Instant,
     ) -> CoreResult<()> {
-        let timer_mask = self.commit_payload_tx(payload_len, now)?;
+        let local_capabilities = tcp_worker_state()
+            .pending_open_capabilities(context.session_id())
+            .unwrap_or_default();
+        for entry in batch {
+            let segment = self.tx_segment(entry.payload_len, local_capabilities)?;
+            segment.write_to_buffer(context.buffers(), entry.index)?;
+            let _ = self.commit_payload_tx(entry.payload_len, now)?;
+        }
         let now = std::time::Instant::now();
-        // Prior per-site predicate was `(timer_mask & bit) != 0 ||
-        // timer_is_active(id) || id == RETRANSMIT`, i.e.
-        // keep_mask = timer_mask | active | (1 << RETRANSMIT).
-        let keep_mask = timer_mask | self.active_timer_mask() | (1u16 << TCP_TIMER_RETRANSMIT);
+        let keep_mask = self.active_timer_mask() | (1u16 << TCP_TIMER_RETRANSMIT);
         context.refresh_tcp_timers(self, keep_mask, now)?;
         Ok(())
+    }
+
+    fn custom_tx(
+        &mut self,
+        _: &DataPlaneRuntime,
+        _: &mut SessionQueueControlContext,
+        _: SessionQueueNext,
+        _: &mut SessionQueueOutput,
+        _: usize,
+        _: std::time::Instant,
+    ) -> CoreResult<usize> {
+        Ok(0)
     }
 
     fn on_close(&mut self, context: &mut SessionQueueControlContext) {
