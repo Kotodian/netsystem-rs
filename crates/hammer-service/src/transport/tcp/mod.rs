@@ -20,10 +20,8 @@ use crate::session::{
     node::{SessionQueueNode, SessionQueueOutput},
     protocol::SessionQueueControlContext,
     runtime::SessionDriverRuntime,
-    runtime::{
-        SessionQueueProtocol, TransportSendFlags, TransportSendParams, TxBatchBuffer,
-    },
     runtime::dispatch_registered_session_queue_once_at,
+    runtime::{SessionQueueProtocol, TransportSendFlags, TransportSendParams, TxBatchBuffer},
 };
 use crate::transport::congestion::CongestionController;
 
@@ -591,8 +589,9 @@ where
         } else {
             self.snd_una()
         };
-        let tx_offset = usize::try_from(TcpSeq::from(start).distance_to(self.tx_payload_sequence()))
-            .map_err(|_| TcpNodeError::TxOffsetOverflow)?;
+        let tx_offset =
+            usize::try_from(TcpSeq::from(start).distance_to(self.tx_payload_sequence()))
+                .map_err(|_| TcpNodeError::TxOffsetOverflow)?;
         let pending_len = pending_len.saturating_sub(tx_offset);
         let snd_space = self.tx_payload_budget(
             pending_len,

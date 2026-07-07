@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use hammer_adapter::{DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId};
+use hammer_adapter::{
+    DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId,
+};
 use hammer_core::error::CoreResult;
 use hammer_infra::segment::Local;
 use hammer_runtime::app::{AppSession, AppSessionConfig, SessionHandle};
