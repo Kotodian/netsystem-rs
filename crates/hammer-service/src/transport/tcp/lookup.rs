@@ -668,11 +668,6 @@ impl<A: TcpListenerAddress> BihashKey for TcpListenerKey<A> {
     fn hash(self) -> u64 {
         hash_words(&[fold_u128(self.words[0]), fold_u128(self.words[1])])
     }
-
-    #[inline(always)]
-    fn key_eq(self, other: Self) -> bool {
-        self == other
-    }
 }
 
 impl TcpV4ListenerKey {
@@ -690,7 +685,7 @@ impl TcpV6ListenerKey {
 }
 
 pub struct TcpListenerTable<A: TcpListenerAddress> {
-    values: Pool<TcpLookupValue>,
+    values: Vec<TcpLookupValue>,
     entries: Bihash<A::Key, 1>,
 }
 
@@ -698,14 +693,14 @@ impl<A: TcpListenerAddress> TcpListenerTable<A> {
     #[inline]
     fn empty() -> Self {
         Self {
-            values: Pool::with_capacity(64),
+            values: Vec::with_capacity(64),
             entries: Bihash::new(64),
         }
     }
 
     #[inline]
     pub fn lookup(&self, key: A::Key) -> Option<TcpLookupValue> {
-        let index = pool_index_from_bihash_value(self.entries.lookup(&key)?);
+        let index = self.entries.lookup(&key)? as usize;
         self.values.get(index).copied()
     }
 
@@ -717,16 +712,15 @@ impl<A: TcpListenerAddress> TcpListenerTable<A> {
     #[inline]
     pub fn insert(&mut self, key: A::Key, value: TcpLookupValue) {
         if let Some(raw) = self.entries.lookup(&key) {
-            if let Some(slot) = self.values.get_mut(pool_index_from_bihash_value(raw)) {
+            if let Some(slot) = self.values.get_mut(raw as usize) {
                 *slot = value;
                 return;
             }
         }
-        let index = self
-            .values
-            .insert(value)
-            .expect("tcp listener lookup pool exhausted");
-        self.entries.insert(key, pool_index_to_bihash_value(index));
+        let index = self.values.len() as u64;
+        debug_assert_ne!(index, FREE_U64);
+        self.values.push(value);
+        self.entries.insert(key, index);
     }
 }
 
@@ -734,7 +728,7 @@ impl<A: TcpListenerAddress> Clone for TcpListenerTable<A> {
     fn clone(&self) -> Self {
         let mut cloned = Self::empty();
         for (key, raw) in self.entries.iter() {
-            if let Some(value) = self.values.get(pool_index_from_bihash_value(*raw)).copied() {
+            if let Some(value) = self.values.get(*raw as usize).copied() {
                 cloned.insert(*key, value);
             }
         }
@@ -1591,7 +1585,7 @@ impl TcpWorkerOwnedState {
                     *remote.ip(),
                     remote.port(),
                 )),
-            _ => None,
+            _ => return,
         };
         if let Some(index) = existing_index {
             let index = index as usize;
@@ -2316,6 +2310,21 @@ mod tests {
             state.fast_open_cookie(local, remote),
             Some((cookie_b, Some(1_460)))
         );
+    }
+
+    #[test]
+    fn fast_open_cookie_cache_ignores_mixed_family_tuple() {
+        let mut state = worker_state();
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 443);
+        let remote = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 50_000);
+        let cookie = state.fast_open_cookie_for_listener_in_epoch(7, local, remote, 42);
+
+        state.remember_fast_open_cookie(local, remote, cookie, Some(1_440));
+
+        assert_eq!(state.fast_open_cookie(local, remote), None);
+        assert_eq!(state.cacheline1.fast_open_cache.len(), 0);
+        assert_eq!(state.cacheline1.fast_open_cache_index_v4.len(), 0);
+        assert_eq!(state.cacheline1.fast_open_cache_index_v6.len(), 0);
     }
 
     #[test]

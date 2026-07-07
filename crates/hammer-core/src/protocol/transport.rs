@@ -163,11 +163,6 @@ impl BihashKey for TransportConnectionKey<Ipv4Addr> {
             | u128::from(self.ports);
         splitmix64((packed ^ (packed >> 64)) as u64)
     }
-
-    #[inline(always)]
-    fn key_eq(self, other: Self) -> bool {
-        self == other
-    }
 }
 
 impl BihashKey for TransportConnectionKey<Ipv6Addr> {
@@ -179,11 +174,6 @@ impl BihashKey for TransportConnectionKey<Ipv6Addr> {
             u64::from(self.scope_id),
             u64::from(self.ports),
         ])
-    }
-
-    #[inline(always)]
-    fn key_eq(self, other: Self) -> bool {
-        self == other
     }
 }
 

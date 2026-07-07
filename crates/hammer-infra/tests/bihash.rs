@@ -13,16 +13,6 @@ fn bihash_key_u64_hashes_deterministically() {
 }
 
 #[test]
-fn bihash_key_u64_eq_symmetric() {
-    let a: u64 = 42;
-    let b: u64 = 42;
-    let c: u64 = 43;
-    assert!(a.key_eq(b));
-    assert!(a.key_eq(a));
-    assert!(!a.key_eq(c));
-}
-
-#[test]
 fn bihash_skeleton_constructs_with_zero_entries() {
     let t: Bihash<u64, 7> = Bihash::new(64);
     assert_eq!(t.len(), 0);
@@ -108,6 +98,25 @@ fn bihash_prefetch_accepts_empty_and_present_keys() {
 
 use hammer_infra::bihash::alloc::PageAlloc;
 use hammer_infra::bihash::value::{FREE_U64, Kv, ValuePage};
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct FixedHashKey {
+    id: u64,
+    hash: u64,
+}
+
+impl FixedHashKey {
+    fn new(id: u64, hash: u64) -> Self {
+        Self { id, hash }
+    }
+}
+
+impl BihashKey for FixedHashKey {
+    #[inline(always)]
+    fn hash(self) -> u64 {
+        self.hash
+    }
+}
 
 #[test]
 fn kv_u64_mark_free_sets_sentinel_in_value() {
@@ -195,6 +204,20 @@ fn bihash_insert_overwrite_replaces_value_without_growing_len() {
     t.insert(7, 2);
     assert_eq!(t.lookup(&7), Some(2));
     assert_eq!(t.len(), 1);
+}
+
+#[test]
+fn bihash_insert_overwrites_key_on_linear_search_fallback_page() {
+    let mut t: Bihash<FixedHashKey, 1> = Bihash::new(1);
+    let first = FixedHashKey::new(1, 0);
+    let fallback = FixedHashKey::new(2, 0);
+
+    t.insert(first, 10);
+    t.insert(fallback, 20);
+    t.insert(fallback, 30);
+
+    assert_eq!(t.lookup(&fallback), Some(30));
+    assert_eq!(t.len(), 2);
 }
 
 #[test]

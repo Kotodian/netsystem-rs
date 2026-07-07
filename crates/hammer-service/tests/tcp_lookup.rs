@@ -52,3 +52,33 @@ fn tcp_lookup_returns_owner_worker_for_ipv6_listener() {
     assert_eq!(lookup.id, 101);
     assert_eq!(lookup.owner_worker, DataWorkerId::new(11));
 }
+
+#[test]
+fn tcp_lookup_listener_table_grows_beyond_initial_listener_count() {
+    let mut snapshot = TcpLookupSnapshot::default();
+
+    {
+        let table =
+            <TcpLookupSnapshot as TcpListenerLookupAccess<TcpIpv4ListenerAddress>>::listener_table_mut(
+                &mut snapshot,
+            );
+        for id in 0..80u32 {
+            table.insert(
+                TcpV4ListenerKey::new(0, Ipv4Addr::new(192, 0, 2, 10), 10_000 + id as u16),
+                TcpLookupValue {
+                    id,
+                    owner_worker: DataWorkerId::new(id),
+                    capabilities: TcpCapabilities::default(),
+                },
+            );
+        }
+    }
+
+    let listener_key = TcpV4ListenerKey::new(0, Ipv4Addr::new(192, 0, 2, 10), 10_079);
+    let lookup = snapshot
+        .lookup_listener::<TcpIpv4ListenerAddress>(listener_key)
+        .expect("listener lookup should exist past the original pool size");
+
+    assert_eq!(lookup.id, 79);
+    assert_eq!(lookup.owner_worker, DataWorkerId::new(79));
+}

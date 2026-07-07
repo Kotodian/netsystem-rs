@@ -1,6 +1,6 @@
 //! Hot-path operations: lookup, insert, remove, clear.
 
-use crate::bihash::{Bihash, BihashKey, Bucket, Kv, PageAlloc, PageId};
+use crate::bihash::{Bihash, BihashKey, Bucket, FREE_U64, Kv, PageAlloc, PageId};
 use crate::prefetch::prefetch_read_l1;
 
 impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
@@ -63,7 +63,7 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
                 if kv_slot_is_free(kv) {
                     continue;
                 }
-                if K::key_eq(kv.key, key) {
+                if kv.key == key {
                     return Some(kv.value);
                 }
             }
@@ -80,6 +80,7 @@ pub(super) fn kv_slot_is_free<K>(kv: &Kv<K>) -> bool {
 impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
     /// Insert or overwrite a key. VPP semantics: `is_add=1` (always overwrite).
     pub fn insert(&mut self, key: K, value: u64) {
+        debug_assert_ne!(value, FREE_U64);
         let hash = key.hash();
         let bucket_idx = (hash as u32) & (self.nbuckets - 1);
         let bucket = self.buckets[bucket_idx as usize];
@@ -96,26 +97,34 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
 
         let page_id = PageId(bucket.offset() as u32);
         let log2_pages = bucket.log2_pages();
-        let page_offset =
-            ((hash >> (self.log2_nbuckets as u32)) as u32) & ((1u32 << log2_pages) - 1);
-        let target = PageId(page_id.0 + page_offset);
-        let page = self.pages.get_mut(target);
+        let linear = bucket.is_linear_search();
+        let page_offset = if linear {
+            0u32
+        } else {
+            ((hash >> (self.log2_nbuckets as u32)) as u32) & ((1u32 << log2_pages) - 1)
+        };
+        let first_page = PageId(page_id.0 + page_offset);
+        let limit = if linear { 1u32 << log2_pages } else { 1 };
 
-        let mut free_idx: Option<usize> = None;
-        for (i, kv) in page.slots().iter().enumerate() {
-            if kv_slot_is_free(kv) {
-                if free_idx.is_none() {
-                    free_idx = Some(i);
+        let mut free_slot: Option<(PageId, usize)> = None;
+        for rel in 0..limit {
+            let cur = PageId(first_page.0 + rel);
+            let page = self.pages.get(cur);
+            for (i, kv) in page.slots().iter().enumerate() {
+                if kv_slot_is_free(kv) {
+                    if free_slot.is_none() {
+                        free_slot = Some((cur, i));
+                    }
+                    continue;
                 }
-                continue;
-            }
-            if K::key_eq(kv.key, key) {
-                page.slots_mut()[i].value = value;
-                return;
+                if kv.key == key {
+                    self.pages.get_mut(cur).slots_mut()[i].value = value;
+                    return;
+                }
             }
         }
-        if let Some(i) = free_idx {
-            page.slots_mut()[i] = Kv { key, value };
+        if let Some((pid, i)) = free_slot {
+            self.pages.get_mut(pid).slots_mut()[i] = Kv { key, value };
             self.buckets[bucket_idx as usize] = Bucket::pack(
                 page_id.0 as u64,
                 log2_pages,
@@ -157,7 +166,7 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
                 if slot.is_free() {
                     continue;
                 }
-                if K::key_eq(slot.key, *key) {
+                if slot.key == *key {
                     slot.mark_free();
                     if !linear {
                         self.buckets[bucket_idx as usize] = Bucket::pack(

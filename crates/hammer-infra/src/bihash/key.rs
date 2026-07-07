@@ -1,23 +1,17 @@
 /// Trait implemented by every key type accepted by `Bihash`.
 ///
-/// Mirrors VPP's per-template function set (`hash`, `key_compare`) but
-/// returns a `u64` hash so behavior is identical on 32- and 64-bit targets.
+/// Mirrors VPP's per-template hash function but uses Rust `Eq` for key
+/// equality and returns a `u64` hash so behavior is identical on 32- and
+/// 64-bit targets.
 pub trait BihashKey: Copy + Eq {
     /// Platform-independent 64-bit hash of the key.
     fn hash(self) -> u64;
-    /// Equality check. Separate from `PartialEq` so `#[inline(always)]`
-    /// is not overridden by trait dispatch in generic contexts.
-    fn key_eq(self, other: Self) -> bool;
 }
 
 impl BihashKey for u64 {
     #[inline(always)]
     fn hash(self) -> u64 {
         splitmix64(self)
-    }
-    #[inline(always)]
-    fn key_eq(self, other: Self) -> bool {
-        self == other
     }
 }
 
@@ -26,10 +20,6 @@ impl BihashKey for u32 {
     fn hash(self) -> u64 {
         splitmix64(u64::from(self))
     }
-    #[inline(always)]
-    fn key_eq(self, other: Self) -> bool {
-        self == other
-    }
 }
 
 impl BihashKey for u16 {
@@ -37,20 +27,12 @@ impl BihashKey for u16 {
     fn hash(self) -> u64 {
         splitmix64(u64::from(self))
     }
-    #[inline(always)]
-    fn key_eq(self, other: Self) -> bool {
-        self == other
-    }
 }
 
 impl BihashKey for usize {
     #[inline(always)]
     fn hash(self) -> u64 {
         splitmix64(self as u64)
-    }
-    #[inline(always)]
-    fn key_eq(self, other: Self) -> bool {
-        self == other
     }
 }
 
@@ -60,10 +42,6 @@ impl BihashKey for u128 {
         let folded = (self ^ (self >> 64)) as u64;
         splitmix64(folded)
     }
-    #[inline(always)]
-    fn key_eq(self, other: Self) -> bool {
-        self == other
-    }
 }
 
 impl BihashKey for [u64; 3] {
@@ -71,25 +49,12 @@ impl BihashKey for [u64; 3] {
     fn hash(self) -> u64 {
         hash_words(&self)
     }
-    #[inline(always)]
-    fn key_eq(self, other: Self) -> bool {
-        self[0] == other[0] && self[1] == other[1] && self[2] == other[2]
-    }
 }
 
 impl BihashKey for [u64; 6] {
     #[inline(always)]
     fn hash(self) -> u64 {
         hash_words(&self)
-    }
-    #[inline(always)]
-    fn key_eq(self, other: Self) -> bool {
-        self[0] == other[0]
-            && self[1] == other[1]
-            && self[2] == other[2]
-            && self[3] == other[3]
-            && self[4] == other[4]
-            && self[5] == other[5]
     }
 }
 
