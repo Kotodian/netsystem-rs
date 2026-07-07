@@ -9,6 +9,7 @@ use super::output::{
 use super::recovery::{TcpRecoveryAck, TcpRecoveryState};
 use super::sack::TcpSackState;
 use super::segment::TcpSegment;
+use super::TcpNodeError;
 use crate::transport::congestion::CongestionController;
 use crossbeam_utils::CachePadded;
 use hammer_adapter::DataWorkerId;
@@ -43,6 +44,43 @@ pub const TCP_TIMER_TIME_WAIT: u32 = 6;
 pub const TCP_TIMER_PACING: u32 = 7;
 pub const TCP_TIMER_COUNT: u32 = 8;
 const TCP_DELAYED_ACK_TICKS: u64 = 1;
+
+pub(crate) fn sync_tcp_timer<C>(
+    timers: &mut hammer_infra::timer_wheel::TimerWheel1t2w2048sl<u32>,
+    connection: &TcpConnection<C>,
+    session: hammer_infra::pool::Index,
+    timer_id: u32,
+    now: Instant,
+) -> CoreResult<()>
+where
+    C: CongestionController + 'static,
+{
+    if connection.timer_is_active(timer_id)
+        && let Some(ticks) = connection.timer_ticks(timer_id, now)
+    {
+        timers
+            .update_timer(session.slot(), session.generation(), timer_id, ticks)
+            .map_err(|_| TcpNodeError::TimerUpdateFailed)?;
+        return Ok(());
+    }
+    let _ = timers.cancel_timer(session.slot(), session.generation(), timer_id);
+    Ok(())
+}
+
+pub(crate) fn sync_all_tcp_timers<C>(
+    timers: &mut hammer_infra::timer_wheel::TimerWheel1t2w2048sl<u32>,
+    connection: &TcpConnection<C>,
+    session: hammer_infra::pool::Index,
+    now: Instant,
+) -> CoreResult<()>
+where
+    C: CongestionController + 'static,
+{
+    for timer_id in 0..TCP_TIMER_COUNT {
+        sync_tcp_timer(timers, connection, session, timer_id, now)?;
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TcpKeepaliveConfig {
