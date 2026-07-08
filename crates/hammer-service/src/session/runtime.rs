@@ -1,3 +1,4 @@
+use std::num::NonZeroU32;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -37,14 +38,45 @@ enum SessionControlEvent {
     Disconnect(SessionId),
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct SessionRxEnqueue {
-    pub(crate) accepted_len: u32,
-    pub(crate) delivered_len: u32,
-    pub(crate) newest_ooo_start: Option<u32>,
-    pub(crate) newest_ooo_len: u32,
-    pub(crate) fifo_full: bool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OooSpan {
+    start: u32,
+    len: NonZeroU32,
 }
+
+impl OooSpan {
+    #[inline]
+    pub(crate) const fn new(start: u32, len: NonZeroU32) -> Self {
+        Self { start, len }
+    }
+
+    #[inline]
+    pub(crate) const fn start(self) -> u32 {
+        self.start
+    }
+
+    #[inline]
+    pub(crate) const fn len(self) -> NonZeroU32 {
+        self.len
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RxDelivery {
+    NotAccepted {
+        available: u32,
+    },
+    InOrder {
+        accepted: NonZeroU32,
+    },
+    OutOfOrder {
+        accepted: NonZeroU32,
+        delivered: u32,
+        span: OooSpan,
+    },
+}
+
+const _: () = assert!(core::mem::size_of::<RxDelivery>() <= 24);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SessionQueueStep {
@@ -461,6 +493,13 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
         self.app_state.app.rx_available_len(session_id)
     }
 
+    #[inline]
+    fn rx_available_u32(&self, session_id: SessionId) -> u32 {
+        self.rx_available_len(session_id)
+            .map(|available| available.min(u32::MAX as usize) as u32)
+            .unwrap_or(0)
+    }
+
     pub(crate) fn ack_tx_up_to(&mut self, session_id: SessionId, bytes: usize) -> CoreResult<()>
     where
         SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
@@ -499,7 +538,7 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
         index: BufferIndex,
         offset: u32,
         _: bool,
-    ) -> CoreResult<SessionRxEnqueue>
+    ) -> CoreResult<RxDelivery>
     where
         SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
     {
@@ -509,24 +548,29 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
                 .app_state
                 .app
                 .copy_rx_from_buffer(session_id, buffers, index)?;
-            Ok(SessionRxEnqueue {
-                accepted_len: wrote as u32,
-                delivered_len: wrote as u32,
-                newest_ooo_start: None,
-                newest_ooo_len: 0,
-                fifo_full: wrote == 0,
+            Ok(match NonZeroU32::new(wrote as u32) {
+                Some(accepted) => RxDelivery::InOrder { accepted },
+                None => RxDelivery::NotAccepted {
+                    available: self.rx_available_u32(session_id),
+                },
             })
         } else {
-            let (delivered, ooo_start, ooo_len) = self
+            let (accepted, delivered, accepted_start) = self
                 .app_state
                 .app
                 .copy_rx_from_buffer_ooo(session_id, buffers, index, offset)?;
-            Ok(SessionRxEnqueue {
-                accepted_len: ooo_len,
-                delivered_len: delivered,
-                newest_ooo_start: ooo_start,
-                newest_ooo_len: ooo_len,
-                fifo_full: ooo_len == 0,
+            Ok(match NonZeroU32::new(accepted) {
+                Some(accepted) => RxDelivery::OutOfOrder {
+                    accepted,
+                    delivered,
+                    span: OooSpan::new(
+                        accepted_start.expect("accepted OOO delivery must report a start offset"),
+                        accepted,
+                    ),
+                },
+                None => RxDelivery::NotAccepted {
+                    available: self.rx_available_u32(session_id),
+                },
             })
         }
     }
@@ -913,6 +957,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroU32;
     use std::sync::{Arc, Mutex, OnceLock};
 
     use crate::session::protocol::SessionQueueControlContext;
@@ -1464,6 +1509,115 @@ mod tests {
             bytes.extend_from_slice(buffer?.current());
         }
         Ok(bytes)
+    }
+
+    fn runtime_for_rx_delivery_tests(
+        fifo_capacity: usize,
+    ) -> (
+        DataPlaneRuntime,
+        SessionDriverRuntime<NoTxPayloadProtocol, Local>,
+        SessionId,
+    ) {
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 2048,
+                    buffer_slots: 16,
+                    frame_capacity: 8,
+                    frame_slots: 8,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
+        let mut driver =
+            SessionDriverRuntime::<NoTxPayloadProtocol, Local>::with_app_session_config(
+                DataWorkerId::new(0),
+                runtime.buffers().clone(),
+                AppSessionConfig::new(fifo_capacity, 8),
+                Local::default(),
+                0,
+            );
+        let session_id = driver
+            .insert_session_with_id(|_| NoTxPayloadProtocol)
+            .expect("insert session");
+        (runtime, driver, session_id)
+    }
+
+    fn append_payload(runtime: &DataPlaneRuntime, payload: &[u8]) -> BufferIndex {
+        let index = runtime.buffers().alloc_index().expect("alloc payload");
+        runtime
+            .buffers()
+            .append(index, payload)
+            .expect("append payload");
+        index
+    }
+
+    #[test]
+    fn ooo_span_len_is_non_zero_by_type() {
+        assert!(NonZeroU32::new(0).is_none());
+
+        let span = OooSpan::new(7, NonZeroU32::new(3).expect("non-zero span len"));
+        assert_eq!(span.start(), 7);
+        assert_eq!(span.len().get(), 3);
+    }
+
+    #[test]
+    fn enqueue_rx_in_order_delivery_cannot_carry_ooo_facts() {
+        let (runtime, driver, session_id) = runtime_for_rx_delivery_tests(16);
+        let payload = append_payload(&runtime, b"hello");
+
+        let delivery = driver
+            .enqueue_rx(session_id, payload, 0, false)
+            .expect("enqueue rx");
+
+        match delivery {
+            RxDelivery::InOrder { accepted } => assert_eq!(accepted.get(), 5),
+            other => panic!("expected in-order delivery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enqueue_rx_zero_accepted_bytes_returns_not_accepted() {
+        let (runtime, driver, session_id) = runtime_for_rx_delivery_tests(4);
+
+        let first = append_payload(&runtime, b"rust");
+        let first_delivery = driver
+            .enqueue_rx(session_id, first, 0, false)
+            .expect("enqueue first payload");
+        assert!(matches!(first_delivery, RxDelivery::InOrder { .. }));
+
+        let second = append_payload(&runtime, b"z");
+        let delivery = driver
+            .enqueue_rx(session_id, second, 0, false)
+            .expect("enqueue full fifo");
+
+        match delivery {
+            RxDelivery::NotAccepted { available } => assert_eq!(available, 0),
+            other => panic!("expected not-accepted delivery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enqueue_rx_ooo_delivery_reports_non_zero_span() {
+        let (runtime, driver, session_id) = runtime_for_rx_delivery_tests(16);
+        let payload = append_payload(&runtime, b"world");
+
+        let delivery = driver
+            .enqueue_rx(session_id, payload, 5, false)
+            .expect("enqueue ooo rx");
+
+        match delivery {
+            RxDelivery::OutOfOrder {
+                accepted,
+                delivered,
+                span,
+            } => {
+                assert_eq!(accepted.get(), 5);
+                assert_eq!(delivered, 0);
+                assert_eq!(span.start(), 5);
+                assert_eq!(span.len().get(), 5);
+            }
+            other => panic!("expected ooo delivery, got {other:?}"),
+        }
     }
 
     fn capture_process(

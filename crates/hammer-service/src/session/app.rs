@@ -225,12 +225,14 @@ impl<S: Segment> SessionAppRuntime<S> {
         buffers: &DataPlaneBuffers,
         index: BufferIndex,
         offset: u32,
-    ) -> CoreResult<(u32, Option<u32>, u32)> {
+    ) -> CoreResult<(u32, u32, Option<u32>)> {
         let Some(session) = self.sessions.lookup(&session_id.get()) else {
-            return Ok((0, None, 0));
+            return Ok((0, 0, None));
         };
         let mut total_len = 0u32;
+        let mut accepted = 0u32;
         let mut delivered = 0u32;
+        let mut accepted_start = None;
         for buf in buffers.chain(index) {
             let buf = buf?;
             let current = buf.current();
@@ -241,12 +243,16 @@ impl<S: Segment> SessionAppRuntime<S> {
                 .rx_fifo()
                 .enqueue_ooo(chunk_offset, current)
                 .map_err(|_| CoreError::internal("ooo enqueue failed"))?;
+            accepted = accepted.wrapping_add(result.accepted);
             delivered = delivered.wrapping_add(result.delivered);
+            if accepted_start.is_none() {
+                accepted_start = result.start;
+            }
             total_len = total_len
                 .checked_add(current.len() as u32)
                 .ok_or_else(|| CoreError::internal("ooo rx buffer length overflow"))?;
         }
-        Ok((delivered, Some(offset), total_len))
+        Ok((accepted, delivered, accepted_start))
     }
 
     pub(crate) fn discard_all_tx_bytes_for_session(&mut self, session_id: SessionId) {

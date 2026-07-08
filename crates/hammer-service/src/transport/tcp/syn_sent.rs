@@ -9,6 +9,7 @@ use super::publish_tcp_connection;
 use super::segment::tcp_packet;
 use super::{TCP_MAIN, TcpNodeError, TcpQueue, ensure_tcp_session_queue, read_session_id};
 use super::{tcp_worker_state, tcp_worker_state_mut};
+use crate::session::runtime::RxDelivery;
 use crate::transport::congestion::CongestionController;
 
 #[hammer_component_macros::node_next]
@@ -169,7 +170,7 @@ where
                 buffer.truncate(packet.payload_len)?;
             }
             let enqueue = queue.enqueue_rx(session_id, index, 0, false)?;
-            if enqueue.delivered_len != 0 {
+            if matches!(enqueue, RxDelivery::InOrder { .. }) {
                 let mut context = queue.session_control_context(session_id);
                 context.mark_ready();
             }

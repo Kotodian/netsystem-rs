@@ -1,3 +1,4 @@
+use crate::session::runtime::RxDelivery;
 use hammer_adapter::{
     BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeId, NodeProcessFn, NodeResult,
     NodeRuntimeData,
@@ -166,42 +167,50 @@ where
         }
         let mut immediate_ack = false;
         if let Some((trim, offset)) = accept_payload {
-            let accepted_len = packet.payload_len.saturating_sub(trim);
+            let accepted_len = packet.payload_len.saturating_sub(trim) as u32;
             {
                 let mut buffer = runtime.buffers().get_buffer_mut(index)?;
                 buffer.advance(packet.payload_offset.saturating_add(trim) as isize)?;
-                buffer.truncate(accepted_len)?;
+                buffer.truncate(accepted_len as usize)?;
             }
-            let enqueue = queue.enqueue_rx(session_id, index, offset, false)?;
+            let delivery = queue.enqueue_rx(session_id, index, offset, false)?;
             let connection = queue.session_mut(session_id).ok_or_else(|| {
                 let _ = runtime
                     .record_current_node_error(TcpNodeError::EstablishedSessionMissing.code());
                 TcpNodeError::EstablishedSessionMissing
             })?;
-            connection.receive_payload(
-                accepted_sequence,
-                trim as u32,
-                enqueue.delivered_len,
-                enqueue.newest_ooo_start,
-                enqueue.newest_ooo_len,
-            );
+            connection.receive_payload(accepted_sequence, trim as u32, delivery);
             let clean_in_order = trim == 0
                 && offset == 0
-                && enqueue.delivered_len == accepted_len as u32
-                && enqueue.newest_ooo_start.is_none();
+                && matches!(
+                    delivery,
+                    RxDelivery::InOrder { accepted } if accepted.get() == accepted_len
+                );
             immediate_ack = if clean_in_order {
                 connection.on_clean_in_order_payload()
             } else {
                 true
             };
-            if enqueue.delivered_len != 0 {
+            if matches!(delivery, RxDelivery::InOrder { .. }) {
                 let mut context = queue.session_control_context(session_id);
                 context.mark_ready();
             }
-            if enqueue.accepted_len != accepted_len as u32 {
-                immediate_ack = true;
-            }
-            if let Some(available) = queue.rx_available_len(session_id) {
+            let available = match delivery {
+                RxDelivery::NotAccepted { available } => Some(available as usize),
+                RxDelivery::InOrder { accepted } => {
+                    if accepted.get() != accepted_len {
+                        immediate_ack = true;
+                    }
+                    queue.rx_available_len(session_id)
+                }
+                RxDelivery::OutOfOrder { accepted, .. } => {
+                    if accepted.get() != accepted_len {
+                        immediate_ack = true;
+                    }
+                    queue.rx_available_len(session_id)
+                }
+            };
+            if let Some(available) = available {
                 let connection = queue.session_mut(session_id).ok_or_else(|| {
                     let _ = runtime
                         .record_current_node_error(TcpNodeError::EstablishedSessionMissing.code());

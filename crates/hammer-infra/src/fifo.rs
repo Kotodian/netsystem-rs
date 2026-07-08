@@ -42,7 +42,9 @@ pub enum FifoError {
 }
 
 pub struct OooResult {
+    pub accepted: u32,
     pub delivered: u32,
+    pub start: Option<u32>,
 }
 
 struct OooSegment {
@@ -631,7 +633,11 @@ impl<S: Segment> Fifo<S> {
         let abs_pos = tail.wrapping_add(offset);
         let written = self.write_at_without_tail_store(abs_pos, src);
         if written == 0 {
-            return Ok(OooResult { delivered: 0 });
+            return Ok(OooResult {
+                accepted: 0,
+                delivered: 0,
+                start: None,
+            });
         }
 
         let seg_end_full = abs_pos.wrapping_add(written as u32);
@@ -649,7 +655,11 @@ impl<S: Segment> Fifo<S> {
 
         if let Some((pred_end, skip, overlap)) = pred_info {
             if skip {
-                return Ok(OooResult { delivered: 0 });
+                return Ok(OooResult {
+                    accepted: 0,
+                    delivered: 0,
+                    start: None,
+                });
             }
             if overlap {
                 seg_start = pred_end;
@@ -657,7 +667,41 @@ impl<S: Segment> Fifo<S> {
         }
 
         if seg_start >= seg_end_full {
-            return Ok(OooResult { delivered: 0 });
+            return Ok(OooResult {
+                accepted: 0,
+                delivered: 0,
+                start: None,
+            });
+        }
+
+        let mut accepted = seg_end_full.wrapping_sub(seg_start);
+        let mut overlap_cursor = seg_start.wrapping_sub(1);
+        loop {
+            let overlap_info = bk.index.successor(&overlap_cursor).and_then(|(key, &idx)| {
+                if *key < seg_end_full {
+                    bk.entries
+                        .get(idx)
+                        .map(|segment| (*key, segment.offset.wrapping_add(segment.len)))
+                } else {
+                    None
+                }
+            });
+            let Some((existing_start, existing_end)) = overlap_info else {
+                break;
+            };
+            let overlap_start = existing_start.max(seg_start);
+            let overlap_end = existing_end.min(seg_end_full);
+            if overlap_end > overlap_start {
+                accepted = accepted.wrapping_sub(overlap_end.wrapping_sub(overlap_start));
+            }
+            overlap_cursor = existing_start;
+        }
+        if accepted == 0 {
+            return Ok(OooResult {
+                accepted: 0,
+                delivered: 0,
+                start: None,
+            });
         }
 
         // Successor walk: remove or trim overlapping segments
@@ -702,6 +746,7 @@ impl<S: Segment> Fifo<S> {
 
         // Insert our segment
         let seg_len = seg_end_full.wrapping_sub(seg_start);
+        let start = seg_start.wrapping_sub(bk.base);
         let idx = bk
             .entries
             .insert(OooSegment {
@@ -718,7 +763,11 @@ impl<S: Segment> Fifo<S> {
             0
         };
 
-        Ok(OooResult { delivered })
+        Ok(OooResult {
+            accepted,
+            delivered,
+            start: Some(start),
+        })
     }
 
     fn promote_contiguous_inner(bk: &mut OooBookkeeping) -> u32 {

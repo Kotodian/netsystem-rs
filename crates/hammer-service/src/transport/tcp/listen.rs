@@ -19,6 +19,7 @@ use super::{set_tcp_worker_state, tcp_worker_state};
 #[cfg(test)]
 use crate::net::NetworkOpaque;
 use crate::session::SessionId;
+use crate::session::runtime::RxDelivery;
 use crate::transport::congestion::CongestionController;
 
 const TCP_LISTENER_BACKLOG: usize = 128;
@@ -1220,7 +1221,7 @@ where
             buffer.truncate(packet.payload_len)?;
         }
         let enqueue = queue.enqueue_rx(session_id, index, 0, false)?;
-        if enqueue.delivered_len != 0 {
+        if matches!(enqueue, RxDelivery::InOrder { .. }) {
             let mut context = queue.session_control_context(session_id);
             context.mark_ready();
         }

@@ -10,6 +10,7 @@ use super::output::{
 use super::recovery::{TcpRecoveryAck, TcpRecoveryState};
 use super::sack::TcpSackState;
 use super::segment::TcpSegment;
+use crate::session::runtime::RxDelivery;
 use crate::transport::congestion::CongestionController;
 use crossbeam_utils::CachePadded;
 use hammer_adapter::DataWorkerId;
@@ -1750,25 +1751,26 @@ where
     }
 
     #[inline]
-    pub(crate) fn receive_payload(
-        &mut self,
-        sequence: TcpSeq,
-        trim: u32,
-        delivered_len: u32,
-        newest_ooo_start: Option<u32>,
-        newest_ooo_len: u32,
-    ) {
+    pub(crate) fn receive_payload(&mut self, sequence: TcpSeq, trim: u32, delivery: RxDelivery) {
         if trim != 0 {
             self.sack
                 .set_duplicate(self.negotiated_options().sack, sequence, self.rcv_nxt);
         }
-        self.rcv_nxt = self.rcv_nxt.advance(delivered_len);
-        if let Some(start) = newest_ooo_start {
-            let left = self.rcv_nxt.advance(start);
-            let right = left.advance(newest_ooo_len);
-            self.sack
-                .update_range(self.negotiated_options().sack, self.rcv_nxt, left, right);
-            return;
+        match delivery {
+            RxDelivery::NotAccepted { .. } => {}
+            RxDelivery::InOrder { accepted } => {
+                self.rcv_nxt = self.rcv_nxt.advance(accepted.get());
+            }
+            RxDelivery::OutOfOrder {
+                delivered, span, ..
+            } => {
+                self.rcv_nxt = self.rcv_nxt.advance(delivered);
+                let left = self.rcv_nxt.advance(span.start());
+                let right = left.advance(span.len().get());
+                self.sack
+                    .update_range(self.negotiated_options().sack, self.rcv_nxt, left, right);
+                return;
+            }
         }
         self.sack.update_range(
             self.negotiated_options().sack,
@@ -2371,10 +2373,12 @@ fn ace_delta(previous: u8, next: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::runtime::{OooSpan, RxDelivery};
     use crate::transport::congestion::BbrController;
     use crate::transport::congestion::{
         AckedPacket, CongestionMetrics, LostPacket, PacketNumber, RttSample,
     };
+    use std::num::NonZeroU32;
     fn established_connection() -> TcpConnection<BbrController> {
         let local: SocketAddr = "192.0.2.10:443".parse().expect("local");
         let remote: SocketAddr = "198.51.100.20:50001".parse().expect("remote");
@@ -2466,6 +2470,60 @@ mod tests {
             Some(local),
             remote,
         )
+    }
+
+    #[test]
+    fn tcp_receive_payload_in_order_rx_delivery_advances_rcv_nxt() {
+        let mut connection = established_connection();
+        let sequence = TcpSeq::from(connection.rcv_nxt());
+
+        connection.receive_payload(
+            sequence,
+            0,
+            RxDelivery::InOrder {
+                accepted: NonZeroU32::new(5).expect("accepted bytes"),
+            },
+        );
+
+        assert_eq!(connection.rcv_nxt(), sequence.advance(5).raw());
+        assert!(!connection.has_pending_sack_output());
+    }
+
+    #[test]
+    fn tcp_receive_payload_ooo_rx_delivery_keeps_rcv_nxt_and_stages_sack() {
+        let mut connection = established_connection();
+        let base = TcpSeq::from(connection.rcv_nxt());
+        let sequence = base.advance(5);
+
+        connection.receive_payload(
+            sequence,
+            0,
+            RxDelivery::OutOfOrder {
+                accepted: NonZeroU32::new(5).expect("accepted bytes"),
+                delivered: 0,
+                span: OooSpan::new(5, NonZeroU32::new(5).expect("ooo len")),
+            },
+        );
+
+        assert_eq!(connection.rcv_nxt(), base.raw());
+        let (blocks, len) = connection
+            .sack
+            .take_output(true, false, TcpSegmentFlags::ACK)
+            .expect("sack output");
+        assert_eq!(len, 1);
+        assert_eq!(blocks[0].left_edge, base.advance(5));
+        assert_eq!(blocks[0].right_edge, base.advance(10));
+    }
+
+    #[test]
+    fn tcp_receive_payload_not_accepted_rx_delivery_leaves_receive_state_unchanged() {
+        let mut connection = established_connection();
+        let sequence = TcpSeq::from(connection.rcv_nxt());
+
+        connection.receive_payload(sequence, 0, RxDelivery::NotAccepted { available: 0 });
+
+        assert_eq!(connection.rcv_nxt(), sequence.raw());
+        assert!(!connection.has_pending_sack_output());
     }
 
     #[derive(Clone, Copy, Debug)]

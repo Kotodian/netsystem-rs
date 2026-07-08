@@ -1293,15 +1293,9 @@ mod tests {
             .expect("enqueue rx");
         {
             let connection = driver.session_mut(session_id).expect("connection");
-            connection.receive_payload(
-                packet.sequence,
-                0,
-                enqueue.delivered_len,
-                enqueue.newest_ooo_start,
-                enqueue.newest_ooo_len,
-            );
+            connection.receive_payload(packet.sequence, 0, enqueue);
         }
-        if enqueue.delivered_len != 0 {
+        if matches!(enqueue, crate::session::runtime::RxDelivery::InOrder { .. }) {
             let mut context = driver.session_control_context(session_id);
             context.mark_ready();
         }

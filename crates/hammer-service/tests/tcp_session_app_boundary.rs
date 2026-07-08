@@ -13,17 +13,37 @@ fn session_ooo_rx_path_does_not_allocate_payload_vec() {
 }
 
 #[test]
-fn session_rx_enqueue_reports_partial_delivery_without_claiming_full_accept() {
+fn session_rx_delivery_models_legal_outcomes() {
     let runtime_source = include_str!("../src/session/runtime.rs");
     let tcp_source = include_str!("../src/transport/tcp/established.rs");
 
     assert!(
-        runtime_source.contains("accepted_len"),
-        "SessionRxEnqueue should report accepted_len separately from delivered_len"
+        runtime_source.contains("enum RxDelivery"),
+        "session runtime must model RX enqueue results with RxDelivery"
     );
     assert!(
-        tcp_source.contains("enqueue.accepted_len"),
-        "TCP established path must branch on exact accepted_len"
+        runtime_source.contains("struct OooSpan"),
+        "session runtime must model OOO spans explicitly"
+    );
+    assert!(
+        runtime_source.contains("NonZeroU32"),
+        "RxDelivery accepted-byte facts must use non-zero domain values"
+    );
+    assert!(
+        !runtime_source.contains("struct SessionRxEnqueue"),
+        "old SessionRxEnqueue field bag should be removed"
+    );
+    assert!(
+        runtime_source.contains("size_of::<RxDelivery>() <="),
+        "session runtime must keep a size guard for the hot-path RxDelivery result"
+    );
+    assert!(
+        tcp_source.contains("RxDelivery::"),
+        "TCP established path must branch on RxDelivery outcomes"
+    );
+    assert!(
+        !tcp_source.contains("enqueue.accepted_len"),
+        "TCP established path must stop reading accepted_len from the old field bag"
     );
 }
 
