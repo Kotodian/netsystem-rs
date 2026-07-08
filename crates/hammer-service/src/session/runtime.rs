@@ -1,3 +1,4 @@
+use std::ptr::NonNull;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -50,6 +51,7 @@ pub struct SessionQueueStep {
 pub struct WorkerSessionRuntime {
     worker: DataWorkerId,
     session_work: hammer_infra::vec::Vec<SessionId>,
+    session_work_scratch: hammer_infra::vec::Vec<SessionId>,
     timers: TimerWheel1t2w2048sl<u32>,
     expired_timers: hammer_infra::vec::Vec<u32>,
     pending_timers: FifoQueue<ExpiredTimer>,
@@ -71,6 +73,9 @@ impl WorkerSessionRuntime {
         Self {
             worker,
             session_work: hammer_infra::vec::Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
+            session_work_scratch: hammer_infra::vec::Vec::with_capacity(
+                DEFAULT_SESSION_POOL_CAPACITY,
+            ),
             timers: TimerWheel1t2w2048sl::with_timer_ids(0, SESSION_TIMER_KIND_COUNT),
             expired_timers: hammer_infra::vec::Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
             pending_timers: FifoQueue::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
@@ -95,10 +100,19 @@ impl WorkerSessionRuntime {
     }
 
     #[inline]
-    pub(crate) fn take_scheduled_session_work(&mut self) -> hammer_infra::vec::Vec<SessionId> {
-        let mut session_work = hammer_infra::vec::Vec::with_capacity(self.session_work.len());
+    fn take_scheduled_session_work(&mut self) -> hammer_infra::vec::Vec<SessionId> {
+        let mut session_work = core::mem::take(&mut self.session_work_scratch);
         core::mem::swap(&mut self.session_work, &mut session_work);
         session_work
+    }
+
+    #[inline]
+    fn keep_scheduled_session_work_scratch(
+        &mut self,
+        mut session_work: hammer_infra::vec::Vec<SessionId>,
+    ) {
+        session_work.clear();
+        self.session_work_scratch = session_work;
     }
 
     pub(crate) fn poll_once_for_ticks<F>(
@@ -343,11 +357,6 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
     }
 
     #[inline]
-    pub fn mark_ready(&mut self, session_id: SessionId) {
-        self.schedule_session_work(session_id);
-    }
-
-    #[inline]
     pub fn insert_session(&mut self, state: St) -> SessionId {
         let index = self
             .runtime
@@ -420,18 +429,24 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
     }
 
     #[inline]
-    pub(crate) fn buffers(&self) -> &DataPlaneBuffers {
-        &self.runtime.buffers
-    }
-
-    #[inline]
     pub(crate) fn timers_mut(&mut self) -> &mut TimerWheel1t2w2048sl<u32> {
         &mut self.runtime.sessions.timers
     }
 
     #[inline]
-    pub(crate) fn scheduler_mut_ptr(&mut self) -> *mut () {
-        self as *mut Self as *mut ()
+    pub(crate) fn session_control_context(
+        &mut self,
+        session_id: SessionId,
+    ) -> SessionQueueControlContext {
+        let has_pending_send = self.app_state.app.has_pending_send(session_id);
+        SessionQueueControlContext::new(
+            &mut self.runtime.sessions.timers as *mut _,
+            NonNull::from(&mut *self).cast(),
+            schedule_session_work_for_driver::<St, Seg> as ScheduleSessionWorkFn,
+            &self.runtime.buffers as *const _,
+            session_id,
+            has_pending_send,
+        )
     }
 
     pub fn has_session_tx(&self, session_id: SessionId) -> bool {
@@ -526,7 +541,7 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
         self.poll_once_for_ticks(timer_ticks)
     }
 
-    pub(crate) fn take_scheduled_session_work(&mut self) -> hammer_infra::vec::Vec<SessionId> {
+    fn take_scheduled_session_work(&mut self) -> hammer_infra::vec::Vec<SessionId> {
         let session_work = self.runtime.sessions.take_scheduled_session_work();
         for index in 0..session_work.len() {
             if let Some(entry) = self
@@ -538,6 +553,16 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
             }
         }
         session_work
+    }
+
+    #[inline]
+    fn keep_scheduled_session_work_scratch(
+        &mut self,
+        session_work: hammer_infra::vec::Vec<SessionId>,
+    ) {
+        self.runtime
+            .sessions
+            .keep_scheduled_session_work_scratch(session_work);
     }
 }
 
@@ -674,15 +699,7 @@ unsafe fn session_queue_context<St, Seg: Segment>(
     session_id: SessionId,
 ) -> crate::session::protocol::SessionQueueControlContext {
     let driver = unsafe { &mut *driver };
-    let has_pending_send = driver.app_state.app.has_pending_send(session_id);
-    crate::session::protocol::SessionQueueControlContext::new(
-        &mut driver.runtime.sessions.timers as *mut _,
-        driver.scheduler_mut_ptr(),
-        Some(schedule_session_work_for_driver::<St, Seg> as ScheduleSessionWorkFn),
-        &driver.runtime.buffers as *const _,
-        session_id,
-        has_pending_send,
-    )
+    driver.session_control_context(session_id)
 }
 
 /// SAFETY: `state` (from `entries`) and `timers`/`ready`/`buffers` (from
@@ -853,9 +870,10 @@ where
             requeue = !(params.snd_space == 0 && transport_desched && !transport_postpone);
         }
         if requeue {
-            driver.mark_ready(session_id);
+            driver.schedule_session_work(session_id);
         }
     }
+    driver.keep_scheduled_session_work_scratch(session_work);
     Ok(())
 }
 
@@ -1385,8 +1403,8 @@ mod tests {
         );
         let session_id = driver.insert_session(NoTxPayloadProtocol);
 
-        driver.mark_ready(session_id);
-        driver.mark_ready(session_id);
+        driver.schedule_session_work(session_id);
+        driver.schedule_session_work(session_id);
 
         assert_eq!(
             driver.take_scheduled_session_work(),
@@ -1394,7 +1412,43 @@ mod tests {
         );
         assert!(driver.take_scheduled_session_work().is_empty());
 
-        driver.mark_ready(session_id);
+        driver.schedule_session_work(session_id);
+
+        assert_eq!(
+            driver.take_scheduled_session_work(),
+            infra_vec([session_id])
+        );
+    }
+
+    #[test]
+    fn session_driver_runtime_context_schedules_session_work() {
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 2048,
+                    buffer_slots: 16,
+                    frame_capacity: 8,
+                    frame_slots: 8,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
+        let mut driver = SessionDriverRuntime::<NoTxPayloadProtocol, Local>::new(
+            DataWorkerId::new(0),
+            runtime.buffers().clone(),
+        );
+        let session_id = driver.insert_session(NoTxPayloadProtocol);
+        let mut context = driver.session_control_context(session_id);
+
+        context.mark_ready();
+        context.mark_ready();
+
+        assert_eq!(
+            driver.take_scheduled_session_work(),
+            infra_vec([session_id])
+        );
+        assert!(driver.take_scheduled_session_work().is_empty());
+
+        context.mark_ready();
 
         assert_eq!(
             driver.take_scheduled_session_work(),
@@ -1422,7 +1476,8 @@ mod tests {
         let next: crate::session::SessionQueueNext = NodeId::new(9).into();
         let mut output = crate::session::node::SessionQueueOutput::default();
 
-        driver.mark_ready(session_id);
+        let mut context = driver.session_control_context(session_id);
+        context.mark_ready();
         let mut step = driver.poll_once_for_ticks(0).expect("poll first turn");
         dispatch_session_queue_pending(
             &runtime,
@@ -1470,7 +1525,8 @@ mod tests {
             buffers.clone(),
         );
         let session_id = driver.insert_session(FakeTxProtocol::default());
-        driver.mark_ready(session_id);
+        let mut context = driver.session_control_context(session_id);
+        context.mark_ready();
         let next: crate::session::SessionQueueNext = NodeId::new(9).into();
         let mut output = crate::session::node::SessionQueueOutput::default();
         let mut step = driver.poll_once_for_ticks(0).expect("poll");
@@ -1530,7 +1586,8 @@ mod tests {
             .expect("send tx payload");
 
         driver.app_mut().attach_session(session_id, app_session);
-        driver.mark_ready(session_id);
+        let mut context = driver.session_control_context(session_id);
+        context.mark_ready();
         let next: crate::session::SessionQueueNext = NodeId::new(9).into();
         let mut output = crate::session::node::SessionQueueOutput::default();
         let mut step = driver.poll_once_for_ticks(0).expect("poll");
@@ -1590,7 +1647,8 @@ mod tests {
             .expect("send tx payload");
 
         driver.app_mut().attach_session(session_id, app_session);
-        driver.mark_ready(session_id);
+        let mut context = driver.session_control_context(session_id);
+        context.mark_ready();
         let next: crate::session::SessionQueueNext = NodeId::new(9).into();
         let mut output = crate::session::node::SessionQueueOutput::default();
         let mut step = driver.poll_once_for_ticks(0).expect("poll");

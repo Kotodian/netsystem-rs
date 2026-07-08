@@ -1221,7 +1221,8 @@ where
         }
         let enqueue = queue.enqueue_rx(session_id, index, 0, false)?;
         if enqueue.delivered_len != 0 {
-            queue.mark_ready(session_id);
+            let mut context = queue.session_control_context(session_id);
+            context.mark_ready();
         }
         tcp_worker_state_mut().finish_listener_pending(listener_id, packet.local, packet.remote);
         Ok((control, Some(session_id)))

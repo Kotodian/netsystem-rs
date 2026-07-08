@@ -525,7 +525,8 @@ where
     if let Some(connection) = driver.session_mut(session_id) {
         connection.timer_set(TCP_TIMER_RETRANSMIT);
     }
-    driver.mark_ready(session_id);
+    let mut context = driver.session_control_context(session_id);
+    context.mark_ready();
     Ok(session_id)
 }
 
@@ -929,16 +930,8 @@ mod tests {
         let mut output = SessionQueueOutput::default();
         let output_next: crate::session::SessionQueueNext = output_node.into();
         let now = std::time::Instant::now();
-        let timer_wheel = driver.timers_mut() as *mut _;
-        let buffers = driver.buffers() as *const _;
-        let mut context = SessionQueueControlContext::new(
-            timer_wheel,
-            core::ptr::null_mut(),
-            None,
-            buffers,
-            session_id,
-            false,
-        );
+        let mut context = driver.session_control_context(session_id);
+        context.refresh_has_pending_tx(false);
         let emitted = driver
             .session_mut(session_id)
             .expect("connection")
@@ -998,7 +991,8 @@ mod tests {
         let payload = b"ping";
         app_session.send_bytes(payload).expect("send tx payload");
         driver.app_mut().attach_session(session_id, app_session);
-        driver.mark_ready(session_id);
+        let mut context = driver.session_control_context(session_id);
+        context.mark_ready();
 
         let initial_snd_nxt = driver.session(session_id).expect("connection").snd_nxt();
 
@@ -1070,16 +1064,8 @@ mod tests {
             )
         };
 
-        let timer_wheel = driver.timers_mut() as *mut _;
-        let buffers = driver.buffers() as *const _;
-        let mut context = SessionQueueControlContext::new(
-            timer_wheel,
-            core::ptr::null_mut(),
-            None,
-            buffers,
-            session_id,
-            false,
-        );
+        let mut context = driver.session_control_context(session_id);
+        context.refresh_has_pending_tx(false);
 
         let error = driver
             .session_mut(session_id)
@@ -1134,7 +1120,8 @@ mod tests {
         );
         app_session.send_bytes(&payload).expect("send tx payload");
         driver.app_mut().attach_session(session_id, app_session);
-        driver.mark_ready(session_id);
+        let mut context = driver.session_control_context(session_id);
+        context.mark_ready();
 
         let initial_snd_nxt = driver.session(session_id).expect("connection").snd_nxt();
         let next: crate::session::SessionQueueNext = output_node.into();
@@ -1306,7 +1293,8 @@ mod tests {
             );
         }
         if enqueue.delivered_len != 0 {
-            driver.mark_ready(session_id);
+            let mut context = driver.session_control_context(session_id);
+            context.mark_ready();
         }
         {
             let now = std::time::Instant::now();

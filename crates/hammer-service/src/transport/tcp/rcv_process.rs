@@ -154,7 +154,8 @@ where
             queue.ack_tx_up_to(session_id, acked_tx_len as usize)?;
         }
         if ack_advanced && queue.app().pending_send_len(session_id)?.is_some() {
-            queue.mark_ready(session_id);
+            let mut context = queue.session_control_context(session_id);
+            context.mark_ready();
         }
         if established_with_payload {
             {
@@ -164,7 +165,8 @@ where
             }
             let enqueue = queue.enqueue_rx(session_id, index, 0, false)?;
             if enqueue.delivered_len != 0 {
-                queue.mark_ready(session_id);
+                let mut context = queue.session_control_context(session_id);
+                context.mark_ready();
             }
         }
         let now = std::time::Instant::now();

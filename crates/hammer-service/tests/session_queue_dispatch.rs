@@ -257,7 +257,6 @@ fn session_tx_dispatch_commits_batch_before_graph_visibility() {
     app_session.send_bytes(&tx_data).expect("send bytes");
 
     driver.app_mut().attach_session(session_id, app_session);
-    driver.mark_ready(session_id);
 
     let next: SessionQueueNext = runtime
         .nodes()
@@ -311,7 +310,6 @@ fn session_tx_deschedules_without_push_header_when_send_space_is_zero() {
         .expect("send pending payload");
 
     driver.app_mut().attach_session(session_id, app_session);
-    driver.mark_ready(session_id);
 
     let next: SessionQueueNext = runtime
         .nodes()
@@ -356,7 +354,6 @@ fn session_tx_packetizes_by_send_goal_size_without_gso_metadata() {
         .expect("send pending payload");
 
     driver.app_mut().attach_session(session_id, app_session);
-    driver.mark_ready(session_id);
 
     let next: SessionQueueNext = runtime
         .nodes()

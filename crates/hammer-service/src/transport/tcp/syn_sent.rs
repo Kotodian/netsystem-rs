@@ -170,7 +170,8 @@ where
             }
             let enqueue = queue.enqueue_rx(session_id, index, 0, false)?;
             if enqueue.delivered_len != 0 {
-                queue.mark_ready(session_id);
+                let mut context = queue.session_control_context(session_id);
+                context.mark_ready();
             }
             keep_current = false;
         };

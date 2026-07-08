@@ -11,7 +11,6 @@ use super::{
     TCP_TIMER_RACK, TCP_TIMER_RETRANSMIT, TCP_TIMER_TLP, TcpNodeError, TcpQueue,
     TcpWorkerOwnedState, ensure_tcp_session_queue, read_session_id,
 };
-use crate::session::protocol::SessionQueueControlContext;
 use crate::transport::congestion::CongestionController;
 
 #[hammer_component_macros::node_next]
@@ -162,7 +161,8 @@ where
             queue.ack_tx_up_to(session_id, acked_tx_len as usize)?;
         }
         if ack_advanced && queue.app().pending_send_len(session_id)?.is_some() {
-            queue.mark_ready(session_id);
+            let mut context = queue.session_control_context(session_id);
+            context.mark_ready();
         }
         let mut immediate_ack = false;
         if let Some((trim, offset)) = accept_payload {
@@ -195,7 +195,8 @@ where
                 true
             };
             if enqueue.delivered_len != 0 {
-                queue.mark_ready(session_id);
+                let mut context = queue.session_control_context(session_id);
+                context.mark_ready();
             }
             if enqueue.accepted_len != accepted_len as u32 {
                 immediate_ack = true;
@@ -241,14 +242,8 @@ where
                     .record_current_node_error(TcpNodeError::EstablishedSessionMissing.code());
                 TcpNodeError::EstablishedSessionMissing
             })? as *const _;
-        let mut context = SessionQueueControlContext::new(
-            queue.timers_mut() as *mut _,
-            core::ptr::null_mut(),
-            None,
-            queue.buffers() as *const _,
-            session_id,
-            has_pending_tx,
-        );
+        let mut context = queue.session_control_context(session_id);
+        context.refresh_has_pending_tx(has_pending_tx);
         let now = std::time::Instant::now();
         let connection = unsafe { &*connection };
         crate::transport::tcp::sync_all_tcp_timers(
