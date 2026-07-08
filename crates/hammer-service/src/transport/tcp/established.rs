@@ -243,7 +243,8 @@ where
             })? as *const _;
         let mut context = SessionQueueControlContext::new(
             queue.timers_mut() as *mut _,
-            queue.ready_mut_ptr(),
+            core::ptr::null_mut(),
+            None,
             queue.buffers() as *const _,
             session_id,
             has_pending_tx,

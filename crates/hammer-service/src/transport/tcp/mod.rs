@@ -930,10 +930,15 @@ mod tests {
         let output_next: crate::session::SessionQueueNext = output_node.into();
         let now = std::time::Instant::now();
         let timer_wheel = driver.timers_mut() as *mut _;
-        let ready = driver.ready_mut_ptr();
         let buffers = driver.buffers() as *const _;
-        let mut context =
-            SessionQueueControlContext::new(timer_wheel, ready, buffers, session_id, false);
+        let mut context = SessionQueueControlContext::new(
+            timer_wheel,
+            core::ptr::null_mut(),
+            None,
+            buffers,
+            session_id,
+            false,
+        );
         let emitted = driver
             .session_mut(session_id)
             .expect("connection")
@@ -1000,7 +1005,7 @@ mod tests {
         let next: crate::session::SessionQueueNext = output_node.into();
         let dispatched =
             dispatch_session_queue_for_ticks(&runtime, &mut driver, 0, next).expect("dispatch tx");
-        assert!(dispatched.ready_sessions >= 1);
+        assert!(dispatched.scheduled_sessions >= 1);
         let _ = runtime.run_ready_nodes().expect("run tcp output");
 
         let connection = driver.session(session_id).expect("connection");
@@ -1066,10 +1071,15 @@ mod tests {
         };
 
         let timer_wheel = driver.timers_mut() as *mut _;
-        let ready = driver.ready_mut_ptr();
         let buffers = driver.buffers() as *const _;
-        let mut context =
-            SessionQueueControlContext::new(timer_wheel, ready, buffers, session_id, false);
+        let mut context = SessionQueueControlContext::new(
+            timer_wheel,
+            core::ptr::null_mut(),
+            None,
+            buffers,
+            session_id,
+            false,
+        );
 
         let error = driver
             .session_mut(session_id)
@@ -1130,7 +1140,7 @@ mod tests {
         let next: crate::session::SessionQueueNext = output_node.into();
         let dispatched =
             dispatch_session_queue_for_ticks(&runtime, &mut driver, 0, next).expect("dispatch tx");
-        assert!(dispatched.ready_sessions >= 1);
+        assert!(dispatched.scheduled_sessions >= 1);
         let _ = runtime.run_ready_nodes().expect("run tcp output");
 
         assert!(drop_state.lock().expect("drop").packets.is_empty());

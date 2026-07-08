@@ -7,6 +7,7 @@ use hammer_adapter::{
     buffer::{Frame, Next},
 };
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_infra::bihash::Bihash;
 use hammer_infra::fifo_queue::FifoQueue;
 use hammer_infra::msg_queue::MsgQueue;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
@@ -16,10 +17,8 @@ use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
 use hammer_runtime::app::{AppContext, AppSessionConfig, SessionHandle, with_current_app_worker};
 
 use crate::session::app::SessionAppRuntimeCreate;
-use crate::session::protocol::SessionQueueControlContext;
-use crate::session::{
-    SessionAppRuntime, SessionId, SessionQueueHandle, SessionQueueNext, SessionReadyQueue,
-};
+use crate::session::protocol::{ScheduleSessionWorkFn, SessionQueueControlContext};
+use crate::session::{SessionAppRuntime, SessionId, SessionQueueHandle, SessionQueueNext};
 
 const DEFAULT_SESSION_TIMER_TICK: Duration = Duration::from_millis(10);
 const DEFAULT_SESSION_POOL_CAPACITY: usize = 1024;
@@ -45,12 +44,12 @@ pub(crate) struct SessionRxEnqueue {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SessionQueueStep {
     pub(crate) expired_timers: usize,
-    pub(crate) ready_sessions: usize,
+    pub(crate) scheduled_sessions: usize,
 }
 
 pub struct WorkerSessionRuntime {
     worker: DataWorkerId,
-    ready: SessionReadyQueue,
+    session_work: hammer_infra::vec::Vec<SessionId>,
     timers: TimerWheel1t2w2048sl<u32>,
     expired_timers: hammer_infra::vec::Vec<u32>,
     pending_timers: FifoQueue<ExpiredTimer>,
@@ -71,7 +70,7 @@ impl WorkerSessionRuntime {
     ) -> Self {
         Self {
             worker,
-            ready: SessionReadyQueue::new(),
+            session_work: hammer_infra::vec::Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
             timers: TimerWheel1t2w2048sl::with_timer_ids(0, SESSION_TIMER_KIND_COUNT),
             expired_timers: hammer_infra::vec::Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
             pending_timers: FifoQueue::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
@@ -86,16 +85,30 @@ impl WorkerSessionRuntime {
     }
 
     #[inline]
-    pub fn mark_ready(&mut self, session_id: SessionId) {
-        self.ready.mark_ready(session_id);
+    fn schedule_session_work(&mut self, session_id: SessionId) {
+        self.session_work.push(session_id);
     }
 
     #[inline]
-    pub(crate) fn take_ready_sessions(&mut self) -> hammer_infra::vec::Vec<SessionId> {
-        self.ready.take_ready_sessions()
+    fn scheduled_session_work_len(&self) -> usize {
+        self.session_work.len()
     }
 
-    pub(crate) fn poll_once_for_ticks(&mut self, timer_ticks: u32) -> CoreResult<SessionQueueStep> {
+    #[inline]
+    pub(crate) fn take_scheduled_session_work(&mut self) -> hammer_infra::vec::Vec<SessionId> {
+        let mut session_work = hammer_infra::vec::Vec::with_capacity(self.session_work.len());
+        core::mem::swap(&mut self.session_work, &mut session_work);
+        session_work
+    }
+
+    pub(crate) fn poll_once_for_ticks<F>(
+        &mut self,
+        timer_ticks: u32,
+        mut mark_schedule_pending: F,
+    ) -> CoreResult<SessionQueueStep>
+    where
+        F: FnMut(SessionId) -> bool,
+    {
         self.expired_timers.clear();
         let expired_timers = self.timers.expire(timer_ticks, &mut self.expired_timers);
         for index in 0..self.expired_timers.len() {
@@ -108,11 +121,13 @@ impl WorkerSessionRuntime {
                 session_id,
                 timer_id,
             });
-            self.ready.mark_ready(session_id);
+            if mark_schedule_pending(session_id) {
+                self.schedule_session_work(session_id);
+            }
         }
         Ok(SessionQueueStep {
             expired_timers,
-            ready_sessions: self.ready.len(),
+            scheduled_sessions: self.scheduled_session_work_len(),
         })
     }
 
@@ -137,11 +152,46 @@ impl WorkerSessionRuntime {
     }
 }
 
+struct SessionEntry<St> {
+    state: St,
+    schedule_pending: bool,
+}
+
+impl<St> SessionEntry<St> {
+    #[inline]
+    const fn new(state: St) -> Self {
+        Self {
+            state,
+            schedule_pending: false,
+        }
+    }
+}
+
+#[inline]
+fn mark_schedule_pending<St>(entries: &mut Pool<SessionEntry<St>>, session_id: SessionId) -> bool {
+    let Some(entry) = entries.get_mut(session_id.pool_index()) else {
+        return false;
+    };
+    if entry.schedule_pending {
+        return false;
+    }
+    entry.schedule_pending = true;
+    true
+}
+
+unsafe fn schedule_session_work_for_driver<St, Seg: Segment>(
+    scheduler: *mut (),
+    session_id: SessionId,
+) {
+    let driver = unsafe { &mut *(scheduler as *mut SessionDriverRuntime<St, Seg>) };
+    driver.schedule_session_work(session_id);
+}
+
 struct SessionDriverRuntimeCore<St> {
     sessions: WorkerSessionRuntime,
-    entries: Pool<St>,
+    entries: Pool<SessionEntry<St>>,
     buffers: DataPlaneBuffers,
-    pending_closes: SessionReadyQueue,
+    pending_closes: Bihash<u64, 7>,
 }
 
 struct SessionDriverRuntimeAppState<Seg: Segment> {
@@ -241,6 +291,17 @@ where
 
 impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
     #[inline]
+    fn schedule_session_work(&mut self, session_id: SessionId) {
+        let core = &mut *self.runtime;
+        let SessionDriverRuntimeCore {
+            sessions, entries, ..
+        } = core;
+        if mark_schedule_pending(entries, session_id) {
+            sessions.schedule_session_work(session_id);
+        }
+    }
+
+    #[inline]
     pub(crate) fn with_app_session_config(
         worker: DataWorkerId,
         buffers: DataPlaneBuffers,
@@ -266,7 +327,7 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
                 entries: Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
                 buffers,
 
-                pending_closes: SessionReadyQueue::new(),
+                pending_closes: Bihash::new(DEFAULT_SESSION_POOL_CAPACITY as u32),
             }),
             app_state: CachePadded::new(SessionDriverRuntimeAppState {
                 app,
@@ -283,7 +344,7 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
 
     #[inline]
     pub fn mark_ready(&mut self, session_id: SessionId) {
-        self.runtime.sessions.mark_ready(session_id);
+        self.schedule_session_work(session_id);
     }
 
     #[inline]
@@ -291,19 +352,25 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
         let index = self
             .runtime
             .entries
-            .insert(state)
+            .insert(SessionEntry::new(state))
             .expect("session pool capacity exhausted");
         SessionId::from(index)
     }
 
     #[inline]
     pub fn session(&self, id: SessionId) -> Option<&St> {
-        self.runtime.entries.get(id.pool_index())
+        self.runtime
+            .entries
+            .get(id.pool_index())
+            .map(|entry| &entry.state)
     }
 
     #[inline]
     pub(crate) fn session_mut(&mut self, id: SessionId) -> Option<&mut St> {
-        self.runtime.entries.get_mut(id.pool_index())
+        self.runtime
+            .entries
+            .get_mut(id.pool_index())
+            .map(|entry| &mut entry.state)
     }
 
     /// Prefetch the session pool slot cacheline for `id`.
@@ -320,7 +387,7 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
     }
 
     pub(crate) fn remove_session(&mut self, id: SessionId) -> Option<St> {
-        self.runtime.pending_closes.take(id);
+        self.runtime.pending_closes.remove(&id.get());
         self.app_state.app.discard_all_tx_bytes_for_session(id);
         let _ = self.app_state.app.detach_session(id);
         let handle = SessionHandle::new(id.pool_index().slot(), self.worker().slot() as u32);
@@ -328,7 +395,7 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
             let _ = worker.detach_session(handle);
         });
         let removed = self.runtime.entries.remove(id.pool_index())?;
-        Some(removed)
+        Some(removed.state)
     }
 
     pub(crate) fn close_session(&mut self, id: SessionId) -> CoreResult<Option<St>>
@@ -363,8 +430,8 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
     }
 
     #[inline]
-    pub(crate) fn ready_mut_ptr(&mut self) -> *mut SessionReadyQueue {
-        &mut self.runtime.sessions.ready as *mut _
+    pub(crate) fn scheduler_mut_ptr(&mut self) -> *mut () {
+        self as *mut Self as *mut ()
     }
 
     pub fn has_session_tx(&self, session_id: SessionId) -> bool {
@@ -387,15 +454,22 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
     }
 
     pub(crate) fn poll_app(&mut self) -> CoreResult<()> {
-        self.app_state
-            .app
-            .drain_tx_events_to(&mut self.runtime.sessions.ready);
+        let app = &self.app_state.app;
+        let core = &mut *self.runtime;
+        let SessionDriverRuntimeCore {
+            sessions, entries, ..
+        } = core;
+        app.drain_tx_events_to(|session_id| {
+            if mark_schedule_pending(entries, session_id) {
+                sessions.schedule_session_work(session_id);
+            }
+        });
         Ok(())
     }
 
     #[inline]
     pub(crate) fn take_close_request(&mut self, session_id: SessionId) -> bool {
-        self.runtime.pending_closes.take(session_id)
+        self.runtime.pending_closes.remove(&session_id.get())
     }
 
     #[inline]
@@ -438,7 +512,13 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
     }
 
     pub fn poll_once_for_ticks(&mut self, timer_ticks: u32) -> CoreResult<SessionQueueStep> {
-        self.runtime.sessions.poll_once_for_ticks(timer_ticks)
+        let core = &mut *self.runtime;
+        let SessionDriverRuntimeCore {
+            sessions, entries, ..
+        } = core;
+        sessions.poll_once_for_ticks(timer_ticks, |session_id| {
+            mark_schedule_pending(entries, session_id)
+        })
     }
 
     pub(crate) fn poll_once_at(&mut self, now: Instant) -> CoreResult<SessionQueueStep> {
@@ -446,8 +526,18 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
         self.poll_once_for_ticks(timer_ticks)
     }
 
-    pub(crate) fn take_ready_sessions(&mut self) -> hammer_infra::vec::Vec<SessionId> {
-        self.runtime.sessions.take_ready_sessions()
+    pub(crate) fn take_scheduled_session_work(&mut self) -> hammer_infra::vec::Vec<SessionId> {
+        let session_work = self.runtime.sessions.take_scheduled_session_work();
+        for index in 0..session_work.len() {
+            if let Some(entry) = self
+                .runtime
+                .entries
+                .get_mut(session_work[index].pool_index())
+            {
+                entry.schedule_pending = false;
+            }
+        }
+        session_work
     }
 }
 
@@ -461,7 +551,7 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
         let index = self
             .runtime
             .entries
-            .insert_with(|index| f.build(SessionId::from(index)))
+            .insert_with(|index| SessionEntry::new(f.build(SessionId::from(index))))
             .ok_or_else(|| CoreError::internal("session pool capacity exhausted"))?;
         let session_id = SessionId::from(index);
         let handle =
@@ -587,7 +677,8 @@ unsafe fn session_queue_context<St, Seg: Segment>(
     let has_pending_send = driver.app_state.app.has_pending_send(session_id);
     crate::session::protocol::SessionQueueControlContext::new(
         &mut driver.runtime.sessions.timers as *mut _,
-        &mut driver.runtime.sessions.ready as *mut _,
+        driver.scheduler_mut_ptr(),
+        Some(schedule_session_work_for_driver::<St, Seg> as ScheduleSessionWorkFn),
         &driver.runtime.buffers as *const _,
         session_id,
         has_pending_send,
@@ -614,6 +705,7 @@ where
         .runtime
         .entries
         .get_mut(pool_index)
+        .map(|entry| &mut entry.state)
         .ok_or_else(|| CoreError::internal("session is missing"))?;
     let mut context = unsafe { session_queue_context(driver_ptr, session_id) };
     f(state, &mut context)
@@ -656,19 +748,17 @@ where
                 let state = driver_ref
                     .session_mut(id)
                     .ok_or_else(|| CoreError::internal("session is missing"))?;
-                let mut context = unsafe { session_queue_context(driver, id) };
+                let mut context = session_queue_context(driver, id);
                 state.on_close(&mut context);
                 let _ = state;
                 let _ = driver_ref.close_session(id)?;
             }
         }
     }
-    let ready_count = driver.runtime.sessions.ready.len();
-    step.ready_sessions = ready_count;
-    for _ in 0..ready_count {
-        let Some(session_id) = driver.runtime.sessions.ready.pop_front() else {
-            break;
-        };
+    let session_work = driver.take_scheduled_session_work();
+    step.scheduled_sessions = session_work.len();
+    for index in 0..session_work.len() {
+        let session_id = session_work[index];
         if driver.session(session_id).is_none() {
             continue;
         }
@@ -942,6 +1032,70 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct MarkReadyTwiceProtocol {
+        ready_calls: usize,
+    }
+
+    impl SessionQueueProtocol for MarkReadyTwiceProtocol {
+        fn handle_expired_timer(
+            &mut self,
+            _: &DataPlaneRuntime,
+            _: &mut SessionQueueControlContext,
+            _: u32,
+            _: crate::session::SessionQueueNext,
+            _: &mut crate::session::node::SessionQueueOutput,
+        ) -> CoreResult<bool> {
+            Ok(false)
+        }
+
+        fn handle_ready_session(
+            &mut self,
+            _: &DataPlaneRuntime,
+            context: &mut SessionQueueControlContext,
+            _: bool,
+            _: crate::session::SessionQueueNext,
+            _: &mut crate::session::node::SessionQueueOutput,
+        ) -> CoreResult<bool> {
+            self.ready_calls += 1;
+            context.mark_ready();
+            context.mark_ready();
+            Ok(false)
+        }
+
+        fn send_params(
+            &mut self,
+            _: &mut SessionQueueControlContext,
+            _: usize,
+            _: Instant,
+        ) -> CoreResult<TransportSendParams> {
+            Err(CoreError::internal("transport send_params must not run"))
+        }
+
+        fn push_header(
+            &mut self,
+            _: &mut SessionQueueControlContext,
+            _: &[TxBatchBuffer],
+            _: Instant,
+        ) -> CoreResult<()> {
+            Err(CoreError::internal("transport push_header must not run"))
+        }
+
+        fn custom_tx(
+            &mut self,
+            _: &DataPlaneRuntime,
+            _: &mut SessionQueueControlContext,
+            _: crate::session::SessionQueueNext,
+            _: &mut crate::session::node::SessionQueueOutput,
+            _: usize,
+            _: Instant,
+        ) -> CoreResult<usize> {
+            Err(CoreError::internal("transport custom_tx must not run"))
+        }
+
+        fn on_close(&mut self, _: &mut SessionQueueControlContext) {}
+    }
+
+    #[derive(Default)]
     struct CaptureState {
         packets: std::vec::Vec<std::vec::Vec<u8>>,
     }
@@ -1042,23 +1196,26 @@ mod tests {
 
         assert_eq!(
             runtime
-                .poll_once_for_ticks(2)
+                .poll_once_for_ticks(2, |_| true)
                 .expect("expire before deadline")
                 .expired_timers,
             0
         );
         assert!(runtime.pending_timers.is_empty());
-        assert!(runtime.take_ready_sessions().is_empty());
+        assert!(runtime.take_scheduled_session_work().is_empty());
 
         assert_eq!(
             runtime
-                .poll_once_for_ticks(1)
+                .poll_once_for_ticks(1, |_| true)
                 .expect("expire at deadline")
                 .expired_timers,
             1
         );
         assert_next_pending_timer(&mut runtime, session_id, timer_id);
-        assert_eq!(runtime.take_ready_sessions(), infra_vec([session_id]));
+        assert_eq!(
+            runtime.take_scheduled_session_work(),
+            infra_vec([session_id])
+        );
     }
 
     #[test]
@@ -1080,22 +1237,25 @@ mod tests {
 
         assert_eq!(
             runtime
-                .poll_once_for_ticks(2)
+                .poll_once_for_ticks(2, |_| true)
                 .expect("expire stale timer")
                 .expired_timers,
             0
         );
         assert!(runtime.pending_timers.is_empty());
-        assert!(runtime.take_ready_sessions().is_empty());
+        assert!(runtime.take_scheduled_session_work().is_empty());
 
         assert_eq!(
             runtime
-                .poll_once_for_ticks(3)
+                .poll_once_for_ticks(3, |_| true)
                 .expect("expire rearmed timer")
                 .expired_timers,
             1
         );
-        assert_eq!(runtime.take_ready_sessions(), infra_vec([session_id]));
+        assert_eq!(
+            runtime.take_scheduled_session_work(),
+            infra_vec([session_id])
+        );
     }
 
     #[test]
@@ -1118,13 +1278,13 @@ mod tests {
 
         assert_eq!(
             runtime
-                .poll_once_for_ticks(2)
+                .poll_once_for_ticks(2, |_| true)
                 .expect("expire canceled timer")
                 .expired_timers,
             0
         );
         assert!(runtime.pending_timers.is_empty());
-        assert!(runtime.take_ready_sessions().is_empty());
+        assert!(runtime.take_scheduled_session_work().is_empty());
     }
 
     #[test]
@@ -1141,12 +1301,15 @@ mod tests {
             .expect("arm first timer");
         assert_eq!(
             runtime
-                .poll_once_for_ticks(1)
+                .poll_once_for_ticks(1, |_| true)
                 .expect("expire first timer")
                 .expired_timers,
             1
         );
-        assert_eq!(runtime.take_ready_sessions(), infra_vec([session_id]));
+        assert_eq!(
+            runtime.take_scheduled_session_work(),
+            infra_vec([session_id])
+        );
 
         runtime
             .timers
@@ -1157,7 +1320,7 @@ mod tests {
 
         assert_eq!(
             runtime
-                .poll_once_for_ticks(1)
+                .poll_once_for_ticks(1, |_| true)
                 .expect("before second deadline")
                 .expired_timers,
             0
@@ -1166,7 +1329,7 @@ mod tests {
 
         assert_eq!(
             runtime
-                .poll_once_for_ticks(1)
+                .poll_once_for_ticks(1, |_| true)
                 .expect("expire second timer")
                 .expired_timers,
             1
@@ -1191,17 +1354,102 @@ mod tests {
 
         let first_ticks = runtime.elapsed_timer_ticks(start + Duration::from_millis(10));
         let first = runtime
-            .poll_once_for_ticks(first_ticks)
+            .poll_once_for_ticks(first_ticks, |_| true)
             .expect("first poll");
         assert_eq!(first.expired_timers, 0);
         assert!(runtime.pending_timers.is_empty());
 
         let second_ticks = runtime.elapsed_timer_ticks(start + Duration::from_millis(20));
         let second = runtime
-            .poll_once_for_ticks(second_ticks)
+            .poll_once_for_ticks(second_ticks, |_| true)
             .expect("second poll");
         assert_eq!(second.expired_timers, 1);
         assert_next_pending_timer(&mut runtime, session_id, timer_id);
+    }
+
+    #[test]
+    fn session_driver_runtime_suppresses_duplicate_session_work_and_reschedules_after_drain() {
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 2048,
+                    buffer_slots: 16,
+                    frame_capacity: 8,
+                    frame_slots: 8,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
+        let mut driver = SessionDriverRuntime::<NoTxPayloadProtocol, Local>::new(
+            DataWorkerId::new(0),
+            runtime.buffers().clone(),
+        );
+        let session_id = driver.insert_session(NoTxPayloadProtocol);
+
+        driver.mark_ready(session_id);
+        driver.mark_ready(session_id);
+
+        assert_eq!(
+            driver.take_scheduled_session_work(),
+            infra_vec([session_id])
+        );
+        assert!(driver.take_scheduled_session_work().is_empty());
+
+        driver.mark_ready(session_id);
+
+        assert_eq!(
+            driver.take_scheduled_session_work(),
+            infra_vec([session_id])
+        );
+    }
+
+    #[test]
+    fn session_context_mark_ready_coalesces_duplicate_requests_during_dispatch() {
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 2048,
+                    buffer_slots: 16,
+                    frame_capacity: 8,
+                    frame_slots: 8,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
+        let mut driver = SessionDriverRuntime::<MarkReadyTwiceProtocol, Local>::new(
+            DataWorkerId::new(0),
+            runtime.buffers().clone(),
+        );
+        let session_id = driver.insert_session(MarkReadyTwiceProtocol::default());
+        let next: crate::session::SessionQueueNext = NodeId::new(9).into();
+        let mut output = crate::session::node::SessionQueueOutput::default();
+
+        driver.mark_ready(session_id);
+        let mut step = driver.poll_once_for_ticks(0).expect("poll first turn");
+        dispatch_session_queue_pending(
+            &runtime,
+            &mut driver,
+            next,
+            &mut output,
+            &mut step,
+            Instant::now(),
+        )
+        .expect("dispatch first turn");
+
+        assert_eq!(step.scheduled_sessions, 1);
+        assert_eq!(driver.session(session_id).expect("state").ready_calls, 1);
+
+        let mut step = driver.poll_once_for_ticks(0).expect("poll second turn");
+        dispatch_session_queue_pending(
+            &runtime,
+            &mut driver,
+            next,
+            &mut output,
+            &mut step,
+            Instant::now(),
+        )
+        .expect("dispatch second turn");
+
+        assert_eq!(step.scheduled_sessions, 1);
+        assert_eq!(driver.session(session_id).expect("state").ready_calls, 2);
     }
 
     #[test]
@@ -1301,7 +1549,7 @@ mod tests {
         assert_eq!(protocol.send_params_calls, 1);
         assert_eq!(protocol.push_header_calls, 0);
         assert!(driver.has_session_tx(session_id));
-        assert!(driver.take_ready_sessions().is_empty());
+        assert!(driver.take_scheduled_session_work().is_empty());
     }
 
     #[test]
@@ -1361,6 +1609,9 @@ mod tests {
         assert_eq!(protocol.send_params_calls, 1);
         assert_eq!(protocol.push_header_calls, 0);
         assert!(driver.has_session_tx(session_id));
-        assert_eq!(driver.take_ready_sessions(), infra_vec([session_id]));
+        assert_eq!(
+            driver.take_scheduled_session_work(),
+            infra_vec([session_id])
+        );
     }
 }

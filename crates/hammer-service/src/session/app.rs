@@ -10,7 +10,7 @@ use hammer_infra::segment::{Local, Segment, Svm};
 use hammer_infra::vec::Vec;
 use hammer_runtime::app::AppSession;
 
-use crate::session::{SessionId, SessionReadyQueue};
+use crate::session::SessionId;
 
 #[derive(Debug, thiserror::Error)]
 enum SessionAppRuntimeError {
@@ -255,7 +255,10 @@ impl<S: Segment> SessionAppRuntime<S> {
         }
     }
 
-    pub(crate) fn drain_tx_events_to(&self, ready: &mut SessionReadyQueue) -> usize {
+    pub(crate) fn drain_tx_events_to(
+        &self,
+        mut schedule_session_work: impl FnMut(SessionId),
+    ) -> usize {
         let mut scheduled = 0usize;
         let mut batch = [SessionEvt {
             session_index: 0,
@@ -276,7 +279,7 @@ impl<S: Segment> SessionAppRuntime<S> {
                     continue;
                 };
                 session.clear_tx_event();
-                ready.mark_ready(*session_id);
+                schedule_session_work(*session_id);
                 scheduled += 1;
             }
             if count < batch.len() {
