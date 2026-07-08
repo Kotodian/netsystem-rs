@@ -110,9 +110,17 @@ _Avoid_: session commit callback, TCP helper, prepare/commit/cancel transaction 
 The Session Runtime step that makes a committed TX Batch visible to the Packet Graph by putting its buffers to the selected next arc. It happens after the transport-owned TX action and is not a TCP-owned output carrier.
 _Avoid_: TCP output carrier, per-buffer `put_next_frame`, pre-commit flush
 
-**Session Ready Queue**:
-The worker-local set of sessions that need session runtime work. It records readiness for session scheduling, not protocol-specific timer discovery.
-_Avoid_: TCP ready list, app wake queue, expired timer scan
+**Session Schedule Pending Bit**:
+A session-owned scheduling fact that records whether this session has already been staged for worker-local Session Runtime work. It is cleared when the worker consumes the staged session work, mirroring VPP's session flag plus worker handle-vector coalescing shape.
+_Avoid_: ready-session token, generic dedup queue, app wake flag, TCP timer flag
+
+**Session Work Batch**:
+The worker-local batch of session ids staged for Session Runtime work. It is an append-and-drain batch; duplicate suppression is decided by each session's Schedule Pending Bit, not by a separate hash-backed ready queue object.
+_Avoid_: Session Ready Queue, DedupFifo, ReadySession list, protocol-specific scheduler
+
+**Session Control Event**:
+A worker-local session lifecycle command, such as disconnect, dispatched by Session Runtime separately from TX/RX session work. Control events may invoke transport close handling, but they are not readiness facts and do not enter the Session Work Batch.
+_Avoid_: close-ready flag, ready-queue close request, synthetic ready boolean, TX event
 
 **Transport Connection**:
 The protocol state associated with a session, such as TCP sequence, ACK, recovery, and timer facts. It does not own app/session FIFOs or runtime scheduling.
@@ -129,6 +137,18 @@ _Avoid_: sent segment record, output carrier, hand-built TCP header object
 **Transport-Neutral TX Fact**:
 A send-side fact Session Runtime may use without knowing protocol header semantics, such as TX offset, send space, Send Goal Size, buffer index, next arc, or transport scheduling intent. These facts are the only transport/session TX seam; TCP header fields, recovery records, timer masks, and TCP Output Intent materialization stay inside TCP transport.
 _Avoid_: TCP segment fact, header fact, recovery callback, timer mask handoff
+
+**RX Enqueue Locality**:
+The receive-side ownership rule that accepted payload bytes are enqueued into the Session FIFO by Session Runtime on the owning Data Worker. Transport supplies only RX delivery facts such as buffer identity, relative offset, and in-order/OOO status, then consumes the returned RX Delivery for sequence, ACK, and SACK decisions. App notification, app-readable readiness, and RX FIFO capacity facts stay session/runtime-owned.
+_Avoid_: TCP-owned RX FIFO writes, app wakeups in transport, cross-worker RX copy, protocol-owned app queue events
+
+**RX Delivery**:
+The transport-neutral successful result of a Session Runtime RX enqueue, modeled as legal receive outcomes rather than a bag of nullable fields. It distinguishes not-accepted, in-order delivery, and out-of-order delivery; accepted-byte and OOO-span invariants are represented by non-zero domain values, while errors use the existing `CoreResult` boundary.
+_Avoid_: RX field bag, zero-length accepted delivery, zero-length OOO fact, RX error enum, TCP enqueue status type, app notification result, ready-queue command
+
+**OOO RX Delivery**:
+Receive-side delivery where out-of-order payload is retained by the Session FIFO's OOO storage and returned to transport as OOO facts for SACK and ACK policy, without making app-readable RX work visible until in-order bytes are delivered.
+_Avoid_: app-readable OOO event, TCP-owned OOO payload store, immediate app wake for OOO bytes
 
 **Send Goal Size**:
 A transport-selected payload sizing fact used by Session Runtime TX packetization. It may equal MSS or a larger GSO-sized goal, but it is still transport-neutral because Session Runtime uses it only to size payload bytes and buffers; offload flags, GSO metadata, TCP option length, and header semantics stay in transport/output code.
