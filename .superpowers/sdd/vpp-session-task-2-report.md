@@ -106,3 +106,27 @@ Scope check:
 
 Concerns:
 - None.
+
+## Review Finding Fix: Non-removing disconnect skips same-turn TX
+
+Status: DONE
+
+Fix summary:
+- Added a regression test for same-turn `Close + TxDeq` where `handle_disconnect` returns `false` and the session remains allocated.
+- The test verifies disconnect control runs first, stale same-turn ready/TX work is skipped, and later-turn scheduling for the same session still works.
+- Updated `dispatch_session_queue_pending` to track sessions that received disconnect control events during the current dispatch turn and skip their work-batch entries for that turn.
+- Did not add placeholder control variants or implement Task 3/Task 4.
+
+TDD evidence:
+- RED: `cargo test -p hammer-service same_turn_close_skips_tx_work_when_disconnect_keeps_session_allocated` failed with `ready_calls == 1`, proving stale ready work still ran after a non-removing disconnect.
+- GREEN: the same focused test passed after the fix.
+
+Verification:
+- `cargo fmt --all`: passed.
+- `cargo fmt --all -- --check`: passed.
+- `cargo test -p hammer-service same_turn_close_skips_tx_work_when_disconnect_keeps_session_allocated`: passed.
+- `cargo test -p hammer-service session::runtime::tests`: passed, 15 tests.
+- `cargo test -p hammer-service`: passed, including 138 library tests and crate integration tests; the crate still emits pre-existing warnings.
+
+Concerns:
+- None.

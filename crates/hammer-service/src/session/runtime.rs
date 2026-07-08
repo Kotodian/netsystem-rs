@@ -803,6 +803,7 @@ where
         }
     }
     let control_event_count = driver.runtime.sessions.control_events.len();
+    let mut controlled_sessions = hammer_infra::vec::Vec::with_capacity(control_event_count);
     for _ in 0..control_event_count {
         let Some(event) = driver.runtime.sessions.control_events.pop_front() else {
             break;
@@ -811,6 +812,7 @@ where
         if driver.session(session_id).is_none() {
             continue;
         }
+        controlled_sessions.push(session_id);
         let driver_ptr = driver as *mut SessionDriverRuntime<St, Seg>;
         let close_current = unsafe {
             with_session_state(driver_ptr, session_id, |state, context| {
@@ -825,6 +827,13 @@ where
     step.scheduled_sessions = session_work.len();
     for index in 0..session_work.len() {
         let session_id = session_work[index];
+        if controlled_sessions
+            .as_slice()
+            .iter()
+            .any(|controlled_session_id| *controlled_session_id == session_id)
+        {
+            continue;
+        }
         if driver.session(session_id).is_none() {
             continue;
         }
@@ -1256,6 +1265,86 @@ mod tests {
         fn on_close(&mut self, _: &mut SessionQueueControlContext) {
             self.close_calls += 1;
         }
+    }
+
+    #[derive(Default)]
+    struct NonRemovingDisconnectProtocol {
+        ready_calls: usize,
+        disconnect_calls: usize,
+        send_params_calls: usize,
+    }
+
+    impl SessionQueueProtocol for NonRemovingDisconnectProtocol {
+        fn handle_expired_timer(
+            &mut self,
+            _: &DataPlaneRuntime,
+            _: &mut SessionQueueControlContext,
+            _: u32,
+            _: crate::session::SessionQueueNext,
+            _: &mut crate::session::node::SessionQueueOutput,
+        ) -> CoreResult<bool> {
+            Ok(false)
+        }
+
+        fn handle_ready_session(
+            &mut self,
+            _: &DataPlaneRuntime,
+            _: &mut SessionQueueControlContext,
+            _: crate::session::SessionQueueNext,
+            _: &mut crate::session::node::SessionQueueOutput,
+        ) -> CoreResult<bool> {
+            self.ready_calls += 1;
+            Ok(false)
+        }
+
+        fn handle_disconnect(
+            &mut self,
+            _: &DataPlaneRuntime,
+            _: &mut SessionQueueControlContext,
+            _: crate::session::SessionQueueNext,
+            _: &mut crate::session::node::SessionQueueOutput,
+        ) -> CoreResult<bool> {
+            self.disconnect_calls += 1;
+            Ok(false)
+        }
+
+        fn send_params(
+            &mut self,
+            _: &mut SessionQueueControlContext,
+            _: usize,
+            _: Instant,
+        ) -> CoreResult<TransportSendParams> {
+            self.send_params_calls += 1;
+            Ok(TransportSendParams {
+                snd_space: 0,
+                tx_offset: 0,
+                send_goal_size: 1,
+                flags: TransportSendFlags::default(),
+            })
+        }
+
+        fn push_header(
+            &mut self,
+            _: &mut SessionQueueControlContext,
+            _: &[TxBatchBuffer],
+            _: Instant,
+        ) -> CoreResult<()> {
+            Err(CoreError::internal("transport push_header must not run"))
+        }
+
+        fn custom_tx(
+            &mut self,
+            _: &DataPlaneRuntime,
+            _: &mut SessionQueueControlContext,
+            _: crate::session::SessionQueueNext,
+            _: &mut crate::session::node::SessionQueueOutput,
+            _: usize,
+            _: Instant,
+        ) -> CoreResult<usize> {
+            Err(CoreError::internal("transport custom_tx must not run"))
+        }
+
+        fn on_close(&mut self, _: &mut SessionQueueControlContext) {}
     }
 
     #[derive(Default)]
@@ -1806,6 +1895,71 @@ mod tests {
         assert_eq!(step.scheduled_sessions, 1);
         assert!(driver.session(session_id).is_none());
         assert!(driver.take_scheduled_session_work().is_empty());
+    }
+
+    #[test]
+    fn same_turn_close_skips_tx_work_when_disconnect_keeps_session_allocated() {
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 2048,
+                    buffer_slots: 16,
+                    frame_capacity: 8,
+                    frame_slots: 8,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
+        let mut driver = SessionDriverRuntime::<NonRemovingDisconnectProtocol, Local>::new(
+            DataWorkerId::new(0),
+            runtime.buffers().clone(),
+        );
+        let session_id = driver.insert_session(NonRemovingDisconnectProtocol::default());
+        let app_session = attach_app_session(&mut driver, session_id);
+        app_session.send_bytes(b"tx").expect("send pending tx");
+        enqueue_runtime_event(&driver, session_id, SessionEvtType::Close);
+        let next: crate::session::SessionQueueNext = NodeId::new(9).into();
+        let mut output = crate::session::node::SessionQueueOutput::default();
+        let mut step = driver.poll_once_for_ticks(0).expect("poll");
+
+        dispatch_session_queue_pending(
+            &runtime,
+            &mut driver,
+            next,
+            &mut output,
+            &mut step,
+            Instant::now(),
+        )
+        .expect("dispatch close plus tx");
+
+        let protocol = driver
+            .session(session_id)
+            .expect("session remains allocated");
+        assert_eq!(step.scheduled_sessions, 1);
+        assert_eq!(protocol.disconnect_calls, 1);
+        assert_eq!(protocol.ready_calls, 0);
+        assert_eq!(protocol.send_params_calls, 0);
+        assert!(driver.take_scheduled_session_work().is_empty());
+
+        let mut context = driver.session_control_context(session_id);
+        context.mark_ready();
+        let mut step = driver.poll_once_for_ticks(0).expect("poll later turn");
+        dispatch_session_queue_pending(
+            &runtime,
+            &mut driver,
+            next,
+            &mut output,
+            &mut step,
+            Instant::now(),
+        )
+        .expect("dispatch later tx");
+
+        let protocol = driver
+            .session(session_id)
+            .expect("session remains allocated");
+        assert_eq!(step.scheduled_sessions, 1);
+        assert_eq!(protocol.disconnect_calls, 1);
+        assert_eq!(protocol.ready_calls, 1);
+        assert_eq!(protocol.send_params_calls, 1);
     }
 
     #[test]
