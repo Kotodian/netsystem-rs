@@ -126,14 +126,7 @@ impl WorkerSessionRuntime {
         self.control_events.push_back(event);
     }
 
-    pub(crate) fn poll_once_for_ticks<F>(
-        &mut self,
-        timer_ticks: u32,
-        mut mark_schedule_pending: F,
-    ) -> CoreResult<SessionQueueStep>
-    where
-        F: FnMut(SessionId) -> bool,
-    {
+    pub(crate) fn poll_once_for_ticks(&mut self, timer_ticks: u32) -> CoreResult<SessionQueueStep> {
         self.expired_timers.clear();
         let expired_timers = self.timers.expire(timer_ticks, &mut self.expired_timers);
         for index in 0..self.expired_timers.len() {
@@ -146,9 +139,6 @@ impl WorkerSessionRuntime {
                 session_id,
                 timer_id,
             });
-            if mark_schedule_pending(session_id) {
-                self.schedule_session_work(session_id);
-            }
         }
         Ok(SessionQueueStep {
             expired_timers,
@@ -542,13 +532,7 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
     }
 
     pub fn poll_once_for_ticks(&mut self, timer_ticks: u32) -> CoreResult<SessionQueueStep> {
-        let core = &mut *self.runtime;
-        let SessionDriverRuntimeCore {
-            sessions, entries, ..
-        } = core;
-        sessions.poll_once_for_ticks(timer_ticks, |session_id| {
-            mark_schedule_pending(entries, session_id)
-        })
+        self.runtime.sessions.poll_once_for_ticks(timer_ticks)
     }
 
     pub(crate) fn poll_once_at(&mut self, now: Instant) -> CoreResult<SessionQueueStep> {
@@ -1191,6 +1175,82 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct TimerMarkReadyProtocol {
+        timer_calls: usize,
+        ready_calls: usize,
+        received_timer: Option<u32>,
+    }
+
+    impl SessionQueueProtocol for TimerMarkReadyProtocol {
+        fn handle_expired_timer(
+            &mut self,
+            _: &DataPlaneRuntime,
+            context: &mut SessionQueueControlContext,
+            timer_id: u32,
+            _: crate::session::SessionQueueNext,
+            _: &mut crate::session::node::SessionQueueOutput,
+        ) -> CoreResult<bool> {
+            self.timer_calls += 1;
+            self.received_timer = Some(timer_id);
+            context.mark_ready();
+            Ok(false)
+        }
+
+        fn handle_ready_session(
+            &mut self,
+            _: &DataPlaneRuntime,
+            _: &mut SessionQueueControlContext,
+            _: crate::session::SessionQueueNext,
+            _: &mut crate::session::node::SessionQueueOutput,
+        ) -> CoreResult<bool> {
+            self.ready_calls += 1;
+            Ok(false)
+        }
+
+        fn handle_disconnect(
+            &mut self,
+            _: &DataPlaneRuntime,
+            _: &mut SessionQueueControlContext,
+            _: crate::session::SessionQueueNext,
+            _: &mut crate::session::node::SessionQueueOutput,
+        ) -> CoreResult<bool> {
+            Ok(false)
+        }
+
+        fn send_params(
+            &mut self,
+            _: &mut SessionQueueControlContext,
+            _: usize,
+            _: Instant,
+        ) -> CoreResult<TransportSendParams> {
+            Err(CoreError::internal("transport send_params must not run"))
+        }
+
+        fn push_header(
+            &mut self,
+            _: &mut SessionQueueControlContext,
+            _: &[TxBatchBuffer],
+            _: Instant,
+        ) -> CoreResult<()> {
+            Err(CoreError::internal("transport push_header must not run"))
+        }
+
+        fn custom_tx(
+            &mut self,
+            _: &DataPlaneRuntime,
+            _: &mut SessionQueueControlContext,
+            _: crate::session::SessionQueueNext,
+            _: &mut crate::session::node::SessionQueueOutput,
+            _: usize,
+            _: Instant,
+        ) -> CoreResult<usize> {
+            Err(CoreError::internal("transport custom_tx must not run"))
+        }
+
+        fn on_close(&mut self, _: &mut SessionQueueControlContext) {}
+    }
+
+    #[derive(Default)]
     struct EventClassificationProtocol {
         ready_calls: usize,
         disconnect_calls: usize,
@@ -1434,7 +1494,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_session_runtime_expires_timer_into_expiry_and_ready_session() {
+    fn worker_session_runtime_expires_timer_into_expiry_without_session_work() {
         let worker = DataWorkerId::new(0);
         let session_id = SessionId::new(9);
         let timer_id = 16;
@@ -1448,7 +1508,7 @@ mod tests {
 
         assert_eq!(
             runtime
-                .poll_once_for_ticks(2, |_| true)
+                .poll_once_for_ticks(2)
                 .expect("expire before deadline")
                 .expired_timers,
             0
@@ -1458,16 +1518,13 @@ mod tests {
 
         assert_eq!(
             runtime
-                .poll_once_for_ticks(1, |_| true)
+                .poll_once_for_ticks(1)
                 .expect("expire at deadline")
                 .expired_timers,
             1
         );
         assert_next_pending_timer(&mut runtime, session_id, timer_id);
-        assert_eq!(
-            runtime.take_scheduled_session_work(),
-            infra_vec([session_id])
-        );
+        assert!(runtime.take_scheduled_session_work().is_empty());
     }
 
     #[test]
@@ -1489,7 +1546,7 @@ mod tests {
 
         assert_eq!(
             runtime
-                .poll_once_for_ticks(2, |_| true)
+                .poll_once_for_ticks(2)
                 .expect("expire stale timer")
                 .expired_timers,
             0
@@ -1499,15 +1556,13 @@ mod tests {
 
         assert_eq!(
             runtime
-                .poll_once_for_ticks(3, |_| true)
+                .poll_once_for_ticks(3)
                 .expect("expire rearmed timer")
                 .expired_timers,
             1
         );
-        assert_eq!(
-            runtime.take_scheduled_session_work(),
-            infra_vec([session_id])
-        );
+        assert!(runtime.take_scheduled_session_work().is_empty());
+        assert_next_pending_timer(&mut runtime, session_id, timer_id);
     }
 
     #[test]
@@ -1530,7 +1585,7 @@ mod tests {
 
         assert_eq!(
             runtime
-                .poll_once_for_ticks(2, |_| true)
+                .poll_once_for_ticks(2)
                 .expect("expire canceled timer")
                 .expired_timers,
             0
@@ -1553,15 +1608,13 @@ mod tests {
             .expect("arm first timer");
         assert_eq!(
             runtime
-                .poll_once_for_ticks(1, |_| true)
+                .poll_once_for_ticks(1)
                 .expect("expire first timer")
                 .expired_timers,
             1
         );
-        assert_eq!(
-            runtime.take_scheduled_session_work(),
-            infra_vec([session_id])
-        );
+        assert!(runtime.take_scheduled_session_work().is_empty());
+        assert_next_pending_timer(&mut runtime, session_id, timer_id);
 
         runtime
             .timers
@@ -1572,7 +1625,7 @@ mod tests {
 
         assert_eq!(
             runtime
-                .poll_once_for_ticks(1, |_| true)
+                .poll_once_for_ticks(1)
                 .expect("before second deadline")
                 .expired_timers,
             0
@@ -1581,7 +1634,7 @@ mod tests {
 
         assert_eq!(
             runtime
-                .poll_once_for_ticks(1, |_| true)
+                .poll_once_for_ticks(1)
                 .expect("expire second timer")
                 .expired_timers,
             1
@@ -1606,14 +1659,14 @@ mod tests {
 
         let first_ticks = runtime.elapsed_timer_ticks(start + Duration::from_millis(10));
         let first = runtime
-            .poll_once_for_ticks(first_ticks, |_| true)
+            .poll_once_for_ticks(first_ticks)
             .expect("first poll");
         assert_eq!(first.expired_timers, 0);
         assert!(runtime.pending_timers.is_empty());
 
         let second_ticks = runtime.elapsed_timer_ticks(start + Duration::from_millis(20));
         let second = runtime
-            .poll_once_for_ticks(second_ticks, |_| true)
+            .poll_once_for_ticks(second_ticks)
             .expect("second poll");
         assert_eq!(second.expired_timers, 1);
         assert_next_pending_timer(&mut runtime, session_id, timer_id);
@@ -1739,6 +1792,52 @@ mod tests {
 
         assert_eq!(step.scheduled_sessions, 1);
         assert_eq!(driver.session(session_id).expect("state").ready_calls, 2);
+    }
+
+    #[test]
+    fn timer_handler_schedules_session_work_through_context() {
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 2048,
+                    buffer_slots: 16,
+                    frame_capacity: 8,
+                    frame_slots: 8,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
+        let mut driver = SessionDriverRuntime::<TimerMarkReadyProtocol, Local>::new(
+            DataWorkerId::new(0),
+            runtime.buffers().clone(),
+        );
+        let session_id = driver.insert_session(TimerMarkReadyProtocol::default());
+        let timer_id = 19;
+        let session = session_id.pool_index();
+        driver
+            .timers_mut()
+            .arm_timer(session.slot(), session.generation(), timer_id, 1)
+            .expect("arm timer");
+
+        let mut step = driver.poll_once_for_ticks(1).expect("poll timer");
+        assert_eq!(step.expired_timers, 1);
+        assert_eq!(step.scheduled_sessions, 0);
+        let next: crate::session::SessionQueueNext = NodeId::new(9).into();
+        let mut output = crate::session::node::SessionQueueOutput::default();
+        dispatch_session_queue_pending(
+            &runtime,
+            &mut driver,
+            next,
+            &mut output,
+            &mut step,
+            Instant::now(),
+        )
+        .expect("dispatch timer");
+
+        let protocol = driver.session(session_id).expect("protocol state");
+        assert_eq!(step.scheduled_sessions, 1);
+        assert_eq!(protocol.timer_calls, 1);
+        assert_eq!(protocol.ready_calls, 1);
+        assert_eq!(protocol.received_timer, Some(timer_id));
     }
 
     fn attach_app_session<St>(
