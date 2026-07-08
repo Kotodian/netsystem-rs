@@ -186,7 +186,7 @@ impl<S: Segment> SessionAppRuntime<S> {
         session_id: SessionId,
         buffers: &DataPlaneBuffers,
         index: BufferIndex,
-    ) -> CoreResult<usize>
+    ) -> CoreResult<(u32, u32)>
     where
         Self: SessionAppRuntimeCreate<S>,
     {
@@ -194,29 +194,43 @@ impl<S: Segment> SessionAppRuntime<S> {
             .sessions
             .lookup(&session_id.get())
             .map(|s| s.session_handle());
-        let wrote = match handle {
+        let delivery = match handle {
             Some(_) => {
                 let Some(session) = self.sessions.lookup(&session_id.get()) else {
-                    return Ok(0);
+                    return Ok((0, 0));
                 };
-                let mut total = 0usize;
-                let mut wrote = 0usize;
+                let mut total = 0u32;
+                let mut accepted = 0u32;
+                let mut promoted = 0u32;
                 for buffer in buffers.chain(index) {
                     let buffer = buffer?;
                     let chunk = buffer.current();
-                    total += chunk.len();
-                    if wrote == total - chunk.len() {
-                        wrote += session.enqueue_rx(chunk).map_err(CoreError::from)?;
+                    let chunk_len = u32::try_from(chunk.len())
+                        .map_err(|_| CoreError::internal("rx buffer length overflow"))?;
+                    if accepted == total {
+                        let rx_available_before = session.rx_fifo().max_enqueue();
+                        let wrote = session.enqueue_rx(chunk).map_err(CoreError::from)?;
+                        let accepted_now = wrote.min(chunk.len()).min(rx_available_before);
+                        let promoted_now = wrote.saturating_sub(accepted_now);
+                        accepted = accepted
+                            .checked_add(accepted_now as u32)
+                            .ok_or_else(|| CoreError::internal("rx accepted length overflow"))?;
+                        promoted = promoted
+                            .checked_add(promoted_now as u32)
+                            .ok_or_else(|| CoreError::internal("rx promoted length overflow"))?;
                     }
+                    total = total
+                        .checked_add(chunk_len)
+                        .ok_or_else(|| CoreError::internal("rx buffer length overflow"))?;
                 }
-                if wrote > 0 {
+                if accepted != 0 || promoted != 0 {
                     self.notify_rx(&session);
                 }
-                wrote
+                (accepted, promoted)
             }
-            None => 0,
+            None => (0, 0),
         };
-        Ok(wrote)
+        Ok(delivery)
     }
 
     pub(crate) fn copy_rx_from_buffer_ooo(
@@ -225,14 +239,14 @@ impl<S: Segment> SessionAppRuntime<S> {
         buffers: &DataPlaneBuffers,
         index: BufferIndex,
         offset: u32,
-    ) -> CoreResult<(u32, u32, Option<u32>)> {
+    ) -> CoreResult<(u32, Option<(u32, u32)>)> {
         let Some(session) = self.sessions.lookup(&session_id.get()) else {
-            return Ok((0, 0, None));
+            return Ok((0, None));
         };
         let mut total_len = 0u32;
         let mut accepted = 0u32;
-        let mut delivered = 0u32;
-        let mut accepted_start = None;
+        let mut newest_start: Option<u32> = None;
+        let mut newest_end: Option<u32> = None;
         for buf in buffers.chain(index) {
             let buf = buf?;
             let current = buf.current();
@@ -244,15 +258,32 @@ impl<S: Segment> SessionAppRuntime<S> {
                 .enqueue_ooo(chunk_offset, current)
                 .map_err(|_| CoreError::internal("ooo enqueue failed"))?;
             accepted = accepted.wrapping_add(result.accepted);
-            delivered = delivered.wrapping_add(result.delivered);
-            if accepted_start.is_none() {
-                accepted_start = result.start;
+            if let Some(start) = result.start {
+                let end = start
+                    .checked_add(result.len)
+                    .ok_or_else(|| CoreError::internal("ooo span end overflow"))?;
+                newest_start = Some(match newest_start {
+                    Some(existing) => existing.min(start),
+                    None => start,
+                });
+                newest_end = Some(match newest_end {
+                    Some(existing) => existing.max(end),
+                    None => end,
+                });
             }
             total_len = total_len
                 .checked_add(current.len() as u32)
                 .ok_or_else(|| CoreError::internal("ooo rx buffer length overflow"))?;
         }
-        Ok((accepted, delivered, accepted_start))
+        let newest = match (newest_start, newest_end) {
+            (Some(start), Some(end)) => Some((
+                start,
+                end.checked_sub(start)
+                    .ok_or_else(|| CoreError::internal("ooo span length underflow"))?,
+            )),
+            _ => None,
+        };
+        Ok((accepted, newest))
     }
 
     pub(crate) fn discard_all_tx_bytes_for_session(&mut self, session_id: SessionId) {

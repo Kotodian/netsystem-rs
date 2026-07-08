@@ -64,15 +64,17 @@ impl OooSpan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RxDelivery {
     NotAccepted {
-        available: u32,
+        rx_available: u32,
     },
     InOrder {
         accepted: NonZeroU32,
+        promoted: u32,
+        rx_available: u32,
     },
     OutOfOrder {
         accepted: NonZeroU32,
-        delivered: u32,
-        span: OooSpan,
+        newest: OooSpan,
+        rx_available: u32,
     },
 }
 
@@ -544,33 +546,42 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
     {
         let buffers = &self.runtime.buffers;
         if offset == 0 {
-            let wrote = self
+            let (accepted, promoted) = self
                 .app_state
                 .app
                 .copy_rx_from_buffer(session_id, buffers, index)?;
-            Ok(match NonZeroU32::new(wrote as u32) {
-                Some(accepted) => RxDelivery::InOrder { accepted },
-                None => RxDelivery::NotAccepted {
-                    available: self.rx_available_u32(session_id),
+            let rx_available = self.rx_available_u32(session_id);
+            Ok(match NonZeroU32::new(accepted) {
+                Some(accepted) => RxDelivery::InOrder {
+                    accepted,
+                    promoted,
+                    rx_available,
                 },
+                None => RxDelivery::NotAccepted { rx_available },
             })
         } else {
-            let (accepted, delivered, accepted_start) = self
+            let (accepted, newest) = self
                 .app_state
                 .app
                 .copy_rx_from_buffer_ooo(session_id, buffers, index, offset)?;
+            let rx_available = self.rx_available_u32(session_id);
             Ok(match NonZeroU32::new(accepted) {
                 Some(accepted) => RxDelivery::OutOfOrder {
                     accepted,
-                    delivered,
-                    span: OooSpan::new(
-                        accepted_start.expect("accepted OOO delivery must report a start offset"),
-                        accepted,
-                    ),
+                    newest: {
+                        let (start, len) = newest.ok_or_else(|| {
+                            CoreError::internal("accepted OOO delivery must report a retained span")
+                        })?;
+                        let len = NonZeroU32::new(len).ok_or_else(|| {
+                            CoreError::internal(
+                                "accepted OOO delivery must report non-zero span length",
+                            )
+                        })?;
+                        OooSpan::new(start, len)
+                    },
+                    rx_available,
                 },
-                None => RxDelivery::NotAccepted {
-                    available: self.rx_available_u32(session_id),
-                },
+                None => RxDelivery::NotAccepted { rx_available },
             })
         }
     }
@@ -1570,7 +1581,44 @@ mod tests {
             .expect("enqueue rx");
 
         match delivery {
-            RxDelivery::InOrder { accepted } => assert_eq!(accepted.get(), 5),
+            RxDelivery::InOrder {
+                accepted,
+                promoted,
+                rx_available,
+            } => {
+                assert_eq!(accepted.get(), 5);
+                assert_eq!(promoted, 0);
+                assert_eq!(rx_available, 11);
+            }
+            other => panic!("expected in-order delivery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enqueue_rx_in_order_delivery_reports_promoted_ooo_bytes() {
+        let (runtime, driver, session_id) = runtime_for_rx_delivery_tests(16);
+        let ooo_payload = append_payload(&runtime, b"world");
+        let in_order_payload = append_payload(&runtime, b"hello");
+
+        let ooo_delivery = driver
+            .enqueue_rx(session_id, ooo_payload, 5, false)
+            .expect("enqueue ooo rx");
+        assert!(matches!(ooo_delivery, RxDelivery::OutOfOrder { .. }));
+
+        let delivery = driver
+            .enqueue_rx(session_id, in_order_payload, 0, false)
+            .expect("enqueue in-order rx");
+
+        match delivery {
+            RxDelivery::InOrder {
+                accepted,
+                promoted,
+                rx_available,
+            } => {
+                assert_eq!(accepted.get(), 5);
+                assert_eq!(promoted, 5);
+                assert_eq!(rx_available, 6);
+            }
             other => panic!("expected in-order delivery, got {other:?}"),
         }
     }
@@ -1591,7 +1639,7 @@ mod tests {
             .expect("enqueue full fifo");
 
         match delivery {
-            RxDelivery::NotAccepted { available } => assert_eq!(available, 0),
+            RxDelivery::NotAccepted { rx_available } => assert_eq!(rx_available, 0),
             other => panic!("expected not-accepted delivery, got {other:?}"),
         }
     }
@@ -1608,13 +1656,13 @@ mod tests {
         match delivery {
             RxDelivery::OutOfOrder {
                 accepted,
-                delivered,
-                span,
+                newest,
+                rx_available,
             } => {
                 assert_eq!(accepted.get(), 5);
-                assert_eq!(delivered, 0);
-                assert_eq!(span.start(), 5);
-                assert_eq!(span.len().get(), 5);
+                assert_eq!(newest.start(), 5);
+                assert_eq!(newest.len().get(), 5);
+                assert_eq!(rx_available, 16);
             }
             other => panic!("expected ooo delivery, got {other:?}"),
         }

@@ -48,17 +48,12 @@ fn session_rx_delivery_models_legal_outcomes() {
 }
 
 #[test]
-fn tcp_receive_window_is_refreshed_from_session_rx_fifo_capacity() {
-    let connection_source = include_str!("../src/transport/tcp/connection.rs");
+fn established_rx_path_does_not_requery_session_rx_capacity() {
     let established_source = include_str!("../src/transport/tcp/established.rs");
 
     assert!(
-        connection_source.contains("set_rcv_wnd"),
-        "TcpConnection needs a narrow API for session-provided RX capacity facts"
-    );
-    assert!(
-        established_source.contains("rx_available_len"),
-        "established RX path must refresh advertised window from session RX capacity"
+        !established_source.contains("queue.rx_available_len(session_id)"),
+        "established RX path must use RxDelivery rx_available facts instead of re-querying session RX capacity"
     );
 }
 

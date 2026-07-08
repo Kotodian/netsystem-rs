@@ -39,8 +39,9 @@ fn ooo_promote_contiguous_gap_filled() {
     f.enqueue(b"hello");
 
     let result = f.enqueue_ooo(0, b"hellohello").unwrap();
-    assert_eq!(result.accepted, 10);
+    assert_eq!(result.accepted, 5);
     assert_eq!(result.start, Some(0));
+    assert_eq!(result.len, 10);
     assert!(result.delivered > 0);
 }
 
@@ -96,4 +97,24 @@ fn duplicate_ooo_enqueue_reports_zero_newly_accepted_bytes() {
     assert_eq!(duplicate.accepted, 0);
     assert_eq!(duplicate.delivered, 0);
     assert_eq!(duplicate.start, None);
+}
+
+#[test]
+fn partial_overlap_ooo_enqueue_reports_retained_span_len() {
+    let mut f = fifo(1 << 16);
+    f.enable_ooo();
+
+    let first = f.enqueue_ooo(5, b"world").expect("first ooo enqueue");
+    let overlap = f
+        .enqueue_ooo(7, b"rld!!")
+        .expect("partially overlapping ooo enqueue");
+
+    assert_eq!(first.accepted, 5);
+    assert_eq!(first.start, Some(5));
+    assert_eq!(first.len, 5);
+
+    assert_eq!(overlap.accepted, 2);
+    assert_eq!(overlap.delivered, 0);
+    assert_eq!(overlap.start, Some(5));
+    assert_eq!(overlap.len, 7);
 }

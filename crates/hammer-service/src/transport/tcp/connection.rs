@@ -1758,15 +1758,16 @@ where
         }
         match delivery {
             RxDelivery::NotAccepted { .. } => {}
-            RxDelivery::InOrder { accepted } => {
-                self.rcv_nxt = self.rcv_nxt.advance(accepted.get());
-            }
-            RxDelivery::OutOfOrder {
-                delivered, span, ..
+            RxDelivery::InOrder {
+                accepted, promoted, ..
             } => {
-                self.rcv_nxt = self.rcv_nxt.advance(delivered);
-                let left = self.rcv_nxt.advance(span.start());
-                let right = left.advance(span.len().get());
+                self.rcv_nxt = self
+                    .rcv_nxt
+                    .advance(accepted.get().saturating_add(promoted));
+            }
+            RxDelivery::OutOfOrder { newest, .. } => {
+                let left = self.rcv_nxt.advance(newest.start());
+                let right = left.advance(newest.len().get());
                 self.sack
                     .update_range(self.negotiated_options().sack, self.rcv_nxt, left, right);
                 return;
@@ -2482,10 +2483,31 @@ mod tests {
             0,
             RxDelivery::InOrder {
                 accepted: NonZeroU32::new(5).expect("accepted bytes"),
+                promoted: 0,
+                rx_available: 4096,
             },
         );
 
         assert_eq!(connection.rcv_nxt(), sequence.advance(5).raw());
+        assert!(!connection.has_pending_sack_output());
+    }
+
+    #[test]
+    fn tcp_receive_payload_in_order_rx_delivery_advances_promoted_bytes() {
+        let mut connection = established_connection();
+        let sequence = TcpSeq::from(connection.rcv_nxt());
+
+        connection.receive_payload(
+            sequence,
+            0,
+            RxDelivery::InOrder {
+                accepted: NonZeroU32::new(5).expect("accepted bytes"),
+                promoted: 5,
+                rx_available: 4096,
+            },
+        );
+
+        assert_eq!(connection.rcv_nxt(), sequence.advance(10).raw());
         assert!(!connection.has_pending_sack_output());
     }
 
@@ -2500,8 +2522,8 @@ mod tests {
             0,
             RxDelivery::OutOfOrder {
                 accepted: NonZeroU32::new(5).expect("accepted bytes"),
-                delivered: 0,
-                span: OooSpan::new(5, NonZeroU32::new(5).expect("ooo len")),
+                newest: OooSpan::new(5, NonZeroU32::new(5).expect("ooo len")),
+                rx_available: 4096,
             },
         );
 
@@ -2520,7 +2542,7 @@ mod tests {
         let mut connection = established_connection();
         let sequence = TcpSeq::from(connection.rcv_nxt());
 
-        connection.receive_payload(sequence, 0, RxDelivery::NotAccepted { available: 0 });
+        connection.receive_payload(sequence, 0, RxDelivery::NotAccepted { rx_available: 0 });
 
         assert_eq!(connection.rcv_nxt(), sequence.raw());
         assert!(!connection.has_pending_sack_output());

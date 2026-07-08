@@ -179,12 +179,21 @@ where
                     .record_current_node_error(TcpNodeError::EstablishedSessionMissing.code());
                 TcpNodeError::EstablishedSessionMissing
             })?;
+            let rx_available = match delivery {
+                RxDelivery::NotAccepted { rx_available }
+                | RxDelivery::InOrder { rx_available, .. }
+                | RxDelivery::OutOfOrder { rx_available, .. } => rx_available as usize,
+            };
             connection.receive_payload(accepted_sequence, trim as u32, delivery);
             let clean_in_order = trim == 0
                 && offset == 0
                 && matches!(
                     delivery,
-                    RxDelivery::InOrder { accepted } if accepted.get() == accepted_len
+                    RxDelivery::InOrder {
+                        accepted,
+                        promoted,
+                        ..
+                    } if promoted == 0 && accepted.get() == accepted_len
                 );
             immediate_ack = if clean_in_order {
                 connection.on_clean_in_order_payload()
@@ -195,29 +204,27 @@ where
                 let mut context = queue.session_control_context(session_id);
                 context.mark_ready();
             }
-            let available = match delivery {
-                RxDelivery::NotAccepted { available } => Some(available as usize),
-                RxDelivery::InOrder { accepted } => {
-                    if accepted.get() != accepted_len {
+            match delivery {
+                RxDelivery::NotAccepted { .. } => {}
+                RxDelivery::InOrder {
+                    accepted, promoted, ..
+                } => {
+                    if accepted.get() != accepted_len || promoted != 0 {
                         immediate_ack = true;
                     }
-                    queue.rx_available_len(session_id)
                 }
                 RxDelivery::OutOfOrder { accepted, .. } => {
                     if accepted.get() != accepted_len {
                         immediate_ack = true;
                     }
-                    queue.rx_available_len(session_id)
                 }
-            };
-            if let Some(available) = available {
-                let connection = queue.session_mut(session_id).ok_or_else(|| {
-                    let _ = runtime
-                        .record_current_node_error(TcpNodeError::EstablishedSessionMissing.code());
-                    TcpNodeError::EstablishedSessionMissing
-                })?;
-                connection.set_rcv_wnd(available);
             }
+            let connection = queue.session_mut(session_id).ok_or_else(|| {
+                let _ = runtime
+                    .record_current_node_error(TcpNodeError::EstablishedSessionMissing.code());
+                TcpNodeError::EstablishedSessionMissing
+            })?;
+            connection.set_rcv_wnd(rx_available);
         } else if duplicate_payload {
             let connection = queue.session_mut(session_id).ok_or_else(|| {
                 let _ = runtime

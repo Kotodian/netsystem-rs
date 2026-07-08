@@ -99,3 +99,36 @@ test result: ok. 146 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
 - `RxDelivery`’s size guard landed at `<= 24` bytes rather than `<= 16`; that still keeps an explicit hot-path bound, but the enum layout is a little larger than the tightest optimistic target.
 - The OOO span start remains the first retained span start after predecessor trimming; accepted-byte accounting is now correct for exact duplicates, but more complex overlap shapes still rely on the existing single-span modeling rather than a richer overlap description.
+
+## Review Fix R1 Addendum (2026-07-08)
+
+### Review findings addressed
+
+- Removed the dead `delivered` field from `RxDelivery::OutOfOrder`; accepted OOO bytes no longer masquerade as app-readable in-order delivery.
+- Carried `rx_available: u32` on every `RxDelivery` outcome and kept RX capacity lookup inside session runtime ownership.
+- Fixed generic FIFO OOO result accounting so newly accepted byte count is separate from the retained/newest OOO span used for SACK decisions.
+- Reworked TCP receive consumption to use `RxDelivery` facts for `rcv_nxt`, SACK staging, ACK decisions, and advertised receive window updates.
+- Replaced the old source guardrail with a boundary check that the established RX path does not call `queue.rx_available_len(session_id)`.
+
+### What changed
+
+- `hammer-infra::fifo::OooResult` now reports `accepted`, `delivered`, `start`, and retained-span `len`; partial-overlap merges preserve the full retained SACK span instead of under-reporting it as only newly accepted bytes.
+- Session app/runtime RX enqueue now returns `(accepted, promoted)` for in-order data and `(accepted, newest_span)` for OOO data, then materializes ADR-shaped `RxDelivery` values with `rx_available`.
+- TCP established receive no longer re-queries session RX capacity after enqueue; it consumes `rx_available` from `RxDelivery` and treats `promoted != 0` as non-clean in-order progress.
+- TCP connection receive advances `rcv_nxt` by `accepted + promoted` only for in-order delivery and keeps OOO delivery on the SACK path without advancing `rcv_nxt`.
+- Added/updated behavior tests for promoted in-order delivery, OOO newest-span reporting, partial-overlap FIFO retention, and the TCP/session boundary guardrail.
+
+### Tests run and outputs
+
+- `cargo test -p hammer-infra fifo_ooo` -> passed as a name-filtered command; executed `0` tests and filtered the suite.
+- `cargo test -p hammer-infra --test fifo_ooo` -> passed, `8 passed; 0 failed`; includes `partial_overlap_ooo_enqueue_reports_retained_span_len`.
+- `cargo test -p hammer-service enqueue_rx_` -> passed, `4 passed; 0 failed`.
+- `cargo test -p hammer-service tcp_receive_payload_` -> passed, `4 passed; 0 failed`.
+- `cargo test -p hammer-service` -> passed after the final FIFO retained-span fix; `148 passed; 0 failed` in lib tests and all integration tests passed (`tcp_session_app_boundary`, `session_runtime`, `session_queue_dispatch`, etc.), with only the existing perf probes ignored.
+- `cargo fmt --all` -> passed.
+- `git diff --check` -> passed.
+
+### Remaining concerns
+
+- No open functional concerns in the Task 4 review-fix scope.
+- The required `cargo test -p hammer-infra fifo_ooo` form is a filter expression rather than a test-target selector, so the report records the additional `--test fifo_ooo` run as the real behavior check.

@@ -45,6 +45,7 @@ pub struct OooResult {
     pub accepted: u32,
     pub delivered: u32,
     pub start: Option<u32>,
+    pub len: u32,
 }
 
 struct OooSegment {
@@ -630,6 +631,7 @@ impl<S: Segment> Fifo<S> {
         }
         let tail = unsafe { (*self.hdr).tail.load(Ordering::Acquire) };
         bk.base = tail;
+        let base = bk.base;
         let abs_pos = tail.wrapping_add(offset);
         let written = self.write_at_without_tail_store(abs_pos, src);
         if written == 0 {
@@ -637,11 +639,14 @@ impl<S: Segment> Fifo<S> {
                 accepted: 0,
                 delivered: 0,
                 start: None,
+                len: 0,
             });
         }
 
         let seg_end_full = abs_pos.wrapping_add(written as u32);
         let mut seg_start = abs_pos;
+        let mut retained_start = seg_start;
+        let mut retained_end = seg_end_full;
 
         // Predecessor check
         let pred_info = bk
@@ -650,18 +655,22 @@ impl<S: Segment> Fifo<S> {
             .and_then(|(_, &idx)| bk.entries.get(idx))
             .map(|s| {
                 let end = s.offset.wrapping_add(s.len);
-                (end, end >= seg_end_full, end > seg_start)
+                (s.offset, end, end >= seg_end_full)
             });
 
-        if let Some((pred_end, skip, overlap)) = pred_info {
+        if let Some((pred_start, pred_end, skip)) = pred_info {
             if skip {
                 return Ok(OooResult {
                     accepted: 0,
                     delivered: 0,
                     start: None,
+                    len: 0,
                 });
             }
-            if overlap {
+            if pred_end >= seg_start {
+                retained_start = pred_start;
+            }
+            if pred_end > seg_start {
                 seg_start = pred_end;
             }
         }
@@ -671,6 +680,7 @@ impl<S: Segment> Fifo<S> {
                 accepted: 0,
                 delivered: 0,
                 start: None,
+                len: 0,
             });
         }
 
@@ -701,6 +711,7 @@ impl<S: Segment> Fifo<S> {
                 accepted: 0,
                 delivered: 0,
                 start: None,
+                len: 0,
             });
         }
 
@@ -724,6 +735,7 @@ impl<S: Segment> Fifo<S> {
                 None => break,
             };
 
+            retained_end = retained_end.max(succ_end);
             if succ_end <= seg_end_full {
                 bk.remove_ooo_entry(succ_key);
             } else {
@@ -746,7 +758,6 @@ impl<S: Segment> Fifo<S> {
 
         // Insert our segment
         let seg_len = seg_end_full.wrapping_sub(seg_start);
-        let start = seg_start.wrapping_sub(bk.base);
         let idx = bk
             .entries
             .insert(OooSegment {
@@ -766,7 +777,8 @@ impl<S: Segment> Fifo<S> {
         Ok(OooResult {
             accepted,
             delivered,
-            start: Some(start),
+            start: Some(retained_start.wrapping_sub(base)),
+            len: retained_end.wrapping_sub(retained_start),
         })
     }
 
