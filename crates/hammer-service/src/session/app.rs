@@ -24,6 +24,13 @@ impl From<SessionAppRuntimeError> for CoreError {
     }
 }
 
+#[inline]
+fn checked_add_ooo_accepted(total: u32, accepted: u32) -> CoreResult<u32> {
+    total
+        .checked_add(accepted)
+        .ok_or_else(|| CoreError::internal("ooo rx accepted length overflow"))
+}
+
 pub struct SessionAppRuntime<S: Segment> {
     buffers: DataPlaneBuffers,
     sessions: FlatHashTable<u64, Arc<AppSession<S>>>,
@@ -257,7 +264,7 @@ impl<S: Segment> SessionAppRuntime<S> {
                 .rx_fifo()
                 .enqueue_ooo(chunk_offset, current)
                 .map_err(|_| CoreError::internal("ooo enqueue failed"))?;
-            accepted = accepted.wrapping_add(result.accepted);
+            accepted = checked_add_ooo_accepted(accepted, result.accepted)?;
             if let Some(start) = result.start {
                 let end = start
                     .checked_add(result.len)
@@ -350,6 +357,26 @@ impl SessionAppRuntime<Local> {
             0,
             Local::default(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_add_ooo_accepted_rejects_overflow() {
+        let error =
+            checked_add_ooo_accepted(u32::MAX, 1).expect_err("overflow must return an error");
+        assert_eq!(error.to_string(), "ooo rx accepted length overflow");
+    }
+
+    #[test]
+    fn checked_add_ooo_accepted_accumulates_without_overflow() {
+        assert_eq!(
+            checked_add_ooo_accepted(7, 11).expect("sum without overflow"),
+            18
+        );
     }
 }
 

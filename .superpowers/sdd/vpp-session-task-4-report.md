@@ -132,3 +132,8 @@ test result: ok. 146 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
 - No open functional concerns in the Task 4 review-fix scope.
 - The required `cargo test -p hammer-infra fifo_ooo` form is a filter expression rather than a test-target selector, so the report records the additional `--test fifo_ooo` run as the real behavior check.
+
+## Review Fix R2 Addendum (2026-07-08)
+
+- Tightened OOO accepted-byte accumulation in `crates/hammer-service/src/session/app.rs` from `wrapping_add` to checked accounting, returning `CoreError::internal("ooo rx accepted length overflow")` on overflow to match the in-order path.
+- Added focused unit coverage for the checked-add helper so the overflow guard is directly exercised instead of being implicit in broader RX tests.

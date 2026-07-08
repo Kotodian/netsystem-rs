@@ -1,15 +1,48 @@
 use hammer_adapter::DataPlaneBuffers;
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
-use std::ptr::NonNull;
 
-use crate::session::SessionId;
+use crate::session::{SessionId, runtime::WorkerSessionRuntime};
 
-pub(crate) type ScheduleSessionWorkFn = unsafe fn(*mut (), SessionId);
+pub(in crate::session) struct SessionWorkScheduler {
+    schedule_pending: *mut bool,
+    sessions: *mut WorkerSessionRuntime,
+    current_session_id: SessionId,
+}
+
+impl SessionWorkScheduler {
+    /// SAFETY: `schedule_pending` must point to the current session entry's
+    /// scheduling bit, and `sessions` must point to the owning
+    /// `WorkerSessionRuntime`. Neither pointer may alias the live protocol
+    /// state borrow for this session.
+    #[inline]
+    pub(in crate::session) const unsafe fn new(
+        schedule_pending: *mut bool,
+        sessions: *mut WorkerSessionRuntime,
+        current_session_id: SessionId,
+    ) -> Self {
+        Self {
+            schedule_pending,
+            sessions,
+            current_session_id,
+        }
+    }
+
+    #[inline]
+    fn mark_ready(&mut self) {
+        unsafe {
+            let schedule_pending = &mut *self.schedule_pending;
+            if *schedule_pending {
+                return;
+            }
+            *schedule_pending = true;
+            (*self.sessions).schedule_session_work(self.current_session_id);
+        }
+    }
+}
 
 pub struct SessionQueueControlContext {
     timer_wheel: *mut TimerWheel1t2w2048sl<u32>,
-    scheduler: NonNull<()>,
-    schedule_session_work: ScheduleSessionWorkFn,
+    scheduler: SessionWorkScheduler,
     buffers: *const DataPlaneBuffers,
     current_session_id: SessionId,
     has_pending_tx: std::cell::Cell<bool>,
@@ -19,8 +52,7 @@ impl SessionQueueControlContext {
     #[inline]
     pub(in crate::session) fn new(
         timer_wheel: *mut TimerWheel1t2w2048sl<u32>,
-        scheduler: NonNull<()>,
-        schedule_session_work: ScheduleSessionWorkFn,
+        scheduler: SessionWorkScheduler,
         buffers: *const DataPlaneBuffers,
         current_session_id: SessionId,
         has_pending_tx: bool,
@@ -28,7 +60,6 @@ impl SessionQueueControlContext {
         Self {
             timer_wheel,
             scheduler,
-            schedule_session_work,
             buffers,
             current_session_id,
             has_pending_tx: std::cell::Cell::new(has_pending_tx),
@@ -47,7 +78,7 @@ impl SessionQueueControlContext {
 
     #[inline]
     pub fn mark_ready(&mut self) {
-        unsafe { (self.schedule_session_work)(self.scheduler.as_ptr(), self.current_session_id) };
+        self.scheduler.mark_ready();
     }
 
     #[inline]
