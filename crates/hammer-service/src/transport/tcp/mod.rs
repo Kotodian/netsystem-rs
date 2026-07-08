@@ -649,13 +649,22 @@ where
         &mut self,
         runtime: &DataPlaneRuntime,
         context: &mut SessionQueueControlContext,
-        close_requested: bool,
         output_next: SessionQueueNext,
         output: &mut SessionQueueOutput,
     ) -> CoreResult<bool> {
-        if close_requested {
-            self.on_session_close();
-        }
+        let now = std::time::Instant::now();
+        let _ = self.custom_tx(runtime, context, output_next, output, 1, now)?;
+        Ok(self.state() == TcpState::Closed)
+    }
+
+    fn handle_disconnect(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        context: &mut SessionQueueControlContext,
+        output_next: SessionQueueNext,
+        output: &mut SessionQueueOutput,
+    ) -> CoreResult<bool> {
+        self.on_session_close();
         let now = std::time::Instant::now();
         let _ = self.custom_tx(runtime, context, output_next, output, 1, now)?;
         Ok(self.state() == TcpState::Closed)

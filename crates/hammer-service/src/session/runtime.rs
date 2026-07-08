@@ -8,9 +8,8 @@ use hammer_adapter::{
     buffer::{Frame, Next},
 };
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_infra::bihash::Bihash;
 use hammer_infra::fifo_queue::FifoQueue;
-use hammer_infra::msg_queue::MsgQueue;
+use hammer_infra::msg_queue::{MsgQueue, SessionEvtType};
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 
 use hammer_infra::segment::{Local, Segment, Svm};
@@ -31,6 +30,11 @@ const SESSION_TIMER_KIND_COUNT: usize = u32::BITS as usize;
 struct ExpiredTimer {
     session_id: SessionId,
     timer_id: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionControlEvent {
+    Disconnect(SessionId),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -55,6 +59,7 @@ pub struct WorkerSessionRuntime {
     timers: TimerWheel1t2w2048sl<u32>,
     expired_timers: hammer_infra::vec::Vec<u32>,
     pending_timers: FifoQueue<ExpiredTimer>,
+    control_events: FifoQueue<SessionControlEvent>,
     timer_tick_duration: Duration,
     last_timer_tick: Instant,
 }
@@ -79,6 +84,7 @@ impl WorkerSessionRuntime {
             timers: TimerWheel1t2w2048sl::with_timer_ids(0, SESSION_TIMER_KIND_COUNT),
             expired_timers: hammer_infra::vec::Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
             pending_timers: FifoQueue::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
+            control_events: FifoQueue::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
             timer_tick_duration,
             last_timer_tick,
         }
@@ -113,6 +119,11 @@ impl WorkerSessionRuntime {
     ) {
         session_work.clear();
         self.session_work_scratch = session_work;
+    }
+
+    #[inline]
+    fn schedule_control_event(&mut self, event: SessionControlEvent) {
+        self.control_events.push_back(event);
     }
 
     pub(crate) fn poll_once_for_ticks<F>(
@@ -205,7 +216,6 @@ struct SessionDriverRuntimeCore<St> {
     sessions: WorkerSessionRuntime,
     entries: Pool<SessionEntry<St>>,
     buffers: DataPlaneBuffers,
-    pending_closes: Bihash<u64, 7>,
 }
 
 struct SessionDriverRuntimeAppState<Seg: Segment> {
@@ -257,7 +267,14 @@ pub trait SessionQueueProtocol: Sized {
         &mut self,
         runtime: &DataPlaneRuntime,
         context: &mut crate::session::protocol::SessionQueueControlContext,
-        close_requested: bool,
+        output_next: crate::session::SessionQueueNext,
+        output: &mut crate::session::node::SessionQueueOutput,
+    ) -> CoreResult<bool>;
+
+    fn handle_disconnect(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        context: &mut crate::session::protocol::SessionQueueControlContext,
         output_next: crate::session::SessionQueueNext,
         output: &mut crate::session::node::SessionQueueOutput,
     ) -> CoreResult<bool>;
@@ -340,8 +357,6 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
                 sessions: WorkerSessionRuntime::new(worker),
                 entries: Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
                 buffers,
-
-                pending_closes: Bihash::new(DEFAULT_SESSION_POOL_CAPACITY as u32),
             }),
             app_state: CachePadded::new(SessionDriverRuntimeAppState {
                 app,
@@ -396,7 +411,6 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
     }
 
     pub(crate) fn remove_session(&mut self, id: SessionId) -> Option<St> {
-        self.runtime.pending_closes.remove(&id.get());
         self.app_state.app.discard_all_tx_bytes_for_session(id);
         let _ = self.app_state.app.detach_session(id);
         let handle = SessionHandle::new(id.pool_index().slot(), self.worker().slot() as u32);
@@ -474,17 +488,18 @@ impl<St, Seg: Segment> SessionDriverRuntime<St, Seg> {
         let SessionDriverRuntimeCore {
             sessions, entries, ..
         } = core;
-        app.drain_tx_events_to(|session_id| {
-            if mark_schedule_pending(entries, session_id) {
-                sessions.schedule_session_work(session_id);
+        app.drain_tx_events_to(|session_id, evt_type| match evt_type {
+            SessionEvtType::TxDeq => {
+                if mark_schedule_pending(entries, session_id) {
+                    sessions.schedule_session_work(session_id);
+                }
             }
+            SessionEvtType::Close => {
+                sessions.schedule_control_event(SessionControlEvent::Disconnect(session_id));
+            }
+            SessionEvtType::RxEnq | SessionEvtType::Connect => {}
         });
         Ok(())
-    }
-
-    #[inline]
-    pub(crate) fn take_close_request(&mut self, session_id: SessionId) -> bool {
-        self.runtime.pending_closes.remove(&session_id.get())
     }
 
     #[inline]
@@ -728,6 +743,30 @@ where
     f(state, &mut context)
 }
 
+unsafe fn close_session_from_protocol<St, Seg>(
+    driver: *mut SessionDriverRuntime<St, Seg>,
+    session_id: SessionId,
+) -> CoreResult<()>
+where
+    St: SessionQueueProtocol,
+    Seg: Segment,
+    SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
+{
+    let driver_ref = unsafe { &mut *driver };
+    if driver_ref.session(session_id).is_none() {
+        return Ok(());
+    }
+    {
+        let state = driver_ref
+            .session_mut(session_id)
+            .ok_or_else(|| CoreError::internal("session is missing"))?;
+        let mut context = unsafe { session_queue_context(driver, session_id) };
+        state.on_close(&mut context);
+    }
+    let _ = driver_ref.close_session(session_id)?;
+    Ok(())
+}
+
 pub fn dispatch_session_queue_pending<St, Seg: Segment>(
     runtime: &DataPlaneRuntime,
     driver: &mut SessionDriverRuntime<St, Seg>,
@@ -760,16 +799,26 @@ where
         };
         if close_current {
             let id = expired_timer.session_id;
-            unsafe {
-                let driver_ref = &mut *driver;
-                let state = driver_ref
-                    .session_mut(id)
-                    .ok_or_else(|| CoreError::internal("session is missing"))?;
-                let mut context = session_queue_context(driver, id);
-                state.on_close(&mut context);
-                let _ = state;
-                let _ = driver_ref.close_session(id)?;
-            }
+            unsafe { close_session_from_protocol(driver, id)? };
+        }
+    }
+    let control_event_count = driver.runtime.sessions.control_events.len();
+    for _ in 0..control_event_count {
+        let Some(event) = driver.runtime.sessions.control_events.pop_front() else {
+            break;
+        };
+        let SessionControlEvent::Disconnect(session_id) = event;
+        if driver.session(session_id).is_none() {
+            continue;
+        }
+        let driver_ptr = driver as *mut SessionDriverRuntime<St, Seg>;
+        let close_current = unsafe {
+            with_session_state(driver_ptr, session_id, |state, context| {
+                state.handle_disconnect(runtime, context, output_next, output)
+            })?
+        };
+        if close_current {
+            unsafe { close_session_from_protocol(driver_ptr, session_id)? };
         }
     }
     let session_work = driver.take_scheduled_session_work();
@@ -779,23 +828,14 @@ where
         if driver.session(session_id).is_none() {
             continue;
         }
-        let close_requested = driver.take_close_request(session_id);
         let driver_ptr = driver as *mut SessionDriverRuntime<St, Seg>;
         let close_current = unsafe {
             with_session_state(driver_ptr, session_id, |state, context| {
-                state.handle_ready_session(runtime, context, close_requested, output_next, output)
+                state.handle_ready_session(runtime, context, output_next, output)
             })?
         };
         if close_current {
-            unsafe {
-                let driver_ref = &mut *driver_ptr;
-                let state = driver_ref
-                    .session_mut(session_id)
-                    .ok_or_else(|| CoreError::internal("session is missing"))?;
-                let mut context = session_queue_context(driver_ptr, session_id);
-                state.on_close(&mut context);
-                let _ = driver_ref.close_session(session_id)?;
-            }
+            unsafe { close_session_from_protocol(driver_ptr, session_id)? };
             continue;
         }
         let mut requeue = false;
@@ -887,6 +927,7 @@ mod tests {
         BufferFrame, InternalNode, Node, NodeId, NodeProcessFn, NodeRegistration, NodeResult,
         NodeRuntimeData,
     };
+    use hammer_infra::msg_queue::{SessionEvt, SessionEvtType};
     use hammer_runtime::app::AppSession;
 
     fn infra_vec<T>(items: impl IntoIterator<Item = T>) -> hammer_infra::vec::Vec<T> {
@@ -938,7 +979,16 @@ mod tests {
             &mut self,
             _: &DataPlaneRuntime,
             _: &mut SessionQueueControlContext,
-            _: bool,
+            _: crate::session::SessionQueueNext,
+            _: &mut crate::session::node::SessionQueueOutput,
+        ) -> CoreResult<bool> {
+            Ok(false)
+        }
+
+        fn handle_disconnect(
+            &mut self,
+            _: &DataPlaneRuntime,
+            _: &mut SessionQueueControlContext,
             _: crate::session::SessionQueueNext,
             _: &mut crate::session::node::SessionQueueOutput,
         ) -> CoreResult<bool> {
@@ -1004,7 +1054,16 @@ mod tests {
             &mut self,
             _: &DataPlaneRuntime,
             _: &mut SessionQueueControlContext,
-            _: bool,
+            _: crate::session::SessionQueueNext,
+            _: &mut crate::session::node::SessionQueueOutput,
+        ) -> CoreResult<bool> {
+            Ok(false)
+        }
+
+        fn handle_disconnect(
+            &mut self,
+            _: &DataPlaneRuntime,
+            _: &mut SessionQueueControlContext,
             _: crate::session::SessionQueueNext,
             _: &mut crate::session::node::SessionQueueOutput,
         ) -> CoreResult<bool> {
@@ -1070,13 +1129,22 @@ mod tests {
             &mut self,
             _: &DataPlaneRuntime,
             context: &mut SessionQueueControlContext,
-            _: bool,
             _: crate::session::SessionQueueNext,
             _: &mut crate::session::node::SessionQueueOutput,
         ) -> CoreResult<bool> {
             self.ready_calls += 1;
             context.mark_ready();
             context.mark_ready();
+            Ok(false)
+        }
+
+        fn handle_disconnect(
+            &mut self,
+            _: &DataPlaneRuntime,
+            _: &mut SessionQueueControlContext,
+            _: crate::session::SessionQueueNext,
+            _: &mut crate::session::node::SessionQueueOutput,
+        ) -> CoreResult<bool> {
             Ok(false)
         }
 
@@ -1111,6 +1179,83 @@ mod tests {
         }
 
         fn on_close(&mut self, _: &mut SessionQueueControlContext) {}
+    }
+
+    #[derive(Default)]
+    struct EventClassificationProtocol {
+        ready_calls: usize,
+        disconnect_calls: usize,
+        close_calls: usize,
+        close_removes: bool,
+    }
+
+    impl SessionQueueProtocol for EventClassificationProtocol {
+        fn handle_expired_timer(
+            &mut self,
+            _: &DataPlaneRuntime,
+            _: &mut SessionQueueControlContext,
+            _: u32,
+            _: crate::session::SessionQueueNext,
+            _: &mut crate::session::node::SessionQueueOutput,
+        ) -> CoreResult<bool> {
+            Ok(false)
+        }
+
+        fn handle_ready_session(
+            &mut self,
+            _: &DataPlaneRuntime,
+            _: &mut SessionQueueControlContext,
+            _: crate::session::SessionQueueNext,
+            _: &mut crate::session::node::SessionQueueOutput,
+        ) -> CoreResult<bool> {
+            self.ready_calls += 1;
+            Ok(false)
+        }
+
+        fn handle_disconnect(
+            &mut self,
+            _: &DataPlaneRuntime,
+            _: &mut SessionQueueControlContext,
+            _: crate::session::SessionQueueNext,
+            _: &mut crate::session::node::SessionQueueOutput,
+        ) -> CoreResult<bool> {
+            self.disconnect_calls += 1;
+            Ok(self.close_removes)
+        }
+
+        fn send_params(
+            &mut self,
+            _: &mut SessionQueueControlContext,
+            _: usize,
+            _: Instant,
+        ) -> CoreResult<TransportSendParams> {
+            Err(CoreError::internal("transport send_params must not run"))
+        }
+
+        fn push_header(
+            &mut self,
+            _: &mut SessionQueueControlContext,
+            _: &[TxBatchBuffer],
+            _: Instant,
+        ) -> CoreResult<()> {
+            Err(CoreError::internal("transport push_header must not run"))
+        }
+
+        fn custom_tx(
+            &mut self,
+            _: &DataPlaneRuntime,
+            _: &mut SessionQueueControlContext,
+            _: crate::session::SessionQueueNext,
+            _: &mut crate::session::node::SessionQueueOutput,
+            _: usize,
+            _: Instant,
+        ) -> CoreResult<usize> {
+            Ok(0)
+        }
+
+        fn on_close(&mut self, _: &mut SessionQueueControlContext) {
+            self.close_calls += 1;
+        }
     }
 
     #[derive(Default)]
@@ -1505,6 +1650,162 @@ mod tests {
 
         assert_eq!(step.scheduled_sessions, 1);
         assert_eq!(driver.session(session_id).expect("state").ready_calls, 2);
+    }
+
+    fn attach_app_session<St>(
+        driver: &mut SessionDriverRuntime<St, Local>,
+        session_id: SessionId,
+    ) -> Arc<AppSession<Local>> {
+        let app_session = Arc::new(
+            AppSession::<Local>::new_in_segment(
+                Local::default(),
+                AppSessionConfig::new(256, 64),
+                SessionHandle::new(session_id.pool_index().slot() as u32, 0),
+                driver.app().tx_evt_q().clone(),
+            )
+            .expect("create app session"),
+        );
+        driver
+            .app_mut()
+            .attach_session(session_id, Arc::clone(&app_session));
+        app_session
+    }
+
+    fn enqueue_runtime_event<St>(
+        driver: &SessionDriverRuntime<St, Local>,
+        session_id: SessionId,
+        evt_type: SessionEvtType,
+    ) {
+        driver
+            .app()
+            .tx_evt_q()
+            .enqueue(SessionEvt {
+                session_index: session_id.pool_index().slot(),
+                evt_type,
+            })
+            .expect("enqueue runtime event");
+    }
+
+    #[test]
+    fn app_tx_deq_event_schedules_session_work() {
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 2048,
+                    buffer_slots: 16,
+                    frame_capacity: 8,
+                    frame_slots: 8,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
+        let mut driver = SessionDriverRuntime::<EventClassificationProtocol, Local>::new(
+            DataWorkerId::new(0),
+            runtime.buffers().clone(),
+        );
+        let session_id = driver.insert_session(EventClassificationProtocol::default());
+        let _app_session = attach_app_session(&mut driver, session_id);
+        enqueue_runtime_event(&driver, session_id, SessionEvtType::TxDeq);
+        let next: crate::session::SessionQueueNext = NodeId::new(9).into();
+        let mut output = crate::session::node::SessionQueueOutput::default();
+        let mut step = driver.poll_once_for_ticks(0).expect("poll");
+
+        dispatch_session_queue_pending(
+            &runtime,
+            &mut driver,
+            next,
+            &mut output,
+            &mut step,
+            Instant::now(),
+        )
+        .expect("dispatch tx event");
+
+        let protocol = driver.session(session_id).expect("protocol state");
+        assert_eq!(step.scheduled_sessions, 1);
+        assert_eq!(protocol.ready_calls, 1);
+        assert_eq!(protocol.disconnect_calls, 0);
+        assert_eq!(protocol.close_calls, 0);
+    }
+
+    #[test]
+    fn app_close_event_dispatches_disconnect_control_event() {
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 2048,
+                    buffer_slots: 16,
+                    frame_capacity: 8,
+                    frame_slots: 8,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
+        let mut driver = SessionDriverRuntime::<EventClassificationProtocol, Local>::new(
+            DataWorkerId::new(0),
+            runtime.buffers().clone(),
+        );
+        let session_id = driver.insert_session(EventClassificationProtocol::default());
+        let _app_session = attach_app_session(&mut driver, session_id);
+        enqueue_runtime_event(&driver, session_id, SessionEvtType::Close);
+        let next: crate::session::SessionQueueNext = NodeId::new(9).into();
+        let mut output = crate::session::node::SessionQueueOutput::default();
+        let mut step = driver.poll_once_for_ticks(0).expect("poll");
+
+        dispatch_session_queue_pending(
+            &runtime,
+            &mut driver,
+            next,
+            &mut output,
+            &mut step,
+            Instant::now(),
+        )
+        .expect("dispatch close event");
+
+        let protocol = driver.session(session_id).expect("protocol state");
+        assert_eq!(step.scheduled_sessions, 0);
+        assert_eq!(protocol.ready_calls, 0);
+        assert_eq!(protocol.disconnect_calls, 1);
+        assert_eq!(protocol.close_calls, 0);
+    }
+
+    #[test]
+    fn same_turn_close_dispatches_before_tx_work_and_skips_removed_session() {
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+                buffers: hammer_adapter::DataPlaneBufferConfig {
+                    buffer_slot_capacity: 2048,
+                    buffer_slots: 16,
+                    frame_capacity: 8,
+                    frame_slots: 8,
+                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                },
+            });
+        let mut driver = SessionDriverRuntime::<EventClassificationProtocol, Local>::new(
+            DataWorkerId::new(0),
+            runtime.buffers().clone(),
+        );
+        let session_id = driver.insert_session(EventClassificationProtocol {
+            close_removes: true,
+            ..EventClassificationProtocol::default()
+        });
+        let app_session = attach_app_session(&mut driver, session_id);
+        app_session.send_bytes(b"tx").expect("send pending tx");
+        enqueue_runtime_event(&driver, session_id, SessionEvtType::Close);
+        let next: crate::session::SessionQueueNext = NodeId::new(9).into();
+        let mut output = crate::session::node::SessionQueueOutput::default();
+        let mut step = driver.poll_once_for_ticks(0).expect("poll");
+
+        dispatch_session_queue_pending(
+            &runtime,
+            &mut driver,
+            next,
+            &mut output,
+            &mut step,
+            Instant::now(),
+        )
+        .expect("dispatch close plus tx");
+
+        assert_eq!(step.scheduled_sessions, 1);
+        assert!(driver.session(session_id).is_none());
+        assert!(driver.take_scheduled_session_work().is_empty());
     }
 
     #[test]

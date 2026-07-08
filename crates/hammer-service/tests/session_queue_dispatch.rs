@@ -77,7 +77,16 @@ impl SessionQueueProtocol for TestTxProtocol {
         &mut self,
         _: &DataPlaneRuntime,
         _: &mut SessionQueueControlContext,
-        _: bool,
+        _: SessionQueueNext,
+        _: &mut hammer_service::session::node::SessionQueueOutput,
+    ) -> CoreResult<bool> {
+        Ok(false)
+    }
+
+    fn handle_disconnect(
+        &mut self,
+        _: &DataPlaneRuntime,
+        _: &mut SessionQueueControlContext,
         _: SessionQueueNext,
         _: &mut hammer_service::session::node::SessionQueueOutput,
     ) -> CoreResult<bool> {

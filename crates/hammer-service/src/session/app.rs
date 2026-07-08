@@ -257,7 +257,7 @@ impl<S: Segment> SessionAppRuntime<S> {
 
     pub(crate) fn drain_tx_events_to(
         &self,
-        mut schedule_session_work: impl FnMut(SessionId),
+        mut dispatch_event: impl FnMut(SessionId, SessionEvtType),
     ) -> usize {
         let mut scheduled = 0usize;
         let mut batch = [SessionEvt {
@@ -278,9 +278,11 @@ impl<S: Segment> SessionAppRuntime<S> {
                 let Some(session) = self.sessions.lookup(&session_id.get()) else {
                     continue;
                 };
-                session.clear_tx_event();
-                schedule_session_work(*session_id);
-                scheduled += 1;
+                if evt.evt_type == SessionEvtType::TxDeq {
+                    session.clear_tx_event();
+                    scheduled += 1;
+                }
+                dispatch_event(*session_id, evt.evt_type);
             }
             if count < batch.len() {
                 break;
