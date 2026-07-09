@@ -5,16 +5,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
-use hammer_adapter::{
-    DataPlaneHandoff, DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig,
-    DataWorkerId, FrameBatchWidth,
-};
 use hammer_core::data_plane::{
     BufferFrame, BufferFramePairBatch, BufferFrameQuadBatch, BufferIndex, BufferPacketCursor,
     BufferPool, BufferPoolArena, BufferRefMut, DataPlaneBufferConfig, DataPlaneBuffers, NodeId,
 };
 use hammer_core::error::CoreResult;
 use hammer_infra::vec::Vec;
+use hammer_runtime::{
+    DataPlaneHandoff, DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig,
+    DataWorkerId, FrameBatchWidth,
+};
 
 trait CleanupOwner {
     fn drop_index_owned(&self, index: BufferIndex);

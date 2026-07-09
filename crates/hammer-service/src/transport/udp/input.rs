@@ -2,15 +2,15 @@ use std::mem::{size_of, transmute};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use hammer_adapter::{
-    DataPlaneRuntime, Node, NodeResult, PacketTrace, TraceFormatter, add_packet_trace,
-};
 use hammer_core::data_plane::{BufferFrame, BufferIndex, NodeId, NodeNextStorage, SecondaryOpaque};
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
 use hammer_core::protocol::transport::UdpHeader;
 use hammer_core::protocol::wire::read_header;
 use hammer_infra::boxed::Slice;
+use hammer_runtime::{
+    DataPlaneRuntime, Node, NodeResult, PacketTrace, TraceFormatter, add_packet_trace,
+};
 
 use crate::data_plane::set_index_node_error_code;
 use crate::net::NetworkOpaque;
@@ -251,7 +251,7 @@ fn udp_input_process_frame(
     snapshot: &UdpInputSnapshot,
     next: &[NodeId; UdpInputNext::COUNT],
 ) -> NodeResult {
-    hammer_adapter::process_frame!(runtime, frame, |index| {
+    hammer_runtime::process_frame!(runtime, frame, |index| {
         match next_node_for_index(runtime, index, snapshot, next) {
             Ok(Some(node)) => node,
             _ => NodeNextStorage::next(next, UdpInputNext::Drop),

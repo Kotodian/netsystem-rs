@@ -3,12 +3,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossbeam_utils::CachePadded;
-use hammer_adapter::{DataPlaneRuntime, DataWorkerId, NodeRuntimeData};
 use hammer_core::data_plane::{BufferIndex, DataPlaneBuffers, Frame, Next};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::fifo_queue::FifoQueue;
 use hammer_infra::msg_queue::{MsgQueue, SessionEvtType};
 use hammer_infra::pool::{Index as PoolIndex, Pool};
+use hammer_runtime::{DataPlaneRuntime, DataWorkerId, NodeRuntimeData};
 
 use hammer_infra::segment::{Local, Segment, Svm};
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
@@ -995,10 +995,10 @@ mod tests {
     use std::sync::{Arc, Mutex, OnceLock};
 
     use crate::session::protocol::SessionQueueControlContext;
-    use hammer_adapter::{InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
     use hammer_core::data_plane::{BufferFrame, NodeId, NodeRegistration};
     use hammer_infra::msg_queue::{SessionEvt, SessionEvtType};
     use hammer_runtime::app::AppSession;
+    use hammer_runtime::{InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
 
     fn infra_vec<T>(items: impl IntoIterator<Item = T>) -> hammer_infra::vec::Vec<T> {
         let mut values = hammer_infra::vec::Vec::new();
@@ -1624,7 +1624,7 @@ mod tests {
         SessionId,
     ) {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
@@ -1971,7 +1971,7 @@ mod tests {
     #[test]
     fn session_driver_runtime_suppresses_duplicate_session_work_and_reschedules_after_drain() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
@@ -2006,7 +2006,7 @@ mod tests {
     #[test]
     fn session_driver_runtime_context_schedules_session_work() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
@@ -2042,7 +2042,7 @@ mod tests {
     #[test]
     fn session_context_mark_ready_coalesces_duplicate_requests_during_dispatch() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
@@ -2093,7 +2093,7 @@ mod tests {
     #[test]
     fn timer_handler_schedules_session_work_through_context() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
@@ -2173,7 +2173,7 @@ mod tests {
     #[test]
     fn app_tx_deq_event_schedules_session_work() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
@@ -2213,7 +2213,7 @@ mod tests {
     #[test]
     fn app_close_event_dispatches_disconnect_control_event() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
@@ -2253,7 +2253,7 @@ mod tests {
     #[test]
     fn same_turn_close_dispatches_before_tx_work_and_skips_removed_session() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
@@ -2295,7 +2295,7 @@ mod tests {
     #[test]
     fn same_turn_close_skips_tx_work_when_disconnect_keeps_session_allocated() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
@@ -2360,7 +2360,7 @@ mod tests {
     #[test]
     fn same_turn_close_skips_expired_timer_dispatch_for_same_session() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
@@ -2406,7 +2406,7 @@ mod tests {
     #[test]
     fn session_tx_does_not_call_transport_when_app_has_no_pending_send() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
@@ -2447,7 +2447,7 @@ mod tests {
     #[test]
     fn session_tx_desched_flag_leaves_session_unqueued_when_send_space_is_zero() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
@@ -2508,7 +2508,7 @@ mod tests {
     #[test]
     fn session_tx_postpone_flag_requeues_remaining_data_when_send_space_is_zero() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,

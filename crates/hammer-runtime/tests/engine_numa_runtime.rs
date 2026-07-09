@@ -1,7 +1,7 @@
-use hammer_adapter::{DataPlaneRuntime, DataPlaneRuntimeConfig};
 use hammer_core::data_plane::DataPlaneBufferConfig;
 use hammer_core::registry::RuntimeRegistry;
 use hammer_runtime::engine::Engine;
+use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig};
 
 fn test_runtime() -> DataPlaneRuntime {
     let buffers = DataPlaneBufferConfig {

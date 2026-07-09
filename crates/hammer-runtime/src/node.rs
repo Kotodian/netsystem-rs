@@ -13,7 +13,7 @@ use hammer_core::data_plane::{
 use hammer_core::error::{CoreError, CoreResult, DataPlaneError};
 use hammer_infra::boxed::Slice;
 
-use crate::buffer::DataPlaneRuntime;
+use crate::DataPlaneRuntime;
 use crate::trace::TraceFormatter;
 
 pub mod next;

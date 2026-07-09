@@ -1,40 +1,21 @@
-pub mod buffer;
 pub mod certificate;
 pub mod component;
 pub mod connection;
-pub mod handoff;
-pub mod instruction_set;
 pub mod network;
-pub mod node;
 pub mod platform;
 pub mod service;
-pub mod trace;
 pub mod wakeup;
 
-pub use buffer::{DataPlaneRuntime, DataPlaneRuntimeConfig};
 pub use hammer_core::protocol::icmp::IcmpErrorMetadata;
 pub use hammer_core::{Network, SocksAddr};
 pub use hammer_infra::hint::unlikely;
-pub use handoff::{DataPlaneHandoff, DataPlaneHandoffWorker, DataWorkerId};
-pub use instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
 
-// Re-exports used by the runtime crate so it doesn't have to know which
-// sub-module each trait lives in.
 pub use certificate::CertificateProviderService;
 pub use component::{
     AsAnyComponent, ComponentMeta, ComponentMetadata, ComponentMetricsMeta, RuntimeComponent,
 };
 pub use connection::ConnectionHandle;
 pub use network::NetworkManager;
-pub use node::{
-    DriverNode, InternalNode, Node, NodeDescriptor, NodeEntry, NodeErrorCounters, NodeProcessFn,
-    NodeResult, NodeRuntime, NodeRuntimeData, NodeRuntimeReady, NoopNode, default_prefetch_indices,
-};
 pub use platform::{
     DefaultInterfaceUpdateListener, NetworkInterface, PlatformInterface, TunOptions, WifiState,
-};
-
-pub use trace::{
-    PacketTrace, TraceControlHandle, TraceControlPlane, TraceEntry, TraceFormatter,
-    TraceInputPolicy, TracePolicy, TraceRecord, TraceRecordSink,
 };

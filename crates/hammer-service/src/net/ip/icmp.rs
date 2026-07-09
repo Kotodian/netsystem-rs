@@ -3,10 +3,6 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwap;
-use hammer_adapter::{
-    DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
-    TraceFormatter, add_packet_trace,
-};
 use hammer_core::data_plane::{
     BufferFrame, BufferIndex, BufferPacketCursor, NodeId, NodeNextStorage, SecondaryOpaque,
 };
@@ -16,6 +12,10 @@ use hammer_core::protocol::icmp::{
     build_echo_reply, build_icmp_error_packet,
 };
 use hammer_core::protocol::wire::read_header;
+use hammer_runtime::{
+    DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
+    TraceFormatter, add_packet_trace,
+};
 
 use crate::data_plane::set_index_node_error_code;
 use crate::net::NetworkOpaque;
@@ -835,7 +835,7 @@ fn icmp_input_process_frame(
     frame: &mut BufferFrame,
     snapshot: &IcmpInputSnapshot,
 ) -> NodeResult {
-    hammer_adapter::process_frame!(runtime, frame, |index| {
+    hammer_runtime::process_frame!(runtime, frame, |index| {
         match next_node_for_index(runtime, index, snapshot) {
             Ok(node) => node,
             Err(_) => snapshot.default_next(IpVersion::V4),
@@ -848,7 +848,7 @@ fn icmp_echo_request_process_frame(
     frame: &mut BufferFrame,
     next: [NodeId; IcmpEchoRequestNext::COUNT],
 ) -> NodeResult {
-    hammer_adapter::process_frame!(runtime, frame, |index| {
+    hammer_runtime::process_frame!(runtime, frame, |index| {
         match next_node_for_echo_request_index(runtime, index, next) {
             Ok(node) => node,
             Err(_) => NodeNextStorage::next(&next, IcmpEchoRequestNext::Drop),
@@ -862,7 +862,7 @@ fn icmp_error_process_frame(
     next: [NodeId; IcmpErrorNext::COUNT],
     source_table: Option<&IcmpErrorSourceSnapshot>,
 ) -> NodeResult {
-    hammer_adapter::process_frame!(runtime, frame, |index| {
+    hammer_runtime::process_frame!(runtime, frame, |index| {
         match next_node_for_icmp_error_index(runtime, index, next, source_table) {
             Ok(node) => node,
             Err(_) => NodeNextStorage::next(&next, IcmpErrorNext::Drop),

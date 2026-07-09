@@ -7,13 +7,13 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use hammer_adapter::{
-    DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, PacketTrace, TraceFormatter,
-    add_packet_trace,
-};
 use hammer_core::data_plane::{Buffer, BufferFrame, BufferIndex, NodeId, NodeRegistration};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_runtime::DataPlaneBarrierHandle;
+use hammer_runtime::{
+    DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, PacketTrace, TraceFormatter,
+    add_packet_trace,
+};
 
 use crate::trace::codec::put_usize;
 
@@ -110,7 +110,7 @@ impl Node for DropNode {
 
 fn drop_node_process(
     runtime: &DataPlaneRuntime,
-    _data: hammer_adapter::node::NodeRuntimeData,
+    _data: hammer_runtime::node::NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> NodeResult {
     let dropped = frame.pending_len();
@@ -188,7 +188,7 @@ impl Node for HandoffNode {
 
 fn handoff_node_process(
     runtime: &DataPlaneRuntime,
-    _data: hammer_adapter::node::NodeRuntimeData,
+    _data: hammer_runtime::node::NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> NodeResult {
     next_feature_frame(runtime, frame)
@@ -211,7 +211,7 @@ mod tests {
     #[test]
     fn drop_node_releases_owned_buffers_when_owner_drops_after_processing() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 64,
                     buffer_slots: 4,
@@ -237,7 +237,7 @@ mod tests {
 
         let _result = drop_node_process(
             &runtime,
-            hammer_adapter::NodeRuntimeData::empty(),
+            hammer_runtime::NodeRuntimeData::empty(),
             &mut frame,
         );
 
@@ -249,7 +249,7 @@ mod tests {
     #[test]
     fn handoff_node_routes_packet_to_metadata_selected_next() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 64,
                     buffer_slots: 4,
@@ -542,7 +542,7 @@ pub fn next_feature_node_for_index(runtime: &DataPlaneRuntime, index: BufferInde
 
 #[inline(always)]
 pub fn next_feature_frame(runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
-    hammer_adapter::process_frame!(runtime, frame, |index| {
+    hammer_runtime::process_frame!(runtime, frame, |index| {
         next_feature_node_for_index(runtime, index)
     })
 }

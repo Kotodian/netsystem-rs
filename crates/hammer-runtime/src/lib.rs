@@ -1,8 +1,5 @@
 extern crate self as hammer_runtime;
 
-// Re-export adapter types so the macros don't need fully-qualified paths and
-// downstream call sites can `use hammer_runtime::adapter::Lifecycle` if they
-// prefer the runtime crate's namespace.
 pub mod engine;
 pub use engine::{Engine, EnginePool};
 pub mod barrier;
@@ -11,16 +8,39 @@ pub mod main_loop;
 pub mod memory;
 
 pub mod adapter {
-    pub use hammer_adapter::*;
+    pub use hammer_adapter::{
+        AsAnyComponent, CertificateProviderService, ComponentMeta, ComponentMetadata,
+        ComponentMetricsMeta, ConnectionHandle, DefaultInterfaceUpdateListener, Network,
+        NetworkInterface, NetworkManager, PlatformInterface, RuntimeComponent, SocksAddr,
+        TunOptions, WifiState,
+    };
 }
 
 pub use hammer_core::error::{HammerError, HammerResult};
+pub use hammer_core::protocol::icmp::IcmpErrorMetadata;
+pub use hammer_core::{Network, SocksAddr};
+pub use hammer_infra::hint::unlikely;
 
 pub mod app;
 pub mod attach;
 mod control_thread;
-mod data_plane;
-pub use data_plane::new_worker_runtime;
+pub mod data_plane;
+pub mod handoff;
+pub mod instruction_set;
+pub mod node;
+pub mod trace;
+pub use data_plane::{DataPlaneRuntime, DataPlaneRuntimeConfig, new_worker_runtime};
+pub use handoff::{DataPlaneHandoff, DataPlaneHandoffWorker, DataWorkerId};
+pub use instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
+pub use node::{
+    DriverNode, InternalNode, Node, NodeDescriptor, NodeEntry, NodeErrorCounters, NodeProcessFn,
+    NodeResult, NodeRuntime, NodeRuntimeData, NodeRuntimeReady, NodeRuntimeStatsRow, NoopNode,
+    default_prefetch_indices,
+};
+pub use trace::{
+    PacketTrace, TraceControlHandle, TraceControlPlane, TraceEntry, TraceFormatter,
+    TraceInputPolicy, TracePolicy, TraceRecord, TraceRecordSink,
+};
 pub mod graph;
 
 mod numa;

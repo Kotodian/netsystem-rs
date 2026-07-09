@@ -2,9 +2,9 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, Mutex};
 
-use hammer_adapter::DataPlaneRuntime;
 use hammer_core::error::HammerResult;
 use hammer_core::registry::RuntimeRegistry;
+use hammer_runtime::DataPlaneRuntime;
 
 thread_local! {
     static CURRENT_ENGINE: RefCell<Option<*mut Engine>> = const { RefCell::new(None) };
@@ -209,9 +209,9 @@ impl EnginePool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hammer_adapter::{DataPlaneRuntime, DataPlaneRuntimeConfig};
     use hammer_core::data_plane::DataPlaneBufferConfig;
     use hammer_core::registry::RuntimeRegistry;
+    use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig};
     use std::sync::Arc;
 
     fn test_runtime() -> DataPlaneRuntime {

@@ -3,10 +3,6 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwap;
-use hammer_adapter::{
-    DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
-    TraceFormatter, add_packet_trace,
-};
 use hammer_core::data_plane::{
     BufferFrame, BufferIndex, BufferPacketCursor, NodeId, NodeNextStorage,
 };
@@ -16,6 +12,10 @@ use hammer_core::protocol::tcp::TcpWireHeader;
 use hammer_core::protocol::transport::UdpHeader;
 use hammer_core::protocol::wire::read_header;
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
+use hammer_runtime::{
+    DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
+    TraceFormatter, add_packet_trace,
+};
 
 use crate::data_plane::{FeatureArcStartHandle, set_index_node_error_code};
 use crate::net::{DpoType, FibLookupResult, FibTableHandle, NetworkOpaque};
@@ -503,7 +503,7 @@ fn process_frame(
     stage: LocalStage,
     feature_arc: Option<&FeatureArcStartHandle>,
 ) -> NodeResult {
-    hammer_adapter::process_frame!(runtime, frame, |index| {
+    hammer_runtime::process_frame!(runtime, frame, |index| {
         match process_index(runtime, index, state, &next, stage, feature_arc) {
             Ok(node) => node,
             Err(_) => state.drop_next(&next),

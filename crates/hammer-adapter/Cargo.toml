@@ -12,16 +12,8 @@ hammer-core = { path = "../hammer-core" }
 hammer-infra = { path = "../hammer-infra" }
 async-trait = { workspace = true }
 bytes = { workspace = true }
-crossbeam-queue = { workspace = true }
 crossbeam-utils = { workspace = true }
 ipnet = { workspace = true }
 tokio = { workspace = true }
 libc = { workspace = true }
 spinning_top = { workspace = true }
-
-[dev-dependencies]
-criterion = { workspace = true }
-
-[[bench]]
-name = "buffer_alloc_free"
-harness = false

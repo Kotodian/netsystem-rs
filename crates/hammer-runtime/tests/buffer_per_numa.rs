@@ -1,21 +1,22 @@
 use std::sync::Arc;
 
-use hammer_adapter::{
-    DataPlaneHandoff, DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig,
-    DataWorkerId,
-};
 use hammer_core::data_plane::{
     BufferPool, BufferPoolArena, DataPlaneBufferConfig, DataPlaneBuffers, NodeId,
 };
 use hammer_infra::heap::Heap;
+use hammer_runtime::{
+    DataPlaneHandoff, DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig,
+    DataWorkerId,
+};
 
 fn runtime_config(
     slot_capacity: usize,
     slots: usize,
     frame_capacity: usize,
     frame_slots: usize,
-    _: DataPlaneInstructionSet,
+    instruction_set: DataPlaneInstructionSet,
 ) -> DataPlaneRuntimeConfig {
+    let _ = instruction_set;
     DataPlaneRuntimeConfig {
         buffers: DataPlaneBufferConfig {
             buffer_slot_capacity: slot_capacity,

@@ -3,16 +3,16 @@ use std::fmt;
 use std::mem::transmute;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use hammer_adapter::{
-    DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
-    TraceFormatter, add_packet_trace,
-};
 use hammer_core::data_plane::{BufferFrame, BufferIndex, NodeId, NodeRegistration};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::forwarding::AdjacencyRewrite;
 use hammer_infra::map::{FlatHashKey, FlatHashTable};
 use hammer_infra::vec::Vec;
 use hammer_runtime::DataPlaneBarrierHandle;
+use hammer_runtime::{
+    DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
+    TraceFormatter, add_packet_trace,
+};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 
 use crate::data_plane::set_index_node_error_code;
@@ -970,7 +970,7 @@ fn interface_output_process_frame(
         .nodes()
         .node_by_name("drop")
         .expect("interface_output_process_frame: drop node not registered");
-    hammer_adapter::process_frame!(runtime, frame, |index| {
+    hammer_runtime::process_frame!(runtime, frame, |index| {
         match InterfaceOutputNode::tx_for_index(output, runtime, index, drop_next) {
             Ok(node) => node,
             Err(_) => drop_next,

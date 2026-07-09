@@ -2,8 +2,8 @@ use std::mem::transmute;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
-use hammer_adapter::{DataPlaneRuntime, TraceControlPlane, TraceInputPolicy, TracePolicy};
 use hammer_core::config::Config;
+use hammer_runtime::{DataPlaneRuntime, TraceControlPlane, TraceInputPolicy, TracePolicy};
 use hammer_runtime::{new_worker_runtime, spawn::DataRuntime};
 use hammer_service::interface::{
     InterfaceConnectedRouteControl, InterfaceControlPlane, InterfaceMtu, InterfaceMtuKind,

@@ -3,12 +3,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use hammer_adapter::{DataPlaneRuntime, DataPlaneRuntimeConfig};
 use hammer_core::data_plane::DataPlaneBufferConfig;
 use hammer_core::registry::RuntimeRegistry;
 use hammer_runtime::barrier;
 use hammer_runtime::engine::Engine;
 use hammer_runtime::spawn::DataRemoteLocalQueue;
+use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig};
 
 fn test_runtime(thread_index: u32) -> DataPlaneRuntime {
     let buffers = DataPlaneBufferConfig {

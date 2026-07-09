@@ -37,15 +37,15 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hammer_adapter::node::NodeRuntimeStatsRow;
-use hammer_adapter::{TraceControlHandle, TraceRecordSink};
 use hammer_core::config::Worker;
 use hammer_core::data_plane::DataPlaneBuffers;
+use hammer_runtime::node::NodeRuntimeStatsRow;
+use hammer_runtime::{TraceControlHandle, TraceRecordSink};
 
 use crate::data_plane::{RuntimeDataPlaneRuntime, new_worker_runtime};
 use crate::worker_thread::apply_worker_thread_setup;
-use hammer_adapter::DataPlaneRuntime;
 use hammer_core::error::{HammerError, HammerResult};
+use hammer_runtime::DataPlaneRuntime;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle as TokioJoinHandle;
 use tracing::instrument::WithSubscriber;
@@ -1354,11 +1354,11 @@ fn next_data_runtime_context_id() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hammer_adapter::{
+    use hammer_core::data_plane::{BufferFrame, NodeId, NodeRegistration, NodeState};
+    use hammer_runtime::{
         DataPlaneRuntime, DriverNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
         TraceControlPlane, TraceEntry, TraceInputPolicy, TracePolicy, TraceRecord,
     };
-    use hammer_core::data_plane::{BufferFrame, NodeId, NodeRegistration, NodeState};
     use std::sync::{
         Arc, Mutex as StdMutex, OnceLock,
         atomic::{AtomicU64, Ordering},

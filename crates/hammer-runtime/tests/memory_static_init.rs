@@ -1,6 +1,6 @@
-use hammer_adapter::{DataPlaneRuntime, DataPlaneRuntimeConfig};
 use hammer_core::data_plane::DataPlaneBufferConfig;
 use hammer_runtime::init::{INIT_FUNCTIONS, topological_order};
+use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig};
 
 fn runtime_config(numa_nodes: &'static [u32], active_numa_node: u32) -> DataPlaneRuntimeConfig {
     DataPlaneRuntimeConfig {
@@ -18,30 +18,24 @@ fn runtime_config(numa_nodes: &'static [u32], active_numa_node: u32) -> DataPlan
 
 #[test]
 fn memory_init_sources_are_static_no_lock() {
-    let adapter_memory = include_str!("../../hammer-adapter/src/memory.rs");
     let runtime_memory = include_str!("../src/memory.rs");
-    for (path, src) in [
-        ("crates/hammer-adapter/src/memory.rs", adapter_memory),
-        ("crates/hammer-runtime/src/memory.rs", runtime_memory),
+    for forbidden in [
+        "Mutex",
+        "RwLock",
+        "OnceLock",
+        "LazyLock",
+        "get_or_init",
+        "thread_local!",
+        "HashMap",
+        "BTreeMap",
+        "pub struct MemoryConfig",
+        "pub struct MemoryMain",
+        "pub struct StaticNumaTable",
     ] {
-        for forbidden in [
-            "Mutex",
-            "RwLock",
-            "OnceLock",
-            "LazyLock",
-            "get_or_init",
-            "thread_local!",
-            "HashMap",
-            "BTreeMap",
-            "pub struct MemoryConfig",
-            "pub struct MemoryMain",
-            "pub struct StaticNumaTable",
-        ] {
-            assert!(
-                !src.contains(forbidden),
-                "{path} must not use {forbidden} for memory initialization"
-            );
-        }
+        assert!(
+            !runtime_memory.contains(forbidden),
+            "crates/hammer-runtime/src/memory.rs must not use {forbidden} for memory initialization"
+        );
     }
 }
 
@@ -91,14 +85,14 @@ fn start_workers_uses_static_memory_runtime_path() {
 
 #[test]
 fn task_4_visibility_surface_stays_narrow() {
-    let buffer_src = include_str!("../../hammer-adapter/src/buffer.rs");
+    let data_plane_src = include_str!("../src/data_plane.rs");
     assert!(
-        !buffer_src.contains("pub struct DataPlaneRuntimeWorkerSeed"),
-        "worker seed concrete type must not be publicly nameable from hammer_adapter::buffer"
+        !data_plane_src.contains("pub struct DataPlaneRuntimeWorkerSeed"),
+        "worker seed concrete type must not be publicly nameable from hammer_runtime::data_plane"
     );
     assert!(
-        !buffer_src.contains("pub fn with_static_buffer_arena"),
-        "static arena constructor helper must stay adapter-crate-visible only"
+        !data_plane_src.contains("pub fn with_static_buffer_arena"),
+        "static arena constructor helper must stay runtime-crate-visible only"
     );
 }
 

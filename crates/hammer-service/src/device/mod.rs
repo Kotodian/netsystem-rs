@@ -31,10 +31,10 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use hammer_adapter::{DataPlaneRuntime, NodeRuntimeData, TraceFormatter};
 use hammer_core::data_plane::NodeId;
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::vec::Vec;
+use hammer_runtime::{DataPlaneRuntime, NodeRuntimeData, TraceFormatter};
 
 /// Hardware interface RX/TX queue schedule mode.
 ///

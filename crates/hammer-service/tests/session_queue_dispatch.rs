@@ -1,16 +1,16 @@
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use hammer_adapter::{
-    DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, InternalNode, Node, NodeProcessFn,
-    NodeResult, NodeRuntimeData,
-};
 use hammer_core::data_plane::{
     BufferFrame, DataPlaneBufferConfig, DataPlaneBuffers, NodeRegistration,
 };
 use hammer_core::error::CoreResult;
 use hammer_infra::segment::Local;
 use hammer_runtime::app::{AppSession, AppSessionConfig, SessionHandle};
+use hammer_runtime::{
+    DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, InternalNode, Node, NodeProcessFn,
+    NodeResult, NodeRuntimeData,
+};
 use hammer_service::session::SessionQueueNext;
 use hammer_service::session::protocol::SessionQueueControlContext;
 use hammer_service::session::runtime::{

@@ -606,7 +606,7 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
         .make_where_clause()
         .predicates
         .push(parse_quote!(
-            #ident #ty_generics: ::hammer_adapter::node::Node
+            #ident #ty_generics: ::hammer_runtime::node::Node
         ));
     let (role_impl_generics, _, role_where_clause) = role_generics.split_for_impl();
     let mut output_fields = Vec::<Field>::new();
@@ -695,7 +695,7 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
 
             #[inline]
             pub fn runtime_nexts(
-                runtime: &::hammer_adapter::DataPlaneRuntime,
+                runtime: &::hammer_runtime::DataPlaneRuntime,
             ) -> ::hammer_core::error::CoreResult<[::hammer_core::data_plane::NodeId; #next::COUNT]> {
                 runtime.current_node_nexts::<{ #next::COUNT }>()
             }
@@ -711,7 +711,7 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
 
             #[inline]
             pub fn runtime_nexts(
-                runtime: &::hammer_adapter::DataPlaneRuntime,
+                runtime: &::hammer_runtime::DataPlaneRuntime,
             ) -> ::hammer_core::error::CoreResult<
                 [::hammer_core::data_plane::NodeId; #sibling_of::NODE_NEXT_COUNT]
             > {
@@ -817,7 +817,7 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
                 quote!()
             };
             quote! {
-                impl #role_impl_generics ::hammer_adapter::node::InternalNode
+                impl #role_impl_generics ::hammer_runtime::node::InternalNode
                     for #ident #ty_generics #role_where_clause
                 {
                     #[inline]
@@ -841,7 +841,7 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
                 quote!()
             };
             quote! {
-                impl #role_impl_generics ::hammer_adapter::node::DriverNode
+                impl #role_impl_generics ::hammer_runtime::node::DriverNode
                     for #ident #ty_generics #role_where_clause
                 {
                     #[inline]
@@ -1318,7 +1318,7 @@ fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<T
 
     let registration = quote! {
         #[::linkme::distributed_slice(#graph_slice)]
-        static #static_ident: ::hammer_adapter::NodeEntry = ::hammer_adapter::NodeEntry {
+        static #static_ident: ::hammer_runtime::NodeEntry = ::hammer_runtime::NodeEntry {
             registration: #node_registration,
             kind: #node_kind,
             init: #init,

@@ -1,7 +1,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use hammer_adapter::DataWorkerId;
 use hammer_core::protocol::tcp::TcpCapabilities;
+use hammer_runtime::DataWorkerId;
 use hammer_service::transport::tcp::lookup::{
     TcpIpv4ListenerAddress, TcpIpv6ListenerAddress, TcpListenerLookupAccess, TcpLookupSnapshot,
     TcpLookupValue, TcpV4ListenerKey, TcpV6ListenerKey,

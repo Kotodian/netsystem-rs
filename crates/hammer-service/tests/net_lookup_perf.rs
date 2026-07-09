@@ -5,12 +5,12 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use hammer_adapter::{
+use hammer_core::data_plane::{BufferFrame, DataPlaneBufferConfig, SecondaryOpaque};
+use hammer_core::error::CoreResult;
+use hammer_runtime::{
     DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node,
     NodeProcessFn, NodeResult, NodeRuntimeData,
 };
-use hammer_core::data_plane::{BufferFrame, DataPlaneBufferConfig, SecondaryOpaque};
-use hammer_core::error::CoreResult;
 use hammer_service::data_plane::DropNode;
 use hammer_service::net::{
     DpoProto, FibTableBuilder, ForwardingMetadata, IpInputNext, IpInputNode, IpLookupControlPlane,

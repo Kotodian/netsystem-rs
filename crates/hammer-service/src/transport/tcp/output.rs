@@ -1,9 +1,9 @@
-use hammer_adapter::{
-    DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
-};
 use hammer_core::data_plane::{BufferFrame, BufferIndex, NodeId, NodeRegistration};
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::tcp_header;
+use hammer_runtime::{
+    DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
+};
 
 use super::TcpOutputError;
 pub const DEFAULT_TCP_OUTPUT_PAYLOAD_LEN: usize = 1_440;
@@ -116,7 +116,7 @@ fn tcp_output_node_process_frame(
 ) -> NodeResult {
     let lookup = next[TcpOutputNext::Lookup as usize];
     let drop = next[TcpOutputNext::Drop as usize];
-    hammer_adapter::process_frame!(runtime, frame, |index| {
+    hammer_runtime::process_frame!(runtime, frame, |index| {
         tcp_output_next_for_index(runtime, index, lookup, drop).unwrap_or(drop)
     })
 }
@@ -211,9 +211,9 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex, OnceLock};
 
-    use hammer_adapter::NodeProcessFn;
     use hammer_core::data_plane::BufferFrame;
     use hammer_core::protocol::tcp::{TcpCapabilities, TcpSegmentFlags};
+    use hammer_runtime::NodeProcessFn;
 
     use super::*;
     use crate::transport::tcp::segment::TcpSegment;
@@ -295,7 +295,7 @@ mod tests {
         NodeId,
     ) {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,

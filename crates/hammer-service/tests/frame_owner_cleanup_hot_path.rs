@@ -1,9 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use hammer_adapter::{DataPlaneRuntime, DataPlaneRuntimeConfig};
 use hammer_core::data_plane::{DataPlaneBufferConfig, NodeId};
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig};
 use hammer_service::tun::{
     RealTunInput, TunBufferIo, TunBufferSendResult, TunDriverMode, TunPacketSource,
 };
@@ -101,9 +101,6 @@ fn runtime_service_and_node_hot_paths_use_frame_owner_cleanup() {
         "crates/hammer-service/src",
     ] {
         visit_rust_files(&root.join(dir), &mut |path| {
-            if allowed_pool_internal(path) {
-                return;
-            }
             let src = fs::read_to_string(path).expect("read source");
             for token in tokens {
                 if src.contains(*token) {
@@ -147,7 +144,7 @@ fn runtime_service_and_node_hot_paths_use_frame_owner_cleanup() {
     }
     assert_no_public_lifetime_helpers(&buffer_src, "crates/hammer-core/src/data_plane/buffer.rs");
     assert_no_panic_or_unreachable(
-        &root.join("crates/hammer-adapter/src/node/next.rs"),
+        &root.join("crates/hammer-runtime/src/node/next.rs"),
         "entire file",
     );
     assert_no_panic_or_unreachable_in_buffer_frame_owner_block(&buffer_src);
@@ -209,10 +206,6 @@ fn visit_rust_files(dir: &Path, f: &mut impl FnMut(&Path)) {
             f(&path);
         }
     }
-}
-
-fn allowed_pool_internal(path: &Path) -> bool {
-    path.ends_with("crates/hammer-adapter/src/buffer.rs")
 }
 
 fn tun_runtime() -> DataPlaneRuntime {

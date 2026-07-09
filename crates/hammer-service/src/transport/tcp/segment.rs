@@ -2,7 +2,6 @@ use std::mem::{size_of, transmute};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::net::{IpEcnCodepoint, NetworkOpaque};
-use hammer_adapter::DataPlaneRuntime;
 use hammer_core::data_plane::{BufferIndex, BufferPacketCursor};
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::{
@@ -10,6 +9,7 @@ use hammer_core::protocol::tcp::{
     TcpSegmentHeader, TcpSeq, TcpTimestampOption, TcpWireHeader, tcp_header,
     tcp_options_from_bytes, tcp_segment_header_len, write_tcp_segment_header,
 };
+use hammer_runtime::DataPlaneRuntime;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpSegment {
@@ -245,16 +245,16 @@ fn copy_sack_blocks(sack_blocks: Option<&[TcpSackBlock]>) -> (Option<[TcpSackBlo
 
 #[cfg(test)]
 mod tests {
-    use hammer_adapter::DataPlaneRuntime;
     use hammer_core::protocol::tcp::tcp_options_from_bytes;
     use hammer_core::protocol::wire::read_header;
+    use hammer_runtime::DataPlaneRuntime;
 
     use super::*;
 
     #[test]
     fn transport_tcp_segment_write_to_buffer_prepends_sack_blocks() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 4,
@@ -297,7 +297,7 @@ mod tests {
     #[test]
     fn transport_tcp_segment_write_to_buffer_prepends_fast_open_cookie() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 4,

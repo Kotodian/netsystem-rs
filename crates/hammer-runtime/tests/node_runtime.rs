@@ -1,14 +1,14 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use hammer_adapter::{
-    DataPlaneRuntime, DataPlaneRuntimeConfig, DriverNode, InternalNode, Node, NodeDescriptor,
-    NodeProcessFn, NodeResult, NodeRuntimeData, TraceFormatter, process_frame,
-};
 use hammer_core::data_plane::{
     BufferFrame, DataPlaneBufferConfig, NodeHandle, NodeId, NodeKind, NodeNext, NodeRegistration,
     NodeState,
 };
 use hammer_core::error::CoreResult;
+use hammer_runtime::{
+    DataPlaneRuntime, DataPlaneRuntimeConfig, DriverNode, InternalNode, Node, NodeDescriptor,
+    NodeProcessFn, NodeResult, NodeRuntimeData, TraceFormatter, process_frame,
+};
 
 static NODE_CALLS_BY_WORD: [AtomicU64; 128] = [const { AtomicU64::new(0) }; 128];
 

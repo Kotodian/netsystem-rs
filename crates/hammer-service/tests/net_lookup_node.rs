@@ -2,16 +2,16 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use hammer_adapter::{
-    DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
-    TraceControlPlane, TraceInputPolicy, TracePolicy,
-};
 use hammer_core::config::Config;
 use hammer_core::data_plane::{BufferFrame, SecondaryOpaque};
 use hammer_core::error::CoreResult;
 use hammer_core::forwarding::AdjacencyRewrite;
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
 use hammer_infra::vec::Vec as InfraVec;
+use hammer_runtime::{
+    DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
+    TraceControlPlane, TraceInputPolicy, TracePolicy,
+};
 use hammer_runtime::{new_worker_runtime, spawn::DataRuntime};
 use hammer_service::data_plane::DropNode;
 use hammer_service::net::{

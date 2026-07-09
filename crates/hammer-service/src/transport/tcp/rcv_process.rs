@@ -1,6 +1,6 @@
-use hammer_adapter::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
 use hammer_core::data_plane::{BufferFrame, BufferIndex, NodeId};
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
 
 use crate::session::runtime::RxDelivery;
 use crate::transport::congestion::CongestionController;

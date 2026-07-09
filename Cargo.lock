@@ -693,8 +693,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
- "criterion",
- "crossbeam-queue",
  "crossbeam-utils",
  "hammer-core",
  "hammer-infra",
@@ -783,6 +781,8 @@ dependencies = [
  "async-trait",
  "bytes",
  "core_affinity",
+ "criterion",
+ "crossbeam-queue",
  "hammer-adapter",
  "hammer-component-macros",
  "hammer-core",

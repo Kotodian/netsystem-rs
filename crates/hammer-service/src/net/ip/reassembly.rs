@@ -5,14 +5,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use hammer_adapter::{
-    DataPlaneRuntime, DataWorkerId, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
-    TraceFormatter, add_packet_trace,
-};
 use hammer_core::data_plane::{BufferFrame, BufferIndex, NodeHandle, NodeId, NodeNextStorage};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::checksum::internet_checksum;
 use hammer_infra::vec::Vec;
+use hammer_runtime::{
+    DataPlaneRuntime, DataWorkerId, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
+    TraceFormatter, add_packet_trace,
+};
 
 use crate::trace::codec::{
     TraceDecodeCursor, put_option_ip_fragment_key, put_option_node, put_option_u32, put_u8, put_u32,

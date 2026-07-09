@@ -2,8 +2,8 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
 
-use hammer_adapter::DataWorkerId;
 use hammer_core::protocol::tcp::{TcpConnectionId, TcpState};
+use hammer_runtime::DataWorkerId;
 use hammer_service::transport::congestion::{BbrController, CongestionController};
 use hammer_service::transport::tcp::connection::TcpConnection;
 use hammer_service::transport::tcp::{DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TcpInputNext};

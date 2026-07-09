@@ -1,7 +1,7 @@
-use hammer_adapter::{DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node, NodeResult};
 use hammer_core::data_plane::{
     BufferFrame, DataPlaneBufferConfig, DataPlaneBuffers, NodeId, NodeRegistration,
 };
+use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node, NodeResult};
 
 #[derive(Debug, Clone, Copy)]
 struct GuardNode;

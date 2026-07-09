@@ -1,14 +1,14 @@
 use std::mem::transmute;
 use std::sync::{Mutex, OnceLock};
 
-use hammer_adapter::{
-    DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
-    TraceFormatter, add_packet_trace, unlikely,
-};
 use hammer_core::data_plane::{
     BufferFrame, BufferIndex, BufferPacketCursor, NodeId, NodeNextStorage,
 };
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_runtime::{
+    DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
+    TraceFormatter, add_packet_trace, unlikely,
+};
 
 use crate::data_plane::{FeatureArcSpec, FeatureArcStartHandle, set_buffer_node_error_code};
 use crate::net::ip::{
@@ -123,7 +123,7 @@ fn ip_input_process_frame(
     next: [NodeId; IpInputNext::COUNT],
     feature_arc: Option<&FeatureArcStartHandle>,
 ) -> NodeResult {
-    hammer_adapter::process_frame!(runtime, frame, |index| {
+    hammer_runtime::process_frame!(runtime, frame, |index| {
         match next_node_for_index(runtime, index, next, feature_arc) {
             Ok(node) => node,
             Err(_) => NodeNextStorage::next(&next, IpInputNext::Drop),

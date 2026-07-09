@@ -4,13 +4,13 @@ use std::mem::transmute;
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
-use hammer_adapter::{DataPlaneRuntime, DataWorkerId, NodeRuntimeData};
 use hammer_core::data_plane::{BufferPacketCursor, NodeId, NodeState, SecondaryOpaque};
 use hammer_core::error::{CoreError, CoreResult, HammerResult};
 #[cfg(test)]
 use hammer_core::protocol::tcp::{TcpCapabilities, TcpFastOpenCookie};
 use hammer_core::protocol::tcp::{TcpControlPacketParseError, TcpError};
 use hammer_core::registry::RuntimeRegistry;
+use hammer_runtime::{DataPlaneRuntime, DataWorkerId, NodeRuntimeData};
 use thiserror::Error;
 
 use crate::session::{
@@ -545,7 +545,7 @@ where
     install_tcp_worker_state(worker_state);
     let mut driver = SessionDriverRuntime::new(
         DataWorkerId::new(0),
-        hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+        hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
             buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                 buffer_slot_capacity: 2048,
                 buffer_slots: 4,
@@ -756,15 +756,15 @@ mod tests {
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::Instant;
 
-    use hammer_adapter::{
-        DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeProcessFn, NodeResult,
-        NodeRuntimeData,
-    };
     use hammer_core::config::network::CongestionController as ConfigCongestionController;
     use hammer_core::data_plane::{BufferFrame, NodeHandle, NodeId, NodeRegistration};
     use hammer_core::error::{CoreError, CoreResult};
     use hammer_core::protocol::tcp::{
         TcpCapabilities, TcpConnectionId, TcpPacket, TcpSackBlock, TcpSegmentFlags, TcpSeq,
+    };
+    use hammer_runtime::{
+        DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeProcessFn, NodeResult,
+        NodeRuntimeData,
     };
 
     use super::*;
@@ -912,7 +912,7 @@ mod tests {
     #[test]
     fn tcp_custom_tx_handles_special_output_without_normal_packetization() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 32,
@@ -969,7 +969,7 @@ mod tests {
     #[test]
     fn tcp_normal_tx_retains_fifo_until_ack_cleanup() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 32,
@@ -1032,7 +1032,7 @@ mod tests {
     #[test]
     fn tcp_push_header_rolls_back_transport_state_when_batch_fails() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 32,
@@ -1093,7 +1093,7 @@ mod tests {
     #[test]
     fn tcp_normal_tx_dispatches_multiple_goal_sized_buffers() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 32,
@@ -1165,7 +1165,7 @@ mod tests {
     #[test]
     fn tcp_timer_dispatch_uses_exact_timer_token() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 32,
@@ -1219,7 +1219,7 @@ mod tests {
     #[test]
     fn session_tcp_delayed_ack_timer_emits_ack_after_first_clean_payload() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 32,
@@ -1438,7 +1438,7 @@ mod tests {
     #[test]
     fn tcp_time_wait_expiry_closes_session() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,

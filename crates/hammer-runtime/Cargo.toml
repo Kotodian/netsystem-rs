@@ -23,6 +23,7 @@ thiserror = { workspace = true }
 toml = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
+crossbeam-queue = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }
@@ -35,8 +36,13 @@ core_affinity = { workspace = true }
 thread-priority = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 indoc = { workspace = true }
 # `test-util` enables `tokio::time::pause()` / `advance()` so timeout-based
 # behaviour (TCP bridge drain idle, idle-keepalive backstop, etc.) can be
 # verified without sleeping for real seconds. Test-only.
 tokio = { workspace = true, features = ["test-util"] }
+
+[[bench]]
+name = "buffer_alloc_free"
+harness = false

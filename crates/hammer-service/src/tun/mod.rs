@@ -2,15 +2,15 @@ use std::marker::PhantomData;
 use std::mem::transmute;
 use std::sync::{Arc, Mutex};
 
-use hammer_adapter::{
-    DataPlaneRuntime, DriverNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
-    TraceFormatter, add_packet_trace, unlikely,
-};
 use hammer_core::data_plane::{
     BufferFrame, BufferIndex, BufferRef, Frame, Next, NodeId, NodeRegistration, SecondaryOpaque,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::vec::Vec;
+use hammer_runtime::{
+    DataPlaneRuntime, DriverNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
+    TraceFormatter, add_packet_trace, unlikely,
+};
 
 pub use crate::device::{
     DeviceEventSource as TunDeviceEventSource, DeviceMain, DeviceRuntimeSlot, DriverScheduleMode,

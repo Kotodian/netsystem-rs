@@ -5,10 +5,6 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwapOption;
-use hammer_adapter::{
-    DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
-    TraceFormatter, add_packet_trace, unlikely,
-};
 use hammer_core::config::{Config, Route, RouteAction};
 use hammer_core::data_plane::{
     BufferFrame, BufferIndex, BufferPacketCursor, NodeId, NodeRegistration, SecondaryOpaque,
@@ -27,6 +23,10 @@ use hammer_core::protocol::icmp::IcmpErrorMetadata;
 use hammer_core::protocol::ip::{IpProtocol, IpVersion, ParsedIpPacket};
 use hammer_core::registry::RuntimeRegistry;
 use hammer_runtime::{ControlThreadHandle, DataPlaneBarrierHandle};
+use hammer_runtime::{
+    DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
+    TraceFormatter, add_packet_trace, unlikely,
+};
 
 use crate::data_plane::set_index_node_error_code;
 use crate::net::{ForwardingMetadata, NetworkOpaque, TapEthernetMetadata};
@@ -737,7 +737,7 @@ fn ip_lookup_process_frame(
     frame: &mut BufferFrame,
     table: &FibTable,
 ) -> NodeResult {
-    hammer_adapter::process_frame!(runtime, frame, |index| {
+    hammer_runtime::process_frame!(runtime, frame, |index| {
         IpLookupNode::process_index(runtime, table, index)
     })
 }

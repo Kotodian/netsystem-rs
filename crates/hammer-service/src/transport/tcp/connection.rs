@@ -13,7 +13,6 @@ use super::segment::TcpSegment;
 use crate::session::runtime::RxDelivery;
 use crate::transport::congestion::CongestionController;
 use crossbeam_utils::CachePadded;
-use hammer_adapter::DataWorkerId;
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::ip_ecn::IpEcnCodepoint;
 use hammer_core::protocol::tcp::{
@@ -23,6 +22,7 @@ use hammer_core::protocol::tcp::{
 };
 #[cfg(test)]
 use hammer_infra::vec::Vec;
+use hammer_runtime::DataWorkerId;
 use thiserror::Error;
 
 const TCP_MAX_WINDOW_SCALE: u8 = 14;

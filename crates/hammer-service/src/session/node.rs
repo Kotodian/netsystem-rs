@@ -3,11 +3,11 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::time::Instant;
 
-use hammer_adapter::{
-    DataPlaneRuntime, DriverNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
-};
 use hammer_core::data_plane::{BufferFrame, BufferIndex, Frame, Next, NodeId, NodeRegistration};
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_runtime::{
+    DataPlaneRuntime, DriverNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
+};
 
 use crate::session::SessionQueueError;
 #[derive(PartialEq, Eq)]

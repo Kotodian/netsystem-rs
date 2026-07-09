@@ -1,6 +1,6 @@
-use hammer_adapter::{DataPlaneRuntime, DataPlaneRuntimeConfig, NodeResult, process_frame};
 use hammer_core::data_plane::{BufferFrame, BufferIndex, DataPlaneBufferConfig, NodeId};
 use hammer_infra::vec::Vec;
+use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, NodeResult, process_frame};
 
 fn test_runtime(buffer_slot_capacity: usize, buffer_slots: usize) -> DataPlaneRuntime {
     DataPlaneRuntime::new(DataPlaneRuntimeConfig {

@@ -1,8 +1,8 @@
-use hammer_adapter::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
 use hammer_core::data_plane::{BufferFrame, BufferIndex, BufferPacketCursor, NodeId};
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::{TcpError, TcpSegmentFlags, tcp_header};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
+use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
 
 #[hammer_component_macros::node_next]
 pub enum TcpResetNext {
@@ -70,7 +70,7 @@ fn tcp_reset_process_frame(
 ) -> NodeResult {
     let drop_next = next[TcpResetNext::Drop as usize];
     let lookup_next = next[TcpResetNext::Lookup as usize];
-    hammer_adapter::process_frame!(runtime, frame, |index| {
+    hammer_runtime::process_frame!(runtime, frame, |index| {
         tcp_reset_next_for_index(runtime, index, drop_next, lookup_next).unwrap_or(drop_next)
     })
 }
@@ -462,8 +462,8 @@ mod tests {
 
     use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 
-    use hammer_adapter::InternalNode;
     use hammer_core::data_plane::BufferNodeError;
+    use hammer_runtime::InternalNode;
 
     use super::*;
     use crate::transport::tcp::TcpResetError;
@@ -542,7 +542,7 @@ mod tests {
     #[test]
     fn tcp_reset_node_rewrites_buffer_and_routes_to_lookup() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 512,
                     buffer_slots: 8,

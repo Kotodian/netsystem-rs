@@ -1,10 +1,10 @@
 use std::cell::{Cell, RefCell};
 
-use hammer_adapter::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
 use hammer_core::data_plane::{BufferFrame, BufferIndex, NodeId};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::{TcpConnectionId, TcpError, TcpPacket, TcpSegmentFlags, TcpSeq};
 use hammer_infra::vec::Vec;
+use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
 
 use super::connection::TcpConnection;
 use super::segment::{TcpSegment, tcp_packet};
@@ -287,14 +287,14 @@ mod tests {
         TCP_FLAG_ACK, TCP_FLAG_SYN, TcpEstablishedNext, TcpEstablishedNode, TcpInputNext,
         TcpSessionDriver,
     };
-    use hammer_adapter::{
-        DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeProcessFn, NodeResult,
-        NodeRuntimeData,
-    };
     use hammer_core::data_plane::{BufferFrame, NodeId, NodeRegistration};
     use hammer_core::error::{CoreError, CoreResult};
     use hammer_core::protocol::tcp::{TcpCapabilities, TcpFastOpenCookie};
     use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
+    use hammer_runtime::{
+        DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeProcessFn, NodeResult,
+        NodeRuntimeData,
+    };
 
     const LOCAL_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
     const REMOTE_IP: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 20);
@@ -407,7 +407,7 @@ mod tests {
     #[test]
     fn initial_syn_emits_cookie_syn_ack_without_creating_session_route() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
@@ -442,7 +442,7 @@ mod tests {
     #[test]
     fn final_ack_creates_real_session_after_cookie_validation() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
@@ -484,7 +484,7 @@ mod tests {
     #[test]
     fn invalid_cookie_does_not_create_real_session_route() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
@@ -522,7 +522,7 @@ mod tests {
     #[test]
     fn final_ack_payload_is_not_folded_into_listener_syn_state() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
@@ -565,7 +565,7 @@ mod tests {
     #[test]
     fn passive_tfo_clears_existing_listener_pending_tuple() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
@@ -613,7 +613,7 @@ mod tests {
     #[test]
     fn passive_tfo_invalid_cookie_does_not_create_session() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
@@ -653,7 +653,7 @@ mod tests {
     #[test]
     fn backlog_full_rejects_new_listener_tuple() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 4096,
                     buffer_slots: 256,
@@ -710,7 +710,7 @@ mod tests {
     #[test]
     fn passive_tfo_valid_cookie_bypasses_listener_backlog() {
         let runtime =
-            hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
+            hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 4096,
                     buffer_slots: 256,

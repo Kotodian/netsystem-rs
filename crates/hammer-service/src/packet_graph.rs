@@ -3,11 +3,11 @@
 
 use std::sync::OnceLock;
 
-use hammer_adapter::NodeEntry;
 use hammer_component_macros::worker_init_function;
 use hammer_core::data_plane::NodeHandle;
 use hammer_core::error::HammerResult;
 use hammer_runtime::Engine;
+use hammer_runtime::NodeEntry;
 
 pub(crate) static WORKER_HANDOFF_NODE_HANDLE: OnceLock<NodeHandle> = OnceLock::new();
 
@@ -23,7 +23,7 @@ pub fn install_worker_graph(engine: &mut Engine) -> HammerResult<()> {
     engine.runtime.set_handoff_node_handle(handle);
 
     let worker = engine.thread_index as usize;
-    let worker_id = hammer_adapter::DataWorkerId::new(engine.thread_index);
+    let worker_id = hammer_runtime::DataWorkerId::new(engine.thread_index);
 
     crate::transport::tcp::install_tcp_worker_state(
         crate::transport::tcp::TcpWorkerOwnedState::new(worker_id),

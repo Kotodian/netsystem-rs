@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use hammer_adapter::DataWorkerId;
+use hammer_runtime::DataWorkerId;
 use hammer_service::transport::congestion::{
     AckedPacket, BbrController, BbrMode, CongestionController, CongestionMetrics, LostPacket,
     PacketNumber, RttSample,

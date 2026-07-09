@@ -2,9 +2,9 @@ use std::cell::UnsafeCell;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use hammer_adapter::DataWorkerId;
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_infra::map::FlatHashTable;
+use hammer_runtime::DataWorkerId;
 
 use crate::transport::tcp::TcpInputControlPlane;
 use crate::transport::tcp::lookup::{

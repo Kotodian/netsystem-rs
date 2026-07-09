@@ -5,7 +5,6 @@ pub mod reassembly;
 
 use std::net::IpAddr;
 
-use hammer_adapter::Network;
 use hammer_core::data_plane::BufferPacketCursor;
 use hammer_core::error::{CoreError, CoreResult};
 pub use hammer_core::protocol::ip::{
@@ -14,6 +13,7 @@ pub use hammer_core::protocol::ip::{
     parse_ip_header,
 };
 use hammer_core::protocol::wire::read_header;
+use hammer_runtime::Network;
 
 pub use icmp::{
     IcmpEchoRequestNext, IcmpEchoRequestNode, IcmpEchoRequestTrace, IcmpErrorNext, IcmpErrorNode,
