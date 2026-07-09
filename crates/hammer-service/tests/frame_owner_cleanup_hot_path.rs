@@ -1,8 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use hammer_adapter::DataPlaneRuntime;
 use hammer_adapter::buffer::{DataPlaneBufferConfig, DataPlaneRuntimeConfig};
-use hammer_adapter::{DataPlaneRuntime, NodeId};
+use hammer_core::data_plane::NodeId;
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_service::tun::{
     RealTunInput, TunBufferIo, TunBufferSendResult, TunDriverMode, TunPacketSource,

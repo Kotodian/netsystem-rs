@@ -1,7 +1,8 @@
 use hammer_adapter::{
-    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeId, NodeProcessFn,
+    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeProcessFn,
     NodeResult, NodeRuntimeData,
 };
+use hammer_core::data_plane::NodeId;
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::{TcpError, TcpSegmentFlags, tcp_header};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};

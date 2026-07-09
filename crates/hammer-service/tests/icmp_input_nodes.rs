@@ -292,7 +292,7 @@ fn push_packet(runtime: &DataPlaneRuntime, frame: &mut BufferFrame, packet: &[u8
 fn push_marked_packet(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
-    trace_input: hammer_adapter::NodeId,
+    trace_input: hammer_core::data_plane::NodeId,
     packet: &[u8],
 ) {
     let buffer = runtime

@@ -3,8 +3,9 @@ use std::sync::Arc;
 use hammer_adapter::buffer::{BufferPool, BufferPoolArena};
 use hammer_adapter::{
     DataPlaneBufferConfig, DataPlaneBuffers, DataPlaneHandoff, DataPlaneInstructionSet,
-    DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, NodeId,
+    DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId,
 };
+use hammer_core::data_plane::NodeId;
 use hammer_infra::heap::Heap;
 
 fn runtime_config(

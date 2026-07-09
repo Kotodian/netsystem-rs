@@ -8,9 +8,10 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    Buffer, BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId, NodeProcessFn,
-    NodeRegistration, NodeResult, PacketTrace, TraceFormatter, add_packet_trace,
+    Buffer, BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeProcessFn,
+    NodeResult, PacketTrace, TraceFormatter, add_packet_trace,
 };
+use hammer_core::data_plane::{NodeId, NodeRegistration};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_runtime::DataPlaneBarrierHandle;
 
@@ -222,7 +223,7 @@ mod tests {
         let drop_node = runtime.nodes().register_internal(DropNode::new());
         let mut frame = runtime
             .buffers()
-            .get_next_frame(hammer_adapter::NodeId::new(0))
+            .get_next_frame(hammer_core::data_plane::NodeId::new(0))
             .expect("alloc frame");
         let first = runtime
             .alloc_index_with_bytes(b"first")

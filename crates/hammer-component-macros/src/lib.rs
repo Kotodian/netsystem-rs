@@ -685,10 +685,10 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
         output_fields.push(name_field);
         constructor_inits.push(quote!(node_name: Self::NODE_NAME));
         let field: Field = parse_quote! {
-            next: [::hammer_adapter::node::NodeId; #next::COUNT]
+            next: [::hammer_core::data_plane::NodeId; #next::COUNT]
         };
         output_fields.push(field);
-        constructor_params.push(quote!(next: [::hammer_adapter::node::NodeId; #next::COUNT]));
+        constructor_params.push(quote!(next: [::hammer_core::data_plane::NodeId; #next::COUNT]));
         constructor_inits.push(quote!(next));
         next_impl = quote! {
             pub const NODE_NEXT_COUNT: usize = #next::COUNT;
@@ -696,7 +696,7 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
             #[inline]
             pub fn runtime_nexts(
                 runtime: &::hammer_adapter::DataPlaneRuntime,
-            ) -> ::hammer_core::error::CoreResult<[::hammer_adapter::node::NodeId; #next::COUNT]> {
+            ) -> ::hammer_core::error::CoreResult<[::hammer_core::data_plane::NodeId; #next::COUNT]> {
                 runtime.current_node_nexts::<{ #next::COUNT }>()
             }
         };
@@ -713,7 +713,7 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
             pub fn runtime_nexts(
                 runtime: &::hammer_adapter::DataPlaneRuntime,
             ) -> ::hammer_core::error::CoreResult<
-                [::hammer_adapter::node::NodeId; #sibling_of::NODE_NEXT_COUNT]
+                [::hammer_core::data_plane::NodeId; #sibling_of::NODE_NEXT_COUNT]
             > {
                 runtime.current_node_nexts::<{ #sibling_of::NODE_NEXT_COUNT }>()
             }
@@ -722,10 +722,10 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
 
     if args.next_node {
         let field: Field = parse_quote! {
-            next: ::hammer_adapter::node::NodeId
+            next: ::hammer_core::data_plane::NodeId
         };
         output_fields.push(field);
-        constructor_params.push(quote!(next: ::hammer_adapter::node::NodeId));
+        constructor_params.push(quote!(next: ::hammer_core::data_plane::NodeId));
         constructor_inits.push(quote!(next));
     }
 
@@ -775,7 +775,7 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
     let registration_impl = if args.role.is_some() {
         quote! {
             #[inline]
-            pub fn node_registration(&self) -> ::hammer_adapter::node::NodeRegistration {
+            pub fn node_registration(&self) -> ::hammer_core::data_plane::NodeRegistration {
                 #registration_tokens
             }
         }
@@ -785,14 +785,14 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
     let initial_nexts_inherent_impl = if args.role.is_some() && args.next.is_some() {
         quote! {
             #[inline]
-            pub fn node_initial_nexts(&self) -> &[::hammer_adapter::node::NodeId] {
+            pub fn node_initial_nexts(&self) -> &[::hammer_core::data_plane::NodeId] {
                 &self.next
             }
         }
     } else if args.role.is_some() {
         quote! {
             #[inline]
-            pub fn node_initial_nexts(&self) -> &[::hammer_adapter::node::NodeId] {
+            pub fn node_initial_nexts(&self) -> &[::hammer_core::data_plane::NodeId] {
                 &[]
             }
         }
@@ -809,7 +809,7 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
             let initial_nexts = if args.next.is_some() {
                 quote! {
                     #[inline]
-                    fn node_initial_nexts(&self) -> &[::hammer_adapter::node::NodeId] {
+                    fn node_initial_nexts(&self) -> &[::hammer_core::data_plane::NodeId] {
                         self.node_initial_nexts()
                     }
                 }
@@ -821,7 +821,7 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
                     for #ident #ty_generics #role_where_clause
                 {
                     #[inline]
-                    fn node_registration(&self) -> ::hammer_adapter::node::NodeRegistration {
+                    fn node_registration(&self) -> ::hammer_core::data_plane::NodeRegistration {
                         self.node_registration()
                     }
 
@@ -833,7 +833,7 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
             let initial_nexts = if args.next.is_some() {
                 quote! {
                     #[inline]
-                    fn node_initial_nexts(&self) -> &[::hammer_adapter::node::NodeId] {
+                    fn node_initial_nexts(&self) -> &[::hammer_core::data_plane::NodeId] {
                         self.node_initial_nexts()
                     }
                 }
@@ -845,7 +845,7 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
                     for #ident #ty_generics #role_where_clause
                 {
                     #[inline]
-                    fn node_registration(&self) -> ::hammer_adapter::node::NodeRegistration {
+                    fn node_registration(&self) -> ::hammer_core::data_plane::NodeRegistration {
                         self.node_registration()
                     }
 
@@ -887,15 +887,15 @@ fn node_registration_tokens(
     sibling_of: &Option<Path>,
 ) -> TokenStream2 {
     if let Some(next) = next {
-        quote!(::hammer_adapter::node::NodeRegistration::next(self.node_name, #next::COUNT))
+        quote!(::hammer_core::data_plane::NodeRegistration::next(self.node_name, #next::COUNT))
     } else if let Some(sibling_of) = sibling_of {
-        quote!(::hammer_adapter::node::NodeRegistration::sibling_of(
+        quote!(::hammer_core::data_plane::NodeRegistration::sibling_of(
             self.node_name,
             #sibling_of::NODE_NAME
         ))
     } else {
         let _ = ident;
-        quote!(::hammer_adapter::node::NodeRegistration::Plain)
+        quote!(::hammer_core::data_plane::NodeRegistration::Plain)
     }
 }
 
@@ -1043,13 +1043,13 @@ fn expand_node_next(item: ItemEnum) -> Result<TokenStream2> {
 
             #[inline(always)]
             pub const fn nodes(
-                #(#node_params: ::hammer_adapter::node::NodeId),*
-            ) -> [::hammer_adapter::node::NodeId; Self::COUNT] {
+                #(#node_params: ::hammer_core::data_plane::NodeId),*
+            ) -> [::hammer_core::data_plane::NodeId; Self::COUNT] {
                 [#(#node_params),*]
             }
         }
 
-        impl ::hammer_adapter::node::NodeNext for #ident {
+        impl ::hammer_core::data_plane::NodeNext for #ident {
             const COUNT: usize = #ident::COUNT;
 
             #[inline(always)]
@@ -1059,7 +1059,7 @@ fn expand_node_next(item: ItemEnum) -> Result<TokenStream2> {
         }
 
         const _: () = {
-            assert!(#ident::COUNT <= ::hammer_adapter::node::MAX_NODE_NEXT_SLOTS);
+            assert!(#ident::COUNT <= ::hammer_core::data_plane::MAX_NODE_NEXT_SLOTS);
         };
     })
 }
@@ -1244,18 +1244,20 @@ fn graph_slice_path(graph: &Ident) -> Path {
 
 fn graph_node_registration(name: &TokenStream2, next: Option<&Path>) -> TokenStream2 {
     match next {
-        Some(next) => quote!(::hammer_adapter::NodeRegistration::next(#name, #next::COUNT)),
-        None => quote!(::hammer_adapter::NodeRegistration::next(#name, 0)),
+        Some(next) => {
+            quote!(::hammer_core::data_plane::NodeRegistration::next(#name, #next::COUNT))
+        }
+        None => quote!(::hammer_core::data_plane::NodeRegistration::next(#name, 0)),
     }
 }
 
 fn graph_node_kind_expr(kind: Option<&Ident>) -> TokenStream2 {
     match kind.map(|k| k.to_string()).as_deref() {
-        Some("driver") => quote!(::hammer_adapter::NodeKind::Driver),
+        Some("driver") => quote!(::hammer_core::data_plane::NodeKind::Driver),
         // `internal` and `handoff` are both `NodeKind::Internal`; handoff nodes
         // register with a handle inside their own init fn, the kind stays Internal.
         Some("internal") | Some("handoff") | None => {
-            quote!(::hammer_adapter::NodeKind::Internal)
+            quote!(::hammer_core::data_plane::NodeKind::Internal)
         }
         Some(other) => quote! {
             compile_error!(concat!("unknown graph node kind: ", #other))

@@ -3,10 +3,11 @@ use std::mem::transmute;
 use std::sync::{Arc, Mutex};
 
 use hammer_adapter::{
-    BufferFrame, BufferIndex, BufferRef, DataPlaneRuntime, DriverNode, Frame, Next, Node, NodeId,
-    NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData, PacketTrace, SecondaryOpaque,
-    TraceFormatter, add_packet_trace, unlikely,
+    BufferFrame, BufferIndex, BufferRef, DataPlaneRuntime, DriverNode, Frame, Next, Node,
+    NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace, SecondaryOpaque, TraceFormatter,
+    add_packet_trace, unlikely,
 };
+use hammer_core::data_plane::{NodeId, NodeRegistration};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::vec::Vec;
 

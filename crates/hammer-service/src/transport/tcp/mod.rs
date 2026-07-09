@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
 use hammer_adapter::{
-    BufferPacketCursor, DataPlaneRuntime, DataWorkerId, NodeId, NodeRuntimeData, NodeState,
-    SecondaryOpaque,
+    BufferPacketCursor, DataPlaneRuntime, DataWorkerId, NodeRuntimeData, SecondaryOpaque,
 };
+use hammer_core::data_plane::{NodeId, NodeState};
 use hammer_core::error::{CoreError, CoreResult, HammerResult};
 #[cfg(test)]
 use hammer_core::protocol::tcp::{TcpCapabilities, TcpFastOpenCookie};
@@ -759,10 +759,11 @@ mod tests {
     use std::time::Instant;
 
     use hammer_adapter::{
-        BufferFrame, DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeHandle, NodeId,
-        NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData,
+        BufferFrame, DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeProcessFn, NodeResult,
+        NodeRuntimeData,
     };
     use hammer_core::config::network::CongestionController as ConfigCongestionController;
+    use hammer_core::data_plane::{NodeHandle, NodeId, NodeRegistration};
     use hammer_core::error::{CoreError, CoreResult};
     use hammer_core::protocol::tcp::{
         TcpCapabilities, TcpConnectionId, TcpPacket, TcpSackBlock, TcpSegmentFlags, TcpSeq,

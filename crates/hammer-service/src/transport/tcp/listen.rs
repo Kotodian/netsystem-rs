@@ -1,9 +1,9 @@
 use std::cell::{Cell, RefCell};
 
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeId, NodeProcessFn, NodeResult,
-    NodeRuntimeData,
+    BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
 };
+use hammer_core::data_plane::NodeId;
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::{TcpConnectionId, TcpError, TcpPacket, TcpSegmentFlags, TcpSeq};
 use hammer_infra::vec::Vec;
@@ -290,9 +290,10 @@ mod tests {
         TcpSessionDriver,
     };
     use hammer_adapter::{
-        BufferFrame, DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeId, NodeProcessFn,
-        NodeRegistration, NodeResult, NodeRuntimeData,
+        BufferFrame, DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeProcessFn, NodeResult,
+        NodeRuntimeData,
     };
+    use hammer_core::data_plane::{NodeId, NodeRegistration};
     use hammer_core::error::{CoreError, CoreResult};
     use hammer_core::protocol::tcp::{TcpCapabilities, TcpFastOpenCookie};
     use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};

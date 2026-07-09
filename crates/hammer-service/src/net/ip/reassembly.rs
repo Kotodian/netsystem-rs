@@ -6,10 +6,10 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, DataWorkerId, Node, NodeHandle, NodeId,
-    NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace, TraceFormatter,
-    add_packet_trace,
+    BufferFrame, BufferIndex, DataPlaneRuntime, DataWorkerId, Node, NodeProcessFn, NodeResult,
+    NodeRuntimeData, PacketTrace, TraceFormatter, add_packet_trace,
 };
+use hammer_core::data_plane::{NodeHandle, NodeId, NodeNextStorage};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::checksum::internet_checksum;
 use hammer_infra::vec::Vec;

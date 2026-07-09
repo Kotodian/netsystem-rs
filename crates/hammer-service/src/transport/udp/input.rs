@@ -3,9 +3,10 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeId, NodeNextStorage, NodeResult,
-    PacketTrace, SecondaryOpaque, TraceFormatter, add_packet_trace,
+    BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeResult, PacketTrace, SecondaryOpaque,
+    TraceFormatter, add_packet_trace,
 };
+use hammer_core::data_plane::{NodeId, NodeNextStorage};
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
 use hammer_core::protocol::transport::UdpHeader;

@@ -141,14 +141,15 @@ fn interface_updates_run_through_configured_runtime_data_plane_barrier() {
     let data_runtime =
         DataRuntime::new(1, "interface-control-barrier-test", 512 * 1024, 2).expect("data runtime");
     let barrier = data_runtime.data_plane_barrier();
-    let lookup_table =
-        IpLookupControlPlane::new(FibTableBuilder::new(hammer_adapter::NodeId::new(0)).build());
+    let lookup_table = IpLookupControlPlane::new(
+        FibTableBuilder::new(hammer_core::data_plane::NodeId::new(0)).build(),
+    );
     let control = InterfaceControlPlane::new()
         .with_data_plane_barrier(barrier.clone())
         .with_connected_routes(InterfaceConnectedRouteControl::new(
             lookup_table.table_handle(),
-            hammer_adapter::NodeId::new(0),
-            hammer_adapter::NodeId::new(1),
+            hammer_core::data_plane::NodeId::new(0),
+            hammer_core::data_plane::NodeId::new(1),
         ));
     let tun0 = control.register_interface("tun0").expect("register tun0");
     let address = IpNet::V4(Ipv4Net::new(Ipv4Addr::new(10, 0, 0, 1), 24).unwrap());

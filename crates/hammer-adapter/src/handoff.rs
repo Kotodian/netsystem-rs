@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use crossbeam_queue::ArrayQueue;
+use hammer_core::data_plane::NodeHandle;
 use hammer_core::error::{CoreResult, DataPlaneError};
 
-use crate::{BufferIndex, BufferPoolArena, NodeHandle};
+use crate::{BufferIndex, BufferPoolArena};
 
 pub(crate) const HANDOFF_SLOT_CAPACITY: usize = 32;
 
@@ -238,6 +239,7 @@ impl DataPlaneHandoffWorker {
 #[cfg(test)]
 mod tests {
     use crate::{DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig};
+    use hammer_core::data_plane::NodeId;
 
     use super::*;
 
@@ -266,7 +268,7 @@ mod tests {
         assert!(frame.slot.iter().any(|value| value == index));
         let mut cleanup = runtime
             .buffers()
-            .get_next_frame(crate::NodeId::new(0))
+            .get_next_frame(NodeId::new(0))
             .expect("cleanup frame");
         cleanup.push_index(index).expect("cleanup push");
     }

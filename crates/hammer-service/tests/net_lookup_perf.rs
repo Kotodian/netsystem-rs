@@ -375,7 +375,7 @@ fn build_lookup(
     runtime: &DataPlaneRuntime,
     scenario: Scenario,
     counters: &Arc<SinkCounters>,
-) -> hammer_adapter::NodeId {
+) -> hammer_core::data_plane::NodeId {
     let drop = runtime.nodes().register_internal(DropNode::new());
     let mut builder = FibTableBuilder::new(drop);
     match scenario {
@@ -416,7 +416,7 @@ fn build_input_lookup(
     runtime: &DataPlaneRuntime,
     scenario: Scenario,
     counters: &Arc<SinkCounters>,
-) -> hammer_adapter::NodeId {
+) -> hammer_core::data_plane::NodeId {
     let lookup = build_lookup(runtime, scenario, counters);
     let drop = runtime.nodes().register_internal(DropNode::new());
     runtime
@@ -429,7 +429,7 @@ fn build_input_lookup(
 fn register_sink(
     runtime: &DataPlaneRuntime,
     counters: &Arc<SinkCounters>,
-) -> hammer_adapter::NodeId {
+) -> hammer_core::data_plane::NodeId {
     runtime
         .nodes()
         .register_internal(SinkNode::new(Arc::clone(counters)))
@@ -438,7 +438,7 @@ fn register_sink(
 fn add_single_path(
     builder: &mut FibTableBuilder,
     proto: DpoProto,
-    node: hammer_adapter::NodeId,
+    node: hammer_core::data_plane::NodeId,
 ) -> hammer_service::net::LoadBalanceIndex {
     builder.add_single_path_load_balance(proto, node)
 }

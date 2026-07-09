@@ -4,10 +4,11 @@ use std::marker::PhantomData;
 use std::time::Instant;
 
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, DriverNode, Node, NodeId, NodeProcessFn,
-    NodeRegistration, NodeResult, NodeRuntimeData,
+    BufferFrame, BufferIndex, DataPlaneRuntime, DriverNode, Node, NodeProcessFn, NodeResult,
+    NodeRuntimeData,
     buffer::{Frame, Next},
 };
+use hammer_core::data_plane::{NodeId, NodeRegistration};
 use hammer_core::error::{CoreError, CoreResult};
 
 use crate::session::SessionQueueError;

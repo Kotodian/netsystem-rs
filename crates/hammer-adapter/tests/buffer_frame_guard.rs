@@ -1,7 +1,6 @@
 use hammer_adapter::buffer::{DataPlaneBufferConfig, DataPlaneBuffers, DataPlaneRuntimeConfig};
-use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, InternalNode, Node, NodeId, NodeRegistration, NodeResult,
-};
+use hammer_adapter::{BufferFrame, DataPlaneRuntime, InternalNode, Node, NodeResult};
+use hammer_core::data_plane::{NodeId, NodeRegistration};
 
 #[derive(Debug, Clone, Copy)]
 struct GuardNode;
@@ -89,7 +88,7 @@ fn put_next_frame_failure_drops_typed_owner_resources() {
     let runtime = test_runtime(256, 128);
     let mut frame = runtime
         .buffers()
-        .get_next_frame(hammer_adapter::NodeId::new(99))
+        .get_next_frame(hammer_core::data_plane::NodeId::new(99))
         .expect("frame<next>");
     let index = runtime.alloc_index().expect("buffer");
     frame.push_index(index).expect("push index");

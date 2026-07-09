@@ -4,9 +4,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeId, NodeNextStorage,
-    NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace, TraceFormatter, add_packet_trace,
+    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeProcessFn,
+    NodeResult, NodeRuntimeData, PacketTrace, TraceFormatter, add_packet_trace,
 };
+use hammer_core::data_plane::{NodeId, NodeNextStorage};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::IcmpHeader;
 use hammer_core::protocol::tcp::TcpWireHeader;
@@ -877,7 +878,7 @@ fn l4_checksum(_packet: &[u8], parsed: &ParsedIpPacket, protocol: u8, segment: &
 
 #[cfg(test)]
 mod tests {
-    use hammer_adapter::{NodeId, NodeNextStorage};
+    use hammer_core::data_plane::{NodeId, NodeNextStorage};
 
     use super::*;
 

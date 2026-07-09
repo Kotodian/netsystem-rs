@@ -998,9 +998,9 @@ mod tests {
 
     use crate::session::protocol::SessionQueueControlContext;
     use hammer_adapter::{
-        BufferFrame, InternalNode, Node, NodeId, NodeProcessFn, NodeRegistration, NodeResult,
-        NodeRuntimeData,
+        BufferFrame, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
     };
+    use hammer_core::data_plane::{NodeId, NodeRegistration};
     use hammer_infra::msg_queue::{SessionEvt, SessionEvtType};
     use hammer_runtime::app::AppSession;
 

@@ -9,8 +9,9 @@ use hammer_adapter::{
     BufferFrame, BufferFramePairBatch, BufferFrameQuadBatch, BufferIndex, BufferPacketCursor,
     BufferPool, BufferPoolArena, BufferRefMut, DataPlaneBufferConfig, DataPlaneBuffers,
     DataPlaneHandoff, DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig,
-    DataWorkerId, Frame, FrameBatchWidth, Next, NodeId, Pending,
+    DataWorkerId, Frame, FrameBatchWidth, Next, Pending,
 };
+use hammer_core::data_plane::NodeId;
 use hammer_core::error::CoreResult;
 use hammer_infra::vec::Vec;
 

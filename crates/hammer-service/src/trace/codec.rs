@@ -1,6 +1,6 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use hammer_adapter::NodeId;
+use hammer_core::data_plane::NodeId;
 use hammer_core::forwarding::DpoType;
 use hammer_core::protocol::icmp::IcmpErrorFamily;
 use hammer_core::protocol::ip::{

@@ -1,7 +1,7 @@
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeId, NodeProcessFn, NodeResult,
-    NodeRuntimeData,
+    BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
 };
+use hammer_core::data_plane::NodeId;
 
 use hammer_core::error::{CoreError, CoreResult};
 
@@ -238,7 +238,8 @@ mod tests {
         TcpInputNext, TcpQueue, TcpSessionDriver, TcpWorkerOwnedState, connect_tcp_session,
         set_tcp_worker_state,
     };
-    use hammer_adapter::{BufferPacketCursor, DataWorkerId, InternalNode, NodeId};
+    use hammer_adapter::{BufferPacketCursor, DataWorkerId, InternalNode};
+    use hammer_core::data_plane::NodeId;
     use hammer_core::error::CoreError;
 
     use super::*;

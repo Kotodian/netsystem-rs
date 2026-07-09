@@ -37,9 +37,8 @@ pub use component::{
 pub use connection::ConnectionHandle;
 pub use network::NetworkManager;
 pub use node::{
-    DriverNode, InternalNode, Node, NodeDescriptor, NodeEntry, NodeErrorCounters, NodeHandle,
-    NodeId, NodeKind, NodeNext, NodeNextStorage, NodeProcessFn, NodeRegistration, NodeResult,
-    NodeRuntime, NodeRuntimeData, NodeRuntimeReady, NodeState, NoopNode, default_prefetch_indices,
+    DriverNode, InternalNode, Node, NodeDescriptor, NodeEntry, NodeErrorCounters, NodeProcessFn,
+    NodeResult, NodeRuntime, NodeRuntimeData, NodeRuntimeReady, NoopNode, default_prefetch_indices,
 };
 pub use platform::{
     DefaultInterfaceUpdateListener, NetworkInterface, PlatformInterface, TunOptions, WifiState,

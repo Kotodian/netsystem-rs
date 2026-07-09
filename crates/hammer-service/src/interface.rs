@@ -4,9 +4,10 @@ use std::mem::transmute;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId, NodeProcessFn,
-    NodeRegistration, NodeResult, NodeRuntimeData, PacketTrace, TraceFormatter, add_packet_trace,
+    BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult,
+    NodeRuntimeData, PacketTrace, TraceFormatter, add_packet_trace,
 };
+use hammer_core::data_plane::{NodeId, NodeRegistration};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::forwarding::AdjacencyRewrite;
 use hammer_infra::map::{FlatHashKey, FlatHashTable};

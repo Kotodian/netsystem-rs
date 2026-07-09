@@ -1,7 +1,7 @@
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeId, NodeProcessFn, NodeResult,
-    NodeRuntimeData,
+    BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
 };
+use hammer_core::data_plane::NodeId;
 use hammer_core::error::{CoreError, CoreResult};
 
 use crate::session::runtime::RxDelivery;

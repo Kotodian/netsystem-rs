@@ -1,7 +1,8 @@
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId, NodeProcessFn,
-    NodeRegistration, NodeResult, NodeRuntimeData,
+    BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult,
+    NodeRuntimeData,
 };
+use hammer_core::data_plane::{NodeId, NodeRegistration};
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::tcp_header;
 

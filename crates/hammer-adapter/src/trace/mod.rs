@@ -5,12 +5,11 @@ use std::sync::{Arc, Mutex};
 
 use crossbeam_queue::SegQueue;
 use hammer_core::config::Trace;
+use hammer_core::data_plane::NodeId;
 use hammer_core::error::{CoreError, CoreResult};
 
 use hammer_infra::map::FlatHashTable;
 use hammer_infra::vec::Vec;
-
-use crate::node::NodeId;
 
 pub type TraceFormatter = fn(&[u8]) -> String;
 

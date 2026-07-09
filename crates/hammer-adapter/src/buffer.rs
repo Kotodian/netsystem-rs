@@ -14,6 +14,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
+use hammer_core::data_plane::{NodeHandle, NodeId, NodeNext};
 use hammer_core::error::{CoreError, CoreResult, DataPlaneError};
 use hammer_infra::{
     align::align_up,
@@ -31,7 +32,7 @@ use spinning_top::{
 use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HANDOFF_SLOT_CAPACITY, HandoffSlot};
 use crate::instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
 use crate::memory::{HAMMER_MAX_NUMA_NODES, StaticNumaTable};
-use crate::node::{NodeEntry, NodeHandle, NodeId, NodeNext, NodeRuntime};
+use crate::node::{NodeEntry, NodeRuntime};
 use crate::trace::{DataPlaneTrace, PacketTrace, TraceControlHandle};
 
 pub const DEFAULT_BUFFER_FRAME_CAPACITY: usize = 256;
@@ -494,12 +495,12 @@ impl Buffer {
     }
 
     #[inline]
-    pub fn current_config(&self) -> crate::NodeId {
-        crate::NodeId::new(self.cacheline0.current_config_or_punt)
+    pub fn current_config(&self) -> NodeId {
+        NodeId::new(self.cacheline0.current_config_or_punt)
     }
 
     #[inline]
-    pub fn set_current_config(&mut self, next: crate::NodeId) {
+    pub fn set_current_config(&mut self, next: NodeId) {
         self.cacheline0.current_config_or_punt = next.slot();
     }
 
@@ -1562,12 +1563,12 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    pub fn current_config(&self, index: BufferIndex) -> CoreResult<crate::NodeId> {
+    pub fn current_config(&self, index: BufferIndex) -> CoreResult<NodeId> {
         self.try_buffers()?.current_config(index)
     }
 
     #[inline]
-    pub fn set_current_config(&self, index: BufferIndex, next: crate::NodeId) -> CoreResult<()> {
+    pub fn set_current_config(&self, index: BufferIndex, next: NodeId) -> CoreResult<()> {
         self.try_buffers()?.set_current_config(index, next)
     }
 
@@ -1808,7 +1809,7 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    pub fn current_config(&self, index: BufferIndex) -> CoreResult<crate::NodeId> {
+    pub fn current_config(&self, index: BufferIndex) -> CoreResult<NodeId> {
         self.buffers.current_config(index)
     }
 
@@ -2453,12 +2454,12 @@ impl BufferPool {
     }
 
     #[inline]
-    pub fn current_config(&self, index: BufferIndex) -> CoreResult<crate::NodeId> {
+    pub fn current_config(&self, index: BufferIndex) -> CoreResult<NodeId> {
         Ok(self.arena.inner.read().buffer(index)?.current_config())
     }
 
     #[inline]
-    pub fn set_current_config(&self, index: BufferIndex, next: crate::NodeId) -> CoreResult<()> {
+    pub fn set_current_config(&self, index: BufferIndex, next: NodeId) -> CoreResult<()> {
         let mut guard = self.arena.inner.write();
         guard.ensure_header_exclusive(index)?;
         guard.buffer_mut(index)?.set_current_config(next);
@@ -4905,6 +4906,7 @@ mod tests {
         BufferIndex, BufferPool, DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig,
     };
     use crate::handoff::{DataPlaneHandoff, DataWorkerId};
+    use hammer_core::data_plane::NodeId;
     use hammer_core::error::CoreResult;
     use hammer_infra::vec::Vec;
 

@@ -4,8 +4,8 @@
 use std::sync::OnceLock;
 
 use hammer_adapter::NodeEntry;
-use hammer_adapter::NodeHandle;
 use hammer_component_macros::worker_init_function;
+use hammer_core::data_plane::NodeHandle;
 use hammer_core::error::HammerResult;
 use hammer_runtime::Engine;
 

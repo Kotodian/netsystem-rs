@@ -101,7 +101,7 @@ struct CorruptCurrentHeaderNode {
 }
 
 impl CorruptCurrentHeaderNode {
-    fn new(next: hammer_adapter::NodeId) -> Self {
+    fn new(next: hammer_core::data_plane::NodeId) -> Self {
         Self {
             runtime_data: NodeRuntimeData::from_words([u64::from(next.slot()), 0, 0, 0]),
         }
@@ -175,7 +175,7 @@ fn corrupt_current_header_process(
     frame: &mut BufferFrame,
 ) -> NodeResult {
     let slot = u32::try_from(data.word(0)).expect("corrupt next node id overflow");
-    let next = hammer_adapter::NodeId::new(slot);
+    let next = hammer_core::data_plane::NodeId::new(slot);
     let _ = frame.retain_indices(|index| {
         runtime
             .get_buffer_mut(index)
@@ -1033,7 +1033,7 @@ fn ip_lookup_uses_ip_input_cursor_without_reparsing_current_header() {
 fn register_sink(
     runtime: &DataPlaneRuntime,
     state: &Arc<Mutex<SinkState>>,
-) -> hammer_adapter::NodeId {
+) -> hammer_core::data_plane::NodeId {
     runtime
         .nodes()
         .register_internal(SinkNode::new(Arc::clone(state)))
@@ -1042,7 +1042,7 @@ fn register_sink(
 fn add_single_path(
     builder: &mut FibTableBuilder,
     proto: DpoProto,
-    node: hammer_adapter::NodeId,
+    node: hammer_core::data_plane::NodeId,
 ) -> hammer_service::net::LoadBalanceIndex {
     builder.add_single_path_load_balance(proto, node)
 }
@@ -1070,7 +1070,7 @@ fn alloc_packet_with_headroom(
 fn push_marked_packet(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
-    trace_input: hammer_adapter::NodeId,
+    trace_input: hammer_core::data_plane::NodeId,
     packet: &[u8],
 ) {
     let index = runtime

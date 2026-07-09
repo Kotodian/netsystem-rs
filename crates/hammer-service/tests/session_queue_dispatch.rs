@@ -3,8 +3,9 @@ use std::time::Instant;
 
 use hammer_adapter::{
     BufferFrame, DataPlaneBufferConfig, DataPlaneBuffers, DataPlaneRuntime, DataPlaneRuntimeConfig,
-    DataWorkerId, InternalNode, Node, NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData,
+    DataWorkerId, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
 };
+use hammer_core::data_plane::NodeRegistration;
 use hammer_core::error::CoreResult;
 use hammer_infra::segment::Local;
 use hammer_runtime::app::{AppSession, AppSessionConfig, SessionHandle};

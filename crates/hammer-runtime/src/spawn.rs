@@ -1354,10 +1354,10 @@ fn next_data_runtime_context_id() -> usize {
 mod tests {
     use super::*;
     use hammer_adapter::{
-        BufferFrame, DataPlaneRuntime, DriverNode, Node, NodeId, NodeProcessFn, NodeRegistration,
-        NodeResult, NodeRuntimeData, NodeState, TraceControlPlane, TraceEntry, TraceInputPolicy,
-        TracePolicy, TraceRecord,
+        BufferFrame, DataPlaneRuntime, DriverNode, Node, NodeProcessFn, NodeResult,
+        NodeRuntimeData, TraceControlPlane, TraceEntry, TraceInputPolicy, TracePolicy, TraceRecord,
     };
+    use hammer_core::data_plane::{NodeId, NodeRegistration, NodeState};
     use std::sync::{
         Arc, Mutex as StdMutex, OnceLock,
         atomic::{AtomicU64, Ordering},
@@ -1488,7 +1488,7 @@ mod tests {
                     let during = runtime.in_use_buffers();
                     let mut owner = runtime
                         .buffers()
-                        .get_next_frame(hammer_adapter::NodeId::new(0))
+                        .get_next_frame(hammer_core::data_plane::NodeId::new(0))
                         .expect("cleanup frame");
                     owner.push_index(index).expect("cleanup push");
                     (before, during)
@@ -1544,7 +1544,7 @@ mod tests {
                         .is_some();
                     let mut owner = runtime
                         .buffers()
-                        .get_next_frame(hammer_adapter::NodeId::new(0))
+                        .get_next_frame(hammer_core::data_plane::NodeId::new(0))
                         .expect("cleanup frame");
                     owner.push_index(index).expect("cleanup push");
                     marked
@@ -1660,7 +1660,7 @@ mod tests {
                             let during = runtime.in_use_buffers();
                             let mut owner = runtime
                                 .buffers()
-                                .get_next_frame(hammer_adapter::NodeId::new(0))
+                                .get_next_frame(hammer_core::data_plane::NodeId::new(0))
                                 .expect("local owner");
                             owner.push_index(buffer).expect("local push");
                             (before, during, owner)
@@ -1726,7 +1726,7 @@ mod tests {
                                 .expect("alloc local data buffer");
                             let mut owner = runtime
                                 .buffers()
-                                .get_next_frame(hammer_adapter::NodeId::new(0))
+                                .get_next_frame(hammer_core::data_plane::NodeId::new(0))
                                 .expect("local owner");
                             owner.push_index(index).expect("local push");
                             owner
@@ -1819,7 +1819,7 @@ mod tests {
                     let runtime = with_data_plane_buffers(Clone::clone);
                     let frame = std::rc::Rc::new(RefCell::new(
                         runtime
-                            .get_next_frame(hammer_adapter::NodeId::new(0))
+                            .get_next_frame(hammer_core::data_plane::NodeId::new(0))
                             .expect("alloc frame"),
                     ));
                     let index = runtime

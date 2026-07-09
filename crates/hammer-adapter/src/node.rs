@@ -6,6 +6,9 @@ use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
+use hammer_core::data_plane::{
+    MAX_NODE_NEXT_SLOTS, NodeHandle, NodeId, NodeKind, NodeNext, NodeRegistration, NodeState,
+};
 use hammer_core::error::{CoreError, CoreResult, DataPlaneError};
 use hammer_infra::boxed::Slice;
 
@@ -14,10 +17,9 @@ use crate::trace::TraceFormatter;
 
 pub mod next;
 
-pub const MAX_NODE_NEXT_SLOTS: usize = 16;
 const DEFAULT_SCHEDULED_FRAME_QUEUE_CAPACITY: usize = 4096;
 
-pub use next::{NodeNext, NodeNextStorage, default_prefetch_indices};
+pub use next::default_prefetch_indices;
 
 #[macro_export]
 macro_rules! process_frame {
@@ -28,10 +30,11 @@ macro_rules! process_frame {
         $(,)?
     ) => {{
         let width = $runtime.preferred_frame_batch_width();
-        let mut next_nodes: [Option<$crate::NodeId>; $crate::node::MAX_NODE_NEXT_SLOTS] =
-            [None; $crate::node::MAX_NODE_NEXT_SLOTS];
+        let mut next_nodes: [Option<::hammer_core::data_plane::NodeId>;
+            ::hammer_core::data_plane::MAX_NODE_NEXT_SLOTS] =
+            [None; ::hammer_core::data_plane::MAX_NODE_NEXT_SLOTS];
         let mut next_frames: [Option<$crate::Frame<$crate::Next>>;
-            $crate::node::MAX_NODE_NEXT_SLOTS] = ::std::array::from_fn(|_| None);
+            ::hammer_core::data_plane::MAX_NODE_NEXT_SLOTS] = ::std::array::from_fn(|_| None);
         let mut next_len = 0usize;
         let mut cached_next = None;
         let mut cached_offset = 0usize;
@@ -63,7 +66,7 @@ macro_rules! process_frame {
             let offset = match offset {
                 Some(offset) => offset,
                 None => {
-                    if next_len == $crate::node::MAX_NODE_NEXT_SLOTS {
+                    if next_len == ::hammer_core::data_plane::MAX_NODE_NEXT_SLOTS {
                         enqueue_failed = true;
                         return Ok(Some(packet_index));
                     }
@@ -114,31 +117,6 @@ macro_rules! process_frame {
     }};
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct NodeId(u32);
-
-impl NodeId {
-    #[inline(always)]
-    pub const fn new(slot: u32) -> Self {
-        Self(slot)
-    }
-
-    #[inline]
-    pub fn slot(self) -> u32 {
-        self.0
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct NodeHandle(u32);
-
-impl NodeHandle {
-    #[inline(always)]
-    pub const fn new(value: u32) -> Self {
-        Self(value)
-    }
-}
-
 pub trait Node {
     fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult;
 
@@ -183,21 +161,6 @@ pub trait Node {
             trace_formatter: self.node_trace_formatter(),
         })
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeKind {
-    Plain,
-    Driver,
-    Internal,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum NodeState {
-    Disabled,
-    #[default]
-    Polling,
-    Interrupt,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -348,39 +311,6 @@ pub trait InternalNode {
     #[inline]
     fn node_initial_nexts(&self) -> &[NodeId] {
         &[]
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeRegistration {
-    Plain,
-    Next {
-        name: &'static str,
-        next_count: usize,
-    },
-    Sibling {
-        name: &'static str,
-        sibling_of: &'static str,
-    },
-}
-
-impl NodeRegistration {
-    #[inline]
-    pub const fn next(name: &'static str, next_count: usize) -> Self {
-        Self::Next { name, next_count }
-    }
-
-    #[inline]
-    pub const fn sibling_of(name: &'static str, sibling_of: &'static str) -> Self {
-        Self::Sibling { name, sibling_of }
-    }
-
-    #[inline]
-    pub fn name(self) -> Option<&'static str> {
-        match self {
-            Self::Plain => None,
-            Self::Next { name, .. } | Self::Sibling { name, .. } => Some(name),
-        }
     }
 }
 
@@ -666,7 +596,7 @@ impl NodeRuntimeInner {
     }
 
     fn push_node_slot(&mut self, slot: NodeRuntimeSlot) -> NodeId {
-        let id = NodeId(u32::try_from(self.nodes.len()).expect("node index fits u32"));
+        let id = NodeId::new(u32::try_from(self.nodes.len()).expect("node index fits u32"));
         self.nodes.push(slot);
         self.node_states.push(NodeState::Polling);
         self.interrupt_pending.push(false);
@@ -754,7 +684,7 @@ impl NodeRuntimeInner {
         match registration {
             NodeRegistration::Plain => {
                 let id = self.push_function_node(kind, process, runtime_data);
-                self.node_trace_formatters[id.0 as usize] = trace_formatter;
+                self.node_trace_formatters[id.slot() as usize] = trace_formatter;
                 if let Some(handle) = handle {
                     self.handles.insert(handle, id);
                 }
@@ -762,14 +692,14 @@ impl NodeRuntimeInner {
             }
             NodeRegistration::Next { name, next_count } => {
                 let id = self.push_function_node(kind, process, runtime_data);
-                self.node_names[id.0 as usize] = Some(name);
-                self.node_trace_formatters[id.0 as usize] = trace_formatter;
+                self.node_names[id.slot() as usize] = Some(name);
+                self.node_trace_formatters[id.slot() as usize] = trace_formatter;
                 if let Some(next_names) = next_names {
-                    self.next_nodes[id.0 as usize] = vec![None; next_count];
-                    self.pending_next_names[id.0 as usize] =
+                    self.next_nodes[id.slot() as usize] = vec![None; next_count];
+                    self.pending_next_names[id.slot() as usize] =
                         next_names.iter().copied().map(Some).collect();
                 } else {
-                    self.next_nodes[id.0 as usize] = initial_nexts
+                    self.next_nodes[id.slot() as usize] = initial_nexts
                         .iter()
                         .copied()
                         .map(Some)
@@ -790,21 +720,21 @@ impl NodeRuntimeInner {
                     .ok_or_else(|| CoreError::internal("node sibling owner is not registered"))?;
                 let owner_nexts = self
                     .next_nodes
-                    .get(owner.0 as usize)
+                    .get(owner.slot() as usize)
                     .cloned()
                     .ok_or_else(|| CoreError::internal("node id out of bounds"))?;
                 let id = self.push_function_node(kind, process, runtime_data);
-                self.node_names[id.0 as usize] = Some(name);
-                self.node_trace_formatters[id.0 as usize] = trace_formatter;
-                self.next_nodes[id.0 as usize] = owner_nexts;
-                self.sibling_owners[id.0 as usize] = Some(owner);
-                let mut group = self.siblings[owner.0 as usize].clone();
+                self.node_names[id.slot() as usize] = Some(name);
+                self.node_trace_formatters[id.slot() as usize] = trace_formatter;
+                self.next_nodes[id.slot() as usize] = owner_nexts;
+                self.sibling_owners[id.slot() as usize] = Some(owner);
+                let mut group = self.siblings[owner.slot() as usize].clone();
                 group.push(owner);
                 let mut sibling_index = 0usize;
                 while sibling_index < group.len() {
                     let sibling = group[sibling_index];
-                    self.siblings[sibling.0 as usize].push(id);
-                    self.siblings[id.0 as usize].push(sibling);
+                    self.siblings[sibling.slot() as usize].push(id);
+                    self.siblings[id.slot() as usize].push(sibling);
                     sibling_index += 1;
                 }
                 self.declared_nodes.insert(name, id);
@@ -850,7 +780,7 @@ impl NodeRuntimeInner {
                 slot += 1;
                 continue;
             };
-            self.next_nodes[slot] = self.next_nodes[owner.0 as usize].clone();
+            self.next_nodes[slot] = self.next_nodes[owner.slot() as usize].clone();
             slot += 1;
         }
 
@@ -858,7 +788,7 @@ impl NodeRuntimeInner {
     }
 
     fn validate_node(&self, node: NodeId) -> CoreResult<()> {
-        if self.nodes.get(node.0 as usize).is_none() {
+        if self.nodes.get(node.slot() as usize).is_none() {
             return Err(CoreError::internal("node id out of bounds"));
         }
         Ok(())
@@ -867,7 +797,7 @@ impl NodeRuntimeInner {
     fn node_next_slot(&self, node: NodeId, slot: usize) -> CoreResult<NodeId> {
         self.validate_node(node)?;
         self.next_nodes
-            .get(node.0 as usize)
+            .get(node.slot() as usize)
             .and_then(|nexts| nexts.get(slot))
             .copied()
             .flatten()
@@ -877,16 +807,16 @@ impl NodeRuntimeInner {
     fn set_node_next_slot(&mut self, node: NodeId, slot: usize, next: NodeId) -> CoreResult<()> {
         let next_count = self
             .next_nodes
-            .get(node.0 as usize)
+            .get(node.slot() as usize)
             .map(Vec::len)
             .ok_or_else(|| CoreError::internal("node id out of bounds"))?;
         if slot >= next_count {
             return Err(CoreError::internal("node next slot out of range"));
         }
-        let mut group = self.siblings[node.0 as usize].clone();
+        let mut group = self.siblings[node.slot() as usize].clone();
         group.push(node);
         for sibling in group {
-            self.next_nodes[sibling.0 as usize][slot] = Some(next);
+            self.next_nodes[sibling.slot() as usize][slot] = Some(next);
         }
         Ok(())
     }
@@ -896,18 +826,18 @@ impl NodeRuntimeInner {
         self.validate_node(next)?;
         let slot = self
             .next_nodes
-            .get(node.0 as usize)
+            .get(node.slot() as usize)
             .map(Vec::len)
             .ok_or_else(|| CoreError::internal("node id out of bounds"))?;
         if slot >= MAX_NODE_NEXT_SLOTS {
             return Err(CoreError::internal("node next slot capacity exceeded"));
         }
-        let mut group = self.siblings[node.0 as usize].clone();
+        let mut group = self.siblings[node.slot() as usize].clone();
         group.push(node);
         for sibling in group {
             let sibling_nexts = self
                 .next_nodes
-                .get_mut(sibling.0 as usize)
+                .get_mut(sibling.slot() as usize)
                 .ok_or_else(|| CoreError::internal("node id out of bounds"))?;
             if sibling_nexts.len() != slot {
                 return Err(CoreError::internal("node sibling next count mismatch"));
@@ -1189,14 +1119,14 @@ impl NodeRuntime {
     pub fn node_kind(&self, node: NodeId) -> CoreResult<NodeKind> {
         let inner = self.inner.borrow();
         inner.validate_node(node)?;
-        Ok(inner.nodes[node.0 as usize].kind)
+        Ok(inner.nodes[node.slot() as usize].kind)
     }
 
     #[inline]
     pub fn node_state(&self, node: NodeId) -> CoreResult<NodeState> {
         let inner = self.inner.borrow();
         inner.validate_node(node)?;
-        Ok(inner.node_states[node.0 as usize])
+        Ok(inner.node_states[node.slot() as usize])
     }
 
     pub fn polling_driver_nodes(&self) -> CoreResult<hammer_infra::vec::Vec<NodeId>> {
@@ -1220,14 +1150,14 @@ impl NodeRuntime {
     pub fn set_node_state(&self, node: NodeId, state: NodeState) -> CoreResult<()> {
         let mut inner = self.inner.borrow_mut();
         inner.validate_node(node)?;
-        inner.node_states[node.0 as usize] = state;
+        inner.node_states[node.slot() as usize] = state;
         Ok(())
     }
 
     pub(crate) fn mark_interrupt_pending(&self, node: NodeId) -> CoreResult<bool> {
         let mut inner = self.inner.borrow_mut();
         inner.validate_node(node)?;
-        let slot = node.0 as usize;
+        let slot = node.slot() as usize;
         if inner.nodes[slot].kind != NodeKind::Driver {
             return Err(CoreError::internal("node is not a driver node"));
         }
@@ -1247,7 +1177,7 @@ impl NodeRuntime {
     pub(crate) fn clear_interrupt_pending(&self, node: NodeId) -> CoreResult<()> {
         let mut inner = self.inner.borrow_mut();
         inner.validate_node(node)?;
-        inner.interrupt_pending[node.0 as usize] = false;
+        inner.interrupt_pending[node.slot() as usize] = false;
         Ok(())
     }
 
@@ -1255,7 +1185,11 @@ impl NodeRuntime {
     pub fn node_name(&self, node: NodeId) -> CoreResult<Option<&'static str>> {
         let inner = self.inner.borrow();
         inner.validate_node(node)?;
-        Ok(inner.node_names.get(node.0 as usize).copied().flatten())
+        Ok(inner
+            .node_names
+            .get(node.slot() as usize)
+            .copied()
+            .flatten())
     }
 
     #[inline]
@@ -1264,7 +1198,7 @@ impl NodeRuntime {
         inner.validate_node(node)?;
         Ok(inner
             .node_trace_formatters
-            .get(node.0 as usize)
+            .get(node.slot() as usize)
             .copied()
             .flatten())
     }
@@ -1284,7 +1218,7 @@ impl NodeRuntime {
         let mut inner = self.inner.borrow_mut();
         inner
             .error_counters
-            .get_mut(node.0 as usize)
+            .get_mut(node.slot() as usize)
             .ok_or_else(|| CoreError::internal("node id out of bounds"))?
             .increment(code);
         let key = NodeRuntimeInner::error_key(node, code);
@@ -1310,7 +1244,7 @@ impl NodeRuntime {
             .inner
             .borrow()
             .error_counters
-            .get(node.0 as usize)
+            .get(node.slot() as usize)
             .ok_or_else(|| CoreError::internal("node id out of bounds"))?
             .get(code))
     }
@@ -1334,11 +1268,11 @@ impl NodeRuntime {
     }
 
     pub fn node_nexts<const COUNT: usize>(&self, node: NodeId) -> CoreResult<[NodeId; COUNT]> {
-        let mut nexts = [NodeId(0); COUNT];
+        let mut nexts = [NodeId::new(0); COUNT];
         let inner = self.inner.borrow();
         let node_nexts = inner
             .next_nodes
-            .get(node.0 as usize)
+            .get(node.slot() as usize)
             .ok_or_else(|| CoreError::internal("node id out of bounds"))?;
         if node_nexts.len() != COUNT {
             return Err(CoreError::internal("node next count mismatch"));
@@ -1379,7 +1313,7 @@ impl NodeRuntime {
         inner.validate_node(node)?;
         inner
             .siblings
-            .get(node.0 as usize)
+            .get(node.slot() as usize)
             .cloned()
             .ok_or_else(|| CoreError::internal("node id out of bounds"))
     }
@@ -1444,7 +1378,7 @@ impl NodeRuntime {
         let mut inner = self.inner.borrow_mut();
         let stats = inner
             .runtime_stats
-            .get_mut(node.0 as usize)
+            .get_mut(node.slot() as usize)
             .ok_or_else(|| CoreError::internal("node id out of bounds"))?;
         stats.calls = stats.calls.saturating_add(1);
         stats.vectors = stats.vectors.saturating_add(vectors as u64);
@@ -1461,7 +1395,7 @@ impl NodeRuntime {
         let inner = self.inner.borrow();
         inner
             .nodes
-            .get(node.0 as usize)
+            .get(node.slot() as usize)
             .copied()
             .ok_or_else(|| CoreError::internal("node id out of bounds"))
     }

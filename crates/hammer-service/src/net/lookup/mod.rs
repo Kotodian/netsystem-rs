@@ -6,11 +6,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwapOption;
 use hammer_adapter::{
-    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, InternalNode, Node, NodeId,
-    NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData, PacketTrace, SecondaryOpaque,
-    TraceFormatter, add_packet_trace, unlikely,
+    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, InternalNode, Node,
+    NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace, SecondaryOpaque, TraceFormatter,
+    add_packet_trace, unlikely,
 };
 use hammer_core::config::{Config, Route, RouteAction};
+use hammer_core::data_plane::{NodeId, NodeRegistration};
 use hammer_core::error::{CoreError, CoreResult, HammerResult};
 use hammer_core::forwarding::{
     Adjacency as CoreAdjacency, DpoId as CoreDpoId, FibEntry as CoreFibEntry,

@@ -46,7 +46,7 @@ impl Node for BlackholeNode {
 
 impl InternalNode for BlackholeNode {}
 
-fn setup_output() -> (DataPlaneRuntime, hammer_adapter::NodeId) {
+fn setup_output() -> (DataPlaneRuntime, hammer_core::data_plane::NodeId) {
     let runtime = test_runtime_configured(2048, 16, 8, 8);
     let drop = runtime.nodes().register_internal(BlackholeNode);
     let lookup = runtime.nodes().register_internal(BlackholeNode);

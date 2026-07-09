@@ -11,10 +11,11 @@ use crate::trace::codec::{
 };
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, DataWorkerId, Node, NodeHandle,
-    NodeId, NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
-    SecondaryOpaque, TraceFormatter, add_packet_trace,
+    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, DataWorkerId, Node,
+    NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace, SecondaryOpaque, TraceFormatter,
+    add_packet_trace,
 };
+use hammer_core::data_plane::{NodeHandle, NodeId, NodeNextStorage};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
 use hammer_core::protocol::tcp::{TcpError, TcpInputFlags, TcpSegmentFlags, tcp_header};
@@ -638,8 +639,9 @@ mod tests {
     use arc_swap::ArcSwap;
     use hammer_adapter::{
         BufferFrame, DataPlaneHandoff, DataPlaneRuntime, DataWorkerId, InternalNode, Node,
-        NodeHandle, NodeProcessFn, NodeResult, NodeRuntimeData,
+        NodeProcessFn, NodeResult, NodeRuntimeData,
     };
+    use hammer_core::data_plane::NodeHandle;
     use hammer_core::error::CoreResult;
     use hammer_core::protocol::tcp::{TcpCapabilities, TcpConnectionId};
 
