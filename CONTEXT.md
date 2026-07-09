@@ -24,6 +24,10 @@ _Avoid_: helper node, background worker, side task
 A named graph edge selected by a graph node for a packet or frame. Next arcs are resolved by graph registration and are not ad hoc node ids passed through protocol code.
 _Avoid_: output callback, destination handler, manually routed node id
 
+**Graph Identity**:
+The core vocabulary that names packet graph participants and their static edge shape, such as node ids, node handles, node kinds, node states, node registrations, and next-arc labels. Graph identity is data-plane vocabulary, not graph execution policy.
+_Avoid_: adapter node identity, runtime-only id, execution trait
+
 **Pending Frame**:
 A Hammer-owned frame scheduled for a graph node to process. A Pending Frame is the current graph node's input ownership state.
 _Avoid_: input vector, borrowed frame, current frame carrier
@@ -50,6 +54,10 @@ _Avoid_: tokio worker, control thread, generic thread
 One fixed-order pass through worker scheduling, ready graph nodes, local tasks, driver polling, timers, and exit checks. Step order is part of the runtime semantics.
 _Avoid_: event loop tick, reactor pass, arbitrary scheduler iteration
 
+**Graph Runtime**:
+The runtime-owned execution context for a Data Worker's Packet Graph, including graph node state, next-arc resolution, pending-frame scheduling, readiness, dispatch, and graph runtime statistics.
+_Avoid_: adapter graph runtime, scheduler helper, node registry wrapper
+
 **Barrier Synchronization**:
 The control-plane mechanism that pauses data workers at a known point so control changes can observe a stable data-plane state. It is not a lock taken around hot-path packet processing.
 _Avoid_: global mutex, graph lock, packet-path synchronization
@@ -59,6 +67,10 @@ A data-plane transfer of packet ownership from one worker to another through wor
 _Avoid_: crossbeam channel payload, TCP migration copy, app queue transfer
 
 ## Buffer And Memory
+
+**Data-Plane Primitive**:
+A packet-path data structure that represents Hammer's shared buffer, frame, packet cursor, frame ownership, or graph identity vocabulary. Data-plane primitives are domain primitives built from generic infrastructure, not generic collections or runtime scheduling policy.
+_Avoid_: infra container, runtime scheduler state, helper object
 
 **Data-Plane Buffer**:
 A VPP-style packet buffer with header state and inline packet storage. Protocol code may move the current window, prepend headers, append bytes, and link buffers by buffer-header state.
