@@ -18,8 +18,20 @@ const ROOT_BANNED_RUNTIME_IMPORTS: &[&str] = &[
     "NodeResult",
     "NodeRuntime",
     "NodeRuntimeData",
+    "NodeErrorCounters",
     "NodeRuntimeReady",
+    "NodeRuntimeStatsRow",
     "NoopNode",
+    "default_prefetch_indices",
+    "PacketTrace",
+    "TraceControlHandle",
+    "TraceControlPlane",
+    "TraceEntry",
+    "TraceFormatter",
+    "TraceInputPolicy",
+    "TracePolicy",
+    "TraceRecord",
+    "TraceRecordSink",
     "process_frame",
     "add_packet_trace",
 ];
@@ -41,8 +53,21 @@ const DIRECT_BANNED_RUNTIME_OWNER_PATHS: &[&str] = &[
     "hammer_adapter::NodeResult",
     "hammer_adapter::NodeRuntime",
     "hammer_adapter::NodeRuntimeData",
+    "hammer_adapter::NodeErrorCounters",
     "hammer_adapter::NodeRuntimeReady",
+    "hammer_adapter::NodeRuntimeStatsRow",
     "hammer_adapter::NoopNode",
+    "hammer_adapter::default_prefetch_indices",
+    "hammer_adapter::DataPlaneTrace",
+    "hammer_adapter::PacketTrace",
+    "hammer_adapter::TraceControlHandle",
+    "hammer_adapter::TraceControlPlane",
+    "hammer_adapter::TraceEntry",
+    "hammer_adapter::TraceFormatter",
+    "hammer_adapter::TraceInputPolicy",
+    "hammer_adapter::TracePolicy",
+    "hammer_adapter::TraceRecord",
+    "hammer_adapter::TraceRecordSink",
     "hammer_adapter::process_frame",
     "hammer_adapter::add_packet_trace",
     "hammer_adapter::node::",
@@ -78,8 +103,8 @@ fn graph_runtime_owner_paths_do_not_point_at_adapter() {
 #[test]
 fn grouped_adapter_runtime_imports_are_rejected() {
     let source = r#"
-        use hammer_adapter::{DataPlaneRuntime, PlatformInterface};
-        pub use hammer_adapter::{NodeEntry};
+        use hammer_adapter::{DataPlaneRuntime, NodeRuntimeStatsRow, PlatformInterface};
+        pub use hammer_adapter::{NodeEntry, TracePolicy};
     "#;
 
     let violations = scan_source_for_violations("sample.rs", source);
@@ -94,6 +119,18 @@ fn grouped_adapter_runtime_imports_are_rejected() {
             .iter()
             .any(|violation| violation.contains("NodeEntry")),
         "expected grouped pub use to be rejected: {violations:#?}"
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("NodeRuntimeStatsRow")),
+        "expected grouped stats import to be rejected: {violations:#?}"
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("TracePolicy")),
+        "expected grouped trace re-export to be rejected: {violations:#?}"
     );
     assert!(
         violations

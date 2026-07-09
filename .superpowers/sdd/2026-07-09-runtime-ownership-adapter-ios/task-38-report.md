@@ -130,3 +130,35 @@ The test commands still emit pre-existing warning noise, mostly deprecated `Flat
 ### Concerns
 
 - Required commands still emit pre-existing workspace warnings unrelated to this fix.
+
+## Fix Amendment (Guard Coverage Follow-Up)
+
+### What I Fixed
+
+- Expanded `crates/hammer-runtime/tests/graph_runtime_owner_guard.rs` root banned imports to match the moved runtime contracts that are now publicly re-exported from `crates/hammer-runtime/src/lib.rs`, including:
+  - node/stats symbols: `NodeErrorCounters`, `NodeRuntimeStatsRow`, `default_prefetch_indices`
+  - trace contracts: `PacketTrace`, `TraceControlHandle`, `TraceControlPlane`, `TraceEntry`, `TraceFormatter`, `TraceInputPolicy`, `TracePolicy`, `TraceRecord`, `TraceRecordSink`
+- Expanded direct banned adapter owner paths for the same moved symbols, plus `hammer_adapter::DataPlaneTrace`, so old root/direct adapter imports and re-exports fail the guard.
+- Added grouped-import regression coverage for one previously omitted node/stats symbol and one previously omitted trace symbol:
+  - `use hammer_adapter::{..., NodeRuntimeStatsRow, ...};`
+  - `pub use hammer_adapter::{..., TracePolicy};`
+- Kept allowed adapter OS/component/platform traits unbanned; the regression still proves `PlatformInterface` remains allowed.
+
+### TDD Evidence
+
+- RED: `cargo test -p hammer-runtime --test graph_runtime_owner_guard` failed because grouped `NodeRuntimeStatsRow` and `TracePolicy` imports were not rejected.
+- GREEN: after expanding the banned symbol lists, `cargo test -p hammer-runtime --test graph_runtime_owner_guard` passed.
+
+### Tests Run And Results
+
+- `cargo test -p hammer-runtime --test graph_runtime_owner_guard` - passed, 2 tests.
+- `cargo fmt --all -- --check` - passed.
+
+### Files Changed
+
+- `crates/hammer-runtime/tests/graph_runtime_owner_guard.rs`
+- `.superpowers/sdd/2026-07-09-runtime-ownership-adapter-ios/task-38-report.md`
+
+### Concerns
+
+- Verification still emits pre-existing workspace deprecation/unused warnings unrelated to this guard coverage fix.
