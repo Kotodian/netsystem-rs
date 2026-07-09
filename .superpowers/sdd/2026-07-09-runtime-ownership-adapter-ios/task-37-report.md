@@ -125,3 +125,35 @@
 
 - The verification runs still emit existing warning noise, mostly deprecated `FlatHashTable` usage and unrelated unused/private-interface warnings. No warnings were treated as failures in this task.
 - The manual stale-import audit exits with code 1 when there are no matches; this is the expected `rg` no-match exit, not a failure.
+
+## Fix amendment (review findings)
+
+### What I fixed
+
+- Removed the stale adapter-owned memory module declaration from `crates/hammer-adapter/src/lib.rs`.
+- Deleted `crates/hammer-adapter/src/memory.rs`, which was still carrying the duplicate adapter copy of `StaticNumaTable` and `HAMMER_MAX_NUMA_NODES` after ownership moved to core.
+- Strengthened `crates/hammer-core/tests/data_plane_buffer_owner_guard.rs` so the guard now inspects full `use hammer_adapter::{...};` statements, including multiline braced imports, and rejects moved root imports such as `BufferIndex` while still allowing remaining runtime imports like `DataPlaneRuntime`.
+- Added focused guard self-tests covering:
+  - rejected root braced moved imports
+  - rejected multiline root braced moved imports
+  - allowed root braced runtime-only imports
+
+### Tests run and results
+
+- `cargo test -p hammer-core --test data_plane_buffer_owner_guard`
+  - PASS: 4 passed.
+- `cargo test -p hammer-adapter`
+  - PASS: all hammer-adapter unit/integration/doc tests passed.
+- `cargo fmt --all -- --check`
+  - PASS.
+
+### Files changed
+
+- `crates/hammer-adapter/src/lib.rs`
+- `crates/hammer-adapter/src/memory.rs` (deleted)
+- `crates/hammer-core/tests/data_plane_buffer_owner_guard.rs`
+- `.superpowers/sdd/2026-07-09-runtime-ownership-adapter-ios/task-37-report.md`
+
+### Concerns
+
+- Test output still includes pre-existing warning noise from deprecated `FlatHashTable` usage and unrelated unused-code warnings; these were unchanged by this amendment.

@@ -4,7 +4,6 @@ pub mod component;
 pub mod connection;
 pub mod handoff;
 pub mod instruction_set;
-mod memory;
 pub mod network;
 pub mod node;
 pub mod platform;

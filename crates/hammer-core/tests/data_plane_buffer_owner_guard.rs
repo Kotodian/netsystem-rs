@@ -71,6 +71,42 @@ const MOVED_ADAPTER_PATTERNS: &[&str] = &[
     "hammer_adapter::buffer::BufferFramePending",
 ];
 
+const MOVED_ROOT_IMPORTS: &[&str] = &[
+    "DEFAULT_BUFFER_FRAME_CAPACITY",
+    "DEFAULT_BUFFER_FRAME_POOL_SIZE",
+    "BUFFER_CACHE_LINE_SIZE",
+    "DEFAULT_PACKET_HEADROOM",
+    "DEFAULT_PRE_DATA_SIZE",
+    "BUFFER_INVALID_INDEX",
+    "BUFFER_THREAD_CACHE_BATCH",
+    "BUFFER_THREAD_CACHE_HIGH_WATER",
+    "BUFFER_IN_USE_FOLD_THRESHOLD",
+    "PrimaryOpaque",
+    "SecondaryOpaque",
+    "BufferFlags",
+    "BufferHeaderCacheline0",
+    "BufferHeaderCacheline1",
+    "Buffer",
+    "BufferIndex",
+    "FrameIndex",
+    "BufferFrame",
+    "Frame",
+    "Next",
+    "Pending",
+    "BufferPacketCursor",
+    "BufferNodeError",
+    "DataPlaneBuffers",
+    "BufferPool",
+    "BufferPoolArena",
+    "BufferRef",
+    "BufferRefMut",
+    "BufferThreadCache",
+    "DataPlaneBufferConfig",
+    "BufferFrameDrain",
+    "DataPlaneBufferChain",
+    "BufferFramePending",
+];
+
 const SCANNED_ROOTS: &[&str] = &[
     "crates/hammer-runtime/src",
     "crates/hammer-runtime/tests",
@@ -132,4 +168,83 @@ fn scan_file(path: &Path, violations: &mut std::vec::Vec<String>) {
             }
         }
     }
+
+    for (statement_line, statement) in use_statements(&text) {
+        if let Some(moved_import) = moved_root_import_in_use_statement(&statement) {
+            violations.push(format!(
+                "{}:{}: hammer_adapter::{{{}}}",
+                path.display(),
+                statement_line,
+                moved_import
+            ));
+        }
+    }
+}
+
+fn use_statements(text: &str) -> std::vec::Vec<(usize, String)> {
+    let mut statements = std::vec::Vec::new();
+    let mut start = None;
+
+    for (line_index, line) in text.lines().enumerate() {
+        if start.is_none() && line.contains("use ") {
+            start = Some(line_index);
+        }
+
+        if let Some(start_line) = start {
+            if line.contains(';') {
+                let statement = text
+                    .lines()
+                    .skip(start_line)
+                    .take(line_index - start_line + 1)
+                    .collect::<std::vec::Vec<_>>()
+                    .join("\n");
+                statements.push((start_line + 1, statement));
+                start = None;
+            }
+        }
+    }
+
+    statements
+}
+
+fn moved_root_import_in_use_statement(statement: &str) -> Option<&'static str> {
+    let (_, remainder) = statement.split_once("use hammer_adapter::{")?;
+    let (inside_braces, _) = remainder.split_once('}')?;
+    for imported in inside_braces.split(',') {
+        let imported = imported.trim();
+        let imported = imported.split_whitespace().next().unwrap_or(imported);
+        if let Some(moved_import) = MOVED_ROOT_IMPORTS
+            .iter()
+            .copied()
+            .find(|item| *item == imported)
+        {
+            return Some(moved_import);
+        }
+    }
+
+    None
+}
+
+#[test]
+fn root_braced_adapter_imports_for_moved_primitives_are_rejected() {
+    let statement = "use hammer_adapter::{BufferIndex, DataPlaneRuntime};";
+    assert_eq!(
+        moved_root_import_in_use_statement(statement),
+        Some("BufferIndex")
+    );
+}
+
+#[test]
+fn multiline_root_braced_adapter_imports_are_rejected() {
+    let statement = "use hammer_adapter::{\n    BufferFrame,\n    DataPlaneRuntime,\n};";
+    assert_eq!(
+        moved_root_import_in_use_statement(statement),
+        Some("BufferFrame")
+    );
+}
+
+#[test]
+fn remaining_runtime_root_imports_are_allowed() {
+    let statement = "use hammer_adapter::{DataPlaneRuntime, DataPlaneRuntimeConfig};";
+    assert_eq!(moved_root_import_in_use_statement(statement), None);
 }
