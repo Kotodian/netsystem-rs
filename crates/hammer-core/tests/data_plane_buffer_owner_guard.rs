@@ -208,17 +208,24 @@ fn use_statements(text: &str) -> std::vec::Vec<(usize, String)> {
 }
 
 fn is_guard_fixture(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            matches!(
-                name,
-                "adapter_deletion_guard.rs"
-                    | "data_plane_buffer_owner_guard.rs"
-                    | "data_plane_graph_identity.rs"
-                    | "graph_runtime_owner_guard.rs"
-            )
-        })
+    let Some(relative_path) = path.strip_prefix(workspace_root()).ok() else {
+        return false;
+    };
+
+    matches!(
+        relative_path.to_string_lossy().as_ref(),
+        "crates/hammer-runtime/tests/adapter_deletion_guard.rs"
+            | "crates/hammer-core/tests/data_plane_buffer_owner_guard.rs"
+            | "crates/hammer-core/tests/data_plane_graph_identity.rs"
+            | "crates/hammer-runtime/tests/graph_runtime_owner_guard.rs"
+    )
+}
+
+fn workspace_root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("hammer-core lives under crates/hammer-core")
 }
 
 fn moved_root_import_in_use_statement(statement: &str) -> Option<&'static str> {

@@ -218,9 +218,18 @@ fn is_relevant_source_file(path: &Path) -> bool {
 }
 
 fn is_guard_test(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name == "graph_runtime_owner_guard.rs")
+    let Some(relative_path) = path.strip_prefix(workspace_root()).ok() else {
+        return false;
+    };
+
+    relative_path == Path::new("crates/hammer-runtime/tests/graph_runtime_owner_guard.rs")
+}
+
+fn workspace_root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("hammer-runtime lives under crates/hammer-runtime")
 }
 
 fn scan_file_for_violations(path: &Path) -> Vec<String> {

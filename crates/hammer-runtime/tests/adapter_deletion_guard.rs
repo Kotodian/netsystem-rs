@@ -92,7 +92,7 @@ fn hammer_adapter_is_not_an_active_workspace_crate_or_dependency() {
         violations.push("crates/hammer-adapter still exists".to_owned());
     }
 
-    for manifest in crate_manifests(&root) {
+    for manifest in repo_manifests(&root) {
         let text = fs::read_to_string(&manifest)
             .unwrap_or_else(|err| panic!("read {}: {err}", manifest.display()));
         if text.contains("hammer-adapter") {
@@ -165,6 +165,38 @@ fn curated_retired_adapter_patterns_allow_current_runtime_surfaces() {
     assert!(find_retired_adapter_pattern("pub trait ComponentMetadata {").is_none());
 }
 
+#[test]
+fn curated_retired_adapter_patterns_do_not_match_identifier_substrings() {
+    assert!(find_retired_adapter_pattern("pub struct ConnectionHandleMap;").is_none());
+    assert!(find_retired_adapter_pattern("pub struct ServiceManagerMetrics;").is_none());
+    assert!(find_retired_adapter_pattern("pub struct NetworkManagerState;").is_none());
+}
+
+#[test]
+fn curated_retired_adapter_patterns_still_match_exact_deleted_identifiers() {
+    assert_eq!(
+        find_retired_adapter_pattern("pub struct ConnectionHandle;").map(|pattern| pattern.term),
+        Some("ConnectionHandle")
+    );
+    assert_eq!(
+        find_retired_adapter_pattern("pub trait ServiceManager {}").map(|pattern| pattern.term),
+        Some("ServiceManager")
+    );
+    assert_eq!(
+        find_retired_adapter_pattern("pub trait NetworkManager {}").map(|pattern| pattern.term),
+        Some("NetworkManager")
+    );
+}
+
+#[test]
+fn manifest_collection_includes_current_repo_manifests_outside_crates() {
+    let root = workspace_root();
+    let manifests = repo_manifests(&root);
+
+    assert!(manifests.contains(&root.join("Cargo.toml")));
+    assert!(manifests.contains(&root.join("third_party/boringtun/Cargo.toml")));
+}
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -173,9 +205,9 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn crate_manifests(root: &Path) -> Vec<PathBuf> {
+fn repo_manifests(root: &Path) -> Vec<PathBuf> {
     let mut manifests = Vec::new();
-    collect_named_files(&root.join("crates"), "Cargo.toml", &mut manifests);
+    collect_manifest_files(root, &mut manifests);
     manifests.sort();
     manifests
 }
@@ -201,18 +233,21 @@ fn source_files(root: &Path) -> Vec<PathBuf> {
 fn find_retired_adapter_pattern(line: &str) -> Option<&'static RetiredAdapterPattern> {
     RETIRED_ADAPTER_SOURCE_PATTERNS
         .iter()
-        .find(|pattern| line.contains(pattern.term))
+        .find(|pattern| line_contains_exact_term(line, pattern.term))
 }
 
-fn collect_named_files(dir: &Path, name: &str, files: &mut Vec<PathBuf>) {
+fn collect_manifest_files(dir: &Path, files: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for entry in entries {
         let path = entry.expect("read directory entry").path();
+        if should_skip_manifest_path(&path) {
+            continue;
+        }
         if path.is_dir() {
-            collect_named_files(&path, name, files);
-        } else if path.file_name().and_then(|file_name| file_name.to_str()) == Some(name) {
+            collect_manifest_files(&path, files);
+        } else if path.file_name().and_then(|file_name| file_name.to_str()) == Some("Cargo.toml") {
             files.push(path);
         }
     }
@@ -236,12 +271,47 @@ fn collect_rs_files(dir: &Path, files: &mut Vec<PathBuf>) {
 }
 
 fn should_skip_source_path(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            name == "adapter_deletion_guard.rs"
-                || name == "data_plane_buffer_owner_guard.rs"
-                || name == "data_plane_graph_identity.rs"
-                || name == "graph_runtime_owner_guard.rs"
-        })
+    let Some(relative_path) = path.strip_prefix(workspace_root()).ok() else {
+        return false;
+    };
+
+    matches!(
+        relative_path.to_string_lossy().as_ref(),
+        "crates/hammer-runtime/tests/adapter_deletion_guard.rs"
+            | "crates/hammer-core/tests/data_plane_buffer_owner_guard.rs"
+            | "crates/hammer-core/tests/data_plane_graph_identity.rs"
+            | "crates/hammer-runtime/tests/graph_runtime_owner_guard.rs"
+    )
+}
+
+fn should_skip_manifest_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component.as_os_str().to_str(),
+            Some("target" | ".git" | ".superpowers" | "docs")
+        )
+    })
+}
+
+fn line_contains_exact_term(line: &str, term: &str) -> bool {
+    let mut search_start = 0;
+
+    while let Some(relative_index) = line[search_start..].find(term) {
+        let start = search_start + relative_index;
+        let end = start + term.len();
+        let previous = line[..start].chars().next_back();
+        let next = line[end..].chars().next();
+
+        if is_term_boundary(previous) && is_term_boundary(next) {
+            return true;
+        }
+
+        search_start = end;
+    }
+
+    false
+}
+
+fn is_term_boundary(ch: Option<char>) -> bool {
+    ch.is_none_or(|ch| !matches!(ch, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_'))
 }
