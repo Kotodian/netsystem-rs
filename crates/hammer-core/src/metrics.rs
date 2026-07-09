@@ -339,8 +339,8 @@ fn labels_sort_key(labels: &[MetricLabel]) -> String {
 /// Install once per process via [`metrics::set_global_recorder`]; afterwards
 /// every `metrics::counter!()` / `metrics::gauge!()` call (including the
 /// ones emitted by `metrics-derive`) lands in the same backing storage that
-/// [`MetricsRegistry::snapshot`] reads, so the existing FFI / log-dump
-/// paths keep working unchanged.
+/// [`MetricsRegistry::snapshot`] reads, so snapshot and log-dump paths keep
+/// working unchanged.
 ///
 /// Each recorder pins a single `(module, component_type, component_id)`
 /// scope; the metric name and any labels supplied via `metrics::Key` are

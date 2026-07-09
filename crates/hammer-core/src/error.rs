@@ -1,10 +1,8 @@
 use thiserror::Error;
 
-/// Internal error type used by foundational layers (config, log, lifecycle,
-/// runtime registry). The user-facing `HammerError` lives in `hammer-ffi` and
-/// converts from this through `From<CoreError>` — that split is what lets the
-/// uniffi `udl_derive(Error)` macro stay inside `hammer-ffi` and avoid
-/// orphan-rule violations.
+/// Error type used by foundational layers (config, log, lifecycle, runtime
+/// registry). `HammerError` is a public alias for this type so downstream crates
+/// share one workspace error boundary.
 #[derive(Debug, Error)]
 pub enum CoreError {
     #[error("parse TOML: {message}")]

@@ -1,6 +1,6 @@
 /// `adapter.NetworkManager` — surfaces the platform's view of network
-/// interfaces and the auto-detected default. Tracks WiFi state on iOS / macOS
-/// and notifies subscribers when the default interface changes.
+/// interfaces and the auto-detected default. Tracks wireless state where
+/// available and notifies subscribers when the default interface changes.
 ///
 pub trait NetworkManager {
     fn auto_detect_interface(&self) -> bool;

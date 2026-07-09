@@ -32,7 +32,7 @@ const DEFAULT_TCP_MAX_SEGMENT_SIZE: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
 pub const TCP_INITIAL_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(50);
 pub const TCP_MIN_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(50);
 pub const TCP_MAX_RETRANSMIT_TIMEOUT: Duration = Duration::from_secs(60);
-/// 60s 2MSL TIME_WAIT. iOS VPN may use a shorter value (e.g. 120 ticks = 1.2s) if needed.
+/// 60s 2MSL TIME_WAIT.
 pub const TCP_TIME_WAIT_TICKS: u64 = 6_000;
 const TCP_PAWS_IDLE: Duration = Duration::from_secs(24 * 86_400);
 pub const TCP_TIMER_RETRANSMIT: u32 = 0;

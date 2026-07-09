@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-// Numeric values intentionally match `sing/log` Level so that the i32 transmitted
-// to Swift over uniffi stays compatible with the Go reference implementation.
+// Numeric values intentionally match `sing/log` Level so platform log codes stay
+// comparable with the Go reference implementation.
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]

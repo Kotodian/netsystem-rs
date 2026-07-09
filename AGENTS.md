@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Hammer is a VPP-style high-performance network data plane framework written in Rust. It originated as an iOS NetworkExtension VPN engine and has evolved into a general-purpose packet-processing framework modeled on VPP's node/graph/session architecture, with a standalone daemon and CLI in addition to the iOS FFI path.
+Hammer is a VPP-style high-performance network data plane framework written in Rust. It is a standalone packet-processing framework modeled on VPP's node/graph/session architecture, with daemon and CLI surfaces for local operation.
 
 The framework centers on a **packet graph runtime**: data-plane work is organized into graph nodes processing frames of buffers, worker-owned state, lock-free hot paths, and VPP-style barrier synchronization between control and data planes.
 
@@ -28,7 +28,7 @@ Workspace root: `crates/`. Dependency direction is strictly one-way to avoid cyc
 |---|---|
 | `hammer-infra` | Bottom-layer infrastructure — lock-free data structures and memory primitives (cache-aligned). FIFO with OOO delivery, `Pool<T>` with generation counters, `TimerWheel1t2w2048sl`, `FlatHashTable`, `RbTree`, `Segment` (Local heap / Svm shared-memory mmap), internet checksum, SIMD primitives, ring buffers. Analogous to VPP's `vppinfra`. |
 | `hammer-core` | Base types — config schema (TOML, multi-file `include`), errors, lifecycle, metrics, log, network primitives, forwarding (DPO/FIB/mtrie/load-balance), protocol wire types (IP/ICMP/TCP options & segment, optional WireGuard). Zero business logic. |
-| `hammer-adapter` | Cross-crate contract layer — inbound/outbound/endpoint traits, platform interface, data-plane buffer/node/handoff abstractions. Decouples implementation from FFI/runtime callers. |
+| `hammer-adapter` | Cross-crate contract layer — inbound/outbound/endpoint traits, platform interface, data-plane buffer/node/handoff abstractions. Decouples implementation from runtime and service callers. |
 | `hammer-component-macros` | Proc macros: `#[graph_node]`, `#[init_function]`, `#[worker_init_function]` for declarative packet-graph node registration via `linkme` distributed slices. |
 | `hammer-runtime` | Runtime engine — worker thread spawning, engine main loop with VPP fixed-schedule step order, barrier synchronization (`control_call_with_barrier`), `RuntimeRegistry` (typed service registry), session/app handle types. |
 | `hammer-service` | Network stack — the largest crate. Interface management, IP input/forward/reassembly, ICMP, TCP (full state machine incl. BBR congestion control, SACK, recovery, TIME_WAIT, keep-alive, ECN, persist, PMTU), UDP, session layer (L5 app/session boundary with SVM FIFO + message queue), TUN/TAP device driver, packet graph registration. Analogous to VPP's `vnet`. |
@@ -37,7 +37,7 @@ Workspace root: `crates/`. Dependency direction is strictly one-way to avoid cyc
 | `hammer` | Daemon binary (analogous to VPP's `vpp`). Loads TOML config, initializes runtime engine + worker graph, binds IPC TCP socket (default `127.0.0.1:7299`, overridable via `HAMMER_IPC_ADDR`), runs the data-plane main loop. |
 | `hammerctl` | CLI control tool (analogous to `vppctl`). Subcommands: `Pause`, `Wake`, `ResetNetwork`, `Shutdown`, `Status`, `Send` (raw handler dispatch). |
 
-Patched dependencies live under `third_party/` (currently `boringtun`, patched via `[patch.crates.io]`). Generated iOS output goes to `dist/ios/`. Design docs live in `docs/superpowers/` (`specs/` for architecture specs, `plans/` for dated implementation plans, `sdd/` for task execution tracking).
+Patched dependencies live under `third_party/` (currently `boringtun`, patched via `[patch.crates.io]`). Design docs live in `docs/superpowers/` (`specs/` for architecture specs, `plans/` for dated implementation plans, `sdd/` for task execution tracking).
 
 ## Build, Test, and Development Commands
 
@@ -58,14 +58,6 @@ make test         # cargo test --workspace
 make clippy
 make fmt
 make clean
-```
-
-For iOS packaging (when the FFI/xcframework path is restored):
-```bash
-make xcframework                    # or: ./scripts/build-xcframework.sh
-PROFILE=release-perf make xcframework   # Instruments-friendly (line-tables debuginfo, no strip)
-FEATURES=wireguard make xcframework     # enable optional protocols
-make clean-ios-lib                  # rm -rf dist/ios
 ```
 
 ## Coding Style & Naming Conventions
@@ -114,15 +106,15 @@ The project follows a TDD rhythm (RED → GREEN → commit) documented in `docs/
 
 Recent commits use scoped messages such as `hammer-runtime(Feat): per-node error counters` and `hammer-infra(Feat): add SIMD primitives`. Follow `<scope>(<Type>): <imperative summary>`, with types like `Feat`, `Fix`, `Refactor`, `Debug`, `Test`, or `docs`.
 
-PRs should include a behavior summary, affected crates, test commands run, and any iOS packaging impact. Link related issues when available. Include generated artifact notes only when Swift/iOS output changes.
+PRs should include a behavior summary, affected crates, test commands run, and any daemon, CLI, or protocol impact. Link related issues when available.
 
 ## Security & Configuration Tips
 
-Do not commit real VPN credentials, server addresses, certificates, or generated framework output. Keep example TOML values synthetic, and document feature flags when enabling optional protocols such as WireGuard.
+Do not commit real VPN credentials, server addresses, certificates, or generated artifacts. Keep example TOML values synthetic, and document feature flags when enabling optional protocols such as WireGuard.
 
 ## Documentation
 
 - `docs/superpowers/specs/` — architecture design specs (node-next traits, shared app ingress registry, timer wheel, TCP complete echo design, TCP worker driver node, L5 app session layer).
 - `docs/superpowers/plans/` — dated implementation plans with checkboxes, file maps, and public-interface additions.
 - `docs/superpowers/sdd/` — per-task execution tracking (progress, briefs, reports, review diffs).
-- `README.md` — high-level architecture overview (note: predates the VPP-clone refactor; the FFI/xcframework sections describe the iOS path, while the daemon/CLI path is newer).
+- `README.md` — high-level architecture overview for the standalone data-plane framework.
