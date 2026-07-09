@@ -162,3 +162,9 @@ The test commands still emit pre-existing warning noise, mostly deprecated `Flat
 ### Concerns
 
 - Verification still emits pre-existing workspace deprecation/unused warnings unrelated to this guard coverage fix.
+
+## Fix Amendment (DataPlaneTrace Grouped Import)
+
+- Added `DataPlaneTrace` to `ROOT_BANNED_RUNTIME_IMPORTS` in `crates/hammer-runtime/tests/graph_runtime_owner_guard.rs` so grouped imports like `use hammer_adapter::{DataPlaneTrace};` are rejected by the guard.
+- Extended the grouped-import regression sample and assertion to explicitly require a `DataPlaneTrace` violation.
+- This is a narrow guard coverage fix only; no runtime ownership surfaces changed.

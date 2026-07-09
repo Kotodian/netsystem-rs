@@ -26,6 +26,7 @@ const ROOT_BANNED_RUNTIME_IMPORTS: &[&str] = &[
     "PacketTrace",
     "TraceControlHandle",
     "TraceControlPlane",
+    "DataPlaneTrace",
     "TraceEntry",
     "TraceFormatter",
     "TraceInputPolicy",
@@ -103,7 +104,7 @@ fn graph_runtime_owner_paths_do_not_point_at_adapter() {
 #[test]
 fn grouped_adapter_runtime_imports_are_rejected() {
     let source = r#"
-        use hammer_adapter::{DataPlaneRuntime, NodeRuntimeStatsRow, PlatformInterface};
+        use hammer_adapter::{DataPlaneRuntime, DataPlaneTrace, NodeRuntimeStatsRow, PlatformInterface};
         pub use hammer_adapter::{NodeEntry, TracePolicy};
     "#;
 
@@ -113,6 +114,12 @@ fn grouped_adapter_runtime_imports_are_rejected() {
             .iter()
             .any(|violation| violation.contains("DataPlaneRuntime")),
         "expected grouped root import to be rejected: {violations:#?}"
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("DataPlaneTrace")),
+        "expected grouped trace import to be rejected: {violations:#?}"
     );
     assert!(
         violations
