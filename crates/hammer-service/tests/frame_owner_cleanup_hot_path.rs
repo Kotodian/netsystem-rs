@@ -95,11 +95,7 @@ fn runtime_service_and_node_hot_paths_use_frame_owner_cleanup() {
     let root = workspace_root();
     let tokens = forbidden_lifetime_tokens();
     let mut failures = String::new();
-    for dir in [
-        "crates/hammer-adapter/src",
-        "crates/hammer-runtime/src",
-        "crates/hammer-service/src",
-    ] {
+    for dir in ["crates/hammer-runtime/src", "crates/hammer-service/src"] {
         visit_rust_files(&root.join(dir), &mut |path| {
             let src = fs::read_to_string(path).expect("read source");
             for token in tokens {

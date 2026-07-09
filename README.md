@@ -11,7 +11,6 @@ lifecycle, configuration, and barriers outside the hot path.
 |---|---|
 | `hammer-infra` | Bottom-layer infrastructure: lock-free queues, pools, timer wheels, hash tables, memory segments, checksums, SIMD helpers, and ring buffers. |
 | `hammer-core` | Base types: config schema, errors, lifecycle, metrics, logging, network primitives, forwarding tables, and protocol wire types. |
-| `hammer-adapter` | Cross-crate contracts for inbound, outbound, endpoint, platform, buffer, node, and handoff boundaries. |
 | `hammer-component-macros` | Registration macros for packet graph nodes and initialization functions. |
 | `hammer-runtime` | Runtime engine for worker threads, graph dispatch, barriers, service registry, and session/app handles. |
 | `hammer-service` | Network stack and packet graph services: interface management, IP, ICMP, TCP, UDP, session layer, device driver, and graph registration. |
@@ -21,8 +20,8 @@ lifecycle, configuration, and barriers outside the hot path.
 | `hammerctl` | Control CLI for daemon operations. |
 
 Dependency direction stays one-way: higher-level binaries and services depend on
-runtime, core, adapter, and infra crates; bottom-layer crates do not depend back
-up the stack.
+runtime, core, and infra crates; bottom-layer crates do not depend back up the
+stack.
 
 ## Runtime Model
 

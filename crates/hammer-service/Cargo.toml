@@ -16,7 +16,6 @@ async-trait = { workspace = true }
 bitflags = "2.10"
 crossbeam-utils = { workspace = true }
 hammer-core = { path = "../hammer-core" }
-hammer-adapter = { path = "../hammer-adapter" }
 hammer-infra = { path = "../hammer-infra" }
 hammer-component-macros = { path = "../hammer-component-macros" }
 hammer-runtime = { path = "../hammer-runtime", default-features = false }

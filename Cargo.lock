@@ -688,25 +688,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "hammer-adapter"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "crossbeam-utils",
- "hammer-core",
- "hammer-infra",
- "ipnet",
- "libc",
- "spinning_top",
- "tokio",
-]
-
-[[package]]
 name = "hammer-app"
 version = "0.1.0"
 dependencies = [
- "hammer-adapter",
  "hammer-core",
  "hammer-infra",
  "hammer-runtime",
@@ -783,7 +767,6 @@ dependencies = [
  "core_affinity",
  "criterion",
  "crossbeam-queue",
- "hammer-adapter",
  "hammer-component-macros",
  "hammer-core",
  "hammer-infra",
@@ -810,7 +793,6 @@ dependencies = [
  "bitflags 2.11.1",
  "crossbeam-utils",
  "etherparse",
- "hammer-adapter",
  "hammer-component-macros",
  "hammer-core",
  "hammer-infra",

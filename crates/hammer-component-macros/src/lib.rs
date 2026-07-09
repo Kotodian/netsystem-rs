@@ -377,7 +377,7 @@ pub fn hammer_component(args: TokenStream, input: TokenStream) -> TokenStream {
     let networks_value = quote!(Vec::new());
     let dependencies_value = quote!(Vec::new());
     let metrics_value = if let Some((module, component_type)) = args.metrics {
-        quote!(Some(::hammer_adapter::ComponentMetricsMeta {
+        quote!(Some(::hammer_runtime::ComponentMetricsMeta {
             module: #module,
             component_type: #component_type,
         }))
@@ -412,9 +412,9 @@ pub fn hammer_component(args: TokenStream, input: TokenStream) -> TokenStream {
     quote! {
         #item
 
-        impl #impl_generics ::hammer_adapter::ComponentMetadata for #ident #ty_generics #where_clause {
-            fn component_meta(&self) -> ::hammer_adapter::ComponentMeta {
-                ::hammer_adapter::ComponentMeta::new(
+        impl #impl_generics ::hammer_runtime::ComponentMetadata for #ident #ty_generics #where_clause {
+            fn component_meta(&self) -> ::hammer_runtime::ComponentMeta {
+                ::hammer_runtime::ComponentMeta::new(
                     #kind_name,
                     #meta_name,
                     #id_value,

@@ -12,12 +12,7 @@ mod trace;
 pub mod transport;
 pub mod tun;
 
-pub mod adapter {
-    pub use hammer_runtime::adapter::*;
-}
-
 pub use hammer_core::error::{HammerError, HammerResult};
-pub use hammer_runtime::RuntimePlatform;
 
 #[cfg(test)]
 pub(crate) fn reset_subsystem_mains_for_test() {

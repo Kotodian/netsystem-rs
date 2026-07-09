@@ -1,17 +1,12 @@
 use std::net::SocketAddr;
-use std::sync::Arc;
 
-use hammer_adapter::PlatformInterface;
 use hammer_core::error::{HammerError, HammerResult, WithContext};
 use tokio::net::{TcpSocket, TcpStream};
-
-use crate::socket_protector::SocketProtector;
 
 #[derive(Clone)]
 pub(crate) struct ServerTcpConnector {
     server: String,
     server_port: u16,
-    protector: SocketProtector,
 }
 
 impl ServerTcpConnector {
@@ -27,15 +22,10 @@ impl ServerTcpConnector {
             TcpSocket::new_v4()
         }
         .with_context(|| format!("{context} create tcp socket"))?;
-        self.protector.protect(&socket)?;
         socket
             .connect(target)
             .await
             .with_context(|| format!("{context} tcp connect"))
-    }
-
-    pub(crate) fn platform(&self) -> Option<Arc<dyn PlatformInterface>> {
-        self.protector.platform()
     }
 }
 
@@ -43,7 +33,6 @@ impl ServerTcpConnector {
 pub(crate) struct ServerTcpConnectorBuilder {
     server: Option<String>,
     server_port: Option<u16>,
-    protector: SocketProtector,
 }
 
 impl ServerTcpConnectorBuilder {
@@ -54,11 +43,6 @@ impl ServerTcpConnectorBuilder {
 
     pub(crate) fn server_port(mut self, server_port: u16) -> Self {
         self.server_port = Some(server_port);
-        self
-    }
-
-    pub(crate) fn protector(mut self, protector: SocketProtector) -> Self {
-        self.protector = protector;
         self
     }
 
@@ -77,7 +61,6 @@ impl ServerTcpConnectorBuilder {
         Ok(ServerTcpConnector {
             server,
             server_port,
-            protector: self.protector,
         })
     }
 }

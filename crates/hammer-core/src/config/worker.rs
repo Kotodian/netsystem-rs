@@ -11,7 +11,7 @@
 //!   (policy/priority), `[worker.numa]`.
 //! - macOS/iOS: `[worker.scheduler]` (qos). No CPU affinity or NUMA on XNU.
 //!
-//! Defaults are derived from `hammer-service`/`hammer-runtime`/`hammer-adapter`
+//! Defaults are derived from `hammer-service`/`hammer-runtime`/`hammer-core`
 //! production constants (see per-field doc comments for sources).
 
 // Default impls below carry production constants (not zero values) and/or use
@@ -30,10 +30,10 @@ const MAX_BLOCKING_THREADS: usize = 4;
 const WORKER_IDLE_SLICE: Duration = Duration::from_millis(1);
 const BUFFER_SLOT_BYTES: usize = 2_048;
 const BUFFER_SLOTS_PER_NUMA: usize = 4_096;
-// hammer-adapter/src/buffer.rs
+// hammer-core/src/data_plane/buffer.rs
 const BUFFER_FRAME_CAPACITY: usize = 256;
 const BUFFER_FRAME_POOL_SIZE: usize = 64;
-// hammer-adapter/src/handoff.rs (DataPlaneHandoff::new(workers, cap))
+// hammer-runtime/src/handoff.rs (DataPlaneHandoff::new(workers, cap))
 const HANDOFF_QUEUE_CAPACITY: usize = 1_024;
 // hammer-runtime/src/app/session.rs AppSessionConfig::DEFAULT
 const APP_SESSION_FIFO_CAPACITY: usize = 64 * 1024;
@@ -136,9 +136,9 @@ pub struct WorkerBuffer {
     /// Slots per NUMA node (VPP `buffers.buffers-per-numa`); on non-Linux this
     /// is the total slot count since there is no NUMA partitioning.
     pub slots_per_numa: usize,
-    /// Default buffer frame capacity (`hammer-adapter::DEFAULT_BUFFER_FRAME_CAPACITY`).
+    /// Default buffer frame capacity (`hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY`).
     pub frame_capacity: usize,
-    /// Default buffer frame pool size (`hammer-adapter::DEFAULT_BUFFER_FRAME_POOL_SIZE`).
+    /// Default buffer frame pool size (`hammer_core::data_plane::DEFAULT_BUFFER_FRAME_POOL_SIZE`).
     pub frame_pool_size: usize,
 }
 

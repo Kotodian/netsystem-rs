@@ -22,13 +22,12 @@ This is a single-context repo: read root `CONTEXT.md` and relevant ADRs under `d
 
 ## Project Structure & Module Organization
 
-Workspace root: `crates/`. Dependency direction is strictly one-way to avoid cycles: `hammer → {hammer-runtime, hammer-service, hammer-ipc, hammer-core, hammer-component-macros}`, `hammer-app → {hammer-runtime, hammer-adapter, hammer-core, hammer-infra}`, `hammer-service → {hammer-runtime, hammer-core, hammer-adapter, hammer-infra, hammer-component-macros}`, `hammer-adapter → {hammer-core, hammer-infra}`, `hammer-ipc → {hammer-core, hammer-runtime}`, `hammer-runtime → {hammer-adapter, hammer-core, hammer-component-macros}`, `hammer-infra → (external only)`, `hammer-core → hammer-infra`.
+Workspace root: `crates/`. Dependency direction is strictly one-way to avoid cycles: `hammer → {hammer-runtime, hammer-service, hammer-ipc, hammer-core, hammer-component-macros}`, `hammer-app → {hammer-runtime, hammer-core, hammer-infra}`, `hammer-service → {hammer-runtime, hammer-core, hammer-infra, hammer-component-macros}`, `hammer-ipc → {hammer-core, hammer-runtime}`, `hammer-runtime → {hammer-core, hammer-component-macros}`, `hammer-infra → (external only)`, `hammer-core → hammer-infra`.
 
 | crate | role |
 |---|---|
 | `hammer-infra` | Bottom-layer infrastructure — lock-free data structures and memory primitives (cache-aligned). FIFO with OOO delivery, `Pool<T>` with generation counters, `TimerWheel1t2w2048sl`, `FlatHashTable`, `RbTree`, `Segment` (Local heap / Svm shared-memory mmap), internet checksum, SIMD primitives, ring buffers. Analogous to VPP's `vppinfra`. |
 | `hammer-core` | Base types — config schema (TOML, multi-file `include`), errors, lifecycle, metrics, log, network primitives, forwarding (DPO/FIB/mtrie/load-balance), protocol wire types (IP/ICMP/TCP options & segment, optional WireGuard). Zero business logic. |
-| `hammer-adapter` | Cross-crate contract layer — inbound/outbound/endpoint traits, platform interface, data-plane buffer/node/handoff abstractions. Decouples implementation from runtime and service callers. |
 | `hammer-component-macros` | Proc macros: `#[graph_node]`, `#[init_function]`, `#[worker_init_function]` for declarative packet-graph node registration via `linkme` distributed slices. |
 | `hammer-runtime` | Runtime engine — worker thread spawning, engine main loop with VPP fixed-schedule step order, barrier synchronization (`control_call_with_barrier`), `RuntimeRegistry` (typed service registry), session/app handle types. |
 | `hammer-service` | Network stack — the largest crate. Interface management, IP input/forward/reassembly, ICMP, TCP (full state machine incl. BBR congestion control, SACK, recovery, TIME_WAIT, keep-alive, ECN, persist, PMTU), UDP, session layer (L5 app/session boundary with SVM FIFO + message queue), TUN/TAP device driver, packet graph registration. Analogous to VPP's `vnet`. |

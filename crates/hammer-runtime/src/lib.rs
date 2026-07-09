@@ -7,15 +7,6 @@ pub mod init;
 pub mod main_loop;
 pub mod memory;
 
-pub mod adapter {
-    pub use hammer_adapter::{
-        AsAnyComponent, CertificateProviderService, ComponentMeta, ComponentMetadata,
-        ComponentMetricsMeta, ConnectionHandle, DefaultInterfaceUpdateListener, Network,
-        NetworkInterface, NetworkManager, PlatformInterface, RuntimeComponent, SocksAddr,
-        TunOptions, WifiState,
-    };
-}
-
 pub use hammer_core::error::{HammerError, HammerResult};
 pub use hammer_core::protocol::icmp::IcmpErrorMetadata;
 pub use hammer_core::{Network, SocksAddr};
@@ -23,6 +14,7 @@ pub use hammer_infra::hint::unlikely;
 
 pub mod app;
 pub mod attach;
+mod component;
 mod control_thread;
 pub mod data_plane;
 pub mod handoff;
@@ -45,15 +37,14 @@ pub mod graph;
 
 mod numa;
 pub mod protocol;
-mod socket_protector;
 pub mod spawn;
 pub mod start_workers;
 mod worker_thread;
 
+pub use component::{ComponentMeta, ComponentMetadata, ComponentMetricsMeta};
 pub use control_thread::{ControlThread, ControlThreadHandle, ControlTimerHandle};
 pub use hammer_core::{
     MetricCounter, MetricGauge, MetricKind, MetricLabel, MetricSample, MetricsRegistry,
     MetricsScope,
 };
-pub use socket_protector::{RuntimePlatform, SocketProtector};
 pub use spawn::{DataPlaneBarrierGuard, DataPlaneBarrierHandle};
