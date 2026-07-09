@@ -76,6 +76,49 @@ fn in_order_enqueue_collects_contiguous_ooo_bytes() {
 }
 
 #[test]
+fn in_order_enqueue_after_future_ooo_uses_visible_tail_chunk() {
+    let mut f = fifo(1 << 16);
+    f.enable_ooo();
+
+    assert_eq!(f.enqueue(b"abcd"), 4);
+    f.enqueue_ooo(4, b"ijkl").expect("ooo enqueue");
+    assert_eq!(f.enqueue(b"efgh"), 8);
+
+    let mut out = [0u8; 16];
+    assert_eq!(f.peek(0, out.len(), &mut out), 12);
+    assert_eq!(&out[..12], b"abcdefghijkl");
+    assert_eq!(f.ooo_enqueued(), 0);
+}
+
+#[test]
+fn in_order_enqueue_inserts_gap_chunk_before_future_ooo_chunk() {
+    let mut f = fifo(1 << 16);
+    f.enable_ooo();
+
+    let first_chunk = vec![b'a'; 4096];
+    let gap_chunk = vec![b'b'; 4096];
+    assert_eq!(f.enqueue(&first_chunk), first_chunk.len());
+    f.enqueue_ooo(4096, b"future").expect("ooo enqueue");
+
+    assert_eq!(f.enqueue(&gap_chunk), gap_chunk.len() + b"future".len());
+
+    let mut out = vec![0u8; first_chunk.len() + gap_chunk.len() + b"future".len()];
+    assert_eq!(f.peek(0, out.len(), &mut out), out.len());
+    assert_eq!(&out[..first_chunk.len()], first_chunk.as_slice());
+    assert_eq!(
+        &out[first_chunk.len()..first_chunk.len() + gap_chunk.len()],
+        gap_chunk.as_slice()
+    );
+    assert_eq!(&out[first_chunk.len() + gap_chunk.len()..], b"future");
+    assert_eq!(f.ooo_enqueued(), 0);
+
+    assert_eq!(f.enqueue(b"!"), 1);
+    let mut out = vec![0u8; first_chunk.len() + gap_chunk.len() + b"future!".len()];
+    assert_eq!(f.peek(0, out.len(), &mut out), out.len());
+    assert_eq!(&out[first_chunk.len() + gap_chunk.len()..], b"future!");
+}
+
+#[test]
 fn ooo_enqueue_rejects_future_write_beyond_fifo_capacity() {
     let mut f = fifo(64);
     f.enable_ooo();

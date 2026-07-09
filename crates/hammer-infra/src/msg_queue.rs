@@ -297,6 +297,26 @@ mod tests {
         }
     }
 
+    fn test_signal_pipe() -> (RawFd, RawFd) {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        for fd in fds {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            assert!(flags >= 0);
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+                0
+            );
+            let fdflags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(fdflags >= 0);
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_SETFD, fdflags | libc::FD_CLOEXEC) },
+                0
+            );
+        }
+        (fds[0], fds[1])
+    }
+
     #[test]
     fn header_layout() {
         use std::mem::{align_of, size_of};
@@ -347,17 +367,29 @@ mod tests {
     #[test]
     fn cross_process_signal_has_fd() {
         let seg = Local::new(4096);
-        let q = MsgQueue::<Local>::new(seg, 4).expect("msgq");
-        assert!(q.read_fd().is_some());
+        unsafe {
+            MsgQueue::<Local>::init_at(seg.clone(), 0, 4).expect("msgq init");
+        }
+        let (read_fd, write_fd) = test_signal_pipe();
+        let q = unsafe { MsgQueue::<Local>::from_shared(seg, 0, Some(read_fd), Some(write_fd)) };
+        assert_eq!(q.read_fd(), Some(read_fd));
+        assert_eq!(q.write_fd(), Some(write_fd));
         assert!(!q.drain());
         q.fire();
         assert!(q.drain());
+        assert!(!q.drain());
     }
 
     #[test]
     fn cross_process_signal_wakes_thread() {
         let seg = Local::new(4096);
-        let q = std::sync::Arc::new(MsgQueue::<Local>::new(seg, 4).expect("msgq"));
+        unsafe {
+            MsgQueue::<Local>::init_at(seg.clone(), 0, 4).expect("msgq init");
+        }
+        let (read_fd, write_fd) = test_signal_pipe();
+        let q = std::sync::Arc::new(unsafe {
+            MsgQueue::<Local>::from_shared(seg, 0, Some(read_fd), Some(write_fd))
+        });
         let wq = std::sync::Arc::clone(&q);
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let dc = std::sync::Arc::clone(&done);

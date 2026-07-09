@@ -206,7 +206,7 @@ impl<S: Segment> Fifo<S> {
             if to_write == 0 {
                 return 0;
             }
-            let written = self.write_at_without_tail_store(tail, &src[..to_write]);
+            let written = self.append_at_tail_without_tail_store(tail, &src[..to_write]);
             if written == 0 {
                 return 0;
             }
@@ -332,7 +332,13 @@ impl<S: Segment> Fifo<S> {
             while chunk_off != 0 {
                 let chunk = &*(self.base.add(chunk_off as usize) as *mut Chunk);
                 if new_head >= chunk.start_byte + chunk.length {
+                    if chunk_off == (*hdr).tail_chunk {
+                        break;
+                    }
                     let next_off = chunk.next.load(Ordering::Acquire);
+                    if next_off == 0 {
+                        break;
+                    }
                     let prev = chunk.refcount.fetch_sub(1, Ordering::Relaxed);
                     if prev == 1 {
                         self.seg
@@ -340,19 +346,103 @@ impl<S: Segment> Fifo<S> {
                     }
                     (*hdr).head_chunk = next_off;
                     chunk_off = next_off;
-                    if next_off == 0 {
-                        // All chunks freed — reset tail_chunk too so
-                        // the producer allocates a fresh chunk on next enqueue.
-                        (*hdr).tail_chunk = 0;
-                        (*hdr).end_chunk = 0;
-                        break;
-                    }
                 } else {
                     break;
                 }
             }
             (*hdr).head.store(new_head, Ordering::Release);
             to_drop
+        }
+    }
+
+    fn append_at_tail_without_tail_store(&self, offset: u32, src: &[u8]) -> usize {
+        if src.is_empty() {
+            return 0;
+        }
+        let hdr = self.hdr;
+        unsafe {
+            let chunk_data_size = (*hdr).min_alloc as usize;
+            let mut written = 0usize;
+            let mut remaining_offset = offset;
+            let mut remaining_src = src;
+            let mut chunk_off = (*hdr).tail_chunk;
+
+            while !remaining_src.is_empty() {
+                if chunk_off == 0 {
+                    let new_off = self.seg.alloc(CHUNK_HEADER_SIZE + chunk_data_size, 64);
+                    std::ptr::write(
+                        self.base.add(new_off as usize) as *mut Chunk,
+                        Chunk {
+                            start_byte: remaining_offset,
+                            length: 0,
+                            next: AtomicU64::new(0),
+                            refcount: AtomicU32::new(1),
+                        },
+                    );
+                    (*hdr).start_chunk = new_off;
+                    (*hdr).end_chunk = new_off;
+                    (*hdr).head_chunk = new_off;
+                    (*hdr).tail_chunk = new_off;
+                    chunk_off = new_off;
+                }
+
+                let chunk = &mut *(self.base.add(chunk_off as usize) as *mut Chunk);
+                let chunk_end = chunk.start_byte + chunk_data_size as u32;
+                if remaining_offset >= chunk_end {
+                    let next_off = chunk.next.load(Ordering::Acquire);
+                    if next_off != 0 {
+                        let next = &*(self.base.add(next_off as usize) as *mut Chunk);
+                        if remaining_offset >= next.start_byte {
+                            (*hdr).tail_chunk = next_off;
+                            chunk_off = next_off;
+                            continue;
+                        }
+                    }
+                    if remaining_offset > chunk_end {
+                        return written;
+                    }
+
+                    let new_off = self.seg.alloc(CHUNK_HEADER_SIZE + chunk_data_size, 64);
+                    std::ptr::write(
+                        self.base.add(new_off as usize) as *mut Chunk,
+                        Chunk {
+                            start_byte: remaining_offset,
+                            length: 0,
+                            next: AtomicU64::new(next_off),
+                            refcount: AtomicU32::new(1),
+                        },
+                    );
+                    chunk.next.store(new_off, Ordering::Release);
+                    if next_off == 0 {
+                        (*hdr).end_chunk = new_off;
+                    }
+                    (*hdr).tail_chunk = new_off;
+                    chunk_off = new_off;
+                    continue;
+                }
+
+                if remaining_offset < chunk.start_byte || remaining_offset > chunk_end {
+                    return written;
+                }
+
+                let data_ptr = self.base.add(chunk_off as usize + CHUNK_HEADER_SIZE);
+                let data_off = (remaining_offset - chunk.start_byte) as usize;
+                let chunk_avail = chunk_data_size - data_off;
+                let to_write = remaining_src.len().min(chunk_avail);
+                std::ptr::copy_nonoverlapping(
+                    remaining_src.as_ptr(),
+                    data_ptr.add(data_off),
+                    to_write,
+                );
+                let new_used = data_off + to_write;
+                if new_used > chunk.length as usize {
+                    chunk.length = new_used as u32;
+                }
+                written += to_write;
+                remaining_offset += to_write as u32;
+                remaining_src = &remaining_src[to_write..];
+            }
+            written
         }
     }
 
@@ -396,12 +486,18 @@ impl<S: Segment> Fifo<S> {
                     );
                     if prev_off != 0 {
                         let prev = &mut *(self.base.add(prev_off as usize) as *mut Chunk);
-                        prev.next.store(new_off, Ordering::Release);
+                        if prev.next.load(Ordering::Acquire) == 0 {
+                            prev.next.store(new_off, Ordering::Release);
+                        }
+                        if prev_off == (*hdr).end_chunk {
+                            (*hdr).end_chunk = new_off;
+                        }
                     } else {
+                        (*hdr).start_chunk = new_off;
+                        (*hdr).end_chunk = new_off;
                         (*hdr).head_chunk = new_off;
+                        (*hdr).tail_chunk = new_off;
                     }
-                    (*hdr).end_chunk = new_off;
-                    (*hdr).tail_chunk = new_off;
                     chunk_off = new_off;
                 }
 
@@ -850,11 +946,50 @@ mod tests {
     use super::*;
     use crate::segment::Local;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::thread;
 
     fn fifo(cap: usize) -> Fifo<Local> {
         let seg = Local::new(cap * 16 + (1 << 20));
         Fifo::<Local>::new(seg, cap).expect("fifo")
+    }
+
+    #[derive(Clone)]
+    struct CountingSegment {
+        inner: Local,
+        frees: Arc<AtomicUsize>,
+    }
+
+    impl CountingSegment {
+        fn new(size: usize) -> Self {
+            Self {
+                inner: Local::new(size),
+                frees: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn frees(&self) -> usize {
+            self.frees.load(AtomicOrdering::Relaxed)
+        }
+    }
+
+    impl Segment for CountingSegment {
+        fn base(&self) -> *mut u8 {
+            self.inner.base()
+        }
+
+        fn alloc(&self, bytes: usize, align: usize) -> u64 {
+            self.inner.alloc(bytes, align)
+        }
+
+        fn free(&self, offset: u64, bytes: usize) {
+            self.frees.fetch_add(1, AtomicOrdering::Relaxed);
+            self.inner.free(offset, bytes);
+        }
+
+        fn fd(&self) -> Option<RawFd> {
+            self.inner.fd()
+        }
     }
 
     #[test]
@@ -877,6 +1012,39 @@ mod tests {
         let mut out = vec![0u8; big.len()];
         assert_eq!(f.peek(0, big.len(), &mut out), big.len());
         assert_eq!(out, big);
+    }
+
+    #[test]
+    fn dequeue_drop_reclaims_consumed_non_tail_chunks_only() {
+        let seg = CountingSegment::new(1 << 20);
+        let f = Fifo::<CountingSegment>::new(seg.clone(), 1 << 16).expect("fifo");
+        let first_chunk = vec![0xA5; 4096];
+        let second_chunk = vec![0x5A; 128];
+
+        assert_eq!(f.enqueue(&first_chunk), first_chunk.len());
+        assert_eq!(f.enqueue(&second_chunk), second_chunk.len());
+        assert_eq!(f.dequeue_drop(first_chunk.len()), first_chunk.len());
+        assert_eq!(seg.frees(), 1);
+
+        assert_eq!(f.dequeue_drop(second_chunk.len()), second_chunk.len());
+        assert_eq!(seg.frees(), 1);
+    }
+
+    #[test]
+    fn dequeue_drop_keeps_tail_chunk_before_future_ooo_successor() {
+        let seg = CountingSegment::new(1 << 20);
+        let mut f = Fifo::<CountingSegment>::new(seg.clone(), 1 << 16).expect("fifo");
+        f.enable_ooo();
+        let first_chunk = vec![0xA5; 4096];
+        let gap_chunk = vec![0x5A; 4096];
+
+        assert_eq!(f.enqueue(&first_chunk), first_chunk.len());
+        f.enqueue_ooo(4096, b"future").expect("ooo enqueue");
+        assert_eq!(f.dequeue_drop(first_chunk.len()), first_chunk.len());
+        assert_eq!(seg.frees(), 0);
+
+        assert_eq!(f.enqueue(&gap_chunk), gap_chunk.len() + b"future".len());
+        assert_eq!(f.enqueue(b"!"), 1);
     }
 
     #[test]
