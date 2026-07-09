@@ -4,10 +4,8 @@ use std::mem::transmute;
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
-use hammer_adapter::{
-    BufferPacketCursor, DataPlaneRuntime, DataWorkerId, NodeRuntimeData, SecondaryOpaque,
-};
-use hammer_core::data_plane::{NodeId, NodeState};
+use hammer_adapter::{DataPlaneRuntime, DataWorkerId, NodeRuntimeData};
+use hammer_core::data_plane::{BufferPacketCursor, NodeId, NodeState, SecondaryOpaque};
 use hammer_core::error::{CoreError, CoreResult, HammerResult};
 #[cfg(test)]
 use hammer_core::protocol::tcp::{TcpCapabilities, TcpFastOpenCookie};
@@ -403,7 +401,7 @@ pub(crate) fn read_session_route_opaque(
 #[inline(always)]
 pub(crate) fn read_session_id(
     runtime: &DataPlaneRuntime,
-    index: hammer_adapter::BufferIndex,
+    index: hammer_core::data_plane::BufferIndex,
 ) -> CoreResult<Option<SessionId>> {
     let buffer = runtime.get_buffer(index)?;
     Ok(read_session_route_opaque(buffer.opaque2()).map(|(session_id, _, _)| session_id))
@@ -548,12 +546,12 @@ where
     let mut driver = SessionDriverRuntime::new(
         DataWorkerId::new(0),
         hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-            buffers: hammer_adapter::DataPlaneBufferConfig {
+            buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                 buffer_slot_capacity: 2048,
                 buffer_slots: 4,
                 frame_capacity: 4,
                 frame_slots: 4,
-                ..hammer_adapter::DataPlaneBufferConfig::default()
+                ..hammer_core::data_plane::DataPlaneBufferConfig::default()
             },
         })
         .buffers()
@@ -759,11 +757,11 @@ mod tests {
     use std::time::Instant;
 
     use hammer_adapter::{
-        BufferFrame, DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeProcessFn, NodeResult,
+        DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeProcessFn, NodeResult,
         NodeRuntimeData,
     };
     use hammer_core::config::network::CongestionController as ConfigCongestionController;
-    use hammer_core::data_plane::{NodeHandle, NodeId, NodeRegistration};
+    use hammer_core::data_plane::{BufferFrame, NodeHandle, NodeId, NodeRegistration};
     use hammer_core::error::{CoreError, CoreResult};
     use hammer_core::protocol::tcp::{
         TcpCapabilities, TcpConnectionId, TcpPacket, TcpSackBlock, TcpSegmentFlags, TcpSeq,
@@ -915,12 +913,12 @@ mod tests {
     fn tcp_custom_tx_handles_special_output_without_normal_packetization() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 32,
                     frame_capacity: 8,
                     frame_slots: 8,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let (output_node, lookup_state, drop_state) = tcp_output_graph(&runtime);
@@ -972,12 +970,12 @@ mod tests {
     fn tcp_normal_tx_retains_fifo_until_ack_cleanup() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 32,
                     frame_capacity: 8,
                     frame_slots: 8,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let (output_node, lookup_state, drop_state) = tcp_output_graph(&runtime);
@@ -1035,12 +1033,12 @@ mod tests {
     fn tcp_push_header_rolls_back_transport_state_when_batch_fails() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 32,
                     frame_capacity: 8,
                     frame_slots: 8,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let mut worker_state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
@@ -1096,12 +1094,12 @@ mod tests {
     fn tcp_normal_tx_dispatches_multiple_goal_sized_buffers() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 32,
                     frame_capacity: 8,
                     frame_slots: 8,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let (output_node, lookup_state, drop_state) = tcp_output_graph(&runtime);
@@ -1168,12 +1166,12 @@ mod tests {
     fn tcp_timer_dispatch_uses_exact_timer_token() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 32,
                     frame_capacity: 8,
                     frame_slots: 8,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let (output_node, lookup_state, drop_state) = tcp_output_graph(&runtime);
@@ -1222,12 +1220,12 @@ mod tests {
     fn session_tcp_delayed_ack_timer_emits_ack_after_first_clean_payload() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 32,
                     frame_capacity: 8,
                     frame_slots: 8,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let (output_node, lookup_state, drop_state) = tcp_output_graph(&runtime);
@@ -1441,12 +1439,12 @@ mod tests {
     fn tcp_time_wait_expiry_closes_session() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
                     frame_capacity: 8,
                     frame_slots: 8,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let (output_node, _, _) = tcp_output_graph(&runtime);

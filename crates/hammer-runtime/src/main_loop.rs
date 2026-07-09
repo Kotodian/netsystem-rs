@@ -111,8 +111,8 @@ pub(crate) fn dispatch_main_loop_callbacks() {}
 mod tests {
     use crate::engine::Engine;
     use crate::spawn::DataRemoteLocalQueue;
-    use hammer_adapter::DataPlaneRuntime;
-    use hammer_adapter::buffer::{DataPlaneBufferConfig, DataPlaneRuntimeConfig};
+    use hammer_adapter::{DataPlaneRuntime, DataPlaneRuntimeConfig};
+    use hammer_core::data_plane::DataPlaneBufferConfig;
     use hammer_core::registry::RuntimeRegistry;
 
     fn test_runtime() -> DataPlaneRuntime {

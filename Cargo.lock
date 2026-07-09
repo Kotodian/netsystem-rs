@@ -742,6 +742,7 @@ dependencies = [
  "serde",
  "serde_path_to_error",
  "serde_with",
+ "spinning_top",
  "thiserror",
  "tokio",
  "toml",

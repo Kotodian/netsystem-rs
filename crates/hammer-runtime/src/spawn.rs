@@ -38,8 +38,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use hammer_adapter::node::NodeRuntimeStatsRow;
-use hammer_adapter::{DataPlaneBuffers, TraceControlHandle, TraceRecordSink};
+use hammer_adapter::{TraceControlHandle, TraceRecordSink};
 use hammer_core::config::Worker;
+use hammer_core::data_plane::DataPlaneBuffers;
 
 use crate::data_plane::{RuntimeDataPlaneRuntime, new_worker_runtime};
 use crate::worker_thread::apply_worker_thread_setup;
@@ -1354,10 +1355,10 @@ fn next_data_runtime_context_id() -> usize {
 mod tests {
     use super::*;
     use hammer_adapter::{
-        BufferFrame, DataPlaneRuntime, DriverNode, Node, NodeProcessFn, NodeResult,
-        NodeRuntimeData, TraceControlPlane, TraceEntry, TraceInputPolicy, TracePolicy, TraceRecord,
+        DataPlaneRuntime, DriverNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
+        TraceControlPlane, TraceEntry, TraceInputPolicy, TracePolicy, TraceRecord,
     };
-    use hammer_core::data_plane::{NodeId, NodeRegistration, NodeState};
+    use hammer_core::data_plane::{BufferFrame, NodeId, NodeRegistration, NodeState};
     use std::sync::{
         Arc, Mutex as StdMutex, OnceLock,
         atomic::{AtomicU64, Ordering},

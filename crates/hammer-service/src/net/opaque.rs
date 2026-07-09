@@ -1,6 +1,6 @@
 use core::mem::{align_of, size_of, transmute};
 
-use hammer_adapter::{BufferPacketCursor, PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES};
+use hammer_core::data_plane::{BufferPacketCursor, PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES};
 use hammer_core::forwarding::DpoType;
 pub use hammer_core::protocol::ip_ecn::IpEcnCodepoint;
 

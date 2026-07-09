@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
-use hammer_adapter::buffer::{BufferPool, BufferPoolArena};
 use hammer_adapter::{
-    DataPlaneBufferConfig, DataPlaneBuffers, DataPlaneHandoff, DataPlaneInstructionSet,
-    DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId,
+    DataPlaneHandoff, DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig,
+    DataWorkerId,
 };
-use hammer_core::data_plane::NodeId;
+use hammer_core::data_plane::{
+    BufferPool, BufferPoolArena, DataPlaneBufferConfig, DataPlaneBuffers, NodeId,
+};
 use hammer_infra::heap::Heap;
 
 fn runtime_config(
@@ -13,7 +14,7 @@ fn runtime_config(
     slots: usize,
     frame_capacity: usize,
     frame_slots: usize,
-    instruction_set: DataPlaneInstructionSet,
+    _: DataPlaneInstructionSet,
 ) -> DataPlaneRuntimeConfig {
     DataPlaneRuntimeConfig {
         buffers: DataPlaneBufferConfig {
@@ -21,7 +22,6 @@ fn runtime_config(
             buffer_slots: slots,
             frame_capacity,
             frame_slots,
-            instruction_set,
             ..DataPlaneBufferConfig::default()
         },
     }
@@ -51,24 +51,21 @@ fn runtime_with_handoff_arena(
 ) -> DataPlaneRuntime {
     let handoff = DataPlaneHandoff::new_shared_buffer_arena(1, frame_capacity.max(1), arena);
     DataPlaneRuntime::attach_handoff_worker(
-        DataPlaneRuntime::new(runtime_config(
-            1,
-            1,
-            frame_capacity,
-            frame_slots,
+        DataPlaneRuntime::new_with_instruction_set(
+            runtime_config(1, 1, frame_capacity, frame_slots, instruction_set),
             instruction_set,
-        )),
+        ),
         DataWorkerId::new(0),
         handoff.worker(DataWorkerId::new(0)),
     )
 }
 
 trait CleanupOwner {
-    fn drop_index_owned(&self, index: hammer_adapter::BufferIndex);
+    fn drop_index_owned(&self, index: hammer_core::data_plane::BufferIndex);
 }
 
 impl CleanupOwner for BufferPool {
-    fn drop_index_owned(&self, index: hammer_adapter::BufferIndex) {
+    fn drop_index_owned(&self, index: hammer_core::data_plane::BufferIndex) {
         let runtime =
             runtime_with_handoff_arena(self.arena(), 1, 1, DataPlaneInstructionSet::native());
         let mut frame = runtime
@@ -80,7 +77,7 @@ impl CleanupOwner for BufferPool {
 }
 
 impl CleanupOwner for DataPlaneRuntime {
-    fn drop_index_owned(&self, index: hammer_adapter::BufferIndex) {
+    fn drop_index_owned(&self, index: hammer_core::data_plane::BufferIndex) {
         let mut frame = self
             .buffers()
             .get_next_frame(NodeId::new(0))
@@ -113,7 +110,7 @@ fn arenas_keep_their_arena_numa_identity() {
 
 #[test]
 fn ordinary_buffer_pool_clone_shares_thread_cache_on_same_thread() {
-    let source = include_str!("../src/buffer.rs");
+    let source = include_str!("../../hammer-core/src/data_plane/buffer.rs");
 
     assert!(
         source.contains("thread_cache: Rc::clone(&self.thread_cache)"),
@@ -147,7 +144,6 @@ fn config_constructor_resolves_active_numa_to_configured_node() {
         buffer_slots: 16,
         frame_capacity: 4,
         frame_slots: 4,
-        instruction_set: DataPlaneInstructionSet::Scalar,
         numa_nodes: &[3],
         active_numa_node: 0,
         ..DataPlaneBufferConfig::default()
@@ -209,7 +205,10 @@ fn handoff_capacities_preserve_handoff_arena_numa_identity() {
         BufferPoolArena::with_capacity_in(1024, 16, Arc::new(Heap::local()), 3),
     );
     let runtime = DataPlaneRuntime::attach_handoff_worker(
-        DataPlaneRuntime::new(runtime_config(1, 1, 4, 4, DataPlaneInstructionSet::Scalar)),
+        DataPlaneRuntime::new_with_instruction_set(
+            runtime_config(1, 1, 4, 4, DataPlaneInstructionSet::Scalar),
+            DataPlaneInstructionSet::Scalar,
+        ),
         DataWorkerId::new(0),
         handoff.worker(DataWorkerId::new(0)),
     );
@@ -234,7 +233,10 @@ fn handoff_worker_clone_falls_back_to_configured_nonzero_numa_arena() {
         BufferPoolArena::with_capacity_in(1024, 16, Arc::new(Heap::local()), 3),
     );
     let runtime = DataPlaneRuntime::attach_handoff_worker(
-        DataPlaneRuntime::new(runtime_config(1, 1, 4, 4, DataPlaneInstructionSet::Scalar)),
+        DataPlaneRuntime::new_with_instruction_set(
+            runtime_config(1, 1, 4, 4, DataPlaneInstructionSet::Scalar),
+            DataPlaneInstructionSet::Scalar,
+        ),
         DataWorkerId::new(0),
         handoff.worker(DataWorkerId::new(0)),
     );

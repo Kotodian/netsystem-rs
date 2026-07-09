@@ -1,8 +1,5 @@
-use hammer_adapter::{
-    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeProcessFn,
-    NodeResult, NodeRuntimeData,
-};
-use hammer_core::data_plane::NodeId;
+use hammer_adapter::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
+use hammer_core::data_plane::{BufferFrame, BufferIndex, BufferPacketCursor, NodeId};
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::{TcpError, TcpSegmentFlags, tcp_header};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
@@ -465,7 +462,8 @@ mod tests {
 
     use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 
-    use hammer_adapter::{BufferNodeError, InternalNode};
+    use hammer_adapter::InternalNode;
+    use hammer_core::data_plane::BufferNodeError;
 
     use super::*;
     use crate::transport::tcp::TcpResetError;
@@ -473,7 +471,7 @@ mod tests {
     #[derive(Default)]
     struct CaptureState {
         packets: std::vec::Vec<std::vec::Vec<u8>>,
-        cursors: std::vec::Vec<hammer_adapter::BufferPacketCursor>,
+        cursors: std::vec::Vec<hammer_core::data_plane::BufferPacketCursor>,
         node_errors: std::vec::Vec<Option<BufferNodeError>>,
     }
 
@@ -545,12 +543,12 @@ mod tests {
     fn tcp_reset_node_rewrites_buffer_and_routes_to_lookup() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 512,
                     buffer_slots: 8,
                     frame_capacity: 4,
                     frame_slots: 4,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let drop_state = Arc::new(Mutex::new(CaptureState::default()));

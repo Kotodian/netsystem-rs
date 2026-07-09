@@ -1,7 +1,5 @@
-use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
-};
-use hammer_core::data_plane::NodeId;
+use hammer_adapter::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
+use hammer_core::data_plane::{BufferFrame, BufferIndex, NodeId};
 
 use hammer_core::error::{CoreError, CoreResult};
 
@@ -238,8 +236,8 @@ mod tests {
         TcpInputNext, TcpQueue, TcpSessionDriver, TcpWorkerOwnedState, connect_tcp_session,
         set_tcp_worker_state,
     };
-    use hammer_adapter::{BufferPacketCursor, DataWorkerId, InternalNode};
-    use hammer_core::data_plane::NodeId;
+    use hammer_adapter::{DataWorkerId, InternalNode};
+    use hammer_core::data_plane::{BufferPacketCursor, NodeId};
     use hammer_core::error::CoreError;
 
     use super::*;
@@ -370,7 +368,7 @@ mod tests {
 
     fn stamp_tcp_cursor(
         runtime: &DataPlaneRuntime,
-        buffer: hammer_adapter::BufferIndex,
+        buffer: hammer_core::data_plane::BufferIndex,
         packet: &[u8],
     ) {
         let header_len = ((*packet.first().expect("IPv4 header") & 0x0f) as usize) * 4;

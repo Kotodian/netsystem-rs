@@ -3,11 +3,12 @@ use std::mem::transmute;
 use std::sync::{Arc, Mutex};
 
 use hammer_adapter::{
-    BufferFrame, BufferIndex, BufferRef, DataPlaneRuntime, DriverNode, Frame, Next, Node,
-    NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace, SecondaryOpaque, TraceFormatter,
-    add_packet_trace, unlikely,
+    DataPlaneRuntime, DriverNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
+    TraceFormatter, add_packet_trace, unlikely,
 };
-use hammer_core::data_plane::{NodeId, NodeRegistration};
+use hammer_core::data_plane::{
+    BufferFrame, BufferIndex, BufferRef, Frame, Next, NodeId, NodeRegistration, SecondaryOpaque,
+};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::vec::Vec;
 
@@ -611,7 +612,7 @@ where
     fn set_l3_metadata(
         &self,
         _: &DataPlaneRuntime,
-        _: hammer_adapter::BufferIndex,
+        _: hammer_core::data_plane::BufferIndex,
         _: &str,
     ) -> CoreResult<()> {
         Ok(())
@@ -813,7 +814,7 @@ where
 #[inline]
 fn packet_total_len(
     runtime: &DataPlaneRuntime,
-    index: hammer_adapter::BufferIndex,
+    index: hammer_core::data_plane::BufferIndex,
 ) -> CoreResult<usize> {
     let packet = runtime.get_buffer(index)?;
     packet

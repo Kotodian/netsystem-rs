@@ -1,7 +1,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use hammer_adapter::{BufferIndex, DataPlaneBuffers};
+use hammer_core::data_plane::{BufferIndex, DataPlaneBuffers};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::fifo::Fifo;
 use hammer_infra::map::FlatHashTable;
@@ -346,9 +346,10 @@ impl SessionAppRuntime<Local> {
         let mut config = hammer_core::config::Config::default();
         config.worker.buffer.slot_bytes = 2048;
         config.worker.buffer.slots_per_numa = 1;
-        config.worker.buffer.frame_capacity = hammer_adapter::buffer::DEFAULT_BUFFER_FRAME_CAPACITY;
+        config.worker.buffer.frame_capacity =
+            hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY;
         config.worker.buffer.frame_pool_size =
-            hammer_adapter::buffer::DEFAULT_BUFFER_FRAME_POOL_SIZE;
+            hammer_core::data_plane::DEFAULT_BUFFER_FRAME_POOL_SIZE;
         let runtime = hammer_runtime::new_worker_runtime(&config);
         Ok(Self::new(
             1024,

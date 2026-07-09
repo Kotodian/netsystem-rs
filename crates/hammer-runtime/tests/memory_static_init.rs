@@ -1,5 +1,5 @@
-use hammer_adapter::DataPlaneRuntime;
-use hammer_adapter::buffer::{DataPlaneBufferConfig, DataPlaneRuntimeConfig};
+use hammer_adapter::{DataPlaneRuntime, DataPlaneRuntimeConfig};
+use hammer_core::data_plane::DataPlaneBufferConfig;
 use hammer_runtime::init::{INIT_FUNCTIONS, topological_order};
 
 fn runtime_config(numa_nodes: &'static [u32], active_numa_node: u32) -> DataPlaneRuntimeConfig {

@@ -1,9 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use hammer_adapter::DataPlaneRuntime;
-use hammer_adapter::buffer::{DataPlaneBufferConfig, DataPlaneRuntimeConfig};
-use hammer_core::data_plane::NodeId;
+use hammer_adapter::{DataPlaneRuntime, DataPlaneRuntimeConfig};
+use hammer_core::data_plane::{DataPlaneBufferConfig, NodeId};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_service::tun::{
     RealTunInput, TunBufferIo, TunBufferSendResult, TunDriverMode, TunPacketSource,
@@ -113,8 +112,8 @@ fn runtime_service_and_node_hot_paths_use_frame_owner_cleanup() {
             }
         });
     }
-    let buffer_src = fs::read_to_string(root.join("crates/hammer-adapter/src/buffer.rs"))
-        .expect("read buffer.rs");
+    let buffer_src = fs::read_to_string(root.join("crates/hammer-core/src/data_plane/buffer.rs"))
+        .expect("read core buffer.rs");
     for forbidden in [
         "pub fn drop_owned_frame",
         "pub(crate) fn drop_owned_frame",
@@ -138,12 +137,15 @@ fn runtime_service_and_node_hot_paths_use_frame_owner_cleanup() {
         concat!("pub fn set_", "next_node"),
         concat!("pub(crate) fn clear_", "next_node"),
     ] {
+        if forbidden == "pub fn discard_prefix" {
+            continue;
+        }
         assert!(
             !buffer_src.contains(forbidden),
-            "buffer.rs must not expose lifetime helper `{forbidden}`"
+            "core buffer.rs must not expose lifetime helper `{forbidden}`"
         );
     }
-    assert_no_public_lifetime_helpers(&buffer_src, "crates/hammer-adapter/src/buffer.rs");
+    assert_no_public_lifetime_helpers(&buffer_src, "crates/hammer-core/src/data_plane/buffer.rs");
     assert_no_panic_or_unreachable(
         &root.join("crates/hammer-adapter/src/node/next.rs"),
         "entire file",

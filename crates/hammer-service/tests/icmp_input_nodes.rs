@@ -1,11 +1,12 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use hammer_adapter::BufferPacketCursor;
 use hammer_adapter::{
-    BufferFrame, BufferNodeError, DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig,
-    InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData, TraceControlPlane,
-    TraceInputPolicy, TracePolicy,
+    DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node, NodeProcessFn, NodeResult,
+    NodeRuntimeData, TraceControlPlane, TraceInputPolicy, TracePolicy,
+};
+use hammer_core::data_plane::{
+    BufferFrame, BufferNodeError, BufferPacketCursor, DataPlaneBufferConfig,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
@@ -78,7 +79,7 @@ impl InternalNode for CaptureNode {}
 
 fn chain_bytes(
     runtime: &DataPlaneRuntime,
-    index: hammer_adapter::BufferIndex,
+    index: hammer_core::data_plane::BufferIndex,
 ) -> CoreResult<InfraVec<u8>> {
     let mut bytes = InfraVec::new();
     for buffer in runtime.buffers().chain(index) {
@@ -305,7 +306,11 @@ fn push_marked_packet(
     frame.push_index(buffer).expect("push packet");
 }
 
-fn set_ip_cursor(runtime: &DataPlaneRuntime, index: hammer_adapter::BufferIndex, packet: &[u8]) {
+fn set_ip_cursor(
+    runtime: &DataPlaneRuntime,
+    index: hammer_core::data_plane::BufferIndex,
+    packet: &[u8],
+) {
     let Some(first) = packet.first().copied() else {
         return;
     };

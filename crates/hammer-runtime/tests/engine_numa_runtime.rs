@@ -1,5 +1,5 @@
-use hammer_adapter::DataPlaneRuntime;
-use hammer_adapter::buffer::{DataPlaneBufferConfig, DataPlaneRuntimeConfig};
+use hammer_adapter::{DataPlaneRuntime, DataPlaneRuntimeConfig};
+use hammer_core::data_plane::DataPlaneBufferConfig;
 use hammer_core::registry::RuntimeRegistry;
 use hammer_runtime::engine::Engine;
 

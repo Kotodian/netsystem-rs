@@ -11,11 +11,13 @@ use crate::trace::codec::{
 };
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, DataWorkerId, Node,
-    NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace, SecondaryOpaque, TraceFormatter,
-    add_packet_trace,
+    DataPlaneRuntime, DataWorkerId, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
+    TraceFormatter, add_packet_trace,
 };
-use hammer_core::data_plane::{NodeHandle, NodeId, NodeNextStorage};
+use hammer_core::data_plane::{
+    BufferFrame, BufferIndex, BufferPacketCursor, NodeHandle, NodeId, NodeNextStorage,
+    SecondaryOpaque,
+};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
 use hammer_core::protocol::tcp::{TcpError, TcpInputFlags, TcpSegmentFlags, tcp_header};
@@ -638,10 +640,10 @@ mod tests {
 
     use arc_swap::ArcSwap;
     use hammer_adapter::{
-        BufferFrame, DataPlaneHandoff, DataPlaneRuntime, DataWorkerId, InternalNode, Node,
-        NodeProcessFn, NodeResult, NodeRuntimeData,
+        DataPlaneHandoff, DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeProcessFn,
+        NodeResult, NodeRuntimeData,
     };
-    use hammer_core::data_plane::NodeHandle;
+    use hammer_core::data_plane::{BufferFrame, NodeHandle};
     use hammer_core::error::CoreResult;
     use hammer_core::protocol::tcp::{TcpCapabilities, TcpConnectionId};
 
@@ -810,12 +812,12 @@ mod tests {
     fn tcp_input_routes_existing_established_tuple_to_established_node() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 64,
                     buffer_slots: 4,
                     frame_capacity: 4,
                     frame_slots: 4,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let mut worker_state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
@@ -845,12 +847,12 @@ mod tests {
     fn tcp_input_existing_session_entry_keeps_owner_for_handoff_decision() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 64,
                     buffer_slots: 4,
                     frame_capacity: 4,
                     frame_slots: 4,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let mut worker_state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
@@ -880,12 +882,12 @@ mod tests {
     fn tcp_input_routes_pending_syn_sent_tuple_to_syn_sent_node() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 64,
                     buffer_slots: 4,
                     frame_capacity: 4,
                     frame_slots: 4,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let worker = DataWorkerId::new(0);
@@ -938,12 +940,12 @@ mod tests {
     fn tcp_input_reports_listener_pending_for_ack_tuple_without_session_route() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 64,
                     buffer_slots: 4,
                     frame_capacity: 4,
                     frame_slots: 4,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let worker = DataWorkerId::new(0);
@@ -986,12 +988,12 @@ mod tests {
         let handoff = DataPlaneHandoff::new(2, 8);
         let runtime = DataPlaneRuntime::attach_handoff_worker(
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
                     frame_capacity: 8,
                     frame_slots: 8,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             }),
             DataWorkerId::new(0),
@@ -1045,12 +1047,12 @@ mod tests {
     fn tcp_input_preserves_session_route_in_opaque_for_follow_on_nodes() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
                     frame_capacity: 8,
                     frame_slots: 8,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let mut worker_state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
@@ -1274,14 +1276,14 @@ mod tests {
 
     fn stamp_tcp_cursor(
         runtime: &DataPlaneRuntime,
-        buffer: hammer_adapter::BufferIndex,
+        buffer: hammer_core::data_plane::BufferIndex,
         packet: &[u8],
     ) {
         let header_len = ((*packet.first().expect("IPv4 header") & 0x0f) as usize) * 4;
         let mut buffer = runtime.get_buffer_mut(buffer).expect("buffer mut");
         let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
         network.set_packet_cursor(
-            hammer_adapter::BufferPacketCursor::new()
+            hammer_core::data_plane::BufferPacketCursor::new()
                 .with_packet_len(packet.len())
                 .with_network_header(0, header_len)
                 .with_transport_header(header_len, 20)
@@ -1307,7 +1309,7 @@ pub(crate) fn stamp_session_route_for_test(
 
 #[inline(always)]
 fn tcp_input_buffer(
-    buffer: &hammer_adapter::Buffer,
+    buffer: &hammer_core::data_plane::Buffer,
 ) -> CoreResult<Result<(IpVersion, IpProtocol, SocketAddr, SocketAddr, TcpInputFlags), TcpInputError>>
 {
     tcp_input_parts(buffer.current(), unsafe {
@@ -1510,7 +1512,10 @@ fn lookup_for_packet(
 }
 
 #[inline(always)]
-fn prefetch_lookup_for_buffer(snapshot: &TcpLookupSnapshot, buffer: &hammer_adapter::Buffer) {
+fn prefetch_lookup_for_buffer(
+    snapshot: &TcpLookupSnapshot,
+    buffer: &hammer_core::data_plane::Buffer,
+) {
     let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
     let cursor = network.packet_cursor();
     if !valid_tcp_cursor(cursor) {
@@ -1576,7 +1581,7 @@ fn prefetch_lookup_for_buffer(snapshot: &TcpLookupSnapshot, buffer: &hammer_adap
 #[inline(always)]
 fn prefetch_session_route_for_buffer<C>(
     session_queue: Option<TcpQueue<C>>,
-    buffer: &hammer_adapter::Buffer,
+    buffer: &hammer_core::data_plane::Buffer,
 ) where
     C: CongestionController + 'static,
 {
@@ -1614,7 +1619,7 @@ fn prefetch_session_route_for_buffer<C>(
 }
 
 #[inline(always)]
-fn tcp_source_port(buffer: &hammer_adapter::Buffer) -> u16 {
+fn tcp_source_port(buffer: &hammer_core::data_plane::Buffer) -> u16 {
     let transport = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) }
         .packet_cursor()
         .transport_header_offset();
@@ -1626,7 +1631,7 @@ fn tcp_source_port(buffer: &hammer_adapter::Buffer) -> u16 {
 }
 
 #[inline(always)]
-fn tcp_destination_port(buffer: &hammer_adapter::Buffer) -> u16 {
+fn tcp_destination_port(buffer: &hammer_core::data_plane::Buffer) -> u16 {
     let transport = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) }
         .packet_cursor()
         .transport_header_offset();

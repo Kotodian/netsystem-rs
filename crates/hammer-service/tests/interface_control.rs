@@ -210,7 +210,7 @@ fn interface_address_publish_installs_receive_route_in_fib() {
         let mut buffer = runtime.get_buffer_mut(index).expect("buffer mut");
         let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
         network.set_packet_cursor(
-            hammer_adapter::BufferPacketCursor::new()
+            hammer_core::data_plane::BufferPacketCursor::new()
                 .with_packet_len(packet.len())
                 .with_network_header(0, 20)
                 .with_transport_header(20, 8)
@@ -415,7 +415,7 @@ fn interface_output_and_tun_output_avoid_packet_copy_shortcuts() {
 
 fn push_packet_with_egress(
     runtime: &DataPlaneRuntime,
-    frame: &mut hammer_adapter::BufferFrame,
+    frame: &mut hammer_core::data_plane::BufferFrame,
     egress_interface: Option<u32>,
     payload: &[u8],
 ) {

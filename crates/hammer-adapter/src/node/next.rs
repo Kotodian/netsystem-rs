@@ -1,4 +1,6 @@
-use crate::{BufferIndex, DataPlaneRuntime};
+use hammer_core::data_plane::BufferIndex;
+
+use crate::DataPlaneRuntime;
 
 #[inline(always)]
 pub fn default_prefetch_indices(runtime: &DataPlaneRuntime, indices: &[BufferIndex]) {

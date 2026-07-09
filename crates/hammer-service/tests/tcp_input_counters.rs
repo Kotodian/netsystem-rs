@@ -1,7 +1,7 @@
 use hammer_adapter::{
-    DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node,
-    NodeResult, NodeRuntimeData,
+    DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node, NodeResult, NodeRuntimeData,
 };
+use hammer_core::data_plane::DataPlaneBufferConfig;
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::TcpSegmentFlags;
 use hammer_service::transport::tcp::{
@@ -31,13 +31,17 @@ fn test_runtime_configured(
 struct BlackholeNode;
 
 impl Node for BlackholeNode {
-    fn process(&mut self, _: &DataPlaneRuntime, _: &mut hammer_adapter::BufferFrame) -> NodeResult {
+    fn process(
+        &mut self,
+        _: &DataPlaneRuntime,
+        _: &mut hammer_core::data_plane::BufferFrame,
+    ) -> NodeResult {
         NodeResult::drop()
     }
     fn node_process(&self) -> hammer_adapter::NodeProcessFn {
         |_: &DataPlaneRuntime,
          _: hammer_adapter::NodeRuntimeData,
-         _: &mut hammer_adapter::BufferFrame| NodeResult::drop()
+         _: &mut hammer_core::data_plane::BufferFrame| NodeResult::drop()
     }
     fn node_runtime_data(&self) -> CoreResult<hammer_adapter::NodeRuntimeData> {
         Ok(NodeRuntimeData::default())

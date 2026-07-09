@@ -1,8 +1,7 @@
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult,
-    NodeRuntimeData,
+    DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
 };
-use hammer_core::data_plane::{NodeId, NodeRegistration};
+use hammer_core::data_plane::{BufferFrame, BufferIndex, NodeId, NodeRegistration};
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::tcp_header;
 
@@ -212,7 +211,8 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex, OnceLock};
 
-    use hammer_adapter::{BufferFrame, NodeProcessFn};
+    use hammer_adapter::NodeProcessFn;
+    use hammer_core::data_plane::BufferFrame;
     use hammer_core::protocol::tcp::{TcpCapabilities, TcpSegmentFlags};
 
     use super::*;
@@ -296,12 +296,12 @@ mod tests {
     ) {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
                     frame_capacity: 8,
                     frame_slots: 8,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let lookup_state = Arc::new(Mutex::new(CaptureState::default()));

@@ -2,10 +2,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneBufferConfig, DataPlaneBuffers, DataPlaneRuntime, DataPlaneRuntimeConfig,
-    DataWorkerId, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
+    DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, InternalNode, Node, NodeProcessFn,
+    NodeResult, NodeRuntimeData,
 };
-use hammer_core::data_plane::NodeRegistration;
+use hammer_core::data_plane::{
+    BufferFrame, DataPlaneBufferConfig, DataPlaneBuffers, NodeRegistration,
+};
 use hammer_core::error::CoreResult;
 use hammer_infra::segment::Local;
 use hammer_runtime::app::{AppSession, AppSessionConfig, SessionHandle};
@@ -197,7 +199,7 @@ fn capture_states() -> &'static Mutex<std::vec::Vec<Arc<Mutex<CaptureState>>>> {
 
 fn chain_bytes(
     buffers: &DataPlaneBuffers,
-    index: hammer_adapter::BufferIndex,
+    index: hammer_core::data_plane::BufferIndex,
 ) -> CoreResult<hammer_infra::vec::Vec<u8>> {
     let mut bytes = hammer_infra::vec::Vec::new();
     for buffer in buffers.chain(index) {

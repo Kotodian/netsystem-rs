@@ -3,10 +3,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
-    SecondaryOpaque, TraceControlPlane, TraceInputPolicy, TracePolicy,
+    DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
+    TraceControlPlane, TraceInputPolicy, TracePolicy,
 };
 use hammer_core::config::Config;
+use hammer_core::data_plane::{BufferFrame, SecondaryOpaque};
 use hammer_core::error::CoreResult;
 use hammer_core::forwarding::AdjacencyRewrite;
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
@@ -58,7 +59,10 @@ struct SinkNode {
     runtime_data: NodeRuntimeData,
 }
 
-fn chain_bytes(runtime: &DataPlaneRuntime, index: hammer_adapter::BufferIndex) -> InfraVec<u8> {
+fn chain_bytes(
+    runtime: &DataPlaneRuntime,
+    index: hammer_core::data_plane::BufferIndex,
+) -> InfraVec<u8> {
     let mut bytes = InfraVec::new();
     for buffer in runtime.buffers().chain(index) {
         bytes.extend_from_slice(buffer.expect("chain buffer").current());
@@ -658,7 +662,7 @@ fn adjacency_rewrite_node_prepends_rewrite_and_sets_egress_interface() {
             dpo_index: adjacency.get(),
         });
         unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }.set_packet_cursor(
-            hammer_adapter::BufferPacketCursor::new()
+            hammer_core::data_plane::BufferPacketCursor::new()
                 .with_packet_len(packet.len())
                 .with_network_header(0, 20)
                 .with_transport_header(20, 8)
@@ -745,7 +749,7 @@ fn adjacency_rewrite_node_prepends_rewrite_when_packet_has_headroom() {
             dpo_index: adjacency.get(),
         });
         unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }.set_packet_cursor(
-            hammer_adapter::BufferPacketCursor::new()
+            hammer_core::data_plane::BufferPacketCursor::new()
                 .with_packet_len(packet.len())
                 .with_network_header(0, 20)
                 .with_transport_header(20, 8)
@@ -1058,7 +1062,7 @@ fn push_packet(runtime: &DataPlaneRuntime, frame: &mut BufferFrame, packet: &[u8
 fn alloc_packet_with_headroom(
     runtime: &DataPlaneRuntime,
     packet: &[u8],
-) -> hammer_adapter::BufferIndex {
+) -> hammer_core::data_plane::BufferIndex {
     let index = runtime.alloc_index().expect("alloc packet with headroom");
     runtime
         .buffers()
@@ -1085,7 +1089,7 @@ fn push_marked_packet(
 
 fn set_lookup_cursor(
     runtime: &DataPlaneRuntime,
-    index: hammer_adapter::BufferIndex,
+    index: hammer_core::data_plane::BufferIndex,
     packet: &[u8],
 ) {
     let Some(first) = packet.first().copied() else {
@@ -1101,7 +1105,7 @@ fn set_lookup_cursor(
         6 => (6u8, packet[6], 40, 40),
         _ => return,
     };
-    let cursor = hammer_adapter::BufferPacketCursor::new()
+    let cursor = hammer_core::data_plane::BufferPacketCursor::new()
         .with_packet_len(packet.len())
         .with_network_header(0, network_len)
         .with_transport_header(transport_offset, 8)

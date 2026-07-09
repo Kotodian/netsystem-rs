@@ -3,10 +3,9 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeResult, PacketTrace, SecondaryOpaque,
-    TraceFormatter, add_packet_trace,
+    DataPlaneRuntime, Node, NodeResult, PacketTrace, TraceFormatter, add_packet_trace,
 };
-use hammer_core::data_plane::{NodeId, NodeNextStorage};
+use hammer_core::data_plane::{BufferFrame, BufferIndex, NodeId, NodeNextStorage, SecondaryOpaque};
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
 use hammer_core::protocol::transport::UdpHeader;
@@ -491,7 +490,7 @@ fn clear_success_metadata(runtime: &DataPlaneRuntime, index: BufferIndex) -> Cor
 }
 
 #[inline(always)]
-fn valid_udp_cursor(cursor: hammer_adapter::BufferPacketCursor) -> bool {
+fn valid_udp_cursor(cursor: hammer_core::data_plane::BufferPacketCursor) -> bool {
     let transport_header_offset = cursor.transport_header_offset();
     let packet_len = cursor.packet_len();
     cursor.packet_len() != 0

@@ -1,6 +1,6 @@
 use std::mem::{align_of, size_of, transmute};
 
-use hammer_adapter::{
+use hammer_core::data_plane::{
     BufferHeaderCacheline0, BufferHeaderCacheline1, PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES,
     PrimaryOpaque, SecondaryOpaque,
 };

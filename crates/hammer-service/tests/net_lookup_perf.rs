@@ -6,10 +6,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneBufferConfig, DataPlaneInstructionSet, DataPlaneRuntime,
-    DataPlaneRuntimeConfig, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
-    SecondaryOpaque,
+    DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node,
+    NodeProcessFn, NodeResult, NodeRuntimeData,
 };
+use hammer_core::data_plane::{BufferFrame, DataPlaneBufferConfig, SecondaryOpaque};
 use hammer_core::error::CoreResult;
 use hammer_service::data_plane::DropNode;
 use hammer_service::net::{
@@ -36,11 +36,10 @@ fn test_runtime_configured_instruction_set(
             buffer_slots,
             frame_capacity,
             frame_slots,
-            instruction_set,
             ..DataPlaneBufferConfig::default()
         },
     };
-    DataPlaneRuntime::new(config)
+    DataPlaneRuntime::new_with_instruction_set(config, instruction_set)
 }
 
 #[derive(Clone, Copy, Default)]

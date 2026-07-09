@@ -2,7 +2,8 @@ use std::mem::{size_of, transmute};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::net::{IpEcnCodepoint, NetworkOpaque};
-use hammer_adapter::{BufferIndex, BufferPacketCursor, DataPlaneRuntime};
+use hammer_adapter::DataPlaneRuntime;
+use hammer_core::data_plane::{BufferIndex, BufferPacketCursor};
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::{
     TcpCapabilities, TcpError, TcpFastOpenCookie, TcpPacket, TcpSackBlock, TcpSegmentFlags,
@@ -101,7 +102,7 @@ impl TcpSegment {
 
     pub(crate) fn write_to_buffer(
         &self,
-        buffers: &hammer_adapter::DataPlaneBuffers,
+        buffers: &hammer_core::data_plane::DataPlaneBuffers,
         index: BufferIndex,
     ) -> CoreResult<()> {
         let mut buffer = buffers.get_buffer_mut(index)?;
@@ -254,12 +255,12 @@ mod tests {
     fn transport_tcp_segment_write_to_buffer_prepends_sack_blocks() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 4,
                     frame_capacity: 4,
                     frame_slots: 4,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let index = runtime.alloc_index().expect("buffer");
@@ -297,12 +298,12 @@ mod tests {
     fn transport_tcp_segment_write_to_buffer_prepends_fast_open_cookie() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 4,
                     frame_capacity: 4,
                     frame_slots: 4,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let index = runtime.alloc_index().expect("buffer");

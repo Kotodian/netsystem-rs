@@ -1,10 +1,8 @@
 use std::sync::Arc;
 
 use crossbeam_queue::ArrayQueue;
-use hammer_core::data_plane::NodeHandle;
+use hammer_core::data_plane::{BufferIndex, BufferPoolArena, NodeHandle};
 use hammer_core::error::{CoreResult, DataPlaneError};
-
-use crate::{BufferIndex, BufferPoolArena};
 
 pub(crate) const HANDOFF_SLOT_CAPACITY: usize = 32;
 
@@ -238,8 +236,8 @@ impl DataPlaneHandoffWorker {
 
 #[cfg(test)]
 mod tests {
-    use crate::{DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig};
-    use hammer_core::data_plane::NodeId;
+    use crate::{DataPlaneRuntime, DataPlaneRuntimeConfig};
+    use hammer_core::data_plane::{DataPlaneBufferConfig, NodeId};
 
     use super::*;
 

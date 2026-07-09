@@ -5,7 +5,8 @@ pub mod reassembly;
 
 use std::net::IpAddr;
 
-use hammer_adapter::{BufferPacketCursor, Network};
+use hammer_adapter::Network;
+use hammer_core::data_plane::BufferPacketCursor;
 use hammer_core::error::{CoreError, CoreResult};
 pub use hammer_core::protocol::ip::{
     IpFragmentKey, IpInputError, IpInputTarget, IpProtocol, IpVersion, Ipv4Header, Ipv6Header,

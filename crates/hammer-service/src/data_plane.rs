@@ -8,10 +8,10 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    Buffer, BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeProcessFn,
-    NodeResult, PacketTrace, TraceFormatter, add_packet_trace,
+    DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, PacketTrace, TraceFormatter,
+    add_packet_trace,
 };
-use hammer_core::data_plane::{NodeId, NodeRegistration};
+use hammer_core::data_plane::{Buffer, BufferFrame, BufferIndex, NodeId, NodeRegistration};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_runtime::DataPlaneBarrierHandle;
 
@@ -212,12 +212,12 @@ mod tests {
     fn drop_node_releases_owned_buffers_when_owner_drops_after_processing() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 64,
                     buffer_slots: 4,
                     frame_capacity: 2,
                     frame_slots: 4,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let drop_node = runtime.nodes().register_internal(DropNode::new());
@@ -250,12 +250,12 @@ mod tests {
     fn handoff_node_routes_packet_to_metadata_selected_next() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 64,
                     buffer_slots: 4,
                     frame_capacity: 2,
                     frame_slots: 4,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let sink = runtime.nodes().register_internal(DropNode::new());
@@ -554,7 +554,10 @@ pub fn set_buffer_node_error_code(
     code: u16,
 ) -> CoreResult<()> {
     let error = runtime.record_current_node_error(code)?;
-    buffer.set_node_error(hammer_adapter::BufferNodeError::new(NodeId::new(0), error));
+    buffer.set_node_error(hammer_core::data_plane::BufferNodeError::new(
+        NodeId::new(0),
+        error,
+    ));
     Ok(())
 }
 
@@ -566,7 +569,10 @@ pub fn set_index_node_error_code(
 ) -> CoreResult<()> {
     let error = runtime.record_current_node_error(code)?;
     let mut buffer = runtime.get_buffer_mut(index)?;
-    buffer.set_node_error(hammer_adapter::BufferNodeError::new(NodeId::new(0), error));
+    buffer.set_node_error(hammer_core::data_plane::BufferNodeError::new(
+        NodeId::new(0),
+        error,
+    ));
     Ok(())
 }
 

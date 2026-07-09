@@ -7,12 +7,13 @@ use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
 use hammer_core::data_plane::{
-    MAX_NODE_NEXT_SLOTS, NodeHandle, NodeId, NodeKind, NodeNext, NodeRegistration, NodeState,
+    BufferFrame, BufferNodeError, Frame, MAX_NODE_NEXT_SLOTS, NodeHandle, NodeId, NodeKind,
+    NodeNext, NodeRegistration, NodeState, Pending,
 };
 use hammer_core::error::{CoreError, CoreResult, DataPlaneError};
 use hammer_infra::boxed::Slice;
 
-use crate::buffer::{BufferFrame, DataPlaneRuntime, Frame, Pending};
+use crate::buffer::DataPlaneRuntime;
 use crate::trace::TraceFormatter;
 
 pub mod next;
@@ -33,8 +34,9 @@ macro_rules! process_frame {
         let mut next_nodes: [Option<::hammer_core::data_plane::NodeId>;
             ::hammer_core::data_plane::MAX_NODE_NEXT_SLOTS] =
             [None; ::hammer_core::data_plane::MAX_NODE_NEXT_SLOTS];
-        let mut next_frames: [Option<$crate::Frame<$crate::Next>>;
-            ::hammer_core::data_plane::MAX_NODE_NEXT_SLOTS] = ::std::array::from_fn(|_| None);
+        let mut next_frames: [Option<
+            ::hammer_core::data_plane::Frame<::hammer_core::data_plane::Next>,
+        >; ::hammer_core::data_plane::MAX_NODE_NEXT_SLOTS] = ::std::array::from_fn(|_| None);
         let mut next_len = 0usize;
         let mut cached_next = None;
         let mut cached_offset = 0usize;
@@ -428,7 +430,7 @@ struct NodeRuntimeInner {
     interrupt_pending: Vec<bool>,
     error_counters: Vec<NodeErrorCounters>,
     error_ids: HashMap<u64, u16>,
-    error_slots: Vec<crate::BufferNodeError>,
+    error_slots: Vec<BufferNodeError>,
     runtime_stats: Vec<NodeRuntimeStats>,
     queue: ScheduledFrameQueue,
     handles: HashMap<NodeHandle, NodeId>,
@@ -1231,9 +1233,7 @@ impl NodeRuntime {
             .checked_add(1)
             .and_then(|value| u16::try_from(value).ok())
             .ok_or_else(|| CoreError::internal("node error slot overflow"))?;
-        inner
-            .error_slots
-            .push(crate::BufferNodeError::new(node, code));
+        inner.error_slots.push(BufferNodeError::new(node, code));
         inner.error_ids.insert(key, next);
         Ok(next)
     }
@@ -1250,7 +1250,7 @@ impl NodeRuntime {
     }
 
     #[inline]
-    pub fn decode_node_error(&self, encoded: u16) -> CoreResult<Option<crate::BufferNodeError>> {
+    pub fn decode_node_error(&self, encoded: u16) -> CoreResult<Option<BufferNodeError>> {
         if encoded == 0 {
             return Ok(None);
         }
@@ -1364,7 +1364,7 @@ impl NodeRuntime {
             runtime.set_current_node(None);
             let _ = self.record_runtime_stats(node, vectors, elapsed_ns);
             processed += 1;
-            drop(frame);
+            runtime.drop_pending_frame_owned(frame);
         }
         Ok(processed)
     }
@@ -1429,6 +1429,7 @@ impl Future for NodeRuntimeReady {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hammer_core::data_plane::DataPlaneBufferConfig;
 
     struct StatsNode;
 
@@ -1464,12 +1465,12 @@ mod tests {
     #[test]
     fn function_node_runtime_stats_count_named_node_frames() {
         let runtime = DataPlaneRuntime::new(crate::DataPlaneRuntimeConfig {
-            buffers: crate::DataPlaneBufferConfig {
+            buffers: DataPlaneBufferConfig {
                 buffer_slot_capacity: 16,
                 buffer_slots: 8,
                 frame_capacity: 4,
                 frame_slots: 2,
-                ..crate::DataPlaneBufferConfig::default()
+                ..DataPlaneBufferConfig::default()
             },
         });
         let node = runtime.nodes().register_internal(StatsNode);

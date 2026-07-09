@@ -38,6 +38,7 @@ bytes = { workspace = true, optional = true }
 nom = { workspace = true }
 etherparse = { workspace = true }
 bitflags = "2.10"
+spinning_top = { workspace = true }
 
 [dev-dependencies]
 indoc = { workspace = true }

@@ -3,10 +3,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossbeam_utils::CachePadded;
-use hammer_adapter::{
-    BufferIndex, DataPlaneBuffers, DataPlaneRuntime, DataWorkerId, NodeRuntimeData,
-    buffer::{Frame, Next},
-};
+use hammer_adapter::{DataPlaneRuntime, DataWorkerId, NodeRuntimeData};
+use hammer_core::data_plane::{BufferIndex, DataPlaneBuffers, Frame, Next};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::fifo_queue::FifoQueue;
 use hammer_infra::msg_queue::{MsgQueue, SessionEvtType};
@@ -997,10 +995,8 @@ mod tests {
     use std::sync::{Arc, Mutex, OnceLock};
 
     use crate::session::protocol::SessionQueueControlContext;
-    use hammer_adapter::{
-        BufferFrame, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
-    };
-    use hammer_core::data_plane::{NodeId, NodeRegistration};
+    use hammer_adapter::{InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
+    use hammer_core::data_plane::{BufferFrame, NodeId, NodeRegistration};
     use hammer_infra::msg_queue::{SessionEvt, SessionEvtType};
     use hammer_runtime::app::AppSession;
 
@@ -1629,12 +1625,12 @@ mod tests {
     ) {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
                     frame_capacity: 8,
                     frame_slots: 8,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let mut driver =
@@ -1976,12 +1972,12 @@ mod tests {
     fn session_driver_runtime_suppresses_duplicate_session_work_and_reschedules_after_drain() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
                     frame_capacity: 8,
                     frame_slots: 8,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let mut driver = SessionDriverRuntime::<NoTxPayloadProtocol, Local>::new(
@@ -2011,12 +2007,12 @@ mod tests {
     fn session_driver_runtime_context_schedules_session_work() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
                     frame_capacity: 8,
                     frame_slots: 8,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let mut driver = SessionDriverRuntime::<NoTxPayloadProtocol, Local>::new(
@@ -2047,12 +2043,12 @@ mod tests {
     fn session_context_mark_ready_coalesces_duplicate_requests_during_dispatch() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
                     frame_capacity: 8,
                     frame_slots: 8,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let mut driver = SessionDriverRuntime::<MarkReadyTwiceProtocol, Local>::new(
@@ -2098,12 +2094,12 @@ mod tests {
     fn timer_handler_schedules_session_work_through_context() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
                     frame_capacity: 8,
                     frame_slots: 8,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let mut driver = SessionDriverRuntime::<TimerMarkReadyProtocol, Local>::new(
@@ -2178,12 +2174,12 @@ mod tests {
     fn app_tx_deq_event_schedules_session_work() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
                     frame_capacity: 8,
                     frame_slots: 8,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let mut driver = SessionDriverRuntime::<EventClassificationProtocol, Local>::new(
@@ -2218,12 +2214,12 @@ mod tests {
     fn app_close_event_dispatches_disconnect_control_event() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
                     frame_capacity: 8,
                     frame_slots: 8,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let mut driver = SessionDriverRuntime::<EventClassificationProtocol, Local>::new(
@@ -2258,12 +2254,12 @@ mod tests {
     fn same_turn_close_dispatches_before_tx_work_and_skips_removed_session() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
                     frame_capacity: 8,
                     frame_slots: 8,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let mut driver = SessionDriverRuntime::<EventClassificationProtocol, Local>::new(
@@ -2300,12 +2296,12 @@ mod tests {
     fn same_turn_close_skips_tx_work_when_disconnect_keeps_session_allocated() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
                     frame_capacity: 8,
                     frame_slots: 8,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let mut driver = SessionDriverRuntime::<NonRemovingDisconnectProtocol, Local>::new(
@@ -2365,12 +2361,12 @@ mod tests {
     fn same_turn_close_skips_expired_timer_dispatch_for_same_session() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
                     frame_capacity: 8,
                     frame_slots: 8,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let mut driver = SessionDriverRuntime::<TimerVsDisconnectProtocol, Local>::new(
@@ -2411,12 +2407,12 @@ mod tests {
     fn session_tx_does_not_call_transport_when_app_has_no_pending_send() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
                     frame_capacity: 8,
                     frame_slots: 8,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let buffers = runtime.buffers();
@@ -2452,12 +2448,12 @@ mod tests {
     fn session_tx_desched_flag_leaves_session_unqueued_when_send_space_is_zero() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
                     frame_capacity: 8,
                     frame_slots: 8,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let buffers = runtime.buffers();
@@ -2513,12 +2509,12 @@ mod tests {
     fn session_tx_postpone_flag_requeues_remaining_data_when_send_space_is_zero() {
         let runtime =
             hammer_adapter::DataPlaneRuntime::new(hammer_adapter::DataPlaneRuntimeConfig {
-                buffers: hammer_adapter::DataPlaneBufferConfig {
+                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
                     frame_capacity: 8,
                     frame_slots: 8,
-                    ..hammer_adapter::DataPlaneBufferConfig::default()
+                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
             });
         let buffers = runtime.buffers();

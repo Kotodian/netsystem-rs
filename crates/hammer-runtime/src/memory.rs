@@ -1,8 +1,8 @@
-use hammer_adapter::buffer::{
-    DEFAULT_BUFFER_FRAME_CAPACITY, DEFAULT_BUFFER_FRAME_POOL_SIZE, DataPlaneBufferConfig,
-    DataPlaneRuntime, DataPlaneRuntimeConfig,
-};
+use hammer_adapter::{DataPlaneRuntime, DataPlaneRuntimeConfig};
 use hammer_component_macros::init_function;
+use hammer_core::data_plane::{
+    DEFAULT_BUFFER_FRAME_CAPACITY, DEFAULT_BUFFER_FRAME_POOL_SIZE, DataPlaneBufferConfig,
+};
 use hammer_core::error::HammerResult;
 
 use crate::engine::Engine;

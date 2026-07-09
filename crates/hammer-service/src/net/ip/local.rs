@@ -4,10 +4,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeProcessFn,
-    NodeResult, NodeRuntimeData, PacketTrace, TraceFormatter, add_packet_trace,
+    DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
+    TraceFormatter, add_packet_trace,
 };
-use hammer_core::data_plane::{NodeId, NodeNextStorage};
+use hammer_core::data_plane::{
+    BufferFrame, BufferIndex, BufferPacketCursor, NodeId, NodeNextStorage,
+};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::IcmpHeader;
 use hammer_core::protocol::tcp::TcpWireHeader;

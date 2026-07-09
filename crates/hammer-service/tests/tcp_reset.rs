@@ -2,10 +2,12 @@ use std::mem::transmute;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use hammer_adapter::{
-    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneBufferConfig, DataPlaneRuntime,
-    DataPlaneRuntimeConfig, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
+    DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node, NodeProcessFn, NodeResult,
+    NodeRuntimeData,
 };
-use hammer_core::data_plane::NodeId;
+use hammer_core::data_plane::{
+    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneBufferConfig, NodeId,
+};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 use hammer_service::net::NetworkOpaque;

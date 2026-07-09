@@ -6,12 +6,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use hammer_adapter::{
-    BufferFrame, BufferFramePairBatch, BufferFrameQuadBatch, BufferIndex, BufferPacketCursor,
-    BufferPool, BufferPoolArena, BufferRefMut, DataPlaneBufferConfig, DataPlaneBuffers,
     DataPlaneHandoff, DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig,
-    DataWorkerId, Frame, FrameBatchWidth, Next, Pending,
+    DataWorkerId, FrameBatchWidth,
 };
-use hammer_core::data_plane::NodeId;
+use hammer_core::data_plane::{
+    BufferFrame, BufferFramePairBatch, BufferFrameQuadBatch, BufferIndex, BufferPacketCursor,
+    BufferPool, BufferPoolArena, BufferRefMut, DataPlaneBufferConfig, DataPlaneBuffers, NodeId,
+};
 use hammer_core::error::CoreResult;
 use hammer_infra::vec::Vec;
 
@@ -59,17 +60,18 @@ fn test_runtime_configured_instruction_set(
     frame_slots: usize,
     instruction_set: DataPlaneInstructionSet,
 ) -> DataPlaneRuntime {
-    let config = DataPlaneRuntimeConfig {
-        buffers: DataPlaneBufferConfig {
-            buffer_slot_capacity,
-            buffer_slots,
-            frame_capacity,
-            frame_slots,
-            instruction_set,
-            ..DataPlaneBufferConfig::default()
+    DataPlaneRuntime::new_with_instruction_set(
+        DataPlaneRuntimeConfig {
+            buffers: DataPlaneBufferConfig {
+                buffer_slot_capacity,
+                buffer_slots,
+                frame_capacity,
+                frame_slots,
+                ..DataPlaneBufferConfig::default()
+            },
         },
-    };
-    DataPlaneRuntime::new(config)
+        instruction_set,
+    )
 }
 
 fn pool_cleanup_runtime(pool: &BufferPool, frame_capacity: usize) -> DataPlaneRuntime {
@@ -155,7 +157,7 @@ fn chain_len(pool: &BufferPool, index: BufferIndex) -> CoreResult<usize> {
 
 #[test]
 fn buffer_header_keeps_hot_metadata_in_first_cacheline() {
-    assert_eq!(align_of::<hammer_adapter::Buffer>(), 64);
+    assert_eq!(align_of::<hammer_core::data_plane::Buffer>(), 64);
     assert!(size_of::<BufferPacketCursor>() <= 32);
 }
 

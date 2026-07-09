@@ -1,4 +1,4 @@
-use hammer_adapter::DataPlaneBuffers;
+use hammer_core::data_plane::DataPlaneBuffers;
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
 
 use crate::session::{SessionId, runtime::WorkerSessionRuntime};
