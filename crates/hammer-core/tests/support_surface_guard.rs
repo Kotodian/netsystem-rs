@@ -80,6 +80,18 @@ const RETIRED_SURFACE_PATTERNS: &[RetiredSurfacePattern] = &[
         reason: "iOS should not be documented as a supported platform surface",
     },
     RetiredSurfacePattern {
+        phrases: &["target_os = \"ios\""],
+        reason: "active first-party cfgs must not compile iOS support surfaces",
+    },
+    RetiredSurfacePattern {
+        phrases: &["macos/ios", "macos and ios"],
+        reason: "active first-party docs must describe macOS-only support",
+    },
+    RetiredSurfacePattern {
+        phrases: &["apple-platform"],
+        reason: "active first-party Cargo features must be named macos-platform",
+    },
+    RetiredSurfacePattern {
         phrases: &["generated ios"],
         reason: "generated iOS output is retired",
     },
@@ -172,7 +184,6 @@ fn scan_roots_include_current_support_surfaces_and_skip_history() {
 fn curated_patterns_ignore_repo_identity_std_ffi_and_platform_cfgs() {
     assert!(find_retired_surface_pattern("repo = Kotodian/hammer-ios-rs").is_none());
     assert!(find_retired_surface_pattern("use std::ffi::CString;").is_none());
-    assert!(find_retired_surface_pattern("#[cfg(target_os = \"ios\")]").is_none());
     assert!(find_retired_surface_pattern("swiftly move packets").is_none());
     assert!(find_retired_surface_pattern("unified queue ownership").is_none());
 }
@@ -193,6 +204,18 @@ fn curated_patterns_still_catch_retired_support_phrases() {
         find_retired_surface_pattern("This was an iOS VPN entry point")
             .map(|pattern| pattern.reason),
         Some("iOS VPN is no longer a supported product identity")
+    );
+    assert_eq!(
+        find_retired_surface_pattern("#[cfg(target_os = \"ios\")]").map(|pattern| pattern.reason),
+        Some("active first-party cfgs must not compile iOS support surfaces")
+    );
+    assert_eq!(
+        find_retired_surface_pattern("Platform surfaces: macOS/iOS").map(|pattern| pattern.reason),
+        Some("active first-party docs must describe macOS-only support")
+    );
+    assert_eq!(
+        find_retired_surface_pattern("apple-platform = []").map(|pattern| pattern.reason),
+        Some("active first-party Cargo features must be named macos-platform")
     );
 }
 

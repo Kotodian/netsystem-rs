@@ -11,9 +11,9 @@ name = "hammer_core"
 default = []
 # Platform-specific config/runtime surfaces. Selected automatically by
 # target_os via cfg; the Cargo feature is a mirror so downstream crates can
-# require it explicitly. Do not enable both linux-platform and apple-platform.
+# require it explicitly. Do not enable both linux-platform and macos-platform.
 linux-platform = []
-apple-platform = []
+macos-platform = []
 # Enables the WireGuard peer state machine and protocol primitives
 # (`boringtun` `Tunn`, peer struct, `WIREGUARD_OVERHEAD`).
 wireguard = ["dep:bytes", "dep:boringtun", "dep:serde_with", "serde_with/base64"]

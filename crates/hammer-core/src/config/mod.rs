@@ -23,7 +23,7 @@ pub use log::Log;
 pub use network::{Network, SessionBackend};
 pub use route::{Route, RouteAction, Via};
 pub use trace::{Trace, TraceInput};
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(target_os = "macos")]
 pub use worker::QosClass;
 pub use worker::Worker;
 pub use worker::WorkerScheduler;

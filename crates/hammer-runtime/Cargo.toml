@@ -10,7 +10,7 @@ name = "hammer_runtime"
 [features]
 default = []
 linux-platform = []
-apple-platform = []
+macos-platform = []
 
 [dependencies]
 hammer-core = { path = "../hammer-core" }

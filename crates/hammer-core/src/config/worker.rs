@@ -9,7 +9,7 @@
 //! Platform surfaces:
 //! - Linux: `[worker.cpu]` (main/app/worker cores), `[worker.scheduler]`
 //!   (policy/priority), `[worker.numa]`.
-//! - macOS/iOS: `[worker.scheduler]` (qos). No CPU affinity or NUMA on XNU.
+//! - macOS: `[worker.scheduler]` (qos). No CPU affinity or NUMA on XNU.
 //!
 //! Defaults are derived from `hammer-service`/`hammer-runtime`/`hammer-core`
 //! production constants (see per-field doc comments for sources).
@@ -65,13 +65,13 @@ pub struct Worker {
     /// "avx2", "avx512", "neon". Default: "native".
     #[serde(default = "default_instruction_set")]
     pub instruction_set: String,
-    /// CPU pinning. Linux only; absent on macOS/iOS (XNU has no thread
+    /// CPU pinning. Linux only; absent on macOS (XNU has no thread
     /// affinity). The three cores are independent: `main_core` runs the
     /// control thread, `app_core` runs the app session/ring runtime, and
     /// `worker_cores` run the dataplane packet graph.
     #[cfg(target_os = "linux")]
     pub cpu: WorkerCpu,
-    /// Scheduling policy / QoS. Linux exposes policy+priority; Apple exposes
+    /// Scheduling policy / QoS. Linux exposes policy+priority; macOS exposes
     /// QoS class. The two shapes are mutually exclusive by target.
     pub scheduler: WorkerScheduler,
     /// NUMA-aware buffer allocation. Linux only.
@@ -300,19 +300,19 @@ impl WorkerCpu {
     }
 }
 
-/// Scheduling. Linux: policy + priority. Apple: QoS class. The two shapes are
+/// Scheduling. Linux: policy + priority. macOS: QoS class. The two shapes are
 /// discriminated by target.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct WorkerScheduler {
-    /// Linux scheduling policy. Ignored on Apple platforms.
+    /// Linux scheduling policy. Ignored on macOS.
     #[cfg(target_os = "linux")]
     pub policy: SchedulerPolicy,
     /// Linux scheduling priority (only meaningful for `fifo`/`rr`).
     #[cfg(target_os = "linux")]
     pub priority: i32,
-    /// Apple QoS class. Ignored on Linux.
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    /// macOS QoS class. Ignored on Linux.
+    #[cfg(target_os = "macos")]
     pub qos: QosClass,
 }
 
@@ -323,7 +323,7 @@ impl Default for WorkerScheduler {
             policy: SchedulerPolicy::default(),
             #[cfg(target_os = "linux")]
             priority: 0,
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            #[cfg(target_os = "macos")]
             qos: QosClass::default(),
         }
     }
@@ -369,8 +369,8 @@ pub enum SchedulerPolicy {
     Rr,
 }
 
-/// Apple QoS class (`pthread_set_qos_class_self_np`).
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+/// macOS QoS class (`pthread_set_qos_class_self_np`).
+#[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum QosClass {
@@ -523,9 +523,9 @@ priority = 10
         assert_eq!(worker.instruction_set, "avx512");
     }
 
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[cfg(target_os = "macos")]
     #[test]
-    fn parse_worker_apple_qos() {
+    fn parse_worker_macos_qos() {
         let worker: Worker = toml::from_str(
             r#"
 [scheduler]
@@ -534,6 +534,6 @@ qos = "userInteractive"
         )
         .expect("parse");
         assert_eq!(worker.scheduler.qos, QosClass::UserInteractive);
-        worker.validate().expect("valid apple qos");
+        worker.validate().expect("valid macos qos");
     }
 }

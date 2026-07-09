@@ -20,12 +20,12 @@ pub fn apply_worker_thread_setup(worker: &Worker, index: usize) {
         }
         let _ = index;
     }
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[cfg(target_os = "macos")]
     {
-        apply_apple_qos(&worker.scheduler);
+        apply_macos_qos(&worker.scheduler);
         let _ = index;
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (worker, index);
     }
@@ -89,8 +89,8 @@ fn apply_linux_scheduler(scheduler: &hammer_core::config::WorkerScheduler) {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-fn apply_apple_qos(scheduler: &hammer_core::config::WorkerScheduler) {
+#[cfg(target_os = "macos")]
+fn apply_macos_qos(scheduler: &hammer_core::config::WorkerScheduler) {
     use hammer_core::config::QosClass;
 
     let qos = match scheduler.qos {
@@ -135,7 +135,7 @@ mod tests {
         );
     }
 
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[cfg(target_os = "macos")]
     #[test]
     fn worker_qos_set_does_not_panic() {
         use hammer_core::config::QosClass;

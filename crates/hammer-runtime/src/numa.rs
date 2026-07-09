@@ -1,7 +1,7 @@
 //! NUMA node probing and memory binding (Linux only).
 //!
 //! Uses `libc` syscalls (`getcpu`, `mbind`) without linking libnuma/hwloc.
-//! macOS/iOS and other platforms expose stub no-ops.
+//! macOS and other platforms expose stub no-ops.
 
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
