@@ -37,6 +37,23 @@ const ROOT_BANNED_RUNTIME_IMPORTS: &[&str] = &[
     "add_packet_trace",
 ];
 
+const RETIRED_ADAPTER_CONTRACT_IMPORTS: &[&str] = &[
+    "SocketProtector",
+    "RuntimePlatform",
+    "PlatformInterface",
+    "NetworkInterface",
+    "DefaultInterfaceUpdateListener",
+    "TunOptions",
+    "WifiState",
+    "CertificateProviderService",
+    "NetworkManager",
+    "AsAnyComponent",
+    "ConnectionHandle",
+    "ConnectionManager",
+    "ServiceManager",
+    "WakeupFd",
+];
+
 const DIRECT_BANNED_RUNTIME_OWNER_PATHS: &[&str] = &[
     "hammer_adapter::DataPlaneRuntime",
     "hammer_adapter::DataPlaneRuntimeConfig",
@@ -75,6 +92,20 @@ const DIRECT_BANNED_RUNTIME_OWNER_PATHS: &[&str] = &[
     "hammer_adapter::handoff::",
     "hammer_adapter::instruction_set::",
     "hammer_adapter::trace::",
+    "hammer_adapter::SocketProtector",
+    "hammer_adapter::RuntimePlatform",
+    "hammer_adapter::PlatformInterface",
+    "hammer_adapter::NetworkInterface",
+    "hammer_adapter::DefaultInterfaceUpdateListener",
+    "hammer_adapter::TunOptions",
+    "hammer_adapter::WifiState",
+    "hammer_adapter::CertificateProviderService",
+    "hammer_adapter::NetworkManager",
+    "hammer_adapter::AsAnyComponent",
+    "hammer_adapter::ConnectionHandle",
+    "hammer_adapter::ConnectionManager",
+    "hammer_adapter::ServiceManager",
+    "hammer_adapter::WakeupFd",
 ];
 
 const SCAN_ROOTS: &[&str] = &[
@@ -102,7 +133,7 @@ fn graph_runtime_owner_paths_do_not_point_at_adapter() {
 }
 
 #[test]
-fn grouped_adapter_runtime_imports_are_rejected() {
+fn grouped_adapter_runtime_and_retired_contract_imports_are_rejected() {
     let source = r#"
         use hammer_adapter::{DataPlaneRuntime, DataPlaneTrace, NodeRuntimeStatsRow, PlatformInterface};
         pub use hammer_adapter::{NodeEntry, TracePolicy};
@@ -142,8 +173,8 @@ fn grouped_adapter_runtime_imports_are_rejected() {
     assert!(
         violations
             .iter()
-            .all(|violation| !violation.contains("PlatformInterface")),
-        "allowed adapter traits must not be rejected: {violations:#?}"
+            .any(|violation| violation.contains("PlatformInterface")),
+        "expected retired adapter contract import to be rejected: {violations:#?}"
     );
 }
 
@@ -273,7 +304,9 @@ fn collect_grouped_root_violations(
 ) {
     for entry in split_top_level_items(group) {
         let item = strip_alias(entry);
-        if ROOT_BANNED_RUNTIME_IMPORTS.contains(&item) {
+        if ROOT_BANNED_RUNTIME_IMPORTS.contains(&item)
+            || RETIRED_ADAPTER_CONTRACT_IMPORTS.contains(&item)
+        {
             violations.insert(format!("{path} contains hammer_adapter::{{{item}}}"));
             continue;
         }

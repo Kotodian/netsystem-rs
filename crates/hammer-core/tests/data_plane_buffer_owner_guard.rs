@@ -142,7 +142,7 @@ fn collect_rs_violations(path: &Path, violations: &mut std::vec::Vec<String>) {
         return;
     }
     if path.is_file() {
-        if path.extension().is_some_and(|ext| ext == "rs") {
+        if path.extension().is_some_and(|ext| ext == "rs") && !is_guard_fixture(path) {
             scan_file(path, violations);
         }
         return;
@@ -207,6 +207,20 @@ fn use_statements(text: &str) -> std::vec::Vec<(usize, String)> {
     statements
 }
 
+fn is_guard_fixture(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            matches!(
+                name,
+                "adapter_deletion_guard.rs"
+                    | "data_plane_buffer_owner_guard.rs"
+                    | "data_plane_graph_identity.rs"
+                    | "graph_runtime_owner_guard.rs"
+            )
+        })
+}
+
 fn moved_root_import_in_use_statement(statement: &str) -> Option<&'static str> {
     let (_, remainder) = statement.split_once("use hammer_adapter::{")?;
     let (inside_braces, _) = remainder.split_once('}')?;
@@ -244,7 +258,7 @@ fn multiline_root_braced_adapter_imports_are_rejected() {
 }
 
 #[test]
-fn remaining_runtime_root_imports_are_allowed() {
-    let statement = "use hammer_adapter::{DataPlaneRuntime, DataPlaneRuntimeConfig};";
+fn current_runtime_root_imports_do_not_trigger_buffer_owner_guard() {
+    let statement = "use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig};";
     assert_eq!(moved_root_import_in_use_statement(statement), None);
 }

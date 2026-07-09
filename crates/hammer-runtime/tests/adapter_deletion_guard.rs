@@ -1,11 +1,88 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+struct RetiredAdapterPattern {
+    term: &'static str,
+    reason: &'static str,
+}
+
+const RETIRED_ADAPTER_SOURCE_PATTERNS: &[RetiredAdapterPattern] = &[
+    RetiredAdapterPattern {
+        term: "hammer_adapter",
+        reason: "deleted adapter crate paths must not remain in active sources",
+    },
+    RetiredAdapterPattern {
+        term: "hammer-adapter",
+        reason: "deleted adapter crate names must not remain in active sources",
+    },
+    RetiredAdapterPattern {
+        term: "hammer_runtime::adapter",
+        reason: "old runtime adapter module paths are deleted",
+    },
+    RetiredAdapterPattern {
+        term: "SocketProtector",
+        reason: "runtime socket-protection compatibility surfaces were deleted",
+    },
+    RetiredAdapterPattern {
+        term: "RuntimePlatform",
+        reason: "runtime platform compatibility wrappers were deleted",
+    },
+    RetiredAdapterPattern {
+        term: "PlatformInterface",
+        reason: "OS-facing platform traits were deleted",
+    },
+    RetiredAdapterPattern {
+        term: "NetworkInterface",
+        reason: "OS-facing network interface models were deleted",
+    },
+    RetiredAdapterPattern {
+        term: "DefaultInterfaceUpdateListener",
+        reason: "OS-facing default-interface listeners were deleted",
+    },
+    RetiredAdapterPattern {
+        term: "TunOptions",
+        reason: "OS-facing tun option models were deleted",
+    },
+    RetiredAdapterPattern {
+        term: "WifiState",
+        reason: "OS-facing wifi state models were deleted",
+    },
+    RetiredAdapterPattern {
+        term: "CertificateProviderService",
+        reason: "adapter certificate service traits were deleted",
+    },
+    RetiredAdapterPattern {
+        term: "NetworkManager",
+        reason: "adapter network manager traits were deleted",
+    },
+    RetiredAdapterPattern {
+        term: "AsAnyComponent",
+        reason: "adapter component compatibility traits were deleted",
+    },
+    RetiredAdapterPattern {
+        term: "ConnectionHandle",
+        reason: "adapter connection traits were deleted",
+    },
+    RetiredAdapterPattern {
+        term: "ConnectionManager",
+        reason: "adapter connection manager traits were deleted",
+    },
+    RetiredAdapterPattern {
+        term: "ServiceManager",
+        reason: "adapter service manager traits were deleted",
+    },
+    RetiredAdapterPattern {
+        term: "WakeupFd",
+        reason: "adapter wakeup traits were deleted",
+    },
+];
+
 #[test]
 fn hammer_adapter_is_not_an_active_workspace_crate_or_dependency() {
     let root = workspace_root();
     let root_manifest =
         fs::read_to_string(root.join("Cargo.toml")).expect("read workspace manifest");
+    let cargo_lock = fs::read_to_string(root.join("Cargo.lock")).expect("read Cargo.lock");
     let mut violations = Vec::new();
 
     if root_manifest.contains("\"crates/hammer-adapter\"") {
@@ -25,6 +102,9 @@ fn hammer_adapter_is_not_an_active_workspace_crate_or_dependency() {
             ));
         }
     }
+    if cargo_lock.contains("name = \"hammer-adapter\"") {
+        violations.push("Cargo.lock still contains a hammer-adapter package".to_owned());
+    }
 
     assert!(
         violations.is_empty(),
@@ -34,7 +114,7 @@ fn hammer_adapter_is_not_an_active_workspace_crate_or_dependency() {
 }
 
 #[test]
-fn current_source_surfaces_do_not_reference_hammer_adapter() {
+fn current_active_surfaces_do_not_reference_deleted_adapter_contracts() {
     let root = workspace_root();
     let mut violations = Vec::new();
 
@@ -42,12 +122,13 @@ fn current_source_surfaces_do_not_reference_hammer_adapter() {
         let text = fs::read_to_string(&file)
             .unwrap_or_else(|err| panic!("read {}: {err}", file.display()));
         for (line_index, line) in text.lines().enumerate() {
-            if line.contains("hammer_adapter") || line.contains("::hammer_adapter") {
+            if let Some(pattern) = find_retired_adapter_pattern(line) {
                 violations.push(format!(
-                    "{}:{}: `{}`",
+                    "{}:{}: `{}` ({})",
                     file.strip_prefix(&root).unwrap_or(&file).display(),
                     line_index + 1,
-                    line.trim()
+                    line.trim(),
+                    pattern.reason
                 ));
             }
         }
@@ -55,9 +136,33 @@ fn current_source_surfaces_do_not_reference_hammer_adapter() {
 
     assert!(
         violations.is_empty(),
-        "current source surfaces must not reference hammer_adapter:\n{}",
+        "current active surfaces must not reference deleted adapter contracts:\n{}",
         violations.join("\n")
     );
+}
+
+#[test]
+fn curated_retired_adapter_patterns_flag_deleted_os_facing_contracts() {
+    assert_eq!(
+        find_retired_adapter_pattern("fn bind(platform: PlatformInterface) {}")
+            .map(|pattern| pattern.reason),
+        Some("OS-facing platform traits were deleted")
+    );
+    assert_eq!(
+        find_retired_adapter_pattern("pub struct SocketProtector;").map(|pattern| pattern.reason),
+        Some("runtime socket-protection compatibility surfaces were deleted")
+    );
+    assert_eq!(
+        find_retired_adapter_pattern("type Listener = DefaultInterfaceUpdateListener;")
+            .map(|pattern| pattern.reason),
+        Some("OS-facing default-interface listeners were deleted")
+    );
+}
+
+#[test]
+fn curated_retired_adapter_patterns_allow_current_runtime_surfaces() {
+    assert!(find_retired_adapter_pattern("use hammer_runtime::DataPlaneRuntime;").is_none());
+    assert!(find_retired_adapter_pattern("pub trait ComponentMetadata {").is_none());
 }
 
 fn workspace_root() -> PathBuf {
@@ -91,6 +196,12 @@ fn source_files(root: &Path) -> Vec<PathBuf> {
     }
     files.sort();
     files
+}
+
+fn find_retired_adapter_pattern(line: &str) -> Option<&'static RetiredAdapterPattern> {
+    RETIRED_ADAPTER_SOURCE_PATTERNS
+        .iter()
+        .find(|pattern| line.contains(pattern.term))
 }
 
 fn collect_named_files(dir: &Path, name: &str, files: &mut Vec<PathBuf>) {

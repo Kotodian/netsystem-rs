@@ -96,9 +96,7 @@ fn runtime_and_macro_surfaces_do_not_use_adapter_graph_identity_paths() {
 
         let normalized_statements = normalized_statements(&text);
         for statement in &normalized_statements {
-            if grouped_import_uses_adapter_identity(statement)
-                || adapter_public_compat_exposes_graph_identity(&file, statement)
-            {
+            if grouped_import_uses_adapter_identity(statement) {
                 violations.push(format!(
                     "{}: `{}`",
                     file.strip_prefix(&root).unwrap_or(&file).display(),
@@ -152,7 +150,6 @@ fn workspace_root() -> PathBuf {
 
 fn scanned_files(root: &Path) -> Vec<PathBuf> {
     const DIRS: &[&str] = &[
-        "crates/hammer-adapter/src",
         "crates/hammer-runtime/src",
         "crates/hammer-service/src",
         "crates/hammer-service/tests",
@@ -208,32 +205,6 @@ fn grouped_import_uses_adapter_identity(statement: &str) -> bool {
     is_adapter_group && contains_banned_identity_name(statement)
 }
 
-fn adapter_public_compat_exposes_graph_identity(file: &Path, statement: &str) -> bool {
-    if !file_is_under_adapter_src(file) || !contains_banned_identity_name(statement) {
-        return false;
-    }
-
-    let public_reexport = statement.starts_with("pubuse")
-        && (statement.contains("node::")
-            || statement.contains("self::node::")
-            || statement.contains("crate::node::")
-            || statement.contains("hammer_core::data_plane::"));
-    let public_alias = statement.starts_with("pubtype")
-        && (statement.contains("=node::")
-            || statement.contains("=self::node::")
-            || statement.contains("=crate::node::")
-            || statement.contains("=hammer_core::data_plane::"));
-
-    public_reexport || public_alias
-}
-
-fn file_is_under_adapter_src(file: &Path) -> bool {
-    let path = file.to_string_lossy();
-    path == "crates/hammer-adapter/src/lib.rs"
-        || path.starts_with("crates/hammer-adapter/src/")
-        || path.contains("/crates/hammer-adapter/src/")
-}
-
 fn contains_banned_identity_name(statement: &str) -> bool {
     BANNED_IDENTITY_NAMES
         .iter()
@@ -241,39 +212,26 @@ fn contains_banned_identity_name(statement: &str) -> bool {
 }
 
 #[test]
-fn adapter_guard_matches_public_compatibility_reexports_from_node_module() {
-    let file = Path::new("crates/hammer-adapter/src/lib.rs");
+fn scan_roots_only_cover_current_active_sources() {
+    let root = workspace_root();
+    let files = scanned_files(&root);
 
     assert!(
-        adapter_public_compat_exposes_graph_identity(file, "pubusecrate::node::NodeId"),
-        "guard should reject root re-exports through crate::node",
-    );
-    assert!(
-        adapter_public_compat_exposes_graph_identity(
-            file,
-            "pubuseself::node::{NodeHandle,NodeKind}"
-        ),
-        "guard should reject root re-exports through self::node",
+        files
+            .iter()
+            .all(|path| !path.starts_with(root.join("crates/hammer-adapter/src"))),
+        "deleted adapter sources must not be treated as active scan roots",
     );
 }
 
 #[test]
-fn adapter_guard_matches_public_compatibility_aliases_in_public_node_module() {
-    let file = Path::new("crates/hammer-adapter/src/node.rs");
-
+fn grouped_adapter_identity_imports_are_rejected() {
     assert!(
-        adapter_public_compat_exposes_graph_identity(file, "pubusehammer_core::data_plane::NodeId"),
-        "guard should reject public node-module re-exports from hammer_core::data_plane",
+        grouped_import_uses_adapter_identity("usehammer_adapter::{NodeId,NodeHandle}"),
+        "guard should reject grouped adapter imports for graph identity items",
     );
     assert!(
-        adapter_public_compat_exposes_graph_identity(
-            file,
-            "pubtypeLegacyNodeId=crate::node::NodeId"
-        ),
-        "guard should reject public node-module type aliases that expose moved identity",
-    );
-    assert!(
-        !adapter_public_compat_exposes_graph_identity(file, "usehammer_core::data_plane::NodeId"),
-        "guard should allow internal adapter imports of core graph identity",
+        !grouped_import_uses_adapter_identity("usehammer_core::data_plane::{NodeId,NodeHandle}"),
+        "guard should allow current core-owned graph identity imports",
     );
 }
