@@ -1,4 +1,30 @@
-const BANNED_RUNTIME_OWNER_PATHS: &[&str] = &[
+use std::fs;
+use std::path::{Path, PathBuf};
+
+const ROOT_BANNED_RUNTIME_IMPORTS: &[&str] = &[
+    "DataPlaneRuntime",
+    "DataPlaneRuntimeConfig",
+    "DataPlaneInstructionSet",
+    "FrameBatchWidth",
+    "DataWorkerId",
+    "DataPlaneHandoff",
+    "DataPlaneHandoffWorker",
+    "Node",
+    "DriverNode",
+    "InternalNode",
+    "NodeDescriptor",
+    "NodeEntry",
+    "NodeProcessFn",
+    "NodeResult",
+    "NodeRuntime",
+    "NodeRuntimeData",
+    "NodeRuntimeReady",
+    "NoopNode",
+    "process_frame",
+    "add_packet_trace",
+];
+
+const DIRECT_BANNED_RUNTIME_OWNER_PATHS: &[&str] = &[
     "hammer_adapter::DataPlaneRuntime",
     "hammer_adapter::DataPlaneRuntimeConfig",
     "hammer_adapter::DataPlaneInstructionSet",
@@ -25,63 +51,229 @@ const BANNED_RUNTIME_OWNER_PATHS: &[&str] = &[
     "hammer_adapter::trace::",
 ];
 
-const SCANNED_SOURCES: &[(&str, &str)] = &[
-    ("hammer-runtime/src/lib.rs", include_str!("../src/lib.rs")),
-    (
-        "hammer-runtime/src/data_plane.rs",
-        include_str!("../src/data_plane.rs"),
-    ),
-    (
-        "hammer-runtime/src/engine.rs",
-        include_str!("../src/engine.rs"),
-    ),
-    (
-        "hammer-runtime/src/spawn.rs",
-        include_str!("../src/spawn.rs"),
-    ),
-    (
-        "hammer-runtime/src/graph/mod.rs",
-        include_str!("../src/graph/mod.rs"),
-    ),
-    (
-        "hammer-component-macros/src/lib.rs",
-        include_str!("../../hammer-component-macros/src/lib.rs"),
-    ),
-    (
-        "hammer-service/src/lib.rs",
-        include_str!("../../hammer-service/src/lib.rs"),
-    ),
-    (
-        "hammer-service/src/data_plane.rs",
-        include_str!("../../hammer-service/src/data_plane.rs"),
-    ),
-    (
-        "hammer-service/src/packet_graph.rs",
-        include_str!("../../hammer-service/src/packet_graph.rs"),
-    ),
-    (
-        "hammer-service/src/session/runtime.rs",
-        include_str!("../../hammer-service/src/session/runtime.rs"),
-    ),
-    (
-        "hammer-service/src/transport/tcp/mod.rs",
-        include_str!("../../hammer-service/src/transport/tcp/mod.rs"),
-    ),
+const SCAN_ROOTS: &[&str] = &[
+    ".",
+    "../hammer-service",
+    "../hammer-app",
+    "../hammer-ipc",
+    "../hammer-component-macros",
+    "../hammer",
+    "../hammerctl",
 ];
 
 #[test]
 fn graph_runtime_owner_paths_do_not_point_at_adapter() {
-    let mut violations = std::vec::Vec::new();
-    for (path, source) in SCANNED_SOURCES {
-        for banned in BANNED_RUNTIME_OWNER_PATHS {
-            if source.contains(banned) {
-                violations.push(format!("{path} contains {banned}"));
-            }
-        }
-    }
+    let violations = collect_source_files()
+        .into_iter()
+        .flat_map(|path| scan_file_for_violations(&path))
+        .collect::<Vec<_>>();
+
     assert!(
         violations.is_empty(),
         "runtime graph contracts must be owned by hammer-runtime:\n{}",
         violations.join("\n")
     );
+}
+
+#[test]
+fn grouped_adapter_runtime_imports_are_rejected() {
+    let source = r#"
+        use hammer_adapter::{DataPlaneRuntime, PlatformInterface};
+        pub use hammer_adapter::{NodeEntry};
+    "#;
+
+    let violations = scan_source_for_violations("sample.rs", source);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("DataPlaneRuntime")),
+        "expected grouped root import to be rejected: {violations:#?}"
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("NodeEntry")),
+        "expected grouped pub use to be rejected: {violations:#?}"
+    );
+    assert!(
+        violations
+            .iter()
+            .all(|violation| !violation.contains("PlatformInterface")),
+        "allowed adapter traits must not be rejected: {violations:#?}"
+    );
+}
+
+fn collect_source_files() -> Vec<PathBuf> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    for root in SCAN_ROOTS {
+        walk_source_tree(&manifest_dir.join(root), &mut files);
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
+fn walk_source_tree(path: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(metadata) = fs::metadata(path) else {
+        return;
+    };
+    if metadata.is_dir() {
+        let Ok(entries) = fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            walk_source_tree(&entry.path(), files);
+        }
+        return;
+    }
+
+    if !is_relevant_source_file(path) || is_guard_test(path) {
+        return;
+    }
+
+    files.push(path.to_path_buf());
+}
+
+fn is_relevant_source_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "Cargo.toml")
+        || path.extension().and_then(|ext| ext.to_str()) == Some("rs")
+}
+
+fn is_guard_test(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "graph_runtime_owner_guard.rs")
+}
+
+fn scan_file_for_violations(path: &Path) -> Vec<String> {
+    let source = match fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(error) => {
+            return vec![format!("{} could not be read: {error}", path.display())];
+        }
+    };
+
+    scan_source_for_violations(&path.display().to_string(), &source)
+}
+
+fn scan_source_for_violations(path: &str, source: &str) -> Vec<String> {
+    let normalized = strip_ascii_whitespace(source);
+    let mut violations = std::collections::BTreeSet::new();
+
+    for banned in DIRECT_BANNED_RUNTIME_OWNER_PATHS {
+        if normalized.contains(banned) {
+            violations.insert(format!("{path} contains {banned}"));
+        }
+    }
+
+    for group in extract_groups(&normalized, "hammer_adapter::{") {
+        collect_grouped_root_violations(path, &group, &mut violations);
+    }
+
+    violations.into_iter().collect()
+}
+
+fn strip_ascii_whitespace(source: &str) -> String {
+    source
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .collect()
+}
+
+fn extract_groups(source: &str, prefix: &str) -> Vec<String> {
+    let mut groups = Vec::new();
+    let mut search_start = 0;
+
+    while let Some(relative_index) = source[search_start..].find(prefix) {
+        let start = search_start + relative_index + prefix.len();
+        if let Some((group, next_start)) = extract_balanced_group(source, start) {
+            groups.push(group);
+            search_start = next_start;
+        } else {
+            break;
+        }
+    }
+
+    groups
+}
+
+fn extract_balanced_group(source: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = source.as_bytes();
+    let mut depth = 1usize;
+    let mut index = start;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((source[start..index].to_string(), index + 1));
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+
+    None
+}
+
+fn collect_grouped_root_violations(
+    path: &str,
+    group: &str,
+    violations: &mut std::collections::BTreeSet<String>,
+) {
+    for entry in split_top_level_items(group) {
+        let item = strip_alias(entry);
+        if ROOT_BANNED_RUNTIME_IMPORTS.contains(&item) {
+            violations.insert(format!("{path} contains hammer_adapter::{{{item}}}"));
+            continue;
+        }
+
+        if let Some((module, rest)) = item.split_once("::") {
+            if is_banned_group_module(module) {
+                violations.insert(format!(
+                    "{path} contains hammer_adapter::{{{module}::{rest}}}"
+                ));
+            }
+        }
+    }
+}
+
+fn split_top_level_items(group: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let mut depth = 0usize;
+    let mut item_start = 0usize;
+
+    for (index, ch) in group.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                if item_start < index {
+                    items.push(&group[item_start..index]);
+                }
+                item_start = index + 1;
+            }
+            _ => {}
+        }
+    }
+
+    if item_start < group.len() {
+        items.push(&group[item_start..]);
+    }
+
+    items.into_iter().filter(|item| !item.is_empty()).collect()
+}
+
+fn strip_alias(item: &str) -> &str {
+    item.split_once("as").map_or(item, |(name, _)| name)
+}
+
+fn is_banned_group_module(module: &str) -> bool {
+    matches!(module, "node" | "handoff" | "instruction_set" | "trace")
 }
