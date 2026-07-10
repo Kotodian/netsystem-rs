@@ -2657,13 +2657,7 @@ mod tests {
             let connection = connections.get_mut(index).expect("connection");
             assert!(
                 connection
-                    .on_tcp_ready_with_timers(
-                        index,
-                        &mut timers,
-                        true,
-                        TcpCapabilities::default(),
-                        now,
-                    )
+                    .on_tcp_ready(index, &mut timers, true, TcpCapabilities::default(), now)
                     .expect("schedule pacing")
                     .is_none()
             );
@@ -4086,6 +4080,8 @@ mod tests {
         connection.snd_nxt = TcpSeq::from(1_000);
 
         let now = Instant::now();
+        let index = PoolIndex::new(0, 0);
+        let mut timers = TcpTimers::new(now, Duration::from_millis(10));
         for i in 0..5u32 {
             let _ = connection
                 .commit_payload_tx(1_000, now + Duration::from_millis(i as u64))
@@ -4118,7 +4114,17 @@ mod tests {
             payload_offset: 0,
             payload_len: 0,
         };
-        let _ = connection.receive_ack(&sack_packet, 1_000, 8_000, &sack_packet.sack_blocks);
+        connection
+            .receive_ack_with_timers(
+                index,
+                &mut timers,
+                &sack_packet,
+                1_000,
+                8_000,
+                &sack_packet.sack_blocks,
+                now + Duration::from_millis(10),
+            )
+            .expect("process sack");
         assert_eq!(
             connection.bytes_in_flight_cached,
             connection.recovery.bytes_in_flight(),
@@ -4145,7 +4151,18 @@ mod tests {
             payload_len: 0,
         };
 
-        let _ = connection.receive_ack(&ack_packet(3_000), 3_000, 8_000, &[]);
+        let packet = ack_packet(3_000);
+        connection
+            .receive_ack_with_timers(
+                index,
+                &mut timers,
+                &packet,
+                3_000,
+                8_000,
+                &[],
+                now + Duration::from_millis(20),
+            )
+            .expect("process partial ack to 3k");
         assert_eq!(
             connection.bytes_in_flight_cached,
             connection.recovery.bytes_in_flight(),
@@ -4164,7 +4181,18 @@ mod tests {
             );
         }
 
-        let _ = connection.receive_ack(&ack_packet(4_000), 4_000, 8_000, &[]);
+        let packet = ack_packet(4_000);
+        connection
+            .receive_ack_with_timers(
+                index,
+                &mut timers,
+                &packet,
+                4_000,
+                8_000,
+                &[],
+                now + Duration::from_millis(30),
+            )
+            .expect("process ack to 4k");
         assert_eq!(
             connection.bytes_in_flight_cached,
             connection.recovery.bytes_in_flight(),
@@ -4190,6 +4218,8 @@ mod tests {
         connection.snd_nxt = TcpSeq::from(1_000);
 
         let now = Instant::now();
+        let index = PoolIndex::new(0, 0);
+        let mut timers = TcpTimers::new(now, Duration::from_millis(10));
         for i in 0..5u32 {
             let _ = connection
                 .commit_payload_tx(1_000, now + Duration::from_millis(i as u64))
@@ -4217,7 +4247,17 @@ mod tests {
             payload_offset: 0,
             payload_len: 0,
         };
-        let _ = connection.receive_ack(&sack_packet, 1_000, 8_000, &sack_blocks);
+        connection
+            .receive_ack_with_timers(
+                index,
+                &mut timers,
+                &sack_packet,
+                1_000,
+                8_000,
+                &sack_blocks,
+                now + Duration::from_millis(10),
+            )
+            .expect("process recovery sack");
         assert_eq!(connection.recovery.bytes_in_flight(), 4_000);
         assert_eq!(connection.bytes_in_flight_cached, 4_000);
 
@@ -4255,7 +4295,18 @@ mod tests {
             payload_len: 0,
         };
 
-        let _ = connection.receive_ack(&ack_packet(3_000), 3_000, 8_000, &[]);
+        let packet = ack_packet(3_000);
+        connection
+            .receive_ack_with_timers(
+                index,
+                &mut timers,
+                &packet,
+                3_000,
+                8_000,
+                &[],
+                now + Duration::from_millis(20),
+            )
+            .expect("process recovery ack to 3k");
         assert_eq!(connection.bytes_in_flight_cached, 3_000);
 
         assert_eq!(
@@ -4263,7 +4314,18 @@ mod tests {
             0
         );
 
-        let _ = connection.receive_ack(&ack_packet(4_000), 4_000, 8_000, &[]);
+        let packet = ack_packet(4_000);
+        connection
+            .receive_ack_with_timers(
+                index,
+                &mut timers,
+                &packet,
+                4_000,
+                8_000,
+                &[],
+                now + Duration::from_millis(30),
+            )
+            .expect("process recovery ack to 4k");
         assert_eq!(connection.bytes_in_flight_cached, 2_000);
 
         assert_eq!(
