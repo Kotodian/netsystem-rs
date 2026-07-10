@@ -11,9 +11,9 @@
 - [x] Verify `cargo test -p hammer-service` baseline.
 - [x] Task 1: Static transport seam, typed lifecycle, and TCP-owned connections.
 - [x] Task 2: Private exact TCP timer engine.
-- [ ] Task 3: Migrate all TCP timer policy into TcpWorker.
-- [ ] Task 4: Delete legacy surfaces and lock architecture guardrails.
-- [ ] Task 5: Final reviews, full verification, push, and `target` cleanup.
+- [x] Task 3: Migrate all TCP timer policy into TcpWorker.
+- [x] Task 4: Delete legacy surfaces and lock architecture guardrails.
+- [ ] Task 5: Final review, formatting, and workspace clippy are complete; workspace tests were canceled at maintainer direction; push and `target` cleanup remain.
 
 ## Global Constraints
 
