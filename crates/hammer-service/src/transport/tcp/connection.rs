@@ -1633,41 +1633,58 @@ where
         now: Instant,
     ) -> CoreResult<()> {
         let retransmit = self.retransmit_timeout().retransmit_timeout();
+        timers.validate_interval(retransmit)?;
+        if self.state != TcpState::Established {
+            return timers.set(
+                index,
+                &mut self.timers,
+                TcpTimerKind::Retransmit,
+                retransmit,
+            );
+        }
+        let rack = self.recovery.rack_timeout(now);
+        let tlp = self.recovery.tlp_timeout(
+            self.retransmit_timeout().smoothed_rtt(),
+            self.retransmit_timeout().retransmit_timeout(),
+        );
+        let persist = (self.snd_wnd == 0 && self.recovery.has_unacked_data())
+            .then(|| self.persist_interval());
+        let pacing = self.pacing_interval();
+        let keepalive = self.keepalive.config.idle;
+        for interval in [rack, tlp, persist, pacing, Some(keepalive)]
+            .into_iter()
+            .flatten()
+        {
+            timers.validate_interval(interval)?;
+        }
+
         timers.set(
             index,
             &mut self.timers,
             TcpTimerKind::Retransmit,
             retransmit,
         )?;
-        if self.state != TcpState::Established {
-            return Ok(());
-        }
-        if let Some(interval) = self.recovery.rack_timeout(now) {
+        if let Some(interval) = rack {
             timers.update(index, &mut self.timers, TcpTimerKind::Rack, interval)?;
         } else {
             timers.reset(index, &mut self.timers, TcpTimerKind::Rack);
         }
-        if let Some(interval) = self.recovery.tlp_timeout(
-            self.retransmit_timeout().smoothed_rtt(),
-            self.retransmit_timeout().retransmit_timeout(),
-        ) {
+        if let Some(interval) = tlp {
             timers.update(index, &mut self.timers, TcpTimerKind::Tlp, interval)?;
         } else {
             timers.reset(index, &mut self.timers, TcpTimerKind::Tlp);
         }
-        if self.snd_wnd == 0 && self.recovery.has_unacked_data() {
-            let interval = self.persist_interval();
+        if let Some(interval) = persist {
             timers.set(index, &mut self.timers, TcpTimerKind::Persist, interval)?;
         } else {
             timers.reset(index, &mut self.timers, TcpTimerKind::Persist);
         }
-        if let Some(interval) = self.pacing_interval() {
+        if let Some(interval) = pacing {
             timers.update(index, &mut self.timers, TcpTimerKind::Pacing, interval)?;
         } else {
             timers.reset(index, &mut self.timers, TcpTimerKind::Pacing);
         }
-        let idle = self.keepalive.config.idle;
-        timers.update(index, &mut self.timers, TcpTimerKind::KeepAlive, idle)
+        timers.update(index, &mut self.timers, TcpTimerKind::KeepAlive, keepalive)
     }
 
     #[inline]
@@ -1764,7 +1781,11 @@ where
         timers.reset(index, &mut self.timers, TcpTimerKind::DelayedAck);
         if self.recovery.has_unacked_data() {
             let interval = self.retransmit_timeout().retransmit_timeout();
-            timers.set(index, &mut self.timers, TcpTimerKind::Retransmit, interval)?;
+            if self.snd_una != snd_una_before {
+                timers.update(index, &mut self.timers, TcpTimerKind::Retransmit, interval)?;
+            } else {
+                timers.set(index, &mut self.timers, TcpTimerKind::Retransmit, interval)?;
+            }
         } else {
             timers.reset(index, &mut self.timers, TcpTimerKind::Retransmit);
         }
@@ -2238,7 +2259,7 @@ where
             return None;
         }
         self.timer_reset(timer_id);
-        if !self.timer_dispatch_pending(timer_id) {
+        if !self.legacy_timer_dispatch_pending(timer_id) {
             return None;
         }
         match timer_id {
@@ -2262,7 +2283,7 @@ where
         local_capabilities: TcpCapabilities,
         now: Instant,
     ) -> CoreResult<Option<TcpSegment>> {
-        if !self.timer_dispatch_pending(kind as u32) {
+        if !self.timer_dispatch_pending(kind) {
             return Ok(None);
         }
         let segment = match kind {
@@ -2329,10 +2350,19 @@ where
         Ok(segment)
     }
 
-    /// Dispatch gate: the connection owns timer dispatch and only forwards the
-    /// exact `timer_id` supplied by the runtime. Returns whether the pending
-    /// timer may be dispatched in the current state.
-    fn timer_dispatch_pending(&self, timer_id: u32) -> bool {
+    fn timer_dispatch_pending(&self, kind: TcpTimerKind) -> bool {
+        match (self.state, kind) {
+            (TcpState::SynSent, _)
+            | (TcpState::Established, _)
+            | (TcpState::FinWait1, TcpTimerKind::Retransmit)
+            | (TcpState::Closing, TcpTimerKind::Retransmit)
+            | (TcpState::LastAck, TcpTimerKind::Retransmit)
+            | (TcpState::TimeWait, _) => true,
+            _ => false,
+        }
+    }
+
+    fn legacy_timer_dispatch_pending(&self, timer_id: u32) -> bool {
         match (self.state, timer_id) {
             (TcpState::SynSent, _)
             | (TcpState::Established, _)
@@ -3154,6 +3184,131 @@ mod tests {
                 .expect("original retransmit deadline")
                 .kind,
             TcpTimerKind::Retransmit
+        );
+    }
+
+    #[test]
+    fn tcp_ack_progress_restarts_retransmit_deadline_at_current_rto() {
+        let (mut connections, index, mut timers, now) = timer_policy_connection();
+        let (packet, original_rto) = {
+            let connection = connections.get_mut(index).expect("connection");
+            let snd_una = TcpSeq::from(connection.snd_una());
+            connection.snd_nxt = snd_una.advance(2);
+            connection
+                .recovery
+                .record_sent(1, snd_una, snd_una.advance(1), 1, 1, now);
+            connection
+                .recovery
+                .record_sent(2, snd_una.advance(1), snd_una.advance(2), 1, 1, now);
+            let rto = connection.retransmit_timeout().retransmit_timeout();
+            timers
+                .update(
+                    index,
+                    connection.timer_state_mut(),
+                    TcpTimerKind::Retransmit,
+                    rto,
+                )
+                .expect("arm retransmit");
+            (
+                TcpPacket {
+                    local: connection.remote(),
+                    remote: connection.local().expect("local"),
+                    sequence: connection.rcv_nxt().into(),
+                    acknowledgment: Some(snd_una.advance(1)),
+                    advertised_window: u16::MAX,
+                    flags: TcpSegmentFlags::ACK,
+                    capabilities: TcpCapabilities::default(),
+                    sack_blocks: Vec::new(),
+                    timestamp: None,
+                    fast_open_cookie: None,
+                    ip_ecn: None,
+                    payload_offset: 0,
+                    payload_len: 0,
+                },
+                rto,
+            )
+        };
+        let ack_at = now + original_rto / 2;
+        timers.advance(ack_at, &mut connections);
+        connections
+            .get_mut(index)
+            .expect("connection")
+            .receive_ack_with_timers(
+                index,
+                &mut timers,
+                &packet,
+                packet.acknowledgment.expect("acknowledgment").raw(),
+                packet.advertised_window,
+                packet.sack_blocks.as_slice(),
+                ack_at,
+            )
+            .expect("process advancing ACK");
+        let current_rto = connections
+            .get(index)
+            .expect("connection")
+            .retransmit_timeout()
+            .retransmit_timeout();
+
+        timers.advance(
+            ack_at + current_rto - Duration::from_millis(10),
+            &mut connections,
+        );
+        assert!(
+            connections
+                .get(index)
+                .expect("connection")
+                .timer_state()
+                .is_armed(TcpTimerKind::Retransmit)
+        );
+        timers.advance(ack_at + current_rto, &mut connections);
+        assert!(
+            connections
+                .get(index)
+                .expect("connection")
+                .timer_state()
+                .is_pending(TcpTimerKind::Retransmit)
+        );
+    }
+
+    #[test]
+    fn tcp_payload_timer_sync_validation_preserves_existing_timer_transaction() {
+        let (mut connections, index, mut timers, now) = timer_policy_connection();
+        let timer_state_before = {
+            let connection = connections.get_mut(index).expect("connection");
+            let snd_una = TcpSeq::from(connection.snd_una());
+            connection.snd_nxt = snd_una.advance(1);
+            connection
+                .recovery
+                .record_sent(1, snd_una, snd_una.advance(1), 1, 1, now);
+            connection.keepalive.config.idle = Duration::from_secs(24 * 60 * 60);
+            timers
+                .update(
+                    index,
+                    connection.timer_state_mut(),
+                    TcpTimerKind::Tlp,
+                    Duration::from_millis(20),
+                )
+                .expect("arm original TLP");
+            *connection.timer_state()
+        };
+
+        connections
+            .get_mut(index)
+            .expect("connection")
+            .sync_payload_tx_timers(index, &mut timers, now)
+            .expect_err("over-horizon keepalive must reject timer plan");
+
+        assert_eq!(
+            *connections.get(index).expect("connection").timer_state(),
+            timer_state_before
+        );
+        timers.advance(now + Duration::from_millis(20), &mut connections);
+        assert!(
+            connections
+                .get(index)
+                .expect("connection")
+                .timer_state()
+                .is_pending(TcpTimerKind::Tlp)
         );
     }
 

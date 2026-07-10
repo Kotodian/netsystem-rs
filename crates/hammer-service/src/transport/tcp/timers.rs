@@ -12,6 +12,7 @@ use crate::transport::congestion::CongestionController;
 
 const TCP_TIMER_MAX_TICKS_PER_UPDATE: u32 = 1_024;
 const TCP_TIMER_EXPIRY_BUDGET: usize = 256;
+const TCP_TIMER_WHEEL_MAX_INTERVAL_TICKS: u64 = 2048 * 2048 - 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -159,6 +160,16 @@ impl TcpTimers {
             )
             .map_err(|_| TcpNodeError::TimerUpdateFailed)?;
         state.arm(kind);
+        Ok(())
+    }
+
+    pub(super) fn validate_interval(&self, interval: Duration) -> CoreResult<()> {
+        let ticks = self.duration_ticks(interval);
+        if ticks > TCP_TIMER_WHEEL_MAX_INTERVAL_TICKS
+            || self.wheel.current_tick().checked_add(ticks).is_none()
+        {
+            return Err(TcpNodeError::TimerUpdateFailed.into());
+        }
         Ok(())
     }
 
