@@ -6,11 +6,7 @@ use hammer_infra::segment::Segment;
 use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
 
 use super::segment::tcp_packet;
-use super::{
-    TCP_TIMER_DELAYED_ACK, TCP_TIMER_KEEP_ALIVE, TCP_TIMER_PACING, TCP_TIMER_PERSIST,
-    TCP_TIMER_RACK, TCP_TIMER_RETRANSMIT, TCP_TIMER_TLP, TcpNodeError, TcpWorker,
-    publish_tcp_connection, read_session_id,
-};
+use super::{TcpNodeError, TcpWorker, publish_tcp_connection, read_session_id};
 use crate::session::SessionQueueHandle;
 use crate::session::app::SessionAppRuntimeCreate;
 use crate::session::runtime::SessionDriverRuntime;
@@ -147,13 +143,28 @@ where
             accepted_sequence,
             duplicate_payload,
         ) = {
-            let connection = queue.session_mut(session_id).ok_or_else(|| {
+            let (_, connection_index) = queue
+                .sessions()
+                .session_transport(session_id)
+                .ok_or(TcpNodeError::EstablishedSessionMissing)?;
+            let worker = &mut queue.transports_mut().0;
+            let crate::transport::tcp::worker::TcpWorker {
+                connections,
+                timers,
+                ..
+            } = worker;
+            let connection = connections.get_mut(connection_index).ok_or_else(|| {
                 let _ = runtime
                     .record_current_node_error(TcpNodeError::EstablishedSessionMissing.code());
                 TcpNodeError::EstablishedSessionMissing
             })?;
             let previous_snd_una = connection.snd_una();
-            let (control, _) = connection.receive_established(&packet)?;
+            let control = connection.receive_established_with_timers(
+                connection_index,
+                timers,
+                &packet,
+                std::time::Instant::now(),
+            )?;
             let accept_payload = connection.accept_payload(&packet);
             let duplicate_payload = accept_payload.is_none() && packet.payload_len != 0;
             (
@@ -180,7 +191,17 @@ where
                 buffer.truncate(accepted_len as usize)?;
             }
             let delivery = queue.enqueue_rx(session_id, index, offset, false)?;
-            let connection = queue.session_mut(session_id).ok_or_else(|| {
+            let (_, connection_index) = queue
+                .sessions()
+                .session_transport(session_id)
+                .ok_or(TcpNodeError::EstablishedSessionMissing)?;
+            let worker = &mut queue.transports_mut().0;
+            let crate::transport::tcp::worker::TcpWorker {
+                connections,
+                timers,
+                ..
+            } = worker;
+            let connection = connections.get_mut(connection_index).ok_or_else(|| {
                 let _ = runtime
                     .record_current_node_error(TcpNodeError::EstablishedSessionMissing.code());
                 TcpNodeError::EstablishedSessionMissing
@@ -202,7 +223,7 @@ where
                     } if promoted == 0 && accepted.get() == accepted_len
                 );
             immediate_ack = if clean_in_order {
-                connection.on_clean_in_order_payload()
+                connection.on_clean_in_order_payload(connection_index, timers)?
             } else {
                 true
             };
@@ -256,26 +277,6 @@ where
                 hammer_core::protocol::tcp::TcpCapabilities::default(),
             ));
         }
-        let now = std::time::Instant::now();
-        let timer_ticks = {
-            let connection = queue.session(session_id).ok_or_else(|| {
-                let _ = runtime
-                    .record_current_node_error(TcpNodeError::EstablishedSessionMissing.code());
-                TcpNodeError::EstablishedSessionMissing
-            })?;
-            std::array::from_fn(|timer_id| {
-                let timer_id = timer_id as u32;
-                connection
-                    .timer_is_active(timer_id)
-                    .then(|| connection.timer_ticks(timer_id, now))
-                    .flatten()
-            })
-        };
-        crate::transport::tcp::sync_all_tcp_timers(
-            queue.timers_mut(),
-            timer_ticks,
-            session_id.pool_index(),
-        )?;
         publish_tcp_connection(&mut queue, session_id)?;
         if tx_segment.is_none() {
             tx_segment = control;

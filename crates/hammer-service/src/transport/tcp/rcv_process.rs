@@ -8,11 +8,7 @@ use crate::session::runtime::RxDelivery;
 use crate::transport::congestion::CongestionController;
 
 use super::segment::tcp_packet;
-use super::{
-    TCP_TIMER_DELAYED_ACK, TCP_TIMER_KEEP_ALIVE, TCP_TIMER_PACING, TCP_TIMER_PERSIST,
-    TCP_TIMER_RACK, TCP_TIMER_RETRANSMIT, TCP_TIMER_TIME_WAIT, TCP_TIMER_TLP, TcpNodeError,
-    TcpWorker, publish_tcp_connection, read_session_id,
-};
+use super::{TcpNodeError, TcpWorker, publish_tcp_connection, read_session_id};
 use crate::session::SessionQueueHandle;
 use crate::session::app::SessionAppRuntimeCreate;
 use crate::session::runtime::SessionDriverRuntime;
@@ -140,14 +136,29 @@ where
         // lead time.
         queue.prefetch_session(session_id);
         let (control, ack_advanced, acked_tx_len, established, established_with_payload) = {
-            let connection = queue.session_mut(session_id).ok_or_else(|| {
+            let (_, connection_index) = queue
+                .sessions()
+                .session_transport(session_id)
+                .ok_or(TcpNodeError::RcvProcessSessionMissing)?;
+            let worker = &mut queue.transports_mut().0;
+            let crate::transport::tcp::worker::TcpWorker {
+                connections,
+                timers,
+                ..
+            } = worker;
+            let connection = connections.get_mut(connection_index).ok_or_else(|| {
                 let _ = runtime
                     .record_current_node_error(TcpNodeError::RcvProcessSessionMissing.code());
                 TcpNodeError::RcvProcessSessionMissing
             })?;
             let previous_state = connection.state();
             let previous_snd_una = connection.snd_una();
-            let control = connection.receive_close_side(&packet)?;
+            let control = connection.receive_close_side(
+                connection_index,
+                timers,
+                &packet,
+                std::time::Instant::now(),
+            )?;
             let established = connection.state() == crate::transport::tcp::TcpState::Established;
             (
                 control,
@@ -176,26 +187,6 @@ where
                 queue.mark_session_ready(session_id);
             }
         }
-        let now = std::time::Instant::now();
-        let timer_ticks = {
-            let connection = queue.session(session_id).ok_or_else(|| {
-                let _ = runtime
-                    .record_current_node_error(TcpNodeError::RcvProcessSessionMissing.code());
-                TcpNodeError::RcvProcessSessionMissing
-            })?;
-            std::array::from_fn(|timer_id| {
-                let timer_id = timer_id as u32;
-                connection
-                    .timer_is_active(timer_id)
-                    .then(|| connection.timer_ticks(timer_id, now))
-                    .flatten()
-            })
-        };
-        crate::transport::tcp::sync_all_tcp_timers(
-            queue.timers_mut(),
-            timer_ticks,
-            session_id.pool_index(),
-        )?;
         publish_tcp_connection(&mut queue, session_id)?;
         if established {
             queue.app().connected(session_id)?;

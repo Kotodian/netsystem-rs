@@ -691,17 +691,6 @@ pub trait SessionTransport<Index, Seg: Segment>: Sized {
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> CoreResult<()>;
-
-    fn handle_legacy_timer(
-        &mut self,
-        sessions: &mut SessionWorker<Index, Seg>,
-        index: Index,
-        timer_id: u32,
-        runtime: &DataPlaneRuntime,
-        output_next: SessionQueueNext,
-        output: &mut crate::session::node::SessionQueueOutput,
-        now: Instant,
-    ) -> CoreResult<()>;
 }
 
 pub trait SessionPacketizedTransport<Index, Seg: Segment>: SessionTransport<Index, Seg> {
@@ -887,18 +876,6 @@ pub trait SessionTransports<Index, Seg: Segment> {
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> CoreResult<()>;
-
-    fn handle_legacy_timer(
-        &mut self,
-        id: SessionTransportId,
-        sessions: &mut SessionWorker<Index, Seg>,
-        index: Index,
-        timer_id: u32,
-        runtime: &DataPlaneRuntime,
-        output_next: SessionQueueNext,
-        output: &mut crate::session::node::SessionQueueOutput,
-        now: Instant,
-    ) -> CoreResult<()>;
 }
 
 impl<Index, Seg: Segment> SessionTransports<Index, Seg> for () {
@@ -932,20 +909,6 @@ impl<Index, Seg: Segment> SessionTransports<Index, Seg> for () {
         _: &mut SessionWorker<Index, Seg>,
         _: Index,
         _: SessionId,
-        _: &DataPlaneRuntime,
-        _: SessionQueueNext,
-        _: &mut crate::session::node::SessionQueueOutput,
-        _: Instant,
-    ) -> CoreResult<()> {
-        Err(CoreError::internal("session transport is not registered"))
-    }
-
-    fn handle_legacy_timer(
-        &mut self,
-        _: SessionTransportId,
-        _: &mut SessionWorker<Index, Seg>,
-        _: Index,
-        _: u32,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
         _: &mut crate::session::node::SessionQueueOutput,
@@ -1029,40 +992,6 @@ where
             now,
         )
     }
-
-    fn handle_legacy_timer(
-        &mut self,
-        id: SessionTransportId,
-        sessions: &mut SessionWorker<Index, Seg>,
-        index: Index,
-        timer_id: u32,
-        runtime: &DataPlaneRuntime,
-        output_next: SessionQueueNext,
-        output: &mut crate::session::node::SessionQueueOutput,
-        now: Instant,
-    ) -> CoreResult<()> {
-        if id == Head::ID {
-            return self.0.handle_legacy_timer(
-                sessions,
-                index,
-                timer_id,
-                runtime,
-                output_next,
-                output,
-                now,
-            );
-        }
-        self.1.handle_legacy_timer(
-            id,
-            sessions,
-            index,
-            timer_id,
-            runtime,
-            output_next,
-            output,
-            now,
-        )
-    }
 }
 
 pub fn dispatch_session_queue_for_ticks<T, Seg, Index>(
@@ -1131,7 +1060,7 @@ where
     } = driver;
     transports.update_time(sessions, runtime, output_next, output, now)?;
     sessions.poll_app()?;
-    let expired_timers = sessions.expire_legacy_timers(timer_ticks);
+    let _ = timer_ticks;
 
     let control_count = sessions.control_events.len();
     for _ in 0..control_count {
@@ -1154,26 +1083,6 @@ where
         }
     }
 
-    let pending_timer_count = sessions.pending_timers.len();
-    for _ in 0..pending_timer_count {
-        let Some(timer) = sessions.pending_timers.pop_front() else {
-            break;
-        };
-        let Some((transport, index)) = sessions.session_transport(timer.session_id) else {
-            continue;
-        };
-        transports.handle_legacy_timer(
-            transport,
-            sessions,
-            index,
-            timer.timer_id,
-            runtime,
-            output_next,
-            output,
-            now,
-        )?;
-    }
-
     let work = sessions.take_scheduled_work();
     let scheduled_sessions = work.len();
     for session_id in work.as_slice() {
@@ -1193,7 +1102,7 @@ where
     }
     sessions.keep_work_scratch(work);
     Ok(SessionQueueStep {
-        expired_timers,
+        expired_timers: 0,
         scheduled_sessions,
     })
 }

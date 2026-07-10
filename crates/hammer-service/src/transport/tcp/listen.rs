@@ -1397,8 +1397,18 @@ where
     })?;
     let result = (|| -> CoreResult<(Option<TcpSegment>, Option<SessionId>)> {
         let control = {
-            let connection = queue
-                .session_mut(session_id)
+            let (_, connection_index) = queue
+                .sessions()
+                .session_transport(session_id)
+                .ok_or_else(|| CoreError::internal("tcp listen session is missing"))?;
+            let worker = &mut queue.transports_mut().0;
+            let TcpWorker {
+                connections,
+                timers,
+                ..
+            } = worker;
+            let connection = connections
+                .get_mut(connection_index)
                 .ok_or_else(|| CoreError::internal("tcp listen session is missing"))?;
             let _ = connection.receive_syn(
                 packet.local,
@@ -1411,7 +1421,12 @@ where
                 0,
                 capabilities,
             )?;
-            connection.receive_final_ack(packet)?
+            connection.receive_final_ack_with_timers(
+                connection_index,
+                timers,
+                packet,
+                std::time::Instant::now(),
+            )?
         };
         queue.transports_mut().0.lookup.finish_listener_pending(
             listener_id,

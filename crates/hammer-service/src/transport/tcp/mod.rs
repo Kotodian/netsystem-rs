@@ -41,8 +41,6 @@ mod timers;
 pub(crate) mod worker;
 
 pub(crate) use connection::sync_all_tcp_timers;
-#[cfg(test)]
-use connection::sync_tcp_timer;
 pub use connection::{
     TCP_INITIAL_RETRANSMIT_TIMEOUT, TCP_MAX_RETRANSMIT_TIMEOUT, TCP_MIN_RETRANSMIT_TIMEOUT,
     TCP_TIMER_COUNT, TCP_TIMER_DELAYED_ACK, TCP_TIMER_KEEP_ALIVE, TCP_TIMER_PACING,
@@ -669,7 +667,7 @@ pub enum TcpInputNext {
 mod legacy_tests {
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex, OnceLock};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use hammer_core::data_plane::{BufferFrame, NodeHandle, NodeId, NodeRegistration};
     use hammer_core::error::CoreResult;
@@ -683,11 +681,12 @@ mod legacy_tests {
         NodeRuntimeData,
     };
 
+    use super::timers::TcpTimerKind;
     use super::*;
     use crate::session::SessionId;
     use crate::session::runtime::{
         SessionDriverRuntime, SessionPacketizedTransport, TxBatchBuffer,
-        dispatch_session_queue_for_ticks,
+        dispatch_session_queue_for_ticks, dispatch_session_queue_pending,
     };
     use crate::transport::congestion::BbrController;
 
@@ -698,6 +697,47 @@ mod legacy_tests {
                 backend,
             ),
         )));
+    }
+
+    fn receive_close_side_for_test<C: CongestionController + 'static>(
+        driver: &mut SessionDriverRuntime<(TcpWorker<C>, ()), Local, PoolIndex>,
+        session_id: SessionId,
+        packet: &TcpPacket,
+    ) -> CoreResult<Option<TcpSegment>> {
+        let (_, connection_index) = driver
+            .sessions()
+            .session_transport(session_id)
+            .ok_or(TcpNodeError::SessionMissing)?;
+        let worker = &mut driver.transports_mut().0;
+        let TcpWorker {
+            connections,
+            timers,
+            ..
+        } = worker;
+        connections
+            .get_mut(connection_index)
+            .ok_or(TcpNodeError::SessionMissing)?
+            .receive_close_side(connection_index, timers, packet, Instant::now())
+    }
+
+    fn clean_in_order_payload_for_test<C: CongestionController + 'static>(
+        driver: &mut SessionDriverRuntime<(TcpWorker<C>, ()), Local, PoolIndex>,
+        session_id: SessionId,
+    ) -> CoreResult<bool> {
+        let (_, connection_index) = driver
+            .sessions()
+            .session_transport(session_id)
+            .ok_or(TcpNodeError::SessionMissing)?;
+        let worker = &mut driver.transports_mut().0;
+        let TcpWorker {
+            connections,
+            timers,
+            ..
+        } = worker;
+        connections
+            .get_mut(connection_index)
+            .ok_or(TcpNodeError::SessionMissing)?
+            .on_clean_in_order_payload(connection_index, timers)
     }
 
     #[test]
@@ -912,10 +952,13 @@ mod legacy_tests {
         output_node: NodeId,
     ) {
         let next: crate::session::SessionQueueNext = output_node.into();
-        let _ = dispatch_session_queue_for_ticks(runtime, driver, ticks, next)
-            .expect("dispatch session queue for timer ticks");
-        let _ = dispatch_session_queue_for_ticks(runtime, driver, 0, next)
-            .expect("dispatch session queue follow-up");
+        let now = Instant::now() + Duration::from_millis(u64::from(ticks) * 10);
+        let mut output = SessionQueueOutput;
+        for _ in 0..ticks.div_ceil(1_024).max(1) {
+            let _ = dispatch_session_queue_pending(runtime, driver, 0, next, &mut output, now)
+                .expect("dispatch TCP timer update");
+        }
+        output.schedule(runtime).expect("schedule TCP timer output");
         let _ = runtime.run_ready_nodes().expect("run timer output");
     }
 
@@ -1183,23 +1226,36 @@ mod legacy_tests {
             .expect("insert session");
         publish_tcp_connection(&mut driver, session_id).expect("refresh session route");
 
-        let expected_sequence = {
-            let connection = driver.session_mut(session_id).expect("connection");
-            connection.timer_set(TCP_TIMER_DELAYED_ACK);
-            connection.timer_set(TCP_TIMER_KEEP_ALIVE);
-            connection.snd_nxt()
-        };
-
-        let session = session_id.pool_index();
-        driver
-            .timers_mut()
-            .update_timer(
-                session.slot(),
-                session.generation(),
-                TCP_TIMER_DELAYED_ACK,
-                1,
-            )
-            .expect("arm delayed ack");
+        let (_, connection_index) = driver
+            .sessions()
+            .session_transport(session_id)
+            .expect("session transport");
+        let expected_sequence = driver.session(session_id).expect("connection").snd_nxt();
+        {
+            let worker = &mut driver.transports_mut().0;
+            let TcpWorker {
+                connections,
+                timers,
+                ..
+            } = worker;
+            let connection = connections.get_mut(connection_index).expect("connection");
+            timers
+                .update(
+                    connection_index,
+                    connection.timer_state_mut(),
+                    TcpTimerKind::DelayedAck,
+                    Duration::from_millis(10),
+                )
+                .expect("arm delayed ACK");
+            timers
+                .update(
+                    connection_index,
+                    connection.timer_state_mut(),
+                    TcpTimerKind::KeepAlive,
+                    Duration::from_millis(30),
+                )
+                .expect("arm keepalive");
+        }
 
         expire_tcp_timers(&runtime, &mut driver, 1, output_node);
 
@@ -1270,9 +1326,11 @@ mod legacy_tests {
                 .receive_established(&packet)
                 .expect("receive data");
             assert!(connection.accept_payload(&packet).is_some());
-            assert!(!connection.on_clean_in_order_payload());
             control
         };
+        assert!(
+            !clean_in_order_payload_for_test(&mut driver, session_id).expect("delay first ACK")
+        );
         {
             let mut buffer = runtime
                 .buffers()
@@ -1295,20 +1353,6 @@ mod legacy_tests {
         if matches!(enqueue, crate::session::runtime::RxDelivery::InOrder { .. }) {
             driver.schedule_session_work_for_test(session_id);
         }
-        {
-            let now = std::time::Instant::now();
-            let session = session_id.pool_index();
-            let ticks = {
-                let connection = driver.session(session_id).expect("connection");
-                connection
-                    .timer_is_active(TCP_TIMER_DELAYED_ACK)
-                    .then(|| connection.timer_ticks(TCP_TIMER_DELAYED_ACK, now))
-                    .flatten()
-            };
-            sync_tcp_timer(driver.timers_mut(), ticks, session, TCP_TIMER_DELAYED_ACK)
-                .expect("refresh delayed ack timer");
-        }
-
         assert!(control.is_none());
         assert!(drop_state.lock().expect("drop").packets.is_empty());
         assert!(lookup_state.lock().expect("lookup").packets.is_empty());
@@ -1357,26 +1401,7 @@ mod legacy_tests {
             payload_offset: 0,
             payload_len: 0,
         };
-        let now = {
-            let connection = driver.session_mut(session_id).expect("connection");
-            let _ = connection
-                .receive_close_side(&packet)
-                .expect("receive fin ack");
-            std::time::Instant::now()
-        };
-        let session = session_id.pool_index();
-        let timer_ticks = {
-            let connection = driver.session(session_id).expect("connection");
-            std::array::from_fn(|timer_id| {
-                let timer_id = timer_id as u32;
-                connection
-                    .timer_is_active(timer_id)
-                    .then(|| connection.timer_ticks(timer_id, now))
-                    .flatten()
-            })
-        };
-        sync_all_tcp_timers(driver.timers_mut(), timer_ticks, session)
-            .expect("sync time wait timer");
+        let _ = receive_close_side_for_test(driver, session_id, &packet).expect("receive fin ack");
     }
 
     fn peer_fin_packet(

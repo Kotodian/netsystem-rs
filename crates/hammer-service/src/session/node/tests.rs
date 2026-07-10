@@ -62,19 +62,6 @@ impl SessionTransport<Index, Local> for TcpRecordingTransport {
         self.0.events.lock().expect("events").push("control");
         Ok(())
     }
-
-    fn handle_legacy_timer(
-        &mut self,
-        _: &mut SessionWorker<Index, Local>,
-        _: Index,
-        _: u32,
-        _: &DataPlaneRuntime,
-        _: SessionQueueNext,
-        _: &mut super::SessionQueueOutput,
-        _: Instant,
-    ) -> CoreResult<()> {
-        Ok(())
-    }
 }
 
 impl TransportInternalTransport<Index, Local> for TcpRecordingTransport {
@@ -120,19 +107,6 @@ impl SessionTransport<Index, Local> for QuicRecordingTransport {
         _: Instant,
     ) -> CoreResult<()> {
         self.0.events.lock().expect("events").push("control");
-        Ok(())
-    }
-
-    fn handle_legacy_timer(
-        &mut self,
-        _: &mut SessionWorker<Index, Local>,
-        _: Index,
-        _: u32,
-        _: &DataPlaneRuntime,
-        _: SessionQueueNext,
-        _: &mut super::SessionQueueOutput,
-        _: Instant,
-    ) -> CoreResult<()> {
         Ok(())
     }
 }
@@ -342,19 +316,6 @@ impl SessionTransport<Index, Local> for QuicShapedTransport {
     ) -> CoreResult<()> {
         Ok(())
     }
-
-    fn handle_legacy_timer(
-        &mut self,
-        _: &mut SessionWorker<Index, Local>,
-        _: Index,
-        _: u32,
-        _: &DataPlaneRuntime,
-        _: SessionQueueNext,
-        _: &mut super::SessionQueueOutput,
-        _: Instant,
-    ) -> CoreResult<()> {
-        Ok(())
-    }
 }
 
 impl TransportInternalTransport<Index, Local> for QuicShapedTransport {
@@ -468,19 +429,6 @@ impl SessionTransport<Index, Local> for FailingPacketizedTransport {
     ) -> CoreResult<()> {
         Ok(())
     }
-
-    fn handle_legacy_timer(
-        &mut self,
-        _: &mut SessionWorker<Index, Local>,
-        _: Index,
-        _: u32,
-        _: &DataPlaneRuntime,
-        _: SessionQueueNext,
-        _: &mut super::SessionQueueOutput,
-        _: Instant,
-    ) -> CoreResult<()> {
-        Ok(())
-    }
 }
 
 impl SessionPacketizedTransport<Index, Local> for FailingPacketizedTransport {
@@ -553,19 +501,6 @@ impl SessionTransport<Index, Local> for RecordingPacketizedTransport {
         &mut self,
         _: &mut SessionWorker<Index, Local>,
         _: Index,
-        _: &DataPlaneRuntime,
-        _: SessionQueueNext,
-        _: &mut super::SessionQueueOutput,
-        _: Instant,
-    ) -> CoreResult<()> {
-        Ok(())
-    }
-
-    fn handle_legacy_timer(
-        &mut self,
-        _: &mut SessionWorker<Index, Local>,
-        _: Index,
-        _: u32,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
         _: &mut super::SessionQueueOutput,

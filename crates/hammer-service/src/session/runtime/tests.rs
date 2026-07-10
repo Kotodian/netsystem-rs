@@ -203,9 +203,21 @@ fn tcp_closed_publication_notifies_app_once_before_cleanup() {
             payload_offset: 0,
             payload_len: 0,
         };
-        connection
-            .receive_close_side(&reset)
+        let (_, transport_index) = driver
+            .sessions
+            .session_transport(session_id)
+            .expect("session transport");
+        driver
+            .transports
+            .0
+            .receive_close_side_for_test(transport_index, &reset)
             .expect("receive reset");
+        let connection = driver
+            .transports
+            .0
+            .connections
+            .get(transport_index)
+            .expect("TCP connection");
         assert_eq!(connection.state(), TcpState::Closed);
     }
     driver.schedule_session_work_for_test(session_id);

@@ -138,20 +138,33 @@ where
             TcpNodeError::SynSentSessionRouteMissing
         })?;
         let (control, acked_tx_len, established, established_with_payload) = {
-            let local_capabilities = queue
-                .transports()
-                .0
-                .lookup
+            let (_, connection_index) = queue
+                .sessions()
+                .session_transport(session_id)
+                .ok_or(TcpNodeError::SynSentSessionMissing)?;
+            let worker = &mut queue.transports_mut().0;
+            let TcpWorker {
+                connections,
+                lookup,
+                timers,
+            } = worker;
+            let local_capabilities = lookup
                 .pending_open_capabilities(session_id)
                 .unwrap_or_default();
-            let connection = queue.session_mut(session_id).ok_or_else(|| {
+            let connection = connections.get_mut(connection_index).ok_or_else(|| {
                 let _ =
                     runtime.record_current_node_error(TcpNodeError::SynSentSessionMissing.code());
                 TcpNodeError::SynSentSessionMissing
             })?;
             let previous_snd_una = connection.snd_una();
             let previous_state = connection.state();
-            let control = connection.receive_open_reply(&packet, local_capabilities)?;
+            let control = connection.receive_open_reply_with_timers(
+                connection_index,
+                timers,
+                &packet,
+                local_capabilities,
+                std::time::Instant::now(),
+            )?;
             let established = connection.state() == crate::transport::tcp::TcpState::Established;
             (
                 control,
