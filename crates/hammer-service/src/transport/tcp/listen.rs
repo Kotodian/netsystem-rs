@@ -1354,7 +1354,7 @@ where
             .0
             .lookup
             .forget_pending_open(session_id);
-        let _ = queue.close_session(session_id)?;
+        let _ = queue.rollback_session(session_id)?;
     }
     result
 }
@@ -1446,7 +1446,7 @@ where
             .0
             .lookup
             .forget_pending_open(session_id);
-        let _ = queue.close_session(session_id)?;
+        let _ = queue.rollback_session(session_id)?;
     }
     result
 }

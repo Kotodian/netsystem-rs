@@ -10,7 +10,7 @@ use hammer_infra::msg_queue::{MsgQueue, SessionEvtType};
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::segment::{Local, Segment, Svm};
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
-use hammer_runtime::app::{AppContext, AppSessionConfig, SessionHandle, with_current_app_worker};
+use hammer_runtime::app::{AppSessionConfig, SessionHandle, with_current_app_worker};
 use hammer_runtime::{DataPlaneRuntime, DataWorkerId, NodeRuntimeData};
 
 use crate::session::app::SessionAppRuntimeCreate;
@@ -115,7 +115,6 @@ pub struct SessionWorker<Index, Seg: Segment = Local> {
     worker: DataWorkerId,
     entries: Pool<SessionEntry<Index>>,
     app: SessionAppRuntime<Seg>,
-    app_context: Option<AppContext<Local>>,
     app_session_config: AppSessionConfig,
     buffers: DataPlaneBuffers,
     session_work: hammer_infra::vec::Vec<SessionId>,
@@ -151,7 +150,6 @@ impl<Index: Copy + Eq, Seg: Segment> SessionWorker<Index, Seg> {
                 worker_index,
                 seg,
             ),
-            app_context: None,
             app_session_config,
             buffers,
             session_work: hammer_infra::vec::Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
@@ -243,7 +241,7 @@ impl<Index: Copy + Eq, Seg: Segment> SessionWorker<Index, Seg> {
         session_id
     }
 
-    fn remove_session_entry(&mut self, session_id: SessionId) -> bool {
+    pub(crate) fn remove_session_entry(&mut self, session_id: SessionId) -> bool {
         self.app.discard_all_tx_bytes_for_session(session_id);
         let _ = self.app.detach_session(session_id);
         let handle = SessionHandle::new(session_id.pool_index().slot(), self.worker.slot() as u32);
@@ -606,24 +604,6 @@ impl<T, Index: Copy + Eq> SessionDriverRuntime<T, Local, Index> {
             Local::default(),
             worker.slot(),
         )
-    }
-
-    pub(crate) fn with_app_context(
-        worker: DataWorkerId,
-        buffers: DataPlaneBuffers,
-        transports: T,
-        app_context: AppContext<Local>,
-    ) -> Self {
-        let mut driver = Self::with_app_session_config(
-            worker,
-            buffers,
-            transports,
-            app_context.app_session_config(),
-            Local::default(),
-            worker.slot(),
-        );
-        driver.sessions.app_context = Some(app_context);
-        driver
     }
 }
 
@@ -1139,7 +1119,9 @@ where
         else {
             break;
         };
-        if let Some((transport, index)) = sessions.session_transport(session_id) {
+        let transport = sessions.session_transport(session_id);
+        sessions.notify_app_closed(session_id);
+        if let Some((transport, index)) = transport {
             transports.disconnect(
                 transport,
                 sessions,
@@ -1150,7 +1132,6 @@ where
                 now,
             )?;
         }
-        sessions.notify_app_closed(session_id);
     }
 
     let pending_timer_count = sessions.pending_timers.len();
@@ -1196,3 +1177,7 @@ where
         scheduled_sessions,
     })
 }
+
+#[cfg(test)]
+#[path = "runtime/tests.rs"]
+mod tests;

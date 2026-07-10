@@ -12,13 +12,13 @@ use super::connection::{
 };
 use super::lookup::TcpLookupState;
 use super::{TcpConnection, TcpNodeError, enqueue_tcp_segment};
+use crate::session::SessionAppRuntime;
 use crate::session::app::SessionAppRuntimeCreate;
 use crate::session::node::{SessionQueueNext, SessionQueueOutput};
 use crate::session::runtime::{
     SessionPacketizedTransport, SessionPacketizedTx, SessionTransport, SessionTransportId,
     SessionWorker, TransportSendFlags, TransportSendParams, TxBatchBuffer,
 };
-use crate::session::{SessionAppRuntime, SessionId};
 use crate::transport::congestion::CongestionController;
 
 const DEFAULT_TCP_CONNECTION_CAPACITY: usize = 1024;
@@ -74,20 +74,23 @@ where
         &mut self,
         sessions: &mut SessionWorker<Index, Seg>,
         index: Index,
-    ) where
+    ) -> CoreResult<()>
+    where
         SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
     {
         let Some(connection) = self.connections.get(index) else {
-            return;
+            return Ok(());
         };
         if connection.state() != TcpState::Closed {
-            return;
+            return Ok(());
         }
         let session_id = connection.session_id();
+        sessions.notify_transport_closed(session_id, index)?;
         self.lookup.forget_session(session_id);
         self.lookup.forget_pending_open(session_id);
         let _ = self.connections.remove(index);
         sessions.notify_transport_deleted(session_id, index);
+        Ok(())
     }
 
     fn control_output<Seg: Segment>(
@@ -139,7 +142,7 @@ where
         if segment.is_none() && !has_pending_tx && has_pending_sack {
             sessions.mark_ready(session_id);
         }
-        self.remove_closed_connection(sessions, index);
+        self.remove_closed_connection(sessions, index)?;
         Ok(())
     }
 }
@@ -175,15 +178,13 @@ where
         output: &mut SessionQueueOutput,
         now: Instant,
     ) -> CoreResult<()> {
-        let session_id = {
+        {
             let connection = self
                 .connections
                 .get_mut(index)
                 .ok_or(TcpNodeError::SessionMissing)?;
             connection.on_session_close();
-            connection.session_id()
-        };
-        sessions.notify_transport_closed(session_id, index)?;
+        }
         self.control_output(sessions, index, runtime, output_next, output, now)
     }
 
@@ -240,7 +241,7 @@ where
         ) {
             sessions.mark_ready(session_id);
         }
-        self.remove_closed_connection(sessions, index);
+        self.remove_closed_connection(sessions, index)?;
         Ok(())
     }
 }

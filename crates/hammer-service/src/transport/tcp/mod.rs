@@ -63,7 +63,6 @@ pub use reset::{TcpResetNext, TcpResetNode};
 use segment::TcpSegment;
 pub use syn_sent::{TcpSynSentNext, TcpSynSentNode};
 
-pub(crate) use lookup::TcpLookupState;
 pub(crate) use worker::TcpWorker;
 
 thread_local! {
@@ -113,7 +112,7 @@ where
         self.sessions_mut().mark_ready(session_id);
     }
 
-    pub(crate) fn close_session(&mut self, session_id: SessionId) -> CoreResult<bool> {
+    pub(crate) fn rollback_session(&mut self, session_id: SessionId) -> CoreResult<bool> {
         let Some((_, index)) = self.sessions().session_transport(session_id) else {
             return Ok(false);
         };
@@ -123,9 +122,7 @@ where
             .lookup
             .forget_pending_open(session_id);
         let _ = self.transports_mut().0.remove_connection(index);
-        self.sessions_mut()
-            .notify_transport_deleted(session_id, index);
-        Ok(true)
+        Ok(self.sessions_mut().remove_session_entry(session_id))
     }
 }
 
@@ -566,7 +563,13 @@ where
         lookup.publish_connection(session_id, connection)
     };
     if close {
-        let _ = driver.close_session(session_id)?;
+        driver
+            .sessions_mut()
+            .notify_transport_closed(session_id, index)?;
+        let _ = driver.transports_mut().0.remove_connection(index);
+        driver
+            .sessions_mut()
+            .notify_transport_deleted(session_id, index);
     }
     Ok(())
 }
@@ -597,7 +600,7 @@ where
             Some(local),
             remote,
         );
-        if let Some((cookie, max_segment_size)) = cached_fast_open {
+        if let Some((cookie, _)) = cached_fast_open {
             connection.set_fast_open_cookie(Some(cookie));
         }
         connection.connect_state(initial_sequence);

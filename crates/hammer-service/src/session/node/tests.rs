@@ -238,6 +238,78 @@ fn attach_local_app_session<T>(
     app_session
 }
 
+struct PayloadCaptureNode {
+    runtime_data: NodeRuntimeData,
+}
+
+impl PayloadCaptureNode {
+    fn new(packets: Arc<Mutex<Vec<Vec<u8>>>>) -> Self {
+        let mut states = payload_capture_states()
+            .lock()
+            .expect("payload capture states");
+        let slot = states.len();
+        states.push(packets);
+        Self {
+            runtime_data: NodeRuntimeData::from_usize(slot).expect("payload capture slot"),
+        }
+    }
+}
+
+impl Node for PayloadCaptureNode {
+    fn process(&mut self, _: &DataPlaneRuntime, _: &mut BufferFrame) -> NodeResult {
+        NodeResult::drop()
+    }
+
+    fn node_process(&self) -> NodeProcessFn {
+        payload_capture_process
+    }
+
+    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        Ok(self.runtime_data)
+    }
+}
+
+impl InternalNode for PayloadCaptureNode {
+    fn node_registration(&self) -> NodeRegistration
+    where
+        Self: Sized,
+    {
+        NodeRegistration::Plain
+    }
+}
+
+fn payload_capture_states() -> &'static Mutex<Vec<Arc<Mutex<Vec<Vec<u8>>>>>> {
+    static STATES: OnceLock<Mutex<Vec<Arc<Mutex<Vec<Vec<u8>>>>>>> = OnceLock::new();
+    STATES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn payload_capture_process(
+    runtime: &DataPlaneRuntime,
+    data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> NodeResult {
+    let Ok(slot) = data.usize_word(0) else {
+        return NodeResult::drop();
+    };
+    let packets = {
+        let states = payload_capture_states()
+            .lock()
+            .expect("payload capture states");
+        let Some(packets) = states.get(slot) else {
+            return NodeResult::drop();
+        };
+        Arc::clone(packets)
+    };
+    let mut packets = packets.lock().expect("captured payloads");
+    for &index in frame.pending_indices() {
+        let Ok(buffer) = runtime.get_buffer(index) else {
+            return NodeResult::drop();
+        };
+        packets.push(buffer.current().to_vec());
+    }
+    NodeResult::drop()
+}
+
 struct QuicShapedTransport {
     streams: Arc<Mutex<Vec<crate::session::SessionId>>>,
     observed_fifo_lengths: Arc<Mutex<Vec<usize>>>,
@@ -290,11 +362,12 @@ impl TransportInternalTransport<Index, Local> for QuicShapedTransport {
         &mut self,
         sessions: &mut SessionWorker<Index, Local>,
         index: Index,
-        _: &DataPlaneRuntime,
-        _: SessionQueueNext,
-        _: &mut super::SessionQueueOutput,
+        runtime: &DataPlaneRuntime,
+        output_next: SessionQueueNext,
+        output: &mut super::SessionQueueOutput,
         _: Instant,
     ) -> CoreResult<()> {
+        let mut frame = runtime.buffers().get_next_frame(output_next.node())?;
         let streams = self.streams.lock().expect("streams").clone();
         for session_id in streams {
             let len = sessions.app().pending_send_len(session_id)?.unwrap_or(0);
@@ -302,8 +375,16 @@ impl TransportInternalTransport<Index, Local> for QuicShapedTransport {
                 .lock()
                 .expect("observed lengths")
                 .push(len);
+            if len != 0 {
+                let buffer = runtime.buffers().alloc_index()?;
+                frame.push_index(buffer)?;
+                sessions
+                    .app()
+                    .copy_tx_to_buffer(session_id, 0, len, buffer)?;
+            }
             sessions.notify_transport_closed(session_id, index)?;
         }
+        output.enqueue_frame(runtime, frame)?;
         Ok(())
     }
 }
@@ -313,6 +394,10 @@ fn quic_shaped_internal_tx_can_fan_close_out_to_stream_sessions() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let streams = Arc::new(Mutex::new(Vec::new()));
     let observed_fifo_lengths = Arc::new(Mutex::new(Vec::new()));
+    let captured_payloads = Arc::new(Mutex::new(Vec::new()));
+    let output = runtime
+        .nodes()
+        .register_internal(PayloadCaptureNode::new(Arc::clone(&captured_payloads)));
     let transport_index = Index::new(12, 4);
     let mut driver = SessionDriverRuntime::new(
         DataWorkerId::new(0),
@@ -333,17 +418,16 @@ fn quic_shaped_internal_tx_can_fan_close_out_to_stream_sessions() {
     first_app.send_bytes(b"one").expect("first stream send");
     assert_eq!(second_app.tx_fifo().enqueue(b"four"), 4);
 
-    dispatch_session_queue_for_ticks(
-        &runtime,
-        &mut driver,
-        0,
-        hammer_core::data_plane::NodeId::new(0).into(),
-    )
-    .expect("internal tx");
+    dispatch_session_queue_for_ticks(&runtime, &mut driver, 0, output.into()).expect("internal tx");
+    let _ = runtime.run_ready_nodes().expect("capture internal TX");
 
     assert_eq!(
         *observed_fifo_lengths.lock().expect("observed lengths"),
         vec![3, 4]
+    );
+    assert_eq!(
+        *captured_payloads.lock().expect("captured payloads"),
+        vec![b"one".to_vec(), b"four".to_vec()]
     );
     for app in [first_app, second_app] {
         let mut events = [SessionEvt {
