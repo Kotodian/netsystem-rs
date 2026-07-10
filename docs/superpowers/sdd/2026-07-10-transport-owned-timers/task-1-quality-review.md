@@ -1,133 +1,100 @@
-# Task 1 Code-Quality Review
+# Task 1 Code-Quality Re-review
 
 ## Verdict
 
-FAIL. No Critical findings; three Important findings remain.
+PASS. No Critical or Important findings remain that block Task 1.
 
-Scope reviewed: `f653c2ea..57df04a8` (`ed5b4ba9`, `59ec18a1`,
-`57df04a8`) against Task 1 of
-`docs/superpowers/plans/2026-07-10-transport-owned-timers.md`, the design
-specification, ADR 0008, `CONTEXT.md`, and `AGENTS.md`.
+Scope re-reviewed: `f653c2ea..3822940d`, with particular attention to the
+follow-up fix `3822940d` and the disposition of the three findings recorded in
+`cb2512d2`. The review also checked the generation-safety follow-up recorded in
+`ccfebb28` and GitHub issue #42.
 
-The earlier spec review is accepted as PASS. This review focuses on
-correctness, soundness, generation safety, lifecycle cleanup, static generic
-and TLS type safety, hot-path allocation/cloning, public API scope,
-maintainability, and test strength.
+The earlier spec review remains accepted as PASS. This re-review focuses on
+static queue typing, worker graph registration order and uniqueness, Local/SVM
+backend selection, the previously identified TX clone, app-event generation
+safety, public callback behavior, and focused regression coverage.
 
-## Findings
+## Finding Disposition
 
-### Important 1: Task 1 replaces the old TLS queue ownership with a new type-erased TLS cache
+### Resolved 1: the TCP session queue remains statically typed through worker graph registration
 
-Files: `crates/hammer-service/src/transport/tcp/mod.rs:68`,
-`crates/hammer-service/src/transport/tcp/mod.rs:174`,
-`crates/hammer-service/src/session/node.rs:276`
+The type-erased TLS cache introduced during Task 1 has been removed by
+`3822940d`. `TCP_SESSION_QUEUE_RUNTIME_DATA`, its `TypeId`/backend key, and
+`ensure_tcp_session_queue` no longer exist.
 
-`TCP_SESSION_QUEUE_RUNTIME_DATA` stores an untyped `NodeRuntimeData` pointer
-behind a `(runtime_key, TypeId<C>, SessionBackend)` key. Callers then construct
-`SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>`
-from that untyped value and `session_queue_cell` casts it to `RefCell<Q>`.
+`wire_worker_graph` now selects the Local or SVM segment backend once, creates
+the concrete `SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>`, and
+passes the resulting typed `SessionQueueHandle` through one consolidated
+`register_typed_worker_graph` path. The handle is used to construct every TCP
+consumer node and attach the session queue without reconstructing its generic
+type from an untyped cached pointer.
 
-The runtime/backend cache test proves that the current key separates the cases
-it exercises, but it does not make the cast statically safe. More importantly,
-this is the exact TLS queue-runtime-data ownership that Task 1 step 6 requires
-removing, and it conflicts with the design/ADR prohibition on TLS and raw
-pointer type erasure. The safe `SessionQueueHandle::new(NodeRuntimeData)` API
-also cannot enforce the safety comment's claim that the same `Q` is recovered.
+The graph installation order is also coherent: `install_worker_graph` first
+registers the seven typed TCP/session nodes, filters those entries from the
+distributed registration slice, and then calls `init_graph` for the remaining
+nodes so named next arcs can resolve after their targets are present. The
+packet-graph regression test verifies that each filtered node has exactly one
+static registration and is omitted from deferred registration.
 
-Concrete fix: remove `TCP_SESSION_QUEUE_RUNTIME_DATA` and make queue ownership
-part of the worker/graph registration context. Keep the typed
-`SessionQueueHandle<SessionDriverRuntime<..., Seg, ...>>` from creation through
-node registration instead of returning and re-keying a raw pointer. Any
-unavoidable runtime-data reconstruction must be a narrowly scoped unsafe
-boundary with an explicit caller contract, not a safe generic constructor.
+This resolves the Task 1 ownership, TLS, and static type-safety finding.
 
-This cache shape is introduced by Task 1. It should not be accepted merely
-because the current runtime/type/backend lookup happens to select the expected
-pointer in the focused test.
+### Deferred 2: the normal TX path still deep-clones connection state
 
-### Important 2: TCP TX still deep-clones allocation-owning connection state on every batch
+`TcpWorker::tx_action` still clones the complete `TcpConnection` for candidate
+TX rollback. That clone rebuilds allocation-owning recovery and SACK state, so
+the original performance concern remains technically valid.
 
-Files: `crates/hammer-service/src/transport/tcp/worker.rs:301`,
-`crates/hammer-service/src/transport/tcp/recovery.rs:1351`,
-`crates/hammer-service/src/transport/tcp/sack.rs:63`,
-`crates/hammer-service/tests/vpp_session_tx_guardrails.rs:63`
+It does not block Task 1: the deep clone predates Task 1, and Task 1 explicitly
+required retaining the candidate clone. Replacing it would introduce a new
+private bounded TX preview/checkpoint type or an equivalent new API shape.
+Explicit user approval has been requested for that surface, as required by the
+repository rules; this review does not treat the replacement as authorized or
+prescribe it as part of `3822940d`.
 
-`TcpWorker::tx_action` executes `connection.clone()` for every normal TX batch.
-That clone is not a cheap snapshot: `TcpRecoveryState::clone` constructs new
-Pool/RbTree storage, clones the scoreboard, and walks all outstanding sent
-samples twice; `TcpSackState::clone` allocates and rebuilds another RbTree.
-Consequently normal packetized TX performs heap-backed infrastructure
-allocations and work proportional to outstanding recovery state.
+### Deferred 3: app-to-session event identity is tracked outside Task 1
 
-The updated guardrail targets the correct new file, but it only rejects the
-spellings `std::vec::Vec::with_capacity` and `std::vec!`. It passes while the
-deep clone allocates through `hammer-infra` Pool/RbTree, so it does not protect
-the stated hot-path property.
+The slot-only `SessionEvt.session_index` weakness also remains technically
+valid, but it predates #41 and changing the Local/SVM app-event identity and
+shared-memory ABI is outside the transport-owned timer refactor.
 
-Concrete fix: replace whole-connection rollback with a bounded send-side
-transaction/checkpoint that covers only fields mutated by `tx_segment` and
-`commit_payload_tx`, or prevalidate/stage the batch so the real connection can
-be updated without cloning recovery and SACK containers. Because the plan
-currently explicitly prescribes the candidate clone, obtain approval for the
-replacement shape. Strengthen the guardrail with an allocation-counting test
-or a structural assertion that rejects `TcpConnection::clone` in `tx_action`.
+Commit `ccfebb28` records the problem and acceptance-test shape in
+`app-event-generation-follow-up.md`. GitHub issue #42, "Make app-to-session
+events generation-aware", is OPEN with `enhancement` and `needs-triage` labels.
+Both records explicitly cover delayed old `Close` and `TxDeq` events after slot
+reuse, the Local/SVM boundary, and ABI/versioning impact.
 
-The deep clone predates Task 1 (`push_header` already used it at `f653c2ea`);
-Task 1 moves it into `TcpWorker::tx_action` and leaves the hot-path cost intact.
+This is therefore a deferred generation-safety issue, not an unresolved Task 1
+failure.
 
-### Important 3: app-to-session events are slot-only and can target a reused generation
+## Additional Re-review Notes
 
-Files: `crates/hammer-infra/src/msg_queue.rs:8`,
-`crates/hammer-service/src/session/app.rs:302`,
-`crates/hammer-service/src/session/node/tests.rs:821`
-
-`SessionEvt` carries only `session_index` (the pool slot). During drain,
-`SessionAppRuntime` resolves that slot through `sessions_by_index` to whichever
-`SessionId` generation is current at consumption time. A delayed or duplicate
-Close/TxDeq produced by an old app session after its slot is removed and reused
-can therefore be delivered to the replacement session. Pool generation checks
-cannot help because the event never carried the old generation.
-
-The new `transport_deleted_then_queued_app_close_releases_the_session_slot`
-test consumes the old Close before inserting the replacement. It proves the
-happy cleanup order, but not the generation boundary. It would still pass an
-implementation that misdelivers a second old Close after reuse.
-
-Concrete fix: make runtime-directed app events generation-aware (carry the
-full generation-safe SessionId/handle, or validate an equivalent generation
-token before dispatch). Add a test that queues two old Close events, consumes
-the first to release the slot, attaches a replacement in that slot, then proves
-the second old event neither closes nor schedules the replacement.
-
-This event-format weakness predates Task 1 and is not introduced by these
-commits. It is nevertheless a blocking residual generation-safety issue for
-Task 1's new lifecycle cleanup and immediate slot-reuse behavior. If changing
-the cross-process event ABI is intentionally out of Task 1 scope, record and
-link a blocking follow-up rather than claiming generation-safe lifecycle
-completion.
-
-## Suspected Areas Re-checked
-
-- Queue cache across runtime/type/backend: the focused test passes, but the
-  cache remains an erased TLS ownership surface and is Finding 1.
-- `TransportDeleted` followed by queued app close: the direct path works and
-  releases the slot; delayed/duplicate events across slot reuse remain unsafe
-  as described in Finding 3.
-- Deep `TcpConnection` clones: confirmed in the normal TX batch path; the clone
-  rebuilds allocation-owning recovery and SACK state (Finding 2).
-- `vpp_session_tx_guardrails` target: it now reads `tcp/worker.rs`, but its
-  assertions are too narrow to detect the confirmed allocation path.
+- `register_tcp_input`, `register_tcp_listen`, `register_tcp_established`,
+  `register_tcp_rcv_process`, and `register_tcp_syn_sent` now look up nodes that
+  were registered by `wire_worker_graph`, instead of registering them directly.
+  Repository search found no ordinary call sites; these functions are graph
+  macro init callbacks, and normal worker initialization wires the typed graph
+  exactly once before deferred macro registration. This is not a behavioral
+  regression in the supported initialization path.
+- Those callback functions remain `pub` even though their behavior is now
+  internal lifecycle plumbing. Narrowing or documenting that surface would be
+  useful cleanup, but no external compatibility contract was found in this
+  repository, so it is non-blocking.
+- Direct repeated calls to `wire_worker_graph` are not an advertised lifecycle
+  operation and were not added as a required idempotent path. Normal worker
+  initialization calls it once; the duplicate-registration guard verifies the
+  supported static/deferred registration split.
 
 ## Verification
 
-- `cargo test -p hammer-service --lib session:: -- --test-threads=1`: PASS,
-  16 tests.
-- `cargo test -p hammer-service --lib tcp_session_queue_cache_isolated_by_runtime_and_backend -- --test-threads=1`:
+- `cargo test -p hammer-service --lib typed_tcp_worker_graph_isolated_by_runtime_and_backend -- --test-threads=1`:
   PASS, 1 test.
-- `cargo test -p hammer-service --test vpp_session_tx_guardrails`: PASS,
-  5 tests, while still missing the deep-clone allocation.
+- `cargo test -p hammer-service --lib packet_graph::tests -- --test-threads=1`:
+  PASS, 2 tests.
+- `cargo test -p hammer-service --test tcp_session_app_boundary`: PASS, 7 tests.
 - `cargo fmt --all -- --check`: PASS.
-- `git diff --check f653c2ea..57df04a8`: PASS.
+- `git diff --check 3822940d^..3822940d`: PASS.
+- `gh issue view 42 --repo Kotodian/hammer-ios-rs`: confirmed OPEN,
+  `enhancement`, `needs-triage`.
 
-The focused builds emit numerous pre-existing warnings; no full workspace test
-suite was run for this quality review.
+The focused builds emit numerous pre-existing warnings. No full workspace test
+suite was run for this re-review.

@@ -58,7 +58,7 @@ Use `hammer_infra::pool::Index` directly for TCP's generation-safe index. Do not
 - Modify: `crates/hammer-service/src/packet_graph.rs`
 - Test: `crates/hammer-service/tests/{session_queue_dispatch,tcp_session_app_boundary}.rs`
 
-- [ ] **Step 1: Write the failing scheduling and lifecycle tests**
+- [x] **Step 1: Write the failing scheduling and lifecycle tests**
 
 Add real-node tests with the following names and independent expected observations:
 
@@ -69,7 +69,7 @@ Add real-node tests with the following names and independent expected observatio
 - `quic_shaped_internal_tx_can_fan_close_out_to_stream_sessions`: assert one test connection reads both stream FIFOs, emits internal TX, and transitions both stream sessions without implementing packetized methods.
 - `failed_session_packetized_tx_action_keeps_fifo_and_graph_unchanged`: assert the typed action error is returned, capture output is empty, and the original FIFO byte count is unchanged.
 
-- [ ] **Step 2: Run the tests and verify RED**
+- [x] **Step 2: Run the tests and verify RED**
 
 Run:
 
@@ -80,7 +80,7 @@ cargo test -p hammer-service failed_session_packetized_tx_action_keeps_fifo_and_
 
 Expected: FAIL because static transport-set dispatch, typed lifecycle, transport-internal TX, and typed packetized action do not exist.
 
-- [ ] **Step 3: Add the typed lifecycle and generic session entry**
+- [x] **Step 3: Add the typed lifecycle and generic session entry**
 
 Implement this approved state shape with private fields and consuming transitions:
 
@@ -129,7 +129,7 @@ struct SessionEntry<Index> {
 
 The generic type parameter remains `Index`; the field remains `index`. Do not create a same-named wrapper type.
 
-- [ ] **Step 4: Add static transport and typed TX traits**
+- [x] **Step 4: Add static transport and typed TX traits**
 
 Implement the closed static seam:
 
@@ -287,7 +287,7 @@ where
 
 Define `SessionTxStrategy`, `SessionPacketizedTx`, and `TransportInternalTx` so packetized transports must provide send parameters and one batch action, while internal transports provide only internal TX. There must be no optional `custom_tx` or fake `push_header` requirement.
 
-- [ ] **Step 5: Refactor the worker root without timer ownership**
+- [x] **Step 5: Refactor the worker root without timer ownership**
 
 Refactor `SessionDriverRuntime` to own sibling values:
 
@@ -302,7 +302,7 @@ pub struct SessionDriverRuntime<T, Seg: Segment = Local, Index = PoolIndex> {
 
 Session creation uses `Pool::insert_with` to obtain the SessionId, creates the app session, then invokes a transport closure that inserts the connection and returns its `PoolIndex`. Precheck TCP pool capacity; if app-session creation fails, do not insert a TCP connection. No hammer-infra reservation API is needed.
 
-- [ ] **Step 6: Move TCP connections and lookup into TcpWorker**
+- [x] **Step 6: Move TCP connections and lookup into TcpWorker**
 
 Implement:
 
@@ -317,7 +317,7 @@ Task 2 adds the timer field after its typed engine exists. Each `TcpConnection` 
 
 Rename existing `TcpWorkerOwnedState` lookup storage to `TcpLookupState`, move it under `TcpWorker`, and remove its TLS queue-runtime-data ownership. Keep the cross-worker `TcpMain` control plane unchanged.
 
-- [ ] **Step 7: Make Local/SVM handles type-correct and delete TcpQueue**
+- [x] **Step 7: Make Local/SVM handles type-correct and delete TcpQueue**
 
 Select `C` and `Seg` together at graph registration and monomorphize session/TCP nodes as `<C, Seg>`. Every node stores or reconstructs:
 
@@ -327,13 +327,13 @@ SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>
 
 Do not add another alias or wrapper named `TcpQueue`. The pointer encoded in `NodeRuntimeData` must always be recovered with the same concrete `Seg` used at allocation.
 
-- [ ] **Step 8: Preserve packetized TX and add internal-TX proof**
+- [x] **Step 8: Preserve packetized TX and add internal-TX proof**
 
 Move existing FIFO selection and buffer preparation behind `SessionPacketizedTx`. TCP's batch action clones candidate TCP state, writes `TcpSegment` output intent to every prepared buffer, commits send state, and only then lets Session Runtime flush the frame. Failure leaves FIFO bytes and graph visibility unchanged.
 
 The test-only QUIC-shaped transport uses `TransportInternalTx`, reads bytes only through transport-neutral SessionWorker methods, schedules two stream SessionIds from one connection, and closes both through lifecycle notifications. Do not create production QUIC modules.
 
-- [ ] **Step 9: Run focused and crate tests**
+- [x] **Step 9: Run focused and crate tests**
 
 Run:
 
@@ -345,7 +345,7 @@ cargo test -p hammer-service
 
 Expected: PASS. Existing TCP TX/RX/connect/close behavior remains green; all six new seam tests pass.
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add crates/hammer-service/src/session crates/hammer-service/src/transport/tcp crates/hammer-service/src/packet_graph.rs crates/hammer-service/tests/session_queue_dispatch.rs crates/hammer-service/tests/tcp_session_app_boundary.rs
