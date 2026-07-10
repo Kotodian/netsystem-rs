@@ -3,21 +3,23 @@ use std::cell::{Cell, RefCell};
 use hammer_core::data_plane::{BufferFrame, BufferIndex, NodeId};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::{TcpConnectionId, TcpError, TcpPacket, TcpSegmentFlags, TcpSeq};
+use hammer_infra::pool::Index as PoolIndex;
+use hammer_infra::segment::Segment;
 use hammer_infra::vec::Vec;
 use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
 
 use super::connection::TcpConnection;
 use super::segment::{TcpSegment, tcp_packet};
 use super::{
-    TCP_MAIN, TcpInputControlPlane, TcpInputNext, TcpNodeError, TcpQueue, ensure_tcp_session_queue,
-    publish_tcp_connection, tcp_worker_state_mut, write_session_route_opaque,
+    TCP_MAIN, TcpInputControlPlane, TcpInputNext, TcpNodeError, TcpWorker,
+    ensure_tcp_session_queue, publish_tcp_connection, write_session_route_opaque,
 };
-#[cfg(test)]
-use super::{set_tcp_worker_state, tcp_worker_state};
 #[cfg(test)]
 use crate::net::NetworkOpaque;
 use crate::session::SessionId;
-use crate::session::runtime::RxDelivery;
+use crate::session::SessionQueueHandle;
+use crate::session::app::SessionAppRuntimeCreate;
+use crate::session::runtime::{RxDelivery, SessionDriverRuntime};
 use crate::transport::congestion::CongestionController;
 
 const TCP_LISTENER_BACKLOG: usize = 128;
@@ -38,27 +40,35 @@ pub enum TcpListenNext {
     next = TcpListenNext,
     role = internal,
 )]
-pub struct TcpListenNode<C: CongestionController + 'static> {
+pub struct TcpListenNode<C: CongestionController + 'static, Seg: Segment> {
     control: TcpInputControlPlane,
-    session_queue: TcpQueue<C>,
+    session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
     #[node(default = Cell::new(None))]
     control_slot: Cell<Option<usize>>,
 }
 
 pub fn register_tcp_listen(runtime: &DataPlaneRuntime, worker: usize) -> CoreResult<NodeId> {
     crate::with_congestion!(|C| {
-        let queue_data = ensure_tcp_session_queue::<C>(runtime, worker)?;
-        let queue = TcpQueue::<C>::new(queue_data);
-        let control = TCP_MAIN
-            .load()
-            .as_deref()
-            .ok_or_else(|| CoreError::internal("tcp main not initialized"))?
-            .control()
-            .clone();
-        runtime.nodes().try_register_internal_with_next_names(
-            TcpListenNode::<C>::new(control, queue, [NodeId::new(0); TcpListenNext::COUNT]),
-            &TcpListenNext::NEXT_NAMES,
-        )
+        crate::with_segment!(|Seg| {
+            let queue_data = ensure_tcp_session_queue::<C>(runtime, worker)?;
+            let queue: SessionQueueHandle<
+                SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>,
+            > = SessionQueueHandle::new(queue_data);
+            let control = TCP_MAIN
+                .load()
+                .as_deref()
+                .ok_or_else(|| CoreError::internal("tcp main not initialized"))?
+                .control()
+                .clone();
+            runtime.nodes().try_register_internal_with_next_names(
+                TcpListenNode::<C, Seg>::new(
+                    control,
+                    queue,
+                    [NodeId::new(0); TcpListenNext::COUNT],
+                ),
+                &TcpListenNext::NEXT_NAMES,
+            )
+        })
     })
 }
 
@@ -88,13 +98,14 @@ fn register_tcp_listen_control(
     })
 }
 
-fn tcp_listen_runtime_data<C>(
-    session_queue: TcpQueue<C>,
+fn tcp_listen_runtime_data<C, Seg>(
+    session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
     control_slot: &Cell<Option<usize>>,
     control: &TcpInputControlPlane,
 ) -> CoreResult<NodeRuntimeData>
 where
     C: CongestionController + 'static,
+    Seg: Segment,
 {
     let queue_data = session_queue.runtime_data();
     let control_slot = register_tcp_listen_control(control_slot, control)?;
@@ -118,9 +129,11 @@ fn tcp_listen_control(data: NodeRuntimeData) -> CoreResult<TcpInputControlPlane>
     })
 }
 
-impl<C> Node for TcpListenNode<C>
+impl<C, Seg> Node for TcpListenNode<C, Seg>
 where
     C: CongestionController + 'static,
+    Seg: Segment,
+    crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     #[inline(always)]
     fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
@@ -133,7 +146,7 @@ where
 
     #[inline]
     fn node_process(&self) -> NodeProcessFn {
-        tcp_listen_process::<C>
+        tcp_listen_process::<C, Seg>
     }
 
     #[inline]
@@ -142,15 +155,17 @@ where
     }
 }
 
-fn tcp_listen_process<C>(
+fn tcp_listen_process<C, Seg>(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> NodeResult
 where
     C: CongestionController + 'static,
+    Seg: Segment,
+    crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
-    let next = match TcpListenNode::<C>::runtime_nexts(runtime) {
+    let next = match TcpListenNode::<C, Seg>::runtime_nexts(runtime) {
         Ok(next) => next,
         Err(_) => return NodeResult::drop(),
     };
@@ -158,25 +173,27 @@ where
         Ok(c) => c,
         Err(_) => return NodeResult::drop(),
     };
-    tcp_listen_process_frame::<C>(
+    tcp_listen_process_frame::<C, Seg>(
         runtime,
         frame,
         &control,
-        TcpQueue::<C>::new(NodeRuntimeData::from_words([data.word(0), 0, 0, 0])),
+        SessionQueueHandle::new(NodeRuntimeData::from_words([data.word(0), 0, 0, 0])),
         next,
     )
 }
 
 #[inline]
-fn tcp_listen_process_frame<C>(
+fn tcp_listen_process_frame<C, Seg>(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
     control: &TcpInputControlPlane,
-    session_queue: TcpQueue<C>,
+    session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
     next: [NodeId; TcpListenNext::COUNT],
 ) -> NodeResult
 where
     C: CongestionController + 'static,
+    Seg: Segment,
+    crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let tcp_output = next[TcpListenNext::Output as usize];
     let tcp_established = next[TcpListenNext::Established as usize];
@@ -202,16 +219,18 @@ where
     NodeResult::drop()
 }
 
-fn tcp_listen_index<C>(
+fn tcp_listen_index<C, Seg>(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
     control: &TcpInputControlPlane,
-    session_queue: TcpQueue<C>,
+    session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
     tcp_output: NodeId,
     tcp_established: NodeId,
 ) -> CoreResult<()>
 where
     C: CongestionController + 'static,
+    Seg: Segment,
+    crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let packet = tcp_packet(runtime, index)?;
     let listener = control.lookup_listener(packet.local).ok_or_else(|| {
@@ -270,22 +289,21 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+mod legacy_tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::{Arc, Mutex, OnceLock};
 
     use super::*;
     use crate::data_plane::DropNode;
+    use crate::session::SessionQueueHandle;
+    use crate::session::runtime::SessionDriverRuntime;
     use crate::transport::congestion::BbrController;
     use crate::transport::tcp::input::TcpInputControlPlane;
-    use crate::transport::tcp::lookup::{
-        TcpIpv4ListenerAddress, TcpV4ListenerKey, TcpWorkerOwnedState,
-    };
+    use crate::transport::tcp::lookup::{TcpIpv4ListenerAddress, TcpV4ListenerKey};
     use crate::transport::tcp::output::{TcpOutputNext, TcpOutputNode};
     use crate::transport::tcp::tcp_control_cursor;
     use crate::transport::tcp::{
-        TCP_FLAG_ACK, TCP_FLAG_SYN, TcpEstablishedNext, TcpEstablishedNode, TcpInputNext,
-        TcpSessionDriver,
+        TCP_FLAG_ACK, TCP_FLAG_SYN, TcpEstablishedNext, TcpEstablishedNode, TcpInputNext, TcpWorker,
     };
     use hammer_core::data_plane::{BufferFrame, NodeId, NodeRegistration};
     use hammer_core::error::{CoreError, CoreResult};
@@ -433,10 +451,20 @@ mod tests {
 
         let mut queue = handle.borrow_mut().expect("tcp queue");
         assert_eq!(
-            tcp_worker_state().session_route_by_tuple(local_addr(), remote_addr(None)),
+            queue
+                .transports()
+                .0
+                .lookup
+                .session_route_by_tuple(local_addr(), remote_addr(None)),
             None
         );
-        assert!(tcp_worker_state_mut().has_listener_pending(local_addr(), remote_addr(None)));
+        assert!(
+            queue
+                .transports_mut()
+                .0
+                .lookup
+                .has_listener_pending(local_addr(), remote_addr(None))
+        );
     }
 
     #[test]
@@ -470,7 +498,10 @@ mod tests {
         drop(packets);
 
         let mut queue = handle.borrow_mut().expect("tcp queue");
-        let route = tcp_worker_state()
+        let route = queue
+            .transports()
+            .0
+            .lookup
             .session_route_by_tuple(local_addr(), remote_addr(None))
             .expect("established session route");
         let connection = queue.session(route.0).expect("tcp session");
@@ -478,7 +509,13 @@ mod tests {
             connection.state(),
             crate::transport::tcp::TcpState::Established
         );
-        assert!(!tcp_worker_state_mut().has_listener_pending(local_addr(), remote_addr(None)));
+        assert!(
+            !queue
+                .transports_mut()
+                .0
+                .lookup
+                .has_listener_pending(local_addr(), remote_addr(None))
+        );
     }
 
     #[test]
@@ -513,10 +550,20 @@ mod tests {
 
         let mut queue = handle.borrow_mut().expect("tcp queue");
         assert_eq!(
-            tcp_worker_state().session_route_by_tuple(local_addr(), remote_addr(None)),
+            queue
+                .transports()
+                .0
+                .lookup
+                .session_route_by_tuple(local_addr(), remote_addr(None)),
             None
         );
-        assert!(tcp_worker_state_mut().has_listener_pending(local_addr(), remote_addr(None)));
+        assert!(
+            queue
+                .transports_mut()
+                .0
+                .lookup
+                .has_listener_pending(local_addr(), remote_addr(None))
+        );
     }
 
     #[test]
@@ -551,7 +598,10 @@ mod tests {
         assert!(runtime.run_ready_nodes().expect("run final ack") >= 1);
 
         let queue = handle.borrow_mut().expect("tcp queue");
-        let route = tcp_worker_state()
+        let route = queue
+            .transports()
+            .0
+            .lookup
             .session_route_by_tuple(local_addr(), remote_addr(None))
             .expect("established session route");
         let connection = queue.session(route.0).expect("tcp session");
@@ -584,12 +634,18 @@ mod tests {
 
         {
             let mut queue = handle.borrow_mut().expect("tcp queue");
-            assert!(tcp_worker_state_mut().has_listener_pending(local_addr(), remote_addr(None)));
-            let cookie = tcp_worker_state_mut().fast_open_cookie_for_listener(
-                LISTENER_ID,
-                local_addr(),
-                remote_addr(None),
+            assert!(
+                queue
+                    .transports_mut()
+                    .0
+                    .lookup
+                    .has_listener_pending(local_addr(), remote_addr(None))
             );
+            let cookie = queue
+                .transports_mut()
+                .0
+                .lookup
+                .fast_open_cookie_for_listener(LISTENER_ID, local_addr(), remote_addr(None));
             send_packet(
                 &runtime,
                 input,
@@ -602,8 +658,17 @@ mod tests {
         }
 
         let mut queue = handle.borrow_mut().expect("tcp queue");
-        assert!(!tcp_worker_state_mut().has_listener_pending(local_addr(), remote_addr(None)));
-        let route = tcp_worker_state()
+        assert!(
+            !queue
+                .transports_mut()
+                .0
+                .lookup
+                .has_listener_pending(local_addr(), remote_addr(None))
+        );
+        let route = queue
+            .transports()
+            .0
+            .lookup
             .session_route_by_tuple(local_addr(), remote_addr(None))
             .expect("tfo session route");
         let connection = queue.session(route.0).expect("tcp session");
@@ -639,10 +704,20 @@ mod tests {
 
         let mut queue = handle.borrow_mut().expect("tcp queue");
         assert_eq!(
-            tcp_worker_state().session_route_by_tuple(local_addr(), remote_addr(None)),
+            queue
+                .transports()
+                .0
+                .lookup
+                .session_route_by_tuple(local_addr(), remote_addr(None)),
             None
         );
-        assert!(tcp_worker_state_mut().has_listener_pending(local_addr(), remote_addr(None)));
+        assert!(
+            queue
+                .transports_mut()
+                .0
+                .lookup
+                .has_listener_pending(local_addr(), remote_addr(None))
+        );
         let packets = output_state.lock().expect("capture");
         assert_eq!(packets.packets.len(), 1);
         let syn_ack = &packets.packets[0];
@@ -697,12 +772,26 @@ mod tests {
 
         let mut queue = handle.borrow_mut().expect("tcp queue");
         assert_eq!(
-            tcp_worker_state_mut().listener_pending_len(LISTENER_ID),
+            queue
+                .transports_mut()
+                .0
+                .lookup
+                .listener_pending_len(LISTENER_ID),
             TCP_LISTENER_BACKLOG
         );
-        assert!(!tcp_worker_state_mut().has_listener_pending(local_addr(), overflow_remote));
+        assert!(
+            !queue
+                .transports_mut()
+                .0
+                .lookup
+                .has_listener_pending(local_addr(), overflow_remote)
+        );
         assert_eq!(
-            tcp_worker_state().session_route_by_tuple(local_addr(), overflow_remote),
+            queue
+                .transports()
+                .0
+                .lookup
+                .session_route_by_tuple(local_addr(), overflow_remote),
             None
         );
     }
@@ -740,11 +829,11 @@ mod tests {
         let tfo_remote = remote_addr(Some(REMOTE_PORT + TCP_LISTENER_BACKLOG as u16 + 1));
         {
             let mut queue = handle.borrow_mut().expect("tcp queue");
-            let cookie = tcp_worker_state_mut().fast_open_cookie_for_listener(
-                LISTENER_ID,
-                local_addr(),
-                tfo_remote,
-            );
+            let cookie = queue
+                .transports_mut()
+                .0
+                .lookup
+                .fast_open_cookie_for_listener(LISTENER_ID, local_addr(), tfo_remote);
             send_packet(
                 &runtime,
                 input,
@@ -766,11 +855,24 @@ mod tests {
 
         let mut queue = handle.borrow_mut().expect("tcp queue");
         assert_eq!(
-            tcp_worker_state_mut().listener_pending_len(LISTENER_ID),
+            queue
+                .transports_mut()
+                .0
+                .lookup
+                .listener_pending_len(LISTENER_ID),
             TCP_LISTENER_BACKLOG
         );
-        assert!(!tcp_worker_state_mut().has_listener_pending(local_addr(), tfo_remote));
-        let route = tcp_worker_state()
+        assert!(
+            !queue
+                .transports_mut()
+                .0
+                .lookup
+                .has_listener_pending(local_addr(), tfo_remote)
+        );
+        let route = queue
+            .transports()
+            .0
+            .lookup
             .session_route_by_tuple(local_addr(), tfo_remote)
             .expect("tfo session route");
         let connection = queue.session(route.0).expect("tcp session");
@@ -779,30 +881,39 @@ mod tests {
 
     fn install_listener_runtime(
         runtime: &DataPlaneRuntime,
-    ) -> (NodeId, TcpQueue<BbrController>, Arc<Mutex<CaptureState>>) {
-        // The TLS worker-state slot holds a raw pointer (see
-        // `lookup::set_tcp_worker_state`). A stack local would dangle once this
-        // helper returns, so leak a heap allocation to give the state a stable
-        // address that stays valid for the whole test.
-        let owner: &'static mut TcpWorkerOwnedState =
-            Box::leak(Box::new(TcpWorkerOwnedState::new(DataWorkerId::new(0))));
-        super::set_tcp_worker_state(owner);
-        let handle = crate::session::node::register_session_queue(
-            TcpSessionDriver::<BbrController>::new(DataWorkerId::new(0), runtime.buffers().clone()),
-        )
-        .expect("register queue");
-        owner.insert_listener::<TcpIpv4ListenerAddress>(
-            TcpV4ListenerKey::new(0, LOCAL_IP, LOCAL_PORT),
-            LISTENER_ID,
-            TcpCapabilities {
-                fast_open: true,
-                ..TcpCapabilities::default()
-            },
+    ) -> (
+        NodeId,
+        SessionQueueHandle<
+            SessionDriverRuntime<
+                (TcpWorker<BbrController>, ()),
+                hammer_infra::segment::Local,
+                PoolIndex,
+            >,
+        >,
+        Arc<Mutex<CaptureState>>,
+    ) {
+        let worker = DataWorkerId::new(0);
+        let mut driver = SessionDriverRuntime::new(
+            worker,
+            runtime.buffers().clone(),
+            (TcpWorker::<BbrController>::new(worker), ()),
         );
+        driver
+            .transports_mut()
+            .0
+            .lookup
+            .insert_listener::<TcpIpv4ListenerAddress>(
+                TcpV4ListenerKey::new(0, LOCAL_IP, LOCAL_PORT),
+                LISTENER_ID,
+                TcpCapabilities {
+                    fast_open: true,
+                    ..TcpCapabilities::default()
+                },
+            );
+        let snapshot = driver.transports().0.lookup.publish_snapshot();
+        let handle = crate::session::node::register_session_queue(driver).expect("register queue");
         let control = TcpInputControlPlane::new();
-        control
-            .publish_lookup(owner.publish_snapshot())
-            .expect("publish lookup");
+        control.publish_lookup(snapshot).expect("publish lookup");
 
         let output_state = Arc::new(Mutex::new(CaptureState::default()));
         let capture = runtime
@@ -1052,16 +1163,18 @@ mod tests {
     }
 }
 
-fn tcp_handle_listener_packet<C>(
+fn tcp_handle_listener_packet<C, Seg>(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
-    queue: &mut crate::session::runtime::SessionDriverRuntime<TcpConnection<C>>,
+    queue: &mut SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>,
     listener_id: u32,
     capabilities: hammer_core::protocol::tcp::TcpCapabilities,
     packet: &TcpPacket,
 ) -> CoreResult<(Option<TcpSegment>, Option<SessionId>)>
 where
     C: CongestionController + 'static,
+    Seg: Segment,
+    crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     if packet.flags == TcpSegmentFlags::SYN {
         return tcp_issue_listener_challenge(
@@ -1079,20 +1192,22 @@ where
     Ok((None, None))
 }
 
-fn tcp_issue_listener_challenge<C>(
+fn tcp_issue_listener_challenge<C, Seg>(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
-    queue: &mut crate::session::runtime::SessionDriverRuntime<TcpConnection<C>>,
+    queue: &mut SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>,
     listener_id: u32,
     capabilities: hammer_core::protocol::tcp::TcpCapabilities,
     packet: &TcpPacket,
 ) -> CoreResult<(Option<TcpSegment>, Option<SessionId>)>
 where
     C: CongestionController + 'static,
+    Seg: Segment,
+    crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let fast_open_valid = if packet.payload_len != 0 && capabilities.fast_open {
         match packet.fast_open_cookie.as_ref() {
-            Some(cookie) => tcp_worker_state_mut().validate_fast_open_cookie(
+            Some(cookie) => queue.transports_mut().0.lookup.validate_fast_open_cookie(
                 listener_id,
                 packet.local,
                 packet.remote,
@@ -1114,7 +1229,7 @@ where
         );
     }
     let (begin_ok, sequence, fast_open_cookie) = {
-        let state = tcp_worker_state_mut();
+        let state = &mut queue.transports_mut().0.lookup;
         let begin_ok = state.begin_listener_pending(
             listener_id,
             packet.local,
@@ -1173,16 +1288,18 @@ where
     ))
 }
 
-fn tcp_accept_listener_fast_open<C>(
+fn tcp_accept_listener_fast_open<C, Seg>(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
-    queue: &mut crate::session::runtime::SessionDriverRuntime<TcpConnection<C>>,
+    queue: &mut SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>,
     listener_id: u32,
     capabilities: hammer_core::protocol::tcp::TcpCapabilities,
     packet: &TcpPacket,
 ) -> CoreResult<(Option<TcpSegment>, Option<SessionId>)>
 where
     C: CongestionController + 'static,
+    Seg: Segment,
+    crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let worker = queue.worker();
     let session_id = queue.insert_session_with_id(|session_id: SessionId| {
@@ -1221,35 +1338,44 @@ where
         }
         let enqueue = queue.enqueue_rx(session_id, index, 0, false)?;
         if matches!(enqueue, RxDelivery::InOrder { .. }) {
-            let mut context = queue.session_control_context(session_id);
-            context.mark_ready();
+            queue.mark_session_ready(session_id);
         }
-        tcp_worker_state_mut().finish_listener_pending(listener_id, packet.local, packet.remote);
+        queue.transports_mut().0.lookup.finish_listener_pending(
+            listener_id,
+            packet.local,
+            packet.remote,
+        );
         Ok((control, Some(session_id)))
     })();
     if result.is_err() {
-        tcp_worker_state_mut().forget_session(session_id);
-        tcp_worker_state_mut().forget_pending_open(session_id);
+        queue.transports_mut().0.lookup.forget_session(session_id);
+        queue
+            .transports_mut()
+            .0
+            .lookup
+            .forget_pending_open(session_id);
         let _ = queue.close_session(session_id)?;
     }
     result
 }
 
-fn tcp_complete_listener_open<C>(
-    queue: &mut crate::session::runtime::SessionDriverRuntime<TcpConnection<C>>,
+fn tcp_complete_listener_open<C, Seg>(
+    queue: &mut SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>,
     listener_id: u32,
     capabilities: hammer_core::protocol::tcp::TcpCapabilities,
     packet: &TcpPacket,
 ) -> CoreResult<(Option<TcpSegment>, Option<SessionId>)>
 where
     C: CongestionController + 'static,
+    Seg: Segment,
+    crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let Some(acknowledgment) = packet.acknowledgment else {
         return Ok((None, None));
     };
     let cookie = acknowledgment.raw().wrapping_sub(1);
     let pending = {
-        let state = tcp_worker_state_mut();
+        let state = &mut queue.transports_mut().0.lookup;
         match state.listener_pending(listener_id, packet.local, packet.remote) {
             Some((client_sequence, advertised_window, syn_capabilities, syn_timestamp))
                 if state.validate_listener_cookie(
@@ -1305,13 +1431,21 @@ where
             )?;
             connection.receive_final_ack(packet)?
         };
-        tcp_worker_state_mut().finish_listener_pending(listener_id, packet.local, packet.remote);
+        queue.transports_mut().0.lookup.finish_listener_pending(
+            listener_id,
+            packet.local,
+            packet.remote,
+        );
         publish_tcp_connection(queue, session_id)?;
         Ok((control, Some(session_id)))
     })();
     if result.is_err() {
-        tcp_worker_state_mut().forget_session(session_id);
-        tcp_worker_state_mut().forget_pending_open(session_id);
+        queue.transports_mut().0.lookup.forget_session(session_id);
+        queue
+            .transports_mut()
+            .0
+            .lookup
+            .forget_pending_open(session_id);
         let _ = queue.close_session(session_id)?;
     }
     result

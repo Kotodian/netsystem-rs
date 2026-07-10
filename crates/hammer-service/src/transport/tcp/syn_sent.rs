@@ -2,12 +2,16 @@ use hammer_core::data_plane::{BufferFrame, BufferIndex, NodeId};
 use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
 
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_infra::pool::Index as PoolIndex;
+use hammer_infra::segment::Segment;
 
 use super::publish_tcp_connection;
 use super::segment::tcp_packet;
-use super::{TCP_MAIN, TcpNodeError, TcpQueue, ensure_tcp_session_queue, read_session_id};
-use super::{tcp_worker_state, tcp_worker_state_mut};
+use super::{TCP_MAIN, TcpNodeError, TcpWorker, ensure_tcp_session_queue, read_session_id};
+use crate::session::SessionQueueHandle;
+use crate::session::app::SessionAppRuntimeCreate;
 use crate::session::runtime::RxDelivery;
+use crate::session::runtime::SessionDriverRuntime;
 use crate::transport::congestion::CongestionController;
 
 #[hammer_component_macros::node_next]
@@ -24,28 +28,34 @@ pub enum TcpSynSentNext {
     next = TcpSynSentNext,
     role = internal,
 )]
-pub struct TcpSynSentNode<C: CongestionController + 'static> {
-    session_queue: TcpQueue<C>,
+pub struct TcpSynSentNode<C: CongestionController + 'static, Seg: Segment> {
+    session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
 }
 
 pub fn register_tcp_syn_sent(runtime: &DataPlaneRuntime, worker: usize) -> CoreResult<NodeId> {
     crate::with_congestion!(|C| {
-        let queue_data = ensure_tcp_session_queue::<C>(runtime, worker)?;
-        let queue = TcpQueue::<C>::new(queue_data);
-        TCP_MAIN
-            .load()
-            .as_deref()
-            .ok_or_else(|| CoreError::internal("tcp main not initialized"))?;
-        runtime.nodes().try_register_internal_with_next_names(
-            TcpSynSentNode::<C>::new(queue, [NodeId::new(0); TcpSynSentNext::COUNT]),
-            &TcpSynSentNext::NEXT_NAMES,
-        )
+        crate::with_segment!(|Seg| {
+            let queue_data = ensure_tcp_session_queue::<C>(runtime, worker)?;
+            let queue = SessionQueueHandle::<
+                SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>,
+            >::new(queue_data);
+            TCP_MAIN
+                .load()
+                .as_deref()
+                .ok_or_else(|| CoreError::internal("tcp main not initialized"))?;
+            runtime.nodes().try_register_internal_with_next_names(
+                TcpSynSentNode::<C, Seg>::new(queue, [NodeId::new(0); TcpSynSentNext::COUNT]),
+                &TcpSynSentNext::NEXT_NAMES,
+            )
+        })
     })
 }
 
-impl<C> Node for TcpSynSentNode<C>
+impl<C, Seg> Node for TcpSynSentNode<C, Seg>
 where
     C: CongestionController + 'static,
+    Seg: Segment,
+    crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     #[inline(always)]
     fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
@@ -58,7 +68,7 @@ where
 
     #[inline]
     fn node_process(&self) -> NodeProcessFn {
-        tcp_syn_sent_process::<C>
+        tcp_syn_sent_process::<C, Seg>
     }
 
     #[inline]
@@ -67,29 +77,38 @@ where
     }
 }
 
-fn tcp_syn_sent_process<C>(
+fn tcp_syn_sent_process<C, Seg>(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> NodeResult
 where
     C: CongestionController + 'static,
+    Seg: Segment,
+    crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
-    let next = match TcpSynSentNode::<C>::runtime_nexts(runtime) {
+    let next = match TcpSynSentNode::<C, Seg>::runtime_nexts(runtime) {
         Ok(next) => next,
         Err(_) => return NodeResult::drop(),
     };
-    tcp_syn_sent_frame::<C>(runtime, frame, TcpQueue::<C>::new(data), next)
+    tcp_syn_sent_frame::<C, Seg>(
+        runtime,
+        frame,
+        SessionQueueHandle::<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>::new(data),
+        next,
+    )
 }
 
-fn tcp_syn_sent_frame<C>(
+fn tcp_syn_sent_frame<C, Seg>(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
-    session_queue: TcpQueue<C>,
+    session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
     next: [NodeId; TcpSynSentNext::COUNT],
 ) -> NodeResult
 where
     C: CongestionController + 'static,
+    Seg: Segment,
+    crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let tcp_output = next[TcpSynSentNext::Output as usize];
     let drop_next = next[TcpSynSentNext::Drop as usize];
@@ -109,14 +128,16 @@ where
     NodeResult::drop()
 }
 
-fn tcp_syn_sent_index<C>(
+fn tcp_syn_sent_index<C, Seg>(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
-    session_queue: TcpQueue<C>,
+    session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
     tcp_output: NodeId,
 ) -> CoreResult<bool>
 where
     C: CongestionController + 'static,
+    Seg: Segment,
+    crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let packet = tcp_packet(runtime, index)?;
     let mut tx_frame = None;
@@ -129,7 +150,10 @@ where
             TcpNodeError::SynSentSessionRouteMissing
         })?;
         let (control, acked_tx_len, established, established_with_payload) = {
-            let local_capabilities = tcp_worker_state()
+            let local_capabilities = queue
+                .transports()
+                .0
+                .lookup
                 .pending_open_capabilities(session_id)
                 .unwrap_or_default();
             let connection = queue.session_mut(session_id).ok_or_else(|| {
@@ -154,7 +178,7 @@ where
             queue.ack_tx_up_to(session_id, acked_tx_len as usize)?;
         }
         if let Some(cookie) = packet.fast_open_cookie.filter(|cookie| !cookie.is_empty()) {
-            tcp_worker_state_mut().remember_fast_open_cookie(
+            queue.transports_mut().0.lookup.remember_fast_open_cookie(
                 packet.local,
                 packet.remote,
                 cookie,
@@ -169,8 +193,7 @@ where
             }
             let enqueue = queue.enqueue_rx(session_id, index, 0, false)?;
             if matches!(enqueue, RxDelivery::InOrder { .. }) {
-                let mut context = queue.session_control_context(session_id);
-                context.mark_ready();
+                queue.mark_session_ready(session_id);
             }
             keep_current = false;
         };
@@ -206,14 +229,16 @@ fn prefetch_tcp_syn_sent(runtime: &DataPlaneRuntime, indices: &[BufferIndex]) {
 }
 
 #[inline(always)]
-fn tcp_syn_sent_enqueue_index<C>(
+fn tcp_syn_sent_enqueue_index<C, Seg>(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
-    session_queue: TcpQueue<C>,
+    session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
     tcp_output: NodeId,
 ) -> CoreResult<bool>
 where
     C: CongestionController + 'static,
+    Seg: Segment,
+    crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     match tcp_syn_sent_index(runtime, index, session_queue, tcp_output) {
         Ok(keep_current) => Ok(keep_current),
@@ -222,22 +247,23 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+mod legacy_tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::{Arc, Mutex, OnceLock};
 
     use crate::data_plane::DropNode;
     use crate::net::NetworkOpaque;
+    use crate::session::SessionQueueHandle;
+    use crate::session::runtime::SessionDriverRuntime;
     use crate::transport::congestion::BbrController;
     use crate::transport::tcp::input::TcpInputControlPlane;
     use crate::transport::tcp::lookup::TcpLookupSnapshot;
     use crate::transport::tcp::output::{TcpOutputNext, TcpOutputNode};
-    use crate::transport::tcp::{
-        TcpInputNext, TcpQueue, TcpSessionDriver, TcpWorkerOwnedState, connect_tcp_session,
-        set_tcp_worker_state,
-    };
+    use crate::transport::tcp::{TcpInputNext, TcpWorker, connect_tcp_session};
     use hammer_core::data_plane::{BufferPacketCursor, NodeId};
     use hammer_core::error::CoreError;
+    use hammer_infra::pool::Index as PoolIndex;
+    use hammer_infra::segment::Local;
     use hammer_runtime::{DataWorkerId, InternalNode};
 
     use super::*;
@@ -323,7 +349,11 @@ mod tests {
         NodeResult::drop()
     }
 
-    fn open_client_session(handle: TcpQueue<BbrController>) -> (crate::session::SessionId, u32) {
+    fn open_client_session(
+        handle: SessionQueueHandle<
+            SessionDriverRuntime<(TcpWorker<BbrController>, ()), Local, PoolIndex>,
+        >,
+    ) -> (crate::session::SessionId, u32) {
         let mut queue = handle.borrow_mut().expect("tcp queue");
         let session_id =
             connect_tcp_session(&mut queue, local_addr(), remote_addr()).expect("connect session");
@@ -343,7 +373,9 @@ mod tests {
 
     fn tcp_input_node(
         runtime: &DataPlaneRuntime,
-        handle: TcpQueue<BbrController>,
+        handle: SessionQueueHandle<
+            SessionDriverRuntime<(TcpWorker<BbrController>, ()), Local, PoolIndex>,
+        >,
         syn_sent: NodeId,
         drop: NodeId,
     ) -> NodeId {

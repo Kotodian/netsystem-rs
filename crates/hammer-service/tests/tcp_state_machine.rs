@@ -163,6 +163,36 @@ fn timer_refresh_loops_consolidated_into_shared_helper() {
 }
 
 #[test]
+fn tcp_receive_hot_paths_do_not_clone_connections_for_timer_or_lookup_sync() {
+    for path in [
+        "src/transport/tcp/established.rs",
+        "src/transport/tcp/rcv_process.rs",
+    ] {
+        let source = read_tcp_source(path);
+        assert!(
+            !source.contains(".clone();"),
+            "{path} must not deep-clone TcpConnection on the receive hot path"
+        );
+    }
+
+    let source = read_tcp_source("src/transport/tcp/mod.rs");
+    let start = source
+        .find("fn publish_tcp_connection")
+        .expect("publish_tcp_connection");
+    let end = source[start..]
+        .find("\n}\n")
+        .expect("publish_tcp_connection end");
+    assert!(
+        !source[start..start + end].contains(".clone()"),
+        "lookup publication must borrow the worker-owned connection"
+    );
+    assert!(
+        !source.contains("*const TcpConnection"),
+        "timer synchronization must not bypass driver borrowing with a raw connection pointer"
+    );
+}
+
+#[test]
 fn input_path_session_slot_prefetch_is_wired() {
     // Source-level smoke guard: the established and rcv_process input nodes
     // must call `queue.prefetch_session(session_id)` after resolving the

@@ -23,11 +23,6 @@ pub fn install_worker_graph(engine: &mut Engine) -> HammerResult<()> {
     engine.runtime.set_handoff_node_handle(handle);
 
     let worker = engine.thread_index as usize;
-    let worker_id = hammer_runtime::DataWorkerId::new(engine.thread_index);
-
-    crate::transport::tcp::install_tcp_worker_state(
-        crate::transport::tcp::TcpWorkerOwnedState::new(worker_id),
-    );
     engine.runtime.init_graph(worker, &SERVICE_GRAPH_NODES)?;
     crate::net::wire_ip_lookup_drop(&engine.runtime)?;
     crate::transport::tcp::wire_worker_graph(&engine.runtime, worker)?;

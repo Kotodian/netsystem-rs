@@ -1,15 +1,19 @@
 use crate::session::runtime::RxDelivery;
 use hammer_core::data_plane::{BufferFrame, BufferIndex, NodeId};
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_infra::pool::Index as PoolIndex;
+use hammer_infra::segment::Segment;
 use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
 
 use super::segment::tcp_packet;
-use super::tcp_worker_state_mut;
 use super::{
     TCP_MAIN, TCP_TIMER_DELAYED_ACK, TCP_TIMER_KEEP_ALIVE, TCP_TIMER_PACING, TCP_TIMER_PERSIST,
-    TCP_TIMER_RACK, TCP_TIMER_RETRANSMIT, TCP_TIMER_TLP, TcpNodeError, TcpQueue,
-    TcpWorkerOwnedState, ensure_tcp_session_queue, read_session_id,
+    TCP_TIMER_RACK, TCP_TIMER_RETRANSMIT, TCP_TIMER_TLP, TcpNodeError, TcpWorker,
+    ensure_tcp_session_queue, publish_tcp_connection, read_session_id,
 };
+use crate::session::SessionQueueHandle;
+use crate::session::app::SessionAppRuntimeCreate;
+use crate::session::runtime::SessionDriverRuntime;
 use crate::transport::congestion::CongestionController;
 
 #[hammer_component_macros::node_next]
@@ -26,28 +30,37 @@ pub enum TcpEstablishedNext {
     next = TcpEstablishedNext,
     role = internal,
 )]
-pub struct TcpEstablishedNode<C: CongestionController + 'static> {
-    session_queue: TcpQueue<C>,
+pub struct TcpEstablishedNode<C: CongestionController + 'static, Seg: Segment> {
+    session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
 }
 
 pub fn register_tcp_established(runtime: &DataPlaneRuntime, worker: usize) -> CoreResult<NodeId> {
     crate::with_congestion!(|C| {
-        let queue_data = ensure_tcp_session_queue::<C>(runtime, worker)?;
-        let queue = TcpQueue::<C>::new(queue_data);
-        TCP_MAIN
-            .load()
-            .as_deref()
-            .ok_or_else(|| CoreError::internal("tcp main not initialized"))?;
-        runtime.nodes().try_register_internal_with_next_names(
-            TcpEstablishedNode::<C>::new(queue, [NodeId::new(0); TcpEstablishedNext::COUNT]),
-            &TcpEstablishedNext::NEXT_NAMES,
-        )
+        crate::with_segment!(|Seg| {
+            let queue_data = ensure_tcp_session_queue::<C>(runtime, worker)?;
+            let queue = SessionQueueHandle::<
+                SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>,
+            >::new(queue_data);
+            TCP_MAIN
+                .load()
+                .as_deref()
+                .ok_or_else(|| CoreError::internal("tcp main not initialized"))?;
+            runtime.nodes().try_register_internal_with_next_names(
+                TcpEstablishedNode::<C, Seg>::new(
+                    queue,
+                    [NodeId::new(0); TcpEstablishedNext::COUNT],
+                ),
+                &TcpEstablishedNext::NEXT_NAMES,
+            )
+        })
     })
 }
 
-impl<C> Node for TcpEstablishedNode<C>
+impl<C, Seg> Node for TcpEstablishedNode<C, Seg>
 where
     C: CongestionController + 'static,
+    Seg: Segment,
+    crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     #[inline(always)]
     fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
@@ -60,7 +73,7 @@ where
 
     #[inline]
     fn node_process(&self) -> NodeProcessFn {
-        tcp_established_process::<C>
+        tcp_established_process::<C, Seg>
     }
 
     #[inline]
@@ -69,29 +82,38 @@ where
     }
 }
 
-fn tcp_established_process<C>(
+fn tcp_established_process<C, Seg>(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> NodeResult
 where
     C: CongestionController + 'static,
+    Seg: Segment,
+    crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
-    let next = match TcpEstablishedNode::<C>::runtime_nexts(runtime) {
+    let next = match TcpEstablishedNode::<C, Seg>::runtime_nexts(runtime) {
         Ok(next) => next,
         Err(_) => return NodeResult::drop(),
     };
-    tcp_established_frame::<C>(runtime, frame, TcpQueue::<C>::new(data), next)
+    tcp_established_frame::<C, Seg>(
+        runtime,
+        frame,
+        SessionQueueHandle::<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>::new(data),
+        next,
+    )
 }
 
-fn tcp_established_frame<C>(
+fn tcp_established_frame<C, Seg>(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
-    session_queue: TcpQueue<C>,
+    session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
     next: [NodeId; TcpEstablishedNext::COUNT],
 ) -> NodeResult
 where
     C: CongestionController + 'static,
+    Seg: Segment,
+    crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let tcp_output = next[TcpEstablishedNext::Output as usize];
     let drop_next = next[TcpEstablishedNext::Drop as usize];
@@ -108,14 +130,16 @@ where
     NodeResult::drop()
 }
 
-fn tcp_established_index<C>(
+fn tcp_established_index<C, Seg>(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
-    session_queue: TcpQueue<C>,
+    session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
     tcp_output: NodeId,
 ) -> CoreResult<()>
 where
     C: CongestionController + 'static,
+    Seg: Segment,
+    crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let packet = tcp_packet(runtime, index)?;
     let mut tx_segment = None;
@@ -160,8 +184,7 @@ where
             queue.ack_tx_up_to(session_id, acked_tx_len as usize)?;
         }
         if ack_advanced && queue.app().pending_send_len(session_id)?.is_some() {
-            let mut context = queue.session_control_context(session_id);
-            context.mark_ready();
+            queue.mark_session_ready(session_id);
         }
         let mut immediate_ack = false;
         if let Some((trim, offset)) = accept_payload {
@@ -199,8 +222,7 @@ where
                 true
             };
             if matches!(delivery, RxDelivery::InOrder { .. }) {
-                let mut context = queue.session_control_context(session_id);
-                context.mark_ready();
+                queue.mark_session_ready(session_id);
             }
             match delivery {
                 RxDelivery::NotAccepted { .. } => {}
@@ -249,32 +271,27 @@ where
                 hammer_core::protocol::tcp::TcpCapabilities::default(),
             ));
         }
-        let has_pending_tx = queue.app().has_pending_send(session_id);
-        let connection: *const crate::transport::tcp::TcpConnection<C> =
-            queue.session(session_id).ok_or_else(|| {
+        let now = std::time::Instant::now();
+        let timer_ticks = {
+            let connection = queue.session(session_id).ok_or_else(|| {
                 let _ = runtime
                     .record_current_node_error(TcpNodeError::EstablishedSessionMissing.code());
                 TcpNodeError::EstablishedSessionMissing
-            })? as *const _;
-        let mut context = queue.session_control_context(session_id);
-        context.refresh_has_pending_tx(has_pending_tx);
-        let now = std::time::Instant::now();
-        let connection = unsafe { &*connection };
+            })?;
+            std::array::from_fn(|timer_id| {
+                let timer_id = timer_id as u32;
+                connection
+                    .timer_is_active(timer_id)
+                    .then(|| connection.timer_ticks(timer_id, now))
+                    .flatten()
+            })
+        };
         crate::transport::tcp::sync_all_tcp_timers(
-            context.timer_wheel(),
-            connection,
+            queue.timers_mut(),
+            timer_ticks,
             session_id.pool_index(),
-            now,
         )?;
-        let connection = queue.session(session_id).ok_or_else(|| {
-            let _ =
-                runtime.record_current_node_error(TcpNodeError::EstablishedSessionMissing.code());
-            TcpNodeError::EstablishedSessionMissing
-        })? as *const _;
-        let protocol = tcp_worker_state_mut() as *mut TcpWorkerOwnedState;
-        if unsafe { (*protocol).publish_connection(session_id, &*connection) } {
-            let _ = queue.close_session(session_id)?;
-        }
+        publish_tcp_connection(&mut queue, session_id)?;
         if tx_segment.is_none() {
             tx_segment = control;
         }

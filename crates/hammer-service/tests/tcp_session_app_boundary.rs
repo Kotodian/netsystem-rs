@@ -87,24 +87,37 @@ fn session_app_runtime_local_has_static_dispatch() {
 }
 
 #[test]
-fn insert_session_with_id_is_generic_over_segment() {
+fn session_creation_is_generic_over_segment_and_tcp_owned() {
     let runtime_source = include_str!("../src/session/runtime.rs");
+    let tcp_source = include_str!("../src/transport/tcp/mod.rs");
 
     let fn_pos = runtime_source
-        .find("fn insert_session_with_id")
-        .expect("insert_session_with_id must be defined");
+        .find("fn insert_session_with_transport")
+        .expect("insert_session_with_transport must be defined");
     let preceding = &runtime_source[..fn_pos];
     let last_impl = preceding
         .rfind("impl<")
-        .expect("insert_session_with_id must live inside an impl block");
+        .expect("insert_session_with_transport must live inside an impl block");
     let impl_block = &preceding[last_impl..];
     assert!(
         impl_block.contains("Seg: Segment") || impl_block.contains("Seg,"),
-        "insert_session_with_id must be in a generic Seg impl block, not a Local-only block; got impl header: {impl_block:?}"
+        "insert_session_with_transport must be generic over Seg; got impl header: {impl_block:?}"
     );
     assert!(
         runtime_source.contains("create_app_session"),
-        "insert_session_with_id must call SessionAppRuntime::create_app_session"
+        "generic session creation must call SessionAppRuntime::create_app_session"
+    );
+    assert!(
+        tcp_source.contains("fn insert_session_with_id"),
+        "TCP must own its connection-aware session insertion entry point"
+    );
+    assert!(
+        tcp_source.contains("transports.0.insert_connection"),
+        "TCP session insertion must place connections in TcpWorker storage"
+    );
+    assert!(
+        tcp_source.contains("self.insert_session_with_transport("),
+        "TCP session insertion must delegate generic lifecycle creation to session runtime"
     );
     assert!(
         !runtime_source.contains("Box<dyn"),
@@ -153,5 +166,9 @@ fn ensure_tcp_session_queue_dispatches_to_svm() {
     assert!(
         tcp_mod_source.contains("new("),
         "ensure_tcp_session_queue must use new() for Local backend"
+    );
+    assert!(
+        !tcp_mod_source.contains("pub fn register_tcp_input<C, Seg>"),
+        "TcpMain must not expose a generic segment that can disagree with the configured backend"
     );
 }

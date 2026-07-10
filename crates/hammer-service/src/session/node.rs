@@ -259,11 +259,11 @@ fn session_queue_node_process(
 
 pub(crate) fn register_session_queue<Q: 'static>(queue: Q) -> CoreResult<SessionQueueHandle<Q>> {
     let queue = Box::leak(Box::new(RefCell::new(queue)));
-    let runtime_data = session_queue_runtime_data(queue)?;
+    let runtime_data = session_queue_node_runtime_data(queue)?;
     Ok(SessionQueueHandle::new(runtime_data))
 }
 
-fn session_queue_runtime_data<Q>(queue: &'static RefCell<Q>) -> CoreResult<NodeRuntimeData> {
+fn session_queue_node_runtime_data<Q>(queue: &'static RefCell<Q>) -> CoreResult<NodeRuntimeData> {
     Ok(NodeRuntimeData::from_words([
         u64::try_from(queue as *const _ as usize)
             .map_err(|_| CoreError::internal("session queue pointer overflow"))?,
@@ -282,3 +282,7 @@ fn session_queue_cell<Q>(data: NodeRuntimeData) -> CoreResult<&'static RefCell<Q
     // recovery.
     unsafe { ptr.as_ref() }.ok_or_else(|| CoreError::internal("session queue is missing"))
 }
+
+#[cfg(test)]
+#[path = "node/tests.rs"]
+mod tests;

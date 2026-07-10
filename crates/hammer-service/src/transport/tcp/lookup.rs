@@ -1,4 +1,3 @@
-use std::cell::{Cell, RefCell};
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -13,49 +12,13 @@ use hammer_core::protocol::transport::TransportConnectionKey;
 use hammer_infra::bihash::{Bihash, BihashKey, FREE_U64};
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::vec::Vec;
-use hammer_runtime::{DataWorkerId, NodeRuntimeData};
+use hammer_runtime::DataWorkerId;
 
 use crate::session::SessionId;
 use crate::transport::congestion::CongestionController;
 use crate::transport::tcp::{TcpConnection, TcpInputNext, TcpState};
 
 pub type TcpLookupId = u32;
-
-thread_local! {
-    static TCP_WORKER_STATE: Cell<*mut TcpWorkerOwnedState> = const { Cell::new(std::ptr::null_mut()) };
-    static TCP_WORKER_STATE_OWNER: RefCell<Option<Box<TcpWorkerOwnedState>>> = const { RefCell::new(None) };
-}
-
-pub(crate) fn set_tcp_worker_state(state: &mut TcpWorkerOwnedState) {
-    TCP_WORKER_STATE.with(|cell| cell.set(state as *mut _));
-}
-
-// VPP alignment: `vlib_worker_threads` set up `vlib_per_thread_main` at worker
-// thread entry before the worker's first frame dispatch. `install_tcp_worker_state`
-// is the Rust mirror: it moves a `TcpWorkerOwnedState` into per-thread ownership
-// (so the box is dropped when the worker thread exits) and points
-// `TCP_WORKER_STATE` at it. Must be called on the worker thread before any
-// graph-wiring reads `tcp_worker_state()` (e.g. `init_graph` / `wire_worker_graph`).
-pub(crate) fn install_tcp_worker_state(state: TcpWorkerOwnedState) {
-    let mut boxed = Box::new(state);
-    let ptr: *mut TcpWorkerOwnedState = &mut *boxed;
-    TCP_WORKER_STATE_OWNER.with(|slot| {
-        *slot.borrow_mut() = Some(boxed);
-    });
-    TCP_WORKER_STATE.with(|cell| cell.set(ptr));
-}
-
-pub(crate) fn tcp_worker_state() -> &'static TcpWorkerOwnedState {
-    let ptr = TCP_WORKER_STATE.with(|cell| cell.get());
-    assert!(!ptr.is_null(), "TCP worker state not initialized");
-    unsafe { &*ptr }
-}
-
-pub(crate) fn tcp_worker_state_mut() -> &'static mut TcpWorkerOwnedState {
-    let ptr = TCP_WORKER_STATE.with(|cell| cell.get());
-    assert!(!ptr.is_null(), "TCP worker state not initialized");
-    unsafe { &mut *ptr }
-}
 
 struct TcpConnectionRouteIndex {
     entries: Pool<TcpConnectionRouteEntry>,
@@ -1249,7 +1212,7 @@ impl Clone for TcpPendingRouteIndex {
     }
 }
 
-pub struct TcpWorkerOwnedStateCacheline0 {
+pub struct TcpLookupStateCacheline0 {
     #[cfg(test)]
     owner_worker: DataWorkerId,
     #[cfg(test)]
@@ -1258,13 +1221,9 @@ pub struct TcpWorkerOwnedStateCacheline0 {
     pending: TcpPendingRouteIndex,
     #[cfg(test)]
     next_iss: u32,
-    /// Per-worker session-queue runtime data for the TCP input node's
-    /// `TcpQueue<C>`. Owned by the worker thread (this TLS); never shared
-    /// across workers, so no synchronization is needed.
-    queue_runtime_data: Option<NodeRuntimeData>,
 }
 
-struct TcpWorkerOwnedStateCacheline1 {
+struct TcpLookupStateCacheline1 {
     fast_open_cache: Vec<TcpFastOpenCacheEntry>,
     fast_open_cache_index_v4: Bihash<TransportConnectionKey<Ipv4Addr>, 3>,
     fast_open_cache_index_v6: Bihash<TransportConnectionKey<Ipv6Addr>, 1>,
@@ -1273,13 +1232,13 @@ struct TcpWorkerOwnedStateCacheline1 {
     listener_cookie_secrets: Vec<TcpFastOpenSecret>,
 }
 
-pub struct TcpWorkerOwnedState {
-    cacheline0: CachePadded<TcpWorkerOwnedStateCacheline0>,
-    cacheline1: CachePadded<TcpWorkerOwnedStateCacheline1>,
+pub struct TcpLookupState {
+    cacheline0: CachePadded<TcpLookupStateCacheline0>,
+    cacheline1: CachePadded<TcpLookupStateCacheline1>,
 }
 
-impl Deref for TcpWorkerOwnedState {
-    type Target = TcpWorkerOwnedStateCacheline0;
+impl Deref for TcpLookupState {
+    type Target = TcpLookupStateCacheline0;
 
     #[inline]
     fn deref(&self) -> &Self::Target {
@@ -1287,20 +1246,20 @@ impl Deref for TcpWorkerOwnedState {
     }
 }
 
-impl DerefMut for TcpWorkerOwnedState {
+impl DerefMut for TcpLookupState {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.cacheline0
     }
 }
 
-impl TcpWorkerOwnedState {
+impl TcpLookupState {
     #[inline]
     pub(crate) fn new(owner_worker: DataWorkerId) -> Self {
         #[cfg(not(test))]
         let _ = owner_worker;
         Self {
-            cacheline0: CachePadded::new(TcpWorkerOwnedStateCacheline0 {
+            cacheline0: CachePadded::new(TcpLookupStateCacheline0 {
                 #[cfg(test)]
                 owner_worker,
                 #[cfg(test)]
@@ -1309,9 +1268,8 @@ impl TcpWorkerOwnedState {
                 pending: TcpPendingRouteIndex::empty(),
                 #[cfg(test)]
                 next_iss: 81_000,
-                queue_runtime_data: None,
             }),
-            cacheline1: CachePadded::new(TcpWorkerOwnedStateCacheline1 {
+            cacheline1: CachePadded::new(TcpLookupStateCacheline1 {
                 fast_open_cache: Vec::new(),
                 fast_open_cache_index_v4: Bihash::new(64),
                 fast_open_cache_index_v6: Bihash::new(64),
@@ -1326,20 +1284,6 @@ impl TcpWorkerOwnedState {
     #[inline]
     pub(crate) fn owner_worker(&self) -> DataWorkerId {
         self.owner_worker
-    }
-
-    /// Per-worker TCP session-queue runtime data, set once by
-    /// `TcpMain::register_tcp_input` when it first builds the worker's
-    /// `TcpQueue<C>`. Read back on subsequent registrations of the same
-    /// worker's TCP input node. Worker-local, no locking.
-    #[inline]
-    pub(crate) fn queue_runtime_data(&self) -> Option<NodeRuntimeData> {
-        self.queue_runtime_data
-    }
-
-    #[inline]
-    pub(crate) fn set_queue_runtime_data(&mut self, data: NodeRuntimeData) {
-        self.queue_runtime_data = Some(data);
     }
 
     #[cfg(test)]
@@ -2101,7 +2045,7 @@ fn hash_socket_addr(hasher: &mut impl Hasher, addr: SocketAddr) {
 mod tests {
     use super::{
         TcpConnectionRouteIndex, TcpInputNext, TcpIpv4ListenerAddress, TcpListenerTable,
-        TcpLookupValue, TcpV4ListenerKey, TcpWorkerOwnedState, pool_index_from_bihash_value,
+        TcpLookupState, TcpLookupValue, TcpV4ListenerKey, pool_index_from_bihash_value,
         pool_index_to_bihash_value, write_bytes,
     };
     use hammer_core::protocol::tcp::{TcpCapabilities, TcpFastOpenCookie};
@@ -2112,8 +2056,8 @@ mod tests {
 
     use crate::session::SessionId;
 
-    fn worker_state() -> TcpWorkerOwnedState {
-        TcpWorkerOwnedState::new(DataWorkerId::new(0))
+    fn worker_state() -> TcpLookupState {
+        TcpLookupState::new(DataWorkerId::new(0))
     }
 
     fn socket_pair() -> (SocketAddr, SocketAddr) {
@@ -2214,7 +2158,7 @@ mod tests {
 
     #[test]
     fn tcp_fast_open_cache_bihash_updates_existing_tuple() {
-        let mut state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
+        let mut state = TcpLookupState::new(DataWorkerId::new(0));
         let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
         let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 50_000);
         let first = TcpFastOpenCookie::try_from(&[1, 2, 3, 4][..]).expect("first cookie");

@@ -25,6 +25,8 @@ use hammer_infra::vec::Vec;
 use hammer_runtime::DataWorkerId;
 use thiserror::Error;
 
+use crate::session::SessionId;
+
 const TCP_MAX_WINDOW_SCALE: u8 = 14;
 const DEFAULT_TCP_WINDOW: u32 = u16::MAX as u32;
 const DEFAULT_TCP_MAX_SEGMENT_SIZE: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
@@ -46,19 +48,13 @@ pub const TCP_TIMER_PACING: u32 = 7;
 pub const TCP_TIMER_COUNT: u32 = 8;
 const TCP_DELAYED_ACK_TICKS: u64 = 1;
 
-pub(crate) fn sync_tcp_timer<C>(
+pub(crate) fn sync_tcp_timer(
     timers: &mut hammer_infra::timer_wheel::TimerWheel1t2w2048sl<u32>,
-    connection: &TcpConnection<C>,
+    ticks: Option<u64>,
     session: hammer_infra::pool::Index,
     timer_id: u32,
-    now: Instant,
-) -> CoreResult<()>
-where
-    C: CongestionController + 'static,
-{
-    if connection.timer_is_active(timer_id)
-        && let Some(ticks) = connection.timer_ticks(timer_id, now)
-    {
+) -> CoreResult<()> {
+    if let Some(ticks) = ticks {
         timers
             .update_timer(session.slot(), session.generation(), timer_id, ticks)
             .map_err(|_| TcpNodeError::TimerUpdateFailed)?;
@@ -68,17 +64,13 @@ where
     Ok(())
 }
 
-pub(crate) fn sync_all_tcp_timers<C>(
+pub(crate) fn sync_all_tcp_timers(
     timers: &mut hammer_infra::timer_wheel::TimerWheel1t2w2048sl<u32>,
-    connection: &TcpConnection<C>,
+    timer_ticks: [Option<u64>; TCP_TIMER_COUNT as usize],
     session: hammer_infra::pool::Index,
-    now: Instant,
-) -> CoreResult<()>
-where
-    C: CongestionController + 'static,
-{
-    for timer_id in 0..TCP_TIMER_COUNT {
-        sync_tcp_timer(timers, connection, session, timer_id, now)?;
+) -> CoreResult<()> {
+    for (timer_id, ticks) in timer_ticks.into_iter().enumerate() {
+        sync_tcp_timer(timers, ticks, session, timer_id as u32)?;
     }
     Ok(())
 }
@@ -284,6 +276,7 @@ pub struct TcpConnectionCacheline0 {
 
 #[derive(Debug, Clone)]
 struct TcpConnectionCacheline1 {
+    session_id: SessionId,
     connection_id: Option<TcpConnectionId>,
     owner_worker: DataWorkerId,
     close_reason: Option<TcpCloseReason>,
@@ -387,6 +380,7 @@ where
         local: Option<SocketAddr>,
         remote: SocketAddr,
     ) -> Self {
+        let session_id = SessionId::new(connection_id.map_or(0, TcpConnectionId::get));
         Self {
             cacheline0: CachePadded::new(TcpConnectionCacheline0 {
                 state: TcpState::Closed,
@@ -408,6 +402,7 @@ where
                 bytes_in_flight_cached: 0,
             }),
             cacheline1: CachePadded::new(TcpConnectionCacheline1 {
+                session_id,
                 connection_id,
                 owner_worker,
                 close_reason: None,
@@ -445,6 +440,11 @@ where
     #[inline]
     pub fn connection_id(&self) -> Option<TcpConnectionId> {
         self.cacheline1.connection_id
+    }
+
+    #[inline]
+    pub(crate) fn session_id(&self) -> SessionId {
+        self.cacheline1.session_id
     }
 
     #[inline]
@@ -3859,7 +3859,9 @@ mod tests {
 
     use crate::session::SessionId;
     use crate::session::runtime::SessionDriverRuntime;
-    use crate::transport::tcp::closing_session_for_test;
+    use crate::transport::tcp::{TcpWorker, closing_session_for_test};
+    use hammer_infra::pool::Index as PoolIndex;
+    use hammer_infra::segment::Local;
 
     fn peer_fin_packet(
         local: SocketAddr,
@@ -3885,7 +3887,7 @@ mod tests {
     }
 
     fn drive_fin_ack_to_time_wait<C>(
-        driver: &mut SessionDriverRuntime<TcpConnection<C>>,
+        driver: &mut SessionDriverRuntime<(TcpWorker<C>, ()), Local, PoolIndex>,
         session_id: SessionId,
         local: SocketAddr,
         remote: SocketAddr,
@@ -3924,19 +3926,22 @@ mod tests {
             std::time::Instant::now()
         };
         let session = session_id.pool_index();
-        let connection: *const TcpConnection<C> =
-            driver.session(session_id).expect("connection") as *const _;
-        crate::transport::tcp::sync_all_tcp_timers(
-            driver.timers_mut(),
-            unsafe { &*connection },
-            session,
-            now,
-        )
-        .expect("sync time wait timer");
+        let timer_ticks = {
+            let connection = driver.session(session_id).expect("connection");
+            std::array::from_fn(|timer_id| {
+                let timer_id = timer_id as u32;
+                connection
+                    .timer_is_active(timer_id)
+                    .then(|| connection.timer_ticks(timer_id, now))
+                    .flatten()
+            })
+        };
+        crate::transport::tcp::sync_all_tcp_timers(driver.timers_mut(), timer_ticks, session)
+            .expect("sync time wait timer");
     }
 
     fn enter_close_wait_for_passive_close_test(
-        driver: &mut SessionDriverRuntime<TcpConnection<BbrController>>,
+        driver: &mut SessionDriverRuntime<(TcpWorker<BbrController>, ()), Local, PoolIndex>,
         session_id: SessionId,
         local: SocketAddr,
         remote: SocketAddr,

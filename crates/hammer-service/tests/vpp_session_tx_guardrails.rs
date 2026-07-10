@@ -62,8 +62,8 @@ fn session_runtime_only_consumes_send_goal_size_for_gso_shaping() {
 
 #[test]
 fn tcp_push_header_does_not_allocate_std_vec_for_batch_commit() {
-    let source = read_source("src/transport/tcp/mod.rs");
-    let push_header = source_between(&source, "    fn push_header(", "    fn custom_tx(");
+    let source = read_source("src/transport/tcp/worker.rs");
+    let push_header = source_between(&source, "    fn tx_action(", "\n    }\n}");
 
     assert!(!push_header.contains("std::vec::Vec::with_capacity"));
     assert!(!push_header.contains("std::vec!"));
