@@ -358,7 +358,7 @@ git commit -m "hammer-service(Refactor): move TCP state behind transport seam"
 - Create: `crates/hammer-service/src/transport/tcp/timers.rs`
 - Modify: `crates/hammer-service/src/transport/tcp/{mod,worker,connection}.rs`
 
-- [ ] **Step 1: Write failing exact-token state tests**
+- [x] **Step 1: Write failing exact-token state tests**
 
 Add tests with these exact names:
 
@@ -372,7 +372,7 @@ tcp_timer_update_preserves_the_new_deadline
 
 The rearm test must prove stale behavior through `pending` plus newly `armed`; do not add an epoch/nonce field.
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
 Run:
 
@@ -382,7 +382,7 @@ cargo test -p hammer-service --lib transport::tcp::timers::tests -- --nocapture
 
 Expected: FAIL because the private typed engine does not exist.
 
-- [ ] **Step 3: Implement approved typed timer state**
+- [x] **Step 3: Implement approved typed timer state**
 
 Implement exactly the approved private shapes:
 
@@ -425,11 +425,11 @@ struct TcpTimerToken {
 
 `TcpTimerState::is_active` means armed OR pending. Expiry removes armed and inserts pending. Reset clears both. Rearm while pending leaves pending present and sets armed; dispatch clears pending and skips the old token when armed is present.
 
-- [ ] **Step 4: Implement immediate set/update/reset and absolute-time advance**
+- [x] **Step 4: Implement immediate set/update/reset and absolute-time advance**
 
 `TcpTimers::{set, update, reset}` receive the generation-safe index plus `&mut TcpTimerState` and synchronize the wheel immediately. Convert durations to ticks with ceiling division and a minimum of one tick. `advance(now, connections)` converts one absolute `Instant` using the private resolution, validates pool generations, moves exact states to pending, and queues exact tokens. It must not depend on SessionWorker.
 
-- [ ] **Step 5: Run timer tests and commit**
+- [x] **Step 5: Run timer tests and commit**
 
 Run:
 
