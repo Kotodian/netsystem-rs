@@ -10,18 +10,20 @@ use super::TcpNodeError;
 use super::connection::TcpConnection;
 use crate::transport::congestion::CongestionController;
 
-const TCP_TIMER_KIND_COUNT: usize = 8;
+const TCP_TIMER_MAX_TICKS_PER_UPDATE: u32 = 1_024;
+const TCP_TIMER_EXPIRY_BUDGET: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
 pub(super) enum TcpTimerKind {
-    Retransmit,
-    Rack,
-    Tlp,
-    DelayedAck,
-    Persist,
-    KeepAlive,
-    TimeWait,
-    Pacing,
+    Retransmit = 0,
+    Rack = 1,
+    Tlp = 2,
+    DelayedAck = 3,
+    Persist = 4,
+    KeepAlive = 5,
+    TimeWait = 6,
+    Pacing = 7,
 }
 
 impl TcpTimerKind {
@@ -51,9 +53,11 @@ impl TcpTimerKind {
     }
 }
 
+const TCP_TIMER_KIND_COUNT: usize = TcpTimerKind::Pacing.id() as usize + 1;
+
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-    pub(super) struct TcpTimerSet: u16 {
+    struct TcpTimerSet: u16 {
         const RETRANSMIT = 1 << 0;
         const RACK = 1 << 1;
         const TLP = 1 << 2;
@@ -125,7 +129,10 @@ impl TcpTimers {
             "TCP timer resolution must be non-zero"
         );
         Self {
-            wheel: TimerWheel1t2w2048sl::with_timer_ids(0, TCP_TIMER_KIND_COUNT),
+            wheel: TimerWheel1t2w2048sl::with_timer_ids(
+                TCP_TIMER_EXPIRY_BUDGET,
+                TCP_TIMER_KIND_COUNT,
+            ),
             expired: Vec::new(),
             pending: FifoQueue::new(),
             last_update,
@@ -140,7 +147,19 @@ impl TcpTimers {
         kind: TcpTimerKind,
         interval: Duration,
     ) -> CoreResult<()> {
-        self.update(index, state, kind, interval)
+        if state.is_armed(kind) {
+            return Ok(());
+        }
+        self.wheel
+            .arm_timer(
+                index.slot(),
+                index.generation(),
+                kind.id(),
+                self.duration_ticks(interval),
+            )
+            .map_err(|_| TcpNodeError::TimerUpdateFailed)?;
+        state.arm(kind);
+        Ok(())
     }
 
     pub(super) fn reset(
@@ -178,12 +197,21 @@ impl TcpTimers {
     where
         C: CongestionController,
     {
-        let ticks = self.elapsed_ticks(now);
-        if ticks == 0 {
+        let elapsed_ticks = self.elapsed_ticks(now);
+        if elapsed_ticks == 0 {
             return;
         }
+        if self.wheel.is_empty() {
+            self.fast_forward_empty_wheel(elapsed_ticks);
+            return;
+        }
+        let requested_ticks = elapsed_ticks.min(u128::from(TCP_TIMER_MAX_TICKS_PER_UPDATE)) as u32;
         self.expired.clear();
-        self.wheel.expire(ticks, &mut self.expired);
+        let tick_before = self.wheel.current_tick();
+        self.wheel.expire(requested_ticks, &mut self.expired);
+        let consumed_ticks = u32::try_from(self.wheel.current_tick() - tick_before)
+            .expect("TCP timer wheel consumes no more than the requested u32 ticks");
+        self.last_update += self.resolution * consumed_ticks;
         for payload in self.expired.as_slice() {
             let Some((slot, generation, kind_id)) = self.wheel.take_expired_timer(*payload) else {
                 continue;
@@ -239,13 +267,16 @@ impl TcpTimers {
             .min(u64::MAX as u128) as u64
     }
 
-    fn elapsed_ticks(&mut self, now: Instant) -> u32 {
+    fn elapsed_ticks(&self, now: Instant) -> u128 {
         let elapsed = now.saturating_duration_since(self.last_update);
-        let ticks = (elapsed.as_nanos() / self.resolution.as_nanos()).min(u32::MAX as u128) as u32;
-        if ticks != 0 {
-            self.last_update += self.resolution * ticks;
-        }
-        ticks
+        elapsed.as_nanos() / self.resolution.as_nanos()
+    }
+
+    fn fast_forward_empty_wheel(&mut self, elapsed_ticks: u128) {
+        let elapsed_nanos = elapsed_ticks * self.resolution.as_nanos();
+        let seconds = (elapsed_nanos / 1_000_000_000) as u64;
+        let nanos = (elapsed_nanos % 1_000_000_000) as u32;
+        self.last_update += Duration::new(seconds, nanos);
     }
 }
 
@@ -257,7 +288,10 @@ mod tests {
     use hammer_infra::pool::{Index, Pool};
     use hammer_runtime::DataWorkerId;
 
-    use super::{TcpTimerKind, TcpTimerState, TcpTimers};
+    use super::{
+        TCP_TIMER_EXPIRY_BUDGET, TCP_TIMER_MAX_TICKS_PER_UPDATE, TcpTimerKind, TcpTimerState,
+        TcpTimers,
+    };
     use crate::transport::congestion::BbrController;
     use crate::transport::tcp::TcpConnection;
 
@@ -502,6 +536,352 @@ mod tests {
                 at_new_deadline.is_pending(TcpTimerKind::Retransmit),
             ),
             (true, false, true, false, false, true),
+        );
+    }
+
+    #[test]
+    fn tcp_timer_repeated_set_preserves_original_deadline() {
+        let now = Instant::now();
+        let (mut connections, index) = test_connections();
+        let mut timers = TcpTimers::new(now, Duration::from_millis(10));
+
+        {
+            let state = connections
+                .get_mut(index)
+                .expect("test connection")
+                .timer_state_mut();
+            timers
+                .set(
+                    index,
+                    state,
+                    TcpTimerKind::Retransmit,
+                    Duration::from_millis(20),
+                )
+                .expect("arm retransmit timer");
+        }
+        timers.advance(now + Duration::from_millis(10), &mut connections);
+        {
+            let state = connections
+                .get_mut(index)
+                .expect("test connection")
+                .timer_state_mut();
+            timers
+                .set(
+                    index,
+                    state,
+                    TcpTimerKind::Retransmit,
+                    Duration::from_millis(20),
+                )
+                .expect("keep retransmit timer armed");
+        }
+        timers.advance(now + Duration::from_millis(20), &mut connections);
+
+        let state = test_timer_state(&connections, index);
+        assert_eq!(
+            (
+                state.is_armed(TcpTimerKind::Retransmit),
+                state.is_pending(TcpTimerKind::Retransmit),
+            ),
+            (false, true),
+        );
+    }
+
+    #[test]
+    fn tcp_timer_advance_zero_elapsed_does_not_move_clock() {
+        let now = Instant::now();
+        let (mut connections, index) = test_connections();
+        let mut timers = TcpTimers::new(now, Duration::from_millis(10));
+
+        {
+            let state = connections
+                .get_mut(index)
+                .expect("test connection")
+                .timer_state_mut();
+            timers
+                .set(
+                    index,
+                    state,
+                    TcpTimerKind::Retransmit,
+                    Duration::from_millis(10),
+                )
+                .expect("arm retransmit timer");
+        }
+        timers.advance(now, &mut connections);
+
+        assert_eq!(
+            (
+                timers.wheel.current_tick(),
+                timers.last_update,
+                test_timer_state(&connections, index).is_armed(TcpTimerKind::Retransmit),
+            ),
+            (0, now, true),
+        );
+    }
+
+    #[test]
+    fn tcp_timer_advance_above_tick_cap_preserves_carryover() {
+        let resolution = Duration::from_millis(10);
+        let now = Instant::now();
+        let deadline = now + resolution * (TCP_TIMER_MAX_TICKS_PER_UPDATE + 1);
+        let (mut connections, index) = test_connections();
+        let mut timers = TcpTimers::new(now, resolution);
+
+        {
+            let state = connections
+                .get_mut(index)
+                .expect("test connection")
+                .timer_state_mut();
+            timers
+                .set(
+                    index,
+                    state,
+                    TcpTimerKind::Retransmit,
+                    resolution * (TCP_TIMER_MAX_TICKS_PER_UPDATE + 1),
+                )
+                .expect("arm retransmit timer");
+        }
+        timers.advance(deadline, &mut connections);
+        let after_capped_advance = test_timer_state(&connections, index);
+        let consumed_tick = timers.wheel.current_tick();
+        let consumed_time = timers.last_update;
+        timers.advance(deadline, &mut connections);
+        let after_carryover = test_timer_state(&connections, index);
+
+        assert_eq!(
+            (
+                consumed_tick,
+                consumed_time,
+                after_capped_advance.is_armed(TcpTimerKind::Retransmit),
+                after_capped_advance.is_pending(TcpTimerKind::Retransmit),
+                after_carryover.is_armed(TcpTimerKind::Retransmit),
+                after_carryover.is_pending(TcpTimerKind::Retransmit),
+            ),
+            (
+                u64::from(TCP_TIMER_MAX_TICKS_PER_UPDATE),
+                now + resolution * TCP_TIMER_MAX_TICKS_PER_UPDATE,
+                true,
+                false,
+                false,
+                true,
+            ),
+        );
+    }
+
+    #[test]
+    fn tcp_timer_empty_wheel_large_jump_fast_forwards_absolute_anchor() {
+        let resolution = Duration::from_millis(10);
+        let jump_ticks = TCP_TIMER_MAX_TICKS_PER_UPDATE * 100;
+        let now = Instant::now();
+        let jumped_now = now + resolution * jump_ticks + Duration::from_millis(5);
+        let (mut connections, index) = test_connections();
+        let mut timers = TcpTimers::new(now, resolution);
+
+        timers.advance(jumped_now, &mut connections);
+        let wheel_tick_after_jump = timers.wheel.current_tick();
+        let anchor_after_jump = timers.last_update;
+        {
+            let state = connections
+                .get_mut(index)
+                .expect("test connection")
+                .timer_state_mut();
+            timers
+                .set(index, state, TcpTimerKind::Retransmit, resolution)
+                .expect("arm retransmit timer after jump");
+        }
+        timers.advance(jumped_now, &mut connections);
+        let before_completed_tick = test_timer_state(&connections, index);
+        timers.advance(jumped_now + Duration::from_millis(5), &mut connections);
+        let after_completed_tick = test_timer_state(&connections, index);
+
+        assert_eq!(
+            (
+                wheel_tick_after_jump,
+                anchor_after_jump,
+                before_completed_tick.is_armed(TcpTimerKind::Retransmit),
+                before_completed_tick.is_pending(TcpTimerKind::Retransmit),
+                after_completed_tick.is_armed(TcpTimerKind::Retransmit),
+                after_completed_tick.is_pending(TcpTimerKind::Retransmit),
+            ),
+            (0, now + resolution * jump_ticks, true, false, false, true,),
+        );
+    }
+
+    #[test]
+    fn tcp_timer_expiry_budget_preserves_successive_deadline_carryover() {
+        let resolution = Duration::from_millis(10);
+        let now = Instant::now();
+        let connection_count = TCP_TIMER_EXPIRY_BUDGET + 1;
+        let mut connections = Pool::with_capacity(connection_count);
+        let mut timers = TcpTimers::new(now, resolution);
+        let mut last_index = None;
+
+        for offset in 0..connection_count {
+            let index = connections
+                .insert(test_connection())
+                .expect("insert test connection");
+            let state = connections
+                .get_mut(index)
+                .expect("test connection")
+                .timer_state_mut();
+            timers
+                .set(
+                    index,
+                    state,
+                    TcpTimerKind::Retransmit,
+                    resolution * (offset as u32 + 1),
+                )
+                .expect("arm successive timer");
+            last_index = Some(index);
+        }
+        let last_index = last_index.expect("last connection index");
+        let deadline = now + resolution * connection_count as u32;
+
+        timers.advance(deadline, &mut connections);
+        let first_tick = timers.wheel.current_tick();
+        let first_anchor = timers.last_update;
+        let mut first_tokens = 0;
+        while timers.take_pending(&mut connections).is_some() {
+            first_tokens += 1;
+        }
+        let last_state_before_carryover = test_timer_state(&connections, last_index);
+        timers.advance(deadline, &mut connections);
+        let second_token = timers.take_pending(&mut connections);
+
+        assert_eq!(
+            (
+                first_tick,
+                first_anchor,
+                first_tokens,
+                last_state_before_carryover.is_armed(TcpTimerKind::Retransmit),
+                last_state_before_carryover.is_pending(TcpTimerKind::Retransmit),
+                timers.wheel.current_tick(),
+                timers.last_update,
+                second_token.map(|token| token.index),
+            ),
+            (
+                TCP_TIMER_EXPIRY_BUDGET as u64,
+                now + resolution * TCP_TIMER_EXPIRY_BUDGET as u32,
+                TCP_TIMER_EXPIRY_BUDGET,
+                true,
+                false,
+                connection_count as u64,
+                deadline,
+                Some(last_index),
+            ),
+        );
+    }
+
+    #[test]
+    fn tcp_timer_queued_token_for_removed_connection_generation_is_ignored() {
+        let now = Instant::now();
+        let (mut connections, old_index) = test_connections();
+        let mut timers = TcpTimers::new(now, Duration::from_millis(10));
+
+        {
+            let state = connections
+                .get_mut(old_index)
+                .expect("old connection")
+                .timer_state_mut();
+            timers
+                .set(
+                    old_index,
+                    state,
+                    TcpTimerKind::Retransmit,
+                    Duration::from_millis(10),
+                )
+                .expect("arm old connection timer");
+        }
+        timers.advance(now + Duration::from_millis(10), &mut connections);
+        let _ = connections
+            .remove(old_index)
+            .expect("remove old connection");
+        let new_index = connections
+            .insert(test_connection())
+            .expect("insert replacement connection");
+        {
+            let state = connections
+                .get_mut(new_index)
+                .expect("new connection")
+                .timer_state_mut();
+            timers
+                .set(
+                    new_index,
+                    state,
+                    TcpTimerKind::Retransmit,
+                    Duration::from_millis(30),
+                )
+                .expect("arm replacement connection timer");
+        }
+
+        let token = timers.take_pending(&mut connections);
+        let new_state = test_timer_state(&connections, new_index);
+        assert_eq!(
+            (
+                token,
+                new_state.is_armed(TcpTimerKind::Retransmit),
+                new_state.is_pending(TcpTimerKind::Retransmit),
+            ),
+            (None, true, false),
+        );
+    }
+
+    #[test]
+    fn tcp_timer_kind_ids_and_flags_are_unique_roundtrips() {
+        let kinds = [
+            TcpTimerKind::Retransmit,
+            TcpTimerKind::Rack,
+            TcpTimerKind::Tlp,
+            TcpTimerKind::DelayedAck,
+            TcpTimerKind::Persist,
+            TcpTimerKind::KeepAlive,
+            TcpTimerKind::TimeWait,
+            TcpTimerKind::Pacing,
+        ];
+        let mut ids = 0u16;
+        let mut flags = 0u16;
+
+        for kind in kinds {
+            let id_bit = 1u16 << kind.id();
+            assert_eq!(TcpTimerKind::from_id(kind.id()), Some(kind));
+            assert_eq!(ids & id_bit, 0, "duplicate TCP timer id");
+            assert_eq!(flags & kind.flag().bits(), 0, "duplicate TCP timer flag");
+            ids |= id_bit;
+            flags |= kind.flag().bits();
+        }
+
+        assert_eq!((ids, flags), (0xff, 0xff));
+    }
+
+    #[test]
+    fn tcp_timer_duplicate_queued_token_dispatches_once() {
+        let now = Instant::now();
+        let (mut connections, index) = test_connections();
+        let mut timers = TcpTimers::new(now, Duration::from_millis(10));
+
+        {
+            let state = connections
+                .get_mut(index)
+                .expect("test connection")
+                .timer_state_mut();
+            timers
+                .set(
+                    index,
+                    state,
+                    TcpTimerKind::Retransmit,
+                    Duration::from_millis(10),
+                )
+                .expect("arm retransmit timer");
+        }
+        timers.advance(now + Duration::from_millis(10), &mut connections);
+        let duplicate = *timers.pending.front().expect("pending timer token");
+        timers.pending.push_back(duplicate);
+
+        assert_eq!(
+            (
+                timers.take_pending(&mut connections),
+                timers.take_pending(&mut connections),
+            ),
+            (Some(duplicate), None),
         );
     }
 }
