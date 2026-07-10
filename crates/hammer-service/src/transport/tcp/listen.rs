@@ -11,8 +11,8 @@ use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRunt
 use super::connection::TcpConnection;
 use super::segment::{TcpSegment, tcp_packet};
 use super::{
-    TCP_MAIN, TcpInputControlPlane, TcpInputNext, TcpNodeError, TcpWorker,
-    ensure_tcp_session_queue, publish_tcp_connection, write_session_route_opaque,
+    TcpInputControlPlane, TcpInputNext, TcpNodeError, TcpWorker, publish_tcp_connection,
+    write_session_route_opaque,
 };
 #[cfg(test)]
 use crate::net::NetworkOpaque;
@@ -47,29 +47,11 @@ pub struct TcpListenNode<C: CongestionController + 'static, Seg: Segment> {
     control_slot: Cell<Option<usize>>,
 }
 
-pub fn register_tcp_listen(runtime: &DataPlaneRuntime, worker: usize) -> CoreResult<NodeId> {
-    crate::with_congestion!(|C| {
-        crate::with_segment!(|Seg| {
-            let queue_data = ensure_tcp_session_queue::<C>(runtime, worker)?;
-            let queue: SessionQueueHandle<
-                SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>,
-            > = SessionQueueHandle::new(queue_data);
-            let control = TCP_MAIN
-                .load()
-                .as_deref()
-                .ok_or_else(|| CoreError::internal("tcp main not initialized"))?
-                .control()
-                .clone();
-            runtime.nodes().try_register_internal_with_next_names(
-                TcpListenNode::<C, Seg>::new(
-                    control,
-                    queue,
-                    [NodeId::new(0); TcpListenNext::COUNT],
-                ),
-                &TcpListenNext::NEXT_NAMES,
-            )
-        })
-    })
+pub fn register_tcp_listen(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+    runtime
+        .nodes()
+        .node_by_name("tcp-listen")
+        .ok_or_else(|| CoreError::internal("TCP worker graph is not registered"))
 }
 
 thread_local! {

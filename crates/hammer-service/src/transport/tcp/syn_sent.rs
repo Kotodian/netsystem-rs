@@ -7,7 +7,7 @@ use hammer_infra::segment::Segment;
 
 use super::publish_tcp_connection;
 use super::segment::tcp_packet;
-use super::{TCP_MAIN, TcpNodeError, TcpWorker, ensure_tcp_session_queue, read_session_id};
+use super::{TcpNodeError, TcpWorker, read_session_id};
 use crate::session::SessionQueueHandle;
 use crate::session::app::SessionAppRuntimeCreate;
 use crate::session::runtime::RxDelivery;
@@ -32,23 +32,11 @@ pub struct TcpSynSentNode<C: CongestionController + 'static, Seg: Segment> {
     session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
 }
 
-pub fn register_tcp_syn_sent(runtime: &DataPlaneRuntime, worker: usize) -> CoreResult<NodeId> {
-    crate::with_congestion!(|C| {
-        crate::with_segment!(|Seg| {
-            let queue_data = ensure_tcp_session_queue::<C>(runtime, worker)?;
-            let queue = SessionQueueHandle::<
-                SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>,
-            >::new(queue_data);
-            TCP_MAIN
-                .load()
-                .as_deref()
-                .ok_or_else(|| CoreError::internal("tcp main not initialized"))?;
-            runtime.nodes().try_register_internal_with_next_names(
-                TcpSynSentNode::<C, Seg>::new(queue, [NodeId::new(0); TcpSynSentNext::COUNT]),
-                &TcpSynSentNext::NEXT_NAMES,
-            )
-        })
-    })
+pub fn register_tcp_syn_sent(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+    runtime
+        .nodes()
+        .node_by_name("tcp-syn-sent")
+        .ok_or_else(|| CoreError::internal("TCP worker graph is not registered"))
 }
 
 impl<C, Seg> Node for TcpSynSentNode<C, Seg>

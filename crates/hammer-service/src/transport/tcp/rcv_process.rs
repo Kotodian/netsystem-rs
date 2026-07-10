@@ -9,9 +9,9 @@ use crate::transport::congestion::CongestionController;
 
 use super::segment::tcp_packet;
 use super::{
-    TCP_MAIN, TCP_TIMER_DELAYED_ACK, TCP_TIMER_KEEP_ALIVE, TCP_TIMER_PACING, TCP_TIMER_PERSIST,
+    TCP_TIMER_DELAYED_ACK, TCP_TIMER_KEEP_ALIVE, TCP_TIMER_PACING, TCP_TIMER_PERSIST,
     TCP_TIMER_RACK, TCP_TIMER_RETRANSMIT, TCP_TIMER_TIME_WAIT, TCP_TIMER_TLP, TcpNodeError,
-    TcpWorker, ensure_tcp_session_queue, publish_tcp_connection, read_session_id,
+    TcpWorker, publish_tcp_connection, read_session_id,
 };
 use crate::session::SessionQueueHandle;
 use crate::session::app::SessionAppRuntimeCreate;
@@ -35,23 +35,11 @@ pub struct TcpRcvProcessNode<C: CongestionController + 'static, Seg: Segment> {
     session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
 }
 
-pub fn register_tcp_rcv_process(runtime: &DataPlaneRuntime, worker: usize) -> CoreResult<NodeId> {
-    crate::with_congestion!(|C| {
-        crate::with_segment!(|Seg| {
-            let queue_data = ensure_tcp_session_queue::<C>(runtime, worker)?;
-            let queue = SessionQueueHandle::<
-                SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>,
-            >::new(queue_data);
-            TCP_MAIN
-                .load()
-                .as_deref()
-                .ok_or_else(|| CoreError::internal("tcp main not initialized"))?;
-            runtime.nodes().try_register_internal_with_next_names(
-                TcpRcvProcessNode::<C, Seg>::new(queue, [NodeId::new(0); TcpRcvProcessNext::COUNT]),
-                &TcpRcvProcessNext::NEXT_NAMES,
-            )
-        })
-    })
+pub fn register_tcp_rcv_process(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+    runtime
+        .nodes()
+        .node_by_name("tcp-rcv-process")
+        .ok_or_else(|| CoreError::internal("TCP worker graph is not registered"))
 }
 
 impl<C, Seg> Node for TcpRcvProcessNode<C, Seg>

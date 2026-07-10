@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 use hammer_component_macros::worker_init_function;
 use hammer_core::data_plane::NodeHandle;
 use hammer_core::error::HammerResult;
+use hammer_infra::vec::Vec;
 use hammer_runtime::Engine;
 use hammer_runtime::NodeEntry;
 
@@ -13,6 +14,30 @@ pub(crate) static WORKER_HANDOFF_NODE_HANDLE: OnceLock<NodeHandle> = OnceLock::n
 
 #[linkme::distributed_slice]
 pub static SERVICE_GRAPH_NODES: [NodeEntry] = [..];
+
+const TCP_TYPED_WORKER_GRAPH_NODES: [&str; 7] = [
+    "session-queue",
+    "tcp-output",
+    "tcp-input",
+    "tcp-listen",
+    "tcp-established",
+    "tcp-rcv-process",
+    "tcp-syn-sent",
+];
+
+fn deferred_worker_graph_nodes() -> Vec<NodeEntry> {
+    let mut entries = Vec::with_capacity(SERVICE_GRAPH_NODES.len());
+    for entry in SERVICE_GRAPH_NODES.iter().copied() {
+        if entry
+            .registration
+            .name()
+            .is_none_or(|name| !TCP_TYPED_WORKER_GRAPH_NODES.contains(&name))
+        {
+            entries.push(entry);
+        }
+    }
+    entries
+}
 
 #[worker_init_function(name = "install_worker_graph")]
 pub fn install_worker_graph(engine: &mut Engine) -> HammerResult<()> {
@@ -23,9 +48,10 @@ pub fn install_worker_graph(engine: &mut Engine) -> HammerResult<()> {
     engine.runtime.set_handoff_node_handle(handle);
 
     let worker = engine.thread_index as usize;
-    engine.runtime.init_graph(worker, &SERVICE_GRAPH_NODES)?;
-    crate::net::wire_ip_lookup_drop(&engine.runtime)?;
     crate::transport::tcp::wire_worker_graph(&engine.runtime, worker)?;
+    let entries = deferred_worker_graph_nodes();
+    engine.runtime.init_graph(worker, entries.as_slice())?;
+    crate::net::wire_ip_lookup_drop(&engine.runtime)?;
     Ok(())
 }
 
@@ -45,9 +71,34 @@ mod tests {
             "ip-lookup",
             "tcp-input",
             "tcp-listen",
+            "tcp-established",
+            "tcp-rcv-process",
+            "tcp-syn-sent",
+            "tcp-output",
             "session-queue",
         ] {
             assert!(names.iter().any(|n| *n == want), "missing {want}");
+        }
+    }
+
+    #[test]
+    fn tcp_typed_worker_graph_nodes_are_filtered_once() {
+        let deferred = deferred_worker_graph_nodes();
+        for name in TCP_TYPED_WORKER_GRAPH_NODES {
+            assert_eq!(
+                SERVICE_GRAPH_NODES
+                    .iter()
+                    .filter(|entry| entry.registration.name() == Some(name))
+                    .count(),
+                1,
+                "expected one static registration for {name}"
+            );
+            assert!(
+                deferred
+                    .iter()
+                    .all(|entry| entry.registration.name() != Some(name)),
+                "typed TCP worker graph node {name} must not be registered twice"
+            );
         }
     }
 }

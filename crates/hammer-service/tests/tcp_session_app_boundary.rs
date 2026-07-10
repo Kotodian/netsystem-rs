@@ -156,19 +156,27 @@ fn session_app_runtime_has_local_and_svm_impl_blocks() {
 }
 
 #[test]
-fn ensure_tcp_session_queue_dispatches_to_svm() {
+fn tcp_worker_graph_keeps_session_queue_typed_without_tls_cache() {
     let tcp_mod_source = include_str!("../src/transport/tcp/mod.rs");
 
     assert!(
         tcp_mod_source.contains("new_svm"),
-        "ensure_tcp_session_queue must use new_svm() for Svm backend"
+        "TCP worker graph must use new_svm() for the Svm backend"
     );
     assert!(
         tcp_mod_source.contains("new("),
-        "ensure_tcp_session_queue must use new() for Local backend"
+        "TCP worker graph must use new() for the Local backend"
     );
     assert!(
-        !tcp_mod_source.contains("pub fn register_tcp_input<C, Seg>"),
-        "TcpMain must not expose a generic segment that can disagree with the configured backend"
+        !tcp_mod_source.contains("TCP_SESSION_QUEUE_RUNTIME_DATA"),
+        "TCP must not cache type-erased session queue runtime data in TLS"
+    );
+    assert!(
+        !tcp_mod_source.contains("TypeId"),
+        "TCP queue ownership must stay statically typed instead of keying by TypeId"
+    );
+    assert!(
+        !tcp_mod_source.contains("ensure_tcp_session_queue"),
+        "TCP nodes must receive one typed queue handle from worker graph registration"
     );
 }
