@@ -7,7 +7,8 @@ use hammer_core::protocol::tcp::{
 use hammer_infra::msg_queue::{SessionEvt, SessionEvtType};
 use hammer_infra::pool::Index;
 use hammer_infra::segment::Local;
-use hammer_runtime::app::{AppSession, AppSessionConfig, SessionHandle};
+use hammer_runtime::app::{AppContext, AppSession, AppSessionConfig, SessionHandle};
+use hammer_runtime::spawn::DataRuntimeContext;
 use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId};
 
 use super::{SessionDriverRuntime, SessionState, dispatch_registered_session_queue_once_at};
@@ -88,6 +89,40 @@ fn poll_app_events(app: &AppSession<Local>) -> Vec<SessionEvtType> {
     }; 4];
     let count = app.poll_events(&mut events);
     events[..count].iter().map(|event| event.evt_type).collect()
+}
+
+#[test]
+fn with_app_context_retains_custom_app_session_config() {
+    let data_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("data runtime");
+    let config = AppSessionConfig::new(512, 8);
+    let app_context = AppContext::new(
+        DataRuntimeContext::new(data_runtime.handle().clone()),
+        config,
+    );
+    let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
+    let worker = DataWorkerId::new(0);
+
+    let driver = TcpDriver::with_app_context(
+        worker,
+        runtime.buffers().clone(),
+        (TcpWorker::new(worker), ()),
+        app_context,
+    );
+
+    assert_eq!(
+        (
+            driver.sessions.app_session_config,
+            driver
+                .sessions
+                .app_context
+                .as_ref()
+                .map(AppContext::app_session_config),
+        ),
+        (config, Some(config))
+    );
 }
 
 #[test]
