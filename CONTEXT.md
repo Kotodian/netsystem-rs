@@ -103,12 +103,28 @@ The seam where application-owned bytes become session-owned bytes and session ev
 _Avoid_: direct TCP app callback, io_uring app ring, socket-like stream hidden inside TCP
 
 **Session Runtime**:
-The worker-local module that owns session readiness, session timers, app/session FIFO access, and TX packet preparation. It schedules session work; transport logic supplies typed transport decisions.
+The worker-local module that owns session readiness, app/session FIFO access, and TX packet preparation. It schedules session work; registered transport dispatch coordinates transport worker updates without exposing transport connections, timers, or exact timer dispatch to Session Runtime.
 _Avoid_: TCP runtime, congestion-control scheduler, app polling loop
 
+**Transport Timer Policy**:
+The transport-owned rules that decide which timer kinds are active, when they should expire, and how exact Timer Token expiry changes transport state. The transport worker owns scheduling and dispatch; Session Runtime does not store, advance, interpret, or deliver transport timers.
+_Avoid_: session timer policy, timer-wheel policy, generic keep mask
+
+**Transport Worker State**:
+The worker-local owner of protocol-specific transport objects, transport timer scheduling, expired Timer Tokens, and exact timer dispatch. A registered transport dispatch advances the worker without exposing TCP connection, QUIC connection, or QUIC stream state to Session Runtime.
+_Avoid_: session connection pool, session timer wheel, protocol state in Session Runtime
+
 **TX Transaction**:
-The send-side unit of work owned by Session Runtime: selecting session-owned TX bytes, preparing data-plane buffers, and making the packet visible to the Packet Graph. Transport logic supplies facts and output intent but does not own payload bytes or scheduling.
+The send-side unit of work owned by Session Runtime for a Session-Packetized TX transport: selecting session-owned TX bytes, preparing data-plane buffers, and making the packet visible to the Packet Graph. Transport logic supplies facts and output intent but does not own payload bytes or session scheduling.
 _Avoid_: TX helper, TCP send path, callback chain, payload selection helper
+
+**Session-Packetized TX**:
+A typed transport TX strategy in which Session Runtime selects FIFO bytes and prepares the TX Batch before transport commits protocol state and output intent. TCP uses this strategy.
+_Avoid_: transport-internal packetization, TCP-owned payload copy, generic custom TX
+
+**Transport-Internal TX**:
+A typed transport TX strategy in which Session Runtime exposes session-owned bytes and readiness to a transport engine that schedules, multiplexes, packetizes, and emits transport packets. QUIC stream TX uses this strategy; payload ownership remains in the Session FIFO.
+_Avoid_: fake push-header path, per-stream QUIC packet buffer, session-owned QUIC packetization
 
 **TX Batch**:
 One TX Transaction may prepare multiple data-plane buffers before a single transport-owned TX action materializes output intent and commits transport state for the batch. A TX Batch is committed and made graph-visible as one unit, preserving VPP-style amortization and ordering across the buffers it contains.
@@ -134,9 +150,21 @@ _Avoid_: Session Ready Queue, DedupFifo, ReadySession list, protocol-specific sc
 A worker-local session lifecycle command, such as disconnect, dispatched by Session Runtime separately from TX/RX session work. Control events may invoke transport close handling, but they are not readiness facts and do not enter the Session Work Batch.
 _Avoid_: close-ready flag, ready-queue close request, synthetic ready boolean, TX event
 
+**Session Lifecycle**:
+The session-owned typed state machine that coordinates independently owned application and transport objects. Its stored states are Active, App Closed, Transport Closed, Closed, and Transport Deleted; Closed retains the Transport Index until asynchronous transport cleanup finishes, while Transport Deleted does not. TCP connection, QUIC connection, and QUIC stream state machines remain protocol-private.
+_Avoid_: TCP close state, QUIC stream state, close boolean, immediate cross-owner deletion
+
+**Transport Deleted**:
+A Session Lifecycle state in which the app-facing transport object no longer exists while the session remains long enough to complete application-side cleanup. It has no Transport Index.
+_Avoid_: stale connection index, TCP closed flag, tombstone connection
+
 **Transport Connection**:
-The protocol state associated with a session, such as TCP sequence, ACK, recovery, and timer facts. It does not own app/session FIFOs or runtime scheduling.
+The transport-worker-owned protocol state associated with a session, such as TCP sequence, ACK, recovery, and timer facts. It does not own app/session FIFOs or Session Runtime scheduling.
 _Avoid_: app session, runtime session, socket object
+
+**Transport Index**:
+An opaque transport-provided index from a Session to its app-facing transport object. The object may be a TCP connection, QUIC connection, or QUIC stream; Session Runtime preserves and passes the index without interpreting the object's kind, pool representation, parent relationship, or state.
+_Avoid_: TCP connection in Session Runtime, QUIC stream id in Session Runtime, SessionId used as a transport index
 
 **TX Byte Retention**:
 The session-owned retention of transmitted application bytes until transport ACK cleanup releases them. Recovery retransmits from session-owned bytes and transport facts, not from private payload copies.
@@ -167,7 +195,7 @@ A transport-selected payload sizing fact used by Session Runtime TX packetizatio
 _Avoid_: TCP MSS field, GSO flag, header option, output metadata
 
 **Timer Token**:
-The exact timer kind supplied by the runtime when a session timer expires. Timer expiry dispatches this token directly to transport logic instead of scanning all transport timer kinds or exposing transport timer masks to infer work.
+The exact transport timer kind produced by Transport Worker State when a transport timer expires. The transport worker dispatches this token directly to the owning Transport Connection instead of scanning timer kinds or routing transport timer state through Session Runtime.
 _Avoid_: all-timer sweep, timer-kind discovery, guessed expired timer
 
 ## Lookup
