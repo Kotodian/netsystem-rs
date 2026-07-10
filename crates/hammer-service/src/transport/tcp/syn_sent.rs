@@ -158,7 +158,7 @@ where
             })?;
             let previous_snd_una = connection.snd_una();
             let previous_state = connection.state();
-            let control = connection.receive_open_reply_with_timers(
+            let control = connection.receive_open_reply(
                 connection_index,
                 timers,
                 &packet,

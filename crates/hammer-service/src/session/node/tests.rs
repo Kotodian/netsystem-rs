@@ -15,7 +15,7 @@ use crate::session::runtime::{
     SessionDriverRuntime, SessionPacketizedTransport, SessionPacketizedTx, SessionTransport,
     SessionTransportId, SessionWorker, TransportInternalTransport, TransportInternalTx,
     TransportSendFlags, TransportSendParams, TxBatchBuffer,
-    dispatch_registered_session_queue_once_at, dispatch_session_queue_for_ticks,
+    dispatch_registered_session_queue_once_at, dispatch_session_queue_once,
 };
 use hammer_infra::msg_queue::{SessionEvt, SessionEvtType};
 use hammer_runtime::app::{AppSession, AppSessionConfig, SessionHandle};
@@ -379,7 +379,7 @@ fn quic_shaped_internal_tx_can_fan_close_out_to_stream_sessions() {
     first_app.send_bytes(b"one").expect("first stream send");
     assert_eq!(second_app.tx_fifo().enqueue(b"four"), 4);
 
-    dispatch_session_queue_for_ticks(&runtime, &mut driver, 0, output.into()).expect("internal tx");
+    dispatch_session_queue_once(&runtime, &mut driver, output.into()).expect("internal tx");
     let _ = runtime.run_ready_nodes().expect("capture internal TX");
 
     assert_eq!(
@@ -650,8 +650,7 @@ fn session_tx_dispatch_commits_batch_before_graph_visibility() {
         .register_internal(VisibilityCaptureNode::new(Arc::clone(&events)))
         .into();
 
-    dispatch_session_queue_for_ticks(&runtime, &mut driver, 0, next)
-        .expect("dispatch session queue");
+    dispatch_session_queue_once(&runtime, &mut driver, next).expect("dispatch session queue");
     let _ = runtime.run_ready_nodes().expect("run capture node");
 
     let transport = &driver.transports().0;
@@ -692,17 +691,15 @@ fn session_tx_deschedules_without_tx_action_when_send_space_is_zero() {
     let app = attach_local_app_session(&mut driver, session_id);
     app.send_bytes(&[0xab; 8]).expect("send bytes");
 
-    let first = dispatch_session_queue_for_ticks(
+    let first = dispatch_session_queue_once(
         &runtime,
         &mut driver,
-        0,
         hammer_core::data_plane::NodeId::new(0).into(),
     )
     .expect("first dispatch");
-    let second = dispatch_session_queue_for_ticks(
+    let second = dispatch_session_queue_once(
         &runtime,
         &mut driver,
-        0,
         hammer_core::data_plane::NodeId::new(0).into(),
     )
     .expect("second dispatch");
@@ -734,10 +731,9 @@ fn failed_session_packetized_tx_action_keeps_fifo_and_graph_unchanged() {
     app.send_bytes(b"stay").expect("send bytes");
     driver.schedule_session_work_for_test(session_id);
 
-    let error = dispatch_session_queue_for_ticks(
+    let error = dispatch_session_queue_once(
         &runtime,
         &mut driver,
-        0,
         hammer_core::data_plane::NodeId::new(0).into(),
     )
     .expect_err("tx action must fail");
@@ -774,10 +770,9 @@ fn transport_deleted_then_queued_app_close_releases_the_session_slot() {
         })
         .expect("queue app close");
 
-    dispatch_session_queue_for_ticks(
+    dispatch_session_queue_once(
         &runtime,
         &mut driver,
-        0,
         hammer_core::data_plane::NodeId::new(0).into(),
     )
     .expect("dispatch app close");

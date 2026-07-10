@@ -138,13 +138,8 @@ where
             let capabilities = lookup
                 .pending_open_capabilities(session_id)
                 .unwrap_or_default();
-            let segment = connection.on_tcp_ready_with_timers(
-                index,
-                timers,
-                has_pending_tx,
-                capabilities,
-                now,
-            )?;
+            let segment =
+                connection.on_tcp_ready(index, timers, has_pending_tx, capabilities, now)?;
             (session_id, segment, connection.has_pending_sack_output())
         };
         if let Some(segment) = segment {
@@ -240,7 +235,7 @@ where
                 .connections
                 .get_mut(index)
                 .ok_or(TcpNodeError::SessionMissing)?;
-            connection.on_session_close();
+            connection.on_session_close(index, &mut self.timers);
         }
         self.control_output(sessions, index, runtime, output_next, output, now)
     }
@@ -318,7 +313,7 @@ where
         for entry in batch {
             let segment = candidate.tx_segment(entry.payload_len, capabilities)?;
             segment.write_to_buffer(sessions.buffers(), entry.index)?;
-            let _ = candidate.commit_payload_tx(entry.payload_len, now)?;
+            candidate.commit_payload_tx(entry.payload_len, now)?;
         }
         *candidate.timer_state_mut() = previous_timer_state;
         candidate.sync_payload_tx_timers(index, &mut self.timers, now)?;

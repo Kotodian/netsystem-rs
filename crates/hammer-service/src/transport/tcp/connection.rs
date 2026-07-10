@@ -3,7 +3,6 @@ use std::ops::{Deref, DerefMut};
 use std::time::{Duration, Instant};
 
 use super::TcpInputNext;
-use super::TcpNodeError;
 use super::output::{
     DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, tcp_effective_output_payload_len, tcp_send_goal_size,
 };
@@ -36,48 +35,9 @@ const DEFAULT_TCP_MAX_SEGMENT_SIZE: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
 pub const TCP_INITIAL_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(50);
 pub const TCP_MIN_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(50);
 pub const TCP_MAX_RETRANSMIT_TIMEOUT: Duration = Duration::from_secs(60);
-/// 60s 2MSL TIME_WAIT.
-pub const TCP_TIME_WAIT_TICKS: u64 = 6_000;
 const TCP_PAWS_IDLE: Duration = Duration::from_secs(24 * 86_400);
-pub const TCP_TIMER_RETRANSMIT: u32 = 0;
-pub const TCP_TIMER_RACK: u32 = 1;
-pub const TCP_TIMER_TLP: u32 = 2;
-pub const TCP_TIMER_DELAYED_ACK: u32 = 3;
-pub const TCP_TIMER_PERSIST: u32 = 4;
-pub const TCP_TIMER_KEEP_ALIVE: u32 = 5;
-pub const TCP_TIMER_TIME_WAIT: u32 = 6;
-pub const TCP_TIMER_PACING: u32 = 7;
-pub const TCP_TIMER_COUNT: u32 = 8;
-const TCP_DELAYED_ACK_TICKS: u64 = 1;
 const TCP_DELAYED_ACK_INTERVAL: Duration = Duration::from_millis(10);
 const TCP_TIME_WAIT_INTERVAL: Duration = Duration::from_secs(60);
-
-pub(crate) fn sync_tcp_timer(
-    timers: &mut hammer_infra::timer_wheel::TimerWheel1t2w2048sl<u32>,
-    ticks: Option<u64>,
-    session: hammer_infra::pool::Index,
-    timer_id: u32,
-) -> CoreResult<()> {
-    if let Some(ticks) = ticks {
-        timers
-            .update_timer(session.slot(), session.generation(), timer_id, ticks)
-            .map_err(|_| TcpNodeError::TimerUpdateFailed)?;
-        return Ok(());
-    }
-    let _ = timers.cancel_timer(session.slot(), session.generation(), timer_id);
-    Ok(())
-}
-
-pub(crate) fn sync_all_tcp_timers(
-    timers: &mut hammer_infra::timer_wheel::TimerWheel1t2w2048sl<u32>,
-    timer_ticks: [Option<u64>; TCP_TIMER_COUNT as usize],
-    session: hammer_infra::pool::Index,
-) -> CoreResult<()> {
-    for (timer_id, ticks) in timer_ticks.into_iter().enumerate() {
-        sync_tcp_timer(timers, ticks, session, timer_id as u32)?;
-    }
-    Ok(())
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TcpKeepaliveConfig {
@@ -319,55 +279,6 @@ impl<C> TcpConnection<C>
 where
     C: CongestionController,
 {
-    #[inline(always)]
-    pub fn timer_is_supported(&self, timer_id: u32) -> bool {
-        matches!(
-            (self.state, timer_id),
-            (TcpState::SynSent, TCP_TIMER_RETRANSMIT)
-                | (TcpState::Established, TCP_TIMER_RETRANSMIT)
-                | (TcpState::FinWait1, TCP_TIMER_RETRANSMIT)
-                | (TcpState::Closing, TCP_TIMER_RETRANSMIT)
-                | (TcpState::LastAck, TCP_TIMER_RETRANSMIT)
-                | (TcpState::Established, TCP_TIMER_RACK)
-                | (TcpState::Established, TCP_TIMER_TLP)
-                | (TcpState::Established, TCP_TIMER_DELAYED_ACK)
-                | (TcpState::Established, TCP_TIMER_PERSIST)
-                | (TcpState::Established, TCP_TIMER_KEEP_ALIVE)
-                | (TcpState::Established, TCP_TIMER_PACING)
-                | (TcpState::TimeWait, TCP_TIMER_TIME_WAIT)
-        )
-    }
-
-    #[inline(always)]
-    pub fn timer_is_active(&self, timer_id: u32) -> bool {
-        TcpTimerKind::from_id(timer_id).is_some_and(|kind| self.timers.is_active(kind))
-    }
-
-    /// Bulk read of the armed-or-pending timer bitmask.
-    ///
-    /// One load replaces up to 8 `timer_is_active` mask-and-test calls at
-    /// call sites that need the whole mask (e.g. computing a timer-refresh
-    /// keep-mask). The per-id `timer_is_active` predicate remains for sites
-    /// that only test a single id.
-    #[inline(always)]
-    pub fn active_timer_mask(&self) -> u16 {
-        self.timers.active_bits()
-    }
-
-    #[inline(always)]
-    pub fn timer_set(&mut self, timer_id: u32) {
-        if let Some(kind) = TcpTimerKind::from_id(timer_id) {
-            self.timers.arm(kind);
-        }
-    }
-
-    #[inline]
-    pub fn timer_reset(&mut self, timer_id: u32) {
-        if let Some(kind) = TcpTimerKind::from_id(timer_id) {
-            self.timers.reset(kind);
-        }
-    }
-
     #[inline]
     pub(super) fn timer_state(&self) -> &TcpTimerState {
         &self.timers
@@ -610,59 +521,6 @@ where
     }
 
     #[inline]
-    pub(crate) fn timer_ticks(&self, timer_id: u32, now: Instant) -> Option<u64> {
-        if !self.timer_is_active(timer_id) {
-            return None;
-        }
-        match (self.state, timer_id) {
-            (TcpState::Established, TCP_TIMER_RETRANSMIT)
-            | (TcpState::FinWait1, TCP_TIMER_RETRANSMIT)
-            | (TcpState::Closing, TCP_TIMER_RETRANSMIT)
-            | (TcpState::LastAck, TCP_TIMER_RETRANSMIT)
-            | (TcpState::SynSent, TCP_TIMER_RETRANSMIT) => Some(
-                (self.retransmit_timeout().retransmit_timeout().as_millis() / 10).max(1) as u64,
-            ),
-            (TcpState::Established, TCP_TIMER_RACK) => self
-                .recovery
-                .rack_timeout(now)
-                .map(|duration| duration.as_millis().div_ceil(10).max(1) as u64),
-            (TcpState::Established, TCP_TIMER_TLP) => self
-                .recovery
-                .tlp_timeout(
-                    self.retransmit_timeout().smoothed_rtt(),
-                    self.retransmit_timeout().retransmit_timeout(),
-                )
-                .map(|duration| duration.as_millis().div_ceil(10).max(1) as u64),
-            (TcpState::Established, TCP_TIMER_DELAYED_ACK) => Some(TCP_DELAYED_ACK_TICKS),
-            (TcpState::Established, TCP_TIMER_PERSIST) => {
-                let rto = self.retransmit_timeout().retransmit_timeout();
-                let base_ticks = (rto.as_millis() / 10).max(1) as u64;
-                let shift = u32::from(self.cacheline1.persist_attempts.min(9));
-                let cap_ticks = TCP_MAX_RETRANSMIT_TIMEOUT.as_millis().div_ceil(10).max(1) as u64;
-                let ticks = base_ticks
-                    .checked_shl(shift)
-                    .unwrap_or(u64::MAX)
-                    .min(cap_ticks);
-                Some(ticks.max(1))
-            }
-            (TcpState::Established, TCP_TIMER_KEEP_ALIVE) => {
-                let interval = if self.keepalive.probes_sent == 0 {
-                    self.keepalive.config.idle
-                } else {
-                    self.keepalive.config.probe_interval
-                };
-                Some(interval.as_millis().div_ceil(10).max(1) as u64)
-            }
-            (TcpState::Established, TCP_TIMER_PACING) => self
-                .congestion
-                .next_send_delay(self.output_payload_len() as u32)
-                .map(|duration| duration.as_millis().div_ceil(10).max(1) as u64),
-            (TcpState::TimeWait, TCP_TIMER_TIME_WAIT) => Some(TCP_TIME_WAIT_TICKS),
-            _ => None,
-        }
-    }
-
-    #[inline]
     fn observe_activity(
         &mut self,
         index: PoolIndex,
@@ -676,15 +534,6 @@ where
             timers.update(index, &mut self.timers, TcpTimerKind::KeepAlive, idle)?;
         }
         Ok(())
-    }
-
-    #[inline]
-    fn record_activity(&mut self, now: Instant) {
-        self.keepalive.last_activity_at = now;
-        self.keepalive.probes_sent = 0;
-        if self.state == TcpState::Established {
-            self.timer_set(TCP_TIMER_KEEP_ALIVE);
-        }
     }
 
     #[inline]
@@ -1020,7 +869,7 @@ where
         index: PoolIndex,
         timers: &mut TcpTimers,
     ) -> CoreResult<bool> {
-        if self.timer_is_active(TCP_TIMER_DELAYED_ACK) {
+        if self.timers.is_active(TcpTimerKind::DelayedAck) {
             timers.reset(index, &mut self.timers, TcpTimerKind::DelayedAck);
             return Ok(true);
         }
@@ -1182,10 +1031,13 @@ where
         )))
     }
 
-    pub(crate) fn receive_open_reply(
+    pub(super) fn receive_open_reply(
         &mut self,
+        index: PoolIndex,
+        timers: &mut TcpTimers,
         packet: &TcpPacket,
         local_capabilities: TcpCapabilities,
+        now: Instant,
     ) -> CoreResult<Option<TcpSegment>> {
         self.ensure_state(TcpState::SynSent)?;
 
@@ -1211,7 +1063,7 @@ where
             {
                 self.cacheline1.close_reason = Some(TcpCloseReason::RemoteReset);
                 self.state = TcpState::Closed;
-                self.timer_reset(TCP_TIMER_RETRANSMIT);
+                timers.reset(index, &mut self.timers, TcpTimerKind::Retransmit);
             }
             return Ok(None);
         }
@@ -1244,8 +1096,8 @@ where
             }
             self.snd_una = acknowledgment;
             self.state = TcpState::Established;
-            self.timer_reset(TCP_TIMER_RETRANSMIT);
-            self.record_activity(Instant::now());
+            timers.reset(index, &mut self.timers, TcpTimerKind::Retransmit);
+            self.observe_activity(index, timers, now)?;
             if packet.payload_len != 0 {
                 self.rcv_nxt = packet.sequence.advance(1 + packet.payload_len as u32);
             }
@@ -1273,28 +1125,6 @@ where
         )))
     }
 
-    pub(super) fn receive_open_reply_with_timers(
-        &mut self,
-        index: PoolIndex,
-        timers: &mut TcpTimers,
-        packet: &TcpPacket,
-        local_capabilities: TcpCapabilities,
-        now: Instant,
-    ) -> CoreResult<Option<TcpSegment>> {
-        let control = self.receive_open_reply(packet, local_capabilities)?;
-        match self.state {
-            TcpState::Established => {
-                timers.reset(index, &mut self.timers, TcpTimerKind::Retransmit);
-                self.observe_activity(index, timers, now)?;
-            }
-            TcpState::Closed => {
-                timers.reset(index, &mut self.timers, TcpTimerKind::Retransmit);
-            }
-            _ => {}
-        }
-        Ok(control)
-    }
-
     #[inline]
     pub(crate) fn take_acked_tx_len(&mut self, previous_snd_una: u32) -> u32 {
         let previous_snd_una = TcpSeq::from(previous_snd_una);
@@ -1312,9 +1142,12 @@ where
         payload_acked
     }
 
-    pub(crate) fn receive_final_ack(
+    pub(super) fn receive_final_ack(
         &mut self,
+        index: PoolIndex,
+        timers: &mut TcpTimers,
         packet: &TcpPacket,
+        now: Instant,
     ) -> CoreResult<Option<TcpSegment>> {
         self.ensure_state(TcpState::SynRcvd)?;
         if !self.observe_inbound_timestamp(
@@ -1328,6 +1161,7 @@ where
         if packet.flags.contains(TcpSegmentFlags::RST) {
             self.cacheline1.close_reason = Some(TcpCloseReason::RemoteReset);
             self.state = TcpState::Closed;
+            timers.reset(index, &mut self.timers, TcpTimerKind::Retransmit);
             return Ok(None);
         }
         let Some(acknowledgment) = packet.acknowledgment else {
@@ -1344,30 +1178,9 @@ where
         }
         self.apply_ack(acknowledgment, packet.advertised_window);
         self.state = TcpState::Established;
-        self.timer_reset(TCP_TIMER_RETRANSMIT);
-        self.record_activity(Instant::now());
+        timers.reset(index, &mut self.timers, TcpTimerKind::Retransmit);
+        self.observe_activity(index, timers, now)?;
         Ok(None)
-    }
-
-    pub(super) fn receive_final_ack_with_timers(
-        &mut self,
-        index: PoolIndex,
-        timers: &mut TcpTimers,
-        packet: &TcpPacket,
-        now: Instant,
-    ) -> CoreResult<Option<TcpSegment>> {
-        let control = self.receive_final_ack(packet)?;
-        match self.state {
-            TcpState::Established => {
-                timers.reset(index, &mut self.timers, TcpTimerKind::Retransmit);
-                self.observe_activity(index, timers, now)?;
-            }
-            TcpState::Closed => {
-                timers.reset(index, &mut self.timers, TcpTimerKind::Retransmit);
-            }
-            _ => {}
-        }
-        Ok(control)
     }
 
     #[inline]
@@ -1488,15 +1301,11 @@ where
         ))
     }
 
-    pub(crate) fn commit_payload_tx(
-        &mut self,
-        payload_len: usize,
-        now: Instant,
-    ) -> CoreResult<u16> {
+    pub(crate) fn commit_payload_tx(&mut self, payload_len: usize, now: Instant) -> CoreResult<()> {
         if self.state == TcpState::SynSent {
             if self.tx_intent_sequence.is_some() {
                 self.clear_tx_intent();
-                return Ok(timer_bit(TCP_TIMER_RETRANSMIT));
+                return Ok(());
             }
             let payload_len = u32::try_from(payload_len)
                 .map_err(|_| TcpConnectionError::PayloadLengthOverflow)?;
@@ -1523,47 +1332,13 @@ where
             );
             self.fast_open_syn_payload_len = payload_len;
             self.snd_nxt = TcpSeq::from(end_sequence);
-            self.timer_set(TCP_TIMER_RETRANSMIT);
             self.pacing_ready = false;
-            return Ok(0);
+            return Ok(());
         }
         self.ensure_state(TcpState::Established)?;
         if self.tx_intent_sequence.is_some() {
             self.clear_tx_intent();
-            let mut timers = 0;
-            self.timer_set(TCP_TIMER_RETRANSMIT);
-            timers |= timer_bit(TCP_TIMER_RETRANSMIT);
-            if self
-                .recovery
-                .rack_timeout(now)
-                .map(|duration| duration.as_millis().div_ceil(10).max(1) as u64)
-                .is_some()
-            {
-                self.timer_set(TCP_TIMER_RACK);
-                timers |= timer_bit(TCP_TIMER_RACK);
-            } else {
-                self.timer_reset(TCP_TIMER_RACK);
-            }
-            if self
-                .recovery
-                .tlp_timeout(
-                    self.retransmit_timeout().smoothed_rtt(),
-                    self.retransmit_timeout().retransmit_timeout(),
-                )
-                .is_some()
-            {
-                self.timer_set(TCP_TIMER_TLP);
-                timers |= timer_bit(TCP_TIMER_TLP);
-            } else {
-                self.timer_reset(TCP_TIMER_TLP);
-            }
-            if self.snd_wnd == 0 && self.recovery.has_unacked_data() {
-                self.timer_set(TCP_TIMER_PERSIST);
-                timers |= timer_bit(TCP_TIMER_PERSIST);
-            } else {
-                self.timer_reset(TCP_TIMER_PERSIST);
-            }
-            return Ok(timers);
+            return Ok(());
         }
         let payload_len =
             u32::try_from(payload_len).map_err(|_| TcpConnectionError::PayloadLengthOverflow)?;
@@ -1585,45 +1360,9 @@ where
             .on_packet_sent(packet_number, payload_len, bytes_in_flight, now);
         self.snd_nxt = TcpSeq::from(end_sequence);
         self.pacing_ready = false;
-        self.record_activity(now);
-        let mut timers = 0;
-        self.timer_set(TCP_TIMER_RETRANSMIT);
-        timers |= timer_bit(TCP_TIMER_RETRANSMIT);
-        if self
-            .recovery
-            .rack_timeout(now)
-            .map(|duration| duration.as_millis().div_ceil(10).max(1) as u64)
-            .is_some()
-        {
-            self.timer_set(TCP_TIMER_RACK);
-            timers |= timer_bit(TCP_TIMER_RACK);
-        } else {
-            self.timer_reset(TCP_TIMER_RACK);
-        }
-        if self
-            .recovery
-            .tlp_timeout(
-                self.retransmit_timeout().smoothed_rtt(),
-                self.retransmit_timeout().retransmit_timeout(),
-            )
-            .is_some()
-        {
-            self.timer_set(TCP_TIMER_TLP);
-            timers |= timer_bit(TCP_TIMER_TLP);
-        } else {
-            self.timer_reset(TCP_TIMER_TLP);
-        }
-        if self
-            .congestion
-            .next_send_delay(self.output_payload_len() as u32)
-            .is_some()
-        {
-            self.timer_set(TCP_TIMER_PACING);
-            timers |= timer_bit(TCP_TIMER_PACING);
-        } else {
-            self.timer_reset(TCP_TIMER_PACING);
-        }
-        Ok(timers)
+        self.keepalive.last_activity_at = now;
+        self.keepalive.probes_sent = 0;
+        Ok(())
     }
 
     pub(super) fn sync_payload_tx_timers(
@@ -1687,72 +1426,6 @@ where
         timers.update(index, &mut self.timers, TcpTimerKind::KeepAlive, keepalive)
     }
 
-    #[inline]
-    pub(crate) fn receive_ack(
-        &mut self,
-        packet: &TcpPacket,
-        acknowledgment: u32,
-        advertised_window: u16,
-        sack_blocks: &[TcpSackBlock],
-    ) -> u16 {
-        let now = Instant::now();
-        let acknowledgment = TcpSeq::from(acknowledgment);
-        let _ = self.observe_ack_progress(packet, acknowledgment, sack_blocks);
-        self.apply_ack(acknowledgment, advertised_window);
-        self.record_activity(now);
-        self.timer_reset(TCP_TIMER_DELAYED_ACK);
-        let mut timers = 0;
-        if self.recovery.has_unacked_data() {
-            self.timer_set(TCP_TIMER_RETRANSMIT);
-            timers |= timer_bit(TCP_TIMER_RETRANSMIT);
-        } else {
-            self.timer_reset(TCP_TIMER_RETRANSMIT);
-        }
-        if self.snd_wnd == 0 && self.recovery.has_unacked_data() {
-            self.timer_set(TCP_TIMER_PERSIST);
-            self.timer_reset(TCP_TIMER_RACK);
-            self.timer_reset(TCP_TIMER_TLP);
-            self.timer_reset(TCP_TIMER_PACING);
-        } else {
-            self.timer_reset(TCP_TIMER_PERSIST);
-            if self
-                .recovery
-                .rack_timeout(now)
-                .map(|duration| duration.as_millis().div_ceil(10).max(1) as u64)
-                .is_some()
-            {
-                self.timer_set(TCP_TIMER_RACK);
-                timers |= timer_bit(TCP_TIMER_RACK);
-            } else {
-                self.timer_reset(TCP_TIMER_RACK);
-            }
-            if self
-                .recovery
-                .tlp_timeout(
-                    self.retransmit_timeout().smoothed_rtt(),
-                    self.retransmit_timeout().retransmit_timeout(),
-                )
-                .is_some()
-            {
-                self.timer_set(TCP_TIMER_TLP);
-                timers |= timer_bit(TCP_TIMER_TLP);
-            } else {
-                self.timer_reset(TCP_TIMER_TLP);
-            }
-            if self
-                .congestion
-                .next_send_delay(self.output_payload_len() as u32)
-                .is_some()
-            {
-                self.timer_set(TCP_TIMER_PACING);
-                timers |= timer_bit(TCP_TIMER_PACING);
-            } else {
-                self.timer_reset(TCP_TIMER_PACING);
-            }
-        }
-        timers
-    }
-
     pub(super) fn receive_ack_with_timers(
         &mut self,
         index: PoolIndex,
@@ -1790,38 +1463,6 @@ where
             timers.reset(index, &mut self.timers, TcpTimerKind::Retransmit);
         }
         self.sync_recovery_timers(index, timers, now, recovery_timing_changed)
-    }
-
-    pub(crate) fn receive_established(
-        &mut self,
-        packet: &TcpPacket,
-    ) -> CoreResult<(Option<TcpSegment>, u16)> {
-        self.ensure_state(TcpState::Established)?;
-        if !self.observe_inbound_timestamp(
-            packet.flags,
-            packet.timestamp,
-            packet.sequence,
-            packet.payload_len,
-        ) {
-            return Ok((None, 0));
-        }
-        self.record_activity(Instant::now());
-        self.observe_peer_ecn_feedback(packet);
-        let mut timers = 0;
-        if let Some(acknowledgment) = packet.acknowledgment
-            && packet.flags.contains(TcpSegmentFlags::ACK)
-        {
-            timers |= self.receive_ack(
-                packet,
-                acknowledgment.raw(),
-                packet.advertised_window,
-                packet.sack_blocks.as_slice(),
-            );
-        }
-        if let Some(segment) = self.receive_fin_in_established(packet)? {
-            return Ok((Some(segment), timers));
-        }
-        Ok((None, timers))
     }
 
     pub(super) fn receive_established_with_timers(
@@ -1915,7 +1556,7 @@ where
         }
 
         match self.state {
-            TcpState::SynRcvd => self.receive_final_ack_with_timers(index, timers, packet, now),
+            TcpState::SynRcvd => self.receive_final_ack(index, timers, packet, now),
             TcpState::FinWait1 => {
                 if packet.flags.contains(TcpSegmentFlags::FIN) && packet.sequence == self.rcv_nxt {
                     self.rcv_nxt = self.rcv_nxt.advance(1);
@@ -2084,37 +1725,13 @@ where
             .has_pending_output(self.negotiated_options().timestamps)
     }
 
-    #[inline]
-    pub(crate) fn on_tcp_ready(
+    fn ready_segment(
         &mut self,
         has_pending_tx: bool,
         local_capabilities: TcpCapabilities,
     ) -> Option<TcpSegment> {
         if self.state == TcpState::SynSent && !has_pending_tx && !self.recovery.has_unacked_data() {
             return self.tx_segment(0, local_capabilities).ok();
-        }
-        if self.state == TcpState::Established {
-            if self.recovery.has_unacked_data() || has_pending_tx {
-                self.timer_set(TCP_TIMER_RETRANSMIT);
-            } else {
-                self.timer_reset(TCP_TIMER_RETRANSMIT);
-            }
-            if self.snd_wnd == 0 && has_pending_tx {
-                self.timer_set(TCP_TIMER_PERSIST);
-            } else if self.snd_wnd != 0 || !self.recovery.has_unacked_data() {
-                self.timer_reset(TCP_TIMER_PERSIST);
-            }
-            if has_pending_tx
-                && self
-                    .congestion
-                    .next_send_delay(self.output_payload_len() as u32)
-                    .is_some()
-            {
-                self.timer_set(TCP_TIMER_PACING);
-            } else {
-                self.timer_reset(TCP_TIMER_PACING);
-            }
-            self.timer_set(TCP_TIMER_KEEP_ALIVE);
         }
         let local = self.local?;
         match self.state {
@@ -2143,7 +1760,6 @@ where
             }
             TcpState::FinWait1 | TcpState::LastAck if self.snd_una == self.snd_nxt => {
                 self.snd_nxt = self.snd_nxt.advance(1);
-                self.timer_set(TCP_TIMER_RETRANSMIT);
                 Some(TcpSegment::new(
                     local,
                     self.remote(),
@@ -2177,7 +1793,7 @@ where
         }
     }
 
-    pub(super) fn on_tcp_ready_with_timers(
+    pub(super) fn on_tcp_ready(
         &mut self,
         index: PoolIndex,
         timers: &mut TcpTimers,
@@ -2214,15 +1830,14 @@ where
             };
             timers.set(index, &mut self.timers, TcpTimerKind::KeepAlive, keepalive)?;
         }
-        let segment = self.on_tcp_ready(has_pending_tx, local_capabilities);
-        match self.state {
+        let segment = self.ready_segment(has_pending_tx, local_capabilities);
+        if matches!(
+            self.state,
             TcpState::SynSent | TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck
-                if self.timer_is_active(TCP_TIMER_RETRANSMIT) =>
-            {
-                let interval = self.retransmit_timeout().retransmit_timeout();
-                timers.set(index, &mut self.timers, TcpTimerKind::Retransmit, interval)?;
-            }
-            _ => {}
+        ) && (self.state == TcpState::SynSent || self.snd_una != self.snd_nxt)
+        {
+            let interval = self.retransmit_timeout().retransmit_timeout();
+            timers.set(index, &mut self.timers, TcpTimerKind::Retransmit, interval)?;
         }
         if self.state != TcpState::Established {
             timers.reset(index, &mut self.timers, TcpTimerKind::KeepAlive);
@@ -2232,46 +1847,21 @@ where
     }
 
     #[inline]
-    pub(crate) fn on_session_close(&mut self) {
+    pub(super) fn on_session_close(&mut self, index: PoolIndex, timers: &mut TcpTimers) {
         match self.state {
             TcpState::Established => {
                 self.cacheline1.close_reason = Some(TcpCloseReason::LocalRequest);
                 self.state = TcpState::FinWait1;
-                self.timer_reset(TCP_TIMER_KEEP_ALIVE);
-                self.timer_reset(TCP_TIMER_PACING);
+                timers.reset(index, &mut self.timers, TcpTimerKind::KeepAlive);
+                timers.reset(index, &mut self.timers, TcpTimerKind::Pacing);
             }
             TcpState::CloseWait => {
                 self.cacheline1.close_reason = Some(TcpCloseReason::LocalRequest);
                 self.state = TcpState::LastAck;
-                self.timer_reset(TCP_TIMER_KEEP_ALIVE);
-                self.timer_reset(TCP_TIMER_PACING);
+                timers.reset(index, &mut self.timers, TcpTimerKind::KeepAlive);
+                timers.reset(index, &mut self.timers, TcpTimerKind::Pacing);
             }
             _ => {}
-        }
-    }
-
-    pub(crate) fn on_tcp_timer_expiry(
-        &mut self,
-        timer_id: u32,
-        local_capabilities: TcpCapabilities,
-    ) -> Option<TcpSegment> {
-        if !self.timer_is_supported(timer_id) {
-            return None;
-        }
-        self.timer_reset(timer_id);
-        if !self.legacy_timer_dispatch_pending(timer_id) {
-            return None;
-        }
-        match timer_id {
-            TCP_TIMER_RETRANSMIT => self.on_retransmit_timer_expiry(local_capabilities),
-            TCP_TIMER_RACK => self.on_rack_timer_expiry(),
-            TCP_TIMER_TLP => self.on_tlp_timer_expiry(),
-            TCP_TIMER_DELAYED_ACK => self.on_delayed_ack_timer_expiry(),
-            TCP_TIMER_PERSIST => self.on_persist_timer_expiry(),
-            TCP_TIMER_KEEP_ALIVE => self.on_keepalive_timer_expiry(),
-            TCP_TIMER_TIME_WAIT => self.on_time_wait_timer_expiry(),
-            TCP_TIMER_PACING => self.on_pacing_timer_expiry(),
-            _ => None,
         }
     }
 
@@ -2302,11 +1892,18 @@ where
                 timers.reset(index, &mut self.timers, TcpTimerKind::Rack);
                 timers.reset(index, &mut self.timers, TcpTimerKind::Tlp);
                 timers.reset(index, &mut self.timers, TcpTimerKind::Pacing);
-                if self.timer_is_supported(TCP_TIMER_RETRANSMIT)
-                    && self.timer_is_active(TCP_TIMER_RETRANSMIT)
-                {
+                if matches!(
+                    self.state,
+                    TcpState::SynSent
+                        | TcpState::Established
+                        | TcpState::FinWait1
+                        | TcpState::Closing
+                        | TcpState::LastAck
+                ) {
                     let interval = self.retransmit_timeout().retransmit_timeout();
                     timers.update(index, &mut self.timers, TcpTimerKind::Retransmit, interval)?;
+                } else {
+                    timers.reset(index, &mut self.timers, TcpTimerKind::Retransmit);
                 }
             }
             TcpTimerKind::Rack => {
@@ -2362,25 +1959,12 @@ where
         }
     }
 
-    fn legacy_timer_dispatch_pending(&self, timer_id: u32) -> bool {
-        match (self.state, timer_id) {
-            (TcpState::SynSent, _)
-            | (TcpState::Established, _)
-            | (TcpState::FinWait1, TCP_TIMER_RETRANSMIT)
-            | (TcpState::Closing, TCP_TIMER_RETRANSMIT)
-            | (TcpState::LastAck, TCP_TIMER_RETRANSMIT)
-            | (TcpState::TimeWait, _) => true,
-            _ => false,
-        }
-    }
-
     fn on_retransmit_timer_expiry(
         &mut self,
         local_capabilities: TcpCapabilities,
     ) -> Option<TcpSegment> {
         if self.state == TcpState::SynSent {
             self.observe_retransmit_timeout();
-            self.timer_set(TCP_TIMER_RETRANSMIT);
             let local = self.local?;
             let capabilities = normalize_tcp_capabilities(local_capabilities);
             let flags = if capabilities.ecn {
@@ -2412,10 +1996,6 @@ where
                     &mut self.congestion,
                 )?;
                 self.observe_retransmit_timeout();
-                self.timer_set(TCP_TIMER_RETRANSMIT);
-                self.timer_reset(TCP_TIMER_RACK);
-                self.timer_reset(TCP_TIMER_TLP);
-                self.timer_reset(TCP_TIMER_PACING);
                 self.tx_intent_sequence = Some(sample.sequence);
                 self.tx_intent_payload_len = sample.payload_len;
                 self.pacing_ready = true;
@@ -2423,7 +2003,6 @@ where
             }
             TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck => {
                 self.observe_retransmit_timeout();
-                self.timer_set(TCP_TIMER_RETRANSMIT);
                 let local = self.local?;
                 Some(TcpSegment::new(
                     local,
@@ -2450,14 +2029,6 @@ where
         self.recovery
             .on_rack_timeout(now, self.snd_nxt, &mut self.congestion);
         let sample = self.recovery.take_rack_retransmit()?;
-        if self
-            .recovery
-            .rack_timeout(now)
-            .map(|duration| duration.as_millis().div_ceil(10).max(1) as u64)
-            .is_some()
-        {
-            self.timer_set(TCP_TIMER_RACK);
-        }
         self.recovery.on_retransmit_sent(sample.bytes);
         self.tx_intent_sequence = Some(sample.sequence);
         self.tx_intent_payload_len = sample.payload_len;
@@ -2468,16 +2039,6 @@ where
     fn on_tlp_timer_expiry(&mut self) -> Option<TcpSegment> {
         self.ensure_state(TcpState::Established).ok()?;
         let sample = self.recovery.take_tlp_probe()?;
-        if self
-            .recovery
-            .tlp_timeout(
-                self.retransmit_timeout().smoothed_rtt(),
-                self.retransmit_timeout().retransmit_timeout(),
-            )
-            .is_some()
-        {
-            self.timer_set(TCP_TIMER_TLP);
-        }
         if self.recovery.in_recovery() {
             self.recovery.on_retransmit_sent(sample.bytes);
         }
@@ -2514,10 +2075,8 @@ where
         }
         self.cacheline1.persist_attempts = self.cacheline1.persist_attempts.saturating_add(1);
         if self.tx_intent_sequence.is_some() {
-            self.timer_set(TCP_TIMER_PERSIST);
             return None;
         }
-        self.timer_set(TCP_TIMER_PERSIST);
         self.tx_intent_sequence = Some(self.snd_una);
         self.tx_intent_payload_len = 1;
         self.pacing_ready = true;
@@ -2535,11 +2094,9 @@ where
         if self.keepalive.probes_sent >= self.keepalive.config.probe_limit {
             self.cacheline1.close_reason = Some(TcpCloseReason::KeepAliveTimeout);
             self.state = TcpState::Closed;
-            self.timer_reset(TCP_TIMER_KEEP_ALIVE);
             return None;
         }
         self.keepalive.probes_sent = self.keepalive.probes_sent.saturating_add(1);
-        self.timer_set(TCP_TIMER_KEEP_ALIVE);
         let local = self.local?;
         Some(TcpSegment::new(
             local,
@@ -2566,7 +2123,6 @@ where
         {
             return None;
         }
-        self.timer_set(TCP_TIMER_PACING);
         self.pacing_ready = true;
         if self.tx_intent_sequence.is_none() {
             self.tx_intent_sequence = Some(self.snd_nxt);
@@ -2617,8 +2173,10 @@ where
             flags: TcpSegmentFlags::ACK,
             ..packet
         };
+        let now = Instant::now();
+        let mut timers = TcpTimers::new(now, Duration::from_millis(10));
         let _ = connection
-            .receive_final_ack(&final_packet)
+            .receive_final_ack(PoolIndex::new(0, 0), &mut timers, &final_packet, now)
             .expect("accept final ack");
         connection
     }
@@ -2762,11 +2320,6 @@ fn clamp_retransmit_timeout(timeout: Duration) -> Duration {
     }
 }
 
-#[inline(always)]
-const fn timer_bit(timer_id: u32) -> u16 {
-    1u16 << timer_id
-}
-
 #[inline]
 fn ace_counter(flags: TcpSegmentFlags) -> u8 {
     ((flags.contains(TcpSegmentFlags::NS) as u8) << 2)
@@ -2843,6 +2396,19 @@ mod tests {
     ) -> CoreResult<Option<TcpSegment>> {
         let mut timers = TcpTimers::new(Instant::now(), Duration::from_millis(10));
         connection.receive_close_side(PoolIndex::new(0, 0), &mut timers, packet, Instant::now())
+    }
+
+    fn start_local_close_for_test<C: CongestionController>(
+        connection: &mut TcpConnection<C>,
+    ) -> TcpSegment {
+        let now = Instant::now();
+        let index = PoolIndex::new(0, 0);
+        let mut timers = TcpTimers::new(now, Duration::from_millis(10));
+        connection.on_session_close(index, &mut timers);
+        connection
+            .on_tcp_ready(index, &mut timers, false, TcpCapabilities::default(), now)
+            .expect("prepare close output")
+            .expect("fin")
     }
 
     #[test]
@@ -3870,8 +3436,11 @@ mod tests {
         };
         connection.connect_state(100);
 
+        let now = Instant::now();
+        let mut timers = TcpTimers::new(now, Duration::from_millis(10));
         let segment = connection
-            .on_tcp_ready(false, local_caps)
+            .on_tcp_ready(PoolIndex::new(0, 0), &mut timers, false, local_caps, now)
+            .expect("prepare syn")
             .expect("initial syn should be emitted");
         let mut header = [0u8; 64];
         let header_len = segment.write_header(&mut header).expect("write header");
@@ -3909,9 +3478,21 @@ mod tests {
         let _ = connection
             .commit_payload_tx(5, now)
             .expect("commit syn payload");
+        let index = PoolIndex::new(0, 0);
+        let mut timers = TcpTimers::new(now, Duration::from_millis(10));
+        connection
+            .sync_payload_tx_timers(index, &mut timers, now)
+            .expect("arm SYN retransmit");
 
         let segment = connection
-            .on_tcp_timer_expiry(TCP_TIMER_RETRANSMIT, local_caps)
+            .on_typed_timer_expiry(
+                index,
+                &mut timers,
+                TcpTimerKind::Retransmit,
+                local_caps,
+                now,
+            )
+            .expect("dispatch retransmit")
             .expect("retransmit");
         let mut header = [0u8; 64];
         let header_len = segment.write_header(&mut header).expect("write header");
@@ -3947,83 +3528,6 @@ mod tests {
     }
 
     #[test]
-    fn tcp_established_supports_pacing_and_keepalive_timers() {
-        let mut connection = established_connection_with_pacing_controller();
-
-        assert!(connection.timer_is_supported(TCP_TIMER_PACING));
-        assert!(connection.timer_is_supported(TCP_TIMER_KEEP_ALIVE));
-        assert_eq!(
-            connection.timer_ticks(TCP_TIMER_PACING, Instant::now()),
-            None
-        );
-
-        let _ = connection.on_tcp_ready(true, TcpCapabilities::default());
-
-        assert!(connection.timer_is_active(TCP_TIMER_PACING));
-        assert_eq!(
-            connection.timer_ticks(TCP_TIMER_PACING, Instant::now()),
-            Some(3)
-        );
-        assert_eq!(
-            connection.timer_ticks(TCP_TIMER_KEEP_ALIVE, Instant::now()),
-            Some(7_500)
-        );
-    }
-
-    #[test]
-    fn tcp_pacing_timer_expiry_rearms_and_requests_tx_dispatch() {
-        let mut connection = established_connection_with_pacing_controller();
-
-        let _ = connection.on_tcp_ready(true, TcpCapabilities::default());
-
-        let pacing_segment =
-            connection.on_tcp_timer_expiry(TCP_TIMER_PACING, TcpCapabilities::default());
-        assert!(pacing_segment.is_none());
-
-        assert!(connection.timer_is_active(TCP_TIMER_PACING));
-        assert!(connection.pacing_ready());
-    }
-
-    #[test]
-    fn tcp_keepalive_timer_expiry_probes_then_closes_idle_connection() {
-        let mut connection = established_connection();
-
-        connection.timer_set(TCP_TIMER_KEEP_ALIVE);
-        connection.keepalive.last_activity_at = Instant::now()
-            .checked_sub(connection.keepalive.config.idle)
-            .expect("move keepalive activity into the past");
-
-        for probe in 0..connection.keepalive.config.probe_limit {
-            let segment = connection
-                .on_tcp_timer_expiry(TCP_TIMER_KEEP_ALIVE, TcpCapabilities::default())
-                .expect("keepalive probe");
-            let mut header = [0u8; 64];
-            let header_len = segment.write_header(&mut header).expect("write header");
-            let parsed =
-                etherparse::TcpSlice::from_slice(&header[..header_len]).expect("parse tcp header");
-
-            assert!(parsed.ack());
-            assert_eq!(
-                parsed.sequence_number(),
-                connection.snd_nxt().wrapping_sub(1),
-            );
-            assert_eq!(connection.keepalive.probes_sent, probe + 1);
-            assert!(connection.timer_is_active(TCP_TIMER_KEEP_ALIVE));
-        }
-
-        assert!(
-            connection
-                .on_tcp_timer_expiry(TCP_TIMER_KEEP_ALIVE, TcpCapabilities::default())
-                .is_none()
-        );
-        assert_eq!(connection.state(), TcpState::Closed);
-        assert_eq!(
-            connection.close_reason(),
-            Some(TcpCloseReason::KeepAliveTimeout)
-        );
-    }
-
-    #[test]
     fn tcp_keepalive_config_defaults_match_prior_constants_and_with_keepalive_overrides() {
         let default_config = TcpKeepaliveConfig::default();
         assert_eq!(default_config.idle, Duration::from_secs(75));
@@ -4055,10 +3559,7 @@ mod tests {
         let mut connection = established_connection();
         let initial_snd_nxt = connection.snd_nxt();
 
-        connection.on_session_close();
-        let segment = connection
-            .on_tcp_ready(false, TcpCapabilities::default())
-            .expect("fin");
+        let segment = start_local_close_for_test(&mut connection);
 
         assert_eq!(connection.state(), TcpState::FinWait1);
         let mut header = [0u8; 64];
@@ -4067,16 +3568,13 @@ mod tests {
             etherparse::TcpSlice::from_slice(&header[..header_len]).expect("parse tcp header");
         assert_eq!(parsed.sequence_number(), initial_snd_nxt);
         assert_eq!(connection.snd_nxt(), initial_snd_nxt.wrapping_add(1));
-        assert!(connection.timer_is_active(TCP_TIMER_RETRANSMIT));
+        assert!(connection.timer_state().is_active(TcpTimerKind::Retransmit));
     }
 
     #[test]
     fn tcp_finwait1_ack_of_local_fin_advances_to_finwait2() {
         let mut connection = established_connection();
-        connection.on_session_close();
-        let _ = connection
-            .on_tcp_ready(false, TcpCapabilities::default())
-            .expect("fin");
+        let _ = start_local_close_for_test(&mut connection);
         let packet = TcpPacket {
             local: connection.remote(),
             remote: connection.local().expect("local"),
@@ -4102,10 +3600,7 @@ mod tests {
     #[test]
     fn tcp_simultaneous_close_moves_to_closing_until_fin_is_acked() {
         let mut connection = established_connection();
-        connection.on_session_close();
-        let _ = connection
-            .on_tcp_ready(false, TcpCapabilities::default())
-            .expect("fin");
+        let _ = start_local_close_for_test(&mut connection);
         let fin = TcpPacket {
             local: connection.remote(),
             remote: connection.local().expect("local"),
@@ -4134,7 +3629,7 @@ mod tests {
         let _ = receive_close_side_for_test(&mut connection, &final_ack).expect("receive fin ack");
 
         assert_eq!(connection.state(), TcpState::TimeWait);
-        assert!(connection.timer_is_active(TCP_TIMER_TIME_WAIT));
+        assert!(connection.timer_state().is_active(TcpTimerKind::TimeWait));
     }
 
     #[test]
@@ -4977,85 +4472,6 @@ mod tests {
         assert_eq!(ace_delta(6, 1), 3);
     }
 
-    #[test]
-    fn time_wait_ticks_is_60s() {
-        assert_eq!(TCP_TIME_WAIT_TICKS, 6_000);
-    }
-
-    #[test]
-    fn persist_timer_backoff_doubles_interval_each_attempt() {
-        let now = Instant::now();
-        let mut connection = established_connection();
-
-        // Default RTO for a fresh connection is TCP_INITIAL_RETRANSMIT_TIMEOUT (50ms),
-        // so the persist base interval is 50ms / 10 = 5 ticks.
-        let base_ticks: u64 = (connection
-            .retransmit_timeout()
-            .retransmit_timeout()
-            .as_millis()
-            / 10) as u64;
-        assert_eq!(base_ticks, 5);
-
-        connection.snd_wnd = 0;
-        connection.timer_set(TCP_TIMER_PERSIST);
-
-        // Each persist expiry re-arms the timer and increments persist_attempts, so
-        // the interval read before the N-th arm uses shift=N: base, base*2, base*4.
-        let expected = [base_ticks, base_ticks * 2, base_ticks * 4];
-        for (step, expected_ticks) in expected.iter().enumerate() {
-            assert_eq!(
-                connection.timer_ticks(TCP_TIMER_PERSIST, now),
-                Some(*expected_ticks),
-                "persist interval before arm {step}"
-            );
-            let _ = connection.on_tcp_timer_expiry(TCP_TIMER_PERSIST, TcpCapabilities::default());
-        }
-
-        // Drive a large RTO so base << 9 exceeds the 60s cap and verify the cap binds.
-        while connection.retransmit_timeout().retransmit_timeout() < TCP_MAX_RETRANSMIT_TIMEOUT {
-            connection.observe_retransmit_timeout();
-        }
-        assert_eq!(
-            connection.retransmit_timeout().retransmit_timeout(),
-            TCP_MAX_RETRANSMIT_TIMEOUT
-        );
-        let maxed_base_ticks: u64 = (TCP_MAX_RETRANSMIT_TIMEOUT.as_millis() / 10) as u64;
-
-        // Reset attempts so the shift starts from 0 with the maxed RTO.
-        connection.snd_wnd = 8_000;
-        let _ = connection.on_tcp_timer_expiry(TCP_TIMER_PERSIST, TcpCapabilities::default());
-        assert_eq!(connection.timer_ticks(TCP_TIMER_PERSIST, now), None);
-
-        connection.snd_wnd = 0;
-        connection.timer_set(TCP_TIMER_PERSIST);
-        assert_eq!(
-            connection.timer_ticks(TCP_TIMER_PERSIST, now),
-            Some(maxed_base_ticks)
-        );
-
-        // Climb attempts until the shift cap (9) plus the 60s interval cap both bind.
-        for _ in 0..15 {
-            let _ = connection.on_tcp_timer_expiry(TCP_TIMER_PERSIST, TcpCapabilities::default());
-        }
-        let capped_ticks: u64 = TCP_MAX_RETRANSMIT_TIMEOUT.as_millis().div_ceil(10).max(1) as u64;
-        assert_eq!(
-            connection.timer_ticks(TCP_TIMER_PERSIST, now),
-            Some(capped_ticks),
-            "persist interval capped at 60s"
-        );
-
-        // Window opening resets the backoff so the next probe uses the base interval.
-        connection.snd_wnd = 8_000;
-        let _ = connection.on_tcp_timer_expiry(TCP_TIMER_PERSIST, TcpCapabilities::default());
-        connection.snd_wnd = 0;
-        connection.timer_set(TCP_TIMER_PERSIST);
-        assert_eq!(
-            connection.timer_ticks(TCP_TIMER_PERSIST, now),
-            Some(maxed_base_ticks),
-            "persist backoff resets when the window opens"
-        );
-    }
-
     use crate::session::SessionId;
     use crate::session::runtime::SessionDriverRuntime;
     use crate::transport::tcp::{TcpWorker, closing_session_for_test};
@@ -5093,10 +4509,23 @@ mod tests {
     ) where
         C: CongestionController + 'static,
     {
+        let (_, index) = driver
+            .sessions()
+            .session_transport(session_id)
+            .expect("session transport");
         {
-            let connection = driver.session_mut(session_id).expect("connection");
-            connection.on_session_close();
-            let _ = connection.on_tcp_ready(false, TcpCapabilities::default());
+            let worker = &mut driver.transports_mut().0;
+            let connection = worker.connections.get_mut(index).expect("connection");
+            connection.on_session_close(index, &mut worker.timers);
+            let _ = connection
+                .on_tcp_ready(
+                    index,
+                    &mut worker.timers,
+                    false,
+                    TcpCapabilities::default(),
+                    Instant::now(),
+                )
+                .expect("prepare final output");
         }
         let (rcv_nxt, snd_nxt) = {
             let connection = driver.session(session_id).expect("connection");
@@ -5117,24 +4546,11 @@ mod tests {
             payload_offset: 0,
             payload_len: 0,
         };
-        let now = {
-            let connection = driver.session_mut(session_id).expect("connection");
-            let _ = receive_close_side_for_test(connection, &packet).expect("receive fin ack");
-            std::time::Instant::now()
-        };
-        let session = session_id.pool_index();
-        let timer_ticks = {
-            let connection = driver.session(session_id).expect("connection");
-            std::array::from_fn(|timer_id| {
-                let timer_id = timer_id as u32;
-                connection
-                    .timer_is_active(timer_id)
-                    .then(|| connection.timer_ticks(timer_id, now))
-                    .flatten()
-            })
-        };
-        crate::transport::tcp::sync_all_tcp_timers(driver.timers_mut(), timer_ticks, session)
-            .expect("sync time wait timer");
+        driver
+            .transports_mut()
+            .0
+            .receive_close_side_for_test(index, &packet)
+            .expect("receive fin ack");
     }
 
     fn enter_close_wait_for_passive_close_test(
@@ -5148,9 +4564,15 @@ mod tests {
             (connection.rcv_nxt(), connection.snd_nxt())
         };
         let packet = peer_fin_packet(local, remote, rcv_nxt, snd_nxt);
-        let connection = driver.session_mut(session_id).expect("connection");
-        let (segment, _) = connection
-            .receive_established(&packet)
+        let (_, index) = driver
+            .sessions()
+            .session_transport(session_id)
+            .expect("session transport");
+        let now = Instant::now();
+        let worker = &mut driver.transports_mut().0;
+        let connection = worker.connections.get_mut(index).expect("connection");
+        let segment = connection
+            .receive_established_with_timers(index, &mut worker.timers, &packet, now)
             .expect("receive peer fin");
         assert!(
             segment.is_some(),
@@ -5169,9 +4591,15 @@ mod tests {
             (connection.rcv_nxt(), connection.snd_nxt())
         };
         let packet = peer_fin_packet(local, remote, rcv_nxt, snd_nxt);
-        let connection = driver.session_mut(session_id).expect("connection");
-        let (segment, _) = connection
-            .receive_established(&packet)
+        let (_, index) = driver
+            .sessions()
+            .session_transport(session_id)
+            .expect("session transport");
+        let now = Instant::now();
+        let worker = &mut driver.transports_mut().0;
+        let connection = worker.connections.get_mut(index).expect("connection");
+        let segment = connection
+            .receive_established_with_timers(index, &mut worker.timers, &packet, now)
             .expect("receive peer fin");
 
         let segment = segment.expect("ack segment");
@@ -5191,8 +4619,13 @@ mod tests {
 
         enter_close_wait_for_passive_close_test(&mut driver, session_id, local, remote);
 
-        let connection = driver.session_mut(session_id).expect("connection");
-        connection.on_session_close();
+        let (_, index) = driver
+            .sessions()
+            .session_transport(session_id)
+            .expect("session transport");
+        let worker = &mut driver.transports_mut().0;
+        let connection = worker.connections.get_mut(index).expect("connection");
+        connection.on_session_close(index, &mut worker.timers);
         assert_eq!(connection.state(), TcpState::LastAck);
     }
 
@@ -5202,8 +4635,13 @@ mod tests {
 
         enter_close_wait_for_passive_close_test(&mut driver, session_id, local, remote);
 
-        let connection = driver.session_mut(session_id).expect("connection");
-        connection.on_session_close();
+        let (_, index) = driver
+            .sessions()
+            .session_transport(session_id)
+            .expect("session transport");
+        let worker = &mut driver.transports_mut().0;
+        let connection = worker.connections.get_mut(index).expect("connection");
+        connection.on_session_close(index, &mut worker.timers);
         assert_eq!(connection.state(), TcpState::LastAck);
 
         let snd_nxt = connection.snd_nxt();
@@ -5234,7 +4672,7 @@ mod tests {
 
         let connection = driver.session(session_id).expect("session");
         assert_eq!(connection.state(), TcpState::TimeWait);
-        assert!(connection.timer_is_active(TCP_TIMER_TIME_WAIT));
+        assert!(connection.timer_state().is_active(TcpTimerKind::TimeWait));
     }
 
     #[test]
@@ -5275,6 +4713,6 @@ mod tests {
         assert!(parsed.ack());
         let connection = driver.session(session_id).expect("session");
         assert_eq!(connection.state(), TcpState::TimeWait);
-        assert!(connection.timer_is_active(TCP_TIMER_TIME_WAIT));
+        assert!(connection.timer_state().is_active(TcpTimerKind::TimeWait));
     }
 }

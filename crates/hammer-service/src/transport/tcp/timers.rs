@@ -93,11 +93,6 @@ impl TcpTimerState {
     }
 
     #[inline]
-    pub(super) fn active_bits(&self) -> u16 {
-        (self.armed | self.pending).bits()
-    }
-
-    #[inline]
     pub(super) fn arm(&mut self, kind: TcpTimerKind) {
         self.armed.insert(kind.flag());
     }

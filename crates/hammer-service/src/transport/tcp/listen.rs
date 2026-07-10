@@ -1421,7 +1421,7 @@ where
                 0,
                 capabilities,
             )?;
-            connection.receive_final_ack_with_timers(
+            connection.receive_final_ack(
                 connection_index,
                 timers,
                 packet,

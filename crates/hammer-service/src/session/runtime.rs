@@ -1,6 +1,6 @@
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crossbeam_utils::CachePadded;
 use hammer_core::data_plane::{BufferIndex, DataPlaneBuffers, Frame, Next};
@@ -9,7 +9,6 @@ use hammer_infra::fifo_queue::FifoQueue;
 use hammer_infra::msg_queue::{MsgQueue, SessionEvtType};
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::segment::{Local, Segment, Svm};
-use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
 use hammer_runtime::app::{AppContext, AppSessionConfig, SessionHandle, with_current_app_worker};
 use hammer_runtime::{DataPlaneRuntime, DataWorkerId, NodeRuntimeData};
 
@@ -17,11 +16,9 @@ use crate::session::app::SessionAppRuntimeCreate;
 use crate::session::state::SessionState;
 use crate::session::{SessionAppRuntime, SessionId, SessionQueueHandle, SessionQueueNext};
 
-const DEFAULT_SESSION_TIMER_TICK: Duration = Duration::from_millis(10);
 const DEFAULT_SESSION_POOL_CAPACITY: usize = 1024;
 const DEFAULT_SESSION_TX_EVENT_CAPACITY: usize = 2048;
 const DEFAULT_TX_DISPATCH_BUDGET: usize = 64;
-const SESSION_TIMER_KIND_COUNT: usize = u32::BITS as usize;
 
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -32,12 +29,6 @@ impl SessionTransportId {
     pub const fn new(value: u8) -> Self {
         Self(value)
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ExpiredTimer {
-    session_id: SessionId,
-    timer_id: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,7 +80,6 @@ const _: () = assert!(core::mem::size_of::<RxDelivery>() <= 24);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SessionQueueStep {
-    pub(crate) expired_timers: usize,
     pub(crate) scheduled_sessions: usize,
 }
 
@@ -121,11 +111,6 @@ pub struct SessionWorker<Index, Seg: Segment = Local> {
     session_work: hammer_infra::vec::Vec<SessionId>,
     session_work_scratch: hammer_infra::vec::Vec<SessionId>,
     control_events: FifoQueue<SessionControlEvent>,
-    timers: TimerWheel1t2w2048sl<u32>,
-    expired_timers: hammer_infra::vec::Vec<u32>,
-    pending_timers: FifoQueue<ExpiredTimer>,
-    timer_tick_duration: Duration,
-    last_timer_tick: Instant,
 }
 
 impl<Index: Copy + Eq, Seg: Segment> SessionWorker<Index, Seg> {
@@ -159,11 +144,6 @@ impl<Index: Copy + Eq, Seg: Segment> SessionWorker<Index, Seg> {
                 DEFAULT_SESSION_POOL_CAPACITY,
             ),
             control_events: FifoQueue::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
-            timers: TimerWheel1t2w2048sl::with_timer_ids(0, SESSION_TIMER_KIND_COUNT),
-            expired_timers: hammer_infra::vec::Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
-            pending_timers: FifoQueue::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
-            timer_tick_duration: DEFAULT_SESSION_TIMER_TICK,
-            last_timer_tick: Instant::now(),
         }
     }
 
@@ -185,11 +165,6 @@ impl<Index: Copy + Eq, Seg: Segment> SessionWorker<Index, Seg> {
     #[inline]
     pub fn buffers(&self) -> &DataPlaneBuffers {
         &self.buffers
-    }
-
-    #[inline]
-    pub(crate) fn timers_mut(&mut self) -> &mut TimerWheel1t2w2048sl<u32> {
-        &mut self.timers
     }
 
     #[inline]
@@ -346,36 +321,6 @@ impl<Index: Copy + Eq, Seg: Segment> SessionWorker<Index, Seg> {
     fn keep_work_scratch(&mut self, mut work: hammer_infra::vec::Vec<SessionId>) {
         work.clear();
         self.session_work_scratch = work;
-    }
-
-    fn elapsed_timer_ticks(&mut self, now: Instant) -> u32 {
-        if self.timer_tick_duration.is_zero() {
-            self.last_timer_tick = now;
-            return 0;
-        }
-        let elapsed = now.saturating_duration_since(self.last_timer_tick);
-        let ticks =
-            (elapsed.as_nanos() / self.timer_tick_duration.as_nanos()).min(u32::MAX as u128) as u32;
-        if ticks != 0 {
-            self.last_timer_tick += self.timer_tick_duration * ticks;
-        }
-        ticks
-    }
-
-    fn expire_legacy_timers(&mut self, ticks: u32) -> usize {
-        self.expired_timers.clear();
-        let count = self.timers.expire(ticks, &mut self.expired_timers);
-        for payload in self.expired_timers.as_slice() {
-            let Some((slot, generation, timer_id)) = self.timers.take_expired_timer(*payload)
-            else {
-                continue;
-            };
-            self.pending_timers.push_back(ExpiredTimer {
-                session_id: SessionId::from(PoolIndex::new(slot, generation)),
-                timer_id,
-            });
-        }
-        count
     }
 
     pub(crate) fn ack_tx_up_to(&mut self, session_id: SessionId, bytes: usize) -> CoreResult<()>
@@ -578,11 +523,6 @@ where
     {
         self.sessions
             .enqueue_rx(session_id, index, offset, queue_event)
-    }
-
-    #[inline]
-    pub(crate) fn timers_mut(&mut self) -> &mut TimerWheel1t2w2048sl<u32> {
-        self.sessions.timers_mut()
     }
 
     #[cfg(test)]
@@ -994,10 +934,10 @@ where
     }
 }
 
-pub fn dispatch_session_queue_for_ticks<T, Seg, Index>(
+#[cfg(test)]
+pub fn dispatch_session_queue_once<T, Seg, Index>(
     runtime: &DataPlaneRuntime,
     driver: &mut SessionDriverRuntime<T, Seg, Index>,
-    timer_ticks: u32,
     output_next: SessionQueueNext,
 ) -> CoreResult<SessionQueueStep>
 where
@@ -1008,14 +948,7 @@ where
 {
     let now = Instant::now();
     let mut output = crate::session::node::SessionQueueOutput::default();
-    let step = dispatch_session_queue_pending(
-        runtime,
-        driver,
-        timer_ticks,
-        output_next,
-        &mut output,
-        now,
-    )?;
+    let step = dispatch_session_queue_pending(runtime, driver, output_next, &mut output, now)?;
     output.schedule(runtime)?;
     Ok(step)
 }
@@ -1035,15 +968,13 @@ where
 {
     let mut driver =
         SessionQueueHandle::<SessionDriverRuntime<T, Seg, Index>>::new(data).borrow_mut()?;
-    let ticks = driver.sessions.elapsed_timer_ticks(now);
-    dispatch_session_queue_pending(runtime, &mut driver, ticks, output_next, output, now)?;
+    dispatch_session_queue_pending(runtime, &mut driver, output_next, output, now)?;
     Ok(())
 }
 
 pub fn dispatch_session_queue_pending<T, Seg, Index>(
     runtime: &DataPlaneRuntime,
     driver: &mut SessionDriverRuntime<T, Seg, Index>,
-    timer_ticks: u32,
     output_next: SessionQueueNext,
     output: &mut crate::session::node::SessionQueueOutput,
     now: Instant,
@@ -1060,7 +991,6 @@ where
     } = driver;
     transports.update_time(sessions, runtime, output_next, output, now)?;
     sessions.poll_app()?;
-    let _ = timer_ticks;
 
     let control_count = sessions.control_events.len();
     for _ in 0..control_count {
@@ -1101,10 +1031,7 @@ where
         )?;
     }
     sessions.keep_work_scratch(work);
-    Ok(SessionQueueStep {
-        expired_timers: 0,
-        scheduled_sessions,
-    })
+    Ok(SessionQueueStep { scheduled_sessions })
 }
 
 #[cfg(test)]

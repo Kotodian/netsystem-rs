@@ -40,11 +40,8 @@ pub mod syn_sent;
 mod timers;
 pub(crate) mod worker;
 
-pub(crate) use connection::sync_all_tcp_timers;
 pub use connection::{
     TCP_INITIAL_RETRANSMIT_TIMEOUT, TCP_MAX_RETRANSMIT_TIMEOUT, TCP_MIN_RETRANSMIT_TIMEOUT,
-    TCP_TIMER_COUNT, TCP_TIMER_DELAYED_ACK, TCP_TIMER_KEEP_ALIVE, TCP_TIMER_PACING,
-    TCP_TIMER_PERSIST, TCP_TIMER_RACK, TCP_TIMER_RETRANSMIT, TCP_TIMER_TIME_WAIT, TCP_TIMER_TLP,
     TcpConnection, TcpRetransmitTimeoutState,
 };
 pub use established::{TcpEstablishedNext, TcpEstablishedNode};
@@ -594,9 +591,6 @@ where
             fast_open: cached_fast_open.is_some(),
         },
     );
-    if let Some(connection) = driver.session_mut(session_id) {
-        connection.timer_set(TCP_TIMER_RETRANSMIT);
-    }
     driver.mark_session_ready(session_id);
     Ok(session_id)
 }
@@ -686,7 +680,7 @@ mod legacy_tests {
     use crate::session::SessionId;
     use crate::session::runtime::{
         SessionDriverRuntime, SessionPacketizedTransport, TxBatchBuffer,
-        dispatch_session_queue_for_ticks, dispatch_session_queue_pending,
+        dispatch_session_queue_once, dispatch_session_queue_pending,
     };
     use crate::transport::congestion::BbrController;
 
@@ -718,6 +712,27 @@ mod legacy_tests {
             .get_mut(connection_index)
             .ok_or(TcpNodeError::SessionMissing)?
             .receive_close_side(connection_index, timers, packet, Instant::now())
+    }
+
+    fn receive_established_for_test<C: CongestionController + 'static>(
+        driver: &mut SessionDriverRuntime<(TcpWorker<C>, ()), Local, PoolIndex>,
+        session_id: SessionId,
+        packet: &TcpPacket,
+    ) -> CoreResult<Option<TcpSegment>> {
+        let (_, connection_index) = driver
+            .sessions()
+            .session_transport(session_id)
+            .ok_or(TcpNodeError::SessionMissing)?;
+        let worker = &mut driver.transports_mut().0;
+        let TcpWorker {
+            connections,
+            timers,
+            ..
+        } = worker;
+        connections
+            .get_mut(connection_index)
+            .ok_or(TcpNodeError::SessionMissing)?
+            .receive_established_with_timers(connection_index, timers, packet, Instant::now())
     }
 
     fn clean_in_order_payload_for_test<C: CongestionController + 'static>(
@@ -948,16 +963,14 @@ mod legacy_tests {
     fn expire_tcp_timers(
         runtime: &DataPlaneRuntime,
         driver: &mut SessionDriverRuntime<(TcpWorker<BbrController>, ()), Local, PoolIndex>,
-        ticks: u32,
+        elapsed: Duration,
         output_node: NodeId,
     ) {
         let next: crate::session::SessionQueueNext = output_node.into();
-        let now = Instant::now() + Duration::from_millis(u64::from(ticks) * 10);
+        let now = Instant::now() + elapsed;
         let mut output = SessionQueueOutput;
-        for _ in 0..ticks.div_ceil(1_024).max(1) {
-            let _ = dispatch_session_queue_pending(runtime, driver, 0, next, &mut output, now)
-                .expect("dispatch TCP timer update");
-        }
+        let _ = dispatch_session_queue_pending(runtime, driver, next, &mut output, now)
+            .expect("dispatch TCP timer update");
         output.schedule(runtime).expect("schedule TCP timer output");
         let _ = runtime.run_ready_nodes().expect("run timer output");
     }
@@ -980,7 +993,7 @@ mod legacy_tests {
     }
 
     #[test]
-    fn tcp_custom_tx_handles_special_output_without_normal_packetization() {
+    fn tcp_control_tx_handles_special_output_without_normal_packetization() {
         let runtime =
             hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
@@ -998,14 +1011,9 @@ mod legacy_tests {
             .expect("insert session");
         publish_tcp_connection(&mut driver, session_id).expect("refresh session route");
 
-        {
-            let connection = driver.session_mut(session_id).expect("connection");
-            connection.on_session_close();
-        }
-
-        driver.schedule_session_work_for_test(session_id);
+        driver.schedule_disconnect_for_test(session_id);
         let output_next: crate::session::SessionQueueNext = output_node.into();
-        let dispatched = dispatch_session_queue_for_ticks(&runtime, &mut driver, 0, output_next)
+        let dispatched = dispatch_session_queue_once(&runtime, &mut driver, output_next)
             .expect("dispatch control tx");
         let _ = runtime.run_ready_nodes().expect("run tcp output");
 
@@ -1065,7 +1073,7 @@ mod legacy_tests {
 
         let next: crate::session::SessionQueueNext = output_node.into();
         let dispatched =
-            dispatch_session_queue_for_ticks(&runtime, &mut driver, 0, next).expect("dispatch tx");
+            dispatch_session_queue_once(&runtime, &mut driver, next).expect("dispatch tx");
         assert!(dispatched.scheduled_sessions >= 1);
         let _ = runtime.run_ready_nodes().expect("run tcp output");
 
@@ -1124,7 +1132,7 @@ mod legacy_tests {
             let connection = driver.session(session_id).expect("connection");
             (
                 connection.snd_nxt(),
-                connection.timer_is_active(TCP_TIMER_RETRANSMIT),
+                connection.timer_state().is_active(TcpTimerKind::Retransmit),
             )
         };
 
@@ -1133,7 +1141,7 @@ mod legacy_tests {
         let connection = driver.session(session_id).expect("connection");
         assert_eq!(connection.snd_nxt(), initial_snd_nxt);
         assert_eq!(
-            connection.timer_is_active(TCP_TIMER_RETRANSMIT),
+            connection.timer_state().is_active(TcpTimerKind::Retransmit),
             retransmit_active
         );
     }
@@ -1179,7 +1187,7 @@ mod legacy_tests {
         let initial_snd_nxt = driver.session(session_id).expect("connection").snd_nxt();
         let next: crate::session::SessionQueueNext = output_node.into();
         let dispatched =
-            dispatch_session_queue_for_ticks(&runtime, &mut driver, 0, next).expect("dispatch tx");
+            dispatch_session_queue_once(&runtime, &mut driver, next).expect("dispatch tx");
         assert!(dispatched.scheduled_sessions >= 1);
         let _ = runtime.run_ready_nodes().expect("run tcp output");
 
@@ -1257,7 +1265,12 @@ mod legacy_tests {
                 .expect("arm keepalive");
         }
 
-        expire_tcp_timers(&runtime, &mut driver, 1, output_node);
+        expire_tcp_timers(
+            &runtime,
+            &mut driver,
+            Duration::from_millis(10),
+            output_node,
+        );
 
         assert!(drop_state.lock().expect("drop").packets.is_empty());
         let packets = &lookup_state.lock().expect("lookup").packets;
@@ -1268,8 +1281,8 @@ mod legacy_tests {
         assert_eq!(tcp_segment_payload(packet), b"");
         assert_eq!(tcp_sequence_number(packet), expected_sequence);
         let connection = driver.session(session_id).expect("connection");
-        assert!(!connection.timer_is_active(TCP_TIMER_DELAYED_ACK));
-        assert!(connection.timer_is_active(TCP_TIMER_KEEP_ALIVE));
+        assert!(!connection.timer_state().is_active(TcpTimerKind::DelayedAck));
+        assert!(connection.timer_state().is_active(TcpTimerKind::KeepAlive));
     }
 
     #[test]
@@ -1321,10 +1334,9 @@ mod legacy_tests {
             payload_len: 5,
         };
         let control = {
-            let connection = driver.session_mut(session_id).expect("connection");
-            let (control, _) = connection
-                .receive_established(&packet)
+            let control = receive_established_for_test(&mut driver, session_id, &packet)
                 .expect("receive data");
+            let connection = driver.session(session_id).expect("connection");
             assert!(connection.accept_payload(&packet).is_some());
             control
         };
@@ -1357,7 +1369,12 @@ mod legacy_tests {
         assert!(drop_state.lock().expect("drop").packets.is_empty());
         assert!(lookup_state.lock().expect("lookup").packets.is_empty());
 
-        expire_tcp_timers(&runtime, &mut driver, 1, output_node);
+        expire_tcp_timers(
+            &runtime,
+            &mut driver,
+            Duration::from_millis(10),
+            output_node,
+        );
 
         assert!(drop_state.lock().expect("drop").packets.is_empty());
         let packets = &lookup_state.lock().expect("lookup").packets;
@@ -1377,10 +1394,23 @@ mod legacy_tests {
     ) where
         C: CongestionController + 'static,
     {
+        let (_, index) = driver
+            .sessions()
+            .session_transport(session_id)
+            .expect("session transport");
         {
-            let connection = driver.session_mut(session_id).expect("connection");
-            connection.on_session_close();
-            let _ = connection.on_tcp_ready(false, TcpCapabilities::default());
+            let worker = &mut driver.transports_mut().0;
+            let connection = worker.connections.get_mut(index).expect("connection");
+            connection.on_session_close(index, &mut worker.timers);
+            let _ = connection
+                .on_tcp_ready(
+                    index,
+                    &mut worker.timers,
+                    false,
+                    TcpCapabilities::default(),
+                    Instant::now(),
+                )
+                .expect("prepare close output");
         }
         let (rcv_nxt, snd_nxt) = {
             let connection = driver.session(session_id).expect("connection");
@@ -1436,10 +1466,9 @@ mod legacy_tests {
             (connection.rcv_nxt(), connection.snd_nxt())
         };
         let packet = peer_fin_packet(local, remote, rcv_nxt.wrapping_add(1), snd_nxt);
-        let connection = driver.session_mut(session_id).expect("connection");
-        let (segment, _) = connection
-            .receive_established(&packet)
+        let segment = receive_established_for_test(&mut driver, session_id, &packet)
             .expect("receive out-of-order fin");
+        let connection = driver.session(session_id).expect("connection");
 
         assert!(segment.is_none());
         assert_eq!(connection.state(), TcpState::Established);
@@ -1463,13 +1492,7 @@ mod legacy_tests {
 
         drive_fin_ack_to_time_wait(&mut driver, session_id, local, remote);
 
-        expire_tcp_timers(
-            &runtime,
-            &mut driver,
-            u32::try_from(crate::transport::tcp::connection::TCP_TIME_WAIT_TICKS)
-                .expect("time wait ticks fit u32"),
-            output_node,
-        );
+        expire_tcp_timers(&runtime, &mut driver, Duration::from_secs(60), output_node);
 
         assert!(driver.session(session_id).is_none());
     }

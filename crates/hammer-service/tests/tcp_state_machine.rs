@@ -72,18 +72,6 @@ fn packet_nodes_do_not_drive_tcp_queue_state() {
 }
 
 #[test]
-fn tcp_timer_dispatch_is_owned_by_connection() {
-    let source = read_tcp_source("src/transport/tcp/connection.rs");
-    assert!(!source.contains("on_retransmit_timeout"));
-    assert!(!source.contains("retransmit_syn_header_if_ready"));
-    assert!(source.contains("pub(crate) fn on_tcp_timer_expiry("));
-    assert!(source.contains("timer_dispatch_pending(timer_id)"));
-    assert!(source.contains("match (self.state, timer_id)"));
-    assert!(source.contains("match timer_id"));
-    assert!(!source.contains("TcpConnectionTimerKind::all"));
-}
-
-#[test]
 fn tcp_input_routes_close_side_receive_states_through_rcv_process() {
     let source = read_tcp_source("src/transport/tcp/mod.rs");
 
@@ -107,7 +95,7 @@ fn tcp_input_routes_close_side_receive_states_through_rcv_process() {
 #[test]
 fn tcp_close_path_updates_connection_state_in_connection() {
     let source = read_tcp_source("src/transport/tcp/connection.rs");
-    assert!(source.contains("pub(crate) fn on_session_close(&mut self)"));
+    assert!(source.contains("pub(super) fn on_session_close("));
     assert!(source.contains("TcpState::Established"));
     assert!(source.contains("self.state = TcpState::FinWait1;"));
     assert!(source.contains("self.state = TcpState::LastAck;"));
@@ -117,49 +105,8 @@ fn tcp_close_path_updates_connection_state_in_connection() {
 fn tcp_syn_sent_timer_expiry_updates_connection_state_in_connection() {
     let source = read_tcp_source("src/transport/tcp/connection.rs");
     assert!(source.contains("self.state == TcpState::SynSent"));
-    assert!(source.contains("pub(crate) fn on_tcp_timer_expiry("));
-    assert!(source.contains("self.timer_set(TCP_TIMER_RETRANSMIT);"));
-}
-
-#[test]
-fn established_node_delegates_timer_refresh_to_shared_helper() {
-    // Source-level guard: after the timer-refresh dedup, the established node
-    // must not iterate a raw `0..TCP_TIMER_COUNT` literal inline. The literal
-    // legitimately remains in connection.rs (the const def + the shared
-    // helper). Here we assert established.rs delegates rather than reopening
-    // the cancel-or-update loop per-site.
-    let source = read_tcp_source("src/transport/tcp/established.rs");
-    assert!(
-        !source.contains("0..crate::transport::tcp::connection::TCP_TIMER_COUNT")
-            && !source.contains("0..TCP_TIMER_COUNT"),
-        "established.rs must delegate timer refresh to the shared helper, \
-         not iterate 0..TCP_TIMER_COUNT inline"
-    );
-}
-
-#[test]
-fn timer_refresh_loops_consolidated_into_shared_helper() {
-    // The cancel-or-update body must live in one shared helper, not be
-    // re-opened at each call site. Assert that rcv_process.rs and the TCP
-    // session-protocol impl in mod.rs no longer carry the raw literal; only
-    // connection.rs (const def + helper) keeps it.
-    for path in [
-        "src/transport/tcp/rcv_process.rs",
-        "src/transport/tcp/mod.rs",
-    ] {
-        let source = read_tcp_source(path);
-        assert!(
-            !source.contains("0..crate::transport::tcp::connection::TCP_TIMER_COUNT")
-                && !source.contains("0..TCP_TIMER_COUNT"),
-            "{path} must delegate timer refresh to the shared helper, \
-             not iterate 0..TCP_TIMER_COUNT inline"
-        );
-    }
-    let connection = read_tcp_source("src/transport/tcp/connection.rs");
-    assert!(
-        connection.contains("pub const TCP_TIMER_COUNT"),
-        "TCP_TIMER_COUNT const definition must remain in connection.rs"
-    );
+    assert!(source.contains("fn on_typed_timer_expiry("));
+    assert!(source.contains("TcpTimerKind::Retransmit"));
 }
 
 #[test]
