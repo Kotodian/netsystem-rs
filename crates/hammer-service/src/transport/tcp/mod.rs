@@ -37,6 +37,7 @@ pub mod reset;
 mod sack;
 pub mod segment;
 pub mod syn_sent;
+mod timers;
 pub(crate) mod worker;
 
 pub(crate) use connection::sync_all_tcp_timers;
@@ -530,6 +531,7 @@ where
         let TcpWorker {
             connections,
             lookup,
+            ..
         } = &mut driver.transports_mut().0;
         let connection = connections.get(index).ok_or(TcpNodeError::SessionMissing)?;
         lookup.publish_connection(session_id, connection)

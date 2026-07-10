@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::{TcpSeq, TcpState};
@@ -11,6 +11,7 @@ use super::connection::{
     sync_all_tcp_timers, sync_tcp_timer,
 };
 use super::lookup::TcpLookupState;
+use super::timers::TcpTimers;
 use super::{TcpConnection, TcpNodeError, enqueue_tcp_segment};
 use crate::session::SessionAppRuntime;
 use crate::session::app::SessionAppRuntimeCreate;
@@ -29,6 +30,7 @@ where
 {
     pub(crate) connections: Pool<TcpConnection<C>>,
     pub(crate) lookup: TcpLookupState,
+    timers: TcpTimers,
 }
 
 impl<C> TcpWorker<C>
@@ -40,6 +42,7 @@ where
         Self {
             connections: Pool::with_capacity(DEFAULT_TCP_CONNECTION_CAPACITY),
             lookup: TcpLookupState::new(worker),
+            timers: TcpTimers::new(Instant::now(), Duration::from_millis(10)),
         }
     }
 

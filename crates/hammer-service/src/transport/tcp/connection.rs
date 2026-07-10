@@ -10,6 +10,7 @@ use super::output::{
 use super::recovery::{TcpRecoveryAck, TcpRecoveryState};
 use super::sack::TcpSackState;
 use super::segment::TcpSegment;
+use super::timers::{TcpTimerKind, TcpTimerState};
 use crate::session::runtime::RxDelivery;
 use crate::transport::congestion::CongestionController;
 use crossbeam_utils::CachePadded;
@@ -137,18 +138,6 @@ struct TcpEcnState {
     received_ce_counter: u64,
     pending_ce_feedback: u64,
     peer_ace_counter: u8,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TcpTimerState {
-    active: u16,
-}
-
-impl Default for TcpTimerState {
-    #[inline]
-    fn default() -> Self {
-        Self { active: 0 }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -348,10 +337,10 @@ where
 
     #[inline(always)]
     pub fn timer_is_active(&self, timer_id: u32) -> bool {
-        timer_mask_contains(self.timers.active, timer_id)
+        TcpTimerKind::from_id(timer_id).is_some_and(|kind| self.timers.is_active(kind))
     }
 
-    /// Bulk read of the active-timer bitmask (`self.timers.active`).
+    /// Bulk read of the armed-or-pending timer bitmask.
     ///
     /// One load replaces up to 8 `timer_is_active` mask-and-test calls at
     /// call sites that need the whole mask (e.g. computing a timer-refresh
@@ -359,17 +348,31 @@ where
     /// that only test a single id.
     #[inline(always)]
     pub fn active_timer_mask(&self) -> u16 {
-        self.timers.active
+        self.timers.active_bits()
     }
 
     #[inline(always)]
     pub fn timer_set(&mut self, timer_id: u32) {
-        self.timers.active |= timer_bit(timer_id);
+        if let Some(kind) = TcpTimerKind::from_id(timer_id) {
+            self.timers.arm(kind);
+        }
     }
 
     #[inline]
     pub fn timer_reset(&mut self, timer_id: u32) {
-        self.timers.active &= !timer_bit(timer_id);
+        if let Some(kind) = TcpTimerKind::from_id(timer_id) {
+            self.timers.reset(kind);
+        }
+    }
+
+    #[inline]
+    pub(super) fn timer_state(&self) -> &TcpTimerState {
+        &self.timers
+    }
+
+    #[inline]
+    pub(super) fn timer_state_mut(&mut self) -> &mut TcpTimerState {
+        &mut self.timers
     }
 
     #[inline]
@@ -2336,11 +2339,6 @@ fn clamp_retransmit_timeout(timeout: Duration) -> Duration {
 #[inline(always)]
 const fn timer_bit(timer_id: u32) -> u16 {
     1u16 << timer_id
-}
-
-#[inline(always)]
-const fn timer_mask_contains(mask: u16, timer_id: u32) -> bool {
-    (mask & timer_bit(timer_id)) != 0
 }
 
 #[inline]
