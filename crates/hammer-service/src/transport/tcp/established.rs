@@ -365,7 +365,7 @@ mod tests {
     use crate::transport::tcp::output::{TcpOutputNext, TcpOutputNode};
     use crate::transport::tcp::tcp_control_cursor;
     use crate::transport::tcp::{
-        TCP_FLAG_ACK, TcpConnection, TcpInputNext, TcpWorker, publish_tcp_connection,
+        TCP_FLAG_ACK, TcpConnection, TcpInputNext, TcpState, TcpWorker, publish_tcp_connection,
         write_session_route_opaque,
     };
 
@@ -564,6 +564,26 @@ mod tests {
         .expect("data packet")
     }
 
+    fn peer_fin_packet(sequence: u32, acknowledgment: u32) -> std::vec::Vec<u8> {
+        tcp_ipv4_packet(
+            remote_addr(),
+            local_addr(),
+            hammer_core::protocol::tcp::TcpSegmentHeader {
+                source_port: remote_addr().port(),
+                destination_port: local_addr().port(),
+                sequence_number: sequence,
+                acknowledgment_number: acknowledgment,
+                flags: TcpSegmentFlags::FIN | TcpSegmentFlags::ACK,
+                advertised_window: u16::MAX,
+                capabilities: TcpCapabilities::default(),
+                timestamp: None,
+                fast_open_cookie: None,
+            },
+            &[],
+        )
+        .expect("peer fin packet")
+    }
+
     fn tcp_ipv4_packet(
         local: SocketAddr,
         remote: SocketAddr,
@@ -697,6 +717,71 @@ mod tests {
         assert_eq!(packets.packets.len(), 1);
         assert_eq!(tcp_flags(&packets.packets[0]) & TCP_FLAG_ACK, TCP_FLAG_ACK);
         assert_eq!(tcp_acknowledgment(&packets.packets[0]), rcv_nxt + 5);
+    }
+
+    #[test]
+    fn peer_fin_moves_established_to_close_wait_and_acks() {
+        let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
+            buffers: hammer_core::data_plane::DataPlaneBufferConfig {
+                buffer_slot_capacity: 2048,
+                buffer_slots: 32,
+                frame_slots: 8,
+                ..hammer_core::data_plane::DataPlaneBufferConfig::default()
+            },
+        });
+        let (established, handle, output_state, _) = install_established_runtime(&runtime);
+        let (session_id, rcv_nxt, snd_nxt) = open_established_session(handle);
+
+        send_to_established(
+            &runtime,
+            established,
+            Some(session_id),
+            peer_fin_packet(rcv_nxt, snd_nxt),
+        );
+        for _ in 0..8 {
+            let _ = runtime.run_ready_nodes().expect("drain");
+            if !output_state.lock().expect("output").packets.is_empty() {
+                break;
+            }
+        }
+
+        let queue = handle.borrow_mut().expect("tcp queue");
+        let connection = queue.session(session_id).expect("session");
+        assert_eq!(connection.state(), TcpState::CloseWait);
+        assert_eq!(connection.rcv_nxt(), rcv_nxt + 1);
+        let packets = output_state.lock().expect("output");
+        assert_eq!(packets.packets.len(), 1);
+        assert_eq!(tcp_flags(&packets.packets[0]) & TCP_FLAG_ACK, TCP_FLAG_ACK);
+        assert_eq!(tcp_acknowledgment(&packets.packets[0]), rcv_nxt + 1);
+    }
+
+    #[test]
+    fn out_of_order_peer_fin_does_not_leave_established() {
+        let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
+            buffers: hammer_core::data_plane::DataPlaneBufferConfig {
+                buffer_slot_capacity: 2048,
+                buffer_slots: 32,
+                frame_slots: 8,
+                ..hammer_core::data_plane::DataPlaneBufferConfig::default()
+            },
+        });
+        let (established, handle, output_state, _) = install_established_runtime(&runtime);
+        let (session_id, rcv_nxt, snd_nxt) = open_established_session(handle);
+
+        send_to_established(
+            &runtime,
+            established,
+            Some(session_id),
+            peer_fin_packet(rcv_nxt.wrapping_add(1), snd_nxt),
+        );
+        let _ = runtime.run_ready_nodes().expect("run established");
+        let _ = runtime.run_ready_nodes().expect("drain");
+
+        let queue = handle.borrow_mut().expect("tcp queue");
+        let connection = queue.session(session_id).expect("session");
+        assert_eq!(connection.state(), TcpState::Established);
+        assert_eq!(connection.rcv_nxt(), rcv_nxt);
+        assert!(output_state.lock().expect("output").packets.is_empty());
     }
 
     #[test]

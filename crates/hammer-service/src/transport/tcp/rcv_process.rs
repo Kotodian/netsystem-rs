@@ -566,6 +566,57 @@ mod tests {
     }
 
     #[test]
+    fn peer_fin_in_finwait2_acks_and_enters_time_wait() {
+        let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
+            buffers: hammer_core::data_plane::DataPlaneBufferConfig {
+                buffer_slot_capacity: 2048,
+                buffer_slots: 32,
+                frame_slots: 8,
+                ..hammer_core::data_plane::DataPlaneBufferConfig::default()
+            },
+        });
+        let (rcv, handle, output_state, _) = install_rcv_runtime(&runtime);
+        let (session_id, rcv_nxt, snd_nxt) = open_fin_wait1_session(handle);
+
+        send_to_rcv(
+            &runtime,
+            rcv,
+            Some(session_id),
+            control_packet(rcv_nxt, snd_nxt, TcpSegmentFlags::ACK),
+        );
+        assert!(runtime.run_ready_nodes().expect("ack local fin") >= 1);
+        {
+            let queue = handle.borrow_mut().expect("tcp queue");
+            assert_eq!(
+                queue.session(session_id).expect("session").state(),
+                TcpState::FinWait2
+            );
+        }
+
+        send_to_rcv(
+            &runtime,
+            rcv,
+            Some(session_id),
+            control_packet(rcv_nxt, snd_nxt, TcpSegmentFlags::FIN | TcpSegmentFlags::ACK),
+        );
+        for _ in 0..8 {
+            let _ = runtime.run_ready_nodes().expect("drain");
+            if !output_state.lock().expect("output").packets.is_empty() {
+                break;
+            }
+        }
+
+        let queue = handle.borrow_mut().expect("tcp queue");
+        let connection = queue.session(session_id).expect("session");
+        assert_eq!(connection.state(), TcpState::TimeWait);
+        assert_eq!(connection.rcv_nxt(), rcv_nxt + 1);
+        let packets = output_state.lock().expect("output");
+        assert_eq!(packets.packets.len(), 1);
+        assert_eq!(tcp_flags(&packets.packets[0]) & TCP_FLAG_ACK, TCP_FLAG_ACK);
+        assert_eq!(tcp_acknowledgment(&packets.packets[0]), rcv_nxt + 1);
+    }
+
+    #[test]
     fn simultaneous_close_acks_peer_fin_and_enters_closing() {
         let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
             buffers: hammer_core::data_plane::DataPlaneBufferConfig {
