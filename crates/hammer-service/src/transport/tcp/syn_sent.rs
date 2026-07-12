@@ -719,7 +719,7 @@ mod legacy_tests {
     }
 
     #[test]
-    fn missing_session_route_on_syn_sent_reaches_drop() {
+    fn syn_ack_without_session_emits_no_final_ack() {
         let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
             buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                 buffer_slot_capacity: 2048,
@@ -735,21 +735,17 @@ mod legacy_tests {
             (TcpWorker::<BbrController>::new(worker), ()),
         );
         let handle = crate::session::node::register_session_queue(driver).expect("register queue");
-        let drop_state = Arc::new(Mutex::new(CaptureState::default()));
-        let drop_capture = runtime
-            .nodes()
-            .register_internal(CaptureNode::new(Arc::clone(&drop_state)));
-        let drop = runtime.nodes().register_internal(DropNode::new());
         let output_state = Arc::new(Mutex::new(CaptureState::default()));
         let capture = runtime
             .nodes()
             .register_internal(CaptureNode::new(Arc::clone(&output_state)));
+        let drop = runtime.nodes().register_internal(DropNode::new());
         let output = runtime
             .nodes()
             .register_internal(TcpOutputNode::new(TcpOutputNext::nodes(drop, capture)));
         let syn_sent = runtime.nodes().register_internal(TcpSynSentNode::new(
             handle,
-            TcpSynSentNext::nodes(output, drop_capture),
+            TcpSynSentNext::nodes(output, drop),
         ));
 
         send_packet(
@@ -765,12 +761,13 @@ mod legacy_tests {
                 SYN | ACK,
             ),
         );
-        assert!(runtime.run_ready_nodes().expect("run syn-sent") >= 1);
-        if drop_state.lock().expect("drop").packets.is_empty() {
-            assert!(runtime.run_ready_nodes().expect("run drop") >= 1);
+        for _ in 0..8 {
+            let _ = runtime.run_ready_nodes().expect("drain graph");
         }
-        assert!(output_state.lock().expect("output").packets.is_empty());
-        assert_eq!(drop_state.lock().expect("drop").packets.len(), 1);
+        assert!(
+            output_state.lock().expect("output").packets.is_empty(),
+            "orphan SYN-ACK must not emit a final ACK"
+        );
     }
 }
 
