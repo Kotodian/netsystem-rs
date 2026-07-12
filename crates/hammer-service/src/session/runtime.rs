@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crossbeam_utils::CachePadded;
-use hammer_core::data_plane::{BufferIndex, DataPlaneBuffers, Frame, Next};
+use hammer_core::data_plane::{Index, DataPlaneBuffers, Frame, Next};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::fifo_queue::FifoQueue;
 use hammer_infra::msg_queue::{MsgQueue, SessionEvtType};
@@ -334,7 +334,7 @@ impl<Index: Copy + Eq, Seg: Segment> SessionWorker<Index, Seg> {
     pub(crate) fn enqueue_rx(
         &self,
         session_id: SessionId,
-        index: BufferIndex,
+        index: hammer_core::data_plane::Index,
         offset: u32,
         _: bool,
     ) -> CoreResult<RxDelivery>
@@ -514,7 +514,7 @@ where
     pub(crate) fn enqueue_rx(
         &self,
         session_id: SessionId,
-        index: BufferIndex,
+        index: hammer_core::data_plane::Index,
         offset: u32,
         queue_event: bool,
     ) -> CoreResult<RxDelivery>
@@ -603,7 +603,7 @@ pub struct TransportSendParams {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TxBatchBuffer {
-    pub index: BufferIndex,
+    pub index: Index,
     pub tx_offset: usize,
     pub payload_len: usize,
 }

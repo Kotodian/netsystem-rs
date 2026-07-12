@@ -1,6 +1,6 @@
 use std::cell::{Cell, RefCell};
 
-use hammer_core::data_plane::{BufferFrame, BufferIndex, NodeId};
+use hammer_core::data_plane::{BufferFrame, Index, NodeId};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::{TcpConnectionId, TcpError, TcpPacket, TcpSegmentFlags, TcpSeq};
 use hammer_infra::pool::Index as PoolIndex;
@@ -203,7 +203,7 @@ where
 
 fn tcp_listen_index<C, Seg>(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
     control: &TcpInputControlPlane,
     session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
     tcp_output: NodeId,
@@ -1147,7 +1147,7 @@ mod legacy_tests {
 
 fn tcp_handle_listener_packet<C, Seg>(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
     queue: &mut SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>,
     listener_id: u32,
     capabilities: hammer_core::protocol::tcp::TcpCapabilities,
@@ -1176,7 +1176,7 @@ where
 
 fn tcp_issue_listener_challenge<C, Seg>(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
     queue: &mut SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>,
     listener_id: u32,
     capabilities: hammer_core::protocol::tcp::TcpCapabilities,
@@ -1272,7 +1272,7 @@ where
 
 fn tcp_accept_listener_fast_open<C, Seg>(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
     queue: &mut SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>,
     listener_id: u32,
     capabilities: hammer_core::protocol::tcp::TcpCapabilities,

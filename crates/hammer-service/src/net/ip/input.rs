@@ -2,7 +2,7 @@ use std::mem::transmute;
 use std::sync::{Mutex, OnceLock};
 
 use hammer_core::data_plane::{
-    BufferFrame, BufferIndex, BufferPacketCursor, NodeId, NodeNextStorage,
+    BufferFrame, Index, BufferPacketCursor, NodeId, NodeNextStorage,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_runtime::{
@@ -204,7 +204,7 @@ fn ip_input_process<A: FeatureArcSpec>(
 #[inline(always)]
 fn next_node_for_index(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
     next: [NodeId; IpInputNext::COUNT],
     feature_arc: Option<&FeatureArcStartHandle>,
 ) -> CoreResult<NodeId> {

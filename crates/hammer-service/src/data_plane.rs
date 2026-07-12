@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use hammer_core::data_plane::{Buffer, BufferFrame, BufferIndex, NodeId, NodeRegistration};
+use hammer_core::data_plane::{Buffer, BufferFrame, Index, NodeId, NodeRegistration};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_runtime::DataPlaneBarrierHandle;
 use hammer_runtime::{
@@ -534,7 +534,7 @@ impl FeatureArcStartHandle {
 }
 
 #[inline(always)]
-pub fn next_feature_node_for_index(runtime: &DataPlaneRuntime, index: BufferIndex) -> NodeId {
+pub fn next_feature_node_for_index(runtime: &DataPlaneRuntime, index: Index) -> NodeId {
     runtime
         .current_config(index)
         .expect("buffer must have a current config")
@@ -564,7 +564,7 @@ pub fn set_buffer_node_error_code(
 #[inline(always)]
 pub fn set_index_node_error_code(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
     code: u16,
 ) -> CoreResult<()> {
     let error = runtime.record_current_node_error(code)?;

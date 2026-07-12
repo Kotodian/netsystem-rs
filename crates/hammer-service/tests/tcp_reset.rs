@@ -2,7 +2,7 @@ use std::mem::transmute;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use hammer_core::data_plane::{
-    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneBufferConfig, NodeId,
+    BufferFrame, Index, BufferPacketCursor, DataPlaneBufferConfig, NodeId,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
@@ -222,7 +222,7 @@ fn schedule_packet(runtime: &DataPlaneRuntime, reset: NodeId, packet: &[u8]) {
     runtime.put_next_frame(frame).expect("schedule reset");
 }
 
-fn set_tcp_cursor(runtime: &DataPlaneRuntime, index: BufferIndex, packet_len: usize) {
+fn set_tcp_cursor(runtime: &DataPlaneRuntime, index: Index, packet_len: usize) {
     let mut buffer = runtime.get_buffer_mut(index).expect("buffer");
     unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }.set_packet_cursor(
         BufferPacketCursor::new()

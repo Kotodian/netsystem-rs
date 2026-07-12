@@ -2,7 +2,7 @@ use std::mem::{size_of, transmute};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::net::{IpEcnCodepoint, NetworkOpaque};
-use hammer_core::data_plane::{BufferIndex, BufferPacketCursor};
+use hammer_core::data_plane::{Index, BufferPacketCursor};
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::{
     TcpCapabilities, TcpError, TcpFastOpenCookie, TcpPacket, TcpSackBlock, TcpSegmentFlags,
@@ -103,7 +103,7 @@ impl TcpSegment {
     pub(crate) fn write_to_buffer(
         &self,
         buffers: &hammer_core::data_plane::DataPlaneBuffers,
-        index: BufferIndex,
+        index: Index,
     ) -> CoreResult<()> {
         let mut buffer = buffers.get_buffer_mut(index)?;
         let header = buffer.prepend_mut(self.header_len())?;
@@ -115,7 +115,7 @@ impl TcpSegment {
     }
 }
 
-pub(crate) fn tcp_packet(runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<TcpPacket> {
+pub(crate) fn tcp_packet(runtime: &DataPlaneRuntime, index: Index) -> CoreResult<TcpPacket> {
     let buffer = runtime.get_buffer(index)?;
     let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
     let cursor = network.packet_cursor();

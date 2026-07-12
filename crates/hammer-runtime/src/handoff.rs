@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crossbeam_queue::ArrayQueue;
-use hammer_core::data_plane::{BufferIndex, BufferPoolArena, NodeHandle};
+use hammer_core::data_plane::{Index, BufferPoolArena, NodeHandle};
 use hammer_core::error::{CoreResult, DataPlaneError};
 
 pub(crate) const HANDOFF_SLOT_CAPACITY: usize = 32;
@@ -46,7 +46,7 @@ pub(crate) struct HandoffFrame {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HandoffSlot {
-    indices: [Option<BufferIndex>; HANDOFF_SLOT_CAPACITY],
+    indices: [Option<Index>; HANDOFF_SLOT_CAPACITY],
     len: usize,
 }
 
@@ -60,7 +60,7 @@ impl HandoffSlot {
     }
 
     #[inline]
-    pub(crate) fn single(index: BufferIndex) -> Self {
+    pub(crate) fn single(index: Index) -> Self {
         let mut slot = Self::new();
         let pushed = slot.push(index);
         debug_assert!(pushed);
@@ -68,7 +68,7 @@ impl HandoffSlot {
     }
 
     #[inline]
-    pub(crate) fn from_prefix(indices: &[BufferIndex]) -> Self {
+    pub(crate) fn from_prefix(indices: &[Index]) -> Self {
         let mut slot = Self::new();
         for index in indices.iter().copied().take(HANDOFF_SLOT_CAPACITY) {
             let pushed = slot.push(index);
@@ -78,7 +78,7 @@ impl HandoffSlot {
     }
 
     #[inline]
-    pub(crate) fn push(&mut self, index: BufferIndex) -> bool {
+    pub(crate) fn push(&mut self, index: Index) -> bool {
         if self.len == HANDOFF_SLOT_CAPACITY {
             return false;
         }
@@ -98,7 +98,7 @@ impl HandoffSlot {
     }
 
     #[inline]
-    pub(crate) fn iter(&self) -> impl Iterator<Item = BufferIndex> + '_ {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = Index> + '_ {
         self.indices[..self.len].iter().filter_map(|index| *index)
     }
 }
@@ -185,7 +185,7 @@ impl DataPlaneHandoffWorker {
         &self,
         worker: DataWorkerId,
         target: NodeHandle,
-        index: BufferIndex,
+        index: Index,
     ) -> Result<(), HandoffEnqueueError> {
         self.enqueue_indices(worker, target, HandoffSlot::single(index))
     }

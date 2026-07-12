@@ -62,11 +62,11 @@ fn runtime_with_handoff_arena(
 }
 
 trait CleanupOwner {
-    fn drop_index_owned(&self, index: hammer_core::data_plane::BufferIndex);
+    fn drop_index_owned(&self, index: hammer_core::data_plane::Index);
 }
 
 impl CleanupOwner for BufferPool {
-    fn drop_index_owned(&self, index: hammer_core::data_plane::BufferIndex) {
+    fn drop_index_owned(&self, index: hammer_core::data_plane::Index) {
         let runtime =
             runtime_with_handoff_arena(self.arena(), 1, 1, DataPlaneInstructionSet::native());
         let mut frame = runtime
@@ -78,7 +78,7 @@ impl CleanupOwner for BufferPool {
 }
 
 impl CleanupOwner for DataPlaneRuntime {
-    fn drop_index_owned(&self, index: hammer_core::data_plane::BufferIndex) {
+    fn drop_index_owned(&self, index: hammer_core::data_plane::Index) {
         let mut frame = self
             .buffers()
             .get_next_frame(NodeId::new(0))

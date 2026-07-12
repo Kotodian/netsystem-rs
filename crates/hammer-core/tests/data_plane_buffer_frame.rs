@@ -6,12 +6,12 @@ use hammer_core::data_plane::{
     BufferFrameBatch, BufferFrameBatchCursor, BufferFrameBatchIndices, BufferFrameBatchWidth,
     BufferFrameBatchWidthPolicy, BufferFrameDrain, BufferFramePairBatch,
     BufferFramePairBatchCursor, BufferFramePending, BufferFrameQuadBatch,
-    BufferFrameQuadBatchCursor, BufferHeaderCacheline0, BufferHeaderCacheline1, BufferIndex,
-    BufferNodeError, BufferPacketCursor, BufferPool, BufferPoolArena, BufferRef, BufferRefMut,
-    BufferThreadCache, DEFAULT_BUFFER_FRAME_CAPACITY, DEFAULT_BUFFER_FRAME_POOL_SIZE,
-    DEFAULT_PACKET_HEADROOM, DEFAULT_PRE_DATA_SIZE, DataPlaneBufferChain, DataPlaneBufferConfig,
-    DataPlaneBuffers, Frame, FrameIndex, Next, NodeId, PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES,
-    Pending, PrimaryOpaque, SecondaryOpaque, buffer_data_offset,
+    BufferFrameQuadBatchCursor, BufferHeaderCacheline0, BufferHeaderCacheline1, BufferNodeError,
+    BufferPacketCursor, BufferPool, BufferPoolArena, BufferRef, BufferRefMut, BufferThreadCache,
+    DEFAULT_BUFFER_FRAME_CAPACITY, DEFAULT_BUFFER_FRAME_POOL_SIZE, DEFAULT_PACKET_HEADROOM,
+    DEFAULT_PRE_DATA_SIZE, DataPlaneBufferChain, DataPlaneBufferConfig, DataPlaneBuffers, Frame,
+    Index, Next, NodeId, PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES, Pending, PrimaryOpaque,
+    SecondaryOpaque, buffer_data_offset,
 };
 use hammer_infra::vec::Vec;
 
@@ -25,7 +25,7 @@ fn test_buffers(buffer_slot_capacity: usize, buffer_slots: usize) -> DataPlaneBu
     })
 }
 
-fn chain_bytes(buffers: &DataPlaneBuffers, index: BufferIndex) -> Vec<u8> {
+fn chain_bytes(buffers: &DataPlaneBuffers, index: Index) -> Vec<u8> {
     let mut out = Vec::new();
     for buffer in buffers.chain(index) {
         out.extend_from_slice(buffer.expect("chain buffer").current());
@@ -91,18 +91,15 @@ fn core_exports_buffer_and_frame_value_primitives() {
         .alloc_index_with_bytes(b"first")
         .expect("first buffer");
     let mut frame = buffers.get_next_frame(NodeId::new(7)).expect("next frame");
-    let first_frame_index = frame.index();
 
     assert_eq!(
         first.pool_id(),
         buffers.try_buffers().expect("pool").pool_id()
     );
-    assert_eq!(first_frame_index.pool_id(), frame.index().pool_id());
     assert_eq!(first.slot(), 1);
     assert_eq!(first.generation(), 1);
-    assert_eq!(first_frame_index.slot(), 0);
-    assert_eq!(first_frame_index.generation(), 1);
     assert_eq!(frame.next(), NodeId::new(7));
+    assert_eq!(size_of::<Index>(), 16);
 
     frame.push_index(first).expect("push first");
     drop(frame);
@@ -117,12 +114,8 @@ fn core_exports_buffer_and_frame_value_primitives() {
     assert!(buffers.get_buffer(first).is_err());
 
     let mut next_frame = buffers.get_next_frame(NodeId::new(8)).expect("next frame");
-    let second_frame_index: FrameIndex = next_frame.index();
-    assert_eq!(second_frame_index.slot(), first_frame_index.slot());
-    assert_ne!(
-        second_frame_index.generation(),
-        first_frame_index.generation()
-    );
+    assert_eq!(next_frame.next(), NodeId::new(8));
+    assert!(next_frame.is_empty());
     next_frame.push_index(second).expect("push second");
 }
 
@@ -164,10 +157,8 @@ fn core_frame_pending_owner_returns_buffers_on_drop() {
     let mut next = buffers.get_next_frame(NodeId::new(1)).expect("next frame");
     let index = buffers.alloc_index().expect("buffer");
     next.push_index(index).expect("push index");
-    let next_frame_index = next.index();
 
     let pending = next.into_pending().expect("pending frame");
-    assert_eq!(pending.index().slot(), next_frame_index.slot());
     assert_eq!(buffers.in_use_buffers(), 1);
     assert_eq!(buffers.frames_in_use(), 1);
 

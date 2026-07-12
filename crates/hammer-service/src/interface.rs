@@ -3,7 +3,7 @@ use std::fmt;
 use std::mem::transmute;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use hammer_core::data_plane::{BufferFrame, BufferIndex, NodeId, NodeRegistration};
+use hammer_core::data_plane::{BufferFrame, Index, NodeId, NodeRegistration};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::forwarding::AdjacencyRewrite;
 use hammer_infra::map::{FlatHashKey, FlatHashTable};
@@ -829,7 +829,7 @@ impl InterfaceOutputNode {
     fn tx_for_index(
         output: &InterfaceOutputHandle,
         runtime: &DataPlaneRuntime,
-        index: BufferIndex,
+        index: Index,
         drop_next: NodeId,
     ) -> CoreResult<NodeId> {
         let interface_index = {

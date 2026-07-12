@@ -1,4 +1,4 @@
-use hammer_core::data_plane::{BufferFrame, BufferIndex, DataPlaneBufferConfig, NodeId};
+use hammer_core::data_plane::{BufferFrame, Index, DataPlaneBufferConfig, NodeId};
 use hammer_infra::vec::Vec;
 use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, NodeResult, process_frame};
 
@@ -22,7 +22,7 @@ fn push_packet(runtime: &DataPlaneRuntime, frame: &mut BufferFrame, payload: &[u
 fn process_test_frame(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
-    processed: &mut Vec<BufferIndex>,
+    processed: &mut Vec<Index>,
     drop_next: NodeId,
 ) -> NodeResult {
     process_frame!(runtime, frame, |index| {

@@ -3,7 +3,7 @@ use std::mem::transmute;
 use std::sync::{Arc, Mutex};
 
 use hammer_core::data_plane::{
-    BufferFrame, BufferIndex, BufferRef, Frame, Next, NodeId, NodeRegistration, SecondaryOpaque,
+    BufferFrame, Index, BufferRef, Frame, Next, NodeId, NodeRegistration, SecondaryOpaque,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::vec::Vec;
@@ -585,10 +585,10 @@ where
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
         in_flight: &mut Frame<Next>,
-    ) -> CoreResult<Option<BufferIndex>> {
+    ) -> CoreResult<Option<Index>> {
         let index = runtime.alloc_index()?;
         in_flight.push_index(index)?;
-        (|| -> CoreResult<Option<BufferIndex>> {
+        (|| -> CoreResult<Option<Index>> {
             let mut buffer = runtime.get_buffer_mut(index)?;
             let dst = buffer.writable_tail_mut();
             let dst_len = dst.len();
@@ -612,7 +612,7 @@ where
     fn set_l3_metadata(
         &self,
         _: &DataPlaneRuntime,
-        _: hammer_core::data_plane::BufferIndex,
+        _: hammer_core::data_plane::Index,
         _: &str,
     ) -> CoreResult<()> {
         Ok(())
@@ -757,7 +757,7 @@ where
     fn try_send_index(
         &mut self,
         runtime: &DataPlaneRuntime,
-        index: BufferIndex,
+        index: Index,
         mode: TunDriverMode,
     ) -> CoreResult<TunBufferSendResult> {
         if mode.is_tap() {
@@ -814,7 +814,7 @@ where
 #[inline]
 fn packet_total_len(
     runtime: &DataPlaneRuntime,
-    index: hammer_core::data_plane::BufferIndex,
+    index: hammer_core::data_plane::Index,
 ) -> CoreResult<usize> {
     let packet = runtime.get_buffer(index)?;
     packet
@@ -1416,7 +1416,7 @@ impl TunPacketSink for MemoryTunOutput {
 fn memory_tun_output_index(
     runtime: &DataPlaneRuntime,
     output: &mut Vec<Vec<u8>>,
-    index: BufferIndex,
+    index: Index,
     mode: TunDriverMode,
 ) -> CoreResult<()> {
     let mut tap_header = None;

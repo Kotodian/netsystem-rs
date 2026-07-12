@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use hammer_core::data_plane::{BufferFrame, BufferIndex, NodeHandle, NodeId, NodeNextStorage};
+use hammer_core::data_plane::{BufferFrame, Index, NodeHandle, NodeId, NodeNextStorage};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::checksum::internet_checksum;
 use hammer_infra::vec::Vec;
@@ -277,7 +277,7 @@ impl IpReassemblyRuntime {
         &mut self,
         runtime: &DataPlaneRuntime,
         next: [NodeId; IpReassemblyNext::COUNT],
-        index: BufferIndex,
+        index: Index,
         now: Instant,
     ) -> CoreResult<()> {
         let buffer = runtime.get_buffer(index)?;
@@ -537,7 +537,7 @@ impl IpReassemblyRuntime {
         &self,
         runtime: &DataPlaneRuntime,
         node: NodeId,
-        index: BufferIndex,
+        index: Index,
     ) -> CoreResult<()> {
         let mut frame = runtime.buffers().get_next_frame(node)?;
         frame.push_index(index)?;
@@ -548,7 +548,7 @@ impl IpReassemblyRuntime {
     fn fragment_first_worker(
         &self,
         runtime: &DataPlaneRuntime,
-        index: BufferIndex,
+        index: Index,
         fragment: ParsedIpFragment,
     ) -> CoreResult<Option<DataWorkerId>> {
         if fragment.payload_offset != 0 {
@@ -774,7 +774,7 @@ impl ReassemblyContext {
     fn insert_fragment(
         &mut self,
         runtime: &DataPlaneRuntime,
-        index: BufferIndex,
+        index: Index,
         fragment: ParsedIpFragment,
         now: Instant,
         max_fragments: usize,
@@ -984,7 +984,7 @@ impl ReassemblyContext {
 
 #[derive(Debug, Clone, Copy)]
 struct ReassemblyFragment {
-    index: BufferIndex,
+    index: Index,
     start: usize,
     end: usize,
     header_len: usize,
@@ -992,13 +992,13 @@ struct ReassemblyFragment {
 
 enum ReassemblyInsert {
     Pending,
-    Drop(BufferIndex),
-    Reassembled(BufferIndex),
-    Failed(BufferIndex),
+    Drop(Index),
+    Reassembled(Index),
+    Failed(Index),
 }
 
 #[inline(always)]
-fn refresh_metadata(runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<()> {
+fn refresh_metadata(runtime: &DataPlaneRuntime, index: Index) -> CoreResult<()> {
     let buffer = runtime.get_buffer(index)?;
     let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
     let parsed = ip_header(buffer.current(), network.packet_cursor())?;

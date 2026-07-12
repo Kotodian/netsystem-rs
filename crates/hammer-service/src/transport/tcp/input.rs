@@ -11,7 +11,7 @@ use crate::trace::codec::{
 };
 use arc_swap::ArcSwap;
 use hammer_core::data_plane::{
-    BufferFrame, BufferIndex, BufferPacketCursor, NodeHandle, NodeId, NodeNextStorage,
+    BufferFrame, Index, BufferPacketCursor, NodeHandle, NodeId, NodeNextStorage,
     SecondaryOpaque,
 };
 use hammer_core::error::{CoreError, CoreResult};
@@ -346,7 +346,7 @@ where
 #[inline(always)]
 fn tcp_input_next_for_index<C, Seg>(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
     snapshot: &TcpLookupSnapshot,
     next: &[NodeId; TcpInputNext::COUNT],
     handoff: Option<NodeHandle>,
@@ -387,7 +387,7 @@ enum TcpInputError {
 #[inline(always)]
 fn next_node_for_index_with_runtime<C, Seg>(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
     parsed: Result<(IpVersion, IpProtocol, SocketAddr, SocketAddr, TcpInputFlags), TcpInputError>,
     snapshot: &TcpLookupSnapshot,
     next: &[NodeId; TcpInputNext::COUNT],
@@ -556,7 +556,7 @@ where
 #[inline(always)]
 fn resolve_success_next_with_trace(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
     next: &[NodeId; TcpInputNext::COUNT],
     next_key: TcpInputNext,
     version: IpVersion,
@@ -588,7 +588,7 @@ fn resolve_success_next_with_trace(
 #[inline(always)]
 fn resolve_error_next_with_runtime(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
     next: &[NodeId; TcpInputNext::COUNT],
     next_key: TcpInputNext,
     error: TcpError,
@@ -1328,7 +1328,7 @@ mod legacy_tests {
 
     fn stamp_tcp_cursor(
         runtime: &DataPlaneRuntime,
-        buffer: hammer_core::data_plane::BufferIndex,
+        buffer: hammer_core::data_plane::Index,
         packet: &[u8],
     ) {
         let header_len = ((*packet.first().expect("IPv4 header") & 0x0f) as usize) * 4;
@@ -1349,7 +1349,7 @@ mod legacy_tests {
 #[cfg(test)]
 pub(crate) fn stamp_session_route_for_test(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
     session_id: SessionId,
     owner: DataWorkerId,
     next: TcpInputNext,
@@ -1372,7 +1372,7 @@ fn tcp_input_buffer(
 #[inline(always)]
 fn prefetch_tcp_input<C, Seg>(
     runtime: &DataPlaneRuntime,
-    indices: &[BufferIndex],
+    indices: &[Index],
     lookup: &TcpLookupSnapshot,
     session_queue: Option<
         SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
@@ -1440,7 +1440,7 @@ fn tcp_input_parts(
 #[inline(always)]
 fn tcp_input_enqueue_index<C, Seg>(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
     snapshot: &TcpLookupSnapshot,
     next: &[NodeId; TcpInputNext::COUNT],
     handoff: Option<NodeHandle>,

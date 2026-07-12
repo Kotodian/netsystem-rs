@@ -3,7 +3,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::time::Instant;
 
-use hammer_core::data_plane::{BufferFrame, BufferIndex, Frame, Next, NodeId, NodeRegistration};
+use hammer_core::data_plane::{BufferFrame, Index, Frame, Next, NodeId, NodeRegistration};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_runtime::{
     DataPlaneRuntime, DriverNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
@@ -93,7 +93,7 @@ impl SessionQueueOutput {
         &mut self,
         runtime: &DataPlaneRuntime,
         node: NodeId,
-        index: BufferIndex,
+        index: Index,
     ) -> CoreResult<()> {
         let mut frame = runtime.buffers().get_next_frame(node)?;
         frame.push_index(index)?;

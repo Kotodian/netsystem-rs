@@ -240,35 +240,20 @@ impl Default for BufferHeaderCacheline1 {
     }
 }
 
+/// Copyable data-plane pool identity. Pools construct it; Frame or another
+/// domain owner retains release responsibility. Copying does not alter
+/// reference counts.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BufferIndex {
+pub struct Index {
     pool_id: u64,
     slot: u32,
     generation: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct FrameIndex {
-    pool_id: u64,
-    slot: u32,
-    generation: u32,
-}
+const _: () = assert!(core::mem::size_of::<Index>() == 16);
 
-impl FrameIndex {
-    pub fn pool_id(self) -> u64 {
-        self.pool_id
-    }
-
-    pub fn slot(self) -> u32 {
-        self.slot
-    }
-
-    pub fn generation(self) -> u32 {
-        self.generation
-    }
-}
-
-impl BufferIndex {
+impl Index {
     pub fn pool_id(self) -> u64 {
         self.pool_id
     }
@@ -762,8 +747,8 @@ impl Buffer {
     }
 
     #[inline]
-    fn set_next_buffer(&mut self, next: Option<BufferIndex>) {
-        self.cacheline0.next_buffer = next.map_or(BUFFER_INVALID_INDEX, BufferIndex::slot);
+    fn set_next_buffer(&mut self, next: Option<Index>) {
+        self.cacheline0.next_buffer = next.map_or(BUFFER_INVALID_INDEX, Index::slot);
         if next.is_some() {
             self.cacheline0.flags.insert(BufferFlags::NEXT_PRESENT);
         } else {
@@ -1028,14 +1013,14 @@ pub(crate) struct FramePool {
 
 pub struct Next {
     owner: DataPlaneBuffers,
-    index: FrameIndex,
+    index: Index,
     next: NodeId,
     frame: Option<BufferFrame>,
 }
 
 pub struct Pending {
     owner: DataPlaneBuffers,
-    index: FrameIndex,
+    index: Index,
     frame: Option<BufferFrame>,
 }
 
@@ -1108,17 +1093,32 @@ impl fmt::Debug for DataPlaneBuffers {
     }
 }
 
-static NEXT_BUFFER_POOL_ID: AtomicU64 = AtomicU64::new(1);
-static NEXT_FRAME_POOL_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
 
 #[inline]
-fn next_buffer_pool_id() -> u64 {
-    NEXT_BUFFER_POOL_ID.fetch_add(1, Ordering::Relaxed)
+fn next_pool_id() -> u64 {
+    let id = NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed);
+    if id == 0 || id == u64::MAX {
+        // Nonzero namespace; never wrap to a previously used ID.
+        abort_pool_id_namespace_exhausted();
+    }
+    id
 }
 
+#[inline(never)]
+#[cold]
+fn abort_pool_id_namespace_exhausted() -> ! {
+    panic!("data-plane pool ID namespace exhausted");
+}
+
+/// Advance a slot generation. Retires the slot when the generation would wrap.
 #[inline]
-fn next_frame_pool_id() -> u64 {
-    NEXT_FRAME_POOL_ID.fetch_add(1, Ordering::Relaxed)
+fn advance_generation(current: u32) -> Option<u32> {
+    if current == u32::MAX {
+        None
+    } else {
+        Some(current.wrapping_add(1).max(1))
+    }
 }
 
 impl Frame<Next> {
@@ -1136,11 +1136,6 @@ impl Frame<Next> {
             Some(frame) => frame,
             None => abort_checked_out_frame(),
         }
-    }
-
-    #[inline]
-    pub fn index(&self) -> FrameIndex {
-        self.state.index
     }
 
     #[inline]
@@ -1180,11 +1175,6 @@ impl Frame<Pending> {
             Some(frame) => frame,
             None => abort_checked_out_frame(),
         }
-    }
-
-    #[inline]
-    pub fn index(&self) -> FrameIndex {
-        self.state.index
     }
 
     #[inline]
@@ -1380,17 +1370,17 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    pub fn alloc_index(&self) -> CoreResult<BufferIndex> {
+    pub fn alloc_index(&self) -> CoreResult<Index> {
         self.try_buffers()?.alloc_index()
     }
 
     #[inline]
-    pub fn alloc_index_with_bytes(&self, bytes: &[u8]) -> CoreResult<BufferIndex> {
+    pub fn alloc_index_with_bytes(&self, bytes: &[u8]) -> CoreResult<Index> {
         self.try_buffers()?.alloc_index_with_bytes(bytes)
     }
 
     #[inline]
-    fn drop_index_owned(&self, index: BufferIndex) {
+    fn drop_index_owned(&self, index: Index) {
         let Ok(buffers) = self.try_buffers() else {
             return;
         };
@@ -1399,7 +1389,7 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    pub fn drop_index_owned_with_trace(&self, index: BufferIndex, release_trace: impl FnMut(u32)) {
+    pub fn drop_index_owned_with_trace(&self, index: Index, release_trace: impl FnMut(u32)) {
         let Ok(buffers) = self.try_buffers() else {
             return;
         };
@@ -1423,31 +1413,31 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    pub fn attach_clone(&self, head: BufferIndex, tail: BufferIndex) -> CoreResult<()> {
+    pub fn attach_clone(&self, head: Index, tail: Index) -> CoreResult<()> {
         self.try_buffers()?.attach_clone(head, tail)
     }
 
     #[inline]
-    pub fn chain_buffer(&self, head: BufferIndex, tail: BufferIndex) -> CoreResult<()> {
+    pub fn chain_buffer(&self, head: Index, tail: Index) -> CoreResult<()> {
         self.try_buffers()?.chain_buffer(head, tail)
     }
 
     #[inline]
-    pub fn prefetch_header(&self, index: BufferIndex) {
+    pub fn prefetch_header(&self, index: Index) {
         if let Ok(buffers) = self.try_buffers() {
             buffers.prefetch_header(index);
         }
     }
 
     #[inline]
-    pub fn prefetch_read(&self, index: BufferIndex) {
+    pub fn prefetch_read(&self, index: Index) {
         if let Ok(buffers) = self.try_buffers() {
             buffers.prefetch_read(index);
         }
     }
 
     #[inline]
-    pub fn prefetch_write(&self, index: BufferIndex) {
+    pub fn prefetch_write(&self, index: Index) {
         if let Ok(buffers) = self.try_buffers() {
             buffers.prefetch_write(index);
         }
@@ -1461,7 +1451,7 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    fn drop_owned_frame(&self, index: FrameIndex, frame: BufferFrame) {
+    fn drop_owned_frame(&self, index: Index, frame: BufferFrame) {
         let mut frame = frame;
         self.drop_frame_indices(&mut frame);
         frame.reset_for_pool_reuse();
@@ -1471,7 +1461,7 @@ impl DataPlaneBuffers {
     #[inline]
     fn drop_owned_frame_with_trace(
         &self,
-        index: FrameIndex,
+        index: Index,
         frame: BufferFrame,
         release_trace: impl FnMut(u32),
     ) {
@@ -1482,7 +1472,7 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    fn alloc_frame(&self) -> CoreResult<(FrameIndex, BufferFrame)> {
+    fn alloc_frame(&self) -> CoreResult<(Index, BufferFrame)> {
         let index = self.frames.alloc_index()?;
         match self.frames.take_index(index) {
             Ok(frame) => Ok((index, frame)),
@@ -1508,42 +1498,42 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    pub fn get_buffer(&self, index: BufferIndex) -> CoreResult<BufferRef<'_>> {
+    pub fn get_buffer(&self, index: Index) -> CoreResult<BufferRef<'_>> {
         self.try_buffers()?.get(index)
     }
 
     #[inline]
-    pub fn get_buffer_mut(&self, index: BufferIndex) -> CoreResult<BufferRefMut<'_>> {
+    pub fn get_buffer_mut(&self, index: Index) -> CoreResult<BufferRefMut<'_>> {
         self.try_buffers()?.get_mut(index)
     }
 
     #[inline]
-    pub fn chain(&self, index: BufferIndex) -> DataPlaneBufferChain<'_> {
+    pub fn chain(&self, index: Index) -> DataPlaneBufferChain<'_> {
         DataPlaneBufferChain::new(self.try_buffers(), index)
     }
 
     #[inline]
-    pub fn node_error_code(&self, index: BufferIndex) -> CoreResult<Option<u16>> {
+    pub fn node_error_code(&self, index: Index) -> CoreResult<Option<u16>> {
         self.try_buffers()?.node_error_code(index)
     }
 
     #[inline]
-    pub fn current_config(&self, index: BufferIndex) -> CoreResult<NodeId> {
+    pub fn current_config(&self, index: Index) -> CoreResult<NodeId> {
         self.try_buffers()?.current_config(index)
     }
 
     #[inline]
-    pub fn set_current_config(&self, index: BufferIndex, next: NodeId) -> CoreResult<()> {
+    pub fn set_current_config(&self, index: Index, next: NodeId) -> CoreResult<()> {
         self.try_buffers()?.set_current_config(index, next)
     }
 
     #[inline]
-    pub fn advance(&self, index: BufferIndex, displacement: isize) -> CoreResult<()> {
+    pub fn advance(&self, index: Index, displacement: isize) -> CoreResult<()> {
         self.try_buffers()?.advance(index, displacement)
     }
 
     #[inline]
-    pub fn append(&self, index: BufferIndex, bytes: &[u8]) -> CoreResult<()> {
+    pub fn append(&self, index: Index, bytes: &[u8]) -> CoreResult<()> {
         self.try_buffers()?.append(index, bytes)
     }
 
@@ -1683,7 +1673,7 @@ impl BufferPoolArena {
 
         Self {
             inner: Arc::new(RwSpinlock::new(BufferPoolInner {
-                pool_id: next_buffer_pool_id(),
+                pool_id: next_pool_id(),
                 numa_node,
                 slot_capacity,
                 slot_stride,
@@ -1795,41 +1785,41 @@ impl BufferPool {
     }
 
     #[inline]
-    pub fn alloc_index(&self) -> CoreResult<BufferIndex> {
+    pub fn alloc_index(&self) -> CoreResult<Index> {
         let mut cache = self.thread_cache.borrow_mut();
         let mut arena = self.arena.inner.write();
         arena.alloc_empty_chain(&mut cache)
     }
 
     #[inline]
-    pub fn alloc_index_with_bytes(&self, bytes: &[u8]) -> CoreResult<BufferIndex> {
+    pub fn alloc_index_with_bytes(&self, bytes: &[u8]) -> CoreResult<Index> {
         let mut cache = self.thread_cache.borrow_mut();
         let mut arena = self.arena.inner.write();
         arena.alloc_chain(&mut cache, bytes)
     }
 
     #[inline]
-    pub fn attach_clone(&self, head: BufferIndex, tail: BufferIndex) -> CoreResult<()> {
+    pub fn attach_clone(&self, head: Index, tail: Index) -> CoreResult<()> {
         self.arena.inner.write().attach_clone(head, tail)
     }
 
     #[inline]
-    pub fn chain_buffer(&self, head: BufferIndex, tail: BufferIndex) -> CoreResult<()> {
+    pub fn chain_buffer(&self, head: Index, tail: Index) -> CoreResult<()> {
         self.arena.inner.write().chain_buffer(head, tail)
     }
 
     #[inline]
-    pub fn prefetch_header(&self, index: BufferIndex) {
+    pub fn prefetch_header(&self, index: Index) {
         self.arena.inner.read().prefetch_header(index);
     }
 
     #[inline]
-    pub fn prefetch_read(&self, index: BufferIndex) {
+    pub fn prefetch_read(&self, index: Index) {
         self.arena.inner.read().prefetch_read(index);
     }
 
     #[inline]
-    pub fn prefetch_write(&self, index: BufferIndex) {
+    pub fn prefetch_write(&self, index: Index) {
         self.arena.inner.read().prefetch_write(index);
     }
 
@@ -1844,7 +1834,7 @@ impl BufferPool {
     }
 
     #[inline]
-    pub fn get(&self, index: BufferIndex) -> CoreResult<BufferRef<'_>> {
+    pub fn get(&self, index: Index) -> CoreResult<BufferRef<'_>> {
         let guard = self.arena.inner.read();
         guard.buffer(index)?;
         Ok(BufferRef {
@@ -1856,7 +1846,7 @@ impl BufferPool {
     }
 
     #[inline]
-    pub fn get_mut(&self, index: BufferIndex) -> CoreResult<BufferRefMut<'_>> {
+    pub fn get_mut(&self, index: Index) -> CoreResult<BufferRefMut<'_>> {
         let mut guard = self.arena.inner.write();
         guard.ensure_writable(index)?;
         guard.buffer_mut(index)?;
@@ -1871,7 +1861,7 @@ impl BufferPool {
     #[inline]
     pub fn chain(
         &self,
-        index: BufferIndex,
+        index: Index,
     ) -> impl Iterator<Item = CoreResult<BufferRef<'_>>> + '_ {
         let mut next = Some(index);
         let mut failed = false;
@@ -1898,34 +1888,34 @@ impl BufferPool {
     }
 
     #[inline]
-    pub fn current_data(&self, index: BufferIndex) -> CoreResult<usize> {
+    pub fn current_data(&self, index: Index) -> CoreResult<usize> {
         Ok(self.arena.inner.read().buffer(index)?.current_data())
     }
 
     #[inline]
-    pub fn current_len(&self, index: BufferIndex) -> CoreResult<usize> {
+    pub fn current_len(&self, index: Index) -> CoreResult<usize> {
         Ok(self.arena.inner.read().buffer(index)?.current_len())
     }
 
     #[inline]
-    pub fn current_ptr(&self, index: BufferIndex) -> CoreResult<*const u8> {
+    pub fn current_ptr(&self, index: Index) -> CoreResult<*const u8> {
         Ok(self.arena.inner.read().buffer(index)?.current_ptr())
     }
 
     #[inline]
-    pub fn current_mut_ptr(&self, index: BufferIndex) -> CoreResult<*mut u8> {
+    pub fn current_mut_ptr(&self, index: Index) -> CoreResult<*mut u8> {
         let mut guard = self.arena.inner.write();
         guard.ensure_writable(index)?;
         Ok(guard.buffer_mut(index)?.current_mut_ptr())
     }
 
     #[inline]
-    pub fn current_config(&self, index: BufferIndex) -> CoreResult<NodeId> {
+    pub fn current_config(&self, index: Index) -> CoreResult<NodeId> {
         Ok(self.arena.inner.read().buffer(index)?.current_config())
     }
 
     #[inline]
-    pub fn set_current_config(&self, index: BufferIndex, next: NodeId) -> CoreResult<()> {
+    pub fn set_current_config(&self, index: Index, next: NodeId) -> CoreResult<()> {
         let mut guard = self.arena.inner.write();
         guard.ensure_header_exclusive(index)?;
         guard.buffer_mut(index)?.set_current_config(next);
@@ -1933,24 +1923,24 @@ impl BufferPool {
     }
 
     #[inline]
-    pub fn node_error_code(&self, index: BufferIndex) -> CoreResult<Option<u16>> {
+    pub fn node_error_code(&self, index: Index) -> CoreResult<Option<u16>> {
         Ok(self.arena.inner.read().buffer(index)?.node_error_code())
     }
 
     #[inline]
-    pub fn advance(&self, index: BufferIndex, displacement: isize) -> CoreResult<()> {
+    pub fn advance(&self, index: Index, displacement: isize) -> CoreResult<()> {
         let mut pool = self.arena.inner.write();
         pool.advance(index, displacement)
     }
 
     #[inline]
-    pub fn truncate_current(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
+    pub fn truncate_current(&self, index: Index, len: usize) -> CoreResult<()> {
         let mut pool = self.arena.inner.write();
         pool.ensure_writable(index)?;
 
         let mut walked = 0usize;
         let mut current = Some(index);
-        let mut cut_buffer: Option<BufferIndex> = None;
+        let mut cut_buffer: Option<Index> = None;
         let mut cut_remainder = 0usize;
         while let Some(current_index) = current {
             let current_len = pool.buffer(current_index)?.current_len();
@@ -1991,14 +1981,14 @@ impl BufferPool {
     }
 
     #[inline]
-    pub fn prepend(&self, index: BufferIndex, bytes: &[u8]) -> CoreResult<()> {
+    pub fn prepend(&self, index: Index, bytes: &[u8]) -> CoreResult<()> {
         let mut pool = self.arena.inner.write();
         pool.ensure_writable(index)?;
         pool.buffer_mut(index)?.prepend(bytes)
     }
 
     #[inline]
-    pub fn append(&self, index: BufferIndex, bytes: &[u8]) -> CoreResult<()> {
+    pub fn append(&self, index: Index, bytes: &[u8]) -> CoreResult<()> {
         let mut cache = self.thread_cache.borrow_mut();
         self.arena
             .inner
@@ -2023,7 +2013,7 @@ impl FramePool {
         let available_len = slots.len();
         Self {
             inner: Rc::new(RefCell::new(FramePoolInner {
-                pool_id: next_frame_pool_id(),
+                pool_id: next_pool_id(),
                 slots,
                 available,
                 available_len,
@@ -2038,12 +2028,12 @@ impl FramePool {
     }
 
     #[inline]
-    fn alloc_index(&self) -> CoreResult<FrameIndex> {
+    fn alloc_index(&self) -> CoreResult<Index> {
         self.inner.borrow_mut().alloc_index()
     }
 
     #[inline]
-    fn return_index(&self, buffers: &BufferPool, index: FrameIndex) -> CoreResult<()> {
+    fn return_index(&self, buffers: &BufferPool, index: Index) -> CoreResult<()> {
         let mut pool = self.inner.borrow_mut();
         let frame = pool.frame_mut(index)?;
         buffers.drop_frame_indices(frame);
@@ -2052,12 +2042,12 @@ impl FramePool {
     }
 
     #[inline]
-    fn take_index(&self, index: FrameIndex) -> CoreResult<BufferFrame> {
+    fn take_index(&self, index: Index) -> CoreResult<BufferFrame> {
         self.inner.borrow_mut().take_frame(index)
     }
 
     #[inline]
-    fn return_taken_index(&self, index: FrameIndex, frame: BufferFrame) -> CoreResult<()> {
+    fn return_taken_index(&self, index: Index, frame: BufferFrame) -> CoreResult<()> {
         self.inner
             .borrow_mut()
             .return_frame_and_release(index, frame)
@@ -2066,89 +2056,96 @@ impl FramePool {
 
 impl FramePoolInner {
     #[inline]
-    fn alloc_index(&mut self) -> CoreResult<FrameIndex> {
-        if self.available_len == 0 {
-            return Err(DataPlaneError::FramePoolExhausted.into());
+    fn alloc_index(&mut self) -> CoreResult<Index> {
+        loop {
+            if self.available_len == 0 {
+                return Err(DataPlaneError::FramePoolExhausted.into());
+            }
+            self.available_len -= 1;
+            let slot = self.available[self.available_len];
+            let pool_id = self.pool_id;
+            let entry = self.slots.get_mut(slot as usize).ok_or(
+                DataPlaneError::IndexSlotOutOfBounds { pool_id, slot },
+            )?;
+            let Some(generation) = advance_generation(entry.generation) else {
+                // Slot retired at max generation; leave it out of available.
+                continue;
+            };
+            entry.generation = generation;
+            entry.allocated = true;
+            let frame = entry
+                .frame
+                .as_mut()
+                .ok_or(DataPlaneError::FrameSlotCheckedOut)?;
+            frame.reset_for_pool_reuse();
+            self.in_use += 1;
+            return Ok(Index {
+                pool_id,
+                slot,
+                generation,
+            });
         }
-        self.available_len -= 1;
-        let slot = self.available[self.available_len];
-        let entry = self
-            .slots
-            .get_mut(slot as usize)
-            .ok_or(DataPlaneError::FrameSlotOutOfBounds)?;
-        entry.generation = entry.generation.wrapping_add(1).max(1);
-        entry.allocated = true;
-        let frame = entry
-            .frame
-            .as_mut()
-            .ok_or(DataPlaneError::FrameSlotCheckedOut)?;
-        frame.reset_for_pool_reuse();
-        self.in_use += 1;
-        Ok(FrameIndex {
-            pool_id: self.pool_id,
-            slot,
-            generation: entry.generation,
-        })
     }
 
     #[inline]
-    fn validate_index(&self, index: FrameIndex) -> CoreResult<()> {
+    fn validate_index(&self, index: Index) -> CoreResult<()> {
         if index.pool_id != self.pool_id {
-            return Err(DataPlaneError::FrameIndexForeign.into());
+            return Err(DataPlaneError::ForeignIndex {
+                expected_pool_id: self.pool_id,
+                actual_pool_id: index.pool_id,
+            }
+            .into());
         }
         Ok(())
     }
 
     #[inline]
-    fn frame_mut(&mut self, index: FrameIndex) -> CoreResult<&mut BufferFrame> {
+    fn entry_mut(&mut self, index: Index) -> CoreResult<&mut FrameSlot> {
         self.validate_index(index)?;
-        let entry = self
-            .slots
-            .get_mut(index.slot as usize)
-            .ok_or(DataPlaneError::FrameSlotOutOfBounds)?;
+        let pool_id = self.pool_id;
+        let entry = self.slots.get_mut(index.slot as usize).ok_or(
+            DataPlaneError::IndexSlotOutOfBounds {
+                pool_id,
+                slot: index.slot,
+            },
+        )?;
         if entry.generation != index.generation {
-            return Err(DataPlaneError::StaleFrameIndex.into());
+            return Err(DataPlaneError::StaleIndex {
+                slot: index.slot,
+                index_generation: index.generation,
+                current_generation: entry.generation,
+            }
+            .into());
         }
         if !entry.allocated {
-            return Err(DataPlaneError::FrameSlotFree.into());
+            return Err(DataPlaneError::IndexSlotFree {
+                pool_id,
+                slot: index.slot,
+            }
+            .into());
         }
-        entry
+        Ok(entry)
+    }
+
+    #[inline]
+    fn frame_mut(&mut self, index: Index) -> CoreResult<&mut BufferFrame> {
+        self.entry_mut(index)?
             .frame
             .as_mut()
             .ok_or(DataPlaneError::FrameSlotCheckedOut.into())
     }
 
     #[inline]
-    fn take_frame(&mut self, index: FrameIndex) -> CoreResult<BufferFrame> {
-        self.validate_index(index)?;
-        let entry = self
-            .slots
-            .get_mut(index.slot as usize)
-            .ok_or(DataPlaneError::FrameSlotOutOfBounds)?;
-        if entry.generation != index.generation {
-            return Err(DataPlaneError::StaleFrameIndex.into());
-        }
-        if !entry.allocated {
-            return Err(DataPlaneError::FrameSlotFree.into());
-        }
-        entry
+    fn take_frame(&mut self, index: Index) -> CoreResult<BufferFrame> {
+        self.entry_mut(index)?
             .frame
             .take()
             .ok_or(DataPlaneError::FrameSlotCheckedOut.into())
     }
 
     #[inline]
-    fn release_index(&mut self, index: FrameIndex) -> CoreResult<()> {
-        let entry = self
-            .slots
-            .get_mut(index.slot as usize)
-            .ok_or(DataPlaneError::FrameSlotOutOfBounds)?;
-        if entry.generation != index.generation {
-            return Err(DataPlaneError::StaleFrameIndex.into());
-        }
-        if !entry.allocated {
-            return Err(DataPlaneError::FrameSlotFree.into());
-        }
+    fn release_index(&mut self, index: Index) -> CoreResult<()> {
+        let entry = self.entry_mut(index)?;
         if entry.frame.is_none() {
             return Err(DataPlaneError::FrameSlotCheckedOut.into());
         }
@@ -2165,20 +2162,10 @@ impl FramePoolInner {
     #[inline]
     fn return_frame_and_release(
         &mut self,
-        index: FrameIndex,
+        index: Index,
         frame: BufferFrame,
     ) -> CoreResult<()> {
-        self.validate_index(index)?;
-        let entry = self
-            .slots
-            .get_mut(index.slot as usize)
-            .ok_or(DataPlaneError::FrameSlotOutOfBounds)?;
-        if entry.generation != index.generation {
-            return Err(DataPlaneError::StaleFrameIndex.into());
-        }
-        if !entry.allocated {
-            return Err(DataPlaneError::FrameSlotFree.into());
-        }
+        let entry = self.entry_mut(index)?;
         if entry.frame.is_some() {
             return Err(DataPlaneError::FrameSlotAlreadyHasFrame.into());
         }
@@ -2225,11 +2212,15 @@ impl DerefMut for Frame<Pending> {
 impl BufferPoolInner {
     #[inline]
     fn slot_index(&self, slot: u32) -> CoreResult<usize> {
-        let slot = usize::try_from(slot).expect("buffer slot index fits usize");
-        if slot >= self.total_slots {
-            return Err(CoreError::internal("buffer slot out of bounds"));
+        let slot_usize = usize::try_from(slot).expect("buffer slot index fits usize");
+        if slot_usize >= self.total_slots {
+            return Err(DataPlaneError::IndexSlotOutOfBounds {
+                pool_id: self.pool_id,
+                slot,
+            }
+            .into());
         }
-        Ok(slot)
+        Ok(slot_usize)
     }
 
     #[inline]
@@ -2321,8 +2312,8 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn index_from_slot(&self, slot: u32) -> Option<BufferIndex> {
-        Some(BufferIndex {
+    fn index_from_slot(&self, slot: u32) -> Option<Index> {
+        Some(Index {
             pool_id: self.pool_id,
             slot,
             generation: self.next_buffer_generation(slot)?,
@@ -2336,7 +2327,7 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn next_buffer(&self, index: BufferIndex) -> CoreResult<Option<BufferIndex>> {
+    fn next_buffer(&self, index: Index) -> CoreResult<Option<Index>> {
         Ok(self
             .buffer(index)?
             .next_buffer_slot()
@@ -2344,7 +2335,7 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn advance(&mut self, index: BufferIndex, displacement: isize) -> CoreResult<()> {
+    fn advance(&mut self, index: Index, displacement: isize) -> CoreResult<()> {
         if displacement == 0 {
             return Ok(());
         }
@@ -2451,7 +2442,7 @@ impl BufferPoolInner {
         &mut self,
         cache: &mut BufferThreadCache,
         bytes: &[u8],
-    ) -> CoreResult<BufferIndex> {
+    ) -> CoreResult<Index> {
         if self.slot_capacity == 0 {
             return Err(CoreError::internal("buffer slot capacity must be nonzero"));
         }
@@ -2482,7 +2473,7 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn alloc_empty_chain(&mut self, cache: &mut BufferThreadCache) -> CoreResult<BufferIndex> {
+    fn alloc_empty_chain(&mut self, cache: &mut BufferThreadCache) -> CoreResult<Index> {
         if self.slot_capacity == 0 {
             return Err(CoreError::internal("buffer slot capacity must be nonzero"));
         }
@@ -2494,7 +2485,7 @@ impl BufferPoolInner {
         &mut self,
         cache: &mut BufferThreadCache,
         bytes: &[u8],
-    ) -> CoreResult<BufferIndex> {
+    ) -> CoreResult<Index> {
         if bytes.len() > self.slot_capacity {
             return Err(CoreError::internal(format!(
                 "buffer bytes exceed slot capacity: {} > {}",
@@ -2510,20 +2501,27 @@ impl BufferPoolInner {
         &mut self,
         cache: &mut BufferThreadCache,
         reset: impl FnOnce(&mut Buffer, usize) -> CoreResult<()>,
-    ) -> CoreResult<BufferIndex> {
-        let slot = match cache.pop() {
-            Some(slot) => slot,
-            None => {
-                self.refill_cache_batch(cache);
-                cache
-                    .pop()
-                    .ok_or_else(|| CoreError::internal("buffer pool exhausted"))?
-            }
-        };
-        let generation = {
+    ) -> CoreResult<Index> {
+        let (slot, generation) = loop {
+            let slot = match cache.pop() {
+                Some(slot) => slot,
+                None => {
+                    self.refill_cache_batch(cache);
+                    cache
+                        .pop()
+                        .ok_or_else(|| CoreError::internal("buffer pool exhausted"))?
+                }
+            };
             let entry = self.slot_state_mut(slot)?;
-            entry.generation = entry.generation.wrapping_add(1).max(1);
-            entry.generation
+            match advance_generation(entry.generation) {
+                Some(generation) => {
+                    entry.generation = generation;
+                    break (slot, generation);
+                }
+                None => {
+                    // Slot retired at max generation; leave it out of the cache.
+                }
+            }
         };
         let reset_result = {
             let data_size = self.slot_capacity;
@@ -2538,7 +2536,7 @@ impl BufferPoolInner {
         self.slot_state_mut(slot)?.allocated = true;
         self.bump_in_use();
         self.prefetch_next_cached_slot(cache);
-        Ok(BufferIndex {
+        Ok(Index {
             pool_id: self.pool_id,
             slot,
             generation,
@@ -2553,20 +2551,27 @@ impl BufferPoolInner {
         &mut self,
         cache: &mut BufferThreadCache,
         headroom: usize,
-    ) -> CoreResult<BufferIndex> {
-        let slot = match cache.pop() {
-            Some(slot) => slot,
-            None => {
-                self.refill_cache_batch(cache);
-                cache
-                    .pop()
-                    .ok_or_else(|| CoreError::internal("buffer pool exhausted"))?
-            }
-        };
-        let generation = {
+    ) -> CoreResult<Index> {
+        let (slot, generation) = loop {
+            let slot = match cache.pop() {
+                Some(slot) => slot,
+                None => {
+                    self.refill_cache_batch(cache);
+                    cache
+                        .pop()
+                        .ok_or_else(|| CoreError::internal("buffer pool exhausted"))?
+                }
+            };
             let entry = self.slot_state_mut(slot)?;
-            entry.generation = entry.generation.wrapping_add(1).max(1);
-            entry.generation
+            match advance_generation(entry.generation) {
+                Some(generation) => {
+                    entry.generation = generation;
+                    break (slot, generation);
+                }
+                None => {
+                    // Slot retired at max generation; leave it out of the cache.
+                }
+            }
         };
         let clean = self
             .buffer_at_slot(slot)?
@@ -2590,7 +2595,7 @@ impl BufferPoolInner {
         self.slot_state_mut(slot)?.allocated = true;
         self.bump_in_use();
         self.prefetch_next_cached_slot(cache);
-        Ok(BufferIndex {
+        Ok(Index {
             pool_id: self.pool_id,
             slot,
             generation,
@@ -2598,43 +2603,53 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn validate_pool_index(&self, index: BufferIndex) -> CoreResult<()> {
+    fn validate_pool_index(&self, index: Index) -> CoreResult<()> {
         if index.pool_id != self.pool_id {
-            return Err(CoreError::internal("buffer index belongs to another pool"));
+            return Err(DataPlaneError::ForeignIndex {
+                expected_pool_id: self.pool_id,
+                actual_pool_id: index.pool_id,
+            }
+            .into());
         }
         Ok(())
     }
 
     #[inline]
-    fn buffer(&self, index: BufferIndex) -> CoreResult<&Buffer> {
+    fn validate_allocated_index(&self, index: Index) -> CoreResult<()> {
         self.validate_pool_index(index)?;
         let entry = self.slot_state(index.slot)?;
         if entry.generation != index.generation {
-            return Err(CoreError::internal("stale buffer index"));
+            return Err(DataPlaneError::StaleIndex {
+                slot: index.slot,
+                index_generation: index.generation,
+                current_generation: entry.generation,
+            }
+            .into());
         }
         if !entry.allocated {
-            return Err(CoreError::internal("buffer slot is free"));
+            return Err(DataPlaneError::IndexSlotFree {
+                pool_id: self.pool_id,
+                slot: index.slot,
+            }
+            .into());
         }
+        Ok(())
+    }
+
+    #[inline]
+    fn buffer(&self, index: Index) -> CoreResult<&Buffer> {
+        self.validate_allocated_index(index)?;
         self.buffer_at_slot(index.slot)
     }
 
     #[inline]
-    fn buffer_mut(&mut self, index: BufferIndex) -> CoreResult<&mut Buffer> {
-        self.validate_pool_index(index)?;
-        {
-            let entry = self.slot_state(index.slot)?;
-            if entry.generation != index.generation {
-                return Err(CoreError::internal("stale buffer index"));
-            }
-            if !entry.allocated {
-                return Err(CoreError::internal("buffer slot is free"));
-            }
-        }
+    fn buffer_mut(&mut self, index: Index) -> CoreResult<&mut Buffer> {
+        self.validate_allocated_index(index)?;
         self.buffer_at_slot_mut(index.slot)
     }
 
     #[inline]
-    fn ensure_header_exclusive(&self, index: BufferIndex) -> CoreResult<()> {
+    fn ensure_header_exclusive(&self, index: Index) -> CoreResult<()> {
         let buffer = self.buffer(index)?;
         if buffer.ref_count() == 1 {
             return Ok(());
@@ -2645,12 +2660,12 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn ensure_writable(&self, index: BufferIndex) -> CoreResult<()> {
+    fn ensure_writable(&self, index: Index) -> CoreResult<()> {
         self.ensure_header_exclusive(index)
     }
 
     #[inline]
-    fn prefetch_header(&self, index: BufferIndex) {
+    fn prefetch_header(&self, index: Index) {
         let Ok(buffer) = self.buffer(index) else {
             return;
         };
@@ -2658,7 +2673,7 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn prefetch_read(&self, index: BufferIndex) {
+    fn prefetch_read(&self, index: Index) {
         let Ok(buffer) = self.buffer(index) else {
             return;
         };
@@ -2668,7 +2683,7 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn prefetch_write(&self, index: BufferIndex) {
+    fn prefetch_write(&self, index: Index) {
         let Ok(buffer) = self.buffer(index) else {
             return;
         };
@@ -2678,7 +2693,7 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn free_chain(&mut self, cache: &mut BufferThreadCache, index: BufferIndex) {
+    fn free_chain(&mut self, cache: &mut BufferThreadCache, index: Index) {
         self.free_chain_trace(cache, index, |_| {});
     }
 
@@ -2686,7 +2701,7 @@ impl BufferPoolInner {
     fn free_chain_trace(
         &mut self,
         cache: &mut BufferThreadCache,
-        index: BufferIndex,
+        index: Index,
         mut release_trace: impl FnMut(u32),
     ) {
         let mut next = Some(index);
@@ -2877,7 +2892,7 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn attach_clone(&mut self, head: BufferIndex, tail: BufferIndex) -> CoreResult<()> {
+    fn attach_clone(&mut self, head: Index, tail: Index) -> CoreResult<()> {
         if head == tail {
             return Err(CoreError::internal(
                 "buffer attach clone requires distinct head and tail",
@@ -2919,7 +2934,7 @@ impl BufferPoolInner {
     fn append_chain(
         &mut self,
         cache: &mut BufferThreadCache,
-        index: BufferIndex,
+        index: Index,
         bytes: &[u8],
     ) -> CoreResult<()> {
         self.ensure_writable(index)?;
@@ -2956,7 +2971,7 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn chain_buffer(&mut self, head: BufferIndex, tail: BufferIndex) -> CoreResult<()> {
+    fn chain_buffer(&mut self, head: Index, tail: Index) -> CoreResult<()> {
         self.ensure_writable(head)?;
         self.buffer(tail)?;
         let tail_len = {
@@ -3016,14 +3031,14 @@ fn prefetch_buffer_data_write(buffer: &Buffer) {
     }
 }
 
-pub(crate) struct BufferIndexList {
-    ptr: NonNull<BufferIndex>,
+pub(crate) struct IndexList {
+    ptr: NonNull<Index>,
     len: usize,
     cap: usize,
     heap: Arc<Heap>,
 }
 
-impl BufferIndexList {
+impl IndexList {
     #[inline]
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         let heap = Arc::new(Heap::local());
@@ -3040,7 +3055,7 @@ impl BufferIndexList {
             .alloc(layout)
             .unwrap_or_else(|| handle_alloc_error(layout));
         let ptr =
-            NonNull::new(raw.as_ptr().cast::<BufferIndex>()).expect("Heap::alloc returned null");
+            NonNull::new(raw.as_ptr().cast::<Index>()).expect("Heap::alloc returned null");
         Self {
             ptr,
             len: 0,
@@ -3065,17 +3080,17 @@ impl BufferIndexList {
     }
 
     #[inline(always)]
-    fn as_slice(&self) -> &[BufferIndex] {
+    fn as_slice(&self) -> &[Index] {
         unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 
     #[inline(always)]
-    fn as_mut_slice(&mut self) -> &mut [BufferIndex] {
+    fn as_mut_slice(&mut self) -> &mut [Index] {
         unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 
     #[inline(always)]
-    pub(crate) fn try_push(&mut self, index: BufferIndex) -> bool {
+    pub(crate) fn try_push(&mut self, index: Index) -> bool {
         if self.len == self.cap {
             return false;
         }
@@ -3085,7 +3100,7 @@ impl BufferIndexList {
     }
 
     #[inline(always)]
-    fn push(&mut self, index: BufferIndex) {
+    fn push(&mut self, index: Index) {
         let pushed = self.try_push(index);
         debug_assert!(pushed);
     }
@@ -3107,7 +3122,7 @@ impl BufferIndexList {
         let len = self.len;
         self.len = 0;
         BufferFrameDrain {
-            indices: self as *mut BufferIndexList,
+            indices: self as *mut IndexList,
             current: 0,
             end: len,
             tail_start: len,
@@ -3122,7 +3137,7 @@ impl BufferIndexList {
         let old_len = self.len;
         self.len = 0;
         BufferFrameDrain {
-            indices: self as *mut BufferIndexList,
+            indices: self as *mut IndexList,
             current: 0,
             end: count,
             tail_start: count,
@@ -3132,14 +3147,14 @@ impl BufferIndexList {
     }
 }
 
-impl fmt::Debug for BufferIndexList {
+impl fmt::Debug for IndexList {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.as_slice().fmt(f)
     }
 }
 
-impl Drop for BufferIndexList {
+impl Drop for IndexList {
     #[inline]
     fn drop(&mut self) {
         if self.cap == 0 {
@@ -3152,15 +3167,15 @@ impl Drop for BufferIndexList {
 
 #[inline]
 fn frame_indices_layout(capacity: usize) -> Layout {
-    let bytes = mem::size_of::<BufferIndex>()
+    let bytes = mem::size_of::<Index>()
         .checked_mul(capacity)
         .expect("frame indices allocation size overflow")
         .max(1);
     Layout::from_size_align(bytes, BUFFER_CACHE_LINE_SIZE).expect("frame indices layout")
 }
 
-impl Deref for BufferIndexList {
-    type Target = [BufferIndex];
+impl Deref for IndexList {
+    type Target = [Index];
 
     #[inline(always)]
     fn deref(&self) -> &Self::Target {
@@ -3168,7 +3183,7 @@ impl Deref for BufferIndexList {
     }
 }
 
-impl DerefMut for BufferIndexList {
+impl DerefMut for IndexList {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.as_mut_slice()
@@ -3176,16 +3191,16 @@ impl DerefMut for BufferIndexList {
 }
 
 pub struct BufferFrameDrain<'frame> {
-    indices: *mut BufferIndexList,
+    indices: *mut IndexList,
     current: usize,
     end: usize,
     tail_start: usize,
     tail_len: usize,
-    state: PhantomData<&'frame mut BufferIndexList>,
+    state: PhantomData<&'frame mut IndexList>,
 }
 
 impl Iterator for BufferFrameDrain<'_> {
-    type Item = BufferIndex;
+    type Item = Index;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -3226,14 +3241,14 @@ impl Drop for BufferFrameDrain<'_> {
 
 pub struct DataPlaneBufferChain<'pool> {
     pool: Option<&'pool BufferPool>,
-    next: Option<BufferIndex>,
+    next: Option<Index>,
     failed: bool,
     error: Option<CoreError>,
 }
 
 impl<'pool> DataPlaneBufferChain<'pool> {
     #[inline]
-    fn new(pool: CoreResult<&'pool BufferPool>, index: BufferIndex) -> Self {
+    fn new(pool: CoreResult<&'pool BufferPool>, index: Index) -> Self {
         match pool {
             Ok(pool) => Self {
                 pool: Some(pool),
@@ -3283,28 +3298,28 @@ impl<'pool> Iterator for DataPlaneBufferChain<'pool> {
 
 #[derive(Debug)]
 pub struct BufferFrame {
-    indices: BufferIndexList,
+    indices: IndexList,
     readiness: Rc<FrameReadiness>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferFramePairBatch {
-    Pair([BufferIndex; 2]),
-    Single(BufferIndex),
+    Pair([Index; 2]),
+    Single(Index),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferFrameQuadBatch {
-    Quad([BufferIndex; 4]),
-    Pair([BufferIndex; 2]),
-    Single(BufferIndex),
+    Quad([Index; 4]),
+    Pair([Index; 2]),
+    Single(Index),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferFrameBatch {
-    Quad([BufferIndex; 4]),
-    Pair([BufferIndex; 2]),
-    Single(BufferIndex),
+    Quad([Index; 4]),
+    Pair([Index; 2]),
+    Single(Index),
 }
 
 impl BufferFramePairBatch {
@@ -3340,14 +3355,14 @@ impl BufferFrameBatch {
 }
 
 pub struct BufferFrameBatchIndices {
-    indices: [Option<BufferIndex>; 4],
+    indices: [Option<Index>; 4],
     len: usize,
     offset: usize,
 }
 
 impl BufferFrameBatchIndices {
     #[inline]
-    fn new(indices: &[BufferIndex]) -> Self {
+    fn new(indices: &[Index]) -> Self {
         let mut values = [None; 4];
         for (offset, index) in indices.iter().copied().enumerate() {
             values[offset] = Some(index);
@@ -3361,7 +3376,7 @@ impl BufferFrameBatchIndices {
 }
 
 impl Iterator for BufferFrameBatchIndices {
-    type Item = BufferIndex;
+    type Item = Index;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -3376,19 +3391,19 @@ impl Iterator for BufferFrameBatchIndices {
 
 #[derive(Debug, Clone)]
 pub struct BufferFramePairBatchCursor<'frame> {
-    indices: &'frame [BufferIndex],
+    indices: &'frame [Index],
     offset: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct BufferFrameQuadBatchCursor<'frame> {
-    indices: &'frame [BufferIndex],
+    indices: &'frame [Index],
     offset: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct BufferFrameBatchCursor<'frame> {
-    indices: &'frame [BufferIndex],
+    indices: &'frame [Index],
     offset: usize,
     width: BufferFrameBatchWidth,
 }
@@ -3568,13 +3583,13 @@ impl BufferFrame {
     #[inline]
     fn with_capacity(capacity: usize) -> Self {
         Self {
-            indices: BufferIndexList::with_capacity(capacity),
+            indices: IndexList::with_capacity(capacity),
             readiness: Rc::new(FrameReadiness::default()),
         }
     }
 
     #[inline]
-    pub fn push_index(&mut self, index: BufferIndex) -> CoreResult<()> {
+    pub fn push_index(&mut self, index: Index) -> CoreResult<()> {
         if self.indices.len() == self.indices.capacity() {
             return Err(DataPlaneError::BufferFrameCapacityExceeded.into());
         }
@@ -3586,7 +3601,7 @@ impl BufferFrame {
     #[inline]
     pub fn push_indices(
         &mut self,
-        indices: impl IntoIterator<Item = BufferIndex>,
+        indices: impl IntoIterator<Item = Index>,
     ) -> CoreResult<()> {
         let indices = indices.into_iter();
         let (lower, upper) = indices.size_hint();
@@ -3649,12 +3664,12 @@ impl BufferFrame {
     }
 
     #[inline]
-    pub fn indices(&self) -> &[BufferIndex] {
+    pub fn indices(&self) -> &[Index] {
         &self.indices
     }
 
     #[inline]
-    pub fn pending_indices(&self) -> &[BufferIndex] {
+    pub fn pending_indices(&self) -> &[Index] {
         &self.indices
     }
 
@@ -3687,7 +3702,7 @@ impl BufferFrame {
     }
 
     #[inline]
-    pub fn iter_indices(&self) -> slice::Iter<'_, BufferIndex> {
+    pub fn iter_indices(&self) -> slice::Iter<'_, Index> {
         self.indices.iter()
     }
 
@@ -3714,7 +3729,7 @@ impl BufferFrame {
     #[inline]
     pub fn retain_indices(
         &mut self,
-        mut keep: impl FnMut(BufferIndex) -> CoreResult<bool>,
+        mut keep: impl FnMut(Index) -> CoreResult<bool>,
     ) -> CoreResult<()> {
         let mut write = 0usize;
         for read in 0..self.indices.len() {
@@ -3739,7 +3754,7 @@ impl BufferFrame {
     pub fn retain_indices_batched(
         &mut self,
         width: impl BufferFrameBatchWidthPolicy,
-        mut keep: impl FnMut(BufferIndex) -> CoreResult<bool>,
+        mut keep: impl FnMut(Index) -> CoreResult<bool>,
     ) -> CoreResult<()> {
         match width.buffer_frame_batch_width() {
             BufferFrameBatchWidth::Octo => self.retain_indices_octo(&mut keep),
@@ -3752,8 +3767,8 @@ impl BufferFrame {
     pub fn retain_indices_batched_with_prefetch(
         &mut self,
         width: impl BufferFrameBatchWidthPolicy,
-        mut prefetch: impl FnMut(BufferIndex),
-        mut keep: impl FnMut(BufferIndex) -> CoreResult<bool>,
+        mut prefetch: impl FnMut(Index),
+        mut keep: impl FnMut(Index) -> CoreResult<bool>,
     ) -> CoreResult<()> {
         match width.buffer_frame_batch_width() {
             BufferFrameBatchWidth::Quad => {
@@ -3773,8 +3788,8 @@ impl BufferFrame {
         &mut self,
         width: impl BufferFrameBatchWidthPolicy,
         state: &mut S,
-        mut prefetch: impl FnMut(&mut S, BufferIndex),
-        mut keep: impl FnMut(&mut S, BufferIndex) -> CoreResult<bool>,
+        mut prefetch: impl FnMut(&mut S, Index),
+        mut keep: impl FnMut(&mut S, Index) -> CoreResult<bool>,
     ) -> CoreResult<()> {
         match width.buffer_frame_batch_width() {
             BufferFrameBatchWidth::Quad => {
@@ -3794,8 +3809,8 @@ impl BufferFrame {
         &mut self,
         width: impl BufferFrameBatchWidthPolicy,
         state: &mut S,
-        mut prefetch: impl FnMut(&mut S, BufferIndex),
-        mut keep: impl FnMut(&mut S, BufferIndex) -> CoreResult<bool>,
+        mut prefetch: impl FnMut(&mut S, Index),
+        mut keep: impl FnMut(&mut S, Index) -> CoreResult<bool>,
     ) -> CoreResult<()> {
         match width.buffer_frame_batch_width() {
             BufferFrameBatchWidth::Quad => {
@@ -3814,7 +3829,7 @@ impl BufferFrame {
     pub fn rewrite_indices_batched(
         &mut self,
         width: impl BufferFrameBatchWidthPolicy,
-        mut rewrite: impl FnMut(BufferIndex) -> CoreResult<Option<BufferIndex>>,
+        mut rewrite: impl FnMut(Index) -> CoreResult<Option<Index>>,
     ) -> CoreResult<()> {
         match width.buffer_frame_batch_width() {
             BufferFrameBatchWidth::Quad => self.rewrite_indices_quad(&mut rewrite),
@@ -3826,7 +3841,7 @@ impl BufferFrame {
     #[inline(always)]
     fn retain_indices_quad(
         &mut self,
-        keep: &mut impl FnMut(BufferIndex) -> CoreResult<bool>,
+        keep: &mut impl FnMut(Index) -> CoreResult<bool>,
     ) -> CoreResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
@@ -3873,8 +3888,8 @@ impl BufferFrame {
     #[inline(always)]
     fn retain_indices_quad_with_prefetch(
         &mut self,
-        prefetch: &mut impl FnMut(BufferIndex),
-        keep: &mut impl FnMut(BufferIndex) -> CoreResult<bool>,
+        prefetch: &mut impl FnMut(Index),
+        keep: &mut impl FnMut(Index) -> CoreResult<bool>,
     ) -> CoreResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
@@ -3889,7 +3904,7 @@ impl BufferFrame {
     #[inline(always)]
     fn retain_indices_pair(
         &mut self,
-        keep: &mut impl FnMut(BufferIndex) -> CoreResult<bool>,
+        keep: &mut impl FnMut(Index) -> CoreResult<bool>,
     ) -> CoreResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
@@ -3904,7 +3919,7 @@ impl BufferFrame {
     #[inline(always)]
     fn retain_indices_octo(
         &mut self,
-        keep: &mut impl FnMut(BufferIndex) -> CoreResult<bool>,
+        keep: &mut impl FnMut(Index) -> CoreResult<bool>,
     ) -> CoreResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
@@ -3991,8 +4006,8 @@ impl BufferFrame {
     #[inline(always)]
     fn retain_indices_pair_with_prefetch(
         &mut self,
-        prefetch: &mut impl FnMut(BufferIndex),
-        keep: &mut impl FnMut(BufferIndex) -> CoreResult<bool>,
+        prefetch: &mut impl FnMut(Index),
+        keep: &mut impl FnMut(Index) -> CoreResult<bool>,
     ) -> CoreResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
@@ -4008,8 +4023,8 @@ impl BufferFrame {
     fn retain_indices_quad_with_prefetch_state<S>(
         &mut self,
         state: &mut S,
-        prefetch: &mut impl FnMut(&mut S, BufferIndex),
-        keep: &mut impl FnMut(&mut S, BufferIndex) -> CoreResult<bool>,
+        prefetch: &mut impl FnMut(&mut S, Index),
+        keep: &mut impl FnMut(&mut S, Index) -> CoreResult<bool>,
     ) -> CoreResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
@@ -4025,8 +4040,8 @@ impl BufferFrame {
     fn retain_indices_pair_with_prefetch_state<S>(
         &mut self,
         state: &mut S,
-        prefetch: &mut impl FnMut(&mut S, BufferIndex),
-        keep: &mut impl FnMut(&mut S, BufferIndex) -> CoreResult<bool>,
+        prefetch: &mut impl FnMut(&mut S, Index),
+        keep: &mut impl FnMut(&mut S, Index) -> CoreResult<bool>,
     ) -> CoreResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
@@ -4042,8 +4057,8 @@ impl BufferFrame {
     fn retain_indices_quad_with_prefetch_state_lazy<S>(
         &mut self,
         state: &mut S,
-        prefetch: &mut impl FnMut(&mut S, BufferIndex),
-        keep: &mut impl FnMut(&mut S, BufferIndex) -> CoreResult<bool>,
+        prefetch: &mut impl FnMut(&mut S, Index),
+        keep: &mut impl FnMut(&mut S, Index) -> CoreResult<bool>,
     ) -> CoreResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
@@ -4059,8 +4074,8 @@ impl BufferFrame {
     fn retain_indices_pair_with_prefetch_state_lazy<S>(
         &mut self,
         state: &mut S,
-        prefetch: &mut impl FnMut(&mut S, BufferIndex),
-        keep: &mut impl FnMut(&mut S, BufferIndex) -> CoreResult<bool>,
+        prefetch: &mut impl FnMut(&mut S, Index),
+        keep: &mut impl FnMut(&mut S, Index) -> CoreResult<bool>,
     ) -> CoreResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
@@ -4075,7 +4090,7 @@ impl BufferFrame {
     #[inline(always)]
     fn rewrite_indices_quad(
         &mut self,
-        rewrite: &mut impl FnMut(BufferIndex) -> CoreResult<Option<BufferIndex>>,
+        rewrite: &mut impl FnMut(Index) -> CoreResult<Option<Index>>,
     ) -> CoreResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
@@ -4090,7 +4105,7 @@ impl BufferFrame {
     #[inline(always)]
     fn rewrite_indices_octo(
         &mut self,
-        rewrite: &mut impl FnMut(BufferIndex) -> CoreResult<Option<BufferIndex>>,
+        rewrite: &mut impl FnMut(Index) -> CoreResult<Option<Index>>,
     ) -> CoreResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
@@ -4105,7 +4120,7 @@ impl BufferFrame {
     #[inline(always)]
     fn rewrite_indices_pair(
         &mut self,
-        rewrite: &mut impl FnMut(BufferIndex) -> CoreResult<Option<BufferIndex>>,
+        rewrite: &mut impl FnMut(Index) -> CoreResult<Option<Index>>,
     ) -> CoreResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
@@ -4122,7 +4137,7 @@ impl BufferFrame {
         &mut self,
         read: usize,
         write: &mut usize,
-        keep: &mut impl FnMut(BufferIndex) -> CoreResult<bool>,
+        keep: &mut impl FnMut(Index) -> CoreResult<bool>,
     ) -> CoreResult<()> {
         let index = self.indices[read];
         if keep(index)? {
@@ -4138,7 +4153,7 @@ impl BufferFrame {
         read: usize,
         write: &mut usize,
         state: &mut S,
-        keep: &mut impl FnMut(&mut S, BufferIndex) -> CoreResult<bool>,
+        keep: &mut impl FnMut(&mut S, Index) -> CoreResult<bool>,
     ) -> CoreResult<()> {
         let index = self.indices[read];
         if keep(state, index)? {
@@ -4154,7 +4169,7 @@ impl BufferFrame {
         read: usize,
         write: &mut Option<usize>,
         state: &mut S,
-        keep: &mut impl FnMut(&mut S, BufferIndex) -> CoreResult<bool>,
+        keep: &mut impl FnMut(&mut S, Index) -> CoreResult<bool>,
     ) -> CoreResult<()> {
         let index = self.indices[read];
         if keep(state, index)? {
@@ -4173,7 +4188,7 @@ impl BufferFrame {
         &mut self,
         read: usize,
         write: &mut usize,
-        rewrite: &mut impl FnMut(BufferIndex) -> CoreResult<Option<BufferIndex>>,
+        rewrite: &mut impl FnMut(Index) -> CoreResult<Option<Index>>,
     ) -> CoreResult<()> {
         let index = self.indices[read];
         if let Some(index) = rewrite(index)? {
@@ -4188,7 +4203,7 @@ impl BufferFrame {
         &self,
         offset: usize,
         width: usize,
-        prefetch: &mut impl FnMut(BufferIndex),
+        prefetch: &mut impl FnMut(Index),
     ) {
         let end = (offset + width).min(self.indices.len());
         for index in self.indices[offset..end].iter().copied() {
@@ -4202,7 +4217,7 @@ impl BufferFrame {
         offset: usize,
         width: usize,
         state: &mut S,
-        prefetch: &mut impl FnMut(&mut S, BufferIndex),
+        prefetch: &mut impl FnMut(&mut S, Index),
     ) {
         let end = (offset + width).min(self.indices.len());
         for index in self.indices[offset..end].iter().copied() {
@@ -4237,7 +4252,7 @@ impl BufferFrame {
 
 impl BufferFramePairBatchCursor<'_> {
     #[inline]
-    pub fn prefetch_next_pair_with(&self, mut prefetch: impl FnMut(BufferIndex)) {
+    pub fn prefetch_next_pair_with(&self, mut prefetch: impl FnMut(Index)) {
         for index in self.indices[self.offset..].iter().take(2).copied() {
             prefetch(index);
         }
@@ -4269,7 +4284,7 @@ impl Iterator for BufferFramePairBatchCursor<'_> {
 
 impl BufferFrameQuadBatchCursor<'_> {
     #[inline]
-    pub fn prefetch_next_quad_with(&self, mut prefetch: impl FnMut(BufferIndex)) {
+    pub fn prefetch_next_quad_with(&self, mut prefetch: impl FnMut(Index)) {
         for index in self.indices[self.offset..].iter().take(4).copied() {
             prefetch(index);
         }
@@ -4310,7 +4325,7 @@ impl Iterator for BufferFrameQuadBatchCursor<'_> {
 
 impl BufferFrameBatchCursor<'_> {
     #[inline]
-    pub fn prefetch_next_with(&self, mut prefetch: impl FnMut(BufferIndex)) {
+    pub fn prefetch_next_with(&self, mut prefetch: impl FnMut(Index)) {
         let width = match self.width {
             BufferFrameBatchWidth::Octo => 8,
             BufferFrameBatchWidth::Quad => 4,
@@ -4366,5 +4381,76 @@ impl Future for BufferFramePending {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.readiness.poll_pending(cx)
+    }
+}
+
+#[cfg(test)]
+mod index_identity_tests {
+    use super::*;
+    use crate::error::CoreError;
+
+    #[test]
+    fn advance_generation_retires_at_max() {
+        assert_eq!(advance_generation(0), Some(1));
+        assert_eq!(advance_generation(u32::MAX - 1), Some(u32::MAX));
+        assert_eq!(advance_generation(u32::MAX), None);
+    }
+
+    #[test]
+    fn buffer_pool_reports_out_of_bounds_slot_facts() {
+        let pool = BufferPool::with_capacity(64, 1);
+        let foreign = Index {
+            pool_id: pool.pool_id(),
+            slot: 99,
+            generation: 1,
+        };
+        match pool.get(foreign).map(|_| ()).unwrap_err() {
+            CoreError::DataPlane(DataPlaneError::IndexSlotOutOfBounds { pool_id, slot }) => {
+                assert_eq!(pool_id, pool.pool_id());
+                assert_eq!(slot, 99);
+            }
+            other => panic!("expected IndexSlotOutOfBounds, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn buffer_pool_retires_slot_at_max_generation() {
+        let pool = BufferPool::with_capacity(64, 2);
+        let first = pool.alloc_index().expect("first");
+        let second = pool.alloc_index().expect("second");
+        let retired_slot = first.slot;
+        {
+            let mut cache = pool.thread_cache.borrow_mut();
+            let mut inner = pool.arena.inner.write();
+            inner.free_chain(&mut cache, first);
+            inner.free_chain(&mut cache, second);
+            // Force the next pop of `retired_slot` to hit max-generation retirement.
+            let entry = inner.slot_state_mut(retired_slot).expect("slot");
+            entry.generation = u32::MAX;
+        }
+        let reused = pool.alloc_index().expect("alloc after retirement");
+        assert_ne!(reused.slot(), retired_slot);
+        assert!(pool.get(Index {
+            pool_id: pool.pool_id(),
+            slot: retired_slot,
+            generation: u32::MAX,
+        })
+        .is_err());
+        {
+            let mut cache = pool.thread_cache.borrow_mut();
+            pool.arena
+                .inner
+                .write()
+                .free_chain(&mut cache, reused);
+        }
+    }
+
+    #[test]
+    fn next_pool_id_never_returns_zero() {
+        let a = next_pool_id();
+        let b = next_pool_id();
+        assert_ne!(a, 0);
+        assert_ne!(b, 0);
+        assert_ne!(a, b);
     }
 }

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use arc_swap::ArcSwapOption;
 use hammer_core::config::{Config, Route, RouteAction};
 use hammer_core::data_plane::{
-    BufferFrame, BufferIndex, BufferPacketCursor, NodeId, NodeRegistration, SecondaryOpaque,
+    BufferFrame, Index, BufferPacketCursor, NodeId, NodeRegistration, SecondaryOpaque,
 };
 use hammer_core::error::{CoreError, CoreResult, HammerResult};
 use hammer_core::forwarding::{
@@ -402,7 +402,7 @@ impl IpLookupNode {
     #[inline(always)]
     fn cached_packet_for_index(
         runtime: &DataPlaneRuntime,
-        index: BufferIndex,
+        index: Index,
     ) -> Option<ParsedIpPacket> {
         let buffer = runtime.get_buffer(index).ok()?;
         packet_from_cached_metadata(
@@ -415,7 +415,7 @@ impl IpLookupNode {
     }
 
     #[inline(always)]
-    fn process_index(runtime: &DataPlaneRuntime, table: &FibTable, index: BufferIndex) -> NodeId {
+    fn process_index(runtime: &DataPlaneRuntime, table: &FibTable, index: Index) -> NodeId {
         let parsed = Self::cached_packet_for_index(runtime, index);
         let traced = runtime
             .get_buffer(index)
@@ -547,7 +547,7 @@ impl AdjacencyRewriteNode {
     fn next_for_index(
         table: &FibTableHandle,
         runtime: &DataPlaneRuntime,
-        index: BufferIndex,
+        index: Index,
     ) -> Option<NodeId> {
         let forwarding = {
             let buffer = runtime.get_buffer(index).expect("buffer");
@@ -783,7 +783,7 @@ fn adjacency_rewrite_process_frame(
 #[inline(always)]
 fn apply_adjacency_rewrite(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
     adjacency: Adjacency,
 ) -> CoreResult<()> {
     let rewrite = adjacency.rewrite.as_slice();

@@ -17,8 +17,7 @@ const MOVED_ADAPTER_PATTERNS: &[&str] = &[
     "hammer_adapter::BufferHeaderCacheline0",
     "hammer_adapter::BufferHeaderCacheline1",
     "hammer_adapter::Buffer",
-    "hammer_adapter::BufferIndex",
-    "hammer_adapter::FrameIndex",
+    "hammer_adapter::Index",
     "hammer_adapter::BufferFrame",
     "hammer_adapter::Frame",
     "hammer_adapter::Next",
@@ -51,8 +50,7 @@ const MOVED_ADAPTER_PATTERNS: &[&str] = &[
     "hammer_adapter::buffer::BufferHeaderCacheline0",
     "hammer_adapter::buffer::BufferHeaderCacheline1",
     "hammer_adapter::buffer::Buffer",
-    "hammer_adapter::buffer::BufferIndex",
-    "hammer_adapter::buffer::FrameIndex",
+    "hammer_adapter::buffer::Index",
     "hammer_adapter::buffer::BufferFrame",
     "hammer_adapter::buffer::Frame",
     "hammer_adapter::buffer::Next",
@@ -87,8 +85,7 @@ const MOVED_ROOT_IMPORTS: &[&str] = &[
     "BufferHeaderCacheline0",
     "BufferHeaderCacheline1",
     "Buffer",
-    "BufferIndex",
-    "FrameIndex",
+    "Index",
     "BufferFrame",
     "Frame",
     "Next",
@@ -248,10 +245,10 @@ fn moved_root_import_in_use_statement(statement: &str) -> Option<&'static str> {
 
 #[test]
 fn root_braced_adapter_imports_for_moved_primitives_are_rejected() {
-    let statement = "use hammer_adapter::{BufferIndex, DataPlaneRuntime};";
+    let statement = "use hammer_adapter::{Index, DataPlaneRuntime};";
     assert_eq!(
         moved_root_import_in_use_statement(statement),
-        Some("BufferIndex")
+        Some("Index")
     );
 }
 

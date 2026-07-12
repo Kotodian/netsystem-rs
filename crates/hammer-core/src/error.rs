@@ -35,20 +35,31 @@ pub enum DataPlaneError {
     #[error("frame pool exhausted")]
     FramePoolExhausted,
 
-    #[error("frame slot out of bounds")]
-    FrameSlotOutOfBounds,
-
     #[error("frame slot is checked out")]
     FrameSlotCheckedOut,
 
-    #[error("frame index belongs to another pool")]
-    FrameIndexForeign,
+    #[error(
+        "index belongs to another pool: expected pool {expected_pool_id}, got pool {actual_pool_id}"
+    )]
+    ForeignIndex {
+        expected_pool_id: u64,
+        actual_pool_id: u64,
+    },
 
-    #[error("stale frame index")]
-    StaleFrameIndex,
+    #[error(
+        "stale index: slot {slot} generation {index_generation} != current {current_generation}"
+    )]
+    StaleIndex {
+        slot: u32,
+        index_generation: u32,
+        current_generation: u32,
+    },
 
-    #[error("frame slot is free")]
-    FrameSlotFree,
+    #[error("index slot {slot} out of bounds for pool {pool_id}")]
+    IndexSlotOutOfBounds { pool_id: u64, slot: u32 },
+
+    #[error("index slot {slot} is free in pool {pool_id}")]
+    IndexSlotFree { pool_id: u64, slot: u32 },
 
     #[error("frame slot already has a frame")]
     FrameSlotAlreadyHasFrame,

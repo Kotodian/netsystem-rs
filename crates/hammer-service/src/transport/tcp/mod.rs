@@ -451,7 +451,7 @@ pub(crate) fn read_session_route_opaque(
 #[inline(always)]
 pub(crate) fn read_session_id(
     runtime: &DataPlaneRuntime,
-    index: hammer_core::data_plane::BufferIndex,
+    index: hammer_core::data_plane::Index,
 ) -> CoreResult<Option<SessionId>> {
     let buffer = runtime.get_buffer(index)?;
     Ok(read_session_route_opaque(buffer.opaque2()).map(|(session_id, _, _)| session_id))

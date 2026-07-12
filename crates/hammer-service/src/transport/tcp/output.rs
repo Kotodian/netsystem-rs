@@ -1,4 +1,4 @@
-use hammer_core::data_plane::{BufferFrame, BufferIndex, NodeId, NodeRegistration};
+use hammer_core::data_plane::{BufferFrame, Index, NodeId, NodeRegistration};
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::tcp_header;
 use hammer_runtime::{
@@ -123,7 +123,7 @@ fn tcp_output_node_process_frame(
 
 fn tcp_output_next_for_index(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
     lookup: NodeId,
     drop: NodeId,
 ) -> CoreResult<NodeId> {
@@ -318,7 +318,7 @@ mod tests {
         (runtime, lookup_state, drop_state, output)
     }
 
-    fn send_to_output(runtime: &DataPlaneRuntime, output: NodeId, index: BufferIndex) {
+    fn send_to_output(runtime: &DataPlaneRuntime, output: NodeId, index: Index) {
         let mut frame = runtime.buffers().get_next_frame(output).expect("frame");
         frame.push_index(index).expect("push index");
         runtime.put_next_frame(frame).expect("put next frame");

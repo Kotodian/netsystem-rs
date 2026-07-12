@@ -1,4 +1,4 @@
-use hammer_core::data_plane::{BufferFrame, BufferIndex, BufferPacketCursor, NodeId};
+use hammer_core::data_plane::{BufferFrame, Index, BufferPacketCursor, NodeId};
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::{TcpError, TcpSegmentFlags, tcp_header};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
@@ -78,7 +78,7 @@ fn tcp_reset_process_frame(
 #[inline(always)]
 fn tcp_reset_next_for_index(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
     drop_next: NodeId,
     lookup_next: NodeId,
 ) -> CoreResult<NodeId> {
@@ -100,7 +100,7 @@ fn tcp_reset_next_for_index(
 #[inline(always)]
 fn tcp_reset_write_reply(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
     reset: Option<([u8; 16], [u8; 16], u16, u16, u32, u32, u8, u8)>,
 ) -> CoreResult<Option<usize>> {
     let Some((
@@ -433,7 +433,7 @@ fn be_u32(value: u32) -> [u8; 4] {
 
 fn refresh_reset_metadata(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
     packet_len: usize,
 ) -> CoreResult<()> {
     const TCP_HEADER_LEN: usize = 20;

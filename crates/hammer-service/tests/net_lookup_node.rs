@@ -61,7 +61,7 @@ struct SinkNode {
 
 fn chain_bytes(
     runtime: &DataPlaneRuntime,
-    index: hammer_core::data_plane::BufferIndex,
+    index: hammer_core::data_plane::Index,
 ) -> InfraVec<u8> {
     let mut bytes = InfraVec::new();
     for buffer in runtime.buffers().chain(index) {
@@ -1062,7 +1062,7 @@ fn push_packet(runtime: &DataPlaneRuntime, frame: &mut BufferFrame, packet: &[u8
 fn alloc_packet_with_headroom(
     runtime: &DataPlaneRuntime,
     packet: &[u8],
-) -> hammer_core::data_plane::BufferIndex {
+) -> hammer_core::data_plane::Index {
     let index = runtime.alloc_index().expect("alloc packet with headroom");
     runtime
         .buffers()
@@ -1089,7 +1089,7 @@ fn push_marked_packet(
 
 fn set_lookup_cursor(
     runtime: &DataPlaneRuntime,
-    index: hammer_core::data_plane::BufferIndex,
+    index: hammer_core::data_plane::Index,
     packet: &[u8],
 ) {
     let Some(first) = packet.first().copied() else {

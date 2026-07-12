@@ -1,5 +1,5 @@
 use crate::session::runtime::RxDelivery;
-use hammer_core::data_plane::{BufferFrame, BufferIndex, NodeId};
+use hammer_core::data_plane::{BufferFrame, Index, NodeId};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::pool::Index as PoolIndex;
 use hammer_infra::segment::Segment;
@@ -113,7 +113,7 @@ where
 
 fn tcp_established_index<C, Seg>(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
     session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
     tcp_output: NodeId,
 ) -> CoreResult<()>

@@ -79,7 +79,7 @@ impl InternalNode for CaptureNode {}
 
 fn chain_bytes(
     runtime: &DataPlaneRuntime,
-    index: hammer_core::data_plane::BufferIndex,
+    index: hammer_core::data_plane::Index,
 ) -> CoreResult<InfraVec<u8>> {
     let mut bytes = InfraVec::new();
     for buffer in runtime.buffers().chain(index) {
@@ -308,7 +308,7 @@ fn push_marked_packet(
 
 fn set_ip_cursor(
     runtime: &DataPlaneRuntime,
-    index: hammer_core::data_plane::BufferIndex,
+    index: hammer_core::data_plane::Index,
     packet: &[u8],
 ) {
     let Some(first) = packet.first().copied() else {

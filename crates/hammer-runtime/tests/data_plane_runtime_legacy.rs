@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use hammer_core::data_plane::{
-    BufferFrame, BufferFramePairBatch, BufferFrameQuadBatch, BufferIndex, BufferPacketCursor,
+    BufferFrame, BufferFramePairBatch, BufferFrameQuadBatch, Index, BufferPacketCursor,
     BufferPool, BufferPoolArena, BufferRefMut, DataPlaneBufferConfig, DataPlaneBuffers, NodeId,
 };
 use hammer_core::error::CoreResult;
@@ -17,7 +17,7 @@ use hammer_runtime::{
 };
 
 trait CleanupOwner {
-    fn drop_index_owned(&self, index: BufferIndex);
+    fn drop_index_owned(&self, index: Index);
 }
 
 fn test_buffers(buffer_slot_capacity: usize, buffer_slots: usize) -> DataPlaneBuffers {
@@ -90,7 +90,7 @@ fn pool_cleanup_runtime(pool: &BufferPool, frame_capacity: usize) -> DataPlaneRu
 }
 
 impl CleanupOwner for BufferPool {
-    fn drop_index_owned(&self, index: BufferIndex) {
+    fn drop_index_owned(&self, index: Index) {
         let runtime = pool_cleanup_runtime(self, 1);
         let mut frame = runtime
             .buffers()
@@ -101,14 +101,14 @@ impl CleanupOwner for BufferPool {
 }
 
 impl CleanupOwner for DataPlaneBuffers {
-    fn drop_index_owned(&self, index: BufferIndex) {
+    fn drop_index_owned(&self, index: Index) {
         let mut frame = self.get_next_frame(NodeId::new(0)).expect("cleanup frame");
         frame.push_index(index).expect("cleanup push index");
     }
 }
 
 impl CleanupOwner for DataPlaneRuntime {
-    fn drop_index_owned(&self, index: BufferIndex) {
+    fn drop_index_owned(&self, index: Index) {
         let mut frame = self
             .buffers()
             .get_next_frame(NodeId::new(0))
@@ -138,7 +138,7 @@ impl Wake for WakeCounter {
     }
 }
 
-fn chain_bytes(pool: &BufferPool, index: BufferIndex) -> CoreResult<Vec<u8>> {
+fn chain_bytes(pool: &BufferPool, index: Index) -> CoreResult<Vec<u8>> {
     let mut out = Vec::new();
     for buffer in pool.chain(index) {
         out.extend_from_slice(buffer?.current());
@@ -146,7 +146,7 @@ fn chain_bytes(pool: &BufferPool, index: BufferIndex) -> CoreResult<Vec<u8>> {
     Ok(out)
 }
 
-fn chain_len(pool: &BufferPool, index: BufferIndex) -> CoreResult<usize> {
+fn chain_len(pool: &BufferPool, index: Index) -> CoreResult<usize> {
     let mut len = 0usize;
     for buffer in pool.chain(index) {
         let _ = buffer?;
@@ -319,14 +319,14 @@ fn runtime_get_buffer_exposes_direct_buffer_borrows() {
 fn public_mut_buffer_accessors_keep_buffer_refmut_shape() {
     fn assert_pool_shape<'a>(
         pool: &'a BufferPool,
-        index: BufferIndex,
+        index: Index,
     ) -> CoreResult<BufferRefMut<'a>> {
         pool.get_mut(index)
     }
 
     fn assert_runtime_shape<'a>(
         runtime: &'a DataPlaneRuntime,
-        index: BufferIndex,
+        index: Index,
     ) -> CoreResult<BufferRefMut<'a>> {
         runtime.get_buffer_mut(index)
     }
@@ -973,7 +973,6 @@ fn buffer_pool_drop_frame_releases_all_indices_and_reuses_frame() {
         .buffers()
         .get_next_frame(NodeId::new(0))
         .expect("alloc frame");
-    let frame_index = frame.index();
     let first = pool
         .alloc_index_with_bytes(b"one")
         .expect("alloc first frame buffer");
@@ -994,8 +993,6 @@ fn buffer_pool_drop_frame_releases_all_indices_and_reuses_frame() {
         .buffers()
         .get_next_frame(NodeId::new(0))
         .expect("reuse frame allocation");
-    assert_eq!(frame.index().slot(), frame_index.slot());
-    assert_ne!(frame.index().generation(), frame_index.generation());
     assert!(frame.is_empty());
     assert_eq!(frame.capacity(), capacity);
     let next = pool
@@ -1291,7 +1288,6 @@ fn data_plane_runtime_allocates_frame_indices_from_reusable_pool() {
         .buffers()
         .get_next_frame(NodeId::new(0))
         .expect("alloc frame");
-    let frame_index = frame.index();
     let first = runtime
         .alloc_index_with_bytes(b"one")
         .expect("alloc first buffer");
@@ -1331,9 +1327,6 @@ fn data_plane_runtime_allocates_frame_indices_from_reusable_pool() {
         .buffers()
         .get_next_frame(NodeId::new(0))
         .expect("reuse frame");
-    let reused_frame_index = reused_frame.index();
-    assert_eq!(reused_frame_index.slot(), frame_index.slot());
-    assert_ne!(reused_frame_index.generation(), frame_index.generation());
     assert!(reused_frame.is_empty());
     drop(reused_frame);
 }
@@ -1368,7 +1361,6 @@ fn data_plane_runtime_checks_out_pooled_frame_for_packet_interfaces() {
         .buffers()
         .get_next_frame(NodeId::new(0))
         .expect("alloc frame");
-    let frame_index = frame.index();
     let buffer = runtime
         .alloc_index_with_bytes(b"pkt")
         .expect("alloc packet buffer");
@@ -1395,8 +1387,6 @@ fn data_plane_runtime_checks_out_pooled_frame_for_packet_interfaces() {
         .buffers()
         .get_next_frame(NodeId::new(0))
         .expect("reuse frame");
-    assert_eq!(reused_frame.index().slot(), frame_index.slot());
-    assert_ne!(reused_frame.index().generation(), frame_index.generation());
     assert!(reused_frame.is_empty());
     drop(reused_frame);
 }
@@ -1435,7 +1425,7 @@ fn push_numbered_indices(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
     count: u8,
-) -> Vec<BufferIndex> {
+) -> Vec<Index> {
     let indices = (0..count)
         .map(|value| {
             runtime

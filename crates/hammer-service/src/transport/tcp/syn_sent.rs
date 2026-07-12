@@ -1,4 +1,4 @@
-use hammer_core::data_plane::{BufferFrame, BufferIndex, NodeId};
+use hammer_core::data_plane::{BufferFrame, Index, NodeId};
 use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
 
 use hammer_core::error::{CoreError, CoreResult};
@@ -118,7 +118,7 @@ where
 
 fn tcp_syn_sent_index<C, Seg>(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
     session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
     tcp_output: NodeId,
 ) -> CoreResult<bool>
@@ -221,7 +221,7 @@ where
 }
 
 #[inline(always)]
-fn prefetch_tcp_syn_sent(runtime: &DataPlaneRuntime, indices: &[BufferIndex]) {
+fn prefetch_tcp_syn_sent(runtime: &DataPlaneRuntime, indices: &[Index]) {
     let mut read = 0usize;
     while read < indices.len() {
         runtime.prefetch_header(indices[read]);
@@ -232,7 +232,7 @@ fn prefetch_tcp_syn_sent(runtime: &DataPlaneRuntime, indices: &[BufferIndex]) {
 #[inline(always)]
 fn tcp_syn_sent_enqueue_index<C, Seg>(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
     session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
     tcp_output: NodeId,
 ) -> CoreResult<bool>
@@ -401,7 +401,7 @@ mod legacy_tests {
 
     fn stamp_tcp_cursor(
         runtime: &DataPlaneRuntime,
-        buffer: hammer_core::data_plane::BufferIndex,
+        buffer: hammer_core::data_plane::Index,
         packet: &[u8],
     ) {
         let header_len = ((*packet.first().expect("IPv4 header") & 0x0f) as usize) * 4;

@@ -1,5 +1,5 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use hammer_core::data_plane::{BufferIndex, BufferPool, DataPlaneBufferConfig, NodeId};
+use hammer_core::data_plane::{Index, BufferPool, DataPlaneBufferConfig, NodeId};
 use hammer_infra::vec::Vec;
 use hammer_runtime::{DataPlaneHandoff, DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId};
 
@@ -30,7 +30,7 @@ fn cleanup_runtime_for_pool(pool: &BufferPool, frame_capacity: usize) -> DataPla
     )
 }
 
-fn drop_owned_index(runtime: &DataPlaneRuntime, index: BufferIndex) {
+fn drop_owned_index(runtime: &DataPlaneRuntime, index: Index) {
     let mut frame = runtime
         .buffers()
         .get_next_frame(NodeId::new(0))
@@ -38,7 +38,7 @@ fn drop_owned_index(runtime: &DataPlaneRuntime, index: BufferIndex) {
     frame.push_index(index).expect("cleanup push index");
 }
 
-fn drop_owned_indices(runtime: &DataPlaneRuntime, indices: Vec<BufferIndex>) {
+fn drop_owned_indices(runtime: &DataPlaneRuntime, indices: Vec<Index>) {
     let mut frame = runtime
         .buffers()
         .get_next_frame(NodeId::new(0))

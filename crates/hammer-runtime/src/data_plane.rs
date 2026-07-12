@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use hammer_core::config::Config;
 use hammer_core::data_plane::{
-    BufferFrame, BufferFrameBatchWidth, BufferFrameBatchWidthPolicy, BufferIndex, BufferNodeError,
+    BufferFrame, BufferFrameBatchWidth, BufferFrameBatchWidthPolicy, Index, BufferNodeError,
     BufferPoolArena, BufferRef, BufferRefMut, DataPlaneBufferChain, DataPlaneBufferConfig,
     DataPlaneBuffers, Frame, Next, NodeHandle, NodeId, NodeNext, Pending,
 };
@@ -253,17 +253,17 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    pub fn alloc_index(&self) -> CoreResult<BufferIndex> {
+    pub fn alloc_index(&self) -> CoreResult<Index> {
         self.buffers.alloc_index()
     }
 
     #[inline]
-    pub fn alloc_index_with_bytes(&self, bytes: &[u8]) -> CoreResult<BufferIndex> {
+    pub fn alloc_index_with_bytes(&self, bytes: &[u8]) -> CoreResult<Index> {
         self.buffers.alloc_index_with_bytes(bytes)
     }
 
     #[inline]
-    fn drop_index_owned(&self, index: BufferIndex) {
+    fn drop_index_owned(&self, index: Index) {
         self.buffers
             .drop_index_owned_with_trace(index, |handle| self.trace.finalize(handle));
     }
@@ -274,27 +274,27 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    pub fn prefetch_header(&self, index: BufferIndex) {
+    pub fn prefetch_header(&self, index: Index) {
         self.buffers.prefetch_header(index);
     }
 
     #[inline]
-    pub fn prefetch_read(&self, index: BufferIndex) {
+    pub fn prefetch_read(&self, index: Index) {
         self.buffers.prefetch_read(index);
     }
 
     #[inline]
-    pub fn prefetch_write(&self, index: BufferIndex) {
+    pub fn prefetch_write(&self, index: Index) {
         self.buffers.prefetch_write(index);
     }
 
     #[inline]
-    pub fn chain(&self, index: BufferIndex) -> DataPlaneBufferChain<'_> {
+    pub fn chain(&self, index: Index) -> DataPlaneBufferChain<'_> {
         self.buffers.chain(index)
     }
 
     #[inline]
-    pub fn current_config(&self, index: BufferIndex) -> CoreResult<NodeId> {
+    pub fn current_config(&self, index: Index) -> CoreResult<NodeId> {
         self.buffers.current_config(index)
     }
 
@@ -309,12 +309,12 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    pub fn get_buffer(&self, index: BufferIndex) -> CoreResult<BufferRef<'_>> {
+    pub fn get_buffer(&self, index: Index) -> CoreResult<BufferRef<'_>> {
         self.buffers.get_buffer(index)
     }
 
     #[inline]
-    pub fn get_buffer_mut(&self, index: BufferIndex) -> CoreResult<BufferRefMut<'_>> {
+    pub fn get_buffer_mut(&self, index: Index) -> CoreResult<BufferRefMut<'_>> {
         self.buffers.get_buffer_mut(index)
     }
 
@@ -361,7 +361,7 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    pub fn try_mark_trace(&self, node: NodeId, index: BufferIndex) -> CoreResult<()> {
+    pub fn try_mark_trace(&self, node: NodeId, index: Index) -> CoreResult<()> {
         if !self.trace.may_mark(node) {
             return Ok(());
         }
@@ -376,7 +376,7 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    pub fn add_trace<T: PacketTrace>(&self, index: BufferIndex, trace: T) -> CoreResult<()> {
+    pub fn add_trace<T: PacketTrace>(&self, index: Index, trace: T) -> CoreResult<()> {
         let Some(node) = self.current_node() else {
             return Ok(());
         };
@@ -393,7 +393,7 @@ impl DataPlaneRuntime {
     }
 
     #[inline(always)]
-    pub fn should_trace_packet(&self, index: BufferIndex) -> CoreResult<bool> {
+    pub fn should_trace_packet(&self, index: Index) -> CoreResult<bool> {
         Ok(crate::unlikely(
             self.get_buffer(index)?.trace_handle().is_some(),
         ))
@@ -429,7 +429,7 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    pub fn node_error(&self, index: BufferIndex) -> CoreResult<Option<BufferNodeError>> {
+    pub fn node_error(&self, index: Index) -> CoreResult<Option<BufferNodeError>> {
         let code = self.buffers.node_error_code(index)?;
         match code {
             Some(code) => self.nodes.decode_node_error(code),
@@ -539,7 +539,7 @@ impl DataPlaneRuntime {
         &self,
         worker: DataWorkerId,
         target: NodeHandle,
-        indices: impl IntoIterator<Item = BufferIndex>,
+        indices: impl IntoIterator<Item = Index>,
     ) -> CoreResult<()> {
         let Some(handoff) = &self.handoff else {
             return Err(DataPlaneError::HandoffNotConfigured.into());
@@ -571,7 +571,7 @@ impl DataPlaneRuntime {
         &self,
         worker: DataWorkerId,
         target: NodeHandle,
-        index: BufferIndex,
+        index: Index,
     ) -> CoreResult<()> {
         let Some(handoff) = &self.handoff else {
             return Err(DataPlaneError::HandoffNotConfigured.into());

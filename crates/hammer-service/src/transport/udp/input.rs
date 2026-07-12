@@ -2,7 +2,7 @@ use std::mem::{size_of, transmute};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use hammer_core::data_plane::{BufferFrame, BufferIndex, NodeId, NodeNextStorage, SecondaryOpaque};
+use hammer_core::data_plane::{BufferFrame, Index, NodeId, NodeNextStorage, SecondaryOpaque};
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
 use hammer_core::protocol::transport::UdpHeader;
@@ -262,7 +262,7 @@ fn udp_input_process_frame(
 #[inline(always)]
 fn next_node_for_index(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
     snapshot: &UdpInputSnapshot,
     next: &[NodeId; UdpInputNext::COUNT],
 ) -> CoreResult<Option<NodeId>> {
@@ -424,7 +424,7 @@ fn next_node_for_index(
 #[inline(always)]
 fn resolve_drop_error(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
     next: &[NodeId; UdpInputNext::COUNT],
     error: UdpInputError,
     version: Option<IpVersion>,
@@ -452,7 +452,7 @@ fn resolve_drop_error(
 #[inline(always)]
 fn resolve_unknown_port(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
     next: &[NodeId; UdpInputNext::COUNT],
     snapshot: &UdpInputSnapshot,
     version: IpVersion,
@@ -481,7 +481,7 @@ fn resolve_unknown_port(
 }
 
 #[inline(always)]
-fn clear_success_metadata(runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<()> {
+fn clear_success_metadata(runtime: &DataPlaneRuntime, index: Index) -> CoreResult<()> {
     let mut buffer = runtime.get_buffer_mut(index)?;
     buffer.clear_node_error();
     let opaque = unsafe { transmute::<_, &mut IcmpErrorOpaque>(buffer.opaque2_mut()) };

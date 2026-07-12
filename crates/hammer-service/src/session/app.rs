@@ -1,7 +1,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use hammer_core::data_plane::{BufferIndex, DataPlaneBuffers};
+use hammer_core::data_plane::{Index, DataPlaneBuffers};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::fifo::Fifo;
 use hammer_infra::map::FlatHashTable;
@@ -164,7 +164,7 @@ impl<S: Segment> SessionAppRuntime<S> {
         session_id: SessionId,
         tx_offset: usize,
         payload_len: usize,
-        index: BufferIndex,
+        index: Index,
     ) -> CoreResult<()> {
         let session = self
             .sessions
@@ -192,7 +192,7 @@ impl<S: Segment> SessionAppRuntime<S> {
         &self,
         session_id: SessionId,
         buffers: &DataPlaneBuffers,
-        index: BufferIndex,
+        index: Index,
     ) -> CoreResult<(u32, u32)>
     where
         Self: SessionAppRuntimeCreate<S>,
@@ -244,7 +244,7 @@ impl<S: Segment> SessionAppRuntime<S> {
         &self,
         session_id: SessionId,
         buffers: &DataPlaneBuffers,
-        index: BufferIndex,
+        index: Index,
         offset: u32,
     ) -> CoreResult<(u32, Option<(u32, u32)>)> {
         let Some(session) = self.sessions.lookup(&session_id.get()) else {

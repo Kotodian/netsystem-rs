@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwap;
 use hammer_core::data_plane::{
-    BufferFrame, BufferIndex, BufferPacketCursor, NodeId, NodeNextStorage,
+    BufferFrame, Index, BufferPacketCursor, NodeId, NodeNextStorage,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::IcmpHeader;
@@ -514,7 +514,7 @@ fn process_frame(
 #[inline(always)]
 fn process_index(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
     state: &IpLocalState,
     next: &[NodeId; IpLocalNext::COUNT],
     stage: LocalStage,
@@ -786,7 +786,7 @@ fn udp_datagram_len(transport: &[u8], header: UdpHeader) -> Result<usize, IpLoca
 #[inline(always)]
 fn refresh_basic_metadata(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
     parsed: &ParsedIpPacket,
     transport_header_len: Option<usize>,
 ) -> CoreResult<()> {

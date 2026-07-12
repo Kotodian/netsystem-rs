@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwap;
 use hammer_core::data_plane::{
-    BufferFrame, BufferIndex, BufferPacketCursor, NodeId, NodeNextStorage, SecondaryOpaque,
+    BufferFrame, Index, BufferPacketCursor, NodeId, NodeNextStorage, SecondaryOpaque,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::{
@@ -873,7 +873,7 @@ fn icmp_error_process_frame(
 #[inline(always)]
 fn next_node_for_index(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
     snapshot: &IcmpInputSnapshot,
 ) -> CoreResult<NodeId> {
     let buffer = runtime.get_buffer(index)?;
@@ -1094,7 +1094,7 @@ fn next_node_for_index(
 #[inline(always)]
 fn next_node_for_echo_request_index(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
     next: [NodeId; IcmpEchoRequestNext::COUNT],
 ) -> CoreResult<NodeId> {
     let packet = collect_current_chain_for_icmp_generation(runtime, index)?;
@@ -1142,7 +1142,7 @@ fn next_node_for_echo_request_index(
 #[inline(always)]
 fn next_node_for_icmp_error_index(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
     next: [NodeId; IcmpErrorNext::COUNT],
     source_table: Option<&IcmpErrorSourceSnapshot>,
 ) -> CoreResult<NodeId> {
@@ -1257,7 +1257,7 @@ fn next_node_for_icmp_error_index(
 #[inline(always)]
 fn collect_current_chain_for_icmp_generation(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
 ) -> CoreResult<hammer_infra::vec::Vec<u8>> {
     let mut bytes = hammer_infra::vec::Vec::new();
     let mut chain = runtime.chain(index);
@@ -1271,7 +1271,7 @@ fn collect_current_chain_for_icmp_generation(
 #[inline(always)]
 fn refresh_generated_icmp_metadata(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    index: Index,
     generated: &IcmpGeneratedPacket,
 ) -> CoreResult<()> {
     let mut buffer = runtime.get_buffer_mut(index)?;
