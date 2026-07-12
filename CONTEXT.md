@@ -60,10 +60,6 @@ _Avoid_: reassembly emit_output get/push/put, packet-path NodeId next, Fanout of
 TUN input receives into the driver Frame, then enqueues every pending Index through Graph Fanout on the registered local next slot (slot 0). It does not acquire a separate Next Frame or push/put by target `NodeId`.
 _Avoid_: TUN input get_next_frame/put_next_frame, NodeId hot-path next field
 
-**Graph Fanout Architecture Guard**:
-Production `hammer-service` packet nodes must not worker-locally `get_next_frame` / `put_next_frame` by target node. Allowed exceptions are Handoff continuation put and RAII scratch frames acquired with `NodeId::new(0)` (reassembly fragment free, TUN in-flight recv). Guard tests live in `tests/graph_fanout_architecture_guard.rs`.
-_Avoid_: one-buffer get/push/put by NodeId locals, restoring production `frame_capacity` knobs
-
 **Graph Fanout**:
 The sole worker-local next-frame enqueue: it groups packet ownership by selected Next Arc and makes the resulting Next Frames visible at the current Graph Node dispatch boundary. Cross-worker ownership transfer remains Handoff, not Graph Fanout.
 _Avoid_: cross-thread fanout, handoff enqueue, output router, per-node manual frame get/push/put, recoverable enqueue Result on the packet path
