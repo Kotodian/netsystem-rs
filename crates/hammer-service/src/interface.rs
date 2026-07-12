@@ -333,14 +333,14 @@ impl InterfaceControlPlane {
 #[derive(Debug, Clone)]
 pub struct InterfaceConnectedRouteControl {
     table: FibTableHandle,
-    drop_next: NodeId,
-    receive_next: NodeId,
+    drop_next: u16,
+    receive_next: u16,
     connected_nexts: Option<InterfaceConnectedNexts>,
 }
 
 impl InterfaceConnectedRouteControl {
     #[inline]
-    pub fn new(table: FibTableHandle, drop_next: NodeId, receive_next: NodeId) -> Self {
+    pub fn new(table: FibTableHandle, drop_next: u16, receive_next: u16) -> Self {
         Self {
             table,
             drop_next,
@@ -352,8 +352,8 @@ impl InterfaceConnectedRouteControl {
     #[inline]
     pub fn with_connected_adjacency(
         mut self,
-        adjacency_rewrite_next: NodeId,
-        interface_output_next: NodeId,
+        adjacency_rewrite_next: u16,
+        interface_output_next: u16,
     ) -> Self {
         self.connected_nexts = Some(InterfaceConnectedNexts {
             adjacency_rewrite_next,
@@ -429,8 +429,8 @@ impl InterfaceConnectedRouteControl {
 
 #[derive(Debug, Clone, Copy)]
 struct InterfaceConnectedNexts {
-    adjacency_rewrite_next: NodeId,
-    interface_output_next: NodeId,
+    adjacency_rewrite_next: u16,
+    interface_output_next: u16,
 }
 
 struct InterfaceStateSlot {

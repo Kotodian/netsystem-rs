@@ -31,17 +31,19 @@ use hammer_runtime::{
 use crate::data_plane::set_index_node_error_code;
 use crate::net::{ForwardingMetadata, NetworkOpaque, TapEthernetMetadata};
 use crate::trace::codec::{
-    TraceDecodeCursor, put_node, put_option_dpo_type, put_option_node, put_option_u16,
-    put_option_u32, put_u32, put_usize,
+    TraceDecodeCursor, put_option_dpo_type, put_option_u16, put_option_u32, put_u16, put_u32,
+    put_usize,
 };
 
-pub type Adjacency = CoreAdjacency<NodeId>;
-pub type DpoId = CoreDpoId<NodeId>;
-pub type FibEntry = CoreFibEntry<NodeId>;
-pub type FibLookupResult = CoreFibLookupResult<NodeId>;
-pub type FibTable = CoreFibTable<NodeId>;
-pub type FibTableBuilder = CoreFibTableBuilder<NodeId>;
-pub type LoadBalance = CoreLoadBalance<NodeId>;
+/// Packet-path forwarding nexts are consumer-local slots (`u16`), not target
+/// `NodeId` values. Graph Runtime resolves slots via Graph Fanout.
+pub type Adjacency = CoreAdjacency<u16>;
+pub type DpoId = CoreDpoId<u16>;
+pub type FibEntry = CoreFibEntry<u16>;
+pub type FibLookupResult = CoreFibLookupResult<u16>;
+pub type FibTable = CoreFibTable<u16>;
+pub type FibTableBuilder = CoreFibTableBuilder<u16>;
+pub type LoadBalance = CoreLoadBalance<u16>;
 
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
@@ -62,7 +64,7 @@ pub struct IpLookupTrace {
     pub bucket_index: Option<u16>,
     pub dpo_type: Option<DpoType>,
     pub dpo_index: Option<u32>,
-    pub next: NodeId,
+    pub next: u16,
 }
 
 impl IpLookupTrace {
@@ -76,7 +78,7 @@ impl IpLookupTrace {
             bucket_index: cursor.read_option_u16()?,
             dpo_type: cursor.read_option_dpo_type()?,
             dpo_index: cursor.read_option_u32()?,
-            next: cursor.read_node()?,
+            next: cursor.read_u16()?,
         };
         cursor.is_empty().then_some(trace)
     }
@@ -92,7 +94,7 @@ impl PacketTrace for IpLookupTrace {
         put_option_u16(out, self.bucket_index);
         put_option_dpo_type(out, self.dpo_type);
         put_option_u32(out, self.dpo_index);
-        put_node(out, self.next);
+        put_u16(out, self.next);
     }
 }
 
@@ -109,7 +111,7 @@ pub struct AdjacencyRewriteTrace {
     pub egress_interface: Option<u32>,
     pub rewrite_len: usize,
     pub error: Option<u16>,
-    pub next: Option<NodeId>,
+    pub next: Option<u16>,
 }
 
 impl AdjacencyRewriteTrace {
@@ -120,7 +122,7 @@ impl AdjacencyRewriteTrace {
             egress_interface: cursor.read_option_u32()?,
             rewrite_len: cursor.read_usize()?,
             error: cursor.read_option_u16()?,
-            next: cursor.read_option_node()?,
+            next: cursor.read_option_u16()?,
         };
         cursor.is_empty().then_some(trace)
     }
@@ -133,7 +135,7 @@ impl PacketTrace for AdjacencyRewriteTrace {
         put_option_u32(out, self.egress_interface);
         put_usize(out, self.rewrite_len);
         put_option_u16(out, self.error);
-        put_option_node(out, self.next);
+        put_option_u16(out, self.next);
     }
 }
 
@@ -300,14 +302,16 @@ pub struct IpMain {
 /// Sentinel `drop` next-node id used by [`IpMain::register_node`] when the real
 /// `drop` node is not registered yet. Replaced by [`IpMain::wire_drop`] before
 /// any packet is processed.
-const DROP_PLACEHOLDER: NodeId = NodeId::new(u32::MAX);
+/// Sentinel drop local-next used by [`IpMain::register_node`] before
+/// [`IpMain::wire_drop`] installs the real slot.
+const DROP_PLACEHOLDER: u16 = u16::MAX;
 
 impl IpMain {
     pub fn new(routes: Arc<[Route]>) -> Self {
         Self { routes }
     }
 
-    fn build_table(&self, drop: NodeId) -> CoreResult<FibTable> {
+    fn build_table(&self, drop: u16) -> CoreResult<FibTable> {
         let mut builder = FibTableBuilder::new(drop);
         for route in self.routes.iter() {
             if let RouteAction::Drop = route
@@ -330,16 +334,19 @@ impl IpMain {
         rt.nodes().try_register_internal(node)
     }
 
-    /// Resolve the `drop` node by name and install the real FIB table on every
-    /// per-worker `IpLookupNode` handle. Must run after `init_graph` has
-    /// registered all nodes, so registration order across the linkme slice does
-    /// not matter.
+    /// Resolve the `drop` node by name, register it as a lookup local next,
+    /// and install the real FIB table on every per-worker `IpLookupNode`.
     pub fn wire_drop(&self, rt: &DataPlaneRuntime) -> CoreResult<()> {
         let drop = rt
             .nodes()
             .node_by_name("drop")
             .ok_or_else(|| CoreError::internal("drop node not registered"))?;
-        let table = self.build_table(drop)?;
+        let lookup = rt
+            .nodes()
+            .node_by_name(IpLookupNode::NODE_NAME)
+            .ok_or_else(|| CoreError::internal("ip-lookup node not registered"))?;
+        let drop_slot = rt.nodes().add_node_next_slot(lookup, drop)?;
+        let table = self.build_table(drop_slot)?;
         let runtimes = lookup_runtimes()
             .lock()
             .map_err(|_| CoreError::internal("IP lookup runtime registry poisoned"))?;
@@ -415,7 +422,7 @@ impl IpLookupNode {
     }
 
     #[inline(always)]
-    fn process_index(runtime: &DataPlaneRuntime, table: &FibTable, index: Index) -> NodeId {
+    fn process_index(runtime: &DataPlaneRuntime, table: &FibTable, index: Index) -> u16 {
         let parsed = Self::cached_packet_for_index(runtime, index);
         let traced = runtime
             .get_buffer(index)
@@ -548,7 +555,7 @@ impl AdjacencyRewriteNode {
         table: &FibTableHandle,
         runtime: &DataPlaneRuntime,
         index: Index,
-    ) -> Option<NodeId> {
+    ) -> Option<u16> {
         let forwarding = {
             let buffer = runtime.get_buffer(index).expect("buffer");
             let opaque = unsafe { transmute::<_, &LookupOpaque>(buffer.opaque2()) };
@@ -737,9 +744,16 @@ fn ip_lookup_process_frame(
     frame: &mut BufferFrame,
     table: &FibTable,
 ) -> NodeResult {
-    hammer_runtime::process_frame!(runtime, frame, |index| {
-        IpLookupNode::process_index(runtime, table, index)
-    })
+    let count = frame.len();
+    if count == 0 {
+        return NodeResult::drop();
+    }
+    let mut nexts = hammer_infra::vec::Vec::with_capacity(count);
+    for &index in frame.indices() {
+        nexts.push(IpLookupNode::process_index(runtime, table, index));
+    }
+    runtime.enqueue_to_next(frame, nexts.as_slice());
+    NodeResult::drop()
 }
 
 fn adjacency_rewrite_process(
@@ -756,27 +770,31 @@ fn adjacency_rewrite_process_frame(
     frame: &mut BufferFrame,
     table: &FibTableHandle,
 ) -> NodeResult {
-    let _ = frame.retain_indices_batched_with_prefetch(
-        runtime.preferred_frame_batch_width(),
-        |index| {
-            runtime.prefetch_header(index);
-            runtime.prefetch_write(index);
-        },
-        |index| {
-            let Some(next) = AdjacencyRewriteNode::next_for_index(table, runtime, index) else {
-                return Ok(true);
-            };
-            let mut next_frame = match runtime.buffers().get_next_frame(next) {
-                Ok(frame) => frame,
-                Err(_) => return Ok(true),
-            };
-            if next_frame.push_index(index).is_err() {
-                return Ok(true);
+    let indices: hammer_infra::vec::Vec<_> = frame.indices().iter().copied().collect();
+    frame.discard_prefix(frame.len());
+    let mut success_indices = hammer_infra::vec::Vec::with_capacity(indices.len());
+    let mut success_nexts = hammer_infra::vec::Vec::with_capacity(indices.len());
+    let mut failed = hammer_infra::vec::Vec::new();
+    for index in indices {
+        match AdjacencyRewriteNode::next_for_index(table, runtime, index) {
+            Some(next) => {
+                success_indices.push(index);
+                success_nexts.push(next);
             }
-            let _ = runtime.put_next_frame(next_frame);
-            Ok(false)
-        },
-    );
+            None => failed.push(index),
+        }
+    }
+    for index in success_indices {
+        frame
+            .push_index(index)
+            .expect("adjacency rewrite success fits production frame");
+    }
+    if !success_nexts.is_empty() {
+        runtime.enqueue_to_next(frame, success_nexts.as_slice());
+    }
+    for index in failed {
+        let _ = frame.push_index(index);
+    }
     NodeResult::drop()
 }
 

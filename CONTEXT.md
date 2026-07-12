@@ -24,6 +24,10 @@ _Avoid_: helper node, background worker, side task
 A named graph edge selected through a current-node-local `u16` slot for a packet or frame. `NodeNext` is only that copyable local-slot decision (`slot() -> u16`); Graph Runtime alone resolves the slot to a target node identity. Static next enums keep count and name metadata inherently; dynamic arc registration returns a checked `u16`.
 _Avoid_: output callback, destination handler, manually routed node id, second local-next type, next-count trait requirement
 
+**Forwarding Local Next**:
+FIB / DPO / load-balance / adjacency packet-path next values are current-node-local `u16` slots owned by the classifying graph node (lookup or adjacency-rewrite). Control-plane wiring registers those slots; lookup and rewrite enqueue through Graph Fanout, not by storing resolved `NodeId` in forwarding tables.
+_Avoid_: FIB-stored NodeId, adjacency NodeId hot path, forwarding-owned frame get/push/put
+
 **Graph Fanout**:
 The sole worker-local next-frame enqueue: it groups packet ownership by selected Next Arc and makes the resulting Next Frames visible at the current Graph Node dispatch boundary. Cross-worker ownership transfer remains Handoff, not Graph Fanout.
 _Avoid_: cross-thread fanout, handoff enqueue, output router, per-node manual frame get/push/put, recoverable enqueue Result on the packet path

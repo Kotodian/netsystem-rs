@@ -214,10 +214,17 @@ fn ip_lookup_node_uses_ipv4_mtrie_longest_prefix_match() {
     let host = register_sink(&runtime, &host_state);
     let drop = runtime.nodes().register_internal(DropNode::new());
 
-    let mut builder = FibTableBuilder::new(drop);
-    let default_lb = add_single_path(&mut builder, DpoProto::IP4, default);
-    let specific_lb = add_single_path(&mut builder, DpoProto::IP4, specific);
-    let host_lb = add_single_path(&mut builder, DpoProto::IP4, host);
+    let (control, lookup) = placeholder_lookup(&runtime);
+    assert_internal_node(&control.node());
+    let drop_slot = next_slot(&runtime, lookup, drop);
+    let default_slot = next_slot(&runtime, lookup, default);
+    let specific_slot = next_slot(&runtime, lookup, specific);
+    let host_slot = next_slot(&runtime, lookup, host);
+
+    let mut builder = FibTableBuilder::new(drop_slot);
+    let default_lb = add_single_path(&mut builder, DpoProto::IP4, default_slot);
+    let specific_lb = add_single_path(&mut builder, DpoProto::IP4, specific_slot);
+    let host_lb = add_single_path(&mut builder, DpoProto::IP4, host_slot);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("default route"),
         default_lb,
@@ -230,10 +237,7 @@ fn ip_lookup_node_uses_ipv4_mtrie_longest_prefix_match() {
         Ipv4Net::new(Ipv4Addr::new(198, 51, 100, 42), 32).expect("host route"),
         host_lb,
     );
-    let control = IpLookupControlPlane::new(builder.build());
-    let lookup = control.node();
-    assert_internal_node(&lookup);
-    let lookup = runtime.nodes().register_internal(lookup);
+    control.publish(builder.build()).expect("publish fib");
     let trace = TraceControlPlane::new(8);
     trace.publish(TracePolicy {
         enabled: true,
@@ -296,7 +300,7 @@ fn ip_lookup_node_uses_ipv4_mtrie_longest_prefix_match() {
             bucket_index: Some(default_forwarding.bucket_index),
             dpo_type: Some(default_forwarding.dpo_type),
             dpo_index: Some(default_forwarding.dpo_index),
-            next: default,
+            next: default_slot,
         }
     );
     assert_eq!(runtime.frames_in_use(), 0);
@@ -309,15 +313,16 @@ fn ip_lookup_vector_enqueue_batches_same_next_in_one_output_frame() {
     let state = Arc::new(Mutex::new(SinkState::default()));
     let sink = register_sink(&runtime, &state);
     let drop_node = runtime.nodes().register_internal(DropNode::new());
-    let mut builder = FibTableBuilder::new(drop_node);
-    let lb = add_single_path(&mut builder, DpoProto::IP4, sink);
+    let (control, lookup) = placeholder_lookup(&runtime);
+    let drop_node_slot = next_slot(&runtime, lookup, drop_node);
+    let sink_slot = next_slot(&runtime, lookup, sink);
+    let mut builder = FibTableBuilder::new(drop_node_slot);
+    let lb = add_single_path(&mut builder, DpoProto::IP4, sink_slot);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("default route"),
         lb,
     );
-    let lookup = runtime
-        .nodes()
-        .register_internal(IpLookupControlPlane::new(builder.build()).node());
+    control.publish(builder.build()).expect("publish fib");
     let mut frame = runtime
         .buffers()
         .get_next_frame(lookup)
@@ -362,10 +367,15 @@ fn ip_lookup_node_uses_ipv6_hash_prefix_order() {
     let host = register_sink(&runtime, &host_state);
     let drop = runtime.nodes().register_internal(DropNode::new());
 
-    let mut builder = FibTableBuilder::new(drop);
-    let default_lb = add_single_path(&mut builder, DpoProto::IP6, default);
-    let subnet_lb = add_single_path(&mut builder, DpoProto::IP6, subnet);
-    let host_lb = add_single_path(&mut builder, DpoProto::IP6, host);
+    let (control, lookup) = placeholder_lookup(&runtime);
+    let drop_slot = next_slot(&runtime, lookup, drop);
+    let default_slot = next_slot(&runtime, lookup, default);
+    let subnet_slot = next_slot(&runtime, lookup, subnet);
+    let host_slot = next_slot(&runtime, lookup, host);
+    let mut builder = FibTableBuilder::new(drop_slot);
+    let default_lb = add_single_path(&mut builder, DpoProto::IP6, default_slot);
+    let subnet_lb = add_single_path(&mut builder, DpoProto::IP6, subnet_slot);
+    let host_lb = add_single_path(&mut builder, DpoProto::IP6, host_slot);
     builder.add_ip6_route(
         Ipv6Net::new(Ipv6Addr::UNSPECIFIED, 0).expect("default route"),
         default_lb,
@@ -378,9 +388,7 @@ fn ip_lookup_node_uses_ipv6_hash_prefix_order() {
         Ipv6Net::new("2001:db8:64::42".parse().expect("host"), 128).expect("host route"),
         host_lb,
     );
-    let lookup = runtime
-        .nodes()
-        .register_internal(IpLookupControlPlane::new(builder.build()).node());
+    control.publish(builder.build()).expect("publish fib");
 
     let mut frame = runtime
         .buffers()
@@ -417,9 +425,11 @@ fn ip_lookup_node_uses_ipv6_hash_prefix_order() {
 fn ip_lookup_node_sends_miss_to_drop_dpo() {
     let runtime = test_runtime(2048, 8, 4);
     let drop = runtime.nodes().register_internal(DropNode::new());
-    let lookup = runtime
-        .nodes()
-        .register_internal(IpLookupControlPlane::new(FibTableBuilder::new(drop).build()).node());
+    let (control, lookup) = placeholder_lookup(&runtime);
+    let drop_slot = next_slot(&runtime, lookup, drop);
+    control
+        .publish(FibTableBuilder::new(drop_slot).build())
+        .expect("publish fib");
     let mut frame = runtime
         .buffers()
         .get_next_frame(lookup)
@@ -449,16 +459,17 @@ fn ip_lookup_node_routes_receive_dpo_to_local_next() {
     let receive = runtime
         .nodes()
         .register_internal(local_control.receive_node());
-    let mut builder = FibTableBuilder::new(drop);
+    let (control, lookup) = placeholder_lookup(&runtime);
+    let drop_slot = next_slot(&runtime, lookup, drop);
+    let receive_slot = next_slot(&runtime, lookup, receive);
+    let mut builder = FibTableBuilder::new(drop_slot);
     let receive_lb =
-        builder.add_load_balance(DpoProto::IP4, [DpoId::receive(DpoProto::IP4, receive)]);
+        builder.add_load_balance(DpoProto::IP4, [DpoId::receive(DpoProto::IP4, receive_slot)]);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 10), 32).expect("receive route"),
         receive_lb,
     );
-    let lookup = runtime
-        .nodes()
-        .register_internal(IpLookupControlPlane::new(builder.build()).node());
+    control.publish(builder.build()).expect("publish fib");
     let mut frame = runtime
         .buffers()
         .get_next_frame(lookup)
@@ -494,14 +505,15 @@ fn ip_lookup_node_routes_direct_receive_dpo_to_local_next() {
     let receive = runtime
         .nodes()
         .register_internal(local_control.receive_node());
-    let mut builder = FibTableBuilder::new(drop);
+    let (control, lookup) = placeholder_lookup(&runtime);
+    let drop_slot = next_slot(&runtime, lookup, drop);
+    let receive_slot = next_slot(&runtime, lookup, receive);
+    let mut builder = FibTableBuilder::new(drop_slot);
     builder.add_ip4_route_dpo(
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 11), 32).expect("direct receive route"),
-        DpoId::receive(DpoProto::IP4, receive),
+        DpoId::receive(DpoProto::IP4, receive_slot),
     );
-    let lookup = runtime
-        .nodes()
-        .register_internal(IpLookupControlPlane::new(builder.build()).node());
+    control.publish(builder.build()).expect("publish fib");
     let mut frame = runtime
         .buffers()
         .get_next_frame(lookup)
@@ -533,17 +545,18 @@ fn ip_lookup_node_routes_stacked_dpo_with_parent_identity() {
     let state = Arc::new(Mutex::new(SinkState::default()));
     let receive = register_sink(&runtime, &state);
     let drop_node = runtime.nodes().register_internal(DropNode::new());
-    let mut builder = FibTableBuilder::new(drop_node);
-    let parent = Dpo::receive(DpoProto::IP4, drop_node);
-    let stacked = Dpo::stack(parent, receive);
+    let (control, lookup) = placeholder_lookup(&runtime);
+    let drop_node_slot = next_slot(&runtime, lookup, drop_node);
+    let receive_slot = next_slot(&runtime, lookup, receive);
+    let mut builder = FibTableBuilder::new(drop_node_slot);
+    let parent = Dpo::receive(DpoProto::IP4, drop_node_slot);
+    let stacked = Dpo::stack(parent, receive_slot);
     let stack_lb = builder.add_load_balance(DpoProto::IP4, [stacked]);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 20), 32).expect("stack route"),
         stack_lb,
     );
-    let lookup = runtime
-        .nodes()
-        .register_internal(IpLookupControlPlane::new(builder.build()).node());
+    control.publish(builder.build()).expect("publish fib");
     let mut frame = runtime
         .buffers()
         .get_next_frame(lookup)
@@ -573,18 +586,19 @@ fn ip_lookup_node_routes_custom_dpo_to_custom_next() {
     let drop = runtime.nodes().register_internal(DropNode::new());
     let custom_type = DpoType::new(7);
     let custom_index = 11;
-    let mut builder = FibTableBuilder::new(drop);
+    let (control, lookup) = placeholder_lookup(&runtime);
+    let drop_slot = next_slot(&runtime, lookup, drop);
+    let custom_slot = next_slot(&runtime, lookup, custom);
+    let mut builder = FibTableBuilder::new(drop_slot);
     let custom_lb = builder.add_load_balance(
         DpoProto::IP4,
-        [Dpo::new(DpoProto::IP4, custom_type, custom_index, custom)],
+        [Dpo::new(DpoProto::IP4, custom_type, custom_index, custom_slot)],
     );
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 30), 32).expect("custom route"),
         custom_lb,
     );
-    let lookup = runtime
-        .nodes()
-        .register_internal(IpLookupControlPlane::new(builder.build()).node());
+    control.publish(builder.build()).expect("publish fib");
     let mut frame = runtime
         .buffers()
         .get_next_frame(lookup)
@@ -612,20 +626,23 @@ fn adjacency_rewrite_node_prepends_rewrite_and_sets_egress_interface() {
     let state = Arc::new(Mutex::new(SinkState::default()));
     let sink = register_sink(&runtime, &state);
     let drop_node = runtime.nodes().register_internal(DropNode::new());
-    let mut builder = FibTableBuilder::new(drop_node);
+    let (control, _lookup) = placeholder_lookup(&runtime);
+    let rewrite_node = runtime
+        .nodes()
+        .register_internal(AdjacencyRewriteNode::new(control.table_handle()));
+    let drop_slot = next_slot(&runtime, rewrite_node, drop_node);
+    let sink_slot = next_slot(&runtime, rewrite_node, sink);
+    let mut builder = FibTableBuilder::new(drop_slot);
     let rewrite = [0xaa, 0xbb, 0xcc, 0xdd];
     let dpo = builder.add_interface_adjacency_dpo(
         DpoProto::IP4,
         12,
         AdjacencyRewrite::try_new(&rewrite).expect("rewrite fits"),
-        drop_node,
-        sink,
+        drop_slot,
+        sink_slot,
     );
     let adjacency = dpo.adjacency_index().expect("adjacency index");
-    let control = IpLookupControlPlane::new(builder.build());
-    let rewrite_node = runtime
-        .nodes()
-        .register_internal(AdjacencyRewriteNode::new(control.table_handle()));
+    control.publish(builder.build()).expect("publish fib");
     let trace = TraceControlPlane::new(8);
     trace.publish(TracePolicy {
         enabled: true,
@@ -695,7 +712,7 @@ fn adjacency_rewrite_node_prepends_rewrite_and_sets_egress_interface() {
             egress_interface: Some(12),
             rewrite_len: rewrite.len(),
             error: None,
-            next: Some(sink),
+            next: Some(sink_slot),
         }
     );
     assert_eq!(runtime.frames_in_use(), 0);
@@ -708,20 +725,23 @@ fn adjacency_rewrite_node_prepends_rewrite_when_packet_has_headroom() {
     let state = Arc::new(Mutex::new(SinkState::default()));
     let sink = register_sink(&runtime, &state);
     let drop_node = runtime.nodes().register_internal(DropNode::new());
-    let mut builder = FibTableBuilder::new(drop_node);
+    let (control, _lookup) = placeholder_lookup(&runtime);
+    let rewrite_node = runtime
+        .nodes()
+        .register_internal(AdjacencyRewriteNode::new(control.table_handle()));
+    let drop_node_slot = next_slot(&runtime, rewrite_node, drop_node);
+    let sink_slot = next_slot(&runtime, rewrite_node, sink);
+    let mut builder = FibTableBuilder::new(drop_node_slot);
     let rewrite = [0xaa, 0xbb, 0xcc, 0xdd];
     let dpo = builder.add_interface_adjacency_dpo(
         DpoProto::IP4,
         9,
         AdjacencyRewrite::try_new(&rewrite).expect("rewrite fits"),
-        drop_node,
-        sink,
+        drop_node_slot,
+        sink_slot,
     );
     let adjacency = dpo.adjacency_index().expect("adjacency index");
-    let control = IpLookupControlPlane::new(builder.build());
-    let rewrite_node = runtime
-        .nodes()
-        .register_internal(AdjacencyRewriteNode::new(control.table_handle()));
+    control.publish(builder.build()).expect("publish fib");
     let mut frame = runtime
         .buffers()
         .get_next_frame(rewrite_node)
@@ -773,7 +793,11 @@ fn adjacency_rewrite_node_prepends_rewrite_when_packet_has_headroom() {
 fn adjacency_rewrite_node_drops_missing_forwarding_and_missing_adjacency() {
     let runtime = test_runtime(2048, 8, 4);
     let drop = runtime.nodes().register_internal(DropNode::new());
-    let control = IpLookupControlPlane::new(FibTableBuilder::new(drop).build());
+    let (control, lookup) = placeholder_lookup(&runtime);
+    let drop_slot = next_slot(&runtime, lookup, drop);
+    control
+        .publish(FibTableBuilder::new(drop_slot).build())
+        .expect("publish fib");
     let rewrite_node = runtime
         .nodes()
         .register_internal(AdjacencyRewriteNode::new(control.table_handle()));
@@ -830,14 +854,17 @@ fn ip_lookup_control_plane_publish_replaces_forwarding_table() {
     let second = register_sink(&runtime, &second_state);
     let drop = runtime.nodes().register_internal(DropNode::new());
 
-    let mut first_builder = FibTableBuilder::new(drop);
-    let first_lb = add_single_path(&mut first_builder, DpoProto::IP4, first);
+    let (control, lookup) = placeholder_lookup(&runtime);
+    let drop_slot = next_slot(&runtime, lookup, drop);
+    let first_slot = next_slot(&runtime, lookup, first);
+    let second_slot = next_slot(&runtime, lookup, second);
+    let mut first_builder = FibTableBuilder::new(drop_slot);
+    let first_lb = add_single_path(&mut first_builder, DpoProto::IP4, first_slot);
     first_builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("first default"),
         first_lb,
     );
-    let control = IpLookupControlPlane::new(first_builder.build());
-    let lookup = runtime.nodes().register_internal(control.node());
+    control.publish(first_builder.build()).expect("publish first fib");
 
     let mut first_frame = runtime
         .buffers()
@@ -852,8 +879,8 @@ fn ip_lookup_control_plane_publish_replaces_forwarding_table() {
     assert_eq!(runtime.run_ready_nodes().expect("run first"), 2);
     assert_payloads(&first_state, &[b"first".as_slice()]);
 
-    let mut second_builder = FibTableBuilder::new(drop);
-    let second_lb = add_single_path(&mut second_builder, DpoProto::IP4, second);
+    let mut second_builder = FibTableBuilder::new(drop_slot);
+    let second_lb = add_single_path(&mut second_builder, DpoProto::IP4, second_slot);
     second_builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("second default"),
         second_lb,
@@ -883,10 +910,11 @@ fn ip_lookup_control_plane_publish_runs_through_runtime_data_plane_barrier() {
     let barrier = data_runtime.data_plane_barrier();
     let runtime = test_runtime(2048, 8, 4);
     let drop = runtime.nodes().register_internal(DropNode::new());
-    let control =
-        IpLookupControlPlane::new(FibTableBuilder::new(drop).build()).with_barrier(barrier.clone());
-    let mut builder = FibTableBuilder::new(drop);
-    let lb = add_single_path(&mut builder, DpoProto::IP4, drop);
+    let (control, lookup) = placeholder_lookup(&runtime);
+    let drop_slot = next_slot(&runtime, lookup, drop);
+    let control = control.with_barrier(barrier.clone());
+    let mut builder = FibTableBuilder::new(drop_slot);
+    let lb = add_single_path(&mut builder, DpoProto::IP4, drop_slot);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::new(203, 0, 113, 0), 24).expect("barrier route"),
         lb,
@@ -910,15 +938,16 @@ fn ip_input_to_lookup_graph_routes_packet_by_fib() {
     let state = Arc::new(Mutex::new(SinkState::default()));
     let sink = register_sink(&runtime, &state);
     let drop = runtime.nodes().register_internal(DropNode::new());
-    let mut builder = FibTableBuilder::new(drop);
-    let lb = add_single_path(&mut builder, DpoProto::IP4, sink);
+    let (control, lookup) = placeholder_lookup(&runtime);
+    let drop_slot = next_slot(&runtime, lookup, drop);
+    let sink_slot = next_slot(&runtime, lookup, sink);
+    let mut builder = FibTableBuilder::new(drop_slot);
+    let lb = add_single_path(&mut builder, DpoProto::IP4, sink_slot);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::new(198, 51, 100, 0), 24).expect("route"),
         lb,
     );
-    let lookup = runtime
-        .nodes()
-        .register_internal(IpLookupControlPlane::new(builder.build()).node());
+    control.publish(builder.build()).expect("publish fib");
     let input = runtime
         .nodes()
         .register_internal(IpInputNode::<IpUnicastArc>::new(IpInputNext::nodes(
@@ -992,15 +1021,16 @@ fn ip_lookup_uses_ip_input_cursor_without_reparsing_current_header() {
     let state = Arc::new(Mutex::new(SinkState::default()));
     let sink = register_sink(&runtime, &state);
     let drop = runtime.nodes().register_internal(DropNode::new());
-    let mut builder = FibTableBuilder::new(drop);
-    let lb = add_single_path(&mut builder, DpoProto::IP4, sink);
+    let (control, lookup) = placeholder_lookup(&runtime);
+    let drop_slot = next_slot(&runtime, lookup, drop);
+    let sink_slot = next_slot(&runtime, lookup, sink);
+    let mut builder = FibTableBuilder::new(drop_slot);
+    let lb = add_single_path(&mut builder, DpoProto::IP4, sink_slot);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::new(198, 51, 100, 0), 24).expect("route"),
         lb,
     );
-    let lookup = runtime
-        .nodes()
-        .register_internal(IpLookupControlPlane::new(builder.build()).node());
+    control.publish(builder.build()).expect("publish fib");
     let corrupt = runtime
         .nodes()
         .register_internal(CorruptCurrentHeaderNode::new(lookup));
@@ -1041,12 +1071,32 @@ fn register_sink(
         .register_internal(SinkNode::new(Arc::clone(state)))
 }
 
+fn next_slot(
+    runtime: &DataPlaneRuntime,
+    owner: hammer_core::data_plane::NodeId,
+    target: hammer_core::data_plane::NodeId,
+) -> u16 {
+    runtime
+        .nodes()
+        .add_node_next_slot(owner, target)
+        .expect("register local next")
+}
+
+fn placeholder_lookup(runtime: &DataPlaneRuntime) -> (
+    IpLookupControlPlane,
+    hammer_core::data_plane::NodeId,
+) {
+    let control = IpLookupControlPlane::new(FibTableBuilder::new(u16::MAX).build());
+    let lookup = runtime.nodes().register_internal(control.node());
+    (control, lookup)
+}
+
 fn add_single_path(
     builder: &mut FibTableBuilder,
     proto: DpoProto,
-    node: hammer_core::data_plane::NodeId,
+    next: u16,
 ) -> hammer_service::net::LoadBalanceIndex {
-    builder.add_single_path_load_balance(proto, node)
+    builder.add_single_path_load_balance(proto, next)
 }
 
 fn push_packet(runtime: &DataPlaneRuntime, frame: &mut BufferFrame, packet: &[u8]) {

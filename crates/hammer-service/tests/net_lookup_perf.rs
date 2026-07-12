@@ -372,11 +372,21 @@ fn build_lookup(
     counters: &Arc<SinkCounters>,
 ) -> hammer_core::data_plane::NodeId {
     let drop = runtime.nodes().register_internal(DropNode::new());
-    let mut builder = FibTableBuilder::new(drop);
+    let control = IpLookupControlPlane::new(FibTableBuilder::new(u16::MAX).build());
+    let lookup = runtime.nodes().register_internal(control.node());
+    let drop_slot = runtime
+        .nodes()
+        .add_node_next_slot(lookup, drop)
+        .expect("drop next");
+    let mut builder = FibTableBuilder::new(drop_slot);
     match scenario {
         Scenario::Ipv4SameNext => {
             let sink = register_sink(runtime, counters);
-            let lb = add_single_path(&mut builder, DpoProto::IP4, sink);
+            let sink_slot = runtime
+                .nodes()
+                .add_node_next_slot(lookup, sink)
+                .expect("sink next");
+            let lb = add_single_path(&mut builder, DpoProto::IP4, sink_slot);
             builder.add_ip4_route(
                 Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("default route"),
                 lb,
@@ -385,7 +395,11 @@ fn build_lookup(
         Scenario::Ipv4MixedNext => {
             for route in 1..=4 {
                 let sink = register_sink(runtime, counters);
-                let lb = add_single_path(&mut builder, DpoProto::IP4, sink);
+                let sink_slot = runtime
+                    .nodes()
+                    .add_node_next_slot(lookup, sink)
+                    .expect("sink next");
+                let lb = add_single_path(&mut builder, DpoProto::IP4, sink_slot);
                 builder.add_ip4_route(
                     Ipv4Net::new(Ipv4Addr::new(198, 51, route, 0), 24).expect("mixed route"),
                     lb,
@@ -394,7 +408,11 @@ fn build_lookup(
         }
         Scenario::Ipv6SameNext => {
             let sink = register_sink(runtime, counters);
-            let lb = add_single_path(&mut builder, DpoProto::IP6, sink);
+            let sink_slot = runtime
+                .nodes()
+                .add_node_next_slot(lookup, sink)
+                .expect("sink next");
+            let lb = add_single_path(&mut builder, DpoProto::IP6, sink_slot);
             builder.add_ip6_route(
                 Ipv6Net::new(Ipv6Addr::new(0x2001, 0x0db8, 0x0064, 0, 0, 0, 0, 0), 64)
                     .expect("ipv6 route"),
@@ -402,9 +420,8 @@ fn build_lookup(
             );
         }
     }
-    runtime
-        .nodes()
-        .register_internal(IpLookupControlPlane::new(builder.build()).node())
+    control.publish(builder.build()).expect("publish fib");
+    lookup
 }
 
 fn build_input_lookup(
@@ -433,9 +450,9 @@ fn register_sink(
 fn add_single_path(
     builder: &mut FibTableBuilder,
     proto: DpoProto,
-    node: hammer_core::data_plane::NodeId,
+    next: u16,
 ) -> hammer_service::net::LoadBalanceIndex {
-    builder.add_single_path_load_balance(proto, node)
+    builder.add_single_path_load_balance(proto, next)
 }
 
 fn build_packets(scenario: Scenario) -> Vec<Vec<u8>> {

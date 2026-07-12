@@ -139,15 +139,13 @@ fn interface_updates_run_through_configured_runtime_data_plane_barrier() {
     let data_runtime =
         DataRuntime::new(1, "interface-control-barrier-test", 512 * 1024, 2).expect("data runtime");
     let barrier = data_runtime.data_plane_barrier();
-    let lookup_table = IpLookupControlPlane::new(
-        FibTableBuilder::new(hammer_core::data_plane::NodeId::new(0)).build(),
-    );
+    let lookup_table = IpLookupControlPlane::new(FibTableBuilder::new(u16::MAX).build());
     let control = InterfaceControlPlane::new()
         .with_data_plane_barrier(barrier.clone())
         .with_connected_routes(InterfaceConnectedRouteControl::new(
             lookup_table.table_handle(),
-            hammer_core::data_plane::NodeId::new(0),
-            hammer_core::data_plane::NodeId::new(1),
+            0,
+            1,
         ));
     let tun0 = control.register_interface("tun0").expect("register tun0");
     let address = IpNet::V4(Ipv4Net::new(Ipv4Addr::new(10, 0, 0, 1), 24).unwrap());
@@ -174,7 +172,7 @@ fn interface_address_publish_installs_receive_route_in_fib() {
     let drop = runtime
         .nodes()
         .register_internal(hammer_service::data_plane::DropNode::new());
-    let lookup_control = IpLookupControlPlane::new(FibTableBuilder::new(drop).build());
+    let lookup_control = IpLookupControlPlane::new(FibTableBuilder::new(u16::MAX).build());
     let adjacency_rewrite = runtime
         .nodes()
         .register_internal(AdjacencyRewriteNode::new(lookup_control.table_handle()));
@@ -187,9 +185,29 @@ fn interface_address_publish_installs_receive_route_in_fib() {
         .nodes()
         .register_internal(local_control.receive_node());
     let lookup = runtime.nodes().register_internal(lookup_control.node());
+    let drop_slot = runtime
+        .nodes()
+        .add_node_next_slot(lookup, drop)
+        .expect("drop next");
+    let receive_slot = runtime
+        .nodes()
+        .add_node_next_slot(lookup, receive)
+        .expect("receive next");
+    let rewrite_slot = runtime
+        .nodes()
+        .add_node_next_slot(lookup, adjacency_rewrite)
+        .expect("rewrite next");
+    let output_slot = runtime
+        .nodes()
+        .add_node_next_slot(adjacency_rewrite, interface_output)
+        .expect("output next");
     let control = InterfaceControlPlane::new().with_connected_routes(
-        InterfaceConnectedRouteControl::new(lookup_control.table_handle(), drop, receive)
-            .with_connected_adjacency(adjacency_rewrite, interface_output),
+        InterfaceConnectedRouteControl::new(
+            lookup_control.table_handle(),
+            drop_slot,
+            receive_slot,
+        )
+        .with_connected_adjacency(rewrite_slot, output_slot),
     );
     let tun0 = control.register_interface("tun0").expect("register tun0");
     let address = IpNet::V4(Ipv4Net::new(Ipv4Addr::new(10, 255, 0, 1), 24).unwrap());
@@ -246,14 +264,14 @@ fn interface_address_publish_installs_receive_route_in_fib() {
         .lookup_ip4(Ipv4Addr::new(10, 255, 0, 2), 0)
         .expect("connected route lookup");
     assert_eq!(connected.dpo.kind(), DpoType::ADJACENCY);
-    assert_eq!(connected.dpo.next(), adjacency_rewrite);
+    assert_eq!(connected.dpo.next(), rewrite_slot);
     let adjacency = lookup_control
         .table_handle()
         .table()
         .adjacency(connected.dpo.adjacency_index().expect("adjacency index"))
         .expect("adjacency entry");
     assert_eq!(adjacency.egress_interface, Some(tun0));
-    assert_eq!(adjacency.next, interface_output);
+    assert_eq!(adjacency.next, output_slot);
 
     control
         .remove_address(tun0, address)
