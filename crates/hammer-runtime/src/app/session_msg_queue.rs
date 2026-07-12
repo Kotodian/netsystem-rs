@@ -9,10 +9,10 @@
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use hammer_infra::msg_queue::MsgQueue;
 use hammer_infra::multi_ring_msg_queue::{
     MultiRingMsgQueue, MultiRingMsgQueueCfg, MultiRingMsgQueueError, RingCfg,
 };
-use hammer_infra::msg_queue::MsgQueue;
 use hammer_infra::segment::{Local, Segment, Svm};
 
 /// VPP session MQ ring roles (`session_mq_rings_e`).
@@ -266,16 +266,14 @@ impl<S: Segment> FlatSessionMsgQueue<S> {
 
 impl<S: Segment> SessionEventQueue for FlatSessionMsgQueue<S> {
     fn enqueue_io(&self, evt: SessionEvt) -> Result<(), SessionMsgQueueError> {
-        self.inner
-            .enqueue(to_infra_evt(evt))
-            .map_err(|e| match e {
-                hammer_infra::msg_queue::MsgQueueError::Full(evt) => {
-                    SessionMsgQueueError::Full(from_infra_evt(evt))
-                }
-                hammer_infra::msg_queue::MsgQueueError::InvalidCapacity => {
-                    SessionMsgQueueError::InvalidConfig
-                }
-            })
+        self.inner.enqueue(to_infra_evt(evt)).map_err(|e| match e {
+            hammer_infra::msg_queue::MsgQueueError::Full(evt) => {
+                SessionMsgQueueError::Full(from_infra_evt(evt))
+            }
+            hammer_infra::msg_queue::MsgQueueError::InvalidCapacity => {
+                SessionMsgQueueError::InvalidConfig
+            }
+        })
     }
 
     fn enqueue_ctrl(&self, evt: SessionEvt) -> Result<(), SessionMsgQueueError> {
@@ -288,7 +286,10 @@ impl<S: Segment> SessionEventQueue for FlatSessionMsgQueue<S> {
 
     fn dequeue_batch(&self, out: &mut [SessionEvt]) -> usize {
         let mut infra = vec![
-            hammer_infra::msg_queue::SessionEvt::io(0, hammer_infra::msg_queue::SessionEvtType::RxEnq);
+            hammer_infra::msg_queue::SessionEvt::io(
+                0,
+                hammer_infra::msg_queue::SessionEvtType::RxEnq
+            );
             out.len()
         ];
         let count = self.inner.dequeue_batch(&mut infra);

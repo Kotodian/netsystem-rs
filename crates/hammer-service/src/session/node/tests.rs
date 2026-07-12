@@ -17,8 +17,8 @@ use crate::session::runtime::{
     TransportSendFlags, TransportSendParams, TxBatchBuffer,
     dispatch_registered_session_queue_once_at, dispatch_session_queue_once,
 };
-use hammer_runtime::app::{SessionEvt, SessionEvtType};
 use hammer_runtime::app::{AppSession, AppSessionConfig, SessionHandle};
+use hammer_runtime::app::{SessionEvt, SessionEvtType};
 
 #[derive(Default)]
 struct BlackholeNode;

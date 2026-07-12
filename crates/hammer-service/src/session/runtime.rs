@@ -540,9 +540,8 @@ where
 impl<T, Index: Copy + Eq> SessionDriverRuntime<T, Local, Index> {
     pub fn new(worker: DataWorkerId, buffers: DataPlaneBuffers, transports: T) -> Self {
         let cap = DEFAULT_SESSION_TX_EVENT_CAPACITY.next_power_of_two().max(2) as u32;
-        let tx_evt_q = Arc::new(
-            SessionMsgQueue::with_cfg(cap, cap.max(2)).expect("local tx_evt_q"),
-        );
+        let tx_evt_q =
+            Arc::new(SessionMsgQueue::with_cfg(cap, cap.max(2)).expect("local tx_evt_q"));
         Self::with_app_session_config(
             worker,
             buffers,
@@ -561,9 +560,8 @@ impl<T, Index: Copy + Eq> SessionDriverRuntime<T, Local, Index> {
         app_context: AppContext<Local>,
     ) -> Self {
         let cap = DEFAULT_SESSION_TX_EVENT_CAPACITY.next_power_of_two().max(2) as u32;
-        let tx_evt_q = Arc::new(
-            SessionMsgQueue::with_cfg(cap, cap.max(2)).expect("local tx_evt_q"),
-        );
+        let tx_evt_q =
+            Arc::new(SessionMsgQueue::with_cfg(cap, cap.max(2)).expect("local tx_evt_q"));
         let mut driver = Self::with_app_session_config(
             worker,
             buffers,
@@ -652,7 +650,9 @@ pub trait SessionTransport<Index, Seg: SessionSegment>: Sized {
     ) -> CoreResult<()>;
 }
 
-pub trait SessionPacketizedTransport<Index, Seg: SessionSegment>: SessionTransport<Index, Seg> {
+pub trait SessionPacketizedTransport<Index, Seg: SessionSegment>:
+    SessionTransport<Index, Seg>
+{
     fn control_tx(
         &mut self,
         sessions: &mut SessionWorker<Index, Seg>,
@@ -681,7 +681,9 @@ pub trait SessionPacketizedTransport<Index, Seg: SessionSegment>: SessionTranspo
     ) -> CoreResult<()>;
 }
 
-pub trait TransportInternalTransport<Index, Seg: SessionSegment>: SessionTransport<Index, Seg> {
+pub trait TransportInternalTransport<Index, Seg: SessionSegment>:
+    SessionTransport<Index, Seg>
+{
     fn internal_tx(
         &mut self,
         sessions: &mut SessionWorker<Index, Seg>,
