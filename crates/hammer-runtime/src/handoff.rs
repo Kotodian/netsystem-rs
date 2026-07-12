@@ -270,4 +270,69 @@ mod tests {
             .expect("cleanup frame");
         cleanup.push_index(index).expect("cleanup push");
     }
+
+    #[test]
+    fn handoff_index_resolves_local_continuation_before_enqueue() {
+        use crate::node::{NodeDescriptor, NodeResult, NodeRuntimeData};
+        use hammer_core::data_plane::{NodeKind, NodeRegistration};
+
+        let handoff = DataPlaneHandoff::new(2, 4);
+        let runtime = DataPlaneRuntime::attach_handoff_worker(
+            DataPlaneRuntime::new(DataPlaneRuntimeConfig {
+                buffers: DataPlaneBufferConfig {
+                    buffer_slot_capacity: 64,
+                    buffer_slots: 4,
+                    frame_slots: 4,
+                    ..DataPlaneBufferConfig::default()
+                },
+            }),
+            DataWorkerId::new(0),
+            handoff.worker(DataWorkerId::new(0)),
+        );
+        let continuation = runtime
+            .nodes()
+            .try_register_descriptor(
+                NodeKind::Internal,
+                NodeDescriptor::new(
+                    |_, _, _| NodeResult::drop(),
+                    NodeRuntimeData::empty(),
+                    NodeRegistration::next("continuation", 0),
+                    &[],
+                    None,
+                ),
+            )
+            .expect("continuation");
+        let owner = runtime
+            .nodes()
+            .try_register_descriptor(
+                NodeKind::Internal,
+                NodeDescriptor::new(
+                    |_, _, _| NodeResult::drop(),
+                    NodeRuntimeData::empty(),
+                    NodeRegistration::next("owner", 1),
+                    &[continuation],
+                    None,
+                ),
+            )
+            .expect("owner");
+        let index = runtime.alloc_index().expect("alloc");
+        let target = NodeHandle::new(9);
+
+        runtime
+            .with_current_node(owner, || {
+                runtime.handoff_index(DataWorkerId::new(1), target, index, Some(0u16))
+            })
+            .expect("handoff with continuation");
+
+        assert_eq!(
+            runtime.buffers().current_config(index).expect("config"),
+            continuation
+        );
+        let frame = handoff
+            .worker(DataWorkerId::new(1))
+            .pop()
+            .expect("queued");
+        assert_eq!(frame.target, target);
+        assert!(frame.slot.iter().any(|value| value == index));
+    }
 }

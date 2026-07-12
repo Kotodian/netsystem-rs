@@ -38,7 +38,6 @@ fn congestion_control_is_not_a_packet_graph_node() {
         "CongestionControlNext",
         "BbrCongestionNode",
         "sibling_of = CongestionControlNode",
-        "runtime_nexts(runtime)?",
     ] {
         assert!(
             !bbr.contains(forbidden) && !module.contains(forbidden),

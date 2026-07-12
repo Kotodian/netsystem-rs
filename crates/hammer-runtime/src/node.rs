@@ -1261,25 +1261,6 @@ impl NodeRuntime {
         self.node_next_slot(node, usize::from(key.slot()))
     }
 
-    pub fn node_nexts<const COUNT: usize>(&self, node: NodeId) -> CoreResult<[NodeId; COUNT]> {
-        let mut nexts = [NodeId::new(0); COUNT];
-        let inner = self.inner.borrow();
-        let node_nexts = inner
-            .next_nodes
-            .get(node.slot() as usize)
-            .ok_or_else(|| CoreError::internal("node id out of bounds"))?;
-        if node_nexts.len() != COUNT {
-            return Err(CoreError::internal("node next count mismatch"));
-        }
-        let mut slot = 0usize;
-        while slot < COUNT {
-            nexts[slot] = node_nexts[slot]
-                .ok_or_else(|| CoreError::internal("node next slot is not registered"))?;
-            slot += 1;
-        }
-        Ok(nexts)
-    }
-
     pub fn node_next_slot(&self, node: NodeId, slot: usize) -> CoreResult<NodeId> {
         let inner = self.inner.borrow();
         inner.node_next_slot(node, slot)

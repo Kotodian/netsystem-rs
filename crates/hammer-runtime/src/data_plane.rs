@@ -432,22 +432,6 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    pub fn current_node_next<K: NodeNext>(&self, key: K) -> CoreResult<NodeId> {
-        let node = self
-            .current_node()
-            .ok_or_else(|| CoreError::internal("node next read outside node processing"))?;
-        self.nodes.node_next(node, key)
-    }
-
-    #[inline]
-    pub fn current_node_nexts<const COUNT: usize>(&self) -> CoreResult<[NodeId; COUNT]> {
-        let node = self
-            .current_node()
-            .ok_or_else(|| CoreError::internal("node next read outside node processing"))?;
-        self.nodes.node_nexts(node)
-    }
-
-    #[inline]
     pub fn record_current_node_error(&self, code: u16) -> CoreResult<u16> {
         let node = self
             .current_node()
@@ -599,12 +583,20 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    pub fn handoff_index(
+    pub fn handoff_index<N: NodeNext>(
         &self,
         worker: DataWorkerId,
         target: NodeHandle,
         index: Index,
+        continuation: Option<N>,
     ) -> CoreResult<()> {
+        if let Some(next) = continuation {
+            let node = self.current_node().ok_or_else(|| {
+                CoreError::internal("handoff continuation outside node processing")
+            })?;
+            let resolved = self.nodes.node_next(node, next)?;
+            self.get_buffer_mut(index)?.set_current_config(resolved);
+        }
         let Some(handoff) = &self.handoff else {
             return Err(DataPlaneError::HandoffNotConfigured.into());
         };

@@ -442,8 +442,6 @@ where
             if let (Some(_), Some(current_worker)) = (handoff, handoff_worker)
                 && owner != current_worker
             {
-                let resolved = runtime.current_node_next(session_next)?;
-                buffer.set_current_config(resolved);
                 unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }
                     .set_handoff_source_worker(Some(current_worker.slot() as u16));
             }
@@ -466,7 +464,7 @@ where
                     },
                 )?;
             }
-            runtime.handoff_index(owner, target, index)?;
+            runtime.handoff_index(owner, target, index, Some(session_next))?;
             return Ok(None);
         }
         return resolve_success_next_with_trace(

@@ -34,7 +34,7 @@ _Avoid_: packet-path NodeId feature next, shared handoff/config field, dual Node
 
 **Protocol Dispatch Local Next**:
 ICMP type and UDP port registries publish consumer-local `u16` next slots. Control may accept target `NodeId` at registration; the published snapshot and packet path carry only local slots and enqueue through Graph Fanout.
-_Avoid_: packet-path NodeId protocol dispatch, NodeNextStorage for ICMP/UDP input registries
+_Avoid_: packet-path NodeId protocol dispatch, ICMP/UDP registry NodeId snapshots on the packet path
 
 **TCP Ingress Local Next**:
 TCP input classifies worker-local nexts as current-node-local `u16` slots and enqueues them through Graph Fanout. Cross-worker session ownership leaves the input Frame through Handoff before Fanout; Handoff may retain destination `NodeId` continuation state, and Fanout never enters the cross-worker queue.
@@ -98,13 +98,22 @@ _Avoid_: event loop tick, reactor pass, arbitrary scheduler iteration
 The runtime-owned execution context for a Data Worker's Packet Graph, including graph node state, next-arc resolution, pending-frame scheduling, readiness, dispatch, and graph runtime statistics.
 _Avoid_: adapter graph runtime, scheduler helper, node registry wrapper
 
+**Graph Fanout Layer Contract**:
+- `hammer-core` owns Index/Frame/Buffer and graph identity (`NodeId`, `NodeHandle`, `NodeNext` as local `u16` slots). It does not enqueue or resolve next arcs.
+- Graph Runtime alone maps local slots to target node identities, owns Graph Fanout (`enqueue_to_next`), appendable Next Frame get/put/rotation, and Handoff queue drain. Direct Frame get/push/put is limited to those internals, the Handoff node drain path, and focused low-level tests.
+- Service Graph Nodes run packet logic, choose current-node-local nexts, transfer Session ownership, or invoke Handoff with a local continuation next. They must not resolve target nodes, cache resolved next arrays, or perform worker-local output Frame get/push/put choreography.
+- Feature control may retain target `NodeId`s while compiling under a barrier; the packet path carries only local slots and config progress.
+- Session Queue accumulates generated indexes with local nexts and flushes once through Graph Fanout.
+- Handoff alone owns cross-worker grouping and may retain destination `NodeId` continuation state after Graph Runtime resolves a local next at enqueue.
+_Avoid_: `NodeNextStorage`, `runtime_nexts`, production `current_node_next(s)`, protocol target-node routing, compatibility wrappers for removed surfaces
+
 **Barrier Synchronization**:
 The control-plane mechanism that pauses data workers at a known point so control changes can observe a stable data-plane state. It is not a lock taken around hot-path packet processing.
 _Avoid_: global mutex, graph lock, packet-path synchronization
 
 **Handoff**:
-A data-plane transfer of packet ownership from one worker to another through worker-owned slots and a handoff graph node. Handoff moves buffer indexes, not protocol payload copies.
-_Avoid_: crossbeam channel payload, TCP migration copy, app queue transfer
+A data-plane transfer of packet ownership from one worker to another through worker-owned slots and a handoff graph node. Handoff moves buffer indexes, not protocol payload copies. Graph Runtime may resolve a current-node-local next into destination `NodeId` continuation state while enqueueing; service nodes pass the local next and must not resolve target node identities themselves.
+_Avoid_: crossbeam channel payload, TCP migration copy, app queue transfer, service-side `current_node_next` / resolved-next arrays
 
 ## Buffer And Memory
 

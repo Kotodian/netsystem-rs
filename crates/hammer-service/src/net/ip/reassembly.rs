@@ -375,7 +375,7 @@ impl IpReassemblyRuntime {
                         next: None,
                     },
                 );
-                runtime.handoff_index(owner, handoff.reassembly, index)?;
+                runtime.handoff_index(owner, handoff.reassembly, index, None::<u16>)?;
                 return Ok(());
             }
         }
@@ -539,7 +539,7 @@ impl IpReassemblyRuntime {
                             next: None,
                         },
                     );
-                    runtime.handoff_index(first_worker, handoff.lookup, index)?;
+                    runtime.handoff_index(first_worker, handoff.lookup, index, None::<u16>)?;
                 } else {
                     let lookup_next = IpReassemblyNext::Lookup;
                     let _ = add_packet_trace!(
