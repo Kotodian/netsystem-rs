@@ -159,7 +159,7 @@ fn bench_runtime_alloc_free(c: &mut Criterion) {
     let mut group = c.benchmark_group("runtime_alloc_free");
     group.bench_function("single", |b| {
         b.iter_batched(
-            || test_runtime(2048, 4096, 256, 64),
+            || test_runtime(2048, 4096, 256),
             |runtime| {
                 let index = runtime.alloc_index().expect("alloc");
                 drop_owned_index(&runtime, index);
@@ -169,7 +169,7 @@ fn bench_runtime_alloc_free(c: &mut Criterion) {
     });
     group.bench_function("batch_256", |b| {
         b.iter_batched(
-            || test_runtime(2048, 4096, 256, 64),
+            || test_runtime(2048, 4096, 256),
             |runtime| {
                 let mut indices = Vec::with_capacity(256);
                 for _ in 0..256 {
