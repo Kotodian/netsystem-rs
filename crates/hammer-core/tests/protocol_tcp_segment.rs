@@ -94,6 +94,32 @@ fn core_tcp_write_ack_with_sack_blocks() {
 }
 
 #[test]
+fn core_tcp_write_urgent_pointer_when_urg_set() {
+    let mut output = [0u8; 64];
+    let written = write_tcp_segment_header(
+        &mut output,
+        TcpSegmentHeader {
+            source_port: 49_152,
+            destination_port: 443,
+            sequence_number: 0x0102_0304,
+            acknowledgment_number: 0x1112_1314,
+            flags: TcpSegmentFlags::ACK | TcpSegmentFlags::URG,
+            advertised_window: 32_768,
+            urgent_pointer: 7,
+            capabilities: TcpCapabilities::default(),
+            timestamp: None,
+            fast_open_cookie: None,
+        },
+        None,
+    )
+    .expect("write urg header");
+    assert_eq!(written, 20);
+    let wire = tcp_header(&output[..written]).expect("parse");
+    assert!(wire.flags().contains(TcpSegmentFlags::URG));
+    assert_eq!(wire.urgent_pointer(), 7);
+}
+
+#[test]
 fn core_tcp_non_ack_does_not_write_sack_blocks() {
     let mut output = [0u8; 64];
 
@@ -145,6 +171,7 @@ fn write_header_for_test(
             acknowledgment_number: 0x1112_1314,
             flags,
             advertised_window: 32_768,
+            urgent_pointer: 0,
             capabilities: TcpCapabilities::default(),
             timestamp: None,
             fast_open_cookie: None,

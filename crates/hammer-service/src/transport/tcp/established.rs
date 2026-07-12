@@ -348,10 +348,14 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::{Arc, Mutex, OnceLock};
 
-    use hammer_core::data_plane::{BufferFrame, NodeId};
+    use std::mem::transmute;
+
+    use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, NodeId};
     use hammer_core::error::CoreResult;
-    use hammer_core::protocol::tcp::{TcpCapabilities, TcpConnectionId, TcpSegmentFlags};
-    use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
+    use hammer_core::protocol::ip::write_ipv4_push_header;
+    use hammer_core::protocol::tcp::{
+        TcpCapabilities, TcpConnectionId, TcpSegmentFlags, TcpSegmentHeader, write_tcp_segment_header,
+    };
     use hammer_infra::pool::Index as PoolIndex;
     use hammer_infra::segment::Local;
     use hammer_runtime::app::{
@@ -369,9 +373,8 @@ mod tests {
     use crate::session::{SessionId, SessionQueueHandle};
     use crate::transport::congestion::BbrController;
     use crate::transport::tcp::output::{TcpOutputNext, TcpOutputNode};
-    use crate::transport::tcp::tcp_control_cursor;
     use crate::transport::tcp::{
-        TCP_FLAG_ACK, TcpConnection, TcpInputNext, TcpState, TcpWorker, publish_tcp_connection,
+        TcpConnection, TcpInputNext, TcpState, TcpWorker, publish_tcp_connection,
         write_session_route_opaque,
     };
 
@@ -517,158 +520,6 @@ mod tests {
         (session_id, connection.rcv_nxt(), connection.snd_nxt())
     }
 
-    fn send_to_established(
-        runtime: &DataPlaneRuntime,
-        established: NodeId,
-        session_id: Option<SessionId>,
-        packet: &[u8],
-    ) {
-        let mut frame = runtime
-            .buffers()
-            .get_next_frame(established)
-            .expect("frame");
-        let buffer = runtime.alloc_index_with_bytes(packet).expect("packet");
-        let cursor = tcp_control_cursor(packet).expect("cursor");
-        let mut data_buffer = runtime.get_buffer_mut(buffer).expect("buffer mut");
-        let network =
-            unsafe { std::mem::transmute::<_, &mut NetworkOpaque>(data_buffer.opaque_mut()) };
-        network.set_packet_cursor(cursor);
-        let ip_version = (packet[0] >> 4) as u8;
-        network.ip_mut().set_ip_version(Some(ip_version));
-        network.ip_mut().set_ip_protocol(Some(6));
-        if let Some(session_id) = session_id {
-            write_session_route_opaque(
-                data_buffer.opaque2_mut(),
-                session_id,
-                DataWorkerId::new(0),
-                TcpInputNext::Established,
-            );
-        }
-        drop(data_buffer);
-        frame.push_index(buffer).expect("push packet");
-        runtime.put_next_frame(frame).expect("put next frame");
-    }
-
-    fn data_packet(sequence: u32, acknowledgment: u32, payload: &[u8]) -> std::vec::Vec<u8> {
-        tcp_ipv4_packet(
-            remote_addr(),
-            local_addr(),
-            hammer_core::protocol::tcp::TcpSegmentHeader {
-                source_port: remote_addr().port(),
-                destination_port: local_addr().port(),
-                sequence_number: sequence,
-                acknowledgment_number: acknowledgment,
-                flags: TcpSegmentFlags::ACK | TcpSegmentFlags::PSH,
-                advertised_window: u16::MAX,
-                capabilities: TcpCapabilities::default(),
-                timestamp: None,
-                fast_open_cookie: None,
-            },
-            payload,
-        )
-        .expect("data packet")
-    }
-
-    fn attach_observable_app(
-        handle: &SessionQueueHandle<
-            SessionDriverRuntime<(TcpWorker<BbrController>, ()), Local, PoolIndex>,
-        >,
-        session_id: SessionId,
-    ) -> Arc<hammer_runtime::app::AppSession<Local>> {
-        let app = Arc::new(
-            hammer_runtime::app::AppSession::new_in_segment(
-                Local::default(),
-                hammer_runtime::app::AppSessionConfig::new(256, 16),
-                hammer_runtime::app::SessionHandle::new(session_id.pool_index().slot(), 0),
-                handle.borrow_mut().expect("tcp queue").app().tx_evt_q().clone(),
-            )
-            .expect("app session"),
-        );
-        handle
-            .borrow_mut()
-            .expect("tcp queue")
-            .app_mut()
-            .attach_session(session_id, Arc::clone(&app));
-        app
-    }
-
-    fn peer_fin_packet(sequence: u32, acknowledgment: u32) -> std::vec::Vec<u8> {
-        tcp_ipv4_packet(
-            remote_addr(),
-            local_addr(),
-            hammer_core::protocol::tcp::TcpSegmentHeader {
-                source_port: remote_addr().port(),
-                destination_port: local_addr().port(),
-                sequence_number: sequence,
-                acknowledgment_number: acknowledgment,
-                flags: TcpSegmentFlags::FIN | TcpSegmentFlags::ACK,
-                advertised_window: u16::MAX,
-                capabilities: TcpCapabilities::default(),
-                timestamp: None,
-                fast_open_cookie: None,
-            },
-            &[],
-        )
-        .expect("peer fin packet")
-    }
-
-    fn tcp_ipv4_packet(
-        local: SocketAddr,
-        remote: SocketAddr,
-        header: hammer_core::protocol::tcp::TcpSegmentHeader<'_>,
-        payload: &[u8],
-    ) -> Result<std::vec::Vec<u8>, hammer_core::protocol::tcp::TcpError> {
-        let mut tcp = [0u8; 60];
-        let tcp_header_len =
-            hammer_core::protocol::tcp::write_tcp_segment_header(&mut tcp, header, None)?;
-        let tcp_len = tcp_header_len
-            .checked_add(payload.len())
-            .ok_or(hammer_core::protocol::tcp::TcpError::Dispatch)?;
-        let (IpAddr::V4(local_ip), IpAddr::V4(remote_ip)) = (local.ip(), remote.ip()) else {
-            return Err(hammer_core::protocol::tcp::TcpError::SegmentInvalid);
-        };
-        let packet_len = 20usize
-            .checked_add(tcp_len)
-            .ok_or(hammer_core::protocol::tcp::TcpError::Dispatch)?;
-        let total_len =
-            u16::try_from(packet_len).map_err(|_| hammer_core::protocol::tcp::TcpError::Length)?;
-        let mut packet = std::vec![0u8; packet_len];
-        packet[0] = 0x45;
-        packet[2] = (total_len >> 8) as u8;
-        packet[3] = total_len as u8;
-        packet[8] = 64;
-        packet[9] = 6;
-        packet[12..16].copy_from_slice(&local_ip.octets());
-        packet[16..20].copy_from_slice(&remote_ip.octets());
-        packet[20..20 + tcp_header_len].copy_from_slice(&tcp[..tcp_header_len]);
-        if !payload.is_empty() {
-            packet[20 + tcp_header_len..].copy_from_slice(payload);
-        }
-        let tcp_len_bytes = [(tcp_len as u16 >> 8) as u8, tcp_len as u8];
-        let tcp_checksum = internet_checksum_parts(&[
-            &local_ip.octets(),
-            &remote_ip.octets(),
-            &[0, 6],
-            &tcp_len_bytes,
-            &packet[20..],
-        ]);
-        packet[36] = (tcp_checksum >> 8) as u8;
-        packet[37] = tcp_checksum as u8;
-        let ip_checksum = internet_checksum(&packet[..20]);
-        packet[10] = (ip_checksum >> 8) as u8;
-        packet[11] = ip_checksum as u8;
-        Ok(packet)
-    }
-
-    fn tcp_flags(packet: &[u8]) -> u8 {
-        let tcp = crate::transport::tcp::tcp_bytes_after_l3(packet);
-        tcp[13]
-    }
-
-    fn tcp_acknowledgment(packet: &[u8]) -> u32 {
-        let tcp = crate::transport::tcp::tcp_bytes_after_l3(packet);
-        u32::from_be_bytes([tcp[8], tcp[9], tcp[10], tcp[11]])
-    }
 
     #[test]
     fn in_order_payload_advances_receive_window() {
@@ -690,12 +541,58 @@ mod tests {
                 .expect("rx capacity")
         };
 
-        send_to_established(
-            &runtime,
-            established,
-            Some(session_id),
-            &data_packet(rcv_nxt, snd_nxt, b"hello"),
-        );
+        let index = runtime.alloc_index().expect("buffer");
+        runtime.buffers().append(index, b"hello").expect("payload");
+        {
+            let mut buffer = runtime.get_buffer_mut(index).expect("buffer mut");
+            {
+                let tcp = buffer.prepend_mut(20).expect("tcp header");
+                write_tcp_segment_header(
+                    tcp,
+                    TcpSegmentHeader {
+                        source_port: REMOTE_PORT,
+                        destination_port: LOCAL_PORT,
+                        sequence_number: rcv_nxt,
+                        acknowledgment_number: snd_nxt,
+                        flags: TcpSegmentFlags::ACK | TcpSegmentFlags::PSH,
+                        advertised_window: u16::MAX,
+                        urgent_pointer: 0,
+                        capabilities: TcpCapabilities::default(),
+                        timestamp: None,
+                        fast_open_cookie: None,
+                    },
+                    None,
+                )
+                .expect("write tcp");
+            }
+            {
+                let ip = buffer.prepend_mut(20).expect("ip header");
+                write_ipv4_push_header(ip, REMOTE_IP, LOCAL_IP, 6, 45).expect("write ip");
+            }
+            let packet_len = buffer.current().len();
+            let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+            network.set_packet_cursor(
+                BufferPacketCursor::new()
+                    .with_packet_len(packet_len)
+                    .with_network_header(0, 20)
+                    .with_transport_header(20, 20)
+                    .with_transport_payload_offset(40),
+            );
+            network.ip_mut().set_ip_version(Some(4));
+            network.ip_mut().set_ip_protocol(Some(6));
+            write_session_route_opaque(
+                buffer.opaque2_mut(),
+                session_id,
+                DataWorkerId::new(0),
+                TcpInputNext::Established,
+            );
+        }
+        let mut frame = runtime
+            .buffers()
+            .get_next_frame(established)
+            .expect("frame");
+        frame.push_index(index).expect("push");
+        runtime.put_next_frame(frame).expect("put");
         assert!(runtime.run_ready_nodes().expect("run established") >= 1);
 
         let queue = handle.borrow_mut().expect("tcp queue");
@@ -708,7 +605,6 @@ mod tests {
                 .expect("rx capacity"),
             rx_before - 5
         );
-        // Delayed ACK: first clean segment does not emit an immediate ACK.
         assert!(output_state.lock().expect("output").packets.is_empty());
     }
 
@@ -725,20 +621,61 @@ mod tests {
         let (established, handle, output_state, _) = install_established_runtime(&runtime);
         let (session_id, rcv_nxt, snd_nxt) = open_established_session(handle);
 
-        send_to_established(
-            &runtime,
-            established,
-            Some(session_id),
-            &data_packet(rcv_nxt, snd_nxt, b"hello"),
-        );
-        assert!(runtime.run_ready_nodes().expect("run first") >= 1);
-
-        send_to_established(
-            &runtime,
-            established,
-            Some(session_id),
-            &data_packet(rcv_nxt, snd_nxt, b"hello"),
-        );
+        for _ in 0..2 {
+            let index = runtime.alloc_index().expect("buffer");
+            runtime.buffers().append(index, b"hello").expect("payload");
+            {
+                let mut buffer = runtime.get_buffer_mut(index).expect("buffer mut");
+                {
+                    let tcp = buffer.prepend_mut(20).expect("tcp header");
+                    write_tcp_segment_header(
+                        tcp,
+                        TcpSegmentHeader {
+                            source_port: REMOTE_PORT,
+                            destination_port: LOCAL_PORT,
+                            sequence_number: rcv_nxt,
+                            acknowledgment_number: snd_nxt,
+                            flags: TcpSegmentFlags::ACK | TcpSegmentFlags::PSH,
+                            advertised_window: u16::MAX,
+                            urgent_pointer: 0,
+                            capabilities: TcpCapabilities::default(),
+                            timestamp: None,
+                            fast_open_cookie: None,
+                        },
+                        None,
+                    )
+                    .expect("write tcp");
+                }
+                {
+                    let ip = buffer.prepend_mut(20).expect("ip header");
+                    write_ipv4_push_header(ip, REMOTE_IP, LOCAL_IP, 6, 45).expect("write ip");
+                }
+                let packet_len = buffer.current().len();
+                let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+                network.set_packet_cursor(
+                    BufferPacketCursor::new()
+                        .with_packet_len(packet_len)
+                        .with_network_header(0, 20)
+                        .with_transport_header(20, 20)
+                        .with_transport_payload_offset(40),
+                );
+                network.ip_mut().set_ip_version(Some(4));
+                network.ip_mut().set_ip_protocol(Some(6));
+                write_session_route_opaque(
+                    buffer.opaque2_mut(),
+                    session_id,
+                    DataWorkerId::new(0),
+                    TcpInputNext::Established,
+                );
+            }
+            let mut frame = runtime
+                .buffers()
+                .get_next_frame(established)
+                .expect("frame");
+            frame.push_index(index).expect("push");
+            runtime.put_next_frame(frame).expect("put");
+            let _ = runtime.run_ready_nodes().expect("run");
+        }
         for _ in 0..8 {
             let _ = runtime.run_ready_nodes().expect("drain");
             if !output_state.lock().expect("output").packets.is_empty() {
@@ -751,8 +688,10 @@ mod tests {
         assert_eq!(connection.rcv_nxt(), rcv_nxt + 5);
         let packets = output_state.lock().expect("output");
         assert_eq!(packets.packets.len(), 1);
-        assert_eq!(tcp_flags(&packets.packets[0]) & TCP_FLAG_ACK, TCP_FLAG_ACK);
-        assert_eq!(tcp_acknowledgment(&packets.packets[0]), rcv_nxt + 5);
+        let tcp = &packets.packets[0][20..];
+        let wire = hammer_core::protocol::tcp::tcp_header(tcp).expect("tcp hdr");
+        assert!(wire.flags().contains(TcpSegmentFlags::ACK));
+        assert_eq!(wire.acknowledgment_number(), rcv_nxt + 5);
     }
 
     #[test]
@@ -768,12 +707,57 @@ mod tests {
         let (established, handle, output_state, _) = install_established_runtime(&runtime);
         let (session_id, rcv_nxt, snd_nxt) = open_established_session(handle);
 
-        send_to_established(
-            &runtime,
-            established,
-            Some(session_id),
-            &peer_fin_packet(rcv_nxt, snd_nxt),
-        );
+        let index = runtime.alloc_index().expect("buffer");
+        {
+            let mut buffer = runtime.get_buffer_mut(index).expect("buffer mut");
+            {
+                let tcp = buffer.prepend_mut(20).expect("tcp header");
+                write_tcp_segment_header(
+                    tcp,
+                    TcpSegmentHeader {
+                        source_port: REMOTE_PORT,
+                        destination_port: LOCAL_PORT,
+                        sequence_number: rcv_nxt,
+                        acknowledgment_number: snd_nxt,
+                        flags: TcpSegmentFlags::FIN | TcpSegmentFlags::ACK,
+                        advertised_window: u16::MAX,
+                        urgent_pointer: 0,
+                        capabilities: TcpCapabilities::default(),
+                        timestamp: None,
+                        fast_open_cookie: None,
+                    },
+                    None,
+                )
+                .expect("write tcp");
+            }
+            {
+                let ip = buffer.prepend_mut(20).expect("ip header");
+                write_ipv4_push_header(ip, REMOTE_IP, LOCAL_IP, 6, 40).expect("write ip");
+            }
+            let packet_len = buffer.current().len();
+            let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+            network.set_packet_cursor(
+                BufferPacketCursor::new()
+                    .with_packet_len(packet_len)
+                    .with_network_header(0, 20)
+                    .with_transport_header(20, 20)
+                    .with_transport_payload_offset(40),
+            );
+            network.ip_mut().set_ip_version(Some(4));
+            network.ip_mut().set_ip_protocol(Some(6));
+            write_session_route_opaque(
+                buffer.opaque2_mut(),
+                session_id,
+                DataWorkerId::new(0),
+                TcpInputNext::Established,
+            );
+        }
+        let mut frame = runtime
+            .buffers()
+            .get_next_frame(established)
+            .expect("frame");
+        frame.push_index(index).expect("push");
+        runtime.put_next_frame(frame).expect("put");
         for _ in 0..8 {
             let _ = runtime.run_ready_nodes().expect("drain");
             if !output_state.lock().expect("output").packets.is_empty() {
@@ -787,8 +771,9 @@ mod tests {
         assert_eq!(connection.rcv_nxt(), rcv_nxt + 1);
         let packets = output_state.lock().expect("output");
         assert_eq!(packets.packets.len(), 1);
-        assert_eq!(tcp_flags(&packets.packets[0]) & TCP_FLAG_ACK, TCP_FLAG_ACK);
-        assert_eq!(tcp_acknowledgment(&packets.packets[0]), rcv_nxt + 1);
+        let wire = hammer_core::protocol::tcp::tcp_header(&packets.packets[0][20..]).expect("tcp");
+        assert!(wire.flags().contains(TcpSegmentFlags::ACK));
+        assert_eq!(wire.acknowledgment_number(), rcv_nxt + 1);
     }
 
     #[test]
@@ -804,12 +789,57 @@ mod tests {
         let (established, handle, output_state, _) = install_established_runtime(&runtime);
         let (session_id, rcv_nxt, snd_nxt) = open_established_session(handle);
 
-        send_to_established(
-            &runtime,
-            established,
-            Some(session_id),
-            &peer_fin_packet(rcv_nxt.wrapping_add(1), snd_nxt),
-        );
+        let index = runtime.alloc_index().expect("buffer");
+        {
+            let mut buffer = runtime.get_buffer_mut(index).expect("buffer mut");
+            {
+                let tcp = buffer.prepend_mut(20).expect("tcp header");
+                write_tcp_segment_header(
+                    tcp,
+                    TcpSegmentHeader {
+                        source_port: REMOTE_PORT,
+                        destination_port: LOCAL_PORT,
+                        sequence_number: rcv_nxt.wrapping_add(1),
+                        acknowledgment_number: snd_nxt,
+                        flags: TcpSegmentFlags::FIN | TcpSegmentFlags::ACK,
+                        advertised_window: u16::MAX,
+                        urgent_pointer: 0,
+                        capabilities: TcpCapabilities::default(),
+                        timestamp: None,
+                        fast_open_cookie: None,
+                    },
+                    None,
+                )
+                .expect("write tcp");
+            }
+            {
+                let ip = buffer.prepend_mut(20).expect("ip header");
+                write_ipv4_push_header(ip, REMOTE_IP, LOCAL_IP, 6, 40).expect("write ip");
+            }
+            let packet_len = buffer.current().len();
+            let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+            network.set_packet_cursor(
+                BufferPacketCursor::new()
+                    .with_packet_len(packet_len)
+                    .with_network_header(0, 20)
+                    .with_transport_header(20, 20)
+                    .with_transport_payload_offset(40),
+            );
+            network.ip_mut().set_ip_version(Some(4));
+            network.ip_mut().set_ip_protocol(Some(6));
+            write_session_route_opaque(
+                buffer.opaque2_mut(),
+                session_id,
+                DataWorkerId::new(0),
+                TcpInputNext::Established,
+            );
+        }
+        let mut frame = runtime
+            .buffers()
+            .get_next_frame(established)
+            .expect("frame");
+        frame.push_index(index).expect("push");
+        runtime.put_next_frame(frame).expect("put");
         let _ = runtime.run_ready_nodes().expect("run established");
         let _ = runtime.run_ready_nodes().expect("drain");
 
@@ -833,12 +863,52 @@ mod tests {
         let (established, handle, output_state, _) = install_established_runtime(&runtime);
         let (session_id, rcv_nxt, snd_nxt) = open_established_session(handle);
 
-        send_to_established(
-            &runtime,
-            established,
-            None,
-            &data_packet(rcv_nxt, snd_nxt, b"x"),
-        );
+        let index = runtime.alloc_index().expect("buffer");
+        runtime.buffers().append(index, b"x").expect("payload");
+        {
+            let mut buffer = runtime.get_buffer_mut(index).expect("buffer mut");
+            {
+                let tcp = buffer.prepend_mut(20).expect("tcp header");
+                write_tcp_segment_header(
+                    tcp,
+                    TcpSegmentHeader {
+                        source_port: REMOTE_PORT,
+                        destination_port: LOCAL_PORT,
+                        sequence_number: rcv_nxt,
+                        acknowledgment_number: snd_nxt,
+                        flags: TcpSegmentFlags::ACK | TcpSegmentFlags::PSH,
+                        advertised_window: u16::MAX,
+                        urgent_pointer: 0,
+                        capabilities: TcpCapabilities::default(),
+                        timestamp: None,
+                        fast_open_cookie: None,
+                    },
+                    None,
+                )
+                .expect("write tcp");
+            }
+            {
+                let ip = buffer.prepend_mut(20).expect("ip header");
+                write_ipv4_push_header(ip, REMOTE_IP, LOCAL_IP, 6, 41).expect("write ip");
+            }
+            let packet_len = buffer.current().len();
+            let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+            network.set_packet_cursor(
+                BufferPacketCursor::new()
+                    .with_packet_len(packet_len)
+                    .with_network_header(0, 20)
+                    .with_transport_header(20, 20)
+                    .with_transport_payload_offset(40),
+            );
+            network.ip_mut().set_ip_version(Some(4));
+            network.ip_mut().set_ip_protocol(Some(6));
+        }
+        let mut frame = runtime
+            .buffers()
+            .get_next_frame(established)
+            .expect("frame");
+        frame.push_index(index).expect("push");
+        runtime.put_next_frame(frame).expect("put");
         let _ = runtime.run_ready_nodes().expect("run established");
         let _ = runtime.run_ready_nodes().expect("drain");
 
@@ -850,10 +920,6 @@ mod tests {
 
     #[test]
     fn urg_segment_marks_session_rx_event_flag() {
-        use hammer_core::protocol::tcp::TcpWireHeader;
-        use hammer_core::protocol::wire::header_mut_ptr;
-        use hammer_runtime::app::{SessionEvt, SessionEvtFlags, SessionEvtType};
-
         let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
             buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                 buffer_slot_capacity: 2048,
@@ -864,24 +930,76 @@ mod tests {
         });
         let (established, handle, _, _) = install_established_runtime(&runtime);
         let (session_id, rcv_nxt, snd_nxt) = open_established_session(handle);
-        let app = attach_observable_app(&handle, session_id);
+        let app = Arc::new(
+            AppSession::new_in_segment(
+                Local::default(),
+                AppSessionConfig::new(256, 16),
+                SessionHandle::new(session_id.pool_index().slot(), 0),
+                handle.borrow_mut().expect("tcp queue").app().tx_evt_q().clone(),
+            )
+            .expect("app session"),
+        );
+        handle
+            .borrow_mut()
+            .expect("tcp queue")
+            .app_mut()
+            .attach_session(session_id, Arc::clone(&app));
         app.want_rx_notification();
 
-        let mut packet = data_packet(rcv_nxt, snd_nxt, b"urg");
+        let index = runtime.alloc_index().expect("buffer");
+        runtime.buffers().append(index, b"urg").expect("payload");
         {
-            let ip_hlen = usize::from(packet[0] & 0x0f) * 4;
-            let ptr = header_mut_ptr::<TcpWireHeader>(&mut packet[ip_hlen..], 0)
-                .expect("tcp wire header");
-            // SAFETY: header_mut_ptr validated the TcpWireHeader range.
-            unsafe {
-                let wire = &mut *ptr;
-                let mut flags = wire.flags();
-                flags.insert(TcpSegmentFlags::URG);
-                wire.set_flags(flags);
-                wire.set_urgent_pointer(3);
+            let mut buffer = runtime.get_buffer_mut(index).expect("buffer mut");
+            {
+                let tcp = buffer.prepend_mut(20).expect("tcp header");
+                write_tcp_segment_header(
+                    tcp,
+                    TcpSegmentHeader {
+                        source_port: REMOTE_PORT,
+                        destination_port: LOCAL_PORT,
+                        sequence_number: rcv_nxt,
+                        acknowledgment_number: snd_nxt,
+                        flags: TcpSegmentFlags::ACK
+                            | TcpSegmentFlags::PSH
+                            | TcpSegmentFlags::URG,
+                        advertised_window: u16::MAX,
+                        urgent_pointer: 3,
+                        capabilities: TcpCapabilities::default(),
+                        timestamp: None,
+                        fast_open_cookie: None,
+                    },
+                    None,
+                )
+                .expect("write tcp");
             }
+            {
+                let ip = buffer.prepend_mut(20).expect("ip header");
+                write_ipv4_push_header(ip, REMOTE_IP, LOCAL_IP, 6, 43).expect("write ip");
+            }
+            let packet_len = buffer.current().len();
+            let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+            network.set_packet_cursor(
+                BufferPacketCursor::new()
+                    .with_packet_len(packet_len)
+                    .with_network_header(0, 20)
+                    .with_transport_header(20, 20)
+                    .with_transport_payload_offset(40),
+            );
+            network.ip_mut().set_ip_version(Some(4));
+            network.ip_mut().set_ip_protocol(Some(6));
+            write_session_route_opaque(
+                buffer.opaque2_mut(),
+                session_id,
+                DataWorkerId::new(0),
+                TcpInputNext::Established,
+            );
         }
-        send_to_established(&runtime, established, Some(session_id), &packet);
+        let mut frame = runtime
+            .buffers()
+            .get_next_frame(established)
+            .expect("frame");
+        frame.push_index(index).expect("push");
+        runtime.put_next_frame(frame).expect("put");
         assert!(runtime.run_ready_nodes().expect("run established") >= 1);
 
         let mut out = [SessionEvt::io(0, SessionEvtType::Close)];
@@ -892,8 +1010,6 @@ mod tests {
 
     #[test]
     fn non_urg_segment_leaves_session_rx_event_flags_clear() {
-        use hammer_runtime::app::{SessionEvt, SessionEvtFlags, SessionEvtType};
-
         let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
             buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                 buffer_slot_capacity: 2048,
@@ -904,15 +1020,74 @@ mod tests {
         });
         let (established, handle, _, _) = install_established_runtime(&runtime);
         let (session_id, rcv_nxt, snd_nxt) = open_established_session(handle);
-        let app = attach_observable_app(&handle, session_id);
+        let app = Arc::new(
+            AppSession::new_in_segment(
+                Local::default(),
+                AppSessionConfig::new(256, 16),
+                SessionHandle::new(session_id.pool_index().slot(), 0),
+                handle.borrow_mut().expect("tcp queue").app().tx_evt_q().clone(),
+            )
+            .expect("app session"),
+        );
+        handle
+            .borrow_mut()
+            .expect("tcp queue")
+            .app_mut()
+            .attach_session(session_id, Arc::clone(&app));
         app.want_rx_notification();
 
-        send_to_established(
-            &runtime,
-            established,
-            Some(session_id),
-            &data_packet(rcv_nxt, snd_nxt, b"ok"),
-        );
+        let index = runtime.alloc_index().expect("buffer");
+        runtime.buffers().append(index, b"ok").expect("payload");
+        {
+            let mut buffer = runtime.get_buffer_mut(index).expect("buffer mut");
+            {
+                let tcp = buffer.prepend_mut(20).expect("tcp header");
+                write_tcp_segment_header(
+                    tcp,
+                    TcpSegmentHeader {
+                        source_port: REMOTE_PORT,
+                        destination_port: LOCAL_PORT,
+                        sequence_number: rcv_nxt,
+                        acknowledgment_number: snd_nxt,
+                        flags: TcpSegmentFlags::ACK | TcpSegmentFlags::PSH,
+                        advertised_window: u16::MAX,
+                        urgent_pointer: 0,
+                        capabilities: TcpCapabilities::default(),
+                        timestamp: None,
+                        fast_open_cookie: None,
+                    },
+                    None,
+                )
+                .expect("write tcp");
+            }
+            {
+                let ip = buffer.prepend_mut(20).expect("ip header");
+                write_ipv4_push_header(ip, REMOTE_IP, LOCAL_IP, 6, 42).expect("write ip");
+            }
+            let packet_len = buffer.current().len();
+            let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+            network.set_packet_cursor(
+                BufferPacketCursor::new()
+                    .with_packet_len(packet_len)
+                    .with_network_header(0, 20)
+                    .with_transport_header(20, 20)
+                    .with_transport_payload_offset(40),
+            );
+            network.ip_mut().set_ip_version(Some(4));
+            network.ip_mut().set_ip_protocol(Some(6));
+            write_session_route_opaque(
+                buffer.opaque2_mut(),
+                session_id,
+                DataWorkerId::new(0),
+                TcpInputNext::Established,
+            );
+        }
+        let mut frame = runtime
+            .buffers()
+            .get_next_frame(established)
+            .expect("frame");
+        frame.push_index(index).expect("push");
+        runtime.put_next_frame(frame).expect("put");
         assert!(runtime.run_ready_nodes().expect("run established") >= 1);
 
         let mut out = [SessionEvt::io(0, SessionEvtType::Close)];

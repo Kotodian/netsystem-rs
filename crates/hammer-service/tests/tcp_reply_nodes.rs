@@ -23,6 +23,7 @@ fn synthesize_control_ack_has_reversed_tuple_and_fields() {
             acknowledgment_number: 7001,
             flags: TcpSegmentFlags::ACK,
             advertised_window: 65_535,
+            urgent_pointer: 0,
             capabilities: TcpCapabilities::default(),
             timestamp: None,
             fast_open_cookie: None,

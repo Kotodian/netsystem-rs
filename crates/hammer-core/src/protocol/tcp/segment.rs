@@ -151,6 +151,7 @@ pub struct TcpSegmentHeader<'a> {
     pub acknowledgment_number: u32,
     pub flags: TcpSegmentFlags,
     pub advertised_window: u16,
+    pub urgent_pointer: u16,
     pub capabilities: TcpCapabilities,
     pub timestamp: Option<TcpTimestampOption>,
     pub fast_open_cookie: Option<&'a TcpFastOpenCookie>,
@@ -173,6 +174,7 @@ pub fn write_tcp_segment_header(
     wire.set_acknowledgment_number(header.acknowledgment_number);
     wire.set_data_offset_flags(tcp_data_offset_flags(header_len, header.flags));
     wire.set_advertised_window(header.advertised_window);
+    wire.set_urgent_pointer(header.urgent_pointer);
     let options = &mut output[TCP_HEADER_MIN_LEN..header_len];
     write_tcp_options(options, header, sack_blocks);
     Ok(header_len)
@@ -366,6 +368,7 @@ mod tests {
                 acknowledgment_number: 0,
                 flags: TcpSegmentFlags::SYN,
                 advertised_window: 4096,
+                urgent_pointer: 0,
                 capabilities: TcpCapabilities {
                     fast_open: true,
                     ..TcpCapabilities::default()

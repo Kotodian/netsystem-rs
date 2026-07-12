@@ -13,8 +13,8 @@ use hammer_runtime::DataPlaneRuntime;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpSegment {
-    local_port: u16,
-    remote_port: u16,
+    local: SocketAddr,
+    remote: SocketAddr,
     sequence: u32,
     acknowledgment: u32,
     advertised_window: u16,
@@ -46,8 +46,8 @@ impl TcpSegment {
     ) -> Self {
         let (sack_blocks, sack_block_count) = copy_sack_blocks(sack_blocks);
         Self {
-            local_port: local.port(),
-            remote_port: remote.port(),
+            local,
+            remote,
             sequence,
             acknowledgment,
             advertised_window,
@@ -88,12 +88,13 @@ impl TcpSegment {
     #[inline]
     fn header(&self) -> TcpSegmentHeader<'_> {
         TcpSegmentHeader {
-            source_port: self.local_port,
-            destination_port: self.remote_port,
+            source_port: self.local.port(),
+            destination_port: self.remote.port(),
             sequence_number: self.sequence,
             acknowledgment_number: self.acknowledgment,
             flags: self.flags,
             advertised_window: self.advertised_window,
+            urgent_pointer: 0,
             capabilities: self.capabilities,
             timestamp: self.timestamp,
             fast_open_cookie: self.fast_open_cookie.as_ref(),
@@ -108,9 +109,16 @@ impl TcpSegment {
         let mut buffer = buffers.get_buffer_mut(index)?;
         let header = buffer.prepend_mut(self.header_len())?;
         self.write_header(header)?;
-        unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }
-            .ip_mut()
-            .set_ip_ecn(self.ip_ecn.map(Into::into));
+        {
+            let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+            network.ip_mut().set_ip_ecn(self.ip_ecn.map(Into::into));
+        }
+        // Stamp L3 endpoints for tcp-output (VPP stamps connection_index; push_ip reads c_lcl/c_rmt).
+        crate::transport::tcp::write_tcp_egress_endpoints(
+            buffer.opaque2_mut(),
+            self.local.ip(),
+            self.remote.ip(),
+        );
         Ok(())
     }
 }

@@ -590,6 +590,7 @@ mod tests {
                 acknowledgment_number: acknowledgment,
                 flags,
                 advertised_window: u16::MAX,
+                urgent_pointer: 0,
                 capabilities: TcpCapabilities::default(),
                 timestamp: None,
                 fast_open_cookie: None,
@@ -600,11 +601,13 @@ mod tests {
     }
 
     fn tcp_flags(packet: &[u8]) -> u8 {
-        packet[13]
+        let tcp = crate::transport::tcp::tcp_bytes_after_l3(packet);
+        tcp[13]
     }
 
     fn tcp_acknowledgment(packet: &[u8]) -> u32 {
-        u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]])
+        let tcp = crate::transport::tcp::tcp_bytes_after_l3(packet);
+        u32::from_be_bytes([tcp[8], tcp[9], tcp[10], tcp[11]])
     }
 
     #[test]
