@@ -36,6 +36,10 @@ _Avoid_: packet-path NodeId feature next, shared handoff/config field, dual Node
 ICMP type and UDP port registries publish consumer-local `u16` next slots. Control may accept target `NodeId` at registration; the published snapshot and packet path carry only local slots and enqueue through Graph Fanout.
 _Avoid_: packet-path NodeId protocol dispatch, NodeNextStorage for ICMP/UDP input registries
 
+**TCP Ingress Local Next**:
+TCP input classifies worker-local nexts as current-node-local `u16` slots and enqueues them through Graph Fanout. Cross-worker session ownership leaves the input Frame through Handoff before Fanout; Handoff may retain destination `NodeId` continuation state, and Fanout never enters the cross-worker queue.
+_Avoid_: TCP input manual get/push/put, Fanout of handoff-owned indexes, worker-local handoff
+
 **Graph Fanout**:
 The sole worker-local next-frame enqueue: it groups packet ownership by selected Next Arc and makes the resulting Next Frames visible at the current Graph Node dispatch boundary. Cross-worker ownership transfer remains Handoff, not Graph Fanout.
 _Avoid_: cross-thread fanout, handoff enqueue, output router, per-node manual frame get/push/put, recoverable enqueue Result on the packet path

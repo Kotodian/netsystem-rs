@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::data_plane::set_buffer_node_error_code;
 use crate::net::ip::{IpProtocol, IpVersion};
 use crate::trace::codec::{
-    TraceDecodeCursor, put_node, put_option_ip_protocol, put_option_ip_version, put_option_u16,
+    TraceDecodeCursor, put_option_ip_protocol, put_option_ip_version, put_option_u16,
     put_u16,
 };
 use arc_swap::ArcSwap;
@@ -52,7 +52,7 @@ pub struct TcpInputTrace {
     pub destination_port: Option<u16>,
     pub flags: u16,
     pub error: Option<u16>,
-    pub next: NodeId,
+    pub next: u16,
 }
 
 impl TcpInputTrace {
@@ -65,7 +65,7 @@ impl TcpInputTrace {
             destination_port: cursor.read_option_u16()?,
             flags: cursor.read_u16()?,
             error: cursor.read_option_u16()?,
-            next: cursor.read_node()?,
+            next: cursor.read_u16()?,
         };
         cursor.is_empty().then_some(trace)
     }
@@ -79,7 +79,7 @@ impl PacketTrace for TcpInputTrace {
         put_option_u16(out, self.destination_port);
         put_u16(out, self.flags);
         put_option_u16(out, self.error);
-        put_node(out, self.next);
+        put_u16(out, self.next);
     }
 }
 
@@ -327,9 +327,10 @@ where
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let width = runtime.preferred_frame_batch_width();
+    let mut nexts = hammer_infra::vec::Vec::with_capacity(frame.len());
     let _ = frame.rewrite_indices_batched(width, |index| {
         prefetch_tcp_input(runtime, &[index], snapshot, session_queue);
-        tcp_input_enqueue_index(
+        match tcp_input_local_next_for_index(
             runtime,
             index,
             snapshot,
@@ -337,14 +338,26 @@ where
             handoff,
             handoff_worker,
             session_queue,
-        )?;
-        Ok(None)
+        ) {
+            Ok(Some(slot)) => {
+                nexts.push(slot);
+                Ok(Some(index))
+            }
+            Ok(None) => Ok(None),
+            Err(_) => {
+                nexts.push(TcpInputNext::Drop.slot() as u16);
+                Ok(Some(index))
+            }
+        }
     });
+    if !nexts.is_empty() {
+        runtime.enqueue_to_next(frame, nexts.as_slice());
+    }
     NodeResult::drop()
 }
 
 #[inline(always)]
-fn tcp_input_next_for_index<C, Seg>(
+fn tcp_input_local_next_for_index<C, Seg>(
     runtime: &DataPlaneRuntime,
     index: Index,
     snapshot: &TcpLookupSnapshot,
@@ -354,7 +367,7 @@ fn tcp_input_next_for_index<C, Seg>(
     session_queue: Option<
         SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
     >,
-) -> CoreResult<Option<NodeId>>
+) -> CoreResult<Option<u16>>
 where
     C: CongestionController + 'static,
     Seg: Segment,
@@ -363,7 +376,7 @@ where
     let buffer = runtime.get_buffer(index)?;
     let parsed = tcp_input_buffer(&buffer)?;
     drop(buffer);
-    next_node_for_index_with_runtime(
+    next_slot_for_index_with_runtime(
         runtime,
         index,
         parsed,
@@ -385,7 +398,7 @@ enum TcpInputError {
 }
 
 #[inline(always)]
-fn next_node_for_index_with_runtime<C, Seg>(
+fn next_slot_for_index_with_runtime<C, Seg>(
     runtime: &DataPlaneRuntime,
     index: Index,
     parsed: Result<(IpVersion, IpProtocol, SocketAddr, SocketAddr, TcpInputFlags), TcpInputError>,
@@ -396,7 +409,7 @@ fn next_node_for_index_with_runtime<C, Seg>(
     session_queue: Option<
         SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
     >,
-) -> CoreResult<Option<NodeId>>
+) -> CoreResult<Option<u16>>
 where
     C: CongestionController + 'static,
     Seg: Segment,
@@ -409,7 +422,6 @@ where
             return resolve_error_next_with_runtime(
                 runtime,
                 index,
-                next,
                 TcpInputNext::Drop,
                 TcpError::Length,
                 None,
@@ -422,7 +434,6 @@ where
             return resolve_error_next_with_runtime(
                 runtime,
                 index,
-                next,
                 TcpInputNext::Drop,
                 TcpError::Dispatch,
                 Some(version),
@@ -438,6 +449,7 @@ where
     let (session_route, listener_pending) =
         session_or_listener_pending_input_entry(session_queue, local, remote, flags)?;
     if let Some((session_id, owner, session_next)) = session_route {
+        let slot = session_next.slot() as u16;
         let resolved = NodeNextStorage::next(next, session_next);
         {
             let mut buffer = runtime.get_buffer_mut(index)?;
@@ -446,6 +458,8 @@ where
             if let (Some(_), Some(current_worker)) = (handoff, handoff_worker)
                 && owner != current_worker
             {
+                // Handoff continuation keeps the destination NodeId; worker-local
+                // fanout never carries target identities on the packet path.
                 buffer.set_current_config(resolved);
                 unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }
                     .set_handoff_source_worker(Some(current_worker.slot() as u16));
@@ -465,7 +479,7 @@ where
                         destination_port: Some(destination_port),
                         flags: u16::from(flags.bits()),
                         error: None,
-                        next: resolved,
+                        next: slot,
                     },
                 )?;
             }
@@ -475,7 +489,6 @@ where
         return resolve_success_next_with_trace(
             runtime,
             index,
-            next,
             session_next,
             version,
             protocol,
@@ -495,7 +508,6 @@ where
         return resolve_success_next_with_trace(
             runtime,
             index,
-            next,
             TcpInputNext::Listen,
             version,
             protocol,
@@ -512,7 +524,6 @@ where
         return resolve_error_next_with_runtime(
             runtime,
             index,
-            next,
             listener_next,
             error,
             Some(version),
@@ -525,7 +536,6 @@ where
         return resolve_error_next_with_runtime(
             runtime,
             index,
-            next,
             TcpInputNext::Punt,
             TcpError::ConnectionClosed,
             Some(version),
@@ -542,7 +552,6 @@ where
     resolve_success_next_with_trace(
         runtime,
         index,
-        next,
         listener_next,
         version,
         protocol,
@@ -557,7 +566,6 @@ where
 fn resolve_success_next_with_trace(
     runtime: &DataPlaneRuntime,
     index: Index,
-    next: &[NodeId; TcpInputNext::COUNT],
     next_key: TcpInputNext,
     version: IpVersion,
     protocol: IpProtocol,
@@ -565,8 +573,8 @@ fn resolve_success_next_with_trace(
     destination_port: u16,
     flags: u16,
     traced: bool,
-) -> CoreResult<Option<NodeId>> {
-    let resolved = NodeNextStorage::next(next, next_key);
+) -> CoreResult<Option<u16>> {
+    let slot = next_key.slot() as u16;
     if traced {
         add_packet_trace!(
             runtime,
@@ -578,30 +586,29 @@ fn resolve_success_next_with_trace(
                 destination_port: Some(destination_port),
                 flags,
                 error: None,
-                next: resolved,
+                next: slot,
             },
         )?;
     }
-    Ok(Some(resolved))
+    Ok(Some(slot))
 }
 
 #[inline(always)]
 fn resolve_error_next_with_runtime(
     runtime: &DataPlaneRuntime,
     index: Index,
-    next: &[NodeId; TcpInputNext::COUNT],
     next_key: TcpInputNext,
     error: TcpError,
     version: Option<IpVersion>,
     protocol: Option<IpProtocol>,
     flags: u16,
     traced: bool,
-) -> CoreResult<Option<NodeId>> {
+) -> CoreResult<Option<u16>> {
     {
         let mut buffer = runtime.get_buffer_mut(index)?;
         set_buffer_node_error_code(runtime, &mut buffer, error as u16)?;
     }
-    let resolved = NodeNextStorage::next(next, next_key);
+    let slot = next_key.slot() as u16;
     if traced {
         add_packet_trace!(
             runtime,
@@ -613,11 +620,11 @@ fn resolve_error_next_with_runtime(
                 destination_port: None,
                 flags,
                 error: Some(error as u16),
-                next: resolved,
+                next: slot,
             },
         )?;
     }
-    Ok(Some(resolved))
+    Ok(Some(slot))
 }
 
 #[inline(always)]
@@ -1429,40 +1436,6 @@ fn tcp_input_parts(
         SocketAddr::new(source_ip, segment.source_port()),
         tcp_input_flags(segment.flags()),
     )))
-}
-
-#[inline(always)]
-fn tcp_input_enqueue_index<C, Seg>(
-    runtime: &DataPlaneRuntime,
-    index: Index,
-    snapshot: &TcpLookupSnapshot,
-    next: &[NodeId; TcpInputNext::COUNT],
-    handoff: Option<NodeHandle>,
-    handoff_worker: Option<DataWorkerId>,
-    session_queue: Option<
-        SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
-    >,
-) -> CoreResult<()>
-where
-    C: CongestionController + 'static,
-    Seg: Segment,
-    crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-{
-    let node = tcp_input_next_for_index(
-        runtime,
-        index,
-        snapshot,
-        next,
-        handoff,
-        handoff_worker,
-        session_queue,
-    )?;
-    if let Some(node) = node {
-        let mut frame = runtime.buffers().get_next_frame(node)?;
-        frame.push_index(index)?;
-        runtime.put_next_frame(frame)?;
-    }
-    Ok(())
 }
 
 #[inline(always)]
