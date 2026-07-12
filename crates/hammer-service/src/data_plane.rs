@@ -220,13 +220,27 @@ fn handoff_node_process(
     _data: hammer_runtime::node::NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> NodeResult {
-    // Handoff continuation uses buffer current_config as a NodeId destination.
-    // Feature Arc config progress lives in NetworkOpaque and must not share this path.
-    hammer_runtime::process_frame!(runtime, frame, |index| {
-        runtime
+    // Handoff continuation stores the destination as NodeId in current_config.
+    // Direct get/push/put is allowed for Handoff; Graph Fanout stays worker-local
+    // and does not resolve cross-worker continuation identities.
+    let indices: hammer_infra::vec::Vec<_> = frame.indices().iter().copied().collect();
+    frame.discard_prefix(indices.len());
+    for index in indices {
+        let next = runtime
             .current_config(index)
-            .expect("handoff buffer must carry a continuation next")
-    })
+            .expect("handoff buffer must carry a continuation next");
+        let mut next_frame = runtime
+            .buffers()
+            .get_next_frame(next)
+            .expect("handoff continuation next frame");
+        next_frame
+            .push_index(index)
+            .expect("handoff continuation push");
+        runtime
+            .put_next_frame(next_frame)
+            .expect("handoff continuation put");
+    }
+    NodeResult::drop()
 }
 
 impl InternalNode for HandoffNode {

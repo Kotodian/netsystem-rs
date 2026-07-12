@@ -33,11 +33,7 @@ pub fn register_tcp_reset(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<No
 impl Node for TcpResetNode {
     #[inline(always)]
     fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
-        let next = match Self::runtime_nexts(runtime) {
-            Ok(next) => next,
-            Err(_) => return NodeResult::drop(),
-        };
-        tcp_reset_process_frame(runtime, frame, next)
+        tcp_reset_process_frame(runtime, frame)
     }
 
     #[inline]
@@ -56,22 +52,12 @@ fn tcp_reset_process(
     _: NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> NodeResult {
-    let next = match TcpResetNode::runtime_nexts(runtime) {
-        Ok(next) => next,
-        Err(_) => return NodeResult::drop(),
-    };
-    tcp_reset_process_frame(runtime, frame, next)
+    tcp_reset_process_frame(runtime, frame)
 }
 
-fn tcp_reset_process_frame(
-    runtime: &DataPlaneRuntime,
-    frame: &mut BufferFrame,
-    next: [NodeId; TcpResetNext::COUNT],
-) -> NodeResult {
-    let drop_next = next[TcpResetNext::Drop as usize];
-    let lookup_next = next[TcpResetNext::Lookup as usize];
+fn tcp_reset_process_frame(runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
     hammer_runtime::process_frame!(runtime, frame, |index| {
-        tcp_reset_next_for_index(runtime, index, drop_next, lookup_next).unwrap_or(drop_next)
+        tcp_reset_next_for_index(runtime, index).unwrap_or(TcpResetNext::Drop)
     })
 }
 
@@ -79,9 +65,7 @@ fn tcp_reset_process_frame(
 fn tcp_reset_next_for_index(
     runtime: &DataPlaneRuntime,
     index: Index,
-    drop_next: NodeId,
-    lookup_next: NodeId,
-) -> CoreResult<NodeId> {
+) -> CoreResult<TcpResetNext> {
     let reset = {
         let buffer = runtime.get_buffer(index)?;
         tcp_reset_prepare_from_current(
@@ -91,10 +75,10 @@ fn tcp_reset_next_for_index(
         )
     };
     let Some(reply_len) = tcp_reset_write_reply(runtime, index, reset)? else {
-        return Ok(drop_next);
+        return Ok(TcpResetNext::Drop);
     };
     refresh_reset_metadata(runtime, index, reply_len)?;
-    Ok(lookup_next)
+    Ok(TcpResetNext::Lookup)
 }
 
 #[inline(always)]

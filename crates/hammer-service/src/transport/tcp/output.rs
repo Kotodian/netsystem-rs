@@ -52,7 +52,7 @@ pub fn register_tcp_output(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<N
 impl Node for TcpOutputNode {
     #[inline(always)]
     fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
-        tcp_output_node_process_frame(runtime, frame, self.next)
+        tcp_output_node_process_frame(runtime, frame)
     }
 
     #[inline]
@@ -86,54 +86,26 @@ fn tcp_output_node_process(
     _: NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> NodeResult {
-    let current = match runtime.current_node() {
-        Some(node) => node,
-        None => return NodeResult::drop(),
-    };
-    let next = [
-        match runtime
-            .nodes()
-            .node_next_slot(current, TcpOutputNext::Drop as usize)
-        {
-            Ok(slot) => slot,
-            Err(_) => return NodeResult::drop(),
-        },
-        match runtime
-            .nodes()
-            .node_next_slot(current, TcpOutputNext::Lookup as usize)
-        {
-            Ok(slot) => slot,
-            Err(_) => return NodeResult::drop(),
-        },
-    ];
-    tcp_output_node_process_frame(runtime, frame, next)
+    tcp_output_node_process_frame(runtime, frame)
 }
 
-fn tcp_output_node_process_frame(
-    runtime: &DataPlaneRuntime,
-    frame: &mut BufferFrame,
-    next: [NodeId; TcpOutputNext::COUNT],
-) -> NodeResult {
-    let lookup = next[TcpOutputNext::Lookup as usize];
-    let drop = next[TcpOutputNext::Drop as usize];
+fn tcp_output_node_process_frame(runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
     hammer_runtime::process_frame!(runtime, frame, |index| {
-        tcp_output_next_for_index(runtime, index, lookup, drop).unwrap_or(drop)
+        tcp_output_next_for_index(runtime, index).unwrap_or(TcpOutputNext::Drop)
     })
 }
 
 fn tcp_output_next_for_index(
     runtime: &DataPlaneRuntime,
     index: Index,
-    lookup: NodeId,
-    drop: NodeId,
-) -> CoreResult<NodeId> {
+) -> CoreResult<TcpOutputNext> {
     let buffer = runtime.get_buffer_mut(index)?;
     let header = buffer.current();
     if tcp_header(header).is_err() {
         let _ = runtime.record_current_node_error(TcpOutputError::NoTcpHeader.code());
-        return Ok(drop);
+        return Ok(TcpOutputNext::Drop);
     }
-    Ok(lookup)
+    Ok(TcpOutputNext::Lookup)
 }
 
 #[inline]

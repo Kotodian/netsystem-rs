@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwap;
 use hammer_core::data_plane::{
-    BufferFrame, Index, BufferPacketCursor, NodeId, NodeNextStorage,
+    BufferFrame, Index, BufferPacketCursor, NodeId, NodeNext,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::IcmpHeader;
@@ -22,8 +22,8 @@ use crate::net::{DpoType, FibLookupResult, FibTableHandle, NetworkOpaque};
 
 use super::{IpInputError, IpInputTarget, IpProtocol, IpVersion, ParsedIpPacket, ip_header};
 use crate::trace::codec::{
-    TraceDecodeCursor, put_node, put_option_ip_protocol, put_option_ip_version, put_option_u16,
-    put_u8, put_usize,
+    TraceDecodeCursor, put_option_ip_protocol, put_option_ip_version, put_option_u16, put_u8,
+    put_u16, put_usize,
 };
 
 const IP_PROTOCOL_ICMP: u8 = 1;
@@ -72,7 +72,7 @@ pub struct IpLocalTrace {
     pub protocol: Option<IpProtocol>,
     pub transport_header_len: usize,
     pub error: Option<u16>,
-    pub next: NodeId,
+    pub next: u16,
 }
 
 impl IpLocalTrace {
@@ -89,7 +89,7 @@ impl IpLocalTrace {
             protocol: cursor.read_option_ip_protocol()?,
             transport_header_len: cursor.read_usize()?,
             error: cursor.read_option_u16()?,
-            next: cursor.read_node()?,
+            next: cursor.read_u16()?,
         };
         cursor.is_empty().then_some(trace)
     }
@@ -108,7 +108,7 @@ impl PacketTrace for IpLocalTrace {
         put_option_ip_protocol(out, self.protocol);
         put_usize(out, self.transport_header_len);
         put_option_u16(out, self.error);
-        put_node(out, self.next);
+        put_u16(out, self.next);
     }
 }
 
@@ -169,11 +169,15 @@ impl IpLocalControlPlane {
         IpReceiveNode::new(IpLocalStateHandle::new(Arc::clone(&self.inner)))
     }
 
+    /// Publish a consumer-local next slot for `protocol`.
+    ///
+    /// Control registers the target via `add_node_next_slot` on the IpLocal
+    /// consumer, then stores only the returned `u16` in the snapshot.
     #[inline]
-    pub fn register_protocol(&self, protocol: u8, node: NodeId) -> CoreResult<()> {
+    pub fn register_protocol(&self, protocol: u8, slot: u16) -> CoreResult<()> {
         self.inner.rcu(|current| {
             let mut next = IpLocalState::clone(current);
-            next.protocol_nexts[protocol as usize] = Some(node);
+            next.protocol_nexts[protocol as usize] = Some(slot);
             next
         });
         Ok(())
@@ -201,7 +205,7 @@ impl IpLocalControlPlane {
 
 #[derive(Debug, Clone)]
 struct IpLocalState {
-    protocol_nexts: Box<[Option<NodeId>; 256]>,
+    protocol_nexts: Box<[Option<u16>; 256]>,
     source_check: IpLocalSourceCheck,
 }
 
@@ -215,48 +219,24 @@ impl IpLocalState {
     }
 
     #[inline(always)]
-    fn protocol_next(&self, next: &[NodeId; IpLocalNext::COUNT], protocol: IpProtocol) -> NodeId {
-        NodeNextStorage::next(self, IpLocalNextKey::Protocol { next, protocol })
+    fn protocol_next_slot(&self, protocol: IpProtocol) -> u16 {
+        self.protocol_nexts[ip_protocol_number(protocol) as usize]
+            .unwrap_or_else(|| default_protocol_slot(protocol))
     }
 
     #[inline(always)]
-    fn punt_next(&self, next: &[NodeId; IpLocalNext::COUNT]) -> NodeId {
-        NodeNextStorage::next(self, IpLocalNextKey::Punt(next))
+    fn punt_slot(&self) -> u16 {
+        NodeNext::slot(IpLocalNext::Punt)
     }
 
     #[inline(always)]
-    fn drop_next(&self, next: &[NodeId; IpLocalNext::COUNT]) -> NodeId {
-        NodeNextStorage::next(self, IpLocalNextKey::Drop(next))
+    fn drop_slot(&self) -> u16 {
+        NodeNext::slot(IpLocalNext::Drop)
     }
 
     #[inline(always)]
-    fn reassembly_next(&self, next: &[NodeId; IpLocalNext::COUNT]) -> NodeId {
-        NodeNextStorage::next(self, IpLocalNextKey::Reassembly(next))
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum IpLocalNextKey<'a> {
-    Drop(&'a [NodeId; IpLocalNext::COUNT]),
-    Punt(&'a [NodeId; IpLocalNext::COUNT]),
-    Reassembly(&'a [NodeId; IpLocalNext::COUNT]),
-    Protocol {
-        next: &'a [NodeId; IpLocalNext::COUNT],
-        protocol: IpProtocol,
-    },
-}
-
-impl NodeNextStorage<IpLocalNextKey<'_>> for IpLocalState {
-    #[inline(always)]
-    fn next(&self, key: IpLocalNextKey<'_>) -> NodeId {
-        match key {
-            IpLocalNextKey::Drop(next) => next[IpLocalNext::Drop.slot()],
-            IpLocalNextKey::Punt(next) => next[IpLocalNext::Punt.slot()],
-            IpLocalNextKey::Reassembly(next) => next[IpLocalNext::Reassembly.slot()],
-            IpLocalNextKey::Protocol { next, protocol } => self.protocol_nexts
-                [ip_protocol_number(protocol) as usize]
-                .unwrap_or_else(|| default_protocol_next(next, protocol)),
-        }
+    fn reassembly_slot(&self) -> u16 {
+        NodeNext::slot(IpLocalNext::Reassembly)
     }
 }
 
@@ -296,15 +276,10 @@ impl Node for IpLocalNode {
     fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
         let state = self.state.load();
         let feature_arc = self.feature_arc.as_ref().map(|arc| arc.start_handle());
-        let next = match Self::runtime_nexts(runtime) {
-            Ok(next) => next,
-            Err(_) => return NodeResult::drop(),
-        };
         process_frame(
             runtime,
             frame,
             &state,
-            next,
             LocalStage::Head,
             feature_arc.as_ref(),
         )
@@ -333,15 +308,10 @@ impl Node for IpReceiveNode {
     fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
         let state = self.state.load();
         let feature_arc = self.feature_arc.as_ref().map(|arc| arc.start_handle());
-        let next = match Self::runtime_nexts(runtime) {
-            Ok(next) => next,
-            Err(_) => return NodeResult::drop(),
-        };
         process_frame(
             runtime,
             frame,
             &state,
-            next,
             LocalStage::Receive,
             feature_arc.as_ref(),
         )
@@ -433,16 +403,11 @@ fn ip_local_process(
         Err(_) => return NodeResult::drop(),
     };
     let snapshot = state.state.load();
-    let next = match IpLocalNode::runtime_nexts(runtime) {
-        Ok(next) => next,
-        Err(_) => return NodeResult::drop(),
-    };
     let feature_arc = state.feature_arc.as_ref();
     process_frame(
         runtime,
         frame,
         &snapshot,
-        next,
         LocalStage::Head,
         feature_arc,
     )
@@ -458,16 +423,11 @@ fn ip_receive_process(
         Err(_) => return NodeResult::drop(),
     };
     let snapshot = state.state.load();
-    let next = match IpReceiveNode::runtime_nexts(runtime) {
-        Ok(next) => next,
-        Err(_) => return NodeResult::drop(),
-    };
     let feature_arc = state.feature_arc.as_ref();
     process_frame(
         runtime,
         frame,
         &snapshot,
-        next,
         LocalStage::Receive,
         feature_arc,
     )
@@ -499,14 +459,13 @@ fn process_frame(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
     state: &IpLocalState,
-    next: [NodeId; IpLocalNext::COUNT],
     stage: LocalStage,
     feature_arc: Option<&FeatureArcStartHandle>,
 ) -> NodeResult {
     hammer_runtime::process_frame!(runtime, frame, |index| {
-        match process_index(runtime, index, state, &next, stage, feature_arc) {
-            Ok(node) => node,
-            Err(_) => state.drop_next(&next),
+        match process_index(runtime, index, state, stage, feature_arc) {
+            Ok(slot) => slot,
+            Err(_) => state.drop_slot(),
         }
     })
 }
@@ -516,10 +475,9 @@ fn process_index(
     runtime: &DataPlaneRuntime,
     index: Index,
     state: &IpLocalState,
-    next: &[NodeId; IpLocalNext::COUNT],
     stage: LocalStage,
     feature_arc: Option<&FeatureArcStartHandle>,
-) -> CoreResult<NodeId> {
+) -> CoreResult<u16> {
     let buffer = runtime.get_buffer(index)?;
     let current = buffer.current();
     let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
@@ -528,7 +486,7 @@ fn process_index(
         Err(_) => {
             drop(buffer);
             set_index_node_error_code(runtime, index, IpLocalError::BadLength.code())?;
-            let resolved = state.drop_next(next);
+            let resolved = state.drop_slot();
             let _ = add_packet_trace!(
                 runtime,
                 index,
@@ -549,7 +507,7 @@ fn process_index(
             let error = error_for_input(parsed.input_error).code();
             drop(buffer);
             set_index_node_error_code(runtime, index, error)?;
-            let resolved = state.drop_next(next);
+            let resolved = state.drop_slot();
             let _ = add_packet_trace!(
                 runtime,
                 index,
@@ -567,7 +525,7 @@ fn process_index(
         IpInputTarget::Reassembly => {
             drop(buffer);
             refresh_basic_metadata(runtime, index, &parsed, None)?;
-            let resolved = state.reassembly_next(next);
+            let resolved = state.reassembly_slot();
             let _ = add_packet_trace!(
                 runtime,
                 index,
@@ -594,7 +552,7 @@ fn process_index(
         None => {
             drop(buffer);
             set_index_node_error_code(runtime, index, IpLocalError::BadLength.code())?;
-            let resolved = state.drop_next(next);
+            let resolved = state.drop_slot();
             let _ = add_packet_trace!(
                 runtime,
                 index,
@@ -616,7 +574,7 @@ fn process_index(
         Err(error) => {
             drop(buffer);
             set_index_node_error_code(runtime, index, error.code())?;
-            let resolved = state.drop_next(next);
+            let resolved = state.drop_slot();
             let _ = add_packet_trace!(
                 runtime,
                 index,
@@ -638,7 +596,7 @@ fn process_index(
     if stage.is_head_of_feature_arc() {
         if !source_check_passes(state, &parsed) {
             set_index_node_error_code(runtime, index, IpLocalError::SourceCheckFailed.code())?;
-            let resolved = state.drop_next(next);
+            let resolved = state.drop_slot();
             let _ = add_packet_trace!(
                 runtime,
                 index,
@@ -654,26 +612,17 @@ fn process_index(
             return Ok(resolved);
         }
         if let Some(feature_arc) = feature_arc {
-            let default_next = state.protocol_next(next, parsed.protocol);
+            let default_slot = state.protocol_next_slot(parsed.protocol);
             let interface_index = {
                 let buffer = runtime.get_buffer(index)?;
                 let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
                 network.sw_if_index[0]
             };
-            let default_slot = next
-                .iter()
-                .position(|node| *node == default_next)
-                .map(|slot| slot as u16)
-                .unwrap_or(IpLocalNext::Drop.slot() as u16);
-            let resolved_slot = if interface_index == 0 {
+            let resolved = if interface_index == 0 {
                 default_slot
             } else {
                 feature_arc.start_for_interface_or(runtime, index, interface_index, default_slot)
             };
-            let resolved = runtime.nodes().node_next_slot(
-                runtime.current_node().expect("current node"),
-                usize::from(resolved_slot),
-            )?;
             let _ = add_packet_trace!(
                 runtime,
                 index,
@@ -690,16 +639,13 @@ fn process_index(
         }
     }
 
-    let resolved = state.protocol_next(next, parsed.protocol);
-    if resolved == state.punt_next(next) && matches!(parsed.protocol, IpProtocol::Other(_)) {
+    let resolved = state.protocol_next_slot(parsed.protocol);
+    let error = if resolved == state.punt_slot() && matches!(parsed.protocol, IpProtocol::Other(_)) {
         set_index_node_error_code(runtime, index, IpLocalError::UnknownProtocol.code())?;
-    }
-    let error =
-        if resolved == state.punt_next(next) && matches!(parsed.protocol, IpProtocol::Other(_)) {
-            Some(IpLocalError::UnknownProtocol.code())
-        } else {
-            None
-        };
+        Some(IpLocalError::UnknownProtocol.code())
+    } else {
+        None
+    };
     let _ = add_packet_trace!(
         runtime,
         index,
@@ -852,12 +798,12 @@ fn ip_protocol_number(protocol: IpProtocol) -> u8 {
 }
 
 #[inline(always)]
-fn default_protocol_next(next: &[NodeId; IpLocalNext::COUNT], protocol: IpProtocol) -> NodeId {
+fn default_protocol_slot(protocol: IpProtocol) -> u16 {
     match protocol {
-        IpProtocol::Tcp => next[IpLocalNext::Tcp.slot()],
-        IpProtocol::Udp => next[IpLocalNext::Udp.slot()],
-        IpProtocol::Icmpv4 | IpProtocol::Icmpv6 => next[IpLocalNext::Icmp.slot()],
-        IpProtocol::Other(_) => next[IpLocalNext::Punt.slot()],
+        IpProtocol::Tcp => NodeNext::slot(IpLocalNext::Tcp),
+        IpProtocol::Udp => NodeNext::slot(IpLocalNext::Udp),
+        IpProtocol::Icmpv4 | IpProtocol::Icmpv6 => NodeNext::slot(IpLocalNext::Icmp),
+        IpProtocol::Other(_) => NodeNext::slot(IpLocalNext::Punt),
     }
 }
 
@@ -889,48 +835,28 @@ fn l4_checksum(_packet: &[u8], parsed: &ParsedIpPacket, protocol: u8, segment: &
 
 #[cfg(test)]
 mod tests {
-    use hammer_core::data_plane::{NodeId, NodeNextStorage};
-
     use super::*;
 
     #[test]
     fn ip_local_state_returns_protocol_or_control_next() {
-        let drop = NodeId::new(1);
-        let punt = NodeId::new(2);
-        let tcp = NodeId::new(3);
-        let udp = NodeId::new(4);
-        let icmp = NodeId::new(5);
-        let reassembly = NodeId::new(6);
-        let next = IpLocalNext::nodes(drop, punt, tcp, udp, icmp, reassembly);
         let state = IpLocalState::new();
 
         assert_eq!(
-            NodeNextStorage::next(
-                &state,
-                IpLocalNextKey::Protocol {
-                    next: &next,
-                    protocol: IpProtocol::Tcp
-                }
-            ),
-            tcp
+            state.protocol_next_slot(IpProtocol::Tcp),
+            NodeNext::slot(IpLocalNext::Tcp)
         );
         assert_eq!(
-            NodeNextStorage::next(
-                &state,
-                IpLocalNextKey::Protocol {
-                    next: &next,
-                    protocol: IpProtocol::Other(99)
-                }
-            ),
-            punt
+            state.protocol_next_slot(IpProtocol::Other(99)),
+            NodeNext::slot(IpLocalNext::Punt)
         );
+        assert_eq!(state.drop_slot(), NodeNext::slot(IpLocalNext::Drop));
         assert_eq!(
-            NodeNextStorage::next(&state, IpLocalNextKey::Drop(&next)),
-            drop
+            state.reassembly_slot(),
+            NodeNext::slot(IpLocalNext::Reassembly)
         );
-        assert_eq!(
-            NodeNextStorage::next(&state, IpLocalNextKey::Reassembly(&next)),
-            reassembly
-        );
+
+        let mut custom = IpLocalState::new();
+        custom.protocol_nexts[IP_PROTOCOL_TCP as usize] = Some(42);
+        assert_eq!(custom.protocol_next_slot(IpProtocol::Tcp), 42);
     }
 }

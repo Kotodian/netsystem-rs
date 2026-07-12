@@ -22,6 +22,15 @@ const DEFAULT_SCHEDULED_FRAME_QUEUE_CAPACITY: usize = 4096;
 
 pub use next::default_prefetch_indices;
 
+/// Run packet logic for every Index in `frame`, record one typed local next
+/// decision per Index, then invoke Graph Fanout once.
+///
+/// The body must yield a value implementing [`NodeNext`] (typically a
+/// `node_next` enum variant or a current-node-local `u16` slot). It must not
+/// remove Indexes from `frame`; Fanout transfers ownership.
+///
+/// Next decisions are written into a fixed stack scratch of production frame
+/// capacity (256). No heap allocation on this path.
 #[macro_export]
 macro_rules! process_frame {
     (
@@ -30,91 +39,22 @@ macro_rules! process_frame {
         |$index:pat_param| $body:expr
         $(,)?
     ) => {{
-        let width = $runtime.preferred_frame_batch_width();
-        let mut next_nodes: [Option<::hammer_core::data_plane::NodeId>;
-            ::hammer_core::data_plane::MAX_NODE_NEXT_SLOTS] =
-            [None; ::hammer_core::data_plane::MAX_NODE_NEXT_SLOTS];
-        let mut next_frames: [Option<
-            ::hammer_core::data_plane::Frame<::hammer_core::data_plane::Next>,
-        >; ::hammer_core::data_plane::MAX_NODE_NEXT_SLOTS] = ::std::array::from_fn(|_| None);
-        let mut next_len = 0usize;
-        let mut cached_next = None;
-        let mut cached_offset = 0usize;
-        let mut enqueue_failed = false;
-
-        let _ = $frame.rewrite_indices_batched(width, |packet_index| {
-            if enqueue_failed {
-                return Ok(Some(packet_index));
-            }
+        let mut next_slots =
+            [0u16; ::hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY];
+        debug_assert!(
+            $frame.len() <= ::hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY,
+            "process_frame! input exceeds production frame capacity"
+        );
+        let mut n = 0usize;
+        for &packet_index in $frame.indices() {
             let next = {
                 let $index = packet_index;
                 $body
             };
-
-            let mut offset = None;
-            if cached_next == Some(next) && next_frames[cached_offset].is_some() {
-                offset = Some(cached_offset);
-            } else {
-                let mut scan = 0usize;
-                while scan < next_len {
-                    if next_nodes[scan] == Some(next) {
-                        offset = Some(scan);
-                        break;
-                    }
-                    scan += 1;
-                }
-            }
-
-            let offset = match offset {
-                Some(offset) => offset,
-                None => {
-                    if next_len == ::hammer_core::data_plane::MAX_NODE_NEXT_SLOTS {
-                        enqueue_failed = true;
-                        return Ok(Some(packet_index));
-                    }
-                    match $runtime.buffers().get_next_frame(next) {
-                        Ok(frame) => {
-                            let offset = next_len;
-                            next_nodes[offset] = Some(next);
-                            next_frames[offset] = Some(frame);
-                            next_len += 1;
-                            offset
-                        }
-                        Err(_) => {
-                            enqueue_failed = true;
-                            return Ok(Some(packet_index));
-                        }
-                    }
-                }
-            };
-
-            cached_next = Some(next);
-            cached_offset = offset;
-
-            match next_frames[offset].as_mut() {
-                Some(frame) => {
-                    if frame.push_index(packet_index).is_ok() {
-                        Ok(None)
-                    } else {
-                        enqueue_failed = true;
-                        Ok(Some(packet_index))
-                    }
-                }
-                None => {
-                    enqueue_failed = true;
-                    Ok(Some(packet_index))
-                }
-            }
-        });
-
-        let mut offset = 0usize;
-        while offset < next_len {
-            if let Some(frame) = next_frames[offset].take() {
-                let _ = $runtime.put_next_frame(frame);
-            }
-            offset += 1;
+            next_slots[n] = ::hammer_core::data_plane::NodeNext::slot(next);
+            n += 1;
         }
-
+        $runtime.enqueue_to_next($frame, &next_slots[..n]);
         $crate::node::NodeResult::drop()
     }};
 }

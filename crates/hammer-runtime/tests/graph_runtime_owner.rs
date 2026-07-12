@@ -73,14 +73,11 @@ fn driver_process(
 ) -> NodeResult {
     assert_eq!(data, NodeRuntimeData::empty());
     DRIVER_CALLS.fetch_add(1, Ordering::SeqCst);
-    let next = runtime
-        .current_node_next(TestNext::Internal)
-        .expect("current node next");
     process_frame!(runtime, frame, |index| {
         let current = runtime.current_node().expect("driver current node");
         runtime.try_mark_trace(current, index).expect("mark trace");
         add_packet_trace!(runtime, index, OwnerTrace(7)).expect("driver trace");
-        next
+        TestNext::Internal
     })
 }
 

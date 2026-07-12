@@ -44,6 +44,10 @@ _Avoid_: TCP input manual get/push/put, Fanout of handoff-owned indexes, worker-
 Session Queue accumulates generated indexes on the driver Frame with one local next per entry, then performs a single Graph Fanout flush at dispatch end. Existing pending output seeds the shared IO count; normal and custom IO share the remaining allowance up to 128; control processing is not charged; unserved IO remains scheduled. Transport commits before graph visibility.
 _Avoid_: per-packet get/push/put from Session Queue, Fanout before transport commit, charging control to the IO budget
 
+**Process Frame Fanout**:
+`process_frame!` only runs packet logic, records one current-node-local `NodeNext` decision per Index into fixed stack scratch of production frame capacity (256), and invokes Graph Fanout once. It does not cache target `NodeId`s, scan groups, acquire Next Frames, push Indexes, branch on capacity, put frames, or heap-allocate next scratch.
+_Avoid_: NodeId process_frame body, temporary Vec next scratch, macro-owned get/push/put, NodeId: NodeNext
+
 **Graph Fanout**:
 The sole worker-local next-frame enqueue: it groups packet ownership by selected Next Arc and makes the resulting Next Frames visible at the current Graph Node dispatch boundary. Cross-worker ownership transfer remains Handoff, not Graph Fanout.
 _Avoid_: cross-thread fanout, handoff enqueue, output router, per-node manual frame get/push/put, recoverable enqueue Result on the packet path

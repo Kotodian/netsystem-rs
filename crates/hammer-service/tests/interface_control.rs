@@ -297,9 +297,14 @@ fn interface_output_dispatches_to_registered_tx_node() {
             tun_main.clone(),
             output_device.output(),
         ));
-    let output_control = InterfaceOutputControlPlane::new();
-    output_control.register_tx(7, tx).expect("register tx node");
+    let mut output_control = InterfaceOutputControlPlane::new().with_nodes(runtime.nodes().clone());
     let output_node = runtime.nodes().register_internal(output_control.node());
+    output_control
+        .attach_consumer(output_node)
+        .expect("attach interface output");
+    let tx_slot = output_control
+        .register_tx(7, tx)
+        .expect("register tx node");
     let trace = TraceControlPlane::new(8);
     trace.publish(TracePolicy {
         enabled: true,
@@ -345,9 +350,9 @@ fn interface_output_dispatches_to_registered_tx_node() {
             .expect("interface output trace"),
         InterfaceOutputTrace {
             egress_interface: Some(7),
-            tx_node: Some(tx),
+            tx_next: Some(tx_slot),
             error: None,
-            next: Some(tx),
+            next: Some(tx_slot),
         }
     );
     assert_eq!(records[0].entries[1].node_name, Some("tun-output-driver"));
@@ -369,8 +374,11 @@ fn interface_output_drops_missing_egress_or_tx_mapping() {
         .nodes()
         .register_internal(hammer_service::data_plane::DropNode::new());
     let output_device = MemoryTunDevice::new();
-    let output_control = InterfaceOutputControlPlane::new();
+    let mut output_control = InterfaceOutputControlPlane::new().with_nodes(runtime.nodes().clone());
     let output_node = runtime.nodes().register_internal(output_control.node());
+    output_control
+        .attach_consumer(output_node)
+        .expect("attach interface output");
     let mut frame = runtime
         .buffers()
         .get_next_frame(output_node)
@@ -392,19 +400,27 @@ fn interface_output_tx_updates_run_through_configured_runtime_data_plane_barrier
         DataRuntime::new(1, "interface-output-barrier-test", 512 * 1024, 2).expect("data runtime");
     let barrier = data_runtime.data_plane_barrier();
     let runtime = test_runtime(2048, 8, 4);
+    let _ = runtime
+        .nodes()
+        .register_internal(hammer_service::data_plane::DropNode::new());
     let device = MemoryTunDevice::new();
     let tx = runtime
         .nodes()
         .register_driver(TunOutputDriverNode::new(device.output()));
-    let output_control =
-        InterfaceOutputControlPlane::new().with_data_plane_barrier(barrier.clone());
+    let mut output_control = InterfaceOutputControlPlane::new()
+        .with_data_plane_barrier(barrier.clone())
+        .with_nodes(runtime.nodes().clone());
+    let output_node = runtime.nodes().register_internal(output_control.node());
+    output_control
+        .attach_consumer(output_node)
+        .expect("attach interface output");
     let output_handle = output_control.handle();
 
-    output_control.register_tx(7, tx).expect("register tx");
-    assert_eq!(output_handle.tx_node(7), Some(tx));
+    let tx_slot = output_control.register_tx(7, tx).expect("register tx");
+    assert_eq!(output_handle.tx_slot(7), Some(tx_slot));
     output_control.unregister_tx(7).expect("unregister tx");
 
-    assert_eq!(output_handle.tx_node(7), None);
+    assert_eq!(output_handle.tx_slot(7), None);
     data_runtime.shutdown_timeout(Duration::from_secs(1));
 }
 

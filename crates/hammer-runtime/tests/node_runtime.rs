@@ -205,11 +205,7 @@ fn forward_default_process(
         Err(_) => return NodeResult::drop(),
     };
     NODE_CALLS_BY_WORD[word].fetch_add(1, Ordering::SeqCst);
-    let next = match runtime.current_node_next(TestNext::Default) {
-        Ok(n) => n,
-        Err(_) => return NodeResult::drop(),
-    };
-    process_frame!(runtime, frame, |_| next)
+    process_frame!(runtime, frame, |_| TestNext::Default)
 }
 
 fn trace_formatter(bytes: &[u8]) -> String {
