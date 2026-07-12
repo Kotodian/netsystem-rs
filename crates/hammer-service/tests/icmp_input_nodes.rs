@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use hammer_core::data_plane::{
     BufferFrame, BufferNodeError, BufferPacketCursor, DataPlaneBufferConfig,
 };
-use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::error::CoreResult;
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 use hammer_infra::vec::Vec as InfraVec;
 use hammer_runtime::{
@@ -142,11 +142,12 @@ fn icmp_input_dispatches_ipv4_echo_request_by_type() {
     let punt = runtime
         .nodes()
         .register_internal(CaptureNode::new(Arc::clone(&punt_state)));
-    let control = IcmpInputControlPlane::new(punt);
-    control
+    let mut control = IcmpInputControlPlane::new(punt).with_nodes(runtime.nodes().clone());
+    let icmp_input = runtime.nodes().register_internal(control.node());
+    control.attach_consumer(icmp_input).expect("attach icmp input");
+    let echo_slot = control
         .register_type(IpVersion::V4, 8, echo)
         .expect("register echo request");
-    let icmp_input = runtime.nodes().register_internal(control.node());
     let trace_control = TraceControlPlane::new(4);
     trace_control.publish(TracePolicy {
         enabled: true,
@@ -180,7 +181,7 @@ fn icmp_input_dispatches_ipv4_echo_request_by_type() {
     assert_eq!(trace.icmp_type, Some(8));
     assert_eq!(trace.code, Some(0));
     assert_eq!(trace.error, None);
-    assert_eq!(trace.next, echo);
+    assert_eq!(trace.next, echo_slot);
 }
 
 #[test]
@@ -194,11 +195,12 @@ fn icmp_input_dispatches_ipv6_echo_request_by_type() {
     let punt = runtime
         .nodes()
         .register_internal(CaptureNode::new(Arc::clone(&punt_state)));
-    let control = IcmpInputControlPlane::new(punt);
+    let mut control = IcmpInputControlPlane::new(punt).with_nodes(runtime.nodes().clone());
+    let icmp_input = runtime.nodes().register_internal(control.node());
+    control.attach_consumer(icmp_input).expect("attach icmp input");
     control
         .register_type(IpVersion::V6, 128, echo)
         .expect("register echo request");
-    let icmp_input = runtime.nodes().register_internal(control.node());
     let packet = ipv6_icmp_packet(128, 0, b"echo6");
     let mut frame = runtime
         .buffers()
@@ -221,8 +223,9 @@ fn icmp_input_sends_unknown_ipv4_type_to_default_next() {
     let punt = runtime
         .nodes()
         .register_internal(CaptureNode::new(Arc::clone(&punt_state)));
-    let control = IcmpInputControlPlane::new(punt);
+    let mut control = IcmpInputControlPlane::new(punt).with_nodes(runtime.nodes().clone());
     let icmp_input = runtime.nodes().register_internal(control.node());
+    control.attach_consumer(icmp_input).expect("attach icmp input");
     let packet = ipv4_icmp_packet(13, 0, b"timestamp");
     let mut frame = runtime
         .buffers()
@@ -244,6 +247,47 @@ fn icmp_input_sends_unknown_ipv4_type_to_default_next() {
 }
 
 #[test]
+fn icmp_input_registers_more_than_sixteen_type_nexts() {
+    let runtime = test_runtime_configured(2048, 64, 8);
+    let punt_state = Arc::new(Mutex::new(CaptureState::default()));
+    let punt = runtime
+        .nodes()
+        .register_internal(CaptureNode::new(Arc::clone(&punt_state)));
+    let mut control = IcmpInputControlPlane::new(punt).with_nodes(runtime.nodes().clone());
+    let icmp_input = runtime.nodes().register_internal(control.node());
+    control.attach_consumer(icmp_input).expect("attach icmp input");
+
+    let mut last_slot = 0u16;
+    let mut last_state = Arc::new(Mutex::new(CaptureState::default()));
+    let mut last_type = 0u8;
+    for icmp_type in 1..=20u8 {
+        let state = Arc::new(Mutex::new(CaptureState::default()));
+        let target = runtime
+            .nodes()
+            .register_internal(CaptureNode::new(Arc::clone(&state)));
+        let slot = control
+            .register_type(IpVersion::V4, icmp_type, target)
+            .expect("register icmp type");
+        assert!(slot > last_slot || icmp_type == 1);
+        last_slot = slot;
+        last_state = state;
+        last_type = icmp_type;
+    }
+    assert!(last_slot >= 16);
+
+    let packet = ipv4_icmp_packet(last_type, 0, b"high-slot");
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(icmp_input)
+        .expect("alloc frame");
+    push_packet(&runtime, &mut frame, &packet);
+    runtime.put_next_frame(frame).expect("schedule");
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(last_state.lock().unwrap().packets, vec![packet]);
+    assert!(punt_state.lock().unwrap().packets.is_empty());
+}
+
+#[test]
 fn icmp_input_rejects_ipv6_echo_request_with_nonzero_code() {
     let runtime = test_runtime_configured(2048, 16, 8);
     let echo_state = Arc::new(Mutex::new(CaptureState::default()));
@@ -254,11 +298,12 @@ fn icmp_input_rejects_ipv6_echo_request_with_nonzero_code() {
     let punt = runtime
         .nodes()
         .register_internal(CaptureNode::new(Arc::clone(&punt_state)));
-    let control = IcmpInputControlPlane::new(punt);
+    let mut control = IcmpInputControlPlane::new(punt).with_nodes(runtime.nodes().clone());
+    let icmp_input = runtime.nodes().register_internal(control.node());
+    control.attach_consumer(icmp_input).expect("attach icmp input");
     control
         .register_type(IpVersion::V6, 128, echo)
         .expect("register echo request");
-    let icmp_input = runtime.nodes().register_internal(control.node());
     let packet = ipv6_icmp_packet(128, 1, b"bad-code");
     let mut frame = runtime
         .buffers()

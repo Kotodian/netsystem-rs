@@ -21,7 +21,7 @@ use crate::data_plane::set_index_node_error_code;
 use crate::net::NetworkOpaque;
 use crate::trace::codec::{
     TraceDecodeCursor, put_node, put_option_icmp_error_family, put_option_ip_version,
-    put_option_u16, put_option_u32, put_option_usize, put_u8,
+    put_option_u16, put_option_u32, put_option_usize, put_u8, put_u16,
 };
 
 use super::{IpInputError, IpProtocol, IpVersion, ip_header};
@@ -79,7 +79,7 @@ pub struct IcmpInputTrace {
     pub icmp_type: Option<u8>,
     pub code: Option<u8>,
     pub error: Option<u16>,
-    pub next: NodeId,
+    pub next: u16,
 }
 
 impl IcmpInputTrace {
@@ -101,7 +101,7 @@ impl IcmpInputTrace {
             icmp_type,
             code,
             error: cursor.read_option_u16()?,
-            next: cursor.read_node()?,
+            next: cursor.read_u16()?,
         };
         cursor.is_empty().then_some(trace)
     }
@@ -125,7 +125,7 @@ impl PacketTrace for IcmpInputTrace {
             None => crate::trace::codec::put_bool(out, false),
         }
         put_option_u16(out, self.error);
-        put_node(out, self.next);
+        put_u16(out, self.next);
     }
 }
 
@@ -356,6 +356,10 @@ fn version_for_family(family: IcmpErrorFamily) -> IpVersion {
 
 pub struct IcmpInputControlPlane {
     inner: Arc<ArcSwap<IcmpInputSnapshot>>,
+    nodes: Option<hammer_runtime::node::NodeRuntime>,
+    consumer: Option<NodeId>,
+    ip4_default_node: NodeId,
+    ip6_default_node: NodeId,
 }
 
 impl IcmpInputControlPlane {
@@ -368,10 +372,38 @@ impl IcmpInputControlPlane {
     pub fn with_defaults(ip4_default_next: NodeId, ip6_default_next: NodeId) -> Self {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(IcmpInputSnapshot::new(
-                ip4_default_next,
-                ip6_default_next,
+                u16::MAX,
+                u16::MAX,
             ))),
+            nodes: None,
+            consumer: None,
+            ip4_default_node: ip4_default_next,
+            ip6_default_node: ip6_default_next,
         }
+    }
+
+    #[inline]
+    pub fn with_nodes(mut self, nodes: hammer_runtime::node::NodeRuntime) -> Self {
+        self.nodes = Some(nodes);
+        self
+    }
+
+    /// Wire default nexts into the ICMP-input local-next table and publish slots.
+    pub fn attach_consumer(&mut self, consumer: NodeId) -> CoreResult<()> {
+        let nodes = self
+            .nodes
+            .as_ref()
+            .ok_or_else(|| CoreError::internal("icmp input attach requires node runtime"))?;
+        let ip4_slot = nodes.add_node_next_slot(consumer, self.ip4_default_node)?;
+        let ip6_slot = if self.ip6_default_node == self.ip4_default_node {
+            ip4_slot
+        } else {
+            nodes.add_node_next_slot(consumer, self.ip6_default_node)?
+        };
+        self.consumer = Some(consumer);
+        self.inner
+            .store(Arc::new(IcmpInputSnapshot::new(ip4_slot, ip6_slot)));
+        Ok(())
     }
 
     #[inline]
@@ -380,13 +412,26 @@ impl IcmpInputControlPlane {
     }
 
     #[inline]
-    pub fn register_type(&self, version: IpVersion, icmp_type: u8, node: NodeId) -> CoreResult<()> {
+    pub fn register_type(
+        &self,
+        version: IpVersion,
+        icmp_type: u8,
+        node: NodeId,
+    ) -> CoreResult<u16> {
+        let consumer = self.consumer.ok_or_else(|| {
+            CoreError::internal("icmp input register_type requires attach_consumer")
+        })?;
+        let nodes = self
+            .nodes
+            .as_ref()
+            .ok_or_else(|| CoreError::internal("icmp input register_type requires node runtime"))?;
+        let slot = nodes.add_node_next_slot(consumer, node)?;
         self.inner.rcu(|current| {
             let mut next = IcmpInputSnapshot::clone(current);
-            next.register_type(version, icmp_type, node);
+            next.register_type(version, icmp_type, slot);
             next
         });
-        Ok(())
+        Ok(slot)
     }
 
     #[inline]
@@ -408,7 +453,7 @@ struct IcmpInputSnapshot {
 
 impl IcmpInputSnapshot {
     #[inline]
-    fn new(ip4_default_next: NodeId, ip6_default_next: NodeId) -> Self {
+    fn new(ip4_default_next: u16, ip6_default_next: u16) -> Self {
         let mut ip4 = IcmpInputTable::new(ip4_default_next);
         ip4.set_spec(ICMP4_ECHO_REPLY, IcmpTypeSpec::echo());
         ip4.set_spec(ICMP4_ECHO_REQUEST, IcmpTypeSpec::echo());
@@ -421,13 +466,19 @@ impl IcmpInputSnapshot {
     }
 
     #[inline(always)]
-    fn default_next(&self, version: IpVersion) -> NodeId {
+    fn default_next(&self, version: IpVersion) -> u16 {
         self.table(version).default_next()
     }
 
     #[inline(always)]
-    fn next_for_type(&self, version: IpVersion, icmp_type: u8) -> Option<NodeId> {
+    fn next_for_type(&self, version: IpVersion, icmp_type: u8) -> Option<u16> {
         self.table(version).next_for_type(icmp_type)
+    }
+
+    #[inline(always)]
+    fn slot_for(&self, version: IpVersion, icmp_type: u8) -> u16 {
+        self.next_for_type(version, icmp_type)
+            .unwrap_or_else(|| self.default_next(version))
     }
 
     #[inline(always)]
@@ -436,8 +487,8 @@ impl IcmpInputSnapshot {
     }
 
     #[inline(always)]
-    fn register_type(&mut self, version: IpVersion, icmp_type: u8, node: NodeId) {
-        self.table_mut(version).register_type(icmp_type, node);
+    fn register_type(&mut self, version: IpVersion, icmp_type: u8, next: u16) {
+        self.table_mut(version).register_type(icmp_type, next);
     }
 
     #[inline(always)]
@@ -462,29 +513,16 @@ impl IcmpInputSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct IcmpInputKey {
-    version: IpVersion,
-    icmp_type: u8,
-}
-
-impl NodeNextStorage<IcmpInputKey> for IcmpInputSnapshot {
-    #[inline(always)]
-    fn next(&self, key: IcmpInputKey) -> NodeId {
-        self.next_for_type(key.version, key.icmp_type)
-            .unwrap_or_else(|| self.default_next(key.version))
-    }
-}
 
 #[derive(Debug, Clone)]
 struct IcmpInputTable {
-    default_next: NodeId,
+    default_next: u16,
     entries: [IcmpInputEntry; 256],
 }
 
 impl IcmpInputTable {
     #[inline]
-    fn new(default_next: NodeId) -> Self {
+    fn new(default_next: u16) -> Self {
         Self {
             default_next,
             entries: [IcmpInputEntry::new(default_next); 256],
@@ -492,7 +530,7 @@ impl IcmpInputTable {
     }
 
     #[inline(always)]
-    fn default_next(&self) -> NodeId {
+    fn default_next(&self) -> u16 {
         self.default_next
     }
 
@@ -502,9 +540,9 @@ impl IcmpInputTable {
     }
 
     #[inline(always)]
-    fn register_type(&mut self, icmp_type: u8, node: NodeId) {
+    fn register_type(&mut self, icmp_type: u8, next: u16) {
         let entry = &mut self.entries[icmp_type as usize];
-        entry.next = node;
+        entry.next = next;
         entry.registered = true;
     }
 
@@ -516,7 +554,7 @@ impl IcmpInputTable {
     }
 
     #[inline(always)]
-    fn next_for_type(&self, icmp_type: u8) -> Option<NodeId> {
+    fn next_for_type(&self, icmp_type: u8) -> Option<u16> {
         let entry = self.entries[icmp_type as usize];
         entry.registered.then_some(entry.next)
     }
@@ -529,14 +567,14 @@ impl IcmpInputTable {
 
 #[derive(Debug, Clone, Copy)]
 struct IcmpInputEntry {
-    next: NodeId,
+    next: u16,
     spec: IcmpTypeSpec,
     registered: bool,
 }
 
 impl IcmpInputEntry {
     #[inline]
-    fn new(default_next: NodeId) -> Self {
+    fn new(default_next: u16) -> Self {
         Self {
             next: default_next,
             spec: IcmpTypeSpec::default(),
@@ -835,12 +873,17 @@ fn icmp_input_process_frame(
     frame: &mut BufferFrame,
     snapshot: &IcmpInputSnapshot,
 ) -> NodeResult {
-    hammer_runtime::process_frame!(runtime, frame, |index| {
-        match next_node_for_index(runtime, index, snapshot) {
-            Ok(node) => node,
-            Err(_) => snapshot.default_next(IpVersion::V4),
-        }
-    })
+    let drop_slot = snapshot.default_next(IpVersion::V4);
+    let mut nexts = hammer_infra::vec::Vec::with_capacity(frame.len());
+    for index in frame.iter_indices() {
+        let slot = match next_slot_for_index(runtime, *index, snapshot) {
+            Ok(slot) => slot,
+            Err(_) => drop_slot,
+        };
+        nexts.push(slot);
+    }
+    runtime.enqueue_to_next(frame, nexts.as_slice());
+    NodeResult::drop()
 }
 
 fn icmp_echo_request_process_frame(
@@ -871,11 +914,11 @@ fn icmp_error_process_frame(
 }
 
 #[inline(always)]
-fn next_node_for_index(
+fn next_slot_for_index(
     runtime: &DataPlaneRuntime,
     index: Index,
     snapshot: &IcmpInputSnapshot,
-) -> CoreResult<NodeId> {
+) -> CoreResult<u16> {
     let buffer = runtime.get_buffer(index)?;
     let current = buffer.current();
     let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
@@ -998,12 +1041,11 @@ fn next_node_for_index(
 
     let icmp_type = header.icmp_type();
     let code = header.code();
-    let key = IcmpInputKey { version, icmp_type };
     if snapshot.next_for_type(version, icmp_type).is_none() {
         drop(buffer);
         let error = IcmpInputError::UnknownType.code();
         set_index_node_error_code(runtime, index, error)?;
-        let next = NodeNextStorage::next(snapshot, key);
+        let next = snapshot.slot_for(version, icmp_type);
         let _ = add_packet_trace!(
             runtime,
             index,
@@ -1076,7 +1118,7 @@ fn next_node_for_index(
 
     drop(buffer);
     runtime.get_buffer_mut(index)?.clear_node_error();
-    let next = NodeNextStorage::next(snapshot, key);
+    let next = snapshot.slot_for(version, icmp_type);
     let _ = add_packet_trace!(
         runtime,
         index,
@@ -1293,37 +1335,20 @@ fn refresh_generated_icmp_metadata(
 
 #[cfg(test)]
 mod tests {
-    use hammer_core::data_plane::{NodeId, NodeNextStorage};
-
     use super::*;
 
     #[test]
     fn icmp_snapshot_storage_returns_registered_or_default_next() {
-        let default = NodeId::new(1);
-        let echo = NodeId::new(2);
+        let default: u16 = 1;
+        let echo: u16 = 2;
         let mut snapshot = IcmpInputSnapshot::new(default, default);
 
         snapshot.register_type(IpVersion::V4, ICMP4_ECHO_REQUEST, echo);
 
         assert_eq!(
-            NodeNextStorage::next(
-                &snapshot,
-                IcmpInputKey {
-                    version: IpVersion::V4,
-                    icmp_type: ICMP4_ECHO_REQUEST,
-                },
-            ),
+            snapshot.slot_for(IpVersion::V4, ICMP4_ECHO_REQUEST),
             echo
         );
-        assert_eq!(
-            NodeNextStorage::next(
-                &snapshot,
-                IcmpInputKey {
-                    version: IpVersion::V4,
-                    icmp_type: 13,
-                },
-            ),
-            default
-        );
+        assert_eq!(snapshot.slot_for(IpVersion::V4, 13), default);
     }
 }

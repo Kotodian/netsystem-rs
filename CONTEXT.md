@@ -32,6 +32,10 @@ _Avoid_: FIB-stored NodeId, adjacency NodeId hot path, forwarding-owned frame ge
 An ordered per-interface chain of feature Graph Nodes. Control may retain target node identities while compiling under a barrier; each published transition stores only a predecessor-local `u16` and the next configuration index. Packet traversal advances configuration progress once per feature, preserves the caller default when no feature applies, and never resolves target node identities. Feature config progress is distinct from Handoff continuation state.
 _Avoid_: packet-path NodeId feature next, shared handoff/config field, dual NodeId/u16 feature API
 
+**Protocol Dispatch Local Next**:
+ICMP type and UDP port registries publish consumer-local `u16` next slots. Control may accept target `NodeId` at registration; the published snapshot and packet path carry only local slots and enqueue through Graph Fanout.
+_Avoid_: packet-path NodeId protocol dispatch, NodeNextStorage for ICMP/UDP input registries
+
 **Graph Fanout**:
 The sole worker-local next-frame enqueue: it groups packet ownership by selected Next Arc and makes the resulting Next Frames visible at the current Graph Node dispatch boundary. Cross-worker ownership transfer remains Handoff, not Graph Fanout.
 _Avoid_: cross-thread fanout, handoff enqueue, output router, per-node manual frame get/push/put, recoverable enqueue Result on the packet path

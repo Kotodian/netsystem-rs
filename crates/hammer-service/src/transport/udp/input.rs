@@ -1,22 +1,23 @@
 use std::mem::{size_of, transmute};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwap;
-use hammer_core::data_plane::{BufferFrame, Index, NodeId, NodeNextStorage, SecondaryOpaque};
-use hammer_core::error::CoreResult;
+use hammer_core::data_plane::{BufferFrame, Index, NodeId, SecondaryOpaque};
+use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
 use hammer_core::protocol::transport::UdpHeader;
 use hammer_core::protocol::wire::read_header;
 use hammer_infra::boxed::Slice;
 use hammer_runtime::{
-    DataPlaneRuntime, Node, NodeResult, PacketTrace, TraceFormatter, add_packet_trace,
+    DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
+    TraceFormatter, add_packet_trace,
 };
 
 use crate::data_plane::set_index_node_error_code;
 use crate::net::NetworkOpaque;
 use crate::net::ip::{IpProtocol, IpVersion};
 use crate::trace::codec::{
-    TraceDecodeCursor, put_node, put_option_ip_protocol, put_option_ip_version, put_option_u16,
+    TraceDecodeCursor, put_option_ip_protocol, put_option_ip_version, put_option_u16, put_u16,
 };
 
 const UDP_HEADER_LEN: usize = 8;
@@ -59,7 +60,7 @@ pub struct UdpInputTrace {
     pub source_port: Option<u16>,
     pub destination_port: Option<u16>,
     pub error: Option<u16>,
-    pub next: NodeId,
+    pub next: u16,
 }
 
 impl UdpInputTrace {
@@ -71,7 +72,7 @@ impl UdpInputTrace {
             source_port: cursor.read_option_u16()?,
             destination_port: cursor.read_option_u16()?,
             error: cursor.read_option_u16()?,
-            next: cursor.read_node()?,
+            next: cursor.read_u16()?,
         };
         cursor.is_empty().then_some(trace)
     }
@@ -84,7 +85,7 @@ impl PacketTrace for UdpInputTrace {
         put_option_u16(out, self.source_port);
         put_option_u16(out, self.destination_port);
         put_option_u16(out, self.error);
-        put_node(out, self.next);
+        put_u16(out, self.next);
     }
 }
 
@@ -98,6 +99,8 @@ fn format_udp_input_trace(bytes: &[u8]) -> String {
 pub struct UdpInputControlPlane {
     inner: Arc<ArcSwap<UdpInputSnapshot>>,
     next: [NodeId; UdpInputNext::COUNT],
+    nodes: Option<hammer_runtime::node::NodeRuntime>,
+    consumer: Option<NodeId>,
 }
 
 impl UdpInputControlPlane {
@@ -106,17 +109,46 @@ impl UdpInputControlPlane {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(UdpInputSnapshot::new())),
             next: nexts,
+            nodes: None,
+            consumer: None,
         }
     }
 
     #[inline]
-    pub fn register_port(&self, port: u16, node: NodeId) -> CoreResult<()> {
+    pub fn with_nodes(mut self, nodes: hammer_runtime::node::NodeRuntime) -> Self {
+        self.nodes = Some(nodes);
+        self
+    }
+
+    pub fn attach_consumer(&mut self, consumer: NodeId) -> CoreResult<()> {
+        if self.nodes.is_none() {
+            return Err(CoreError::internal(
+                "udp input attach requires node runtime",
+            ));
+        }
+        self.consumer = Some(consumer);
+        Ok(())
+    }
+
+    #[inline]
+    pub fn register_port(&self, port: u16, node: NodeId) -> CoreResult<u16> {
+        let consumer = self.consumer.ok_or_else(|| {
+            CoreError::internal(
+                "udp input register_port requires attach_consumer",
+            )
+        })?;
+        let nodes = self.nodes.as_ref().ok_or_else(|| {
+            CoreError::internal(
+                "udp input register_port requires node runtime",
+            )
+        })?;
+        let slot = nodes.add_node_next_slot(consumer, node)?;
         self.inner.rcu(|current| {
             let mut next = UdpInputSnapshot::clone(current);
-            next.register_port(port, node);
+            next.register_port(port, slot);
             next
         });
-        Ok(())
+        Ok(slot)
     }
 
     #[inline]
@@ -162,8 +194,8 @@ impl UdpInputSnapshot {
     }
 
     #[inline(always)]
-    fn register_port(&mut self, port: u16, node: NodeId) {
-        self.ports[port as usize] = UdpPortAction::Dispatch(node);
+    fn register_port(&mut self, port: u16, next: u16) {
+        self.ports[port as usize] = UdpPortAction::Dispatch(next);
     }
 
     #[inline(always)]
@@ -186,23 +218,7 @@ impl UdpInputSnapshot {
 enum UdpPortAction {
     IcmpError,
     Punt,
-    Dispatch(NodeId),
-}
-
-#[derive(Debug, Clone, Copy)]
-enum UdpInputNextKey<'a> {
-    Punt(&'a [NodeId; UdpInputNext::COUNT]),
-    IcmpError(&'a [NodeId; UdpInputNext::COUNT]),
-}
-
-impl NodeNextStorage<UdpInputNextKey<'_>> for UdpInputSnapshot {
-    #[inline(always)]
-    fn next(&self, key: UdpInputNextKey<'_>) -> NodeId {
-        match key {
-            UdpInputNextKey::Punt(next) => next[UdpInputNext::Punt.slot()],
-            UdpInputNextKey::IcmpError(next) => next[UdpInputNext::IcmpError.slot()],
-        }
-    }
+    Dispatch(u16),
 }
 
 #[derive(Clone)]
@@ -222,8 +238,52 @@ impl UdpInputSnapshotHandle {
     }
 }
 
+#[derive(Clone)]
+struct UdpInputRuntime {
+    snapshot: UdpInputSnapshotHandle,
+}
+
+fn udp_input_runtimes() -> &'static Mutex<Vec<UdpInputRuntime>> {
+    static RUNTIMES: OnceLock<Mutex<Vec<UdpInputRuntime>>> = OnceLock::new();
+    RUNTIMES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn register_udp_input_runtime(snapshot: UdpInputSnapshotHandle) -> NodeRuntimeData {
+    let mut runtimes = udp_input_runtimes()
+        .lock()
+        .expect("UDP input runtime registry poisoned");
+    let slot = runtimes.len();
+    runtimes.push(UdpInputRuntime { snapshot });
+    NodeRuntimeData::from_usize(slot).expect("UDP input runtime slot overflow")
+}
+
+fn udp_input_runtime(data: NodeRuntimeData) -> CoreResult<UdpInputRuntime> {
+    let slot = data.usize_word(0)?;
+    udp_input_runtimes()
+        .lock()
+        .map_err(|_| CoreError::internal("UDP input runtime registry poisoned"))?
+        .get(slot)
+        .cloned()
+        .ok_or_else(|| CoreError::internal("UDP input runtime slot is invalid"))
+}
+
+fn udp_input_process(
+    runtime: &DataPlaneRuntime,
+    data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> NodeResult {
+    let state = match udp_input_runtime(data) {
+        Ok(state) => state,
+        Err(_) => return NodeResult::drop(),
+    };
+    let snapshot = state.snapshot.load();
+    udp_input_process_frame(runtime, frame, &snapshot)
+}
+
 #[hammer_component_macros::node(role = internal, next = UdpInputNext)]
 pub struct UdpInputNode {
+    #[node(default = register_udp_input_runtime(snapshot.clone()))]
+    runtime_data: NodeRuntimeData,
     snapshot: UdpInputSnapshotHandle,
 }
 
@@ -231,16 +291,22 @@ impl Node for UdpInputNode {
     #[inline(always)]
     fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
         let snapshot = self.snapshot.load();
-        let next = match Self::runtime_nexts(runtime) {
-            Ok(next) => next,
-            Err(_) => return NodeResult::drop(),
-        };
-        udp_input_process_frame(runtime, frame, &snapshot, &next)
+        udp_input_process_frame(runtime, frame, &snapshot)
     }
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
         Some(format_udp_input_trace)
+    }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        udp_input_process
+    }
+
+    #[inline]
+    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        Ok(self.runtime_data)
     }
 }
 
@@ -249,23 +315,26 @@ fn udp_input_process_frame(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
     snapshot: &UdpInputSnapshot,
-    next: &[NodeId; UdpInputNext::COUNT],
 ) -> NodeResult {
-    hammer_runtime::process_frame!(runtime, frame, |index| {
-        match next_node_for_index(runtime, index, snapshot, next) {
-            Ok(Some(node)) => node,
-            _ => NodeNextStorage::next(next, UdpInputNext::Drop),
-        }
-    })
+    let drop_slot = UdpInputNext::Drop.slot() as u16;
+    let mut nexts = hammer_infra::vec::Vec::with_capacity(frame.len());
+    for index in frame.iter_indices() {
+        let slot = match next_slot_for_index(runtime, *index, snapshot) {
+            Ok(Some(slot)) => slot,
+            _ => drop_slot,
+        };
+        nexts.push(slot);
+    }
+    runtime.enqueue_to_next(frame, nexts.as_slice());
+    NodeResult::drop()
 }
 
 #[inline(always)]
-fn next_node_for_index(
+fn next_slot_for_index(
     runtime: &DataPlaneRuntime,
     index: Index,
     snapshot: &UdpInputSnapshot,
-    next: &[NodeId; UdpInputNext::COUNT],
-) -> CoreResult<Option<NodeId>> {
+) -> CoreResult<Option<u16>> {
     let (version, protocol, source_port, destination_port) = {
         let buffer = runtime.get_buffer(index)?;
         let current = buffer.current();
@@ -280,7 +349,6 @@ fn next_node_for_index(
                 return resolve_drop_error(
                     runtime,
                     index,
-                    next,
                     UdpInputError::BadLength,
                     None,
                     None,
@@ -300,7 +368,6 @@ fn next_node_for_index(
                 return resolve_drop_error(
                     runtime,
                     index,
-                    next,
                     UdpInputError::BadLength,
                     None,
                     None,
@@ -314,7 +381,6 @@ fn next_node_for_index(
             return resolve_drop_error(
                 runtime,
                 index,
-                next,
                 UdpInputError::WrongProtocol,
                 Some(version),
                 Some(protocol),
@@ -327,7 +393,6 @@ fn next_node_for_index(
             return resolve_drop_error(
                 runtime,
                 index,
-                next,
                 UdpInputError::BadLength,
                 None,
                 None,
@@ -343,7 +408,6 @@ fn next_node_for_index(
                 return resolve_drop_error(
                     runtime,
                     index,
-                    next,
                     UdpInputError::BadLength,
                     None,
                     None,
@@ -363,7 +427,6 @@ fn next_node_for_index(
             return resolve_drop_error(
                 runtime,
                 index,
-                next,
                 UdpInputError::BadLength,
                 None,
                 None,
@@ -375,7 +438,7 @@ fn next_node_for_index(
     };
 
     match snapshot.action(destination_port) {
-        UdpPortAction::Dispatch(node) => {
+        UdpPortAction::Dispatch(slot) => {
             clear_success_metadata(runtime, index)?;
             add_packet_trace!(
                 runtime,
@@ -386,14 +449,14 @@ fn next_node_for_index(
                     source_port: Some(source_port),
                     destination_port: Some(destination_port),
                     error: None,
-                    next: node,
+                    next: slot,
                 },
             )?;
-            Ok(Some(node))
+            Ok(Some(slot))
         }
         UdpPortAction::Punt => {
             clear_success_metadata(runtime, index)?;
-            let resolved = NodeNextStorage::next(snapshot, UdpInputNextKey::Punt(next));
+            let slot = UdpInputNext::Punt.slot() as u16;
             add_packet_trace!(
                 runtime,
                 index,
@@ -403,16 +466,14 @@ fn next_node_for_index(
                     source_port: Some(source_port),
                     destination_port: Some(destination_port),
                     error: None,
-                    next: resolved,
+                    next: slot,
                 },
             )?;
-            Ok(Some(resolved))
+            Ok(Some(slot))
         }
         UdpPortAction::IcmpError => resolve_unknown_port(
             runtime,
             index,
-            next,
-            snapshot,
             version,
             protocol,
             source_port,
@@ -425,15 +486,14 @@ fn next_node_for_index(
 fn resolve_drop_error(
     runtime: &DataPlaneRuntime,
     index: Index,
-    next: &[NodeId; UdpInputNext::COUNT],
     error: UdpInputError,
     version: Option<IpVersion>,
     protocol: Option<IpProtocol>,
     source_port: Option<u16>,
     destination_port: Option<u16>,
-) -> CoreResult<Option<NodeId>> {
+) -> CoreResult<Option<u16>> {
     set_index_node_error_code(runtime, index, error.code())?;
-    let resolved = NodeNextStorage::next(next, UdpInputNext::Drop);
+    let slot = UdpInputNext::Drop.slot() as u16;
     add_packet_trace!(
         runtime,
         index,
@@ -443,28 +503,28 @@ fn resolve_drop_error(
             source_port,
             destination_port,
             error: Some(error.code()),
-            next: resolved,
+            next: slot,
         },
     )?;
-    Ok(Some(resolved))
+    Ok(Some(slot))
 }
 
 #[inline(always)]
 fn resolve_unknown_port(
     runtime: &DataPlaneRuntime,
     index: Index,
-    next: &[NodeId; UdpInputNext::COUNT],
-    snapshot: &UdpInputSnapshot,
     version: IpVersion,
     protocol: IpProtocol,
     source_port: u16,
     destination_port: u16,
-) -> CoreResult<Option<NodeId>> {
+) -> CoreResult<Option<u16>> {
     set_index_node_error_code(runtime, index, UdpInputError::UnknownPort.code())?;
-    let mut buffer = runtime.get_buffer_mut(index)?;
-    let opaque = unsafe { transmute::<_, &mut IcmpErrorOpaque>(buffer.opaque2_mut()) };
-    opaque.icmp_error = port_unreachable_metadata(version);
-    let resolved = NodeNextStorage::next(snapshot, UdpInputNextKey::IcmpError(next));
+    {
+        let mut buffer = runtime.get_buffer_mut(index)?;
+        let opaque = unsafe { transmute::<_, &mut IcmpErrorOpaque>(buffer.opaque2_mut()) };
+        opaque.icmp_error = port_unreachable_metadata(version);
+    }
+    let slot = UdpInputNext::IcmpError.slot() as u16;
     add_packet_trace!(
         runtime,
         index,
@@ -474,13 +534,12 @@ fn resolve_unknown_port(
             source_port: Some(source_port),
             destination_port: Some(destination_port),
             error: Some(UdpInputError::UnknownPort.code()),
-            next: resolved,
+            next: slot,
         },
     )?;
-    Ok(Some(resolved))
+    Ok(Some(slot))
 }
 
-#[inline(always)]
 fn clear_success_metadata(runtime: &DataPlaneRuntime, index: Index) -> CoreResult<()> {
     let mut buffer = runtime.get_buffer_mut(index)?;
     buffer.clear_node_error();
