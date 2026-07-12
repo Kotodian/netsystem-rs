@@ -4,12 +4,12 @@
 //! proves the warmed grouping/transfer section performs zero heap allocations.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hammer_core::data_plane::{
-    BufferFrame, DataPlaneBufferConfig, Frame, Index, Next, NodeId, NodeKind, NodeRegistration,
-    DEFAULT_BUFFER_FRAME_CAPACITY,
+    BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, DataPlaneBufferConfig, Frame, Index, Next, NodeId,
+    NodeKind, NodeRegistration,
 };
 use hammer_core::error::CoreResult;
 use hammer_runtime::node::{NodeDescriptor, NodeProcessFn, NodeResult, NodeRuntimeData};
@@ -92,7 +92,11 @@ fn collect(slot: usize) -> NodeProcessFn {
     }
 }
 
-fn register_sink(runtime: &DataPlaneRuntime, name: &'static str, slot: usize) -> CoreResult<NodeId> {
+fn register_sink(
+    runtime: &DataPlaneRuntime,
+    name: &'static str,
+    slot: usize,
+) -> CoreResult<NodeId> {
     runtime.nodes().try_register_descriptor(
         NodeKind::Internal,
         NodeDescriptor::new(
@@ -139,12 +143,7 @@ fn snapshot_allocs() -> (usize, usize) {
     )
 }
 
-fn fanout_once(
-    runtime: &DataPlaneRuntime,
-    owner: NodeId,
-    frame: &mut Frame<Next>,
-    nexts: &[u16],
-) {
+fn fanout_once(runtime: &DataPlaneRuntime, owner: NodeId, frame: &mut Frame<Next>, nexts: &[u16]) {
     runtime.with_current_node(owner, || {
         runtime.enqueue_to_next(frame, nexts);
     });
@@ -271,7 +270,8 @@ fn warmed_fanout_grouping_allocates_zero_heap() -> CoreResult<()> {
     drop(frame);
 
     assert_eq!(
-        after.0, before.0,
+        after.0,
+        before.0,
         "warmed fanout allocated {} times ({} bytes)",
         after.0 - before.0,
         after.1.saturating_sub(before.1)

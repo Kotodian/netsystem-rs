@@ -4,9 +4,9 @@ use std::rc::Rc;
 
 use hammer_core::config::Config;
 use hammer_core::data_plane::{
-    BufferFrame, BufferFrameBatchWidth, BufferFrameBatchWidthPolicy, Index, BufferNodeError,
+    BufferFrame, BufferFrameBatchWidth, BufferFrameBatchWidthPolicy, BufferNodeError,
     BufferPoolArena, BufferRef, BufferRefMut, DataPlaneBufferChain, DataPlaneBufferConfig,
-    DataPlaneBuffers, Frame, Next, NodeHandle, NodeId, NodeNext, Pending,
+    DataPlaneBuffers, Frame, Index, Next, NodeHandle, NodeId, NodeNext, Pending,
 };
 use hammer_core::error::{CoreError, CoreResult, DataPlaneError};
 

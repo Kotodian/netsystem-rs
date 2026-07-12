@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crossbeam_queue::ArrayQueue;
-use hammer_core::data_plane::{Index, BufferPoolArena, NodeHandle};
+use hammer_core::data_plane::{BufferPoolArena, Index, NodeHandle};
 use hammer_core::error::{CoreResult, DataPlaneError};
 
 pub(crate) const HANDOFF_SLOT_CAPACITY: usize = 32;
@@ -328,10 +328,7 @@ mod tests {
             runtime.buffers().current_config(index).expect("config"),
             continuation
         );
-        let frame = handoff
-            .worker(DataWorkerId::new(1))
-            .pop()
-            .expect("queued");
+        let frame = handoff.worker(DataWorkerId::new(1)).pop().expect("queued");
         assert_eq!(frame.target, target);
         assert!(frame.slot.iter().any(|value| value == index));
     }

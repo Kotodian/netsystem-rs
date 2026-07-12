@@ -6,11 +6,13 @@
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use hammer_core::data_plane::{
-    BufferFrame, DataPlaneBufferConfig, Frame, Index, Next, NodeId, NodeKind, NodeRegistration,
-    DEFAULT_BUFFER_FRAME_CAPACITY,
+    BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, DataPlaneBufferConfig, Frame, Index, Next, NodeId,
+    NodeKind, NodeRegistration,
 };
 use hammer_core::error::CoreResult;
-use hammer_infra::mask_compare::{mask_compare_u16_arch, mask_compare_u16_scalar, mask_compare_u16_words};
+use hammer_infra::mask_compare::{
+    mask_compare_u16_arch, mask_compare_u16_scalar, mask_compare_u16_words,
+};
 use hammer_runtime::node::{NodeDescriptor, NodeResult, NodeRuntimeData};
 use hammer_runtime::{DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig};
 
@@ -72,10 +74,7 @@ fn build_fixture(pattern: FanoutPattern) -> FanoutFixture {
     ];
     let owner = register_owner(&runtime, &sinks).expect("owner");
     let mut indices = Vec::with_capacity(DEFAULT_BUFFER_FRAME_CAPACITY);
-    let mut frame = runtime
-        .buffers()
-        .get_next_frame(owner)
-        .expect("frame");
+    let mut frame = runtime.buffers().get_next_frame(owner).expect("frame");
     for offset in 0..DEFAULT_BUFFER_FRAME_CAPACITY {
         let index = runtime
             .alloc_index_with_bytes(&[(offset % 256) as u8])
