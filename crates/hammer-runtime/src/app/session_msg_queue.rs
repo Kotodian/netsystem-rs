@@ -38,17 +38,59 @@ pub struct SessionEvt {
     pub evt_type: SessionEvtType,
     /// VPP `session_event_t.postponed`; unused by Hammer producers today.
     pub postponed: u8,
-    _pad: [u8; 2],
+    /// Session/app event flags (e.g. urgent RX). Occupies VPP-aligned pad space.
+    flags: SessionEvtFlags,
+    _pad: u8,
     identity: u64,
+}
+
+/// Flags carried on [`SessionEvt`] (no separate OOB/MSG_OOB channel).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(transparent)]
+pub struct SessionEvtFlags(u8);
+
+impl SessionEvtFlags {
+    /// TCP URG / urgent pointer marked this RX delivery.
+    pub const URGENT: Self = Self(0x01);
+
+    #[inline]
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    #[inline]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    #[inline]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    #[inline]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
 }
 
 impl SessionEvt {
     #[inline]
     pub const fn io(session_index: u32, evt_type: SessionEvtType) -> Self {
+        Self::io_with_flags(session_index, evt_type, SessionEvtFlags::empty())
+    }
+
+    #[inline]
+    pub const fn io_with_flags(
+        session_index: u32,
+        evt_type: SessionEvtType,
+        flags: SessionEvtFlags,
+    ) -> Self {
         Self {
             evt_type,
             postponed: 0,
-            _pad: [0; 2],
+            flags,
+            _pad: 0,
             identity: session_index as u64,
         }
     }
@@ -58,7 +100,8 @@ impl SessionEvt {
         Self {
             evt_type,
             postponed: 0,
-            _pad: [0; 2],
+            flags: SessionEvtFlags::empty(),
+            _pad: 0,
             identity: (session_index as u64) | ((worker_index as u64) << 32),
         }
     }
@@ -76,6 +119,11 @@ impl SessionEvt {
     #[inline]
     pub const fn session_handle_raw(self) -> u64 {
         self.identity
+    }
+
+    #[inline]
+    pub const fn flags(self) -> SessionEvtFlags {
+        self.flags
     }
 
     fn as_bytes(self) -> [u8; SESSION_EVT_BYTES] {

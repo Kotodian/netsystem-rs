@@ -334,7 +334,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
         session_id: SessionId,
         index: hammer_core::data_plane::Index,
         offset: u32,
-        _: bool,
+        urgent: bool,
     ) -> CoreResult<RxDelivery>
     where
         SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
@@ -342,7 +342,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
         if offset == 0 {
             let (accepted, promoted) =
                 self.app
-                    .copy_rx_from_buffer(session_id, &self.buffers, index)?;
+                    .copy_rx_from_buffer(session_id, &self.buffers, index, urgent)?;
             let rx_available = self.rx_available_u32(session_id);
             return Ok(match NonZeroU32::new(accepted) {
                 Some(accepted) => RxDelivery::InOrder {
@@ -516,13 +516,13 @@ where
         session_id: SessionId,
         index: hammer_core::data_plane::Index,
         offset: u32,
-        queue_event: bool,
+        urgent: bool,
     ) -> CoreResult<RxDelivery>
     where
         SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
     {
         self.sessions
-            .enqueue_rx(session_id, index, offset, queue_event)
+            .enqueue_rx(session_id, index, offset, urgent)
     }
 
     #[cfg(test)]

@@ -194,6 +194,7 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
         session_id: SessionId,
         buffers: &DataPlaneBuffers,
         index: Index,
+        urgent: bool,
     ) -> CoreResult<(u32, u32)>
     where
         Self: SessionAppRuntimeCreate<S>,
@@ -210,6 +211,7 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
                 let mut total = 0u32;
                 let mut accepted = 0u32;
                 let mut promoted = 0u32;
+                let mut urgent_pending = urgent;
                 for buffer in buffers.chain(index) {
                     let buffer = buffer?;
                     let chunk = buffer.current();
@@ -217,7 +219,15 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
                         .map_err(|_| CoreError::internal("rx buffer length overflow"))?;
                     if accepted == total {
                         let rx_available_before = session.rx_fifo().max_enqueue();
-                        let wrote = session.enqueue_rx(chunk).map_err(CoreError::from)?;
+                        let flags = if urgent_pending {
+                            urgent_pending = false;
+                            hammer_runtime::app::SessionEvtFlags::URGENT
+                        } else {
+                            hammer_runtime::app::SessionEvtFlags::empty()
+                        };
+                        let wrote = session
+                            .enqueue_rx_with_flags(chunk, flags)
+                            .map_err(CoreError::from)?;
                         let accepted_now = wrote.min(chunk.len()).min(rx_available_before);
                         let promoted_now = wrote.saturating_sub(accepted_now);
                         accepted = accepted

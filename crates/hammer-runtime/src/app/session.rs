@@ -9,7 +9,7 @@ use hammer_infra::segment::{Local, Svm};
 use crate::app::SessionHandle;
 use crate::app::SessionOffsets;
 use crate::app::session_msg_queue::{
-    SessionEventQueue, SessionEvt, SessionEvtType, SessionMsgQueue, SessionSegment,
+    SessionEventQueue, SessionEvt, SessionEvtFlags, SessionEvtType, SessionMsgQueue, SessionSegment,
 };
 
 /// VPP-style app/session object: per-session byte FIFOs plus event queue.
@@ -120,35 +120,6 @@ impl<S: SessionSegment> AppSession<S> {
         self.evt_q.read_signal()
     }
 
-    /// Transport-side convenience: post a session event to the app's queue.
-    /// Used by session runtime on RX enqueue / connect / close.
-    ///
-    /// IO events (`RxEnq` / `TxDeq`) carry session index only. Control events
-    /// (`Connect` / `Close`) carry the full Session Handle, matching VPP
-    /// `session_event_t` identity rules.
-    #[inline]
-    pub fn push_event(&self, evt_type: SessionEvtType) -> HammerResult<()> {
-        match evt_type {
-            SessionEvtType::RxEnq | SessionEvtType::TxDeq => {
-                let evt = SessionEvt::io(self.handle.session_index(), evt_type);
-                self.evt_q
-                    .enqueue_io(evt)
-                    .map_err(|_| HammerError::internal("app session evt_q full"))?;
-            }
-            SessionEvtType::Connect | SessionEvtType::Close => {
-                let evt = SessionEvt::ctrl(
-                    self.handle.session_index(),
-                    self.handle.worker_index(),
-                    evt_type,
-                );
-                self.evt_q
-                    .enqueue_ctrl(evt)
-                    .map_err(|_| HammerError::internal("app session evt_q full"))?;
-            }
-        }
-        Ok(())
-    }
-
     /// Transport-side convenience: enqueue received bytes and emit a
     /// `SessionEvtType::RxEnq` event with edge-triggered signal semantics.
     /// Returns bytes enqueued. The event is only signalled if the fifo
@@ -156,9 +127,26 @@ impl<S: SessionSegment> AppSession<S> {
     /// `want_notification`.
     #[inline]
     pub fn enqueue_rx(&self, bytes: &[u8]) -> HammerResult<usize> {
+        self.enqueue_rx_with_flags(bytes, SessionEvtFlags::empty())
+    }
+
+    /// Like [`Self::enqueue_rx`], but attaches [`SessionEvtFlags`] on the RxEnq
+    /// event. Urgent delivery always posts an event (still requires
+    /// `want_notification`) so the app observes the mark even when the FIFO
+    /// was already non-empty.
+    #[inline]
+    pub fn enqueue_rx_with_flags(
+        &self,
+        bytes: &[u8],
+        flags: SessionEvtFlags,
+    ) -> HammerResult<usize> {
         let wrote = self.rx_fifo.enqueue(bytes);
-        if wrote > 0 && self.rx_fifo.should_signal(wrote) {
-            self.push_event(SessionEvtType::RxEnq)?;
+        if wrote == 0 {
+            return Ok(0);
+        }
+        let urgent = flags.contains(SessionEvtFlags::URGENT);
+        if urgent || self.rx_fifo.should_signal(wrote) {
+            self.push_event_with_flags(SessionEvtType::RxEnq, flags)?;
         }
         Ok(wrote)
     }
@@ -177,6 +165,44 @@ impl<S: SessionSegment> AppSession<S> {
     #[inline]
     pub fn clear_tx_event(&self) {
         self.tx_fifo.unset_event();
+    }
+
+    /// Transport-side convenience: post a session event to the app's queue.
+    /// Used by session runtime on RX enqueue / connect / close.
+    ///
+    /// IO events (`RxEnq` / `TxDeq`) carry session index only. Control events
+    /// (`Connect` / `Close`) carry the full Session Handle, matching VPP
+    /// `session_event_t` identity rules.
+    #[inline]
+    pub fn push_event(&self, evt_type: SessionEvtType) -> HammerResult<()> {
+        self.push_event_with_flags(evt_type, SessionEvtFlags::empty())
+    }
+
+    #[inline]
+    pub fn push_event_with_flags(
+        &self,
+        evt_type: SessionEvtType,
+        flags: SessionEvtFlags,
+    ) -> HammerResult<()> {
+        match evt_type {
+            SessionEvtType::RxEnq | SessionEvtType::TxDeq => {
+                let evt = SessionEvt::io_with_flags(self.handle.session_index(), evt_type, flags);
+                self.evt_q
+                    .enqueue_io(evt)
+                    .map_err(|_| HammerError::internal("app session evt_q full"))?;
+            }
+            SessionEvtType::Connect | SessionEvtType::Close => {
+                let evt = SessionEvt::ctrl(
+                    self.handle.session_index(),
+                    self.handle.worker_index(),
+                    evt_type,
+                );
+                self.evt_q
+                    .enqueue_ctrl(evt)
+                    .map_err(|_| HammerError::internal("app session evt_q full"))?;
+            }
+        }
+        Ok(())
     }
 
     #[inline]
@@ -435,6 +461,33 @@ mod tests {
         let mut out = [SessionEvt::io(0, SessionEvtType::Close)];
         assert_eq!(session.poll_events(&mut out), 1);
         assert_eq!(out[0].evt_type, SessionEvtType::RxEnq);
+    }
+
+    #[test]
+    fn app_session_enqueue_rx_urgent_marks_rx_event_flag() {
+        use crate::app::SessionEvtFlags;
+
+        let session = new_session(AppSessionConfig::new(64, 4), 1);
+        session.want_rx_notification();
+        assert_eq!(
+            session
+                .enqueue_rx_with_flags(b"urg", SessionEvtFlags::URGENT)
+                .expect("enqueue urgent"),
+            3
+        );
+        let mut out = [SessionEvt::io(0, SessionEvtType::Close)];
+        assert_eq!(session.poll_events(&mut out), 1);
+        assert_eq!(out[0].evt_type, SessionEvtType::RxEnq);
+        assert!(out[0].flags().contains(SessionEvtFlags::URGENT));
+
+        // Non-urgent path keeps flags clear (edge-triggered: may not fire while data pending).
+        assert_eq!(session.consume_rx(3), 3);
+        session.want_rx_notification();
+        assert_eq!(session.enqueue_rx(b"ok").expect("enqueue"), 2);
+        let mut out = [SessionEvt::io(0, SessionEvtType::Close)];
+        assert_eq!(session.poll_events(&mut out), 1);
+        assert_eq!(out[0].evt_type, SessionEvtType::RxEnq);
+        assert!(out[0].flags().is_empty());
     }
 
     #[test]

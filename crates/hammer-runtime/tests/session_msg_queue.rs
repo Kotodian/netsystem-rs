@@ -15,7 +15,22 @@ fn enqueue_io_roundtrips_on_io_ring() {
     assert_eq!(got, evt);
     assert_eq!(got.session_index(), 7);
     assert_eq!(got.worker_index(), 0);
+    assert!(got.flags().is_empty());
     assert!(q.dequeue().is_none());
+}
+
+#[test]
+fn session_evt_io_preserves_urgent_flag() {
+    use hammer_runtime::app::SessionEvtFlags;
+
+    let q = SessionMsgQueue::with_defaults().expect("queue");
+    let evt = SessionEvt::io_with_flags(11, SessionEvtType::RxEnq, SessionEvtFlags::URGENT);
+    q.enqueue_io(evt).expect("enqueue_io");
+
+    let got = q.dequeue().expect("dequeue");
+    assert_eq!(got.evt_type, SessionEvtType::RxEnq);
+    assert_eq!(got.session_index(), 11);
+    assert!(got.flags().contains(SessionEvtFlags::URGENT));
 }
 
 #[test]

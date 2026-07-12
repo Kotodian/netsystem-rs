@@ -11,6 +11,6 @@ pub use handle::SessionHandle;
 pub use layout::SessionOffsets;
 pub use session::{AppSession, AppSessionConfig};
 pub use session_msg_queue::{
-    SessionEventQueue, SessionEvt, SessionEvtType, SessionMqRing, SessionMsgQueue,
+    SessionEventQueue, SessionEvt, SessionEvtFlags, SessionEvtType, SessionMqRing, SessionMsgQueue,
     SessionMsgQueueError, SessionSegment,
 };

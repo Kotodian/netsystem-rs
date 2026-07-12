@@ -227,7 +227,12 @@ where
                 buffer.advance(packet.payload_offset.saturating_add(trim) as isize)?;
                 buffer.truncate(accepted_len as usize)?;
             }
-            let delivery = queue.enqueue_rx(session_id, index, offset, false)?;
+            let delivery = queue.enqueue_rx(
+                session_id,
+                index,
+                offset,
+                packet.flags.contains(hammer_core::protocol::tcp::TcpSegmentFlags::URG),
+            )?;
             let (_, connection_index) = queue
                 .sessions()
                 .session_transport(session_id)
@@ -349,6 +354,9 @@ mod tests {
     use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
     use hammer_infra::pool::Index as PoolIndex;
     use hammer_infra::segment::Local;
+    use hammer_runtime::app::{
+        AppSession, AppSessionConfig, SessionEvt, SessionEvtFlags, SessionEvtType, SessionHandle,
+    };
     use hammer_runtime::{
         DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeProcessFn, NodeResult,
         NodeRuntimeData,
@@ -513,14 +521,14 @@ mod tests {
         runtime: &DataPlaneRuntime,
         established: NodeId,
         session_id: Option<SessionId>,
-        packet: std::vec::Vec<u8>,
+        packet: &[u8],
     ) {
         let mut frame = runtime
             .buffers()
             .get_next_frame(established)
             .expect("frame");
-        let buffer = runtime.alloc_index_with_bytes(&packet).expect("packet");
-        let cursor = tcp_control_cursor(&packet).expect("cursor");
+        let buffer = runtime.alloc_index_with_bytes(packet).expect("packet");
+        let cursor = tcp_control_cursor(packet).expect("cursor");
         let mut data_buffer = runtime.get_buffer_mut(buffer).expect("buffer mut");
         let network =
             unsafe { std::mem::transmute::<_, &mut NetworkOpaque>(data_buffer.opaque_mut()) };
@@ -559,6 +567,29 @@ mod tests {
             payload,
         )
         .expect("data packet")
+    }
+
+    fn attach_observable_app(
+        handle: &SessionQueueHandle<
+            SessionDriverRuntime<(TcpWorker<BbrController>, ()), Local, PoolIndex>,
+        >,
+        session_id: SessionId,
+    ) -> Arc<hammer_runtime::app::AppSession<Local>> {
+        let app = Arc::new(
+            hammer_runtime::app::AppSession::new_in_segment(
+                Local::default(),
+                hammer_runtime::app::AppSessionConfig::new(256, 16),
+                hammer_runtime::app::SessionHandle::new(session_id.pool_index().slot(), 0),
+                handle.borrow_mut().expect("tcp queue").app().tx_evt_q().clone(),
+            )
+            .expect("app session"),
+        );
+        handle
+            .borrow_mut()
+            .expect("tcp queue")
+            .app_mut()
+            .attach_session(session_id, Arc::clone(&app));
+        app
     }
 
     fn peer_fin_packet(sequence: u32, acknowledgment: u32) -> std::vec::Vec<u8> {
@@ -630,11 +661,13 @@ mod tests {
     }
 
     fn tcp_flags(packet: &[u8]) -> u8 {
-        packet[13]
+        let tcp = crate::transport::tcp::tcp_bytes_after_l3(packet);
+        tcp[13]
     }
 
     fn tcp_acknowledgment(packet: &[u8]) -> u32 {
-        u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]])
+        let tcp = crate::transport::tcp::tcp_bytes_after_l3(packet);
+        u32::from_be_bytes([tcp[8], tcp[9], tcp[10], tcp[11]])
     }
 
     #[test]
@@ -661,7 +694,7 @@ mod tests {
             &runtime,
             established,
             Some(session_id),
-            data_packet(rcv_nxt, snd_nxt, b"hello"),
+            &data_packet(rcv_nxt, snd_nxt, b"hello"),
         );
         assert!(runtime.run_ready_nodes().expect("run established") >= 1);
 
@@ -696,7 +729,7 @@ mod tests {
             &runtime,
             established,
             Some(session_id),
-            data_packet(rcv_nxt, snd_nxt, b"hello"),
+            &data_packet(rcv_nxt, snd_nxt, b"hello"),
         );
         assert!(runtime.run_ready_nodes().expect("run first") >= 1);
 
@@ -704,7 +737,7 @@ mod tests {
             &runtime,
             established,
             Some(session_id),
-            data_packet(rcv_nxt, snd_nxt, b"hello"),
+            &data_packet(rcv_nxt, snd_nxt, b"hello"),
         );
         for _ in 0..8 {
             let _ = runtime.run_ready_nodes().expect("drain");
@@ -739,7 +772,7 @@ mod tests {
             &runtime,
             established,
             Some(session_id),
-            peer_fin_packet(rcv_nxt, snd_nxt),
+            &peer_fin_packet(rcv_nxt, snd_nxt),
         );
         for _ in 0..8 {
             let _ = runtime.run_ready_nodes().expect("drain");
@@ -775,7 +808,7 @@ mod tests {
             &runtime,
             established,
             Some(session_id),
-            peer_fin_packet(rcv_nxt.wrapping_add(1), snd_nxt),
+            &peer_fin_packet(rcv_nxt.wrapping_add(1), snd_nxt),
         );
         let _ = runtime.run_ready_nodes().expect("run established");
         let _ = runtime.run_ready_nodes().expect("drain");
@@ -804,7 +837,7 @@ mod tests {
             &runtime,
             established,
             None,
-            data_packet(rcv_nxt, snd_nxt, b"x"),
+            &data_packet(rcv_nxt, snd_nxt, b"x"),
         );
         let _ = runtime.run_ready_nodes().expect("run established");
         let _ = runtime.run_ready_nodes().expect("drain");
@@ -813,5 +846,79 @@ mod tests {
         let connection = queue.session(session_id).expect("session");
         assert_eq!(connection.rcv_nxt(), rcv_nxt);
         assert!(output_state.lock().expect("output").packets.is_empty());
+    }
+
+    #[test]
+    fn urg_segment_marks_session_rx_event_flag() {
+        use hammer_core::protocol::tcp::TcpWireHeader;
+        use hammer_core::protocol::wire::header_mut_ptr;
+        use hammer_runtime::app::{SessionEvt, SessionEvtFlags, SessionEvtType};
+
+        let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
+            buffers: hammer_core::data_plane::DataPlaneBufferConfig {
+                buffer_slot_capacity: 2048,
+                buffer_slots: 32,
+                frame_slots: 8,
+                ..hammer_core::data_plane::DataPlaneBufferConfig::default()
+            },
+        });
+        let (established, handle, _, _) = install_established_runtime(&runtime);
+        let (session_id, rcv_nxt, snd_nxt) = open_established_session(handle);
+        let app = attach_observable_app(&handle, session_id);
+        app.want_rx_notification();
+
+        let mut packet = data_packet(rcv_nxt, snd_nxt, b"urg");
+        {
+            let ip_hlen = usize::from(packet[0] & 0x0f) * 4;
+            let ptr = header_mut_ptr::<TcpWireHeader>(&mut packet[ip_hlen..], 0)
+                .expect("tcp wire header");
+            // SAFETY: header_mut_ptr validated the TcpWireHeader range.
+            unsafe {
+                let wire = &mut *ptr;
+                let mut flags = wire.flags();
+                flags.insert(TcpSegmentFlags::URG);
+                wire.set_flags(flags);
+                wire.set_urgent_pointer(3);
+            }
+        }
+        send_to_established(&runtime, established, Some(session_id), &packet);
+        assert!(runtime.run_ready_nodes().expect("run established") >= 1);
+
+        let mut out = [SessionEvt::io(0, SessionEvtType::Close)];
+        assert_eq!(app.poll_events(&mut out), 1);
+        assert_eq!(out[0].evt_type, SessionEvtType::RxEnq);
+        assert!(out[0].flags().contains(SessionEvtFlags::URGENT));
+    }
+
+    #[test]
+    fn non_urg_segment_leaves_session_rx_event_flags_clear() {
+        use hammer_runtime::app::{SessionEvt, SessionEvtFlags, SessionEvtType};
+
+        let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
+            buffers: hammer_core::data_plane::DataPlaneBufferConfig {
+                buffer_slot_capacity: 2048,
+                buffer_slots: 32,
+                frame_slots: 8,
+                ..hammer_core::data_plane::DataPlaneBufferConfig::default()
+            },
+        });
+        let (established, handle, _, _) = install_established_runtime(&runtime);
+        let (session_id, rcv_nxt, snd_nxt) = open_established_session(handle);
+        let app = attach_observable_app(&handle, session_id);
+        app.want_rx_notification();
+
+        send_to_established(
+            &runtime,
+            established,
+            Some(session_id),
+            &data_packet(rcv_nxt, snd_nxt, b"ok"),
+        );
+        assert!(runtime.run_ready_nodes().expect("run established") >= 1);
+
+        let mut out = [SessionEvt::io(0, SessionEvtType::Close)];
+        assert_eq!(app.poll_events(&mut out), 1);
+        assert_eq!(out[0].evt_type, SessionEvtType::RxEnq);
+        assert!(out[0].flags().is_empty());
+        assert!(!out[0].flags().contains(SessionEvtFlags::URGENT));
     }
 }

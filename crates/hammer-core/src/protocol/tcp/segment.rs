@@ -56,6 +56,11 @@ impl TcpWireHeader {
     }
 
     #[inline(always)]
+    pub fn urgent_pointer(self) -> u16 {
+        u16::from_be_bytes(self.urgent_pointer)
+    }
+
+    #[inline(always)]
     pub fn flags(self) -> TcpSegmentFlags {
         let first = self.data_offset_reserved_flags[0];
         let second = self.data_offset_reserved_flags[1];
@@ -70,6 +75,18 @@ impl TcpWireHeader {
         flags.set(TcpSegmentFlags::ECE, second & 0x40 != 0);
         flags.set(TcpSegmentFlags::CWR, second & 0x80 != 0);
         flags
+    }
+
+    #[inline(always)]
+    pub fn set_urgent_pointer(&mut self, value: u16) {
+        self.urgent_pointer = value.to_be_bytes();
+    }
+
+    #[inline(always)]
+    pub fn set_flags(&mut self, flags: TcpSegmentFlags) {
+        let data_offset = self.data_offset_reserved_flags[0] & 0xf0;
+        let ns = u8::from(flags.contains(TcpSegmentFlags::NS));
+        self.data_offset_reserved_flags = [data_offset | ns, (flags.bits() & 0xff) as u8];
     }
 
     #[inline(always)]
