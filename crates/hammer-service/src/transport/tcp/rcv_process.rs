@@ -723,4 +723,260 @@ mod tests {
         assert_eq!(connection.state(), TcpState::FinWait1);
         assert!(output_state.lock().expect("output").packets.is_empty());
     }
+
+    fn open_closing_session(
+        handle: SessionQueueHandle<
+            SessionDriverRuntime<(TcpWorker<BbrController>, ()), Local, PoolIndex>,
+        >,
+    ) -> (SessionId, u32, u32) {
+        let mut queue = handle.borrow_mut().expect("tcp queue");
+        let session_id = queue
+            .insert_session_with_id(|session_id| {
+                TcpConnection::established_with_sack_for_test(
+                    Some(TcpConnectionId::new(session_id.get())),
+                    DataWorkerId::new(0),
+                    LOCAL_PORT,
+                    Some(local_addr()),
+                    remote_addr(),
+                )
+            })
+            .expect("insert");
+        {
+            let (_, connection_index) = queue
+                .sessions()
+                .session_transport(session_id)
+                .expect("transport");
+            let worker = &mut queue.transports_mut().0;
+            let TcpWorker {
+                connections,
+                timers,
+                ..
+            } = worker;
+            let connection = connections.get_mut(connection_index).expect("connection");
+            connection.on_session_close(connection_index, timers);
+            let _ = connection
+                .on_tcp_ready(
+                    connection_index,
+                    timers,
+                    false,
+                    TcpCapabilities::default(),
+                    std::time::Instant::now(),
+                )
+                .expect("prepare fin")
+                .expect("fin segment");
+            let rcv_nxt = connection.rcv_nxt();
+            let snd_una = connection.snd_una();
+            // Peer FIN that ACKs only snd_una → Closing (simultaneous close).
+            let packet = hammer_core::protocol::tcp::TcpPacket {
+                local: remote_addr(),
+                remote: local_addr(),
+                sequence: rcv_nxt.into(),
+                acknowledgment: Some(snd_una.into()),
+                advertised_window: u16::MAX,
+                flags: TcpSegmentFlags::FIN | TcpSegmentFlags::ACK,
+                capabilities: TcpCapabilities::default(),
+                sack_blocks: hammer_infra::vec::Vec::new(),
+                timestamp: None,
+                fast_open_cookie: None,
+                ip_ecn: None,
+                payload_offset: 0,
+                payload_len: 0,
+            };
+            let _ = connection
+                .receive_close_side(
+                    connection_index,
+                    timers,
+                    &packet,
+                    std::time::Instant::now(),
+                )
+                .expect("simultaneous close");
+            assert_eq!(connection.state(), TcpState::Closing);
+        }
+        publish_tcp_connection(&mut queue, session_id).expect("publish");
+        let connection = queue.session(session_id).expect("session");
+        (session_id, connection.rcv_nxt(), connection.snd_nxt())
+    }
+
+    fn open_last_ack_session(
+        handle: SessionQueueHandle<
+            SessionDriverRuntime<(TcpWorker<BbrController>, ()), Local, PoolIndex>,
+        >,
+    ) -> (SessionId, u32, u32) {
+        let mut queue = handle.borrow_mut().expect("tcp queue");
+        let session_id = queue
+            .insert_session_with_id(|session_id| {
+                TcpConnection::established_with_sack_for_test(
+                    Some(TcpConnectionId::new(session_id.get())),
+                    DataWorkerId::new(0),
+                    LOCAL_PORT,
+                    Some(local_addr()),
+                    remote_addr(),
+                )
+            })
+            .expect("insert");
+        {
+            let (_, connection_index) = queue
+                .sessions()
+                .session_transport(session_id)
+                .expect("transport");
+            let worker = &mut queue.transports_mut().0;
+            let TcpWorker {
+                connections,
+                timers,
+                ..
+            } = worker;
+            let connection = connections.get_mut(connection_index).expect("connection");
+            let rcv_nxt = connection.rcv_nxt();
+            let snd_nxt = connection.snd_nxt();
+            let packet = hammer_core::protocol::tcp::TcpPacket {
+                local: remote_addr(),
+                remote: local_addr(),
+                sequence: rcv_nxt.into(),
+                acknowledgment: Some(snd_nxt.into()),
+                advertised_window: u16::MAX,
+                flags: TcpSegmentFlags::FIN | TcpSegmentFlags::ACK,
+                capabilities: TcpCapabilities::default(),
+                sack_blocks: hammer_infra::vec::Vec::new(),
+                timestamp: None,
+                fast_open_cookie: None,
+                ip_ecn: None,
+                payload_offset: 0,
+                payload_len: 0,
+            };
+            let _ = connection
+                .receive_established_with_timers(
+                    connection_index,
+                    timers,
+                    &packet,
+                    std::time::Instant::now(),
+                )
+                .expect("peer fin");
+            assert_eq!(connection.state(), TcpState::CloseWait);
+            connection.on_session_close(connection_index, timers);
+            assert_eq!(connection.state(), TcpState::LastAck);
+            let _ = connection
+                .on_tcp_ready(
+                    connection_index,
+                    timers,
+                    false,
+                    TcpCapabilities::default(),
+                    std::time::Instant::now(),
+                )
+                .expect("prepare fin")
+                .expect("fin segment");
+        }
+        publish_tcp_connection(&mut queue, session_id).expect("publish");
+        let connection = queue.session(session_id).expect("session");
+        (session_id, connection.rcv_nxt(), connection.snd_nxt())
+    }
+
+    #[test]
+    fn ack_of_local_fin_in_closing_enters_time_wait() {
+        let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
+            buffers: hammer_core::data_plane::DataPlaneBufferConfig {
+                buffer_slot_capacity: 2048,
+                buffer_slots: 32,
+                frame_slots: 8,
+                ..hammer_core::data_plane::DataPlaneBufferConfig::default()
+            },
+        });
+        let (rcv, handle, output_state, _) = install_rcv_runtime(&runtime);
+        let (session_id, rcv_nxt, snd_nxt) = open_closing_session(handle);
+
+        send_to_rcv(
+            &runtime,
+            rcv,
+            Some(session_id),
+            control_packet(rcv_nxt, snd_nxt, TcpSegmentFlags::ACK),
+        );
+        assert!(runtime.run_ready_nodes().expect("run") >= 1);
+
+        let queue = handle.borrow_mut().expect("tcp queue");
+        let connection = queue.session(session_id).expect("session");
+        assert_eq!(connection.state(), TcpState::TimeWait);
+        assert!(output_state.lock().expect("output").packets.is_empty());
+    }
+
+    #[test]
+    fn ack_of_local_fin_in_last_ack_closes() {
+        let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
+            buffers: hammer_core::data_plane::DataPlaneBufferConfig {
+                buffer_slot_capacity: 2048,
+                buffer_slots: 32,
+                frame_slots: 8,
+                ..hammer_core::data_plane::DataPlaneBufferConfig::default()
+            },
+        });
+        let (rcv, handle, output_state, _) = install_rcv_runtime(&runtime);
+        let (session_id, rcv_nxt, snd_nxt) = open_last_ack_session(handle);
+
+        send_to_rcv(
+            &runtime,
+            rcv,
+            Some(session_id),
+            control_packet(rcv_nxt, snd_nxt, TcpSegmentFlags::ACK),
+        );
+        assert!(runtime.run_ready_nodes().expect("run") >= 1);
+
+        let queue = handle.borrow_mut().expect("tcp queue");
+        assert!(
+            queue.session(session_id).is_none(),
+            "LastAck final ACK must close and delete the session"
+        );
+        assert!(output_state.lock().expect("output").packets.is_empty());
+    }
+
+    #[test]
+    fn time_wait_duplicate_fin_reacks_peer() {
+        let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
+            buffers: hammer_core::data_plane::DataPlaneBufferConfig {
+                buffer_slot_capacity: 2048,
+                buffer_slots: 32,
+                frame_slots: 8,
+                ..hammer_core::data_plane::DataPlaneBufferConfig::default()
+            },
+        });
+        let (rcv, handle, output_state, _) = install_rcv_runtime(&runtime);
+        let (session_id, rcv_nxt, snd_nxt) = open_closing_session(handle);
+
+        send_to_rcv(
+            &runtime,
+            rcv,
+            Some(session_id),
+            control_packet(rcv_nxt, snd_nxt, TcpSegmentFlags::ACK),
+        );
+        assert!(runtime.run_ready_nodes().expect("enter time wait") >= 1);
+        {
+            let queue = handle.borrow_mut().expect("tcp queue");
+            assert_eq!(
+                queue.session(session_id).expect("session").state(),
+                TcpState::TimeWait
+            );
+        }
+
+        send_to_rcv(
+            &runtime,
+            rcv,
+            Some(session_id),
+            control_packet(
+                rcv_nxt.wrapping_sub(1),
+                snd_nxt,
+                TcpSegmentFlags::FIN | TcpSegmentFlags::ACK,
+            ),
+        );
+        for _ in 0..8 {
+            let _ = runtime.run_ready_nodes().expect("drain");
+            if !output_state.lock().expect("output").packets.is_empty() {
+                break;
+            }
+        }
+
+        let queue = handle.borrow_mut().expect("tcp queue");
+        let connection = queue.session(session_id).expect("session");
+        assert_eq!(connection.state(), TcpState::TimeWait);
+        let packets = output_state.lock().expect("output");
+        assert_eq!(packets.packets.len(), 1);
+        assert_eq!(tcp_flags(&packets.packets[0]) & TCP_FLAG_ACK, TCP_FLAG_ACK);
+        assert_eq!(tcp_acknowledgment(&packets.packets[0]), rcv_nxt);
+    }
 }
