@@ -5,12 +5,12 @@ use std::task::Waker;
 
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_infra::map::FlatHashTable;
-use hammer_infra::msg_queue::{MsgQueue, SessionEvt};
-use hammer_infra::segment::Segment;
+use hammer_infra::segment::Local;
 use tokio::sync::Notify;
 
 use crate::app::handle::SessionHandle;
 use crate::app::session::{AppSession, AppSessionConfig};
+use crate::app::session_msg_queue::{SessionEventQueue, SessionEvt, SessionMsgQueue, SessionSegment};
 
 struct SessionNotify {
     rx_readable: Notify,
@@ -32,13 +32,13 @@ impl SessionNotify {
 /// plus the worker-level event queue poll loop.
 /// The registry itself stays on the owning data worker thread.
 #[derive(Clone)]
-pub struct AppWorker<S: Segment> {
+pub struct AppWorker<S: SessionSegment> {
     worker_index: usize,
     sessions: FlatHashTable<u64, Arc<AppSession<S>>>,
     notifies: FlatHashTable<u64, Arc<SessionNotify>>,
 }
 
-impl<S: Segment> AppWorker<S> {
+impl<S: SessionSegment> AppWorker<S> {
     pub fn new(worker_index: usize) -> Self {
         Self {
             worker_index,
@@ -98,7 +98,7 @@ impl<S: Segment> AppWorker<S> {
     }
 }
 
-impl<S: Segment> fmt::Debug for AppWorker<S> {
+impl<S: SessionSegment> fmt::Debug for AppWorker<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AppWorker")
             .field("worker_index", &self.worker_index)
@@ -106,8 +106,6 @@ impl<S: Segment> fmt::Debug for AppWorker<S> {
             .finish_non_exhaustive()
     }
 }
-
-use hammer_infra::segment::Local;
 
 impl AppWorker<Local> {
     /// Create a fresh per-session FIFO/msgq object and register it.
@@ -124,8 +122,8 @@ impl AppWorker<Local> {
                 handle.raw()
             )));
         }
-        let tx_evt_q = Arc::new(
-            MsgQueue::<Local>::with_capacity(64)
+        let tx_evt_q: Arc<SessionMsgQueue> = Arc::new(
+            SessionMsgQueue::with_cfg(64, 64)
                 .map_err(|_| HammerError::internal("invalid tx_evt_q capacity"))?,
         );
         let session = Arc::new(AppSession::<Local>::new_in_segment(
@@ -143,12 +141,12 @@ impl AppWorker<Local> {
     /// In-process variant that joins the shared runtime-side TX event queue
     /// owned by `SessionAppRuntime` instead of creating a private per-session
     /// queue.  The dataplane drains all sessions' TX events from this single
-    /// shared `MsgQueue` via `SessionAppRuntime::drain_tx_events_to`.
+    /// shared Session Message Queue via `SessionAppRuntime::drain_tx_events_to`.
     pub fn attach_session_local_with_runtime_tx(
         &mut self,
         handle: SessionHandle,
         config: AppSessionConfig,
-        runtime_tx_evt_q: Arc<MsgQueue<Local>>,
+        runtime_tx_evt_q: Arc<SessionMsgQueue>,
     ) -> HammerResult<Arc<AppSession<Local>>> {
         if self.sessions.lookup(&handle.raw()).is_some() {
             return Err(HammerError::internal(format!(

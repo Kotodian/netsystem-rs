@@ -4,7 +4,7 @@ use hammer_core::data_plane::NodeState;
 use hammer_core::protocol::tcp::{
     TcpCapabilities, TcpConnectionId, TcpPacket, TcpSegmentFlags, TcpState,
 };
-use hammer_infra::msg_queue::{SessionEvt, SessionEvtType};
+use hammer_runtime::app::{SessionEvt, SessionEvtType};
 use hammer_infra::pool::Index;
 use hammer_infra::segment::Local;
 use hammer_runtime::app::{AppContext, AppSession, AppSessionConfig, SessionHandle};
@@ -143,7 +143,7 @@ fn app_close_is_recorded_before_tcp_disconnect() {
         .1;
     let app = attach_app(&mut driver, session_id);
     app.tx_evt_q()
-        .enqueue(SessionEvt::ctrl(
+        .enqueue_ctrl(SessionEvt::ctrl(
             session_id.pool_index().slot(),
             0,
             SessionEvtType::Close,
@@ -238,7 +238,7 @@ fn tcp_closed_publication_notifies_app_once_before_cleanup() {
     assert_eq!(poll_app_events(&app), vec![SessionEvtType::Close]);
 
     app.tx_evt_q()
-        .enqueue(SessionEvt::ctrl(
+        .enqueue_ctrl(SessionEvt::ctrl(
             session_id.pool_index().slot(),
             0,
             SessionEvtType::Close,

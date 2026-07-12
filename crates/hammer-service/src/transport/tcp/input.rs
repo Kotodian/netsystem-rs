@@ -16,7 +16,7 @@ use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
 use hammer_core::protocol::tcp::{TcpError, TcpInputFlags, TcpSegmentFlags, tcp_header};
 use hammer_infra::pool::Index as PoolIndex;
-use hammer_infra::segment::Segment;
+use hammer_runtime::app::SessionSegment;
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
     TraceFormatter, add_packet_trace,
@@ -131,7 +131,7 @@ impl TcpInputControlPlane {
     ) -> TcpInputNode<C, Seg>
     where
         C: CongestionController + 'static,
-        Seg: Segment,
+        Seg: SessionSegment,
         crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
     {
         let mut node = TcpInputNode::<C, Seg>::new(Arc::clone(&self.inner), next);
@@ -151,7 +151,7 @@ impl TcpInputControlPlane {
     init = crate::transport::tcp::register_tcp_input,
     role = internal,
 )]
-pub struct TcpInputNode<C: CongestionController + 'static, Seg: Segment> {
+pub struct TcpInputNode<C: CongestionController + 'static, Seg: SessionSegment> {
     #[node(default = register_tcp_input_runtime(snapshot.clone()))]
     runtime_data: NodeRuntimeData,
     snapshot: Arc<ArcSwap<TcpLookupSnapshot>>,
@@ -167,7 +167,7 @@ pub struct TcpInputNode<C: CongestionController + 'static, Seg: Segment> {
 impl<C, Seg> Node for TcpInputNode<C, Seg>
 where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     #[inline(always)]
@@ -255,7 +255,7 @@ fn sync_tcp_input_runtime<C, Seg>(
 ) -> CoreResult<()>
 where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
 {
     let slot = data.usize_word(0)?;
     TCP_INPUT_RUNTIMES.with(|runtimes| {
@@ -277,7 +277,7 @@ fn tcp_input_process<C, Seg>(
 ) -> NodeResult
 where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let state = match tcp_input_runtime(data) {
@@ -310,7 +310,7 @@ fn tcp_input_process_frame<C, Seg>(
 ) -> NodeResult
 where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let width = runtime.preferred_frame_batch_width();
@@ -355,7 +355,7 @@ fn tcp_input_local_next_for_index<C, Seg>(
 ) -> CoreResult<Option<u16>>
 where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let buffer = runtime.get_buffer(index)?;
@@ -395,7 +395,7 @@ fn next_slot_for_index_with_runtime<C, Seg>(
 ) -> CoreResult<Option<u16>>
 where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let traced = runtime.get_buffer(index)?.trace_handle().is_some();
@@ -617,7 +617,7 @@ fn session_or_listener_pending_input_entry<C, Seg>(
 ) -> CoreResult<(Option<(SessionId, DataWorkerId, TcpInputNext)>, bool)>
 where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let Some(session_queue) = session_queue else {
@@ -1359,7 +1359,7 @@ fn prefetch_tcp_input<C, Seg>(
     >,
 ) where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let mut read = 0usize;
@@ -1592,7 +1592,7 @@ fn prefetch_session_route_for_buffer<C, Seg>(
     buffer: &hammer_core::data_plane::Buffer,
 ) where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let Some(session_queue) = session_queue else {

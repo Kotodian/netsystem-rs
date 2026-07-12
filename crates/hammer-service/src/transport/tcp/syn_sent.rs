@@ -5,7 +5,7 @@ use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRunt
 
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::pool::Index as PoolIndex;
-use hammer_infra::segment::Segment;
+use hammer_runtime::app::SessionSegment;
 
 use super::publish_tcp_connection;
 use super::segment::tcp_packet;
@@ -30,7 +30,7 @@ pub enum TcpSynSentNext {
     next = TcpSynSentNext,
     role = internal,
 )]
-pub struct TcpSynSentNode<C: CongestionController + 'static, Seg: Segment> {
+pub struct TcpSynSentNode<C: CongestionController + 'static, Seg: SessionSegment> {
     session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
 }
 
@@ -44,7 +44,7 @@ pub fn register_tcp_syn_sent(runtime: &DataPlaneRuntime, _: usize) -> CoreResult
 impl<C, Seg> Node for TcpSynSentNode<C, Seg>
 where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     #[inline(always)]
@@ -70,7 +70,7 @@ fn tcp_syn_sent_process<C, Seg>(
 ) -> NodeResult
 where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     tcp_syn_sent_frame::<C, Seg>(
@@ -87,7 +87,7 @@ fn tcp_syn_sent_frame<C, Seg>(
 ) -> NodeResult
 where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let input_len = frame.len();
@@ -170,7 +170,7 @@ fn tcp_syn_sent_index<C, Seg>(
 ) -> CoreResult<bool>
 where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let packet = tcp_packet(runtime, index)?;

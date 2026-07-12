@@ -5,7 +5,7 @@ use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::TcpPacket;
 use hammer_core::protocol::tcp::{TcpSeq, TcpState};
 use hammer_infra::pool::{Index, Pool};
-use hammer_infra::segment::Segment;
+use hammer_runtime::app::SessionSegment;
 use hammer_runtime::{DataPlaneRuntime, DataWorkerId};
 
 use super::lookup::TcpLookupState;
@@ -89,7 +89,7 @@ where
         Ok(())
     }
 
-    fn remove_closed_connection<Seg: Segment>(
+    fn remove_closed_connection<Seg: SessionSegment>(
         &mut self,
         sessions: &mut SessionWorker<Index, Seg>,
         index: Index,
@@ -112,7 +112,7 @@ where
         Ok(())
     }
 
-    fn control_output<Seg: Segment>(
+    fn control_output<Seg: SessionSegment>(
         &mut self,
         sessions: &mut SessionWorker<Index, Seg>,
         index: Index,
@@ -162,7 +162,7 @@ where
 impl<C, Seg> SessionTransport<Index, Seg> for TcpWorker<C>
 where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     type Tx = SessionPacketizedTx;
@@ -247,7 +247,7 @@ where
 impl<C, Seg> SessionPacketizedTransport<Index, Seg> for TcpWorker<C>
 where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     #[inline]

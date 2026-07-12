@@ -5,9 +5,9 @@ use hammer_core::error::{HammerError, HammerResult};
 use hammer_infra::fifo::Fifo;
 use hammer_infra::fifo::FifoError;
 use hammer_infra::msg_queue::MsgQueue;
-use hammer_infra::segment::Segment;
+use hammer_infra::segment::{Segment, Svm};
 
-use crate::app::{AppSession, AppSessionConfig, SessionHandle, SessionOffsets};
+use crate::app::{AppSession, AppSessionConfig, SessionHandle, SessionOffsets, SessionSegment};
 
 /// Server side of the Unix-domain-socket attach protocol.
 /// The dataplane binds a listener, accepts app connections, and sends
@@ -18,7 +18,7 @@ pub struct AttachServer {
 
 /// Result of a successful attach: the dataplane-side session object and
 /// the metadata needed by the app process to reconstruct the session.
-pub struct AttachedApp<S: Segment> {
+pub struct AttachedApp<S: SessionSegment> {
     pub session: AppSession<S>,
     pub offsets: SessionOffsets,
     pub shm_fd: RawFd,
@@ -117,19 +117,19 @@ impl AttachServer {
     /// Accept a single app process connection and set up a shared-memory
     /// session. Returns an [`AttachedApp`] with the dataplane-side session
     /// and the metadata the app process needs to reconstruct its side.
-    pub fn accept<S: Segment>(
+    pub fn accept(
         &self,
         config: AppSessionConfig,
-        seg: &S,
+        seg: &Svm,
         handle: SessionHandle,
-    ) -> HammerResult<AttachedApp<S>> {
+    ) -> HammerResult<AttachedApp<Svm>> {
         let offsets =
             SessionOffsets::allocate(seg, config.fifo_capacity as u32, config.evt_q_capacity);
 
         unsafe {
-            Fifo::<S>::init_at(seg.clone(), offsets.rx_fifo_off, config.fifo_capacity)
+            Fifo::<Svm>::init_at(seg.clone(), offsets.rx_fifo_off, config.fifo_capacity)
                 .map_err(|e| HammerError::internal(format!("attach init rx fifo: {e:?}")))?;
-            Fifo::<S>::init_at(seg.clone(), offsets.tx_fifo_off, config.fifo_capacity)
+            Fifo::<Svm>::init_at(seg.clone(), offsets.tx_fifo_off, config.fifo_capacity)
                 .map_err(|e| HammerError::internal(format!("attach init tx fifo: {e:?}")))?;
         }
 
@@ -139,9 +139,9 @@ impl AttachServer {
             .next_power_of_two()
             .max(2);
         unsafe {
-            MsgQueue::<S>::init_at(seg.clone(), offsets.evt_q_off, evt_q_ring)
+            MsgQueue::<Svm>::init_at(seg.clone(), offsets.evt_q_off, evt_q_ring)
                 .map_err(|e| HammerError::internal(format!("attach init evt_q: {e:?}")))?;
-            MsgQueue::<S>::init_at(seg.clone(), offsets.tx_evt_q_off, 64)
+            MsgQueue::<Svm>::init_at(seg.clone(), offsets.tx_evt_q_off, 64)
                 .map_err(|e| HammerError::internal(format!("attach init tx_evt_q: {e:?}")))?;
         }
 
@@ -150,7 +150,7 @@ impl AttachServer {
         let (tx_evt_q_read, tx_evt_q_write) = create_pipe_flags()?;
 
         let session = unsafe {
-            AppSession::<S>::from_segment(
+            AppSession::<Svm>::from_segment(
                 handle,
                 seg,
                 &offsets,

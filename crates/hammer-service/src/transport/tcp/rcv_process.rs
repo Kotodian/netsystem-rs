@@ -3,7 +3,7 @@ use hammer_core::data_plane::{
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::pool::Index as PoolIndex;
-use hammer_infra::segment::Segment;
+use hammer_runtime::app::SessionSegment;
 use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
 
 use crate::session::runtime::RxDelivery;
@@ -29,7 +29,7 @@ pub enum TcpRcvProcessNext {
     next = TcpRcvProcessNext,
     role = internal,
 )]
-pub struct TcpRcvProcessNode<C: CongestionController + 'static, Seg: Segment> {
+pub struct TcpRcvProcessNode<C: CongestionController + 'static, Seg: SessionSegment> {
     session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
 }
 
@@ -43,7 +43,7 @@ pub fn register_tcp_rcv_process(runtime: &DataPlaneRuntime, _: usize) -> CoreRes
 impl<C, Seg> Node for TcpRcvProcessNode<C, Seg>
 where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     #[inline(always)]
@@ -69,7 +69,7 @@ fn tcp_rcv_process_process<C, Seg>(
 ) -> NodeResult
 where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     tcp_rcv_process_frame::<C, Seg>(
@@ -86,7 +86,7 @@ fn tcp_rcv_process_frame<C, Seg>(
 ) -> NodeResult
 where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let input_len = frame.len();
@@ -157,7 +157,7 @@ fn tcp_rcv_process_index<C, Seg>(
 ) -> CoreResult<()>
 where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let packet = tcp_packet(runtime, index)?;

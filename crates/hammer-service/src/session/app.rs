@@ -5,10 +5,13 @@ use hammer_core::data_plane::{DataPlaneBuffers, Index};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::fifo::Fifo;
 use hammer_infra::map::FlatHashTable;
-use hammer_infra::msg_queue::{MsgQueue, SessionEvt, SessionEvtType};
+use hammer_infra::msg_queue::MsgQueue;
 use hammer_infra::segment::{Local, Segment, Svm};
 use hammer_infra::vec::Vec;
-use hammer_runtime::app::AppSession;
+use hammer_runtime::app::{
+    AppSession, FlatSessionMsgQueue, SessionEventQueue, SessionEvt, SessionEvtType,
+    SessionMsgQueue, SessionSegment,
+};
 
 use crate::session::SessionId;
 
@@ -31,16 +34,16 @@ fn checked_add_ooo_accepted(total: u32, accepted: u32) -> CoreResult<u32> {
         .ok_or_else(|| CoreError::internal("ooo rx accepted length overflow"))
 }
 
-pub struct SessionAppRuntime<S: Segment> {
+pub struct SessionAppRuntime<S: SessionSegment> {
     buffers: DataPlaneBuffers,
     sessions: FlatHashTable<u64, Arc<AppSession<S>>>,
     sessions_by_index: Vec<Option<SessionId>>,
-    tx_evt_q: Arc<MsgQueue<S>>,
+    tx_evt_q: Arc<S::EventQueue>,
     worker_index: usize,
     seg: S,
 }
 
-impl<S: Segment> fmt::Debug for SessionAppRuntime<S> {
+impl<S: SessionSegment> fmt::Debug for SessionAppRuntime<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SessionAppRuntime")
             .field("buffers", &self.buffers)
@@ -51,12 +54,12 @@ impl<S: Segment> fmt::Debug for SessionAppRuntime<S> {
     }
 }
 
-impl<S: Segment> SessionAppRuntime<S> {
+impl<S: SessionSegment> SessionAppRuntime<S> {
     #[inline]
     pub fn new(
         session_capacity: usize,
         buffers: DataPlaneBuffers,
-        tx_evt_q: Arc<MsgQueue<S>>,
+        tx_evt_q: Arc<S::EventQueue>,
         worker_index: usize,
         seg: S,
     ) -> Self {
@@ -74,7 +77,7 @@ impl<S: Segment> SessionAppRuntime<S> {
     /// `attach_session_local_with_runtime_tx` shares this same queue, so the
     /// dataplane side can drain all sessions' TX events from one ring.
     #[inline]
-    pub fn tx_evt_q(&self) -> &Arc<MsgQueue<S>> {
+    pub fn tx_evt_q(&self) -> &Arc<S::EventQueue> {
         &self.tx_evt_q
     }
 
@@ -341,8 +344,8 @@ impl<S: Segment> SessionAppRuntime<S> {
 impl SessionAppRuntime<Local> {
     #[inline]
     pub fn default_local() -> CoreResult<Self> {
-        let tx_evt_q = Arc::new(
-            MsgQueue::<Local>::with_capacity(2048)
+        let tx_evt_q: Arc<SessionMsgQueue> = Arc::new(
+            SessionMsgQueue::with_cfg(2048, 1024)
                 .map_err(|_| SessionAppRuntimeError::TxEventQueue)?,
         );
         let mut config = hammer_core::config::Config::default();
@@ -364,9 +367,8 @@ impl SessionAppRuntime<Local> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hammer_infra::msg_queue::SessionEvtType;
     use hammer_infra::pool::Index as PoolIndex;
-    use hammer_runtime::app::{AppSessionConfig, SessionHandle};
+    use hammer_runtime::app::{AppSessionConfig, SessionEvt, SessionEvtType, SessionHandle};
     use std::sync::Mutex;
 
     #[test]
@@ -388,10 +390,10 @@ mod tests {
     fn drain_drops_events_for_unmapped_session_slot() {
         let app = SessionAppRuntime::<Local>::default_local().expect("app runtime");
         app.tx_evt_q()
-            .enqueue(SessionEvt::ctrl(3, 0, SessionEvtType::Close))
+            .enqueue_ctrl(SessionEvt::ctrl(3, 0, SessionEvtType::Close))
             .expect("enqueue close");
         app.tx_evt_q()
-            .enqueue(SessionEvt::io(3, SessionEvtType::TxDeq))
+            .enqueue_io(SessionEvt::io(3, SessionEvtType::TxDeq))
             .expect("enqueue txdeq");
 
         let dispatched = Mutex::new(Vec::new());
@@ -421,7 +423,7 @@ mod tests {
         );
         app.attach_session(session_id, session);
         app.tx_evt_q()
-            .enqueue(SessionEvt::ctrl(5, 9, SessionEvtType::Close))
+            .enqueue_ctrl(SessionEvt::ctrl(5, 9, SessionEvtType::Close))
             .expect("enqueue close for wrong worker");
 
         let dispatched = Mutex::new(Vec::new());
@@ -451,7 +453,7 @@ mod tests {
         );
         app.attach_session(session_id, session);
         app.tx_evt_q()
-            .enqueue(SessionEvt::ctrl(5, 0, SessionEvtType::Close))
+            .enqueue_ctrl(SessionEvt::ctrl(5, 0, SessionEvtType::Close))
             .expect("enqueue close");
 
         let dispatched = Mutex::new(Vec::new());
@@ -471,12 +473,12 @@ mod tests {
 
 impl SessionAppRuntime<Svm> {}
 
-pub trait SessionAppRuntimeCreate<S: Segment> {
+pub trait SessionAppRuntimeCreate<S: SessionSegment> {
     fn create_app_session(
         &self,
         handle: hammer_runtime::app::SessionHandle,
         config: hammer_runtime::app::AppSessionConfig,
-        tx_evt_q: Arc<MsgQueue<S>>,
+        tx_evt_q: Arc<S::EventQueue>,
     ) -> CoreResult<Arc<AppSession<S>>>;
 
     fn notify_rx(&self, session: &AppSession<S>);
@@ -489,7 +491,7 @@ impl SessionAppRuntimeCreate<Local> for SessionAppRuntime<Local> {
         &self,
         handle: hammer_runtime::app::SessionHandle,
         config: hammer_runtime::app::AppSessionConfig,
-        tx_evt_q: Arc<MsgQueue<Local>>,
+        tx_evt_q: Arc<SessionMsgQueue>,
     ) -> CoreResult<Arc<AppSession<Local>>> {
         hammer_runtime::app::with_current_app_worker(self.worker_index, |worker| {
             worker
@@ -519,7 +521,7 @@ impl SessionAppRuntimeCreate<Svm> for SessionAppRuntime<Svm> {
         &self,
         handle: hammer_runtime::app::SessionHandle,
         config: hammer_runtime::app::AppSessionConfig,
-        tx_evt_q: Arc<MsgQueue<Svm>>,
+        tx_evt_q: Arc<FlatSessionMsgQueue<Svm>>,
     ) -> CoreResult<Arc<AppSession<Svm>>> {
         let rx_fifo = Arc::new(
             Fifo::<Svm>::new(self.seg.clone(), config.fifo_capacity)
@@ -534,10 +536,10 @@ impl SessionAppRuntimeCreate<Svm> for SessionAppRuntime<Svm> {
             .saturating_add(1)
             .next_power_of_two()
             .max(2);
-        let evt_q = Arc::new(
+        let evt_q = Arc::new(FlatSessionMsgQueue::new(
             MsgQueue::<Svm>::new(self.seg.clone(), evt_q_ring)
                 .map_err(|e| CoreError::internal(format!("svm evt_q: {e:?}")))?,
-        );
+        ));
 
         let session = Arc::new(AppSession::<Svm>::from_parts(
             rx_fifo, tx_fifo, evt_q, tx_evt_q, handle,

@@ -6,7 +6,7 @@ use hammer_core::data_plane::{
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::{TcpConnectionId, TcpError, TcpPacket, TcpSegmentFlags, TcpSeq};
 use hammer_infra::pool::Index as PoolIndex;
-use hammer_infra::segment::Segment;
+use hammer_runtime::app::SessionSegment;
 use hammer_infra::vec::Vec;
 use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
 
@@ -42,7 +42,7 @@ pub enum TcpListenNext {
     next = TcpListenNext,
     role = internal,
 )]
-pub struct TcpListenNode<C: CongestionController + 'static, Seg: Segment> {
+pub struct TcpListenNode<C: CongestionController + 'static, Seg: SessionSegment> {
     control: TcpInputControlPlane,
     session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
     #[node(default = Cell::new(None))]
@@ -89,7 +89,7 @@ fn tcp_listen_runtime_data<C, Seg>(
 ) -> CoreResult<NodeRuntimeData>
 where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
 {
     let queue_data = session_queue.runtime_data();
     let control_slot = register_tcp_listen_control(control_slot, control)?;
@@ -116,7 +116,7 @@ fn tcp_listen_control(data: NodeRuntimeData) -> CoreResult<TcpInputControlPlane>
 impl<C, Seg> Node for TcpListenNode<C, Seg>
 where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     #[inline(always)]
@@ -142,7 +142,7 @@ fn tcp_listen_process<C, Seg>(
 ) -> NodeResult
 where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let control = match tcp_listen_control(data) {
@@ -166,7 +166,7 @@ fn tcp_listen_process_frame<C, Seg>(
 ) -> NodeResult
 where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let input_len = frame.len();
@@ -239,7 +239,7 @@ fn tcp_listen_index<C, Seg>(
 ) -> CoreResult<()>
 where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let packet = tcp_packet(runtime, index)?;
@@ -1183,7 +1183,7 @@ fn tcp_handle_listener_packet<C, Seg>(
 ) -> CoreResult<(Option<TcpSegment>, Option<SessionId>)>
 where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     if packet.flags == TcpSegmentFlags::SYN {
@@ -1212,7 +1212,7 @@ fn tcp_issue_listener_challenge<C, Seg>(
 ) -> CoreResult<(Option<TcpSegment>, Option<SessionId>)>
 where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let fast_open_valid = if packet.payload_len != 0 && capabilities.fast_open {
@@ -1308,7 +1308,7 @@ fn tcp_accept_listener_fast_open<C, Seg>(
 ) -> CoreResult<(Option<TcpSegment>, Option<SessionId>)>
 where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let worker = queue.worker();
@@ -1377,7 +1377,7 @@ fn tcp_complete_listener_open<C, Seg>(
 ) -> CoreResult<(Option<TcpSegment>, Option<SessionId>)>
 where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let Some(acknowledgment) = packet.acknowledgment else {

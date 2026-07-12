@@ -6,10 +6,13 @@ use crossbeam_utils::CachePadded;
 use hammer_core::data_plane::{BufferFrame, DataPlaneBuffers, Frame, Index, Next};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::fifo_queue::FifoQueue;
-use hammer_infra::msg_queue::{MsgQueue, SessionEvtType};
+use hammer_infra::msg_queue::MsgQueue;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::segment::{Local, Segment, Svm};
-use hammer_runtime::app::{AppContext, AppSessionConfig, SessionHandle, with_current_app_worker};
+use hammer_runtime::app::{
+    AppContext, AppSessionConfig, FlatSessionMsgQueue, SessionEvtType, SessionHandle,
+    SessionMsgQueue, SessionSegment, with_current_app_worker,
+};
 use hammer_runtime::{DataPlaneRuntime, DataWorkerId, NodeRuntimeData};
 
 use crate::session::app::SessionAppRuntimeCreate;
@@ -101,7 +104,7 @@ impl<Index> SessionEntry<Index> {
     }
 }
 
-pub struct SessionWorker<Index, Seg: Segment = Local> {
+pub struct SessionWorker<Index, Seg: SessionSegment = Local> {
     worker: DataWorkerId,
     entries: Pool<SessionEntry<Index>>,
     app: SessionAppRuntime<Seg>,
@@ -113,19 +116,15 @@ pub struct SessionWorker<Index, Seg: Segment = Local> {
     control_events: FifoQueue<SessionControlEvent>,
 }
 
-impl<Index: Copy + Eq, Seg: Segment> SessionWorker<Index, Seg> {
+impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
     fn with_app_session_config(
         worker: DataWorkerId,
         buffers: DataPlaneBuffers,
         app_session_config: AppSessionConfig,
         seg: Seg,
         worker_index: usize,
+        tx_evt_q: Arc<Seg::EventQueue>,
     ) -> Self {
-        let tx_evt_q = Arc::new(
-            MsgQueue::<Seg>::new(seg.clone(), DEFAULT_SESSION_TX_EVENT_CAPACITY)
-                .map_err(|error| CoreError::internal(format!("tx_evt_q: {error:?}")))
-                .expect("tx_evt_q allocation"),
-        );
         Self {
             worker,
             entries: Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
@@ -390,14 +389,14 @@ impl<Index: Copy + Eq, Seg: Segment> SessionWorker<Index, Seg> {
     }
 }
 
-pub struct SessionDriverRuntime<T, Seg: Segment = Local, Index = PoolIndex> {
+pub struct SessionDriverRuntime<T, Seg: SessionSegment = Local, Index = PoolIndex> {
     sessions: CachePadded<SessionWorker<Index, Seg>>,
     transports: CachePadded<T>,
 }
 
 impl<T, Seg, Index> SessionDriverRuntime<T, Seg, Index>
 where
-    Seg: Segment,
+    Seg: SessionSegment,
     Index: Copy + Eq,
 {
     fn with_app_session_config(
@@ -407,6 +406,7 @@ where
         app_session_config: AppSessionConfig,
         seg: Seg,
         worker_index: usize,
+        tx_evt_q: Arc<Seg::EventQueue>,
     ) -> Self {
         Self {
             sessions: CachePadded::new(SessionWorker::with_app_session_config(
@@ -415,6 +415,7 @@ where
                 app_session_config,
                 seg,
                 worker_index,
+                tx_evt_q,
             )),
             transports: CachePadded::new(transports),
         }
@@ -538,6 +539,10 @@ where
 
 impl<T, Index: Copy + Eq> SessionDriverRuntime<T, Local, Index> {
     pub fn new(worker: DataWorkerId, buffers: DataPlaneBuffers, transports: T) -> Self {
+        let cap = DEFAULT_SESSION_TX_EVENT_CAPACITY.next_power_of_two().max(2) as u32;
+        let tx_evt_q = Arc::new(
+            SessionMsgQueue::with_cfg(cap, cap.max(2)).expect("local tx_evt_q"),
+        );
         Self::with_app_session_config(
             worker,
             buffers,
@@ -545,6 +550,7 @@ impl<T, Index: Copy + Eq> SessionDriverRuntime<T, Local, Index> {
             AppSessionConfig::default(),
             Local::default(),
             worker.slot(),
+            tx_evt_q,
         )
     }
 
@@ -554,6 +560,10 @@ impl<T, Index: Copy + Eq> SessionDriverRuntime<T, Local, Index> {
         transports: T,
         app_context: AppContext<Local>,
     ) -> Self {
+        let cap = DEFAULT_SESSION_TX_EVENT_CAPACITY.next_power_of_two().max(2) as u32;
+        let tx_evt_q = Arc::new(
+            SessionMsgQueue::with_cfg(cap, cap.max(2)).expect("local tx_evt_q"),
+        );
         let mut driver = Self::with_app_session_config(
             worker,
             buffers,
@@ -561,6 +571,7 @@ impl<T, Index: Copy + Eq> SessionDriverRuntime<T, Local, Index> {
             app_context.app_session_config(),
             Local::default(),
             worker.slot(),
+            tx_evt_q,
         );
         driver.sessions.app_context = Some(app_context);
         driver
@@ -574,13 +585,19 @@ impl<T, Index: Copy + Eq> SessionDriverRuntime<T, Svm, Index> {
         transports: T,
         app_session_config: AppSessionConfig,
     ) -> Self {
+        let seg = Svm::default();
+        let tx_evt_q = Arc::new(FlatSessionMsgQueue::new(
+            MsgQueue::<Svm>::new(seg.clone(), DEFAULT_SESSION_TX_EVENT_CAPACITY)
+                .expect("svm tx_evt_q"),
+        ));
         Self::with_app_session_config(
             worker,
             buffers,
             transports,
             app_session_config,
-            Svm::default(),
+            seg,
             worker.slot(),
+            tx_evt_q,
         )
     }
 }
@@ -608,7 +625,7 @@ pub struct TxBatchBuffer {
     pub payload_len: usize,
 }
 
-pub trait SessionTransport<Index, Seg: Segment>: Sized {
+pub trait SessionTransport<Index, Seg: SessionSegment>: Sized {
     type Tx: SessionTxStrategy<Self, Index, Seg>;
 
     const ID: SessionTransportId;
@@ -635,7 +652,7 @@ pub trait SessionTransport<Index, Seg: Segment>: Sized {
     ) -> CoreResult<()>;
 }
 
-pub trait SessionPacketizedTransport<Index, Seg: Segment>: SessionTransport<Index, Seg> {
+pub trait SessionPacketizedTransport<Index, Seg: SessionSegment>: SessionTransport<Index, Seg> {
     fn control_tx(
         &mut self,
         sessions: &mut SessionWorker<Index, Seg>,
@@ -664,7 +681,7 @@ pub trait SessionPacketizedTransport<Index, Seg: Segment>: SessionTransport<Inde
     ) -> CoreResult<()>;
 }
 
-pub trait TransportInternalTransport<Index, Seg: Segment>: SessionTransport<Index, Seg> {
+pub trait TransportInternalTransport<Index, Seg: SessionSegment>: SessionTransport<Index, Seg> {
     fn internal_tx(
         &mut self,
         sessions: &mut SessionWorker<Index, Seg>,
@@ -677,7 +694,7 @@ pub trait TransportInternalTransport<Index, Seg: Segment>: SessionTransport<Inde
     ) -> CoreResult<()>;
 }
 
-pub trait SessionTxStrategy<T, Index, Seg: Segment>
+pub trait SessionTxStrategy<T, Index, Seg: SessionSegment>
 where
     T: SessionTransport<Index, Seg>,
 {
@@ -701,7 +718,7 @@ impl<T, Index, Seg> SessionTxStrategy<T, Index, Seg> for SessionPacketizedTx
 where
     T: SessionPacketizedTransport<Index, Seg>,
     Index: Copy + Eq,
-    Seg: Segment,
+    Seg: SessionSegment,
     SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     fn dispatch(
@@ -780,7 +797,7 @@ impl<T, Index, Seg> SessionTxStrategy<T, Index, Seg> for TransportInternalTx
 where
     T: TransportInternalTransport<Index, Seg>,
     Index: Copy + Eq,
-    Seg: Segment,
+    Seg: SessionSegment,
 {
     #[inline]
     fn dispatch(
@@ -798,7 +815,7 @@ where
     }
 }
 
-pub trait SessionTransports<Index, Seg: Segment> {
+pub trait SessionTransports<Index, Seg: SessionSegment> {
     fn update_time(
         &mut self,
         sessions: &mut SessionWorker<Index, Seg>,
@@ -835,7 +852,7 @@ pub trait SessionTransports<Index, Seg: Segment> {
     ) -> CoreResult<()>;
 }
 
-impl<Index, Seg: Segment> SessionTransports<Index, Seg> for () {
+impl<Index, Seg: SessionSegment> SessionTransports<Index, Seg> for () {
     fn update_time(
         &mut self,
         _: &mut SessionWorker<Index, Seg>,
@@ -883,7 +900,7 @@ where
     Head: SessionTransport<Index, Seg>,
     Tail: SessionTransports<Index, Seg>,
     Index: Copy + Eq,
-    Seg: Segment,
+    Seg: SessionSegment,
 {
     fn update_time(
         &mut self,
@@ -976,7 +993,7 @@ pub fn dispatch_session_queue_once<T, Seg, Index>(
 ) -> CoreResult<SessionQueueStep>
 where
     T: SessionTransports<Index, Seg>,
-    Seg: Segment,
+    Seg: SessionSegment,
     Index: Copy + Eq,
     SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
@@ -1006,7 +1023,7 @@ pub(crate) fn dispatch_registered_session_queue_once_at<T, Seg, Index>(
 ) -> CoreResult<()>
 where
     T: SessionTransports<Index, Seg> + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     Index: Copy + Eq + 'static,
     SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
@@ -1026,7 +1043,7 @@ pub fn dispatch_session_queue_pending<T, Seg, Index>(
 ) -> CoreResult<SessionQueueStep>
 where
     T: SessionTransports<Index, Seg>,
-    Seg: Segment,
+    Seg: SessionSegment,
     Index: Copy + Eq,
     SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {

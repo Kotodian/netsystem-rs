@@ -22,7 +22,7 @@ use crate::session::{
 };
 use crate::transport::congestion::CongestionController;
 use hammer_infra::pool::Index as PoolIndex;
-use hammer_infra::segment::Segment;
+use hammer_runtime::app::SessionSegment;
 
 pub mod congestion;
 pub mod connection;
@@ -62,7 +62,7 @@ pub(crate) use worker::TcpWorker;
 impl<C, Seg> SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>
 where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     #[inline]
@@ -139,7 +139,7 @@ impl TcpMain {
     ) -> CoreResult<NodeId>
     where
         C: CongestionController + 'static,
-        Seg: Segment,
+        Seg: SessionSegment,
         crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
     {
         let worker_id = DataWorkerId::new(
@@ -193,7 +193,7 @@ fn register_typed_worker_graph<C, Seg>(
 ) -> CoreResult<SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>>
 where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let queue = crate::session::node::register_session_queue(driver)?;
@@ -519,7 +519,7 @@ fn publish_tcp_connection<C, Seg>(
 ) -> CoreResult<()>
 where
     C: CongestionController + 'static,
-    Seg: Segment,
+    Seg: SessionSegment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let (_, index) = driver

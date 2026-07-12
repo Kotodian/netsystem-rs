@@ -17,7 +17,7 @@ use crate::session::runtime::{
     TransportSendFlags, TransportSendParams, TxBatchBuffer,
     dispatch_registered_session_queue_once_at, dispatch_session_queue_once,
 };
-use hammer_infra::msg_queue::{SessionEvt, SessionEvtType};
+use hammer_runtime::app::{SessionEvt, SessionEvtType};
 use hammer_runtime::app::{AppSession, AppSessionConfig, SessionHandle};
 
 #[derive(Default)]
@@ -824,7 +824,7 @@ fn transport_deleted_then_queued_app_close_releases_the_session_slot() {
         .sessions_mut()
         .notify_transport_deleted(session_id, transport_index);
     app.tx_evt_q()
-        .enqueue(SessionEvt::ctrl(
+        .enqueue_ctrl(SessionEvt::ctrl(
             session_id.pool_index().slot(),
             0,
             SessionEvtType::Close,
