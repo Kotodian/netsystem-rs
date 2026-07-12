@@ -5,4 +5,6 @@
 //! each entry's `init` fn; `NodeRuntime::resolve_named_next_nodes` links by
 //! name (VPP `vlib_node_main_init`).
 
+mod fanout;
+
 pub use crate::NodeEntry;

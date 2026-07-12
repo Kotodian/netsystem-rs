@@ -25,8 +25,8 @@ A named graph edge selected through a current-node-local `u16` slot for a packet
 _Avoid_: output callback, destination handler, manually routed node id, second local-next type, next-count trait requirement
 
 **Graph Fanout**:
-A worker-local graph operation that groups packet ownership by selected Next Arc and makes the resulting Next Frames visible at the current Graph Node dispatch boundary. Cross-worker ownership transfer remains Handoff, not Graph Fanout.
-_Avoid_: cross-thread fanout, handoff enqueue, output router
+The sole worker-local next-frame enqueue: it groups packet ownership by selected Next Arc and makes the resulting Next Frames visible at the current Graph Node dispatch boundary. Cross-worker ownership transfer remains Handoff, not Graph Fanout.
+_Avoid_: cross-thread fanout, handoff enqueue, output router, per-node manual frame get/push/put, recoverable enqueue Result on the packet path
 
 **Graph Identity**:
 The core vocabulary that names packet graph participants and their static edge shape, such as node ids, node handles, node kinds, node states, node registrations, and next-arc labels. Graph identity is data-plane vocabulary, not graph execution policy.

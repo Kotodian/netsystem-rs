@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::rc::Rc;
 
@@ -31,16 +31,36 @@ pub struct DataPlaneRuntimeConfig {
     pub buffers: DataPlaneBufferConfig,
 }
 
-#[derive(Debug)]
 pub struct DataPlaneRuntime {
     buffers: DataPlaneBuffers,
     nodes: NodeRuntime,
     current_node: Rc<Cell<Option<NodeId>>>,
+    /// Worker-local appendable Next Frame per (current node × local slot).
+    pub(crate) appendable_next_frames: RefCell<Vec<(NodeId, u16, Frame<Next>)>>,
     handoff: Option<DataPlaneHandoffWorker>,
     handoff_node_handle: Option<NodeHandle>,
     active_numa_node: u32,
     trace: DataPlaneTrace,
     instruction_set: DataPlaneInstructionSet,
+}
+
+impl fmt::Debug for DataPlaneRuntime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DataPlaneRuntime")
+            .field("buffers", &self.buffers)
+            .field("nodes", &self.nodes)
+            .field("current_node", &self.current_node.get())
+            .field(
+                "appendable_next_frames",
+                &self.appendable_next_frames.borrow().len(),
+            )
+            .field("handoff", &self.handoff)
+            .field("handoff_node_handle", &self.handoff_node_handle)
+            .field("active_numa_node", &self.active_numa_node)
+            .field("trace", &self.trace)
+            .field("instruction_set", &self.instruction_set)
+            .finish()
+    }
 }
 
 pub(crate) type RuntimeDataPlaneRuntime = DataPlaneRuntime;
@@ -104,6 +124,7 @@ impl Clone for DataPlaneRuntime {
             buffers: self.buffers.clone(),
             nodes: self.nodes.clone(),
             current_node: Rc::clone(&self.current_node),
+            appendable_next_frames: RefCell::new(Vec::new()),
             handoff: self.handoff.clone(),
             handoff_node_handle: self.handoff_node_handle,
             active_numa_node: self.active_numa_node,
@@ -167,6 +188,7 @@ impl DataPlaneRuntime {
             buffers,
             nodes: NodeRuntime::default(),
             current_node: Rc::new(Cell::new(None)),
+            appendable_next_frames: RefCell::new(Vec::new()),
             handoff: None,
             handoff_node_handle: None,
             trace: DataPlaneTrace::default(),

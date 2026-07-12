@@ -1415,6 +1415,7 @@ impl NodeRuntime {
             let start = Instant::now();
             let frame = slot.dispatch(runtime, frame);
             let elapsed_ns = elapsed_ns(start);
+            runtime.flush_fanout_appendable();
             runtime.set_current_node(None);
             let _ = self.record_runtime_stats(node, vectors, elapsed_ns);
             processed += 1;
