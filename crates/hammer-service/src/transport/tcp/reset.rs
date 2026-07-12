@@ -279,6 +279,9 @@ fn tcp_reset_write_ipv4_reply(
     reset.fill(0);
     reset[0] = 0x45;
     write_be_u16(reset, 2, total_len as u16);
+    if crate::transport::active_tcp_policy().pmtu_enabled {
+        hammer_core::protocol::ip::apply_ipv4_dont_fragment(reset, true);
+    }
     reset[8] = 64;
     reset[9] = 6;
     write_bytes(reset, 12, &source[..4]);

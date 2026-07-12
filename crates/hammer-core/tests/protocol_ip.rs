@@ -1,9 +1,61 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use hammer_core::protocol::ip::{
-    IpFragmentKey, parse_ip_fragment, parse_ip_fragment_with_chain_len,
+    IPV4_FLAG_DONT_FRAGMENT, IpFragmentKey, apply_ipv4_dont_fragment, parse_ip_fragment,
+    parse_ip_fragment_with_chain_len, read_ipv4_flags_fragment, write_ipv4_push_header,
 };
 use hammer_infra::bihash::{Bihash, BihashKey};
+
+#[test]
+fn write_ipv4_push_header_matches_vpp_vlib_buffer_push_ip4_always_df() {
+    // VPP vlib_buffer_push_ip4 → push_ip4_custom(..., is_df=1, ttl=255).
+    let mut header = [0u8; 20];
+    write_ipv4_push_header(
+        &mut header,
+        Ipv4Addr::new(192, 0, 2, 10),
+        Ipv4Addr::new(198, 51, 100, 20),
+        6,
+        24,
+    )
+    .expect("push");
+    assert_eq!(header[0], 0x45);
+    assert_eq!(u16::from_be_bytes([header[2], header[3]]), 24);
+    assert_eq!(
+        read_ipv4_flags_fragment(&header).expect("flags") & IPV4_FLAG_DONT_FRAGMENT,
+        IPV4_FLAG_DONT_FRAGMENT
+    );
+    assert_eq!(header[8], 255);
+    assert_eq!(header[9], 6);
+    assert_eq!(&header[12..16], &[192, 0, 2, 10]);
+    assert_eq!(&header[16..20], &[198, 51, 100, 20]);
+    assert_eq!(internet_checksum(&header), 0);
+}
+
+#[test]
+fn apply_ipv4_dont_fragment_sets_df_bit_without_clearing_offset() {
+    let mut header = [0u8; 20];
+    header[0] = 0x45;
+    // Pre-existing fragment offset 16 (words) = 0x0010 in flags/frag field.
+    header[6..8].copy_from_slice(&0x0010u16.to_be_bytes());
+
+    apply_ipv4_dont_fragment(&mut header, true);
+
+    let flags = read_ipv4_flags_fragment(&header).expect("flags");
+    assert_eq!(flags & IPV4_FLAG_DONT_FRAGMENT, IPV4_FLAG_DONT_FRAGMENT);
+    assert_eq!(flags & 0x1fff, 0x0010);
+}
+
+#[test]
+fn apply_ipv4_dont_fragment_disabled_clears_df_bit() {
+    let mut header = [0u8; 20];
+    header[0] = 0x45;
+    header[6..8].copy_from_slice(&IPV4_FLAG_DONT_FRAGMENT.to_be_bytes());
+
+    apply_ipv4_dont_fragment(&mut header, false);
+
+    let flags = read_ipv4_flags_fragment(&header).expect("flags");
+    assert_eq!(flags & IPV4_FLAG_DONT_FRAGMENT, 0);
+}
 
 #[test]
 fn parse_ipv4_fragment_accepts_payload_spanning_buffer_chain() {

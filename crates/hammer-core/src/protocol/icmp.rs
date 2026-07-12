@@ -3,7 +3,7 @@ use std::num::NonZeroU64;
 
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 
-use super::ip::{IpProtocol, IpVersion, parse_ip_header};
+use super::ip::{IpProtocol, IpVersion, apply_ipv4_dont_fragment, parse_ip_header};
 use super::wire::read_header;
 
 #[derive(Clone, Copy)]
@@ -193,6 +193,7 @@ pub fn build_echo_reply(packet: &[u8]) -> Result<IcmpGeneratedPacket, IcmpBuildE
             icmp[2..4].copy_from_slice(&checksum.to_be_bytes());
             swap_ranges::<4>(&mut reply, IPV4_SOURCE_OFFSET, IPV4_DESTINATION_OFFSET);
             reply[IPV4_TTL_OFFSET] = LOCAL_ORIGINATED_TTL;
+            apply_ipv4_dont_fragment(&mut reply, true);
             update_ipv4_header_checksum(&mut reply, parsed.network_header_len);
             Ok(IcmpGeneratedPacket {
                 packet: reply,
@@ -277,6 +278,7 @@ fn build_ipv4_icmp_error(
     packet[IPV4_PROTOCOL_OFFSET] = ICMP_PROTOCOL_V4;
     packet[IPV4_SOURCE_OFFSET..IPV4_SOURCE_OFFSET + 4].copy_from_slice(&local_source.octets());
     packet[IPV4_DESTINATION_OFFSET..IPV4_DESTINATION_OFFSET + 4].copy_from_slice(&source.octets());
+    apply_ipv4_dont_fragment(&mut packet, true);
     let icmp_offset = IPV4_HEADER_MIN_LEN;
     packet[icmp_offset] = metadata.icmp_type();
     packet[icmp_offset + 1] = metadata.code();
@@ -435,6 +437,40 @@ mod tests {
         assert_eq!(&reply.packet[24..], &request[24..]);
         assert_eq!(internet_checksum(&reply.packet[..20]), 0);
         assert_eq!(internet_checksum(&reply.packet[20..]), 0);
+    }
+
+    #[test]
+    fn build_echo_reply_sets_ipv4_dont_fragment() {
+        use crate::protocol::ip::{IPV4_FLAG_DONT_FRAGMENT, read_ipv4_flags_fragment};
+
+        let request = ipv4_icmp_echo_packet(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(192, 0, 2, 1),
+            b"echo4",
+        );
+        let reply = build_echo_reply(&request).expect("echo reply");
+        let flags = read_ipv4_flags_fragment(&reply.packet).expect("flags");
+        assert_eq!(flags & IPV4_FLAG_DONT_FRAGMENT, IPV4_FLAG_DONT_FRAGMENT);
+    }
+
+    #[test]
+    fn build_icmp_error_packet_sets_ipv4_dont_fragment() {
+        use crate::protocol::ip::{IPV4_FLAG_DONT_FRAGMENT, read_ipv4_flags_fragment};
+
+        let original = ipv4_packet(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(192, 0, 2, 1),
+            6,
+            8,
+        );
+        let error = build_icmp_error_packet(
+            &original,
+            IcmpErrorMetadata::ipv4_destination_unreachable(4, 576),
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+        )
+        .expect("error");
+        let flags = read_ipv4_flags_fragment(&error.packet).expect("flags");
+        assert_eq!(flags & IPV4_FLAG_DONT_FRAGMENT, IPV4_FLAG_DONT_FRAGMENT);
     }
 
     #[test]

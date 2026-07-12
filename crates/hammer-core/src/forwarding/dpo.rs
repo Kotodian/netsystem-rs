@@ -425,4 +425,22 @@ pub struct Adjacency<N> {
     pub proto: DpoProto,
     pub egress_interface: Option<u32>,
     pub rewrite: AdjacencyRewrite,
+    /// Operational L3 MTU in bytes — VPP `rewrite_header.max_l3_packet_bytes`.
+    pub max_l3_packet_bytes: u16,
+}
+
+/// Default Ethernet L3 MTU used when interface MTU has not been applied yet.
+pub const DEFAULT_ADJACENCY_L3_MTU: u16 = 1_500;
+
+impl<N> Adjacency<N> {
+    /// VPP `adj_nbr_set_mtu`: `path_mtu == 0` restores `link_mtu`; otherwise
+    /// clamps to `min(link_mtu, path_mtu)`.
+    #[inline]
+    pub fn set_path_mtu(&mut self, link_mtu: u16, path_mtu: u16) {
+        if path_mtu == 0 {
+            self.max_l3_packet_bytes = link_mtu;
+        } else {
+            self.max_l3_packet_bytes = link_mtu.min(path_mtu);
+        }
+    }
 }

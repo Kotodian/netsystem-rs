@@ -1,6 +1,7 @@
 pub mod icmp;
 pub mod input;
 pub mod local;
+pub mod pmtu;
 pub mod reassembly;
 
 use std::net::IpAddr;
@@ -18,12 +19,17 @@ use hammer_runtime::Network;
 pub use icmp::{
     IcmpEchoRequestNext, IcmpEchoRequestNode, IcmpEchoRequestTrace, IcmpErrorNext, IcmpErrorNode,
     IcmpErrorSourceTable, IcmpErrorSourceTableHandle, IcmpErrorTrace, IcmpInputControlPlane,
-    IcmpInputError, IcmpInputNode, IcmpInputTrace, IcmpNodeError,
+    IcmpInputError, IcmpInputNode, IcmpInputTrace, IcmpNodeError, IcmpPathMtuNode,
 };
 pub use input::{IpInputNext, IpInputNode, IpInputTrace, IpUnicastArc};
 pub use local::{
     IpLocalArc, IpLocalControlPlane, IpLocalError, IpLocalNext, IpLocalNode, IpLocalSourceCheck,
     IpLocalTrace, IpLocalTraceStage, IpReceiveNode,
+};
+pub use pmtu::{
+    IPV4_MIN_PATH_MTU, IPV4_TCP_BASE_OVERHEAD, PATH_MTU_CACHE, PathMtuCache,
+    apply_ipv4_frag_needed_icmp, ipv4_path_mtu_to_mss, path_mtu_cache,
+    process_ipv4_icmp_path_mtu_packet, publish_path_mtu_cache, reset_path_mtu_cache_for_test,
 };
 pub use reassembly::{
     IpReassemblyDirectory, IpReassemblyExpireWalk, IpReassemblyHandoff, IpReassemblyNext,

@@ -1,13 +1,15 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::error::{CoreError, CoreResult};
-use crate::protocol::wire::read_header;
+use crate::protocol::wire::{header_mut_ptr, read_header};
 use hammer_infra::bihash::{BihashKey, hash_words, splitmix64};
 use hammer_infra::checksum::internet_checksum;
 
 const IPV4_HEADER_MIN_LEN: usize = 20;
 const IPV6_HEADER_LEN: usize = 40;
 const IPV4_FLAG_MORE_FRAGMENTS: u16 = 0x2000;
+/// IPv4 Don't Fragment flag (RFC 791).
+pub const IPV4_FLAG_DONT_FRAGMENT: u16 = 0x4000;
 const IPV4_FRAGMENT_OFFSET_MASK: u16 = 0x1fff;
 const IPV6_NEXT_HEADER_FRAGMENT: u8 = 44;
 const IPV6_FRAGMENT_HEADER_LEN: usize = 8;
@@ -199,6 +201,11 @@ impl Ipv4Header {
     #[inline(always)]
     pub fn flags_fragment(self) -> u16 {
         u16::from_be_bytes(self.flags_fragment)
+    }
+
+    #[inline(always)]
+    pub fn dont_fragment(self) -> bool {
+        self.flags_fragment() & IPV4_FLAG_DONT_FRAGMENT != 0
     }
 
     #[inline(always)]
@@ -540,4 +547,115 @@ fn parse_ipv6_fragment(packet: &[u8], chain_len: usize) -> CoreResult<ParsedIpFr
         more_fragments,
         header_len: IPV6_HEADER_LEN + IPV6_FRAGMENT_HEADER_LEN,
     })
+}
+
+/// Read the IPv4 flags/fragment field from a raw header.
+#[inline]
+pub fn read_ipv4_flags_fragment(header: &[u8]) -> Option<u16> {
+    let bytes = header.get(6..8)?;
+    Some(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+/// Set or clear the IPv4 Don't Fragment flag on a raw header in place.
+#[inline]
+pub fn apply_ipv4_dont_fragment(output: &mut [u8], enabled: bool) {
+    let Ok(ptr) = header_mut_ptr::<Ipv4Header>(output, 0) else {
+        return;
+    };
+    // SAFETY: `header_mut_ptr` checked the range; fields are byte arrays only.
+    let header = unsafe { &mut *ptr };
+    let mut flags = u16::from_be_bytes(header.flags_fragment);
+    if enabled {
+        flags |= IPV4_FLAG_DONT_FRAGMENT;
+    } else {
+        flags &= !IPV4_FLAG_DONT_FRAGMENT;
+    }
+    header.flags_fragment = flags.to_be_bytes();
+}
+
+/// Write a locally originated IPv4 header like VPP `vlib_buffer_push_ip4`.
+///
+/// Always sets DF (`is_df=1`) and TTL 255. Does not support fragmentation.
+/// `output` must hold at least an [`Ipv4Header`]; `total_len` is the full L3
+/// packet length including this header.
+#[inline]
+pub fn write_ipv4_push_header(
+    output: &mut [u8],
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    protocol: u8,
+    total_len: u16,
+) -> CoreResult<()> {
+    let ptr = header_mut_ptr::<Ipv4Header>(output, 0)?;
+    // SAFETY: `header_mut_ptr` checked the range; `Ipv4Header` fields are only
+    // byte arrays so mutable field access cannot create unaligned multi-byte refs.
+    unsafe {
+        ptr.write(Ipv4Header {
+            version_ihl: 0x45,
+            dscp_ecn: 0,
+            total_len: total_len.to_be_bytes(),
+            identification: [0; 2],
+            flags_fragment: IPV4_FLAG_DONT_FRAGMENT.to_be_bytes(),
+            ttl: 255,
+            protocol,
+            checksum: [0; 2],
+            source: src.octets(),
+            destination: dst.octets(),
+        });
+    }
+    let checksum = internet_checksum(&output[..IPV4_HEADER_MIN_LEN]);
+    // SAFETY: range already validated above.
+    unsafe {
+        (*ptr).checksum = checksum.to_be_bytes();
+    }
+    Ok(())
+}
+
+/// Write a locally originated IPv6 header like VPP `vlib_buffer_push_ip6`.
+#[inline]
+pub fn write_ipv6_push_header(
+    output: &mut [u8],
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    next_header: u8,
+    payload_len: u16,
+) -> CoreResult<()> {
+    let ptr = header_mut_ptr::<Ipv6Header>(output, 0)?;
+    // SAFETY: same as `write_ipv4_push_header` — packed wire layout, byte fields only.
+    let header = unsafe { &mut *ptr };
+    *header = Ipv6Header {
+        version_traffic_flow: [0x60, 0, 0, 0],
+        payload_len: payload_len.to_be_bytes(),
+        next_header,
+        hop_limit: 255,
+        source: src.octets(),
+        destination: dst.octets(),
+    };
+    Ok(())
+}
+
+/// Result of VPP-style `ip4_mtu_check` at adjacency rewrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ipv4MtuAction {
+    Ok,
+    /// Packet exceeds adj MTU and DF is clear → fragment.
+    Fragment { mtu: u16 },
+    /// Packet exceeds adj MTU and DF is set → ICMP Frag-Needed.
+    IcmpFragNeeded { mtu: u16 },
+}
+
+/// VPP `ip4_mtu_check`: compare L3 packet length to adjacency `max_l3_packet_bytes`.
+#[inline]
+pub fn ipv4_mtu_check(packet_len: u16, adj_packet_bytes: u16, dont_fragment: bool) -> Ipv4MtuAction {
+    if packet_len <= adj_packet_bytes {
+        Ipv4MtuAction::Ok
+    } else if dont_fragment {
+        Ipv4MtuAction::IcmpFragNeeded {
+            mtu: adj_packet_bytes,
+        }
+    } else {
+        Ipv4MtuAction::Fragment {
+            mtu: adj_packet_bytes,
+        }
+    }
 }

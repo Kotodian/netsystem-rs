@@ -686,6 +686,23 @@ impl Node for IcmpEchoRequestNode {
     }
 }
 
+/// Consume IPv4 ICMP Destination Unreachable / Fragmentation Needed and update
+/// the IP-owned path MTU cache (Hammer extension beyond VPP core TCP PMTU).
+#[hammer_component_macros::node(role = internal)]
+pub struct IcmpPathMtuNode;
+
+impl Node for IcmpPathMtuNode {
+    #[inline(always)]
+    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
+        icmp_path_mtu_process_frame(runtime, frame)
+    }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        icmp_path_mtu_process
+    }
+}
+
 #[derive(Clone)]
 struct IcmpInputRuntime {
     snapshot: IcmpInputSnapshotHandle,
@@ -734,6 +751,30 @@ fn icmp_echo_request_process(
     frame: &mut BufferFrame,
 ) -> NodeResult {
     icmp_echo_request_process_frame(runtime, frame)
+}
+
+fn icmp_path_mtu_process(
+    runtime: &DataPlaneRuntime,
+    _: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> NodeResult {
+    icmp_path_mtu_process_frame(runtime, frame)
+}
+
+fn icmp_path_mtu_process_frame(
+    runtime: &DataPlaneRuntime,
+    frame: &mut BufferFrame,
+) -> NodeResult {
+    for index in frame.iter_indices() {
+        let _ = update_path_mtu_from_index(runtime, *index);
+    }
+    NodeResult::drop()
+}
+
+fn update_path_mtu_from_index(runtime: &DataPlaneRuntime, index: Index) -> CoreResult<()> {
+    let packet = collect_current_chain_for_icmp_generation(runtime, index)?;
+    let _ = super::pmtu::process_ipv4_icmp_path_mtu_packet(packet.as_ref());
+    Ok(())
 }
 
 #[hammer_component_macros::node_next]

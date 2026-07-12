@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::ops::{Deref, DerefMut};
 use std::time::{Duration, Instant};
 
@@ -35,9 +35,7 @@ const DEFAULT_TCP_MAX_SEGMENT_SIZE: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
 pub const TCP_INITIAL_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(50);
 pub const TCP_MIN_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(50);
 pub const TCP_MAX_RETRANSMIT_TIMEOUT: Duration = Duration::from_secs(60);
-const TCP_PAWS_IDLE: Duration = Duration::from_secs(24 * 86_400);
 const TCP_DELAYED_ACK_INTERVAL: Duration = Duration::from_millis(10);
-const TCP_TIME_WAIT_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TcpKeepaliveConfig {
@@ -49,10 +47,11 @@ struct TcpKeepaliveConfig {
 impl Default for TcpKeepaliveConfig {
     #[inline]
     fn default() -> Self {
+        let policy = crate::transport::active_tcp_policy();
         Self {
-            idle: Duration::from_secs(75),
-            probe_interval: Duration::from_secs(75),
-            probe_limit: 8,
+            idle: policy.keepalive_idle,
+            probe_interval: policy.keepalive_probe_interval,
+            probe_limit: policy.keepalive_probe_limit,
         }
     }
 }
@@ -134,16 +133,21 @@ pub struct TcpRetransmitTimeoutState {
     srtt: Option<Duration>,
     rttvar: Option<Duration>,
     rto: Duration,
+    min: Duration,
+    max: Duration,
     skip_next_sample: bool,
 }
 
 impl TcpRetransmitTimeoutState {
     #[inline]
     pub fn new() -> Self {
+        let policy = crate::transport::active_tcp_policy();
         Self {
             srtt: None,
             rttvar: None,
-            rto: TCP_INITIAL_RETRANSMIT_TIMEOUT,
+            rto: policy.retransmit_initial,
+            min: policy.retransmit_min,
+            max: policy.retransmit_max,
             skip_next_sample: false,
         }
     }
@@ -161,6 +165,17 @@ impl TcpRetransmitTimeoutState {
     #[inline]
     pub fn retransmit_timeout(&self) -> Duration {
         self.rto
+    }
+
+    #[inline]
+    fn clamp_timeout(&self, timeout: Duration) -> Duration {
+        if timeout < self.min {
+            self.min
+        } else if timeout > self.max {
+            self.max
+        } else {
+            timeout
+        }
     }
 
     pub fn observe_ack_sample(&mut self, rtt: Duration) -> Duration {
@@ -181,18 +196,18 @@ impl TcpRetransmitTimeoutState {
                 self.rttvar = Some(rtt / 2);
             }
         }
-        self.rto = retransmit_timeout_from_estimate(
+        self.rto = self.clamp_timeout(retransmit_timeout_from_estimate(
             self.srtt
                 .expect("smoothed RTT should be initialized by ACK sample"),
             self.rttvar
                 .expect("RTT variance should be initialized by ACK sample"),
-        );
+        ));
         self.rto
     }
 
     #[inline]
     pub fn on_retransmission_timeout(&mut self) -> Duration {
-        self.rto = clamp_retransmit_timeout(self.rto * 2);
+        self.rto = self.clamp_timeout(self.rto * 2);
         self.skip_next_sample = true;
         self.rto
     }
@@ -251,6 +266,11 @@ where
     congestion: C,
     recovery: TcpRecoveryState,
     sack: TcpSackState,
+    time_wait: Duration,
+    nagle: bool,
+    paws_idle: Duration,
+    pmtu_enabled: bool,
+    path_mtu_retransmit: bool,
 }
 
 impl<C> Deref for TcpConnection<C>
@@ -297,6 +317,8 @@ where
         local: Option<SocketAddr>,
         remote: SocketAddr,
     ) -> Self {
+        let policy = crate::transport::active_tcp_policy();
+        let mss = policy.mss as u32;
         let session_id = SessionId::new(connection_id.map_or(0, TcpConnectionId::get));
         Self {
             cacheline0: CachePadded::new(TcpConnectionCacheline0 {
@@ -309,9 +331,9 @@ where
                 irs: TcpSeq::from(0),
                 snd_una: TcpSeq::from(0),
                 snd_nxt: TcpSeq::from(0),
-                snd_wnd: DEFAULT_TCP_WINDOW,
+                snd_wnd: policy.receive_window,
                 rcv_nxt: TcpSeq::from(0),
-                rcv_wnd: DEFAULT_TCP_WINDOW,
+                rcv_wnd: policy.receive_window,
                 negotiated_options: TcpNegotiatedOptions::default(),
                 tx_intent_sequence: None,
                 tx_intent_payload_len: 0,
@@ -331,9 +353,14 @@ where
             timestamps: TcpTimestampState::default(),
             keepalive: TcpKeepaliveState::new(Instant::now()),
             ecn: TcpEcnState::default(),
-            congestion: C::new(DEFAULT_TCP_MAX_SEGMENT_SIZE),
+            congestion: C::new(mss.max(1)),
             recovery: TcpRecoveryState::new(),
             sack: TcpSackState::default(),
+            time_wait: policy.time_wait,
+            nagle: policy.nagle,
+            paws_idle: policy.paws_idle,
+            pmtu_enabled: policy.pmtu_enabled,
+            path_mtu_retransmit: false,
         }
     }
 
@@ -494,6 +521,115 @@ where
     }
 
     #[inline]
+    pub fn nagle(&self) -> bool {
+        self.nagle
+    }
+
+    #[inline]
+    pub fn time_wait(&self) -> Duration {
+        self.time_wait
+    }
+
+    #[inline]
+    pub fn paws_idle(&self) -> Duration {
+        self.paws_idle
+    }
+
+    #[inline]
+    pub fn keepalive_idle(&self) -> Duration {
+        self.keepalive.config.idle
+    }
+
+    #[inline]
+    pub fn keepalive_probe_interval(&self) -> Duration {
+        self.keepalive.config.probe_interval
+    }
+
+    #[inline]
+    pub fn keepalive_probe_limit(&self) -> u8 {
+        self.keepalive.config.probe_limit
+    }
+
+    /// Clamp send MSS from an IP-side path MTU when PMTU is enabled.
+    ///
+    /// Returns `true` when the connection MSS was reduced. If unacked data is
+    /// present, also marks a path-MTU retransmit request and arms a TX intent
+    /// from `snd_una` under the new MSS so oversized in-flight work is retried.
+    pub fn apply_path_mtu(&mut self, path_mtu: u16) -> bool {
+        if !self.pmtu_enabled {
+            return false;
+        }
+        let mss = crate::net::ip::ipv4_path_mtu_to_mss(path_mtu);
+        let current = self
+            .negotiated_options
+            .send_max_segment_size
+            .filter(|value| *value != 0)
+            .unwrap_or(u16::MAX);
+        if mss >= current {
+            return false;
+        }
+        self.negotiated_options.send_max_segment_size = Some(mss);
+        self.congestion.on_mtu_update(u32::from(mss));
+        if self.recovery.has_unacked_data() {
+            self.path_mtu_retransmit = true;
+            let unacked = self.snd_una.distance_to(self.snd_nxt);
+            let intent_len = u32::from(mss).min(unacked).max(1);
+            self.tx_intent_sequence = Some(self.snd_una);
+            self.tx_intent_payload_len = intent_len;
+            self.pacing_ready = true;
+        }
+        true
+    }
+
+    /// Take and clear the path-MTU retransmit request raised by [`Self::apply_path_mtu`].
+    #[inline]
+    pub fn take_path_mtu_retransmit(&mut self) -> bool {
+        let pending = self.path_mtu_retransmit;
+        self.path_mtu_retransmit = false;
+        pending
+    }
+
+    /// Pull the IP-owned path MTU for this connection's remote and clamp MSS.
+    pub fn refresh_path_mtu_from_cache(&mut self) -> bool {
+        if !self.pmtu_enabled {
+            return false;
+        }
+        let IpAddr::V4(remote) = self.remote.ip() else {
+            return false;
+        };
+        let Some(cache) = crate::net::ip::path_mtu_cache() else {
+            return false;
+        };
+        let Some(path_mtu) = cache.path_mtu(IpAddr::V4(remote)) else {
+            return false;
+        };
+        self.apply_path_mtu(path_mtu)
+    }
+
+    /// Test helper: record `bytes` of unacked payload so PMTU shrink can request retransmit.
+    #[cfg(test)]
+    pub(crate) fn mark_unacked_for_path_mtu_test(&mut self, bytes: u32) {
+        let sequence = self.snd_una;
+        let end = sequence.advance(bytes);
+        self.snd_nxt = end;
+        let packet_number = self.recovery.next_packet_number();
+        self.recovery.record_sent(
+            packet_number,
+            sequence,
+            end,
+            bytes,
+            bytes,
+            Instant::now(),
+        );
+        self.refresh_bytes_in_flight_cached();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_nagle_for_test(&mut self, enabled: bool) {
+        self.nagle = enabled;
+    }
+
+    #[inline]
     pub fn retransmit_timeout(&self) -> &TcpRetransmitTimeoutState {
         &self.retransmit_timeout
     }
@@ -542,7 +678,7 @@ where
         self.retransmit_timeout()
             .retransmit_timeout()
             .saturating_mul(1_u32 << shift)
-            .min(TCP_MAX_RETRANSMIT_TIMEOUT)
+            .min(self.retransmit_timeout.max)
     }
 
     #[inline]
@@ -842,7 +978,7 @@ where
             let paws_expired = self
                 .timestamps
                 .recent_remote_at
-                .is_some_and(|recent_at| now.saturating_duration_since(recent_at) > TCP_PAWS_IDLE);
+                .is_some_and(|recent_at| now.saturating_duration_since(recent_at) > self.paws_idle);
             if paws_expired {
                 self.timestamps.recent_remote = Some(timestamp.tsval);
                 self.timestamps.recent_remote_at = Some(now);
@@ -1233,6 +1369,13 @@ where
         {
             return 0;
         }
+        // Nagle (orthogonal to pacing): while unacked data is in flight, only
+        // emit full MSS multiples; hold a trailing partial segment. Skip during
+        // recovery so PRR/limited transmit can send sub-MSS repair/new data.
+        if self.nagle && bytes_in_flight > 0 && !self.recovery.in_recovery() {
+            let mss = self.send_goal_size().max(1);
+            return (allowed / mss) * mss;
+        }
         allowed
     }
 
@@ -1569,11 +1712,12 @@ where
                         })
                         .is_some()
                     {
+                        let time_wait = self.time_wait;
                         timers.update(
                             index,
                             &mut self.timers,
                             TcpTimerKind::TimeWait,
-                            TCP_TIME_WAIT_INTERVAL,
+                            time_wait,
                         )?;
                         TcpState::TimeWait
                     } else {
@@ -1600,11 +1744,12 @@ where
                 if packet.flags.contains(TcpSegmentFlags::FIN) && packet.sequence == self.rcv_nxt {
                     self.rcv_nxt = self.rcv_nxt.advance(1);
                     self.state = TcpState::TimeWait;
+                    let time_wait = self.time_wait;
                     timers.update(
                         index,
                         &mut self.timers,
                         TcpTimerKind::TimeWait,
-                        TCP_TIME_WAIT_INTERVAL,
+                        time_wait,
                     )?;
                     return Ok(Some(self.control_segment(
                         packet.local,
@@ -1624,11 +1769,12 @@ where
                     && acknowledgment == self.snd_nxt
                 {
                     self.state = TcpState::TimeWait;
+                    let time_wait = self.time_wait;
                     timers.update(
                         index,
                         &mut self.timers,
                         TcpTimerKind::TimeWait,
-                        TCP_TIME_WAIT_INTERVAL,
+                        time_wait,
                     )?;
                 }
                 Ok(None)
@@ -1645,11 +1791,12 @@ where
             }
             TcpState::TimeWait => {
                 if packet.flags.contains(TcpSegmentFlags::FIN) {
+                    let time_wait = self.time_wait;
                     timers.update(
                         index,
                         &mut self.timers,
                         TcpTimerKind::TimeWait,
-                        TCP_TIME_WAIT_INTERVAL,
+                        time_wait,
                     )?;
                     return Ok(Some(self.control_segment(
                         packet.local,
@@ -2306,18 +2453,7 @@ fn advertised_window_from_receive(receive_window: u32, window_scale: u8) -> u16 
 
 #[inline]
 fn retransmit_timeout_from_estimate(srtt: Duration, rttvar: Duration) -> Duration {
-    clamp_retransmit_timeout(srtt.saturating_add(rttvar.saturating_mul(4)))
-}
-
-#[inline]
-fn clamp_retransmit_timeout(timeout: Duration) -> Duration {
-    if timeout < TCP_MIN_RETRANSMIT_TIMEOUT {
-        TCP_MIN_RETRANSMIT_TIMEOUT
-    } else if timeout > TCP_MAX_RETRANSMIT_TIMEOUT {
-        TCP_MAX_RETRANSMIT_TIMEOUT
-    } else {
-        timeout
-    }
+    srtt.saturating_add(rttvar.saturating_mul(4))
 }
 
 #[inline]
@@ -3891,7 +4027,7 @@ mod tests {
         ));
         connection.timestamps.recent_remote_at = Some(
             Instant::now()
-                .checked_sub(TCP_PAWS_IDLE + Duration::from_secs(1))
+                .checked_sub(connection.paws_idle + Duration::from_secs(1))
                 .expect("recent remote age"),
         );
         assert!(connection.observe_inbound_timestamp(
@@ -4776,5 +4912,139 @@ mod tests {
         let connection = driver.session(session_id).expect("session");
         assert_eq!(connection.state(), TcpState::TimeWait);
         assert!(connection.timer_state().is_active(TcpTimerKind::TimeWait));
+    }
+
+    #[test]
+    fn nagle_holds_small_send_while_unacked_data_in_flight() {
+        let mut connection = established_connection_with_test_controller();
+        let capabilities = TcpCapabilities {
+            max_segment_size: Some(1_000),
+            window_scale: None,
+            sack: true,
+            timestamps: false,
+            ecn: false,
+            accurate_ecn: false,
+            fast_open: false,
+        };
+        let _ = connection.apply_peer_handshake_capabilities(capabilities, capabilities);
+        connection.snd_wnd = 8_000;
+        assert!(connection.nagle());
+
+        let now = Instant::now();
+        connection
+            .commit_payload_tx(200, now)
+            .expect("seed unacked");
+        assert!(connection.bytes_in_flight_cached > 0);
+
+        assert_eq!(
+            connection.tx_payload_budget(100, now, TcpCapabilities::default()),
+            0
+        );
+    }
+
+    #[test]
+    fn nagle_allows_full_mss_multiples_while_unacked() {
+        let mut connection = established_connection_with_test_controller();
+        let capabilities = TcpCapabilities {
+            max_segment_size: Some(1_000),
+            window_scale: None,
+            sack: true,
+            timestamps: false,
+            ecn: false,
+            accurate_ecn: false,
+            fast_open: false,
+        };
+        let _ = connection.apply_peer_handshake_capabilities(capabilities, capabilities);
+        connection.snd_wnd = 16_000;
+
+        let now = Instant::now();
+        connection
+            .commit_payload_tx(200, now)
+            .expect("seed unacked");
+
+        // 2_500 pending → only 2 full MSS while unacked data is in flight.
+        assert_eq!(
+            connection.tx_payload_budget(2_500, now, TcpCapabilities::default()),
+            2_000
+        );
+    }
+
+    #[test]
+    fn nagle_allows_small_send_when_nothing_unacked() {
+        let mut connection = established_connection_with_test_controller();
+        let capabilities = TcpCapabilities {
+            max_segment_size: Some(1_000),
+            window_scale: None,
+            sack: true,
+            timestamps: false,
+            ecn: false,
+            accurate_ecn: false,
+            fast_open: false,
+        };
+        let _ = connection.apply_peer_handshake_capabilities(capabilities, capabilities);
+        connection.snd_wnd = 8_000;
+        assert_eq!(connection.bytes_in_flight_cached, 0);
+
+        assert_eq!(
+            connection.tx_payload_budget(100, Instant::now(), TcpCapabilities::default()),
+            100
+        );
+    }
+
+    #[test]
+    fn nagle_disabled_allows_small_send_with_unacked_data() {
+        let mut connection = established_connection_with_test_controller();
+        connection.set_nagle_for_test(false);
+        let capabilities = TcpCapabilities {
+            max_segment_size: Some(1_000),
+            window_scale: None,
+            sack: true,
+            timestamps: false,
+            ecn: false,
+            accurate_ecn: false,
+            fast_open: false,
+        };
+        let _ = connection.apply_peer_handshake_capabilities(capabilities, capabilities);
+        connection.snd_wnd = 8_000;
+
+        let now = Instant::now();
+        connection
+            .commit_payload_tx(200, now)
+            .expect("seed unacked");
+        assert!(connection.bytes_in_flight_cached > 0);
+
+        assert_eq!(
+            connection.tx_payload_budget(100, now, TcpCapabilities::default()),
+            100
+        );
+    }
+
+    #[test]
+    fn pacing_still_holds_when_nagle_is_disabled() {
+        let mut connection = established_connection_with_pacing_controller();
+        connection.set_nagle_for_test(false);
+        let capabilities = TcpCapabilities {
+            max_segment_size: Some(1_000),
+            window_scale: None,
+            sack: true,
+            timestamps: false,
+            ecn: false,
+            accurate_ecn: false,
+            fast_open: false,
+        };
+        let _ = connection.apply_peer_handshake_capabilities(capabilities, capabilities);
+        connection.snd_wnd = 8_000;
+        assert!(!connection.pacing_ready());
+        assert!(
+            connection
+                .congestion()
+                .next_send_delay(100)
+                .is_some()
+        );
+
+        assert_eq!(
+            connection.tx_payload_budget(100, Instant::now(), TcpCapabilities::default()),
+            0
+        );
     }
 }

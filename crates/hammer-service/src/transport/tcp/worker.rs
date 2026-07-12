@@ -273,8 +273,9 @@ where
     ) -> CoreResult<TransportSendParams> {
         let connection = self
             .connections
-            .get(index)
+            .get_mut(index)
             .ok_or(TcpNodeError::SessionMissing)?;
+        let _ = connection.refresh_path_mtu_from_cache();
         let start = if connection.state() == TcpState::SynSent {
             connection.iss()
         } else {

@@ -31,6 +31,7 @@ pub mod input;
 pub mod listen;
 pub mod lookup;
 pub mod output;
+pub mod policy;
 pub mod rcv_process;
 pub mod recovery;
 pub mod reset;
@@ -40,6 +41,7 @@ pub mod syn_sent;
 mod timers;
 pub(crate) mod worker;
 
+pub use policy::TcpPolicy;
 pub use connection::{
     TCP_INITIAL_RETRANSMIT_TIMEOUT, TCP_MAX_RETRANSMIT_TIMEOUT, TCP_MIN_RETRANSMIT_TIMEOUT,
     TcpConnection, TcpRetransmitTimeoutState,
@@ -362,6 +364,10 @@ impl From<TcpNodeError> for CoreError {
 pub enum TcpOutputError {
     #[error("not a TCP header")]
     NoTcpHeader,
+    #[error("missing TCP egress endpoints")]
+    MissingEgressEndpoints,
+    #[error("unsupported TCP egress address family")]
+    UnsupportedEgress,
 }
 
 impl TcpOutputError {
@@ -409,6 +415,97 @@ impl Default for TcpRouteOpaque {
             reserved: [0; 42],
         }
     }
+}
+
+/// Stamped on TX buffers so tcp-output can push L3 like VPP `tcp_output_push_ip`
+/// (which reads `c_lcl_ip` / `c_rmt_ip` via connection_index).
+const TCP_EGRESS_TAG: u32 = 0x5443_5045; // "TCPE"
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct TcpEgressOpaque {
+    tag: u32,
+    version: u8,
+    pad: [u8; 3],
+    local: [u8; 16],
+    remote: [u8; 16],
+    reserved: [u8; 16],
+}
+
+const _: () =
+    assert!(std::mem::size_of::<TcpEgressOpaque>() == std::mem::size_of::<SecondaryOpaque>());
+
+#[inline(always)]
+pub(crate) fn write_tcp_egress_endpoints(
+    opaque: &mut SecondaryOpaque,
+    local: std::net::IpAddr,
+    remote: std::net::IpAddr,
+) {
+    let (version, local_bytes, remote_bytes) = match (local, remote) {
+        (std::net::IpAddr::V4(local), std::net::IpAddr::V4(remote)) => {
+            let mut local_bytes = [0u8; 16];
+            let mut remote_bytes = [0u8; 16];
+            local_bytes[..4].copy_from_slice(&local.octets());
+            remote_bytes[..4].copy_from_slice(&remote.octets());
+            (4u8, local_bytes, remote_bytes)
+        }
+        (std::net::IpAddr::V6(local), std::net::IpAddr::V6(remote)) => {
+            (6u8, local.octets(), remote.octets())
+        }
+        _ => return,
+    };
+    let egress = unsafe { transmute::<&mut SecondaryOpaque, &mut TcpEgressOpaque>(opaque) };
+    *egress = TcpEgressOpaque {
+        tag: TCP_EGRESS_TAG,
+        version,
+        pad: [0; 3],
+        local: local_bytes,
+        remote: remote_bytes,
+        reserved: [0; 16],
+    };
+}
+
+#[inline(always)]
+pub(crate) fn read_tcp_egress_endpoints(
+    opaque: &SecondaryOpaque,
+) -> Option<(std::net::IpAddr, std::net::IpAddr)> {
+    let egress = unsafe { *transmute::<&SecondaryOpaque, &TcpEgressOpaque>(opaque) };
+    if egress.tag != TCP_EGRESS_TAG {
+        return None;
+    }
+    match egress.version {
+        4 => Some((
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                egress.local[0],
+                egress.local[1],
+                egress.local[2],
+                egress.local[3],
+            )),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                egress.remote[0],
+                egress.remote[1],
+                egress.remote[2],
+                egress.remote[3],
+            )),
+        )),
+        6 => Some((
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(egress.local)),
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(egress.remote)),
+        )),
+        _ => None,
+    }
+}
+
+/// Skip a leading IPv4/IPv6 header when present (tcp-output push), else treat as bare TCP.
+#[cfg(test)]
+#[inline]
+pub(crate) fn tcp_bytes_after_l3(packet: &[u8]) -> &[u8] {
+    let offset = match packet.first().copied().map(|b| b >> 4) {
+        Some(4) if packet.len() >= 20 => usize::from(packet[0] & 0x0f) * 4,
+        Some(6) if packet.len() >= 40 => 40,
+        _ => 0,
+    };
+    packet.get(offset..).unwrap_or(packet)
 }
 
 #[inline(always)]
@@ -708,6 +805,7 @@ mod legacy_tests {
             crate::transport::TransportMain::new(
                 hammer_core::config::network::CongestionController::Bbr,
                 backend,
+                crate::transport::tcp::TcpPolicy::production_defaults(),
             ),
         )));
     }
@@ -1036,19 +1134,24 @@ mod legacy_tests {
         let _ = runtime.run_ready_nodes().expect("run timer output");
     }
 
+    fn tcp_bytes(packet: &[u8]) -> &[u8] {
+        crate::transport::tcp::tcp_bytes_after_l3(packet)
+    }
+
     fn tcp_segment_payload(packet: &[u8]) -> &[u8] {
-        let segment = etherparse::TcpSlice::from_slice(packet).expect("tcp segment");
-        &packet[segment.header_len()..]
+        let tcp = tcp_bytes(packet);
+        let segment = etherparse::TcpSlice::from_slice(tcp).expect("tcp segment");
+        &tcp[segment.header_len()..]
     }
 
     fn tcp_ack_number(packet: &[u8]) -> u32 {
-        etherparse::TcpSlice::from_slice(packet)
+        etherparse::TcpSlice::from_slice(tcp_bytes(packet))
             .expect("tcp segment")
             .acknowledgment_number()
     }
 
     fn tcp_sequence_number(packet: &[u8]) -> u32 {
-        etherparse::TcpSlice::from_slice(packet)
+        etherparse::TcpSlice::from_slice(tcp_bytes(packet))
             .expect("tcp segment")
             .sequence_number()
     }
@@ -1082,7 +1185,7 @@ mod legacy_tests {
         assert!(drop_state.lock().expect("drop").packets.is_empty());
         let packets = &lookup_state.lock().expect("lookup").packets;
         assert_eq!(packets.len(), 1);
-        let segment = etherparse::TcpSlice::from_slice(&packets[0]).expect("tcp segment");
+        let segment = etherparse::TcpSlice::from_slice(tcp_bytes(&packets[0])).expect("tcp segment");
         assert_eq!(
             tcp_flags(&segment),
             TcpSegmentFlags::ACK | TcpSegmentFlags::FIN
@@ -1333,7 +1436,7 @@ mod legacy_tests {
         let packets = &lookup_state.lock().expect("lookup").packets;
         assert_eq!(packets.len(), 1);
         let packet = &packets[0];
-        let segment = etherparse::TcpSlice::from_slice(packet).expect("tcp segment");
+        let segment = etherparse::TcpSlice::from_slice(tcp_bytes(packet)).expect("tcp segment");
         assert_eq!(tcp_flags(&segment), TcpSegmentFlags::ACK);
         assert_eq!(tcp_segment_payload(packet), b"");
         assert_eq!(tcp_sequence_number(packet), expected_sequence);
@@ -1436,7 +1539,7 @@ mod legacy_tests {
         let packets = &lookup_state.lock().expect("lookup").packets;
         assert_eq!(packets.len(), 1);
         let packet = &packets[0];
-        let segment = etherparse::TcpSlice::from_slice(packet).expect("tcp segment");
+        let segment = etherparse::TcpSlice::from_slice(tcp_bytes(packet)).expect("tcp segment");
         assert_eq!(tcp_flags(&segment), TcpSegmentFlags::ACK);
         assert_eq!(tcp_segment_payload(packet), b"");
         assert_eq!(tcp_ack_number(packet), sequence.wrapping_add(5));

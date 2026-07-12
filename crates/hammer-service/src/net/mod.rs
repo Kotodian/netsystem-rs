@@ -5,12 +5,15 @@ mod opaque;
 pub use ip::{
     IcmpEchoRequestNext, IcmpEchoRequestNode, IcmpEchoRequestTrace, IcmpErrorNext, IcmpErrorNode,
     IcmpErrorSourceTable, IcmpErrorSourceTableHandle, IcmpErrorTrace, IcmpInputControlPlane,
-    IcmpInputError, IcmpInputNode, IcmpInputTrace, IcmpNodeError, IpInputError, IpInputNext,
+    IcmpInputError, IcmpInputNode, IcmpInputTrace, IcmpNodeError, IcmpPathMtuNode, IpInputError,
+    IpInputNext,
     IpInputNode, IpInputTarget, IpInputTrace, IpLocalArc, IpLocalControlPlane, IpLocalError,
     IpLocalNext, IpLocalNode, IpLocalSourceCheck, IpLocalTrace, IpLocalTraceStage, IpProtocol,
     IpReassemblyDirectory, IpReassemblyExpireWalk, IpReassemblyHandoff, IpReassemblyNext,
     IpReassemblyNode, IpReassemblyTrace, IpReassemblyTraceAction, IpReceiveNode, IpUnicastArc,
-    IpVersion, pack_fragment_owner_value, unpack_fragment_owner_value,
+    IpVersion, PATH_MTU_CACHE, PathMtuCache, pack_fragment_owner_value, path_mtu_cache,
+    process_ipv4_icmp_path_mtu_packet, publish_path_mtu_cache, reset_path_mtu_cache_for_test,
+    unpack_fragment_owner_value,
 };
 pub use lookup::{
     Adjacency, AdjacencyIndex, AdjacencyRewriteNode, AdjacencyRewriteNodeError,
@@ -26,4 +29,5 @@ pub use opaque::{ForwardingMetadata, IpEcnCodepoint, NetworkOpaque, TapEthernetM
 #[cfg(test)]
 pub(crate) fn reset_ip_main_for_test() {
     lookup::reset_for_test();
+    reset_path_mtu_cache_for_test();
 }

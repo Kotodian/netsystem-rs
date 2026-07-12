@@ -453,19 +453,27 @@ mod legacy_tests {
         acknowledgment: u32,
         flags: u8,
     ) {
-        let _ = source;
-        let _ = destination;
-        assert_eq!(u16::from_be_bytes([packet[0], packet[1]]), source_port);
-        assert_eq!(u16::from_be_bytes([packet[2], packet[3]]), destination_port);
+        assert_eq!(packet[0], 0x45);
+        assert!(
+            hammer_core::protocol::ip::read_ipv4_flags_fragment(&packet[..20])
+                .expect("flags")
+                & hammer_core::protocol::ip::IPV4_FLAG_DONT_FRAGMENT
+                != 0
+        );
+        assert_eq!(&packet[12..16], &source.octets());
+        assert_eq!(&packet[16..20], &destination.octets());
+        let tcp = crate::transport::tcp::tcp_bytes_after_l3(packet);
+        assert_eq!(u16::from_be_bytes([tcp[0], tcp[1]]), source_port);
+        assert_eq!(u16::from_be_bytes([tcp[2], tcp[3]]), destination_port);
         assert_eq!(
-            u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]),
+            u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]),
             sequence
         );
         assert_eq!(
-            u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]),
+            u32::from_be_bytes([tcp[8], tcp[9], tcp[10], tcp[11]]),
             acknowledgment
         );
-        assert_eq!(packet[13] & flags, flags);
+        assert_eq!(tcp[13] & flags, flags);
     }
 
     fn tcp_packet(

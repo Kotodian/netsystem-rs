@@ -5,8 +5,8 @@ mod ip6_fib;
 mod load_balance;
 
 pub use dpo::{
-    Adjacency, AdjacencyIndex, AdjacencyRewrite, AdjacencyRewriteError, Dpo, DpoClass, DpoId,
-    DpoKind, DpoProto, DpoStackRegistry, DpoType, DpoTypeRegistry,
+    Adjacency, AdjacencyIndex, AdjacencyRewrite, AdjacencyRewriteError, DEFAULT_ADJACENCY_L3_MTU,
+    Dpo, DpoClass, DpoId, DpoKind, DpoProto, DpoStackRegistry, DpoType, DpoTypeRegistry,
 };
 pub use fib::{FibEntry, FibLookupResult, FibRouteDpoError, FibTable, FibTableBuilder, flow_hash};
 pub use ip4_mtrie::{Ip4Mtrie, Ip4MtrieRoute, Ip4MtrieValue};

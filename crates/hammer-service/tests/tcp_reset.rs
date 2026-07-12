@@ -186,6 +186,22 @@ fn tcp_reset_reply_reverses_ip_tuple_and_addrs() {
     assert_eq!(&reply[0][16..20], &[192, 0, 2, 1]);
 }
 
+#[test]
+fn tcp_reset_sets_ipv4_dont_fragment_when_pmtu_enabled() {
+    use hammer_core::protocol::ip::{IPV4_FLAG_DONT_FRAGMENT, read_ipv4_flags_fragment};
+
+    let (runtime, reset, lookup_state, _) = reset_graph();
+    let packet = ipv4_tcp_packet(0x10, 1_000, 9_000, &[]);
+    schedule_packet(&runtime, reset, &packet);
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+
+    let reply = lookup_state.lock().unwrap().packets.clone();
+    assert_eq!(reply.len(), 1);
+    let flags = read_ipv4_flags_fragment(&reply[0]).expect("flags");
+    assert_eq!(flags & IPV4_FLAG_DONT_FRAGMENT, IPV4_FLAG_DONT_FRAGMENT);
+}
+
 fn reset_graph() -> (
     DataPlaneRuntime,
     NodeId,

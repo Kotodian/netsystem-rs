@@ -368,6 +368,7 @@ pub fn init(reg: &RuntimeRegistry) -> HammerResult<()> {
     let config = reg.require::<Config>()?;
     let routes = Arc::from(config.network.route.clone().into_boxed_slice());
     IP_MAIN.store(Some(Arc::new(IpMain::new(routes))));
+    crate::net::ip::publish_path_mtu_cache(crate::net::ip::PathMtuCache::new());
     Ok(())
 }
 
@@ -526,6 +527,7 @@ pub enum AdjacencyRewriteNodeError {
     MissingForwarding,
     WrongDpo,
     MissingAdjacency,
+    MtuExceeded,
 }
 
 impl AdjacencyRewriteNodeError {
@@ -535,6 +537,7 @@ impl AdjacencyRewriteNodeError {
             Self::MissingForwarding => 1,
             Self::WrongDpo => 2,
             Self::MissingAdjacency => 3,
+            Self::MtuExceeded => 4,
         }
     }
 }
@@ -547,9 +550,42 @@ pub struct AdjacencyRewriteNode {
 }
 
 impl AdjacencyRewriteNode {
+    /// Configure the fanout slot used when DF + MTU exceed (VPP icmp-error next).
+    pub fn configure_icmp_error_next(runtime_data: NodeRuntimeData, next: u16) {
+        let Ok(slot) = runtime_data.usize_word(0) else {
+            return;
+        };
+        let Ok(mut runtimes) = adjacency_rewrite_runtimes().lock() else {
+            return;
+        };
+        if let Some(runtime) = runtimes.get_mut(slot) {
+            runtime.icmp_error_next = Some(next);
+        }
+    }
+
+    /// Configure the fanout slot used when non-DF + MTU exceed (VPP fragment next).
+    pub fn configure_fragment_next(runtime_data: NodeRuntimeData, next: u16) {
+        let Ok(slot) = runtime_data.usize_word(0) else {
+            return;
+        };
+        let Ok(mut runtimes) = adjacency_rewrite_runtimes().lock() else {
+            return;
+        };
+        if let Some(runtime) = runtimes.get_mut(slot) {
+            runtime.fragment_next = Some(next);
+        }
+    }
+
+    #[inline]
+    pub fn runtime_data_handle(&self) -> NodeRuntimeData {
+        self.runtime_data
+    }
+
     #[inline(always)]
     fn next_for_index(
         table: &FibTableHandle,
+        icmp_error_next: Option<u16>,
+        fragment_next: Option<u16>,
         runtime: &DataPlaneRuntime,
         index: Index,
     ) -> Option<u16> {
@@ -617,6 +653,24 @@ impl AdjacencyRewriteNode {
             );
             return None;
         };
+
+        if let Some(next) =
+            adjacency_mtu_divert(runtime, index, &adjacency, icmp_error_next, fragment_next)
+        {
+            let _ = add_packet_trace!(
+                runtime,
+                index,
+                AdjacencyRewriteTrace {
+                    dpo_index: Some(forwarding.dpo_index),
+                    egress_interface: adjacency.egress_interface,
+                    rewrite_len: 0,
+                    error: Some(AdjacencyRewriteNodeError::MtuExceeded.code()),
+                    next: Some(next),
+                },
+            );
+            return Some(next);
+        }
+
         let rewrite_len = adjacency.rewrite.as_slice().len();
         let egress_interface = adjacency.egress_interface;
         let next = adjacency.next;
@@ -639,7 +693,14 @@ impl AdjacencyRewriteNode {
 impl Node for AdjacencyRewriteNode {
     #[inline(always)]
     fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
-        adjacency_rewrite_process_frame(runtime, frame, &self.table)
+        let state = adjacency_rewrite_runtime(self.runtime_data).expect("adjacency rewrite runtime");
+        adjacency_rewrite_process_frame(
+            runtime,
+            frame,
+            &state.table,
+            state.icmp_error_next,
+            state.fragment_next,
+        )
     }
 
     #[inline]
@@ -676,6 +737,12 @@ struct LookupRuntime {
 #[derive(Clone)]
 struct AdjacencyRewriteRuntime {
     table: FibTableHandle,
+    /// Fanout slot for ICMP Frag-Needed when DF + MTU exceeded (VPP
+    /// `IP4_REWRITE_NEXT_ICMP_ERROR`). `None` drops the packet.
+    icmp_error_next: Option<u16>,
+    /// Fanout slot for fragmentation when non-DF + MTU exceeded (VPP
+    /// `IP4_REWRITE_NEXT_FRAGMENT`). `None` drops the packet.
+    fragment_next: Option<u16>,
 }
 
 fn lookup_runtimes() -> &'static Mutex<Vec<LookupRuntime>> {
@@ -702,7 +769,11 @@ fn register_adjacency_rewrite_runtime(table: FibTableHandle) -> NodeRuntimeData 
         .lock()
         .expect("adjacency rewrite runtime registry poisoned");
     let slot = runtimes.len();
-    runtimes.push(AdjacencyRewriteRuntime { table });
+    runtimes.push(AdjacencyRewriteRuntime {
+        table,
+        icmp_error_next: None,
+        fragment_next: None,
+    });
     NodeRuntimeData::from_usize(slot).expect("adjacency rewrite runtime slot overflow")
 }
 
@@ -759,13 +830,21 @@ fn adjacency_rewrite_process(
     frame: &mut BufferFrame,
 ) -> NodeResult {
     let state = adjacency_rewrite_runtime(data).expect("adjacency rewrite runtime");
-    adjacency_rewrite_process_frame(runtime, frame, &state.table)
+    adjacency_rewrite_process_frame(
+        runtime,
+        frame,
+        &state.table,
+        state.icmp_error_next,
+        state.fragment_next,
+    )
 }
 
 fn adjacency_rewrite_process_frame(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
     table: &FibTableHandle,
+    icmp_error_next: Option<u16>,
+    fragment_next: Option<u16>,
 ) -> NodeResult {
     let indices: hammer_infra::vec::Vec<_> = frame.indices().iter().copied().collect();
     frame.discard_prefix(frame.len());
@@ -773,7 +852,13 @@ fn adjacency_rewrite_process_frame(
     let mut success_nexts = hammer_infra::vec::Vec::with_capacity(indices.len());
     let mut failed = hammer_infra::vec::Vec::new();
     for index in indices {
-        match AdjacencyRewriteNode::next_for_index(table, runtime, index) {
+        match AdjacencyRewriteNode::next_for_index(
+            table,
+            icmp_error_next,
+            fragment_next,
+            runtime,
+            index,
+        ) {
             Some(next) => {
                 success_indices.push(index);
                 success_nexts.push(next);
@@ -793,6 +878,54 @@ fn adjacency_rewrite_process_frame(
         let _ = frame.push_index(index);
     }
     NodeResult::drop()
+}
+
+/// VPP `ip4_mtu_check` at rewrite: DF + oversize → ICMP Frag-Needed next;
+/// non-DF + oversize → fragment next.
+/// Returns `Some(next)` when the packet is diverted (no rewrite applied).
+#[inline(always)]
+fn adjacency_mtu_divert(
+    runtime: &DataPlaneRuntime,
+    index: Index,
+    adjacency: &Adjacency,
+    icmp_error_next: Option<u16>,
+    fragment_next: Option<u16>,
+) -> Option<u16> {
+    if adjacency.proto != DpoProto::IP4 {
+        return None;
+    }
+    let action = {
+        let buffer = runtime.get_buffer(index).ok()?;
+        let current = buffer.current();
+        if current.len() < 20 {
+            return None;
+        }
+        let header_total = u16::from_be_bytes([current[2], current[3]]);
+        let packet_len = if header_total != 0 {
+            header_total
+        } else {
+            u16::try_from(current.len()).unwrap_or(u16::MAX)
+        };
+        let dont_fragment = hammer_core::protocol::ip::read_ipv4_flags_fragment(current)
+            .is_some_and(|flags| flags & hammer_core::protocol::ip::IPV4_FLAG_DONT_FRAGMENT != 0);
+        hammer_core::protocol::ip::ipv4_mtu_check(
+            packet_len,
+            adjacency.max_l3_packet_bytes,
+            dont_fragment,
+        )
+    };
+    match action {
+        hammer_core::protocol::ip::Ipv4MtuAction::Ok => None,
+        hammer_core::protocol::ip::Ipv4MtuAction::IcmpFragNeeded { mtu } => {
+            let next = icmp_error_next?;
+            let mut buffer = runtime.get_buffer_mut(index).ok()?;
+            let opaque = unsafe { transmute::<_, &mut LookupOpaque>(buffer.opaque2_mut()) };
+            opaque.icmp_error =
+                Some(IcmpErrorMetadata::ipv4_destination_unreachable(4, u32::from(mtu)));
+            Some(next)
+        }
+        hammer_core::protocol::ip::Ipv4MtuAction::Fragment { .. } => fragment_next,
+    }
 }
 
 #[inline(always)]

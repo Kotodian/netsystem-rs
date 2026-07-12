@@ -1,11 +1,15 @@
-use hammer_core::data_plane::{BufferFrame, Index, NodeId, NodeRegistration};
+use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId, NodeRegistration};
 use hammer_core::error::CoreResult;
+use hammer_core::protocol::ip::{write_ipv4_push_header, write_ipv6_push_header};
 use hammer_core::protocol::tcp::tcp_header;
 use hammer_runtime::{
     DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
 };
 
-use super::TcpOutputError;
+use super::{TcpOutputError, read_tcp_egress_endpoints};
+use crate::net::NetworkOpaque;
+use std::mem::transmute;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 pub const DEFAULT_TCP_OUTPUT_PAYLOAD_LEN: usize = 1_440;
 pub const TCP_FLAG_FIN: u8 = 0x01;
 pub const TCP_FLAG_SYN: u8 = 0x02;
@@ -102,13 +106,103 @@ fn tcp_output_next_for_index(
     runtime: &DataPlaneRuntime,
     index: Index,
 ) -> CoreResult<TcpOutputNext> {
-    let buffer = runtime.get_buffer_mut(index)?;
+    let buffer = runtime.get_buffer(index)?;
     let header = buffer.current();
     if tcp_header(header).is_err() {
         let _ = runtime.record_current_node_error(TcpOutputError::NoTcpHeader.code());
         return Ok(TcpOutputNext::Drop);
     }
-    Ok(TcpOutputNext::Lookup)
+    let tcp_len = header.len();
+    let endpoints = read_tcp_egress_endpoints(buffer.opaque2());
+    drop(buffer);
+
+    let Some((local, remote)) = endpoints else {
+        let _ = runtime.record_current_node_error(TcpOutputError::MissingEgressEndpoints.code());
+        return Ok(TcpOutputNext::Drop);
+    };
+
+    match (local, remote) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+            tcp_output_push_ipv4(runtime, index, src, dst, tcp_len)?;
+            Ok(TcpOutputNext::Lookup)
+        }
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            tcp_output_push_ipv6(runtime, index, src, dst, tcp_len)?;
+            Ok(TcpOutputNext::Lookup)
+        }
+        _ => {
+            let _ = runtime.record_current_node_error(TcpOutputError::UnsupportedEgress.code());
+            Ok(TcpOutputNext::Drop)
+        }
+    }
+}
+
+/// VPP `tcp_output_push_ip` → `vlib_buffer_push_ip4(..., is_df=1)`.
+fn tcp_output_push_ipv4(
+    runtime: &DataPlaneRuntime,
+    index: Index,
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    tcp_len: usize,
+) -> CoreResult<()> {
+    const IPV4_HEADER_LEN: usize = 20;
+    let total_len = u16::try_from(IPV4_HEADER_LEN + tcp_len).map_err(|_| {
+        hammer_core::error::CoreError::internal("tcp-output ipv4 total length overflow")
+    })?;
+    let mut buffer = runtime.get_buffer_mut(index)?;
+    {
+        let header = buffer.prepend_mut(IPV4_HEADER_LEN)?;
+        write_ipv4_push_header(header, src, dst, 6, total_len)?;
+    }
+    let packet_len = buffer.current().len();
+    let tcp_header_len = tcp_header(&buffer.current()[IPV4_HEADER_LEN..])
+        .map(|tcp| tcp.header_len())
+        .unwrap_or(20);
+    let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+    network.set_packet_cursor(
+        BufferPacketCursor::new()
+            .with_packet_len(packet_len)
+            .with_network_header(0, IPV4_HEADER_LEN)
+            .with_transport_header(IPV4_HEADER_LEN, tcp_header_len)
+            .with_transport_payload_offset(IPV4_HEADER_LEN + tcp_header_len),
+    );
+    network.ip_mut().set_ip_version(Some(4));
+    network.ip_mut().set_ip_protocol(Some(6));
+    Ok(())
+}
+
+/// VPP `tcp_output_push_ip` IPv6 path (`vlib_buffer_push_ip6_custom`).
+fn tcp_output_push_ipv6(
+    runtime: &DataPlaneRuntime,
+    index: Index,
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    tcp_len: usize,
+) -> CoreResult<()> {
+    const IPV6_HEADER_LEN: usize = 40;
+    let payload_len = u16::try_from(tcp_len).map_err(|_| {
+        hammer_core::error::CoreError::internal("tcp-output ipv6 payload length overflow")
+    })?;
+    let mut buffer = runtime.get_buffer_mut(index)?;
+    {
+        let header = buffer.prepend_mut(IPV6_HEADER_LEN)?;
+        write_ipv6_push_header(header, src, dst, 6, payload_len)?;
+    }
+    let packet_len = buffer.current().len();
+    let tcp_header_len = tcp_header(&buffer.current()[IPV6_HEADER_LEN..])
+        .map(|tcp| tcp.header_len())
+        .unwrap_or(20);
+    let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+    network.set_packet_cursor(
+        BufferPacketCursor::new()
+            .with_packet_len(packet_len)
+            .with_network_header(0, IPV6_HEADER_LEN)
+            .with_transport_header(IPV6_HEADER_LEN, tcp_header_len)
+            .with_transport_payload_offset(IPV6_HEADER_LEN + tcp_header_len),
+    );
+    network.ip_mut().set_ip_version(Some(6));
+    network.ip_mut().set_ip_protocol(Some(6));
+    Ok(())
 }
 
 #[inline]
@@ -318,7 +412,9 @@ mod tests {
     }
 
     #[test]
-    fn tcp_output_routes_tcp_buffers_to_lookup() {
+    fn tcp_output_pushes_ipv4_with_df_then_routes_lookup() {
+        // VPP tcp_output_push_ip → vlib_buffer_push_ip4(..., is_df=1):
+        // tcp-output pushes IPv4 (always DF) in front of the TCP header, then lookup.
         let (runtime, lookup_state, drop_state, output) = output_graph();
         let index = runtime.alloc_index().expect("buffer");
         runtime.buffers().append(index, b"hello").expect("payload");
@@ -333,15 +429,31 @@ mod tests {
         let packets = &lookup_state.lock().unwrap().packets;
         assert_eq!(packets.len(), 1);
         let packet = &packets[0];
-        assert_eq!(&packet[0..2], &[0xc3, 0x50]);
-        assert_eq!(&packet[2..4], &[0x01, 0xbb]);
-        assert_eq!(&packet[4..8], &[0, 0, 0, 100]);
-        assert_eq!(&packet[8..12], &[0, 0, 0, 200]);
-        assert_eq!(packet[12] >> 4, 5);
-        assert_eq!(packet[13] & TCP_FLAG_ACK, TCP_FLAG_ACK);
-        assert_eq!(packet[13] & TCP_FLAG_PSH, TCP_FLAG_PSH);
-        assert_eq!(&packet[14..16], &[0x10, 0x00]);
-        assert_eq!(&packet[20..], b"hello");
+        assert_eq!(packet[0], 0x45);
+        assert_eq!(
+            u16::from_be_bytes([packet[2], packet[3]]) as usize,
+            packet.len()
+        );
+        assert!(
+            hammer_core::protocol::ip::read_ipv4_flags_fragment(&packet[..20])
+                .expect("flags")
+                & hammer_core::protocol::ip::IPV4_FLAG_DONT_FRAGMENT
+                != 0
+        );
+        assert_eq!(packet[8], 255); // VPP push_ip4 ttl
+        assert_eq!(packet[9], 6); // TCP
+        assert_eq!(&packet[12..16], &[192, 0, 2, 10]);
+        assert_eq!(&packet[16..20], &[198, 51, 100, 20]);
+        let tcp = &packet[20..];
+        assert_eq!(&tcp[0..2], &[0xc3, 0x50]);
+        assert_eq!(&tcp[2..4], &[0x01, 0xbb]);
+        assert_eq!(&tcp[4..8], &[0, 0, 0, 100]);
+        assert_eq!(&tcp[8..12], &[0, 0, 0, 200]);
+        assert_eq!(tcp[12] >> 4, 5);
+        assert_eq!(tcp[13] & TCP_FLAG_ACK, TCP_FLAG_ACK);
+        assert_eq!(tcp[13] & TCP_FLAG_PSH, TCP_FLAG_PSH);
+        assert_eq!(&tcp[14..16], &[0x10, 0x00]);
+        assert_eq!(&tcp[20..], b"hello");
     }
 
     #[test]

@@ -26,7 +26,7 @@ use std::mem::transmute;
 #[repr(C)]
 struct LookupTestOpaque {
     _tap_ethernet: Option<TapEthernetMetadata>,
-    _icmp_error: Option<IcmpErrorMetadata>,
+    icmp_error: Option<IcmpErrorMetadata>,
     forwarding: Option<ForwardingMetadata>,
 }
 
@@ -51,6 +51,7 @@ struct SinkState {
     forwarding: Vec<Option<ForwardingMetadata>>,
     egress_interfaces: Vec<Option<u32>>,
     frame_lens: Vec<usize>,
+    icmp_errors: Vec<Option<IcmpErrorMetadata>>,
 }
 
 struct SinkNode {
@@ -151,18 +152,20 @@ fn sink_process(
         .push(frame.pending_len());
     for buffer in frame.pending_indices().iter().copied() {
         let payload = chain_bytes(runtime, buffer);
-        let (egress_interface, forwarding) = {
+        let (egress_interface, forwarding, icmp_error) = {
             let buffer = runtime.get_buffer(buffer).expect("get buffer");
             let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
             let opaque = unsafe { transmute::<_, &LookupTestOpaque>(buffer.opaque2()) };
             (
                 Some(network.sw_if_index[1]).filter(|value| *value != 0),
                 opaque.forwarding,
+                opaque.icmp_error,
             )
         };
         let mut state = state.lock().expect("sink state poisoned");
         state.forwarding.push(forwarding);
         state.egress_interfaces.push(egress_interface);
+        state.icmp_errors.push(icmp_error);
         state.payloads.push(payload);
     }
     NodeResult::drop()
@@ -719,6 +722,141 @@ fn adjacency_rewrite_node_prepends_rewrite_and_sets_egress_interface() {
     );
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn adjacency_rewrite_df_mtu_exceed_diverts_to_icmp_frag_needed() {
+    use hammer_core::protocol::ip::{IPV4_FLAG_DONT_FRAGMENT, apply_ipv4_dont_fragment};
+
+    let runtime = test_runtime(2048, 8, 4);
+    let forward_state = Arc::new(Mutex::new(SinkState::default()));
+    let icmp_state = Arc::new(Mutex::new(SinkState::default()));
+    let forward_sink = register_sink(&runtime, &forward_state);
+    let icmp_sink = register_sink(&runtime, &icmp_state);
+    let drop_node = runtime.nodes().register_internal(DropNode::new());
+    let (control, _lookup) = placeholder_lookup(&runtime);
+    let rewrite_obj = AdjacencyRewriteNode::new(control.table_handle());
+    let rewrite_runtime = rewrite_obj.runtime_data_handle();
+    let rewrite_node = runtime.nodes().register_internal(rewrite_obj);
+    let drop_slot = next_slot(&runtime, rewrite_node, drop_node);
+    let forward_slot = next_slot(&runtime, rewrite_node, forward_sink);
+    let icmp_slot = next_slot(&runtime, rewrite_node, icmp_sink);
+    AdjacencyRewriteNode::configure_icmp_error_next(rewrite_runtime, icmp_slot);
+
+    let mut builder = FibTableBuilder::new(drop_slot);
+    let dpo = builder.add_interface_adjacency_dpo(
+        DpoProto::IP4,
+        12,
+        AdjacencyRewrite::empty(),
+        drop_slot,
+        forward_slot,
+    );
+    let adjacency = dpo.adjacency_index().expect("adjacency index");
+    builder
+        .adjacency_mut(adjacency)
+        .expect("adj")
+        .set_path_mtu(1_500, 100);
+    control.publish(builder.build()).expect("publish fib");
+
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(rewrite_node)
+        .expect("alloc frame");
+    let mut packet = ipv4_udp_packet([10, 0, 0, 1], 30_014, [192, 0, 2, 30], 53, &[0u8; 80]);
+    apply_ipv4_dont_fragment(&mut packet, true);
+    assert_eq!(
+        u16::from_be_bytes([packet[6], packet[7]]) & IPV4_FLAG_DONT_FRAGMENT,
+        IPV4_FLAG_DONT_FRAGMENT
+    );
+    let index = alloc_packet_with_headroom(&runtime, &packet);
+    {
+        let mut buffer = runtime.get_buffer_mut(index).expect("buffer");
+        let opaque = unsafe { transmute::<_, &mut LookupTestOpaque>(buffer.opaque2_mut()) };
+        opaque.forwarding = Some(ForwardingMetadata {
+            fib_index: 0,
+            route_dpo_type: DpoType::ADJACENCY,
+            route_dpo_index: adjacency.get(),
+            load_balance_index: u32::MAX,
+            bucket_index: u16::MAX,
+            dpo_type: DpoType::ADJACENCY,
+            dpo_index: adjacency.get(),
+        });
+    }
+    frame.push_index(index).expect("push packet");
+    runtime.put_next_frame(frame).expect("schedule");
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+
+    assert!(forward_state.lock().unwrap().payloads.is_empty());
+    let icmp = icmp_state.lock().unwrap();
+    assert_eq!(icmp.payloads.len(), 1);
+    assert_eq!(icmp.payloads[0].as_slice(), packet.as_slice());
+    let meta = icmp.icmp_errors[0].expect("icmp metadata");
+    assert_eq!(meta.icmp_type(), 3);
+    assert_eq!(meta.code(), 4);
+    assert_eq!(meta.data(), 100);
+}
+
+#[test]
+fn adjacency_rewrite_non_df_mtu_exceed_diverts_to_fragment_next() {
+    let runtime = test_runtime(2048, 8, 4);
+    let forward_state = Arc::new(Mutex::new(SinkState::default()));
+    let fragment_state = Arc::new(Mutex::new(SinkState::default()));
+    let forward_sink = register_sink(&runtime, &forward_state);
+    let fragment_sink = register_sink(&runtime, &fragment_state);
+    let drop_node = runtime.nodes().register_internal(DropNode::new());
+    let (control, _lookup) = placeholder_lookup(&runtime);
+    let rewrite_obj = AdjacencyRewriteNode::new(control.table_handle());
+    let rewrite_runtime = rewrite_obj.runtime_data_handle();
+    let rewrite_node = runtime.nodes().register_internal(rewrite_obj);
+    let drop_slot = next_slot(&runtime, rewrite_node, drop_node);
+    let forward_slot = next_slot(&runtime, rewrite_node, forward_sink);
+    let fragment_slot = next_slot(&runtime, rewrite_node, fragment_sink);
+    AdjacencyRewriteNode::configure_fragment_next(rewrite_runtime, fragment_slot);
+
+    let mut builder = FibTableBuilder::new(drop_slot);
+    let dpo = builder.add_interface_adjacency_dpo(
+        DpoProto::IP4,
+        12,
+        AdjacencyRewrite::empty(),
+        drop_slot,
+        forward_slot,
+    );
+    let adjacency = dpo.adjacency_index().expect("adjacency index");
+    builder
+        .adjacency_mut(adjacency)
+        .expect("adj")
+        .set_path_mtu(1_500, 100);
+    control.publish(builder.build()).expect("publish fib");
+
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(rewrite_node)
+        .expect("alloc frame");
+    // No DF bit: oversize should fragment, not ICMP Frag-Needed.
+    let packet = ipv4_udp_packet([10, 0, 0, 1], 30_014, [192, 0, 2, 30], 53, &[0u8; 80]);
+    assert_eq!(u16::from_be_bytes([packet[6], packet[7]]) & 0x4000, 0);
+    let index = alloc_packet_with_headroom(&runtime, &packet);
+    {
+        let mut buffer = runtime.get_buffer_mut(index).expect("buffer");
+        let opaque = unsafe { transmute::<_, &mut LookupTestOpaque>(buffer.opaque2_mut()) };
+        opaque.forwarding = Some(ForwardingMetadata {
+            fib_index: 0,
+            route_dpo_type: DpoType::ADJACENCY,
+            route_dpo_index: adjacency.get(),
+            load_balance_index: u32::MAX,
+            bucket_index: u16::MAX,
+            dpo_type: DpoType::ADJACENCY,
+            dpo_index: adjacency.get(),
+        });
+    }
+    frame.push_index(index).expect("push packet");
+    runtime.put_next_frame(frame).expect("schedule");
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+
+    assert!(forward_state.lock().unwrap().payloads.is_empty());
+    let fragment = fragment_state.lock().unwrap();
+    assert_eq!(fragment.payloads.len(), 1);
+    assert_eq!(fragment.payloads[0].as_slice(), packet.as_slice());
 }
 
 #[test]

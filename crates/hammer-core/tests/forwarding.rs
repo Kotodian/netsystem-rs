@@ -198,6 +198,52 @@ fn fib_table_builder_adds_interface_adjacency_with_rewrite() {
         &[0xaa, 0xbb, 0x08, 0x00]
     );
     assert_eq!(adjacency_entry.next, NextHop::Direct);
+    // VPP rewrite_header.max_l3_packet_bytes defaults from interface MTU;
+    // Hammer seeds Ethernet-sized L3 MTU until interface/path MTU is applied.
+    assert_eq!(adjacency_entry.max_l3_packet_bytes, 1_500);
+}
+
+#[test]
+fn adjacency_set_path_mtu_matches_vpp_adj_nbr_set_mtu() {
+    use hammer_core::forwarding::Adjacency;
+
+    let mut adjacency = Adjacency {
+        next: NextHop::Direct,
+        proto: DpoProto::IP4,
+        egress_interface: Some(1),
+        rewrite: AdjacencyRewrite::empty(),
+        max_l3_packet_bytes: 1_500,
+    };
+
+    // Non-zero path MTU clamps to min(link, path).
+    adjacency.set_path_mtu(1_500, 576);
+    assert_eq!(adjacency.max_l3_packet_bytes, 576);
+
+    // Zero path MTU restores link MTU (VPP adj_nbr_set_mtu(0)).
+    adjacency.set_path_mtu(1_500, 0);
+    assert_eq!(adjacency.max_l3_packet_bytes, 1_500);
+
+    // Path MTU above link does not raise the link ceiling.
+    adjacency.set_path_mtu(1_500, 9_000);
+    assert_eq!(adjacency.max_l3_packet_bytes, 1_500);
+}
+
+#[test]
+fn ipv4_mtu_check_matches_vpp_ip4_mtu_check() {
+    use hammer_core::protocol::ip::{Ipv4MtuAction, ipv4_mtu_check};
+
+    assert_eq!(
+        ipv4_mtu_check(1_400, 1_500, true),
+        Ipv4MtuAction::Ok
+    );
+    assert_eq!(
+        ipv4_mtu_check(1_600, 1_500, true),
+        Ipv4MtuAction::IcmpFragNeeded { mtu: 1_500 }
+    );
+    assert_eq!(
+        ipv4_mtu_check(1_600, 1_500, false),
+        Ipv4MtuAction::Fragment { mtu: 1_500 }
+    );
 }
 
 #[test]

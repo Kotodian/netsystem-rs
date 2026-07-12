@@ -4,7 +4,9 @@ use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 
 use crate::protocol::ip::{IpProtocol, IpVersion, ParsedIpPacket};
 
-use super::dpo::{Adjacency, AdjacencyIndex, AdjacencyRewrite, DpoId, DpoProto};
+use super::dpo::{
+    Adjacency, AdjacencyIndex, AdjacencyRewrite, DEFAULT_ADJACENCY_L3_MTU, DpoId, DpoProto,
+};
 use super::ip4_mtrie::{Ip4Mtrie, Ip4MtrieRoute, Ip4MtrieValue};
 use super::ip6_fib::Ip6Fib;
 use super::load_balance::{LoadBalance, LoadBalanceError, LoadBalanceIndex};
@@ -297,6 +299,11 @@ impl<N: Copy> FibTableBuilder<N> {
     }
 
     #[inline]
+    pub fn adjacency_mut(&mut self, index: AdjacencyIndex) -> Option<&mut Adjacency<N>> {
+        self.adjacencies.get_mut(index.slot())
+    }
+
+    #[inline]
     pub fn add_interface_adjacency(
         &mut self,
         proto: DpoProto,
@@ -310,6 +317,7 @@ impl<N: Copy> FibTableBuilder<N> {
             proto,
             egress_interface: egress_interface.into(),
             rewrite,
+            max_l3_packet_bytes: DEFAULT_ADJACENCY_L3_MTU,
         });
         index
     }
