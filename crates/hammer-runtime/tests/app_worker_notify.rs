@@ -1,5 +1,6 @@
-use hammer_infra::segment::Local;
-use hammer_runtime::app::{AppSessionConfig, SessionHandle, with_current_app_worker};
+use hammer_runtime::app::{
+    AppSessionConfig, SessionEvtType, SessionHandle, with_current_app_worker,
+};
 use tokio::time::{Duration, timeout};
 
 #[tokio::test(flavor = "current_thread")]
@@ -45,7 +46,7 @@ async fn local_app_worker_next_event_wakes_after_event_notify() {
     let producer = async {
         tokio::task::yield_now().await;
         session
-            .push_event(hammer_infra::msg_queue::SessionEvtType::Connect)
+            .push_event(SessionEvtType::Connect)
             .expect("push event");
         with_current_app_worker(0, |worker| worker.wake_evt(handle));
     };

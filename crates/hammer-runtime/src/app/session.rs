@@ -7,12 +7,12 @@ use hammer_infra::fifo::Fifo;
 use hammer_infra::msg_queue::MsgQueue;
 use hammer_infra::segment::{Local, Svm};
 
+use crate::app::SessionHandle;
+use crate::app::SessionOffsets;
 use crate::app::session_msg_queue::{
     FlatSessionMsgQueue, SessionEventQueue, SessionEvt, SessionEvtType, SessionMsgQueue,
     SessionSegment,
 };
-use crate::app::SessionHandle;
-use crate::app::SessionOffsets;
 
 /// VPP-style app/session object: per-session byte FIFOs plus event queue.
 ///
@@ -288,9 +288,7 @@ impl AppSession<Local> {
                 .map_err(|_| HammerError::internal("invalid tx fifo capacity"))?,
         );
         let ring_nitems = config.evt_q_capacity.max(1) as u32;
-        let q_nitems = (config.evt_q_capacity + 1)
-            .next_power_of_two()
-            .max(2) as u32;
+        let q_nitems = (config.evt_q_capacity + 1).next_power_of_two().max(2) as u32;
         let evt_q = Arc::new(
             SessionMsgQueue::with_cfg(q_nitems, ring_nitems)
                 .map_err(|_| HammerError::internal("invalid app session evt_q capacity"))?,
@@ -356,6 +354,32 @@ mod tests {
             Arc::new(SessionMsgQueue::with_cfg(64, 64).expect("tx_evt_q"));
         AppSession::<Local>::new_in_segment(Local::default(), config, handle, tx_evt_q)
             .expect("session")
+    }
+
+    #[test]
+    fn app_session_send_bytes_clears_tx_event_when_tx_evt_q_full() {
+        let tx_evt_q: Arc<SessionMsgQueue> =
+            Arc::new(SessionMsgQueue::with_cfg(2, 1).expect("tx_evt_q"));
+        tx_evt_q
+            .enqueue_io(SessionEvt::io(99, SessionEvtType::TxDeq))
+            .expect("fill io ring");
+        let session = AppSession::<Local>::new_in_segment(
+            Local::default(),
+            AppSessionConfig::new(64, 4),
+            SessionHandle::new(1, 0),
+            Arc::clone(&tx_evt_q),
+        )
+        .expect("session");
+
+        assert!(session.send_bytes(b"x").is_err());
+        assert!(!session.tx_fifo().has_event());
+
+        assert!(tx_evt_q.dequeue().is_some());
+        assert_eq!(session.send_bytes(b"y").expect("retry after drain"), 1);
+        assert!(session.tx_fifo().has_event());
+        let evt = tx_evt_q.dequeue().expect("tx deq after retry");
+        assert_eq!(evt.evt_type, SessionEvtType::TxDeq);
+        assert_eq!(evt.session_index(), 1);
     }
 
     #[test]

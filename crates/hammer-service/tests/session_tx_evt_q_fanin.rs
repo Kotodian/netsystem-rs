@@ -2,16 +2,15 @@
 //! Behavioral only — no source greps.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
-use hammer_runtime::app::{SessionEventQueue, SessionEvt, SessionEvtType, SessionMsgQueue};
+use hammer_runtime::app::{SessionEvt, SessionEvtType, SessionMsgQueue};
 
 #[test]
 fn shared_tx_evt_q_concurrent_enqueue_io_preserves_all_events() {
-    let q: Arc<SessionMsgQueue> =
-        Arc::new(SessionMsgQueue::with_cfg(512, 256).expect("queue"));
+    let q: Arc<SessionMsgQueue> = Arc::new(SessionMsgQueue::with_cfg(512, 256).expect("queue"));
     let producers = 8usize;
     let per = 50usize;
     let total = producers * per;
