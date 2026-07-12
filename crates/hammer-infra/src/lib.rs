@@ -12,6 +12,7 @@ pub mod map;
 pub mod mask_compare;
 pub mod msg_queue;
 pub mod mtrie;
+pub mod multi_ring_msg_queue;
 pub mod pool;
 pub mod prefetch;
 pub mod rbtree;
