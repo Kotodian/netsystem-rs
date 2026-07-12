@@ -48,6 +48,14 @@ _Avoid_: per-packet get/push/put from Session Queue, Fanout before transport com
 `process_frame!` only runs packet logic, records one current-node-local `NodeNext` decision per Index into fixed stack scratch of production frame capacity (256), and invokes Graph Fanout once. It does not cache target `NodeId`s, scan groups, acquire Next Frames, push Indexes, branch on capacity, put frames, or heap-allocate next scratch.
 _Avoid_: NodeId process_frame body, temporary Vec next scratch, macro-owned get/push/put, NodeId: NodeNext
 
+**IP Reassembly Fanout**:
+IP reassembly drains the input Frame, retains pending fragments in reassembly context, and accumulates worker-local Drop/Lookup outputs on the same Frame with fixed stack next scratch before one Graph Fanout flush (with mid-dispatch flush if output hits frame capacity). Cross-worker fragment ownership remains Handoff.
+_Avoid_: reassembly emit_output get/push/put, packet-path NodeId next, Fanout of handoff-owned fragments
+
+**TUN Ingress Fanout**:
+TUN input receives into the driver Frame, then enqueues every pending Index through Graph Fanout on the registered local next slot (slot 0). It does not acquire a separate Next Frame or push/put by target `NodeId`.
+_Avoid_: TUN input get_next_frame/put_next_frame, NodeId hot-path next field
+
 **Graph Fanout**:
 The sole worker-local next-frame enqueue: it groups packet ownership by selected Next Arc and makes the resulting Next Frames visible at the current Graph Node dispatch boundary. Cross-worker ownership transfer remains Handoff, not Graph Fanout.
 _Avoid_: cross-thread fanout, handoff enqueue, output router, per-node manual frame get/push/put, recoverable enqueue Result on the packet path

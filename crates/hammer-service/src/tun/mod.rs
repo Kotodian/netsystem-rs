@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use hammer_core::data_plane::{
     BufferFrame, Index, BufferRef, Frame, Next, NodeId, NodeRegistration, SecondaryOpaque,
+    DEFAULT_BUFFER_FRAME_CAPACITY,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::vec::Vec;
@@ -157,7 +158,6 @@ pub struct TunInputRuntime {
     interface_control: Option<InterfaceControlHandle>,
     device_main: Option<Arc<DeviceMain>>,
     rx_queue: Option<u32>,
-    next: NodeId,
     max_batch: usize,
     mode: TunDriverMode,
 }
@@ -353,23 +353,10 @@ impl TunDriverDirection for TunInputRuntime {
         if !frame.has_pending() {
             return NodeResult::drop();
         }
-        let mut next_frame = match runtime.buffers().get_next_frame(self.next) {
-            Ok(frame) => frame,
-            Err(_) => return NodeResult::drop(),
-        };
-        let width = runtime.preferred_frame_batch_width();
-        if frame
-            .retain_indices_batched(width, |index| {
-                next_frame.push_index(index)?;
-                Ok(false)
-            })
-            .is_err()
-        {
-            return NodeResult::drop();
-        }
-        if runtime.put_next_frame(next_frame).is_err() {
-            return NodeResult::drop();
-        }
+        let n = frame.len();
+        debug_assert!(n <= DEFAULT_BUFFER_FRAME_CAPACITY);
+        let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
+        runtime.enqueue_to_next(frame, &nexts[..n]);
         NodeResult::drop()
     }
 }
@@ -1057,7 +1044,6 @@ impl TunDriverNode<TunInputRuntime> {
             interface_control: None,
             device_main: None,
             rx_queue: None,
-            next,
             max_batch: DEFAULT_TUN_RECV_BATCH,
             mode: TunDriverMode::Tun,
         });
