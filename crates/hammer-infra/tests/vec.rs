@@ -64,3 +64,14 @@ impl Drop for DropCounter {
         self.drops.set(self.drops.get() + 1);
     }
 }
+
+#[test]
+fn drain_prefix_drop_restores_untouched_tail() {
+    let mut values = Vec::with_capacity(4);
+    values.extend_from_slice(&[10, 20, 30, 40]);
+    {
+        let mut drained = values.drain(0..2);
+        assert_eq!(drained.next(), Some(10));
+    }
+    assert_eq!(values.as_slice(), &[30, 40]);
+}

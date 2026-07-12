@@ -1,5 +1,4 @@
 use core::alloc::{GlobalAlloc, Layout};
-use core::marker::PhantomData;
 use core::mem;
 use core::ptr::{self, NonNull};
 use core::slice;
@@ -22,6 +21,7 @@ use hammer_infra::{
     heap::Heap,
     prefetch::{prefetch_read_l1, prefetch_read_l2, prefetch_write_l1},
     simd::movemask_4,
+    vec::Vec,
 };
 use spinning_top::{
     RawRwSpinlock, RwSpinlock,
@@ -3031,214 +3031,6 @@ fn prefetch_buffer_data_write(buffer: &Buffer) {
     }
 }
 
-pub(crate) struct IndexList {
-    ptr: NonNull<Index>,
-    len: usize,
-    cap: usize,
-    heap: Arc<Heap>,
-}
-
-impl IndexList {
-    #[inline]
-    pub(crate) fn with_capacity(capacity: usize) -> Self {
-        let heap = Arc::new(Heap::local());
-        if capacity == 0 {
-            return Self {
-                ptr: NonNull::dangling(),
-                len: 0,
-                cap: 0,
-                heap,
-            };
-        }
-        let layout = frame_indices_layout(capacity);
-        let raw = heap
-            .alloc(layout)
-            .unwrap_or_else(|| handle_alloc_error(layout));
-        let ptr =
-            NonNull::new(raw.as_ptr().cast::<Index>()).expect("Heap::alloc returned null");
-        Self {
-            ptr,
-            len: 0,
-            cap: capacity,
-            heap,
-        }
-    }
-
-    #[inline(always)]
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    #[inline(always)]
-    fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    #[inline(always)]
-    pub(crate) fn capacity(&self) -> usize {
-        self.cap
-    }
-
-    #[inline(always)]
-    fn as_slice(&self) -> &[Index] {
-        unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
-    }
-
-    #[inline(always)]
-    fn as_mut_slice(&mut self) -> &mut [Index] {
-        unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
-    }
-
-    #[inline(always)]
-    pub(crate) fn try_push(&mut self, index: Index) -> bool {
-        if self.len == self.cap {
-            return false;
-        }
-        unsafe { self.ptr.as_ptr().add(self.len).write(index) };
-        self.len += 1;
-        true
-    }
-
-    #[inline(always)]
-    fn push(&mut self, index: Index) {
-        let pushed = self.try_push(index);
-        debug_assert!(pushed);
-    }
-
-    #[inline(always)]
-    pub(crate) fn clear(&mut self) {
-        self.len = 0;
-    }
-
-    #[inline(always)]
-    fn truncate(&mut self, len: usize) {
-        if len < self.len {
-            self.len = len;
-        }
-    }
-
-    #[inline]
-    fn drain_all(&mut self) -> BufferFrameDrain<'_> {
-        let len = self.len;
-        self.len = 0;
-        BufferFrameDrain {
-            indices: self as *mut IndexList,
-            current: 0,
-            end: len,
-            tail_start: len,
-            tail_len: 0,
-            state: PhantomData,
-        }
-    }
-
-    #[inline]
-    fn drain_prefix(&mut self, count: usize) -> BufferFrameDrain<'_> {
-        let count = count.min(self.len);
-        let old_len = self.len;
-        self.len = 0;
-        BufferFrameDrain {
-            indices: self as *mut IndexList,
-            current: 0,
-            end: count,
-            tail_start: count,
-            tail_len: old_len - count,
-            state: PhantomData,
-        }
-    }
-}
-
-impl fmt::Debug for IndexList {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.as_slice().fmt(f)
-    }
-}
-
-impl Drop for IndexList {
-    #[inline]
-    fn drop(&mut self) {
-        if self.cap == 0 {
-            return;
-        }
-        let layout = frame_indices_layout(self.cap);
-        unsafe { GlobalAlloc::dealloc(&*self.heap, self.ptr.as_ptr().cast::<u8>(), layout) };
-    }
-}
-
-#[inline]
-fn frame_indices_layout(capacity: usize) -> Layout {
-    let bytes = mem::size_of::<Index>()
-        .checked_mul(capacity)
-        .expect("frame indices allocation size overflow")
-        .max(1);
-    Layout::from_size_align(bytes, BUFFER_CACHE_LINE_SIZE).expect("frame indices layout")
-}
-
-impl Deref for IndexList {
-    type Target = [Index];
-
-    #[inline(always)]
-    fn deref(&self) -> &Self::Target {
-        self.as_slice()
-    }
-}
-
-impl DerefMut for IndexList {
-    #[inline(always)]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.as_mut_slice()
-    }
-}
-
-pub struct BufferFrameDrain<'frame> {
-    indices: *mut IndexList,
-    current: usize,
-    end: usize,
-    tail_start: usize,
-    tail_len: usize,
-    state: PhantomData<&'frame mut IndexList>,
-}
-
-impl Iterator for BufferFrameDrain<'_> {
-    type Item = Index;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.current == self.end {
-            return None;
-        }
-        let index = self.current;
-        self.current += 1;
-        Some(unsafe { (*self.indices).ptr.as_ptr().add(index).read() })
-    }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.end - self.current;
-        (len, Some(len))
-    }
-}
-
-impl ExactSizeIterator for BufferFrameDrain<'_> {}
-
-impl Drop for BufferFrameDrain<'_> {
-    #[inline]
-    fn drop(&mut self) {
-        if self.tail_len == 0 {
-            return;
-        }
-        unsafe {
-            let indices = &mut *self.indices;
-            ptr::copy(
-                indices.ptr.as_ptr().add(self.tail_start),
-                indices.ptr.as_ptr(),
-                self.tail_len,
-            );
-            indices.len += self.tail_len;
-        }
-    }
-}
-
 pub struct DataPlaneBufferChain<'pool> {
     pool: Option<&'pool BufferPool>,
     next: Option<Index>,
@@ -3298,7 +3090,7 @@ impl<'pool> Iterator for DataPlaneBufferChain<'pool> {
 
 #[derive(Debug)]
 pub struct BufferFrame {
-    indices: IndexList,
+    indices: Vec<Index>,
     readiness: Rc<FrameReadiness>,
 }
 
@@ -3583,7 +3375,7 @@ impl BufferFrame {
     #[inline]
     fn with_capacity(capacity: usize) -> Self {
         Self {
-            indices: IndexList::with_capacity(capacity),
+            indices: Vec::with_capacity(capacity),
             readiness: Rc::new(FrameReadiness::default()),
         }
     }
@@ -3707,9 +3499,9 @@ impl BufferFrame {
     }
 
     #[inline]
-    fn drain_indices(&mut self) -> BufferFrameDrain<'_> {
+    fn drain_indices(&mut self) -> hammer_infra::vec::Drain<'_, Index> {
         self.readiness.clear_pending();
-        self.indices.drain_all()
+        self.indices.drain(..)
     }
 
     #[inline]
@@ -3718,7 +3510,7 @@ impl BufferFrame {
             return;
         }
         let count = count.min(self.indices.len());
-        drop(self.indices.drain_prefix(count));
+        drop(self.indices.drain(..count));
         if self.indices.is_empty() {
             self.readiness.clear_pending();
         } else {

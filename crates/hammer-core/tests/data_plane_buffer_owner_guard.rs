@@ -31,7 +31,6 @@ const MOVED_ADAPTER_PATTERNS: &[&str] = &[
     "hammer_adapter::BufferRefMut",
     "hammer_adapter::BufferThreadCache",
     "hammer_adapter::DataPlaneBufferConfig",
-    "hammer_adapter::BufferFrameDrain",
     "hammer_adapter::DataPlaneBufferChain",
     "hammer_adapter::BufferFramePending",
     "hammer_adapter::buffer::{",
@@ -64,7 +63,6 @@ const MOVED_ADAPTER_PATTERNS: &[&str] = &[
     "hammer_adapter::buffer::BufferRefMut",
     "hammer_adapter::buffer::BufferThreadCache",
     "hammer_adapter::buffer::DataPlaneBufferConfig",
-    "hammer_adapter::buffer::BufferFrameDrain",
     "hammer_adapter::buffer::DataPlaneBufferChain",
     "hammer_adapter::buffer::BufferFramePending",
 ];
@@ -99,7 +97,6 @@ const MOVED_ROOT_IMPORTS: &[&str] = &[
     "BufferRefMut",
     "BufferThreadCache",
     "DataPlaneBufferConfig",
-    "BufferFrameDrain",
     "DataPlaneBufferChain",
     "BufferFramePending",
 ];

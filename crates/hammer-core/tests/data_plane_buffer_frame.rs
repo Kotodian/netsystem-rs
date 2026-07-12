@@ -4,14 +4,14 @@ use hammer_core::data_plane::{
     BUFFER_CACHE_LINE_SIZE, BUFFER_IN_USE_FOLD_THRESHOLD, BUFFER_INVALID_INDEX,
     BUFFER_THREAD_CACHE_BATCH, BUFFER_THREAD_CACHE_HIGH_WATER, Buffer, BufferFlags, BufferFrame,
     BufferFrameBatch, BufferFrameBatchCursor, BufferFrameBatchIndices, BufferFrameBatchWidth,
-    BufferFrameBatchWidthPolicy, BufferFrameDrain, BufferFramePairBatch,
-    BufferFramePairBatchCursor, BufferFramePending, BufferFrameQuadBatch,
-    BufferFrameQuadBatchCursor, BufferHeaderCacheline0, BufferHeaderCacheline1, BufferNodeError,
-    BufferPacketCursor, BufferPool, BufferPoolArena, BufferRef, BufferRefMut, BufferThreadCache,
-    DEFAULT_BUFFER_FRAME_CAPACITY, DEFAULT_BUFFER_FRAME_POOL_SIZE, DEFAULT_PACKET_HEADROOM,
-    DEFAULT_PRE_DATA_SIZE, DataPlaneBufferChain, DataPlaneBufferConfig, DataPlaneBuffers, Frame,
-    Index, Next, NodeId, PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES, Pending, PrimaryOpaque,
-    SecondaryOpaque, buffer_data_offset,
+    BufferFrameBatchWidthPolicy, BufferFramePairBatch, BufferFramePairBatchCursor,
+    BufferFramePending, BufferFrameQuadBatch, BufferFrameQuadBatchCursor, BufferHeaderCacheline0,
+    BufferHeaderCacheline1, BufferNodeError, BufferPacketCursor, BufferPool, BufferPoolArena,
+    BufferRef, BufferRefMut, BufferThreadCache, DEFAULT_BUFFER_FRAME_CAPACITY,
+    DEFAULT_BUFFER_FRAME_POOL_SIZE, DEFAULT_PACKET_HEADROOM, DEFAULT_PRE_DATA_SIZE,
+    DataPlaneBufferChain, DataPlaneBufferConfig, DataPlaneBuffers, Frame, Index, Next, NodeId,
+    PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES, Pending, PrimaryOpaque, SecondaryOpaque,
+    buffer_data_offset,
 };
 use hammer_infra::vec::Vec;
 
@@ -60,7 +60,6 @@ fn core_exports_buffer_and_frame_value_primitives() {
 
     type CoreFrameNext = Frame<Next>;
     type CoreFramePending = Frame<Pending>;
-    type CoreBufferFrameDrain<'a> = BufferFrameDrain<'a>;
     type CoreBufferFramePairBatchCursor<'a> = BufferFramePairBatchCursor<'a>;
     type CoreBufferFrameQuadBatchCursor<'a> = BufferFrameQuadBatchCursor<'a>;
     type CoreBufferFrameBatchCursor<'a> = BufferFrameBatchCursor<'a>;
@@ -79,7 +78,6 @@ fn core_exports_buffer_and_frame_value_primitives() {
     let _ = size_of::<DataPlaneBufferChain>();
     let _ = size_of::<CoreFrameNext>();
     let _ = size_of::<CoreFramePending>();
-    let _ = size_of::<CoreBufferFrameDrain<'static>>();
     let _ = size_of::<CoreBufferFramePairBatchCursor<'static>>();
     let _ = size_of::<CoreBufferFrameQuadBatchCursor<'static>>();
     let _ = size_of::<CoreBufferFrameBatchCursor<'static>>();
@@ -185,4 +183,111 @@ fn core_frame_pending_owner_can_release_trace_handles_on_return() {
     assert_eq!(released, vec![42]);
     assert_eq!(buffers.in_use_buffers(), 0);
     assert_eq!(buffers.frames_in_use(), 0);
+}
+
+#[test]
+fn core_frame_empty_and_full_cleanup_release_owned_buffers_once() {
+    let buffers = test_buffers(64, 8);
+
+    let empty = buffers.get_next_frame(NodeId::new(0)).expect("empty frame");
+    assert!(empty.is_empty());
+    assert_eq!(empty.capacity(), 4);
+    drop(empty);
+    assert_eq!(buffers.in_use_buffers(), 0);
+    assert_eq!(buffers.frames_in_use(), 0);
+
+    let mut full = buffers.get_next_frame(NodeId::new(1)).expect("full frame");
+    let mut owned = std::vec::Vec::new();
+    for _ in 0..full.capacity() {
+        let index = buffers.alloc_index().expect("buffer");
+        full.push_index(index).expect("push within capacity");
+        owned.push(index);
+    }
+    let overflow = buffers.alloc_index().expect("overflow buffer");
+    assert!(full.push_index(overflow).is_err());
+    assert_eq!(full.len(), full.capacity());
+    assert_eq!(buffers.in_use_buffers(), full.capacity() + 1);
+
+    drop(full);
+    assert_eq!(buffers.in_use_buffers(), 1);
+    assert!(buffers.get_buffer(overflow).is_ok());
+    for index in owned {
+        assert!(buffers.get_buffer(index).is_err());
+    }
+
+    let mut cleanup = buffers.get_next_frame(NodeId::new(2)).expect("cleanup frame");
+    cleanup.push_index(overflow).expect("own overflow");
+    drop(cleanup);
+    assert_eq!(buffers.in_use_buffers(), 0);
+    assert_eq!(buffers.frames_in_use(), 0);
+}
+
+#[test]
+fn core_frame_transfer_moves_index_without_double_release() {
+    let buffers = test_buffers(64, 4);
+    let first = buffers.alloc_index_with_bytes(b"a").expect("first");
+    let second = buffers.alloc_index_with_bytes(b"b").expect("second");
+
+    let mut source = buffers.get_next_frame(NodeId::new(3)).expect("source");
+    source.push_index(first).expect("push first");
+    source.push_index(second).expect("push second");
+    assert_eq!(source.indices(), &[first, second]);
+
+    let moved = source.indices()[0];
+    source.discard_prefix(1);
+    assert_eq!(source.indices(), &[second]);
+
+    let mut destination = buffers.get_next_frame(NodeId::new(4)).expect("destination");
+    destination.push_index(moved).expect("transfer");
+    assert_eq!(destination.indices(), &[moved]);
+    assert_eq!(buffers.in_use_buffers(), 2);
+
+    drop(source);
+    assert_eq!(buffers.in_use_buffers(), 1);
+    assert!(buffers.get_buffer(first).is_ok());
+    assert!(buffers.get_buffer(second).is_err());
+
+    drop(destination);
+    assert_eq!(buffers.in_use_buffers(), 0);
+    assert!(buffers.get_buffer(first).is_err());
+}
+
+#[test]
+fn core_frame_retain_preserves_stable_order() {
+    let buffers = test_buffers(64, 8);
+    let indices: std::vec::Vec<_> = (0..4)
+        .map(|i| {
+            buffers
+                .alloc_index_with_bytes(&[i])
+                .expect("alloc index")
+        })
+        .collect();
+
+    let mut frame = buffers.get_next_frame(NodeId::new(5)).expect("frame");
+    frame
+        .push_indices(indices.iter().copied())
+        .expect("push indices");
+
+    let mut discarded = std::vec::Vec::new();
+    frame
+        .retain_indices(|index| {
+            if index == indices[0] || index == indices[2] {
+                Ok(true)
+            } else {
+                discarded.push(index);
+                Ok(false)
+            }
+        })
+        .expect("retain selected");
+    assert_eq!(frame.indices(), &[indices[0], indices[2]]);
+    assert_eq!(discarded, std::vec![indices[1], indices[3]]);
+
+    let mut cleanup = buffers.get_next_frame(NodeId::new(6)).expect("cleanup");
+    cleanup
+        .push_indices(discarded)
+        .expect("own discarded indexes");
+
+    drop(frame);
+    drop(cleanup);
+    assert_eq!(buffers.in_use_buffers(), 0);
 }
