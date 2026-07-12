@@ -9,6 +9,7 @@ pub mod fifo_queue;
 pub mod heap;
 pub mod hint;
 pub mod map;
+pub mod mask_compare;
 pub mod msg_queue;
 pub mod mtrie;
 pub mod pool;
