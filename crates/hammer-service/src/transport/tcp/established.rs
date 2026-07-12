@@ -618,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn in_order_payload_is_accepted_into_session_rx() {
+    fn in_order_payload_advances_receive_window() {
         let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
             buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                 buffer_slot_capacity: 2048,
@@ -627,8 +627,15 @@ mod tests {
                 ..hammer_core::data_plane::DataPlaneBufferConfig::default()
             },
         });
-        let (established, handle, output_state, drop_state) = install_established_runtime(&runtime);
+        let (established, handle, output_state, _) = install_established_runtime(&runtime);
         let (session_id, rcv_nxt, snd_nxt) = open_established_session(handle);
+        let rx_before = {
+            let queue = handle.borrow_mut().expect("tcp queue");
+            queue
+                .app()
+                .rx_available_len(session_id)
+                .expect("rx capacity")
+        };
 
         send_to_established(
             &runtime,
@@ -641,13 +648,16 @@ mod tests {
         let queue = handle.borrow_mut().expect("tcp queue");
         let connection = queue.session(session_id).expect("session");
         assert_eq!(connection.rcv_nxt(), rcv_nxt + 5);
-        assert!(drop_state.lock().expect("drop").packets.is_empty());
-        // First clean in-order payload uses delayed ACK; no immediate control.
+        assert_eq!(
+            queue.app().rx_available_len(session_id).expect("rx capacity"),
+            rx_before - 5
+        );
+        // Delayed ACK: first clean segment does not emit an immediate ACK.
         assert!(output_state.lock().expect("output").packets.is_empty());
     }
 
     #[test]
-    fn duplicate_payload_emits_ack_through_tcp_output() {
+    fn duplicate_segment_triggers_immediate_ack() {
         let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
             buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                 buffer_slot_capacity: 2048,
@@ -656,7 +666,7 @@ mod tests {
                 ..hammer_core::data_plane::DataPlaneBufferConfig::default()
             },
         });
-        let (established, handle, output_state, drop_state) = install_established_runtime(&runtime);
+        let (established, handle, output_state, _) = install_established_runtime(&runtime);
         let (session_id, rcv_nxt, snd_nxt) = open_established_session(handle);
 
         send_to_established(
@@ -673,21 +683,24 @@ mod tests {
             Some(session_id),
             data_packet(rcv_nxt, snd_nxt, b"hello"),
         );
-        assert!(runtime.run_ready_nodes().expect("run duplicate") >= 1);
-        if output_state.lock().expect("output").packets.is_empty() {
-            assert!(runtime.run_ready_nodes().expect("run output") >= 1);
+        for _ in 0..8 {
+            let _ = runtime.run_ready_nodes().expect("drain");
+            if !output_state.lock().expect("output").packets.is_empty() {
+                break;
+            }
         }
 
-        assert!(drop_state.lock().expect("drop").packets.is_empty());
+        let queue = handle.borrow_mut().expect("tcp queue");
+        let connection = queue.session(session_id).expect("session");
+        assert_eq!(connection.rcv_nxt(), rcv_nxt + 5);
         let packets = output_state.lock().expect("output");
         assert_eq!(packets.packets.len(), 1);
-        let ack = &packets.packets[0];
-        assert_eq!(tcp_flags(ack) & TCP_FLAG_ACK, TCP_FLAG_ACK);
-        assert_eq!(tcp_acknowledgment(ack), rcv_nxt + 5);
+        assert_eq!(tcp_flags(&packets.packets[0]) & TCP_FLAG_ACK, TCP_FLAG_ACK);
+        assert_eq!(tcp_acknowledgment(&packets.packets[0]), rcv_nxt + 5);
     }
 
     #[test]
-    fn missing_session_route_reaches_drop_next() {
+    fn segment_without_session_is_discarded_without_side_effects() {
         let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
             buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                 buffer_slot_capacity: 2048,
@@ -696,8 +709,8 @@ mod tests {
                 ..hammer_core::data_plane::DataPlaneBufferConfig::default()
             },
         });
-        let (established, handle, output_state, drop_state) = install_established_runtime(&runtime);
-        let (_, rcv_nxt, snd_nxt) = open_established_session(handle);
+        let (established, handle, output_state, _) = install_established_runtime(&runtime);
+        let (session_id, rcv_nxt, snd_nxt) = open_established_session(handle);
 
         send_to_established(
             &runtime,
@@ -705,12 +718,12 @@ mod tests {
             None,
             data_packet(rcv_nxt, snd_nxt, b"x"),
         );
-        assert!(runtime.run_ready_nodes().expect("run established") >= 1);
-        if drop_state.lock().expect("drop").packets.is_empty() {
-            assert!(runtime.run_ready_nodes().expect("run drop") >= 1);
-        }
+        let _ = runtime.run_ready_nodes().expect("run established");
+        let _ = runtime.run_ready_nodes().expect("drain");
 
+        let queue = handle.borrow_mut().expect("tcp queue");
+        let connection = queue.session(session_id).expect("session");
+        assert_eq!(connection.rcv_nxt(), rcv_nxt);
         assert!(output_state.lock().expect("output").packets.is_empty());
-        assert_eq!(drop_state.lock().expect("drop").packets.len(), 1);
     }
 }

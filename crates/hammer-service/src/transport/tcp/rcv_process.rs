@@ -539,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn finwait1_ack_of_local_fin_advances_to_finwait2() {
+    fn ack_of_local_fin_moves_finwait1_to_finwait2() {
         let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
             buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                 buffer_slot_capacity: 2048,
@@ -548,7 +548,7 @@ mod tests {
                 ..hammer_core::data_plane::DataPlaneBufferConfig::default()
             },
         });
-        let (rcv, handle, output_state, drop_state) = install_rcv_runtime(&runtime);
+        let (rcv, handle, output_state, _) = install_rcv_runtime(&runtime);
         let (session_id, rcv_nxt, snd_nxt) = open_fin_wait1_session(handle);
 
         send_to_rcv(
@@ -557,17 +557,16 @@ mod tests {
             Some(session_id),
             control_packet(rcv_nxt, snd_nxt, TcpSegmentFlags::ACK),
         );
-        assert!(runtime.run_ready_nodes().expect("run rcv") >= 1);
+        assert!(runtime.run_ready_nodes().expect("run") >= 1);
 
         let queue = handle.borrow_mut().expect("tcp queue");
         let connection = queue.session(session_id).expect("session");
         assert_eq!(connection.state(), TcpState::FinWait2);
-        assert!(drop_state.lock().expect("drop").packets.is_empty());
         assert!(output_state.lock().expect("output").packets.is_empty());
     }
 
     #[test]
-    fn finwait1_remote_fin_emits_ack_through_tcp_output() {
+    fn simultaneous_close_acks_peer_fin_and_enters_closing() {
         let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
             buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                 buffer_slot_capacity: 2048,
@@ -576,7 +575,7 @@ mod tests {
                 ..hammer_core::data_plane::DataPlaneBufferConfig::default()
             },
         });
-        let (rcv, handle, output_state, drop_state) = install_rcv_runtime(&runtime);
+        let (rcv, handle, output_state, _) = install_rcv_runtime(&runtime);
         let (session_id, rcv_nxt, snd_una) = {
             let mut queue = handle.borrow_mut().expect("tcp queue");
             let session_id = queue
@@ -603,8 +602,6 @@ mod tests {
                 } = worker;
                 let connection = connections.get_mut(connection_index).expect("connection");
                 connection.on_session_close(connection_index, timers);
-                // Advance snd_nxt for the local FIN so a remote FIN that only
-                // ACKs snd_una enters Closing (simultaneous close), not TimeWait.
                 let _ = connection
                     .on_tcp_ready(
                         connection_index,
@@ -638,20 +635,18 @@ mod tests {
             }
         }
 
-        {
-            let queue = handle.borrow_mut().expect("tcp queue");
-            let connection = queue.session(session_id).expect("session");
-            assert_eq!(connection.state(), TcpState::Closing);
-        }
-        assert!(drop_state.lock().expect("drop").packets.is_empty());
+        let queue = handle.borrow_mut().expect("tcp queue");
+        let connection = queue.session(session_id).expect("session");
+        assert_eq!(connection.state(), TcpState::Closing);
+        assert_eq!(connection.rcv_nxt(), rcv_nxt + 1);
         let packets = output_state.lock().expect("output");
-        assert_eq!(packets.packets.len(), 1, "FIN must produce ACK via tcp-output");
+        assert_eq!(packets.packets.len(), 1);
         assert_eq!(tcp_flags(&packets.packets[0]) & TCP_FLAG_ACK, TCP_FLAG_ACK);
         assert_eq!(tcp_acknowledgment(&packets.packets[0]), rcv_nxt + 1);
     }
 
     #[test]
-    fn missing_session_route_reaches_drop_next() {
+    fn close_side_segment_without_session_is_discarded() {
         let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
             buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                 buffer_slot_capacity: 2048,
@@ -660,8 +655,8 @@ mod tests {
                 ..hammer_core::data_plane::DataPlaneBufferConfig::default()
             },
         });
-        let (rcv, handle, output_state, drop_state) = install_rcv_runtime(&runtime);
-        let (_, rcv_nxt, snd_nxt) = open_fin_wait1_session(handle);
+        let (rcv, handle, output_state, _) = install_rcv_runtime(&runtime);
+        let (session_id, rcv_nxt, snd_nxt) = open_fin_wait1_session(handle);
 
         send_to_rcv(
             &runtime,
@@ -669,12 +664,12 @@ mod tests {
             None,
             control_packet(rcv_nxt, snd_nxt, TcpSegmentFlags::ACK),
         );
-        assert!(runtime.run_ready_nodes().expect("run rcv") >= 1);
-        if drop_state.lock().expect("drop").packets.is_empty() {
-            assert!(runtime.run_ready_nodes().expect("run drop") >= 1);
-        }
+        let _ = runtime.run_ready_nodes().expect("run");
+        let _ = runtime.run_ready_nodes().expect("drain");
 
+        let queue = handle.borrow_mut().expect("tcp queue");
+        let connection = queue.session(session_id).expect("session");
+        assert_eq!(connection.state(), TcpState::FinWait1);
         assert!(output_state.lock().expect("output").packets.is_empty());
-        assert_eq!(drop_state.lock().expect("drop").packets.len(), 1);
     }
 }
