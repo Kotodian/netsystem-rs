@@ -244,6 +244,12 @@ impl<S: Segment> MultiRingMsgQueue<S> {
             slot: desc.slot,
         })
     }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        let hdr = unsafe { &*self.hdr };
+        hdr.q_head.load(Ordering::Acquire) == hdr.q_tail.load(Ordering::Acquire)
+    }
 }
 
 fn validate_cfg(cfg: &MultiRingMsgQueueCfg<'_>) -> Result<(), MultiRingMsgQueueError> {

@@ -5,12 +5,10 @@ use hammer_core::data_plane::{DataPlaneBuffers, Index};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::fifo::Fifo;
 use hammer_infra::map::FlatHashTable;
-use hammer_infra::msg_queue::MsgQueue;
 use hammer_infra::segment::{Local, Segment, Svm};
 use hammer_infra::vec::Vec;
 use hammer_runtime::app::{
-    AppSession, FlatSessionMsgQueue, SessionEventQueue, SessionEvt, SessionEvtType,
-    SessionMsgQueue, SessionSegment,
+    AppSession, SessionEventQueue, SessionEvt, SessionEvtType, SessionMsgQueue, SessionSegment,
 };
 
 use crate::session::SessionId;
@@ -521,7 +519,7 @@ impl SessionAppRuntimeCreate<Svm> for SessionAppRuntime<Svm> {
         &self,
         handle: hammer_runtime::app::SessionHandle,
         config: hammer_runtime::app::AppSessionConfig,
-        tx_evt_q: Arc<FlatSessionMsgQueue<Svm>>,
+        tx_evt_q: Arc<SessionMsgQueue<Svm>>,
     ) -> CoreResult<Arc<AppSession<Svm>>> {
         let rx_fifo = Arc::new(
             Fifo::<Svm>::new(self.seg.clone(), config.fifo_capacity)
@@ -531,15 +529,17 @@ impl SessionAppRuntimeCreate<Svm> for SessionAppRuntime<Svm> {
             Fifo::<Svm>::new(self.seg.clone(), config.fifo_capacity)
                 .map_err(|e| CoreError::internal(format!("svm tx fifo: {e:?}")))?,
         );
-        let evt_q_ring = config
-            .evt_q_capacity
-            .saturating_add(1)
-            .next_power_of_two()
-            .max(2);
-        let evt_q = Arc::new(FlatSessionMsgQueue::new(
-            MsgQueue::<Svm>::new(self.seg.clone(), evt_q_ring)
-                .map_err(|e| CoreError::internal(format!("svm evt_q: {e:?}")))?,
-        ));
+        let ring_nitems = config.evt_q_capacity.max(1) as u32;
+        let q_nitems = (config.evt_q_capacity + 1).next_power_of_two().max(2) as u32;
+        let layout = SessionMsgQueue::<Svm>::layout_bytes(q_nitems, ring_nitems)
+            .map_err(|_| CoreError::internal("invalid svm evt_q layout"))?;
+        let evt_off = self.seg.alloc(layout, 64);
+        let evt_q = Arc::new(
+            unsafe {
+                SessionMsgQueue::<Svm>::init_at(self.seg.clone(), evt_off, q_nitems, ring_nitems)
+            }
+            .map_err(|e| CoreError::internal(format!("svm evt_q: {e:?}")))?,
+        );
 
         let session = Arc::new(AppSession::<Svm>::from_parts(
             rx_fifo, tx_fifo, evt_q, tx_evt_q, handle,

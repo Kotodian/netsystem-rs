@@ -6,12 +6,11 @@ use crossbeam_utils::CachePadded;
 use hammer_core::data_plane::{BufferFrame, DataPlaneBuffers, Frame, Index, Next};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::fifo_queue::FifoQueue;
-use hammer_infra::msg_queue::MsgQueue;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::segment::{Local, Segment, Svm};
 use hammer_runtime::app::{
-    AppContext, AppSessionConfig, FlatSessionMsgQueue, SessionEvtType, SessionHandle,
-    SessionMsgQueue, SessionSegment, with_current_app_worker,
+    AppContext, AppSessionConfig, SessionEvtType, SessionHandle, SessionMsgQueue, SessionSegment,
+    with_current_app_worker,
 };
 use hammer_runtime::{DataPlaneRuntime, DataWorkerId, NodeRuntimeData};
 
@@ -584,10 +583,13 @@ impl<T, Index: Copy + Eq> SessionDriverRuntime<T, Svm, Index> {
         app_session_config: AppSessionConfig,
     ) -> Self {
         let seg = Svm::default();
-        let tx_evt_q = Arc::new(FlatSessionMsgQueue::new(
-            MsgQueue::<Svm>::new(seg.clone(), DEFAULT_SESSION_TX_EVENT_CAPACITY)
+        let cap = DEFAULT_SESSION_TX_EVENT_CAPACITY.next_power_of_two().max(2) as u32;
+        let layout = SessionMsgQueue::<Svm>::layout_bytes(cap, cap.max(2)).expect("tx layout");
+        let off = seg.alloc(layout, 64);
+        let tx_evt_q = Arc::new(
+            unsafe { SessionMsgQueue::<Svm>::init_at(seg.clone(), off, cap, cap.max(2)) }
                 .expect("svm tx_evt_q"),
-        ));
+        );
         Self::with_app_session_config(
             worker,
             buffers,

@@ -1,6 +1,8 @@
 use hammer_infra::align::align_up;
 use hammer_infra::segment::Segment;
 
+use crate::app::session_msg_queue::SessionMsgQueue;
+
 /// Offsets for the four session queues within a shared segment.
 /// These are filled in by the dataplane when it pre-allocates session
 /// resources, then sent to the app process via SCM_RIGHTS.
@@ -19,13 +21,22 @@ impl SessionOffsets {
         let chunk_data_size = (fifo_chunks as usize).min(4096);
         let per_chunk = 16 + chunk_data_size;
         let fifo_total = align_up(192 + fifo_chunks as usize * per_chunk, 64);
-        let evt_q_ring = evt_q_capacity.saturating_add(1).next_power_of_two().max(2);
-        let msgq_total = align_up(16 + evt_q_ring * 8, 64);
+        let ring_nitems = evt_q_capacity.max(1) as u32;
+        let q_nitems = (evt_q_capacity + 1).next_power_of_two().max(2) as u32;
+        let evt_msgq_total = align_up(
+            SessionMsgQueue::<S>::layout_bytes(q_nitems, ring_nitems).expect("session mq layout"),
+            64,
+        );
+        // Shared worker tx_evt_q uses a fixed 64/64 multi-ring capacity (attach path).
+        let tx_msgq_total = align_up(
+            SessionMsgQueue::<S>::layout_bytes(64, 64).expect("tx session mq layout"),
+            64,
+        );
 
         let rx_fifo_off = seg.alloc(fifo_total, 64);
         let tx_fifo_off = seg.alloc(fifo_total, 64);
-        let evt_q_off = seg.alloc(msgq_total, 64);
-        let tx_evt_q_off = seg.alloc(msgq_total, 64);
+        let evt_q_off = seg.alloc(evt_msgq_total, 64);
+        let tx_evt_q_off = seg.alloc(tx_msgq_total, 64);
         Self {
             rx_fifo_off,
             tx_fifo_off,

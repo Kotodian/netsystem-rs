@@ -4,10 +4,11 @@ use std::os::unix::io::AsRawFd;
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_infra::fifo::Fifo;
 use hammer_infra::fifo::FifoError;
-use hammer_infra::msg_queue::MsgQueue;
 use hammer_infra::segment::{Segment, Svm};
 
-use crate::app::{AppSession, AppSessionConfig, SessionHandle, SessionOffsets, SessionSegment};
+use crate::app::{
+    AppSession, AppSessionConfig, SessionHandle, SessionMsgQueue, SessionOffsets, SessionSegment,
+};
 
 /// Server side of the Unix-domain-socket attach protocol.
 /// The dataplane binds a listener, accepts app connections, and sends
@@ -133,15 +134,12 @@ impl AttachServer {
                 .map_err(|e| HammerError::internal(format!("attach init tx fifo: {e:?}")))?;
         }
 
-        let evt_q_ring = config
-            .evt_q_capacity
-            .saturating_add(1)
-            .next_power_of_two()
-            .max(2);
+        let ring_nitems = config.evt_q_capacity.max(1) as u32;
+        let q_nitems = (config.evt_q_capacity + 1).next_power_of_two().max(2) as u32;
         unsafe {
-            MsgQueue::<Svm>::init_at(seg.clone(), offsets.evt_q_off, evt_q_ring)
+            SessionMsgQueue::<Svm>::init_at(seg.clone(), offsets.evt_q_off, q_nitems, ring_nitems)
                 .map_err(|e| HammerError::internal(format!("attach init evt_q: {e:?}")))?;
-            MsgQueue::<Svm>::init_at(seg.clone(), offsets.tx_evt_q_off, 64)
+            SessionMsgQueue::<Svm>::init_at(seg.clone(), offsets.tx_evt_q_off, 64, 64)
                 .map_err(|e| HammerError::internal(format!("attach init tx_evt_q: {e:?}")))?;
         }
 
@@ -170,9 +168,9 @@ impl AttachServer {
             .fd()
             .ok_or_else(|| HammerError::internal("attach segment has no fd"))?;
 
-        // Dup the fds we need to send to the app so the server-side MsgQueues
-        // (inside the AppSession, via from_segment) retain ownership of their
-        // copies.
+        // Dup the fds we need to send to the app so the server-side Session
+        // Message Queues (inside the AppSession, via from_segment) retain
+        // ownership of their copies.
         let client_evt_q_read = dup_fd(evt_q_read)?;
         let client_tx_evt_q_write = dup_fd(tx_evt_q_write)?;
 

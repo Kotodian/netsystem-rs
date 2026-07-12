@@ -2,8 +2,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 use hammer_core::error::HammerResult;
-use hammer_infra::msg_queue::SessionEvt;
 use hammer_infra::segment::Svm;
+use hammer_runtime::app::{SessionEventQueue, SessionEvt};
 use tokio::io::unix::AsyncFd;
 
 /// Cross-process async facade over an [`AppSession<Svm>`].
@@ -20,8 +20,8 @@ impl RemoteAppSession {
     /// Wrap an existing cross-process session.
     ///
     /// Duplicates the event-queue signal-read fd so the [`AsyncFd`] has
-    /// sole ownership of its descriptor. The original within the MsgQueue
-    /// is unaffected.
+    /// sole ownership of its descriptor. The original within the Session
+    /// Message Queue is unaffected.
     pub fn new(session: Arc<hammer_runtime::app::AppSession<Svm>>) -> HammerResult<Self> {
         let read_fd = session.evt_q().read_fd().ok_or_else(|| {
             hammer_core::error::HammerError::internal(

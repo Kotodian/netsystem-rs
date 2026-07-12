@@ -7,9 +7,9 @@
 //! Session Event identity follows ADR-0010 (VPP `session_event_t` rules).
 
 use std::mem::size_of;
+use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use hammer_infra::msg_queue::MsgQueue;
 use hammer_infra::multi_ring_msg_queue::{
     MultiRingMsgQueue, MultiRingMsgQueueCfg, MultiRingMsgQueueError, RingCfg,
 };
@@ -107,7 +107,7 @@ pub enum SessionMsgQueueError {
     Full(SessionEvt),
 }
 
-/// Shared Session Message Queue operations for Local (multi-ring) and flat adapters.
+/// Shared Session Message Queue operations for Local and SVM backends.
 pub trait SessionEventQueue: Send + Sync {
     fn enqueue_io(&self, evt: SessionEvt) -> Result<(), SessionMsgQueueError>;
     fn enqueue_ctrl(&self, evt: SessionEvt) -> Result<(), SessionMsgQueueError>;
@@ -117,6 +117,8 @@ pub trait SessionEventQueue: Send + Sync {
     fn drain(&self) -> bool;
     fn read_signal(&self) -> bool;
     fn clear(&self);
+    fn is_empty(&self) -> bool;
+    fn read_fd(&self) -> Option<RawFd>;
 }
 
 /// Segment type with a statically-known session event queue implementation.
@@ -124,32 +126,38 @@ pub trait SessionSegment: Segment {
     type EventQueue: SessionEventQueue;
 }
 
-/// Session Message Queue with IO + CTRL rings over the infra multi-ring primitive.
-pub struct SessionMsgQueue {
-    inner: MultiRingMsgQueue,
-    signal: AtomicBool,
+fn session_ring_cfg(q_nitems: u32, ring_nitems: u32) -> Result<[RingCfg; 2], SessionMsgQueueError> {
+    if !q_nitems.is_power_of_two() || q_nitems < 2 || ring_nitems < 1 {
+        return Err(SessionMsgQueueError::InvalidConfig);
+    }
+    Ok([
+        RingCfg {
+            nitems: ring_nitems,
+            elsize: SESSION_EVT_BYTES,
+        },
+        RingCfg {
+            nitems: ring_nitems,
+            elsize: SESSION_EVT_BYTES,
+        },
+    ])
 }
 
-impl SessionMsgQueue {
+/// Session Message Queue with IO + CTRL rings over the infra multi-ring primitive.
+pub struct SessionMsgQueue<S: Segment = Local> {
+    inner: MultiRingMsgQueue<S>,
+    signal_atomic: AtomicBool,
+    signal_read: Option<RawFd>,
+    signal_write: Option<RawFd>,
+}
+
+impl SessionMsgQueue<Local> {
     /// Default Local queue: 2048 descriptors, 1024 slots per ring, SessionEvt elsize.
     pub fn with_defaults() -> Result<Self, SessionMsgQueueError> {
         Self::with_cfg(2048, 1024)
     }
 
     pub fn with_cfg(q_nitems: u32, ring_nitems: u32) -> Result<Self, SessionMsgQueueError> {
-        if !q_nitems.is_power_of_two() || q_nitems < 2 || ring_nitems < 1 {
-            return Err(SessionMsgQueueError::InvalidConfig);
-        }
-        let rings = [
-            RingCfg {
-                nitems: ring_nitems,
-                elsize: SESSION_EVT_BYTES,
-            },
-            RingCfg {
-                nitems: ring_nitems,
-                elsize: SESSION_EVT_BYTES,
-            },
-        ];
+        let rings = session_ring_cfg(q_nitems, ring_nitems)?;
         let inner = MultiRingMsgQueue::with_cfg(MultiRingMsgQueueCfg {
             q_nitems,
             rings: &rings,
@@ -160,8 +168,74 @@ impl SessionMsgQueue {
         })?;
         Ok(Self {
             inner,
-            signal: AtomicBool::new(false),
+            signal_atomic: AtomicBool::new(false),
+            signal_read: None,
+            signal_write: None,
         })
+    }
+}
+
+impl<S: Segment> SessionMsgQueue<S> {
+    /// On-segment byte size for a Session Message Queue with the given capacities.
+    pub fn layout_bytes(q_nitems: u32, ring_nitems: u32) -> Result<usize, SessionMsgQueueError> {
+        let rings = session_ring_cfg(q_nitems, ring_nitems)?;
+        Ok(MultiRingMsgQueue::<S>::layout_bytes(
+            &MultiRingMsgQueueCfg {
+                q_nitems,
+                rings: &rings,
+            },
+        ))
+    }
+
+    /// Initialise a Session Message Queue at a pre-allocated segment offset.
+    ///
+    /// # Safety
+    /// Caller must reserve at least [`Self::layout_bytes`] at `hdr_offset`.
+    pub unsafe fn init_at(
+        seg: S,
+        hdr_offset: u64,
+        q_nitems: u32,
+        ring_nitems: u32,
+    ) -> Result<Self, SessionMsgQueueError> {
+        let rings = session_ring_cfg(q_nitems, ring_nitems)?;
+        let inner = unsafe {
+            MultiRingMsgQueue::init_at(
+                seg,
+                hdr_offset,
+                &MultiRingMsgQueueCfg {
+                    q_nitems,
+                    rings: &rings,
+                },
+            )
+        }
+        .map_err(|e| match e {
+            MultiRingMsgQueueError::InvalidConfig => SessionMsgQueueError::InvalidConfig,
+            other => panic!("unexpected multi-ring init error: {other:?}"),
+        })?;
+        Ok(Self {
+            inner,
+            signal_atomic: AtomicBool::new(false),
+            signal_read: None,
+            signal_write: None,
+        })
+    }
+
+    /// Remap an already-initialised Session Message Queue and attach optional signal fds.
+    ///
+    /// # Safety
+    /// `hdr_offset` must point at a queue previously initialised with [`Self::init_at`].
+    pub unsafe fn from_shared(
+        seg: S,
+        hdr_offset: u64,
+        signal_read: Option<RawFd>,
+        signal_write: Option<RawFd>,
+    ) -> Self {
+        Self {
+            inner: unsafe { MultiRingMsgQueue::from_shared(seg, hdr_offset) },
+            signal_atomic: AtomicBool::new(false),
+            signal_read,
+            signal_write,
+        }
     }
 
     #[inline]
@@ -198,7 +272,7 @@ impl SessionMsgQueue {
     }
 }
 
-impl SessionEventQueue for SessionMsgQueue {
+impl<S: Segment> SessionEventQueue for SessionMsgQueue<S> {
     fn enqueue_io(&self, evt: SessionEvt) -> Result<(), SessionMsgQueueError> {
         self.enqueue_on(SessionMqRing::Io, evt)
     }
@@ -228,11 +302,37 @@ impl SessionEventQueue for SessionMsgQueue {
     }
 
     fn fire(&self) {
-        self.signal.store(true, Ordering::Release);
+        if let Some(fd) = self.signal_write {
+            let val: [u8; 1] = [1];
+            let ret = unsafe { libc::write(fd, val.as_ptr() as *const libc::c_void, 1) };
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() != std::io::ErrorKind::WouldBlock {
+                    panic!("session mq signal write failed: {err}");
+                }
+            }
+        } else {
+            self.signal_atomic.store(true, Ordering::Release);
+        }
     }
 
     fn drain(&self) -> bool {
-        self.signal.swap(false, Ordering::AcqRel)
+        if let Some(fd) = self.signal_read {
+            let mut buf = [0u8; 64];
+            let mut woke = false;
+            loop {
+                let ret =
+                    unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+                if ret > 0 {
+                    woke = true;
+                    continue;
+                }
+                break;
+            }
+            woke
+        } else {
+            self.signal_atomic.swap(false, Ordering::AcqRel)
+        }
     }
 
     fn read_signal(&self) -> bool {
@@ -241,97 +341,34 @@ impl SessionEventQueue for SessionMsgQueue {
 
     fn clear(&self) {
         while SessionEventQueue::dequeue(self).is_some() {}
-        self.signal.store(false, Ordering::Relaxed);
-    }
-}
-
-/// Flat infra `MsgQueue` adapter (SVM / pre-hard-cut). Both rings map to the single flat ring.
-pub struct FlatSessionMsgQueue<S: Segment> {
-    inner: MsgQueue<S>,
-}
-
-impl<S: Segment> FlatSessionMsgQueue<S> {
-    pub fn new(inner: MsgQueue<S>) -> Self {
-        Self { inner }
-    }
-
-    pub fn into_inner(self) -> MsgQueue<S> {
-        self.inner
-    }
-
-    pub fn inner(&self) -> &MsgQueue<S> {
-        &self.inner
-    }
-}
-
-impl<S: Segment> SessionEventQueue for FlatSessionMsgQueue<S> {
-    fn enqueue_io(&self, evt: SessionEvt) -> Result<(), SessionMsgQueueError> {
-        self.inner.enqueue(to_infra_evt(evt)).map_err(|e| match e {
-            hammer_infra::msg_queue::MsgQueueError::Full(evt) => {
-                SessionMsgQueueError::Full(from_infra_evt(evt))
+        if let Some(fd) = self.signal_read {
+            let mut buf = [0u8; 64];
+            loop {
+                let ret =
+                    unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+                if ret <= 0 {
+                    break;
+                }
             }
-            hammer_infra::msg_queue::MsgQueueError::InvalidCapacity => {
-                SessionMsgQueueError::InvalidConfig
-            }
-        })
-    }
-
-    fn enqueue_ctrl(&self, evt: SessionEvt) -> Result<(), SessionMsgQueueError> {
-        self.enqueue_io(evt)
-    }
-
-    fn dequeue(&self) -> Option<SessionEvt> {
-        self.inner.dequeue().map(from_infra_evt)
-    }
-
-    fn dequeue_batch(&self, out: &mut [SessionEvt]) -> usize {
-        let mut infra = vec![
-            hammer_infra::msg_queue::SessionEvt::io(
-                0,
-                hammer_infra::msg_queue::SessionEvtType::RxEnq
-            );
-            out.len()
-        ];
-        let count = self.inner.dequeue_batch(&mut infra);
-        for (dst, src) in out.iter_mut().zip(infra[..count].iter().copied()) {
-            *dst = from_infra_evt(src);
         }
-        count
+        self.signal_atomic.store(false, Ordering::Relaxed);
     }
 
-    fn fire(&self) {
-        self.inner.fire();
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
     }
 
-    fn drain(&self) -> bool {
-        self.inner.drain()
-    }
-
-    fn read_signal(&self) -> bool {
-        self.inner.read_signal()
-    }
-
-    fn clear(&self) {
-        self.inner.clear();
+    fn read_fd(&self) -> Option<RawFd> {
+        self.signal_read
     }
 }
 
 impl SessionSegment for Local {
-    type EventQueue = SessionMsgQueue;
+    type EventQueue = SessionMsgQueue<Local>;
 }
 
 impl SessionSegment for Svm {
-    type EventQueue = FlatSessionMsgQueue<Svm>;
-}
-
-fn to_infra_evt(evt: SessionEvt) -> hammer_infra::msg_queue::SessionEvt {
-    // SAFETY: identical repr(C) layout / ADR-0010 packing.
-    unsafe { std::mem::transmute(evt) }
-}
-
-fn from_infra_evt(evt: hammer_infra::msg_queue::SessionEvt) -> SessionEvt {
-    unsafe { std::mem::transmute(evt) }
+    type EventQueue = SessionMsgQueue<Svm>;
 }
 
 const _: () = assert!(SESSION_EVT_BYTES == 16);
-const _: () = assert!(size_of::<hammer_infra::msg_queue::SessionEvt>() == SESSION_EVT_BYTES);

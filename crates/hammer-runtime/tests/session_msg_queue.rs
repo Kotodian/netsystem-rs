@@ -76,3 +76,40 @@ fn adr0010_io_index_only_ctrl_handle_packing() {
         (0x1111_2222u64) | ((0x3333_4444u64) << 32)
     );
 }
+
+#[test]
+fn svm_session_msg_queue_pipe_signal_wakes_consumer() {
+    use std::os::fd::RawFd;
+
+    use hammer_infra::segment::{Segment, Svm};
+    use hammer_runtime::app::SessionEventQueue;
+
+    fn pipe_nonblock() -> (RawFd, RawFd) {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        for fd in &fds {
+            let flags = unsafe { libc::fcntl(*fd, libc::F_GETFL) };
+            unsafe {
+                libc::fcntl(*fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+        }
+        (fds[0], fds[1])
+    }
+
+    let (read_fd, write_fd) = pipe_nonblock();
+    let seg = Svm::default();
+    let bytes = SessionMsgQueue::<Svm>::layout_bytes(8, 4).expect("layout");
+    let off = seg.alloc(bytes, 64);
+    drop(unsafe { SessionMsgQueue::<Svm>::init_at(seg.clone(), off, 8, 4) }.expect("init"));
+
+    let producer =
+        unsafe { SessionMsgQueue::<Svm>::from_shared(seg.clone(), off, None, Some(write_fd)) };
+    let consumer = unsafe { SessionMsgQueue::<Svm>::from_shared(seg, off, Some(read_fd), None) };
+
+    assert!(!consumer.read_signal());
+    producer
+        .enqueue_io(SessionEvt::io(9, SessionEvtType::TxDeq))
+        .expect("enqueue");
+    assert!(consumer.read_signal());
+    assert_eq!(consumer.dequeue().map(|e| e.session_index()), Some(9));
+}

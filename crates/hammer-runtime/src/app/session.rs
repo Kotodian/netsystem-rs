@@ -4,14 +4,12 @@ use std::sync::Arc;
 
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_infra::fifo::Fifo;
-use hammer_infra::msg_queue::MsgQueue;
 use hammer_infra::segment::{Local, Svm};
 
 use crate::app::SessionHandle;
 use crate::app::SessionOffsets;
 use crate::app::session_msg_queue::{
-    FlatSessionMsgQueue, SessionEventQueue, SessionEvt, SessionEvtType, SessionMsgQueue,
-    SessionSegment,
+    SessionEventQueue, SessionEvt, SessionEvtType, SessionMsgQueue, SessionSegment,
 };
 
 /// VPP-style app/session object: per-session byte FIFOs plus event queue.
@@ -235,8 +233,9 @@ impl<S: SessionSegment> AppSession<S> {
 impl AppSession<Svm> {
     /// Reconstruct an app session from a pre-allocated shared segment.
     /// Called by AttachClient (app process) after receiving offsets over
-    /// the Unix socket. The segment must already contain valid Fifo/MsgQueue
-    /// headers at the given offsets; the signal fds must be open for reading.
+    /// the Unix socket. The segment must already contain valid Fifo /
+    /// Session Message Queue headers at the given offsets; the signal fds
+    /// must be open for reading.
     ///
     /// # Safety
     /// Caller must guarantee the segment is valid and the offsets point to
@@ -250,17 +249,22 @@ impl AppSession<Svm> {
         tx_evt_q_read: Option<RawFd>,
         tx_evt_q_write: Option<RawFd>,
     ) -> Self {
-        let evt_q = Arc::new(FlatSessionMsgQueue::new(unsafe {
-            MsgQueue::from_shared(seg.clone(), offsets.evt_q_off, evt_q_read, evt_q_write)
-        }));
-        let tx_evt_q = Arc::new(FlatSessionMsgQueue::new(unsafe {
-            MsgQueue::from_shared(
+        let evt_q = Arc::new(unsafe {
+            SessionMsgQueue::<Svm>::from_shared(
+                seg.clone(),
+                offsets.evt_q_off,
+                evt_q_read,
+                evt_q_write,
+            )
+        });
+        let tx_evt_q = Arc::new(unsafe {
+            SessionMsgQueue::<Svm>::from_shared(
                 seg.clone(),
                 offsets.tx_evt_q_off,
                 tx_evt_q_read,
                 tx_evt_q_write,
             )
-        }));
+        });
         Self {
             rx_fifo: Arc::new(unsafe { Fifo::from_shared(seg.clone(), offsets.rx_fifo_off) }),
             tx_fifo: Arc::new(unsafe { Fifo::from_shared(seg.clone(), offsets.tx_fifo_off) }),
