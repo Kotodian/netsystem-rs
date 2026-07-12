@@ -150,8 +150,8 @@ The app/session byte store for RX and TX payload ownership. App-to-session copyi
 _Avoid_: AppRing, SQE, CQE, submission queue, completion queue, TCP-owned payload copy
 
 **Session Message Queue**:
-The app/session event queue used to signal RX enqueue, TX dequeue, connect, and close facts. It carries session events, not payload bytes.
-_Avoid_: payload channel, async stream, per-protocol event bus
+The VPP-shaped app/session signaling queue: a producer-locked multi-ring message queue (descriptor queue plus IO and CTRL rings) that carries Session Events, not payload bytes. Producers choose the ring via enqueue API (`enqueue_io` / `enqueue_ctrl`); Local and SVM backends share the same logical layout, with backend-specific wake signaling beside the shared header.
+_Avoid_: flat SessionEvt ring, payload channel, async stream, per-protocol event bus, matching `evt_type` inside a universal enqueue
 
 ## Session And Transport
 
@@ -208,12 +208,12 @@ The VPP-shaped app/runtime routing identity for a session: session index plus wo
 _Avoid_: generation-bearing session handle, SessionId-as-app-handle, opaque cookie without worker index
 
 **Session Event**:
-An app↔session message-queue event aligned with VPP `session_event_t`. IO events carry session index only; control close/reset events carry a Session Handle. Consume paths drop events whose session slot is free or unmapped. Slot reuse after free may still target a replacement session; that window matches VPP and is not closed by adding generation to the event.
-_Avoid_: generation-safe SessionEvt, Index-in-event as ownership proof, one identity field for every event kind
+An app↔session Session Message Queue event aligned with VPP `session_event_t`. IO events (`RxEnq` / `TxDeq`) use the IO ring and carry session index only; control Session Events (`Connect` / `Close`) use the CTRL ring and carry a Session Handle. Consume paths drop events whose session slot is free or unmapped. Slot reuse after free may still target a replacement session; that window matches VPP and is not closed by adding generation to the event. These are not worker-local Session Control Events.
+_Avoid_: generation-safe SessionEvt, Index-in-event as ownership proof, one identity field for every event kind, confusing MQ CTRL-ring events with Session Control Events
 
 **Session Control Event**:
-A worker-local session lifecycle command, such as disconnect, dispatched by Session Runtime separately from TX/RX session work. Control events may invoke transport close handling, but they are not readiness facts and do not enter the Session Work Batch.
-_Avoid_: close-ready flag, ready-queue close request, synthetic ready boolean, TX event
+A worker-local session lifecycle command, such as disconnect, dispatched by Session Runtime separately from TX/RX session work and separately from Session Message Queue CTRL-ring Session Events. Control events may invoke transport close handling, but they are not readiness facts and do not enter the Session Work Batch.
+_Avoid_: close-ready flag, ready-queue close request, synthetic ready boolean, TX event, MQ CTRL-ring Session Event
 
 **Session Lifecycle**:
 The session-owned typed state machine that coordinates independently owned application and transport objects. Its stored states are Active, App Closed, Transport Closed, Closed, and Transport Deleted; Closed retains the Transport Index until asynchronous transport cleanup finishes, while Transport Deleted does not. TCP connection, QUIC connection, and QUIC stream state machines remain protocol-private.
