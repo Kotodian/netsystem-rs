@@ -3,9 +3,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwap;
-use hammer_core::data_plane::{
-    BufferFrame, Index, BufferPacketCursor, NodeId, NodeNext,
-};
+use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId, NodeNext};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::IcmpHeader;
 use hammer_core::protocol::tcp::TcpWireHeader;
@@ -404,13 +402,7 @@ fn ip_local_process(
     };
     let snapshot = state.state.load();
     let feature_arc = state.feature_arc.as_ref();
-    process_frame(
-        runtime,
-        frame,
-        &snapshot,
-        LocalStage::Head,
-        feature_arc,
-    )
+    process_frame(runtime, frame, &snapshot, LocalStage::Head, feature_arc)
 }
 
 fn ip_receive_process(
@@ -424,13 +416,7 @@ fn ip_receive_process(
     };
     let snapshot = state.state.load();
     let feature_arc = state.feature_arc.as_ref();
-    process_frame(
-        runtime,
-        frame,
-        &snapshot,
-        LocalStage::Receive,
-        feature_arc,
-    )
+    process_frame(runtime, frame, &snapshot, LocalStage::Receive, feature_arc)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -640,7 +626,8 @@ fn process_index(
     }
 
     let resolved = state.protocol_next_slot(parsed.protocol);
-    let error = if resolved == state.punt_slot() && matches!(parsed.protocol, IpProtocol::Other(_)) {
+    let error = if resolved == state.punt_slot() && matches!(parsed.protocol, IpProtocol::Other(_))
+    {
         set_index_node_error_code(runtime, index, IpLocalError::UnknownProtocol.code())?;
         Some(IpLocalError::UnknownProtocol.code())
     } else {

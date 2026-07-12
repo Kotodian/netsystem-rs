@@ -2,7 +2,7 @@ use std::mem::transmute;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use hammer_core::data_plane::{
-    BufferFrame, Index, BufferPacketCursor, DataPlaneBufferConfig, NodeId,
+    BufferFrame, BufferPacketCursor, DataPlaneBufferConfig, Index, NodeId,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};

@@ -1,5 +1,5 @@
 use hammer_core::data_plane::{
-    BufferFrame, Index, NodeId, NodeNext, DEFAULT_BUFFER_FRAME_CAPACITY,
+    BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Index, NodeId, NodeNext,
 };
 use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
 
@@ -92,8 +92,7 @@ where
 {
     let input_len = frame.len();
     debug_assert!(input_len <= DEFAULT_BUFFER_FRAME_CAPACITY);
-    let mut inputs =
-        [core::mem::MaybeUninit::<Index>::uninit(); DEFAULT_BUFFER_FRAME_CAPACITY];
+    let mut inputs = [core::mem::MaybeUninit::<Index>::uninit(); DEFAULT_BUFFER_FRAME_CAPACITY];
     for (offset, &index) in frame.indices().iter().enumerate() {
         inputs[offset].write(index);
     }
@@ -101,8 +100,7 @@ where
 
     let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
     let mut out_len = 0usize;
-    let mut keep =
-        [core::mem::MaybeUninit::<Index>::uninit(); DEFAULT_BUFFER_FRAME_CAPACITY];
+    let mut keep = [core::mem::MaybeUninit::<Index>::uninit(); DEFAULT_BUFFER_FRAME_CAPACITY];
     let mut keep_len = 0usize;
 
     for offset in 0..input_len {
@@ -672,8 +670,7 @@ mod legacy_tests {
         let (session_id, iss) = open_client_session(handle);
         {
             let mut queue = handle.borrow_mut().expect("tcp queue");
-            crate::transport::tcp::publish_tcp_connection(&mut queue, session_id)
-                .expect("publish");
+            crate::transport::tcp::publish_tcp_connection(&mut queue, session_id).expect("publish");
         }
 
         send_packet(
@@ -705,7 +702,11 @@ mod legacy_tests {
             );
         }
         let packets = output_state.lock().expect("capture");
-        assert_eq!(packets.packets.len(), 1, "final ACK must reach tcp-output capture");
+        assert_eq!(
+            packets.packets.len(),
+            1,
+            "final ACK must reach tcp-output capture"
+        );
         assert_tcp_packet(
             &packets.packets[0],
             LOCAL,
@@ -770,4 +771,3 @@ mod legacy_tests {
         );
     }
 }
-

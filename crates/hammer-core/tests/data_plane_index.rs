@@ -1,10 +1,10 @@
-use hammer_core::data_plane::{
-    BufferPool, DataPlaneBufferConfig, DataPlaneBuffers, Index, NodeId,
-};
+use hammer_core::data_plane::{BufferPool, DataPlaneBufferConfig, DataPlaneBuffers, Index, NodeId};
 use hammer_core::error::{CoreError, DataPlaneError};
 
 fn release(buffers: &DataPlaneBuffers, index: Index) {
-    let mut frame = buffers.get_next_frame(NodeId::new(0)).expect("cleanup frame");
+    let mut frame = buffers
+        .get_next_frame(NodeId::new(0))
+        .expect("cleanup frame");
     frame.push_index(index).expect("push cleanup index");
 }
 
@@ -57,9 +57,7 @@ fn buffer_validation_reports_structured_foreign_stale_and_free_facts() {
     });
     let first = first_buffers.try_buffers().expect("first pool");
     let second = second_buffers.try_buffers().expect("second pool");
-    let index = first_buffers
-        .alloc_index_with_bytes(b"x")
-        .expect("alloc");
+    let index = first_buffers.alloc_index_with_bytes(b"x").expect("alloc");
 
     match second.get(index).map(|_| ()).unwrap_err() {
         CoreError::DataPlane(DataPlaneError::ForeignIndex {
@@ -81,9 +79,7 @@ fn buffer_validation_reports_structured_foreign_stale_and_free_facts() {
         other => panic!("expected IndexSlotFree, got {other:?}"),
     }
 
-    let reused = first_buffers
-        .alloc_index_with_bytes(b"y")
-        .expect("realloc");
+    let reused = first_buffers.alloc_index_with_bytes(b"y").expect("realloc");
     assert_eq!(reused.slot(), index.slot());
     assert_ne!(reused.generation(), index.generation());
     match first.get(index).map(|_| ()).unwrap_err() {

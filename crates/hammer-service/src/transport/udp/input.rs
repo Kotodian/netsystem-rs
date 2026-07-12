@@ -133,15 +133,12 @@ impl UdpInputControlPlane {
     #[inline]
     pub fn register_port(&self, port: u16, node: NodeId) -> CoreResult<u16> {
         let consumer = self.consumer.ok_or_else(|| {
-            CoreError::internal(
-                "udp input register_port requires attach_consumer",
-            )
+            CoreError::internal("udp input register_port requires attach_consumer")
         })?;
-        let nodes = self.nodes.as_ref().ok_or_else(|| {
-            CoreError::internal(
-                "udp input register_port requires node runtime",
-            )
-        })?;
+        let nodes = self
+            .nodes
+            .as_ref()
+            .ok_or_else(|| CoreError::internal("udp input register_port requires node runtime"))?;
         let slot = nodes.add_node_next_slot(consumer, node)?;
         self.inner.rcu(|current| {
             let mut next = UdpInputSnapshot::clone(current);

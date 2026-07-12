@@ -11,9 +11,8 @@ use hammer_runtime::{
 use crate::trace::codec::put_usize;
 
 pub use crate::feature_arc::{
-    Feature, FeatureArc, FeatureArcControl, FeatureArcSpec, FeatureArcStart,
-    FeatureArcStartHandle, FeatureArcStartNode, FeatureArcStartSlot, next_feature_frame,
-    next_feature_slot_for_index,
+    Feature, FeatureArc, FeatureArcControl, FeatureArcSpec, FeatureArcStart, FeatureArcStartHandle,
+    FeatureArcStartNode, FeatureArcStartSlot, next_feature_frame, next_feature_slot_for_index,
 };
 
 #[inline(always)]
@@ -44,7 +43,6 @@ pub fn set_index_node_error_code(
     ));
     Ok(())
 }
-
 
 #[hammer_component_macros::graph_node(
     graph = service,
@@ -329,5 +327,3 @@ mod tests {
         assert_eq!(runtime.in_use_buffers(), 0);
     }
 }
-
-

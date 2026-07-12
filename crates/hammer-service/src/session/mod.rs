@@ -9,7 +9,5 @@ pub mod state;
 pub use app::SessionAppRuntime;
 pub use error::SessionQueueError;
 pub use id::SessionId;
-pub use node::{
-    SESSION_QUEUE_IO_BUDGET, SessionQueueHandle, SessionQueueNext, SessionQueueNode,
-};
+pub use node::{SESSION_QUEUE_IO_BUDGET, SessionQueueHandle, SessionQueueNext, SessionQueueNode};
 pub use runtime::SessionWorker;

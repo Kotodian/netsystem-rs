@@ -243,10 +243,7 @@ fn moved_root_import_in_use_statement(statement: &str) -> Option<&'static str> {
 #[test]
 fn root_braced_adapter_imports_for_moved_primitives_are_rejected() {
     let statement = "use hammer_adapter::{Index, DataPlaneRuntime};";
-    assert_eq!(
-        moved_root_import_in_use_statement(statement),
-        Some("Index")
-    );
+    assert_eq!(moved_root_import_in_use_statement(statement), Some("Index"));
 }
 
 #[test]

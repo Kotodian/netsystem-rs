@@ -292,12 +292,7 @@ fn measure_packet_scalar(scenario: Scenario) -> ProbeStats {
 }
 
 fn measure_lookup(scenario: Scenario, instruction_set: DataPlaneInstructionSet) -> ProbeStats {
-    let runtime = test_runtime_configured_instruction_set(
-        2048,
-        FRAME_PACKETS,
-        32,
-        instruction_set,
-    );
+    let runtime = test_runtime_configured_instruction_set(2048, FRAME_PACKETS, 32, instruction_set);
     let counters = Arc::new(SinkCounters::default());
     let lookup = build_lookup(&runtime, scenario, &counters);
     let packets_by_frame = build_packets(scenario);
@@ -331,12 +326,7 @@ fn measure_input_lookup(
     scenario: Scenario,
     instruction_set: DataPlaneInstructionSet,
 ) -> ProbeStats {
-    let runtime = test_runtime_configured_instruction_set(
-        2048,
-        FRAME_PACKETS,
-        32,
-        instruction_set,
-    );
+    let runtime = test_runtime_configured_instruction_set(2048, FRAME_PACKETS, 32, instruction_set);
     let counters = Arc::new(SinkCounters::default());
     let input = build_input_lookup(&runtime, scenario, &counters);
     let packets_by_frame = build_packets(scenario);

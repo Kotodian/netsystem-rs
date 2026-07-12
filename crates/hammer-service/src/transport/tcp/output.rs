@@ -89,7 +89,10 @@ fn tcp_output_node_process(
     tcp_output_node_process_frame(runtime, frame)
 }
 
-fn tcp_output_node_process_frame(runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
+fn tcp_output_node_process_frame(
+    runtime: &DataPlaneRuntime,
+    frame: &mut BufferFrame,
+) -> NodeResult {
     hammer_runtime::process_frame!(runtime, frame, |index| {
         tcp_output_next_for_index(runtime, index).unwrap_or(TcpOutputNext::Drop)
     })

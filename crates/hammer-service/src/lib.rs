@@ -2,8 +2,8 @@ extern crate self as hammer_service;
 
 pub mod app;
 pub mod data_plane;
-pub mod feature_arc;
 pub mod device;
+pub mod feature_arc;
 pub mod interface;
 pub mod net;
 mod packet_graph;

@@ -39,8 +39,7 @@ macro_rules! process_frame {
         |$index:pat_param| $body:expr
         $(,)?
     ) => {{
-        let mut next_slots =
-            [0u16; ::hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY];
+        let mut next_slots = [0u16; ::hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY];
         debug_assert!(
             $frame.len() <= ::hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY,
             "process_frame! input exceeds production frame capacity"
@@ -773,9 +772,8 @@ impl NodeRuntimeInner {
             .get(node.slot() as usize)
             .map(Vec::len)
             .ok_or_else(|| CoreError::internal("node id out of bounds"))?;
-        let slot = u16::try_from(slot).map_err(|_| {
-            CoreError::internal("node next slot cannot be represented as u16")
-        })?;
+        let slot = u16::try_from(slot)
+            .map_err(|_| CoreError::internal("node next slot cannot be represented as u16"))?;
         let mut group = self.siblings[node.slot() as usize].clone();
         group.push(node);
         for sibling in group {
@@ -814,10 +812,7 @@ mod local_next_slot_tests {
             ],
             node_states: vec![NodeState::Polling, NodeState::Polling],
             interrupt_pending: vec![false, false],
-            error_counters: vec![
-                NodeErrorCounters::default(),
-                NodeErrorCounters::default(),
-            ],
+            error_counters: vec![NodeErrorCounters::default(), NodeErrorCounters::default()],
             error_ids: HashMap::new(),
             error_slots: Vec::new(),
             runtime_stats: vec![NodeRuntimeStats::default(), NodeRuntimeStats::default()],

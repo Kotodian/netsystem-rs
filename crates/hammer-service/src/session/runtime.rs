@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crossbeam_utils::CachePadded;
-use hammer_core::data_plane::{BufferFrame, Index, DataPlaneBuffers, Frame, Next};
+use hammer_core::data_plane::{BufferFrame, DataPlaneBuffers, Frame, Index, Next};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::fifo_queue::FifoQueue;
 use hammer_infra::msg_queue::{MsgQueue, SessionEvtType};
@@ -916,8 +916,16 @@ where
                 .0
                 .disconnect(sessions, index, runtime, output_next, frame, output, now);
         }
-        self.1
-            .disconnect(id, sessions, index, runtime, output_next, frame, output, now)
+        self.1.disconnect(
+            id,
+            sessions,
+            index,
+            runtime,
+            output_next,
+            frame,
+            output,
+            now,
+        )
     }
 
     fn ready(
@@ -973,10 +981,17 @@ where
     SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let now = Instant::now();
-    let mut staging = BufferFrame::with_capacity(hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY);
+    let mut staging =
+        BufferFrame::with_capacity(hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY);
     let mut output = crate::session::node::SessionQueueOutput::default();
-    let step =
-        dispatch_session_queue_pending(runtime, driver, output_next, &mut staging, &mut output, now)?;
+    let step = dispatch_session_queue_pending(
+        runtime,
+        driver,
+        output_next,
+        &mut staging,
+        &mut output,
+        now,
+    )?;
     runtime.with_current_node(owner, || output.flush(runtime, &mut staging));
     Ok(step)
 }

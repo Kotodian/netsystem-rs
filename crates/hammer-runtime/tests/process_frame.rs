@@ -1,6 +1,6 @@
 use hammer_core::data_plane::{
-    BufferFrame, DataPlaneBufferConfig, Index, NodeKind, NodeNext, NodeRegistration,
-    DEFAULT_BUFFER_FRAME_CAPACITY,
+    BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, DataPlaneBufferConfig, Index, NodeKind, NodeNext,
+    NodeRegistration,
 };
 use hammer_infra::vec::Vec;
 use hammer_runtime::{

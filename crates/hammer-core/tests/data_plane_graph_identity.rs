@@ -53,8 +53,14 @@ fn core_data_plane_graph_identity_items_have_expected_behavior() {
     ));
 
     let nexts = [NodeId::new(3), NodeId::new(9)];
-    assert_eq!(nexts[usize::from(NodeNext::slot(ExampleNext::Drop))], NodeId::new(3));
-    assert_eq!(nexts[usize::from(NodeNext::slot(ExampleNext::Punt))], NodeId::new(9));
+    assert_eq!(
+        nexts[usize::from(NodeNext::slot(ExampleNext::Drop))],
+        NodeId::new(3)
+    );
+    assert_eq!(
+        nexts[usize::from(NodeNext::slot(ExampleNext::Punt))],
+        NodeId::new(9)
+    );
 
     assert_eq!(NodeKind::Driver, NodeKind::Driver);
     assert_eq!(NodeKind::Internal, NodeKind::Internal);

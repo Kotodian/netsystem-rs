@@ -57,10 +57,7 @@ struct SinkNode {
     runtime_data: NodeRuntimeData,
 }
 
-fn chain_bytes(
-    runtime: &DataPlaneRuntime,
-    index: hammer_core::data_plane::Index,
-) -> InfraVec<u8> {
+fn chain_bytes(runtime: &DataPlaneRuntime, index: hammer_core::data_plane::Index) -> InfraVec<u8> {
     let mut bytes = InfraVec::new();
     for buffer in runtime.buffers().chain(index) {
         bytes.extend_from_slice(buffer.expect("chain buffer").current());
@@ -592,7 +589,12 @@ fn ip_lookup_node_routes_custom_dpo_to_custom_next() {
     let mut builder = FibTableBuilder::new(drop_slot);
     let custom_lb = builder.add_load_balance(
         DpoProto::IP4,
-        [Dpo::new(DpoProto::IP4, custom_type, custom_index, custom_slot)],
+        [Dpo::new(
+            DpoProto::IP4,
+            custom_type,
+            custom_index,
+            custom_slot,
+        )],
     );
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 30), 32).expect("custom route"),
@@ -864,7 +866,9 @@ fn ip_lookup_control_plane_publish_replaces_forwarding_table() {
         Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("first default"),
         first_lb,
     );
-    control.publish(first_builder.build()).expect("publish first fib");
+    control
+        .publish(first_builder.build())
+        .expect("publish first fib");
 
     let mut first_frame = runtime
         .buffers()
@@ -1082,10 +1086,9 @@ fn next_slot(
         .expect("register local next")
 }
 
-fn placeholder_lookup(runtime: &DataPlaneRuntime) -> (
-    IpLookupControlPlane,
-    hammer_core::data_plane::NodeId,
-) {
+fn placeholder_lookup(
+    runtime: &DataPlaneRuntime,
+) -> (IpLookupControlPlane, hammer_core::data_plane::NodeId) {
     let control = IpLookupControlPlane::new(FibTableBuilder::new(u16::MAX).build());
     let lookup = runtime.nodes().register_internal(control.node());
     (control, lookup)

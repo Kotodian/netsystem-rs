@@ -3,8 +3,8 @@ use std::mem::transmute;
 use std::sync::{Arc, Mutex};
 
 use hammer_core::data_plane::{
-    BufferFrame, Index, BufferRef, Frame, Next, NodeId, NodeRegistration, SecondaryOpaque,
-    DEFAULT_BUFFER_FRAME_CAPACITY,
+    BufferFrame, BufferRef, DEFAULT_BUFFER_FRAME_CAPACITY, Frame, Index, Next, NodeId,
+    NodeRegistration, SecondaryOpaque,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::vec::Vec;

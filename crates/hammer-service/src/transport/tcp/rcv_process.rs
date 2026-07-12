@@ -1,5 +1,5 @@
 use hammer_core::data_plane::{
-    BufferFrame, Index, NodeId, NodeNext, DEFAULT_BUFFER_FRAME_CAPACITY,
+    BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Index, NodeId, NodeNext,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::pool::Index as PoolIndex;
@@ -91,8 +91,7 @@ where
 {
     let input_len = frame.len();
     debug_assert!(input_len <= DEFAULT_BUFFER_FRAME_CAPACITY);
-    let mut inputs =
-        [core::mem::MaybeUninit::<Index>::uninit(); DEFAULT_BUFFER_FRAME_CAPACITY];
+    let mut inputs = [core::mem::MaybeUninit::<Index>::uninit(); DEFAULT_BUFFER_FRAME_CAPACITY];
     for (offset, &index) in frame.indices().iter().enumerate() {
         inputs[offset].write(index);
     }
@@ -247,7 +246,6 @@ where
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -273,8 +271,8 @@ mod tests {
     use crate::transport::tcp::output::{TcpOutputNext, TcpOutputNode};
     use crate::transport::tcp::tcp_control_cursor;
     use crate::transport::tcp::{
-        TCP_FLAG_ACK, TcpConnection, TcpInputNext, TcpState, TcpWorker,
-        publish_tcp_connection, write_session_route_opaque,
+        TCP_FLAG_ACK, TcpConnection, TcpInputNext, TcpState, TcpWorker, publish_tcp_connection,
+        write_session_route_opaque,
     };
 
     const LOCAL_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
@@ -577,7 +575,11 @@ mod tests {
         Ok(packet)
     }
 
-    fn control_packet(sequence: u32, acknowledgment: u32, flags: TcpSegmentFlags) -> std::vec::Vec<u8> {
+    fn control_packet(
+        sequence: u32,
+        acknowledgment: u32,
+        flags: TcpSegmentFlags,
+    ) -> std::vec::Vec<u8> {
         tcp_ipv4_packet(
             remote_addr(),
             local_addr(),
@@ -664,7 +666,11 @@ mod tests {
             &runtime,
             rcv,
             Some(session_id),
-            control_packet(rcv_nxt, snd_nxt, TcpSegmentFlags::FIN | TcpSegmentFlags::ACK),
+            control_packet(
+                rcv_nxt,
+                snd_nxt,
+                TcpSegmentFlags::FIN | TcpSegmentFlags::ACK,
+            ),
         );
         drain_until_output(&runtime, &output_state);
 
@@ -816,7 +822,11 @@ mod tests {
             &runtime,
             established,
             Some(session_id),
-            control_packet(rcv_nxt, snd_nxt, TcpSegmentFlags::FIN | TcpSegmentFlags::ACK),
+            control_packet(
+                rcv_nxt,
+                snd_nxt,
+                TcpSegmentFlags::FIN | TcpSegmentFlags::ACK,
+            ),
         );
         drain_until_output(&runtime, &output_state);
         {
@@ -934,7 +944,11 @@ mod tests {
             &runtime,
             rcv,
             Some(session_id),
-            control_packet(rcv_nxt, snd_nxt, TcpSegmentFlags::RST | TcpSegmentFlags::ACK),
+            control_packet(
+                rcv_nxt,
+                snd_nxt,
+                TcpSegmentFlags::RST | TcpSegmentFlags::ACK,
+            ),
         );
         assert!(runtime.run_ready_nodes().expect("run") >= 1);
 

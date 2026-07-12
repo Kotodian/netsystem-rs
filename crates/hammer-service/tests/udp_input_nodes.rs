@@ -163,9 +163,7 @@ fn udp_input_dispatches_registered_port_by_local_slot() {
     let echo = runtime
         .nodes()
         .register_internal(CaptureNode::new(Arc::clone(&echo_state)));
-    let echo_slot = control
-        .register_port(53, echo)
-        .expect("register dns port");
+    let echo_slot = control.register_port(53, echo).expect("register dns port");
     assert!(echo_slot >= UdpInputNext::COUNT as u16);
 
     let trace_control = TraceControlPlane::new(4);

@@ -1852,10 +1852,7 @@ impl BufferPool {
     }
 
     #[inline]
-    pub fn chain(
-        &self,
-        index: Index,
-    ) -> impl Iterator<Item = CoreResult<BufferRef<'_>>> + '_ {
+    pub fn chain(&self, index: Index) -> impl Iterator<Item = CoreResult<BufferRef<'_>>> + '_ {
         let mut next = Some(index);
         let mut failed = false;
         std::iter::from_fn(move || {
@@ -2057,9 +2054,10 @@ impl FramePoolInner {
             self.available_len -= 1;
             let slot = self.available[self.available_len];
             let pool_id = self.pool_id;
-            let entry = self.slots.get_mut(slot as usize).ok_or(
-                DataPlaneError::IndexSlotOutOfBounds { pool_id, slot },
-            )?;
+            let entry = self
+                .slots
+                .get_mut(slot as usize)
+                .ok_or(DataPlaneError::IndexSlotOutOfBounds { pool_id, slot })?;
             let Some(generation) = advance_generation(entry.generation) else {
                 // Slot retired at max generation; leave it out of available.
                 continue;
@@ -2153,11 +2151,7 @@ impl FramePoolInner {
     }
 
     #[inline]
-    fn return_frame_and_release(
-        &mut self,
-        index: Index,
-        frame: BufferFrame,
-    ) -> CoreResult<()> {
+    fn return_frame_and_release(&mut self, index: Index, frame: BufferFrame) -> CoreResult<()> {
         let entry = self.entry_mut(index)?;
         if entry.frame.is_some() {
             return Err(DataPlaneError::FrameSlotAlreadyHasFrame.into());
@@ -2431,11 +2425,7 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn alloc_chain(
-        &mut self,
-        cache: &mut BufferThreadCache,
-        bytes: &[u8],
-    ) -> CoreResult<Index> {
+    fn alloc_chain(&mut self, cache: &mut BufferThreadCache, bytes: &[u8]) -> CoreResult<Index> {
         if self.slot_capacity == 0 {
             return Err(CoreError::internal("buffer slot capacity must be nonzero"));
         }
@@ -2474,11 +2464,7 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn alloc_slot(
-        &mut self,
-        cache: &mut BufferThreadCache,
-        bytes: &[u8],
-    ) -> CoreResult<Index> {
+    fn alloc_slot(&mut self, cache: &mut BufferThreadCache, bytes: &[u8]) -> CoreResult<Index> {
         if bytes.len() > self.slot_capacity {
             return Err(CoreError::internal(format!(
                 "buffer bytes exceed slot capacity: {} > {}",
@@ -3389,10 +3375,7 @@ impl BufferFrame {
     }
 
     #[inline]
-    pub fn push_indices(
-        &mut self,
-        indices: impl IntoIterator<Item = Index>,
-    ) -> CoreResult<()> {
+    pub fn push_indices(&mut self, indices: impl IntoIterator<Item = Index>) -> CoreResult<()> {
         let indices = indices.into_iter();
         let (lower, upper) = indices.size_hint();
         if let Some(upper) = upper {
@@ -3989,12 +3972,7 @@ impl BufferFrame {
     }
 
     #[inline(always)]
-    fn prefetch_indices(
-        &self,
-        offset: usize,
-        width: usize,
-        prefetch: &mut impl FnMut(Index),
-    ) {
+    fn prefetch_indices(&self, offset: usize, width: usize, prefetch: &mut impl FnMut(Index)) {
         let end = (offset + width).min(self.indices.len());
         for index in self.indices[offset..end].iter().copied() {
             prefetch(index);
@@ -4220,18 +4198,17 @@ mod index_identity_tests {
         }
         let reused = pool.alloc_index().expect("alloc after retirement");
         assert_ne!(reused.slot(), retired_slot);
-        assert!(pool.get(Index {
-            pool_id: pool.pool_id(),
-            slot: retired_slot,
-            generation: u32::MAX,
-        })
-        .is_err());
+        assert!(
+            pool.get(Index {
+                pool_id: pool.pool_id(),
+                slot: retired_slot,
+                generation: u32::MAX,
+            })
+            .is_err()
+        );
         {
             let mut cache = pool.thread_cache.borrow_mut();
-            pool.arena
-                .inner
-                .write()
-                .free_chain(&mut cache, reused);
+            pool.arena.inner.write().free_chain(&mut cache, reused);
         }
     }
 

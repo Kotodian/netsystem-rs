@@ -6,13 +6,11 @@ use std::sync::Arc;
 use crate::data_plane::set_buffer_node_error_code;
 use crate::net::ip::{IpProtocol, IpVersion};
 use crate::trace::codec::{
-    TraceDecodeCursor, put_option_ip_protocol, put_option_ip_version, put_option_u16,
-    put_u16,
+    TraceDecodeCursor, put_option_ip_protocol, put_option_ip_version, put_option_u16, put_u16,
 };
 use arc_swap::ArcSwap;
 use hammer_core::data_plane::{
-    BufferFrame, Index, BufferPacketCursor, NodeHandle, NodeId,
-    SecondaryOpaque,
+    BufferFrame, BufferPacketCursor, Index, NodeHandle, NodeId, SecondaryOpaque,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::IcmpErrorMetadata;

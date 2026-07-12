@@ -1,6 +1,6 @@
 use crate::session::runtime::RxDelivery;
 use hammer_core::data_plane::{
-    BufferFrame, Index, NodeId, NodeNext, DEFAULT_BUFFER_FRAME_CAPACITY,
+    BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Index, NodeId, NodeNext,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::pool::Index as PoolIndex;
@@ -90,8 +90,7 @@ where
 {
     let input_len = frame.len();
     debug_assert!(input_len <= DEFAULT_BUFFER_FRAME_CAPACITY);
-    let mut inputs =
-        [core::mem::MaybeUninit::<Index>::uninit(); DEFAULT_BUFFER_FRAME_CAPACITY];
+    let mut inputs = [core::mem::MaybeUninit::<Index>::uninit(); DEFAULT_BUFFER_FRAME_CAPACITY];
     for (offset, &index) in frame.indices().iter().enumerate() {
         inputs[offset].write(index);
     }
@@ -339,7 +338,6 @@ where
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -508,11 +506,7 @@ mod tests {
             .expect("insert established");
         publish_tcp_connection(&mut queue, session_id).expect("publish");
         let connection = queue.session(session_id).expect("session");
-        (
-            session_id,
-            connection.rcv_nxt(),
-            connection.snd_nxt(),
-        )
+        (session_id, connection.rcv_nxt(), connection.snd_nxt())
     }
 
     fn send_to_established(
@@ -521,7 +515,10 @@ mod tests {
         session_id: Option<SessionId>,
         packet: std::vec::Vec<u8>,
     ) {
-        let mut frame = runtime.buffers().get_next_frame(established).expect("frame");
+        let mut frame = runtime
+            .buffers()
+            .get_next_frame(established)
+            .expect("frame");
         let buffer = runtime.alloc_index_with_bytes(&packet).expect("packet");
         let cursor = tcp_control_cursor(&packet).expect("cursor");
         let mut data_buffer = runtime.get_buffer_mut(buffer).expect("buffer mut");
@@ -599,8 +596,11 @@ mod tests {
         let (IpAddr::V4(local_ip), IpAddr::V4(remote_ip)) = (local.ip(), remote.ip()) else {
             return Err(hammer_core::protocol::tcp::TcpError::SegmentInvalid);
         };
-        let packet_len = 20usize.checked_add(tcp_len).ok_or(hammer_core::protocol::tcp::TcpError::Dispatch)?;
-        let total_len = u16::try_from(packet_len).map_err(|_| hammer_core::protocol::tcp::TcpError::Length)?;
+        let packet_len = 20usize
+            .checked_add(tcp_len)
+            .ok_or(hammer_core::protocol::tcp::TcpError::Dispatch)?;
+        let total_len =
+            u16::try_from(packet_len).map_err(|_| hammer_core::protocol::tcp::TcpError::Length)?;
         let mut packet = std::vec![0u8; packet_len];
         packet[0] = 0x45;
         packet[2] = (total_len >> 8) as u8;
@@ -669,7 +669,10 @@ mod tests {
         let connection = queue.session(session_id).expect("session");
         assert_eq!(connection.rcv_nxt(), rcv_nxt + 5);
         assert_eq!(
-            queue.app().rx_available_len(session_id).expect("rx capacity"),
+            queue
+                .app()
+                .rx_available_len(session_id)
+                .expect("rx capacity"),
             rx_before - 5
         );
         // Delayed ACK: first clean segment does not emit an immediate ACK.

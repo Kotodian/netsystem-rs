@@ -1,9 +1,7 @@
 use std::mem::transmute;
 use std::sync::{Mutex, OnceLock};
 
-use hammer_core::data_plane::{
-    BufferFrame, Index, BufferPacketCursor, NodeId,
-};
+use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_runtime::{
     DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
@@ -303,9 +301,7 @@ fn next_slot_for_index(
                 default_next
             }
         }
-        IpInputTarget::LookupMulticast => {
-            IpInputNext::LookupMulticast.slot() as u16
-        }
+        IpInputTarget::LookupMulticast => IpInputNext::LookupMulticast.slot() as u16,
         IpInputTarget::IcmpError => IpInputNext::IcmpError.slot() as u16,
         IpInputTarget::Reassembly => IpInputNext::Reassembly.slot() as u16,
     };

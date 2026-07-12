@@ -1,7 +1,7 @@
 //! VPP `vlib_buffer_enqueue_to_next` / `enqueue_one`.
 
 use hammer_core::data_plane::{
-    BufferFrame, Frame, Index, Next, NodeId, NodeNext, DEFAULT_BUFFER_FRAME_CAPACITY,
+    BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Frame, Index, Next, NodeId, NodeNext,
 };
 use hammer_infra::mask_compare::{mask_compare_u16, mask_compare_u16_words};
 
@@ -82,7 +82,10 @@ impl DataPlaneRuntime {
         used: &mut [u64; MASK_WORDS],
         n_left: usize,
     ) -> usize {
-        let target = match self.nodes().node_next_slot(current, usize::from(next_index)) {
+        let target = match self
+            .nodes()
+            .node_next_slot(current, usize::from(next_index))
+        {
             Ok(node) => node,
             Err(_) => abort_fanout("local next slot is not registered"),
         };
@@ -177,8 +180,8 @@ mod tests {
     use std::sync::Mutex;
 
     use hammer_core::data_plane::{
-        DataPlaneBufferConfig, Index, NodeId, NodeKind, NodeNext, NodeRegistration,
-        DEFAULT_BUFFER_FRAME_CAPACITY,
+        DEFAULT_BUFFER_FRAME_CAPACITY, DataPlaneBufferConfig, Index, NodeId, NodeKind, NodeNext,
+        NodeRegistration,
     };
     use hammer_core::error::CoreResult;
 
@@ -270,7 +273,12 @@ mod tests {
         })
     }
 
-    fn run_fanout(runtime: &DataPlaneRuntime, owner: NodeId, frame: &mut BufferFrame, nexts: &[u16]) {
+    fn run_fanout(
+        runtime: &DataPlaneRuntime,
+        owner: NodeId,
+        frame: &mut BufferFrame,
+        nexts: &[u16],
+    ) {
         runtime.set_current_node(Some(owner));
         runtime.enqueue_to_next(frame, nexts);
         runtime.flush_fanout_appendable();
@@ -516,7 +524,10 @@ mod tests {
         }
         let high = register_plain(&runtime, collect_b)?;
         let high_slot = runtime.nodes().add_node_next_slot(owner, high)?;
-        assert!(high_slot > 16, "expected slot above old limit, got {high_slot}");
+        assert!(
+            high_slot > 16,
+            "expected slot above old limit, got {high_slot}"
+        );
         assert_eq!(high_slot, slot + 1);
 
         clear_sinks();

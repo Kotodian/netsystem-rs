@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwap;
 use hammer_core::data_plane::{
-    BufferFrame, Index, BufferPacketCursor, NodeId, NodeNext, SecondaryOpaque,
+    BufferFrame, BufferPacketCursor, Index, NodeId, NodeNext, SecondaryOpaque,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::{
@@ -512,7 +512,6 @@ impl IcmpInputSnapshot {
         }
     }
 }
-
 
 #[derive(Debug, Clone)]
 struct IcmpInputTable {
@@ -1325,10 +1324,7 @@ mod tests {
 
         snapshot.register_type(IpVersion::V4, ICMP4_ECHO_REQUEST, echo);
 
-        assert_eq!(
-            snapshot.slot_for(IpVersion::V4, ICMP4_ECHO_REQUEST),
-            echo
-        );
+        assert_eq!(snapshot.slot_for(IpVersion::V4, ICMP4_ECHO_REQUEST), echo);
         assert_eq!(snapshot.slot_for(IpVersion::V4, 13), default);
     }
 }

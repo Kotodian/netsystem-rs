@@ -2,7 +2,7 @@ use std::mem::{size_of, transmute};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::net::{IpEcnCodepoint, NetworkOpaque};
-use hammer_core::data_plane::{Index, BufferPacketCursor};
+use hammer_core::data_plane::{BufferPacketCursor, Index};
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::{
     TcpCapabilities, TcpError, TcpFastOpenCookie, TcpPacket, TcpSackBlock, TcpSegmentFlags,

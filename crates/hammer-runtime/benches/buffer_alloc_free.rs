@@ -1,5 +1,5 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use hammer_core::data_plane::{Index, BufferPool, DataPlaneBufferConfig, NodeId};
+use hammer_core::data_plane::{BufferPool, DataPlaneBufferConfig, Index, NodeId};
 use hammer_infra::vec::Vec;
 use hammer_runtime::{DataPlaneHandoff, DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId};
 

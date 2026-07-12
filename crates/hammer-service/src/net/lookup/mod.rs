@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use arc_swap::ArcSwapOption;
 use hammer_core::config::{Config, Route, RouteAction};
 use hammer_core::data_plane::{
-    BufferFrame, Index, BufferPacketCursor, NodeId, NodeRegistration, SecondaryOpaque,
+    BufferFrame, BufferPacketCursor, Index, NodeId, NodeRegistration, SecondaryOpaque,
 };
 use hammer_core::error::{CoreError, CoreResult, HammerResult};
 use hammer_core::forwarding::{
@@ -407,10 +407,7 @@ pub struct IpLookupNode {
 
 impl IpLookupNode {
     #[inline(always)]
-    fn cached_packet_for_index(
-        runtime: &DataPlaneRuntime,
-        index: Index,
-    ) -> Option<ParsedIpPacket> {
+    fn cached_packet_for_index(runtime: &DataPlaneRuntime, index: Index) -> Option<ParsedIpPacket> {
         let buffer = runtime.get_buffer(index).ok()?;
         packet_from_cached_metadata(
             unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) },

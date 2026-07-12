@@ -20,7 +20,6 @@ use crate::session::runtime::{
 use hammer_infra::msg_queue::{SessionEvt, SessionEvtType};
 use hammer_runtime::app::{AppSession, AppSessionConfig, SessionHandle};
 
-
 #[derive(Default)]
 struct BlackholeNode;
 
@@ -35,7 +34,6 @@ impl Node for BlackholeNode {
 }
 
 impl InternalNode for BlackholeNode {}
-
 
 fn test_session_queue_next(
     runtime: &DataPlaneRuntime,
@@ -426,8 +424,14 @@ fn quic_shaped_internal_tx_can_fan_close_out_to_stream_sessions() {
 
     let (owner, next) = {
         let node = SessionQueueNode::new().expect("session queue node");
-        let owner = runtime.nodes().try_register_driver(node).expect("register sq");
-        let slot = runtime.nodes().add_node_next_slot(owner, output).expect("next");
+        let owner = runtime
+            .nodes()
+            .try_register_driver(node)
+            .expect("register sq");
+        let slot = runtime
+            .nodes()
+            .add_node_next_slot(owner, output)
+            .expect("next");
         (owner, SessionQueueNext::from_slot(slot))
     };
     dispatch_session_queue_once(&runtime, owner, &mut driver, next).expect("internal tx");
@@ -701,14 +705,20 @@ fn session_tx_dispatch_commits_batch_before_graph_visibility() {
     app.send_bytes(&[0xab; 16]).expect("send bytes");
     let output_node = runtime
         .nodes()
-        .register_internal(VisibilityCaptureNode::new(Arc::clone(&events)))
-        ;
+        .register_internal(VisibilityCaptureNode::new(Arc::clone(&events)));
     let node = SessionQueueNode::new().expect("session queue node");
-    let owner = runtime.nodes().try_register_driver(node).expect("register sq");
+    let owner = runtime
+        .nodes()
+        .try_register_driver(node)
+        .expect("register sq");
     let next = SessionQueueNext::from_slot(
-        runtime.nodes().add_node_next_slot(owner, output_node).expect("next"),
+        runtime
+            .nodes()
+            .add_node_next_slot(owner, output_node)
+            .expect("next"),
     );
-    dispatch_session_queue_once(&runtime, owner, &mut driver, next).expect("dispatch session queue");
+    dispatch_session_queue_once(&runtime, owner, &mut driver, next)
+        .expect("dispatch session queue");
     let _ = runtime.run_ready_nodes().expect("run capture node");
 
     let transport = &driver.transports().0;
@@ -751,12 +761,10 @@ fn session_tx_deschedules_without_tx_action_when_send_space_is_zero() {
     let sink = runtime.nodes().register_internal(BlackholeNode);
     let (owner, next) = test_session_queue_next(&runtime, sink);
 
-    let first = dispatch_session_queue_once(&runtime, owner, &mut driver, next,
-    )
-    .expect("first dispatch");
-    let second = dispatch_session_queue_once(&runtime, owner, &mut driver, next,
-    )
-    .expect("second dispatch");
+    let first =
+        dispatch_session_queue_once(&runtime, owner, &mut driver, next).expect("first dispatch");
+    let second =
+        dispatch_session_queue_once(&runtime, owner, &mut driver, next).expect("second dispatch");
 
     let transport = &driver.transports().0;
     assert_eq!(first.scheduled_sessions, 1);
@@ -787,9 +795,8 @@ fn failed_session_packetized_tx_action_keeps_fifo_and_graph_unchanged() {
     let sink = runtime.nodes().register_internal(BlackholeNode);
     let (owner, next) = test_session_queue_next(&runtime, sink);
 
-    let error = dispatch_session_queue_once(&runtime, owner, &mut driver, next,
-    )
-    .expect_err("tx action must fail");
+    let error = dispatch_session_queue_once(&runtime, owner, &mut driver, next)
+        .expect_err("tx action must fail");
 
     assert_eq!(error.to_string(), "test tx action failure");
     assert_eq!(
@@ -826,9 +833,7 @@ fn transport_deleted_then_queued_app_close_releases_the_session_slot() {
     let sink = runtime.nodes().register_internal(BlackholeNode);
     let (owner, next) = test_session_queue_next(&runtime, sink);
 
-    dispatch_session_queue_once(&runtime, owner, &mut driver, next,
-    )
-    .expect("dispatch app close");
+    dispatch_session_queue_once(&runtime, owner, &mut driver, next).expect("dispatch app close");
 
     assert!(!driver.sessions().has_session(session_id));
     let replacement = driver.insert_session(FailingPacketizedTransport::ID, Index::new(4, 10));

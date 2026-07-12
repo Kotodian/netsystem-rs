@@ -1,4 +1,4 @@
-use hammer_core::data_plane::{BufferFrame, Index, BufferPacketCursor, NodeId};
+use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId};
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::{TcpError, TcpSegmentFlags, tcp_header};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
@@ -62,10 +62,7 @@ fn tcp_reset_process_frame(runtime: &DataPlaneRuntime, frame: &mut BufferFrame) 
 }
 
 #[inline(always)]
-fn tcp_reset_next_for_index(
-    runtime: &DataPlaneRuntime,
-    index: Index,
-) -> CoreResult<TcpResetNext> {
+fn tcp_reset_next_for_index(runtime: &DataPlaneRuntime, index: Index) -> CoreResult<TcpResetNext> {
     let reset = {
         let buffer = runtime.get_buffer(index)?;
         tcp_reset_prepare_from_current(

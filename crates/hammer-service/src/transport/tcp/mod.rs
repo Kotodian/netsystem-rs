@@ -687,7 +687,6 @@ mod legacy_tests {
     };
     use crate::transport::congestion::BbrController;
 
-
     fn session_queue_output_next(
         runtime: &DataPlaneRuntime,
         output_node: NodeId,
@@ -703,7 +702,6 @@ mod legacy_tests {
             .expect("session queue output next");
         (owner, crate::session::SessionQueueNext::from_slot(slot))
     }
-
 
     fn install_transport_backend(backend: hammer_core::config::SessionBackend) {
         crate::transport::TRANSPORT_MAIN.store(Some(Arc::new(
@@ -1024,9 +1022,15 @@ mod legacy_tests {
                 hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY,
             );
             let mut output = SessionQueueOutput::default();
-            let _ =
-                dispatch_session_queue_pending(runtime, driver, next, &mut staging, &mut output, now)
-                    .expect("dispatch TCP timer update");
+            let _ = dispatch_session_queue_pending(
+                runtime,
+                driver,
+                next,
+                &mut staging,
+                &mut output,
+                now,
+            )
+            .expect("dispatch TCP timer update");
             runtime.with_current_node(owner, || output.flush(runtime, &mut staging));
         }
         let _ = runtime.run_ready_nodes().expect("run timer output");

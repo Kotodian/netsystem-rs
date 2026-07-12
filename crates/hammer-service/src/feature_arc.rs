@@ -623,13 +623,7 @@ impl<A: FeatureArcSpec> FeatureArcState<A> {
                 start_nexts.insert((start.slot(), *interface_index), start_next);
             }
 
-            chains.insert(
-                *interface_index,
-                FeatureArcChain {
-                    head_config,
-                    steps,
-                },
-            );
+            chains.insert(*interface_index, FeatureArcChain { head_config, steps });
         }
 
         self.chains = chains;
@@ -696,9 +690,7 @@ impl<A: FeatureArcSpec> FeatureArcState<A> {
                 .iter()
                 .copied()
                 .chain(self.registered.keys().copied())
-                .find(|id| {
-                    !selected.contains(id) && indegree.get(id).copied().unwrap_or(0) == 0
-                })
+                .find(|id| !selected.contains(id) && indegree.get(id).copied().unwrap_or(0) == 0)
                 .or_else(|| {
                     // Stable fallback: lowest ordinal among zero-indegree.
                     self.registered

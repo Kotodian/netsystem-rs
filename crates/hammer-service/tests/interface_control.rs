@@ -202,12 +202,8 @@ fn interface_address_publish_installs_receive_route_in_fib() {
         .add_node_next_slot(adjacency_rewrite, interface_output)
         .expect("output next");
     let control = InterfaceControlPlane::new().with_connected_routes(
-        InterfaceConnectedRouteControl::new(
-            lookup_control.table_handle(),
-            drop_slot,
-            receive_slot,
-        )
-        .with_connected_adjacency(rewrite_slot, output_slot),
+        InterfaceConnectedRouteControl::new(lookup_control.table_handle(), drop_slot, receive_slot)
+            .with_connected_adjacency(rewrite_slot, output_slot),
     );
     let tun0 = control.register_interface("tun0").expect("register tun0");
     let address = IpNet::V4(Ipv4Net::new(Ipv4Addr::new(10, 255, 0, 1), 24).unwrap());
@@ -302,9 +298,7 @@ fn interface_output_dispatches_to_registered_tx_node() {
     output_control
         .attach_consumer(output_node)
         .expect("attach interface output");
-    let tx_slot = output_control
-        .register_tx(7, tx)
-        .expect("register tx node");
+    let tx_slot = output_control.register_tx(7, tx).expect("register tx node");
     let trace = TraceControlPlane::new(8);
     trace.publish(TracePolicy {
         enabled: true,

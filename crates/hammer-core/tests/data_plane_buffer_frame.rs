@@ -214,7 +214,9 @@ fn core_frame_empty_and_full_cleanup_release_owned_buffers_once() {
         assert!(buffers.get_buffer(index).is_err());
     }
 
-    let mut cleanup = buffers.get_next_frame(NodeId::new(2)).expect("cleanup frame");
+    let mut cleanup = buffers
+        .get_next_frame(NodeId::new(2))
+        .expect("cleanup frame");
     cleanup.push_index(overflow).expect("own overflow");
     drop(cleanup);
     assert_eq!(buffers.in_use_buffers(), 0);
@@ -255,11 +257,7 @@ fn core_frame_transfer_moves_index_without_double_release() {
 fn core_frame_retain_preserves_stable_order() {
     let buffers = test_buffers(64, 8);
     let indices: std::vec::Vec<_> = (0..4)
-        .map(|i| {
-            buffers
-                .alloc_index_with_bytes(&[i])
-                .expect("alloc index")
-        })
+        .map(|i| buffers.alloc_index_with_bytes(&[i]).expect("alloc index"))
         .collect();
 
     let mut frame = buffers.get_next_frame(NodeId::new(5)).expect("frame");

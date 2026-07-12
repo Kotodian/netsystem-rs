@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use hammer_core::data_plane::{
-    BufferFrame, BufferFramePairBatch, BufferFrameQuadBatch, Index, BufferPacketCursor,
-    BufferPool, BufferPoolArena, BufferRefMut, DEFAULT_BUFFER_FRAME_CAPACITY, DataPlaneBufferConfig,
-    DataPlaneBuffers, NodeId,
+    BufferFrame, BufferFramePairBatch, BufferFrameQuadBatch, BufferPacketCursor, BufferPool,
+    BufferPoolArena, BufferRefMut, DEFAULT_BUFFER_FRAME_CAPACITY, DataPlaneBufferConfig,
+    DataPlaneBuffers, Index, NodeId,
 };
 use hammer_core::error::CoreResult;
 use hammer_infra::vec::Vec;
@@ -74,12 +74,7 @@ fn test_runtime_configured_instruction_set(
 fn pool_cleanup_runtime(pool: &BufferPool, queue_capacity: usize) -> DataPlaneRuntime {
     let handoff = DataPlaneHandoff::new_shared_buffer_arena(1, queue_capacity.max(1), pool.arena());
     DataPlaneRuntime::attach_handoff_worker(
-        test_runtime_configured_instruction_set(
-            1,
-            1,
-            1,
-            DataPlaneInstructionSet::native(),
-        ),
+        test_runtime_configured_instruction_set(1, 1, 1, DataPlaneInstructionSet::native()),
         DataWorkerId::new(0),
         handoff.worker(DataWorkerId::new(0)),
     )
@@ -313,10 +308,7 @@ fn runtime_get_buffer_exposes_direct_buffer_borrows() {
 
 #[test]
 fn public_mut_buffer_accessors_keep_buffer_refmut_shape() {
-    fn assert_pool_shape<'a>(
-        pool: &'a BufferPool,
-        index: Index,
-    ) -> CoreResult<BufferRefMut<'a>> {
+    fn assert_pool_shape<'a>(pool: &'a BufferPool, index: Index) -> CoreResult<BufferRefMut<'a>> {
         pool.get_mut(index)
     }
 
@@ -1267,7 +1259,9 @@ fn buffer_frame_push_index_respects_production_capacity() {
     let mut owned = Vec::new();
     for _ in 0..DEFAULT_BUFFER_FRAME_CAPACITY {
         let index = pool.alloc_index().expect("alloc frame buffer");
-        frame.push_index(index).expect("push within production capacity");
+        frame
+            .push_index(index)
+            .expect("push within production capacity");
         owned.push(index);
     }
     let overflow = pool.alloc_index().expect("overflow buffer");

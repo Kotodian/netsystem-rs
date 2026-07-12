@@ -55,9 +55,7 @@ fn test_runtime() -> DataPlaneRuntime {
 }
 
 fn push_packet(runtime: &DataPlaneRuntime, frame: &mut BufferFrame, sw_if_index: u32) {
-    let index = runtime
-        .alloc_index_with_bytes(&[0u8; 64])
-        .expect("alloc");
+    let index = runtime.alloc_index_with_bytes(&[0u8; 64]).expect("alloc");
     {
         let mut buffer = runtime.get_buffer_mut(index).expect("buffer");
         let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
@@ -98,11 +96,7 @@ impl FeatureArcStartNode<TestArc> for StartNode {
 }
 
 impl StartNode {
-    fn new(
-        name: &'static str,
-        visits: Arc<Mutex<VisitState>>,
-        default_next: u16,
-    ) -> Self {
+    fn new(name: &'static str, visits: Arc<Mutex<VisitState>>, default_next: u16) -> Self {
         let mut runtimes = start_runtimes().lock().unwrap();
         let slot = runtimes.len();
         runtimes.push(StartRuntime {
@@ -356,8 +350,7 @@ fn register_start(
 
 #[test]
 fn empty_chain_preserves_caller_default_next() {
-    let data_runtime =
-        DataRuntime::new(1, "feature-empty", 512 * 1024, 2).expect("data runtime");
+    let data_runtime = DataRuntime::new(1, "feature-empty", 512 * 1024, 2).expect("data runtime");
     let runtime = test_runtime();
     let visits = Arc::new(Mutex::new(VisitState::default()));
     let end = runtime
@@ -367,10 +360,7 @@ fn empty_chain_preserves_caller_default_next() {
     control.set_default_end_node(end).expect("default end");
     let start_id = register_start(&runtime, &mut control, &visits, "start-a", end);
 
-    let mut frame = runtime
-        .buffers()
-        .get_next_frame(start_id)
-        .expect("frame");
+    let mut frame = runtime.buffers().get_next_frame(start_id).expect("frame");
     push_packet(&runtime, &mut frame, 3);
     runtime.put_next_frame(frame).expect("schedule");
     assert_eq!(runtime.run_ready_nodes().expect("run"), 2);
@@ -380,8 +370,7 @@ fn empty_chain_preserves_caller_default_next() {
 
 #[test]
 fn two_feature_chain_traverses_in_order_through_graph_runtime() {
-    let data_runtime =
-        DataRuntime::new(1, "feature-chain", 512 * 1024, 2).expect("data runtime");
+    let data_runtime = DataRuntime::new(1, "feature-chain", 512 * 1024, 2).expect("data runtime");
     let runtime = test_runtime();
     let visits = Arc::new(Mutex::new(VisitState::default()));
     let end = runtime
@@ -409,16 +398,15 @@ fn two_feature_chain_traverses_in_order_through_graph_runtime() {
         .expect("register second");
 
     let start_id = register_start(&runtime, &mut control, &visits, "start-a", end);
-    control.enable_feature::<FirstFeature>(9).expect("enable first");
+    control
+        .enable_feature::<FirstFeature>(9)
+        .expect("enable first");
     control
         .enable_feature::<SecondFeature>(9)
         .expect("enable second");
     *handle_slot.lock().unwrap() = Some(control.arc().start_handle());
 
-    let mut frame = runtime
-        .buffers()
-        .get_next_frame(start_id)
-        .expect("frame");
+    let mut frame = runtime.buffers().get_next_frame(start_id).expect("frame");
     push_packet(&runtime, &mut frame, 9);
     runtime.put_next_frame(frame).expect("schedule");
     let ran = runtime.run_ready_nodes().expect("run");
@@ -463,10 +451,7 @@ fn per_interface_end_override_compiles_on_final_predecessor() {
     control.enable_feature::<FirstFeature>(4).expect("enable");
     *handle_slot.lock().unwrap() = Some(control.arc().start_handle());
 
-    let mut frame = runtime
-        .buffers()
-        .get_next_frame(start_id)
-        .expect("frame");
+    let mut frame = runtime.buffers().get_next_frame(start_id).expect("frame");
     push_packet(&runtime, &mut frame, 4);
     runtime.put_next_frame(frame).expect("schedule");
     assert!(runtime.run_ready_nodes().expect("run") >= 3);
@@ -506,10 +491,7 @@ fn multiple_start_nodes_compile_distinct_first_transitions() {
 
     for (start_id, label) in [(start_a, "start-a"), (start_b, "start-b")] {
         visits.lock().unwrap().order.clear();
-        let mut frame = runtime
-            .buffers()
-            .get_next_frame(start_id)
-            .expect("frame");
+        let mut frame = runtime.buffers().get_next_frame(start_id).expect("frame");
         push_packet(&runtime, &mut frame, 2);
         runtime.put_next_frame(frame).expect("schedule");
         assert!(runtime.run_ready_nodes().expect("run") >= 3);

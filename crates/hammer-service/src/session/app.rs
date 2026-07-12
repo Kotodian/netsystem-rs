@@ -1,7 +1,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use hammer_core::data_plane::{Index, DataPlaneBuffers};
+use hammer_core::data_plane::{DataPlaneBuffers, Index};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::fifo::Fifo;
 use hammer_infra::map::FlatHashTable;
@@ -364,8 +364,8 @@ impl SessionAppRuntime<Local> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hammer_infra::pool::Index as PoolIndex;
     use hammer_infra::msg_queue::SessionEvtType;
+    use hammer_infra::pool::Index as PoolIndex;
     use hammer_runtime::app::{AppSessionConfig, SessionHandle};
     use std::sync::Mutex;
 
