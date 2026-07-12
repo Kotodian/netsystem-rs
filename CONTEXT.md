@@ -28,6 +28,10 @@ _Avoid_: output callback, destination handler, manually routed node id, second l
 FIB / DPO / load-balance / adjacency packet-path next values are current-node-local `u16` slots owned by the classifying graph node (lookup or adjacency-rewrite). Control-plane wiring registers those slots; lookup and rewrite enqueue through Graph Fanout, not by storing resolved `NodeId` in forwarding tables.
 _Avoid_: FIB-stored NodeId, adjacency NodeId hot path, forwarding-owned frame get/push/put
 
+**Feature Arc**:
+An ordered per-interface chain of feature Graph Nodes. Control may retain target node identities while compiling under a barrier; each published transition stores only a predecessor-local `u16` and the next configuration index. Packet traversal advances configuration progress once per feature, preserves the caller default when no feature applies, and never resolves target node identities. Feature config progress is distinct from Handoff continuation state.
+_Avoid_: packet-path NodeId feature next, shared handoff/config field, dual NodeId/u16 feature API
+
 **Graph Fanout**:
 The sole worker-local next-frame enqueue: it groups packet ownership by selected Next Arc and makes the resulting Next Frames visible at the current Graph Node dispatch boundary. Cross-worker ownership transfer remains Handoff, not Graph Fanout.
 _Avoid_: cross-thread fanout, handoff enqueue, output router, per-node manual frame get/push/put, recoverable enqueue Result on the packet path

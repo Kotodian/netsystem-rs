@@ -134,6 +134,25 @@ impl NetworkIpOpaque {
             self.ip_ecn_valid = 0;
         }
     }
+
+    #[inline]
+    pub fn feature_config_index(&self) -> u32 {
+        u32::from_le_bytes([
+            self.reserved[0],
+            self.reserved[1],
+            self.reserved[2],
+            self.reserved[3],
+        ])
+    }
+
+    #[inline]
+    pub fn set_feature_config_index(&mut self, index: u32) {
+        let bytes = index.to_le_bytes();
+        self.reserved[0] = bytes[0];
+        self.reserved[1] = bytes[1];
+        self.reserved[2] = bytes[2];
+        self.reserved[3] = bytes[3];
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -263,6 +282,16 @@ impl NetworkOpaque {
                 usize::from(ip.transport_header_len()),
             )
             .with_transport_payload_offset(usize::from(ip.transport_payload_offset()))
+    }
+
+    #[inline]
+    pub fn feature_config_index(&self) -> u32 {
+        self.ip().feature_config_index()
+    }
+
+    #[inline]
+    pub fn set_feature_config_index(&mut self, index: u32) {
+        self.ip_mut().set_feature_config_index(index);
     }
 
     #[inline]

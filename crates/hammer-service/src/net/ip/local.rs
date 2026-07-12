@@ -654,17 +654,26 @@ fn process_index(
             return Ok(resolved);
         }
         if let Some(feature_arc) = feature_arc {
-            let next = state.protocol_next(next, parsed.protocol);
+            let default_next = state.protocol_next(next, parsed.protocol);
             let interface_index = {
                 let buffer = runtime.get_buffer(index)?;
                 let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
                 network.sw_if_index[0]
             };
-            let resolved = if interface_index == 0 {
-                next
+            let default_slot = next
+                .iter()
+                .position(|node| *node == default_next)
+                .map(|slot| slot as u16)
+                .unwrap_or(IpLocalNext::Drop.slot() as u16);
+            let resolved_slot = if interface_index == 0 {
+                default_slot
             } else {
-                feature_arc.start_for_interface_or(interface_index, next)
+                feature_arc.start_for_interface_or(runtime, index, interface_index, default_slot)
             };
+            let resolved = runtime.nodes().node_next_slot(
+                runtime.current_node().expect("current node"),
+                usize::from(resolved_slot),
+            )?;
             let _ = add_packet_trace!(
                 runtime,
                 index,

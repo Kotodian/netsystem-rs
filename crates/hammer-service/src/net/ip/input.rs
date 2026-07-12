@@ -2,7 +2,7 @@ use std::mem::transmute;
 use std::sync::{Mutex, OnceLock};
 
 use hammer_core::data_plane::{
-    BufferFrame, Index, BufferPacketCursor, NodeId, NodeNextStorage,
+    BufferFrame, Index, BufferPacketCursor, NodeId,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_runtime::{
@@ -16,8 +16,8 @@ use crate::net::ip::{
 };
 use crate::net::{IpEcnCodepoint, NetworkOpaque};
 use crate::trace::codec::{
-    TraceDecodeCursor, put_node, put_option_ip_input_error, put_option_ip_input_target,
-    put_option_ip_protocol, put_option_ip_version, put_usize,
+    TraceDecodeCursor, put_option_ip_input_error, put_option_ip_input_target,
+    put_option_ip_protocol, put_option_ip_version, put_u16, put_usize,
 };
 
 #[hammer_component_macros::feature_arc]
@@ -48,7 +48,7 @@ pub struct IpInputTrace {
     pub input_target: Option<IpInputTarget>,
     pub input_error: Option<IpInputError>,
     pub packet_len: usize,
-    pub next: NodeId,
+    pub next: u16,
 }
 
 impl IpInputTrace {
@@ -60,7 +60,7 @@ impl IpInputTrace {
             input_target: cursor.read_option_ip_input_target()?,
             input_error: cursor.read_option_ip_input_error()?,
             packet_len: cursor.read_usize()?,
-            next: cursor.read_node()?,
+            next: cursor.read_u16()?,
         };
         cursor.is_empty().then_some(trace)
     }
@@ -73,7 +73,7 @@ impl PacketTrace for IpInputTrace {
         put_option_ip_input_target(out, self.input_target);
         put_option_ip_input_error(out, self.input_error);
         put_usize(out, self.packet_len);
-        put_node(out, self.next);
+        put_u16(out, self.next);
     }
 }
 
@@ -123,12 +123,18 @@ fn ip_input_process_frame(
     next: [NodeId; IpInputNext::COUNT],
     feature_arc: Option<&FeatureArcStartHandle>,
 ) -> NodeResult {
-    hammer_runtime::process_frame!(runtime, frame, |index| {
-        match next_node_for_index(runtime, index, next, feature_arc) {
-            Ok(node) => node,
-            Err(_) => NodeNextStorage::next(&next, IpInputNext::Drop),
-        }
-    })
+    let _ = next; // static next table retained for NodeRegistration wiring
+    let mut nexts = hammer_infra::vec::Vec::with_capacity(frame.len());
+    let drop_slot = IpInputNext::Drop.slot() as u16;
+    for index in frame.iter_indices() {
+        let slot = match next_slot_for_index(runtime, *index, feature_arc) {
+            Ok(slot) => slot,
+            Err(_) => drop_slot,
+        };
+        nexts.push(slot);
+    }
+    runtime.enqueue_to_next(frame, nexts.as_slice());
+    NodeResult::drop()
 }
 
 /// Per-instance state held in the global IP input registry. Mirrors the
@@ -202,19 +208,18 @@ fn ip_input_process<A: FeatureArcSpec>(
 }
 
 #[inline(always)]
-fn next_node_for_index(
+fn next_slot_for_index(
     runtime: &DataPlaneRuntime,
     index: Index,
-    next: [NodeId; IpInputNext::COUNT],
     feature_arc: Option<&FeatureArcStartHandle>,
-) -> CoreResult<NodeId> {
+) -> CoreResult<u16> {
     let (trace, parsed, _) = {
         let mut buffer = runtime.get_buffer_mut(index)?;
         let traced = buffer.trace_handle().is_some();
         match parse_ip_header(buffer.current()) {
             Err(_) => {
                 set_buffer_node_error_code(runtime, &mut buffer, IpInputError::BadLength.code())?;
-                let resolved = NodeNextStorage::next(&next, IpInputNext::Drop);
+                let resolved = IpInputNext::Drop.slot() as u16;
                 drop(buffer);
                 if unlikely(traced) {
                     let _ = add_packet_trace!(
@@ -280,7 +285,7 @@ fn next_node_for_index(
                         input_target: Some(parsed.input_target),
                         input_error: Some(parsed.input_error),
                         packet_len: parsed.packet_len,
-                        next: NodeNextStorage::next(&next, IpInputNext::Drop),
+                        next: IpInputNext::Drop.slot() as u16,
                     }),
                     parsed,
                     network,
@@ -289,11 +294,11 @@ fn next_node_for_index(
         }
     };
     let resolved = match parsed.input_target {
-        IpInputTarget::Drop => NodeNextStorage::next(&next, IpInputNext::Drop),
-        IpInputTarget::Punt => NodeNextStorage::next(&next, IpInputNext::Punt),
-        IpInputTarget::Options => NodeNextStorage::next(&next, IpInputNext::Options),
+        IpInputTarget::Drop => IpInputNext::Drop.slot() as u16,
+        IpInputTarget::Punt => IpInputNext::Punt.slot() as u16,
+        IpInputTarget::Options => IpInputNext::Options.slot() as u16,
         IpInputTarget::Lookup => {
-            let default_next = NodeNextStorage::next(&next, IpInputNext::Lookup);
+            let default_next = IpInputNext::Lookup.slot() as u16;
             if let Some(arc) = feature_arc {
                 let Some(interface_index) = ({
                     let buffer = runtime.get_buffer(index)?;
@@ -303,16 +308,16 @@ fn next_node_for_index(
                 }) else {
                     return Ok(default_next);
                 };
-                arc.start_for_interface_or(interface_index, default_next)
+                arc.start_for_interface_or(runtime, index, interface_index, default_next)
             } else {
                 default_next
             }
         }
         IpInputTarget::LookupMulticast => {
-            NodeNextStorage::next(&next, IpInputNext::LookupMulticast)
+            IpInputNext::LookupMulticast.slot() as u16
         }
-        IpInputTarget::IcmpError => NodeNextStorage::next(&next, IpInputNext::IcmpError),
-        IpInputTarget::Reassembly => NodeNextStorage::next(&next, IpInputNext::Reassembly),
+        IpInputTarget::IcmpError => IpInputNext::IcmpError.slot() as u16,
+        IpInputTarget::Reassembly => IpInputNext::Reassembly.slot() as u16,
     };
     if let Some(trace) = trace {
         let _ = add_packet_trace!(
