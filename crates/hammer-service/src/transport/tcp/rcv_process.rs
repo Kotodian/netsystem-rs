@@ -992,6 +992,35 @@ mod tests {
     }
 
     #[test]
+    fn rst_in_syn_rcvd_deletes_session() {
+        let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
+            buffers: hammer_core::data_plane::DataPlaneBufferConfig {
+                buffer_slot_capacity: 2048,
+                buffer_slots: 32,
+                frame_slots: 8,
+                ..hammer_core::data_plane::DataPlaneBufferConfig::default()
+            },
+        });
+        let (rcv, handle, output_state, _) = install_rcv_runtime(&runtime);
+        let (session_id, rcv_nxt, snd_nxt) = open_syn_rcvd_session(handle);
+
+        send_to_rcv(
+            &runtime,
+            rcv,
+            Some(session_id),
+            control_packet(rcv_nxt, snd_nxt, TcpSegmentFlags::RST | TcpSegmentFlags::ACK),
+        );
+        assert!(runtime.run_ready_nodes().expect("run") >= 1);
+
+        let queue = handle.borrow_mut().expect("tcp queue");
+        assert!(
+            queue.session(session_id).is_none(),
+            "RST in SynRcvd must delete the half-open session"
+        );
+        assert!(output_state.lock().expect("output").packets.is_empty());
+    }
+
+    #[test]
     fn time_wait_duplicate_fin_reacks_peer() {
         let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
             buffers: hammer_core::data_plane::DataPlaneBufferConfig {
