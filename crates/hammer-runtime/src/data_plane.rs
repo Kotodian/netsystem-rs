@@ -124,7 +124,9 @@ impl Clone for DataPlaneRuntime {
             buffers: self.buffers.clone(),
             nodes: self.nodes.clone(),
             current_node: Rc::clone(&self.current_node),
-            appendable_next_frames: RefCell::new(Vec::new()),
+            appendable_next_frames: RefCell::new(Vec::with_capacity(
+                hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY,
+            )),
             handoff: self.handoff.clone(),
             handoff_node_handle: self.handoff_node_handle,
             active_numa_node: self.active_numa_node,
@@ -188,7 +190,9 @@ impl DataPlaneRuntime {
             buffers,
             nodes: NodeRuntime::default(),
             current_node: Rc::new(Cell::new(None)),
-            appendable_next_frames: RefCell::new(Vec::new()),
+            appendable_next_frames: RefCell::new(Vec::with_capacity(
+                hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY,
+            )),
             handoff: None,
             handoff_node_handle: None,
             trace: DataPlaneTrace::default(),

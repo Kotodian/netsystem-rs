@@ -45,3 +45,7 @@ tokio = { workspace = true, features = ["test-util"] }
 [[bench]]
 name = "buffer_alloc_free"
 harness = false
+
+[[bench]]
+name = "graph_fanout"
+harness = false
