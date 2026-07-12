@@ -1,0 +1,70 @@
+# Tun TCP Lab — VPP-shaped, config-driven (no ops CLI).
+# Address plan avoids LAN 192.168.1.0/24 and Fake-IP 198.18.0.0/15.
+
+[log]
+level = "debug"
+
+# VPP: cpu { workers 1 } / unix { poll-sleep-usec 50000 }
+[worker]
+workers = 1
+poll_sleep = "50ms"
+
+# VPP: buffers { data-size 2048  buffers-per-numa 2048 }
+[worker.buffer]
+data_size = 2048
+buffers_per_numa = 2048
+
+[worker.scheduler]
+qos = "utility"
+
+# VPP: session { enable use-app-socket-api preallocated-sessions event-queue-length }
+[network.session]
+backend = "svm"
+attach_socket_path = "/var/run/hammer/attach.sock"
+preallocated_sessions = 64
+event_queue_length = 256
+ooo_capacity = 32
+
+[network.session.buffer]
+slot_bytes = 2048
+slots = 4
+
+# Lab-shortened timers (must be wired by later slices to take effect at runtime)
+[network.tcp]
+mss = 1440
+receive_window = 65535
+congestion = "bbr"
+nagle = true
+time_wait = "2s"
+paws_idle = "24h"
+
+[network.tcp.pmtu]
+enabled = true
+
+[network.tcp.retransmit]
+initial = "50ms"
+min = "50ms"
+max = "3s"
+
+[network.tcp.keepalive]
+idle = "3s"
+probe_interval = "1s"
+probe_limit = 3
+
+[[network.tcp.listen]]
+address = "10.66.77.1:7300"
+
+[[network.interface]]
+name = "utun"
+driver = "tun"
+address = ["10.66.77.1/30"]
+
+[network.interface.mtu]
+l3 = 1500
+ip4 = 1500
+ip6 = 1500
+mpls = 1500
+
+[[network.route]]
+prefix = "10.66.77.0/30"
+interface = "utun"

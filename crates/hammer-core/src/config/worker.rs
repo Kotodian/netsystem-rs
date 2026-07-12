@@ -46,6 +46,8 @@ fn default_instruction_set() -> String {
 #[serde(deny_unknown_fields, default)]
 pub struct Worker {
     /// Number of dataplane worker threads running the packet graph.
+    /// VPP `cpu { workers N }` alias: `workers`.
+    #[serde(alias = "workers")]
     pub count: usize,
     /// Worker thread stack size in bytes.
     pub stack_size: usize,
@@ -53,8 +55,9 @@ pub struct Worker {
     pub max_blocking_threads: usize,
     /// VPP-style poll interval: how long a worker parks when no packets are
     /// pending. `idle_slice` is kept as the serialized field for existing
-    /// configs; `poll_interval` is accepted as an input alias.
-    #[serde(with = "humantime_serde", alias = "poll_interval")]
+    /// configs; `poll_interval` / `poll_sleep` (VPP `unix.poll-sleep-usec`)
+    /// are accepted as input aliases.
+    #[serde(with = "humantime_serde", alias = "poll_interval", alias = "poll_sleep")]
     pub idle_slice: Duration,
     pub buffer: WorkerBuffer,
     pub handoff: WorkerHandoff,
@@ -131,9 +134,11 @@ impl Worker {
 #[serde(deny_unknown_fields, default)]
 pub struct WorkerBuffer {
     /// Per-slot byte capacity (VPP `buffers.data-size`).
+    #[serde(alias = "data_size")]
     pub slot_bytes: usize,
     /// Slots per NUMA node (VPP `buffers.buffers-per-numa`); on non-Linux this
     /// is the total slot count since there is no NUMA partitioning.
+    #[serde(alias = "buffers_per_numa")]
     pub slots_per_numa: usize,
     /// Initial buffer frame pool size (`hammer_core::data_plane::DEFAULT_BUFFER_FRAME_POOL_SIZE`).
     pub frame_pool_size: usize,

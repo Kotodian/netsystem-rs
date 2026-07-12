@@ -177,12 +177,18 @@ pub struct Tcp {
     pub mss: usize,
     pub receive_window: u32,
     pub congestion: CongestionController,
+    /// Nagle coalescing; default on (orthogonal to pacing).
+    pub nagle: bool,
     #[serde(with = "humantime_serde")]
     pub time_wait: Duration,
     #[serde(with = "humantime_serde")]
     pub paws_idle: Duration,
     pub retransmit: Retransmit,
     pub keepalive: Keepalive,
+    pub pmtu: Pmtu,
+    /// Config-driven listeners applied at network init (not CLI bind).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listen: Vec<TcpListen>,
 }
 
 impl Default for Tcp {
@@ -191,10 +197,13 @@ impl Default for Tcp {
             mss: TCP_MSS,
             receive_window: TCP_WINDOW,
             congestion: CongestionController::Bbr,
+            nagle: true,
             time_wait: TCP_TIME_WAIT,
             paws_idle: TCP_PAWS_IDLE,
             retransmit: Retransmit::default(),
             keepalive: Keepalive::default(),
+            pmtu: Pmtu::default(),
+            listen: Vec::new(),
         }
     }
 }
@@ -223,6 +232,71 @@ impl Tcp {
         }
         self.retransmit.validate()?;
         self.keepalive.validate()?;
+        self.pmtu.validate()?;
+        for entry in &self.listen {
+            entry.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Pmtu {
+    pub enabled: bool,
+}
+
+impl Default for Pmtu {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+impl Pmtu {
+    fn validate(&self) -> HammerResult<()> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TcpListen {
+    pub address: std::net::SocketAddr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub md5_password: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ao_keys: Vec<TcpAoKey>,
+}
+
+impl TcpListen {
+    fn validate(&self) -> HammerResult<()> {
+        if self.md5_password.is_some() && !self.ao_keys.is_empty() {
+            return Err(HammerError::config_validation(
+                "network.tcp.listen md5_password and ao_keys are mutually exclusive",
+            ));
+        }
+        for key in &self.ao_keys {
+            key.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TcpAoKey {
+    pub key_id: u8,
+    pub rnext_key_id: u8,
+    pub key: String,
+}
+
+impl TcpAoKey {
+    fn validate(&self) -> HammerResult<()> {
+        if self.key.is_empty() {
+            return Err(HammerError::config_validation(
+                "network.tcp.listen.ao_keys.key must be non-empty",
+            ));
+        }
         Ok(())
     }
 }
@@ -411,7 +485,11 @@ pub struct Session {
     pub attach_socket_path: Option<String>,
     #[serde(with = "humantime_serde")]
     pub timer_tick: Duration,
+    /// VPP `session { preallocated-sessions }` alias: `preallocated_sessions`.
+    #[serde(alias = "preallocated_sessions")]
     pub pool_capacity: usize,
+    /// VPP `session { event-queue-length }` alias: `event_queue_length`.
+    #[serde(alias = "event_queue_length")]
     pub ready_queue_capacity: usize,
     pub app_session_capacity: usize,
     pub ooo_capacity: usize,
@@ -549,6 +627,9 @@ mod tests {
         let network = Network::default();
         assert_eq!(network.tcp.mss, TCP_MSS);
         assert_eq!(network.tcp.receive_window, TCP_WINDOW);
+        assert!(network.tcp.nagle);
+        assert!(network.tcp.pmtu.enabled);
+        assert!(network.tcp.listen.is_empty());
         assert_eq!(network.tcp.retransmit.initial, TCP_INITIAL_RTO);
         assert_eq!(network.tcp.retransmit.min, TCP_MIN_RTO);
         assert_eq!(network.tcp.retransmit.max, TCP_MAX_RTO);
