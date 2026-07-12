@@ -246,3 +246,435 @@ where
     }
     Ok(())
 }
+
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use hammer_core::data_plane::{BufferFrame, NodeId};
+    use hammer_core::error::CoreResult;
+    use hammer_core::protocol::tcp::{TcpCapabilities, TcpConnectionId, TcpSegmentFlags};
+    use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
+    use hammer_infra::pool::Index as PoolIndex;
+    use hammer_infra::segment::Local;
+    use hammer_runtime::{
+        DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeProcessFn, NodeResult,
+        NodeRuntimeData,
+    };
+
+    use super::*;
+    use crate::data_plane::DropNode;
+    use crate::net::NetworkOpaque;
+    use crate::session::runtime::SessionDriverRuntime;
+    use crate::session::{SessionId, SessionQueueHandle};
+    use crate::transport::congestion::BbrController;
+    use crate::transport::tcp::output::{TcpOutputNext, TcpOutputNode};
+    use crate::transport::tcp::tcp_control_cursor;
+    use crate::transport::tcp::{
+        TCP_FLAG_ACK, TcpConnection, TcpInputNext, TcpState, TcpWorker,
+        publish_tcp_connection, write_session_route_opaque,
+    };
+
+    const LOCAL_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
+    const REMOTE_IP: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 20);
+    const LOCAL_PORT: u16 = 443;
+    const REMOTE_PORT: u16 = 50_001;
+
+    #[derive(Default)]
+    struct CaptureState {
+        packets: std::vec::Vec<std::vec::Vec<u8>>,
+    }
+
+    struct CaptureNode {
+        runtime_data: NodeRuntimeData,
+    }
+
+    impl CaptureNode {
+        fn new(state: Arc<Mutex<CaptureState>>) -> Self {
+            let mut states = capture_states().lock().expect("capture registry");
+            let slot = states.len();
+            states.push(state);
+            Self {
+                runtime_data: NodeRuntimeData::from_usize(slot).expect("capture slot"),
+            }
+        }
+    }
+
+    impl Node for CaptureNode {
+        fn process(&mut self, _: &DataPlaneRuntime, _: &mut BufferFrame) -> NodeResult {
+            NodeResult::drop()
+        }
+
+        fn node_process(&self) -> NodeProcessFn {
+            capture_process
+        }
+
+        fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+            Ok(self.runtime_data)
+        }
+    }
+
+    impl InternalNode for CaptureNode {}
+
+    fn capture_states() -> &'static Mutex<std::vec::Vec<Arc<Mutex<CaptureState>>>> {
+        static STATES: OnceLock<Mutex<std::vec::Vec<Arc<Mutex<CaptureState>>>>> = OnceLock::new();
+        STATES.get_or_init(|| Mutex::new(std::vec::Vec::new()))
+    }
+
+    fn capture_process(
+        runtime: &DataPlaneRuntime,
+        data: NodeRuntimeData,
+        frame: &mut BufferFrame,
+    ) -> NodeResult {
+        let state = match capture_states().lock() {
+            Ok(states) => {
+                let slot = match data.usize_word(0) {
+                    Ok(slot) => slot,
+                    Err(_) => return NodeResult::drop(),
+                };
+                match states.get(slot) {
+                    Some(state) => Arc::clone(state),
+                    None => return NodeResult::drop(),
+                }
+            }
+            Err(_) => return NodeResult::drop(),
+        };
+        for &index in frame.pending_indices() {
+            let packet = match runtime.get_buffer(index) {
+                Ok(buffer) => buffer.current().to_vec(),
+                Err(_) => continue,
+            };
+            match state.lock() {
+                Ok(mut state) => state.packets.push(packet),
+                Err(_) => continue,
+            }
+        }
+        NodeResult::drop()
+    }
+
+    fn local_addr() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(LOCAL_IP), LOCAL_PORT)
+    }
+
+    fn remote_addr() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(REMOTE_IP), REMOTE_PORT)
+    }
+
+    fn install_rcv_runtime(
+        runtime: &DataPlaneRuntime,
+    ) -> (
+        NodeId,
+        SessionQueueHandle<SessionDriverRuntime<(TcpWorker<BbrController>, ()), Local, PoolIndex>>,
+        Arc<Mutex<CaptureState>>,
+        Arc<Mutex<CaptureState>>,
+    ) {
+        let worker = DataWorkerId::new(0);
+        let driver = SessionDriverRuntime::new(
+            worker,
+            runtime.buffers().clone(),
+            (TcpWorker::<BbrController>::new(worker), ()),
+        );
+        let handle = crate::session::node::register_session_queue(driver).expect("register queue");
+        let output_state = Arc::new(Mutex::new(CaptureState::default()));
+        let drop_state = Arc::new(Mutex::new(CaptureState::default()));
+        let capture = runtime
+            .nodes()
+            .register_internal(CaptureNode::new(Arc::clone(&output_state)));
+        let drop_capture = runtime
+            .nodes()
+            .register_internal(CaptureNode::new(Arc::clone(&drop_state)));
+        let drop = runtime.nodes().register_internal(DropNode::new());
+        let output = runtime
+            .nodes()
+            .register_internal(TcpOutputNode::new(TcpOutputNext::nodes(drop, capture)));
+        let rcv = runtime.nodes().register_internal(TcpRcvProcessNode::new(
+            handle,
+            TcpRcvProcessNext::nodes(output, drop_capture),
+        ));
+        (rcv, handle, output_state, drop_state)
+    }
+
+    fn open_fin_wait1_session(
+        handle: SessionQueueHandle<
+            SessionDriverRuntime<(TcpWorker<BbrController>, ()), Local, PoolIndex>,
+        >,
+    ) -> (SessionId, u32, u32) {
+        let mut queue = handle.borrow_mut().expect("tcp queue");
+        let session_id = queue
+            .insert_session_with_id(|session_id| {
+                TcpConnection::established_with_sack_for_test(
+                    Some(TcpConnectionId::new(session_id.get())),
+                    DataWorkerId::new(0),
+                    LOCAL_PORT,
+                    Some(local_addr()),
+                    remote_addr(),
+                )
+            })
+            .expect("insert established");
+        {
+            let (_, connection_index) = queue
+                .sessions()
+                .session_transport(session_id)
+                .expect("transport");
+            let worker = &mut queue.transports_mut().0;
+            let TcpWorker {
+                connections,
+                timers,
+                ..
+            } = worker;
+            let connection = connections.get_mut(connection_index).expect("connection");
+            connection.on_session_close(connection_index, timers);
+            assert_eq!(connection.state(), TcpState::FinWait1);
+        }
+        publish_tcp_connection(&mut queue, session_id).expect("publish");
+        let connection = queue.session(session_id).expect("session");
+        (session_id, connection.rcv_nxt(), connection.snd_nxt())
+    }
+
+    fn send_to_rcv(
+        runtime: &DataPlaneRuntime,
+        rcv: NodeId,
+        session_id: Option<SessionId>,
+        packet: std::vec::Vec<u8>,
+    ) {
+        let mut frame = runtime.buffers().get_next_frame(rcv).expect("frame");
+        let buffer = runtime.alloc_index_with_bytes(&packet).expect("packet");
+        let cursor = tcp_control_cursor(&packet).expect("cursor");
+        let mut data_buffer = runtime.get_buffer_mut(buffer).expect("buffer mut");
+        let network =
+            unsafe { std::mem::transmute::<_, &mut NetworkOpaque>(data_buffer.opaque_mut()) };
+        network.set_packet_cursor(cursor);
+        let ip_version = (packet[0] >> 4) as u8;
+        network.ip_mut().set_ip_version(Some(ip_version));
+        network.ip_mut().set_ip_protocol(Some(6));
+        if let Some(session_id) = session_id {
+            write_session_route_opaque(
+                data_buffer.opaque2_mut(),
+                session_id,
+                DataWorkerId::new(0),
+                TcpInputNext::RcvProcess,
+            );
+        }
+        drop(data_buffer);
+        frame.push_index(buffer).expect("push packet");
+        runtime.put_next_frame(frame).expect("put next frame");
+    }
+
+    fn tcp_ipv4_packet(
+        local: SocketAddr,
+        remote: SocketAddr,
+        header: hammer_core::protocol::tcp::TcpSegmentHeader<'_>,
+        payload: &[u8],
+    ) -> Result<std::vec::Vec<u8>, hammer_core::protocol::tcp::TcpError> {
+        let mut tcp = [0u8; 60];
+        let tcp_header_len =
+            hammer_core::protocol::tcp::write_tcp_segment_header(&mut tcp, header, None)?;
+        let tcp_len = tcp_header_len
+            .checked_add(payload.len())
+            .ok_or(hammer_core::protocol::tcp::TcpError::Dispatch)?;
+        let (IpAddr::V4(local_ip), IpAddr::V4(remote_ip)) = (local.ip(), remote.ip()) else {
+            return Err(hammer_core::protocol::tcp::TcpError::SegmentInvalid);
+        };
+        let packet_len = 20usize
+            .checked_add(tcp_len)
+            .ok_or(hammer_core::protocol::tcp::TcpError::Dispatch)?;
+        let total_len =
+            u16::try_from(packet_len).map_err(|_| hammer_core::protocol::tcp::TcpError::Length)?;
+        let mut packet = std::vec![0u8; packet_len];
+        packet[0] = 0x45;
+        packet[2] = (total_len >> 8) as u8;
+        packet[3] = total_len as u8;
+        packet[8] = 64;
+        packet[9] = 6;
+        packet[12..16].copy_from_slice(&local_ip.octets());
+        packet[16..20].copy_from_slice(&remote_ip.octets());
+        packet[20..20 + tcp_header_len].copy_from_slice(&tcp[..tcp_header_len]);
+        if !payload.is_empty() {
+            packet[20 + tcp_header_len..].copy_from_slice(payload);
+        }
+        let tcp_len_bytes = [(tcp_len as u16 >> 8) as u8, tcp_len as u8];
+        let tcp_checksum = internet_checksum_parts(&[
+            &local_ip.octets(),
+            &remote_ip.octets(),
+            &[0, 6],
+            &tcp_len_bytes,
+            &packet[20..],
+        ]);
+        packet[36] = (tcp_checksum >> 8) as u8;
+        packet[37] = tcp_checksum as u8;
+        let ip_checksum = internet_checksum(&packet[..20]);
+        packet[10] = (ip_checksum >> 8) as u8;
+        packet[11] = ip_checksum as u8;
+        Ok(packet)
+    }
+
+    fn control_packet(sequence: u32, acknowledgment: u32, flags: TcpSegmentFlags) -> std::vec::Vec<u8> {
+        tcp_ipv4_packet(
+            remote_addr(),
+            local_addr(),
+            hammer_core::protocol::tcp::TcpSegmentHeader {
+                source_port: remote_addr().port(),
+                destination_port: local_addr().port(),
+                sequence_number: sequence,
+                acknowledgment_number: acknowledgment,
+                flags,
+                advertised_window: u16::MAX,
+                capabilities: TcpCapabilities::default(),
+                timestamp: None,
+                fast_open_cookie: None,
+            },
+            &[],
+        )
+        .expect("control packet")
+    }
+
+    fn tcp_flags(packet: &[u8]) -> u8 {
+        packet[13]
+    }
+
+    fn tcp_acknowledgment(packet: &[u8]) -> u32 {
+        u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]])
+    }
+
+    #[test]
+    fn finwait1_ack_of_local_fin_advances_to_finwait2() {
+        let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
+            buffers: hammer_core::data_plane::DataPlaneBufferConfig {
+                buffer_slot_capacity: 2048,
+                buffer_slots: 32,
+                frame_slots: 8,
+                ..hammer_core::data_plane::DataPlaneBufferConfig::default()
+            },
+        });
+        let (rcv, handle, output_state, drop_state) = install_rcv_runtime(&runtime);
+        let (session_id, rcv_nxt, snd_nxt) = open_fin_wait1_session(handle);
+
+        send_to_rcv(
+            &runtime,
+            rcv,
+            Some(session_id),
+            control_packet(rcv_nxt, snd_nxt, TcpSegmentFlags::ACK),
+        );
+        assert!(runtime.run_ready_nodes().expect("run rcv") >= 1);
+
+        let queue = handle.borrow_mut().expect("tcp queue");
+        let connection = queue.session(session_id).expect("session");
+        assert_eq!(connection.state(), TcpState::FinWait2);
+        assert!(drop_state.lock().expect("drop").packets.is_empty());
+        assert!(output_state.lock().expect("output").packets.is_empty());
+    }
+
+    #[test]
+    fn finwait1_remote_fin_emits_ack_through_tcp_output() {
+        let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
+            buffers: hammer_core::data_plane::DataPlaneBufferConfig {
+                buffer_slot_capacity: 2048,
+                buffer_slots: 32,
+                frame_slots: 8,
+                ..hammer_core::data_plane::DataPlaneBufferConfig::default()
+            },
+        });
+        let (rcv, handle, output_state, drop_state) = install_rcv_runtime(&runtime);
+        let (session_id, rcv_nxt, snd_una) = {
+            let mut queue = handle.borrow_mut().expect("tcp queue");
+            let session_id = queue
+                .insert_session_with_id(|session_id| {
+                    TcpConnection::established_with_sack_for_test(
+                        Some(TcpConnectionId::new(session_id.get())),
+                        DataWorkerId::new(0),
+                        LOCAL_PORT,
+                        Some(local_addr()),
+                        remote_addr(),
+                    )
+                })
+                .expect("insert");
+            {
+                let (_, connection_index) = queue
+                    .sessions()
+                    .session_transport(session_id)
+                    .expect("transport");
+                let worker = &mut queue.transports_mut().0;
+                let TcpWorker {
+                    connections,
+                    timers,
+                    ..
+                } = worker;
+                let connection = connections.get_mut(connection_index).expect("connection");
+                connection.on_session_close(connection_index, timers);
+                // Advance snd_nxt for the local FIN so a remote FIN that only
+                // ACKs snd_una enters Closing (simultaneous close), not TimeWait.
+                let _ = connection
+                    .on_tcp_ready(
+                        connection_index,
+                        timers,
+                        false,
+                        TcpCapabilities::default(),
+                        std::time::Instant::now(),
+                    )
+                    .expect("prepare fin")
+                    .expect("fin segment");
+            }
+            publish_tcp_connection(&mut queue, session_id).expect("publish");
+            let connection = queue.session(session_id).expect("session");
+            (session_id, connection.rcv_nxt(), connection.snd_una())
+        };
+
+        send_to_rcv(
+            &runtime,
+            rcv,
+            Some(session_id),
+            control_packet(
+                rcv_nxt,
+                snd_una,
+                TcpSegmentFlags::FIN | TcpSegmentFlags::ACK,
+            ),
+        );
+        for _ in 0..8 {
+            let _ = runtime.run_ready_nodes().expect("drain");
+            if !output_state.lock().expect("output").packets.is_empty() {
+                break;
+            }
+        }
+
+        {
+            let queue = handle.borrow_mut().expect("tcp queue");
+            let connection = queue.session(session_id).expect("session");
+            assert_eq!(connection.state(), TcpState::Closing);
+        }
+        assert!(drop_state.lock().expect("drop").packets.is_empty());
+        let packets = output_state.lock().expect("output");
+        assert_eq!(packets.packets.len(), 1, "FIN must produce ACK via tcp-output");
+        assert_eq!(tcp_flags(&packets.packets[0]) & TCP_FLAG_ACK, TCP_FLAG_ACK);
+        assert_eq!(tcp_acknowledgment(&packets.packets[0]), rcv_nxt + 1);
+    }
+
+    #[test]
+    fn missing_session_route_reaches_drop_next() {
+        let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
+            buffers: hammer_core::data_plane::DataPlaneBufferConfig {
+                buffer_slot_capacity: 2048,
+                buffer_slots: 16,
+                frame_slots: 8,
+                ..hammer_core::data_plane::DataPlaneBufferConfig::default()
+            },
+        });
+        let (rcv, handle, output_state, drop_state) = install_rcv_runtime(&runtime);
+        let (_, rcv_nxt, snd_nxt) = open_fin_wait1_session(handle);
+
+        send_to_rcv(
+            &runtime,
+            rcv,
+            None,
+            control_packet(rcv_nxt, snd_nxt, TcpSegmentFlags::ACK),
+        );
+        assert!(runtime.run_ready_nodes().expect("run rcv") >= 1);
+        if drop_state.lock().expect("drop").packets.is_empty() {
+            assert!(runtime.run_ready_nodes().expect("run drop") >= 1);
+        }
+
+        assert!(output_state.lock().expect("output").packets.is_empty());
+        assert_eq!(drop_state.lock().expect("drop").packets.len(), 1);
+    }
+}
