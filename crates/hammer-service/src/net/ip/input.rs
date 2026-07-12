@@ -90,12 +90,8 @@ where
 {
     #[inline(always)]
     fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
-        let next = match Self::runtime_nexts(runtime) {
-            Ok(next) => next,
-            Err(_) => return NodeResult::drop(),
-        };
         let feature_arc = self.feature_arc.as_ref().map(|arc| arc.start_handle());
-        ip_input_process_frame(runtime, frame, next, feature_arc.as_ref())
+        ip_input_process_frame(runtime, frame, feature_arc.as_ref())
     }
 
     #[inline]
@@ -120,10 +116,8 @@ where
 fn ip_input_process_frame(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
-    next: [NodeId; IpInputNext::COUNT],
     feature_arc: Option<&FeatureArcStartHandle>,
 ) -> NodeResult {
-    let _ = next; // static next table retained for NodeRegistration wiring
     let mut nexts = hammer_infra::vec::Vec::with_capacity(frame.len());
     let drop_slot = IpInputNext::Drop.slot() as u16;
     for index in frame.iter_indices() {
@@ -199,12 +193,8 @@ fn ip_input_process<A: FeatureArcSpec>(
         Ok(state) => state,
         Err(_) => return NodeResult::drop(),
     };
-    let next = match IpInputNode::<A>::runtime_nexts(runtime) {
-        Ok(next) => next,
-        Err(_) => return NodeResult::drop(),
-    };
     let feature_arc = state.feature_arc.as_ref();
-    ip_input_process_frame(runtime, frame, next, feature_arc)
+    ip_input_process_frame(runtime, frame, feature_arc)
 }
 
 #[inline(always)]

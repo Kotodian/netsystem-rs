@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use hammer_core::data_plane::{
-    NodeHandle, NodeId, NodeKind, NodeNext, NodeNextStorage, NodeRegistration, NodeState,
+    NodeHandle, NodeId, NodeKind, NodeNext, NodeRegistration, NodeState,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,17 +53,8 @@ fn core_data_plane_graph_identity_items_have_expected_behavior() {
     ));
 
     let nexts = [NodeId::new(3), NodeId::new(9)];
-    assert_eq!(
-        NodeNextStorage::next(&nexts, ExampleNext::Drop),
-        NodeId::new(3)
-    );
-    assert_eq!(
-        NodeNextStorage::next(&nexts, ExampleNext::Punt),
-        NodeId::new(9)
-    );
-
-    let direct = NodeId::new(11);
-    assert_eq!(NodeNextStorage::next(&direct, ()), NodeId::new(11));
+    assert_eq!(nexts[usize::from(NodeNext::slot(ExampleNext::Drop))], NodeId::new(3));
+    assert_eq!(nexts[usize::from(NodeNext::slot(ExampleNext::Punt))], NodeId::new(9));
 
     assert_eq!(NodeKind::Driver, NodeKind::Driver);
     assert_eq!(NodeKind::Internal, NodeKind::Internal);
@@ -122,7 +113,6 @@ const BANNED_IDENTITY_NAMES: &[&str] = &[
     "NodeState",
     "NodeRegistration",
     "NodeNext",
-    "NodeNextStorage",
 ];
 
 const BANNED_EXPLICIT_PATHS: &[&str] = &[
@@ -132,14 +122,12 @@ const BANNED_EXPLICIT_PATHS: &[&str] = &[
     "hammer_adapter::NodeState",
     "hammer_adapter::NodeRegistration",
     "hammer_adapter::NodeNext",
-    "hammer_adapter::NodeNextStorage",
     "hammer_adapter::node::NodeId",
     "hammer_adapter::node::NodeHandle",
     "hammer_adapter::node::NodeKind",
     "hammer_adapter::node::NodeState",
     "hammer_adapter::node::NodeRegistration",
     "hammer_adapter::node::NodeNext",
-    "hammer_adapter::node::NodeNextStorage",
 ];
 
 fn workspace_root() -> PathBuf {

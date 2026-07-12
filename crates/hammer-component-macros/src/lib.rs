@@ -692,13 +692,6 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
         constructor_inits.push(quote!(next));
         next_impl = quote! {
             pub const NODE_NEXT_COUNT: usize = #next::COUNT;
-
-            #[inline]
-            pub fn runtime_nexts(
-                runtime: &::hammer_runtime::DataPlaneRuntime,
-            ) -> ::hammer_core::error::CoreResult<[::hammer_core::data_plane::NodeId; #next::COUNT]> {
-                runtime.current_node_nexts::<{ #next::COUNT }>()
-            }
         };
     } else if let Some(sibling_of) = &args.sibling_of {
         let name_field: Field = parse_quote! {
@@ -708,15 +701,6 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
         constructor_inits.push(quote!(node_name: Self::NODE_NAME));
         next_impl = quote! {
             pub const NODE_NEXT_COUNT: usize = #sibling_of::NODE_NEXT_COUNT;
-
-            #[inline]
-            pub fn runtime_nexts(
-                runtime: &::hammer_runtime::DataPlaneRuntime,
-            ) -> ::hammer_core::error::CoreResult<
-                [::hammer_core::data_plane::NodeId; #sibling_of::NODE_NEXT_COUNT]
-            > {
-                runtime.current_node_nexts::<{ #sibling_of::NODE_NEXT_COUNT }>()
-            }
         };
     }
 

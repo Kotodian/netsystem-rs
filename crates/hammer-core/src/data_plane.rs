@@ -100,24 +100,3 @@ impl NodeNext for u16 {
         self
     }
 }
-
-pub trait NodeNextStorage<K> {
-    fn next(&self, key: K) -> NodeId;
-}
-
-impl<K, const N: usize> NodeNextStorage<K> for [NodeId; N]
-where
-    K: NodeNext,
-{
-    #[inline(always)]
-    fn next(&self, key: K) -> NodeId {
-        self[usize::from(key.slot())]
-    }
-}
-
-impl NodeNextStorage<()> for NodeId {
-    #[inline(always)]
-    fn next(&self, _key: ()) -> NodeId {
-        *self
-    }
-}

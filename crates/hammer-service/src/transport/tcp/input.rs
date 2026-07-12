@@ -11,7 +11,7 @@ use crate::trace::codec::{
 };
 use arc_swap::ArcSwap;
 use hammer_core::data_plane::{
-    BufferFrame, Index, BufferPacketCursor, NodeHandle, NodeId, NodeNextStorage,
+    BufferFrame, Index, BufferPacketCursor, NodeHandle, NodeId,
     SecondaryOpaque,
 };
 use hammer_core::error::{CoreError, CoreResult};
@@ -175,15 +175,10 @@ where
     #[inline(always)]
     fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
         let snapshot = self.snapshot.load();
-        let next = match Self::runtime_nexts(runtime) {
-            Ok(next) => next,
-            Err(_) => return NodeResult::drop(),
-        };
         tcp_input_process_frame(
             runtime,
             frame,
             &snapshot,
-            &next,
             self.handoff,
             self.handoff_worker,
             self.session_queue,
@@ -292,10 +287,6 @@ where
         Err(_) => return NodeResult::drop(),
     };
     let snapshot = state.snapshot.load();
-    let next = match TcpInputNode::<C, Seg>::runtime_nexts(runtime) {
-        Ok(next) => next,
-        Err(_) => return NodeResult::drop(),
-    };
     let session_queue = state
         .session_queue
         .map(SessionQueueHandle::<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>::new);
@@ -303,7 +294,6 @@ where
         runtime,
         frame,
         &snapshot,
-        &next,
         state.handoff,
         state.handoff_worker,
         session_queue,
@@ -314,7 +304,6 @@ fn tcp_input_process_frame<C, Seg>(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
     snapshot: &TcpLookupSnapshot,
-    next: &[NodeId; TcpInputNext::COUNT],
     handoff: Option<NodeHandle>,
     handoff_worker: Option<DataWorkerId>,
     session_queue: Option<
@@ -334,7 +323,6 @@ where
             runtime,
             index,
             snapshot,
-            next,
             handoff,
             handoff_worker,
             session_queue,
@@ -361,7 +349,6 @@ fn tcp_input_local_next_for_index<C, Seg>(
     runtime: &DataPlaneRuntime,
     index: Index,
     snapshot: &TcpLookupSnapshot,
-    next: &[NodeId; TcpInputNext::COUNT],
     handoff: Option<NodeHandle>,
     handoff_worker: Option<DataWorkerId>,
     session_queue: Option<
@@ -381,7 +368,6 @@ where
         index,
         parsed,
         snapshot,
-        next,
         handoff,
         handoff_worker,
         session_queue,
@@ -403,7 +389,6 @@ fn next_slot_for_index_with_runtime<C, Seg>(
     index: Index,
     parsed: Result<(IpVersion, IpProtocol, SocketAddr, SocketAddr, TcpInputFlags), TcpInputError>,
     snapshot: &TcpLookupSnapshot,
-    next: &[NodeId; TcpInputNext::COUNT],
     handoff: Option<NodeHandle>,
     handoff_worker: Option<DataWorkerId>,
     session_queue: Option<
@@ -450,7 +435,6 @@ where
         session_or_listener_pending_input_entry(session_queue, local, remote, flags)?;
     if let Some((session_id, owner, session_next)) = session_route {
         let slot = session_next.slot() as u16;
-        let resolved = NodeNextStorage::next(next, session_next);
         {
             let mut buffer = runtime.get_buffer_mut(index)?;
             buffer.clear_node_error();
@@ -458,8 +442,7 @@ where
             if let (Some(_), Some(current_worker)) = (handoff, handoff_worker)
                 && owner != current_worker
             {
-                // Handoff continuation keeps the destination NodeId; worker-local
-                // fanout never carries target identities on the packet path.
+                let resolved = runtime.current_node_next(session_next)?;
                 buffer.set_current_config(resolved);
                 unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }
                     .set_handoff_source_worker(Some(current_worker.slot() as u16));
