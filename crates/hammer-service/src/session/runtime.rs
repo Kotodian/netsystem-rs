@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crossbeam_utils::CachePadded;
-use hammer_core::data_plane::{Index, DataPlaneBuffers, Frame, Next};
+use hammer_core::data_plane::{BufferFrame, Index, DataPlaneBuffers, Frame, Next};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::fifo_queue::FifoQueue;
 use hammer_infra::msg_queue::{MsgQueue, SessionEvtType};
@@ -618,6 +618,7 @@ pub trait SessionTransport<Index, Seg: Segment>: Sized {
         sessions: &mut SessionWorker<Index, Seg>,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
+        frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> CoreResult<()>;
@@ -628,6 +629,7 @@ pub trait SessionTransport<Index, Seg: Segment>: Sized {
         index: Index,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
+        frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> CoreResult<()>;
@@ -640,6 +642,7 @@ pub trait SessionPacketizedTransport<Index, Seg: Segment>: SessionTransport<Inde
         index: Index,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
+        frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> CoreResult<()>;
@@ -668,6 +671,7 @@ pub trait TransportInternalTransport<Index, Seg: Segment>: SessionTransport<Inde
         index: Index,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
+        frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> CoreResult<()>;
@@ -684,6 +688,7 @@ where
         session_id: SessionId,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
+        frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> CoreResult<()>;
@@ -706,10 +711,11 @@ where
         session_id: SessionId,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
+        frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> CoreResult<()> {
-        transport.control_tx(sessions, index, runtime, output_next, output, now)?;
+        transport.control_tx(sessions, index, runtime, output_next, frame, output, now)?;
         let Some(total_len) = sessions.app.pending_send_len(session_id)? else {
             return Ok(());
         };
@@ -721,14 +727,17 @@ where
         }
         let mut batch_offset = params.tx_offset;
         let mut remaining_space = params.snd_space;
-        if batch_offset < total_len && remaining_space != 0 && params.send_goal_size != 0 {
-            let mut frame: Frame<Next> = sessions.buffers.get_next_frame(output_next.node())?;
-            let batch_capacity = frame.remaining_capacity().min(DEFAULT_TX_DISPATCH_BUDGET);
-            let mut batch = hammer_infra::vec::Vec::with_capacity(batch_capacity);
-            while batch.len() < DEFAULT_TX_DISPATCH_BUDGET
-                && frame.remaining_capacity() != 0
-                && remaining_space != 0
-            {
+        let io_budget = output
+            .remaining_io_budget()
+            .min(DEFAULT_TX_DISPATCH_BUDGET)
+            .min(frame.remaining_capacity());
+        if batch_offset < total_len
+            && remaining_space != 0
+            && params.send_goal_size != 0
+            && io_budget != 0
+        {
+            let mut batch = hammer_infra::vec::Vec::with_capacity(io_budget);
+            while batch.len() < io_budget && remaining_space != 0 {
                 let pending_len = total_len.saturating_sub(batch_offset);
                 if pending_len == 0 {
                     break;
@@ -738,7 +747,6 @@ where
                     break;
                 }
                 let buffer = sessions.buffers.alloc_index()?;
-                frame.push_index(buffer)?;
                 sessions
                     .app
                     .copy_tx_to_buffer(session_id, batch_offset, payload_len, buffer)?;
@@ -751,7 +759,12 @@ where
                 remaining_space -= payload_len;
             }
             transport.tx_action(sessions, index, batch.as_slice(), now)?;
-            output.enqueue_frame(runtime, frame)?;
+            for item in batch.as_slice() {
+                if !output.try_enqueue_io(frame, output_next, item.index)? {
+                    sessions.mark_ready(session_id);
+                    break;
+                }
+            }
         }
         let pending_len = total_len.saturating_sub(batch_offset);
         let descheduled = params.flags.contains(TransportSendFlags::DESCHED)
@@ -777,10 +790,11 @@ where
         _: SessionId,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
+        frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> CoreResult<()> {
-        transport.internal_tx(sessions, index, runtime, output_next, output, now)
+        transport.internal_tx(sessions, index, runtime, output_next, frame, output, now)
     }
 }
 
@@ -790,6 +804,7 @@ pub trait SessionTransports<Index, Seg: Segment> {
         sessions: &mut SessionWorker<Index, Seg>,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
+        frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> CoreResult<()>;
@@ -801,6 +816,7 @@ pub trait SessionTransports<Index, Seg: Segment> {
         index: Index,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
+        frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> CoreResult<()>;
@@ -813,6 +829,7 @@ pub trait SessionTransports<Index, Seg: Segment> {
         session_id: SessionId,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
+        frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> CoreResult<()>;
@@ -824,6 +841,7 @@ impl<Index, Seg: Segment> SessionTransports<Index, Seg> for () {
         _: &mut SessionWorker<Index, Seg>,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
+        _: &mut BufferFrame,
         _: &mut crate::session::node::SessionQueueOutput,
         _: Instant,
     ) -> CoreResult<()> {
@@ -837,6 +855,7 @@ impl<Index, Seg: Segment> SessionTransports<Index, Seg> for () {
         _: Index,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
+        _: &mut BufferFrame,
         _: &mut crate::session::node::SessionQueueOutput,
         _: Instant,
     ) -> CoreResult<()> {
@@ -851,6 +870,7 @@ impl<Index, Seg: Segment> SessionTransports<Index, Seg> for () {
         _: SessionId,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
+        _: &mut BufferFrame,
         _: &mut crate::session::node::SessionQueueOutput,
         _: Instant,
     ) -> CoreResult<()> {
@@ -870,13 +890,14 @@ where
         sessions: &mut SessionWorker<Index, Seg>,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
+        frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> CoreResult<()> {
         self.0
-            .update_time(sessions, runtime, output_next, output, now)?;
+            .update_time(sessions, runtime, output_next, frame, output, now)?;
         self.1
-            .update_time(sessions, runtime, output_next, output, now)
+            .update_time(sessions, runtime, output_next, frame, output, now)
     }
 
     fn disconnect(
@@ -886,16 +907,17 @@ where
         index: Index,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
+        frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> CoreResult<()> {
         if id == Head::ID {
             return self
                 .0
-                .disconnect(sessions, index, runtime, output_next, output, now);
+                .disconnect(sessions, index, runtime, output_next, frame, output, now);
         }
         self.1
-            .disconnect(id, sessions, index, runtime, output_next, output, now)
+            .disconnect(id, sessions, index, runtime, output_next, frame, output, now)
     }
 
     fn ready(
@@ -906,6 +928,7 @@ where
         session_id: SessionId,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
+        frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> CoreResult<()> {
@@ -917,6 +940,7 @@ where
                 session_id,
                 runtime,
                 output_next,
+                frame,
                 output,
                 now,
             );
@@ -928,6 +952,7 @@ where
             session_id,
             runtime,
             output_next,
+            frame,
             output,
             now,
         )
@@ -937,6 +962,7 @@ where
 #[cfg(test)]
 pub fn dispatch_session_queue_once<T, Seg, Index>(
     runtime: &DataPlaneRuntime,
+    owner: hammer_core::data_plane::NodeId,
     driver: &mut SessionDriverRuntime<T, Seg, Index>,
     output_next: SessionQueueNext,
 ) -> CoreResult<SessionQueueStep>
@@ -947,9 +973,11 @@ where
     SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let now = Instant::now();
+    let mut staging = BufferFrame::with_capacity(hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY);
     let mut output = crate::session::node::SessionQueueOutput::default();
-    let step = dispatch_session_queue_pending(runtime, driver, output_next, &mut output, now)?;
-    output.schedule(runtime)?;
+    let step =
+        dispatch_session_queue_pending(runtime, driver, output_next, &mut staging, &mut output, now)?;
+    runtime.with_current_node(owner, || output.flush(runtime, &mut staging));
     Ok(step)
 }
 
@@ -958,6 +986,7 @@ pub(crate) fn dispatch_registered_session_queue_once_at<T, Seg, Index>(
     data: NodeRuntimeData,
     output_next: SessionQueueNext,
     now: Instant,
+    frame: &mut BufferFrame,
     output: &mut crate::session::node::SessionQueueOutput,
 ) -> CoreResult<()>
 where
@@ -968,7 +997,7 @@ where
 {
     let mut driver =
         SessionQueueHandle::<SessionDriverRuntime<T, Seg, Index>>::new(data).borrow_mut()?;
-    dispatch_session_queue_pending(runtime, &mut driver, output_next, output, now)?;
+    dispatch_session_queue_pending(runtime, &mut driver, output_next, frame, output, now)?;
     Ok(())
 }
 
@@ -976,6 +1005,7 @@ pub fn dispatch_session_queue_pending<T, Seg, Index>(
     runtime: &DataPlaneRuntime,
     driver: &mut SessionDriverRuntime<T, Seg, Index>,
     output_next: SessionQueueNext,
+    frame: &mut BufferFrame,
     output: &mut crate::session::node::SessionQueueOutput,
     now: Instant,
 ) -> CoreResult<SessionQueueStep>
@@ -989,7 +1019,7 @@ where
         sessions,
         transports,
     } = driver;
-    transports.update_time(sessions, runtime, output_next, output, now)?;
+    transports.update_time(sessions, runtime, output_next, frame, output, now)?;
     sessions.poll_app()?;
 
     let control_count = sessions.control_events.len();
@@ -1007,6 +1037,7 @@ where
                 index,
                 runtime,
                 output_next,
+                frame,
                 output,
                 now,
             )?;
@@ -1026,6 +1057,7 @@ where
             *session_id,
             runtime,
             output_next,
+            frame,
             output,
             now,
         )?;

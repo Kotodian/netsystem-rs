@@ -3,13 +3,17 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::time::Instant;
 
-use hammer_core::data_plane::{BufferFrame, Index, Frame, Next, NodeId, NodeRegistration};
+use hammer_core::data_plane::{BufferFrame, Index, NodeId, NodeRegistration};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_runtime::{
     DataPlaneRuntime, DriverNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
 };
 
 use crate::session::SessionQueueError;
+
+/// Shared Session Queue IO allowance for normal and custom TX in one dispatch.
+pub const SESSION_QUEUE_IO_BUDGET: usize = 128;
+
 #[derive(PartialEq, Eq)]
 pub struct SessionQueueHandle<Q> {
     runtime_data: NodeRuntimeData,
@@ -59,20 +63,19 @@ impl<Q> fmt::Debug for SessionQueueHandle<Q> {
     }
 }
 
+/// Current-node-local next slot for Session Queue generated output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SessionQueueNext(NodeId);
+pub struct SessionQueueNext(u16);
 
 impl SessionQueueNext {
     #[inline]
-    pub const fn node(self) -> NodeId {
-        self.0
+    pub const fn from_slot(slot: u16) -> Self {
+        Self(slot)
     }
-}
 
-impl From<NodeId> for SessionQueueNext {
     #[inline]
-    fn from(node: NodeId) -> Self {
-        Self(node)
+    pub const fn slot(self) -> u16 {
+        self.0
     }
 }
 
@@ -81,38 +84,71 @@ pub(crate) type SessionQueueDispatchFn = fn(
     NodeRuntimeData,
     SessionQueueNext,
     Instant,
+    &mut BufferFrame,
     &mut SessionQueueOutput,
 ) -> CoreResult<()>;
 
-#[derive(Default)]
-pub struct SessionQueueOutput;
+/// Accumulates Session Queue TX indexes on the driver Frame and records one
+/// local next per entry. Graph Fanout runs once at [`Self::flush`].
+pub struct SessionQueueOutput {
+    nexts: hammer_infra::vec::Vec<u16>,
+    io_count: usize,
+}
+
+impl Default for SessionQueueOutput {
+    #[inline]
+    fn default() -> Self {
+        Self::seeded(0)
+    }
+}
 
 impl SessionQueueOutput {
     #[inline]
-    pub fn enqueue(
+    pub fn seeded(pending_seed: usize) -> Self {
+        Self {
+            nexts: hammer_infra::vec::Vec::new(),
+            io_count: pending_seed.min(SESSION_QUEUE_IO_BUDGET),
+        }
+    }
+
+    #[inline]
+    pub fn remaining_io_budget(&self) -> usize {
+        SESSION_QUEUE_IO_BUDGET.saturating_sub(self.io_count)
+    }
+
+    #[inline]
+    pub fn io_count(&self) -> usize {
+        self.io_count
+    }
+
+    /// Enqueue one normal/custom IO index into the driver Frame.
+    ///
+    /// Returns `Ok(false)` when the shared IO budget is exhausted; the caller
+    /// keeps ownership of `index` and should leave unserved work pending.
+    #[inline]
+    pub fn try_enqueue_io(
         &mut self,
-        runtime: &DataPlaneRuntime,
-        node: NodeId,
+        frame: &mut BufferFrame,
+        next: SessionQueueNext,
         index: Index,
-    ) -> CoreResult<()> {
-        let mut frame = runtime.buffers().get_next_frame(node)?;
+    ) -> CoreResult<bool> {
+        if self.io_count >= SESSION_QUEUE_IO_BUDGET {
+            return Ok(false);
+        }
         frame.push_index(index)?;
-        runtime.put_next_frame(frame)
+        self.nexts.push(next.slot());
+        self.io_count += 1;
+        Ok(true)
     }
 
+    /// One Graph Fanout flush for every index recorded on `frame` this dispatch.
     #[inline]
-    pub fn enqueue_frame(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: Frame<Next>,
-    ) -> CoreResult<()> {
-        runtime.put_next_frame(frame)
-    }
-
-    #[inline]
-    pub fn schedule(self, runtime: &DataPlaneRuntime) -> CoreResult<()> {
-        let _ = runtime;
-        Ok(())
+    pub fn flush(self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) {
+        debug_assert_eq!(frame.len(), self.nexts.len());
+        if self.nexts.is_empty() {
+            return;
+        }
+        runtime.enqueue_to_next(frame, self.nexts.as_slice());
     }
 }
 
@@ -138,6 +174,7 @@ thread_local! {
     static SESSION_QUEUE_NODES: RefCell<hammer_infra::vec::Vec<hammer_infra::vec::Vec<SessionQueueAttachment>>> =
         const { RefCell::new(hammer_infra::vec::Vec::new()) };
     static SESSION_QUEUE_NODE_RUNTIME_DATA: Cell<Option<NodeRuntimeData>> = const { Cell::new(None) };
+    static SESSION_QUEUE_NODE_ID: Cell<Option<NodeId>> = const { Cell::new(None) };
 }
 
 pub fn register_session_queue_node(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
@@ -145,6 +182,7 @@ pub fn register_session_queue_node(runtime: &DataPlaneRuntime, _: usize) -> Core
     let runtime_data = node.runtime_data;
     let id = runtime.nodes().try_register_driver(node)?;
     SESSION_QUEUE_NODE_RUNTIME_DATA.with(|data| data.set(Some(runtime_data)));
+    SESSION_QUEUE_NODE_ID.with(|data| data.set(Some(id)));
     Ok(id)
 }
 
@@ -160,18 +198,22 @@ impl SessionQueueNode {
     }
 
     pub(crate) fn attach_queue_by_runtime_data<Q>(
+        runtime: &DataPlaneRuntime,
+        consumer: NodeId,
         runtime_data: NodeRuntimeData,
         handle: SessionQueueHandle<Q>,
-        output_next: SessionQueueNext,
+        output_node: NodeId,
         dispatch: SessionQueueDispatchFn,
     ) -> CoreResult<()> {
-        let slot = runtime_data.usize_word(0)?;
+        let slot = runtime.nodes().add_node_next_slot(consumer, output_node)?;
+        let output_next = SessionQueueNext::from_slot(slot);
+        let attachment_slot = runtime_data.usize_word(0)?;
         SESSION_QUEUE_NODES.with(|nodes| {
             let mut nodes = nodes
                 .try_borrow_mut()
                 .map_err(|_| CoreError::internal("session queue nodes borrowed"))?;
             let node = nodes
-                .get_mut(slot)
+                .get_mut(attachment_slot)
                 .ok_or_else(|| CoreError::internal("session queue node slot is invalid"))?;
             node.push(SessionQueueAttachment {
                 runtime_data: handle.runtime_data(),
@@ -184,6 +226,12 @@ impl SessionQueueNode {
 
     pub(crate) fn registered_runtime_data() -> CoreResult<NodeRuntimeData> {
         SESSION_QUEUE_NODE_RUNTIME_DATA
+            .with(|data| data.get())
+            .ok_or_else(|| CoreError::internal("session queue node not registered"))
+    }
+
+    pub(crate) fn registered_node_id() -> CoreResult<NodeId> {
+        SESSION_QUEUE_NODE_ID
             .with(|data| data.get())
             .ok_or_else(|| CoreError::internal("session queue node not registered"))
     }
@@ -218,7 +266,7 @@ impl DriverNode for SessionQueueNode {
 fn session_queue_node_process(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
-    _: &mut BufferFrame,
+    frame: &mut BufferFrame,
 ) -> NodeResult {
     let slot = match data.usize_word(0) {
         Ok(slot) => slot,
@@ -238,6 +286,7 @@ fn session_queue_node_process(
             attachment.runtime_data,
             attachment.output_next,
             now,
+            frame,
             &mut output,
         )
         .map_err(CoreError::from)
@@ -248,12 +297,12 @@ fn session_queue_node_process(
         .and_then(|_| Ok(()))
         .is_err()
         {
-            let _ = output.schedule(runtime);
+            output.flush(runtime, frame);
             return NodeResult::drop();
         }
         index += 1;
     }
-    let _ = output.schedule(runtime);
+    output.flush(runtime, frame);
     NodeResult::drop()
 }
 

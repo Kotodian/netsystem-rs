@@ -3369,7 +3369,7 @@ macro_rules! rewrite_ladder {
 
 impl BufferFrame {
     #[inline]
-    fn with_capacity(capacity: usize) -> Self {
+    pub fn with_capacity(capacity: usize) -> Self {
         assert!(capacity > 0, "frame capacity must be non-zero");
         Self {
             indices: Vec::with_capacity(capacity),

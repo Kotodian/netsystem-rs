@@ -118,6 +118,7 @@ where
         index: Index,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
+        frame: &mut hammer_core::data_plane::BufferFrame,
         output: &mut SessionQueueOutput,
         now: Instant,
     ) -> CoreResult<()>
@@ -144,7 +145,7 @@ where
         };
         if let Some(segment) = segment {
             if segment.payload_len() == 0 {
-                enqueue_tcp_segment(runtime, output_next, output, segment)?;
+                enqueue_tcp_segment(runtime, frame, output_next, output, segment)?;
             } else {
                 sessions.mark_ready(session_id);
             }
@@ -173,6 +174,7 @@ where
         sessions: &mut SessionWorker<Index, Seg>,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
+        frame: &mut hammer_core::data_plane::BufferFrame,
         output: &mut SessionQueueOutput,
         now: Instant,
     ) -> CoreResult<()> {
@@ -202,7 +204,7 @@ where
             };
             if let Some(segment) = segment {
                 if segment.payload_len() == 0 {
-                    enqueue_tcp_segment(runtime, output_next, output, segment)?;
+                    enqueue_tcp_segment(runtime, frame, output_next, output, segment)?;
                 } else {
                     sessions.mark_ready(session_id);
                 }
@@ -227,6 +229,7 @@ where
         index: Index,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
+        frame: &mut hammer_core::data_plane::BufferFrame,
         output: &mut SessionQueueOutput,
         now: Instant,
     ) -> CoreResult<()> {
@@ -237,7 +240,7 @@ where
                 .ok_or(TcpNodeError::SessionMissing)?;
             connection.on_session_close(index, &mut self.timers);
         }
-        self.control_output(sessions, index, runtime, output_next, output, now)
+        self.control_output(sessions, index, runtime, output_next, frame, output, now)
     }
 }
 
@@ -254,10 +257,11 @@ where
         index: Index,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
+        frame: &mut hammer_core::data_plane::BufferFrame,
         output: &mut SessionQueueOutput,
         now: Instant,
     ) -> CoreResult<()> {
-        self.control_output(sessions, index, runtime, output_next, output, now)
+        self.control_output(sessions, index, runtime, output_next, frame, output, now)
     }
 
     fn send_params(

@@ -59,9 +59,11 @@ fn attach_driver_to_node(
     let runtime_data = SessionQueueNode::registered_runtime_data().expect("session queue data");
     let handle = register_session_queue(driver).expect("session queue handle");
     SessionQueueNode::attach_queue_by_runtime_data(
+        runtime,
+        node,
         runtime_data,
         handle,
-        output.into(),
+        output,
         dispatch_registered_session_queue_once_at::<(TcpWorker<BbrController>, ()), Local, Index>,
     )
     .expect("attach session queue");

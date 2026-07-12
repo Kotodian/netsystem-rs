@@ -222,9 +222,11 @@ where
         &TcpSynSentNext::NEXT_NAMES,
     )?;
     SessionQueueNode::attach_queue_by_runtime_data(
+        runtime,
+        session_queue,
         SessionQueueNode::registered_runtime_data()?,
         queue,
-        tcp_output.into(),
+        tcp_output,
         dispatch_registered_session_queue_once_at::<(TcpWorker<C>, ()), Seg, PoolIndex>,
     )?;
     runtime
@@ -497,15 +499,17 @@ pub fn tcp_control_cursor(packet: &[u8]) -> Result<BufferPacketCursor, TcpContro
 
 fn enqueue_tcp_segment(
     runtime: &DataPlaneRuntime,
+    frame: &mut hammer_core::data_plane::BufferFrame,
     output_next: SessionQueueNext,
     output: &mut SessionQueueOutput,
     segment: TcpSegment,
 ) -> CoreResult<()> {
-    let mut owner = runtime.buffers().get_next_frame(output_next.node())?;
+    if output.remaining_io_budget() == 0 {
+        return Ok(());
+    }
     let index = runtime.buffers().alloc_index()?;
-    owner.push_index(index)?;
     segment.write_to_buffer(runtime.buffers(), index)?;
-    output.enqueue_frame(runtime, owner)?;
+    let _ = output.try_enqueue_io(frame, output_next, index)?;
     Ok(())
 }
 
@@ -682,6 +686,24 @@ mod legacy_tests {
         dispatch_session_queue_once, dispatch_session_queue_pending,
     };
     use crate::transport::congestion::BbrController;
+
+
+    fn session_queue_output_next(
+        runtime: &DataPlaneRuntime,
+        output_node: NodeId,
+    ) -> (NodeId, crate::session::SessionQueueNext) {
+        let node = SessionQueueNode::new().expect("session queue node");
+        let owner = runtime
+            .nodes()
+            .try_register_driver(node)
+            .expect("register session queue");
+        let slot = runtime
+            .nodes()
+            .add_node_next_slot(owner, output_node)
+            .expect("session queue output next");
+        (owner, crate::session::SessionQueueNext::from_slot(slot))
+    }
+
 
     fn install_transport_backend(backend: hammer_core::config::SessionBackend) {
         crate::transport::TRANSPORT_MAIN.store(Some(Arc::new(
@@ -965,12 +987,16 @@ mod legacy_tests {
         elapsed: Duration,
         output_node: NodeId,
     ) {
-        let next: crate::session::SessionQueueNext = output_node.into();
+        let (owner, next) = session_queue_output_next(runtime, output_node);
         let now = Instant::now() + elapsed;
-        let mut output = SessionQueueOutput;
-        let _ = dispatch_session_queue_pending(runtime, driver, next, &mut output, now)
+        let mut staging =
+            hammer_core::data_plane::BufferFrame::with_capacity(
+                hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY,
+            );
+        let mut output = SessionQueueOutput::default();
+        let _ = dispatch_session_queue_pending(runtime, driver, next, &mut staging, &mut output, now)
             .expect("dispatch TCP timer update");
-        output.schedule(runtime).expect("schedule TCP timer output");
+        runtime.with_current_node(owner, || output.flush(runtime, &mut staging));
         let _ = runtime.run_ready_nodes().expect("run timer output");
     }
 
@@ -1010,8 +1036,8 @@ mod legacy_tests {
         publish_tcp_connection(&mut driver, session_id).expect("refresh session route");
 
         driver.schedule_disconnect_for_test(session_id);
-        let output_next: crate::session::SessionQueueNext = output_node.into();
-        let dispatched = dispatch_session_queue_once(&runtime, &mut driver, output_next)
+        let (owner, output_next) = session_queue_output_next(&runtime, output_node);
+        let dispatched = dispatch_session_queue_once(&runtime, owner, &mut driver, output_next)
             .expect("dispatch control tx");
         let _ = runtime.run_ready_nodes().expect("run tcp output");
 
@@ -1068,9 +1094,9 @@ mod legacy_tests {
 
         let initial_snd_nxt = driver.session(session_id).expect("connection").snd_nxt();
 
-        let next: crate::session::SessionQueueNext = output_node.into();
+        let (owner, next) = session_queue_output_next(&runtime, output_node);
         let dispatched =
-            dispatch_session_queue_once(&runtime, &mut driver, next).expect("dispatch tx");
+            dispatch_session_queue_once(&runtime, owner, &mut driver, next).expect("dispatch tx");
         assert!(dispatched.scheduled_sessions >= 1);
         let _ = runtime.run_ready_nodes().expect("run tcp output");
 
@@ -1180,9 +1206,9 @@ mod legacy_tests {
         driver.schedule_session_work_for_test(session_id);
 
         let initial_snd_nxt = driver.session(session_id).expect("connection").snd_nxt();
-        let next: crate::session::SessionQueueNext = output_node.into();
+        let (owner, next) = session_queue_output_next(&runtime, output_node);
         let dispatched =
-            dispatch_session_queue_once(&runtime, &mut driver, next).expect("dispatch tx");
+            dispatch_session_queue_once(&runtime, owner, &mut driver, next).expect("dispatch tx");
         assert!(dispatched.scheduled_sessions >= 1);
         let _ = runtime.run_ready_nodes().expect("run tcp output");
 

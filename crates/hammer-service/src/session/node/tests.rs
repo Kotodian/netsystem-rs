@@ -20,6 +20,39 @@ use crate::session::runtime::{
 use hammer_infra::msg_queue::{SessionEvt, SessionEvtType};
 use hammer_runtime::app::{AppSession, AppSessionConfig, SessionHandle};
 
+
+#[derive(Default)]
+struct BlackholeNode;
+
+impl Node for BlackholeNode {
+    fn process(&mut self, _: &DataPlaneRuntime, _: &mut BufferFrame) -> NodeResult {
+        NodeResult::drop()
+    }
+
+    fn node_process(&self) -> NodeProcessFn {
+        |_, _, _| NodeResult::drop()
+    }
+}
+
+impl InternalNode for BlackholeNode {}
+
+
+fn test_session_queue_next(
+    runtime: &DataPlaneRuntime,
+    output: hammer_core::data_plane::NodeId,
+) -> (hammer_core::data_plane::NodeId, SessionQueueNext) {
+    let node = SessionQueueNode::new().expect("session queue node");
+    let owner = runtime
+        .nodes()
+        .try_register_driver(node)
+        .expect("register session queue");
+    let slot = runtime
+        .nodes()
+        .add_node_next_slot(owner, output)
+        .expect("session queue next");
+    (owner, SessionQueueNext::from_slot(slot))
+}
+
 #[derive(Clone)]
 struct RecordingState {
     events: Arc<Mutex<Vec<&'static str>>>,
@@ -42,6 +75,7 @@ impl SessionTransport<Index, Local> for TcpRecordingTransport {
         _: &mut SessionWorker<Index, Local>,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
+        _: &mut BufferFrame,
         _: &mut super::SessionQueueOutput,
         now: Instant,
     ) -> CoreResult<()> {
@@ -56,6 +90,7 @@ impl SessionTransport<Index, Local> for TcpRecordingTransport {
         _: Index,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
+        _: &mut BufferFrame,
         _: &mut super::SessionQueueOutput,
         _: Instant,
     ) -> CoreResult<()> {
@@ -71,6 +106,7 @@ impl TransportInternalTransport<Index, Local> for TcpRecordingTransport {
         _: Index,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
+        _: &mut BufferFrame,
         _: &mut super::SessionQueueOutput,
         _: Instant,
     ) -> CoreResult<()> {
@@ -89,6 +125,7 @@ impl SessionTransport<Index, Local> for QuicRecordingTransport {
         _: &mut SessionWorker<Index, Local>,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
+        _: &mut BufferFrame,
         _: &mut super::SessionQueueOutput,
         now: Instant,
     ) -> CoreResult<()> {
@@ -103,6 +140,7 @@ impl SessionTransport<Index, Local> for QuicRecordingTransport {
         _: Index,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
+        _: &mut BufferFrame,
         _: &mut super::SessionQueueOutput,
         _: Instant,
     ) -> CoreResult<()> {
@@ -118,6 +156,7 @@ impl TransportInternalTransport<Index, Local> for QuicRecordingTransport {
         _: Index,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
+        _: &mut BufferFrame,
         _: &mut super::SessionQueueOutput,
         _: Instant,
     ) -> CoreResult<()> {
@@ -161,10 +200,13 @@ fn session_queue_updates_all_static_transports_before_control_and_io() {
         .nodes()
         .try_register_driver(node)
         .expect("register session queue node");
+    let sink = runtime.nodes().register_internal(BlackholeNode);
     SessionQueueNode::attach_queue_by_runtime_data(
+        &runtime,
+        node_id,
         node_data,
         handle,
-        hammer_core::data_plane::NodeId::new(0).into(),
+        sink,
         dispatch_registered_session_queue_once_at::<
             (TcpRecordingTransport, (QuicRecordingTransport, ())),
             Local,
@@ -299,6 +341,7 @@ impl SessionTransport<Index, Local> for QuicShapedTransport {
         _: &mut SessionWorker<Index, Local>,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
+        _: &mut BufferFrame,
         _: &mut super::SessionQueueOutput,
         _: Instant,
     ) -> CoreResult<()> {
@@ -311,6 +354,7 @@ impl SessionTransport<Index, Local> for QuicShapedTransport {
         _: Index,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
+        _: &mut BufferFrame,
         _: &mut super::SessionQueueOutput,
         _: Instant,
     ) -> CoreResult<()> {
@@ -325,10 +369,10 @@ impl TransportInternalTransport<Index, Local> for QuicShapedTransport {
         index: Index,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
+        frame: &mut BufferFrame,
         output: &mut super::SessionQueueOutput,
         _: Instant,
     ) -> CoreResult<()> {
-        let mut frame = runtime.buffers().get_next_frame(output_next.node())?;
         let streams = self.streams.lock().expect("streams").clone();
         for session_id in streams {
             let len = sessions.app().pending_send_len(session_id)?.unwrap_or(0);
@@ -338,14 +382,15 @@ impl TransportInternalTransport<Index, Local> for QuicShapedTransport {
                 .push(len);
             if len != 0 {
                 let buffer = runtime.buffers().alloc_index()?;
-                frame.push_index(buffer)?;
                 sessions
                     .app()
                     .copy_tx_to_buffer(session_id, 0, len, buffer)?;
+                if !output.try_enqueue_io(frame, output_next, buffer)? {
+                    break;
+                }
             }
             sessions.notify_transport_closed(session_id, index)?;
         }
-        output.enqueue_frame(runtime, frame)?;
         Ok(())
     }
 }
@@ -379,7 +424,13 @@ fn quic_shaped_internal_tx_can_fan_close_out_to_stream_sessions() {
     first_app.send_bytes(b"one").expect("first stream send");
     assert_eq!(second_app.tx_fifo().enqueue(b"four"), 4);
 
-    dispatch_session_queue_once(&runtime, &mut driver, output.into()).expect("internal tx");
+    let (owner, next) = {
+        let node = SessionQueueNode::new().expect("session queue node");
+        let owner = runtime.nodes().try_register_driver(node).expect("register sq");
+        let slot = runtime.nodes().add_node_next_slot(owner, output).expect("next");
+        (owner, SessionQueueNext::from_slot(slot))
+    };
+    dispatch_session_queue_once(&runtime, owner, &mut driver, next).expect("internal tx");
     let _ = runtime.run_ready_nodes().expect("capture internal TX");
 
     assert_eq!(
@@ -409,6 +460,7 @@ impl SessionTransport<Index, Local> for FailingPacketizedTransport {
         _: &mut SessionWorker<Index, Local>,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
+        _: &mut BufferFrame,
         _: &mut super::SessionQueueOutput,
         _: Instant,
     ) -> CoreResult<()> {
@@ -421,6 +473,7 @@ impl SessionTransport<Index, Local> for FailingPacketizedTransport {
         _: Index,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
+        _: &mut BufferFrame,
         _: &mut super::SessionQueueOutput,
         _: Instant,
     ) -> CoreResult<()> {
@@ -435,6 +488,7 @@ impl SessionPacketizedTransport<Index, Local> for FailingPacketizedTransport {
         _: Index,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
+        _: &mut BufferFrame,
         _: &mut super::SessionQueueOutput,
         _: Instant,
     ) -> CoreResult<()> {
@@ -488,6 +542,7 @@ impl SessionTransport<Index, Local> for RecordingPacketizedTransport {
         _: &mut SessionWorker<Index, Local>,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
+        _: &mut BufferFrame,
         _: &mut super::SessionQueueOutput,
         _: Instant,
     ) -> CoreResult<()> {
@@ -500,6 +555,7 @@ impl SessionTransport<Index, Local> for RecordingPacketizedTransport {
         _: Index,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
+        _: &mut BufferFrame,
         _: &mut super::SessionQueueOutput,
         _: Instant,
     ) -> CoreResult<()> {
@@ -514,6 +570,7 @@ impl SessionPacketizedTransport<Index, Local> for RecordingPacketizedTransport {
         _: Index,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
+        _: &mut BufferFrame,
         _: &mut super::SessionQueueOutput,
         _: Instant,
     ) -> CoreResult<()> {
@@ -642,12 +699,16 @@ fn session_tx_dispatch_commits_batch_before_graph_visibility() {
     let session_id = driver.insert_session(RecordingPacketizedTransport::ID, Index::new(5, 1));
     let app = attach_local_app_session(&mut driver, session_id);
     app.send_bytes(&[0xab; 16]).expect("send bytes");
-    let next = runtime
+    let output_node = runtime
         .nodes()
         .register_internal(VisibilityCaptureNode::new(Arc::clone(&events)))
-        .into();
-
-    dispatch_session_queue_once(&runtime, &mut driver, next).expect("dispatch session queue");
+        ;
+    let node = SessionQueueNode::new().expect("session queue node");
+    let owner = runtime.nodes().try_register_driver(node).expect("register sq");
+    let next = SessionQueueNext::from_slot(
+        runtime.nodes().add_node_next_slot(owner, output_node).expect("next"),
+    );
+    dispatch_session_queue_once(&runtime, owner, &mut driver, next).expect("dispatch session queue");
     let _ = runtime.run_ready_nodes().expect("run capture node");
 
     let transport = &driver.transports().0;
@@ -687,17 +748,13 @@ fn session_tx_deschedules_without_tx_action_when_send_space_is_zero() {
     let session_id = driver.insert_session(RecordingPacketizedTransport::ID, Index::new(6, 1));
     let app = attach_local_app_session(&mut driver, session_id);
     app.send_bytes(&[0xab; 8]).expect("send bytes");
+    let sink = runtime.nodes().register_internal(BlackholeNode);
+    let (owner, next) = test_session_queue_next(&runtime, sink);
 
-    let first = dispatch_session_queue_once(
-        &runtime,
-        &mut driver,
-        hammer_core::data_plane::NodeId::new(0).into(),
+    let first = dispatch_session_queue_once(&runtime, owner, &mut driver, next,
     )
     .expect("first dispatch");
-    let second = dispatch_session_queue_once(
-        &runtime,
-        &mut driver,
-        hammer_core::data_plane::NodeId::new(0).into(),
+    let second = dispatch_session_queue_once(&runtime, owner, &mut driver, next,
     )
     .expect("second dispatch");
 
@@ -727,11 +784,10 @@ fn failed_session_packetized_tx_action_keeps_fifo_and_graph_unchanged() {
     let app = attach_local_app_session(&mut driver, session_id);
     app.send_bytes(b"stay").expect("send bytes");
     driver.schedule_session_work_for_test(session_id);
+    let sink = runtime.nodes().register_internal(BlackholeNode);
+    let (owner, next) = test_session_queue_next(&runtime, sink);
 
-    let error = dispatch_session_queue_once(
-        &runtime,
-        &mut driver,
-        hammer_core::data_plane::NodeId::new(0).into(),
+    let error = dispatch_session_queue_once(&runtime, owner, &mut driver, next,
     )
     .expect_err("tx action must fail");
 
@@ -767,11 +823,10 @@ fn transport_deleted_then_queued_app_close_releases_the_session_slot() {
             SessionEvtType::Close,
         ))
         .expect("queue app close");
+    let sink = runtime.nodes().register_internal(BlackholeNode);
+    let (owner, next) = test_session_queue_next(&runtime, sink);
 
-    dispatch_session_queue_once(
-        &runtime,
-        &mut driver,
-        hammer_core::data_plane::NodeId::new(0).into(),
+    dispatch_session_queue_once(&runtime, owner, &mut driver, next,
     )
     .expect("dispatch app close");
 
@@ -785,4 +840,30 @@ fn transport_deleted_then_queued_app_close_releases_the_session_slot() {
         replacement.pool_index().generation(),
         session_id.pool_index().generation()
     );
+}
+
+#[test]
+fn session_queue_io_budget_caps_normal_and_custom_tx_at_128() {
+    use super::SESSION_QUEUE_IO_BUDGET;
+    let mut output = super::SessionQueueOutput::default();
+    let mut frame = BufferFrame::with_capacity(SESSION_QUEUE_IO_BUDGET + 8);
+    let next = SessionQueueNext::from_slot(0);
+    let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
+    for _ in 0..SESSION_QUEUE_IO_BUDGET {
+        let index = runtime.alloc_index().expect("alloc");
+        assert!(
+            output
+                .try_enqueue_io(&mut frame, next, index)
+                .expect("enqueue within budget")
+        );
+    }
+    assert_eq!(output.remaining_io_budget(), 0);
+    assert_eq!(output.io_count(), SESSION_QUEUE_IO_BUDGET);
+    let overflow = runtime.alloc_index().expect("overflow alloc");
+    assert!(
+        !output
+            .try_enqueue_io(&mut frame, next, overflow)
+            .expect("enqueue at cap")
+    );
+    assert_eq!(frame.len(), SESSION_QUEUE_IO_BUDGET);
 }

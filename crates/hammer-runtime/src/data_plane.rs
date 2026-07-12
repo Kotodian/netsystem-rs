@@ -373,6 +373,20 @@ impl DataPlaneRuntime {
         self.current_node.get()
     }
 
+    /// Run `f` with `node` installed as the ambient current graph node.
+    ///
+    /// Used by Session Queue test helpers and any non-dispatch path that must
+    /// flush through Graph Fanout against a concrete owner node's local nexts.
+    #[inline]
+    pub fn with_current_node<R>(&self, node: NodeId, f: impl FnOnce() -> R) -> R {
+        let previous = self.current_node.get();
+        self.current_node.set(Some(node));
+        let result = f();
+        self.flush_fanout_appendable();
+        self.current_node.set(previous);
+        result
+    }
+
     #[inline]
     pub fn may_mark_trace(&self, node: NodeId) -> bool {
         self.trace.may_mark(node)
