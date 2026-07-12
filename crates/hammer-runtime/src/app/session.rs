@@ -190,13 +190,24 @@ impl<S: Segment> AppSession<S> {
 
     /// Transport-side convenience: post a session event to the app's queue.
     /// Used by session runtime on RX enqueue / connect / close.
+    ///
+    /// IO events (`RxEnq` / `TxDeq`) carry session index only. Control events
+    /// (`Connect` / `Close`) carry the full Session Handle, matching VPP
+    /// `session_event_t` identity rules.
     #[inline]
     pub fn push_event(&self, evt_type: SessionEvtType) -> HammerResult<()> {
-        self.evt_q
-            .enqueue(SessionEvt {
-                session_index: self.handle.session_index(),
+        let evt = match evt_type {
+            SessionEvtType::RxEnq | SessionEvtType::TxDeq => {
+                SessionEvt::io(self.handle.session_index(), evt_type)
+            }
+            SessionEvtType::Connect | SessionEvtType::Close => SessionEvt::ctrl(
+                self.handle.session_index(),
+                self.handle.worker_index(),
                 evt_type,
-            })
+            ),
+        };
+        self.evt_q
+            .enqueue(evt)
             .map_err(|_| HammerError::internal("app session evt_q full"))?;
         Ok(())
     }
@@ -238,10 +249,10 @@ impl<S: Segment> AppSession<S> {
         }
         if self
             .tx_evt_q
-            .enqueue(SessionEvt {
-                session_index: self.handle.session_index(),
-                evt_type: SessionEvtType::TxDeq,
-            })
+            .enqueue(SessionEvt::io(
+                self.handle.session_index(),
+                SessionEvtType::TxDeq,
+            ))
             .is_err()
         {
             self.tx_fifo.unset_event();
@@ -366,30 +377,21 @@ mod tests {
         let session = new_session(AppSessionConfig::new(64, 4), 1);
         assert_eq!(session.enqueue_rx(b"abc").expect("enqueue rx"), 3);
         assert_eq!(
-            session.poll_events(&mut [SessionEvt {
-                session_index: 0,
-                evt_type: SessionEvtType::Close
-            }]),
+            session.poll_events(&mut [SessionEvt::io(0, SessionEvtType::Close)]),
             0
         );
 
         session.want_rx_notification();
         assert_eq!(session.enqueue_rx(b"def").expect("enqueue rx"), 3);
         assert_eq!(
-            session.poll_events(&mut [SessionEvt {
-                session_index: 0,
-                evt_type: SessionEvtType::Close
-            }]),
+            session.poll_events(&mut [SessionEvt::io(0, SessionEvtType::Close)]),
             0
         );
 
         assert_eq!(session.consume_rx(6), 6);
         session.want_rx_notification();
         assert_eq!(session.enqueue_rx(b"ghi").expect("enqueue rx"), 3);
-        let mut out = [SessionEvt {
-            session_index: 0,
-            evt_type: SessionEvtType::Close,
-        }];
+        let mut out = [SessionEvt::io(0, SessionEvtType::Close)];
         assert_eq!(session.poll_events(&mut out), 1);
         assert_eq!(out[0].evt_type, SessionEvtType::RxEnq);
     }
@@ -400,13 +402,32 @@ mod tests {
         session
             .push_event(SessionEvtType::Connect)
             .expect("push connect");
-        let mut out = [SessionEvt {
-            session_index: 0,
-            evt_type: SessionEvtType::RxEnq,
-        }; 4];
+        let mut out = [SessionEvt::io(0, SessionEvtType::RxEnq); 4];
         assert_eq!(session.poll_events(&mut out), 1);
-        assert_eq!(out[0].session_index, 1);
+        assert_eq!(out[0].session_index(), 1);
         assert_eq!(out[0].evt_type, SessionEvtType::Connect);
+        assert_eq!(out[0].worker_index(), 0);
+    }
+
+    #[test]
+    fn app_session_close_event_carries_session_handle() {
+        let handle = SessionHandle::new(11, 7);
+        let tx_evt_q = Arc::new(MsgQueue::<Local>::with_capacity(64).expect("tx_evt_q"));
+        let session = AppSession::<Local>::new_in_segment(
+            Local::default(),
+            AppSessionConfig::new(64, 4),
+            handle,
+            tx_evt_q,
+        )
+        .expect("session");
+        session
+            .push_event(SessionEvtType::Close)
+            .expect("push close");
+        let mut out = [SessionEvt::io(0, SessionEvtType::RxEnq)];
+        assert_eq!(session.poll_events(&mut out), 1);
+        assert_eq!(out[0].evt_type, SessionEvtType::Close);
+        assert_eq!(out[0].session_index(), 11);
+        assert_eq!(out[0].worker_index(), 7);
     }
 
     #[test]
@@ -433,10 +454,7 @@ mod tests {
         assert_eq!(session.drop_tx_acked(1).expect("drop tx"), 1);
         assert!(session.read_signal());
         assert!(!session.read_signal());
-        let mut out = [SessionEvt {
-            session_index: 0,
-            evt_type: SessionEvtType::Close,
-        }];
+        let mut out = [SessionEvt::io(0, SessionEvtType::Close)];
         assert_eq!(session.poll_events(&mut out), 1);
         assert_eq!(out[0].evt_type, SessionEvtType::TxDeq);
 
@@ -455,10 +473,7 @@ mod tests {
         session.clear();
         assert!(session.rx_fifo().is_empty());
         assert!(session.tx_fifo().is_empty());
-        let mut out = [SessionEvt {
-            session_index: 0,
-            evt_type: SessionEvtType::RxEnq,
-        }; 4];
+        let mut out = [SessionEvt::io(0, SessionEvtType::RxEnq); 4];
         assert_eq!(session.poll_events(&mut out), 0);
     }
 

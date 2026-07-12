@@ -56,7 +56,7 @@ async fn local_app_worker_next_event_wakes_after_event_notify() {
     .await
     .expect("next_event should wake");
 
-    assert_eq!(event.session_index, handle.session_index());
+    assert_eq!(event.session_index(), handle.session_index());
 }
 
 #[tokio::test(flavor = "current_thread")]

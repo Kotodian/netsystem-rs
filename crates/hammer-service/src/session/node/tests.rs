@@ -391,10 +391,7 @@ fn quic_shaped_internal_tx_can_fan_close_out_to_stream_sessions() {
         vec![b"one".to_vec(), b"four".to_vec()]
     );
     for app in [first_app, second_app] {
-        let mut events = [SessionEvt {
-            session_index: 0,
-            evt_type: SessionEvtType::Connect,
-        }];
+        let mut events = [SessionEvt::io(0, SessionEvtType::Connect)];
         assert_eq!(app.poll_events(&mut events), 1);
         assert_eq!(events[0].evt_type, SessionEvtType::Close);
     }
@@ -764,10 +761,11 @@ fn transport_deleted_then_queued_app_close_releases_the_session_slot() {
         .sessions_mut()
         .notify_transport_deleted(session_id, transport_index);
     app.tx_evt_q()
-        .enqueue(SessionEvt {
-            session_index: session_id.pool_index().slot(),
-            evt_type: SessionEvtType::Close,
-        })
+        .enqueue(SessionEvt::ctrl(
+            session_id.pool_index().slot(),
+            0,
+            SessionEvtType::Close,
+        ))
         .expect("queue app close");
 
     dispatch_session_queue_once(

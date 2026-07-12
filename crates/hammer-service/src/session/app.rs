@@ -304,10 +304,8 @@ impl<S: Segment> SessionAppRuntime<S> {
         mut dispatch_event: impl FnMut(SessionId, SessionEvtType),
     ) -> usize {
         let mut scheduled = 0usize;
-        let mut batch = [SessionEvt {
-            session_index: 0,
-            evt_type: SessionEvtType::Connect,
-        }; 64];
+        let mut batch = [SessionEvt::io(0, SessionEvtType::Connect); 64];
+        let worker_index = self.worker_index as u32;
         loop {
             self.tx_evt_q.drain();
             let count = self.tx_evt_q.dequeue_batch(&mut batch);
@@ -315,7 +313,11 @@ impl<S: Segment> SessionAppRuntime<S> {
                 break;
             }
             for evt in batch[..count].iter() {
-                let Some(Some(session_id)) = self.sessions_by_index.get(evt.session_index as usize)
+                if evt.evt_type == SessionEvtType::Close && evt.worker_index() != worker_index {
+                    continue;
+                }
+                let Some(Some(session_id)) =
+                    self.sessions_by_index.get(evt.session_index() as usize)
                 else {
                     continue;
                 };
@@ -364,6 +366,10 @@ impl SessionAppRuntime<Local> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hammer_infra::pool::Index as PoolIndex;
+    use hammer_infra::msg_queue::SessionEvtType;
+    use hammer_runtime::app::{AppSessionConfig, SessionHandle};
+    use std::sync::Mutex;
 
     #[test]
     fn checked_add_ooo_accepted_rejects_overflow() {
@@ -377,6 +383,90 @@ mod tests {
         assert_eq!(
             checked_add_ooo_accepted(7, 11).expect("sum without overflow"),
             18
+        );
+    }
+
+    #[test]
+    fn drain_drops_events_for_unmapped_session_slot() {
+        let app = SessionAppRuntime::<Local>::default_local().expect("app runtime");
+        app.tx_evt_q()
+            .enqueue(SessionEvt::ctrl(3, 0, SessionEvtType::Close))
+            .expect("enqueue close");
+        app.tx_evt_q()
+            .enqueue(SessionEvt::io(3, SessionEvtType::TxDeq))
+            .expect("enqueue txdeq");
+
+        let dispatched = Mutex::new(Vec::new());
+        let scheduled = app.drain_tx_events_to(|session_id, evt_type| {
+            dispatched
+                .lock()
+                .expect("dispatched")
+                .push((session_id.get(), evt_type));
+        });
+
+        assert_eq!(scheduled, 0);
+        assert!(dispatched.lock().expect("dispatched").is_empty());
+    }
+
+    #[test]
+    fn drain_drops_close_when_worker_index_mismatches() {
+        let mut app = SessionAppRuntime::<Local>::default_local().expect("app runtime");
+        let session_id = SessionId::from(PoolIndex::new(5, 1));
+        let session = Arc::new(
+            AppSession::new_in_segment(
+                Local::default(),
+                AppSessionConfig::new(64, 4),
+                SessionHandle::new(5, 0),
+                app.tx_evt_q().clone(),
+            )
+            .expect("app session"),
+        );
+        app.attach_session(session_id, session);
+        app.tx_evt_q()
+            .enqueue(SessionEvt::ctrl(5, 9, SessionEvtType::Close))
+            .expect("enqueue close for wrong worker");
+
+        let dispatched = Mutex::new(Vec::new());
+        let scheduled = app.drain_tx_events_to(|session_id, evt_type| {
+            dispatched
+                .lock()
+                .expect("dispatched")
+                .push((session_id.get(), evt_type));
+        });
+
+        assert_eq!(scheduled, 0);
+        assert!(dispatched.lock().expect("dispatched").is_empty());
+    }
+
+    #[test]
+    fn drain_dispatches_close_with_matching_session_handle() {
+        let mut app = SessionAppRuntime::<Local>::default_local().expect("app runtime");
+        let session_id = SessionId::from(PoolIndex::new(5, 1));
+        let session = Arc::new(
+            AppSession::new_in_segment(
+                Local::default(),
+                AppSessionConfig::new(64, 4),
+                SessionHandle::new(5, 0),
+                app.tx_evt_q().clone(),
+            )
+            .expect("app session"),
+        );
+        app.attach_session(session_id, session);
+        app.tx_evt_q()
+            .enqueue(SessionEvt::ctrl(5, 0, SessionEvtType::Close))
+            .expect("enqueue close");
+
+        let dispatched = Mutex::new(Vec::new());
+        app.drain_tx_events_to(|id, evt_type| {
+            dispatched
+                .lock()
+                .expect("dispatched")
+                .push((id.get(), evt_type));
+        });
+
+        assert_eq!(
+            *dispatched.lock().expect("dispatched"),
+            vec![(session_id.get(), SessionEvtType::Close)]
         );
     }
 }

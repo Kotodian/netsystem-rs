@@ -83,10 +83,7 @@ fn run_session_queue(runtime: &DataPlaneRuntime) {
 }
 
 fn poll_app_events(app: &AppSession<Local>) -> Vec<SessionEvtType> {
-    let mut events = [SessionEvt {
-        session_index: 0,
-        evt_type: SessionEvtType::Connect,
-    }; 4];
+    let mut events = [SessionEvt::io(0, SessionEvtType::Connect); 4];
     let count = app.poll_events(&mut events);
     events[..count].iter().map(|event| event.evt_type).collect()
 }
@@ -144,10 +141,11 @@ fn app_close_is_recorded_before_tcp_disconnect() {
         .1;
     let app = attach_app(&mut driver, session_id);
     app.tx_evt_q()
-        .enqueue(SessionEvt {
-            session_index: session_id.pool_index().slot(),
-            evt_type: SessionEvtType::Close,
-        })
+        .enqueue(SessionEvt::ctrl(
+            session_id.pool_index().slot(),
+            0,
+            SessionEvtType::Close,
+        ))
         .expect("queue app close");
     let handle = attach_driver_to_node(&runtime, driver);
 
@@ -238,10 +236,11 @@ fn tcp_closed_publication_notifies_app_once_before_cleanup() {
     assert_eq!(poll_app_events(&app), vec![SessionEvtType::Close]);
 
     app.tx_evt_q()
-        .enqueue(SessionEvt {
-            session_index: session_id.pool_index().slot(),
-            evt_type: SessionEvtType::Close,
-        })
+        .enqueue(SessionEvt::ctrl(
+            session_id.pool_index().slot(),
+            0,
+            SessionEvtType::Close,
+        ))
         .expect("queue app cleanup");
     run_session_queue(&runtime);
 

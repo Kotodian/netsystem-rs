@@ -21,8 +21,12 @@ A graph node that performs data-plane work while packet ownership stays on the c
 _Avoid_: helper node, background worker, side task
 
 **Next Arc**:
-A named graph edge selected by a graph node for a packet or frame. Next arcs are resolved by graph registration and are not ad hoc node ids passed through protocol code.
+A named graph edge selected through a current-node-local slot for a packet or frame. Graph Runtime resolves Next Arc slots through graph registration; protocol code does not route packets with target node ids.
 _Avoid_: output callback, destination handler, manually routed node id
+
+**Graph Fanout**:
+A worker-local graph operation that groups packet ownership by selected Next Arc and makes the resulting Next Frames visible at the current Graph Node dispatch boundary. Cross-worker ownership transfer remains Handoff, not Graph Fanout.
+_Avoid_: cross-thread fanout, handoff enqueue, output router
 
 **Graph Identity**:
 The core vocabulary that names packet graph participants and their static edge shape, such as node ids, node handles, node kinds, node states, node registrations, and next-arc labels. Graph identity is data-plane vocabulary, not graph execution policy.
@@ -38,7 +42,7 @@ _Avoid_: submit frame, `submit_frame`, `NextFrame` carrier, node-attached frame
 
 **Frame State**:
 The concrete state payload inside a frame. `Next` and `Pending` are state bodies that own frame fields directly, not marker types and not tags for a separate storage enum.
-_Avoid_: marker state, `PhantomData`, `FrameStorage`, `FrameOwner`
+_Avoid_: marker-backed frame state, separate frame storage, separate frame owner
 
 **Node Dispatch Result**:
 The outcome of running a graph node over a Pending Frame. Next Frames are acquired and put during node execution; they are not carried back as the node dispatch result.
@@ -76,9 +80,17 @@ _Avoid_: infra container, runtime scheduler state, helper object
 A VPP-style packet buffer with header state and inline packet storage. Protocol code may move the current window, prepend headers, append bytes, and link buffers by buffer-header state.
 _Avoid_: `Vec<u8>` packet, packet object, protocol-owned payload copy
 
+**Index**:
+A copyable data-plane identity containing pool, slot, and generation facts. Buffer and frame pools use the same concrete value, but only pools construct it. Index does not own release policy; buffer ownership belongs to the Frame or other domain owner that contains the identity.
+_Avoid_: pool-specific index family, index alias, per-index owner, per-index release context
+
 **Buffer Chain**:
 A packet represented by linked data-plane buffers using buffer-header state. Sharing or chaining is represented by buffer metadata, not by feature-specific owner records.
 _Avoid_: TCP chain wrapper, single-buffer owner wrapper, payload segment list
+
+**Frame Ownership**:
+The worker-local ownership of all buffer references contained in a Pending Frame or Next Frame. Moving indexes between Frames transfers this ownership as a batch, and dropping the owning Frame releases the references that remain in it.
+_Avoid_: per-index owner, manual buffer free, borrowed input ownership
 
 **Packet Cursor**:
 Packet metadata that records parsed network and transport offsets for a data-plane buffer. It is a parsed-position fact, not a replacement for buffer header state.
@@ -145,6 +157,14 @@ _Avoid_: ready-session token, generic dedup queue, app wake flag, TCP timer flag
 **Session Work Batch**:
 The worker-local batch of session ids staged for Session Runtime work. It is an append-and-drain batch; duplicate suppression is decided by each session's Schedule Pending Bit, not by a separate hash-backed ready queue object.
 _Avoid_: Session Ready Queue, DedupFifo, ReadySession list, protocol-specific scheduler
+
+**Session Handle**:
+The VPP-shaped app/runtime routing identity for a session: session index plus worker/thread index. It is not a pool generation token. Control close events carry a Session Handle; IO readiness events do not invent a stronger identity.
+_Avoid_: generation-bearing session handle, SessionId-as-app-handle, opaque cookie without worker index
+
+**Session Event**:
+An app↔session message-queue event aligned with VPP `session_event_t`. IO events carry session index only; control close/reset events carry a Session Handle. Consume paths drop events whose session slot is free or unmapped. Slot reuse after free may still target a replacement session; that window matches VPP and is not closed by adding generation to the event.
+_Avoid_: generation-safe SessionEvt, Index-in-event as ownership proof, one identity field for every event kind
 
 **Session Control Event**:
 A worker-local session lifecycle command, such as disconnect, dispatched by Session Runtime separately from TX/RX session work. Control events may invoke transport close handling, but they are not readiness facts and do not enter the Session Work Batch.

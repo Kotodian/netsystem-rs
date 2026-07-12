@@ -3,11 +3,76 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::segment::{Local, Segment};
 
+/// App↔session message-queue event aligned with VPP `session_event_t`.
+///
+/// # Identity rules (VPP)
+///
+/// - **IO events** (`RxEnq`, `TxDeq`): construct with [`SessionEvt::io`]. Only
+///   the session index is significant; worker bits are zero.
+/// - **Control events** (`Connect`, `Close`): construct with [`SessionEvt::ctrl`].
+///   Identity is the VPP-shaped Session Handle packing
+///   `(session_index as u64) | ((worker_index as u64) << 32)`.
+///
+/// # ABI / shared memory
+///
+/// Layout is `repr(C)` and 16 bytes: `evt_type`, `postponed`, 2 pad bytes, then
+/// a `u64` identity. Local and SVM backends share this layout. Hammer does
+/// **not** embed pool generation in the event; after a free slot is reused, a
+/// stale index-only IO event may target the replacement session, matching VPP.
+///
+/// Consume paths should drop events whose session slot is free/unmapped, and
+/// drop Close events whose worker index does not match the draining worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct SessionEvt {
-    pub session_index: u32,
     pub evt_type: SessionEvtType,
+    /// VPP `session_event_t.postponed`; unused by Hammer producers today.
+    pub postponed: u8,
+    _pad: [u8; 2],
+    /// IO events: low 32 bits = session_index, high 32 bits = 0.
+    /// Control Close: VPP-shaped Session Handle packing
+    /// `(session_index as u64) | ((worker_index as u64) << 32)`.
+    identity: u64,
+}
+
+impl SessionEvt {
+    /// VPP IO event identity: session index only (`SESSION_IO_EVT_*`).
+    #[inline]
+    pub const fn io(session_index: u32, evt_type: SessionEvtType) -> Self {
+        Self {
+            evt_type,
+            postponed: 0,
+            _pad: [0; 2],
+            identity: session_index as u64,
+        }
+    }
+
+    /// VPP control event identity: full session handle
+    /// (`SESSION_CTRL_EVT_CLOSE` / reset).
+    #[inline]
+    pub const fn ctrl(session_index: u32, worker_index: u32, evt_type: SessionEvtType) -> Self {
+        Self {
+            evt_type,
+            postponed: 0,
+            _pad: [0; 2],
+            identity: (session_index as u64) | ((worker_index as u64) << 32),
+        }
+    }
+
+    #[inline]
+    pub const fn session_index(self) -> u32 {
+        self.identity as u32
+    }
+
+    #[inline]
+    pub const fn worker_index(self) -> u32 {
+        (self.identity >> 32) as u32
+    }
+
+    #[inline]
+    pub const fn session_handle_raw(self) -> u64 {
+        self.identity
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,10 +356,7 @@ mod tests {
     use SessionEvtType::{Connect, RxEnq, TxDeq};
 
     fn evt(i: u32, t: SessionEvtType) -> SessionEvt {
-        SessionEvt {
-            session_index: i,
-            evt_type: t,
-        }
+        SessionEvt::io(i, t)
     }
 
     fn test_signal_pipe() -> (RawFd, RawFd) {
@@ -322,6 +384,34 @@ mod tests {
         use std::mem::{align_of, size_of};
         assert_eq!(align_of::<MsgQueueHeader>(), 4);
         assert_eq!(size_of::<MsgQueueHeader>(), 16);
+    }
+
+    #[test]
+    fn io_event_carries_session_index_only() {
+        let evt = SessionEvt::io(42, TxDeq);
+        assert_eq!(evt.evt_type, TxDeq);
+        assert_eq!(evt.session_index(), 42);
+        assert_eq!(evt.worker_index(), 0);
+    }
+
+    #[test]
+    fn close_event_carries_full_session_handle() {
+        let evt = SessionEvt::ctrl(7, 3, SessionEvtType::Close);
+        assert_eq!(evt.evt_type, SessionEvtType::Close);
+        assert_eq!(evt.session_index(), 7);
+        assert_eq!(evt.worker_index(), 3);
+    }
+
+    #[test]
+    fn session_evt_layout_matches_vpp_handle_packing() {
+        use std::mem::size_of;
+        // event_type + postponed + pad + u64 identity (VPP session_event_t shape)
+        assert_eq!(size_of::<SessionEvt>(), 16);
+        let evt = SessionEvt::ctrl(0x1111_2222, 0x3333_4444, SessionEvtType::Close);
+        assert_eq!(
+            evt.session_handle_raw(),
+            (0x1111_2222u64) | ((0x3333_4444u64) << 32)
+        );
     }
 
     #[test]
