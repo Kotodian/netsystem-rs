@@ -119,7 +119,6 @@ mod tests {
         let buffers = DataPlaneBufferConfig {
             buffer_slot_capacity: 64,
             buffer_slots: 4,
-            frame_capacity: 16,
             frame_slots: 4,
             ..DataPlaneBufferConfig::default()
         };

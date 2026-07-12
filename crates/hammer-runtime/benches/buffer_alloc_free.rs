@@ -6,14 +6,12 @@ use hammer_runtime::{DataPlaneHandoff, DataPlaneRuntime, DataPlaneRuntimeConfig,
 fn test_runtime(
     buffer_slot_capacity: usize,
     buffer_slots: usize,
-    frame_capacity: usize,
     frame_slots: usize,
 ) -> DataPlaneRuntime {
     let config = DataPlaneRuntimeConfig {
         buffers: DataPlaneBufferConfig {
             buffer_slot_capacity,
             buffer_slots,
-            frame_capacity,
             frame_slots,
             ..DataPlaneBufferConfig::default()
         },
@@ -21,10 +19,10 @@ fn test_runtime(
     DataPlaneRuntime::new(config)
 }
 
-fn cleanup_runtime_for_pool(pool: &BufferPool, frame_capacity: usize) -> DataPlaneRuntime {
-    let handoff = DataPlaneHandoff::new_shared_buffer_arena(1, frame_capacity.max(1), pool.arena());
+fn cleanup_runtime_for_pool(pool: &BufferPool, queue_capacity: usize) -> DataPlaneRuntime {
+    let handoff = DataPlaneHandoff::new_shared_buffer_arena(1, queue_capacity.max(1), pool.arena());
     DataPlaneRuntime::attach_handoff_worker(
-        test_runtime(1, 1, frame_capacity.max(1), 1),
+        test_runtime(1, 1, 1),
         DataWorkerId::new(0),
         handoff.worker(DataWorkerId::new(0)),
     )

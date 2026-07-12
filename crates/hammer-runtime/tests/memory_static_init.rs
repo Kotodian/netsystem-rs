@@ -7,7 +7,6 @@ fn runtime_config(numa_nodes: &'static [u32], active_numa_node: u32) -> DataPlan
         buffers: DataPlaneBufferConfig {
             buffer_slot_capacity: 2048,
             buffer_slots: 64,
-            frame_capacity: 256,
             frame_slots: 32,
             numa_nodes,
             active_numa_node,

@@ -31,6 +31,8 @@ use spinning_top::{
 
 use super::memory::{HAMMER_MAX_NUMA_NODES, StaticNumaTable};
 
+/// Production graph Frame logical maximum. Insertion enforces this limit even
+/// though the underlying infrastructure vector remains growable.
 pub const DEFAULT_BUFFER_FRAME_CAPACITY: usize = 256;
 pub const DEFAULT_BUFFER_FRAME_POOL_SIZE: usize = 64;
 pub const BUFFER_CACHE_LINE_SIZE: usize = 64;
@@ -1050,7 +1052,6 @@ impl BufferFrameBatchWidthPolicy for BufferFrameBatchWidth {
 pub struct DataPlaneBufferConfig {
     pub buffer_slot_capacity: usize,
     pub buffer_slots: usize,
-    pub frame_capacity: usize,
     pub frame_slots: usize,
     pub numa_nodes: &'static [u32],
     pub thread_index: u32,
@@ -1063,7 +1064,6 @@ impl Default for DataPlaneBufferConfig {
         Self {
             buffer_slot_capacity: BUFFER_CACHE_LINE_SIZE,
             buffer_slots: 1024,
-            frame_capacity: DEFAULT_BUFFER_FRAME_CAPACITY,
             frame_slots: DEFAULT_BUFFER_FRAME_POOL_SIZE,
             numa_nodes: &[0],
             thread_index: 0,
@@ -1078,7 +1078,6 @@ pub struct DataPlaneBuffers {
     active_numa_node: u32,
     thread_index: u32,
     frames: FramePool,
-    frame_capacity: usize,
     frame_slots: usize,
 }
 
@@ -1087,7 +1086,7 @@ impl fmt::Debug for DataPlaneBuffers {
         f.debug_struct("DataPlaneBuffers")
             .field("active_numa_node", &self.active_numa_node)
             .field("thread_index", &self.thread_index)
-            .field("frame_capacity", &self.frame_capacity)
+            .field("frame_capacity", &DEFAULT_BUFFER_FRAME_CAPACITY)
             .field("frame_slots", &self.frame_slots)
             .finish()
     }
@@ -1238,7 +1237,6 @@ impl DataPlaneBuffers {
         let active_numa_node = Self::resolve_numa_node(&buffer_arenas, config.active_numa_node);
         Self::from_buffer_arenas(
             buffer_arenas,
-            config.frame_capacity,
             config.frame_slots,
             config.thread_index,
             active_numa_node,
@@ -1248,7 +1246,6 @@ impl DataPlaneBuffers {
     #[inline]
     fn from_buffer_arenas(
         buffer_arenas: StaticNumaTable<BufferPoolArena, HAMMER_MAX_NUMA_NODES>,
-        frame_capacity: usize,
         frame_slots: usize,
         thread_index: u32,
         requested_numa_node: u32,
@@ -1258,8 +1255,7 @@ impl DataPlaneBuffers {
             buffer_pools: Self::buffer_pools_from_arenas(&buffer_arenas),
             active_numa_node,
             thread_index,
-            frames: FramePool::with_capacity(frame_capacity, frame_slots),
-            frame_capacity,
+            frames: FramePool::with_capacity(DEFAULT_BUFFER_FRAME_CAPACITY, frame_slots),
             frame_slots,
         }
     }
@@ -1272,8 +1268,7 @@ impl DataPlaneBuffers {
             buffer_pools: Self::worker_buffer_pools_from_arenas(&buffer_arenas),
             active_numa_node,
             thread_index,
-            frames: FramePool::with_capacity(self.frame_capacity, self.frame_slots),
-            frame_capacity: self.frame_capacity,
+            frames: FramePool::with_capacity(DEFAULT_BUFFER_FRAME_CAPACITY, self.frame_slots),
             frame_slots: self.frame_slots,
         }
     }
@@ -1311,7 +1306,6 @@ impl DataPlaneBuffers {
     #[inline]
     pub fn from_cloned_buffer_arenas(
         arenas: impl IntoIterator<Item = BufferPoolArena>,
-        frame_capacity: usize,
         frame_slots: usize,
         thread_index: u32,
         requested_numa_node: u32,
@@ -1323,7 +1317,6 @@ impl DataPlaneBuffers {
         }
         Self::from_buffer_arenas(
             buffer_arenas,
-            frame_capacity,
             frame_slots,
             thread_index,
             requested_numa_node,
@@ -1361,7 +1354,7 @@ impl DataPlaneBuffers {
 
     #[inline]
     pub fn frame_capacity(&self) -> usize {
-        self.frame_capacity
+        DEFAULT_BUFFER_FRAME_CAPACITY
     }
 
     #[inline]
@@ -3091,6 +3084,9 @@ impl<'pool> Iterator for DataPlaneBufferChain<'pool> {
 #[derive(Debug)]
 pub struct BufferFrame {
     indices: Vec<Index>,
+    /// Logical graph Frame maximum. Independent of the growable vector's
+    /// reserved capacity.
+    limit: usize,
     readiness: Rc<FrameReadiness>,
 }
 
@@ -3374,15 +3370,17 @@ macro_rules! rewrite_ladder {
 impl BufferFrame {
     #[inline]
     fn with_capacity(capacity: usize) -> Self {
+        assert!(capacity > 0, "frame capacity must be non-zero");
         Self {
             indices: Vec::with_capacity(capacity),
+            limit: capacity,
             readiness: Rc::new(FrameReadiness::default()),
         }
     }
 
     #[inline]
     pub fn push_index(&mut self, index: Index) -> CoreResult<()> {
-        if self.indices.len() == self.indices.capacity() {
+        if self.indices.len() == self.limit {
             return Err(DataPlaneError::BufferFrameCapacityExceeded.into());
         }
         self.indices.push(index);
@@ -3398,16 +3396,16 @@ impl BufferFrame {
         let indices = indices.into_iter();
         let (lower, upper) = indices.size_hint();
         if let Some(upper) = upper {
-            if self.indices.len() + upper > self.indices.capacity() {
+            if self.indices.len() + upper > self.limit {
                 return Err(DataPlaneError::BufferFrameCapacityExceeded.into());
             }
-        } else if self.indices.len() + lower > self.indices.capacity() {
+        } else if self.indices.len() + lower > self.limit {
             return Err(DataPlaneError::BufferFrameCapacityExceeded.into());
         }
 
         let original_len = self.indices.len();
         for index in indices {
-            if self.indices.len() == self.indices.capacity() {
+            if self.indices.len() == self.limit {
                 self.indices.truncate(original_len);
                 return Err(DataPlaneError::BufferFrameCapacityExceeded.into());
             }
@@ -3441,7 +3439,7 @@ impl BufferFrame {
 
     #[inline]
     pub fn capacity(&self) -> usize {
-        self.indices.capacity()
+        self.limit
     }
 
     #[inline]
@@ -4244,5 +4242,53 @@ mod index_identity_tests {
         assert_ne!(a, 0);
         assert_ne!(b, 0);
         assert_ne!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod frame_capacity_tests {
+    use super::*;
+
+    fn test_index(slot: u32) -> Index {
+        Index {
+            pool_id: 1,
+            slot,
+            generation: 1,
+        }
+    }
+
+    #[test]
+    fn buffer_frame_test_capacity_is_crate_private_logical_limit() {
+        let mut frame = BufferFrame::with_capacity(2);
+        assert_eq!(frame.capacity(), 2);
+        frame.push_index(test_index(0)).expect("first");
+        frame.push_index(test_index(1)).expect("second");
+        assert!(frame.push_index(test_index(2)).is_err());
+        assert_eq!(frame.indices(), &[test_index(0), test_index(1)]);
+    }
+
+    #[test]
+    fn production_frame_accepts_256_and_rejects_257th() {
+        let mut frame = BufferFrame::with_capacity(DEFAULT_BUFFER_FRAME_CAPACITY);
+        for slot in 0..DEFAULT_BUFFER_FRAME_CAPACITY as u32 {
+            frame
+                .push_index(test_index(slot))
+                .expect("push within production limit");
+        }
+        assert_eq!(frame.len(), DEFAULT_BUFFER_FRAME_CAPACITY);
+        assert!(frame.push_index(test_index(u32::MAX)).is_err());
+        assert_eq!(frame.len(), DEFAULT_BUFFER_FRAME_CAPACITY);
+    }
+
+    #[test]
+    fn production_bulk_push_is_atomic_against_logical_limit() {
+        let mut frame = BufferFrame::with_capacity(DEFAULT_BUFFER_FRAME_CAPACITY);
+        for slot in 0..(DEFAULT_BUFFER_FRAME_CAPACITY as u32 - 1) {
+            frame.push_index(test_index(slot)).expect("seed");
+        }
+        let before = frame.indices().to_vec();
+        let batch = [test_index(1000), test_index(1001)];
+        assert!(frame.push_indices(batch).is_err());
+        assert_eq!(frame.indices(), before.as_slice());
     }
 }

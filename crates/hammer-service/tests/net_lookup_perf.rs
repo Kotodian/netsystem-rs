@@ -26,7 +26,6 @@ static PERF_PROBE_LOCK: Mutex<()> = Mutex::new(());
 fn test_runtime_configured_instruction_set(
     buffer_slot_capacity: usize,
     buffer_slots: usize,
-    frame_capacity: usize,
     frame_slots: usize,
     instruction_set: DataPlaneInstructionSet,
 ) -> DataPlaneRuntime {
@@ -34,7 +33,6 @@ fn test_runtime_configured_instruction_set(
         buffers: DataPlaneBufferConfig {
             buffer_slot_capacity,
             buffer_slots,
-            frame_capacity,
             frame_slots,
             ..DataPlaneBufferConfig::default()
         },
@@ -263,7 +261,7 @@ fn measure_input_lookup_samples(
 
 fn measure_packet_scalar(scenario: Scenario) -> ProbeStats {
     let runtime =
-        test_runtime_configured_instruction_set(2048, 1, 1, 2, DataPlaneInstructionSet::Scalar);
+        test_runtime_configured_instruction_set(2048, 1, 2, DataPlaneInstructionSet::Scalar);
     let counters = Arc::new(SinkCounters::default());
     let lookup = build_lookup(&runtime, scenario, &counters);
     let packets_by_frame = build_packets(scenario);
@@ -296,7 +294,6 @@ fn measure_packet_scalar(scenario: Scenario) -> ProbeStats {
 fn measure_lookup(scenario: Scenario, instruction_set: DataPlaneInstructionSet) -> ProbeStats {
     let runtime = test_runtime_configured_instruction_set(
         2048,
-        FRAME_PACKETS,
         FRAME_PACKETS,
         32,
         instruction_set,
@@ -336,7 +333,6 @@ fn measure_input_lookup(
 ) -> ProbeStats {
     let runtime = test_runtime_configured_instruction_set(
         2048,
-        FRAME_PACKETS,
         FRAME_PACKETS,
         32,
         instruction_set,

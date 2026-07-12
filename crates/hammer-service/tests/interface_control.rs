@@ -19,13 +19,11 @@ use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 fn test_runtime(
     buffer_slot_capacity: usize,
     buffer_slots: usize,
-    frame_capacity: usize,
     frame_pool_size: usize,
 ) -> DataPlaneRuntime {
     let mut config = Config::default();
     config.worker.buffer.slot_bytes = buffer_slot_capacity;
     config.worker.buffer.slots_per_numa = buffer_slots;
-    config.worker.buffer.frame_capacity = frame_capacity;
     config.worker.buffer.frame_pool_size = frame_pool_size;
     new_worker_runtime(&config)
 }
@@ -172,7 +170,7 @@ fn interface_updates_run_through_configured_runtime_data_plane_barrier() {
 
 #[test]
 fn interface_address_publish_installs_receive_route_in_fib() {
-    let runtime = test_runtime(2048, 8, 8, 4);
+    let runtime = test_runtime(2048, 8, 4);
     let drop = runtime
         .nodes()
         .register_internal(hammer_service::data_plane::DropNode::new());
@@ -269,7 +267,7 @@ fn interface_address_publish_installs_receive_route_in_fib() {
 
 #[test]
 fn interface_output_dispatches_to_registered_tx_node() {
-    let runtime = test_runtime(2048, 8, 8, 4);
+    let runtime = test_runtime(2048, 8, 4);
     let _ = runtime
         .nodes()
         .register_internal(hammer_service::data_plane::DropNode::new());
@@ -348,7 +346,7 @@ fn interface_output_dispatches_to_registered_tx_node() {
 
 #[test]
 fn interface_output_drops_missing_egress_or_tx_mapping() {
-    let runtime = test_runtime(2048, 8, 8, 4);
+    let runtime = test_runtime(2048, 8, 4);
     let _ = runtime
         .nodes()
         .register_internal(hammer_service::data_plane::DropNode::new());
@@ -375,7 +373,7 @@ fn interface_output_tx_updates_run_through_configured_runtime_data_plane_barrier
     let data_runtime =
         DataRuntime::new(1, "interface-output-barrier-test", 512 * 1024, 2).expect("data runtime");
     let barrier = data_runtime.data_plane_barrier();
-    let runtime = test_runtime(2048, 8, 8, 4);
+    let runtime = test_runtime(2048, 8, 4);
     let device = MemoryTunDevice::new();
     let tx = runtime
         .nodes()

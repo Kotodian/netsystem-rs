@@ -60,8 +60,8 @@ idle_slice = "1ms"                      # spawn.rs:137   DATA_WORKER_IDLE_SLICE
 [worker.buffer]
 slot_bytes = 2048                       # spawn.rs:135   DATA_BUFFER_SLOT_CAPACITY  (VPP data-size)
 slots_per_numa = 4096                   # spawn.rs:136   DATA_BUFFER_SLOTS           (VPP buffers-per-numa；非 Linux = 总量)
-frame_capacity = 256                    # buffer.rs:29   DEFAULT_BUFFER_FRAME_CAPACITY
-frame_pool_size = 64                    # buffer.rs:30   DEFAULT_BUFFER_FRAME_POOL_SIZE
+frame_pool_size = 64                    # buffer.rs DEFAULT_BUFFER_FRAME_POOL_SIZE
+# Graph Frame logical capacity is fixed at DEFAULT_BUFFER_FRAME_CAPACITY (256).
 
 [worker.handoff]
 queue_capacity = 1024                   # handoff.rs:56  DataPlaneHandoff::new(workers, queue_capacity)
@@ -146,7 +146,7 @@ mtu = { l3 = 9000, ip4 = 9000, ip6 = 9000, mpls = 9000 }  # interface.rs Interfa
 `hammer-core/src/config/worker.rs`：
 - `Worker { count: usize, stack_size: usize, max_blocking_threads: usize, idle_slice: Duration, buffer: WorkerBuffer, handoff: WorkerHandoff, app_ring: WorkerAppRing, cpu: WorkerCpu, scheduler: WorkerScheduler, numa: WorkerNuma }`
   - `cpu`/`numa` 仅 `linux-platform` feature；apple 的 `scheduler` 用同名字段不同形状 → 用 `#[cfg]` 分支或 enum。
-- `WorkerBuffer { slot_bytes, slots_per_numa, frame_capacity, frame_pool_size: usize }`
+- `WorkerBuffer { slot_bytes, slots_per_numa, frame_pool_size: usize }`
 - `WorkerHandoff { queue_capacity: usize }`
 - `WorkerAppRing { capacity: usize }`
 - `WorkerCpu { main_core: Option<usize>, worker_cores: Vec<usize>, skip_cores: usize, relative: bool }`（linux）

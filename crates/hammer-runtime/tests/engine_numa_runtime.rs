@@ -7,7 +7,6 @@ fn test_runtime() -> DataPlaneRuntime {
     let buffers = DataPlaneBufferConfig {
         buffer_slot_capacity: 2048,
         buffer_slots: 64,
-        frame_capacity: 256,
         frame_slots: 64,
         numa_nodes: &[0, 1],
         active_numa_node: 0,

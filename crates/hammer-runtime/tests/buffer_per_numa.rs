@@ -12,7 +12,6 @@ use hammer_runtime::{
 fn runtime_config(
     slot_capacity: usize,
     slots: usize,
-    frame_capacity: usize,
     frame_slots: usize,
     instruction_set: DataPlaneInstructionSet,
 ) -> DataPlaneRuntimeConfig {
@@ -21,7 +20,6 @@ fn runtime_config(
         buffers: DataPlaneBufferConfig {
             buffer_slot_capacity: slot_capacity,
             buffer_slots: slots,
-            frame_capacity,
             frame_slots,
             ..DataPlaneBufferConfig::default()
         },
@@ -46,14 +44,13 @@ fn runtime_with_numa(
 
 fn runtime_with_handoff_arena(
     arena: BufferPoolArena,
-    frame_capacity: usize,
     frame_slots: usize,
     instruction_set: DataPlaneInstructionSet,
 ) -> DataPlaneRuntime {
-    let handoff = DataPlaneHandoff::new_shared_buffer_arena(1, frame_capacity.max(1), arena);
+    let handoff = DataPlaneHandoff::new_shared_buffer_arena(1, frame_slots.max(1), arena);
     DataPlaneRuntime::attach_handoff_worker(
         DataPlaneRuntime::new_with_instruction_set(
-            runtime_config(1, 1, frame_capacity, frame_slots, instruction_set),
+            runtime_config(1, 1, frame_slots, instruction_set),
             instruction_set,
         ),
         DataWorkerId::new(0),
@@ -68,7 +65,7 @@ trait CleanupOwner {
 impl CleanupOwner for BufferPool {
     fn drop_index_owned(&self, index: hammer_core::data_plane::Index) {
         let runtime =
-            runtime_with_handoff_arena(self.arena(), 1, 1, DataPlaneInstructionSet::native());
+            runtime_with_handoff_arena(self.arena(), 1, DataPlaneInstructionSet::native());
         let mut frame = runtime
             .buffers()
             .get_next_frame(NodeId::new(0))
@@ -143,7 +140,6 @@ fn config_constructor_resolves_active_numa_to_configured_node() {
     let config = DataPlaneBufferConfig {
         buffer_slot_capacity: 1024,
         buffer_slots: 16,
-        frame_capacity: 4,
         frame_slots: 4,
         numa_nodes: &[3],
         active_numa_node: 0,
@@ -175,7 +171,7 @@ fn config_constructor_resolves_active_numa_to_configured_node() {
 #[test]
 fn handoff_arena_constructor_uses_arena_numa_identity() {
     let arena = BufferPoolArena::with_capacity_in(1024, 16, Arc::new(Heap::local()), 3);
-    let runtime = runtime_with_handoff_arena(arena, 4, 4, DataPlaneInstructionSet::Scalar);
+    let runtime = runtime_with_handoff_arena(arena, 4, DataPlaneInstructionSet::Scalar);
     let buffers = runtime.buffers();
 
     assert_eq!(buffers.active_numa_node(), 3);
@@ -207,7 +203,7 @@ fn handoff_capacities_preserve_handoff_arena_numa_identity() {
     );
     let runtime = DataPlaneRuntime::attach_handoff_worker(
         DataPlaneRuntime::new_with_instruction_set(
-            runtime_config(1, 1, 4, 4, DataPlaneInstructionSet::Scalar),
+            runtime_config(1, 1, 4, DataPlaneInstructionSet::Scalar),
             DataPlaneInstructionSet::Scalar,
         ),
         DataWorkerId::new(0),
@@ -235,7 +231,7 @@ fn handoff_worker_clone_falls_back_to_configured_nonzero_numa_arena() {
     );
     let runtime = DataPlaneRuntime::attach_handoff_worker(
         DataPlaneRuntime::new_with_instruction_set(
-            runtime_config(1, 1, 4, 4, DataPlaneInstructionSet::Scalar),
+            runtime_config(1, 1, 4, DataPlaneInstructionSet::Scalar),
             DataPlaneInstructionSet::Scalar,
         ),
         DataWorkerId::new(0),

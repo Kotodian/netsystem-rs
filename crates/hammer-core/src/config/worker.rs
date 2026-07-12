@@ -31,7 +31,6 @@ const WORKER_IDLE_SLICE: Duration = Duration::from_millis(1);
 const BUFFER_SLOT_BYTES: usize = 2_048;
 const BUFFER_SLOTS_PER_NUMA: usize = 4_096;
 // hammer-core/src/data_plane/buffer.rs
-const BUFFER_FRAME_CAPACITY: usize = 256;
 const BUFFER_FRAME_POOL_SIZE: usize = 64;
 // hammer-runtime/src/handoff.rs (DataPlaneHandoff::new(workers, cap))
 const HANDOFF_QUEUE_CAPACITY: usize = 1_024;
@@ -136,9 +135,7 @@ pub struct WorkerBuffer {
     /// Slots per NUMA node (VPP `buffers.buffers-per-numa`); on non-Linux this
     /// is the total slot count since there is no NUMA partitioning.
     pub slots_per_numa: usize,
-    /// Default buffer frame capacity (`hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY`).
-    pub frame_capacity: usize,
-    /// Default buffer frame pool size (`hammer_core::data_plane::DEFAULT_BUFFER_FRAME_POOL_SIZE`).
+    /// Initial buffer frame pool size (`hammer_core::data_plane::DEFAULT_BUFFER_FRAME_POOL_SIZE`).
     pub frame_pool_size: usize,
 }
 
@@ -147,7 +144,6 @@ impl Default for WorkerBuffer {
         Self {
             slot_bytes: BUFFER_SLOT_BYTES,
             slots_per_numa: BUFFER_SLOTS_PER_NUMA,
-            frame_capacity: BUFFER_FRAME_CAPACITY,
             frame_pool_size: BUFFER_FRAME_POOL_SIZE,
         }
     }
@@ -163,11 +159,6 @@ impl WorkerBuffer {
         if self.slots_per_numa == 0 {
             return Err(HammerError::config_validation(
                 "worker.buffer.slots_per_numa must be non-zero",
-            ));
-        }
-        if self.frame_capacity == 0 {
-            return Err(HammerError::config_validation(
-                "worker.buffer.frame_capacity must be non-zero",
             ));
         }
         if self.frame_pool_size == 0 {
@@ -420,7 +411,6 @@ mod tests {
         assert_eq!(worker.idle_slice, WORKER_IDLE_SLICE);
         assert_eq!(worker.buffer.slot_bytes, BUFFER_SLOT_BYTES);
         assert_eq!(worker.buffer.slots_per_numa, BUFFER_SLOTS_PER_NUMA);
-        assert_eq!(worker.buffer.frame_capacity, BUFFER_FRAME_CAPACITY);
         assert_eq!(worker.buffer.frame_pool_size, BUFFER_FRAME_POOL_SIZE);
         assert_eq!(worker.handoff.queue_capacity, HANDOFF_QUEUE_CAPACITY);
         assert_eq!(worker.app_session.fifo_capacity, APP_SESSION_FIFO_CAPACITY);
@@ -447,6 +437,18 @@ mod tests {
     fn parse_worker_poll_interval_alias() {
         let worker: Worker = toml::from_str(r#"poll_interval = "25ms""#).expect("parse");
         assert_eq!(worker.idle_slice, Duration::from_millis(25));
+    }
+
+    #[test]
+    fn parse_worker_rejects_obsolete_frame_capacity() {
+        let err = toml::from_str::<Worker>(
+            r#"
+            [buffer]
+            frame_capacity = 128
+            "#,
+        )
+        .expect_err("obsolete frame_capacity must be rejected");
+        assert!(err.to_string().contains("frame_capacity"));
     }
 
     #[test]

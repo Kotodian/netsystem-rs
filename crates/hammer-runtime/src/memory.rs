@@ -1,7 +1,5 @@
 use hammer_component_macros::init_function;
-use hammer_core::data_plane::{
-    DEFAULT_BUFFER_FRAME_CAPACITY, DEFAULT_BUFFER_FRAME_POOL_SIZE, DataPlaneBufferConfig,
-};
+use hammer_core::data_plane::{DEFAULT_BUFFER_FRAME_POOL_SIZE, DataPlaneBufferConfig};
 use hammer_core::error::HammerResult;
 use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig};
 
@@ -17,7 +15,6 @@ pub fn memory_init(engine: &mut Engine) -> HammerResult<()> {
         buffers: DataPlaneBufferConfig {
             buffer_slot_capacity: DEFAULT_BUFFER_SLOT_CAPACITY,
             buffer_slots: DEFAULT_BUFFER_SLOTS_PER_NUMA,
-            frame_capacity: DEFAULT_BUFFER_FRAME_CAPACITY,
             frame_slots: DEFAULT_BUFFER_FRAME_POOL_SIZE,
             numa_nodes: DEFAULT_NUMA_NODES,
             thread_index: engine.thread_index,

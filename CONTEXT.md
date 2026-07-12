@@ -89,8 +89,8 @@ A packet represented by linked data-plane buffers using buffer-header state. Sha
 _Avoid_: TCP chain wrapper, single-buffer owner wrapper, payload segment list
 
 **Frame Ownership**:
-The worker-local ownership of all buffer references contained in a Pending Frame or Next Frame. Moving indexes between Frames transfers this ownership as a batch, and dropping the owning Frame releases the references that remain in it.
-_Avoid_: per-index owner, manual buffer free, borrowed input ownership
+The worker-local ownership of all buffer references contained in a Pending Frame or Next Frame. Moving indexes between Frames transfers this ownership as a batch, and dropping the owning Frame releases the references that remain in it. Production Frames store indexes in `hammer_infra::vec::Vec` with a fixed logical maximum of 256; Frame-pool size remains the only buffer-frame tuning knob.
+_Avoid_: per-index owner, manual buffer free, borrowed input ownership, configurable production frame capacity
 
 **Packet Cursor**:
 Packet metadata that records parsed network and transport offsets for a data-plane buffer. It is a parsed-position fact, not a replacement for buffer header state.

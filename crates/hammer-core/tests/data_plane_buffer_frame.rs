@@ -19,7 +19,6 @@ fn test_buffers(buffer_slot_capacity: usize, buffer_slots: usize) -> DataPlaneBu
     DataPlaneBuffers::new(DataPlaneBufferConfig {
         buffer_slot_capacity,
         buffer_slots,
-        frame_capacity: 4,
         frame_slots: 2,
         ..DataPlaneBufferConfig::default()
     })
@@ -187,11 +186,11 @@ fn core_frame_pending_owner_can_release_trace_handles_on_return() {
 
 #[test]
 fn core_frame_empty_and_full_cleanup_release_owned_buffers_once() {
-    let buffers = test_buffers(64, 8);
+    let buffers = test_buffers(64, DEFAULT_BUFFER_FRAME_CAPACITY + 1);
 
     let empty = buffers.get_next_frame(NodeId::new(0)).expect("empty frame");
     assert!(empty.is_empty());
-    assert_eq!(empty.capacity(), 4);
+    assert_eq!(empty.capacity(), DEFAULT_BUFFER_FRAME_CAPACITY);
     drop(empty);
     assert_eq!(buffers.in_use_buffers(), 0);
     assert_eq!(buffers.frames_in_use(), 0);

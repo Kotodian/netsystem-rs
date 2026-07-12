@@ -16,14 +16,12 @@ use hammer_service::transport::tcp::{TcpResetNext, TcpResetNode};
 fn test_runtime_configured(
     buffer_slot_capacity: usize,
     buffer_slots: usize,
-    frame_capacity: usize,
     frame_slots: usize,
 ) -> DataPlaneRuntime {
     let config = DataPlaneRuntimeConfig {
         buffers: DataPlaneBufferConfig {
             buffer_slot_capacity,
             buffer_slots,
-            frame_capacity,
             frame_slots,
             ..DataPlaneBufferConfig::default()
         },
@@ -194,7 +192,7 @@ fn reset_graph() -> (
     Arc<Mutex<CaptureState>>,
     Arc<Mutex<CaptureState>>,
 ) {
-    let runtime = test_runtime_configured(512, 8, 4, 4);
+    let runtime = test_runtime_configured(512, 8, 4);
     let lookup_state = Arc::new(Mutex::new(CaptureState::default()));
     let drop_state = Arc::new(Mutex::new(CaptureState::default()));
     let drop = runtime

@@ -48,7 +48,6 @@ pub(crate) type RuntimeDataPlaneRuntime = DataPlaneRuntime;
 #[derive(Clone)]
 struct DataPlaneRuntimeWorkerSeed {
     buffer_arenas: std::vec::Vec<BufferPoolArena>,
-    frame_capacity: usize,
     frame_slots: usize,
     instruction_set: DataPlaneInstructionSet,
     handoff: Option<DataPlaneHandoffWorker>,
@@ -58,7 +57,6 @@ struct DataPlaneRuntimeWorkerSeed {
 impl fmt::Debug for DataPlaneRuntimeWorkerSeed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DataPlaneRuntimeWorkerSeed")
-            .field("frame_capacity", &self.frame_capacity)
             .field("frame_slots", &self.frame_slots)
             .field("instruction_set", &self.instruction_set)
             .field("handoff_node_handle", &self.handoff_node_handle)
@@ -121,7 +119,6 @@ impl DataPlaneRuntimeWorkerSeed {
         let mut runtime = DataPlaneRuntime::from_buffers_with_instruction_set(
             DataPlaneBuffers::from_cloned_buffer_arenas(
                 self.buffer_arenas.iter().cloned(),
-                self.frame_capacity,
                 self.frame_slots,
                 thread_index,
                 numa_node,
@@ -181,7 +178,6 @@ impl DataPlaneRuntime {
     fn seed_for_worker(&self) -> DataPlaneRuntimeWorkerSeed {
         DataPlaneRuntimeWorkerSeed {
             buffer_arenas: self.buffers.clone_buffer_arenas(),
-            frame_capacity: self.buffers.frame_capacity(),
             frame_slots: self.buffers.frame_slots(),
             instruction_set: self.instruction_set,
             handoff: self.handoff.clone(),
@@ -615,7 +611,6 @@ pub fn new_worker_runtime(config: &Config) -> DataPlaneRuntime {
     let buffers = DataPlaneBufferConfig {
         buffer_slot_capacity: buffer.slot_bytes,
         buffer_slots: buffer.slots_per_numa,
-        frame_capacity: buffer.frame_capacity,
         frame_slots: buffer.frame_pool_size,
         ..DataPlaneBufferConfig::default()
     };

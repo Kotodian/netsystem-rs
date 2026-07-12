@@ -23,13 +23,11 @@ fn calls_for(word: u64) -> u64 {
 fn test_runtime(
     buffer_slot_capacity: usize,
     buffer_slots: usize,
-    frame_capacity: usize,
     frame_pool_size: usize,
 ) -> DataPlaneRuntime {
     let buffers = DataPlaneBufferConfig {
         buffer_slot_capacity,
         buffer_slots,
-        frame_capacity,
         frame_slots: frame_pool_size,
         ..DataPlaneBufferConfig::default()
     };
@@ -221,7 +219,7 @@ fn trace_formatter(bytes: &[u8]) -> String {
 #[test]
 fn register_internal_uses_descriptor_function_and_runtime_data() {
     reset_calls(42);
-    let runtime = test_runtime(64, 4, 4, 2);
+    let runtime = test_runtime(64, 4, 2);
     let node = runtime.nodes().register_internal(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::from_words([42, 0, 0, 0]),
@@ -239,7 +237,7 @@ fn register_internal_uses_descriptor_function_and_runtime_data() {
 #[test]
 fn register_driver_preserves_old_spelling_for_descriptor_nodes() {
     reset_calls(7);
-    let runtime = test_runtime(64, 4, 4, 2);
+    let runtime = test_runtime(64, 4, 2);
     let node = runtime.nodes().register_driver(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::from_words([7, 0, 0, 0]),
@@ -255,7 +253,7 @@ fn register_driver_preserves_old_spelling_for_descriptor_nodes() {
 
 #[test]
 fn runtime_exposes_node_kind_and_state() {
-    let runtime = test_runtime(64, 4, 4, 2);
+    let runtime = test_runtime(64, 4, 2);
     let internal = runtime.nodes().register_internal(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::empty(),
@@ -288,7 +286,7 @@ fn runtime_exposes_node_kind_and_state() {
 #[test]
 fn schedule_empty_frame_runs_driver_without_packet_vectors() {
     reset_calls(21);
-    let runtime = test_runtime(64, 4, 4, 2);
+    let runtime = test_runtime(64, 4, 2);
     let driver = runtime.nodes().register_driver(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::from_words([21, 0, 0, 0]),
@@ -309,7 +307,7 @@ fn schedule_polling_driver_nodes_schedules_only_polling_drivers() {
     reset_calls(32);
     reset_calls(33);
 
-    let runtime = test_runtime(64, 8, 4, 8);
+    let runtime = test_runtime(64, 8, 8);
     let polling_driver = runtime.nodes().register_driver(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::from_words([31, 0, 0, 0]),
@@ -352,7 +350,7 @@ fn schedule_polling_driver_nodes_schedules_only_polling_drivers() {
 #[test]
 fn interrupt_pending_coalesces_empty_driver_dispatch() {
     reset_calls(31);
-    let runtime = test_runtime(64, 4, 4, 4);
+    let runtime = test_runtime(64, 4, 4);
     let driver = runtime.nodes().register_driver(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::from_words([31, 0, 0, 0]),
@@ -383,7 +381,7 @@ fn interrupt_pending_coalesces_empty_driver_dispatch() {
 #[test]
 fn disabled_driver_interrupt_does_not_schedule() {
     reset_calls(37);
-    let runtime = test_runtime(64, 4, 4, 4);
+    let runtime = test_runtime(64, 4, 4);
     let driver = runtime.nodes().register_driver(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::from_words([37, 0, 0, 0]),
@@ -406,7 +404,7 @@ fn disabled_driver_interrupt_does_not_schedule() {
 #[test]
 fn disabled_node_skips_already_queued_empty_frame() {
     reset_calls(41);
-    let runtime = test_runtime(64, 4, 4, 4);
+    let runtime = test_runtime(64, 4, 4);
     let driver = runtime.nodes().register_driver(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::from_words([41, 0, 0, 0]),
@@ -427,7 +425,7 @@ fn disabled_node_skips_already_queued_empty_frame() {
 
 #[test]
 fn descriptor_registration_keeps_name_next_slots_trace_and_siblings() {
-    let runtime = test_runtime(64, 8, 8, 4);
+    let runtime = test_runtime(64, 8, 4);
     let default = runtime.nodes().register_internal(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::empty(),
@@ -477,7 +475,7 @@ fn descriptor_registration_keeps_name_next_slots_trace_and_siblings() {
 
 #[test]
 fn default_node_process_path_registers_and_drops_gracefully() {
-    let runtime = test_runtime(64, 4, 4, 2);
+    let runtime = test_runtime(64, 4, 2);
     let node = runtime.nodes().register_internal(ProcessOnlyNode);
     let mut frame = runtime.buffers().get_next_frame(node).expect("alloc frame");
     push_packet(&runtime, &mut frame, b"packet");
@@ -495,7 +493,7 @@ fn descriptor_next_node_runs_with_runtime_resolved_next_slot() {
     reset_calls(11);
     reset_calls(13);
     reset_calls(17);
-    let runtime = test_runtime(64, 8, 8, 4);
+    let runtime = test_runtime(64, 8, 4);
     let default = runtime.nodes().register_internal(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::from_words([11, 0, 0, 0]),
@@ -526,7 +524,7 @@ fn descriptor_next_node_runs_with_runtime_resolved_next_slot() {
 
 #[test]
 fn descriptor_registration_validates_declared_next_shape() {
-    let runtime = test_runtime(64, 4, 4, 2);
+    let runtime = test_runtime(64, 4, 2);
     let next = runtime.nodes().register_internal(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::empty(),
@@ -551,7 +549,7 @@ fn descriptor_registration_validates_declared_next_shape() {
 #[test]
 fn descriptor_registration_with_handle_registers_handle_once() {
     const HANDLE: NodeHandle = NodeHandle::new(9);
-    let runtime = test_runtime(64, 4, 4, 2);
+    let runtime = test_runtime(64, 4, 2);
     let node = runtime
         .nodes()
         .register_internal_with_handle(
@@ -583,7 +581,7 @@ fn node_descriptor_exposes_public_snapshot_accessors() {
         Some(trace_formatter),
     );
 
-    let runtime = test_runtime(64, 4, 4, 2);
+    let runtime = test_runtime(64, 4, 2);
     let mut frame = runtime
         .buffers()
         .get_next_frame(NodeId::new(0))
@@ -605,7 +603,7 @@ fn node_descriptor_exposes_public_snapshot_accessors() {
 
 #[test]
 fn node_by_name_returns_registered_id_and_none_for_unknown() {
-    let runtime = test_runtime(64, 4, 4, 2);
+    let runtime = test_runtime(64, 4, 2);
     let drop = runtime.nodes().register_internal(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::empty(),
@@ -623,7 +621,7 @@ fn node_by_name_returns_registered_id_and_none_for_unknown() {
 
 #[test]
 fn set_node_next_slot_redirects_existing_next_slot() {
-    let runtime = test_runtime(64, 4, 4, 2);
+    let runtime = test_runtime(64, 4, 2);
     let initial = runtime.nodes().register_internal(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::empty(),
@@ -663,7 +661,7 @@ fn set_node_next_slot_redirects_existing_next_slot() {
 
 #[test]
 fn try_register_descriptor_registers_erased_descriptor() {
-    let runtime = test_runtime(64, 4, 4, 2);
+    let runtime = test_runtime(64, 4, 2);
     let drop = runtime.nodes().register_internal(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::empty(),
@@ -694,7 +692,7 @@ fn try_register_descriptor_registers_erased_descriptor() {
 
 #[test]
 fn try_register_descriptor_rejects_next_count_mismatch() {
-    let runtime = test_runtime(64, 4, 4, 2);
+    let runtime = test_runtime(64, 4, 2);
     let empty_nexts: &[NodeId] = &[];
     let descriptor = NodeDescriptor::new(
         count_process,
@@ -713,7 +711,7 @@ fn try_register_descriptor_rejects_next_count_mismatch() {
 
 #[test]
 fn add_node_next_slot_returns_u16_and_supports_slots_above_sixteen() {
-    let runtime = test_runtime(64, 4, 4, 2);
+    let runtime = test_runtime(64, 4, 2);
     let drop = runtime.nodes().register_internal(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::from_words([1, 0, 0, 0]),
@@ -751,7 +749,7 @@ fn add_node_next_slot_returns_u16_and_supports_slots_above_sixteen() {
 
 #[test]
 fn sparse_local_u16_slots_resolve_through_runtime() {
-    let runtime = test_runtime(64, 4, 4, 2);
+    let runtime = test_runtime(64, 4, 2);
     let mut initial = Vec::with_capacity(32);
     for word in 0..32u64 {
         initial.push(runtime.nodes().register_internal(DescriptorNode::plain(
@@ -796,7 +794,7 @@ fn sparse_local_u16_slots_resolve_through_runtime() {
 
 #[test]
 fn add_node_next_slot_keeps_sibling_tables_consistent() {
-    let runtime = test_runtime(64, 4, 4, 2);
+    let runtime = test_runtime(64, 4, 2);
     let seed = runtime.nodes().register_internal(DescriptorNode::plain(
         count_process,
         NodeRuntimeData::from_words([1, 0, 0, 0]),

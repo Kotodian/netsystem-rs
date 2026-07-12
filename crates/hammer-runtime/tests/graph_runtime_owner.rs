@@ -106,7 +106,6 @@ fn runtime_owner_registers_dispatches_traces_and_reports_stats() -> CoreResult<(
         buffers: DataPlaneBufferConfig {
             buffer_slot_capacity: 128,
             buffer_slots: 8,
-            frame_capacity: 4,
             frame_slots: 8,
             ..DataPlaneBufferConfig::default()
         },

@@ -13,14 +13,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 fn test_runtime_configured(
     buffer_slot_capacity: usize,
     buffer_slots: usize,
-    frame_capacity: usize,
     frame_slots: usize,
 ) -> DataPlaneRuntime {
     let config = DataPlaneRuntimeConfig {
         buffers: DataPlaneBufferConfig {
             buffer_slot_capacity,
             buffer_slots,
-            frame_capacity,
             frame_slots,
             ..DataPlaneBufferConfig::default()
         },
@@ -51,7 +49,7 @@ impl Node for BlackholeNode {
 impl InternalNode for BlackholeNode {}
 
 fn setup_output() -> (DataPlaneRuntime, hammer_core::data_plane::NodeId) {
-    let runtime = test_runtime_configured(2048, 16, 8, 8);
+    let runtime = test_runtime_configured(2048, 16, 8);
     let drop = runtime.nodes().register_internal(BlackholeNode);
     let lookup = runtime.nodes().register_internal(BlackholeNode);
     let output = runtime

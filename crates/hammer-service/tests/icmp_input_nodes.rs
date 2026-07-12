@@ -19,14 +19,12 @@ use std::mem::transmute;
 fn test_runtime_configured(
     buffer_slot_capacity: usize,
     buffer_slots: usize,
-    frame_capacity: usize,
     frame_slots: usize,
 ) -> DataPlaneRuntime {
     let config = DataPlaneRuntimeConfig {
         buffers: DataPlaneBufferConfig {
             buffer_slot_capacity,
             buffer_slots,
-            frame_capacity,
             frame_slots,
             ..DataPlaneBufferConfig::default()
         },
@@ -135,7 +133,7 @@ fn capture_process(
 
 #[test]
 fn icmp_input_dispatches_ipv4_echo_request_by_type() {
-    let runtime = test_runtime_configured(2048, 16, 8, 8);
+    let runtime = test_runtime_configured(2048, 16, 8);
     let echo_state = Arc::new(Mutex::new(CaptureState::default()));
     let punt_state = Arc::new(Mutex::new(CaptureState::default()));
     let echo = runtime
@@ -187,7 +185,7 @@ fn icmp_input_dispatches_ipv4_echo_request_by_type() {
 
 #[test]
 fn icmp_input_dispatches_ipv6_echo_request_by_type() {
-    let runtime = test_runtime_configured(2048, 16, 8, 8);
+    let runtime = test_runtime_configured(2048, 16, 8);
     let echo_state = Arc::new(Mutex::new(CaptureState::default()));
     let punt_state = Arc::new(Mutex::new(CaptureState::default()));
     let echo = runtime
@@ -218,7 +216,7 @@ fn icmp_input_dispatches_ipv6_echo_request_by_type() {
 
 #[test]
 fn icmp_input_sends_unknown_ipv4_type_to_default_next() {
-    let runtime = test_runtime_configured(2048, 16, 8, 8);
+    let runtime = test_runtime_configured(2048, 16, 8);
     let punt_state = Arc::new(Mutex::new(CaptureState::default()));
     let punt = runtime
         .nodes()
@@ -247,7 +245,7 @@ fn icmp_input_sends_unknown_ipv4_type_to_default_next() {
 
 #[test]
 fn icmp_input_rejects_ipv6_echo_request_with_nonzero_code() {
-    let runtime = test_runtime_configured(2048, 16, 8, 8);
+    let runtime = test_runtime_configured(2048, 16, 8);
     let echo_state = Arc::new(Mutex::new(CaptureState::default()));
     let punt_state = Arc::new(Mutex::new(CaptureState::default()));
     let echo = runtime

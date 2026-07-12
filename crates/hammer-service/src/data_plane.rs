@@ -215,7 +215,6 @@ mod tests {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 64,
                     buffer_slots: 4,
-                    frame_capacity: 2,
                     frame_slots: 4,
                     ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
@@ -253,7 +252,6 @@ mod tests {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 64,
                     buffer_slots: 4,
-                    frame_capacity: 2,
                     frame_slots: 4,
                     ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },

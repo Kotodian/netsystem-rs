@@ -27,7 +27,6 @@ fn buffer_and_frame_pools_share_nonzero_pool_id_namespace() {
     let buffers = DataPlaneBuffers::new(DataPlaneBufferConfig {
         buffer_slot_capacity: 64,
         buffer_slots: 2,
-        frame_capacity: 4,
         frame_slots: 2,
         ..DataPlaneBufferConfig::default()
     });
@@ -47,14 +46,12 @@ fn buffer_validation_reports_structured_foreign_stale_and_free_facts() {
     let first_buffers = DataPlaneBuffers::new(DataPlaneBufferConfig {
         buffer_slot_capacity: 64,
         buffer_slots: 2,
-        frame_capacity: 4,
         frame_slots: 4,
         ..DataPlaneBufferConfig::default()
     });
     let second_buffers = DataPlaneBuffers::new(DataPlaneBufferConfig {
         buffer_slot_capacity: 64,
         buffer_slots: 2,
-        frame_capacity: 4,
         frame_slots: 4,
         ..DataPlaneBufferConfig::default()
     });

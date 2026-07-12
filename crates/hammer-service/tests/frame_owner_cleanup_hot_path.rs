@@ -209,7 +209,6 @@ fn tun_runtime() -> DataPlaneRuntime {
         buffers: DataPlaneBufferConfig {
             buffer_slot_capacity: 256,
             buffer_slots: 8,
-            frame_capacity: 4,
             frame_slots: 4,
             ..DataPlaneBufferConfig::default()
         },

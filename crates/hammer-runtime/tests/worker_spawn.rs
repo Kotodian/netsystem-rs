@@ -14,7 +14,6 @@ fn test_runtime(thread_index: u32) -> DataPlaneRuntime {
     let buffers = DataPlaneBufferConfig {
         buffer_slot_capacity: 64,
         buffer_slots: 4,
-        frame_capacity: 16,
         frame_slots: 4,
         thread_index,
         ..DataPlaneBufferConfig::default()

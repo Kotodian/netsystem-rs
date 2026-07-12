@@ -614,7 +614,6 @@ where
             buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                 buffer_slot_capacity: 2048,
                 buffer_slots: 4,
-                frame_capacity: 4,
                 frame_slots: 4,
                 ..hammer_core::data_plane::DataPlaneBufferConfig::default()
             },
@@ -999,7 +998,6 @@ mod legacy_tests {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 32,
-                    frame_capacity: 8,
                     frame_slots: 8,
                     ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
@@ -1043,7 +1041,6 @@ mod legacy_tests {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 32,
-                    frame_capacity: 8,
                     frame_slots: 8,
                     ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
@@ -1103,7 +1100,6 @@ mod legacy_tests {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 32,
-                    frame_capacity: 8,
                     frame_slots: 8,
                     ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
@@ -1153,7 +1149,6 @@ mod legacy_tests {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 32,
-                    frame_capacity: 8,
                     frame_slots: 8,
                     ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
@@ -1222,7 +1217,6 @@ mod legacy_tests {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 32,
-                    frame_capacity: 8,
                     frame_slots: 8,
                     ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
@@ -1292,7 +1286,6 @@ mod legacy_tests {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 32,
-                    frame_capacity: 8,
                     frame_slots: 8,
                     ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },
@@ -1482,7 +1475,6 @@ mod legacy_tests {
                 buffers: hammer_core::data_plane::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
-                    frame_capacity: 8,
                     frame_slots: 8,
                     ..hammer_core::data_plane::DataPlaneBufferConfig::default()
                 },

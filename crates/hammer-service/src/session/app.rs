@@ -348,8 +348,6 @@ impl SessionAppRuntime<Local> {
         let mut config = hammer_core::config::Config::default();
         config.worker.buffer.slot_bytes = 2048;
         config.worker.buffer.slots_per_numa = 1;
-        config.worker.buffer.frame_capacity =
-            hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY;
         config.worker.buffer.frame_pool_size =
             hammer_core::data_plane::DEFAULT_BUFFER_FRAME_POOL_SIZE;
         let runtime = hammer_runtime::new_worker_runtime(&config);

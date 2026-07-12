@@ -36,13 +36,11 @@ const _: () =
 fn test_runtime(
     buffer_slot_capacity: usize,
     buffer_slots: usize,
-    frame_capacity: usize,
     frame_pool_size: usize,
 ) -> DataPlaneRuntime {
     let mut config = Config::default();
     config.worker.buffer.slot_bytes = buffer_slot_capacity;
     config.worker.buffer.slots_per_numa = buffer_slots;
-    config.worker.buffer.frame_capacity = frame_capacity;
     config.worker.buffer.frame_pool_size = frame_pool_size;
     new_worker_runtime(&config)
 }
@@ -207,7 +205,7 @@ where
 
 #[test]
 fn ip_lookup_node_uses_ipv4_mtrie_longest_prefix_match() {
-    let runtime = test_runtime(2048, 16, 8, 8);
+    let runtime = test_runtime(2048, 16, 8);
     let default_state = Arc::new(Mutex::new(SinkState::default()));
     let specific_state = Arc::new(Mutex::new(SinkState::default()));
     let host_state = Arc::new(Mutex::new(SinkState::default()));
@@ -307,7 +305,7 @@ fn ip_lookup_node_uses_ipv4_mtrie_longest_prefix_match() {
 
 #[test]
 fn ip_lookup_vector_enqueue_batches_same_next_in_one_output_frame() {
-    let runtime = test_runtime(2048, 8, 8, 4);
+    let runtime = test_runtime(2048, 8, 4);
     let state = Arc::new(Mutex::new(SinkState::default()));
     let sink = register_sink(&runtime, &state);
     let drop_node = runtime.nodes().register_internal(DropNode::new());
@@ -355,7 +353,7 @@ fn ip_lookup_vector_enqueue_batches_same_next_in_one_output_frame() {
 
 #[test]
 fn ip_lookup_node_uses_ipv6_hash_prefix_order() {
-    let runtime = test_runtime(2048, 16, 8, 8);
+    let runtime = test_runtime(2048, 16, 8);
     let default_state = Arc::new(Mutex::new(SinkState::default()));
     let subnet_state = Arc::new(Mutex::new(SinkState::default()));
     let host_state = Arc::new(Mutex::new(SinkState::default()));
@@ -417,7 +415,7 @@ fn ip_lookup_node_uses_ipv6_hash_prefix_order() {
 
 #[test]
 fn ip_lookup_node_sends_miss_to_drop_dpo() {
-    let runtime = test_runtime(2048, 8, 8, 4);
+    let runtime = test_runtime(2048, 8, 4);
     let drop = runtime.nodes().register_internal(DropNode::new());
     let lookup = runtime
         .nodes()
@@ -441,7 +439,7 @@ fn ip_lookup_node_sends_miss_to_drop_dpo() {
 
 #[test]
 fn ip_lookup_node_routes_receive_dpo_to_local_next() {
-    let runtime = test_runtime(2048, 8, 8, 4);
+    let runtime = test_runtime(2048, 8, 4);
     let state = Arc::new(Mutex::new(SinkState::default()));
     let drop = runtime.nodes().register_internal(DropNode::new());
     let udp = register_sink(&runtime, &state);
@@ -486,7 +484,7 @@ fn ip_lookup_node_routes_receive_dpo_to_local_next() {
 
 #[test]
 fn ip_lookup_node_routes_direct_receive_dpo_to_local_next() {
-    let runtime = test_runtime(2048, 8, 8, 4);
+    let runtime = test_runtime(2048, 8, 4);
     let state = Arc::new(Mutex::new(SinkState::default()));
     let drop = runtime.nodes().register_internal(DropNode::new());
     let udp = register_sink(&runtime, &state);
@@ -531,7 +529,7 @@ fn ip_lookup_node_routes_direct_receive_dpo_to_local_next() {
 
 #[test]
 fn ip_lookup_node_routes_stacked_dpo_with_parent_identity() {
-    let runtime = test_runtime(2048, 8, 8, 4);
+    let runtime = test_runtime(2048, 8, 4);
     let state = Arc::new(Mutex::new(SinkState::default()));
     let receive = register_sink(&runtime, &state);
     let drop_node = runtime.nodes().register_internal(DropNode::new());
@@ -569,7 +567,7 @@ fn ip_lookup_node_routes_stacked_dpo_with_parent_identity() {
 
 #[test]
 fn ip_lookup_node_routes_custom_dpo_to_custom_next() {
-    let runtime = test_runtime(2048, 8, 8, 4);
+    let runtime = test_runtime(2048, 8, 4);
     let state = Arc::new(Mutex::new(SinkState::default()));
     let custom = register_sink(&runtime, &state);
     let drop = runtime.nodes().register_internal(DropNode::new());
@@ -610,7 +608,7 @@ fn ip_lookup_node_routes_custom_dpo_to_custom_next() {
 
 #[test]
 fn adjacency_rewrite_node_prepends_rewrite_and_sets_egress_interface() {
-    let runtime = test_runtime(2048, 8, 8, 4);
+    let runtime = test_runtime(2048, 8, 4);
     let state = Arc::new(Mutex::new(SinkState::default()));
     let sink = register_sink(&runtime, &state);
     let drop_node = runtime.nodes().register_internal(DropNode::new());
@@ -706,7 +704,7 @@ fn adjacency_rewrite_node_prepends_rewrite_and_sets_egress_interface() {
 
 #[test]
 fn adjacency_rewrite_node_prepends_rewrite_when_packet_has_headroom() {
-    let runtime = test_runtime(256, 16, 8, 4);
+    let runtime = test_runtime(256, 16, 4);
     let state = Arc::new(Mutex::new(SinkState::default()));
     let sink = register_sink(&runtime, &state);
     let drop_node = runtime.nodes().register_internal(DropNode::new());
@@ -773,7 +771,7 @@ fn adjacency_rewrite_node_prepends_rewrite_when_packet_has_headroom() {
 
 #[test]
 fn adjacency_rewrite_node_drops_missing_forwarding_and_missing_adjacency() {
-    let runtime = test_runtime(2048, 8, 8, 4);
+    let runtime = test_runtime(2048, 8, 4);
     let drop = runtime.nodes().register_internal(DropNode::new());
     let control = IpLookupControlPlane::new(FibTableBuilder::new(drop).build());
     let rewrite_node = runtime
@@ -825,7 +823,7 @@ fn adjacency_rewrite_node_drops_missing_forwarding_and_missing_adjacency() {
 
 #[test]
 fn ip_lookup_control_plane_publish_replaces_forwarding_table() {
-    let runtime = test_runtime(2048, 8, 8, 4);
+    let runtime = test_runtime(2048, 8, 4);
     let first_state = Arc::new(Mutex::new(SinkState::default()));
     let second_state = Arc::new(Mutex::new(SinkState::default()));
     let first = register_sink(&runtime, &first_state);
@@ -883,7 +881,7 @@ fn ip_lookup_control_plane_publish_runs_through_runtime_data_plane_barrier() {
     let data_runtime =
         DataRuntime::new(1, "ip-lookup-barrier-test", 512 * 1024, 2).expect("data runtime");
     let barrier = data_runtime.data_plane_barrier();
-    let runtime = test_runtime(2048, 8, 8, 4);
+    let runtime = test_runtime(2048, 8, 4);
     let drop = runtime.nodes().register_internal(DropNode::new());
     let control =
         IpLookupControlPlane::new(FibTableBuilder::new(drop).build()).with_barrier(barrier.clone());
@@ -908,7 +906,7 @@ fn ip_lookup_control_plane_publish_runs_through_runtime_data_plane_barrier() {
 
 #[test]
 fn ip_input_to_lookup_graph_routes_packet_by_fib() {
-    let runtime = test_runtime(2048, 8, 8, 4);
+    let runtime = test_runtime(2048, 8, 4);
     let state = Arc::new(Mutex::new(SinkState::default()));
     let sink = register_sink(&runtime, &state);
     let drop = runtime.nodes().register_internal(DropNode::new());
@@ -947,7 +945,7 @@ fn ip_input_to_lookup_graph_routes_packet_by_fib() {
 
 #[test]
 fn ip_input_batches_lookup_packets_into_one_scheduled_next_frame() {
-    let runtime = test_runtime(2048, 8, 8, 4);
+    let runtime = test_runtime(2048, 8, 4);
     let state = Arc::new(Mutex::new(SinkState::default()));
     let sink = register_sink(&runtime, &state);
     let drop = runtime.nodes().register_internal(DropNode::new());
@@ -990,7 +988,7 @@ fn ip_input_batches_lookup_packets_into_one_scheduled_next_frame() {
 
 #[test]
 fn ip_lookup_uses_ip_input_cursor_without_reparsing_current_header() {
-    let runtime = test_runtime(2048, 8, 8, 4);
+    let runtime = test_runtime(2048, 8, 4);
     let state = Arc::new(Mutex::new(SinkState::default()));
     let sink = register_sink(&runtime, &state);
     let drop = runtime.nodes().register_internal(DropNode::new());

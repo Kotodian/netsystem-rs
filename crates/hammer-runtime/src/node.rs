@@ -1522,7 +1522,6 @@ mod tests {
             buffers: DataPlaneBufferConfig {
                 buffer_slot_capacity: 16,
                 buffer_slots: 8,
-                frame_capacity: 4,
                 frame_slots: 2,
                 ..DataPlaneBufferConfig::default()
             },

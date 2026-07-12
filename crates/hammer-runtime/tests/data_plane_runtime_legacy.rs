@@ -7,7 +7,8 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use hammer_core::data_plane::{
     BufferFrame, BufferFramePairBatch, BufferFrameQuadBatch, Index, BufferPacketCursor,
-    BufferPool, BufferPoolArena, BufferRefMut, DataPlaneBufferConfig, DataPlaneBuffers, NodeId,
+    BufferPool, BufferPoolArena, BufferRefMut, DEFAULT_BUFFER_FRAME_CAPACITY, DataPlaneBufferConfig,
+    DataPlaneBuffers, NodeId,
 };
 use hammer_core::error::CoreResult;
 use hammer_infra::vec::Vec;
@@ -41,13 +42,11 @@ fn test_runtime(buffer_slot_capacity: usize, buffer_slots: usize) -> DataPlaneRu
 fn test_runtime_configured(
     buffer_slot_capacity: usize,
     buffer_slots: usize,
-    frame_capacity: usize,
     frame_slots: usize,
 ) -> DataPlaneRuntime {
     test_runtime_configured_instruction_set(
         buffer_slot_capacity,
         buffer_slots,
-        frame_capacity,
         frame_slots,
         DataPlaneInstructionSet::native(),
     )
@@ -56,7 +55,6 @@ fn test_runtime_configured(
 fn test_runtime_configured_instruction_set(
     buffer_slot_capacity: usize,
     buffer_slots: usize,
-    frame_capacity: usize,
     frame_slots: usize,
     instruction_set: DataPlaneInstructionSet,
 ) -> DataPlaneRuntime {
@@ -65,7 +63,6 @@ fn test_runtime_configured_instruction_set(
             buffers: DataPlaneBufferConfig {
                 buffer_slot_capacity,
                 buffer_slots,
-                frame_capacity,
                 frame_slots,
                 ..DataPlaneBufferConfig::default()
             },
@@ -74,13 +71,12 @@ fn test_runtime_configured_instruction_set(
     )
 }
 
-fn pool_cleanup_runtime(pool: &BufferPool, frame_capacity: usize) -> DataPlaneRuntime {
-    let handoff = DataPlaneHandoff::new_shared_buffer_arena(1, frame_capacity.max(1), pool.arena());
+fn pool_cleanup_runtime(pool: &BufferPool, queue_capacity: usize) -> DataPlaneRuntime {
+    let handoff = DataPlaneHandoff::new_shared_buffer_arena(1, queue_capacity.max(1), pool.arena());
     DataPlaneRuntime::attach_handoff_worker(
         test_runtime_configured_instruction_set(
             1,
             1,
-            frame_capacity.max(1),
             1,
             DataPlaneInstructionSet::native(),
         ),
@@ -406,7 +402,7 @@ fn buffer_header_and_packet_data_start_cacheline_aligned() {
 
 #[test]
 fn buffer_exposes_vpp_style_current_pointer_and_advance() {
-    let runtime: DataPlaneRuntime = test_runtime_configured(128, 1, 1, 1);
+    let runtime: DataPlaneRuntime = test_runtime_configured(128, 1, 1);
     let buffer = runtime
         .alloc_index_with_bytes(b"network-transport")
         .expect("alloc buffer");
@@ -815,7 +811,7 @@ fn instruction_set_selects_preferred_frame_batch_width() {
 #[test]
 fn data_plane_runtime_can_use_explicit_instruction_set() {
     let runtime: DataPlaneRuntime =
-        test_runtime_configured_instruction_set(8, 4, 2, 1, DataPlaneInstructionSet::Avx2);
+        test_runtime_configured_instruction_set(8, 4, 1, DataPlaneInstructionSet::Avx2);
 
     assert_eq!(runtime.instruction_set(), DataPlaneInstructionSet::Avx2);
     assert_eq!(runtime.preferred_frame_batch_width(), FrameBatchWidth::Quad);
@@ -823,7 +819,7 @@ fn data_plane_runtime_can_use_explicit_instruction_set() {
 
 #[test]
 fn data_plane_runtime_defaults_to_native_instruction_set() {
-    let runtime: DataPlaneRuntime = test_runtime_configured(8, 4, 2, 1);
+    let runtime: DataPlaneRuntime = test_runtime_configured(8, 4, 1);
 
     assert_eq!(runtime.instruction_set(), DataPlaneInstructionSet::native());
     assert_eq!(
@@ -865,12 +861,12 @@ fn handoff_workers_share_buffer_arena_and_keep_per_worker_free_cache() {
     let arena = BufferPoolArena::with_capacity(8, 4);
     let handoff = DataPlaneHandoff::new_shared_buffer_arena(2, 4, arena);
     let first: DataPlaneRuntime = DataPlaneRuntime::attach_handoff_worker(
-        test_runtime_configured_instruction_set(8, 4, 2, 2, DataPlaneInstructionSet::Scalar),
+        test_runtime_configured_instruction_set(8, 4, 2, DataPlaneInstructionSet::Scalar),
         DataWorkerId::new(0),
         handoff.worker(DataWorkerId::new(0)),
     );
     let second: DataPlaneRuntime = DataPlaneRuntime::attach_handoff_worker(
-        test_runtime_configured_instruction_set(8, 4, 2, 2, DataPlaneInstructionSet::Scalar),
+        test_runtime_configured_instruction_set(8, 4, 2, DataPlaneInstructionSet::Scalar),
         DataWorkerId::new(1),
         handoff.worker(DataWorkerId::new(1)),
     );
@@ -913,12 +909,12 @@ fn handoff_workers_share_buffer_arena_and_keep_per_worker_free_cache() {
 fn queue_only_handoff_constructor_keeps_runtime_buffer_arenas_separate() {
     let handoff = DataPlaneHandoff::new(2, 4);
     let first: DataPlaneRuntime = DataPlaneRuntime::attach_handoff_worker(
-        test_runtime_configured(8, 4, 2, 2),
+        test_runtime_configured(8, 4, 2),
         DataWorkerId::new(0),
         handoff.worker(DataWorkerId::new(0)),
     );
     let second: DataPlaneRuntime = DataPlaneRuntime::attach_handoff_worker(
-        test_runtime_configured(8, 4, 2, 2),
+        test_runtime_configured(8, 4, 2),
         DataWorkerId::new(1),
         handoff.worker(DataWorkerId::new(1)),
     );
@@ -941,7 +937,7 @@ fn queue_only_handoff_constructor_keeps_runtime_buffer_arenas_separate() {
 
 #[test]
 fn buffer_frame_owner_drop_frees_buffers() {
-    let runtime: DataPlaneRuntime = test_runtime_configured(8, 4, 2, 1);
+    let runtime: DataPlaneRuntime = test_runtime_configured(8, 4, 1);
     let pool = runtime.buffers().try_buffers().expect("active buffer pool");
     let mut frame = runtime
         .buffers()
@@ -967,7 +963,7 @@ fn buffer_frame_owner_drop_frees_buffers() {
 
 #[test]
 fn buffer_pool_drop_frame_releases_all_indices_and_reuses_frame() {
-    let runtime: DataPlaneRuntime = test_runtime_configured(8, 4, 2, 1);
+    let runtime: DataPlaneRuntime = test_runtime_configured(8, 4, 1);
     let pool = runtime.buffers().try_buffers().expect("active buffer pool");
     let mut frame = runtime
         .buffers()
@@ -1005,7 +1001,7 @@ fn buffer_pool_drop_frame_releases_all_indices_and_reuses_frame() {
 
 #[test]
 fn buffer_frame_tracks_pending_indices_until_owner_drop() {
-    let runtime: DataPlaneRuntime = test_runtime_configured(8, 4, 2, 1);
+    let runtime: DataPlaneRuntime = test_runtime_configured(8, 4, 1);
     let pool = runtime.buffers().try_buffers().expect("active buffer pool");
     let mut frame = runtime
         .buffers()
@@ -1035,7 +1031,7 @@ fn buffer_frame_tracks_pending_indices_until_owner_drop() {
 
 #[test]
 fn buffer_frame_pending_future_wakes_when_index_is_pushed() {
-    let runtime: DataPlaneRuntime = test_runtime_configured(8, 2, 1, 1);
+    let runtime: DataPlaneRuntime = test_runtime_configured(8, 2, 1);
     let mut frame = runtime
         .buffers()
         .get_next_frame(NodeId::new(0))
@@ -1067,7 +1063,7 @@ fn buffer_frame_pending_future_wakes_when_index_is_pushed() {
 
 #[test]
 fn buffer_frame_push_indices_batches_one_wake() {
-    let runtime: DataPlaneRuntime = test_runtime_configured(8, 4, 2, 1);
+    let runtime: DataPlaneRuntime = test_runtime_configured(8, 4, 1);
     let mut frame = runtime
         .buffers()
         .get_next_frame(NodeId::new(0))
@@ -1100,7 +1096,7 @@ fn buffer_frame_push_indices_batches_one_wake() {
 
 #[test]
 fn buffer_frame_pair_batch_cursor_splits_into_pairs_then_tail() {
-    let runtime: DataPlaneRuntime = test_runtime_configured(8, 8, 8, 1);
+    let runtime: DataPlaneRuntime = test_runtime_configured(8, 8, 1);
     let pool = runtime.buffers().try_buffers().expect("active buffer pool");
     let mut frame = runtime
         .buffers()
@@ -1132,7 +1128,7 @@ fn buffer_frame_pair_batch_cursor_splits_into_pairs_then_tail() {
 
 #[test]
 fn buffer_frame_quad_batch_cursor_splits_into_quad_pair_then_tail() {
-    let runtime: DataPlaneRuntime = test_runtime_configured(8, 8, 8, 1);
+    let runtime: DataPlaneRuntime = test_runtime_configured(8, 8, 1);
     let pool = runtime.buffers().try_buffers().expect("active buffer pool");
     let mut frame = runtime
         .buffers()
@@ -1164,7 +1160,7 @@ fn buffer_frame_quad_batch_cursor_splits_into_quad_pair_then_tail() {
 
 #[test]
 fn buffer_frame_batch_cursors_are_empty_for_empty_frame() {
-    let runtime: DataPlaneRuntime = test_runtime_configured(8, 2, 8, 1);
+    let runtime: DataPlaneRuntime = test_runtime_configured(8, 2, 1);
     let frame = runtime
         .buffers()
         .get_next_frame(NodeId::new(0))
@@ -1178,7 +1174,7 @@ fn buffer_frame_batch_cursors_are_empty_for_empty_frame() {
 
 #[test]
 fn buffer_frame_batch_cursor_uses_requested_width() {
-    let runtime: DataPlaneRuntime = test_runtime_configured(8, 8, 8, 1);
+    let runtime: DataPlaneRuntime = test_runtime_configured(8, 8, 1);
     let mut frame = runtime
         .buffers()
         .get_next_frame(NodeId::new(0))
@@ -1211,9 +1207,9 @@ fn buffer_frame_batch_cursor_uses_requested_width() {
 #[test]
 fn buffer_frame_batch_dispatch_uses_runtime_preferred_width() {
     let quad_runtime: DataPlaneRuntime =
-        test_runtime_configured_instruction_set(8, 8, 8, 1, DataPlaneInstructionSet::Avx2);
+        test_runtime_configured_instruction_set(8, 8, 1, DataPlaneInstructionSet::Avx2);
     let pair_runtime: DataPlaneRuntime =
-        test_runtime_configured_instruction_set(8, 8, 8, 1, DataPlaneInstructionSet::Scalar);
+        test_runtime_configured_instruction_set(8, 8, 1, DataPlaneInstructionSet::Scalar);
     let mut quad_frame = quad_runtime
         .buffers()
         .get_next_frame(NodeId::new(0))
@@ -1258,32 +1254,35 @@ fn buffer_frame_batch_dispatch_uses_runtime_preferred_width() {
 }
 
 #[test]
-fn buffer_frame_push_index_respects_preallocated_capacity() {
-    let runtime: DataPlaneRuntime = test_runtime_configured(8, 4, 1, 1);
+fn buffer_frame_push_index_respects_production_capacity() {
+    let runtime: DataPlaneRuntime =
+        test_runtime_configured(8, DEFAULT_BUFFER_FRAME_CAPACITY + 1, 1);
     let pool = runtime.buffers().try_buffers().expect("active buffer pool");
     let mut frame = runtime
         .buffers()
         .get_next_frame(NodeId::new(0))
         .expect("alloc frame");
-    let first = pool
-        .alloc_index_with_bytes(b"first")
-        .expect("alloc first frame buffer");
-    let second = pool
-        .alloc_index_with_bytes(b"second")
-        .expect("alloc second frame buffer");
+    assert_eq!(frame.capacity(), DEFAULT_BUFFER_FRAME_CAPACITY);
 
-    frame.push_index(first).expect("push first frame index");
-    assert!(frame.push_index(second).is_err());
-    assert_eq!(frame.indices(), &[first]);
-    assert_eq!(pool.in_use(), 2);
+    let mut owned = Vec::new();
+    for _ in 0..DEFAULT_BUFFER_FRAME_CAPACITY {
+        let index = pool.alloc_index().expect("alloc frame buffer");
+        frame.push_index(index).expect("push within production capacity");
+        owned.push(index);
+    }
+    let overflow = pool.alloc_index().expect("overflow buffer");
+    assert!(frame.push_index(overflow).is_err());
+    assert_eq!(frame.len(), DEFAULT_BUFFER_FRAME_CAPACITY);
+    assert_eq!(frame.indices(), owned.as_slice());
+    assert_eq!(pool.in_use(), DEFAULT_BUFFER_FRAME_CAPACITY + 1);
 
     drop(frame);
-    drop_owned_index!(&pool, second);
+    drop_owned_index!(&pool, overflow);
 }
 
 #[test]
 fn data_plane_runtime_allocates_frame_indices_from_reusable_pool() {
-    let runtime: DataPlaneRuntime = test_runtime_configured(8, 4, 2, 1);
+    let runtime: DataPlaneRuntime = test_runtime_configured(8, 4, 1);
     let mut frame = runtime
         .buffers()
         .get_next_frame(NodeId::new(0))
@@ -1333,7 +1332,7 @@ fn data_plane_runtime_allocates_frame_indices_from_reusable_pool() {
 
 #[test]
 fn frame_ref_mut_push_indices_batches_into_pooled_frame() {
-    let runtime: DataPlaneRuntime = test_runtime_configured(8, 4, 2, 1);
+    let runtime: DataPlaneRuntime = test_runtime_configured(8, 4, 1);
     let mut frame = runtime
         .buffers()
         .get_next_frame(NodeId::new(0))
@@ -1356,7 +1355,7 @@ fn frame_ref_mut_push_indices_batches_into_pooled_frame() {
 
 #[test]
 fn data_plane_runtime_checks_out_pooled_frame_for_packet_interfaces() {
-    let runtime: DataPlaneRuntime = test_runtime_configured(8, 4, 2, 1);
+    let runtime: DataPlaneRuntime = test_runtime_configured(8, 4, 1);
     let mut frame = runtime
         .buffers()
         .get_next_frame(NodeId::new(0))
@@ -1393,7 +1392,7 @@ fn data_plane_runtime_checks_out_pooled_frame_for_packet_interfaces() {
 
 #[test]
 fn buffer_frame_lazy_state_retain_compacts_after_first_drop() {
-    let runtime: DataPlaneRuntime = test_runtime_configured(8, 8, 8, 1);
+    let runtime: DataPlaneRuntime = test_runtime_configured(8, 8, 1);
     let mut frame = runtime
         .buffers()
         .get_next_frame(NodeId::new(0))
