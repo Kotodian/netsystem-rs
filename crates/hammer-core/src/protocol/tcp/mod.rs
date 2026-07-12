@@ -13,9 +13,7 @@ pub use options::{
     ParsedTcpOptions, TcpSackBlock, TcpTimestampOption, tcp_capabilities_from_options,
     tcp_options_from_bytes,
 };
-pub use segment::{
-    TcpSegmentHeader, TcpWireHeader, tcp_header, tcp_segment_header_len, write_tcp_segment_header,
-};
+pub use segment::{TcpSegmentHeader, TcpWireHeader, tcp_header};
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]

@@ -157,35 +157,36 @@ pub struct TcpSegmentHeader<'a> {
     pub fast_open_cookie: Option<&'a TcpFastOpenCookie>,
 }
 
-pub fn write_tcp_segment_header(
-    output: &mut [u8],
-    header: TcpSegmentHeader<'_>,
-    sack_blocks: Option<&[TcpSackBlock]>,
-) -> Result<usize, TcpError> {
-    let header_len = tcp_segment_header_len(header, sack_blocks);
-    if output.len() < header_len {
-        return Err(TcpError::Length);
+impl TcpSegmentHeader<'_> {
+    /// Header + options length, matching VPP `tcp_hdr_opts_len` sizing.
+    #[inline]
+    pub fn header_len(self, sack_blocks: Option<&[TcpSackBlock]>) -> usize {
+        TCP_HEADER_MIN_LEN + tcp_options_len(self, sack_blocks)
     }
-    output[..header_len].fill(0);
-    let wire = tcp_wire_header_mut(output);
-    wire.set_source_port(header.source_port);
-    wire.set_destination_port(header.destination_port);
-    wire.set_sequence_number(header.sequence_number);
-    wire.set_acknowledgment_number(header.acknowledgment_number);
-    wire.set_data_offset_flags(tcp_data_offset_flags(header_len, header.flags));
-    wire.set_advertised_window(header.advertised_window);
-    wire.set_urgent_pointer(header.urgent_pointer);
-    let options = &mut output[TCP_HEADER_MIN_LEN..header_len];
-    write_tcp_options(options, header, sack_blocks);
-    Ok(header_len)
-}
 
-#[inline]
-pub fn tcp_segment_header_len(
-    header: TcpSegmentHeader<'_>,
-    sack_blocks: Option<&[TcpSackBlock]>,
-) -> usize {
-    TCP_HEADER_MIN_LEN + tcp_options_len(header, sack_blocks)
+    /// Write this header into a buffer slice (VPP `vlib_buffer_push_tcp` wire layout).
+    pub fn write_to_buffer(
+        self,
+        output: &mut [u8],
+        sack_blocks: Option<&[TcpSackBlock]>,
+    ) -> Result<usize, TcpError> {
+        let header_len = self.header_len(sack_blocks);
+        if output.len() < header_len {
+            return Err(TcpError::Length);
+        }
+        output[..header_len].fill(0);
+        let wire = tcp_wire_header_mut(output);
+        wire.set_source_port(self.source_port);
+        wire.set_destination_port(self.destination_port);
+        wire.set_sequence_number(self.sequence_number);
+        wire.set_acknowledgment_number(self.acknowledgment_number);
+        wire.set_data_offset_flags(tcp_data_offset_flags(header_len, self.flags));
+        wire.set_advertised_window(self.advertised_window);
+        wire.set_urgent_pointer(self.urgent_pointer);
+        let options = &mut output[TCP_HEADER_MIN_LEN..header_len];
+        write_tcp_options(options, self, sack_blocks);
+        Ok(header_len)
+    }
 }
 
 #[inline(always)]
@@ -359,25 +360,22 @@ mod tests {
         let cookie: TcpFastOpenCookie = (&[1, 2, 3, 4][..]).try_into().expect("cookie");
         let mut output = [0u8; 64];
 
-        let written = write_tcp_segment_header(
-            &mut output,
-            TcpSegmentHeader {
-                source_port: 1000,
-                destination_port: 2000,
-                sequence_number: 1,
-                acknowledgment_number: 0,
-                flags: TcpSegmentFlags::SYN,
-                advertised_window: 4096,
-                urgent_pointer: 0,
-                capabilities: TcpCapabilities {
-                    fast_open: true,
-                    ..TcpCapabilities::default()
-                },
-                timestamp: None,
-                fast_open_cookie: Some(&cookie),
+        let written = TcpSegmentHeader {
+            source_port: 1000,
+            destination_port: 2000,
+            sequence_number: 1,
+            acknowledgment_number: 0,
+            flags: TcpSegmentFlags::SYN,
+            advertised_window: 4096,
+            urgent_pointer: 0,
+            capabilities: TcpCapabilities {
+                fast_open: true,
+                ..TcpCapabilities::default()
             },
-            None,
-        )
+            timestamp: None,
+            fast_open_cookie: Some(&cookie),
+        }
+        .write_to_buffer(&mut output, None)
         .expect("write header");
 
         assert_eq!(

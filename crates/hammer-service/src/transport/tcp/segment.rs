@@ -7,7 +7,7 @@ use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::{
     TcpCapabilities, TcpError, TcpFastOpenCookie, TcpPacket, TcpSackBlock, TcpSegmentFlags,
     TcpSegmentHeader, TcpSeq, TcpTimestampOption, TcpWireHeader, tcp_header,
-    tcp_options_from_bytes, tcp_segment_header_len, write_tcp_segment_header,
+    tcp_options_from_bytes,
 };
 use hammer_runtime::DataPlaneRuntime;
 
@@ -64,12 +64,12 @@ impl TcpSegment {
 
     #[inline]
     pub fn write_header(&self, output: &mut [u8]) -> Result<usize, TcpError> {
-        write_tcp_segment_header(output, self.header(), self.sack_blocks())
+        self.header().write_to_buffer(output, self.sack_blocks())
     }
 
     #[inline]
     pub fn header_len(&self) -> usize {
-        tcp_segment_header_len(self.header(), self.sack_blocks())
+        self.header().header_len(self.sack_blocks())
     }
 
     #[inline]

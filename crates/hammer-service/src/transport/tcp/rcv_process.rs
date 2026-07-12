@@ -534,8 +534,7 @@ mod tests {
         payload: &[u8],
     ) -> Result<std::vec::Vec<u8>, hammer_core::protocol::tcp::TcpError> {
         let mut tcp = [0u8; 60];
-        let tcp_header_len =
-            hammer_core::protocol::tcp::write_tcp_segment_header(&mut tcp, header, None)?;
+        let tcp_header_len = header.write_to_buffer(&mut tcp, None)?;
         let tcp_len = tcp_header_len
             .checked_add(payload.len())
             .ok_or(hammer_core::protocol::tcp::TcpError::Dispatch)?;

@@ -1,7 +1,7 @@
 use hammer_core::error::CoreError;
 use hammer_core::protocol::tcp::{
     TcpCapabilities, TcpError, TcpSackBlock, TcpSegmentFlags, TcpSegmentHeader, TcpSeq,
-    TcpWireHeader, tcp_header, tcp_options_from_bytes, write_tcp_segment_header,
+    TcpWireHeader, tcp_header, tcp_options_from_bytes,
 };
 
 #[test]
@@ -96,22 +96,19 @@ fn core_tcp_write_ack_with_sack_blocks() {
 #[test]
 fn core_tcp_write_urgent_pointer_when_urg_set() {
     let mut output = [0u8; 64];
-    let written = write_tcp_segment_header(
-        &mut output,
-        TcpSegmentHeader {
-            source_port: 49_152,
-            destination_port: 443,
-            sequence_number: 0x0102_0304,
-            acknowledgment_number: 0x1112_1314,
-            flags: TcpSegmentFlags::ACK | TcpSegmentFlags::URG,
-            advertised_window: 32_768,
-            urgent_pointer: 7,
-            capabilities: TcpCapabilities::default(),
-            timestamp: None,
-            fast_open_cookie: None,
-        },
-        None,
-    )
+    let written = TcpSegmentHeader {
+        source_port: 49_152,
+        destination_port: 443,
+        sequence_number: 0x0102_0304,
+        acknowledgment_number: 0x1112_1314,
+        flags: TcpSegmentFlags::ACK | TcpSegmentFlags::URG,
+        advertised_window: 32_768,
+        urgent_pointer: 7,
+        capabilities: TcpCapabilities::default(),
+        timestamp: None,
+        fast_open_cookie: None,
+    }
+    .write_to_buffer(&mut output, None)
     .expect("write urg header");
     assert_eq!(written, 20);
     let wire = tcp_header(&output[..written]).expect("parse");
@@ -162,20 +159,17 @@ fn write_header_for_test(
     flags: TcpSegmentFlags,
     sack_blocks: &[TcpSackBlock],
 ) -> Result<usize, CoreError> {
-    Ok(write_tcp_segment_header(
-        output,
-        TcpSegmentHeader {
-            source_port: 49_152,
-            destination_port: 443,
-            sequence_number: 0x0102_0304,
-            acknowledgment_number: 0x1112_1314,
-            flags,
-            advertised_window: 32_768,
-            urgent_pointer: 0,
-            capabilities: TcpCapabilities::default(),
-            timestamp: None,
-            fast_open_cookie: None,
-        },
-        Some(sack_blocks),
-    )?)
+    Ok(TcpSegmentHeader {
+        source_port: 49_152,
+        destination_port: 443,
+        sequence_number: 0x0102_0304,
+        acknowledgment_number: 0x1112_1314,
+        flags,
+        advertised_window: 32_768,
+        urgent_pointer: 0,
+        capabilities: TcpCapabilities::default(),
+        timestamp: None,
+        fast_open_cookie: None,
+    }
+    .write_to_buffer(output, Some(sack_blocks))?)
 }

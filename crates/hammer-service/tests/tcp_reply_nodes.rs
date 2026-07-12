@@ -1,8 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use hammer_core::protocol::tcp::{
-    TcpCapabilities, TcpError, TcpSegmentFlags, TcpSegmentHeader, write_tcp_segment_header,
-};
+use hammer_core::protocol::tcp::{TcpCapabilities, TcpError, TcpSegmentFlags, TcpSegmentHeader};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 
 fn v4(a: u8, b: u8, c: u8, d: u8, port: u16) -> SocketAddr {
@@ -59,7 +57,7 @@ fn tcp_control_packet(
     payload: &[u8],
 ) -> Result<std::vec::Vec<u8>, TcpError> {
     let mut tcp = [0u8; 60];
-    let tcp_header_len = write_tcp_segment_header(&mut tcp, header, None)?;
+    let tcp_header_len = header.write_to_buffer(&mut tcp, None)?;
     let tcp_len = tcp_header_len
         .checked_add(payload.len())
         .ok_or(TcpError::Dispatch)?;

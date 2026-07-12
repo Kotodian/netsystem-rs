@@ -231,7 +231,9 @@ where
                 session_id,
                 index,
                 offset,
-                packet.flags.contains(hammer_core::protocol::tcp::TcpSegmentFlags::URG),
+                packet
+                    .flags
+                    .contains(hammer_core::protocol::tcp::TcpSegmentFlags::URG),
             )?;
             let (_, connection_index) = queue
                 .sessions()
@@ -354,7 +356,7 @@ mod tests {
     use hammer_core::error::CoreResult;
     use hammer_core::protocol::ip::write_ipv4_push_header;
     use hammer_core::protocol::tcp::{
-        TcpCapabilities, TcpConnectionId, TcpSegmentFlags, TcpSegmentHeader, write_tcp_segment_header,
+        TcpCapabilities, TcpConnectionId, TcpSegmentFlags, TcpSegmentHeader,
     };
     use hammer_infra::pool::Index as PoolIndex;
     use hammer_infra::segment::Local;
@@ -520,7 +522,6 @@ mod tests {
         (session_id, connection.rcv_nxt(), connection.snd_nxt())
     }
 
-
     #[test]
     fn in_order_payload_advances_receive_window() {
         let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
@@ -547,22 +548,19 @@ mod tests {
             let mut buffer = runtime.get_buffer_mut(index).expect("buffer mut");
             {
                 let tcp = buffer.prepend_mut(20).expect("tcp header");
-                write_tcp_segment_header(
-                    tcp,
-                    TcpSegmentHeader {
-                        source_port: REMOTE_PORT,
-                        destination_port: LOCAL_PORT,
-                        sequence_number: rcv_nxt,
-                        acknowledgment_number: snd_nxt,
-                        flags: TcpSegmentFlags::ACK | TcpSegmentFlags::PSH,
-                        advertised_window: u16::MAX,
-                        urgent_pointer: 0,
-                        capabilities: TcpCapabilities::default(),
-                        timestamp: None,
-                        fast_open_cookie: None,
-                    },
-                    None,
-                )
+                TcpSegmentHeader {
+                    source_port: REMOTE_PORT,
+                    destination_port: LOCAL_PORT,
+                    sequence_number: rcv_nxt,
+                    acknowledgment_number: snd_nxt,
+                    flags: TcpSegmentFlags::ACK | TcpSegmentFlags::PSH,
+                    advertised_window: u16::MAX,
+                    urgent_pointer: 0,
+                    capabilities: TcpCapabilities::default(),
+                    timestamp: None,
+                    fast_open_cookie: None,
+                }
+                .write_to_buffer(tcp, None)
                 .expect("write tcp");
             }
             {
@@ -628,22 +626,19 @@ mod tests {
                 let mut buffer = runtime.get_buffer_mut(index).expect("buffer mut");
                 {
                     let tcp = buffer.prepend_mut(20).expect("tcp header");
-                    write_tcp_segment_header(
-                        tcp,
-                        TcpSegmentHeader {
-                            source_port: REMOTE_PORT,
-                            destination_port: LOCAL_PORT,
-                            sequence_number: rcv_nxt,
-                            acknowledgment_number: snd_nxt,
-                            flags: TcpSegmentFlags::ACK | TcpSegmentFlags::PSH,
-                            advertised_window: u16::MAX,
-                            urgent_pointer: 0,
-                            capabilities: TcpCapabilities::default(),
-                            timestamp: None,
-                            fast_open_cookie: None,
-                        },
-                        None,
-                    )
+                    TcpSegmentHeader {
+                        source_port: REMOTE_PORT,
+                        destination_port: LOCAL_PORT,
+                        sequence_number: rcv_nxt,
+                        acknowledgment_number: snd_nxt,
+                        flags: TcpSegmentFlags::ACK | TcpSegmentFlags::PSH,
+                        advertised_window: u16::MAX,
+                        urgent_pointer: 0,
+                        capabilities: TcpCapabilities::default(),
+                        timestamp: None,
+                        fast_open_cookie: None,
+                    }
+                    .write_to_buffer(tcp, None)
                     .expect("write tcp");
                 }
                 {
@@ -712,22 +707,19 @@ mod tests {
             let mut buffer = runtime.get_buffer_mut(index).expect("buffer mut");
             {
                 let tcp = buffer.prepend_mut(20).expect("tcp header");
-                write_tcp_segment_header(
-                    tcp,
-                    TcpSegmentHeader {
-                        source_port: REMOTE_PORT,
-                        destination_port: LOCAL_PORT,
-                        sequence_number: rcv_nxt,
-                        acknowledgment_number: snd_nxt,
-                        flags: TcpSegmentFlags::FIN | TcpSegmentFlags::ACK,
-                        advertised_window: u16::MAX,
-                        urgent_pointer: 0,
-                        capabilities: TcpCapabilities::default(),
-                        timestamp: None,
-                        fast_open_cookie: None,
-                    },
-                    None,
-                )
+                TcpSegmentHeader {
+                    source_port: REMOTE_PORT,
+                    destination_port: LOCAL_PORT,
+                    sequence_number: rcv_nxt,
+                    acknowledgment_number: snd_nxt,
+                    flags: TcpSegmentFlags::FIN | TcpSegmentFlags::ACK,
+                    advertised_window: u16::MAX,
+                    urgent_pointer: 0,
+                    capabilities: TcpCapabilities::default(),
+                    timestamp: None,
+                    fast_open_cookie: None,
+                }
+                .write_to_buffer(tcp, None)
                 .expect("write tcp");
             }
             {
@@ -794,22 +786,19 @@ mod tests {
             let mut buffer = runtime.get_buffer_mut(index).expect("buffer mut");
             {
                 let tcp = buffer.prepend_mut(20).expect("tcp header");
-                write_tcp_segment_header(
-                    tcp,
-                    TcpSegmentHeader {
-                        source_port: REMOTE_PORT,
-                        destination_port: LOCAL_PORT,
-                        sequence_number: rcv_nxt.wrapping_add(1),
-                        acknowledgment_number: snd_nxt,
-                        flags: TcpSegmentFlags::FIN | TcpSegmentFlags::ACK,
-                        advertised_window: u16::MAX,
-                        urgent_pointer: 0,
-                        capabilities: TcpCapabilities::default(),
-                        timestamp: None,
-                        fast_open_cookie: None,
-                    },
-                    None,
-                )
+                TcpSegmentHeader {
+                    source_port: REMOTE_PORT,
+                    destination_port: LOCAL_PORT,
+                    sequence_number: rcv_nxt.wrapping_add(1),
+                    acknowledgment_number: snd_nxt,
+                    flags: TcpSegmentFlags::FIN | TcpSegmentFlags::ACK,
+                    advertised_window: u16::MAX,
+                    urgent_pointer: 0,
+                    capabilities: TcpCapabilities::default(),
+                    timestamp: None,
+                    fast_open_cookie: None,
+                }
+                .write_to_buffer(tcp, None)
                 .expect("write tcp");
             }
             {
@@ -869,22 +858,19 @@ mod tests {
             let mut buffer = runtime.get_buffer_mut(index).expect("buffer mut");
             {
                 let tcp = buffer.prepend_mut(20).expect("tcp header");
-                write_tcp_segment_header(
-                    tcp,
-                    TcpSegmentHeader {
-                        source_port: REMOTE_PORT,
-                        destination_port: LOCAL_PORT,
-                        sequence_number: rcv_nxt,
-                        acknowledgment_number: snd_nxt,
-                        flags: TcpSegmentFlags::ACK | TcpSegmentFlags::PSH,
-                        advertised_window: u16::MAX,
-                        urgent_pointer: 0,
-                        capabilities: TcpCapabilities::default(),
-                        timestamp: None,
-                        fast_open_cookie: None,
-                    },
-                    None,
-                )
+                TcpSegmentHeader {
+                    source_port: REMOTE_PORT,
+                    destination_port: LOCAL_PORT,
+                    sequence_number: rcv_nxt,
+                    acknowledgment_number: snd_nxt,
+                    flags: TcpSegmentFlags::ACK | TcpSegmentFlags::PSH,
+                    advertised_window: u16::MAX,
+                    urgent_pointer: 0,
+                    capabilities: TcpCapabilities::default(),
+                    timestamp: None,
+                    fast_open_cookie: None,
+                }
+                .write_to_buffer(tcp, None)
                 .expect("write tcp");
             }
             {
@@ -935,7 +921,12 @@ mod tests {
                 Local::default(),
                 AppSessionConfig::new(256, 16),
                 SessionHandle::new(session_id.pool_index().slot(), 0),
-                handle.borrow_mut().expect("tcp queue").app().tx_evt_q().clone(),
+                handle
+                    .borrow_mut()
+                    .expect("tcp queue")
+                    .app()
+                    .tx_evt_q()
+                    .clone(),
             )
             .expect("app session"),
         );
@@ -952,24 +943,19 @@ mod tests {
             let mut buffer = runtime.get_buffer_mut(index).expect("buffer mut");
             {
                 let tcp = buffer.prepend_mut(20).expect("tcp header");
-                write_tcp_segment_header(
-                    tcp,
-                    TcpSegmentHeader {
-                        source_port: REMOTE_PORT,
-                        destination_port: LOCAL_PORT,
-                        sequence_number: rcv_nxt,
-                        acknowledgment_number: snd_nxt,
-                        flags: TcpSegmentFlags::ACK
-                            | TcpSegmentFlags::PSH
-                            | TcpSegmentFlags::URG,
-                        advertised_window: u16::MAX,
-                        urgent_pointer: 3,
-                        capabilities: TcpCapabilities::default(),
-                        timestamp: None,
-                        fast_open_cookie: None,
-                    },
-                    None,
-                )
+                TcpSegmentHeader {
+                    source_port: REMOTE_PORT,
+                    destination_port: LOCAL_PORT,
+                    sequence_number: rcv_nxt,
+                    acknowledgment_number: snd_nxt,
+                    flags: TcpSegmentFlags::ACK | TcpSegmentFlags::PSH | TcpSegmentFlags::URG,
+                    advertised_window: u16::MAX,
+                    urgent_pointer: 3,
+                    capabilities: TcpCapabilities::default(),
+                    timestamp: None,
+                    fast_open_cookie: None,
+                }
+                .write_to_buffer(tcp, None)
                 .expect("write tcp");
             }
             {
@@ -1025,7 +1011,12 @@ mod tests {
                 Local::default(),
                 AppSessionConfig::new(256, 16),
                 SessionHandle::new(session_id.pool_index().slot(), 0),
-                handle.borrow_mut().expect("tcp queue").app().tx_evt_q().clone(),
+                handle
+                    .borrow_mut()
+                    .expect("tcp queue")
+                    .app()
+                    .tx_evt_q()
+                    .clone(),
             )
             .expect("app session"),
         );
@@ -1042,22 +1033,19 @@ mod tests {
             let mut buffer = runtime.get_buffer_mut(index).expect("buffer mut");
             {
                 let tcp = buffer.prepend_mut(20).expect("tcp header");
-                write_tcp_segment_header(
-                    tcp,
-                    TcpSegmentHeader {
-                        source_port: REMOTE_PORT,
-                        destination_port: LOCAL_PORT,
-                        sequence_number: rcv_nxt,
-                        acknowledgment_number: snd_nxt,
-                        flags: TcpSegmentFlags::ACK | TcpSegmentFlags::PSH,
-                        advertised_window: u16::MAX,
-                        urgent_pointer: 0,
-                        capabilities: TcpCapabilities::default(),
-                        timestamp: None,
-                        fast_open_cookie: None,
-                    },
-                    None,
-                )
+                TcpSegmentHeader {
+                    source_port: REMOTE_PORT,
+                    destination_port: LOCAL_PORT,
+                    sequence_number: rcv_nxt,
+                    acknowledgment_number: snd_nxt,
+                    flags: TcpSegmentFlags::ACK | TcpSegmentFlags::PSH,
+                    advertised_window: u16::MAX,
+                    urgent_pointer: 0,
+                    capabilities: TcpCapabilities::default(),
+                    timestamp: None,
+                    fast_open_cookie: None,
+                }
+                .write_to_buffer(tcp, None)
                 .expect("write tcp");
             }
             {
