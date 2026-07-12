@@ -331,3 +331,42 @@ fn bihash_iter_after_inserts_yields_correct_count() {
     assert!(pairs.contains(&(2, 20)));
     assert!(pairs.contains(&(3, 30)));
 }
+
+#[test]
+fn bihash_arc_shared_insert_lookup_across_threads_without_external_mutex() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let table = Arc::new(Bihash::<u64, 7>::new(256));
+    let writers = (0..8u64)
+        .map(|worker| {
+            let table = Arc::clone(&table);
+            thread::spawn(move || {
+                for i in 0..64u64 {
+                    let key = worker * 1000 + i;
+                    table.insert(key, key * 2);
+                    assert_eq!(table.lookup(&key), Some(key * 2));
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for handle in writers {
+        handle.join().expect("writer");
+    }
+
+    for worker in 0..8u64 {
+        for i in 0..64u64 {
+            let key = worker * 1000 + i;
+            assert_eq!(table.lookup(&key), Some(key * 2));
+        }
+    }
+}
+
+#[test]
+fn bihash_insert_if_absent_keeps_first_writer_value() {
+    let table = Bihash::<u64, 7>::new(32);
+    assert!(table.insert_if_absent(7, 70).is_ok());
+    assert_eq!(table.insert_if_absent(7, 99), Err(70));
+    assert_eq!(table.lookup(&7), Some(70));
+}

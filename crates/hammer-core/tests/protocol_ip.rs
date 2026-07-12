@@ -3,6 +3,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use hammer_core::protocol::ip::{
     IpFragmentKey, parse_ip_fragment, parse_ip_fragment_with_chain_len,
 };
+use hammer_infra::bihash::{Bihash, BihashKey};
 
 #[test]
 fn parse_ipv4_fragment_accepts_payload_spanning_buffer_chain() {
@@ -64,6 +65,38 @@ fn parse_ipv6_fragment_accepts_payload_spanning_buffer_chain() {
             identification: 0x0102_0304,
         }
     );
+}
+
+#[test]
+fn ip_fragment_key_is_bihash_key_for_shared_owner_directory() {
+    let v4_a = IpFragmentKey::V4 {
+        source: Ipv4Addr::new(10, 0, 0, 1),
+        destination: Ipv4Addr::new(10, 0, 0, 2),
+        protocol: 6,
+        identification: 1,
+    };
+    let v4_b = IpFragmentKey::V4 {
+        source: Ipv4Addr::new(10, 0, 0, 1),
+        destination: Ipv4Addr::new(10, 0, 0, 2),
+        protocol: 6,
+        identification: 2,
+    };
+    let v6 = IpFragmentKey::V6 {
+        source: Ipv6Addr::LOCALHOST,
+        destination: Ipv6Addr::UNSPECIFIED,
+        next_header: 17,
+        identification: 9,
+    };
+
+    assert_ne!(v4_a.hash(), v4_b.hash());
+    assert_eq!(v4_a.hash(), v4_a.hash());
+    assert_ne!(v4_a.hash(), v6.hash());
+
+    let table = Bihash::<IpFragmentKey, 1>::new(32);
+    table.insert(v4_a, 0x11);
+    assert_eq!(table.lookup(&v4_a), Some(0x11));
+    table.insert(v4_a, 0x22);
+    assert_eq!(table.lookup(&v4_a), Some(0x22));
 }
 
 fn ipv4_udp_packet(source: [u8; 4], destination: [u8; 4], payload: &[u8]) -> Vec<u8> {

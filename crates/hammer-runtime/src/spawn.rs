@@ -1323,7 +1323,7 @@ pub fn set_data_plane_runtime(runtime: RuntimeDataPlaneRuntime) {
     });
 }
 
-pub(crate) fn with_data_plane_runtime<R>(f: impl FnOnce(&RuntimeDataPlaneRuntime) -> R) -> R {
+pub fn with_data_plane_runtime<R>(f: impl FnOnce(&RuntimeDataPlaneRuntime) -> R) -> R {
     DATA_PLANE_RUNTIME.with(|runtime| {
         f(runtime
             .borrow()

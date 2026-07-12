@@ -2,6 +2,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::error::{CoreError, CoreResult};
 use crate::protocol::wire::read_header;
+use hammer_infra::bihash::{BihashKey, hash_words, splitmix64};
 use hammer_infra::checksum::internet_checksum;
 
 const IPV4_HEADER_MIN_LEN: usize = 20;
@@ -109,6 +110,54 @@ pub enum IpFragmentKey {
         next_header: u8,
         identification: u32,
     },
+}
+
+impl Default for IpFragmentKey {
+    #[inline]
+    fn default() -> Self {
+        Self::V4 {
+            source: Ipv4Addr::UNSPECIFIED,
+            destination: Ipv4Addr::UNSPECIFIED,
+            protocol: 0,
+            identification: 0,
+        }
+    }
+}
+
+impl BihashKey for IpFragmentKey {
+    #[inline(always)]
+    fn hash(self) -> u64 {
+        match self {
+            Self::V4 {
+                source,
+                destination,
+                protocol,
+                identification,
+            } => {
+                let packed = (u128::from(u32::from(source)) << 96)
+                    | (u128::from(u32::from(destination)) << 64)
+                    | (u128::from(protocol) << 48)
+                    | u128::from(identification);
+                splitmix64((packed ^ (packed >> 64)) as u64)
+            }
+            Self::V6 {
+                source,
+                destination,
+                next_header,
+                identification,
+            } => hash_words(&[
+                fold_u128(u128::from(source)),
+                fold_u128(u128::from(destination)),
+                u64::from(next_header),
+                u64::from(identification),
+            ]),
+        }
+    }
+}
+
+#[inline(always)]
+fn fold_u128(value: u128) -> u64 {
+    value as u64 ^ (value >> 64) as u64
 }
 
 #[derive(Clone, Copy)]

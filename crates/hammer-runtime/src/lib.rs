@@ -47,4 +47,4 @@ pub use hammer_core::{
     MetricCounter, MetricGauge, MetricKind, MetricLabel, MetricSample, MetricsRegistry,
     MetricsScope,
 };
-pub use spawn::{DataPlaneBarrierGuard, DataPlaneBarrierHandle};
+pub use spawn::{DataPlaneBarrierGuard, DataPlaneBarrierHandle, with_data_plane_runtime};

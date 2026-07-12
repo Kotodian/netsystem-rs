@@ -1,8 +1,8 @@
 //! Heap-backed page allocator with LIFO freelists for VPP-style bihash.
 //!
-//! Phase 1 (this task) only supports `log2_pages == 0` (single page
-//! allocations).  Multi-page allocations will be added when bucket
-//! expansion is implemented.
+//! Pages are individually boxed so growing the page pointer table does not
+//! move live page contents — required for lock-free readers under concurrent
+//! writers that only publish new pages.
 
 use std::sync::Arc;
 
@@ -38,7 +38,7 @@ impl PageId {
 
 /// Heap-backed page allocator with per-size-class LIFO freelists.
 pub struct PageAlloc<K, const KVP: usize> {
-    pages: Vec<ValuePage<K, KVP>>,
+    pages: Vec<Box<ValuePage<K, KVP>>>,
     /// `freelists[log2_pages]` is a LIFO stack of PageIds.
     freelists: [Vec<PageId>; 8],
     heap: Arc<Heap>,
@@ -69,11 +69,11 @@ impl<K: Copy + Default, const KVP: usize> PageAlloc<K, KVP> {
     pub fn alloc_single(&mut self, log2_pages: u8) -> PageId {
         debug_assert_eq!(log2_pages, 0, "Phase 1 supports only log2_pages == 0");
         if let Some(id) = self.freelists[0].pop() {
-            self.pages[id.index()] = ValuePage::new();
+            *self.pages[id.index()] = ValuePage::new();
             self.live += 1;
             id
         } else {
-            self.pages.push(ValuePage::new());
+            self.pages.push(Box::new(ValuePage::new()));
             self.live += 1;
             PageId::from_index(self.pages.len() - 1)
         }
@@ -88,13 +88,8 @@ impl<K: Copy + Default, const KVP: usize> PageAlloc<K, KVP> {
     }
 
     /// Allocate a fresh page by pushing onto `pages` (bypassing the freelist).
-    ///
-    /// Unlike `alloc_single`, this guarantees the returned `PageId` is the
-    /// next consecutive slot in `pages`. `split_and_rehash` uses this to
-    /// ensure the new page run is contiguous so the lookup's `first_id + rel`
-    /// addressing stays correct.
     pub fn alloc_fresh(&mut self) -> PageId {
-        self.pages.push(ValuePage::new());
+        self.pages.push(Box::new(ValuePage::new()));
         self.live += 1;
         PageId::from_index(self.pages.len() - 1)
     }

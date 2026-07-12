@@ -30,8 +30,8 @@ impl<'a, K: BihashKey + Default, const KVP: usize> Iterator for BihashIter<'a, K
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.bucket_idx < self.bihash.nbuckets() as usize {
-            let bucket = self.bihash.buckets()[self.bucket_idx];
-            if bucket.is_empty() {
+            let bucket = self.bihash.load_bucket(self.bucket_idx);
+            if bucket.is_empty() || bucket.is_locked() {
                 self.bucket_idx += 1;
                 self.page_rel = 0;
                 self.slot_idx = 0;

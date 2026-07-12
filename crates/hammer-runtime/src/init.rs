@@ -80,6 +80,9 @@ pub static MAIN_LOOP_ENTER_FUNCTIONS: [InitFunction] = [..];
 pub static MAIN_LOOP_EXIT_FUNCTIONS: [InitFunction] = [..];
 
 #[linkme::distributed_slice]
+pub static MAIN_LOOP_CALLBACKS: [fn()] = [..];
+
+#[linkme::distributed_slice]
 pub static WORKER_INIT_FUNCTIONS: [InitFunction] = [..];
 
 pub fn topological_order<T: Ordered>(items: &[T]) -> Result<Vec<usize>, InitError> {

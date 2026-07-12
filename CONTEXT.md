@@ -53,8 +53,8 @@ _Avoid_: per-packet get/push/put from Session Queue, Fanout before transport com
 _Avoid_: NodeId process_frame body, temporary Vec next scratch, macro-owned get/push/put, NodeId: NodeNext
 
 **IP Reassembly Fanout**:
-IP reassembly drains the input Frame, retains pending fragments in reassembly context, and accumulates worker-local Drop/Lookup outputs on the same Frame with fixed stack next scratch before one Graph Fanout flush (with mid-dispatch flush if output hits frame capacity). Cross-worker fragment ownership remains Handoff.
-_Avoid_: reassembly emit_output get/push/put, packet-path NodeId next, Fanout of handoff-owned fragments
+IP reassembly drains the input Frame, retains pending fragments in Fragment Context, and accumulates worker-local Drop/Input outputs on the same Frame with fixed stack next scratch before one Graph Fanout flush (with mid-dispatch flush if output hits frame capacity). Cross-worker fragment ownership remains Handoff.
+_Avoid_: reassembly emit_output get/push/put, packet-path NodeId next, Fanout of handoff-owned fragments, direct Lookup bypass of IP Input
 
 **TUN Ingress Fanout**:
 TUN input receives into the driver Frame, then enqueues every pending Index through Graph Fanout on the registered local next slot (slot 0). It does not acquire a separate Next Frame or push/put by target `NodeId`.
@@ -262,6 +262,32 @@ _Avoid_: TCP MSS field, GSO flag, header option, output metadata
 **Timer Token**:
 The exact transport timer kind produced by Transport Worker State when a transport timer expires. The transport worker dispatches this token directly to the owning Transport Connection instead of scanning timer kinds or routing transport timer state through Session Runtime.
 _Avoid_: all-timer sweep, timer-kind discovery, guessed expired timer
+
+## IP Reassembly
+
+**IP Reassembly**:
+The deep module that owns Fragment Context storage, Fragment Owner Bihash interaction, Memory Owner and Sendout decisions, fragment assembly, expiry policy, and reassembly trace emission. The graph node is only the Pending Frame drain and Graph Fanout shell.
+_Avoid_: reassembly helper, outcome interpreter node, sticky failed-key table, graph node owning context tables
+
+**Fragment Context**:
+The Memory Owner's per-key record of held fragment Indexes, completeness, Sendout Worker, and last-heard time. It lives in the owner Data Worker's Pool and is never mutated by another worker.
+_Avoid_: shared HashMap context, first_fragment_worker as a third role, global mutex context table
+
+**Fragment Owner Bihash**:
+The shared bihash that maps an IP fragment key to a packed Bihash Value of Fragment Context pool index plus Memory Owner Worker, matching VPP full-reassembly ownership lookup.
+_Avoid_: ArcSwap whole-table directory, std HashMap owner map, bihash storing fragment payloads
+
+**Memory Owner Worker**:
+The Data Worker that created the Fragment Context for a fragment key and alone may mutate that Pool entry. Non-owner workers Handoff fragments to this worker's reassembly node.
+_Avoid_: handoff.worker as a vague owner, directory owner without pool locality
+
+**Sendout Worker**:
+The Data Worker that received the fragment with offset zero. When reassembly completes on a different Memory Owner, the completed datagram is Handed off to this worker before re-entering IP Input.
+_Avoid_: first_fragment_worker, opaque handoff source as a permanent third role name
+
+**IP Reassembly Expire Walk**:
+The per-Data-Worker periodic walk that expires stale Fragment Contexts on the local Pool, frees held fragments, and deletes Fragment Owner Bihash entries, mirroring VPP full-reassembly expire-walk ownership.
+_Avoid_: global expire mutex scan, sticky deny after timeout, Fanout of expired fragments to Input
 
 ## Lookup
 

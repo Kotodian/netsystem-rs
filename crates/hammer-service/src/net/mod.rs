@@ -8,8 +8,9 @@ pub use ip::{
     IcmpInputError, IcmpInputNode, IcmpInputTrace, IcmpNodeError, IpInputError, IpInputNext,
     IpInputNode, IpInputTarget, IpInputTrace, IpLocalArc, IpLocalControlPlane, IpLocalError,
     IpLocalNext, IpLocalNode, IpLocalSourceCheck, IpLocalTrace, IpLocalTraceStage, IpProtocol,
-    IpReassemblyDirectory, IpReassemblyHandoff, IpReassemblyNext, IpReassemblyNode,
-    IpReassemblyTrace, IpReassemblyTraceAction, IpReceiveNode, IpUnicastArc, IpVersion,
+    IpReassemblyDirectory, IpReassemblyExpireWalk, IpReassemblyHandoff, IpReassemblyNext,
+    IpReassemblyNode, IpReassemblyTrace, IpReassemblyTraceAction, IpReceiveNode, IpUnicastArc,
+    IpVersion, pack_fragment_owner_value, unpack_fragment_owner_value,
 };
 pub use lookup::{
     Adjacency, AdjacencyIndex, AdjacencyRewriteNode, AdjacencyRewriteNodeError,

@@ -1,15 +1,15 @@
-use std::collections::HashMap;
-use std::collections::hash_map::Entry;
+use std::cell::RefCell;
 use std::mem::transmute;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwap;
 use hammer_core::data_plane::{
     BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Index, NodeHandle, NodeId, NodeNext,
 };
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_infra::bihash::{Bihash, FREE_U64};
 use hammer_infra::checksum::internet_checksum;
+use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::vec::Vec;
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
@@ -38,9 +38,28 @@ const DEFAULT_REASSEMBLY_TIMEOUT: Duration = Duration::from_millis(100);
 const DEFAULT_MAX_REASSEMBLIES: usize = 1024;
 const DEFAULT_MAX_FRAGMENTS_PER_REASSEMBLY: usize = 64;
 
+#[inline]
+pub fn pack_fragment_owner_value(index: PoolIndex, owner: DataWorkerId) -> u64 {
+    debug_assert!(owner.slot() <= u16::MAX as usize);
+    debug_assert!(index.generation() <= u16::MAX as u32);
+    let value = u64::from(index.slot())
+        | (u64::from(index.generation() as u16) << 32)
+        | (u64::from(owner.slot() as u16) << 48);
+    debug_assert_ne!(value, FREE_U64);
+    value
+}
+
+#[inline]
+pub fn unpack_fragment_owner_value(value: u64) -> (PoolIndex, DataWorkerId) {
+    let slot = value as u32;
+    let generation = ((value >> 32) as u16) as u32;
+    let owner = DataWorkerId::new(u32::from((value >> 48) as u16));
+    (PoolIndex::new(slot, generation), owner)
+}
+
 #[hammer_component_macros::node_next]
 pub enum IpReassemblyNext {
-    Lookup,
+    Input,
     Drop,
 }
 
@@ -119,13 +138,157 @@ fn format_ip_reassembly_trace(bytes: &[u8]) -> String {
     }
 }
 
+#[derive(Clone)]
+pub struct IpReassemblyDirectory {
+    inner: Arc<Bihash<IpFragmentKey, 1>>,
+}
+
+impl IpReassemblyDirectory {
+    #[inline]
+    pub fn new(nbuckets: u32) -> Self {
+        Self {
+            inner: Arc::new(Bihash::new(nbuckets)),
+        }
+    }
+
+    #[inline]
+    pub fn claim_or_lookup(
+        &self,
+        key: IpFragmentKey,
+        index: PoolIndex,
+        worker: DataWorkerId,
+    ) -> (DataWorkerId, bool) {
+        let value = pack_fragment_owner_value(index, worker);
+        match self.inner.insert_if_absent(key, value) {
+            Ok(()) => (worker, true),
+            Err(existing) => {
+                let (_, owner) = unpack_fragment_owner_value(existing);
+                (owner, false)
+            }
+        }
+    }
+
+    #[inline]
+    pub fn lookup(&self, key: IpFragmentKey) -> Option<(PoolIndex, DataWorkerId)> {
+        self.inner.lookup(&key).map(unpack_fragment_owner_value)
+    }
+
+    #[inline]
+    pub fn remove(&self, key: IpFragmentKey) {
+        let _ = self.inner.remove(&key);
+    }
+}
+
+#[derive(Clone)]
+pub struct IpReassemblyHandoff {
+    reassembly: NodeHandle,
+    input: NodeHandle,
+    worker: DataWorkerId,
+    directory: IpReassemblyDirectory,
+}
+
+impl IpReassemblyHandoff {
+    #[inline]
+    pub fn new(
+        reassembly: NodeHandle,
+        input: NodeHandle,
+        worker: DataWorkerId,
+        directory: IpReassemblyDirectory,
+    ) -> Self {
+        Self {
+            reassembly,
+            input,
+            worker,
+            directory,
+        }
+    }
+
+    #[inline]
+    pub fn reassembly(&self) -> NodeHandle {
+        self.reassembly
+    }
+
+    #[inline]
+    pub fn input(&self) -> NodeHandle {
+        self.input
+    }
+
+    #[inline]
+    pub fn worker(&self) -> DataWorkerId {
+        self.worker
+    }
+
+    #[inline]
+    pub fn directory(&self) -> &IpReassemblyDirectory {
+        &self.directory
+    }
+}
+
+struct IpReassemblyWorker {
+    worker: DataWorkerId,
+    contexts: Pool<FragmentContext>,
+    directory: Option<Arc<IpReassemblyDirectory>>,
+    handoff: Option<IpReassemblyHandoff>,
+    timeout: Duration,
+    max_reassemblies: usize,
+    max_fragments_per_reassembly: usize,
+}
+
+thread_local! {
+    static WORKER: RefCell<Option<IpReassemblyWorker>> = const { RefCell::new(None) };
+}
+
+fn with_worker_mut<R>(f: impl FnOnce(&mut IpReassemblyWorker) -> R) -> Option<R> {
+    WORKER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        slot.as_mut().map(f)
+    })
+}
+
+fn ensure_worker(config: &IpReassemblyNode) {
+    WORKER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            let worker = config
+                .handoff
+                .as_ref()
+                .map(|h| h.worker)
+                .unwrap_or_else(|| DataWorkerId::new(0));
+            let directory = config
+                .directory
+                .clone()
+                .or_else(|| config.handoff.as_ref().map(|h| Arc::new(h.directory.clone())));
+            *slot = Some(IpReassemblyWorker {
+                worker,
+                contexts: Pool::with_capacity(config.max_reassemblies.max(1)),
+                directory,
+                handoff: config.handoff.clone(),
+                timeout: config.timeout,
+                max_reassemblies: config.max_reassemblies,
+                max_fragments_per_reassembly: config.max_fragments_per_reassembly,
+            });
+        } else if let Some(worker) = slot.as_mut() {
+            worker.timeout = config.timeout;
+            worker.max_reassemblies = config.max_reassemblies;
+            worker.max_fragments_per_reassembly = config.max_fragments_per_reassembly;
+            if config.handoff.is_some() {
+                worker.handoff = config.handoff.clone();
+                worker.worker = config.handoff.as_ref().unwrap().worker;
+                worker.directory = Some(Arc::new(config.handoff.as_ref().unwrap().directory.clone()));
+            } else if let Some(directory) = &config.directory {
+                worker.directory = Some(Arc::clone(directory));
+            }
+        }
+    });
+}
+
 #[hammer_component_macros::node(role = internal, next = IpReassemblyNext)]
 #[derive(Clone)]
 pub struct IpReassemblyNode {
-    #[node(default = register_ip_reassembly_runtime())]
-    runtime_data: NodeRuntimeData,
     #[node(default)]
     handoff: Option<IpReassemblyHandoff>,
+    #[node(default)]
+    directory: Option<Arc<IpReassemblyDirectory>>,
     #[node(default = DEFAULT_REASSEMBLY_TIMEOUT)]
     timeout: Duration,
     #[node(default = DEFAULT_MAX_REASSEMBLIES)]
@@ -134,128 +297,86 @@ pub struct IpReassemblyNode {
     max_fragments_per_reassembly: usize,
 }
 
-struct IpReassemblyRuntime {
-    handoff: Option<IpReassemblyHandoff>,
-    timeout: Duration,
-    max_reassemblies: usize,
-    max_fragments_per_reassembly: usize,
-    contexts: HashMap<IpFragmentKey, ReassemblyContext>,
-    failed_keys: Vec<IpFragmentKey>,
-}
-
-impl Default for IpReassemblyRuntime {
-    fn default() -> Self {
-        Self {
-            handoff: None,
-            timeout: DEFAULT_REASSEMBLY_TIMEOUT,
-            max_reassemblies: DEFAULT_MAX_REASSEMBLIES,
-            max_fragments_per_reassembly: DEFAULT_MAX_FRAGMENTS_PER_REASSEMBLY,
-            contexts: HashMap::new(),
-            failed_keys: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct IpReassemblyHandoff {
-    reassembly: NodeHandle,
-    lookup: NodeHandle,
-    worker: DataWorkerId,
-    directory: IpReassemblyDirectory,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct IpReassemblyDirectory {
-    inner: Arc<ArcSwap<HashMap<IpFragmentKey, DataWorkerId>>>,
-}
-
-impl IpReassemblyHandoff {
-    #[inline]
-    pub fn new(
-        reassembly: NodeHandle,
-        lookup: NodeHandle,
-        worker: DataWorkerId,
-        directory: IpReassemblyDirectory,
-    ) -> Self {
-        Self {
-            reassembly,
-            lookup,
-            worker,
-            directory,
-        }
-    }
-}
-
 impl IpReassemblyNode {
     #[inline]
     pub fn with_handoff(mut self, handoff: IpReassemblyHandoff) -> Self {
-        set_ip_reassembly_runtime_handoff(self.runtime_data, Some(handoff.clone()))
-            .expect("IP reassembly runtime slot");
+        self.directory = Some(Arc::new(handoff.directory.clone()));
         self.handoff = Some(handoff);
         self
     }
 
     #[inline]
+    pub fn with_directory(mut self, directory: Arc<IpReassemblyDirectory>) -> Self {
+        self.directory = Some(directory);
+        self
+    }
+
+    #[inline]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        set_ip_reassembly_runtime_timeout(self.runtime_data, timeout)
-            .expect("IP reassembly runtime slot");
         self.timeout = timeout;
         self
     }
 
     #[inline]
     pub fn with_max_fragments_per_reassembly(mut self, max_fragments: usize) -> Self {
-        set_ip_reassembly_runtime_max_fragments(self.runtime_data, max_fragments)
-            .expect("IP reassembly runtime slot");
         self.max_fragments_per_reassembly = max_fragments;
         self
     }
 
     #[inline]
     pub fn expire(&mut self, runtime: &DataPlaneRuntime, now: Instant) -> usize {
-        let Ok(expired) = expire_ip_reassembly_runtime(self.runtime_data, runtime, now) else {
-            return 0;
-        };
-        expired
+        ensure_worker(self);
+        with_worker_mut(|worker| worker.expire(runtime, now)).unwrap_or(0)
     }
 }
 
-impl IpReassemblyRuntime {
+#[hammer_component_macros::node(role = internal)]
+#[derive(Clone, Default)]
+pub struct IpReassemblyExpireWalk {
+    #[node(default)]
+    reassembly: Option<IpReassemblyNode>,
+}
+
+impl IpReassemblyExpireWalk {
     #[inline]
-    fn sync_config(
-        &mut self,
-        handoff: Option<IpReassemblyHandoff>,
-        timeout: Duration,
-        max_reassemblies: usize,
-        max_fragments_per_reassembly: usize,
-    ) {
-        self.handoff = handoff;
-        self.timeout = timeout;
-        self.max_reassemblies = max_reassemblies;
-        self.max_fragments_per_reassembly = max_fragments_per_reassembly;
+    pub fn with_reassembly(mut self, reassembly: IpReassemblyNode) -> Self {
+        self.reassembly = Some(reassembly);
+        self
     }
+}
 
+impl Node for IpReassemblyExpireWalk {
     #[inline]
-    fn expire(&mut self, runtime: &DataPlaneRuntime, now: Instant) -> CoreResult<usize> {
-        let timeout = self.timeout;
-        let expired = self
-            .contexts
-            .iter()
-            .filter_map(|(key, context)| {
-                (now.duration_since(context.updated_at) > timeout).then_some(*key)
-            })
-            .collect::<Vec<_>>();
+    fn process(&mut self, runtime: &DataPlaneRuntime, _frame: &mut BufferFrame) -> NodeResult {
+        if let Some(node) = self.reassembly.as_mut() {
+            let _ = node.expire(runtime, Instant::now());
+        }
+        NodeResult::drop()
+    }
+}
 
-        let expired_len = expired.len();
-        for key in expired {
-            if let Some(context) = self.contexts.remove(&key) {
-                context.drop_fragments(runtime)?;
+
+impl IpReassemblyWorker {
+    fn expire(&mut self, runtime: &DataPlaneRuntime, now: Instant) -> usize {
+        let timeout = self.timeout;
+        let mut expired_keys = Vec::new();
+        for (index, context) in self.contexts.iter() {
+            if now.duration_since(context.updated_at) > timeout {
+                expired_keys.push((index, context.key));
             }
-            if let Some(handoff) = &self.handoff {
+        }
+        let count = expired_keys.len();
+        for (index, key) in expired_keys {
+            if let Some(context) = self.contexts.remove(index) {
+                let _ = context.drop_fragments(runtime);
+            }
+            if let Some(directory) = &self.directory {
+                directory.remove(key);
+            } else if let Some(handoff) = &self.handoff {
                 handoff.directory.remove(key);
             }
         }
-        Ok(expired_len)
+        count
     }
 
     fn process_frame(
@@ -264,7 +385,6 @@ impl IpReassemblyRuntime {
         frame: &mut BufferFrame,
         now: Instant,
     ) -> NodeResult {
-        self.failed_keys.clear();
         let input_len = frame.len();
         debug_assert!(input_len <= DEFAULT_BUFFER_FRAME_CAPACITY);
         let mut inputs = [core::mem::MaybeUninit::<Index>::uninit(); DEFAULT_BUFFER_FRAME_CAPACITY];
@@ -301,11 +421,9 @@ impl IpReassemblyRuntime {
         nexts[*out_len] = NodeNext::slot(next);
         frame.push_index(index)?;
         *out_len += 1;
-        debug_assert_eq!(*out_len, frame.len());
         Ok(())
     }
 
-    #[inline]
     fn process_index(
         &mut self,
         runtime: &DataPlaneRuntime,
@@ -315,8 +433,8 @@ impl IpReassemblyRuntime {
         nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
         out_len: &mut usize,
     ) -> CoreResult<()> {
+        let current_worker = self.worker;
         let buffer = runtime.get_buffer(index)?;
-        let current_worker = self.current_worker();
         let fragment = match parse_ip_fragment_with_chain_len(
             buffer.current(),
             buffer.total_len_not_including_first(),
@@ -343,79 +461,109 @@ impl IpReassemblyRuntime {
         drop(buffer);
 
         let key = fragment.key;
-        if self.failed_keys.contains(&key) {
-            let drop_next = IpReassemblyNext::Drop;
-            let _ = add_packet_trace!(
-                runtime,
-                index,
-                IpReassemblyTrace {
-                    key: Some(key),
-                    action: IpReassemblyTraceAction::Drop,
-                    current_worker,
-                    owner_worker: Some(current_worker),
-                    next: Some(NodeNext::slot(drop_next)),
-                },
-            );
-            Self::emit_local(runtime, out_frame, nexts, out_len, drop_next, index)?;
-            return Ok(());
-        }
-        let fragment_first_worker = self.fragment_first_worker(runtime, index, fragment)?;
-        if let Some(handoff) = &self.handoff {
-            let owner = handoff.directory.owner_or_insert(key, handoff.worker);
-            if owner != handoff.worker {
-                let _ = add_packet_trace!(
-                    runtime,
-                    index,
-                    IpReassemblyTrace {
-                        key: Some(key),
-                        action: IpReassemblyTraceAction::Handoff,
-                        current_worker,
-                        owner_worker: Some(owner),
-                        next: None,
-                    },
-                );
-                runtime.handoff_index(owner, handoff.reassembly, index, None::<u16>)?;
-                return Ok(());
+        let directory = self
+            .directory
+            .as_ref()
+            .map(|d| d.as_ref())
+            .or_else(|| self.handoff.as_ref().map(|h| &h.directory));
+
+        // Memory-owner handoff before touching local pool.
+        if let (Some(directory), Some(handoff)) = (directory, self.handoff.as_ref()) {
+            if let Some((_, owner)) = directory.lookup(key) {
+                if owner != current_worker {
+                    let _ = add_packet_trace!(
+                        runtime,
+                        index,
+                        IpReassemblyTrace {
+                            key: Some(key),
+                            action: IpReassemblyTraceAction::Handoff,
+                            current_worker,
+                            owner_worker: Some(owner),
+                            next: None,
+                        },
+                    );
+                    runtime.handoff_index(owner, handoff.reassembly, index, None::<u16>)?;
+                    return Ok(());
+                }
             }
         }
-        if !self.contexts.contains_key(&key) {
-            if self.contexts.len() == self.max_reassemblies {
+
+        let pool_index = match directory.and_then(|d| d.lookup(key)) {
+            Some((pool_index, owner)) if owner == current_worker => pool_index,
+            Some(_) => {
+                // Owned elsewhere — should have handed off above.
                 let drop_next = IpReassemblyNext::Drop;
-                let _ = add_packet_trace!(
-                    runtime,
-                    index,
-                    IpReassemblyTrace {
-                        key: Some(key),
-                        action: IpReassemblyTraceAction::Drop,
-                        current_worker,
-                        owner_worker: Some(current_worker),
-                        next: Some(NodeNext::slot(drop_next)),
-                    },
-                );
                 Self::emit_local(runtime, out_frame, nexts, out_len, drop_next, index)?;
                 return Ok(());
             }
-            self.contexts.insert(
-                key,
-                ReassemblyContext::new(
-                    fragment.version,
-                    now,
-                    fragment_first_worker.unwrap_or_else(|| self.current_worker()),
-                ),
-            );
-        }
+            None => {
+                if self.contexts.len() >= self.max_reassemblies {
+                    let drop_next = IpReassemblyNext::Drop;
+                    let _ = add_packet_trace!(
+                        runtime,
+                        index,
+                        IpReassemblyTrace {
+                            key: Some(key),
+                            action: IpReassemblyTraceAction::Drop,
+                            current_worker,
+                            owner_worker: Some(current_worker),
+                            next: Some(NodeNext::slot(drop_next)),
+                        },
+                    );
+                    Self::emit_local(runtime, out_frame, nexts, out_len, drop_next, index)?;
+                    return Ok(());
+                }
+                let ctx_index = self
+                    .contexts
+                    .insert(FragmentContext::new(key, fragment.version, now))
+                    .ok_or_else(|| CoreError::internal("reassembly pool full"))?;
+                if let Some(directory) = directory {
+                    let (owner, created) = directory.claim_or_lookup(key, ctx_index, current_worker);
+                    if !created {
+                        let _ = self.contexts.remove(ctx_index);
+                        if owner != current_worker {
+                            if let Some(handoff) = &self.handoff {
+                                let _ = add_packet_trace!(
+                                    runtime,
+                                    index,
+                                    IpReassemblyTrace {
+                                        key: Some(key),
+                                        action: IpReassemblyTraceAction::Handoff,
+                                        current_worker,
+                                        owner_worker: Some(owner),
+                                        next: None,
+                                    },
+                                );
+                                runtime.handoff_index(owner, handoff.reassembly, index, None::<u16>)?;
+                                return Ok(());
+                            }
+                        }
+                        // Lost race to same worker — look up again.
+                        if let Some((idx, _)) = directory.lookup(key) {
+                            idx
+                        } else {
+                            return Ok(());
+                        }
+                    } else {
+                        ctx_index
+                    }
+                } else {
+                    ctx_index
+                }
+            }
+        };
 
         let mut reassembled = None;
         let mut failed = None;
-        let mut pending_trace_owner = None;
+        let mut pending_sendout = None;
         let mut drop_trace = None;
         {
             let context = self
                 .contexts
-                .get_mut(&key)
-                .ok_or_else(|| CoreError::internal("missing reassembly context"))?;
-            if let Some(worker) = fragment_first_worker {
-                context.first_fragment_worker = worker;
+                .get_mut(pool_index)
+                .ok_or_else(|| CoreError::internal("missing fragment context"))?;
+            if fragment.payload_offset == 0 {
+                context.sendout_worker = Some(current_worker);
             }
             let outcome = context.insert_fragment(
                 runtime,
@@ -426,17 +574,17 @@ impl IpReassemblyRuntime {
             )?;
             match outcome {
                 ReassemblyInsert::Pending => {
-                    pending_trace_owner = Some(context.first_fragment_worker);
+                    pending_sendout = context.sendout_worker.or(Some(current_worker));
                 }
                 ReassemblyInsert::Drop(index) => {
-                    drop_trace = Some((index, context.first_fragment_worker));
+                    drop_trace = Some((index, context.sendout_worker.unwrap_or(current_worker)));
                 }
                 ReassemblyInsert::Reassembled(index) => reassembled = Some(index),
                 ReassemblyInsert::Failed(index) => failed = Some(index),
             }
         }
 
-        if let Some(owner) = pending_trace_owner {
+        if let Some(owner) = pending_sendout {
             let _ = add_packet_trace!(
                 runtime,
                 index,
@@ -470,7 +618,8 @@ impl IpReassemblyRuntime {
         if let Some(failed_index) = failed {
             let drop_next = IpReassemblyNext::Drop;
             let drop_slot = NodeNext::slot(drop_next);
-            if let Some(context) = self.contexts.remove(&key) {
+            if let Some(context) = self.contexts.remove(pool_index) {
+                let sendout = context.sendout_worker.unwrap_or(current_worker);
                 for fragment in context.fragments {
                     let _ = add_packet_trace!(
                         runtime,
@@ -479,7 +628,7 @@ impl IpReassemblyRuntime {
                             key: Some(key),
                             action: IpReassemblyTraceAction::Failed,
                             current_worker,
-                            owner_worker: Some(context.first_fragment_worker),
+                            owner_worker: Some(sendout),
                             next: Some(drop_slot),
                         },
                     );
@@ -505,28 +654,29 @@ impl IpReassemblyRuntime {
                 },
             );
             Self::emit_local(runtime, out_frame, nexts, out_len, drop_next, failed_index)?;
-            if !self.failed_keys.contains(&key) {
-                self.failed_keys.push(key);
-            }
-            if let Some(handoff) = &self.handoff {
+            if let Some(directory) = &self.directory {
+                directory.remove(key);
+            } else if let Some(handoff) = &self.handoff {
                 handoff.directory.remove(key);
             }
             return Ok(());
         }
 
         if let Some(index) = reassembled {
-            let first_worker = self
+            let sendout = self
                 .contexts
-                .get(&key)
-                .map(|context| context.first_fragment_worker);
-            self.contexts.remove(&key);
-            if let Some(handoff) = &self.handoff {
+                .get(pool_index)
+                .and_then(|context| context.sendout_worker)
+                .unwrap_or(current_worker);
+            let _ = self.contexts.remove(pool_index);
+            if let Some(directory) = &self.directory {
+                directory.remove(key);
+            } else if let Some(handoff) = &self.handoff {
                 handoff.directory.remove(key);
             }
             refresh_metadata(runtime, index)?;
             if let Some(handoff) = &self.handoff {
-                let first_worker = first_worker.unwrap_or(handoff.worker);
-                if first_worker != handoff.worker {
+                if sendout != current_worker {
                     let _ = add_packet_trace!(
                         runtime,
                         index,
@@ -534,108 +684,29 @@ impl IpReassemblyRuntime {
                             key: Some(key),
                             action: IpReassemblyTraceAction::Handoff,
                             current_worker,
-                            owner_worker: Some(first_worker),
+                            owner_worker: Some(sendout),
                             next: None,
                         },
                     );
-                    runtime.handoff_index(first_worker, handoff.lookup, index, None::<u16>)?;
-                } else {
-                    let lookup_next = IpReassemblyNext::Lookup;
-                    let _ = add_packet_trace!(
-                        runtime,
-                        index,
-                        IpReassemblyTrace {
-                            key: Some(key),
-                            action: IpReassemblyTraceAction::Reassembled,
-                            current_worker,
-                            owner_worker: Some(first_worker),
-                            next: Some(NodeNext::slot(lookup_next)),
-                        },
-                    );
-                    Self::emit_local(runtime, out_frame, nexts, out_len, lookup_next, index)?;
+                    runtime.handoff_index(sendout, handoff.input, index, None::<u16>)?;
                     return Ok(());
                 }
-            } else {
-                let lookup_next = IpReassemblyNext::Lookup;
-                let _ = add_packet_trace!(
-                    runtime,
-                    index,
-                    IpReassemblyTrace {
-                        key: Some(key),
-                        action: IpReassemblyTraceAction::Reassembled,
-                        current_worker,
-                        owner_worker: first_worker,
-                        next: Some(NodeNext::slot(lookup_next)),
-                    },
-                );
-                Self::emit_local(runtime, out_frame, nexts, out_len, lookup_next, index)?;
-                return Ok(());
             }
+            let input_next = IpReassemblyNext::Input;
+            let _ = add_packet_trace!(
+                runtime,
+                index,
+                IpReassemblyTrace {
+                    key: Some(key),
+                    action: IpReassemblyTraceAction::Reassembled,
+                    current_worker,
+                    owner_worker: Some(sendout),
+                    next: Some(NodeNext::slot(input_next)),
+                },
+            );
+            Self::emit_local(runtime, out_frame, nexts, out_len, input_next, index)?;
         }
         Ok(())
-    }
-
-    #[inline(always)]
-    fn fragment_first_worker(
-        &self,
-        runtime: &DataPlaneRuntime,
-        index: Index,
-        fragment: ParsedIpFragment,
-    ) -> CoreResult<Option<DataWorkerId>> {
-        if fragment.payload_offset != 0 {
-            return Ok(None);
-        }
-        if fragment.payload_offset == 0 {
-            let buffer = runtime.get_buffer(index)?;
-            let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
-            if let Some(worker) = network.handoff_source_worker() {
-                return Ok(Some(DataWorkerId::new(u32::from(worker))));
-            }
-        }
-        Ok(Some(self.current_worker()))
-    }
-
-    #[inline(always)]
-    fn current_worker(&self) -> DataWorkerId {
-        self.handoff
-            .as_ref()
-            .map(|handoff| handoff.worker)
-            .unwrap_or_else(|| DataWorkerId::new(0))
-    }
-}
-
-impl IpReassemblyDirectory {
-    #[inline]
-    fn owner_or_insert(&self, key: IpFragmentKey, worker: DataWorkerId) -> DataWorkerId {
-        if let Some(owner) = self.inner.load().get(&key).copied() {
-            return owner;
-        }
-
-        let mut inserted = None;
-        self.inner.rcu(|current| {
-            let mut next = HashMap::clone(current);
-            match next.entry(key) {
-                Entry::Occupied(entry) => inserted = Some(*entry.get()),
-                Entry::Vacant(entry) => {
-                    entry.insert(worker);
-                    inserted = Some(worker);
-                }
-            }
-            next
-        });
-        inserted.unwrap_or(worker)
-    }
-
-    #[inline]
-    fn remove(&self, key: IpFragmentKey) {
-        if !self.inner.load().contains_key(&key) {
-            return;
-        }
-        self.inner.rcu(|current| {
-            let mut next = HashMap::clone(current);
-            next.remove(&key);
-            next
-        });
     }
 }
 
@@ -652,14 +723,8 @@ impl Node for IpReassemblyNode {
 
     #[inline]
     fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
-        sync_ip_reassembly_runtime(
-            self.runtime_data,
-            self.handoff.clone(),
-            self.timeout,
-            self.max_reassemblies,
-            self.max_fragments_per_reassembly,
-        )?;
-        Ok(self.runtime_data)
+        ensure_worker(self);
+        Ok(NodeRuntimeData::empty())
     }
 
     #[inline]
@@ -668,132 +733,39 @@ impl Node for IpReassemblyNode {
     }
 }
 
-fn ip_reassembly_runtimes() -> &'static Mutex<Vec<IpReassemblyRuntime>> {
-    static RUNTIMES: OnceLock<Mutex<Vec<IpReassemblyRuntime>>> = OnceLock::new();
-    RUNTIMES.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-fn register_ip_reassembly_runtime() -> NodeRuntimeData {
-    let mut runtimes = ip_reassembly_runtimes()
-        .lock()
-        .expect("IP reassembly runtime registry poisoned");
-    let slot = runtimes.len();
-    runtimes.push(IpReassemblyRuntime::default());
-    NodeRuntimeData::from_usize(slot).expect("IP reassembly runtime slot overflow")
-}
-
-fn set_ip_reassembly_runtime_handoff(
-    data: NodeRuntimeData,
-    handoff: Option<IpReassemblyHandoff>,
-) -> CoreResult<()> {
-    let slot = data.usize_word(0)?;
-    let mut runtimes = ip_reassembly_runtimes()
-        .lock()
-        .map_err(|_| CoreError::internal("IP reassembly runtime registry poisoned"))?;
-    let runtime = runtimes
-        .get_mut(slot)
-        .ok_or_else(|| CoreError::internal("IP reassembly runtime slot is invalid"))?;
-    runtime.handoff = handoff;
-    Ok(())
-}
-
-fn set_ip_reassembly_runtime_timeout(data: NodeRuntimeData, timeout: Duration) -> CoreResult<()> {
-    let slot = data.usize_word(0)?;
-    let mut runtimes = ip_reassembly_runtimes()
-        .lock()
-        .map_err(|_| CoreError::internal("IP reassembly runtime registry poisoned"))?;
-    let runtime = runtimes
-        .get_mut(slot)
-        .ok_or_else(|| CoreError::internal("IP reassembly runtime slot is invalid"))?;
-    runtime.timeout = timeout;
-    Ok(())
-}
-
-fn set_ip_reassembly_runtime_max_fragments(
-    data: NodeRuntimeData,
-    max_fragments: usize,
-) -> CoreResult<()> {
-    let slot = data.usize_word(0)?;
-    let mut runtimes = ip_reassembly_runtimes()
-        .lock()
-        .map_err(|_| CoreError::internal("IP reassembly runtime registry poisoned"))?;
-    let runtime = runtimes
-        .get_mut(slot)
-        .ok_or_else(|| CoreError::internal("IP reassembly runtime slot is invalid"))?;
-    runtime.max_fragments_per_reassembly = max_fragments;
-    Ok(())
-}
-
-fn sync_ip_reassembly_runtime(
-    data: NodeRuntimeData,
-    handoff: Option<IpReassemblyHandoff>,
-    timeout: Duration,
-    max_reassemblies: usize,
-    max_fragments_per_reassembly: usize,
-) -> CoreResult<()> {
-    let slot = data.usize_word(0)?;
-    let mut runtimes = ip_reassembly_runtimes()
-        .lock()
-        .map_err(|_| CoreError::internal("IP reassembly runtime registry poisoned"))?;
-    let runtime = runtimes
-        .get_mut(slot)
-        .ok_or_else(|| CoreError::internal("IP reassembly runtime slot is invalid"))?;
-    runtime.sync_config(
-        handoff,
-        timeout,
-        max_reassemblies,
-        max_fragments_per_reassembly,
-    );
-    Ok(())
-}
-
-fn expire_ip_reassembly_runtime(
-    data: NodeRuntimeData,
-    runtime: &DataPlaneRuntime,
-    now: Instant,
-) -> CoreResult<usize> {
-    let slot = data.usize_word(0)?;
-    let mut runtimes = ip_reassembly_runtimes()
-        .lock()
-        .map_err(|_| CoreError::internal("IP reassembly runtime registry poisoned"))?;
-    let state = runtimes
-        .get_mut(slot)
-        .ok_or_else(|| CoreError::internal("IP reassembly runtime slot is invalid"))?;
-    state.expire(runtime, now)
-}
-
 fn ip_reassembly_process(
     runtime: &DataPlaneRuntime,
-    data: NodeRuntimeData,
+    _data: NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> NodeResult {
-    (|| -> CoreResult<NodeResult> {
-        let slot = data.usize_word(0)?;
-        let mut runtimes = ip_reassembly_runtimes()
-            .lock()
-            .map_err(|_| CoreError::internal("IP reassembly runtime registry poisoned"))?;
-        let state = runtimes
-            .get_mut(slot)
-            .ok_or_else(|| CoreError::internal("IP reassembly runtime slot is invalid"))?;
-        Ok(state.process_frame(runtime, frame, Instant::now()))
-    })()
-    .unwrap_or_else(|_| NodeResult::drop())
+    // Config is on TLS worker; node_process closure cannot access &self easily
+    // beyond ensuring worker exists via prior node_runtime_data / expire.
+    WORKER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some(worker) = slot.as_mut() {
+            worker.process_frame(runtime, frame, Instant::now())
+        } else {
+            NodeResult::drop()
+        }
+    })
 }
 
-struct ReassemblyContext {
+struct FragmentContext {
+    key: IpFragmentKey,
     version: IpVersion,
-    first_fragment_worker: DataWorkerId,
+    sendout_worker: Option<DataWorkerId>,
     updated_at: Instant,
     total_payload_len: Option<usize>,
     fragments: Vec<ReassemblyFragment>,
 }
 
-impl ReassemblyContext {
+impl FragmentContext {
     #[inline]
-    fn new(version: IpVersion, now: Instant, first_fragment_worker: DataWorkerId) -> Self {
+    fn new(key: IpFragmentKey, version: IpVersion, now: Instant) -> Self {
         Self {
+            key,
             version,
-            first_fragment_worker,
+            sendout_worker: None,
             updated_at: now,
             total_payload_len: None,
             fragments: Vec::new(),
@@ -1068,3 +1040,16 @@ fn update_ipv4_header_checksum(packet: &mut [u8], header_len: usize) {
     packet[IPV4_HEADER_CHECKSUM_OFFSET..IPV4_HEADER_CHECKSUM_OFFSET + 2]
         .copy_from_slice(&checksum.to_be_bytes());
 }
+
+fn expire_ip_reassembly_main_loop_callback() {
+    let _ = hammer_runtime::with_data_plane_runtime(|runtime| {
+        WORKER.with(|slot| {
+            if let Some(worker) = slot.borrow_mut().as_mut() {
+                let _ = worker.expire(runtime, Instant::now());
+            }
+        });
+    });
+}
+
+#[linkme::distributed_slice(hammer_runtime::init::MAIN_LOOP_CALLBACKS)]
+static EXPIRE_IP_REASSEMBLY: fn() = expire_ip_reassembly_main_loop_callback;

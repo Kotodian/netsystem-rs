@@ -26,8 +26,9 @@ pub use local::{
     IpLocalTrace, IpLocalTraceStage, IpReceiveNode,
 };
 pub use reassembly::{
-    IpReassemblyDirectory, IpReassemblyHandoff, IpReassemblyNext, IpReassemblyNode,
-    IpReassemblyTrace, IpReassemblyTraceAction,
+    IpReassemblyDirectory, IpReassemblyExpireWalk, IpReassemblyHandoff, IpReassemblyNext,
+    IpReassemblyNode, IpReassemblyTrace, IpReassemblyTraceAction, pack_fragment_owner_value,
+    unpack_fragment_owner_value,
 };
 
 #[inline(always)]

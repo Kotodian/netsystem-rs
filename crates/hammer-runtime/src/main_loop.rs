@@ -103,9 +103,12 @@ pub fn engine_main_loop(
     }
 }
 
-/// Dispatch main-loop callbacks. Currently a no-op — hook for future
-/// per-iteration callback registration.
-pub(crate) fn dispatch_main_loop_callbacks() {}
+/// Dispatch main-loop callbacks registered via `MAIN_LOOP_CALLBACKS`.
+pub(crate) fn dispatch_main_loop_callbacks() {
+    for callback in crate::init::MAIN_LOOP_CALLBACKS.iter() {
+        callback();
+    }
+}
 
 #[cfg(test)]
 mod tests {
