@@ -43,15 +43,17 @@ enum TestNext {
 }
 
 impl NodeNext for TestNext {
-    const COUNT: usize = 2;
-
     #[inline(always)]
-    fn slot(self) -> usize {
+    fn slot(self) -> u16 {
         match self {
             Self::Default => 0,
             Self::Alternate => 1,
         }
     }
+}
+
+impl TestNext {
+    const COUNT: usize = 2;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -707,6 +709,133 @@ fn try_register_descriptor_rejects_next_count_mismatch() {
         .try_register_descriptor(NodeKind::Internal, descriptor)
         .expect_err("initial next count mismatch must fail");
     assert!(err.to_string().contains("node initial next count mismatch"));
+}
+
+#[test]
+fn add_node_next_slot_returns_u16_and_supports_slots_above_sixteen() {
+    let runtime = test_runtime(64, 4, 4, 2);
+    let drop = runtime.nodes().register_internal(DescriptorNode::plain(
+        count_process,
+        NodeRuntimeData::from_words([1, 0, 0, 0]),
+    ));
+    let owner = runtime.nodes().register_internal(DescriptorNode::next(
+        "dynamic-owner",
+        count_process,
+        NodeRuntimeData::empty(),
+        [drop, drop],
+    ));
+
+    let mut last_slot = 1u16;
+    for word in 2u64..20 {
+        let target = runtime.nodes().register_internal(DescriptorNode::plain(
+            count_process,
+            NodeRuntimeData::from_words([word, 0, 0, 0]),
+        ));
+        let slot = runtime
+            .nodes()
+            .add_node_next_slot(owner, target)
+            .expect("append dynamic next");
+        assert_eq!(slot, last_slot + 1);
+        last_slot = slot;
+        assert_eq!(
+            runtime
+                .nodes()
+                .node_next_slot(owner, usize::from(slot))
+                .unwrap(),
+            target
+        );
+        assert_eq!(runtime.nodes().node_next(owner, slot).unwrap(), target);
+    }
+    assert!(last_slot >= 16);
+}
+
+#[test]
+fn sparse_local_u16_slots_resolve_through_runtime() {
+    let runtime = test_runtime(64, 4, 4, 2);
+    let mut initial = Vec::with_capacity(32);
+    for word in 0..32u64 {
+        initial.push(runtime.nodes().register_internal(DescriptorNode::plain(
+            count_process,
+            NodeRuntimeData::from_words([word, 0, 0, 0]),
+        )));
+    }
+    let owner = runtime
+        .nodes()
+        .try_register_descriptor(
+            NodeKind::Internal,
+            NodeDescriptor::new(
+                count_process,
+                NodeRuntimeData::empty(),
+                NodeRegistration::next("sparse-owner", 32),
+                &initial,
+                None,
+            ),
+        )
+        .expect("register sparse owner");
+    let redirected = runtime.nodes().register_internal(DescriptorNode::plain(
+        count_process,
+        NodeRuntimeData::from_words([99, 0, 0, 0]),
+    ));
+
+    runtime
+        .nodes()
+        .set_node_next(owner, 0u16, initial[0])
+        .expect("keep slot 0");
+    runtime
+        .nodes()
+        .set_node_next(owner, 31u16, redirected)
+        .expect("redirect sparse high slot");
+
+    assert_eq!(runtime.nodes().node_next(owner, 0u16).unwrap(), initial[0]);
+    assert_eq!(runtime.nodes().node_next(owner, 31u16).unwrap(), redirected);
+    assert_eq!(
+        runtime.nodes().node_next_slot(owner, 15).unwrap(),
+        initial[15]
+    );
+}
+
+#[test]
+fn add_node_next_slot_keeps_sibling_tables_consistent() {
+    let runtime = test_runtime(64, 4, 4, 2);
+    let seed = runtime.nodes().register_internal(DescriptorNode::plain(
+        count_process,
+        NodeRuntimeData::from_words([1, 0, 0, 0]),
+    ));
+    let target = runtime.nodes().register_internal(DescriptorNode::plain(
+        count_process,
+        NodeRuntimeData::from_words([9, 0, 0, 0]),
+    ));
+    let owner = runtime.nodes().register_internal(DescriptorNode::next(
+        "sibling-dynamic-owner",
+        count_process,
+        NodeRuntimeData::empty(),
+        [seed, seed],
+    ));
+    let sibling = runtime.nodes().register_internal(DescriptorNode::sibling(
+        "sibling-dynamic-child",
+        "sibling-dynamic-owner",
+        count_process,
+        NodeRuntimeData::empty(),
+    ));
+
+    let slot = runtime
+        .nodes()
+        .add_node_next_slot(owner, target)
+        .expect("append on owner");
+    assert_eq!(
+        runtime
+            .nodes()
+            .node_next_slot(owner, usize::from(slot))
+            .unwrap(),
+        target
+    );
+    assert_eq!(
+        runtime
+            .nodes()
+            .node_next_slot(sibling, usize::from(slot))
+            .unwrap(),
+        target
+    );
 }
 
 fn push_packet(runtime: &DataPlaneRuntime, frame: &mut BufferFrame, payload: &[u8]) {

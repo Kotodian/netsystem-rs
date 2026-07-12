@@ -637,8 +637,10 @@ impl NodeRuntimeInner {
         handle: Option<NodeHandle>,
         next_names: Option<&[&'static str]>,
     ) -> CoreResult<NodeId> {
-        if initial_nexts.len() > MAX_NODE_NEXT_SLOTS {
-            return Err(CoreError::internal("node next slot capacity exceeded"));
+        if initial_nexts.len() > usize::from(u16::MAX) + 1 {
+            return Err(CoreError::internal(
+                "node next slot cannot be represented as u16",
+            ));
         }
         if let Some(next_names) = next_names {
             if !initial_nexts.is_empty() {
@@ -823,7 +825,7 @@ impl NodeRuntimeInner {
         Ok(())
     }
 
-    fn add_node_next_slot(&mut self, node: NodeId, next: NodeId) -> CoreResult<usize> {
+    fn add_node_next_slot(&mut self, node: NodeId, next: NodeId) -> CoreResult<u16> {
         self.validate_node(node)?;
         self.validate_node(next)?;
         let slot = self
@@ -831,9 +833,9 @@ impl NodeRuntimeInner {
             .get(node.slot() as usize)
             .map(Vec::len)
             .ok_or_else(|| CoreError::internal("node id out of bounds"))?;
-        if slot >= MAX_NODE_NEXT_SLOTS {
-            return Err(CoreError::internal("node next slot capacity exceeded"));
-        }
+        let slot = u16::try_from(slot).map_err(|_| {
+            CoreError::internal("node next slot cannot be represented as u16")
+        })?;
         let mut group = self.siblings[node.slot() as usize].clone();
         group.push(node);
         for sibling in group {
@@ -841,12 +843,64 @@ impl NodeRuntimeInner {
                 .next_nodes
                 .get_mut(sibling.slot() as usize)
                 .ok_or_else(|| CoreError::internal("node id out of bounds"))?;
-            if sibling_nexts.len() != slot {
+            if sibling_nexts.len() != usize::from(slot) {
                 return Err(CoreError::internal("node sibling next count mismatch"));
             }
             sibling_nexts.push(Some(next));
         }
         Ok(slot)
+    }
+}
+
+#[cfg(test)]
+mod local_next_slot_tests {
+    use super::*;
+
+    #[test]
+    fn add_node_next_slot_rejects_non_u16_before_mutating_siblings() {
+        let process: NodeProcessFn = |_, _, _| NodeResult::drop();
+        let mut inner = NodeRuntimeInner {
+            nodes: vec![
+                NodeRuntimeSlot {
+                    kind: NodeKind::Internal,
+                    process,
+                    runtime_data: NodeRuntimeData::empty(),
+                },
+                NodeRuntimeSlot {
+                    kind: NodeKind::Internal,
+                    process,
+                    runtime_data: NodeRuntimeData::empty(),
+                },
+            ],
+            node_states: vec![NodeState::Polling, NodeState::Polling],
+            interrupt_pending: vec![false, false],
+            error_counters: vec![
+                NodeErrorCounters::default(),
+                NodeErrorCounters::default(),
+            ],
+            error_ids: HashMap::new(),
+            error_slots: Vec::new(),
+            runtime_stats: vec![NodeRuntimeStats::default(), NodeRuntimeStats::default()],
+            queue: ScheduledFrameQueue::with_capacity(4),
+            handles: HashMap::new(),
+            declared_nodes: HashMap::new(),
+            node_names: vec![None, None],
+            node_trace_formatters: vec![None, None],
+            next_nodes: vec![
+                vec![Some(NodeId::new(1)); usize::from(u16::MAX) + 1],
+                Vec::new(),
+            ],
+            pending_next_names: vec![Vec::new(), Vec::new()],
+            sibling_owners: vec![None, None],
+            siblings: vec![Vec::new(), Vec::new()],
+        };
+
+        let before = inner.next_nodes[0].len();
+        let err = inner
+            .add_node_next_slot(NodeId::new(0), NodeId::new(1))
+            .expect_err("slot past u16 must fail");
+        assert!(err.to_string().contains("cannot be represented as u16"));
+        assert_eq!(inner.next_nodes[0].len(), before);
     }
 }
 
@@ -1264,7 +1318,7 @@ impl NodeRuntime {
 
     #[inline]
     pub fn node_next<K: NodeNext>(&self, node: NodeId, key: K) -> CoreResult<NodeId> {
-        self.node_next_slot(node, key.slot())
+        self.node_next_slot(node, usize::from(key.slot()))
     }
 
     pub fn node_nexts<const COUNT: usize>(&self, node: NodeId) -> CoreResult<[NodeId; COUNT]> {
@@ -1293,7 +1347,7 @@ impl NodeRuntime {
 
     #[inline]
     pub fn set_node_next<K: NodeNext>(&self, node: NodeId, key: K, next: NodeId) -> CoreResult<()> {
-        self.set_node_next_slot(node, key.slot(), next)
+        self.set_node_next_slot(node, usize::from(key.slot()), next)
     }
 
     pub fn set_node_next_slot(&self, node: NodeId, slot: usize, next: NodeId) -> CoreResult<()> {
@@ -1303,7 +1357,7 @@ impl NodeRuntime {
         inner.set_node_next_slot(node, slot, next)
     }
 
-    pub fn add_node_next_slot(&self, node: NodeId, next: NodeId) -> CoreResult<usize> {
+    pub fn add_node_next_slot(&self, node: NodeId, next: NodeId) -> CoreResult<u16> {
         let mut inner = self.inner.borrow_mut();
         inner.add_node_next_slot(node, next)
     }

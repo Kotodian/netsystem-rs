@@ -17,13 +17,15 @@ enum TestNext {
 }
 
 impl NodeNext for TestNext {
-    const COUNT: usize = 1;
-
-    fn slot(self) -> usize {
+    fn slot(self) -> u16 {
         match self {
             Self::Internal => 0,
         }
     }
+}
+
+impl TestNext {
+    const COUNT: usize = 1;
 }
 
 struct Driver;

@@ -91,9 +91,14 @@ impl NodeRegistration {
 pub const MAX_NODE_NEXT_SLOTS: usize = 16;
 
 pub trait NodeNext: Copy + Eq {
-    const COUNT: usize;
+    fn slot(self) -> u16;
+}
 
-    fn slot(self) -> usize;
+impl NodeNext for u16 {
+    #[inline(always)]
+    fn slot(self) -> u16 {
+        self
+    }
 }
 
 pub trait NodeNextStorage<K> {
@@ -106,7 +111,7 @@ where
 {
     #[inline(always)]
     fn next(&self, key: K) -> NodeId {
-        self[key.slot()]
+        self[usize::from(key.slot())]
     }
 }
 

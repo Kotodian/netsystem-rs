@@ -2,8 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use hammer_core::data_plane::{
-    MAX_NODE_NEXT_SLOTS, NodeHandle, NodeId, NodeKind, NodeNext, NodeNextStorage, NodeRegistration,
-    NodeState,
+    NodeHandle, NodeId, NodeKind, NodeNext, NodeNextStorage, NodeRegistration, NodeState,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,10 +11,12 @@ enum ExampleNext {
     Punt,
 }
 
-impl NodeNext for ExampleNext {
+impl ExampleNext {
     const COUNT: usize = 2;
+}
 
-    fn slot(self) -> usize {
+impl NodeNext for ExampleNext {
+    fn slot(self) -> u16 {
         match self {
             Self::Drop => 0,
             Self::Punt => 1,
@@ -68,7 +69,8 @@ fn core_data_plane_graph_identity_items_have_expected_behavior() {
     assert_eq!(NodeKind::Internal, NodeKind::Internal);
     assert_eq!(NodeState::Disabled, NodeState::Disabled);
     assert_eq!(NodeState::default(), NodeState::Polling);
-    assert!(MAX_NODE_NEXT_SLOTS >= ExampleNext::COUNT);
+    assert_eq!(NodeNext::slot(ExampleNext::Drop), 0u16);
+    assert_eq!(NodeNext::slot(42u16), 42u16);
 }
 
 #[test]

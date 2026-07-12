@@ -1050,16 +1050,14 @@ fn expand_node_next(item: ItemEnum) -> Result<TokenStream2> {
         }
 
         impl ::hammer_core::data_plane::NodeNext for #ident {
-            const COUNT: usize = #ident::COUNT;
-
             #[inline(always)]
-            fn slot(self) -> usize {
-                self as usize
+            fn slot(self) -> u16 {
+                self as u16
             }
         }
 
         const _: () = {
-            assert!(#ident::COUNT <= ::hammer_core::data_plane::MAX_NODE_NEXT_SLOTS);
+            assert!(#ident::COUNT <= u16::MAX as usize + 1);
         };
     })
 }
@@ -1794,6 +1792,22 @@ mod tests {
         assert!(
             !expanded.contains("# [next"),
             "next attr must be stripped from emitted variants: {expanded}"
+        );
+        assert!(
+            expanded.contains("fn slot (self) -> u16"),
+            "NodeNext::slot must return u16: {expanded}"
+        );
+        assert!(
+            expanded.contains("pub const fn slot (self) -> usize"),
+            "generated enums keep inherent usize slot metadata: {expanded}"
+        );
+        assert!(
+            !expanded.contains("const COUNT : usize = SampleNext :: COUNT"),
+            "NodeNext trait must not require COUNT: {expanded}"
+        );
+        assert!(
+            !expanded.contains("MAX_NODE_NEXT_SLOTS"),
+            "obsolete 16-next macro guard must be gone: {expanded}"
         );
     }
 }
