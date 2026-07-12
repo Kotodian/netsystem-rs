@@ -1,4 +1,6 @@
-use hammer_core::data_plane::{BufferFrame, Index, NodeId};
+use hammer_core::data_plane::{
+    BufferFrame, Index, NodeId, NodeNext, DEFAULT_BUFFER_FRAME_CAPACITY,
+};
 use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
 
 use hammer_core::error::{CoreError, CoreResult};
@@ -47,11 +49,7 @@ where
 {
     #[inline(always)]
     fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
-        let next = match Self::runtime_nexts(runtime) {
-            Ok(next) => next,
-            Err(_) => return NodeResult::drop(),
-        };
-        tcp_syn_sent_frame(runtime, frame, self.session_queue, next)
+        tcp_syn_sent_frame(runtime, frame, self.session_queue)
     }
 
     #[inline]
@@ -75,15 +73,10 @@ where
     Seg: Segment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
-    let next = match TcpSynSentNode::<C, Seg>::runtime_nexts(runtime) {
-        Ok(next) => next,
-        Err(_) => return NodeResult::drop(),
-    };
     tcp_syn_sent_frame::<C, Seg>(
         runtime,
         frame,
         SessionQueueHandle::<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>::new(data),
-        next,
     )
 }
 
@@ -91,36 +84,91 @@ fn tcp_syn_sent_frame<C, Seg>(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
     session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
-    next: [NodeId; TcpSynSentNext::COUNT],
 ) -> NodeResult
 where
     C: CongestionController + 'static,
     Seg: Segment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
-    let tcp_output = next[TcpSynSentNext::Output as usize];
-    let drop_next = next[TcpSynSentNext::Drop as usize];
-    let width = runtime.preferred_frame_batch_width();
-    let _ = frame.retain_indices_batched_with_prefetch(
-        width,
-        |index| prefetch_tcp_syn_sent(runtime, &[index]),
-        |index| {
-            tcp_syn_sent_enqueue_index(runtime, index, session_queue, tcp_output).or_else(|_| {
-                let mut frame = runtime.buffers().get_next_frame(drop_next)?;
-                frame.push_index(index)?;
-                runtime.put_next_frame(frame)?;
-                Ok(false)
-            })
-        },
-    );
+    let input_len = frame.len();
+    debug_assert!(input_len <= DEFAULT_BUFFER_FRAME_CAPACITY);
+    let mut inputs =
+        [core::mem::MaybeUninit::<Index>::uninit(); DEFAULT_BUFFER_FRAME_CAPACITY];
+    for (offset, &index) in frame.indices().iter().enumerate() {
+        inputs[offset].write(index);
+    }
+    frame.discard_prefix(input_len);
+
+    let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
+    let mut out_len = 0usize;
+    let mut keep =
+        [core::mem::MaybeUninit::<Index>::uninit(); DEFAULT_BUFFER_FRAME_CAPACITY];
+    let mut keep_len = 0usize;
+
+    for offset in 0..input_len {
+        let index = unsafe { inputs[offset].assume_init() };
+        match tcp_syn_sent_index(
+            runtime,
+            index,
+            session_queue,
+            frame,
+            &mut nexts,
+            &mut out_len,
+        ) {
+            Ok(true) => {
+                keep[keep_len].write(index);
+                keep_len += 1;
+            }
+            Ok(false) => {}
+            Err(_) => {
+                let _ = emit_local(
+                    runtime,
+                    frame,
+                    &mut nexts,
+                    &mut out_len,
+                    TcpSynSentNext::Drop,
+                    index,
+                );
+            }
+        }
+    }
+    if out_len != 0 {
+        runtime.enqueue_to_next(frame, &nexts[..out_len]);
+    }
+    for offset in 0..keep_len {
+        let index = unsafe { keep[offset].assume_init() };
+        let _ = frame.push_index(index);
+    }
     NodeResult::drop()
+}
+
+#[inline]
+fn emit_local(
+    runtime: &DataPlaneRuntime,
+    frame: &mut BufferFrame,
+    nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
+    out_len: &mut usize,
+    next: TcpSynSentNext,
+    index: Index,
+) -> CoreResult<()> {
+    if *out_len == DEFAULT_BUFFER_FRAME_CAPACITY {
+        runtime.enqueue_to_next(frame, &nexts[..*out_len]);
+        *out_len = 0;
+    }
+    nexts[*out_len] = NodeNext::slot(next);
+    frame.push_index(index)?;
+    *out_len += 1;
+    debug_assert_eq!(*out_len, frame.len());
+    Ok(())
 }
 
 fn tcp_syn_sent_index<C, Seg>(
     runtime: &DataPlaneRuntime,
     index: Index,
     session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
-    tcp_output: NodeId,
+    out_frame: &mut BufferFrame,
+    nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
+    out_len: &mut usize,
 ) -> CoreResult<bool>
 where
     C: CongestionController + 'static,
@@ -128,8 +176,8 @@ where
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let packet = tcp_packet(runtime, index)?;
-    let mut tx_frame = None;
     let mut keep_current = true;
+    let mut control_segment = None;
     let result = {
         let mut queue = session_queue.borrow_mut()?;
         let session_id = read_session_id(runtime, index)?.ok_or_else(|| {
@@ -202,49 +250,25 @@ where
         if established {
             queue.app().connected(session_id)?;
         }
-        if let Some(segment) = control {
-            let mut owner = runtime.buffers().get_next_frame(tcp_output)?;
-            let allocated = runtime.buffers().alloc_index()?;
-            owner.push_index(allocated)?;
-            segment.write_to_buffer(runtime.buffers(), allocated)?;
-            tx_frame = Some(owner);
-        }
+        control_segment = control;
         Ok(())
     };
     if let Err(error) = result {
         return Err(error);
     }
-    if let Some(tx_frame) = tx_frame.take() {
-        runtime.put_next_frame(tx_frame)?;
+    if let Some(segment) = control_segment.take() {
+        let allocated = runtime.buffers().alloc_index()?;
+        segment.write_to_buffer(runtime.buffers(), allocated)?;
+        emit_local(
+            runtime,
+            out_frame,
+            nexts,
+            out_len,
+            TcpSynSentNext::Output,
+            allocated,
+        )?;
     }
     Ok(keep_current)
-}
-
-#[inline(always)]
-fn prefetch_tcp_syn_sent(runtime: &DataPlaneRuntime, indices: &[Index]) {
-    let mut read = 0usize;
-    while read < indices.len() {
-        runtime.prefetch_header(indices[read]);
-        read += 1;
-    }
-}
-
-#[inline(always)]
-fn tcp_syn_sent_enqueue_index<C, Seg>(
-    runtime: &DataPlaneRuntime,
-    index: Index,
-    session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
-    tcp_output: NodeId,
-) -> CoreResult<bool>
-where
-    C: CongestionController + 'static,
-    Seg: Segment,
-    crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-{
-    match tcp_syn_sent_index(runtime, index, session_queue, tcp_output) {
-        Ok(keep_current) => Ok(keep_current),
-        Err(error) => Err(error),
-    }
 }
 
 #[cfg(test)]
@@ -408,14 +432,17 @@ mod legacy_tests {
         let packet_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
         let tcp_header_len = ((packet[header_len + 12] >> 4) as usize) * 4;
         let mut buffer = runtime.get_buffer_mut(buffer).expect("buffer mut");
-        unsafe { std::mem::transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }
-            .set_packet_cursor(
-                BufferPacketCursor::new()
-                    .with_packet_len(packet_len)
-                    .with_network_header(0, header_len)
-                    .with_transport_header(header_len, tcp_header_len)
-                    .with_transport_payload_offset(header_len + tcp_header_len),
-            );
+        let network = unsafe { std::mem::transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+        network.set_packet_cursor(
+            BufferPacketCursor::new()
+                .with_packet_len(packet_len)
+                .with_network_header(0, header_len)
+                .with_transport_header(header_len, tcp_header_len)
+                .with_transport_payload_offset(header_len + tcp_header_len),
+        );
+        let ip_version = (packet[0] >> 4) as u8;
+        network.ip_mut().set_ip_version(Some(ip_version));
+        network.ip_mut().set_ip_protocol(Some(6));
     }
 
     fn assert_tcp_packet(
@@ -600,4 +627,150 @@ mod legacy_tests {
         }
         !(sum as u16)
     }
+
+    fn install_syn_sent_runtime(
+        runtime: &DataPlaneRuntime,
+    ) -> (
+        NodeId,
+        SessionQueueHandle<SessionDriverRuntime<(TcpWorker<BbrController>, ()), Local, PoolIndex>>,
+        Arc<Mutex<CaptureState>>,
+    ) {
+        let worker = DataWorkerId::new(0);
+        let driver = SessionDriverRuntime::new(
+            worker,
+            runtime.buffers().clone(),
+            (TcpWorker::<BbrController>::new(worker), ()),
+        );
+        let handle = crate::session::node::register_session_queue(driver).expect("register queue");
+        let output_state = Arc::new(Mutex::new(CaptureState::default()));
+        let capture = runtime
+            .nodes()
+            .register_internal(CaptureNode::new(Arc::clone(&output_state)));
+        let drop = runtime.nodes().register_internal(DropNode::new());
+        let output = runtime
+            .nodes()
+            .register_internal(TcpOutputNode::new(TcpOutputNext::nodes(drop, capture)));
+        let syn_sent = runtime.nodes().register_internal(TcpSynSentNode::new(
+            handle,
+            TcpSynSentNext::nodes(output, drop),
+        ));
+        let input = tcp_input_node(runtime, handle, syn_sent, drop);
+        (input, handle, output_state)
+    }
+
+    #[test]
+    fn syn_ack_establishes_session_and_emits_final_ack() {
+        let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
+            buffers: hammer_core::data_plane::DataPlaneBufferConfig {
+                buffer_slot_capacity: 2048,
+                buffer_slots: 32,
+                frame_slots: 8,
+                ..hammer_core::data_plane::DataPlaneBufferConfig::default()
+            },
+        });
+        let (input, handle, output_state) = install_syn_sent_runtime(&runtime);
+        let (session_id, iss) = open_client_session(handle);
+        {
+            let mut queue = handle.borrow_mut().expect("tcp queue");
+            crate::transport::tcp::publish_tcp_connection(&mut queue, session_id)
+                .expect("publish");
+        }
+
+        send_packet(
+            &runtime,
+            input,
+            tcp_packet(
+                REMOTE,
+                REMOTE_PORT,
+                LOCAL,
+                LOCAL_PORT,
+                SERVER_ISN,
+                iss.wrapping_add(1),
+                SYN | ACK,
+            ),
+        );
+        for _ in 0..8 {
+            let _ = runtime.run_ready_nodes().expect("drain graph");
+            if !output_state.lock().expect("capture").packets.is_empty() {
+                break;
+            }
+        }
+
+        {
+            let queue = handle.borrow_mut().expect("tcp queue");
+            let connection = queue.session(session_id).expect("session");
+            assert_eq!(
+                connection.state(),
+                crate::transport::tcp::TcpState::Established
+            );
+        }
+        let packets = output_state.lock().expect("capture");
+        assert_eq!(packets.packets.len(), 1, "final ACK must reach tcp-output capture");
+        assert_tcp_packet(
+            &packets.packets[0],
+            LOCAL,
+            LOCAL_PORT,
+            REMOTE,
+            REMOTE_PORT,
+            iss.wrapping_add(1),
+            SERVER_ISN.wrapping_add(1),
+            ACK,
+        );
+    }
+
+    #[test]
+    fn missing_session_route_on_syn_sent_reaches_drop() {
+        let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
+            buffers: hammer_core::data_plane::DataPlaneBufferConfig {
+                buffer_slot_capacity: 2048,
+                buffer_slots: 16,
+                frame_slots: 8,
+                ..hammer_core::data_plane::DataPlaneBufferConfig::default()
+            },
+        });
+        let worker = DataWorkerId::new(0);
+        let driver = SessionDriverRuntime::new(
+            worker,
+            runtime.buffers().clone(),
+            (TcpWorker::<BbrController>::new(worker), ()),
+        );
+        let handle = crate::session::node::register_session_queue(driver).expect("register queue");
+        let drop_state = Arc::new(Mutex::new(CaptureState::default()));
+        let drop_capture = runtime
+            .nodes()
+            .register_internal(CaptureNode::new(Arc::clone(&drop_state)));
+        let drop = runtime.nodes().register_internal(DropNode::new());
+        let output_state = Arc::new(Mutex::new(CaptureState::default()));
+        let capture = runtime
+            .nodes()
+            .register_internal(CaptureNode::new(Arc::clone(&output_state)));
+        let output = runtime
+            .nodes()
+            .register_internal(TcpOutputNode::new(TcpOutputNext::nodes(drop, capture)));
+        let syn_sent = runtime.nodes().register_internal(TcpSynSentNode::new(
+            handle,
+            TcpSynSentNext::nodes(output, drop_capture),
+        ));
+
+        send_packet(
+            &runtime,
+            syn_sent,
+            tcp_packet(
+                REMOTE,
+                REMOTE_PORT,
+                LOCAL,
+                LOCAL_PORT,
+                SERVER_ISN,
+                1,
+                SYN | ACK,
+            ),
+        );
+        assert!(runtime.run_ready_nodes().expect("run syn-sent") >= 1);
+        if drop_state.lock().expect("drop").packets.is_empty() {
+            assert!(runtime.run_ready_nodes().expect("run drop") >= 1);
+        }
+        assert!(output_state.lock().expect("output").packets.is_empty());
+        assert_eq!(drop_state.lock().expect("drop").packets.len(), 1);
+    }
 }
+

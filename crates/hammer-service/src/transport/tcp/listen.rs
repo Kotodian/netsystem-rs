@@ -1,6 +1,8 @@
 use std::cell::{Cell, RefCell};
 
-use hammer_core::data_plane::{BufferFrame, Index, NodeId};
+use hammer_core::data_plane::{
+    BufferFrame, Index, NodeId, NodeNext, DEFAULT_BUFFER_FRAME_CAPACITY,
+};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::{TcpConnectionId, TcpError, TcpPacket, TcpSegmentFlags, TcpSeq};
 use hammer_infra::pool::Index as PoolIndex;
@@ -119,11 +121,7 @@ where
 {
     #[inline(always)]
     fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
-        let next = match Self::runtime_nexts(runtime) {
-            Ok(next) => next,
-            Err(_) => return NodeResult::drop(),
-        };
-        tcp_listen_process_frame(runtime, frame, &self.control, self.session_queue, next)
+        tcp_listen_process_frame(runtime, frame, &self.control, self.session_queue)
     }
 
     #[inline]
@@ -147,10 +145,6 @@ where
     Seg: Segment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
-    let next = match TcpListenNode::<C, Seg>::runtime_nexts(runtime) {
-        Ok(next) => next,
-        Err(_) => return NodeResult::drop(),
-    };
     let control = match tcp_listen_control(data) {
         Ok(c) => c,
         Err(_) => return NodeResult::drop(),
@@ -160,7 +154,6 @@ where
         frame,
         &control,
         SessionQueueHandle::new(NodeRuntimeData::from_words([data.word(0), 0, 0, 0])),
-        next,
     )
 }
 
@@ -170,35 +163,70 @@ fn tcp_listen_process_frame<C, Seg>(
     frame: &mut BufferFrame,
     control: &TcpInputControlPlane,
     session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
-    next: [NodeId; TcpListenNext::COUNT],
 ) -> NodeResult
 where
     C: CongestionController + 'static,
     Seg: Segment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
-    let tcp_output = next[TcpListenNext::Output as usize];
-    let tcp_established = next[TcpListenNext::Established as usize];
-    let drop_next = next[TcpListenNext::Drop as usize];
-    let width = runtime.preferred_frame_batch_width();
-    let _ = frame.rewrite_indices_batched(width, |index| {
+    let input_len = frame.len();
+    debug_assert!(input_len <= DEFAULT_BUFFER_FRAME_CAPACITY);
+    let mut inputs =
+        [core::mem::MaybeUninit::<Index>::uninit(); DEFAULT_BUFFER_FRAME_CAPACITY];
+    for (offset, &index) in frame.indices().iter().enumerate() {
+        inputs[offset].write(index);
+    }
+    frame.discard_prefix(input_len);
+
+    let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
+    let mut out_len = 0usize;
+    for offset in 0..input_len {
+        let index = unsafe { inputs[offset].assume_init() };
         if tcp_listen_index(
             runtime,
             index,
             control,
             session_queue,
-            tcp_output,
-            tcp_established,
+            frame,
+            &mut nexts,
+            &mut out_len,
         )
         .is_err()
-            && let Ok(mut drop_frame) = runtime.buffers().get_next_frame(drop_next)
-            && drop_frame.push_index(index).is_ok()
         {
-            let _ = runtime.put_next_frame(drop_frame);
+            let _ = emit_local(
+                runtime,
+                frame,
+                &mut nexts,
+                &mut out_len,
+                TcpListenNext::Drop,
+                index,
+            );
         }
-        Ok(None)
-    });
+    }
+    if out_len != 0 {
+        runtime.enqueue_to_next(frame, &nexts[..out_len]);
+    }
     NodeResult::drop()
+}
+
+#[inline]
+fn emit_local(
+    runtime: &DataPlaneRuntime,
+    frame: &mut BufferFrame,
+    nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
+    out_len: &mut usize,
+    next: TcpListenNext,
+    index: Index,
+) -> CoreResult<()> {
+    if *out_len == DEFAULT_BUFFER_FRAME_CAPACITY {
+        runtime.enqueue_to_next(frame, &nexts[..*out_len]);
+        *out_len = 0;
+    }
+    nexts[*out_len] = NodeNext::slot(next);
+    frame.push_index(index)?;
+    *out_len += 1;
+    debug_assert_eq!(*out_len, frame.len());
+    Ok(())
 }
 
 fn tcp_listen_index<C, Seg>(
@@ -206,8 +234,9 @@ fn tcp_listen_index<C, Seg>(
     index: Index,
     control: &TcpInputControlPlane,
     session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
-    tcp_output: NodeId,
-    tcp_established: NodeId,
+    out_frame: &mut BufferFrame,
+    nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
+    out_len: &mut usize,
 ) -> CoreResult<()>
 where
     C: CongestionController + 'static,
@@ -219,7 +248,7 @@ where
         let _ = runtime.record_current_node_error(TcpNodeError::NoListener.code());
         TcpError::NoListener
     })?;
-    let mut tx_frame = None;
+    let mut control_segment = None;
     let established_session;
     let result = {
         let mut queue = session_queue.borrow_mut()?;
@@ -232,21 +261,24 @@ where
             &packet,
         )?;
         established_session = session_id;
-        if let Some(segment) = control {
-            let mut owner = runtime.buffers().get_next_frame(tcp_output)?;
-            let allocated = runtime.buffers().alloc_index()?;
-            owner.push_index(allocated)?;
-            segment.write_to_buffer(runtime.buffers(), allocated)?;
-            tx_frame = Some(owner);
-        }
+        control_segment = control;
         Ok(())
     };
     if let Err(error) = result {
         return Err(error);
     }
 
-    if let Some(tx_frame) = tx_frame.take() {
-        runtime.put_next_frame(tx_frame)?;
+    if let Some(segment) = control_segment.take() {
+        let allocated = runtime.buffers().alloc_index()?;
+        segment.write_to_buffer(runtime.buffers(), allocated)?;
+        emit_local(
+            runtime,
+            out_frame,
+            nexts,
+            out_len,
+            TcpListenNext::Output,
+            allocated,
+        )?;
     }
     if let Some(session_id) = established_session
         && packet.payload_len != 0
@@ -261,9 +293,14 @@ where
                 TcpInputNext::Established,
             );
             drop(buffer);
-            let mut established_frame = runtime.buffers().get_next_frame(tcp_established)?;
-            established_frame.push_index(index)?;
-            runtime.put_next_frame(established_frame)?;
+            emit_local(
+                runtime,
+                out_frame,
+                nexts,
+                out_len,
+                TcpListenNext::Established,
+                index,
+            )?;
             return Ok(());
         }
     }

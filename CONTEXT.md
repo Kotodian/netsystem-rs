@@ -40,6 +40,10 @@ _Avoid_: packet-path NodeId protocol dispatch, NodeNextStorage for ICMP/UDP inpu
 TCP input classifies worker-local nexts as current-node-local `u16` slots and enqueues them through Graph Fanout. Cross-worker session ownership leaves the input Frame through Handoff before Fanout; Handoff may retain destination `NodeId` continuation state, and Fanout never enters the cross-worker queue.
 _Avoid_: TCP input manual get/push/put, Fanout of handoff-owned indexes, worker-local handoff
 
+**TCP State Fanout**:
+TCP established, rcv-process, listen, and syn-sent drain the input Frame, select current-node-local nexts (Output / Drop / Established forward), and flush through Graph Fanout with fixed stack next scratch. Accepted RX payload crosses into Session ownership at the existing app/session seam; generated control buffers are Fanout to tcp-output after TCP/Session state commit. syn-sent retains non-consumed Indexes on the source Frame for RAII free.
+_Avoid_: state-node get_next_frame/put_next_frame by target NodeId, one-buffer control put before commit
+
 **Session Queue Fanout**:
 Session Queue accumulates generated indexes on the driver Frame with one local next per entry, then performs a single Graph Fanout flush at dispatch end. Existing pending output seeds the shared IO count; normal and custom IO share the remaining allowance up to 128; control processing is not charged; unserved IO remains scheduled. Transport commits before graph visibility.
 _Avoid_: per-packet get/push/put from Session Queue, Fanout before transport commit, charging control to the IO budget

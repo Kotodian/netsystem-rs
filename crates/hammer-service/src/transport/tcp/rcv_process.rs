@@ -1,4 +1,6 @@
-use hammer_core::data_plane::{BufferFrame, Index, NodeId};
+use hammer_core::data_plane::{
+    BufferFrame, Index, NodeId, NodeNext, DEFAULT_BUFFER_FRAME_CAPACITY,
+};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::pool::Index as PoolIndex;
 use hammer_infra::segment::Segment;
@@ -46,11 +48,7 @@ where
 {
     #[inline(always)]
     fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
-        let next = match Self::runtime_nexts(runtime) {
-            Ok(next) => next,
-            Err(_) => return NodeResult::drop(),
-        };
-        tcp_rcv_process_frame(runtime, frame, self.session_queue, next)
+        tcp_rcv_process_frame(runtime, frame, self.session_queue)
     }
 
     #[inline]
@@ -74,15 +72,10 @@ where
     Seg: Segment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
-    let next = match TcpRcvProcessNode::<C, Seg>::runtime_nexts(runtime) {
-        Ok(next) => next,
-        Err(_) => return NodeResult::drop(),
-    };
     tcp_rcv_process_frame::<C, Seg>(
         runtime,
         frame,
         SessionQueueHandle::<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>::new(data),
-        next,
     )
 }
 
@@ -90,33 +83,78 @@ fn tcp_rcv_process_frame<C, Seg>(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
     session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
-    next: [NodeId; TcpRcvProcessNext::COUNT],
 ) -> NodeResult
 where
     C: CongestionController + 'static,
     Seg: Segment,
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
-    let tcp_output = next[TcpRcvProcessNext::Output as usize];
-    let drop_next = next[TcpRcvProcessNext::Drop as usize];
-    let width = runtime.preferred_frame_batch_width();
-    let _ = frame.rewrite_indices_batched(width, |index| {
-        if tcp_rcv_process_index(runtime, index, session_queue, tcp_output).is_err()
-            && let Ok(mut drop_frame) = runtime.buffers().get_next_frame(drop_next)
-            && drop_frame.push_index(index).is_ok()
+    let input_len = frame.len();
+    debug_assert!(input_len <= DEFAULT_BUFFER_FRAME_CAPACITY);
+    let mut inputs =
+        [core::mem::MaybeUninit::<Index>::uninit(); DEFAULT_BUFFER_FRAME_CAPACITY];
+    for (offset, &index) in frame.indices().iter().enumerate() {
+        inputs[offset].write(index);
+    }
+    frame.discard_prefix(input_len);
+
+    let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
+    let mut out_len = 0usize;
+    for offset in 0..input_len {
+        let index = unsafe { inputs[offset].assume_init() };
+        if tcp_rcv_process_index(
+            runtime,
+            index,
+            session_queue,
+            frame,
+            &mut nexts,
+            &mut out_len,
+        )
+        .is_err()
         {
-            let _ = runtime.put_next_frame(drop_frame);
+            let _ = emit_local(
+                runtime,
+                frame,
+                &mut nexts,
+                &mut out_len,
+                TcpRcvProcessNext::Drop,
+                index,
+            );
         }
-        Ok(None)
-    });
+    }
+    if out_len != 0 {
+        runtime.enqueue_to_next(frame, &nexts[..out_len]);
+    }
     NodeResult::drop()
+}
+
+#[inline]
+fn emit_local(
+    runtime: &DataPlaneRuntime,
+    frame: &mut BufferFrame,
+    nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
+    out_len: &mut usize,
+    next: TcpRcvProcessNext,
+    index: Index,
+) -> CoreResult<()> {
+    if *out_len == DEFAULT_BUFFER_FRAME_CAPACITY {
+        runtime.enqueue_to_next(frame, &nexts[..*out_len]);
+        *out_len = 0;
+    }
+    nexts[*out_len] = NodeNext::slot(next);
+    frame.push_index(index)?;
+    *out_len += 1;
+    debug_assert_eq!(*out_len, frame.len());
+    Ok(())
 }
 
 fn tcp_rcv_process_index<C, Seg>(
     runtime: &DataPlaneRuntime,
     index: Index,
     session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
-    tcp_output: NodeId,
+    out_frame: &mut BufferFrame,
+    nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
+    out_len: &mut usize,
 ) -> CoreResult<()>
 where
     C: CongestionController + 'static,
@@ -195,11 +233,16 @@ where
     };
     let control = result?;
     if let Some(segment) = control {
-        let mut owner = runtime.buffers().get_next_frame(tcp_output)?;
         let allocated = runtime.buffers().alloc_index()?;
-        owner.push_index(allocated)?;
         segment.write_to_buffer(runtime.buffers(), allocated)?;
-        runtime.put_next_frame(owner)?;
+        emit_local(
+            runtime,
+            out_frame,
+            nexts,
+            out_len,
+            TcpRcvProcessNext::Output,
+            allocated,
+        )?;
     }
     Ok(())
 }
