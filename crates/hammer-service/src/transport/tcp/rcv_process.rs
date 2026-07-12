@@ -926,6 +926,71 @@ mod tests {
         assert!(output_state.lock().expect("output").packets.is_empty());
     }
 
+    fn open_syn_rcvd_session(
+        handle: SessionQueueHandle<
+            SessionDriverRuntime<(TcpWorker<BbrController>, ()), Local, PoolIndex>,
+        >,
+    ) -> (SessionId, u32, u32) {
+        let mut queue = handle.borrow_mut().expect("tcp queue");
+        let session_id = queue
+            .insert_session_with_id(|session_id| {
+                let mut connection = TcpConnection::new(
+                    Some(TcpConnectionId::new(session_id.get())),
+                    DataWorkerId::new(0),
+                    LOCAL_PORT,
+                    Some(local_addr()),
+                    remote_addr(),
+                );
+                let _ = connection
+                    .receive_syn(
+                        remote_addr(),
+                        local_addr(),
+                        TcpSegmentFlags::SYN,
+                        7_000.into(),
+                        u16::MAX,
+                        TcpCapabilities::default(),
+                        None,
+                        0,
+                        TcpCapabilities::default(),
+                    )
+                    .expect("accept syn")
+                    .expect("syn-ack");
+                assert_eq!(connection.state(), TcpState::SynRcvd);
+                connection
+            })
+            .expect("insert syn-rcvd");
+        publish_tcp_connection(&mut queue, session_id).expect("publish");
+        let connection = queue.session(session_id).expect("session");
+        (session_id, connection.rcv_nxt(), connection.snd_nxt())
+    }
+
+    #[test]
+    fn final_ack_in_syn_rcvd_enters_established() {
+        let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
+            buffers: hammer_core::data_plane::DataPlaneBufferConfig {
+                buffer_slot_capacity: 2048,
+                buffer_slots: 32,
+                frame_slots: 8,
+                ..hammer_core::data_plane::DataPlaneBufferConfig::default()
+            },
+        });
+        let (rcv, handle, output_state, _) = install_rcv_runtime(&runtime);
+        let (session_id, rcv_nxt, snd_nxt) = open_syn_rcvd_session(handle);
+
+        send_to_rcv(
+            &runtime,
+            rcv,
+            Some(session_id),
+            control_packet(rcv_nxt, snd_nxt, TcpSegmentFlags::ACK),
+        );
+        assert!(runtime.run_ready_nodes().expect("run") >= 1);
+
+        let queue = handle.borrow_mut().expect("tcp queue");
+        let connection = queue.session(session_id).expect("session");
+        assert_eq!(connection.state(), TcpState::Established);
+        assert!(output_state.lock().expect("output").packets.is_empty());
+    }
+
     #[test]
     fn time_wait_duplicate_fin_reacks_peer() {
         let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
