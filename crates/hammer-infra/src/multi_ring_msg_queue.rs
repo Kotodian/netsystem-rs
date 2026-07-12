@@ -59,9 +59,9 @@ struct RingHeader {
     _pad: u32,
 }
 
-/// Local multi-ring message queue (expand surface; flat [`crate::msg_queue::MsgQueue`] remains).
-pub struct MultiRingMsgQueue {
-    _seg: Local,
+/// VPP-shaped multi-ring message queue over a [`Segment`] backend.
+pub struct MultiRingMsgQueue<S: Segment = Local> {
+    _seg: S,
     hdr: *mut QueueHeader,
     descs: *mut MsgDesc,
     rings: Vec<RingView>,
@@ -74,17 +74,39 @@ struct RingView {
     data: *mut u8,
 }
 
-unsafe impl Send for MultiRingMsgQueue {}
-unsafe impl Sync for MultiRingMsgQueue {}
+unsafe impl<S: Segment> Send for MultiRingMsgQueue<S> {}
+unsafe impl<S: Segment> Sync for MultiRingMsgQueue<S> {}
 
-impl MultiRingMsgQueue {
+impl MultiRingMsgQueue<Local> {
     pub fn with_cfg(cfg: MultiRingMsgQueueCfg<'_>) -> Result<Self, MultiRingMsgQueueError> {
         validate_cfg(&cfg)?;
-        let bytes = layout_bytes(&cfg);
+        let bytes = Self::layout_bytes(&cfg);
         let seg = Local::new(bytes + 64);
         let hdr_off = seg.alloc(bytes, 8);
+        unsafe { Self::init_at(seg, hdr_off, &cfg) }
+    }
+}
+
+impl<S: Segment> MultiRingMsgQueue<S> {
+    /// Byte size of the on-segment layout for `cfg` (excluding caller padding).
+    pub fn layout_bytes(cfg: &MultiRingMsgQueueCfg<'_>) -> usize {
+        layout_bytes(cfg)
+    }
+
+    /// Initialise a multi-ring queue at a pre-allocated offset in `seg`.
+    ///
+    /// # Safety
+    /// Caller must guarantee `seg` has at least [`Self::layout_bytes`] bytes
+    /// available at `hdr_offset`, and that no other live view mutates the same
+    /// region without the queue's producer/consumer protocol.
+    pub unsafe fn init_at(
+        seg: S,
+        hdr_offset: u64,
+        cfg: &MultiRingMsgQueueCfg<'_>,
+    ) -> Result<Self, MultiRingMsgQueueError> {
+        validate_cfg(cfg)?;
         let base = seg.base();
-        let hdr = unsafe { base.add(hdr_off as usize) as *mut QueueHeader };
+        let hdr = unsafe { base.add(hdr_offset as usize) as *mut QueueHeader };
         unsafe {
             std::ptr::write(
                 hdr,
@@ -100,7 +122,7 @@ impl MultiRingMsgQueue {
             );
         }
 
-        let mut offset = hdr_off as usize + std::mem::size_of::<QueueHeader>();
+        let mut offset = hdr_offset as usize + std::mem::size_of::<QueueHeader>();
         let descs = unsafe { base.add(offset) as *mut MsgDesc };
         offset += cfg.q_nitems as usize * std::mem::size_of::<MsgDesc>();
 
@@ -144,8 +166,46 @@ impl MultiRingMsgQueue {
         })
     }
 
+    /// Remap an already-initialised multi-ring queue from shared segment memory.
+    ///
+    /// # Safety
+    /// `hdr_offset` must point at a queue previously initialised with
+    /// [`Self::init_at`] (or equivalent layout). Ring headers must still be
+    /// valid; the caller owns signaling separately.
+    pub unsafe fn from_shared(seg: S, hdr_offset: u64) -> Self {
+        let base = seg.base();
+        let hdr = unsafe { base.add(hdr_offset as usize) as *mut QueueHeader };
+        let qhdr = unsafe { &*hdr };
+        let mut offset = hdr_offset as usize + std::mem::size_of::<QueueHeader>();
+        let descs = unsafe { base.add(offset) as *mut MsgDesc };
+        offset += qhdr.q_nitems as usize * std::mem::size_of::<MsgDesc>();
+
+        let mut rings = Vec::with_capacity(qhdr.n_rings as usize);
+        for _ in 0..qhdr.n_rings {
+            let ring_hdr = unsafe { base.add(offset) as *mut RingHeader };
+            let rhdr = unsafe { &*ring_hdr };
+            offset += std::mem::size_of::<RingHeader>();
+            let free_slots = unsafe { base.add(offset) as *mut u32 };
+            offset += rhdr.nitems as usize * std::mem::size_of::<u32>();
+            let data = unsafe { base.add(offset) };
+            offset += rhdr.nitems as usize * rhdr.elsize as usize;
+            rings.push(RingView {
+                hdr: ring_hdr,
+                free_slots,
+                data,
+            });
+        }
+        let _ = offset;
+        Self {
+            _seg: seg,
+            hdr,
+            descs,
+            rings,
+        }
+    }
+
     #[inline]
-    pub fn lock(&self) -> ProducerGuard<'_> {
+    pub fn lock(&self) -> ProducerGuard<'_, S> {
         self.lock_producer();
         ProducerGuard { queue: self }
     }
@@ -168,7 +228,7 @@ impl MultiRingMsgQueue {
     }
 
     /// Consumer: take next descriptor without the producer lock.
-    pub fn sub(&self) -> Option<RingMsg<'_>> {
+    pub fn sub(&self) -> Option<RingMsg<'_, S>> {
         let hdr = unsafe { &*self.hdr };
         let head = hdr.q_head.load(Ordering::Relaxed);
         let tail = hdr.q_tail.load(Ordering::Acquire);
@@ -213,13 +273,13 @@ fn layout_bytes(cfg: &MultiRingMsgQueueCfg<'_>) -> usize {
 }
 
 /// RAII producer lock — unlocks on Drop.
-pub struct ProducerGuard<'a> {
-    queue: &'a MultiRingMsgQueue,
+pub struct ProducerGuard<'a, S: Segment = Local> {
+    queue: &'a MultiRingMsgQueue<S>,
 }
 
-impl<'a> ProducerGuard<'a> {
+impl<'a, S: Segment> ProducerGuard<'a, S> {
     /// Allocate a free slot on `ring` (must be held under this guard).
-    pub fn alloc(&mut self, ring: u32) -> Result<MsgSlot, MultiRingMsgQueueError> {
+    pub fn alloc(&mut self, ring: u32) -> Result<MsgSlot<S>, MultiRingMsgQueueError> {
         let qhdr = unsafe { &*self.queue.hdr };
         let head = qhdr.q_head.load(Ordering::Acquire);
         let tail = qhdr.q_tail.load(Ordering::Relaxed);
@@ -240,7 +300,7 @@ impl<'a> ProducerGuard<'a> {
         let slot = unsafe { *ring_view.free_slots.add(new_top as usize) };
         rhdr.free_top.store(new_top, Ordering::Relaxed);
         Ok(MsgSlot {
-            queue: self.queue as *const MultiRingMsgQueue,
+            queue: self.queue as *const MultiRingMsgQueue<S>,
             ring,
             slot,
             elsize: rhdr.elsize as usize,
@@ -250,7 +310,7 @@ impl<'a> ProducerGuard<'a> {
     }
 
     /// Publish an allocated slot onto the descriptor queue.
-    pub fn add(&mut self, mut slot: MsgSlot) {
+    pub fn add(&mut self, mut slot: MsgSlot<S>) {
         let qhdr = unsafe { &*self.queue.hdr };
         let tail = qhdr.q_tail.load(Ordering::Relaxed);
         let idx = tail & qhdr.q_mask;
@@ -265,15 +325,15 @@ impl<'a> ProducerGuard<'a> {
     }
 }
 
-impl Drop for ProducerGuard<'_> {
+impl<S: Segment> Drop for ProducerGuard<'_, S> {
     fn drop(&mut self) {
         self.queue.unlock_producer();
     }
 }
 
 /// Writable ring slot while the producer guard is held.
-pub struct MsgSlot {
-    queue: *const MultiRingMsgQueue,
+pub struct MsgSlot<S: Segment = Local> {
+    queue: *const MultiRingMsgQueue<S>,
     ring: u32,
     slot: u32,
     elsize: usize,
@@ -281,15 +341,15 @@ pub struct MsgSlot {
     committed: bool,
 }
 
-unsafe impl Send for MsgSlot {}
+unsafe impl<S: Segment> Send for MsgSlot<S> {}
 
-impl MsgSlot {
+impl<S: Segment> MsgSlot<S> {
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.data, self.elsize) }
     }
 }
 
-impl Drop for MsgSlot {
+impl<S: Segment> Drop for MsgSlot<S> {
     fn drop(&mut self) {
         if self.committed {
             return;
@@ -302,13 +362,13 @@ impl Drop for MsgSlot {
 }
 
 /// Consumer-owned message; Drop returns the ring data slot.
-pub struct RingMsg<'a> {
-    queue: &'a MultiRingMsgQueue,
+pub struct RingMsg<'a, S: Segment = Local> {
+    queue: &'a MultiRingMsgQueue<S>,
     ring: u32,
     slot: u32,
 }
 
-impl RingMsg<'_> {
+impl<S: Segment> RingMsg<'_, S> {
     pub fn ring_index(&self) -> u32 {
         self.ring
     }
@@ -320,7 +380,7 @@ impl RingMsg<'_> {
     }
 }
 
-impl Drop for RingMsg<'_> {
+impl<S: Segment> Drop for RingMsg<'_, S> {
     fn drop(&mut self) {
         // Serialize freelist updates with producers.
         self.queue.lock_producer();
@@ -329,7 +389,7 @@ impl Drop for RingMsg<'_> {
     }
 }
 
-fn free_ring_slot_unlocked(queue: &MultiRingMsgQueue, ring: u32, slot: u32) {
+fn free_ring_slot_unlocked<S: Segment>(queue: &MultiRingMsgQueue<S>, ring: u32, slot: u32) {
     let ring_view = &queue.rings[ring as usize];
     let rhdr = unsafe { &*ring_view.hdr };
     let top = rhdr.free_top.load(Ordering::Relaxed);

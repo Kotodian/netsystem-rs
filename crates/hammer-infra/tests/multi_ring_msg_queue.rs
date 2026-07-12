@@ -9,6 +9,7 @@ use std::thread;
 use hammer_infra::multi_ring_msg_queue::{
     MultiRingMsgQueue, MultiRingMsgQueueCfg, MultiRingMsgQueueError, RingCfg,
 };
+use hammer_infra::segment::{Segment, Svm};
 
 fn u64_queue() -> MultiRingMsgQueue {
     MultiRingMsgQueue::with_cfg(MultiRingMsgQueueCfg {
@@ -27,7 +28,11 @@ fn u64_queue() -> MultiRingMsgQueue {
     .expect("queue")
 }
 
-fn write_u64(q: &MultiRingMsgQueue, ring: u32, value: u64) -> Result<(), MultiRingMsgQueueError> {
+fn write_u64<S: Segment>(
+    q: &MultiRingMsgQueue<S>,
+    ring: u32,
+    value: u64,
+) -> Result<(), MultiRingMsgQueueError> {
     let mut guard = q.lock();
     let mut slot = guard.alloc(ring)?;
     slot.as_mut_slice().copy_from_slice(&value.to_le_bytes());
@@ -35,7 +40,7 @@ fn write_u64(q: &MultiRingMsgQueue, ring: u32, value: u64) -> Result<(), MultiRi
     Ok(())
 }
 
-fn read_u64(msg: &hammer_infra::multi_ring_msg_queue::RingMsg<'_>) -> u64 {
+fn read_u64<S: Segment>(msg: &hammer_infra::multi_ring_msg_queue::RingMsg<'_, S>) -> u64 {
     let bytes: [u8; 8] = msg.as_slice().try_into().expect("elsize 8");
     u64::from_le_bytes(bytes)
 }
@@ -215,4 +220,40 @@ fn concurrent_producers_preserve_all_elements() {
         }
     }
     assert!(q.sub().is_none());
+}
+
+#[test]
+fn svm_init_at_and_from_shared_roundtrip_preserves_payload() {
+    let cfg = MultiRingMsgQueueCfg {
+        q_nitems: 8,
+        rings: &[
+            RingCfg {
+                nitems: 4,
+                elsize: 8,
+            },
+            RingCfg {
+                nitems: 4,
+                elsize: 8,
+            },
+        ],
+    };
+    let bytes = MultiRingMsgQueue::<Svm>::layout_bytes(&cfg);
+    let seg = Svm::default();
+    let off = seg.alloc(bytes, 64);
+
+    let producer =
+        unsafe { MultiRingMsgQueue::<Svm>::init_at(seg.clone(), off, &cfg) }.expect("init_at");
+    write_u64(&producer, 0, 0x1111_2222_3333_4444).expect("io");
+    write_u64(&producer, 1, 0xaaaa_bbbb_cccc_dddd).expect("ctrl");
+
+    let consumer = unsafe { MultiRingMsgQueue::<Svm>::from_shared(seg, off) };
+    let first = consumer.sub().expect("first");
+    assert_eq!(first.ring_index(), 0);
+    assert_eq!(read_u64(&first), 0x1111_2222_3333_4444);
+    drop(first);
+    let second = consumer.sub().expect("second");
+    assert_eq!(second.ring_index(), 1);
+    assert_eq!(read_u64(&second), 0xaaaa_bbbb_cccc_dddd);
+    drop(second);
+    assert!(consumer.sub().is_none());
 }
