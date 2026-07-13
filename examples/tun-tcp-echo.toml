@@ -14,9 +14,6 @@ poll_sleep = "50ms"
 data_size = 2048
 buffers_per_numa = 2048
 
-[worker.scheduler]
-qos = "utility"
-
 # VPP: session { enable use-app-socket-api preallocated-sessions event-queue-length }
 [network.session]
 backend = "svm"

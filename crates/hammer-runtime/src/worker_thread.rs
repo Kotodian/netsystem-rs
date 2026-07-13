@@ -127,12 +127,8 @@ mod tests {
         worker.cpu.worker_cores = vec![target];
         apply_worker_thread_setup(&worker, 0);
         assert_eq!(
-            get_core_ids().map(|cores| {
-                cores
-                    .into_iter()
-                    .map(|core| core.id)
-                    .collect::<Vec<_>>()
-            }),
+            get_core_ids()
+                .map(|cores| { cores.into_iter().map(|core| core.id).collect::<Vec<_>>() }),
             Some(vec![target])
         );
     }
