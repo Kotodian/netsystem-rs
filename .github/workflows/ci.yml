@@ -79,3 +79,23 @@ jobs:
           key: test-${{ matrix.platform }}
       - name: Run workspace tests [${{ matrix.platform }}]
         run: cargo test --workspace
+
+  bihash-read-scaling-linux:
+    name: bihash read scaling [linux]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout [linux]
+        uses: actions/checkout@v4
+      - name: Install Rust [linux]
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+      - name: Cache Cargo [linux]
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: bihash-read-scaling-linux
+      - name: Check bihash read scaling [linux]
+        run: >-
+          cargo test -p hammer-infra --release --test bihash_read_scaling
+          -- --ignored --nocapture

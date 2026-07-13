@@ -96,7 +96,6 @@ fn bihash_prefetch_accepts_empty_and_present_keys() {
 
 // ── ValuePage / Kv / FREE_U64 ──────────────────────────────────────────
 
-use hammer_infra::bihash::alloc::PageAlloc;
 use hammer_infra::bihash::value::{FREE_U64, Kv, ValuePage};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -157,25 +156,6 @@ fn value_page_4_fresh_new_has_all_free_count() {
 fn value_page_7_capacity_matches_kvp_const() {
     let page = ValuePage::<u64, 7>::new();
     assert_eq!(page.capacity(), 7);
-}
-
-#[test]
-fn page_alloc_returns_distinct_page_ids() {
-    let mut a = PageAlloc::<u64, 7>::new();
-    let p1 = a.alloc_single(0);
-    let p2 = a.alloc_single(0);
-    assert_ne!(p1, p2);
-    assert_eq!(a.live_pages(), 2);
-}
-
-#[test]
-fn page_alloc_free_reuses_page_id_lifo() {
-    let mut a = PageAlloc::<u64, 7>::new();
-    let p1 = a.alloc_single(0);
-    a.free(p1, 0);
-    let p2 = a.alloc_single(0);
-    assert_eq!(p1, p2);
-    assert_eq!(a.live_pages(), 1);
 }
 
 #[test]
@@ -325,7 +305,7 @@ fn bihash_iter_after_inserts_yields_correct_count() {
     t.insert(1, 10);
     t.insert(2, 20);
     t.insert(3, 30);
-    let pairs: Vec<(u64, u64)> = t.iter().map(|(&k, &v)| (k, v)).collect();
+    let pairs: Vec<(u64, u64)> = t.iter().collect();
     assert_eq!(pairs.len(), 3);
     assert!(pairs.contains(&(1, 10)));
     assert!(pairs.contains(&(2, 20)));
@@ -369,4 +349,80 @@ fn bihash_insert_if_absent_keeps_first_writer_value() {
     assert!(table.insert_if_absent(7, 70).is_ok());
     assert_eq!(table.insert_if_absent(7, 99), Err(70));
     assert_eq!(table.lookup(&7), Some(70));
+}
+
+#[test]
+fn bihash_concurrent_overwrite_lookup_observes_complete_values() {
+    use std::sync::Barrier;
+    use std::thread;
+
+    let table = Arc::new(Bihash::<u64, 7>::new(32));
+    table.insert(7, 70);
+    let start = Arc::new(Barrier::new(5));
+
+    let writer = {
+        let table = Arc::clone(&table);
+        let start = Arc::clone(&start);
+        thread::spawn(move || {
+            start.wait();
+            for value in 0..20_000u64 {
+                table.insert(7, 70 + (value & 1));
+            }
+        })
+    };
+    let readers = (0..4)
+        .map(|_| {
+            let table = Arc::clone(&table);
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                for _ in 0..20_000 {
+                    assert!(matches!(table.lookup(&7), Some(70 | 71)));
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    writer.join().expect("writer");
+    for reader in readers {
+        reader.join().expect("reader");
+    }
+}
+
+#[test]
+fn bihash_concurrent_split_keeps_published_entries_visible() {
+    use std::sync::Barrier;
+    use std::thread;
+
+    let table = Arc::new(Bihash::<u64, 2>::new(64));
+    table.insert(0, 99);
+    let start = Arc::new(Barrier::new(5));
+
+    let writer = {
+        let table = Arc::clone(&table);
+        let start = Arc::clone(&start);
+        thread::spawn(move || {
+            start.wait();
+            for key in 1..4_096u64 {
+                table.insert(key, key);
+            }
+        })
+    };
+    let readers = (0..4)
+        .map(|_| {
+            let table = Arc::clone(&table);
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                for _ in 0..10_000 {
+                    assert_eq!(table.lookup(&0), Some(99));
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    writer.join().expect("writer");
+    for reader in readers {
+        reader.join().expect("reader");
+    }
 }

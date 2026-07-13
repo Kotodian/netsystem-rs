@@ -1,12 +1,13 @@
 //! Hot-path operations: lookup, insert, remove, clear.
 //!
-//! Lookup is lock-free aside from retrying while a bucket lock bit is set.
-//! Insert/remove CAS the bucket lock bit, mutate pages, then publish.
+//! Lookup scans immutable published pages. Writers hold the bucket lock,
+//! modify an unpublished replacement, publish its offset, and retire the old
+//! allocation through PageAlloc.
 
-use crate::bihash::{
-    AtomicBucket, Bihash, BihashKey, Bucket, FREE_U64, Kv, PageAlloc, PageId,
-};
+use crate::bihash::{AtomicBucket, Bihash, BihashKey, Bucket, FREE_U64, Kv, ValuePage};
 use crate::prefetch::prefetch_read_l1;
+
+type Slot = (usize, usize);
 
 impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
     #[inline(always)]
@@ -24,17 +25,14 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
         prefetch_read_l1(bucket_ptr);
     }
 
-    /// Lock-free lookup with retry while the target bucket is writer-locked.
+    /// Lock-free lookup with retry while the target bucket changes.
     #[inline(always)]
     pub fn lookup(&self, key: &K) -> Option<u64> {
         self.lookup_with_hash(*key, key.hash())
     }
 
     #[inline(always)]
-    pub fn lookup_with_hash(&self, key: K, hash: u64) -> Option<u64>
-    where
-        K: Copy,
-    {
+    pub fn lookup_with_hash(&self, key: K, hash: u64) -> Option<u64> {
         if self.nbuckets() == 0 {
             return None;
         }
@@ -48,44 +46,27 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
             if bucket.is_empty() {
                 return None;
             }
-            let generation = bucket.generation();
-            let found = self.scan_bucket(bucket, key, hash);
-            let after = self.load_bucket(bucket_idx);
-            if after.is_locked() || after.generation() != generation {
-                continue;
-            }
-            return found;
-        }
-    }
-
-    #[inline(always)]
-    fn scan_bucket(&self, bucket: Bucket, key: K, hash: u64) -> Option<u64> {
-        let page_id = PageId(bucket.offset() as u32);
-        if page_id.is_none() {
-            return None;
-        }
-        let log2_pages = bucket.log2_pages();
-        let linear = bucket.is_linear_search();
-        let page_offset = if linear {
-            0u32
-        } else {
-            ((hash >> (self.log2_nbuckets() as u32)) as u32) & ((1u32 << log2_pages) - 1)
-        };
-        let first_page = PageId(page_id.0 + page_offset);
-        let limit = if linear { 1u32 << log2_pages } else { 1 };
-        for rel in 0..limit {
-            let cur = PageId(first_page.0 + rel);
-            let page = self.pages().get(cur);
-            for kv in page.slots() {
-                if kv_slot_is_free(kv) {
-                    continue;
-                }
-                if kv.key == key {
-                    return Some(kv.value);
-                }
+            let found = self.pages.read(
+                bucket.offset(),
+                bucket.log2_pages(),
+                || self.load_bucket(bucket_idx) == bucket,
+                |pages| {
+                    scan_pages(
+                        pages,
+                        bucket.log2_pages(),
+                        bucket.is_linear_search(),
+                        key,
+                        hash,
+                        self.log2_nbuckets(),
+                    )
+                    .0
+                    .map(|(_, value)| value)
+                },
+            );
+            if let Some(found) = found {
+                return found;
             }
         }
-        None
     }
 
     /// Insert only when absent. On conflict returns the existing value.
@@ -95,75 +76,24 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
         let bucket_idx = ((hash as u32) & (self.nbuckets() - 1)) as usize;
         let bucket = self.lock_bucket(bucket_idx);
 
-        if !bucket.is_empty() {
-            if let Some(existing) = self.scan_bucket(bucket, key, hash) {
-                self.store_bucket(
-                    bucket_idx,
-                    Bucket::pack(
-                        bucket.offset(),
-                        bucket.log2_pages(),
-                        bucket.refcnt(),
-                        bucket.generation(),
-                        bucket.is_linear_search(),
-                        false,
-                    ),
-                );
-                return Err(existing);
-            }
-        }
-
-        // Reuse insert body while already holding the lock by unlocking and
-        // calling insert — but that races. Inline the empty/free-slot paths.
         if bucket.is_empty() {
-            let page_id = self.with_alloc_mut(|pages| pages.alloc_single(0));
-            unsafe {
-                self.pages_mut().get_mut(page_id).slots_mut()[0] = Kv { key, value };
-            }
-            self.store_bucket(
-                bucket_idx,
-                Bucket::pack(page_id.0 as u64, 0, 1, 0, false, false),
-            );
+            let (offset, _) = self.pages.allocate(0, |pages| {
+                pages[0].slots_mut()[0] = Kv { key, value };
+            });
+            self.store_bucket(bucket_idx, Bucket::pack(offset, 0, 1, 0, false, false));
             self.add_len(1);
             return Ok(());
         }
 
-        let page_id = PageId(bucket.offset() as u32);
-        let log2_pages = bucket.log2_pages();
-        let linear = bucket.is_linear_search();
-        let page_offset = if linear {
-            0u32
-        } else {
-            ((hash >> (self.log2_nbuckets() as u32)) as u32) & ((1u32 << log2_pages) - 1)
-        };
-        let first_page = PageId(page_id.0 + page_offset);
-        let limit = if linear { 1u32 << log2_pages } else { 1 };
-        let mut free_slot: Option<(PageId, usize)> = None;
-        for rel in 0..limit {
-            let cur = PageId(first_page.0 + rel);
-            let page = self.pages().get(cur);
-            for (i, kv) in page.slots().iter().enumerate() {
-                if kv_slot_is_free(kv) {
-                    if free_slot.is_none() {
-                        free_slot = Some((cur, i));
-                    }
-                }
-            }
+        let (found, free) = self.inspect_locked(bucket, key, hash);
+        if let Some((_, existing)) = found {
+            self.unlock_unchanged(bucket_idx, bucket);
+            return Err(existing);
         }
-        if let Some((pid, i)) = free_slot {
-            unsafe {
-                self.pages_mut().get_mut(pid).slots_mut()[i] = Kv { key, value };
-            }
-            self.store_bucket(
-                bucket_idx,
-                Bucket::pack(
-                    page_id.0 as u64,
-                    log2_pages,
-                    bucket.refcnt() + 1,
-                    bucket.generation().wrapping_add(1) & 0x1F,
-                    linear,
-                    false,
-                ),
-            );
+        if let Some(slot) = free {
+            self.replace_locked(bucket_idx, bucket, bucket.refcnt() + 1, |pages| {
+                pages[slot.0].slots_mut()[slot.1] = Kv { key, value };
+            });
             self.add_len(1);
             return Ok(());
         }
@@ -180,70 +110,25 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
         let bucket = self.lock_bucket(bucket_idx);
 
         if bucket.is_empty() {
-            let page_id = self.with_alloc_mut(|pages| pages.alloc_single(0));
-            unsafe {
-                self.pages_mut().get_mut(page_id).slots_mut()[0] = Kv { key, value };
-            }
-            self.store_bucket(
-                bucket_idx,
-                Bucket::pack(page_id.0 as u64, 0, 1, 0, false, false),
-            );
+            let (offset, _) = self.pages.allocate(0, |pages| {
+                pages[0].slots_mut()[0] = Kv { key, value };
+            });
+            self.store_bucket(bucket_idx, Bucket::pack(offset, 0, 1, 0, false, false));
             self.add_len(1);
             return;
         }
 
-        let page_id = PageId(bucket.offset() as u32);
-        let log2_pages = bucket.log2_pages();
-        let linear = bucket.is_linear_search();
-        let page_offset = if linear {
-            0u32
-        } else {
-            ((hash >> (self.log2_nbuckets() as u32)) as u32) & ((1u32 << log2_pages) - 1)
-        };
-        let first_page = PageId(page_id.0 + page_offset);
-        let limit = if linear { 1u32 << log2_pages } else { 1 };
-
-        let mut free_slot: Option<(PageId, usize)> = None;
-        for rel in 0..limit {
-            let cur = PageId(first_page.0 + rel);
-            let page = self.pages().get(cur);
-            for (i, kv) in page.slots().iter().enumerate() {
-                if kv_slot_is_free(kv) {
-                    if free_slot.is_none() {
-                        free_slot = Some((cur, i));
-                    }
-                    continue;
-                }
-                if kv.key == key {
-                    unsafe {
-                        self.pages_mut().get_mut(cur).slots_mut()[i].value = value;
-                    }
-                    let unlocked = Bucket::pack(
-                        page_id.0 as u64,
-                        log2_pages,
-                        bucket.refcnt(),
-                        bucket.generation().wrapping_add(1) & 0x1F,
-                        bucket.is_linear_search(),
-                        false,
-                    );
-                    self.store_bucket(bucket_idx, unlocked);
-                    return;
-                }
-            }
+        let (found, free) = self.inspect_locked(bucket, key, hash);
+        if let Some((slot, _)) = found {
+            self.replace_locked(bucket_idx, bucket, bucket.refcnt(), |pages| {
+                pages[slot.0].slots_mut()[slot.1].value = value;
+            });
+            return;
         }
-        if let Some((pid, i)) = free_slot {
-            unsafe {
-                self.pages_mut().get_mut(pid).slots_mut()[i] = Kv { key, value };
-            }
-            let unlocked = Bucket::pack(
-                page_id.0 as u64,
-                log2_pages,
-                bucket.refcnt() + 1,
-                bucket.generation().wrapping_add(1) & 0x1F,
-                bucket.is_linear_search(),
-                false,
-            );
-            self.store_bucket(bucket_idx, unlocked);
+        if let Some(slot) = free {
+            self.replace_locked(bucket_idx, bucket, bucket.refcnt() + 1, |pages| {
+                pages[slot.0].slots_mut()[slot.1] = Kv { key, value };
+            });
             self.add_len(1);
             return;
         }
@@ -260,79 +145,134 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
             self.store_bucket(bucket_idx, Bucket::empty());
             return false;
         }
-        let page_id = PageId(bucket.offset() as u32);
-        let log2_pages = bucket.log2_pages();
-        let linear = bucket.is_linear_search();
-        let page_offset = if linear {
-            0u32
-        } else {
-            ((hash >> (self.log2_nbuckets() as u32)) as u32) & ((1u32 << log2_pages) - 1)
-        };
-        let limit = if linear { 1u32 << log2_pages } else { 1 };
 
-        for rel in 0..limit {
-            let cur = PageId(page_id.0 + page_offset + rel);
-            let page = unsafe { self.pages_mut().get_mut(cur) };
-            for slot in page.slots_mut() {
-                if slot.is_free() {
-                    continue;
-                }
-                if slot.key == *key {
-                    slot.mark_free();
-                    let unlocked = if !linear {
-                        Bucket::pack(
-                            page_id.0 as u64,
-                            log2_pages,
-                            bucket.refcnt() - 1,
-                            bucket.generation().wrapping_add(1) & 0x1F,
-                            false,
-                            false,
-                        )
-                    } else {
-                        Bucket::pack(
-                            page_id.0 as u64,
-                            log2_pages,
-                            bucket.refcnt(),
-                            bucket.generation().wrapping_add(1) & 0x1F,
-                            true,
-                            false,
-                        )
-                    };
-                    self.store_bucket(bucket_idx, unlocked);
-                    self.add_len(-1);
-                    return true;
-                }
-            }
+        let (found, _) = self.inspect_locked(bucket, *key, hash);
+        let Some((slot, _)) = found else {
+            self.unlock_unchanged(bucket_idx, bucket);
+            return false;
+        };
+
+        if bucket.refcnt() == 1 {
+            self.store_bucket(bucket_idx, Bucket::empty());
+            self.pages.retire(bucket.offset(), bucket.log2_pages());
+        } else {
+            self.replace_locked(bucket_idx, bucket, bucket.refcnt() - 1, |pages| {
+                pages[slot.0].slots_mut()[slot.1].mark_free();
+            });
         }
-        self.store_bucket(
-            bucket_idx,
-            Bucket::pack(
-                page_id.0 as u64,
-                log2_pages,
-                bucket.refcnt(),
-                bucket.generation(),
-                linear,
-                false,
-            ),
-        );
-        false
+        self.add_len(-1);
+        true
     }
 
     /// Remove all entries from the table.
     pub fn clear(&self) {
-        // Lock every bucket so lookups retry, then rebuild the arena.
+        let mut retired = crate::vec::Vec::new();
         for idx in 0..self.nbuckets() as usize {
-            let _ = self.lock_bucket(idx);
+            let bucket = self.lock_bucket(idx);
+            if !bucket.is_empty() {
+                retired.push((bucket.offset(), bucket.log2_pages()));
+            }
         }
-        self.with_alloc_mut(|pages| {
-            let heap = pages.heap();
-            *pages = PageAlloc::new_in(heap);
-        });
         for idx in 0..self.nbuckets() as usize {
             self.store_bucket(idx, Bucket::empty());
         }
+        for (offset, log2_pages) in retired {
+            self.pages.retire(offset, log2_pages);
+        }
         self.set_len(0);
     }
+
+    fn inspect_locked(
+        &self,
+        bucket: Bucket,
+        key: K,
+        hash: u64,
+    ) -> (Option<(Slot, u64)>, Option<Slot>) {
+        self.pages.inspect(bucket.offset(), bucket.log2_pages(), |pages| {
+            scan_pages(
+                pages,
+                bucket.log2_pages(),
+                bucket.is_linear_search(),
+                key,
+                hash,
+                self.log2_nbuckets(),
+            )
+        })
+    }
+
+    fn replace_locked(
+        &self,
+        bucket_idx: usize,
+        bucket: Bucket,
+        refcnt: u16,
+        update: impl FnOnce(&mut [ValuePage<K, KVP>]),
+    ) {
+        let (offset, _) = self.pages.replace(
+            bucket.offset(),
+            bucket.log2_pages(),
+            bucket.log2_pages(),
+            |old, new| {
+                new.clone_from_slice(old);
+                update(new);
+            },
+        );
+        self.store_bucket(
+            bucket_idx,
+            Bucket::pack(
+                offset,
+                bucket.log2_pages(),
+                refcnt,
+                bucket.generation().wrapping_add(1) & 0x1F,
+                bucket.is_linear_search(),
+                false,
+            ),
+        );
+        self.pages.retire(bucket.offset(), bucket.log2_pages());
+    }
+
+    #[inline]
+    fn unlock_unchanged(&self, bucket_idx: usize, bucket: Bucket) {
+        self.store_bucket(
+            bucket_idx,
+            Bucket::pack(
+                bucket.offset(),
+                bucket.log2_pages(),
+                bucket.refcnt(),
+                bucket.generation(),
+                bucket.is_linear_search(),
+                false,
+            ),
+        );
+    }
+}
+
+fn scan_pages<K: BihashKey + Default, const KVP: usize>(
+    pages: &[ValuePage<K, KVP>],
+    log2_pages: u8,
+    linear: bool,
+    key: K,
+    hash: u64,
+    log2_nbuckets: u8,
+) -> (Option<(Slot, u64)>, Option<Slot>) {
+    let first = if linear {
+        0
+    } else {
+        ((hash >> u32::from(log2_nbuckets)) as usize) & ((1usize << log2_pages) - 1)
+    };
+    let limit = if linear { 1usize << log2_pages } else { 1 };
+    let mut free = None;
+    for (page_index, page) in pages.iter().enumerate().skip(first).take(limit) {
+        for (slot_index, kv) in page.slots().iter().enumerate() {
+            if kv_slot_is_free(kv) {
+                free.get_or_insert((page_index, slot_index));
+                continue;
+            }
+            if kv.key == key {
+                return (Some(((page_index, slot_index), kv.value)), free);
+            }
+        }
+    }
+    (None, free)
 }
 
 #[inline(always)]

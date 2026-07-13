@@ -691,8 +691,8 @@ impl<A: TcpListenerAddress> Clone for TcpListenerTable<A> {
     fn clone(&self) -> Self {
         let mut cloned = Self::empty();
         for (key, raw) in self.entries.iter() {
-            if let Some(value) = self.values.get(*raw as usize).copied() {
-                cloned.insert(*key, value);
+            if let Some(value) = self.values.get(raw as usize).copied() {
+                cloned.insert(key, value);
             }
         }
         cloned

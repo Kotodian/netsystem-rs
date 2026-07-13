@@ -7,15 +7,14 @@
 //!
 //! Concurrency (VPP-shaped):
 //! - Lookups load `AtomicBucket` and never take a mutex.
-//! - Writers CAS the per-bucket lock bit, mutate pages, then publish an
-//!   unlocked bucket word (generation bump).
-//! - Page-arena push/free uses a spin bit (allocator sync only).
+//! - Writers CAS the per-bucket lock bit, prepare immutable replacement pages,
+//!   then publish an unlocked bucket word.
+//! - Page allocation and reclamation use an allocator-only spin lock.
 
-use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-pub mod alloc;
+mod alloc;
 pub mod bucket;
 pub mod iter;
 pub mod key;
@@ -24,7 +23,6 @@ pub mod split;
 pub mod template;
 pub mod value;
 
-pub use alloc::{PageAlloc, PageId};
 pub use bucket::{AtomicBucket, Bucket};
 pub use iter::BihashIter;
 pub use key::{BihashKey, hash_words, splitmix64};
@@ -33,6 +31,7 @@ pub use value::{FREE_U64, Kv, ValuePage};
 
 use crate::boxed::Slice;
 use crate::heap::Heap;
+use alloc::PageAlloc;
 
 /// A bounded-index extensible hash table.
 ///
@@ -42,18 +41,11 @@ use crate::heap::Heap;
 ///           recommended values per key shape.
 pub struct Bihash<K: BihashKey, const KVP: usize> {
     buckets: Slice<AtomicBucket>,
-    pages: UnsafeCell<PageAlloc<K, KVP>>,
-    /// Spin bit for PageAlloc push/free only — not a table reader lock.
-    alloc_busy: AtomicBool,
+    pages: PageAlloc<K, KVP>,
     len: AtomicUsize,
     nbuckets: u32,
     log2_nbuckets: u8,
-    heap: Arc<Heap>,
 }
-
-// SAFETY: bucket lock bit + alloc_busy establish exclusive mutation of pages;
-// readers only observe unlocked buckets via Acquire loads.
-unsafe impl<K: BihashKey + Send, const KVP: usize> Sync for Bihash<K, KVP> {}
 
 impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
     /// Create a bihash with at least `nbuckets` buckets. `nbuckets` is
@@ -70,17 +62,17 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
         }
         let actual_buckets = nbuckets.next_power_of_two();
         let log2 = actual_buckets.trailing_zeros() as u8;
-        let buckets = Slice::from_fn(actual_buckets as usize, |_| {
-            AtomicBucket::new(Bucket::empty())
-        });
+        let buckets = Slice::from_fn_in(
+            actual_buckets as usize,
+            |_| AtomicBucket::new(Bucket::empty()),
+            heap.clone(),
+        );
         Self {
             buckets,
-            pages: UnsafeCell::new(PageAlloc::new_in(heap.clone())),
-            alloc_busy: AtomicBool::new(false),
+            pages: PageAlloc::new_in(heap),
             len: AtomicUsize::new(0),
             nbuckets: actual_buckets,
             log2_nbuckets: log2,
-            heap,
         }
     }
 
@@ -105,23 +97,18 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
     }
 
     #[inline]
-    pub(crate) fn heap(&self) -> Arc<Heap> {
-        self.heap.clone()
-    }
-
-    #[inline]
     pub(crate) fn atomic_bucket(&self, idx: usize) -> &AtomicBucket {
         &self.buckets[idx]
     }
 
     #[inline]
     pub(crate) fn load_bucket(&self, idx: usize) -> Bucket {
-        self.buckets[idx].load(Ordering::Acquire)
+        self.buckets[idx].load(Ordering::SeqCst)
     }
 
     #[inline]
     pub(crate) fn store_bucket(&self, idx: usize, bucket: Bucket) {
-        self.buckets[idx].store(bucket, Ordering::Release);
+        self.buckets[idx].store(bucket, Ordering::SeqCst);
     }
 
     #[inline]
@@ -134,8 +121,8 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
         self.buckets[idx].compare_exchange(
             current,
             new,
-            Ordering::AcqRel,
-            Ordering::Acquire,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
         )
     }
 
@@ -163,31 +150,6 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
     }
 
     #[inline]
-    pub(crate) fn pages(&self) -> &PageAlloc<K, KVP> {
-        unsafe { &*self.pages.get() }
-    }
-
-    /// SAFETY: caller holds the bucket lock bit for every page it mutates, and
-    /// holds `alloc_busy` across any PageAlloc push/free.
-    #[inline]
-    pub(crate) unsafe fn pages_mut(&self) -> &mut PageAlloc<K, KVP> {
-        unsafe { &mut *self.pages.get() }
-    }
-
-    pub(crate) fn with_alloc_mut<R>(&self, f: impl FnOnce(&mut PageAlloc<K, KVP>) -> R) -> R {
-        while self
-            .alloc_busy
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-        let result = f(unsafe { &mut *self.pages.get() });
-        self.alloc_busy.store(false, Ordering::Release);
-        result
-    }
-
-    #[inline]
     pub(crate) fn add_len(&self, delta: isize) {
         if delta >= 0 {
             self.len.fetch_add(delta as usize, Ordering::Relaxed);
@@ -201,7 +163,7 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
         self.len.store(len, Ordering::Relaxed);
     }
 
-    /// Snapshot-style iterator over `(&K, &V)` pairs.
+    /// Weakly consistent iterator over copied `(K, u64)` pairs.
     #[inline]
     pub fn iter(&self) -> BihashIter<'_, K, KVP> {
         BihashIter::new(self)

@@ -79,13 +79,21 @@ impl<T, const ALIGN: usize> Slice<T, ALIGN> {
     }
 
     #[inline]
-    pub fn from_fn(mut len: usize, mut f: impl FnMut(usize) -> T) -> Self {
+    pub fn from_fn(len: usize, f: impl FnMut(usize) -> T) -> Self {
+        Self::from_fn_in(len, f, Arc::new(Heap::local()))
+    }
+
+    #[inline]
+    pub(crate) fn from_fn_in(
+        mut len: usize,
+        mut f: impl FnMut(usize) -> T,
+        heap: Arc<Heap>,
+    ) -> Self {
         if len == 0 {
             return Self::new();
         }
 
         let cap = len;
-        let heap = Arc::new(Heap::local());
         let ptr = allocate_in::<T, ALIGN>(cap, &heap);
         let mut guard = InitGuard::<T, ALIGN> {
             ptr,
