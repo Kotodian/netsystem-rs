@@ -161,7 +161,11 @@ fn linux_eventfd_readiness_dispatches_through_file_main() {
     let mut files = FileMain::new(worker).expect("create FileMain");
     // SAFETY: eventfd returns a fresh descriptor or -1 with errno set.
     let raw_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-    assert!(raw_fd >= 0, "create eventfd: {}", std::io::Error::last_os_error());
+    assert!(
+        raw_fd >= 0,
+        "create eventfd: {}",
+        std::io::Error::last_os_error()
+    );
     // SAFETY: ownership of the fresh eventfd descriptor is transferred once.
     let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
     let index = files

@@ -152,9 +152,7 @@ impl Poller {
                 };
                 if completion.user_data == CONTROL_TOKEN {
                     result = Some(completion.result);
-                } else if completion.user_data != token
-                    && pending.try_push(completion).is_err()
-                {
+                } else if completion.user_data != token && pending.try_push(completion).is_err() {
                     return Err(HammerError::internal(
                         "worker io_uring pending completion ring is full while cancelling",
                     ));

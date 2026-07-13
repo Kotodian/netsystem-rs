@@ -38,7 +38,14 @@ pub fn bind_current_thread_memory_to_numa(_node: u32) -> hammer_core::error::Ham
 fn current_numa_node_impl() -> Option<u32> {
     let mut cpu: libc::c_uint = 0;
     let mut node: libc::c_uint = 0;
-    let rc = unsafe { libc::syscall(libc::SYS_getcpu, &mut cpu, &mut node, std::ptr::null_mut()) };
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_getcpu,
+            &mut cpu,
+            &mut node,
+            std::ptr::null_mut::<libc::c_void>(),
+        )
+    };
     if rc == 0 { Some(node) } else { None }
 }
 

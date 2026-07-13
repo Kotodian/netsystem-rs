@@ -33,7 +33,7 @@ pub fn apply_worker_thread_setup(worker: &Worker, index: usize) {
 
 #[cfg(target_os = "linux")]
 fn apply_linux_cpu_affinity(index: usize, cpu: &WorkerCpu) {
-    use core_affinity::{CoreId, get_core_ids, set_for_current};
+    use core_affinity::{CoreId, set_for_current};
 
     let core = if !cpu.worker_cores.is_empty() {
         cpu.worker_cores.get(index).copied()
@@ -47,7 +47,7 @@ fn apply_linux_cpu_affinity(index: usize, cpu: &WorkerCpu) {
 
 #[cfg(target_os = "linux")]
 fn auto_worker_core(index: usize, cpu: &WorkerCpu) -> Option<usize> {
-    let cores = get_core_ids()?;
+    let cores = core_affinity::get_core_ids()?;
     let reserved: std::collections::HashSet<usize> =
         cpu.main_core.into_iter().chain(cpu.app_core).collect();
     cores
@@ -61,32 +61,37 @@ fn auto_worker_core(index: usize, cpu: &WorkerCpu) -> Option<usize> {
 fn apply_linux_scheduler(scheduler: &hammer_core::config::WorkerScheduler) {
     use hammer_core::config::SchedulerPolicy;
     use thread_priority::{
-        RealtimeThreadSchedulePolicy, ThreadPriority, ThreadPriorityValue, ThreadSchedulePolicy,
+        NormalThreadSchedulePolicy, RealtimeThreadSchedulePolicy, ThreadPriority,
+        ThreadPriorityOsValue, ThreadPriorityValue, ThreadSchedulePolicy,
+        set_thread_priority_and_policy, thread_native_id,
     };
 
-    match scheduler.policy {
+    let policy = match scheduler.policy {
         SchedulerPolicy::Other => {
-            let _ = ThreadSchedulePolicy::Other.set_for_current();
+            ThreadSchedulePolicy::Normal(NormalThreadSchedulePolicy::Other)
         }
         SchedulerPolicy::Batch => {
-            let _ = ThreadSchedulePolicy::Batch.set_for_current();
+            ThreadSchedulePolicy::Normal(NormalThreadSchedulePolicy::Batch)
         }
-        SchedulerPolicy::Idle => {
-            let _ = ThreadSchedulePolicy::Idle.set_for_current();
-        }
+        SchedulerPolicy::Idle => ThreadSchedulePolicy::Normal(NormalThreadSchedulePolicy::Idle),
         SchedulerPolicy::Fifo => {
-            let priority = ThreadPriorityValue::try_from(scheduler.priority)
-                .unwrap_or(ThreadPriorityValue::Min);
-            let _ = ThreadPriority::Crossplatform(priority).set_for_current();
+            ThreadSchedulePolicy::Realtime(RealtimeThreadSchedulePolicy::Fifo)
         }
         SchedulerPolicy::Rr => {
-            let priority = ThreadPriorityValue::try_from(scheduler.priority)
-                .unwrap_or(ThreadPriorityValue::Min);
-            let _ = RealtimeThreadSchedulePolicy::RoundRobin
-                .with_priority(priority)
-                .set_for_current();
+            ThreadSchedulePolicy::Realtime(RealtimeThreadSchedulePolicy::RoundRobin)
         }
-    }
+    };
+    let priority = match policy {
+        ThreadSchedulePolicy::Normal(_) => {
+            ThreadPriority::Os(ThreadPriorityOsValue::default())
+        }
+        ThreadSchedulePolicy::Realtime(_) => u8::try_from(scheduler.priority)
+            .ok()
+            .and_then(|value| ThreadPriorityValue::try_from(value).ok())
+            .map(ThreadPriority::Crossplatform)
+            .unwrap_or(ThreadPriority::Min),
+    };
+    let _ = set_thread_priority_and_policy(thread_native_id(), priority, policy);
 }
 
 #[cfg(target_os = "macos")]
