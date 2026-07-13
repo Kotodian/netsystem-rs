@@ -13,8 +13,8 @@ use hammer_core::data_plane::{
 use hammer_core::error::{CoreError, CoreResult, DataPlaneError};
 use hammer_infra::boxed::Slice;
 
-use crate::DataPlaneRuntime;
 use crate::trace::TraceFormatter;
+use crate::{DataPlaneInstructionSet, DataPlaneRuntime};
 
 pub mod next;
 
@@ -143,6 +143,41 @@ impl NodeRuntimeData {
 }
 
 pub type NodeProcessFn = fn(&DataPlaneRuntime, NodeRuntimeData, &mut BufferFrame) -> NodeResult;
+
+type NodeFunction = unsafe fn(&DataPlaneRuntime, NodeRuntimeData, &mut BufferFrame) -> NodeResult;
+
+/// One platform-compiled process-function candidate for an existing Graph Node.
+#[derive(Clone, Copy)]
+#[doc(hidden)]
+pub struct NodeFunctionRegistration {
+    node_name: &'static str,
+    instruction_set: DataPlaneInstructionSet,
+    function: NodeFunction,
+}
+
+impl NodeFunctionRegistration {
+    /// Creates a Node Function registration used by `#[node_function]`.
+    ///
+    /// # Safety
+    /// `function` must have no CPU requirements beyond `instruction_set` and
+    /// must obey the [`NodeFunction`] calling contract.
+    #[doc(hidden)]
+    pub const unsafe fn new(
+        node_name: &'static str,
+        instruction_set: DataPlaneInstructionSet,
+        function: unsafe fn(&DataPlaneRuntime, NodeRuntimeData, &mut BufferFrame) -> NodeResult,
+    ) -> Self {
+        Self {
+            node_name,
+            instruction_set,
+            function,
+        }
+    }
+}
+
+#[linkme::distributed_slice]
+#[doc(hidden)]
+pub static NODE_FUNCTIONS: [NodeFunctionRegistration] = [..];
 
 #[derive(Debug, Clone, Copy)]
 pub struct NodeDescriptor<'a> {
@@ -384,7 +419,7 @@ struct NodeRuntimeInner {
 
 struct NodeRuntimeSlot {
     kind: NodeKind,
-    process: NodeProcessFn,
+    process: NodeFunction,
     runtime_data: NodeRuntimeData,
 }
 
@@ -411,7 +446,10 @@ impl NodeRuntimeSlot {
     #[inline]
     fn dispatch(self, runtime: &DataPlaneRuntime, frame: Frame<Pending>) -> Frame<Pending> {
         let mut frame = frame;
-        (self.process)(runtime, self.runtime_data, &mut frame);
+        // SAFETY: graph initialization installs specialized functions only
+        // after validating their instruction set against the current CPU.
+        // Default safe functions coerce to this pointer type.
+        unsafe { (self.process)(runtime, self.runtime_data, &mut frame) };
         frame
     }
 }
@@ -865,7 +903,89 @@ impl Default for NodeRuntime {
     }
 }
 
+fn preferred_node_function<'registration>(
+    node_name: &str,
+    instruction_set: DataPlaneInstructionSet,
+    registrations: &'registration [NodeFunctionRegistration],
+) -> CoreResult<Option<&'registration NodeFunctionRegistration>> {
+    let mut seen = [false; DataPlaneInstructionSet::VARIANT_COUNT];
+    let mut selected = None;
+    let mut selected_priority = 0;
+
+    for registration in registrations
+        .iter()
+        .filter(|registration| registration.node_name == node_name)
+    {
+        let slot = registration.instruction_set.slot();
+        if seen[slot] {
+            return Err(CoreError::internal(format!(
+                "duplicate Node Function for `{node_name}` and {:?}",
+                registration.instruction_set
+            )));
+        }
+        seen[slot] = true;
+
+        if !registration.instruction_set.is_supported() {
+            continue;
+        }
+        let Some(priority) = instruction_set.candidate_priority(registration.instruction_set)
+        else {
+            continue;
+        };
+        if selected.is_none() || priority > selected_priority {
+            selected = Some(registration);
+            selected_priority = priority;
+        }
+    }
+
+    Ok(selected)
+}
+
+#[cfg(test)]
+mod node_function_tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_instruction_set_is_rejected() {
+        let duplicate = NodeFunctionRegistration {
+            node_name: "fixture",
+            instruction_set: DataPlaneInstructionSet::Scalar,
+            function: missing_node_process,
+        };
+
+        let error = match preferred_node_function(
+            "fixture",
+            DataPlaneInstructionSet::Scalar,
+            &[duplicate, duplicate],
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("duplicate Node Function must fail"),
+        };
+
+        assert!(error.to_string().contains("duplicate Node Function"));
+    }
+}
+
 impl NodeRuntime {
+    pub(crate) fn install_node_function(
+        &self,
+        node: NodeId,
+        instruction_set: DataPlaneInstructionSet,
+    ) -> CoreResult<()> {
+        let Some(node_name) = self.node_name(node)? else {
+            return Ok(());
+        };
+        let Some(registration) =
+            preferred_node_function(node_name, instruction_set, &NODE_FUNCTIONS)?
+        else {
+            return Ok(());
+        };
+        let mut inner = self.inner.borrow_mut();
+        inner.validate_node(node)?;
+        inner.nodes[node.slot() as usize].process = registration.function;
+        Ok(())
+    }
+
     pub fn register_driver<N>(&self, node: N) -> NodeId
     where
         N: DriverNode + Node,

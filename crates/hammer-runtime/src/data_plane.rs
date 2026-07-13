@@ -346,13 +346,21 @@ impl DataPlaneRuntime {
     }
 
     pub fn init_graph(&self, worker: usize, entries: &[NodeEntry]) -> CoreResult<()> {
+        if !self.instruction_set.is_supported() {
+            return Err(CoreError::internal(format!(
+                "configured instruction set {:?} is not supported by this CPU",
+                self.instruction_set
+            )));
+        }
         for entry in entries {
-            (entry.init)(self, worker).map_err(|err| {
+            let node = (entry.init)(self, worker).map_err(|err| {
                 CoreError::internal(format!(
                     "init graph node `{}`: {err}",
                     entry.registration.name().unwrap_or("?")
                 ))
             })?;
+            self.nodes
+                .install_node_function(node, self.instruction_set)?;
         }
         self.nodes.resolve_named_next_nodes()
     }
@@ -638,7 +646,7 @@ impl DataPlaneRuntime {
     }
 }
 
-pub fn new_worker_runtime(config: &Config) -> DataPlaneRuntime {
+pub fn new_worker_runtime(config: &Config) -> CoreResult<DataPlaneRuntime> {
     let buffer = &config.worker.buffer;
     let buffers = DataPlaneBufferConfig {
         buffer_slot_capacity: buffer.slot_bytes,
@@ -646,23 +654,34 @@ pub fn new_worker_runtime(config: &Config) -> DataPlaneRuntime {
         frame_slots: buffer.frame_pool_size,
         ..DataPlaneBufferConfig::default()
     };
-    DataPlaneRuntime::new_with_instruction_set(
+    let instruction_set = parse_instruction_set(&config.worker.instruction_set)?;
+    if !instruction_set.is_supported() {
+        return Err(CoreError::internal(format!(
+            "configured instruction set {instruction_set:?} is not supported by this CPU"
+        )));
+    }
+    Ok(DataPlaneRuntime::new_with_instruction_set(
         DataPlaneRuntimeConfig { buffers },
-        parse_instruction_set(&config.worker.instruction_set),
-    )
+        instruction_set,
+    ))
 }
 
-fn parse_instruction_set(s: &str) -> DataPlaneInstructionSet {
-    match s.to_lowercase().as_str() {
-        "native" => DataPlaneInstructionSet::native(),
-        "scalar" => DataPlaneInstructionSet::Scalar,
-        "sse2" => DataPlaneInstructionSet::Sse2,
-        "avx2" => DataPlaneInstructionSet::Avx2,
-        "avx512" => DataPlaneInstructionSet::Avx512,
-        "neon" => DataPlaneInstructionSet::Neon,
-        _ => {
-            tracing::warn!("unknown instruction_set '{s}', falling back to native");
-            DataPlaneInstructionSet::native()
-        }
+fn parse_instruction_set(value: &str) -> CoreResult<DataPlaneInstructionSet> {
+    if value.eq_ignore_ascii_case("native") {
+        Ok(DataPlaneInstructionSet::native())
+    } else if value.eq_ignore_ascii_case("scalar") {
+        Ok(DataPlaneInstructionSet::Scalar)
+    } else if value.eq_ignore_ascii_case("sse2") {
+        Ok(DataPlaneInstructionSet::Sse2)
+    } else if value.eq_ignore_ascii_case("avx2") {
+        Ok(DataPlaneInstructionSet::Avx2)
+    } else if value.eq_ignore_ascii_case("avx512") {
+        Ok(DataPlaneInstructionSet::Avx512)
+    } else if value.eq_ignore_ascii_case("neon") {
+        Ok(DataPlaneInstructionSet::Neon)
+    } else {
+        Err(CoreError::internal(format!(
+            "unknown instruction set `{value}`"
+        )))
     }
 }

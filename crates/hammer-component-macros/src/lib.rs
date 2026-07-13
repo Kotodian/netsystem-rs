@@ -4,9 +4,151 @@ use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{
     Attribute, Error, Expr, ExprPath, Field, Fields, FieldsNamed, GenericParam, Generics, Ident,
-    Item, ItemEnum, ItemStruct, LitStr, Path, Result, Token, Type, bracketed, parenthesized,
-    parse_macro_input, parse_quote, spanned::Spanned,
+    Item, ItemEnum, ItemFn, ItemStruct, LitStr, Path, Result, Token, Type, bracketed,
+    parenthesized, parse_macro_input, parse_quote, spanned::Spanned,
 };
+
+struct NodeFunctionArgs {
+    node: Path,
+}
+
+impl Parse for NodeFunctionArgs {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let mut node = None;
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            match key.to_string().as_str() {
+                "node" => node = Some(input.parse()?),
+                other => {
+                    return Err(Error::new(
+                        key.span(),
+                        format!("unknown `node_function` argument `{other}`; expected `node`"),
+                    ));
+                }
+            }
+            if input.peek(Token![,]) {
+                input.parse::<Token![,]>()?;
+            }
+        }
+        Ok(Self {
+            node: node.ok_or_else(|| Error::new(Span::call_site(), "missing `node` argument"))?,
+        })
+    }
+}
+
+/// Registers multiarch Node Function candidates for an existing Graph Node.
+///
+/// The function is compiled once per instruction-set variant supported by the
+/// target architecture. Conditional compilation attributes on the function gate
+/// every generated variant.
+#[proc_macro_attribute]
+pub fn node_function(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as NodeFunctionArgs);
+    let function = parse_macro_input!(input as ItemFn);
+    expand_node_function(args, function).into()
+}
+
+fn expand_node_function(args: NodeFunctionArgs, function: ItemFn) -> TokenStream2 {
+    let node = &args.node;
+    let function_name = function.sig.ident.clone();
+    // VPP recompiles one VLIB_NODE_FN body for each enabled march variant.
+    // Generate the equivalent private symbols from one Rust declaration.
+    let scalar = expand_node_function_variant(
+        node,
+        &function,
+        function_name,
+        "scalar",
+        quote!(::hammer_runtime::DataPlaneInstructionSet::Scalar),
+        quote!(),
+        quote!(),
+    );
+    let x86_architecture = quote!(#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]);
+    let sse2 = expand_node_function_variant(
+        node,
+        &function,
+        format_ident!("__{}_sse2", function.sig.ident),
+        "sse2",
+        quote!(::hammer_runtime::DataPlaneInstructionSet::Sse2),
+        x86_architecture.clone(),
+        quote!(#[target_feature(enable = "sse2")]),
+    );
+    let avx2 = expand_node_function_variant(
+        node,
+        &function,
+        format_ident!("__{}_avx2", function.sig.ident),
+        "avx2",
+        quote!(::hammer_runtime::DataPlaneInstructionSet::Avx2),
+        x86_architecture.clone(),
+        quote!(#[target_feature(enable = "avx2")]),
+    );
+    let avx512 = expand_node_function_variant(
+        node,
+        &function,
+        format_ident!("__{}_avx512", function.sig.ident),
+        "avx512",
+        quote!(::hammer_runtime::DataPlaneInstructionSet::Avx512),
+        x86_architecture,
+        quote!(#[target_feature(enable = "avx512f")]),
+    );
+    let neon = expand_node_function_variant(
+        node,
+        &function,
+        format_ident!("__{}_neon", function.sig.ident),
+        "neon",
+        quote!(::hammer_runtime::DataPlaneInstructionSet::Neon),
+        quote!(#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]),
+        quote!(#[target_feature(enable = "neon")]),
+    );
+
+    quote! {
+        #scalar
+        #sse2
+        #avx2
+        #avx512
+        #neon
+    }
+}
+
+fn expand_node_function_variant(
+    node: &Path,
+    function: &ItemFn,
+    function_name: Ident,
+    suffix: &str,
+    instruction_set: TokenStream2,
+    architecture: TokenStream2,
+    target_feature: TokenStream2,
+) -> TokenStream2 {
+    let mut variant_function = function.clone();
+    variant_function.sig.ident = function_name.clone();
+    if !target_feature.is_empty() && variant_function.sig.unsafety.is_none() {
+        variant_function.sig.unsafety = Some(parse_quote!(unsafe));
+    }
+    let input_cfg = function.attrs.iter().filter(|attribute| {
+        attribute.path().is_ident("cfg") || attribute.path().is_ident("cfg_attr")
+    });
+    let static_name = format_ident!(
+        "__NODE_FUNCTION_{}_{}",
+        function.sig.ident.to_string().to_ascii_uppercase(),
+        suffix.to_ascii_uppercase(),
+    );
+    quote! {
+        #architecture
+        #target_feature
+        #variant_function
+
+        #architecture
+        #(#input_cfg)*
+        #[::linkme::distributed_slice(::hammer_runtime::node::NODE_FUNCTIONS)]
+        static #static_name: ::hammer_runtime::node::NodeFunctionRegistration = unsafe {
+            ::hammer_runtime::node::NodeFunctionRegistration::new(
+                #node::NODE_NAME,
+                #instruction_set,
+                #function_name,
+            )
+        };
+    }
+}
 
 #[derive(Clone, Copy)]
 enum ComponentKind {
@@ -57,10 +199,17 @@ struct NodeArgs {
     start_arc: Option<Path>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum NodeRole {
     Internal,
     Driver,
+}
+
+#[derive(Clone, Copy)]
+enum GraphNodeState {
+    Polling,
+    Interrupt,
+    Disabled,
 }
 
 #[derive(Default)]
@@ -447,7 +596,7 @@ pub fn hammer_component(args: TokenStream, input: TokenStream) -> TokenStream {
 pub fn node(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as NodeArgs);
     let item = parse_macro_input!(input as ItemStruct);
-    expand_node(args, item)
+    expand_node(args, item, None, true)
         .unwrap_or_else(Error::into_compile_error)
         .into()
 }
@@ -593,11 +742,17 @@ pub fn node_next(args: TokenStream, input: TokenStream) -> TokenStream {
         .into()
 }
 
-fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
+fn expand_node(
+    args: NodeArgs,
+    item: ItemStruct,
+    declared_name: Option<LitStr>,
+    allow_name_override: bool,
+) -> Result<TokenStream2> {
     let attrs = item.attrs;
     let vis = item.vis;
     let ident = item.ident;
-    let node_name = LitStr::new(&graph_node_name_from_ident(&ident), ident.span());
+    let node_name = declared_name
+        .unwrap_or_else(|| LitStr::new(&graph_node_name_from_ident(&ident), ident.span()));
     let generics = item.generics;
     let fields = item.fields;
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
@@ -679,11 +834,13 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
     let declared_node = args.next.is_some() || args.sibling_of.is_some();
     let mut next_impl = quote!();
     if let Some(next) = &args.next {
-        let name_field: Field = parse_quote! {
-            node_name: &'static str
-        };
-        output_fields.push(name_field);
-        constructor_inits.push(quote!(node_name: Self::NODE_NAME));
+        if allow_name_override {
+            let name_field: Field = parse_quote! {
+                node_name: &'static str
+            };
+            output_fields.push(name_field);
+            constructor_inits.push(quote!(node_name: Self::NODE_NAME));
+        }
         let field: Field = parse_quote! {
             next: [::hammer_core::data_plane::NodeId; #next::COUNT]
         };
@@ -694,11 +851,13 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
             pub const NODE_NEXT_COUNT: usize = #next::COUNT;
         };
     } else if let Some(sibling_of) = &args.sibling_of {
-        let name_field: Field = parse_quote! {
-            node_name: &'static str
-        };
-        output_fields.push(name_field);
-        constructor_inits.push(quote!(node_name: Self::NODE_NAME));
+        if allow_name_override {
+            let name_field: Field = parse_quote! {
+                node_name: &'static str
+            };
+            output_fields.push(name_field);
+            constructor_inits.push(quote!(node_name: Self::NODE_NAME));
+        }
         next_impl = quote! {
             pub const NODE_NEXT_COUNT: usize = #sibling_of::NODE_NEXT_COUNT;
         };
@@ -743,7 +902,7 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
         quote!()
     };
 
-    let declared_name_impl = if declared_node {
+    let declared_name_impl = if declared_node && allow_name_override {
         quote! {
             #[inline]
             pub fn with_node_name(mut self, node_name: &'static str) -> Self {
@@ -755,7 +914,8 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
         quote!()
     };
 
-    let registration_tokens = node_registration_tokens(&ident, &args.next, &args.sibling_of);
+    let registration_tokens =
+        node_registration_tokens(&ident, &args.next, &args.sibling_of, allow_name_override);
     let registration_impl = if args.role.is_some() {
         quote! {
             #[inline]
@@ -869,17 +1029,30 @@ fn node_registration_tokens(
     ident: &Ident,
     next: &Option<Path>,
     sibling_of: &Option<Path>,
+    allow_name_override: bool,
 ) -> TokenStream2 {
+    let name = if allow_name_override {
+        quote!(self.node_name)
+    } else {
+        quote!(Self::NODE_NAME)
+    };
     if let Some(next) = next {
-        quote!(::hammer_core::data_plane::NodeRegistration::next(self.node_name, #next::COUNT))
+        quote!(::hammer_core::data_plane::NodeRegistration::next(#name, #next::COUNT))
     } else if let Some(sibling_of) = sibling_of {
         quote!(::hammer_core::data_plane::NodeRegistration::sibling_of(
-            self.node_name,
+            #name,
             #sibling_of::NODE_NAME
         ))
     } else {
         let _ = ident;
-        quote!(::hammer_core::data_plane::NodeRegistration::Plain)
+        if allow_name_override {
+            quote!(::hammer_core::data_plane::NodeRegistration::Plain)
+        } else {
+            quote!(::hammer_core::data_plane::NodeRegistration::next(
+                Self::NODE_NAME,
+                0,
+            ))
+        }
     }
 }
 
@@ -1074,15 +1247,12 @@ fn to_snake_case(input: &str) -> String {
 
 struct GraphNodeArgs {
     graph: Ident,
-    /// User-supplied init function: `fn(&DataPlaneRuntime, usize) -> CoreResult<NodeId>`.
-    /// The macro does not generate the init body; it only references this fn in the
-    /// `NodeEntry`. The fn reads its own subsystem's `*_MAIN` global (or registers
-    /// directly) — the macro never knows protocol details.
     init: Option<Path>,
     kind: Option<Ident>,
     name: Option<LitStr>,
     next: Option<Path>,
     role: Option<NodeRole>,
+    state: Option<GraphNodeState>,
     next_node: bool,
     sibling_of: Option<Path>,
     start_arc: Option<Path>,
@@ -1097,6 +1267,7 @@ impl Default for GraphNodeArgs {
             name: None,
             next: None,
             role: None,
+            state: None,
             next_node: false,
             sibling_of: None,
             start_arc: None,
@@ -1155,6 +1326,25 @@ impl Parse for GraphNodeArgs {
                                 }
                             });
                         }
+                        "state" => {
+                            if args.state.is_some() {
+                                return Err(Error::new(key.span(), "duplicate `state` argument"));
+                            }
+                            let state: Ident = input.parse()?;
+                            args.state = Some(match state.to_string().as_str() {
+                                "polling" => GraphNodeState::Polling,
+                                "interrupt" => GraphNodeState::Interrupt,
+                                "disabled" => GraphNodeState::Disabled,
+                                other => {
+                                    return Err(Error::new(
+                                        state.span(),
+                                        format!(
+                                            "unknown graph node state `{other}`; expected `polling`, `interrupt`, or `disabled`"
+                                        ),
+                                    ));
+                                }
+                            });
+                        }
                         "sibling_of" => {
                             if args.sibling_of.is_some() {
                                 return Err(Error::new(
@@ -1177,7 +1367,7 @@ impl Parse for GraphNodeArgs {
                             return Err(Error::new(
                                 key.span(),
                                 format!(
-                                    "unknown `graph_node` argument `{other}`; expected `graph`, `init`, `kind`, `name`, `next`, `role`, `next_node`, `sibling_of`, or `start_arc`"
+                                    "unknown `graph_node` argument `{other}`; expected `graph`, `init`, `kind`, `name`, `next`, `role`, `state`, `next_node`, `sibling_of`, or `start_arc`"
                                 ),
                             ));
                         }
@@ -1192,9 +1382,25 @@ impl Parse for GraphNodeArgs {
             return Err(Error::new(Span::call_site(), "missing `graph` argument"));
         }
         if args.init.is_none() {
+            match args.kind.as_ref().map(ToString::to_string).as_deref() {
+                Some("driver" | "internal") => {}
+                Some("handoff") => {
+                    return Err(Error::new(
+                        Span::call_site(),
+                        "handoff graph nodes require an explicit `init` function",
+                    ));
+                }
+                _ => {
+                    return Err(Error::new(
+                        Span::call_site(),
+                        "graph nodes require either `init` or `kind = driver|internal` for generated initialization",
+                    ));
+                }
+            }
+        } else if args.state.is_some() {
             return Err(Error::new(
                 Span::call_site(),
-                "missing `init` argument (path to a `fn(&DataPlaneRuntime, usize) -> CoreResult<NodeId>`)",
+                "`state` belongs to generated graph initialization; remove the explicit `init`",
             ));
         }
         if args.next.is_some() && args.next_node {
@@ -1224,12 +1430,23 @@ fn graph_slice_path(graph: &Ident) -> Path {
     parse_quote!(crate::packet_graph::#slice)
 }
 
-fn graph_node_registration(name: &TokenStream2, next: Option<&Path>) -> TokenStream2 {
-    match next {
-        Some(next) => {
+fn graph_node_registration(
+    name: &TokenStream2,
+    next: Option<&Path>,
+    sibling_of: Option<&Path>,
+) -> TokenStream2 {
+    match (next, sibling_of) {
+        (Some(next), None) => {
             quote!(::hammer_core::data_plane::NodeRegistration::next(#name, #next::COUNT))
         }
-        None => quote!(::hammer_core::data_plane::NodeRegistration::next(#name, 0)),
+        (None, Some(sibling_of)) => quote!(
+            ::hammer_core::data_plane::NodeRegistration::sibling_of(
+                #name,
+                #sibling_of::NODE_NAME,
+            )
+        ),
+        (None, None) => quote!(::hammer_core::data_plane::NodeRegistration::next(#name, 0)),
+        (Some(_), Some(_)) => unreachable!("graph node args reject next with sibling_of"),
     }
 }
 
@@ -1247,17 +1464,99 @@ fn graph_node_kind_expr(kind: Option<&Ident>) -> TokenStream2 {
     }
 }
 
+fn graph_node_role_from_kind(kind: Option<&Ident>) -> Result<NodeRole> {
+    match kind.map(ToString::to_string).as_deref() {
+        Some("driver") => Ok(NodeRole::Driver),
+        Some("internal") => Ok(NodeRole::Internal),
+        _ => Err(Error::new(
+            Span::call_site(),
+            "generated graph initialization requires `kind = driver|internal`",
+        )),
+    }
+}
+
+fn graph_node_state_expr(state: GraphNodeState) -> TokenStream2 {
+    match state {
+        GraphNodeState::Polling => quote!(::hammer_core::data_plane::NodeState::Polling),
+        GraphNodeState::Interrupt => quote!(::hammer_core::data_plane::NodeState::Interrupt),
+        GraphNodeState::Disabled => quote!(::hammer_core::data_plane::NodeState::Disabled),
+    }
+}
+
+fn generated_graph_node_init(
+    args: &GraphNodeArgs,
+    ident: &Ident,
+    item: &Item,
+    role: NodeRole,
+) -> Result<(Ident, TokenStream2)> {
+    let Item::Struct(item) = item else {
+        return Err(Error::new(
+            item.span(),
+            "graph_node can only initialize a struct",
+        ));
+    };
+    if !matches!(item.fields, Fields::Unit) || !item.generics.params.is_empty() {
+        return Err(Error::new(
+            item.span(),
+            "generated graph initialization requires a non-generic unit struct",
+        ));
+    }
+
+    let init_ident = format_ident!(
+        "__{}_graph_node_{}_init",
+        args.graph.to_string().to_ascii_lowercase(),
+        to_snake_case(&ident.to_string()),
+    );
+    let constructor = if let Some(next) = &args.next {
+        quote!(#ident::new([
+            ::hammer_core::data_plane::NodeId::new(0);
+            #next::COUNT
+        ]))
+    } else {
+        quote!(#ident::new())
+    };
+    let register = match (role, args.next.as_ref()) {
+        (NodeRole::Driver, Some(next)) => quote!(
+            runtime
+                .nodes()
+                .try_register_driver_with_next_names(node, &#next::NEXT_NAMES)?
+        ),
+        (NodeRole::Driver, None) => {
+            quote!(runtime.nodes().try_register_driver(node)?)
+        }
+        (NodeRole::Internal, Some(next)) => quote!(
+            runtime
+                .nodes()
+                .try_register_internal_with_next_names(node, &#next::NEXT_NAMES)?
+        ),
+        (NodeRole::Internal, None) => {
+            quote!(runtime.nodes().try_register_internal(node)?)
+        }
+    };
+    let set_state = args
+        .state
+        .map(graph_node_state_expr)
+        .map(|state| quote!(runtime.nodes().set_node_state(node_id, #state)?;));
+    let generated = quote! {
+        fn #init_ident(
+            runtime: &::hammer_runtime::DataPlaneRuntime,
+            _: usize,
+        ) -> ::hammer_core::error::CoreResult<::hammer_core::data_plane::NodeId> {
+            let node = #constructor;
+            let node_id = #register;
+            #set_state
+            Ok(node_id)
+        }
+    };
+    Ok((init_ident, generated))
+}
+
 /// Registers a struct as a graph node via linkme `NodeEntry`.
 ///
 /// Emits a `NodeEntry` collected into the `{graph}_GRAPH_NODES` linkme slice.
-/// The node's init function is supplied by `init = path` and must have the
-/// signature `fn(&DataPlaneRuntime, usize) -> CoreResult<NodeId>`; the macro
-/// does not generate the init body. The init fn reads its own subsystem's
-/// `*_MAIN` global (or registers the node directly) — the macro never knows
-/// protocol details, so new transports (e.g. quic) plug in without touching
-/// the macro. `DataPlaneRuntime::init_graph` walks the slice and calls each
-/// `init`; `resolve_named_next_nodes` then resolves next-node names (VPP
-/// `vlib_node_main_init`).
+/// A zero-state `kind = driver|internal` unit node receives a generated init.
+/// Nodes with business state supply `init = path`. `DataPlaneRuntime::init_graph`
+/// walks the slice and resolves named next-node arcs after registration.
 /// ```ignore
 /// #[hammer_component_macros::graph_node(graph = service, init = my::register_foo)]
 /// pub struct FooNode;
@@ -1284,7 +1583,7 @@ fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<T
     let static_ident = format_ident!(
         "__{}_GRAPH_NODE_{}",
         args.graph.to_string().to_ascii_uppercase(),
-        ident
+        to_snake_case(&ident.to_string()).to_ascii_uppercase()
     );
     let node_kind = graph_node_kind_expr(args.kind.as_ref());
     let node_name = if let Some(name) = &args.name {
@@ -1292,11 +1591,29 @@ fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<T
     } else {
         quote!(#ident::NODE_NAME)
     };
-    let node_registration = graph_node_registration(&node_name, args.next.as_ref());
-    let init = args
-        .init
-        .as_ref()
-        .expect("graph_node `init` argument validated in parse");
+    let node_registration =
+        graph_node_registration(&node_name, args.next.as_ref(), args.sibling_of.as_ref());
+    let generated_role = if args.init.is_none() {
+        Some(graph_node_role_from_kind(args.kind.as_ref())?)
+    } else {
+        None
+    };
+    if let (Some(declared), Some(generated)) = (args.role, generated_role)
+        && declared != generated
+    {
+        return Err(Error::new(
+            Span::call_site(),
+            "graph node `role` must match `kind`",
+        ));
+    }
+    let effective_role = generated_role.or(args.role);
+    let (init, generated_init) = if let Some(init) = args.init.as_ref() {
+        (quote!(#init), quote!())
+    } else {
+        let role = generated_role.expect("generated graph init role validated");
+        let (init, generated) = generated_graph_node_init(&args, ident, &item, role)?;
+        (quote!(#init), generated)
+    };
 
     let registration = quote! {
         #[::linkme::distributed_slice(#graph_slice)]
@@ -1317,9 +1634,8 @@ fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<T
             .any(|f| f.attrs.iter().any(|a| a.path().is_ident("node"))),
         _ => false,
     };
-    let needs_node_expansion = args.role.is_some()
+    let needs_node_expansion = effective_role.is_some()
         || args.next_node
-        || args.sibling_of.is_some()
         || args.start_arc.is_some()
         || has_field_node_attr;
 
@@ -1337,17 +1653,19 @@ fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<T
             next: args.next.clone(),
             next_node: args.next_node,
             sibling_of: args.sibling_of.clone(),
-            role: args.role,
+            role: effective_role,
             start_arc: args.start_arc.clone(),
         };
-        let node_output = expand_node(node_args, struct_item)?;
+        let node_output = expand_node(node_args, struct_item, args.name.clone(), false)?;
         Ok(quote! {
             #node_output
+            #generated_init
             #registration
         })
     } else {
         Ok(quote! {
             #item
+            #generated_init
             #registration
         })
     }
@@ -1684,6 +2002,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn node_function_expansion_registers_multiarch_candidates_without_graph_entry() {
+        let args = syn::parse_str::<NodeFunctionArgs>("node = DeviceTxNode")
+            .expect("parse Node Function args");
+        let function = syn::parse_str::<ItemFn>(concat!(
+            "#[cfg(feature = \"device-tx\")] ",
+            "fn device_tx(runtime: &Runtime, data: Data, frame: &mut Frame) -> Result { body() }",
+        ))
+        .expect("parse Node Function");
+        let expanded = expand_node_function(args, function).to_string();
+
+        assert!(expanded.contains("DataPlaneInstructionSet :: Scalar"));
+        assert!(expanded.contains("target_arch = \"x86_64\""));
+        assert!(expanded.contains("target_feature (enable = \"avx2\")"));
+        assert!(expanded.contains("target_feature (enable = \"neon\")"));
+        assert!(expanded.contains("NodeFunctionRegistration :: new"));
+        assert!(expanded.matches("device-tx").count() > 1);
+        assert!(!expanded.contains("NodeEntry"));
+    }
+
+    #[test]
+    fn node_function_rejects_instruction_set_at_call_site() {
+        let error =
+            match syn::parse_str::<NodeFunctionArgs>("node = DeviceTxNode, instruction_set = sse2")
+            {
+                Ok(_) => panic!("Node Function march variants belong to the macro"),
+                Err(error) => error,
+            };
+
+        assert!(
+            error
+                .to_string()
+                .contains("unknown `node_function` argument")
+        );
+    }
+
+    #[test]
     fn node_args_rejects_next_with_sibling_of() {
         let err = match syn::parse_str::<NodeArgs>(
             "role = internal, next = OwnerNext, sibling_of = OwnerNode",
@@ -1721,7 +2075,9 @@ mod tests {
         let args =
             syn::parse_str::<NodeArgs>("role = internal, next = OwnerNext").expect("parse next");
         let item = syn::parse_str::<ItemStruct>("pub struct OwnerNode;").expect("parse item");
-        let expanded = expand_node(args, item).expect("expand node").to_string();
+        let expanded = expand_node(args, item, None, true)
+            .expect("expand node")
+            .to_string();
 
         assert!(
             expanded.contains("with_node_name"),
@@ -1737,7 +2093,9 @@ mod tests {
     fn plain_node_expansion_does_not_inject_node_name_override() {
         let args = syn::parse_str::<NodeArgs>("").expect("parse plain");
         let item = syn::parse_str::<ItemStruct>("pub struct PlainNode;").expect("parse item");
-        let expanded = expand_node(args, item).expect("expand node").to_string();
+        let expanded = expand_node(args, item, None, true)
+            .expect("expand node")
+            .to_string();
 
         assert!(
             !expanded.contains("with_node_name"),
@@ -1746,6 +2104,100 @@ mod tests {
         assert!(
             !expanded.contains("node_name"),
             "plain node should not store instance node name: {expanded}"
+        );
+    }
+
+    #[test]
+    fn graph_node_expands_fixed_name_driver_sibling() {
+        let args = syn::parse_str::<GraphNodeArgs>(
+            r#"graph = service, init = crate::register_input_sibling, name = "input-sibling", kind = driver, role = driver, sibling_of = InputOwnerNode"#,
+        )
+        .expect("parse graph sibling");
+        let item = syn::parse_str::<Item>("pub struct InputSiblingNode;")
+            .expect("parse graph sibling node");
+        let ident = match &item {
+            Item::Struct(item) => item.ident.clone(),
+            _ => unreachable!(),
+        };
+        let expanded = expand_graph_node(args, &ident, item)
+            .expect("expand graph sibling")
+            .to_string();
+
+        assert!(
+            expanded.contains("DriverNode"),
+            "missing driver role: {expanded}"
+        );
+        assert!(
+            expanded.contains("InputOwnerNode :: NODE_NEXT_COUNT"),
+            "missing inherited sibling next count: {expanded}"
+        );
+        assert!(
+            expanded.contains("sibling_of (\"input-sibling\" , InputOwnerNode :: NODE_NAME"),
+            "missing static sibling registration: {expanded}"
+        );
+        assert!(
+            !expanded.contains("with_node_name"),
+            "static graph node must not expose a name override: {expanded}"
+        );
+    }
+
+    #[test]
+    fn graph_node_generates_zero_state_driver_init() {
+        let args = syn::parse_str::<GraphNodeArgs>(
+            r#"graph = service, name = "input-owner", kind = driver, next = InputNext, state = disabled"#,
+        )
+        .expect("parse generated graph init");
+        let item = syn::parse_str::<Item>("pub struct InputOwnerNode;")
+            .expect("parse generated graph node");
+        let ident = match &item {
+            Item::Struct(item) => item.ident.clone(),
+            _ => unreachable!(),
+        };
+        let expanded = expand_graph_node(args, &ident, item)
+            .expect("expand generated graph init")
+            .to_string();
+
+        assert!(
+            expanded.contains("DriverNode"),
+            "missing driver role: {expanded}"
+        );
+        assert!(
+            expanded.contains("try_register_driver_with_next_names"),
+            "missing generated named-next registration: {expanded}"
+        );
+        assert!(
+            expanded.contains("NodeState :: Disabled"),
+            "missing generated disabled state: {expanded}"
+        );
+        assert!(
+            expanded.contains("init : __service_graph_node_input_owner_node_init"),
+            "static entry must use generated init: {expanded}"
+        );
+    }
+
+    #[test]
+    fn graph_node_expands_fixed_name_zero_next_internal_registration() {
+        let args = syn::parse_str::<GraphNodeArgs>(
+            r#"graph = service, init = crate::register_output, name = "output", kind = internal, role = internal"#,
+        )
+        .expect("parse zero-next graph node");
+        let item = syn::parse_str::<Item>("pub struct OutputNode;")
+            .expect("parse zero-next graph node item");
+        let ident = match &item {
+            Item::Struct(item) => item.ident.clone(),
+            _ => unreachable!(),
+        };
+        let expanded = expand_graph_node(args, &ident, item)
+            .expect("expand zero-next graph node")
+            .to_string();
+
+        assert!(
+            expanded.contains("NodeRegistration :: next (Self :: NODE_NAME , 0"),
+            "zero-next graph node must keep its fixed name: {expanded}"
+        );
+        assert!(
+            !expanded.contains("NodeRegistration :: Plain"),
+            "zero-next graph node must not register anonymously: {expanded}"
         );
     }
 

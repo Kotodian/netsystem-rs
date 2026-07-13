@@ -51,7 +51,7 @@ fn test_runtime() -> DataPlaneRuntime {
     config.worker.buffer.slot_bytes = 2048;
     config.worker.buffer.slots_per_numa = 64;
     config.worker.buffer.frame_pool_size = 32;
-    new_worker_runtime(&config)
+    new_worker_runtime(&config).expect("create worker runtime")
 }
 
 fn push_packet(runtime: &DataPlaneRuntime, frame: &mut BufferFrame, sw_if_index: u32) {

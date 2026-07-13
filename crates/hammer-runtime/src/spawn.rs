@@ -114,12 +114,13 @@ pub(crate) fn current_worker_idle_slice() -> Duration {
     DATA_WORKER_IDLE_SLICE.with(|slot| slot.get())
 }
 
-fn init_data_plane_runtime(config: &hammer_core::config::Config) {
+fn init_data_plane_runtime(config: &hammer_core::config::Config) -> HammerResult<()> {
     DATA_PLANE_RUNTIME.with(|runtime| {
         if runtime.borrow().is_none() {
-            *runtime.borrow_mut() = Some(new_worker_runtime(config));
+            *runtime.borrow_mut() = Some(new_worker_runtime(config)?);
         }
-    });
+        Ok(())
+    })
 }
 
 #[derive(Clone, Default)]
@@ -186,7 +187,13 @@ impl DataRuntime {
                         worker: worker_config.clone(),
                         ..hammer_core::config::Config::default()
                     };
-                    init_data_plane_runtime(&config);
+                    if let Err(error) = init_data_plane_runtime(&config) {
+                        let _ = handle_tx.send(Err(format!(
+                            "init data runtime worker {worker_name}: {error}"
+                        )));
+                        let _ = done_tx.send(());
+                        return;
+                    }
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .max_blocking_threads(max_blocking_threads)
                         .enable_all()

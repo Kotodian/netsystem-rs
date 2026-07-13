@@ -361,7 +361,7 @@ impl SessionAppRuntime<Local> {
         config.worker.buffer.slots_per_numa = 1;
         config.worker.buffer.frame_pool_size =
             hammer_core::data_plane::DEFAULT_BUFFER_FRAME_POOL_SIZE;
-        let runtime = hammer_runtime::new_worker_runtime(&config);
+        let runtime = hammer_runtime::new_worker_runtime(&config)?;
         Ok(Self::new(
             1024,
             runtime.buffers().clone(),

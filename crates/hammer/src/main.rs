@@ -36,7 +36,10 @@ fn main() {
     let registry = Arc::new(RuntimeRegistry::new());
     registry.set::<Config>(Arc::new(config.clone()));
 
-    let runtime = new_worker_runtime(&config);
+    let runtime = new_worker_runtime(&config).unwrap_or_else(|error| {
+        eprintln!("Failed to initialize data-plane runtime: {error}");
+        std::process::exit(1);
+    });
     let engine = Engine::new(runtime, Arc::clone(&registry));
     let mut pool = EnginePool::new(engine);
 

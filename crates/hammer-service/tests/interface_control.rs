@@ -25,7 +25,7 @@ fn test_runtime(
     config.worker.buffer.slot_bytes = buffer_slot_capacity;
     config.worker.buffer.slots_per_numa = buffer_slots;
     config.worker.buffer.frame_pool_size = frame_pool_size;
-    new_worker_runtime(&config)
+    new_worker_runtime(&config).expect("create worker runtime")
 }
 
 #[test]
