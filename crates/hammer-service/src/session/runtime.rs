@@ -521,8 +521,7 @@ where
     where
         SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
     {
-        self.sessions
-            .enqueue_rx(session_id, index, offset, urgent)
+        self.sessions.enqueue_rx(session_id, index, offset, urgent)
     }
 
     #[cfg(test)]

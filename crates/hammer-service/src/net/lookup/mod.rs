@@ -693,7 +693,8 @@ impl AdjacencyRewriteNode {
 impl Node for AdjacencyRewriteNode {
     #[inline(always)]
     fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
-        let state = adjacency_rewrite_runtime(self.runtime_data).expect("adjacency rewrite runtime");
+        let state =
+            adjacency_rewrite_runtime(self.runtime_data).expect("adjacency rewrite runtime");
         adjacency_rewrite_process_frame(
             runtime,
             frame,
@@ -920,8 +921,10 @@ fn adjacency_mtu_divert(
             let next = icmp_error_next?;
             let mut buffer = runtime.get_buffer_mut(index).ok()?;
             let opaque = unsafe { transmute::<_, &mut LookupOpaque>(buffer.opaque2_mut()) };
-            opaque.icmp_error =
-                Some(IcmpErrorMetadata::ipv4_destination_unreachable(4, u32::from(mtu)));
+            opaque.icmp_error = Some(IcmpErrorMetadata::ipv4_destination_unreachable(
+                4,
+                u32::from(mtu),
+            ));
             Some(next)
         }
         hammer_core::protocol::ip::Ipv4MtuAction::Fragment { .. } => fragment_next,

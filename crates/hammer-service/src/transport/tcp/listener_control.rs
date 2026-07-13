@@ -275,10 +275,7 @@ mod tests {
             "closed listener lookup must be removed"
         );
         assert!(
-            snapshot
-                .tcp_listeners
-                .iter()
-                .all(|id| *id != lookup_id),
+            snapshot.tcp_listeners.iter().all(|id| *id != lookup_id),
             "closed listener registration must be removed"
         );
     }

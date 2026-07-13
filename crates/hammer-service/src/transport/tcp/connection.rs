@@ -613,14 +613,8 @@ where
         let end = sequence.advance(bytes);
         self.snd_nxt = end;
         let packet_number = self.recovery.next_packet_number();
-        self.recovery.record_sent(
-            packet_number,
-            sequence,
-            end,
-            bytes,
-            bytes,
-            Instant::now(),
-        );
+        self.recovery
+            .record_sent(packet_number, sequence, end, bytes, bytes, Instant::now());
         self.refresh_bytes_in_flight_cached();
     }
 
@@ -1745,12 +1739,7 @@ where
                     self.rcv_nxt = self.rcv_nxt.advance(1);
                     self.state = TcpState::TimeWait;
                     let time_wait = self.time_wait;
-                    timers.update(
-                        index,
-                        &mut self.timers,
-                        TcpTimerKind::TimeWait,
-                        time_wait,
-                    )?;
+                    timers.update(index, &mut self.timers, TcpTimerKind::TimeWait, time_wait)?;
                     return Ok(Some(self.control_segment(
                         packet.local,
                         packet.remote,
@@ -1770,12 +1759,7 @@ where
                 {
                     self.state = TcpState::TimeWait;
                     let time_wait = self.time_wait;
-                    timers.update(
-                        index,
-                        &mut self.timers,
-                        TcpTimerKind::TimeWait,
-                        time_wait,
-                    )?;
+                    timers.update(index, &mut self.timers, TcpTimerKind::TimeWait, time_wait)?;
                 }
                 Ok(None)
             }
@@ -1792,12 +1776,7 @@ where
             TcpState::TimeWait => {
                 if packet.flags.contains(TcpSegmentFlags::FIN) {
                     let time_wait = self.time_wait;
-                    timers.update(
-                        index,
-                        &mut self.timers,
-                        TcpTimerKind::TimeWait,
-                        time_wait,
-                    )?;
+                    timers.update(index, &mut self.timers, TcpTimerKind::TimeWait, time_wait)?;
                     return Ok(Some(self.control_segment(
                         packet.local,
                         packet.remote,
@@ -5035,12 +5014,7 @@ mod tests {
         let _ = connection.apply_peer_handshake_capabilities(capabilities, capabilities);
         connection.snd_wnd = 8_000;
         assert!(!connection.pacing_ready());
-        assert!(
-            connection
-                .congestion()
-                .next_send_delay(100)
-                .is_some()
-        );
+        assert!(connection.congestion().next_send_delay(100).is_some());
 
         assert_eq!(
             connection.tx_payload_budget(100, Instant::now(), TcpCapabilities::default()),

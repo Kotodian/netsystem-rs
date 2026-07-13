@@ -435,8 +435,7 @@ mod tests {
             packet.len()
         );
         assert!(
-            hammer_core::protocol::ip::read_ipv4_flags_fragment(&packet[..20])
-                .expect("flags")
+            hammer_core::protocol::ip::read_ipv4_flags_fragment(&packet[..20]).expect("flags")
                 & hammer_core::protocol::ip::IPV4_FLAG_DONT_FRAGMENT
                 != 0
         );

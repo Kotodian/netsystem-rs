@@ -232,10 +232,7 @@ fn adjacency_set_path_mtu_matches_vpp_adj_nbr_set_mtu() {
 fn ipv4_mtu_check_matches_vpp_ip4_mtu_check() {
     use hammer_core::protocol::ip::{Ipv4MtuAction, ipv4_mtu_check};
 
-    assert_eq!(
-        ipv4_mtu_check(1_400, 1_500, true),
-        Ipv4MtuAction::Ok
-    );
+    assert_eq!(ipv4_mtu_check(1_400, 1_500, true), Ipv4MtuAction::Ok);
     assert_eq!(
         ipv4_mtu_check(1_600, 1_500, true),
         Ipv4MtuAction::IcmpFragNeeded { mtu: 1_500 }

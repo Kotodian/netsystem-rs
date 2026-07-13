@@ -34,13 +34,7 @@ fn bihash_lookup_avoids_shared_reader_lock_regression() {
         locked_samples.push(measure_lookup(
             Arc::clone(&locked),
             reader_count,
-            |table, key| {
-                table
-                    .read()
-                    .expect("read lock")
-                    .get(key)
-                    .copied()
-            },
+            |table, key| table.read().expect("read lock").get(key).copied(),
         ));
     }
     bihash_samples.sort_unstable();
@@ -72,9 +66,7 @@ where
                 let mut sum = 0u64;
                 for lookup_index in 0..LOOKUPS_PER_READER {
                     let key = (lookup_index + reader as u64) & (ENTRY_COUNT - 1);
-                    sum = sum.wrapping_add(
-                        lookup(&table, black_box(&key)).unwrap_or_default(),
-                    );
+                    sum = sum.wrapping_add(lookup(&table, black_box(&key)).unwrap_or_default());
                 }
                 black_box(sum);
             })

@@ -57,7 +57,11 @@ pub struct Worker {
     /// pending. `idle_slice` is kept as the serialized field for existing
     /// configs; `poll_interval` / `poll_sleep` (VPP `unix.poll-sleep-usec`)
     /// are accepted as input aliases.
-    #[serde(with = "humantime_serde", alias = "poll_interval", alias = "poll_sleep")]
+    #[serde(
+        with = "humantime_serde",
+        alias = "poll_interval",
+        alias = "poll_sleep"
+    )]
     pub idle_slice: Duration,
     pub buffer: WorkerBuffer,
     pub handoff: WorkerHandoff,

@@ -45,7 +45,6 @@ pub mod syn_sent;
 mod timers;
 pub(crate) mod worker;
 
-pub use policy::TcpPolicy;
 pub use connection::{
     TCP_INITIAL_RETRANSMIT_TIMEOUT, TCP_MAX_RETRANSMIT_TIMEOUT, TCP_MIN_RETRANSMIT_TIMEOUT,
     TcpConnection, TcpRetransmitTimeoutState,
@@ -57,6 +56,7 @@ pub use output::{
     DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_SYN,
     TcpOutputNext, TcpOutputNode,
 };
+pub use policy::TcpPolicy;
 pub use rcv_process::{TcpRcvProcessNext, TcpRcvProcessNode};
 pub use recovery::{TcpRecoveryAck, TcpRecoveryState};
 pub use reset::{TcpResetNext, TcpResetNode};
@@ -189,7 +189,11 @@ pub fn init(reg: &RuntimeRegistry) -> HammerResult<()> {
     let main = TcpMain::new();
     if let Some(config) = reg.get::<Config>() {
         for entry in &config.network.tcp.listen {
-            main.bind_tcp_listener(entry.address, DataWorkerId::new(0), TcpCapabilities::default())?;
+            main.bind_tcp_listener(
+                entry.address,
+                DataWorkerId::new(0),
+                TcpCapabilities::default(),
+            )?;
         }
     }
     TCP_MAIN.store(Some(Arc::new(main)));
@@ -1241,7 +1245,8 @@ mod legacy_tests {
         assert!(drop_state.lock().expect("drop").packets.is_empty());
         let packets = &lookup_state.lock().expect("lookup").packets;
         assert_eq!(packets.len(), 1);
-        let segment = etherparse::TcpSlice::from_slice(tcp_bytes(&packets[0])).expect("tcp segment");
+        let segment =
+            etherparse::TcpSlice::from_slice(tcp_bytes(&packets[0])).expect("tcp segment");
         assert_eq!(
             tcp_flags(&segment),
             TcpSegmentFlags::ACK | TcpSegmentFlags::FIN

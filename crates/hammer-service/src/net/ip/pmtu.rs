@@ -99,10 +99,7 @@ const IPV4_HEADER_MIN_LEN: usize = 20;
 
 /// Parse an IPv4 ICMP Destination Unreachable / Fragmentation Needed message
 /// (payload starting at the ICMP header) and update the path MTU cache.
-pub fn apply_ipv4_frag_needed_icmp(
-    cache: &PathMtuCache,
-    icmp: &[u8],
-) -> Option<(Ipv4Addr, u16)> {
+pub fn apply_ipv4_frag_needed_icmp(cache: &PathMtuCache, icmp: &[u8]) -> Option<(Ipv4Addr, u16)> {
     if icmp.len() < ICMP_HEADER_LEN + IPV4_HEADER_MIN_LEN {
         return None;
     }

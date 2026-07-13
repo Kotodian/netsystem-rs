@@ -639,14 +639,22 @@ pub fn write_ipv6_push_header(
 pub enum Ipv4MtuAction {
     Ok,
     /// Packet exceeds adj MTU and DF is clear → fragment.
-    Fragment { mtu: u16 },
+    Fragment {
+        mtu: u16,
+    },
     /// Packet exceeds adj MTU and DF is set → ICMP Frag-Needed.
-    IcmpFragNeeded { mtu: u16 },
+    IcmpFragNeeded {
+        mtu: u16,
+    },
 }
 
 /// VPP `ip4_mtu_check`: compare L3 packet length to adjacency `max_l3_packet_bytes`.
 #[inline]
-pub fn ipv4_mtu_check(packet_len: u16, adj_packet_bytes: u16, dont_fragment: bool) -> Ipv4MtuAction {
+pub fn ipv4_mtu_check(
+    packet_len: u16,
+    adj_packet_bytes: u16,
+    dont_fragment: bool,
+) -> Ipv4MtuAction {
     if packet_len <= adj_packet_bytes {
         Ipv4MtuAction::Ok
     } else if dont_fragment {

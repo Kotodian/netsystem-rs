@@ -67,24 +67,16 @@ fn apply_linux_scheduler(scheduler: &hammer_core::config::WorkerScheduler) {
     };
 
     let policy = match scheduler.policy {
-        SchedulerPolicy::Other => {
-            ThreadSchedulePolicy::Normal(NormalThreadSchedulePolicy::Other)
-        }
-        SchedulerPolicy::Batch => {
-            ThreadSchedulePolicy::Normal(NormalThreadSchedulePolicy::Batch)
-        }
+        SchedulerPolicy::Other => ThreadSchedulePolicy::Normal(NormalThreadSchedulePolicy::Other),
+        SchedulerPolicy::Batch => ThreadSchedulePolicy::Normal(NormalThreadSchedulePolicy::Batch),
         SchedulerPolicy::Idle => ThreadSchedulePolicy::Normal(NormalThreadSchedulePolicy::Idle),
-        SchedulerPolicy::Fifo => {
-            ThreadSchedulePolicy::Realtime(RealtimeThreadSchedulePolicy::Fifo)
-        }
+        SchedulerPolicy::Fifo => ThreadSchedulePolicy::Realtime(RealtimeThreadSchedulePolicy::Fifo),
         SchedulerPolicy::Rr => {
             ThreadSchedulePolicy::Realtime(RealtimeThreadSchedulePolicy::RoundRobin)
         }
     };
     let priority = match policy {
-        ThreadSchedulePolicy::Normal(_) => {
-            ThreadPriority::Os(ThreadPriorityOsValue::default())
-        }
+        ThreadSchedulePolicy::Normal(_) => ThreadPriority::Os(ThreadPriorityOsValue::default()),
         ThreadSchedulePolicy::Realtime(_) => u8::try_from(scheduler.priority)
             .ok()
             .and_then(|value| ThreadPriorityValue::try_from(value).ok())
@@ -135,8 +127,13 @@ mod tests {
         worker.cpu.worker_cores = vec![target];
         apply_worker_thread_setup(&worker, 0);
         assert_eq!(
-            core_affinity::get_for_current().map(|core| core.id),
-            Some(target)
+            get_core_ids().map(|cores| {
+                cores
+                    .into_iter()
+                    .map(|core| core.id)
+                    .collect::<Vec<_>>()
+            }),
+            Some(vec![target])
         );
     }
 

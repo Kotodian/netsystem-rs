@@ -87,10 +87,7 @@ impl<K: Copy + Default, const KVP: usize> PageAllocState<K, KVP> {
             // SAFETY: `pages` names `page_count` uninitialized writable slots.
             unsafe { pages.as_ptr().add(index).write(ValuePage::new()) };
         }
-        self.blocks.push(PageBlock {
-            pages,
-            log2_pages,
-        });
+        self.blocks.push(PageBlock { pages, log2_pages });
         let offset = u64::try_from(self.blocks.len()).expect("bihash allocator offset fits u64");
         let directory = self.grow_directory();
         (offset, Some(directory))
@@ -115,16 +112,16 @@ impl<K: Copy + Default, const KVP: usize> PageAllocState<K, KVP> {
             .unwrap_or_else(|| handle_alloc_error(layout));
         let slot = raw.cast::<CachePadded<AtomicU64>>();
         // SAFETY: `slot` points to one suitably aligned writable allocation.
-        unsafe { slot.as_ptr().write(CachePadded::new(AtomicU64::new(NO_OFFSET))) };
+        unsafe {
+            slot.as_ptr()
+                .write(CachePadded::new(AtomicU64::new(NO_OFFSET)))
+        };
         self.hazards.push(slot);
         slot
     }
 
     fn retire(&mut self, offset: u64, log2_pages: u8) {
-        self.retired.push(RetiredOffset {
-            offset,
-            log2_pages,
-        });
+        self.retired.push(RetiredOffset { offset, log2_pages });
         self.collect_retired();
     }
 
@@ -176,11 +173,7 @@ impl<K, const KVP: usize> Drop for PageAllocState<K, KVP> {
                     block.pages.as_ptr(),
                     page_count,
                 ));
-                deallocate_in::<ValuePage<K, KVP>, CACHE_LINE>(
-                    block.pages,
-                    page_count,
-                    &self.heap,
-                );
+                deallocate_in::<ValuePage<K, KVP>, CACHE_LINE>(block.pages, page_count, &self.heap);
             }
         }
         for slot in &self.hazards {
@@ -250,9 +243,8 @@ impl<K: Copy + Default, const KVP: usize> PageAlloc<K, KVP> {
             debug_assert_ne!(old_ptr, new_ptr);
             // SAFETY: the old block remains immutable and live; the new block is
             // unpublished and exclusively owned by this allocator operation.
-            let old_pages = unsafe {
-                std::slice::from_raw_parts(old_ptr.as_ptr(), 1usize << old_log2_pages)
-            };
+            let old_pages =
+                unsafe { std::slice::from_raw_parts(old_ptr.as_ptr(), 1usize << old_log2_pages) };
             let new_pages = unsafe {
                 std::slice::from_raw_parts_mut(new_ptr.as_ptr(), 1usize << new_log2_pages)
             };

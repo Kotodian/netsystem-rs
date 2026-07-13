@@ -761,10 +761,7 @@ fn icmp_path_mtu_process(
     icmp_path_mtu_process_frame(runtime, frame)
 }
 
-fn icmp_path_mtu_process_frame(
-    runtime: &DataPlaneRuntime,
-    frame: &mut BufferFrame,
-) -> NodeResult {
+fn icmp_path_mtu_process_frame(runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
     for index in frame.iter_indices() {
         let _ = update_path_mtu_from_index(runtime, *index);
     }

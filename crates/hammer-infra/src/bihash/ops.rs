@@ -188,16 +188,17 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
         key: K,
         hash: u64,
     ) -> (Option<(Slot, u64)>, Option<Slot>) {
-        self.pages.inspect(bucket.offset(), bucket.log2_pages(), |pages| {
-            scan_pages(
-                pages,
-                bucket.log2_pages(),
-                bucket.is_linear_search(),
-                key,
-                hash,
-                self.log2_nbuckets(),
-            )
-        })
+        self.pages
+            .inspect(bucket.offset(), bucket.log2_pages(), |pages| {
+                scan_pages(
+                    pages,
+                    bucket.log2_pages(),
+                    bucket.is_linear_search(),
+                    key,
+                    hash,
+                    self.log2_nbuckets(),
+                )
+            })
     }
 
     fn replace_locked(

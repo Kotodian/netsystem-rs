@@ -11,8 +11,8 @@
 //!   then publish an unlocked bucket word.
 //! - Page allocation and reclamation use an allocator-only spin lock.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod alloc;
 pub mod bucket;
@@ -118,12 +118,7 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
         current: Bucket,
         new: Bucket,
     ) -> Result<Bucket, Bucket> {
-        self.buckets[idx].compare_exchange(
-            current,
-            new,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        )
+        self.buckets[idx].compare_exchange(current, new, Ordering::SeqCst, Ordering::SeqCst)
     }
 
     /// Lock the bucket word (VPP lock bit). Returns the locked snapshot.

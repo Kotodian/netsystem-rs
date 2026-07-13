@@ -29,13 +29,8 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
                         if kv_slot_is_free(kv) {
                             continue;
                         }
-                        displaced |= !place(
-                            new_pages,
-                            new_log2,
-                            kv.key,
-                            kv.value,
-                            self.log2_nbuckets(),
-                        );
+                        displaced |=
+                            !place(new_pages, new_log2, kv.key, kv.value, self.log2_nbuckets());
                         refcnt += 1;
                     }
                 }

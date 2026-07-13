@@ -254,10 +254,12 @@ fn ensure_worker(config: &IpReassemblyNode) {
                 .as_ref()
                 .map(|h| h.worker)
                 .unwrap_or_else(|| DataWorkerId::new(0));
-            let directory = config
-                .directory
-                .clone()
-                .or_else(|| config.handoff.as_ref().map(|h| Arc::new(h.directory.clone())));
+            let directory = config.directory.clone().or_else(|| {
+                config
+                    .handoff
+                    .as_ref()
+                    .map(|h| Arc::new(h.directory.clone()))
+            });
             *slot = Some(IpReassemblyWorker {
                 worker,
                 contexts: Pool::with_capacity(config.max_reassemblies.max(1)),
@@ -274,7 +276,8 @@ fn ensure_worker(config: &IpReassemblyNode) {
             if config.handoff.is_some() {
                 worker.handoff = config.handoff.clone();
                 worker.worker = config.handoff.as_ref().unwrap().worker;
-                worker.directory = Some(Arc::new(config.handoff.as_ref().unwrap().directory.clone()));
+                worker.directory =
+                    Some(Arc::new(config.handoff.as_ref().unwrap().directory.clone()));
             } else if let Some(directory) = &config.directory {
                 worker.directory = Some(Arc::clone(directory));
             }
@@ -354,7 +357,6 @@ impl Node for IpReassemblyExpireWalk {
         NodeResult::drop()
     }
 }
-
 
 impl IpReassemblyWorker {
     fn expire(&mut self, runtime: &DataPlaneRuntime, now: Instant) -> usize {
@@ -518,7 +520,8 @@ impl IpReassemblyWorker {
                     .insert(FragmentContext::new(key, fragment.version, now))
                     .ok_or_else(|| CoreError::internal("reassembly pool full"))?;
                 if let Some(directory) = directory {
-                    let (owner, created) = directory.claim_or_lookup(key, ctx_index, current_worker);
+                    let (owner, created) =
+                        directory.claim_or_lookup(key, ctx_index, current_worker);
                     if !created {
                         let _ = self.contexts.remove(ctx_index);
                         if owner != current_worker {
@@ -534,7 +537,12 @@ impl IpReassemblyWorker {
                                         next: None,
                                     },
                                 );
-                                runtime.handoff_index(owner, handoff.reassembly, index, None::<u16>)?;
+                                runtime.handoff_index(
+                                    owner,
+                                    handoff.reassembly,
+                                    index,
+                                    None::<u16>,
+                                )?;
                                 return Ok(());
                             }
                         }
