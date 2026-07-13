@@ -1,16 +1,13 @@
 //! Service packet graph: linkme `SERVICE_GRAPH_NODES` for graph registration.
 //! Control-plane init migrated to `#[init_function]` in the init system.
 
-use std::sync::OnceLock;
-
 use hammer_component_macros::worker_init_function;
+use hammer_core::config::Config;
 use hammer_core::data_plane::NodeHandle;
 use hammer_core::error::HammerResult;
 use hammer_infra::vec::Vec;
 use hammer_runtime::Engine;
 use hammer_runtime::NodeEntry;
-
-pub(crate) static WORKER_HANDOFF_NODE_HANDLE: OnceLock<NodeHandle> = OnceLock::new();
 
 #[linkme::distributed_slice]
 pub static SERVICE_GRAPH_NODES: [NodeEntry] = [..];
@@ -41,10 +38,8 @@ fn deferred_worker_graph_nodes() -> Vec<NodeEntry> {
 
 #[worker_init_function(name = "install_worker_graph")]
 pub fn install_worker_graph(engine: &mut Engine) -> HammerResult<()> {
-    let handle = *WORKER_HANDOFF_NODE_HANDLE.get().ok_or_else(|| {
-        hammer_core::error::CoreError::internal("install_worker_graph: handoff node handle not set")
-    })?;
-
+    let config = engine.registry.require::<Config>()?;
+    let handle = NodeHandle::new(config.worker.handoff.node_handle);
     engine.runtime.set_handoff_node_handle(handle);
 
     let worker = engine.thread_index as usize;

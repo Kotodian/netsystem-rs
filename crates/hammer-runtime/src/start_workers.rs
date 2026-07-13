@@ -33,7 +33,7 @@ pub fn start_workers(engine: &mut Engine) -> HammerResult<()> {
                 let engine = worker_seed.spawn_on_numa(idx, worker_numa_node);
                 spawn::set_data_plane_runtime(engine.runtime.clone());
 
-                worker_main(idx, engine);
+                worker_main(idx, engine, worker_config.idle_slice);
             })
             .map_err(|e| {
                 hammer_core::error::HammerError::internal(format!(
@@ -59,8 +59,14 @@ fn resolve_worker_startup(registry: &Arc<RuntimeRegistry>) -> HammerResult<(Work
     Ok((worker_config, worker_count))
 }
 
-fn worker_main(idx: u32, mut engine: Engine) {
-    let _ = crate::init::run_worker_init_functions(&mut engine);
+fn worker_main(idx: u32, mut engine: Engine, idle_slice: std::time::Duration) {
+    spawn::apply_worker_idle_slice(idle_slice);
+
+    if let Err(err) = crate::init::run_worker_init_functions(&mut engine) {
+        tracing::error!("worker {idx} init failed: {err}");
+        spawn::cleanup_thread_local();
+        return;
+    }
 
     let tokio_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -109,5 +115,24 @@ mod tests {
             resolve_worker_startup(&registry).expect("configured worker startup");
         assert_eq!(configured_worker.count, 7);
         assert_eq!(configured_count, 7);
+    }
+
+    #[test]
+    fn resolve_worker_startup_carries_poll_sleep_idle_slice() {
+        let registry = Arc::new(RuntimeRegistry::new());
+        let mut config = Config::default();
+        config.worker.idle_slice = std::time::Duration::from_millis(50);
+        config.worker.count = 1;
+        registry.set(Arc::new(config));
+
+        let (worker, count) = resolve_worker_startup(&registry).expect("worker startup");
+        assert_eq!(count, 1);
+        assert_eq!(worker.idle_slice, std::time::Duration::from_millis(50));
+
+        spawn::apply_worker_idle_slice(worker.idle_slice);
+        assert_eq!(
+            spawn::current_worker_idle_slice(),
+            std::time::Duration::from_millis(50)
+        );
     }
 }

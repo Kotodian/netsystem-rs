@@ -106,6 +106,14 @@ thread_local! {
     pub(crate) static DATA_LOCAL_DRIVER_WAKER: RefCell<Option<Waker>> = const { RefCell::new(None) };
 }
 
+pub(crate) fn apply_worker_idle_slice(idle_slice: Duration) {
+    DATA_WORKER_IDLE_SLICE.with(|slot| slot.set(idle_slice));
+}
+
+pub(crate) fn current_worker_idle_slice() -> Duration {
+    DATA_WORKER_IDLE_SLICE.with(|slot| slot.get())
+}
+
 fn init_data_plane_runtime(config: &hammer_core::config::Config) {
     DATA_PLANE_RUNTIME.with(|runtime| {
         if runtime.borrow().is_none() {

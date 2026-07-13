@@ -9,6 +9,9 @@ use hammer_core::registry::RuntimeRegistry;
 use hammer_runtime::engine::{Engine, EnginePool};
 use hammer_runtime::new_worker_runtime;
 
+// Force-link service init/graph distributed slices into the daemon binary.
+use hammer_service as _;
+
 mod ipc_handlers;
 mod ipc_loop;
 
@@ -36,6 +39,13 @@ fn main() {
     let runtime = new_worker_runtime(&config);
     let engine = Engine::new(runtime, Arc::clone(&registry));
     let mut pool = EnginePool::new(engine);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("build tokio runtime");
+    let _enter = rt.enter();
 
     let listener = bind_ipc_socket();
     pool.set_ipc_listener(listener);
@@ -73,12 +83,6 @@ fn main() {
     });
 
     let listener = pool.take_ipc_listener().expect("IPC listener configured");
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
-        .build()
-        .expect("build tokio runtime");
 
     tracing::info!("hammer started");
 

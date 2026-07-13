@@ -1,13 +1,16 @@
 pub use hammer_core::protocol::tcp::{TcpInputFlags, TcpSeq, TcpState};
 
 use std::mem::transmute;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
+use hammer_core::config::Config;
 use hammer_core::data_plane::{BufferPacketCursor, NodeId, NodeState, SecondaryOpaque};
 use hammer_core::error::{CoreError, CoreResult, HammerResult};
+use hammer_core::protocol::tcp::TcpCapabilities;
 #[cfg(test)]
-use hammer_core::protocol::tcp::{TcpCapabilities, TcpFastOpenCookie};
+use hammer_core::protocol::tcp::TcpFastOpenCookie;
 use hammer_core::protocol::tcp::{TcpControlPacketParseError, TcpError};
 use hammer_core::registry::RuntimeRegistry;
 use hammer_runtime::{DataPlaneRuntime, DataWorkerId};
@@ -29,6 +32,7 @@ pub mod connection;
 pub mod established;
 pub mod input;
 pub mod listen;
+mod listener_control;
 pub mod lookup;
 pub mod output;
 pub mod policy;
@@ -115,17 +119,27 @@ where
 
 pub struct TcpMain {
     control: TcpInputControlPlane,
+    listeners: listener_control::TcpListenerControlHandle,
 }
 
 impl TcpMain {
     pub fn new() -> Self {
-        Self {
-            control: TcpInputControlPlane::new(),
-        }
+        let control = TcpInputControlPlane::new();
+        let listeners = listener_control::TcpListenerControlHandle::new(control.clone());
+        Self { control, listeners }
     }
 
     pub fn control(&self) -> &TcpInputControlPlane {
         &self.control
+    }
+
+    fn bind_tcp_listener(
+        &self,
+        bind: SocketAddr,
+        owner_worker: DataWorkerId,
+        capabilities: TcpCapabilities,
+    ) -> HammerResult<lookup::TcpLookupId> {
+        self.listeners.bind(bind, owner_worker, capabilities)
     }
 
     /// Build and register this worker's `TcpInputNode<C>`.
@@ -171,14 +185,20 @@ pub(crate) fn reset_for_test() {
     TCP_MAIN.store(None);
 }
 
-pub fn init(_reg: &RuntimeRegistry) -> HammerResult<()> {
-    TCP_MAIN.store(Some(Arc::new(TcpMain::new())));
+pub fn init(reg: &RuntimeRegistry) -> HammerResult<()> {
+    let main = TcpMain::new();
+    if let Some(config) = reg.get::<Config>() {
+        for entry in &config.network.tcp.listen {
+            main.bind_tcp_listener(entry.address, DataWorkerId::new(0), TcpCapabilities::default())?;
+        }
+    }
+    TCP_MAIN.store(Some(Arc::new(main)));
     Ok(())
 }
 
-#[hammer_component_macros::init_function(name = "tcp_init")]
+#[hammer_component_macros::init_function(name = "tcp_init", runs_after = ["transport_init"])]
 fn init_tcp(engine: &mut hammer_runtime::Engine) -> HammerResult<()> {
-    init(&engine.registry)
+    init(engine.registry.as_ref())
 }
 
 pub fn register_tcp_input(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
@@ -755,6 +775,42 @@ pub enum TcpInputNext {
     Established,
     #[next("tcp-reset")]
     Reset,
+}
+
+#[cfg(test)]
+mod init_tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+
+    use hammer_core::config::Config;
+    use hammer_core::config::loader::parse_config;
+    use hammer_core::registry::RuntimeRegistry;
+
+    use super::*;
+
+    #[test]
+    fn tcp_init_binds_configured_listens() {
+        crate::reset_subsystem_mains_for_test();
+        let cfg = parse_config(
+            r#"
+[[network.tcp.listen]]
+address = "10.0.0.1:7"
+"#,
+        )
+        .expect("parse");
+        let registry = RuntimeRegistry::new();
+        registry.set::<Config>(Arc::new(cfg));
+        init(registry.as_ref()).expect("tcp_init");
+
+        let entry = TCP_MAIN
+            .load()
+            .as_deref()
+            .expect("tcp main")
+            .control()
+            .lookup_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 7));
+        assert!(entry.is_some(), "configured listen must be in lookup");
+        assert_eq!(entry.unwrap().id, 1);
+    }
 }
 
 #[cfg(test)]

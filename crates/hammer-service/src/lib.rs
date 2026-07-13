@@ -7,7 +7,6 @@ pub mod feature_arc;
 pub mod interface;
 pub mod net;
 mod packet_graph;
-mod service;
 pub mod session;
 mod trace;
 pub mod transport;
@@ -20,4 +19,5 @@ pub(crate) fn reset_subsystem_mains_for_test() {
     crate::transport::reset_for_test();
     crate::transport::tcp::reset_for_test();
     crate::net::reset_ip_main_for_test();
+    crate::interface::reset_interface_main_for_test();
 }

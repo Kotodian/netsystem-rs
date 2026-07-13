@@ -3,9 +3,12 @@ use std::fmt;
 use std::mem::transmute;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use arc_swap::ArcSwapOption;
+use hammer_core::config::Config;
 use hammer_core::data_plane::{BufferFrame, Index, NodeId, NodeRegistration};
-use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::error::{CoreError, CoreResult, HammerResult};
 use hammer_core::forwarding::AdjacencyRewrite;
+use hammer_core::registry::RuntimeRegistry;
 use hammer_infra::map::{FlatHashKey, FlatHashTable};
 use hammer_infra::vec::Vec;
 use hammer_runtime::DataPlaneBarrierHandle;
@@ -328,6 +331,35 @@ impl InterfaceControlPlane {
         self.inner.replace_after_barrier(state);
         Ok(())
     }
+}
+
+/// Process-level interface control plane (VPP-style main). Filled by
+/// `interface_init` from `[[network.interface]]` only — no device open.
+pub static INTERFACE_MAIN: ArcSwapOption<InterfaceControlPlane> = ArcSwapOption::const_empty();
+
+#[cfg(test)]
+pub(crate) fn reset_interface_main_for_test() {
+    INTERFACE_MAIN.store(None);
+}
+
+pub fn init(reg: &RuntimeRegistry) -> HammerResult<()> {
+    let plane = InterfaceControlPlane::new();
+    if let Some(config) = reg.get::<Config>() {
+        for iface in &config.network.interface {
+            let mtu = InterfaceMtu::new(iface.mtu.l3, iface.mtu.ip4, iface.mtu.ip6, iface.mtu.mpls);
+            let index = plane.register_interface_with_mtu(iface.name.clone(), mtu)?;
+            for address in &iface.address {
+                plane.add_address(index, *address)?;
+            }
+        }
+    }
+    INTERFACE_MAIN.store(Some(Arc::new(plane)));
+    Ok(())
+}
+
+#[hammer_component_macros::init_function(name = "interface_init")]
+fn init_interface(engine: &mut hammer_runtime::Engine) -> HammerResult<()> {
+    init(engine.registry.as_ref())
 }
 
 #[derive(Debug, Clone)]
@@ -1018,4 +1050,45 @@ fn interface_output_process_frame(
             Err(_) => drop_next,
         }
     })
+}
+
+#[cfg(test)]
+mod init_tests {
+    use super::*;
+    use hammer_core::config::Config;
+    use hammer_core::config::loader::parse_config;
+    use hammer_core::registry::RuntimeRegistry;
+    use std::str::FromStr;
+    use std::sync::Arc;
+
+    #[test]
+    fn interface_init_publishes_configured_interfaces() {
+        reset_interface_main_for_test();
+        let cfg = parse_config(
+            r#"
+[[network.interface]]
+name = "utun9"
+address = ["10.0.0.1/30"]
+mtu = { l3 = 1500, ip4 = 1500, ip6 = 1500, mpls = 1500 }
+"#,
+        )
+        .expect("parse");
+        let registry = RuntimeRegistry::new();
+        registry.set::<Config>(Arc::new(cfg));
+        init(registry.as_ref()).expect("interface_init");
+
+        let main = INTERFACE_MAIN.load();
+        let plane = main.as_deref().expect("interface main");
+        let handle = plane.handle();
+        let index = handle.interface_index("utun9").expect("name");
+        assert_eq!(handle.interface_name(index).as_deref(), Some("utun9"));
+        assert_eq!(
+            handle.interface_mtu(index),
+            Some(InterfaceMtu::new(1500, 1500, 1500, 1500))
+        );
+        assert_eq!(
+            handle.interface_addresses(index),
+            vec![IpNet::from_str("10.0.0.1/30").expect("cidr")]
+        );
+    }
 }
