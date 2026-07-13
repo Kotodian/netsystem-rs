@@ -16,9 +16,10 @@ impl BarrierGuard {
 /// Release workers from the barrier. Called by BarrierGuard::drop and
 /// DataPlaneBarrierGuard::drop.
 pub fn barrier_release(wait: &AtomicU32, workers: &AtomicU32) {
-    workers.store(0, Ordering::SeqCst);
-    std::sync::atomic::compiler_fence(Ordering::SeqCst);
     wait.store(0, Ordering::Release);
+    while workers.load(Ordering::Acquire) > 0 {
+        spin_loop();
+    }
 }
 
 impl Drop for BarrierGuard {
@@ -54,6 +55,7 @@ pub fn barrier_check(wait: &AtomicU32, workers: &AtomicU32) {
         while wait.load(Ordering::Acquire) > 0 {
             spin_loop();
         }
+        workers.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -93,9 +95,7 @@ mod tests {
 
         assert!(!flag.load(Ordering::Acquire));
 
-        workers.store(0, Ordering::SeqCst);
-        std::sync::atomic::compiler_fence(Ordering::SeqCst);
-        wait.store(0, Ordering::Release);
+        barrier_release(&wait, &workers);
 
         worker.join().unwrap();
         assert!(flag.load(Ordering::Acquire));
@@ -154,13 +154,40 @@ mod tests {
 
         assert_eq!(counter.load(Ordering::Acquire), 0);
 
-        workers_at_barrier.store(0, Ordering::SeqCst);
-        std::sync::atomic::compiler_fence(Ordering::SeqCst);
-        wait.store(0, Ordering::Release);
+        barrier_release(&wait, &workers_at_barrier);
 
         for h in handles {
             h.join().unwrap();
         }
         assert_eq!(counter.load(Ordering::Acquire), n as u32);
+    }
+
+    #[test]
+    fn barrier_release_waits_for_worker_owned_count_to_reach_zero() {
+        let wait = Arc::new(AtomicU32::new(1));
+        let workers = Arc::new(AtomicU32::new(1));
+        let (released_tx, released_rx) = mpsc::channel();
+        let (exit_tx, exit_rx) = mpsc::channel();
+
+        let worker_wait = Arc::clone(&wait);
+        let worker_count = Arc::clone(&workers);
+        let worker = thread::spawn(move || {
+            while worker_wait.load(Ordering::Acquire) > 0 {
+                spin_loop();
+            }
+            released_tx.send(()).expect("report barrier release");
+            exit_rx.recv().expect("leave barrier");
+            worker_count.fetch_sub(1, Ordering::Release);
+        });
+
+        let release_wait = Arc::clone(&wait);
+        let release_count = Arc::clone(&workers);
+        let releaser = thread::spawn(move || barrier_release(&release_wait, &release_count));
+
+        released_rx.recv().expect("worker observed release");
+        exit_tx.send(()).expect("allow worker exit");
+        worker.join().expect("worker");
+        releaser.join().expect("releaser");
+        assert_eq!(workers.load(Ordering::Acquire), 0);
     }
 }
