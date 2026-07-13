@@ -13,6 +13,7 @@ members = [
 ]
 exclude = [
     "third_party/boringtun",
+    "third_party/io-uring",
 ]
 
 [workspace.package]
@@ -70,6 +71,8 @@ bincode = "1"
 mimalloc = { version = "0.1", default-features = false }
 talc = { version = "5.0.4", default-features = false }
 spinning_top = "0.3"
+io-uring = "0.7.13"
 
 [patch.crates-io]
 boringtun = { path = "third_party/boringtun" }
+io-uring = { path = "third_party/io-uring" }

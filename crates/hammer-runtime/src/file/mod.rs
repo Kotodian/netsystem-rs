@@ -17,6 +17,10 @@ use crate::DataWorkerId;
 mod macos;
 #[cfg(target_os = "macos")]
 use macos::Poller;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+use linux::Poller;
 
 /// Worker-local callback invoked for one ready descriptor event.
 pub type FileFunction = fn(&mut File) -> HammerResult<()>;
@@ -274,13 +278,23 @@ impl FileMain {
                 continue;
             }
             dispatched += file.dispatch(event.readiness)?;
+            if event.rearm {
+                let spec = self
+                    .files
+                    .get(index)
+                    .map(|file| file.poll_spec(index))
+                    .ok_or_else(|| {
+                        HammerError::internal("File disappeared while rearming readiness")
+                    })?;
+                self.poller.add(spec)?;
+            }
         }
         Ok(dispatched)
     }
 }
 
 pub(super) const POLL_BATCH_SIZE: usize = 16;
-const FILE_POOL_CAPACITY: usize = 1024;
+pub(super) const FILE_POOL_CAPACITY: usize = 1024;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct PollSpec {
@@ -294,6 +308,7 @@ pub(super) struct PollSpec {
 pub(super) struct PollEvent {
     pub(super) index: Option<Index>,
     pub(super) readiness: Readiness,
+    pub(super) rearm: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

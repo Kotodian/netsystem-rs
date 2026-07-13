@@ -75,6 +75,7 @@ impl Poller {
             *ready = PollEvent {
                 index: decode_index(event.udata as usize as u64),
                 readiness,
+                rearm: false,
             };
         }
         Ok(count)

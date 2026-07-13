@@ -32,6 +32,7 @@ libc = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 core_affinity = { workspace = true }
+io-uring = { workspace = true, features = ["io_safety"] }
 thread-priority = { workspace = true }
 
 [dev-dependencies]

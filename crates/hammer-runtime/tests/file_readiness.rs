@@ -1,6 +1,8 @@
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use std::io::Write;
+#[cfg(target_os = "linux")]
+use std::os::fd::FromRawFd;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -114,6 +116,99 @@ fn readable_file_dispatches_on_its_polling_worker() {
 }
 
 #[test]
+fn readable_file_dispatches_across_repeated_readiness_cycles() {
+    let worker = DataWorkerId::new(0);
+    let mut files = FileMain::new(worker).expect("create FileMain");
+    let mut socket = RegisteredSocket::register(
+        &mut files,
+        worker,
+        "repeated readable",
+        0,
+        FileFunctions {
+            read: Some(|file| {
+                let mut byte = 0_u8;
+                // SAFETY: `byte` is writable for one byte and File retains the
+                // live descriptor for the duration of callback dispatch.
+                let count = unsafe {
+                    libc::read(
+                        file.fd(),
+                        std::ptr::from_mut(&mut byte).cast::<libc::c_void>(),
+                        1,
+                    )
+                };
+                assert_eq!(count, 1);
+                file.set_private_data(file.private_data() + 1);
+                Ok(())
+            }),
+            ..FileFunctions::default()
+        },
+    );
+
+    socket.make_readable();
+    assert_eq!(files.poll().expect("poll first readiness"), 1);
+    socket.make_readable();
+    assert_eq!(files.poll().expect("poll second readiness"), 1);
+
+    let file = files.get(socket.index).expect("registered file");
+    assert_eq!(file.private_data(), 2);
+    assert_eq!(file.read_events(), 2);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_eventfd_readiness_dispatches_through_file_main() {
+    let worker = DataWorkerId::new(0);
+    let mut files = FileMain::new(worker).expect("create FileMain");
+    // SAFETY: eventfd returns a fresh descriptor or -1 with errno set.
+    let raw_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    assert!(raw_fd >= 0, "create eventfd: {}", std::io::Error::last_os_error());
+    // SAFETY: ownership of the fresh eventfd descriptor is transferred once.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let index = files
+        .add(File::new(
+            Arc::new(fd),
+            worker,
+            "linux eventfd".to_owned(),
+            0,
+            FileFunctions {
+                read: Some(|file| {
+                    let mut value = 0_u64;
+                    // SAFETY: `value` is writable for eight bytes and File
+                    // retains the descriptor during callback dispatch.
+                    let count = unsafe {
+                        libc::read(
+                            file.fd(),
+                            std::ptr::from_mut(&mut value).cast::<libc::c_void>(),
+                            std::mem::size_of::<u64>(),
+                        )
+                    };
+                    assert_eq!(count, std::mem::size_of::<u64>() as isize);
+                    file.set_private_data(value);
+                    Ok(())
+                }),
+                ..FileFunctions::default()
+            },
+        ))
+        .expect("register eventfd");
+
+    let value = 7_u64;
+    // SAFETY: `value` is readable for eight bytes and File owns the live fd.
+    let count = unsafe {
+        libc::write(
+            raw_fd,
+            std::ptr::from_ref(&value).cast::<libc::c_void>(),
+            std::mem::size_of::<u64>(),
+        )
+    };
+    assert_eq!(count, std::mem::size_of::<u64>() as isize);
+    assert_eq!(files.poll().expect("poll eventfd readiness"), 1);
+
+    let file = files.get(index).expect("registered eventfd");
+    assert_eq!(file.private_data(), value);
+    assert_eq!(file.read_events(), 1);
+}
+
+#[test]
 fn write_interest_changes_without_replacing_file_index() {
     let worker = DataWorkerId::new(0);
     let mut files = FileMain::new(worker).expect("create FileMain");
@@ -169,7 +264,7 @@ fn error_callback_runs_before_delete_closes_the_descriptor() {
 
     assert!(files.delete(socket.index).expect("delete file"));
     // SAFETY: F_GETFD only queries the descriptor number. EBADF proves the
-    // last OwnedFd was released after kqueue deletion.
+    // last OwnedFd was released after readiness deletion.
     assert_eq!(unsafe { libc::fcntl(socket.raw_fd, libc::F_GETFD) }, -1);
     assert_eq!(
         std::io::Error::last_os_error().raw_os_error(),
