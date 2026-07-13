@@ -2,9 +2,11 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, Mutex};
 
-use hammer_core::error::HammerResult;
+use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::registry::RuntimeRegistry;
 use hammer_runtime::DataPlaneRuntime;
+
+use crate::{DataWorkerId, FileMain};
 
 thread_local! {
     static CURRENT_ENGINE: RefCell<Option<*mut Engine>> = const { RefCell::new(None) };
@@ -28,6 +30,7 @@ pub struct Engine {
     pub workers_at_barrier: Arc<AtomicU32>,
     pub main_loop_exit_now: AtomicBool,
     pub main_loop_exit_status: Mutex<i32>,
+    file_main: Option<FileMain>,
 }
 
 impl Engine {
@@ -39,8 +42,12 @@ impl Engine {
         workers_at_barrier: Arc<AtomicU32>,
         index: u32,
         numa_node: u32,
-    ) -> Self {
-        Self {
+    ) -> HammerResult<Self> {
+        let worker = index
+            .checked_sub(1)
+            .map(DataWorkerId::new)
+            .ok_or_else(|| HammerError::internal("data worker thread index must be non-zero"))?;
+        Ok(Self {
             thread_index: index,
             numa_node,
             main_loop_count: AtomicU32::new(0),
@@ -50,7 +57,8 @@ impl Engine {
             workers_at_barrier,
             main_loop_exit_now: AtomicBool::new(false),
             main_loop_exit_status: Mutex::new(0),
-        }
+            file_main: Some(FileMain::new(worker)?),
+        })
     }
 
     pub fn new(runtime: DataPlaneRuntime, registry: Arc<RuntimeRegistry>) -> Self {
@@ -64,14 +72,15 @@ impl Engine {
             workers_at_barrier: Arc::new(AtomicU32::new(0)),
             main_loop_exit_now: AtomicBool::new(false),
             main_loop_exit_status: Mutex::new(0),
+            file_main: None,
         }
     }
 
-    pub fn spawn(&self, index: u32) -> Self {
+    pub fn spawn(&self, index: u32) -> HammerResult<Self> {
         self.spawn_on_numa(index, self.numa_node)
     }
 
-    pub fn spawn_on_numa(&self, index: u32, numa_node: u32) -> Self {
+    pub fn spawn_on_numa(&self, index: u32, numa_node: u32) -> HammerResult<Self> {
         Self::worker_with_runtime(
             self.runtime.clone_for_worker(index, numa_node),
             Arc::clone(&self.registry),
@@ -80,6 +89,26 @@ impl Engine {
             index,
             numa_node,
         )
+    }
+
+    #[inline]
+    pub fn data_worker_id(&self) -> HammerResult<DataWorkerId> {
+        self.thread_index
+            .checked_sub(1)
+            .map(DataWorkerId::new)
+            .ok_or_else(|| HammerError::internal("main thread has no data worker id"))
+    }
+
+    pub fn file_main(&self) -> HammerResult<&FileMain> {
+        self.file_main
+            .as_ref()
+            .ok_or_else(|| HammerError::internal("main thread has no FileMain"))
+    }
+
+    pub fn file_main_mut(&mut self) -> HammerResult<&mut FileMain> {
+        self.file_main
+            .as_mut()
+            .ok_or_else(|| HammerError::internal("main thread has no FileMain"))
     }
 
     pub(crate) fn worker_seed(
@@ -124,7 +153,7 @@ where
     F: Fn(u32, u32) -> DataPlaneRuntime + Send + 'static,
 {
     #[inline]
-    pub(crate) fn spawn_on_numa(&self, index: u32, numa_node: u32) -> Engine {
+    pub(crate) fn spawn_on_numa(&self, index: u32, numa_node: u32) -> HammerResult<Engine> {
         Engine::worker_with_runtime(
             (self.runtime_seed)(index, numa_node),
             Arc::clone(&self.registry),
@@ -231,16 +260,27 @@ mod tests {
     #[test]
     fn spawn_shares_registry_and_resets_thread_index() {
         let main = test_engine();
-        let worker = main.spawn(3);
+        let worker = main.spawn(3).expect("spawn worker");
         assert_eq!(worker.thread_index, 3);
         assert_eq!(main.thread_index, 0);
         assert!(Arc::ptr_eq(&main.registry, &worker.registry));
     }
 
     #[test]
+    fn data_worker_id_maps_one_based_engine_workers_to_zero_based_ids() {
+        let main = test_engine();
+        let worker_1 = main.spawn(1).expect("spawn worker 1");
+        let worker_2 = main.spawn(2).expect("spawn worker 2");
+
+        assert!(main.data_worker_id().is_err());
+        assert_eq!(worker_1.data_worker_id().unwrap(), DataWorkerId::new(0));
+        assert_eq!(worker_2.data_worker_id().unwrap(), DataWorkerId::new(1));
+    }
+
+    #[test]
     fn spawn_shares_barrier_arcs() {
         let main = test_engine();
-        let worker = main.spawn(1);
+        let worker = main.spawn(1).expect("spawn worker");
         assert!(Arc::ptr_eq(&main.wait_at_barrier, &worker.wait_at_barrier));
         assert!(Arc::ptr_eq(
             &main.workers_at_barrier,
@@ -255,7 +295,7 @@ mod tests {
             .store(42, std::sync::atomic::Ordering::Relaxed);
         main.main_loop_exit_now
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let worker = main.spawn(1);
+        let worker = main.spawn(1).expect("spawn worker");
         assert_eq!(
             worker
                 .main_loop_count

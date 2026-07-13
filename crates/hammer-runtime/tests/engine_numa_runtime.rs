@@ -21,7 +21,7 @@ fn spawned_engine_uses_worker_numa_runtime_view() {
     let mut main = Engine::new(runtime, RuntimeRegistry::new());
     main.numa_node = 0;
 
-    let worker = main.spawn_on_numa(3, 1);
+    let worker = main.spawn_on_numa(3, 1).expect("spawn worker on NUMA node");
 
     let main_index = main.runtime.alloc_index().expect("main alloc");
     let worker_index = worker.runtime.alloc_index().expect("worker alloc");

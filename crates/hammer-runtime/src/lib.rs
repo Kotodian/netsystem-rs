@@ -2,6 +2,8 @@ extern crate self as hammer_runtime;
 
 pub mod engine;
 pub use engine::{Engine, EnginePool};
+pub mod file;
+pub use file::{File, FileFunction, FileFunctions, FileMain};
 pub mod barrier;
 pub mod init;
 pub mod main_loop;

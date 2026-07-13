@@ -30,10 +30,16 @@ pub fn start_workers(engine: &mut Engine) -> HammerResult<()> {
                 let worker_index = usize::try_from(idx - 1).expect("worker index fits usize");
                 crate::worker_thread::apply_worker_thread_setup(&worker_config, worker_index);
                 let worker_numa_node = crate::numa::current_numa_node().unwrap_or(0);
-                let engine = worker_seed.spawn_on_numa(idx, worker_numa_node);
+                let mut engine = match worker_seed.spawn_on_numa(idx, worker_numa_node) {
+                    Ok(engine) => engine,
+                    Err(error) => {
+                        tracing::error!(worker = idx, %error, "worker runtime init failed");
+                        return;
+                    }
+                };
                 spawn::set_data_plane_runtime(engine.runtime.clone());
 
-                worker_main(idx, engine, worker_config.idle_slice);
+                worker_main(idx, &mut engine, worker_config.idle_slice);
             })
             .map_err(|e| {
                 hammer_core::error::HammerError::internal(format!(
@@ -59,10 +65,10 @@ fn resolve_worker_startup(registry: &Arc<RuntimeRegistry>) -> HammerResult<(Work
     Ok((worker_config, worker_count))
 }
 
-fn worker_main(idx: u32, mut engine: Engine, idle_slice: std::time::Duration) {
+fn worker_main(idx: u32, engine: &mut Engine, idle_slice: std::time::Duration) {
     spawn::apply_worker_idle_slice(idle_slice);
 
-    if let Err(err) = crate::init::run_worker_init_functions(&mut engine) {
+    if let Err(err) = crate::init::run_worker_init_functions(engine) {
         tracing::error!("worker {idx} init failed: {err}");
         spawn::cleanup_thread_local();
         return;
@@ -76,7 +82,7 @@ fn worker_main(idx: u32, mut engine: Engine, idle_slice: std::time::Duration) {
     let remote_local = spawn::DataRemoteLocalQueue::default();
     remote_local.attach_current_thread();
 
-    let exit_status = crate::main_loop::engine_main_loop(&engine, &tokio_rt, &remote_local);
+    let exit_status = crate::main_loop::engine_main_loop(engine, &tokio_rt, &remote_local);
 
     spawn::cleanup_thread_local();
 

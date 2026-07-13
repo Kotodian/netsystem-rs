@@ -29,9 +29,9 @@ fn worker_spawn_engine_main_loop_exits() {
     for idx in 0..n_workers {
         let handle = thread::spawn(move || {
             let rt = test_runtime(idx);
-            hammer_runtime::spawn::set_data_plane_runtime(rt.clone());
-            let mut engine = Engine::new(rt, RuntimeRegistry::new());
-            engine.thread_index = idx;
+            let main = Engine::new(rt, RuntimeRegistry::new());
+            let mut engine = main.spawn(idx + 1).expect("spawn data worker");
+            hammer_runtime::spawn::set_data_plane_runtime(engine.runtime.clone());
 
             let remote_local = DataRemoteLocalQueue::default();
             remote_local.attach_current_thread();
@@ -43,7 +43,7 @@ fn worker_spawn_engine_main_loop_exits() {
 
             engine.main_loop_exit_now.store(true, Ordering::Relaxed);
             let status =
-                hammer_runtime::main_loop::engine_main_loop(&engine, &tokio_rt, &remote_local);
+                hammer_runtime::main_loop::engine_main_loop(&mut engine, &tokio_rt, &remote_local);
             assert_eq!(0, status, "worker {idx} exit status");
         });
         handles.push(handle);

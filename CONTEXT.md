@@ -107,6 +107,16 @@ _Avoid_: adapter graph runtime, scheduler helper, node registry wrapper
 - Handoff alone owns cross-worker grouping and may retain destination `NodeId` continuation state after Graph Runtime resolves a local next at enqueue.
 _Avoid_: `NodeNextStorage`, `runtime_nexts`, production `current_node_next(s)`, protocol target-node routing, compatibility wrappers for removed surfaces
 
+**File Readiness**:
+The worker-local registry that maps operating-system fd readiness to callbacks using the existing generation-bearing Pool Index. A File contains descriptor ownership, worker ownership, one read/write/error File Functions table, private data, description, and event counters; it is not a packet-I/O adapter.
+_Avoid_: File-specific Index, `AsyncFd`, TUN I/O backend, runtime platform enum, packet read/write callback
+
+**File Readiness Layer Contract**:
+- `hammer-runtime` owns File lifetime, worker ownership, generation checks, readiness counters, callback dispatch, and the fixed Main Loop Step where readiness is polled.
+- Platform adapters are crate-private and may only add, modify, cancel, and collect readiness for existing File records. macOS uses kqueue; Linux uses io_uring without epoll or fallback.
+- Device implementations own device fd state and all packet `readv`/`writev` operations. A File callback may only schedule or mark worker-local runtime work; it must not read or write packet payload.
+- Graph Nodes own packet receive/transmit and Buffer Chain handling after readiness schedules them.
+
 **Barrier Synchronization**:
 The control-plane mechanism that pauses data workers at a known point so control changes can observe a stable data-plane state. It is not a lock taken around hot-path packet processing.
 _Avoid_: global mutex, graph lock, packet-path synchronization

@@ -101,7 +101,7 @@ fn engine_spawn_uses_initialized_runtime_view_for_inherited_numa() {
     let main =
         hammer_runtime::Engine::new(main_runtime, hammer_core::registry::RuntimeRegistry::new());
 
-    let worker = main.spawn(3);
+    let worker = main.spawn(3).expect("spawn worker");
 
     assert_eq!(worker.thread_index, 3);
     assert_eq!(worker.numa_node, 0);
