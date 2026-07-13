@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt-linux:
+    name: fmt [linux]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout [linux]
+        uses: actions/checkout@v4
+      - name: Install Rust [linux]
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting [linux]
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy [${{ matrix.platform }}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            runner: ubuntu-24.04
+          - platform: macos
+            runner: macos-15
+    steps:
+      - name: Checkout [${{ matrix.platform }}]
+        uses: actions/checkout@v4
+      - name: Install Rust [${{ matrix.platform }}]
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache Cargo [${{ matrix.platform }}]
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy-${{ matrix.platform }}
+      - name: Run clippy [${{ matrix.platform }}]
+        run: cargo clippy --workspace --all-targets
+
+  test:
+    name: test [${{ matrix.platform }}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            runner: ubuntu-24.04
+          - platform: macos
+            runner: macos-15
+    steps:
+      - name: Checkout [${{ matrix.platform }}]
+        uses: actions/checkout@v4
+      - name: Install Rust [${{ matrix.platform }}]
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo [${{ matrix.platform }}]
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.platform }}
+      - name: Run workspace tests [${{ matrix.platform }}]
+        run: cargo test --workspace
