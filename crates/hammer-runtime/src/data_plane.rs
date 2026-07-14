@@ -370,6 +370,18 @@ impl DataPlaneRuntime {
         self.nodes.resolve_named_next_nodes()
     }
 
+    /// Global Graph Transaction: drain residual scheduled frames, detach the
+    /// live topology, rebuild and renumber from `entries`, then leave workers
+    /// to adopt the new topology via `clone_for_worker` (VPP refork analogue).
+    ///
+    /// Does not invent plugin unload; disable/isolate is catalog filtering
+    /// before rebuild (#95). Business state must rebind by name, not NodeId.
+    pub fn rebuild_graph(&self, worker: usize, entries: &[NodeEntry]) -> CoreResult<()> {
+        self.set_current_node(None);
+        self.nodes.detach_graph_for_rebuild();
+        self.init_graph(worker, entries)
+    }
+
     #[inline]
     pub fn set_trace_control(&self, control: Option<TraceControlHandle>, packet_capacity: usize) {
         self.trace.set_control(control, packet_capacity);

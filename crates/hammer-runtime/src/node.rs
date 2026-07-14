@@ -578,6 +578,11 @@ impl ScheduledFrameQueue {
         }
         frame
     }
+
+    #[inline]
+    fn drain_all(&mut self) {
+        while self.pop_front().is_some() {}
+    }
 }
 
 impl NodeRuntimeInner {
@@ -1016,6 +1021,40 @@ mod node_function_tests {
 }
 
 impl NodeRuntime {
+    /// Drain scheduled frames and clear topology so `init_graph` can renumber.
+    ///
+    /// VPP analogue: barrier-held main-thread graph mutation before worker refork.
+    /// Old `NodeId` values become unreachable after this returns.
+    pub fn detach_graph_for_rebuild(&self) {
+        {
+            let mut queue = self.queue.borrow_mut();
+            queue.drain_all();
+        }
+        self.readiness.clear_pending();
+        let capacity = {
+            let inner = self.inner.borrow();
+            inner.scheduled_frame_queue_capacity
+        };
+        *self.inner.borrow_mut() = NodeRuntimeInner {
+            nodes: Vec::new(),
+            node_states: Vec::new(),
+            interrupt_pending: Vec::new(),
+            error_counters: Vec::new(),
+            error_ids: HashMap::new(),
+            error_slots: Vec::new(),
+            runtime_stats: Vec::new(),
+            scheduled_frame_queue_capacity: capacity,
+            handles: HashMap::new(),
+            declared_nodes: HashMap::new(),
+            node_names: Vec::new(),
+            node_trace_formatters: Vec::new(),
+            next_nodes: Vec::new(),
+            pending_next_names: Vec::new(),
+            sibling_owners: Vec::new(),
+            siblings: Vec::new(),
+        };
+    }
+
     pub(crate) fn clone_inner_for_worker(&self) -> CoreResult<NodeRuntimeInner> {
         let inner = self.inner.borrow();
         if inner
