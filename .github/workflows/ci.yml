@@ -104,6 +104,8 @@ jobs:
         with:
           key: bihash-read-scaling-linux
       - name: Check bihash read scaling [linux]
+        env:
+          RUSTFLAGS: ""
         run: >-
           cargo test -p hammer-infra --release --test bihash_read_scaling
           -- --ignored --nocapture
