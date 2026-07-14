@@ -99,6 +99,8 @@ For TCP, session, dataplane buffer, and recovery work:
 
 Add integration tests near the crate whose behavior changes. Test files live in crate-local `tests/` directories (e.g. `crates/hammer-runtime/tests/`, `crates/hammer-core/tests/`). Use descriptive file names like `service_lifecycle.rs`, `config_parse.rs`, `tcp_output.rs`, or `fifo_ooo.rs`. Prefer focused tests for config parsing, lifecycle behavior, routing, TCP protocol edge cases, and data-structure correctness.
 
+Do not write source-text assertion tests that read `.rs`, `Cargo.toml`, or other implementation files and use `contains`, regular expressions, or string matching to claim behavioral or architectural correctness. Such tests do not prove that code compiles, symbols are registered, dynamic libraries export the required inventory, generic dispatch is preserved, or runtime state is installed. Verify those properties through compile-time type checks, real `dlopen`/`dlsym` integration tests, callable lifecycle hooks, and observable runtime graph/state assertions. Source inspection is allowed only in dedicated repository-policy tooling when the property is inherently textual and cannot be expressed through compilation or behavior; it must not substitute for an executable test.
+
 The project follows a TDD rhythm (RED → GREEN → commit) documented in `docs/superpowers/plans/`. Run `cargo test --workspace` before a PR; use `cargo test -p <crate>` while iterating.
 
 ## Commit & Pull Request Guidelines

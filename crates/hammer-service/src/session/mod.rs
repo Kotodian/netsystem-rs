@@ -1,7 +1,10 @@
+//! Session layer — shared in `hammer-service` (not a loadable plugin).
+
 use std::sync::Arc;
 
 use hammer_core::config::Config;
-use hammer_core::config::network::{Session, SessionBackend};
+use hammer_core::config::SessionBackend;
+use hammer_core::config::network::Session;
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_runtime::attach::AttachServer;
 
@@ -19,16 +22,17 @@ pub use id::SessionId;
 pub use node::{SESSION_QUEUE_IO_BUDGET, SessionQueueHandle, SessionQueueNext, SessionQueueNode};
 pub use runtime::SessionWorker;
 
-hammer_component_macros::declare_plugin!(name = "session", load_after = ["transport"]);
-
-#[hammer_component_macros::config_function(name = "session_config", plugin = "session")]
+#[hammer_component_macros::config_function(name = "session_config")]
 fn configure_session(config: Arc<Config>) -> HammerResult<Option<Arc<Session>>> {
-    Ok(config.network.session.clone().map(Arc::new))
+    let Some(session) = config.network.session.clone() else {
+        return Ok(None);
+    };
+    crate::transport::publish_session_backend(session.backend);
+    Ok(Some(Arc::new(session)))
 }
 
 #[hammer_component_macros::config_function(
     name = "session_attach_config",
-    plugin = "session",
     runs_after = ["session_config"]
 )]
 fn configure_attach_server(

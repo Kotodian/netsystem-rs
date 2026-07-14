@@ -7,7 +7,8 @@
 //! Session Event identity follows ADR-0010 (VPP `session_event_t` rules).
 
 use std::mem::size_of;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use hammer_infra::multi_ring_msg_queue::{
@@ -194,8 +195,8 @@ fn session_ring_cfg(q_nitems: u32, ring_nitems: u32) -> Result<[RingCfg; 2], Ses
 pub struct SessionMsgQueue<S: Segment = Local> {
     inner: MultiRingMsgQueue<S>,
     signal_atomic: AtomicBool,
-    signal_read: Option<RawFd>,
-    signal_write: Option<RawFd>,
+    signal_read: Option<Arc<OwnedFd>>,
+    signal_write: Option<Arc<OwnedFd>>,
 }
 
 impl SessionMsgQueue<Local> {
@@ -272,12 +273,39 @@ impl<S: Segment> SessionMsgQueue<S> {
     ///
     /// # Safety
     /// `hdr_offset` must point at a queue previously initialised with [`Self::init_at`].
+    /// Every supplied descriptor must be valid and transfer ownership to the
+    /// returned queue. Equal read/write values are treated as one shared eventfd.
     pub unsafe fn from_shared(
         seg: S,
         hdr_offset: u64,
         signal_read: Option<RawFd>,
         signal_write: Option<RawFd>,
     ) -> Self {
+        let (signal_read, signal_write) = match (signal_read, signal_write) {
+            (Some(read), Some(write)) if read == write => {
+                // SAFETY: the caller transfers one valid descriptor; equal values
+                // name the same open file description and must have one owner.
+                let signal = Arc::new(unsafe { OwnedFd::from_raw_fd(read) });
+                (Some(Arc::clone(&signal)), Some(signal))
+            }
+            (read, write) => {
+                let read = match read {
+                    Some(fd) => {
+                        // SAFETY: the caller transfers ownership of this descriptor.
+                        Some(Arc::new(unsafe { OwnedFd::from_raw_fd(fd) }))
+                    }
+                    None => None,
+                };
+                let write = match write {
+                    Some(fd) => {
+                        // SAFETY: the caller transfers ownership of this descriptor.
+                        Some(Arc::new(unsafe { OwnedFd::from_raw_fd(fd) }))
+                    }
+                    None => None,
+                };
+                (read, write)
+            }
+        };
         Self {
             inner: unsafe { MultiRingMsgQueue::from_shared(seg, hdr_offset) },
             signal_atomic: AtomicBool::new(false),
@@ -350,7 +378,8 @@ impl<S: Segment> SessionEventQueue for SessionMsgQueue<S> {
     }
 
     fn fire(&self) {
-        if let Some(fd) = self.signal_write {
+        if let Some(signal_write) = &self.signal_write {
+            let fd = signal_write.as_raw_fd();
             let val: [u8; 1] = [1];
             let ret = unsafe { libc::write(fd, val.as_ptr() as *const libc::c_void, 1) };
             if ret < 0 {
@@ -365,7 +394,8 @@ impl<S: Segment> SessionEventQueue for SessionMsgQueue<S> {
     }
 
     fn drain(&self) -> bool {
-        if let Some(fd) = self.signal_read {
+        if let Some(signal_read) = &self.signal_read {
+            let fd = signal_read.as_raw_fd();
             let mut buf = [0u8; 64];
             let mut woke = false;
             loop {
@@ -389,7 +419,8 @@ impl<S: Segment> SessionEventQueue for SessionMsgQueue<S> {
 
     fn clear(&self) {
         while SessionEventQueue::dequeue(self).is_some() {}
-        if let Some(fd) = self.signal_read {
+        if let Some(signal_read) = &self.signal_read {
+            let fd = signal_read.as_raw_fd();
             let mut buf = [0u8; 64];
             loop {
                 let ret =
@@ -407,7 +438,10 @@ impl<S: Segment> SessionEventQueue for SessionMsgQueue<S> {
     }
 
     fn read_fd(&self) -> Option<RawFd> {
-        self.signal_read
+        match &self.signal_read {
+            Some(signal_read) => Some(signal_read.as_raw_fd()),
+            None => None,
+        }
     }
 }
 

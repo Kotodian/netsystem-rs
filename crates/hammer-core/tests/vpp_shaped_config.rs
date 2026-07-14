@@ -1,7 +1,6 @@
 //! Functional config tests for VPP-shaped Lab startup surface (#62).
 //! Assert typed fields after parse — do not match error/message strings.
 
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use hammer_core::config::{SessionBackend, parse_config};
@@ -51,80 +50,16 @@ event_queue_length = 256
 }
 
 #[test]
-fn tcp_listen_entries_bind_typed_socket_addrs() {
-    let cfg = parse_config(
-        r#"
-[[network.tcp.listen]]
-address = "10.66.77.1:7300"
-
-[[network.tcp.listen]]
-address = "10.66.77.1:7301"
-md5_password = "lab-secret"
-"#,
-    )
-    .expect("parse tcp listen entries");
-
-    let listen = &cfg.network.tcp.listen;
-    assert_eq!(listen.len(), 2);
-    assert_eq!(
-        listen[0].address,
-        "10.66.77.1:7300".parse::<SocketAddr>().expect("addr")
-    );
-    assert!(listen[0].md5_password.is_none());
-    assert!(listen[0].ao_keys.is_empty());
-    assert_eq!(
-        listen[1].address,
-        "10.66.77.1:7301".parse::<SocketAddr>().expect("addr")
-    );
-    assert_eq!(listen[1].md5_password.as_deref(), Some("lab-secret"));
-}
-
-#[test]
-fn tcp_nagle_and_pmtu_parse_as_typed_policy() {
-    let cfg = parse_config(
+fn legacy_network_tcp_schema_is_rejected() {
+    let error = parse_config(
         r#"
 [network.tcp]
-nagle = false
-
-[network.tcp.pmtu]
-enabled = false
+mss = 1200
 "#,
     )
-    .expect("parse nagle/pmtu");
+    .expect_err("TCP schema belongs to plugin.tcp");
 
-    assert!(!cfg.network.tcp.nagle);
-    assert!(!cfg.network.tcp.pmtu.enabled);
-}
-
-#[test]
-fn tcp_nagle_and_pmtu_default_enabled() {
-    let cfg = parse_config("").expect("empty config");
-    assert!(cfg.network.tcp.nagle);
-    assert!(cfg.network.tcp.pmtu.enabled);
-    assert!(cfg.network.tcp.listen.is_empty());
-}
-
-#[test]
-fn tcp_ao_keys_parse_on_listen_entry() {
-    let cfg = parse_config(
-        r#"
-[[network.tcp.listen]]
-address = "10.66.77.1:7300"
-
-[[network.tcp.listen.ao_keys]]
-key_id = 1
-rnext_key_id = 2
-key = "ao-material"
-"#,
-    )
-    .expect("parse ao keys");
-
-    assert_eq!(cfg.network.tcp.listen.len(), 1);
-    let keys = &cfg.network.tcp.listen[0].ao_keys;
-    assert_eq!(keys.len(), 1);
-    assert_eq!(keys[0].key_id, 1);
-    assert_eq!(keys[0].rnext_key_id, 2);
-    assert_eq!(keys[0].key, "ao-material");
+    assert!(error.to_string().contains("tcp"));
 }
 
 #[test]
@@ -144,20 +79,9 @@ fn lab_toml_example_parses_to_locked_topology() {
     );
     assert_eq!(session.pool_capacity, 64);
     assert_eq!(session.ready_queue_capacity, 256);
-    assert!(cfg.network.tcp.nagle);
-    assert!(cfg.network.tcp.pmtu.enabled);
-    assert_eq!(cfg.network.tcp.time_wait, Duration::from_secs(2));
-    assert_eq!(cfg.network.tcp.keepalive.idle, Duration::from_secs(3));
-    assert_eq!(
-        cfg.network.tcp.keepalive.probe_interval,
-        Duration::from_secs(1)
-    );
-    assert_eq!(cfg.network.tcp.keepalive.probe_limit, 3);
-    assert_eq!(cfg.network.tcp.listen.len(), 1);
-    assert_eq!(
-        cfg.network.tcp.listen[0].address,
-        "10.66.77.1:7300".parse::<SocketAddr>().expect("listen")
-    );
+    let tcp = cfg.plugin_toml_text("tcp").expect("TCP plugin TOML");
+    assert!(tcp.contains("time_wait = \"2s\""));
+    assert!(tcp.contains("probe_limit = 3"));
     assert_eq!(cfg.network.interface.len(), 1);
     assert_eq!(cfg.network.interface[0].name, "utun");
     assert_eq!(

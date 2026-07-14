@@ -1,0 +1,12 @@
+[package]
+name = "hammer-plugin-ip"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "hammer_plugin_ip"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+hammer-core = { path = "../../hammer-core" }

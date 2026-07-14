@@ -1,0 +1,29 @@
+[package]
+name = "hammer-plugin-tcp"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "hammer_plugin_tcp"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+hammer-core = { path = "../../../hammer-core" }
+hammer-infra = { path = "../../../hammer-infra" }
+hammer-runtime = { path = "../../../hammer-runtime", default-features = false }
+hammer-service = { path = "../../../hammer-service", default-features = false }
+hammer-component-macros = { path = "../../../hammer-component-macros" }
+arc-swap = { workspace = true }
+crossbeam-utils = { workspace = true }
+bitflags = "2.10"
+humantime-serde = { workspace = true }
+linkme = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+ipnet = { workspace = true }
+etherparse = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

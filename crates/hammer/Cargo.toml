@@ -12,7 +12,11 @@ path = "src/main.rs"
 hammer-runtime = { path = "../hammer-runtime" }
 hammer-infra = { path = "../hammer-infra" }
 hammer-ipc = { path = "../hammer-ipc" }
-hammer-service = { path = "../hammer-service", features = ["plugins-lab"] }
+hammer-service = { path = "../hammer-service" }
+hammer-plugin-tun = { path = "../hammer-plugins/device/tun" }
+hammer-plugin-tcp = { path = "../hammer-plugins/transport/tcp" }
+hammer-plugin-udp = { path = "../hammer-plugins/transport/udp" }
+hammer-plugin-ip = { path = "../hammer-plugins/ip" }
 hammer-core = { path = "../hammer-core" }
 hammer-component-macros = { path = "../hammer-component-macros" }
 clap = { workspace = true, features = ["derive"] }

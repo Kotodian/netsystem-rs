@@ -87,7 +87,7 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
         }
     }
 
-    pub(crate) fn detach_session(&mut self, session_id: SessionId) -> Option<Arc<AppSession<S>>> {
+    pub fn detach_session(&mut self, session_id: SessionId) -> Option<Arc<AppSession<S>>> {
         let slot = session_id.pool_index().slot() as usize;
         if let Some(entry) = self.sessions_by_index.get_mut(slot) {
             *entry = None;
@@ -95,7 +95,7 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
         self.sessions.remove(&session_id.get())
     }
 
-    pub(crate) fn connected(&self, session_id: SessionId) -> CoreResult<()>
+    pub fn connected(&self, session_id: SessionId) -> CoreResult<()>
     where
         Self: SessionAppRuntimeCreate<S>,
     {
@@ -109,7 +109,7 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
         Ok(())
     }
 
-    pub(crate) fn closed(&self, session_id: SessionId) -> CoreResult<()>
+    pub fn closed(&self, session_id: SessionId) -> CoreResult<()>
     where
         Self: SessionAppRuntimeCreate<S>,
     {
@@ -123,7 +123,7 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
         Ok(())
     }
 
-    pub(crate) fn discard_acked_tx_bytes(
+    pub fn discard_acked_tx_bytes(
         &mut self,
         session_id: SessionId,
         len: usize,
@@ -149,18 +149,18 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
             .filter(|len| *len != 0))
     }
 
-    pub(crate) fn rx_available_len(&self, session_id: SessionId) -> Option<usize> {
+    pub fn rx_available_len(&self, session_id: SessionId) -> Option<usize> {
         self.sessions
             .lookup(&session_id.get())
             .map(|session| session.rx_fifo().max_enqueue())
     }
 
     #[inline]
-    pub(crate) fn has_pending_send(&self, session_id: SessionId) -> bool {
+    pub fn has_pending_send(&self, session_id: SessionId) -> bool {
         self.pending_send_len(session_id).ok().flatten().is_some()
     }
 
-    pub(crate) fn copy_tx_to_buffer(
+    pub fn copy_tx_to_buffer(
         &self,
         session_id: SessionId,
         tx_offset: usize,
@@ -189,7 +189,7 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
         Ok(())
     }
 
-    pub(crate) fn copy_rx_from_buffer(
+    pub fn copy_rx_from_buffer(
         &self,
         session_id: SessionId,
         buffers: &DataPlaneBuffers,
@@ -251,7 +251,7 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
         Ok(delivery)
     }
 
-    pub(crate) fn copy_rx_from_buffer_ooo(
+    pub fn copy_rx_from_buffer_ooo(
         &self,
         session_id: SessionId,
         buffers: &DataPlaneBuffers,
@@ -304,13 +304,13 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
         Ok((accepted, newest))
     }
 
-    pub(crate) fn discard_all_tx_bytes_for_session(&mut self, session_id: SessionId) {
+    pub fn discard_all_tx_bytes_for_session(&mut self, session_id: SessionId) {
         if let Some(session) = self.sessions.lookup(&session_id.get()) {
             let _ = session.drop_tx_acked(session.tx_fifo().max_dequeue());
         }
     }
 
-    pub(crate) fn drain_tx_events_to(
+    pub fn drain_tx_events_to(
         &self,
         mut dispatch_event: impl FnMut(SessionId, SessionEvtType),
     ) -> usize {

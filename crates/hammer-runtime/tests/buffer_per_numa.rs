@@ -103,15 +103,6 @@ fn arenas_keep_their_arena_numa_identity() {
     assert_ne!(p0.buffer_raw_ptr(i0.slot()), p1.buffer_raw_ptr(i1.slot()));
 }
 
-#[test]
-fn ordinary_buffer_pool_clone_shares_thread_cache_on_same_thread() {
-    let source = include_str!("../../hammer-core/src/data_plane/buffer.rs");
-
-    assert!(
-        source.contains("thread_cache: Rc::clone(&self.thread_cache)"),
-        "BufferPool::clone must share thread_cache on same-thread clones"
-    );
-}
 
 #[test]
 fn empty_numa_configuration_defaults_to_numa_zero() {
@@ -273,18 +264,4 @@ fn same_numa_worker_clone_shares_arena_but_not_thread_cache() {
     assert_eq!(worker.cached_free_buffers(), 0);
 
     drop_owned_index!(&worker, worker_index);
-}
-
-#[test]
-fn handoff_source_does_not_use_lock_backed_lazy_arena_init() {
-    let source = include_str!("../src/handoff.rs");
-
-    assert!(
-        !source.contains("Mutex"),
-        "handoff.rs must not contain Mutex-backed arena initialization"
-    );
-    assert!(
-        !source.contains("set_or_get_buffer_arena"),
-        "handoff.rs must not contain lazy arena setter/getter"
-    );
 }

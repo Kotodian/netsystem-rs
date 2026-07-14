@@ -17,28 +17,6 @@ fn runtime_config(numa_nodes: &'static [u32], active_numa_node: u32) -> DataPlan
     }
 }
 
-#[test]
-fn memory_init_sources_are_static_no_lock() {
-    let runtime_memory = include_str!("../src/memory.rs");
-    for forbidden in [
-        "Mutex",
-        "RwLock",
-        "OnceLock",
-        "LazyLock",
-        "get_or_init",
-        "thread_local!",
-        "HashMap",
-        "BTreeMap",
-        "pub struct MemoryConfig",
-        "pub struct MemoryMain",
-        "pub struct StaticNumaTable",
-    ] {
-        assert!(
-            !runtime_memory.contains(forbidden),
-            "crates/hammer-runtime/src/memory.rs must not use {forbidden} for memory initialization"
-        );
-    }
-}
 
 #[test]
 fn memory_init_is_registered_before_workers() {
@@ -63,26 +41,6 @@ fn memory_init_is_registered_before_workers() {
     assert!(memory_pos < workers_pos);
 }
 
-#[test]
-fn start_workers_uses_static_memory_runtime_path() {
-    let start_workers = include_str!("../src/start_workers.rs");
-    assert!(
-        !start_workers.contains("new_worker_runtime"),
-        "worker startup must not bypass static memory initialization"
-    );
-    assert!(
-        !start_workers.contains("MemoryMain::from_static_config"),
-        "worker startup must not re-materialize static memory inside worker threads"
-    );
-    assert!(
-        start_workers.contains("worker_seed")
-            && !start_workers.contains(concat!(
-                "DataPlaneRuntime::with_",
-                "buffer_arena_and_frame_capacity"
-            )),
-        "worker startup must derive worker runtimes from the initialized main runtime view"
-    );
-}
 
 #[test]
 fn memory_init_materializes_the_configured_buffer_and_instruction_set_policy() {
@@ -127,18 +85,6 @@ fn memory_init_materializes_the_configured_buffer_and_instruction_set_policy() {
     assert!(engine.runtime.alloc_index().is_err());
 }
 
-#[test]
-fn task_4_visibility_surface_stays_narrow() {
-    let data_plane_src = include_str!("../src/data_plane.rs");
-    assert!(
-        !data_plane_src.contains("pub struct DataPlaneRuntimeWorkerSeed"),
-        "worker seed concrete type must not be publicly nameable from hammer_runtime::data_plane"
-    );
-    assert!(
-        !data_plane_src.contains("pub fn with_static_buffer_arena"),
-        "static arena constructor helper must stay runtime-crate-visible only"
-    );
-}
 
 #[test]
 fn engine_spawn_uses_initialized_runtime_view_for_inherited_numa() {

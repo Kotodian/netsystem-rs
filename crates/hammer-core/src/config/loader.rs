@@ -105,7 +105,6 @@ fn merge_config(dst: &mut Config, src: &Config) {
     dst.trace.record_capacity = src.trace.record_capacity;
     dst.trace.packet_capacity = src.trace.packet_capacity;
     dst.trace.inputs.extend(src.trace.inputs.clone());
-    dst.network.tcp = src.network.tcp.clone();
     dst.network.ip = src.network.ip.clone();
     if src.network.session.is_some() {
         dst.network.session = src.network.session.clone();

@@ -40,7 +40,8 @@ pub use plugin::{
     select_loaded_plugins_from, validate_catalog_semver,
 };
 pub use plugin_loader::{
-    collect_plugin_inventory, plugin_cdylib_filename, plugin_cdylib_path, LoadTransaction,
+    LoadTransaction, built_plugin_cdylib_path, collect_plugin_inventory, plugin_cdylib_filename,
+    plugin_cdylib_path, read_plugin_registration, workspace_target_dir,
 };
 pub use trace::{
     PacketTrace, TraceControlHandle, TraceControlPlane, TraceEntry, TraceFormatter,

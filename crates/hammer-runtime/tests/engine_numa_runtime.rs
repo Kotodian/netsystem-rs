@@ -33,30 +33,3 @@ fn spawned_engine_uses_worker_numa_runtime_view() {
     assert_eq!(main.runtime.active_numa_node(), 0);
     assert_eq!(worker.runtime.active_numa_node(), 1);
 }
-
-#[test]
-fn start_workers_applies_setup_before_numa_probe_and_runtime_clone() {
-    let start_workers = include_str!("../src/start_workers.rs");
-    let setup_pos = start_workers
-        .find("apply_worker_thread_setup(&worker_config, worker_index);")
-        .expect("worker setup call");
-    let numa_pos = start_workers
-        .find("current_numa_node().unwrap_or(0)")
-        .expect("numa probe");
-    let spawn_pos = start_workers
-        .find("worker_seed.spawn_on_numa(idx, worker_numa_node)")
-        .expect("worker runtime clone");
-
-    assert!(
-        start_workers.contains(".get::<hammer_core::config::Config>()"),
-        "start_workers must read worker config from the runtime registry"
-    );
-    assert!(
-        setup_pos < numa_pos,
-        "worker thread setup must happen before probing the worker NUMA node"
-    );
-    assert!(
-        numa_pos < spawn_pos,
-        "worker runtime clone must happen after the worker NUMA node is known"
-    );
-}

@@ -1,4 +1,4 @@
-//! `[network]` config section: dataplane protocol parameters (tcp/ip/session/interface).
+//! `[network]` config section: shared IP, session, and interface parameters.
 //!
 //! Single-layer schema: each struct directly deserializes from TOML. Container
 //! `#[serde(default)]` fills missing fields from each struct's `Default` impl
@@ -11,9 +11,6 @@
 #![allow(clippy::derivable_impls)]
 //!
 //! Defaults are derived from the production constants in `hammer-service`:
-//! - TCP: `transport/tcp/output.rs::DEFAULT_TCP_OUTPUT_PAYLOAD_LEN`,
-//!   `transport/tcp/connection.rs::{DEFAULT_TCP_WINDOW,TCP_*_RETRANSMIT_TIMEOUT,
-//!   TCP_TIME_WAIT_TICKS,TCP_PAWS_IDLE,TcpKeepaliveConfig::default}`.
 //! - IP reassembly: `net/ip/reassembly.rs::{DEFAULT_REASSEMBLY_TIMEOUT,
 //!   DEFAULT_MAX_REASSEMBLIES,DEFAULT_MAX_FRAGMENTS_PER_REASSEMBLY}`.
 //! - Session: `session/runtime.rs::{DEFAULT_SESSION_TIMER_TICK,
@@ -32,21 +29,6 @@ use super::constants as C;
 use super::route::{Route, validate_routes};
 use hammer_infra::vec::Vec;
 
-// TCP defaults (transport/tcp/output.rs / connection.rs).
-const TCP_MSS: usize = 1_440;
-const TCP_WINDOW: u32 = u16::MAX as u32;
-const TCP_INITIAL_RTO: Duration = Duration::from_millis(50);
-const TCP_MIN_RTO: Duration = Duration::from_millis(50);
-const TCP_MAX_RTO: Duration = Duration::from_secs(60);
-// TCP_TIME_WAIT_TICKS = 6000 at a 100ms timer tick → 600s. The dataplane timer
-// tick is configurable via [network.session].timer_tick; this config expresses
-// the wait as a wall-clock duration so it stays correct regardless of tick.
-const TCP_TIME_WAIT: Duration = Duration::from_secs(600);
-const TCP_PAWS_IDLE: Duration = Duration::from_secs(24 * 86_400);
-const KEEPALIVE_IDLE: Duration = Duration::from_secs(75);
-const KEEPALIVE_PROBE_INTERVAL: Duration = Duration::from_secs(75);
-const KEEPALIVE_PROBE_LIMIT: u8 = 8;
-
 // IP reassembly defaults (net/ip/reassembly.rs).
 const REASSEMBLY_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_REASSEMBLIES: usize = 1_024;
@@ -64,7 +46,6 @@ const SESSION_BUFFER_SLOTS: usize = 1;
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Network {
-    pub tcp: Tcp,
     pub ip: Ip,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<Session>,
@@ -77,7 +58,6 @@ pub struct Network {
 impl Default for Network {
     fn default() -> Self {
         Self {
-            tcp: Tcp::default(),
             ip: Ip::default(),
             session: None,
             interface: Vec::new(),
@@ -92,7 +72,6 @@ impl Network {
     }
 
     pub fn validate(&self) -> HammerResult<()> {
-        self.tcp.validate()?;
         self.ip.validate()?;
         if let Some(session) = &self.session {
             session.validate()?;
@@ -175,224 +154,6 @@ fn host_prefix(cidr: IpNet) -> IpNet {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct Tcp {
-    pub mss: usize,
-    pub receive_window: u32,
-    pub congestion: CongestionController,
-    /// Nagle coalescing; default on (orthogonal to pacing).
-    pub nagle: bool,
-    #[serde(with = "humantime_serde")]
-    pub time_wait: Duration,
-    #[serde(with = "humantime_serde")]
-    pub paws_idle: Duration,
-    pub retransmit: Retransmit,
-    pub keepalive: Keepalive,
-    pub pmtu: Pmtu,
-    /// Config-driven listeners applied at network init (not CLI bind).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub listen: Vec<TcpListen>,
-}
-
-impl Default for Tcp {
-    fn default() -> Self {
-        Self {
-            mss: TCP_MSS,
-            receive_window: TCP_WINDOW,
-            congestion: CongestionController::Bbr,
-            nagle: true,
-            time_wait: TCP_TIME_WAIT,
-            paws_idle: TCP_PAWS_IDLE,
-            retransmit: Retransmit::default(),
-            keepalive: Keepalive::default(),
-            pmtu: Pmtu::default(),
-            listen: Vec::new(),
-        }
-    }
-}
-
-impl Tcp {
-    fn validate(&self) -> HammerResult<()> {
-        if self.mss == 0 {
-            return Err(HammerError::config_validation(
-                "network.tcp.mss must be non-zero",
-            ));
-        }
-        if self.receive_window == 0 {
-            return Err(HammerError::config_validation(
-                "network.tcp.receive_window must be non-zero",
-            ));
-        }
-        if self.time_wait.is_zero() {
-            return Err(HammerError::config_validation(
-                "network.tcp.time_wait must be non-zero",
-            ));
-        }
-        if self.paws_idle.is_zero() {
-            return Err(HammerError::config_validation(
-                "network.tcp.paws_idle must be non-zero",
-            ));
-        }
-        self.retransmit.validate()?;
-        self.keepalive.validate()?;
-        self.pmtu.validate()?;
-        for entry in &self.listen {
-            entry.validate()?;
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct Pmtu {
-    pub enabled: bool,
-}
-
-impl Default for Pmtu {
-    fn default() -> Self {
-        Self { enabled: true }
-    }
-}
-
-impl Pmtu {
-    fn validate(&self) -> HammerResult<()> {
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct TcpListen {
-    pub address: std::net::SocketAddr,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub md5_password: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ao_keys: Vec<TcpAoKey>,
-}
-
-impl TcpListen {
-    fn validate(&self) -> HammerResult<()> {
-        if self.md5_password.is_some() && !self.ao_keys.is_empty() {
-            return Err(HammerError::config_validation(
-                "network.tcp.listen md5_password and ao_keys are mutually exclusive",
-            ));
-        }
-        for key in &self.ao_keys {
-            key.validate()?;
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct TcpAoKey {
-    pub key_id: u8,
-    pub rnext_key_id: u8,
-    pub key: String,
-}
-
-impl TcpAoKey {
-    fn validate(&self) -> HammerResult<()> {
-        if self.key.is_empty() {
-            return Err(HammerError::config_validation(
-                "network.tcp.listen.ao_keys.key must be non-empty",
-            ));
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct Retransmit {
-    #[serde(with = "humantime_serde")]
-    pub initial: Duration,
-    #[serde(with = "humantime_serde")]
-    pub min: Duration,
-    #[serde(with = "humantime_serde")]
-    pub max: Duration,
-}
-
-impl Default for Retransmit {
-    fn default() -> Self {
-        Self {
-            initial: TCP_INITIAL_RTO,
-            min: TCP_MIN_RTO,
-            max: TCP_MAX_RTO,
-        }
-    }
-}
-
-impl Retransmit {
-    fn validate(&self) -> HammerResult<()> {
-        if self.initial.is_zero() {
-            return Err(HammerError::config_validation(
-                "network.tcp.retransmit.initial must be non-zero",
-            ));
-        }
-        if self.min.is_zero() {
-            return Err(HammerError::config_validation(
-                "network.tcp.retransmit.min must be non-zero",
-            ));
-        }
-        if self.max.is_zero() {
-            return Err(HammerError::config_validation(
-                "network.tcp.retransmit.max must be non-zero",
-            ));
-        }
-        if self.min > self.initial {
-            return Err(HammerError::config_validation(
-                "network.tcp.retransmit.min must not exceed initial",
-            ));
-        }
-        if self.initial > self.max {
-            return Err(HammerError::config_validation(
-                "network.tcp.retransmit.initial must not exceed max",
-            ));
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct Keepalive {
-    #[serde(with = "humantime_serde")]
-    pub idle: Duration,
-    #[serde(with = "humantime_serde")]
-    pub probe_interval: Duration,
-    pub probe_limit: u8,
-}
-
-impl Default for Keepalive {
-    fn default() -> Self {
-        Self {
-            idle: KEEPALIVE_IDLE,
-            probe_interval: KEEPALIVE_PROBE_INTERVAL,
-            probe_limit: KEEPALIVE_PROBE_LIMIT,
-        }
-    }
-}
-
-impl Keepalive {
-    fn validate(&self) -> HammerResult<()> {
-        if self.idle.is_zero() {
-            return Err(HammerError::config_validation(
-                "network.tcp.keepalive.idle must be non-zero",
-            ));
-        }
-        if self.probe_interval.is_zero() {
-            return Err(HammerError::config_validation(
-                "network.tcp.keepalive.probe_interval must be non-zero",
-            ));
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionBackend {
@@ -404,18 +165,6 @@ pub enum SessionBackend {
 impl Default for SessionBackend {
     fn default() -> Self {
         Self::Local
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CongestionController {
-    Bbr,
-}
-
-impl Default for CongestionController {
-    fn default() -> Self {
-        Self::Bbr
     }
 }
 
@@ -615,22 +364,6 @@ mod tests {
     #[test]
     fn network_defaults_match_production_constants() {
         let network = Network::default();
-        assert_eq!(network.tcp.mss, TCP_MSS);
-        assert_eq!(network.tcp.receive_window, TCP_WINDOW);
-        assert!(network.tcp.nagle);
-        assert!(network.tcp.pmtu.enabled);
-        assert!(network.tcp.listen.is_empty());
-        assert_eq!(network.tcp.retransmit.initial, TCP_INITIAL_RTO);
-        assert_eq!(network.tcp.retransmit.min, TCP_MIN_RTO);
-        assert_eq!(network.tcp.retransmit.max, TCP_MAX_RTO);
-        assert_eq!(network.tcp.time_wait, TCP_TIME_WAIT);
-        assert_eq!(network.tcp.paws_idle, TCP_PAWS_IDLE);
-        assert_eq!(network.tcp.keepalive.idle, KEEPALIVE_IDLE);
-        assert_eq!(
-            network.tcp.keepalive.probe_interval,
-            KEEPALIVE_PROBE_INTERVAL
-        );
-        assert_eq!(network.tcp.keepalive.probe_limit, KEEPALIVE_PROBE_LIMIT);
         assert_eq!(network.ip.reassembly.timeout, REASSEMBLY_TIMEOUT);
         assert_eq!(network.ip.reassembly.max_reassemblies, MAX_REASSEMBLIES);
         assert_eq!(
@@ -658,21 +391,6 @@ mod tests {
     #[test]
     fn parse_network_full() {
         let input = r#"
-            [tcp]
-            mss = 1200
-            receive_window = 32768
-            congestion = "bbr"
-            time_wait = "30s"
-            paws_idle = "12h"
-            [tcp.retransmit]
-            initial = "100ms"
-            min = "100ms"
-            max = "30s"
-            [tcp.keepalive]
-            idle = "60s"
-            probe_interval = "30s"
-            probe_limit = 4
-
             [ip.reassembly]
             timeout = "200ms"
             max_reassemblies = 512
@@ -698,13 +416,6 @@ mod tests {
         "#;
         let network = parse_inner(input);
         network.validate().expect("build");
-        assert_eq!(network.tcp.mss, 1200);
-        assert_eq!(network.tcp.receive_window, 32768);
-        assert_eq!(network.tcp.congestion, CongestionController::Bbr);
-        assert_eq!(network.tcp.time_wait, Duration::from_secs(30));
-        assert_eq!(network.tcp.paws_idle, Duration::from_secs(12 * 3600));
-        assert_eq!(network.tcp.retransmit.initial, Duration::from_millis(100));
-        assert_eq!(network.tcp.keepalive.probe_limit, 4);
         assert_eq!(network.ip.reassembly.max_reassemblies, 512);
         let session = network.session.as_ref().expect("configured session");
         assert_eq!(session.timer_tick, Duration::from_millis(5));
@@ -717,14 +428,14 @@ mod tests {
 
     #[test]
     fn parse_network_partial_fill_uses_defaults() {
-        // Only override mss; everything else must keep production defaults.
-        let network = parse_inner("[tcp]\nmss = 1200\n");
+        let network = parse_inner("[ip.reassembly]\nmax_reassemblies = 512\n");
         network.validate().expect("build");
-        assert_eq!(network.tcp.mss, 1200);
-        assert_eq!(network.tcp.receive_window, TCP_WINDOW);
-        assert_eq!(network.tcp.time_wait, TCP_TIME_WAIT);
+        assert_eq!(network.ip.reassembly.max_reassemblies, 512);
+        assert_eq!(
+            network.ip.reassembly.max_fragments_per_reassembly,
+            MAX_FRAGMENTS_PER_REASSEMBLY
+        );
         assert!(network.session.is_none());
-        assert_eq!(network.ip.reassembly.max_reassemblies, MAX_REASSEMBLIES);
     }
 
     #[test]
@@ -745,28 +456,6 @@ mod tests {
         )
         .expect_err("parse should reject unknown interface fields");
         assert!(err.to_string().contains("driver") || err.to_string().contains("unknown"));
-    }
-
-    #[test]
-    fn parse_network_rejects_zero_mss() {
-        let err = parse_inner("[tcp]\nmss = 0\n")
-            .validate()
-            .expect_err("reject");
-        assert!(err.to_string().contains("network.tcp.mss must be non-zero"));
-    }
-
-    #[test]
-    fn parse_network_rejects_retransmit_min_exceeds_initial() {
-        let input = r#"
-            [tcp.retransmit]
-            initial = "50ms"
-            min = "100ms"
-        "#;
-        let err = parse_inner(input).validate().expect_err("reject");
-        assert!(
-            err.to_string()
-                .contains("retransmit.min must not exceed initial")
-        );
     }
 
     #[test]

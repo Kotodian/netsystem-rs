@@ -23,7 +23,7 @@ pub struct SessionQueueHandle<Q> {
 
 impl<Q> SessionQueueHandle<Q> {
     #[inline]
-    pub(crate) const fn new(runtime_data: NodeRuntimeData) -> Self {
+    pub const fn new(runtime_data: NodeRuntimeData) -> Self {
         Self {
             runtime_data,
             _queue: PhantomData,
@@ -31,12 +31,12 @@ impl<Q> SessionQueueHandle<Q> {
     }
 
     #[inline]
-    pub(crate) const fn runtime_data(self) -> NodeRuntimeData {
+    pub const fn runtime_data(self) -> NodeRuntimeData {
         self.runtime_data
     }
 
     #[inline]
-    pub(crate) fn borrow_mut(self) -> CoreResult<RefMut<'static, Q>>
+    pub fn borrow_mut(self) -> CoreResult<RefMut<'static, Q>>
     where
         Q: 'static,
     {
@@ -80,7 +80,7 @@ impl SessionQueueNext {
     }
 }
 
-pub(crate) type SessionQueueDispatchFn = fn(
+pub type SessionQueueDispatchFn = fn(
     &DataPlaneRuntime,
     NodeRuntimeData,
     SessionQueueNext,
@@ -165,7 +165,6 @@ struct SessionQueueAttachment {
     init = crate::session::node::register_session_queue_node,
     name = "session-queue",
     kind = driver,
-    plugin = "session",
 )]
 #[derive(Clone)]
 pub struct SessionQueueNode {
@@ -199,7 +198,7 @@ impl SessionQueueNode {
         })
     }
 
-    pub(crate) fn attach_queue_by_runtime_data<Q>(
+    pub fn attach_queue_by_runtime_data<Q>(
         runtime: &DataPlaneRuntime,
         consumer: NodeId,
         runtime_data: NodeRuntimeData,
@@ -226,13 +225,13 @@ impl SessionQueueNode {
         })
     }
 
-    pub(crate) fn registered_runtime_data() -> CoreResult<NodeRuntimeData> {
+    pub fn registered_runtime_data() -> CoreResult<NodeRuntimeData> {
         SESSION_QUEUE_NODE_RUNTIME_DATA
             .with(|data| data.get())
             .ok_or_else(|| CoreError::internal("session queue node not registered"))
     }
 
-    pub(crate) fn registered_node_id() -> CoreResult<NodeId> {
+    pub fn registered_node_id() -> CoreResult<NodeId> {
         SESSION_QUEUE_NODE_ID
             .with(|data| data.get())
             .ok_or_else(|| CoreError::internal("session queue node not registered"))
@@ -308,7 +307,7 @@ fn session_queue_node_process(
     NodeResult::drop()
 }
 
-pub(crate) fn register_session_queue<Q: 'static>(queue: Q) -> CoreResult<SessionQueueHandle<Q>> {
+pub fn register_session_queue<Q: 'static>(queue: Q) -> CoreResult<SessionQueueHandle<Q>> {
     let queue = Box::leak(Box::new(RefCell::new(queue)));
     let runtime_data = session_queue_node_runtime_data(queue)?;
     Ok(SessionQueueHandle::new(runtime_data))

@@ -23,26 +23,39 @@ fn semver_accepts_compatible_host() {
 
 #[test]
 fn configured_roots_expand_hard_load_after_dependencies() {
+    // Shared infra (device / interface / transport) is not a plugin.
     let catalog = [
         PluginRegistration {
-            name: "device",
+            name: "ip",
             version: "0.1.0",
             version_required: "0.1.0",
             load_after: &[],
         },
         PluginRegistration {
-            name: "interface",
+            name: "session",
             version: "0.1.0",
             version_required: "0.1.0",
-            load_after: &["device"],
+            load_after: &[],
+        },
+        PluginRegistration {
+            name: "tcp",
+            version: "0.1.0",
+            version_required: "0.1.0",
+            load_after: &["session"],
         },
         PluginRegistration {
             name: "tun",
             version: "0.1.0",
             version_required: "0.1.0",
-            load_after: &["device", "interface"],
+            load_after: &[],
+        },
+        PluginRegistration {
+            name: "udp",
+            version: "0.1.0",
+            version_required: "0.1.0",
+            load_after: &[],
         },
     ];
-    let ordered = select_and_expand_plugins(&["tun".into()], &catalog).expect("expand");
-    assert_eq!(ordered, ["device", "interface", "tun"]);
+    let ordered = select_and_expand_plugins(&["tcp".into()], &catalog).expect("expand");
+    assert_eq!(ordered, ["session", "tcp"]);
 }

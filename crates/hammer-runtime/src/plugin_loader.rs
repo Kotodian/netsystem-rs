@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use hammer_core::plugin::PluginRegistration;
 use hammer_infra::vec::Vec;
 use libloading::Library;
 
@@ -66,6 +67,16 @@ impl LoadTransaction {
             .get(name)
             .and_then(|held| held.library.as_ref())
             .is_some()
+    }
+
+    /// `dlsym` registration from a held library.
+    pub fn registration(&self, name: &str) -> Result<&'static PluginRegistration, String> {
+        let library = self
+            .held
+            .get(name)
+            .and_then(|held| held.library.as_ref())
+            .ok_or_else(|| format!("plugin `{name}` is not held"))?;
+        read_plugin_registration(library)
     }
 
     /// Open a cdylib and retain it under `name` (refcount +1).
@@ -153,4 +164,46 @@ pub fn collect_plugin_inventory<T>(
         out.extend(slice.iter());
     }
     Ok(out)
+}
+
+/// `dlsym` the plugin registration export (`hammer_plugin_registration`).
+///
+/// The symbol returns a pointer to a static `PluginRegistration` owned by the
+/// cdylib (Rust layout; not a C registration block).
+pub fn read_plugin_registration(library: &Library) -> Result<&'static PluginRegistration, String> {
+    type RegistrationFn = unsafe extern "C" fn() -> *const PluginRegistration;
+    let symbol = unsafe { library.get::<RegistrationFn>(b"hammer_plugin_registration\0") }
+        .map_err(|err| err.to_string())?;
+    let ptr = unsafe { symbol() };
+    if ptr.is_null() {
+        return Err("hammer_plugin_registration returned null".into());
+    }
+    Ok(unsafe { &*ptr })
+}
+
+/// Workspace `target/{debug,release}` directory for integration tests.
+pub fn workspace_target_dir() -> PathBuf {
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
+        return PathBuf::from(dir).join(profile);
+    }
+    let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    dir.pop(); // crates/
+    dir.pop(); // workspace root
+    dir.join("target").join(profile)
+}
+
+/// Resolve a built `libhammer_plugin_<name>.{dylib,so}` under the workspace target dir.
+pub fn built_plugin_cdylib_path(plugin_name: &str) -> PathBuf {
+    let target = workspace_target_dir();
+    let primary = plugin_cdylib_path(&target, plugin_name);
+    if primary.is_file() {
+        return primary;
+    }
+    // Path-dep builds place the cdylib under `deps/`.
+    plugin_cdylib_path(&target.join("deps"), plugin_name)
 }

@@ -2413,7 +2413,7 @@ fn inject_plugin_into_item(item: &mut Item, plugin_name: &LitStr) -> Result<()> 
 /// cannot inject ownership tags — see [`plugin`].
 ///
 /// ```ignore
-/// hammer_component_macros::declare_plugin!(name = "tun", load_after = ["device", "interface"]);
+/// hammer_component_macros::declare_plugin!(name = "tun", load_after = []);
 ///
 /// #[graph_node(..., plugin = "tun")]
 /// struct TunInputDriverNode;

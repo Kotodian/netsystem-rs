@@ -1,7 +1,7 @@
 pub mod ip;
 mod lookup;
 
-hammer_component_macros::declare_plugin!(name = "ip", load_after = ["interface"]);
+hammer_component_macros::declare_plugin!(name = "ip", load_after = []);
 
 pub use crate::opaque::{ForwardingMetadata, IpEcnCodepoint, NetworkOpaque, TapEthernetMetadata};
 pub use ip::{
@@ -26,8 +26,7 @@ pub use lookup::{
 
 pub(crate) use lookup::wire_ip_lookup_drop;
 
-#[cfg(test)]
-pub(crate) fn reset_ip_main_for_test() {
+pub fn reset_ip_main_for_test() {
     lookup::reset_for_test();
     reset_path_mtu_cache_for_test();
 }

@@ -7,20 +7,6 @@ publish.workspace = true
 [lib]
 name = "hammer_service"
 
-[features]
-default = ["plugins-lab"]
-plugins-lab = [
-  "plugin-device", "plugin-interface", "plugin-tun", "plugin-ip",
-  "plugin-transport", "plugin-session", "plugin-tcp", "plugin-udp",
-]
-plugin-device = []
-plugin-interface = ["plugin-device"]
-plugin-tun = ["plugin-device", "plugin-interface"]
-plugin-ip = ["plugin-interface"]
-plugin-transport = ["plugin-ip"]
-plugin-session = ["plugin-transport"]
-plugin-tcp = ["plugin-session", "plugin-transport"]
-plugin-udp = ["plugin-transport"]
 
 [dependencies]
 arc-swap = { workspace = true }

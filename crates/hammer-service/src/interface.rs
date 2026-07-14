@@ -18,8 +18,6 @@ use hammer_runtime::{
 };
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 
-hammer_component_macros::declare_plugin!(name = "interface", load_after = ["device"]);
-
 use crate::data_plane::set_index_node_error_code;
 use crate::net::{DpoId, DpoProto, FibTableBuilder, FibTableHandle, NetworkOpaque};
 use crate::trace::codec::{TraceDecodeCursor, put_option_u16, put_option_u32};
@@ -339,8 +337,7 @@ impl InterfaceControlPlane {
 /// `interface_init` from `[[network.interface]]` only — no device open.
 pub static INTERFACE_MAIN: ArcSwapOption<InterfaceControlPlane> = ArcSwapOption::const_empty();
 
-#[cfg(test)]
-pub(crate) fn reset_interface_main_for_test() {
+pub fn reset_interface_main_for_test() {
     INTERFACE_MAIN.store(None);
 }
 
@@ -350,7 +347,7 @@ pub fn init(reg: &RuntimeRegistry) -> HammerResult<()> {
     Ok(())
 }
 
-#[hammer_component_macros::init_function(name = "interface_init", plugin = "interface")]
+#[hammer_component_macros::init_function(name = "interface_init")]
 fn init_interface(config: Arc<Config>) -> HammerResult<Arc<InterfaceControlPlane>> {
     let plane = InterfaceControlPlane::new();
     for iface in &config.network.interface {

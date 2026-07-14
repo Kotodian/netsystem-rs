@@ -10,6 +10,10 @@ use hammer_runtime::new_worker_runtime;
 
 // Force-link service init/graph distributed slices into the daemon binary.
 use hammer_infra::vec::Vec;
+use hammer_plugin_ip as _;
+use hammer_plugin_tcp as _;
+use hammer_plugin_tun as _;
+use hammer_plugin_udp as _;
 use hammer_service as _;
 
 mod ipc_handlers;

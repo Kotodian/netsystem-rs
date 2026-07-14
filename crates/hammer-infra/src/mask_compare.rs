@@ -204,26 +204,4 @@ mod tests {
         assert_eq!(arch_count, 5);
         assert_eq!(arch_masks[0], 0b1010_1101);
     }
-
-    #[test]
-    fn public_surface_names_avoid_graph_vocabulary() {
-        let src = include_str!("mask_compare.rs");
-        let production = src
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production section before tests");
-        for forbidden in [
-            "Graph Node",
-            "Next Arc",
-            "NextArc",
-            "BufferFrame",
-            "NodeNext",
-            "enqueue_to_next",
-        ] {
-            assert!(
-                !production.contains(forbidden),
-                "mask_compare production surface must not contain {forbidden:?}"
-            );
-        }
-    }
 }

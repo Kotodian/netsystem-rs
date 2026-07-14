@@ -2,12 +2,8 @@
 # Address plan avoids LAN 192.168.1.0/24 and Fake-IP 198.18.0.0/15.
 
 plugins = [
-  "device",
-  "interface",
   "tun",
   "ip",
-  "transport",
-  "session",
   "tcp",
   "udp",
 ]
@@ -37,8 +33,8 @@ ooo_capacity = 32
 slot_bytes = 2048
 slots = 4
 
-# Lab-shortened timers (must be wired by later slices to take effect at runtime)
-[network.tcp]
+# Lab-shortened timers (plugin-owned schema)
+[plugin.tcp]
 mss = 1440
 receive_window = 65535
 congestion = "bbr"
@@ -46,20 +42,20 @@ nagle = true
 time_wait = "2s"
 paws_idle = "24h"
 
-[network.tcp.pmtu]
+[plugin.tcp.pmtu]
 enabled = true
 
-[network.tcp.retransmit]
+[plugin.tcp.retransmit]
 initial = "50ms"
 min = "50ms"
 max = "3s"
 
-[network.tcp.keepalive]
+[plugin.tcp.keepalive]
 idle = "3s"
 probe_interval = "1s"
 probe_limit = 3
 
-[[network.tcp.listen]]
+[[plugin.tcp.listen]]
 address = "10.66.77.1:7300"
 
 [[network.interface]]

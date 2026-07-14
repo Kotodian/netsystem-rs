@@ -360,8 +360,7 @@ impl IpMain {
 
 pub static IP_MAIN: ArcSwapOption<IpMain> = ArcSwapOption::const_empty();
 
-#[cfg(test)]
-pub(crate) fn reset_for_test() {
+pub fn reset_for_test() {
     IP_MAIN.store(None);
 }
 

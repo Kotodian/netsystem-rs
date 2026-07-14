@@ -8,35 +8,35 @@ use hammer_core::protocol::ip::{
 };
 use hammer_infra::vec::Vec;
 
-pub(crate) fn put_bool(out: &mut Vec<u8>, value: bool) {
+pub fn put_bool(out: &mut Vec<u8>, value: bool) {
     out.push(u8::from(value));
 }
 
-pub(crate) fn put_u8(out: &mut Vec<u8>, value: u8) {
+pub fn put_u8(out: &mut Vec<u8>, value: u8) {
     out.push(value);
 }
 
-pub(crate) fn put_u16(out: &mut Vec<u8>, value: u16) {
+pub fn put_u16(out: &mut Vec<u8>, value: u16) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
-pub(crate) fn put_u32(out: &mut Vec<u8>, value: u32) {
+pub fn put_u32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
-pub(crate) fn put_u64(out: &mut Vec<u8>, value: u64) {
+pub fn put_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
-pub(crate) fn put_usize(out: &mut Vec<u8>, value: usize) {
+pub fn put_usize(out: &mut Vec<u8>, value: usize) {
     put_u64(out, value as u64);
 }
 
-pub(crate) fn put_node(out: &mut Vec<u8>, value: NodeId) {
+pub fn put_node(out: &mut Vec<u8>, value: NodeId) {
     put_u32(out, value.slot());
 }
 
-pub(crate) fn put_option_u16(out: &mut Vec<u8>, value: Option<u16>) {
+pub fn put_option_u16(out: &mut Vec<u8>, value: Option<u16>) {
     match value {
         Some(value) => {
             put_bool(out, true);
@@ -46,7 +46,7 @@ pub(crate) fn put_option_u16(out: &mut Vec<u8>, value: Option<u16>) {
     }
 }
 
-pub(crate) fn put_option_u32(out: &mut Vec<u8>, value: Option<u32>) {
+pub fn put_option_u32(out: &mut Vec<u8>, value: Option<u32>) {
     match value {
         Some(value) => {
             put_bool(out, true);
@@ -56,7 +56,7 @@ pub(crate) fn put_option_u32(out: &mut Vec<u8>, value: Option<u32>) {
     }
 }
 
-pub(crate) fn put_option_usize(out: &mut Vec<u8>, value: Option<usize>) {
+pub fn put_option_usize(out: &mut Vec<u8>, value: Option<usize>) {
     match value {
         Some(value) => {
             put_bool(out, true);
@@ -66,7 +66,7 @@ pub(crate) fn put_option_usize(out: &mut Vec<u8>, value: Option<usize>) {
     }
 }
 
-pub(crate) fn put_option_node(out: &mut Vec<u8>, value: Option<NodeId>) {
+pub fn put_option_node(out: &mut Vec<u8>, value: Option<NodeId>) {
     match value {
         Some(value) => {
             put_bool(out, true);
@@ -76,14 +76,14 @@ pub(crate) fn put_option_node(out: &mut Vec<u8>, value: Option<NodeId>) {
     }
 }
 
-pub(crate) fn encode_ip_version(value: IpVersion) -> u8 {
+pub fn encode_ip_version(value: IpVersion) -> u8 {
     match value {
         IpVersion::V4 => 4,
         IpVersion::V6 => 6,
     }
 }
 
-pub(crate) fn decode_ip_version(value: u8) -> Option<IpVersion> {
+pub fn decode_ip_version(value: u8) -> Option<IpVersion> {
     match value {
         4 => Some(IpVersion::V4),
         6 => Some(IpVersion::V6),
@@ -91,7 +91,7 @@ pub(crate) fn decode_ip_version(value: u8) -> Option<IpVersion> {
     }
 }
 
-pub(crate) fn put_option_ip_version(out: &mut Vec<u8>, value: Option<IpVersion>) {
+pub fn put_option_ip_version(out: &mut Vec<u8>, value: Option<IpVersion>) {
     match value {
         Some(value) => {
             put_bool(out, true);
@@ -101,7 +101,7 @@ pub(crate) fn put_option_ip_version(out: &mut Vec<u8>, value: Option<IpVersion>)
     }
 }
 
-pub(crate) fn encode_ip_protocol(value: IpProtocol) -> (u8, u8) {
+pub fn encode_ip_protocol(value: IpProtocol) -> (u8, u8) {
     match value {
         IpProtocol::Icmpv4 => (1, 0),
         IpProtocol::Tcp => (6, 0),
@@ -111,7 +111,7 @@ pub(crate) fn encode_ip_protocol(value: IpProtocol) -> (u8, u8) {
     }
 }
 
-pub(crate) fn decode_ip_protocol(kind: u8, other: u8) -> Option<IpProtocol> {
+pub fn decode_ip_protocol(kind: u8, other: u8) -> Option<IpProtocol> {
     match kind {
         1 => Some(IpProtocol::Icmpv4),
         6 => Some(IpProtocol::Tcp),
@@ -122,7 +122,7 @@ pub(crate) fn decode_ip_protocol(kind: u8, other: u8) -> Option<IpProtocol> {
     }
 }
 
-pub(crate) fn put_option_ip_protocol(out: &mut Vec<u8>, value: Option<IpProtocol>) {
+pub fn put_option_ip_protocol(out: &mut Vec<u8>, value: Option<IpProtocol>) {
     match value {
         Some(value) => {
             put_bool(out, true);
@@ -134,7 +134,7 @@ pub(crate) fn put_option_ip_protocol(out: &mut Vec<u8>, value: Option<IpProtocol
     }
 }
 
-pub(crate) fn encode_ip_input_target(value: IpInputTarget) -> u8 {
+pub fn encode_ip_input_target(value: IpInputTarget) -> u8 {
     match value {
         IpInputTarget::Drop => 0,
         IpInputTarget::Punt => 1,
@@ -146,7 +146,7 @@ pub(crate) fn encode_ip_input_target(value: IpInputTarget) -> u8 {
     }
 }
 
-pub(crate) fn decode_ip_input_target(value: u8) -> Option<IpInputTarget> {
+pub fn decode_ip_input_target(value: u8) -> Option<IpInputTarget> {
     match value {
         0 => Some(IpInputTarget::Drop),
         1 => Some(IpInputTarget::Punt),
@@ -159,7 +159,7 @@ pub(crate) fn decode_ip_input_target(value: u8) -> Option<IpInputTarget> {
     }
 }
 
-pub(crate) fn put_option_ip_input_target(out: &mut Vec<u8>, value: Option<IpInputTarget>) {
+pub fn put_option_ip_input_target(out: &mut Vec<u8>, value: Option<IpInputTarget>) {
     match value {
         Some(value) => {
             put_bool(out, true);
@@ -169,11 +169,11 @@ pub(crate) fn put_option_ip_input_target(out: &mut Vec<u8>, value: Option<IpInpu
     }
 }
 
-pub(crate) fn encode_ip_input_error(value: IpInputError) -> u8 {
+pub fn encode_ip_input_error(value: IpInputError) -> u8 {
     value as u8
 }
 
-pub(crate) fn decode_ip_input_error(value: u8) -> Option<IpInputError> {
+pub fn decode_ip_input_error(value: u8) -> Option<IpInputError> {
     match value {
         0 => Some(IpInputError::None),
         1 => Some(IpInputError::Version),
@@ -188,7 +188,7 @@ pub(crate) fn decode_ip_input_error(value: u8) -> Option<IpInputError> {
     }
 }
 
-pub(crate) fn put_option_ip_input_error(out: &mut Vec<u8>, value: Option<IpInputError>) {
+pub fn put_option_ip_input_error(out: &mut Vec<u8>, value: Option<IpInputError>) {
     match value {
         Some(value) => {
             put_bool(out, true);
@@ -198,7 +198,7 @@ pub(crate) fn put_option_ip_input_error(out: &mut Vec<u8>, value: Option<IpInput
     }
 }
 
-pub(crate) fn put_option_dpo_type(out: &mut Vec<u8>, value: Option<DpoType>) {
+pub fn put_option_dpo_type(out: &mut Vec<u8>, value: Option<DpoType>) {
     match value {
         Some(value) => {
             put_bool(out, true);
@@ -208,14 +208,14 @@ pub(crate) fn put_option_dpo_type(out: &mut Vec<u8>, value: Option<DpoType>) {
     }
 }
 
-pub(crate) fn encode_icmp_error_family(value: IcmpErrorFamily) -> u8 {
+pub fn encode_icmp_error_family(value: IcmpErrorFamily) -> u8 {
     match value {
         IcmpErrorFamily::Ipv4 => 4,
         IcmpErrorFamily::Ipv6 => 6,
     }
 }
 
-pub(crate) fn decode_icmp_error_family(value: u8) -> Option<IcmpErrorFamily> {
+pub fn decode_icmp_error_family(value: u8) -> Option<IcmpErrorFamily> {
     match value {
         4 => Some(IcmpErrorFamily::Ipv4),
         6 => Some(IcmpErrorFamily::Ipv6),
@@ -223,7 +223,7 @@ pub(crate) fn decode_icmp_error_family(value: u8) -> Option<IcmpErrorFamily> {
     }
 }
 
-pub(crate) fn put_option_icmp_error_family(out: &mut Vec<u8>, value: Option<IcmpErrorFamily>) {
+pub fn put_option_icmp_error_family(out: &mut Vec<u8>, value: Option<IcmpErrorFamily>) {
     match value {
         Some(value) => {
             put_bool(out, true);
@@ -233,7 +233,7 @@ pub(crate) fn put_option_icmp_error_family(out: &mut Vec<u8>, value: Option<Icmp
     }
 }
 
-pub(crate) fn put_option_ip_fragment_key(out: &mut Vec<u8>, value: Option<IpFragmentKey>) {
+pub fn put_option_ip_fragment_key(out: &mut Vec<u8>, value: Option<IpFragmentKey>) {
     match value {
         Some(IpFragmentKey::V4 {
             source,
@@ -263,21 +263,21 @@ pub(crate) fn put_option_ip_fragment_key(out: &mut Vec<u8>, value: Option<IpFrag
     }
 }
 
-pub(crate) struct TraceDecodeCursor<'a> {
+pub struct TraceDecodeCursor<'a> {
     bytes: &'a [u8],
     position: usize,
 }
 
 impl<'a> TraceDecodeCursor<'a> {
-    pub(crate) fn new(bytes: &'a [u8]) -> Self {
+    pub fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, position: 0 }
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.position == self.bytes.len()
     }
 
-    pub(crate) fn read_bool(&mut self) -> Option<bool> {
+    pub fn read_bool(&mut self) -> Option<bool> {
         match self.read_u8()? {
             0 => Some(false),
             1 => Some(true),
@@ -285,40 +285,40 @@ impl<'a> TraceDecodeCursor<'a> {
         }
     }
 
-    pub(crate) fn read_u8(&mut self) -> Option<u8> {
+    pub fn read_u8(&mut self) -> Option<u8> {
         let value = *self.bytes.get(self.position)?;
         self.position += 1;
         Some(value)
     }
 
-    pub(crate) fn read_array<const LEN: usize>(&mut self) -> Option<[u8; LEN]> {
+    pub fn read_array<const LEN: usize>(&mut self) -> Option<[u8; LEN]> {
         let end = self.position.checked_add(LEN)?;
         let bytes = self.bytes.get(self.position..end)?;
         self.position = end;
         bytes.try_into().ok()
     }
 
-    pub(crate) fn read_u16(&mut self) -> Option<u16> {
+    pub fn read_u16(&mut self) -> Option<u16> {
         Some(u16::from_le_bytes(self.read_array()?))
     }
 
-    pub(crate) fn read_u32(&mut self) -> Option<u32> {
+    pub fn read_u32(&mut self) -> Option<u32> {
         Some(u32::from_le_bytes(self.read_array()?))
     }
 
-    pub(crate) fn read_u64(&mut self) -> Option<u64> {
+    pub fn read_u64(&mut self) -> Option<u64> {
         Some(u64::from_le_bytes(self.read_array()?))
     }
 
-    pub(crate) fn read_usize(&mut self) -> Option<usize> {
+    pub fn read_usize(&mut self) -> Option<usize> {
         usize::try_from(self.read_u64()?).ok()
     }
 
-    pub(crate) fn read_node(&mut self) -> Option<NodeId> {
+    pub fn read_node(&mut self) -> Option<NodeId> {
         Some(NodeId::new(self.read_u32()?))
     }
 
-    pub(crate) fn read_option_u16(&mut self) -> Option<Option<u16>> {
+    pub fn read_option_u16(&mut self) -> Option<Option<u16>> {
         if self.read_bool()? {
             Some(Some(self.read_u16()?))
         } else {
@@ -326,7 +326,7 @@ impl<'a> TraceDecodeCursor<'a> {
         }
     }
 
-    pub(crate) fn read_option_u32(&mut self) -> Option<Option<u32>> {
+    pub fn read_option_u32(&mut self) -> Option<Option<u32>> {
         if self.read_bool()? {
             Some(Some(self.read_u32()?))
         } else {
@@ -334,7 +334,7 @@ impl<'a> TraceDecodeCursor<'a> {
         }
     }
 
-    pub(crate) fn read_option_usize(&mut self) -> Option<Option<usize>> {
+    pub fn read_option_usize(&mut self) -> Option<Option<usize>> {
         if self.read_bool()? {
             Some(Some(self.read_usize()?))
         } else {
@@ -342,7 +342,7 @@ impl<'a> TraceDecodeCursor<'a> {
         }
     }
 
-    pub(crate) fn read_option_node(&mut self) -> Option<Option<NodeId>> {
+    pub fn read_option_node(&mut self) -> Option<Option<NodeId>> {
         if self.read_bool()? {
             Some(Some(self.read_node()?))
         } else {
@@ -350,7 +350,7 @@ impl<'a> TraceDecodeCursor<'a> {
         }
     }
 
-    pub(crate) fn read_option_ip_version(&mut self) -> Option<Option<IpVersion>> {
+    pub fn read_option_ip_version(&mut self) -> Option<Option<IpVersion>> {
         if self.read_bool()? {
             Some(Some(decode_ip_version(self.read_u8()?)?))
         } else {
@@ -358,7 +358,7 @@ impl<'a> TraceDecodeCursor<'a> {
         }
     }
 
-    pub(crate) fn read_option_ip_protocol(&mut self) -> Option<Option<IpProtocol>> {
+    pub fn read_option_ip_protocol(&mut self) -> Option<Option<IpProtocol>> {
         if self.read_bool()? {
             let kind = self.read_u8()?;
             let other = self.read_u8()?;
@@ -368,7 +368,7 @@ impl<'a> TraceDecodeCursor<'a> {
         }
     }
 
-    pub(crate) fn read_option_ip_input_target(&mut self) -> Option<Option<IpInputTarget>> {
+    pub fn read_option_ip_input_target(&mut self) -> Option<Option<IpInputTarget>> {
         if self.read_bool()? {
             Some(Some(decode_ip_input_target(self.read_u8()?)?))
         } else {
@@ -376,7 +376,7 @@ impl<'a> TraceDecodeCursor<'a> {
         }
     }
 
-    pub(crate) fn read_option_ip_input_error(&mut self) -> Option<Option<IpInputError>> {
+    pub fn read_option_ip_input_error(&mut self) -> Option<Option<IpInputError>> {
         if self.read_bool()? {
             Some(Some(decode_ip_input_error(self.read_u8()?)?))
         } else {
@@ -384,7 +384,7 @@ impl<'a> TraceDecodeCursor<'a> {
         }
     }
 
-    pub(crate) fn read_option_dpo_type(&mut self) -> Option<Option<DpoType>> {
+    pub fn read_option_dpo_type(&mut self) -> Option<Option<DpoType>> {
         if self.read_bool()? {
             Some(Some(DpoType::new(self.read_u16()?)))
         } else {
@@ -392,7 +392,7 @@ impl<'a> TraceDecodeCursor<'a> {
         }
     }
 
-    pub(crate) fn read_option_icmp_error_family(&mut self) -> Option<Option<IcmpErrorFamily>> {
+    pub fn read_option_icmp_error_family(&mut self) -> Option<Option<IcmpErrorFamily>> {
         if self.read_bool()? {
             Some(Some(decode_icmp_error_family(self.read_u8()?)?))
         } else {
@@ -400,7 +400,7 @@ impl<'a> TraceDecodeCursor<'a> {
         }
     }
 
-    pub(crate) fn read_option_ip_fragment_key(&mut self) -> Option<Option<IpFragmentKey>> {
+    pub fn read_option_ip_fragment_key(&mut self) -> Option<Option<IpFragmentKey>> {
         match self.read_u8()? {
             0 => Some(None),
             4 => Some(Some(IpFragmentKey::V4 {

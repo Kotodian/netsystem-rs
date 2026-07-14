@@ -683,6 +683,10 @@ dependencies = [
  "hammer-core",
  "hammer-infra",
  "hammer-ipc",
+ "hammer-plugin-ip",
+ "hammer-plugin-tcp",
+ "hammer-plugin-tun",
+ "hammer-plugin-udp",
  "hammer-runtime",
  "hammer-service",
  "linkme",
@@ -769,6 +773,64 @@ dependencies = [
 ]
 
 [[package]]
+name = "hammer-plugin-ip"
+version = "0.1.0"
+dependencies = [
+ "hammer-core",
+]
+
+[[package]]
+name = "hammer-plugin-tcp"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "bitflags 2.11.1",
+ "crossbeam-utils",
+ "etherparse",
+ "hammer-component-macros",
+ "hammer-core",
+ "hammer-infra",
+ "hammer-runtime",
+ "hammer-service",
+ "humantime-serde",
+ "ipnet",
+ "linkme",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "hammer-plugin-tun"
+version = "0.1.0"
+dependencies = [
+ "hammer-component-macros",
+ "hammer-core",
+ "hammer-infra",
+ "hammer-runtime",
+ "hammer-service",
+ "libc",
+ "linkme",
+ "serde",
+ "tracing",
+]
+
+[[package]]
+name = "hammer-plugin-udp"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "hammer-component-macros",
+ "hammer-core",
+ "hammer-infra",
+ "hammer-runtime",
+ "hammer-service",
+ "linkme",
+ "tracing",
+]
+
+[[package]]
 name = "hammer-runtime"
 version = "0.1.0"
 dependencies = [
@@ -780,6 +842,7 @@ dependencies = [
  "hammer-component-macros",
  "hammer-core",
  "hammer-infra",
+ "hammer-plugin-tun",
  "indoc",
  "io-uring",
  "ipnet",

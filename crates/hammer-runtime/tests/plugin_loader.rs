@@ -1,5 +1,5 @@
 use hammer_runtime::plugin_loader::{
-    collect_plugin_inventory, plugin_cdylib_filename, LoadTransaction,
+    LoadTransaction, collect_plugin_inventory, plugin_cdylib_filename,
 };
 use hammer_runtime::{PluginRegistration, select_and_expand_plugins};
 
@@ -18,32 +18,32 @@ fn platform_library_name_uses_hammer_plugin_prefix() {
 fn load_transaction_rolls_back_libraries_when_activate_fails() {
     let catalog = [
         PluginRegistration {
-            name: "device",
+            name: "session",
             version: "0.1.0",
             version_required: "0.1.0",
             load_after: &[],
         },
         PluginRegistration {
-            name: "interface",
+            name: "tcp",
             version: "0.1.0",
             version_required: "0.1.0",
-            load_after: &["device"],
+            load_after: &["session"],
         },
     ];
-    let order = select_and_expand_plugins(&["interface".into()], &catalog).expect("plan");
-    assert_eq!(order, ["device", "interface"]);
+    let order = select_and_expand_plugins(&["tcp".into()], &catalog).expect("plan");
+    assert_eq!(order, ["session", "tcp"]);
 
     let mut tx = LoadTransaction::new("0.1.0");
     let err = tx
         .activate_in_order(&order, |name| {
-            if name == "interface" {
-                Err("interface activate failed".into())
+            if name == "tcp" {
+                Err("tcp activate failed".into())
             } else {
                 Ok(())
             }
         })
         .expect_err("activate must fail");
-    assert!(err.contains("interface"));
+    assert!(err.contains("tcp"));
     assert!(
         tx.activated().is_empty(),
         "rollback must clear activated set, got {:?}",
@@ -54,17 +54,17 @@ fn load_transaction_rolls_back_libraries_when_activate_fails() {
 #[test]
 fn shared_dependency_stays_referenced_across_two_roots() {
     let mut tx = LoadTransaction::new("0.1.0");
-    tx.activate_in_order(&["device", "tun"], |_| Ok(()))
-        .expect("tun");
-    tx.activate_in_order(&["device", "ip"], |_| Ok(()))
-        .expect("ip");
-    assert_eq!(tx.refcount("device"), 2);
-    tx.release_plan(&["device", "tun"]);
-    assert_eq!(tx.refcount("device"), 1);
-    assert!(tx.is_held("device"));
-    tx.release_plan(&["device", "ip"]);
-    assert_eq!(tx.refcount("device"), 0);
-    assert!(!tx.is_held("device"));
+    tx.activate_in_order(&["session", "tcp"], |_| Ok(()))
+        .expect("tcp");
+    tx.activate_in_order(&["session", "udp"], |_| Ok(()))
+        .expect("udp");
+    assert_eq!(tx.refcount("session"), 2);
+    tx.release_plan(&["session", "tcp"]);
+    assert_eq!(tx.refcount("session"), 1);
+    assert!(tx.is_held("session"));
+    tx.release_plan(&["session", "udp"]);
+    assert_eq!(tx.refcount("session"), 0);
+    assert!(!tx.is_held("session"));
 }
 
 #[test]
@@ -73,15 +73,39 @@ fn collect_plugin_inventory_merges_private_slices() {
     struct Entry {
         name: &'static str,
     }
-    static DEVICE: [Entry; 1] = [Entry { name: "device-init" }];
+    static IP: [Entry; 1] = [Entry { name: "ip-init" }];
     static TUN: [Entry; 1] = [Entry { name: "tun-init" }];
 
-    let merged = collect_plugin_inventory(&["device", "tun"], |plugin| match plugin {
-        "device" => Ok(&DEVICE[..]),
+    let merged = collect_plugin_inventory(&["ip", "tun"], |plugin| match plugin {
+        "ip" => Ok(&IP[..]),
         "tun" => Ok(&TUN[..]),
         other => Err(format!("missing inventory for {other}")),
     })
     .expect("collect");
     let names: Vec<&str> = merged.iter().map(|entry| entry.name).collect();
-    assert_eq!(names, ["device-init", "tun-init"]);
+    assert_eq!(names, ["ip-init", "tun-init"]);
+}
+
+#[test]
+fn open_tun_cdylib_and_read_registration_via_dlsym() {
+    use hammer_core::plugin::host_meets_plugin_requirement;
+    use hammer_runtime::plugin_loader::{LoadTransaction, built_plugin_cdylib_path};
+
+    let path = built_plugin_cdylib_path("tun");
+    assert!(
+        path.is_file(),
+        "expected built plugin at {} (build hammer-plugin-tun first)",
+        path.display()
+    );
+
+    let mut tx = LoadTransaction::new(env!("CARGO_PKG_VERSION"));
+    tx.open_library("tun", &path).expect("dlopen tun");
+    assert!(tx.has_library("tun"));
+
+    let registration = tx.registration("tun").expect("dlsym registration");
+    assert_eq!(registration.name, "tun");
+    assert_eq!(registration.load_after, &[] as &[&str]);
+    host_meets_plugin_requirement(env!("CARGO_PKG_VERSION"), registration.version_required)
+        .expect("semver");
+    assert_eq!(registration.version, env!("CARGO_PKG_VERSION"));
 }

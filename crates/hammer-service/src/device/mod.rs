@@ -37,8 +37,6 @@ use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
 };
 
-hammer_component_macros::declare_plugin!(name = "device", load_after = []);
-
 #[hammer_component_macros::node_next]
 pub enum DeviceInputNext {
     #[next("ip-input")]
@@ -49,13 +47,14 @@ pub enum DeviceInputNext {
     Drop,
 }
 
+/// Abstract device-input owner node. Concrete drivers (tun, …) register as siblings.
+/// Builtin of the shared device abstraction — not a loadable plugin.
 #[hammer_component_macros::graph_node(
     graph = service,
     name = "device-input",
     next = DeviceInputNext,
     kind = driver,
     state = disabled,
-    plugin = "device",
 )]
 #[derive(Debug, Clone, Copy)]
 pub struct DeviceInputNode;
@@ -98,18 +97,18 @@ pub struct DeviceMain {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DeviceRxQueue {
-    pub(crate) device_instance: u32,
-    pub(crate) queue_id: u32,
-    pub(crate) owner: DataWorkerId,
-    pub(crate) mode: DriverScheduleMode,
+pub struct DeviceRxQueue {
+    pub device_instance: u32,
+    pub queue_id: u32,
+    pub owner: DataWorkerId,
+    pub mode: DriverScheduleMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DeviceTxQueue {
-    pub(crate) device_instance: u32,
-    pub(crate) queue_id: u32,
-    pub(crate) owner: DataWorkerId,
+pub struct DeviceTxQueue {
+    pub device_instance: u32,
+    pub queue_id: u32,
+    pub owner: DataWorkerId,
 }
 
 // SAFETY: queue registration finishes before worker startup. Published queue
@@ -126,7 +125,7 @@ impl DeviceMain {
         })
     }
 
-    pub(crate) fn register_rx_queue(
+    pub fn register_rx_queue(
         &self,
         device_instance: u32,
         queue_id: u32,
@@ -149,7 +148,7 @@ impl DeviceMain {
         Ok(())
     }
 
-    pub(crate) fn register_tx_queue(
+    pub fn register_tx_queue(
         &self,
         device_instance: u32,
         queue_id: u32,
@@ -170,7 +169,7 @@ impl DeviceMain {
         Ok(())
     }
 
-    pub(crate) fn rx_poll_vector(&self, owner: DataWorkerId) -> Vec<DeviceRxQueue> {
+    pub fn rx_poll_vector(&self, owner: DataWorkerId) -> Vec<DeviceRxQueue> {
         let queues = unsafe { &*self.rx_queues.get() };
         queues
             .iter()
@@ -179,13 +178,13 @@ impl DeviceMain {
             .collect()
     }
 
-    pub(crate) fn tx_queues(&self) -> Vec<DeviceTxQueue> {
+    pub fn tx_queues(&self) -> Vec<DeviceTxQueue> {
         let queues = unsafe { &*self.tx_queues.get() };
         queues.iter().copied().collect()
     }
 }
 
-#[hammer_component_macros::init_function(name = "device_init", plugin = "device")]
+#[hammer_component_macros::init_function(name = "device_init")]
 fn init_device() -> HammerResult<Arc<DeviceMain>> {
     Ok(DeviceMain::new())
 }

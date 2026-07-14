@@ -128,3 +128,25 @@ fn svm_session_msg_queue_pipe_signal_wakes_consumer() {
     assert!(consumer.read_signal());
     assert_eq!(consumer.dequeue().map(|e| e.session_index()), Some(9));
 }
+
+#[test]
+fn svm_session_msg_queue_owns_attached_signal_descriptors() {
+    use hammer_infra::segment::{Segment, Svm};
+
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+
+    let seg = Svm::default();
+    let bytes = SessionMsgQueue::<Svm>::layout_bytes(8, 4).expect("layout");
+    let off = seg.alloc(bytes, 64);
+    drop(unsafe { SessionMsgQueue::<Svm>::init_at(seg.clone(), off, 8, 4) }.expect("init"));
+
+    drop(unsafe { SessionMsgQueue::<Svm>::from_shared(seg, off, Some(fds[0]), Some(fds[1])) });
+
+    assert_eq!(
+        (unsafe { libc::fcntl(fds[0], libc::F_GETFD) }, unsafe {
+            libc::fcntl(fds[1], libc::F_GETFD)
+        },),
+        (-1, -1)
+    );
+}

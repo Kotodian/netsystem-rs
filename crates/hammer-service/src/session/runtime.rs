@@ -40,30 +40,30 @@ enum SessionControlEvent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct OooSpan {
+pub struct OooSpan {
     start: u32,
     len: NonZeroU32,
 }
 
 impl OooSpan {
     #[inline]
-    pub(crate) const fn new(start: u32, len: NonZeroU32) -> Self {
+    pub const fn new(start: u32, len: NonZeroU32) -> Self {
         Self { start, len }
     }
 
     #[inline]
-    pub(crate) const fn start(self) -> u32 {
+    pub const fn start(self) -> u32 {
         self.start
     }
 
     #[inline]
-    pub(crate) const fn len(self) -> NonZeroU32 {
+    pub const fn len(self) -> NonZeroU32 {
         self.len
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RxDelivery {
+pub enum RxDelivery {
     NotAccepted {
         rx_available: u32,
     },
@@ -83,7 +83,7 @@ const _: () = assert!(core::mem::size_of::<RxDelivery>() <= 24);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SessionQueueStep {
-    pub(crate) scheduled_sessions: usize,
+    pub scheduled_sessions: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,7 +145,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
     }
 
     #[inline]
-    pub(crate) const fn worker(&self) -> DataWorkerId {
+    pub const fn worker(&self) -> DataWorkerId {
         self.worker
     }
 
@@ -165,7 +165,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
     }
 
     #[inline]
-    pub(crate) fn session_transport(
+    pub fn session_transport(
         &self,
         session_id: SessionId,
     ) -> Option<(SessionTransportId, Index)> {
@@ -174,12 +174,12 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
     }
 
     #[inline]
-    pub(crate) fn has_session(&self, session_id: SessionId) -> bool {
+    pub fn has_session(&self, session_id: SessionId) -> bool {
         self.entries.contains_key(session_id.pool_index())
     }
 
     #[inline]
-    pub(crate) fn prefetch_session(&self, session_id: SessionId) {
+    pub fn prefetch_session(&self, session_id: SessionId) {
         self.entries.prefetch_slot(session_id.pool_index());
     }
 
@@ -202,7 +202,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
         Ok(())
     }
 
-    pub(crate) fn insert_session_for_test(
+    pub fn insert_session_for_test(
         &mut self,
         transport: SessionTransportId,
         index: Index,
@@ -215,7 +215,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
         session_id
     }
 
-    pub(crate) fn remove_session_entry(&mut self, session_id: SessionId) -> bool {
+    pub fn remove_session_entry(&mut self, session_id: SessionId) -> bool {
         self.app.discard_all_tx_bytes_for_session(session_id);
         let _ = self.app.detach_session(session_id);
         let handle = SessionHandle::new(session_id.pool_index().slot(), self.worker.slot() as u32);
@@ -225,7 +225,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
         self.entries.remove(session_id.pool_index()).is_some()
     }
 
-    pub(crate) fn notify_transport_closed(
+    pub fn notify_transport_closed(
         &mut self,
         session_id: SessionId,
         index: Index,
@@ -243,7 +243,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
         Ok(())
     }
 
-    pub(crate) fn notify_transport_deleted(&mut self, session_id: SessionId, index: Index) {
+    pub fn notify_transport_deleted(&mut self, session_id: SessionId, index: Index) {
         let remove = self
             .entries
             .get_mut(session_id.pool_index())
@@ -265,7 +265,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
     }
 
     #[inline]
-    pub(crate) fn mark_ready(&mut self, session_id: SessionId) {
+    pub fn mark_ready(&mut self, session_id: SessionId) {
         let Some(entry) = self.entries.get_mut(session_id.pool_index()) else {
             return;
         };
@@ -320,7 +320,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
         self.session_work_scratch = work;
     }
 
-    pub(crate) fn ack_tx_up_to(&mut self, session_id: SessionId, bytes: usize) -> CoreResult<()>
+    pub fn ack_tx_up_to(&mut self, session_id: SessionId, bytes: usize) -> CoreResult<()>
     where
         SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
     {
@@ -328,7 +328,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
         Ok(())
     }
 
-    pub(crate) fn enqueue_rx(
+    pub fn enqueue_rx(
         &self,
         session_id: SessionId,
         index: hammer_core::data_plane::Index,
@@ -375,7 +375,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
     }
 
     #[inline]
-    pub(crate) fn rx_available_len(&self, session_id: SessionId) -> Option<usize> {
+    pub fn rx_available_len(&self, session_id: SessionId) -> Option<usize> {
         self.app.rx_available_len(session_id)
     }
 
@@ -420,22 +420,32 @@ where
     }
 
     #[inline]
-    pub(crate) fn sessions(&self) -> &SessionWorker<Index, Seg> {
+    pub fn sessions(&self) -> &SessionWorker<Index, Seg> {
         &self.sessions
     }
 
     #[inline]
-    pub(crate) fn sessions_mut(&mut self) -> &mut SessionWorker<Index, Seg> {
+    pub fn sessions_mut(&mut self) -> &mut SessionWorker<Index, Seg> {
         &mut self.sessions
     }
 
     #[inline]
-    pub(crate) fn transports(&self) -> &T {
+    pub fn app_session_config(&self) -> AppSessionConfig {
+        self.sessions.app_session_config
+    }
+
+    #[inline]
+    pub fn app_context(&self) -> Option<&AppContext<Local>> {
+        self.sessions.app_context.as_ref()
+    }
+
+    #[inline]
+    pub fn transports(&self) -> &T {
         &self.transports
     }
 
     #[inline]
-    pub(crate) fn transports_mut(&mut self) -> &mut T {
+    pub fn transports_mut(&mut self) -> &mut T {
         &mut self.transports
     }
 
@@ -444,7 +454,7 @@ where
         self.sessions.insert_session_for_test(transport, index)
     }
 
-    pub(crate) fn insert_session_with_transport<F>(
+    pub fn insert_session_with_transport<F>(
         &mut self,
         transport: SessionTransportId,
         create_transport: F,
@@ -492,17 +502,17 @@ where
     }
 
     #[inline]
-    pub(crate) fn worker(&self) -> DataWorkerId {
+    pub fn worker(&self) -> DataWorkerId {
         self.sessions.worker()
     }
 
     #[inline]
-    pub(crate) fn prefetch_session(&self, session_id: SessionId) {
+    pub fn prefetch_session(&self, session_id: SessionId) {
         self.sessions.prefetch_session(session_id);
     }
 
     #[inline]
-    pub(crate) fn ack_tx_up_to(&mut self, session_id: SessionId, bytes: usize) -> CoreResult<()>
+    pub fn ack_tx_up_to(&mut self, session_id: SessionId, bytes: usize) -> CoreResult<()>
     where
         SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
     {
@@ -510,7 +520,7 @@ where
     }
 
     #[inline]
-    pub(crate) fn enqueue_rx(
+    pub fn enqueue_rx(
         &self,
         session_id: SessionId,
         index: hammer_core::data_plane::Index,
@@ -523,13 +533,11 @@ where
         self.sessions.enqueue_rx(session_id, index, offset, urgent)
     }
 
-    #[cfg(test)]
-    pub(crate) fn schedule_disconnect_for_test(&mut self, session_id: SessionId) {
+    pub fn schedule_disconnect_for_test(&mut self, session_id: SessionId) {
         self.sessions.schedule_disconnect(session_id);
     }
 
-    #[cfg(test)]
-    pub(crate) fn schedule_session_work_for_test(&mut self, session_id: SessionId) {
+    pub fn schedule_session_work_for_test(&mut self, session_id: SessionId) {
         self.sessions.mark_ready(session_id);
     }
 }
@@ -550,7 +558,7 @@ impl<T, Index: Copy + Eq> SessionDriverRuntime<T, Local, Index> {
         )
     }
 
-    pub(crate) fn with_app_context(
+    pub fn with_app_context(
         worker: DataWorkerId,
         buffers: DataPlaneBuffers,
         transports: T,
@@ -574,7 +582,7 @@ impl<T, Index: Copy + Eq> SessionDriverRuntime<T, Local, Index> {
 }
 
 impl<T, Index: Copy + Eq> SessionDriverRuntime<T, Svm, Index> {
-    pub(crate) fn new_svm(
+    pub fn new_svm(
         worker: DataWorkerId,
         buffers: DataPlaneBuffers,
         transports: T,
@@ -986,7 +994,6 @@ where
     }
 }
 
-#[cfg(test)]
 pub fn dispatch_session_queue_once<T, Seg, Index>(
     runtime: &DataPlaneRuntime,
     owner: hammer_core::data_plane::NodeId,
@@ -1015,7 +1022,7 @@ where
     Ok(step)
 }
 
-pub(crate) fn dispatch_registered_session_queue_once_at<T, Seg, Index>(
+pub fn dispatch_registered_session_queue_once_at<T, Seg, Index>(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     output_next: SessionQueueNext,
@@ -1100,6 +1107,7 @@ where
     Ok(SessionQueueStep { scheduled_sessions })
 }
 
-#[cfg(test)]
-#[path = "runtime/tests.rs"]
-mod tests;
+// TCP-coupled driver tests live in hammer-plugin-tcp (session_driver_tests).
+// #[cfg(test)]
+// #[path = "runtime/tests.rs"]
+// mod tests;
