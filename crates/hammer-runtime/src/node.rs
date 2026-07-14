@@ -151,6 +151,7 @@ type NodeFunction = unsafe fn(&DataPlaneRuntime, NodeRuntimeData, &mut BufferFra
 #[derive(Clone, Copy)]
 #[doc(hidden)]
 pub struct NodeFunctionRegistration {
+    plugin: Option<&'static str>,
     node_name: &'static str,
     instruction_set: DataPlaneInstructionSet,
     function: NodeFunction,
@@ -164,15 +165,22 @@ impl NodeFunctionRegistration {
     /// must obey the [`NodeFunction`] calling contract.
     #[doc(hidden)]
     pub const unsafe fn new(
+        plugin: Option<&'static str>,
         node_name: &'static str,
         instruction_set: DataPlaneInstructionSet,
         function: unsafe fn(&DataPlaneRuntime, NodeRuntimeData, &mut BufferFrame) -> NodeResult,
     ) -> Self {
         Self {
+            plugin,
             node_name,
             instruction_set,
             function,
         }
+    }
+
+    #[inline]
+    pub(crate) fn plugin(&self) -> Option<&'static str> {
+        self.plugin
     }
 }
 
@@ -1002,6 +1010,7 @@ mod node_function_tests {
     #[test]
     fn duplicate_instruction_set_is_rejected() {
         let duplicate = NodeFunctionRegistration {
+            plugin: None,
             node_name: "fixture",
             instruction_set: DataPlaneInstructionSet::Scalar,
             function: missing_node_process,
@@ -1091,12 +1100,13 @@ impl NodeRuntime {
         &self,
         node: NodeId,
         instruction_set: DataPlaneInstructionSet,
+        registrations: &[NodeFunctionRegistration],
     ) -> CoreResult<()> {
         let Some(node_name) = self.node_name(node)? else {
             return Ok(());
         };
         let Some(registration) =
-            preferred_node_function(node_name, instruction_set, &NODE_FUNCTIONS)?
+            preferred_node_function(node_name, instruction_set, registrations)?
         else {
             return Ok(());
         };

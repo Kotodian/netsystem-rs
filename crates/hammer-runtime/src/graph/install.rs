@@ -10,22 +10,18 @@ use hammer_component_macros::init_function;
 use hammer_core::config::Config;
 use hammer_core::data_plane::NodeHandle;
 use hammer_core::error::HammerResult;
-use hammer_infra::vec::Vec;
 
 use crate::engine::Engine;
-use crate::node::{GRAPH_NODES, NodeEntry};
-use crate::plugin::filter_by_plugin;
 
 #[init_function(name = "install_packet_graph", runs_after = ["memory_init"])]
 pub fn install_packet_graph(engine: &mut Engine, config: Arc<Config>) -> HammerResult<()> {
     let handle = NodeHandle::new(config.worker.handoff.node_handle);
     engine.runtime.set_handoff_node_handle(handle);
 
-    let loaded = engine.loaded_plugins();
-    let filtered: Vec<NodeEntry> = filter_by_plugin(&GRAPH_NODES[..], loaded, |entry| entry.plugin)
-        .into_iter()
-        .copied()
-        .collect();
-    engine.runtime.init_graph(0, &filtered)?;
+    let entries = engine.plugin_main().graph_nodes();
+    let functions = engine.plugin_main().node_functions();
+    engine
+        .runtime
+        .init_graph_with_node_functions(0, &entries, &functions)?;
     Ok(())
 }

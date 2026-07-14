@@ -123,11 +123,7 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
         Ok(())
     }
 
-    pub fn discard_acked_tx_bytes(
-        &mut self,
-        session_id: SessionId,
-        len: usize,
-    ) -> CoreResult<bool>
+    pub fn discard_acked_tx_bytes(&mut self, session_id: SessionId, len: usize) -> CoreResult<bool>
     where
         Self: SessionAppRuntimeCreate<S>,
     {

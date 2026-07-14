@@ -1,12 +1,12 @@
 use std::time::{Duration, Instant};
 
+use hammer_plugin_tcp::DEFAULT_TCP_OUTPUT_PAYLOAD_LEN;
+use hammer_plugin_tcp::connection::TcpConnection;
 use hammer_runtime::DataWorkerId;
 use hammer_service::transport::congestion::{
     AckedPacket, BbrController, BbrMode, CongestionController, CongestionMetrics, LostPacket,
     PacketNumber, RttSample,
 };
-use hammer_plugin_tcp::DEFAULT_TCP_OUTPUT_PAYLOAD_LEN;
-use hammer_plugin_tcp::connection::TcpConnection;
 
 const MSS: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
 

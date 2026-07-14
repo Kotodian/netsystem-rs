@@ -1,28 +1,8 @@
 //! Dynamic `tcp` plugin (`libhammer_plugin_tcp`).
 
-use hammer_core::plugin::PluginRegistration;
-
-static LOAD_AFTER: &[&str] = &[];
-
-static REGISTRATION: PluginRegistration = PluginRegistration {
-    name: "tcp",
-    version: env!("CARGO_PKG_VERSION"),
-    version_required: env!("CARGO_PKG_VERSION"),
-    load_after: LOAD_AFTER,
-};
-
-#[unsafe(no_mangle)]
-pub extern "C" fn hammer_plugin_registration() -> *const PluginRegistration {
-    &REGISTRATION
-}
-
-pub fn registration() -> &'static PluginRegistration {
-    &REGISTRATION
-}
-
 pub use hammer_core::protocol::tcp::{TcpInputFlags, TcpSeq, TcpState};
 
-hammer_component_macros::declare_plugin!(name = "tcp", load_after = []);
+hammer_component_macros::declare_plugin!(name = "tcp", load_after = ["ip"]);
 
 use std::mem::transmute;
 use std::net::SocketAddr;

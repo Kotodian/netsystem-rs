@@ -402,11 +402,11 @@ fn schedule_polling_driver_nodes_schedules_only_polling_drivers() {
 
 #[test]
 fn interrupt_pending_coalesces_empty_driver_dispatch() {
-    reset_calls(31);
+    reset_calls(34);
     let runtime = test_runtime(64, 4, 4);
     let driver = runtime.nodes().register_driver(DescriptorNode::plain(
         count_process,
-        NodeRuntimeData::from_words([31, 0, 0, 0]),
+        NodeRuntimeData::from_words([34, 0, 0, 0]),
     ));
     runtime
         .nodes()
@@ -426,7 +426,7 @@ fn interrupt_pending_coalesces_empty_driver_dispatch() {
     assert!(runtime.nodes().has_pending());
 
     assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 1);
-    assert_eq!(calls_for(31), 1);
+    assert_eq!(calls_for(34), 1);
     assert!(!runtime.nodes().has_pending());
     assert_eq!(runtime.buffers().frames_in_use(), 0);
 }

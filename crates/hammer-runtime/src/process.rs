@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, LocalSet};
 
 use crate::DataPlaneRuntime;
-use crate::plugin::filter_by_plugin;
+use crate::PluginMain;
 
 pub type ProcessFuture = Pin<Box<dyn Future<Output = HammerResult<()>> + 'static>>;
 
@@ -219,13 +219,13 @@ impl ProcessMain {
         &mut self,
         registry: Arc<RuntimeRegistry>,
         runtime: DataPlaneRuntime,
-        loaded_plugins: &[&'static str],
+        plugin_main: &PluginMain,
     ) -> HammerResult<()> {
         self.ensure_owner()?;
         if !self.running.is_empty() {
             return Err(HammerError::internal("Process Nodes are already started"));
         }
-        let entries = filter_by_plugin(&PROCESS_NODES, loaded_plugins, |entry| entry.plugin);
+        let entries = plugin_main.process_nodes();
         let mut names = Vec::with_capacity(entries.len());
         for entry in &entries {
             if names.contains(&entry.name) {

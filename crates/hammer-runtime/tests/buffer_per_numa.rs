@@ -103,7 +103,6 @@ fn arenas_keep_their_arena_numa_identity() {
     assert_ne!(p0.buffer_raw_ptr(i0.slot()), p1.buffer_raw_ptr(i1.slot()));
 }
 
-
 #[test]
 fn empty_numa_configuration_defaults_to_numa_zero() {
     let runtime = runtime_with_numa(1024, 16, &[]);

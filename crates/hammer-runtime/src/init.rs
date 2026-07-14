@@ -1,5 +1,6 @@
 use petgraph::algo::toposort;
 use petgraph::graphmap::DiGraphMap;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use hammer_core::error::{CoreError, HammerResult};
 
@@ -127,44 +128,39 @@ pub fn topological_order<T: Ordered>(items: &[T]) -> Result<Vec<usize>, InitErro
     Ok(result)
 }
 
-fn dispatch_init(items: &[InitFunction], engine: &mut Engine) -> HammerResult<()> {
-    let loaded = engine.loaded_plugins();
-    let filtered: Vec<InitFunction> =
-        crate::plugin::filter_by_plugin(items, loaded, |item| item.plugin)
-            .into_iter()
-            .copied()
-            .collect();
-    let order = topological_order(&filtered)?;
+fn dispatch_init(items: Vec<InitFunction>, engine: &mut Engine) -> HammerResult<()> {
+    let order = topological_order(&items)?;
     for index in order {
-        (filtered[index].func)(engine)?;
+        let function = items[index];
+        catch_unwind(AssertUnwindSafe(|| (function.func)(engine))).map_err(|_| {
+            CoreError::internal(format!("init function `{}` panicked", function.name))
+        })??;
     }
     Ok(())
 }
 
-/// Run init functions filtered by `engine.loaded_plugins()`.
 pub fn run_init_functions(engine: &mut Engine) -> HammerResult<()> {
-    dispatch_init(&INIT_FUNCTIONS, engine)
+    let functions = engine.plugin_main().init_functions();
+    dispatch_init(functions, engine)
 }
 
-/// Run worker-init functions filtered by `engine.loaded_plugins()`.
 pub fn run_worker_init_functions(engine: &mut Engine) -> HammerResult<()> {
-    dispatch_init(&WORKER_INIT_FUNCTIONS, engine)
+    let functions = engine.plugin_main().worker_init_functions();
+    dispatch_init(functions, engine)
 }
 
 pub fn run_main_loop_enter(engine: &mut Engine) -> HammerResult<()> {
-    dispatch_init(&MAIN_LOOP_ENTER_FUNCTIONS, engine)
+    let functions = engine.plugin_main().main_loop_enter_functions();
+    dispatch_init(functions, engine)
 }
 
 pub fn run_main_loop_exit(engine: &mut Engine) -> HammerResult<()> {
-    dispatch_init(&MAIN_LOOP_EXIT_FUNCTIONS, engine)
+    let functions = engine.plugin_main().main_loop_exit_functions();
+    dispatch_init(functions, engine)
 }
 
 pub fn run_config_functions(engine: &mut Engine, early: bool) -> HammerResult<()> {
-    let functions = if early {
-        &EARLY_CONFIG_FUNCTIONS[..]
-    } else {
-        &CONFIG_FUNCTIONS[..]
-    };
+    let functions = engine.plugin_main().config_functions(early);
     dispatch_init(functions, engine)
 }
 

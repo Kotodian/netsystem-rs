@@ -18,6 +18,7 @@ hammer-infra = { path = "../hammer-infra" }
 hammer-component-macros = { path = "../hammer-component-macros" }
 linkme = { workspace = true }
 petgraph = { workspace = true }
+semver = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
 async-trait = { workspace = true }
@@ -42,6 +43,8 @@ indoc = { workspace = true }
 # Ensures tested plugin cdylibs are built for registration dlsym tests.
 hammer-plugin-ip = { path = "../hammer-plugins/ip" }
 hammer-plugin-tun = { path = "../hammer-plugins/device/tun" }
+hammer-plugin-tcp = { path = "../hammer-plugins/transport/tcp" }
+hammer-plugin-udp = { path = "../hammer-plugins/transport/udp" }
 # `test-util` enables `tokio::time::pause()` / `advance()` so timeout-based
 # behaviour (TCP bridge drain idle, idle-keepalive backstop, etc.) can be
 # verified without sleeping for real seconds. Test-only.

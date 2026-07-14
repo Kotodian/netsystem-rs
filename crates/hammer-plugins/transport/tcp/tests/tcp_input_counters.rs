@@ -1,12 +1,12 @@
 use hammer_core::data_plane::DataPlaneBufferConfig;
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::TcpSegmentFlags;
-use hammer_runtime::{
-    DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node, NodeResult, NodeRuntimeData,
-};
 use hammer_plugin_tcp::{
     TcpNodeError, TcpOutputError,
     output::{TcpOutputNext, TcpOutputNode},
+};
+use hammer_runtime::{
+    DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node, NodeResult, NodeRuntimeData,
 };
 use std::sync::{Arc, Mutex, OnceLock};
 

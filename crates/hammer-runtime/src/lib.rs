@@ -34,13 +34,9 @@ pub use node::{
     NodeProcessFn, NodeResult, NodeRuntime, NodeRuntimeData, NodeRuntimeReady, NodeRuntimeStatsRow,
     NoopNode, default_prefetch_indices,
 };
-pub use plugin::{
-    PLUGIN_REGISTRATIONS, PluginError, PluginRegistration, compiled_plugin_names, filter_by_plugin,
-    host_meets_plugin_requirement, select_and_expand_plugins, select_loaded_plugins,
-    select_loaded_plugins_from, validate_catalog_semver,
-};
+pub use plugin::{PluginError, PluginMain, PluginRegistration, host_meets_plugin_requirement};
 pub use plugin_loader::{
-    LoadTransaction, built_plugin_cdylib_path, collect_plugin_inventory, plugin_cdylib_filename,
+    built_plugin_cdylib_path, built_plugin_path, configured_plugin_path, plugin_cdylib_filename,
     plugin_cdylib_path, read_plugin_registration, workspace_target_dir,
 };
 pub use process::{

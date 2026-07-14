@@ -5,7 +5,7 @@ use hammer_core::data_plane::{BufferFrame, DataPlaneBufferConfig};
 use hammer_infra::vec::Vec;
 use hammer_runtime::{
     DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig, GRAPH_NODES, Node,
-    NodeResult, NodeRuntimeData, filter_by_plugin, spawn::DataRuntime,
+    NodeResult, NodeRuntimeData, spawn::DataRuntime,
 };
 
 static DISPATCH_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -36,8 +36,8 @@ fn multiarch_process(_: &DataPlaneRuntime, _: NodeRuntimeData, _: &mut BufferFra
 }
 
 fn multiarch_entries() -> Vec<hammer_runtime::NodeEntry> {
-    filter_by_plugin(&GRAPH_NODES[..], &[], |_| None)
-        .into_iter()
+    GRAPH_NODES
+        .iter()
         .filter(|entry| entry.registration.name() == Some("multiarch-fixture"))
         .copied()
         .collect()

@@ -11,20 +11,25 @@ use syn::{
 
 struct NodeFunctionArgs {
     node: Path,
+    plugin: Option<LitStr>,
 }
 
 impl Parse for NodeFunctionArgs {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let mut node = None;
+        let mut plugin = None;
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             input.parse::<Token![=]>()?;
             match key.to_string().as_str() {
                 "node" => node = Some(input.parse()?),
+                "plugin" => plugin = Some(input.parse()?),
                 other => {
                     return Err(Error::new(
                         key.span(),
-                        format!("unknown `node_function` argument `{other}`; expected `node`"),
+                        format!(
+                            "unknown `node_function` argument `{other}`; expected `node` or `plugin`"
+                        ),
                     ));
                 }
             }
@@ -34,6 +39,7 @@ impl Parse for NodeFunctionArgs {
         }
         Ok(Self {
             node: node.ok_or_else(|| Error::new(Span::call_site(), "missing `node` argument"))?,
+            plugin,
         })
     }
 }
@@ -52,6 +58,7 @@ pub fn node_function(args: TokenStream, input: TokenStream) -> TokenStream {
 
 fn expand_node_function(args: NodeFunctionArgs, function: ItemFn) -> TokenStream2 {
     let node = &args.node;
+    let plugin = plugin_option_tokens(args.plugin.as_ref());
     let function_name = function.sig.ident.clone();
     // VPP recompiles one VLIB_NODE_FN body for each enabled march variant.
     // Generate the equivalent private symbols from one Rust declaration.
@@ -63,6 +70,7 @@ fn expand_node_function(args: NodeFunctionArgs, function: ItemFn) -> TokenStream
         quote!(::hammer_runtime::DataPlaneInstructionSet::Scalar),
         quote!(),
         quote!(),
+        &plugin,
     );
     let x86_architecture = quote!(#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]);
     let sse2 = expand_node_function_variant(
@@ -73,6 +81,7 @@ fn expand_node_function(args: NodeFunctionArgs, function: ItemFn) -> TokenStream
         quote!(::hammer_runtime::DataPlaneInstructionSet::Sse2),
         x86_architecture.clone(),
         quote!(#[target_feature(enable = "sse2")]),
+        &plugin,
     );
     let avx2 = expand_node_function_variant(
         node,
@@ -82,6 +91,7 @@ fn expand_node_function(args: NodeFunctionArgs, function: ItemFn) -> TokenStream
         quote!(::hammer_runtime::DataPlaneInstructionSet::Avx2),
         x86_architecture.clone(),
         quote!(#[target_feature(enable = "avx2")]),
+        &plugin,
     );
     let avx512 = expand_node_function_variant(
         node,
@@ -91,6 +101,7 @@ fn expand_node_function(args: NodeFunctionArgs, function: ItemFn) -> TokenStream
         quote!(::hammer_runtime::DataPlaneInstructionSet::Avx512),
         x86_architecture,
         quote!(#[target_feature(enable = "avx512f")]),
+        &plugin,
     );
     let neon = expand_node_function_variant(
         node,
@@ -100,6 +111,7 @@ fn expand_node_function(args: NodeFunctionArgs, function: ItemFn) -> TokenStream
         quote!(::hammer_runtime::DataPlaneInstructionSet::Neon),
         quote!(#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]),
         quote!(#[target_feature(enable = "neon")]),
+        &plugin,
     );
 
     quote! {
@@ -119,6 +131,7 @@ fn expand_node_function_variant(
     instruction_set: TokenStream2,
     architecture: TokenStream2,
     target_feature: TokenStream2,
+    plugin: &TokenStream2,
 ) -> TokenStream2 {
     let mut variant_function = function.clone();
     variant_function.sig.ident = function_name.clone();
@@ -143,6 +156,7 @@ fn expand_node_function_variant(
         #[::linkme::distributed_slice(::hammer_runtime::node::NODE_FUNCTIONS)]
         static #static_name: ::hammer_runtime::node::NodeFunctionRegistration = unsafe {
             ::hammer_runtime::node::NodeFunctionRegistration::new(
+                #plugin,
                 #node::NODE_NAME,
                 #instruction_set,
                 #function_name,
@@ -2440,6 +2454,7 @@ const PLUGIN_OWNED_MACROS: &[&str] = &[
     "main_loop_enter_function",
     "main_loop_exit_function",
     "process_node",
+    "node_function",
 ];
 
 fn attribute_macro_leaf(path: &Path) -> Option<String> {
@@ -2540,7 +2555,7 @@ fn inject_plugin_into_item(item: &mut Item, plugin_name: &LitStr) -> Result<()> 
     Ok(())
 }
 
-/// Emits only a `PluginRegistration` into `PLUGIN_REGISTRATIONS`.
+/// Exports one VPP-shaped dynamic [`PluginRegistration`].
 ///
 /// Use this inside an external module (`mod foo;` / `foo/mod.rs`) together with
 /// explicit `plugin = "..."` on each lifecycle/graph attribute. Proc macros
@@ -2559,7 +2574,7 @@ pub fn declare_plugin(input: TokenStream) -> TokenStream {
     plugin_registration_tokens(&args).into()
 }
 
-/// Marks an **inline** module as a statically linked plugin and tags nested
+/// Marks an **inline** module as a dynamic plugin and tags nested
 /// lifecycle/graph contributions with `plugin = "..."`.
 ///
 /// For external modules (`mod foo;` without `{ ... }`), this attribute only
@@ -2590,14 +2605,33 @@ fn plugin_registration_tokens(args: &PluginArgs) -> TokenStream2 {
         name.value().to_ascii_uppercase().replace('-', "_")
     );
     quote! {
-        #[::linkme::distributed_slice(::hammer_runtime::PLUGIN_REGISTRATIONS)]
-        static #static_ident: ::hammer_runtime::PluginRegistration =
-            ::hammer_runtime::PluginRegistration {
+        static #static_ident: ::std::sync::OnceLock<::hammer_runtime::PluginRegistration> =
+            ::std::sync::OnceLock::new();
+
+        pub fn registration() -> &'static ::hammer_runtime::PluginRegistration {
+            #static_ident.get_or_init(|| ::hammer_runtime::PluginRegistration {
                 name: #name,
                 version: env!("CARGO_PKG_VERSION"),
                 version_required: env!("CARGO_PKG_VERSION"),
                 load_after: &[#(#load_after),*],
-            };
+                init_functions: &::hammer_runtime::init::INIT_FUNCTIONS,
+                config_functions: &::hammer_runtime::init::CONFIG_FUNCTIONS,
+                early_config_functions: &::hammer_runtime::init::EARLY_CONFIG_FUNCTIONS,
+                main_loop_enter_functions: &::hammer_runtime::init::MAIN_LOOP_ENTER_FUNCTIONS,
+                main_loop_exit_functions: &::hammer_runtime::init::MAIN_LOOP_EXIT_FUNCTIONS,
+                worker_init_functions: &::hammer_runtime::init::WORKER_INIT_FUNCTIONS,
+                graph_nodes: &::hammer_runtime::GRAPH_NODES,
+                node_functions: &::hammer_runtime::node::NODE_FUNCTIONS,
+                process_nodes: &::hammer_runtime::PROCESS_NODES,
+            })
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn hammer_plugin_registration()
+            -> *const ::hammer_runtime::PluginRegistration
+        {
+            registration()
+        }
     }
 }
 
@@ -3061,7 +3095,7 @@ mod tests {
         let expanded = expand_plugin(args, &mut module)
             .expect("extern #[plugin] emits registration")
             .to_string();
-        assert!(expanded.contains("PLUGIN_REGISTRATIONS"));
+        assert!(expanded.contains("hammer_plugin_registration"));
         assert!(expanded.contains("name : \"tun\""));
         assert!(expanded.contains("mod tun ;"));
     }
@@ -3071,7 +3105,7 @@ mod tests {
         let args = syn::parse_str::<PluginArgs>(r#"name = "device", load_after = []"#)
             .expect("parse plugin args");
         let expanded = plugin_registration_tokens(&args).to_string();
-        assert!(expanded.contains("PLUGIN_REGISTRATIONS"));
+        assert!(expanded.contains("hammer_plugin_registration"));
         assert!(expanded.contains("PluginRegistration"));
         assert!(expanded.contains("name : \"device\""));
     }

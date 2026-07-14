@@ -165,10 +165,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
     }
 
     #[inline]
-    pub fn session_transport(
-        &self,
-        session_id: SessionId,
-    ) -> Option<(SessionTransportId, Index)> {
+    pub fn session_transport(&self, session_id: SessionId) -> Option<(SessionTransportId, Index)> {
         let entry = self.entries.get(session_id.pool_index())?;
         Some((entry.transport, entry.state.transport_index()?))
     }
@@ -225,11 +222,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
         self.entries.remove(session_id.pool_index()).is_some()
     }
 
-    pub fn notify_transport_closed(
-        &mut self,
-        session_id: SessionId,
-        index: Index,
-    ) -> CoreResult<()>
+    pub fn notify_transport_closed(&mut self, session_id: SessionId, index: Index) -> CoreResult<()>
     where
         SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
     {

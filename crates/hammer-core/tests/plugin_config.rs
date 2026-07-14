@@ -67,10 +67,7 @@ interfaces = ["utun"]
     )
     .expect("parse startup config");
 
-    let text = config
-        .plugin_toml_text("tun")
-        .expect("raw tun plugin toml");
+    let text = config.plugin_toml_text("tun").expect("raw tun plugin toml");
     assert!(text.contains("interfaces"));
     assert!(text.contains("utun"));
 }
-

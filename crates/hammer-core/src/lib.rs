@@ -6,7 +6,6 @@ pub mod forwarding;
 pub mod log;
 pub mod metrics;
 pub mod network;
-pub mod plugin;
 pub mod protocol;
 pub mod registry;
 

@@ -21,8 +21,6 @@ use hammer_service::interface::InterfaceControlPlane;
 use hammer_service::opaque::NetworkOpaque;
 
 // External `mod tun;` cannot receive ownership injection from `#[plugin]`.
-hammer_component_macros::declare_plugin!(name = "tun", load_after = []);
-
 /// TUN-owned instance list under `[plugin.tun]`.
 ///
 /// Names reference `[[network.interface]]` entries (L3/FIB). This driver

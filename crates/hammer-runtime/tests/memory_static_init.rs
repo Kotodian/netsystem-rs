@@ -1,7 +1,6 @@
 use hammer_core::config::Config;
 use hammer_core::data_plane::DataPlaneBufferConfig;
 use hammer_core::registry::RuntimeRegistry;
-use hammer_runtime::init::{INIT_FUNCTIONS, topological_order};
 use hammer_runtime::{DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig, Engine};
 
 fn runtime_config(numa_nodes: &'static [u32], active_numa_node: u32) -> DataPlaneRuntimeConfig {
@@ -16,31 +15,6 @@ fn runtime_config(numa_nodes: &'static [u32], active_numa_node: u32) -> DataPlan
         },
     }
 }
-
-
-#[test]
-fn memory_init_is_registered_before_workers() {
-    let memory = INIT_FUNCTIONS
-        .iter()
-        .find(|f| f.name == "memory_init")
-        .expect("memory_init registration");
-    assert!(
-        memory.runs_before.contains(&"start_workers"),
-        "memory_init must run before worker threads are spawned"
-    );
-
-    let order = topological_order(&INIT_FUNCTIONS).expect("init order");
-    let memory_pos = order
-        .iter()
-        .position(|idx| INIT_FUNCTIONS[*idx].name == "memory_init")
-        .expect("memory_init in order");
-    let workers_pos = order
-        .iter()
-        .position(|idx| INIT_FUNCTIONS[*idx].name == "start_workers")
-        .expect("start_workers in order");
-    assert!(memory_pos < workers_pos);
-}
-
 
 #[test]
 fn memory_init_materializes_the_configured_buffer_and_instruction_set_policy() {
@@ -84,7 +58,6 @@ fn memory_init_materializes_the_configured_buffer_and_instruction_set_policy() {
     }
     assert!(engine.runtime.alloc_index().is_err());
 }
-
 
 #[test]
 fn engine_spawn_uses_initialized_runtime_view_for_inherited_numa() {

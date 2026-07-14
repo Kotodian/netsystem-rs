@@ -1,68 +1,71 @@
-# Hammer statically linked plugin system
+# Hammer dynamic plugin system
 
-Date: 2026-07-14  
-Issue: #85  
-Parent: #72
+Date: 2026-07-14
+Issue: #96
+Supersedes: #85 static plugin assembly
 
-## Summary
+## Ownership
 
-Hammer uses a VPP-shaped **statically linked** plugin model with stronger Rust compile-time controls:
+Hammer follows VPP's split between library registration and main-thread plugin
+authority:
 
-1. **Cargo `plugin-<name>` features** decide what enters the binary catalog.
-2. **`#[plugin(name = "...")]`** lexical ownership tags every lifecycle/graph contribution.
-3. **TOML `plugins = [...]`** selects a loaded subset of the **compiled** catalog at startup.
-4. Required **`Arc<T>` DI** remains; optional injection is not used for feature activation.
+- `hammer-core` owns canonical Frame, Buffer, Index, and graph identity types.
+- `hammer-runtime::PluginRegistration` is the one registration block exported
+  by each dynamic library as `hammer_plugin_registration`.
+- `hammer-runtime::PluginMain` corresponds to VPP's `plugin_main_t`. It owns the
+  plugin path, every library handle, dependency order, and all imported
+  executable contributions.
+- `Engine` and every worker share one `Arc<PluginMain>`. Runtime graph state and
+  Process Node futures are destroyed before the final library handle.
 
-No `dlopen`, unload, `Plugin` trait, `PluginId`, activation token, or per-plugin graph slice.
+There is no Registrar, parallel data-plane type, second inventory export, weak
+registration symbol, or static/dynamic dual mode.
 
-## Compile-time
+## Loadable libraries
 
-### Features
+The loadable set is `tun`, `ip`, `tcp`, and `udp`:
 
-| Feature | Plugin name | Typical deps |
-|---|---|---|
-| `plugin-device` | `device` | — |
-| `plugin-interface` | `interface` | `plugin-device` |
-| `plugin-tun` | `tun` | `plugin-device`, `plugin-interface` |
-| `plugin-ip` | `ip` | `plugin-interface` |
-| `plugin-transport` | `transport` | `plugin-ip` |
-| `plugin-session` | `session` | `plugin-transport` |
-| `plugin-tcp` | `tcp` | `plugin-session`, `plugin-transport` |
-| `plugin-udp` | `udp` | `plugin-transport` |
+- `tun` is a device-driver plugin.
+- `ip`, `tcp`, and `udp` own their protocol graph and lifecycle contributions.
+- `device`, `interface`, `transport`, and `session` remain shared
+  `hammer-service` infrastructure and are not plugin roots.
+- TCP uses shared session infrastructure. UDP remains transport-only.
 
-Daemon (`hammer`) enables the product set explicitly. Uncompiled plugins never appear in `PLUGIN_REGISTRATIONS` or lifecycle slices.
+Linux uses `libhammer_plugin_<name>.so`; macOS uses
+`libhammer_plugin_<name>.dylib`. `HAMMER_PLUGIN_DIR` selects the directory; the
+default is the daemon executable directory.
 
-### `#[plugin]`
+## Registration and startup
 
-- Applied to an external module; children inherit ownership.
-- Emits `PluginRegistration { name, load_after }`.
-- Rejects nested plugins; restores poison scope; preserves `cfg` / `cfg_attr`.
-- Service declarations outside a plugin module are compile errors (trybuild).
+`declare_plugin!` generates the library's single strong registration export.
+The returned registration refers directly to that DSO's private `linkme`
+slices for init, config, worker init, main-loop hooks, Graph Nodes, Node
+Function variants, and Process Nodes.
 
-### DI
+Startup proceeds on the main thread:
 
-- Init/config adapters take required `Arc<T>` and may publish `Arc<T>`.
-- Feature deps ensure provider **types** exist when a consumer plugin is compiled.
-- Startup still fails if a loaded plugin never published a required `Arc` (ordering / empty config).
+1. Read configured root names from `plugins = [...]`.
+2. `PluginMain` opens each root and transitive `load_after` dependency, checks
+   the exported name and host SemVer, and rejects duplicates or cycles.
+3. For every phase, keep host records with `plugin = None` and import only DSO
+   records whose `plugin` equals that library's registration name. Builtins in
+   the DSO's private runtime copy are never imported.
+4. Run config/init ordering, build the graph once on the main thread, and clone
+   the resolved graph when workers are forked.
+5. Start Process Nodes on the main thread's Tokio `LocalSet`.
 
-## Runtime
+An empty root list opens no libraries and creates no plugin instances. Missing
+libraries fail with the plugin name and resolved platform path. Plugin TOML
+remains owned by `[plugin.<name>]` and is parsed by the plugin's lifecycle code.
 
-1. Validate `Config.plugins`: unique, each ∈ compiled catalog, `load_after` acyclic and only references loaded plugins (never auto-load).
-2. Filter every phase (`EARLY_CONFIG`, `CONFIG`, `INIT`, `GRAPH_NODES`, `WORKER_INIT`, `MAIN_LOOP_*`) by loaded set before DAG / `init_graph`.
-3. One global `GRAPH_NODES`; one main-thread `init_graph`; workers clone topology only.
-4. Early-config decodes `[plugin.<name>]` via `Config::plugin_config::<T>` into `RuntimeRegistry`.
-5. Config may create zero instances for a loaded plugin with an empty section.
+## Safety boundary
 
-## Catalogs
-
-- `PLUGIN_REGISTRATIONS: [PluginRegistration]`
-- `GRAPH_NODES: [NodeEntry]` (replaces `SERVICE_GRAPH_NODES` / `TUN_GRAPH_NODES` / `TCP_WORKER_GRAPH_NODES`)
-- Existing init slices gain `plugin: Option<&'static str>` (`None` = runtime builtin)
-- `MAIN_LOOP_CALLBACKS` becomes owner-bearing records (not bare `fn()`)
-
-## Non-goals
-
-- Dynamic loading / hot reload
-- `Plugin` trait / activation objects
-- Config alone enabling an uncompiled plugin
-- Typestate marker types (`TunPlugin`) unless a second consumer needs Interface approval
+- The registration symbol is called only while its `libloading::Library` is
+  held by `PluginMain`.
+- Imported slices and function pointers are used only by engines sharing that
+  same `PluginMain`.
+- Init calls are caught at the runtime dispatch boundary.
+- Normal shutdown joins workers and Process Nodes before dropping plugin
+  handles.
+- Runtime disable/unload must drain and rebuild the graph before replacing the
+  shared `PluginMain`; it is tracked separately from startup loading.

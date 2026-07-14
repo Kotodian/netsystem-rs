@@ -12,7 +12,9 @@ use hammer_core::error::{CoreError, CoreResult, DataPlaneError};
 
 use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HANDOFF_SLOT_CAPACITY, HandoffSlot};
 use crate::instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
-use crate::node::{NodeEntry, NodeRuntime, NodeRuntimeInner};
+use crate::node::{
+    NODE_FUNCTIONS, NodeEntry, NodeFunctionRegistration, NodeRuntime, NodeRuntimeInner,
+};
 use crate::trace::{DataPlaneTrace, PacketTrace, TraceControlHandle};
 use hammer_infra::vec::Vec;
 
@@ -351,6 +353,15 @@ impl DataPlaneRuntime {
     }
 
     pub fn init_graph(&self, worker: usize, entries: &[NodeEntry]) -> CoreResult<()> {
+        self.init_graph_with_node_functions(worker, entries, &NODE_FUNCTIONS)
+    }
+
+    pub fn init_graph_with_node_functions(
+        &self,
+        worker: usize,
+        entries: &[NodeEntry],
+        node_functions: &[NodeFunctionRegistration],
+    ) -> CoreResult<()> {
         if !self.instruction_set.is_supported() {
             return Err(CoreError::internal(format!(
                 "configured instruction set {:?} is not supported by this CPU",
@@ -371,7 +382,7 @@ impl DataPlaneRuntime {
                 ))
             })?;
             self.nodes
-                .install_node_function(node, self.instruction_set)?;
+                .install_node_function(node, self.instruction_set, node_functions)?;
         }
         self.nodes.resolve_named_next_nodes()
     }
@@ -383,9 +394,18 @@ impl DataPlaneRuntime {
     /// Does not invent plugin unload; disable/isolate is catalog filtering
     /// before rebuild (#95). Business state must rebind by name, not NodeId.
     pub fn rebuild_graph(&self, worker: usize, entries: &[NodeEntry]) -> CoreResult<()> {
+        self.rebuild_graph_with_node_functions(worker, entries, &NODE_FUNCTIONS)
+    }
+
+    pub fn rebuild_graph_with_node_functions(
+        &self,
+        worker: usize,
+        entries: &[NodeEntry],
+        node_functions: &[NodeFunctionRegistration],
+    ) -> CoreResult<()> {
         self.set_current_node(None);
         self.nodes.detach_graph_for_rebuild();
-        self.init_graph(worker, entries)
+        self.init_graph_with_node_functions(worker, entries, node_functions)
     }
 
     #[inline]

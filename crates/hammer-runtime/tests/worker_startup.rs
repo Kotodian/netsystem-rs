@@ -30,16 +30,10 @@ fn startup_node_process(
 #[hammer_component_macros::worker_init_function(name = "verify_worker_startup_contract")]
 fn verify_worker_startup_contract(engine: &mut Engine) -> HammerResult<()> {
     let worker = engine.data_worker_id()?;
-    let node = engine.runtime.nodes().try_register_descriptor(
-        NodeKind::Internal,
-        NodeDescriptor::new(
-            startup_node_process,
-            NodeRuntimeData::from_words([worker.slot() as u64 + 1, 0, 0, 0]),
-            NodeRegistration::next("startup-node", 0),
-            &[],
-            None,
-        ),
-    )?;
+    let node = engine
+        .runtime
+        .node_by_name("startup-node")
+        .ok_or_else(|| CoreError::internal("worker clone is missing startup-node"))?;
     assert_eq!(node, NodeId::new(0));
     engine
         .runtime
@@ -132,7 +126,7 @@ fn data_worker_startup_is_transactional() {
     assert!(
         error
             .to_string()
-            .contains("data worker panicked during initialization")
+            .contains("init function `verify_worker_startup_contract` panicked")
     );
     stop_workers(&mut pool);
 }

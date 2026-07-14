@@ -8,12 +8,9 @@ use hammer_core::registry::RuntimeRegistry;
 use hammer_runtime::engine::{Engine, EnginePool};
 use hammer_runtime::new_worker_runtime;
 
-// Force-link service init/graph distributed slices into the daemon binary.
 use hammer_infra::vec::Vec;
-use hammer_plugin_ip as _;
-use hammer_plugin_tcp as _;
-use hammer_plugin_tun as _;
-use hammer_plugin_udp as _;
+// Shared device/interface/transport/session infrastructure contributes host
+// builtins; loadable protocol and device-driver code comes only from DSOs.
 use hammer_service as _;
 
 mod ipc_handlers;

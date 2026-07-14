@@ -1,120 +1,349 @@
-//! Statically linked plugin catalog wiring on top of `hammer_core::plugin`.
+//! Dynamic plugin registration and dependency selection.
 //!
-//! Cargo features decide which `PluginRegistration` entries are linked into
-//! `PLUGIN_REGISTRATIONS`. Startup `Config.plugins` selects a loaded subset;
-//! lifecycle and graph contributions are then filtered by that set.
+//! Registration records are owned by `hammer-runtime`, like VPP keeps plugin
+//! and executable registration in `vlib`. Each plugin DSO exports exactly one
+//! [`PluginRegistration`] whose slices refer to that DSO's private inventories.
 
-use hammer_core::error::HammerResult;
+use semver::{Version, VersionReq};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use hammer_core::error::HammerError;
 use hammer_infra::vec::Vec;
+use libloading::Library;
 
-pub use hammer_core::plugin::{
-    PluginError, PluginRegistration, filter_by_plugin, host_meets_plugin_requirement,
-    select_and_expand_plugins, select_loaded_plugins_from, validate_catalog_semver,
+use crate::init::{
+    CONFIG_FUNCTIONS, EARLY_CONFIG_FUNCTIONS, INIT_FUNCTIONS, InitFunction,
+    MAIN_LOOP_ENTER_FUNCTIONS, MAIN_LOOP_EXIT_FUNCTIONS, WORKER_INIT_FUNCTIONS,
 };
+use crate::node::{GRAPH_NODES, NODE_FUNCTIONS, NodeEntry, NodeFunctionRegistration};
+use crate::plugin_loader::{plugin_cdylib_path, read_plugin_registration};
+use crate::process::{PROCESS_NODES, ProcessEntry};
 
-#[linkme::distributed_slice]
-pub static PLUGIN_REGISTRATIONS: [PluginRegistration] = [..];
-
-/// Names of every plugin linked into this binary.
-pub fn compiled_plugin_names() -> Vec<&'static str> {
-    PLUGIN_REGISTRATIONS
-        .iter()
-        .map(|registration| registration.name)
-        .collect()
+/// Metadata and executable inventories exported by one plugin DSO.
+#[derive(Clone, Copy)]
+pub struct PluginRegistration {
+    pub name: &'static str,
+    pub version: &'static str,
+    pub version_required: &'static str,
+    pub load_after: &'static [&'static str],
+    pub init_functions: &'static [InitFunction],
+    pub config_functions: &'static [InitFunction],
+    pub early_config_functions: &'static [InitFunction],
+    pub main_loop_enter_functions: &'static [InitFunction],
+    pub main_loop_exit_functions: &'static [InitFunction],
+    pub worker_init_functions: &'static [InitFunction],
+    pub graph_nodes: &'static [NodeEntry],
+    pub node_functions: &'static [NodeFunctionRegistration],
+    pub process_nodes: &'static [ProcessEntry],
 }
 
-/// Validate and order the requested plugin list against the compiled catalog.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PluginError {
+    #[error("unknown plugin `{0}`")]
+    Unknown(String),
+    #[error("duplicate plugin `{0}` in requested list")]
+    Duplicate(String),
+    #[error("plugin load_after cycle involving `{0}`")]
+    Cycle(String),
+    #[error("host version `{host}` does not satisfy plugin requirement `{required}`")]
+    SemVerMismatch { host: String, required: String },
+    #[error("invalid semver: {0}")]
+    InvalidSemVer(String),
+    #[error("failed to open plugin `{name}` at `{path}`: {error}")]
+    LibraryOpen {
+        name: String,
+        path: PathBuf,
+        error: String,
+    },
+    #[error("failed to read registration from plugin `{name}` at `{path}`: {error}")]
+    Registration {
+        name: String,
+        path: PathBuf,
+        error: String,
+    },
+    #[error("plugin file for `{requested}` exported registration for `{exported}`")]
+    NameMismatch { requested: String, exported: String },
+}
+
+impl From<PluginError> for HammerError {
+    fn from(error: PluginError) -> Self {
+        HammerError::config_validation(error.to_string())
+    }
+}
+
+/// Main-thread plugin authority, corresponding to VPP's `plugin_main_t`.
 ///
-/// Rejects unknown names, duplicates, `load_after` edges to unloaded plugins,
-/// and cycles among the selected set. Does not auto-load missing dependencies.
-pub fn select_loaded_plugins(requested: &[String]) -> HammerResult<Vec<&'static str>> {
-    select_loaded_plugins_from(requested, &PLUGIN_REGISTRATIONS).map_err(Into::into)
+/// The library table owns every DSO handle. Engines and workers share this
+/// object so imported function pointers and static registration data cannot
+/// outlive their provider library.
+pub struct PluginMain {
+    host_version: String,
+    plugin_path: PathBuf,
+    libraries: HashMap<String, Library>,
+    load_order: Vec<String>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+impl std::fmt::Debug for PluginMain {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PluginMain")
+            .field("host_version", &self.host_version)
+            .field("plugin_path", &self.plugin_path)
+            .field("load_order", &self.load_order)
+            .finish_non_exhaustive()
+    }
+}
 
-    fn catalog(entries: &[(&'static str, &'static [&'static str])]) -> Vec<PluginRegistration> {
-        entries
+impl PluginMain {
+    pub fn empty(host_version: impl Into<String>) -> Self {
+        Self {
+            host_version: host_version.into(),
+            plugin_path: PathBuf::new(),
+            libraries: HashMap::new(),
+            load_order: Vec::new(),
+        }
+    }
+
+    /// Load configured roots and their transitive `load_after` dependencies.
+    ///
+    /// A failed load drops the partially built `PluginMain`, closing every DSO
+    /// before any imported contribution can be installed into the runtime.
+    pub fn load(
+        host_version: impl Into<String>,
+        plugin_path: impl Into<PathBuf>,
+        roots: &[String],
+    ) -> Result<Self, PluginError> {
+        let mut main = Self {
+            host_version: host_version.into(),
+            plugin_path: plugin_path.into(),
+            libraries: HashMap::new(),
+            load_order: Vec::new(),
+        };
+        let mut requested = Vec::with_capacity(roots.len());
+        for root in roots {
+            if requested.contains(root) {
+                return Err(PluginError::Duplicate(root.clone()));
+            }
+            requested.push(root.clone());
+        }
+        let mut visiting = Vec::new();
+        for root in roots {
+            main.load_one(root, &mut visiting)?;
+        }
+        Ok(main)
+    }
+
+    fn load_one(&mut self, name: &str, visiting: &mut Vec<String>) -> Result<(), PluginError> {
+        if visiting.iter().any(|candidate| candidate == name) {
+            return Err(PluginError::Cycle(name.to_owned()));
+        }
+        if self.libraries.contains_key(name) {
+            return Ok(());
+        }
+
+        let path = plugin_cdylib_path(&self.plugin_path, name);
+        // SAFETY: `PluginMain` retains the returned handle until every Engine
+        // sharing it has stopped using imported registration data.
+        let library = unsafe { Library::new(&path) }.map_err(|error| PluginError::LibraryOpen {
+            name: name.to_owned(),
+            path: path.clone(),
+            error: error.to_string(),
+        })?;
+        let (exported_name, version_required, dependencies) = {
+            let registration =
+                read_plugin_registration(&library).map_err(|error| PluginError::Registration {
+                    name: name.to_owned(),
+                    path: path.clone(),
+                    error,
+                })?;
+            (
+                registration.name.to_owned(),
+                registration.version_required.to_owned(),
+                registration
+                    .load_after
+                    .iter()
+                    .map(|dependency| (*dependency).to_owned())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        if exported_name != name {
+            return Err(PluginError::NameMismatch {
+                requested: name.to_owned(),
+                exported: exported_name,
+            });
+        }
+        host_meets_plugin_requirement(&self.host_version, &version_required)?;
+
+        self.libraries.insert(name.to_owned(), library);
+        visiting.push(name.to_owned());
+        for dependency in dependencies {
+            self.load_one(&dependency, visiting)?;
+        }
+        visiting.pop();
+        self.load_order.push(name.to_owned());
+        Ok(())
+    }
+
+    #[inline]
+    pub fn plugin_path(&self) -> &Path {
+        &self.plugin_path
+    }
+
+    #[inline]
+    pub fn loaded_plugins(&self) -> &[String] {
+        &self.load_order
+    }
+
+    pub fn registration(&self, name: &str) -> Result<&PluginRegistration, PluginError> {
+        let library = self
+            .libraries
+            .get(name)
+            .ok_or_else(|| PluginError::Unknown(name.to_owned()))?;
+        read_plugin_registration(library).map_err(|error| PluginError::Registration {
+            name: name.to_owned(),
+            path: plugin_cdylib_path(&self.plugin_path, name),
+            error,
+        })
+    }
+
+    fn registrations(&self) -> Vec<&PluginRegistration> {
+        self.load_order
             .iter()
-            .map(|(name, load_after)| PluginRegistration {
-                name,
-                version: "0.1.0",
-                version_required: "0.1.0",
-                load_after,
+            .map(|name| {
+                self.registration(name)
+                    .expect("loaded plugin registration was already validated")
             })
             .collect()
     }
 
-    #[test]
-    fn rejects_unknown_plugin() {
-        let catalog = catalog(&[("tun", &[])]);
-        let err = select_loaded_plugins_from(&["tcp".into()], &catalog).unwrap_err();
-        assert_eq!(err, PluginError::Unknown("tcp".into()));
+    pub fn init_functions(&self) -> Vec<InitFunction> {
+        collect_owned(
+            &INIT_FUNCTIONS,
+            &self.registrations(),
+            |entry| entry.plugin,
+            |registration| registration.init_functions,
+        )
     }
 
-    #[test]
-    fn rejects_duplicate() {
-        let catalog = catalog(&[("tun", &[])]);
-        let err = select_loaded_plugins_from(&["tun".into(), "tun".into()], &catalog).unwrap_err();
-        assert_eq!(err, PluginError::Duplicate("tun".into()));
+    pub fn config_functions(&self, early: bool) -> Vec<InitFunction> {
+        if early {
+            collect_owned(
+                &EARLY_CONFIG_FUNCTIONS,
+                &self.registrations(),
+                |entry| entry.plugin,
+                |registration| registration.early_config_functions,
+            )
+        } else {
+            collect_owned(
+                &CONFIG_FUNCTIONS,
+                &self.registrations(),
+                |entry| entry.plugin,
+                |registration| registration.config_functions,
+            )
+        }
     }
 
-    #[test]
-    fn rejects_load_after_cycle() {
-        let catalog = catalog(&[("a", &["b"]), ("b", &["a"])]);
-        let err = select_loaded_plugins_from(&["a".into(), "b".into()], &catalog).unwrap_err();
-        assert!(matches!(err, PluginError::Cycle(_)));
+    pub fn worker_init_functions(&self) -> Vec<InitFunction> {
+        collect_owned(
+            &WORKER_INIT_FUNCTIONS,
+            &self.registrations(),
+            |entry| entry.plugin,
+            |registration| registration.worker_init_functions,
+        )
     }
 
-    #[test]
-    fn rejects_load_after_unloaded() {
-        let catalog = catalog(&[("tcp", &["session"]), ("session", &[])]);
-        let err = select_loaded_plugins_from(&["tcp".into()], &catalog).unwrap_err();
-        assert_eq!(
-            err,
-            PluginError::LoadAfterMissing {
-                name: "tcp".into(),
-                dep: "session".into(),
-            }
+    pub fn main_loop_enter_functions(&self) -> Vec<InitFunction> {
+        collect_owned(
+            &MAIN_LOOP_ENTER_FUNCTIONS,
+            &self.registrations(),
+            |entry| entry.plugin,
+            |registration| registration.main_loop_enter_functions,
+        )
+    }
+
+    pub fn main_loop_exit_functions(&self) -> Vec<InitFunction> {
+        collect_owned(
+            &MAIN_LOOP_EXIT_FUNCTIONS,
+            &self.registrations(),
+            |entry| entry.plugin,
+            |registration| registration.main_loop_exit_functions,
+        )
+    }
+
+    pub fn graph_nodes(&self) -> Vec<NodeEntry> {
+        collect_owned(
+            &GRAPH_NODES,
+            &self.registrations(),
+            |entry| entry.plugin,
+            |registration| registration.graph_nodes,
+        )
+    }
+
+    pub fn node_functions(&self) -> Vec<NodeFunctionRegistration> {
+        collect_owned(
+            &NODE_FUNCTIONS,
+            &self.registrations(),
+            NodeFunctionRegistration::plugin,
+            |registration| registration.node_functions,
+        )
+    }
+
+    pub fn process_nodes(&self) -> Vec<ProcessEntry> {
+        collect_owned(
+            &PROCESS_NODES,
+            &self.registrations(),
+            |entry| entry.plugin,
+            |registration| registration.process_nodes,
+        )
+    }
+}
+
+pub fn host_meets_plugin_requirement(
+    host_version: &str,
+    version_required: &str,
+) -> Result<(), PluginError> {
+    if version_required.is_empty() {
+        return Ok(());
+    }
+    let host = Version::parse(host_version)
+        .map_err(|error| PluginError::InvalidSemVer(format!("host `{host_version}`: {error}")))?;
+    let required = Version::parse(version_required).map_err(|error| {
+        PluginError::InvalidSemVer(format!("required `{version_required}`: {error}"))
+    })?;
+    let requirement = VersionReq::parse(&format!(">={required}"))
+        .map_err(|error| PluginError::InvalidSemVer(error.to_string()))?;
+    if requirement.matches(&host) {
+        Ok(())
+    } else {
+        Err(PluginError::SemVerMismatch {
+            host: host_version.to_owned(),
+            required: version_required.to_owned(),
+        })
+    }
+}
+
+/// Copy host builtins and only records explicitly owned by each loaded DSO.
+fn collect_owned<T: Copy>(
+    builtins: &[T],
+    registrations: &[&PluginRegistration],
+    plugin_of: impl Fn(&T) -> Option<&'static str>,
+    inventory: impl Fn(&PluginRegistration) -> &[T],
+) -> Vec<T> {
+    let mut collected = Vec::new();
+    collected.extend(
+        builtins
+            .iter()
+            .filter(|entry| plugin_of(entry).is_none())
+            .copied(),
+    );
+    for registration in registrations {
+        collected.extend(
+            inventory(registration)
+                .iter()
+                .filter(|entry| plugin_of(entry) == Some(registration.name))
+                .copied(),
         );
     }
-
-    #[test]
-    fn orders_by_load_after() {
-        let catalog = catalog(&[("tcp", &["session"]), ("session", &[]), ("ip", &[])]);
-        let loaded =
-            select_loaded_plugins_from(&["tcp".into(), "session".into(), "ip".into()], &catalog)
-                .expect("select");
-        let session = loaded.iter().position(|n| *n == "session").unwrap();
-        let tcp = loaded.iter().position(|n| *n == "tcp").unwrap();
-        assert!(session < tcp);
-    }
-
-    #[test]
-    fn filter_keeps_builtins_and_loaded_only() {
-        #[derive(Debug, PartialEq)]
-        struct Item {
-            plugin: Option<&'static str>,
-            name: &'static str,
-        }
-        let items = [
-            Item {
-                plugin: None,
-                name: "builtin",
-            },
-            Item {
-                plugin: Some("tun"),
-                name: "tun-node",
-            },
-            Item {
-                plugin: Some("tcp"),
-                name: "tcp-node",
-            },
-        ];
-        let filtered = filter_by_plugin(&items, &["tun"], |item| item.plugin);
-        let names: Vec<&str> = filtered.iter().map(|item| item.name).collect();
-        assert_eq!(names, hammer_infra::vec!["builtin", "tun-node"]);
-    }
+    collected
 }

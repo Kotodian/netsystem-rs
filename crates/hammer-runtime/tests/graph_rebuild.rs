@@ -1,12 +1,10 @@
 //! Graph rebuild transaction prototype (#100).
 
-use hammer_core::data_plane::{
-    DataPlaneBufferConfig, NodeId, NodeKind, NodeRegistration,
-};
+use hammer_core::data_plane::{DataPlaneBufferConfig, NodeId, NodeKind, NodeRegistration};
 use hammer_core::error::CoreResult;
 use hammer_runtime::{
-    DataPlaneRuntime, DataPlaneRuntimeConfig, NodeDescriptor, NodeEntry, NodeProcessFn,
-    NodeResult, NodeRuntimeData,
+    DataPlaneRuntime, DataPlaneRuntimeConfig, NodeDescriptor, NodeEntry, NodeProcessFn, NodeResult,
+    NodeRuntimeData,
 };
 
 fn test_runtime() -> DataPlaneRuntime {
@@ -97,7 +95,9 @@ fn rebuild_graph_renumbers_nodes_and_invalidates_old_node_ids() {
     assert_eq!(old_beta.slot(), 1);
 
     // Shrink the graph so the previous high slot becomes out of range.
-    runtime.rebuild_graph(0, &[entry("gamma")]).expect("rebuild");
+    runtime
+        .rebuild_graph(0, &[entry("gamma")])
+        .expect("rebuild");
 
     assert!(
         runtime.nodes().node_name(old_beta).is_err(),
@@ -106,7 +106,9 @@ fn rebuild_graph_renumbers_nodes_and_invalidates_old_node_ids() {
     assert!(runtime.node_by_name("alpha").is_none());
     assert!(runtime.node_by_name("beta").is_none());
 
-    let new_gamma = runtime.node_by_name("gamma").expect("gamma rebound by name");
+    let new_gamma = runtime
+        .node_by_name("gamma")
+        .expect("gamma rebound by name");
     assert_eq!(new_gamma.slot(), 0);
     // Slot reuse is VPP-shaped: callers must rebind by name, never cache NodeId.
     assert_eq!(old_alpha.slot(), new_gamma.slot());
