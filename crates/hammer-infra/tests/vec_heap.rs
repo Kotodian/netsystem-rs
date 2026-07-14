@@ -38,6 +38,35 @@ fn hammer_vec_routes_through_heap_handle() {
 }
 
 #[test]
+fn explicit_svm_vec_keeps_its_heap_across_the_full_lifecycle() {
+    let region = SvmRegion::with_size(1 << 20);
+    let heap = Arc::new(Heap::svm_data(region.clone()).expect("owner region heap"));
+    let start = region.base() as usize;
+    let end = start + region.size();
+
+    let mut values = HVec::with_capacity_in(0, heap);
+    for value in 0..256_u64 {
+        values.push(value);
+    }
+    let values_ptr = values.as_ptr() as usize;
+    assert!(values_ptr >= start && values_ptr < end);
+
+    let clone = values.clone();
+    let clone_ptr = clone.as_ptr() as usize;
+    assert!(clone_ptr >= start && clone_ptr < end);
+
+    let boxed = clone.into_boxed_slice();
+    let boxed_ptr = boxed.as_ptr() as usize;
+    assert!(boxed_ptr >= start && boxed_ptr < end);
+
+    let mut consumed = values.into_iter();
+    assert_eq!(consumed.next(), Some(0));
+    assert_eq!(consumed.size_hint(), (255, Some(255)));
+    drop(consumed);
+    drop(boxed);
+}
+
+#[test]
 fn hammer_vec_default_does_not_touch_a_svm_probe() {
     let mut v: HVec<u64> = HVec::with_capacity(64);
     v.push(7);
