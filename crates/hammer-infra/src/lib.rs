@@ -1,3 +1,13 @@
+#![doc = r#"
+```compile_fail
+use hammer_infra::heap::Heap;
+```
+
+```compile_fail
+use hammer_infra::vec::RawVec;
+```
+"#]
+
 pub mod align;
 pub mod bihash;
 pub mod bitmap;
