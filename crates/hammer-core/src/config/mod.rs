@@ -88,6 +88,24 @@ impl Config {
             .map_err(|error| HammerError::config_parse(format!("parse plugin.{name}: {error}")))
     }
 
+    /// Raw TOML text for `[plugin.<name>]` (empty table if section absent).
+    ///
+    /// Dynamic plugins parse this themselves (#95 TOML text handoff).
+    pub fn plugin_toml_text(&self, name: &str) -> HammerResult<String> {
+        if !self.plugins.iter().any(|plugin| plugin == name) {
+            return Err(HammerError::config_validation(format!(
+                "plugin `{name}` is not requested"
+            )));
+        }
+        let value = self
+            .plugin_sections
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| toml::Value::Table(toml::Table::new()));
+        toml::to_string(&value)
+            .map_err(|error| HammerError::internal(format!("encode plugin.{name}: {error}")))
+    }
+
     /// Validate every section's invariants. Called by `parse_config` and
     /// `load_config` after assembly.
     pub fn validate(&self) -> HammerResult<()> {

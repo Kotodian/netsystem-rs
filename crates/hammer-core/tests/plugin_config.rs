@@ -54,3 +54,23 @@ plugins = ["tun"]
         .expect("decode empty TUN plugin config");
     assert!(tun.interfaces.is_empty());
 }
+
+#[test]
+fn plugin_toml_text_hands_raw_section_to_plugin() {
+    let config = parse_config(
+        r#"
+plugins = ["tun"]
+
+[plugin.tun]
+interfaces = ["utun"]
+"#,
+    )
+    .expect("parse startup config");
+
+    let text = config
+        .plugin_toml_text("tun")
+        .expect("raw tun plugin toml");
+    assert!(text.contains("interfaces"));
+    assert!(text.contains("utun"));
+}
+

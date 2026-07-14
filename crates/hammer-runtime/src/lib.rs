@@ -9,6 +9,7 @@ pub mod init;
 pub mod main_loop;
 pub mod memory;
 pub mod plugin;
+pub mod plugin_loader;
 
 pub use hammer_core::error::{HammerError, HammerResult};
 pub use hammer_core::protocol::icmp::IcmpErrorMetadata;
@@ -35,7 +36,11 @@ pub use node::{
 };
 pub use plugin::{
     PLUGIN_REGISTRATIONS, PluginError, PluginRegistration, compiled_plugin_names, filter_by_plugin,
-    select_loaded_plugins, select_loaded_plugins_from,
+    host_meets_plugin_requirement, select_and_expand_plugins, select_loaded_plugins,
+    select_loaded_plugins_from, validate_catalog_semver,
+};
+pub use plugin_loader::{
+    collect_plugin_inventory, plugin_cdylib_filename, plugin_cdylib_path, LoadTransaction,
 };
 pub use trace::{
     PacketTrace, TraceControlHandle, TraceControlPlane, TraceEntry, TraceFormatter,

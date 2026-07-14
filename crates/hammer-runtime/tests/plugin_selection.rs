@@ -8,7 +8,12 @@ use hammer_runtime::{
 fn catalog(entries: &[(&'static str, &'static [&'static str])]) -> Vec<PluginRegistration> {
     entries
         .iter()
-        .map(|(name, load_after)| PluginRegistration { name, load_after })
+        .map(|(name, load_after)| PluginRegistration {
+            name,
+            version: "0.1.0",
+            version_required: "0.1.0",
+            load_after,
+        })
         .collect()
 }
 
@@ -39,7 +44,7 @@ fn load_after_to_unloaded_plugin_is_rejected() {
     let err = select_loaded_plugins_from(&["tcp".into()], &catalog).unwrap_err();
     assert_eq!(
         err,
-        PluginError::LoadAfterUnloaded {
+        PluginError::LoadAfterMissing {
             name: "tcp".into(),
             dep: "session".into(),
         }

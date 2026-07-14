@@ -1,0 +1,11 @@
+[package]
+name = "hammer-plugin-abi-host"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+hammer-core = { workspace = true }
+hammer-runtime = { workspace = true }
+libloading = { workspace = true }
+abi_stable = { workspace = true }

@@ -2459,6 +2459,8 @@ fn plugin_registration_tokens(args: &PluginArgs) -> TokenStream2 {
         static #static_ident: ::hammer_runtime::PluginRegistration =
             ::hammer_runtime::PluginRegistration {
                 name: #name,
+                version: env!("CARGO_PKG_VERSION"),
+                version_required: env!("CARGO_PKG_VERSION"),
                 load_after: &[#(#load_after),*],
             };
     }

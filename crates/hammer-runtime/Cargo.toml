@@ -29,6 +29,7 @@ metrics = { workspace = true }
 metrics-derive = { workspace = true }
 ipnet = { workspace = true }
 libc = { workspace = true }
+libloading = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 core_affinity = { workspace = true }

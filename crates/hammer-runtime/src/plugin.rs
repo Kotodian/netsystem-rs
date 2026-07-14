@@ -1,41 +1,19 @@
-//! Statically linked plugin catalog and startup selection.
+//! Statically linked plugin catalog wiring on top of `hammer_core::plugin`.
 //!
 //! Cargo features decide which `PluginRegistration` entries are linked into
 //! `PLUGIN_REGISTRATIONS`. Startup `Config.plugins` selects a loaded subset;
 //! lifecycle and graph contributions are then filtered by that set.
 
-use hammer_core::error::{HammerError, HammerResult};
+use hammer_core::error::HammerResult;
 use hammer_infra::vec::Vec;
-use petgraph::algo::toposort;
-use petgraph::graphmap::DiGraphMap;
 
-/// Static metadata for one compiled plugin (VPP `VLIB_PLUGIN_REGISTER` shape).
-#[derive(Debug, Clone, Copy)]
-pub struct PluginRegistration {
-    pub name: &'static str,
-    pub load_after: &'static [&'static str],
-}
+pub use hammer_core::plugin::{
+    PluginError, PluginRegistration, filter_by_plugin, host_meets_plugin_requirement,
+    select_and_expand_plugins, select_loaded_plugins_from, validate_catalog_semver,
+};
 
 #[linkme::distributed_slice]
 pub static PLUGIN_REGISTRATIONS: [PluginRegistration] = [..];
-
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum PluginError {
-    #[error("unknown plugin `{0}` (not in compiled catalog)")]
-    Unknown(String),
-    #[error("duplicate plugin `{0}` in requested list")]
-    Duplicate(String),
-    #[error("plugin `{name}` load_after references unloaded plugin `{dep}`")]
-    LoadAfterUnloaded { name: String, dep: String },
-    #[error("plugin load_after cycle involving `{0}`")]
-    Cycle(String),
-}
-
-impl From<PluginError> for HammerError {
-    fn from(err: PluginError) -> Self {
-        HammerError::config_validation(err.to_string())
-    }
-}
 
 /// Names of every plugin linked into this binary.
 pub fn compiled_plugin_names() -> Vec<&'static str> {
@@ -53,63 +31,6 @@ pub fn select_loaded_plugins(requested: &[String]) -> HammerResult<Vec<&'static 
     select_loaded_plugins_from(requested, &PLUGIN_REGISTRATIONS).map_err(Into::into)
 }
 
-/// Testable selection against an explicit catalog (avoids linkme in unit tests).
-pub fn select_loaded_plugins_from(
-    requested: &[String],
-    catalog: &[PluginRegistration],
-) -> Result<Vec<&'static str>, PluginError> {
-    let mut selected: Vec<&'static str> = Vec::with_capacity(requested.len());
-    for name in requested {
-        let Some(registration) = catalog.iter().find(|entry| entry.name == name.as_str()) else {
-            return Err(PluginError::Unknown(name.clone()));
-        };
-        if selected.contains(&registration.name) {
-            return Err(PluginError::Duplicate(name.clone()));
-        }
-        selected.push(registration.name);
-    }
-
-    let selected_set = &selected;
-    let mut graph = DiGraphMap::<&str, ()>::new();
-    for name in selected_set.iter().copied() {
-        graph.add_node(name);
-    }
-    for name in selected_set.iter().copied() {
-        let registration = catalog
-            .iter()
-            .find(|entry| entry.name == name)
-            .expect("selected name must be in catalog");
-        for dep in registration.load_after {
-            if !selected_set.iter().any(|loaded| *loaded == *dep) {
-                return Err(PluginError::LoadAfterUnloaded {
-                    name: name.to_owned(),
-                    dep: (*dep).to_owned(),
-                });
-            }
-            graph.add_edge(*dep, name, ());
-        }
-    }
-
-    let ordered =
-        toposort(&graph, None).map_err(|cycle| PluginError::Cycle(cycle.node_id().to_string()))?;
-    Ok(ordered.into_iter().collect())
-}
-
-/// Keep builtins (`plugin: None`) and contributions owned by a loaded plugin.
-pub fn filter_by_plugin<'a, T>(
-    items: &'a [T],
-    loaded: &[&str],
-    plugin_of: impl Fn(&T) -> Option<&'static str>,
-) -> Vec<&'a T> {
-    items
-        .iter()
-        .filter(|item| match plugin_of(item) {
-            None => true,
-            Some(name) => loaded.iter().any(|loaded| *loaded == name),
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,7 +38,12 @@ mod tests {
     fn catalog(entries: &[(&'static str, &'static [&'static str])]) -> Vec<PluginRegistration> {
         entries
             .iter()
-            .map(|(name, load_after)| PluginRegistration { name, load_after })
+            .map(|(name, load_after)| PluginRegistration {
+                name,
+                version: "0.1.0",
+                version_required: "0.1.0",
+                load_after,
+            })
             .collect()
     }
 
@@ -148,7 +74,7 @@ mod tests {
         let err = select_loaded_plugins_from(&["tcp".into()], &catalog).unwrap_err();
         assert_eq!(
             err,
-            PluginError::LoadAfterUnloaded {
+            PluginError::LoadAfterMissing {
                 name: "tcp".into(),
                 dep: "session".into(),
             }

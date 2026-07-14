@@ -1,0 +1,14 @@
+[workspace]
+resolver = "3"
+members = ["host", "plugin"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+hammer-core = { path = "../../crates/hammer-core" }
+hammer-runtime = { path = "../../crates/hammer-runtime" }
+libloading = "0.8"
+abi_stable = { version = "0.11.3", default-features = false }

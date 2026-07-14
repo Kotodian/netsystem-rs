@@ -1,0 +1,12 @@
+[package]
+name = "hammer-plugin-abi-plugin"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+hammer-core = { workspace = true }
+hammer-runtime = { workspace = true }
