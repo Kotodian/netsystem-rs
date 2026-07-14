@@ -73,7 +73,7 @@ linkme = "0.3"
 petgraph = "0.6"
 clap = "4"
 bincode = "1"
-mimalloc = { version = "0.1", default-features = false }
+mimalloc = { version = "0.1", default-features = false, features = ["local_dynamic_tls"] }
 talc = { version = "5.0.4", default-features = false }
 spinning_top = "0.3"
 io-uring = "0.7.13"

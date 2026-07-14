@@ -62,6 +62,8 @@ remains owned by `[plugin.<name>]` and is parsed by the plugin's lifecycle code.
 
 - The registration symbol is called only while its `libloading::Library` is
   held by `PluginMain`.
+- Workspace mimalloc uses local-dynamic TLS so each Linux plugin DSO can own its
+  allocator instance without consuming the process's fixed static TLS reserve.
 - Imported slices and function pointers are used only by engines sharing that
   same `PluginMain`.
 - Init calls are caught at the runtime dispatch boundary.
