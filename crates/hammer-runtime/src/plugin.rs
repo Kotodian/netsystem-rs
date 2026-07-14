@@ -10,15 +10,14 @@ use std::path::{Path, PathBuf};
 
 use hammer_core::error::HammerError;
 use hammer_infra::vec::Vec;
+use libloading::Library;
 
 use crate::init::{
     CONFIG_FUNCTIONS, EARLY_CONFIG_FUNCTIONS, INIT_FUNCTIONS, InitFunction,
     MAIN_LOOP_ENTER_FUNCTIONS, MAIN_LOOP_EXIT_FUNCTIONS, WORKER_INIT_FUNCTIONS,
 };
 use crate::node::{GRAPH_NODES, NODE_FUNCTIONS, NodeEntry, NodeFunctionRegistration};
-use crate::plugin_loader::{
-    PluginLibrary, open_plugin_library, plugin_cdylib_path, read_plugin_registration,
-};
+use crate::plugin_loader::{plugin_cdylib_path, read_plugin_registration};
 use crate::process::{PROCESS_NODES, ProcessEntry};
 
 /// Metadata and executable inventories exported by one plugin DSO.
@@ -77,12 +76,11 @@ impl From<PluginError> for HammerError {
 ///
 /// The library table owns every DSO handle. Engines and workers share this
 /// object so imported function pointers and static registration data cannot
-/// outlive the live handle. Startup-loaded handles and Unix images remain live
-/// until process exit because active Rust DSO unload is not yet proven safe.
+/// outlive their provider library.
 pub struct PluginMain {
     host_version: String,
     plugin_path: PathBuf,
-    libraries: HashMap<String, PluginLibrary>,
+    libraries: HashMap<String, Library>,
     load_order: Vec<String>,
 }
 
@@ -109,9 +107,8 @@ impl PluginMain {
 
     /// Load configured roots and their transitive `load_after` dependencies.
     ///
-    /// A failed load drops the partially built `PluginMain` without calling
-    /// `dlclose`; no imported contribution is installed into the runtime, and
-    /// the operating system reclaims opened handles at process exit.
+    /// A failed load drops the partially built `PluginMain`, closing every DSO
+    /// before any imported contribution can be installed into the runtime.
     pub fn load(
         host_version: impl Into<String>,
         plugin_path: impl Into<PathBuf>,
@@ -146,7 +143,9 @@ impl PluginMain {
         }
 
         let path = plugin_cdylib_path(&self.plugin_path, name);
-        let library = open_plugin_library(&path).map_err(|error| PluginError::LibraryOpen {
+        // SAFETY: `PluginMain` retains the returned handle until every Engine
+        // sharing it has stopped using imported registration data.
+        let library = unsafe { Library::new(&path) }.map_err(|error| PluginError::LibraryOpen {
             name: name.to_owned(),
             path: path.clone(),
             error: error.to_string(),

@@ -16,9 +16,7 @@ authority:
   plugin path, every library handle, dependency order, and all imported
   executable contributions.
 - `Engine` and every worker share one `Arc<PluginMain>`. Runtime graph state and
-  Process Node futures are destroyed before the final library handle. Startup
-  libraries are opened with `RTLD_NODELETE`, and their loader handles and
-  images remain live until process exit.
+  Process Node futures are destroyed before the final library handle.
 
 There is no Registrar, parallel data-plane type, second inventory export, weak
 registration symbol, or static/dynamic dual mode.
@@ -64,19 +62,12 @@ remains owned by `[plugin.<name>]` and is parsed by the plugin's lifecycle code.
 
 - The registration symbol is called only while its `libloading::Library` is
   held by `PluginMain`.
-- Linux and macOS startup loading uses `RTLD_NOW | RTLD_LOCAL |
-  RTLD_NODELETE`. Dropping `PluginMain` intentionally transfers its loader
-  handles to process-lifetime ownership instead of calling `dlclose`; Rust DSOs
-  are not unmapped and their termination routines do not run mid-process.
 - Workspace mimalloc uses local-dynamic TLS so each Linux plugin DSO can own its
   allocator instance without consuming the process's fixed static TLS reserve.
 - Imported slices and function pointers are used only by engines sharing that
   same `PluginMain`.
 - Init calls are caught at the runtime dispatch boundary.
-- Normal shutdown joins workers and Process Nodes before dropping `PluginMain`;
-  startup-loaded handles and images remain live until process exit.
+- Normal shutdown joins workers and Process Nodes before dropping plugin
+  handles.
 - Runtime disable/unload must drain and rebuild the graph before replacing the
-  shared `PluginMain`. It must additionally prove that all service leases,
-  function pointers, worker state, TLS, and plugin-owned Drop objects are gone
-  before an unloadable handle is allowed; it is tracked separately from
-  startup loading.
+  shared `PluginMain`; it is tracked separately from startup loading.

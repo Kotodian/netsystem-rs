@@ -81,14 +81,12 @@ jobs:
         run: >-
           cargo build -p hammer-plugin-tun -p hammer-plugin-ip
           -p hammer-plugin-tcp -p hammer-plugin-udp
-      - name: Dynamic plugin loading smoke [${{ matrix.platform }}]
-        run: |
-          cargo test -p hammer-runtime --test plugin_loader tcp_root_loads_ip_dependency_first -- --exact
-          cargo test -p hammer-runtime --test plugin_loader plugin_main_loads_all_network_dsos_and_owns_their_contributions -- --exact
-          cargo test -p hammer-runtime --test plugin_loader dynamically_imported_node_entry_installs_callable_graph_state -- --exact
-          cargo test -p hammer-core --test plugin_config
       - name: Run workspace tests [${{ matrix.platform }}]
         run: cargo test --workspace
+      - name: Dynamic plugin loading smoke [${{ matrix.platform }}]
+        run: |
+          cargo test -p hammer-runtime --test plugin_loader
+          cargo test -p hammer-core --test plugin_config
 
   bihash-read-scaling-linux:
     name: bihash read scaling [linux]
