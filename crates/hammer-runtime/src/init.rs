@@ -47,14 +47,6 @@ pub struct InitFunction {
     pub func: fn(&mut Engine) -> HammerResult<()>,
 }
 
-/// Main-loop callback with optional plugin ownership (replaces bare `fn()`).
-#[derive(Clone, Copy)]
-pub struct MainLoopCallback {
-    pub plugin: Option<&'static str>,
-    pub name: &'static str,
-    pub func: fn(),
-}
-
 impl Ordered for InitFunction {
     fn name(&self) -> &'static str {
         self.name
@@ -81,9 +73,6 @@ pub static MAIN_LOOP_ENTER_FUNCTIONS: [InitFunction] = [..];
 
 #[linkme::distributed_slice]
 pub static MAIN_LOOP_EXIT_FUNCTIONS: [InitFunction] = [..];
-
-#[linkme::distributed_slice]
-pub static MAIN_LOOP_CALLBACKS: [MainLoopCallback] = [..];
 
 #[linkme::distributed_slice]
 pub static WORKER_INIT_FUNCTIONS: [InitFunction] = [..];
@@ -177,14 +166,6 @@ pub fn run_config_functions(engine: &mut Engine, early: bool) -> HammerResult<()
         &CONFIG_FUNCTIONS[..]
     };
     dispatch_init(functions, engine)
-}
-
-/// Dispatch main-loop callbacks owned by builtins or a loaded plugin.
-pub fn dispatch_main_loop_callbacks(loaded: &[&str]) {
-    for callback in crate::plugin::filter_by_plugin(&MAIN_LOOP_CALLBACKS[..], loaded, |c| c.plugin)
-    {
-        (callback.func)();
-    }
 }
 
 #[cfg(test)]

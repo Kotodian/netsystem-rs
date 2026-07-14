@@ -333,27 +333,24 @@ impl IpReassemblyNode {
     }
 }
 
-#[hammer_component_macros::node(role = internal)]
-#[derive(Clone, Default)]
-pub struct IpReassemblyExpireWalk {
-    #[node(default)]
-    reassembly: Option<IpReassemblyNode>,
-}
-
-impl IpReassemblyExpireWalk {
-    #[inline]
-    pub fn with_reassembly(mut self, reassembly: IpReassemblyNode) -> Self {
-        self.reassembly = Some(reassembly);
-        self
-    }
-}
+#[hammer_component_macros::graph_node(
+    graph = ip,
+    name = "ip-reassembly-expire-walk",
+    kind = driver,
+    state = polling,
+    plugin = "ip",
+)]
+#[derive(Debug, Clone, Copy)]
+pub struct IpReassemblyExpireWalk;
 
 impl Node for IpReassemblyExpireWalk {
     #[inline]
     fn process(&mut self, runtime: &DataPlaneRuntime, _frame: &mut BufferFrame) -> NodeResult {
-        if let Some(node) = self.reassembly.as_mut() {
-            let _ = node.expire(runtime, Instant::now());
-        }
+        WORKER.with(|slot| {
+            if let Some(worker) = slot.borrow_mut().as_mut() {
+                let _ = worker.expire(runtime, Instant::now());
+            }
+        });
         NodeResult::drop()
     }
 }
@@ -1048,21 +1045,3 @@ fn update_ipv4_header_checksum(packet: &mut [u8], header_len: usize) {
     packet[IPV4_HEADER_CHECKSUM_OFFSET..IPV4_HEADER_CHECKSUM_OFFSET + 2]
         .copy_from_slice(&checksum.to_be_bytes());
 }
-
-fn expire_ip_reassembly_main_loop_callback() {
-    let _ = hammer_runtime::with_data_plane_runtime(|runtime| {
-        WORKER.with(|slot| {
-            if let Some(worker) = slot.borrow_mut().as_mut() {
-                let _ = worker.expire(runtime, Instant::now());
-            }
-        });
-    });
-}
-
-#[linkme::distributed_slice(hammer_runtime::init::MAIN_LOOP_CALLBACKS)]
-static EXPIRE_IP_REASSEMBLY: hammer_runtime::init::MainLoopCallback =
-    hammer_runtime::init::MainLoopCallback {
-        plugin: Some("ip"),
-        name: "expire_ip_reassembly",
-        func: expire_ip_reassembly_main_loop_callback,
-    };

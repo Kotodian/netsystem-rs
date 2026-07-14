@@ -27,7 +27,6 @@ pub mod node;
 pub mod trace;
 pub use data_plane::{DataPlaneRuntime, DataPlaneRuntimeConfig, new_worker_runtime};
 pub use handoff::{DataPlaneHandoff, DataPlaneHandoffWorker, DataWorkerId};
-pub use init::MainLoopCallback;
 pub use instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
 pub use node::{
     DriverNode, GRAPH_NODES, InternalNode, Node, NodeDescriptor, NodeEntry, NodeErrorCounters,
