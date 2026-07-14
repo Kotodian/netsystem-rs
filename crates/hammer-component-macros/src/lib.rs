@@ -1691,6 +1691,140 @@ fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<T
     }
 }
 
+struct ProcessFnArgs {
+    name: LitStr,
+    plugin: Option<LitStr>,
+}
+
+impl Parse for ProcessFnArgs {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let mut name = None;
+        let mut plugin = None;
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            match key.to_string().as_str() {
+                "name" => name = Some(input.parse()?),
+                "plugin" => plugin = Some(input.parse()?),
+                other => {
+                    return Err(Error::new(
+                        key.span(),
+                        format!(
+                            "unknown Process Node argument `{other}`; expected `name` or `plugin`"
+                        ),
+                    ));
+                }
+            }
+            if input.parse::<Option<Token![,]>>()?.is_none() {
+                break;
+            }
+        }
+        Ok(Self {
+            name: name.ok_or_else(|| Error::new(Span::call_site(), "missing `name` argument"))?,
+            plugin,
+        })
+    }
+}
+
+/// Registers an async VPP-style Process Node on the main-thread executor.
+#[proc_macro_attribute]
+pub fn process_node(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as ProcessFnArgs);
+    let function = parse_macro_input!(input as ItemFn);
+    expand_process_node(args, function)
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
+fn expand_process_node(args: ProcessFnArgs, function: ItemFn) -> Result<TokenStream2> {
+    let signature = &function.sig;
+    if signature.asyncness.is_none()
+        || signature.constness.is_some()
+        || signature.unsafety.is_some()
+        || signature.abi.is_some()
+        || signature.variadic.is_some()
+        || !signature.generics.params.is_empty()
+        || signature.generics.where_clause.is_some()
+    {
+        return Err(Error::new(
+            signature.span(),
+            "Process Nodes must be safe, async, non-generic Rust functions",
+        ));
+    }
+    if signature.inputs.len() != 1 {
+        return Err(Error::new(
+            signature.inputs.span(),
+            "Process Nodes take exactly one ProcessContext parameter",
+        ));
+    }
+    let Some(FnArg::Typed(context)) = signature.inputs.first() else {
+        return Err(Error::new(
+            signature.inputs.span(),
+            "Process Nodes cannot have a receiver",
+        ));
+    };
+    if !type_path_ends_with(&context.ty, "ProcessContext") {
+        return Err(Error::new(
+            context.ty.span(),
+            "Process Node parameter must be ProcessContext",
+        ));
+    }
+    let ReturnType::Type(_, output) = &signature.output else {
+        return Err(Error::new(
+            signature.output.span(),
+            "Process Nodes must return HammerResult<()> through their future",
+        ));
+    };
+    let Some(value) = wrapped_type(output, "HammerResult") else {
+        return Err(Error::new(
+            output.span(),
+            "Process Nodes must return HammerResult<()> through their future",
+        ));
+    };
+    if !matches!(&value, Type::Tuple(tuple) if tuple.elems.is_empty()) {
+        return Err(Error::new(
+            value.span(),
+            "Process Nodes must return HammerResult<()> through their future",
+        ));
+    }
+
+    let function_name = &function.sig.ident;
+    let adapter_name = format_ident!("__hammer_process_adapter_{}", function_name);
+    let static_ident = format_ident!(
+        "__PROCESS_NODE_{}",
+        args.name.value().to_ascii_uppercase().replace('-', "_")
+    );
+    let name = args.name;
+    let plugin = plugin_option_tokens(args.plugin.as_ref());
+    let conditional_attributes: Vec<_> = function
+        .attrs
+        .iter()
+        .filter(|attribute| {
+            attribute.path().is_ident("cfg") || attribute.path().is_ident("cfg_attr")
+        })
+        .cloned()
+        .collect();
+
+    Ok(quote! {
+        #function
+
+        #(#conditional_attributes)*
+        fn #adapter_name(
+            __hammer_context: ::hammer_runtime::ProcessContext,
+        ) -> ::hammer_runtime::ProcessFuture {
+            ::std::boxed::Box::pin(#function_name(__hammer_context))
+        }
+
+        #(#conditional_attributes)*
+        #[::linkme::distributed_slice(::hammer_runtime::PROCESS_NODES)]
+        static #static_ident: ::hammer_runtime::ProcessEntry = ::hammer_runtime::ProcessEntry {
+            plugin: #plugin,
+            name: #name,
+            start: #adapter_name,
+        };
+    })
+}
+
 // ── Init / Config function macros (VPP VLIB_INIT_FUNCTION / VLIB_CONFIG_FUNCTION) ──
 
 struct InitFnArgs {
@@ -2305,6 +2439,7 @@ const PLUGIN_OWNED_MACROS: &[&str] = &[
     "graph_node",
     "main_loop_enter_function",
     "main_loop_exit_function",
+    "process_node",
 ];
 
 fn attribute_macro_leaf(path: &Path) -> Option<String> {

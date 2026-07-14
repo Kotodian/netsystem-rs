@@ -1,15 +1,17 @@
-use std::cell::RefCell;
 use std::mem::transmute;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwapOption;
+use hammer_core::config::Config;
 use hammer_core::data_plane::{
     BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Index, NodeHandle, NodeId, NodeNext,
 };
-use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::error::{CoreError, CoreResult, HammerResult};
 use hammer_infra::bihash::{Bihash, FREE_U64};
 use hammer_infra::checksum::internet_checksum;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
+use hammer_infra::spinlock::Spinlock;
 use hammer_infra::vec::Vec;
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
@@ -35,6 +37,7 @@ const IPV4_HEADER_CHECKSUM_OFFSET: usize = 10;
 const IPV6_PAYLOAD_LENGTH_OFFSET: usize = 4;
 const IPV6_NEXT_HEADER_OFFSET: usize = 6;
 const DEFAULT_REASSEMBLY_TIMEOUT: Duration = Duration::from_millis(100);
+const REASSEMBLY_EXPIRE_WALK_INTERVAL: Duration = Duration::from_millis(50);
 const DEFAULT_MAX_REASSEMBLIES: usize = 1024;
 const DEFAULT_MAX_FRAGMENTS_PER_REASSEMBLY: usize = 64;
 
@@ -232,57 +235,71 @@ struct IpReassemblyWorker {
     timeout: Duration,
     max_reassemblies: usize,
     max_fragments_per_reassembly: usize,
+    last_id: usize,
 }
 
-thread_local! {
-    static WORKER: RefCell<Option<IpReassemblyWorker>> = const { RefCell::new(None) };
+struct IpReassemblyMain {
+    per_thread_data: Vec<Spinlock<IpReassemblyWorker>>,
 }
 
-fn with_worker_mut<R>(f: impl FnOnce(&mut IpReassemblyWorker) -> R) -> Option<R> {
-    WORKER.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        slot.as_mut().map(f)
-    })
-}
+static IP_REASSEMBLY_MAIN: ArcSwapOption<IpReassemblyMain> = ArcSwapOption::const_empty();
 
-fn ensure_worker(config: &IpReassemblyNode) {
-    WORKER.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if slot.is_none() {
-            let worker = config
-                .handoff
-                .as_ref()
-                .map(|h| h.worker)
-                .unwrap_or_else(|| DataWorkerId::new(0));
-            let directory = config.directory.clone().or_else(|| {
-                config
-                    .handoff
-                    .as_ref()
-                    .map(|h| Arc::new(h.directory.clone()))
-            });
-            *slot = Some(IpReassemblyWorker {
-                worker,
-                contexts: Pool::with_capacity(config.max_reassemblies.max(1)),
-                directory,
-                handoff: config.handoff.clone(),
-                timeout: config.timeout,
-                max_reassemblies: config.max_reassemblies,
-                max_fragments_per_reassembly: config.max_fragments_per_reassembly,
-            });
-        } else if let Some(worker) = slot.as_mut() {
-            worker.timeout = config.timeout;
-            worker.max_reassemblies = config.max_reassemblies;
-            worker.max_fragments_per_reassembly = config.max_fragments_per_reassembly;
-            if config.handoff.is_some() {
-                worker.handoff = config.handoff.clone();
-                worker.worker = config.handoff.as_ref().unwrap().worker;
-                worker.directory =
-                    Some(Arc::new(config.handoff.as_ref().unwrap().directory.clone()));
-            } else if let Some(directory) = &config.directory {
-                worker.directory = Some(Arc::clone(directory));
-            }
+impl IpReassemblyMain {
+    fn new(worker_count: usize) -> Arc<Self> {
+        let directory = Arc::new(IpReassemblyDirectory::new(
+            u32::try_from(DEFAULT_MAX_REASSEMBLIES).unwrap_or(u32::MAX),
+        ));
+        let mut per_thread_data = Vec::with_capacity(worker_count);
+        for worker in 0..worker_count {
+            per_thread_data.push(Spinlock::new(IpReassemblyWorker {
+                worker: DataWorkerId::new(worker as u32),
+                contexts: Pool::with_capacity(DEFAULT_MAX_REASSEMBLIES),
+                directory: Some(Arc::clone(&directory)),
+                handoff: None,
+                timeout: DEFAULT_REASSEMBLY_TIMEOUT,
+                max_reassemblies: DEFAULT_MAX_REASSEMBLIES,
+                max_fragments_per_reassembly: DEFAULT_MAX_FRAGMENTS_PER_REASSEMBLY,
+                last_id: 0,
+            }));
         }
-    });
+        Arc::new(Self { per_thread_data })
+    }
+
+    fn worker_slot(runtime: &DataPlaneRuntime) -> usize {
+        runtime.thread_index().saturating_sub(1) as usize
+    }
+
+    fn expire_all(&self, runtime: &DataPlaneRuntime, now: Instant) -> usize {
+        self.per_thread_data
+            .iter()
+            .map(|worker| worker.lock().expire(runtime, now))
+            .sum()
+    }
+
+    fn expire_worker(&self, runtime: &DataPlaneRuntime, now: Instant) -> usize {
+        self.per_thread_data
+            .get(Self::worker_slot(runtime))
+            .map(|worker| worker.lock().expire(runtime, now))
+            .unwrap_or(0)
+    }
+
+    fn process_frame(&self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
+        let Some(worker) = self.per_thread_data.get(Self::worker_slot(runtime)) else {
+            return NodeResult::drop();
+        };
+        worker.lock().process_frame(runtime, frame, Instant::now())
+    }
+}
+
+#[hammer_component_macros::init_function(
+    name = "ip_reassembly_init",
+    plugin = "ip",
+    runs_before = ["install_packet_graph"]
+)]
+fn init_ip_reassembly(config: Arc<Config>) -> HammerResult<Arc<IpReassemblyMain>> {
+    let main = IpReassemblyMain::new(config.worker.count);
+    IP_REASSEMBLY_MAIN.store(Some(Arc::clone(&main)));
+    Ok(main)
 }
 
 #[hammer_component_macros::node(role = internal, next = IpReassemblyNext)]
@@ -294,8 +311,6 @@ pub struct IpReassemblyNode {
     directory: Option<Arc<IpReassemblyDirectory>>,
     #[node(default = DEFAULT_REASSEMBLY_TIMEOUT)]
     timeout: Duration,
-    #[node(default = DEFAULT_MAX_REASSEMBLIES)]
-    max_reassemblies: usize,
     #[node(default = DEFAULT_MAX_FRAGMENTS_PER_REASSEMBLY)]
     max_fragments_per_reassembly: usize,
 }
@@ -328,39 +343,42 @@ impl IpReassemblyNode {
 
     #[inline]
     pub fn expire(&mut self, runtime: &DataPlaneRuntime, now: Instant) -> usize {
-        ensure_worker(self);
-        with_worker_mut(|worker| worker.expire(runtime, now)).unwrap_or(0)
+        IP_REASSEMBLY_MAIN
+            .load_full()
+            .map(|main| main.expire_worker(runtime, now))
+            .unwrap_or(0)
     }
 }
 
-#[hammer_component_macros::graph_node(
-    graph = ip,
-    name = "ip-reassembly-expire-walk",
-    kind = driver,
-    state = polling,
-    plugin = "ip",
-)]
-#[derive(Debug, Clone, Copy)]
-pub struct IpReassemblyExpireWalk;
-
-impl Node for IpReassemblyExpireWalk {
-    #[inline]
-    fn process(&mut self, runtime: &DataPlaneRuntime, _frame: &mut BufferFrame) -> NodeResult {
-        WORKER.with(|slot| {
-            if let Some(worker) = slot.borrow_mut().as_mut() {
-                let _ = worker.expire(runtime, Instant::now());
-            }
-        });
-        NodeResult::drop()
+#[hammer_component_macros::process_node(name = "ip-reassembly-expire-walk", plugin = "ip")]
+async fn ip_reassembly_expire_process(
+    mut context: hammer_runtime::ProcessContext,
+) -> HammerResult<()> {
+    let main = context.require::<IpReassemblyMain>()?;
+    loop {
+        let _ = context
+            .wait_for_event_or_clock(REASSEMBLY_EXPIRE_WALK_INTERVAL)
+            .await;
+        let _ = main.expire_all(context.data_plane_runtime(), Instant::now());
     }
 }
 
 impl IpReassemblyWorker {
     fn expire(&mut self, runtime: &DataPlaneRuntime, now: Instant) -> usize {
         let timeout = self.timeout;
+        let capacity = self.contexts.capacity();
+        let walk_len = self
+            .max_reassemblies
+            .saturating_mul(REASSEMBLY_EXPIRE_WALK_INTERVAL.as_millis() as usize)
+            / 1_000
+            + 1;
+        let begin = self.last_id.min(capacity);
+        let end = begin.saturating_add(walk_len).min(capacity);
+        self.last_id = if end == capacity { 0 } else { end };
         let mut expired_keys = Vec::new();
         for (index, context) in self.contexts.iter() {
-            if now.duration_since(context.updated_at) > timeout {
+            let slot = index.slot() as usize;
+            if slot >= begin && slot < end && now.duration_since(context.updated_at) > timeout {
                 expired_keys.push((index, context.key));
             }
         }
@@ -728,7 +746,6 @@ impl Node for IpReassemblyNode {
 
     #[inline]
     fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
-        ensure_worker(self);
         Ok(NodeRuntimeData::empty())
     }
 
@@ -743,16 +760,10 @@ fn ip_reassembly_process(
     _data: NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> NodeResult {
-    // Config is on TLS worker; node_process closure cannot access &self easily
-    // beyond ensuring worker exists via prior node_runtime_data / expire.
-    WORKER.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if let Some(worker) = slot.as_mut() {
-            worker.process_frame(runtime, frame, Instant::now())
-        } else {
-            NodeResult::drop()
-        }
-    })
+    IP_REASSEMBLY_MAIN
+        .load_full()
+        .map(|main| main.process_frame(runtime, frame))
+        .unwrap_or_else(NodeResult::drop)
 }
 
 struct FragmentContext {

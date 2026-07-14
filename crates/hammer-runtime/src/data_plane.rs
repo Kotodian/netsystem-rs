@@ -258,6 +258,12 @@ impl DataPlaneRuntime {
         &self.buffers
     }
 
+    /// VPP-style runtime thread index: zero for main, one-based for workers.
+    #[inline]
+    pub fn thread_index(&self) -> u32 {
+        self.buffers.thread_index()
+    }
+
     #[inline]
     pub fn in_use_buffers(&self) -> usize {
         self.buffers.in_use_buffers()

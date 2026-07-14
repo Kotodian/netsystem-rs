@@ -10,6 +10,7 @@ pub mod main_loop;
 pub mod memory;
 pub mod plugin;
 pub mod plugin_loader;
+mod process;
 
 pub use hammer_core::error::{HammerError, HammerResult};
 pub use hammer_core::protocol::icmp::IcmpErrorMetadata;
@@ -41,6 +42,10 @@ pub use plugin::{
 pub use plugin_loader::{
     LoadTransaction, built_plugin_cdylib_path, collect_plugin_inventory, plugin_cdylib_filename,
     plugin_cdylib_path, read_plugin_registration, workspace_target_dir,
+};
+pub use process::{
+    PROCESS_NODES, ProcessContext, ProcessEntry, ProcessEventBatch, ProcessFuture, ProcessHandle,
+    ProcessWake,
 };
 pub use trace::{
     PacketTrace, TraceControlHandle, TraceControlPlane, TraceEntry, TraceFormatter,

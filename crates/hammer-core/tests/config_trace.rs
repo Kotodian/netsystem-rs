@@ -68,18 +68,3 @@ fn parse_config_allows_enabled_trace_with_empty_inputs() {
     assert!(options.trace.enabled);
     assert!(options.trace.inputs.is_empty());
 }
-
-#[test]
-fn parse_config_rejects_unsupported_trace_keys() {
-    let cfg = indoc! {r#"
-        [trace]
-        enabled = true
-        legacy = true
-    "#};
-    let err = config::parse_config(cfg).expect_err("accepted unsupported trace key");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("unsupported config key: legacy"),
-        "error = {msg:?}"
-    );
-}

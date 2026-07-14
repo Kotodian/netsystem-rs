@@ -41,6 +41,7 @@ pub mod rbtree;
 pub mod ring;
 pub mod segment;
 pub mod simd;
+pub mod spinlock;
 pub mod svm_region;
 pub mod timer_wheel;
 pub mod vec;

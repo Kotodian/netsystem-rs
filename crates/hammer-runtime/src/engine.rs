@@ -8,7 +8,8 @@ use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::registry::RuntimeRegistry;
 use hammer_runtime::DataPlaneRuntime;
 
-use crate::{DataPlaneHandoffWorker, DataWorkerId, FileMain};
+use crate::process::ProcessMain;
+use crate::{DataPlaneHandoffWorker, DataWorkerId, FileMain, ProcessHandle};
 use hammer_infra::vec::Vec;
 
 thread_local! {
@@ -39,6 +40,7 @@ pub struct Engine {
     pub main_loop_exit_status: Mutex<i32>,
     file_main: Option<FileMain>,
     worker_threads: Mutex<Vec<JoinHandle<()>>>,
+    processes: ProcessMain,
 }
 
 impl Engine {
@@ -70,6 +72,7 @@ impl Engine {
             main_loop_exit_status: Mutex::new(0),
             file_main: Some(FileMain::new(worker)?),
             worker_threads: Mutex::new(Vec::new()),
+            processes: ProcessMain::new(),
         })
     }
 
@@ -87,6 +90,7 @@ impl Engine {
             main_loop_exit_status: Mutex::new(0),
             file_main: None,
             worker_threads: Mutex::new(Vec::new()),
+            processes: ProcessMain::new(),
         }
     }
 
@@ -175,6 +179,37 @@ impl Engine {
         }
         retained.extend(threads.drain(..));
         Ok(())
+    }
+
+    pub fn start_process_nodes(&mut self) -> HammerResult<()> {
+        if self.thread_index != 0 {
+            return Err(HammerError::internal(
+                "Process Nodes can only start on the main thread",
+            ));
+        }
+        self.processes.start(
+            Arc::clone(&self.registry),
+            self.runtime.clone(),
+            &self.loaded_plugins,
+        )
+    }
+
+    pub fn process_handle(&self, name: &str) -> Option<ProcessHandle> {
+        self.processes.handle(name)
+    }
+
+    pub fn run_processes_until<F>(&self, runtime: &tokio::runtime::Runtime, future: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        self.processes.run_until(runtime, future)
+    }
+
+    pub fn shutdown_process_nodes(
+        &mut self,
+        runtime: &tokio::runtime::Runtime,
+    ) -> HammerResult<()> {
+        self.processes.shutdown(runtime)
     }
 
     fn join_worker_threads(&self) {
@@ -310,6 +345,7 @@ impl EnginePool {
         crate::init::run_init_functions(engine)?;
         crate::init::run_config_functions(engine, false)?;
         crate::init::run_main_loop_enter(engine)?;
+        engine.start_process_nodes()?;
         Ok(())
     }
 

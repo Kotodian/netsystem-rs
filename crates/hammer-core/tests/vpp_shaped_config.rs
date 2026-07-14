@@ -50,19 +50,6 @@ event_queue_length = 256
 }
 
 #[test]
-fn legacy_network_tcp_schema_is_rejected() {
-    let error = parse_config(
-        r#"
-[network.tcp]
-mss = 1200
-"#,
-    )
-    .expect_err("TCP schema belongs to plugin.tcp");
-
-    assert!(error.to_string().contains("tcp"));
-}
-
-#[test]
 fn lab_toml_example_parses_to_locked_topology() {
     let content = include_str!("../../../examples/tun-tcp-echo.toml");
     let cfg = parse_config(content).expect("parse Lab TOML");

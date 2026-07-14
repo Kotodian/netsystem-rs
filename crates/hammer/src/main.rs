@@ -67,12 +67,15 @@ fn main() {
 
     tracing::info!("hammer started");
 
-    rt.block_on(async {
+    pool.main_engine().run_processes_until(&rt, async {
         ipc_loop::clnt_loop(listener).await;
     });
 
-    let pool_engine = pool.main_engine();
+    let pool_engine = pool.main_engine_mut();
     EnginePool::main_loop_exit(pool_engine);
+    pool_engine
+        .shutdown_process_nodes(&rt)
+        .unwrap_or_else(|error| tracing::error!(%error, "Process Node shutdown failed"));
     pool.close();
     Engine::uninstall_current();
 }

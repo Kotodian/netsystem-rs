@@ -1177,6 +1177,12 @@ impl Drop for Pending {
 }
 
 impl DataPlaneBuffers {
+    /// VPP-style runtime thread index: zero for main, one-based for workers.
+    #[inline]
+    pub fn thread_index(&self) -> u32 {
+        self.thread_index
+    }
+
     #[inline]
     pub fn new(config: DataPlaneBufferConfig) -> Self {
         Self::from_numa_config(config)
