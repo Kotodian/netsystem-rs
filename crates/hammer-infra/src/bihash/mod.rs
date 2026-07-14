@@ -29,8 +29,8 @@ pub use key::{BihashKey, hash_words, splitmix64};
 pub use template::{Bihash8x8, Bihash16x8, Bihash24x8, Bihash48x8};
 pub use value::{FREE_U64, Kv, ValuePage};
 
-use crate::boxed::Slice;
 use crate::heap::Heap;
+use crate::heap_boxed::Slice;
 use alloc::PageAlloc;
 
 /// A bounded-index extensible hash table.
@@ -56,7 +56,7 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
         Self::with_capacity_in(nbuckets, Arc::new(Heap::local()))
     }
 
-    pub fn with_capacity_in(mut nbuckets: u32, heap: Arc<Heap>) -> Self {
+    pub(crate) fn with_capacity_in(mut nbuckets: u32, heap: Arc<Heap>) -> Self {
         if nbuckets == 0 {
             nbuckets = 1;
         }

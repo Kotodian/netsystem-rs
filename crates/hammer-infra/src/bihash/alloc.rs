@@ -14,9 +14,9 @@ use crossbeam_utils::CachePadded;
 
 use crate::align::CACHE_LINE;
 use crate::bihash::value::ValuePage;
-use crate::boxed::{Slice, allocate_in, deallocate_in};
 use crate::heap::Heap;
-use crate::vec::Vec;
+use crate::heap_boxed::{Slice, allocate_in, deallocate_in};
+use crate::heap_vec::Vec;
 
 const MAX_LOG2_PAGES: usize = 8;
 const NO_OFFSET: u64 = 0;

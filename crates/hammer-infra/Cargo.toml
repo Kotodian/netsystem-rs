@@ -8,6 +8,7 @@ publish.workspace = true
 name = "hammer_infra"
 
 [dependencies]
+allocator-api2 = { workspace = true }
 crossbeam-utils = { workspace = true }
 libc = { workspace = true }
 mimalloc = { workspace = true }

@@ -11,7 +11,7 @@ use hammer_core::data_plane::{
     NodeNext, NodeRegistration, NodeState, Pending,
 };
 use hammer_core::error::{CoreError, CoreResult, DataPlaneError};
-use hammer_infra::boxed::Slice;
+use hammer_infra::boxed::Box;
 
 use crate::trace::TraceFormatter;
 use crate::{DataPlaneInstructionSet, DataPlaneRuntime};
@@ -327,6 +327,7 @@ impl NodeResult {
 
 pub struct NodeRuntime {
     inner: Rc<RefCell<NodeRuntimeInner>>,
+    queue: Rc<RefCell<ScheduledFrameQueue>>,
     readiness: Rc<NodeReadiness>,
 }
 
@@ -334,6 +335,7 @@ impl Clone for NodeRuntime {
     fn clone(&self) -> Self {
         Self {
             inner: Rc::clone(&self.inner),
+            queue: Rc::clone(&self.queue),
             readiness: Rc::clone(&self.readiness),
         }
     }
@@ -342,9 +344,10 @@ impl Clone for NodeRuntime {
 impl std::fmt::Debug for NodeRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let inner = self.inner.borrow();
+        let queue = self.queue.borrow();
         f.debug_struct("NodeRuntime")
             .field("nodes_len", &inner.nodes.len())
-            .field("queue_len", &inner.queue.len())
+            .field("queue_len", &queue.len())
             .field("readiness", &self.readiness)
             .finish()
     }
@@ -398,7 +401,8 @@ impl NodeReadiness {
     }
 }
 
-struct NodeRuntimeInner {
+#[derive(Clone)]
+pub(crate) struct NodeRuntimeInner {
     nodes: Vec<NodeRuntimeSlot>,
     node_states: Vec<NodeState>,
     interrupt_pending: Vec<bool>,
@@ -406,7 +410,7 @@ struct NodeRuntimeInner {
     error_ids: HashMap<u64, u16>,
     error_slots: Vec<BufferNodeError>,
     runtime_stats: Vec<NodeRuntimeStats>,
-    queue: ScheduledFrameQueue,
+    scheduled_frame_queue_capacity: usize,
     handles: HashMap<NodeHandle, NodeId>,
     declared_nodes: HashMap<&'static str, NodeId>,
     node_names: Vec<Option<&'static str>>,
@@ -502,7 +506,7 @@ struct ScheduledFrame {
 }
 
 struct ScheduledFrameQueue {
-    slots: Slice<Option<ScheduledFrame>>,
+    slots: Box<[Option<ScheduledFrame>]>,
     head: usize,
     len: usize,
 }
@@ -511,7 +515,7 @@ impl ScheduledFrameQueue {
     #[inline]
     fn with_capacity(capacity: usize) -> Self {
         Self {
-            slots: Slice::from_fn(capacity, |_| None),
+            slots: Box::from_fn(capacity, |_| None),
             head: 0,
             len: 0,
         }
@@ -601,6 +605,27 @@ impl NodeRuntimeInner {
             process,
             runtime_data,
         })
+    }
+
+    fn clone_for_worker(&self) -> Self {
+        Self {
+            nodes: self.nodes.clone(),
+            node_states: self.node_states.clone(),
+            interrupt_pending: vec![false; self.nodes.len()],
+            error_counters: vec![NodeErrorCounters::default(); self.nodes.len()],
+            error_ids: self.error_ids.clone(),
+            error_slots: self.error_slots.clone(),
+            runtime_stats: vec![NodeRuntimeStats::default(); self.nodes.len()],
+            scheduled_frame_queue_capacity: self.scheduled_frame_queue_capacity,
+            handles: self.handles.clone(),
+            declared_nodes: self.declared_nodes.clone(),
+            node_names: self.node_names.clone(),
+            node_trace_formatters: self.node_trace_formatters.clone(),
+            next_nodes: self.next_nodes.clone(),
+            pending_next_names: vec![Vec::new(); self.nodes.len()],
+            sibling_owners: self.sibling_owners.clone(),
+            siblings: self.siblings.clone(),
+        }
     }
 
     fn register_function_declared(
@@ -805,6 +830,13 @@ impl NodeRuntimeInner {
     fn add_node_next_slot(&mut self, node: NodeId, next: NodeId) -> CoreResult<u16> {
         self.validate_node(node)?;
         self.validate_node(next)?;
+        if let Some(slot) = self.next_nodes[node.slot() as usize]
+            .iter()
+            .position(|target| *target == Some(next))
+        {
+            return u16::try_from(slot)
+                .map_err(|_| CoreError::internal("node next slot cannot be represented as u16"));
+        }
         let slot = self
             .next_nodes
             .get(node.slot() as usize)
@@ -847,30 +879,36 @@ mod local_next_slot_tests {
                     process,
                     runtime_data: NodeRuntimeData::empty(),
                 },
+                NodeRuntimeSlot {
+                    kind: NodeKind::Internal,
+                    process,
+                    runtime_data: NodeRuntimeData::empty(),
+                },
             ],
-            node_states: vec![NodeState::Polling, NodeState::Polling],
-            interrupt_pending: vec![false, false],
-            error_counters: vec![NodeErrorCounters::default(), NodeErrorCounters::default()],
+            node_states: vec![NodeState::Polling; 3],
+            interrupt_pending: vec![false; 3],
+            error_counters: vec![NodeErrorCounters::default(); 3],
             error_ids: HashMap::new(),
             error_slots: Vec::new(),
-            runtime_stats: vec![NodeRuntimeStats::default(), NodeRuntimeStats::default()],
-            queue: ScheduledFrameQueue::with_capacity(4),
+            runtime_stats: vec![NodeRuntimeStats::default(); 3],
+            scheduled_frame_queue_capacity: 4,
             handles: HashMap::new(),
             declared_nodes: HashMap::new(),
-            node_names: vec![None, None],
-            node_trace_formatters: vec![None, None],
+            node_names: vec![None; 3],
+            node_trace_formatters: vec![None; 3],
             next_nodes: vec![
                 vec![Some(NodeId::new(1)); usize::from(u16::MAX) + 1],
                 Vec::new(),
+                Vec::new(),
             ],
-            pending_next_names: vec![Vec::new(), Vec::new()],
-            sibling_owners: vec![None, None],
-            siblings: vec![Vec::new(), Vec::new()],
+            pending_next_names: vec![Vec::new(), Vec::new(), Vec::new()],
+            sibling_owners: vec![None; 3],
+            siblings: vec![Vec::new(), Vec::new(), Vec::new()],
         };
 
         let before = inner.next_nodes[0].len();
         let err = inner
-            .add_node_next_slot(NodeId::new(0), NodeId::new(1))
+            .add_node_next_slot(NodeId::new(0), NodeId::new(2))
             .expect_err("slot past u16 must fail");
         assert!(err.to_string().contains("cannot be represented as u16"));
         assert_eq!(inner.next_nodes[0].len(), before);
@@ -888,7 +926,7 @@ impl Default for NodeRuntime {
                 error_ids: HashMap::new(),
                 error_slots: Vec::new(),
                 runtime_stats: Vec::new(),
-                queue: ScheduledFrameQueue::with_capacity(DEFAULT_SCHEDULED_FRAME_QUEUE_CAPACITY),
+                scheduled_frame_queue_capacity: DEFAULT_SCHEDULED_FRAME_QUEUE_CAPACITY,
                 handles: HashMap::new(),
                 declared_nodes: HashMap::new(),
                 node_names: Vec::new(),
@@ -898,6 +936,9 @@ impl Default for NodeRuntime {
                 sibling_owners: Vec::new(),
                 siblings: Vec::new(),
             })),
+            queue: Rc::new(RefCell::new(ScheduledFrameQueue::with_capacity(
+                DEFAULT_SCHEDULED_FRAME_QUEUE_CAPACITY,
+            ))),
             readiness: Rc::new(NodeReadiness::default()),
         }
     }
@@ -967,6 +1008,38 @@ mod node_function_tests {
 }
 
 impl NodeRuntime {
+    pub(crate) fn clone_inner_for_worker(&self) -> CoreResult<NodeRuntimeInner> {
+        let inner = self.inner.borrow();
+        if inner
+            .pending_next_names
+            .iter()
+            .any(|names| !names.is_empty())
+        {
+            return Err(CoreError::internal(
+                "main graph has unresolved next names before worker clone",
+            ));
+        }
+        Ok(inner.clone_for_worker())
+    }
+
+    pub(crate) fn from_worker_inner(inner: NodeRuntimeInner) -> Self {
+        debug_assert!(
+            inner
+                .pending_next_names
+                .iter()
+                .all(|names| names.is_empty()),
+            "worker graph must be resolved before cloning"
+        );
+        let queue_capacity = inner.scheduled_frame_queue_capacity;
+        Self {
+            inner: Rc::new(RefCell::new(inner)),
+            queue: Rc::new(RefCell::new(ScheduledFrameQueue::with_capacity(
+                queue_capacity,
+            ))),
+            readiness: Rc::new(NodeReadiness::default()),
+        }
+    }
+
     pub(crate) fn install_node_function(
         &self,
         node: NodeId,
@@ -1315,7 +1388,7 @@ impl NodeRuntime {
     }
 
     pub fn has_pending(&self) -> bool {
-        !self.inner.borrow().queue.is_empty()
+        !self.queue.borrow().is_empty()
     }
 
     pub fn ready(&self) -> NodeRuntimeReady {
@@ -1415,9 +1488,8 @@ impl NodeRuntime {
         allow_empty: bool,
     ) -> CoreResult<()> {
         self.validate_node(node)?;
-        self.inner
+        self.queue
             .borrow_mut()
-            .queue
             .push_back(ScheduledFrame {
                 node,
                 frame,
@@ -1492,9 +1564,9 @@ impl NodeRuntime {
     }
 
     fn pop_scheduled(&self) -> Option<ScheduledFrame> {
-        let mut inner = self.inner.borrow_mut();
-        let scheduled = inner.queue.pop_front();
-        if inner.queue.is_empty() {
+        let mut queue = self.queue.borrow_mut();
+        let scheduled = queue.pop_front();
+        if queue.is_empty() {
             self.readiness.clear_pending();
         }
         scheduled

@@ -1,233 +1,222 @@
-use std::alloc::{GlobalAlloc, handle_alloc_error};
+//! Public Rust-shaped `Vec<T>` backed by Hammer's main mimalloc heap.
+
 use std::fmt;
-use std::marker::PhantomData;
-use std::mem;
-use std::ops::{Bound, Deref, DerefMut, RangeBounds};
-use std::ptr::{self, NonNull};
-use std::sync::Arc;
+use std::mem::MaybeUninit;
+use std::ops::{Deref, DerefMut, RangeBounds};
 
-use crate::align::{self, CACHE_LINE};
-use crate::boxed::Slice;
-use crate::heap::Heap;
-use crate::prefetch::prefetch_read_l1;
+use allocator_api2::vec::{self as api_vec, Vec as ApiVec};
 
-pub type Vec<T> = RawVec<T, CACHE_LINE>;
-pub type Drain<'a, T> = RawDrain<'a, T, CACHE_LINE>;
-pub type IntoIter<T> = RawIntoIter<T, CACHE_LINE>;
+use crate::boxed::Box;
+use crate::main_alloc::MainAllocator;
 
-const COPY_PREFETCH_LINES: usize = 4;
+pub type Drain<'a, T> = api_vec::Drain<'a, T, MainAllocator>;
+pub type IntoIter<T> = api_vec::IntoIter<T, MainAllocator>;
+pub type Splice<'a, I> = api_vec::Splice<'a, I, MainAllocator>;
 
-pub struct RawVec<T, const ALIGN: usize = CACHE_LINE> {
-    ptr: NonNull<T>,
-    len: usize,
-    cap: usize,
-    /// `None` selects the main heap. `Some` retains an explicit non-main
-    /// heap so growth, conversion, iteration, and drop preserve provenance.
-    heap: Option<Arc<Heap>>,
-    _marker: PhantomData<T>,
+/// Three-word concrete vector facade (`ptr`, `len`, `cap`).
+#[repr(transparent)]
+pub struct Vec<T> {
+    inner: ApiVec<T, MainAllocator>,
 }
 
-unsafe impl<T: Send, const ALIGN: usize> Send for RawVec<T, ALIGN> {}
-unsafe impl<T: Sync, const ALIGN: usize> Sync for RawVec<T, ALIGN> {}
-
-impl<T, const ALIGN: usize> RawVec<T, ALIGN> {
+impl<T> Vec<T> {
     #[inline]
+    #[must_use]
     pub const fn new() -> Self {
         Self {
-            ptr: NonNull::dangling(),
-            len: 0,
-            cap: 0,
-            heap: None,
-            _marker: PhantomData,
+            inner: ApiVec::new_in(MainAllocator),
         }
     }
 
-    /// Allocates backing storage from Hammer's main heap.
     #[inline]
+    #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
-        if capacity == 0 {
-            return Self::new();
-        }
-        let heap = Heap::main();
-        let layout = align::array_layout::<T, ALIGN>(capacity);
-        let raw = heap
-            .alloc(layout)
-            .unwrap_or_else(|| handle_alloc_error(layout));
-        let ptr = NonNull::new(raw.as_ptr().cast::<T>()).expect("Heap::alloc returned null");
         Self {
-            ptr,
-            len: 0,
-            cap: capacity,
-            heap: None,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Allocates `capacity` slots of `T` from `heap`. Main-heap handles are
-    /// normalized to the default representation; explicit non-main handles
-    /// are retained for growth, conversion, iteration, and drop.
-    #[inline]
-    pub fn with_capacity_in(capacity: usize, heap: Arc<Heap>) -> Self {
-        let heap = (!heap.is_main_heap()).then_some(heap);
-        if capacity == 0 {
-            return Self {
-                ptr: NonNull::dangling(),
-                len: 0,
-                cap: 0,
-                heap,
-                _marker: PhantomData,
-            };
-        }
-        let main_heap = Heap::main();
-        let allocator = heap.as_deref().unwrap_or(&main_heap);
-        let layout = align::array_layout::<T, ALIGN>(capacity);
-        let raw = allocator
-            .alloc(layout)
-            .unwrap_or_else(|| handle_alloc_error(layout));
-        let ptr = NonNull::new(raw.as_ptr().cast::<T>()).expect("Heap::alloc returned null");
-        Self {
-            ptr,
-            len: 0,
-            cap: capacity,
-            heap,
-            _marker: PhantomData,
+            inner: ApiVec::with_capacity_in(capacity, MainAllocator),
         }
     }
 
     #[inline]
-    pub fn from_elem_copy(len: usize, value: T) -> Self
-    where
-        T: Copy,
-    {
-        let mut out = Self::with_capacity(len);
-        for _ in 0..len {
-            out.push(value);
-        }
-        out
-    }
-
-    #[inline(always)]
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    #[inline(always)]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    #[inline(always)]
     pub fn capacity(&self) -> usize {
-        self.cap
-    }
-
-    #[inline(always)]
-    pub fn as_ptr(&self) -> *const T {
-        self.ptr.as_ptr()
-    }
-
-    #[inline(always)]
-    pub fn as_mut_ptr(&mut self) -> *mut T {
-        self.ptr.as_ptr()
-    }
-
-    #[inline(always)]
-    pub fn as_slice(&self) -> &[T] {
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
-    }
-
-    #[inline(always)]
-    pub fn as_mut_slice(&mut self) -> &mut [T] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
-    }
-
-    #[inline(always)]
-    pub fn alignment(&self) -> usize {
-        align::allocation_align::<T, ALIGN>()
+        self.inner.capacity()
     }
 
     #[inline]
     pub fn reserve(&mut self, additional: usize) {
-        let required = self
-            .len
-            .checked_add(additional)
-            .expect("aligned vec capacity overflow");
-        if required <= self.cap {
-            return;
-        }
-        let doubled = self.cap.max(1).saturating_mul(2);
-        self.grow_to(required.max(doubled));
-    }
-
-    #[inline(always)]
-    pub fn push(&mut self, value: T) {
-        if self.len == self.cap {
-            self.grow_for_push();
-        }
-        unsafe { self.ptr.as_ptr().add(self.len).write(value) };
-        self.len += 1;
+        self.inner.reserve(additional);
     }
 
     #[inline]
-    pub fn pop(&mut self) -> Option<T> {
-        if self.len == 0 {
-            return None;
-        }
-        self.len -= 1;
-        Some(unsafe { self.ptr.as_ptr().add(self.len).read() })
+    pub fn reserve_exact(&mut self, additional: usize) {
+        self.inner.reserve_exact(additional);
     }
 
     #[inline]
-    pub fn remove(&mut self, index: usize) -> T {
-        assert!(index < self.len, "remove index out of bounds");
-        unsafe {
-            let ptr = self.ptr.as_ptr().add(index);
-            let value = ptr.read();
-            ptr::copy(ptr.add(1), ptr, self.len - index - 1);
-            self.len -= 1;
-            value
-        }
+    pub fn shrink_to_fit(&mut self) {
+        self.inner.shrink_to_fit();
     }
 
     #[inline]
-    pub fn clear(&mut self) {
-        unsafe {
-            ptr::drop_in_place(std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len));
-        }
-        self.len = 0;
+    pub fn shrink_to(&mut self, min_capacity: usize) {
+        self.inner.shrink_to(min_capacity);
     }
 
     #[inline]
     pub fn truncate(&mut self, len: usize) {
-        if len >= self.len {
-            return;
-        }
-        unsafe {
-            let tail = self.ptr.as_ptr().add(len);
-            ptr::drop_in_place(std::slice::from_raw_parts_mut(tail, self.len - len));
-        }
-        self.len = len;
+        self.inner.truncate(len);
     }
 
     #[inline]
-    pub fn extend_from_slice(&mut self, other: &[T])
-    where
-        T: Copy,
-    {
-        self.extend_from_copy_slice(other);
+    pub fn as_slice(&self) -> &[T] {
+        self.inner.as_slice()
     }
 
     #[inline]
-    pub fn extend_from_cloned_slice(&mut self, other: &[T])
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        self.inner.as_mut_slice()
+    }
+
+    #[inline]
+    pub fn as_ptr(&self) -> *const T {
+        self.inner.as_ptr()
+    }
+
+    #[inline]
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.inner.as_mut_ptr()
+    }
+
+    #[inline]
+    pub unsafe fn set_len(&mut self, new_len: usize) {
+        unsafe { self.inner.set_len(new_len) };
+    }
+
+    #[inline]
+    pub fn swap_remove(&mut self, index: usize) -> T {
+        self.inner.swap_remove(index)
+    }
+
+    #[inline]
+    pub fn insert(&mut self, index: usize, element: T) {
+        self.inner.insert(index, element);
+    }
+
+    #[inline]
+    pub fn remove(&mut self, index: usize) -> T {
+        self.inner.remove(index)
+    }
+
+    #[inline]
+    pub fn retain<F>(&mut self, f: F)
     where
-        T: Clone,
+        F: FnMut(&T) -> bool,
     {
-        self.reserve(other.len());
-        let start = self.len;
-        for (offset, value) in other.iter().enumerate() {
-            unsafe { self.ptr.as_ptr().add(start + offset).write(value.clone()) };
-            self.len += 1;
+        self.inner.retain(f);
+    }
+
+    #[inline]
+    pub fn retain_mut<F>(&mut self, f: F)
+    where
+        F: FnMut(&mut T) -> bool,
+    {
+        self.inner.retain_mut(f);
+    }
+
+    #[inline]
+    pub fn dedup_by_key<F, K>(&mut self, key: F)
+    where
+        F: FnMut(&mut T) -> K,
+        K: PartialEq,
+    {
+        self.inner.dedup_by_key(key);
+    }
+
+    #[inline]
+    pub fn dedup_by<F>(&mut self, same_bucket: F)
+    where
+        F: FnMut(&mut T, &mut T) -> bool,
+    {
+        self.inner.dedup_by(same_bucket);
+    }
+
+    #[inline]
+    pub fn push(&mut self, value: T) {
+        self.inner.push(value);
+    }
+
+    #[inline]
+    pub fn pop(&mut self) -> Option<T> {
+        self.inner.pop()
+    }
+
+    #[inline]
+    pub fn append(&mut self, other: &mut Self) {
+        self.inner.append(&mut other.inner);
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.inner.clear();
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    #[inline]
+    pub fn split_off(&mut self, at: usize) -> Self {
+        Self {
+            inner: self.inner.split_off(at),
         }
+    }
+
+    #[inline]
+    pub fn resize_with<F>(&mut self, new_len: usize, f: F)
+    where
+        F: FnMut() -> T,
+    {
+        self.inner.resize_with(new_len, f);
+    }
+
+    #[inline]
+    pub fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<T>] {
+        self.inner.spare_capacity_mut()
+    }
+
+    #[inline]
+    pub fn into_boxed_slice(self) -> Box<[T]> {
+        Box::from_api(self.inner.into_boxed_slice())
+    }
+
+    #[inline]
+    pub fn drain<R>(&mut self, range: R) -> Drain<'_, T>
+    where
+        R: RangeBounds<usize>,
+    {
+        self.inner.drain(range)
+    }
+
+    #[inline]
+    pub fn into_iter(self) -> IntoIter<T> {
+        self.inner.into_iter()
+    }
+}
+
+impl<T: Clone> Vec<T> {
+    #[inline]
+    pub fn resize(&mut self, new_len: usize, value: T) {
+        self.inner.resize(new_len, value);
+    }
+
+    #[inline]
+    pub fn extend_from_slice(&mut self, other: &[T]) {
+        self.inner.extend_from_slice(other);
     }
 
     #[inline]
@@ -235,373 +224,164 @@ impl<T, const ALIGN: usize> RawVec<T, ALIGN> {
     where
         T: Copy,
     {
-        let count = other.len();
-        if count == 0 {
-            return;
-        }
-        self.reserve(count);
-        prefetch_slice_prefix(other);
-        unsafe {
-            ptr::copy_nonoverlapping(other.as_ptr(), self.ptr.as_ptr().add(self.len), count);
-        }
-        self.len += count;
+        self.inner.extend_from_slice(other);
     }
+}
 
+impl<T: Copy> Vec<T> {
     #[inline]
-    pub fn drain<R>(&mut self, range: R) -> RawDrain<'_, T, ALIGN>
-    where
-        R: RangeBounds<usize>,
-    {
-        let len = self.len;
-        let start = match range.start_bound() {
-            Bound::Included(&start) => start,
-            Bound::Excluded(&start) => start.checked_add(1).expect("drain range start overflow"),
-            Bound::Unbounded => 0,
-        };
-        let end = match range.end_bound() {
-            Bound::Included(&end) => end.checked_add(1).expect("drain range end overflow"),
-            Bound::Excluded(&end) => end,
-            Bound::Unbounded => len,
-        };
-        assert!(start <= end, "drain range start exceeds end");
-        assert!(end <= len, "drain range end exceeds length");
-
-        self.len = start;
-        RawDrain {
-            vec: self as *mut RawVec<T, ALIGN>,
-            current: start,
-            end,
-            tail_start: end,
-            tail_len: len - end,
-            _marker: PhantomData,
-        }
+    pub fn from_elem_copy(len: usize, value: T) -> Self {
+        let mut values = Self::with_capacity(len);
+        values.resize(len, value);
+        values
     }
+}
 
+impl<T: PartialEq> Vec<T> {
     #[inline]
-    pub fn into_boxed_slice(mut self) -> Slice<T, ALIGN> {
-        let ptr = self.ptr;
-        let len = self.len;
-        let cap = self.cap;
-        let heap = self.heap.take();
-        self.ptr = NonNull::dangling();
-        self.len = 0;
-        self.cap = 0;
-        mem::forget(self);
-        unsafe { Slice::from_raw_parts(ptr, len, cap, heap) }
-    }
-
-    #[inline]
-    fn grow_to(&mut self, next_capacity: usize) {
-        let main_heap = Heap::main();
-        let heap = self.heap.as_deref().unwrap_or(&main_heap);
-        let old_cap = self.cap;
-        let next_layout = align::array_layout::<T, ALIGN>(next_capacity);
-        let next_raw = heap
-            .alloc(next_layout)
-            .unwrap_or_else(|| handle_alloc_error(next_layout));
-        let next_ptr =
-            NonNull::new(next_raw.as_ptr().cast::<T>()).expect("Heap::alloc returned null");
-        for index in 0..self.len {
-            unsafe {
-                next_ptr
-                    .as_ptr()
-                    .add(index)
-                    .write(self.ptr.as_ptr().add(index).read());
-            }
-        }
-        if old_cap > 0 {
-            let old_layout = align::array_layout::<T, ALIGN>(old_cap);
-            let raw = self.ptr.as_ptr().cast::<u8>();
-            unsafe { GlobalAlloc::dealloc(heap, raw, old_layout) };
-        }
-        self.ptr = next_ptr;
-        self.cap = next_capacity;
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn grow_for_push(&mut self) {
-        self.reserve(1);
+    pub fn dedup(&mut self) {
+        self.inner.dedup();
     }
 }
 
-#[inline]
-fn prefetch_slice_prefix<T>(slice: &[T]) {
-    let byte_len = mem::size_of_val(slice);
-    if byte_len == 0 {
-        return;
-    }
-    let lines = byte_len.div_ceil(CACHE_LINE).min(COPY_PREFETCH_LINES);
-    let ptr = slice.as_ptr().cast::<u8>();
-    for line in 0..lines {
-        unsafe { prefetch_read_l1(ptr.add(line * CACHE_LINE)) };
-    }
-}
-
-pub struct RawDrain<'a, T, const ALIGN: usize = CACHE_LINE> {
-    vec: *mut RawVec<T, ALIGN>,
-    current: usize,
-    end: usize,
-    tail_start: usize,
-    tail_len: usize,
-    _marker: PhantomData<&'a mut RawVec<T, ALIGN>>,
-}
-
-impl<T, const ALIGN: usize> Iterator for RawDrain<'_, T, ALIGN> {
-    type Item = T;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.current == self.end {
-            return None;
-        }
-        let index = self.current;
-        self.current += 1;
-        Some(unsafe { (*self.vec).ptr.as_ptr().add(index).read() })
-    }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.end - self.current;
-        (len, Some(len))
-    }
-}
-
-impl<T, const ALIGN: usize> ExactSizeIterator for RawDrain<'_, T, ALIGN> {}
-
-impl<T, const ALIGN: usize> Drop for RawDrain<'_, T, ALIGN> {
-    fn drop(&mut self) {
-        unsafe {
-            let vec = &mut *self.vec;
-            while self.current < self.end {
-                ptr::drop_in_place(vec.ptr.as_ptr().add(self.current));
-                self.current += 1;
-            }
-            if self.tail_len != 0 {
-                ptr::copy(
-                    vec.ptr.as_ptr().add(self.tail_start),
-                    vec.ptr.as_ptr().add(vec.len),
-                    self.tail_len,
-                );
-            }
-            vec.len += self.tail_len;
-        }
-    }
-}
-
-pub struct RawIntoIter<T, const ALIGN: usize = CACHE_LINE> {
-    ptr: NonNull<T>,
-    cap: usize,
-    current: usize,
-    end: usize,
-    /// `None` selects the main heap; `Some` retains an explicit non-main heap.
-    heap: Option<Arc<Heap>>,
-}
-
-impl<T, const ALIGN: usize> Iterator for RawIntoIter<T, ALIGN> {
-    type Item = T;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.current == self.end {
-            return None;
-        }
-        let index = self.current;
-        self.current += 1;
-        Some(unsafe { self.ptr.as_ptr().add(index).read() })
-    }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.end - self.current;
-        (len, Some(len))
-    }
-}
-
-impl<T, const ALIGN: usize> ExactSizeIterator for RawIntoIter<T, ALIGN> {}
-
-impl<T, const ALIGN: usize> Drop for RawIntoIter<T, ALIGN> {
-    fn drop(&mut self) {
-        unsafe {
-            while self.current < self.end {
-                ptr::drop_in_place(self.ptr.as_ptr().add(self.current));
-                self.current += 1;
-            }
-        }
-        if self.cap > 0 {
-            let main_heap = Heap::main();
-            let heap = self.heap.as_deref().unwrap_or(&main_heap);
-            let layout = align::array_layout::<T, ALIGN>(self.cap);
-            let raw = self.ptr.as_ptr().cast::<u8>();
-            unsafe { GlobalAlloc::dealloc(heap, raw, layout) };
-        }
-    }
-}
-
-impl<T, const ALIGN: usize> Default for RawVec<T, ALIGN> {
+impl<T> Default for Vec<T> {
     #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T: Clone, const ALIGN: usize> Clone for RawVec<T, ALIGN> {
+impl<T: Clone> Clone for Vec<T> {
     #[inline]
     fn clone(&self) -> Self {
-        let mut values = match self.heap.as_ref() {
-            Some(heap) => Self::with_capacity_in(self.len, heap.clone()),
-            None => Self::with_capacity(self.len),
-        };
-        values.extend_from_cloned_slice(self.as_slice());
-        values
+        Self {
+            inner: self.inner.clone(),
+        }
     }
 }
 
-impl<T: fmt::Debug, const ALIGN: usize> fmt::Debug for RawVec<T, ALIGN> {
+impl<T: fmt::Debug> fmt::Debug for Vec<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.as_slice().fmt(f)
+        self.inner.fmt(f)
     }
 }
 
-impl<T: PartialEq, const ALIGN: usize> PartialEq for RawVec<T, ALIGN> {
+impl<T> Deref for Vec<T> {
+    type Target = [T];
+
+    #[inline]
+    fn deref(&self) -> &[T] {
+        self.inner.as_slice()
+    }
+}
+
+impl<T> DerefMut for Vec<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [T] {
+        self.inner.as_mut_slice()
+    }
+}
+
+impl<T> Extend<T> for Vec<T> {
+    #[inline]
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        self.inner.extend(iter);
+    }
+}
+
+impl<T> FromIterator<T> for Vec<T> {
+    #[inline]
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let mut out = Self::new();
+        out.extend(iter);
+        out
+    }
+}
+
+impl<T, const N: usize> From<[T; N]> for Vec<T> {
+    #[inline]
+    fn from(array: [T; N]) -> Self {
+        let mut out = Self::with_capacity(N);
+        for value in array {
+            out.push(value);
+        }
+        out
+    }
+}
+
+impl<T> From<std::vec::Vec<T>> for Vec<T> {
+    #[inline]
+    fn from(values: std::vec::Vec<T>) -> Self {
+        let mut out = Self::with_capacity(values.len());
+        out.extend(values);
+        out
+    }
+}
+
+impl<T> From<Box<[T]>> for Vec<T> {
+    #[inline]
+    fn from(boxed: Box<[T]>) -> Self {
+        Self {
+            inner: ApiVec::from(boxed.into_api()),
+        }
+    }
+}
+
+impl<T: PartialEq> PartialEq for Vec<T> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.as_slice() == other.as_slice()
     }
 }
 
-impl<T: Eq, const ALIGN: usize> Eq for RawVec<T, ALIGN> {}
+impl<T: Eq> Eq for Vec<T> {}
 
-impl<T, U, const ALIGN: usize> PartialEq<&[U]> for RawVec<T, ALIGN>
-where
-    T: PartialEq<U>,
-{
+impl<T: PartialEq> PartialEq<[T]> for Vec<T> {
     #[inline]
-    fn eq(&self, other: &&[U]) -> bool {
-        self.as_slice() == *other
-    }
-}
-
-impl<T, U, const ALIGN: usize> PartialEq<[U]> for RawVec<T, ALIGN>
-where
-    T: PartialEq<U>,
-{
-    #[inline]
-    fn eq(&self, other: &[U]) -> bool {
+    fn eq(&self, other: &[T]) -> bool {
         self.as_slice() == other
     }
 }
 
-impl<T, U, const ALIGN: usize> PartialEq<std::vec::Vec<U>> for RawVec<T, ALIGN>
-where
-    T: PartialEq<U>,
-{
+impl<T: PartialEq> PartialEq<&[T]> for Vec<T> {
     #[inline]
-    fn eq(&self, other: &std::vec::Vec<U>) -> bool {
+    fn eq(&self, other: &&[T]) -> bool {
+        self.as_slice() == *other
+    }
+}
+
+impl<T: PartialEq, const N: usize> PartialEq<[T; N]> for Vec<T> {
+    #[inline]
+    fn eq(&self, other: &[T; N]) -> bool {
         self.as_slice() == other.as_slice()
     }
 }
 
-impl<T, U, const ALIGN: usize, const N: usize> PartialEq<&[U; N]> for RawVec<T, ALIGN>
-where
-    T: PartialEq<U>,
-{
+impl<T: PartialEq, const N: usize> PartialEq<&[T; N]> for Vec<T> {
     #[inline]
-    fn eq(&self, other: &&[U; N]) -> bool {
+    fn eq(&self, other: &&[T; N]) -> bool {
         self.as_slice() == other.as_slice()
     }
 }
 
-impl<T, U, const ALIGN: usize, const N: usize> PartialEq<[U; N]> for RawVec<T, ALIGN>
-where
-    T: PartialEq<U>,
-{
+impl<T: PartialEq> PartialEq<std::vec::Vec<T>> for Vec<T> {
     #[inline]
-    fn eq(&self, other: &[U; N]) -> bool {
+    fn eq(&self, other: &std::vec::Vec<T>) -> bool {
         self.as_slice() == other.as_slice()
     }
 }
 
-impl<T, const ALIGN: usize> Drop for RawVec<T, ALIGN> {
-    fn drop(&mut self) {
-        self.clear();
-        if self.cap > 0 {
-            let main_heap = Heap::main();
-            let heap = self.heap.as_deref().unwrap_or(&main_heap);
-            let layout = align::array_layout::<T, ALIGN>(self.cap);
-            let raw = self.ptr.as_ptr().cast::<u8>();
-            unsafe { GlobalAlloc::dealloc(heap, raw, layout) };
-        }
-    }
-}
-
-impl<T, const ALIGN: usize> Deref for RawVec<T, ALIGN> {
-    type Target = [T];
-
-    #[inline(always)]
-    fn deref(&self) -> &Self::Target {
-        self.as_slice()
-    }
-}
-
-impl<T, const ALIGN: usize> DerefMut for RawVec<T, ALIGN> {
-    #[inline(always)]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.as_mut_slice()
-    }
-}
-
-impl<T, const ALIGN: usize> Extend<T> for RawVec<T, ALIGN> {
-    #[inline]
-    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
-        let iter = iter.into_iter();
-        let (lower, _) = iter.size_hint();
-        self.reserve(lower);
-        for value in iter {
-            self.push(value);
-        }
-    }
-}
-
-impl<T, const ALIGN: usize> FromIterator<T> for RawVec<T, ALIGN> {
-    #[inline]
-    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        let mut values = Self::new();
-        values.extend(iter);
-        values
-    }
-}
-
-impl<T, const ALIGN: usize> From<std::vec::Vec<T>> for RawVec<T, ALIGN> {
-    #[inline]
-    fn from(values: std::vec::Vec<T>) -> Self {
-        values.into_iter().collect()
-    }
-}
-
-impl<T, const ALIGN: usize> IntoIterator for RawVec<T, ALIGN> {
+impl<T> IntoIterator for Vec<T> {
     type Item = T;
-    type IntoIter = RawIntoIter<T, ALIGN>;
+    type IntoIter = IntoIter<T>;
 
     #[inline]
-    fn into_iter(mut self) -> Self::IntoIter {
-        let heap = self.heap.take();
-        let iter = RawIntoIter {
-            ptr: self.ptr,
-            cap: self.cap,
-            current: 0,
-            end: self.len,
-            heap,
-        };
-        self.ptr = NonNull::dangling();
-        self.len = 0;
-        self.cap = 0;
-        mem::forget(self);
-        iter
+    fn into_iter(self) -> Self::IntoIter {
+        self.inner.into_iter()
     }
 }
 
-impl<'a, T, const ALIGN: usize> IntoIterator for &'a RawVec<T, ALIGN> {
+impl<'a, T> IntoIterator for &'a Vec<T> {
     type Item = &'a T;
     type IntoIter = std::slice::Iter<'a, T>;
 
@@ -611,7 +391,7 @@ impl<'a, T, const ALIGN: usize> IntoIterator for &'a RawVec<T, ALIGN> {
     }
 }
 
-impl<'a, T, const ALIGN: usize> IntoIterator for &'a mut RawVec<T, ALIGN> {
+impl<'a, T> IntoIterator for &'a mut Vec<T> {
     type Item = &'a mut T;
     type IntoIter = std::slice::IterMut<'a, T>;
 

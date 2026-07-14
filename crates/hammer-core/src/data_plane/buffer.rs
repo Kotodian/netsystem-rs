@@ -1,9 +1,7 @@
-use core::alloc::{GlobalAlloc, Layout};
 use core::mem;
 use core::ptr::{self, NonNull};
 use core::slice;
 use core::sync::atomic::{AtomicU64, Ordering};
-use std::alloc::handle_alloc_error;
 use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::future::Future;
@@ -17,8 +15,8 @@ use crate::data_plane::NodeId;
 use crate::error::{CoreError, CoreResult, DataPlaneError};
 use hammer_infra::{
     align::align_up,
-    boxed::Slice,
-    heap::Heap,
+    boxed::Box,
+    physmem::PhysmemMap,
     prefetch::{prefetch_read_l1, prefetch_read_l2, prefetch_write_l1},
     simd::movemask_4,
     vec::Vec,
@@ -837,16 +835,10 @@ struct BufferPoolInner {
     numa_node: u32,
     slot_capacity: usize,
     slot_stride: usize,
-    region: Arc<Heap>,
-    region_base: usize,
-    region_layout: Layout,
+    region: PhysmemMap,
     region_size: usize,
-    metadata_heap: Arc<Heap>,
-    metadata_base: usize,
-    metadata_layout: Layout,
-    slot_states: usize,
-    available_stack: usize,
-    available_len: usize,
+    slot_states: Box<[BufferSlot]>,
+    available_stack: Vec<u32>,
     total_slots: usize,
     in_use: usize,
     in_use_delta: i32,
@@ -856,39 +848,16 @@ impl fmt::Debug for BufferPoolInner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BufferPoolInner")
             .field("pool_id", &self.pool_id)
+            .field("numa_node", &self.numa_node)
             .field("slot_capacity", &self.slot_capacity)
             .field("slot_stride", &self.slot_stride)
-            .field("region_base", &self.region_base)
+            .field("region_base", &self.region.base())
             .field("region_size", &self.region_size)
-            .field("metadata_base", &self.metadata_base)
-            .field("available_len", &self.available_len)
+            .field("available_len", &self.available_stack.len())
             .field("total_slots", &self.total_slots)
             .field("in_use", &self.in_use)
             .field("in_use_delta", &self.in_use_delta)
             .finish()
-    }
-}
-
-impl Drop for BufferPoolInner {
-    fn drop(&mut self) {
-        // SAFETY: `region_base` came from `self.region.alloc(self.region_layout)`
-        // during arena construction and has not been deallocated yet.
-        unsafe {
-            GlobalAlloc::dealloc(
-                &*self.region,
-                self.region_base as *mut u8,
-                self.region_layout,
-            )
-        };
-        // SAFETY: `metadata_base` came from `self.metadata_heap.alloc` during
-        // arena construction and is paired with `metadata_layout`.
-        unsafe {
-            GlobalAlloc::dealloc(
-                &*self.metadata_heap,
-                self.metadata_base as *mut u8,
-                self.metadata_layout,
-            )
-        };
     }
 }
 
@@ -1002,8 +971,8 @@ struct FrameSlot {
 #[derive(Debug)]
 struct FramePoolInner {
     pool_id: u64,
-    slots: Slice<FrameSlot>,
-    available: Slice<u32>,
+    slots: Box<[FrameSlot]>,
+    available: Box<[u32]>,
     available_len: usize,
     in_use: usize,
 }
@@ -1222,13 +1191,11 @@ impl DataPlaneBuffers {
             config.numa_nodes
         };
         for &numa_node in configured_numa_nodes {
-            let heap = Arc::new(Heap::local());
             let inserted = buffer_arenas.insert(
                 numa_node,
-                BufferPoolArena::with_capacity_in(
+                BufferPoolArena::with_capacity_on_numa(
                     config.buffer_slot_capacity,
                     config.buffer_slots,
-                    heap,
                     numa_node,
                 ),
             );
@@ -1296,7 +1263,7 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    pub fn clone_buffer_arenas(&self) -> std::vec::Vec<BufferPoolArena> {
+    pub fn clone_buffer_arenas(&self) -> Vec<BufferPoolArena> {
         self.buffer_arenas()
             .iter()
             .map(|(_, arena)| arena.clone())
@@ -1600,16 +1567,11 @@ impl DataPlaneBuffers {
 impl BufferPoolArena {
     #[inline]
     pub fn with_capacity(slot_capacity: usize, slots: usize) -> Self {
-        Self::with_capacity_in(slot_capacity, slots, Arc::new(Heap::local()), 0)
+        Self::with_capacity_on_numa(slot_capacity, slots, 0)
     }
 
     #[inline]
-    pub fn with_capacity_in(
-        slot_capacity: usize,
-        slots: usize,
-        heap: Arc<Heap>,
-        numa_node: u32,
-    ) -> Self {
+    pub fn with_capacity_on_numa(slot_capacity: usize, slots: usize, numa_node: u32) -> Self {
         assert!(slot_capacity > 0, "buffer slot capacity must be non-zero");
         assert!(
             slots > 0,
@@ -1628,40 +1590,23 @@ impl BufferPoolArena {
         let region_size = slot_stride
             .checked_mul(total_slots)
             .expect("buffer arena size overflow");
-        let region_layout = Layout::from_size_align(region_size, BUFFER_CACHE_LINE_SIZE)
-            .expect("buffer arena layout");
-        let region_base = heap
-            .alloc(region_layout)
-            .expect("buffer arena heap allocation");
+        let region = PhysmemMap::create("buffers", region_size, 0, numa_node)
+            .expect("buffer arena physmem map");
         unsafe {
-            ptr::write_bytes(region_base.as_ptr(), 0, region_layout.size());
+            ptr::write_bytes(region.base(), 0, region.size());
         }
 
-        let slot_state_bytes = mem::size_of::<BufferSlot>()
-            .checked_mul(total_slots)
-            .expect("buffer metadata slot state overflow");
-        let available_bytes = mem::size_of::<u32>()
-            .checked_mul(slots)
-            .expect("buffer metadata availability overflow");
-        let available_offset = align_up(slot_state_bytes, mem::align_of::<u32>());
-        let metadata_size = available_offset
-            .checked_add(available_bytes)
-            .expect("buffer metadata size overflow");
-        let metadata_layout = Layout::from_size_align(metadata_size, BUFFER_CACHE_LINE_SIZE)
-            .expect("buffer metadata layout");
-        let metadata_base = heap
-            .alloc(metadata_layout)
-            .expect("buffer metadata heap allocation");
-        unsafe {
-            ptr::write_bytes(metadata_base.as_ptr(), 0, metadata_layout.size());
-        }
-        let slot_states = metadata_base.cast::<BufferSlot>();
-        let available_stack = unsafe {
-            NonNull::new_unchecked(metadata_base.as_ptr().add(available_offset).cast::<u32>())
-        };
+        let slot_states = Box::from_elem(
+            total_slots,
+            BufferSlot {
+                generation: 0,
+                allocated: false,
+            },
+        );
+        let mut available_stack = Vec::with_capacity(slots);
         for i in 0..slots {
             let slot = u32::try_from(total_slots - i - 1).expect("buffer slot fits u32");
-            unsafe { available_stack.as_ptr().add(i).write(slot) };
+            available_stack.push(slot);
         }
 
         Self {
@@ -1670,16 +1615,10 @@ impl BufferPoolArena {
                 numa_node,
                 slot_capacity,
                 slot_stride,
-                region: Arc::clone(&heap),
-                region_base: region_base.as_ptr() as usize,
-                region_layout,
-                region_size,
-                metadata_heap: heap,
-                metadata_base: metadata_base.as_ptr() as usize,
-                metadata_layout,
-                slot_states: slot_states.as_ptr() as usize,
-                available_stack: available_stack.as_ptr() as usize,
-                available_len: slots,
+                region_size: region.size(),
+                region,
+                slot_states,
+                available_stack,
                 total_slots,
                 in_use: 0,
                 in_use_delta: 0,
@@ -1742,7 +1681,7 @@ impl BufferPool {
 
     #[inline]
     pub fn base_ptr(&self) -> *const u8 {
-        self.arena.inner.read().region_base as *const u8
+        self.arena.inner.read().region.base() as *const u8
     }
 
     #[inline]
@@ -1990,21 +1929,21 @@ impl BufferPool {
 impl FramePool {
     #[inline]
     fn with_capacity(frame_capacity: usize, slots: usize) -> Self {
-        let mut available = Slice::from_elem(slots, 0u32);
+        let mut available = Box::from_elem(slots, 0u32);
         for offset in 0..slots {
             available[offset] =
                 u32::try_from(slots - offset - 1).expect("frame slot index fits u32");
         }
-        let slots = Slice::from_fn(slots, |_| FrameSlot {
+        let frame_slots = Box::from_fn(slots, |_| FrameSlot {
             generation: 0,
             allocated: false,
             frame: Some(BufferFrame::with_capacity(frame_capacity)),
         });
-        let available_len = slots.len();
+        let available_len = frame_slots.len();
         Self {
             inner: Rc::new(RefCell::new(FramePoolInner {
                 pool_id: next_pool_id(),
-                slots,
+                slots: frame_slots,
                 available,
                 available_len,
                 in_use: 0,
@@ -2220,47 +2159,25 @@ impl BufferPoolInner {
     #[inline]
     fn slot_state(&self, slot: u32) -> CoreResult<&BufferSlot> {
         let slot = self.slot_index(slot)?;
-        // SAFETY: `slot_states` points to `total_slots` contiguous `BufferSlot`
-        // records allocated during arena construction.
-        Ok(unsafe { &*((self.slot_states as *const BufferSlot).add(slot)) })
+        Ok(&self.slot_states[slot])
     }
 
     #[inline]
     fn slot_state_mut(&mut self, slot: u32) -> CoreResult<&mut BufferSlot> {
         let slot = self.slot_index(slot)?;
-        // SAFETY: the mutable borrow of `self` guarantees unique access to the
-        // raw metadata block.
-        Ok(unsafe { &mut *((self.slot_states as *mut BufferSlot).add(slot)) })
+        Ok(&mut self.slot_states[slot])
     }
 
     #[inline]
     fn pop_available_slot(&mut self) -> Option<u32> {
-        if self.available_len == 0 {
-            return None;
-        }
-        self.available_len -= 1;
-        // SAFETY: `available_len` always tracks initialized stack entries in
-        // `available_stack`.
-        Some(unsafe {
-            (self.available_stack as *const u32)
-                .add(self.available_len)
-                .read()
-        })
+        self.available_stack.pop()
     }
 
     #[inline]
     fn push_available_slot(&mut self, slot: u32) {
         debug_assert_ne!(slot, 0);
-        debug_assert!(self.available_len < self.total_slots - 1);
-        // SAFETY: `available_len < total_slots - 1` and slot 0 is never
-        // inserted, so the raw availability stack has spare initialized
-        // capacity.
-        unsafe {
-            (self.available_stack as *mut u32)
-                .add(self.available_len)
-                .write(slot);
-        }
-        self.available_len += 1;
+        debug_assert!(self.available_stack.len() < self.total_slots - 1);
+        self.available_stack.push(slot);
     }
 
     #[inline]
@@ -2268,7 +2185,7 @@ impl BufferPoolInner {
         let offset = self.slot_offset(slot)?;
         // SAFETY: `offset` is validated to land within the arena region and
         // each slot begins with an inline `Buffer` header.
-        Ok(unsafe { (self.region_base as *mut u8).add(offset).cast::<Buffer>() })
+        Ok(unsafe { self.region.base().add(offset).cast::<Buffer>() })
     }
 
     #[inline]
@@ -2279,7 +2196,7 @@ impl BufferPoolInner {
             .ok_or_else(|| CoreError::internal("buffer data pointer overflow"))?;
         // SAFETY: `offset` points at the inline data block within the validated
         // arena slot.
-        Ok(unsafe { (self.region_base as *mut u8).add(offset) })
+        Ok(unsafe { self.region.base().add(offset) })
     }
 
     #[inline]
@@ -2788,7 +2705,7 @@ impl BufferPoolInner {
     #[cold]
     #[inline(never)]
     fn refill_cache_batch(&mut self, cache: &mut BufferThreadCache) {
-        let arena_free = self.available_len;
+        let arena_free = self.available_stack.len();
         if arena_free == 0 {
             return;
         }

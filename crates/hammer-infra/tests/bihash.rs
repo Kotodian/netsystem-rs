@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use hammer_infra::bihash::bucket::Bucket;
 use hammer_infra::bihash::{Bihash, Bihash8x8, BihashKey};
-use hammer_infra::heap::Heap;
 
 #[test]
 fn bihash_key_u64_hashes_deterministically() {
@@ -71,9 +70,8 @@ fn bucket_refcnt_max_is_8191() {
 }
 
 #[test]
-fn bihash_with_capacity_in_uses_supplied_heap_surface() {
-    let heap = Arc::new(Heap::main());
-    let mut table: Bihash<u64, 7> = Bihash::with_capacity_in(8, heap);
+fn bihash_default_constructor_supports_insert_lookup() {
+    let mut table: Bihash<u64, 7> = Bihash::new(8);
 
     table.insert(10, 100);
     table.insert(11, 110);

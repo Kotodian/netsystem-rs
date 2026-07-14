@@ -129,3 +129,34 @@ static SVM_VTABLE: HeapVTable = HeapVTable {
     alloc: shared_owner_alloc_callback,
     dealloc: shared_owner_dealloc_callback,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::heap_vec::Vec as HeapVec;
+    use crate::svm_region::SvmRegion;
+
+    #[test]
+    fn main_heap_handle_is_metadata_free() {
+        let main = Heap::main();
+        assert!(main.is_main_heap());
+        assert!(main.region().is_none());
+        let clone = main.clone();
+        assert!(clone.is_main_heap());
+    }
+
+    #[test]
+    fn svm_vector_retains_provenance_across_growth_and_drop() {
+        let region = SvmRegion::with_size(1 << 20);
+        let heap = Arc::new(Heap::svm_data(region).expect("owner region heap"));
+        let mut values = HeapVec::with_capacity_in(0, heap);
+        for value in 0..64u64 {
+            values.push(value);
+        }
+        let clone = values.clone();
+        assert_eq!(clone.len(), 64);
+        assert_eq!(clone[63], 63);
+        drop(clone);
+        drop(values);
+    }
+}

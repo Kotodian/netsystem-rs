@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use crate::boxed::Slice;
 use crate::heap::Heap;
+use crate::heap_boxed::Slice;
+use crate::heap_vec::Vec;
 use crate::prefetch::prefetch_read_l1;
-use crate::vec::Vec;
 
 #[deprecated(since = "0.1.0", note = "use hammer_infra::bihash::BihashKey instead")]
 pub trait FlatHashKey: Copy + Eq {
@@ -83,7 +83,7 @@ impl<K: FlatHashKey, V: Clone> FlatHashTable<K, V> {
     /// path so a rehash re-allocates a larger bucket slice from the
     /// same `Heap`.
     #[inline]
-    pub fn with_capacity_in(capacity: usize, heap: Arc<Heap>) -> Self {
+    pub(crate) fn with_capacity_in(capacity: usize, heap: Arc<Heap>) -> Self {
         let capacity = capacity.next_power_of_two().max(1);
         let buckets = Slice::from_elem_in(capacity, FlatHashBucket::empty(), heap.clone());
         Self {

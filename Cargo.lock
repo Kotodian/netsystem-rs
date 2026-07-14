@@ -24,6 +24,10 @@ dependencies = [
 [[package]]
 name = "allocator-api2"
 version = "0.4.0"
+
+[[package]]
+name = "allocator-api2"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c880a97d28a3681c0267bd29cff89621202715b065127cd445fa0f0fe0aa2880"
 
@@ -737,6 +741,7 @@ dependencies = [
 name = "hammer-infra"
 version = "0.1.0"
 dependencies = [
+ "allocator-api2 0.4.0",
  "crossbeam-utils",
  "libc",
  "mimalloc",
@@ -799,6 +804,7 @@ dependencies = [
  "hammer-infra",
  "hammer-runtime",
  "ipnet",
+ "libc",
  "linkme",
  "nom",
  "smoltcp",
@@ -1830,7 +1836,7 @@ version = "5.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40a5888b3189a89207eea4190e74387b5db3150d213f84186cac637dcd55259d"
 dependencies = [
- "allocator-api2",
+ "allocator-api2 0.4.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "lock_api",
 ]
 

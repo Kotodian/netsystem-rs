@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crossbeam_utils::CachePadded;
 
-use crate::boxed::Slice;
+use crate::heap_boxed::Slice;
 use crate::prefetch::prefetch_read_l1;
 use crate::vec::Vec;
 

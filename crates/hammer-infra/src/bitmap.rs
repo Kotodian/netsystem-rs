@@ -13,9 +13,9 @@ impl Bitmap {
 
     #[inline]
     pub fn with_capacity(bits: usize) -> Self {
-        Self {
-            words: Vec::from_elem_copy(words_for(bits), 0),
-        }
+        let mut words = Vec::with_capacity(words_for(bits));
+        words.resize(words_for(bits), 0);
+        Self { words }
     }
 
     #[inline]

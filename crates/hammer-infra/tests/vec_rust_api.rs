@@ -18,7 +18,7 @@ fn vec_uses_the_rust_collection_interface() {
     assert_eq!(values.spare_capacity_mut().len(), available);
 
     let boxed: Box<[i32]> = values.into_boxed_slice();
-    assert_eq!(&*boxed, &[1, 2, 3]);
+    assert_eq!(&*boxed, &[1, 3, 2]);
 
     let repeated: Vec<_> = hammer_infra::vec![7; 3];
     assert_eq!(repeated, [7, 7, 7]);

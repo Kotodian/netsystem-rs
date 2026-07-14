@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use crate::align::{self, CACHE_LINE};
 use crate::bitmap::Bitmap;
-use crate::boxed::Slice;
 use crate::heap::Heap;
+use crate::heap_boxed::Slice;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Index {
@@ -67,7 +67,7 @@ impl<T, const ALIGN: usize> Pool<T, ALIGN> {
     /// region; the Local vtable's `dealloc` hands the slab back to the
     /// global allocator).
     #[inline]
-    pub fn with_capacity_in(capacity: usize, heap: Arc<Heap>) -> Self {
+    pub(crate) fn with_capacity_in(capacity: usize, heap: Arc<Heap>) -> Self {
         let stride = align::slot_stride::<T, ALIGN>();
         let layout = if capacity == 0 {
             None

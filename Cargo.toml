@@ -12,6 +12,7 @@ members = [
     "crates/hammerctl",
 ]
 exclude = [
+    "third_party/allocator-api2",
     "third_party/boringtun",
     "third_party/io-uring",
 ]
@@ -72,6 +73,7 @@ mimalloc = { version = "0.1", default-features = false }
 talc = { version = "5.0.4", default-features = false }
 spinning_top = "0.3"
 io-uring = "0.7.13"
+allocator-api2 = { path = "third_party/allocator-api2" }
 
 [patch.crates-io]
 boringtun = { path = "third_party/boringtun" }

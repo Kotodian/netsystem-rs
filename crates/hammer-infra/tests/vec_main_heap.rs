@@ -1,10 +1,9 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::sync::Arc;
+use std::mem;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use hammer_infra::boxed::Slice;
-use hammer_infra::heap::Heap;
+use hammer_infra::boxed::Box;
 use hammer_infra::vec::Vec;
 
 struct CountingAllocator;
@@ -47,14 +46,10 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
 #[test]
 fn default_heap_lifecycles_avoid_the_process_global_allocator() {
-    let explicit_main = Arc::new(Heap::main());
-    let explicit_main_ref = Arc::downgrade(&explicit_main);
+    assert_eq!(mem::size_of::<Vec<u64>>(), 3 * mem::size_of::<usize>());
 
     ALLOCATIONS.store(0, Ordering::Relaxed);
     COUNT_ALLOCATIONS.with(|count| count.set(true));
-
-    let main = Heap::main();
-    let main_clone = main.clone();
 
     let empty_values = Vec::<u64>::with_capacity(0);
     let mut values = Vec::new();
@@ -64,10 +59,14 @@ fn default_heap_lifecycles_avoid_the_process_global_allocator() {
     let clone = values.clone();
     std::hint::black_box((&values, &clone));
 
-    let slice: Slice<u64> = Slice::from_elem(256, 7_u64);
+    let repeated = hammer_infra::vec![7_u64; 3];
+    let listed = hammer_infra::vec![1_u64, 2, 3];
+    std::hint::black_box((&repeated, &listed));
+
+    let slice: Box<[u64]> = Box::from_elem(256, 7_u64);
     let slice_clone = slice.clone();
-    let empty_slice: Slice<u64> = Slice::from_elem(0, 0);
-    let generated: Slice<u64> = Slice::from_fn(64, |index| index as u64);
+    let empty_slice: Box<[u64]> = Box::from_elem(0, 0);
+    let generated: Box<[u64]> = Box::from_fn(64, |index| index as u64);
     std::hint::black_box((&slice, &slice_clone, &empty_slice, &generated));
 
     let boxed = clone.into_boxed_slice();
@@ -76,21 +75,16 @@ fn default_heap_lifecycles_avoid_the_process_global_allocator() {
     let mut consumed = values.into_iter();
     assert_eq!(consumed.next(), Some(0));
 
-    let explicit_main_values = Vec::<u64>::with_capacity_in(16, explicit_main);
-    let retained_explicit_main_refs = explicit_main_ref.strong_count();
-
-    drop(explicit_main_values);
     drop(consumed);
     drop(boxed);
     drop(generated);
     drop(empty_slice);
     drop(slice_clone);
     drop(slice);
+    drop(listed);
+    drop(repeated);
     drop(empty_values);
-    drop(main_clone);
-    drop(main);
 
     COUNT_ALLOCATIONS.with(|count| count.set(false));
     assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);
-    assert_eq!(retained_explicit_main_refs, 0);
 }

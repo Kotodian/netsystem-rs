@@ -7,7 +7,7 @@ use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
 use hammer_core::protocol::transport::UdpHeader;
 use hammer_core::protocol::wire::read_header;
-use hammer_infra::boxed::Slice;
+use hammer_infra::boxed::Box;
 use hammer_runtime::{
     DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
     TraceFormatter, add_packet_trace,
@@ -179,14 +179,14 @@ impl UdpInputControlPlane {
 
 #[derive(Clone)]
 struct UdpInputSnapshot {
-    ports: Slice<UdpPortAction>,
+    ports: Box<[UdpPortAction]>,
 }
 
 impl UdpInputSnapshot {
     #[inline]
     fn new() -> Self {
         Self {
-            ports: Slice::from_elem(UDP_PORT_COUNT, UdpPortAction::IcmpError),
+            ports: Box::from_elem(UDP_PORT_COUNT, UdpPortAction::IcmpError),
         }
     }
 
