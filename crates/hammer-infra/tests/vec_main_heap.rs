@@ -63,7 +63,7 @@ fn default_heap_lifecycles_avoid_the_process_global_allocator() {
     let clone = values.clone();
     std::hint::black_box((&values, &clone));
 
-    let slice = Slice::from_elem(256, 7_u64);
+    let slice: Slice<u64> = Slice::from_elem(256, 7_u64);
     let slice_clone = slice.clone();
     std::hint::black_box((&slice, &slice_clone));
 
