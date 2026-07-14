@@ -1,5 +1,3 @@
-use std::cell::UnsafeCell;
-use std::fmt;
 use std::mem::{size_of, transmute};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -11,13 +9,7 @@ use hammer_core::data_plane::{
 };
 use hammer_core::error::{CoreError, CoreResult, HammerResult};
 use hammer_core::forwarding::{
-    Adjacency as CoreAdjacency, DpoId as CoreDpoId, FibEntry as CoreFibEntry,
-    FibLookupResult as CoreFibLookupResult, FibTable as CoreFibTable,
-    FibTableBuilder as CoreFibTableBuilder, LoadBalance as CoreLoadBalance,
-};
-pub use hammer_core::forwarding::{
-    AdjacencyIndex, Dpo, DpoClass, DpoProto, DpoStackRegistry, DpoType, DpoTypeRegistry,
-    FibRouteDpoError, LoadBalanceError, LoadBalanceIndex,
+    Adjacency, AdjacencyIndex, DpoProto, DpoType, FibLookupResult, FibTable, FibTableBuilder,
 };
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
 use hammer_core::protocol::ip::{IpProtocol, IpVersion, ParsedIpPacket};
@@ -28,23 +20,14 @@ use hammer_runtime::{
     TraceFormatter, add_packet_trace, unlikely,
 };
 
-use crate::data_plane::set_index_node_error_code;
-use crate::net::{ForwardingMetadata, NetworkOpaque, TapEthernetMetadata};
-use crate::trace::codec::{
+use hammer_infra::vec::Vec;
+use hammer_service::data_plane::set_index_node_error_code;
+use hammer_service::net::fib::FibTableHandle;
+use hammer_service::opaque::{ForwardingMetadata, NetworkOpaque, TapEthernetMetadata};
+use hammer_service::trace::codec::{
     TraceDecodeCursor, put_option_dpo_type, put_option_u16, put_option_u32, put_u16, put_u32,
     put_usize,
 };
-use hammer_infra::vec::Vec;
-
-/// Packet-path forwarding nexts are consumer-local slots (`u16`), not target
-/// `NodeId` values. Graph Runtime resolves slots via Graph Fanout.
-pub type Adjacency = CoreAdjacency<u16>;
-pub type DpoId = CoreDpoId<u16>;
-pub type FibEntry = CoreFibEntry<u16>;
-pub type FibLookupResult = CoreFibLookupResult<u16>;
-pub type FibTable = CoreFibTable<u16>;
-pub type FibTableBuilder = CoreFibTableBuilder<u16>;
-pub type LoadBalance = CoreLoadBalance<u16>;
 
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
@@ -147,70 +130,6 @@ fn format_adjacency_rewrite_trace(bytes: &[u8]) -> String {
     }
 }
 
-#[derive(Clone)]
-pub struct FibTableHandle {
-    inner: Arc<FibTableSlot>,
-}
-
-struct FibTableSlot {
-    table: UnsafeCell<FibTable>,
-}
-
-impl FibTableHandle {
-    #[inline]
-    pub fn new(table: FibTable) -> Self {
-        Self {
-            inner: Arc::new(FibTableSlot::new(table)),
-        }
-    }
-
-    #[inline]
-    pub fn table(&self) -> &FibTable {
-        self.inner.table()
-    }
-
-    #[inline]
-    pub(crate) fn replace_after_barrier(&self, table: FibTable) {
-        self.inner.replace_after_barrier(table);
-    }
-}
-
-impl fmt::Debug for FibTableHandle {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FibTableHandle").finish_non_exhaustive()
-    }
-}
-
-impl FibTableSlot {
-    #[inline]
-    fn new(table: FibTable) -> Self {
-        Self {
-            table: UnsafeCell::new(table),
-        }
-    }
-
-    #[inline]
-    fn table(&self) -> &FibTable {
-        // SAFETY: FIB table writes are serialized by the runtime data-plane
-        // barrier before publication. Data-plane nodes only take immutable
-        // references while workers are running.
-        unsafe { &*self.table.get() }
-    }
-
-    #[inline]
-    fn replace_after_barrier(&self, table: FibTable) {
-        // SAFETY: callers replace the table either while the runtime
-        // data-plane barrier is held, or during single-threaded graph setup in
-        // tests before packets are processed.
-        unsafe {
-            *self.table.get() = table;
-        }
-    }
-}
-
-unsafe impl Send for FibTableSlot {}
-unsafe impl Sync for FibTableSlot {}
-
 pub struct IpLookupControlPlane {
     table: FibTableHandle,
     control_handle: Option<Arc<ControlThreadHandle>>,
@@ -219,7 +138,7 @@ pub struct IpLookupControlPlane {
 
 impl IpLookupControlPlane {
     #[inline]
-    pub fn new(table: FibTable) -> Self {
+    pub fn new(table: FibTable<u16>) -> Self {
         Self {
             table: FibTableHandle::new(table),
             control_handle: None,
@@ -259,7 +178,7 @@ impl IpLookupControlPlane {
     }
 
     #[inline]
-    pub fn publish(&self, table: FibTable) -> HammerResult<()> {
+    pub fn publish(&self, table: FibTable<u16>) -> HammerResult<()> {
         let table_handle = self.table.clone();
         let barrier = self.barrier.clone();
         let publish = move || {
@@ -312,8 +231,8 @@ impl IpMain {
         Self { routes }
     }
 
-    fn build_table(&self, drop: u16) -> CoreResult<FibTable> {
-        let mut builder = FibTableBuilder::new(drop);
+    fn build_table(&self, drop: u16) -> CoreResult<FibTable<u16>> {
+        let mut builder = FibTableBuilder::<u16>::new(drop);
         for route in self.routes.iter() {
             if let RouteAction::Drop = route
                 .action()
@@ -368,7 +287,9 @@ pub fn init(reg: &RuntimeRegistry) -> HammerResult<()> {
     let config = reg.require::<Config>()?;
     let routes = Arc::<[_]>::from(config.network.route.as_slice());
     IP_MAIN.store(Some(Arc::new(IpMain::new(routes))));
-    crate::net::ip::publish_path_mtu_cache(crate::net::ip::PathMtuCache::new());
+    hammer_service::net::pmtu::publish_path_mtu_cache(
+        hammer_service::net::pmtu::PathMtuCache::new(),
+    );
     Ok(())
 }
 
@@ -408,7 +329,7 @@ pub fn wire_ip_lookup_drop(runtime: &DataPlaneRuntime) -> CoreResult<()> {
 
 #[hammer_component_macros::graph_node(
     graph = service,
-    init = crate::net::lookup::register_ip_lookup,
+    init = crate::lookup::register_ip_lookup,
     plugin = "ip",
 )]
 pub struct IpLookupNode {
@@ -431,7 +352,7 @@ impl IpLookupNode {
     }
 
     #[inline(always)]
-    fn process_index(runtime: &DataPlaneRuntime, table: &FibTable, index: Index) -> u16 {
+    fn process_index(runtime: &DataPlaneRuntime, table: &FibTable<u16>, index: Index) -> u16 {
         let parsed = Self::cached_packet_for_index(runtime, index);
         let traced = runtime
             .get_buffer(index)
@@ -467,7 +388,7 @@ impl IpLookupNode {
         };
         let result = table
             .lookup_packet(&parsed)
-            .unwrap_or_else(|| FibLookupResult::terminal(table.drop_dpo(parsed.version)));
+            .unwrap_or_else(|| FibLookupResult::<u16>::terminal(table.drop_dpo(parsed.version)));
         let mut buffer = runtime.get_buffer_mut(index).expect("buffer mut");
         let opaque = unsafe { transmute::<_, &mut LookupOpaque>(buffer.opaque2_mut()) };
         opaque.forwarding = Some(ForwardingMetadata {
@@ -822,7 +743,7 @@ fn ip_lookup_process(
 fn ip_lookup_process_frame(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
-    table: &FibTable,
+    table: &FibTable<u16>,
 ) -> NodeResult {
     let count = frame.len();
     if count == 0 {
@@ -899,7 +820,7 @@ fn adjacency_rewrite_process_frame(
 fn adjacency_mtu_divert(
     runtime: &DataPlaneRuntime,
     index: Index,
-    adjacency: &Adjacency,
+    adjacency: &Adjacency<u16>,
     icmp_error_next: Option<u16>,
     fragment_next: Option<u16>,
 ) -> Option<u16> {
@@ -946,7 +867,7 @@ fn adjacency_mtu_divert(
 fn apply_adjacency_rewrite(
     runtime: &DataPlaneRuntime,
     index: Index,
-    adjacency: Adjacency,
+    adjacency: Adjacency<u16>,
 ) -> CoreResult<()> {
     let rewrite = adjacency.rewrite.as_slice();
     let mut buffer = runtime.get_buffer_mut(index)?;

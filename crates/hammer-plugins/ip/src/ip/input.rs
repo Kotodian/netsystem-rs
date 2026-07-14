@@ -1,23 +1,25 @@
 use std::mem::transmute;
 use std::sync::{Mutex, OnceLock};
 
-use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId};
+use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_runtime::{
     DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
     TraceFormatter, add_packet_trace, unlikely,
 };
 
-use crate::data_plane::{FeatureArcSpec, FeatureArcStartHandle, set_buffer_node_error_code};
-use crate::net::ip::{
+use crate::ip::{
     IpInputError, IpInputTarget, IpProtocol, IpVersion, network_for_protocol, parse_ip_header,
 };
-use crate::net::{IpEcnCodepoint, NetworkOpaque};
-use crate::trace::codec::{
+use hammer_infra::vec::Vec;
+use hammer_service::data_plane::{
+    FeatureArcSpec, FeatureArcStartHandle, set_buffer_node_error_code,
+};
+use hammer_service::opaque::{IpEcnCodepoint, NetworkOpaque};
+use hammer_service::trace::codec::{
     TraceDecodeCursor, put_option_ip_input_error, put_option_ip_input_target,
     put_option_ip_protocol, put_option_ip_version, put_u16, put_usize,
 };
-use hammer_infra::vec::Vec;
 
 #[hammer_component_macros::feature_arc]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -6,12 +6,12 @@ use hammer_core::data_plane::{
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
+use hammer_plugin_tcp::{TcpResetNext, TcpResetNode};
 use hammer_runtime::{
     DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node, NodeProcessFn, NodeResult,
     NodeRuntimeData,
 };
-use hammer_service::net::NetworkOpaque;
-use hammer_plugin_tcp::{TcpResetNext, TcpResetNode};
+use hammer_service::opaque::NetworkOpaque;
 
 fn test_runtime_configured(
     buffer_slot_capacity: usize,

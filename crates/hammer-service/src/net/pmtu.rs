@@ -1,4 +1,4 @@
-//! Per-route Path MTU cache owned on the IP side (not TCP-private storage).
+//! Shared Path MTU state published by the IP plugin for transport consumers.
 //!
 //! VPP ownership (`vnet/ip/ip_path_mtu.{h,c}`):
 //! - Control-plane tracker `ip_pmtu_t` / `ip_path_mtu_update()` writes path MTU.

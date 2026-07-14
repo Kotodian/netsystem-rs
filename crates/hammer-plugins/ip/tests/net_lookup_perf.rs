@@ -7,15 +7,14 @@ use std::time::{Duration, Instant};
 
 use hammer_core::data_plane::{BufferFrame, DataPlaneBufferConfig, SecondaryOpaque};
 use hammer_core::error::CoreResult;
+use hammer_core::forwarding::{DpoProto, FibTableBuilder};
+use hammer_plugin_ip::{IpInputNext, IpInputNode, IpLookupControlPlane, IpUnicastArc};
 use hammer_runtime::{
     DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node,
     NodeProcessFn, NodeResult, NodeRuntimeData,
 };
 use hammer_service::data_plane::DropNode;
-use hammer_service::net::{
-    DpoProto, FibTableBuilder, ForwardingMetadata, IpInputNext, IpInputNode, IpLookupControlPlane,
-    IpUnicastArc, TapEthernetMetadata,
-};
+use hammer_service::opaque::{ForwardingMetadata, TapEthernetMetadata};
 use ipnet::{Ipv4Net, Ipv6Net};
 
 const FRAME_PACKETS: usize = 128;
@@ -138,7 +137,7 @@ enum Scenario {
 }
 
 #[test]
-#[ignore = "performance probe; run with `cargo test -p hammer-service --release --test net_lookup_perf -- --ignored --nocapture --test-threads=1`"]
+#[ignore = "performance probe; run with `cargo test -p hammer-plugin-ip --release --test net_lookup_perf -- --ignored --nocapture --test-threads=1`"]
 fn ip_lookup_frame_batch_perf_probe() {
     let _guard = PERF_PROBE_LOCK.lock().expect("perf probe lock");
     let scenarios = [
@@ -175,7 +174,7 @@ fn ip_lookup_frame_batch_perf_probe() {
 }
 
 #[test]
-#[ignore = "performance probe; run with `cargo test -p hammer-service --release --test net_lookup_perf -- --ignored --nocapture --test-threads=1`"]
+#[ignore = "performance probe; run with `cargo test -p hammer-plugin-ip --release --test net_lookup_perf -- --ignored --nocapture --test-threads=1`"]
 fn ip_input_lookup_frame_batch_perf_probe() {
     let _guard = PERF_PROBE_LOCK.lock().expect("perf probe lock");
     let scenarios = [
@@ -438,10 +437,10 @@ fn register_sink(
 }
 
 fn add_single_path(
-    builder: &mut FibTableBuilder,
+    builder: &mut FibTableBuilder<u16>,
     proto: DpoProto,
     next: u16,
-) -> hammer_service::net::LoadBalanceIndex {
+) -> hammer_core::forwarding::LoadBalanceIndex {
     builder.add_single_path_load_balance(proto, next)
 }
 

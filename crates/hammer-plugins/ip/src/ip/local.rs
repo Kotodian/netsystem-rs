@@ -16,11 +16,13 @@ use hammer_runtime::{
     TraceFormatter, add_packet_trace,
 };
 
-use crate::data_plane::{FeatureArcStartHandle, set_index_node_error_code};
-use crate::net::{DpoType, FibLookupResult, FibTableHandle, NetworkOpaque};
+use hammer_core::forwarding::{DpoType, FibLookupResult};
+use hammer_service::data_plane::{FeatureArcStartHandle, set_index_node_error_code};
+use hammer_service::net::fib::FibTableHandle;
+use hammer_service::opaque::NetworkOpaque;
 
 use super::{IpInputError, IpInputTarget, IpProtocol, IpVersion, ParsedIpPacket, ip_header};
-use crate::trace::codec::{
+use hammer_service::trace::codec::{
     TraceDecodeCursor, put_option_ip_protocol, put_option_ip_version, put_option_u16, put_u8,
     put_u16, put_usize,
 };
@@ -759,7 +761,7 @@ fn source_check_passes(state: &IpLocalState, parsed: &ParsedIpPacket) -> bool {
 }
 
 #[inline(always)]
-fn source_lookup_result_is_usable(result: FibLookupResult) -> bool {
+fn source_lookup_result_is_usable(result: FibLookupResult<u16>) -> bool {
     !matches!(
         result.dpo.kind(),
         DpoType::DROP | DpoType::PUNT | DpoType::RECEIVE

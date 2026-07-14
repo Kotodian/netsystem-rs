@@ -16,8 +16,8 @@ use hammer_runtime::{
     TraceFormatter, add_packet_trace,
 };
 
+use hammer_core::protocol::ip::{IpProtocol, IpVersion};
 use hammer_service::data_plane::set_index_node_error_code;
-use hammer_service::net::ip::{IpProtocol, IpVersion};
 use hammer_service::opaque::NetworkOpaque;
 use hammer_service::trace::codec::{
     TraceDecodeCursor, put_option_ip_protocol, put_option_ip_version, put_option_u16, put_u16,

@@ -9,4 +9,11 @@ name = "hammer_plugin_ip"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+arc-swap = { workspace = true }
 hammer-core = { path = "../../hammer-core" }
+hammer-infra = { path = "../../hammer-infra" }
+hammer-runtime = { path = "../../hammer-runtime", default-features = false }
+hammer-service = { path = "../../hammer-service", default-features = false }
+hammer-component-macros = { path = "../../hammer-component-macros" }
+linkme = { workspace = true }
+ipnet = { workspace = true }

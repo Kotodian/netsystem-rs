@@ -9,7 +9,7 @@ use hammer_core::protocol::tcp::{
     tcp_options_from_bytes,
 };
 use hammer_runtime::DataPlaneRuntime;
-use hammer_service::net::{IpEcnCodepoint, NetworkOpaque};
+use hammer_service::opaque::{IpEcnCodepoint, NetworkOpaque};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpSegment {

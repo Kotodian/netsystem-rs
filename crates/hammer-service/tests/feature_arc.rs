@@ -13,7 +13,7 @@ use hammer_service::data_plane::{
     Feature, FeatureArc, FeatureArcControl, FeatureArcSpec, FeatureArcStartHandle,
     FeatureArcStartNode, FeatureArcStartSlot, next_feature_frame,
 };
-use hammer_service::net::NetworkOpaque;
+use hammer_service::opaque::NetworkOpaque;
 use std::mem::transmute;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

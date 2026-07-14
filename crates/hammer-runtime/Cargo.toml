@@ -39,7 +39,8 @@ thread-priority = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 indoc = { workspace = true }
-# Ensures `libhammer_plugin_tun` is built for registration dlsym tests.
+# Ensures tested plugin cdylibs are built for registration dlsym tests.
+hammer-plugin-ip = { path = "../hammer-plugins/ip" }
 hammer-plugin-tun = { path = "../hammer-plugins/device/tun" }
 # `test-util` enables `tokio::time::pause()` / `advance()` so timeout-based
 # behaviour (TCP bridge drain idle, idle-keepalive backstop, etc.) can be

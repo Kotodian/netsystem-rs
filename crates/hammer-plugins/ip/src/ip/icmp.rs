@@ -17,9 +17,9 @@ use hammer_runtime::{
     TraceFormatter, add_packet_trace,
 };
 
-use crate::data_plane::set_index_node_error_code;
-use crate::opaque::NetworkOpaque;
-use crate::trace::codec::{
+use hammer_service::data_plane::set_index_node_error_code;
+use hammer_service::opaque::NetworkOpaque;
+use hammer_service::trace::codec::{
     TraceDecodeCursor, put_option_icmp_error_family, put_option_ip_version, put_option_u16,
     put_option_u32, put_option_usize, put_u8, put_u16,
 };
@@ -113,17 +113,17 @@ impl PacketTrace for IcmpInputTrace {
         put_option_ip_version(out, self.version);
         match self.icmp_type {
             Some(value) => {
-                crate::trace::codec::put_bool(out, true);
+                hammer_service::trace::codec::put_bool(out, true);
                 put_u8(out, value);
             }
-            None => crate::trace::codec::put_bool(out, false),
+            None => hammer_service::trace::codec::put_bool(out, false),
         }
         match self.code {
             Some(value) => {
-                crate::trace::codec::put_bool(out, true);
+                hammer_service::trace::codec::put_bool(out, true);
                 put_u8(out, value);
             }
-            None => crate::trace::codec::put_bool(out, false),
+            None => hammer_service::trace::codec::put_bool(out, false),
         }
         put_option_u16(out, self.error);
         put_u16(out, self.next);
@@ -186,7 +186,7 @@ impl PacketTrace for IcmpErrorTrace {
     fn encode_trace(&self, out: &mut Vec<u8>) {
         put_option_icmp_error_family(out, self.family);
         put_option_u32(out, self.ingress_interface);
-        crate::trace::codec::put_bool(out, self.local_source_present);
+        hammer_service::trace::codec::put_bool(out, self.local_source_present);
         put_option_usize(out, self.generated_len);
         put_option_u16(out, self.error);
         put_u16(out, self.next);
@@ -771,7 +771,7 @@ fn icmp_path_mtu_process_frame(runtime: &DataPlaneRuntime, frame: &mut BufferFra
 
 fn update_path_mtu_from_index(runtime: &DataPlaneRuntime, index: Index) -> CoreResult<()> {
     let packet = collect_current_chain_for_icmp_generation(runtime, index)?;
-    let _ = super::pmtu::process_ipv4_icmp_path_mtu_packet(packet.as_ref());
+    let _ = hammer_service::net::pmtu::process_ipv4_icmp_path_mtu_packet(packet.as_ref());
     Ok(())
 }
 

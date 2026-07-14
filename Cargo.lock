@@ -776,7 +776,14 @@ dependencies = [
 name = "hammer-plugin-ip"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
+ "hammer-component-macros",
  "hammer-core",
+ "hammer-infra",
+ "hammer-runtime",
+ "hammer-service",
+ "ipnet",
+ "linkme",
 ]
 
 [[package]]
@@ -790,6 +797,7 @@ dependencies = [
  "hammer-component-macros",
  "hammer-core",
  "hammer-infra",
+ "hammer-plugin-ip",
  "hammer-runtime",
  "hammer-service",
  "humantime-serde",
@@ -842,6 +850,7 @@ dependencies = [
  "hammer-component-macros",
  "hammer-core",
  "hammer-infra",
+ "hammer-plugin-ip",
  "hammer-plugin-tun",
  "indoc",
  "io-uring",

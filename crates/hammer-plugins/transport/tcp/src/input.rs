@@ -9,6 +9,7 @@ use hammer_core::data_plane::{
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
+use hammer_core::protocol::ip::{IpProtocol, IpVersion};
 use hammer_core::protocol::tcp::{TcpError, TcpInputFlags, TcpSegmentFlags, tcp_header};
 use hammer_infra::pool::Index as PoolIndex;
 use hammer_infra::vec::Vec;
@@ -18,7 +19,6 @@ use hammer_runtime::{
     TraceFormatter, add_packet_trace,
 };
 use hammer_service::data_plane::set_buffer_node_error_code;
-use hammer_service::net::ip::{IpProtocol, IpVersion};
 use hammer_service::trace::codec::{
     TraceDecodeCursor, put_option_ip_protocol, put_option_ip_version, put_option_u16, put_u16,
 };

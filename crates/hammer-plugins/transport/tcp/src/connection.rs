@@ -560,7 +560,7 @@ where
         if !self.pmtu_enabled {
             return false;
         }
-        let mss = hammer_service::net::ip::ipv4_path_mtu_to_mss(path_mtu);
+        let mss = hammer_service::net::pmtu::ipv4_path_mtu_to_mss(path_mtu);
         let current = self
             .negotiated_options
             .send_max_segment_size
@@ -598,7 +598,7 @@ where
         let IpAddr::V4(remote) = self.remote.ip() else {
             return false;
         };
-        let Some(cache) = hammer_service::net::ip::path_mtu_cache() else {
+        let Some(cache) = hammer_service::net::pmtu::path_mtu_cache() else {
             return false;
         };
         let Some(path_mtu) = cache.path_mtu(IpAddr::V4(remote)) else {

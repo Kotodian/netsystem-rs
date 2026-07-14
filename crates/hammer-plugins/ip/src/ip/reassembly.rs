@@ -16,15 +16,15 @@ use hammer_runtime::{
     TraceFormatter, add_packet_trace,
 };
 
-use crate::trace::codec::{
+use hammer_service::trace::codec::{
     TraceDecodeCursor, put_option_ip_fragment_key, put_option_u16, put_option_u32, put_u8, put_u32,
 };
 
-use crate::net::ip::{
+use crate::ip::{
     IpFragmentKey, IpProtocol, IpVersion, ParsedIpFragment, ip_header, network_for_protocol,
     parse_ip_fragment_with_chain_len,
 };
-use crate::opaque::NetworkOpaque;
+use hammer_service::opaque::NetworkOpaque;
 
 const IPV4_HEADER_MIN_LEN: usize = 20;
 const IPV6_HEADER_LEN: usize = 40;

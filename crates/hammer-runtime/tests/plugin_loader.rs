@@ -87,25 +87,27 @@ fn collect_plugin_inventory_merges_private_slices() {
 }
 
 #[test]
-fn open_tun_cdylib_and_read_registration_via_dlsym() {
+fn open_network_plugin_cdylibs_and_read_registration_via_dlsym() {
     use hammer_core::plugin::host_meets_plugin_requirement;
     use hammer_runtime::plugin_loader::{LoadTransaction, built_plugin_cdylib_path};
 
-    let path = built_plugin_cdylib_path("tun");
-    assert!(
-        path.is_file(),
-        "expected built plugin at {} (build hammer-plugin-tun first)",
-        path.display()
-    );
-
     let mut tx = LoadTransaction::new(env!("CARGO_PKG_VERSION"));
-    tx.open_library("tun", &path).expect("dlopen tun");
-    assert!(tx.has_library("tun"));
+    for name in ["tun", "ip"] {
+        let path = built_plugin_cdylib_path(name);
+        assert!(
+            path.is_file(),
+            "expected built plugin at {}",
+            path.display()
+        );
 
-    let registration = tx.registration("tun").expect("dlsym registration");
-    assert_eq!(registration.name, "tun");
-    assert_eq!(registration.load_after, &[] as &[&str]);
-    host_meets_plugin_requirement(env!("CARGO_PKG_VERSION"), registration.version_required)
-        .expect("semver");
-    assert_eq!(registration.version, env!("CARGO_PKG_VERSION"));
+        tx.open_library(name, &path).expect("dlopen plugin");
+        assert!(tx.has_library(name));
+
+        let registration = tx.registration(name).expect("dlsym registration");
+        assert_eq!(registration.name, name);
+        assert_eq!(registration.load_after, &[] as &[&str]);
+        host_meets_plugin_requirement(env!("CARGO_PKG_VERSION"), registration.version_required)
+            .expect("semver");
+        assert_eq!(registration.version, env!("CARGO_PKG_VERSION"));
+    }
 }

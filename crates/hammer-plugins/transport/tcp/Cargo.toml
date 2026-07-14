@@ -26,4 +26,5 @@ ipnet = { workspace = true }
 etherparse = { workspace = true }
 
 [dev-dependencies]
+hammer-plugin-ip = { path = "../../ip" }
 tokio = { workspace = true }

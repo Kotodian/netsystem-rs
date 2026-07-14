@@ -7,7 +7,7 @@ use arc_swap::ArcSwapOption;
 use hammer_core::config::Config;
 use hammer_core::data_plane::{BufferFrame, Index, NodeId, NodeRegistration};
 use hammer_core::error::{CoreError, CoreResult, HammerResult};
-use hammer_core::forwarding::AdjacencyRewrite;
+use hammer_core::forwarding::{AdjacencyRewrite, DpoId, DpoProto, FibTableBuilder};
 use hammer_core::registry::RuntimeRegistry;
 use hammer_infra::map::{FlatHashKey, FlatHashTable};
 use hammer_infra::vec::Vec;
@@ -19,7 +19,8 @@ use hammer_runtime::{
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 
 use crate::data_plane::set_index_node_error_code;
-use crate::net::{DpoId, DpoProto, FibTableBuilder, FibTableHandle, NetworkOpaque};
+use crate::net::fib::FibTableHandle;
+use crate::opaque::NetworkOpaque;
 use crate::trace::codec::{TraceDecodeCursor, put_option_u16, put_option_u32};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -395,7 +396,7 @@ impl InterfaceConnectedRouteControl {
     }
 
     fn publish_state(&self, state: &InterfaceState) -> CoreResult<()> {
-        let mut builder = FibTableBuilder::new(self.drop_next);
+        let mut builder = FibTableBuilder::<u16>::new(self.drop_next);
         for record in state.addresses.iter().filter(|record| !record.removed) {
             self.add_address_routes(&mut builder, record);
         }
@@ -403,12 +404,18 @@ impl InterfaceConnectedRouteControl {
         Ok(())
     }
 
-    fn add_address_routes(&self, builder: &mut FibTableBuilder, record: &InterfaceAddressRecord) {
+    fn add_address_routes(
+        &self,
+        builder: &mut FibTableBuilder<u16>,
+        record: &InterfaceAddressRecord,
+    ) {
         match record.address {
             IpNet::V4(address) => {
                 let receive = Ipv4Net::new(address.addr(), 32).expect("IPv4 host prefix");
-                builder
-                    .add_ip4_route_dpo(receive, DpoId::receive(DpoProto::IP4, self.receive_next));
+                builder.add_ip4_route_dpo(
+                    receive,
+                    DpoId::<u16>::receive(DpoProto::IP4, self.receive_next),
+                );
                 if address.prefix_len() < 32 {
                     let prefix =
                         Ipv4Net::new(address.network(), address.prefix_len()).expect("IPv4 prefix");
@@ -422,8 +429,10 @@ impl InterfaceConnectedRouteControl {
             }
             IpNet::V6(address) => {
                 let receive = Ipv6Net::new(address.addr(), 128).expect("IPv6 host prefix");
-                builder
-                    .add_ip6_route_dpo(receive, DpoId::receive(DpoProto::IP6, self.receive_next));
+                builder.add_ip6_route_dpo(
+                    receive,
+                    DpoId::<u16>::receive(DpoProto::IP6, self.receive_next),
+                );
                 if address.prefix_len() < 128 {
                     let prefix =
                         Ipv6Net::new(address.network(), address.prefix_len()).expect("IPv6 prefix");
@@ -440,7 +449,7 @@ impl InterfaceConnectedRouteControl {
 
     fn add_connected_route(
         &self,
-        builder: &mut FibTableBuilder,
+        builder: &mut FibTableBuilder<u16>,
         prefix: IpNet,
         proto: DpoProto,
         interface_index: u32,

@@ -4,6 +4,10 @@ use std::time::Duration;
 
 use hammer_core::config::Config;
 use hammer_core::data_plane::{BufferFrame, NodeRegistration};
+use hammer_core::forwarding::{DpoType, FibTableBuilder};
+use hammer_plugin_ip::{
+    AdjacencyRewriteNode, IpLocalControlPlane, IpLocalNext, IpLookupControlPlane,
+};
 use hammer_runtime::{
     DataPlaneRuntime, InternalNode, Node, NodeResult, TraceControlPlane, TraceInputPolicy,
     TracePolicy, new_worker_runtime, spawn::DataRuntime,
@@ -12,10 +16,7 @@ use hammer_service::interface::{
     InterfaceConnectedRouteControl, InterfaceControlPlane, InterfaceMtu, InterfaceMtuKind,
     InterfaceOutputControlPlane, InterfaceOutputTrace,
 };
-use hammer_service::net::{
-    AdjacencyRewriteNode, DpoType, FibTableBuilder, IpLocalControlPlane, IpLocalNext,
-    IpLookupControlPlane, NetworkOpaque,
-};
+use hammer_service::opaque::NetworkOpaque;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 
 #[derive(Clone, Copy)]
@@ -421,4 +422,48 @@ fn interface_output_tx_updates_run_through_configured_runtime_data_plane_barrier
 
     assert_eq!(output_handle.tx_slot(7), None);
     data_runtime.shutdown_timeout(Duration::from_secs(1));
+}
+
+fn push_packet_with_egress(
+    runtime: &DataPlaneRuntime,
+    frame: &mut BufferFrame,
+    egress_interface: Option<u32>,
+    payload: &[u8],
+) {
+    let packet = ipv4_packet([10, 0, 0, 1], [198, 51, 100, 7], payload);
+    let index = runtime
+        .alloc_index_with_bytes(&packet)
+        .expect("alloc packet");
+    if let Some(egress_interface) = egress_interface {
+        let mut buffer = runtime.get_buffer_mut(index).expect("buffer mut");
+        let opaque = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+        opaque.sw_if_index[1] = egress_interface;
+    }
+    frame.push_index(index).expect("push packet");
+}
+
+fn ipv4_packet(source: [u8; 4], destination: [u8; 4], payload: &[u8]) -> Vec<u8> {
+    let total_len = 20 + payload.len();
+    let mut packet = vec![0u8; total_len];
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    packet[8] = 64;
+    packet[9] = 59;
+    packet[12..16].copy_from_slice(&source);
+    packet[16..20].copy_from_slice(&destination);
+    let checksum = ipv4_checksum(&packet[..20]);
+    packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+    packet[20..].copy_from_slice(payload);
+    packet
+}
+
+fn ipv4_checksum(header: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    for chunk in header.chunks_exact(2) {
+        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
 }

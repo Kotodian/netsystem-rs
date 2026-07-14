@@ -25,6 +25,6 @@ pub fn reset_subsystem_mains_for_test() {
 /// Test helper for plugin crates that cannot see `#[cfg(test)]` items on this crate.
 pub fn reset_subsystem_mains_for_plugin_test() {
     crate::transport::reset_for_test();
-    crate::net::reset_ip_main_for_test();
+    crate::net::pmtu::reset_path_mtu_cache_for_test();
     crate::interface::reset_interface_main_for_test();
 }

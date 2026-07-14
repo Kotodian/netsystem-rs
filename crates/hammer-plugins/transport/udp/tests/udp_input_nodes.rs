@@ -5,13 +5,14 @@ use hammer_core::data_plane::{
     BufferFrame, BufferNodeError, BufferPacketCursor, DataPlaneBufferConfig,
 };
 use hammer_core::error::CoreResult;
+use hammer_core::protocol::ip::{IpProtocol, IpVersion};
 use hammer_infra::vec::Vec as InfraVec;
 use hammer_plugin_udp::{UdpInputControlPlane, UdpInputError, UdpInputNext, UdpInputTrace};
 use hammer_runtime::{
     DataPlaneRuntime, DataPlaneRuntimeConfig, GRAPH_NODES, InternalNode, Node, NodeProcessFn,
     NodeResult, NodeRuntimeData, TraceControlPlane, TraceInputPolicy, TracePolicy,
 };
-use hammer_service::net::{IpProtocol, IpVersion, NetworkOpaque};
+use hammer_service::opaque::NetworkOpaque;
 
 fn test_runtime_configured(
     buffer_slot_capacity: usize,

@@ -71,7 +71,7 @@ fn tcp_reset_next_for_index(runtime: &DataPlaneRuntime, index: Index) -> CoreRes
         tcp_reset_prepare_from_current(
             buffer.current(),
             unsafe {
-                std::mem::transmute::<_, &hammer_service::net::NetworkOpaque>(buffer.opaque())
+                std::mem::transmute::<_, &hammer_service::opaque::NetworkOpaque>(buffer.opaque())
             }
             .packet_cursor(),
         )
@@ -435,7 +435,7 @@ fn refresh_reset_metadata(
     };
     buffer.clear_node_error();
     unsafe {
-        std::mem::transmute::<_, &mut hammer_service::net::NetworkOpaque>(buffer.opaque_mut())
+        std::mem::transmute::<_, &mut hammer_service::opaque::NetworkOpaque>(buffer.opaque_mut())
     }
     .set_packet_cursor(
         BufferPacketCursor::new()
@@ -519,7 +519,7 @@ mod tests {
         for index in frame.pending_indices().iter().copied() {
             let buffer = runtime.get_buffer(index).expect("capture buffer");
             let cursor = unsafe {
-                std::mem::transmute::<_, &hammer_service::net::NetworkOpaque>(buffer.opaque())
+                std::mem::transmute::<_, &hammer_service::opaque::NetworkOpaque>(buffer.opaque())
             }
             .packet_cursor();
             state.packets.push(buffer.current().to_vec().into());
@@ -563,7 +563,7 @@ mod tests {
         {
             let mut buffer = runtime.get_buffer_mut(index).expect("buffer");
             unsafe {
-                std::mem::transmute::<_, &mut hammer_service::net::NetworkOpaque>(
+                std::mem::transmute::<_, &mut hammer_service::opaque::NetworkOpaque>(
                     buffer.opaque_mut(),
                 )
             }

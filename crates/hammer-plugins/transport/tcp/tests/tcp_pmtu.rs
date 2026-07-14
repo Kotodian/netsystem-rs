@@ -7,18 +7,18 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, DataPlaneBufferConfig, Index};
 use hammer_core::error::CoreResult;
+use hammer_core::protocol::ip::IpVersion;
 use hammer_infra::vec::Vec as InfraVec;
+use hammer_plugin_ip::{IcmpInputControlPlane, IcmpPathMtuNode};
 use hammer_runtime::{
     DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node, NodeProcessFn, NodeResult,
     NodeRuntimeData,
 };
-use hammer_service::net::ip::{
-    apply_ipv4_frag_needed_icmp, path_mtu_cache, process_ipv4_icmp_path_mtu_packet,
+use hammer_service::net::pmtu::{
+    PathMtuCache, apply_ipv4_frag_needed_icmp, path_mtu_cache, process_ipv4_icmp_path_mtu_packet,
     publish_path_mtu_cache, reset_path_mtu_cache_for_test,
 };
-use hammer_service::net::{
-    IcmpInputControlPlane, IcmpPathMtuNode, IpVersion, NetworkOpaque, PathMtuCache,
-};
+use hammer_service::opaque::NetworkOpaque;
 
 static PATH_MTU_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
 

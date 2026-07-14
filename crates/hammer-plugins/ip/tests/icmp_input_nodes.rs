@@ -5,15 +5,15 @@ use hammer_core::data_plane::{
     BufferFrame, BufferNodeError, BufferPacketCursor, DataPlaneBufferConfig,
 };
 use hammer_core::error::CoreResult;
+use hammer_core::protocol::ip::IpVersion;
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 use hammer_infra::vec::Vec as InfraVec;
+use hammer_plugin_ip::{IcmpInputControlPlane, IcmpInputError, IcmpInputTrace};
 use hammer_runtime::{
     DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node, NodeProcessFn, NodeResult,
     NodeRuntimeData, TraceControlPlane, TraceInputPolicy, TracePolicy,
 };
-use hammer_service::net::{
-    IcmpInputControlPlane, IcmpInputError, IcmpInputTrace, IpVersion, NetworkOpaque,
-};
+use hammer_service::opaque::NetworkOpaque;
 use std::mem::transmute;
 
 fn test_runtime_configured(

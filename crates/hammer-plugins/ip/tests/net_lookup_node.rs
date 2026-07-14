@@ -6,19 +6,20 @@ use hammer_core::config::Config;
 use hammer_core::data_plane::{BufferFrame, SecondaryOpaque};
 use hammer_core::error::CoreResult;
 use hammer_core::forwarding::AdjacencyRewrite;
+use hammer_core::forwarding::{Dpo, DpoId, DpoProto, DpoType, FibTableBuilder};
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
 use hammer_infra::vec::Vec as InfraVec;
+use hammer_plugin_ip::{
+    AdjacencyRewriteNode, AdjacencyRewriteTrace, IpInputNext, IpInputNode, IpLocalControlPlane,
+    IpLocalNext, IpLookupControlPlane, IpLookupTrace, IpUnicastArc,
+};
 use hammer_runtime::{
     DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
     TraceControlPlane, TraceInputPolicy, TracePolicy,
 };
 use hammer_runtime::{new_worker_runtime, spawn::DataRuntime};
 use hammer_service::data_plane::DropNode;
-use hammer_service::net::{
-    AdjacencyRewriteNode, AdjacencyRewriteTrace, Dpo, DpoId, DpoProto, DpoType, FibTableBuilder,
-    ForwardingMetadata, IpInputNext, IpInputNode, IpLocalControlPlane, IpLocalNext,
-    IpLookupControlPlane, IpLookupTrace, IpUnicastArc, NetworkOpaque, TapEthernetMetadata,
-};
+use hammer_service::opaque::{ForwardingMetadata, NetworkOpaque, TapEthernetMetadata};
 use ipnet::{Ipv4Net, Ipv6Net};
 use std::mem::transmute;
 
@@ -1233,10 +1234,10 @@ fn placeholder_lookup(
 }
 
 fn add_single_path(
-    builder: &mut FibTableBuilder,
+    builder: &mut FibTableBuilder<u16>,
     proto: DpoProto,
     next: u16,
-) -> hammer_service::net::LoadBalanceIndex {
+) -> hammer_core::forwarding::LoadBalanceIndex {
     builder.add_single_path_load_balance(proto, next)
 }
 
