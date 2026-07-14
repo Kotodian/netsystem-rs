@@ -154,6 +154,50 @@ fn hammer_vec_drop_returns_storage_to_same_heap() {
 }
 
 #[test]
+fn hammer_vec_into_iter_drop_returns_storage_to_same_heap() {
+    let region = SvmRegion::with_size(20 * 1024);
+    let heap = Arc::new(Heap::svm_data(region.clone()).expect("owner region heap"));
+    let capacity = 1536usize;
+    let layout = Layout::from_size_align(capacity * std::mem::size_of::<u64>(), 64).unwrap();
+
+    {
+        let mut values = HVec::with_capacity_in(capacity, heap.clone());
+        values.push(7_u64);
+        let mut values = values.into_iter();
+        assert_eq!(values.next(), Some(7));
+    }
+
+    let raw = heap
+        .alloc(layout)
+        .expect("IntoIter drop must return Vec storage to the same heap");
+    unsafe {
+        GlobalAlloc::dealloc(&*heap, raw.as_ptr(), layout);
+    }
+}
+
+#[test]
+fn hammer_vec_into_boxed_slice_drop_returns_storage_to_same_heap() {
+    let region = SvmRegion::with_size(20 * 1024);
+    let heap = Arc::new(Heap::svm_data(region.clone()).expect("owner region heap"));
+    let capacity = 1536usize;
+    let layout = Layout::from_size_align(capacity * std::mem::size_of::<u64>(), 64).unwrap();
+
+    {
+        let mut values = HVec::with_capacity_in(capacity, heap.clone());
+        values.push(7_u64);
+        let values = values.into_boxed_slice();
+        assert_eq!(&*values, &[7]);
+    }
+
+    let raw = heap
+        .alloc(layout)
+        .expect("Slice drop must return converted Vec storage to the same heap");
+    unsafe {
+        GlobalAlloc::dealloc(&*heap, raw.as_ptr(), layout);
+    }
+}
+
+#[test]
 fn hammer_slice_drop_returns_storage_to_same_heap() {
     let region = SvmRegion::with_size(20 * 1024);
     let heap = Arc::new(Heap::svm_data(region.clone()).expect("owner region heap"));

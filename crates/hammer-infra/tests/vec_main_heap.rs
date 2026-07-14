@@ -56,6 +56,7 @@ fn default_heap_lifecycles_avoid_the_process_global_allocator() {
     let main = Heap::main();
     let main_clone = main.clone();
 
+    let empty_values = Vec::<u64>::with_capacity(0);
     let mut values = Vec::new();
     for value in 0..256 {
         values.push(value);
@@ -65,7 +66,9 @@ fn default_heap_lifecycles_avoid_the_process_global_allocator() {
 
     let slice: Slice<u64> = Slice::from_elem(256, 7_u64);
     let slice_clone = slice.clone();
-    std::hint::black_box((&slice, &slice_clone));
+    let empty_slice: Slice<u64> = Slice::from_elem(0, 0);
+    let generated: Slice<u64> = Slice::from_fn(64, |index| index as u64);
+    std::hint::black_box((&slice, &slice_clone, &empty_slice, &generated));
 
     let boxed = clone.into_boxed_slice();
     std::hint::black_box(&boxed);
@@ -79,8 +82,11 @@ fn default_heap_lifecycles_avoid_the_process_global_allocator() {
     drop(explicit_main_values);
     drop(consumed);
     drop(boxed);
+    drop(generated);
+    drop(empty_slice);
     drop(slice_clone);
     drop(slice);
+    drop(empty_values);
     drop(main_clone);
     drop(main);
 
