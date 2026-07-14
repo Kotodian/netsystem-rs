@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::network::Network;
+use hammer_infra::vec::Vec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MetricKind {
@@ -279,7 +280,7 @@ fn counter_for_network(
     extra: &[(String, String)],
     network: &str,
 ) -> MetricCounter {
-    let mut labels: Vec<(String, String)> = extra.to_vec();
+    let mut labels: Vec<(String, String)> = Vec::from(extra.to_vec());
     labels.push(("network".to_owned(), network.to_owned()));
     scope.counter_with_labels(name, labels)
 }

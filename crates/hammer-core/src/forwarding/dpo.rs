@@ -1,6 +1,7 @@
 use crate::protocol::ip::IpVersion;
 
 use super::load_balance::LoadBalanceIndex;
+use hammer_infra::vec::Vec;
 
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

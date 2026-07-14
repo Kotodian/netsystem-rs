@@ -1,10 +1,13 @@
 //! Public Rust-shaped `Vec<T>` backed by Hammer's main mimalloc heap.
 
 use std::fmt;
+use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::ops::{Deref, DerefMut, RangeBounds};
 
 use allocator_api2::vec::{self as api_vec, Vec as ApiVec};
+use serde::de::{SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::align::CACHE_LINE;
 use crate::aligned_alloc::AlignTo;
@@ -418,6 +421,15 @@ impl<T> From<std::vec::Vec<T>> for Vec<T> {
     }
 }
 
+impl<T: Clone> From<&[T]> for Vec<T> {
+    #[inline]
+    fn from(values: &[T]) -> Self {
+        let mut out = Self::with_capacity(values.len());
+        out.extend_from_slice(values);
+        out
+    }
+}
+
 impl<T> From<Box<[T]>> for Vec<T> {
     #[inline]
     fn from(boxed: Box<[T]>) -> Self {
@@ -434,7 +446,14 @@ impl<T: PartialEq> PartialEq for Vec<T> {
     }
 }
 
-impl<T: Eq> Eq for Vec<T> {}
+impl<T: PartialEq> Eq for Vec<T> {}
+
+impl<T: std::hash::Hash> std::hash::Hash for Vec<T> {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_slice().hash(state);
+    }
+}
 
 impl<T: PartialEq> PartialEq<[T]> for Vec<T> {
     #[inline]
@@ -498,5 +517,58 @@ impl<'a, T> IntoIterator for &'a mut Vec<T> {
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
         self.as_mut_slice().iter_mut()
+    }
+}
+
+impl<T> Serialize for Vec<T>
+where
+    T: Serialize,
+{
+    #[inline]
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.as_slice().serialize(serializer)
+    }
+}
+
+impl<'de, T> Deserialize<'de> for Vec<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct VecVisitor<T> {
+            marker: PhantomData<T>,
+        }
+
+        impl<'de, T> Visitor<'de> for VecVisitor<T>
+        where
+            T: Deserialize<'de>,
+        {
+            type Value = Vec<T>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a sequence")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut values = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(value) = seq.next_element()? {
+                    values.push(value);
+                }
+                Ok(values)
+            }
+        }
+
+        deserializer.deserialize_seq(VecVisitor {
+            marker: PhantomData,
+        })
     }
 }

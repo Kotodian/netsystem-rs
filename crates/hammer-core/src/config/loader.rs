@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{HammerError, HammerResult};
 
 use super::Config;
+use hammer_infra::vec::Vec;
 
 /// Parse a single TOML string into a validated `Config`. The `include` key is
 /// ignored here — use `load_config` for multi-file loading.

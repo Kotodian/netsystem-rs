@@ -2,7 +2,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 
+use crate::ds::prefetch::prefetch_read_l1;
 use crate::protocol::ip::{IpProtocol, IpVersion, ParsedIpPacket};
+use hammer_infra::boxed::Box;
+use hammer_infra::vec::Vec;
 
 use super::dpo::{
     Adjacency, AdjacencyIndex, AdjacencyRewrite, DEFAULT_ADJACENCY_L3_MTU, DpoId, DpoProto,
@@ -10,7 +13,6 @@ use super::dpo::{
 use super::ip4_mtrie::{Ip4Mtrie, Ip4MtrieRoute, Ip4MtrieValue};
 use super::ip6_fib::Ip6Fib;
 use super::load_balance::{LoadBalance, LoadBalanceError, LoadBalanceIndex};
-use crate::ds::prefetch::prefetch_read_l1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FibEntry<N> {

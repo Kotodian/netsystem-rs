@@ -27,6 +27,7 @@ use std::net::IpAddr;
 use ipnet::IpNet;
 
 use crate::error::{HammerError, HammerResult};
+use hammer_infra::vec::Vec;
 
 /// A single FIB entry: a prefix and the DPO action for matching packets.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -203,7 +204,7 @@ mod tests {
         assert_eq!(
             route.action().unwrap(),
             RouteAction::LoadBalance {
-                via: vec![
+                via: hammer_infra::vec![
                     IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
                     IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3))
                 ],

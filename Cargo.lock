@@ -681,6 +681,7 @@ dependencies = [
  "clap",
  "hammer-component-macros",
  "hammer-core",
+ "hammer-infra",
  "hammer-ipc",
  "hammer-runtime",
  "hammer-service",
@@ -745,6 +746,7 @@ dependencies = [
  "crossbeam-utils",
  "libc",
  "mimalloc",
+ "serde",
  "spinning_top",
  "talc",
 ]
@@ -755,6 +757,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "hammer-core",
+ "hammer-infra",
  "hammer-runtime",
  "libc",
  "linkme",
@@ -819,6 +822,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "clap",
+ "hammer-infra",
  "hammer-ipc",
  "hex",
  "tokio",

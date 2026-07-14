@@ -30,6 +30,7 @@ use crate::error::{HammerError, HammerResult};
 
 use super::constants as C;
 use super::route::{Route, validate_routes};
+use hammer_infra::vec::Vec;
 
 // TCP defaults (transport/tcp/output.rs / connection.rs).
 const TCP_MSS: usize = 1_440;

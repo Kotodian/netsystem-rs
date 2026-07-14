@@ -367,7 +367,7 @@ pub(crate) fn reset_for_test() {
 
 pub fn init(reg: &RuntimeRegistry) -> HammerResult<()> {
     let config = reg.require::<Config>()?;
-    let routes = Arc::from(config.network.route.clone().into_boxed_slice());
+    let routes = Arc::<[_]>::from(config.network.route.as_slice());
     IP_MAIN.store(Some(Arc::new(IpMain::new(routes))));
     crate::net::ip::publish_path_mtu_cache(crate::net::ip::PathMtuCache::new());
     Ok(())

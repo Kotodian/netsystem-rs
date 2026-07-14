@@ -1,14 +1,15 @@
 use hammer_component_macros::ipc_handler;
 use hammer_runtime::engine::Engine;
+use hammer_infra::vec::Vec;
 
 #[ipc_handler(name = "ping")]
 fn handle_ping(_engine: &mut Engine, _request: &[u8]) -> Vec<u8> {
-    b"pong".to_vec()
+    Vec::from(b"pong".as_slice())
 }
 
 #[ipc_handler(name = "status")]
 fn handle_status(_engine: &mut Engine, _request: &[u8]) -> Vec<u8> {
-    b"ok".to_vec()
+    Vec::from(b"ok".as_slice())
 }
 
 #[ipc_handler(name = "pause")]

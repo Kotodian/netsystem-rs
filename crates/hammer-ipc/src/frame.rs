@@ -2,6 +2,7 @@
 //! Error types for the IPC layer.
 
 use std::io::{Read, Write};
+use hammer_infra::vec::Vec;
 
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024; // 16 MB
 const MAX_FRAME_SIZE_STR: &str = "16 MB";
@@ -34,7 +35,7 @@ pub fn read_frame<R: Read>(stream: &mut R) -> Result<Vec<u8>, IpcError> {
     if len > MAX_FRAME_SIZE {
         return Err(IpcError::FrameTooLarge(len));
     }
-    let mut payload = vec![0u8; len];
+    let mut payload = hammer_infra::vec![0u8; len];
     stream.read_exact(&mut payload)?;
     Ok(payload)
 }
@@ -58,7 +59,7 @@ pub async fn async_read_frame(
         return Err(IpcError::FrameTooLarge(len));
     }
     stream.read_exact(&mut buf[..len]).await?;
-    Ok(Some(buf[..len].to_vec()))
+    Ok(Some(Vec::from(&buf[..len])))
 }
 
 /// Write a length-prefixed frame to an async stream.

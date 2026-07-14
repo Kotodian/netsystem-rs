@@ -3,6 +3,7 @@
 use clap::{Parser, Subcommand};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use hammer_infra::vec::Vec;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -64,10 +65,10 @@ async fn main() {
             let bytes = if payload.is_empty() {
                 Vec::new()
             } else {
-                hex::decode(payload).unwrap_or_else(|e| {
+                Vec::from(hex::decode(payload).unwrap_or_else(|e| {
                     eprintln!("Invalid hex payload: {e}");
                     std::process::exit(1);
-                })
+                }))
             };
             (name.as_str(), bytes)
         }
@@ -90,7 +91,7 @@ async fn main() {
             std::process::exit(1);
         });
 
-    let mut buf = vec![0u8; 65536];
+    let mut buf = hammer_infra::vec![0u8; 65536];
     match hammer_ipc::frame::async_read_frame(&mut stream, &mut buf).await {
         Ok(Some(data)) => {
             if data.is_empty() {

@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 hammer-ipc = { path = "../hammer-ipc" }
+hammer-infra = { path = "../hammer-infra" }
 clap = { workspace = true, features = ["derive"] }
 bincode = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt"] }

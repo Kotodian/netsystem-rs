@@ -1,6 +1,7 @@
 //! `[trace]` config section: declarative packet trace policy. Single-layer schema.
 
 use crate::error::{HammerError, HammerResult};
+use hammer_infra::vec::Vec;
 
 pub const DEFAULT_TRACE_RECORD_CAPACITY: usize = 1024;
 pub const DEFAULT_TRACE_PACKET_CAPACITY: usize = 256;

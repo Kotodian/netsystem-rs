@@ -1,6 +1,7 @@
 //! IPC protocol message definitions.
 
 use serde::{Deserialize, Serialize};
+use hammer_infra::vec::Vec;
 
 /// Current protocol version sent on connect.
 pub const PROTOCOL_VERSION: u32 = 1;

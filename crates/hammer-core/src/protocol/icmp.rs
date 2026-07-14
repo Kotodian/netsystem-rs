@@ -5,6 +5,7 @@ use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 
 use super::ip::{IpProtocol, IpVersion, apply_ipv4_dont_fragment, parse_ip_header};
 use super::wire::read_header;
+use hammer_infra::vec::Vec;
 
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
@@ -185,7 +186,7 @@ pub fn build_echo_reply(packet: &[u8]) -> Result<IcmpGeneratedPacket, IcmpBuildE
             if internet_checksum(icmp) != 0 {
                 return Err(IcmpBuildError::BadChecksum);
             }
-            let mut reply = packet.to_vec();
+            let mut reply = Vec::from(packet);
             let icmp = &mut reply[icmp_offset..parsed.packet_len];
             icmp[0] = ICMP4_ECHO_REPLY;
             zero_checksum(icmp);
@@ -213,7 +214,7 @@ pub fn build_echo_reply(packet: &[u8]) -> Result<IcmpGeneratedPacket, IcmpBuildE
             if icmpv6_checksum(packet, icmp_offset, parsed.packet_len)? != 0 {
                 return Err(IcmpBuildError::BadChecksum);
             }
-            let mut reply = packet.to_vec();
+            let mut reply = Vec::from(packet);
             let icmp = &mut reply[icmp_offset..parsed.packet_len];
             icmp[0] = ICMP6_ECHO_REPLY;
             zero_checksum(icmp);
@@ -271,7 +272,7 @@ fn build_ipv4_icmp_error(
         .len()
         .min(IPV4_MIN_MTU - IPV4_HEADER_MIN_LEN - ICMP_ECHO_HEADER_LEN);
     let total_len = IPV4_HEADER_MIN_LEN + ICMP_ECHO_HEADER_LEN + quote_len;
-    let mut packet = vec![0u8; total_len];
+    let mut packet = hammer_infra::vec![0u8; total_len];
     packet[0] = 0x45;
     packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
     packet[IPV4_TTL_OFFSET] = LOCAL_ORIGINATED_TTL;
@@ -307,7 +308,7 @@ fn build_ipv6_icmp_error(
         .min(IPV6_MIN_MTU - IPV6_HEADER_LEN - ICMP_ECHO_HEADER_LEN);
     let payload_len = ICMP_ECHO_HEADER_LEN + quote_len;
     let total_len = IPV6_HEADER_LEN + payload_len;
-    let mut packet = vec![0u8; total_len];
+    let mut packet = hammer_infra::vec![0u8; total_len];
     packet[0] = 0x60;
     packet[4..6].copy_from_slice(&(payload_len as u16).to_be_bytes());
     packet[IPV6_NEXT_HEADER_OFFSET] = ICMP_PROTOCOL_V6;
@@ -418,6 +419,8 @@ fn icmpv6_checksum(
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    use hammer_infra::vec::Vec;
 
     use super::{IcmpBuildError, IcmpErrorMetadata, build_echo_reply, build_icmp_error_packet};
 
@@ -665,7 +668,7 @@ mod tests {
         payload_len: usize,
     ) -> Vec<u8> {
         let total_len = 20 + payload_len;
-        let mut packet = vec![0u8; total_len];
+        let mut packet = hammer_infra::vec![0u8; total_len];
         packet[0] = 0x45;
         packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
         packet[8] = 64;
@@ -681,7 +684,7 @@ mod tests {
         protocol: u8,
         payload: &[u8],
     ) -> Vec<u8> {
-        let mut packet = vec![0u8; 40 + payload.len()];
+        let mut packet = hammer_infra::vec![0u8; 40 + payload.len()];
         packet[0] = 0x60;
         packet[4..6].copy_from_slice(&(payload.len() as u16).to_be_bytes());
         packet[6] = protocol;

@@ -37,6 +37,7 @@ pub mod constants {
 }
 
 use crate::error::{HammerError, HammerResult};
+use hammer_infra::vec::Vec;
 
 /// The full TOML schema. Top-level `include` drives multi-file loading
 /// (see `loader`); it is consumed by `load_config` and absent from a

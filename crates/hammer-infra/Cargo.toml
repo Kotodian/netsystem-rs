@@ -12,5 +12,6 @@ allocator-api2 = { workspace = true }
 crossbeam-utils = { workspace = true }
 libc = { workspace = true }
 mimalloc = { workspace = true }
+serde = { workspace = true }
 spinning_top = { workspace = true }
 talc = { workspace = true }

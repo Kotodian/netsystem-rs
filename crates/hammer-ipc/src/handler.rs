@@ -2,6 +2,7 @@ use linkme::distributed_slice;
 use serde::{Deserialize, Serialize};
 
 use hammer_runtime::engine::Engine;
+use hammer_infra::vec::Vec;
 
 /// Handler function type: synchronous fn running on the reactor thread.
 pub type IpcHandlerFn = fn(&mut Engine, &[u8]) -> Vec<u8>;

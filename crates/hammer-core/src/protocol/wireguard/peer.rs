@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use hammer_infra::vec::Vec;
 
 #[cfg(feature = "amneziawg")]
 use boringtun::noise::AmneziaConfig;
@@ -303,7 +304,7 @@ impl PeerDataTunnel {
 
     fn queue_packet(&mut self, packet: &[u8]) {
         if self.packet_queue.len() < 256 {
-            self.packet_queue.push_back(packet.to_vec());
+            self.packet_queue.push_back(Vec::from(packet));
         }
     }
 
@@ -347,6 +348,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use boringtun::noise::{Packet, TunnControlResult, TunnResult};
+    use hammer_infra::vec::Vec;
 
     use super::*;
 
@@ -359,14 +361,14 @@ mod tests {
             public_key: peer_pub,
             pre_shared_key: None,
             endpoint,
-            allowed_ips: vec!["10.0.0.0/8".parse().unwrap()],
+            allowed_ips: hammer_infra::vec!["10.0.0.0/8".parse().unwrap()],
             persistent_keepalive: None,
             reserved: [0; 3],
         }
     }
 
     fn dummy_ipv4_packet(last_octet: u8) -> Vec<u8> {
-        let mut pkt = vec![0u8; 60];
+        let mut pkt = hammer_infra::vec![0u8; 60];
         pkt[0] = 0x45;
         pkt[2..4].copy_from_slice(&60u16.to_be_bytes());
         pkt[8] = 64;
@@ -383,13 +385,13 @@ mod tests {
         initiator_data: &mut PeerDataTunnel,
         responder_data: &mut PeerDataTunnel,
     ) {
-        let mut init_buf = vec![0u8; 2048];
+        let mut init_buf = hammer_infra::vec![0u8; 2048];
         let init = match initiator.start_handshake(&mut init_buf, true) {
             TunnResult::WriteToNetwork(out) => out.to_vec(),
             other => panic!("expected handshake init, got {:?}", other),
         };
 
-        let mut response_buf = vec![0u8; 2048];
+        let mut response_buf = hammer_infra::vec![0u8; 2048];
         let response = match responder.decapsulate_control(None, &init, &mut response_buf) {
             TunnControlResult::WriteToNetworkAndInstallSession { packet, session } => {
                 responder_data.install_session(PeerDataSessionUpdate {
@@ -401,7 +403,7 @@ mod tests {
             other => panic!("expected responder session, got {:?}", other),
         };
 
-        let mut final_buf = vec![0u8; 2048];
+        let mut final_buf = hammer_infra::vec![0u8; 2048];
         match initiator.decapsulate_control(None, &response, &mut final_buf) {
             TunnControlResult::InstallSession { session, .. } => {
                 initiator_data.install_session(PeerDataSessionUpdate {
@@ -434,12 +436,12 @@ mod tests {
 
         let old_packet_1 = dummy_ipv4_packet(5);
         let old_packet_2 = dummy_ipv4_packet(6);
-        let mut old_buf_1 = vec![0u8; 2048];
+        let mut old_buf_1 = hammer_infra::vec![0u8; 2048];
         let old_encrypted_1 = match a_data.encapsulate(&old_packet_1, &mut old_buf_1) {
             PeerDataResult::WriteToNetwork(out) => out.to_vec(),
             other => panic!("old packet 1 should encrypt, got {:?}", other),
         };
-        let mut old_buf_2 = vec![0u8; 2048];
+        let mut old_buf_2 = hammer_infra::vec![0u8; 2048];
         let old_encrypted_2 = match a_data.encapsulate(&old_packet_2, &mut old_buf_2) {
             PeerDataResult::WriteToNetwork(out) => out.to_vec(),
             other => panic!("old packet 2 should encrypt, got {:?}", other),
@@ -455,7 +457,7 @@ mod tests {
         handshake(&mut a_control, &mut b_control, 2, &mut a_data, &mut b_data);
 
         let new_packet = dummy_ipv4_packet(7);
-        let mut new_buf = vec![0u8; 2048];
+        let mut new_buf = hammer_infra::vec![0u8; 2048];
         let new_encrypted = match a_data.encapsulate(&new_packet, &mut new_buf) {
             PeerDataResult::WriteToNetwork(out) => out.to_vec(),
             other => panic!("new packet should encrypt, got {:?}", other),
@@ -471,20 +473,20 @@ mod tests {
             "rekey must switch tx to the newly installed session"
         );
 
-        let mut old_plain = vec![0u8; 2048];
+        let mut old_plain = hammer_infra::vec![0u8; 2048];
         match b_data.decapsulate(&old_encrypted_1, &mut old_plain) {
             PeerDataResult::WriteToTunnelV4(out, _) => assert_eq!(out, old_packet_1),
             other => panic!("old rx session should still decrypt, got {:?}", other),
         }
 
-        let mut new_plain = vec![0u8; 2048];
+        let mut new_plain = hammer_infra::vec![0u8; 2048];
         match b_data.decapsulate(&new_encrypted, &mut new_plain) {
             PeerDataResult::WriteToTunnelV4(out, _) => assert_eq!(out, new_packet),
             other => panic!("new rx session should decrypt, got {:?}", other),
         }
 
         b_data.expire_session(old_receiver_index, 1);
-        let mut expired_plain = vec![0u8; 2048];
+        let mut expired_plain = hammer_infra::vec![0u8; 2048];
         match b_data.decapsulate(&old_encrypted_2, &mut expired_plain) {
             PeerDataResult::Err(_) => {}
             other => panic!(

@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 hammer-core = { path = "../hammer-core" }
+hammer-infra = { path = "../hammer-infra" }
 hammer-runtime = { path = "../hammer-runtime" }
 serde = { workspace = true, features = ["derive"] }
 bincode = { workspace = true }
