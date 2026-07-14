@@ -5,7 +5,6 @@ use std::io::Write;
 use std::os::fd::FromRawFd;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::sync::Arc;
 
 use hammer_infra::pool::Index;
 use hammer_runtime::{DataWorkerId, File, FileFunctions, FileMain};
@@ -29,7 +28,7 @@ impl RegisteredSocket {
         let raw_fd = fd.as_raw_fd();
         let index = files
             .add(File::new(
-                Arc::new(fd),
+                fd,
                 worker,
                 description.to_owned(),
                 private_data,
@@ -170,7 +169,7 @@ fn linux_eventfd_readiness_dispatches_through_file_main() {
     let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
     let index = files
         .add(File::new(
-            Arc::new(fd),
+            fd,
             worker,
             "linux eventfd".to_owned(),
             0,

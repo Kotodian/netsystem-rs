@@ -1,6 +1,5 @@
 use std::cell::RefCell;
 use std::mem::transmute;
-use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
 use hammer_core::config::Config;
@@ -8,7 +7,7 @@ use hammer_core::config::network::Interface;
 use hammer_core::data_plane::{
     BufferFrame, BufferRef, DEFAULT_BUFFER_FRAME_CAPACITY, NodeId, NodeState,
 };
-use hammer_core::error::{CoreError, CoreResult, HammerError, HammerResult};
+use hammer_core::error::{CoreError, HammerError, HammerResult};
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, File, FileFunctions, Node, NodeProcessFn, NodeResult,
     NodeRuntimeData, PacketTrace, TraceFormatter, add_packet_trace,
@@ -54,7 +53,8 @@ struct TunControl {
 
 struct TunControlDevice {
     interface_index: u32,
-    fd: Arc<OwnedFd>,
+    requested_name: String,
+    mtu: u32,
 }
 
 struct TunWorkerRuntime {
@@ -65,7 +65,7 @@ struct TunWorkerRuntime {
 
 struct TunWorkerDevice {
     interface_index: u32,
-    fd: Arc<OwnedFd>,
+    file_index: hammer_infra::pool::Index,
 }
 
 impl TunControl {
@@ -96,13 +96,6 @@ impl TunControl {
         let device_instance = u32::try_from(devices.len())
             .map_err(|_| HammerError::internal("TUN device instance overflow"))?;
         let owner = DataWorkerId::new(device_instance % worker_count);
-        let (fd, kernel_name) = platform::open(&interface.name, interface.mtu.l3)?;
-        tracing::info!(
-            logical_name = %interface.name,
-            %kernel_name,
-            owner = owner.slot(),
-            "opened TUN file"
-        );
         self.device_main.register_rx_queue(
             device_instance,
             0,
@@ -113,12 +106,18 @@ impl TunControl {
             .register_tx_queue(device_instance, 0, owner)?;
         devices.push(Some(TunControlDevice {
             interface_index,
-            fd: Arc::new(fd),
+            requested_name: interface.name.clone(),
+            mtu: interface.mtu.l3,
         }));
         Ok(())
     }
 
-    fn take_worker_runtime(&self, worker: DataWorkerId) -> CoreResult<TunWorkerRuntime> {
+    fn take_worker_runtime(
+        &self,
+        engine: &mut hammer_runtime::Engine,
+        worker: DataWorkerId,
+        tun_input: NodeId,
+    ) -> HammerResult<TunWorkerRuntime> {
         let rx_poll_vector = self.device_main.rx_poll_vector(worker);
 
         let mut control_devices = self
@@ -131,9 +130,26 @@ impl TunControl {
                 .get_mut(queue.device_instance as usize)
                 .and_then(Option::take)
                 .ok_or_else(|| CoreError::internal("TUN RX queue already has an owner"))?;
+            let (fd, kernel_name) = platform::open(&device.requested_name, device.mtu)?;
+            tracing::info!(
+                logical_name = %device.requested_name,
+                %kernel_name,
+                owner = worker.slot(),
+                "opened TUN file"
+            );
+            let file_index = engine.file_main_mut()?.add(File::new(
+                fd,
+                worker,
+                format!("TUN interface {}", device.interface_index),
+                u64::from(tun_input.slot()),
+                FileFunctions {
+                    read: Some(schedule_tun_input),
+                    ..FileFunctions::default()
+                },
+            ))?;
             devices.push(TunWorkerDevice {
                 interface_index: device.interface_index,
-                fd: device.fd,
+                file_index,
             });
         }
         Ok(TunWorkerRuntime {
@@ -178,23 +194,11 @@ fn configure_tun_worker(
     control: Arc<TunControl>,
 ) -> HammerResult<()> {
     let worker = engine.data_worker_id()?;
-    let runtime = control.take_worker_runtime(worker)?;
     let tun_input = engine
         .runtime
         .node_by_name(TunInputDriverNode::NODE_NAME)
         .ok_or_else(|| CoreError::internal("tun-input is not registered"))?;
-    for device in &runtime.devices {
-        engine.file_main_mut()?.add(File::new(
-            Arc::clone(&device.fd),
-            worker,
-            format!("TUN interface {}", device.interface_index),
-            u64::from(tun_input.slot()),
-            FileFunctions {
-                read: Some(schedule_tun_input),
-                ..FileFunctions::default()
-            },
-        ))?;
-    }
+    let runtime = control.take_worker_runtime(engine, worker, tun_input)?;
     engine.runtime.nodes().set_node_state(
         tun_input,
         if runtime.has_rx_queues() {
@@ -340,6 +344,16 @@ impl TunWorkerRuntime {
         for (queue, device) in self.rx_poll_vector.iter().zip(&mut self.devices) {
             debug_assert_eq!(queue.owner, self.worker);
             debug_assert_eq!(queue.queue_id, 0);
+            let Some(fd) = hammer_runtime::Engine::with_current(|engine| {
+                engine
+                    .file_main()
+                    .ok()
+                    .and_then(|files| files.get(device.file_index))
+                    .map(File::fd)
+            })
+            .flatten() else {
+                return;
+            };
             while frame.remaining_capacity() > 0 {
                 let Ok(index) = runtime.alloc_index() else {
                     return;
@@ -355,7 +369,7 @@ impl TunWorkerRuntime {
                         return;
                     };
                     let writable = buffer.writable_tail_mut();
-                    match platform::try_recv(device.fd.as_raw_fd(), writable) {
+                    match platform::try_recv(fd, writable) {
                         Ok(Some(length)) => {
                             if buffer.commit_writable_tail(length).is_err() {
                                 return;
@@ -428,7 +442,17 @@ impl TunWorkerRuntime {
         for buffer in &buffers {
             segments.push(buffer.current());
         }
-        let _ = platform::try_send(device.fd.as_raw_fd(), version, &segments);
+        let Some(fd) = hammer_runtime::Engine::with_current(|engine| {
+            engine
+                .file_main()
+                .ok()
+                .and_then(|files| files.get(device.file_index))
+                .map(File::fd)
+        })
+        .flatten() else {
+            return;
+        };
+        let _ = platform::try_send(fd, version, &segments);
     }
 }
 

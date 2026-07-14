@@ -6,7 +6,6 @@
 
 use std::fmt;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::sync::Arc;
 
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_infra::pool::{Index, Pool};
@@ -33,9 +32,9 @@ pub struct FileFunctions {
     pub error: Option<FileFunction>,
 }
 
-/// Readiness metadata and callback state for one safely shared descriptor.
+/// Readiness metadata, callback state, and ownership for one descriptor.
 pub struct File {
-    fd: Arc<OwnedFd>,
+    fd: OwnedFd,
     polling_worker: DataWorkerId,
     description: String,
     private_data: u64,
@@ -53,7 +52,7 @@ impl File {
     /// Write interest is enabled later through
     /// [`FileMain::set_data_available_to_write`].
     pub fn new(
-        fd: Arc<OwnedFd>,
+        fd: OwnedFd,
         polling_worker: DataWorkerId,
         description: String,
         private_data: u64,

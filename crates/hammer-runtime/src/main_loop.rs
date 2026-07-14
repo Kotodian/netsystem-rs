@@ -118,7 +118,6 @@ mod tests {
     use std::io::Write;
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
-    use std::sync::Arc;
 
     use crate::engine::Engine;
     use crate::spawn::DataRemoteLocalQueue;
@@ -179,7 +178,7 @@ mod tests {
             .file_main_mut()
             .expect("worker FileMain")
             .add(File::new(
-                Arc::new(OwnedFd::from(registered)),
+                OwnedFd::from(registered),
                 worker,
                 "main-loop readiness".to_owned(),
                 0,
