@@ -41,13 +41,21 @@ use crate::error::{HammerError, HammerResult};
 /// The full TOML schema. Top-level `include` drives multi-file loading
 /// (see `loader`); it is consumed by `load_config` and absent from a
 /// single-file `parse_config` result.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
     /// Files/directories to merge in before this config's own sections apply.
     /// Only meaningful when loading from a path via `load_config`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    plugins: Vec<String>,
+    #[serde(
+        default,
+        rename = "plugin",
+        skip_serializing_if = "toml::Table::is_empty"
+    )]
+    plugin_sections: toml::Table,
     pub log: Log,
     pub trace: Trace,
     pub network: Network,
@@ -55,6 +63,30 @@ pub struct Config {
 }
 
 impl Config {
+    #[inline]
+    pub fn requested_plugins(&self) -> &[String] {
+        &self.plugins
+    }
+
+    pub fn plugin_config<T>(&self, name: &str) -> HammerResult<T>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        if !self.plugins.iter().any(|plugin| plugin == name) {
+            return Err(HammerError::config_validation(format!(
+                "plugin `{name}` is not requested"
+            )));
+        }
+        let value = self
+            .plugin_sections
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| toml::Value::Table(toml::Table::new()));
+        value
+            .try_into()
+            .map_err(|error| HammerError::config_parse(format!("parse plugin.{name}: {error}")))
+    }
+
     /// Validate every section's invariants. Called by `parse_config` and
     /// `load_config` after assembly.
     pub fn validate(&self) -> HammerResult<()> {

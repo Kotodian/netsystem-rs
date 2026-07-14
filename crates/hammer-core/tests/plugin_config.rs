@@ -12,14 +12,14 @@ fn loaded_plugin_decodes_its_owned_config_section() {
         r#"
 plugins = ["tun"]
 
-[tun]
+[plugin.tun]
 interface = ["utun"]
 "#,
     )
     .expect("parse startup config");
 
     let tun = config
-        .plugin::<TunConfig>("tun")
+        .plugin_config::<TunConfig>("tun")
         .expect("decode loaded TUN plugin config");
 
     assert_eq!(
