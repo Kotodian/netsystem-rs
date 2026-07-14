@@ -20,6 +20,36 @@ pub fn plugin_cdylib_path(dir: &Path, plugin_name: &str) -> PathBuf {
     dir.join(plugin_cdylib_filename(plugin_name))
 }
 
+/// Open a startup plugin without permitting its image to be unmapped.
+///
+/// Rust DSOs contain allocator TLS, registration statics, and Drop glue whose
+/// process-wide teardown order cannot be proven safe at `PluginMain` drop.
+/// `RTLD_NODELETE` still lets the handle follow normal RAII while retaining the
+/// image until process exit. Runtime plugin unload requires a separate, proven
+/// drain and teardown protocol.
+pub(crate) fn open_plugin_library(path: &Path) -> Result<Library, libloading::Error> {
+    #[cfg(unix)]
+    {
+        use libloading::os::unix::{Library as UnixLibrary, RTLD_LOCAL, RTLD_NOW};
+
+        // SAFETY: loading executes plugin initializers. The caller validates
+        // the exported registration before using it, retains the returned
+        // handle for every imported pointer, and RTLD_NODELETE prevents unsafe
+        // termination routines from running during ordinary handle teardown.
+        let library =
+            unsafe { UnixLibrary::open(Some(path), RTLD_NOW | RTLD_LOCAL | libc::RTLD_NODELETE) }?;
+        Ok(Library::from(library))
+    }
+
+    #[cfg(not(unix))]
+    {
+        // SAFETY: non-Unix targets do not currently provide Hammer plugins.
+        // This fallback preserves compilation until that platform defines an
+        // equivalent process-lifetime image policy.
+        unsafe { Library::new(path) }
+    }
+}
+
 /// Resolve the daemon plugin directory.
 ///
 /// VPP has `plugin_path`; Hammer accepts `HAMMER_PLUGIN_DIR` and otherwise
