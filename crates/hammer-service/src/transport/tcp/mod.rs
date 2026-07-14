@@ -25,6 +25,8 @@ use crate::session::{
 };
 use crate::transport::congestion::CongestionController;
 use hammer_infra::pool::Index as PoolIndex;
+#[cfg(test)]
+use hammer_infra::vec::Vec;
 use hammer_runtime::app::SessionSegment;
 
 pub mod congestion;
@@ -1033,7 +1035,7 @@ mod legacy_tests {
 
     #[derive(Default)]
     struct CaptureState {
-        packets: std::vec::Vec<std::vec::Vec<u8>>,
+        packets: Vec<Vec<u8>>,
     }
 
     struct CaptureNode {
@@ -1074,9 +1076,9 @@ mod legacy_tests {
         }
     }
 
-    fn capture_states() -> &'static Mutex<std::vec::Vec<Arc<Mutex<CaptureState>>>> {
-        static STATES: OnceLock<Mutex<std::vec::Vec<Arc<Mutex<CaptureState>>>>> = OnceLock::new();
-        STATES.get_or_init(|| Mutex::new(std::vec::Vec::new()))
+    fn capture_states() -> &'static Mutex<Vec<Arc<Mutex<CaptureState>>>> {
+        static STATES: OnceLock<Mutex<Vec<Arc<Mutex<CaptureState>>>>> = OnceLock::new();
+        STATES.get_or_init(|| Mutex::new(Vec::new()))
     }
 
     fn capture_process(
@@ -1101,7 +1103,7 @@ mod legacy_tests {
                 Ok(buf) => buf.current().to_vec(),
                 Err(_) => return NodeResult::drop(),
             };
-            state.packets.push(packet);
+            state.packets.push(packet.into());
         }
         NodeResult::drop()
     }
@@ -1389,7 +1391,7 @@ mod legacy_tests {
             .session(session_id)
             .expect("connection")
             .send_goal_size();
-        let payload = vec![0x5a; send_goal_size * 2];
+        let payload = hammer_infra::vec![0x5a; send_goal_size * 2];
         let fifo_capacity = (payload.len() * 2).next_power_of_two().max(256);
         let app_session = Arc::new(
             hammer_runtime::app::AppSession::new_in_segment(
@@ -1544,7 +1546,7 @@ mod legacy_tests {
             advertised_window: u16::MAX,
             flags: TcpSegmentFlags::ACK | TcpSegmentFlags::PSH,
             capabilities: TcpCapabilities::default(),
-            sack_blocks: hammer_infra::vec::Vec::new(),
+            sack_blocks: Vec::new(),
             timestamp: None,
             fast_open_cookie: None,
             ip_ecn: None,
@@ -1642,7 +1644,7 @@ mod legacy_tests {
             advertised_window: u16::MAX,
             flags: TcpSegmentFlags::FIN | TcpSegmentFlags::ACK,
             capabilities: TcpCapabilities::default(),
-            sack_blocks: hammer_infra::vec::Vec::new(),
+            sack_blocks: Vec::new(),
             timestamp: None,
             fast_open_cookie: None,
             ip_ecn: None,
@@ -1666,7 +1668,7 @@ mod legacy_tests {
             advertised_window: u16::MAX,
             flags: TcpSegmentFlags::FIN | TcpSegmentFlags::ACK,
             capabilities: TcpCapabilities::default(),
-            sack_blocks: hammer_infra::vec::Vec::new(),
+            sack_blocks: Vec::new(),
             timestamp: None,
             fast_open_cookie: None,
             ip_ecn: None,

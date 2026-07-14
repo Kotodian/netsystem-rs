@@ -878,7 +878,7 @@ impl InterfaceOutputTrace {
 
 impl PacketTrace for InterfaceOutputTrace {
     #[inline]
-    fn encode_trace(&self, out: &mut hammer_infra::vec::Vec<u8>) {
+    fn encode_trace(&self, out: &mut Vec<u8>) {
         put_option_u32(out, self.egress_interface);
         put_option_u16(out, self.tx_next);
         put_option_u16(out, self.error);
@@ -1089,7 +1089,7 @@ mtu = { l3 = 1500, ip4 = 1500, ip6 = 1500, mpls = 1500 }
         );
         assert_eq!(
             handle.interface_addresses(index),
-            vec![IpNet::from_str("10.0.0.1/30").expect("cidr")]
+            hammer_infra::vec![IpNet::from_str("10.0.0.1/30").expect("cidr")]
         );
     }
 }

@@ -7,11 +7,11 @@ use std::thread::JoinHandle;
 use hammer_core::config::Worker;
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::registry::RuntimeRegistry;
-use hammer_infra::vec::Vec;
 
 use crate::engine::Engine;
 use crate::spawn;
 use crate::{DataPlaneHandoff, DataWorkerId, barrier};
+use hammer_infra::vec::Vec;
 
 #[hammer_component_macros::main_loop_enter_function]
 pub fn start_workers(engine: &mut Engine) -> HammerResult<()> {

@@ -4,6 +4,8 @@ use hammer_core::data_plane::{
     BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Frame, Index, Next, NodeId, NodeNext,
 };
 use hammer_infra::mask_compare::{mask_compare_u16, mask_compare_u16_words};
+#[cfg(test)]
+use hammer_infra::vec::Vec;
 
 use crate::DataPlaneRuntime;
 

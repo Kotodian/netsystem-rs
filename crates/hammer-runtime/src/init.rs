@@ -4,6 +4,7 @@ use petgraph::graphmap::DiGraphMap;
 use hammer_core::error::{CoreError, HammerResult};
 
 use crate::engine::Engine;
+use hammer_infra::vec::Vec;
 
 #[derive(Debug, thiserror::Error)]
 pub enum InitError {
@@ -184,7 +185,7 @@ mod tests {
         let fns = mock(&[("a", &[], &["b"]), ("b", &["a"], &[])]);
         let order = topological_order(&fns).expect("topo");
         let names: Vec<&str> = order.iter().map(|i| fns[*i].name).collect();
-        assert_eq!(names, vec!["a", "b"]);
+        assert_eq!(names, hammer_infra::vec!["a", "b"]);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use hammer_core::Network;
+use hammer_infra::vec::Vec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ComponentMetricsMeta {

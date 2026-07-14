@@ -10,6 +10,8 @@ use super::{TcpOutputError, read_tcp_egress_endpoints};
 use crate::net::NetworkOpaque;
 use std::mem::transmute;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+#[cfg(test)]
+use hammer_infra::vec::Vec;
 pub const DEFAULT_TCP_OUTPUT_PAYLOAD_LEN: usize = 1_440;
 pub const TCP_FLAG_FIN: u8 = 0x01;
 pub const TCP_FLAG_SYN: u8 = 0x02;
@@ -289,7 +291,7 @@ mod tests {
 
     #[derive(Default)]
     struct CaptureState {
-        packets: std::vec::Vec<std::vec::Vec<u8>>,
+        packets: Vec<Vec<u8>>,
     }
 
     struct CaptureNode {
@@ -323,9 +325,9 @@ mod tests {
 
     impl InternalNode for CaptureNode {}
 
-    fn capture_states() -> &'static Mutex<std::vec::Vec<Arc<Mutex<CaptureState>>>> {
-        static STATES: OnceLock<Mutex<std::vec::Vec<Arc<Mutex<CaptureState>>>>> = OnceLock::new();
-        STATES.get_or_init(|| Mutex::new(std::vec::Vec::new()))
+    fn capture_states() -> &'static Mutex<Vec<Arc<Mutex<CaptureState>>>> {
+        static STATES: OnceLock<Mutex<Vec<Arc<Mutex<CaptureState>>>>> = OnceLock::new();
+        STATES.get_or_init(|| Mutex::new(Vec::new()))
     }
 
     fn capture_process(
@@ -350,7 +352,7 @@ mod tests {
                 Err(_) => return NodeResult::drop(),
             };
             match state.lock() {
-                Ok(mut guard) => guard.packets.push(packet),
+                Ok(mut guard) => guard.packets.push(packet.into()),
                 Err(_) => return NodeResult::drop(),
             }
         }

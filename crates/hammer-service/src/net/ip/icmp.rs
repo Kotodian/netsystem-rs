@@ -25,6 +25,7 @@ use crate::trace::codec::{
 };
 
 use super::{IpInputError, IpProtocol, IpVersion, ip_header};
+use hammer_infra::vec::Vec;
 
 const ICMP_HEADER_MIN_LEN: usize = 4;
 const ICMP_ECHO_HEADER_LEN: usize = 8;
@@ -108,7 +109,7 @@ impl IcmpInputTrace {
 }
 
 impl PacketTrace for IcmpInputTrace {
-    fn encode_trace(&self, out: &mut hammer_infra::vec::Vec<u8>) {
+    fn encode_trace(&self, out: &mut Vec<u8>) {
         put_option_ip_version(out, self.version);
         match self.icmp_type {
             Some(value) => {
@@ -149,7 +150,7 @@ impl IcmpEchoRequestTrace {
 }
 
 impl PacketTrace for IcmpEchoRequestTrace {
-    fn encode_trace(&self, out: &mut hammer_infra::vec::Vec<u8>) {
+    fn encode_trace(&self, out: &mut Vec<u8>) {
         put_option_usize(out, self.generated_len);
         put_option_u16(out, self.error);
         put_u16(out, self.next);
@@ -182,7 +183,7 @@ impl IcmpErrorTrace {
 }
 
 impl PacketTrace for IcmpErrorTrace {
-    fn encode_trace(&self, out: &mut hammer_infra::vec::Vec<u8>) {
+    fn encode_trace(&self, out: &mut Vec<u8>) {
         put_option_icmp_error_family(out, self.family);
         put_option_u32(out, self.ingress_interface);
         crate::trace::codec::put_bool(out, self.local_source_present);
@@ -296,14 +297,14 @@ impl IcmpErrorSourceTableHandle {
 
 #[derive(Debug, Clone)]
 struct IcmpErrorSourceSnapshot {
-    sources: hammer_infra::vec::Vec<IcmpErrorSourceEntry>,
+    sources: Vec<IcmpErrorSourceEntry>,
 }
 
 impl IcmpErrorSourceSnapshot {
     #[inline]
     fn new() -> Self {
         Self {
-            sources: hammer_infra::vec::Vec::new(),
+            sources: Vec::new(),
         }
     }
 
@@ -895,7 +896,7 @@ fn icmp_input_process_frame(
     snapshot: &IcmpInputSnapshot,
 ) -> NodeResult {
     let drop_slot = snapshot.default_next(IpVersion::V4);
-    let mut nexts = hammer_infra::vec::Vec::with_capacity(frame.len());
+    let mut nexts = Vec::with_capacity(frame.len());
     for index in frame.iter_indices() {
         let slot = match next_slot_for_index(runtime, *index, snapshot) {
             Ok(slot) => slot,
@@ -1317,8 +1318,8 @@ fn next_for_icmp_error_index(
 fn collect_current_chain_for_icmp_generation(
     runtime: &DataPlaneRuntime,
     index: Index,
-) -> CoreResult<hammer_infra::vec::Vec<u8>> {
-    let mut bytes = hammer_infra::vec::Vec::new();
+) -> CoreResult<Vec<u8>> {
+    let mut bytes = Vec::new();
     let mut chain = runtime.chain(index);
     while let Some(buffer) = chain.next() {
         let buffer = buffer?;

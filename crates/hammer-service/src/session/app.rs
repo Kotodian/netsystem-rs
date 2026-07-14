@@ -474,7 +474,7 @@ mod tests {
 
         assert_eq!(
             *dispatched.lock().expect("dispatched"),
-            vec![(session_id.get(), SessionEvtType::Close)]
+            hammer_infra::vec![(session_id.get(), SessionEvtType::Close)]
         );
     }
 }

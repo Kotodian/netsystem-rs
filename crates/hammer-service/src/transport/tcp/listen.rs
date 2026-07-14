@@ -341,7 +341,7 @@ mod legacy_tests {
 
     #[derive(Default)]
     struct CaptureState {
-        packets: std::vec::Vec<std::vec::Vec<u8>>,
+        packets: Vec<Vec<u8>>,
     }
 
     struct CaptureNode {
@@ -382,9 +382,9 @@ mod legacy_tests {
         }
     }
 
-    fn capture_states() -> &'static Mutex<std::vec::Vec<Arc<Mutex<CaptureState>>>> {
-        static STATES: OnceLock<Mutex<std::vec::Vec<Arc<Mutex<CaptureState>>>>> = OnceLock::new();
-        STATES.get_or_init(|| Mutex::new(std::vec::Vec::new()))
+    fn capture_states() -> &'static Mutex<Vec<Arc<Mutex<CaptureState>>>> {
+        static STATES: OnceLock<Mutex<Vec<Arc<Mutex<CaptureState>>>>> = OnceLock::new();
+        STATES.get_or_init(|| Mutex::new(Vec::new()))
     }
 
     fn capture_process(
@@ -409,7 +409,7 @@ mod legacy_tests {
                 Ok(buf) => buf.current().to_vec(),
                 Err(_) => return NodeResult::drop(),
             };
-            state.packets.push(packet);
+            state.packets.push(packet.into());
         }
         NodeResult::drop()
     }
@@ -950,7 +950,7 @@ mod legacy_tests {
         (input, handle, output_state)
     }
 
-    fn send_packet(runtime: &DataPlaneRuntime, node: NodeId, packet: std::vec::Vec<u8>) {
+    fn send_packet(runtime: &DataPlaneRuntime, node: NodeId, packet: Vec<u8>) {
         let mut frame = runtime.buffers().get_next_frame(node).expect("frame");
         let buffer = runtime.alloc_index_with_bytes(&packet).expect("packet");
         let cursor = tcp_control_cursor(&packet).expect("cursor");
@@ -965,11 +965,11 @@ mod legacy_tests {
         runtime.put_next_frame(frame).expect("put next frame");
     }
 
-    fn syn_packet() -> std::vec::Vec<u8> {
+    fn syn_packet() -> Vec<u8> {
         syn_packet_from(remote_addr(None), CLIENT_ISN)
     }
 
-    fn syn_packet_from(remote: SocketAddr, sequence: u32) -> std::vec::Vec<u8> {
+    fn syn_packet_from(remote: SocketAddr, sequence: u32) -> Vec<u8> {
         tcp_control_packet(
             remote,
             local_addr(),
@@ -995,7 +995,7 @@ mod legacy_tests {
         sequence: u32,
         payload: &[u8],
         cookie: TcpFastOpenCookie,
-    ) -> std::vec::Vec<u8> {
+    ) -> Vec<u8> {
         tcp_control_packet(
             remote,
             local_addr(),
@@ -1019,7 +1019,7 @@ mod legacy_tests {
         .expect("tfo syn")
     }
 
-    fn ack_packet(acknowledgment: u32) -> std::vec::Vec<u8> {
+    fn ack_packet(acknowledgment: u32) -> Vec<u8> {
         tcp_control_packet(
             remote_addr(None),
             local_addr(),
@@ -1040,7 +1040,7 @@ mod legacy_tests {
         .expect("ack packet")
     }
 
-    fn ack_packet_with_payload(acknowledgment: u32, payload_len: usize) -> std::vec::Vec<u8> {
+    fn ack_packet_with_payload(acknowledgment: u32, payload_len: usize) -> Vec<u8> {
         tcp_control_packet(
             remote_addr(None),
             local_addr(),
@@ -1056,7 +1056,7 @@ mod legacy_tests {
                 timestamp: None,
                 fast_open_cookie: None,
             },
-            &std::vec![b'x'; payload_len],
+            &hammer_infra::vec![b'x'; payload_len],
         )
         .expect("ack packet")
     }
@@ -1066,7 +1066,7 @@ mod legacy_tests {
         remote: SocketAddr,
         header: hammer_core::protocol::tcp::TcpSegmentHeader<'_>,
         payload: &[u8],
-    ) -> Result<std::vec::Vec<u8>, TcpError> {
+    ) -> Result<Vec<u8>, TcpError> {
         let mut tcp = [0u8; 60];
         let tcp_header_len = header.write_to_buffer(&mut tcp, None)?;
         let tcp_len = tcp_header_len
@@ -1076,7 +1076,7 @@ mod legacy_tests {
             (IpAddr::V4(local_ip), IpAddr::V4(remote_ip)) => {
                 let packet_len = 20usize.checked_add(tcp_len).ok_or(TcpError::Dispatch)?;
                 let total_len = u16::try_from(packet_len).map_err(|_| TcpError::Length)?;
-                let mut packet = std::vec![0u8; packet_len];
+                let mut packet = hammer_infra::vec![0u8; packet_len];
                 packet[0] = 0x45;
                 write_be_u16(&mut packet, 2, total_len);
                 packet[8] = 64;
@@ -1103,7 +1103,7 @@ mod legacy_tests {
             (IpAddr::V6(local_ip), IpAddr::V6(remote_ip)) => {
                 let packet_len = 40usize.checked_add(tcp_len).ok_or(TcpError::Dispatch)?;
                 let payload_len = u16::try_from(tcp_len).map_err(|_| TcpError::Length)?;
-                let mut packet = std::vec![0u8; packet_len];
+                let mut packet = hammer_infra::vec![0u8; packet_len];
                 packet[0] = 0x60;
                 write_be_u16(&mut packet, 4, payload_len);
                 packet[6] = 6;

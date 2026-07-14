@@ -13,6 +13,7 @@ use hammer_service::data_plane::{
     FeatureArcStartNode, FeatureArcStartSlot, next_feature_frame,
 };
 use hammer_service::net::NetworkOpaque;
+use hammer_infra::vec::Vec;
 use std::mem::transmute;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -37,7 +38,7 @@ impl Feature<TestArc> for SecondFeature {
     }
 
     fn runs_after() -> Vec<TestArc> {
-        vec![TestArc::First]
+        hammer_infra::vec![TestArc::First]
     }
 }
 

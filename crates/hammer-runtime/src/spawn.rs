@@ -49,6 +49,7 @@ use hammer_runtime::DataPlaneRuntime;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle as TokioJoinHandle;
 use tracing::instrument::WithSubscriber;
+use hammer_infra::vec::Vec;
 
 #[derive(Clone)]
 pub struct DataRuntimeContext {
@@ -289,7 +290,7 @@ impl DataRuntime {
 
 impl DataRuntimeContext {
     pub fn new(handle: Handle) -> Self {
-        Self::new_many(vec![handle])
+        Self::new_many(hammer_infra::vec![handle])
     }
 
     pub fn new_many(handles: Vec<Handle>) -> Self {
@@ -1477,7 +1478,7 @@ mod tests {
 
         assert_eq!(
             names,
-            vec![
+            hammer_infra::vec![
                 (0, "spawn-test-init-0".to_owned()),
                 (1, "spawn-test-init-1".to_owned()),
             ]
@@ -1532,7 +1533,7 @@ mod tests {
             enabled: false,
             record_capacity: 8,
             packet_capacity: 2,
-            inputs: vec![TraceInputPolicy {
+            inputs: hammer_infra::vec![TraceInputPolicy {
                 node: NodeId::new(0),
                 count: 2,
             }]
@@ -1566,7 +1567,7 @@ mod tests {
             })
             .expect("inspect workers");
 
-        assert_eq!(marks, vec![false, false]);
+        assert_eq!(marks, hammer_infra::vec![false, false]);
 
         data_runtime.shutdown_timeout(Duration::from_secs(1));
     }

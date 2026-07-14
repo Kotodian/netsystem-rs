@@ -8,6 +8,7 @@ use hammer_core::registry::RuntimeRegistry;
 use hammer_runtime::DataPlaneRuntime;
 
 use crate::{DataPlaneHandoffWorker, DataWorkerId, FileMain};
+use hammer_infra::vec::Vec;
 
 thread_local! {
     static CURRENT_ENGINE: RefCell<Option<*mut Engine>> = const { RefCell::new(None) };
@@ -33,7 +34,7 @@ pub struct Engine {
     pub main_loop_exit_now: Arc<AtomicBool>,
     pub main_loop_exit_status: Mutex<i32>,
     file_main: Option<FileMain>,
-    worker_threads: Mutex<hammer_infra::vec::Vec<JoinHandle<()>>>,
+    worker_threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl Engine {
@@ -62,7 +63,7 @@ impl Engine {
             main_loop_exit_now,
             main_loop_exit_status: Mutex::new(0),
             file_main: Some(FileMain::new(worker)?),
-            worker_threads: Mutex::new(hammer_infra::vec::Vec::new()),
+            worker_threads: Mutex::new(Vec::new()),
         })
     }
 
@@ -78,7 +79,7 @@ impl Engine {
             main_loop_exit_now: Arc::new(AtomicBool::new(false)),
             main_loop_exit_status: Mutex::new(0),
             file_main: None,
-            worker_threads: Mutex::new(hammer_infra::vec::Vec::new()),
+            worker_threads: Mutex::new(Vec::new()),
         }
     }
 
@@ -136,7 +137,7 @@ impl Engine {
 
     pub(crate) fn retain_worker_threads(
         &self,
-        threads: &mut hammer_infra::vec::Vec<JoinHandle<()>>,
+        threads: &mut Vec<JoinHandle<()>>,
     ) -> HammerResult<()> {
         let mut retained = self
             .worker_threads
@@ -224,7 +225,7 @@ where
 }
 
 pub struct EnginePool {
-    pub engines: hammer_infra::vec::Vec<Engine>,
+    pub engines: Vec<Engine>,
     pub name: String,
     pub exec_path: String,
     pub argv: Vec<String>,
@@ -234,7 +235,7 @@ pub struct EnginePool {
 
 impl EnginePool {
     pub fn new(main: Engine) -> Self {
-        let mut engines = hammer_infra::vec::Vec::new();
+        let mut engines = Vec::new();
         engines.push(main);
         Self {
             engines,

@@ -8,6 +8,7 @@ use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::fifo_queue::FifoQueue;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::segment::{Local, Segment, Svm};
+use hammer_infra::vec::Vec;
 use hammer_runtime::app::{
     AppContext, AppSessionConfig, SessionEvtType, SessionHandle, SessionMsgQueue, SessionSegment,
     with_current_app_worker,
@@ -110,8 +111,8 @@ pub struct SessionWorker<Index, Seg: SessionSegment = Local> {
     app_context: Option<AppContext<Local>>,
     app_session_config: AppSessionConfig,
     buffers: DataPlaneBuffers,
-    session_work: hammer_infra::vec::Vec<SessionId>,
-    session_work_scratch: hammer_infra::vec::Vec<SessionId>,
+    session_work: Vec<SessionId>,
+    session_work_scratch: Vec<SessionId>,
     control_events: FifoQueue<SessionControlEvent>,
 }
 
@@ -137,8 +138,8 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
             app_context: None,
             app_session_config,
             buffers,
-            session_work: hammer_infra::vec::Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
-            session_work_scratch: hammer_infra::vec::Vec::with_capacity(
+            session_work: Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
+            session_work_scratch: Vec::with_capacity(
                 DEFAULT_SESSION_POOL_CAPACITY,
             ),
             control_events: FifoQueue::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
@@ -305,7 +306,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
         Ok(())
     }
 
-    fn take_scheduled_work(&mut self) -> hammer_infra::vec::Vec<SessionId> {
+    fn take_scheduled_work(&mut self) -> Vec<SessionId> {
         let mut work = core::mem::take(&mut self.session_work_scratch);
         core::mem::swap(&mut self.session_work, &mut work);
         for session_id in work.as_slice() {
@@ -316,7 +317,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
         work
     }
 
-    fn keep_work_scratch(&mut self, mut work: hammer_infra::vec::Vec<SessionId>) {
+    fn keep_work_scratch(&mut self, mut work: Vec<SessionId>) {
         work.clear();
         self.session_work_scratch = work;
     }
@@ -756,7 +757,7 @@ where
             && params.send_goal_size != 0
             && io_budget != 0
         {
-            let mut batch = hammer_infra::vec::Vec::with_capacity(io_budget);
+            let mut batch = Vec::with_capacity(io_budget);
             while batch.len() < io_budget && remaining_space != 0 {
                 let pending_len = total_len.saturating_sub(batch_offset);
                 if pending_len == 0 {

@@ -6,6 +6,8 @@ use hammer_core::config::Worker;
 use crate::numa;
 #[cfg(target_os = "linux")]
 use hammer_core::config::WorkerCpu;
+#[cfg(test)]
+use hammer_infra::vec::Vec;
 
 /// Apply platform worker-thread setup before the dataplane loop runs.
 pub fn apply_worker_thread_setup(worker: &Worker, index: usize) {
@@ -124,12 +126,12 @@ mod tests {
         let target = cores[1].id;
         let mut worker = Worker::default();
         worker.count = 1;
-        worker.cpu.worker_cores = vec![target];
+        worker.cpu.worker_cores = hammer_infra::vec![target];
         apply_worker_thread_setup(&worker, 0);
         assert_eq!(
             get_core_ids()
                 .map(|cores| { cores.into_iter().map(|core| core.id).collect::<Vec<_>>() }),
-            Some(vec![target])
+            Some(hammer_infra::vec![target])
         );
     }
 

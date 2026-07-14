@@ -9,12 +9,12 @@ use hammer_core::data_plane::{
     DataPlaneBuffers, Frame, Index, Next, NodeHandle, NodeId, NodeNext, NodeRegistration, Pending,
 };
 use hammer_core::error::{CoreError, CoreResult, DataPlaneError};
-use hammer_infra::vec::Vec;
 
 use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HANDOFF_SLOT_CAPACITY, HandoffSlot};
 use crate::instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
 use crate::node::{NodeEntry, NodeRuntime, NodeRuntimeInner};
 use crate::trace::{DataPlaneTrace, PacketTrace, TraceControlHandle};
+use hammer_infra::vec::Vec;
 
 impl BufferFrameBatchWidthPolicy for FrameBatchWidth {
     #[inline]
@@ -434,7 +434,7 @@ impl DataPlaneRuntime {
         };
         let node_name = self.nodes.node_name(node)?;
         let formatter = self.nodes.node_trace_formatter(node)?;
-        let mut payload_bytes = hammer_infra::vec::Vec::new();
+        let mut payload_bytes = Vec::new();
         trace.encode_trace(&mut payload_bytes);
         self.trace
             .add_entry(handle, node, node_name, formatter, payload_bytes);

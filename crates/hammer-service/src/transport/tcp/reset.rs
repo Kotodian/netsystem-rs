@@ -2,6 +2,8 @@ use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId};
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::{TcpError, TcpSegmentFlags, tcp_header};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
+#[cfg(test)]
+use hammer_infra::vec::Vec;
 use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
 
 #[hammer_component_macros::node_next]
@@ -454,9 +456,9 @@ mod tests {
 
     #[derive(Default)]
     struct CaptureState {
-        packets: std::vec::Vec<std::vec::Vec<u8>>,
-        cursors: std::vec::Vec<hammer_core::data_plane::BufferPacketCursor>,
-        node_errors: std::vec::Vec<Option<BufferNodeError>>,
+        packets: Vec<Vec<u8>>,
+        cursors: Vec<hammer_core::data_plane::BufferPacketCursor>,
+        node_errors: Vec<Option<BufferNodeError>>,
     }
 
     struct CaptureNode {
@@ -490,9 +492,9 @@ mod tests {
 
     impl InternalNode for CaptureNode {}
 
-    fn capture_states() -> &'static Mutex<std::vec::Vec<Arc<Mutex<CaptureState>>>> {
-        static STATES: OnceLock<Mutex<std::vec::Vec<Arc<Mutex<CaptureState>>>>> = OnceLock::new();
-        STATES.get_or_init(|| Mutex::new(std::vec::Vec::new()))
+    fn capture_states() -> &'static Mutex<Vec<Arc<Mutex<CaptureState>>>> {
+        static STATES: OnceLock<Mutex<Vec<Arc<Mutex<CaptureState>>>>> = OnceLock::new();
+        STATES.get_or_init(|| Mutex::new(Vec::new()))
     }
 
     fn capture_process(
@@ -514,7 +516,7 @@ mod tests {
             let cursor =
                 unsafe { std::mem::transmute::<_, &crate::net::NetworkOpaque>(buffer.opaque()) }
                     .packet_cursor();
-            state.packets.push(buffer.current().to_vec());
+            state.packets.push(buffer.current().to_vec().into());
             state.cursors.push(cursor);
             state
                 .node_errors
@@ -596,7 +598,7 @@ mod tests {
     fn ipv4_tcp_packet(flags: u8, sequence: u32, acknowledgment: u32, payload: &[u8]) -> Vec<u8> {
         let packet_len = 20 + 20 + payload.len();
         let total_len = u16::try_from(packet_len).expect("packet length fits");
-        let mut packet = vec![0u8; packet_len];
+        let mut packet = hammer_infra::vec![0u8; packet_len];
         packet[0] = 0x45;
         write_be_u16(&mut packet, 2, total_len);
         packet[8] = 64;

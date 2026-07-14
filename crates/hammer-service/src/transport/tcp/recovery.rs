@@ -244,7 +244,7 @@ struct RackDeadlineIndex {
 #[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct ScoreboardSnapshot {
-    pub holes: std::vec::Vec<(u32, u32, bool)>,
+    pub holes: Vec<(u32, u32, bool)>,
     pub high_sacked: u32,
     pub high_rxt: u32,
     pub lost_bytes: u32,
@@ -643,7 +643,7 @@ impl TcpRecoveryState {
     /// ascending order, plus `high_sacked`, `high_rxt` and `lost_bytes`.
     #[cfg(test)]
     pub(crate) fn scoreboard_snapshot(&self) -> ScoreboardSnapshot {
-        let mut holes: std::vec::Vec<(u32, u32, bool)> = std::vec::Vec::new();
+        let mut holes: Vec<(u32, u32, bool)> = Vec::new();
         for (start, hole) in self.scoreboard.holes.iter() {
             holes.push((u32::from(*start), u32::from(hole.end), hole.lost));
         }
@@ -659,8 +659,8 @@ impl TcpRecoveryState {
     /// Test accessor: every outstanding sample as (sequence, end, bytes, lost,
     /// retransmitted) in ascending sequence order.
     #[cfg(test)]
-    pub(crate) fn sample_snapshot(&self) -> std::vec::Vec<(u32, u32, u32, bool, bool)> {
-        let mut out = std::vec::Vec::new();
+    pub(crate) fn sample_snapshot(&self) -> Vec<(u32, u32, u32, bool, bool)> {
+        let mut out = Vec::new();
         let mut cursor = self.sample_head;
         while let Some(index) = cursor {
             let s = self.sent_sample(index);
@@ -2578,7 +2578,7 @@ mod tests {
                 .iter()
                 .map(|p| p.packet_number)
                 .collect::<Vec<_>>(),
-            vec![1, 2],
+            hammer_infra::vec![1, 2],
             "cumulative ack must deliver segments in ascending order"
         );
         assert_eq!(
@@ -2728,18 +2728,18 @@ mod tests {
         for i in 0..5u32 {
             c.push(TcpSeq::from(1_000 + i));
         }
-        let mut out = std::vec::Vec::new();
+        let mut out = Vec::new();
         while let Some(k) = c.pop_front() {
             out.push(u32::from(k));
         }
-        assert_eq!(out, vec![1_000, 1_001, 1_002, 1_003, 1_004]);
+        assert_eq!(out, hammer_infra::vec![1_000, 1_001, 1_002, 1_003, 1_004]);
 
         // At cap exactly: still inline.
         let mut c = ScoreboardKeyCollector::new();
         for i in 0..SCOREBOARD_KEY_INLINE_CAP as u32 {
             c.push(TcpSeq::from(2_000 + i));
         }
-        let mut out = std::vec::Vec::new();
+        let mut out = Vec::new();
         while let Some(k) = c.pop_front() {
             out.push(u32::from(k));
         }
@@ -2755,7 +2755,7 @@ mod tests {
         for i in 0..(SCOREBOARD_KEY_INLINE_CAP + 4) as u32 {
             c.push(TcpSeq::from(3_000 + i));
         }
-        let mut out = std::vec::Vec::new();
+        let mut out = Vec::new();
         while let Some(k) = c.pop_front() {
             out.push(u32::from(k));
         }
@@ -2773,7 +2773,7 @@ mod tests {
         for i in 0..(SCOREBOARD_KEY_INLINE_CAP + 2) as u32 {
             c.push(TcpSeq::from(4_000 + i));
         }
-        let mut out = std::vec::Vec::new();
+        let mut out = Vec::new();
         while let Some(k) = c.pop_back() {
             out.push(u32::from(k));
         }
@@ -2812,7 +2812,7 @@ mod tests {
         }
 
         // SACK every even-indexed segment to create gaps; ack_floor stays at 1000.
-        let mut blocks: std::vec::Vec<TcpSackBlock> = std::vec::Vec::new();
+        let mut blocks: Vec<TcpSackBlock> = Vec::new();
         for i in 0..N {
             if i % 2 == 1 {
                 let seq = 1_000 + i * SEG;
@@ -2967,7 +2967,7 @@ mod tests {
                         let hi = next_seq.max(cum_ack);
                         let ack_seq = cum_ack + rng.next_u32(hi.saturating_sub(cum_ack).max(1));
                         cum_ack = ack_seq;
-                        let mut blocks: std::vec::Vec<TcpSackBlock> = std::vec::Vec::new();
+                        let mut blocks: Vec<TcpSackBlock> = Vec::new();
                         let nblocks = 1 + rng.next_u32(2) as usize;
                         for _ in 0..nblocks {
                             let span = next_seq.saturating_sub(ack_seq).max(1);

@@ -16,6 +16,7 @@ use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
 use hammer_core::protocol::tcp::{TcpError, TcpInputFlags, TcpSegmentFlags, tcp_header};
 use hammer_infra::pool::Index as PoolIndex;
+use hammer_infra::vec::Vec;
 use hammer_runtime::app::SessionSegment;
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
@@ -70,7 +71,7 @@ impl TcpInputTrace {
 }
 
 impl PacketTrace for TcpInputTrace {
-    fn encode_trace(&self, out: &mut hammer_infra::vec::Vec<u8>) {
+    fn encode_trace(&self, out: &mut Vec<u8>) {
         put_option_ip_version(out, self.version);
         put_option_ip_protocol(out, self.protocol);
         put_option_u16(out, self.source_port);
@@ -214,8 +215,8 @@ struct TcpInputRuntime {
 }
 
 thread_local! {
-    static TCP_INPUT_RUNTIMES: RefCell<hammer_infra::vec::Vec<TcpInputRuntime>> =
-        const { RefCell::new(hammer_infra::vec::Vec::new()) };
+    static TCP_INPUT_RUNTIMES: RefCell<Vec<TcpInputRuntime>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 fn register_tcp_input_runtime(snapshot: Arc<ArcSwap<TcpLookupSnapshot>>) -> NodeRuntimeData {
@@ -314,7 +315,7 @@ where
     crate::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let width = runtime.preferred_frame_batch_width();
-    let mut nexts = hammer_infra::vec::Vec::with_capacity(frame.len());
+    let mut nexts = Vec::with_capacity(frame.len());
     let _ = frame.rewrite_indices_batched(width, |index| {
         prefetch_tcp_input(runtime, &[index], snapshot, session_queue);
         match tcp_input_local_next_for_index(
@@ -664,6 +665,7 @@ mod legacy_tests {
     use hammer_core::protocol::tcp::{TcpCapabilities, TcpConnectionId};
     use hammer_infra::pool::Index as PoolIndex;
     use hammer_infra::segment::Local;
+    use hammer_infra::vec::Vec;
     use hammer_runtime::{
         DataPlaneHandoff, DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeProcessFn,
         NodeResult, NodeRuntimeData,
@@ -741,10 +743,10 @@ mod legacy_tests {
     impl InternalNode for SessionRouteProbeNode {}
 
     fn session_route_probe_states()
-    -> &'static Mutex<std::vec::Vec<Arc<Mutex<SessionRouteProbeState>>>> {
-        static STATES: OnceLock<Mutex<std::vec::Vec<Arc<Mutex<SessionRouteProbeState>>>>> =
+    -> &'static Mutex<Vec<Arc<Mutex<SessionRouteProbeState>>>> {
+        static STATES: OnceLock<Mutex<Vec<Arc<Mutex<SessionRouteProbeState>>>>> =
             OnceLock::new();
-        STATES.get_or_init(|| Mutex::new(std::vec::Vec::new()))
+        STATES.get_or_init(|| Mutex::new(Vec::new()))
     }
 
     fn session_route_probe_process(
@@ -1201,8 +1203,8 @@ mod legacy_tests {
         source_port: u16,
         destination: Ipv4Addr,
         destination_port: u16,
-    ) -> std::vec::Vec<u8> {
-        let mut packet = std::vec![0u8; 40];
+    ) -> Vec<u8> {
+        let mut packet = hammer_infra::vec![0u8; 40];
         packet[0] = 0x45;
         write_be_u16(&mut packet, 2, 40);
         packet[8] = 64;

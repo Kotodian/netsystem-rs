@@ -10,6 +10,7 @@ use hammer_core::protocol::tcp::TcpWireHeader;
 use hammer_core::protocol::transport::UdpHeader;
 use hammer_core::protocol::wire::read_header;
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
+use hammer_infra::vec::Vec;
 use hammer_runtime::{
     DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
     TraceFormatter, add_packet_trace,
@@ -94,7 +95,7 @@ impl IpLocalTrace {
 }
 
 impl PacketTrace for IpLocalTrace {
-    fn encode_trace(&self, out: &mut hammer_infra::vec::Vec<u8>) {
+    fn encode_trace(&self, out: &mut Vec<u8>) {
         put_u8(
             out,
             match self.stage {
@@ -347,9 +348,9 @@ struct IpLocalRuntime {
     feature_arc: Option<FeatureArcStartHandle>,
 }
 
-fn ip_local_runtimes() -> &'static Mutex<hammer_infra::vec::Vec<IpLocalRuntime>> {
-    static RUNTIMES: OnceLock<Mutex<hammer_infra::vec::Vec<IpLocalRuntime>>> = OnceLock::new();
-    RUNTIMES.get_or_init(|| Mutex::new(hammer_infra::vec::Vec::new()))
+fn ip_local_runtimes() -> &'static Mutex<Vec<IpLocalRuntime>> {
+    static RUNTIMES: OnceLock<Mutex<Vec<IpLocalRuntime>>> = OnceLock::new();
+    RUNTIMES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 fn register_ip_local_runtime(

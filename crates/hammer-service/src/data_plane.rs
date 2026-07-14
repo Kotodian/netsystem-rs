@@ -14,6 +14,7 @@ pub use crate::feature_arc::{
     Feature, FeatureArc, FeatureArcControl, FeatureArcSpec, FeatureArcStart, FeatureArcStartHandle,
     FeatureArcStartNode, FeatureArcStartSlot, next_feature_frame, next_feature_slot_for_index,
 };
+use hammer_infra::vec::Vec;
 
 #[inline(always)]
 pub fn set_buffer_node_error_code(
@@ -106,7 +107,7 @@ impl DropTrace {
 
 impl PacketTrace for DropTrace {
     #[inline]
-    fn encode_trace(&self, out: &mut hammer_infra::vec::Vec<u8>) {
+    fn encode_trace(&self, out: &mut Vec<u8>) {
         put_usize(out, self.dropped);
     }
 }
@@ -221,7 +222,7 @@ fn handoff_node_process(
     // Handoff continuation stores the destination as NodeId in current_config.
     // Direct get/push/put is allowed for Handoff; Graph Fanout stays worker-local
     // and does not resolve cross-worker continuation identities.
-    let indices: hammer_infra::vec::Vec<_> = frame.indices().iter().copied().collect();
+    let indices: Vec<_> = frame.indices().iter().copied().collect();
     frame.discard_prefix(indices.len());
     for index in indices {
         let next = runtime

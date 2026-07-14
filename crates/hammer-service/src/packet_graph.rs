@@ -9,6 +9,8 @@ use hammer_core::data_plane::NodeHandle;
 use hammer_core::error::HammerResult;
 use hammer_runtime::Engine;
 use hammer_runtime::NodeEntry;
+#[cfg(test)]
+use hammer_infra::vec::Vec;
 
 #[linkme::distributed_slice]
 pub static SERVICE_GRAPH_NODES: [NodeEntry] = [..];

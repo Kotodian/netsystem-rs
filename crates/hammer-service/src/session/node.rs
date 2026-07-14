@@ -10,6 +10,7 @@ use hammer_runtime::{
 };
 
 use crate::session::SessionQueueError;
+use hammer_infra::vec::Vec;
 
 /// Shared Session Queue IO allowance for normal and custom TX in one dispatch.
 pub const SESSION_QUEUE_IO_BUDGET: usize = 128;
@@ -91,7 +92,7 @@ pub(crate) type SessionQueueDispatchFn = fn(
 /// Accumulates Session Queue TX indexes on the driver Frame and records one
 /// local next per entry. Graph Fanout runs once at [`Self::flush`].
 pub struct SessionQueueOutput {
-    nexts: hammer_infra::vec::Vec<u16>,
+    nexts: Vec<u16>,
     io_count: usize,
 }
 
@@ -106,7 +107,7 @@ impl SessionQueueOutput {
     #[inline]
     pub fn seeded(pending_seed: usize) -> Self {
         Self {
-            nexts: hammer_infra::vec::Vec::new(),
+            nexts: Vec::new(),
             io_count: pending_seed.min(SESSION_QUEUE_IO_BUDGET),
         }
     }
@@ -171,8 +172,8 @@ pub struct SessionQueueNode {
 }
 
 thread_local! {
-    static SESSION_QUEUE_NODES: RefCell<hammer_infra::vec::Vec<hammer_infra::vec::Vec<SessionQueueAttachment>>> =
-        const { RefCell::new(hammer_infra::vec::Vec::new()) };
+    static SESSION_QUEUE_NODES: RefCell<Vec<Vec<SessionQueueAttachment>>> =
+        const { RefCell::new(Vec::new()) };
     static SESSION_QUEUE_NODE_RUNTIME_DATA: Cell<Option<NodeRuntimeData>> = const { Cell::new(None) };
     static SESSION_QUEUE_NODE_ID: Cell<Option<NodeId>> = const { Cell::new(None) };
 }
@@ -192,7 +193,7 @@ impl SessionQueueNode {
             let mut nodes = nodes.borrow_mut();
             let slot = nodes.len();
             let runtime_data = NodeRuntimeData::from_usize(slot)?;
-            nodes.push(hammer_infra::vec::Vec::new());
+            nodes.push(Vec::new());
             Ok(Self { runtime_data })
         })
     }

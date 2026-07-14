@@ -34,6 +34,7 @@ use crate::trace::codec::{
     TraceDecodeCursor, put_option_dpo_type, put_option_u16, put_option_u32, put_u16, put_u32,
     put_usize,
 };
+use hammer_infra::vec::Vec;
 
 /// Packet-path forwarding nexts are consumer-local slots (`u16`), not target
 /// `NodeId` values. Graph Runtime resolves slots via Graph Fanout.
@@ -86,7 +87,7 @@ impl IpLookupTrace {
 
 impl PacketTrace for IpLookupTrace {
     #[inline]
-    fn encode_trace(&self, out: &mut hammer_infra::vec::Vec<u8>) {
+    fn encode_trace(&self, out: &mut Vec<u8>) {
         put_u32(out, self.fib_index);
         put_option_dpo_type(out, self.route_dpo_type);
         put_option_u32(out, self.route_dpo_index);
@@ -130,7 +131,7 @@ impl AdjacencyRewriteTrace {
 
 impl PacketTrace for AdjacencyRewriteTrace {
     #[inline]
-    fn encode_trace(&self, out: &mut hammer_infra::vec::Vec<u8>) {
+    fn encode_trace(&self, out: &mut Vec<u8>) {
         put_option_u32(out, self.dpo_index);
         put_option_u32(out, self.egress_interface);
         put_usize(out, self.rewrite_len);
@@ -817,7 +818,7 @@ fn ip_lookup_process_frame(
     if count == 0 {
         return NodeResult::drop();
     }
-    let mut nexts = hammer_infra::vec::Vec::with_capacity(count);
+    let mut nexts = Vec::with_capacity(count);
     for &index in frame.indices() {
         nexts.push(IpLookupNode::process_index(runtime, table, index));
     }
@@ -847,11 +848,11 @@ fn adjacency_rewrite_process_frame(
     icmp_error_next: Option<u16>,
     fragment_next: Option<u16>,
 ) -> NodeResult {
-    let indices: hammer_infra::vec::Vec<_> = frame.indices().iter().copied().collect();
+    let indices: Vec<_> = frame.indices().iter().copied().collect();
     frame.discard_prefix(frame.len());
-    let mut success_indices = hammer_infra::vec::Vec::with_capacity(indices.len());
-    let mut success_nexts = hammer_infra::vec::Vec::with_capacity(indices.len());
-    let mut failed = hammer_infra::vec::Vec::new();
+    let mut success_indices = Vec::with_capacity(indices.len());
+    let mut success_nexts = Vec::with_capacity(indices.len());
+    let mut failed = Vec::new();
     for index in indices {
         match AdjacencyRewriteNode::next_for_index(
             table,

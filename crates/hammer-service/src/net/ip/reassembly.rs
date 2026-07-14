@@ -122,7 +122,7 @@ impl IpReassemblyTrace {
 
 impl PacketTrace for IpReassemblyTrace {
     #[inline]
-    fn encode_trace(&self, out: &mut hammer_infra::vec::Vec<u8>) {
+    fn encode_trace(&self, out: &mut Vec<u8>) {
         put_option_ip_fragment_key(out, self.key);
         put_u8(out, self.action.encode());
         put_u32(out, self.current_worker.slot() as u32);

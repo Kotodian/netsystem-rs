@@ -16,6 +16,7 @@ use hammer_runtime::node::NodeRuntime;
 use hammer_runtime::{DataPlaneBarrierHandle, DataPlaneRuntime, NodeResult};
 
 use crate::net::NetworkOpaque;
+use hammer_infra::vec::Vec;
 
 pub struct FeatureArc<A: FeatureArcSpec> {
     inner: Arc<FeatureArcInner<A>>,
@@ -305,7 +306,7 @@ pub fn next_feature_frame(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
 ) -> NodeResult {
-    let mut nexts = hammer_infra::vec::Vec::with_capacity(frame.len());
+    let mut nexts = Vec::with_capacity(frame.len());
     for index in frame.iter_indices() {
         nexts.push(handle.next_feature_slot(runtime, *index));
     }

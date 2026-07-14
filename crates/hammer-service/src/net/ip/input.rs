@@ -17,6 +17,7 @@ use crate::trace::codec::{
     TraceDecodeCursor, put_option_ip_input_error, put_option_ip_input_target,
     put_option_ip_protocol, put_option_ip_version, put_u16, put_usize,
 };
+use hammer_infra::vec::Vec;
 
 #[hammer_component_macros::feature_arc]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -65,7 +66,7 @@ impl IpInputTrace {
 }
 
 impl PacketTrace for IpInputTrace {
-    fn encode_trace(&self, out: &mut hammer_infra::vec::Vec<u8>) {
+    fn encode_trace(&self, out: &mut Vec<u8>) {
         put_option_ip_version(out, self.version);
         put_option_ip_protocol(out, self.protocol);
         put_option_ip_input_target(out, self.input_target);
@@ -116,7 +117,7 @@ fn ip_input_process_frame(
     frame: &mut BufferFrame,
     feature_arc: Option<&FeatureArcStartHandle>,
 ) -> NodeResult {
-    let mut nexts = hammer_infra::vec::Vec::with_capacity(frame.len());
+    let mut nexts = Vec::with_capacity(frame.len());
     let drop_slot = IpInputNext::Drop.slot() as u16;
     for index in frame.iter_indices() {
         let slot = match next_slot_for_index(runtime, *index, feature_arc) {
@@ -143,9 +144,9 @@ struct IpInputRuntime {
     feature_arc: Option<FeatureArcStartHandle>,
 }
 
-fn ip_input_runtimes() -> &'static Mutex<hammer_infra::vec::Vec<IpInputRuntime>> {
-    static RUNTIMES: OnceLock<Mutex<hammer_infra::vec::Vec<IpInputRuntime>>> = OnceLock::new();
-    RUNTIMES.get_or_init(|| Mutex::new(hammer_infra::vec::Vec::new()))
+fn ip_input_runtimes() -> &'static Mutex<Vec<IpInputRuntime>> {
+    static RUNTIMES: OnceLock<Mutex<Vec<IpInputRuntime>>> = OnceLock::new();
+    RUNTIMES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 fn register_ip_input_runtime(feature_arc: Option<FeatureArcStartHandle>) -> NodeRuntimeData {

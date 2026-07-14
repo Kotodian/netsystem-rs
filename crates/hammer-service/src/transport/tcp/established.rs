@@ -4,6 +4,8 @@ use hammer_core::data_plane::{
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::pool::Index as PoolIndex;
+#[cfg(test)]
+use hammer_infra::vec::Vec;
 use hammer_runtime::app::SessionSegment;
 use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
 
@@ -387,7 +389,7 @@ mod tests {
 
     #[derive(Default)]
     struct CaptureState {
-        packets: std::vec::Vec<std::vec::Vec<u8>>,
+        packets: Vec<Vec<u8>>,
     }
 
     struct CaptureNode {
@@ -421,9 +423,9 @@ mod tests {
 
     impl InternalNode for CaptureNode {}
 
-    fn capture_states() -> &'static Mutex<std::vec::Vec<Arc<Mutex<CaptureState>>>> {
-        static STATES: OnceLock<Mutex<std::vec::Vec<Arc<Mutex<CaptureState>>>>> = OnceLock::new();
-        STATES.get_or_init(|| Mutex::new(std::vec::Vec::new()))
+    fn capture_states() -> &'static Mutex<Vec<Arc<Mutex<CaptureState>>>> {
+        static STATES: OnceLock<Mutex<Vec<Arc<Mutex<CaptureState>>>>> = OnceLock::new();
+        STATES.get_or_init(|| Mutex::new(Vec::new()))
     }
 
     fn capture_process(
@@ -450,7 +452,7 @@ mod tests {
                 Err(_) => continue,
             };
             match state.lock() {
-                Ok(mut state) => state.packets.push(packet),
+                Ok(mut state) => state.packets.push(packet.into()),
                 Err(_) => continue,
             }
         }

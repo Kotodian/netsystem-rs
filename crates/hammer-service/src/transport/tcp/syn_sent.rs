@@ -5,6 +5,8 @@ use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRunt
 
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::pool::Index as PoolIndex;
+#[cfg(test)]
+use hammer_infra::vec::Vec;
 use hammer_runtime::app::SessionSegment;
 
 use super::publish_tcp_connection;
@@ -302,7 +304,7 @@ mod legacy_tests {
 
     #[derive(Default)]
     struct CaptureState {
-        packets: std::vec::Vec<std::vec::Vec<u8>>,
+        packets: Vec<Vec<u8>>,
     }
 
     struct CaptureNode {
@@ -336,9 +338,9 @@ mod legacy_tests {
 
     impl InternalNode for CaptureNode {}
 
-    fn capture_states() -> &'static Mutex<std::vec::Vec<Arc<Mutex<CaptureState>>>> {
-        static STATES: OnceLock<Mutex<std::vec::Vec<Arc<Mutex<CaptureState>>>>> = OnceLock::new();
-        STATES.get_or_init(|| Mutex::new(std::vec::Vec::new()))
+    fn capture_states() -> &'static Mutex<Vec<Arc<Mutex<CaptureState>>>> {
+        static STATES: OnceLock<Mutex<Vec<Arc<Mutex<CaptureState>>>>> = OnceLock::new();
+        STATES.get_or_init(|| Mutex::new(Vec::new()))
     }
 
     fn capture_process(
@@ -365,7 +367,7 @@ mod legacy_tests {
                 Err(_) => continue,
             };
             match state.lock() {
-                Ok(mut state) => state.packets.push(packet),
+                Ok(mut state) => state.packets.push(packet.into()),
                 Err(_) => continue,
             }
         }
@@ -413,7 +415,7 @@ mod legacy_tests {
         ))
     }
 
-    fn send_packet(runtime: &DataPlaneRuntime, node: NodeId, packet: std::vec::Vec<u8>) {
+    fn send_packet(runtime: &DataPlaneRuntime, node: NodeId, packet: Vec<u8>) {
         let mut frame = runtime.buffers().get_next_frame(node).expect("frame");
         let buffer = runtime.alloc_index_with_bytes(&packet).expect("packet");
         stamp_tcp_cursor(runtime, buffer, &packet);
@@ -483,7 +485,7 @@ mod legacy_tests {
         sequence: u32,
         acknowledgment: u32,
         flags: u8,
-    ) -> std::vec::Vec<u8> {
+    ) -> Vec<u8> {
         let mut packet = ipv4_packet(source, destination, 6, 20);
         write_tcp_segment(
             &mut packet[20..],
@@ -504,9 +506,9 @@ mod legacy_tests {
         destination: Ipv4Addr,
         protocol: u8,
         payload_len: usize,
-    ) -> std::vec::Vec<u8> {
+    ) -> Vec<u8> {
         let total_len = 20 + payload_len;
-        let mut packet = vec![0u8; total_len];
+        let mut packet = hammer_infra::vec![0u8; total_len];
         packet[0] = 0x45;
         write_be_u16(&mut packet, 2, total_len as u16);
         packet[8] = 64;

@@ -10,6 +10,7 @@ use std::sync::Arc;
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::protocol::tcp::TcpCapabilities;
 use hammer_infra::map::FlatHashTable;
+use hammer_infra::vec::Vec;
 use hammer_runtime::DataWorkerId;
 
 use super::TcpInputControlPlane;
@@ -30,7 +31,7 @@ struct TcpListenerControlState {
     next_tcp_lookup_id: TcpLookupId,
     tcp_control: TcpInputControlPlane,
     tcp_lookup: TcpLookupSnapshot,
-    tcp_listeners: hammer_infra::vec::Vec<TcpListenerRegistration>,
+    tcp_listeners: Vec<TcpListenerRegistration>,
     tcp_listener_slots: FlatHashTable<u64, usize>,
 }
 
@@ -66,7 +67,7 @@ pub(super) struct TcpListenerControlHandle {
 #[cfg(test)]
 #[derive(Clone)]
 struct TcpListenerControlSnapshot {
-    tcp_listeners: hammer_infra::vec::Vec<TcpLookupId>,
+    tcp_listeners: Vec<TcpLookupId>,
     tcp_lookup: TcpLookupSnapshot,
 }
 
@@ -76,7 +77,7 @@ impl TcpListenerControlState {
             next_tcp_lookup_id: 1,
             tcp_control,
             tcp_lookup: TcpLookupSnapshot::empty(),
-            tcp_listeners: hammer_infra::vec::Vec::new(),
+            tcp_listeners: Vec::new(),
             tcp_listener_slots: FlatHashTable::new(),
         }
     }
@@ -220,7 +221,7 @@ impl TcpListenerControlHandle {
     #[cfg(test)]
     fn snapshot_for_test(&self) -> TcpListenerControlSnapshot {
         let state = unsafe { &*self.state.inner.get() };
-        let mut tcp_listeners = hammer_infra::vec::Vec::new();
+        let mut tcp_listeners = Vec::new();
         for registration in state.tcp_listeners.iter() {
             tcp_listeners.push(registration.lookup_id);
         }

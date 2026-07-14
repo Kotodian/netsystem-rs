@@ -9,7 +9,6 @@ use hammer_core::data_plane::{
     BufferFrame, BufferRef, DEFAULT_BUFFER_FRAME_CAPACITY, NodeId, NodeState,
 };
 use hammer_core::error::{CoreError, CoreResult, HammerError, HammerResult};
-use hammer_infra::vec::Vec;
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, File, FileFunctions, Node, NodeProcessFn, NodeResult,
     NodeRuntimeData, PacketTrace, TraceFormatter, add_packet_trace,
@@ -18,6 +17,7 @@ use hammer_runtime::{
 use crate::device::{DeviceInputNext, DeviceInputNode, DeviceMain, DeviceRxQueue};
 use crate::interface::InterfaceControlPlane;
 use crate::net::NetworkOpaque;
+use hammer_infra::vec::Vec;
 
 #[cfg(target_os = "macos")]
 mod darwin;

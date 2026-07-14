@@ -13,6 +13,8 @@ use hammer_core::metrics::{MetricKind, MetricSample};
 
 pub use self::timer::ControlTimerHandle;
 use self::timer::{ControlTimerId, ControlTimerRegistration, TimerRegistry};
+#[cfg(test)]
+use hammer_infra::vec::Vec;
 
 pub const DEFAULT_CONTROL_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -476,7 +478,7 @@ fn build_component_snapshot_lines(samples: &[MetricSample], ts: u64) -> Vec<Stri
     write_snapshot_body(&mut single, samples);
     single.push('}');
     if single.len() <= SNAPSHOT_CHUNK_THRESHOLD {
-        return vec![single];
+        return hammer_infra::vec![single];
     }
     let mut chunks: Vec<Vec<&MetricSample>> = Vec::new();
     let mut diagnostics: Vec<String> = Vec::new();

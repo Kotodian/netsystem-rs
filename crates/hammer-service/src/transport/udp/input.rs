@@ -8,6 +8,7 @@ use hammer_core::protocol::icmp::IcmpErrorMetadata;
 use hammer_core::protocol::transport::UdpHeader;
 use hammer_core::protocol::wire::read_header;
 use hammer_infra::boxed::Box;
+use hammer_infra::vec::Vec;
 use hammer_runtime::{
     DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
     TraceFormatter, add_packet_trace,
@@ -79,7 +80,7 @@ impl UdpInputTrace {
 }
 
 impl PacketTrace for UdpInputTrace {
-    fn encode_trace(&self, out: &mut hammer_infra::vec::Vec<u8>) {
+    fn encode_trace(&self, out: &mut Vec<u8>) {
         put_option_ip_version(out, self.version);
         put_option_ip_protocol(out, self.protocol);
         put_option_u16(out, self.source_port);
@@ -314,7 +315,7 @@ fn udp_input_process_frame(
     snapshot: &UdpInputSnapshot,
 ) -> NodeResult {
     let drop_slot = UdpInputNext::Drop.slot() as u16;
-    let mut nexts = hammer_infra::vec::Vec::with_capacity(frame.len());
+    let mut nexts = Vec::with_capacity(frame.len());
     for index in frame.iter_indices() {
         let slot = match next_slot_for_index(runtime, *index, snapshot) {
             Ok(Some(slot)) => slot,

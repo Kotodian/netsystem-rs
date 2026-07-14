@@ -34,7 +34,7 @@ fn verify_worker_startup_contract(engine: &mut Engine) -> HammerResult<()> {
         NodeKind::Internal,
         NodeDescriptor::new(
             startup_node_process,
-            NodeRuntimeData::from_words([u64::from(worker.slot()) + 1, 0, 0, 0]),
+            NodeRuntimeData::from_words([worker.slot() as u64 + 1, 0, 0, 0]),
             NodeRegistration::next("startup-node", 0),
             &[],
             None,
