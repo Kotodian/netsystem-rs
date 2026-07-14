@@ -21,10 +21,8 @@ pub struct RawVec<T, const ALIGN: usize = CACHE_LINE> {
     ptr: NonNull<T>,
     len: usize,
     cap: usize,
-    /// Heap that allocated the backing storage. Retained so `Drop` /
-    /// `grow_to` / `into_iter` can dealloc through the same `Heap`.
-    /// `None` is only valid when `cap == 0`; allocating constructors
-    /// and the lazy `grow_to` path always populate it.
+    /// `None` selects the main heap. `Some` retains an explicit non-main
+    /// heap so growth, conversion, iteration, and drop preserve provenance.
     heap: Option<Arc<Heap>>,
     _marker: PhantomData<T>,
 }
@@ -44,30 +42,13 @@ impl<T, const ALIGN: usize> RawVec<T, ALIGN> {
         }
     }
 
-    /// Back-compat: allocates the backing storage from the global
-    /// allocator via `Heap::local()`. Equivalent to
-    /// `with_capacity_in(capacity, Arc::new(Heap::local()))`.
+    /// Allocates backing storage from Hammer's main heap.
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
-        Self::with_capacity_in(capacity, Arc::new(Heap::local()))
-    }
-
-    /// Allocates `capacity` slots of `T` from `heap` and stores the
-    /// `heap` handle so `Drop` / `grow_to` / `into_iter` can dealloc
-    /// through the same `Heap`. The SVM vtable's `dealloc` returns the
-    /// offset to the shared-memory region; the Local vtable's
-    /// `dealloc` hands the storage back to the global allocator.
-    #[inline]
-    pub fn with_capacity_in(capacity: usize, heap: Arc<Heap>) -> Self {
         if capacity == 0 {
-            return Self {
-                ptr: NonNull::dangling(),
-                len: 0,
-                cap: 0,
-                heap: Some(heap),
-                _marker: PhantomData,
-            };
+            return Self::new();
         }
+        let heap = Heap::main();
         let layout = align::array_layout::<T, ALIGN>(capacity);
         let raw = heap
             .alloc(layout)
@@ -77,7 +58,38 @@ impl<T, const ALIGN: usize> RawVec<T, ALIGN> {
             ptr,
             len: 0,
             cap: capacity,
-            heap: Some(heap),
+            heap: None,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Allocates `capacity` slots of `T` from `heap`. Main-heap handles are
+    /// normalized to the default representation; explicit non-main handles
+    /// are retained for growth, conversion, iteration, and drop.
+    #[inline]
+    pub fn with_capacity_in(capacity: usize, heap: Arc<Heap>) -> Self {
+        let heap = (!heap.is_main_heap()).then_some(heap);
+        if capacity == 0 {
+            return Self {
+                ptr: NonNull::dangling(),
+                len: 0,
+                cap: 0,
+                heap,
+                _marker: PhantomData,
+            };
+        }
+        let main_heap = Heap::main();
+        let allocator = heap.as_deref().unwrap_or(&main_heap);
+        let layout = align::array_layout::<T, ALIGN>(capacity);
+        let raw = allocator
+            .alloc(layout)
+            .unwrap_or_else(|| handle_alloc_error(layout));
+        let ptr = NonNull::new(raw.as_ptr().cast::<T>()).expect("Heap::alloc returned null");
+        Self {
+            ptr,
+            len: 0,
+            cap: capacity,
+            heap,
             _marker: PhantomData,
         }
     }
@@ -270,28 +282,18 @@ impl<T, const ALIGN: usize> RawVec<T, ALIGN> {
         let ptr = self.ptr;
         let len = self.len;
         let cap = self.cap;
-        // Transfer the Heap handle so the Slice's `Drop` can dealloc
-        // through the same vtable. `heap = None` only when `cap == 0`,
-        // in which case the Slice's `Drop` is a no-op.
-        let heap = self.heap.clone().unwrap_or_else(|| Arc::new(Heap::local()));
+        let heap = self.heap.take();
         self.ptr = NonNull::dangling();
         self.len = 0;
         self.cap = 0;
-        self.heap = None;
         mem::forget(self);
         unsafe { Slice::from_raw_parts(ptr, len, cap, heap) }
     }
 
     #[inline]
     fn grow_to(&mut self, next_capacity: usize) {
-        // The new region must come from the same Heap that owns the
-        // existing region, otherwise `Drop`'s dealloc would target a
-        // foreign allocator. Lazy-initialise to `Heap::local()` for
-        // the `RawVec::new()` (heap = None) entry path.
-        let heap = self
-            .heap
-            .get_or_insert_with(|| Arc::new(Heap::local()))
-            .clone();
+        let main_heap = Heap::main();
+        let heap = self.heap.as_deref().unwrap_or(&main_heap);
         let old_cap = self.cap;
         let next_layout = align::array_layout::<T, ALIGN>(next_capacity);
         let next_raw = heap
@@ -310,7 +312,7 @@ impl<T, const ALIGN: usize> RawVec<T, ALIGN> {
         if old_cap > 0 {
             let old_layout = align::array_layout::<T, ALIGN>(old_cap);
             let raw = self.ptr.as_ptr().cast::<u8>();
-            unsafe { GlobalAlloc::dealloc(&*heap, raw, old_layout) };
+            unsafe { GlobalAlloc::dealloc(heap, raw, old_layout) };
         }
         self.ptr = next_ptr;
         self.cap = next_capacity;
@@ -392,9 +394,7 @@ pub struct RawIntoIter<T, const ALIGN: usize = CACHE_LINE> {
     cap: usize,
     current: usize,
     end: usize,
-    /// Heap that allocated the buffer. Retained so `Drop` can route the
-    /// dealloc through the same vtable. `None` is only valid when
-    /// `cap == 0` (no dealloc needed).
+    /// `None` selects the main heap; `Some` retains an explicit non-main heap.
     heap: Option<Arc<Heap>>,
 }
 
@@ -429,11 +429,11 @@ impl<T, const ALIGN: usize> Drop for RawIntoIter<T, ALIGN> {
             }
         }
         if self.cap > 0 {
-            if let Some(heap) = self.heap.as_ref() {
-                let layout = align::array_layout::<T, ALIGN>(self.cap);
-                let raw = self.ptr.as_ptr().cast::<u8>();
-                unsafe { GlobalAlloc::dealloc(&**heap, raw, layout) };
-            }
+            let main_heap = Heap::main();
+            let heap = self.heap.as_deref().unwrap_or(&main_heap);
+            let layout = align::array_layout::<T, ALIGN>(self.cap);
+            let raw = self.ptr.as_ptr().cast::<u8>();
+            unsafe { GlobalAlloc::dealloc(heap, raw, layout) };
         }
     }
 }
@@ -448,7 +448,12 @@ impl<T, const ALIGN: usize> Default for RawVec<T, ALIGN> {
 impl<T: Clone, const ALIGN: usize> Clone for RawVec<T, ALIGN> {
     #[inline]
     fn clone(&self) -> Self {
-        self.as_slice().iter().cloned().collect()
+        let mut values = match self.heap.as_ref() {
+            Some(heap) => Self::with_capacity_in(self.len, heap.clone()),
+            None => Self::with_capacity(self.len),
+        };
+        values.extend_from_cloned_slice(self.as_slice());
+        values
     }
 }
 
@@ -521,11 +526,11 @@ impl<T, const ALIGN: usize> Drop for RawVec<T, ALIGN> {
     fn drop(&mut self) {
         self.clear();
         if self.cap > 0 {
-            if let Some(heap) = self.heap.as_ref() {
-                let layout = align::array_layout::<T, ALIGN>(self.cap);
-                let raw = self.ptr.as_ptr().cast::<u8>();
-                unsafe { GlobalAlloc::dealloc(&**heap, raw, layout) };
-            }
+            let main_heap = Heap::main();
+            let heap = self.heap.as_deref().unwrap_or(&main_heap);
+            let layout = align::array_layout::<T, ALIGN>(self.cap);
+            let raw = self.ptr.as_ptr().cast::<u8>();
+            unsafe { GlobalAlloc::dealloc(heap, raw, layout) };
         }
     }
 }
@@ -580,7 +585,7 @@ impl<T, const ALIGN: usize> IntoIterator for RawVec<T, ALIGN> {
 
     #[inline]
     fn into_iter(mut self) -> Self::IntoIter {
-        let heap = self.heap.clone();
+        let heap = self.heap.take();
         let iter = RawIntoIter {
             ptr: self.ptr,
             cap: self.cap,
@@ -591,7 +596,6 @@ impl<T, const ALIGN: usize> IntoIterator for RawVec<T, ALIGN> {
         self.ptr = NonNull::dangling();
         self.len = 0;
         self.cap = 0;
-        self.heap = None;
         mem::forget(self);
         iter
     }

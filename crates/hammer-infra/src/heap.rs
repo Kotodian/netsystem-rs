@@ -18,7 +18,6 @@ struct HeapVTable {
 }
 
 enum HeapData {
-    Main,
     SvmData { region: SvmRegion },
 }
 
@@ -30,7 +29,7 @@ pub enum HeapError {
 #[derive(Clone)]
 pub struct Heap {
     vtable: &'static HeapVTable,
-    data: Arc<HeapData>,
+    data: Option<Arc<HeapData>>,
 }
 
 impl Heap {
@@ -38,7 +37,7 @@ impl Heap {
     pub fn main() -> Heap {
         Heap {
             vtable: &MAIN_VTABLE,
-            data: Arc::new(HeapData::Main),
+            data: None,
         }
     }
 
@@ -54,7 +53,7 @@ impl Heap {
         }
         Ok(Heap {
             vtable: &SVM_VTABLE,
-            data: Arc::new(HeapData::SvmData { region }),
+            data: Some(Arc::new(HeapData::SvmData { region })),
         })
     }
 
@@ -66,20 +65,22 @@ impl Heap {
 
     #[inline]
     pub fn is_main_heap(&self) -> bool {
-        matches!(self.data.as_ref(), HeapData::Main)
+        self.data.is_none()
     }
 
     #[inline]
     pub fn region(&self) -> Option<&SvmRegion> {
-        match self.data.as_ref() {
-            HeapData::SvmData { region } => Some(region),
-            HeapData::Main => None,
+        match self.data.as_deref() {
+            Some(HeapData::SvmData { region }) => Some(region),
+            None => None,
         }
     }
 
     #[inline]
     fn data_ptr(&self) -> *const () {
-        Arc::as_ptr(&self.data).cast::<()>()
+        self.data
+            .as_ref()
+            .map_or(std::ptr::null(), |data| Arc::as_ptr(data).cast::<()>())
     }
 }
 
@@ -107,8 +108,8 @@ static MAIN_VTABLE: HeapVTable = HeapVTable {
 };
 
 unsafe fn shared_owner_alloc_callback(data: *const (), layout: Layout) -> *mut u8 {
-    let HeapData::SvmData { region } = (unsafe { &*(data.cast::<HeapData>()) }) else {
-        return std::ptr::null_mut();
+    let region = match unsafe { &*(data.cast::<HeapData>()) } {
+        HeapData::SvmData { region } => region,
     };
     region
         .alloc_layout(layout)
@@ -116,8 +117,8 @@ unsafe fn shared_owner_alloc_callback(data: *const (), layout: Layout) -> *mut u
 }
 
 unsafe fn shared_owner_dealloc_callback(data: *const (), ptr: *mut u8, layout: Layout) {
-    let HeapData::SvmData { region } = (unsafe { &*(data.cast::<HeapData>()) }) else {
-        return;
+    let region = match unsafe { &*(data.cast::<HeapData>()) } {
+        HeapData::SvmData { region } => region,
     };
     if let Some(ptr) = NonNull::new(ptr) {
         unsafe { region.dealloc_layout(ptr, layout) };
