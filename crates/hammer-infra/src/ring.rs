@@ -527,13 +527,15 @@ impl fmt::Debug for LockFreeRingCursors {
 
 #[repr(C, align(64))]
 pub struct LockFreeRingSlot<T> {
+    sequence: AtomicU32,
     value: UnsafeCell<MaybeUninit<T>>,
 }
 
 impl<T> LockFreeRingSlot<T> {
     #[inline]
-    const fn uninit() -> Self {
+    const fn uninit(sequence: u32) -> Self {
         Self {
+            sequence: AtomicU32::new(sequence),
             value: UnsafeCell::new(MaybeUninit::uninit()),
         }
     }
@@ -555,7 +557,7 @@ impl<T: Copy> LockFreeRing<T> {
         if size < 2 || !size.is_power_of_two() || size > u32::MAX as usize {
             return Err(RingError::InvalidCapacity);
         }
-        let slots = Slice::from_fn(size, |_| LockFreeRingSlot::uninit());
+        let slots = Slice::from_fn(size, |index| LockFreeRingSlot::uninit(index as u32));
         Ok(Self {
             size: size as u32,
             mask: size as u32 - 1,
@@ -601,15 +603,12 @@ impl<T: Copy> LockFreeRing<T> {
 
     /// Multi-producer enqueue.
     ///
-    /// DPDK MP/MC CAS algorithm: a producer atomically reserves a slot by CASing
-    /// `producer.head` forward, writes the value, then waits for its turn
-    /// (`producer.tail == reserved_head`) before publishing `producer.tail`
-    /// with Release ordering. The Release publish pairs with the Acquire load
-    /// of `producer.tail` in `dequeue`, so the slot write is visible to
-    /// consumers before they observe the new tail.
+    /// A producer atomically reserves a position by CASing `producer.head`,
+    /// writes the value, and publishes that slot's sequence with Release
+    /// ordering. Producers never wait for an earlier producer to publish.
     ///
     /// `T: Copy` guarantees slot reads do not leave ownership behind, so the
-    /// slot is logically vacant once `consumer.tail` advances past it.
+    /// consumer can return the slot to the next sequence lap after reading it.
     ///
     /// `head`/`tail` are wrapping `u32` counters; the slot index is `head &
     /// mask`. ABA is bounded by u32 space (capacity - 1): a producer that
@@ -620,11 +619,14 @@ impl<T: Copy> LockFreeRing<T> {
     /// a single ring without a wrap-aware cursor (documented assumption).
     #[inline]
     pub fn enqueue(&self, value: T) -> Result<(), RingError<T>> {
-        let prod_head = loop {
+        let (prod_head, slot) = loop {
             let head = self.cursors.producer.head.load(Ordering::Acquire);
             let cons_tail = self.cursors.consumer.tail.load(Ordering::Acquire);
-            let free = self.mask.wrapping_add(cons_tail).wrapping_sub(head);
-            if free == 0 {
+            if head.wrapping_sub(cons_tail) >= self.capacity {
+                return Err(RingError::Full(value));
+            }
+            let slot = (head & self.mask) as usize;
+            if self.slots[slot].sequence.load(Ordering::Acquire) != head {
                 return Err(RingError::Full(value));
             }
             let next = head.wrapping_add(1);
@@ -634,50 +636,36 @@ impl<T: Copy> LockFreeRing<T> {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => break head,
+                Ok(_) => break (head, slot),
                 Err(_) => std::hint::spin_loop(),
             }
         };
 
-        let slot = (prod_head & self.mask) as usize;
         // SAFETY: `prod_head & mask` selects a slot inside the power-of-two
-        // table. The CAS above reserved this slot exclusively for this
-        // producer until `producer.tail` is published below. No other producer
-        // writes to it and no consumer reads it until the Release store of
-        // `producer.tail` pairs with their Acquire load.
+        // table. Matching the slot sequence and CASing producer head reserves
+        // the slot exclusively. A consumer cannot read it before the sequence
+        // Release store below.
         unsafe {
             (*self.slots[slot].value.get()).write(value);
         }
-
-        // Wait for prior producers to publish their tail so we preserve
-        // FIFO order: only the producer whose reserved head matches the
-        // current tail may publish. Other producers may still be writing
-        // their slots; we must not overtake them or a consumer could read
-        // an uninitialised slot between our publish and theirs.
-        while self.cursors.producer.tail.load(Ordering::Acquire) != prod_head {
-            std::hint::spin_loop();
-        }
-        self.cursors
-            .producer
-            .tail
+        self.cursors.producer.tail.fetch_add(1, Ordering::Release);
+        self.slots[slot]
+            .sequence
             .store(prod_head.wrapping_add(1), Ordering::Release);
         Ok(())
     }
 
     /// Multi-consumer dequeue.
     ///
-    /// Symmetric to `enqueue`: a consumer CASes `consumer.head` forward to
-    /// reserve a slot, reads the value (Acquire load of `producer.tail` proves
-    /// the slot was published), waits for its turn, then publishes
-    /// `consumer.tail` with Release ordering so producers observe the freed
-    /// slot in order.
+    /// Symmetric to `enqueue`: a consumer reserves only the next published
+    /// slot, reads it, and advances that slot's sequence to the next lap.
+    /// Consumers never wait for an earlier consumer to publish a global tail.
     #[inline]
     pub fn dequeue(&self) -> Option<T> {
-        let cons_head = loop {
+        let (cons_head, slot) = loop {
             let head = self.cursors.consumer.head.load(Ordering::Acquire);
-            let prod_tail = self.cursors.producer.tail.load(Ordering::Acquire);
-            let entries = prod_tail.wrapping_sub(head);
-            if entries == 0 {
+            let slot = (head & self.mask) as usize;
+            if self.slots[slot].sequence.load(Ordering::Acquire) != head.wrapping_add(1) {
                 return None;
             }
             let next = head.wrapping_add(1);
@@ -687,28 +675,23 @@ impl<T: Copy> LockFreeRing<T> {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => break head,
+                Ok(_) => break (head, slot),
                 Err(_) => std::hint::spin_loop(),
             }
         };
 
-        let slot = (cons_head & self.mask) as usize;
         // Prefetch is unnecessary for a single dequeue; batch loops issue
         // ahead-of-touch prefetches instead.
         // SAFETY: `cons_head & mask` selects a slot inside the table. The
-        // Acquire load of `producer.tail` above observed `prod_tail >
-        // cons_head`, which pairs with the Release store in `enqueue` that
-        // followed the slot write. `T: Copy` means reading does not leave
-        // ownership to drop.
+        // Acquire load of the matching sequence pairs with the producer's
+        // Release publication after its slot write. `T: Copy` means reading
+        // does not leave ownership to drop.
         let value = unsafe { (*self.slots[slot].value.get()).assume_init_read() };
 
-        while self.cursors.consumer.tail.load(Ordering::Acquire) != cons_head {
-            std::hint::spin_loop();
-        }
-        self.cursors
-            .consumer
-            .tail
-            .store(cons_head.wrapping_add(1), Ordering::Release);
+        self.cursors.consumer.tail.fetch_add(1, Ordering::Release);
+        self.slots[slot]
+            .sequence
+            .store(cons_head.wrapping_add(self.size), Ordering::Release);
         Some(value)
     }
 
