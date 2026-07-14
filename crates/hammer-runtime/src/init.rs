@@ -35,11 +35,24 @@ pub trait Ordered {
     }
 }
 
+/// Lifecycle registration collected by linkme.
+///
+/// `plugin: None` marks a runtime builtin; plugin-owned entries set `Some(name)`.
+#[derive(Clone, Copy)]
 pub struct InitFunction {
+    pub plugin: Option<&'static str>,
     pub name: &'static str,
     pub runs_before: &'static [&'static str],
     pub runs_after: &'static [&'static str],
     pub func: fn(&mut Engine) -> HammerResult<()>,
+}
+
+/// Main-loop callback with optional plugin ownership (replaces bare `fn()`).
+#[derive(Clone, Copy)]
+pub struct MainLoopCallback {
+    pub plugin: Option<&'static str>,
+    pub name: &'static str,
+    pub func: fn(),
 }
 
 impl Ordered for InitFunction {
@@ -70,7 +83,7 @@ pub static MAIN_LOOP_ENTER_FUNCTIONS: [InitFunction] = [..];
 pub static MAIN_LOOP_EXIT_FUNCTIONS: [InitFunction] = [..];
 
 #[linkme::distributed_slice]
-pub static MAIN_LOOP_CALLBACKS: [fn()] = [..];
+pub static MAIN_LOOP_CALLBACKS: [MainLoopCallback] = [..];
 
 #[linkme::distributed_slice]
 pub static WORKER_INIT_FUNCTIONS: [InitFunction] = [..];
@@ -126,17 +139,25 @@ pub fn topological_order<T: Ordered>(items: &[T]) -> Result<Vec<usize>, InitErro
 }
 
 fn dispatch_init(items: &[InitFunction], engine: &mut Engine) -> HammerResult<()> {
-    let order = topological_order(items)?;
+    let loaded = engine.loaded_plugins();
+    let filtered: Vec<InitFunction> =
+        crate::plugin::filter_by_plugin(items, loaded, |item| item.plugin)
+            .into_iter()
+            .copied()
+            .collect();
+    let order = topological_order(&filtered)?;
     for index in order {
-        (items[index].func)(engine)?;
+        (filtered[index].func)(engine)?;
     }
     Ok(())
 }
 
+/// Run init functions filtered by `engine.loaded_plugins()`.
 pub fn run_init_functions(engine: &mut Engine) -> HammerResult<()> {
     dispatch_init(&INIT_FUNCTIONS, engine)
 }
 
+/// Run worker-init functions filtered by `engine.loaded_plugins()`.
 pub fn run_worker_init_functions(engine: &mut Engine) -> HammerResult<()> {
     dispatch_init(&WORKER_INIT_FUNCTIONS, engine)
 }
@@ -158,6 +179,14 @@ pub fn run_config_functions(engine: &mut Engine, early: bool) -> HammerResult<()
     dispatch_init(functions, engine)
 }
 
+/// Dispatch main-loop callbacks owned by builtins or a loaded plugin.
+pub fn dispatch_main_loop_callbacks(loaded: &[&str]) {
+    for callback in crate::plugin::filter_by_plugin(&MAIN_LOOP_CALLBACKS[..], loaded, |c| c.plugin)
+    {
+        (callback.func)();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,6 +201,7 @@ mod tests {
         specs
             .iter()
             .map(|(name, after, before)| InitFunction {
+                plugin: None,
                 name,
                 runs_after: after,
                 runs_before: before,

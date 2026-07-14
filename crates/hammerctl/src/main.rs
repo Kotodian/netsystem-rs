@@ -1,9 +1,9 @@
 //! hammerctl — CLI client for hammer daemon
 
 use clap::{Parser, Subcommand};
+use hammer_infra::vec::Vec;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use hammer_infra::vec::Vec;
 
 #[derive(Parser, Debug)]
 #[command(

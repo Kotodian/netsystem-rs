@@ -32,10 +32,12 @@ use std::sync::Arc;
 
 use hammer_core::data_plane::BufferFrame;
 use hammer_core::error::{CoreError, CoreResult, HammerResult};
+use hammer_infra::vec::Vec;
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
 };
-use hammer_infra::vec::Vec;
+
+hammer_component_macros::declare_plugin!(name = "device", load_after = []);
 
 #[hammer_component_macros::node_next]
 pub enum DeviceInputNext {
@@ -53,6 +55,7 @@ pub enum DeviceInputNext {
     next = DeviceInputNext,
     kind = driver,
     state = disabled,
+    plugin = "device",
 )]
 #[derive(Debug, Clone, Copy)]
 pub struct DeviceInputNode;
@@ -182,10 +185,7 @@ impl DeviceMain {
     }
 }
 
-#[hammer_component_macros::init_function(
-    name = "device_init",
-    runs_after = ["interface_init"]
-)]
+#[hammer_component_macros::init_function(name = "device_init", plugin = "device")]
 fn init_device() -> HammerResult<Arc<DeviceMain>> {
     Ok(DeviceMain::new())
 }

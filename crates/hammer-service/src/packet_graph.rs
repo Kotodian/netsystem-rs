@@ -1,5 +1,4 @@
-//! Service packet graph: linkme `SERVICE_GRAPH_NODES` for graph registration.
-//! Control-plane init migrated to `#[init_function]` in the init system.
+//! Service packet graph: one global `GRAPH_NODES` catalog filtered by loaded plugins.
 
 use std::sync::Arc;
 
@@ -7,30 +6,23 @@ use hammer_component_macros::init_function;
 use hammer_core::config::Config;
 use hammer_core::data_plane::NodeHandle;
 use hammer_core::error::HammerResult;
-use hammer_runtime::Engine;
-use hammer_runtime::NodeEntry;
-#[cfg(test)]
 use hammer_infra::vec::Vec;
-
-#[linkme::distributed_slice]
-pub static SERVICE_GRAPH_NODES: [NodeEntry] = [..];
-
-#[linkme::distributed_slice]
-pub static TUN_GRAPH_NODES: [NodeEntry] = [..];
-
-#[linkme::distributed_slice]
-pub static TCP_WORKER_GRAPH_NODES: [NodeEntry] = [..];
+use hammer_runtime::{Engine, GRAPH_NODES, NodeEntry, filter_by_plugin};
 
 #[init_function(
     name = "install_packet_graph",
-    runs_after = ["memory_init", "device_init", "ip_init"]
+    runs_after = ["memory_init"]
 )]
 pub fn install_packet_graph(engine: &mut Engine, config: Arc<Config>) -> HammerResult<()> {
     let handle = NodeHandle::new(config.worker.handoff.node_handle);
     engine.runtime.set_handoff_node_handle(handle);
 
-    engine.runtime.init_graph(0, &SERVICE_GRAPH_NODES)?;
-    crate::net::wire_ip_lookup_drop(&engine.runtime)?;
+    let loaded = engine.loaded_plugins();
+    let filtered: Vec<NodeEntry> = filter_by_plugin(&GRAPH_NODES[..], loaded, |entry| entry.plugin)
+        .into_iter()
+        .copied()
+        .collect();
+    engine.runtime.init_graph(0, &filtered)?;
     Ok(())
 }
 
@@ -41,6 +33,20 @@ mod tests {
     use crate::tun::TunInputDriverNode;
     use hammer_core::data_plane::{NodeKind, NodeRegistration};
 
+    fn entry_by_name(name: &str) -> Option<(NodeKind, NodeRegistration, Option<&'static str>)> {
+        GRAPH_NODES
+            .iter()
+            .find(|entry| entry.registration.name() == Some(name))
+            .map(|entry| (entry.kind, entry.registration, entry.plugin))
+    }
+
+    fn graph_names() -> Vec<&'static str> {
+        GRAPH_NODES
+            .iter()
+            .filter_map(|entry| entry.registration.name())
+            .collect()
+    }
+
     #[test]
     fn device_input_family_uses_macro_generated_next_layout() {
         assert_eq!(DeviceInputNode::NODE_NEXT_COUNT, DeviceInputNext::COUNT);
@@ -48,19 +54,12 @@ mod tests {
     }
 
     #[test]
-    fn service_graph_declares_vpp_device_input_family() {
-        let entry = |entries: &[NodeEntry], name| {
-            entries
-                .iter()
-                .find(|entry| entry.registration.name() == Some(name))
-                .map(|entry| (entry.kind, entry.registration))
-        };
-
+    fn global_graph_declares_vpp_device_input_family() {
         assert_eq!(
             (
-                entry(&SERVICE_GRAPH_NODES, "device-input"),
-                entry(&TUN_GRAPH_NODES, "tun-input"),
-                entry(&TUN_GRAPH_NODES, "tun-output"),
+                entry_by_name("device-input").map(|(kind, registration, _)| (kind, registration)),
+                entry_by_name("tun-input").map(|(kind, registration, _)| (kind, registration)),
+                entry_by_name("tun-output").map(|(kind, registration, _)| (kind, registration)),
             ),
             (
                 Some((NodeKind::Driver, NodeRegistration::next("device-input", 3),)),
@@ -74,41 +73,15 @@ mod tests {
     }
 
     #[test]
-    fn tun_driver_nodes_are_loaded_only_with_the_tun_module() {
-        let service_names: Vec<&'static str> = SERVICE_GRAPH_NODES
-            .iter()
-            .filter_map(|entry| entry.registration.name())
-            .collect();
-        let tun_names: Vec<&'static str> = TUN_GRAPH_NODES
-            .iter()
-            .filter_map(|entry| entry.registration.name())
-            .collect();
-
-        assert!(service_names.contains(&"device-input"));
-        assert!(!service_names.contains(&"tun-input"));
-        assert!(!service_names.contains(&"tun-output"));
-        assert!(tun_names.contains(&"tun-input"));
-        assert!(tun_names.contains(&"tun-output"));
-    }
-
-    #[test]
-    fn service_graph_contains_tcp_nodes() {
-        let service_names: Vec<&'static str> = SERVICE_GRAPH_NODES
-            .iter()
-            .filter_map(|e| e.registration.name())
-            .collect();
-        for want in ["drop", "handoff", "ip-lookup"] {
-            assert!(
-                service_names.iter().any(|name| *name == want),
-                "missing {want}"
-            );
-        }
-
-        let tcp_names: Vec<&'static str> = TCP_WORKER_GRAPH_NODES
-            .iter()
-            .filter_map(|entry| entry.registration.name())
-            .collect();
+    fn global_graph_contains_service_tun_and_tcp_nodes() {
+        let names = graph_names();
         for want in [
+            "device-input",
+            "tun-input",
+            "tun-output",
+            "drop",
+            "handoff",
+            "ip-lookup",
             "tcp-input",
             "tcp-listen",
             "tcp-established",
@@ -117,19 +90,30 @@ mod tests {
             "tcp-output",
             "session-queue",
         ] {
-            assert!(tcp_names.iter().any(|name| *name == want), "missing {want}");
+            assert!(
+                names.iter().any(|name| *name == want),
+                "missing {want} in GRAPH_NODES"
+            );
         }
     }
 
     #[test]
-    fn subsystem_graph_slices_do_not_duplicate_service_registrations() {
-        for entry in TUN_GRAPH_NODES.iter().chain(TCP_WORKER_GRAPH_NODES.iter()) {
-            let name = entry.registration.name().expect("declared node name");
-            assert!(
-                SERVICE_GRAPH_NODES
-                    .iter()
-                    .all(|service| service.registration.name() != Some(name)),
-                "subsystem graph node {name} must not be in the service slice"
+    fn graph_node_entries_carry_plugin_owner_field() {
+        let owners = [
+            ("device-input", Some("device")),
+            ("tun-input", Some("tun")),
+            ("tun-output", Some("tun")),
+            ("ip-lookup", Some("ip")),
+            ("tcp-input", Some("tcp")),
+            ("session-queue", Some("session")),
+            ("drop", None),
+            ("handoff", None),
+        ];
+        for (name, plugin) in owners {
+            assert_eq!(
+                entry_by_name(name).map(|(_, _, owner)| owner),
+                Some(plugin),
+                "{name} plugin owner"
             );
         }
     }

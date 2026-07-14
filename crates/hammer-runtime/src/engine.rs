@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use hammer_core::config::Config;
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::registry::RuntimeRegistry;
 use hammer_runtime::DataPlaneRuntime;
@@ -17,6 +18,7 @@ thread_local! {
 pub(crate) struct EngineWorkerSeed<F> {
     runtime_seed: F,
     registry: Arc<RuntimeRegistry>,
+    loaded_plugins: Arc<[&'static str]>,
     wait_at_barrier: Arc<AtomicU32>,
     workers_at_barrier: Arc<AtomicU32>,
     main_loop_exit_now: Arc<AtomicBool>,
@@ -29,6 +31,8 @@ pub struct Engine {
     pub main_loop_count: AtomicU32,
     pub runtime: DataPlaneRuntime,
     pub registry: Arc<RuntimeRegistry>,
+    /// Plugins selected from `Config.plugins` against the compiled catalog.
+    loaded_plugins: Arc<[&'static str]>,
     pub wait_at_barrier: Arc<AtomicU32>,
     pub workers_at_barrier: Arc<AtomicU32>,
     pub main_loop_exit_now: Arc<AtomicBool>,
@@ -42,6 +46,7 @@ impl Engine {
     fn worker_with_runtime(
         runtime: DataPlaneRuntime,
         registry: Arc<RuntimeRegistry>,
+        loaded_plugins: Arc<[&'static str]>,
         wait_at_barrier: Arc<AtomicU32>,
         workers_at_barrier: Arc<AtomicU32>,
         main_loop_exit_now: Arc<AtomicBool>,
@@ -58,6 +63,7 @@ impl Engine {
             main_loop_count: AtomicU32::new(0),
             runtime,
             registry,
+            loaded_plugins,
             wait_at_barrier,
             workers_at_barrier,
             main_loop_exit_now,
@@ -74,6 +80,7 @@ impl Engine {
             main_loop_count: AtomicU32::new(0),
             runtime,
             registry,
+            loaded_plugins: Arc::from([]),
             wait_at_barrier: Arc::new(AtomicU32::new(0)),
             workers_at_barrier: Arc::new(AtomicU32::new(0)),
             main_loop_exit_now: Arc::new(AtomicBool::new(false)),
@@ -81,6 +88,24 @@ impl Engine {
             file_main: None,
             worker_threads: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Plugins selected at `main_loop_enter` (empty until selection runs).
+    #[inline]
+    pub fn loaded_plugins(&self) -> &[&'static str] {
+        &self.loaded_plugins
+    }
+
+    /// Validate `Config.plugins` and store the loaded set on this engine.
+    pub fn select_plugins_from_config(&mut self) -> HammerResult<()> {
+        let requested = self
+            .registry
+            .get::<Config>()
+            .map(|config| config.requested_plugins().to_vec())
+            .unwrap_or_default();
+        let loaded = crate::plugin::select_loaded_plugins(&requested)?;
+        self.loaded_plugins = Arc::from(loaded.as_slice());
+        Ok(())
     }
 
     pub fn spawn(&self, index: u32) -> HammerResult<Self> {
@@ -91,6 +116,7 @@ impl Engine {
         Self::worker_with_runtime(
             self.runtime.clone_for_worker(index, numa_node),
             Arc::clone(&self.registry),
+            Arc::clone(&self.loaded_plugins),
             Arc::clone(&self.wait_at_barrier),
             Arc::clone(&self.workers_at_barrier),
             Arc::clone(&self.main_loop_exit_now),
@@ -129,6 +155,7 @@ impl Engine {
                 runtime_seed.clone_for_worker(thread_index, numa_node)
             },
             registry: Arc::clone(&self.registry),
+            loaded_plugins: Arc::clone(&self.loaded_plugins),
             wait_at_barrier: Arc::clone(&self.wait_at_barrier),
             workers_at_barrier: Arc::clone(&self.workers_at_barrier),
             main_loop_exit_now: Arc::clone(&self.main_loop_exit_now),
@@ -215,6 +242,7 @@ where
         Engine::worker_with_runtime(
             runtime,
             Arc::clone(&self.registry),
+            Arc::clone(&self.loaded_plugins),
             Arc::clone(&self.wait_at_barrier),
             Arc::clone(&self.workers_at_barrier),
             Arc::clone(&self.main_loop_exit_now),
@@ -277,6 +305,7 @@ impl EnginePool {
 
     pub fn main_loop_enter(engine: &mut Engine) -> HammerResult<()> {
         engine.install_current();
+        engine.select_plugins_from_config()?;
         crate::init::run_config_functions(engine, true)?;
         crate::init::run_init_functions(engine)?;
         crate::init::run_config_functions(engine, false)?;

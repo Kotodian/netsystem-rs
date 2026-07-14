@@ -1,5 +1,8 @@
 pub use hammer_core::protocol::tcp::{TcpInputFlags, TcpSeq, TcpState};
 
+#[cfg(feature = "plugin-tcp")]
+hammer_component_macros::declare_plugin!(name = "tcp", load_after = ["session", "transport"]);
+
 use std::mem::transmute;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -191,7 +194,11 @@ pub fn init(reg: &RuntimeRegistry) -> HammerResult<()> {
     init_tcp(reg.require::<Config>()?)
 }
 
-#[hammer_component_macros::init_function(name = "tcp_init", runs_after = ["transport_init"])]
+#[hammer_component_macros::init_function(
+    name = "tcp_init",
+    plugin = "tcp",
+    runs_after = ["transport_init"]
+)]
 fn init_tcp(config: Arc<Config>) -> HammerResult<()> {
     let main = TcpMain::new();
     for entry in &config.network.tcp.listen {

@@ -12,7 +12,7 @@ path = "src/main.rs"
 hammer-runtime = { path = "../hammer-runtime" }
 hammer-infra = { path = "../hammer-infra" }
 hammer-ipc = { path = "../hammer-ipc" }
-hammer-service = { path = "../hammer-service" }
+hammer-service = { path = "../hammer-service", features = ["plugins-lab"] }
 hammer-core = { path = "../hammer-core" }
 hammer-component-macros = { path = "../hammer-component-macros" }
 clap = { workspace = true, features = ["derive"] }

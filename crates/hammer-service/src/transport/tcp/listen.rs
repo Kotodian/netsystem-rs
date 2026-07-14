@@ -17,7 +17,7 @@ use super::{
     write_session_route_opaque,
 };
 #[cfg(test)]
-use crate::net::NetworkOpaque;
+use crate::opaque::NetworkOpaque;
 use crate::session::SessionId;
 use crate::session::SessionQueueHandle;
 use crate::session::app::SessionAppRuntimeCreate;
@@ -41,6 +41,7 @@ pub enum TcpListenNext {
     name = "tcp-listen",
     next = TcpListenNext,
     role = internal,
+    plugin = "tcp",
 )]
 pub struct TcpListenNode<C: CongestionController + 'static, Seg: SessionSegment> {
     control: TcpInputControlPlane,

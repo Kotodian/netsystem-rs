@@ -28,7 +28,7 @@ use super::lookup::{
     TcpV4ListenerKey, TcpV6ListenerKey,
 };
 use super::{TcpInputNext, TcpWorker, write_session_route_opaque};
-use crate::net::NetworkOpaque;
+use crate::opaque::NetworkOpaque;
 use crate::session::app::SessionAppRuntimeCreate;
 use crate::session::runtime::SessionDriverRuntime;
 use crate::session::{SessionId, SessionQueueHandle};
@@ -151,6 +151,7 @@ impl TcpInputControlPlane {
     next = TcpInputNext,
     init = crate::transport::tcp::register_tcp_input,
     role = internal,
+    plugin = "tcp",
 )]
 pub struct TcpInputNode<C: CongestionController + 'static, Seg: SessionSegment> {
     #[node(default = register_tcp_input_runtime(snapshot.clone()))]
@@ -671,7 +672,7 @@ mod legacy_tests {
         NodeResult, NodeRuntimeData,
     };
 
-    use crate::net::NetworkOpaque;
+    use crate::opaque::NetworkOpaque;
     use crate::session::runtime::SessionDriverRuntime;
     use crate::session::{SessionId, SessionQueueHandle};
     use crate::transport::congestion::BbrController;
@@ -742,10 +743,8 @@ mod legacy_tests {
 
     impl InternalNode for SessionRouteProbeNode {}
 
-    fn session_route_probe_states()
-    -> &'static Mutex<Vec<Arc<Mutex<SessionRouteProbeState>>>> {
-        static STATES: OnceLock<Mutex<Vec<Arc<Mutex<SessionRouteProbeState>>>>> =
-            OnceLock::new();
+    fn session_route_probe_states() -> &'static Mutex<Vec<Arc<Mutex<SessionRouteProbeState>>>> {
+        static STATES: OnceLock<Mutex<Vec<Arc<Mutex<SessionRouteProbeState>>>>> = OnceLock::new();
         STATES.get_or_init(|| Mutex::new(Vec::new()))
     }
 

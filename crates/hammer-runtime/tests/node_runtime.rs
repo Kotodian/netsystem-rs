@@ -65,11 +65,13 @@ fn init_graph_registers_sibling_owner_before_sibling() {
     let runtime = test_runtime(64, 4, 2);
     let entries = [
         NodeEntry {
+            plugin: None,
             registration: NodeRegistration::sibling_of("init-graph-sibling", "init-graph-owner"),
             kind: NodeKind::Internal,
             init: init_graph_sibling,
         },
         NodeEntry {
+            plugin: None,
             registration: NodeRegistration::next("init-graph-owner", 0),
             kind: NodeKind::Internal,
             init: init_graph_owner,

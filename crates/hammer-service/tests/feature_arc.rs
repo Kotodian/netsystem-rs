@@ -4,6 +4,7 @@ use std::time::Duration;
 use hammer_core::config::Config;
 use hammer_core::data_plane::{BufferFrame, NodeRegistration};
 use hammer_core::error::CoreResult;
+use hammer_infra::vec::Vec;
 use hammer_runtime::{
     DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
 };
@@ -13,7 +14,6 @@ use hammer_service::data_plane::{
     FeatureArcStartNode, FeatureArcStartSlot, next_feature_frame,
 };
 use hammer_service::net::NetworkOpaque;
-use hammer_infra::vec::Vec;
 use std::mem::transmute;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

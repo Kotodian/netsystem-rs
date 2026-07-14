@@ -7,11 +7,11 @@ use hammer_runtime::{
 };
 
 use super::{TcpOutputError, read_tcp_egress_endpoints};
-use crate::net::NetworkOpaque;
-use std::mem::transmute;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use crate::opaque::NetworkOpaque;
 #[cfg(test)]
 use hammer_infra::vec::Vec;
+use std::mem::transmute;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 pub const DEFAULT_TCP_OUTPUT_PAYLOAD_LEN: usize = 1_440;
 pub const TCP_FLAG_FIN: u8 = 0x01;
 pub const TCP_FLAG_SYN: u8 = 0x02;
@@ -29,6 +29,7 @@ pub enum TcpOutputNext {
     graph = tcp_worker,
     init = crate::transport::tcp::output::register_tcp_output,
     next = TcpOutputNext,
+    plugin = "tcp",
 )]
 #[derive(Clone, Copy)]
 pub struct TcpOutputNode {

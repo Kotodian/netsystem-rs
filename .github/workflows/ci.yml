@@ -79,6 +79,13 @@ jobs:
           key: test-${{ matrix.platform }}
       - name: Run workspace tests [${{ matrix.platform }}]
         run: cargo test --workspace
+      - name: Plugin feature matrix smoke [${{ matrix.platform }}]
+        run: |
+          cargo check -p hammer-service --no-default-features
+          cargo check -p hammer-service --no-default-features --features plugin-device
+          cargo check -p hammer-service --features plugins-lab
+          cargo test -p hammer-runtime --test plugin_selection
+          cargo test -p hammer-core --test plugin_config
 
   bihash-read-scaling-linux:
     name: bihash read scaling [linux]

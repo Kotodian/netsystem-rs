@@ -15,8 +15,8 @@ use hammer_runtime::{
 };
 
 use crate::data_plane::set_index_node_error_code;
-use crate::net::NetworkOpaque;
 use crate::net::ip::{IpProtocol, IpVersion};
+use crate::opaque::NetworkOpaque;
 use crate::trace::codec::{
     TraceDecodeCursor, put_option_ip_protocol, put_option_ip_version, put_option_u16, put_u16,
 };

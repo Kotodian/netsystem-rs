@@ -20,11 +20,11 @@ use crate::trace::codec::{
     TraceDecodeCursor, put_option_ip_fragment_key, put_option_u16, put_option_u32, put_u8, put_u32,
 };
 
-use crate::net::NetworkOpaque;
 use crate::net::ip::{
     IpFragmentKey, IpProtocol, IpVersion, ParsedIpFragment, ip_header, network_for_protocol,
     parse_ip_fragment_with_chain_len,
 };
+use crate::opaque::NetworkOpaque;
 
 const IPV4_HEADER_MIN_LEN: usize = 20;
 const IPV6_HEADER_LEN: usize = 40;
@@ -1060,4 +1060,9 @@ fn expire_ip_reassembly_main_loop_callback() {
 }
 
 #[linkme::distributed_slice(hammer_runtime::init::MAIN_LOOP_CALLBACKS)]
-static EXPIRE_IP_REASSEMBLY: fn() = expire_ip_reassembly_main_loop_callback;
+static EXPIRE_IP_REASSEMBLY: hammer_runtime::init::MainLoopCallback =
+    hammer_runtime::init::MainLoopCallback {
+        plugin: Some("ip"),
+        name: "expire_ip_reassembly",
+        func: expire_ip_reassembly_main_loop_callback,
+    };

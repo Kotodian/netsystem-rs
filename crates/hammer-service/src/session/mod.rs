@@ -19,13 +19,16 @@ pub use id::SessionId;
 pub use node::{SESSION_QUEUE_IO_BUDGET, SessionQueueHandle, SessionQueueNext, SessionQueueNode};
 pub use runtime::SessionWorker;
 
-#[hammer_component_macros::config_function(name = "session_config")]
+hammer_component_macros::declare_plugin!(name = "session", load_after = ["transport"]);
+
+#[hammer_component_macros::config_function(name = "session_config", plugin = "session")]
 fn configure_session(config: Arc<Config>) -> HammerResult<Option<Arc<Session>>> {
     Ok(config.network.session.clone().map(Arc::new))
 }
 
 #[hammer_component_macros::config_function(
     name = "session_attach_config",
+    plugin = "session",
     runs_after = ["session_config"]
 )]
 fn configure_attach_server(

@@ -18,7 +18,7 @@ use hammer_runtime::{
 };
 
 use crate::data_plane::set_index_node_error_code;
-use crate::net::NetworkOpaque;
+use crate::opaque::NetworkOpaque;
 use crate::trace::codec::{
     TraceDecodeCursor, put_option_icmp_error_family, put_option_ip_version, put_option_u16,
     put_option_u32, put_option_usize, put_u8, put_u16,

@@ -249,7 +249,8 @@ mod tests {
 
     #[test]
     fn load_balance_rejects_bucket_count_that_exceeds_hot_path_index() {
-        let buckets = hammer_infra::vec![DpoId::drop(DpoProto::IP4, Next::A); u16::MAX as usize + 1];
+        let buckets =
+            hammer_infra::vec![DpoId::drop(DpoProto::IP4, Next::A); u16::MAX as usize + 1];
         let err = LoadBalance::try_new(DpoProto::IP4, buckets)
             .expect_err("oversized load-balance should be rejected");
 

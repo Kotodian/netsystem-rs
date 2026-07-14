@@ -1,9 +1,19 @@
 use hammer_core::config::parse_config;
+use hammer_infra::vec::Vec;
 
 #[derive(Debug, PartialEq, Eq, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, default)]
 struct TunConfig {
-    interface: Vec<String>,
+    #[serde(default, alias = "interface")]
+    interfaces: Vec<String>,
+}
+
+impl Default for TunConfig {
+    fn default() -> Self {
+        Self {
+            interfaces: Vec::new(),
+        }
+    }
 }
 
 #[test]
@@ -13,7 +23,7 @@ fn loaded_plugin_decodes_its_owned_config_section() {
 plugins = ["tun"]
 
 [plugin.tun]
-interface = ["utun"]
+interfaces = ["utun"]
 "#,
     )
     .expect("parse startup config");
@@ -25,7 +35,22 @@ interface = ["utun"]
     assert_eq!(
         tun,
         TunConfig {
-            interface: vec!["utun".to_owned()],
+            interfaces: hammer_infra::vec!["utun".to_owned()],
         }
     );
+}
+
+#[test]
+fn empty_plugin_section_decodes_to_zero_instances() {
+    let config = parse_config(
+        r#"
+plugins = ["tun"]
+"#,
+    )
+    .expect("parse startup config");
+
+    let tun = config
+        .plugin_config::<TunConfig>("tun")
+        .expect("decode empty TUN plugin config");
+    assert!(tun.interfaces.is_empty());
 }

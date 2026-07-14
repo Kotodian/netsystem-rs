@@ -31,6 +31,7 @@ pub enum TcpSynSentNext {
     name = "tcp-syn-sent",
     next = TcpSynSentNext,
     role = internal,
+    plugin = "tcp",
 )]
 pub struct TcpSynSentNode<C: CongestionController + 'static, Seg: SessionSegment> {
     session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
@@ -277,7 +278,7 @@ mod legacy_tests {
     use std::sync::{Arc, Mutex, OnceLock};
 
     use crate::data_plane::DropNode;
-    use crate::net::NetworkOpaque;
+    use crate::opaque::NetworkOpaque;
     use crate::session::SessionQueueHandle;
     use crate::session::runtime::SessionDriverRuntime;
     use crate::transport::congestion::BbrController;

@@ -3,7 +3,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const FORBIDDEN: &[&str] = &["std::vec::Vec", "std::vec!", "alloc::vec::Vec", "alloc::vec!"];
+const FORBIDDEN: &[&str] = &[
+    "std::vec::Vec",
+    "std::vec!",
+    "alloc::vec::Vec",
+    "alloc::vec!",
+];
 
 #[test]
 fn production_core_src_avoids_std_vec() {
@@ -33,7 +38,8 @@ fn collect_violations(dir: &Path, violations: &mut Vec<String>) {
         if name.contains("test") {
             continue;
         }
-        let text = fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
         for (line_no, line) in text.lines().enumerate() {
             let trimmed = line.trim_start();
             if trimmed.starts_with("//") {

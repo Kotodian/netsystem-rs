@@ -1,6 +1,6 @@
+use hammer_infra::vec::Vec;
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use hammer_infra::vec::Vec;
 
 #[cfg(feature = "amneziawg")]
 use boringtun::noise::AmneziaConfig;

@@ -4,7 +4,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
 use hammer_core::config::Config;
-use hammer_core::config::network::{Interface, InterfaceDriver};
+use hammer_core::config::network::Interface;
 use hammer_core::data_plane::{
     BufferFrame, BufferRef, DEFAULT_BUFFER_FRAME_CAPACITY, NodeId, NodeState,
 };
@@ -16,9 +16,22 @@ use hammer_runtime::{
 
 use crate::device::{DeviceInputNext, DeviceInputNode, DeviceMain, DeviceRxQueue};
 use crate::interface::InterfaceControlPlane;
-use crate::net::NetworkOpaque;
+use crate::opaque::NetworkOpaque;
 use hammer_infra::vec::Vec;
 
+// External `mod tun;` cannot receive ownership injection from `#[plugin]`.
+hammer_component_macros::declare_plugin!(name = "tun", load_after = ["device", "interface"]);
+
+/// TUN-owned instance list under `[plugin.tun]`.
+///
+/// Names reference `[[network.interface]]` entries registered by the interface
+/// plugin (L3/FIB). This plugin opens fds/queues for those instances only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields, default)]
+struct TunPluginConfig {
+    #[serde(default, alias = "interface")]
+    interfaces: Vec<String>,
+}
 #[cfg(target_os = "macos")]
 mod darwin;
 #[cfg(target_os = "macos")]
@@ -129,45 +142,38 @@ impl TunControl {
     }
 }
 
-#[hammer_component_macros::config_function(name = "tun_config")]
+#[hammer_component_macros::config_function(name = "tun_config", plugin = "tun")]
 fn configure_tun(
-    engine: &mut hammer_runtime::Engine,
     config: Arc<Config>,
     device_main: Arc<DeviceMain>,
     interface_main: Arc<InterfaceControlPlane>,
-) -> HammerResult<Option<Arc<TunControl>>> {
-    let mut interfaces = config
-        .network
-        .interface
-        .iter()
-        .filter(|interface| interface.driver == InterfaceDriver::Tun);
-    let Some(interface) = interfaces.next() else {
-        return Ok(None);
-    };
-
-    engine
-        .runtime
-        .init_graph(0, &crate::packet_graph::TUN_GRAPH_NODES)?;
+) -> HammerResult<Arc<TunControl>> {
+    let tun_cfg = config.plugin_config::<TunPluginConfig>("tun")?;
     let control = TunControl::new(device_main);
-    let interface_index = interface_main
-        .handle()
-        .interface_index(&interface.name)
-        .ok_or_else(|| HammerError::internal("TUN interface is not registered"))?;
-    control.add_interface(interface, interface_index, config.worker.count)?;
-    for interface in interfaces {
+    for name in &tun_cfg.interfaces {
+        let interface = config
+            .network
+            .interface
+            .iter()
+            .find(|interface| interface.name == *name)
+            .ok_or_else(|| {
+                HammerError::config_validation(format!(
+                    "plugin.tun interface `{name}` is not declared in [[network.interface]]"
+                ))
+            })?;
         let interface_index = interface_main
             .handle()
             .interface_index(&interface.name)
             .ok_or_else(|| HammerError::internal("TUN interface is not registered"))?;
         control.add_interface(interface, interface_index, config.worker.count)?;
     }
-    Ok(Some(control))
+    Ok(control)
 }
 
-#[hammer_component_macros::worker_init_function(name = "tun_worker_init")]
+#[hammer_component_macros::worker_init_function(name = "tun_worker_init", plugin = "tun")]
 fn configure_tun_worker(
     engine: &mut hammer_runtime::Engine,
-    #[inject(optional)] control: Arc<TunControl>,
+    control: Arc<TunControl>,
 ) -> HammerResult<()> {
     let worker = engine.data_worker_id()?;
     let runtime = control.take_worker_runtime(worker)?;
@@ -216,6 +222,7 @@ fn schedule_tun_input(file: &mut File) -> HammerResult<()> {
     kind = driver,
     state = disabled,
     sibling_of = DeviceInputNode,
+    plugin = "tun",
 )]
 #[derive(Debug, Clone, Copy)]
 pub struct TunInputDriverNode;
@@ -241,6 +248,7 @@ impl Node for TunInputDriverNode {
     graph = tun,
     name = "tun-output",
     kind = internal,
+    plugin = "tun",
 )]
 #[derive(Debug, Clone, Copy)]
 pub struct TunOutputDriverNode;

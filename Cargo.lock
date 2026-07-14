@@ -810,6 +810,7 @@ dependencies = [
  "libc",
  "linkme",
  "nom",
+ "serde",
  "smoltcp",
  "thiserror",
  "tokio",

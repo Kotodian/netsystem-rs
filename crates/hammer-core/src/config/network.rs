@@ -577,8 +577,6 @@ impl SessionBuffer {
 #[serde(deny_unknown_fields)]
 pub struct Interface {
     pub name: String,
-    #[serde(default = "InterfaceDriver::default")]
-    pub driver: InterfaceDriver,
     /// Local interface addresses in CIDR form, e.g. `10.0.0.1/24`.
     /// Each address auto-derives two FIB entries (VPP adjacency-source
     /// semantics): the containing subnet → glean adjacency out of this
@@ -588,18 +586,6 @@ pub struct Interface {
     pub address: Vec<IpNet>,
     #[serde(default = "InterfaceMtu::default")]
     pub mtu: InterfaceMtu,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum InterfaceDriver {
-    Tun,
-}
-
-impl Default for InterfaceDriver {
-    fn default() -> Self {
-        Self::Tun
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -704,7 +690,6 @@ mod tests {
 
             [[interface]]
             name = "tun0"
-            driver = "tun"
             [interface.mtu]
             l3 = 1500
             ip4 = 1500
@@ -727,7 +712,6 @@ mod tests {
         assert_eq!(session.buffer.slots, 4);
         assert_eq!(network.interface.len(), 1);
         assert_eq!(network.interface[0].name, "tun0");
-        assert_eq!(network.interface[0].driver, InterfaceDriver::Tun);
         assert_eq!(network.interface[0].mtu.l3, 1500);
     }
 
@@ -751,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_network_rejects_unknown_driver() {
+    fn parse_network_rejects_unknown_interface_field() {
         let err = toml::from_str::<Network>(
             r#"
             [[interface]]
@@ -759,8 +743,8 @@ mod tests {
             driver = "wireguard"
             "#,
         )
-        .expect_err("parse should reject unknown enum variant");
-        assert!(err.to_string().contains("wireguard"));
+        .expect_err("parse should reject unknown interface fields");
+        assert!(err.to_string().contains("driver") || err.to_string().contains("unknown"));
     }
 
     #[test]

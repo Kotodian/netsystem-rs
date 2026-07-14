@@ -15,7 +15,7 @@ use hammer_core::error::{CoreError, CoreResult};
 use hammer_runtime::node::NodeRuntime;
 use hammer_runtime::{DataPlaneBarrierHandle, DataPlaneRuntime, NodeResult};
 
-use crate::net::NetworkOpaque;
+use crate::opaque::NetworkOpaque;
 use hammer_infra::vec::Vec;
 
 pub struct FeatureArc<A: FeatureArcSpec> {

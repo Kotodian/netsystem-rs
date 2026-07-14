@@ -30,6 +30,7 @@ pub enum TcpRcvProcessNext {
     name = "tcp-rcv-process",
     next = TcpRcvProcessNext,
     role = internal,
+    plugin = "tcp",
 )]
 pub struct TcpRcvProcessNode<C: CongestionController + 'static, Seg: SessionSegment> {
     session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
@@ -266,7 +267,7 @@ mod tests {
 
     use super::*;
     use crate::data_plane::DropNode;
-    use crate::net::NetworkOpaque;
+    use crate::opaque::NetworkOpaque;
     use crate::session::runtime::SessionDriverRuntime;
     use crate::session::{SessionId, SessionQueueHandle};
     use crate::transport::congestion::BbrController;
@@ -576,11 +577,7 @@ mod tests {
         Ok(packet)
     }
 
-    fn control_packet(
-        sequence: u32,
-        acknowledgment: u32,
-        flags: TcpSegmentFlags,
-    ) -> Vec<u8> {
+    fn control_packet(sequence: u32, acknowledgment: u32, flags: TcpSegmentFlags) -> Vec<u8> {
         tcp_ipv4_packet(
             remote_addr(),
             local_addr(),

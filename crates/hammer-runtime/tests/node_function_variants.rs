@@ -2,17 +2,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use hammer_core::config::Config;
 use hammer_core::data_plane::{BufferFrame, DataPlaneBufferConfig};
+use hammer_infra::vec::Vec;
 use hammer_runtime::{
-    DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig, Node, NodeResult,
-    NodeRuntimeData, spawn::DataRuntime,
+    DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig, GRAPH_NODES, Node,
+    NodeResult, NodeRuntimeData, filter_by_plugin, spawn::DataRuntime,
 };
-
-mod packet_graph {
-    use hammer_runtime::NodeEntry;
-
-    #[linkme::distributed_slice]
-    pub static MULTIARCH_GRAPH_NODES: [NodeEntry] = [..];
-}
 
 static DISPATCH_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -41,6 +35,14 @@ fn multiarch_process(_: &DataPlaneRuntime, _: NodeRuntimeData, _: &mut BufferFra
     NodeResult::drop()
 }
 
+fn multiarch_entries() -> Vec<hammer_runtime::NodeEntry> {
+    filter_by_plugin(&GRAPH_NODES[..], &[], |_| None)
+        .into_iter()
+        .filter(|entry| entry.registration.name() == Some("multiarch-fixture"))
+        .copied()
+        .collect()
+}
+
 #[test]
 fn node_function_selection_changes_dispatch_without_changing_topology() {
     let runtime_config = DataPlaneRuntimeConfig {
@@ -51,12 +53,13 @@ fn node_function_selection_changes_dispatch_without_changing_topology() {
             ..DataPlaneBufferConfig::default()
         },
     };
+    let entries = multiarch_entries();
     let scalar = DataPlaneRuntime::new_with_instruction_set(
         runtime_config.clone(),
         DataPlaneInstructionSet::Scalar,
     );
     scalar
-        .init_graph(0, &packet_graph::MULTIARCH_GRAPH_NODES)
+        .init_graph(0, &entries)
         .expect("initialize scalar graph");
     let scalar_node = scalar
         .node_by_name(MultiarchNode::NODE_NAME)
@@ -88,7 +91,7 @@ fn node_function_selection_changes_dispatch_without_changing_topology() {
         DataPlaneInstructionSet::native(),
     );
     native
-        .init_graph(0, &packet_graph::MULTIARCH_GRAPH_NODES)
+        .init_graph(0, &entries)
         .expect("initialize native graph");
     let native_node = native
         .node_by_name(MultiarchNode::NODE_NAME)

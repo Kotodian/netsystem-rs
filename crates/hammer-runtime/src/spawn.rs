@@ -45,11 +45,11 @@ use hammer_runtime::{TraceControlHandle, TraceRecordSink};
 use crate::data_plane::{RuntimeDataPlaneRuntime, new_worker_runtime};
 use crate::worker_thread::apply_worker_thread_setup;
 use hammer_core::error::{HammerError, HammerResult};
+use hammer_infra::vec::Vec;
 use hammer_runtime::DataPlaneRuntime;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle as TokioJoinHandle;
 use tracing::instrument::WithSubscriber;
-use hammer_infra::vec::Vec;
 
 #[derive(Clone)]
 pub struct DataRuntimeContext {

@@ -1,7 +1,9 @@
 pub mod ip;
 mod lookup;
-mod opaque;
 
+hammer_component_macros::declare_plugin!(name = "ip", load_after = ["interface"]);
+
+pub use crate::opaque::{ForwardingMetadata, IpEcnCodepoint, NetworkOpaque, TapEthernetMetadata};
 pub use ip::{
     IcmpEchoRequestNext, IcmpEchoRequestNode, IcmpEchoRequestTrace, IcmpErrorNext, IcmpErrorNode,
     IcmpErrorSourceTable, IcmpErrorSourceTableHandle, IcmpErrorTrace, IcmpInputControlPlane,
@@ -23,7 +25,6 @@ pub use lookup::{
 };
 
 pub(crate) use lookup::wire_ip_lookup_drop;
-pub use opaque::{ForwardingMetadata, IpEcnCodepoint, NetworkOpaque, TapEthernetMetadata};
 
 #[cfg(test)]
 pub(crate) fn reset_ip_main_for_test() {

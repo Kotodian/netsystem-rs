@@ -1,6 +1,6 @@
 use hammer_component_macros::ipc_handler;
-use hammer_runtime::engine::Engine;
 use hammer_infra::vec::Vec;
+use hammer_runtime::engine::Engine;
 
 #[ipc_handler(name = "ping")]
 fn handle_ping(_engine: &mut Engine, _request: &[u8]) -> Vec<u8> {

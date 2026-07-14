@@ -49,7 +49,7 @@ pub fn engine_main_loop(
         barrier::barrier_check(&wait, &workers);
 
         // Step 2: Main-loop callbacks
-        dispatch_main_loop_callbacks();
+        crate::init::dispatch_main_loop_callbacks(engine.loaded_plugins());
 
         // Step 3: Poll worker-local File readiness before graph dispatch.
         match engine.file_main_mut().and_then(|files| files.poll()) {
@@ -110,13 +110,6 @@ pub fn engine_main_loop(
                 .expect("engine_main_loop: poisoned exit status mutex");
             return status;
         }
-    }
-}
-
-/// Dispatch main-loop callbacks registered via `MAIN_LOOP_CALLBACKS`.
-pub(crate) fn dispatch_main_loop_callbacks() {
-    for callback in crate::init::MAIN_LOOP_CALLBACKS.iter() {
-        callback();
     }
 }
 

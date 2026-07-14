@@ -10,6 +10,8 @@ pub mod congestion;
 pub mod tcp;
 pub mod udp;
 
+hammer_component_macros::declare_plugin!(name = "transport", load_after = ["ip"]);
+
 use tcp::TcpPolicy;
 
 pub struct TransportMain {
@@ -79,7 +81,7 @@ pub fn init(reg: &RuntimeRegistry) -> HammerResult<()> {
     init_transport(reg.require::<hammer_core::config::Config>()?)
 }
 
-#[hammer_component_macros::init_function(name = "transport_init")]
+#[hammer_component_macros::init_function(name = "transport_init", plugin = "transport")]
 fn init_transport(config: Arc<hammer_core::config::Config>) -> HammerResult<()> {
     let session_backend = config
         .network

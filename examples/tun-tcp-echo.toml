@@ -1,6 +1,17 @@
 # Tun TCP Lab — VPP-shaped, config-driven (no ops CLI).
 # Address plan avoids LAN 192.168.1.0/24 and Fake-IP 198.18.0.0/15.
 
+plugins = [
+  "device",
+  "interface",
+  "tun",
+  "ip",
+  "transport",
+  "session",
+  "tcp",
+  "udp",
+]
+
 [log]
 level = "debug"
 
@@ -53,7 +64,6 @@ address = "10.66.77.1:7300"
 
 [[network.interface]]
 name = "utun"
-driver = "tun"
 address = ["10.66.77.1/30"]
 
 [network.interface.mtu]
@@ -61,6 +71,9 @@ l3 = 1500
 ip4 = 1500
 ip6 = 1500
 mpls = 1500
+
+[plugin.tun]
+interfaces = ["utun"]
 
 [[network.route]]
 prefix = "10.66.77.0/30"

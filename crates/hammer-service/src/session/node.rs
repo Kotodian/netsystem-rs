@@ -165,6 +165,7 @@ struct SessionQueueAttachment {
     init = crate::session::node::register_session_queue_node,
     name = "session-queue",
     kind = driver,
+    plugin = "session",
 )]
 #[derive(Clone)]
 pub struct SessionQueueNode {

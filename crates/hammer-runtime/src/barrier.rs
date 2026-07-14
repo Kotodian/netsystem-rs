@@ -1,8 +1,8 @@
 use core::hint::spin_loop;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(test)]
 use hammer_infra::vec::Vec;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// RAII guard that releases the barrier when dropped.
 /// The control thread holds this while mutating shared state.

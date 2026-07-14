@@ -1,8 +1,8 @@
 //! Message framing: [u32 BE length][payload]
 //! Error types for the IPC layer.
 
-use std::io::{Read, Write};
 use hammer_infra::vec::Vec;
+use std::io::{Read, Write};
 
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024; // 16 MB
 const MAX_FRAME_SIZE_STR: &str = "16 MB";

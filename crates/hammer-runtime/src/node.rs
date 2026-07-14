@@ -295,12 +295,19 @@ pub trait InternalNode {
 ///
 /// `Copy` so linkme `distributed_slice` `[..]` catch-all can collect struct
 /// literals emitted by `#[graph_node]` across crates.
+///
+/// `plugin: None` marks a runtime builtin; plugin-owned nodes set `Some(name)`.
 #[derive(Clone, Copy)]
 pub struct NodeEntry {
+    pub plugin: Option<&'static str>,
     pub registration: NodeRegistration,
     pub kind: NodeKind,
     pub init: fn(&DataPlaneRuntime, usize) -> CoreResult<NodeId>,
 }
+
+/// Global graph-node catalog (replaces per-subsystem `*_GRAPH_NODES` slices).
+#[linkme::distributed_slice]
+pub static GRAPH_NODES: [NodeEntry] = [..];
 
 #[derive(Debug, Clone, Copy)]
 pub enum NoopNode {}

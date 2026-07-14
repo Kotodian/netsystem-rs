@@ -8,6 +8,7 @@ pub mod barrier;
 pub mod init;
 pub mod main_loop;
 pub mod memory;
+pub mod plugin;
 
 pub use hammer_core::error::{HammerError, HammerResult};
 pub use hammer_core::protocol::icmp::IcmpErrorMetadata;
@@ -25,11 +26,16 @@ pub mod node;
 pub mod trace;
 pub use data_plane::{DataPlaneRuntime, DataPlaneRuntimeConfig, new_worker_runtime};
 pub use handoff::{DataPlaneHandoff, DataPlaneHandoffWorker, DataWorkerId};
+pub use init::MainLoopCallback;
 pub use instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
 pub use node::{
-    DriverNode, InternalNode, Node, NodeDescriptor, NodeEntry, NodeErrorCounters, NodeProcessFn,
-    NodeResult, NodeRuntime, NodeRuntimeData, NodeRuntimeReady, NodeRuntimeStatsRow, NoopNode,
-    default_prefetch_indices,
+    DriverNode, GRAPH_NODES, InternalNode, Node, NodeDescriptor, NodeEntry, NodeErrorCounters,
+    NodeProcessFn, NodeResult, NodeRuntime, NodeRuntimeData, NodeRuntimeReady, NodeRuntimeStatsRow,
+    NoopNode, default_prefetch_indices,
+};
+pub use plugin::{
+    PLUGIN_REGISTRATIONS, PluginError, PluginRegistration, compiled_plugin_names, filter_by_plugin,
+    select_loaded_plugins, select_loaded_plugins_from,
 };
 pub use trace::{
     PacketTrace, TraceControlHandle, TraceControlPlane, TraceEntry, TraceFormatter,

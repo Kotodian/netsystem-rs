@@ -192,7 +192,6 @@ mod tests {
             r#"
             [[network.interface]]
             name = "tun0"
-            driver = "tun"
             address = ["10.0.0.1/24"]
             "#,
         )

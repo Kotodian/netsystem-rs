@@ -4,9 +4,9 @@ use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{
     Attribute, Error, Expr, ExprPath, Field, Fields, FieldsNamed, FnArg, GenericArgument,
-    GenericParam, Generics, Ident, Item, ItemEnum, ItemFn, ItemStruct, LitBool, LitStr, Path,
-    PathArguments, Result, ReturnType, Token, Type, bracketed, parenthesized, parse_macro_input,
-    parse_quote, spanned::Spanned,
+    GenericParam, Generics, Ident, Item, ItemEnum, ItemFn, ItemMod, ItemStruct, LitBool, LitStr,
+    Meta, Path, PathArguments, Result, ReturnType, Token, Type, bracketed, parenthesized,
+    parse_macro_input, parse_quote, spanned::Spanned,
 };
 
 struct NodeFunctionArgs {
@@ -1247,10 +1247,12 @@ fn to_snake_case(input: &str) -> String {
 }
 
 struct GraphNodeArgs {
-    graph: Ident,
+    /// Deprecated: ignored for slice targeting; kept for source/symbol naming compat.
+    graph: Option<Ident>,
     init: Option<Path>,
     kind: Option<Ident>,
     name: Option<LitStr>,
+    plugin: Option<LitStr>,
     next: Option<Path>,
     role: Option<NodeRole>,
     state: Option<GraphNodeState>,
@@ -1262,10 +1264,11 @@ struct GraphNodeArgs {
 impl Default for GraphNodeArgs {
     fn default() -> Self {
         Self {
-            graph: Ident::new("_", Span::call_site()),
+            graph: None,
             init: None,
             kind: None,
             name: None,
+            plugin: None,
             next: None,
             role: None,
             state: None,
@@ -1291,8 +1294,14 @@ impl Parse for GraphNodeArgs {
                 _ => {
                     input.parse::<Token![=]>()?;
                     match key.to_string().as_str() {
-                        "graph" => args.graph = input.parse()?,
+                        "graph" => args.graph = Some(input.parse()?),
                         "init" => args.init = Some(input.parse()?),
+                        "plugin" => {
+                            if args.plugin.is_some() {
+                                return Err(Error::new(key.span(), "duplicate `plugin` argument"));
+                            }
+                            args.plugin = Some(input.parse()?);
+                        }
                         "kind" => {
                             let kind: Ident = input.parse()?;
                             args.kind = Some(match kind.to_string().as_str() {
@@ -1368,7 +1377,7 @@ impl Parse for GraphNodeArgs {
                             return Err(Error::new(
                                 key.span(),
                                 format!(
-                                    "unknown `graph_node` argument `{other}`; expected `graph`, `init`, `kind`, `name`, `next`, `role`, `state`, `next_node`, `sibling_of`, or `start_arc`"
+                                    "unknown `graph_node` argument `{other}`; expected `graph`, `init`, `plugin`, `kind`, `name`, `next`, `role`, `state`, `next_node`, `sibling_of`, or `start_arc`"
                                 ),
                             ));
                         }
@@ -1378,9 +1387,6 @@ impl Parse for GraphNodeArgs {
             if input.parse::<Option<Token![,]>>()?.is_none() {
                 break;
             }
-        }
-        if args.graph == Ident::new("_", Span::call_site()) {
-            return Err(Error::new(Span::call_site(), "missing `graph` argument"));
         }
         if args.init.is_none() {
             match args.kind.as_ref().map(ToString::to_string).as_deref() {
@@ -1424,11 +1430,6 @@ impl Parse for GraphNodeArgs {
         }
         Ok(args)
     }
-}
-
-fn graph_slice_path(graph: &Ident) -> Path {
-    let slice = format_ident!("{}_GRAPH_NODES", graph.to_string().to_ascii_uppercase());
-    parse_quote!(crate::packet_graph::#slice)
 }
 
 fn graph_node_registration(
@@ -1503,9 +1504,14 @@ fn generated_graph_node_init(
         ));
     }
 
+    let graph_label = args
+        .graph
+        .as_ref()
+        .map(|graph| graph.to_string().to_ascii_lowercase())
+        .unwrap_or_else(|| "graph".to_owned());
     let init_ident = format_ident!(
         "__{}_graph_node_{}_init",
-        args.graph.to_string().to_ascii_lowercase(),
+        graph_label,
         to_snake_case(&ident.to_string()),
     );
     let constructor = if let Some(next) = &args.next {
@@ -1554,13 +1560,13 @@ fn generated_graph_node_init(
 
 /// Registers a struct as a graph node via linkme `NodeEntry`.
 ///
-/// Emits a `NodeEntry` collected into the `{graph}_GRAPH_NODES` linkme slice.
+/// Emits a `NodeEntry` into the global `::hammer_runtime::GRAPH_NODES` catalog.
 /// A zero-state `kind = driver|internal` unit node receives a generated init.
 /// Nodes with business state supply `init = path`. `DataPlaneRuntime::init_graph`
-/// walks the slice and resolves named next-node arcs after registration.
+/// walks the filtered catalog and resolves named next-node arcs after registration.
 /// ```ignore
-/// #[hammer_component_macros::graph_node(graph = service, init = my::register_foo)]
-/// pub struct FooNode;
+/// #[hammer_component_macros::graph_node(kind = driver, name = "device-input", next = DeviceInputNext)]
+/// pub struct DeviceInputNode;
 /// ```
 #[proc_macro_attribute]
 pub fn graph_node(args: TokenStream, input: TokenStream) -> TokenStream {
@@ -1579,11 +1585,22 @@ pub fn graph_node(args: TokenStream, input: TokenStream) -> TokenStream {
         .into()
 }
 
+fn plugin_option_tokens(plugin: Option<&LitStr>) -> TokenStream2 {
+    match plugin {
+        Some(name) => quote!(::core::option::Option::Some(#name)),
+        None => quote!(::core::option::Option::None),
+    }
+}
+
 fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<TokenStream2> {
-    let graph_slice = graph_slice_path(&args.graph);
+    let graph_label = args
+        .graph
+        .as_ref()
+        .map(|graph| graph.to_string().to_ascii_uppercase())
+        .unwrap_or_else(|| "GRAPH".to_owned());
     let static_ident = format_ident!(
         "__{}_GRAPH_NODE_{}",
-        args.graph.to_string().to_ascii_uppercase(),
+        graph_label,
         to_snake_case(&ident.to_string()).to_ascii_uppercase()
     );
     let node_kind = graph_node_kind_expr(args.kind.as_ref());
@@ -1594,6 +1611,7 @@ fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<T
     };
     let node_registration =
         graph_node_registration(&node_name, args.next.as_ref(), args.sibling_of.as_ref());
+    let plugin = plugin_option_tokens(args.plugin.as_ref());
     let generated_role = if args.init.is_none() {
         Some(graph_node_role_from_kind(args.kind.as_ref())?)
     } else {
@@ -1617,8 +1635,9 @@ fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<T
     };
 
     let registration = quote! {
-        #[::linkme::distributed_slice(#graph_slice)]
+        #[::linkme::distributed_slice(::hammer_runtime::GRAPH_NODES)]
         static #static_ident: ::hammer_runtime::NodeEntry = ::hammer_runtime::NodeEntry {
+            plugin: #plugin,
             registration: #node_registration,
             kind: #node_kind,
             init: #init,
@@ -1676,6 +1695,7 @@ fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<T
 
 struct InitFnArgs {
     name: LitStr,
+    plugin: Option<LitStr>,
     runs_before: Vec<LitStr>,
     runs_after: Vec<LitStr>,
 }
@@ -1683,6 +1703,7 @@ struct InitFnArgs {
 impl Parse for InitFnArgs {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let mut name = None;
+        let mut plugin = None;
         let mut runs_before = Vec::new();
         let mut runs_after = Vec::new();
         while !input.is_empty() {
@@ -1695,13 +1716,19 @@ impl Parse for InitFnArgs {
                     }
                     name = Some(input.parse()?);
                 }
+                "plugin" => {
+                    if plugin.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `plugin` argument"));
+                    }
+                    plugin = Some(input.parse()?);
+                }
                 "runs_before" => runs_before = parse_litstr_array(input)?,
                 "runs_after" => runs_after = parse_litstr_array(input)?,
                 other => {
                     return Err(Error::new(
                         key.span(),
                         format!(
-                            "unknown argument `{other}`; expected `name`, `runs_before`, or `runs_after`"
+                            "unknown argument `{other}`; expected `name`, `plugin`, `runs_before`, or `runs_after`"
                         ),
                     ));
                 }
@@ -1712,6 +1739,7 @@ impl Parse for InitFnArgs {
         }
         Ok(Self {
             name: name.ok_or_else(|| Error::new(Span::call_site(), "missing `name` argument"))?,
+            plugin,
             runs_before,
             runs_after,
         })
@@ -1726,6 +1754,7 @@ struct ConfigFnArgs {
 impl Parse for ConfigFnArgs {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let mut name = None;
+        let mut plugin = None;
         let mut early = None;
         let mut runs_before = Vec::new();
         let mut runs_after = Vec::new();
@@ -1739,6 +1768,12 @@ impl Parse for ConfigFnArgs {
                     }
                     name = Some(input.parse()?);
                 }
+                "plugin" => {
+                    if plugin.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `plugin` argument"));
+                    }
+                    plugin = Some(input.parse()?);
+                }
                 "runs_before" => runs_before = parse_litstr_array(input)?,
                 "runs_after" => runs_after = parse_litstr_array(input)?,
                 "early" => {
@@ -1751,7 +1786,7 @@ impl Parse for ConfigFnArgs {
                     return Err(Error::new(
                         key.span(),
                         format!(
-                            "unknown argument `{other}`; expected `name`, `early`, `runs_before`, or `runs_after`"
+                            "unknown argument `{other}`; expected `name`, `plugin`, `early`, `runs_before`, or `runs_after`"
                         ),
                     ));
                 }
@@ -1764,6 +1799,7 @@ impl Parse for ConfigFnArgs {
             init: InitFnArgs {
                 name: name
                     .ok_or_else(|| Error::new(Span::call_site(), "missing `name` argument"))?,
+                plugin,
                 runs_before,
                 runs_after,
             },
@@ -1843,6 +1879,7 @@ fn expand_registered_function(
     let function_name = &function.sig.ident;
     let adapter_name = format_ident!("__hammer_init_adapter_{}", function_name);
     let name = args.name;
+    let plugin = plugin_option_tokens(args.plugin.as_ref());
     let runs_before = args.runs_before;
     let runs_after = args.runs_after;
     let static_ident = init_function_static_name(&name);
@@ -1906,6 +1943,7 @@ fn expand_registered_function(
         #(#registration_attributes)*
         #[::linkme::distributed_slice(#slice)]
         static #static_ident: ::hammer_runtime::init::InitFunction = ::hammer_runtime::init::InitFunction {
+            plugin: #plugin,
             name: #name,
             runs_before: &[#(#runs_before),*],
             runs_after: &[#(#runs_after),*],
@@ -2111,17 +2149,14 @@ pub fn early_config_function(args: TokenStream, input: TokenStream) -> TokenStre
 /// ```
 #[proc_macro_attribute]
 pub fn main_loop_enter_function(args: TokenStream, input: TokenStream) -> TokenStream {
-    if !args.is_empty() {
-        return Error::new(
-            Span::call_site(),
-            "`main_loop_enter_function` does not accept arguments",
-        )
-        .to_compile_error()
-        .into();
-    }
+    let plugin = match parse_optional_plugin_only_args(args) {
+        Ok(plugin) => plugin,
+        Err(error) => return error.to_compile_error().into(),
+    };
     let fn_item = parse_macro_input!(input as syn::ItemFn);
     expand_main_loop_function(
         fn_item,
+        plugin,
         quote!(::hammer_runtime::init::MAIN_LOOP_ENTER_FUNCTIONS),
     )
     .unwrap_or_else(Error::into_compile_error)
@@ -2131,28 +2166,69 @@ pub fn main_loop_enter_function(args: TokenStream, input: TokenStream) -> TokenS
 /// Registers a function to run at main-loop-exit time.
 #[proc_macro_attribute]
 pub fn main_loop_exit_function(args: TokenStream, input: TokenStream) -> TokenStream {
-    if !args.is_empty() {
-        return Error::new(
-            Span::call_site(),
-            "`main_loop_exit_function` does not accept arguments",
-        )
-        .to_compile_error()
-        .into();
-    }
+    let plugin = match parse_optional_plugin_only_args(args) {
+        Ok(plugin) => plugin,
+        Err(error) => return error.to_compile_error().into(),
+    };
     let fn_item = parse_macro_input!(input as syn::ItemFn);
     expand_main_loop_function(
         fn_item,
+        plugin,
         quote!(::hammer_runtime::init::MAIN_LOOP_EXIT_FUNCTIONS),
     )
     .unwrap_or_else(Error::into_compile_error)
     .into()
 }
 
-fn expand_main_loop_function(function: ItemFn, slice: TokenStream2) -> Result<TokenStream2> {
+fn parse_optional_plugin_only_args(args: TokenStream) -> Result<Option<LitStr>> {
+    if args.is_empty() {
+        return Ok(None);
+    }
+    syn::parse::<OptionalPluginArgs>(args.into()).map(|parsed| parsed.plugin)
+}
+
+struct OptionalPluginArgs {
+    plugin: Option<LitStr>,
+}
+
+impl Parse for OptionalPluginArgs {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let mut plugin = None;
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            match key.to_string().as_str() {
+                "plugin" => {
+                    if plugin.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `plugin` argument"));
+                    }
+                    plugin = Some(input.parse()?);
+                }
+                other => {
+                    return Err(Error::new(
+                        key.span(),
+                        format!("unknown argument `{other}`; expected `plugin`"),
+                    ));
+                }
+            }
+            if input.parse::<Option<Token![,]>>()?.is_none() {
+                break;
+            }
+        }
+        Ok(Self { plugin })
+    }
+}
+
+fn expand_main_loop_function(
+    function: ItemFn,
+    plugin: Option<LitStr>,
+    slice: TokenStream2,
+) -> Result<TokenStream2> {
     let name = LitStr::new(&function.sig.ident.to_string(), function.sig.ident.span());
     expand_registered_function(
         InitFnArgs {
             name,
+            plugin,
             runs_before: Vec::new(),
             runs_after: Vec::new(),
         },
@@ -2179,6 +2255,237 @@ pub fn worker_init_function(args: TokenStream, input: TokenStream) -> TokenStrea
     )
     .unwrap_or_else(Error::into_compile_error)
     .into()
+}
+
+struct PluginArgs {
+    name: LitStr,
+    load_after: Vec<LitStr>,
+}
+
+impl Parse for PluginArgs {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let mut name = None;
+        let mut load_after = Vec::new();
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            match key.to_string().as_str() {
+                "name" => {
+                    if name.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `name` argument"));
+                    }
+                    name = Some(input.parse()?);
+                }
+                "load_after" => load_after = parse_litstr_array(input)?,
+                other => {
+                    return Err(Error::new(
+                        key.span(),
+                        format!(
+                            "unknown `plugin` argument `{other}`; expected `name` or `load_after`"
+                        ),
+                    ));
+                }
+            }
+            if input.parse::<Option<Token![,]>>()?.is_none() {
+                break;
+            }
+        }
+        Ok(Self {
+            name: name.ok_or_else(|| Error::new(Span::call_site(), "missing `name` argument"))?,
+            load_after,
+        })
+    }
+}
+
+const PLUGIN_OWNED_MACROS: &[&str] = &[
+    "init_function",
+    "config_function",
+    "early_config_function",
+    "worker_init_function",
+    "graph_node",
+    "main_loop_enter_function",
+    "main_loop_exit_function",
+];
+
+fn attribute_macro_leaf(path: &Path) -> Option<String> {
+    path.segments
+        .last()
+        .map(|segment| segment.ident.to_string())
+}
+
+fn is_plugin_attribute(attribute: &Attribute) -> bool {
+    attribute_macro_leaf(attribute.path()).is_some_and(|leaf| leaf == "plugin")
+}
+
+fn is_plugin_owned_attribute(attribute: &Attribute) -> bool {
+    attribute_macro_leaf(attribute.path())
+        .is_some_and(|leaf| PLUGIN_OWNED_MACROS.contains(&leaf.as_str()))
+}
+
+fn inject_plugin_into_attribute(attribute: &mut Attribute, plugin_name: &LitStr) -> Result<()> {
+    let Meta::List(list) = &mut attribute.meta else {
+        // Bare `#[main_loop_enter_function]` — rewrite to include plugin.
+        if attribute_macro_leaf(attribute.path()).is_some_and(|leaf| {
+            leaf == "main_loop_enter_function" || leaf == "main_loop_exit_function"
+        }) {
+            let path = attribute.path().clone();
+            *attribute = parse_quote!(#[#path(plugin = #plugin_name)]);
+            return Ok(());
+        }
+        return Ok(());
+    };
+    let mut tokens = list.tokens.clone();
+    if !tokens.is_empty() {
+        tokens.extend(quote!(,));
+    }
+    tokens.extend(quote!(plugin = #plugin_name));
+    list.tokens = tokens;
+    Ok(())
+}
+
+fn inject_plugin_into_item(item: &mut Item, plugin_name: &LitStr) -> Result<()> {
+    match item {
+        Item::Mod(module) => {
+            if module.attrs.iter().any(is_plugin_attribute) {
+                return Err(Error::new(
+                    module.span(),
+                    "nested `#[plugin]` is not allowed",
+                ));
+            }
+            for attribute in &mut module.attrs {
+                if is_plugin_owned_attribute(attribute) {
+                    inject_plugin_into_attribute(attribute, plugin_name)?;
+                }
+            }
+            if let Some((_, items)) = &mut module.content {
+                for nested in items {
+                    inject_plugin_into_item(nested, plugin_name)?;
+                }
+            }
+        }
+        Item::Fn(function) => {
+            for attribute in &mut function.attrs {
+                if is_plugin_owned_attribute(attribute) {
+                    inject_plugin_into_attribute(attribute, plugin_name)?;
+                }
+            }
+        }
+        Item::Struct(structure) => {
+            for attribute in &mut structure.attrs {
+                if is_plugin_owned_attribute(attribute) {
+                    inject_plugin_into_attribute(attribute, plugin_name)?;
+                }
+            }
+        }
+        Item::Enum(enumeration) => {
+            for attribute in &mut enumeration.attrs {
+                if is_plugin_owned_attribute(attribute) {
+                    inject_plugin_into_attribute(attribute, plugin_name)?;
+                }
+            }
+        }
+        Item::Impl(implementation) => {
+            for attribute in &mut implementation.attrs {
+                if is_plugin_owned_attribute(attribute) {
+                    inject_plugin_into_attribute(attribute, plugin_name)?;
+                }
+            }
+            for item in &mut implementation.items {
+                if let syn::ImplItem::Fn(method) = item {
+                    for attribute in &mut method.attrs {
+                        if is_plugin_owned_attribute(attribute) {
+                            inject_plugin_into_attribute(attribute, plugin_name)?;
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Emits only a `PluginRegistration` into `PLUGIN_REGISTRATIONS`.
+///
+/// Use this inside an external module (`mod foo;` / `foo/mod.rs`) together with
+/// explicit `plugin = "..."` on each lifecycle/graph attribute. Proc macros
+/// cannot see the body of an external module, so `#[plugin]` on `mod foo;`
+/// cannot inject ownership tags — see [`plugin`].
+///
+/// ```ignore
+/// hammer_component_macros::declare_plugin!(name = "tun", load_after = ["device", "interface"]);
+///
+/// #[graph_node(..., plugin = "tun")]
+/// struct TunInputDriverNode;
+/// ```
+#[proc_macro]
+pub fn declare_plugin(input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(input as PluginArgs);
+    plugin_registration_tokens(&args).into()
+}
+
+/// Marks an **inline** module as a statically linked plugin and tags nested
+/// lifecycle/graph contributions with `plugin = "..."`.
+///
+/// For external modules (`mod foo;` without `{ ... }`), this attribute only
+/// emits [`PluginRegistration`] — it cannot inject `plugin =` into the other
+/// file. Prefer [`declare_plugin`] inside that module plus explicit `plugin =`
+/// on each owned declaration.
+///
+/// Nested `#[plugin]` is rejected.
+///
+/// ```ignore
+/// #[plugin(name = "tun", load_after = ["device", "interface"])]
+/// mod tun { ... }
+/// ```
+#[proc_macro_attribute]
+pub fn plugin(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as PluginArgs);
+    let mut module = parse_macro_input!(input as ItemMod);
+    expand_plugin(args, &mut module)
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
+fn plugin_registration_tokens(args: &PluginArgs) -> TokenStream2 {
+    let name = &args.name;
+    let load_after = &args.load_after;
+    let static_ident = format_ident!(
+        "__PLUGIN_REGISTRATION_{}",
+        name.value().to_ascii_uppercase().replace('-', "_")
+    );
+    quote! {
+        #[::linkme::distributed_slice(::hammer_runtime::PLUGIN_REGISTRATIONS)]
+        static #static_ident: ::hammer_runtime::PluginRegistration =
+            ::hammer_runtime::PluginRegistration {
+                name: #name,
+                load_after: &[#(#load_after),*],
+            };
+    }
+}
+
+fn expand_plugin(args: PluginArgs, module: &mut ItemMod) -> Result<TokenStream2> {
+    if module.attrs.iter().any(is_plugin_attribute) {
+        return Err(Error::new(
+            module.span(),
+            "nested `#[plugin]` is not allowed",
+        ));
+    }
+    let name = &args.name;
+    // External modules (`mod foo;`) have `content: None`. Macros cannot read the
+    // other file, so ownership injection is skipped — callers must use
+    // `declare_plugin!` + explicit `plugin =` inside the module body.
+    if let Some((_, items)) = &mut module.content {
+        for item in items.iter_mut() {
+            inject_plugin_into_item(item, name)?;
+        }
+    }
+    let registration = plugin_registration_tokens(&args);
+    Ok(quote! {
+        #registration
+
+        #module
+    })
 }
 
 #[cfg(test)]
@@ -2221,6 +2528,7 @@ mod tests {
         assert!(expanded.contains("init_device (__hammer_engine , __hammer_injected_1)"));
         assert!(expanded.contains("func : __hammer_init_adapter_init_device"));
         assert!(expanded.contains("runs_before : & [\"workers\"]"));
+        assert!(expanded.contains("plugin : :: core :: option :: Option :: None"));
     }
 
     #[test]
@@ -2317,6 +2625,7 @@ mod tests {
         .expect("parse main-loop function");
         let expanded = expand_main_loop_function(
             function,
+            None,
             quote!(::hammer_runtime::init::MAIN_LOOP_ENTER_FUNCTIONS),
         )
         .expect("expand main-loop function")
@@ -2325,6 +2634,7 @@ mod tests {
         assert!(expanded.contains("MAIN_LOOP_ENTER_FUNCTIONS"));
         assert!(expanded.contains("registry . require :: < HandoffMain > () ?"));
         assert!(expanded.contains("func : __hammer_init_adapter_start_workers"));
+        assert!(expanded.contains("plugin : :: core :: option :: Option :: None"));
     }
 
     #[test]
@@ -2462,6 +2772,14 @@ mod tests {
             "missing static sibling registration: {expanded}"
         );
         assert!(
+            expanded.contains("GRAPH_NODES"),
+            "missing global graph catalog registration: {expanded}"
+        );
+        assert!(
+            expanded.contains("plugin : :: core :: option :: Option :: None"),
+            "missing plugin owner field: {expanded}"
+        );
+        assert!(
             !expanded.contains("with_node_name"),
             "static graph node must not expose a name override: {expanded}"
         );
@@ -2498,6 +2816,10 @@ mod tests {
         assert!(
             expanded.contains("init : __service_graph_node_input_owner_node_init"),
             "static entry must use generated init: {expanded}"
+        );
+        assert!(
+            expanded.contains("GRAPH_NODES"),
+            "missing global graph catalog registration: {expanded}"
         );
     }
 
@@ -2571,6 +2893,50 @@ mod tests {
             !expanded.contains("MAX_NODE_NEXT_SLOTS"),
             "obsolete 16-next macro guard must be gone: {expanded}"
         );
+    }
+
+    #[test]
+    fn plugin_rejects_nested_plugins() {
+        let args = syn::parse_str::<PluginArgs>(r#"name = "outer""#).expect("parse plugin args");
+        let mut module = syn::parse_str::<ItemMod>(
+            r#"
+            mod outer {
+                #[plugin(name = "inner")]
+                mod inner {}
+            }
+            "#,
+        )
+        .expect("parse module");
+        let error = expand_plugin(args, &mut module).expect_err("nested plugin must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("nested `#[plugin]` is not allowed"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn plugin_on_extern_mod_emits_registration_without_body_injection() {
+        let args = syn::parse_str::<PluginArgs>(r#"name = "tun", load_after = ["device"]"#)
+            .expect("parse plugin args");
+        let mut module = syn::parse_str::<ItemMod>("mod tun;").expect("parse extern mod");
+        let expanded = expand_plugin(args, &mut module)
+            .expect("extern #[plugin] emits registration")
+            .to_string();
+        assert!(expanded.contains("PLUGIN_REGISTRATIONS"));
+        assert!(expanded.contains("name : \"tun\""));
+        assert!(expanded.contains("mod tun ;"));
+    }
+
+    #[test]
+    fn declare_plugin_tokens_match_registration_shape() {
+        let args = syn::parse_str::<PluginArgs>(r#"name = "device", load_after = []"#)
+            .expect("parse plugin args");
+        let expanded = plugin_registration_tokens(&args).to_string();
+        assert!(expanded.contains("PLUGIN_REGISTRATIONS"));
+        assert!(expanded.contains("PluginRegistration"));
+        assert!(expanded.contains("name : \"device\""));
     }
 }
 

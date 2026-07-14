@@ -139,9 +139,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
             app_session_config,
             buffers,
             session_work: Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
-            session_work_scratch: Vec::with_capacity(
-                DEFAULT_SESSION_POOL_CAPACITY,
-            ),
+            session_work_scratch: Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
             control_events: FifoQueue::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
         }
     }

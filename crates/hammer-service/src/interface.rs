@@ -18,6 +18,8 @@ use hammer_runtime::{
 };
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 
+hammer_component_macros::declare_plugin!(name = "interface", load_after = ["device"]);
+
 use crate::data_plane::set_index_node_error_code;
 use crate::net::{DpoId, DpoProto, FibTableBuilder, FibTableHandle, NetworkOpaque};
 use crate::trace::codec::{TraceDecodeCursor, put_option_u16, put_option_u32};
@@ -348,7 +350,7 @@ pub fn init(reg: &RuntimeRegistry) -> HammerResult<()> {
     Ok(())
 }
 
-#[hammer_component_macros::init_function(name = "interface_init")]
+#[hammer_component_macros::init_function(name = "interface_init", plugin = "interface")]
 fn init_interface(config: Arc<Config>) -> HammerResult<Arc<InterfaceControlPlane>> {
     let plane = InterfaceControlPlane::new();
     for iface in &config.network.interface {

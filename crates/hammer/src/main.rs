@@ -9,8 +9,8 @@ use hammer_runtime::engine::{Engine, EnginePool};
 use hammer_runtime::new_worker_runtime;
 
 // Force-link service init/graph distributed slices into the daemon binary.
-use hammer_service as _;
 use hammer_infra::vec::Vec;
+use hammer_service as _;
 
 mod ipc_handlers;
 mod ipc_loop;
