@@ -183,10 +183,8 @@ impl DataRuntime {
                 .spawn(move || {
                     apply_worker_thread_setup(&worker_config, index);
                     DATA_WORKER_IDLE_SLICE.with(|slot| slot.set(idle_slice));
-                    let config = hammer_core::config::Config {
-                        worker: worker_config.clone(),
-                        ..hammer_core::config::Config::default()
-                    };
+                    let mut config = hammer_core::config::Config::default();
+                    config.worker = worker_config.clone();
                     if let Err(error) = init_data_plane_runtime(&config) {
                         let _ = handle_tx.send(Err(format!(
                             "init data runtime worker {worker_name}: {error}"
