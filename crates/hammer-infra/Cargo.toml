@@ -6,6 +6,7 @@ publish.workspace = true
 
 [lib]
 name = "hammer_infra"
+crate-type = ["dylib", "rlib"]
 
 [dependencies]
 allocator-api2 = { workspace = true }

@@ -81,10 +81,5 @@ pub fn built_plugin_cdylib_path(plugin_name: &str) -> PathBuf {
 }
 
 pub fn built_plugin_path() -> PathBuf {
-    let target = workspace_target_dir();
-    if plugin_cdylib_path(&target, "tun").is_file() {
-        target
-    } else {
-        target.join("deps")
-    }
+    workspace_target_dir().join("deps")
 }

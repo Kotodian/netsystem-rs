@@ -58,6 +58,11 @@ pub fn node_function(args: TokenStream, input: TokenStream) -> TokenStream {
 
 fn expand_node_function(args: NodeFunctionArgs, function: ItemFn) -> TokenStream2 {
     let node = &args.node;
+    let inventory = plugin_inventory_slice(
+        args.plugin.as_ref(),
+        quote!(::hammer_runtime::node::NODE_FUNCTIONS),
+        quote!(crate::__HAMMER_PLUGIN_NODE_FUNCTIONS),
+    );
     let plugin = plugin_option_tokens(args.plugin.as_ref());
     let function_name = function.sig.ident.clone();
     // VPP recompiles one VLIB_NODE_FN body for each enabled march variant.
@@ -71,6 +76,7 @@ fn expand_node_function(args: NodeFunctionArgs, function: ItemFn) -> TokenStream
         quote!(),
         quote!(),
         &plugin,
+        &inventory,
     );
     let x86_architecture = quote!(#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]);
     let sse2 = expand_node_function_variant(
@@ -82,6 +88,7 @@ fn expand_node_function(args: NodeFunctionArgs, function: ItemFn) -> TokenStream
         x86_architecture.clone(),
         quote!(#[target_feature(enable = "sse2")]),
         &plugin,
+        &inventory,
     );
     let avx2 = expand_node_function_variant(
         node,
@@ -92,6 +99,7 @@ fn expand_node_function(args: NodeFunctionArgs, function: ItemFn) -> TokenStream
         x86_architecture.clone(),
         quote!(#[target_feature(enable = "avx2")]),
         &plugin,
+        &inventory,
     );
     let avx512 = expand_node_function_variant(
         node,
@@ -102,6 +110,7 @@ fn expand_node_function(args: NodeFunctionArgs, function: ItemFn) -> TokenStream
         x86_architecture,
         quote!(#[target_feature(enable = "avx512f")]),
         &plugin,
+        &inventory,
     );
     let neon = expand_node_function_variant(
         node,
@@ -112,6 +121,7 @@ fn expand_node_function(args: NodeFunctionArgs, function: ItemFn) -> TokenStream
         quote!(#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]),
         quote!(#[target_feature(enable = "neon")]),
         &plugin,
+        &inventory,
     );
 
     quote! {
@@ -132,6 +142,7 @@ fn expand_node_function_variant(
     architecture: TokenStream2,
     target_feature: TokenStream2,
     plugin: &TokenStream2,
+    inventory: &TokenStream2,
 ) -> TokenStream2 {
     let mut variant_function = function.clone();
     variant_function.sig.ident = function_name.clone();
@@ -153,7 +164,7 @@ fn expand_node_function_variant(
 
         #architecture
         #(#input_cfg)*
-        #[::linkme::distributed_slice(::hammer_runtime::node::NODE_FUNCTIONS)]
+        #[::linkme::distributed_slice(#inventory)]
         static #static_name: ::hammer_runtime::node::NodeFunctionRegistration = unsafe {
             ::hammer_runtime::node::NodeFunctionRegistration::new(
                 #plugin,
@@ -1606,6 +1617,14 @@ fn plugin_option_tokens(plugin: Option<&LitStr>) -> TokenStream2 {
     }
 }
 
+fn plugin_inventory_slice(
+    plugin: Option<&LitStr>,
+    builtin: TokenStream2,
+    private: TokenStream2,
+) -> TokenStream2 {
+    if plugin.is_some() { private } else { builtin }
+}
+
 fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<TokenStream2> {
     let graph_label = args
         .graph
@@ -1625,6 +1644,11 @@ fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<T
     };
     let node_registration =
         graph_node_registration(&node_name, args.next.as_ref(), args.sibling_of.as_ref());
+    let inventory = plugin_inventory_slice(
+        args.plugin.as_ref(),
+        quote!(::hammer_runtime::GRAPH_NODES),
+        quote!(crate::__HAMMER_PLUGIN_GRAPH_NODES),
+    );
     let plugin = plugin_option_tokens(args.plugin.as_ref());
     let generated_role = if args.init.is_none() {
         Some(graph_node_role_from_kind(args.kind.as_ref())?)
@@ -1649,7 +1673,7 @@ fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<T
     };
 
     let registration = quote! {
-        #[::linkme::distributed_slice(::hammer_runtime::GRAPH_NODES)]
+        #[::linkme::distributed_slice(#inventory)]
         static #static_ident: ::hammer_runtime::NodeEntry = ::hammer_runtime::NodeEntry {
             plugin: #plugin,
             registration: #node_registration,
@@ -1809,6 +1833,11 @@ fn expand_process_node(args: ProcessFnArgs, function: ItemFn) -> Result<TokenStr
         args.name.value().to_ascii_uppercase().replace('-', "_")
     );
     let name = args.name;
+    let inventory = plugin_inventory_slice(
+        args.plugin.as_ref(),
+        quote!(::hammer_runtime::PROCESS_NODES),
+        quote!(crate::__HAMMER_PLUGIN_PROCESS_NODES),
+    );
     let plugin = plugin_option_tokens(args.plugin.as_ref());
     let conditional_attributes: Vec<_> = function
         .attrs
@@ -1830,7 +1859,7 @@ fn expand_process_node(args: ProcessFnArgs, function: ItemFn) -> Result<TokenStr
         }
 
         #(#conditional_attributes)*
-        #[::linkme::distributed_slice(::hammer_runtime::PROCESS_NODES)]
+        #[::linkme::distributed_slice(#inventory)]
         static #static_ident: ::hammer_runtime::ProcessEntry = ::hammer_runtime::ProcessEntry {
             plugin: #plugin,
             name: #name,
@@ -1999,6 +2028,7 @@ pub fn init_function(args: TokenStream, input: TokenStream) -> TokenStream {
         args,
         fn_item,
         quote!(::hammer_runtime::init::INIT_FUNCTIONS),
+        quote!(crate::__HAMMER_PLUGIN_INIT_FUNCTIONS),
     )
     .unwrap_or_else(Error::into_compile_error)
     .into()
@@ -2019,7 +2049,8 @@ enum InitOutput {
 fn expand_registered_function(
     args: InitFnArgs,
     mut function: ItemFn,
-    slice: TokenStream2,
+    builtin_inventory: TokenStream2,
+    plugin_inventory: TokenStream2,
 ) -> Result<TokenStream2> {
     validate_init_function_qualifiers(&function)?;
     let arguments = init_arguments(&mut function)?;
@@ -2027,6 +2058,8 @@ fn expand_registered_function(
     let function_name = &function.sig.ident;
     let adapter_name = format_ident!("__hammer_init_adapter_{}", function_name);
     let name = args.name;
+    let inventory =
+        plugin_inventory_slice(args.plugin.as_ref(), builtin_inventory, plugin_inventory);
     let plugin = plugin_option_tokens(args.plugin.as_ref());
     let runs_before = args.runs_before;
     let runs_after = args.runs_after;
@@ -2089,7 +2122,7 @@ fn expand_registered_function(
         }
 
         #(#registration_attributes)*
-        #[::linkme::distributed_slice(#slice)]
+        #[::linkme::distributed_slice(#inventory)]
         static #static_ident: ::hammer_runtime::init::InitFunction = ::hammer_runtime::init::InitFunction {
             plugin: #plugin,
             name: #name,
@@ -2272,12 +2305,18 @@ pub fn config_function(args: TokenStream, input: TokenStream) -> TokenStream {
 }
 
 fn expand_config_function(args: ConfigFnArgs, function: ItemFn) -> Result<TokenStream2> {
-    let slice = if args.early {
-        quote!(::hammer_runtime::init::EARLY_CONFIG_FUNCTIONS)
+    let (builtin_inventory, plugin_inventory) = if args.early {
+        (
+            quote!(::hammer_runtime::init::EARLY_CONFIG_FUNCTIONS),
+            quote!(crate::__HAMMER_PLUGIN_EARLY_CONFIG_FUNCTIONS),
+        )
     } else {
-        quote!(::hammer_runtime::init::CONFIG_FUNCTIONS)
+        (
+            quote!(::hammer_runtime::init::CONFIG_FUNCTIONS),
+            quote!(crate::__HAMMER_PLUGIN_CONFIG_FUNCTIONS),
+        )
     };
-    expand_registered_function(args.init, function, slice)
+    expand_registered_function(args.init, function, builtin_inventory, plugin_inventory)
 }
 
 /// Shorthand for `#[config_function(name = "...", early = true)]`.
@@ -2306,6 +2345,7 @@ pub fn main_loop_enter_function(args: TokenStream, input: TokenStream) -> TokenS
         fn_item,
         plugin,
         quote!(::hammer_runtime::init::MAIN_LOOP_ENTER_FUNCTIONS),
+        quote!(crate::__HAMMER_PLUGIN_MAIN_LOOP_ENTER_FUNCTIONS),
     )
     .unwrap_or_else(Error::into_compile_error)
     .into()
@@ -2323,6 +2363,7 @@ pub fn main_loop_exit_function(args: TokenStream, input: TokenStream) -> TokenSt
         fn_item,
         plugin,
         quote!(::hammer_runtime::init::MAIN_LOOP_EXIT_FUNCTIONS),
+        quote!(crate::__HAMMER_PLUGIN_MAIN_LOOP_EXIT_FUNCTIONS),
     )
     .unwrap_or_else(Error::into_compile_error)
     .into()
@@ -2370,7 +2411,8 @@ impl Parse for OptionalPluginArgs {
 fn expand_main_loop_function(
     function: ItemFn,
     plugin: Option<LitStr>,
-    slice: TokenStream2,
+    builtin_inventory: TokenStream2,
+    plugin_inventory: TokenStream2,
 ) -> Result<TokenStream2> {
     let name = LitStr::new(&function.sig.ident.to_string(), function.sig.ident.span());
     expand_registered_function(
@@ -2381,7 +2423,8 @@ fn expand_main_loop_function(
             runs_after: Vec::new(),
         },
         function,
-        slice,
+        builtin_inventory,
+        plugin_inventory,
     )
 }
 
@@ -2400,6 +2443,7 @@ pub fn worker_init_function(args: TokenStream, input: TokenStream) -> TokenStrea
         args,
         fn_item,
         quote!(::hammer_runtime::init::WORKER_INIT_FUNCTIONS),
+        quote!(crate::__HAMMER_PLUGIN_WORKER_INIT_FUNCTIONS),
     )
     .unwrap_or_else(Error::into_compile_error)
     .into()
@@ -2605,6 +2649,33 @@ fn plugin_registration_tokens(args: &PluginArgs) -> TokenStream2 {
         name.value().to_ascii_uppercase().replace('-', "_")
     );
     quote! {
+        #[::linkme::distributed_slice]
+        static __HAMMER_PLUGIN_INIT_FUNCTIONS: [::hammer_runtime::init::InitFunction] = [..];
+
+        #[::linkme::distributed_slice]
+        static __HAMMER_PLUGIN_CONFIG_FUNCTIONS: [::hammer_runtime::init::InitFunction] = [..];
+
+        #[::linkme::distributed_slice]
+        static __HAMMER_PLUGIN_EARLY_CONFIG_FUNCTIONS: [::hammer_runtime::init::InitFunction] = [..];
+
+        #[::linkme::distributed_slice]
+        static __HAMMER_PLUGIN_MAIN_LOOP_ENTER_FUNCTIONS: [::hammer_runtime::init::InitFunction] = [..];
+
+        #[::linkme::distributed_slice]
+        static __HAMMER_PLUGIN_MAIN_LOOP_EXIT_FUNCTIONS: [::hammer_runtime::init::InitFunction] = [..];
+
+        #[::linkme::distributed_slice]
+        static __HAMMER_PLUGIN_WORKER_INIT_FUNCTIONS: [::hammer_runtime::init::InitFunction] = [..];
+
+        #[::linkme::distributed_slice]
+        static __HAMMER_PLUGIN_GRAPH_NODES: [::hammer_runtime::NodeEntry] = [..];
+
+        #[::linkme::distributed_slice]
+        static __HAMMER_PLUGIN_NODE_FUNCTIONS: [::hammer_runtime::node::NodeFunctionRegistration] = [..];
+
+        #[::linkme::distributed_slice]
+        static __HAMMER_PLUGIN_PROCESS_NODES: [::hammer_runtime::ProcessEntry] = [..];
+
         static #static_ident: ::std::sync::OnceLock<::hammer_runtime::PluginRegistration> =
             ::std::sync::OnceLock::new();
 
@@ -2614,15 +2685,15 @@ fn plugin_registration_tokens(args: &PluginArgs) -> TokenStream2 {
                 version: env!("CARGO_PKG_VERSION"),
                 version_required: env!("CARGO_PKG_VERSION"),
                 load_after: &[#(#load_after),*],
-                init_functions: &::hammer_runtime::init::INIT_FUNCTIONS,
-                config_functions: &::hammer_runtime::init::CONFIG_FUNCTIONS,
-                early_config_functions: &::hammer_runtime::init::EARLY_CONFIG_FUNCTIONS,
-                main_loop_enter_functions: &::hammer_runtime::init::MAIN_LOOP_ENTER_FUNCTIONS,
-                main_loop_exit_functions: &::hammer_runtime::init::MAIN_LOOP_EXIT_FUNCTIONS,
-                worker_init_functions: &::hammer_runtime::init::WORKER_INIT_FUNCTIONS,
-                graph_nodes: &::hammer_runtime::GRAPH_NODES,
-                node_functions: &::hammer_runtime::node::NODE_FUNCTIONS,
-                process_nodes: &::hammer_runtime::PROCESS_NODES,
+                init_functions: &__HAMMER_PLUGIN_INIT_FUNCTIONS,
+                config_functions: &__HAMMER_PLUGIN_CONFIG_FUNCTIONS,
+                early_config_functions: &__HAMMER_PLUGIN_EARLY_CONFIG_FUNCTIONS,
+                main_loop_enter_functions: &__HAMMER_PLUGIN_MAIN_LOOP_ENTER_FUNCTIONS,
+                main_loop_exit_functions: &__HAMMER_PLUGIN_MAIN_LOOP_EXIT_FUNCTIONS,
+                worker_init_functions: &__HAMMER_PLUGIN_WORKER_INIT_FUNCTIONS,
+                graph_nodes: &__HAMMER_PLUGIN_GRAPH_NODES,
+                node_functions: &__HAMMER_PLUGIN_NODE_FUNCTIONS,
+                process_nodes: &__HAMMER_PLUGIN_PROCESS_NODES,
             })
         }
 
@@ -2670,6 +2741,7 @@ mod tests {
             arguments,
             function,
             quote!(::hammer_runtime::init::INIT_FUNCTIONS),
+            quote!(crate::__HAMMER_PLUGIN_INIT_FUNCTIONS),
         )
         .expect("expand init function")
         .to_string()
@@ -2798,6 +2870,7 @@ mod tests {
             function,
             None,
             quote!(::hammer_runtime::init::MAIN_LOOP_ENTER_FUNCTIONS),
+            quote!(crate::__HAMMER_PLUGIN_MAIN_LOOP_ENTER_FUNCTIONS),
         )
         .expect("expand main-loop function")
         .to_string();

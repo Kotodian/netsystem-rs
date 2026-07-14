@@ -4,9 +4,6 @@ use hammer_runtime::{
     DataPlaneRuntime, DataPlaneRuntimeConfig, PluginError, PluginMain,
     host_meets_plugin_requirement,
 };
-use std::sync::Mutex;
-
-static DYNAMIC_LIBRARY_TEST: Mutex<()> = Mutex::new(());
 
 #[test]
 fn platform_library_name_uses_hammer_plugin_prefix() {
@@ -63,7 +60,6 @@ fn missing_plugin_reports_name_and_resolved_path() {
 
 #[test]
 fn plugin_main_loads_all_network_dsos_and_owns_their_contributions() {
-    let library_guard = DYNAMIC_LIBRARY_TEST.lock().expect("dynamic library test");
     let roots = ["tun".into(), "ip".into(), "tcp".into(), "udp".into()];
     let main = PluginMain::load(env!("CARGO_PKG_VERSION"), built_plugin_path(), &roots)
         .expect("load network plugins");
@@ -77,6 +73,32 @@ fn plugin_main_loads_all_network_dsos_and_owns_their_contributions() {
             registration
                 .graph_nodes
                 .iter()
+                .all(|entry| entry.plugin == Some(name)),
+            "{name} registration must expose only its DSO-private Graph Node inventory"
+        );
+        assert!(
+            registration
+                .init_functions
+                .iter()
+                .chain(registration.config_functions)
+                .chain(registration.early_config_functions)
+                .chain(registration.main_loop_enter_functions)
+                .chain(registration.main_loop_exit_functions)
+                .chain(registration.worker_init_functions)
+                .all(|entry| entry.plugin == Some(name)),
+            "{name} registration must expose only its DSO-private lifecycle inventory"
+        );
+        assert!(
+            registration
+                .process_nodes
+                .iter()
+                .all(|entry| entry.plugin == Some(name)),
+            "{name} registration must expose only its DSO-private Process Node inventory"
+        );
+        assert!(
+            registration
+                .graph_nodes
+                .iter()
                 .any(|entry| entry.plugin == Some(name)),
             "{name} must export at least one owned Graph Node"
         );
@@ -86,14 +108,39 @@ fn plugin_main_loads_all_network_dsos_and_owns_their_contributions() {
     for name in ["tun", "ip", "tcp", "udp"] {
         assert!(graph_nodes.iter().any(|entry| entry.plugin == Some(name)));
     }
-    drop(graph_nodes);
-    drop(main);
-    drop(library_guard);
+
+    let tun = main.registration("tun").expect("tun registration");
+    assert!(
+        tun.config_functions
+            .iter()
+            .any(|entry| entry.name == "tun_config")
+    );
+    assert!(
+        tun.worker_init_functions
+            .iter()
+            .any(|entry| entry.name == "tun_worker_init")
+    );
+    let ip = main.registration("ip").expect("ip registration");
+    assert!(
+        ip.init_functions
+            .iter()
+            .any(|entry| entry.name == "ip_init")
+    );
+    assert!(
+        ip.process_nodes
+            .iter()
+            .any(|entry| entry.name == "ip-reassembly-expire-walk")
+    );
+    let tcp = main.registration("tcp").expect("tcp registration");
+    assert!(
+        tcp.init_functions
+            .iter()
+            .any(|entry| entry.name == "tcp_init")
+    );
 }
 
 #[test]
 fn tcp_root_loads_ip_dependency_first() {
-    let library_guard = DYNAMIC_LIBRARY_TEST.lock().expect("dynamic library test");
     let main = PluginMain::load(
         env!("CARGO_PKG_VERSION"),
         built_plugin_path(),
@@ -101,13 +148,10 @@ fn tcp_root_loads_ip_dependency_first() {
     )
     .expect("load tcp dependency closure");
     assert_eq!(main.loaded_plugins(), ["ip", "tcp"]);
-    drop(main);
-    drop(library_guard);
 }
 
 #[test]
 fn dynamically_imported_node_entry_installs_callable_graph_state() {
-    let library_guard = DYNAMIC_LIBRARY_TEST.lock().expect("dynamic library test");
     let main = PluginMain::load(
         env!("CARGO_PKG_VERSION"),
         built_plugin_path(),
@@ -130,7 +174,4 @@ fn dynamically_imported_node_entry_installs_callable_graph_state() {
 
     let installed = (entry.init)(&runtime, 0).expect("call dynamic node init");
     assert_eq!(runtime.node_by_name("udp-input"), Some(installed));
-    drop(runtime);
-    drop(main);
-    drop(library_guard);
 }

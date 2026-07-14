@@ -6,6 +6,7 @@ publish.workspace = true
 
 [lib]
 name = "hammer_service"
+crate-type = ["dylib", "rlib"]
 
 
 [dependencies]

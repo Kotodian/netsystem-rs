@@ -6,6 +6,7 @@ publish.workspace = true
 
 [lib]
 name = "hammer_runtime"
+crate-type = ["dylib", "rlib"]
 
 [features]
 default = []
