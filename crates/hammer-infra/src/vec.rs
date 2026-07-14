@@ -6,6 +6,8 @@ use std::ops::{Deref, DerefMut, RangeBounds};
 
 use allocator_api2::vec::{self as api_vec, Vec as ApiVec};
 
+use crate::align::CACHE_LINE;
+use crate::aligned_alloc::AlignTo;
 use crate::boxed::Box;
 use crate::main_alloc::MainAllocator;
 
@@ -13,10 +15,108 @@ pub type Drain<'a, T> = api_vec::Drain<'a, T, MainAllocator>;
 pub type IntoIter<T> = api_vec::IntoIter<T, MainAllocator>;
 pub type Splice<'a, I> = api_vec::Splice<'a, I, MainAllocator>;
 
+/// Explicitly cache-line-aligned vector (`ALIGN = `[`CACHE_LINE`]).
+pub type CacheLineVec<T> = AlignedVec<T, CACHE_LINE>;
+
 /// Three-word concrete vector facade (`ptr`, `len`, `cap`).
 #[repr(transparent)]
 pub struct Vec<T> {
     inner: ApiVec<T, MainAllocator>,
+}
+
+/// Vector whose backing allocation is raised to at least `ALIGN` bytes.
+///
+/// Use this (or [`CacheLineVec`]) when a call site demonstrably needs stronger
+/// alignment than the ordinary VPP minimum on [`Vec`].
+#[repr(transparent)]
+pub struct AlignedVec<T, const ALIGN: usize = CACHE_LINE> {
+    inner: ApiVec<T, AlignTo<ALIGN>>,
+}
+
+impl<T, const ALIGN: usize> AlignedVec<T, ALIGN> {
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            inner: ApiVec::new_in(AlignTo),
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            inner: ApiVec::with_capacity_in(capacity, AlignTo),
+        }
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.inner.capacity()
+    }
+
+    #[inline]
+    pub fn push(&mut self, value: T) {
+        self.inner.push(value);
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    #[inline]
+    pub fn as_ptr(&self) -> *const T {
+        self.inner.as_ptr()
+    }
+
+    #[inline]
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.inner.as_mut_ptr()
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[T] {
+        self.inner.as_slice()
+    }
+
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        self.inner.as_mut_slice()
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.inner.clear();
+    }
+}
+
+impl<T, const ALIGN: usize> Default for AlignedVec<T, ALIGN> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T, const ALIGN: usize> Deref for AlignedVec<T, ALIGN> {
+    type Target = [T];
+
+    #[inline]
+    fn deref(&self) -> &[T] {
+        self.inner.as_slice()
+    }
+}
+
+impl<T, const ALIGN: usize> DerefMut for AlignedVec<T, ALIGN> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [T] {
+        self.inner.as_mut_slice()
+    }
 }
 
 impl<T> Vec<T> {

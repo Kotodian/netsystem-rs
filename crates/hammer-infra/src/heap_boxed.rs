@@ -165,8 +165,10 @@ impl<T, const ALIGN: usize> Drop for Slice<T, ALIGN> {
         }
         let main_heap = Heap::main();
         let heap = self.heap.as_deref().unwrap_or(&main_heap);
+        let len = self.len;
+        self.len = 0;
         unsafe {
-            ptr::drop_in_place(std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len));
+            ptr::drop_in_place(std::slice::from_raw_parts_mut(self.ptr.as_ptr(), len));
             deallocate_in::<T, ALIGN>(self.ptr, self.cap, heap);
         }
     }

@@ -191,10 +191,12 @@ impl<T, const ALIGN: usize> RawVec<T, ALIGN> {
 
     #[inline]
     pub fn clear(&mut self) {
-        unsafe {
-            ptr::drop_in_place(std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len));
-        }
+        // Shrink length before dropping so a panic in `Drop` cannot double-drop.
+        let len = self.len;
         self.len = 0;
+        unsafe {
+            ptr::drop_in_place(std::slice::from_raw_parts_mut(self.ptr.as_ptr(), len));
+        }
     }
 
     #[inline]
@@ -202,11 +204,13 @@ impl<T, const ALIGN: usize> RawVec<T, ALIGN> {
         if len >= self.len {
             return;
         }
+        // Shrink length before dropping so a panic in `Drop` cannot double-drop.
+        let remaining = self.len - len;
+        self.len = len;
         unsafe {
             let tail = self.ptr.as_ptr().add(len);
-            ptr::drop_in_place(std::slice::from_raw_parts_mut(tail, self.len - len));
+            ptr::drop_in_place(std::slice::from_raw_parts_mut(tail, remaining));
         }
-        self.len = len;
     }
 
     #[inline]
@@ -371,20 +375,42 @@ impl<T, const ALIGN: usize> ExactSizeIterator for RawDrain<'_, T, ALIGN> {}
 
 impl<T, const ALIGN: usize> Drop for RawDrain<'_, T, ALIGN> {
     fn drop(&mut self) {
+        /// Restores the untouched tail even if dropping drained elements panics.
+        struct DropGuard<'r, 'a, T, const ALIGN: usize>(&'r mut RawDrain<'a, T, ALIGN>);
+
+        impl<T, const ALIGN: usize> Drop for DropGuard<'_, '_, T, ALIGN> {
+            fn drop(&mut self) {
+                unsafe {
+                    let drain = &mut *self.0;
+                    let vec = &mut *drain.vec;
+                    if drain.tail_len != 0 {
+                        let start = vec.len;
+                        let tail = drain.tail_start;
+                        if tail != start {
+                            ptr::copy(
+                                vec.ptr.as_ptr().add(tail),
+                                vec.ptr.as_ptr().add(start),
+                                drain.tail_len,
+                            );
+                        }
+                        vec.len = start + drain.tail_len;
+                    }
+                    drain.tail_len = 0;
+                }
+            }
+        }
+
+        let mut current = self.current;
+        let end = self.end;
+        self.current = end;
+        let vec_ptr = unsafe { (*self.vec).ptr.as_ptr() };
+        let _guard = DropGuard(self);
         unsafe {
-            let vec = &mut *self.vec;
-            while self.current < self.end {
-                ptr::drop_in_place(vec.ptr.as_ptr().add(self.current));
-                self.current += 1;
+            while current < end {
+                let index = current;
+                current += 1;
+                ptr::drop_in_place(vec_ptr.add(index));
             }
-            if self.tail_len != 0 {
-                ptr::copy(
-                    vec.ptr.as_ptr().add(self.tail_start),
-                    vec.ptr.as_ptr().add(vec.len),
-                    self.tail_len,
-                );
-            }
-            vec.len += self.tail_len;
         }
     }
 }
@@ -422,19 +448,32 @@ impl<T, const ALIGN: usize> ExactSizeIterator for RawIntoIter<T, ALIGN> {}
 
 impl<T, const ALIGN: usize> Drop for RawIntoIter<T, ALIGN> {
     fn drop(&mut self) {
-        unsafe {
-            while self.current < self.end {
-                ptr::drop_in_place(self.ptr.as_ptr().add(self.current));
-                self.current += 1;
+        /// Deallocates backing storage even if remaining element drops panic.
+        struct DropGuard<'a, T, const ALIGN: usize>(&'a mut RawIntoIter<T, ALIGN>);
+
+        impl<T, const ALIGN: usize> Drop for DropGuard<'_, T, ALIGN> {
+            fn drop(&mut self) {
+                let iter = &mut *self.0;
+                if iter.cap > 0 {
+                    let main_heap = Heap::main();
+                    let heap = iter.heap.as_deref().unwrap_or(&main_heap);
+                    let layout = align::array_layout::<T, ALIGN>(iter.cap);
+                    let raw = iter.ptr.as_ptr().cast::<u8>();
+                    unsafe { GlobalAlloc::dealloc(heap, raw, layout) };
+                    iter.cap = 0;
+                }
             }
         }
-        if self.cap > 0 {
-            let main_heap = Heap::main();
-            let heap = self.heap.as_deref().unwrap_or(&main_heap);
-            let layout = align::array_layout::<T, ALIGN>(self.cap);
-            let raw = self.ptr.as_ptr().cast::<u8>();
-            unsafe { GlobalAlloc::dealloc(heap, raw, layout) };
+
+        let guard = DropGuard(self);
+        unsafe {
+            while guard.0.current < guard.0.end {
+                let index = guard.0.current;
+                guard.0.current += 1;
+                ptr::drop_in_place(guard.0.ptr.as_ptr().add(index));
+            }
         }
+        // `guard` deallocates on scope exit.
     }
 }
 
@@ -618,5 +657,103 @@ impl<'a, T, const ALIGN: usize> IntoIterator for &'a mut RawVec<T, ALIGN> {
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
         self.as_mut_slice().iter_mut()
+    }
+}
+
+#[cfg(test)]
+mod panic_drop_tests {
+    use super::Vec as HeapVec;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct PanicDrop {
+        id: u32,
+        panic_on_drop: bool,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl PanicDrop {
+        fn new(id: u32, panic_on_drop: bool) -> Self {
+            Self {
+                id,
+                panic_on_drop,
+                dropped: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn track(&self) -> Arc<AtomicBool> {
+            Arc::clone(&self.dropped)
+        }
+    }
+
+    impl Drop for PanicDrop {
+        fn drop(&mut self) {
+            assert!(
+                !self.dropped.swap(true, Ordering::SeqCst),
+                "element {} dropped more than once",
+                self.id
+            );
+            if self.panic_on_drop {
+                panic!("panic on drop {}", self.id);
+            }
+        }
+    }
+
+    #[test]
+    fn raw_clear_is_panic_drop_safe() {
+        let mut values = HeapVec::new();
+        values.push(PanicDrop::new(1, true));
+        values.push(PanicDrop::new(2, false));
+
+        let result = catch_unwind(AssertUnwindSafe(|| values.clear()));
+        assert!(result.is_err());
+        drop(values);
+    }
+
+    #[test]
+    fn raw_truncate_is_panic_drop_safe() {
+        let mut values = HeapVec::new();
+        values.push(PanicDrop::new(1, false));
+        values.push(PanicDrop::new(2, true));
+        values.push(PanicDrop::new(3, false));
+
+        let result = catch_unwind(AssertUnwindSafe(|| values.truncate(1)));
+        assert!(result.is_err());
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].id, 1);
+        drop(values);
+    }
+
+    #[test]
+    fn raw_drain_restores_tail_after_panic_in_drop() {
+        let mut values = HeapVec::new();
+        values.push(PanicDrop::new(1, false));
+        values.push(PanicDrop::new(2, true));
+        values.push(PanicDrop::new(3, false));
+        let track_tail = values[2].track();
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _ = values.drain(0..2);
+        }));
+        assert!(result.is_err());
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].id, 3);
+        assert!(!track_tail.load(Ordering::SeqCst));
+        drop(values);
+        assert!(track_tail.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn raw_into_iter_is_panic_drop_safe() {
+        let mut values = HeapVec::new();
+        values.push(PanicDrop::new(1, false));
+        values.push(PanicDrop::new(2, true));
+        values.push(PanicDrop::new(3, false));
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _ = values.into_iter();
+        }));
+        assert!(result.is_err());
     }
 }

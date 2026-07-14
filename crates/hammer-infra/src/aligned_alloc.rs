@@ -1,35 +1,26 @@
-//! Local main-heap allocator (mimalloc). ZST so public `Vec<T>` stays three words.
+//! Allocators that raise allocation alignment above the element natural align.
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::ptr::NonNull;
 
 use allocator_api2::alloc::{AllocError, Allocator};
 
-/// VPP-shaped ordinary vector floor (`VEC_MIN_ALIGN` / clib `sizeof(void*)` class).
-pub(crate) const VEC_MIN_ALIGN: usize = 8;
+use crate::main_alloc::MIMALLOC;
 
-pub(crate) static MIMALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-/// Hammer's process-local main heap backend.
-///
-/// Public collections default to this allocator. It must remain a ZST so
-/// `Vec<T>` / `Box<T>` stay the same size as the Rust std shapes.
-///
-/// Ordinary allocations raise alignment to at least [`VEC_MIN_ALIGN`], matching
-/// VPP's default vector rule. Call sites that need cache-line alignment must use
-/// [`crate::vec::AlignedVec`] / [`crate::vec::CacheLineVec`] explicitly.
+/// Raise `layout.align()` to at least `ALIGN` before forwarding to mimalloc.
 #[derive(Copy, Clone, Debug, Default)]
-pub struct MainAllocator;
+pub struct AlignTo<const ALIGN: usize>;
 
-fn with_min_align(layout: Layout) -> Result<Layout, AllocError> {
-    let align = layout.align().max(VEC_MIN_ALIGN);
+fn bump_align(layout: Layout, min_align: usize) -> Result<Layout, AllocError> {
+    debug_assert!(min_align.is_power_of_two() && min_align != 0);
+    let align = layout.align().max(min_align);
     Layout::from_size_align(layout.size(), align).map_err(|_| AllocError)
 }
 
-unsafe impl Allocator for MainAllocator {
+unsafe impl<const ALIGN: usize> Allocator for AlignTo<ALIGN> {
     #[inline]
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        let layout = with_min_align(layout)?;
+        let layout = bump_align(layout, ALIGN)?;
         match layout.size() {
             0 => Ok(NonNull::slice_from_raw_parts(NonNull::dangling(), 0)),
             size => {
@@ -42,7 +33,7 @@ unsafe impl Allocator for MainAllocator {
 
     #[inline]
     fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        let layout = with_min_align(layout)?;
+        let layout = bump_align(layout, ALIGN)?;
         match layout.size() {
             0 => Ok(NonNull::slice_from_raw_parts(NonNull::dangling(), 0)),
             size => {
@@ -55,7 +46,7 @@ unsafe impl Allocator for MainAllocator {
 
     #[inline]
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-        let layout = match with_min_align(layout) {
+        let layout = match bump_align(layout, ALIGN) {
             Ok(layout) => layout,
             Err(_) => return,
         };

@@ -17,6 +17,7 @@ fn leak(v: &Vec<u64>) {
 "#]
 
 pub mod align;
+pub(crate) mod aligned_alloc;
 pub mod bihash;
 pub mod bitmap;
 pub mod boxed;
