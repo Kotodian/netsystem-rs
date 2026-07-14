@@ -12,6 +12,7 @@ use hammer_runtime::{
 
 static OBSERVED_THREADS: OnceLock<Mutex<Vec<ThreadId>>> = OnceLock::new();
 static PANICKING_PROCESS_RAN: AtomicBool = AtomicBool::new(false);
+static CLOCK_OBSERVED: AtomicBool = AtomicBool::new(false);
 
 #[hammer_component_macros::process_node(name = "panicking-process-runtime-test")]
 async fn panicking_process_runtime_test(_: ProcessContext) -> HammerResult<()> {
@@ -32,6 +33,7 @@ async fn process_runtime_test(mut context: ProcessContext) -> HammerResult<()> {
         .lock()
         .expect("observed thread registry")
         .push(std::thread::current().id());
+    CLOCK_OBSERVED.store(true, Ordering::Release);
 
     let wake = context
         .wait_for_event_or_clock(Duration::from_secs(1))
@@ -67,6 +69,7 @@ fn process_clock_and_events_run_only_on_main_thread() {
         .expect("observed thread registry")
         .clear();
     PANICKING_PROCESS_RAN.store(false, Ordering::Relaxed);
+    CLOCK_OBSERVED.store(false, Ordering::Relaxed);
     let main_thread = std::thread::current().id();
     let mut engine = test_engine();
     engine.start_process_nodes().expect("start process nodes");
@@ -79,10 +82,31 @@ fn process_clock_and_events_run_only_on_main_thread() {
         .expect("main runtime");
 
     engine.run_processes_until(&runtime, async {
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !CLOCK_OBSERVED.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Process Node clock wake");
         process.signal(7, 11).expect("signal first event datum");
         process.signal(7, 13).expect("signal second event datum");
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let observed = OBSERVED_THREADS
+                    .get()
+                    .expect("observed thread registry")
+                    .lock()
+                    .expect("observed thread registry")
+                    .len();
+                if observed == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Process Node event wake");
     });
     engine
         .shutdown_process_nodes(&runtime)
