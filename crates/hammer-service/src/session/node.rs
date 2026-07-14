@@ -160,7 +160,7 @@ struct SessionQueueAttachment {
 }
 
 #[hammer_component_macros::graph_node(
-    graph = service,
+    graph = tcp_worker,
     init = crate::session::node::register_session_queue_node,
     name = "session-queue",
     kind = driver,

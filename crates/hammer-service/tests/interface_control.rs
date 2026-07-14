@@ -3,8 +3,11 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 use hammer_core::config::Config;
-use hammer_runtime::{DataPlaneRuntime, TraceControlPlane, TraceInputPolicy, TracePolicy};
-use hammer_runtime::{new_worker_runtime, spawn::DataRuntime};
+use hammer_core::data_plane::{BufferFrame, NodeRegistration};
+use hammer_runtime::{
+    DataPlaneRuntime, InternalNode, Node, NodeResult, TraceControlPlane, TraceInputPolicy,
+    TracePolicy, new_worker_runtime, spawn::DataRuntime,
+};
 use hammer_service::interface::{
     InterfaceConnectedRouteControl, InterfaceControlPlane, InterfaceMtu, InterfaceMtuKind,
     InterfaceOutputControlPlane, InterfaceOutputTrace,
@@ -13,8 +16,22 @@ use hammer_service::net::{
     AdjacencyRewriteNode, DpoType, FibTableBuilder, IpLocalControlPlane, IpLocalNext,
     IpLookupControlPlane, NetworkOpaque,
 };
-use hammer_service::tun::{MemoryTunDevice, TunMain, TunOutputDriverNode, TunOutputTrace};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+
+#[derive(Clone, Copy)]
+struct InterfaceTxSinkNode;
+
+impl Node for InterfaceTxSinkNode {
+    fn process(&mut self, _: &DataPlaneRuntime, _: &mut BufferFrame) -> NodeResult {
+        NodeResult::drop()
+    }
+}
+
+impl InternalNode for InterfaceTxSinkNode {
+    fn node_registration(&self) -> NodeRegistration {
+        NodeRegistration::next("interface-test-tx", 0)
+    }
+}
 
 fn test_runtime(
     buffer_slot_capacity: usize,
@@ -285,14 +302,7 @@ fn interface_output_dispatches_to_registered_tx_node() {
     let _ = runtime
         .nodes()
         .register_internal(hammer_service::data_plane::DropNode::new());
-    let output_device = MemoryTunDevice::new();
-    let tun_main = TunMain::default_main();
-    let tx = runtime
-        .nodes()
-        .register_driver(TunOutputDriverNode::new_with_main(
-            tun_main.clone(),
-            output_device.output(),
-        ));
+    let tx = runtime.nodes().register_internal(InterfaceTxSinkNode);
     let mut output_control = InterfaceOutputControlPlane::new().with_nodes(runtime.nodes().clone());
     let output_node = runtime.nodes().register_internal(output_control.node());
     output_control
@@ -332,12 +342,20 @@ fn interface_output_dispatches_to_registered_tx_node() {
     runtime.put_next_frame(frame).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-    assert_eq!(output_device.drain_output(), vec![packet]);
+    assert_eq!(
+        runtime
+            .nodes()
+            .node_runtime_stats_snapshot()
+            .into_iter()
+            .find(|stats| stats.node_id == tx)
+            .map(|stats| stats.vectors),
+        Some(1)
+    );
     assert_eq!(trace.drain_completed(), 1);
     let records = trace.take_records();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].input_node, output_node);
-    assert_eq!(records[0].entries.len(), 2);
+    assert_eq!(records[0].entries.len(), 1);
     assert_eq!(records[0].entries[0].node_name, Some("interface-output"));
     assert_eq!(
         InterfaceOutputTrace::decode(&records[0].entries[0].payload_bytes)
@@ -347,14 +365,6 @@ fn interface_output_dispatches_to_registered_tx_node() {
             tx_next: Some(tx_slot),
             error: None,
             next: Some(tx_slot),
-        }
-    );
-    assert_eq!(records[0].entries[1].node_name, Some("tun-output-driver"));
-    assert_eq!(
-        TunOutputTrace::decode(&records[0].entries[1].payload_bytes).expect("tun output trace"),
-        TunOutputTrace {
-            mode: hammer_service::tun::TunDriverMode::Tun,
-            pending: 1,
         }
     );
     assert_eq!(runtime.frames_in_use(), 0);
@@ -367,7 +377,6 @@ fn interface_output_drops_missing_egress_or_tx_mapping() {
     let _ = runtime
         .nodes()
         .register_internal(hammer_service::data_plane::DropNode::new());
-    let output_device = MemoryTunDevice::new();
     let mut output_control = InterfaceOutputControlPlane::new().with_nodes(runtime.nodes().clone());
     let output_node = runtime.nodes().register_internal(output_control.node());
     output_control
@@ -383,7 +392,6 @@ fn interface_output_drops_missing_egress_or_tx_mapping() {
     runtime.put_next_frame(frame).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-    assert!(output_device.drain_output().is_empty());
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }
@@ -397,10 +405,7 @@ fn interface_output_tx_updates_run_through_configured_runtime_data_plane_barrier
     let _ = runtime
         .nodes()
         .register_internal(hammer_service::data_plane::DropNode::new());
-    let device = MemoryTunDevice::new();
-    let tx = runtime
-        .nodes()
-        .register_driver(TunOutputDriverNode::new(device.output()));
+    let tx = runtime.nodes().register_internal(InterfaceTxSinkNode);
     let mut output_control = InterfaceOutputControlPlane::new()
         .with_data_plane_barrier(barrier.clone())
         .with_nodes(runtime.nodes().clone());

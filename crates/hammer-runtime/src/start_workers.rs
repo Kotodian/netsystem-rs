@@ -1,112 +1,213 @@
-use std::sync::atomic::AtomicU32;
+use core::hint::spin_loop;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
+use std::thread::JoinHandle;
 
-use crate::engine::Engine;
-use crate::spawn;
 use hammer_core::config::Worker;
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::registry::RuntimeRegistry;
+use hammer_infra::vec::Vec;
 
-pub static WORKER_BARRIER_ARCS: OnceLock<(Arc<AtomicU32>, Arc<AtomicU32>, u32)> = OnceLock::new();
+use crate::engine::Engine;
+use crate::spawn;
+use crate::{DataPlaneHandoff, DataWorkerId, barrier};
 
+#[hammer_component_macros::main_loop_enter_function]
 pub fn start_workers(engine: &mut Engine) -> HammerResult<()> {
-    let (worker_config, n_workers) = resolve_worker_startup(&engine.registry)?;
-    let wait = Arc::new(AtomicU32::new(0));
+    let (worker_config, worker_count) = resolve_worker_startup(&engine.registry)?;
+    let wait = Arc::new(AtomicU32::new(1));
     let workers = Arc::new(AtomicU32::new(0));
-
-    let _ = WORKER_BARRIER_ARCS.set((Arc::clone(&wait), Arc::clone(&workers), n_workers));
-
+    let ready = Arc::new(AtomicU32::new(0));
     engine.wait_at_barrier = Arc::clone(&wait);
     engine.workers_at_barrier = Arc::clone(&workers);
+    engine.main_loop_exit_now.store(false, Ordering::Release);
 
-    for idx in 1..=n_workers {
-        let worker_seed = engine.worker_seed();
+    let handoff = DataPlaneHandoff::new(worker_config.count, worker_config.handoff.queue_capacity);
+    let mut startup = Vec::with_capacity(worker_config.count);
+    for _ in 0..worker_config.count {
+        startup.push(OnceLock::new());
+    }
+    let startup = Arc::new(startup);
+    let mut threads = Vec::with_capacity(worker_config.count);
+
+    for thread_index in 1..=worker_count {
+        let worker_seed = engine.worker_seed()?;
         let worker_config = worker_config.clone();
-
-        thread::Builder::new()
-            .name(format!("hammer-worker-{idx}"))
+        let worker = DataWorkerId::new(thread_index - 1);
+        let handoff = handoff.worker(worker);
+        let worker_startup = Arc::clone(&startup);
+        let worker_ready = Arc::clone(&ready);
+        let worker_wait = Arc::clone(&wait);
+        let workers_at_barrier = Arc::clone(&workers);
+        let worker_exit = Arc::clone(&engine.main_loop_exit_now);
+        let launched = thread::Builder::new()
+            .name(format!("hammer-worker-{thread_index}"))
             .spawn(move || {
-                let worker_index = usize::try_from(idx - 1).expect("worker index fits usize");
-                crate::worker_thread::apply_worker_thread_setup(&worker_config, worker_index);
-                let worker_numa_node = crate::numa::current_numa_node().unwrap_or(0);
-                let mut engine = match worker_seed.spawn_on_numa(idx, worker_numa_node) {
-                    Ok(engine) => engine,
+                let initialized: Result<_, String> = (|| {
+                    let worker_slot = worker.slot();
+                    crate::worker_thread::apply_worker_thread_setup(&worker_config, worker_slot);
+                    let numa_node = crate::numa::current_numa_node().unwrap_or(0);
+                    let mut engine = worker_seed
+                        .spawn_on_numa(thread_index, numa_node, handoff)
+                        .map_err(|error| error.to_string())?;
+                    spawn::set_data_plane_runtime(engine.runtime.clone());
+                    spawn::apply_worker_idle_slice(worker_config.idle_slice);
+                    crate::init::run_worker_init_functions(&mut engine)
+                        .map_err(|error| error.to_string())?;
+                    let tokio = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|error| format!("build per-worker tokio runtime: {error}"))?;
+                    Ok((engine, tokio))
+                })();
+
+                let running = match initialized {
+                    Ok((engine, tokio)) => {
+                        let published = worker_startup[worker.slot()].set(Ok(()));
+                        debug_assert!(published.is_ok());
+                        Some((engine, tokio))
+                    }
                     Err(error) => {
-                        tracing::error!(worker = idx, %error, "worker runtime init failed");
-                        return;
+                        let published = worker_startup[worker.slot()].set(Err(error));
+                        debug_assert!(published.is_ok());
+                        None
                     }
                 };
-                spawn::set_data_plane_runtime(engine.runtime.clone());
 
-                worker_main(idx, &mut engine, worker_config.idle_slice);
-            })
-            .map_err(|e| {
-                hammer_core::error::HammerError::internal(format!(
-                    "failed to spawn worker {idx}: {e}"
-                ))
-            })?;
+                worker_ready.fetch_add(1, Ordering::Release);
+                barrier::barrier_check(&worker_wait, &workers_at_barrier);
+
+                let Some((mut engine, tokio)) = running else {
+                    spawn::cleanup_thread_local();
+                    return;
+                };
+                if worker_exit.load(Ordering::Acquire) {
+                    spawn::cleanup_thread_local();
+                    return;
+                }
+
+                let remote_local = spawn::DataRemoteLocalQueue::default();
+                remote_local.attach_current_thread();
+                let exit_status =
+                    crate::main_loop::engine_main_loop(&mut engine, &tokio, &remote_local);
+                spawn::cleanup_thread_local();
+                tracing::debug!(worker = thread_index, exit_status, "worker exited");
+            });
+
+        match launched {
+            Ok(thread) => threads.push(thread),
+            Err(error) => {
+                abort_workers(&wait, &workers, &engine.main_loop_exit_now, threads);
+                return Err(HammerError::internal(format!(
+                    "failed to spawn worker {thread_index}: {error}"
+                )));
+            }
+        }
     }
 
+    while ready.load(Ordering::Acquire) != worker_count {
+        if threads.iter().any(JoinHandle::is_finished) {
+            abort_workers(&wait, &workers, &engine.main_loop_exit_now, threads);
+            return Err(HammerError::internal(
+                "worker exited before publishing startup state",
+            ));
+        }
+        spin_loop();
+    }
+    while workers.load(Ordering::Acquire) != worker_count {
+        if threads.iter().any(JoinHandle::is_finished) {
+            abort_workers(&wait, &workers, &engine.main_loop_exit_now, threads);
+            return Err(HammerError::internal(
+                "worker exited before reaching the initial barrier",
+            ));
+        }
+        spin_loop();
+    }
+
+    if let Err(error) = validate_worker_topologies(&startup) {
+        abort_workers(&wait, &workers, &engine.main_loop_exit_now, threads);
+        return Err(error);
+    }
+    if let Err(error) = engine.retain_worker_threads(&mut threads) {
+        abort_workers(&wait, &workers, &engine.main_loop_exit_now, threads);
+        return Err(error);
+    }
+    barrier::barrier_release(&wait, &workers);
     Ok(())
 }
 
 fn resolve_worker_startup(registry: &Arc<RuntimeRegistry>) -> HammerResult<(Worker, u32)> {
-    let worker_config = registry
+    let worker = registry
         .get::<hammer_core::config::Config>()
         .map(|config| config.worker.clone())
-        .unwrap_or_else(hammer_core::config::Worker::default);
-    let worker_count = u32::try_from(worker_config.count).map_err(|_| {
-        HammerError::internal(format!(
-            "worker.count does not fit u32: {}",
-            worker_config.count
-        ))
+        .unwrap_or_default();
+    worker.validate()?;
+    let count = u32::try_from(worker.count).map_err(|_| {
+        HammerError::internal(format!("worker.count does not fit u32: {}", worker.count))
     })?;
-    Ok((worker_config, worker_count))
+    Ok((worker, count))
 }
 
-fn worker_main(idx: u32, engine: &mut Engine, idle_slice: std::time::Duration) {
-    spawn::apply_worker_idle_slice(idle_slice);
+fn validate_worker_topologies<T>(startup: &[OnceLock<Result<T, String>>]) -> HammerResult<()>
+where
+    T: PartialEq,
+{
+    let expected = match startup.first().and_then(OnceLock::get) {
+        Some(Ok(topology)) => topology,
+        Some(Err(error)) => {
+            return Err(HammerError::internal(format!(
+                "worker 0 initialization failed: {error}"
+            )));
+        }
+        None => return Err(HammerError::internal("worker 0 startup state is missing")),
+    };
 
-    if let Err(err) = crate::init::run_worker_init_functions(engine) {
-        tracing::error!("worker {idx} init failed: {err}");
-        spawn::cleanup_thread_local();
-        return;
+    for (worker, state) in startup.iter().enumerate().skip(1) {
+        match state.get() {
+            Some(Ok(topology)) if topology == expected => {}
+            Some(Ok(_)) => {
+                return Err(HammerError::internal(format!(
+                    "worker graph topology mismatch between worker 0 and worker {worker}"
+                )));
+            }
+            Some(Err(error)) => {
+                return Err(HammerError::internal(format!(
+                    "worker {worker} initialization failed: {error}"
+                )));
+            }
+            None => {
+                return Err(HammerError::internal(format!(
+                    "worker {worker} startup state is missing"
+                )));
+            }
+        }
     }
-
-    let tokio_rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build per-worker tokio runtime");
-
-    let remote_local = spawn::DataRemoteLocalQueue::default();
-    remote_local.attach_current_thread();
-
-    let exit_status = crate::main_loop::engine_main_loop(engine, &tokio_rt, &remote_local);
-
-    spawn::cleanup_thread_local();
-
-    tracing::debug!("worker {idx} exited with status {exit_status}");
+    Ok(())
 }
 
-#[::linkme::distributed_slice(crate::init::INIT_FUNCTIONS)]
-static __INIT_FN_START_WORKERS: crate::init::InitFunction = crate::init::InitFunction {
-    name: "start_workers",
-    runs_before: &[],
-    runs_after: &[],
-    func: start_workers,
-};
+fn abort_workers(
+    wait: &AtomicU32,
+    workers: &AtomicU32,
+    exit: &AtomicBool,
+    threads: Vec<JoinHandle<()>>,
+) {
+    exit.store(true, Ordering::Release);
+    barrier::barrier_release(wait, workers);
+    for thread in threads {
+        let _ = thread.join();
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use hammer_core::config::Config;
     use hammer_core::registry::RuntimeRegistry;
-    use std::sync::Arc;
 
     #[test]
     fn resolve_worker_startup_uses_registry_config_and_defaults() {
-        let registry = Arc::new(RuntimeRegistry::new());
+        let registry = RuntimeRegistry::new();
 
         let (default_worker, default_count) =
             resolve_worker_startup(&registry).expect("default worker startup");
@@ -125,7 +226,7 @@ mod tests {
 
     #[test]
     fn resolve_worker_startup_carries_poll_sleep_idle_slice() {
-        let registry = Arc::new(RuntimeRegistry::new());
+        let registry = RuntimeRegistry::new();
         let mut config = Config::default();
         config.worker.idle_slice = std::time::Duration::from_millis(50);
         config.worker.count = 1;

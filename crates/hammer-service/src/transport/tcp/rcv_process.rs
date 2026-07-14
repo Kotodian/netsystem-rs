@@ -23,7 +23,7 @@ pub enum TcpRcvProcessNext {
 }
 
 #[hammer_component_macros::graph_node(
-    graph = service,
+    graph = tcp_worker,
     init = crate::transport::tcp::rcv_process::register_tcp_rcv_process,
     name = "tcp-rcv-process",
     next = TcpRcvProcessNext,

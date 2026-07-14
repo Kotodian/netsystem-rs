@@ -3,9 +3,10 @@ use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{
-    Attribute, Error, Expr, ExprPath, Field, Fields, FieldsNamed, GenericParam, Generics, Ident,
-    Item, ItemEnum, ItemFn, ItemStruct, LitStr, Path, Result, Token, Type, bracketed,
-    parenthesized, parse_macro_input, parse_quote, spanned::Spanned,
+    Attribute, Error, Expr, ExprPath, Field, Fields, FieldsNamed, FnArg, GenericArgument,
+    GenericParam, Generics, Ident, Item, ItemEnum, ItemFn, ItemStruct, LitBool, LitStr, Path,
+    PathArguments, Result, ReturnType, Token, Type, bracketed, parenthesized, parse_macro_input,
+    parse_quote, spanned::Spanned,
 };
 
 struct NodeFunctionArgs {
@@ -1718,7 +1719,7 @@ impl Parse for InitFnArgs {
 }
 
 struct ConfigFnArgs {
-    name: LitStr,
+    init: InitFnArgs,
     early: bool,
 }
 
@@ -1726,53 +1727,7 @@ impl Parse for ConfigFnArgs {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let mut name = None;
         let mut early = None;
-        while !input.is_empty() {
-            let key: Ident = input.parse()?;
-            input.parse::<Token![=]>()?;
-            match key.to_string().as_str() {
-                "name" => {
-                    if name.is_some() {
-                        return Err(Error::new(key.span(), "duplicate `name` argument"));
-                    }
-                    name = Some(input.parse()?);
-                }
-                "early" => {
-                    if early.is_some() {
-                        return Err(Error::new(key.span(), "duplicate `early` argument"));
-                    }
-                    let v: Ident = input.parse()?;
-                    early = Some(match v.to_string().as_str() {
-                        "true" => true,
-                        "false" => false,
-                        _ => return Err(Error::new(v.span(), "expected `true` or `false`")),
-                    });
-                }
-                other => {
-                    return Err(Error::new(
-                        key.span(),
-                        format!("unknown argument `{other}`; expected `name` or `early`"),
-                    ));
-                }
-            }
-            if input.parse::<Option<Token![,]>>()?.is_none() {
-                break;
-            }
-        }
-        Ok(Self {
-            name: name.ok_or_else(|| Error::new(Span::call_site(), "missing `name` argument"))?,
-            early: early.unwrap_or(false),
-        })
-    }
-}
-
-struct WorkerInitFnArgs {
-    name: LitStr,
-    runs_after: Vec<LitStr>,
-}
-
-impl Parse for WorkerInitFnArgs {
-    fn parse(input: ParseStream<'_>) -> Result<Self> {
-        let mut name = None;
+        let mut runs_before = Vec::new();
         let mut runs_after = Vec::new();
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -1784,11 +1739,20 @@ impl Parse for WorkerInitFnArgs {
                     }
                     name = Some(input.parse()?);
                 }
+                "runs_before" => runs_before = parse_litstr_array(input)?,
                 "runs_after" => runs_after = parse_litstr_array(input)?,
+                "early" => {
+                    if early.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `early` argument"));
+                    }
+                    early = Some(input.parse::<LitBool>()?.value());
+                }
                 other => {
                     return Err(Error::new(
                         key.span(),
-                        format!("unknown argument `{other}`; expected `name` or `runs_after`"),
+                        format!(
+                            "unknown argument `{other}`; expected `name`, `early`, `runs_before`, or `runs_after`"
+                        ),
                     ));
                 }
             }
@@ -1797,8 +1761,13 @@ impl Parse for WorkerInitFnArgs {
             }
         }
         Ok(Self {
-            name: name.ok_or_else(|| Error::new(Span::call_site(), "missing `name` argument"))?,
-            runs_after,
+            init: InitFnArgs {
+                name: name
+                    .ok_or_else(|| Error::new(Span::call_site(), "missing `name` argument"))?,
+                runs_before,
+                runs_after,
+            },
+            early: early.unwrap_or(false),
         })
     }
 }
@@ -1836,63 +1805,293 @@ fn init_function_static_name(fn_name: &LitStr) -> Ident {
 /// Example:
 /// ```ignore
 /// #[init_function(name = "tcp_init", runs_after = ["buffer_main_init"], runs_before = ["session_init"])]
-/// fn tcp_init(vm: &mut EngineMain) -> Result<()> { ... }
+/// fn tcp_init(vm: &mut Engine, config: Arc<Config>) -> HammerResult<Arc<TcpMain>> { ... }
 /// ```
 #[proc_macro_attribute]
 pub fn init_function(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as InitFnArgs);
     let fn_item = parse_macro_input!(input as syn::ItemFn);
-    let fn_name = &fn_item.sig.ident;
+    expand_registered_function(
+        args,
+        fn_item,
+        quote!(::hammer_runtime::init::INIT_FUNCTIONS),
+    )
+    .unwrap_or_else(Error::into_compile_error)
+    .into()
+}
+
+enum InitArgument {
+    Engine,
+    Required { binding: Ident, ty: Type },
+    Optional { binding: Ident, ty: Type },
+}
+
+enum InitOutput {
+    Unit,
+    Arc,
+    OptionalArc,
+}
+
+fn expand_registered_function(
+    args: InitFnArgs,
+    mut function: ItemFn,
+    slice: TokenStream2,
+) -> Result<TokenStream2> {
+    validate_init_function_qualifiers(&function)?;
+    let arguments = init_arguments(&mut function)?;
+    let output = init_output(&function)?;
+    let function_name = &function.sig.ident;
+    let adapter_name = format_ident!("__hammer_init_adapter_{}", function_name);
     let name = args.name;
     let runs_before = args.runs_before;
     let runs_after = args.runs_after;
     let static_ident = init_function_static_name(&name);
+    let conditional_attributes: Vec<_> = function
+        .attrs
+        .iter()
+        .filter(|attribute| {
+            attribute.path().is_ident("cfg") || attribute.path().is_ident("cfg_attr")
+        })
+        .cloned()
+        .collect();
+    let adapter_attributes = conditional_attributes.clone();
+    let registration_attributes = conditional_attributes;
+    let mut injections = Vec::new();
+    let mut call_arguments = Vec::with_capacity(arguments.len());
+    for argument in arguments {
+        match argument {
+            InitArgument::Engine => call_arguments.push(quote!(__hammer_engine)),
+            InitArgument::Required { binding, ty } => {
+                injections.push(quote! {
+                    let #binding = __hammer_engine.registry.require::<#ty>()?;
+                });
+                call_arguments.push(quote!(#binding));
+            }
+            InitArgument::Optional { binding, ty } => {
+                injections.push(quote! {
+                    let Some(#binding) = __hammer_engine.registry.get::<#ty>() else {
+                        return Ok(());
+                    };
+                });
+                call_arguments.push(quote!(#binding));
+            }
+        }
+    }
+    let invoke = match output {
+        InitOutput::Unit => quote!(#function_name(#(#call_arguments),*)),
+        InitOutput::Arc => quote! {
+            let __hammer_produced = #function_name(#(#call_arguments),*)?;
+            __hammer_engine.registry.set(__hammer_produced);
+            Ok(())
+        },
+        InitOutput::OptionalArc => quote! {
+            if let Some(__hammer_produced) = #function_name(#(#call_arguments),*)? {
+                __hammer_engine.registry.set(__hammer_produced);
+            }
+            Ok(())
+        },
+    };
 
-    let expanded = quote! {
-        #fn_item
+    Ok(quote! {
+        #function
 
-        #[::linkme::distributed_slice(::hammer_runtime::init::INIT_FUNCTIONS)]
+        #(#adapter_attributes)*
+        fn #adapter_name(
+            __hammer_engine: &mut ::hammer_runtime::Engine,
+        ) -> ::hammer_core::error::HammerResult<()> {
+            #(#injections)*
+            #invoke
+        }
+
+        #(#registration_attributes)*
+        #[::linkme::distributed_slice(#slice)]
         static #static_ident: ::hammer_runtime::init::InitFunction = ::hammer_runtime::init::InitFunction {
             name: #name,
             runs_before: &[#(#runs_before),*],
             runs_after: &[#(#runs_after),*],
-            func: #fn_name,
+            func: #adapter_name,
         };
-    };
-    expanded.into()
+    })
 }
 
-/// Registers a function as a config function for TOML block dispatching.
+fn validate_init_function_qualifiers(function: &ItemFn) -> Result<()> {
+    let signature = &function.sig;
+    if signature.constness.is_some()
+        || signature.asyncness.is_some()
+        || signature.unsafety.is_some()
+        || signature.abi.is_some()
+        || signature.variadic.is_some()
+        || !signature.generics.params.is_empty()
+        || signature.generics.where_clause.is_some()
+    {
+        return Err(Error::new(
+            signature.span(),
+            "init functions must be safe, synchronous, non-generic Rust functions",
+        ));
+    }
+    Ok(())
+}
+
+fn init_arguments(function: &mut ItemFn) -> Result<Vec<InitArgument>> {
+    let mut arguments = Vec::with_capacity(function.sig.inputs.len());
+    let mut engine_count = 0usize;
+    for (index, argument) in function.sig.inputs.iter_mut().enumerate() {
+        let FnArg::Typed(argument) = argument else {
+            return Err(Error::new(
+                argument.span(),
+                "init functions cannot have a receiver",
+            ));
+        };
+        let optional = take_optional_injection(&mut argument.attrs)?;
+        if is_mut_engine_reference(&argument.ty) {
+            if optional {
+                return Err(Error::new(
+                    argument.span(),
+                    "the Engine parameter cannot use #[inject(optional)]",
+                ));
+            }
+            engine_count += 1;
+            arguments.push(InitArgument::Engine);
+            continue;
+        }
+        let Some(ty) = wrapped_type(&argument.ty, "Arc") else {
+            return Err(Error::new(
+                argument.ty.span(),
+                "init parameters must be `&mut Engine` or `Arc<T>`",
+            ));
+        };
+        let binding = format_ident!("__hammer_injected_{index}");
+        arguments.push(if optional {
+            InitArgument::Optional { binding, ty }
+        } else {
+            InitArgument::Required { binding, ty }
+        });
+    }
+    if engine_count > 1 {
+        return Err(Error::new(
+            function.sig.inputs.span(),
+            "init functions can have at most one `&mut Engine` parameter",
+        ));
+    }
+    Ok(arguments)
+}
+
+fn take_optional_injection(attributes: &mut Vec<Attribute>) -> Result<bool> {
+    let mut optional = false;
+    let mut retained = Vec::with_capacity(attributes.len());
+    for attribute in attributes.drain(..) {
+        if !attribute.path().is_ident("inject") {
+            retained.push(attribute);
+            continue;
+        }
+        if optional {
+            return Err(Error::new(
+                attribute.span(),
+                "duplicate #[inject(optional)] attribute",
+            ));
+        }
+        let mode = attribute.parse_args::<Ident>()?;
+        if mode != "optional" {
+            return Err(Error::new(mode.span(), "expected `inject(optional)`"));
+        }
+        optional = true;
+    }
+    *attributes = retained;
+    Ok(optional)
+}
+
+fn is_mut_engine_reference(ty: &Type) -> bool {
+    let Type::Reference(reference) = ty else {
+        return false;
+    };
+    reference.mutability.is_some() && type_path_ends_with(&reference.elem, "Engine")
+}
+
+fn type_path_ends_with(ty: &Type, expected: &str) -> bool {
+    let Type::Path(path) = ty else {
+        return false;
+    };
+    path.qself.is_none()
+        && path
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == expected)
+}
+
+fn wrapped_type(ty: &Type, wrapper: &str) -> Option<Type> {
+    let Type::Path(path) = ty else {
+        return None;
+    };
+    let segment = path.path.segments.last()?;
+    if path.qself.is_some() || segment.ident != wrapper {
+        return None;
+    }
+    let PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+        return None;
+    };
+    if arguments.args.len() != 1 {
+        return None;
+    }
+    match arguments.args.first()? {
+        GenericArgument::Type(ty) => Some(ty.clone()),
+        _ => None,
+    }
+}
+
+fn init_output(function: &ItemFn) -> Result<InitOutput> {
+    let ReturnType::Type(_, result) = &function.sig.output else {
+        return Err(Error::new(
+            function.sig.output.span(),
+            "init functions must return HammerResult<T>",
+        ));
+    };
+    let Some(value) = wrapped_type(result, "HammerResult") else {
+        return Err(Error::new(
+            result.span(),
+            "init functions must return HammerResult<T>",
+        ));
+    };
+    if matches!(&value, Type::Tuple(tuple) if tuple.elems.is_empty()) {
+        return Ok(InitOutput::Unit);
+    }
+    if wrapped_type(&value, "Arc").is_some() {
+        return Ok(InitOutput::Arc);
+    }
+    if let Some(value) = wrapped_type(&value, "Option")
+        && wrapped_type(&value, "Arc").is_some()
+    {
+        return Ok(InitOutput::OptionalArc);
+    }
+    Err(Error::new(
+        value.span(),
+        "init functions must return HammerResult<()>, HammerResult<Arc<T>>, or HammerResult<Option<Arc<T>>>",
+    ))
+}
+
+/// Registers a typed config provider in the ordered config init phase.
 ///
 /// Example:
 /// ```ignore
-/// #[config_function(name = "tcp", early = false)]
-/// fn tcp_config(vm: &mut EngineMain, input: &toml::Value) -> Result<()> { ... }
+/// #[config_function(name = "tcp", early = false, runs_after = ["session"])]
+/// fn tcp_config(vm: &mut Engine, session: Arc<SessionMain>) -> HammerResult<()> { ... }
 /// ```
 #[proc_macro_attribute]
 pub fn config_function(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as ConfigFnArgs);
     let fn_item = parse_macro_input!(input as syn::ItemFn);
-    let fn_name = &fn_item.sig.ident;
-    let name = args.name;
-    let early = args.early;
-    let static_ident = init_function_static_name(&name);
-    let slice = if early {
+    expand_config_function(args, fn_item)
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
+fn expand_config_function(args: ConfigFnArgs, function: ItemFn) -> Result<TokenStream2> {
+    let slice = if args.early {
         quote!(::hammer_runtime::init::EARLY_CONFIG_FUNCTIONS)
     } else {
         quote!(::hammer_runtime::init::CONFIG_FUNCTIONS)
     };
-
-    let expanded = quote! {
-        #fn_item
-
-        #[::linkme::distributed_slice(#slice)]
-        static #static_ident: ::hammer_runtime::init::ConfigFunction = ::hammer_runtime::init::ConfigFunction {
-            name: #name,
-            func: #fn_name,
-        };
-    };
-    expanded.into()
+    expand_registered_function(args.init, function, slice)
 }
 
 /// Shorthand for `#[config_function(name = "...", early = true)]`.
@@ -1908,7 +2107,7 @@ pub fn early_config_function(args: TokenStream, input: TokenStream) -> TokenStre
 /// Example:
 /// ```ignore
 /// #[main_loop_enter_function]
-/// fn start_workers(vm: &mut EngineMain) -> Result<()> { ... }
+/// fn start_workers(vm: &mut Engine, config: Arc<Config>) -> HammerResult<()> { ... }
 /// ```
 #[proc_macro_attribute]
 pub fn main_loop_enter_function(args: TokenStream, input: TokenStream) -> TokenStream {
@@ -1921,21 +2120,12 @@ pub fn main_loop_enter_function(args: TokenStream, input: TokenStream) -> TokenS
         .into();
     }
     let fn_item = parse_macro_input!(input as syn::ItemFn);
-    let fn_name = &fn_item.sig.ident;
-    let static_ident = format_ident!("__MAIN_LOOP_ENTER_{}", fn_name);
-
-    let expanded = quote! {
-        #fn_item
-
-        #[::linkme::distributed_slice(::hammer_runtime::init::MAIN_LOOP_ENTER_FUNCTIONS)]
-        static #static_ident: ::hammer_runtime::init::InitFunction = ::hammer_runtime::init::InitFunction {
-            name: stringify!(#fn_name),
-            runs_before: &[],
-            runs_after: &[],
-            func: #fn_name,
-        };
-    };
-    expanded.into()
+    expand_main_loop_function(
+        fn_item,
+        quote!(::hammer_runtime::init::MAIN_LOOP_ENTER_FUNCTIONS),
+    )
+    .unwrap_or_else(Error::into_compile_error)
+    .into()
 }
 
 /// Registers a function to run at main-loop-exit time.
@@ -1950,21 +2140,25 @@ pub fn main_loop_exit_function(args: TokenStream, input: TokenStream) -> TokenSt
         .into();
     }
     let fn_item = parse_macro_input!(input as syn::ItemFn);
-    let fn_name = &fn_item.sig.ident;
-    let static_ident = format_ident!("__MAIN_LOOP_EXIT_{}", fn_name);
+    expand_main_loop_function(
+        fn_item,
+        quote!(::hammer_runtime::init::MAIN_LOOP_EXIT_FUNCTIONS),
+    )
+    .unwrap_or_else(Error::into_compile_error)
+    .into()
+}
 
-    let expanded = quote! {
-        #fn_item
-
-        #[::linkme::distributed_slice(::hammer_runtime::init::MAIN_LOOP_EXIT_FUNCTIONS)]
-        static #static_ident: ::hammer_runtime::init::InitFunction = ::hammer_runtime::init::InitFunction {
-            name: stringify!(#fn_name),
-            runs_before: &[],
-            runs_after: &[],
-            func: #fn_name,
-        };
-    };
-    expanded.into()
+fn expand_main_loop_function(function: ItemFn, slice: TokenStream2) -> Result<TokenStream2> {
+    let name = LitStr::new(&function.sig.ident.to_string(), function.sig.ident.span());
+    expand_registered_function(
+        InitFnArgs {
+            name,
+            runs_before: Vec::new(),
+            runs_after: Vec::new(),
+        },
+        function,
+        slice,
+    )
 }
 
 /// Registers a per-worker init function in the topologically-sorted worker init chain.
@@ -1972,34 +2166,166 @@ pub fn main_loop_exit_function(args: TokenStream, input: TokenStream) -> TokenSt
 /// Example:
 /// ```ignore
 /// #[worker_init_function(name = "tcp_worker_init", runs_after = ["generic_worker_init"])]
-/// fn tcp_worker_init(vm: &mut EngineMain) -> Result<()> { ... }
+/// fn tcp_worker_init(vm: &mut Engine, tcp: Arc<TcpMain>) -> HammerResult<()> { ... }
 /// ```
 #[proc_macro_attribute]
 pub fn worker_init_function(args: TokenStream, input: TokenStream) -> TokenStream {
-    let args = parse_macro_input!(args as WorkerInitFnArgs);
+    let args = parse_macro_input!(args as InitFnArgs);
     let fn_item = parse_macro_input!(input as syn::ItemFn);
-    let fn_name = &fn_item.sig.ident;
-    let name = args.name;
-    let runs_after = args.runs_after;
-    let static_ident = init_function_static_name(&name);
-
-    let expanded = quote! {
-        #fn_item
-
-        #[::linkme::distributed_slice(::hammer_runtime::init::WORKER_INIT_FUNCTIONS)]
-        static #static_ident: ::hammer_runtime::init::InitFunction = ::hammer_runtime::init::InitFunction {
-            name: #name,
-            runs_before: &[],
-            runs_after: &[#(#runs_after),*],
-            func: #fn_name,
-        };
-    };
-    expanded.into()
+    expand_registered_function(
+        args,
+        fn_item,
+        quote!(::hammer_runtime::init::WORKER_INIT_FUNCTIONS),
+    )
+    .unwrap_or_else(Error::into_compile_error)
+    .into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn expand_registered_test_function(arguments: &str, function: &str) -> String {
+        let arguments = syn::parse_str::<InitFnArgs>(arguments).expect("parse init arguments");
+        let function = syn::parse_str::<ItemFn>(function).expect("parse init function");
+        expand_registered_function(
+            arguments,
+            function,
+            quote!(::hammer_runtime::init::INIT_FUNCTIONS),
+        )
+        .expect("expand init function")
+        .to_string()
+    }
+
+    #[test]
+    fn init_function_rejects_when_predicates() {
+        let error = match syn::parse_str::<InitFnArgs>(r#"name = "tun", when = |_| true"#) {
+            Ok(_) => panic!("when predicates must not be part of init registration"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("unknown argument `when`"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn init_adapter_injects_required_arc_from_registry() {
+        let expanded = expand_registered_test_function(
+            r#"name = "device", runs_before = ["workers"]"#,
+            "fn init_device(engine: &mut Engine, device: Arc<DeviceMain>) -> HammerResult<()> { use_device(engine, device) }",
+        );
+
+        assert!(expanded.contains("registry . require :: < DeviceMain > () ?"));
+        assert!(expanded.contains("init_device (__hammer_engine , __hammer_injected_1)"));
+        assert!(expanded.contains("func : __hammer_init_adapter_init_device"));
+        assert!(expanded.contains("runs_before : & [\"workers\"]"));
+    }
+
+    #[test]
+    fn init_adapter_skips_optional_arc_when_registry_entry_is_absent() {
+        let expanded = expand_registered_test_function(
+            r#"name = "tun-worker""#,
+            "fn init_tun_worker(engine: &mut Engine, #[inject(optional)] tun: Arc<TunControl>) -> HammerResult<()> { use_tun(engine, tun) }",
+        );
+
+        assert!(expanded.contains("registry . get :: < TunControl > ()"));
+        assert!(expanded.contains("let Some (__hammer_injected_1)"));
+        assert!(expanded.contains("else { return Ok (()) ; }"));
+        assert!(
+            !expanded.contains("inject (optional)"),
+            "the adapter-only parameter attribute must be removed: {expanded}"
+        );
+    }
+
+    #[test]
+    fn init_adapter_publishes_arc_results() {
+        let expanded = expand_registered_test_function(
+            r#"name = "device""#,
+            "fn init_device(engine: &mut Engine) -> HammerResult<Arc<DeviceMain>> { make_device(engine) }",
+        );
+
+        assert!(expanded.contains("let __hammer_produced = init_device (__hammer_engine) ?"));
+        assert!(expanded.contains("__hammer_engine . registry . set (__hammer_produced)"));
+        assert!(expanded.contains("Ok (())"));
+    }
+
+    #[test]
+    fn init_adapter_supports_provider_without_engine_parameter() {
+        let expanded = expand_registered_test_function(
+            r#"name = "device""#,
+            "fn init_device(config: Arc<Config>) -> HammerResult<Arc<DeviceMain>> { make_device(config) }",
+        );
+
+        assert!(expanded.contains("registry . require :: < Config > () ?"));
+        assert!(expanded.contains("init_device (__hammer_injected_0) ?"));
+        assert!(expanded.contains("registry . set (__hammer_produced)"));
+    }
+
+    #[test]
+    fn init_adapter_publishes_present_optional_arc_results() {
+        let expanded = expand_registered_test_function(
+            r#"name = "tun""#,
+            "fn init_tun(engine: &mut Engine) -> HammerResult<Option<Arc<TunControl>>> { make_tun(engine) }",
+        );
+
+        assert!(
+            expanded.contains("if let Some (__hammer_produced) = init_tun (__hammer_engine) ?")
+        );
+        assert!(expanded.contains("__hammer_engine . registry . set (__hammer_produced)"));
+    }
+
+    #[test]
+    fn config_function_arguments_include_ordering_and_early_phase() {
+        let arguments = syn::parse_str::<ConfigFnArgs>(
+            r#"name = "session", early = true, runs_before = ["tcp"], runs_after = ["device"]"#,
+        )
+        .expect("parse config arguments");
+
+        assert!(arguments.early);
+        assert_eq!(arguments.init.name.value(), "session");
+        assert_eq!(arguments.init.runs_before[0].value(), "tcp");
+        assert_eq!(arguments.init.runs_after[0].value(), "device");
+    }
+
+    #[test]
+    fn config_function_uses_the_same_init_adapter_registration() {
+        let arguments =
+            syn::parse_str::<ConfigFnArgs>(r#"name = "session", runs_after = ["transport"]"#)
+                .expect("parse config arguments");
+        let function = syn::parse_str::<ItemFn>(
+            "fn configure_session(engine: &mut Engine) -> HammerResult<Option<Arc<Session>>> { configure(engine) }",
+        )
+        .expect("parse config function");
+        let expanded = expand_config_function(arguments, function)
+            .expect("expand config function")
+            .to_string();
+
+        assert!(expanded.contains("CONFIG_FUNCTIONS"));
+        assert!(expanded.contains("init :: InitFunction"));
+        assert!(!expanded.contains("ConfigFunction"));
+        assert!(expanded.contains("func : __hammer_init_adapter_configure_session"));
+        assert!(expanded.contains("runs_after : & [\"transport\"]"));
+    }
+
+    #[test]
+    fn main_loop_function_uses_the_same_init_adapter() {
+        let function = syn::parse_str::<ItemFn>(
+            "fn start_workers(engine: &mut Engine, handoff: Arc<HandoffMain>) -> HammerResult<()> { start(engine, handoff) }",
+        )
+        .expect("parse main-loop function");
+        let expanded = expand_main_loop_function(
+            function,
+            quote!(::hammer_runtime::init::MAIN_LOOP_ENTER_FUNCTIONS),
+        )
+        .expect("expand main-loop function")
+        .to_string();
+
+        assert!(expanded.contains("MAIN_LOOP_ENTER_FUNCTIONS"));
+        assert!(expanded.contains("registry . require :: < HandoffMain > () ?"));
+        assert!(expanded.contains("func : __hammer_init_adapter_start_workers"));
+    }
 
     #[test]
     fn node_function_expansion_registers_multiarch_candidates_without_graph_entry() {

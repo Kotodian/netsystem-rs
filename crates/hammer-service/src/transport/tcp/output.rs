@@ -24,7 +24,7 @@ pub enum TcpOutputNext {
 }
 
 #[hammer_component_macros::graph_node(
-    graph = service,
+    graph = tcp_worker,
     init = crate::transport::tcp::output::register_tcp_output,
     next = TcpOutputNext,
 )]

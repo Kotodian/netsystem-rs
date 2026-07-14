@@ -1,6 +1,8 @@
+use hammer_core::config::Config;
 use hammer_core::data_plane::DataPlaneBufferConfig;
+use hammer_core::registry::RuntimeRegistry;
 use hammer_runtime::init::{INIT_FUNCTIONS, topological_order};
-use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig};
+use hammer_runtime::{DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig, Engine};
 
 fn runtime_config(numa_nodes: &'static [u32], active_numa_node: u32) -> DataPlaneRuntimeConfig {
     DataPlaneRuntimeConfig {
@@ -80,6 +82,49 @@ fn start_workers_uses_static_memory_runtime_path() {
             )),
         "worker startup must derive worker runtimes from the initialized main runtime view"
     );
+}
+
+#[test]
+fn memory_init_materializes_the_configured_buffer_and_instruction_set_policy() {
+    let mut config = Config::default();
+    config.worker.buffer.slot_bytes = 4096;
+    config.worker.buffer.slots_per_numa = 7;
+    config.worker.buffer.frame_pool_size = 5;
+    config.worker.instruction_set = "scalar".to_owned();
+    let expected = hammer_runtime::new_worker_runtime(&config).expect("configured runtime");
+    let expected_stride = expected
+        .buffers()
+        .try_buffers()
+        .expect("configured buffer pool")
+        .slot_stride();
+    let registry = RuntimeRegistry::new();
+    let config = std::sync::Arc::new(config);
+    registry.set(std::sync::Arc::clone(&config));
+    let mut engine = Engine::new(DataPlaneRuntime::new(runtime_config(&[0], 0)), registry);
+
+    hammer_runtime::memory::memory_init(&mut engine, config).expect("configured memory init");
+
+    assert_eq!(
+        engine.runtime.instruction_set(),
+        DataPlaneInstructionSet::Scalar
+    );
+    assert_eq!(engine.runtime.buffers().frame_slots(), 5);
+    assert_eq!(
+        engine
+            .runtime
+            .buffers()
+            .try_buffers()
+            .unwrap()
+            .slot_stride(),
+        expected_stride
+    );
+    for _ in 0..7 {
+        engine
+            .runtime
+            .alloc_index()
+            .expect("configured buffer slot");
+    }
+    assert!(engine.runtime.alloc_index().is_err());
 }
 
 #[test]

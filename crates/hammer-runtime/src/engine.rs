@@ -1,12 +1,13 @@
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::registry::RuntimeRegistry;
 use hammer_runtime::DataPlaneRuntime;
 
-use crate::{DataWorkerId, FileMain};
+use crate::{DataPlaneHandoffWorker, DataWorkerId, FileMain};
 
 thread_local! {
     static CURRENT_ENGINE: RefCell<Option<*mut Engine>> = const { RefCell::new(None) };
@@ -17,6 +18,7 @@ pub(crate) struct EngineWorkerSeed<F> {
     registry: Arc<RuntimeRegistry>,
     wait_at_barrier: Arc<AtomicU32>,
     workers_at_barrier: Arc<AtomicU32>,
+    main_loop_exit_now: Arc<AtomicBool>,
 }
 
 #[repr(align(64))]
@@ -28,9 +30,10 @@ pub struct Engine {
     pub registry: Arc<RuntimeRegistry>,
     pub wait_at_barrier: Arc<AtomicU32>,
     pub workers_at_barrier: Arc<AtomicU32>,
-    pub main_loop_exit_now: AtomicBool,
+    pub main_loop_exit_now: Arc<AtomicBool>,
     pub main_loop_exit_status: Mutex<i32>,
     file_main: Option<FileMain>,
+    worker_threads: Mutex<hammer_infra::vec::Vec<JoinHandle<()>>>,
 }
 
 impl Engine {
@@ -40,6 +43,7 @@ impl Engine {
         registry: Arc<RuntimeRegistry>,
         wait_at_barrier: Arc<AtomicU32>,
         workers_at_barrier: Arc<AtomicU32>,
+        main_loop_exit_now: Arc<AtomicBool>,
         index: u32,
         numa_node: u32,
     ) -> HammerResult<Self> {
@@ -55,9 +59,10 @@ impl Engine {
             registry,
             wait_at_barrier,
             workers_at_barrier,
-            main_loop_exit_now: AtomicBool::new(false),
+            main_loop_exit_now,
             main_loop_exit_status: Mutex::new(0),
             file_main: Some(FileMain::new(worker)?),
+            worker_threads: Mutex::new(hammer_infra::vec::Vec::new()),
         })
     }
 
@@ -70,9 +75,10 @@ impl Engine {
             registry,
             wait_at_barrier: Arc::new(AtomicU32::new(0)),
             workers_at_barrier: Arc::new(AtomicU32::new(0)),
-            main_loop_exit_now: AtomicBool::new(false),
+            main_loop_exit_now: Arc::new(AtomicBool::new(false)),
             main_loop_exit_status: Mutex::new(0),
             file_main: None,
+            worker_threads: Mutex::new(hammer_infra::vec::Vec::new()),
         }
     }
 
@@ -86,6 +92,7 @@ impl Engine {
             Arc::clone(&self.registry),
             Arc::clone(&self.wait_at_barrier),
             Arc::clone(&self.workers_at_barrier),
+            Arc::clone(&self.main_loop_exit_now),
             index,
             numa_node,
         )
@@ -113,12 +120,48 @@ impl Engine {
 
     pub(crate) fn worker_seed(
         &self,
-    ) -> EngineWorkerSeed<impl Fn(u32, u32) -> DataPlaneRuntime + Send + 'static> {
-        EngineWorkerSeed {
-            runtime_seed: self.runtime.worker_seed(),
+    ) -> HammerResult<EngineWorkerSeed<impl Fn(u32, u32) -> DataPlaneRuntime + Send + 'static>>
+    {
+        let runtime_seed = self.runtime.worker_seed()?;
+        Ok(EngineWorkerSeed {
+            runtime_seed: move |thread_index, numa_node| {
+                runtime_seed.clone_for_worker(thread_index, numa_node)
+            },
             registry: Arc::clone(&self.registry),
             wait_at_barrier: Arc::clone(&self.wait_at_barrier),
             workers_at_barrier: Arc::clone(&self.workers_at_barrier),
+            main_loop_exit_now: Arc::clone(&self.main_loop_exit_now),
+        })
+    }
+
+    pub(crate) fn retain_worker_threads(
+        &self,
+        threads: &mut hammer_infra::vec::Vec<JoinHandle<()>>,
+    ) -> HammerResult<()> {
+        let mut retained = self
+            .worker_threads
+            .lock()
+            .map_err(|_| HammerError::internal("worker thread registry poisoned"))?;
+        if !retained.is_empty() {
+            return Err(HammerError::internal("data workers are already started"));
+        }
+        retained.extend(threads.drain(..));
+        Ok(())
+    }
+
+    fn join_worker_threads(&self) {
+        let threads = self
+            .worker_threads
+            .lock()
+            .map(|mut threads| std::mem::take(&mut *threads));
+        let Ok(threads) = threads else {
+            tracing::error!("worker thread registry poisoned during shutdown");
+            return;
+        };
+        for thread in threads {
+            if thread.join().is_err() {
+                tracing::error!("data worker panicked during shutdown");
+            }
         }
     }
 
@@ -153,12 +196,27 @@ where
     F: Fn(u32, u32) -> DataPlaneRuntime + Send + 'static,
 {
     #[inline]
-    pub(crate) fn spawn_on_numa(&self, index: u32, numa_node: u32) -> HammerResult<Engine> {
-        Engine::worker_with_runtime(
+    pub(crate) fn spawn_on_numa(
+        &self,
+        index: u32,
+        numa_node: u32,
+        handoff: DataPlaneHandoffWorker,
+    ) -> HammerResult<Engine> {
+        let worker = index
+            .checked_sub(1)
+            .map(DataWorkerId::new)
+            .ok_or_else(|| HammerError::internal("data worker thread index must be non-zero"))?;
+        let runtime = DataPlaneRuntime::attach_handoff_worker(
             (self.runtime_seed)(index, numa_node),
+            worker,
+            handoff,
+        );
+        Engine::worker_with_runtime(
+            runtime,
             Arc::clone(&self.registry),
             Arc::clone(&self.wait_at_barrier),
             Arc::clone(&self.workers_at_barrier),
+            Arc::clone(&self.main_loop_exit_now),
             index,
             numa_node,
         )
@@ -218,7 +276,10 @@ impl EnginePool {
 
     pub fn main_loop_enter(engine: &mut Engine) -> HammerResult<()> {
         engine.install_current();
+        crate::init::run_config_functions(engine, true)?;
         crate::init::run_init_functions(engine)?;
+        crate::init::run_config_functions(engine, false)?;
+        crate::init::run_main_loop_enter(engine)?;
         Ok(())
     }
 
@@ -229,6 +290,8 @@ impl EnginePool {
     }
 
     pub fn close(&mut self) {
+        Self::main_loop_exit(self.main_engine());
+        self.main_engine().join_worker_threads();
         if let Some(listener) = self.ipc_listener.take() {
             drop(listener);
         }

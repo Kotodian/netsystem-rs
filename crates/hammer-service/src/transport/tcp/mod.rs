@@ -186,23 +186,21 @@ pub(crate) fn reset_for_test() {
 }
 
 pub fn init(reg: &RuntimeRegistry) -> HammerResult<()> {
-    let main = TcpMain::new();
-    if let Some(config) = reg.get::<Config>() {
-        for entry in &config.network.tcp.listen {
-            main.bind_tcp_listener(
-                entry.address,
-                DataWorkerId::new(0),
-                TcpCapabilities::default(),
-            )?;
-        }
-    }
-    TCP_MAIN.store(Some(Arc::new(main)));
-    Ok(())
+    init_tcp(reg.require::<Config>()?)
 }
 
 #[hammer_component_macros::init_function(name = "tcp_init", runs_after = ["transport_init"])]
-fn init_tcp(engine: &mut hammer_runtime::Engine) -> HammerResult<()> {
-    init(engine.registry.as_ref())
+fn init_tcp(config: Arc<Config>) -> HammerResult<()> {
+    let main = TcpMain::new();
+    for entry in &config.network.tcp.listen {
+        main.bind_tcp_listener(
+            entry.address,
+            DataWorkerId::new(0),
+            TcpCapabilities::default(),
+        )?;
+    }
+    TCP_MAIN.store(Some(Arc::new(main)));
+    Ok(())
 }
 
 pub fn register_tcp_input(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {

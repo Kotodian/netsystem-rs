@@ -36,7 +36,7 @@ pub enum TcpListenNext {
 }
 
 #[hammer_component_macros::graph_node(
-    graph = service,
+    graph = tcp_worker,
     init = crate::transport::tcp::listen::register_tcp_listen,
     name = "tcp-listen",
     next = TcpListenNext,

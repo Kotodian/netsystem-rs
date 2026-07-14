@@ -343,23 +343,24 @@ pub(crate) fn reset_interface_main_for_test() {
 }
 
 pub fn init(reg: &RuntimeRegistry) -> HammerResult<()> {
-    let plane = InterfaceControlPlane::new();
-    if let Some(config) = reg.get::<Config>() {
-        for iface in &config.network.interface {
-            let mtu = InterfaceMtu::new(iface.mtu.l3, iface.mtu.ip4, iface.mtu.ip6, iface.mtu.mpls);
-            let index = plane.register_interface_with_mtu(iface.name.clone(), mtu)?;
-            for address in &iface.address {
-                plane.add_address(index, *address)?;
-            }
-        }
-    }
-    INTERFACE_MAIN.store(Some(Arc::new(plane)));
+    let plane = init_interface(reg.require::<Config>()?)?;
+    reg.set(plane);
     Ok(())
 }
 
 #[hammer_component_macros::init_function(name = "interface_init")]
-fn init_interface(engine: &mut hammer_runtime::Engine) -> HammerResult<()> {
-    init(engine.registry.as_ref())
+fn init_interface(config: Arc<Config>) -> HammerResult<Arc<InterfaceControlPlane>> {
+    let plane = InterfaceControlPlane::new();
+    for iface in &config.network.interface {
+        let mtu = InterfaceMtu::new(iface.mtu.l3, iface.mtu.ip4, iface.mtu.ip6, iface.mtu.mpls);
+        let index = plane.register_interface_with_mtu(iface.name.clone(), mtu)?;
+        for address in &iface.address {
+            plane.add_address(index, *address)?;
+        }
+    }
+    let plane = Arc::new(plane);
+    INTERFACE_MAIN.store(Some(Arc::clone(&plane)));
+    Ok(plane)
 }
 
 #[derive(Debug, Clone)]

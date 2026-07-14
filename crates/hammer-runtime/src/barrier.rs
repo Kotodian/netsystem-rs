@@ -59,6 +59,17 @@ pub fn barrier_check(wait: &AtomicU32, workers: &AtomicU32) {
     }
 }
 
+/// Startup-only barrier check whose release advances to another non-zero
+/// phase. The regular control-plane barrier always releases to zero.
+pub(crate) fn barrier_check_phase(wait: &AtomicU32, workers: &AtomicU32, phase: u32) {
+    debug_assert_ne!(phase, 0);
+    workers.fetch_add(1, Ordering::Release);
+    while wait.load(Ordering::Acquire) == phase {
+        spin_loop();
+    }
+    workers.fetch_sub(1, Ordering::Release);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

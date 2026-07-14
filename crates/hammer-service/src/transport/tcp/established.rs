@@ -22,7 +22,7 @@ pub enum TcpEstablishedNext {
 }
 
 #[hammer_component_macros::graph_node(
-    graph = service,
+    graph = tcp_worker,
     init = crate::transport::tcp::established::register_tcp_established,
     name = "tcp-established",
     next = TcpEstablishedNext,

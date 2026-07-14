@@ -6,13 +6,14 @@ use hammer_core::config::Config;
 use hammer_core::data_plane::{
     BufferFrame, BufferFrameBatchWidth, BufferFrameBatchWidthPolicy, BufferNodeError,
     BufferPoolArena, BufferRef, BufferRefMut, DataPlaneBufferChain, DataPlaneBufferConfig,
-    DataPlaneBuffers, Frame, Index, Next, NodeHandle, NodeId, NodeNext, Pending,
+    DataPlaneBuffers, Frame, Index, Next, NodeHandle, NodeId, NodeNext, NodeRegistration, Pending,
 };
 use hammer_core::error::{CoreError, CoreResult, DataPlaneError};
+use hammer_infra::vec::Vec;
 
 use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HANDOFF_SLOT_CAPACITY, HandoffSlot};
 use crate::instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
-use crate::node::{NodeEntry, NodeRuntime};
+use crate::node::{NodeEntry, NodeRuntime, NodeRuntimeInner};
 use crate::trace::{DataPlaneTrace, PacketTrace, TraceControlHandle};
 
 impl BufferFrameBatchWidthPolicy for FrameBatchWidth {
@@ -66,9 +67,10 @@ impl fmt::Debug for DataPlaneRuntime {
 pub(crate) type RuntimeDataPlaneRuntime = DataPlaneRuntime;
 
 #[derive(Clone)]
-struct DataPlaneRuntimeWorkerSeed {
-    buffer_arenas: std::vec::Vec<BufferPoolArena>,
+pub(crate) struct DataPlaneRuntimeWorkerSeed {
+    buffer_arenas: Vec<BufferPoolArena>,
     frame_slots: usize,
+    nodes: NodeRuntimeInner,
     instruction_set: DataPlaneInstructionSet,
     handoff: Option<DataPlaneHandoffWorker>,
     handoff_node_handle: Option<NodeHandle>,
@@ -138,7 +140,7 @@ impl Clone for DataPlaneRuntime {
 
 impl DataPlaneRuntimeWorkerSeed {
     #[inline]
-    fn clone_for_worker(&self, thread_index: u32, numa_node: u32) -> DataPlaneRuntime {
+    pub(crate) fn clone_for_worker(&self, thread_index: u32, numa_node: u32) -> DataPlaneRuntime {
         let mut runtime = DataPlaneRuntime::from_buffers_with_instruction_set(
             DataPlaneBuffers::from_cloned_buffer_arenas(
                 self.buffer_arenas.iter().cloned(),
@@ -148,6 +150,7 @@ impl DataPlaneRuntimeWorkerSeed {
             ),
             self.instruction_set,
         );
+        runtime.nodes = NodeRuntime::from_worker_inner(self.nodes.clone());
         runtime.handoff = self.handoff.clone();
         runtime.handoff_node_handle = self.handoff_node_handle;
         if let Some(handoff) = runtime.handoff.clone()
@@ -201,26 +204,22 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    fn seed_for_worker(&self) -> DataPlaneRuntimeWorkerSeed {
-        DataPlaneRuntimeWorkerSeed {
-            buffer_arenas: self.buffers.clone_buffer_arenas(),
-            frame_slots: self.buffers.frame_slots(),
-            instruction_set: self.instruction_set,
-            handoff: self.handoff.clone(),
-            handoff_node_handle: self.handoff_node_handle,
-        }
-    }
-
-    #[inline]
     pub fn clone_for_worker(&self, thread_index: u32, numa_node: u32) -> Self {
-        self.seed_for_worker()
+        self.worker_seed()
+            .expect("main graph must be resolved before worker clone")
             .clone_for_worker(thread_index, numa_node)
     }
 
     #[inline]
-    pub fn worker_seed(&self) -> impl Fn(u32, u32) -> DataPlaneRuntime + Send + 'static {
-        let seed = self.seed_for_worker();
-        move |thread_index, numa_node| seed.clone_for_worker(thread_index, numa_node)
+    pub(crate) fn worker_seed(&self) -> CoreResult<DataPlaneRuntimeWorkerSeed> {
+        Ok(DataPlaneRuntimeWorkerSeed {
+            buffer_arenas: self.buffers.clone_buffer_arenas(),
+            frame_slots: self.buffers.frame_slots(),
+            nodes: self.nodes.clone_inner_for_worker()?,
+            instruction_set: self.instruction_set,
+            handoff: self.handoff.clone(),
+            handoff_node_handle: self.handoff_node_handle,
+        })
     }
 
     #[inline]
@@ -352,7 +351,13 @@ impl DataPlaneRuntime {
                 self.instruction_set
             )));
         }
-        for entry in entries {
+        let owners = entries
+            .iter()
+            .filter(|entry| !matches!(entry.registration, NodeRegistration::Sibling { .. }));
+        let siblings = entries
+            .iter()
+            .filter(|entry| matches!(entry.registration, NodeRegistration::Sibling { .. }));
+        for entry in owners.chain(siblings) {
             let node = (entry.init)(self, worker).map_err(|err| {
                 CoreError::internal(format!(
                     "init graph node `{}`: {err}",

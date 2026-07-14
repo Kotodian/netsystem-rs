@@ -40,13 +40,14 @@ event_queue_length = 256
     )
     .expect("parse VPP-shaped session aliases");
 
-    assert_eq!(cfg.network.session.backend, SessionBackend::Svm);
+    let session = cfg.network.session.as_ref().expect("configured session");
+    assert_eq!(session.backend, SessionBackend::Svm);
     assert_eq!(
-        cfg.network.session.attach_socket_path.as_deref(),
+        session.attach_socket_path.as_deref(),
         Some("/var/run/hammer/attach.sock")
     );
-    assert_eq!(cfg.network.session.pool_capacity, 64);
-    assert_eq!(cfg.network.session.ready_queue_capacity, 256);
+    assert_eq!(session.pool_capacity, 64);
+    assert_eq!(session.ready_queue_capacity, 256);
 }
 
 #[test]
@@ -135,13 +136,14 @@ fn lab_toml_example_parses_to_locked_topology() {
     assert_eq!(cfg.worker.idle_slice, Duration::from_millis(50));
     assert_eq!(cfg.worker.buffer.slot_bytes, 2048);
     assert_eq!(cfg.worker.buffer.slots_per_numa, 2048);
-    assert_eq!(cfg.network.session.backend, SessionBackend::Svm);
+    let session = cfg.network.session.as_ref().expect("configured session");
+    assert_eq!(session.backend, SessionBackend::Svm);
     assert_eq!(
-        cfg.network.session.attach_socket_path.as_deref(),
+        session.attach_socket_path.as_deref(),
         Some("/var/run/hammer/attach.sock")
     );
-    assert_eq!(cfg.network.session.pool_capacity, 64);
-    assert_eq!(cfg.network.session.ready_queue_capacity, 256);
+    assert_eq!(session.pool_capacity, 64);
+    assert_eq!(session.ready_queue_capacity, 256);
     assert!(cfg.network.tcp.nagle);
     assert!(cfg.network.tcp.pmtu.enabled);
     assert_eq!(cfg.network.tcp.time_wait, Duration::from_secs(2));

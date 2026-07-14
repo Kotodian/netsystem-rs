@@ -57,7 +57,7 @@ IP reassembly drains the input Frame, retains pending fragments in Fragment Cont
 _Avoid_: reassembly emit_output get/push/put, packet-path NodeId next, Fanout of handoff-owned fragments, direct Lookup bypass of IP Input
 
 **TUN Ingress Fanout**:
-TUN input receives into the driver Frame, then enqueues every pending Index through Graph Fanout on the registered local next slot (slot 0). It does not acquire a separate Next Frame or push/put by target `NodeId`.
+TUN input is a `device-input` sibling. It receives into the Driver Frame, classifies the L3 version, and enqueues every pending Index through Graph Fanout on the inherited IPv4, IPv6, or Drop local Next Arc. It declares no independent next table and does not acquire a separate Next Frame or push/put by target `NodeId`.
 _Avoid_: TUN input get_next_frame/put_next_frame, NodeId hot-path next field
 
 **Graph Fanout**:

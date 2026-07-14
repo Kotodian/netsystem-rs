@@ -27,5 +27,6 @@ tracing = { workspace = true }
 smoltcp = { workspace = true }
 thiserror = { workspace = true }
 linkme = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]

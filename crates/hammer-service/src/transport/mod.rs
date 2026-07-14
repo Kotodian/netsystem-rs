@@ -76,19 +76,23 @@ pub(crate) fn reset_for_test() {
 }
 
 pub fn init(reg: &RuntimeRegistry) -> HammerResult<()> {
-    let config = reg.require::<hammer_core::config::Config>()?;
-    TRANSPORT_MAIN.store(Some(Arc::new(TransportMain::new(
-        config.network.tcp.congestion,
-        config.network.session.backend,
-        TcpPolicy::from_config(&config.network.tcp),
-    ))));
-    Ok(())
+    init_transport(reg.require::<hammer_core::config::Config>()?)
 }
 
 #[hammer_component_macros::init_function(name = "transport_init")]
-fn init_transport(engine: &mut hammer_runtime::Engine) -> HammerResult<()> {
-    let reg = &engine.registry;
-    init(reg)
+fn init_transport(config: Arc<hammer_core::config::Config>) -> HammerResult<()> {
+    let session_backend = config
+        .network
+        .session
+        .as_ref()
+        .map(|session| session.backend)
+        .unwrap_or_default();
+    TRANSPORT_MAIN.store(Some(Arc::new(TransportMain::new(
+        config.network.tcp.congestion,
+        session_backend,
+        TcpPolicy::from_config(&config.network.tcp),
+    ))));
+    Ok(())
 }
 
 /// Config → CC controller type. Single transport-layer dispatch point.

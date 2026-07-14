@@ -106,7 +106,9 @@ fn merge_config(dst: &mut Config, src: &Config) {
     dst.trace.inputs.extend(src.trace.inputs.clone());
     dst.network.tcp = src.network.tcp.clone();
     dst.network.ip = src.network.ip.clone();
-    dst.network.session = src.network.session.clone();
+    if src.network.session.is_some() {
+        dst.network.session = src.network.session.clone();
+    }
     dst.network.interface.extend(src.network.interface.clone());
     dst.network.route.extend(src.network.route.clone());
     dst.worker = src.worker.clone();

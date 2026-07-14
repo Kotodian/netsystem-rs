@@ -145,7 +145,7 @@ impl TcpInputControlPlane {
 }
 
 #[hammer_component_macros::graph_node(
-    graph = service,
+    graph = tcp_worker,
     name = "tcp-input",
     next = TcpInputNext,
     init = crate::transport::tcp::register_tcp_input,

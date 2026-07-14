@@ -19,7 +19,7 @@ fn parse_config_builds_enabled_trace_options() {
         packet_capacity = 8
 
         [[trace.inputs]]
-        node = "tun-input-driver"
+        node = "tun-input"
         count = 4
 
         [[trace.inputs]]
@@ -31,7 +31,7 @@ fn parse_config_builds_enabled_trace_options() {
     assert_eq!(options.trace.record_capacity, 32);
     assert_eq!(options.trace.packet_capacity, 8);
     assert_eq!(options.trace.inputs.len(), 2);
-    assert_eq!(options.trace.inputs[0].node, "tun-input-driver");
+    assert_eq!(options.trace.inputs[0].node, "tun-input");
     assert_eq!(options.trace.inputs[0].count, 4);
     assert_eq!(options.trace.inputs[1].node, "ip-input");
     assert_eq!(options.trace.inputs[1].count, 2);
@@ -46,7 +46,7 @@ fn parse_config_keeps_trace_disabled_with_inputs_as_no_marking_policy() {
         packet_capacity = 4
 
         [[trace.inputs]]
-        node = "tun-input-driver"
+        node = "tun-input"
         count = 10
     "#};
     let options = config::parse_config(cfg).expect("parse disabled trace config");

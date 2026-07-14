@@ -53,25 +53,14 @@ impl Ordered for InitFunction {
     }
 }
 
-pub struct ConfigFunction {
-    pub name: &'static str,
-    pub func: fn(&mut Engine, &toml::Value) -> HammerResult<()>,
-}
-
-impl Ordered for ConfigFunction {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-}
-
 #[linkme::distributed_slice]
 pub static INIT_FUNCTIONS: [InitFunction] = [..];
 
 #[linkme::distributed_slice]
-pub static CONFIG_FUNCTIONS: [ConfigFunction] = [..];
+pub static CONFIG_FUNCTIONS: [InitFunction] = [..];
 
 #[linkme::distributed_slice]
-pub static EARLY_CONFIG_FUNCTIONS: [ConfigFunction] = [..];
+pub static EARLY_CONFIG_FUNCTIONS: [InitFunction] = [..];
 
 #[linkme::distributed_slice]
 pub static MAIN_LOOP_ENTER_FUNCTIONS: [InitFunction] = [..];
@@ -135,50 +124,37 @@ pub fn topological_order<T: Ordered>(items: &[T]) -> Result<Vec<usize>, InitErro
     Ok(result)
 }
 
-fn dispatch<T: Ordered>(
-    items: &[T],
-    engine: &mut Engine,
-    run: impl Fn(&T, &mut Engine) -> HammerResult<()>,
-) -> HammerResult<()> {
+fn dispatch_init(items: &[InitFunction], engine: &mut Engine) -> HammerResult<()> {
     let order = topological_order(items)?;
-    for idx in order {
-        run(&items[idx], engine)?;
+    for index in order {
+        (items[index].func)(engine)?;
     }
     Ok(())
 }
 
 pub fn run_init_functions(engine: &mut Engine) -> HammerResult<()> {
-    dispatch(&INIT_FUNCTIONS, engine, |f, e| (f.func)(e))
+    dispatch_init(&INIT_FUNCTIONS, engine)
 }
 
 pub fn run_worker_init_functions(engine: &mut Engine) -> HammerResult<()> {
-    dispatch(&WORKER_INIT_FUNCTIONS, engine, |f, e| (f.func)(e))
+    dispatch_init(&WORKER_INIT_FUNCTIONS, engine)
 }
 
 pub fn run_main_loop_enter(engine: &mut Engine) -> HammerResult<()> {
-    dispatch(&MAIN_LOOP_ENTER_FUNCTIONS, engine, |f, e| (f.func)(e))
+    dispatch_init(&MAIN_LOOP_ENTER_FUNCTIONS, engine)
 }
 
 pub fn run_main_loop_exit(engine: &mut Engine) -> HammerResult<()> {
-    dispatch(&MAIN_LOOP_EXIT_FUNCTIONS, engine, |f, e| (f.func)(e))
+    dispatch_init(&MAIN_LOOP_EXIT_FUNCTIONS, engine)
 }
 
-pub fn run_config_functions(
-    engine: &mut Engine,
-    early: bool,
-    config: &toml::Value,
-) -> HammerResult<()> {
+pub fn run_config_functions(engine: &mut Engine, early: bool) -> HammerResult<()> {
     let functions = if early {
         &EARLY_CONFIG_FUNCTIONS[..]
     } else {
         &CONFIG_FUNCTIONS[..]
     };
-    let empty = toml::Value::Table(toml::value::Table::new());
-    for func in functions {
-        let section = config.get(func.name).unwrap_or(&empty);
-        (func.func)(engine, section)?;
-    }
-    Ok(())
+    dispatch_init(functions, engine)
 }
 
 #[cfg(test)]

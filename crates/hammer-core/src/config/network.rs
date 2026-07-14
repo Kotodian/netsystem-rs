@@ -65,7 +65,8 @@ const SESSION_BUFFER_SLOTS: usize = 1;
 pub struct Network {
     pub tcp: Tcp,
     pub ip: Ip,
-    pub session: Session,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<Session>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interface: Vec<Interface>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -77,7 +78,7 @@ impl Default for Network {
         Self {
             tcp: Tcp::default(),
             ip: Ip::default(),
-            session: Session::default(),
+            session: None,
             interface: Vec::new(),
             route: Vec::new(),
         }
@@ -92,7 +93,9 @@ impl Network {
     pub fn validate(&self) -> HammerResult<()> {
         self.tcp.validate()?;
         self.ip.validate()?;
-        self.session.validate()?;
+        if let Some(session) = &self.session {
+            session.validate()?;
+        }
         self.validate_interfaces()?;
         validate_routes(&self.route)?;
         Ok(())
@@ -647,13 +650,15 @@ mod tests {
             network.ip.reassembly.max_fragments_per_reassembly,
             MAX_FRAGMENTS_PER_REASSEMBLY
         );
-        assert_eq!(network.session.timer_tick, SESSION_TIMER_TICK);
-        assert_eq!(network.session.pool_capacity, SESSION_POOL_CAPACITY);
-        assert_eq!(network.session.ready_queue_capacity, READY_QUEUE_CAPACITY);
-        assert_eq!(network.session.app_session_capacity, APP_SESSION_CAPACITY);
-        assert_eq!(network.session.ooo_capacity, OOO_CAPACITY);
-        assert_eq!(network.session.buffer.slot_bytes, SESSION_BUFFER_SLOT_BYTES);
-        assert_eq!(network.session.buffer.slots, SESSION_BUFFER_SLOTS);
+        assert!(network.session.is_none());
+        let session = Session::default();
+        assert_eq!(session.timer_tick, SESSION_TIMER_TICK);
+        assert_eq!(session.pool_capacity, SESSION_POOL_CAPACITY);
+        assert_eq!(session.ready_queue_capacity, READY_QUEUE_CAPACITY);
+        assert_eq!(session.app_session_capacity, APP_SESSION_CAPACITY);
+        assert_eq!(session.ooo_capacity, OOO_CAPACITY);
+        assert_eq!(session.buffer.slot_bytes, SESSION_BUFFER_SLOT_BYTES);
+        assert_eq!(session.buffer.slots, SESSION_BUFFER_SLOTS);
         assert_eq!(network.interface, Vec::new());
     }
 
@@ -715,9 +720,10 @@ mod tests {
         assert_eq!(network.tcp.retransmit.initial, Duration::from_millis(100));
         assert_eq!(network.tcp.keepalive.probe_limit, 4);
         assert_eq!(network.ip.reassembly.max_reassemblies, 512);
-        assert_eq!(network.session.timer_tick, Duration::from_millis(5));
-        assert_eq!(network.session.buffer.slot_bytes, 4096);
-        assert_eq!(network.session.buffer.slots, 4);
+        let session = network.session.as_ref().expect("configured session");
+        assert_eq!(session.timer_tick, Duration::from_millis(5));
+        assert_eq!(session.buffer.slot_bytes, 4096);
+        assert_eq!(session.buffer.slots, 4);
         assert_eq!(network.interface.len(), 1);
         assert_eq!(network.interface[0].name, "tun0");
         assert_eq!(network.interface[0].driver, InterfaceDriver::Tun);
@@ -732,7 +738,7 @@ mod tests {
         assert_eq!(network.tcp.mss, 1200);
         assert_eq!(network.tcp.receive_window, TCP_WINDOW);
         assert_eq!(network.tcp.time_wait, TCP_TIME_WAIT);
-        assert_eq!(network.session.timer_tick, SESSION_TIMER_TICK);
+        assert!(network.session.is_none());
         assert_eq!(network.ip.reassembly.max_reassemblies, MAX_REASSEMBLIES);
     }
 

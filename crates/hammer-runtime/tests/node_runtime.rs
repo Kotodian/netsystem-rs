@@ -7,7 +7,7 @@ use hammer_core::data_plane::{
 use hammer_core::error::CoreResult;
 use hammer_runtime::{
     DataPlaneRuntime, DataPlaneRuntimeConfig, DriverNode, InternalNode, Node, NodeDescriptor,
-    NodeProcessFn, NodeResult, NodeRuntimeData, TraceFormatter, process_frame,
+    NodeEntry, NodeProcessFn, NodeResult, NodeRuntimeData, TraceFormatter, process_frame,
 };
 
 static NODE_CALLS_BY_WORD: [AtomicU64; 128] = [const { AtomicU64::new(0) }; 128];
@@ -32,6 +32,61 @@ fn test_runtime(
         ..DataPlaneBufferConfig::default()
     };
     DataPlaneRuntime::new(DataPlaneRuntimeConfig { buffers })
+}
+
+fn init_graph_owner(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+    runtime.nodes().try_register_descriptor(
+        NodeKind::Internal,
+        NodeDescriptor::new(
+            count_process,
+            NodeRuntimeData::empty(),
+            NodeRegistration::next("init-graph-owner", 0),
+            &[],
+            None,
+        ),
+    )
+}
+
+fn init_graph_sibling(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+    runtime.nodes().try_register_descriptor(
+        NodeKind::Internal,
+        NodeDescriptor::new(
+            count_process,
+            NodeRuntimeData::empty(),
+            NodeRegistration::sibling_of("init-graph-sibling", "init-graph-owner"),
+            &[],
+            None,
+        ),
+    )
+}
+
+#[test]
+fn init_graph_registers_sibling_owner_before_sibling() {
+    let runtime = test_runtime(64, 4, 2);
+    let entries = [
+        NodeEntry {
+            registration: NodeRegistration::sibling_of("init-graph-sibling", "init-graph-owner"),
+            kind: NodeKind::Internal,
+            init: init_graph_sibling,
+        },
+        NodeEntry {
+            registration: NodeRegistration::next("init-graph-owner", 0),
+            kind: NodeKind::Internal,
+            init: init_graph_owner,
+        },
+    ];
+
+    runtime
+        .init_graph(0, &entries)
+        .expect("owner must be registered before sibling regardless of linkme order");
+
+    let owner = runtime
+        .node_by_name("init-graph-owner")
+        .expect("owner registered");
+    let sibling = runtime
+        .node_by_name("init-graph-sibling")
+        .expect("sibling registered");
+    assert_eq!(runtime.nodes().node_siblings(owner).unwrap(), vec![sibling]);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -829,6 +884,254 @@ fn add_node_next_slot_keeps_sibling_tables_consistent() {
             .node_next_slot(sibling, usize::from(slot))
             .unwrap(),
         target
+    );
+}
+
+#[test]
+fn add_node_next_slot_reuses_existing_target_across_sibling_family() {
+    let runtime = test_runtime(64, 4, 2);
+    let first = runtime.nodes().register_internal(DescriptorNode::plain(
+        count_process,
+        NodeRuntimeData::from_words([1, 0, 0, 0]),
+    ));
+    let second = runtime.nodes().register_internal(DescriptorNode::plain(
+        count_process,
+        NodeRuntimeData::from_words([2, 0, 0, 0]),
+    ));
+    let appended = runtime.nodes().register_internal(DescriptorNode::plain(
+        count_process,
+        NodeRuntimeData::from_words([3, 0, 0, 0]),
+    ));
+    let owner = runtime.nodes().register_internal(DescriptorNode::next(
+        "sibling-existing-owner",
+        count_process,
+        NodeRuntimeData::empty(),
+        [first, second],
+    ));
+    let sibling = runtime.nodes().register_internal(DescriptorNode::sibling(
+        "sibling-existing-child",
+        "sibling-existing-owner",
+        count_process,
+        NodeRuntimeData::empty(),
+    ));
+
+    let existing_slot = runtime
+        .nodes()
+        .add_node_next_slot(sibling, second)
+        .expect("reuse existing target from sibling");
+    assert_eq!(existing_slot, 1);
+
+    let appended_slot = runtime
+        .nodes()
+        .add_node_next_slot(sibling, appended)
+        .expect("append target from sibling after reused slot");
+    assert_eq!(appended_slot, 2);
+    assert_eq!(
+        runtime
+            .nodes()
+            .node_next_slot(owner, usize::from(appended_slot))
+            .unwrap(),
+        appended
+    );
+}
+
+#[test]
+fn worker_clone_materializes_the_registered_graph_without_rebinding_nodes() {
+    const HANDLE: NodeHandle = NodeHandle::new(41);
+
+    reset_calls(73);
+    let runtime = test_runtime(64, 8, 4);
+    let drop = runtime.nodes().register_internal(DescriptorNode::plain(
+        count_process,
+        NodeRuntimeData::empty(),
+    ));
+    let owner = runtime
+        .nodes()
+        .register_internal_with_handle(
+            HANDLE,
+            DescriptorNode::next(
+                "worker-clone-owner",
+                count_process,
+                NodeRuntimeData::from_words([73, 0, 0, 0]),
+                [drop, drop],
+            )
+            .with_trace(trace_formatter),
+        )
+        .expect("register canonical owner");
+    let sibling = runtime.nodes().register_internal(DescriptorNode::sibling(
+        "worker-clone-sibling",
+        "worker-clone-owner",
+        count_process,
+        NodeRuntimeData::from_words([74, 0, 0, 0]),
+    ));
+
+    let worker = runtime.clone_for_worker(1, 0);
+
+    assert_eq!(worker.node_by_name("worker-clone-owner"), Some(owner));
+    assert_eq!(worker.node_by_name("worker-clone-sibling"), Some(sibling));
+    assert_eq!(worker.nodes().node_for_handle(HANDLE).unwrap(), owner);
+    assert_eq!(worker.nodes().node_kind(owner).unwrap(), NodeKind::Internal);
+    assert_eq!(worker.nodes().node_siblings(owner).unwrap(), vec![sibling]);
+    assert_eq!(
+        worker
+            .nodes()
+            .node_next_slot(sibling, TestNext::Alternate as usize)
+            .unwrap(),
+        drop
+    );
+    assert_eq!(
+        worker
+            .nodes()
+            .node_trace_formatter(owner)
+            .unwrap()
+            .expect("canonical trace formatter")(b"abc"),
+        "descriptor trace bytes=3"
+    );
+
+    let mut frame = worker.buffers().get_next_frame(owner).expect("alloc frame");
+    push_packet(&worker, &mut frame, b"packet");
+    worker.put_next_frame(frame).expect("put next frame");
+    assert_eq!(worker.run_ready_nodes().expect("run cloned node"), 1);
+    assert_eq!(calls_for(73), 1);
+
+    let duplicate = worker.nodes().try_register_internal(DescriptorNode::next(
+        "worker-clone-owner",
+        count_process,
+        NodeRuntimeData::from_words([99, 0, 0, 0]),
+        [drop, drop],
+    ));
+    assert!(
+        duplicate
+            .expect_err("registration must not become worker binding")
+            .to_string()
+            .contains("node name is already registered")
+    );
+}
+
+#[test]
+fn worker_clone_resets_execution_state_but_keeps_configured_node_state() {
+    reset_calls(81);
+    let runtime = test_runtime(64, 8, 4);
+    let drop = runtime.nodes().register_internal(DescriptorNode::plain(
+        count_process,
+        NodeRuntimeData::empty(),
+    ));
+    let node = runtime.nodes().register_internal(DescriptorNode::next(
+        "worker-clone-state",
+        count_process,
+        NodeRuntimeData::from_words([81, 0, 0, 0]),
+        [drop, drop],
+    ));
+    let driver = runtime.nodes().register_driver(DescriptorNode::plain(
+        count_process,
+        NodeRuntimeData::empty(),
+    ));
+
+    let mut frame = runtime.buffers().get_next_frame(node).expect("alloc frame");
+    push_packet(&runtime, &mut frame, b"packet");
+    runtime.put_next_frame(frame).expect("put next frame");
+    assert_eq!(runtime.run_ready_nodes().expect("run canonical node"), 1);
+
+    let encoded = runtime
+        .nodes()
+        .increment_node_error(node, 7)
+        .expect("define and increment node error");
+    runtime
+        .nodes()
+        .set_node_state(driver, NodeState::Interrupt)
+        .expect("configure interrupt driver");
+    assert!(
+        runtime
+            .set_node_interrupt_pending(driver)
+            .expect("schedule canonical interrupt")
+    );
+    assert!(runtime.nodes().has_pending());
+
+    let worker = runtime.clone_for_worker(1, 0);
+
+    assert!(!worker.nodes().has_pending());
+    assert_eq!(worker.current_node(), None);
+    assert_eq!(
+        worker.nodes().node_state(driver).unwrap(),
+        NodeState::Interrupt
+    );
+    assert_eq!(worker.nodes().node_error_count(node, 7).unwrap(), 0);
+    assert_eq!(
+        worker.nodes().decode_node_error(encoded).unwrap(),
+        runtime.nodes().decode_node_error(encoded).unwrap()
+    );
+    let row = worker
+        .nodes()
+        .node_runtime_stats_snapshot()
+        .into_iter()
+        .find(|row| row.node_id == node)
+        .expect("cloned node stats row");
+    assert_eq!(row.calls, 0);
+    assert_eq!(row.vectors, 0);
+    assert!(
+        worker
+            .set_node_interrupt_pending(driver)
+            .expect("worker interrupt pending starts clear")
+    );
+}
+
+#[test]
+fn worker_sibling_next_updates_are_local_to_that_graph_clone() {
+    let runtime = test_runtime(64, 8, 4);
+    let initial = runtime.nodes().register_internal(DescriptorNode::plain(
+        count_process,
+        NodeRuntimeData::from_words([1, 0, 0, 0]),
+    ));
+    let dynamic = runtime.nodes().register_internal(DescriptorNode::plain(
+        count_process,
+        NodeRuntimeData::from_words([2, 0, 0, 0]),
+    ));
+    let owner = runtime.nodes().register_internal(DescriptorNode::next(
+        "worker-sibling-owner",
+        count_process,
+        NodeRuntimeData::empty(),
+        [initial, initial],
+    ));
+    let sibling = runtime.nodes().register_internal(DescriptorNode::sibling(
+        "worker-sibling-child",
+        "worker-sibling-owner",
+        count_process,
+        NodeRuntimeData::empty(),
+    ));
+    let first = runtime.clone_for_worker(1, 0);
+    let second = runtime.clone_for_worker(2, 0);
+
+    let slot = first
+        .nodes()
+        .add_node_next_slot(sibling, dynamic)
+        .expect("add worker-local sibling next");
+
+    assert_eq!(slot, 2);
+    assert_eq!(
+        first
+            .nodes()
+            .node_next_slot(owner, usize::from(slot))
+            .unwrap(),
+        dynamic
+    );
+    assert_eq!(
+        first
+            .nodes()
+            .node_next_slot(sibling, usize::from(slot))
+            .unwrap(),
+        dynamic
+    );
+    assert!(
+        runtime
+            .nodes()
+            .node_next_slot(owner, usize::from(slot))
+            .is_err()
+    );
+    assert!(
+        second
+            .nodes()
+            .node_next_slot(owner, usize::from(slot))
+            .is_err()
     );
 }
 

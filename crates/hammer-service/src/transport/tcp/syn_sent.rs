@@ -24,7 +24,7 @@ pub enum TcpSynSentNext {
 }
 
 #[hammer_component_macros::graph_node(
-    graph = service,
+    graph = tcp_worker,
     init = crate::transport::tcp::syn_sent::register_tcp_syn_sent,
     name = "tcp-syn-sent",
     next = TcpSynSentNext,

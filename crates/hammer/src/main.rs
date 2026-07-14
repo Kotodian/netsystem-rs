@@ -4,7 +4,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use hammer_core::config::Config;
-use hammer_core::config::SessionBackend;
 use hammer_core::registry::RuntimeRegistry;
 use hammer_runtime::engine::{Engine, EnginePool};
 use hammer_runtime::new_worker_runtime;
@@ -52,32 +51,6 @@ fn main() {
 
     let listener = bind_ipc_socket();
     pool.set_ipc_listener(listener);
-
-    let mut attach_server: Option<hammer_runtime::attach::AttachServer> = None;
-    {
-        let config = registry.require::<Config>().unwrap_or_else(|e| {
-            eprintln!("failed to get config from registry: {e}");
-            std::process::exit(1);
-        });
-        if config.network.session.backend == SessionBackend::Svm {
-            let path = config
-                .network
-                .session
-                .attach_socket_path
-                .as_deref()
-                .unwrap_or_else(|| {
-                    eprintln!("attach_socket_path is required when session.backend = \"svm\"");
-                    std::process::exit(1);
-                });
-            attach_server = Some(
-                hammer_runtime::attach::AttachServer::bind(path).unwrap_or_else(|e| {
-                    eprintln!("failed to bind attach server: {e}");
-                    std::process::exit(1);
-                }),
-            );
-            eprintln!("attach server bound at {path}");
-        }
-    }
 
     let pool_engine = pool.main_engine_mut();
     EnginePool::main_loop_enter(pool_engine).unwrap_or_else(|e| {
