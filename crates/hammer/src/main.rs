@@ -73,7 +73,8 @@ fn main() {
     pool_engine
         .shutdown_process_nodes(&rt)
         .unwrap_or_else(|error| tracing::error!(%error, "Process Node shutdown failed"));
-    pool.close();
+    pool.close()
+        .unwrap_or_else(|error| tracing::error!(%error, "Main-loop exit hook failed"));
     Engine::uninstall_current();
 }
 

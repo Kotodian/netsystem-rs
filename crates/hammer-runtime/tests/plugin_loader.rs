@@ -39,20 +39,19 @@ fn platform_library_name_uses_hammer_plugin_prefix() {
 
 #[test]
 fn empty_root_set_loads_no_plugin_instances() {
-    let main = PluginMain::load(
+    PluginMain::load(
         env!("CARGO_PKG_VERSION"),
-        "/directory/does/not/need/to/exist",
+        std::path::Path::new("/directory/does/not/need/to/exist"),
         &[],
     )
     .expect("empty plugin set");
-    assert!(main.loaded_plugins().is_empty());
 }
 
 #[test]
 fn duplicate_roots_are_rejected_before_opening_libraries() {
     let error = PluginMain::load(
         env!("CARGO_PKG_VERSION"),
-        "/directory/does/not/need/to/exist",
+        std::path::Path::new("/directory/does/not/need/to/exist"),
         &["udp".into(), "udp".into()],
     )
     .expect_err("duplicate roots must fail");
@@ -116,23 +115,31 @@ fn dso_constructors_publish_and_failed_load_unlinks_before_successful_activation
     _ = install_packet_graph(&mut rollback_probe, Arc::new(Default::default()));
     assert!(rollback_probe.runtime.node_by_name("udp-input").is_none());
 
-    let config = Arc::new(parse_config("plugins = [\"udp\"]").expect("UDP plugin config"));
+    let config =
+        Arc::new(parse_config("plugins = [\"ip\", \"udp\"]").expect("IP and UDP plugin config"));
     let mut engine = test_engine();
     engine.registry.set(Arc::clone(&config));
+    let error = engine
+        .load_plugins_from_config(&built_plugin_path())
+        .expect_err("plugin loading before memory_init must fail");
+    assert!(error.to_string().contains("memory_init must complete"));
+    hammer_runtime::memory::memory_init(&mut engine, Arc::clone(&config))
+        .expect("initialize memory before plugin loading");
     engine
         .load_plugins_from_config(&built_plugin_path())
         .expect("load UDP dependency closure");
-    assert_eq!(engine.loaded_plugins(), ["ip", "udp"]);
-
-    for name in ["ip", "udp"] {
-        let registration = engine
-            .plugin_main()
-            .registration(name)
-            .expect("plugin metadata");
-        assert_eq!(registration.name, name);
-        assert_eq!(registration.version, env!("CARGO_PKG_VERSION"));
-    }
+    assert_eq!(engine.loaded_plugins().as_slice(), ["ip", "udp"]);
 
     engine.start_process_nodes().expect("start Process Nodes");
     assert!(engine.process_handle("ip-reassembly-expire-walk").is_some());
+
+    drop(engine);
+
+    let mut retained_probe = test_engine();
+    retained_probe.registry.set(Arc::clone(&config));
+    hammer_runtime::init::run_config_functions(&mut retained_probe, true)
+        .expect("configure process-retained plugin images");
+    hammer_runtime::init::run_init_functions(&mut retained_probe)
+        .expect("initialize process-retained plugin images");
+    assert!(retained_probe.runtime.node_by_name("udp-input").is_some());
 }

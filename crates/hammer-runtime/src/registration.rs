@@ -167,8 +167,9 @@ fn collect<T: Copy>(inventory: impl Fn(&RegistrationInventories) -> &[T]) -> Vec
         let mut current = REGISTRATION_HEAD.load(Ordering::Acquire);
         while !current.is_null() {
             // SAFETY: the protected list contains only linked static images;
-            // copied entries stay valid because PluginMain retains every
-            // activated provider DSO until runtime state has been dropped.
+            // copied entries stay valid because the process-global PluginMain
+            // owns every activated provider DSO until process exit. Failed
+            // transactions unlink before returning their error.
             let image = unsafe { &*current };
             // SAFETY: a linked image initializes inventories before
             // publication, and the lock prevents unlink during this read.

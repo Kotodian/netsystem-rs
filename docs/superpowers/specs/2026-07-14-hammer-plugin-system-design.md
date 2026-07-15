@@ -26,10 +26,13 @@ The Hammer ownership mapping is therefore:
   exactly the same mechanism.
 - `PluginRegistration` exports metadata only: name, version requirement, and
   `load_after` dependencies.
-- `PluginMain` owns the plugin path, dependency order, and DSO handles only.
-  It does not own, filter, or merge executable registrations.
-- `Engine` and workers retain the same `Arc<PluginMain>`, so dynamically
-  installed function pointers cannot outlive their provider handles.
+- `PluginMain` owns the dependency order, name-to-library index, and DSO handles
+  only. It does not own, filter, or merge executable registrations. Its vectors
+  and hash table allocate from the Hammer main heap through `hammer-infra`.
+- A completed load transaction moves its `PluginMain` into the single
+  process-scope authority. Activated plugin code and static data therefore
+  remain mapped until process exit, including when runtime or registry state
+  outlives an individual `Engine`.
 
 There is no service registration export, Registrar, second runtime authority,
 weak registration symbol, or static/dynamic merge path.
@@ -58,14 +61,17 @@ those image-local slices; they do not accept a plugin owner argument.
 Startup proceeds on the main thread:
 
 1. Process-start constructors publish the runtime and service images.
-2. Read configured plugin roots from `plugins = [...]`.
-3. `PluginMain` calls `dlopen`. The DSO constructor publishes its image before
+2. Run the static no-lock `memory_init` and materialize the configured runtime
+   memory before any plugin allocation or `dlopen`.
+3. Read configured plugin roots from `plugins = [...]` and expand dependencies
+   through transaction-local `hammer-infra` hash tables.
+4. `PluginMain` calls `dlopen`. The DSO constructor publishes its image before
    `dlopen` returns.
-4. Read the metadata export, validate its name and host SemVer, then load each
+5. Read the metadata export, validate its name and host SemVer, then load each
    transitive `load_after` dependency in dependency order.
-5. Lifecycle, graph, Node Function, and Process Node consumers read the one
+6. Lifecycle, graph, Node Function, and Process Node consumers read the one
    runtime authority. They do not consult `PluginMain` for executable records.
-6. Build the graph once on the main thread, clone the resolved graph for Data
+7. Build the graph once on the main thread, clone the resolved graph for Data
    Workers, and start Process Nodes on the main thread's Tokio `LocalSet`.
 
 An empty root list opens no plugin DSOs. Missing libraries report the requested
@@ -80,9 +86,10 @@ Each unload destructor removes its `RegistrationImage` before the image is
 unmapped, so a later runtime collection cannot observe stale function pointers.
 
 After successful activation Hammer exposes no generic unload, replacement, or
-inventory-filtering operation. Workers and Process Nodes stop and graph state
-is dropped before the retained `PluginMain` handles are released during normal
-process shutdown.
+inventory-filtering operation. Activated handles remain mapped until process
+exit; disable is isolation rather than `dlclose`, as approved in #95. Shutdown
+stops Data Workers before dispatching registered main-loop-exit hooks, matching
+the ordering in vendored VPP `vlib/main.c`.
 
 ## Layer isolation contract
 
@@ -107,8 +114,11 @@ process shutdown.
   consumer may race activation with a failed-load handle rollback.
 - Workspace linking uses the shared Hammer dynamic libraries. A plugin that
   embeds another Hammer runtime would create a second authority and is invalid.
-- Runtime graph state and Process Node futures are destroyed before the final
-  plugin handle.
+- The safe host API does not expose borrowed registration metadata independently
+  of `PluginMain`; the `repr(C)` metadata record and raw symbol remain an
+  internal `dlopen` boundary.
+- Activated plugin handles are never dropped. Failed load transactions unlink
+  their registration images before their transaction-local handles are closed.
 
 Focused verification:
 

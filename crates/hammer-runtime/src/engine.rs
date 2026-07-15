@@ -19,10 +19,10 @@ thread_local! {
 pub(crate) struct EngineWorkerSeed<F> {
     runtime_seed: F,
     registry: Arc<RuntimeRegistry>,
-    plugin_main: Arc<PluginMain>,
     wait_at_barrier: Arc<AtomicU32>,
     workers_at_barrier: Arc<AtomicU32>,
     main_loop_exit_now: Arc<AtomicBool>,
+    memory_initialized: bool,
 }
 
 #[repr(align(64))]
@@ -36,11 +36,11 @@ pub struct Engine {
     pub workers_at_barrier: Arc<AtomicU32>,
     pub main_loop_exit_now: Arc<AtomicBool>,
     pub main_loop_exit_status: Mutex<i32>,
+    pub(crate) memory_initialized: bool,
+    main_loop_exit_functions_called: bool,
     file_main: Option<FileMain>,
     worker_threads: Mutex<Vec<JoinHandle<()>>>,
     processes: ProcessMain,
-    // Must drop after runtime graph state and Process Node futures.
-    plugin_main: Arc<PluginMain>,
 }
 
 impl Engine {
@@ -48,10 +48,10 @@ impl Engine {
     fn worker_with_runtime(
         runtime: DataPlaneRuntime,
         registry: Arc<RuntimeRegistry>,
-        plugin_main: Arc<PluginMain>,
         wait_at_barrier: Arc<AtomicU32>,
         workers_at_barrier: Arc<AtomicU32>,
         main_loop_exit_now: Arc<AtomicBool>,
+        memory_initialized: bool,
         index: u32,
         numa_node: u32,
     ) -> HammerResult<Self> {
@@ -69,10 +69,11 @@ impl Engine {
             workers_at_barrier,
             main_loop_exit_now,
             main_loop_exit_status: Mutex::new(0),
+            memory_initialized,
+            main_loop_exit_functions_called: false,
             file_main: Some(FileMain::new(worker)?),
             worker_threads: Mutex::new(Vec::new()),
             processes: ProcessMain::new(),
-            plugin_main,
         })
     }
 
@@ -87,34 +88,30 @@ impl Engine {
             workers_at_barrier: Arc::new(AtomicU32::new(0)),
             main_loop_exit_now: Arc::new(AtomicBool::new(false)),
             main_loop_exit_status: Mutex::new(0),
+            memory_initialized: false,
+            main_loop_exit_functions_called: false,
             file_main: None,
             worker_threads: Mutex::new(Vec::new()),
             processes: ProcessMain::new(),
-            plugin_main: Arc::new(PluginMain::empty(env!("CARGO_PKG_VERSION"))),
         }
     }
 
-    #[inline]
-    pub fn plugin_main(&self) -> &PluginMain {
-        &self.plugin_main
-    }
-
-    #[inline]
-    pub fn loaded_plugins(&self) -> &[String] {
-        self.plugin_main.loaded_plugins()
+    pub fn loaded_plugins(&self) -> Vec<&'static str> {
+        PluginMain::loaded_plugins()
     }
 
     pub fn load_plugins_from_config(&mut self, plugin_path: &std::path::Path) -> HammerResult<()> {
+        if !self.memory_initialized {
+            return Err(HammerError::internal(
+                "memory_init must complete before plugin loading",
+            ));
+        }
         let requested = self
             .registry
             .get::<Config>()
             .map(|config| config.requested_plugins().to_vec())
             .unwrap_or_default();
-        self.plugin_main = Arc::new(PluginMain::load(
-            env!("CARGO_PKG_VERSION"),
-            plugin_path,
-            &requested,
-        )?);
+        PluginMain::load(env!("CARGO_PKG_VERSION"), plugin_path, &requested)?;
         Ok(())
     }
 
@@ -126,10 +123,10 @@ impl Engine {
         Self::worker_with_runtime(
             self.runtime.clone_for_worker(index, numa_node),
             Arc::clone(&self.registry),
-            Arc::clone(&self.plugin_main),
             Arc::clone(&self.wait_at_barrier),
             Arc::clone(&self.workers_at_barrier),
             Arc::clone(&self.main_loop_exit_now),
+            self.memory_initialized,
             index,
             numa_node,
         )
@@ -165,10 +162,10 @@ impl Engine {
                 runtime_seed.clone_for_worker(thread_index, numa_node)
             },
             registry: Arc::clone(&self.registry),
-            plugin_main: Arc::clone(&self.plugin_main),
             wait_at_barrier: Arc::clone(&self.wait_at_barrier),
             workers_at_barrier: Arc::clone(&self.workers_at_barrier),
             main_loop_exit_now: Arc::clone(&self.main_loop_exit_now),
+            memory_initialized: self.memory_initialized,
         })
     }
 
@@ -280,10 +277,10 @@ where
         Engine::worker_with_runtime(
             runtime,
             Arc::clone(&self.registry),
-            Arc::clone(&self.plugin_main),
             Arc::clone(&self.wait_at_barrier),
             Arc::clone(&self.workers_at_barrier),
             Arc::clone(&self.main_loop_exit_now),
+            self.memory_initialized,
             index,
             numa_node,
         )
@@ -343,6 +340,8 @@ impl EnginePool {
 
     pub fn main_loop_enter(engine: &mut Engine) -> HammerResult<()> {
         engine.install_current();
+        let config = engine.registry.require::<Config>()?;
+        crate::memory::memory_init(engine, config)?;
         let plugin_path = crate::plugin_loader::configured_plugin_path()
             .map_err(HammerError::config_validation)?;
         engine.load_plugins_from_config(&plugin_path)?;
@@ -360,12 +359,22 @@ impl EnginePool {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    pub fn close(&mut self) {
+    pub fn close(&mut self) -> HammerResult<()> {
         Self::main_loop_exit(self.main_engine());
         self.main_engine().join_worker_threads();
+        let exit_result = {
+            let main = self.main_engine_mut();
+            if main.main_loop_exit_functions_called {
+                Ok(())
+            } else {
+                main.main_loop_exit_functions_called = true;
+                crate::init::run_main_loop_exit(main)
+            }
+        };
         if let Some(listener) = self.ipc_listener.take() {
             drop(listener);
         }
+        exit_result
     }
 }
 

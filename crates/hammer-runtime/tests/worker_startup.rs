@@ -89,7 +89,7 @@ fn engine_pool() -> EnginePool {
 
 fn stop_workers(pool: &mut EnginePool) {
     EnginePool::main_loop_exit(pool.main_engine());
-    pool.close();
+    pool.close().expect("close worker pool");
 }
 
 #[test]

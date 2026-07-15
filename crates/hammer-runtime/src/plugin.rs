@@ -5,16 +5,20 @@
 //! independently by load constructors into the runtime registration authority.
 
 use semver::{Version, VersionReq};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use hammer_core::error::HammerError;
+use hammer_infra::map::FlatHashTable;
+use hammer_infra::spinlock::Spinlock;
 use hammer_infra::vec::Vec;
 use libloading::Library;
 
 use crate::plugin_loader::{plugin_cdylib_path, read_plugin_registration};
 
+static PLUGIN_MAIN: Spinlock<Option<PluginMain>> = Spinlock::new(None);
+
 /// Metadata exported by one plugin DSO.
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PluginRegistration {
     pub name: &'static str,
@@ -25,8 +29,6 @@ pub struct PluginRegistration {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PluginError {
-    #[error("unknown plugin `{0}`")]
-    Unknown(String),
     #[error("duplicate plugin `{0}` in requested list")]
     Duplicate(String),
     #[error("plugin load_after cycle involving `{0}`")]
@@ -49,6 +51,8 @@ pub enum PluginError {
     },
     #[error("plugin file for `{requested}` exported registration for `{exported}`")]
     NameMismatch { requested: String, exported: String },
+    #[error("plugins are already activated for this process")]
+    AlreadyActivated,
 }
 
 impl From<PluginError> for HammerError {
@@ -59,77 +63,88 @@ impl From<PluginError> for HammerError {
 
 /// Main-thread plugin authority, corresponding to VPP's `plugin_main_t`.
 ///
-/// The library table owns every DSO handle. Engines and workers share this
-/// object so imported function pointers and static registration data cannot
-/// outlive their provider library.
+/// The process-global library table owns every activated DSO handle, matching
+/// VPP's `vlib_plugin_main`. Failed load transactions never enter this table and
+/// unload before returning their error.
 pub struct PluginMain {
-    host_version: String,
-    plugin_path: PathBuf,
-    libraries: HashMap<String, Library>,
-    load_order: Vec<String>,
+    library_index_by_name: FlatHashTable<&'static str, usize>,
+    load_order: Vec<&'static str>,
+    // Drop last so every DSO-backed name remains valid while indexes drop.
+    libraries: Vec<Library>,
 }
 
 impl std::fmt::Debug for PluginMain {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("PluginMain")
-            .field("host_version", &self.host_version)
-            .field("plugin_path", &self.plugin_path)
             .field("load_order", &self.load_order)
             .finish_non_exhaustive()
     }
 }
 
 impl PluginMain {
-    pub fn empty(host_version: impl Into<String>) -> Self {
-        Self {
-            host_version: host_version.into(),
-            plugin_path: PathBuf::new(),
-            libraries: HashMap::new(),
-            load_order: Vec::new(),
-        }
-    }
-
     /// Load configured roots and their transitive `load_after` dependencies.
     ///
-    /// A failed load drops the partially built `PluginMain`, closing every DSO
-    /// before any imported contribution can be installed into the runtime.
+    /// A failed load drops the partially built `PluginMain`; DSO destructors
+    /// unlink constructor-published contributions before the handles close. A
+    /// successful dependency closure remains mapped until process exit.
     pub fn load(
-        host_version: impl Into<String>,
-        plugin_path: impl Into<PathBuf>,
+        host_version: &str,
+        plugin_path: &Path,
         roots: &[String],
-    ) -> Result<Self, PluginError> {
-        let mut main = Self {
-            host_version: host_version.into(),
-            plugin_path: plugin_path.into(),
-            libraries: HashMap::new(),
-            load_order: Vec::new(),
-        };
-        let mut requested = Vec::with_capacity(roots.len());
-        for root in roots {
-            if requested.contains(root) {
-                return Err(PluginError::Duplicate(root.clone()));
-            }
-            requested.push(root.clone());
-        }
-        let mut visiting = Vec::new();
-        for root in roots {
-            main.load_one(root, &mut visiting)?;
-        }
-        Ok(main)
-    }
-
-    fn load_one(&mut self, name: &str, visiting: &mut Vec<String>) -> Result<(), PluginError> {
-        if visiting.iter().any(|candidate| candidate == name) {
-            return Err(PluginError::Cycle(name.to_owned()));
-        }
-        if self.libraries.contains_key(name) {
+    ) -> Result<(), PluginError> {
+        if roots.is_empty() {
             return Ok(());
         }
 
-        let path = plugin_cdylib_path(&self.plugin_path, name);
-        // SAFETY: `PluginMain` retains the returned handle until every Engine
-        // sharing it has stopped using imported registration data.
+        let mut requested = FlatHashTable::with_capacity(roots.len());
+        for root in roots {
+            let name = root.as_str();
+            if requested.get(&name).is_some() {
+                return Err(PluginError::Duplicate(root.clone()));
+            }
+            requested.insert(name, ());
+        }
+
+        let mut main = Self {
+            library_index_by_name: FlatHashTable::with_capacity(roots.len()),
+            load_order: Vec::with_capacity(roots.len()),
+            libraries: Vec::with_capacity(roots.len()),
+        };
+        let mut visiting = FlatHashTable::with_capacity(roots.len());
+        let mut loaded = FlatHashTable::with_capacity(roots.len());
+        for root in roots {
+            main.load_one(host_version, plugin_path, root, &mut visiting, &mut loaded)?;
+        }
+
+        let mut process_main = PLUGIN_MAIN.lock();
+        if process_main.is_some() {
+            return Err(PluginError::AlreadyActivated);
+        }
+        *process_main = Some(main);
+        Ok(())
+    }
+
+    fn load_one<'a>(
+        &mut self,
+        host_version: &str,
+        plugin_path: &Path,
+        name: &'a str,
+        visiting: &mut FlatHashTable<&'a str, ()>,
+        loaded: &mut FlatHashTable<&'a str, ()>,
+    ) -> Result<(), PluginError> {
+        if visiting.get(&name).is_some() {
+            return Err(PluginError::Cycle(name.to_owned()));
+        }
+        if loaded.get(&name).is_some() {
+            return Ok(());
+        }
+        visiting.insert(name, ());
+
+        let path = plugin_cdylib_path(plugin_path, name);
+        // SAFETY: a successful transaction moves the handle into the
+        // process-global PluginMain. A failed transaction drops it after the
+        // DSO destructor unlinks its constructor-published registration image.
         let library = unsafe { Library::new(&path) }.map_err(|error| PluginError::LibraryOpen {
             name: name.to_owned(),
             path: path.clone(),
@@ -143,53 +158,37 @@ impl PluginMain {
                     error,
                 })?;
             (
-                registration.name.to_owned(),
-                registration.version_required.to_owned(),
-                registration
-                    .load_after
-                    .iter()
-                    .map(|dependency| (*dependency).to_owned())
-                    .collect::<Vec<_>>(),
+                registration.name,
+                registration.version_required,
+                registration.load_after,
             )
         };
         if exported_name != name {
             return Err(PluginError::NameMismatch {
                 requested: name.to_owned(),
-                exported: exported_name,
+                exported: exported_name.to_owned(),
             });
         }
-        host_meets_plugin_requirement(&self.host_version, &version_required)?;
+        host_meets_plugin_requirement(host_version, version_required)?;
 
-        self.libraries.insert(name.to_owned(), library);
-        visiting.push(name.to_owned());
+        let library_index = self.libraries.len();
+        self.libraries.push(library);
+        self.library_index_by_name
+            .insert(exported_name, library_index);
         for dependency in dependencies {
-            self.load_one(&dependency, visiting)?;
+            self.load_one(host_version, plugin_path, dependency, visiting, loaded)?;
         }
-        visiting.pop();
-        self.load_order.push(name.to_owned());
+        visiting.remove(&name);
+        loaded.insert(exported_name, ());
+        self.load_order.push(exported_name);
         Ok(())
     }
 
-    #[inline]
-    pub fn plugin_path(&self) -> &Path {
-        &self.plugin_path
-    }
-
-    #[inline]
-    pub fn loaded_plugins(&self) -> &[String] {
-        &self.load_order
-    }
-
-    pub fn registration(&self, name: &str) -> Result<&PluginRegistration, PluginError> {
-        let library = self
-            .libraries
-            .get(name)
-            .ok_or_else(|| PluginError::Unknown(name.to_owned()))?;
-        read_plugin_registration(library).map_err(|error| PluginError::Registration {
-            name: name.to_owned(),
-            path: plugin_cdylib_path(&self.plugin_path, name),
-            error,
-        })
+    pub fn loaded_plugins() -> Vec<&'static str> {
+        PLUGIN_MAIN
+            .lock()
+            .as_ref()
+            .map_or_else(Vec::new, |main| main.load_order.clone())
     }
 }
 

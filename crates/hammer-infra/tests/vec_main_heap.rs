@@ -4,6 +4,7 @@ use std::mem;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hammer_infra::boxed::Box;
+use hammer_infra::map::FlatHashTable;
 use hammer_infra::vec::Vec;
 
 struct CountingAllocator;
@@ -84,6 +85,39 @@ fn default_heap_lifecycles_avoid_the_process_global_allocator() {
     drop(listed);
     drop(repeated);
     drop(empty_values);
+
+    COUNT_ALLOCATIONS.with(|count| count.set(false));
+    assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn default_hash_table_lifecycle_uses_main_heap_for_string_index() {
+    ALLOCATIONS.store(0, Ordering::Relaxed);
+    COUNT_ALLOCATIONS.with(|count| count.set(true));
+
+    let mut table = FlatHashTable::new();
+    for (index, name) in [
+        "tun",
+        "ip",
+        "tcp",
+        "udp",
+        "device",
+        "interface",
+        "transport",
+        "session",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        table.insert(name, index);
+    }
+    assert_eq!(table.get(&"tcp"), Some(&2));
+    assert_eq!(table.remove(&"session"), Some(7));
+    let clone = table.clone();
+    assert_eq!(clone.get(&"transport"), Some(&6));
+    std::hint::black_box((&table, &clone));
+    drop(clone);
+    drop(table);
 
     COUNT_ALLOCATIONS.with(|count| count.set(false));
     assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);

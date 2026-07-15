@@ -46,7 +46,7 @@ pub use node::{
 pub use plugin::{PluginError, PluginMain, PluginRegistration, host_meets_plugin_requirement};
 pub use plugin_loader::{
     built_plugin_cdylib_path, built_plugin_path, configured_plugin_path, plugin_cdylib_filename,
-    plugin_cdylib_path, read_plugin_registration, workspace_target_dir,
+    plugin_cdylib_path, workspace_target_dir,
 };
 pub use process::{
     ProcessContext, ProcessEntry, ProcessEventBatch, ProcessFuture, ProcessHandle, ProcessWake,
