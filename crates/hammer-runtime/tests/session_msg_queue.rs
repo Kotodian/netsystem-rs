@@ -1,9 +1,24 @@
 //! Behavioral tests for Session Message Queue (IO / CTRL rings).
 //! Observable enqueue/dequeue only — no source greps.
 
+use std::os::fd::RawFd;
+
 use hammer_runtime::app::session_msg_queue::{
     SessionEvt, SessionEvtType, SessionMsgQueue, SessionMsgQueueError,
 };
+
+fn descriptor_identity(fd: RawFd) -> std::io::Result<(libc::dev_t, libc::ino_t)> {
+    let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `status` is writable storage for one `stat`; a successful
+    // `fstat` initializes the complete value before it is read.
+    if unsafe { libc::fstat(fd, status.as_mut_ptr()) } == 0 {
+        // SAFETY: the successful `fstat` initialized `status` above.
+        let status = unsafe { status.assume_init() };
+        Ok((status.st_dev, status.st_ino))
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
 
 #[test]
 fn enqueue_io_roundtrips_on_io_ring() {
@@ -94,8 +109,6 @@ fn adr0010_io_index_only_ctrl_handle_packing() {
 
 #[test]
 fn svm_session_msg_queue_pipe_signal_wakes_consumer() {
-    use std::os::fd::RawFd;
-
     use hammer_infra::segment::{Segment, Svm};
     use hammer_runtime::app::SessionEventQueue;
 
@@ -135,6 +148,10 @@ fn svm_session_msg_queue_owns_attached_signal_descriptors() {
 
     let mut fds = [0i32; 2];
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let identities = [
+        descriptor_identity(fds[0]).expect("pipe read descriptor identity"),
+        descriptor_identity(fds[1]).expect("pipe write descriptor identity"),
+    ];
 
     let seg = Svm::default();
     let bytes = SessionMsgQueue::<Svm>::layout_bytes(8, 4).expect("layout");
@@ -143,10 +160,10 @@ fn svm_session_msg_queue_owns_attached_signal_descriptors() {
 
     drop(unsafe { SessionMsgQueue::<Svm>::from_shared(seg, off, Some(fds[0]), Some(fds[1])) });
 
-    assert_eq!(
-        (unsafe { libc::fcntl(fds[0], libc::F_GETFD) }, unsafe {
-            libc::fcntl(fds[1], libc::F_GETFD)
-        },),
-        (-1, -1)
-    );
+    for (fd, identity) in fds.into_iter().zip(identities) {
+        match descriptor_identity(fd) {
+            Err(error) => assert_eq!(error.raw_os_error(), Some(libc::EBADF)),
+            Ok(reused) => assert_ne!(reused, identity, "signal descriptor remains open"),
+        }
+    }
 }
