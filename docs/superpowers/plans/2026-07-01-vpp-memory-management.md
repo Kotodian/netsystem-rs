@@ -72,7 +72,7 @@ Approved/required existing or new public APIs:
 - `pub(crate) const HAMMER_MAX_NUMA_NODES: usize = 32` if a shared const is required, matching local VPP's `VLIB_BUFFER_MAX_NUMA_NODES`. Do not expose a public NUMA table or memory manager type.
 - `DataPlaneBufferConfig` and `DataPlaneRuntimeConfig` as the single construction surface for `DataPlaneBuffers` / `DataPlaneRuntime`; all old `with_*` constructors are removed.
 - `hammer_runtime::memory::memory_init(engine: &mut Engine) -> HammerResult<()>`, registered as `#[init_function(name = "memory_init", runs_before = ["start_workers"])]`.
-- `DataPlaneRuntime::clone_for_worker(thread_index: u32, numa_node: u32) -> Self`, used by `Engine::spawn_on_numa`.
+- `DataPlaneRuntime::for_worker(thread_index: u32, numa_node: u32) -> Self`, used by `Engine::spawn_on_numa`.
 - `Frame<Next>` and `Frame<Pending>` remain the public typed owner shapes. `Next` and `Pending` are concrete state bodies that directly own the frame fields; they are not marker types, do not use `PhantomData`, and do not delegate ownership to `FrameStorage` or `FrameOwner`.
 - `Frame<Next>` as Hammer's public RAII owner for next-frame contents already associated with a selected next arc, and `Frame<Pending>` as Hammer's scheduler-owned pending-frame RAII owner while a node is dispatching it. These are Rust ownership wrappers, not direct public equivalents of `vlib_next_frame_t` or `vlib_pending_frame_t`.
 - `DataPlaneBuffers::get_next_frame(next: NodeId) -> CoreResult<Frame<Next>>` and `DataPlaneRuntime::put_next_frame(frame: Frame<Next>) -> CoreResult<()>`, using VPP-inspired get/put terminology while keeping Hammer's existing `NodeId` graph model. There is no public pending-queue extraction API and no new pending-process callback type in this plan.
@@ -1747,7 +1747,7 @@ cargo test -p hammer-adapter --test buffer_per_numa -- --nocapture
 cargo test -p hammer-runtime --test engine_numa_runtime -- --nocapture
 ```
 
-Expected before the fix: missing `with_capacity_in`, `numa_node`, config-driven NUMA construction, `spawn_on_numa`, `clone_for_worker`, or `active_numa_node`.
+Expected before the fix: missing `with_capacity_in`, `numa_node`, config-driven NUMA construction, `spawn_on_numa`, `for_worker`, or `active_numa_node`.
 
 - [ ] **Step 4: Implement NUMA-aware construction**
 
@@ -1766,13 +1766,15 @@ impl BufferPool {
 impl DataPlaneBuffers {
     pub fn new(config: DataPlaneBufferConfig) -> Self;
     pub fn try_buffers(&self) -> CoreResult<&BufferPool>;
-    pub fn clone_for_worker(&self, thread_index: u32, numa_node: u32) -> Self;
     pub fn active_numa_node(&self) -> u32;
 }
 
+impl From<&DataPlaneBuffers> for DataPlaneBufferWorkerSeed;
+impl From<DataPlaneBufferWorkerConfig> for DataPlaneBuffers;
+
 impl DataPlaneRuntime {
     pub fn new(config: DataPlaneRuntimeConfig) -> Self;
-    pub fn clone_for_worker(&self, thread_index: u32, numa_node: u32) -> Self;
+    pub fn for_worker(&self, thread_index: u32, numa_node: u32) -> Self;
     pub fn active_numa_node(&self) -> u32;
 }
 ```
@@ -1781,6 +1783,7 @@ Implementation requirements:
 
 - `DataPlaneBuffers` stores a private fixed NUMA array of `BufferPool` plus `active_numa_node: u32` and `thread_index: u32`.
 - `DataPlaneBuffers::try_buffers()` returns the active pool as `CoreResult<&BufferPool>`.
+- `DataPlaneBufferWorkerSeed::from(&buffers)` captures the shared Buffer Arena handles and frame-pool sizing. `DataPlaneBuffers::from(DataPlaneBufferWorkerConfig { ... })` consumes that named source type to construct one worker-local buffer view; do not add tuple conversions or ad-hoc `*_clone`/`from_shared_*` constructors.
 - `DataPlaneBufferConfig` is the only public construction surface. Tests and callers must build `DataPlaneRuntimeConfig { buffers: DataPlaneBufferConfig { ... } }`; do not keep capacity-only compatibility constructors.
 - Add `Engine::spawn_on_numa(thread_index, numa_node)` and make worker startup use it so the runtime view is cloned after the worker NUMA node is known.
 - `Engine::spawn(index)` remains a compatibility wrapper that calls `spawn_on_numa(index, self.numa_node)` only for callers that intentionally inherit the current engine's NUMA node.

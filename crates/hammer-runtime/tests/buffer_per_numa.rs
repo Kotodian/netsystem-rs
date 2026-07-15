@@ -210,7 +210,7 @@ fn handoff_capacities_preserve_handoff_arena_numa_identity() {
 }
 
 #[test]
-fn handoff_worker_clone_falls_back_to_configured_nonzero_numa_arena() {
+fn handoff_worker_runtime_falls_back_to_configured_nonzero_numa_arena() {
     let handoff = DataPlaneHandoff::new_shared_buffer_arena(
         2,
         4,
@@ -225,7 +225,7 @@ fn handoff_worker_clone_falls_back_to_configured_nonzero_numa_arena() {
         handoff.worker(DataWorkerId::new(0)),
     );
 
-    let worker = runtime.clone_for_worker(1, 1);
+    let worker = runtime.for_worker(1, 1);
     let main_index = runtime.alloc_index().expect("main handoff alloc");
     let worker_index = worker.alloc_index().expect("worker handoff alloc");
 
@@ -246,9 +246,9 @@ fn handoff_worker_clone_falls_back_to_configured_nonzero_numa_arena() {
 }
 
 #[test]
-fn same_numa_worker_clone_shares_arena_but_not_thread_cache() {
+fn same_numa_worker_runtime_shares_arena_but_not_thread_cache() {
     let runtime = runtime_with_numa(1024, 4, &[0]);
-    let worker = runtime.clone_for_worker(1, 0);
+    let worker = runtime.for_worker(1, 0);
 
     let main_index = runtime.alloc_index().expect("main alloc");
     drop_owned_index!(&runtime, main_index);

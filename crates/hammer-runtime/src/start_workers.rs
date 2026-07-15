@@ -32,7 +32,7 @@ pub fn start_workers(engine: &mut Engine) -> HammerResult<()> {
     let mut threads = Vec::with_capacity(worker_config.count);
 
     for thread_index in 1..=worker_count {
-        let worker_seed = engine.worker_seed()?;
+        let worker_seed = engine.worker_seed();
         let worker_config = worker_config.clone();
         let worker = DataWorkerId::new(thread_index - 1);
         let handoff = handoff.worker(worker);

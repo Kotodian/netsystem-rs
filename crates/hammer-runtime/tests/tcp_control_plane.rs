@@ -1,12 +1,12 @@
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use hammer_core::protocol::tcp::{
     TcpCapabilities, TcpCloseReason, TcpControlPlaneAction, TcpListenerId, TcpListenerKey,
 };
+use hammer_runtime::ControlThread;
 use hammer_runtime::protocol::tcp::TcpControlPlane;
-use hammer_runtime::{ControlThread, MetricsRegistry};
 
 fn run_control_thread(thread: ControlThread) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
@@ -62,7 +62,7 @@ fn tcp_control_plane_tracks_listener_install_and_remove() {
 }
 
 #[test]
-fn tcp_control_plane_clone_shares_listener_state() {
+fn tcp_control_plane_handles_share_listener_state() {
     let (control_handle, control_thread) =
         ControlThread::new(std::time::Instant::now(), hammer_core::log::Level::Info);
     let join = run_control_thread(control_thread);
@@ -79,14 +79,14 @@ fn tcp_control_plane_clone_shares_listener_state() {
         fast_open: false,
     };
 
-    let plane2 = plane.clone();
-    plane2
+    let shared_plane = plane.clone();
+    shared_plane
         .apply(TcpControlPlaneAction::InstallListener {
             listener_id,
             listener,
             capabilities,
         })
-        .expect("install listener through clone");
+        .expect("install listener through shared handle");
     assert_eq!(
         plane.listener_for_test(listener_id),
         Some((listener, capabilities))

@@ -9,7 +9,7 @@ use std::cell::UnsafeCell;
 use std::hint::spin_loop;
 use std::mem::MaybeUninit;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
 use hammer_infra::vec::Vec;
 
@@ -19,6 +19,7 @@ use crate::process::ProcessEntry;
 
 static REGISTRATION_HEAD: AtomicPtr<RegistrationImage> = AtomicPtr::new(ptr::null_mut());
 static REGISTRATION_LOCK: AtomicBool = AtomicBool::new(false);
+static REGISTRATION_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// One link image's immutable executable inventories and intrusive list link.
 ///
@@ -98,6 +99,7 @@ impl RegistrationImage {
             self.next.store(head, Ordering::Relaxed);
             self.linked.store(true, Ordering::Relaxed);
             REGISTRATION_HEAD.store(ptr::from_ref(self).cast_mut(), Ordering::Release);
+            REGISTRATION_GENERATION.fetch_add(1, Ordering::Release);
         });
     }
 
@@ -131,6 +133,7 @@ impl RegistrationImage {
                         unsafe { (*previous).next.store(next, Ordering::Relaxed) };
                     }
                     self.next.store(ptr::null_mut(), Ordering::Relaxed);
+                    REGISTRATION_GENERATION.fetch_add(1, Ordering::Release);
                     return;
                 }
                 previous = current;
@@ -138,6 +141,11 @@ impl RegistrationImage {
             }
         });
     }
+}
+
+#[inline]
+pub(crate) fn generation() -> u64 {
+    REGISTRATION_GENERATION.load(Ordering::Acquire)
 }
 
 struct RegistrationLockGuard;

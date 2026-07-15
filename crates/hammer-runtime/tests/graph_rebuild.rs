@@ -138,7 +138,7 @@ fn rebuild_graph_rebinds_surviving_nodes_by_name() {
 }
 
 #[test]
-fn worker_clone_after_rebuild_matches_main_topology() {
+fn worker_runtime_after_rebuild_matches_main_topology() {
     let runtime = test_runtime();
     runtime
         .init_graph(0, &[entry("alpha"), entry("beta")])
@@ -147,7 +147,7 @@ fn worker_clone_after_rebuild_matches_main_topology() {
         .rebuild_graph(0, &[entry("gamma")])
         .expect("rebuild");
 
-    let worker = runtime.clone_for_worker(1, 0);
+    let worker = runtime.for_worker(1, 0);
     assert_eq!(
         worker.node_by_name("gamma").map(|id| id.slot()),
         runtime.node_by_name("gamma").map(|id| id.slot())

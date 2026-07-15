@@ -399,7 +399,6 @@ impl NodeReadiness {
     }
 }
 
-#[derive(Clone)]
 pub(crate) struct NodeRuntimeInner {
     nodes: Vec<NodeRuntimeSlot>,
     node_states: Vec<NodeState>,
@@ -417,6 +416,30 @@ pub(crate) struct NodeRuntimeInner {
     pending_next_names: Vec<Vec<Option<&'static str>>>,
     sibling_owners: Vec<Option<NodeId>>,
     siblings: Vec<Vec<NodeId>>,
+}
+
+impl Clone for NodeRuntimeInner {
+    fn clone(&self) -> Self {
+        let node_count = self.nodes.len();
+        Self {
+            nodes: self.nodes.clone(),
+            node_states: self.node_states.clone(),
+            interrupt_pending: hammer_infra::vec![false; node_count],
+            error_counters: hammer_infra::vec![NodeErrorCounters::default(); node_count],
+            error_ids: self.error_ids.clone(),
+            error_slots: self.error_slots.clone(),
+            runtime_stats: hammer_infra::vec![NodeRuntimeStats::default(); node_count],
+            scheduled_frame_queue_capacity: self.scheduled_frame_queue_capacity,
+            handles: self.handles.clone(),
+            declared_nodes: self.declared_nodes.clone(),
+            node_names: self.node_names.clone(),
+            node_trace_formatters: self.node_trace_formatters.clone(),
+            next_nodes: self.next_nodes.clone(),
+            pending_next_names: hammer_infra::vec![Vec::new(); node_count],
+            sibling_owners: self.sibling_owners.clone(),
+            siblings: self.siblings.clone(),
+        }
+    }
 }
 
 struct NodeRuntimeSlot {
@@ -610,27 +633,6 @@ impl NodeRuntimeInner {
         })
     }
 
-    fn clone_for_worker(&self) -> Self {
-        Self {
-            nodes: self.nodes.clone(),
-            node_states: self.node_states.clone(),
-            interrupt_pending: hammer_infra::vec![false; self.nodes.len()],
-            error_counters: hammer_infra::vec![NodeErrorCounters::default(); self.nodes.len()],
-            error_ids: self.error_ids.clone(),
-            error_slots: self.error_slots.clone(),
-            runtime_stats: hammer_infra::vec![NodeRuntimeStats::default(); self.nodes.len()],
-            scheduled_frame_queue_capacity: self.scheduled_frame_queue_capacity,
-            handles: self.handles.clone(),
-            declared_nodes: self.declared_nodes.clone(),
-            node_names: self.node_names.clone(),
-            node_trace_formatters: self.node_trace_formatters.clone(),
-            next_nodes: self.next_nodes.clone(),
-            pending_next_names: hammer_infra::vec![Vec::new(); self.nodes.len()],
-            sibling_owners: self.sibling_owners.clone(),
-            siblings: self.siblings.clone(),
-        }
-    }
-
     fn register_function_declared(
         &mut self,
         kind: NodeKind,
@@ -771,15 +773,22 @@ impl NodeRuntimeInner {
                     index += 1;
                     continue;
                 };
-                let target =
-                    self.declared_nodes.get(name).copied().ok_or_else(|| {
-                        CoreError::internal(format!("unknown next node `{name}`"))
-                    })?;
+                let target = if let Some(target) = self.declared_nodes.get(name).copied() {
+                    self.pending_next_names[slot][index] = None;
+                    target
+                } else {
+                    self.declared_nodes
+                        .get("drop")
+                        .copied()
+                        .ok_or(DataPlaneError::NamedNextFallbackMissing)?
+                };
                 self.validate_node(target)?;
                 self.next_nodes[slot][index] = Some(target);
                 index += 1;
             }
-            self.pending_next_names[slot].clear();
+            if self.pending_next_names[slot].iter().all(Option::is_none) {
+                self.pending_next_names[slot].clear();
+            }
             slot += 1;
         }
 
@@ -989,6 +998,50 @@ fn preferred_node_function<'registration>(
 mod node_function_tests {
     use super::*;
 
+    fn graph_update_probe_process(
+        _: &DataPlaneRuntime,
+        _: NodeRuntimeData,
+        _: &mut BufferFrame,
+    ) -> NodeResult {
+        NodeResult::drop()
+    }
+
+    fn register_graph_update_probe(runtime: &NodeRuntime, name: &'static str) -> NodeId {
+        runtime
+            .try_register_descriptor(
+                NodeKind::Internal,
+                NodeDescriptor::new(
+                    graph_update_probe_process,
+                    NodeRuntimeData::empty(),
+                    NodeRegistration::next(name, 0),
+                    &[],
+                    None,
+                ),
+            )
+            .expect("register graph update probe")
+    }
+
+    struct NamedNextProbe {
+        name: &'static str,
+        next_count: usize,
+    }
+
+    impl Node for NamedNextProbe {
+        fn process(&mut self, _: &DataPlaneRuntime, _: &mut BufferFrame) -> NodeResult {
+            NodeResult::drop()
+        }
+
+        fn node_process(&self) -> NodeProcessFn {
+            graph_update_probe_process
+        }
+    }
+
+    impl InternalNode for NamedNextProbe {
+        fn node_registration(&self) -> NodeRegistration {
+            NodeRegistration::next(self.name, self.next_count)
+        }
+    }
+
     #[test]
     fn duplicate_instruction_set_is_rejected() {
         let duplicate = NodeFunctionRegistration {
@@ -1008,12 +1061,105 @@ mod node_function_tests {
 
         assert!(error.to_string().contains("duplicate Node Function"));
     }
+
+    #[test]
+    fn worker_graph_replacement_uses_the_updated_main_topology() {
+        let main = NodeRuntime::default();
+        let alpha = register_graph_update_probe(&main, "alpha");
+        let worker = NodeRuntime::from_worker_inner(main.snapshot());
+        let worker_data = NodeRuntimeData::from_usize(41).expect("worker runtime data");
+        worker
+            .set_node_runtime_data(alpha, worker_data)
+            .expect("bind worker data");
+        worker
+            .set_node_state(alpha, NodeState::Disabled)
+            .expect("disable worker alpha");
+        worker.inner.borrow_mut().interrupt_pending[alpha.slot() as usize] = true;
+
+        let beta = register_graph_update_probe(&main, "beta");
+        worker.replace_graph(main.snapshot());
+
+        assert_eq!(worker.node_by_name("alpha"), Some(alpha));
+        assert_eq!(worker.node_by_name("beta"), Some(beta));
+        assert_eq!(
+            worker.node_state(alpha).expect("alpha state"),
+            NodeState::Polling
+        );
+        assert!(!worker.inner.borrow().interrupt_pending[alpha.slot() as usize]);
+        assert_eq!(
+            worker
+                .inner
+                .borrow()
+                .nodes
+                .get(alpha.slot() as usize)
+                .map(|node| node.runtime_data),
+            Some(NodeRuntimeData::empty())
+        );
+    }
+
+    #[test]
+    fn missing_named_next_uses_drop_until_late_target_is_registered() {
+        let runtime = NodeRuntime::default();
+        let drop_node = runtime
+            .try_register_internal_with_next_names(
+                NamedNextProbe {
+                    name: "drop",
+                    next_count: 0,
+                },
+                &[],
+            )
+            .expect("register drop");
+        let source = runtime
+            .try_register_internal_with_next_names(
+                NamedNextProbe {
+                    name: "source",
+                    next_count: 1,
+                },
+                &["late-target"],
+            )
+            .expect("register source");
+
+        runtime
+            .resolve_named_next_nodes()
+            .expect("defer missing next to drop");
+        assert_eq!(
+            runtime
+                .inner
+                .borrow()
+                .node_next_slot(source, 0)
+                .expect("source fallback"),
+            drop_node
+        );
+
+        let target = runtime
+            .try_register_internal_with_next_names(
+                NamedNextProbe {
+                    name: "late-target",
+                    next_count: 0,
+                },
+                &[],
+            )
+            .expect("register late target");
+        runtime
+            .resolve_named_next_nodes()
+            .expect("resolve late target");
+
+        assert_eq!(
+            runtime
+                .inner
+                .borrow()
+                .node_next_slot(source, 0)
+                .expect("resolved source next"),
+            target
+        );
+    }
 }
 
 impl NodeRuntime {
     /// Drain scheduled frames and clear topology so `init_graph` can renumber.
     ///
-    /// VPP analogue: barrier-held main-thread graph mutation before worker refork.
+    /// VPP analogue: barrier-held main-thread graph mutation before workers
+    /// install a clone of the updated graph.
     /// Old `NodeId` values become unreachable after this returns.
     pub fn detach_graph_for_rebuild(&self) {
         {
@@ -1045,18 +1191,14 @@ impl NodeRuntime {
         };
     }
 
-    pub(crate) fn clone_inner_for_worker(&self) -> CoreResult<NodeRuntimeInner> {
-        let inner = self.inner.borrow();
-        if inner
-            .pending_next_names
-            .iter()
-            .any(|names| !names.is_empty())
-        {
-            return Err(CoreError::internal(
-                "main graph has unresolved next names before worker clone",
-            ));
-        }
-        Ok(inner.clone_for_worker())
+    pub(crate) fn snapshot(&self) -> NodeRuntimeInner {
+        self.inner.borrow().clone()
+    }
+
+    pub(crate) fn replace_graph(&self, graph: NodeRuntimeInner) {
+        self.queue.borrow_mut().drain_all();
+        self.readiness.clear_pending();
+        *self.inner.borrow_mut() = graph;
     }
 
     pub(crate) fn from_worker_inner(inner: NodeRuntimeInner) -> Self {
@@ -1065,7 +1207,7 @@ impl NodeRuntime {
                 .pending_next_names
                 .iter()
                 .all(|names| names.is_empty()),
-            "worker graph must be resolved before cloning"
+            "worker graph must be resolved before installation"
         );
         let queue_capacity = inner.scheduled_frame_queue_capacity;
         Self {

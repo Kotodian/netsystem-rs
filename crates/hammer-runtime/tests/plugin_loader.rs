@@ -55,7 +55,13 @@ fn duplicate_roots_are_rejected_before_opening_libraries() {
         &["udp".into(), "udp".into()],
     )
     .expect_err("duplicate roots must fail");
-    assert_eq!(error, PluginError::Duplicate("udp".into()));
+    assert!(matches!(
+        error,
+        PluginError::DuplicateRoot {
+            first: 0,
+            duplicate: 1
+        }
+    ));
 }
 
 #[test]
@@ -70,8 +76,7 @@ fn missing_plugin_reports_name_and_resolved_path() {
     let error = PluginMain::load(env!("CARGO_PKG_VERSION"), &directory, &["missing".into()])
         .expect_err("missing plugin must fail");
     match error {
-        PluginError::LibraryOpen { name, path, .. } => {
-            assert_eq!(name, "missing");
+        PluginError::LibraryOpen { path, .. } => {
             assert_eq!(path, directory.join(plugin_cdylib_filename("missing")));
         }
         other => panic!("unexpected error: {other}"),
@@ -99,13 +104,7 @@ fn dso_constructors_publish_and_failed_load_unlinks_before_successful_activation
         &["mismatch".into()],
     )
     .expect_err("mismatched registration must fail");
-    assert_eq!(
-        error,
-        PluginError::NameMismatch {
-            requested: "mismatch".into(),
-            exported: "udp".into(),
-        }
-    );
+    assert!(matches!(error, PluginError::NameMismatch { path } if path == mismatch_path));
     fs::remove_dir_all(&mismatch_dir).expect("remove mismatch plugin directory");
 
     let mut rollback_probe = test_engine();
@@ -115,24 +114,57 @@ fn dso_constructors_publish_and_failed_load_unlinks_before_successful_activation
     _ = install_packet_graph(&mut rollback_probe, Arc::new(Default::default()));
     assert!(rollback_probe.runtime.node_by_name("udp-input").is_none());
 
-    let config = Arc::new(
-        parse_config("plugins = [\"tun\", \"tcp\", \"udp\"]")
-            .expect("TUN, TCP, and UDP plugin config"),
-    );
+    let config = Arc::new(parse_config("plugins = [\"ip\"]").expect("IP plugin config"));
     let mut engine = test_engine();
     engine.registry.set(Arc::clone(&config));
+    let startup_roots = hammer_infra::vec!["ip".into()];
     let error = engine
-        .load_plugins_from_config(&built_plugin_path())
+        .load_plugins(&built_plugin_path(), &startup_roots)
         .expect_err("plugin loading before memory_init must fail");
-    assert!(error.to_string().contains("memory_init must complete"));
+    assert!(matches!(
+        error,
+        hammer_core::error::CoreError::MemoryNotInitialized
+    ));
     hammer_runtime::memory::memory_init(&mut engine, Arc::clone(&config))
         .expect("initialize memory before plugin loading");
     engine
-        .load_plugins_from_config(&built_plugin_path())
-        .expect("load all plugin roots and their IP dependency");
+        .load_plugins(&built_plugin_path(), &startup_roots)
+        .expect("load the startup IP root");
+    assert_eq!(engine.loaded_plugins().as_slice(), ["ip"]);
+    assert!(engine.runtime.node_by_name("ip-input").is_some());
+
+    engine
+        .load_plugins(
+            &built_plugin_path(),
+            &["tcp".into(), "udp".into(), "tun".into()],
+        )
+        .expect("add TCP, UDP, and TUN while skipping the loaded IP dependency");
     assert_eq!(
         engine.loaded_plugins().as_slice(),
-        ["tun", "ip", "tcp", "udp"]
+        ["ip", "tcp", "udp", "tun"]
+    );
+    for node in ["tun-input", "tcp-input", "udp-input"] {
+        assert!(engine.runtime.node_by_name(node).is_some());
+    }
+
+    engine
+        .load_plugins(&built_plugin_path(), &["tcp".into()])
+        .expect("repeated additive load is idempotent");
+    assert_eq!(
+        engine.loaded_plugins().as_slice(),
+        ["ip", "tcp", "udp", "tun"]
+    );
+
+    let error = engine
+        .load_plugins(&built_plugin_path(), &["missing".into()])
+        .expect_err("a missing additive root must fail");
+    assert!(matches!(
+        error,
+        hammer_core::error::CoreError::PluginLibraryOpen { .. }
+    ));
+    assert_eq!(
+        engine.loaded_plugins().as_slice(),
+        ["ip", "tcp", "udp", "tun"]
     );
 
     engine.start_process_nodes().expect("start Process Nodes");

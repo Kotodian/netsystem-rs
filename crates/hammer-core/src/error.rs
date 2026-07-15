@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use thiserror::Error;
 
 /// Error type used by foundational layers (config, log, lifecycle, runtime
@@ -16,6 +17,57 @@ pub enum CoreError {
 
     #[error("service closed")]
     ServiceClosed,
+
+    #[error("memory initialization has not completed")]
+    MemoryNotInitialized,
+
+    #[error("duplicate plugin roots at indexes {first} and {duplicate}")]
+    PluginDuplicateRoot { first: usize, duplicate: usize },
+
+    #[error("plugin dependency cycle while loading `{path}`")]
+    PluginDependencyCycle { path: PathBuf },
+
+    #[error("host plugin version is invalid")]
+    PluginHostVersionInvalid,
+
+    #[error("required plugin version is invalid")]
+    PluginRequiredVersionInvalid,
+
+    #[error("host plugin version does not satisfy the plugin requirement")]
+    PluginSemVerMismatch,
+
+    #[error("failed to open plugin `{path}`")]
+    PluginLibraryOpen { path: PathBuf },
+
+    #[error("failed to read the registration symbol from plugin `{path}`")]
+    PluginRegistrationSymbol { path: PathBuf },
+
+    #[error("plugin `{path}` returned a null registration")]
+    PluginRegistrationNull { path: PathBuf },
+
+    #[error("plugin `{path}` exported a mismatched registration name")]
+    PluginNameMismatch { path: PathBuf },
+
+    #[error("failed to resolve the daemon executable path")]
+    PluginExecutablePath {
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("daemon executable `{executable}` has no parent directory")]
+    PluginExecutableParentMissing { executable: PathBuf },
+
+    #[error("worker count {count} does not fit u32")]
+    WorkerCountOverflow { count: usize },
+
+    #[error("a worker graph update is already pending")]
+    WorkerGraphUpdateAlreadyPending,
+
+    #[error("the pending worker graph is missing")]
+    WorkerGraphUpdateMissing,
+
+    #[error("worker graph update state is poisoned")]
+    WorkerGraphUpdateStatePoisoned,
 
     #[error(transparent)]
     Tcp(#[from] crate::protocol::tcp::TcpError),
@@ -81,6 +133,15 @@ pub enum DataPlaneError {
 
     #[error("data plane handoff node handle is not configured")]
     HandoffNodeHandleMissing,
+
+    #[error("named next fallback node is not registered")]
+    NamedNextFallbackMissing,
+
+    #[error("configured data-plane instruction set is unsupported")]
+    UnsupportedDataPlaneInstructionSet,
+
+    #[error("constructor-published graph registration is unnamed")]
+    UnnamedGraphRegistration,
 
     #[error("active NUMA buffer pool is missing")]
     ActiveNumaBufferPoolMissing,

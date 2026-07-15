@@ -45,7 +45,11 @@ pub fn engine_main_loop(
         let mut progress = false;
 
         // Step 1: Barrier check — VPP threads.c:296
-        barrier::barrier_check(&wait, &workers);
+        if barrier::barrier_check_and_report(&wait, &workers)
+            && !engine.apply_worker_graph_update_after_barrier()
+        {
+            return 1;
+        }
 
         // Step 2: Poll worker-local File readiness before graph dispatch.
         match engine.file_main_mut().and_then(|files| files.poll()) {

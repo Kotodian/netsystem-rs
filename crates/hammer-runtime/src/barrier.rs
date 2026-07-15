@@ -52,12 +52,22 @@ pub fn barrier_sync(
 /// Called by workers in their main loop. If the wait flag is set,
 /// acknowledge and spin until released.
 pub fn barrier_check(wait: &AtomicU32, workers: &AtomicU32) {
+    _ = barrier_check_and_report(wait, workers);
+}
+
+/// Runtime-internal barrier check that reports whether this worker crossed a
+/// barrier release and must inspect a published graph update before dispatch
+/// resumes.
+pub(crate) fn barrier_check_and_report(wait: &AtomicU32, workers: &AtomicU32) -> bool {
     if wait.load(Ordering::Acquire) > 0 {
         workers.fetch_add(1, Ordering::Release);
         while wait.load(Ordering::Acquire) > 0 {
             spin_loop();
         }
         workers.fetch_sub(1, Ordering::Release);
+        true
+    } else {
+        false
     }
 }
 

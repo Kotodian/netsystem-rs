@@ -37,3 +37,37 @@ pub struct IpcRequest {
 pub struct IpcResponse {
     pub payload: Vec<u8>,
 }
+
+/// Typed result of `plugin list` and `plugin load` handler commands.
+///
+/// Loaded names borrow from the encoded response on decode and point at
+/// process-lifetime registration names on encode. Failures cross IPC only as
+/// stable categories; runtime error text is never allocated into the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PluginCommandReply<'a> {
+    Loaded(#[serde(borrow)] Vec<&'a str>),
+    Error(PluginCommandError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PluginCommandError {
+    InvalidRequest,
+    MemoryNotInitialized,
+    DuplicateRoot,
+    DependencyCycle,
+    HostVersionInvalid,
+    RequiredVersionInvalid,
+    VersionMismatch,
+    LibraryOpen,
+    RegistrationSymbol,
+    RegistrationNull,
+    RegistrationNameMismatch,
+    ExecutablePath,
+    ExecutableParentMissing,
+    Configuration,
+    GraphMaterialization,
+    WorkerCountOverflow,
+    WorkerGraphUpdatePending,
+    WorkerGraphUpdate,
+    Lifecycle,
+}

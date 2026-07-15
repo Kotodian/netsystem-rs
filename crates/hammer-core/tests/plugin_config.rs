@@ -71,3 +71,20 @@ interfaces = ["utun"]
     assert!(text.contains("interfaces"));
     assert!(text.contains("utun"));
 }
+
+#[test]
+fn plugin_section_is_available_without_being_a_startup_root() {
+    let config = parse_config(
+        r#"
+[plugin.tun]
+interfaces = ["utun"]
+"#,
+    )
+    .expect("parse late-load plugin config");
+
+    let tun = config
+        .plugin_config::<TunConfig>("tun")
+        .expect("decode configuration for a late-loaded plugin");
+
+    assert_eq!(tun.interfaces.as_slice(), ["utun"]);
+}

@@ -77,16 +77,16 @@ fn engine_spawn_uses_initialized_runtime_view_for_inherited_numa() {
             .alloc_index()
             .expect("worker alloc")
             .pool_id(),
-        "worker clone on inherited NUMA must share the initialized runtime arena"
+        "worker runtime on inherited NUMA must share the initialized runtime arena"
     );
 }
 
 #[test]
 fn runtime_config_builds_per_numa_worker_views_without_global_lookup() {
     let runtime = DataPlaneRuntime::new(runtime_config(&[0, 1], 0));
-    let main = runtime.clone_for_worker(0, 0);
-    let worker_same_numa = runtime.clone_for_worker(3, 0);
-    let worker_other_numa = runtime.clone_for_worker(4, 1);
+    let main = runtime.for_worker(0, 0);
+    let worker_same_numa = runtime.for_worker(3, 0);
+    let worker_other_numa = runtime.for_worker(4, 1);
 
     assert_eq!(main.active_numa_node(), 0);
     assert_eq!(worker_same_numa.active_numa_node(), 0);

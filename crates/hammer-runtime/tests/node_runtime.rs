@@ -936,7 +936,7 @@ fn add_node_next_slot_reuses_existing_target_across_sibling_family() {
 }
 
 #[test]
-fn worker_clone_materializes_the_registered_graph_without_rebinding_nodes() {
+fn worker_runtime_materializes_the_registered_graph_without_rebinding_nodes() {
     const HANDLE: NodeHandle = NodeHandle::new(41);
 
     reset_calls(73);
@@ -950,7 +950,7 @@ fn worker_clone_materializes_the_registered_graph_without_rebinding_nodes() {
         .register_internal_with_handle(
             HANDLE,
             DescriptorNode::next(
-                "worker-clone-owner",
+                "worker-owner",
                 count_process,
                 NodeRuntimeData::from_words([73, 0, 0, 0]),
                 [drop, drop],
@@ -959,16 +959,16 @@ fn worker_clone_materializes_the_registered_graph_without_rebinding_nodes() {
         )
         .expect("register canonical owner");
     let sibling = runtime.nodes().register_internal(DescriptorNode::sibling(
-        "worker-clone-sibling",
-        "worker-clone-owner",
+        "worker-sibling",
+        "worker-owner",
         count_process,
         NodeRuntimeData::from_words([74, 0, 0, 0]),
     ));
 
-    let worker = runtime.clone_for_worker(1, 0);
+    let worker = runtime.for_worker(1, 0);
 
-    assert_eq!(worker.node_by_name("worker-clone-owner"), Some(owner));
-    assert_eq!(worker.node_by_name("worker-clone-sibling"), Some(sibling));
+    assert_eq!(worker.node_by_name("worker-owner"), Some(owner));
+    assert_eq!(worker.node_by_name("worker-sibling"), Some(sibling));
     assert_eq!(worker.nodes().node_for_handle(HANDLE).unwrap(), owner);
     assert_eq!(worker.nodes().node_kind(owner).unwrap(), NodeKind::Internal);
     assert_eq!(worker.nodes().node_siblings(owner).unwrap(), vec![sibling]);
@@ -991,11 +991,11 @@ fn worker_clone_materializes_the_registered_graph_without_rebinding_nodes() {
     let mut frame = worker.buffers().get_next_frame(owner).expect("alloc frame");
     push_packet(&worker, &mut frame, b"packet");
     worker.put_next_frame(frame).expect("put next frame");
-    assert_eq!(worker.run_ready_nodes().expect("run cloned node"), 1);
+    assert_eq!(worker.run_ready_nodes().expect("run worker node"), 1);
     assert_eq!(calls_for(73), 1);
 
     let duplicate = worker.nodes().try_register_internal(DescriptorNode::next(
-        "worker-clone-owner",
+        "worker-owner",
         count_process,
         NodeRuntimeData::from_words([99, 0, 0, 0]),
         [drop, drop],
@@ -1009,7 +1009,7 @@ fn worker_clone_materializes_the_registered_graph_without_rebinding_nodes() {
 }
 
 #[test]
-fn worker_clone_resets_execution_state_but_keeps_configured_node_state() {
+fn worker_runtime_resets_execution_state_but_keeps_configured_node_state() {
     reset_calls(81);
     let runtime = test_runtime(64, 8, 4);
     let drop = runtime.nodes().register_internal(DescriptorNode::plain(
@@ -1017,7 +1017,7 @@ fn worker_clone_resets_execution_state_but_keeps_configured_node_state() {
         NodeRuntimeData::empty(),
     ));
     let node = runtime.nodes().register_internal(DescriptorNode::next(
-        "worker-clone-state",
+        "worker-state",
         count_process,
         NodeRuntimeData::from_words([81, 0, 0, 0]),
         [drop, drop],
@@ -1047,7 +1047,7 @@ fn worker_clone_resets_execution_state_but_keeps_configured_node_state() {
     );
     assert!(runtime.nodes().has_pending());
 
-    let worker = runtime.clone_for_worker(1, 0);
+    let worker = runtime.for_worker(1, 0);
 
     assert!(!worker.nodes().has_pending());
     assert_eq!(worker.current_node(), None);
@@ -1065,7 +1065,7 @@ fn worker_clone_resets_execution_state_but_keeps_configured_node_state() {
         .node_runtime_stats_snapshot()
         .into_iter()
         .find(|row| row.node_id == node)
-        .expect("cloned node stats row");
+        .expect("worker node stats row");
     assert_eq!(row.calls, 0);
     assert_eq!(row.vectors, 0);
     assert!(
@@ -1076,7 +1076,7 @@ fn worker_clone_resets_execution_state_but_keeps_configured_node_state() {
 }
 
 #[test]
-fn worker_sibling_next_updates_are_local_to_that_graph_clone() {
+fn worker_sibling_next_updates_are_local_to_that_worker_graph() {
     let runtime = test_runtime(64, 8, 4);
     let initial = runtime.nodes().register_internal(DescriptorNode::plain(
         count_process,
@@ -1098,8 +1098,8 @@ fn worker_sibling_next_updates_are_local_to_that_graph_clone() {
         count_process,
         NodeRuntimeData::empty(),
     ));
-    let first = runtime.clone_for_worker(1, 0);
-    let second = runtime.clone_for_worker(2, 0);
+    let first = runtime.for_worker(1, 0);
+    let second = runtime.for_worker(2, 0);
 
     let slot = first
         .nodes()

@@ -4,7 +4,7 @@
 //! dependency order, and DSO handles. Executable registrations are published
 //! independently by load constructors into the runtime registration authority.
 
-use semver::{Version, VersionReq};
+use semver::Version;
 use std::path::{Path, PathBuf};
 
 use hammer_core::error::HammerError;
@@ -27,37 +27,68 @@ pub struct PluginRegistration {
     pub load_after: &'static [&'static str],
 }
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub enum PluginError {
-    #[error("duplicate plugin `{0}` in requested list")]
-    Duplicate(String),
-    #[error("plugin load_after cycle involving `{0}`")]
-    Cycle(String),
+    #[error("duplicate plugin roots at indexes {first} and {duplicate}")]
+    DuplicateRoot { first: usize, duplicate: usize },
+    #[error("plugin load_after cycle while loading `{path}`")]
+    Cycle { path: PathBuf },
     #[error("host version `{host}` does not satisfy plugin requirement `{required}`")]
-    SemVerMismatch { host: String, required: String },
-    #[error("invalid semver: {0}")]
-    InvalidSemVer(String),
-    #[error("failed to open plugin `{name}` at `{path}`: {error}")]
+    SemVerMismatch { host: Version, required: Version },
+    #[error("invalid host semver")]
+    InvalidHostSemVer {
+        #[source]
+        source: semver::Error,
+    },
+    #[error("invalid required semver")]
+    InvalidRequiredSemVer {
+        #[source]
+        source: semver::Error,
+    },
+    #[error("failed to open plugin at `{path}`")]
     LibraryOpen {
-        name: String,
         path: PathBuf,
-        error: String,
+        #[source]
+        source: libloading::Error,
     },
-    #[error("failed to read registration from plugin `{name}` at `{path}`: {error}")]
-    Registration {
-        name: String,
+    #[error("failed to read the registration symbol from plugin at `{path}`")]
+    RegistrationSymbol {
         path: PathBuf,
-        error: String,
+        #[source]
+        source: libloading::Error,
     },
-    #[error("plugin file for `{requested}` exported registration for `{exported}`")]
-    NameMismatch { requested: String, exported: String },
-    #[error("plugins are already activated for this process")]
-    AlreadyActivated,
+    #[error("plugin at `{path}` returned a null registration")]
+    RegistrationNull { path: PathBuf },
+    #[error("plugin at `{path}` exported a mismatched registration name")]
+    NameMismatch { path: PathBuf },
+    #[error("failed to resolve the daemon executable path")]
+    ExecutablePath {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("daemon executable `{executable}` has no parent directory")]
+    ExecutableParentMissing { executable: PathBuf },
 }
 
 impl From<PluginError> for HammerError {
     fn from(error: PluginError) -> Self {
-        HammerError::config_validation(error.to_string())
+        match error {
+            PluginError::DuplicateRoot { first, duplicate } => {
+                Self::PluginDuplicateRoot { first, duplicate }
+            }
+            PluginError::Cycle { path } => Self::PluginDependencyCycle { path },
+            PluginError::SemVerMismatch { .. } => Self::PluginSemVerMismatch,
+            PluginError::InvalidHostSemVer { .. } => Self::PluginHostVersionInvalid,
+            PluginError::InvalidRequiredSemVer { .. } => Self::PluginRequiredVersionInvalid,
+            PluginError::LibraryOpen { path, .. } => Self::PluginLibraryOpen { path },
+            PluginError::RegistrationSymbol { path, .. } => Self::PluginRegistrationSymbol { path },
+            PluginError::RegistrationNull { path } => Self::PluginRegistrationNull { path },
+            PluginError::NameMismatch { path } => Self::PluginNameMismatch { path },
+            PluginError::ExecutablePath { source } => Self::PluginExecutablePath { source },
+            PluginError::ExecutableParentMissing { executable } => {
+                Self::PluginExecutableParentMissing { executable }
+            }
+        }
     }
 }
 
@@ -98,15 +129,19 @@ impl PluginMain {
         }
 
         let mut requested = FlatHashTable::with_capacity(roots.len());
-        for root in roots {
+        for (index, root) in roots.iter().enumerate() {
             let name = root.as_str();
-            if requested.get(&name).is_some() {
-                return Err(PluginError::Duplicate(root.clone()));
+            if let Some(first) = requested.get(&name).copied() {
+                return Err(PluginError::DuplicateRoot {
+                    first,
+                    duplicate: index,
+                });
             }
-            requested.insert(name, ());
+            requested.insert(name, index);
         }
 
-        let mut main = Self {
+        let mut process_main = PLUGIN_MAIN.lock();
+        let mut transaction = Self {
             library_index_by_name: FlatHashTable::with_capacity(roots.len()),
             load_order: Vec::with_capacity(roots.len()),
             libraries: Vec::with_capacity(roots.len()),
@@ -114,14 +149,32 @@ impl PluginMain {
         let mut visiting = FlatHashTable::with_capacity(roots.len());
         let mut loaded = FlatHashTable::with_capacity(roots.len());
         for root in roots {
-            main.load_one(host_version, plugin_path, root, &mut visiting, &mut loaded)?;
+            transaction.load_one(
+                host_version,
+                plugin_path,
+                root,
+                process_main.as_ref(),
+                &mut visiting,
+                &mut loaded,
+            )?;
         }
 
-        let mut process_main = PLUGIN_MAIN.lock();
-        if process_main.is_some() {
-            return Err(PluginError::AlreadyActivated);
+        if transaction.load_order.is_empty() {
+            return Ok(());
         }
-        *process_main = Some(main);
+
+        let main = process_main.get_or_insert_with(|| Self {
+            library_index_by_name: FlatHashTable::with_capacity(transaction.libraries.len()),
+            load_order: Vec::with_capacity(transaction.load_order.len()),
+            libraries: Vec::with_capacity(transaction.libraries.len()),
+        });
+        let library_base = main.libraries.len();
+        for (name, index) in transaction.library_index_by_name.iter() {
+            main.library_index_by_name
+                .insert(name, library_base + index);
+        }
+        main.load_order.append(&mut transaction.load_order);
+        main.libraries.append(&mut transaction.libraries);
         Ok(())
     }
 
@@ -130,11 +183,20 @@ impl PluginMain {
         host_version: &str,
         plugin_path: &Path,
         name: &'a str,
+        active: Option<&PluginMain>,
         visiting: &mut FlatHashTable<&'a str, ()>,
         loaded: &mut FlatHashTable<&'a str, ()>,
     ) -> Result<(), PluginError> {
+        if active
+            .and_then(|main| main.library_index_by_name.get(&name))
+            .is_some()
+        {
+            return Ok(());
+        }
         if visiting.get(&name).is_some() {
-            return Err(PluginError::Cycle(name.to_owned()));
+            return Err(PluginError::Cycle {
+                path: plugin_cdylib_path(plugin_path, name),
+            });
         }
         if loaded.get(&name).is_some() {
             return Ok(());
@@ -145,18 +207,18 @@ impl PluginMain {
         // SAFETY: a successful transaction moves the handle into the
         // process-global PluginMain. A failed transaction drops it after the
         // DSO destructor unlinks its constructor-published registration image.
-        let library = unsafe { Library::new(&path) }.map_err(|error| PluginError::LibraryOpen {
-            name: name.to_owned(),
-            path: path.clone(),
-            error: error.to_string(),
-        })?;
+        let library =
+            unsafe { Library::new(&path) }.map_err(|source| PluginError::LibraryOpen {
+                path: path.clone(),
+                source,
+            })?;
         let (exported_name, version_required, dependencies) = {
-            let registration =
-                read_plugin_registration(&library).map_err(|error| PluginError::Registration {
-                    name: name.to_owned(),
+            let registration = read_plugin_registration(&library)
+                .map_err(|source| PluginError::RegistrationSymbol {
                     path: path.clone(),
-                    error,
-                })?;
+                    source,
+                })?
+                .ok_or_else(|| PluginError::RegistrationNull { path: path.clone() })?;
             (
                 registration.name,
                 registration.version_required,
@@ -164,10 +226,7 @@ impl PluginMain {
             )
         };
         if exported_name != name {
-            return Err(PluginError::NameMismatch {
-                requested: name.to_owned(),
-                exported: exported_name.to_owned(),
-            });
+            return Err(PluginError::NameMismatch { path });
         }
         host_meets_plugin_requirement(host_version, version_required)?;
 
@@ -176,7 +235,14 @@ impl PluginMain {
         self.library_index_by_name
             .insert(exported_name, library_index);
         for dependency in dependencies {
-            self.load_one(host_version, plugin_path, dependency, visiting, loaded)?;
+            self.load_one(
+                host_version,
+                plugin_path,
+                dependency,
+                active,
+                visiting,
+                loaded,
+            )?;
         }
         visiting.remove(&name);
         loaded.insert(exported_name, ());
@@ -199,19 +265,13 @@ pub fn host_meets_plugin_requirement(
     if version_required.is_empty() {
         return Ok(());
     }
-    let host = Version::parse(host_version)
-        .map_err(|error| PluginError::InvalidSemVer(format!("host `{host_version}`: {error}")))?;
-    let required = Version::parse(version_required).map_err(|error| {
-        PluginError::InvalidSemVer(format!("required `{version_required}`: {error}"))
-    })?;
-    let requirement = VersionReq::parse(&format!(">={required}"))
-        .map_err(|error| PluginError::InvalidSemVer(error.to_string()))?;
-    if requirement.matches(&host) {
+    let host =
+        Version::parse(host_version).map_err(|source| PluginError::InvalidHostSemVer { source })?;
+    let required = Version::parse(version_required)
+        .map_err(|source| PluginError::InvalidRequiredSemVer { source })?;
+    if host >= required {
         Ok(())
     } else {
-        Err(PluginError::SemVerMismatch {
-            host: host_version.to_owned(),
-            required: version_required.to_owned(),
-        })
+        Err(PluginError::SemVerMismatch { host, required })
     }
 }

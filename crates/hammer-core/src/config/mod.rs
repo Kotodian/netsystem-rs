@@ -73,11 +73,6 @@ impl Config {
     where
         T: serde::de::DeserializeOwned,
     {
-        if !self.plugins.iter().any(|plugin| plugin == name) {
-            return Err(HammerError::config_validation(format!(
-                "plugin `{name}` is not requested"
-            )));
-        }
         let value = self
             .plugin_sections
             .get(name)
@@ -92,11 +87,6 @@ impl Config {
     ///
     /// Dynamic plugins parse this themselves (#95 TOML text handoff).
     pub fn plugin_toml_text(&self, name: &str) -> HammerResult<String> {
-        if !self.plugins.iter().any(|plugin| plugin == name) {
-            return Err(HammerError::config_validation(format!(
-                "plugin `{name}` is not requested"
-            )));
-        }
         let value = self
             .plugin_sections
             .get(name)

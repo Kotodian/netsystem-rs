@@ -3,6 +3,7 @@ use petgraph::graphmap::DiGraphMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use hammer_core::error::{CoreError, HammerResult};
+use hammer_infra::map::FlatHashTable;
 
 use crate::engine::Engine;
 use hammer_infra::vec::Vec;
@@ -107,10 +108,18 @@ pub fn topological_order<T: Ordered>(items: &[T]) -> Result<Vec<usize>, InitErro
     Ok(result)
 }
 
-fn dispatch_init(items: Vec<InitFunction>, engine: &mut Engine) -> HammerResult<()> {
+fn dispatch_init(
+    items: Vec<InitFunction>,
+    called: &mut FlatHashTable<&'static str, ()>,
+    engine: &mut Engine,
+) -> HammerResult<()> {
     let order = topological_order(&items)?;
     for index in order {
         let function = items[index];
+        if called.get(&function.name).is_some() {
+            continue;
+        }
+        called.insert(function.name, ());
         catch_unwind(AssertUnwindSafe(|| (function.func)(engine))).map_err(|_| {
             CoreError::internal(format!("init function `{}` panicked", function.name))
         })??;
@@ -120,27 +129,51 @@ fn dispatch_init(items: Vec<InitFunction>, engine: &mut Engine) -> HammerResult<
 
 pub fn run_init_functions(engine: &mut Engine) -> HammerResult<()> {
     let functions = crate::registration::init_functions();
-    dispatch_init(functions, engine)
+    let mut called = std::mem::take(&mut engine.called_init_functions);
+    let result = dispatch_init(functions, &mut called, engine);
+    engine.called_init_functions = called;
+    result
 }
 
 pub fn run_worker_init_functions(engine: &mut Engine) -> HammerResult<()> {
     let functions = crate::registration::worker_init_functions();
-    dispatch_init(functions, engine)
+    let mut called = std::mem::take(&mut engine.called_worker_init_functions);
+    let result = dispatch_init(functions, &mut called, engine);
+    engine.called_worker_init_functions = called;
+    result
 }
 
 pub fn run_main_loop_enter(engine: &mut Engine) -> HammerResult<()> {
     let functions = crate::registration::main_loop_enter_functions();
-    dispatch_init(functions, engine)
+    let mut called = std::mem::take(&mut engine.called_main_loop_enter_functions);
+    let result = dispatch_init(functions, &mut called, engine);
+    engine.called_main_loop_enter_functions = called;
+    result?;
+    engine.main_loop_entered = true;
+    Ok(())
 }
 
 pub fn run_main_loop_exit(engine: &mut Engine) -> HammerResult<()> {
     let functions = crate::registration::main_loop_exit_functions();
-    dispatch_init(functions, engine)
+    let mut called = std::mem::take(&mut engine.called_main_loop_exit_functions);
+    let result = dispatch_init(functions, &mut called, engine);
+    engine.called_main_loop_exit_functions = called;
+    result
 }
 
 pub fn run_config_functions(engine: &mut Engine, early: bool) -> HammerResult<()> {
     let functions = crate::registration::config_functions(early);
-    dispatch_init(functions, engine)
+    if early {
+        let mut called = std::mem::take(&mut engine.called_early_config_functions);
+        let result = dispatch_init(functions, &mut called, engine);
+        engine.called_early_config_functions = called;
+        result
+    } else {
+        let mut called = std::mem::take(&mut engine.called_config_functions);
+        let result = dispatch_init(functions, &mut called, engine);
+        engine.called_config_functions = called;
+        result
+    }
 }
 
 #[cfg(test)]

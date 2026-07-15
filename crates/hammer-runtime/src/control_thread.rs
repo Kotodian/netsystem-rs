@@ -656,10 +656,10 @@ mod tests {
         let handle = run_control_thread(thread);
 
         let fired = Arc::new(AtomicBool::new(false));
-        let fired_clone = Arc::clone(&fired);
-        let timer_handle = control_handle
+        let thread_fired = Arc::clone(&fired);
+        control_handle
             .schedule_once(Duration::from_millis(10), move || {
-                let fired = Arc::clone(&fired_clone);
+                let fired = Arc::clone(&thread_fired);
                 async move {
                     fired.store(true, Ordering::SeqCst);
                 }

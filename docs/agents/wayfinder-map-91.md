@@ -16,7 +16,7 @@ session semantics.
 ## Authority And Constraints
 
 - Use the vendored `third_party/vpp` loader, main-thread graph registration,
-  worker barrier/refork, frame batching, and session/transport ownership as the
+  worker barrier/graph publication, frame batching, and session/transport ownership as the
   semantic authority.
 - Plugin loading and configured instance creation are separate. Empty root
   configuration may load no plugins and create no instances; a late-loaded
@@ -26,7 +26,7 @@ session semantics.
   as a plugin dependency.
 - Plugins publish registration inventory, Graph Nodes, and typed named Next
   Arcs. The main-thread Graph Runtime exclusively registers nodes, resolves
-  names, and reforks workers. Workers never mutate topology.
+  names, and publishes the updated graph to workers. Workers never mutate topology.
 - `hammer-core` owns canonical data-plane types and the registration contract.
   Do not add shadow Frame/Buffer types, View types, owner wrappers, carriers,
   payload copies, temporary payload Vecs, or per-packet ABI dispatch.
@@ -58,15 +58,19 @@ session semantics.
   uniformly by Graph Runtime.
 - [#94](https://github.com/Kotodian/hammer-ios-rs/issues/94): static plugin
   assembly and its superseded compatibility path are removed.
+- [#103](https://github.com/Kotodian/hammer-ios-rs/issues/103): additive plugin
+  loading now dispatches only newly published lifecycle inventory, extends the
+  main-thread Graph Runtime, publishes one updated graph to live workers, and
+  exposes plugin list/load through daemon IPC and `hammerctl`.
 
 ## Open Path
 
-1. [#103](https://github.com/Kotodian/hammer-ios-rs/issues/103) is the current
-   frontier: implement additive loading, new-image lifecycle dispatch,
-   main-thread graph extension, worker refork, and `hammerctl plugin list|load`.
+1. [#104](https://github.com/Kotodian/hammer-ios-rs/issues/104) is the current
+   prerequisite: make the Hammer main heap process-global while preserving
+   Buffer Arena PhysmemMap and SVM mmap allocation ownership.
 2. [#98](https://github.com/Kotodian/hammer-ios-rs/issues/98) remains blocked
-   by #103: verify Linux/macOS parity, ownership, performance, and failure
-   behavior.
+   by #104: verify Linux/macOS parity, ownership, performance, and failure
+   behavior after the allocator boundary is final.
 
 ## Out Of Scope
 

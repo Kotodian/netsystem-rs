@@ -75,6 +75,9 @@ fn process_clock_and_events_run_only_on_main_thread() {
     let main_thread = std::thread::current().id();
     let mut engine = test_engine();
     engine.start_process_nodes().expect("start process nodes");
+    engine
+        .start_process_nodes()
+        .expect("starting the same Process Node inventory is idempotent");
     let process = engine
         .process_handle("process-runtime-test")
         .expect("registered process handle");

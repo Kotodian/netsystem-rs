@@ -189,6 +189,7 @@ pub(crate) struct ProcessMain {
     owner: ThreadId,
     local: LocalSet,
     running: Vec<RunningProcess>,
+    started: bool,
 }
 
 impl ProcessMain {
@@ -197,7 +198,13 @@ impl ProcessMain {
             owner: thread::current().id(),
             local: LocalSet::new(),
             running: Vec::new(),
+            started: false,
         }
+    }
+
+    #[inline]
+    pub(crate) fn is_started(&self) -> bool {
+        self.started
     }
 
     fn ensure_owner(&self) -> HammerResult<()> {
@@ -216,9 +223,6 @@ impl ProcessMain {
         runtime: DataPlaneRuntime,
     ) -> HammerResult<()> {
         self.ensure_owner()?;
-        if !self.running.is_empty() {
-            return Err(HammerError::internal("Process Nodes are already started"));
-        }
         let entries = crate::registration::process_nodes();
         let mut names = Vec::with_capacity(entries.len());
         for entry in &entries {
@@ -232,6 +236,13 @@ impl ProcessMain {
         }
         let mut prepared = Vec::with_capacity(entries.len());
         for entry in entries {
+            if self
+                .running
+                .iter()
+                .any(|running| running.handle.name == entry.name)
+            {
+                continue;
+            }
             let (events, receiver) = mpsc::unbounded_channel();
             let context =
                 ProcessContext::new(entry.name, Arc::clone(&registry), runtime.clone(), receiver);
@@ -254,6 +265,7 @@ impl ProcessMain {
                 task,
             });
         }
+        self.started = true;
         Ok(())
     }
 

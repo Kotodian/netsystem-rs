@@ -4,9 +4,10 @@ use std::rc::Rc;
 
 use hammer_core::config::Config;
 use hammer_core::data_plane::{
-    BufferFrame, BufferFrameBatchWidth, BufferFrameBatchWidthPolicy, BufferNodeError,
-    BufferPoolArena, BufferRef, BufferRefMut, DataPlaneBufferChain, DataPlaneBufferConfig,
-    DataPlaneBuffers, Frame, Index, Next, NodeHandle, NodeId, NodeNext, NodeRegistration, Pending,
+    BufferFrame, BufferFrameBatchWidth, BufferFrameBatchWidthPolicy, BufferNodeError, BufferRef,
+    BufferRefMut, DataPlaneBufferChain, DataPlaneBufferConfig, DataPlaneBufferWorkerConfig,
+    DataPlaneBufferWorkerSeed, DataPlaneBuffers, Frame, Index, Next, NodeHandle, NodeId, NodeNext,
+    NodeRegistration, Pending,
 };
 use hammer_core::error::{CoreError, CoreResult, DataPlaneError};
 
@@ -66,20 +67,24 @@ impl fmt::Debug for DataPlaneRuntime {
 
 pub(crate) type RuntimeDataPlaneRuntime = DataPlaneRuntime;
 
-#[derive(Clone)]
 pub(crate) struct DataPlaneRuntimeWorkerSeed {
-    buffer_arenas: Vec<BufferPoolArena>,
-    frame_slots: usize,
+    buffers: DataPlaneBufferWorkerSeed,
     nodes: NodeRuntimeInner,
     instruction_set: DataPlaneInstructionSet,
     handoff: Option<DataPlaneHandoffWorker>,
     handoff_node_handle: Option<NodeHandle>,
 }
 
+pub(crate) struct DataPlaneRuntimeWorkerConfig {
+    pub(crate) seed: DataPlaneRuntimeWorkerSeed,
+    pub(crate) thread_index: u32,
+    pub(crate) numa_node: u32,
+}
+
 impl fmt::Debug for DataPlaneRuntimeWorkerSeed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DataPlaneRuntimeWorkerSeed")
-            .field("frame_slots", &self.frame_slots)
+            .field("buffers", &self.buffers)
             .field("instruction_set", &self.instruction_set)
             .field("handoff_node_handle", &self.handoff_node_handle)
             .finish()
@@ -138,24 +143,46 @@ impl Clone for DataPlaneRuntime {
     }
 }
 
-impl DataPlaneRuntimeWorkerSeed {
-    #[inline]
-    pub(crate) fn clone_for_worker(&self, thread_index: u32, numa_node: u32) -> DataPlaneRuntime {
-        let mut runtime = DataPlaneRuntime::from_buffers_with_instruction_set(
-            DataPlaneBuffers::from_cloned_buffer_arenas(
-                self.buffer_arenas.iter().cloned(),
-                self.frame_slots,
-                thread_index,
-                numa_node,
-            ),
-            self.instruction_set,
-        );
-        runtime.nodes = NodeRuntime::from_worker_inner(self.nodes.clone());
-        runtime.handoff = self.handoff.clone();
-        runtime.handoff_node_handle = self.handoff_node_handle;
-        if let Some(handoff) = runtime.handoff.clone()
-            && let Some(arena) = handoff.configured_buffer_arena()
-        {
+impl From<&DataPlaneRuntime> for DataPlaneRuntimeWorkerSeed {
+    fn from(runtime: &DataPlaneRuntime) -> Self {
+        Self {
+            buffers: DataPlaneBufferWorkerSeed::from(&runtime.buffers),
+            nodes: runtime.nodes.snapshot(),
+            instruction_set: runtime.instruction_set,
+            handoff: runtime.handoff.clone(),
+            handoff_node_handle: runtime.handoff_node_handle,
+        }
+    }
+}
+
+impl From<DataPlaneRuntimeWorkerConfig> for DataPlaneRuntime {
+    fn from(config: DataPlaneRuntimeWorkerConfig) -> Self {
+        let DataPlaneRuntimeWorkerConfig {
+            seed,
+            thread_index,
+            numa_node,
+        } = config;
+        let DataPlaneRuntimeWorkerSeed {
+            buffers,
+            nodes,
+            instruction_set,
+            handoff,
+            handoff_node_handle,
+        } = seed;
+        let buffers = DataPlaneBuffers::from(DataPlaneBufferWorkerConfig {
+            seed: buffers,
+            thread_index,
+            numa_node,
+        });
+        let mut runtime = Self::from_buffers_with_instruction_set(buffers, instruction_set);
+        runtime.nodes = NodeRuntime::from_worker_inner(nodes);
+        runtime.handoff = handoff;
+        runtime.handoff_node_handle = handoff_node_handle;
+        let configured_arena = runtime
+            .handoff
+            .as_ref()
+            .and_then(DataPlaneHandoffWorker::configured_buffer_arena);
+        if let Some(arena) = configured_arena {
             runtime.buffers = runtime.buffers.with_active_buffer_arena(arena);
             runtime.active_numa_node = runtime.buffers.active_numa_node();
         }
@@ -204,22 +231,13 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    pub fn clone_for_worker(&self, thread_index: u32, numa_node: u32) -> Self {
-        self.worker_seed()
-            .expect("main graph must be resolved before worker clone")
-            .clone_for_worker(thread_index, numa_node)
-    }
-
-    #[inline]
-    pub(crate) fn worker_seed(&self) -> CoreResult<DataPlaneRuntimeWorkerSeed> {
-        Ok(DataPlaneRuntimeWorkerSeed {
-            buffer_arenas: self.buffers.clone_buffer_arenas(),
-            frame_slots: self.buffers.frame_slots(),
-            nodes: self.nodes.clone_inner_for_worker()?,
-            instruction_set: self.instruction_set,
-            handoff: self.handoff.clone(),
-            handoff_node_handle: self.handoff_node_handle,
-        })
+    pub fn for_worker(&self, thread_index: u32, numa_node: u32) -> Self {
+        DataPlaneRuntimeWorkerConfig {
+            seed: DataPlaneRuntimeWorkerSeed::from(self),
+            thread_index,
+            numa_node,
+        }
+        .into()
     }
 
     #[inline]
@@ -386,9 +404,41 @@ impl DataPlaneRuntime {
         self.nodes.resolve_named_next_nodes()
     }
 
+    pub(crate) fn extend_graph_with_node_functions(
+        &self,
+        worker: usize,
+        entries: &[NodeEntry],
+        node_functions: &[NodeFunctionRegistration],
+    ) -> CoreResult<()> {
+        if !self.instruction_set.is_supported() {
+            return Err(DataPlaneError::UnsupportedDataPlaneInstructionSet.into());
+        }
+
+        for register_siblings in [false, true] {
+            for entry in entries {
+                let is_sibling = matches!(entry.registration, NodeRegistration::Sibling { .. });
+                if is_sibling != register_siblings {
+                    continue;
+                }
+                let name = entry
+                    .registration
+                    .name()
+                    .ok_or(DataPlaneError::UnnamedGraphRegistration)?;
+                if self.nodes.node_by_name(name).is_some() {
+                    continue;
+                }
+                let node = (entry.init)(self, worker)?;
+                self.nodes
+                    .install_node_function(node, self.instruction_set, node_functions)?;
+            }
+        }
+        self.nodes.resolve_named_next_nodes()?;
+        Ok(())
+    }
+
     /// Global Graph Transaction: drain residual scheduled frames, detach the
-    /// live topology, rebuild and renumber from `entries`, then leave workers
-    /// to adopt the new topology via `clone_for_worker` (VPP refork analogue).
+    /// live topology, rebuild and renumber from `entries`, then publish the
+    /// updated topology to workers.
     ///
     /// This is a graph transaction, not a plugin unload operation; it neither
     /// changes the registration authority nor releases DSO handles. Business
