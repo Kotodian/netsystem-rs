@@ -62,15 +62,19 @@ session semantics.
   loading now dispatches only newly published lifecycle inventory, extends the
   main-thread Graph Runtime, publishes one updated graph to live workers, and
   exposes plugin list/load through daemon IPC and `hammerctl`.
+- [#104](https://github.com/Kotodian/hammer-ios-rs/issues/104): one
+  process-global fixed-capacity mimalloc Main Heap now owns ordinary
+  post-`READY` allocation without fallback; bootstrap allocation remains on
+  the operating-system allocator, and Buffer Arena/SVM mappings retain their
+  explicit ownership domains.
+- [#98](https://github.com/Kotodian/hammer-ios-rs/issues/98): the real four-DSO
+  plugin system, additive Graph publication, allocation ownership, failure
+  behavior, and dataplane performance gates are verified on Linux and macOS.
 
 ## Open Path
 
-1. [#104](https://github.com/Kotodian/hammer-ios-rs/issues/104) is the current
-   prerequisite: make the Hammer main heap process-global while preserving
-   Buffer Arena PhysmemMap and SVM mmap allocation ownership.
-2. [#98](https://github.com/Kotodian/hammer-ios-rs/issues/98) remains blocked
-   by #104: verify Linux/macOS parity, ownership, performance, and failure
-   behavior after the allocator boundary is final.
+None. The destination is complete: all wayfinder research, prototype,
+implementation, and verification tickets are closed.
 
 ## Out Of Scope
 
