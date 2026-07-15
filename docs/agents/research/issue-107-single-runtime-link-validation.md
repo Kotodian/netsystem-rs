@@ -58,3 +58,15 @@ Stable Rust can consume the current Hammer Rust dylib graph when the dylibs shar
 Conversely, a `hammer-infra` dylib that statically owns `std` and the allocator shim cannot be consumed by the higher Rust final images required by Hammer. The failure occurs in rustc's dependency-format selection before platform loader behavior, so the authorized Linux/macOS topology is invalidated at the common Rust link layer.
 
 Issue 107 therefore has no successful implementation result. Under the explicit no-alternate-architecture constraint, this is a blocker rather than permission to introduce per-image forwarding allocators, native interposition, a custom `libstd`, or a different authority.
+
+## Stable compiler capability audit
+
+A second audit checked whether another stable rustc artifact or dependency-format control could implement the same single-image topology.
+
+- The Rust 1.96.0 [`dependency_format`](https://github.com/rust-lang/rust/blob/ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96/compiler/rustc_metadata/src/dependency_format.rs) implementation requires every crate to appear exactly once, rejects a static dependency contributed by more than one dylib, and states that there is no per-library linkage preference beyond the global static/dynamic switch.
+- Rust issue [#100781](https://github.com/rust-lang/rust/issues/100781) remains open. In the allocator/dylib discussion, a compiler maintainer notes that a Rust dylib which does not dynamically link `libstd` cannot then be combined with `libstd`, because `libcore` would be included twice. The proposed portable allocator function-pointer seam remains only a design idea, not a compiler capability.
+- Rust issue [#114518](https://github.com/rust-lang/rust/issues/114518) remains an open stable-to-stable regression showing that `prefer-dynamic` can mix the System allocator with a selected global allocator.
+- Rust 1.96.0 recognizes an experimental `sdylib` crate type but rejects it with E0658. Its linked tracking issue [#139939](https://github.com/rust-lang/rust/issues/139939) is labelled experimental and unimplemented; it is not a stable deployable artifact format.
+- The installed stable compiler rejects `-Z` options, so compiler-private dependency-format exceptions cannot be used by this repository.
+
+The stable artifact matrix is therefore exhausted: `rlib` and `staticlib` duplicate the authority in each final image, `cdylib` does not provide Rust dependency metadata, an ordinary `dylib` requires the conflicting dependency-format choice above, and `sdylib` is unavailable. None implements the authorized topology.
