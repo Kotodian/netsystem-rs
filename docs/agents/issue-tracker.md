@@ -50,6 +50,19 @@ one of `wayfinder:research`, `wayfinder:prototype`, `wayfinder:grilling`, or
   comment, close the ticket, and append only a one-line linked gist to the
   map's `Decisions so far` section.
 
+### Local Map Snapshots
+
+Keep each active map body mirrored at
+`docs/agents/wayfinder-map-<issue-number>.md`. The committed file is the local
+tracker snapshot and the source for `gh issue edit --body-file`; update it in
+the same operation that changes the map destination, decisions, open path, or
+frontier. Native GitHub sub-issue and blocking relationships remain
+authoritative and are not duplicated in the snapshot.
+
+Active snapshots:
+
+- [Map #91: VPP-aligned dynamic network plugin system](wayfinder-map-91.md)
+
 GitHub REST `id` values, issue numbers, and GraphQL node IDs are distinct. Read
 the node IDs used by these mutations with a repository GraphQL query; never
 substitute an issue number for a node ID.
