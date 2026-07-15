@@ -1376,6 +1376,18 @@ impl NodeRuntime {
         Ok(())
     }
 
+    #[inline]
+    pub(crate) fn set_node_runtime_data(
+        &self,
+        node: NodeId,
+        runtime_data: NodeRuntimeData,
+    ) -> CoreResult<()> {
+        let mut inner = self.inner.borrow_mut();
+        inner.validate_node(node)?;
+        inner.nodes[node.slot() as usize].runtime_data = runtime_data;
+        Ok(())
+    }
+
     pub(crate) fn mark_interrupt_pending(&self, node: NodeId) -> CoreResult<bool> {
         let mut inner = self.inner.borrow_mut();
         inner.validate_node(node)?;

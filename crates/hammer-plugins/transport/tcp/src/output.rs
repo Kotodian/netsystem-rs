@@ -49,6 +49,9 @@ impl TcpOutputNode {
 }
 
 pub fn register_tcp_output(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+    if let Some(node) = runtime.nodes().node_by_name(TcpOutputNode::NODE_NAME) {
+        return Ok(node);
+    }
     runtime.nodes().try_register_internal_with_next_names(
         TcpOutputNode::new([NodeId::new(0); TcpOutputNext::COUNT]),
         &TcpOutputNext::NEXT_NAMES,

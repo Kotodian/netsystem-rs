@@ -115,8 +115,10 @@ fn dso_constructors_publish_and_failed_load_unlinks_before_successful_activation
     _ = install_packet_graph(&mut rollback_probe, Arc::new(Default::default()));
     assert!(rollback_probe.runtime.node_by_name("udp-input").is_none());
 
-    let config =
-        Arc::new(parse_config("plugins = [\"ip\", \"udp\"]").expect("IP and UDP plugin config"));
+    let config = Arc::new(
+        parse_config("plugins = [\"tun\", \"tcp\", \"udp\"]")
+            .expect("TUN, TCP, and UDP plugin config"),
+    );
     let mut engine = test_engine();
     engine.registry.set(Arc::clone(&config));
     let error = engine
@@ -127,8 +129,11 @@ fn dso_constructors_publish_and_failed_load_unlinks_before_successful_activation
         .expect("initialize memory before plugin loading");
     engine
         .load_plugins_from_config(&built_plugin_path())
-        .expect("load UDP dependency closure");
-    assert_eq!(engine.loaded_plugins().as_slice(), ["ip", "udp"]);
+        .expect("load all plugin roots and their IP dependency");
+    assert_eq!(
+        engine.loaded_plugins().as_slice(),
+        ["tun", "ip", "tcp", "udp"]
+    );
 
     engine.start_process_nodes().expect("start Process Nodes");
     assert!(engine.process_handle("ip-reassembly-expire-walk").is_some());
@@ -141,5 +146,25 @@ fn dso_constructors_publish_and_failed_load_unlinks_before_successful_activation
         .expect("configure process-retained plugin images");
     hammer_runtime::init::run_init_functions(&mut retained_probe)
         .expect("initialize process-retained plugin images");
-    assert!(retained_probe.runtime.node_by_name("udp-input").is_some());
+    hammer_runtime::init::run_config_functions(&mut retained_probe, false)
+        .expect("configure process-retained plugin images after initialization");
+    for node in ["tun-input", "ip-input", "tcp-input", "udp-input"] {
+        assert!(
+            retained_probe.runtime.node_by_name(node).is_some(),
+            "loaded plugin node `{node}` is missing from the main graph"
+        );
+    }
+
+    let mut worker = retained_probe
+        .spawn(1)
+        .expect("clone the main graph for worker 0");
+    hammer_runtime::init::run_worker_init_functions(&mut worker)
+        .expect("bind worker-local plugin state to the cloned graph");
+    for node in ["tun-input", "ip-input", "tcp-input", "udp-input"] {
+        assert_eq!(
+            worker.runtime.node_by_name(node),
+            retained_probe.runtime.node_by_name(node),
+            "worker node `{node}` must retain the main graph NodeId"
+        );
+    }
 }

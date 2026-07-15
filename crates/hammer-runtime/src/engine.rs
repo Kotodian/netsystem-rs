@@ -4,10 +4,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use hammer_core::config::Config;
+use hammer_core::data_plane::NodeId;
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::registry::RuntimeRegistry;
 use hammer_runtime::DataPlaneRuntime;
 
+use crate::node::NodeRuntimeData;
 use crate::process::ProcessMain;
 use crate::{DataPlaneHandoffWorker, DataWorkerId, FileMain, PluginMain, ProcessHandle};
 use hammer_infra::vec::Vec;
@@ -138,6 +140,20 @@ impl Engine {
             .checked_sub(1)
             .map(DataWorkerId::new)
             .ok_or_else(|| HammerError::internal("main thread has no data worker id"))
+    }
+
+    /// Replace only one cloned Data Worker's node-local runtime data.
+    ///
+    /// Worker initialization may use this after the main thread has built the
+    /// graph. It cannot change node identity, process functions, or next arcs;
+    /// those remain under main-thread Graph authority.
+    pub fn set_worker_node_runtime_data(
+        &mut self,
+        node: NodeId,
+        data: NodeRuntimeData,
+    ) -> HammerResult<()> {
+        self.data_worker_id()?;
+        self.runtime.nodes().set_node_runtime_data(node, data)
     }
 
     pub fn file_main(&self) -> HammerResult<&FileMain> {
@@ -418,6 +434,19 @@ mod tests {
         assert!(main.data_worker_id().is_err());
         assert_eq!(worker_1.data_worker_id().unwrap(), DataWorkerId::new(0));
         assert_eq!(worker_2.data_worker_id().unwrap(), DataWorkerId::new(1));
+    }
+
+    #[test]
+    fn main_thread_cannot_replace_worker_node_runtime_data() {
+        let mut main = test_engine();
+        let error = main
+            .set_worker_node_runtime_data(NodeId::new(0), NodeRuntimeData::empty())
+            .expect_err("main thread must not bind worker runtime data");
+        assert!(
+            error
+                .to_string()
+                .contains("main thread has no data worker id")
+        );
     }
 
     #[test]

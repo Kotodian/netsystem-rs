@@ -179,6 +179,9 @@ thread_local! {
 }
 
 pub fn register_session_queue_node(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+    if let Some(node) = runtime.nodes().node_by_name("session-queue") {
+        return Ok(node);
+    }
     let node = SessionQueueNode::new()?;
     let runtime_data = node.runtime_data;
     let id = runtime.nodes().try_register_driver(node)?;
