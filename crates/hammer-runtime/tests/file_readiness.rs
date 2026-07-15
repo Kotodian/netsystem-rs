@@ -55,6 +55,19 @@ impl RegisteredSocket {
     }
 }
 
+fn descriptor_identity(fd: RawFd) -> std::io::Result<(libc::dev_t, libc::ino_t)> {
+    let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `status` points to writable storage for one `stat`; on success
+    // `fstat` initializes it completely.
+    if unsafe { libc::fstat(fd, status.as_mut_ptr()) } == 0 {
+        // SAFETY: the successful `fstat` above initialized every field.
+        let status = unsafe { status.assume_init() };
+        Ok((status.st_dev, status.st_ino))
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 #[test]
 fn deleted_file_index_does_not_resolve_after_pool_slot_reuse() {
     let worker = DataWorkerId::new(0);
@@ -252,6 +265,9 @@ fn error_callback_runs_before_delete_closes_the_descriptor() {
         0,
         FileFunctions {
             error: Some(|file| {
+                // SAFETY: F_GETFD only queries the descriptor retained by File
+                // for the full callback duration.
+                assert!(unsafe { libc::fcntl(file.fd(), libc::F_GETFD) } >= 0);
                 file.set_private_data(1);
                 Ok(())
             }),
@@ -265,14 +281,12 @@ fn error_callback_runs_before_delete_closes_the_descriptor() {
     assert_eq!(file.private_data(), 1);
     assert_eq!(file.error_events(), 1);
 
+    let identity = descriptor_identity(socket.raw_fd).expect("live descriptor identity");
     assert!(files.delete(socket.index).expect("delete file"));
-    // SAFETY: F_GETFD only queries the descriptor number. EBADF proves the
-    // last OwnedFd was released after readiness deletion.
-    assert_eq!(unsafe { libc::fcntl(socket.raw_fd, libc::F_GETFD) }, -1);
-    assert_eq!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::EBADF)
-    );
+    match descriptor_identity(socket.raw_fd) {
+        Err(error) => assert_eq!(error.raw_os_error(), Some(libc::EBADF)),
+        Ok(reused) => assert_ne!(reused, identity, "deleted descriptor remains open"),
+    }
 }
 
 #[test]
