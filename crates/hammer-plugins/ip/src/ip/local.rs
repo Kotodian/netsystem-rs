@@ -43,11 +43,17 @@ pub enum IpLocalArc {
 
 #[hammer_component_macros::node_next]
 pub enum IpLocalNext {
+    #[next("drop")]
     Drop,
+    #[next("drop")]
     Punt,
+    #[next("drop")]
     Tcp,
+    #[next("drop")]
     Udp,
+    #[next("icmp-input")]
     Icmp,
+    #[next("ip-reassembly")]
     Reassembly,
 }
 
@@ -258,18 +264,61 @@ impl IpLocalStateHandle {
     }
 }
 
-#[hammer_component_macros::node(role = internal, next = IpLocalNext, start_arc = IpLocalArc)]
+#[hammer_component_macros::graph_node(
+    graph = ip,
+    init = register_ip_local,
+    role = internal,
+    next = IpLocalNext,
+    start_arc = IpLocalArc,
+)]
 pub struct IpLocalNode {
     #[node(default = register_ip_local_runtime(state.clone(), None))]
     runtime_data: NodeRuntimeData,
     state: IpLocalStateHandle,
 }
 
-#[hammer_component_macros::node(role = internal, sibling_of = IpLocalNode, start_arc = IpLocalArc)]
+#[hammer_component_macros::graph_node(
+    graph = ip,
+    init = register_ip_receive,
+    role = internal,
+    sibling_of = IpLocalNode,
+    start_arc = IpLocalArc,
+)]
 pub struct IpReceiveNode {
     #[node(default = register_ip_local_runtime(state.clone(), None))]
     runtime_data: NodeRuntimeData,
     state: IpLocalStateHandle,
+}
+
+fn pending_ip_local_controls() -> &'static Mutex<Vec<(usize, IpLocalControlPlane)>> {
+    static CONTROLS: OnceLock<Mutex<Vec<(usize, IpLocalControlPlane)>>> = OnceLock::new();
+    CONTROLS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn register_ip_local(runtime: &DataPlaneRuntime, worker: usize) -> CoreResult<NodeId> {
+    let control = IpLocalControlPlane::new([NodeId::new(0); IpLocalNext::COUNT]);
+    let node = runtime
+        .nodes()
+        .try_register_internal_with_next_names(control.node(), &IpLocalNext::NEXT_NAMES)?;
+    pending_ip_local_controls()
+        .lock()
+        .map_err(|_| CoreError::internal("IP local initializer registry poisoned"))?
+        .push((worker, control));
+    Ok(node)
+}
+
+fn register_ip_receive(runtime: &DataPlaneRuntime, worker: usize) -> CoreResult<NodeId> {
+    let mut controls = pending_ip_local_controls()
+        .lock()
+        .map_err(|_| CoreError::internal("IP local initializer registry poisoned"))?;
+    let position = controls
+        .iter()
+        .position(|(registered_worker, _)| *registered_worker == worker)
+        .ok_or_else(|| CoreError::internal("IP local sibling initialized before its owner"))?;
+    let (_, control) = controls.remove(position);
+    runtime
+        .nodes()
+        .try_register_internal(control.receive_node())
 }
 
 impl Node for IpLocalNode {

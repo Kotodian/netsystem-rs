@@ -18,7 +18,6 @@ pub enum TcpResetNext {
     init = crate::reset::register_tcp_reset,
     next = TcpResetNext,
     role = internal,
-    plugin = "tcp",
 )]
 #[derive(Clone, Copy)]
 pub struct TcpResetNode {

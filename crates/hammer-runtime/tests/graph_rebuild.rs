@@ -76,7 +76,6 @@ fn init_gamma(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
 
 fn entry(name: &'static str) -> NodeEntry {
     NodeEntry {
-        plugin: None,
         registration: NodeRegistration::next(name, 0),
         kind: NodeKind::Internal,
         init: init_named(name),

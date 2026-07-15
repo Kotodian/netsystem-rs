@@ -1,7 +1,7 @@
 use std::mem::transmute;
 use std::sync::{Mutex, OnceLock};
 
-use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index};
+use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_runtime::{
     DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
@@ -27,19 +27,40 @@ pub enum IpUnicastArc {}
 
 #[hammer_component_macros::node_next]
 pub enum IpInputNext {
+    #[next("drop")]
     Drop,
+    #[next("drop")]
     Punt,
+    #[next("drop")]
     Options,
+    #[next("ip-lookup")]
     Lookup,
+    #[next("drop")]
     LookupMulticast,
+    #[next("icmp-error")]
     IcmpError,
+    #[next("ip-reassembly")]
     Reassembly,
 }
 
-#[hammer_component_macros::node(role = internal, next = IpInputNext, start_arc = A)]
+#[hammer_component_macros::graph_node(
+    graph = ip,
+    init = register_ip_input,
+    role = internal,
+    name = "ip-input",
+    next = IpInputNext,
+    start_arc = A,
+)]
 pub struct IpInputNode<A: FeatureArcSpec = IpUnicastArc> {
     #[node(default = register_ip_input_runtime(None))]
     runtime_data: NodeRuntimeData,
+}
+
+fn register_ip_input(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+    runtime.nodes().try_register_internal_with_next_names(
+        IpInputNode::<IpUnicastArc>::new([NodeId::new(0); IpInputNext::COUNT]),
+        &IpInputNext::NEXT_NAMES,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

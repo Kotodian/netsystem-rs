@@ -29,7 +29,6 @@ pub enum TcpOutputNext {
     graph = tcp_worker,
     init = crate::output::register_tcp_output,
     next = TcpOutputNext,
-    plugin = "tcp",
 )]
 #[derive(Clone, Copy)]
 pub struct TcpOutputNode {

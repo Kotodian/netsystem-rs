@@ -12,9 +12,7 @@ use hammer_core::error::{CoreError, CoreResult, DataPlaneError};
 
 use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HANDOFF_SLOT_CAPACITY, HandoffSlot};
 use crate::instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
-use crate::node::{
-    NODE_FUNCTIONS, NodeEntry, NodeFunctionRegistration, NodeRuntime, NodeRuntimeInner,
-};
+use crate::node::{NodeEntry, NodeFunctionRegistration, NodeRuntime, NodeRuntimeInner};
 use crate::trace::{DataPlaneTrace, PacketTrace, TraceControlHandle};
 use hammer_infra::vec::Vec;
 
@@ -353,7 +351,8 @@ impl DataPlaneRuntime {
     }
 
     pub fn init_graph(&self, worker: usize, entries: &[NodeEntry]) -> CoreResult<()> {
-        self.init_graph_with_node_functions(worker, entries, &NODE_FUNCTIONS)
+        let node_functions = crate::registration::node_functions();
+        self.init_graph_with_node_functions(worker, entries, &node_functions)
     }
 
     pub fn init_graph_with_node_functions(
@@ -391,10 +390,12 @@ impl DataPlaneRuntime {
     /// live topology, rebuild and renumber from `entries`, then leave workers
     /// to adopt the new topology via `clone_for_worker` (VPP refork analogue).
     ///
-    /// Does not invent plugin unload; disable/isolate is catalog filtering
-    /// before rebuild (#95). Business state must rebind by name, not NodeId.
+    /// This is a graph transaction, not a plugin unload operation; it neither
+    /// changes the registration authority nor releases DSO handles. Business
+    /// state must rebind by name, not `NodeId`.
     pub fn rebuild_graph(&self, worker: usize, entries: &[NodeEntry]) -> CoreResult<()> {
-        self.rebuild_graph_with_node_functions(worker, entries, &NODE_FUNCTIONS)
+        let node_functions = crate::registration::node_functions();
+        self.rebuild_graph_with_node_functions(worker, entries, &node_functions)
     }
 
     pub fn rebuild_graph_with_node_functions(

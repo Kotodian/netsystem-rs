@@ -6,14 +6,14 @@ use arc_swap::ArcSwap;
 use hammer_core::data_plane::{
     BufferFrame, BufferPacketCursor, Index, NodeId, NodeNext, SecondaryOpaque,
 };
-use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::error::{CoreError, CoreResult, HammerResult};
 use hammer_core::protocol::icmp::{
     IcmpBuildError, IcmpErrorFamily, IcmpErrorMetadata, IcmpGeneratedPacket, IcmpHeader,
     build_echo_reply, build_icmp_error_packet,
 };
 use hammer_core::protocol::wire::read_header;
 use hammer_runtime::{
-    DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
+    DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
     TraceFormatter, add_packet_trace,
 };
 
@@ -629,11 +629,57 @@ impl IcmpInputSnapshotHandle {
     }
 }
 
-#[hammer_component_macros::node]
+#[hammer_component_macros::graph_node(
+    graph = ip,
+    init = register_icmp_input,
+    role = internal,
+)]
 pub struct IcmpInputNode {
     #[node(default = register_icmp_input_runtime(snapshot.clone()))]
     runtime_data: NodeRuntimeData,
     snapshot: IcmpInputSnapshotHandle,
+}
+
+fn register_icmp_input(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+    let snapshot = IcmpInputSnapshotHandle::new(Arc::new(ArcSwap::from_pointee(
+        IcmpInputSnapshot::new(u16::MAX, u16::MAX),
+    )));
+    let node = runtime
+        .nodes()
+        .try_register_internal(IcmpInputNode::new(snapshot.clone()))?;
+    pending_icmp_input_registrations()
+        .lock()
+        .map_err(|_| CoreError::internal("ICMP input initializer registry poisoned"))?
+        .push((node, snapshot));
+    Ok(node)
+}
+
+fn pending_icmp_input_registrations() -> &'static Mutex<Vec<(NodeId, IcmpInputSnapshotHandle)>> {
+    static CONTROLS: OnceLock<Mutex<Vec<(NodeId, IcmpInputSnapshotHandle)>>> = OnceLock::new();
+    CONTROLS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[hammer_component_macros::init_function(
+    name = "wire_icmp_input",
+    runs_after = ["install_packet_graph"]
+)]
+fn wire_icmp_input(engine: &mut hammer_runtime::Engine) -> HammerResult<()> {
+    let drop = engine
+        .runtime
+        .nodes()
+        .node_by_name("drop")
+        .ok_or_else(|| CoreError::internal("drop node is not registered"))?;
+    let mut controls = pending_icmp_input_registrations()
+        .lock()
+        .map_err(|_| CoreError::internal("ICMP input initializer registry poisoned"))?;
+    let (node, snapshot) = controls
+        .pop()
+        .ok_or_else(|| CoreError::internal("ICMP input node is not registered"))?;
+    let drop_slot = engine.runtime.nodes().add_node_next_slot(node, drop)?;
+    snapshot
+        .inner
+        .store(Arc::new(IcmpInputSnapshot::new(drop_slot, drop_slot)));
+    Ok(())
 }
 
 impl Node for IcmpInputNode {
@@ -659,15 +705,19 @@ impl Node for IcmpInputNode {
     }
 }
 
-impl InternalNode for IcmpInputNode {}
-
 #[hammer_component_macros::node_next]
 pub enum IcmpEchoRequestNext {
+    #[next("ip-lookup")]
     Lookup,
+    #[next("drop")]
     Drop,
 }
 
-#[hammer_component_macros::node(role = internal, next = IcmpEchoRequestNext)]
+#[hammer_component_macros::graph_node(
+    graph = ip,
+    kind = internal,
+    next = IcmpEchoRequestNext,
+)]
 pub struct IcmpEchoRequestNode;
 
 impl Node for IcmpEchoRequestNode {
@@ -689,7 +739,7 @@ impl Node for IcmpEchoRequestNode {
 
 /// Consume IPv4 ICMP Destination Unreachable / Fragmentation Needed and update
 /// the IP-owned path MTU cache (Hammer extension beyond VPP core TCP PMTU).
-#[hammer_component_macros::node(role = internal)]
+#[hammer_component_macros::graph_node(graph = ip, kind = internal)]
 pub struct IcmpPathMtuNode;
 
 impl Node for IcmpPathMtuNode {
@@ -777,16 +827,30 @@ fn update_path_mtu_from_index(runtime: &DataPlaneRuntime, index: Index) -> CoreR
 
 #[hammer_component_macros::node_next]
 pub enum IcmpErrorNext {
+    #[next("drop")]
     Drop,
+    #[next("ip-lookup")]
     Lookup,
 }
 
-#[hammer_component_macros::node(role = internal, next = IcmpErrorNext)]
+#[hammer_component_macros::graph_node(
+    graph = ip,
+    init = register_icmp_error,
+    role = internal,
+    next = IcmpErrorNext,
+)]
 pub struct IcmpErrorNode {
     #[node(default = register_icmp_error_runtime(None))]
     runtime_data: NodeRuntimeData,
     #[node(default)]
     source_table: Option<IcmpErrorSourceTableHandle>,
+}
+
+fn register_icmp_error(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+    runtime.nodes().try_register_internal_with_next_names(
+        IcmpErrorNode::new([NodeId::new(0); IcmpErrorNext::COUNT]),
+        &IcmpErrorNext::NEXT_NAMES,
+    )
 }
 
 impl IcmpErrorNode {

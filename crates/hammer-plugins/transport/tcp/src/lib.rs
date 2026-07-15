@@ -238,7 +238,6 @@ pub fn init(reg: &RuntimeRegistry) -> HammerResult<()> {
 
 #[hammer_component_macros::init_function(
     name = "tcp_init",
-    plugin = "tcp",
     runs_after = ["transport_init"]
 )]
 fn init_tcp(config: Arc<Config>) -> HammerResult<()> {

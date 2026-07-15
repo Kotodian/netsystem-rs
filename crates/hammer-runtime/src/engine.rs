@@ -193,11 +193,8 @@ impl Engine {
                 "Process Nodes can only start on the main thread",
             ));
         }
-        self.processes.start(
-            Arc::clone(&self.registry),
-            self.runtime.clone(),
-            &self.plugin_main,
-        )
+        self.processes
+            .start(Arc::clone(&self.registry), self.runtime.clone())
     }
 
     pub fn process_handle(&self, name: &str) -> Option<ProcessHandle> {

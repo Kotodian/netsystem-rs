@@ -5,31 +5,26 @@ use syn::parse::{Parse, ParseStream};
 use syn::{
     Attribute, Error, Expr, ExprPath, Field, Fields, FieldsNamed, FnArg, GenericArgument,
     GenericParam, Generics, Ident, Item, ItemEnum, ItemFn, ItemMod, ItemStruct, LitBool, LitStr,
-    Meta, Path, PathArguments, Result, ReturnType, Token, Type, bracketed, parenthesized,
+    Path, PathArguments, Result, ReturnType, Token, Type, bracketed, parenthesized,
     parse_macro_input, parse_quote, spanned::Spanned,
 };
 
 struct NodeFunctionArgs {
     node: Path,
-    plugin: Option<LitStr>,
 }
 
 impl Parse for NodeFunctionArgs {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let mut node = None;
-        let mut plugin = None;
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             input.parse::<Token![=]>()?;
             match key.to_string().as_str() {
                 "node" => node = Some(input.parse()?),
-                "plugin" => plugin = Some(input.parse()?),
                 other => {
                     return Err(Error::new(
                         key.span(),
-                        format!(
-                            "unknown `node_function` argument `{other}`; expected `node` or `plugin`"
-                        ),
+                        format!("unknown `node_function` argument `{other}`; expected `node`"),
                     ));
                 }
             }
@@ -39,7 +34,6 @@ impl Parse for NodeFunctionArgs {
         }
         Ok(Self {
             node: node.ok_or_else(|| Error::new(Span::call_site(), "missing `node` argument"))?,
-            plugin,
         })
     }
 }
@@ -58,12 +52,7 @@ pub fn node_function(args: TokenStream, input: TokenStream) -> TokenStream {
 
 fn expand_node_function(args: NodeFunctionArgs, function: ItemFn) -> TokenStream2 {
     let node = &args.node;
-    let inventory = plugin_inventory_slice(
-        args.plugin.as_ref(),
-        quote!(::hammer_runtime::node::NODE_FUNCTIONS),
-        quote!(crate::__HAMMER_PLUGIN_NODE_FUNCTIONS),
-    );
-    let plugin = plugin_option_tokens(args.plugin.as_ref());
+    let inventory = quote!(crate::__HAMMER_IMAGE_NODE_FUNCTIONS);
     let function_name = function.sig.ident.clone();
     // VPP recompiles one VLIB_NODE_FN body for each enabled march variant.
     // Generate the equivalent private symbols from one Rust declaration.
@@ -75,7 +64,6 @@ fn expand_node_function(args: NodeFunctionArgs, function: ItemFn) -> TokenStream
         quote!(::hammer_runtime::DataPlaneInstructionSet::Scalar),
         quote!(),
         quote!(),
-        &plugin,
         &inventory,
     );
     let x86_architecture = quote!(#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]);
@@ -87,7 +75,6 @@ fn expand_node_function(args: NodeFunctionArgs, function: ItemFn) -> TokenStream
         quote!(::hammer_runtime::DataPlaneInstructionSet::Sse2),
         x86_architecture.clone(),
         quote!(#[target_feature(enable = "sse2")]),
-        &plugin,
         &inventory,
     );
     let avx2 = expand_node_function_variant(
@@ -98,7 +85,6 @@ fn expand_node_function(args: NodeFunctionArgs, function: ItemFn) -> TokenStream
         quote!(::hammer_runtime::DataPlaneInstructionSet::Avx2),
         x86_architecture.clone(),
         quote!(#[target_feature(enable = "avx2")]),
-        &plugin,
         &inventory,
     );
     let avx512 = expand_node_function_variant(
@@ -109,7 +95,6 @@ fn expand_node_function(args: NodeFunctionArgs, function: ItemFn) -> TokenStream
         quote!(::hammer_runtime::DataPlaneInstructionSet::Avx512),
         x86_architecture,
         quote!(#[target_feature(enable = "avx512f")]),
-        &plugin,
         &inventory,
     );
     let neon = expand_node_function_variant(
@@ -120,7 +105,6 @@ fn expand_node_function(args: NodeFunctionArgs, function: ItemFn) -> TokenStream
         quote!(::hammer_runtime::DataPlaneInstructionSet::Neon),
         quote!(#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]),
         quote!(#[target_feature(enable = "neon")]),
-        &plugin,
         &inventory,
     );
 
@@ -141,7 +125,6 @@ fn expand_node_function_variant(
     instruction_set: TokenStream2,
     architecture: TokenStream2,
     target_feature: TokenStream2,
-    plugin: &TokenStream2,
     inventory: &TokenStream2,
 ) -> TokenStream2 {
     let mut variant_function = function.clone();
@@ -167,7 +150,6 @@ fn expand_node_function_variant(
         #[::linkme::distributed_slice(#inventory)]
         static #static_name: ::hammer_runtime::node::NodeFunctionRegistration = unsafe {
             ::hammer_runtime::node::NodeFunctionRegistration::new(
-                #plugin,
                 #node::NODE_NAME,
                 #instruction_set,
                 #function_name,
@@ -1277,7 +1259,6 @@ struct GraphNodeArgs {
     init: Option<Path>,
     kind: Option<Ident>,
     name: Option<LitStr>,
-    plugin: Option<LitStr>,
     next: Option<Path>,
     role: Option<NodeRole>,
     state: Option<GraphNodeState>,
@@ -1293,7 +1274,6 @@ impl Default for GraphNodeArgs {
             init: None,
             kind: None,
             name: None,
-            plugin: None,
             next: None,
             role: None,
             state: None,
@@ -1321,12 +1301,6 @@ impl Parse for GraphNodeArgs {
                     match key.to_string().as_str() {
                         "graph" => args.graph = Some(input.parse()?),
                         "init" => args.init = Some(input.parse()?),
-                        "plugin" => {
-                            if args.plugin.is_some() {
-                                return Err(Error::new(key.span(), "duplicate `plugin` argument"));
-                            }
-                            args.plugin = Some(input.parse()?);
-                        }
                         "kind" => {
                             let kind: Ident = input.parse()?;
                             args.kind = Some(match kind.to_string().as_str() {
@@ -1585,7 +1559,7 @@ fn generated_graph_node_init(
 
 /// Registers a struct as a graph node via linkme `NodeEntry`.
 ///
-/// Emits a `NodeEntry` into the global `::hammer_runtime::GRAPH_NODES` catalog.
+/// Emits a `NodeEntry` into the current link image's private catalog.
 /// A zero-state `kind = driver|internal` unit node receives a generated init.
 /// Nodes with business state supply `init = path`. `DataPlaneRuntime::init_graph`
 /// walks the filtered catalog and resolves named next-node arcs after registration.
@@ -1610,21 +1584,6 @@ pub fn graph_node(args: TokenStream, input: TokenStream) -> TokenStream {
         .into()
 }
 
-fn plugin_option_tokens(plugin: Option<&LitStr>) -> TokenStream2 {
-    match plugin {
-        Some(name) => quote!(::core::option::Option::Some(#name)),
-        None => quote!(::core::option::Option::None),
-    }
-}
-
-fn plugin_inventory_slice(
-    plugin: Option<&LitStr>,
-    builtin: TokenStream2,
-    private: TokenStream2,
-) -> TokenStream2 {
-    if plugin.is_some() { private } else { builtin }
-}
-
 fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<TokenStream2> {
     let graph_label = args
         .graph
@@ -1644,12 +1603,7 @@ fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<T
     };
     let node_registration =
         graph_node_registration(&node_name, args.next.as_ref(), args.sibling_of.as_ref());
-    let inventory = plugin_inventory_slice(
-        args.plugin.as_ref(),
-        quote!(::hammer_runtime::GRAPH_NODES),
-        quote!(crate::__HAMMER_PLUGIN_GRAPH_NODES),
-    );
-    let plugin = plugin_option_tokens(args.plugin.as_ref());
+    let inventory = quote!(crate::__HAMMER_IMAGE_GRAPH_NODES);
     let generated_role = if args.init.is_none() {
         Some(graph_node_role_from_kind(args.kind.as_ref())?)
     } else {
@@ -1675,7 +1629,6 @@ fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<T
     let registration = quote! {
         #[::linkme::distributed_slice(#inventory)]
         static #static_ident: ::hammer_runtime::NodeEntry = ::hammer_runtime::NodeEntry {
-            plugin: #plugin,
             registration: #node_registration,
             kind: #node_kind,
             init: #init,
@@ -1731,25 +1684,20 @@ fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<T
 
 struct ProcessFnArgs {
     name: LitStr,
-    plugin: Option<LitStr>,
 }
 
 impl Parse for ProcessFnArgs {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let mut name = None;
-        let mut plugin = None;
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             input.parse::<Token![=]>()?;
             match key.to_string().as_str() {
                 "name" => name = Some(input.parse()?),
-                "plugin" => plugin = Some(input.parse()?),
                 other => {
                     return Err(Error::new(
                         key.span(),
-                        format!(
-                            "unknown Process Node argument `{other}`; expected `name` or `plugin`"
-                        ),
+                        format!("unknown Process Node argument `{other}`; expected `name`"),
                     ));
                 }
             }
@@ -1759,7 +1707,6 @@ impl Parse for ProcessFnArgs {
         }
         Ok(Self {
             name: name.ok_or_else(|| Error::new(Span::call_site(), "missing `name` argument"))?,
-            plugin,
         })
     }
 }
@@ -1833,12 +1780,7 @@ fn expand_process_node(args: ProcessFnArgs, function: ItemFn) -> Result<TokenStr
         args.name.value().to_ascii_uppercase().replace('-', "_")
     );
     let name = args.name;
-    let inventory = plugin_inventory_slice(
-        args.plugin.as_ref(),
-        quote!(::hammer_runtime::PROCESS_NODES),
-        quote!(crate::__HAMMER_PLUGIN_PROCESS_NODES),
-    );
-    let plugin = plugin_option_tokens(args.plugin.as_ref());
+    let inventory = quote!(crate::__HAMMER_IMAGE_PROCESS_NODES);
     let conditional_attributes: Vec<_> = function
         .attrs
         .iter()
@@ -1861,7 +1803,6 @@ fn expand_process_node(args: ProcessFnArgs, function: ItemFn) -> Result<TokenStr
         #(#conditional_attributes)*
         #[::linkme::distributed_slice(#inventory)]
         static #static_ident: ::hammer_runtime::ProcessEntry = ::hammer_runtime::ProcessEntry {
-            plugin: #plugin,
             name: #name,
             start: #adapter_name,
         };
@@ -1872,7 +1813,6 @@ fn expand_process_node(args: ProcessFnArgs, function: ItemFn) -> Result<TokenStr
 
 struct InitFnArgs {
     name: LitStr,
-    plugin: Option<LitStr>,
     runs_before: Vec<LitStr>,
     runs_after: Vec<LitStr>,
 }
@@ -1880,7 +1820,6 @@ struct InitFnArgs {
 impl Parse for InitFnArgs {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let mut name = None;
-        let mut plugin = None;
         let mut runs_before = Vec::new();
         let mut runs_after = Vec::new();
         while !input.is_empty() {
@@ -1893,19 +1832,13 @@ impl Parse for InitFnArgs {
                     }
                     name = Some(input.parse()?);
                 }
-                "plugin" => {
-                    if plugin.is_some() {
-                        return Err(Error::new(key.span(), "duplicate `plugin` argument"));
-                    }
-                    plugin = Some(input.parse()?);
-                }
                 "runs_before" => runs_before = parse_litstr_array(input)?,
                 "runs_after" => runs_after = parse_litstr_array(input)?,
                 other => {
                     return Err(Error::new(
                         key.span(),
                         format!(
-                            "unknown argument `{other}`; expected `name`, `plugin`, `runs_before`, or `runs_after`"
+                            "unknown argument `{other}`; expected `name`, `runs_before`, or `runs_after`"
                         ),
                     ));
                 }
@@ -1916,7 +1849,6 @@ impl Parse for InitFnArgs {
         }
         Ok(Self {
             name: name.ok_or_else(|| Error::new(Span::call_site(), "missing `name` argument"))?,
-            plugin,
             runs_before,
             runs_after,
         })
@@ -1931,7 +1863,6 @@ struct ConfigFnArgs {
 impl Parse for ConfigFnArgs {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let mut name = None;
-        let mut plugin = None;
         let mut early = None;
         let mut runs_before = Vec::new();
         let mut runs_after = Vec::new();
@@ -1945,12 +1876,6 @@ impl Parse for ConfigFnArgs {
                     }
                     name = Some(input.parse()?);
                 }
-                "plugin" => {
-                    if plugin.is_some() {
-                        return Err(Error::new(key.span(), "duplicate `plugin` argument"));
-                    }
-                    plugin = Some(input.parse()?);
-                }
                 "runs_before" => runs_before = parse_litstr_array(input)?,
                 "runs_after" => runs_after = parse_litstr_array(input)?,
                 "early" => {
@@ -1963,7 +1888,7 @@ impl Parse for ConfigFnArgs {
                     return Err(Error::new(
                         key.span(),
                         format!(
-                            "unknown argument `{other}`; expected `name`, `plugin`, `early`, `runs_before`, or `runs_after`"
+                            "unknown argument `{other}`; expected `name`, `early`, `runs_before`, or `runs_after`"
                         ),
                     ));
                 }
@@ -1976,7 +1901,6 @@ impl Parse for ConfigFnArgs {
             init: InitFnArgs {
                 name: name
                     .ok_or_else(|| Error::new(Span::call_site(), "missing `name` argument"))?,
-                plugin,
                 runs_before,
                 runs_after,
             },
@@ -2024,14 +1948,9 @@ fn init_function_static_name(fn_name: &LitStr) -> Ident {
 pub fn init_function(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as InitFnArgs);
     let fn_item = parse_macro_input!(input as syn::ItemFn);
-    expand_registered_function(
-        args,
-        fn_item,
-        quote!(::hammer_runtime::init::INIT_FUNCTIONS),
-        quote!(crate::__HAMMER_PLUGIN_INIT_FUNCTIONS),
-    )
-    .unwrap_or_else(Error::into_compile_error)
-    .into()
+    expand_registered_function(args, fn_item, quote!(crate::__HAMMER_IMAGE_INIT_FUNCTIONS))
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
 }
 
 enum InitArgument {
@@ -2049,8 +1968,7 @@ enum InitOutput {
 fn expand_registered_function(
     args: InitFnArgs,
     mut function: ItemFn,
-    builtin_inventory: TokenStream2,
-    plugin_inventory: TokenStream2,
+    inventory: TokenStream2,
 ) -> Result<TokenStream2> {
     validate_init_function_qualifiers(&function)?;
     let arguments = init_arguments(&mut function)?;
@@ -2058,9 +1976,6 @@ fn expand_registered_function(
     let function_name = &function.sig.ident;
     let adapter_name = format_ident!("__hammer_init_adapter_{}", function_name);
     let name = args.name;
-    let inventory =
-        plugin_inventory_slice(args.plugin.as_ref(), builtin_inventory, plugin_inventory);
-    let plugin = plugin_option_tokens(args.plugin.as_ref());
     let runs_before = args.runs_before;
     let runs_after = args.runs_after;
     let static_ident = init_function_static_name(&name);
@@ -2124,7 +2039,6 @@ fn expand_registered_function(
         #(#registration_attributes)*
         #[::linkme::distributed_slice(#inventory)]
         static #static_ident: ::hammer_runtime::init::InitFunction = ::hammer_runtime::init::InitFunction {
-            plugin: #plugin,
             name: #name,
             runs_before: &[#(#runs_before),*],
             runs_after: &[#(#runs_after),*],
@@ -2305,18 +2219,12 @@ pub fn config_function(args: TokenStream, input: TokenStream) -> TokenStream {
 }
 
 fn expand_config_function(args: ConfigFnArgs, function: ItemFn) -> Result<TokenStream2> {
-    let (builtin_inventory, plugin_inventory) = if args.early {
-        (
-            quote!(::hammer_runtime::init::EARLY_CONFIG_FUNCTIONS),
-            quote!(crate::__HAMMER_PLUGIN_EARLY_CONFIG_FUNCTIONS),
-        )
+    let inventory = if args.early {
+        quote!(crate::__HAMMER_IMAGE_EARLY_CONFIG_FUNCTIONS)
     } else {
-        (
-            quote!(::hammer_runtime::init::CONFIG_FUNCTIONS),
-            quote!(crate::__HAMMER_PLUGIN_CONFIG_FUNCTIONS),
-        )
+        quote!(crate::__HAMMER_IMAGE_CONFIG_FUNCTIONS)
     };
-    expand_registered_function(args.init, function, builtin_inventory, plugin_inventory)
+    expand_registered_function(args.init, function, inventory)
 }
 
 /// Shorthand for `#[config_function(name = "...", early = true)]`.
@@ -2336,16 +2244,18 @@ pub fn early_config_function(args: TokenStream, input: TokenStream) -> TokenStre
 /// ```
 #[proc_macro_attribute]
 pub fn main_loop_enter_function(args: TokenStream, input: TokenStream) -> TokenStream {
-    let plugin = match parse_optional_plugin_only_args(args) {
-        Ok(plugin) => plugin,
-        Err(error) => return error.to_compile_error().into(),
-    };
+    if !args.is_empty() {
+        return Error::new(
+            Span::call_site(),
+            "main_loop_enter_function takes no arguments",
+        )
+        .to_compile_error()
+        .into();
+    }
     let fn_item = parse_macro_input!(input as syn::ItemFn);
     expand_main_loop_function(
         fn_item,
-        plugin,
-        quote!(::hammer_runtime::init::MAIN_LOOP_ENTER_FUNCTIONS),
-        quote!(crate::__HAMMER_PLUGIN_MAIN_LOOP_ENTER_FUNCTIONS),
+        quote!(crate::__HAMMER_IMAGE_MAIN_LOOP_ENTER_FUNCTIONS),
     )
     .unwrap_or_else(Error::into_compile_error)
     .into()
@@ -2354,77 +2264,33 @@ pub fn main_loop_enter_function(args: TokenStream, input: TokenStream) -> TokenS
 /// Registers a function to run at main-loop-exit time.
 #[proc_macro_attribute]
 pub fn main_loop_exit_function(args: TokenStream, input: TokenStream) -> TokenStream {
-    let plugin = match parse_optional_plugin_only_args(args) {
-        Ok(plugin) => plugin,
-        Err(error) => return error.to_compile_error().into(),
-    };
+    if !args.is_empty() {
+        return Error::new(
+            Span::call_site(),
+            "main_loop_exit_function takes no arguments",
+        )
+        .to_compile_error()
+        .into();
+    }
     let fn_item = parse_macro_input!(input as syn::ItemFn);
     expand_main_loop_function(
         fn_item,
-        plugin,
-        quote!(::hammer_runtime::init::MAIN_LOOP_EXIT_FUNCTIONS),
-        quote!(crate::__HAMMER_PLUGIN_MAIN_LOOP_EXIT_FUNCTIONS),
+        quote!(crate::__HAMMER_IMAGE_MAIN_LOOP_EXIT_FUNCTIONS),
     )
     .unwrap_or_else(Error::into_compile_error)
     .into()
 }
 
-fn parse_optional_plugin_only_args(args: TokenStream) -> Result<Option<LitStr>> {
-    if args.is_empty() {
-        return Ok(None);
-    }
-    syn::parse::<OptionalPluginArgs>(args.into()).map(|parsed| parsed.plugin)
-}
-
-struct OptionalPluginArgs {
-    plugin: Option<LitStr>,
-}
-
-impl Parse for OptionalPluginArgs {
-    fn parse(input: ParseStream<'_>) -> Result<Self> {
-        let mut plugin = None;
-        while !input.is_empty() {
-            let key: Ident = input.parse()?;
-            input.parse::<Token![=]>()?;
-            match key.to_string().as_str() {
-                "plugin" => {
-                    if plugin.is_some() {
-                        return Err(Error::new(key.span(), "duplicate `plugin` argument"));
-                    }
-                    plugin = Some(input.parse()?);
-                }
-                other => {
-                    return Err(Error::new(
-                        key.span(),
-                        format!("unknown argument `{other}`; expected `plugin`"),
-                    ));
-                }
-            }
-            if input.parse::<Option<Token![,]>>()?.is_none() {
-                break;
-            }
-        }
-        Ok(Self { plugin })
-    }
-}
-
-fn expand_main_loop_function(
-    function: ItemFn,
-    plugin: Option<LitStr>,
-    builtin_inventory: TokenStream2,
-    plugin_inventory: TokenStream2,
-) -> Result<TokenStream2> {
+fn expand_main_loop_function(function: ItemFn, inventory: TokenStream2) -> Result<TokenStream2> {
     let name = LitStr::new(&function.sig.ident.to_string(), function.sig.ident.span());
     expand_registered_function(
         InitFnArgs {
             name,
-            plugin,
             runs_before: Vec::new(),
             runs_after: Vec::new(),
         },
         function,
-        builtin_inventory,
-        plugin_inventory,
+        inventory,
     )
 }
 
@@ -2442,8 +2308,7 @@ pub fn worker_init_function(args: TokenStream, input: TokenStream) -> TokenStrea
     expand_registered_function(
         args,
         fn_item,
-        quote!(::hammer_runtime::init::WORKER_INIT_FUNCTIONS),
-        quote!(crate::__HAMMER_PLUGIN_WORKER_INIT_FUNCTIONS),
+        quote!(crate::__HAMMER_IMAGE_WORKER_INIT_FUNCTIONS),
     )
     .unwrap_or_else(Error::into_compile_error)
     .into()
@@ -2489,18 +2354,6 @@ impl Parse for PluginArgs {
     }
 }
 
-const PLUGIN_OWNED_MACROS: &[&str] = &[
-    "init_function",
-    "config_function",
-    "early_config_function",
-    "worker_init_function",
-    "graph_node",
-    "main_loop_enter_function",
-    "main_loop_exit_function",
-    "process_node",
-    "node_function",
-];
-
 fn attribute_macro_leaf(path: &Path) -> Option<String> {
     path.segments
         .last()
@@ -2511,105 +2364,12 @@ fn is_plugin_attribute(attribute: &Attribute) -> bool {
     attribute_macro_leaf(attribute.path()).is_some_and(|leaf| leaf == "plugin")
 }
 
-fn is_plugin_owned_attribute(attribute: &Attribute) -> bool {
-    attribute_macro_leaf(attribute.path())
-        .is_some_and(|leaf| PLUGIN_OWNED_MACROS.contains(&leaf.as_str()))
-}
-
-fn inject_plugin_into_attribute(attribute: &mut Attribute, plugin_name: &LitStr) -> Result<()> {
-    let Meta::List(list) = &mut attribute.meta else {
-        // Bare `#[main_loop_enter_function]` — rewrite to include plugin.
-        if attribute_macro_leaf(attribute.path()).is_some_and(|leaf| {
-            leaf == "main_loop_enter_function" || leaf == "main_loop_exit_function"
-        }) {
-            let path = attribute.path().clone();
-            *attribute = parse_quote!(#[#path(plugin = #plugin_name)]);
-            return Ok(());
-        }
-        return Ok(());
-    };
-    let mut tokens = list.tokens.clone();
-    if !tokens.is_empty() {
-        tokens.extend(quote!(,));
-    }
-    tokens.extend(quote!(plugin = #plugin_name));
-    list.tokens = tokens;
-    Ok(())
-}
-
-fn inject_plugin_into_item(item: &mut Item, plugin_name: &LitStr) -> Result<()> {
-    match item {
-        Item::Mod(module) => {
-            if module.attrs.iter().any(is_plugin_attribute) {
-                return Err(Error::new(
-                    module.span(),
-                    "nested `#[plugin]` is not allowed",
-                ));
-            }
-            for attribute in &mut module.attrs {
-                if is_plugin_owned_attribute(attribute) {
-                    inject_plugin_into_attribute(attribute, plugin_name)?;
-                }
-            }
-            if let Some((_, items)) = &mut module.content {
-                for nested in items {
-                    inject_plugin_into_item(nested, plugin_name)?;
-                }
-            }
-        }
-        Item::Fn(function) => {
-            for attribute in &mut function.attrs {
-                if is_plugin_owned_attribute(attribute) {
-                    inject_plugin_into_attribute(attribute, plugin_name)?;
-                }
-            }
-        }
-        Item::Struct(structure) => {
-            for attribute in &mut structure.attrs {
-                if is_plugin_owned_attribute(attribute) {
-                    inject_plugin_into_attribute(attribute, plugin_name)?;
-                }
-            }
-        }
-        Item::Enum(enumeration) => {
-            for attribute in &mut enumeration.attrs {
-                if is_plugin_owned_attribute(attribute) {
-                    inject_plugin_into_attribute(attribute, plugin_name)?;
-                }
-            }
-        }
-        Item::Impl(implementation) => {
-            for attribute in &mut implementation.attrs {
-                if is_plugin_owned_attribute(attribute) {
-                    inject_plugin_into_attribute(attribute, plugin_name)?;
-                }
-            }
-            for item in &mut implementation.items {
-                if let syn::ImplItem::Fn(method) = item {
-                    for attribute in &mut method.attrs {
-                        if is_plugin_owned_attribute(attribute) {
-                            inject_plugin_into_attribute(attribute, plugin_name)?;
-                        }
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
 /// Exports one VPP-shaped dynamic [`PluginRegistration`].
-///
-/// Use this inside an external module (`mod foo;` / `foo/mod.rs`) together with
-/// explicit `plugin = "..."` on each lifecycle/graph attribute. Proc macros
-/// cannot see the body of an external module, so `#[plugin]` on `mod foo;`
-/// cannot inject ownership tags — see [`plugin`].
 ///
 /// ```ignore
 /// hammer_component_macros::declare_plugin!(name = "tun", load_after = []);
 ///
-/// #[graph_node(..., plugin = "tun")]
+/// #[graph_node(...)]
 /// struct TunInputDriverNode;
 /// ```
 #[proc_macro]
@@ -2618,15 +2378,8 @@ pub fn declare_plugin(input: TokenStream) -> TokenStream {
     plugin_registration_tokens(&args).into()
 }
 
-/// Marks an **inline** module as a dynamic plugin and tags nested
-/// lifecycle/graph contributions with `plugin = "..."`.
-///
-/// For external modules (`mod foo;` without `{ ... }`), this attribute only
-/// emits [`PluginRegistration`] — it cannot inject `plugin =` into the other
-/// file. Prefer [`declare_plugin`] inside that module plus explicit `plugin =`
-/// on each owned declaration.
-///
-/// Nested `#[plugin]` is rejected.
+/// Marks a module as a dynamic plugin and emits its metadata plus registration
+/// image declaration.
 ///
 /// ```ignore
 /// #[plugin(name = "tun", load_after = ["device", "interface"])]
@@ -2649,52 +2402,19 @@ fn plugin_registration_tokens(args: &PluginArgs) -> TokenStream2 {
         name.value().to_ascii_uppercase().replace('-', "_")
     );
     quote! {
-        #[::linkme::distributed_slice]
-        static __HAMMER_PLUGIN_INIT_FUNCTIONS: [::hammer_runtime::init::InitFunction] = [..];
+        ::hammer_runtime::__declare_registration_image!();
 
-        #[::linkme::distributed_slice]
-        static __HAMMER_PLUGIN_CONFIG_FUNCTIONS: [::hammer_runtime::init::InitFunction] = [..];
-
-        #[::linkme::distributed_slice]
-        static __HAMMER_PLUGIN_EARLY_CONFIG_FUNCTIONS: [::hammer_runtime::init::InitFunction] = [..];
-
-        #[::linkme::distributed_slice]
-        static __HAMMER_PLUGIN_MAIN_LOOP_ENTER_FUNCTIONS: [::hammer_runtime::init::InitFunction] = [..];
-
-        #[::linkme::distributed_slice]
-        static __HAMMER_PLUGIN_MAIN_LOOP_EXIT_FUNCTIONS: [::hammer_runtime::init::InitFunction] = [..];
-
-        #[::linkme::distributed_slice]
-        static __HAMMER_PLUGIN_WORKER_INIT_FUNCTIONS: [::hammer_runtime::init::InitFunction] = [..];
-
-        #[::linkme::distributed_slice]
-        static __HAMMER_PLUGIN_GRAPH_NODES: [::hammer_runtime::NodeEntry] = [..];
-
-        #[::linkme::distributed_slice]
-        static __HAMMER_PLUGIN_NODE_FUNCTIONS: [::hammer_runtime::node::NodeFunctionRegistration] = [..];
-
-        #[::linkme::distributed_slice]
-        static __HAMMER_PLUGIN_PROCESS_NODES: [::hammer_runtime::ProcessEntry] = [..];
-
-        static #static_ident: ::std::sync::OnceLock<::hammer_runtime::PluginRegistration> =
-            ::std::sync::OnceLock::new();
-
-        pub fn registration() -> &'static ::hammer_runtime::PluginRegistration {
-            #static_ident.get_or_init(|| ::hammer_runtime::PluginRegistration {
+        static #static_ident: ::hammer_runtime::PluginRegistration =
+            ::hammer_runtime::PluginRegistration {
                 name: #name,
                 version: env!("CARGO_PKG_VERSION"),
                 version_required: env!("CARGO_PKG_VERSION"),
                 load_after: &[#(#load_after),*],
-                init_functions: &__HAMMER_PLUGIN_INIT_FUNCTIONS,
-                config_functions: &__HAMMER_PLUGIN_CONFIG_FUNCTIONS,
-                early_config_functions: &__HAMMER_PLUGIN_EARLY_CONFIG_FUNCTIONS,
-                main_loop_enter_functions: &__HAMMER_PLUGIN_MAIN_LOOP_ENTER_FUNCTIONS,
-                main_loop_exit_functions: &__HAMMER_PLUGIN_MAIN_LOOP_EXIT_FUNCTIONS,
-                worker_init_functions: &__HAMMER_PLUGIN_WORKER_INIT_FUNCTIONS,
-                graph_nodes: &__HAMMER_PLUGIN_GRAPH_NODES,
-                node_functions: &__HAMMER_PLUGIN_NODE_FUNCTIONS,
-                process_nodes: &__HAMMER_PLUGIN_PROCESS_NODES,
-            })
+            };
+
+        pub fn registration() -> &'static ::hammer_runtime::PluginRegistration {
+            __hammer_link_registration_image();
+            &#static_ident
         }
 
         #[unsafe(no_mangle)]
@@ -2712,15 +2432,6 @@ fn expand_plugin(args: PluginArgs, module: &mut ItemMod) -> Result<TokenStream2>
             module.span(),
             "nested `#[plugin]` is not allowed",
         ));
-    }
-    let name = &args.name;
-    // External modules (`mod foo;`) have `content: None`. Macros cannot read the
-    // other file, so ownership injection is skipped — callers must use
-    // `declare_plugin!` + explicit `plugin =` inside the module body.
-    if let Some((_, items)) = &mut module.content {
-        for item in items.iter_mut() {
-            inject_plugin_into_item(item, name)?;
-        }
     }
     let registration = plugin_registration_tokens(&args);
     Ok(quote! {
@@ -2740,8 +2451,7 @@ mod tests {
         expand_registered_function(
             arguments,
             function,
-            quote!(::hammer_runtime::init::INIT_FUNCTIONS),
-            quote!(crate::__HAMMER_PLUGIN_INIT_FUNCTIONS),
+            quote!(crate::__HAMMER_IMAGE_INIT_FUNCTIONS),
         )
         .expect("expand init function")
         .to_string()
@@ -2771,7 +2481,6 @@ mod tests {
         assert!(expanded.contains("init_device (__hammer_engine , __hammer_injected_1)"));
         assert!(expanded.contains("func : __hammer_init_adapter_init_device"));
         assert!(expanded.contains("runs_before : & [\"workers\"]"));
-        assert!(expanded.contains("plugin : :: core :: option :: Option :: None"));
     }
 
     #[test]
@@ -2868,9 +2577,7 @@ mod tests {
         .expect("parse main-loop function");
         let expanded = expand_main_loop_function(
             function,
-            None,
-            quote!(::hammer_runtime::init::MAIN_LOOP_ENTER_FUNCTIONS),
-            quote!(crate::__HAMMER_PLUGIN_MAIN_LOOP_ENTER_FUNCTIONS),
+            quote!(crate::__HAMMER_IMAGE_MAIN_LOOP_ENTER_FUNCTIONS),
         )
         .expect("expand main-loop function")
         .to_string();
@@ -2878,7 +2585,6 @@ mod tests {
         assert!(expanded.contains("MAIN_LOOP_ENTER_FUNCTIONS"));
         assert!(expanded.contains("registry . require :: < HandoffMain > () ?"));
         assert!(expanded.contains("func : __hammer_init_adapter_start_workers"));
-        assert!(expanded.contains("plugin : :: core :: option :: Option :: None"));
     }
 
     #[test]
@@ -3016,12 +2722,8 @@ mod tests {
             "missing static sibling registration: {expanded}"
         );
         assert!(
-            expanded.contains("GRAPH_NODES"),
-            "missing global graph catalog registration: {expanded}"
-        );
-        assert!(
-            expanded.contains("plugin : :: core :: option :: Option :: None"),
-            "missing plugin owner field: {expanded}"
+            expanded.contains("__HAMMER_IMAGE_GRAPH_NODES"),
+            "missing image-local graph catalog registration: {expanded}"
         );
         assert!(
             !expanded.contains("with_node_name"),
@@ -3062,8 +2764,8 @@ mod tests {
             "static entry must use generated init: {expanded}"
         );
         assert!(
-            expanded.contains("GRAPH_NODES"),
-            "missing global graph catalog registration: {expanded}"
+            expanded.contains("__HAMMER_IMAGE_GRAPH_NODES"),
+            "missing image-local graph catalog registration: {expanded}"
         );
     }
 
@@ -3136,27 +2838,6 @@ mod tests {
         assert!(
             !expanded.contains("MAX_NODE_NEXT_SLOTS"),
             "obsolete 16-next macro guard must be gone: {expanded}"
-        );
-    }
-
-    #[test]
-    fn plugin_rejects_nested_plugins() {
-        let args = syn::parse_str::<PluginArgs>(r#"name = "outer""#).expect("parse plugin args");
-        let mut module = syn::parse_str::<ItemMod>(
-            r#"
-            mod outer {
-                #[plugin(name = "inner")]
-                mod inner {}
-            }
-            "#,
-        )
-        .expect("parse module");
-        let error = expand_plugin(args, &mut module).expect_err("nested plugin must fail");
-        assert!(
-            error
-                .to_string()
-                .contains("nested `#[plugin]` is not allowed"),
-            "unexpected error: {error}"
         );
     }
 

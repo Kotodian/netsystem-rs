@@ -1,5 +1,14 @@
 extern crate self as hammer_runtime;
 
+mod registration;
+
+#[doc(hidden)]
+pub mod __private {
+    pub use crate::registration::RegistrationImage;
+}
+
+crate::__declare_registration_image!();
+
 pub mod engine;
 pub use engine::{Engine, EnginePool};
 pub mod file;
@@ -30,9 +39,9 @@ pub use data_plane::{DataPlaneRuntime, DataPlaneRuntimeConfig, new_worker_runtim
 pub use handoff::{DataPlaneHandoff, DataPlaneHandoffWorker, DataWorkerId};
 pub use instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
 pub use node::{
-    DriverNode, GRAPH_NODES, InternalNode, Node, NodeDescriptor, NodeEntry, NodeErrorCounters,
-    NodeProcessFn, NodeResult, NodeRuntime, NodeRuntimeData, NodeRuntimeReady, NodeRuntimeStatsRow,
-    NoopNode, default_prefetch_indices,
+    DriverNode, InternalNode, Node, NodeDescriptor, NodeEntry, NodeErrorCounters, NodeProcessFn,
+    NodeResult, NodeRuntime, NodeRuntimeData, NodeRuntimeReady, NodeRuntimeStatsRow, NoopNode,
+    default_prefetch_indices,
 };
 pub use plugin::{PluginError, PluginMain, PluginRegistration, host_meets_plugin_requirement};
 pub use plugin_loader::{
@@ -40,8 +49,7 @@ pub use plugin_loader::{
     plugin_cdylib_path, read_plugin_registration, workspace_target_dir,
 };
 pub use process::{
-    PROCESS_NODES, ProcessContext, ProcessEntry, ProcessEventBatch, ProcessFuture, ProcessHandle,
-    ProcessWake,
+    ProcessContext, ProcessEntry, ProcessEventBatch, ProcessFuture, ProcessHandle, ProcessWake,
 };
 pub use trace::{
     PacketTrace, TraceControlHandle, TraceControlPlane, TraceEntry, TraceFormatter,

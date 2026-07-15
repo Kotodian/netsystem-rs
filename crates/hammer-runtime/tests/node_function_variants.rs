@@ -1,12 +1,16 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use hammer_core::config::Config;
 use hammer_core::data_plane::{BufferFrame, DataPlaneBufferConfig};
-use hammer_infra::vec::Vec;
+use hammer_core::registry::RuntimeRegistry;
+use hammer_runtime::graph::install_packet_graph;
 use hammer_runtime::{
-    DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig, GRAPH_NODES, Node,
-    NodeResult, NodeRuntimeData, spawn::DataRuntime,
+    DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig, Engine, Node, NodeResult,
+    NodeRuntimeData, spawn::DataRuntime,
 };
+
+hammer_runtime::__declare_registration_image!();
 
 static DISPATCH_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -35,14 +39,6 @@ fn multiarch_process(_: &DataPlaneRuntime, _: NodeRuntimeData, _: &mut BufferFra
     NodeResult::drop()
 }
 
-fn multiarch_entries() -> Vec<hammer_runtime::NodeEntry> {
-    GRAPH_NODES
-        .iter()
-        .filter(|entry| entry.registration.name() == Some("multiarch-fixture"))
-        .copied()
-        .collect()
-}
-
 #[test]
 fn node_function_selection_changes_dispatch_without_changing_topology() {
     let runtime_config = DataPlaneRuntimeConfig {
@@ -53,26 +49,38 @@ fn node_function_selection_changes_dispatch_without_changing_topology() {
             ..DataPlaneBufferConfig::default()
         },
     };
-    let entries = multiarch_entries();
-    let scalar = DataPlaneRuntime::new_with_instruction_set(
-        runtime_config.clone(),
-        DataPlaneInstructionSet::Scalar,
+    let mut scalar = Engine::new(
+        DataPlaneRuntime::new_with_instruction_set(
+            runtime_config.clone(),
+            DataPlaneInstructionSet::Scalar,
+        ),
+        RuntimeRegistry::new(),
     );
-    scalar
-        .init_graph(0, &entries)
+    install_packet_graph(&mut scalar, Arc::new(Config::default()))
         .expect("initialize scalar graph");
     let scalar_node = scalar
+        .runtime
         .node_by_name(MultiarchNode::NODE_NAME)
         .expect("scalar graph node");
     let scalar_topology = (
         scalar_node,
-        scalar.nodes().node_name(scalar_node).expect("scalar name"),
-        scalar.nodes().node_kind(scalar_node).expect("scalar kind"),
         scalar
+            .runtime
+            .nodes()
+            .node_name(scalar_node)
+            .expect("scalar name"),
+        scalar
+            .runtime
+            .nodes()
+            .node_kind(scalar_node)
+            .expect("scalar kind"),
+        scalar
+            .runtime
             .nodes()
             .node_state(scalar_node)
             .expect("scalar state"),
         scalar
+            .runtime
             .nodes()
             .node_siblings(scalar_node)
             .expect("scalar siblings")
@@ -81,30 +89,47 @@ fn node_function_selection_changes_dispatch_without_changing_topology() {
 
     DISPATCH_COUNT.store(0, Ordering::Relaxed);
     scalar
+        .runtime
         .schedule_empty_frame(scalar_node)
         .expect("schedule scalar fixture");
-    scalar.run_ready_nodes().expect("dispatch scalar fixture");
+    scalar
+        .runtime
+        .run_ready_nodes()
+        .expect("dispatch scalar fixture");
     assert_eq!(DISPATCH_COUNT.load(Ordering::Relaxed), 1);
 
-    let native = DataPlaneRuntime::new_with_instruction_set(
-        runtime_config,
-        DataPlaneInstructionSet::native(),
+    let mut native = Engine::new(
+        DataPlaneRuntime::new_with_instruction_set(
+            runtime_config,
+            DataPlaneInstructionSet::native(),
+        ),
+        RuntimeRegistry::new(),
     );
-    native
-        .init_graph(0, &entries)
+    install_packet_graph(&mut native, Arc::new(Config::default()))
         .expect("initialize native graph");
     let native_node = native
+        .runtime
         .node_by_name(MultiarchNode::NODE_NAME)
         .expect("native graph node");
     let native_topology = (
         native_node,
-        native.nodes().node_name(native_node).expect("native name"),
-        native.nodes().node_kind(native_node).expect("native kind"),
         native
+            .runtime
+            .nodes()
+            .node_name(native_node)
+            .expect("native name"),
+        native
+            .runtime
+            .nodes()
+            .node_kind(native_node)
+            .expect("native kind"),
+        native
+            .runtime
             .nodes()
             .node_state(native_node)
             .expect("native state"),
         native
+            .runtime
             .nodes()
             .node_siblings(native_node)
             .expect("native siblings")
@@ -114,10 +139,14 @@ fn node_function_selection_changes_dispatch_without_changing_topology() {
     DISPATCH_COUNT.store(0, Ordering::Relaxed);
     for _ in 0..2 {
         native
+            .runtime
             .schedule_empty_frame(native_node)
             .expect("schedule native fixture");
     }
-    native.run_ready_nodes().expect("dispatch native fixture");
+    native
+        .runtime
+        .run_ready_nodes()
+        .expect("dispatch native fixture");
     assert_eq!(DISPATCH_COUNT.load(Ordering::Relaxed), 2);
 
     assert_eq!(native_topology, scalar_topology);

@@ -151,7 +151,6 @@ impl TcpInputControlPlane {
     next = TcpInputNext,
     init = crate::register_tcp_input,
     role = internal,
-    plugin = "tcp",
 )]
 pub struct TcpInputNode<C: CongestionController + 'static, Seg: SessionSegment> {
     #[node(default = register_tcp_input_runtime(snapshot.clone()))]

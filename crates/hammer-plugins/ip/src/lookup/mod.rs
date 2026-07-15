@@ -206,7 +206,7 @@ impl IpLookupControlPlane {
 /// Owns the static routes read from config. The FIB table is built in two
 /// phases so that graph registration is order-independent:
 ///   1. `register_node` runs inside `DataPlaneRuntime::init_graph` as the
-///      `ip-lookup` init fn. linkme `GRAPH_NODES` section order is
+///      `ip-lookup` init fn. Registration image order is
 ///      non-deterministic per build, so the `drop` node may not be registered
 ///      yet at this point. The node is therefore registered with a placeholder
 ///      table whose `drop` next-node id is [`DROP_PLACEHOLDER`].
@@ -293,14 +293,16 @@ pub fn init(reg: &RuntimeRegistry) -> HammerResult<()> {
     Ok(())
 }
 
-#[hammer_component_macros::init_function(name = "ip_init", plugin = "ip")]
+#[hammer_component_macros::init_function(
+    name = "ip_init",
+    runs_before = ["install_packet_graph"]
+)]
 fn init_ip(engine: &mut hammer_runtime::Engine) -> HammerResult<()> {
     init(&engine.registry)
 }
 
 #[hammer_component_macros::init_function(
     name = "wire_ip_lookup",
-    plugin = "ip",
     runs_after = ["install_packet_graph", "ip_init"]
 )]
 fn wire_ip_lookup(engine: &mut hammer_runtime::Engine) -> HammerResult<()> {
@@ -330,7 +332,6 @@ pub fn wire_ip_lookup_drop(runtime: &DataPlaneRuntime) -> CoreResult<()> {
 #[hammer_component_macros::graph_node(
     graph = service,
     init = crate::lookup::register_ip_lookup,
-    plugin = "ip",
 )]
 pub struct IpLookupNode {
     #[node(default = register_ip_lookup_runtime(table.clone()))]

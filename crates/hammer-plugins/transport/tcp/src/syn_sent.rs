@@ -32,7 +32,6 @@ pub enum TcpSynSentNext {
     name = "tcp-syn-sent",
     next = TcpSynSentNext,
     role = internal,
-    plugin = "tcp",
 )]
 pub struct TcpSynSentNode<C: CongestionController + 'static, Seg: SessionSegment> {
     session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,

@@ -36,12 +36,9 @@ pub trait Ordered {
     }
 }
 
-/// Lifecycle registration collected by linkme.
-///
-/// `plugin: None` marks a runtime builtin; plugin-owned entries set `Some(name)`.
+/// Lifecycle registration collected from constructor-published link images.
 #[derive(Clone, Copy)]
 pub struct InitFunction {
-    pub plugin: Option<&'static str>,
     pub name: &'static str,
     pub runs_before: &'static [&'static str],
     pub runs_after: &'static [&'static str],
@@ -59,24 +56,6 @@ impl Ordered for InitFunction {
         self.runs_after
     }
 }
-
-#[linkme::distributed_slice]
-pub static INIT_FUNCTIONS: [InitFunction] = [..];
-
-#[linkme::distributed_slice]
-pub static CONFIG_FUNCTIONS: [InitFunction] = [..];
-
-#[linkme::distributed_slice]
-pub static EARLY_CONFIG_FUNCTIONS: [InitFunction] = [..];
-
-#[linkme::distributed_slice]
-pub static MAIN_LOOP_ENTER_FUNCTIONS: [InitFunction] = [..];
-
-#[linkme::distributed_slice]
-pub static MAIN_LOOP_EXIT_FUNCTIONS: [InitFunction] = [..];
-
-#[linkme::distributed_slice]
-pub static WORKER_INIT_FUNCTIONS: [InitFunction] = [..];
 
 pub fn topological_order<T: Ordered>(items: &[T]) -> Result<Vec<usize>, InitError> {
     let mut graph = DiGraphMap::<&str, ()>::new();
@@ -140,27 +119,27 @@ fn dispatch_init(items: Vec<InitFunction>, engine: &mut Engine) -> HammerResult<
 }
 
 pub fn run_init_functions(engine: &mut Engine) -> HammerResult<()> {
-    let functions = engine.plugin_main().init_functions();
+    let functions = crate::registration::init_functions();
     dispatch_init(functions, engine)
 }
 
 pub fn run_worker_init_functions(engine: &mut Engine) -> HammerResult<()> {
-    let functions = engine.plugin_main().worker_init_functions();
+    let functions = crate::registration::worker_init_functions();
     dispatch_init(functions, engine)
 }
 
 pub fn run_main_loop_enter(engine: &mut Engine) -> HammerResult<()> {
-    let functions = engine.plugin_main().main_loop_enter_functions();
+    let functions = crate::registration::main_loop_enter_functions();
     dispatch_init(functions, engine)
 }
 
 pub fn run_main_loop_exit(engine: &mut Engine) -> HammerResult<()> {
-    let functions = engine.plugin_main().main_loop_exit_functions();
+    let functions = crate::registration::main_loop_exit_functions();
     dispatch_init(functions, engine)
 }
 
 pub fn run_config_functions(engine: &mut Engine, early: bool) -> HammerResult<()> {
-    let functions = engine.plugin_main().config_functions(early);
+    let functions = crate::registration::config_functions(early);
     dispatch_init(functions, engine)
 }
 
@@ -178,7 +157,6 @@ mod tests {
         specs
             .iter()
             .map(|(name, after, before)| InitFunction {
-                plugin: None,
                 name,
                 runs_after: after,
                 runs_before: before,

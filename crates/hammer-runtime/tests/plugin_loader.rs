@@ -1,9 +1,30 @@
+use std::fs;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use hammer_core::config::parse_config;
 use hammer_core::data_plane::DataPlaneBufferConfig;
-use hammer_runtime::plugin_loader::{built_plugin_path, plugin_cdylib_filename};
+use hammer_core::registry::RuntimeRegistry;
+use hammer_runtime::graph::install_packet_graph;
+use hammer_runtime::plugin_loader::{
+    built_plugin_cdylib_path, built_plugin_path, plugin_cdylib_filename,
+};
 use hammer_runtime::{
-    DataPlaneRuntime, DataPlaneRuntimeConfig, PluginError, PluginMain,
+    DataPlaneRuntime, DataPlaneRuntimeConfig, Engine, PluginError, PluginMain,
     host_meets_plugin_requirement,
 };
+
+fn test_engine() -> Engine {
+    let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig {
+        buffers: DataPlaneBufferConfig {
+            buffer_slot_capacity: 256,
+            buffer_slots: 32,
+            frame_slots: 32,
+            ..DataPlaneBufferConfig::default()
+        },
+    });
+    Engine::new(runtime, RuntimeRegistry::new())
+}
 
 #[test]
 fn platform_library_name_uses_hammer_plugin_prefix() {
@@ -59,119 +80,59 @@ fn missing_plugin_reports_name_and_resolved_path() {
 }
 
 #[test]
-fn plugin_main_loads_all_network_dsos_and_owns_their_contributions() {
-    let roots = ["tun".into(), "ip".into(), "tcp".into(), "udp".into()];
-    let main = PluginMain::load(env!("CARGO_PKG_VERSION"), built_plugin_path(), &roots)
-        .expect("load network plugins");
+fn dso_constructors_publish_and_failed_load_unlinks_before_successful_activation() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let mismatch_dir = std::env::temp_dir().join(format!(
+        "hammer-registration-rollback-{}-{unique}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&mismatch_dir).expect("create mismatch plugin directory");
+    let mismatch_path = mismatch_dir.join(plugin_cdylib_filename("mismatch"));
+    fs::copy(built_plugin_cdylib_path("udp"), &mismatch_path)
+        .expect("copy UDP DSO under a mismatched name");
 
-    assert_eq!(main.loaded_plugins(), roots);
-    for name in ["tun", "ip", "tcp", "udp"] {
-        let registration = main.registration(name).expect("registration");
+    let error = PluginMain::load(
+        env!("CARGO_PKG_VERSION"),
+        &mismatch_dir,
+        &["mismatch".into()],
+    )
+    .expect_err("mismatched registration must fail");
+    assert_eq!(
+        error,
+        PluginError::NameMismatch {
+            requested: "mismatch".into(),
+            exported: "udp".into(),
+        }
+    );
+    fs::remove_dir_all(&mismatch_dir).expect("remove mismatch plugin directory");
+
+    let mut rollback_probe = test_engine();
+    // Shared infrastructure may remain mapped independently and references IP
+    // nexts. Node creation precedes named-next resolution, so the failed UDP
+    // image can still be checked without requiring a complete plugin graph.
+    _ = install_packet_graph(&mut rollback_probe, Arc::new(Default::default()));
+    assert!(rollback_probe.runtime.node_by_name("udp-input").is_none());
+
+    let config = Arc::new(parse_config("plugins = [\"udp\"]").expect("UDP plugin config"));
+    let mut engine = test_engine();
+    engine.registry.set(Arc::clone(&config));
+    engine
+        .load_plugins_from_config(&built_plugin_path())
+        .expect("load UDP dependency closure");
+    assert_eq!(engine.loaded_plugins(), ["ip", "udp"]);
+
+    for name in ["ip", "udp"] {
+        let registration = engine
+            .plugin_main()
+            .registration(name)
+            .expect("plugin metadata");
         assert_eq!(registration.name, name);
         assert_eq!(registration.version, env!("CARGO_PKG_VERSION"));
-        assert!(
-            registration
-                .graph_nodes
-                .iter()
-                .all(|entry| entry.plugin == Some(name)),
-            "{name} registration must expose only its DSO-private Graph Node inventory"
-        );
-        assert!(
-            registration
-                .init_functions
-                .iter()
-                .chain(registration.config_functions)
-                .chain(registration.early_config_functions)
-                .chain(registration.main_loop_enter_functions)
-                .chain(registration.main_loop_exit_functions)
-                .chain(registration.worker_init_functions)
-                .all(|entry| entry.plugin == Some(name)),
-            "{name} registration must expose only its DSO-private lifecycle inventory"
-        );
-        assert!(
-            registration
-                .process_nodes
-                .iter()
-                .all(|entry| entry.plugin == Some(name)),
-            "{name} registration must expose only its DSO-private Process Node inventory"
-        );
-        assert!(
-            registration
-                .graph_nodes
-                .iter()
-                .any(|entry| entry.plugin == Some(name)),
-            "{name} must export at least one owned Graph Node"
-        );
     }
 
-    let graph_nodes = main.graph_nodes();
-    for name in ["tun", "ip", "tcp", "udp"] {
-        assert!(graph_nodes.iter().any(|entry| entry.plugin == Some(name)));
-    }
-
-    let tun = main.registration("tun").expect("tun registration");
-    assert!(
-        tun.config_functions
-            .iter()
-            .any(|entry| entry.name == "tun_config")
-    );
-    assert!(
-        tun.worker_init_functions
-            .iter()
-            .any(|entry| entry.name == "tun_worker_init")
-    );
-    let ip = main.registration("ip").expect("ip registration");
-    assert!(
-        ip.init_functions
-            .iter()
-            .any(|entry| entry.name == "ip_init")
-    );
-    assert!(
-        ip.process_nodes
-            .iter()
-            .any(|entry| entry.name == "ip-reassembly-expire-walk")
-    );
-    let tcp = main.registration("tcp").expect("tcp registration");
-    assert!(
-        tcp.init_functions
-            .iter()
-            .any(|entry| entry.name == "tcp_init")
-    );
-}
-
-#[test]
-fn tcp_root_loads_ip_dependency_first() {
-    let main = PluginMain::load(
-        env!("CARGO_PKG_VERSION"),
-        built_plugin_path(),
-        &["tcp".into()],
-    )
-    .expect("load tcp dependency closure");
-    assert_eq!(main.loaded_plugins(), ["ip", "tcp"]);
-}
-
-#[test]
-fn dynamically_imported_node_entry_installs_callable_graph_state() {
-    let main = PluginMain::load(
-        env!("CARGO_PKG_VERSION"),
-        built_plugin_path(),
-        &["udp".into()],
-    )
-    .expect("load udp plugin");
-    let entry = main
-        .graph_nodes()
-        .into_iter()
-        .find(|entry| entry.registration.name() == Some("udp-input"))
-        .expect("udp-input contribution");
-    let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig {
-        buffers: DataPlaneBufferConfig {
-            buffer_slot_capacity: 128,
-            buffer_slots: 8,
-            frame_slots: 8,
-            ..DataPlaneBufferConfig::default()
-        },
-    });
-
-    let installed = (entry.init)(&runtime, 0).expect("call dynamic node init");
-    assert_eq!(runtime.node_by_name("udp-input"), Some(installed));
+    engine.start_process_nodes().expect("start Process Nodes");
+    assert!(engine.process_handle("ip-reassembly-expire-walk").is_some());
 }

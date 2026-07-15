@@ -20,7 +20,6 @@ use hammer_service::device::{
 use hammer_service::interface::InterfaceControlPlane;
 use hammer_service::opaque::NetworkOpaque;
 
-// External `mod tun;` cannot receive ownership injection from `#[plugin]`.
 /// TUN-owned instance list under `[plugin.tun]`.
 ///
 /// Names reference `[[network.interface]]` entries (L3/FIB). This driver
@@ -158,7 +157,7 @@ impl TunControl {
     }
 }
 
-#[hammer_component_macros::config_function(name = "tun_config", plugin = "tun")]
+#[hammer_component_macros::config_function(name = "tun_config")]
 fn configure_tun(
     config: Arc<Config>,
     device_main: Arc<DeviceMain>,
@@ -186,7 +185,7 @@ fn configure_tun(
     Ok(control)
 }
 
-#[hammer_component_macros::worker_init_function(name = "tun_worker_init", plugin = "tun")]
+#[hammer_component_macros::worker_init_function(name = "tun_worker_init")]
 fn configure_tun_worker(
     engine: &mut hammer_runtime::Engine,
     control: Arc<TunControl>,
@@ -226,7 +225,6 @@ fn schedule_tun_input(file: &mut File) -> HammerResult<()> {
     kind = driver,
     state = disabled,
     sibling_of = DeviceInputNode,
-    plugin = "tun",
 )]
 #[derive(Debug, Clone, Copy)]
 pub struct TunInputDriverNode;
@@ -252,7 +250,6 @@ impl Node for TunInputDriverNode {
     graph = tun,
     name = "tun-output",
     kind = internal,
-    plugin = "tun",
 )]
 #[derive(Debug, Clone, Copy)]
 pub struct TunOutputDriverNode;

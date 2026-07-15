@@ -44,8 +44,8 @@ pub fn read_plugin_registration(library: &Library) -> Result<&PluginRegistration
     // `declare_plugin!`; the returned `Symbol` cannot outlive `library`.
     let symbol = unsafe { library.get::<RegistrationFn>(b"hammer_plugin_registration\0") }
         .map_err(|error| error.to_string())?;
-    // SAFETY: generated registration functions only initialize and return a
-    // DSO-owned `OnceLock<PluginRegistration>` and never unwind.
+    // SAFETY: generated registration functions return a DSO-static metadata
+    // record and never unwind.
     let pointer = unsafe { symbol() };
     if pointer.is_null() {
         return Err("hammer_plugin_registration returned null".into());
@@ -73,11 +73,11 @@ pub fn workspace_target_dir() -> PathBuf {
 
 pub fn built_plugin_cdylib_path(plugin_name: &str) -> PathBuf {
     let target = workspace_target_dir();
-    let primary = plugin_cdylib_path(&target, plugin_name);
-    if primary.is_file() {
-        return primary;
+    let dependency = plugin_cdylib_path(&target.join("deps"), plugin_name);
+    if dependency.is_file() {
+        return dependency;
     }
-    plugin_cdylib_path(&target.join("deps"), plugin_name)
+    plugin_cdylib_path(&target, plugin_name)
 }
 
 pub fn built_plugin_path() -> PathBuf {

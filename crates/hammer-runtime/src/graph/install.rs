@@ -1,8 +1,7 @@
-//! Host installs the packet graph from plugin (and builtin) `GRAPH_NODES`.
+//! Host installs the packet graph from the process-wide registration authority.
 //!
-//! Plugins contribute nodes via `#[graph_node]` / cdylib inventory; this init
-//! only filters by `loaded_plugins` and calls `init_graph`. It is not a
-//! service-owned graph catalog.
+//! Plugins and builtins contribute nodes through the same constructor-published
+//! link-image inventories. This is not a service-owned graph catalog.
 
 use std::sync::Arc;
 
@@ -18,8 +17,8 @@ pub fn install_packet_graph(engine: &mut Engine, config: Arc<Config>) -> HammerR
     let handle = NodeHandle::new(config.worker.handoff.node_handle);
     engine.runtime.set_handoff_node_handle(handle);
 
-    let entries = engine.plugin_main().graph_nodes();
-    let functions = engine.plugin_main().node_functions();
+    let entries = crate::registration::graph_nodes();
+    let functions = crate::registration::node_functions();
     engine
         .runtime
         .init_graph_with_node_functions(0, &entries, &functions)?;

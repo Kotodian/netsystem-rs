@@ -1,6 +1,11 @@
-use hammer_core::data_plane::{NodeKind, NodeRegistration};
+use std::sync::Arc;
+
+use hammer_core::config::Config;
+use hammer_core::data_plane::NodeKind;
+use hammer_core::registry::RuntimeRegistry;
 use hammer_plugin_tun::TunInputDriverNode;
-use hammer_runtime::GRAPH_NODES;
+use hammer_runtime::graph::install_packet_graph;
+use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, Engine};
 use hammer_service::device::{DeviceInputNext, DeviceInputNode};
 
 #[test]
@@ -10,25 +15,38 @@ fn tun_input_matches_device_input_next_layout() {
 }
 
 #[test]
-fn tun_graph_nodes_owned_by_tun_plugin() {
-    let tun_input = GRAPH_NODES
-        .iter()
-        .find(|entry| entry.registration.name() == Some("tun-input"))
-        .expect("tun-input");
-    let tun_output = GRAPH_NODES
-        .iter()
-        .find(|entry| entry.registration.name() == Some("tun-output"))
+fn tun_graph_nodes_install_from_the_link_image() {
+    _ = hammer_plugin_tun::registration();
+    let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
+    let mut engine = Engine::new(runtime, RuntimeRegistry::new());
+
+    // The service image references protocol-plugin nodes that are not linked
+    // into this focused test. Node creation precedes named-next resolution.
+    _ = install_packet_graph(&mut engine, Arc::new(Config::default()));
+
+    let device_input = engine
+        .runtime
+        .node_by_name("device-input")
+        .expect("device-input");
+    let tun_input = engine.runtime.node_by_name("tun-input").expect("tun-input");
+    let tun_output = engine
+        .runtime
+        .node_by_name("tun-output")
         .expect("tun-output");
-    assert_eq!(tun_input.kind, NodeKind::Driver);
     assert_eq!(
-        tun_input.registration,
-        NodeRegistration::sibling_of("tun-input", "device-input")
+        engine.runtime.nodes().node_kind(tun_input).unwrap(),
+        NodeKind::Driver
     );
-    assert_eq!(tun_input.plugin, Some("tun"));
-    assert_eq!(tun_output.kind, NodeKind::Internal);
     assert_eq!(
-        tun_output.registration,
-        NodeRegistration::next("tun-output", 0)
+        engine.runtime.nodes().node_kind(tun_output).unwrap(),
+        NodeKind::Internal
     );
-    assert_eq!(tun_output.plugin, Some("tun"));
+    assert!(
+        engine
+            .runtime
+            .nodes()
+            .node_siblings(tun_input)
+            .unwrap()
+            .contains(&device_input)
+    );
 }

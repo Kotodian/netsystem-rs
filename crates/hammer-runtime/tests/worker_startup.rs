@@ -12,6 +12,8 @@ use hammer_runtime::{
     new_worker_runtime,
 };
 
+hammer_runtime::__declare_registration_image!();
+
 const READY: usize = 0;
 const INIT_FAILURE: usize = 1;
 const PANIC: usize = 2;

@@ -62,7 +62,9 @@ pub fn unpack_fragment_owner_value(value: u64) -> (PoolIndex, DataWorkerId) {
 
 #[hammer_component_macros::node_next]
 pub enum IpReassemblyNext {
+    #[next("ip-input")]
     Input,
+    #[next("drop")]
     Drop,
 }
 
@@ -293,7 +295,6 @@ impl IpReassemblyMain {
 
 #[hammer_component_macros::init_function(
     name = "ip_reassembly_init",
-    plugin = "ip",
     runs_before = ["install_packet_graph"]
 )]
 fn init_ip_reassembly(config: Arc<Config>) -> HammerResult<Arc<IpReassemblyMain>> {
@@ -302,7 +303,12 @@ fn init_ip_reassembly(config: Arc<Config>) -> HammerResult<Arc<IpReassemblyMain>
     Ok(main)
 }
 
-#[hammer_component_macros::node(role = internal, next = IpReassemblyNext)]
+#[hammer_component_macros::graph_node(
+    graph = ip,
+    init = register_ip_reassembly,
+    role = internal,
+    next = IpReassemblyNext,
+)]
 #[derive(Clone)]
 pub struct IpReassemblyNode {
     #[node(default)]
@@ -350,7 +356,14 @@ impl IpReassemblyNode {
     }
 }
 
-#[hammer_component_macros::process_node(name = "ip-reassembly-expire-walk", plugin = "ip")]
+fn register_ip_reassembly(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+    runtime.nodes().try_register_internal_with_next_names(
+        IpReassemblyNode::new([NodeId::new(0); IpReassemblyNext::COUNT]),
+        &IpReassemblyNext::NEXT_NAMES,
+    )
+}
+
+#[hammer_component_macros::process_node(name = "ip-reassembly-expire-walk")]
 async fn ip_reassembly_expire_process(
     mut context: hammer_runtime::ProcessContext,
 ) -> HammerResult<()> {

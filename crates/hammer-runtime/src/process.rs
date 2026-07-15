@@ -19,19 +19,14 @@ use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, LocalSet};
 
 use crate::DataPlaneRuntime;
-use crate::PluginMain;
 
 pub type ProcessFuture = Pin<Box<dyn Future<Output = HammerResult<()>> + 'static>>;
 
 #[derive(Clone, Copy)]
 pub struct ProcessEntry {
-    pub plugin: Option<&'static str>,
     pub name: &'static str,
     pub start: fn(ProcessContext) -> ProcessFuture,
 }
-
-#[linkme::distributed_slice]
-pub static PROCESS_NODES: [ProcessEntry] = [..];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessEventBatch {
@@ -219,13 +214,12 @@ impl ProcessMain {
         &mut self,
         registry: Arc<RuntimeRegistry>,
         runtime: DataPlaneRuntime,
-        plugin_main: &PluginMain,
     ) -> HammerResult<()> {
         self.ensure_owner()?;
         if !self.running.is_empty() {
             return Err(HammerError::internal("Process Nodes are already started"));
         }
-        let entries = plugin_main.process_nodes();
+        let entries = crate::registration::process_nodes();
         let mut names = Vec::with_capacity(entries.len());
         for entry in &entries {
             if names.contains(&entry.name) {

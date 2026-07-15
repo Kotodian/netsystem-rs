@@ -30,7 +30,6 @@ pub enum TcpEstablishedNext {
     name = "tcp-established",
     next = TcpEstablishedNext,
     role = internal,
-    plugin = "tcp",
 )]
 pub struct TcpEstablishedNode<C: CongestionController + 'static, Seg: SessionSegment> {
     session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,

@@ -42,7 +42,6 @@ pub enum TcpListenNext {
     name = "tcp-listen",
     next = TcpListenNext,
     role = internal,
-    plugin = "tcp",
 )]
 pub struct TcpListenNode<C: CongestionController + 'static, Seg: SessionSegment> {
     control: TcpInputControlPlane,

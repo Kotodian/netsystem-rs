@@ -10,6 +10,8 @@ use hammer_runtime::{
     DataPlaneRuntime, DataPlaneRuntimeConfig, Engine, ProcessContext, ProcessWake,
 };
 
+hammer_runtime::__declare_registration_image!();
+
 static OBSERVED_THREADS: OnceLock<Mutex<Vec<ThreadId>>> = OnceLock::new();
 static PANICKING_PROCESS_RAN: AtomicBool = AtomicBool::new(false);
 static CLOCK_OBSERVED: AtomicBool = AtomicBool::new(false);

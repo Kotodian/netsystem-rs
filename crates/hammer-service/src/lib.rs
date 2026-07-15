@@ -1,5 +1,7 @@
 extern crate self as hammer_service;
 
+hammer_runtime::__declare_registration_image!();
+
 pub mod app;
 pub mod data_plane;
 /// Device-class abstraction. Concrete drivers live under `hammer-plugins/device/`.

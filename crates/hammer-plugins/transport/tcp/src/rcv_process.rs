@@ -31,7 +31,6 @@ pub enum TcpRcvProcessNext {
     name = "tcp-rcv-process",
     next = TcpRcvProcessNext,
     role = internal,
-    plugin = "tcp",
 )]
 pub struct TcpRcvProcessNode<C: CongestionController + 'static, Seg: SessionSegment> {
     session_queue: SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,

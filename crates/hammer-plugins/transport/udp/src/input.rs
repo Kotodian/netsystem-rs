@@ -289,7 +289,6 @@ fn udp_input_process(
     next = UdpInputNext,
     init = register_udp_input,
     role = internal,
-    plugin = "udp",
 )]
 pub struct UdpInputNode {
     #[node(default = register_udp_input_runtime(snapshot.clone()))]
