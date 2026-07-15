@@ -3,7 +3,6 @@ use std::time::{Duration, Instant};
 use hammer_core::protocol::tcp::{TcpSackBlock, TcpSeq};
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::rbtree::RbTree;
-use hammer_infra::vec::Vec;
 
 use hammer_service::transport::congestion::{
     AckedPacket, CongestionController, LostPacket, PacketNumber, RttSample,
@@ -2542,7 +2541,7 @@ mod tests {
                 .iter()
                 .map(|p| p.packet_number)
                 .collect::<Vec<_>>(),
-            hammer_infra::vec![1, 2],
+            vec![1, 2],
             "cumulative ack must deliver segments in ascending order"
         );
         assert_eq!(
@@ -2632,7 +2631,7 @@ mod tests {
         while let Some(k) = c.pop_front() {
             out.push(u32::from(k));
         }
-        assert_eq!(out, hammer_infra::vec![1_000, 1_001, 1_002, 1_003, 1_004]);
+        assert_eq!(out, vec![1_000, 1_001, 1_002, 1_003, 1_004]);
 
         // At cap exactly: still inline.
         let mut c = ScoreboardKeyCollector::new();

@@ -21,7 +21,6 @@
 use std::time::Duration;
 
 use crate::error::{HammerError, HammerResult};
-use hammer_infra::vec::Vec;
 
 // hammer-service/src/service.rs
 const WORKER_THREADS: usize = 2;
@@ -492,7 +491,7 @@ mod tests {
         let worker = Worker {
             count: 2,
             cpu: WorkerCpu {
-                worker_cores: hammer_infra::vec![1],
+                worker_cores: vec![1],
                 ..Default::default()
             },
             ..Default::default()

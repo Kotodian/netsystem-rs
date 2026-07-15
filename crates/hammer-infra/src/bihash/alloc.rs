@@ -5,7 +5,7 @@
 //! reused only after no lookup hazard protects them.
 
 use std::alloc::{GlobalAlloc, Layout, handle_alloc_error};
-use std::cell::{RefCell, UnsafeCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
@@ -16,7 +16,6 @@ use crate::align::CACHE_LINE;
 use crate::bihash::value::ValuePage;
 use crate::heap::Heap;
 use crate::heap_boxed::{Slice, allocate_in, deallocate_in};
-use crate::heap_vec::Vec;
 
 const MAX_LOG2_PAGES: usize = 8;
 const NO_OFFSET: u64 = 0;
@@ -31,6 +30,7 @@ struct HazardBinding {
 
 thread_local! {
     static BIHASH_HAZARDS: RefCell<Vec<HazardBinding>> = const { RefCell::new(Vec::new()) };
+    static LAST_BIHASH_HAZARD: Cell<Option<HazardBinding>> = const { Cell::new(None) };
 }
 
 struct PageBlock<K, const KVP: usize> {
@@ -56,11 +56,11 @@ struct PageAllocState<K, const KVP: usize> {
 impl<K: Copy + Default, const KVP: usize> PageAllocState<K, KVP> {
     fn new(heap: Arc<Heap>) -> Self {
         Self {
-            blocks: Vec::with_capacity_in(0, heap.clone()),
-            directories: Vec::with_capacity_in(0, heap.clone()),
-            hazards: Vec::with_capacity_in(0, heap.clone()),
-            freelists: core::array::from_fn(|_| Vec::with_capacity_in(0, heap.clone())),
-            retired: Vec::with_capacity_in(0, heap.clone()),
+            blocks: Vec::new(),
+            directories: Vec::new(),
+            hazards: Vec::new(),
+            freelists: core::array::from_fn(|_| Vec::new()),
+            retired: Vec::new(),
             heap,
         }
     }
@@ -262,6 +262,7 @@ impl<K: Copy + Default, const KVP: usize> PageAlloc<K, KVP> {
         self.with_state(|state| inspect(state.pages(offset, log2_pages)))
     }
 
+    #[inline(always)]
     pub(crate) fn read<R>(
         &self,
         offset: u64,
@@ -290,16 +291,28 @@ impl<K: Copy + Default, const KVP: usize> PageAlloc<K, KVP> {
             )
         };
         let result = read(pages);
-        let published = still_published();
         drop(hazard);
-        published.then_some(result)
+        Some(result)
     }
 
     pub(crate) fn retire(&self, offset: u64, log2_pages: u8) {
         self.with_state(|state| state.retire(offset, log2_pages));
     }
 
+    #[inline(always)]
     fn hazard_slot(&self) -> NonNull<CachePadded<AtomicU64>> {
+        let cached = LAST_BIHASH_HAZARD.with(|last| {
+            let binding = last.get()?;
+            let available = binding.domain == self.hazard_domain
+                // SAFETY: PageAlloc owns stable hazard slots until it is dropped,
+                // and hazard domains are never reused by another PageAlloc.
+                && unsafe { binding.slot.as_ref() }.load(Ordering::Relaxed) == NO_OFFSET;
+            available.then_some(binding.slot)
+        });
+        if let Some(slot) = cached {
+            return slot;
+        }
+
         let existing = BIHASH_HAZARDS.with(|bindings| {
             bindings
                 .borrow()
@@ -312,6 +325,12 @@ impl<K: Copy + Default, const KVP: usize> PageAlloc<K, KVP> {
                 .map(|binding| binding.slot)
         });
         if let Some(slot) = existing {
+            LAST_BIHASH_HAZARD.with(|last| {
+                last.set(Some(HazardBinding {
+                    domain: self.hazard_domain,
+                    slot,
+                }));
+            });
             return slot;
         }
 
@@ -321,6 +340,12 @@ impl<K: Copy + Default, const KVP: usize> PageAlloc<K, KVP> {
                 domain: self.hazard_domain,
                 slot,
             });
+        });
+        LAST_BIHASH_HAZARD.with(|last| {
+            last.set(Some(HazardBinding {
+                domain: self.hazard_domain,
+                slot,
+            }));
         });
         slot
     }
@@ -358,6 +383,9 @@ struct HazardGuard {
 impl Drop for HazardGuard {
     fn drop(&mut self) {
         // SAFETY: the PageAlloc owns this stable slot for the duration of lookup.
-        unsafe { self.slot.as_ref() }.store(NO_OFFSET, Ordering::SeqCst);
+        // Release keeps every protected page read before the clear. A stale
+        // non-zero observation can only delay reclamation, so clearing does
+        // not need to participate in hazard publication's SeqCst order.
+        unsafe { self.slot.as_ref() }.store(NO_OFFSET, Ordering::Release);
     }
 }

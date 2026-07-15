@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use hammer_core::data_plane::{BufferFrame, DataPlaneBufferConfig, SecondaryOpaque};
+use hammer_core::data_plane::{
+    BufferFrame, BufferPacketCursor, DataPlaneBufferConfig, Index, SecondaryOpaque,
+};
 use hammer_core::error::CoreResult;
 use hammer_core::forwarding::{DpoProto, FibTableBuilder};
 use hammer_plugin_ip::{
@@ -16,7 +18,7 @@ use hammer_runtime::{
     NodeProcessFn, NodeResult, NodeRuntimeData,
 };
 use hammer_service::data_plane::DropNode;
-use hammer_service::opaque::{ForwardingMetadata, TapEthernetMetadata};
+use hammer_service::opaque::{ForwardingMetadata, NetworkOpaque, TapEthernetMetadata};
 use ipnet::{Ipv4Net, Ipv6Net};
 
 const FRAME_PACKETS: usize = 128;
@@ -44,8 +46,8 @@ fn test_runtime_configured_instruction_set(
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct LookupPerfOpaque {
-    _tap_ethernet: Option<TapEthernetMetadata>,
-    _icmp_error: Option<hammer_core::protocol::icmp::IcmpErrorMetadata>,
+    tap_ethernet: Option<TapEthernetMetadata>,
+    icmp_error: Option<hammer_core::protocol::icmp::IcmpErrorMetadata>,
     forwarding: Option<ForwardingMetadata>,
 }
 
@@ -75,7 +77,7 @@ impl SinkNode {
 
 impl Node for SinkNode {
     #[inline(always)]
-    fn process(&mut self, _runtime: &DataPlaneRuntime, _frame: &mut BufferFrame) -> NodeResult {
+    fn process(&mut self, _: &DataPlaneRuntime, _: &mut BufferFrame) -> NodeResult {
         NodeResult::drop()
     }
 
@@ -139,9 +141,9 @@ enum Scenario {
 }
 
 #[test]
-#[ignore = "performance probe; run with `cargo test -p hammer-plugin-ip --release --test net_lookup_perf -- --ignored --nocapture --test-threads=1`"]
+#[ignore = "performance probe; run with `make verify-dataplane-performance`"]
 fn ip_lookup_frame_batch_perf_probe() {
-    let _guard = PERF_PROBE_LOCK.lock().expect("perf probe lock");
+    let performance_test_guard = PERF_PROBE_LOCK.lock().expect("performance test lock");
     let scenarios = [
         Scenario::Ipv4SameNext,
         Scenario::Ipv4MixedNext,
@@ -173,12 +175,13 @@ fn ip_lookup_frame_batch_perf_probe() {
             frame_native.best.checksum,
         );
     }
+    drop(performance_test_guard);
 }
 
 #[test]
-#[ignore = "performance probe; run with `cargo test -p hammer-plugin-ip --release --test net_lookup_perf -- --ignored --nocapture --test-threads=1`"]
+#[ignore = "performance probe; run with `make verify-dataplane-performance`"]
 fn ip_input_lookup_frame_batch_perf_probe() {
-    let _guard = PERF_PROBE_LOCK.lock().expect("perf probe lock");
+    let performance_test_guard = PERF_PROBE_LOCK.lock().expect("performance test lock");
     let scenarios = [
         Scenario::Ipv4SameNext,
         Scenario::Ipv4MixedNext,
@@ -204,6 +207,7 @@ fn ip_input_lookup_frame_batch_perf_probe() {
             pipeline_native.best.checksum,
         );
     }
+    drop(performance_test_guard);
 }
 
 fn measure_packet_scalar_samples(scenario: Scenario) -> ProbeSummary {
@@ -274,9 +278,7 @@ fn measure_packet_scalar(scenario: Scenario) -> ProbeStats {
                 .buffers()
                 .get_next_frame(lookup)
                 .expect("alloc frame");
-            let index = runtime
-                .alloc_index_with_bytes(packet)
-                .expect("alloc packet");
+            let index = allocate_lookup_packet(&runtime, packet);
             frame.push_index(index).expect("push packet");
             runtime.put_next_frame(frame).expect("schedule");
             black_box(runtime.run_ready_nodes().expect("run nodes"));
@@ -305,9 +307,7 @@ fn measure_lookup(scenario: Scenario, instruction_set: DataPlaneInstructionSet) 
             .get_next_frame(lookup)
             .expect("alloc frame");
         for packet in packets_by_frame.iter() {
-            let index = runtime
-                .alloc_index_with_bytes(packet)
-                .expect("alloc packet");
+            let index = allocate_lookup_packet(&runtime, packet);
             frame.push_index(index).expect("push packet");
         }
         runtime.put_next_frame(frame).expect("schedule");
@@ -363,6 +363,15 @@ fn build_lookup(
     counters: &Arc<SinkCounters>,
 ) -> hammer_core::data_plane::NodeId {
     let drop = runtime.nodes().register_internal(DropNode::new());
+    build_lookup_with_drop(runtime, scenario, counters, drop)
+}
+
+fn build_lookup_with_drop(
+    runtime: &DataPlaneRuntime,
+    scenario: Scenario,
+    counters: &Arc<SinkCounters>,
+    drop: hammer_core::data_plane::NodeId,
+) -> hammer_core::data_plane::NodeId {
     let control = IpLookupControlPlane::new(FibTableBuilder::new(u16::MAX).build());
     let lookup = runtime
         .nodes()
@@ -422,8 +431,8 @@ fn build_input_lookup(
     scenario: Scenario,
     counters: &Arc<SinkCounters>,
 ) -> hammer_core::data_plane::NodeId {
-    let lookup = build_lookup(runtime, scenario, counters);
     let drop = runtime.nodes().register_internal(DropNode::new());
+    let lookup = build_lookup_with_drop(runtime, scenario, counters, drop);
     runtime
         .nodes()
         .register_internal(IpInputNode::<IpUnicastArc>::new(IpInputNext::nodes(
@@ -480,6 +489,34 @@ fn build_packets(scenario: Scenario) -> Vec<Vec<u8>> {
         packets.push(packet);
     }
     packets
+}
+
+fn allocate_lookup_packet(runtime: &DataPlaneRuntime, packet: &[u8]) -> Index {
+    let index = runtime
+        .alloc_index_with_bytes(packet)
+        .expect("allocate lookup packet");
+    let Some(first_byte) = packet.first().copied() else {
+        return index;
+    };
+    let (ip_version, ip_protocol, network_header_len) = match first_byte >> 4 {
+        4 => (4, packet[9], usize::from(first_byte & 0x0f) * 4),
+        6 => (6, packet[6], 40),
+        _ => return index,
+    };
+    let cursor = BufferPacketCursor::new()
+        .with_packet_len(packet.len())
+        .with_network_header(0, network_header_len)
+        .with_transport_header(network_header_len, 8)
+        .with_transport_payload_offset(network_header_len + 8);
+    let mut buffer = runtime.get_buffer_mut(index).expect("lookup packet buffer");
+    // SAFETY: `NetworkOpaque` is the declared primary-opaque layout and its
+    // compile-time size/alignment checks fit the buffer's opaque storage.
+    let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+    network.set_packet_cursor(cursor);
+    let ip = network.ip_mut();
+    ip.set_ip_version(Some(ip_version));
+    ip.set_ip_protocol(Some(ip_protocol));
+    index
 }
 
 fn ipv4_udp_packet(

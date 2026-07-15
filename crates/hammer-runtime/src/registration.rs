@@ -11,8 +11,6 @@ use std::mem::MaybeUninit;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
-use hammer_infra::vec::Vec;
-
 use crate::init::InitFunction;
 use crate::node::{NodeEntry, NodeFunctionRegistration};
 use crate::process::ProcessEntry;

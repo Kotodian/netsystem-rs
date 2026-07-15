@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, DataPlaneBufferConfig, Index};
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::ip::IpVersion;
-use hammer_infra::vec::Vec as InfraVec;
 use hammer_plugin_ip::{IcmpInputControlPlane, IcmpPathMtuNode};
 use hammer_runtime::{
     DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node, NodeProcessFn, NodeResult,
@@ -258,8 +257,8 @@ fn capture_process(
     NodeResult::drop()
 }
 
-fn chain_bytes(runtime: &DataPlaneRuntime, index: Index) -> CoreResult<InfraVec<u8>> {
-    let mut bytes = InfraVec::new();
+fn chain_bytes(runtime: &DataPlaneRuntime, index: Index) -> CoreResult<Vec<u8>> {
+    let mut bytes = Vec::new();
     for buffer in runtime.buffers().chain(index) {
         bytes.extend_from_slice(buffer?.current());
     }

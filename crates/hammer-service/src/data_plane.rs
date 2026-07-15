@@ -14,7 +14,6 @@ pub use crate::feature_arc::{
     Feature, FeatureArc, FeatureArcControl, FeatureArcSpec, FeatureArcStart, FeatureArcStartHandle,
     FeatureArcStartNode, FeatureArcStartSlot, next_feature_frame, next_feature_slot_for_index,
 };
-use hammer_infra::vec::Vec;
 
 #[inline(always)]
 pub fn set_buffer_node_error_code(

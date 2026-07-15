@@ -21,6 +21,9 @@ pub enum CoreError {
     #[error("memory initialization has not completed")]
     MemoryNotInitialized,
 
+    #[error(transparent)]
+    MainHeap(#[from] hammer_infra::main_heap::MainHeapError),
+
     #[error("duplicate plugin roots at indexes {first} and {duplicate}")]
     PluginDuplicateRoot { first: usize, duplicate: usize },
 

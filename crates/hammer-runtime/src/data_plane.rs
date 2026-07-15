@@ -15,7 +15,6 @@ use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HANDOFF_SLOT_CAPACITY
 use crate::instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
 use crate::node::{NodeEntry, NodeFunctionRegistration, NodeRuntime, NodeRuntimeInner};
 use crate::trace::{DataPlaneTrace, PacketTrace, TraceControlHandle};
-use hammer_infra::vec::Vec;
 
 impl BufferFrameBatchWidthPolicy for FrameBatchWidth {
     #[inline]
@@ -741,6 +740,7 @@ impl DataPlaneRuntime {
 }
 
 pub fn new_worker_runtime(config: &Config) -> CoreResult<DataPlaneRuntime> {
+    crate::memory::ensure_main_heap(config)?;
     let buffer = &config.worker.buffer;
     let buffers = DataPlaneBufferConfig {
         buffer_slot_capacity: buffer.slot_bytes,

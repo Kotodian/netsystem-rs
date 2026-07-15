@@ -1,6 +1,4 @@
 use core::hint::spin_loop;
-#[cfg(test)]
-use hammer_infra::vec::Vec;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 

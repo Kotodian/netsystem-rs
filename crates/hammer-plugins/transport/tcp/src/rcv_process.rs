@@ -4,8 +4,6 @@ use hammer_core::data_plane::{
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::pool::Index as PoolIndex;
-#[cfg(test)]
-use hammer_infra::vec::Vec;
 use hammer_runtime::app::SessionSegment;
 use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
 
@@ -551,7 +549,7 @@ mod tests {
             .ok_or(hammer_core::protocol::tcp::TcpError::Dispatch)?;
         let total_len =
             u16::try_from(packet_len).map_err(|_| hammer_core::protocol::tcp::TcpError::Length)?;
-        let mut packet = hammer_infra::vec![0u8; packet_len];
+        let mut packet = vec![0u8; packet_len];
         packet[0] = 0x45;
         packet[2] = (total_len >> 8) as u8;
         packet[3] = total_len as u8;

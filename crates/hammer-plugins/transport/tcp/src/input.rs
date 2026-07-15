@@ -12,7 +12,6 @@ use hammer_core::protocol::icmp::IcmpErrorMetadata;
 use hammer_core::protocol::ip::{IpProtocol, IpVersion};
 use hammer_core::protocol::tcp::{TcpError, TcpInputFlags, TcpSegmentFlags, tcp_header};
 use hammer_infra::pool::Index as PoolIndex;
-use hammer_infra::vec::Vec;
 use hammer_runtime::app::SessionSegment;
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,

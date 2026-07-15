@@ -1,7 +1,5 @@
 use hammer_core::protocol::tcp::{TcpSackBlock, TcpSegmentFlags, TcpSeq};
 use hammer_infra::rbtree::RbTree;
-#[cfg(test)]
-use hammer_infra::vec::Vec;
 
 const TCP_MAX_SACK_BLOCKS: usize = 255;
 const TCP_OUTPUT_SACK_BLOCKS: usize = 4;

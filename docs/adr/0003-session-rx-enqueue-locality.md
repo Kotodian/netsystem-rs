@@ -8,7 +8,7 @@ Hammer should mirror that ownership shape instead of inventing a generic dedupli
 
 Session scheduling coalescing belongs to the session layer, fully isolated from transport connection state. Hammer should model the VPP-style pending fact beside the session runtime entry, not inside TCP or any other transport `St`. Transport may request that its owning session be scheduled through the session context, but it must not own, inspect, or clear the pending bit.
 
-The worker-local batch should align with VPP's vector shape, not preserve the old FIFO/hash-set abstraction. Hammer should append scheduled `SessionId`s to a worker-local `hammer_infra::vec::Vec<SessionId>`, flush the current vector in order, then clear/reset it. Duplicate suppression is only the session-layer pending bit; the batch itself must not own a `FlatHashTable`, `DedupFifo`, or queue-level membership state.
+The worker-local batch should align with VPP's vector shape, not preserve the old FIFO/hash-set abstraction. Hammer should append scheduled `SessionId`s to a worker-local standard `Vec<SessionId>` backed by the Main Heap, flush the current vector in order, then clear/reset it. Duplicate suppression is only the session-layer pending bit; the batch itself must not own a hash-backed membership table, `DedupFifo`, or queue-level membership state.
 
 Rust should encode this ownership boundary with a private session-layer entry that wraps transport state, for example `SessionEntry<St> { state: St, schedule_pending: bool }`. The session pool owns `SessionEntry<St>`, while existing `session()` / `session_mut()` style accessors return only `&St` / `&mut St` to transport-facing callers. TCP and other transports therefore cannot represent or mutate session scheduling state by type.
 

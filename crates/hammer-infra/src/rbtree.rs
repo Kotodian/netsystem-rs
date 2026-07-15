@@ -1,5 +1,4 @@
 use crate::pool::{Index as PoolIndex, Pool};
-use crate::vec::Vec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Color {

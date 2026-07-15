@@ -4,8 +4,6 @@ use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 
 use crate::ds::prefetch::prefetch_read_l1;
 use crate::protocol::ip::{IpProtocol, IpVersion, ParsedIpPacket};
-use hammer_infra::boxed::Box;
-use hammer_infra::vec::Vec;
 
 use super::dpo::{
     Adjacency, AdjacencyIndex, AdjacencyRewrite, DEFAULT_ADJACENCY_L3_MTU, DpoId, DpoProto,

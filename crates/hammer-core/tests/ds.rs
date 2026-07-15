@@ -1,6 +1,4 @@
-use hammer_core::ds::{
-    FlatHashTable, MtrieEntry, PackedMtrie, PackedMtrieValue, PrefixLengthSearchOrder,
-};
+use hammer_core::ds::{MtrieEntry, PackedMtrie, PackedMtrieValue, PrefixLengthSearchOrder};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Next {
@@ -45,18 +43,6 @@ fn packed_mtrie_stores_leaf_encoded_values_for_hot_paths() {
     assert_eq!(trie.root_alignment(), 64);
     assert_eq!(trie.root_addr() % 64, 0);
     assert_eq!(trie.ply_addr(0).expect("ply") % 64, 0);
-}
-
-#[test]
-fn flat_hash_table_is_generic_and_exposes_bucket_prefetch() {
-    let table = FlatHashTable::from_entries([(10u128, Next::Drop), (42u128, Next::Forward)]);
-
-    table.prefetch_key(&42);
-
-    assert_eq!(table.lookup(&10), Some(Next::Drop));
-    assert_eq!(table.lookup(&42), Some(Next::Forward));
-    assert_eq!(table.lookup(&99), None);
-    assert!(table.bucket_count().is_power_of_two());
 }
 
 #[test]

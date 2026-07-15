@@ -1,6 +1,5 @@
 //! IPC protocol message definitions.
 
-use hammer_infra::vec::Vec;
 use serde::{Deserialize, Serialize};
 
 /// Current protocol version sent on connect.

@@ -25,7 +25,6 @@ use hammer_service::trace::codec::{
 };
 
 use super::{IpInputError, IpProtocol, IpVersion, ip_header};
-use hammer_infra::vec::Vec;
 
 const ICMP_HEADER_MIN_LEN: usize = 4;
 const ICMP_ECHO_HEADER_LEN: usize = 8;
@@ -1366,7 +1365,7 @@ fn collect_current_chain_for_icmp_generation(
     let mut chain = runtime.chain(index);
     while let Some(buffer) = chain.next() {
         let buffer = buffer?;
-        bytes.extend_from_copy_slice(buffer.current());
+        bytes.extend_from_slice(buffer.current());
     }
     Ok(bytes)
 }

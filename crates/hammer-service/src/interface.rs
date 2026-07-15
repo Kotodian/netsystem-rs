@@ -1,4 +1,5 @@
 use std::cell::UnsafeCell;
+use std::collections::HashMap;
 use std::fmt;
 use std::mem::transmute;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -9,8 +10,6 @@ use hammer_core::data_plane::{BufferFrame, Index, NodeId, NodeRegistration};
 use hammer_core::error::{CoreError, CoreResult, HammerResult};
 use hammer_core::forwarding::{AdjacencyRewrite, DpoId, DpoProto, FibTableBuilder};
 use hammer_core::registry::RuntimeRegistry;
-use hammer_infra::map::{FlatHashKey, FlatHashTable};
-use hammer_infra::vec::Vec;
 use hammer_runtime::DataPlaneBarrierHandle;
 use hammer_runtime::{
     DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
@@ -517,7 +516,7 @@ unsafe impl Sync for InterfaceStateSlot {}
 struct InterfaceState {
     interfaces: Vec<InterfaceRecord>,
     addresses: Vec<InterfaceAddressRecord>,
-    address_to_index: FlatHashTable<InterfaceAddressKey, u32>,
+    address_to_index: HashMap<InterfaceAddressKey, u32>,
 }
 
 impl InterfaceState {
@@ -566,11 +565,12 @@ impl InterfaceState {
     #[inline]
     fn interface_address_index(&self, interface_index: u32, address: IpNet) -> Option<u32> {
         self.address_to_index
-            .lookup(&InterfaceAddressKey::new(interface_index, address))
+            .get(&InterfaceAddressKey::new(interface_index, address))
+            .copied()
     }
 
     fn rebuild_address_index(&mut self) {
-        let mut address_to_index = FlatHashTable::with_capacity(self.addresses.len().max(1));
+        let mut address_to_index = HashMap::with_capacity(self.addresses.len());
         for (index, address) in self.addresses.iter().enumerate() {
             if address.removed {
                 continue;
@@ -628,18 +628,6 @@ impl InterfaceAddressKey {
             address_hi,
             address_lo,
         }
-    }
-}
-
-impl FlatHashKey for InterfaceAddressKey {
-    #[inline(always)]
-    fn hash_key(self) -> usize {
-        let mut value = u128::from(self.interface_index);
-        value ^= u128::from(self.address_family) << 32;
-        value ^= u128::from(self.prefix_len) << 40;
-        value ^= u128::from(self.address_hi) << 64;
-        value ^= u128::from(self.address_lo);
-        value.hash_key()
     }
 }
 
@@ -1097,7 +1085,7 @@ mtu = { l3 = 1500, ip4 = 1500, ip6 = 1500, mpls = 1500 }
         );
         assert_eq!(
             handle.interface_addresses(index),
-            hammer_infra::vec![IpNet::from_str("10.0.0.1/30").expect("cidr")]
+            vec![IpNet::from_str("10.0.0.1/30").expect("cidr")]
         );
     }
 }

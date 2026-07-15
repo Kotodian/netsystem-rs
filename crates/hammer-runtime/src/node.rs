@@ -11,8 +11,6 @@ use hammer_core::data_plane::{
     NodeNext, NodeRegistration, NodeState, Pending,
 };
 use hammer_core::error::{CoreError, CoreResult, DataPlaneError};
-use hammer_infra::boxed::Box;
-use hammer_infra::vec::Vec;
 
 use crate::trace::TraceFormatter;
 use crate::{DataPlaneInstructionSet, DataPlaneRuntime};
@@ -424,18 +422,18 @@ impl Clone for NodeRuntimeInner {
         Self {
             nodes: self.nodes.clone(),
             node_states: self.node_states.clone(),
-            interrupt_pending: hammer_infra::vec![false; node_count],
-            error_counters: hammer_infra::vec![NodeErrorCounters::default(); node_count],
+            interrupt_pending: vec![false; node_count],
+            error_counters: vec![NodeErrorCounters::default(); node_count],
             error_ids: self.error_ids.clone(),
             error_slots: self.error_slots.clone(),
-            runtime_stats: hammer_infra::vec![NodeRuntimeStats::default(); node_count],
+            runtime_stats: vec![NodeRuntimeStats::default(); node_count],
             scheduled_frame_queue_capacity: self.scheduled_frame_queue_capacity,
             handles: self.handles.clone(),
             declared_nodes: self.declared_nodes.clone(),
             node_names: self.node_names.clone(),
             node_trace_formatters: self.node_trace_formatters.clone(),
             next_nodes: self.next_nodes.clone(),
-            pending_next_names: hammer_infra::vec![Vec::new(); node_count],
+            pending_next_names: vec![Vec::new(); node_count],
             sibling_owners: self.sibling_owners.clone(),
             siblings: self.siblings.clone(),
         }
@@ -536,7 +534,10 @@ impl ScheduledFrameQueue {
     #[inline]
     fn with_capacity(capacity: usize) -> Self {
         Self {
-            slots: Box::from_fn(capacity, |_| None),
+            slots: (0..capacity)
+                .map(|_| None)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             head: 0,
             len: 0,
         }
@@ -706,7 +707,7 @@ impl NodeRuntimeInner {
                 self.node_names[id.slot() as usize] = Some(name);
                 self.node_trace_formatters[id.slot() as usize] = trace_formatter;
                 if let Some(next_names) = next_names {
-                    self.next_nodes[id.slot() as usize] = hammer_infra::vec![None; next_count];
+                    self.next_nodes[id.slot() as usize] = vec![None; next_count];
                     self.pending_next_names[id.slot() as usize] =
                         next_names.iter().copied().map(Some).collect();
                 } else {
@@ -880,7 +881,7 @@ mod local_next_slot_tests {
     fn add_node_next_slot_rejects_non_u16_before_mutating_siblings() {
         let process: NodeProcessFn = |_, _, _| NodeResult::drop();
         let mut inner = NodeRuntimeInner {
-            nodes: hammer_infra::vec![
+            nodes: vec![
                 NodeRuntimeSlot {
                     kind: NodeKind::Internal,
                     process,
@@ -897,25 +898,25 @@ mod local_next_slot_tests {
                     runtime_data: NodeRuntimeData::empty(),
                 },
             ],
-            node_states: hammer_infra::vec![NodeState::Polling; 3],
-            interrupt_pending: hammer_infra::vec![false; 3],
-            error_counters: hammer_infra::vec![NodeErrorCounters::default(); 3],
+            node_states: vec![NodeState::Polling; 3],
+            interrupt_pending: vec![false; 3],
+            error_counters: vec![NodeErrorCounters::default(); 3],
             error_ids: HashMap::new(),
             error_slots: Vec::new(),
-            runtime_stats: hammer_infra::vec![NodeRuntimeStats::default(); 3],
+            runtime_stats: vec![NodeRuntimeStats::default(); 3],
             scheduled_frame_queue_capacity: 4,
             handles: HashMap::new(),
             declared_nodes: HashMap::new(),
-            node_names: hammer_infra::vec![None; 3],
-            node_trace_formatters: hammer_infra::vec![None; 3],
-            next_nodes: hammer_infra::vec![
-                hammer_infra::vec![Some(NodeId::new(1)); usize::from(u16::MAX) + 1],
+            node_names: vec![None; 3],
+            node_trace_formatters: vec![None; 3],
+            next_nodes: vec![
+                vec![Some(NodeId::new(1)); usize::from(u16::MAX) + 1],
                 Vec::new(),
                 Vec::new(),
             ],
-            pending_next_names: hammer_infra::vec![Vec::new(), Vec::new(), Vec::new()],
-            sibling_owners: hammer_infra::vec![None; 3],
-            siblings: hammer_infra::vec![Vec::new(), Vec::new(), Vec::new()],
+            pending_next_names: vec![Vec::new(), Vec::new(), Vec::new()],
+            sibling_owners: vec![None; 3],
+            siblings: vec![Vec::new(), Vec::new(), Vec::new()],
         };
 
         let before = inner.next_nodes[0].len();

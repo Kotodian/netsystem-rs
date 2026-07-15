@@ -2,15 +2,14 @@
 //!
 //! Hammer follows VPP's "active heap" model with a concrete handle instead of
 //! a public heap trait. The handle carries a private vtable plus backend state
-//! and routes allocation through either mimalloc or an owner SVM region.
+//! and routes allocation through either the fixed process Main Heap or an
+//! owner SVM region.
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::ptr::NonNull;
 use std::sync::Arc;
 
 use crate::svm_region::SvmRegion;
-
-static MAIN_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 struct HeapVTable {
     alloc: unsafe fn(*const (), Layout) -> *mut u8,
@@ -95,11 +94,11 @@ unsafe impl GlobalAlloc for Heap {
 }
 
 unsafe fn main_alloc_callback(_: *const (), layout: Layout) -> *mut u8 {
-    unsafe { GlobalAlloc::alloc(&MAIN_ALLOCATOR, layout) }
+    unsafe { crate::main_heap::allocate(layout) }
 }
 
 unsafe fn main_dealloc_callback(_: *const (), ptr: *mut u8, layout: Layout) {
-    unsafe { GlobalAlloc::dealloc(&MAIN_ALLOCATOR, ptr, layout) }
+    unsafe { crate::main_heap::deallocate(ptr, layout) }
 }
 
 static MAIN_VTABLE: HeapVTable = HeapVTable {
@@ -133,7 +132,7 @@ static SVM_VTABLE: HeapVTable = HeapVTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::heap_vec::Vec as HeapVec;
+    use crate::heap_boxed::Slice;
     use crate::svm_region::SvmRegion;
 
     #[test]
@@ -146,13 +145,10 @@ mod tests {
     }
 
     #[test]
-    fn svm_vector_retains_provenance_across_growth_and_drop() {
+    fn svm_slice_retains_provenance_across_clone_and_drop() {
         let region = SvmRegion::with_size(1 << 20);
         let heap = Arc::new(Heap::svm_data(region).expect("owner region heap"));
-        let mut values = HeapVec::with_capacity_in(0, heap);
-        for value in 0..64u64 {
-            values.push(value);
-        }
+        let values: Slice<u64> = Slice::from_fn_in(64, |index| index as u64, heap);
         let clone = values.clone();
         assert_eq!(clone.len(), 64);
         assert_eq!(clone[63], 63);

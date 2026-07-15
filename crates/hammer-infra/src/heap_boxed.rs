@@ -1,24 +1,26 @@
 use std::alloc::{GlobalAlloc, handle_alloc_error};
 use std::fmt;
 use std::marker::PhantomData;
+use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::ptr::{self, NonNull};
 use std::sync::Arc;
 
 use crate::align::{self, CACHE_LINE};
 use crate::heap::Heap;
-use crate::heap_vec::RawVec;
 
 pub(crate) struct Slice<T, const ALIGN: usize = CACHE_LINE> {
     ptr: NonNull<T>,
     len: usize,
-    cap: usize,
     /// `None` selects the main heap. `Some` retains an explicit non-main heap.
     heap: Option<Arc<Heap>>,
-    _marker: PhantomData<T>,
+    marker: PhantomData<T>,
 }
 
+// SAFETY: Slice owns its allocation and only exposes shared access through
+// `&self`; moving it between threads is sound when its elements are Send.
 unsafe impl<T: Send, const ALIGN: usize> Send for Slice<T, ALIGN> {}
+// SAFETY: shared access is sound when its elements are Sync.
 unsafe impl<T: Sync, const ALIGN: usize> Sync for Slice<T, ALIGN> {}
 
 impl<T, const ALIGN: usize> Slice<T, ALIGN> {
@@ -27,9 +29,8 @@ impl<T, const ALIGN: usize> Slice<T, ALIGN> {
         Self {
             ptr: NonNull::dangling(),
             len: 0,
-            cap: 0,
             heap: None,
-            _marker: PhantomData,
+            marker: PhantomData,
         }
     }
 
@@ -38,11 +39,7 @@ impl<T, const ALIGN: usize> Slice<T, ALIGN> {
     where
         T: Clone,
     {
-        let mut values = RawVec::<T, ALIGN>::with_capacity(len);
-        for _ in 0..len {
-            values.push(value.clone());
-        }
-        values.into_boxed_slice()
+        Self::from_fn(len, |_| value.clone())
     }
 
     /// Allocates `len` slots of `T` from `heap` and initializes every slot to
@@ -53,25 +50,55 @@ impl<T, const ALIGN: usize> Slice<T, ALIGN> {
     where
         T: Clone,
     {
-        let mut values = RawVec::<T, ALIGN>::with_capacity_in(len, heap);
-        for _ in 0..len {
-            values.push(value.clone());
-        }
-        values.into_boxed_slice()
+        Self::from_fn_in(len, |_| value.clone(), heap)
     }
 
     #[inline]
     pub fn from_fn(len: usize, f: impl FnMut(usize) -> T) -> Self {
-        let mut values = RawVec::<T, ALIGN>::with_capacity(len);
-        values.extend((0..len).map(f));
-        values.into_boxed_slice()
+        Self::from_fn_with_heap(len, f, None)
     }
 
     #[inline]
     pub(crate) fn from_fn_in(len: usize, f: impl FnMut(usize) -> T, heap: Arc<Heap>) -> Self {
-        let mut values = RawVec::<T, ALIGN>::with_capacity_in(len, heap);
-        values.extend((0..len).map(f));
-        values.into_boxed_slice()
+        let heap = (!heap.is_main_heap()).then_some(heap);
+        Self::from_fn_with_heap(len, f, heap)
+    }
+
+    fn from_fn_with_heap(
+        len: usize,
+        mut f: impl FnMut(usize) -> T,
+        heap: Option<Arc<Heap>>,
+    ) -> Self {
+        if len == 0 {
+            return Self {
+                ptr: NonNull::dangling(),
+                len: 0,
+                heap,
+                marker: PhantomData,
+            };
+        }
+
+        let main_heap = Heap::main();
+        let allocator = heap.as_deref().unwrap_or(&main_heap);
+        let ptr = allocate_in::<T, ALIGN>(len, allocator);
+        let mut guard = SliceInitGuard::<T, ALIGN> {
+            ptr,
+            initialized: 0,
+            capacity: len,
+            heap: allocator,
+        };
+        for index in 0..len {
+            // SAFETY: `index < len`; each slot is written exactly once.
+            unsafe { ptr.as_ptr().add(index).write(f(index)) };
+            guard.initialized += 1;
+        }
+        mem::forget(guard);
+        Self {
+            ptr,
+            len,
+            heap,
+            marker: PhantomData,
+        }
     }
 
     #[inline(always)]
@@ -96,40 +123,15 @@ impl<T, const ALIGN: usize> Slice<T, ALIGN> {
 
     #[inline(always)]
     pub fn as_slice(&self) -> &[T] {
-        // SAFETY: `ptr` points to `len` initialized contiguous elements, or is
-        // a valid dangling pointer when `len == 0`.
+        // SAFETY: `ptr` owns `len` initialized contiguous elements, or is a
+        // valid dangling pointer when `len == 0`.
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 
     #[inline(always)]
     pub fn as_mut_slice(&mut self) -> &mut [T] {
-        // SAFETY: Same invariant as `as_slice`, with unique access.
+        // SAFETY: the same invariant as `as_slice`, with unique access.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
-    }
-
-    #[inline(always)]
-    pub fn alignment(&self) -> usize {
-        align::allocation_align::<T, ALIGN>()
-    }
-
-    /// # Safety
-    /// `ptr` must have been allocated for `cap` slots of `T` by the main heap
-    /// when `heap` is `None`, or by the retained non-main heap when it is
-    /// `Some`.
-    #[inline]
-    pub(crate) unsafe fn from_raw_parts(
-        ptr: NonNull<T>,
-        len: usize,
-        cap: usize,
-        heap: Option<Arc<Heap>>,
-    ) -> Self {
-        Self {
-            ptr,
-            len,
-            cap,
-            heap,
-            _marker: PhantomData,
-        }
     }
 }
 
@@ -143,33 +145,30 @@ impl<T, const ALIGN: usize> Default for Slice<T, ALIGN> {
 impl<T: Clone, const ALIGN: usize> Clone for Slice<T, ALIGN> {
     #[inline]
     fn clone(&self) -> Self {
-        let mut values = match self.heap.as_ref() {
-            Some(heap) => RawVec::<T, ALIGN>::with_capacity_in(self.cap, heap.clone()),
-            None => RawVec::<T, ALIGN>::with_capacity(self.cap),
-        };
-        values.extend_from_cloned_slice(self.as_slice());
-        values.into_boxed_slice()
+        let heap = self.heap.clone();
+        Self::from_fn_with_heap(self.len, |index| self[index].clone(), heap)
     }
 }
 
 impl<T: fmt::Debug, const ALIGN: usize> fmt::Debug for Slice<T, ALIGN> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.as_slice().fmt(f)
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.as_slice().fmt(formatter)
     }
 }
 
 impl<T, const ALIGN: usize> Drop for Slice<T, ALIGN> {
     fn drop(&mut self) {
-        if self.cap == 0 {
+        if self.len == 0 {
             return;
         }
         let main_heap = Heap::main();
         let heap = self.heap.as_deref().unwrap_or(&main_heap);
-        let len = self.len;
-        self.len = 0;
+        let len = mem::take(&mut self.len);
+        // SAFETY: Slice owns all `len` initialized elements and the allocation
+        // was created by this same heap with the matching layout.
         unsafe {
             ptr::drop_in_place(std::slice::from_raw_parts_mut(self.ptr.as_ptr(), len));
-            deallocate_in::<T, ALIGN>(self.ptr, self.cap, heap);
+            deallocate_in::<T, ALIGN>(self.ptr, len, heap);
         }
     }
 }
@@ -190,12 +189,24 @@ impl<T, const ALIGN: usize> DerefMut for Slice<T, ALIGN> {
     }
 }
 
-impl<T, const ALIGN: usize> FromIterator<T> for Slice<T, ALIGN> {
-    #[inline]
-    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        let mut values = crate::heap_vec::RawVec::<T, ALIGN>::new();
-        values.extend(iter);
-        values.into_boxed_slice()
+struct SliceInitGuard<'a, T, const ALIGN: usize> {
+    ptr: NonNull<T>,
+    initialized: usize,
+    capacity: usize,
+    heap: &'a Heap,
+}
+
+impl<T, const ALIGN: usize> Drop for SliceInitGuard<'_, T, ALIGN> {
+    fn drop(&mut self) {
+        // SAFETY: only the initialized prefix contains valid elements, and the
+        // entire allocation was created from `heap` for `capacity` elements.
+        unsafe {
+            ptr::drop_in_place(std::slice::from_raw_parts_mut(
+                self.ptr.as_ptr(),
+                self.initialized,
+            ));
+            deallocate_in::<T, ALIGN>(self.ptr, self.capacity, self.heap);
+        }
     }
 }
 
@@ -205,10 +216,9 @@ pub(crate) fn allocate_in<T, const ALIGN: usize>(capacity: usize, heap: &Heap) -
         return NonNull::dangling();
     }
     let layout = align::array_layout::<T, ALIGN>(capacity);
-    let ptr = heap
-        .alloc(layout)
-        .unwrap_or_else(|| handle_alloc_error(layout));
-    NonNull::new(ptr.as_ptr().cast::<T>()).expect("Heap::alloc returned null")
+    heap.alloc(layout)
+        .unwrap_or_else(|| handle_alloc_error(layout))
+        .cast::<T>()
 }
 
 #[inline]
@@ -221,6 +231,7 @@ pub(crate) unsafe fn deallocate_in<T, const ALIGN: usize>(
         return;
     }
     let layout = align::array_layout::<T, ALIGN>(capacity);
-    let raw = ptr.as_ptr().cast::<u8>();
-    unsafe { GlobalAlloc::dealloc(heap, raw, layout) };
+    // SAFETY: callers pass the same heap, capacity, element type, and alignment
+    // used by `allocate_in`.
+    unsafe { GlobalAlloc::dealloc(heap, ptr.as_ptr().cast::<u8>(), layout) };
 }

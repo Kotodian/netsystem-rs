@@ -8,7 +8,6 @@ use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::fifo_queue::FifoQueue;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::segment::{Local, Segment, Svm};
-use hammer_infra::vec::Vec;
 use hammer_runtime::app::{
     AppContext, AppSessionConfig, SessionEvtType, SessionHandle, SessionMsgQueue, SessionSegment,
     with_current_app_worker,

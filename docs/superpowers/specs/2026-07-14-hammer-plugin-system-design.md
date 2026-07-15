@@ -27,8 +27,8 @@ The Hammer ownership mapping is therefore:
 - `PluginRegistration` exports metadata only: name, version requirement, and
   `load_after` dependencies.
 - `PluginMain` owns the dependency order, name-to-library index, and DSO handles
-  only. It does not own, filter, or merge executable registrations. Its vectors
-  and hash table allocate from the Hammer main heap through `hammer-infra`.
+  only. It does not own, filter, or merge executable registrations. Its standard
+  vectors and maps allocate through the process-global Hammer Main Heap.
 - A completed load transaction moves its `PluginMain` into the single
   process-scope authority. Activated plugin code and static data therefore
   remain mapped until process exit, including when runtime or registry state

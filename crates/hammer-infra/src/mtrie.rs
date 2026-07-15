@@ -30,7 +30,6 @@
 use std::marker::PhantomData;
 
 use crate::prefetch::prefetch_read_l1;
-use crate::vec::Vec;
 
 const MTRIE_16_BITS: u8 = 16;
 const MTRIE_8_BITS: u8 = 8;

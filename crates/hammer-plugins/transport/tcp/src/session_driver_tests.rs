@@ -191,7 +191,7 @@ fn tcp_closed_publication_notifies_app_once_before_cleanup() {
             advertised_window: 0,
             flags: TcpSegmentFlags::RST,
             capabilities: TcpCapabilities::default(),
-            sack_blocks: hammer_infra::vec::Vec::new(),
+            sack_blocks: std::vec::Vec::new(),
             timestamp: None,
             fast_open_cookie: None,
             ip_ecn: None,

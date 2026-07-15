@@ -27,7 +27,6 @@ use crate::error::{HammerError, HammerResult};
 
 use super::constants as C;
 use super::route::{Route, validate_routes};
-use hammer_infra::vec::Vec;
 
 // IP reassembly defaults (net/ip/reassembly.rs).
 const REASSEMBLY_TIMEOUT: Duration = Duration::from_millis(100);

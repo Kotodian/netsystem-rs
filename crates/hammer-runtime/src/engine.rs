@@ -1,5 +1,6 @@
 use core::hint::spin_loop;
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -14,8 +15,6 @@ use crate::data_plane::{DataPlaneRuntimeWorkerConfig, DataPlaneRuntimeWorkerSeed
 use crate::node::{NodeRuntimeData, NodeRuntimeInner};
 use crate::process::ProcessMain;
 use crate::{DataPlaneHandoffWorker, DataWorkerId, FileMain, PluginMain, ProcessHandle};
-use hammer_infra::map::FlatHashTable;
-use hammer_infra::vec::Vec;
 
 thread_local! {
     static CURRENT_ENGINE: RefCell<Option<*mut Engine>> = const { RefCell::new(None) };
@@ -45,12 +44,12 @@ pub struct Engine {
     pub main_loop_exit_now: Arc<AtomicBool>,
     pub main_loop_exit_status: Mutex<i32>,
     pub(crate) memory_initialized: bool,
-    pub(crate) called_init_functions: FlatHashTable<&'static str, ()>,
-    pub(crate) called_worker_init_functions: FlatHashTable<&'static str, ()>,
-    pub(crate) called_early_config_functions: FlatHashTable<&'static str, ()>,
-    pub(crate) called_config_functions: FlatHashTable<&'static str, ()>,
-    pub(crate) called_main_loop_enter_functions: FlatHashTable<&'static str, ()>,
-    pub(crate) called_main_loop_exit_functions: FlatHashTable<&'static str, ()>,
+    pub(crate) called_init_functions: HashSet<&'static str>,
+    pub(crate) called_worker_init_functions: HashSet<&'static str>,
+    pub(crate) called_early_config_functions: HashSet<&'static str>,
+    pub(crate) called_config_functions: HashSet<&'static str>,
+    pub(crate) called_main_loop_enter_functions: HashSet<&'static str>,
+    pub(crate) called_main_loop_exit_functions: HashSet<&'static str>,
     pub(crate) main_loop_entered: bool,
     materialized_registration_generation: u64,
     pending_worker_graph: Arc<Mutex<Option<NodeRuntimeInner>>>,
@@ -92,12 +91,12 @@ impl Engine {
             main_loop_exit_now,
             main_loop_exit_status: Mutex::new(0),
             memory_initialized,
-            called_init_functions: FlatHashTable::new(),
-            called_worker_init_functions: FlatHashTable::new(),
-            called_early_config_functions: FlatHashTable::new(),
-            called_config_functions: FlatHashTable::new(),
-            called_main_loop_enter_functions: FlatHashTable::new(),
-            called_main_loop_exit_functions: FlatHashTable::new(),
+            called_init_functions: HashSet::new(),
+            called_worker_init_functions: HashSet::new(),
+            called_early_config_functions: HashSet::new(),
+            called_config_functions: HashSet::new(),
+            called_main_loop_enter_functions: HashSet::new(),
+            called_main_loop_exit_functions: HashSet::new(),
             main_loop_entered: false,
             materialized_registration_generation: 0,
             pending_worker_graph,
@@ -125,12 +124,12 @@ impl Engine {
             main_loop_exit_now: Arc::new(AtomicBool::new(false)),
             main_loop_exit_status: Mutex::new(0),
             memory_initialized: false,
-            called_init_functions: FlatHashTable::new(),
-            called_worker_init_functions: FlatHashTable::new(),
-            called_early_config_functions: FlatHashTable::new(),
-            called_config_functions: FlatHashTable::new(),
-            called_main_loop_enter_functions: FlatHashTable::new(),
-            called_main_loop_exit_functions: FlatHashTable::new(),
+            called_init_functions: HashSet::new(),
+            called_worker_init_functions: HashSet::new(),
+            called_early_config_functions: HashSet::new(),
+            called_config_functions: HashSet::new(),
+            called_main_loop_enter_functions: HashSet::new(),
+            called_main_loop_exit_functions: HashSet::new(),
             main_loop_entered: false,
             materialized_registration_generation: 0,
             pending_worker_graph,

@@ -20,8 +20,6 @@ use hammer_core::protocol::tcp::{
     TcpTimestampOption,
 };
 use hammer_infra::pool::Index as PoolIndex;
-#[cfg(test)]
-use hammer_infra::vec::Vec;
 use hammer_runtime::DataWorkerId;
 use hammer_service::session::runtime::RxDelivery;
 use hammer_service::transport::congestion::CongestionController;

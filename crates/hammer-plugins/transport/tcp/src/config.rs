@@ -4,7 +4,6 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use hammer_core::error::{HammerError, HammerResult};
-use hammer_infra::vec::Vec;
 
 const TCP_MSS: usize = 1_440;
 const TCP_WINDOW: u32 = u16::MAX as u32;

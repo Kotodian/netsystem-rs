@@ -16,7 +16,6 @@ use hammer_runtime::node::NodeRuntime;
 use hammer_runtime::{DataPlaneBarrierHandle, DataPlaneRuntime, NodeResult};
 
 use crate::opaque::NetworkOpaque;
-use hammer_infra::vec::Vec;
 
 pub struct FeatureArc<A: FeatureArcSpec> {
     inner: Arc<FeatureArcInner<A>>,

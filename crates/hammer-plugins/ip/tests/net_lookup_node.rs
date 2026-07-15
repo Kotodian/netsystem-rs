@@ -8,7 +8,6 @@ use hammer_core::error::CoreResult;
 use hammer_core::forwarding::AdjacencyRewrite;
 use hammer_core::forwarding::{Dpo, DpoId, DpoProto, DpoType, FibTableBuilder};
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
-use hammer_infra::vec::Vec as InfraVec;
 use hammer_plugin_ip::{
     AdjacencyRewriteNode, AdjacencyRewriteTrace, IpInputNext, IpInputNode, IpLocalControlPlane,
     IpLocalNext, IpLookupControlPlane, IpLookupNext, IpLookupTrace, IpUnicastArc,
@@ -48,7 +47,7 @@ fn test_runtime(
 
 #[derive(Default)]
 struct SinkState {
-    payloads: Vec<hammer_infra::vec::Vec<u8>>,
+    payloads: Vec<std::vec::Vec<u8>>,
     forwarding: Vec<Option<ForwardingMetadata>>,
     egress_interfaces: Vec<Option<u32>>,
     frame_lens: Vec<usize>,
@@ -59,8 +58,8 @@ struct SinkNode {
     runtime_data: NodeRuntimeData,
 }
 
-fn chain_bytes(runtime: &DataPlaneRuntime, index: hammer_core::data_plane::Index) -> InfraVec<u8> {
-    let mut bytes = InfraVec::new();
+fn chain_bytes(runtime: &DataPlaneRuntime, index: hammer_core::data_plane::Index) -> Vec<u8> {
+    let mut bytes = Vec::new();
     for buffer in runtime.buffers().chain(index) {
         bytes.extend_from_slice(buffer.expect("chain buffer").current());
     }

@@ -1,6 +1,5 @@
 use hammer_component_macros::ipc_handler;
 use hammer_core::error::CoreError;
-use hammer_infra::vec::Vec;
 use hammer_ipc::{PluginCommandError, PluginCommandReply};
 use hammer_runtime::engine::Engine;
 
@@ -113,7 +112,8 @@ fn plugin_command_error(error: CoreError) -> PluginCommandError {
             PluginCommandError::Configuration
         }
         CoreError::DataPlane(_) => PluginCommandError::GraphMaterialization,
-        CoreError::Lifecycle { .. }
+        CoreError::MainHeap(_)
+        | CoreError::Lifecycle { .. }
         | CoreError::ServiceClosed
         | CoreError::Tcp(_)
         | CoreError::Internal { .. } => PluginCommandError::Lifecycle,

@@ -1,5 +1,7 @@
 # Shared App Ingress Registry Design
 
+> **Container choices superseded by Issue #104 and ADR 0014.** `FlatHashTable` and `hammer_infra::vec::Vec` no longer exist; ordinary storage uses standard collections through the Main Heap, while packet-path exact lookup uses an existing VPP-style dataplane primitive.
+
 ## Goal
 
 Make TCP and UDP reuse the same app-ingress registration structure inside `hammer-service`.

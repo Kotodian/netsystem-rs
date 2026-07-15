@@ -7,7 +7,6 @@ use hammer_core::data_plane::{
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::ip::IpVersion;
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
-use hammer_infra::vec::Vec as InfraVec;
 use hammer_plugin_ip::{IcmpInputControlPlane, IcmpInputError, IcmpInputTrace};
 use hammer_runtime::{
     DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node, NodeProcessFn, NodeResult,
@@ -78,8 +77,8 @@ impl InternalNode for CaptureNode {}
 fn chain_bytes(
     runtime: &DataPlaneRuntime,
     index: hammer_core::data_plane::Index,
-) -> CoreResult<InfraVec<u8>> {
-    let mut bytes = InfraVec::new();
+) -> CoreResult<Vec<u8>> {
+    let mut bytes = Vec::new();
     for buffer in runtime.buffers().chain(index) {
         bytes.extend_from_slice(buffer?.current());
     }

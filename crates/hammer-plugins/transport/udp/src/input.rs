@@ -9,8 +9,6 @@ use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
 use hammer_core::protocol::transport::UdpHeader;
 use hammer_core::protocol::wire::read_header;
-use hammer_infra::boxed::Box;
-use hammer_infra::vec::Vec;
 use hammer_runtime::{
     DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
     TraceFormatter, add_packet_trace,
@@ -192,7 +190,7 @@ impl UdpInputSnapshot {
     #[inline]
     fn new() -> Self {
         Self {
-            ports: Box::from_elem(UDP_PORT_COUNT, UdpPortAction::IcmpError),
+            ports: vec![UdpPortAction::IcmpError; UDP_PORT_COUNT].into_boxed_slice(),
         }
     }
 

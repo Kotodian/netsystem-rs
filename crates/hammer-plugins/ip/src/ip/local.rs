@@ -10,7 +10,6 @@ use hammer_core::protocol::tcp::TcpWireHeader;
 use hammer_core::protocol::transport::UdpHeader;
 use hammer_core::protocol::wire::read_header;
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
-use hammer_infra::vec::Vec;
 use hammer_runtime::{
     DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
     TraceFormatter, add_packet_trace,

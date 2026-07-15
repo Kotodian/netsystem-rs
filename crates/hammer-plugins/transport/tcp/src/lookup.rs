@@ -11,7 +11,6 @@ use hammer_core::protocol::tcp::{
 use hammer_core::protocol::transport::TransportConnectionKey;
 use hammer_infra::bihash::{Bihash, BihashKey, FREE_U64};
 use hammer_infra::pool::{Index as PoolIndex, Pool};
-use hammer_infra::vec::Vec;
 use hammer_runtime::DataWorkerId;
 
 use crate::{TcpConnection, TcpInputNext, TcpState};

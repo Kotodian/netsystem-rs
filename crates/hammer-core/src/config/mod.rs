@@ -1,6 +1,6 @@
 //! Hammer configuration: single-layer, single-name TOML schema.
 //!
-//! Each section (`[log]`, `[trace]`, `[network]`, `[worker]`) is a struct that
+//! Each section (`[log]`, `[memory]`, `[trace]`, `[network]`, `[worker]`) is a struct that
 //! directly deserializes from TOML. Container `#[serde(default)]` fills missing
 //! fields from each struct's `Default` impl (which carries production
 //! constants); `#[serde(with = "humantime_serde")]` handles `Duration` parsing.
@@ -11,15 +11,19 @@
 //! (see `loader::load_config`): directories are loaded as sorted `*.toml`
 //! fragments and merged into one `Config`.
 
+pub mod bootstrap;
 pub mod loader;
 pub mod log;
+pub mod memory;
 pub mod network;
 pub mod route;
 pub mod trace;
 pub mod worker;
 
-pub use loader::{load_config, parse_config};
+pub use bootstrap::BootstrapConfig;
+pub use loader::{load_bootstrap_config, load_config, parse_bootstrap_config, parse_config};
 pub use log::Log;
+pub use memory::Memory;
 pub use network::{Network, SessionBackend};
 pub use route::{Route, RouteAction, Via};
 pub use trace::{Trace, TraceInput};
@@ -37,7 +41,6 @@ pub mod constants {
 }
 
 use crate::error::{HammerError, HammerResult};
-use hammer_infra::vec::Vec;
 
 /// The full TOML schema. Top-level `include` drives multi-file loading
 /// (see `loader`); it is consumed by `load_config` and absent from a
@@ -58,6 +61,7 @@ pub struct Config {
     )]
     plugin_sections: toml::Table,
     pub log: Log,
+    pub memory: Memory,
     pub trace: Trace,
     pub network: Network,
     pub worker: Worker,
@@ -99,6 +103,7 @@ impl Config {
     /// Validate every section's invariants. Called by `parse_config` and
     /// `load_config` after assembly.
     pub fn validate(&self) -> HammerResult<()> {
+        self.memory.validate()?;
         self.trace.validate()?;
         self.network.validate()?;
         self.worker.validate()?;

@@ -2,8 +2,6 @@ use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::marker::PhantomData;
 
-use crate::vec::Vec;
-
 pub struct Descriptor<Tag> {
     raw: u64,
     _marker: PhantomData<fn() -> Tag>,

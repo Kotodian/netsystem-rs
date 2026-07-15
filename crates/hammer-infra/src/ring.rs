@@ -7,7 +7,6 @@ use crossbeam_utils::CachePadded;
 
 use crate::heap_boxed::Slice;
 use crate::prefetch::prefetch_read_l1;
-use crate::vec::Vec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SubmissionDescriptor<Opcode, UserData, Object, Payload> {

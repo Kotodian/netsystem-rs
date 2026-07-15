@@ -9,7 +9,7 @@ lifecycle, configuration, and barriers outside the hot path.
 
 | crate | role |
 |---|---|
-| `hammer-infra` | Bottom-layer infrastructure: lock-free queues, pools, timer wheels, hash tables, memory segments, checksums, SIMD helpers, and ring buffers. |
+| `hammer-infra` | Bottom-layer infrastructure: the fixed-capacity process-global Main Heap, lock-free queues, pools, timer wheels, VPP-style Bihash, memory segments, checksums, SIMD helpers, and ring buffers. |
 | `hammer-core` | Base types: config schema, errors, lifecycle, metrics, logging, network primitives, forwarding tables, and protocol wire types. |
 | `hammer-component-macros` | Registration macros for packet graph nodes and initialization functions. |
 | `hammer-runtime` | Runtime engine for worker threads, graph dispatch, barriers, service registry, and session/app handles. |

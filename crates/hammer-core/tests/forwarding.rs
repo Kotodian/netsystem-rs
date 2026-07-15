@@ -128,7 +128,7 @@ fn ip6_prefix_hash_table_is_generic_and_uses_longest_prefix_match() {
 }
 
 #[test]
-fn ip6_prefix_hash_table_exposes_explicit_prefetch_for_flat_buckets() {
+fn ip6_prefix_hash_table_exposes_explicit_bihash_prefetch() {
     let table = Ip6PrefixHashTable::from_routes([
         (
             Ipv6Net::new(Ipv6Addr::UNSPECIFIED, 0).expect("default route"),
@@ -144,6 +144,45 @@ fn ip6_prefix_hash_table_exposes_explicit_prefetch_for_flat_buckets() {
     table.prefetch_destination(destination);
 
     assert_eq!(table.lookup(destination), Some(NextHop::Direct));
+}
+
+#[test]
+fn ip6_prefix_bihash_preserves_large_route_set_lpm_overwrite_and_clone() {
+    let default = Ipv6Net::new(Ipv6Addr::UNSPECIFIED, 0).expect("default route");
+    let subnet_addr = Ipv6Addr::new(0x2001, 0x0db8, 0x0064, 0, 0, 0, 0, 0);
+    let subnet = Ipv6Net::new(subnet_addr, 64).expect("subnet route");
+    let mut routes = Vec::with_capacity(514);
+    routes.push((default, 1u32));
+    routes.push((subnet, 2u32));
+
+    for suffix in 0..512u128 {
+        let address = Ipv6Addr::from(u128::from(subnet_addr) | suffix);
+        routes.push((
+            Ipv6Net::new(address, 128).expect("host route"),
+            suffix as u32 + 10,
+        ));
+    }
+    let mut table = Ip6PrefixHashTable::from_routes(routes);
+
+    let target = Ipv6Addr::from(u128::from(subnet_addr) | 42);
+    let route_count = table.len();
+    table.insert(
+        Ipv6Net::new(target, 128).expect("replacement host route"),
+        u32::MAX,
+    );
+    table.prefetch_destination(target);
+    let cloned = table.clone();
+
+    assert_eq!(table.len(), route_count);
+    assert_eq!(cloned.lookup(target), Some(u32::MAX));
+    assert_eq!(
+        cloned.lookup(Ipv6Addr::from(u128::from(subnet_addr) | 600)),
+        Some(2)
+    );
+    assert_eq!(
+        cloned.lookup("2001:db8:ffff::1".parse().expect("default destination")),
+        Some(1)
+    );
 }
 
 #[test]

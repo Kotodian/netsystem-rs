@@ -1,10 +1,10 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::task::Waker;
 
 use hammer_core::error::{HammerError, HammerResult};
-use hammer_infra::map::FlatHashTable;
 use hammer_infra::segment::Local;
 use tokio::sync::Notify;
 
@@ -36,16 +36,16 @@ impl SessionNotify {
 #[derive(Clone)]
 pub struct AppWorker<S: SessionSegment> {
     worker_index: usize,
-    sessions: FlatHashTable<u64, Arc<AppSession<S>>>,
-    notifies: FlatHashTable<u64, Arc<SessionNotify>>,
+    sessions: HashMap<u64, Arc<AppSession<S>>>,
+    notifies: HashMap<u64, Arc<SessionNotify>>,
 }
 
 impl<S: SessionSegment> AppWorker<S> {
     pub fn new(worker_index: usize) -> Self {
         Self {
             worker_index,
-            sessions: FlatHashTable::new(),
-            notifies: FlatHashTable::new(),
+            sessions: HashMap::new(),
+            notifies: HashMap::new(),
         }
     }
 
@@ -57,7 +57,7 @@ impl<S: SessionSegment> AppWorker<S> {
     /// Look up a session handle without detaching.
     #[inline]
     pub fn session(&self, handle: SessionHandle) -> Option<Arc<AppSession<S>>> {
-        self.sessions.lookup(&handle.raw())
+        self.sessions.get(&handle.raw()).cloned()
     }
 
     /// Remove a session. Mirrors VPP `app_worker_del_session`.
@@ -70,7 +70,7 @@ impl<S: SessionSegment> AppWorker<S> {
     /// `Arc<SessionNotify>` so callers can await `rx_readable` / `tx_writable`
     /// / `evt_readable` without holding a borrow on the worker.
     pub fn notify_entry(&self, handle: SessionHandle) -> Option<Arc<SessionNotify>> {
-        self.notifies.lookup(&handle.raw())
+        self.notifies.get(&handle.raw()).cloned()
     }
 
     pub fn wake_rx(&self, handle: SessionHandle) {
@@ -117,7 +117,7 @@ impl AppWorker<Local> {
         handle: SessionHandle,
         config: AppSessionConfig,
     ) -> HammerResult<Arc<AppSession<Local>>> {
-        if self.sessions.lookup(&handle.raw()).is_some() {
+        if self.sessions.contains_key(&handle.raw()) {
             return Err(HammerError::internal(format!(
                 "app worker {} already has session {}",
                 self.worker_index,
@@ -150,7 +150,7 @@ impl AppWorker<Local> {
         config: AppSessionConfig,
         runtime_tx_evt_q: Arc<SessionMsgQueue>,
     ) -> HammerResult<Arc<AppSession<Local>>> {
-        if self.sessions.lookup(&handle.raw()).is_some() {
+        if self.sessions.contains_key(&handle.raw()) {
             return Err(HammerError::internal(format!(
                 "app worker {} already has session {}",
                 self.worker_index,
@@ -174,7 +174,8 @@ impl AppWorker<Local> {
     pub async fn send_all(&self, handle: SessionHandle, bytes: &[u8]) -> HammerResult<usize> {
         let session = self
             .sessions
-            .lookup(&handle.raw())
+            .get(&handle.raw())
+            .cloned()
             .ok_or_else(|| HammerError::internal("app session not found"))?;
         let notify = self.notify_entry(handle);
         let mut written = 0usize;
@@ -211,7 +212,7 @@ impl AppWorker<Local> {
 
     /// App-side async receive via worker. Waits until RX FIFO has data.
     pub async fn recv(&self, handle: SessionHandle, out: &mut [u8]) -> usize {
-        let Some(session) = self.sessions.lookup(&handle.raw()) else {
+        let Some(session) = self.sessions.get(&handle.raw()).cloned() else {
             return 0;
         };
         let notify = self.notify_entry(handle);
@@ -247,7 +248,7 @@ impl AppWorker<Local> {
 
     /// App-side async event receive via worker.
     pub async fn next_event(&self, handle: SessionHandle) -> Option<SessionEvt> {
-        let session = self.sessions.lookup(&handle.raw())?;
+        let session = self.sessions.get(&handle.raw()).cloned()?;
         let notify = self.notify_entry(handle);
         loop {
             if let Some(evt) = session.evt_q().dequeue() {
@@ -273,24 +274,20 @@ impl AppWorker<Local> {
 
 #[derive(Debug, Default, Clone)]
 pub struct AppWorkerRegistry {
-    by_worker: FlatHashTable<usize, AppWorker<Local>>,
+    by_worker: HashMap<usize, AppWorker<Local>>,
 }
 
 impl AppWorkerRegistry {
     fn new() -> Self {
         Self {
-            by_worker: FlatHashTable::new(),
+            by_worker: HashMap::new(),
         }
     }
 
     fn get_or_insert(&mut self, worker_index: usize) -> &mut AppWorker<Local> {
-        if self.by_worker.lookup(&worker_index).is_none() {
-            self.by_worker
-                .insert(worker_index, AppWorker::<Local>::new(worker_index));
-        }
         self.by_worker
-            .get_mut(&worker_index)
-            .expect("app worker was just inserted")
+            .entry(worker_index)
+            .or_insert_with(|| AppWorker::<Local>::new(worker_index))
     }
 }
 

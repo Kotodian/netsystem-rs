@@ -1,5 +1,7 @@
 # VPP-Style Memory Management Implementation Plan
 
+> **Partially superseded by Issue #104 and ADR 0014.** The instructions below that reject `#[global_allocator]`, allow an expandable ordinary mimalloc backend, or require allocator-specific `Vec` / `FlatHashTable` storage are historical and no longer authoritative. The explicit Buffer Arena PhysmemMap and SVM mapping ownership decisions remain authoritative.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build Hammer's VPP-style memory model with a concrete explicit heap handle, inline buffer storage, NUMA-selected buffer pools, worker-local buffer caches, and frame ownership that drops resources automatically on the data-plane hot path.

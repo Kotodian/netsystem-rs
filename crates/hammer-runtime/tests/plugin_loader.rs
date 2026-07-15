@@ -117,7 +117,7 @@ fn dso_constructors_publish_and_failed_load_unlinks_before_successful_activation
     let config = Arc::new(parse_config("plugins = [\"ip\"]").expect("IP plugin config"));
     let mut engine = test_engine();
     engine.registry.set(Arc::clone(&config));
-    let startup_roots = hammer_infra::vec!["ip".into()];
+    let startup_roots = vec!["ip".into()];
     let error = engine
         .load_plugins(&built_plugin_path(), &startup_roots)
         .expect_err("plugin loading before memory_init must fail");

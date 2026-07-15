@@ -1,7 +1,6 @@
 use linkme::distributed_slice;
 use serde::{Deserialize, Serialize};
 
-use hammer_infra::vec::Vec;
 use hammer_runtime::engine::Engine;
 
 /// Handler function type: synchronous fn running on the reactor thread.

@@ -1,4 +1,3 @@
-use hammer_infra::vec::Vec;
 use tokio::net::TcpListener;
 
 pub async fn clnt_loop(listener: TcpListener) {
@@ -16,7 +15,7 @@ pub async fn clnt_loop(listener: TcpListener) {
 
 async fn conn_loop(stream: tokio::net::TcpStream) {
     let (mut reader, mut writer) = stream.into_split();
-    let mut buf = hammer_infra::vec![0u8; 65536];
+    let mut buf = vec![0u8; 65536];
 
     loop {
         match hammer_ipc::frame::async_read_frame(&mut reader, &mut buf).await {

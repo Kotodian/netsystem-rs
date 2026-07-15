@@ -14,7 +14,6 @@ use std::time::Duration;
 
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::registry::RuntimeRegistry;
-use hammer_infra::vec::Vec;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, LocalSet};
 
@@ -156,7 +155,7 @@ impl ProcessContext {
         }
         self.pending.push(ProcessEventBatch {
             event_type: signal.event_type,
-            data: hammer_infra::vec![signal.data],
+            data: vec![signal.data],
         });
     }
 }

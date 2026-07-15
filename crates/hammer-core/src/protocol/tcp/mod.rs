@@ -1,6 +1,5 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use crate::ds::FlatHashKey;
 use crate::protocol::ip_ecn::IpEcnCodepoint;
 use crate::protocol::transport::TransportConnectionKey;
 use thiserror::Error;
@@ -112,7 +111,7 @@ pub struct TcpPacket {
     pub advertised_window: u16,
     pub flags: TcpSegmentFlags,
     pub capabilities: TcpCapabilities,
-    pub sack_blocks: hammer_infra::vec::Vec<TcpSackBlock>,
+    pub sack_blocks: std::vec::Vec<TcpSackBlock>,
     pub timestamp: Option<TcpTimestampOption>,
     pub fast_open_cookie: Option<TcpFastOpenCookie>,
     pub ip_ecn: Option<IpEcnCodepoint>,
@@ -468,13 +467,6 @@ impl TcpV4ListenerKey {
     }
 }
 
-impl FlatHashKey for TcpV4ListenerKey {
-    #[inline(always)]
-    fn hash_key(self) -> usize {
-        self.0.hash_key()
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TcpV6ListenerKey {
     local_addr: u128,
@@ -503,13 +495,6 @@ impl TcpV6ListenerKey {
     #[inline]
     pub const fn local_port(self) -> u16 {
         self.scope_port as u16
-    }
-}
-
-impl FlatHashKey for TcpV6ListenerKey {
-    #[inline(always)]
-    fn hash_key(self) -> usize {
-        hash_words(&[fold_u128(self.local_addr), self.scope_port])
     }
 }
 
@@ -579,26 +564,4 @@ pub enum TcpWorkerEvent {
     },
 }
 
-#[inline(always)]
-fn fold_u128(value: u128) -> u64 {
-    value as u64 ^ (value >> 64) as u64
-}
-
-#[inline(always)]
-fn hash_words(words: &[u64]) -> usize {
-    let mut state = 0x9e37_79b9_7f4a_7c15u64;
-    for word in words {
-        state ^= splitmix64(*word ^ state);
-        state = state.rotate_left(13);
-    }
-    splitmix64(state) as usize
-}
-
-#[inline(always)]
-fn splitmix64(mut value: u64) -> u64 {
-    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
-}
 use std::cmp::Ordering;

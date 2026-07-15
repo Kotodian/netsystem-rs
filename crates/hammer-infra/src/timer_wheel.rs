@@ -1,5 +1,4 @@
 use crate::bitmap::Bitmap;
-use crate::vec::Vec;
 
 const INVALID_INDEX: u32 = u32::MAX;
 

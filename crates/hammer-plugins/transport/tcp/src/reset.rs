@@ -2,8 +2,6 @@ use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId};
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::{TcpError, TcpSegmentFlags, tcp_header};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
-#[cfg(test)]
-use hammer_infra::vec::Vec;
 use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
 
 #[hammer_component_macros::node_next]
@@ -605,7 +603,7 @@ mod tests {
     fn ipv4_tcp_packet(flags: u8, sequence: u32, acknowledgment: u32, payload: &[u8]) -> Vec<u8> {
         let packet_len = 20 + 20 + payload.len();
         let total_len = u16::try_from(packet_len).expect("packet length fits");
-        let mut packet = hammer_infra::vec![0u8; packet_len];
+        let mut packet = vec![0u8; packet_len];
         packet[0] = 0x45;
         write_be_u16(&mut packet, 2, total_len);
         packet[8] = 64;

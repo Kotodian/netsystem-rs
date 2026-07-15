@@ -4,9 +4,7 @@ use std::sync::Arc;
 use hammer_core::data_plane::{DataPlaneBuffers, Index};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::fifo::Fifo;
-use hammer_infra::map::FlatHashTable;
 use hammer_infra::segment::{Local, Segment, Svm};
-use hammer_infra::vec::Vec;
 use hammer_runtime::app::{
     AppSession, SessionEventQueue, SessionEvt, SessionEvtType, SessionMsgQueue, SessionSegment,
 };
@@ -34,8 +32,7 @@ fn checked_add_ooo_accepted(total: u32, accepted: u32) -> CoreResult<u32> {
 
 pub struct SessionAppRuntime<S: SessionSegment> {
     buffers: DataPlaneBuffers,
-    sessions: FlatHashTable<u64, Arc<AppSession<S>>>,
-    sessions_by_index: Vec<Option<SessionId>>,
+    session_slots: Vec<Option<(SessionId, Arc<AppSession<S>>)>>,
     tx_evt_q: Arc<S::EventQueue>,
     worker_index: usize,
     seg: S,
@@ -45,9 +42,8 @@ impl<S: SessionSegment> fmt::Debug for SessionAppRuntime<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SessionAppRuntime")
             .field("buffers", &self.buffers)
-            .field("sessions", &self.sessions)
-            .field("sessions_by_index", &self.sessions_by_index)
-            .field("msg_queue_slots", &self.sessions_by_index.len())
+            .field("session_slots", &self.session_slots)
+            .field("msg_queue_slots", &self.session_slots.len())
             .finish_non_exhaustive()
     }
 }
@@ -63,8 +59,7 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
     ) -> Self {
         Self {
             buffers,
-            sessions: FlatHashTable::new(),
-            sessions_by_index: Vec::from_elem_copy(session_capacity, None),
+            session_slots: vec![None; session_capacity],
             tx_evt_q,
             worker_index,
             seg,
@@ -80,26 +75,36 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
     }
 
     pub fn attach_session(&mut self, session_id: SessionId, session: Arc<AppSession<S>>) {
-        self.sessions.insert(session_id.get(), session);
         let slot = session_id.pool_index().slot() as usize;
-        if let Some(entry) = self.sessions_by_index.get_mut(slot) {
-            *entry = Some(session_id);
-        }
+        self.session_slots[slot] = Some((session_id, session));
     }
 
     pub fn detach_session(&mut self, session_id: SessionId) -> Option<Arc<AppSession<S>>> {
         let slot = session_id.pool_index().slot() as usize;
-        if let Some(entry) = self.sessions_by_index.get_mut(slot) {
-            *entry = None;
+        let entry = self.session_slots.get_mut(slot)?;
+        if entry
+            .as_ref()
+            .is_some_and(|(stored, _)| *stored == session_id)
+        {
+            return entry.take().map(|(_, session)| session);
         }
-        self.sessions.remove(&session_id.get())
+        None
+    }
+
+    #[inline(always)]
+    fn session(&self, session_id: SessionId) -> Option<&Arc<AppSession<S>>> {
+        let slot = session_id.pool_index().slot() as usize;
+        self.session_slots
+            .get(slot)?
+            .as_ref()
+            .and_then(|(stored, session)| (*stored == session_id).then_some(session))
     }
 
     pub fn connected(&self, session_id: SessionId) -> CoreResult<()>
     where
         Self: SessionAppRuntimeCreate<S>,
     {
-        let Some(session) = self.sessions.lookup(&session_id.get()) else {
+        let Some(session) = self.session(session_id) else {
             return Ok(());
         };
         session
@@ -113,7 +118,7 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
     where
         Self: SessionAppRuntimeCreate<S>,
     {
-        let Some(session) = self.sessions.lookup(&session_id.get()) else {
+        let Some(session) = self.session(session_id) else {
             return Ok(());
         };
         session
@@ -127,7 +132,7 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
     where
         Self: SessionAppRuntimeCreate<S>,
     {
-        let Some(session) = self.sessions.lookup(&session_id.get()) else {
+        let Some(session) = self.session(session_id) else {
             return Ok(false);
         };
         let dropped = session.drop_tx_acked(len).map_err(CoreError::from)?;
@@ -139,15 +144,13 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
 
     pub fn pending_send_len(&self, session_id: SessionId) -> CoreResult<Option<usize>> {
         Ok(self
-            .sessions
-            .lookup(&session_id.get())
+            .session(session_id)
             .map(|session| session.tx_fifo().max_dequeue())
             .filter(|len| *len != 0))
     }
 
     pub fn rx_available_len(&self, session_id: SessionId) -> Option<usize> {
-        self.sessions
-            .lookup(&session_id.get())
+        self.session(session_id)
             .map(|session| session.rx_fifo().max_enqueue())
     }
 
@@ -164,8 +167,7 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
         index: Index,
     ) -> CoreResult<()> {
         let session = self
-            .sessions
-            .lookup(&session_id.get())
+            .session(session_id)
             .ok_or_else(|| CoreError::internal("app session is missing"))?;
         let written = session
             .tx_fifo()
@@ -195,56 +197,46 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
     where
         Self: SessionAppRuntimeCreate<S>,
     {
-        let handle = self
-            .sessions
-            .lookup(&session_id.get())
-            .map(|s| s.session_handle());
-        let delivery = match handle {
-            Some(_) => {
-                let Some(session) = self.sessions.lookup(&session_id.get()) else {
-                    return Ok((0, 0));
-                };
-                let mut total = 0u32;
-                let mut accepted = 0u32;
-                let mut promoted = 0u32;
-                let mut urgent_pending = urgent;
-                for buffer in buffers.chain(index) {
-                    let buffer = buffer?;
-                    let chunk = buffer.current();
-                    let chunk_len = u32::try_from(chunk.len())
-                        .map_err(|_| CoreError::internal("rx buffer length overflow"))?;
-                    if accepted == total {
-                        let rx_available_before = session.rx_fifo().max_enqueue();
-                        let flags = if urgent_pending {
-                            urgent_pending = false;
-                            hammer_runtime::app::SessionEvtFlags::URGENT
-                        } else {
-                            hammer_runtime::app::SessionEvtFlags::empty()
-                        };
-                        let wrote = session
-                            .enqueue_rx_with_flags(chunk, flags)
-                            .map_err(CoreError::from)?;
-                        let accepted_now = wrote.min(chunk.len()).min(rx_available_before);
-                        let promoted_now = wrote.saturating_sub(accepted_now);
-                        accepted = accepted
-                            .checked_add(accepted_now as u32)
-                            .ok_or_else(|| CoreError::internal("rx accepted length overflow"))?;
-                        promoted = promoted
-                            .checked_add(promoted_now as u32)
-                            .ok_or_else(|| CoreError::internal("rx promoted length overflow"))?;
-                    }
-                    total = total
-                        .checked_add(chunk_len)
-                        .ok_or_else(|| CoreError::internal("rx buffer length overflow"))?;
-                }
-                if accepted != 0 || promoted != 0 {
-                    self.notify_rx(&session);
-                }
-                (accepted, promoted)
-            }
-            None => (0, 0),
+        let Some(session) = self.session(session_id) else {
+            return Ok((0, 0));
         };
-        Ok(delivery)
+        let mut total = 0u32;
+        let mut accepted = 0u32;
+        let mut promoted = 0u32;
+        let mut urgent_pending = urgent;
+        for buffer in buffers.chain(index) {
+            let buffer = buffer?;
+            let chunk = buffer.current();
+            let chunk_len = u32::try_from(chunk.len())
+                .map_err(|_| CoreError::internal("rx buffer length overflow"))?;
+            if accepted == total {
+                let rx_available_before = session.rx_fifo().max_enqueue();
+                let flags = if urgent_pending {
+                    urgent_pending = false;
+                    hammer_runtime::app::SessionEvtFlags::URGENT
+                } else {
+                    hammer_runtime::app::SessionEvtFlags::empty()
+                };
+                let wrote = session
+                    .enqueue_rx_with_flags(chunk, flags)
+                    .map_err(CoreError::from)?;
+                let accepted_now = wrote.min(chunk.len()).min(rx_available_before);
+                let promoted_now = wrote.saturating_sub(accepted_now);
+                accepted = accepted
+                    .checked_add(accepted_now as u32)
+                    .ok_or_else(|| CoreError::internal("rx accepted length overflow"))?;
+                promoted = promoted
+                    .checked_add(promoted_now as u32)
+                    .ok_or_else(|| CoreError::internal("rx promoted length overflow"))?;
+            }
+            total = total
+                .checked_add(chunk_len)
+                .ok_or_else(|| CoreError::internal("rx buffer length overflow"))?;
+        }
+        if accepted != 0 || promoted != 0 {
+            self.notify_rx(session);
+        }
+        Ok((accepted, promoted))
     }
 
     pub fn copy_rx_from_buffer_ooo(
@@ -254,7 +246,7 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
         index: Index,
         offset: u32,
     ) -> CoreResult<(u32, Option<(u32, u32)>)> {
-        let Some(session) = self.sessions.lookup(&session_id.get()) else {
+        let Some(session) = self.session(session_id) else {
             return Ok((0, None));
         };
         let mut total_len = 0u32;
@@ -301,7 +293,7 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
     }
 
     pub fn discard_all_tx_bytes_for_session(&mut self, session_id: SessionId) {
-        if let Some(session) = self.sessions.lookup(&session_id.get()) {
+        if let Some(session) = self.session(session_id) {
             let _ = session.drop_tx_acked(session.tx_fifo().max_dequeue());
         }
     }
@@ -323,12 +315,9 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
                 if evt.evt_type == SessionEvtType::Close && evt.worker_index() != worker_index {
                     continue;
                 }
-                let Some(Some(session_id)) =
-                    self.sessions_by_index.get(evt.session_index() as usize)
+                let Some(Some((session_id, session))) =
+                    self.session_slots.get(evt.session_index() as usize)
                 else {
-                    continue;
-                };
-                let Some(session) = self.sessions.lookup(&session_id.get()) else {
                     continue;
                 };
                 if evt.evt_type == SessionEvtType::TxDeq {
@@ -470,7 +459,7 @@ mod tests {
 
         assert_eq!(
             *dispatched.lock().expect("dispatched"),
-            hammer_infra::vec![(session_id.get(), SessionEvtType::Close)]
+            vec![(session_id.get(), SessionEvtType::Close)]
         );
     }
 }

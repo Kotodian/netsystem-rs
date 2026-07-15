@@ -1,6 +1,5 @@
 use hammer_core::data_plane::{BufferFrame, DataPlaneBufferConfig, NodeNext, NodeRegistration};
 use hammer_core::error::CoreResult;
-use hammer_infra::vec::Vec;
 use hammer_runtime::{
     DataPlaneRuntime, DataPlaneRuntimeConfig, DriverNode, Node, NodeDescriptor, NodeProcessFn,
     NodeResult, NodeRuntimeData, PacketTrace, TraceControlPlane, TraceFormatter, TraceInputPolicy,

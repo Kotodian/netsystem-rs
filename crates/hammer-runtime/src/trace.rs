@@ -8,9 +8,6 @@ use hammer_core::config::Trace;
 use hammer_core::data_plane::NodeId;
 use hammer_core::error::{CoreError, CoreResult};
 
-use hammer_infra::map::FlatHashTable;
-use hammer_infra::vec::Vec;
-
 pub type TraceFormatter = fn(&[u8]) -> String;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,7 +125,7 @@ struct TraceControlInner {
 struct TraceControlState {
     epoch: u64,
     policy: TracePolicy,
-    quotas: FlatHashTable<u32, u32>,
+    quotas: HashMap<u32, u32>,
     active: HashMap<u32, PacketTraceState>,
     ring: VecDeque<TraceRecord>,
 }
@@ -141,7 +138,7 @@ impl TraceControlPlane {
                 state: Mutex::new(TraceControlState {
                     epoch: 0,
                     policy: TracePolicy::disabled(record_capacity, 1),
-                    quotas: FlatHashTable::new(),
+                    quotas: HashMap::new(),
                     active: HashMap::new(),
                     ring: VecDeque::with_capacity(record_capacity),
                 }),
@@ -177,14 +174,13 @@ impl TraceControlPlane {
             .expect("trace control lock poisoned");
         state.epoch = epoch;
         state.quotas = if policy.enabled {
-            FlatHashTable::from_entries(
-                policy
-                    .inputs
-                    .iter()
-                    .map(|input| (input.node.slot(), input.count)),
-            )
+            policy
+                .inputs
+                .iter()
+                .map(|input| (input.node.slot(), input.count))
+                .collect()
         } else {
-            FlatHashTable::new()
+            HashMap::new()
         };
         let marking_inputs = if policy.enabled {
             policy.inputs.len()
@@ -309,7 +305,7 @@ impl TraceControlHandle {
             .expect("trace control lock poisoned");
         state.policy.enabled
             && state.active.len() < state.policy.packet_capacity.max(1)
-            && state.quotas.lookup(&node.slot()).unwrap_or(0) > 0
+            && state.quotas.get(&node.slot()).copied().unwrap_or(0) > 0
     }
 
     pub fn try_mark(&self, node: NodeId, node_name: Option<&'static str>) -> Option<u32> {
@@ -328,7 +324,7 @@ impl TraceControlHandle {
             return None;
         }
         let epoch = state.epoch;
-        let quota = state.quotas.lookup(&node.slot())?;
+        let quota = state.quotas.get(&node.slot()).copied()?;
         if quota == 0 {
             return None;
         }

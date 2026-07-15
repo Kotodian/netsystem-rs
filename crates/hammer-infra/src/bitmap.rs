@@ -1,5 +1,3 @@
-use crate::vec::Vec;
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Bitmap {
     words: Vec<u64>,

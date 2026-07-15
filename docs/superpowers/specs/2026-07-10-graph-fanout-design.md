@@ -97,7 +97,7 @@ No buffer validation path returns a string-only internal error.
 
 ### Frame Storage And Capacity
 
-`BufferFrame` stores Index values in the existing heap-backed `hammer_infra::vec::Vec<Index>`. Frame cleanup and compaction use that container directly; Frame defines no collection or iterator implementation of its own.
+`BufferFrame` stores Index values in a Main Heap-backed standard `Vec<Index>`. Frame cleanup and compaction use that container directly; Frame defines no collection or iterator implementation of its own.
 
 Graph frame capacity is a logical maximum of 256 even though the underlying generic vector can grow. Production insertion enforces that limit. The production frame-capacity setting is removed; smaller frames exist only through crate-private test construction.
 

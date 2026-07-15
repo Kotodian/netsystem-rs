@@ -20,7 +20,6 @@ use hammer_runtime::{
     TraceFormatter, add_packet_trace, unlikely,
 };
 
-use hammer_infra::vec::Vec;
 use hammer_service::data_plane::set_index_node_error_code;
 use hammer_service::net::fib::FibTableHandle;
 use hammer_service::opaque::{ForwardingMetadata, NetworkOpaque, TapEthernetMetadata};

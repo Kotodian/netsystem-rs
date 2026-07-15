@@ -12,7 +12,6 @@ use hammer_infra::bihash::{Bihash, FREE_U64};
 use hammer_infra::checksum::internet_checksum;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::spinlock::Spinlock;
-use hammer_infra::vec::Vec;
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
     TraceFormatter, add_packet_trace,

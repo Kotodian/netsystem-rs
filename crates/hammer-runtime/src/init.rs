@@ -1,12 +1,11 @@
 use petgraph::algo::toposort;
 use petgraph::graphmap::DiGraphMap;
+use std::collections::HashSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use hammer_core::error::{CoreError, HammerResult};
-use hammer_infra::map::FlatHashTable;
 
 use crate::engine::Engine;
-use hammer_infra::vec::Vec;
 
 #[derive(Debug, thiserror::Error)]
 pub enum InitError {
@@ -110,16 +109,16 @@ pub fn topological_order<T: Ordered>(items: &[T]) -> Result<Vec<usize>, InitErro
 
 fn dispatch_init(
     items: Vec<InitFunction>,
-    called: &mut FlatHashTable<&'static str, ()>,
+    called: &mut HashSet<&'static str>,
     engine: &mut Engine,
 ) -> HammerResult<()> {
     let order = topological_order(&items)?;
     for index in order {
         let function = items[index];
-        if called.get(&function.name).is_some() {
+        if called.contains(function.name) {
             continue;
         }
-        called.insert(function.name, ());
+        called.insert(function.name);
         catch_unwind(AssertUnwindSafe(|| (function.func)(engine))).map_err(|_| {
             CoreError::internal(format!("init function `{}` panicked", function.name))
         })??;
@@ -203,7 +202,7 @@ mod tests {
         let fns = mock(&[("a", &[], &["b"]), ("b", &["a"], &[])]);
         let order = topological_order(&fns).expect("topo");
         let names: Vec<&str> = order.iter().map(|i| fns[*i].name).collect();
-        assert_eq!(names, hammer_infra::vec!["a", "b"]);
+        assert_eq!(names, vec!["a", "b"]);
     }
 
     #[test]

@@ -5,12 +5,11 @@
 //! independently by load constructors into the runtime registration authority.
 
 use semver::Version;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use hammer_core::error::HammerError;
-use hammer_infra::map::FlatHashTable;
 use hammer_infra::spinlock::Spinlock;
-use hammer_infra::vec::Vec;
 use libloading::Library;
 
 use crate::plugin_loader::{plugin_cdylib_path, read_plugin_registration};
@@ -98,7 +97,7 @@ impl From<PluginError> for HammerError {
 /// VPP's `vlib_plugin_main`. Failed load transactions never enter this table and
 /// unload before returning their error.
 pub struct PluginMain {
-    library_index_by_name: FlatHashTable<&'static str, usize>,
+    library_index_by_name: HashMap<&'static str, usize>,
     load_order: Vec<&'static str>,
     // Drop last so every DSO-backed name remains valid while indexes drop.
     libraries: Vec<Library>,
@@ -128,10 +127,10 @@ impl PluginMain {
             return Ok(());
         }
 
-        let mut requested = FlatHashTable::with_capacity(roots.len());
+        let mut requested = HashMap::with_capacity(roots.len());
         for (index, root) in roots.iter().enumerate() {
             let name = root.as_str();
-            if let Some(first) = requested.get(&name).copied() {
+            if let Some(first) = requested.get(name).copied() {
                 return Err(PluginError::DuplicateRoot {
                     first,
                     duplicate: index,
@@ -142,12 +141,12 @@ impl PluginMain {
 
         let mut process_main = PLUGIN_MAIN.lock();
         let mut transaction = Self {
-            library_index_by_name: FlatHashTable::with_capacity(roots.len()),
+            library_index_by_name: HashMap::with_capacity(roots.len()),
             load_order: Vec::with_capacity(roots.len()),
             libraries: Vec::with_capacity(roots.len()),
         };
-        let mut visiting = FlatHashTable::with_capacity(roots.len());
-        let mut loaded = FlatHashTable::with_capacity(roots.len());
+        let mut visiting = HashSet::with_capacity(roots.len());
+        let mut loaded = HashSet::with_capacity(roots.len());
         for root in roots {
             transaction.load_one(
                 host_version,
@@ -164,12 +163,12 @@ impl PluginMain {
         }
 
         let main = process_main.get_or_insert_with(|| Self {
-            library_index_by_name: FlatHashTable::with_capacity(transaction.libraries.len()),
+            library_index_by_name: HashMap::with_capacity(transaction.libraries.len()),
             load_order: Vec::with_capacity(transaction.load_order.len()),
             libraries: Vec::with_capacity(transaction.libraries.len()),
         });
         let library_base = main.libraries.len();
-        for (name, index) in transaction.library_index_by_name.iter() {
+        for (&name, &index) in &transaction.library_index_by_name {
             main.library_index_by_name
                 .insert(name, library_base + index);
         }
@@ -184,24 +183,24 @@ impl PluginMain {
         plugin_path: &Path,
         name: &'a str,
         active: Option<&PluginMain>,
-        visiting: &mut FlatHashTable<&'a str, ()>,
-        loaded: &mut FlatHashTable<&'a str, ()>,
+        visiting: &mut HashSet<&'a str>,
+        loaded: &mut HashSet<&'a str>,
     ) -> Result<(), PluginError> {
         if active
-            .and_then(|main| main.library_index_by_name.get(&name))
+            .and_then(|main| main.library_index_by_name.get(name))
             .is_some()
         {
             return Ok(());
         }
-        if visiting.get(&name).is_some() {
+        if visiting.contains(name) {
             return Err(PluginError::Cycle {
                 path: plugin_cdylib_path(plugin_path, name),
             });
         }
-        if loaded.get(&name).is_some() {
+        if loaded.contains(name) {
             return Ok(());
         }
-        visiting.insert(name, ());
+        visiting.insert(name);
 
         let path = plugin_cdylib_path(plugin_path, name);
         // SAFETY: a successful transaction moves the handle into the
@@ -244,8 +243,8 @@ impl PluginMain {
                 loaded,
             )?;
         }
-        visiting.remove(&name);
-        loaded.insert(exported_name, ());
+        visiting.remove(name);
+        loaded.insert(exported_name);
         self.load_order.push(exported_name);
         Ok(())
     }

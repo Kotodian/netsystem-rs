@@ -15,11 +15,9 @@ use crate::data_plane::NodeId;
 use crate::error::{CoreError, CoreResult, DataPlaneError};
 use hammer_infra::{
     align::align_up,
-    boxed::Box,
     physmem::PhysmemMap,
     prefetch::{prefetch_read_l1, prefetch_read_l2, prefetch_write_l1},
     simd::movemask_4,
-    vec::Vec,
 };
 use spinning_top::{
     RawRwSpinlock, RwSpinlock,
@@ -30,7 +28,7 @@ use spinning_top::{
 use super::memory::{HAMMER_MAX_NUMA_NODES, StaticNumaTable};
 
 /// Production graph Frame logical maximum. Insertion enforces this limit even
-/// though the underlying infrastructure vector remains growable.
+/// though the underlying standard vector remains growable.
 pub const DEFAULT_BUFFER_FRAME_CAPACITY: usize = 256;
 pub const DEFAULT_BUFFER_FRAME_POOL_SIZE: usize = 64;
 pub const BUFFER_CACHE_LINE_SIZE: usize = 64;
@@ -1590,13 +1588,14 @@ impl BufferPoolArena {
             ptr::write_bytes(region.base(), 0, region.size());
         }
 
-        let slot_states = Box::from_elem(
-            total_slots,
+        let slot_states = vec![
             BufferSlot {
                 generation: 0,
                 allocated: false,
-            },
-        );
+            };
+            total_slots
+        ]
+        .into_boxed_slice();
         let mut available_stack = Vec::with_capacity(slots);
         for i in 0..slots {
             let slot = u32::try_from(total_slots - i - 1).expect("buffer slot fits u32");
@@ -1915,16 +1914,19 @@ impl BufferPool {
 impl FramePool {
     #[inline]
     fn with_capacity(frame_capacity: usize, slots: usize) -> Self {
-        let mut available = Box::from_elem(slots, 0u32);
+        let mut available = vec![0u32; slots].into_boxed_slice();
         for offset in 0..slots {
             available[offset] =
                 u32::try_from(slots - offset - 1).expect("frame slot index fits u32");
         }
-        let frame_slots = Box::from_fn(slots, |_| FrameSlot {
-            generation: 0,
-            allocated: false,
-            frame: Some(BufferFrame::with_capacity(frame_capacity)),
-        });
+        let frame_slots = (0..slots)
+            .map(|_| FrameSlot {
+                generation: 0,
+                allocated: false,
+                frame: Some(BufferFrame::with_capacity(frame_capacity)),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         let available_len = frame_slots.len();
         Self {
             inner: Rc::new(RefCell::new(FramePoolInner {
@@ -3383,7 +3385,7 @@ impl BufferFrame {
     }
 
     #[inline]
-    fn drain_indices(&mut self) -> hammer_infra::vec::Drain<'_, Index> {
+    fn drain_indices(&mut self) -> std::vec::Drain<'_, Index> {
         self.readiness.clear_pending();
         self.indices.drain(..)
     }

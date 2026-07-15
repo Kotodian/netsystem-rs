@@ -69,7 +69,7 @@ pub fn hash_words(words: &[u64]) -> u64 {
     splitmix64(state)
 }
 
-/// The same splitmix64 used by `FlatHashTable` in `crates/hammer-infra/src/map.rs`.
+/// SplitMix64 finalizer used by scalar and composite bihash keys.
 #[inline(always)]
 pub fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);

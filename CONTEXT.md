@@ -127,6 +127,14 @@ _Avoid_: crossbeam channel payload, TCP migration copy, app queue transfer, serv
 
 ## Buffer And Memory
 
+**Main Heap**:
+The single process-global, fixed-capacity memory domain for ordinary Rust and third-party allocations after bootstrap. It is reserved once and exhaustion never expands it or falls back to another allocation domain.
+_Avoid_: per-plugin heap, expandable global allocator, allocator-specific ordinary collection
+
+**Bootstrap Allocation**:
+The temporary allocation domain used only before Main Heap initialization to discover startup configuration. Bootstrap allocations may be released after initialization but must never become a post-initialization fallback.
+_Avoid_: secondary heap, main-heap overflow fallback, plugin bootstrap allocation
+
 **Data-Plane Primitive**:
 A packet-path data structure that represents Hammer's shared buffer, frame, packet cursor, frame ownership, or graph identity vocabulary. Data-plane primitives are domain primitives built from generic infrastructure, not generic collections or runtime scheduling policy.
 _Avoid_: infra container, runtime scheduler state, helper object
@@ -144,7 +152,7 @@ A packet represented by linked data-plane buffers using buffer-header state. Sha
 _Avoid_: TCP chain wrapper, single-buffer owner wrapper, payload segment list
 
 **Frame Ownership**:
-The worker-local ownership of all buffer references contained in a Pending Frame or Next Frame. Moving indexes between Frames transfers this ownership as a batch, and dropping the owning Frame releases the references that remain in it. Production Frames store indexes in `hammer_infra::vec::Vec` with a fixed logical maximum of 256; Frame-pool size remains the only buffer-frame tuning knob.
+The worker-local ownership of all buffer references contained in a Pending Frame or Next Frame. Moving indexes between Frames transfers this ownership as a batch, and dropping the owning Frame releases the references that remain in it. Production Frames store indexes in a Main Heap-backed standard `Vec` with a fixed logical maximum of 256; Frame-pool size remains the only buffer-frame tuning knob.
 _Avoid_: per-index owner, manual buffer free, borrowed input ownership, configurable production frame capacity
 
 **Packet Cursor**:

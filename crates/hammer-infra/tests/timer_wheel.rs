@@ -2,7 +2,6 @@ use hammer_infra::timer_wheel::{
     TimerStartError, TimerWheel, TimerWheel1t1w32sl, TimerWheel1t2w32sl, TimerWheel1w32FastHint,
     TimerWheel2t1w2048sl,
 };
-use hammer_infra::vec::Vec;
 
 fn expired_values(expired: &Vec<u32>) -> std::vec::Vec<u32> {
     expired.iter().copied().collect()

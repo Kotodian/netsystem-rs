@@ -32,7 +32,6 @@ use std::sync::Arc;
 
 use hammer_core::data_plane::BufferFrame;
 use hammer_core::error::{CoreError, CoreResult, HammerResult};
-use hammer_infra::vec::Vec;
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
 };

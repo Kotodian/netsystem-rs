@@ -11,7 +11,6 @@ use hammer_core::registry::RuntimeRegistry;
 use crate::engine::Engine;
 use crate::spawn;
 use crate::{DataPlaneHandoff, DataWorkerId, barrier};
-use hammer_infra::vec::Vec;
 
 #[hammer_component_macros::main_loop_enter_function]
 pub fn start_workers(engine: &mut Engine) -> HammerResult<()> {

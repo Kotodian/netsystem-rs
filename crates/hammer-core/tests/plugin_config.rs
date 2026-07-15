@@ -1,5 +1,4 @@
 use hammer_core::config::parse_config;
-use hammer_infra::vec::Vec;
 
 #[derive(Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -35,7 +34,7 @@ interfaces = ["utun"]
     assert_eq!(
         tun,
         TunConfig {
-            interfaces: hammer_infra::vec!["utun".to_owned()],
+            interfaces: vec!["utun".to_owned()],
         }
     );
 }

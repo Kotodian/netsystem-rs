@@ -4,7 +4,6 @@ use std::time::Duration;
 use hammer_core::config::Config;
 use hammer_core::data_plane::{BufferFrame, NodeRegistration};
 use hammer_core::error::CoreResult;
-use hammer_infra::vec::Vec;
 use hammer_runtime::{
     DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
 };
@@ -38,7 +37,7 @@ impl Feature<TestArc> for SecondFeature {
     }
 
     fn runs_after() -> Vec<TestArc> {
-        hammer_infra::vec![TestArc::First]
+        vec![TestArc::First]
     }
 }
 
@@ -132,7 +131,7 @@ fn start_node_process(
     let slot = data.usize_word(0).expect("slot");
     let state = start_runtimes().lock().unwrap()[slot].clone();
     state.visits.lock().unwrap().order.push(state.name);
-    let mut nexts = hammer_infra::vec::Vec::with_capacity(frame.len());
+    let mut nexts = std::vec::Vec::with_capacity(frame.len());
     for index in frame.iter_indices() {
         let slot = match &state.feature_arc {
             Some(handle) => {

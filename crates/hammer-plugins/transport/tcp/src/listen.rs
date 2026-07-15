@@ -7,7 +7,6 @@ use hammer_core::data_plane::{
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::{TcpConnectionId, TcpError, TcpPacket, TcpSegmentFlags, TcpSeq};
 use hammer_infra::pool::Index as PoolIndex;
-use hammer_infra::vec::Vec;
 use hammer_runtime::app::SessionSegment;
 use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
 

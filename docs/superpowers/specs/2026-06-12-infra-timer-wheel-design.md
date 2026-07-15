@@ -122,7 +122,7 @@ impl<T, const WHEELS: usize, const SLOTS: usize, const SHIFT: usize>
     pub fn advance_to(
         &mut self,
         now_tick: u64,
-        expired: &mut hammer_infra::vec::Vec<ExpiredTimer<T>>,
+        expired: &mut Vec<ExpiredTimer<T>>,
     );
 }
 ```

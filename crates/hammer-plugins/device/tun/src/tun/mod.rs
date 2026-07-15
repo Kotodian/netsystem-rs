@@ -13,7 +13,6 @@ use hammer_runtime::{
     NodeRuntimeData, PacketTrace, TraceFormatter, add_packet_trace,
 };
 
-use hammer_infra::vec::Vec;
 use hammer_service::device::{
     DeviceInputNext, DeviceInputNode, DeviceMain, DeviceRxQueue, DriverScheduleMode,
 };

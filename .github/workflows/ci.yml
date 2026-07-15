@@ -77,16 +77,36 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: test-${{ matrix.platform }}
-      - name: Build dynamic plugins [${{ matrix.platform }}]
-        run: >-
-          cargo build -p hammer-plugin-tun -p hammer-plugin-ip
-          -p hammer-plugin-tcp -p hammer-plugin-udp
+      - name: Verify allocation contract [${{ matrix.platform }}]
+        run: make verify-allocation-contract
       - name: Run workspace tests [${{ matrix.platform }}]
         run: cargo test --workspace
-      - name: Dynamic plugin loading smoke [${{ matrix.platform }}]
-        run: |
-          cargo test -p hammer-runtime --test plugin_loader
-          cargo test -p hammer-core --test plugin_config
+
+  dataplane-performance:
+    name: dataplane performance [${{ matrix.platform }}]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            runner: ubuntu-24.04
+          - platform: macos
+            runner: macos-15
+    steps:
+      - name: Checkout [${{ matrix.platform }}]
+        uses: actions/checkout@v4
+      - name: Install Rust [${{ matrix.platform }}]
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+      - name: Cache Cargo [${{ matrix.platform }}]
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: dataplane-performance-${{ matrix.platform }}
+      - name: Measure dataplane performance [${{ matrix.platform }}]
+        run: make verify-dataplane-performance
 
   bihash-read-scaling-linux:
     name: bihash read scaling [linux]

@@ -1,7 +1,6 @@
 //! hammerctl — CLI client for hammer daemon
 
 use clap::{Parser, Subcommand};
-use hammer_infra::vec::Vec;
 use hammer_ipc::{IpcResponse, PluginCommandError, PluginCommandReply};
 use tokio::net::TcpStream;
 
@@ -60,8 +59,22 @@ enum PluginCommand {
     },
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
+fn main() {
+    hammer_infra::main_heap::init_default().unwrap_or_else(|error| {
+        eprintln!("Failed to initialize main heap: {error}");
+        std::process::exit(1);
+    });
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .unwrap_or_else(|error| {
+            eprintln!("Failed to initialize Tokio runtime: {error}");
+            std::process::exit(1);
+        });
+    runtime.block_on(run());
+}
+
+async fn run() {
     let cli = Cli::parse();
 
     let mut stream = match TcpStream::connect(&cli.addr).await {
@@ -124,7 +137,7 @@ async fn main() {
             std::process::exit(1);
         });
 
-    let mut buf = hammer_infra::vec![0u8; 65536];
+    let mut buf = vec![0u8; 65536];
     match hammer_ipc::frame::async_read_frame(&mut stream, &mut buf).await {
         Ok(Some(data)) => {
             let response: IpcResponse = match bincode::deserialize(&data) {

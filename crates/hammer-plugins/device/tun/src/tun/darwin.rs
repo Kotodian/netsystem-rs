@@ -4,7 +4,6 @@ use std::mem::{size_of, size_of_val};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_infra::vec::Vec;
 
 const CONTROL_NAME: &[u8] = b"com.apple.net.utun_control";
 const CTLIOCGINFO: libc::c_ulong = 0xc064_4e03;

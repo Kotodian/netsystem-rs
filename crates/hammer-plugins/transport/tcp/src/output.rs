@@ -7,8 +7,6 @@ use hammer_runtime::{
 };
 
 use super::{TcpOutputError, read_tcp_egress_endpoints};
-#[cfg(test)]
-use hammer_infra::vec::Vec;
 use hammer_service::opaque::NetworkOpaque;
 use std::mem::transmute;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};

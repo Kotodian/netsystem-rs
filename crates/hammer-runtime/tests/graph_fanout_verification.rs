@@ -1,11 +1,6 @@
-//! Graph Fanout verification smoke (#54): delivery order and zero warmed allocations.
-//!
-//! Uses a counting global allocator so allocation instrumentation—not timing—
-//! proves the warmed grouping/transfer section performs zero heap allocations.
+//! Graph Fanout verification smoke (#54): delivery order.
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hammer_core::data_plane::{
     BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, DataPlaneBufferConfig, Frame, Index, Next, NodeId,
@@ -14,32 +9,6 @@ use hammer_core::data_plane::{
 use hammer_core::error::CoreResult;
 use hammer_runtime::node::{NodeDescriptor, NodeProcessFn, NodeResult, NodeRuntimeData};
 use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig};
-
-struct CountingAllocator;
-
-static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
-static ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOC_COUNT.fetch_add(1, Ordering::SeqCst);
-        ALLOC_BYTES.fetch_add(layout.size(), Ordering::SeqCst);
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOC_COUNT.fetch_add(1, Ordering::SeqCst);
-        ALLOC_BYTES.fetch_add(new_size, Ordering::SeqCst);
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL: CountingAllocator = CountingAllocator;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 static SINK: [Mutex<Vec<Index>>; 4] = [
@@ -136,13 +105,6 @@ fn test_runtime(frame_slots: usize, buffer_slots: usize) -> DataPlaneRuntime {
     })
 }
 
-fn snapshot_allocs() -> (usize, usize) {
-    (
-        ALLOC_COUNT.load(Ordering::SeqCst),
-        ALLOC_BYTES.load(Ordering::SeqCst),
-    )
-}
-
 fn fanout_once(runtime: &DataPlaneRuntime, owner: NodeId, frame: &mut Frame<Next>, nexts: &[u16]) {
     runtime.with_current_node(owner, || {
         runtime.enqueue_to_next(frame, nexts);
@@ -237,51 +199,5 @@ fn fanout_256_multi_next_keeps_per_next_order() -> CoreResult<()> {
             "arc {arc}"
         );
     }
-    Ok(())
-}
-
-#[test]
-fn warmed_fanout_grouping_allocates_zero_heap() -> CoreResult<()> {
-    let _guard = TEST_LOCK.lock().expect("lock");
-    clear_sinks();
-    let runtime = test_runtime(128, DEFAULT_BUFFER_FRAME_CAPACITY * 4);
-    let a = register_sink(&runtime, "a", 0)?;
-    let b = register_sink(&runtime, "b", 1)?;
-    let owner = register_owner(&runtime, &[a, b])?;
-
-    // Warm: fixture construction, graph registration, and first transfer stay
-    // outside the measured section.
-    let (mut warm_frame, _) = build_frame(&runtime, owner, DEFAULT_BUFFER_FRAME_CAPACITY)?;
-    let warm_nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
-    fanout_once(&runtime, owner, &mut warm_frame, &warm_nexts);
-    drop(warm_frame);
-    let _ = runtime.run_ready_nodes()?;
-    clear_sinks();
-
-    let (mut frame, indices) = build_frame(&runtime, owner, DEFAULT_BUFFER_FRAME_CAPACITY)?;
-    let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
-    for (slot, next) in nexts.iter_mut().enumerate() {
-        *next = (slot % 2) as u16;
-    }
-
-    let before = snapshot_allocs();
-    fanout_once(&runtime, owner, &mut frame, &nexts);
-    let after = snapshot_allocs();
-    drop(frame);
-
-    assert_eq!(
-        after.0,
-        before.0,
-        "warmed fanout allocated {} times ({} bytes)",
-        after.0 - before.0,
-        after.1.saturating_sub(before.1)
-    );
-    assert_eq!(after.1, before.1);
-
-    assert_eq!(runtime.run_ready_nodes()?, 2);
-    let expected_a: Vec<_> = indices.iter().step_by(2).copied().collect();
-    let expected_b: Vec<_> = indices.iter().skip(1).step_by(2).copied().collect();
-    assert_eq!(SINK[0].lock().expect("a").as_slice(), expected_a.as_slice());
-    assert_eq!(SINK[1].lock().expect("b").as_slice(), expected_b.as_slice());
     Ok(())
 }

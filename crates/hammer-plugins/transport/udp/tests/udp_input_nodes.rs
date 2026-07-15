@@ -8,7 +8,6 @@ use hammer_core::data_plane::{
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::ip::{IpProtocol, IpVersion};
 use hammer_core::registry::RuntimeRegistry;
-use hammer_infra::vec::Vec as InfraVec;
 use hammer_plugin_udp::{UdpInputControlPlane, UdpInputError, UdpInputNext, UdpInputTrace};
 use hammer_runtime::graph::install_packet_graph;
 use hammer_runtime::{
@@ -98,8 +97,8 @@ fn capture_states() -> &'static Mutex<Vec<Arc<Mutex<CaptureState>>>> {
 fn chain_bytes(
     runtime: &DataPlaneRuntime,
     index: hammer_core::data_plane::Index,
-) -> CoreResult<InfraVec<u8>> {
-    let mut bytes = InfraVec::new();
+) -> CoreResult<Vec<u8>> {
+    let mut bytes = Vec::new();
     for buffer in runtime.buffers().chain(index) {
         bytes.extend_from_slice(buffer?.current());
     }

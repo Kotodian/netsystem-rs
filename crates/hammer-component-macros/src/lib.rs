@@ -680,30 +680,30 @@ pub fn feature(args: TokenStream, input: TokenStream) -> TokenStream {
     let runs_before_fn = if runs_before.is_empty() {
         quote! {
             #[inline]
-            fn runs_before() -> ::hammer_infra::vec::Vec<#arc> {
-                ::hammer_infra::vec::Vec::new()
+            fn runs_before() -> ::std::vec::Vec<#arc> {
+                ::std::vec::Vec::new()
             }
         }
     } else {
         quote! {
             #[inline]
-            fn runs_before() -> ::hammer_infra::vec::Vec<#arc> {
-                ::hammer_infra::vec![#(#arc::#runs_before),*]
+            fn runs_before() -> ::std::vec::Vec<#arc> {
+                ::std::vec![#(#arc::#runs_before),*]
             }
         }
     };
     let runs_after_fn = if runs_after.is_empty() {
         quote! {
             #[inline]
-            fn runs_after() -> ::hammer_infra::vec::Vec<#arc> {
-                ::hammer_infra::vec::Vec::new()
+            fn runs_after() -> ::std::vec::Vec<#arc> {
+                ::std::vec::Vec::new()
             }
         }
     } else {
         quote! {
             #[inline]
-            fn runs_after() -> ::hammer_infra::vec::Vec<#arc> {
-                ::hammer_infra::vec![#(#arc::#runs_after),*]
+            fn runs_after() -> ::std::vec::Vec<#arc> {
+                ::std::vec![#(#arc::#runs_after),*]
             }
         }
     };

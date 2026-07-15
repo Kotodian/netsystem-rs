@@ -10,7 +10,6 @@ use hammer_runtime::{
 };
 
 use crate::session::SessionQueueError;
-use hammer_infra::vec::Vec;
 
 /// Shared Session Queue IO allowance for normal and custom TX in one dispatch.
 pub const SESSION_QUEUE_IO_BUDGET: usize = 128;

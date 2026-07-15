@@ -1,5 +1,7 @@
 # Hammer L5 App Session Layer 设计
 
+> **容器选择已由 Issue #104 和 ADR 0014 取代。** `FlatHashTable` 与 `hammer_infra::vec::Vec` 已删除；普通存储通过 Main Heap 使用标准集合，worker-local packet/session lookup 使用现有固定 typed storage 或 VPP-style dataplane primitive。
+
 - **日期：** 2026-06-13
 - **状态：** 草案，已按最新讨论收敛到 OSI/L5 session 分层
 - **范围：** 只定义 app-facing session 公共层的边界与首轮拆分目标；不实现 TCP 发送推进，不引入 QUIC 状态机，不改变现有 app ring 行为

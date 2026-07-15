@@ -4,13 +4,12 @@
 //! Control-plane fills happen only from `tcp::init`.
 
 use std::cell::UnsafeCell;
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::protocol::tcp::TcpCapabilities;
-use hammer_infra::map::FlatHashTable;
-use hammer_infra::vec::Vec;
 use hammer_runtime::DataWorkerId;
 
 use super::TcpInputControlPlane;
@@ -32,7 +31,7 @@ struct TcpListenerControlState {
     tcp_control: TcpInputControlPlane,
     tcp_lookup: TcpLookupSnapshot,
     tcp_listeners: Vec<TcpListenerRegistration>,
-    tcp_listener_slots: FlatHashTable<u64, usize>,
+    tcp_listener_slots: HashMap<u64, usize>,
 }
 
 struct TcpListenerControlCell {
@@ -78,7 +77,7 @@ impl TcpListenerControlState {
             tcp_control,
             tcp_lookup: TcpLookupSnapshot::empty(),
             tcp_listeners: Vec::new(),
-            tcp_listener_slots: FlatHashTable::new(),
+            tcp_listener_slots: HashMap::new(),
         }
     }
 
@@ -114,7 +113,8 @@ impl TcpListenerControlState {
     fn close_tcp_listener(&mut self, lookup_id: TcpLookupId) -> HammerResult<()> {
         let slot = self
             .tcp_listener_slots
-            .lookup(&u64::from(lookup_id))
+            .get(&u64::from(lookup_id))
+            .copied()
             .ok_or_else(|| {
                 HammerError::internal(format!(
                     "tcp listener {lookup_id} is not registered in tcp main"
@@ -155,7 +155,7 @@ impl TcpListenerControlState {
     }
 
     fn rebuild_tcp_listener_slots(&mut self) {
-        let mut slots = FlatHashTable::new();
+        let mut slots = HashMap::new();
         for (index, registration) in self.tcp_listeners.iter().cloned().enumerate() {
             slots.insert(u64::from(registration.lookup_id), index);
         }

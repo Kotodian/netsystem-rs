@@ -1,5 +1,4 @@
 use super::{TcpCapabilities, TcpFastOpenCookie, TcpSeq};
-use hammer_infra::vec::Vec;
 
 const TCP_OPTION_EOL: u8 = 0;
 const TCP_OPTION_NOP: u8 = 1;

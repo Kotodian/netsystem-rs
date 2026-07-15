@@ -1,7 +1,5 @@
 use core::fmt;
 
-use crate::vec::Vec;
-
 pub struct FifoQueue<T> {
     front: Vec<T>,
     back: Vec<T>,

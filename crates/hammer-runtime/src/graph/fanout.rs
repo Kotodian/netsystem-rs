@@ -1,13 +1,10 @@
 //! VPP `vlib_buffer_enqueue_to_next` / `enqueue_one`.
 
+use crate::DataPlaneRuntime;
 use hammer_core::data_plane::{
     BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Frame, Index, Next, NodeId, NodeNext,
 };
 use hammer_infra::mask_compare::{mask_compare_u16, mask_compare_u16_words};
-#[cfg(test)]
-use hammer_infra::vec::Vec;
-
-use crate::DataPlaneRuntime;
 
 const MASK_WORDS: usize = mask_compare_u16_words(DEFAULT_BUFFER_FRAME_CAPACITY);
 

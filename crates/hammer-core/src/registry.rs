@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::error::HammerError;
-use hammer_infra::vec::Vec;
 
 /// Typed service registry — Rust counterpart of Go's `service.ContextWith[T]`
 /// / `service.FromContext[T]`. Each manager registers itself by its concrete

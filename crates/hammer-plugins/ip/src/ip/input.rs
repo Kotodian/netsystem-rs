@@ -11,7 +11,6 @@ use hammer_runtime::{
 use crate::ip::{
     IpInputError, IpInputTarget, IpProtocol, IpVersion, network_for_protocol, parse_ip_header,
 };
-use hammer_infra::vec::Vec;
 use hammer_service::data_plane::{
     FeatureArcSpec, FeatureArcStartHandle, set_buffer_node_error_code,
 };

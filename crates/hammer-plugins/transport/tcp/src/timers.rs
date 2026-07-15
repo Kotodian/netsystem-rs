@@ -4,7 +4,6 @@ use hammer_core::error::CoreResult;
 use hammer_infra::fifo_queue::FifoQueue;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
-use hammer_infra::vec::Vec;
 
 use super::TcpNodeError;
 use super::connection::TcpConnection;

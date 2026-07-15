@@ -1,6 +1,7 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use hammer_core::data_plane::{BufferPool, DataPlaneBufferConfig, Index, NodeId};
-use hammer_infra::vec::Vec;
+use hammer_core::data_plane::{
+    BufferPool, DEFAULT_BUFFER_FRAME_CAPACITY, DataPlaneBufferConfig, Index, NodeId,
+};
 use hammer_runtime::{DataPlaneHandoff, DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId};
 
 fn test_runtime(
@@ -37,13 +38,15 @@ fn drop_owned_index(runtime: &DataPlaneRuntime, index: Index) {
 }
 
 fn drop_owned_indices(runtime: &DataPlaneRuntime, indices: Vec<Index>) {
-    let mut frame = runtime
-        .buffers()
-        .get_next_frame(NodeId::new(0))
-        .expect("cleanup frame");
-    frame
-        .push_indices(indices)
-        .expect("cleanup push batch indices");
+    for chunk in indices.chunks(DEFAULT_BUFFER_FRAME_CAPACITY) {
+        let mut frame = runtime
+            .buffers()
+            .get_next_frame(NodeId::new(0))
+            .expect("cleanup frame");
+        frame
+            .push_indices(chunk.iter().copied())
+            .expect("cleanup push batch indices");
+    }
 }
 
 /// Allocate and free a single empty buffer, one pair per iteration. This is

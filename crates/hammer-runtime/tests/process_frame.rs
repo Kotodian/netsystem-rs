@@ -2,7 +2,6 @@ use hammer_core::data_plane::{
     BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, DataPlaneBufferConfig, Index, NodeKind, NodeNext,
     NodeRegistration,
 };
-use hammer_infra::vec::Vec;
 use hammer_runtime::{
     DataPlaneRuntime, DataPlaneRuntimeConfig, NodeDescriptor, NodeProcessFn, NodeResult,
     NodeRuntimeData, process_frame,

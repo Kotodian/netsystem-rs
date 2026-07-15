@@ -166,7 +166,7 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
 
     /// Remove all entries from the table.
     pub fn clear(&self) {
-        let mut retired = crate::vec::Vec::new();
+        let mut retired = std::vec::Vec::new();
         for idx in 0..self.nbuckets() as usize {
             let bucket = self.lock_bucket(idx);
             if !bucket.is_empty() {
@@ -247,6 +247,7 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
     }
 }
 
+#[inline(always)]
 fn scan_pages<K: BihashKey + Default, const KVP: usize>(
     pages: &[ValuePage<K, KVP>],
     log2_pages: u8,

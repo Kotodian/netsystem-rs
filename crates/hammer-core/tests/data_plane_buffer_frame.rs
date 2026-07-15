@@ -13,7 +13,6 @@ use hammer_core::data_plane::{
     PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES, Pending, PrimaryOpaque, SecondaryOpaque,
     buffer_data_offset,
 };
-use hammer_infra::vec::Vec;
 
 fn test_buffers(buffer_slot_capacity: usize, buffer_slots: usize) -> DataPlaneBuffers {
     DataPlaneBuffers::new(DataPlaneBufferConfig {

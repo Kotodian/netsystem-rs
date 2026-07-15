@@ -3,7 +3,6 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_infra::vec::Vec;
 
 const TUN_DEVICE: &[u8] = b"/dev/net/tun\0";
 
