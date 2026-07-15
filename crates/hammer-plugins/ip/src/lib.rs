@@ -8,16 +8,16 @@ mod lookup;
 pub use ip::{
     IcmpEchoRequestNext, IcmpEchoRequestNode, IcmpEchoRequestTrace, IcmpErrorNext, IcmpErrorNode,
     IcmpErrorSourceTable, IcmpErrorSourceTableHandle, IcmpErrorTrace, IcmpInputControlPlane,
-    IcmpInputError, IcmpInputNode, IcmpInputTrace, IcmpNodeError, IcmpPathMtuNode, IpInputNext,
-    IpInputNode, IpInputTrace, IpLocalArc, IpLocalControlPlane, IpLocalError, IpLocalNext,
-    IpLocalNode, IpLocalSourceCheck, IpLocalTrace, IpLocalTraceStage, IpReassemblyDirectory,
-    IpReassemblyHandoff, IpReassemblyNext, IpReassemblyNode, IpReassemblyTrace,
-    IpReassemblyTraceAction, IpReceiveNode, IpUnicastArc, pack_fragment_owner_value,
-    unpack_fragment_owner_value,
+    IcmpInputError, IcmpInputNext, IcmpInputNode, IcmpInputTrace, IcmpNodeError, IcmpPathMtuNode,
+    IpInputNext, IpInputNode, IpInputTrace, IpLocalArc, IpLocalControlPlane, IpLocalError,
+    IpLocalNext, IpLocalNode, IpLocalSourceCheck, IpLocalTrace, IpLocalTraceStage,
+    IpReassemblyDirectory, IpReassemblyHandoff, IpReassemblyNext, IpReassemblyNode,
+    IpReassemblyTrace, IpReassemblyTraceAction, IpReceiveNode, IpUnicastArc,
+    pack_fragment_owner_value, unpack_fragment_owner_value,
 };
 pub use lookup::{
     AdjacencyRewriteNode, AdjacencyRewriteNodeError, AdjacencyRewriteTrace, IpLookupControlPlane,
-    IpLookupNode, IpLookupTrace,
+    IpLookupNext, IpLookupNode, IpLookupTrace,
 };
 pub fn reset_ip_main_for_test() {
     lookup::reset_for_test();

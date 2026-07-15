@@ -6,7 +6,7 @@ use hammer_core::config::Config;
 use hammer_core::data_plane::{BufferFrame, NodeRegistration};
 use hammer_core::forwarding::{DpoType, FibTableBuilder};
 use hammer_plugin_ip::{
-    AdjacencyRewriteNode, IpLocalControlPlane, IpLocalNext, IpLookupControlPlane,
+    AdjacencyRewriteNode, IpLocalControlPlane, IpLocalNext, IpLookupControlPlane, IpLookupNext,
 };
 use hammer_runtime::{
     DataPlaneRuntime, InternalNode, Node, NodeResult, TraceControlPlane, TraceInputPolicy,
@@ -202,7 +202,9 @@ fn interface_address_publish_installs_receive_route_in_fib() {
     let receive = runtime
         .nodes()
         .register_internal(local_control.receive_node());
-    let lookup = runtime.nodes().register_internal(lookup_control.node());
+    let lookup = runtime
+        .nodes()
+        .register_internal(lookup_control.node(IpLookupNext::nodes(drop)));
     let drop_slot = runtime
         .nodes()
         .add_node_next_slot(lookup, drop)

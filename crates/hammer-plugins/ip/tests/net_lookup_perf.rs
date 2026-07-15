@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 use hammer_core::data_plane::{BufferFrame, DataPlaneBufferConfig, SecondaryOpaque};
 use hammer_core::error::CoreResult;
 use hammer_core::forwarding::{DpoProto, FibTableBuilder};
-use hammer_plugin_ip::{IpInputNext, IpInputNode, IpLookupControlPlane, IpUnicastArc};
+use hammer_plugin_ip::{
+    IpInputNext, IpInputNode, IpLookupControlPlane, IpLookupNext, IpUnicastArc,
+};
 use hammer_runtime::{
     DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node,
     NodeProcessFn, NodeResult, NodeRuntimeData,
@@ -362,7 +364,9 @@ fn build_lookup(
 ) -> hammer_core::data_plane::NodeId {
     let drop = runtime.nodes().register_internal(DropNode::new());
     let control = IpLookupControlPlane::new(FibTableBuilder::new(u16::MAX).build());
-    let lookup = runtime.nodes().register_internal(control.node());
+    let lookup = runtime
+        .nodes()
+        .register_internal(control.node(IpLookupNext::nodes(drop)));
     let drop_slot = runtime
         .nodes()
         .add_node_next_slot(lookup, drop)

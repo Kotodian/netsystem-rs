@@ -3,8 +3,8 @@ use std::sync::Arc;
 use hammer_core::config::Config;
 use hammer_core::registry::RuntimeRegistry;
 use hammer_plugin_ip::{
-    IcmpEchoRequestNext, IcmpErrorNext, IpInputNext, IpLocalNext, IpReassemblyNext,
-    reset_ip_main_for_test,
+    IcmpEchoRequestNext, IcmpErrorNext, IcmpInputNext, IpInputNext, IpLocalNext, IpLookupNext,
+    IpReassemblyNext, reset_ip_main_for_test,
 };
 use hammer_runtime::init::run_init_functions;
 use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, Engine};
@@ -84,5 +84,9 @@ fn ip_plugin_installs_its_vpp_style_packet_graph() {
             .unwrap(),
         input
     );
-    assert_eq!(nodes.node_next_slot(icmp_input, 0).unwrap(), drop);
+    assert_eq!(
+        nodes.node_next(icmp_input, IcmpInputNext::Drop).unwrap(),
+        drop
+    );
+    assert_eq!(nodes.node_next(lookup, IpLookupNext::Drop).unwrap(), drop);
 }

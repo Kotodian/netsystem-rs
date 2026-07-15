@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use arc_swap::ArcSwapOption;
 use hammer_core::config::{Config, Route, RouteAction};
 use hammer_core::data_plane::{
-    BufferFrame, BufferPacketCursor, Index, NodeId, NodeRegistration, SecondaryOpaque,
+    BufferFrame, BufferPacketCursor, Index, NodeId, NodeNext, NodeRegistration, SecondaryOpaque,
 };
 use hammer_core::error::{CoreError, CoreResult, HammerResult};
 use hammer_core::forwarding::{
@@ -173,8 +173,8 @@ impl IpLookupControlPlane {
     }
 
     #[inline]
-    pub fn node(&self) -> IpLookupNode {
-        IpLookupNode::new(self.table_handle())
+    pub fn node(&self, next: [NodeId; IpLookupNext::COUNT]) -> IpLookupNode {
+        IpLookupNode::new(self.table_handle(), next)
     }
 
     #[inline]
@@ -201,38 +201,28 @@ impl IpLookupControlPlane {
     }
 }
 
+#[hammer_component_macros::node_next]
+pub enum IpLookupNext {
+    #[next("drop")]
+    Drop,
+}
+
 /// IP-lookup subsystem control-plane main (VPP `ip_main_t`).
 ///
-/// Owns the static routes read from config. The FIB table is built in two
-/// phases so that graph registration is order-independent:
-///   1. `register_node` runs inside `DataPlaneRuntime::init_graph` as the
-///      `ip-lookup` init fn. Registration image order is
-///      non-deterministic per build, so the `drop` node may not be registered
-///      yet at this point. The node is therefore registered with a placeholder
-///      table whose `drop` next-node id is [`DROP_PLACEHOLDER`].
-///   2. `wire_drop` runs after `init_graph` has registered every node, resolves
-///      `drop` by name, rebuilds the real FIB table, and swaps it into every
-///      per-worker `IpLookupNode` handle via `FibTableHandle::replace_after_barrier`.
-/// No packet flows between the two phases (graph setup completes before the
-/// data plane starts), so the placeholder never reaches the hot path.
+/// Owns the static routes read from config. FIB DPOs store `ip-lookup` local
+/// next slots; Graph Runtime resolves the declared next names after every node
+/// is registered.
 pub struct IpMain {
     routes: Arc<[Route]>,
 }
-
-/// Sentinel `drop` next-node id used by [`IpMain::register_node`] when the real
-/// `drop` node is not registered yet. Replaced by [`IpMain::wire_drop`] before
-/// any packet is processed.
-/// Sentinel drop local-next used by [`IpMain::register_node`] before
-/// [`IpMain::wire_drop`] installs the real slot.
-const DROP_PLACEHOLDER: u16 = u16::MAX;
 
 impl IpMain {
     pub fn new(routes: Arc<[Route]>) -> Self {
         Self { routes }
     }
 
-    fn build_table(&self, drop: u16) -> CoreResult<FibTable<u16>> {
-        let mut builder = FibTableBuilder::<u16>::new(drop);
+    fn build_table(&self) -> CoreResult<FibTable<u16>> {
+        let mut builder = FibTableBuilder::<u16>::new(NodeNext::slot(IpLookupNext::Drop));
         for route in self.routes.iter() {
             if let RouteAction::Drop = route
                 .action()
@@ -244,36 +234,11 @@ impl IpMain {
         Ok(builder.build())
     }
 
-    /// Build and register this worker's `IpLookupNode` with a placeholder
-    /// FIB table. The real table is installed by [`wire_drop`] after every
-    /// graph node has registered. `IpLookupNode` is not congestion-typed, so
-    /// this is plain (no `with_congestion!`).
     pub fn register_node(&self, rt: &DataPlaneRuntime) -> CoreResult<NodeId> {
-        let placeholder = self.build_table(DROP_PLACEHOLDER)?;
-        let node = IpLookupControlPlane::new(placeholder).node();
-        rt.nodes().try_register_internal(node)
-    }
-
-    /// Resolve the `drop` node by name, register it as a lookup local next,
-    /// and install the real FIB table on every per-worker `IpLookupNode`.
-    pub fn wire_drop(&self, rt: &DataPlaneRuntime) -> CoreResult<()> {
-        let drop = rt
-            .nodes()
-            .node_by_name("drop")
-            .ok_or_else(|| CoreError::internal("drop node not registered"))?;
-        let lookup = rt
-            .nodes()
-            .node_by_name(IpLookupNode::NODE_NAME)
-            .ok_or_else(|| CoreError::internal("ip-lookup node not registered"))?;
-        let drop_slot = rt.nodes().add_node_next_slot(lookup, drop)?;
-        let table = self.build_table(drop_slot)?;
-        let runtimes = lookup_runtimes()
-            .lock()
-            .map_err(|_| CoreError::internal("IP lookup runtime registry poisoned"))?;
-        for runtime in runtimes.iter() {
-            runtime.table.replace_after_barrier(table.clone());
-        }
-        Ok(())
+        let table = self.build_table()?;
+        let node = IpLookupControlPlane::new(table).node(IpLookupNext::nodes(NodeId::new(0)));
+        rt.nodes()
+            .try_register_internal_with_next_names(node, &IpLookupNext::NEXT_NAMES)
     }
 }
 
@@ -301,15 +266,6 @@ fn init_ip(engine: &mut hammer_runtime::Engine) -> HammerResult<()> {
     init(&engine.registry)
 }
 
-#[hammer_component_macros::init_function(
-    name = "wire_ip_lookup",
-    runs_after = ["install_packet_graph", "ip_init"]
-)]
-fn wire_ip_lookup(engine: &mut hammer_runtime::Engine) -> HammerResult<()> {
-    wire_ip_lookup_drop(&engine.runtime)?;
-    Ok(())
-}
-
 pub fn register_ip_lookup(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
     IP_MAIN
         .load()
@@ -318,20 +274,10 @@ pub fn register_ip_lookup(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<No
         .register_node(runtime)
 }
 
-/// Resolve the `drop` next-node and install the real FIB table on every
-/// per-worker `IpLookupNode`. Call after `DataPlaneRuntime::init_graph` has
-/// registered all graph nodes for this worker.
-pub fn wire_ip_lookup_drop(runtime: &DataPlaneRuntime) -> CoreResult<()> {
-    IP_MAIN
-        .load()
-        .as_deref()
-        .ok_or_else(|| CoreError::internal("ip main not initialized"))?
-        .wire_drop(runtime)
-}
-
 #[hammer_component_macros::graph_node(
     graph = service,
     init = crate::lookup::register_ip_lookup,
+    next = IpLookupNext,
 )]
 pub struct IpLookupNode {
     #[node(default = register_ip_lookup_runtime(table.clone()))]
@@ -451,7 +397,12 @@ impl InternalNode for IpLookupNode {
     where
         Self: Sized,
     {
-        NodeRegistration::next(Self::NODE_NAME, 0)
+        NodeRegistration::next(Self::NODE_NAME, IpLookupNext::COUNT)
+    }
+
+    #[inline]
+    fn node_initial_nexts(&self) -> &[NodeId] {
+        &self.next
     }
 }
 

@@ -11,7 +11,7 @@ use hammer_core::protocol::icmp::IcmpErrorMetadata;
 use hammer_infra::vec::Vec as InfraVec;
 use hammer_plugin_ip::{
     AdjacencyRewriteNode, AdjacencyRewriteTrace, IpInputNext, IpInputNode, IpLocalControlPlane,
-    IpLocalNext, IpLookupControlPlane, IpLookupTrace, IpUnicastArc,
+    IpLocalNext, IpLookupControlPlane, IpLookupNext, IpLookupTrace, IpUnicastArc,
 };
 use hammer_runtime::{
     DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
@@ -216,7 +216,7 @@ fn ip_lookup_node_uses_ipv4_mtrie_longest_prefix_match() {
     let drop = runtime.nodes().register_internal(DropNode::new());
 
     let (control, lookup) = placeholder_lookup(&runtime);
-    assert_internal_node(&control.node());
+    assert_internal_node(&control.node(IpLookupNext::nodes(drop)));
     let drop_slot = next_slot(&runtime, lookup, drop);
     let default_slot = next_slot(&runtime, lookup, default);
     let specific_slot = next_slot(&runtime, lookup, specific);
@@ -1228,8 +1228,11 @@ fn next_slot(
 fn placeholder_lookup(
     runtime: &DataPlaneRuntime,
 ) -> (IpLookupControlPlane, hammer_core::data_plane::NodeId) {
+    let drop = runtime.node_by_name("drop").expect("drop node");
     let control = IpLookupControlPlane::new(FibTableBuilder::new(u16::MAX).build());
-    let lookup = runtime.nodes().register_internal(control.node());
+    let lookup = runtime
+        .nodes()
+        .register_internal(control.node(IpLookupNext::nodes(drop)));
     (control, lookup)
 }
 
