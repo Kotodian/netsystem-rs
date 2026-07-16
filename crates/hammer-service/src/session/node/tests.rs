@@ -1,22 +1,20 @@
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use hammer_core::data_plane::{BufferFrame, NodeRegistration, NodeState};
+use hammer_core::data_plane::{BufferFrame, NodeRegistration};
 use hammer_core::error::CoreResult;
-use hammer_core::registry::RuntimeRegistry;
 use hammer_infra::pool::Index;
 use hammer_infra::segment::Local;
 use hammer_runtime::{
-    DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, Engine, InternalNode, Node,
-    NodeProcessFn, NodeResult, NodeRuntimeData,
+    DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, InternalNode, Node, NodeProcessFn,
+    NodeResult, NodeRuntimeData,
 };
 
-use super::{SessionQueueNext, SessionQueueNode, register_session_queue};
+use super::{SessionQueueNext, SessionQueueNode};
 use crate::session::runtime::{
-    SessionDriverRuntime, SessionPacketizedTransport, SessionPacketizedTx, SessionTransport,
-    SessionTransportId, SessionWorker, TransportInternalTransport, TransportInternalTx,
-    TransportSendFlags, TransportSendParams, TxBatchBuffer,
-    dispatch_registered_session_queue_once_at, dispatch_session_queue_once,
+    SessionPacketizedTransport, SessionPacketizedTx, SessionTransport, SessionTransportId,
+    SessionWorker, TransportInternalTransport, TransportInternalTx, TransportSendFlags,
+    TransportSendParams, TxBatchBuffer, dispatch_session_queue_once,
 };
 use hammer_runtime::app::{AppSession, AppSessionConfig, SessionHandle};
 use hammer_runtime::app::{SessionEvt, SessionEvtType};
@@ -60,9 +58,6 @@ struct RecordingState {
 
 #[derive(Clone)]
 struct TcpRecordingTransport(RecordingState);
-
-#[derive(Clone)]
-struct QuicRecordingTransport(RecordingState);
 
 impl SessionTransport<Index, Local> for TcpRecordingTransport {
     type Tx = TransportInternalTx;
@@ -114,137 +109,37 @@ impl TransportInternalTransport<Index, Local> for TcpRecordingTransport {
     }
 }
 
-impl SessionTransport<Index, Local> for QuicRecordingTransport {
-    type Tx = TransportInternalTx;
-
-    const ID: SessionTransportId = SessionTransportId::new(2);
-
-    fn update_time(
-        &mut self,
-        _: &mut SessionWorker<Index, Local>,
-        _: &DataPlaneRuntime,
-        _: SessionQueueNext,
-        _: &mut BufferFrame,
-        _: &mut super::SessionQueueOutput,
-        now: Instant,
-    ) -> CoreResult<()> {
-        self.0.events.lock().expect("events").push("quic_time");
-        self.0.sampled_times.lock().expect("times").push(now);
-        Ok(())
-    }
-
-    fn disconnect(
-        &mut self,
-        _: &mut SessionWorker<Index, Local>,
-        _: Index,
-        _: &DataPlaneRuntime,
-        _: SessionQueueNext,
-        _: &mut BufferFrame,
-        _: &mut super::SessionQueueOutput,
-        _: Instant,
-    ) -> CoreResult<()> {
-        self.0.events.lock().expect("events").push("control");
-        Ok(())
-    }
-}
-
-impl TransportInternalTransport<Index, Local> for QuicRecordingTransport {
-    fn internal_tx(
-        &mut self,
-        _: &mut SessionWorker<Index, Local>,
-        _: Index,
-        _: &DataPlaneRuntime,
-        _: SessionQueueNext,
-        _: &mut BufferFrame,
-        _: &mut super::SessionQueueOutput,
-        _: Instant,
-    ) -> CoreResult<()> {
-        self.0.events.lock().expect("events").push("io");
-        Ok(())
-    }
-}
-
 #[test]
-fn session_queue_updates_all_static_transports_before_control_and_io() {
-    let main = Engine::new(
-        DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()),
-        RuntimeRegistry::new(),
-    );
-    let mut engine = main.spawn(1).expect("spawn data worker");
-    let worker = engine.data_worker_id().expect("data worker id");
+fn session_queue_updates_transport_before_control_and_io() {
+    let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
+    let worker = DataWorkerId::new(0);
     let events = Arc::new(Mutex::new(Vec::new()));
     let sampled_times = Arc::new(Mutex::new(Vec::new()));
-    let quic_id = QuicRecordingTransport::ID;
-    let transports = (
-        TcpRecordingTransport(RecordingState {
-            events: Arc::clone(&events),
-            sampled_times: Arc::clone(&sampled_times),
-        }),
-        (
-            QuicRecordingTransport(RecordingState {
-                events: Arc::clone(&events),
-                sampled_times: Arc::clone(&sampled_times),
-            }),
-            (),
-        ),
-    );
-    let mut driver = SessionDriverRuntime::<_, Local, Index>::new(
-        worker,
-        engine.runtime.buffers().clone(),
-        transports,
-    );
-    let session_id = driver.insert_session(quic_id, Index::new(9, 3));
-    driver.schedule_disconnect_for_test(session_id);
-    driver.schedule_session_work_for_test(session_id);
+    let mut sessions = SessionWorker::<Index, Local>::new(worker, runtime.buffers().clone());
+    let mut transport = TcpRecordingTransport(RecordingState {
+        events: Arc::clone(&events),
+        sampled_times: Arc::clone(&sampled_times),
+    });
+    let session_id = sessions.insert_session_for_test(TcpRecordingTransport::ID, Index::new(9, 3));
+    sessions.schedule_disconnect(session_id);
+    sessions.mark_ready(session_id);
+    let sink = runtime.nodes().register_internal(BlackholeNode);
+    let (owner, next) = test_session_queue_next(&runtime, sink);
 
-    let node = SessionQueueNode::new().expect("session queue node");
-    let node_data = node.runtime_data;
-    let node_id = engine
-        .runtime
-        .nodes()
-        .try_register_driver(node)
-        .expect("register session queue node");
-    let sink = engine.runtime.nodes().register_internal(BlackholeNode);
-    let handle =
-        register_session_queue(&mut engine, node_id, node_data, driver).expect("register queue");
-    SessionQueueNode::attach_queue_by_runtime_data(
-        &engine.runtime,
-        node_id,
-        node_data,
-        handle,
-        sink,
-        dispatch_registered_session_queue_once_at::<
-            (TcpRecordingTransport, (QuicRecordingTransport, ())),
-            Local,
-            Index,
-        >,
-    )
-    .expect("attach queue");
-    engine
-        .runtime
-        .nodes()
-        .set_node_state(node_id, NodeState::Polling)
-        .expect("poll session queue");
+    let step = dispatch_session_queue_once(&runtime, owner, &mut sessions, &mut transport, next)
+        .expect("dispatch queue");
 
-    assert_eq!(
-        engine
-            .runtime
-            .schedule_polling_driver_nodes()
-            .expect("schedule session queue"),
-        1
-    );
-    assert_eq!(engine.runtime.run_ready_nodes().expect("dispatch queue"), 1);
+    assert_eq!(step.scheduled_sessions, 1);
     assert_eq!(
         *events.lock().expect("events"),
-        vec!["tcp_time", "quic_time", "control", "io"]
+        vec!["tcp_time", "control", "io"]
     );
     let times = sampled_times.lock().expect("times");
-    assert_eq!(times.len(), 2);
-    assert_eq!(times[0], times[1]);
+    assert_eq!(times.len(), 1);
 }
 
-fn attach_local_app_session<T>(
-    driver: &mut SessionDriverRuntime<T, Local, Index>,
+fn attach_local_app_session(
+    sessions: &mut SessionWorker<Index, Local>,
     session_id: crate::session::SessionId,
 ) -> Arc<AppSession<Local>> {
     let app_session = Arc::new(
@@ -252,11 +147,11 @@ fn attach_local_app_session<T>(
             Local::default(),
             AppSessionConfig::new(256, 16),
             SessionHandle::new(session_id.pool_index().slot(), 0),
-            driver.app().tx_evt_q().clone(),
+            sessions.app().tx_evt_q().clone(),
         )
         .expect("app session"),
     );
-    driver
+    sessions
         .app_mut()
         .attach_session(session_id, Arc::clone(&app_session));
     app_session
@@ -413,22 +308,17 @@ fn quic_shaped_internal_tx_can_fan_close_out_to_stream_sessions() {
         .nodes()
         .register_internal(PayloadCaptureNode::new(Arc::clone(&captured_payloads)));
     let transport_index = Index::new(12, 4);
-    let mut driver = SessionDriverRuntime::new(
-        DataWorkerId::new(0),
-        runtime.buffers().clone(),
-        (
-            QuicShapedTransport {
-                streams: Arc::clone(&streams),
-                observed_fifo_lengths: Arc::clone(&observed_fifo_lengths),
-            },
-            (),
-        ),
-    );
-    let first = driver.insert_session(QuicShapedTransport::ID, transport_index);
-    let second = driver.insert_session(QuicShapedTransport::ID, transport_index);
+    let mut sessions =
+        SessionWorker::<Index, Local>::new(DataWorkerId::new(0), runtime.buffers().clone());
+    let mut transport = QuicShapedTransport {
+        streams: Arc::clone(&streams),
+        observed_fifo_lengths: Arc::clone(&observed_fifo_lengths),
+    };
+    let first = sessions.insert_session_for_test(QuicShapedTransport::ID, transport_index);
+    let second = sessions.insert_session_for_test(QuicShapedTransport::ID, transport_index);
     *streams.lock().expect("streams") = vec![first, second];
-    let first_app = attach_local_app_session(&mut driver, first);
-    let second_app = attach_local_app_session(&mut driver, second);
+    let first_app = attach_local_app_session(&mut sessions, first);
+    let second_app = attach_local_app_session(&mut sessions, second);
     first_app.send_bytes(b"one").expect("first stream send");
     assert_eq!(second_app.tx_fifo().enqueue(b"four"), 4);
 
@@ -444,7 +334,8 @@ fn quic_shaped_internal_tx_can_fan_close_out_to_stream_sessions() {
             .expect("next");
         (owner, SessionQueueNext::from_slot(slot))
     };
-    dispatch_session_queue_once(&runtime, owner, &mut driver, next).expect("internal tx");
+    dispatch_session_queue_once(&runtime, owner, &mut sessions, &mut transport, next)
+        .expect("internal tx");
     let _ = runtime.run_ready_nodes().expect("capture internal TX");
 
     assert_eq!(
@@ -531,9 +422,7 @@ impl SessionPacketizedTransport<Index, Local> for FailingPacketizedTransport {
         _: &[TxBatchBuffer],
         _: Instant,
     ) -> CoreResult<()> {
-        Err(hammer_core::error::CoreError::internal(
-            "test tx action failure",
-        ))
+        Err(hammer_core::protocol::tcp::TcpError::Dispatch.into())
     }
 }
 
@@ -705,13 +594,12 @@ fn session_tx_dispatch_commits_batch_before_graph_visibility() {
         tx_action_calls: 0,
         batches: Vec::new(),
     };
-    let mut driver = SessionDriverRuntime::new(
-        DataWorkerId::new(0),
-        runtime.buffers().clone(),
-        (transport, ()),
-    );
-    let session_id = driver.insert_session(RecordingPacketizedTransport::ID, Index::new(5, 1));
-    let app = attach_local_app_session(&mut driver, session_id);
+    let mut sessions =
+        SessionWorker::<Index, Local>::new(DataWorkerId::new(0), runtime.buffers().clone());
+    let mut transport = transport;
+    let session_id =
+        sessions.insert_session_for_test(RecordingPacketizedTransport::ID, Index::new(5, 1));
+    let app = attach_local_app_session(&mut sessions, session_id);
     app.send_bytes(&[0xab; 16]).expect("send bytes");
     let output_node = runtime
         .nodes()
@@ -727,11 +615,10 @@ fn session_tx_dispatch_commits_batch_before_graph_visibility() {
             .add_node_next_slot(owner, output_node)
             .expect("next"),
     );
-    dispatch_session_queue_once(&runtime, owner, &mut driver, next)
+    dispatch_session_queue_once(&runtime, owner, &mut sessions, &mut transport, next)
         .expect("dispatch session queue");
     let _ = runtime.run_ready_nodes().expect("run capture node");
 
-    let transport = &driver.transports().0;
     assert_eq!(transport.send_params_calls, 1);
     assert_eq!(transport.tx_action_calls, 1);
     assert_eq!(
@@ -760,29 +647,27 @@ fn session_tx_deschedules_without_tx_action_when_send_space_is_zero() {
         tx_action_calls: 0,
         batches: Vec::new(),
     };
-    let mut driver = SessionDriverRuntime::new(
-        DataWorkerId::new(0),
-        runtime.buffers().clone(),
-        (transport, ()),
-    );
-    let session_id = driver.insert_session(RecordingPacketizedTransport::ID, Index::new(6, 1));
-    let app = attach_local_app_session(&mut driver, session_id);
+    let mut sessions =
+        SessionWorker::<Index, Local>::new(DataWorkerId::new(0), runtime.buffers().clone());
+    let mut transport = transport;
+    let session_id =
+        sessions.insert_session_for_test(RecordingPacketizedTransport::ID, Index::new(6, 1));
+    let app = attach_local_app_session(&mut sessions, session_id);
     app.send_bytes(&[0xab; 8]).expect("send bytes");
     let sink = runtime.nodes().register_internal(BlackholeNode);
     let (owner, next) = test_session_queue_next(&runtime, sink);
 
-    let first =
-        dispatch_session_queue_once(&runtime, owner, &mut driver, next).expect("first dispatch");
-    let second =
-        dispatch_session_queue_once(&runtime, owner, &mut driver, next).expect("second dispatch");
+    let first = dispatch_session_queue_once(&runtime, owner, &mut sessions, &mut transport, next)
+        .expect("first dispatch");
+    let second = dispatch_session_queue_once(&runtime, owner, &mut sessions, &mut transport, next)
+        .expect("second dispatch");
 
-    let transport = &driver.transports().0;
     assert_eq!(first.scheduled_sessions, 1);
     assert_eq!(second.scheduled_sessions, 0);
     assert_eq!(transport.send_params_calls, 1);
     assert_eq!(transport.tx_action_calls, 0);
     assert_eq!(
-        driver
+        sessions
             .app()
             .pending_send_len(session_id)
             .expect("pending length"),
@@ -793,24 +678,26 @@ fn session_tx_deschedules_without_tx_action_when_send_space_is_zero() {
 #[test]
 fn failed_session_packetized_tx_action_keeps_fifo_and_graph_unchanged() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let mut driver = SessionDriverRuntime::new(
-        DataWorkerId::new(0),
-        runtime.buffers().clone(),
-        (FailingPacketizedTransport, ()),
-    );
-    let session_id = driver.insert_session(FailingPacketizedTransport::ID, Index::new(2, 1));
-    let app = attach_local_app_session(&mut driver, session_id);
+    let mut sessions =
+        SessionWorker::<Index, Local>::new(DataWorkerId::new(0), runtime.buffers().clone());
+    let mut transport = FailingPacketizedTransport;
+    let session_id =
+        sessions.insert_session_for_test(FailingPacketizedTransport::ID, Index::new(2, 1));
+    let app = attach_local_app_session(&mut sessions, session_id);
     app.send_bytes(b"stay").expect("send bytes");
-    driver.schedule_session_work_for_test(session_id);
+    sessions.mark_ready(session_id);
     let sink = runtime.nodes().register_internal(BlackholeNode);
     let (owner, next) = test_session_queue_next(&runtime, sink);
 
-    let error = dispatch_session_queue_once(&runtime, owner, &mut driver, next)
+    let error = dispatch_session_queue_once(&runtime, owner, &mut sessions, &mut transport, next)
         .expect_err("tx action must fail");
 
-    assert_eq!(error.to_string(), "test tx action failure");
+    assert!(matches!(
+        error,
+        hammer_core::error::CoreError::Tcp(hammer_core::protocol::tcp::TcpError::Dispatch)
+    ));
     assert_eq!(
-        driver
+        sessions
             .app()
             .pending_send_len(session_id)
             .expect("pending length"),
@@ -823,16 +710,13 @@ fn failed_session_packetized_tx_action_keeps_fifo_and_graph_unchanged() {
 fn transport_deleted_then_queued_app_close_releases_the_session_slot() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let transport_index = Index::new(3, 9);
-    let mut driver = SessionDriverRuntime::new(
-        DataWorkerId::new(0),
-        runtime.buffers().clone(),
-        (FailingPacketizedTransport, ()),
-    );
-    let session_id = driver.insert_session(FailingPacketizedTransport::ID, transport_index);
-    let app = attach_local_app_session(&mut driver, session_id);
-    driver
-        .sessions_mut()
-        .notify_transport_deleted(session_id, transport_index);
+    let mut sessions =
+        SessionWorker::<Index, Local>::new(DataWorkerId::new(0), runtime.buffers().clone());
+    let mut transport = FailingPacketizedTransport;
+    let session_id =
+        sessions.insert_session_for_test(FailingPacketizedTransport::ID, transport_index);
+    let app = attach_local_app_session(&mut sessions, session_id);
+    sessions.notify_transport_deleted(session_id, transport_index);
     app.tx_evt_q()
         .enqueue_ctrl(SessionEvt::ctrl(
             session_id.pool_index().slot(),
@@ -843,10 +727,12 @@ fn transport_deleted_then_queued_app_close_releases_the_session_slot() {
     let sink = runtime.nodes().register_internal(BlackholeNode);
     let (owner, next) = test_session_queue_next(&runtime, sink);
 
-    dispatch_session_queue_once(&runtime, owner, &mut driver, next).expect("dispatch app close");
+    dispatch_session_queue_once(&runtime, owner, &mut sessions, &mut transport, next)
+        .expect("dispatch app close");
 
-    assert!(!driver.sessions().has_session(session_id));
-    let replacement = driver.insert_session(FailingPacketizedTransport::ID, Index::new(4, 10));
+    assert!(!sessions.has_session(session_id));
+    let replacement =
+        sessions.insert_session_for_test(FailingPacketizedTransport::ID, Index::new(4, 10));
     assert_eq!(
         replacement.pool_index().slot(),
         session_id.pool_index().slot()

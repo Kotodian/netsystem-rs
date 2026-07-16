@@ -1,22 +1,22 @@
 use std::num::NonZeroU32;
+use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crossbeam_utils::CachePadded;
 use hammer_core::data_plane::{BufferFrame, DataPlaneBuffers, Frame, Index, Next};
-use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::error::{AttachError, CoreError, CoreResult};
 use hammer_infra::fifo_queue::FifoQueue;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::segment::{Local, Segment, Svm};
 use hammer_runtime::app::{
-    AppContext, AppSessionConfig, SessionEvtType, SessionHandle, SessionMsgQueue, SessionSegment,
-    with_current_app_worker,
+    AppContext, AppSessionConfig, SessionEventQueue, SessionEvtType, SessionHandle,
+    SessionMsgQueue, SessionSegment, with_current_app_worker,
 };
-use hammer_runtime::{DataPlaneRuntime, DataWorkerId, NodeRuntimeData};
+use hammer_runtime::{DataPlaneRuntime, DataWorkerId, Engine, File, FileFunctions};
 
 use crate::session::app::SessionAppRuntimeCreate;
 use crate::session::state::SessionState;
-use crate::session::{SessionAppRuntime, SessionId, SessionQueueHandle, SessionQueueNext};
+use crate::session::{SessionAppRuntime, SessionId, SessionQueueNext};
 
 const DEFAULT_SESSION_POOL_CAPACITY: usize = 1024;
 const DEFAULT_SESSION_TX_EVENT_CAPACITY: usize = 2048;
@@ -113,6 +113,7 @@ pub struct SessionWorker<Index, Seg: SessionSegment = Local> {
     session_work: Vec<SessionId>,
     session_work_scratch: Vec<SessionId>,
     control_events: FifoQueue<SessionControlEvent>,
+    readiness_file: Option<PoolIndex>,
 }
 
 impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
@@ -140,6 +141,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
             session_work: Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
             session_work_scratch: Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
             control_events: FifoQueue::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
+            readiness_file: None,
         }
     }
 
@@ -164,6 +166,59 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
     }
 
     #[inline]
+    pub fn app_session_config(&self) -> AppSessionConfig {
+        self.app_session_config
+    }
+
+    #[inline]
+    pub fn app_context(&self) -> Option<&AppContext<Local>> {
+        self.app_context.as_ref()
+    }
+
+    /// Registers the session queue signal with the worker FileMain.
+    ///
+    /// The queue retains its original endpoint. FileMain owns a duplicated
+    /// descriptor and must remove it before this worker is replaced.
+    pub fn install_queue_readiness(
+        &mut self,
+        engine: &mut Engine,
+        session_queue: hammer_core::data_plane::NodeId,
+    ) -> CoreResult<()> {
+        self.remove_queue_readiness(engine)?;
+        let Some(signal_read_fd) = self.app.tx_evt_q().read_fd() else {
+            return Ok(());
+        };
+        // SAFETY: the queue retains its original read endpoint while FileMain
+        // owns this independent duplicated descriptor.
+        let signal_read = unsafe { BorrowedFd::borrow_raw(signal_read_fd) }
+            .try_clone_to_owned()
+            .map_err(|source| AttachError::SessionSignalDuplicate { source })?;
+        let worker = engine.data_worker_id()?;
+        let file = engine.file_main_mut()?.add(File::new(
+            signal_read,
+            worker,
+            "SVM session queue app-to-dataplane signal".to_owned(),
+            u64::from(session_queue.slot()),
+            FileFunctions {
+                read: Some(schedule_session_queue),
+                ..FileFunctions::default()
+            },
+        ))?;
+        self.readiness_file = Some(file);
+        Ok(())
+    }
+
+    /// Cancels session queue readiness before the queue itself is released.
+    pub fn remove_queue_readiness(&mut self, engine: &mut Engine) -> CoreResult<()> {
+        let Some(file) = self.readiness_file else {
+            return Ok(());
+        };
+        let _ = engine.file_main_mut()?.delete(file)?;
+        self.readiness_file = None;
+        Ok(())
+    }
+
+    #[inline]
     pub fn session_transport(&self, session_id: SessionId) -> Option<(SessionTransportId, Index)> {
         let entry = self.entries.get(session_id.pool_index())?;
         Some((entry.transport, entry.state.transport_index()?))
@@ -179,7 +234,10 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
         self.entries.prefetch_slot(session_id.pool_index());
     }
 
-    fn insert_creating_session(&mut self, transport: SessionTransportId) -> CoreResult<SessionId> {
+    pub fn insert_creating_session(
+        &mut self,
+        transport: SessionTransportId,
+    ) -> CoreResult<SessionId> {
         self.entries
             .insert_with(|index| {
                 let _ = index;
@@ -189,7 +247,11 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
             .ok_or_else(|| CoreError::internal("session pool capacity exhausted"))
     }
 
-    fn finish_session_creation(&mut self, session_id: SessionId, index: Index) -> CoreResult<()> {
+    pub fn finish_session_creation(
+        &mut self,
+        session_id: SessionId,
+        index: Index,
+    ) -> CoreResult<()> {
         let entry = self
             .entries
             .get_mut(session_id.pool_index())
@@ -269,12 +331,12 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
     }
 
     #[inline]
-    fn schedule_disconnect(&mut self, session_id: SessionId) {
+    pub fn schedule_disconnect(&mut self, session_id: SessionId) {
         self.control_events
             .push_back(SessionControlEvent::Disconnect(session_id));
     }
 
-    fn poll_app(&mut self) -> CoreResult<()> {
+    pub fn poll_app(&mut self) -> CoreResult<()> {
         let entries = &mut self.entries;
         let session_work = &mut self.session_work;
         let control_events = &mut self.control_events;
@@ -296,7 +358,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
         Ok(())
     }
 
-    fn take_scheduled_work(&mut self) -> Vec<SessionId> {
+    pub fn take_scheduled_work(&mut self) -> Vec<SessionId> {
         let mut work = core::mem::take(&mut self.session_work_scratch);
         core::mem::swap(&mut self.session_work, &mut work);
         for session_id in work.as_slice() {
@@ -307,7 +369,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
         work
     }
 
-    fn keep_work_scratch(&mut self, mut work: Vec<SessionId>) {
+    pub fn keep_work_scratch(&mut self, mut work: Vec<SessionId>) {
         work.clear();
         self.session_work_scratch = work;
     }
@@ -379,170 +441,14 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
     }
 }
 
-pub struct SessionDriverRuntime<T, Seg: SessionSegment = Local, Index = PoolIndex> {
-    sessions: CachePadded<SessionWorker<Index, Seg>>,
-    transports: CachePadded<T>,
-}
-
-impl<T, Seg, Index> SessionDriverRuntime<T, Seg, Index>
-where
-    Seg: SessionSegment,
-    Index: Copy + Eq,
-{
-    fn with_app_session_config(
-        worker: DataWorkerId,
-        buffers: DataPlaneBuffers,
-        transports: T,
-        app_session_config: AppSessionConfig,
-        seg: Seg,
-        worker_index: usize,
-        tx_evt_q: Arc<Seg::EventQueue>,
-    ) -> Self {
-        Self {
-            sessions: CachePadded::new(SessionWorker::with_app_session_config(
-                worker,
-                buffers,
-                app_session_config,
-                seg,
-                worker_index,
-                tx_evt_q,
-            )),
-            transports: CachePadded::new(transports),
-        }
-    }
-
-    #[inline]
-    pub fn sessions(&self) -> &SessionWorker<Index, Seg> {
-        &self.sessions
-    }
-
-    #[inline]
-    pub fn sessions_mut(&mut self) -> &mut SessionWorker<Index, Seg> {
-        &mut self.sessions
-    }
-
-    #[inline]
-    pub fn app_session_config(&self) -> AppSessionConfig {
-        self.sessions.app_session_config
-    }
-
-    #[inline]
-    pub fn app_context(&self) -> Option<&AppContext<Local>> {
-        self.sessions.app_context.as_ref()
-    }
-
-    #[inline]
-    pub fn transports(&self) -> &T {
-        &self.transports
-    }
-
-    #[inline]
-    pub fn transports_mut(&mut self) -> &mut T {
-        &mut self.transports
-    }
-
-    #[inline]
-    pub fn insert_session(&mut self, transport: SessionTransportId, index: Index) -> SessionId {
-        self.sessions.insert_session_for_test(transport, index)
-    }
-
-    pub fn insert_session_with_transport<F>(
-        &mut self,
-        transport: SessionTransportId,
-        create_transport: F,
-    ) -> CoreResult<SessionId>
-    where
-        F: FnOnce(SessionId, &mut T) -> CoreResult<Index>,
-        SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-    {
-        let session_id = self.sessions.insert_creating_session(transport)?;
-        let handle = SessionHandle::new(
-            session_id.pool_index().slot(),
-            self.sessions.worker.slot() as u32,
-        );
-        let app_session = match self.sessions.app.create_app_session(
-            handle,
-            self.sessions.app_session_config,
-            self.sessions.app.tx_evt_q().clone(),
-        ) {
-            Ok(session) => session,
-            Err(error) => {
-                self.sessions.remove_session_entry(session_id);
-                return Err(error);
-            }
-        };
-        self.sessions.app.attach_session(session_id, app_session);
-        let index = match create_transport(session_id, &mut self.transports) {
-            Ok(index) => index,
-            Err(error) => {
-                self.sessions.remove_session_entry(session_id);
-                return Err(error);
-            }
-        };
-        self.sessions.finish_session_creation(session_id, index)?;
-        Ok(session_id)
-    }
-
-    #[inline]
-    pub fn app(&self) -> &SessionAppRuntime<Seg> {
-        self.sessions.app()
-    }
-
-    #[inline]
-    pub fn app_mut(&mut self) -> &mut SessionAppRuntime<Seg> {
-        self.sessions.app_mut()
-    }
-
-    #[inline]
-    pub fn worker(&self) -> DataWorkerId {
-        self.sessions.worker()
-    }
-
-    #[inline]
-    pub fn prefetch_session(&self, session_id: SessionId) {
-        self.sessions.prefetch_session(session_id);
-    }
-
-    #[inline]
-    pub fn ack_tx_up_to(&mut self, session_id: SessionId, bytes: usize) -> CoreResult<()>
-    where
-        SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-    {
-        self.sessions.ack_tx_up_to(session_id, bytes)
-    }
-
-    #[inline]
-    pub fn enqueue_rx(
-        &self,
-        session_id: SessionId,
-        index: hammer_core::data_plane::Index,
-        offset: u32,
-        urgent: bool,
-    ) -> CoreResult<RxDelivery>
-    where
-        SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-    {
-        self.sessions.enqueue_rx(session_id, index, offset, urgent)
-    }
-
-    pub fn schedule_disconnect_for_test(&mut self, session_id: SessionId) {
-        self.sessions.schedule_disconnect(session_id);
-    }
-
-    pub fn schedule_session_work_for_test(&mut self, session_id: SessionId) {
-        self.sessions.mark_ready(session_id);
-    }
-}
-
-impl<T, Index: Copy + Eq> SessionDriverRuntime<T, Local, Index> {
-    pub fn new(worker: DataWorkerId, buffers: DataPlaneBuffers, transports: T) -> Self {
+impl<Index: Copy + Eq> SessionWorker<Index, Local> {
+    pub fn new(worker: DataWorkerId, buffers: DataPlaneBuffers) -> Self {
         let cap = DEFAULT_SESSION_TX_EVENT_CAPACITY.next_power_of_two().max(2) as u32;
         let tx_evt_q =
             Arc::new(SessionMsgQueue::with_cfg(cap, cap.max(2)).expect("local tx_evt_q"));
         Self::with_app_session_config(
             worker,
             buffers,
-            transports,
             AppSessionConfig::default(),
             Local::default(),
             worker.slot(),
@@ -553,31 +459,28 @@ impl<T, Index: Copy + Eq> SessionDriverRuntime<T, Local, Index> {
     pub fn with_app_context(
         worker: DataWorkerId,
         buffers: DataPlaneBuffers,
-        transports: T,
         app_context: AppContext<Local>,
     ) -> Self {
         let cap = DEFAULT_SESSION_TX_EVENT_CAPACITY.next_power_of_two().max(2) as u32;
         let tx_evt_q =
             Arc::new(SessionMsgQueue::with_cfg(cap, cap.max(2)).expect("local tx_evt_q"));
-        let mut driver = Self::with_app_session_config(
+        let mut sessions = Self::with_app_session_config(
             worker,
             buffers,
-            transports,
             app_context.app_session_config(),
             Local::default(),
             worker.slot(),
             tx_evt_q,
         );
-        driver.sessions.app_context = Some(app_context);
-        driver
+        sessions.app_context = Some(app_context);
+        sessions
     }
 }
 
-impl<T, Index: Copy + Eq> SessionDriverRuntime<T, Svm, Index> {
+impl<Index: Copy + Eq> SessionWorker<Index, Svm> {
     pub fn new_svm(
         worker: DataWorkerId,
         buffers: DataPlaneBuffers,
-        transports: T,
         app_session_config: AppSessionConfig,
     ) -> Self {
         let seg = Svm::default();
@@ -593,7 +496,6 @@ impl<T, Index: Copy + Eq> SessionDriverRuntime<T, Svm, Index> {
         Self::with_app_session_config(
             worker,
             buffers,
-            transports,
             app_session_config,
             seg,
             worker.slot(),
@@ -819,183 +721,15 @@ where
     }
 }
 
-pub trait SessionTransports<Index, Seg: SessionSegment> {
-    fn update_time(
-        &mut self,
-        sessions: &mut SessionWorker<Index, Seg>,
-        runtime: &DataPlaneRuntime,
-        output_next: SessionQueueNext,
-        frame: &mut BufferFrame,
-        output: &mut crate::session::node::SessionQueueOutput,
-        now: Instant,
-    ) -> CoreResult<()>;
-
-    fn disconnect(
-        &mut self,
-        id: SessionTransportId,
-        sessions: &mut SessionWorker<Index, Seg>,
-        index: Index,
-        runtime: &DataPlaneRuntime,
-        output_next: SessionQueueNext,
-        frame: &mut BufferFrame,
-        output: &mut crate::session::node::SessionQueueOutput,
-        now: Instant,
-    ) -> CoreResult<()>;
-
-    fn ready(
-        &mut self,
-        id: SessionTransportId,
-        sessions: &mut SessionWorker<Index, Seg>,
-        index: Index,
-        session_id: SessionId,
-        runtime: &DataPlaneRuntime,
-        output_next: SessionQueueNext,
-        frame: &mut BufferFrame,
-        output: &mut crate::session::node::SessionQueueOutput,
-        now: Instant,
-    ) -> CoreResult<()>;
-}
-
-impl<Index, Seg: SessionSegment> SessionTransports<Index, Seg> for () {
-    fn update_time(
-        &mut self,
-        _: &mut SessionWorker<Index, Seg>,
-        _: &DataPlaneRuntime,
-        _: SessionQueueNext,
-        _: &mut BufferFrame,
-        _: &mut crate::session::node::SessionQueueOutput,
-        _: Instant,
-    ) -> CoreResult<()> {
-        Ok(())
-    }
-
-    fn disconnect(
-        &mut self,
-        _: SessionTransportId,
-        _: &mut SessionWorker<Index, Seg>,
-        _: Index,
-        _: &DataPlaneRuntime,
-        _: SessionQueueNext,
-        _: &mut BufferFrame,
-        _: &mut crate::session::node::SessionQueueOutput,
-        _: Instant,
-    ) -> CoreResult<()> {
-        Err(CoreError::internal("session transport is not registered"))
-    }
-
-    fn ready(
-        &mut self,
-        _: SessionTransportId,
-        _: &mut SessionWorker<Index, Seg>,
-        _: Index,
-        _: SessionId,
-        _: &DataPlaneRuntime,
-        _: SessionQueueNext,
-        _: &mut BufferFrame,
-        _: &mut crate::session::node::SessionQueueOutput,
-        _: Instant,
-    ) -> CoreResult<()> {
-        Err(CoreError::internal("session transport is not registered"))
-    }
-}
-
-impl<Head, Tail, Index, Seg> SessionTransports<Index, Seg> for (Head, Tail)
-where
-    Head: SessionTransport<Index, Seg>,
-    Tail: SessionTransports<Index, Seg>,
-    Index: Copy + Eq,
-    Seg: SessionSegment,
-{
-    fn update_time(
-        &mut self,
-        sessions: &mut SessionWorker<Index, Seg>,
-        runtime: &DataPlaneRuntime,
-        output_next: SessionQueueNext,
-        frame: &mut BufferFrame,
-        output: &mut crate::session::node::SessionQueueOutput,
-        now: Instant,
-    ) -> CoreResult<()> {
-        self.0
-            .update_time(sessions, runtime, output_next, frame, output, now)?;
-        self.1
-            .update_time(sessions, runtime, output_next, frame, output, now)
-    }
-
-    fn disconnect(
-        &mut self,
-        id: SessionTransportId,
-        sessions: &mut SessionWorker<Index, Seg>,
-        index: Index,
-        runtime: &DataPlaneRuntime,
-        output_next: SessionQueueNext,
-        frame: &mut BufferFrame,
-        output: &mut crate::session::node::SessionQueueOutput,
-        now: Instant,
-    ) -> CoreResult<()> {
-        if id == Head::ID {
-            return self
-                .0
-                .disconnect(sessions, index, runtime, output_next, frame, output, now);
-        }
-        self.1.disconnect(
-            id,
-            sessions,
-            index,
-            runtime,
-            output_next,
-            frame,
-            output,
-            now,
-        )
-    }
-
-    fn ready(
-        &mut self,
-        id: SessionTransportId,
-        sessions: &mut SessionWorker<Index, Seg>,
-        index: Index,
-        session_id: SessionId,
-        runtime: &DataPlaneRuntime,
-        output_next: SessionQueueNext,
-        frame: &mut BufferFrame,
-        output: &mut crate::session::node::SessionQueueOutput,
-        now: Instant,
-    ) -> CoreResult<()> {
-        if id == Head::ID {
-            return <Head::Tx as SessionTxStrategy<Head, Index, Seg>>::dispatch(
-                &mut self.0,
-                sessions,
-                index,
-                session_id,
-                runtime,
-                output_next,
-                frame,
-                output,
-                now,
-            );
-        }
-        self.1.ready(
-            id,
-            sessions,
-            index,
-            session_id,
-            runtime,
-            output_next,
-            frame,
-            output,
-            now,
-        )
-    }
-}
-
 pub fn dispatch_session_queue_once<T, Seg, Index>(
     runtime: &DataPlaneRuntime,
     owner: hammer_core::data_plane::NodeId,
-    driver: &mut SessionDriverRuntime<T, Seg, Index>,
+    sessions: &mut SessionWorker<Index, Seg>,
+    transport: &mut T,
     output_next: SessionQueueNext,
 ) -> CoreResult<SessionQueueStep>
 where
-    T: SessionTransports<Index, Seg>,
+    T: SessionTransport<Index, Seg>,
     Seg: SessionSegment,
     Index: Copy + Eq,
     SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
@@ -1006,7 +740,8 @@ where
     let mut output = crate::session::node::SessionQueueOutput::default();
     let step = dispatch_session_queue_pending(
         runtime,
-        driver,
+        sessions,
+        transport,
         output_next,
         &mut staging,
         &mut output,
@@ -1016,45 +751,22 @@ where
     Ok(step)
 }
 
-pub fn dispatch_registered_session_queue_once_at<T, Seg, Index>(
-    runtime: &DataPlaneRuntime,
-    data: NodeRuntimeData,
-    output_next: SessionQueueNext,
-    now: Instant,
-    frame: &mut BufferFrame,
-    output: &mut crate::session::node::SessionQueueOutput,
-) -> CoreResult<()>
-where
-    T: SessionTransports<Index, Seg> + 'static,
-    Seg: SessionSegment,
-    Index: Copy + Eq + 'static,
-    SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-{
-    let mut driver =
-        SessionQueueHandle::<SessionDriverRuntime<T, Seg, Index>>::new(data).borrow_mut()?;
-    dispatch_session_queue_pending(runtime, &mut driver, output_next, frame, output, now)?;
-    Ok(())
-}
-
 pub fn dispatch_session_queue_pending<T, Seg, Index>(
     runtime: &DataPlaneRuntime,
-    driver: &mut SessionDriverRuntime<T, Seg, Index>,
+    sessions: &mut SessionWorker<Index, Seg>,
+    transport: &mut T,
     output_next: SessionQueueNext,
     frame: &mut BufferFrame,
     output: &mut crate::session::node::SessionQueueOutput,
     now: Instant,
 ) -> CoreResult<SessionQueueStep>
 where
-    T: SessionTransports<Index, Seg>,
+    T: SessionTransport<Index, Seg>,
     Seg: SessionSegment,
     Index: Copy + Eq,
     SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
-    let SessionDriverRuntime {
-        sessions,
-        transports,
-    } = driver;
-    transports.update_time(sessions, runtime, output_next, frame, output, now)?;
+    transport.update_time(sessions, runtime, output_next, frame, output, now)?;
     sessions.poll_app()?;
 
     let control_count = sessions.control_events.len();
@@ -1063,13 +775,27 @@ where
         else {
             break;
         };
-        let transport = sessions.session_transport(session_id);
+        let session_transport = sessions.session_transport(session_id);
         sessions.notify_app_closed(session_id);
-        if let Some((transport, index)) = transport {
-            transports.disconnect(
+        if let Some((transport_id, index)) = session_transport
+            && transport_id == T::ID
+        {
+            transport.disconnect(sessions, index, runtime, output_next, frame, output, now)?;
+        }
+    }
+
+    let work = sessions.take_scheduled_work();
+    let scheduled_sessions = work.len();
+    for session_id in work.as_slice() {
+        let Some((transport_id, index)) = sessions.session_transport(*session_id) else {
+            continue;
+        };
+        if transport_id == T::ID {
+            <T::Tx as SessionTxStrategy<T, Index, Seg>>::dispatch(
                 transport,
                 sessions,
                 index,
+                *session_id,
                 runtime,
                 output_next,
                 frame,
@@ -1078,27 +804,15 @@ where
             )?;
         }
     }
-
-    let work = sessions.take_scheduled_work();
-    let scheduled_sessions = work.len();
-    for session_id in work.as_slice() {
-        let Some((transport, index)) = sessions.session_transport(*session_id) else {
-            continue;
-        };
-        transports.ready(
-            transport,
-            sessions,
-            index,
-            *session_id,
-            runtime,
-            output_next,
-            frame,
-            output,
-            now,
-        )?;
-    }
     sessions.keep_work_scratch(work);
     Ok(SessionQueueStep { scheduled_sessions })
+}
+
+fn schedule_session_queue(file: &mut File) -> CoreResult<()> {
+    let node = hammer_core::data_plane::NodeId::new(file.private_data() as u32);
+    Engine::with_current(|engine| engine.runtime.schedule_empty_frame(node))
+        .expect("File callbacks run on their polling Engine")?;
+    Ok(())
 }
 
 // TCP-coupled driver tests live in hammer-plugin-tcp (session_driver_tests).

@@ -1,23 +1,23 @@
+use std::cell::RefCell;
 use std::os::fd::RawFd;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
 use hammer_core::data_plane::{BufferFrame, NodeState};
-use hammer_core::error::CoreResult;
+use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::registry::RuntimeRegistry;
 use hammer_infra::pool::Index;
 use hammer_infra::segment::{Local, Svm};
 use hammer_runtime::app::{AppSessionConfig, SessionEventQueue, SessionEvt, SessionEvtType};
 use hammer_runtime::{
-    DataPlaneRuntime, DataPlaneRuntimeConfig, Engine, InternalNode, Node, NodeProcessFn, NodeResult,
+    DataPlaneRuntime, DataPlaneRuntimeConfig, Engine, InternalNode, Node, NodeProcessFn,
+    NodeResult, NodeRuntimeData,
 };
-use hammer_service::session::node::{
-    SessionQueueNext, SessionQueueNode, SessionQueueOutput, register_session_queue,
-};
+use hammer_service::session::node::{SessionQueueNext, SessionQueueNode, SessionQueueOutput};
 use hammer_service::session::runtime::{
-    SessionDriverRuntime, SessionTransport, SessionTransportId, SessionWorker,
-    TransportInternalTransport, TransportInternalTx, dispatch_registered_session_queue_once_at,
+    SessionTransport, SessionTransportId, SessionWorker, TransportInternalTransport,
+    TransportInternalTx, dispatch_session_queue_pending,
 };
 
 #[derive(Default)]
@@ -37,10 +37,9 @@ impl InternalNode for BlackholeNode {}
 
 fn descriptor_identity(fd: RawFd) -> std::io::Result<(libc::dev_t, libc::ino_t)> {
     let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: status is writable storage for one stat, and a successful fstat
-    // initializes it completely before assume_init below.
+    // SAFETY: `fstat` initializes all fields before the value is read.
     if unsafe { libc::fstat(fd, status.as_mut_ptr()) } == 0 {
-        // SAFETY: fstat succeeded and initialized the complete stat value.
+        // SAFETY: the successful `fstat` call initialized `status`.
         let status = unsafe { status.assume_init() };
         Ok((status.st_dev, status.st_ino))
     } else {
@@ -98,6 +97,52 @@ impl TransportInternalTransport<Index, Svm> for RecordingTransport {
     }
 }
 
+struct TestWorker {
+    sessions: SessionWorker<Index, Svm>,
+    transport: RecordingTransport,
+}
+
+thread_local! {
+    static TEST_WORKER: RefCell<Option<TestWorker>> = const { RefCell::new(None) };
+}
+
+fn install_test_worker(worker: TestWorker) {
+    TEST_WORKER.with(|slot| *slot.borrow_mut() = Some(worker));
+}
+
+fn with_test_worker_mut<R>(f: impl FnOnce(&mut TestWorker) -> CoreResult<R>) -> CoreResult<R> {
+    TEST_WORKER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        f(slot.as_mut().ok_or_else(CoreError::service_closed)?)
+    })
+}
+
+fn take_test_worker() -> TestWorker {
+    TEST_WORKER.with(|slot| slot.borrow_mut().take().expect("test worker"))
+}
+
+fn dispatch_test_worker(
+    runtime: &DataPlaneRuntime,
+    _: NodeRuntimeData,
+    output_next: SessionQueueNext,
+    now: Instant,
+    frame: &mut BufferFrame,
+    output: &mut SessionQueueOutput,
+) -> CoreResult<()> {
+    with_test_worker_mut(|worker| {
+        dispatch_session_queue_pending(
+            runtime,
+            &mut worker.sessions,
+            &mut worker.transport,
+            output_next,
+            frame,
+            output,
+            now,
+        )
+        .map(|_| ())
+    })
+}
+
 fn worker_engine() -> Engine {
     let main = Engine::new(
         DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()),
@@ -106,24 +151,29 @@ fn worker_engine() -> Engine {
     main.spawn(1).expect("spawn data worker")
 }
 
-#[test]
-fn local_session_runtime_does_not_register_file_readiness() {
-    let mut engine = worker_engine();
-    let worker = engine.data_worker_id().expect("data worker id");
+fn register_session_queue(
+    engine: &mut Engine,
+) -> (hammer_core::data_plane::NodeId, NodeRuntimeData) {
     let node = SessionQueueNode::new().expect("session queue node");
-    let node_data = node
-        .node_runtime_data()
-        .expect("session queue runtime data");
-    let session_queue = engine
+    let data = node.node_runtime_data().expect("session queue data");
+    let id = engine
         .runtime
         .nodes()
         .try_register_driver(node)
         .expect("register session queue node");
-    let driver =
-        SessionDriverRuntime::<(), Local, Index>::new(worker, engine.runtime.buffers().clone(), ());
+    (id, data)
+}
 
-    let _ = register_session_queue(&mut engine, session_queue, node_data, driver)
-        .expect("bind local session runtime");
+#[test]
+fn local_session_worker_does_not_register_file_readiness() {
+    let mut engine = worker_engine();
+    let worker = engine.data_worker_id().expect("data worker id");
+    let (session_queue, _) = register_session_queue(&mut engine);
+    let mut sessions = SessionWorker::<Index, Local>::new(worker, engine.runtime.buffers().clone());
+
+    sessions
+        .install_queue_readiness(&mut engine, session_queue)
+        .expect("install local queue readiness");
 
     assert_eq!(
         engine
@@ -140,52 +190,47 @@ fn svm_readiness_schedules_session_queue_before_the_node_drains_events() {
     let mut engine = worker_engine();
     let worker = engine.data_worker_id().expect("data worker id");
     let events = Arc::new(Mutex::new(Vec::new()));
-    let mut driver = SessionDriverRuntime::<_, Svm, Index>::new_svm(
+    let (session_queue, node_data) = register_session_queue(&mut engine);
+    let sink = engine.runtime.nodes().register_internal(BlackholeNode);
+    let output_next = SessionQueueNode::compile_output_next(&engine.runtime, session_queue, sink)
+        .expect("compile session queue transport edge");
+    SessionQueueNode::install_worker_attachment(node_data, output_next, dispatch_test_worker)
+        .expect("install session queue transport dispatch");
+
+    let mut sessions = SessionWorker::<Index, Svm>::new_svm(
         worker,
         engine.runtime.buffers().clone(),
-        (RecordingTransport(Arc::clone(&events)), ()),
         AppSessionConfig::default(),
     );
-    let session_id = driver
-        .insert_session_with_transport(RecordingTransport::ID, |_, _| Ok(Index::new(7, 1)))
-        .expect("create session");
-    let node = SessionQueueNode::new().expect("session queue node");
-    let node_data = node
-        .node_runtime_data()
-        .expect("session queue runtime data");
-    let session_queue = engine
-        .runtime
-        .nodes()
-        .try_register_driver(node)
-        .expect("register session queue node");
-    let sink = engine.runtime.nodes().register_internal(BlackholeNode);
-    let handle = register_session_queue(&mut engine, session_queue, node_data, driver)
-        .expect("bind SVM session runtime");
-    SessionQueueNode::attach_queue_by_runtime_data(
-        &engine.runtime,
-        session_queue,
-        node_data,
-        handle,
-        sink,
-        dispatch_registered_session_queue_once_at::<(RecordingTransport, ()), Svm, Index>,
-    )
-    .expect("attach session queue");
+    let session_id = sessions.insert_session_for_test(RecordingTransport::ID, Index::new(7, 1));
+    sessions.schedule_disconnect(session_id);
+    sessions
+        .install_queue_readiness(&mut engine, session_queue)
+        .expect("install SVM queue readiness");
+    install_test_worker(TestWorker {
+        sessions,
+        transport: RecordingTransport(Arc::clone(&events)),
+    });
     engine
         .runtime
         .nodes()
         .set_node_state(session_queue, NodeState::Polling)
         .expect("poll session queue");
-    handle
-        .borrow_mut()
-        .expect("session runtime")
-        .app()
-        .tx_evt_q()
-        .enqueue_ctrl(SessionEvt::ctrl(
-            session_id.pool_index().slot(),
-            worker.slot() as u32,
-            SessionEvtType::Close,
-        ))
-        .expect("app writes close event");
+
+    with_test_worker_mut(|worker| {
+        worker
+            .sessions
+            .app()
+            .tx_evt_q()
+            .enqueue_ctrl(SessionEvt::ctrl(
+                session_id.pool_index().slot(),
+                worker.sessions.worker().slot() as u32,
+                SessionEvtType::Close,
+            ))
+            .expect("app writes close event");
+        Ok(())
+    })
+    .expect("queue close event");
 
     engine.install_current();
     let callbacks = engine
@@ -200,25 +245,22 @@ fn svm_readiness_schedules_session_queue_before_the_node_drains_events() {
     assert!(events.lock().expect("events").is_empty());
     assert!(engine.runtime.run_ready_nodes().expect("run session queue") >= 1);
     assert_eq!(*events.lock().expect("events"), vec!["time", "close"]);
+
+    let mut worker = take_test_worker();
+    worker
+        .sessions
+        .remove_queue_readiness(&mut engine)
+        .expect("remove SVM queue readiness");
 }
 
 #[test]
-fn replacing_svm_session_runtime_removes_the_old_file_before_queue_release() {
+fn replacing_svm_session_worker_removes_the_old_file_before_queue_release() {
     let mut engine = worker_engine();
     let worker = engine.data_worker_id().expect("data worker id");
-    let node = SessionQueueNode::new().expect("session queue node");
-    let node_data = node
-        .node_runtime_data()
-        .expect("session queue runtime data");
-    let session_queue = engine
-        .runtime
-        .nodes()
-        .try_register_driver(node)
-        .expect("register session queue node");
-    let first = SessionDriverRuntime::<(), Svm, Index>::new_svm(
+    let (session_queue, _) = register_session_queue(&mut engine);
+    let mut first = SessionWorker::<Index, Svm>::new_svm(
         worker,
         engine.runtime.buffers().clone(),
-        (),
         AppSessionConfig::default(),
     );
     first
@@ -229,18 +271,23 @@ fn replacing_svm_session_runtime_removes_the_old_file_before_queue_release() {
             worker.slot() as u32,
             SessionEvtType::Close,
         ))
-        .expect("signal first runtime");
-    let _ = register_session_queue(&mut engine, session_queue, node_data, first)
-        .expect("bind first SVM session runtime");
+        .expect("signal first worker");
+    first
+        .install_queue_readiness(&mut engine, session_queue)
+        .expect("install first readiness");
+    first
+        .remove_queue_readiness(&mut engine)
+        .expect("remove first readiness before queue release");
+    drop(first);
 
-    let second = SessionDriverRuntime::<(), Svm, Index>::new_svm(
+    let mut second = SessionWorker::<Index, Svm>::new_svm(
         worker,
         engine.runtime.buffers().clone(),
-        (),
         AppSessionConfig::default(),
     );
-    let handle = register_session_queue(&mut engine, session_queue, node_data, second)
-        .expect("replace SVM session runtime");
+    second
+        .install_queue_readiness(&mut engine, session_queue)
+        .expect("install replacement readiness");
 
     engine.install_current();
     assert_eq!(
@@ -251,9 +298,7 @@ fn replacing_svm_session_runtime_removes_the_old_file_before_queue_release() {
             .expect("old readiness must be removed"),
         0
     );
-    handle
-        .borrow_mut()
-        .expect("replacement runtime")
+    second
         .app()
         .tx_evt_q()
         .enqueue_ctrl(SessionEvt::ctrl(
@@ -261,7 +306,7 @@ fn replacing_svm_session_runtime_removes_the_old_file_before_queue_release() {
             worker.slot() as u32,
             SessionEvtType::Close,
         ))
-        .expect("signal replacement runtime");
+        .expect("signal replacement worker");
     assert_eq!(
         engine
             .file_main_mut()
@@ -271,6 +316,9 @@ fn replacing_svm_session_runtime_removes_the_old_file_before_queue_release() {
         1
     );
     Engine::uninstall_current();
+    second
+        .remove_queue_readiness(&mut engine)
+        .expect("remove replacement readiness");
 }
 
 #[test]
@@ -278,29 +326,21 @@ fn worker_teardown_closes_session_queue_and_file_descriptors() {
     let (descriptor, identity) = thread::spawn(|| {
         let mut engine = worker_engine();
         let worker = engine.data_worker_id().expect("data worker id");
-        let node = SessionQueueNode::new().expect("session queue node");
-        let node_data = node
-            .node_runtime_data()
-            .expect("session queue runtime data");
-        let session_queue = engine
-            .runtime
-            .nodes()
-            .try_register_driver(node)
-            .expect("register session queue node");
-        let driver = SessionDriverRuntime::<(), Svm, Index>::new_svm(
+        let (session_queue, _) = register_session_queue(&mut engine);
+        let mut sessions = SessionWorker::<Index, Svm>::new_svm(
             worker,
             engine.runtime.buffers().clone(),
-            (),
             AppSessionConfig::default(),
         );
-        let descriptor = driver
+        let descriptor = sessions
             .app()
             .tx_evt_q()
             .read_fd()
             .expect("SVM queue read descriptor");
         let identity = descriptor_identity(descriptor).expect("queue descriptor identity");
-        let _ = register_session_queue(&mut engine, session_queue, node_data, driver)
-            .expect("bind SVM session runtime");
+        sessions
+            .install_queue_readiness(&mut engine, session_queue)
+            .expect("install queue readiness");
         (descriptor, identity)
     })
     .join()

@@ -11,8 +11,6 @@ use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
 use hammer_core::protocol::ip::{IpProtocol, IpVersion};
 use hammer_core::protocol::tcp::{TcpError, TcpInputFlags, TcpSegmentFlags, tcp_header};
-use hammer_infra::pool::Index as PoolIndex;
-use hammer_runtime::app::SessionSegment;
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
     TraceFormatter, add_packet_trace,
@@ -26,11 +24,10 @@ use super::lookup::{
     TcpIpv4ListenerAddress, TcpIpv6ListenerAddress, TcpLookupSnapshot, TcpLookupValue,
     TcpV4ListenerKey, TcpV6ListenerKey,
 };
-use super::{TcpInputNext, TcpWorker, write_session_route_opaque};
+use super::{TcpInputNext, TcpWorkerStore, with_tcp_worker_mut, write_session_route_opaque};
 use hammer_service::opaque::NetworkOpaque;
+use hammer_service::session::SessionId;
 use hammer_service::session::app::SessionAppRuntimeCreate;
-use hammer_service::session::runtime::SessionDriverRuntime;
-use hammer_service::session::{SessionId, SessionQueueHandle};
 use hammer_service::transport::congestion::CongestionController;
 
 #[derive(Clone, Copy, Default)]
@@ -124,18 +121,14 @@ impl TcpInputControlPlane {
     pub(crate) fn node<C, Seg>(
         &self,
         next: [NodeId; TcpInputNext::COUNT],
-        session_queue: Option<
-            SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
-        >,
         handoff: Option<(NodeHandle, DataWorkerId)>,
-    ) -> TcpInputNode<C, Seg>
+    ) -> TcpInputNode
     where
         C: CongestionController + 'static,
-        Seg: SessionSegment,
+        Seg: TcpWorkerStore<C>,
         hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
     {
-        let mut node = TcpInputNode::<C, Seg>::new(Arc::clone(&self.inner), next);
-        node.session_queue = session_queue;
+        let mut node = TcpInputNode::for_worker::<C, Seg>(Arc::clone(&self.inner), next);
         if let Some((handoff, worker)) = handoff {
             node.handoff = Some(handoff);
             node.handoff_worker = Some(worker);
@@ -151,36 +144,40 @@ impl TcpInputControlPlane {
     init = crate::register_tcp_input,
     role = internal,
 )]
-pub struct TcpInputNode<C: CongestionController + 'static, Seg: SessionSegment> {
-    #[node(default = register_tcp_input_runtime(snapshot.clone()))]
+pub struct TcpInputNode {
     runtime_data: NodeRuntimeData,
-    snapshot: Arc<ArcSwap<TcpLookupSnapshot>>,
+    process: NodeProcessFn,
     #[node(default)]
     handoff: Option<NodeHandle>,
     #[node(default)]
     handoff_worker: Option<DataWorkerId>,
-    #[node(default)]
-    session_queue:
-        Option<SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>>,
 }
 
-impl<C, Seg> Node for TcpInputNode<C, Seg>
-where
-    C: CongestionController + 'static,
-    Seg: SessionSegment,
-    hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-{
+impl TcpInputNode {
+    pub(crate) fn for_worker<C, Seg>(
+        snapshot: Arc<ArcSwap<TcpLookupSnapshot>>,
+        next: [NodeId; TcpInputNext::COUNT],
+    ) -> Self
+    where
+        C: CongestionController + 'static,
+        Seg: TcpWorkerStore<C>,
+        hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
+    {
+        Self::new(
+            register_tcp_input_runtime(snapshot),
+            tcp_input_process::<C, Seg>,
+            next,
+        )
+    }
+}
+
+impl Node for TcpInputNode {
     #[inline(always)]
     fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
-        let snapshot = self.snapshot.load();
-        tcp_input_process_frame(
-            runtime,
-            frame,
-            &snapshot,
-            self.handoff,
-            self.handoff_worker,
-            self.session_queue,
-        )
+        if sync_tcp_input_runtime(self.runtime_data, self.handoff, self.handoff_worker).is_err() {
+            return NodeResult::drop();
+        }
+        (self.process)(runtime, self.runtime_data, frame)
     }
 
     #[inline]
@@ -190,17 +187,12 @@ where
 
     #[inline]
     fn node_process(&self) -> NodeProcessFn {
-        tcp_input_process::<C, Seg>
+        self.process
     }
 
     #[inline]
     fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
-        sync_tcp_input_runtime(
-            self.runtime_data,
-            self.handoff,
-            self.handoff_worker,
-            self.session_queue,
-        )?;
+        sync_tcp_input_runtime(self.runtime_data, self.handoff, self.handoff_worker)?;
         Ok(self.runtime_data)
     }
 }
@@ -210,7 +202,6 @@ struct TcpInputRuntime {
     snapshot: Arc<ArcSwap<TcpLookupSnapshot>>,
     handoff: Option<NodeHandle>,
     handoff_worker: Option<DataWorkerId>,
-    session_queue: Option<NodeRuntimeData>,
 }
 
 thread_local! {
@@ -226,15 +217,12 @@ fn register_tcp_input_runtime(snapshot: Arc<ArcSwap<TcpLookupSnapshot>>) -> Node
             snapshot,
             handoff: None,
             handoff_worker: None,
-            session_queue: None,
         });
         NodeRuntimeData::from_usize(slot).expect("TCP input runtime slot overflow")
     })
 }
 
-fn tcp_input_runtime(data: NodeRuntimeData) -> CoreResult<TcpInputRuntime>
-where
-{
+fn tcp_input_runtime(data: NodeRuntimeData) -> CoreResult<TcpInputRuntime> {
     let slot = data.usize_word(0)?;
     TCP_INPUT_RUNTIMES.with(|runtimes| {
         runtimes
@@ -245,18 +233,11 @@ where
     })
 }
 
-fn sync_tcp_input_runtime<C, Seg>(
+fn sync_tcp_input_runtime(
     data: NodeRuntimeData,
     handoff: Option<NodeHandle>,
     handoff_worker: Option<DataWorkerId>,
-    session_queue: Option<
-        SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
-    >,
-) -> CoreResult<()>
-where
-    C: CongestionController + 'static,
-    Seg: SessionSegment,
-{
+) -> CoreResult<()> {
     let slot = data.usize_word(0)?;
     TCP_INPUT_RUNTIMES.with(|runtimes| {
         let mut runtimes = runtimes.borrow_mut();
@@ -265,7 +246,6 @@ where
             .ok_or_else(|| CoreError::internal("TCP input runtime slot is invalid"))?;
         runtime.handoff = handoff;
         runtime.handoff_worker = handoff_worker;
-        runtime.session_queue = session_queue.map(SessionQueueHandle::runtime_data);
         Ok(())
     })
 }
@@ -277,7 +257,7 @@ fn tcp_input_process<C, Seg>(
 ) -> NodeResult
 where
     C: CongestionController + 'static,
-    Seg: SessionSegment,
+    Seg: TcpWorkerStore<C>,
     hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let state = match tcp_input_runtime(data) {
@@ -285,16 +265,12 @@ where
         Err(_) => return NodeResult::drop(),
     };
     let snapshot = state.snapshot.load();
-    let session_queue = state
-        .session_queue
-        .map(SessionQueueHandle::<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>::new);
-    tcp_input_process_frame(
+    tcp_input_process_frame::<C, Seg>(
         runtime,
         frame,
         &snapshot,
         state.handoff,
         state.handoff_worker,
-        session_queue,
     )
 }
 
@@ -304,26 +280,22 @@ fn tcp_input_process_frame<C, Seg>(
     snapshot: &TcpLookupSnapshot,
     handoff: Option<NodeHandle>,
     handoff_worker: Option<DataWorkerId>,
-    session_queue: Option<
-        SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
-    >,
 ) -> NodeResult
 where
     C: CongestionController + 'static,
-    Seg: SessionSegment,
+    Seg: TcpWorkerStore<C>,
     hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let width = runtime.preferred_frame_batch_width();
     let mut nexts = Vec::with_capacity(frame.len());
     let _ = frame.rewrite_indices_batched(width, |index| {
-        prefetch_tcp_input(runtime, &[index], snapshot, session_queue);
-        match tcp_input_local_next_for_index(
+        prefetch_tcp_input::<C, Seg>(runtime, &[index], snapshot);
+        match tcp_input_local_next_for_index::<C, Seg>(
             runtime,
             index,
             snapshot,
             handoff,
             handoff_worker,
-            session_queue,
         ) {
             Ok(Some(slot)) => {
                 nexts.push(slot);
@@ -349,26 +321,22 @@ fn tcp_input_local_next_for_index<C, Seg>(
     snapshot: &TcpLookupSnapshot,
     handoff: Option<NodeHandle>,
     handoff_worker: Option<DataWorkerId>,
-    session_queue: Option<
-        SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
-    >,
 ) -> CoreResult<Option<u16>>
 where
     C: CongestionController + 'static,
-    Seg: SessionSegment,
+    Seg: TcpWorkerStore<C>,
     hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let buffer = runtime.get_buffer(index)?;
     let parsed = tcp_input_buffer(&buffer)?;
     drop(buffer);
-    next_slot_for_index_with_runtime(
+    next_slot_for_index_with_runtime::<C, Seg>(
         runtime,
         index,
         parsed,
         snapshot,
         handoff,
         handoff_worker,
-        session_queue,
     )
 }
 
@@ -389,13 +357,10 @@ fn next_slot_for_index_with_runtime<C, Seg>(
     snapshot: &TcpLookupSnapshot,
     handoff: Option<NodeHandle>,
     handoff_worker: Option<DataWorkerId>,
-    session_queue: Option<
-        SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
-    >,
 ) -> CoreResult<Option<u16>>
 where
     C: CongestionController + 'static,
-    Seg: SessionSegment,
+    Seg: TcpWorkerStore<C>,
     hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let traced = runtime.get_buffer(index)?.trace_handle().is_some();
@@ -430,7 +395,7 @@ where
     let destination_port = local.port();
 
     let (session_route, listener_pending) =
-        session_or_listener_pending_input_entry(session_queue, local, remote, flags)?;
+        session_or_listener_pending_input_entry::<C, Seg>(local, remote, flags)?;
     if let Some((session_id, owner, session_next)) = session_route {
         let slot = session_next.slot() as u16;
         {
@@ -608,31 +573,23 @@ fn resolve_error_next_with_runtime(
 
 #[inline(always)]
 fn session_or_listener_pending_input_entry<C, Seg>(
-    session_queue: Option<
-        SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
-    >,
     local: SocketAddr,
     remote: SocketAddr,
     flags: TcpInputFlags,
 ) -> CoreResult<(Option<(SessionId, DataWorkerId, TcpInputNext)>, bool)>
 where
     C: CongestionController + 'static,
-    Seg: SessionSegment,
+    Seg: TcpWorkerStore<C>,
     hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
-    let Some(session_queue) = session_queue else {
-        return Ok((None, false));
-    };
-    let mut queue = session_queue.borrow_mut()?;
-    let (route, listener_pending) = queue.transports_mut().0.lookup.input_route(
-        local,
-        remote,
-        flags.contains(TcpInputFlags::ACK) && !flags.contains(TcpInputFlags::RST),
-    );
-    if let Some(route) = route {
-        return Ok((Some(route), false));
-    }
-    Ok((None, listener_pending))
+    with_tcp_worker_mut::<C, Seg, _>(|state| {
+        let (route, listener_pending) = state.tcp.lookup.input_route(
+            local,
+            remote,
+            flags.contains(TcpInputFlags::ACK) && !flags.contains(TcpInputFlags::RST),
+        );
+        Ok((route, listener_pending))
+    })
 }
 
 #[inline(always)]
@@ -680,12 +637,9 @@ fn prefetch_tcp_input<C, Seg>(
     runtime: &DataPlaneRuntime,
     indices: &[Index],
     lookup: &TcpLookupSnapshot,
-    session_queue: Option<
-        SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
-    >,
 ) where
     C: CongestionController + 'static,
-    Seg: SessionSegment,
+    Seg: TcpWorkerStore<C>,
     hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let mut read = 0usize;
@@ -694,7 +648,7 @@ fn prefetch_tcp_input<C, Seg>(
         runtime.prefetch_read(index);
         if let Ok(buffer) = runtime.get_buffer(index) {
             prefetch_lookup_for_buffer(lookup, &buffer);
-            prefetch_session_route_for_buffer(session_queue, &buffer);
+            prefetch_session_route_for_buffer::<C, Seg>(&buffer);
         }
         read += 1;
     }
@@ -911,19 +865,12 @@ fn prefetch_lookup_for_buffer(
 }
 
 #[inline(always)]
-fn prefetch_session_route_for_buffer<C, Seg>(
-    session_queue: Option<
-        SessionQueueHandle<SessionDriverRuntime<(TcpWorker<C>, ()), Seg, PoolIndex>>,
-    >,
-    buffer: &hammer_core::data_plane::Buffer,
-) where
+fn prefetch_session_route_for_buffer<C, Seg>(buffer: &hammer_core::data_plane::Buffer)
+where
     C: CongestionController + 'static,
-    Seg: SessionSegment,
+    Seg: TcpWorkerStore<C>,
     hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
-    let Some(session_queue) = session_queue else {
-        return;
-    };
     let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
     let cursor = network.packet_cursor();
     if !valid_tcp_cursor(cursor) {
@@ -951,9 +898,10 @@ fn prefetch_session_route_for_buffer<C, Seg>(
     };
     let local = SocketAddr::new(destination_ip, tcp_destination_port(buffer));
     let remote = SocketAddr::new(source_ip, tcp_source_port(buffer));
-    if let Ok(queue) = session_queue.borrow_mut() {
-        queue.transports().0.lookup.prefetch_tuple(local, remote);
-    }
+    let _ = with_tcp_worker_mut::<C, Seg, _>(|state| {
+        state.tcp.lookup.prefetch_tuple(local, remote);
+        Ok(())
+    });
 }
 
 #[inline(always)]
