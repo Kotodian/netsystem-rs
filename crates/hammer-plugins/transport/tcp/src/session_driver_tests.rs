@@ -6,12 +6,13 @@ use hammer_core::data_plane::NodeState;
 use hammer_core::protocol::tcp::{
     TcpCapabilities, TcpConnectionId, TcpPacket, TcpSegmentFlags, TcpState,
 };
+use hammer_core::registry::RuntimeRegistry;
 use hammer_infra::pool::Index;
 use hammer_infra::segment::Local;
 use hammer_runtime::app::{AppContext, AppSession, AppSessionConfig, SessionHandle};
 use hammer_runtime::app::{SessionEvt, SessionEvtType};
 use hammer_runtime::spawn::DataRuntimeContext;
-use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId};
+use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, Engine};
 
 use hammer_service::data_plane::DropNode;
 use hammer_service::session::SessionId;
@@ -71,7 +72,9 @@ where
     let output = runtime.nodes().register_internal(DropNode::new());
     let node = register_session_queue_node(runtime, 0).expect("session queue node");
     let runtime_data = SessionQueueNode::registered_runtime_data().expect("session queue data");
-    let handle = register_session_queue(driver).expect("session queue handle");
+    let mut engine = Engine::new(runtime.clone(), RuntimeRegistry::new());
+    let handle = register_session_queue(&mut engine, node, runtime_data, driver)
+        .expect("session queue handle");
     SessionQueueNode::attach_queue_by_runtime_data(
         runtime,
         node,

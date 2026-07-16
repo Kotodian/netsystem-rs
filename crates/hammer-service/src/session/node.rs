@@ -1,15 +1,21 @@
+use std::any::Any;
 use std::cell::{Cell, RefCell, RefMut};
 use std::fmt;
 use std::marker::PhantomData;
+use std::os::fd::BorrowedFd;
+use std::rc::Rc;
 use std::time::Instant;
 
 use hammer_core::data_plane::{BufferFrame, Index, NodeId, NodeRegistration};
-use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::error::{AttachError, CoreError, CoreResult};
+use hammer_runtime::app::{SessionEventQueue, SessionSegment};
 use hammer_runtime::{
-    DataPlaneRuntime, DriverNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
+    DataPlaneRuntime, DriverNode, Engine, File, FileFunctions, Node, NodeProcessFn, NodeResult,
+    NodeRuntimeData,
 };
 
 use crate::session::SessionQueueError;
+use crate::session::runtime::SessionDriverRuntime;
 
 /// Shared Session Queue IO allowance for normal and custom TX in one dispatch.
 pub const SESSION_QUEUE_IO_BUDGET: usize = 128;
@@ -17,7 +23,7 @@ pub const SESSION_QUEUE_IO_BUDGET: usize = 128;
 #[derive(PartialEq, Eq)]
 pub struct SessionQueueHandle<Q> {
     runtime_data: NodeRuntimeData,
-    _queue: PhantomData<fn() -> Q>,
+    _queue: PhantomData<Rc<Q>>,
 }
 
 impl<Q> SessionQueueHandle<Q> {
@@ -40,9 +46,10 @@ impl<Q> SessionQueueHandle<Q> {
         Q: 'static,
     {
         let queue = session_queue_cell::<Q>(self.runtime_data)?;
-        queue
+        let queue = queue
             .try_borrow_mut()
-            .map_err(|_| CoreError::internal("session queue borrowed"))
+            .map_err(|_| CoreError::internal("session queue borrowed"))?;
+        RefMut::filter_map(queue, Option::as_mut).map_err(|_| CoreError::service_closed())
     }
 }
 
@@ -159,6 +166,19 @@ struct SessionQueueAttachment {
     dispatch: SessionQueueDispatchFn,
 }
 
+struct SessionQueueOwner {
+    attachment_slot: usize,
+    queue: &'static dyn Any,
+    release: fn(&'static dyn Any),
+    readiness_file: Option<hammer_infra::pool::Index>,
+}
+
+impl Drop for SessionQueueOwner {
+    fn drop(&mut self) {
+        (self.release)(self.queue);
+    }
+}
+
 #[hammer_component_macros::graph_node(
     graph = tcp_worker,
     init = crate::session::node::register_session_queue_node,
@@ -173,6 +193,7 @@ pub struct SessionQueueNode {
 thread_local! {
     static SESSION_QUEUE_NODES: RefCell<Vec<Vec<SessionQueueAttachment>>> =
         const { RefCell::new(Vec::new()) };
+    static SESSION_QUEUE_OWNERS: RefCell<Vec<SessionQueueOwner>> = const { RefCell::new(Vec::new()) };
     static SESSION_QUEUE_NODE_RUNTIME_DATA: Cell<Option<NodeRuntimeData>> = const { Cell::new(None) };
     static SESSION_QUEUE_NODE_ID: Cell<Option<NodeId>> = const { Cell::new(None) };
 }
@@ -309,13 +330,117 @@ fn session_queue_node_process(
     NodeResult::drop()
 }
 
-pub fn register_session_queue<Q: 'static>(queue: Q) -> CoreResult<SessionQueueHandle<Q>> {
-    let queue = Box::leak(Box::new(RefCell::new(queue)));
-    let runtime_data = session_queue_node_runtime_data(queue)?;
-    Ok(SessionQueueHandle::new(runtime_data))
+pub fn register_session_queue<T, Seg, QueueIndex>(
+    engine: &mut Engine,
+    session_queue: NodeId,
+    node_runtime_data: NodeRuntimeData,
+    queue: SessionDriverRuntime<T, Seg, QueueIndex>,
+) -> CoreResult<SessionQueueHandle<SessionDriverRuntime<T, Seg, QueueIndex>>>
+where
+    T: 'static,
+    Seg: SessionSegment,
+    QueueIndex: Copy + Eq + 'static,
+{
+    type Queue<T, Seg, QueueIndex> = RefCell<Option<SessionDriverRuntime<T, Seg, QueueIndex>>>;
+
+    let attachment_slot = node_runtime_data.usize_word(0)?;
+    SESSION_QUEUE_OWNERS.with(|owners| {
+        let mut owners = owners
+            .try_borrow_mut()
+            .map_err(|_| CoreError::internal("session queue owners borrowed"))?;
+        if let Some(owner) = owners
+            .iter_mut()
+            .find(|owner| owner.attachment_slot == attachment_slot)
+        {
+            let Some(queue_cell) = owner.queue.downcast_ref::<Queue<T, Seg, QueueIndex>>() else {
+                return Err(CoreError::service_closed());
+            };
+            if let Some(file) = owner.readiness_file {
+                let _ = engine.file_main_mut()?.delete(file)?;
+                owner.readiness_file = None;
+            }
+            *queue_cell.borrow_mut() = Some(queue);
+            let queue = queue_cell.borrow();
+            let Some(queue) = queue.as_ref() else {
+                return Err(CoreError::service_closed());
+            };
+            owner.readiness_file = register_session_queue_readiness(engine, session_queue, queue)?;
+            return Ok(SessionQueueHandle::new(session_queue_node_runtime_data(
+                queue_cell,
+            )?));
+        }
+
+        let queue = Box::leak(Box::new(RefCell::new(Some(queue))));
+        let runtime_data = session_queue_node_runtime_data(queue)?;
+        owners.push(SessionQueueOwner {
+            attachment_slot,
+            queue,
+            release: release_session_queue::<SessionDriverRuntime<T, Seg, QueueIndex>>,
+            readiness_file: None,
+        });
+        let queue = queue.borrow();
+        let Some(queue) = queue.as_ref() else {
+            return Err(CoreError::service_closed());
+        };
+        let owner_index = owners.len() - 1;
+        owners[owner_index].readiness_file =
+            register_session_queue_readiness(engine, session_queue, queue)?;
+        Ok(SessionQueueHandle::new(runtime_data))
+    })
 }
 
-fn session_queue_node_runtime_data<Q>(queue: &'static RefCell<Q>) -> CoreResult<NodeRuntimeData> {
+fn release_session_queue<Q: 'static>(queue: &'static dyn Any) {
+    let Some(queue) = queue.downcast_ref::<RefCell<Option<Q>>>() else {
+        return;
+    };
+    if let Ok(mut queue) = queue.try_borrow_mut() {
+        queue.take();
+    }
+}
+
+fn register_session_queue_readiness<T, Seg, QueueIndex>(
+    engine: &mut Engine,
+    session_queue: NodeId,
+    queue: &SessionDriverRuntime<T, Seg, QueueIndex>,
+) -> CoreResult<Option<hammer_infra::pool::Index>>
+where
+    Seg: SessionSegment,
+    QueueIndex: Copy + Eq,
+{
+    let Some(signal_read_fd) = queue.app().tx_evt_q().read_fd() else {
+        return Ok(None);
+    };
+    // SAFETY: the Session Runtime queue remains owned by SESSION_QUEUE_OWNERS
+    // until its File registration is removed. Cloning does not consume it.
+    let signal_read = unsafe { BorrowedFd::borrow_raw(signal_read_fd) }
+        .try_clone_to_owned()
+        .map_err(|source| AttachError::SessionSignalDuplicate { source })?;
+    let worker = engine.data_worker_id()?;
+    engine
+        .file_main_mut()?
+        .add(File::new(
+            signal_read,
+            worker,
+            "SVM session queue app-to-dataplane signal".to_owned(),
+            u64::from(session_queue.slot()),
+            FileFunctions {
+                read: Some(schedule_session_queue),
+                ..FileFunctions::default()
+            },
+        ))
+        .map(Some)
+}
+
+fn schedule_session_queue(file: &mut File) -> CoreResult<()> {
+    let node = NodeId::new(file.private_data() as u32);
+    Engine::with_current(|engine| engine.runtime.schedule_empty_frame(node))
+        .expect("File callbacks run on their polling Engine")?;
+    Ok(())
+}
+
+fn session_queue_node_runtime_data<Q>(
+    queue: &'static RefCell<Option<Q>>,
+) -> CoreResult<NodeRuntimeData> {
     Ok(NodeRuntimeData::from_words([
         u64::try_from(queue as *const _ as usize)
             .map_err(|_| CoreError::internal("session queue pointer overflow"))?,
@@ -325,13 +450,14 @@ fn session_queue_node_runtime_data<Q>(queue: &'static RefCell<Q>) -> CoreResult<
     ]))
 }
 
-fn session_queue_cell<Q>(data: NodeRuntimeData) -> CoreResult<&'static RefCell<Q>> {
+fn session_queue_cell<Q>(data: NodeRuntimeData) -> CoreResult<&'static RefCell<Option<Q>>> {
     let raw = usize::try_from(data.word(0))
         .map_err(|_| CoreError::internal("session queue pointer is invalid"))?;
-    let ptr = raw as *const RefCell<Q>;
-    // SAFETY: `register_session_queue` leaks a `RefCell<Q>` and stores the exact
-    // pointer in `NodeRuntimeData`. The typed handle preserves the same `Q` on
-    // recovery.
+    let ptr = raw as *const RefCell<Option<Q>>;
+    // SAFETY: register_session_queue leaks the emptyable RefCell allocation and
+    // stores its exact pointer in NodeRuntimeData. SessionQueueOwner releases Q
+    // at worker teardown without invalidating the allocation, and the typed
+    // handle preserves the same Q on recovery.
     unsafe { ptr.as_ref() }.ok_or_else(|| CoreError::internal("session queue is missing"))
 }
 

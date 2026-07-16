@@ -6,7 +6,6 @@ hammer_component_macros::declare_plugin!(name = "tcp", load_after = ["ip"]);
 
 use std::mem::transmute;
 use std::net::SocketAddr;
-use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
@@ -16,17 +15,15 @@ use hammer_core::error::{CoreError, CoreResult, HammerResult};
 use hammer_core::protocol::tcp::TcpCapabilities;
 use hammer_core::protocol::tcp::{TcpControlPacketParseError, TcpError};
 use hammer_core::registry::RuntimeRegistry;
-use hammer_runtime::{
-    DataPlaneRuntime, DataWorkerId, Engine, File, FileFunctions, Node, NodeRuntimeData,
-};
+use hammer_runtime::{DataPlaneRuntime, DataWorkerId, Engine, Node, NodeRuntimeData};
 use thiserror::Error;
 
 use hammer_infra::pool::Index as PoolIndex;
-use hammer_runtime::app::{SessionEventQueue, SessionSegment};
+use hammer_runtime::app::SessionSegment;
 use hammer_service::session::app::SessionAppRuntimeCreate;
 use hammer_service::session::{
     SessionId, SessionQueueHandle, SessionQueueNext,
-    node::{SessionQueueNode, SessionQueueOutput},
+    node::{SessionQueueNode, SessionQueueOutput, register_session_queue},
     runtime::SessionDriverRuntime,
     runtime::dispatch_registered_session_queue_once_at,
 };
@@ -388,9 +385,9 @@ where
         .node_by_name("tcp-syn-sent")
         .ok_or_else(|| CoreError::internal("tcp-syn-sent is not registered"))?;
 
-    let queue = hammer_service::session::node::register_session_queue(driver)?;
     let session_queue_node = SessionQueueNode::new()?;
     let session_queue_data = session_queue_node.node_runtime_data()?;
+    let queue = register_session_queue(engine, session_queue, session_queue_data, driver)?;
     SessionQueueNode::attach_queue_by_runtime_data(
         &engine.runtime,
         session_queue,
@@ -474,42 +471,7 @@ fn init_tcp_worker(engine: &mut Engine) -> HammerResult<()> {
                     (TcpWorker::new(worker), ()),
                     hammer_runtime::app::AppSessionConfig::default(),
                 );
-                let signal_read_fd = driver
-                    .app()
-                    .tx_evt_q()
-                    .read_fd()
-                    .ok_or(TcpNodeError::SvmQueueSignalReadFdMissing)?;
                 bind_typed_worker_graph::<C, Seg>(engine, driver)?;
-                let session_queue = engine
-                    .runtime
-                    .node_by_name("session-queue")
-                    .ok_or(TcpNodeError::SvmQueueNodeMissing)?;
-                // SAFETY: F_DUPFD_CLOEXEC duplicates the live queue endpoint
-                // and returns a fresh descriptor whose ownership moves below.
-                let duplicated = unsafe { libc::fcntl(signal_read_fd, libc::F_DUPFD_CLOEXEC, 0) };
-                if duplicated < 0 {
-                    return Err(TcpNodeError::SvmQueueSignalReadFdDuplicate.into());
-                }
-                // SAFETY: fcntl returned a new descriptor and File becomes its
-                // sole owner after this transfer.
-                let signal_read = unsafe { OwnedFd::from_raw_fd(duplicated) };
-                engine.file_main_mut()?.add(File::new(
-                    signal_read,
-                    worker,
-                    "SVM session queue app-to-dataplane signal".to_owned(),
-                    u64::from(session_queue.slot()),
-                    FileFunctions {
-                        read: Some(|file| {
-                            let node = NodeId::new(file.private_data() as u32);
-                            Engine::with_current(|engine| {
-                                engine.runtime.schedule_empty_frame(node)
-                            })
-                            .expect("File callbacks run on their polling Engine")?;
-                            Ok(())
-                        }),
-                        ..FileFunctions::default()
-                    },
-                ))?;
             }
         },
     }
@@ -561,12 +523,6 @@ pub enum TcpNodeError {
     BbrCongestion,
     #[error("bad window")]
     BadWindow,
-    #[error("SVM session queue signal-read descriptor is missing")]
-    SvmQueueSignalReadFdMissing,
-    #[error("duplicate SVM session queue signal-read descriptor")]
-    SvmQueueSignalReadFdDuplicate,
-    #[error("SVM session queue node is missing")]
-    SvmQueueNodeMissing,
 }
 
 impl TcpNodeError {
@@ -595,10 +551,7 @@ impl From<TcpNodeError> for TcpError {
             | TcpNodeError::Retransmit
             | TcpNodeError::PacingLimited
             | TcpNodeError::PersistTimer
-            | TcpNodeError::BbrCongestion
-            | TcpNodeError::SvmQueueSignalReadFdMissing
-            | TcpNodeError::SvmQueueSignalReadFdDuplicate
-            | TcpNodeError::SvmQueueNodeMissing => TcpError::Dispatch,
+            | TcpNodeError::BbrCongestion => TcpError::Dispatch,
             TcpNodeError::BadChecksum | TcpNodeError::BadSegment => TcpError::SegmentInvalid,
             TcpNodeError::ResetReceived => TcpError::ConnectionClosed,
             TcpNodeError::NoListener => TcpError::NoListener,

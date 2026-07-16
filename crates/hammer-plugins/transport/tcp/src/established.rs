@@ -360,13 +360,14 @@ mod tests {
     use hammer_core::protocol::tcp::{
         TcpCapabilities, TcpConnectionId, TcpSegmentFlags, TcpSegmentHeader,
     };
+    use hammer_core::registry::RuntimeRegistry;
     use hammer_infra::pool::Index as PoolIndex;
     use hammer_infra::segment::Local;
     use hammer_runtime::app::{
         AppSession, AppSessionConfig, SessionEvt, SessionEvtFlags, SessionEvtType, SessionHandle,
     };
     use hammer_runtime::{
-        DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeProcessFn, NodeResult,
+        DataPlaneRuntime, DataWorkerId, Engine, InternalNode, Node, NodeProcessFn, NodeResult,
         NodeRuntimeData,
     };
 
@@ -379,7 +380,7 @@ mod tests {
     use hammer_service::data_plane::DropNode;
     use hammer_service::opaque::NetworkOpaque;
     use hammer_service::session::runtime::SessionDriverRuntime;
-    use hammer_service::session::{SessionId, SessionQueueHandle};
+    use hammer_service::session::{SessionId, SessionQueueHandle, SessionQueueNode};
     use hammer_service::transport::congestion::BbrController;
 
     const LOCAL_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
@@ -481,8 +482,22 @@ mod tests {
             runtime.buffers().clone(),
             (TcpWorker::<BbrController>::new(worker), ()),
         );
-        let handle =
-            hammer_service::session::node::register_session_queue(driver).expect("register queue");
+        let queue_node = SessionQueueNode::new().expect("session queue node");
+        let queue_data = queue_node
+            .node_runtime_data()
+            .expect("session queue runtime data");
+        let queue_id = runtime
+            .nodes()
+            .try_register_driver(queue_node)
+            .expect("queue node");
+        let mut engine = Engine::new(runtime.clone(), RuntimeRegistry::new());
+        let handle = hammer_service::session::node::register_session_queue(
+            &mut engine,
+            queue_id,
+            queue_data,
+            driver,
+        )
+        .expect("register queue");
 
         let output_state = Arc::new(Mutex::new(CaptureState::default()));
         let drop_state = Arc::new(Mutex::new(CaptureState::default()));

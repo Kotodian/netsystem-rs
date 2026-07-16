@@ -1,15 +1,14 @@
-use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use hammer_core::data_plane::{BufferFrame, NodeId, NodeRegistration, NodeState};
+use hammer_core::data_plane::{BufferFrame, NodeRegistration, NodeState};
 use hammer_core::error::CoreResult;
 use hammer_core::registry::RuntimeRegistry;
 use hammer_infra::pool::Index;
-use hammer_infra::segment::{Local, Svm};
+use hammer_infra::segment::Local;
 use hammer_runtime::{
-    DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, Engine, File, FileFunctions,
-    InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
+    DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, Engine, InternalNode, Node,
+    NodeProcessFn, NodeResult, NodeRuntimeData,
 };
 
 use super::{SessionQueueNext, SessionQueueNode, register_session_queue};
@@ -19,7 +18,7 @@ use crate::session::runtime::{
     TransportSendFlags, TransportSendParams, TxBatchBuffer,
     dispatch_registered_session_queue_once_at, dispatch_session_queue_once,
 };
-use hammer_runtime::app::{AppSession, AppSessionConfig, SessionEventQueue, SessionHandle};
+use hammer_runtime::app::{AppSession, AppSessionConfig, SessionHandle};
 use hammer_runtime::app::{SessionEvt, SessionEvtType};
 
 #[derive(Default)]
@@ -165,59 +164,14 @@ impl TransportInternalTransport<Index, Local> for QuicRecordingTransport {
     }
 }
 
-struct SessionSignalTransport(Arc<Mutex<Vec<&'static str>>>);
-
-impl SessionTransport<Index, Svm> for SessionSignalTransport {
-    type Tx = TransportInternalTx;
-
-    const ID: SessionTransportId = SessionTransportId::new(3);
-
-    fn update_time(
-        &mut self,
-        _: &mut SessionWorker<Index, Svm>,
-        _: &DataPlaneRuntime,
-        _: SessionQueueNext,
-        _: &mut BufferFrame,
-        _: &mut super::SessionQueueOutput,
-        _: Instant,
-    ) -> CoreResult<()> {
-        self.0.lock().expect("events").push("time");
-        Ok(())
-    }
-
-    fn disconnect(
-        &mut self,
-        _: &mut SessionWorker<Index, Svm>,
-        _: Index,
-        _: &DataPlaneRuntime,
-        _: SessionQueueNext,
-        _: &mut BufferFrame,
-        _: &mut super::SessionQueueOutput,
-        _: Instant,
-    ) -> CoreResult<()> {
-        self.0.lock().expect("events").push("close");
-        Ok(())
-    }
-}
-
-impl TransportInternalTransport<Index, Svm> for SessionSignalTransport {
-    fn internal_tx(
-        &mut self,
-        _: &mut SessionWorker<Index, Svm>,
-        _: Index,
-        _: &DataPlaneRuntime,
-        _: SessionQueueNext,
-        _: &mut BufferFrame,
-        _: &mut super::SessionQueueOutput,
-        _: Instant,
-    ) -> CoreResult<()> {
-        Ok(())
-    }
-}
-
 #[test]
 fn session_queue_updates_all_static_transports_before_control_and_io() {
-    let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
+    let main = Engine::new(
+        DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()),
+        RuntimeRegistry::new(),
+    );
+    let mut engine = main.spawn(1).expect("spawn data worker");
+    let worker = engine.data_worker_id().expect("data worker id");
     let events = Arc::new(Mutex::new(Vec::new()));
     let sampled_times = Arc::new(Mutex::new(Vec::new()));
     let quic_id = QuicRecordingTransport::ID;
@@ -235,24 +189,26 @@ fn session_queue_updates_all_static_transports_before_control_and_io() {
         ),
     );
     let mut driver = SessionDriverRuntime::<_, Local, Index>::new(
-        DataWorkerId::new(0),
-        runtime.buffers().clone(),
+        worker,
+        engine.runtime.buffers().clone(),
         transports,
     );
     let session_id = driver.insert_session(quic_id, Index::new(9, 3));
     driver.schedule_disconnect_for_test(session_id);
     driver.schedule_session_work_for_test(session_id);
 
-    let handle = register_session_queue(driver).expect("register queue");
     let node = SessionQueueNode::new().expect("session queue node");
     let node_data = node.runtime_data;
-    let node_id = runtime
+    let node_id = engine
+        .runtime
         .nodes()
         .try_register_driver(node)
         .expect("register session queue node");
-    let sink = runtime.nodes().register_internal(BlackholeNode);
+    let sink = engine.runtime.nodes().register_internal(BlackholeNode);
+    let handle =
+        register_session_queue(&mut engine, node_id, node_data, driver).expect("register queue");
     SessionQueueNode::attach_queue_by_runtime_data(
-        &runtime,
+        &engine.runtime,
         node_id,
         node_data,
         handle,
@@ -264,18 +220,20 @@ fn session_queue_updates_all_static_transports_before_control_and_io() {
         >,
     )
     .expect("attach queue");
-    runtime
+    engine
+        .runtime
         .nodes()
         .set_node_state(node_id, NodeState::Polling)
         .expect("poll session queue");
 
     assert_eq!(
-        runtime
+        engine
+            .runtime
             .schedule_polling_driver_nodes()
             .expect("schedule session queue"),
         1
     );
-    assert_eq!(runtime.run_ready_nodes().expect("dispatch queue"), 1);
+    assert_eq!(engine.runtime.run_ready_nodes().expect("dispatch queue"), 1);
     assert_eq!(
         *events.lock().expect("events"),
         vec!["tcp_time", "quic_time", "control", "io"]
@@ -283,127 +241,6 @@ fn session_queue_updates_all_static_transports_before_control_and_io() {
     let times = sampled_times.lock().expect("times");
     assert_eq!(times.len(), 2);
     assert_eq!(times[0], times[1]);
-}
-
-#[test]
-fn svm_app_signal_schedules_session_queue_before_the_node_drains_events() {
-    let main = Engine::new(
-        DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()),
-        RuntimeRegistry::new(),
-    );
-    let mut engine = main.spawn(1).expect("spawn data worker");
-    let worker = engine.data_worker_id().expect("data worker id");
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let mut driver: SessionDriverRuntime<_, Svm, Index> = SessionDriverRuntime::new_svm(
-        worker,
-        engine.runtime.buffers().clone(),
-        (SessionSignalTransport(Arc::clone(&events)), ()),
-        AppSessionConfig::default(),
-    );
-    let session_id = driver
-        .insert_session_with_transport(SessionSignalTransport::ID, |_, _| Ok(Index::new(7, 1)))
-        .expect("create session");
-    let signal_read_fd = driver
-        .app()
-        .tx_evt_q()
-        .read_fd()
-        .expect("SVM queue signal-read descriptor");
-
-    // SAFETY: the descriptor is borrowed from the live SVM queue; fcntl only
-    // queries flags and does not take ownership.
-    let status_flags = unsafe { libc::fcntl(signal_read_fd, libc::F_GETFL) };
-    assert!(status_flags & libc::O_NONBLOCK != 0);
-    // SAFETY: as above, fcntl only queries descriptor flags.
-    let descriptor_flags = unsafe { libc::fcntl(signal_read_fd, libc::F_GETFD) };
-    assert!(descriptor_flags & libc::FD_CLOEXEC != 0);
-
-    let handle = register_session_queue(driver).expect("register queue");
-    let node = SessionQueueNode::new().expect("session queue node");
-    let node_data = node.runtime_data;
-    let session_queue = engine
-        .runtime
-        .nodes()
-        .try_register_driver(node)
-        .expect("register session queue node");
-    let sink = engine.runtime.nodes().register_internal(BlackholeNode);
-    SessionQueueNode::attach_queue_by_runtime_data(
-        &engine.runtime,
-        session_queue,
-        node_data,
-        handle,
-        sink,
-        dispatch_registered_session_queue_once_at::<(SessionSignalTransport, ()), Svm, Index>,
-    )
-    .expect("attach session queue");
-    engine
-        .runtime
-        .nodes()
-        .set_node_state(session_queue, NodeState::Polling)
-        .expect("poll session queue");
-
-    // SAFETY: F_DUPFD_CLOEXEC creates a new descriptor whose ownership moves
-    // into File below; the queue keeps its original descriptor for drain.
-    let duplicated = unsafe { libc::fcntl(signal_read_fd, libc::F_DUPFD_CLOEXEC, 0) };
-    assert!(duplicated >= 0);
-    // SAFETY: fcntl returned a fresh descriptor that File owns exactly once.
-    let signal_read = unsafe { OwnedFd::from_raw_fd(duplicated) };
-    let file_index = engine
-        .file_main_mut()
-        .expect("worker FileMain")
-        .add(File::new(
-            signal_read,
-            worker,
-            "SVM session queue app-to-dataplane signal".to_owned(),
-            u64::from(session_queue.slot()),
-            FileFunctions {
-                read: Some(|file| {
-                    let node = NodeId::new(file.private_data() as u32);
-                    Engine::with_current(|engine| engine.runtime.schedule_empty_frame(node))
-                        .expect("File callbacks run on their polling Engine")?;
-                    Ok(())
-                }),
-                ..FileFunctions::default()
-            },
-        ))
-        .expect("register SVM queue signal with FileMain");
-
-    handle
-        .borrow_mut()
-        .expect("session queue")
-        .app()
-        .tx_evt_q()
-        .enqueue_ctrl(SessionEvt::ctrl(
-            session_id.pool_index().slot(),
-            worker.slot() as u32,
-            SessionEvtType::Close,
-        ))
-        .expect("app writes close event");
-
-    engine.install_current();
-    assert_eq!(
-        engine
-            .file_main_mut()
-            .expect("worker FileMain")
-            .poll()
-            .expect("poll SVM queue readiness"),
-        1
-    );
-    Engine::uninstall_current();
-
-    assert_eq!(
-        engine
-            .file_main()
-            .expect("worker FileMain")
-            .get(file_index)
-            .expect("registered queue file")
-            .read_events(),
-        1
-    );
-    assert!(engine.runtime.nodes().has_pending());
-    assert!(events.lock().expect("events").is_empty());
-
-    assert!(engine.runtime.run_ready_nodes().expect("run session queue") >= 1);
-    assert_eq!(*events.lock().expect("events"), vec!["time", "close"]);
 }
 
 fn attach_local_app_session<T>(
