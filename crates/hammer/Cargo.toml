@@ -29,4 +29,5 @@ hammer-plugin-ip = { path = "../hammer-plugins/ip" }
 hammer-plugin-tcp = { path = "../hammer-plugins/transport/tcp" }
 hammer-plugin-udp = { path = "../hammer-plugins/transport/udp" }
 hammer-plugin-tun = { path = "../hammer-plugins/device/tun" }
+libc = { workspace = true }
 thiserror = { workspace = true }

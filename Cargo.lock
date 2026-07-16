@@ -691,6 +691,7 @@ dependencies = [
  "hammer-plugin-udp",
  "hammer-runtime",
  "hammer-service",
+ "libc",
  "linkme",
  "thiserror",
  "tokio",

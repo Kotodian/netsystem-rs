@@ -600,6 +600,28 @@ impl ScheduledFrameQueue {
 }
 
 impl NodeRuntimeInner {
+    fn inherit_worker_state(&mut self, current: &Self) -> CoreResult<()> {
+        if self.nodes.len() < current.nodes.len() {
+            return Err(CoreError::WorkerGraphUpdateNotAdditive);
+        }
+
+        for slot in 0..current.nodes.len() {
+            if self.node_names[slot] != current.node_names[slot]
+                || self.nodes[slot].kind != current.nodes[slot].kind
+            {
+                return Err(CoreError::WorkerGraphUpdateNotAdditive);
+            }
+
+            // The main thread publishes topology and process functions. The
+            // worker retains only state owned by its established node instance.
+            self.nodes[slot].runtime_data = current.nodes[slot].runtime_data;
+            self.node_states[slot] = current.node_states[slot];
+            self.error_counters[slot] = current.error_counters[slot].clone();
+            self.runtime_stats[slot] = current.runtime_stats[slot];
+        }
+        Ok(())
+    }
+
     #[inline]
     fn error_key(node: NodeId, code: u16) -> u64 {
         (u64::from(node.slot()) << 16) | u64::from(code)
@@ -957,6 +979,26 @@ impl Default for NodeRuntime {
     }
 }
 
+impl From<NodeRuntimeInner> for NodeRuntime {
+    fn from(inner: NodeRuntimeInner) -> Self {
+        debug_assert!(
+            inner
+                .pending_next_names
+                .iter()
+                .all(|names| names.is_empty()),
+            "worker graph must be resolved before installation"
+        );
+        let queue_capacity = inner.scheduled_frame_queue_capacity;
+        Self {
+            inner: Rc::new(RefCell::new(inner)),
+            queue: Rc::new(RefCell::new(ScheduledFrameQueue::with_capacity(
+                queue_capacity,
+            ))),
+            readiness: Rc::new(NodeReadiness::default()),
+        }
+    }
+}
+
 fn preferred_node_function<'registration>(
     node_name: &str,
     instruction_set: DataPlaneInstructionSet,
@@ -1067,7 +1109,7 @@ mod node_function_tests {
     fn worker_graph_replacement_uses_the_updated_main_topology() {
         let main = NodeRuntime::default();
         let alpha = register_graph_update_probe(&main, "alpha");
-        let worker = NodeRuntime::from_worker_inner(main.snapshot());
+        let worker: NodeRuntime = main.snapshot().into();
         let worker_data = NodeRuntimeData::from_usize(41).expect("worker runtime data");
         worker
             .set_node_runtime_data(alpha, worker_data)
@@ -1202,22 +1244,13 @@ impl NodeRuntime {
         *self.inner.borrow_mut() = graph;
     }
 
-    pub(crate) fn from_worker_inner(inner: NodeRuntimeInner) -> Self {
-        debug_assert!(
-            inner
-                .pending_next_names
-                .iter()
-                .all(|names| names.is_empty()),
-            "worker graph must be resolved before installation"
-        );
-        let queue_capacity = inner.scheduled_frame_queue_capacity;
-        Self {
-            inner: Rc::new(RefCell::new(inner)),
-            queue: Rc::new(RefCell::new(ScheduledFrameQueue::with_capacity(
-                queue_capacity,
-            ))),
-            readiness: Rc::new(NodeReadiness::default()),
-        }
+    pub(crate) fn replace_graph_preserving_worker_state(
+        &self,
+        mut graph: NodeRuntimeInner,
+    ) -> CoreResult<()> {
+        graph.inherit_worker_state(&self.inner.borrow())?;
+        self.replace_graph(graph);
+        Ok(())
     }
 
     pub(crate) fn install_node_function(

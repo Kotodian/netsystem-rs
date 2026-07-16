@@ -266,16 +266,19 @@ impl Engine {
                     .ok_or(HammerError::WorkerGraphUpdateMissing)
             })
             .and_then(|graph| {
-                self.runtime.nodes().replace_graph(graph);
-                self.called_worker_init_functions.clear();
+                self.runtime
+                    .nodes()
+                    .replace_graph_preserving_worker_state(graph)?;
                 crate::init::run_worker_init_functions(self)
             });
         let succeeded = result.is_ok();
-        if let Err(error) = result
-            && let Ok(mut first_error) = self.worker_graph_update_error.lock()
-            && first_error.is_none()
-        {
-            *first_error = Some(error);
+        if let Err(error) = result {
+            self.main_loop_exit_now.store(true, Ordering::Release);
+            if let Ok(mut first_error) = self.worker_graph_update_error.lock()
+                && first_error.is_none()
+            {
+                *first_error = Some(error);
+            }
         }
 
         let previous = self.workers_updating_graph.fetch_sub(1, Ordering::AcqRel);
@@ -283,7 +286,7 @@ impl Engine {
         while self.workers_updating_graph.load(Ordering::Acquire) != 0 {
             spin_loop();
         }
-        succeeded
+        succeeded && !self.main_loop_exit_now.load(Ordering::Acquire)
     }
 
     pub fn spawn(&self, index: u32) -> HammerResult<Self> {

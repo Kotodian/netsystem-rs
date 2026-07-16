@@ -174,7 +174,7 @@ impl From<DataPlaneRuntimeWorkerConfig> for DataPlaneRuntime {
             numa_node,
         });
         let mut runtime = Self::from_buffers_with_instruction_set(buffers, instruction_set);
-        runtime.nodes = NodeRuntime::from_worker_inner(nodes);
+        runtime.nodes = nodes.into();
         runtime.handoff = handoff;
         runtime.handoff_node_handle = handoff_node_handle;
         let configured_arena = runtime
