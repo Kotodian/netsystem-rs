@@ -72,6 +72,112 @@ pub enum CoreError {
     #[error("worker graph update state is poisoned")]
     WorkerGraphUpdateStatePoisoned,
 
+    #[error("failed to create attach signal pipe")]
+    AttachSignalPipeCreate {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to read attach signal status flags")]
+    AttachSignalStatusFlags {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to set attach signal nonblocking status")]
+    AttachSignalNonblocking {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to read attach signal descriptor flags")]
+    AttachSignalDescriptorFlags {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to set attach signal close-on-exec")]
+    AttachSignalCloseOnExec {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("attach control buffer has no first header")]
+    AttachControlHeaderMissing,
+    #[error("failed to send attach descriptors")]
+    AttachSend {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to bind attach server at {path}")]
+    AttachBind {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("attach RX FIFO configuration is invalid")]
+    AttachRxFifoInvalid,
+    #[error("attach TX FIFO configuration is invalid")]
+    AttachTxFifoInvalid,
+    #[error("attach event queue configuration is invalid")]
+    AttachEventQueueInvalid,
+    #[error("attach TX event queue configuration is invalid")]
+    AttachTxEventQueueInvalid,
+    #[error("failed to accept attach client")]
+    AttachAccept {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("attach segment has no backing descriptor")]
+    AttachSegmentDescriptorMissing,
+    #[error("failed to connect to attach server at {path}")]
+    AttachConnect {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to receive attach descriptors")]
+    AttachReceive {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("attach metadata length mismatch: expected {expected}, got {actual}")]
+    AttachMetadataLength { expected: usize, actual: usize },
+    #[error("attach descriptor control data was truncated")]
+    AttachControlTruncated,
+    #[error("attach message contained unexpected control data")]
+    AttachUnexpectedControl,
+    #[error("attach descriptor control header is invalid")]
+    AttachInvalidControlHeader,
+    #[error("attach descriptor payload is invalid")]
+    AttachInvalidDescriptorPayload,
+    #[error("attach descriptor count mismatch: expected {expected}, got {actual}")]
+    AttachDescriptorCount { expected: usize, actual: usize },
+    #[error("failed to read received attach descriptor flags")]
+    AttachReceivedDescriptorFlags {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to set received attach descriptor close-on-exec")]
+    AttachReceivedDescriptorCloseOnExec {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("attach offsets exceed the mapped address range")]
+    AttachOffsetOverflow,
+    #[error("failed to map the attached SVM segment")]
+    AttachSegmentMap {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("remote app session requires a signal-read descriptor")]
+    AttachSessionSignalMissing,
+    #[error("failed to duplicate remote app session signal descriptor")]
+    AttachSessionSignalDuplicate {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to register remote app session readiness")]
+    AttachSessionReadiness {
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error(transparent)]
     Tcp(#[from] crate::protocol::tcp::TcpError),
 

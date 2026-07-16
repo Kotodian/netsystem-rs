@@ -150,6 +150,11 @@ impl Svm {
         Ok(Self { region })
     }
 
+    /// Attach to a shared mapping through a borrowed descriptor.
+    ///
+    /// The returned segment owns a close-on-exec duplicate, so the caller may
+    /// close the supplied descriptor immediately without invalidating
+    /// [`Segment::fd`].
     pub fn from_fd(fd: RawFd, size: usize) -> Result<Self, io::Error> {
         SvmRegion::from_fd(fd, size)
             .map(|region| Self { region })

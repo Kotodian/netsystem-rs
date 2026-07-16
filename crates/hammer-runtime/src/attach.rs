@@ -1,9 +1,7 @@
-use std::os::fd::RawFd;
-use std::os::unix::io::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 
-use hammer_core::error::{HammerError, HammerResult};
+use hammer_core::error::{CoreError, HammerResult};
 use hammer_infra::fifo::Fifo;
-use hammer_infra::fifo::FifoError;
 use hammer_infra::segment::{Segment, Svm};
 
 use crate::app::{
@@ -25,32 +23,56 @@ pub struct AttachedApp<S: SessionSegment> {
     pub shm_fd: RawFd,
 }
 
-fn create_pipe_flags() -> HammerResult<(RawFd, RawFd)> {
+fn create_pipe_flags() -> HammerResult<(OwnedFd, OwnedFd)> {
     let mut fds = [0i32; 2];
+    // SAFETY: fds is writable for two descriptors. Fresh descriptors are
+    // transferred into OwnedFd immediately on success.
     let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
     if ret != 0 {
-        return Err(HammerError::internal("create attach signal pipe"));
+        return Err(CoreError::AttachSignalPipeCreate {
+            source: std::io::Error::last_os_error(),
+        });
     }
-    for fd in &fds {
-        let flags = unsafe { libc::fcntl(*fd, libc::F_GETFL) };
-        unsafe {
-            libc::fcntl(*fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    // SAFETY: pipe returned two fresh descriptors with unique ownership.
+    let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    // SAFETY: ownership of the distinct write descriptor transfers once.
+    let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    for fd in [&read, &write] {
+        // SAFETY: fcntl only queries the live descriptor owned above.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
+            return Err(CoreError::AttachSignalStatusFlags {
+                source: std::io::Error::last_os_error(),
+            });
         }
-        let fdflags = unsafe { libc::fcntl(*fd, libc::F_GETFD) };
-        unsafe {
-            libc::fcntl(*fd, libc::F_SETFD, fdflags | libc::FD_CLOEXEC);
+        // SAFETY: queried flags are valid for this live descriptor.
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(CoreError::AttachSignalNonblocking {
+                source: std::io::Error::last_os_error(),
+            });
+        }
+        // SAFETY: fcntl only queries descriptor flags.
+        let descriptor_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        if descriptor_flags < 0 {
+            return Err(CoreError::AttachSignalDescriptorFlags {
+                source: std::io::Error::last_os_error(),
+            });
+        }
+        // SAFETY: queried flags are valid for this live descriptor.
+        if unsafe {
+            libc::fcntl(
+                fd.as_raw_fd(),
+                libc::F_SETFD,
+                descriptor_flags | libc::FD_CLOEXEC,
+            )
+        } < 0
+        {
+            return Err(CoreError::AttachSignalCloseOnExec {
+                source: std::io::Error::last_os_error(),
+            });
         }
     }
-    Ok((fds[0], fds[1]))
-}
-
-fn dup_fd(fd: RawFd) -> HammerResult<RawFd> {
-    let duped = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-    if duped < 0 {
-        Err(HammerError::internal("dup attach signal fd"))
-    } else {
-        Ok(duped)
-    }
+    Ok((read, write))
 }
 
 /// Pack the fds needed by the app process into a SCM_RIGHTS message
@@ -85,7 +107,7 @@ fn send_attach_message(
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&msg);
         if cmsg.is_null() {
-            return Err(HammerError::internal("attach CMSG_FIRSTHDR failed"));
+            return Err(CoreError::AttachControlHeaderMissing);
         }
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
@@ -96,10 +118,9 @@ fn send_attach_message(
 
     let ret = unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, 0) };
     if ret < 0 {
-        Err(HammerError::internal(format!(
-            "attach sendmsg failed: {}",
-            std::io::Error::last_os_error()
-        )))
+        Err(CoreError::AttachSend {
+            source: std::io::Error::last_os_error(),
+        })
     } else {
         Ok(())
     }
@@ -109,8 +130,11 @@ impl AttachServer {
     /// Bind to a Unix domain socket at `path`.
     pub fn bind(path: &str) -> HammerResult<Self> {
         let _ = std::fs::remove_file(path);
-        let listener = std::os::unix::net::UnixListener::bind(path).map_err(|e| {
-            HammerError::internal(format!("failed to bind attach server at {path}: {e}"))
+        let listener = std::os::unix::net::UnixListener::bind(path).map_err(|source| {
+            CoreError::AttachBind {
+                path: path.into(),
+                source,
+            }
         })?;
         Ok(Self { listener })
     }
@@ -129,18 +153,18 @@ impl AttachServer {
 
         unsafe {
             Fifo::<Svm>::init_at(seg.clone(), offsets.rx_fifo_off, config.fifo_capacity)
-                .map_err(|e| HammerError::internal(format!("attach init rx fifo: {e:?}")))?;
+                .map_err(|_| CoreError::AttachRxFifoInvalid)?;
             Fifo::<Svm>::init_at(seg.clone(), offsets.tx_fifo_off, config.fifo_capacity)
-                .map_err(|e| HammerError::internal(format!("attach init tx fifo: {e:?}")))?;
+                .map_err(|_| CoreError::AttachTxFifoInvalid)?;
         }
 
         let ring_nitems = config.evt_q_capacity.max(1) as u32;
         let q_nitems = (config.evt_q_capacity + 1).next_power_of_two().max(2) as u32;
         unsafe {
             SessionMsgQueue::<Svm>::init_at(seg.clone(), offsets.evt_q_off, q_nitems, ring_nitems)
-                .map_err(|e| HammerError::internal(format!("attach init evt_q: {e:?}")))?;
+                .map_err(|_| CoreError::AttachEventQueueInvalid)?;
             SessionMsgQueue::<Svm>::init_at(seg.clone(), offsets.tx_evt_q_off, 64, 64)
-                .map_err(|e| HammerError::internal(format!("attach init tx_evt_q: {e:?}")))?;
+                .map_err(|_| CoreError::AttachTxEventQueueInvalid)?;
         }
 
         // Create signal pipe pairs for cross-process notification.
@@ -153,8 +177,8 @@ impl AttachServer {
                 seg,
                 &offsets,
                 None,
-                Some(evt_q_write),
-                Some(tx_evt_q_read),
+                Some(evt_q_write.into_raw_fd()),
+                Some(tx_evt_q_read.into_raw_fd()),
                 None,
             )
         };
@@ -162,23 +186,15 @@ impl AttachServer {
         let (stream, _) = self
             .listener
             .accept()
-            .map_err(|e| HammerError::internal(format!("attach accept connection: {e}")))?;
+            .map_err(|source| CoreError::AttachAccept { source })?;
 
-        let shm_fd = seg
-            .fd()
-            .ok_or_else(|| HammerError::internal("attach segment has no fd"))?;
-
-        // Dup the fds we need to send to the app so the server-side Session
-        // Message Queues (inside the AppSession, via from_segment) retain
-        // ownership of their copies.
-        let client_evt_q_read = dup_fd(evt_q_read)?;
-        let client_tx_evt_q_write = dup_fd(tx_evt_q_write)?;
+        let shm_fd = seg.fd().ok_or(CoreError::AttachSegmentDescriptorMissing)?;
 
         send_attach_message(
             &stream,
             shm_fd,
-            client_evt_q_read,
-            client_tx_evt_q_write,
+            evt_q_read.as_raw_fd(),
+            tx_evt_q_write.as_raw_fd(),
             &offsets,
         )?;
 

@@ -31,7 +31,6 @@ struct SvmRegionInner {
     size: usize,
     fd: RawFd,
     allocator: Option<talc::TalcLock<spinning_top::RawSpinlock, talc::source::Manual>>,
-    fd_owned: bool,
 }
 
 unsafe impl Send for SvmRegionInner {}
@@ -57,7 +56,7 @@ impl SvmRegion {
         let pid = std::process::id();
 
         #[cfg(target_os = "linux")]
-        let (base, fd, fd_owned) = {
+        let (base, fd) = {
             let name = CString::new(format!("hammer-region-{pid}-{counter}"))
                 .expect("generated memfd name contains no nul");
             let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
@@ -91,11 +90,11 @@ impl SvmRegion {
                 panic!("SvmRegion::with_size: mmap failed: {error}");
             }
 
-            (base.cast::<u8>(), fd, true)
+            (base.cast::<u8>(), fd)
         };
 
         #[cfg(not(target_os = "linux"))]
-        let (base, fd, fd_owned) = {
+        let (base, fd) = {
             let name = CString::new(format!("/hammer-region-{pid}-{counter}"))
                 .expect("generated shm name contains no nul");
             let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600) };
@@ -130,7 +129,7 @@ impl SvmRegion {
                 panic!("SvmRegion::with_size: mmap failed: {error}");
             }
 
-            (base.cast::<u8>(), fd, true)
+            (base.cast::<u8>(), fd)
         };
 
         let allocator = match Self::claim_allocator(base, total) {
@@ -150,16 +149,21 @@ impl SvmRegion {
                 size: total,
                 fd,
                 allocator,
-                fd_owned,
             }),
         }
     }
 
     pub fn from_fd(fd: RawFd, size: usize) -> Option<SvmRegion> {
-        Self::from_fd_owned(fd, size, false)
+        // SAFETY: F_DUPFD_CLOEXEC duplicates the borrowed live descriptor and
+        // returns a fresh descriptor owned by the attached mapping.
+        let owned_fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if owned_fd < 0 {
+            return None;
+        }
+        Self::from_fd_owned(owned_fd, size)
     }
 
-    pub(crate) fn from_fd_owned(fd: RawFd, size: usize, fd_owned: bool) -> Option<SvmRegion> {
+    pub(crate) fn from_fd_owned(fd: RawFd, size: usize) -> Option<SvmRegion> {
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         assert!(
             page > 0,
@@ -177,9 +181,7 @@ impl SvmRegion {
             )
         };
         if base == libc::MAP_FAILED {
-            if fd_owned {
-                unsafe { libc::close(fd) };
-            }
+            unsafe { libc::close(fd) };
             return None;
         }
 
@@ -189,7 +191,6 @@ impl SvmRegion {
                 size: total,
                 fd,
                 allocator: None,
-                fd_owned,
             }),
         })
     }
@@ -233,7 +234,6 @@ impl SvmRegion {
                 size: total,
                 fd,
                 allocator,
-                fd_owned: true,
             }),
         })
     }
@@ -358,9 +358,7 @@ impl Drop for SvmRegionInner {
             if !self.base.is_null() {
                 libc::munmap(self.base.cast::<libc::c_void>(), self.size);
             }
-            if self.fd_owned {
-                libc::close(self.fd);
-            }
+            libc::close(self.fd);
         }
     }
 }
