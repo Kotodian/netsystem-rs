@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use hammer_app::attach::AttachClient;
 use hammer_app::remote_session::RemoteAppSession;
-use hammer_core::error::CoreError;
+use hammer_core::error::{AttachError, CoreError};
 use hammer_infra::segment::{Segment, Svm};
 use hammer_runtime::app::{AppSessionConfig, SessionEventQueue, SessionHandle};
 use hammer_runtime::attach::{AttachServer, AttachedApp};
@@ -158,7 +158,10 @@ fn assert_attach_server_failure_releases_created_descriptors() {
         &segment,
         SessionHandle::new(1, 0),
     );
-    assert!(matches!(result, Err(CoreError::AttachSend { .. })));
+    assert!(matches!(
+        result,
+        Err(CoreError::Attach(AttachError::Send { .. }))
+    ));
 
     drop(server);
     drop(segment);
@@ -194,10 +197,10 @@ fn assert_malformed_attach_closes_received_descriptor_before_returning_error() {
     );
     assert!(matches!(
         result,
-        Err(CoreError::AttachDescriptorCount {
+        Err(CoreError::Attach(AttachError::DescriptorCount {
             expected: 3,
             actual: 1
-        })
+        }))
     ));
     let mut peer = server_thread.join().expect("join malformed server");
     peer.set_nonblocking(true).expect("set peer nonblocking");
@@ -223,7 +226,10 @@ fn assert_mapping_failure_closes_every_received_descriptor() {
         path.to_str().expect("socket path"),
         SessionHandle::new(1, 0),
     );
-    assert!(matches!(result, Err(CoreError::AttachSegmentMap { .. })));
+    assert!(matches!(
+        result,
+        Err(CoreError::Attach(AttachError::SegmentMap { .. }))
+    ));
     let (sent, peer, identity, baseline) = server_thread.join().expect("join mapping server");
     assert_eq!(count_open_identity(identity), baseline);
     drop(sent);

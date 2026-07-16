@@ -1,7 +1,7 @@
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 
-use hammer_core::error::{CoreError, HammerResult};
+use hammer_core::error::{AttachError, HammerResult};
 use hammer_infra::segment::Svm;
 
 use hammer_runtime::app::{AppSession, SessionHandle, SessionOffsets};
@@ -31,9 +31,10 @@ fn recv_attach_message(stream: &UnixStream) -> HammerResult<([OwnedFd; 3], Sessi
     // SAFETY: message points to writable data and control buffers for recvmsg.
     let ret = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, 0) };
     if ret < 0 {
-        return Err(CoreError::AttachReceive {
+        return Err(AttachError::Receive {
             source: std::io::Error::last_os_error(),
-        });
+        }
+        .into());
     }
 
     let mut received = Vec::new();
@@ -43,17 +44,17 @@ fn recv_attach_message(stream: &UnixStream) -> HammerResult<([OwnedFd; 3], Sessi
         let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
         while !cmsg.is_null() {
             if (*cmsg).cmsg_level != libc::SOL_SOCKET || (*cmsg).cmsg_type != libc::SCM_RIGHTS {
-                return Err(CoreError::AttachUnexpectedControl);
+                return Err(AttachError::UnexpectedControl.into());
             }
             rights_headers += 1;
             let header_len = libc::CMSG_LEN(0) as usize;
             let cmsg_len = (*cmsg).cmsg_len as usize;
             if cmsg_len < header_len {
-                return Err(CoreError::AttachInvalidControlHeader);
+                return Err(AttachError::InvalidControlHeader.into());
             }
             let payload_len = cmsg_len - header_len;
             if payload_len % std::mem::size_of::<RawFd>() != 0 {
-                return Err(CoreError::AttachInvalidDescriptorPayload);
+                return Err(AttachError::InvalidDescriptorPayload.into());
             }
             let fd_count = payload_len / std::mem::size_of::<RawFd>();
             let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
@@ -67,39 +68,43 @@ fn recv_attach_message(stream: &UnixStream) -> HammerResult<([OwnedFd; 3], Sessi
         }
     }
     if ret as usize != std::mem::size_of_val(&offsets_bytes) {
-        return Err(CoreError::AttachMetadataLength {
+        return Err(AttachError::MetadataLength {
             expected: std::mem::size_of_val(&offsets_bytes),
             actual: ret as usize,
-        });
+        }
+        .into());
     }
     if msg.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0 {
-        return Err(CoreError::AttachControlTruncated);
+        return Err(AttachError::ControlTruncated.into());
     }
     if rights_headers != 1 || received.len() != 3 {
-        return Err(CoreError::AttachDescriptorCount {
+        return Err(AttachError::DescriptorCount {
             expected: 3,
             actual: received.len(),
-        });
+        }
+        .into());
     }
     for fd in &received {
         // SAFETY: fcntl only queries a live received descriptor.
         let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
         if flags < 0 {
-            return Err(CoreError::AttachReceivedDescriptorFlags {
+            return Err(AttachError::ReceivedDescriptorFlags {
                 source: std::io::Error::last_os_error(),
-            });
+            }
+            .into());
         }
         // SAFETY: queried descriptor flags are valid for F_SETFD.
         if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
-            return Err(CoreError::AttachReceivedDescriptorCloseOnExec {
+            return Err(AttachError::ReceivedDescriptorCloseOnExec {
                 source: std::io::Error::last_os_error(),
-            });
+            }
+            .into());
         }
     }
     let fds: [OwnedFd; 3] =
         received
             .try_into()
-            .map_err(|received: Vec<OwnedFd>| CoreError::AttachDescriptorCount {
+            .map_err(|received: Vec<OwnedFd>| AttachError::DescriptorCount {
                 expected: 3,
                 actual: received.len(),
             })?;
@@ -118,7 +123,7 @@ impl AttachClient {
     /// Connect to the dataplane's attach socket at `path` and set up
     /// the app-side half of a shared-memory session.
     pub fn connect(path: &str, handle: SessionHandle) -> HammerResult<Self> {
-        let stream = UnixStream::connect(path).map_err(|source| CoreError::AttachConnect {
+        let stream = UnixStream::connect(path).map_err(|source| AttachError::Connect {
             path: path.into(),
             source,
         })?;
@@ -132,10 +137,10 @@ impl AttachClient {
         let seg_size = offsets
             .tx_evt_q_off
             .checked_add(4096)
-            .ok_or(CoreError::AttachOffsetOverflow)? as usize;
+            .ok_or(AttachError::OffsetOverflow)? as usize;
 
         let seg = Svm::from_fd(shm_fd.as_raw_fd(), seg_size)
-            .map_err(|source| CoreError::AttachSegmentMap { source })?;
+            .map_err(|source| AttachError::SegmentMap { source })?;
 
         let session = unsafe {
             AppSession::<Svm>::from_segment(

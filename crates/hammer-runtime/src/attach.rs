@@ -1,6 +1,6 @@
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 
-use hammer_core::error::{CoreError, HammerResult};
+use hammer_core::error::{AttachError, HammerResult};
 use hammer_infra::fifo::Fifo;
 use hammer_infra::segment::{Segment, Svm};
 
@@ -29,9 +29,10 @@ fn create_pipe_flags() -> HammerResult<(OwnedFd, OwnedFd)> {
     // transferred into OwnedFd immediately on success.
     let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
     if ret != 0 {
-        return Err(CoreError::AttachSignalPipeCreate {
+        return Err(AttachError::SignalPipeCreate {
             source: std::io::Error::last_os_error(),
-        });
+        }
+        .into());
     }
     // SAFETY: pipe returned two fresh descriptors with unique ownership.
     let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
@@ -41,22 +42,25 @@ fn create_pipe_flags() -> HammerResult<(OwnedFd, OwnedFd)> {
         // SAFETY: fcntl only queries the live descriptor owned above.
         let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
         if flags < 0 {
-            return Err(CoreError::AttachSignalStatusFlags {
+            return Err(AttachError::SignalStatusFlags {
                 source: std::io::Error::last_os_error(),
-            });
+            }
+            .into());
         }
         // SAFETY: queried flags are valid for this live descriptor.
         if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-            return Err(CoreError::AttachSignalNonblocking {
+            return Err(AttachError::SignalNonblocking {
                 source: std::io::Error::last_os_error(),
-            });
+            }
+            .into());
         }
         // SAFETY: fcntl only queries descriptor flags.
         let descriptor_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
         if descriptor_flags < 0 {
-            return Err(CoreError::AttachSignalDescriptorFlags {
+            return Err(AttachError::SignalDescriptorFlags {
                 source: std::io::Error::last_os_error(),
-            });
+            }
+            .into());
         }
         // SAFETY: queried flags are valid for this live descriptor.
         if unsafe {
@@ -67,9 +71,10 @@ fn create_pipe_flags() -> HammerResult<(OwnedFd, OwnedFd)> {
             )
         } < 0
         {
-            return Err(CoreError::AttachSignalCloseOnExec {
+            return Err(AttachError::SignalCloseOnExec {
                 source: std::io::Error::last_os_error(),
-            });
+            }
+            .into());
         }
     }
     Ok((read, write))
@@ -107,7 +112,7 @@ fn send_attach_message(
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&msg);
         if cmsg.is_null() {
-            return Err(CoreError::AttachControlHeaderMissing);
+            return Err(AttachError::ControlHeaderMissing.into());
         }
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
@@ -118,9 +123,10 @@ fn send_attach_message(
 
     let ret = unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, 0) };
     if ret < 0 {
-        Err(CoreError::AttachSend {
+        Err(AttachError::Send {
             source: std::io::Error::last_os_error(),
-        })
+        }
+        .into())
     } else {
         Ok(())
     }
@@ -130,12 +136,11 @@ impl AttachServer {
     /// Bind to a Unix domain socket at `path`.
     pub fn bind(path: &str) -> HammerResult<Self> {
         let _ = std::fs::remove_file(path);
-        let listener = std::os::unix::net::UnixListener::bind(path).map_err(|source| {
-            CoreError::AttachBind {
+        let listener =
+            std::os::unix::net::UnixListener::bind(path).map_err(|source| AttachError::Bind {
                 path: path.into(),
                 source,
-            }
-        })?;
+            })?;
         Ok(Self { listener })
     }
 
@@ -153,18 +158,18 @@ impl AttachServer {
 
         unsafe {
             Fifo::<Svm>::init_at(seg.clone(), offsets.rx_fifo_off, config.fifo_capacity)
-                .map_err(|_| CoreError::AttachRxFifoInvalid)?;
+                .map_err(|_| AttachError::RxFifoInvalid)?;
             Fifo::<Svm>::init_at(seg.clone(), offsets.tx_fifo_off, config.fifo_capacity)
-                .map_err(|_| CoreError::AttachTxFifoInvalid)?;
+                .map_err(|_| AttachError::TxFifoInvalid)?;
         }
 
         let ring_nitems = config.evt_q_capacity.max(1) as u32;
         let q_nitems = (config.evt_q_capacity + 1).next_power_of_two().max(2) as u32;
         unsafe {
             SessionMsgQueue::<Svm>::init_at(seg.clone(), offsets.evt_q_off, q_nitems, ring_nitems)
-                .map_err(|_| CoreError::AttachEventQueueInvalid)?;
+                .map_err(|_| AttachError::EventQueueInvalid)?;
             SessionMsgQueue::<Svm>::init_at(seg.clone(), offsets.tx_evt_q_off, 64, 64)
-                .map_err(|_| CoreError::AttachTxEventQueueInvalid)?;
+                .map_err(|_| AttachError::TxEventQueueInvalid)?;
         }
 
         // Create signal pipe pairs for cross-process notification.
@@ -186,9 +191,9 @@ impl AttachServer {
         let (stream, _) = self
             .listener
             .accept()
-            .map_err(|source| CoreError::AttachAccept { source })?;
+            .map_err(|source| AttachError::Accept { source })?;
 
-        let shm_fd = seg.fd().ok_or(CoreError::AttachSegmentDescriptorMissing)?;
+        let shm_fd = seg.fd().ok_or(AttachError::SegmentDescriptorMissing)?;
 
         send_attach_message(
             &stream,

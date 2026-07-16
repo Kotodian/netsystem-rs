@@ -1,7 +1,7 @@
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
-use hammer_core::error::{CoreError, HammerResult};
+use hammer_core::error::{AttachError, HammerResult};
 use hammer_infra::segment::Svm;
 use hammer_runtime::app::{SessionEventQueue, SessionEvt};
 use tokio::io::unix::AsyncFd;
@@ -26,19 +26,20 @@ impl RemoteAppSession {
         let read_fd = session
             .evt_q()
             .read_fd()
-            .ok_or(CoreError::AttachSessionSignalMissing)?;
+            .ok_or(AttachError::SessionSignalMissing)?;
         // SAFETY: F_DUPFD_CLOEXEC duplicates the live queue endpoint and
         // returns a fresh descriptor whose ownership transfers below.
         let duped = unsafe { libc::fcntl(read_fd, libc::F_DUPFD_CLOEXEC, 0) };
         if duped < 0 {
-            return Err(CoreError::AttachSessionSignalDuplicate {
+            return Err(AttachError::SessionSignalDuplicate {
                 source: std::io::Error::last_os_error(),
-            });
+            }
+            .into());
         }
         // SAFETY: fcntl returned a fresh descriptor and ownership transfers once.
         let owned = unsafe { OwnedFd::from_raw_fd(duped) };
         let evt_async_fd =
-            AsyncFd::new(owned).map_err(|source| CoreError::AttachSessionReadiness { source })?;
+            AsyncFd::new(owned).map_err(|source| AttachError::SessionReadiness { source })?;
         Ok(Self {
             session,
             evt_async_fd,

@@ -105,42 +105,14 @@ fn plugin_command_error(error: CoreError) -> PluginCommandError {
         }
         CoreError::WorkerCountOverflow { .. } => PluginCommandError::WorkerCountOverflow,
         CoreError::WorkerGraphUpdateAlreadyPending => PluginCommandError::WorkerGraphUpdatePending,
-        CoreError::WorkerGraphUpdateMissing | CoreError::WorkerGraphUpdateStatePoisoned => {
-            PluginCommandError::WorkerGraphUpdate
-        }
+        CoreError::WorkerGraphUpdateMissing
+        | CoreError::WorkerGraphUpdateStatePoisoned
+        | CoreError::WorkerGraphUpdateNotAdditive => PluginCommandError::WorkerGraphUpdate,
         CoreError::ConfigParse { .. } | CoreError::ConfigValidation { .. } => {
             PluginCommandError::Configuration
         }
         CoreError::DataPlane(_) => PluginCommandError::GraphMaterialization,
-        CoreError::AttachSignalPipeCreate { .. }
-        | CoreError::AttachSignalStatusFlags { .. }
-        | CoreError::AttachSignalNonblocking { .. }
-        | CoreError::AttachSignalDescriptorFlags { .. }
-        | CoreError::AttachSignalCloseOnExec { .. }
-        | CoreError::AttachControlHeaderMissing
-        | CoreError::AttachSend { .. }
-        | CoreError::AttachBind { .. }
-        | CoreError::AttachRxFifoInvalid
-        | CoreError::AttachTxFifoInvalid
-        | CoreError::AttachEventQueueInvalid
-        | CoreError::AttachTxEventQueueInvalid
-        | CoreError::AttachAccept { .. }
-        | CoreError::AttachSegmentDescriptorMissing
-        | CoreError::AttachConnect { .. }
-        | CoreError::AttachReceive { .. }
-        | CoreError::AttachMetadataLength { .. }
-        | CoreError::AttachControlTruncated
-        | CoreError::AttachUnexpectedControl
-        | CoreError::AttachInvalidControlHeader
-        | CoreError::AttachInvalidDescriptorPayload
-        | CoreError::AttachDescriptorCount { .. }
-        | CoreError::AttachReceivedDescriptorFlags { .. }
-        | CoreError::AttachReceivedDescriptorCloseOnExec { .. }
-        | CoreError::AttachOffsetOverflow
-        | CoreError::AttachSegmentMap { .. }
-        | CoreError::AttachSessionSignalMissing
-        | CoreError::AttachSessionSignalDuplicate { .. }
-        | CoreError::AttachSessionReadiness { .. }
+        CoreError::Attach(_)
         | CoreError::MainHeap(_)
         | CoreError::Lifecycle { .. }
         | CoreError::ServiceClosed
