@@ -585,8 +585,10 @@ impl<T, Index: Copy + Eq> SessionDriverRuntime<T, Svm, Index> {
         let layout = SessionMsgQueue::<Svm>::layout_bytes(cap, cap.max(2)).expect("tx layout");
         let off = seg.alloc(layout, 64);
         let tx_evt_q = Arc::new(
-            unsafe { SessionMsgQueue::<Svm>::init_at(seg.clone(), off, cap, cap.max(2)) }
-                .expect("svm tx_evt_q"),
+            unsafe {
+                SessionMsgQueue::<Svm>::init_at_with_signal(seg.clone(), off, cap, cap.max(2))
+            }
+            .expect("svm tx_evt_q"),
         );
         Self::with_app_session_config(
             worker,

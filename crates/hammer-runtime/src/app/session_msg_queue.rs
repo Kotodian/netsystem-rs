@@ -7,7 +7,7 @@
 //! Session Event identity follows ADR-0010 (VPP `session_event_t` rules).
 
 use std::mem::size_of;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -154,6 +154,11 @@ pub enum SessionEvtType {
 pub enum SessionMsgQueueError {
     InvalidConfig,
     Full(SessionEvt),
+    SignalPipeCreate,
+    SignalStatusFlags,
+    SignalNonblocking,
+    SignalDescriptorFlags,
+    SignalCloseOnExec,
 }
 
 /// Shared Session Message Queue operations for Local and SVM backends.
@@ -442,6 +447,80 @@ impl<S: Segment> SessionEventQueue for SessionMsgQueue<S> {
             Some(signal_read) => Some(signal_read.as_raw_fd()),
             None => None,
         }
+    }
+}
+
+impl SessionMsgQueue<Svm> {
+    /// Initialise an SVM queue and attach a nonblocking, close-on-exec
+    /// app-write/dataplane-read signal pair owned by the queue.
+    ///
+    /// # Safety
+    /// Caller must reserve at least [`Self::layout_bytes`] at `hdr_offset`.
+    pub unsafe fn init_at_with_signal(
+        seg: Svm,
+        hdr_offset: u64,
+        q_nitems: u32,
+        ring_nitems: u32,
+    ) -> Result<Self, SessionMsgQueueError> {
+        // SAFETY: forwarded caller layout guarantee initializes the shared
+        // queue before it is remapped with the signal endpoint ownership.
+        drop(unsafe { Self::init_at(seg.clone(), hdr_offset, q_nitems, ring_nitems) }?);
+        let mut fds = [-1; 2];
+        // SAFETY: `fds` is writable for two descriptor values. On success each
+        // descriptor is immediately transferred into exactly one OwnedFd.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+            return Err(SessionMsgQueueError::SignalPipeCreate);
+        }
+        // SAFETY: pipe returned fresh, distinct descriptors and ownership moves
+        // into the two OwnedFd values exactly once.
+        let signal_read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        // SAFETY: see the preceding ownership transfer for the write endpoint.
+        let signal_write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        for fd in [&signal_read, &signal_write] {
+            // SAFETY: `fd` remains owned by this function; fcntl only queries
+            // descriptor flags and does not take ownership.
+            let status_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+            if status_flags < 0 {
+                return Err(SessionMsgQueueError::SignalStatusFlags);
+            }
+            // SAFETY: as above; queried flags are valid input for F_SETFL.
+            if unsafe {
+                libc::fcntl(
+                    fd.as_raw_fd(),
+                    libc::F_SETFL,
+                    status_flags | libc::O_NONBLOCK,
+                )
+            } < 0
+            {
+                return Err(SessionMsgQueueError::SignalNonblocking);
+            }
+            // SAFETY: as above; this only queries descriptor flags.
+            let descriptor_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+            if descriptor_flags < 0 {
+                return Err(SessionMsgQueueError::SignalDescriptorFlags);
+            }
+            // SAFETY: as above; queried flags are valid input for F_SETFD.
+            if unsafe {
+                libc::fcntl(
+                    fd.as_raw_fd(),
+                    libc::F_SETFD,
+                    descriptor_flags | libc::FD_CLOEXEC,
+                )
+            } < 0
+            {
+                return Err(SessionMsgQueueError::SignalCloseOnExec);
+            }
+        }
+        // SAFETY: the queue was initialized above and the fresh descriptors
+        // transfer sole ownership into the returned queue.
+        Ok(unsafe {
+            Self::from_shared(
+                seg,
+                hdr_offset,
+                Some(signal_read.into_raw_fd()),
+                Some(signal_write.into_raw_fd()),
+            )
+        })
     }
 }
 

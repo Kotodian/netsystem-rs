@@ -802,6 +802,7 @@ dependencies = [
  "hammer-service",
  "humantime-serde",
  "ipnet",
+ "libc",
  "linkme",
  "serde",
  "thiserror",
