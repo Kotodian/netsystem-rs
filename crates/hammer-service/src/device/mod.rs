@@ -33,8 +33,10 @@ use std::sync::Arc;
 use hammer_core::data_plane::{BufferFrame, NodeId};
 use hammer_core::error::{CoreError, CoreResult, HammerResult};
 use hammer_runtime::{
-    DataPlaneRuntime, DataWorkerId, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
+    DataPlaneRuntime, DataWorkerId, Engine, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
 };
+
+use crate::interface::{InterfaceOutputControlPlane, InterfaceOutputNode};
 
 #[hammer_component_macros::node_next]
 pub enum DeviceInputNext {
@@ -233,6 +235,22 @@ impl DeviceMain {
             .filter(|queue| queue.assigned_workers.contains(&owner))
             .cloned()
             .collect()
+    }
+
+    /// Compile this worker's assigned TX queues into its interface-output runtime.
+    ///
+    /// Queue assignment is published by the control plane before workers start.
+    /// The plugin calls this service-owned method during worker init; it cannot
+    /// select output nodes or mutate another worker's graph directly.
+    pub fn install_worker_output_runtime(&self, engine: &mut Engine) -> HammerResult<()> {
+        let worker = engine.data_worker_id()?;
+        let interface_output = engine
+            .runtime
+            .node_by_name(InterfaceOutputNode::NODE_NAME)
+            .ok_or_else(|| CoreError::internal("interface-output is not registered"))?;
+        let mut output = InterfaceOutputControlPlane::new().with_nodes(engine.runtime.nodes().clone());
+        let tx_queues = self.tx_queues_for_worker(worker);
+        output.install_worker_runtime(engine, interface_output, &tx_queues)
     }
 }
 

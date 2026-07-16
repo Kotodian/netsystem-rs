@@ -8,9 +8,7 @@ use hammer_runtime::{
 };
 use hammer_service::data_plane::DropNode;
 use hammer_service::device::DeviceMain;
-use hammer_service::interface::{
-    InterfaceOutputControlPlane, install_worker_interface_output_runtime,
-};
+use hammer_service::interface::InterfaceOutputControlPlane;
 use hammer_service::opaque::NetworkOpaque;
 
 #[derive(Clone, Copy)]
@@ -52,10 +50,8 @@ fn worker_output_runtimes_only_install_their_assigned_tx_queues() {
 
     let mut first_worker = engine.spawn(1).expect("first worker");
     let mut second_worker = engine.spawn(2).expect("second worker");
-    install_worker_interface_output_runtime(&mut first_worker, &devices)
-        .expect("first runtime");
-    install_worker_interface_output_runtime(&mut second_worker, &devices)
-        .expect("second runtime");
+    devices.install_worker_output_runtime(&mut first_worker).expect("first runtime");
+    devices.install_worker_output_runtime(&mut second_worker).expect("second runtime");
 
     dispatch_to_interface(&first_worker.runtime, output, 11);
     assert_eq!(node_vectors(&first_worker.runtime, sink), Some(1));

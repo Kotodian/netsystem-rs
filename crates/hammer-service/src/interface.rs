@@ -811,47 +811,37 @@ impl InterfaceOutputControlPlane {
     }
 }
 
-/// Install the service-owned interface-output runtime for one data worker.
-///
-/// The device layer publishes queue identity, assigned workers, and generic
-/// graph output nodes. This service layer compiles those facts into the
-/// worker-local output dispatch table. Device plugins may register an output
-/// node, but they do not own interface-output policy or mutate another
-/// worker's graph.
-pub fn install_worker_interface_output_runtime(
-    engine: &mut Engine,
-    devices: &DeviceMain,
-) -> HammerResult<()> {
-    let worker = engine.data_worker_id()?;
-    let interface_output = engine
-        .runtime
-        .node_by_name(InterfaceOutputNode::NODE_NAME)
-        .ok_or_else(|| CoreError::internal("interface-output is not registered"))?;
-    let mut output =
-        InterfaceOutputControlPlane::new().with_nodes(engine.runtime.nodes().clone());
-    output.attach_consumer(interface_output)?;
+impl InterfaceOutputControlPlane {
+    pub(crate) fn install_worker_runtime(
+        &mut self,
+        engine: &mut Engine,
+        interface_output: NodeId,
+        tx_queues: &[DeviceTxQueue],
+    ) -> HammerResult<()> {
+        self.attach_consumer(interface_output)?;
 
-    let mut installed = Vec::new();
-    for queue in devices.tx_queues_for_worker(worker) {
-        if let Some((_, node)) = installed
-            .iter()
-            .find(|(interface_index, _)| *interface_index == queue.interface_index)
-        {
-            if *node != queue.output_node {
-                return Err(CoreError::internal(
-                    "interface TX queues must use one output node per interface",
-                ));
+        let mut installed = Vec::new();
+        for queue in tx_queues {
+            if let Some((_, node)) = installed
+                .iter()
+                .find(|(interface_index, _)| *interface_index == queue.interface_index)
+            {
+                if *node != queue.output_node {
+                    return Err(CoreError::internal(
+                        "interface TX queues must use one output node per interface",
+                    ));
+                }
+                continue;
             }
-            continue;
+            self.register_tx(queue.interface_index, queue.output_node)?;
+            installed.push((queue.interface_index, queue.output_node));
         }
-        output.register_tx(queue.interface_index, queue.output_node)?;
-        installed.push((queue.interface_index, queue.output_node));
-    }
 
-    engine.set_worker_node_runtime_data(
-        interface_output,
-        register_interface_output_runtime(output.handle()),
-    )
+        engine.set_worker_node_runtime_data(
+            interface_output,
+            register_interface_output_runtime(self.handle()),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Default)]

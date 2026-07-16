@@ -14,10 +14,9 @@ use hammer_runtime::{
 };
 
 use hammer_service::device::{
-    DeviceInputNext, DeviceInputNode, DeviceMain, DeviceRxQueue, DeviceTxQueue,
-    DriverScheduleMode,
+    DeviceInputNext, DeviceInputNode, DeviceMain, DeviceRxQueue, DeviceTxQueue, DriverScheduleMode,
 };
-use hammer_service::interface::{InterfaceControlPlane, install_worker_interface_output_runtime};
+use hammer_service::interface::InterfaceControlPlane;
 use hammer_service::opaque::NetworkOpaque;
 
 /// TUN-owned instance list under `[plugin.tun]`.
@@ -102,8 +101,13 @@ impl TunControl {
             owner,
             DriverScheduleMode::Interrupt,
         )?;
-        self.device_main
-            .register_tx_queue(interface_index, device_instance, 0, owner, output_node)?;
+        self.device_main.register_tx_queue(
+            interface_index,
+            device_instance,
+            0,
+            owner,
+            output_node,
+        )?;
         devices.push(Some(TunControlDevice {
             interface_index,
             requested_name: interface.name.clone(),
@@ -201,12 +205,7 @@ fn configure_tun(
             .handle()
             .interface_index(&interface.name)
             .ok_or_else(|| HammerError::internal("TUN interface is not registered"))?;
-        control.add_interface(
-            interface,
-            interface_index,
-            config.worker.count,
-            tun_output,
-        )?;
+        control.add_interface(interface, interface_index, config.worker.count, tun_output)?;
     }
     Ok(control)
 }
@@ -221,7 +220,7 @@ fn configure_tun_worker(
         .runtime
         .node_by_name(TunInputDriverNode::NODE_NAME)
         .ok_or_else(|| CoreError::internal("tun-input is not registered"))?;
-    install_worker_interface_output_runtime(engine, &control.device_main)?;
+    control.device_main.install_worker_output_runtime(engine)?;
     let runtime = control.take_worker_runtime(engine, worker, tun_input)?;
     engine.runtime.nodes().set_node_state(
         tun_input,
