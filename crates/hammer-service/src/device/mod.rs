@@ -248,7 +248,8 @@ impl DeviceMain {
             .runtime
             .node_by_name(InterfaceOutputNode::NODE_NAME)
             .ok_or_else(|| CoreError::internal("interface-output is not registered"))?;
-        let mut output = InterfaceOutputControlPlane::new().with_nodes(engine.runtime.nodes().clone());
+        let mut output =
+            InterfaceOutputControlPlane::new().with_nodes(engine.runtime.nodes().clone());
         let tx_queues = self.tx_queues_for_worker(worker);
         output.install_worker_runtime(engine, interface_output, &tx_queues)
     }
