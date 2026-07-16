@@ -18,7 +18,7 @@ use hammer_runtime::{
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 
 use crate::data_plane::set_index_node_error_code;
-use crate::device::DeviceMain;
+use crate::device::DeviceTxQueue;
 use crate::net::fib::FibTableHandle;
 use crate::opaque::NetworkOpaque;
 use crate::trace::codec::{TraceDecodeCursor, put_option_u16, put_option_u32};
