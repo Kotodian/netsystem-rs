@@ -1,11 +1,12 @@
 //! Behavioral tests for Session Message Queue (IO / CTRL rings).
 //! Observable enqueue/dequeue only — no source greps.
 
-use std::os::fd::RawFd;
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 
 use hammer_runtime::app::session_msg_queue::{
     SessionEvt, SessionEvtType, SessionMsgQueue, SessionMsgQueueError,
 };
+use hammer_runtime::{DataWorkerId, File, FileFunctions, FileMain};
 
 fn descriptor_identity(fd: RawFd) -> std::io::Result<(libc::dev_t, libc::ino_t)> {
     let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -166,4 +167,56 @@ fn svm_session_msg_queue_owns_attached_signal_descriptors() {
             Ok(reused) => assert_ne!(reused, identity, "signal descriptor remains open"),
         }
     }
+}
+
+#[test]
+fn file_readiness_duplicate_closes_independently_of_queue_signal_owner() {
+    use hammer_infra::segment::{Segment, Svm};
+    use hammer_runtime::app::SessionEventQueue;
+
+    let seg = Svm::default();
+    let bytes = SessionMsgQueue::<Svm>::layout_bytes(8, 4).expect("layout");
+    let off = seg.alloc(bytes, 64);
+    let queue = unsafe { SessionMsgQueue::<Svm>::init_at_with_signal(seg, off, 8, 4) }
+        .expect("queue with signal");
+    let queue_fd = queue.read_fd().expect("queue signal-read descriptor");
+    let queue_identity = descriptor_identity(queue_fd).expect("queue descriptor identity");
+
+    // SAFETY: F_DUPFD_CLOEXEC returns a fresh descriptor whose ownership moves
+    // into File below. The queue retains its original endpoint.
+    let duplicated = unsafe { libc::fcntl(queue_fd, libc::F_DUPFD_CLOEXEC, 0) };
+    assert!(duplicated >= 0, "duplicate queue signal-read descriptor");
+    let duplicate_identity =
+        descriptor_identity(duplicated).expect("File duplicate descriptor identity");
+    // SAFETY: fcntl returned a fresh descriptor and File becomes its sole owner.
+    let file_fd = unsafe { OwnedFd::from_raw_fd(duplicated) };
+    let worker = DataWorkerId::new(0);
+    let mut files = FileMain::new(worker).expect("FileMain");
+    let file_index = files
+        .add(File::new(
+            file_fd,
+            worker,
+            "SVM queue readiness duplicate".to_owned(),
+            0,
+            FileFunctions {
+                read: Some(|_| Ok(())),
+                ..FileFunctions::default()
+            },
+        ))
+        .expect("register File duplicate");
+
+    assert!(files.delete(file_index).expect("delete File duplicate"));
+    match descriptor_identity(duplicated) {
+        Err(error) => assert_eq!(error.raw_os_error(), Some(libc::EBADF)),
+        Ok(reused) => assert_ne!(reused, duplicate_identity, "File duplicate remains open"),
+    }
+    assert_eq!(
+        descriptor_identity(queue_fd).expect("queue endpoint remains open"),
+        queue_identity
+    );
+
+    queue
+        .enqueue_ctrl(SessionEvt::ctrl(1, 0, SessionEvtType::Close))
+        .expect("signal through queue-owned endpoints");
+    assert!(queue.read_signal());
 }

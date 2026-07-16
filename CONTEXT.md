@@ -86,6 +86,22 @@ _Avoid_: `NodeNextFrames`, `NextFrame` carrier, `Current(NodeId)`, forwarding re
 
 ## Runtime
 
+**Resource Authority**:
+The single module that decides whether a resource exists and defines its invariants. Resource Authority is distinct from the Handle Owner that closes one concrete descriptor, mapping, allocation, or registration; a Registrar may attach an already-created resource without acquiring its business behavior.
+_Avoid_: shared ownership by convention, callback owner, fd holder as semantic owner
+
+**Handle Owner**:
+The RAII owner of one concrete resource handle. Duplicated descriptors have independent Handle Owners even when they refer to the same kernel object. Holding a `RawFd`, `NodeId`, `Index`, queue offset, or Transport Index is observation or routing, not ownership.
+_Avoid_: unowned raw descriptor, borrowed handle called owner, duplicate without teardown owner
+
+**Work Consumer**:
+The module that performs work after readiness or an event is observed. File callbacks only mark or schedule existing worker-local work; the scheduled Graph Node or domain module remains the Work Consumer.
+_Avoid_: queue drain in readiness callback, protocol work in poller, observer-owned behavior
+
+**Failure Translator**:
+The crate-seam operation that maps an owner-local typed failure while preserving its category and source. Presentation text is not semantic identity, and a lower-layer failure must not be flattened into a string by a layer that does not own it.
+_Avoid_: `Internal(format!(...))` at every seam, message matching, universal business error
+
 **Data Worker**:
 A worker that owns data-plane hot-path state for one execution lane. Data-plane state is worker-local unless a handoff or control-plane barrier explicitly crosses the seam.
 _Avoid_: tokio worker, control thread, generic thread
@@ -114,8 +130,10 @@ _Avoid_: File-specific Index, `AsyncFd`, TUN I/O backend, runtime platform enum,
 **File Readiness Layer Contract**:
 - `hammer-runtime` owns File lifetime, worker ownership, generation checks, readiness counters, callback dispatch, and the fixed Main Loop Step where readiness is polled.
 - Platform adapters are crate-private and may only add, modify, cancel, and collect readiness for existing File records. macOS uses kqueue; Linux uses io_uring without epoll or fallback.
-- Device implementations own device fd state and all packet `readv`/`writev` operations. A File callback may only schedule or mark worker-local runtime work; it must not read or write packet payload.
+- Device implementations own device identity and all packet `readv`/`writev` operations; after registration, File owns the descriptor handle lifetime. A File callback may only schedule or mark worker-local runtime work; it must not read or write packet payload.
 - Graph Nodes own packet receive/transmit and Buffer Chain handling after readiness schedules them.
+- SVM and Physmem backing descriptors never enter FileMain. A Session Message Queue may expose its signal-read endpoint for an independently owned File duplicate; Session Runtime owns that registration and the queue remains the signal endpoint authority.
+- File removal cancels backend interest before its descriptor drops. Queue originals, File duplicates, and app `AsyncFd` duplicates each close through their own Handle Owner.
 
 **Barrier Synchronization**:
 The control-plane mechanism that pauses data workers at a known point so control changes can observe a stable data-plane state. It is not a lock taken around hot-path packet processing.
