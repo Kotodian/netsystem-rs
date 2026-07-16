@@ -14,9 +14,10 @@ use hammer_runtime::{
 };
 
 use hammer_service::device::{
-    DeviceInputNext, DeviceInputNode, DeviceMain, DeviceRxQueue, DriverScheduleMode,
+    DeviceInputNext, DeviceInputNode, DeviceMain, DeviceRxQueue, DeviceTxQueue,
+    DriverScheduleMode,
 };
-use hammer_service::interface::InterfaceControlPlane;
+use hammer_service::interface::{InterfaceControlPlane, install_worker_interface_output_runtime};
 use hammer_service::opaque::NetworkOpaque;
 
 /// TUN-owned instance list under `[plugin.tun]`.
@@ -56,10 +57,12 @@ struct TunControlDevice {
 struct TunWorkerRuntime {
     worker: DataWorkerId,
     rx_poll_vector: Vec<DeviceRxQueue>,
+    tx_queues: Vec<DeviceTxQueue>,
     devices: Vec<TunWorkerDevice>,
 }
 
 struct TunWorkerDevice {
+    device_instance: u32,
     interface_index: u32,
     file_index: hammer_infra::pool::Index,
 }
@@ -77,6 +80,7 @@ impl TunControl {
         interface: &Interface,
         interface_index: u32,
         worker_count: usize,
+        output_node: NodeId,
     ) -> HammerResult<()> {
         let worker_count = u32::try_from(worker_count)
             .map_err(|_| HammerError::internal("worker count does not fit u32"))?;
@@ -99,7 +103,7 @@ impl TunControl {
             DriverScheduleMode::Interrupt,
         )?;
         self.device_main
-            .register_tx_queue(device_instance, 0, owner)?;
+            .register_tx_queue(interface_index, device_instance, 0, owner, output_node)?;
         devices.push(Some(TunControlDevice {
             interface_index,
             requested_name: interface.name.clone(),
@@ -115,6 +119,7 @@ impl TunControl {
         tun_input: NodeId,
     ) -> HammerResult<TunWorkerRuntime> {
         let rx_poll_vector = self.device_main.rx_poll_vector(worker);
+        let tx_queues = self.device_main.tx_queues_for_worker(worker);
 
         let mut control_devices = self
             .devices
@@ -144,13 +149,25 @@ impl TunControl {
                 },
             ))?;
             devices.push(TunWorkerDevice {
+                device_instance: queue.device_instance,
                 interface_index: device.interface_index,
                 file_index,
             });
         }
+        for queue in &tx_queues {
+            if !devices
+                .iter()
+                .any(|device| device.device_instance == queue.device_instance)
+            {
+                return Err(CoreError::internal(
+                    "TUN TX queue has no same-worker RX-owned file",
+                ));
+            }
+        }
         Ok(TunWorkerRuntime {
             worker,
             rx_poll_vector,
+            tx_queues,
             devices,
         })
     }
@@ -158,12 +175,17 @@ impl TunControl {
 
 #[hammer_component_macros::config_function(name = "tun_config")]
 fn configure_tun(
+    engine: &mut hammer_runtime::Engine,
     config: Arc<Config>,
     device_main: Arc<DeviceMain>,
     interface_main: Arc<InterfaceControlPlane>,
 ) -> HammerResult<Arc<TunControl>> {
     let tun_cfg = config.plugin_config::<TunPluginConfig>("tun")?;
     let control = TunControl::new(device_main);
+    let tun_output = engine
+        .runtime
+        .node_by_name(TunOutputDriverNode::NODE_NAME)
+        .ok_or_else(|| CoreError::internal("tun-output is not registered"))?;
     for name in &tun_cfg.interfaces {
         let interface = config
             .network
@@ -179,7 +201,12 @@ fn configure_tun(
             .handle()
             .interface_index(&interface.name)
             .ok_or_else(|| HammerError::internal("TUN interface is not registered"))?;
-        control.add_interface(interface, interface_index, config.worker.count)?;
+        control.add_interface(
+            interface,
+            interface_index,
+            config.worker.count,
+            tun_output,
+        )?;
     }
     Ok(control)
 }
@@ -194,6 +221,7 @@ fn configure_tun_worker(
         .runtime
         .node_by_name(TunInputDriverNode::NODE_NAME)
         .ok_or_else(|| CoreError::internal("tun-input is not registered"))?;
+    install_worker_interface_output_runtime(engine, &control.device_main)?;
     let runtime = control.take_worker_runtime(engine, worker, tun_input)?;
     engine.runtime.nodes().set_node_state(
         tun_input,
@@ -410,9 +438,13 @@ impl TunWorkerRuntime {
             network.sw_if_index[1]
         });
         let Some(device) = interface_index.and_then(|interface_index| {
+            let queue = self
+                .tx_queues
+                .iter()
+                .find(|queue| queue.interface_index == interface_index)?;
             self.devices
                 .iter_mut()
-                .find(|device| device.interface_index == interface_index)
+                .find(|device| device.device_instance == queue.device_instance)
         }) else {
             return;
         };

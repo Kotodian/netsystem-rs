@@ -12,12 +12,13 @@ use hammer_core::forwarding::{AdjacencyRewrite, DpoId, DpoProto, FibTableBuilder
 use hammer_core::registry::RuntimeRegistry;
 use hammer_runtime::DataPlaneBarrierHandle;
 use hammer_runtime::{
-    DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
-    TraceFormatter, add_packet_trace,
+    DataPlaneRuntime, Engine, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
+    PacketTrace, TraceFormatter, add_packet_trace,
 };
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 
 use crate::data_plane::set_index_node_error_code;
+use crate::device::DeviceMain;
 use crate::net::fib::FibTableHandle;
 use crate::opaque::NetworkOpaque;
 use crate::trace::codec::{TraceDecodeCursor, put_option_u16, put_option_u32};
@@ -810,6 +811,49 @@ impl InterfaceOutputControlPlane {
     }
 }
 
+/// Install the service-owned interface-output runtime for one data worker.
+///
+/// The device layer publishes queue identity, assigned workers, and generic
+/// graph output nodes. This service layer compiles those facts into the
+/// worker-local output dispatch table. Device plugins may register an output
+/// node, but they do not own interface-output policy or mutate another
+/// worker's graph.
+pub fn install_worker_interface_output_runtime(
+    engine: &mut Engine,
+    devices: &DeviceMain,
+) -> HammerResult<()> {
+    let worker = engine.data_worker_id()?;
+    let interface_output = engine
+        .runtime
+        .node_by_name(InterfaceOutputNode::NODE_NAME)
+        .ok_or_else(|| CoreError::internal("interface-output is not registered"))?;
+    let mut output =
+        InterfaceOutputControlPlane::new().with_nodes(engine.runtime.nodes().clone());
+    output.attach_consumer(interface_output)?;
+
+    let mut installed = Vec::new();
+    for queue in devices.tx_queues_for_worker(worker) {
+        if let Some((_, node)) = installed
+            .iter()
+            .find(|(interface_index, _)| *interface_index == queue.interface_index)
+        {
+            if *node != queue.output_node {
+                return Err(CoreError::internal(
+                    "interface TX queues must use one output node per interface",
+                ));
+            }
+            continue;
+        }
+        output.register_tx(queue.interface_index, queue.output_node)?;
+        installed.push((queue.interface_index, queue.output_node));
+    }
+
+    engine.set_worker_node_runtime_data(
+        interface_output,
+        register_interface_output_runtime(output.handle()),
+    )
+}
+
 #[derive(Debug, Clone, Default)]
 struct InterfaceOutputState {
     drop_slot: Option<u16>,
@@ -894,6 +938,18 @@ pub struct InterfaceOutputNode {
     #[node(default = register_interface_output_runtime(output.clone()))]
     runtime_data: NodeRuntimeData,
     output: InterfaceOutputHandle,
+}
+
+#[hammer_component_macros::init_function(
+    name = "interface_output_graph_init",
+    runs_after = ["install_packet_graph"]
+)]
+fn install_interface_output_graph(engine: &mut Engine) -> HammerResult<()> {
+    engine
+        .runtime
+        .nodes()
+        .try_register_internal(InterfaceOutputControlPlane::new().node())?;
+    Ok(())
 }
 
 impl InterfaceOutputNode {

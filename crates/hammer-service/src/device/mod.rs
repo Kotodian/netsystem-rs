@@ -30,7 +30,7 @@
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 
-use hammer_core::data_plane::BufferFrame;
+use hammer_core::data_plane::{BufferFrame, NodeId};
 use hammer_core::error::{CoreError, CoreResult, HammerResult};
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
@@ -103,11 +103,25 @@ pub struct DeviceRxQueue {
     pub mode: DriverScheduleMode,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceTxQueue {
+    pub interface_index: u32,
     pub device_instance: u32,
     pub queue_id: u32,
-    pub owner: DataWorkerId,
+    pub output_node: NodeId,
+    assigned_workers: Vec<DataWorkerId>,
+}
+
+impl DeviceTxQueue {
+    #[inline]
+    pub fn assigned_workers(&self) -> &[DataWorkerId] {
+        &self.assigned_workers
+    }
+
+    #[inline]
+    pub fn is_shared(&self) -> bool {
+        self.assigned_workers.len() > 1
+    }
 }
 
 // SAFETY: queue registration finishes before worker startup. Published queue
@@ -149,9 +163,11 @@ impl DeviceMain {
 
     pub fn register_tx_queue(
         &self,
+        interface_index: u32,
         device_instance: u32,
         queue_id: u32,
         owner: DataWorkerId,
+        output_node: NodeId,
     ) -> CoreResult<()> {
         let queues = unsafe { &mut *self.tx_queues.get() };
         if queues
@@ -161,10 +177,29 @@ impl DeviceMain {
             return Err(CoreError::internal("device TX queue is already registered"));
         }
         queues.push(DeviceTxQueue {
+            interface_index,
             device_instance,
             queue_id,
-            owner,
+            output_node,
+            assigned_workers: vec![owner],
         });
+        Ok(())
+    }
+
+    pub fn assign_tx_queue_to_worker(
+        &self,
+        device_instance: u32,
+        queue_id: u32,
+        worker: DataWorkerId,
+    ) -> CoreResult<()> {
+        let queues = unsafe { &mut *self.tx_queues.get() };
+        let queue = queues
+            .iter_mut()
+            .find(|queue| queue.device_instance == device_instance && queue.queue_id == queue_id)
+            .ok_or_else(|| CoreError::internal("device TX queue is not registered"))?;
+        if !queue.assigned_workers.contains(&worker) {
+            queue.assigned_workers.push(worker);
+        }
         Ok(())
     }
 
@@ -179,7 +214,25 @@ impl DeviceMain {
 
     pub fn tx_queues(&self) -> Vec<DeviceTxQueue> {
         let queues = unsafe { &*self.tx_queues.get() };
-        queues.iter().copied().collect()
+        queues.to_vec()
+    }
+
+    pub fn tx_queues_for_interface(&self, interface_index: u32) -> Vec<DeviceTxQueue> {
+        let queues = unsafe { &*self.tx_queues.get() };
+        queues
+            .iter()
+            .cloned()
+            .filter(|queue| queue.interface_index == interface_index)
+            .collect()
+    }
+
+    pub fn tx_queues_for_worker(&self, owner: DataWorkerId) -> Vec<DeviceTxQueue> {
+        let queues = unsafe { &*self.tx_queues.get() };
+        queues
+            .iter()
+            .filter(|queue| queue.assigned_workers.contains(&owner))
+            .cloned()
+            .collect()
     }
 }
 
