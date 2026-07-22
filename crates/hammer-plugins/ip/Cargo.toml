@@ -6,9 +6,10 @@ publish.workspace = true
 
 [lib]
 name = "hammer_plugin_ip"
-crate-type = ["cdylib", "rlib"]
+crate-type = ["dylib", "rlib"]
 
 [dependencies]
+abi_stable = { workspace = true }
 arc-swap = { workspace = true }
 hammer-core = { path = "../../hammer-core" }
 hammer-infra = { path = "../../hammer-infra" }
@@ -17,3 +18,6 @@ hammer-service = { path = "../../hammer-service", default-features = false }
 hammer-component-macros = { path = "../../hammer-component-macros" }
 linkme = { workspace = true }
 ipnet = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+humantime-serde = { workspace = true }

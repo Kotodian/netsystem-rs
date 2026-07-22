@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use hammer_core::protocol::tcp::{TcpSackBlock, TcpSeq};
+use crate::{TcpSackBlock, TcpSeq};
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::rbtree::RbTree;
 

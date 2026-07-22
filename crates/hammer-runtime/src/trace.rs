@@ -3,10 +3,24 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::config::Trace;
+use crate::error::{RuntimeError, RuntimeResult};
 use crossbeam_queue::SegQueue;
-use hammer_core::config::Trace;
 use hammer_core::data_plane::NodeId;
-use hammer_core::error::{CoreError, CoreResult};
+
+#[hammer_component_macros::config_function(name = "runtime_trace_config", section = "trace")]
+fn configure_trace(
+    trace: Trace,
+    engine: &mut crate::Engine,
+) -> RuntimeResult<Arc<TraceControlPlane>> {
+    trace.validate()?;
+    let control = Arc::new(TraceControlPlane::new(trace.record_capacity));
+    control.publish_options(&trace, |name| engine.runtime.node_by_name(name))?;
+    engine
+        .runtime
+        .set_trace_control(Some(control.handle()), trace.packet_capacity);
+    Ok(control)
+}
 
 pub type TraceFormatter = fn(&[u8]) -> String;
 
@@ -79,8 +93,21 @@ struct PacketTraceState {
     entries: Vec<TraceEntry>,
 }
 
-pub trait PacketTrace {
-    fn encode_trace(&self, out: &mut Vec<u8>);
+pub trait PacketTrace: serde::Serialize {}
+
+impl<T> PacketTrace for T where T: serde::Serialize {}
+
+#[macro_export]
+macro_rules! format_packet_trace {
+    ($trace:ty) => {
+        |bytes: &[u8]| {
+            format!(
+                "{} {}",
+                ::std::any::type_name::<$trace>(),
+                $crate::trace::format_raw_payload(bytes),
+            )
+        }
+    };
 }
 
 #[macro_export]
@@ -209,12 +236,12 @@ impl TraceControlPlane {
         &self,
         options: &Trace,
         resolve_node: impl Fn(&str) -> Option<NodeId>,
-    ) -> CoreResult<u64> {
+    ) -> RuntimeResult<u64> {
         let mut inputs = Vec::with_capacity(options.inputs.len());
         if options.enabled {
             for input in &options.inputs {
                 let node = resolve_node(&input.node).ok_or_else(|| {
-                    CoreError::config_validation(format!(
+                    RuntimeError::config_validation(format!(
                         "trace.inputs node is not a declared packet node: {}",
                         input.node
                     ))
@@ -499,7 +526,8 @@ fn node_label(node: NodeId, name: Option<&'static str>) -> String {
     }
 }
 
-fn format_raw_payload(payload: &[u8]) -> String {
+#[doc(hidden)]
+pub fn format_raw_payload(payload: &[u8]) -> String {
     let mut output = String::with_capacity(2 + payload.len() * 2);
     output.push_str("0x");
     for byte in payload {

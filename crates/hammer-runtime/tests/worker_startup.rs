@@ -1,16 +1,16 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use hammer_core::config::Config;
 use hammer_core::data_plane::{
     BufferFrame, NodeHandle, NodeId, NodeKind, NodeRegistration, NodeState,
 };
-use hammer_core::error::{CoreError, HammerResult};
-use hammer_core::registry::RuntimeRegistry;
+use hammer_runtime::RuntimeRegistry;
+use hammer_runtime::config::Worker;
 use hammer_runtime::start_workers::start_workers;
 use hammer_runtime::{
     DataPlaneRuntime, Engine, EnginePool, NodeDescriptor, NodeResult, NodeRuntimeData,
     new_worker_runtime,
 };
+use hammer_runtime::{RuntimeError, RuntimeResult};
 
 hammer_runtime::__declare_registration_image!();
 
@@ -30,12 +30,12 @@ fn startup_node_process(
 }
 
 #[hammer_component_macros::worker_init_function(name = "verify_worker_startup_contract")]
-fn verify_worker_startup_contract(engine: &mut Engine) -> HammerResult<()> {
+fn verify_worker_startup_contract(engine: &mut Engine) -> RuntimeResult<()> {
     let worker = engine.data_worker_id()?;
     let node = engine
         .runtime
         .node_by_name("startup-node")
-        .ok_or_else(|| CoreError::internal("worker clone is missing startup-node"))?;
+        .ok_or_else(|| RuntimeError::invariant("worker clone is missing startup-node"))?;
     assert_eq!(node, NodeId::new(0));
     engine
         .runtime
@@ -47,7 +47,7 @@ fn verify_worker_startup_contract(engine: &mut Engine) -> HammerResult<()> {
 
     match CASE.load(Ordering::Acquire) {
         INIT_FAILURE if worker.slot() == 1 => {
-            return Err(CoreError::internal("injected worker initialization failure").into());
+            return Err(RuntimeError::invariant("injected worker initialization failure").into());
         }
         PANIC if worker.slot() == 1 => panic!("injected worker initialization panic"),
         _ => {}
@@ -58,13 +58,11 @@ fn verify_worker_startup_contract(engine: &mut Engine) -> HammerResult<()> {
 }
 
 fn engine_pool() -> EnginePool {
-    let mut config = Config::default();
-    config.worker.count = 2;
-    config.worker.buffer.slot_bytes = 2048;
-    config.worker.buffer.slots_per_numa = 64;
-    config.worker.buffer.frame_pool_size = 64;
-    config.worker.instruction_set = "scalar".to_owned();
-    let runtime = new_worker_runtime(&config).expect("configured runtime");
+    let mut worker = Worker::default();
+    worker.count = 2;
+    worker.buffer.slots_per_numa = 64;
+    worker.instruction_set = "scalar".to_owned();
+    let runtime = new_worker_runtime(&worker).expect("configured runtime");
     let node = runtime
         .nodes()
         .try_register_descriptor(
@@ -82,9 +80,7 @@ fn engine_pool() -> EnginePool {
         .nodes()
         .set_node_state(node, NodeState::Disabled)
         .expect("canonical startup node state");
-    let registry = RuntimeRegistry::new();
-    registry.set(std::sync::Arc::new(config));
-    EnginePool::new(Engine::new(runtime, registry))
+    EnginePool::new(Engine::new(runtime, RuntimeRegistry::new()))
 }
 
 fn stop_workers(pool: &mut EnginePool) {

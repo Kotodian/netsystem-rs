@@ -7,7 +7,7 @@
 use std::fmt;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
-use hammer_core::error::{HammerError, HammerResult};
+use crate::error::{RuntimeError, RuntimeResult};
 use hammer_infra::pool::{Index, Pool};
 
 use crate::DataWorkerId;
@@ -22,7 +22,7 @@ mod linux;
 use linux::Poller;
 
 /// Worker-local callback invoked for one ready descriptor event.
-pub type FileFunction = fn(&mut File) -> HammerResult<()>;
+pub type FileFunction = fn(&mut File) -> RuntimeResult<()>;
 
 /// Functions dispatched for one File's read, write, and error readiness.
 #[derive(Clone, Copy, Debug, Default)]
@@ -129,7 +129,7 @@ impl File {
         }
     }
 
-    fn dispatch(&mut self, readiness: Readiness) -> HammerResult<usize> {
+    fn dispatch(&mut self, readiness: Readiness) -> RuntimeResult<usize> {
         if readiness.contains(Readiness::ERROR)
             && let Some(function) = self.functions.error
         {
@@ -183,7 +183,7 @@ pub struct FileMain {
 
 impl FileMain {
     /// Creates the platform poller and empty File registry for one Data Worker.
-    pub fn new(polling_worker: DataWorkerId) -> HammerResult<Self> {
+    pub fn new(polling_worker: DataWorkerId) -> RuntimeResult<Self> {
         Ok(Self {
             polling_worker,
             poller: Poller::new()?,
@@ -192,9 +192,9 @@ impl FileMain {
     }
 
     /// Registers a File and returns its existing `hammer-infra` Pool Index.
-    pub fn add(&mut self, file: File) -> HammerResult<Index> {
+    pub fn add(&mut self, file: File) -> RuntimeResult<Index> {
         if file.polling_worker != self.polling_worker {
-            return Err(HammerError::internal(format!(
+            return Err(RuntimeError::invariant(format!(
                 "file polling worker {:?} does not match FileMain worker {:?}",
                 file.polling_worker, self.polling_worker
             )));
@@ -203,12 +203,12 @@ impl FileMain {
         let index = self
             .files
             .insert(file)
-            .ok_or_else(|| HammerError::internal("FileMain pool is full"))?;
+            .ok_or_else(|| RuntimeError::invariant("FileMain pool is full"))?;
         let spec = self
             .files
             .get(index)
             .map(|file| file.poll_spec(index))
-            .ok_or_else(|| HammerError::internal("new File index did not resolve"))?;
+            .ok_or_else(|| RuntimeError::invariant("new File index did not resolve"))?;
         if let Err(error) = self.poller.add(spec) {
             self.files.remove(index);
             return Err(error);
@@ -223,7 +223,7 @@ impl FileMain {
     }
 
     /// Removes backend interest before releasing the File record.
-    pub fn delete(&mut self, index: Index) -> HammerResult<bool> {
+    pub fn delete(&mut self, index: Index) -> RuntimeResult<bool> {
         let Some(spec) = self.files.get(index).map(|file| file.poll_spec(index)) else {
             return Ok(false);
         };
@@ -237,9 +237,9 @@ impl FileMain {
         &mut self,
         index: Index,
         available: bool,
-    ) -> HammerResult<bool> {
+    ) -> RuntimeResult<bool> {
         let Some(file) = self.files.get(index) else {
-            return Err(HammerError::internal(
+            return Err(RuntimeError::invariant(
                 "File index is stale or not registered",
             ));
         };
@@ -252,7 +252,7 @@ impl FileMain {
         after.write = available;
         self.poller.modify(before, after)?;
         let Some(file) = self.files.get_mut(index) else {
-            return Err(HammerError::internal(
+            return Err(RuntimeError::invariant(
                 "File disappeared while updating write readiness",
             ));
         };
@@ -261,7 +261,7 @@ impl FileMain {
     }
 
     /// Performs one nonblocking readiness poll and dispatches live callbacks.
-    pub fn poll(&mut self) -> HammerResult<usize> {
+    pub fn poll(&mut self) -> RuntimeResult<usize> {
         let mut events = [PollEvent::default(); POLL_BATCH_SIZE];
         let count = self.poller.poll(&mut events)?;
         let mut dispatched = 0;
@@ -283,7 +283,7 @@ impl FileMain {
                     .get(index)
                     .map(|file| file.poll_spec(index))
                     .ok_or_else(|| {
-                        HammerError::internal("File disappeared while rearming readiness")
+                        RuntimeError::invariant("File disappeared while rearming readiness")
                     })?;
                 self.poller.add(spec)?;
             }

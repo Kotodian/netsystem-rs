@@ -2,9 +2,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use hammer_core::data_plane::{BufferFrame, NodeRegistration};
-use hammer_core::error::CoreResult;
 use hammer_infra::pool::Index;
 use hammer_infra::segment::Local;
+use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
 use hammer_runtime::{
     DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, InternalNode, Node, NodeProcessFn,
     NodeResult, NodeRuntimeData,
@@ -72,7 +72,7 @@ impl SessionTransport<Index, Local> for TcpRecordingTransport {
         _: &mut BufferFrame,
         _: &mut super::SessionQueueOutput,
         now: Instant,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         self.0.events.lock().expect("events").push("tcp_time");
         self.0.sampled_times.lock().expect("times").push(now);
         Ok(())
@@ -87,7 +87,7 @@ impl SessionTransport<Index, Local> for TcpRecordingTransport {
         _: &mut BufferFrame,
         _: &mut super::SessionQueueOutput,
         _: Instant,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         self.0.events.lock().expect("events").push("control");
         Ok(())
     }
@@ -103,7 +103,7 @@ impl TransportInternalTransport<Index, Local> for TcpRecordingTransport {
         _: &mut BufferFrame,
         _: &mut super::SessionQueueOutput,
         _: Instant,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         self.0.events.lock().expect("events").push("io");
         Ok(())
     }
@@ -183,7 +183,7 @@ impl Node for PayloadCaptureNode {
         payload_capture_process
     }
 
-    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
         Ok(self.runtime_data)
     }
 }
@@ -247,7 +247,7 @@ impl SessionTransport<Index, Local> for QuicShapedTransport {
         _: &mut BufferFrame,
         _: &mut super::SessionQueueOutput,
         _: Instant,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         Ok(())
     }
 
@@ -260,7 +260,7 @@ impl SessionTransport<Index, Local> for QuicShapedTransport {
         _: &mut BufferFrame,
         _: &mut super::SessionQueueOutput,
         _: Instant,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         Ok(())
     }
 }
@@ -275,7 +275,7 @@ impl TransportInternalTransport<Index, Local> for QuicShapedTransport {
         frame: &mut BufferFrame,
         output: &mut super::SessionQueueOutput,
         _: Instant,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         let streams = self.streams.lock().expect("streams").clone();
         for session_id in streams {
             let len = sessions.app().pending_send_len(session_id)?.unwrap_or(0);
@@ -368,7 +368,7 @@ impl SessionTransport<Index, Local> for FailingPacketizedTransport {
         _: &mut BufferFrame,
         _: &mut super::SessionQueueOutput,
         _: Instant,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         Ok(())
     }
 
@@ -381,7 +381,7 @@ impl SessionTransport<Index, Local> for FailingPacketizedTransport {
         _: &mut BufferFrame,
         _: &mut super::SessionQueueOutput,
         _: Instant,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         Ok(())
     }
 }
@@ -396,7 +396,7 @@ impl SessionPacketizedTransport<Index, Local> for FailingPacketizedTransport {
         _: &mut BufferFrame,
         _: &mut super::SessionQueueOutput,
         _: Instant,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         Ok(())
     }
 
@@ -406,7 +406,7 @@ impl SessionPacketizedTransport<Index, Local> for FailingPacketizedTransport {
         _: Index,
         pending_len: usize,
         _: Instant,
-    ) -> CoreResult<TransportSendParams> {
+    ) -> RuntimeResult<TransportSendParams> {
         Ok(TransportSendParams {
             snd_space: pending_len,
             tx_offset: 0,
@@ -421,8 +421,10 @@ impl SessionPacketizedTransport<Index, Local> for FailingPacketizedTransport {
         _: Index,
         _: &[TxBatchBuffer],
         _: Instant,
-    ) -> CoreResult<()> {
-        Err(hammer_core::protocol::tcp::TcpError::Dispatch.into())
+    ) -> RuntimeResult<()> {
+        Err(RuntimeError::invariant(
+            "forced packetized transport failure",
+        ))
     }
 }
 
@@ -448,7 +450,7 @@ impl SessionTransport<Index, Local> for RecordingPacketizedTransport {
         _: &mut BufferFrame,
         _: &mut super::SessionQueueOutput,
         _: Instant,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         Ok(())
     }
 
@@ -461,7 +463,7 @@ impl SessionTransport<Index, Local> for RecordingPacketizedTransport {
         _: &mut BufferFrame,
         _: &mut super::SessionQueueOutput,
         _: Instant,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         Ok(())
     }
 }
@@ -476,7 +478,7 @@ impl SessionPacketizedTransport<Index, Local> for RecordingPacketizedTransport {
         _: &mut BufferFrame,
         _: &mut super::SessionQueueOutput,
         _: Instant,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         Ok(())
     }
 
@@ -486,7 +488,7 @@ impl SessionPacketizedTransport<Index, Local> for RecordingPacketizedTransport {
         _: Index,
         _: usize,
         _: Instant,
-    ) -> CoreResult<TransportSendParams> {
+    ) -> RuntimeResult<TransportSendParams> {
         self.send_params_calls += 1;
         Ok(self.params)
     }
@@ -497,7 +499,7 @@ impl SessionPacketizedTransport<Index, Local> for RecordingPacketizedTransport {
         _: Index,
         batch: &[TxBatchBuffer],
         _: Instant,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         let _ = self.runtime.run_ready_nodes()?;
         self.events.lock().expect("events").push("transport_commit");
         self.tx_action_calls += 1;
@@ -537,7 +539,7 @@ impl Node for VisibilityCaptureNode {
         visibility_capture_process
     }
 
-    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
         Ok(self.runtime_data)
     }
 }
@@ -694,7 +696,7 @@ fn failed_session_packetized_tx_action_keeps_fifo_and_graph_unchanged() {
 
     assert!(matches!(
         error,
-        hammer_core::error::CoreError::Tcp(hammer_core::protocol::tcp::TcpError::Dispatch)
+        RuntimeError::Invariant { ref detail } if detail == "forced packetized transport failure"
     ));
     assert_eq!(
         sessions

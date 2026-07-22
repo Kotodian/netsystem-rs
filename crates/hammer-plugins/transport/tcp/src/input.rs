@@ -1,30 +1,27 @@
 use std::cell::RefCell;
 use std::mem::{size_of, transmute};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
+use crate::{TcpError, TcpInputFlags, TcpSegmentFlags, tcp_header};
 use arc_swap::ArcSwap;
 use hammer_core::data_plane::{
     BufferFrame, BufferPacketCursor, Index, NodeHandle, NodeId, SecondaryOpaque,
 };
-use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::protocol::icmp::IcmpErrorMetadata;
-use hammer_core::protocol::ip::{IpProtocol, IpVersion};
-use hammer_core::protocol::tcp::{TcpError, TcpInputFlags, TcpSegmentFlags, tcp_header};
 use hammer_runtime::{
-    DataPlaneRuntime, DataWorkerId, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
-    TraceFormatter, add_packet_trace,
+    DataPlaneRuntime, DataWorkerId, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
+    TraceFormatter, add_packet_trace, format_packet_trace,
 };
+use hammer_runtime::{RuntimeError, RuntimeResult};
 use hammer_service::data_plane::set_buffer_node_error_code;
-use hammer_service::trace::codec::{
-    TraceDecodeCursor, put_option_ip_protocol, put_option_ip_version, put_option_u16, put_u16,
-};
 
 use super::lookup::{
     TcpIpv4ListenerAddress, TcpIpv6ListenerAddress, TcpLookupSnapshot, TcpLookupValue,
     TcpV4ListenerKey, TcpV6ListenerKey,
 };
 use super::{TcpInputNext, TcpWorkerStore, with_tcp_worker_mut, write_session_route_opaque};
+use crate::protocol::{TcpIpProtocol, TcpIpVersion};
 use hammer_service::opaque::NetworkOpaque;
 use hammer_service::session::SessionId;
 use hammer_service::session::app::SessionAppRuntimeCreate;
@@ -33,56 +30,21 @@ use hammer_service::transport::congestion::CongestionController;
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct IcmpErrorOpaque {
-    icmp_error: Option<IcmpErrorMetadata>,
+    icmp_error: Option<NonZeroU64>,
     reserved: [u64; 6],
 }
 
 const _: () = assert!(size_of::<IcmpErrorOpaque>() == size_of::<SecondaryOpaque>());
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct TcpInputTrace {
-    pub version: Option<IpVersion>,
-    pub protocol: Option<IpProtocol>,
+    pub version: Option<TcpIpVersion>,
+    pub protocol: Option<TcpIpProtocol>,
     pub source_port: Option<u16>,
     pub destination_port: Option<u16>,
     pub flags: u16,
     pub error: Option<u16>,
     pub next: u16,
-}
-
-impl TcpInputTrace {
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let mut cursor = TraceDecodeCursor::new(bytes);
-        let trace = Self {
-            version: cursor.read_option_ip_version()?,
-            protocol: cursor.read_option_ip_protocol()?,
-            source_port: cursor.read_option_u16()?,
-            destination_port: cursor.read_option_u16()?,
-            flags: cursor.read_u16()?,
-            error: cursor.read_option_u16()?,
-            next: cursor.read_u16()?,
-        };
-        cursor.is_empty().then_some(trace)
-    }
-}
-
-impl PacketTrace for TcpInputTrace {
-    fn encode_trace(&self, out: &mut Vec<u8>) {
-        put_option_ip_version(out, self.version);
-        put_option_ip_protocol(out, self.protocol);
-        put_option_u16(out, self.source_port);
-        put_option_u16(out, self.destination_port);
-        put_u16(out, self.flags);
-        put_option_u16(out, self.error);
-        put_u16(out, self.next);
-    }
-}
-
-fn format_tcp_input_trace(bytes: &[u8]) -> String {
-    match TcpInputTrace::decode(bytes) {
-        Some(trace) => format!("{trace:?}"),
-        None => format!("TcpInputTrace invalid={bytes:?}"),
-    }
 }
 
 #[derive(Clone)]
@@ -99,7 +61,7 @@ impl TcpInputControlPlane {
     }
 
     #[inline]
-    pub fn publish_lookup(&self, lookup: TcpLookupSnapshot) -> CoreResult<()> {
+    pub fn publish_lookup(&self, lookup: TcpLookupSnapshot) -> RuntimeResult<()> {
         self.inner.store(Arc::new(lookup));
         Ok(())
     }
@@ -182,7 +144,7 @@ impl Node for TcpInputNode {
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_tcp_input_trace)
+        Some(format_packet_trace!(TcpInputTrace))
     }
 
     #[inline]
@@ -191,7 +153,7 @@ impl Node for TcpInputNode {
     }
 
     #[inline]
-    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
         sync_tcp_input_runtime(self.runtime_data, self.handoff, self.handoff_worker)?;
         Ok(self.runtime_data)
     }
@@ -222,14 +184,14 @@ fn register_tcp_input_runtime(snapshot: Arc<ArcSwap<TcpLookupSnapshot>>) -> Node
     })
 }
 
-fn tcp_input_runtime(data: NodeRuntimeData) -> CoreResult<TcpInputRuntime> {
+fn tcp_input_runtime(data: NodeRuntimeData) -> RuntimeResult<TcpInputRuntime> {
     let slot = data.usize_word(0)?;
     TCP_INPUT_RUNTIMES.with(|runtimes| {
         runtimes
             .borrow()
             .get(slot)
             .cloned()
-            .ok_or_else(|| CoreError::internal("TCP input runtime slot is invalid"))
+            .ok_or_else(|| RuntimeError::invariant("TCP input runtime slot is invalid"))
     })
 }
 
@@ -237,13 +199,13 @@ fn sync_tcp_input_runtime(
     data: NodeRuntimeData,
     handoff: Option<NodeHandle>,
     handoff_worker: Option<DataWorkerId>,
-) -> CoreResult<()> {
+) -> RuntimeResult<()> {
     let slot = data.usize_word(0)?;
     TCP_INPUT_RUNTIMES.with(|runtimes| {
         let mut runtimes = runtimes.borrow_mut();
         let runtime = runtimes
             .get_mut(slot)
-            .ok_or_else(|| CoreError::internal("TCP input runtime slot is invalid"))?;
+            .ok_or_else(|| RuntimeError::invariant("TCP input runtime slot is invalid"))?;
         runtime.handoff = handoff;
         runtime.handoff_worker = handoff_worker;
         Ok(())
@@ -321,7 +283,7 @@ fn tcp_input_local_next_for_index<C, Seg>(
     snapshot: &TcpLookupSnapshot,
     handoff: Option<NodeHandle>,
     handoff_worker: Option<DataWorkerId>,
-) -> CoreResult<Option<u16>>
+) -> RuntimeResult<Option<u16>>
 where
     C: CongestionController + 'static,
     Seg: TcpWorkerStore<C>,
@@ -344,8 +306,8 @@ where
 enum TcpInputError {
     BadLength,
     WrongProtocol {
-        version: IpVersion,
-        protocol: IpProtocol,
+        version: TcpIpVersion,
+        protocol: TcpIpProtocol,
     },
 }
 
@@ -353,11 +315,20 @@ enum TcpInputError {
 fn next_slot_for_index_with_runtime<C, Seg>(
     runtime: &DataPlaneRuntime,
     index: Index,
-    parsed: Result<(IpVersion, IpProtocol, SocketAddr, SocketAddr, TcpInputFlags), TcpInputError>,
+    parsed: Result<
+        (
+            TcpIpVersion,
+            TcpIpProtocol,
+            SocketAddr,
+            SocketAddr,
+            TcpInputFlags,
+        ),
+        TcpInputError,
+    >,
     snapshot: &TcpLookupSnapshot,
     handoff: Option<NodeHandle>,
     handoff_worker: Option<DataWorkerId>,
-) -> CoreResult<Option<u16>>
+) -> RuntimeResult<Option<u16>>
 where
     C: CongestionController + 'static,
     Seg: TcpWorkerStore<C>,
@@ -511,13 +482,13 @@ fn resolve_success_next_with_trace(
     runtime: &DataPlaneRuntime,
     index: Index,
     next_key: TcpInputNext,
-    version: IpVersion,
-    protocol: IpProtocol,
+    version: TcpIpVersion,
+    protocol: TcpIpProtocol,
     source_port: u16,
     destination_port: u16,
     flags: u16,
     traced: bool,
-) -> CoreResult<Option<u16>> {
+) -> RuntimeResult<Option<u16>> {
     let slot = next_key.slot() as u16;
     if traced {
         add_packet_trace!(
@@ -543,11 +514,11 @@ fn resolve_error_next_with_runtime(
     index: Index,
     next_key: TcpInputNext,
     error: TcpError,
-    version: Option<IpVersion>,
-    protocol: Option<IpProtocol>,
+    version: Option<TcpIpVersion>,
+    protocol: Option<TcpIpProtocol>,
     flags: u16,
     traced: bool,
-) -> CoreResult<Option<u16>> {
+) -> RuntimeResult<Option<u16>> {
     {
         let mut buffer = runtime.get_buffer_mut(index)?;
         set_buffer_node_error_code(runtime, &mut buffer, error as u16)?;
@@ -576,7 +547,7 @@ fn session_or_listener_pending_input_entry<C, Seg>(
     local: SocketAddr,
     remote: SocketAddr,
     flags: TcpInputFlags,
-) -> CoreResult<(Option<(SessionId, DataWorkerId, TcpInputNext)>, bool)>
+) -> RuntimeResult<(Option<(SessionId, DataWorkerId, TcpInputNext)>, bool)>
 where
     C: CongestionController + 'static,
     Seg: TcpWorkerStore<C>,
@@ -616,7 +587,7 @@ pub(crate) fn stamp_session_route_for_test(
     session_id: SessionId,
     owner: DataWorkerId,
     next: TcpInputNext,
-) -> CoreResult<()> {
+) -> RuntimeResult<()> {
     let mut buffer = runtime.get_buffer_mut(index)?;
     write_session_route_opaque(buffer.opaque2_mut(), session_id, owner, next);
     Ok(())
@@ -625,8 +596,18 @@ pub(crate) fn stamp_session_route_for_test(
 #[inline(always)]
 fn tcp_input_buffer(
     buffer: &hammer_core::data_plane::Buffer,
-) -> CoreResult<Result<(IpVersion, IpProtocol, SocketAddr, SocketAddr, TcpInputFlags), TcpInputError>>
-{
+) -> RuntimeResult<
+    Result<
+        (
+            TcpIpVersion,
+            TcpIpProtocol,
+            SocketAddr,
+            SocketAddr,
+            TcpInputFlags,
+        ),
+        TcpInputError,
+    >,
+> {
     tcp_input_parts(buffer.current(), unsafe {
         transmute::<_, &NetworkOpaque>(buffer.opaque())
     })
@@ -658,13 +639,23 @@ fn prefetch_tcp_input<C, Seg>(
 fn tcp_input_parts(
     current: &[u8],
     network: &NetworkOpaque,
-) -> CoreResult<Result<(IpVersion, IpProtocol, SocketAddr, SocketAddr, TcpInputFlags), TcpInputError>>
-{
+) -> RuntimeResult<
+    Result<
+        (
+            TcpIpVersion,
+            TcpIpProtocol,
+            SocketAddr,
+            SocketAddr,
+            TcpInputFlags,
+        ),
+        TcpInputError,
+    >,
+> {
     let cursor = network.packet_cursor();
     let Some((version, protocol)) = ip_facts(network) else {
         return Ok(Err(TcpInputError::BadLength));
     };
-    if protocol != IpProtocol::Tcp {
+    if protocol != TcpIpProtocol::Tcp {
         return Ok(Err(TcpInputError::WrongProtocol { version, protocol }));
     }
     if !valid_tcp_cursor(cursor) {
@@ -703,13 +694,13 @@ fn valid_tcp_cursor(cursor: BufferPacketCursor) -> bool {
 }
 
 #[inline(always)]
-fn ip_facts(network: &NetworkOpaque) -> Option<(IpVersion, IpProtocol)> {
+fn ip_facts(network: &NetworkOpaque) -> Option<(TcpIpVersion, TcpIpProtocol)> {
     let version = match network.ip().ip_version()? {
-        4 => IpVersion::V4,
-        6 => IpVersion::V6,
+        4 => TcpIpVersion::V4,
+        6 => TcpIpVersion::V6,
         _ => return None,
     };
-    Some((version, IpProtocol::from(network.ip().ip_protocol()?)))
+    Some((version, TcpIpProtocol::from(network.ip().ip_protocol()?)))
 }
 
 #[inline(always)]
@@ -731,15 +722,15 @@ fn tcp_input_flags(flags: TcpSegmentFlags) -> TcpInputFlags {
 }
 
 #[inline(always)]
-fn source_ip(version: IpVersion, packet: &[u8]) -> CoreResult<IpAddr> {
+fn source_ip(version: TcpIpVersion, packet: &[u8]) -> RuntimeResult<IpAddr> {
     match version {
-        IpVersion::V4 => {
+        TcpIpVersion::V4 => {
             let Some(source) = packet.get(12..16) else {
                 return Err(TcpError::Length.into());
             };
             Ok(Ipv4Addr::new(source[0], source[1], source[2], source[3]).into())
         }
-        IpVersion::V6 => {
+        TcpIpVersion::V6 => {
             let Some(source) = packet.get(8..24) else {
                 return Err(TcpError::Length.into());
             };
@@ -750,9 +741,9 @@ fn source_ip(version: IpVersion, packet: &[u8]) -> CoreResult<IpAddr> {
 }
 
 #[inline(always)]
-fn destination_ip(version: IpVersion, packet: &[u8]) -> CoreResult<IpAddr> {
+fn destination_ip(version: TcpIpVersion, packet: &[u8]) -> RuntimeResult<IpAddr> {
     match version {
-        IpVersion::V4 => {
+        TcpIpVersion::V4 => {
             let Some(destination) = packet.get(16..20) else {
                 return Err(TcpError::Length.into());
             };
@@ -764,7 +755,7 @@ fn destination_ip(version: IpVersion, packet: &[u8]) -> CoreResult<IpAddr> {
             )
             .into())
         }
-        IpVersion::V6 => {
+        TcpIpVersion::V6 => {
             let Some(destination) = packet.get(24..40) else {
                 return Err(TcpError::Length.into());
             };
@@ -822,7 +813,7 @@ fn prefetch_lookup_for_buffer(
         return;
     };
     match version {
-        IpVersion::V4 if network_header.len() >= 20 => {
+        TcpIpVersion::V4 if network_header.len() >= 20 => {
             let local_addr = Ipv4Addr::new(
                 network_header[16],
                 network_header[17],
@@ -835,7 +826,7 @@ fn prefetch_lookup_for_buffer(
                 destination_port,
             ));
         }
-        IpVersion::V6 if network_header.len() >= 40 => {
+        TcpIpVersion::V6 if network_header.len() >= 40 => {
             let local_addr = Ipv6Addr::from([
                 network_header[24],
                 network_header[25],

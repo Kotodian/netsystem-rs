@@ -6,19 +6,19 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use hammer_core::data_plane::{
-    BufferFrame, BufferPacketCursor, DataPlaneBufferConfig, Index, SecondaryOpaque,
+    BufferFrame, BufferPacketCursor, Index, SecondaryOpaque,
 };
-use hammer_core::error::CoreResult;
-use hammer_core::forwarding::{DpoProto, FibTableBuilder};
+use hammer_plugin_ip::forwarding::{DpoProto, FibTableBuilder, ForwardingMetadata};
 use hammer_plugin_ip::{
     IpInputNext, IpInputNode, IpLookupControlPlane, IpLookupNext, IpUnicastArc,
 };
+use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
-    DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node,
-    NodeProcessFn, NodeResult, NodeRuntimeData,
+    DataPlaneBufferConfig, DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig,
+    InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
 };
 use hammer_service::data_plane::DropNode;
-use hammer_service::opaque::{ForwardingMetadata, NetworkOpaque, TapEthernetMetadata};
+use hammer_service::opaque::{NetworkOpaque, TapEthernetMetadata};
 use ipnet::{Ipv4Net, Ipv6Net};
 
 const FRAME_PACKETS: usize = 128;
@@ -47,7 +47,7 @@ fn test_runtime_configured_instruction_set(
 #[repr(C)]
 struct LookupPerfOpaque {
     tap_ethernet: Option<TapEthernetMetadata>,
-    icmp_error: Option<hammer_core::protocol::icmp::IcmpErrorMetadata>,
+    icmp_error: Option<hammer_plugin_ip::protocol::icmp::IcmpErrorMetadata>,
     forwarding: Option<ForwardingMetadata>,
 }
 
@@ -87,7 +87,7 @@ impl Node for SinkNode {
     }
 
     #[inline]
-    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
         Ok(self.runtime_data)
     }
 }
@@ -453,7 +453,7 @@ fn add_single_path(
     builder: &mut FibTableBuilder<u16>,
     proto: DpoProto,
     next: u16,
-) -> hammer_core::forwarding::LoadBalanceIndex {
+) -> hammer_plugin_ip::forwarding::LoadBalanceIndex {
     builder.add_single_path_load_balance(proto, next)
 }
 

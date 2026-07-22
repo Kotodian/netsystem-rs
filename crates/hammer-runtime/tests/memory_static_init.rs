@@ -1,6 +1,6 @@
-use hammer_core::config::Config;
-use hammer_core::data_plane::DataPlaneBufferConfig;
-use hammer_core::registry::RuntimeRegistry;
+use hammer_runtime::DataPlaneBufferConfig;
+use hammer_runtime::RuntimeRegistry;
+use hammer_runtime::config::Worker;
 use hammer_runtime::{DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig, Engine};
 
 fn runtime_config(numa_nodes: &'static [u32], active_numa_node: u32) -> DataPlaneRuntimeConfig {
@@ -18,23 +18,34 @@ fn runtime_config(numa_nodes: &'static [u32], active_numa_node: u32) -> DataPlan
 
 #[test]
 fn memory_init_materializes_the_configured_buffer_and_instruction_set_policy() {
-    let mut config = Config::default();
-    config.worker.buffer.slot_bytes = 4096;
-    config.worker.buffer.slots_per_numa = 7;
-    config.worker.buffer.frame_pool_size = 5;
-    config.worker.instruction_set = "scalar".to_owned();
-    let expected = hammer_runtime::new_worker_runtime(&config).expect("configured runtime");
+    let mut expected_worker = Worker::default();
+    expected_worker.buffer.slot_bytes = 4096;
+    expected_worker.buffer.slots_per_numa = 7;
+    expected_worker.buffer.frame_pool_size = 5;
+    expected_worker.instruction_set = "scalar".to_owned();
+    let expected =
+        hammer_runtime::new_worker_runtime(&expected_worker).expect("configured runtime");
     let expected_stride = expected
         .buffers()
         .try_buffers()
         .expect("configured buffer pool")
         .slot_stride();
     let registry = RuntimeRegistry::new();
-    let config = std::sync::Arc::new(config);
-    registry.set(std::sync::Arc::clone(&config));
     let mut engine = Engine::new(DataPlaneRuntime::new(runtime_config(&[0], 0)), registry);
 
-    hammer_runtime::memory::memory_init(&mut engine, config).expect("configured memory init");
+    engine
+        .configure_early(
+            r#"
+[worker]
+instruction_set = "scalar"
+
+[worker.buffer]
+slot_bytes = 4096
+slots_per_numa = 7
+frame_pool_size = 5
+"#,
+        )
+        .expect("configured worker config dispatch");
 
     assert_eq!(
         engine.runtime.instruction_set(),
@@ -62,8 +73,7 @@ fn memory_init_materializes_the_configured_buffer_and_instruction_set_policy() {
 #[test]
 fn engine_spawn_uses_initialized_runtime_view_for_inherited_numa() {
     let main_runtime = DataPlaneRuntime::new(runtime_config(&[0], 0));
-    let main =
-        hammer_runtime::Engine::new(main_runtime, hammer_core::registry::RuntimeRegistry::new());
+    let main = hammer_runtime::Engine::new(main_runtime, hammer_runtime::RuntimeRegistry::new());
 
     let worker = main.spawn(3).expect("spawn worker");
 

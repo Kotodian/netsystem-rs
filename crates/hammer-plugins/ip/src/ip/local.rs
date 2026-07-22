@@ -2,36 +2,28 @@ use std::mem::transmute;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::protocol::icmp::IcmpHeader;
+use crate::protocol::wire::read_header;
 use arc_swap::ArcSwap;
 use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId, NodeNext};
-use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::protocol::icmp::IcmpHeader;
-use hammer_core::protocol::tcp::TcpWireHeader;
-use hammer_core::protocol::transport::UdpHeader;
-use hammer_core::protocol::wire::read_header;
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 use hammer_runtime::{
-    DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
-    TraceFormatter, add_packet_trace,
+    DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, TraceFormatter,
+    add_packet_trace, format_packet_trace,
 };
+use hammer_runtime::{RuntimeError, RuntimeResult};
 
-use hammer_core::forwarding::{DpoType, FibLookupResult};
+use crate::forwarding::{DpoType, FibLookupResult, FibTableHandle};
 use hammer_service::data_plane::{FeatureArcStartHandle, set_index_node_error_code};
-use hammer_service::net::fib::FibTableHandle;
 use hammer_service::opaque::NetworkOpaque;
 
 use super::{IpInputError, IpInputTarget, IpProtocol, IpVersion, ParsedIpPacket, ip_header};
-use hammer_service::trace::codec::{
-    TraceDecodeCursor, put_option_ip_protocol, put_option_ip_version, put_option_u16, put_u8,
-    put_u16, put_usize,
-};
 
 const IP_PROTOCOL_ICMP: u8 = 1;
 const IP_PROTOCOL_TCP: u8 = 6;
 const IP_PROTOCOL_UDP: u8 = 17;
 const IP_PROTOCOL_ICMP6: u8 = 58;
 const TCP_HEADER_MIN_LEN: usize = 20;
-const UDP_HEADER_LEN: usize = 8;
 const ICMP_HEADER_MIN_LEN: usize = 4;
 
 #[hammer_component_macros::feature_arc]
@@ -65,13 +57,13 @@ pub enum IpLocalError {
     UnknownProtocol,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum IpLocalTraceStage {
     Head,
     Receive,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct IpLocalTrace {
     pub stage: IpLocalTraceStage,
     pub version: Option<IpVersion>,
@@ -79,50 +71,6 @@ pub struct IpLocalTrace {
     pub transport_header_len: usize,
     pub error: Option<u16>,
     pub next: u16,
-}
-
-impl IpLocalTrace {
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let mut cursor = TraceDecodeCursor::new(bytes);
-        let stage = match cursor.read_u8()? {
-            0 => IpLocalTraceStage::Head,
-            1 => IpLocalTraceStage::Receive,
-            _ => return None,
-        };
-        let trace = Self {
-            stage,
-            version: cursor.read_option_ip_version()?,
-            protocol: cursor.read_option_ip_protocol()?,
-            transport_header_len: cursor.read_usize()?,
-            error: cursor.read_option_u16()?,
-            next: cursor.read_u16()?,
-        };
-        cursor.is_empty().then_some(trace)
-    }
-}
-
-impl PacketTrace for IpLocalTrace {
-    fn encode_trace(&self, out: &mut Vec<u8>) {
-        put_u8(
-            out,
-            match self.stage {
-                IpLocalTraceStage::Head => 0,
-                IpLocalTraceStage::Receive => 1,
-            },
-        );
-        put_option_ip_version(out, self.version);
-        put_option_ip_protocol(out, self.protocol);
-        put_usize(out, self.transport_header_len);
-        put_option_u16(out, self.error);
-        put_u16(out, self.next);
-    }
-}
-
-fn format_ip_local_trace(bytes: &[u8]) -> String {
-    match IpLocalTrace::decode(bytes) {
-        Some(trace) => format!("{trace:?}"),
-        None => format!("IpLocalTrace invalid={bytes:?}"),
-    }
 }
 
 impl IpLocalError {
@@ -180,7 +128,7 @@ impl IpLocalControlPlane {
     /// Control registers the target via `add_node_next_slot` on the IpLocal
     /// consumer, then stores only the returned `u16` in the snapshot.
     #[inline]
-    pub fn register_protocol(&self, protocol: u8, slot: u16) -> CoreResult<()> {
+    pub fn register_protocol(&self, protocol: u8, slot: u16) -> RuntimeResult<()> {
         self.inner.rcu(|current| {
             let mut next = IpLocalState::clone(current);
             next.protocol_nexts[protocol as usize] = Some(slot);
@@ -190,7 +138,7 @@ impl IpLocalControlPlane {
     }
 
     #[inline]
-    pub fn unregister_protocol(&self, protocol: u8) -> CoreResult<()> {
+    pub fn unregister_protocol(&self, protocol: u8) -> RuntimeResult<()> {
         self.inner.rcu(|current| {
             let mut next = IpLocalState::clone(current);
             next.protocol_nexts[protocol as usize] = None;
@@ -294,26 +242,26 @@ fn pending_ip_local_controls() -> &'static Mutex<Vec<(usize, IpLocalControlPlane
     CONTROLS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn register_ip_local(runtime: &DataPlaneRuntime, worker: usize) -> CoreResult<NodeId> {
+fn register_ip_local(runtime: &DataPlaneRuntime, worker: usize) -> RuntimeResult<NodeId> {
     let control = IpLocalControlPlane::new([NodeId::new(0); IpLocalNext::COUNT]);
     let node = runtime
         .nodes()
         .try_register_internal_with_next_names(control.node(), &IpLocalNext::NEXT_NAMES)?;
     pending_ip_local_controls()
         .lock()
-        .map_err(|_| CoreError::internal("IP local initializer registry poisoned"))?
+        .map_err(|_| RuntimeError::invariant("IP local initializer registry poisoned"))?
         .push((worker, control));
     Ok(node)
 }
 
-fn register_ip_receive(runtime: &DataPlaneRuntime, worker: usize) -> CoreResult<NodeId> {
+fn register_ip_receive(runtime: &DataPlaneRuntime, worker: usize) -> RuntimeResult<NodeId> {
     let mut controls = pending_ip_local_controls()
         .lock()
-        .map_err(|_| CoreError::internal("IP local initializer registry poisoned"))?;
+        .map_err(|_| RuntimeError::invariant("IP local initializer registry poisoned"))?;
     let position = controls
         .iter()
         .position(|(registered_worker, _)| *registered_worker == worker)
-        .ok_or_else(|| CoreError::internal("IP local sibling initialized before its owner"))?;
+        .ok_or_else(|| RuntimeError::invariant("IP local sibling initialized before its owner"))?;
     let (_, control) = controls.remove(position);
     runtime
         .nodes()
@@ -336,7 +284,7 @@ impl Node for IpLocalNode {
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_ip_local_trace)
+        Some(format_packet_trace!(IpLocalTrace))
     }
 
     #[inline]
@@ -345,7 +293,7 @@ impl Node for IpLocalNode {
     }
 
     #[inline]
-    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
         let feature_arc = self.feature_arc.as_ref().map(|arc| arc.start_handle());
         sync_ip_local_runtime(self.runtime_data, self.state.clone(), feature_arc)?;
         Ok(self.runtime_data)
@@ -368,7 +316,7 @@ impl Node for IpReceiveNode {
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_ip_local_trace)
+        Some(format_packet_trace!(IpLocalTrace))
     }
 
     #[inline]
@@ -377,7 +325,7 @@ impl Node for IpReceiveNode {
     }
 
     #[inline]
-    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
         let feature_arc = self.feature_arc.as_ref().map(|arc| arc.start_handle());
         sync_ip_local_runtime(self.runtime_data, self.state.clone(), feature_arc)?;
         Ok(self.runtime_data)
@@ -419,27 +367,27 @@ fn sync_ip_local_runtime(
     data: NodeRuntimeData,
     state: IpLocalStateHandle,
     feature_arc: Option<FeatureArcStartHandle>,
-) -> CoreResult<()> {
+) -> RuntimeResult<()> {
     let slot = data.usize_word(0)?;
     let mut runtimes = ip_local_runtimes()
         .lock()
-        .map_err(|_| CoreError::internal("IP local runtime registry poisoned"))?;
+        .map_err(|_| RuntimeError::invariant("IP local runtime registry poisoned"))?;
     let runtime = runtimes
         .get_mut(slot)
-        .ok_or_else(|| CoreError::internal("IP local runtime slot is invalid"))?;
+        .ok_or_else(|| RuntimeError::invariant("IP local runtime slot is invalid"))?;
     runtime.state = state;
     runtime.feature_arc = feature_arc;
     Ok(())
 }
 
-fn ip_local_runtime(data: NodeRuntimeData) -> CoreResult<IpLocalRuntime> {
+fn ip_local_runtime(data: NodeRuntimeData) -> RuntimeResult<IpLocalRuntime> {
     let slot = data.usize_word(0)?;
     ip_local_runtimes()
         .lock()
-        .map_err(|_| CoreError::internal("IP local runtime registry poisoned"))?
+        .map_err(|_| RuntimeError::invariant("IP local runtime registry poisoned"))?
         .get(slot)
         .cloned()
-        .ok_or_else(|| CoreError::internal("IP local runtime slot is invalid"))
+        .ok_or_else(|| RuntimeError::invariant("IP local runtime slot is invalid"))
 }
 
 fn ip_local_process(
@@ -514,7 +462,7 @@ fn process_index(
     state: &IpLocalState,
     stage: LocalStage,
     feature_arc: Option<&FeatureArcStartHandle>,
-) -> CoreResult<u16> {
+) -> RuntimeResult<u16> {
     let buffer = runtime.get_buffer(index)?;
     let current = buffer.current();
     let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
@@ -583,7 +531,7 @@ fn process_index(
     let first_len = current.len().min(parsed.packet_len);
     let packet = current
         .get(..first_len)
-        .ok_or_else(|| CoreError::internal("invalid local packet length"))?;
+        .ok_or_else(|| RuntimeError::invariant("invalid local packet length"))?;
     let transport = match packet.get(parsed.transport_header_offset..parsed.packet_len) {
         Some(transport) => transport,
         None => {
@@ -716,24 +664,9 @@ fn validate_transport(
             }
             Ok(Some(header_len))
         }
-        IpProtocol::Udp => {
-            let header = read_header::<UdpHeader>(transport, 0)
-                .map_err(|_| IpLocalError::BadTransportHeader)?;
-            let datagram_len = udp_datagram_len(transport, header)?;
-            let datagram = &transport[..datagram_len];
-            if stage.is_head_of_feature_arc() {
-                let checksum = header.checksum();
-                match parsed.version {
-                    IpVersion::V4 if checksum == 0 => {}
-                    IpVersion::V6 if checksum == 0 => return Err(IpLocalError::BadChecksum),
-                    _ if l4_checksum(packet, parsed, IP_PROTOCOL_UDP, datagram) != 0 => {
-                        return Err(IpLocalError::BadChecksum);
-                    }
-                    _ => {}
-                }
-            }
-            Ok(Some(UDP_HEADER_LEN))
-        }
+        // UDP owns its header, length, and checksum validation in the UDP input
+        // node. IP establishes only the IP packet cursor before protocol dispatch.
+        IpProtocol::Udp => Ok(None),
         IpProtocol::Icmpv4 => {
             read_header::<IcmpHeader>(transport, 0)
                 .map_err(|_| IpLocalError::BadTransportHeader)?;
@@ -758,22 +691,12 @@ fn validate_transport(
 
 #[inline(always)]
 fn tcp_header_len(transport: &[u8]) -> Result<usize, IpLocalError> {
-    let header =
-        read_header::<TcpWireHeader>(transport, 0).map_err(|_| IpLocalError::BadTransportHeader)?;
-    let header_len = header.header_len();
+    let data_offset = *transport.get(12).ok_or(IpLocalError::BadTransportHeader)?;
+    let header_len = usize::from(data_offset >> 4) * 4;
     if header_len < TCP_HEADER_MIN_LEN || transport.len() < header_len {
         return Err(IpLocalError::BadTransportHeader);
     }
     Ok(header_len)
-}
-
-#[inline(always)]
-fn udp_datagram_len(transport: &[u8], header: UdpHeader) -> Result<usize, IpLocalError> {
-    let len = header.length();
-    if len < UDP_HEADER_LEN || transport.len() < len {
-        return Err(IpLocalError::BadTransportHeader);
-    }
-    Ok(len)
 }
 
 #[inline(always)]
@@ -782,7 +705,7 @@ fn refresh_basic_metadata(
     index: Index,
     parsed: &ParsedIpPacket,
     transport_header_len: Option<usize>,
-) -> CoreResult<()> {
+) -> RuntimeResult<()> {
     let mut buffer = runtime.get_buffer_mut(index)?;
     let transport_header_len = transport_header_len.unwrap_or_default();
     unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }.set_packet_cursor(

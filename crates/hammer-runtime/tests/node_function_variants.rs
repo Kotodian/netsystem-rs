@@ -1,13 +1,12 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use hammer_core::config::Config;
-use hammer_core::data_plane::{BufferFrame, DataPlaneBufferConfig};
-use hammer_core::registry::RuntimeRegistry;
+use hammer_core::data_plane::{BufferFrame};
+use hammer_runtime::RuntimeRegistry;
+use hammer_runtime::config::Worker;
 use hammer_runtime::graph::install_packet_graph;
 use hammer_runtime::{
-    DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig, Engine, Node, NodeResult,
-    NodeRuntimeData, spawn::DataRuntime,
+    DataPlaneBufferConfig, DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig,
+    Engine, Node, NodeResult, NodeRuntimeData, spawn::DataRuntime,
 };
 
 hammer_runtime::__declare_registration_image!();
@@ -56,8 +55,7 @@ fn node_function_selection_changes_dispatch_without_changing_topology() {
         ),
         RuntimeRegistry::new(),
     );
-    install_packet_graph(&mut scalar, Arc::new(Config::default()))
-        .expect("initialize scalar graph");
+    install_packet_graph(&mut scalar).expect("initialize scalar graph");
     let scalar_node = scalar
         .runtime
         .node_by_name(MultiarchNode::NODE_NAME)
@@ -105,8 +103,7 @@ fn node_function_selection_changes_dispatch_without_changing_topology() {
         ),
         RuntimeRegistry::new(),
     );
-    install_packet_graph(&mut native, Arc::new(Config::default()))
-        .expect("initialize native graph");
+    install_packet_graph(&mut native).expect("initialize native graph");
     let native_node = native
         .runtime
         .node_by_name(MultiarchNode::NODE_NAME)
@@ -154,15 +151,15 @@ fn node_function_selection_changes_dispatch_without_changing_topology() {
 
 #[test]
 fn worker_runtime_rejects_unknown_and_unsupported_instruction_sets() {
-    let mut config = Config::default();
-    config.worker.instruction_set = "unknown".to_owned();
-    let Err(error) = DataRuntime::from_config(&config.worker, "unknown-isa-worker") else {
+    let mut worker = Worker::default();
+    worker.instruction_set = "unknown".to_owned();
+    let Err(error) = DataRuntime::from_config(&worker, "unknown-isa-worker") else {
         panic!("unknown instruction set must fail");
     };
     assert!(error.to_string().contains("unknown instruction set"));
 
-    config.worker.instruction_set = UNSUPPORTED_INSTRUCTION_SET.to_owned();
-    let Err(error) = DataRuntime::from_config(&config.worker, "unsupported-isa-worker") else {
+    worker.instruction_set = UNSUPPORTED_INSTRUCTION_SET.to_owned();
+    let Err(error) = DataRuntime::from_config(&worker, "unsupported-isa-worker") else {
         panic!("unsupported instruction set must fail");
     };
     assert!(error.to_string().contains("not supported by this CPU"));

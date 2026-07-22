@@ -2,13 +2,15 @@ use std::ffi::c_void;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
-use hammer_core::error::{CoreError, CoreResult};
+use hammer_runtime::{RuntimeError, RuntimeResult};
 
 const TUN_DEVICE: &[u8] = b"/dev/net/tun\0";
 
-pub(super) fn open(requested_name: &str, mtu: u32) -> CoreResult<(OwnedFd, String)> {
+pub(super) fn open(requested_name: &str, mtu: u32) -> RuntimeResult<(OwnedFd, String)> {
     if requested_name.len() >= libc::IFNAMSIZ || requested_name.as_bytes().contains(&0) {
-        return Err(CoreError::internal("Linux TUN interface name is invalid"));
+        return Err(RuntimeError::invariant(
+            "Linux TUN interface name is invalid",
+        ));
     }
 
     // SAFETY: TUN_DEVICE is NUL-terminated, and these flags do not require an
@@ -46,7 +48,7 @@ pub(super) fn open(requested_name: &str, mtu: u32) -> CoreResult<(OwnedFd, Strin
     Ok((fd, name))
 }
 
-pub(super) fn try_recv(fd: RawFd, payload: &mut [u8]) -> CoreResult<Option<usize>> {
+pub(super) fn try_recv(fd: RawFd, payload: &mut [u8]) -> RuntimeResult<Option<usize>> {
     let mut vectors = Vec::with_capacity(1);
     vectors.push(libc::iovec {
         iov_base: payload.as_mut_ptr().cast::<c_void>(),
@@ -58,14 +60,16 @@ pub(super) fn try_recv(fd: RawFd, payload: &mut [u8]) -> CoreResult<Option<usize
         let read = unsafe { libc::readv(fd, vectors.as_ptr(), 1) };
         if read >= 0 {
             let read = usize::try_from(read)
-                .map_err(|_| CoreError::internal("Linux TUN read length overflow"))?;
+                .map_err(|_| RuntimeError::invariant("Linux TUN read length overflow"))?;
             if read == 0 {
-                return Err(CoreError::internal("Linux TUN packet has no L3 payload"));
+                return Err(RuntimeError::invariant(
+                    "Linux TUN packet has no L3 payload",
+                ));
             }
             match payload[0] >> 4 {
                 4 | 6 => return Ok(Some(read)),
                 _ => {
-                    return Err(CoreError::internal(
+                    return Err(RuntimeError::invariant(
                         "Linux TUN packet has unsupported L3 version",
                     ));
                 }
@@ -76,7 +80,7 @@ pub(super) fn try_recv(fd: RawFd, payload: &mut [u8]) -> CoreResult<Option<usize
             io::ErrorKind::WouldBlock => return Ok(None),
             io::ErrorKind::Interrupted => continue,
             _ => {
-                return Err(CoreError::internal(format!(
+                return Err(RuntimeError::invariant(format!(
                     "read Linux TUN packet: {error}"
                 )));
             }
@@ -84,9 +88,9 @@ pub(super) fn try_recv(fd: RawFd, payload: &mut [u8]) -> CoreResult<Option<usize
     }
 }
 
-pub(super) fn try_send(fd: RawFd, version: u8, segments: &[&[u8]]) -> CoreResult<bool> {
+pub(super) fn try_send(fd: RawFd, version: u8, segments: &[&[u8]]) -> RuntimeResult<bool> {
     if version != 4 && version != 6 {
-        return Err(CoreError::internal(
+        return Err(RuntimeError::invariant(
             "cannot send unsupported L3 version to Linux TUN",
         ));
     }
@@ -94,20 +98,20 @@ pub(super) fn try_send(fd: RawFd, version: u8, segments: &[&[u8]]) -> CoreResult
         .iter()
         .find_map(|segment| segment.first())
         .map(|first| first >> 4)
-        .ok_or_else(|| CoreError::internal("Linux TUN packet has no L3 payload"))?;
+        .ok_or_else(|| RuntimeError::invariant("Linux TUN packet has no L3 payload"))?;
     if packet_version != version {
-        return Err(CoreError::internal(
+        return Err(RuntimeError::invariant(
             "Linux TUN packet does not match the supplied L3 version",
         ));
     }
     let count = libc::c_int::try_from(segments.len())
-        .map_err(|_| CoreError::internal("Linux TUN buffer chain has too many segments"))?;
+        .map_err(|_| RuntimeError::invariant("Linux TUN buffer chain has too many segments"))?;
     let mut vectors = Vec::with_capacity(segments.len());
     let mut total = 0usize;
     for segment in segments {
         total = total
             .checked_add(segment.len())
-            .ok_or_else(|| CoreError::internal("Linux TUN packet length overflow"))?;
+            .ok_or_else(|| RuntimeError::invariant("Linux TUN packet length overflow"))?;
         vectors.push(libc::iovec {
             iov_base: segment.as_ptr().cast::<c_void>().cast_mut(),
             iov_len: segment.len(),
@@ -120,9 +124,9 @@ pub(super) fn try_send(fd: RawFd, version: u8, segments: &[&[u8]]) -> CoreResult
         let written = unsafe { libc::writev(fd, vectors.as_ptr(), count) };
         if written >= 0 {
             let written = usize::try_from(written)
-                .map_err(|_| CoreError::internal("Linux TUN write length overflow"))?;
+                .map_err(|_| RuntimeError::invariant("Linux TUN write length overflow"))?;
             if written != total {
-                return Err(CoreError::internal("partial Linux TUN packet write"));
+                return Err(RuntimeError::invariant("partial Linux TUN packet write"));
             }
             return Ok(true);
         }
@@ -131,7 +135,7 @@ pub(super) fn try_send(fd: RawFd, version: u8, segments: &[&[u8]]) -> CoreResult
             io::ErrorKind::WouldBlock => return Ok(false),
             io::ErrorKind::Interrupted => continue,
             _ => {
-                return Err(CoreError::internal(format!(
+                return Err(RuntimeError::invariant(format!(
                     "write Linux TUN packet: {error}"
                 )));
             }
@@ -139,25 +143,25 @@ pub(super) fn try_send(fd: RawFd, version: u8, segments: &[&[u8]]) -> CoreResult
     }
 }
 
-fn interface_name(name: &[libc::c_char; libc::IFNAMSIZ]) -> CoreResult<String> {
+fn interface_name(name: &[libc::c_char; libc::IFNAMSIZ]) -> RuntimeResult<String> {
     let length = name
         .iter()
         .position(|byte| *byte == 0)
-        .ok_or_else(|| CoreError::internal("Linux TUN interface name is not terminated"))?;
+        .ok_or_else(|| RuntimeError::invariant("Linux TUN interface name is not terminated"))?;
     if length == 0 {
-        return Err(CoreError::internal("Linux TUN interface name is empty"));
+        return Err(RuntimeError::invariant("Linux TUN interface name is empty"));
     }
     // SAFETY: c_char and u8 have identical size and alignment. The source
     // array is initialized, live, and contains at least length elements.
     let bytes = unsafe { std::slice::from_raw_parts(name.as_ptr().cast::<u8>(), length) };
     std::str::from_utf8(bytes)
         .map(str::to_owned)
-        .map_err(|_| CoreError::internal("Linux TUN interface name is not UTF-8"))
+        .map_err(|_| RuntimeError::invariant("Linux TUN interface name is not UTF-8"))
 }
 
-fn set_mtu(request: &mut libc::ifreq, mtu: u32) -> CoreResult<()> {
+fn set_mtu(request: &mut libc::ifreq, mtu: u32) -> RuntimeResult<()> {
     let mtu = libc::c_int::try_from(mtu)
-        .map_err(|_| CoreError::internal("Linux TUN MTU does not fit c_int"))?;
+        .map_err(|_| RuntimeError::invariant("Linux TUN MTU does not fit c_int"))?;
     // SAFETY: socket has no pointer arguments. A successful descriptor is
     // transferred immediately into OwnedFd and therefore closed exactly once.
     let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
@@ -175,6 +179,6 @@ fn set_mtu(request: &mut libc::ifreq, mtu: u32) -> CoreResult<()> {
     Ok(())
 }
 
-fn last_error(operation: &str) -> CoreError {
-    CoreError::internal(format!("{operation}: {}", io::Error::last_os_error()))
+fn last_error(operation: &str) -> RuntimeError {
+    RuntimeError::invariant(format!("{operation}: {}", io::Error::last_os_error()))
 }

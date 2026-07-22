@@ -6,12 +6,11 @@ pub use buffer::{
     BUFFER_THREAD_CACHE_BATCH, BUFFER_THREAD_CACHE_HIGH_WATER, Buffer, BufferFlags, BufferFrame,
     BufferFrameBatch, BufferFrameBatchCursor, BufferFrameBatchIndices, BufferFrameBatchWidth,
     BufferFrameBatchWidthPolicy, BufferFramePairBatch, BufferFramePairBatchCursor,
-    BufferFramePending, BufferFrameQuadBatch, BufferFrameQuadBatchCursor, BufferHeaderCacheline0,
+    BufferFrameQuadBatch, BufferFrameQuadBatchCursor, BufferHeaderCacheline0,
     BufferHeaderCacheline1, BufferNodeError, BufferPacketCursor, BufferPool, BufferPoolArena,
     BufferRef, BufferRefMut, BufferThreadCache, DEFAULT_BUFFER_FRAME_CAPACITY,
     DEFAULT_BUFFER_FRAME_POOL_SIZE, DEFAULT_PACKET_HEADROOM, DEFAULT_PRE_DATA_SIZE,
-    DataPlaneBufferChain, DataPlaneBufferConfig, DataPlaneBufferWorkerConfig,
-    DataPlaneBufferWorkerSeed, DataPlaneBuffers, Frame, Index, Next, PRIMARY_OPAQUE_ALIGN,
+    DataPlaneBufferChain, DataPlaneBuffers, Frame, Index, Next, PRIMARY_OPAQUE_ALIGN,
     PRIMARY_OPAQUE_BYTES, Pending, PrimaryOpaque, SecondaryOpaque, buffer_data_offset,
 };
 

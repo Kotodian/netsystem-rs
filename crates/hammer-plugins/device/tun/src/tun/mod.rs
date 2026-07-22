@@ -2,32 +2,27 @@ use std::cell::RefCell;
 use std::mem::transmute;
 use std::sync::{Arc, Mutex};
 
-use hammer_core::config::Config;
-use hammer_core::config::network::Interface;
 use hammer_core::data_plane::{
     BufferFrame, BufferRef, DEFAULT_BUFFER_FRAME_CAPACITY, NodeId, NodeState,
 };
-use hammer_core::error::{CoreError, HammerError, HammerResult};
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, File, FileFunctions, Node, NodeProcessFn, NodeResult,
-    NodeRuntimeData, PacketTrace, TraceFormatter, add_packet_trace,
+    NodeRuntimeData, TraceFormatter, add_packet_trace, format_packet_trace,
 };
+use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use hammer_service::device::{
     DeviceInputNext, DeviceInputNode, DeviceMain, DeviceRxQueue, DeviceTxQueue, DriverScheduleMode,
 };
-use hammer_service::interface::InterfaceControlPlane;
+use hammer_service::interface::{InterfaceConfig, configure_interfaces};
 use hammer_service::opaque::NetworkOpaque;
 
-/// TUN-owned instance list under `[plugin.tun]`.
-///
-/// Names reference `[[network.interface]]` entries (L3/FIB). This driver
-/// opens fds/queues for those instances only.
+/// TUN-owned configuration under `[plugin.tun]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
 struct TunPluginConfig {
-    #[serde(default, alias = "interface")]
-    interfaces: Vec<String>,
+    #[serde(default)]
+    interfaces: Vec<InterfaceConfig>,
 }
 #[cfg(target_os = "macos")]
 mod darwin;
@@ -76,24 +71,28 @@ impl TunControl {
 
     fn add_interface(
         &self,
-        interface: &Interface,
+        interface_name: &str,
+        mtu: u32,
         interface_index: u32,
         worker_count: usize,
+        input_node: NodeId,
         output_node: NodeId,
-    ) -> HammerResult<()> {
+    ) -> RuntimeResult<()> {
         let worker_count = u32::try_from(worker_count)
-            .map_err(|_| HammerError::internal("worker count does not fit u32"))?;
+            .map_err(|_| RuntimeError::invariant("worker count does not fit u32"))?;
         if worker_count == 0 {
-            return Err(HammerError::internal(
+            return Err(RuntimeError::invariant(
                 "at least one data worker is required for a TUN interface",
             ));
         }
         let mut devices = self
             .devices
             .lock()
-            .map_err(|_| HammerError::internal("TUN control devices poisoned"))?;
-        let device_instance = u32::try_from(devices.len())
-            .map_err(|_| HammerError::internal("TUN device instance overflow"))?;
+            .map_err(|_| RuntimeError::invariant("TUN control devices poisoned"))?;
+        let device = self
+            .device_main
+            .register_device(interface_index, input_node, output_node)?;
+        let device_instance = device.instance;
         let owner = DataWorkerId::new(device_instance % worker_count);
         self.device_main.register_rx_queue(
             device_instance,
@@ -110,8 +109,8 @@ impl TunControl {
         )?;
         devices.push(Some(TunControlDevice {
             interface_index,
-            requested_name: interface.name.clone(),
-            mtu: interface.mtu.l3,
+            requested_name: interface_name.to_owned(),
+            mtu,
         }));
         Ok(())
     }
@@ -121,20 +120,20 @@ impl TunControl {
         engine: &mut hammer_runtime::Engine,
         worker: DataWorkerId,
         tun_input: NodeId,
-    ) -> HammerResult<TunWorkerRuntime> {
+    ) -> RuntimeResult<TunWorkerRuntime> {
         let rx_poll_vector = self.device_main.rx_poll_vector(worker);
         let tx_queues = self.device_main.tx_queues_for_worker(worker);
 
         let mut control_devices = self
             .devices
             .lock()
-            .map_err(|_| CoreError::internal("TUN control devices poisoned"))?;
+            .map_err(|_| RuntimeError::invariant("TUN control devices poisoned"))?;
         let mut devices = Vec::with_capacity(rx_poll_vector.len());
         for queue in &rx_poll_vector {
             let device = control_devices
                 .get_mut(queue.device_instance as usize)
                 .and_then(Option::take)
-                .ok_or_else(|| CoreError::internal("TUN RX queue already has an owner"))?;
+                .ok_or_else(|| RuntimeError::invariant("TUN RX queue already has an owner"))?;
             let (fd, kernel_name) = platform::open(&device.requested_name, device.mtu)?;
             tracing::info!(
                 logical_name = %device.requested_name,
@@ -163,7 +162,7 @@ impl TunControl {
                 .iter()
                 .any(|device| device.device_instance == queue.device_instance)
             {
-                return Err(CoreError::internal(
+                return Err(RuntimeError::invariant(
                     "TUN TX queue has no same-worker RX-owned file",
                 ));
             }
@@ -177,35 +176,46 @@ impl TunControl {
     }
 }
 
-#[hammer_component_macros::config_function(name = "tun_config")]
+#[hammer_component_macros::config_function(name = "tun_config", section = "plugin.tun")]
 fn configure_tun(
+    tun_cfg: TunPluginConfig,
     engine: &mut hammer_runtime::Engine,
-    config: Arc<Config>,
     device_main: Arc<DeviceMain>,
-    interface_main: Arc<InterfaceControlPlane>,
-) -> HammerResult<Arc<TunControl>> {
-    let tun_cfg = config.plugin_config::<TunPluginConfig>("tun")?;
+) -> RuntimeResult<Arc<TunControl>> {
+    let interface_main = configure_interfaces(&tun_cfg.interfaces)?;
+    engine.registry.set(Arc::clone(&interface_main));
     let control = TunControl::new(device_main);
+    let tun_input = engine
+        .runtime
+        .node_by_name(TunInputDriverNode::NODE_NAME)
+        .ok_or_else(|| RuntimeError::invariant("tun-input is not registered"))?;
     let tun_output = engine
         .runtime
         .node_by_name(TunOutputDriverNode::NODE_NAME)
-        .ok_or_else(|| CoreError::internal("tun-output is not registered"))?;
-    for name in &tun_cfg.interfaces {
-        let interface = config
-            .network
-            .interface
-            .iter()
-            .find(|interface| interface.name == *name)
-            .ok_or_else(|| {
-                HammerError::config_validation(format!(
-                    "plugin.tun interface `{name}` is not declared in [[network.interface]]"
-                ))
-            })?;
+        .ok_or_else(|| RuntimeError::invariant("tun-output is not registered"))?;
+    for interface in &tun_cfg.interfaces {
         let interface_index = interface_main
             .handle()
             .interface_index(&interface.name)
-            .ok_or_else(|| HammerError::internal("TUN interface is not registered"))?;
-        control.add_interface(interface, interface_index, config.worker.count, tun_output)?;
+            .ok_or_else(|| {
+                RuntimeError::config_validation(format!(
+                    "plugin.tun interface `{}` was not registered",
+                    interface.name
+                ))
+            })?;
+        let mtu = interface_main
+            .handle()
+            .interface_mtu(interface_index)
+            .ok_or_else(|| RuntimeError::invariant("TUN interface has no MTU"))?
+            .l3();
+        control.add_interface(
+            &interface.name,
+            mtu,
+            interface_index,
+            engine.configured_worker_count(),
+            tun_input,
+            tun_output,
+        )?;
     }
     Ok(control)
 }
@@ -214,12 +224,12 @@ fn configure_tun(
 fn configure_tun_worker(
     engine: &mut hammer_runtime::Engine,
     control: Arc<TunControl>,
-) -> HammerResult<()> {
+) -> RuntimeResult<()> {
     let worker = engine.data_worker_id()?;
     let tun_input = engine
         .runtime
         .node_by_name(TunInputDriverNode::NODE_NAME)
-        .ok_or_else(|| CoreError::internal("tun-input is not registered"))?;
+        .ok_or_else(|| RuntimeError::invariant("tun-input is not registered"))?;
     control.device_main.install_worker_output_runtime(engine)?;
     let runtime = control.take_worker_runtime(engine, worker, tun_input)?;
     engine.runtime.nodes().set_node_state(
@@ -236,12 +246,12 @@ fn configure_tun_worker(
     Ok(())
 }
 
-fn schedule_tun_input(file: &mut File) -> HammerResult<()> {
+fn schedule_tun_input(file: &mut File) -> RuntimeResult<()> {
     let node = u32::try_from(file.private_data())
         .map(NodeId::new)
-        .map_err(|_| HammerError::internal("TUN input node id overflow"))?;
+        .map_err(|_| RuntimeError::invariant("TUN input node id overflow"))?;
     hammer_runtime::Engine::with_current(|engine| engine.runtime.schedule_empty_frame(node))
-        .ok_or_else(|| HammerError::internal("TUN File callback has no current Engine"))??;
+        .ok_or_else(|| RuntimeError::invariant("TUN File callback has no current Engine"))??;
     Ok(())
 }
 
@@ -268,7 +278,7 @@ impl Node for TunInputDriverNode {
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_tun_input_trace)
+        Some(format_packet_trace!(TunInputTrace))
     }
 }
 
@@ -293,7 +303,7 @@ impl Node for TunOutputDriverNode {
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_tun_output_trace)
+        Some(format_packet_trace!(TunOutputTrace))
     }
 }
 
@@ -503,101 +513,21 @@ fn fanout_tun_input(runtime: &DataPlaneRuntime, frame: &mut BufferFrame) {
     runtime.enqueue_to_next(frame, &nexts[..count]);
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum TunDriverMode {
     Tun,
     Tap,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct TunInputTrace {
     pub interface_index: Option<u32>,
     pub mode: TunDriverMode,
     pub received: usize,
 }
 
-impl TunInputTrace {
-    pub const ENCODED_LEN: usize = 14;
-
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != Self::ENCODED_LEN {
-            return None;
-        }
-        let interface_index = match bytes[0] {
-            0 => None,
-            1 => Some(u32::from_le_bytes(bytes[1..5].try_into().ok()?)),
-            _ => return None,
-        };
-        let mode = decode_tun_driver_mode(bytes[5])?;
-        let received = usize::try_from(u64::from_le_bytes(bytes[6..14].try_into().ok()?)).ok()?;
-        Some(Self {
-            interface_index,
-            mode,
-            received,
-        })
-    }
-}
-
-impl PacketTrace for TunInputTrace {
-    fn encode_trace(&self, out: &mut Vec<u8>) {
-        out.push(u8::from(self.interface_index.is_some()));
-        out.extend_from_slice(&self.interface_index.unwrap_or_default().to_le_bytes());
-        out.push(encode_tun_driver_mode(self.mode));
-        out.extend_from_slice(&(self.received as u64).to_le_bytes());
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct TunOutputTrace {
     pub mode: TunDriverMode,
     pub pending: usize,
-}
-
-impl TunOutputTrace {
-    pub const ENCODED_LEN: usize = 9;
-
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != Self::ENCODED_LEN {
-            return None;
-        }
-        let mode = decode_tun_driver_mode(bytes[0])?;
-        let pending = usize::try_from(u64::from_le_bytes(bytes[1..9].try_into().ok()?)).ok()?;
-        Some(Self { mode, pending })
-    }
-}
-
-impl PacketTrace for TunOutputTrace {
-    fn encode_trace(&self, out: &mut Vec<u8>) {
-        out.push(encode_tun_driver_mode(self.mode));
-        out.extend_from_slice(&(self.pending as u64).to_le_bytes());
-    }
-}
-
-fn format_tun_input_trace(bytes: &[u8]) -> String {
-    TunInputTrace::decode(bytes)
-        .map(|trace| format!("{trace:?}"))
-        .unwrap_or_else(|| format!("TunInputTrace invalid={bytes:?}"))
-}
-
-fn format_tun_output_trace(bytes: &[u8]) -> String {
-    TunOutputTrace::decode(bytes)
-        .map(|trace| format!("{trace:?}"))
-        .unwrap_or_else(|| format!("TunOutputTrace invalid={bytes:?}"))
-}
-
-#[inline]
-fn encode_tun_driver_mode(mode: TunDriverMode) -> u8 {
-    match mode {
-        TunDriverMode::Tun => 0,
-        TunDriverMode::Tap => 1,
-    }
-}
-
-#[inline]
-fn decode_tun_driver_mode(value: u8) -> Option<TunDriverMode> {
-    match value {
-        0 => Some(TunDriverMode::Tun),
-        1 => Some(TunDriverMode::Tap),
-        _ => None,
-    }
 }

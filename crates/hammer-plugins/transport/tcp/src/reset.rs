@@ -1,7 +1,7 @@
+use crate::{TcpError, TcpSegmentFlags, tcp_header};
 use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId};
-use hammer_core::error::CoreResult;
-use hammer_core::protocol::tcp::{TcpError, TcpSegmentFlags, tcp_header};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
+use hammer_runtime::RuntimeResult;
 use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
 
 #[hammer_component_macros::node_next]
@@ -23,7 +23,7 @@ pub struct TcpResetNode {
     cached_next: Option<NodeId>,
 }
 
-pub fn register_tcp_reset(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+pub fn register_tcp_reset(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_internal_with_next_names(
         TcpResetNode::new([NodeId::new(0); TcpResetNext::COUNT]),
         &TcpResetNext::NEXT_NAMES,
@@ -42,7 +42,7 @@ impl Node for TcpResetNode {
     }
 
     #[inline]
-    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
         Ok(NodeRuntimeData::default())
     }
 }
@@ -62,7 +62,10 @@ fn tcp_reset_process_frame(runtime: &DataPlaneRuntime, frame: &mut BufferFrame) 
 }
 
 #[inline(always)]
-fn tcp_reset_next_for_index(runtime: &DataPlaneRuntime, index: Index) -> CoreResult<TcpResetNext> {
+fn tcp_reset_next_for_index(
+    runtime: &DataPlaneRuntime,
+    index: Index,
+) -> RuntimeResult<TcpResetNext> {
     let reset = {
         let buffer = runtime.get_buffer(index)?;
         tcp_reset_prepare_from_current(
@@ -85,7 +88,7 @@ fn tcp_reset_write_reply(
     runtime: &DataPlaneRuntime,
     index: Index,
     reset: Option<([u8; 16], [u8; 16], u16, u16, u32, u32, u8, u8)>,
-) -> CoreResult<Option<usize>> {
+) -> RuntimeResult<Option<usize>> {
     let Some((
         source,
         destination,
@@ -282,7 +285,8 @@ fn tcp_reset_write_ipv4_reply(
     reset[0] = 0x45;
     write_be_u16(reset, 2, total_len as u16);
     if crate::active_tcp_policy().pmtu_enabled {
-        hammer_core::protocol::ip::apply_ipv4_dont_fragment(reset, true);
+        let flags = u16::from_be_bytes([reset[6], reset[7]]) | 0x4000;
+        reset[6..8].copy_from_slice(&flags.to_be_bytes());
     }
     reset[8] = 64;
     reset[9] = 6;
@@ -421,7 +425,7 @@ fn refresh_reset_metadata(
     runtime: &DataPlaneRuntime,
     index: Index,
     packet_len: usize,
-) -> CoreResult<()> {
+) -> RuntimeResult<()> {
     const TCP_HEADER_LEN: usize = 20;
 
     let mut buffer = runtime.get_buffer_mut(index)?;
@@ -487,7 +491,7 @@ mod tests {
             capture_process
         }
 
-        fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
             Ok(self.runtime_data)
         }
     }
@@ -532,11 +536,11 @@ mod tests {
     fn tcp_reset_node_rewrites_buffer_and_routes_to_lookup() {
         let runtime =
             hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
-                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
+                buffers: hammer_runtime::DataPlaneBufferConfig {
                     buffer_slot_capacity: 512,
                     buffer_slots: 8,
                     frame_slots: 4,
-                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
+                    ..hammer_runtime::DataPlaneBufferConfig::default()
                 },
             });
         let drop_state = Arc::new(Mutex::new(CaptureState::default()));

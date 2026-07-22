@@ -5,22 +5,23 @@ use hammer_core::data_plane::{
     BUFFER_THREAD_CACHE_BATCH, BUFFER_THREAD_CACHE_HIGH_WATER, Buffer, BufferFlags, BufferFrame,
     BufferFrameBatch, BufferFrameBatchCursor, BufferFrameBatchIndices, BufferFrameBatchWidth,
     BufferFrameBatchWidthPolicy, BufferFramePairBatch, BufferFramePairBatchCursor,
-    BufferFramePending, BufferFrameQuadBatch, BufferFrameQuadBatchCursor, BufferHeaderCacheline0,
+    BufferFrameQuadBatch, BufferFrameQuadBatchCursor, BufferHeaderCacheline0,
     BufferHeaderCacheline1, BufferNodeError, BufferPacketCursor, BufferPool, BufferPoolArena,
     BufferRef, BufferRefMut, BufferThreadCache, DEFAULT_BUFFER_FRAME_CAPACITY,
     DEFAULT_BUFFER_FRAME_POOL_SIZE, DEFAULT_PACKET_HEADROOM, DEFAULT_PRE_DATA_SIZE,
-    DataPlaneBufferChain, DataPlaneBufferConfig, DataPlaneBuffers, Frame, Index, Next, NodeId,
+    DataPlaneBufferChain, DataPlaneBuffers, Frame, Index, Next, NodeId,
     PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES, Pending, PrimaryOpaque, SecondaryOpaque,
     buffer_data_offset,
 };
+use hammer_core::error::{BufferInvariant, DataPlaneError, PacketGraphError};
 
 fn test_buffers(buffer_slot_capacity: usize, buffer_slots: usize) -> DataPlaneBuffers {
-    DataPlaneBuffers::new(DataPlaneBufferConfig {
-        buffer_slot_capacity,
-        buffer_slots,
-        frame_slots: 2,
-        ..DataPlaneBufferConfig::default()
-    })
+    DataPlaneBuffers::from_arenas(
+        [BufferPoolArena::with_capacity(buffer_slot_capacity, buffer_slots)],
+        2,
+        0,
+        0,
+    )
 }
 
 fn chain_bytes(buffers: &DataPlaneBuffers, index: Index) -> Vec<u8> {
@@ -29,6 +30,19 @@ fn chain_bytes(buffers: &DataPlaneBuffers, index: Index) -> Vec<u8> {
         out.extend_from_slice(buffer.expect("chain buffer").current());
     }
     out
+}
+
+#[test]
+fn buffer_invariant_failure_is_structured() {
+    let buffers = BufferPool::with_capacity(4, 1);
+    let index = buffers.alloc_index().expect("buffer");
+
+    assert!(matches!(
+        buffers.attach_clone(index, index).unwrap_err(),
+        PacketGraphError::DataPlane(DataPlaneError::BufferInvariant(
+            BufferInvariant::CloneRequiresDistinctBuffers
+        ))
+    ));
 }
 
 #[test]
@@ -69,7 +83,6 @@ fn core_exports_buffer_and_frame_value_primitives() {
     let _ = size_of::<BufferFrameBatchIndices>();
     let _ = size_of::<BufferFramePairBatch>();
     let _ = size_of::<BufferFrameQuadBatch>();
-    let _ = size_of::<BufferFramePending>();
     let _ = size_of::<BufferPool>();
     let _ = size_of::<BufferPoolArena>();
     let _ = size_of::<BufferThreadCache>();

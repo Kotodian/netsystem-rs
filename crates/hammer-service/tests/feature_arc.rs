@@ -1,9 +1,9 @@
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use hammer_core::config::Config;
 use hammer_core::data_plane::{BufferFrame, NodeRegistration};
-use hammer_core::error::CoreResult;
+use hammer_runtime::RuntimeResult;
+use hammer_runtime::config::Worker;
 use hammer_runtime::{
     DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
 };
@@ -47,11 +47,10 @@ struct VisitState {
 }
 
 fn test_runtime() -> DataPlaneRuntime {
-    let mut config = Config::default();
-    config.worker.buffer.slot_bytes = 2048;
-    config.worker.buffer.slots_per_numa = 64;
-    config.worker.buffer.frame_pool_size = 32;
-    new_worker_runtime(&config).expect("create worker runtime")
+    let mut worker = Worker::default();
+    worker.buffer.slots_per_numa = 64;
+    worker.buffer.frame_pool_size = 32;
+    new_worker_runtime(&worker).expect("create worker runtime")
 }
 
 fn push_packet(runtime: &DataPlaneRuntime, frame: &mut BufferFrame, sw_if_index: u32) {
@@ -169,7 +168,7 @@ impl Node for StartNode {
         start_node_process
     }
 
-    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
         self.sync_runtime();
         Ok(self.runtime_data)
     }
@@ -243,7 +242,7 @@ impl Node for LazyAdvance {
         advance_node_process
     }
 
-    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
         Ok(self.runtime_data)
     }
 }
@@ -308,7 +307,7 @@ impl Node for EndSink {
         end_node_process
     }
 
-    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
         Ok(self.runtime_data)
     }
 }

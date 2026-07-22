@@ -1,8 +1,8 @@
 use std::net::SocketAddr;
 
-use hammer_core::protocol::tcp::{TcpConnectionId, TcpState};
 use hammer_plugin_tcp::connection::TcpConnection;
 use hammer_plugin_tcp::{DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TcpInputNext};
+use hammer_plugin_tcp::{TcpConnectionId, TcpState};
 use hammer_runtime::DataWorkerId;
 use hammer_service::transport::congestion::{BbrController, CongestionController};
 

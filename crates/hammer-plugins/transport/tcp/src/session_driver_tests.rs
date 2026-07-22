@@ -2,10 +2,8 @@
 
 use std::sync::Arc;
 
+use crate::{TcpCapabilities, TcpConnectionId, TcpPacket, TcpSegmentFlags, TcpState};
 use hammer_core::data_plane::NodeId;
-use hammer_core::protocol::tcp::{
-    TcpCapabilities, TcpConnectionId, TcpPacket, TcpSegmentFlags, TcpState,
-};
 use hammer_infra::pool::Index;
 use hammer_infra::segment::Local;
 use hammer_runtime::app::{AppContext, AppSession, AppSessionConfig, SessionHandle};

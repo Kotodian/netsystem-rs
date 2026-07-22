@@ -4,7 +4,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::task::Waker;
 
-use hammer_core::error::{HammerError, HammerResult};
+use crate::error::{RuntimeError, RuntimeResult};
 use hammer_infra::segment::Local;
 use tokio::sync::Notify;
 
@@ -116,9 +116,9 @@ impl AppWorker<Local> {
         &mut self,
         handle: SessionHandle,
         config: AppSessionConfig,
-    ) -> HammerResult<Arc<AppSession<Local>>> {
+    ) -> RuntimeResult<Arc<AppSession<Local>>> {
         if self.sessions.contains_key(&handle.raw()) {
-            return Err(HammerError::internal(format!(
+            return Err(RuntimeError::invariant(format!(
                 "app worker {} already has session {}",
                 self.worker_index,
                 handle.raw()
@@ -126,7 +126,7 @@ impl AppWorker<Local> {
         }
         let tx_evt_q: Arc<SessionMsgQueue> = Arc::new(
             SessionMsgQueue::with_cfg(64, 64)
-                .map_err(|_| HammerError::internal("invalid tx_evt_q capacity"))?,
+                .map_err(|_| RuntimeError::invariant("invalid tx_evt_q capacity"))?,
         );
         let session = Arc::new(AppSession::<Local>::new_in_segment(
             Local::default(),
@@ -149,9 +149,9 @@ impl AppWorker<Local> {
         handle: SessionHandle,
         config: AppSessionConfig,
         runtime_tx_evt_q: Arc<SessionMsgQueue>,
-    ) -> HammerResult<Arc<AppSession<Local>>> {
+    ) -> RuntimeResult<Arc<AppSession<Local>>> {
         if self.sessions.contains_key(&handle.raw()) {
-            return Err(HammerError::internal(format!(
+            return Err(RuntimeError::invariant(format!(
                 "app worker {} already has session {}",
                 self.worker_index,
                 handle.raw()
@@ -171,12 +171,12 @@ impl AppWorker<Local> {
 
     /// App-side async send via worker. Applies FIFO backpressure and completes
     /// only after every byte has entered the session-owned TX FIFO.
-    pub async fn send_all(&self, handle: SessionHandle, bytes: &[u8]) -> HammerResult<usize> {
+    pub async fn send_all(&self, handle: SessionHandle, bytes: &[u8]) -> RuntimeResult<usize> {
         let session = self
             .sessions
             .get(&handle.raw())
             .cloned()
-            .ok_or_else(|| HammerError::internal("app session not found"))?;
+            .ok_or_else(|| RuntimeError::invariant("app session not found"))?;
         let notify = self.notify_entry(handle);
         let mut written = 0usize;
         while written < bytes.len() {

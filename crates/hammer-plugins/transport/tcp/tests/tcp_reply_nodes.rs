@@ -1,7 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use hammer_core::protocol::tcp::{TcpCapabilities, TcpError, TcpSegmentFlags, TcpSegmentHeader};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
+use hammer_plugin_tcp::{TcpCapabilities, TcpError, TcpSegmentFlags, TcpSegmentHeader};
 
 fn v4(a: u8, b: u8, c: u8, d: u8, port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), port)

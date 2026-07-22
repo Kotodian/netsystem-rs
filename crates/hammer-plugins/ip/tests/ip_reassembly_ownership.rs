@@ -4,14 +4,16 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hammer_core::data_plane::{DataPlaneBufferConfig, NodeHandle, NodeId, NodeNext};
-use hammer_core::protocol::ip::IpFragmentKey;
+use hammer_core::data_plane::{NodeHandle, NodeId, NodeNext};
 use hammer_infra::pool::Index as PoolIndex;
+use hammer_plugin_ip::protocol::ip::IpFragmentKey;
 use hammer_plugin_ip::{
     IpReassemblyDirectory, IpReassemblyHandoff, IpReassemblyNext, IpReassemblyNode,
     pack_fragment_owner_value, unpack_fragment_owner_value,
 };
-use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId};
+use hammer_runtime::{
+    DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId,
+};
 
 fn test_runtime() -> DataPlaneRuntime {
     DataPlaneRuntime::new(DataPlaneRuntimeConfig {

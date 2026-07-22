@@ -5,15 +5,15 @@ use std::thread;
 use std::time::Instant;
 
 use hammer_core::data_plane::{BufferFrame, NodeState};
-use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::registry::RuntimeRegistry;
 use hammer_infra::pool::Index;
 use hammer_infra::segment::{Local, Svm};
+use hammer_runtime::RuntimeRegistry;
 use hammer_runtime::app::{AppSessionConfig, SessionEventQueue, SessionEvt, SessionEvtType};
 use hammer_runtime::{
     DataPlaneRuntime, DataPlaneRuntimeConfig, Engine, InternalNode, Node, NodeProcessFn,
     NodeResult, NodeRuntimeData,
 };
+use hammer_runtime::{RuntimeError, RuntimeResult};
 use hammer_service::session::node::{SessionQueueNext, SessionQueueNode, SessionQueueOutput};
 use hammer_service::session::runtime::{
     SessionTransport, SessionTransportId, SessionWorker, TransportInternalTransport,
@@ -62,7 +62,7 @@ impl SessionTransport<Index, Svm> for RecordingTransport {
         _: &mut BufferFrame,
         _: &mut SessionQueueOutput,
         _: Instant,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         self.0.lock().expect("events").push("time");
         Ok(())
     }
@@ -76,7 +76,7 @@ impl SessionTransport<Index, Svm> for RecordingTransport {
         _: &mut BufferFrame,
         _: &mut SessionQueueOutput,
         _: Instant,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         self.0.lock().expect("events").push("close");
         Ok(())
     }
@@ -92,7 +92,7 @@ impl TransportInternalTransport<Index, Svm> for RecordingTransport {
         _: &mut BufferFrame,
         _: &mut SessionQueueOutput,
         _: Instant,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         Ok(())
     }
 }
@@ -110,10 +110,12 @@ fn install_test_worker(worker: TestWorker) {
     TEST_WORKER.with(|slot| *slot.borrow_mut() = Some(worker));
 }
 
-fn with_test_worker_mut<R>(f: impl FnOnce(&mut TestWorker) -> CoreResult<R>) -> CoreResult<R> {
+fn with_test_worker_mut<R>(
+    f: impl FnOnce(&mut TestWorker) -> RuntimeResult<R>,
+) -> RuntimeResult<R> {
     TEST_WORKER.with(|slot| {
         let mut slot = slot.borrow_mut();
-        f(slot.as_mut().ok_or_else(CoreError::service_closed)?)
+        f(slot.as_mut().ok_or_else(RuntimeError::service_closed)?)
     })
 }
 
@@ -128,7 +130,7 @@ fn dispatch_test_worker(
     now: Instant,
     frame: &mut BufferFrame,
     output: &mut SessionQueueOutput,
-) -> CoreResult<()> {
+) -> RuntimeResult<()> {
     with_test_worker_mut(|worker| {
         dispatch_session_queue_pending(
             runtime,

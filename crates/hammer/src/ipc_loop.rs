@@ -1,10 +1,26 @@
 use tokio::net::TcpListener;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 pub async fn clnt_loop(listener: TcpListener) {
     loop {
-        match listener.accept().await {
+        if hammer_runtime::engine::Engine::with_current(|engine| {
+            engine.main_loop_exit_now.load(Ordering::Relaxed)
+        })
+        .unwrap_or(true)
+        {
+            return;
+        }
+        let accepted = tokio::select! {
+            accepted = listener.accept() => Some(accepted),
+            _ = tokio::time::sleep(Duration::from_millis(10)) => None,
+        };
+        let Some(accepted) = accepted else {
+            continue;
+        };
+        match accepted {
             Ok((stream, _addr)) => {
-                tokio::spawn(conn_loop(stream));
+                conn_loop(stream).await;
             }
             Err(e) => {
                 tracing::error!("IPC accept error: {e}");

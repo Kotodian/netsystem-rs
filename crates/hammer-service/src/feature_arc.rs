@@ -2,7 +2,6 @@
 
 use std::cell::UnsafeCell;
 use std::collections::{HashMap, HashSet};
-use std::fmt;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::mem::transmute;
@@ -11,8 +10,8 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use hammer_core::data_plane::{BufferFrame, Index, NodeId};
-use hammer_core::error::{CoreError, CoreResult};
 use hammer_runtime::node::NodeRuntime;
+use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
 use hammer_runtime::{DataPlaneBarrierHandle, DataPlaneRuntime, NodeResult};
 
 use crate::opaque::NetworkOpaque;
@@ -48,13 +47,12 @@ pub struct FeatureArcStart {
     pub started: bool,
 }
 
-#[derive(Debug)]
 struct FeatureArcInner<A: FeatureArcSpec> {
     state: UnsafeCell<FeatureArcState<A>>,
     start_state: Arc<ArcSwap<FeatureArcStartState>>,
 }
 
-pub trait FeatureArcSpec: Copy + Eq + Hash + fmt::Debug + 'static {}
+pub trait FeatureArcSpec: Copy + Eq + Hash + 'static {}
 
 pub trait Feature<A: FeatureArcSpec>: 'static {
     fn id() -> A;
@@ -115,13 +113,7 @@ impl<A: FeatureArcSpec> FeatureArcStartSlot<A> {
     }
 }
 
-impl<A: FeatureArcSpec> fmt::Debug for FeatureArc<A> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("FeatureArc").finish_non_exhaustive()
-    }
-}
-
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct FeatureArcRegistration<A: FeatureArcSpec> {
     node: NodeId,
     runs_before: Vec<A>,
@@ -129,7 +121,7 @@ struct FeatureArcRegistration<A: FeatureArcSpec> {
     ordinal: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct FeatureArcState<A: FeatureArcSpec> {
     registered: HashMap<A, FeatureArcRegistration<A>>,
     feature_order: Vec<A>,
@@ -182,7 +174,7 @@ struct FeatureArcChain {
     steps: Vec<FeatureArcStep>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct FeatureArcEnabled<A: FeatureArcSpec> {
     id: A,
     config: Option<Vec<u8>>,
@@ -356,7 +348,7 @@ impl<A: FeatureArcSpec> FeatureArcControl<A> {
         }
     }
 
-    pub fn register_feature<F: Feature<A>>(&mut self, node: NodeId) -> CoreResult<()> {
+    pub fn register_feature<F: Feature<A>>(&mut self, node: NodeId) -> RuntimeResult<()> {
         let id = F::id();
         let ordinal = self
             .state
@@ -391,7 +383,7 @@ impl<A: FeatureArcSpec> FeatureArcControl<A> {
     }
 
     /// Record a start Graph Node so publication compiles its predecessor-local first transition.
-    pub fn add_start_node(&mut self, node: NodeId) -> CoreResult<()> {
+    pub fn add_start_node(&mut self, node: NodeId) -> RuntimeResult<()> {
         if !self.start_nodes.contains(&node) {
             self.start_nodes.push(node);
             self.state.start_nodes = self.start_nodes.clone();
@@ -400,7 +392,7 @@ impl<A: FeatureArcSpec> FeatureArcControl<A> {
         Ok(())
     }
 
-    pub fn remove_start_node(&mut self, node: NodeId) -> CoreResult<()> {
+    pub fn remove_start_node(&mut self, node: NodeId) -> RuntimeResult<()> {
         self.start_nodes.retain(|n| *n != node);
         self.state.start_nodes = self.start_nodes.clone();
         self.publish()
@@ -413,18 +405,18 @@ impl<A: FeatureArcSpec> FeatureArcControl<A> {
         &mut self,
         start: &mut S,
         node: NodeId,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         self.attach_start(start);
         self.add_start_node(node)
     }
 
-    pub fn set_default_end_node(&mut self, node: NodeId) -> CoreResult<()> {
+    pub fn set_default_end_node(&mut self, node: NodeId) -> RuntimeResult<()> {
         self.default_end = Some(node);
         self.state.default_end = Some(node);
         self.publish()
     }
 
-    pub fn enable_feature<F: Feature<A>>(&mut self, interface_index: u32) -> CoreResult<()> {
+    pub fn enable_feature<F: Feature<A>>(&mut self, interface_index: u32) -> RuntimeResult<()> {
         self.enable_feature_config::<F>(interface_index, None)
     }
 
@@ -432,7 +424,7 @@ impl<A: FeatureArcSpec> FeatureArcControl<A> {
         &mut self,
         interface_index: u32,
         config: impl Into<Vec<u8>>,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         self.enable_feature_config::<F>(interface_index, Some(config.into()))
     }
 
@@ -440,13 +432,10 @@ impl<A: FeatureArcSpec> FeatureArcControl<A> {
         &mut self,
         interface_index: u32,
         config: Option<Vec<u8>>,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         let id = F::id();
         if !self.state.registered.contains_key(&id) {
-            return Err(CoreError::internal(format!(
-                "feature is not registered: {:?}",
-                id
-            )));
+            return Err(RuntimeError::invariant("feature is not registered"));
         }
         let enabled = self.state.enabled.entry(interface_index).or_default();
         if let Some(enabled) = enabled.iter_mut().find(|enabled| enabled.id == id) {
@@ -457,13 +446,10 @@ impl<A: FeatureArcSpec> FeatureArcControl<A> {
         self.publish()
     }
 
-    pub fn disable_feature<F: Feature<A>>(&mut self, interface_index: u32) -> CoreResult<()> {
+    pub fn disable_feature<F: Feature<A>>(&mut self, interface_index: u32) -> RuntimeResult<()> {
         let id = F::id();
         if !self.state.registered.contains_key(&id) {
-            return Err(CoreError::internal(format!(
-                "feature is not registered: {:?}",
-                id
-            )));
+            return Err(RuntimeError::invariant("feature is not registered"));
         }
         if let Some(enabled) = self.state.enabled.get_mut(&interface_index) {
             enabled.retain(|enabled| enabled.id != id);
@@ -487,18 +473,18 @@ impl<A: FeatureArcSpec> FeatureArcControl<A> {
         &mut self,
         interface_index: u32,
         node: NodeId,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         self.state.end_nodes.insert(interface_index, node);
         self.publish()
     }
 
-    pub fn clear_end_node_for_interface(&mut self, interface_index: u32) -> CoreResult<()> {
+    pub fn clear_end_node_for_interface(&mut self, interface_index: u32) -> RuntimeResult<()> {
         self.state.end_nodes.remove(&interface_index);
         self.publish()
     }
 
     #[inline]
-    fn publish(&mut self) -> CoreResult<()> {
+    fn publish(&mut self) -> RuntimeResult<()> {
         let inner = Arc::clone(&self.inner);
         let mut state = self.state.clone();
         state.start_nodes = self.start_nodes.clone();
@@ -506,9 +492,9 @@ impl<A: FeatureArcSpec> FeatureArcControl<A> {
         let nodes = self
             .nodes
             .clone()
-            .ok_or_else(|| CoreError::internal("feature arc publish requires node runtime"))?;
+            .ok_or_else(|| RuntimeError::invariant("feature arc publish requires node runtime"))?;
         let barrier = self.barrier.as_ref().ok_or_else(|| {
-            CoreError::internal("feature arc publish requires data-plane barrier")
+            RuntimeError::invariant("feature arc publish requires data-plane barrier")
         })?;
         let mut published = None;
         barrier.synchronize(|| {
@@ -551,7 +537,7 @@ impl<A: FeatureArcSpec> FeatureArcInner<A> {
 }
 
 impl<A: FeatureArcSpec> FeatureArcState<A> {
-    fn rebuild(&mut self, nodes: &NodeRuntime) -> CoreResult<()> {
+    fn rebuild(&mut self, nodes: &NodeRuntime) -> RuntimeResult<()> {
         self.feature_order = self.sorted_feature_order()?;
         let feature_order = self.feature_order.clone();
         let mut chains = HashMap::with_capacity(self.enabled.len());
@@ -578,7 +564,7 @@ impl<A: FeatureArcSpec> FeatureArcState<A> {
                 .copied()
                 .or(self.default_end)
                 .ok_or_else(|| {
-                    CoreError::internal("feature arc chain requires a compiled end node")
+                    RuntimeError::invariant("feature arc chain requires a compiled end node")
                 })?;
 
             let feature_nodes = chain_features
@@ -587,9 +573,11 @@ impl<A: FeatureArcSpec> FeatureArcState<A> {
                     self.registered
                         .get(id)
                         .map(|registration| registration.node)
-                        .ok_or_else(|| CoreError::internal("feature chain references missing node"))
+                        .ok_or_else(|| {
+                            RuntimeError::invariant("feature chain references missing node")
+                        })
                 })
-                .collect::<CoreResult<Vec<_>>>()?;
+                .collect::<RuntimeResult<Vec<_>>>()?;
 
             let head_config = configs.len() as u32;
             let mut steps = Vec::with_capacity(feature_nodes.len());
@@ -644,7 +632,7 @@ impl<A: FeatureArcSpec> FeatureArcState<A> {
         }
     }
 
-    fn sorted_feature_order(&self) -> CoreResult<Vec<A>> {
+    fn sorted_feature_order(&self) -> RuntimeResult<Vec<A>> {
         let mut edges = self
             .registered
             .keys()
@@ -707,7 +695,7 @@ impl<A: FeatureArcSpec> FeatureArcState<A> {
                         })
                 })
             else {
-                return Err(CoreError::internal(
+                return Err(RuntimeError::invariant(
                     "feature order constraints contain a cycle",
                 ));
             };

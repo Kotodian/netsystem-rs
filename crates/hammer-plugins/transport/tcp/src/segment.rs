@@ -1,15 +1,16 @@
 use std::mem::{size_of, transmute};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use hammer_core::data_plane::{BufferPacketCursor, Index};
-use hammer_core::error::CoreResult;
-use hammer_core::protocol::tcp::{
+use crate::protocol::TcpEcnCodepoint;
+use crate::{
     TcpCapabilities, TcpError, TcpFastOpenCookie, TcpPacket, TcpSackBlock, TcpSegmentFlags,
     TcpSegmentHeader, TcpSeq, TcpTimestampOption, TcpWireHeader, tcp_header,
     tcp_options_from_bytes,
 };
+use hammer_core::data_plane::{BufferPacketCursor, Index};
 use hammer_runtime::DataPlaneRuntime;
-use hammer_service::opaque::{IpEcnCodepoint, NetworkOpaque};
+use hammer_runtime::RuntimeResult;
+use hammer_service::opaque::NetworkOpaque;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpSegment {
@@ -24,7 +25,7 @@ pub struct TcpSegment {
     sack_block_count: u8,
     timestamp: Option<TcpTimestampOption>,
     fast_open_cookie: Option<TcpFastOpenCookie>,
-    ip_ecn: Option<IpEcnCodepoint>,
+    ip_ecn: Option<TcpEcnCodepoint>,
     payload_len: usize,
 }
 
@@ -41,7 +42,7 @@ impl TcpSegment {
         sack_blocks: Option<&[TcpSackBlock]>,
         timestamp: Option<TcpTimestampOption>,
         fast_open_cookie: Option<TcpFastOpenCookie>,
-        ip_ecn: Option<IpEcnCodepoint>,
+        ip_ecn: Option<TcpEcnCodepoint>,
         payload_len: usize,
     ) -> Self {
         let (sack_blocks, sack_block_count) = copy_sack_blocks(sack_blocks);
@@ -105,7 +106,7 @@ impl TcpSegment {
         &self,
         buffers: &hammer_core::data_plane::DataPlaneBuffers,
         index: Index,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         let mut buffer = buffers.get_buffer_mut(index)?;
         let header = buffer.prepend_mut(self.header_len())?;
         self.write_header(header)?;
@@ -119,7 +120,7 @@ impl TcpSegment {
     }
 }
 
-pub(crate) fn tcp_packet(runtime: &DataPlaneRuntime, index: Index) -> CoreResult<TcpPacket> {
+pub(crate) fn tcp_packet(runtime: &DataPlaneRuntime, index: Index) -> RuntimeResult<TcpPacket> {
     let buffer = runtime.get_buffer(index)?;
     let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
     let cursor = network.packet_cursor();
@@ -175,7 +176,7 @@ pub(crate) fn tcp_packet(runtime: &DataPlaneRuntime, index: Index) -> CoreResult
         sack_blocks: parsed_options.sack_blocks,
         timestamp: parsed_options.timestamp,
         fast_open_cookie: parsed_options.fast_open_cookie,
-        ip_ecn: network.ip().ip_ecn().map(IpEcnCodepoint::from),
+        ip_ecn: network.ip().ip_ecn().map(TcpEcnCodepoint::from),
         payload_offset: cursor.transport_payload_offset(),
         payload_len: first_len
             .checked_sub(cursor.transport_payload_offset())
@@ -249,8 +250,7 @@ fn copy_sack_blocks(sack_blocks: Option<&[TcpSackBlock]>) -> (Option<[TcpSackBlo
 
 #[cfg(test)]
 mod tests {
-    use hammer_core::protocol::tcp::tcp_options_from_bytes;
-    use hammer_core::protocol::wire::read_header;
+    use crate::tcp_options_from_bytes;
     use hammer_runtime::DataPlaneRuntime;
 
     use super::*;
@@ -259,11 +259,11 @@ mod tests {
     fn transport_tcp_segment_write_to_buffer_prepends_sack_blocks() {
         let runtime =
             hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
-                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
+                buffers: hammer_runtime::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 4,
                     frame_slots: 4,
-                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
+                    ..hammer_runtime::DataPlaneBufferConfig::default()
                 },
             });
         let index = runtime.alloc_index().expect("buffer");
@@ -292,7 +292,7 @@ mod tests {
             .write_to_buffer(runtime.buffers(), index)
             .expect("write segment");
         let buffer = runtime.get_buffer(index).expect("buffer");
-        let header = read_header::<TcpWireHeader>(buffer.current(), 0).expect("tcp header");
+        let header = tcp_header(buffer.current()).expect("tcp header");
         let parsed = tcp_options_from_bytes(&buffer.current()[20..header.header_len()]);
         assert_eq!(parsed.sack_blocks, blocks);
     }
@@ -301,11 +301,11 @@ mod tests {
     fn transport_tcp_segment_write_to_buffer_prepends_fast_open_cookie() {
         let runtime =
             hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
-                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
+                buffers: hammer_runtime::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 4,
                     frame_slots: 4,
-                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
+                    ..hammer_runtime::DataPlaneBufferConfig::default()
                 },
             });
         let index = runtime.alloc_index().expect("buffer");
@@ -333,7 +333,7 @@ mod tests {
             .write_to_buffer(runtime.buffers(), index)
             .expect("write segment");
         let buffer = runtime.get_buffer(index).expect("buffer");
-        let header = read_header::<TcpWireHeader>(buffer.current(), 0).expect("tcp header");
+        let header = tcp_header(buffer.current()).expect("tcp header");
         let parsed = tcp_options_from_bytes(&buffer.current()[20..header.header_len()]);
         assert_eq!(
             parsed

@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use hammer_core::data_plane::{BufferFrame, DataPlaneBuffers, Frame, Index, Next};
-use hammer_core::error::{AttachError, CoreError, CoreResult};
 use hammer_infra::fifo_queue::FifoQueue;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::segment::{Local, Segment, Svm};
@@ -12,6 +11,7 @@ use hammer_runtime::app::{
     AppContext, AppSessionConfig, SessionEventQueue, SessionEvtType, SessionHandle,
     SessionMsgQueue, SessionSegment, with_current_app_worker,
 };
+use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
 use hammer_runtime::{DataPlaneRuntime, DataWorkerId, Engine, File, FileFunctions};
 
 use crate::session::app::SessionAppRuntimeCreate;
@@ -183,7 +183,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
         &mut self,
         engine: &mut Engine,
         session_queue: hammer_core::data_plane::NodeId,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         self.remove_queue_readiness(engine)?;
         let Some(signal_read_fd) = self.app.tx_evt_q().read_fd() else {
             return Ok(());
@@ -209,7 +209,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
     }
 
     /// Cancels session queue readiness before the queue itself is released.
-    pub fn remove_queue_readiness(&mut self, engine: &mut Engine) -> CoreResult<()> {
+    pub fn remove_queue_readiness(&mut self, engine: &mut Engine) -> RuntimeResult<()> {
         let Some(file) = self.readiness_file else {
             return Ok(());
         };
@@ -237,25 +237,25 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
     pub fn insert_creating_session(
         &mut self,
         transport: SessionTransportId,
-    ) -> CoreResult<SessionId> {
+    ) -> RuntimeResult<SessionId> {
         self.entries
             .insert_with(|index| {
                 let _ = index;
                 SessionEntry::creating(transport)
             })
             .map(SessionId::from)
-            .ok_or_else(|| CoreError::internal("session pool capacity exhausted"))
+            .ok_or_else(|| RuntimeError::invariant("session pool capacity exhausted"))
     }
 
     pub fn finish_session_creation(
         &mut self,
         session_id: SessionId,
         index: Index,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         let entry = self
             .entries
             .get_mut(session_id.pool_index())
-            .ok_or_else(|| CoreError::internal("session is missing"))?;
+            .ok_or_else(|| RuntimeError::invariant("session is missing"))?;
         entry.state = SessionState::active(index);
         Ok(())
     }
@@ -283,7 +283,11 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
         self.entries.remove(session_id.pool_index()).is_some()
     }
 
-    pub fn notify_transport_closed(&mut self, session_id: SessionId, index: Index) -> CoreResult<()>
+    pub fn notify_transport_closed(
+        &mut self,
+        session_id: SessionId,
+        index: Index,
+    ) -> RuntimeResult<()>
     where
         SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
     {
@@ -336,7 +340,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
             .push_back(SessionControlEvent::Disconnect(session_id));
     }
 
-    pub fn poll_app(&mut self) -> CoreResult<()> {
+    pub fn poll_app(&mut self) -> RuntimeResult<()> {
         let entries = &mut self.entries;
         let session_work = &mut self.session_work;
         let control_events = &mut self.control_events;
@@ -374,7 +378,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
         self.session_work_scratch = work;
     }
 
-    pub fn ack_tx_up_to(&mut self, session_id: SessionId, bytes: usize) -> CoreResult<()>
+    pub fn ack_tx_up_to(&mut self, session_id: SessionId, bytes: usize) -> RuntimeResult<()>
     where
         SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
     {
@@ -388,7 +392,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
         index: hammer_core::data_plane::Index,
         offset: u32,
         urgent: bool,
-    ) -> CoreResult<RxDelivery>
+    ) -> RuntimeResult<RxDelivery>
     where
         SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
     {
@@ -413,10 +417,12 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
         Ok(match NonZeroU32::new(accepted) {
             Some(accepted) => {
                 let (start, len) = newest.ok_or_else(|| {
-                    CoreError::internal("accepted OOO delivery must report a retained span")
+                    RuntimeError::invariant("accepted OOO delivery must report a retained span")
                 })?;
                 let len = NonZeroU32::new(len).ok_or_else(|| {
-                    CoreError::internal("accepted OOO delivery must report non-zero span length")
+                    RuntimeError::invariant(
+                        "accepted OOO delivery must report non-zero span length",
+                    )
                 })?;
                 RxDelivery::OutOfOrder {
                     accepted,
@@ -540,7 +546,7 @@ pub trait SessionTransport<Index, Seg: SessionSegment>: Sized {
         frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
-    ) -> CoreResult<()>;
+    ) -> RuntimeResult<()>;
 
     fn disconnect(
         &mut self,
@@ -551,7 +557,7 @@ pub trait SessionTransport<Index, Seg: SessionSegment>: Sized {
         frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
-    ) -> CoreResult<()>;
+    ) -> RuntimeResult<()>;
 }
 
 pub trait SessionPacketizedTransport<Index, Seg: SessionSegment>:
@@ -566,7 +572,7 @@ pub trait SessionPacketizedTransport<Index, Seg: SessionSegment>:
         frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
-    ) -> CoreResult<()>;
+    ) -> RuntimeResult<()>;
 
     fn send_params(
         &mut self,
@@ -574,7 +580,7 @@ pub trait SessionPacketizedTransport<Index, Seg: SessionSegment>:
         index: Index,
         pending_len: usize,
         now: Instant,
-    ) -> CoreResult<TransportSendParams>;
+    ) -> RuntimeResult<TransportSendParams>;
 
     fn tx_action(
         &mut self,
@@ -582,7 +588,7 @@ pub trait SessionPacketizedTransport<Index, Seg: SessionSegment>:
         index: Index,
         batch: &[TxBatchBuffer],
         now: Instant,
-    ) -> CoreResult<()>;
+    ) -> RuntimeResult<()>;
 }
 
 pub trait TransportInternalTransport<Index, Seg: SessionSegment>:
@@ -597,7 +603,7 @@ pub trait TransportInternalTransport<Index, Seg: SessionSegment>:
         frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
-    ) -> CoreResult<()>;
+    ) -> RuntimeResult<()>;
 }
 
 pub trait SessionTxStrategy<T, Index, Seg: SessionSegment>
@@ -614,7 +620,7 @@ where
         frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
-    ) -> CoreResult<()>;
+    ) -> RuntimeResult<()>;
 }
 
 pub struct SessionPacketizedTx;
@@ -637,14 +643,14 @@ where
         frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         transport.control_tx(sessions, index, runtime, output_next, frame, output, now)?;
         let Some(total_len) = sessions.app.pending_send_len(session_id)? else {
             return Ok(());
         };
         let params = transport.send_params(sessions, index, total_len, now)?;
         if params.tx_offset > total_len {
-            return Err(CoreError::internal(
+            return Err(RuntimeError::invariant(
                 "session tx offset exceeds chain length",
             ));
         }
@@ -716,7 +722,7 @@ where
         frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         transport.internal_tx(sessions, index, runtime, output_next, frame, output, now)
     }
 }
@@ -727,7 +733,7 @@ pub fn dispatch_session_queue_once<T, Seg, Index>(
     sessions: &mut SessionWorker<Index, Seg>,
     transport: &mut T,
     output_next: SessionQueueNext,
-) -> CoreResult<SessionQueueStep>
+) -> RuntimeResult<SessionQueueStep>
 where
     T: SessionTransport<Index, Seg>,
     Seg: SessionSegment,
@@ -759,7 +765,7 @@ pub fn dispatch_session_queue_pending<T, Seg, Index>(
     frame: &mut BufferFrame,
     output: &mut crate::session::node::SessionQueueOutput,
     now: Instant,
-) -> CoreResult<SessionQueueStep>
+) -> RuntimeResult<SessionQueueStep>
 where
     T: SessionTransport<Index, Seg>,
     Seg: SessionSegment,
@@ -808,7 +814,7 @@ where
     Ok(SessionQueueStep { scheduled_sessions })
 }
 
-fn schedule_session_queue(file: &mut File) -> CoreResult<()> {
+fn schedule_session_queue(file: &mut File) -> RuntimeResult<()> {
     let node = hammer_core::data_plane::NodeId::new(file.private_data() as u32);
     Engine::with_current(|engine| engine.runtime.schedule_empty_frame(node))
         .expect("File callbacks run on their polling Engine")?;

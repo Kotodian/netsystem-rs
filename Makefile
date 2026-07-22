@@ -16,6 +16,7 @@ clean:
 	cargo clean
 
 test:
+	cargo build -p hammer-plugin-tun -p hammer-plugin-ip -p hammer-plugin-tcp -p hammer-plugin-udp
 	cargo test --workspace
 
 clippy:

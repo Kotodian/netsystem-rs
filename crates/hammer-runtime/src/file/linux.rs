@@ -1,7 +1,7 @@
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-use hammer_core::error::{HammerError, HammerResult};
+use crate::error::{RuntimeError, RuntimeResult};
 use hammer_infra::pool::Index;
 use hammer_infra::ring::LocalRing;
 use io_uring::{IoUring, Probe, cqueue, opcode, squeue, types};
@@ -32,7 +32,7 @@ pub(super) struct Poller {
 }
 
 impl Poller {
-    pub(super) fn new() -> HammerResult<Self> {
+    pub(super) fn new() -> RuntimeResult<Self> {
         let mut builder = IoUring::builder();
         builder.dontfork();
         let mut ring = builder
@@ -48,7 +48,7 @@ impl Poller {
             ("poll-remove", opcode::PollRemove::CODE),
         ] {
             if !probe.is_supported(code) {
-                return Err(HammerError::internal(format!(
+                return Err(RuntimeError::invariant(format!(
                     "worker io_uring does not support required {name} operation"
                 )));
             }
@@ -65,7 +65,7 @@ impl Poller {
         })
     }
 
-    pub(super) fn add(&mut self, spec: PollSpec) -> HammerResult<()> {
+    pub(super) fn add(&mut self, spec: PollSpec) -> RuntimeResult<()> {
         if !spec.read && !spec.write {
             self.current_tokens[spec.index.slot() as usize] = CONTROL_TOKEN;
             return Ok(());
@@ -81,16 +81,19 @@ impl Poller {
         Ok(())
     }
 
-    pub(super) fn modify(&mut self, before: PollSpec, after: PollSpec) -> HammerResult<()> {
+    pub(super) fn modify(&mut self, before: PollSpec, after: PollSpec) -> RuntimeResult<()> {
         self.cancel(before.index)?;
         self.add(after)
     }
 
-    pub(super) fn delete(&mut self, spec: PollSpec) -> HammerResult<()> {
+    pub(super) fn delete(&mut self, spec: PollSpec) -> RuntimeResult<()> {
         self.cancel(spec.index)
     }
 
-    pub(super) fn poll(&mut self, ready: &mut [PollEvent; POLL_BATCH_SIZE]) -> HammerResult<usize> {
+    pub(super) fn poll(
+        &mut self,
+        ready: &mut [PollEvent; POLL_BATCH_SIZE],
+    ) -> RuntimeResult<usize> {
         let mut count = 0;
         while count < ready.len() {
             let Some(completion) = self.pending.pop() else {
@@ -119,7 +122,7 @@ impl Poller {
                     count += 1;
                 }
             } else if pending.try_push(completion).is_err() {
-                return Err(HammerError::internal(
+                return Err(RuntimeError::invariant(
                     "worker io_uring pending completion ring is full",
                 ));
             }
@@ -127,7 +130,7 @@ impl Poller {
         Ok(count)
     }
 
-    fn cancel(&mut self, index: Index) -> HammerResult<()> {
+    fn cancel(&mut self, index: Index) -> RuntimeResult<()> {
         let slot = index.slot() as usize;
         let token = self.current_tokens[slot];
         if token == CONTROL_TOKEN {
@@ -153,7 +156,7 @@ impl Poller {
                 if completion.user_data == CONTROL_TOKEN {
                     result = Some(completion.result);
                 } else if completion.user_data != token && pending.try_push(completion).is_err() {
-                    return Err(HammerError::internal(
+                    return Err(RuntimeError::invariant(
                         "worker io_uring pending completion ring is full while cancelling",
                     ));
                 }
@@ -177,7 +180,7 @@ impl Poller {
             | u64::from(index.slot())
     }
 
-    fn submit(&mut self, entry: squeue::Entry) -> HammerResult<()> {
+    fn submit(&mut self, entry: squeue::Entry) -> RuntimeResult<()> {
         loop {
             let pushed = {
                 let mut submissions = self.ring.submission();
@@ -194,7 +197,7 @@ impl Poller {
     }
 }
 
-fn probe_multishot(ring: &mut IoUring) -> HammerResult<bool> {
+fn probe_multishot(ring: &mut IoUring) -> RuntimeResult<bool> {
     // SAFETY: eventfd returns a fresh descriptor or -1 with errno set.
     let fd = unsafe { libc::eventfd(1, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     if fd < 0 {
@@ -215,7 +218,9 @@ fn probe_multishot(ring: &mut IoUring) -> HammerResult<bool> {
     let completion = ring
         .completion()
         .find(|completion| completion.user_data() == PROBE_TOKEN)
-        .ok_or_else(|| HammerError::internal("io_uring multishot probe produced no completion"))?;
+        .ok_or_else(|| {
+            RuntimeError::invariant("io_uring multishot probe produced no completion")
+        })?;
     if completion.result() == -libc::EINVAL {
         return Ok(false);
     }
@@ -254,7 +259,7 @@ fn completion_event(
     completion: Completion,
     current_tokens: &[u64; FILE_POOL_CAPACITY],
     multishot: bool,
-) -> HammerResult<Option<PollEvent>> {
+) -> RuntimeResult<Option<PollEvent>> {
     if completion.user_data == CONTROL_TOKEN {
         return Ok(None);
     }
@@ -309,14 +314,14 @@ fn decode_poll_token(token: u64) -> Option<Index> {
     (generation != 0 && slot < FILE_POOL_CAPACITY as u32).then(|| Index::new(slot, generation))
 }
 
-fn push(ring: &mut IoUring, entry: squeue::Entry) -> HammerResult<()> {
+fn push(ring: &mut IoUring, entry: squeue::Entry) -> RuntimeResult<()> {
     let mut submissions = ring.submission();
     // SAFETY: probe entries contain no borrowed userspace buffer.
     unsafe { submissions.push(&entry) }
-        .map_err(|_| HammerError::internal("worker io_uring submission queue is full"))
+        .map_err(|_| RuntimeError::invariant("worker io_uring submission queue is full"))
 }
 
-fn submit(ring: &IoUring) -> HammerResult<usize> {
+fn submit(ring: &IoUring) -> RuntimeResult<usize> {
     loop {
         match ring.submit() {
             Ok(submitted) => return Ok(submitted),
@@ -326,7 +331,7 @@ fn submit(ring: &IoUring) -> HammerResult<usize> {
     }
 }
 
-fn submit_and_wait(ring: &IoUring) -> HammerResult<()> {
+fn submit_and_wait(ring: &IoUring) -> RuntimeResult<()> {
     loop {
         match ring.submit_and_wait(1) {
             Ok(_) => return Ok(()),
@@ -338,10 +343,10 @@ fn submit_and_wait(ring: &IoUring) -> HammerResult<()> {
     }
 }
 
-fn completion_error(operation: &str, result: i32) -> HammerError {
+fn completion_error(operation: &str, result: i32) -> RuntimeError {
     io_error(operation, io::Error::from_raw_os_error(-result))
 }
 
-fn io_error(operation: &str, error: io::Error) -> HammerError {
-    HammerError::internal(format!("{operation}: {error}"))
+fn io_error(operation: &str, error: io::Error) -> RuntimeError {
+    RuntimeError::invariant(format!("{operation}: {error}"))
 }

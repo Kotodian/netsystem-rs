@@ -2,8 +2,8 @@ use crate::{TcpWorkerStore, publish_tcp_connection, read_session_id, with_tcp_wo
 use hammer_core::data_plane::{
     BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Index, NodeId, NodeNext,
 };
-use hammer_core::error::{CoreError, CoreResult};
 use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
+use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use hammer_service::session::runtime::RxDelivery;
 use hammer_service::transport::congestion::CongestionController;
@@ -41,11 +41,11 @@ impl TcpRcvProcessNode {
     }
 }
 
-pub fn register_tcp_rcv_process(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+pub fn register_tcp_rcv_process(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
     runtime
         .nodes()
         .node_by_name("tcp-rcv-process")
-        .ok_or_else(|| CoreError::internal("TCP worker graph is not registered"))
+        .ok_or_else(|| RuntimeError::invariant("TCP worker graph is not registered"))
 }
 
 impl Node for TcpRcvProcessNode {
@@ -116,7 +116,7 @@ fn emit_local(
     out_len: &mut usize,
     next: TcpRcvProcessNext,
     index: Index,
-) -> CoreResult<()> {
+) -> RuntimeResult<()> {
     if *out_len == DEFAULT_BUFFER_FRAME_CAPACITY {
         runtime.enqueue_to_next(frame, &nexts[..*out_len]);
         *out_len = 0;
@@ -134,7 +134,7 @@ fn tcp_rcv_process_index<C, Seg>(
     out_frame: &mut BufferFrame,
     nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
     out_len: &mut usize,
-) -> CoreResult<()>
+) -> RuntimeResult<()>
 where
     C: CongestionController + 'static,
     Seg: TcpWorkerStore<C>,

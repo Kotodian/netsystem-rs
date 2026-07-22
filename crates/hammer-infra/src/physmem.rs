@@ -59,11 +59,10 @@ impl PhysmemMap {
             1usize << log2_page_size
         };
         let total = align_up(size, page_bytes);
-        let counter = PHYSMEM_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let label = format!("hpm{counter}");
-
         #[cfg(target_os = "linux")]
         let (base, fd, fd_owned) = {
+            let counter = PHYSMEM_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let label = format!("hpm{}-{counter}", std::process::id());
             let cname = CString::new(label).map_err(|_| PhysmemError::CreateFailed)?;
             let fd = unsafe { libc::memfd_create(cname.as_ptr(), libc::MFD_CLOEXEC) };
             if fd < 0 {
@@ -92,12 +91,24 @@ impl PhysmemMap {
 
         #[cfg(not(target_os = "linux"))]
         let (base, fd, fd_owned) = {
-            let cname =
-                CString::new(format!("/{label}")).map_err(|_| PhysmemError::CreateFailed)?;
-            let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600) };
-            if fd < 0 {
-                return Err(PhysmemError::CreateFailed);
-            }
+            let (cname, fd) = loop {
+                let counter = PHYSMEM_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let label = format!("/hpm{}-{counter}", std::process::id());
+                let cname = CString::new(label).map_err(|_| PhysmemError::CreateFailed)?;
+                let fd = unsafe {
+                    libc::shm_open(
+                        cname.as_ptr(),
+                        libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+                        0o600,
+                    )
+                };
+                if fd >= 0 {
+                    break (cname, fd);
+                }
+                if std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
+                    return Err(PhysmemError::CreateFailed);
+                }
+            };
             unsafe { libc::shm_unlink(cname.as_ptr()) };
             if unsafe { libc::ftruncate(fd, total as libc::off_t) } != 0 {
                 unsafe { libc::close(fd) };

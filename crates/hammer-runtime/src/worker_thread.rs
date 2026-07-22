@@ -1,11 +1,11 @@
 //! Per-worker thread setup: CPU affinity, scheduler policy, QoS, NUMA.
 
-use hammer_core::config::Worker;
+use crate::config::Worker;
 
 #[cfg(target_os = "linux")]
-use crate::numa;
+use crate::config::WorkerCpu;
 #[cfg(target_os = "linux")]
-use hammer_core::config::WorkerCpu;
+use crate::numa;
 
 /// Apply platform worker-thread setup before the dataplane loop runs.
 pub fn apply_worker_thread_setup(worker: &Worker, index: usize) {
@@ -58,8 +58,8 @@ fn auto_worker_core(index: usize, cpu: &WorkerCpu) -> Option<usize> {
 }
 
 #[cfg(target_os = "linux")]
-fn apply_linux_scheduler(scheduler: &hammer_core::config::WorkerScheduler) {
-    use hammer_core::config::SchedulerPolicy;
+fn apply_linux_scheduler(scheduler: &crate::config::WorkerScheduler) {
+    use crate::config::SchedulerPolicy;
     use thread_priority::{
         NormalThreadSchedulePolicy, RealtimeThreadSchedulePolicy, ThreadPriority,
         ThreadPriorityOsValue, ThreadPriorityValue, ThreadSchedulePolicy,
@@ -87,8 +87,8 @@ fn apply_linux_scheduler(scheduler: &hammer_core::config::WorkerScheduler) {
 }
 
 #[cfg(target_os = "macos")]
-fn apply_macos_qos(scheduler: &hammer_core::config::WorkerScheduler) {
-    use hammer_core::config::QosClass;
+fn apply_macos_qos(scheduler: &crate::config::WorkerScheduler) {
+    use crate::config::QosClass;
 
     let qos = match scheduler.qos {
         QosClass::UserInteractive => libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE,
@@ -105,7 +105,7 @@ fn apply_macos_qos(scheduler: &hammer_core::config::WorkerScheduler) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hammer_core::config::Worker;
+    use crate::config::Worker;
 
     #[test]
     fn worker_thread_setup_accepts_default_worker() {
@@ -136,7 +136,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn worker_qos_set_does_not_panic() {
-        use hammer_core::config::QosClass;
+        use crate::config::QosClass;
 
         let mut worker = Worker::default();
         worker.scheduler.qos = QosClass::UserInteractive;

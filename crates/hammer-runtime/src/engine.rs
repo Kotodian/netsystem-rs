@@ -5,12 +5,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use hammer_core::config::Config;
+use crate::error::{RuntimeError, RuntimeResult};
 use hammer_core::data_plane::NodeId;
-use hammer_core::error::{HammerError, HammerResult};
-use hammer_core::registry::RuntimeRegistry;
 use hammer_runtime::DataPlaneRuntime;
+use hammer_runtime::RuntimeRegistry;
 
+use crate::config::Worker;
 use crate::data_plane::{DataPlaneRuntimeWorkerConfig, DataPlaneRuntimeWorkerSeed};
 use crate::node::{NodeRuntimeData, NodeRuntimeInner};
 use crate::process::ProcessMain;
@@ -28,8 +28,9 @@ pub(crate) struct EngineWorkerSeed {
     main_loop_exit_now: Arc<AtomicBool>,
     pending_worker_graph: Arc<Mutex<Option<NodeRuntimeInner>>>,
     workers_updating_graph: Arc<AtomicU32>,
-    worker_graph_update_error: Arc<Mutex<Option<HammerError>>>,
+    worker_graph_update_error: Arc<Mutex<Option<RuntimeError>>>,
     memory_initialized: bool,
+    worker_config: Worker,
 }
 
 #[repr(align(64))]
@@ -44,6 +45,8 @@ pub struct Engine {
     pub main_loop_exit_now: Arc<AtomicBool>,
     pub main_loop_exit_status: Mutex<i32>,
     pub(crate) memory_initialized: bool,
+    plugin_main: PluginMain,
+    worker_config: Worker,
     pub(crate) called_init_functions: HashSet<&'static str>,
     pub(crate) called_worker_init_functions: HashSet<&'static str>,
     pub(crate) called_early_config_functions: HashSet<&'static str>,
@@ -54,7 +57,7 @@ pub struct Engine {
     materialized_registration_generation: u64,
     pending_worker_graph: Arc<Mutex<Option<NodeRuntimeInner>>>,
     workers_updating_graph: Arc<AtomicU32>,
-    worker_graph_update_error: Arc<Mutex<Option<HammerError>>>,
+    worker_graph_update_error: Arc<Mutex<Option<RuntimeError>>>,
     main_loop_exit_functions_called: bool,
     file_main: Option<FileMain>,
     worker_threads: Mutex<Vec<JoinHandle<()>>>,
@@ -71,15 +74,16 @@ impl Engine {
         main_loop_exit_now: Arc<AtomicBool>,
         pending_worker_graph: Arc<Mutex<Option<NodeRuntimeInner>>>,
         workers_updating_graph: Arc<AtomicU32>,
-        worker_graph_update_error: Arc<Mutex<Option<HammerError>>>,
+        worker_graph_update_error: Arc<Mutex<Option<RuntimeError>>>,
         memory_initialized: bool,
+        worker_config: Worker,
         index: u32,
         numa_node: u32,
-    ) -> HammerResult<Self> {
+    ) -> RuntimeResult<Self> {
         let worker = index
             .checked_sub(1)
             .map(DataWorkerId::new)
-            .ok_or_else(|| HammerError::internal("data worker thread index must be non-zero"))?;
+            .ok_or_else(|| RuntimeError::invariant("data worker thread index must be non-zero"))?;
         Ok(Self {
             thread_index: index,
             numa_node,
@@ -91,6 +95,8 @@ impl Engine {
             main_loop_exit_now,
             main_loop_exit_status: Mutex::new(0),
             memory_initialized,
+            plugin_main: PluginMain::default(),
+            worker_config,
             called_init_functions: HashSet::new(),
             called_worker_init_functions: HashSet::new(),
             called_early_config_functions: HashSet::new(),
@@ -124,6 +130,8 @@ impl Engine {
             main_loop_exit_now: Arc::new(AtomicBool::new(false)),
             main_loop_exit_status: Mutex::new(0),
             memory_initialized: false,
+            plugin_main: PluginMain::default(),
+            worker_config: Worker::default(),
             called_init_functions: HashSet::new(),
             called_worker_init_functions: HashSet::new(),
             called_early_config_functions: HashSet::new(),
@@ -142,8 +150,16 @@ impl Engine {
         }
     }
 
-    pub fn loaded_plugins(&self) -> Vec<&'static str> {
-        PluginMain::loaded_plugins()
+    pub fn loaded_plugins(&self) -> Vec<String> {
+        self.plugin_main.loaded_plugins()
+    }
+
+    pub fn plugin_main(&self) -> &PluginMain {
+        &self.plugin_main
+    }
+
+    pub fn plugin_main_mut(&mut self) -> &mut PluginMain {
+        &mut self.plugin_main
     }
 
     /// Add plugin roots and materialize their newly published runtime state.
@@ -151,26 +167,35 @@ impl Engine {
     /// This is the sole plugin-loading interface. The main thread owns DSO
     /// activation, lifecycle/config dispatch, and append-only Graph Runtime
     /// mutation. Data Workers never load images or mutate graph topology.
-    pub fn load_plugins(
-        &mut self,
-        plugin_path: &std::path::Path,
-        roots: &[String],
-    ) -> HammerResult<()> {
+    /// Apply the runtime-owned early configuration before any plugin image is
+    /// loaded.
+    pub fn configure_early(&mut self, config: &str) -> RuntimeResult<()> {
+        crate::init::run_config_functions(self, true, config)
+    }
+
+    /// Add plugin roots and materialize their newly published runtime state.
+    ///
+    /// Registered owners deserialize their own declared section from `config`.
+    pub fn load_plugins(&mut self, roots: &[String], config: &str) -> RuntimeResult<()> {
         if !self.memory_initialized {
-            return Err(HammerError::MemoryNotInitialized);
+            return Err(RuntimeError::MemoryNotInitialized);
         }
 
         let resume_main_loop = self.main_loop_entered;
         let resume_processes = self.processes.is_started();
-        PluginMain::load(env!("CARGO_PKG_VERSION"), plugin_path, roots)?;
-        let registration_generation = crate::registration::generation();
+        self.plugin_main.load(env!("CARGO_PKG_VERSION"), roots)?;
+        let registration_generation = self.plugin_main.registration_generation();
         if registration_generation == self.materialized_registration_generation {
             return Ok(());
         }
 
         let worker_count = if resume_main_loop {
-            let count = self.registry.require::<Config>()?.worker.count;
-            u32::try_from(count).map_err(|_| HammerError::WorkerCountOverflow { count })?
+            let count = self
+                .worker_threads
+                .lock()
+                .map_err(|_| RuntimeError::invariant("worker thread registry poisoned"))?
+                .len();
+            u32::try_from(count).map_err(|_| RuntimeError::WorkerCountOverflow { count })?
         } else {
             0
         };
@@ -184,13 +209,13 @@ impl Engine {
             ))
         };
 
-        crate::init::run_config_functions(self, true)?;
+        crate::init::run_config_functions(self, true, config)?;
         crate::init::run_init_functions(self)?;
-        let entries = crate::registration::graph_nodes();
-        let functions = crate::registration::node_functions();
+        let entries = self.plugin_main.graph_nodes();
+        let functions = self.plugin_main.node_functions();
         self.runtime
             .extend_graph_with_node_functions(0, &entries, &functions)?;
-        crate::init::run_config_functions(self, false)?;
+        crate::init::run_config_functions(self, false, config)?;
         if worker_count != 0 {
             self.publish_worker_graph(worker_count)?;
         }
@@ -208,22 +233,22 @@ impl Engine {
         Ok(())
     }
 
-    fn publish_worker_graph(&self, worker_count: u32) -> HammerResult<()> {
+    fn publish_worker_graph(&self, worker_count: u32) -> RuntimeResult<()> {
         if self.workers_updating_graph.load(Ordering::Acquire) != 0 {
-            return Err(HammerError::WorkerGraphUpdateAlreadyPending);
+            return Err(RuntimeError::WorkerGraphUpdateAlreadyPending);
         }
         let graph = self.runtime.nodes().snapshot();
         let mut published = self
             .pending_worker_graph
             .lock()
-            .map_err(|_| HammerError::WorkerGraphUpdateStatePoisoned)?;
+            .map_err(|_| RuntimeError::WorkerGraphUpdateStatePoisoned)?;
         if published.is_some() {
-            return Err(HammerError::WorkerGraphUpdateAlreadyPending);
+            return Err(RuntimeError::WorkerGraphUpdateAlreadyPending);
         }
         let mut error = self
             .worker_graph_update_error
             .lock()
-            .map_err(|_| HammerError::WorkerGraphUpdateStatePoisoned)?;
+            .map_err(|_| RuntimeError::WorkerGraphUpdateStatePoisoned)?;
         *error = None;
         *published = Some(graph);
         self.workers_updating_graph
@@ -231,18 +256,18 @@ impl Engine {
         Ok(())
     }
 
-    fn finish_worker_graph_update(&self) -> HammerResult<()> {
+    fn finish_worker_graph_update(&self) -> RuntimeResult<()> {
         while self.workers_updating_graph.load(Ordering::Acquire) != 0 {
             spin_loop();
         }
         let error = self
             .worker_graph_update_error
             .lock()
-            .map_err(|_| HammerError::WorkerGraphUpdateStatePoisoned)?
+            .map_err(|_| RuntimeError::WorkerGraphUpdateStatePoisoned)?
             .take();
         self.pending_worker_graph
             .lock()
-            .map_err(|_| HammerError::WorkerGraphUpdateStatePoisoned)?
+            .map_err(|_| RuntimeError::WorkerGraphUpdateStatePoisoned)?
             .take();
         match error {
             Some(error) => Err(error),
@@ -258,12 +283,12 @@ impl Engine {
         let result = self
             .pending_worker_graph
             .lock()
-            .map_err(|_| HammerError::WorkerGraphUpdateStatePoisoned)
+            .map_err(|_| RuntimeError::WorkerGraphUpdateStatePoisoned)
             .and_then(|published| {
                 published
                     .as_ref()
                     .cloned()
-                    .ok_or(HammerError::WorkerGraphUpdateMissing)
+                    .ok_or(RuntimeError::WorkerGraphUpdateMissing)
             })
             .and_then(|graph| {
                 self.runtime
@@ -289,11 +314,11 @@ impl Engine {
         succeeded && !self.main_loop_exit_now.load(Ordering::Acquire)
     }
 
-    pub fn spawn(&self, index: u32) -> HammerResult<Self> {
+    pub fn spawn(&self, index: u32) -> RuntimeResult<Self> {
         self.spawn_on_numa(index, self.numa_node)
     }
 
-    pub fn spawn_on_numa(&self, index: u32, numa_node: u32) -> HammerResult<Self> {
+    pub fn spawn_on_numa(&self, index: u32, numa_node: u32) -> RuntimeResult<Self> {
         Self::worker_with_runtime(
             self.runtime.for_worker(index, numa_node),
             Arc::clone(&self.registry),
@@ -304,17 +329,43 @@ impl Engine {
             Arc::clone(&self.workers_updating_graph),
             Arc::clone(&self.worker_graph_update_error),
             self.memory_initialized,
+            self.worker_config.clone(),
             index,
             numa_node,
         )
     }
 
     #[inline]
-    pub fn data_worker_id(&self) -> HammerResult<DataWorkerId> {
+    pub fn data_worker_id(&self) -> RuntimeResult<DataWorkerId> {
         self.thread_index
             .checked_sub(1)
             .map(DataWorkerId::new)
-            .ok_or_else(|| HammerError::internal("main thread has no data worker id"))
+            .ok_or_else(|| RuntimeError::invariant("main thread has no data worker id"))
+    }
+
+    /// The configured number of data workers. This is runtime state, not a
+    /// retained startup document.
+    #[inline]
+    pub fn configured_worker_count(&self) -> usize {
+        self.worker_config.count
+    }
+
+    #[inline]
+    pub(crate) fn worker_config(&self) -> &Worker {
+        &self.worker_config
+    }
+
+    pub(crate) fn apply_worker_config(&mut self, worker: Worker) -> RuntimeResult<()> {
+        if self.memory_initialized {
+            return Err(RuntimeError::invariant(
+                "worker configuration cannot change after runtime initialization",
+            ));
+        }
+        worker.validate()?;
+        self.runtime = crate::new_worker_runtime(&worker)?;
+        self.worker_config = worker;
+        self.memory_initialized = true;
+        Ok(())
     }
 
     /// Replace only one cloned Data Worker's node-local runtime data.
@@ -326,21 +377,21 @@ impl Engine {
         &mut self,
         node: NodeId,
         data: NodeRuntimeData,
-    ) -> HammerResult<()> {
+    ) -> RuntimeResult<()> {
         self.data_worker_id()?;
         self.runtime.nodes().set_node_runtime_data(node, data)
     }
 
-    pub fn file_main(&self) -> HammerResult<&FileMain> {
+    pub fn file_main(&self) -> RuntimeResult<&FileMain> {
         self.file_main
             .as_ref()
-            .ok_or_else(|| HammerError::internal("main thread has no FileMain"))
+            .ok_or_else(|| RuntimeError::invariant("main thread has no FileMain"))
     }
 
-    pub fn file_main_mut(&mut self) -> HammerResult<&mut FileMain> {
+    pub fn file_main_mut(&mut self) -> RuntimeResult<&mut FileMain> {
         self.file_main
             .as_mut()
-            .ok_or_else(|| HammerError::internal("main thread has no FileMain"))
+            .ok_or_else(|| RuntimeError::invariant("main thread has no FileMain"))
     }
 
     pub(crate) fn worker_seed(&self) -> EngineWorkerSeed {
@@ -354,32 +405,36 @@ impl Engine {
             workers_updating_graph: Arc::clone(&self.workers_updating_graph),
             worker_graph_update_error: Arc::clone(&self.worker_graph_update_error),
             memory_initialized: self.memory_initialized,
+            worker_config: self.worker_config.clone(),
         }
     }
 
     pub(crate) fn retain_worker_threads(
         &self,
         threads: &mut Vec<JoinHandle<()>>,
-    ) -> HammerResult<()> {
+    ) -> RuntimeResult<()> {
         let mut retained = self
             .worker_threads
             .lock()
-            .map_err(|_| HammerError::internal("worker thread registry poisoned"))?;
+            .map_err(|_| RuntimeError::invariant("worker thread registry poisoned"))?;
         if !retained.is_empty() {
-            return Err(HammerError::internal("data workers are already started"));
+            return Err(RuntimeError::invariant("data workers are already started"));
         }
         retained.extend(threads.drain(..));
         Ok(())
     }
 
-    pub fn start_process_nodes(&mut self) -> HammerResult<()> {
+    pub fn start_process_nodes(&mut self) -> RuntimeResult<()> {
         if self.thread_index != 0 {
-            return Err(HammerError::internal(
+            return Err(RuntimeError::invariant(
                 "Process Nodes can only start on the main thread",
             ));
         }
-        self.processes
-            .start(Arc::clone(&self.registry), self.runtime.clone())
+        self.processes.start(
+            Arc::clone(&self.registry),
+            self.runtime.clone(),
+            self.plugin_main.process_nodes(),
+        )
     }
 
     pub fn process_handle(&self, name: &str) -> Option<ProcessHandle> {
@@ -396,7 +451,7 @@ impl Engine {
     pub fn shutdown_process_nodes(
         &mut self,
         runtime: &tokio::runtime::Runtime,
-    ) -> HammerResult<()> {
+    ) -> RuntimeResult<()> {
         self.processes.shutdown(runtime)
     }
 
@@ -449,11 +504,11 @@ impl EngineWorkerSeed {
         index: u32,
         numa_node: u32,
         handoff: DataPlaneHandoffWorker,
-    ) -> HammerResult<Engine> {
+    ) -> RuntimeResult<Engine> {
         let worker = index
             .checked_sub(1)
             .map(DataWorkerId::new)
-            .ok_or_else(|| HammerError::internal("data worker thread index must be non-zero"))?;
+            .ok_or_else(|| RuntimeError::invariant("data worker thread index must be non-zero"))?;
         let Self {
             runtime_seed,
             registry,
@@ -464,6 +519,7 @@ impl EngineWorkerSeed {
             workers_updating_graph,
             worker_graph_update_error,
             memory_initialized,
+            worker_config,
         } = self;
         let runtime = DataPlaneRuntime::attach_handoff_worker(
             DataPlaneRuntime::from(DataPlaneRuntimeWorkerConfig {
@@ -484,6 +540,7 @@ impl EngineWorkerSeed {
             workers_updating_graph,
             worker_graph_update_error,
             memory_initialized,
+            worker_config,
             index,
             numa_node,
         )
@@ -541,17 +598,14 @@ impl EnginePool {
         self.ipc_listener.take()
     }
 
-    pub fn main_loop_enter(engine: &mut Engine) -> HammerResult<()> {
+    pub fn main_loop_enter(
+        engine: &mut Engine,
+        roots: &[String],
+        config: &str,
+    ) -> RuntimeResult<()> {
         engine.install_current();
-        let config = engine.registry.require::<Config>()?;
-        crate::memory::memory_init(engine, config)?;
-        let plugin_path = crate::plugin_loader::configured_plugin_path()?;
-        let roots = engine
-            .registry
-            .require::<Config>()?
-            .requested_plugins()
-            .to_vec();
-        engine.load_plugins(&plugin_path, &roots)?;
+        engine.configure_early(config)?;
+        engine.load_plugins(roots, config)?;
         crate::init::run_main_loop_enter(engine)?;
         engine.start_process_nodes()?;
         Ok(())
@@ -563,7 +617,7 @@ impl EnginePool {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    pub fn close(&mut self) -> HammerResult<()> {
+    pub fn close(&mut self) -> RuntimeResult<()> {
         Self::main_loop_exit(self.main_engine());
         self.main_engine().join_worker_threads();
         let exit_result = {
@@ -585,8 +639,8 @@ impl EnginePool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hammer_core::data_plane::DataPlaneBufferConfig;
-    use hammer_core::registry::RuntimeRegistry;
+    use crate::DataPlaneBufferConfig;
+    use hammer_runtime::RuntimeRegistry;
     use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig};
     use std::sync::Arc;
 

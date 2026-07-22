@@ -3,7 +3,7 @@ use std::io;
 use std::mem::{size_of, size_of_val};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
-use hammer_core::error::{CoreError, CoreResult};
+use hammer_runtime::{RuntimeError, RuntimeResult};
 
 const CONTROL_NAME: &[u8] = b"com.apple.net.utun_control";
 const CTLIOCGINFO: libc::c_ulong = 0xc064_4e03;
@@ -29,7 +29,7 @@ struct InterfaceRequest {
     value: InterfaceRequestValue,
 }
 
-pub(super) fn open(requested_name: &str, mtu: u32) -> CoreResult<(OwnedFd, String)> {
+pub(super) fn open(requested_name: &str, mtu: u32) -> RuntimeResult<(OwnedFd, String)> {
     let unit = parse_unit(requested_name)?;
     // SAFETY: socket has no pointer arguments. A successful raw descriptor is
     // transferred immediately into OwnedFd and therefore closed exactly once.
@@ -78,7 +78,7 @@ pub(super) fn open(requested_name: &str, mtu: u32) -> CoreResult<(OwnedFd, Strin
     Ok((fd, name))
 }
 
-pub(super) fn try_recv(fd: RawFd, payload: &mut [u8]) -> CoreResult<Option<usize>> {
+pub(super) fn try_recv(fd: RawFd, payload: &mut [u8]) -> RuntimeResult<Option<usize>> {
     let mut family = [0u8; UTUN_HEADER_LEN];
     let mut vectors = Vec::with_capacity(2);
     vectors.push(libc::iovec {
@@ -96,13 +96,13 @@ pub(super) fn try_recv(fd: RawFd, payload: &mut [u8]) -> CoreResult<Option<usize
         let read = unsafe { libc::readv(fd, vectors.as_ptr(), 2) };
         if read >= 0 {
             let read = usize::try_from(read)
-                .map_err(|_| CoreError::internal("utun read length overflow"))?;
+                .map_err(|_| RuntimeError::invariant("utun read length overflow"))?;
             if read <= UTUN_HEADER_LEN {
-                return Err(CoreError::internal("utun packet has no L3 payload"));
+                return Err(RuntimeError::invariant("utun packet has no L3 payload"));
             }
             let family = u32::from_be_bytes(family);
             if family != libc::AF_INET as u32 && family != libc::AF_INET6 as u32 {
-                return Err(CoreError::internal(
+                return Err(RuntimeError::invariant(
                     "utun packet has unsupported address family",
                 ));
             }
@@ -110,10 +110,10 @@ pub(super) fn try_recv(fd: RawFd, payload: &mut [u8]) -> CoreResult<Option<usize
             let version = payload
                 .first()
                 .map(|first| first >> 4)
-                .ok_or_else(|| CoreError::internal("utun packet has empty L3 payload"))?;
+                .ok_or_else(|| RuntimeError::invariant("utun packet has empty L3 payload"))?;
             let expected = if family == libc::AF_INET as u32 { 4 } else { 6 };
             if version != expected {
-                return Err(CoreError::internal(
+                return Err(RuntimeError::invariant(
                     "utun address family does not match the L3 version",
                 ));
             }
@@ -123,17 +123,21 @@ pub(super) fn try_recv(fd: RawFd, payload: &mut [u8]) -> CoreResult<Option<usize
         match error.kind() {
             io::ErrorKind::WouldBlock => return Ok(None),
             io::ErrorKind::Interrupted => continue,
-            _ => return Err(CoreError::internal(format!("read utun packet: {error}"))),
+            _ => {
+                return Err(RuntimeError::invariant(format!(
+                    "read utun packet: {error}"
+                )));
+            }
         }
     }
 }
 
-pub(super) fn try_send(fd: RawFd, version: u8, segments: &[&[u8]]) -> CoreResult<bool> {
+pub(super) fn try_send(fd: RawFd, version: u8, segments: &[&[u8]]) -> RuntimeResult<bool> {
     let family = match version {
         4 => libc::AF_INET as u32,
         6 => libc::AF_INET6 as u32,
         _ => {
-            return Err(CoreError::internal(
+            return Err(RuntimeError::invariant(
                 "cannot send unsupported L3 version to utun",
             ));
         }
@@ -141,9 +145,9 @@ pub(super) fn try_send(fd: RawFd, version: u8, segments: &[&[u8]]) -> CoreResult
     let vector_count = segments
         .len()
         .checked_add(1)
-        .ok_or_else(|| CoreError::internal("utun buffer chain has too many segments"))?;
+        .ok_or_else(|| RuntimeError::invariant("utun buffer chain has too many segments"))?;
     let count = libc::c_int::try_from(vector_count)
-        .map_err(|_| CoreError::internal("utun buffer chain has too many segments"))?;
+        .map_err(|_| RuntimeError::invariant("utun buffer chain has too many segments"))?;
     let header = family.to_be_bytes();
     let mut vectors = Vec::with_capacity(vector_count);
     vectors.push(libc::iovec {
@@ -154,7 +158,7 @@ pub(super) fn try_send(fd: RawFd, version: u8, segments: &[&[u8]]) -> CoreResult
     for segment in segments {
         total = total
             .checked_add(segment.len())
-            .ok_or_else(|| CoreError::internal("utun packet length overflow"))?;
+            .ok_or_else(|| RuntimeError::invariant("utun packet length overflow"))?;
         vectors.push(libc::iovec {
             iov_base: segment.as_ptr().cast::<c_void>().cast_mut(),
             iov_len: segment.len(),
@@ -167,9 +171,9 @@ pub(super) fn try_send(fd: RawFd, version: u8, segments: &[&[u8]]) -> CoreResult
         let written = unsafe { libc::writev(fd, vectors.as_ptr(), count) };
         if written >= 0 {
             let written = usize::try_from(written)
-                .map_err(|_| CoreError::internal("utun write length overflow"))?;
+                .map_err(|_| RuntimeError::invariant("utun write length overflow"))?;
             if written != total {
-                return Err(CoreError::internal("partial utun datagram write"));
+                return Err(RuntimeError::invariant("partial utun datagram write"));
             }
             return Ok(true);
         }
@@ -177,14 +181,20 @@ pub(super) fn try_send(fd: RawFd, version: u8, segments: &[&[u8]]) -> CoreResult
         match error.kind() {
             io::ErrorKind::WouldBlock => return Ok(false),
             io::ErrorKind::Interrupted => continue,
-            _ => return Err(CoreError::internal(format!("write utun packet: {error}"))),
+            _ => {
+                return Err(RuntimeError::invariant(format!(
+                    "write utun packet: {error}"
+                )));
+            }
         }
     }
 }
 
-fn parse_unit(name: &str) -> CoreResult<u32> {
+fn parse_unit(name: &str) -> RuntimeResult<u32> {
     let Some(suffix) = name.strip_prefix("utun") else {
-        return Err(CoreError::internal("Darwin TUN name must start with utun"));
+        return Err(RuntimeError::invariant(
+            "Darwin TUN name must start with utun",
+        ));
     };
     if suffix.is_empty() {
         return Ok(0);
@@ -193,10 +203,10 @@ fn parse_unit(name: &str) -> CoreResult<u32> {
         .parse::<u32>()
         .ok()
         .and_then(|unit| unit.checked_add(1))
-        .ok_or_else(|| CoreError::internal("Darwin TUN name has an invalid unit"))
+        .ok_or_else(|| RuntimeError::invariant("Darwin TUN name has an invalid unit"))
 }
 
-fn set_nonblocking(fd: RawFd) -> CoreResult<()> {
+fn set_nonblocking(fd: RawFd) -> RuntimeResult<()> {
     // SAFETY: fd is live and F_GETFL has no pointer argument.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
@@ -209,10 +219,10 @@ fn set_nonblocking(fd: RawFd) -> CoreResult<()> {
     Ok(())
 }
 
-fn kernel_name(fd: RawFd) -> CoreResult<String> {
+fn kernel_name(fd: RawFd) -> RuntimeResult<String> {
     let mut name = [0u8; libc::IFNAMSIZ];
     let mut length = libc::socklen_t::try_from(name.len())
-        .map_err(|_| CoreError::internal("utun interface name buffer overflow"))?;
+        .map_err(|_| RuntimeError::invariant("utun interface name buffer overflow"))?;
     // SAFETY: name is writable for length bytes and length itself is a live
     // socklen_t out-parameter for this call.
     if unsafe {
@@ -228,21 +238,21 @@ fn kernel_name(fd: RawFd) -> CoreResult<String> {
         return Err(last_error("read utun kernel name"));
     }
     let length = usize::try_from(length)
-        .map_err(|_| CoreError::internal("utun interface name length overflow"))?;
+        .map_err(|_| RuntimeError::invariant("utun interface name length overflow"))?;
     let bytes = name
         .get(..length)
-        .ok_or_else(|| CoreError::internal("utun interface name length is invalid"))?;
+        .ok_or_else(|| RuntimeError::invariant("utun interface name length is invalid"))?;
     let bytes = bytes.strip_suffix(&[0]).unwrap_or(bytes);
     std::str::from_utf8(bytes)
         .map(str::to_owned)
-        .map_err(|_| CoreError::internal("utun interface name is not UTF-8"))
+        .map_err(|_| RuntimeError::invariant("utun interface name is not UTF-8"))
 }
 
-fn set_mtu(name: &str, mtu: u32) -> CoreResult<()> {
+fn set_mtu(name: &str, mtu: u32) -> RuntimeResult<()> {
     let mtu = libc::c_int::try_from(mtu)
-        .map_err(|_| CoreError::internal("utun MTU does not fit c_int"))?;
+        .map_err(|_| RuntimeError::invariant("utun MTU does not fit c_int"))?;
     if name.len() >= libc::IFNAMSIZ {
-        return Err(CoreError::internal("utun interface name is too long"));
+        return Err(RuntimeError::invariant("utun interface name is too long"));
     }
     // SAFETY: socket has no pointer arguments. The descriptor is transferred
     // immediately to OwnedFd on success.
@@ -267,8 +277,8 @@ fn set_mtu(name: &str, mtu: u32) -> CoreResult<()> {
     Ok(())
 }
 
-fn last_error(operation: &str) -> CoreError {
-    CoreError::internal(format!("{operation}: {}", io::Error::last_os_error()))
+fn last_error(operation: &str) -> RuntimeError {
+    RuntimeError::invariant(format!("{operation}: {}", io::Error::last_os_error()))
 }
 
 #[cfg(test)]

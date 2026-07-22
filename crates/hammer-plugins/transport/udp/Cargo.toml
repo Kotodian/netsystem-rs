@@ -6,9 +6,10 @@ publish.workspace = true
 
 [lib]
 name = "hammer_plugin_udp"
-crate-type = ["cdylib", "rlib"]
+crate-type = ["dylib", "rlib"]
 
 [dependencies]
+abi_stable = { workspace = true }
 hammer-core = { path = "../../../hammer-core" }
 hammer-infra = { path = "../../../hammer-infra" }
 hammer-runtime = { path = "../../../hammer-runtime", default-features = false }
@@ -17,3 +18,4 @@ hammer-component-macros = { path = "../../../hammer-component-macros" }
 linkme = { workspace = true }
 arc-swap = { workspace = true }
 tracing = { workspace = true }
+serde = { workspace = true }

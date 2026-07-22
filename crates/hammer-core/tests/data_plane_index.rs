@@ -1,11 +1,22 @@
-use hammer_core::data_plane::{BufferPool, DataPlaneBufferConfig, DataPlaneBuffers, Index, NodeId};
-use hammer_core::error::{CoreError, DataPlaneError};
+use hammer_core::data_plane::{
+    BufferPool, BufferPoolArena, DataPlaneBuffers, Index, NodeId,
+};
+use hammer_core::error::{DataPlaneError, PacketGraphError};
 
 fn release(buffers: &DataPlaneBuffers, index: Index) {
     let mut frame = buffers
         .get_next_frame(NodeId::new(0))
         .expect("cleanup frame");
     frame.push_index(index).expect("push cleanup index");
+}
+
+fn buffers(buffer_slot_capacity: usize, buffer_slots: usize, frame_slots: usize) -> DataPlaneBuffers {
+    DataPlaneBuffers::from_arenas(
+        [BufferPoolArena::with_capacity(buffer_slot_capacity, buffer_slots)],
+        frame_slots,
+        0,
+        0,
+    )
 }
 
 #[test]
@@ -24,12 +35,7 @@ fn index_is_sixteen_bytes_and_copyable_without_refcount_change() {
 
 #[test]
 fn buffer_and_frame_pools_share_nonzero_pool_id_namespace() {
-    let buffers = DataPlaneBuffers::new(DataPlaneBufferConfig {
-        buffer_slot_capacity: 64,
-        buffer_slots: 2,
-        frame_slots: 2,
-        ..DataPlaneBufferConfig::default()
-    });
+    let buffers = buffers(64, 2, 2);
     let buffer_pool_id = buffers.try_buffers().expect("buffer pool").pool_id();
     let index = buffers.alloc_index().expect("buffer index");
     assert_ne!(buffer_pool_id, 0);
@@ -43,24 +49,14 @@ fn buffer_and_frame_pools_share_nonzero_pool_id_namespace() {
 
 #[test]
 fn buffer_validation_reports_structured_foreign_stale_and_free_facts() {
-    let first_buffers = DataPlaneBuffers::new(DataPlaneBufferConfig {
-        buffer_slot_capacity: 64,
-        buffer_slots: 2,
-        frame_slots: 4,
-        ..DataPlaneBufferConfig::default()
-    });
-    let second_buffers = DataPlaneBuffers::new(DataPlaneBufferConfig {
-        buffer_slot_capacity: 64,
-        buffer_slots: 2,
-        frame_slots: 4,
-        ..DataPlaneBufferConfig::default()
-    });
+    let first_buffers = buffers(64, 2, 4);
+    let second_buffers = buffers(64, 2, 4);
     let first = first_buffers.try_buffers().expect("first pool");
     let second = second_buffers.try_buffers().expect("second pool");
     let index = first_buffers.alloc_index_with_bytes(b"x").expect("alloc");
 
     match second.get(index).map(|_| ()).unwrap_err() {
-        CoreError::DataPlane(DataPlaneError::ForeignIndex {
+        PacketGraphError::DataPlane(DataPlaneError::ForeignIndex {
             expected_pool_id,
             actual_pool_id,
         }) => {
@@ -72,7 +68,7 @@ fn buffer_validation_reports_structured_foreign_stale_and_free_facts() {
 
     release(&first_buffers, index);
     match first.get(index).map(|_| ()).unwrap_err() {
-        CoreError::DataPlane(DataPlaneError::IndexSlotFree { pool_id, slot }) => {
+        PacketGraphError::DataPlane(DataPlaneError::IndexSlotFree { pool_id, slot }) => {
             assert_eq!(pool_id, first.pool_id());
             assert_eq!(slot, index.slot());
         }
@@ -83,7 +79,7 @@ fn buffer_validation_reports_structured_foreign_stale_and_free_facts() {
     assert_eq!(reused.slot(), index.slot());
     assert_ne!(reused.generation(), index.generation());
     match first.get(index).map(|_| ()).unwrap_err() {
-        CoreError::DataPlane(DataPlaneError::StaleIndex {
+        PacketGraphError::DataPlane(DataPlaneError::StaleIndex {
             slot,
             index_generation,
             current_generation,

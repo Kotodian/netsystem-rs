@@ -1,8 +1,8 @@
 use std::mem::transmute;
 
-use hammer_core::config::Config;
 use hammer_core::data_plane::{BufferFrame, NodeId, NodeRegistration};
-use hammer_core::registry::RuntimeRegistry;
+use hammer_runtime::RuntimeRegistry;
+use hammer_runtime::config::Worker;
 use hammer_runtime::{
     DataPlaneRuntime, Engine, InternalNode, Node, NodeResult, new_worker_runtime,
 };
@@ -28,7 +28,7 @@ impl InternalNode for TxSinkNode {
 
 #[test]
 fn worker_output_runtimes_only_install_their_assigned_tx_queues() {
-    let runtime = new_worker_runtime(&Config::default()).expect("runtime");
+    let runtime = new_worker_runtime(&Worker::default()).expect("runtime");
     let engine = Engine::new(runtime, RuntimeRegistry::new());
     let _ = engine.runtime.nodes().register_internal(DropNode::new());
     let sink = engine.runtime.nodes().register_internal(TxSinkNode);
@@ -38,14 +38,36 @@ fn worker_output_runtimes_only_install_their_assigned_tx_queues() {
         .register_internal(InterfaceOutputControlPlane::new().node());
 
     let devices = DeviceMain::new();
+    let first_device = devices
+        .register_device(11, NodeId::new(0), sink)
+        .expect("register first device");
+    let second_device = devices
+        .register_device(12, NodeId::new(0), sink)
+        .expect("register second device");
     devices
-        .register_tx_queue(11, 1, 0, hammer_runtime::DataWorkerId::new(0), sink)
+        .register_tx_queue(
+            11,
+            first_device.instance,
+            0,
+            hammer_runtime::DataWorkerId::new(0),
+            sink,
+        )
         .expect("single-worker TX queue");
     devices
-        .register_tx_queue(12, 2, 0, hammer_runtime::DataWorkerId::new(0), sink)
+        .register_tx_queue(
+            12,
+            second_device.instance,
+            0,
+            hammer_runtime::DataWorkerId::new(0),
+            sink,
+        )
         .expect("shared TX queue");
     devices
-        .assign_tx_queue_to_worker(2, 0, hammer_runtime::DataWorkerId::new(1))
+        .assign_tx_queue_to_worker(
+            second_device.instance,
+            0,
+            hammer_runtime::DataWorkerId::new(1),
+        )
         .expect("share TX queue");
 
     let mut first_worker = engine.spawn(1).expect("first worker");

@@ -1,12 +1,12 @@
 use std::net::SocketAddr;
 
-use hammer_core::protocol::tcp::{TcpCapabilities, TcpSegmentFlags, tcp_options_from_bytes};
 use hammer_plugin_tcp::output::{
     tcp_available_send_window, tcp_output_next_sequence, tcp_output_sequence_len,
     tcp_payload_len_in_send_window,
 };
 use hammer_plugin_tcp::segment::TcpSegment;
 use hammer_plugin_tcp::{TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_SYN};
+use hammer_plugin_tcp::{TcpCapabilities, TcpSegmentFlags, tcp_options_from_bytes};
 
 #[test]
 fn tcp_segment_writes_tcp_header_bytes() {
@@ -112,7 +112,7 @@ fn tcp_segment_writes_nonzero_timestamp_when_enabled() {
             ..TcpCapabilities::default()
         },
         None,
-        Some(hammer_core::protocol::tcp::TcpTimestampOption { tsval: 7, tsecr: 3 }),
+        Some(hammer_plugin_tcp::TcpTimestampOption { tsval: 7, tsecr: 3 }),
         None,
         None,
         0,

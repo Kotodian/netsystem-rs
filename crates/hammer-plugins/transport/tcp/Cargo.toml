@@ -6,9 +6,10 @@ publish.workspace = true
 
 [lib]
 name = "hammer_plugin_tcp"
-crate-type = ["cdylib", "rlib"]
+crate-type = ["dylib", "rlib"]
 
 [dependencies]
+abi_stable = { workspace = true }
 hammer-core = { path = "../../../hammer-core" }
 hammer-infra = { path = "../../../hammer-infra" }
 hammer-runtime = { path = "../../../hammer-runtime", default-features = false }
@@ -21,11 +22,11 @@ humantime-serde = { workspace = true }
 linkme = { workspace = true }
 libc = { workspace = true }
 serde = { workspace = true }
+toml = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 ipnet = { workspace = true }
 etherparse = { workspace = true }
 
 [dev-dependencies]
-hammer-plugin-ip = { path = "../../ip" }
 tokio = { workspace = true }

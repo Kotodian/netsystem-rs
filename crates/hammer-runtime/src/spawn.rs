@@ -37,14 +37,14 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hammer_core::config::Worker;
 use hammer_core::data_plane::DataPlaneBuffers;
 use hammer_runtime::node::NodeRuntimeStatsRow;
 use hammer_runtime::{TraceControlHandle, TraceRecordSink};
 
+use crate::config::Worker;
 use crate::data_plane::{RuntimeDataPlaneRuntime, new_worker_runtime};
+use crate::error::{RuntimeError, RuntimeResult};
 use crate::worker_thread::apply_worker_thread_setup;
-use hammer_core::error::{HammerError, HammerResult};
 use hammer_runtime::DataPlaneRuntime;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle as TokioJoinHandle;
@@ -114,7 +114,7 @@ pub(crate) fn current_worker_idle_slice() -> Duration {
     DATA_WORKER_IDLE_SLICE.with(|slot| slot.get())
 }
 
-fn init_data_plane_runtime(config: &hammer_core::config::Config) -> HammerResult<()> {
+fn init_data_plane_runtime(config: &Worker) -> RuntimeResult<()> {
     DATA_PLANE_RUNTIME.with(|runtime| {
         if runtime.borrow().is_none() {
             *runtime.borrow_mut() = Some(new_worker_runtime(config)?);
@@ -135,7 +135,7 @@ impl DataRuntime {
         thread_name: &str,
         thread_stack_size: usize,
         max_blocking_threads: usize,
-    ) -> HammerResult<Self> {
+    ) -> RuntimeResult<Self> {
         let mut worker = Worker::default();
         worker.count = worker_threads;
         worker.stack_size = thread_stack_size;
@@ -143,14 +143,14 @@ impl DataRuntime {
         Self::from_config(&worker, thread_name)
     }
 
-    pub fn from_config(worker: &Worker, thread_name: &str) -> HammerResult<Self> {
-        worker.validate().map_err(HammerError::from)?;
+    pub fn from_config(worker: &Worker, thread_name: &str) -> RuntimeResult<Self> {
+        worker.validate().map_err(RuntimeError::from)?;
         Self::spawn_workers(worker, thread_name)
     }
 
-    fn spawn_workers(worker: &Worker, thread_name: &str) -> HammerResult<Self> {
+    fn spawn_workers(worker: &Worker, thread_name: &str) -> RuntimeResult<Self> {
         if worker.count == 0 {
-            return Err(HammerError::internal(
+            return Err(RuntimeError::invariant(
                 "data runtime must have at least one worker thread",
             ));
         }
@@ -183,9 +183,7 @@ impl DataRuntime {
                 .spawn(move || {
                     apply_worker_thread_setup(&worker_config, index);
                     DATA_WORKER_IDLE_SLICE.with(|slot| slot.set(idle_slice));
-                    let mut config = hammer_core::config::Config::default();
-                    config.worker = worker_config.clone();
-                    if let Err(error) = init_data_plane_runtime(&config) {
+                    if let Err(error) = init_data_plane_runtime(&worker_config) {
                         let _ = handle_tx.send(Err(format!(
                             "init data runtime worker {worker_name}: {error}"
                         )));
@@ -222,13 +220,13 @@ impl DataRuntime {
                     let _ = done_tx.send(());
                 })
                 .map_err(|err| {
-                    HammerError::internal(format!("spawn data runtime worker: {err}"))
+                    RuntimeError::invariant(format!("spawn data runtime worker: {err}"))
                 })?;
 
             let handle = handle_rx.recv().map_err(|err| {
-                HammerError::internal(format!("receive data runtime handle: {err}"))
+                RuntimeError::invariant(format!("receive data runtime handle: {err}"))
             })?;
-            let handle = handle.map_err(HammerError::internal)?;
+            let handle = handle.map_err(RuntimeError::invariant)?;
             context_workers.push(DataRuntimeContextWorker {
                 handle,
                 remote_local,
@@ -337,7 +335,7 @@ impl DataRuntimeContext {
         }
     }
 
-    pub fn for_each_worker<F, R>(&self, f: F) -> HammerResult<Vec<R>>
+    pub fn for_each_worker<F, R>(&self, f: F) -> RuntimeResult<Vec<R>>
     where
         F: Fn(usize) -> R + Send + Sync + 'static,
         R: Send + 'static,
@@ -363,15 +361,15 @@ impl DataRuntimeContext {
             .collect::<Vec<_>>();
         for _ in 0..results.len() {
             let (index, result) = rx.recv().map_err(|err| {
-                HammerError::internal(format!("receive data worker initializer result: {err}"))
+                RuntimeError::invariant(format!("receive data worker initializer result: {err}"))
             })?;
             let slot = results.get_mut(index).ok_or_else(|| {
-                HammerError::internal(format!(
+                RuntimeError::invariant(format!(
                     "data worker initializer index out of range: {index}"
                 ))
             })?;
             if slot.is_some() {
-                return Err(HammerError::internal(format!(
+                return Err(RuntimeError::invariant(format!(
                     "duplicate data worker initializer result: {index}"
                 )));
             }
@@ -383,7 +381,7 @@ impl DataRuntimeContext {
             .enumerate()
             .map(|(index, result)| {
                 result.ok_or_else(|| {
-                    HammerError::internal(format!(
+                    RuntimeError::invariant(format!(
                         "missing data worker initializer result: {index}"
                     ))
                 })
@@ -391,7 +389,7 @@ impl DataRuntimeContext {
             .collect()
     }
 
-    pub fn install_on_workers<F, R>(&self, f: F) -> HammerResult<Vec<R>>
+    pub fn install_on_workers<F, R>(&self, f: F) -> RuntimeResult<Vec<R>>
     where
         F: Fn(usize, &DataPlaneRuntime) -> R + Send + Sync + 'static,
         R: Send + 'static,
@@ -403,7 +401,7 @@ impl DataRuntimeContext {
         &self,
         control: Option<TraceControlHandle>,
         packet_capacity: usize,
-    ) -> HammerResult<()> {
+    ) -> RuntimeResult<()> {
         let _ = packet_capacity;
         self.for_each_worker(move |_| {
             with_data_plane_runtime(|runtime| {
@@ -413,12 +411,14 @@ impl DataRuntimeContext {
         .map(|_| ())
     }
 
-    pub fn drain_trace_records_on_workers(&self, sink: TraceRecordSink) -> HammerResult<usize> {
+    pub fn drain_trace_records_on_workers(&self, sink: TraceRecordSink) -> RuntimeResult<usize> {
         self.for_each_worker(move |_| sink.drain_completed())
             .map(|counts| counts.into_iter().sum())
     }
 
-    pub fn runtime_stats_on_workers(&self) -> HammerResult<Vec<(usize, Vec<NodeRuntimeStatsRow>)>> {
+    pub fn runtime_stats_on_workers(
+        &self,
+    ) -> RuntimeResult<Vec<(usize, Vec<NodeRuntimeStatsRow>)>> {
         self.for_each_worker(move |worker| {
             with_data_plane_runtime(|runtime| {
                 (worker, runtime.nodes().node_runtime_stats_snapshot())
@@ -428,7 +428,7 @@ impl DataRuntimeContext {
 
     pub async fn runtime_stats_on_workers_async(
         &self,
-    ) -> HammerResult<Vec<(usize, Vec<NodeRuntimeStatsRow>)>> {
+    ) -> RuntimeResult<Vec<(usize, Vec<NodeRuntimeStatsRow>)>> {
         let mut receivers = Vec::with_capacity(self.inner.workers.len());
         for (index, worker) in self.inner.workers.iter().cloned().enumerate() {
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -451,15 +451,15 @@ impl DataRuntimeContext {
             .collect::<Vec<_>>();
         for rx in receivers {
             let (index, rows) = rx.await.map_err(|err| {
-                HammerError::internal(format!("receive data worker runtime stats: {err}"))
+                RuntimeError::invariant(format!("receive data worker runtime stats: {err}"))
             })?;
             let slot = results.get_mut(index).ok_or_else(|| {
-                HammerError::internal(format!(
+                RuntimeError::invariant(format!(
                     "data worker runtime stats index out of range: {index}"
                 ))
             })?;
             if slot.is_some() {
-                return Err(HammerError::internal(format!(
+                return Err(RuntimeError::invariant(format!(
                     "duplicate data worker runtime stats: {index}"
                 )));
             }
@@ -471,7 +471,7 @@ impl DataRuntimeContext {
             .enumerate()
             .map(|(index, result)| {
                 result.ok_or_else(|| {
-                    HammerError::internal(format!("missing data worker runtime stats: {index}"))
+                    RuntimeError::invariant(format!("missing data worker runtime stats: {index}"))
                 })
             })
             .collect()
@@ -481,7 +481,7 @@ impl DataRuntimeContext {
         self.inner.workers.len()
     }
 
-    pub fn spawn_local_on_worker<F, Fut>(&self, worker: usize, factory: F) -> HammerResult<()>
+    pub fn spawn_local_on_worker<F, Fut>(&self, worker: usize, factory: F) -> RuntimeResult<()>
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = ()> + 'static,
@@ -501,7 +501,7 @@ impl DataRuntimeContext {
         &self,
         worker: usize,
         factory: F,
-    ) -> HammerResult<T>
+    ) -> RuntimeResult<T>
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = T> + 'static,
@@ -519,7 +519,7 @@ impl DataRuntimeContext {
                 let complete_state = Arc::clone(&complete_state);
                 drop(spawn_local(move || async move {
                     let result = join.await.map_err(|err| {
-                        HammerError::internal(format!("join worker-local task: {err}"))
+                        RuntimeError::invariant(format!("join worker-local task: {err}"))
                     });
                     complete_state.complete(result);
                 }));
@@ -531,8 +531,8 @@ impl DataRuntimeContext {
     pub(crate) fn call_blocking_on_worker<R>(
         &self,
         worker: usize,
-        f: impl FnOnce() -> HammerResult<R> + Send + 'static,
-    ) -> HammerResult<R>
+        f: impl FnOnce() -> RuntimeResult<R> + Send + 'static,
+    ) -> RuntimeResult<R>
     where
         R: Send + 'static,
     {
@@ -542,14 +542,14 @@ impl DataRuntimeContext {
             Box::new(move || {
                 let result = match catch_unwind(AssertUnwindSafe(f)) {
                     Ok(result) => result,
-                    Err(_) => Err(HammerError::internal("data worker closure panicked")),
+                    Err(_) => Err(RuntimeError::invariant("data worker closure panicked")),
                 };
                 let _ = done_tx.send(result);
             }),
         )?;
         done_rx
             .recv()
-            .map_err(|_| HammerError::internal("data worker closure canceled"))?
+            .map_err(|_| RuntimeError::invariant("data worker closure canceled"))?
     }
 
     fn spawn_send_on_worker<F>(&self, worker: usize, future: F) -> JoinHandle<F::Output>
@@ -595,9 +595,9 @@ impl DataRuntimeContext {
         &self,
         worker: usize,
         task: RemoteDataLocalTask,
-    ) -> HammerResult<()> {
+    ) -> RuntimeResult<()> {
         if worker >= self.inner.workers.len() {
-            return Err(HammerError::internal(format!(
+            return Err(RuntimeError::invariant(format!(
                 "invalid app worker {worker}; worker_count={}",
                 self.inner.workers.len()
             )));
@@ -638,7 +638,7 @@ pub struct DataPlaneBarrierHandle {
 }
 
 impl DataPlaneBarrierHandle {
-    pub fn sync(&self) -> HammerResult<DataPlaneBarrierGuard> {
+    pub fn sync(&self) -> RuntimeResult<DataPlaneBarrierGuard> {
         self.wait.store(1, Ordering::SeqCst);
         std::sync::atomic::compiler_fence(Ordering::SeqCst);
         while self.workers.load(Ordering::Acquire) != self.n_workers {
@@ -651,7 +651,7 @@ impl DataPlaneBarrierHandle {
         })
     }
 
-    pub fn synchronize<R>(&self, operation: impl FnOnce() -> HammerResult<R>) -> HammerResult<R> {
+    pub fn synchronize<R>(&self, operation: impl FnOnce() -> RuntimeResult<R>) -> RuntimeResult<R> {
         let _guard = self.sync()?;
         operation()
     }
@@ -860,7 +860,7 @@ impl<T> DataLocalJoinState<T> {
 }
 
 struct DataRemoteJoinState<T> {
-    result: Mutex<Option<HammerResult<T>>>,
+    result: Mutex<Option<RuntimeResult<T>>>,
     waker: Mutex<Option<Waker>>,
 }
 
@@ -872,7 +872,7 @@ impl<T> DataRemoteJoinState<T> {
         }
     }
 
-    fn complete(&self, result: HammerResult<T>) {
+    fn complete(&self, result: RuntimeResult<T>) {
         let mut slot = self.result.lock().expect("remote local result poisoned");
         if slot.is_none() {
             *slot = Some(result);
@@ -894,7 +894,7 @@ struct DataRemoteJoinHandle<T> {
 }
 
 impl<T> Future for DataRemoteJoinHandle<T> {
-    type Output = HammerResult<T>;
+    type Output = RuntimeResult<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut slot = self
@@ -1817,76 +1817,6 @@ mod tests {
             !has_tokio_handle,
             "dataplane spawned task should not inherit a Tokio worker runtime"
         );
-
-        data_runtime.shutdown_timeout(Duration::from_secs(1));
-    }
-
-    #[test]
-    fn frame_pending_future_resumes_on_current_data_worker() {
-        let _guard = test_lock();
-        let data_runtime =
-            DataRuntime::new(1, "spawn-test-frame", 512 * 1024, 2).expect("data runtime");
-        let context = data_runtime.context();
-        let (before_thread, after_thread, payload) = run_on_context(&context, async {
-            spawn(async {
-                spawn_local(|| async {
-                    let runtime = with_data_plane_buffers(Clone::clone);
-                    let frame = std::rc::Rc::new(RefCell::new(
-                        runtime
-                            .get_next_frame(hammer_core::data_plane::NodeId::new(0))
-                            .expect("alloc frame"),
-                    ));
-                    let index = runtime
-                        .alloc_index_with_bytes(b"packet")
-                        .expect("alloc data buffer");
-                    let consumer_frame = std::rc::Rc::clone(&frame);
-                    let consumer_runtime = runtime.clone();
-                    let consumer = spawn_current_local(async move {
-                        let before_thread = thread::current()
-                            .name()
-                            .map(ToOwned::to_owned)
-                            .unwrap_or_default();
-                        let pending = consumer_frame.borrow().pending();
-                        pending.await;
-                        let after_thread = thread::current()
-                            .name()
-                            .map(ToOwned::to_owned)
-                            .unwrap_or_default();
-                        let buffer = consumer_frame.borrow().pending_indices()[0];
-                        let payload = consumer_runtime
-                            .get_buffer(buffer)
-                            .expect("pending buffer")
-                            .current()
-                            .to_vec();
-                        (before_thread, after_thread, payload)
-                    });
-                    let producer_frame = std::rc::Rc::clone(&frame);
-                    let producer = spawn_current_local(async move {
-                        yield_local_now().await;
-                        producer_frame
-                            .borrow_mut()
-                            .push_index(index)
-                            .expect("push pending buffer");
-                    });
-                    producer.await.expect("producer joined");
-                    let result = consumer.await.expect("consumer joined");
-                    let frame = match std::rc::Rc::try_unwrap(frame) {
-                        Ok(frame) => frame.into_inner(),
-                        Err(_) => panic!("frame has remaining references"),
-                    };
-                    drop(frame);
-                    result
-                })
-                .await
-                .expect("local frame task finished")
-            })
-            .await
-            .expect("data task finished")
-        });
-
-        assert_eq!(before_thread, "spawn-test-frame-0");
-        assert_eq!(after_thread, "spawn-test-frame-0");
-        assert_eq!(payload, b"packet");
 
         data_runtime.shutdown_timeout(Duration::from_secs(1));
     }

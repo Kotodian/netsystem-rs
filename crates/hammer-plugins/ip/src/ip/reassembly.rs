@@ -3,24 +3,20 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
-use hammer_core::config::Config;
 use hammer_core::data_plane::{
     BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Index, NodeHandle, NodeId, NodeNext,
 };
-use hammer_core::error::{CoreError, CoreResult, HammerResult};
 use hammer_infra::bihash::{Bihash, FREE_U64};
 use hammer_infra::checksum::internet_checksum;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::spinlock::Spinlock;
 use hammer_runtime::{
-    DataPlaneRuntime, DataWorkerId, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
-    TraceFormatter, add_packet_trace,
+    DataPlaneRuntime, DataWorkerId, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
+    TraceFormatter, add_packet_trace, format_packet_trace,
 };
+use hammer_runtime::{RuntimeError, RuntimeResult};
 
-use hammer_service::trace::codec::{
-    TraceDecodeCursor, put_option_ip_fragment_key, put_option_u16, put_option_u32, put_u8, put_u32,
-};
-
+use crate::config::{NetworkIpConfig, ReassemblyConfig};
 use crate::ip::{
     IpFragmentKey, IpProtocol, IpVersion, ParsedIpFragment, ip_header, network_for_protocol,
     parse_ip_fragment_with_chain_len,
@@ -67,7 +63,7 @@ pub enum IpReassemblyNext {
     Drop,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum IpReassemblyTraceAction {
     Pending,
     Drop,
@@ -76,70 +72,13 @@ pub enum IpReassemblyTraceAction {
     Failed,
 }
 
-impl IpReassemblyTraceAction {
-    #[inline]
-    fn encode(self) -> u8 {
-        match self {
-            Self::Pending => 0,
-            Self::Drop => 1,
-            Self::Reassembled => 2,
-            Self::Handoff => 3,
-            Self::Failed => 4,
-        }
-    }
-
-    #[inline]
-    fn decode(value: u8) -> Option<Self> {
-        match value {
-            0 => Some(Self::Pending),
-            1 => Some(Self::Drop),
-            2 => Some(Self::Reassembled),
-            3 => Some(Self::Handoff),
-            4 => Some(Self::Failed),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct IpReassemblyTrace {
     pub key: Option<IpFragmentKey>,
     pub action: IpReassemblyTraceAction,
     pub current_worker: DataWorkerId,
     pub owner_worker: Option<DataWorkerId>,
     pub next: Option<u16>,
-}
-
-impl IpReassemblyTrace {
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let mut cursor = TraceDecodeCursor::new(bytes);
-        let trace = Self {
-            key: cursor.read_option_ip_fragment_key()?,
-            action: IpReassemblyTraceAction::decode(cursor.read_u8()?)?,
-            current_worker: DataWorkerId::new(cursor.read_u32()?),
-            owner_worker: cursor.read_option_u32()?.map(DataWorkerId::new),
-            next: cursor.read_option_u16()?,
-        };
-        cursor.is_empty().then_some(trace)
-    }
-}
-
-impl PacketTrace for IpReassemblyTrace {
-    #[inline]
-    fn encode_trace(&self, out: &mut Vec<u8>) {
-        put_option_ip_fragment_key(out, self.key);
-        put_u8(out, self.action.encode());
-        put_u32(out, self.current_worker.slot() as u32);
-        put_option_u32(out, self.owner_worker.map(|worker| worker.slot() as u32));
-        put_option_u16(out, self.next);
-    }
-}
-
-fn format_ip_reassembly_trace(bytes: &[u8]) -> String {
-    match IpReassemblyTrace::decode(bytes) {
-        Some(trace) => format!("{trace:?}"),
-        None => format!("IpReassemblyTrace invalid={bytes:?}"),
-    }
 }
 
 #[derive(Clone)]
@@ -246,20 +185,20 @@ struct IpReassemblyMain {
 static IP_REASSEMBLY_MAIN: ArcSwapOption<IpReassemblyMain> = ArcSwapOption::const_empty();
 
 impl IpReassemblyMain {
-    fn new(worker_count: usize) -> Arc<Self> {
+    fn new(worker_count: usize, config: &ReassemblyConfig) -> Arc<Self> {
         let directory = Arc::new(IpReassemblyDirectory::new(
-            u32::try_from(DEFAULT_MAX_REASSEMBLIES).unwrap_or(u32::MAX),
+            u32::try_from(config.max_reassemblies).unwrap_or(u32::MAX),
         ));
         let mut per_thread_data = Vec::with_capacity(worker_count);
         for worker in 0..worker_count {
             per_thread_data.push(Spinlock::new(IpReassemblyWorker {
                 worker: DataWorkerId::new(worker as u32),
-                contexts: Pool::with_capacity(DEFAULT_MAX_REASSEMBLIES),
+                contexts: Pool::with_capacity(config.max_reassemblies),
                 directory: Some(Arc::clone(&directory)),
                 handoff: None,
-                timeout: DEFAULT_REASSEMBLY_TIMEOUT,
-                max_reassemblies: DEFAULT_MAX_REASSEMBLIES,
-                max_fragments_per_reassembly: DEFAULT_MAX_FRAGMENTS_PER_REASSEMBLY,
+                timeout: config.timeout,
+                max_reassemblies: config.max_reassemblies,
+                max_fragments_per_reassembly: config.max_fragments_per_reassembly,
                 last_id: 0,
             }));
         }
@@ -292,14 +231,33 @@ impl IpReassemblyMain {
     }
 }
 
+#[hammer_component_macros::config_function(
+    name = "ip_reassembly_config",
+    section = "network",
+    early = true,
+    runs_after = ["runtime_worker_config"]
+)]
+fn configure_ip_reassembly(
+    config: NetworkIpConfig,
+    engine: &mut hammer_runtime::Engine,
+) -> RuntimeResult<()> {
+    config.ip.reassembly.validate()?;
+    let main = IpReassemblyMain::new(engine.configured_worker_count(), &config.ip.reassembly);
+    IP_REASSEMBLY_MAIN.store(Some(main));
+    Ok(())
+}
+
 #[hammer_component_macros::init_function(
     name = "ip_reassembly_init",
     runs_before = ["install_packet_graph"]
 )]
-fn init_ip_reassembly(config: Arc<Config>) -> HammerResult<Arc<IpReassemblyMain>> {
-    let main = IpReassemblyMain::new(config.worker.count);
-    IP_REASSEMBLY_MAIN.store(Some(Arc::clone(&main)));
-    Ok(main)
+fn init_ip_reassembly() -> RuntimeResult<()> {
+    if IP_REASSEMBLY_MAIN.load().is_none() {
+        return Err(
+            RuntimeError::invariant("IP reassembly configuration was not installed").into(),
+        );
+    }
+    Ok(())
 }
 
 #[hammer_component_macros::graph_node(
@@ -355,7 +313,7 @@ impl IpReassemblyNode {
     }
 }
 
-fn register_ip_reassembly(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+fn register_ip_reassembly(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_internal_with_next_names(
         IpReassemblyNode::new([NodeId::new(0); IpReassemblyNext::COUNT]),
         &IpReassemblyNext::NEXT_NAMES,
@@ -365,7 +323,7 @@ fn register_ip_reassembly(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<No
 #[hammer_component_macros::process_node(name = "ip-reassembly-expire-walk")]
 async fn ip_reassembly_expire_process(
     mut context: hammer_runtime::ProcessContext,
-) -> HammerResult<()> {
+) -> RuntimeResult<()> {
     let main = context.require::<IpReassemblyMain>()?;
     loop {
         let _ = context
@@ -442,7 +400,7 @@ impl IpReassemblyWorker {
         out_len: &mut usize,
         next: IpReassemblyNext,
         index: Index,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         if *out_len == DEFAULT_BUFFER_FRAME_CAPACITY {
             runtime.enqueue_to_next(frame, &nexts[..*out_len]);
             *out_len = 0;
@@ -461,7 +419,7 @@ impl IpReassemblyWorker {
         out_frame: &mut BufferFrame,
         nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
         out_len: &mut usize,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         let current_worker = self.worker;
         let buffer = runtime.get_buffer(index)?;
         let fragment = match parse_ip_fragment_with_chain_len(
@@ -545,7 +503,7 @@ impl IpReassemblyWorker {
                 let ctx_index = self
                     .contexts
                     .insert(FragmentContext::new(key, fragment.version, now))
-                    .ok_or_else(|| CoreError::internal("reassembly pool full"))?;
+                    .ok_or_else(|| RuntimeError::invariant("reassembly pool full"))?;
                 if let Some(directory) = directory {
                     let (owner, created) =
                         directory.claim_or_lookup(key, ctx_index, current_worker);
@@ -596,7 +554,7 @@ impl IpReassemblyWorker {
             let context = self
                 .contexts
                 .get_mut(pool_index)
-                .ok_or_else(|| CoreError::internal("missing fragment context"))?;
+                .ok_or_else(|| RuntimeError::invariant("missing fragment context"))?;
             if fragment.payload_offset == 0 {
                 context.sendout_worker = Some(current_worker);
             }
@@ -757,13 +715,13 @@ impl Node for IpReassemblyNode {
     }
 
     #[inline]
-    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
         Ok(NodeRuntimeData::empty())
     }
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_ip_reassembly_trace)
+        Some(format_packet_trace!(IpReassemblyTrace))
     }
 }
 
@@ -808,12 +766,12 @@ impl FragmentContext {
         fragment: ParsedIpFragment,
         now: Instant,
         max_fragments: usize,
-    ) -> CoreResult<ReassemblyInsert> {
+    ) -> RuntimeResult<ReassemblyInsert> {
         self.updated_at = now;
         let start = fragment.payload_offset;
         let end = start
             .checked_add(fragment.payload_len)
-            .ok_or_else(|| CoreError::internal("fragment payload length overflow"))?;
+            .ok_or_else(|| RuntimeError::invariant("fragment payload length overflow"))?;
         if start == end {
             return Ok(ReassemblyInsert::Drop(index));
         }
@@ -882,7 +840,7 @@ impl FragmentContext {
         &mut self,
         runtime: &DataPlaneRuntime,
         total_payload_len: usize,
-    ) -> CoreResult<ReassemblyInsert> {
+    ) -> RuntimeResult<ReassemblyInsert> {
         match self.version {
             IpVersion::V4 => self.assemble_ipv4_chain(runtime, total_payload_len),
             IpVersion::V6 => self.assemble_ipv6_chain(runtime, total_payload_len),
@@ -894,20 +852,20 @@ impl FragmentContext {
         &mut self,
         runtime: &DataPlaneRuntime,
         total_payload_len: usize,
-    ) -> CoreResult<ReassemblyInsert> {
+    ) -> RuntimeResult<ReassemblyInsert> {
         let first_offset = self.first_fragment_offset()?;
         let first = self.fragments[first_offset];
         let header_len = first.header_len;
         if header_len < IPV4_HEADER_MIN_LEN
             || runtime.get_buffer(first.index)?.current_len() < header_len
         {
-            return Err(CoreError::internal("invalid IPv4 fragment header"));
+            return Err(RuntimeError::invariant("invalid IPv4 fragment header"));
         }
         let total_len = header_len
             .checked_add(total_payload_len)
-            .ok_or_else(|| CoreError::internal("IPv4 reassembled length overflow"))?;
+            .ok_or_else(|| RuntimeError::invariant("IPv4 reassembled length overflow"))?;
         if total_len > u16::MAX as usize {
-            return Err(CoreError::internal("IPv4 reassembled packet too large"));
+            return Err(RuntimeError::invariant("IPv4 reassembled packet too large"));
         }
 
         let complete = first.index;
@@ -926,7 +884,7 @@ impl FragmentContext {
             let mut buffer = runtime.get_buffer_mut(complete)?;
             let header = buffer.current();
             if header.len() < header_len {
-                return Err(CoreError::internal("invalid IPv4 reassembled header"));
+                return Err(RuntimeError::invariant("invalid IPv4 reassembled header"));
             }
             let header = &mut buffer.current_mut()[..header_len];
             header[IPV4_TOTAL_LENGTH_OFFSET..IPV4_TOTAL_LENGTH_OFFSET + 2]
@@ -943,17 +901,17 @@ impl FragmentContext {
         &mut self,
         runtime: &DataPlaneRuntime,
         total_payload_len: usize,
-    ) -> CoreResult<ReassemblyInsert> {
+    ) -> RuntimeResult<ReassemblyInsert> {
         let first_offset = self.first_fragment_offset()?;
         let first = self.fragments[first_offset];
         if runtime.get_buffer(first.index)?.current_len()
             < IPV6_HEADER_LEN + IPV6_FRAGMENT_HEADER_LEN
         {
-            return Err(CoreError::internal("invalid IPv6 fragment header"));
+            return Err(RuntimeError::invariant("invalid IPv6 fragment header"));
         }
         let payload_len = total_payload_len;
         if payload_len > u16::MAX as usize {
-            return Err(CoreError::internal("IPv6 reassembled packet too large"));
+            return Err(RuntimeError::invariant("IPv6 reassembled packet too large"));
         }
         let complete = first.index;
         let fragment_next_header = {
@@ -992,15 +950,15 @@ impl FragmentContext {
     }
 
     #[inline]
-    fn first_fragment_offset(&self) -> CoreResult<usize> {
+    fn first_fragment_offset(&self) -> RuntimeResult<usize> {
         self.fragments
             .iter()
             .position(|fragment| fragment.start == 0)
-            .ok_or_else(|| CoreError::internal("missing first IP fragment"))
+            .ok_or_else(|| RuntimeError::invariant("missing first IP fragment"))
     }
 
     #[inline]
-    fn drop_fragments(self, runtime: &DataPlaneRuntime) -> CoreResult<()> {
+    fn drop_fragments(self, runtime: &DataPlaneRuntime) -> RuntimeResult<()> {
         let mut owner = runtime.buffers().get_next_frame(NodeId::new(0))?;
         for fragment in self.fragments {
             if owner.push_index(fragment.index).is_err() {
@@ -1028,7 +986,7 @@ enum ReassemblyInsert {
 }
 
 #[inline(always)]
-fn refresh_metadata(runtime: &DataPlaneRuntime, index: Index) -> CoreResult<()> {
+fn refresh_metadata(runtime: &DataPlaneRuntime, index: Index) -> RuntimeResult<()> {
     let buffer = runtime.get_buffer(index)?;
     let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
     let parsed = ip_header(buffer.current(), network.packet_cursor())?;
@@ -1037,12 +995,12 @@ fn refresh_metadata(runtime: &DataPlaneRuntime, index: Index) -> CoreResult<()> 
         Some(_) => Ok(()),
         None => {
             let IpProtocol::Other(protocol) = parsed.protocol else {
-                return Err(CoreError::internal(format!(
+                return Err(RuntimeError::invariant(format!(
                     "unsupported reassembled transport protocol: {:?}",
                     parsed.protocol
                 )));
             };
-            Err(CoreError::internal(format!(
+            Err(RuntimeError::invariant(format!(
                 "unsupported reassembled transport protocol: {protocol}"
             )))
         }
@@ -1053,11 +1011,11 @@ fn refresh_metadata(runtime: &DataPlaneRuntime, index: Index) -> CoreResult<()> 
 fn trim_fragment_payload_chain(
     runtime: &DataPlaneRuntime,
     fragment: ReassemblyFragment,
-) -> CoreResult<()> {
+) -> RuntimeResult<()> {
     let payload_len = fragment.end - fragment.start;
     let mut buffer = runtime.get_buffer_mut(fragment.index)?;
     buffer.advance(fragment.header_len as isize)?;
-    buffer.truncate(payload_len)
+    Ok(buffer.truncate(payload_len)?)
 }
 
 #[inline(always)]

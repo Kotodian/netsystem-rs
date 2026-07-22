@@ -2,13 +2,10 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 
 use hammer_core::data_plane::{Buffer, BufferFrame, Index, NodeId, NodeRegistration};
-use hammer_core::error::{CoreError, CoreResult};
+use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
 use hammer_runtime::{
-    DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, PacketTrace, TraceFormatter,
-    add_packet_trace,
+    DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, add_packet_trace,
 };
-
-use crate::trace::codec::put_usize;
 
 pub use crate::feature_arc::{
     Feature, FeatureArc, FeatureArcControl, FeatureArcSpec, FeatureArcStart, FeatureArcStartHandle,
@@ -20,7 +17,7 @@ pub fn set_buffer_node_error_code(
     runtime: &DataPlaneRuntime,
     buffer: &mut Buffer,
     code: u16,
-) -> CoreResult<()> {
+) -> RuntimeResult<()> {
     let error = runtime.record_current_node_error(code)?;
     buffer.set_node_error(hammer_core::data_plane::BufferNodeError::new(
         NodeId::new(0),
@@ -34,7 +31,7 @@ pub fn set_index_node_error_code(
     runtime: &DataPlaneRuntime,
     index: Index,
     code: u16,
-) -> CoreResult<()> {
+) -> RuntimeResult<()> {
     let error = runtime.record_current_node_error(code)?;
     let mut buffer = runtime.get_buffer_mut(index)?;
     buffer.set_node_error(hammer_core::data_plane::BufferNodeError::new(
@@ -76,46 +73,19 @@ impl HandoffNode {
     }
 }
 
-pub fn register_drop(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+pub fn register_drop(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_internal(DropNode)
 }
 
-pub fn register_handoff(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+pub fn register_handoff(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
     runtime
         .nodes()
         .register_internal_with_handle(runtime.handoff_node_handle()?, HandoffNode)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct DropTrace {
     pub dropped: usize,
-}
-
-impl DropTrace {
-    pub const ENCODED_LEN: usize = 8;
-
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != Self::ENCODED_LEN {
-            return None;
-        }
-        Some(Self {
-            dropped: usize::try_from(u64::from_le_bytes(bytes.try_into().ok()?)).ok()?,
-        })
-    }
-}
-
-impl PacketTrace for DropTrace {
-    #[inline]
-    fn encode_trace(&self, out: &mut Vec<u8>) {
-        put_usize(out, self.dropped);
-    }
-}
-
-fn format_drop_trace(bytes: &[u8]) -> String {
-    match DropTrace::decode(bytes) {
-        Some(trace) => format!("{trace:?}"),
-        None => format!("DropTrace invalid={bytes:?}"),
-    }
 }
 
 impl Node for DropNode {
@@ -127,11 +97,6 @@ impl Node for DropNode {
     #[inline]
     fn node_process(&self) -> NodeProcessFn {
         drop_node_process
-    }
-
-    #[inline]
-    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_drop_trace)
     }
 }
 
@@ -259,11 +224,11 @@ mod tests {
     fn drop_node_releases_owned_buffers_when_owner_drops_after_processing() {
         let runtime =
             hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
-                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
+                buffers: hammer_runtime::DataPlaneBufferConfig {
                     buffer_slot_capacity: 64,
                     buffer_slots: 4,
                     frame_slots: 4,
-                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
+                    ..hammer_runtime::DataPlaneBufferConfig::default()
                 },
             });
         let drop_node = runtime.nodes().register_internal(DropNode::new());
@@ -296,11 +261,11 @@ mod tests {
     fn handoff_node_routes_packet_to_metadata_selected_next() {
         let runtime =
             hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
-                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
+                buffers: hammer_runtime::DataPlaneBufferConfig {
                     buffer_slot_capacity: 64,
                     buffer_slots: 4,
                     frame_slots: 4,
-                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
+                    ..hammer_runtime::DataPlaneBufferConfig::default()
                 },
             });
         let sink = runtime.nodes().register_internal(DropNode::new());

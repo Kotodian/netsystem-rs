@@ -3,12 +3,12 @@
 use std::sync::Mutex;
 
 use hammer_core::data_plane::{
-    BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, DataPlaneBufferConfig, Frame, Index, Next, NodeId,
+    BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Frame, Index, Next, NodeId,
     NodeKind, NodeRegistration,
 };
-use hammer_core::error::CoreResult;
+use hammer_runtime::RuntimeResult;
 use hammer_runtime::node::{NodeDescriptor, NodeProcessFn, NodeResult, NodeRuntimeData};
-use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig};
+use hammer_runtime::{DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig};
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 static SINK: [Mutex<Vec<Index>>; 4] = [
@@ -65,7 +65,7 @@ fn register_sink(
     runtime: &DataPlaneRuntime,
     name: &'static str,
     slot: usize,
-) -> CoreResult<NodeId> {
+) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_descriptor(
         NodeKind::Internal,
         NodeDescriptor::new(
@@ -78,7 +78,7 @@ fn register_sink(
     )
 }
 
-fn register_owner(runtime: &DataPlaneRuntime, nexts: &[NodeId]) -> CoreResult<NodeId> {
+fn register_owner(runtime: &DataPlaneRuntime, nexts: &[NodeId]) -> RuntimeResult<NodeId> {
     fn noop(_: &DataPlaneRuntime, _: NodeRuntimeData, _: &mut BufferFrame) -> NodeResult {
         NodeResult::drop()
     }
@@ -115,7 +115,7 @@ fn build_frame(
     runtime: &DataPlaneRuntime,
     owner: NodeId,
     count: usize,
-) -> CoreResult<(Frame<Next>, Vec<Index>)> {
+) -> RuntimeResult<(Frame<Next>, Vec<Index>)> {
     let mut indices = Vec::with_capacity(count);
     let mut frame = runtime.buffers().get_next_frame(owner)?;
     for offset in 0..count {
@@ -127,7 +127,7 @@ fn build_frame(
 }
 
 #[test]
-fn fanout_256_single_next_delivers_stable_order() -> CoreResult<()> {
+fn fanout_256_single_next_delivers_stable_order() -> RuntimeResult<()> {
     let _guard = TEST_LOCK.lock().expect("lock");
     clear_sinks();
     let runtime = test_runtime(64, DEFAULT_BUFFER_FRAME_CAPACITY + 64);
@@ -145,7 +145,7 @@ fn fanout_256_single_next_delivers_stable_order() -> CoreResult<()> {
 }
 
 #[test]
-fn fanout_256_alternating_two_next_keeps_per_next_order() -> CoreResult<()> {
+fn fanout_256_alternating_two_next_keeps_per_next_order() -> RuntimeResult<()> {
     let _guard = TEST_LOCK.lock().expect("lock");
     clear_sinks();
     let runtime = test_runtime(64, DEFAULT_BUFFER_FRAME_CAPACITY + 64);
@@ -168,7 +168,7 @@ fn fanout_256_alternating_two_next_keeps_per_next_order() -> CoreResult<()> {
 }
 
 #[test]
-fn fanout_256_multi_next_keeps_per_next_order() -> CoreResult<()> {
+fn fanout_256_multi_next_keeps_per_next_order() -> RuntimeResult<()> {
     let _guard = TEST_LOCK.lock().expect("lock");
     clear_sinks();
     let runtime = test_runtime(64, DEFAULT_BUFFER_FRAME_CAPACITY + 64);

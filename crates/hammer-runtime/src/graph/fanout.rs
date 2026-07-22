@@ -179,14 +179,15 @@ mod tests {
     use std::sync::Mutex;
 
     use hammer_core::data_plane::{
-        DEFAULT_BUFFER_FRAME_CAPACITY, DataPlaneBufferConfig, Index, NodeId, NodeKind, NodeNext,
+        DEFAULT_BUFFER_FRAME_CAPACITY, Index, NodeId, NodeKind, NodeNext,
         NodeRegistration,
     };
-    use hammer_core::error::CoreResult;
+    use hammer_runtime::RuntimeResult;
 
     use super::*;
     use crate::{
-        DataPlaneRuntimeConfig, NodeDescriptor, NodeProcessFn, NodeResult, NodeRuntimeData,
+        DataPlaneBufferConfig, DataPlaneRuntimeConfig, NodeDescriptor, NodeProcessFn,
+        NodeResult, NodeRuntimeData,
     };
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -222,7 +223,7 @@ mod tests {
         runtime: &DataPlaneRuntime,
         name: &'static str,
         process: NodeProcessFn,
-    ) -> CoreResult<NodeId> {
+    ) -> RuntimeResult<NodeId> {
         runtime.nodes().try_register_descriptor(
             NodeKind::Internal,
             NodeDescriptor::new(
@@ -235,7 +236,7 @@ mod tests {
         )
     }
 
-    fn register_plain(runtime: &DataPlaneRuntime, process: NodeProcessFn) -> CoreResult<NodeId> {
+    fn register_plain(runtime: &DataPlaneRuntime, process: NodeProcessFn) -> RuntimeResult<NodeId> {
         runtime.nodes().try_register_descriptor(
             NodeKind::Internal,
             NodeDescriptor::new(
@@ -248,7 +249,7 @@ mod tests {
         )
     }
 
-    fn register_owner(runtime: &DataPlaneRuntime, nexts: &[NodeId]) -> CoreResult<NodeId> {
+    fn register_owner(runtime: &DataPlaneRuntime, nexts: &[NodeId]) -> RuntimeResult<NodeId> {
         runtime.nodes().try_register_descriptor(
             NodeKind::Internal,
             NodeDescriptor::new(
@@ -285,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn single_next_in_order() -> CoreResult<()> {
+    fn single_next_in_order() -> RuntimeResult<()> {
         let _guard = TEST_LOCK.lock().expect("test lock");
         clear_sinks();
         let runtime = test_runtime(8, 8);
@@ -309,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_is_noop() -> CoreResult<()> {
+    fn empty_is_noop() -> RuntimeResult<()> {
         let _guard = TEST_LOCK.lock().expect("test lock");
         clear_sinks();
         let runtime = test_runtime(4, 4);
@@ -326,7 +327,7 @@ mod tests {
     }
 
     #[test]
-    fn alternating_stable_per_next() -> CoreResult<()> {
+    fn alternating_stable_per_next() -> RuntimeResult<()> {
         let _guard = TEST_LOCK.lock().expect("test lock");
         clear_sinks();
         let runtime = test_runtime(8, 8);
@@ -358,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn append_then_rotate() -> CoreResult<()> {
+    fn append_then_rotate() -> RuntimeResult<()> {
         let _guard = TEST_LOCK.lock().expect("test lock");
         clear_sinks();
         let runtime = test_runtime(8, DEFAULT_BUFFER_FRAME_CAPACITY + 8);
@@ -395,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn sparse_local_slots() -> CoreResult<()> {
+    fn sparse_local_slots() -> RuntimeResult<()> {
         let _guard = TEST_LOCK.lock().expect("test lock");
         clear_sinks();
         let runtime = test_runtime(8, 8);
@@ -424,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_node_next() -> CoreResult<()> {
+    fn typed_node_next() -> RuntimeResult<()> {
         #[derive(Clone, Copy, PartialEq, Eq)]
         enum Arc {
             B = 1,
@@ -458,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn drop_is_ordinary_local_next() -> CoreResult<()> {
+    fn drop_is_ordinary_local_next() -> RuntimeResult<()> {
         let _guard = TEST_LOCK.lock().expect("test lock");
         clear_sinks();
         let runtime = test_runtime(8, 8);
@@ -481,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn full_frame_single_next() -> CoreResult<()> {
+    fn full_frame_single_next() -> RuntimeResult<()> {
         let _guard = TEST_LOCK.lock().expect("test lock");
         clear_sinks();
         let runtime = test_runtime(8, DEFAULT_BUFFER_FRAME_CAPACITY + 4);
@@ -508,7 +509,7 @@ mod tests {
     }
 
     #[test]
-    fn local_slot_above_old_sixteen_limit() -> CoreResult<()> {
+    fn local_slot_above_old_sixteen_limit() -> RuntimeResult<()> {
         let _guard = TEST_LOCK.lock().expect("test lock");
         clear_sinks();
         let runtime = test_runtime(8, 32);

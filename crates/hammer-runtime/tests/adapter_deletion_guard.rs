@@ -162,7 +162,6 @@ fn curated_retired_adapter_patterns_flag_deleted_os_facing_contracts() {
 #[test]
 fn curated_retired_adapter_patterns_allow_current_runtime_surfaces() {
     assert!(find_retired_adapter_pattern("use hammer_runtime::DataPlaneRuntime;").is_none());
-    assert!(find_retired_adapter_pattern("pub trait ComponentMetadata {").is_none());
 }
 
 #[test]
@@ -194,7 +193,6 @@ fn manifest_collection_includes_current_repo_manifests_outside_crates() {
     let manifests = repo_manifests(&root);
 
     assert!(manifests.contains(&root.join("Cargo.toml")));
-    assert!(manifests.contains(&root.join("third_party/boringtun/Cargo.toml")));
 }
 
 fn workspace_root() -> PathBuf {

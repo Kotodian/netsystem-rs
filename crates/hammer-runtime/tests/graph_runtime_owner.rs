@@ -1,9 +1,10 @@
-use hammer_core::data_plane::{BufferFrame, DataPlaneBufferConfig, NodeNext, NodeRegistration};
-use hammer_core::error::CoreResult;
+use hammer_core::data_plane::{BufferFrame, NodeNext, NodeRegistration};
+use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
-    DataPlaneRuntime, DataPlaneRuntimeConfig, DriverNode, Node, NodeDescriptor, NodeProcessFn,
-    NodeResult, NodeRuntimeData, PacketTrace, TraceControlPlane, TraceFormatter, TraceInputPolicy,
-    TracePolicy, add_packet_trace, process_frame,
+    DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, DriverNode, Node,
+    NodeDescriptor, NodeProcessFn, NodeResult, NodeRuntimeData, TraceControlPlane,
+    TraceFormatter, TraceInputPolicy, TracePolicy, add_packet_trace, format_packet_trace,
+    process_frame,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -43,7 +44,7 @@ impl Node for Driver {
     }
 
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_trace)
+        Some(format_packet_trace!(u8))
     }
 }
 
@@ -51,18 +52,6 @@ impl DriverNode for Driver {
     fn node_registration(&self) -> NodeRegistration {
         NodeRegistration::next("owner-driver", TestNext::COUNT)
     }
-}
-
-struct OwnerTrace(u8);
-
-impl PacketTrace for OwnerTrace {
-    fn encode_trace(&self, out: &mut Vec<u8>) {
-        out.push(self.0);
-    }
-}
-
-fn format_trace(bytes: &[u8]) -> String {
-    format!("owner-trace:{}", bytes.len())
 }
 
 fn driver_process(
@@ -75,7 +64,7 @@ fn driver_process(
     process_frame!(runtime, frame, |index| {
         let current = runtime.current_node().expect("driver current node");
         runtime.try_mark_trace(current, index).expect("mark trace");
-        add_packet_trace!(runtime, index, OwnerTrace(7)).expect("driver trace");
+        add_packet_trace!(runtime, index, 7u8).expect("driver trace");
         TestNext::Internal
     })
 }
@@ -88,13 +77,13 @@ fn internal_process(
     assert_eq!(data, NodeRuntimeData::empty());
     INTERNAL_CALLS.fetch_add(1, Ordering::SeqCst);
     for index in frame.pending_indices() {
-        add_packet_trace!(runtime, *index, OwnerTrace(9)).expect("internal trace");
+        add_packet_trace!(runtime, *index, 9u8).expect("internal trace");
     }
     NodeResult::drop()
 }
 
 #[test]
-fn runtime_owner_registers_dispatches_traces_and_reports_stats() -> CoreResult<()> {
+fn runtime_owner_registers_dispatches_traces_and_reports_stats() -> RuntimeResult<()> {
     DRIVER_CALLS.store(0, Ordering::SeqCst);
     INTERNAL_CALLS.store(0, Ordering::SeqCst);
 
@@ -114,7 +103,7 @@ fn runtime_owner_registers_dispatches_traces_and_reports_stats() -> CoreResult<(
             NodeRuntimeData::empty(),
             NodeRegistration::next("owner-internal", 0),
             &[],
-            Some(format_trace),
+            Some(format_packet_trace!(u8)),
         ),
     )?;
     let driver = runtime
@@ -163,7 +152,7 @@ fn runtime_owner_registers_dispatches_traces_and_reports_stats() -> CoreResult<(
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].input_node, driver);
     assert_eq!(records[0].entries.len(), 2);
-    assert_eq!(records[0].entries[0].format_payload(), "owner-trace:1");
+    assert_eq!(records[0].entries[0].format_payload(), "u8 0x07");
 
     Ok(())
 }

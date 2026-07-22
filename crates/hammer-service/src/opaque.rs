@@ -1,8 +1,6 @@
 use core::mem::{align_of, size_of, transmute};
 
 use hammer_core::data_plane::{BufferPacketCursor, PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES};
-use hammer_core::forwarding::DpoType;
-pub use hammer_core::protocol::ip_ecn::IpEcnCodepoint;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TapEthernetMetadata {
@@ -31,17 +29,6 @@ impl TapEthernetMetadata {
         header[12..14].copy_from_slice(&self.ethertype.to_be_bytes());
         header
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ForwardingMetadata {
-    pub fib_index: u32,
-    pub route_dpo_type: DpoType,
-    pub route_dpo_index: u32,
-    pub load_balance_index: u32,
-    pub bucket_index: u16,
-    pub dpo_type: DpoType,
-    pub dpo_index: u32,
 }
 
 #[derive(Clone, Copy, Default)]

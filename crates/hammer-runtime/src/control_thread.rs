@@ -7,9 +7,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use hammer_core::error::{HammerError, HammerResult};
+use crate::error::{RuntimeError, RuntimeResult};
+use crate::log::Level;
 #[cfg(test)]
-use hammer_core::metrics::{MetricKind, MetricSample};
+use crate::metrics::{MetricKind, MetricSample};
 
 pub use self::timer::ControlTimerHandle;
 use self::timer::{ControlTimerId, ControlTimerRegistration, TimerRegistry};
@@ -62,7 +63,7 @@ impl ControlThreadHandle {
         &self,
         delay: Duration,
         callback: F,
-    ) -> HammerResult<ControlTimerHandle>
+    ) -> RuntimeResult<ControlTimerHandle>
     where
         F: FnMut() -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
@@ -79,13 +80,13 @@ impl ControlThreadHandle {
         initial_delay: Duration,
         interval: Duration,
         callback: F,
-    ) -> HammerResult<ControlTimerHandle>
+    ) -> RuntimeResult<ControlTimerHandle>
     where
         F: FnMut() -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
         if interval.is_zero() {
-            return Err(HammerError::internal(
+            return Err(RuntimeError::invariant(
                 "control timer interval must be non-zero",
             ));
         }
@@ -107,25 +108,25 @@ impl ControlThreadHandle {
     fn schedule_timer(
         &self,
         registration: ControlTimerRegistration,
-    ) -> HammerResult<ControlTimerHandle> {
+    ) -> RuntimeResult<ControlTimerHandle> {
         if self.closed.load(Ordering::Relaxed) {
-            return Err(HammerError::service_closed());
+            return Err(RuntimeError::service_closed());
         }
         let id = registration.id();
         self.command_tx
             .send(ControlCommand::RegisterTimer(registration))
-            .map_err(|_| HammerError::internal("control thread stopped"))?;
+            .map_err(|_| RuntimeError::invariant("control thread stopped"))?;
         Ok(ControlTimerHandle::new(id, self.command_tx.clone()))
     }
 
-    pub fn call<R>(&self, f: impl FnOnce() -> R + Send + 'static) -> HammerResult<R>
+    pub fn call<R>(&self, f: impl FnOnce() -> R + Send + 'static) -> RuntimeResult<R>
     where
         R: Send + 'static,
     {
         self.call_with_timeout(DEFAULT_CONTROL_CALL_TIMEOUT, f)
     }
 
-    pub fn call_blocking<R>(&self, f: impl FnOnce() -> R + Send + 'static) -> HammerResult<R>
+    pub fn call_blocking<R>(&self, f: impl FnOnce() -> R + Send + 'static) -> RuntimeResult<R>
     where
         R: Send + 'static,
     {
@@ -136,50 +137,50 @@ impl ControlThreadHandle {
         &self,
         f: impl FnOnce() -> R + Send + 'static,
         _with_timeout: bool,
-    ) -> HammerResult<R>
+    ) -> RuntimeResult<R>
     where
         R: Send + 'static,
     {
-        let (done_tx, done_rx) = mpsc::channel::<HammerResult<R>>();
+        let (done_tx, done_rx) = mpsc::channel::<RuntimeResult<R>>();
         self.command_tx
             .send(ControlCommand::Call(Box::new(move || {
                 let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
                     Ok(value) => Ok(value),
-                    Err(_) => Err(HammerError::internal("control closure panicked")),
+                    Err(_) => Err(RuntimeError::invariant("control closure panicked")),
                 };
                 let _ = done_tx.send(outcome);
             })))
-            .map_err(|_| HammerError::internal("control thread stopped"))?;
+            .map_err(|_| RuntimeError::invariant("control thread stopped"))?;
         done_rx
             .recv()
-            .map_err(|_| HammerError::internal("control command canceled"))?
+            .map_err(|_| RuntimeError::invariant("control command canceled"))?
     }
 
     pub fn call_with_timeout<R>(
         &self,
         timeout: Duration,
         f: impl FnOnce() -> R + Send + 'static,
-    ) -> HammerResult<R>
+    ) -> RuntimeResult<R>
     where
         R: Send + 'static,
     {
-        let (done_tx, done_rx) = mpsc::channel::<HammerResult<R>>();
+        let (done_tx, done_rx) = mpsc::channel::<RuntimeResult<R>>();
         self.command_tx
             .send(ControlCommand::Call(Box::new(move || {
                 let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
                     Ok(value) => Ok(value),
-                    Err(_) => Err(HammerError::internal("control closure panicked")),
+                    Err(_) => Err(RuntimeError::invariant("control closure panicked")),
                 };
                 let _ = done_tx.send(outcome);
             })))
-            .map_err(|_| HammerError::internal("control thread stopped"))?;
+            .map_err(|_| RuntimeError::invariant("control thread stopped"))?;
         match done_rx.recv_timeout(timeout) {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                Err(HammerError::internal("control command timed out"))
+                Err(RuntimeError::invariant("control command timed out"))
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                Err(HammerError::internal("control command canceled"))
+                Err(RuntimeError::invariant("control command canceled"))
             }
         }
     }
@@ -187,12 +188,12 @@ impl ControlThreadHandle {
     pub fn call_async<R>(
         &self,
         timeout: Duration,
-        f: impl FnOnce(mpsc::Sender<HammerResult<R>>) -> HammerResult<()> + Send + 'static,
-    ) -> HammerResult<R>
+        f: impl FnOnce(mpsc::Sender<RuntimeResult<R>>) -> RuntimeResult<()> + Send + 'static,
+    ) -> RuntimeResult<R>
     where
         R: Send + 'static,
     {
-        let (done_tx, done_rx) = mpsc::channel::<HammerResult<R>>();
+        let (done_tx, done_rx) = mpsc::channel::<RuntimeResult<R>>();
         let dispatch_done_tx = done_tx.clone();
         self.command_tx
             .send(ControlCommand::AsyncCall(Box::new(move || {
@@ -205,19 +206,20 @@ impl ControlThreadHandle {
                         let _ = done_tx.send(Err(err));
                     }
                     Err(_) => {
-                        let _ = done_tx
-                            .send(Err(HammerError::internal("control async closure panicked")));
+                        let _ = done_tx.send(Err(RuntimeError::invariant(
+                            "control async closure panicked",
+                        )));
                     }
                 }
             })))
-            .map_err(|_| HammerError::internal("control thread stopped"))?;
+            .map_err(|_| RuntimeError::invariant("control thread stopped"))?;
         match done_rx.recv_timeout(timeout) {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                Err(HammerError::internal("control async command timed out"))
+                Err(RuntimeError::invariant("control async command timed out"))
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                Err(HammerError::internal("control async command canceled"))
+                Err(RuntimeError::invariant("control async command canceled"))
             }
         }
     }
@@ -233,14 +235,14 @@ impl ControlThreadHandle {
     pub fn control_call_with_barrier<R>(
         &self,
         f: impl FnOnce() -> R + Send + 'static,
-    ) -> HammerResult<R>
+    ) -> RuntimeResult<R>
     where
         R: Send + 'static,
     {
         let (wait, workers, n_workers) = {
             let guard = self.barrier_state.lock().expect("barrier_state lock");
             let s = guard.as_ref().ok_or_else(|| {
-                HammerError::internal("control_call_with_barrier: barrier not configured")
+                RuntimeError::invariant("control_call_with_barrier: barrier not configured")
             })?;
             (Arc::clone(&s.wait), Arc::clone(&s.workers), s.n_workers)
         };
@@ -260,9 +262,10 @@ pub struct ControlThread {
 
 impl ControlThread {
     pub fn new(
-        _base_time: std::time::Instant,
-        _min_level: hammer_core::log::Level,
+        base_time: std::time::Instant,
+        min_level: Level,
     ) -> (Arc<ControlThreadHandle>, Self) {
+        let _ = (base_time, min_level);
         let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = ControlThreadHandle::new(command_tx.clone());
         let thread = Self {
@@ -594,7 +597,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hammer_core::metrics::MetricLabel;
+    use crate::metrics::MetricLabel;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
@@ -611,8 +614,7 @@ mod tests {
 
     #[test]
     fn control_handle_shutdown_completes() {
-        let (control_handle, thread) =
-            ControlThread::new(std::time::Instant::now(), hammer_core::log::Level::Info);
+        let (control_handle, thread) = ControlThread::new(std::time::Instant::now(), Level::Info);
         let handle = run_control_thread(thread);
         assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
         handle.join().expect("control thread join");
@@ -620,14 +622,13 @@ mod tests {
 
     #[test]
     fn control_thread_survives_panicking_call() {
-        let (control_handle, thread) =
-            ControlThread::new(std::time::Instant::now(), hammer_core::log::Level::Info);
+        let (control_handle, thread) = ControlThread::new(std::time::Instant::now(), Level::Info);
         let handle = run_control_thread(thread);
 
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
 
-        let panicked: HammerResult<()> =
+        let panicked: RuntimeResult<()> =
             control_handle.call_with_timeout(Duration::from_secs(1), || panic!("boom"));
         assert!(panicked.is_err(), "panicking closure should surface error");
         assert!(
@@ -635,7 +636,7 @@ mod tests {
             "control thread must survive panic"
         );
 
-        let ok: HammerResult<()> = control_handle.call_with_timeout(Duration::from_secs(1), || {});
+        let ok: RuntimeResult<()> = control_handle.call_with_timeout(Duration::from_secs(1), || {});
         assert!(
             ok.is_ok(),
             "control thread must still service calls after panic"
@@ -649,8 +650,7 @@ mod tests {
     #[test]
     fn control_timer_fires_once() {
         use std::sync::atomic::AtomicBool;
-        let (control_handle, thread) =
-            ControlThread::new(std::time::Instant::now(), hammer_core::log::Level::Info);
+        let (control_handle, thread) = ControlThread::new(std::time::Instant::now(), Level::Info);
         let handle = run_control_thread(thread);
 
         let fired = Arc::new(AtomicBool::new(false));

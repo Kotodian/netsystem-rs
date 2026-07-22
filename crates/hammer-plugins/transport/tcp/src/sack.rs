@@ -1,4 +1,4 @@
-use hammer_core::protocol::tcp::{TcpSackBlock, TcpSegmentFlags, TcpSeq};
+use crate::{TcpSackBlock, TcpSegmentFlags, TcpSeq};
 use hammer_infra::rbtree::RbTree;
 
 const TCP_MAX_SACK_BLOCKS: usize = 255;

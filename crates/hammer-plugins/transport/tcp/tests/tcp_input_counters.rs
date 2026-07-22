@@ -1,13 +1,13 @@
-use hammer_core::data_plane::DataPlaneBufferConfig;
-use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::protocol::tcp::TcpSegmentFlags;
+use hammer_plugin_tcp::TcpSegmentFlags;
 use hammer_plugin_tcp::{
     TcpNodeError, TcpOutputError,
     output::{TcpOutputNext, TcpOutputNode},
 };
 use hammer_runtime::{
-    DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node, NodeResult, NodeRuntimeData,
+    DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node,
+    NodeResult, NodeRuntimeData,
 };
+use hammer_runtime::{RuntimeError, RuntimeResult};
 use std::sync::{Arc, Mutex, OnceLock};
 
 fn test_runtime_configured(
@@ -41,7 +41,7 @@ impl Node for BlackholeNode {
          _: hammer_runtime::NodeRuntimeData,
          _: &mut hammer_core::data_plane::BufferFrame| NodeResult::drop()
     }
-    fn node_runtime_data(&self) -> CoreResult<hammer_runtime::NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<hammer_runtime::NodeRuntimeData> {
         Ok(NodeRuntimeData::default())
     }
 }

@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
+use crate::error::RuntimeResult;
 use crossbeam_queue::ArrayQueue;
 use hammer_core::data_plane::{BufferPoolArena, Index, NodeHandle};
-use hammer_core::error::{CoreResult, DataPlaneError};
+use hammer_core::error::DataPlaneError;
 
 pub(crate) const HANDOFF_SLOT_CAPACITY: usize = 32;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 pub struct DataWorkerId(u32);
 
 impl DataWorkerId {
@@ -195,7 +196,7 @@ impl DataPlaneHandoffWorker {
         &self,
         worker: DataWorkerId,
         slots: usize,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         let queue = self
             .inner
             .queues
@@ -236,8 +237,8 @@ impl DataPlaneHandoffWorker {
 
 #[cfg(test)]
 mod tests {
-    use crate::{DataPlaneRuntime, DataPlaneRuntimeConfig};
-    use hammer_core::data_plane::{DataPlaneBufferConfig, NodeId};
+    use crate::{DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig};
+    use hammer_core::data_plane::{NodeId};
 
     use super::*;
 

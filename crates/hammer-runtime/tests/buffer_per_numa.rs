@@ -1,9 +1,7 @@
-use hammer_core::data_plane::{
-    BufferPool, BufferPoolArena, DataPlaneBufferConfig, DataPlaneBuffers, NodeId,
-};
+use hammer_core::data_plane::{BufferPool, BufferPoolArena, NodeId};
 use hammer_runtime::{
-    DataPlaneHandoff, DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig,
-    DataWorkerId,
+    DataPlaneBufferConfig, DataPlaneHandoff, DataPlaneInstructionSet, DataPlaneRuntime,
+    DataPlaneRuntimeConfig, DataWorkerId,
 };
 
 fn runtime_config(
@@ -104,9 +102,15 @@ fn arenas_keep_their_arena_numa_identity() {
 }
 
 #[test]
-fn empty_numa_configuration_defaults_to_numa_zero() {
-    let runtime = runtime_with_numa(1024, 16, &[]);
-    let index = runtime.alloc_index().expect("fallback alloc");
+fn default_numa_configuration_uses_numa_zero() {
+    let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig {
+        buffers: DataPlaneBufferConfig {
+            buffer_slot_capacity: 1024,
+            buffer_slots: 16,
+            ..Default::default()
+        },
+    });
+    let index = runtime.alloc_index().expect("default alloc");
 
     assert_eq!(runtime.active_numa_node(), 0);
     assert_eq!(runtime.buffers().active_numa_node(), 0);
@@ -132,7 +136,9 @@ fn config_constructor_resolves_active_numa_to_configured_node() {
         active_numa_node: 0,
         ..DataPlaneBufferConfig::default()
     };
-    let buffers = DataPlaneBuffers::new(config);
+    let buffers = DataPlaneRuntime::new(DataPlaneRuntimeConfig { buffers: config })
+        .buffers()
+        .clone();
     let runtime = runtime_with_numa(1024, 16, &[3]);
 
     assert_eq!(buffers.active_numa_node(), 3);

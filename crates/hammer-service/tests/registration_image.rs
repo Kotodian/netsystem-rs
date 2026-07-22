@@ -1,10 +1,6 @@
-use std::sync::Arc;
-
-use hammer_core::config::Config;
-use hammer_core::data_plane::DataPlaneBufferConfig;
-use hammer_core::registry::RuntimeRegistry;
+use hammer_runtime::RuntimeRegistry;
 use hammer_runtime::graph::install_packet_graph;
-use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, Engine};
+use hammer_runtime::{DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, Engine};
 
 #[test]
 fn service_builtin_image_installs_through_runtime_authority() {
@@ -22,7 +18,7 @@ fn service_builtin_image_installs_through_runtime_authority() {
     // The service graph references protocol-plugin nodes, so resolving all
     // named next arcs requires those plugins. Registration and node creation
     // happen before that final resolution step.
-    _ = install_packet_graph(&mut engine, Arc::new(Config::default()));
+    _ = install_packet_graph(&mut engine);
 
     assert!(engine.runtime.node_by_name("drop").is_some());
     assert!(engine.runtime.node_by_name("device-input").is_some());

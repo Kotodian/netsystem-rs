@@ -4,12 +4,12 @@ use crate::{
 };
 use std::cell::{Cell, RefCell};
 
+use crate::{TcpConnectionId, TcpError, TcpPacket, TcpSegmentFlags, TcpSeq};
 use hammer_core::data_plane::{
     BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Index, NodeId, NodeNext,
 };
-use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::protocol::tcp::{TcpConnectionId, TcpError, TcpPacket, TcpSegmentFlags, TcpSeq};
 use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
+use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use super::connection::TcpConnection;
 use super::segment::{TcpSegment, tcp_packet};
@@ -60,11 +60,11 @@ impl TcpListenNode {
     }
 }
 
-pub fn register_tcp_listen(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+pub fn register_tcp_listen(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
     runtime
         .nodes()
         .node_by_name("tcp-listen")
-        .ok_or_else(|| CoreError::internal("TCP worker graph is not registered"))
+        .ok_or_else(|| RuntimeError::invariant("TCP worker graph is not registered"))
 }
 
 thread_local! {
@@ -75,12 +75,14 @@ thread_local! {
 fn register_tcp_listen_control(
     control_slot: &Cell<Option<usize>>,
     control: &TcpInputControlPlane,
-) -> CoreResult<usize> {
+) -> RuntimeResult<usize> {
     TCP_LISTEN_CONTROLS.with(|controls| {
         let mut controls = controls.borrow_mut();
         if let Some(slot) = control_slot.get() {
             let Some(current) = controls.get_mut(slot) else {
-                return Err(CoreError::internal("tcp listen control slot is invalid"));
+                return Err(RuntimeError::invariant(
+                    "tcp listen control slot is invalid",
+                ));
             };
             *current = control.clone();
             Ok(slot)
@@ -96,25 +98,25 @@ fn register_tcp_listen_control(
 fn tcp_listen_runtime_data(
     control_slot: &Cell<Option<usize>>,
     control: &TcpInputControlPlane,
-) -> CoreResult<NodeRuntimeData> {
+) -> RuntimeResult<NodeRuntimeData> {
     let control_slot = register_tcp_listen_control(control_slot, control)?;
     Ok(NodeRuntimeData::from_words([
         0,
         u64::try_from(control_slot)
-            .map_err(|_| CoreError::internal("tcp listen control slot overflow"))?,
+            .map_err(|_| RuntimeError::invariant("tcp listen control slot overflow"))?,
         0,
         0,
     ]))
 }
 
-fn tcp_listen_control(data: NodeRuntimeData) -> CoreResult<TcpInputControlPlane> {
+fn tcp_listen_control(data: NodeRuntimeData) -> RuntimeResult<TcpInputControlPlane> {
     let slot = data.usize_word(1)?;
     TCP_LISTEN_CONTROLS.with(|controls| {
         controls
             .borrow()
             .get(slot)
             .cloned()
-            .ok_or_else(|| CoreError::internal("tcp listen control is missing"))
+            .ok_or_else(|| RuntimeError::invariant("tcp listen control is missing"))
     })
 }
 
@@ -134,7 +136,7 @@ impl Node for TcpListenNode {
     }
 
     #[inline]
-    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
         tcp_listen_runtime_data(&self.control_slot, &self.control)
     }
 }
@@ -204,7 +206,7 @@ fn emit_local(
     out_len: &mut usize,
     next: TcpListenNext,
     index: Index,
-) -> CoreResult<()> {
+) -> RuntimeResult<()> {
     if *out_len == DEFAULT_BUFFER_FRAME_CAPACITY {
         runtime.enqueue_to_next(frame, &nexts[..*out_len]);
         *out_len = 0;
@@ -223,7 +225,7 @@ fn tcp_listen_index<C, Seg>(
     out_frame: &mut BufferFrame,
     nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
     out_len: &mut usize,
-) -> CoreResult<()>
+) -> RuntimeResult<()>
 where
     C: CongestionController + 'static,
     Seg: TcpWorkerStore<C>,
@@ -290,9 +292,9 @@ fn tcp_handle_listener_packet<C, Seg>(
     index: Index,
     state: &mut TcpWorkerState<C, Seg>,
     listener_id: u32,
-    capabilities: hammer_core::protocol::tcp::TcpCapabilities,
+    capabilities: crate::TcpCapabilities,
     packet: &TcpPacket,
-) -> CoreResult<(Option<TcpSegment>, Option<SessionId>)>
+) -> RuntimeResult<(Option<TcpSegment>, Option<SessionId>)>
 where
     C: CongestionController + 'static,
     Seg: TcpWorkerStore<C>,
@@ -319,9 +321,9 @@ fn tcp_issue_listener_challenge<C, Seg>(
     index: Index,
     state: &mut TcpWorkerState<C, Seg>,
     listener_id: u32,
-    capabilities: hammer_core::protocol::tcp::TcpCapabilities,
+    capabilities: crate::TcpCapabilities,
     packet: &TcpPacket,
-) -> CoreResult<(Option<TcpSegment>, Option<SessionId>)>
+) -> RuntimeResult<(Option<TcpSegment>, Option<SessionId>)>
 where
     C: CongestionController + 'static,
     Seg: TcpWorkerStore<C>,
@@ -396,12 +398,10 @@ where
             flags,
             syn_ack_capabilities,
             None,
-            packet
-                .timestamp
-                .map(|timestamp| hammer_core::protocol::tcp::TcpTimestampOption {
-                    tsval: timestamp.tsecr.max(1),
-                    tsecr: timestamp.tsval,
-                }),
+            packet.timestamp.map(|timestamp| crate::TcpTimestampOption {
+                tsval: timestamp.tsecr.max(1),
+                tsecr: timestamp.tsval,
+            }),
             fast_open_cookie,
             None,
             0,
@@ -415,9 +415,9 @@ fn tcp_accept_listener_fast_open<C, Seg>(
     index: Index,
     state: &mut TcpWorkerState<C, Seg>,
     listener_id: u32,
-    capabilities: hammer_core::protocol::tcp::TcpCapabilities,
+    capabilities: crate::TcpCapabilities,
     packet: &TcpPacket,
-) -> CoreResult<(Option<TcpSegment>, Option<SessionId>)>
+) -> RuntimeResult<(Option<TcpSegment>, Option<SessionId>)>
 where
     C: CongestionController + 'static,
     Seg: TcpWorkerStore<C>,
@@ -434,7 +434,7 @@ where
             packet.remote,
         )
     })?;
-    let result = (|| -> CoreResult<(Option<TcpSegment>, Option<SessionId>)> {
+    let result = (|| -> RuntimeResult<(Option<TcpSegment>, Option<SessionId>)> {
         let control = {
             let (_, connection_index) = state
                 .sessions
@@ -484,9 +484,9 @@ where
 fn tcp_complete_listener_open<C, Seg>(
     state: &mut TcpWorkerState<C, Seg>,
     listener_id: u32,
-    capabilities: hammer_core::protocol::tcp::TcpCapabilities,
+    capabilities: crate::TcpCapabilities,
     packet: &TcpPacket,
-) -> CoreResult<(Option<TcpSegment>, Option<SessionId>)>
+) -> RuntimeResult<(Option<TcpSegment>, Option<SessionId>)>
 where
     C: CongestionController + 'static,
     Seg: TcpWorkerStore<C>,
@@ -535,7 +535,7 @@ where
         connection.connect_state(cookie);
         connection
     })?;
-    let result = (|| -> CoreResult<(Option<TcpSegment>, Option<SessionId>)> {
+    let result = (|| -> RuntimeResult<(Option<TcpSegment>, Option<SessionId>)> {
         let control = {
             let (_, connection_index) = state
                 .sessions

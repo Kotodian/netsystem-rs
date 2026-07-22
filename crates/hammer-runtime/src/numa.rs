@@ -5,8 +5,7 @@
 
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
-#[cfg(target_os = "linux")]
-use hammer_core::error::HammerResult;
+use crate::error::RuntimeResult;
 
 /// Return the NUMA node index for the current CPU, when available.
 #[cfg(target_os = "linux")]
@@ -24,13 +23,13 @@ pub fn current_numa_node() -> Option<u32> {
 /// Bind the current thread's future heap allocations to `node` when supported.
 #[cfg(target_os = "linux")]
 #[inline]
-pub fn bind_current_thread_memory_to_numa(node: u32) -> HammerResult<()> {
+pub fn bind_current_thread_memory_to_numa(node: u32) -> RuntimeResult<()> {
     bind_current_thread_memory_to_numa_impl(node)
 }
 
 #[cfg(not(target_os = "linux"))]
 #[inline]
-pub fn bind_current_thread_memory_to_numa(_node: u32) -> hammer_core::error::HammerResult<()> {
+pub fn bind_current_thread_memory_to_numa(_node: u32) -> RuntimeResult<()> {
     Ok(())
 }
 
@@ -50,7 +49,7 @@ fn current_numa_node_impl() -> Option<u32> {
 }
 
 #[cfg(target_os = "linux")]
-fn bind_current_thread_memory_to_numa_impl(_node: u32) -> HammerResult<()> {
+fn bind_current_thread_memory_to_numa_impl(_node: u32) -> RuntimeResult<()> {
     Ok(())
 }
 
@@ -60,7 +59,7 @@ fn current_numa_node_impl() -> Option<u32> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn bind_current_thread_memory_to_numa_impl(_node: u32) -> hammer_core::error::HammerResult<()> {
+fn bind_current_thread_memory_to_numa_impl(_node: u32) -> RuntimeResult<()> {
     Ok(())
 }
 

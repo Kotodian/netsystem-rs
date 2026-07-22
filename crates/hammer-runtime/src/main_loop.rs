@@ -121,8 +121,8 @@ mod tests {
 
     use crate::engine::Engine;
     use crate::spawn::DataRemoteLocalQueue;
-    use hammer_core::data_plane::DataPlaneBufferConfig;
-    use hammer_core::registry::RuntimeRegistry;
+    use crate::DataPlaneBufferConfig;
+    use hammer_runtime::RuntimeRegistry;
     use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, File, FileFunctions};
 
     fn test_runtime() -> DataPlaneRuntime {

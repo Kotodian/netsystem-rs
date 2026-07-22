@@ -70,7 +70,8 @@ auto_detect_interface = true
 ```
 
 Optional protocols are enabled through Cargo features on their owning crates.
-WireGuard protocol config lives in `hammer-core` behind the `wireguard` feature.
+WireGuard and Amnezia are not currently supported; their future plugin-owned
+implementation is tracked in [#115](https://github.com/Kotodian/hammer-ios-rs/issues/115).
 
 ## Build And Test
 

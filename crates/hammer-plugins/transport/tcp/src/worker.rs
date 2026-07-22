@@ -1,12 +1,12 @@
 use std::time::{Duration, Instant};
 
-use hammer_core::error::{CoreError, CoreResult};
 #[cfg(test)]
-use hammer_core::protocol::tcp::TcpPacket;
-use hammer_core::protocol::tcp::{TcpSeq, TcpState};
+use crate::TcpPacket;
+use crate::{TcpSeq, TcpState};
 use hammer_infra::pool::{Index, Pool};
 use hammer_runtime::app::SessionSegment;
 use hammer_runtime::{DataPlaneRuntime, DataWorkerId};
+use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use super::lookup::TcpLookupState;
 use super::timers::{TcpTimerKind, TcpTimers};
@@ -50,10 +50,13 @@ where
     }
 
     #[inline]
-    pub(crate) fn insert_connection(&mut self, connection: TcpConnection<C>) -> CoreResult<Index> {
+    pub(crate) fn insert_connection(
+        &mut self,
+        connection: TcpConnection<C>,
+    ) -> RuntimeResult<Index> {
         self.connections
             .insert(connection)
-            .ok_or_else(|| CoreError::internal("TCP connection pool capacity exhausted"))
+            .ok_or_else(|| RuntimeError::invariant("TCP connection pool capacity exhausted"))
     }
 
     #[inline]
@@ -76,7 +79,7 @@ where
         &mut self,
         index: Index,
         packet: &TcpPacket,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         let Self {
             connections,
             timers,
@@ -93,7 +96,7 @@ where
         &mut self,
         sessions: &mut SessionWorker<Index, Seg>,
         index: Index,
-    ) -> CoreResult<()>
+    ) -> RuntimeResult<()>
     where
         SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
     {
@@ -121,7 +124,7 @@ where
         frame: &mut hammer_core::data_plane::BufferFrame,
         output: &mut SessionQueueOutput,
         now: Instant,
-    ) -> CoreResult<()>
+    ) -> RuntimeResult<()>
     where
         SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
     {
@@ -177,7 +180,7 @@ where
         frame: &mut hammer_core::data_plane::BufferFrame,
         output: &mut SessionQueueOutput,
         now: Instant,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         self.timers.advance(now, &mut self.connections);
         while let Some(token) = self.timers.take_pending(&mut self.connections) {
             let (session_id, segment) = {
@@ -232,7 +235,7 @@ where
         frame: &mut hammer_core::data_plane::BufferFrame,
         output: &mut SessionQueueOutput,
         now: Instant,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         {
             let connection = self
                 .connections
@@ -260,7 +263,7 @@ where
         frame: &mut hammer_core::data_plane::BufferFrame,
         output: &mut SessionQueueOutput,
         now: Instant,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         self.control_output(sessions, index, runtime, output_next, frame, output, now)
     }
 
@@ -270,7 +273,7 @@ where
         index: Index,
         pending_len: usize,
         now: Instant,
-    ) -> CoreResult<TransportSendParams> {
+    ) -> RuntimeResult<TransportSendParams> {
         let connection = self
             .connections
             .get_mut(index)
@@ -304,7 +307,7 @@ where
         index: Index,
         batch: &[TxBatchBuffer],
         now: Instant,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         let connection = self
             .connections
             .get(index)

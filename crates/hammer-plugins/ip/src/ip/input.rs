@@ -2,23 +2,20 @@ use std::mem::transmute;
 use std::sync::{Mutex, OnceLock};
 
 use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId};
-use hammer_core::error::{CoreError, CoreResult};
 use hammer_runtime::{
-    DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
-    TraceFormatter, add_packet_trace, unlikely,
+    DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, TraceFormatter,
+    add_packet_trace, format_packet_trace, unlikely,
 };
+use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use crate::ip::{
     IpInputError, IpInputTarget, IpProtocol, IpVersion, network_for_protocol, parse_ip_header,
 };
+use crate::protocol::ip_ecn::IpEcnCodepoint;
 use hammer_service::data_plane::{
     FeatureArcSpec, FeatureArcStartHandle, set_buffer_node_error_code,
 };
-use hammer_service::opaque::{IpEcnCodepoint, NetworkOpaque};
-use hammer_service::trace::codec::{
-    TraceDecodeCursor, put_option_ip_input_error, put_option_ip_input_target,
-    put_option_ip_protocol, put_option_ip_version, put_u16, put_usize,
-};
+use hammer_service::opaque::NetworkOpaque;
 
 #[hammer_component_macros::feature_arc]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -55,14 +52,14 @@ pub struct IpInputNode<A: FeatureArcSpec = IpUnicastArc> {
     runtime_data: NodeRuntimeData,
 }
 
-fn register_ip_input(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+fn register_ip_input(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_internal_with_next_names(
         IpInputNode::<IpUnicastArc>::new([NodeId::new(0); IpInputNext::COUNT]),
         &IpInputNext::NEXT_NAMES,
     )
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct IpInputTrace {
     pub version: Option<IpVersion>,
     pub protocol: Option<IpProtocol>,
@@ -70,39 +67,6 @@ pub struct IpInputTrace {
     pub input_error: Option<IpInputError>,
     pub packet_len: usize,
     pub next: u16,
-}
-
-impl IpInputTrace {
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let mut cursor = TraceDecodeCursor::new(bytes);
-        let trace = Self {
-            version: cursor.read_option_ip_version()?,
-            protocol: cursor.read_option_ip_protocol()?,
-            input_target: cursor.read_option_ip_input_target()?,
-            input_error: cursor.read_option_ip_input_error()?,
-            packet_len: cursor.read_usize()?,
-            next: cursor.read_u16()?,
-        };
-        cursor.is_empty().then_some(trace)
-    }
-}
-
-impl PacketTrace for IpInputTrace {
-    fn encode_trace(&self, out: &mut Vec<u8>) {
-        put_option_ip_version(out, self.version);
-        put_option_ip_protocol(out, self.protocol);
-        put_option_ip_input_target(out, self.input_target);
-        put_option_ip_input_error(out, self.input_error);
-        put_usize(out, self.packet_len);
-        put_u16(out, self.next);
-    }
-}
-
-fn format_ip_input_trace(bytes: &[u8]) -> String {
-    match IpInputTrace::decode(bytes) {
-        Some(trace) => format!("{trace:?}"),
-        None => format!("IpInputTrace invalid={bytes:?}"),
-    }
 }
 
 impl<A> Node for IpInputNode<A>
@@ -122,11 +86,11 @@ where
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_ip_input_trace)
+        Some(format_packet_trace!(IpInputTrace))
     }
 
     #[inline]
-    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
         let feature_arc = self.feature_arc.as_ref().map(|arc| arc.start_handle());
         sync_ip_input_runtime(self.runtime_data, feature_arc)?;
         Ok(self.runtime_data)
@@ -183,26 +147,26 @@ fn register_ip_input_runtime(feature_arc: Option<FeatureArcStartHandle>) -> Node
 fn sync_ip_input_runtime(
     data: NodeRuntimeData,
     feature_arc: Option<FeatureArcStartHandle>,
-) -> CoreResult<()> {
+) -> RuntimeResult<()> {
     let slot = data.usize_word(0)?;
     let mut runtimes = ip_input_runtimes()
         .lock()
-        .map_err(|_| CoreError::internal("IP input runtime registry poisoned"))?;
+        .map_err(|_| RuntimeError::invariant("IP input runtime registry poisoned"))?;
     let runtime = runtimes
         .get_mut(slot)
-        .ok_or_else(|| CoreError::internal("IP input runtime slot is invalid"))?;
+        .ok_or_else(|| RuntimeError::invariant("IP input runtime slot is invalid"))?;
     runtime.feature_arc = feature_arc;
     Ok(())
 }
 
-fn ip_input_runtime(data: NodeRuntimeData) -> CoreResult<IpInputRuntime> {
+fn ip_input_runtime(data: NodeRuntimeData) -> RuntimeResult<IpInputRuntime> {
     let slot = data.usize_word(0)?;
     ip_input_runtimes()
         .lock()
-        .map_err(|_| CoreError::internal("IP input runtime registry poisoned"))?
+        .map_err(|_| RuntimeError::invariant("IP input runtime registry poisoned"))?
         .get(slot)
         .cloned()
-        .ok_or_else(|| CoreError::internal("IP input runtime slot is invalid"))
+        .ok_or_else(|| RuntimeError::invariant("IP input runtime slot is invalid"))
 }
 
 fn ip_input_process<A: FeatureArcSpec>(
@@ -223,7 +187,7 @@ fn next_slot_for_index(
     runtime: &DataPlaneRuntime,
     index: Index,
     feature_arc: Option<&FeatureArcStartHandle>,
-) -> CoreResult<u16> {
+) -> RuntimeResult<u16> {
     let (trace, parsed, _) = {
         let mut buffer = runtime.get_buffer_mut(index)?;
         let traced = buffer.trace_handle().is_some();

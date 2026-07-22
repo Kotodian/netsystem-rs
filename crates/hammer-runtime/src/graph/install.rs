@@ -1,24 +1,21 @@
 //! Host installs the packet graph from the process-wide registration authority.
 //!
-//! Plugins and builtins contribute nodes through the same constructor-published
+//! Plugins and builtins contribute nodes through the same PluginMain-owned
 //! link-image inventories. This is not a service-owned graph catalog.
 
-use std::sync::Arc;
-
+use crate::error::RuntimeResult;
 use hammer_component_macros::init_function;
-use hammer_core::config::Config;
 use hammer_core::data_plane::NodeHandle;
-use hammer_core::error::HammerResult;
 
 use crate::engine::Engine;
 
-#[init_function(name = "install_packet_graph", runs_after = ["memory_init"])]
-pub fn install_packet_graph(engine: &mut Engine, config: Arc<Config>) -> HammerResult<()> {
-    let handle = NodeHandle::new(config.worker.handoff.node_handle);
+#[init_function(name = "install_packet_graph")]
+pub fn install_packet_graph(engine: &mut Engine) -> RuntimeResult<()> {
+    let handle = NodeHandle::new(engine.worker_config().handoff.node_handle);
     engine.runtime.set_handoff_node_handle(handle);
 
-    let entries = crate::registration::graph_nodes();
-    let functions = crate::registration::node_functions();
+    let entries = engine.plugin_main().graph_nodes();
+    let functions = engine.plugin_main().node_functions();
     engine
         .runtime
         .init_graph_with_node_functions(0, &entries, &functions)?;

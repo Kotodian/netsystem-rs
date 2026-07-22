@@ -1,6 +1,6 @@
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 
-use hammer_core::error::{AttachError, HammerResult};
+use crate::{AttachError, RuntimeResult};
 use hammer_infra::fifo::Fifo;
 use hammer_infra::segment::{Segment, Svm};
 
@@ -23,7 +23,7 @@ pub struct AttachedApp<S: SessionSegment> {
     pub shm_fd: RawFd,
 }
 
-fn create_pipe_flags() -> HammerResult<(OwnedFd, OwnedFd)> {
+fn create_pipe_flags() -> RuntimeResult<(OwnedFd, OwnedFd)> {
     let mut fds = [0i32; 2];
     // SAFETY: fds is writable for two descriptors. Fresh descriptors are
     // transferred into OwnedFd immediately on success.
@@ -88,7 +88,7 @@ fn send_attach_message(
     evt_q_read_fd: RawFd,
     tx_evt_q_write_fd: RawFd,
     offsets: &SessionOffsets,
-) -> HammerResult<()> {
+) -> RuntimeResult<()> {
     let fds = [shm_fd, evt_q_read_fd, tx_evt_q_write_fd];
     let offsets_bytes: [u64; 4] = [
         offsets.rx_fifo_off,
@@ -134,7 +134,7 @@ fn send_attach_message(
 
 impl AttachServer {
     /// Bind to a Unix domain socket at `path`.
-    pub fn bind(path: &str) -> HammerResult<Self> {
+    pub fn bind(path: &str) -> RuntimeResult<Self> {
         let _ = std::fs::remove_file(path);
         let listener =
             std::os::unix::net::UnixListener::bind(path).map_err(|source| AttachError::Bind {
@@ -152,7 +152,7 @@ impl AttachServer {
         config: AppSessionConfig,
         seg: &Svm,
         handle: SessionHandle,
-    ) -> HammerResult<AttachedApp<Svm>> {
+    ) -> RuntimeResult<AttachedApp<Svm>> {
         let offsets =
             SessionOffsets::allocate(seg, config.fifo_capacity as u32, config.evt_q_capacity);
 

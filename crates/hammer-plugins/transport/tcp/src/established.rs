@@ -2,8 +2,8 @@ use crate::{TcpWorkerStore, publish_tcp_connection, read_session_id, with_tcp_wo
 use hammer_core::data_plane::{
     BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Index, NodeId, NodeNext,
 };
-use hammer_core::error::{CoreError, CoreResult};
 use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
+use hammer_runtime::{RuntimeError, RuntimeResult};
 use hammer_service::session::runtime::RxDelivery;
 
 use super::TcpNodeError;
@@ -40,11 +40,11 @@ impl TcpEstablishedNode {
     }
 }
 
-pub fn register_tcp_established(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+pub fn register_tcp_established(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
     runtime
         .nodes()
         .node_by_name("tcp-established")
-        .ok_or_else(|| CoreError::internal("TCP worker graph is not registered"))
+        .ok_or_else(|| RuntimeError::invariant("TCP worker graph is not registered"))
 }
 
 impl Node for TcpEstablishedNode {
@@ -115,7 +115,7 @@ fn emit_local(
     out_len: &mut usize,
     next: TcpEstablishedNext,
     index: Index,
-) -> CoreResult<()> {
+) -> RuntimeResult<()> {
     if *out_len == DEFAULT_BUFFER_FRAME_CAPACITY {
         runtime.enqueue_to_next(frame, &nexts[..*out_len]);
         *out_len = 0;
@@ -133,7 +133,7 @@ fn tcp_established_index<C, Seg>(
     out_frame: &mut BufferFrame,
     nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
     out_len: &mut usize,
-) -> CoreResult<()>
+) -> RuntimeResult<()>
 where
     C: CongestionController + 'static,
     Seg: TcpWorkerStore<C>,
@@ -210,9 +210,7 @@ where
                 session_id,
                 index,
                 offset,
-                packet
-                    .flags
-                    .contains(hammer_core::protocol::tcp::TcpSegmentFlags::URG),
+                packet.flags.contains(crate::TcpSegmentFlags::URG),
             )?;
             let rx_available = match delivery {
                 RxDelivery::NotAccepted { rx_available }
@@ -292,9 +290,9 @@ where
             Some(connection.control_segment(
                 packet.local,
                 packet.remote,
-                hammer_core::protocol::tcp::TcpSegmentFlags::ACK,
+                crate::TcpSegmentFlags::ACK,
                 None,
-                hammer_core::protocol::tcp::TcpCapabilities::default(),
+                crate::TcpCapabilities::default(),
             ))
         } else {
             None

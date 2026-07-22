@@ -1,9 +1,6 @@
-use std::sync::Arc;
-
-use hammer_core::config::Config;
 use hammer_core::data_plane::NodeKind;
-use hammer_core::registry::RuntimeRegistry;
 use hammer_plugin_tun::TunInputDriverNode;
+use hammer_runtime::RuntimeRegistry;
 use hammer_runtime::graph::install_packet_graph;
 use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, Engine};
 use hammer_service::device::{DeviceInputNext, DeviceInputNode};
@@ -16,13 +13,13 @@ fn tun_input_matches_device_input_next_layout() {
 
 #[test]
 fn tun_graph_nodes_install_from_the_link_image() {
-    _ = hammer_plugin_tun::registration();
+    _ = hammer_plugin_tun::plugin_module();
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let mut engine = Engine::new(runtime, RuntimeRegistry::new());
 
     // The service image references protocol-plugin nodes that are not linked
     // into this focused test. Node creation precedes named-next resolution.
-    _ = install_packet_graph(&mut engine, Arc::new(Config::default()));
+    _ = install_packet_graph(&mut engine);
 
     let device_input = engine
         .runtime

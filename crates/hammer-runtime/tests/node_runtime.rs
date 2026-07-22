@@ -1,13 +1,14 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use hammer_core::data_plane::{
-    BufferFrame, DataPlaneBufferConfig, NodeHandle, NodeId, NodeKind, NodeNext, NodeRegistration,
+    BufferFrame, NodeHandle, NodeId, NodeKind, NodeNext, NodeRegistration,
     NodeState,
 };
-use hammer_core::error::CoreResult;
+use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
-    DataPlaneRuntime, DataPlaneRuntimeConfig, DriverNode, InternalNode, Node, NodeDescriptor,
-    NodeEntry, NodeProcessFn, NodeResult, NodeRuntimeData, TraceFormatter, process_frame,
+    DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, DriverNode, InternalNode,
+    Node, NodeDescriptor, NodeEntry, NodeProcessFn, NodeResult, NodeRuntimeData,
+    TraceFormatter, process_frame,
 };
 
 static NODE_CALLS_BY_WORD: [AtomicU64; 128] = [const { AtomicU64::new(0) }; 128];
@@ -34,7 +35,7 @@ fn test_runtime(
     DataPlaneRuntime::new(DataPlaneRuntimeConfig { buffers })
 }
 
-fn init_graph_owner(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+fn init_graph_owner(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_descriptor(
         NodeKind::Internal,
         NodeDescriptor::new(
@@ -47,7 +48,7 @@ fn init_graph_owner(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> 
     )
 }
 
-fn init_graph_sibling(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+fn init_graph_sibling(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_descriptor(
         NodeKind::Internal,
         NodeDescriptor::new(
@@ -186,7 +187,7 @@ impl Node for DescriptorNode {
     }
 
     #[inline]
-    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
         Ok(self.runtime_data)
     }
 

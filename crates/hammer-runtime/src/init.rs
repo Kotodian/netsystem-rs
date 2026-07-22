@@ -3,7 +3,7 @@ use petgraph::graphmap::DiGraphMap;
 use std::collections::HashSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use hammer_core::error::{CoreError, HammerResult};
+use crate::error::{RuntimeError, RuntimeResult};
 
 use crate::engine::Engine;
 
@@ -20,9 +20,9 @@ pub enum InitError {
     Cycle { cycle: String },
 }
 
-impl From<InitError> for CoreError {
+impl From<InitError> for RuntimeError {
     fn from(err: InitError) -> Self {
-        CoreError::internal(err.to_string())
+        RuntimeError::invariant(err.to_string())
     }
 }
 
@@ -36,16 +36,41 @@ pub trait Ordered {
     }
 }
 
-/// Lifecycle registration collected from constructor-published link images.
+/// Lifecycle registration collected from link images retained by PluginMain.
 #[derive(Clone, Copy)]
 pub struct InitFunction {
     pub name: &'static str,
     pub runs_before: &'static [&'static str],
     pub runs_after: &'static [&'static str],
-    pub func: fn(&mut Engine) -> HammerResult<()>,
+    pub func: fn(&mut Engine) -> RuntimeResult<()>,
 }
 
 impl Ordered for InitFunction {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    fn runs_before(&self) -> &'static [&'static str] {
+        self.runs_before
+    }
+    fn runs_after(&self) -> &'static [&'static str] {
+        self.runs_after
+    }
+}
+
+/// Serde configuration registration collected from link images.
+///
+/// Each owner receives the original startup document and deserializes its
+/// declared section through a macro-generated, owner-local serde wrapper.
+#[derive(Clone, Copy)]
+pub struct ConfigFunction {
+    pub name: &'static str,
+    pub section: &'static str,
+    pub runs_before: &'static [&'static str],
+    pub runs_after: &'static [&'static str],
+    pub func: fn(&str, &mut Engine) -> RuntimeResult<()>,
+}
+
+impl Ordered for ConfigFunction {
     fn name(&self) -> &'static str {
         self.name
     }
@@ -111,7 +136,7 @@ fn dispatch_init(
     items: Vec<InitFunction>,
     called: &mut HashSet<&'static str>,
     engine: &mut Engine,
-) -> HammerResult<()> {
+) -> RuntimeResult<()> {
     let order = topological_order(&items)?;
     for index in order {
         let function = items[index];
@@ -120,30 +145,30 @@ fn dispatch_init(
         }
         called.insert(function.name);
         catch_unwind(AssertUnwindSafe(|| (function.func)(engine))).map_err(|_| {
-            CoreError::internal(format!("init function `{}` panicked", function.name))
+            RuntimeError::invariant(format!("init function `{}` panicked", function.name))
         })??;
     }
     Ok(())
 }
 
-pub fn run_init_functions(engine: &mut Engine) -> HammerResult<()> {
-    let functions = crate::registration::init_functions();
+pub fn run_init_functions(engine: &mut Engine) -> RuntimeResult<()> {
+    let functions = engine.plugin_main().init_functions();
     let mut called = std::mem::take(&mut engine.called_init_functions);
     let result = dispatch_init(functions, &mut called, engine);
     engine.called_init_functions = called;
     result
 }
 
-pub fn run_worker_init_functions(engine: &mut Engine) -> HammerResult<()> {
-    let functions = crate::registration::worker_init_functions();
+pub fn run_worker_init_functions(engine: &mut Engine) -> RuntimeResult<()> {
+    let functions = engine.plugin_main().worker_init_functions();
     let mut called = std::mem::take(&mut engine.called_worker_init_functions);
     let result = dispatch_init(functions, &mut called, engine);
     engine.called_worker_init_functions = called;
     result
 }
 
-pub fn run_main_loop_enter(engine: &mut Engine) -> HammerResult<()> {
-    let functions = crate::registration::main_loop_enter_functions();
+pub fn run_main_loop_enter(engine: &mut Engine) -> RuntimeResult<()> {
+    let functions = engine.plugin_main().main_loop_enter_functions();
     let mut called = std::mem::take(&mut engine.called_main_loop_enter_functions);
     let result = dispatch_init(functions, &mut called, engine);
     engine.called_main_loop_enter_functions = called;
@@ -152,24 +177,44 @@ pub fn run_main_loop_enter(engine: &mut Engine) -> HammerResult<()> {
     Ok(())
 }
 
-pub fn run_main_loop_exit(engine: &mut Engine) -> HammerResult<()> {
-    let functions = crate::registration::main_loop_exit_functions();
+pub fn run_main_loop_exit(engine: &mut Engine) -> RuntimeResult<()> {
+    let functions = engine.plugin_main().main_loop_exit_functions();
     let mut called = std::mem::take(&mut engine.called_main_loop_exit_functions);
     let result = dispatch_init(functions, &mut called, engine);
     engine.called_main_loop_exit_functions = called;
     result
 }
 
-pub fn run_config_functions(engine: &mut Engine, early: bool) -> HammerResult<()> {
-    let functions = crate::registration::config_functions(early);
+fn dispatch_config(
+    items: Vec<ConfigFunction>,
+    called: &mut HashSet<&'static str>,
+    engine: &mut Engine,
+    document: &str,
+) -> RuntimeResult<()> {
+    let order = topological_order(&items)?;
+    for index in order {
+        let function = items[index];
+        if called.contains(function.name) {
+            continue;
+        }
+        catch_unwind(AssertUnwindSafe(|| (function.func)(document, engine))).map_err(|_| {
+            RuntimeError::invariant(format!("config function `{}` panicked", function.name))
+        })??;
+        called.insert(function.name);
+    }
+    Ok(())
+}
+
+pub fn run_config_functions(engine: &mut Engine, early: bool, document: &str) -> RuntimeResult<()> {
+    let functions = engine.plugin_main().config_functions(early);
     if early {
         let mut called = std::mem::take(&mut engine.called_early_config_functions);
-        let result = dispatch_init(functions, &mut called, engine);
+        let result = dispatch_config(functions, &mut called, engine, document);
         engine.called_early_config_functions = called;
         result
     } else {
         let mut called = std::mem::take(&mut engine.called_config_functions);
-        let result = dispatch_init(functions, &mut called, engine);
+        let result = dispatch_config(functions, &mut called, engine, document);
         engine.called_config_functions = called;
         result
     }
@@ -249,7 +294,7 @@ mod tests {
     #[test]
     fn init_error_converts_to_core_error() {
         let err = InitError::DuplicateName("foo");
-        let core: CoreError = err.into();
+        let core: RuntimeError = err.into();
         assert!(core.to_string().contains("duplicate"));
     }
 }

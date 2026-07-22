@@ -1,10 +1,10 @@
 //! Graph rebuild transaction prototype (#100).
 
-use hammer_core::data_plane::{DataPlaneBufferConfig, NodeId, NodeKind, NodeRegistration};
-use hammer_core::error::CoreResult;
+use hammer_core::data_plane::{NodeId, NodeKind, NodeRegistration};
+use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
-    DataPlaneRuntime, DataPlaneRuntimeConfig, NodeDescriptor, NodeEntry, NodeProcessFn, NodeResult,
-    NodeRuntimeData,
+    DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, NodeDescriptor, NodeEntry,
+    NodeProcessFn, NodeResult, NodeRuntimeData,
 };
 
 fn test_runtime() -> DataPlaneRuntime {
@@ -26,7 +26,7 @@ fn noop_process(
     NodeResult::drop()
 }
 
-fn init_named(name: &'static str) -> fn(&DataPlaneRuntime, usize) -> CoreResult<NodeId> {
+fn init_named(name: &'static str) -> fn(&DataPlaneRuntime, usize) -> RuntimeResult<NodeId> {
     match name {
         "alpha" => init_alpha,
         "beta" => init_beta,
@@ -35,7 +35,7 @@ fn init_named(name: &'static str) -> fn(&DataPlaneRuntime, usize) -> CoreResult<
     }
 }
 
-fn init_alpha(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+fn init_alpha(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_descriptor(
         NodeKind::Internal,
         NodeDescriptor::new(
@@ -48,7 +48,7 @@ fn init_alpha(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
     )
 }
 
-fn init_beta(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+fn init_beta(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_descriptor(
         NodeKind::Internal,
         NodeDescriptor::new(
@@ -61,7 +61,7 @@ fn init_beta(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
     )
 }
 
-fn init_gamma(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+fn init_gamma(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_descriptor(
         NodeKind::Internal,
         NodeDescriptor::new(

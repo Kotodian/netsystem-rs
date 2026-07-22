@@ -2,7 +2,7 @@ use std::fmt;
 use std::os::fd::RawFd;
 use std::sync::Arc;
 
-use hammer_core::error::{HammerError, HammerResult};
+use crate::error::{RuntimeError, RuntimeResult};
 use hammer_infra::fifo::Fifo;
 use hammer_infra::segment::{Local, Svm};
 
@@ -85,7 +85,7 @@ impl<S: SessionSegment> AppSession<S> {
     /// number of bytes accepted (may be < `bytes.len()` if fifo full; caller
     /// retries or backpressures).
     #[inline]
-    pub fn send_bytes(&self, bytes: &[u8]) -> HammerResult<usize> {
+    pub fn send_bytes(&self, bytes: &[u8]) -> RuntimeResult<usize> {
         let wrote = self.tx_fifo.enqueue(bytes);
         self.notify_tx_event(wrote)?;
         Ok(wrote)
@@ -126,7 +126,7 @@ impl<S: SessionSegment> AppSession<S> {
     /// transitioned empty → non-empty this call AND the app had set
     /// `want_notification`.
     #[inline]
-    pub fn enqueue_rx(&self, bytes: &[u8]) -> HammerResult<usize> {
+    pub fn enqueue_rx(&self, bytes: &[u8]) -> RuntimeResult<usize> {
         self.enqueue_rx_with_flags(bytes, SessionEvtFlags::empty())
     }
 
@@ -139,7 +139,7 @@ impl<S: SessionSegment> AppSession<S> {
         &self,
         bytes: &[u8],
         flags: SessionEvtFlags,
-    ) -> HammerResult<usize> {
+    ) -> RuntimeResult<usize> {
         let wrote = self.rx_fifo.enqueue(bytes);
         if wrote == 0 {
             return Ok(0);
@@ -154,7 +154,7 @@ impl<S: SessionSegment> AppSession<S> {
     /// Transport-side convenience: drop acked bytes from tx_fifo and emit
     /// `SessionEvtType::TxDeq` (edge-triggered by FIFO dequeue notification).
     #[inline]
-    pub fn drop_tx_acked(&self, len: usize) -> HammerResult<usize> {
+    pub fn drop_tx_acked(&self, len: usize) -> RuntimeResult<usize> {
         let dropped = self.tx_fifo.dequeue_drop(len);
         if dropped > 0 && self.tx_fifo.needs_deq_notification(dropped) {
             self.push_event(SessionEvtType::TxDeq)?;
@@ -174,7 +174,7 @@ impl<S: SessionSegment> AppSession<S> {
     /// (`Connect` / `Close`) carry the full Session Handle, matching VPP
     /// `session_event_t` identity rules.
     #[inline]
-    pub fn push_event(&self, evt_type: SessionEvtType) -> HammerResult<()> {
+    pub fn push_event(&self, evt_type: SessionEvtType) -> RuntimeResult<()> {
         self.push_event_with_flags(evt_type, SessionEvtFlags::empty())
     }
 
@@ -183,13 +183,13 @@ impl<S: SessionSegment> AppSession<S> {
         &self,
         evt_type: SessionEvtType,
         flags: SessionEvtFlags,
-    ) -> HammerResult<()> {
+    ) -> RuntimeResult<()> {
         match evt_type {
             SessionEvtType::RxEnq | SessionEvtType::TxDeq => {
                 let evt = SessionEvt::io_with_flags(self.handle.session_index(), evt_type, flags);
                 self.evt_q
                     .enqueue_io(evt)
-                    .map_err(|_| HammerError::internal("app session evt_q full"))?;
+                    .map_err(|_| RuntimeError::invariant("app session evt_q full"))?;
             }
             SessionEvtType::Connect | SessionEvtType::Close => {
                 let evt = SessionEvt::ctrl(
@@ -199,14 +199,14 @@ impl<S: SessionSegment> AppSession<S> {
                 );
                 self.evt_q
                     .enqueue_ctrl(evt)
-                    .map_err(|_| HammerError::internal("app session evt_q full"))?;
+                    .map_err(|_| RuntimeError::invariant("app session evt_q full"))?;
             }
         }
         Ok(())
     }
 
     #[inline]
-    fn notify_tx_event(&self, wrote: usize) -> HammerResult<()> {
+    fn notify_tx_event(&self, wrote: usize) -> RuntimeResult<()> {
         if wrote == 0 || !self.tx_fifo.set_event() {
             return Ok(());
         }
@@ -219,7 +219,7 @@ impl<S: SessionSegment> AppSession<S> {
             .is_err()
         {
             self.tx_fifo.unset_event();
-            return Err(HammerError::internal("session tx event queue full"));
+            return Err(RuntimeError::invariant("session tx event queue full"));
         }
         Ok(())
     }
@@ -308,20 +308,20 @@ impl AppSession<Local> {
         config: AppSessionConfig,
         handle: SessionHandle,
         tx_evt_q: Arc<SessionMsgQueue>,
-    ) -> HammerResult<Self> {
+    ) -> RuntimeResult<Self> {
         let mut rx_fifo = Fifo::<Local>::new(seg.clone(), config.fifo_capacity)
-            .map_err(|_| HammerError::internal("invalid rx fifo capacity"))?;
+            .map_err(|_| RuntimeError::invariant("invalid rx fifo capacity"))?;
         rx_fifo.enable_ooo();
         let rx_fifo = Arc::new(rx_fifo);
         let tx_fifo = Arc::new(
             Fifo::<Local>::new(seg, config.fifo_capacity)
-                .map_err(|_| HammerError::internal("invalid tx fifo capacity"))?,
+                .map_err(|_| RuntimeError::invariant("invalid tx fifo capacity"))?,
         );
         let ring_nitems = config.evt_q_capacity.max(1) as u32;
         let q_nitems = (config.evt_q_capacity + 1).next_power_of_two().max(2) as u32;
         let evt_q = Arc::new(
             SessionMsgQueue::with_cfg(q_nitems, ring_nitems)
-                .map_err(|_| HammerError::internal("invalid app session evt_q capacity"))?,
+                .map_err(|_| RuntimeError::invariant("invalid app session evt_q capacity"))?,
         );
         Ok(Self {
             rx_fifo,

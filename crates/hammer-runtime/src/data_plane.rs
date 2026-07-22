@@ -2,15 +2,16 @@ use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::rc::Rc;
 
-use hammer_core::config::Config;
+use crate::error::{RuntimeError, RuntimeResult};
 use hammer_core::data_plane::{
     BufferFrame, BufferFrameBatchWidth, BufferFrameBatchWidthPolicy, BufferNodeError, BufferRef,
-    BufferRefMut, DataPlaneBufferChain, DataPlaneBufferConfig, DataPlaneBufferWorkerConfig,
-    DataPlaneBufferWorkerSeed, DataPlaneBuffers, Frame, Index, Next, NodeHandle, NodeId, NodeNext,
-    NodeRegistration, Pending,
+    BufferRefMut, BufferPoolArena, DataPlaneBufferChain, DataPlaneBuffers,
+    BUFFER_CACHE_LINE_SIZE, DEFAULT_BUFFER_FRAME_POOL_SIZE, Frame, Index, Next, NodeHandle,
+    NodeId, NodeNext, NodeRegistration, Pending,
 };
-use hammer_core::error::{CoreError, CoreResult, DataPlaneError};
+use hammer_core::error::DataPlaneError;
 
+use crate::config::Worker;
 use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HANDOFF_SLOT_CAPACITY, HandoffSlot};
 use crate::instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
 use crate::node::{NodeEntry, NodeFunctionRegistration, NodeRuntime, NodeRuntimeInner};
@@ -30,6 +31,52 @@ impl BufferFrameBatchWidthPolicy for FrameBatchWidth {
 #[derive(Debug, Clone, Default)]
 pub struct DataPlaneRuntimeConfig {
     pub buffers: DataPlaneBufferConfig,
+}
+
+/// Runtime-owned buffer arena policy.
+///
+/// Core owns packet storage and frame ownership. Runtime selects the worker and
+/// NUMA layout that constructs those storage arenas.
+#[derive(Debug, Clone)]
+pub struct DataPlaneBufferConfig {
+    pub buffer_slot_capacity: usize,
+    pub buffer_slots: usize,
+    pub frame_slots: usize,
+    pub numa_nodes: &'static [u32],
+    pub thread_index: u32,
+    pub active_numa_node: u32,
+}
+
+impl Default for DataPlaneBufferConfig {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            buffer_slot_capacity: BUFFER_CACHE_LINE_SIZE,
+            buffer_slots: 1024,
+            frame_slots: DEFAULT_BUFFER_FRAME_POOL_SIZE,
+            numa_nodes: &[0],
+            thread_index: 0,
+            active_numa_node: 0,
+        }
+    }
+}
+
+impl From<DataPlaneBufferConfig> for DataPlaneBuffers {
+    fn from(config: DataPlaneBufferConfig) -> Self {
+        let arenas = config.numa_nodes.iter().copied().map(|numa_node| {
+            BufferPoolArena::with_capacity_on_numa(
+                config.buffer_slot_capacity,
+                config.buffer_slots,
+                numa_node,
+            )
+        });
+        DataPlaneBuffers::from_arenas(
+            arenas,
+            config.frame_slots,
+            config.thread_index,
+            config.active_numa_node,
+        )
+    }
 }
 
 pub struct DataPlaneRuntime {
@@ -67,7 +114,8 @@ impl fmt::Debug for DataPlaneRuntime {
 pub(crate) type RuntimeDataPlaneRuntime = DataPlaneRuntime;
 
 pub(crate) struct DataPlaneRuntimeWorkerSeed {
-    buffers: DataPlaneBufferWorkerSeed,
+    buffer_arenas: Vec<BufferPoolArena>,
+    frame_slots: usize,
     nodes: NodeRuntimeInner,
     instruction_set: DataPlaneInstructionSet,
     handoff: Option<DataPlaneHandoffWorker>,
@@ -83,7 +131,8 @@ pub(crate) struct DataPlaneRuntimeWorkerConfig {
 impl fmt::Debug for DataPlaneRuntimeWorkerSeed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DataPlaneRuntimeWorkerSeed")
-            .field("buffers", &self.buffers)
+            .field("buffer_arenas", &self.buffer_arenas.len())
+            .field("frame_slots", &self.frame_slots)
             .field("instruction_set", &self.instruction_set)
             .field("handoff_node_handle", &self.handoff_node_handle)
             .finish()
@@ -105,7 +154,7 @@ impl<'runtime> HandoffSlotGuard<'runtime> {
     }
 
     #[inline]
-    fn push_into_frame(&mut self, frame: &mut Frame<Next>) -> CoreResult<()> {
+    fn push_into_frame(&mut self, frame: &mut Frame<Next>) -> RuntimeResult<()> {
         match self.slot.as_ref() {
             Some(slot) => frame.push_indices(slot.iter())?,
             None => return Ok(()),
@@ -145,7 +194,8 @@ impl Clone for DataPlaneRuntime {
 impl From<&DataPlaneRuntime> for DataPlaneRuntimeWorkerSeed {
     fn from(runtime: &DataPlaneRuntime) -> Self {
         Self {
-            buffers: DataPlaneBufferWorkerSeed::from(&runtime.buffers),
+            buffer_arenas: runtime.buffers.buffer_arenas().collect(),
+            frame_slots: runtime.buffers.frame_slots(),
             nodes: runtime.nodes.snapshot(),
             instruction_set: runtime.instruction_set,
             handoff: runtime.handoff.clone(),
@@ -162,17 +212,19 @@ impl From<DataPlaneRuntimeWorkerConfig> for DataPlaneRuntime {
             numa_node,
         } = config;
         let DataPlaneRuntimeWorkerSeed {
-            buffers,
+            buffer_arenas,
+            frame_slots,
             nodes,
             instruction_set,
             handoff,
             handoff_node_handle,
         } = seed;
-        let buffers = DataPlaneBuffers::from(DataPlaneBufferWorkerConfig {
-            seed: buffers,
+        let buffers = DataPlaneBuffers::from_arenas(
+            buffer_arenas,
+            frame_slots,
             thread_index,
             numa_node,
-        });
+        );
         let mut runtime = Self::from_buffers_with_instruction_set(buffers, instruction_set);
         runtime.nodes = nodes.into();
         runtime.handoff = handoff;
@@ -193,7 +245,7 @@ impl DataPlaneRuntime {
     #[inline]
     pub fn new(config: DataPlaneRuntimeConfig) -> Self {
         Self::from_buffers_with_instruction_set(
-            DataPlaneBuffers::new(config.buffers),
+            config.buffers.into(),
             DataPlaneInstructionSet::native(),
         )
     }
@@ -204,7 +256,7 @@ impl DataPlaneRuntime {
         instruction_set: DataPlaneInstructionSet,
     ) -> Self {
         Self::from_buffers_with_instruction_set(
-            DataPlaneBuffers::new(config.buffers),
+            config.buffers.into(),
             instruction_set,
         )
     }
@@ -260,7 +312,7 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    pub fn handoff_node_handle(&self) -> CoreResult<NodeHandle> {
+    pub fn handoff_node_handle(&self) -> RuntimeResult<NodeHandle> {
         self.handoff_node_handle
             .ok_or(DataPlaneError::HandoffNodeHandleMissing.into())
     }
@@ -297,13 +349,13 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    pub fn alloc_index(&self) -> CoreResult<Index> {
-        self.buffers.alloc_index()
+    pub fn alloc_index(&self) -> RuntimeResult<Index> {
+        Ok(self.buffers.alloc_index()?)
     }
 
     #[inline]
-    pub fn alloc_index_with_bytes(&self, bytes: &[u8]) -> CoreResult<Index> {
-        self.buffers.alloc_index_with_bytes(bytes)
+    pub fn alloc_index_with_bytes(&self, bytes: &[u8]) -> RuntimeResult<Index> {
+        Ok(self.buffers.alloc_index_with_bytes(bytes)?)
     }
 
     #[inline]
@@ -338,12 +390,12 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    pub fn current_config(&self, index: Index) -> CoreResult<NodeId> {
-        self.buffers.current_config(index)
+    pub fn current_config(&self, index: Index) -> RuntimeResult<NodeId> {
+        Ok(self.buffers.current_config(index)?)
     }
 
     #[inline]
-    pub fn put_next_frame(&self, frame: Frame<Next>) -> CoreResult<()> {
+    pub fn put_next_frame(&self, frame: Frame<Next>) -> RuntimeResult<()> {
         let next = frame.next();
         let pending = frame.into_pending()?;
         if !pending.has_pending() {
@@ -353,13 +405,13 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    pub fn get_buffer(&self, index: Index) -> CoreResult<BufferRef<'_>> {
-        self.buffers.get_buffer(index)
+    pub fn get_buffer(&self, index: Index) -> RuntimeResult<BufferRef<'_>> {
+        Ok(self.buffers.get_buffer(index)?)
     }
 
     #[inline]
-    pub fn get_buffer_mut(&self, index: Index) -> CoreResult<BufferRefMut<'_>> {
-        self.buffers.get_buffer_mut(index)
+    pub fn get_buffer_mut(&self, index: Index) -> RuntimeResult<BufferRefMut<'_>> {
+        Ok(self.buffers.get_buffer_mut(index)?)
     }
 
     #[inline]
@@ -367,8 +419,10 @@ impl DataPlaneRuntime {
         &self.nodes
     }
 
-    pub fn init_graph(&self, worker: usize, entries: &[NodeEntry]) -> CoreResult<()> {
-        let node_functions = crate::registration::node_functions();
+    pub fn init_graph(&self, worker: usize, entries: &[NodeEntry]) -> RuntimeResult<()> {
+        let node_functions = crate::builtin_registration_image()
+            .node_functions()
+            .to_vec();
         self.init_graph_with_node_functions(worker, entries, &node_functions)
     }
 
@@ -377,9 +431,9 @@ impl DataPlaneRuntime {
         worker: usize,
         entries: &[NodeEntry],
         node_functions: &[NodeFunctionRegistration],
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         if !self.instruction_set.is_supported() {
-            return Err(CoreError::internal(format!(
+            return Err(RuntimeError::invariant(format!(
                 "configured instruction set {:?} is not supported by this CPU",
                 self.instruction_set
             )));
@@ -392,7 +446,7 @@ impl DataPlaneRuntime {
             .filter(|entry| matches!(entry.registration, NodeRegistration::Sibling { .. }));
         for entry in owners.chain(siblings) {
             let node = (entry.init)(self, worker).map_err(|err| {
-                CoreError::internal(format!(
+                RuntimeError::invariant(format!(
                     "init graph node `{}`: {err}",
                     entry.registration.name().unwrap_or("?")
                 ))
@@ -408,7 +462,7 @@ impl DataPlaneRuntime {
         worker: usize,
         entries: &[NodeEntry],
         node_functions: &[NodeFunctionRegistration],
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         if !self.instruction_set.is_supported() {
             return Err(DataPlaneError::UnsupportedDataPlaneInstructionSet.into());
         }
@@ -442,8 +496,10 @@ impl DataPlaneRuntime {
     /// This is a graph transaction, not a plugin unload operation; it neither
     /// changes the registration authority nor releases DSO handles. Business
     /// state must rebind by name, not `NodeId`.
-    pub fn rebuild_graph(&self, worker: usize, entries: &[NodeEntry]) -> CoreResult<()> {
-        let node_functions = crate::registration::node_functions();
+    pub fn rebuild_graph(&self, worker: usize, entries: &[NodeEntry]) -> RuntimeResult<()> {
+        let node_functions = crate::builtin_registration_image()
+            .node_functions()
+            .to_vec();
         self.rebuild_graph_with_node_functions(worker, entries, &node_functions)
     }
 
@@ -452,7 +508,7 @@ impl DataPlaneRuntime {
         worker: usize,
         entries: &[NodeEntry],
         node_functions: &[NodeFunctionRegistration],
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         self.set_current_node(None);
         self.nodes.detach_graph_for_rebuild();
         self.init_graph_with_node_functions(worker, entries, node_functions)
@@ -498,7 +554,7 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    pub fn try_mark_trace(&self, node: NodeId, index: Index) -> CoreResult<()> {
+    pub fn try_mark_trace(&self, node: NodeId, index: Index) -> RuntimeResult<()> {
         if !self.trace.may_mark(node) {
             return Ok(());
         }
@@ -513,7 +569,7 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    pub fn add_trace<T: PacketTrace>(&self, index: Index, trace: T) -> CoreResult<()> {
+    pub fn add_trace<T: PacketTrace>(&self, index: Index, trace: T) -> RuntimeResult<()> {
         let Some(node) = self.current_node() else {
             return Ok(());
         };
@@ -522,35 +578,36 @@ impl DataPlaneRuntime {
         };
         let node_name = self.nodes.node_name(node)?;
         let formatter = self.nodes.node_trace_formatter(node)?;
-        let mut payload_bytes = Vec::new();
-        trace.encode_trace(&mut payload_bytes);
+        let payload_bytes = bincode::serialize(&trace).map_err(|error| {
+            RuntimeError::invariant(format!("packet trace serialization failed: {error}"))
+        })?;
         self.trace
             .add_entry(handle, node, node_name, formatter, payload_bytes);
         Ok(())
     }
 
     #[inline(always)]
-    pub fn should_trace_packet(&self, index: Index) -> CoreResult<bool> {
+    pub fn should_trace_packet(&self, index: Index) -> RuntimeResult<bool> {
         Ok(crate::unlikely(
             self.get_buffer(index)?.trace_handle().is_some(),
         ))
     }
 
     #[inline]
-    pub fn record_current_node_error(&self, code: u16) -> CoreResult<u16> {
+    pub fn record_current_node_error(&self, code: u16) -> RuntimeResult<u16> {
         let node = self
             .current_node()
-            .ok_or_else(|| CoreError::internal("node error set outside node processing"))?;
+            .ok_or_else(|| RuntimeError::invariant("node error set outside node processing"))?;
         self.nodes.increment_node_error(node, code)
     }
 
     #[inline]
-    pub fn node_error_count(&self, node: NodeId, code: u16) -> CoreResult<u64> {
+    pub fn node_error_count(&self, node: NodeId, code: u16) -> RuntimeResult<u64> {
         self.nodes.node_error_count(node, code)
     }
 
     #[inline]
-    pub fn node_error(&self, index: Index) -> CoreResult<Option<BufferNodeError>> {
+    pub fn node_error(&self, index: Index) -> RuntimeResult<Option<BufferNodeError>> {
         let code = self.buffers.node_error_code(index)?;
         match code {
             Some(code) => self.nodes.decode_node_error(code),
@@ -569,14 +626,14 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    pub fn schedule_empty_frame(&self, node: NodeId) -> CoreResult<()> {
+    pub fn schedule_empty_frame(&self, node: NodeId) -> RuntimeResult<()> {
         let frame = self.buffers.get_next_frame(node)?;
         let pending = frame.into_pending()?;
         self.nodes.schedule_frame(node, pending, true)
     }
 
     #[inline]
-    pub fn schedule_polling_driver_nodes(&self) -> CoreResult<usize> {
+    pub fn schedule_polling_driver_nodes(&self) -> RuntimeResult<usize> {
         let nodes = self.nodes.polling_driver_nodes()?;
         let scheduled = nodes.len();
         for node in nodes {
@@ -586,7 +643,7 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    pub fn set_node_interrupt_pending(&self, node: NodeId) -> CoreResult<bool> {
+    pub fn set_node_interrupt_pending(&self, node: NodeId) -> RuntimeResult<bool> {
         if !self.nodes.mark_interrupt_pending(node)? {
             return Ok(false);
         }
@@ -598,13 +655,13 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    pub fn run_ready_nodes(&self) -> CoreResult<usize> {
+    pub fn run_ready_nodes(&self) -> RuntimeResult<usize> {
         self.drain_handoff_frames()?;
         self.nodes.run_ready_function_nodes(self)
     }
 
     #[inline]
-    fn drain_handoff_frames(&self) -> CoreResult<()> {
+    fn drain_handoff_frames(&self) -> RuntimeResult<()> {
         let Some(handoff) = &self.handoff else {
             return Ok(());
         };
@@ -631,7 +688,7 @@ impl DataPlaneRuntime {
         worker: DataWorkerId,
         target: NodeHandle,
         frame: &mut BufferFrame,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         let Some(handoff) = &self.handoff else {
             return Err(DataPlaneError::HandoffNotConfigured.into());
         };
@@ -661,7 +718,7 @@ impl DataPlaneRuntime {
         worker: DataWorkerId,
         target: NodeHandle,
         indices: impl IntoIterator<Item = Index>,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         let Some(handoff) = &self.handoff else {
             return Err(DataPlaneError::HandoffNotConfigured.into());
         };
@@ -694,10 +751,10 @@ impl DataPlaneRuntime {
         target: NodeHandle,
         index: Index,
         continuation: Option<N>,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         if let Some(next) = continuation {
             let node = self.current_node().ok_or_else(|| {
-                CoreError::internal("handoff continuation outside node processing")
+                RuntimeError::invariant("handoff continuation outside node processing")
             })?;
             let resolved = self.nodes.node_next(node, next)?;
             self.get_buffer_mut(index)?.set_current_config(resolved);
@@ -723,7 +780,7 @@ impl DataPlaneRuntime {
         worker: DataWorkerId,
         target: NodeHandle,
         slot: HandoffSlot,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         let Some(handoff) = &self.handoff else {
             return Err(DataPlaneError::HandoffNotConfigured.into());
         };
@@ -739,18 +796,17 @@ impl DataPlaneRuntime {
     }
 }
 
-pub fn new_worker_runtime(config: &Config) -> CoreResult<DataPlaneRuntime> {
-    crate::memory::ensure_main_heap(config)?;
-    let buffer = &config.worker.buffer;
+pub fn new_worker_runtime(config: &Worker) -> RuntimeResult<DataPlaneRuntime> {
+    let buffer = &config.buffer;
     let buffers = DataPlaneBufferConfig {
         buffer_slot_capacity: buffer.slot_bytes,
         buffer_slots: buffer.slots_per_numa,
         frame_slots: buffer.frame_pool_size,
         ..DataPlaneBufferConfig::default()
     };
-    let instruction_set = parse_instruction_set(&config.worker.instruction_set)?;
+    let instruction_set = parse_instruction_set(&config.instruction_set)?;
     if !instruction_set.is_supported() {
-        return Err(CoreError::internal(format!(
+        return Err(RuntimeError::invariant(format!(
             "configured instruction set {instruction_set:?} is not supported by this CPU"
         )));
     }
@@ -760,7 +816,7 @@ pub fn new_worker_runtime(config: &Config) -> CoreResult<DataPlaneRuntime> {
     ))
 }
 
-fn parse_instruction_set(value: &str) -> CoreResult<DataPlaneInstructionSet> {
+fn parse_instruction_set(value: &str) -> RuntimeResult<DataPlaneInstructionSet> {
     if value.eq_ignore_ascii_case("native") {
         Ok(DataPlaneInstructionSet::native())
     } else if value.eq_ignore_ascii_case("scalar") {
@@ -774,7 +830,7 @@ fn parse_instruction_set(value: &str) -> CoreResult<DataPlaneInstructionSet> {
     } else if value.eq_ignore_ascii_case("neon") {
         Ok(DataPlaneInstructionSet::Neon)
     } else {
-        Err(CoreError::internal(format!(
+        Err(RuntimeError::invariant(format!(
             "unknown instruction set `{value}`"
         )))
     }

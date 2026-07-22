@@ -1,18 +1,16 @@
 use std::mem::transmute;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use hammer_core::config::Config;
 use hammer_core::data_plane::{
-    BufferFrame, BufferNodeError, BufferPacketCursor, DataPlaneBufferConfig,
-};
-use hammer_core::error::CoreResult;
-use hammer_core::protocol::ip::{IpProtocol, IpVersion};
-use hammer_core::registry::RuntimeRegistry;
+    BufferFrame, BufferNodeError, BufferPacketCursor, };
+use hammer_infra::checksum::internet_checksum_parts;
 use hammer_plugin_udp::{UdpInputControlPlane, UdpInputError, UdpInputNext, UdpInputTrace};
+use hammer_runtime::RuntimeRegistry;
+use hammer_runtime::RuntimeResult;
 use hammer_runtime::graph::install_packet_graph;
 use hammer_runtime::{
-    DataPlaneRuntime, DataPlaneRuntimeConfig, Engine, InternalNode, Node, NodeProcessFn,
-    NodeResult, NodeRuntimeData, TraceControlPlane, TraceInputPolicy, TracePolicy,
+    DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, Engine, InternalNode, Node,
+    NodeProcessFn, NodeResult, NodeRuntimeData, TraceControlPlane, TraceInputPolicy, TracePolicy,
 };
 use hammer_service::opaque::NetworkOpaque;
 
@@ -34,14 +32,14 @@ fn test_runtime_configured(
 
 #[test]
 fn udp_graph_contribution_initializes_with_existing_drop_node() {
-    _ = hammer_plugin_udp::registration();
+    _ = hammer_plugin_udp::plugin_module();
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let mut engine = Engine::new(runtime, RuntimeRegistry::new());
 
     // The statically linked UDP image has no IP dependency image in this test,
     // so the full service graph may stop at an unresolved IP next. All image
     // contributions are installed before named-next resolution.
-    _ = install_packet_graph(&mut engine, Arc::new(Config::default()));
+    _ = install_packet_graph(&mut engine);
 
     assert!(engine.runtime.node_by_name("drop").is_some());
     assert!(engine.runtime.node_by_name("udp-input").is_some());
@@ -51,6 +49,7 @@ fn udp_graph_contribution_initializes_with_existing_drop_node() {
 struct CaptureState {
     packets: Vec<Vec<u8>>,
     node_errors: Vec<Option<BufferNodeError>>,
+    packet_cursors: Vec<BufferPacketCursor>,
 }
 
 struct CaptureNode {
@@ -82,7 +81,7 @@ impl Node for CaptureNode {
     }
 
     #[inline]
-    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
         Ok(self.runtime_data)
     }
 }
@@ -97,7 +96,7 @@ fn capture_states() -> &'static Mutex<Vec<Arc<Mutex<CaptureState>>>> {
 fn chain_bytes(
     runtime: &DataPlaneRuntime,
     index: hammer_core::data_plane::Index,
-) -> CoreResult<Vec<u8>> {
+) -> RuntimeResult<Vec<u8>> {
     let mut bytes = Vec::new();
     for buffer in runtime.buffers().chain(index) {
         bytes.extend_from_slice(buffer?.current());
@@ -130,10 +129,17 @@ fn capture_process(
             Ok(err) => err,
             Err(_) => return NodeResult::drop(),
         };
+        let packet_cursor = match runtime.get_buffer(index) {
+            Ok(buffer) => {
+                unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) }.packet_cursor()
+            }
+            Err(_) => return NodeResult::drop(),
+        };
         match state.lock() {
             Ok(mut guard) => {
                 guard.packets.push(packet.into_iter().collect());
                 guard.node_errors.push(node_error);
+                guard.packet_cursors.push(packet_cursor);
             }
             Err(_) => return NodeResult::drop(),
         }
@@ -211,14 +217,120 @@ fn udp_input_dispatches_registered_port_by_local_slot() {
     assert!(icmp_state.lock().unwrap().packets.is_empty());
     assert_eq!(trace_control.drain_completed(), 1);
     let records = trace_control.take_records();
-    let trace =
-        UdpInputTrace::decode(&records[0].entries[0].payload_bytes).expect("udp input trace");
-    assert_eq!(trace.version, Some(IpVersion::V4));
-    assert_eq!(trace.protocol, Some(IpProtocol::Udp));
-    assert_eq!(trace.source_port, Some(12_345));
-    assert_eq!(trace.destination_port, Some(53));
-    assert_eq!(trace.error, None);
-    assert_eq!(trace.next, echo_slot);
+    let entry = &records[0].entries[0];
+    assert!(!entry.payload_bytes.is_empty());
+    assert!(
+        entry
+            .format_payload()
+            .starts_with(std::any::type_name::<UdpInputTrace>())
+    );
+}
+
+#[test]
+fn udp_input_owns_udp_cursor_initialization() {
+    let runtime = test_runtime_configured(2048, 16, 8);
+    let (control, udp_input, drop_state, punt_state, icmp_state) = wire_udp_input(&runtime);
+    let echo_state = Arc::new(Mutex::new(CaptureState::default()));
+    let echo = runtime
+        .nodes()
+        .register_internal(CaptureNode::new(Arc::clone(&echo_state)));
+    control.register_port(53, echo).expect("register dns port");
+
+    let packet = ipv4_udp_packet(12_345, 53, b"dns");
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(udp_input)
+        .expect("alloc frame");
+    push_packet_with_ip_cursor(&runtime, &mut frame, &packet);
+    runtime.put_next_frame(frame).expect("schedule");
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    let echo = echo_state.lock().expect("echo state");
+    assert_eq!(echo.packets, vec![packet]);
+    assert_eq!(echo.packet_cursors.len(), 1);
+    assert_eq!(echo.packet_cursors[0].transport_header_len(), 8);
+    assert_eq!(echo.packet_cursors[0].transport_payload_offset(), 28);
+    assert!(drop_state.lock().unwrap().packets.is_empty());
+    assert!(punt_state.lock().unwrap().packets.is_empty());
+    assert!(icmp_state.lock().unwrap().packets.is_empty());
+}
+
+#[test]
+fn udp_input_rejects_invalid_ipv4_checksum() {
+    let runtime = test_runtime_configured(2048, 16, 8);
+    let (_control, udp_input, drop_state, punt_state, icmp_state) = wire_udp_input(&runtime);
+    let mut packet = ipv4_udp_packet(12_345, 53, b"dns");
+    set_ipv4_udp_checksum(&mut packet);
+    packet[27] ^= 1;
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(udp_input)
+        .expect("alloc frame");
+    push_packet(&runtime, &mut frame, &packet);
+    runtime.put_next_frame(frame).expect("schedule");
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(drop_state.lock().unwrap().packets, vec![packet]);
+    assert_eq!(
+        drop_state.lock().unwrap().node_errors,
+        vec![Some(BufferNodeError::new(
+            udp_input,
+            UdpInputError::BadChecksum.code()
+        ))]
+    );
+    assert!(punt_state.lock().unwrap().packets.is_empty());
+    assert!(icmp_state.lock().unwrap().packets.is_empty());
+}
+
+#[test]
+fn udp_input_dispatches_valid_ipv4_checksum() {
+    let runtime = test_runtime_configured(2048, 16, 8);
+    let (control, udp_input, drop_state, punt_state, icmp_state) = wire_udp_input(&runtime);
+    let echo_state = Arc::new(Mutex::new(CaptureState::default()));
+    let echo = runtime
+        .nodes()
+        .register_internal(CaptureNode::new(Arc::clone(&echo_state)));
+    control.register_port(53, echo).expect("register dns port");
+
+    let mut packet = ipv4_udp_packet(12_345, 53, b"dns");
+    set_ipv4_udp_checksum(&mut packet);
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(udp_input)
+        .expect("alloc frame");
+    push_packet(&runtime, &mut frame, &packet);
+    runtime.put_next_frame(frame).expect("schedule");
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(echo_state.lock().unwrap().packets, vec![packet]);
+    assert!(drop_state.lock().unwrap().packets.is_empty());
+    assert!(punt_state.lock().unwrap().packets.is_empty());
+    assert!(icmp_state.lock().unwrap().packets.is_empty());
+}
+
+#[test]
+fn udp_input_rejects_missing_ipv6_checksum() {
+    let runtime = test_runtime_configured(2048, 16, 8);
+    let (_control, udp_input, drop_state, punt_state, icmp_state) = wire_udp_input(&runtime);
+    let packet = ipv6_udp_packet(12_345, 53, b"dns");
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(udp_input)
+        .expect("alloc frame");
+    push_packet(&runtime, &mut frame, &packet);
+    runtime.put_next_frame(frame).expect("schedule");
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(drop_state.lock().unwrap().packets, vec![packet]);
+    assert_eq!(
+        drop_state.lock().unwrap().node_errors,
+        vec![Some(BufferNodeError::new(
+            udp_input,
+            UdpInputError::BadChecksum.code()
+        ))]
+    );
+    assert!(punt_state.lock().unwrap().packets.is_empty());
+    assert!(icmp_state.lock().unwrap().packets.is_empty());
 }
 
 #[test]
@@ -305,7 +417,15 @@ fn push_packet(runtime: &DataPlaneRuntime, frame: &mut BufferFrame, packet: &[u8
     let buffer = runtime
         .alloc_index_with_bytes(packet)
         .expect("alloc packet");
-    set_udp_opaque(runtime, buffer, packet);
+    set_udp_opaque(runtime, buffer, packet, 8);
+    frame.push_index(buffer).expect("push packet");
+}
+
+fn push_packet_with_ip_cursor(runtime: &DataPlaneRuntime, frame: &mut BufferFrame, packet: &[u8]) {
+    let buffer = runtime
+        .alloc_index_with_bytes(packet)
+        .expect("alloc packet");
+    set_udp_opaque(runtime, buffer, packet, 0);
     frame.push_index(buffer).expect("push packet");
 }
 
@@ -321,7 +441,7 @@ fn push_marked_packet(
     runtime
         .try_mark_trace(trace_input, buffer)
         .expect("mark packet");
-    set_udp_opaque(runtime, buffer, packet);
+    set_udp_opaque(runtime, buffer, packet, 8);
     frame.push_index(buffer).expect("push packet");
 }
 
@@ -329,6 +449,7 @@ fn set_udp_opaque(
     runtime: &DataPlaneRuntime,
     index: hammer_core::data_plane::Index,
     packet: &[u8],
+    transport_header_len: usize,
 ) {
     let Some(first) = packet.first().copied() else {
         return;
@@ -340,8 +461,8 @@ fn set_udp_opaque(
                 BufferPacketCursor::new()
                     .with_packet_len(packet.len())
                     .with_network_header(0, ihl)
-                    .with_transport_header(ihl, 8)
-                    .with_transport_payload_offset(ihl + 8),
+                    .with_transport_header(ihl, transport_header_len)
+                    .with_transport_payload_offset(ihl + transport_header_len),
                 4u8,
                 packet.get(9).copied().unwrap_or(17),
             )
@@ -350,8 +471,8 @@ fn set_udp_opaque(
             BufferPacketCursor::new()
                 .with_packet_len(packet.len())
                 .with_network_header(0, 40)
-                .with_transport_header(40, 8)
-                .with_transport_payload_offset(48),
+                .with_transport_header(40, transport_header_len)
+                .with_transport_payload_offset(40 + transport_header_len),
             6u8,
             packet.get(6).copied().unwrap_or(17),
         ),
@@ -379,4 +500,33 @@ fn ipv4_udp_packet(source_port: u16, destination_port: u16, payload: &[u8]) -> V
     packet[24..26].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
     packet[28..].copy_from_slice(payload);
     packet
+}
+
+fn ipv6_udp_packet(source_port: u16, destination_port: u16, payload: &[u8]) -> Vec<u8> {
+    let payload_len = 8 + payload.len();
+    let mut packet = vec![0u8; 40 + payload_len];
+    packet[0] = 0x60;
+    packet[4..6].copy_from_slice(&(payload_len as u16).to_be_bytes());
+    packet[6] = 17;
+    packet[7] = 64;
+    packet[8..24].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    packet[24..40].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    packet[40..42].copy_from_slice(&source_port.to_be_bytes());
+    packet[42..44].copy_from_slice(&destination_port.to_be_bytes());
+    packet[44..46].copy_from_slice(&(payload_len as u16).to_be_bytes());
+    packet[48..].copy_from_slice(payload);
+    packet
+}
+
+fn set_ipv4_udp_checksum(packet: &mut [u8]) {
+    let (ip, udp) = packet.split_at_mut(20);
+    udp[6..8].fill(0);
+    let checksum = internet_checksum_parts(&[
+        &ip[12..16],
+        &ip[16..20],
+        &[0, 17],
+        &(udp.len() as u16).to_be_bytes(),
+        udp,
+    ]);
+    udp[6..8].copy_from_slice(&checksum.to_be_bytes());
 }

@@ -1,10 +1,28 @@
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
-use hammer_core::error::{AttachError, HammerResult};
 use hammer_infra::segment::Svm;
+use hammer_runtime::RuntimeResult;
 use hammer_runtime::app::{SessionEventQueue, SessionEvt};
+use thiserror::Error;
 use tokio::io::unix::AsyncFd;
+
+/// Failures while adapting an attached session to asynchronous app I/O.
+#[derive(Debug, Error)]
+pub enum RemoteAppSessionError {
+    #[error("remote app session requires a signal-read descriptor")]
+    SessionSignalMissing,
+    #[error("failed to duplicate remote app session signal descriptor")]
+    SessionSignalDuplicate {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to register remote app session readiness")]
+    SessionReadiness {
+        #[source]
+        source: std::io::Error,
+    },
+}
 
 /// Cross-process async facade over an [`AppSession<Svm>`].
 ///
@@ -22,24 +40,29 @@ impl RemoteAppSession {
     /// Duplicates the event-queue signal-read fd so the [`AsyncFd`] has
     /// sole ownership of its descriptor. The original within the Session
     /// Message Queue is unaffected.
-    pub fn new(session: Arc<hammer_runtime::app::AppSession<Svm>>) -> HammerResult<Self> {
+    ///
+    /// # Panics
+    ///
+    /// Panics unless called while a Tokio runtime with I/O enabled is entered.
+    pub fn new(
+        session: Arc<hammer_runtime::app::AppSession<Svm>>,
+    ) -> Result<Self, RemoteAppSessionError> {
         let read_fd = session
             .evt_q()
             .read_fd()
-            .ok_or(AttachError::SessionSignalMissing)?;
+            .ok_or(RemoteAppSessionError::SessionSignalMissing)?;
         // SAFETY: F_DUPFD_CLOEXEC duplicates the live queue endpoint and
         // returns a fresh descriptor whose ownership transfers below.
         let duped = unsafe { libc::fcntl(read_fd, libc::F_DUPFD_CLOEXEC, 0) };
         if duped < 0 {
-            return Err(AttachError::SessionSignalDuplicate {
+            return Err(RemoteAppSessionError::SessionSignalDuplicate {
                 source: std::io::Error::last_os_error(),
-            }
-            .into());
+            });
         }
         // SAFETY: fcntl returned a fresh descriptor and ownership transfers once.
         let owned = unsafe { OwnedFd::from_raw_fd(duped) };
-        let evt_async_fd =
-            AsyncFd::new(owned).map_err(|source| AttachError::SessionReadiness { source })?;
+        let evt_async_fd = AsyncFd::new(owned)
+            .map_err(|source| RemoteAppSessionError::SessionReadiness { source })?;
         Ok(Self {
             session,
             evt_async_fd,
@@ -67,7 +90,7 @@ impl RemoteAppSession {
 
     /// App-side async send. Copies `bytes` into the TX FIFO, applying
     /// backpressure when the FIFO is full.
-    pub async fn send_all(&self, bytes: &[u8]) -> HammerResult<usize> {
+    pub async fn send_all(&self, bytes: &[u8]) -> RuntimeResult<usize> {
         let mut written = 0usize;
         while written < bytes.len() {
             let accepted = self.session.send_bytes(&bytes[written..])?;

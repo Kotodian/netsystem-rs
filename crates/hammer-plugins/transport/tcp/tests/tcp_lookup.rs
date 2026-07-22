@@ -1,6 +1,6 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use hammer_core::protocol::tcp::TcpCapabilities;
+use hammer_plugin_tcp::TcpCapabilities;
 use hammer_plugin_tcp::lookup::{
     TcpIpv4ListenerAddress, TcpIpv6ListenerAddress, TcpListenerLookupAccess, TcpLookupSnapshot,
     TcpLookupValue, TcpV4ListenerKey, TcpV6ListenerKey,

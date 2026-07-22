@@ -3,9 +3,9 @@ use std::sync::{Mutex, OnceLock};
 use std::thread::ThreadId;
 use std::time::Duration;
 
-use hammer_core::data_plane::DataPlaneBufferConfig;
-use hammer_core::error::HammerResult;
-use hammer_core::registry::RuntimeRegistry;
+use hammer_runtime::DataPlaneBufferConfig;
+use hammer_runtime::RuntimeRegistry;
+use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
     DataPlaneRuntime, DataPlaneRuntimeConfig, Engine, ProcessContext, ProcessWake,
 };
@@ -17,13 +17,13 @@ static PANICKING_PROCESS_RAN: AtomicBool = AtomicBool::new(false);
 static CLOCK_OBSERVED: AtomicBool = AtomicBool::new(false);
 
 #[hammer_component_macros::process_node(name = "panicking-process-runtime-test")]
-async fn panicking_process_runtime_test(_: ProcessContext) -> HammerResult<()> {
+async fn panicking_process_runtime_test(_: ProcessContext) -> RuntimeResult<()> {
     PANICKING_PROCESS_RAN.store(true, Ordering::Release);
     panic!("injected Process Node panic");
 }
 
 #[hammer_component_macros::process_node(name = "process-runtime-test")]
-async fn process_runtime_test(mut context: ProcessContext) -> HammerResult<()> {
+async fn process_runtime_test(mut context: ProcessContext) -> RuntimeResult<()> {
     assert_eq!(
         context
             .wait_for_event_or_clock(Duration::from_millis(1))

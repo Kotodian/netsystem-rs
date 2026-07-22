@@ -1,29 +1,152 @@
 //! Dynamic plugin registration and dependency selection.
 //!
 //! `PluginMain` corresponds to VPP's `plugin_main_t`: it owns metadata,
-//! dependency order, and DSO handles. Executable registrations are published
-//! independently by load constructors into the runtime registration authority.
+//! dependency order, DSO handles, and executable registration images.
 
-use semver::Version;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use hammer_core::error::HammerError;
-use hammer_infra::spinlock::Spinlock;
+use abi_stable::{
+    RRef, StableAbi,
+    library::RootModule,
+    sabi_trait,
+    std_types::{ROption, RSlice, RSliceMut, RStr},
+};
 use libloading::Library;
+use object::{Object, ObjectSection};
+use serde::Deserialize;
+use semver::Version;
 
-use crate::plugin_loader::{plugin_cdylib_path, read_plugin_registration};
+use crate::error::RuntimeError;
+use crate::init::{ConfigFunction, InitFunction};
+use crate::node::{NodeEntry, NodeFunctionRegistration};
+use crate::plugin_loader::read_plugin_module;
+use crate::process::ProcessEntry;
+use crate::registration::RegistrationImage;
 
-static PLUGIN_MAIN: Spinlock<Option<PluginMain>> = Spinlock::new(None);
+/// The two IP header writers exposed to transport plugins.
+///
+/// The implementation belongs to the IP plugin. This interface is part of
+/// Runtime's single dynamic-plugin root contract so `PluginMain` can retain it
+/// without knowing the IP implementation image.
+#[sabi_trait]
+pub trait IpOutput: Send + Sync {
+    fn write_ipv4_header(
+        &self,
+        output: RSliceMut<'_, u8>,
+        source: RSlice<'_, u8>,
+        destination: RSlice<'_, u8>,
+        protocol: u8,
+        total_len: u16,
+    ) -> bool;
 
-/// Metadata exported by one plugin DSO.
+    fn write_ipv6_header(
+        &self,
+        output: RSliceMut<'_, u8>,
+        source: RSlice<'_, u8>,
+        destination: RSlice<'_, u8>,
+        next_header: u8,
+        payload_len: u16,
+    ) -> bool;
+}
+
+/// Metadata owned by one dynamically loaded plugin module.
 #[repr(C)]
-#[derive(Clone, Copy)]
-pub struct PluginRegistration {
-    pub name: &'static str,
-    pub version: &'static str,
-    pub version_required: &'static str,
-    pub load_after: &'static [&'static str],
+#[derive(Clone, Copy, StableAbi)]
+pub struct PluginMetadata {
+    name: RStr<'static>,
+    version: RStr<'static>,
+    version_required: RStr<'static>,
+    load_after: RSlice<'static, RStr<'static>>,
+}
+
+impl PluginMetadata {
+    #[doc(hidden)]
+    pub const fn new(
+        name: RStr<'static>,
+        version: RStr<'static>,
+        version_required: RStr<'static>,
+        load_after: RSlice<'static, RStr<'static>>,
+    ) -> Self {
+        Self {
+            name,
+            version,
+            version_required,
+            load_after,
+        }
+    }
+
+    #[inline]
+    pub fn name(&self) -> &str {
+        self.name.as_str()
+    }
+
+    #[inline]
+    pub fn version_required(&self) -> &str {
+        self.version_required.as_str()
+    }
+
+    #[inline]
+    pub fn version(&self) -> &str {
+        self.version.as_str()
+    }
+
+    #[inline]
+    pub fn load_after(&self) -> impl Iterator<Item = &str> {
+        self.load_after.as_slice().iter().map(|dependency| dependency.as_str())
+    }
+}
+
+/// The sole `abi_stable` root module exported by every Hammer plugin DSO.
+///
+/// IP is currently the only plugin exposing a callable cross-plugin service,
+/// and it exposes exactly its IPv4 and IPv6 header writers. Other plugins
+/// publish `ROption::RNone`.
+#[repr(C)]
+#[derive(StableAbi)]
+#[sabi(kind(Prefix(prefix_ref = PluginModuleRef)))]
+pub struct PluginModule {
+    pub metadata: PluginMetadata,
+    pub registration_image: RRef<'static, RegistrationImage>,
+    #[sabi(last_prefix_field)]
+    pub ip_output: ROption<RRef<'static, IpOutput_CTO<'static, 'static>>>,
+}
+
+/// Declarative DSO metadata read before loading a plugin.
+///
+/// The macro writes this TOML document into a fixed object-file section so
+/// `PluginMain` can discover the complete dependency closure before `dlopen`.
+#[derive(Deserialize)]
+struct PluginManifest {
+    name: String,
+    version: String,
+    version_required: String,
+    #[serde(default)]
+    load_after: Vec<String>,
+}
+
+impl PluginModule {
+    #[doc(hidden)]
+    pub const fn new(
+        metadata: PluginMetadata,
+        registration_image: RRef<'static, RegistrationImage>,
+        ip_output: ROption<RRef<'static, IpOutput_CTO<'static, 'static>>>,
+    ) -> Self {
+        Self {
+            metadata,
+            registration_image,
+            ip_output,
+        }
+    }
+}
+
+impl RootModule for PluginModuleRef {
+    abi_stable::declare_root_module_statics! {PluginModuleRef}
+
+    const BASE_NAME: &'static str = "hammer_plugin";
+    const NAME: &'static str = "hammer_plugin";
+    const VERSION_STRINGS: abi_stable::sabi_types::VersionStrings =
+        abi_stable::package_version_strings!();
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -50,16 +173,32 @@ pub enum PluginError {
         #[source]
         source: libloading::Error,
     },
-    #[error("failed to read the registration symbol from plugin at `{path}`")]
-    RegistrationSymbol {
+    #[error("failed to initialize the abi_stable root module from plugin `{path}`")]
+    RootModule {
         path: PathBuf,
         #[source]
-        source: libloading::Error,
+        source: crate::plugin_loader::PluginModuleLoadError,
     },
-    #[error("plugin at `{path}` returned a null registration")]
-    RegistrationNull { path: PathBuf },
-    #[error("plugin at `{path}` exported a mismatched registration name")]
+    #[error("plugin at `{path}` exported a mismatched module name")]
     NameMismatch { path: PathBuf },
+    #[error("failed to read plugin manifest from `{path}`")]
+    ManifestRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to inspect plugin manifest in `{path}`: {message}")]
+    ManifestObject { path: PathBuf, message: String },
+    #[error("plugin manifest section is missing from `{path}`")]
+    ManifestMissing { path: PathBuf },
+    #[error("failed to parse plugin manifest in `{path}`")]
+    ManifestParse {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+    #[error("plugin root metadata does not match the manifest in `{path}`")]
+    ManifestMetadataMismatch { path: PathBuf },
     #[error("failed to resolve the daemon executable path")]
     ExecutablePath {
         #[source]
@@ -69,38 +208,30 @@ pub enum PluginError {
     ExecutableParentMissing { executable: PathBuf },
 }
 
-impl From<PluginError> for HammerError {
-    fn from(error: PluginError) -> Self {
-        match error {
-            PluginError::DuplicateRoot { first, duplicate } => {
-                Self::PluginDuplicateRoot { first, duplicate }
-            }
-            PluginError::Cycle { path } => Self::PluginDependencyCycle { path },
-            PluginError::SemVerMismatch { .. } => Self::PluginSemVerMismatch,
-            PluginError::InvalidHostSemVer { .. } => Self::PluginHostVersionInvalid,
-            PluginError::InvalidRequiredSemVer { .. } => Self::PluginRequiredVersionInvalid,
-            PluginError::LibraryOpen { path, .. } => Self::PluginLibraryOpen { path },
-            PluginError::RegistrationSymbol { path, .. } => Self::PluginRegistrationSymbol { path },
-            PluginError::RegistrationNull { path } => Self::PluginRegistrationNull { path },
-            PluginError::NameMismatch { path } => Self::PluginNameMismatch { path },
-            PluginError::ExecutablePath { source } => Self::PluginExecutablePath { source },
-            PluginError::ExecutableParentMissing { executable } => {
-                Self::PluginExecutableParentMissing { executable }
-            }
-        }
-    }
-}
-
 /// Main-thread plugin authority, corresponding to VPP's `plugin_main_t`.
 ///
 /// The process-global library table owns every activated DSO handle, matching
 /// VPP's `vlib_plugin_main`. Failed load transactions never enter this table and
 /// unload before returning their error.
 pub struct PluginMain {
-    library_index_by_name: HashMap<&'static str, usize>,
-    load_order: Vec<&'static str>,
-    // Drop last so every DSO-backed name remains valid while indexes drop.
+    modules_by_plugin: HashMap<String, PluginModuleRef>,
+    library_index_by_name: HashMap<String, usize>,
+    load_order: Vec<String>,
+    builtin_registration_images: Vec<&'static RegistrationImage>,
+    // Drop last so every DSO-backed root module remains valid while indexes drop.
     libraries: Vec<Library>,
+}
+
+impl Default for PluginMain {
+    fn default() -> Self {
+        Self {
+            modules_by_plugin: HashMap::new(),
+            library_index_by_name: HashMap::new(),
+            load_order: Vec::new(),
+            builtin_registration_images: vec![crate::builtin_registration_image()],
+            libraries: Vec::new(),
+        }
+    }
 }
 
 impl std::fmt::Debug for PluginMain {
@@ -113,16 +244,33 @@ impl std::fmt::Debug for PluginMain {
 }
 
 impl PluginMain {
+    /// Adds one host-owned registration image before plugin lifecycle starts.
+    pub fn register_builtin_image(&mut self, image: &'static RegistrationImage) {
+        self.builtin_registration_images.push(image);
+    }
+
+    /// Resolve the configured plugin directory.
+    ///
+    /// VPP owns plugin-path selection in `plugin_main`; Hammer accepts
+    /// `HAMMER_PLUGIN_DIR` and otherwise loads libraries beside the daemon.
+    pub fn directory(&self) -> Result<PathBuf, PluginError> {
+        if let Some(path) = std::env::var_os("HAMMER_PLUGIN_DIR") {
+            return Ok(PathBuf::from(path));
+        }
+        let executable =
+            std::env::current_exe().map_err(|source| PluginError::ExecutablePath { source })?;
+        executable
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or(PluginError::ExecutableParentMissing { executable })
+    }
+
     /// Load configured roots and their transitive `load_after` dependencies.
     ///
-    /// A failed load drops the partially built `PluginMain`; DSO destructors
-    /// unlink constructor-published contributions before the handles close. A
-    /// successful dependency closure remains mapped until process exit.
-    pub fn load(
-        host_version: &str,
-        plugin_path: &Path,
-        roots: &[String],
-    ) -> Result<(), PluginError> {
+    /// A failed transaction drops its DSO handles. A successful dependency
+    /// closure remains mapped until exit.
+    pub fn load(&mut self, host_version: &str, roots: &[String]) -> Result<(), PluginError> {
+        let plugin_path = self.directory()?;
         if roots.is_empty() {
             return Ok(());
         }
@@ -139,121 +287,219 @@ impl PluginMain {
             requested.insert(name, index);
         }
 
-        let mut process_main = PLUGIN_MAIN.lock();
+        let mut manifests = HashMap::with_capacity(roots.len());
+        let mut visiting = HashSet::with_capacity(roots.len());
+        let mut resolved = HashSet::with_capacity(roots.len());
+        let mut load_order = Vec::with_capacity(roots.len());
+        for root in roots {
+            Self::resolve_load_order(
+                host_version,
+                &plugin_path,
+                root,
+                self,
+                &mut manifests,
+                &mut visiting,
+                &mut resolved,
+                &mut load_order,
+            )?;
+        }
+
         let mut transaction = Self {
+            modules_by_plugin: HashMap::with_capacity(roots.len()),
             library_index_by_name: HashMap::with_capacity(roots.len()),
             load_order: Vec::with_capacity(roots.len()),
+            builtin_registration_images: self.builtin_registration_images.clone(),
             libraries: Vec::with_capacity(roots.len()),
         };
-        let mut visiting = HashSet::with_capacity(roots.len());
-        let mut loaded = HashSet::with_capacity(roots.len());
-        for root in roots {
-            transaction.load_one(
-                host_version,
-                plugin_path,
-                root,
-                process_main.as_ref(),
-                &mut visiting,
-                &mut loaded,
-            )?;
+        for name in load_order {
+            let manifest = manifests
+                .get(&name)
+                .expect("resolved plugin must retain its manifest");
+            transaction.load_one(&plugin_path, manifest)?;
         }
 
         if transaction.load_order.is_empty() {
             return Ok(());
         }
 
-        let main = process_main.get_or_insert_with(|| Self {
-            library_index_by_name: HashMap::with_capacity(transaction.libraries.len()),
-            load_order: Vec::with_capacity(transaction.load_order.len()),
-            libraries: Vec::with_capacity(transaction.libraries.len()),
-        });
-        let library_base = main.libraries.len();
-        for (&name, &index) in &transaction.library_index_by_name {
-            main.library_index_by_name
-                .insert(name, library_base + index);
+        let library_base = self.libraries.len();
+        for (name, &index) in &transaction.library_index_by_name {
+            self.library_index_by_name
+                .insert(name.clone(), library_base + index);
         }
-        main.load_order.append(&mut transaction.load_order);
-        main.libraries.append(&mut transaction.libraries);
+        self.modules_by_plugin.extend(transaction.modules_by_plugin);
+        self.load_order.append(&mut transaction.load_order);
+        self.libraries.append(&mut transaction.libraries);
         Ok(())
     }
 
-    fn load_one<'a>(
-        &mut self,
+    fn resolve_load_order(
         host_version: &str,
         plugin_path: &Path,
-        name: &'a str,
-        active: Option<&PluginMain>,
-        visiting: &mut HashSet<&'a str>,
-        loaded: &mut HashSet<&'a str>,
+        name: &str,
+        active: &PluginMain,
+        manifests: &mut HashMap<String, PluginManifest>,
+        visiting: &mut HashSet<String>,
+        resolved: &mut HashSet<String>,
+        load_order: &mut Vec<String>,
     ) -> Result<(), PluginError> {
-        if active
-            .and_then(|main| main.library_index_by_name.get(name))
-            .is_some()
-        {
+        if active.library_index_by_name.contains_key(name) || resolved.contains(name) {
             return Ok(());
         }
-        if visiting.contains(name) {
-            return Err(PluginError::Cycle {
-                path: plugin_cdylib_path(plugin_path, name),
-            });
+        let path = plugin_path.join(libloading::library_filename(format!("hammer_plugin_{name}")));
+        if !visiting.insert(name.to_owned()) {
+            return Err(PluginError::Cycle { path });
         }
-        if loaded.contains(name) {
-            return Ok(());
-        }
-        visiting.insert(name);
 
-        let path = plugin_cdylib_path(plugin_path, name);
-        // SAFETY: a successful transaction moves the handle into the
-        // process-global PluginMain. A failed transaction drops it after the
-        // DSO destructor unlinks its constructor-published registration image.
+        let bytes = std::fs::read(&path).map_err(|source| PluginError::ManifestRead {
+            path: path.clone(),
+            source,
+        })?;
+        let file = object::File::parse(&*bytes).map_err(|source| PluginError::ManifestObject {
+            path: path.clone(),
+            message: source.to_string(),
+        })?;
+        let section = file
+            .sections()
+            .find(|section| {
+                section
+                    .name()
+                    .is_ok_and(|name| matches!(name, "__hammer_plugin" | ".hammer_plugin"))
+            })
+            .ok_or_else(|| PluginError::ManifestMissing { path: path.clone() })?;
+        let data = section.data().map_err(|source| PluginError::ManifestObject {
+            path: path.clone(),
+            message: source.to_string(),
+        })?;
+        let data = std::str::from_utf8(data).map_err(|source| PluginError::ManifestObject {
+            path: path.clone(),
+            message: source.to_string(),
+        })?;
+        let manifest: PluginManifest =
+            toml::from_str(data).map_err(|source| PluginError::ManifestParse {
+                path: path.clone(),
+                source,
+            })?;
+        if manifest.name != name {
+            return Err(PluginError::NameMismatch { path });
+        }
+        host_meets_plugin_requirement(host_version, &manifest.version_required)?;
+        for dependency in &manifest.load_after {
+            Self::resolve_load_order(
+                host_version,
+                plugin_path,
+                dependency,
+                active,
+                manifests,
+                visiting,
+                resolved,
+                load_order,
+            )?;
+        }
+        visiting.remove(name);
+        resolved.insert(name.to_owned());
+        manifests.insert(name.to_owned(), manifest);
+        load_order.push(name.to_owned());
+        Ok(())
+    }
+
+    fn load_one(&mut self, plugin_path: &Path, manifest: &PluginManifest) -> Result<(), PluginError> {
+        let path = plugin_path.join(libloading::library_filename(format!(
+            "hammer_plugin_{}",
+            manifest.name
+        )));
+        // SAFETY: PluginMain retains each successfully opened library until
+        // shutdown, so its ABI root and registration image remain valid.
         let library =
             unsafe { Library::new(&path) }.map_err(|source| PluginError::LibraryOpen {
                 path: path.clone(),
                 source,
             })?;
-        let (exported_name, version_required, dependencies) = {
-            let registration = read_plugin_registration(&library)
-                .map_err(|source| PluginError::RegistrationSymbol {
-                    path: path.clone(),
-                    source,
-                })?
-                .ok_or_else(|| PluginError::RegistrationNull { path: path.clone() })?;
-            (
-                registration.name,
-                registration.version_required,
-                registration.load_after,
-            )
-        };
-        if exported_name != name {
-            return Err(PluginError::NameMismatch { path });
+        let module = read_plugin_module(&library).map_err(|source| PluginError::RootModule {
+            path: path.clone(),
+            source,
+        })?;
+        let metadata = module.metadata();
+        if metadata.name() != manifest.name
+            || metadata.version() != manifest.version
+            || metadata.version_required() != manifest.version_required
+            || metadata.load_after().ne(manifest.load_after.iter().map(String::as_str))
+        {
+            return Err(PluginError::ManifestMetadataMismatch { path });
         }
-        host_meets_plugin_requirement(host_version, version_required)?;
-
         let library_index = self.libraries.len();
         self.libraries.push(library);
+        self.modules_by_plugin.insert(manifest.name.clone(), module);
         self.library_index_by_name
-            .insert(exported_name, library_index);
-        for dependency in dependencies {
-            self.load_one(
-                host_version,
-                plugin_path,
-                dependency,
-                active,
-                visiting,
-                loaded,
-            )?;
-        }
-        visiting.remove(name);
-        loaded.insert(exported_name);
-        self.load_order.push(exported_name);
+            .insert(manifest.name.clone(), library_index);
+        self.load_order.push(manifest.name.clone());
         Ok(())
     }
 
-    pub fn loaded_plugins() -> Vec<&'static str> {
-        PLUGIN_MAIN
-            .lock()
-            .as_ref()
-            .map_or_else(Vec::new, |main| main.load_order.clone())
+    pub fn loaded_plugins(&self) -> Vec<String> {
+        self.load_order.clone()
+    }
+
+    #[inline]
+    pub(crate) fn registration_generation(&self) -> u64 {
+        (self.load_order.len() + 1) as u64
+    }
+
+    fn collect_registrations<T: Copy + 'static>(
+        &self,
+        inventory: impl Fn(&RegistrationImage) -> &'static [T],
+    ) -> Vec<T> {
+        let mut registrations = Vec::new();
+        for image in &self.builtin_registration_images {
+            registrations.extend_from_slice(inventory(image));
+        }
+        for name in &self.load_order {
+            let Some(module) = self.modules_by_plugin.get(name) else {
+                continue;
+            };
+            registrations.extend_from_slice(inventory(module.registration_image().get()));
+        }
+        registrations
+    }
+
+    pub(crate) fn init_functions(&self) -> Vec<InitFunction> {
+        self.collect_registrations(RegistrationImage::init_functions)
+    }
+
+    pub(crate) fn config_functions(&self, early: bool) -> Vec<ConfigFunction> {
+        self.collect_registrations(|image| image.config_functions(early))
+    }
+
+    pub(crate) fn worker_init_functions(&self) -> Vec<InitFunction> {
+        self.collect_registrations(RegistrationImage::worker_init_functions)
+    }
+
+    pub(crate) fn main_loop_enter_functions(&self) -> Vec<InitFunction> {
+        self.collect_registrations(RegistrationImage::main_loop_enter_functions)
+    }
+
+    pub(crate) fn main_loop_exit_functions(&self) -> Vec<InitFunction> {
+        self.collect_registrations(RegistrationImage::main_loop_exit_functions)
+    }
+
+    pub(crate) fn graph_nodes(&self) -> Vec<NodeEntry> {
+        self.collect_registrations(RegistrationImage::graph_nodes)
+    }
+
+    pub(crate) fn node_functions(&self) -> Vec<NodeFunctionRegistration> {
+        self.collect_registrations(RegistrationImage::node_functions)
+    }
+
+    pub(crate) fn process_nodes(&self) -> Vec<ProcessEntry> {
+        self.collect_registrations(RegistrationImage::process_nodes)
+    }
+
+    /// Resolves one activated plugin module retained by this `PluginMain`.
+    pub fn plugin(&self, name: &str) -> Result<PluginModuleRef, RuntimeError> {
+        self.modules_by_plugin
+            .get(name)
+            .copied()
+            .ok_or_else(|| RuntimeError::invariant(format!("plugin `{name}` is not loaded")))
     }
 }
 

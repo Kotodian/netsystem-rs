@@ -2,27 +2,23 @@ use std::mem::{size_of, transmute};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::protocol::icmp::{
+    IcmpBuildError, IcmpErrorFamily, IcmpErrorMetadata, IcmpGeneratedPacket, IcmpHeader,
+    build_echo_reply, build_icmp_error_packet,
+};
+use crate::protocol::wire::read_header;
 use arc_swap::ArcSwap;
 use hammer_core::data_plane::{
     BufferFrame, BufferPacketCursor, Index, NodeId, NodeNext, SecondaryOpaque,
 };
-use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::protocol::icmp::{
-    IcmpBuildError, IcmpErrorFamily, IcmpErrorMetadata, IcmpGeneratedPacket, IcmpHeader,
-    build_echo_reply, build_icmp_error_packet,
-};
-use hammer_core::protocol::wire::read_header;
 use hammer_runtime::{
-    DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
-    TraceFormatter, add_packet_trace,
+    DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, TraceFormatter,
+    add_packet_trace, format_packet_trace,
 };
+use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use hammer_service::data_plane::set_index_node_error_code;
 use hammer_service::opaque::NetworkOpaque;
-use hammer_service::trace::codec::{
-    TraceDecodeCursor, put_option_icmp_error_family, put_option_ip_version, put_option_u16,
-    put_option_u32, put_option_usize, put_u8, put_u16,
-};
 
 use super::{IpInputError, IpProtocol, IpVersion, ip_header};
 
@@ -73,7 +69,7 @@ pub enum IcmpNodeError {
     UnsupportedFamily,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct IcmpInputTrace {
     pub version: Option<IpVersion>,
     pub icmp_type: Option<u8>,
@@ -82,81 +78,14 @@ pub struct IcmpInputTrace {
     pub next: u16,
 }
 
-impl IcmpInputTrace {
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let mut cursor = TraceDecodeCursor::new(bytes);
-        let version = cursor.read_option_ip_version()?;
-        let icmp_type = if cursor.read_bool()? {
-            Some(cursor.read_u8()?)
-        } else {
-            None
-        };
-        let code = if cursor.read_bool()? {
-            Some(cursor.read_u8()?)
-        } else {
-            None
-        };
-        let trace = Self {
-            version,
-            icmp_type,
-            code,
-            error: cursor.read_option_u16()?,
-            next: cursor.read_u16()?,
-        };
-        cursor.is_empty().then_some(trace)
-    }
-}
-
-impl PacketTrace for IcmpInputTrace {
-    fn encode_trace(&self, out: &mut Vec<u8>) {
-        put_option_ip_version(out, self.version);
-        match self.icmp_type {
-            Some(value) => {
-                hammer_service::trace::codec::put_bool(out, true);
-                put_u8(out, value);
-            }
-            None => hammer_service::trace::codec::put_bool(out, false),
-        }
-        match self.code {
-            Some(value) => {
-                hammer_service::trace::codec::put_bool(out, true);
-                put_u8(out, value);
-            }
-            None => hammer_service::trace::codec::put_bool(out, false),
-        }
-        put_option_u16(out, self.error);
-        put_u16(out, self.next);
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct IcmpEchoRequestTrace {
     pub generated_len: Option<usize>,
     pub error: Option<u16>,
     pub next: u16,
 }
 
-impl IcmpEchoRequestTrace {
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let mut cursor = TraceDecodeCursor::new(bytes);
-        let trace = Self {
-            generated_len: cursor.read_option_usize()?,
-            error: cursor.read_option_u16()?,
-            next: cursor.read_u16()?,
-        };
-        cursor.is_empty().then_some(trace)
-    }
-}
-
-impl PacketTrace for IcmpEchoRequestTrace {
-    fn encode_trace(&self, out: &mut Vec<u8>) {
-        put_option_usize(out, self.generated_len);
-        put_option_u16(out, self.error);
-        put_u16(out, self.next);
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct IcmpErrorTrace {
     pub family: Option<IcmpErrorFamily>,
     pub ingress_interface: Option<u32>,
@@ -164,53 +93,6 @@ pub struct IcmpErrorTrace {
     pub generated_len: Option<usize>,
     pub error: Option<u16>,
     pub next: u16,
-}
-
-impl IcmpErrorTrace {
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let mut cursor = TraceDecodeCursor::new(bytes);
-        let trace = Self {
-            family: cursor.read_option_icmp_error_family()?,
-            ingress_interface: cursor.read_option_u32()?,
-            local_source_present: cursor.read_bool()?,
-            generated_len: cursor.read_option_usize()?,
-            error: cursor.read_option_u16()?,
-            next: cursor.read_u16()?,
-        };
-        cursor.is_empty().then_some(trace)
-    }
-}
-
-impl PacketTrace for IcmpErrorTrace {
-    fn encode_trace(&self, out: &mut Vec<u8>) {
-        put_option_icmp_error_family(out, self.family);
-        put_option_u32(out, self.ingress_interface);
-        hammer_service::trace::codec::put_bool(out, self.local_source_present);
-        put_option_usize(out, self.generated_len);
-        put_option_u16(out, self.error);
-        put_u16(out, self.next);
-    }
-}
-
-fn format_icmp_input_trace(bytes: &[u8]) -> String {
-    match IcmpInputTrace::decode(bytes) {
-        Some(trace) => format!("{trace:?}"),
-        None => format!("IcmpInputTrace invalid={bytes:?}"),
-    }
-}
-
-fn format_icmp_echo_request_trace(bytes: &[u8]) -> String {
-    match IcmpEchoRequestTrace::decode(bytes) {
-        Some(trace) => format!("{trace:?}"),
-        None => format!("IcmpEchoRequestTrace invalid={bytes:?}"),
-    }
-}
-
-fn format_icmp_error_trace(bytes: &[u8]) -> String {
-    match IcmpErrorTrace::decode(bytes) {
-        Some(trace) => format!("{trace:?}"),
-        None => format!("IcmpErrorTrace invalid={bytes:?}"),
-    }
 }
 
 impl IcmpNodeError {
@@ -389,11 +271,11 @@ impl IcmpInputControlPlane {
     }
 
     /// Wire default nexts into the ICMP-input local-next table and publish slots.
-    pub fn attach_consumer(&mut self, consumer: NodeId) -> CoreResult<()> {
+    pub fn attach_consumer(&mut self, consumer: NodeId) -> RuntimeResult<()> {
         let nodes = self
             .nodes
             .as_ref()
-            .ok_or_else(|| CoreError::internal("icmp input attach requires node runtime"))?;
+            .ok_or_else(|| RuntimeError::invariant("icmp input attach requires node runtime"))?;
         let ip4_slot = nodes.add_node_next_slot(consumer, self.ip4_default_node)?;
         let ip6_slot = if self.ip6_default_node == self.ip4_default_node {
             ip4_slot
@@ -420,14 +302,13 @@ impl IcmpInputControlPlane {
         version: IpVersion,
         icmp_type: u8,
         node: NodeId,
-    ) -> CoreResult<u16> {
+    ) -> RuntimeResult<u16> {
         let consumer = self.consumer.ok_or_else(|| {
-            CoreError::internal("icmp input register_type requires attach_consumer")
+            RuntimeError::invariant("icmp input register_type requires attach_consumer")
         })?;
-        let nodes = self
-            .nodes
-            .as_ref()
-            .ok_or_else(|| CoreError::internal("icmp input register_type requires node runtime"))?;
+        let nodes = self.nodes.as_ref().ok_or_else(|| {
+            RuntimeError::invariant("icmp input register_type requires node runtime")
+        })?;
         let slot = nodes.add_node_next_slot(consumer, node)?;
         self.inner.rcu(|current| {
             let mut next = IcmpInputSnapshot::clone(current);
@@ -438,7 +319,7 @@ impl IcmpInputControlPlane {
     }
 
     #[inline]
-    pub fn unregister_type(&self, version: IpVersion, icmp_type: u8) -> CoreResult<()> {
+    pub fn unregister_type(&self, version: IpVersion, icmp_type: u8) -> RuntimeResult<()> {
         self.inner.rcu(|current| {
             let mut next = IcmpInputSnapshot::clone(current);
             next.unregister_type(version, icmp_type);
@@ -649,7 +530,7 @@ pub struct IcmpInputNode {
     snapshot: IcmpInputSnapshotHandle,
 }
 
-fn register_icmp_input(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+fn register_icmp_input(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
     let drop_slot = NodeNext::slot(IcmpInputNext::Drop);
     let snapshot = IcmpInputSnapshotHandle::new(Arc::new(ArcSwap::from_pointee(
         IcmpInputSnapshot::new(drop_slot, drop_slot),
@@ -669,7 +550,7 @@ impl Node for IcmpInputNode {
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_icmp_input_trace)
+        Some(format_packet_trace!(IcmpInputTrace))
     }
 
     #[inline]
@@ -678,7 +559,7 @@ impl Node for IcmpInputNode {
     }
 
     #[inline]
-    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
         Ok(self.runtime_data)
     }
 }
@@ -706,7 +587,7 @@ impl Node for IcmpEchoRequestNode {
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_icmp_echo_request_trace)
+        Some(format_packet_trace!(IcmpEchoRequestTrace))
     }
 
     #[inline]
@@ -751,14 +632,14 @@ fn register_icmp_input_runtime(snapshot: IcmpInputSnapshotHandle) -> NodeRuntime
     NodeRuntimeData::from_usize(slot).expect("ICMP input runtime slot overflow")
 }
 
-fn icmp_input_runtime(data: NodeRuntimeData) -> CoreResult<IcmpInputRuntime> {
+fn icmp_input_runtime(data: NodeRuntimeData) -> RuntimeResult<IcmpInputRuntime> {
     let slot = data.usize_word(0)?;
     icmp_input_runtimes()
         .lock()
-        .map_err(|_| CoreError::internal("ICMP input runtime registry poisoned"))?
+        .map_err(|_| RuntimeError::invariant("ICMP input runtime registry poisoned"))?
         .get(slot)
         .cloned()
-        .ok_or_else(|| CoreError::internal("ICMP input runtime slot is invalid"))
+        .ok_or_else(|| RuntimeError::invariant("ICMP input runtime slot is invalid"))
 }
 
 fn icmp_input_process(
@@ -797,7 +678,7 @@ fn icmp_path_mtu_process_frame(runtime: &DataPlaneRuntime, frame: &mut BufferFra
     NodeResult::drop()
 }
 
-fn update_path_mtu_from_index(runtime: &DataPlaneRuntime, index: Index) -> CoreResult<()> {
+fn update_path_mtu_from_index(runtime: &DataPlaneRuntime, index: Index) -> RuntimeResult<()> {
     let packet = collect_current_chain_for_icmp_generation(runtime, index)?;
     let _ = hammer_service::net::pmtu::process_ipv4_icmp_path_mtu_packet(packet.as_ref());
     Ok(())
@@ -824,7 +705,7 @@ pub struct IcmpErrorNode {
     source_table: Option<IcmpErrorSourceTableHandle>,
 }
 
-fn register_icmp_error(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+fn register_icmp_error(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_internal_with_next_names(
         IcmpErrorNode::new([NodeId::new(0); IcmpErrorNext::COUNT]),
         &IcmpErrorNext::NEXT_NAMES,
@@ -854,7 +735,7 @@ impl Node for IcmpErrorNode {
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_icmp_error_trace)
+        Some(format_packet_trace!(IcmpErrorTrace))
     }
 
     #[inline]
@@ -863,7 +744,7 @@ impl Node for IcmpErrorNode {
     }
 
     #[inline]
-    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
         sync_icmp_error_runtime(self.runtime_data, self.source_table.clone())?;
         Ok(self.runtime_data)
     }
@@ -893,26 +774,26 @@ fn register_icmp_error_runtime(
 fn sync_icmp_error_runtime(
     data: NodeRuntimeData,
     source_table: Option<IcmpErrorSourceTableHandle>,
-) -> CoreResult<()> {
+) -> RuntimeResult<()> {
     let slot = data.usize_word(0)?;
     let mut runtimes = icmp_error_runtimes()
         .lock()
-        .map_err(|_| CoreError::internal("ICMP error runtime registry poisoned"))?;
+        .map_err(|_| RuntimeError::invariant("ICMP error runtime registry poisoned"))?;
     let runtime = runtimes
         .get_mut(slot)
-        .ok_or_else(|| CoreError::internal("ICMP error runtime slot is invalid"))?;
+        .ok_or_else(|| RuntimeError::invariant("ICMP error runtime slot is invalid"))?;
     runtime.source_table = source_table;
     Ok(())
 }
 
-fn icmp_error_runtime(data: NodeRuntimeData) -> CoreResult<IcmpErrorRuntime> {
+fn icmp_error_runtime(data: NodeRuntimeData) -> RuntimeResult<IcmpErrorRuntime> {
     let slot = data.usize_word(0)?;
     icmp_error_runtimes()
         .lock()
-        .map_err(|_| CoreError::internal("ICMP error runtime registry poisoned"))?
+        .map_err(|_| RuntimeError::invariant("ICMP error runtime registry poisoned"))?
         .get(slot)
         .cloned()
-        .ok_or_else(|| CoreError::internal("ICMP error runtime slot is invalid"))
+        .ok_or_else(|| RuntimeError::invariant("ICMP error runtime slot is invalid"))
 }
 
 fn icmp_error_process(
@@ -980,7 +861,7 @@ fn next_slot_for_index(
     runtime: &DataPlaneRuntime,
     index: Index,
     snapshot: &IcmpInputSnapshot,
-) -> CoreResult<u16> {
+) -> RuntimeResult<u16> {
     let buffer = runtime.get_buffer(index)?;
     let current = buffer.current();
     let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
@@ -1199,7 +1080,7 @@ fn next_slot_for_index(
 fn next_for_echo_request_index(
     runtime: &DataPlaneRuntime,
     index: Index,
-) -> CoreResult<IcmpEchoRequestNext> {
+) -> RuntimeResult<IcmpEchoRequestNext> {
     let packet = collect_current_chain_for_icmp_generation(runtime, index)?;
     match build_echo_reply(packet.as_ref()) {
         Ok(generated) => {
@@ -1247,7 +1128,7 @@ fn next_for_icmp_error_index(
     runtime: &DataPlaneRuntime,
     index: Index,
     source_table: Option<&IcmpErrorSourceSnapshot>,
-) -> CoreResult<IcmpErrorNext> {
+) -> RuntimeResult<IcmpErrorNext> {
     let buffer = runtime.get_buffer(index)?;
     let opaque = unsafe { transmute::<_, &IcmpErrorOpaque>(buffer.opaque2()) };
     let Some(metadata) = opaque.icmp_error else {
@@ -1360,7 +1241,7 @@ fn next_for_icmp_error_index(
 fn collect_current_chain_for_icmp_generation(
     runtime: &DataPlaneRuntime,
     index: Index,
-) -> CoreResult<Vec<u8>> {
+) -> RuntimeResult<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut chain = runtime.chain(index);
     while let Some(buffer) = chain.next() {
@@ -1375,7 +1256,7 @@ fn refresh_generated_icmp_metadata(
     runtime: &DataPlaneRuntime,
     index: Index,
     generated: &IcmpGeneratedPacket,
-) -> CoreResult<()> {
+) -> RuntimeResult<()> {
     let mut buffer = runtime.get_buffer_mut(index)?;
     let packet_len = generated.packet.len();
     buffer.clear_node_error();

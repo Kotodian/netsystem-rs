@@ -67,9 +67,12 @@ FileMain.
 
 ### `hammer-core`
 
-May define configuration, errors, data-plane identity, Buffer/Frame ownership,
-protocol wire facts, and forwarding facts. It must not poll descriptors,
-schedule nodes, own session queues, or own transport workers.
+The narrow packet-graph ABI contract in ADR-0016 supersedes this ADR's earlier
+Core ownership list. Core may define only data-plane identity and Buffer/Frame
+ownership facts plus errors intrinsic to those primitives. It must not own
+configuration, process services, logging, metrics, protocol wire/state, or
+forwarding policy; it must not poll descriptors, schedule nodes, own session
+queues, or own transport workers.
 
 ### `hammer-runtime`
 

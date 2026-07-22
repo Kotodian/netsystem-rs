@@ -58,18 +58,12 @@ probe_limit = 3
 [[plugin.tcp.listen]]
 address = "10.66.77.1:7300"
 
-[[network.interface]]
+[plugin.tun]
+
+[[plugin.tun.interfaces]]
 name = "utun"
 address = ["10.66.77.1/30"]
-
-[network.interface.mtu]
-l3 = 1500
-ip4 = 1500
-ip6 = 1500
-mpls = 1500
-
-[plugin.tun]
-interfaces = ["utun"]
+mtu = { l3 = 1500, ip4 = 1500, ip6 = 1500, mpls = 1500 }
 
 [[network.route]]
 prefix = "10.66.77.0/30"

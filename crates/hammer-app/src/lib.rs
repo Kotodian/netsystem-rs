@@ -11,8 +11,8 @@ pub mod udp;
 
 use std::sync::Arc;
 
-use hammer_core::error::HammerResult;
 use hammer_infra::segment::Local;
+use hammer_runtime::RuntimeResult;
 use hammer_runtime::app as runtime_app;
 pub use hammer_runtime::app::{AppSession, AppSessionConfig, SessionHandle};
 pub use hammer_runtime::spawn::DataRuntimeContext;
@@ -41,7 +41,7 @@ impl AppContext {
     }
 
     #[inline]
-    pub fn session(&self, handle: SessionHandle) -> HammerResult<Option<Arc<AppSession<Local>>>> {
+    pub fn session(&self, handle: SessionHandle) -> RuntimeResult<Option<Arc<AppSession<Local>>>> {
         self.inner.session(handle)
     }
 
@@ -49,7 +49,7 @@ impl AppContext {
     pub async fn session_async(
         &self,
         handle: SessionHandle,
-    ) -> HammerResult<Option<Arc<AppSession<Local>>>> {
+    ) -> RuntimeResult<Option<Arc<AppSession<Local>>>> {
         self.inner.session_async(handle).await
     }
 }
@@ -81,7 +81,7 @@ impl App {
     }
 
     #[inline]
-    pub fn session(&self, handle: SessionHandle) -> HammerResult<Option<Arc<AppSession<Local>>>> {
+    pub fn session(&self, handle: SessionHandle) -> RuntimeResult<Option<Arc<AppSession<Local>>>> {
         self.context.session(handle)
     }
 
@@ -89,7 +89,7 @@ impl App {
     pub async fn session_async(
         &self,
         handle: SessionHandle,
-    ) -> HammerResult<Option<Arc<AppSession<Local>>>> {
+    ) -> RuntimeResult<Option<Arc<AppSession<Local>>>> {
         self.context.session_async(handle).await
     }
 }

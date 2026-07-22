@@ -2,12 +2,12 @@ use std::fmt;
 use std::sync::Arc;
 
 use hammer_core::data_plane::{DataPlaneBuffers, Index};
-use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::fifo::Fifo;
 use hammer_infra::segment::{Local, Segment, Svm};
 use hammer_runtime::app::{
     AppSession, SessionEventQueue, SessionEvt, SessionEvtType, SessionMsgQueue, SessionSegment,
 };
+use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
 
 use crate::session::SessionId;
 
@@ -17,17 +17,17 @@ enum SessionAppRuntimeError {
     TxEventQueue,
 }
 
-impl From<SessionAppRuntimeError> for CoreError {
+impl From<SessionAppRuntimeError> for RuntimeError {
     fn from(error: SessionAppRuntimeError) -> Self {
-        CoreError::lifecycle("session app", error.to_string())
+        RuntimeError::lifecycle("session app", error.to_string())
     }
 }
 
 #[inline]
-fn checked_add_ooo_accepted(total: u32, accepted: u32) -> CoreResult<u32> {
+fn checked_add_ooo_accepted(total: u32, accepted: u32) -> RuntimeResult<u32> {
     total
         .checked_add(accepted)
-        .ok_or_else(|| CoreError::internal("ooo rx accepted length overflow"))
+        .ok_or_else(|| RuntimeError::invariant("ooo rx accepted length overflow"))
 }
 
 pub struct SessionAppRuntime<S: SessionSegment> {
@@ -100,7 +100,7 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
             .and_then(|(stored, session)| (*stored == session_id).then_some(session))
     }
 
-    pub fn connected(&self, session_id: SessionId) -> CoreResult<()>
+    pub fn connected(&self, session_id: SessionId) -> RuntimeResult<()>
     where
         Self: SessionAppRuntimeCreate<S>,
     {
@@ -109,12 +109,12 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
         };
         session
             .push_event(SessionEvtType::Connect)
-            .map_err(CoreError::from)?;
+            .map_err(RuntimeError::from)?;
         self.notify_evt(&session);
         Ok(())
     }
 
-    pub fn closed(&self, session_id: SessionId) -> CoreResult<()>
+    pub fn closed(&self, session_id: SessionId) -> RuntimeResult<()>
     where
         Self: SessionAppRuntimeCreate<S>,
     {
@@ -123,26 +123,30 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
         };
         session
             .push_event(SessionEvtType::Close)
-            .map_err(CoreError::from)?;
+            .map_err(RuntimeError::from)?;
         self.notify_evt(&session);
         Ok(())
     }
 
-    pub fn discard_acked_tx_bytes(&mut self, session_id: SessionId, len: usize) -> CoreResult<bool>
+    pub fn discard_acked_tx_bytes(
+        &mut self,
+        session_id: SessionId,
+        len: usize,
+    ) -> RuntimeResult<bool>
     where
         Self: SessionAppRuntimeCreate<S>,
     {
         let Some(session) = self.session(session_id) else {
             return Ok(false);
         };
-        let dropped = session.drop_tx_acked(len).map_err(CoreError::from)?;
+        let dropped = session.drop_tx_acked(len).map_err(RuntimeError::from)?;
         if dropped != 0 {
             self.notify_tx(&session);
         }
         Ok(dropped != 0)
     }
 
-    pub fn pending_send_len(&self, session_id: SessionId) -> CoreResult<Option<usize>> {
+    pub fn pending_send_len(&self, session_id: SessionId) -> RuntimeResult<Option<usize>> {
         Ok(self
             .session(session_id)
             .map(|session| session.tx_fifo().max_dequeue())
@@ -165,10 +169,10 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
         tx_offset: usize,
         payload_len: usize,
         index: Index,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         let session = self
             .session(session_id)
-            .ok_or_else(|| CoreError::internal("app session is missing"))?;
+            .ok_or_else(|| RuntimeError::invariant("app session is missing"))?;
         let written = session
             .tx_fifo()
             .peek_segments(tx_offset, payload_len, |first, second| {
@@ -178,11 +182,11 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
                 if !second.is_empty() {
                     self.buffers.append(index, second)?;
                 }
-                CoreResult::Ok(first.len() + second.len())
+                RuntimeResult::Ok(first.len() + second.len())
             })
-            .ok_or_else(|| CoreError::internal("app session tx fifo ended early"))??;
+            .ok_or_else(|| RuntimeError::invariant("app session tx fifo ended early"))??;
         if written != payload_len {
-            return Err(CoreError::internal("app session tx fifo ended early"));
+            return Err(RuntimeError::invariant("app session tx fifo ended early"));
         }
         Ok(())
     }
@@ -193,7 +197,7 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
         buffers: &DataPlaneBuffers,
         index: Index,
         urgent: bool,
-    ) -> CoreResult<(u32, u32)>
+    ) -> RuntimeResult<(u32, u32)>
     where
         Self: SessionAppRuntimeCreate<S>,
     {
@@ -208,7 +212,7 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
             let buffer = buffer?;
             let chunk = buffer.current();
             let chunk_len = u32::try_from(chunk.len())
-                .map_err(|_| CoreError::internal("rx buffer length overflow"))?;
+                .map_err(|_| RuntimeError::invariant("rx buffer length overflow"))?;
             if accepted == total {
                 let rx_available_before = session.rx_fifo().max_enqueue();
                 let flags = if urgent_pending {
@@ -219,19 +223,19 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
                 };
                 let wrote = session
                     .enqueue_rx_with_flags(chunk, flags)
-                    .map_err(CoreError::from)?;
+                    .map_err(RuntimeError::from)?;
                 let accepted_now = wrote.min(chunk.len()).min(rx_available_before);
                 let promoted_now = wrote.saturating_sub(accepted_now);
                 accepted = accepted
                     .checked_add(accepted_now as u32)
-                    .ok_or_else(|| CoreError::internal("rx accepted length overflow"))?;
+                    .ok_or_else(|| RuntimeError::invariant("rx accepted length overflow"))?;
                 promoted = promoted
                     .checked_add(promoted_now as u32)
-                    .ok_or_else(|| CoreError::internal("rx promoted length overflow"))?;
+                    .ok_or_else(|| RuntimeError::invariant("rx promoted length overflow"))?;
             }
             total = total
                 .checked_add(chunk_len)
-                .ok_or_else(|| CoreError::internal("rx buffer length overflow"))?;
+                .ok_or_else(|| RuntimeError::invariant("rx buffer length overflow"))?;
         }
         if accepted != 0 || promoted != 0 {
             self.notify_rx(session);
@@ -245,7 +249,7 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
         buffers: &DataPlaneBuffers,
         index: Index,
         offset: u32,
-    ) -> CoreResult<(u32, Option<(u32, u32)>)> {
+    ) -> RuntimeResult<(u32, Option<(u32, u32)>)> {
         let Some(session) = self.session(session_id) else {
             return Ok((0, None));
         };
@@ -258,16 +262,16 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
             let current = buf.current();
             let chunk_offset = offset
                 .checked_add(total_len)
-                .ok_or_else(|| CoreError::internal("ooo rx offset overflow"))?;
+                .ok_or_else(|| RuntimeError::invariant("ooo rx offset overflow"))?;
             let result = session
                 .rx_fifo()
                 .enqueue_ooo(chunk_offset, current)
-                .map_err(|_| CoreError::internal("ooo enqueue failed"))?;
+                .map_err(|_| RuntimeError::invariant("ooo enqueue failed"))?;
             accepted = checked_add_ooo_accepted(accepted, result.accepted)?;
             if let Some(start) = result.start {
                 let end = start
                     .checked_add(result.len)
-                    .ok_or_else(|| CoreError::internal("ooo span end overflow"))?;
+                    .ok_or_else(|| RuntimeError::invariant("ooo span end overflow"))?;
                 newest_start = Some(match newest_start {
                     Some(existing) => existing.min(start),
                     None => start,
@@ -279,13 +283,13 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
             }
             total_len = total_len
                 .checked_add(current.len() as u32)
-                .ok_or_else(|| CoreError::internal("ooo rx buffer length overflow"))?;
+                .ok_or_else(|| RuntimeError::invariant("ooo rx buffer length overflow"))?;
         }
         let newest = match (newest_start, newest_end) {
             (Some(start), Some(end)) => Some((
                 start,
                 end.checked_sub(start)
-                    .ok_or_else(|| CoreError::internal("ooo span length underflow"))?,
+                    .ok_or_else(|| RuntimeError::invariant("ooo span length underflow"))?,
             )),
             _ => None,
         };
@@ -336,16 +340,12 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
 
 impl SessionAppRuntime<Local> {
     #[inline]
-    pub fn default_local() -> CoreResult<Self> {
+    pub fn default_local() -> RuntimeResult<Self> {
         let tx_evt_q: Arc<SessionMsgQueue> = Arc::new(
             SessionMsgQueue::with_cfg(2048, 1024)
                 .map_err(|_| SessionAppRuntimeError::TxEventQueue)?,
         );
-        let mut config = hammer_core::config::Config::default();
-        config.worker.buffer.slot_bytes = 2048;
-        config.worker.buffer.slots_per_numa = 1;
-        config.worker.buffer.frame_pool_size =
-            hammer_core::data_plane::DEFAULT_BUFFER_FRAME_POOL_SIZE;
+        let config = hammer_runtime::config::Worker::default();
         let runtime = hammer_runtime::new_worker_runtime(&config)?;
         Ok(Self::new(
             1024,
@@ -472,7 +472,7 @@ pub trait SessionAppRuntimeCreate<S: SessionSegment> {
         handle: hammer_runtime::app::SessionHandle,
         config: hammer_runtime::app::AppSessionConfig,
         tx_evt_q: Arc<S::EventQueue>,
-    ) -> CoreResult<Arc<AppSession<S>>>;
+    ) -> RuntimeResult<Arc<AppSession<S>>>;
 
     fn notify_rx(&self, session: &AppSession<S>);
     fn notify_tx(&self, session: &AppSession<S>);
@@ -485,11 +485,11 @@ impl SessionAppRuntimeCreate<Local> for SessionAppRuntime<Local> {
         handle: hammer_runtime::app::SessionHandle,
         config: hammer_runtime::app::AppSessionConfig,
         tx_evt_q: Arc<SessionMsgQueue>,
-    ) -> CoreResult<Arc<AppSession<Local>>> {
+    ) -> RuntimeResult<Arc<AppSession<Local>>> {
         hammer_runtime::app::with_current_app_worker(self.worker_index, |worker| {
             worker
                 .attach_session_local_with_runtime_tx(handle, config, tx_evt_q)
-                .map_err(CoreError::from)
+                .map_err(RuntimeError::from)
         })
     }
 
@@ -515,25 +515,25 @@ impl SessionAppRuntimeCreate<Svm> for SessionAppRuntime<Svm> {
         handle: hammer_runtime::app::SessionHandle,
         config: hammer_runtime::app::AppSessionConfig,
         tx_evt_q: Arc<SessionMsgQueue<Svm>>,
-    ) -> CoreResult<Arc<AppSession<Svm>>> {
+    ) -> RuntimeResult<Arc<AppSession<Svm>>> {
         let rx_fifo = Arc::new(
             Fifo::<Svm>::new(self.seg.clone(), config.fifo_capacity)
-                .map_err(|e| CoreError::internal(format!("svm rx fifo: {e:?}")))?,
+                .map_err(|_| RuntimeError::invariant("svm rx fifo allocation failed"))?,
         );
         let tx_fifo = Arc::new(
             Fifo::<Svm>::new(self.seg.clone(), config.fifo_capacity)
-                .map_err(|e| CoreError::internal(format!("svm tx fifo: {e:?}")))?,
+                .map_err(|_| RuntimeError::invariant("svm tx fifo allocation failed"))?,
         );
         let ring_nitems = config.evt_q_capacity.max(1) as u32;
         let q_nitems = (config.evt_q_capacity + 1).next_power_of_two().max(2) as u32;
         let layout = SessionMsgQueue::<Svm>::layout_bytes(q_nitems, ring_nitems)
-            .map_err(|_| CoreError::internal("invalid svm evt_q layout"))?;
+            .map_err(|_| RuntimeError::invariant("invalid svm evt_q layout"))?;
         let evt_off = self.seg.alloc(layout, 64);
         let evt_q = Arc::new(
             unsafe {
                 SessionMsgQueue::<Svm>::init_at(self.seg.clone(), evt_off, q_nitems, ring_nitems)
             }
-            .map_err(|e| CoreError::internal(format!("svm evt_q: {e:?}")))?,
+            .map_err(|_| RuntimeError::invariant("svm event queue initialization failed"))?,
         );
 
         let session = Arc::new(AppSession::<Svm>::from_parts(

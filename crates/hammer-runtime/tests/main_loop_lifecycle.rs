@@ -1,8 +1,8 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use hammer_core::data_plane::DataPlaneBufferConfig;
-use hammer_core::error::HammerResult;
-use hammer_core::registry::RuntimeRegistry;
+use hammer_runtime::DataPlaneBufferConfig;
+use hammer_runtime::RuntimeRegistry;
+use hammer_runtime::RuntimeResult;
 use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, Engine, EnginePool};
 
 hammer_runtime::__declare_registration_image!();
@@ -10,7 +10,7 @@ hammer_runtime::__declare_registration_image!();
 static EXIT_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 #[hammer_component_macros::main_loop_exit_function]
-fn observe_main_loop_exit(_: &mut Engine) -> HammerResult<()> {
+fn observe_main_loop_exit(_: &mut Engine) -> RuntimeResult<()> {
     EXIT_CALLS.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }

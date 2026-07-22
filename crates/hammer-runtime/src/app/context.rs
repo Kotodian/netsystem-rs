@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use hammer_core::error::HammerResult;
+use crate::error::RuntimeResult;
 use hammer_infra::segment::Segment;
 
 use crate::app::application::with_current_app_worker;
@@ -38,7 +38,7 @@ impl AppContext<Local> {
         self.data_context.worker_count()
     }
 
-    pub fn session(&self, handle: SessionHandle) -> HammerResult<Option<Arc<AppSession<Local>>>> {
+    pub fn session(&self, handle: SessionHandle) -> RuntimeResult<Option<Arc<AppSession<Local>>>> {
         let worker = handle.worker_index() as usize;
         if worker >= self.data_context.worker_count() {
             return Ok(None);
@@ -58,7 +58,7 @@ impl AppContext<Local> {
     pub async fn session_async(
         &self,
         handle: SessionHandle,
-    ) -> HammerResult<Option<Arc<AppSession<Local>>>> {
+    ) -> RuntimeResult<Option<Arc<AppSession<Local>>>> {
         let worker = handle.worker_index() as usize;
         if worker >= self.data_context.worker_count() {
             return Ok(None);

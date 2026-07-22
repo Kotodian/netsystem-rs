@@ -9,7 +9,7 @@
 //! installs the filtered catalog — see [`install::install_packet_graph`].
 
 mod fanout;
-mod install;
+pub(crate) mod install;
 
 pub use crate::NodeEntry;
 pub use install::install_packet_graph;

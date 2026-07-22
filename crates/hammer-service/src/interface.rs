@@ -5,23 +5,107 @@ use std::mem::transmute;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwapOption;
-use hammer_core::config::Config;
 use hammer_core::data_plane::{BufferFrame, Index, NodeId, NodeRegistration};
-use hammer_core::error::{CoreError, CoreResult, HammerResult};
-use hammer_core::forwarding::{AdjacencyRewrite, DpoId, DpoProto, FibTableBuilder};
-use hammer_core::registry::RuntimeRegistry;
 use hammer_runtime::DataPlaneBarrierHandle;
+use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
 use hammer_runtime::{
     DataPlaneRuntime, Engine, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
-    PacketTrace, TraceFormatter, add_packet_trace,
+    add_packet_trace,
 };
-use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+use ipnet::IpNet;
 
 use crate::data_plane::set_index_node_error_code;
 use crate::device::DeviceTxQueue;
-use crate::net::fib::FibTableHandle;
 use crate::opaque::NetworkOpaque;
-use crate::trace::codec::{TraceDecodeCursor, put_option_u16, put_option_u32};
+
+pub const DEFAULT_INTERFACE_MTU: u32 = 9_000;
+
+/// One generic interface declaration embedded by a device plugin's own
+/// configuration section.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InterfaceConfig {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub address: Vec<IpNet>,
+    #[serde(default)]
+    pub mtu: InterfaceConfigMtu,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct InterfaceConfigMtu {
+    pub l3: u32,
+    pub ip4: u32,
+    pub ip6: u32,
+    pub mpls: u32,
+}
+
+impl Default for InterfaceConfigMtu {
+    fn default() -> Self {
+        Self {
+            l3: DEFAULT_INTERFACE_MTU,
+            ip4: DEFAULT_INTERFACE_MTU,
+            ip6: DEFAULT_INTERFACE_MTU,
+            mpls: DEFAULT_INTERFACE_MTU,
+        }
+    }
+}
+
+impl InterfaceConfig {
+    fn validate(&self) -> RuntimeResult<()> {
+        if self.name.is_empty() {
+            return Err(RuntimeError::config_validation(
+                "interface.name must be non-empty",
+            ));
+        }
+        let mtu = self.mtu;
+        if mtu.l3 == 0 || mtu.ip4 == 0 || mtu.ip6 == 0 || mtu.mpls == 0 {
+            return Err(RuntimeError::config_validation(
+                "interface.mtu values must be non-zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Materialize generic interface state from one device plugin's declarations.
+///
+/// Each driver owns where its declarations appear in TOML. The service owns
+/// the common schema, validation, and interface state installation so another
+/// driver can use the same implementation without sharing TUN configuration.
+pub fn configure_interfaces(
+    interfaces: &[InterfaceConfig],
+) -> RuntimeResult<Arc<InterfaceControlPlane>> {
+    let mut names = std::collections::HashSet::with_capacity(interfaces.len());
+    for interface in interfaces {
+        interface.validate()?;
+        if !names.insert(interface.name.as_str()) {
+            return Err(RuntimeError::config_validation(format!(
+                "duplicate interface name: {}",
+                interface.name
+            )));
+        }
+    }
+
+    let plane = INTERFACE_MAIN
+        .load_full()
+        .unwrap_or_else(|| Arc::new(InterfaceControlPlane::new()));
+    for interface in interfaces {
+        let mtu = InterfaceMtu::new(
+            interface.mtu.l3,
+            interface.mtu.ip4,
+            interface.mtu.ip6,
+            interface.mtu.mpls,
+        );
+        let index = plane.register_interface_with_mtu(interface.name.clone(), mtu)?;
+        for address in &interface.address {
+            plane.add_address(index, *address)?;
+        }
+    }
+    INTERFACE_MAIN.store(Some(Arc::clone(&plane)));
+    Ok(plane)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InterfaceMtu {
@@ -141,7 +225,6 @@ impl InterfaceControlHandle {
 pub struct InterfaceControlPlane {
     inner: Arc<InterfaceStateSlot>,
     barrier: Option<DataPlaneBarrierHandle>,
-    connected_routes: Option<InterfaceConnectedRouteControl>,
 }
 
 impl Default for InterfaceControlPlane {
@@ -157,7 +240,6 @@ impl InterfaceControlPlane {
         Self {
             inner: Arc::new(InterfaceStateSlot::new(InterfaceState::default())),
             barrier: None,
-            connected_routes: None,
         }
     }
 
@@ -168,17 +250,11 @@ impl InterfaceControlPlane {
     }
 
     #[inline]
-    pub fn with_connected_routes(mut self, routes: InterfaceConnectedRouteControl) -> Self {
-        self.connected_routes = Some(routes);
-        self
-    }
-
-    #[inline]
     pub fn handle(&self) -> InterfaceControlHandle {
         InterfaceControlHandle::new(Arc::clone(&self.inner))
     }
 
-    pub fn register_interface(&self, name: impl Into<String>) -> CoreResult<u32> {
+    pub fn register_interface(&self, name: impl Into<String>) -> RuntimeResult<u32> {
         self.register_interface_with_mtu(name, InterfaceMtu::default())
     }
 
@@ -186,10 +262,10 @@ impl InterfaceControlPlane {
         &self,
         name: impl Into<String>,
         mtu: InterfaceMtu,
-    ) -> CoreResult<u32> {
+    ) -> RuntimeResult<u32> {
         let name = name.into();
         if name.is_empty() {
-            return Err(CoreError::internal("interface name is empty"));
+            return Err(RuntimeError::invariant("interface name is empty"));
         }
         let mut index = None;
         self.synchronize(|| {
@@ -209,16 +285,18 @@ impl InterfaceControlPlane {
             self.publish(next)?;
             Ok(())
         })?;
-        index.ok_or_else(|| CoreError::internal("interface registration did not publish an index"))
+        index.ok_or_else(|| {
+            RuntimeError::invariant("interface registration did not publish an index")
+        })
     }
 
-    pub fn set_mtu(&self, interface_index: u32, mtu: InterfaceMtu) -> CoreResult<()> {
+    pub fn set_mtu(&self, interface_index: u32, mtu: InterfaceMtu) -> RuntimeResult<()> {
         self.ensure_interface(interface_index)?;
         self.synchronize(|| {
             let current = self.inner.state();
             let mut next = InterfaceState::clone(current);
             let interface = next.interface_mut(interface_index).ok_or_else(|| {
-                CoreError::internal(format!("interface {interface_index} is not registered"))
+                RuntimeError::invariant(format!("interface {interface_index} is not registered"))
             })?;
             interface.mtu = mtu;
             self.publish(next)?;
@@ -231,13 +309,13 @@ impl InterfaceControlPlane {
         interface_index: u32,
         kind: InterfaceMtuKind,
         value: u32,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         self.ensure_interface(interface_index)?;
         self.synchronize(|| {
             let current = self.inner.state();
             let mut next = InterfaceState::clone(current);
             let interface = next.interface_mut(interface_index).ok_or_else(|| {
-                CoreError::internal(format!("interface {interface_index} is not registered"))
+                RuntimeError::invariant(format!("interface {interface_index} is not registered"))
             })?;
             interface.mtu.set(kind, value);
             self.publish(next)?;
@@ -245,7 +323,7 @@ impl InterfaceControlPlane {
         })
     }
 
-    pub fn add_address(&self, interface_index: u32, address: IpNet) -> CoreResult<u32> {
+    pub fn add_address(&self, interface_index: u32, address: IpNet) -> RuntimeResult<u32> {
         self.ensure_interface(interface_index)?;
         let mut address_index = None;
         self.synchronize(|| {
@@ -271,10 +349,10 @@ impl InterfaceControlPlane {
             Ok(())
         })?;
         address_index
-            .ok_or_else(|| CoreError::internal("interface address did not publish an index"))
+            .ok_or_else(|| RuntimeError::invariant("interface address did not publish an index"))
     }
 
-    pub fn remove_address(&self, interface_index: u32, address: IpNet) -> CoreResult<bool> {
+    pub fn remove_address(&self, interface_index: u32, address: IpNet) -> RuntimeResult<bool> {
         self.ensure_interface(interface_index)?;
         let mut removed = false;
         self.synchronize(|| {
@@ -305,18 +383,18 @@ impl InterfaceControlPlane {
     }
 
     #[inline]
-    fn ensure_interface(&self, interface_index: u32) -> CoreResult<()> {
+    fn ensure_interface(&self, interface_index: u32) -> RuntimeResult<()> {
         if self.inner.state().interface(interface_index).is_some() {
             Ok(())
         } else {
-            Err(CoreError::internal(format!(
+            Err(RuntimeError::invariant(format!(
                 "interface {interface_index} is not registered"
             )))
         }
     }
 
     #[inline]
-    fn synchronize<R>(&self, operation: impl FnOnce() -> CoreResult<R>) -> CoreResult<R> {
+    fn synchronize<R>(&self, operation: impl FnOnce() -> RuntimeResult<R>) -> RuntimeResult<R> {
         if let Some(barrier) = &self.barrier {
             barrier.synchronize(operation)
         } else {
@@ -325,153 +403,18 @@ impl InterfaceControlPlane {
     }
 
     #[inline]
-    fn publish(&self, state: InterfaceState) -> CoreResult<()> {
-        if let Some(routes) = &self.connected_routes {
-            routes.publish_state(&state)?;
-        }
+    fn publish(&self, state: InterfaceState) -> RuntimeResult<()> {
         self.inner.replace_after_barrier(state);
         Ok(())
     }
 }
 
-/// Process-level interface control plane (VPP-style main). Filled by
-/// `interface_init` from `[[network.interface]]` only — no device open.
+/// Process-level interface control plane (VPP-style main). Device plugins
+/// supply their own configuration sections; service owns the generic state.
 pub static INTERFACE_MAIN: ArcSwapOption<InterfaceControlPlane> = ArcSwapOption::const_empty();
 
 pub fn reset_interface_main_for_test() {
     INTERFACE_MAIN.store(None);
-}
-
-pub fn init(reg: &RuntimeRegistry) -> HammerResult<()> {
-    let plane = init_interface(reg.require::<Config>()?)?;
-    reg.set(plane);
-    Ok(())
-}
-
-#[hammer_component_macros::init_function(name = "interface_init")]
-fn init_interface(config: Arc<Config>) -> HammerResult<Arc<InterfaceControlPlane>> {
-    let plane = InterfaceControlPlane::new();
-    for iface in &config.network.interface {
-        let mtu = InterfaceMtu::new(iface.mtu.l3, iface.mtu.ip4, iface.mtu.ip6, iface.mtu.mpls);
-        let index = plane.register_interface_with_mtu(iface.name.clone(), mtu)?;
-        for address in &iface.address {
-            plane.add_address(index, *address)?;
-        }
-    }
-    let plane = Arc::new(plane);
-    INTERFACE_MAIN.store(Some(Arc::clone(&plane)));
-    Ok(plane)
-}
-
-#[derive(Debug, Clone)]
-pub struct InterfaceConnectedRouteControl {
-    table: FibTableHandle,
-    drop_next: u16,
-    receive_next: u16,
-    connected_nexts: Option<InterfaceConnectedNexts>,
-}
-
-impl InterfaceConnectedRouteControl {
-    #[inline]
-    pub fn new(table: FibTableHandle, drop_next: u16, receive_next: u16) -> Self {
-        Self {
-            table,
-            drop_next,
-            receive_next,
-            connected_nexts: None,
-        }
-    }
-
-    #[inline]
-    pub fn with_connected_adjacency(
-        mut self,
-        adjacency_rewrite_next: u16,
-        interface_output_next: u16,
-    ) -> Self {
-        self.connected_nexts = Some(InterfaceConnectedNexts {
-            adjacency_rewrite_next,
-            interface_output_next,
-        });
-        self
-    }
-
-    fn publish_state(&self, state: &InterfaceState) -> CoreResult<()> {
-        let mut builder = FibTableBuilder::<u16>::new(self.drop_next);
-        for record in state.addresses.iter().filter(|record| !record.removed) {
-            self.add_address_routes(&mut builder, record);
-        }
-        self.table.replace_after_barrier(builder.build());
-        Ok(())
-    }
-
-    fn add_address_routes(
-        &self,
-        builder: &mut FibTableBuilder<u16>,
-        record: &InterfaceAddressRecord,
-    ) {
-        match record.address {
-            IpNet::V4(address) => {
-                let receive = Ipv4Net::new(address.addr(), 32).expect("IPv4 host prefix");
-                builder.add_ip4_route_dpo(
-                    receive,
-                    DpoId::<u16>::receive(DpoProto::IP4, self.receive_next),
-                );
-                if address.prefix_len() < 32 {
-                    let prefix =
-                        Ipv4Net::new(address.network(), address.prefix_len()).expect("IPv4 prefix");
-                    self.add_connected_route(
-                        builder,
-                        IpNet::V4(prefix),
-                        DpoProto::IP4,
-                        record.interface_index,
-                    );
-                }
-            }
-            IpNet::V6(address) => {
-                let receive = Ipv6Net::new(address.addr(), 128).expect("IPv6 host prefix");
-                builder.add_ip6_route_dpo(
-                    receive,
-                    DpoId::<u16>::receive(DpoProto::IP6, self.receive_next),
-                );
-                if address.prefix_len() < 128 {
-                    let prefix =
-                        Ipv6Net::new(address.network(), address.prefix_len()).expect("IPv6 prefix");
-                    self.add_connected_route(
-                        builder,
-                        IpNet::V6(prefix),
-                        DpoProto::IP6,
-                        record.interface_index,
-                    );
-                }
-            }
-        }
-    }
-
-    fn add_connected_route(
-        &self,
-        builder: &mut FibTableBuilder<u16>,
-        prefix: IpNet,
-        proto: DpoProto,
-        interface_index: u32,
-    ) {
-        let Some(nexts) = self.connected_nexts else {
-            return;
-        };
-        let dpo = builder.add_interface_adjacency_dpo(
-            proto,
-            interface_index,
-            AdjacencyRewrite::empty(),
-            nexts.adjacency_rewrite_next,
-            nexts.interface_output_next,
-        );
-        builder.add_route_dpo(prefix, dpo);
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct InterfaceConnectedNexts {
-    adjacency_rewrite_next: u16,
-    interface_output_next: u16,
 }
 
 struct InterfaceStateSlot {
@@ -744,14 +687,13 @@ impl InterfaceOutputControlPlane {
     }
 
     /// Wire Drop into the interface-output local-next table.
-    pub fn attach_consumer(&mut self, consumer: NodeId) -> CoreResult<()> {
-        let nodes = self
-            .nodes
-            .as_ref()
-            .ok_or_else(|| CoreError::internal("interface output attach requires node runtime"))?;
+    pub fn attach_consumer(&mut self, consumer: NodeId) -> RuntimeResult<()> {
+        let nodes = self.nodes.as_ref().ok_or_else(|| {
+            RuntimeError::invariant("interface output attach requires node runtime")
+        })?;
         let drop = nodes
             .node_by_name("drop")
-            .ok_or_else(|| CoreError::internal("interface output attach requires drop node"))?;
+            .ok_or_else(|| RuntimeError::invariant("interface output attach requires drop node"))?;
         let drop_slot = nodes.add_node_next_slot(consumer, drop)?;
         self.consumer = Some(consumer);
         self.synchronize(|| {
@@ -763,12 +705,12 @@ impl InterfaceOutputControlPlane {
         })
     }
 
-    pub fn register_tx(&self, interface_index: u32, node: NodeId) -> CoreResult<u16> {
+    pub fn register_tx(&self, interface_index: u32, node: NodeId) -> RuntimeResult<u16> {
         let consumer = self.consumer.ok_or_else(|| {
-            CoreError::internal("interface output register_tx requires attach_consumer")
+            RuntimeError::invariant("interface output register_tx requires attach_consumer")
         })?;
         let nodes = self.nodes.as_ref().ok_or_else(|| {
-            CoreError::internal("interface output register_tx requires node runtime")
+            RuntimeError::invariant("interface output register_tx requires node runtime")
         })?;
         let slot = nodes.add_node_next_slot(consumer, node)?;
         self.synchronize(|| {
@@ -780,7 +722,7 @@ impl InterfaceOutputControlPlane {
         })
     }
 
-    pub fn unregister_tx(&self, interface_index: u32) -> CoreResult<bool> {
+    pub fn unregister_tx(&self, interface_index: u32) -> RuntimeResult<bool> {
         let mut removed = false;
         self.synchronize(|| {
             let current = self.inner.state();
@@ -797,7 +739,7 @@ impl InterfaceOutputControlPlane {
     }
 
     #[inline]
-    fn synchronize<R>(&self, operation: impl FnOnce() -> CoreResult<R>) -> CoreResult<R> {
+    fn synchronize<R>(&self, operation: impl FnOnce() -> RuntimeResult<R>) -> RuntimeResult<R> {
         if let Some(barrier) = &self.barrier {
             barrier.synchronize(operation)
         } else {
@@ -817,7 +759,7 @@ impl InterfaceOutputControlPlane {
         engine: &mut Engine,
         interface_output: NodeId,
         tx_queues: &[DeviceTxQueue],
-    ) -> HammerResult<()> {
+    ) -> RuntimeResult<()> {
         self.attach_consumer(interface_output)?;
 
         let mut installed = Vec::new();
@@ -827,7 +769,7 @@ impl InterfaceOutputControlPlane {
                 .find(|(interface_index, _)| *interface_index == queue.interface_index)
             {
                 if *node != queue.output_node {
-                    return Err(CoreError::internal(
+                    return Err(RuntimeError::invariant(
                         "interface TX queues must use one output node per interface",
                     ));
                 }
@@ -885,42 +827,12 @@ impl InterfaceOutputNodeError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct InterfaceOutputTrace {
     pub egress_interface: Option<u32>,
     pub tx_next: Option<u16>,
     pub error: Option<u16>,
     pub next: Option<u16>,
-}
-
-impl InterfaceOutputTrace {
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let mut cursor = TraceDecodeCursor::new(bytes);
-        let trace = Self {
-            egress_interface: cursor.read_option_u32()?,
-            tx_next: cursor.read_option_u16()?,
-            error: cursor.read_option_u16()?,
-            next: cursor.read_option_u16()?,
-        };
-        cursor.is_empty().then_some(trace)
-    }
-}
-
-impl PacketTrace for InterfaceOutputTrace {
-    #[inline]
-    fn encode_trace(&self, out: &mut Vec<u8>) {
-        put_option_u32(out, self.egress_interface);
-        put_option_u16(out, self.tx_next);
-        put_option_u16(out, self.error);
-        put_option_u16(out, self.next);
-    }
-}
-
-fn format_interface_output_trace(bytes: &[u8]) -> String {
-    match InterfaceOutputTrace::decode(bytes) {
-        Some(trace) => format!("{trace:?}"),
-        None => format!("InterfaceOutputTrace invalid={bytes:?}"),
-    }
 }
 
 #[hammer_component_macros::node]
@@ -934,7 +846,7 @@ pub struct InterfaceOutputNode {
     name = "interface_output_graph_init",
     runs_after = ["install_packet_graph"]
 )]
-fn install_interface_output_graph(engine: &mut Engine) -> HammerResult<()> {
+fn install_interface_output_graph(engine: &mut Engine) -> RuntimeResult<()> {
     engine
         .runtime
         .nodes()
@@ -949,7 +861,7 @@ impl InterfaceOutputNode {
         runtime: &DataPlaneRuntime,
         index: Index,
         drop_next: u16,
-    ) -> CoreResult<u16> {
+    ) -> RuntimeResult<u16> {
         let interface_index = {
             let buffer = runtime.get_buffer(index)?;
             let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
@@ -1012,17 +924,12 @@ impl Node for InterfaceOutputNode {
     }
 
     #[inline]
-    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_interface_output_trace)
-    }
-
-    #[inline]
     fn node_process(&self) -> NodeProcessFn {
         interface_output_process
     }
 
     #[inline]
-    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
         Ok(self.runtime_data)
     }
 }
@@ -1056,14 +963,14 @@ fn register_interface_output_runtime(output: InterfaceOutputHandle) -> NodeRunti
     NodeRuntimeData::from_usize(slot).expect("interface output runtime slot overflow")
 }
 
-fn interface_output_runtime(data: NodeRuntimeData) -> CoreResult<InterfaceOutputRuntime> {
+fn interface_output_runtime(data: NodeRuntimeData) -> RuntimeResult<InterfaceOutputRuntime> {
     let slot = data.usize_word(0)?;
     interface_output_runtimes()
         .lock()
-        .map_err(|_| CoreError::internal("interface output runtime registry poisoned"))?
+        .map_err(|_| RuntimeError::invariant("interface output runtime registry poisoned"))?
         .get(slot)
         .cloned()
-        .ok_or_else(|| CoreError::internal("interface output runtime slot is invalid"))
+        .ok_or_else(|| RuntimeError::invariant("interface output runtime slot is invalid"))
 }
 
 fn interface_output_process(
@@ -1093,45 +1000,4 @@ fn interface_output_process_frame(
             Err(_) => drop_next,
         }
     })
-}
-
-#[cfg(test)]
-mod init_tests {
-    use super::*;
-    use hammer_core::config::Config;
-    use hammer_core::config::loader::parse_config;
-    use hammer_core::registry::RuntimeRegistry;
-    use std::str::FromStr;
-    use std::sync::Arc;
-
-    #[test]
-    fn interface_init_publishes_configured_interfaces() {
-        reset_interface_main_for_test();
-        let cfg = parse_config(
-            r#"
-[[network.interface]]
-name = "utun9"
-address = ["10.0.0.1/30"]
-mtu = { l3 = 1500, ip4 = 1500, ip6 = 1500, mpls = 1500 }
-"#,
-        )
-        .expect("parse");
-        let registry = RuntimeRegistry::new();
-        registry.set::<Config>(Arc::new(cfg));
-        init(registry.as_ref()).expect("interface_init");
-
-        let main = INTERFACE_MAIN.load();
-        let plane = main.as_deref().expect("interface main");
-        let handle = plane.handle();
-        let index = handle.interface_index("utun9").expect("name");
-        assert_eq!(handle.interface_name(index).as_deref(), Some("utun9"));
-        assert_eq!(
-            handle.interface_mtu(index),
-            Some(InterfaceMtu::new(1500, 1500, 1500, 1500))
-        );
-        assert_eq!(
-            handle.interface_addresses(index),
-            vec![IpNet::from_str("10.0.0.1/30").expect("cidr")]
-        );
-    }
 }

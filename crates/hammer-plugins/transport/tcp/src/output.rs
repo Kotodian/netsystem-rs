@@ -1,20 +1,33 @@
+#[cfg(test)]
+use crate::{TCP_FLAG_ACK, TCP_FLAG_PSH};
+use crate::{TCP_FLAG_FIN, TCP_FLAG_SYN, tcp_header};
+use abi_stable::{
+    RRef,
+    std_types::{RSlice, RSliceMut},
+};
 use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId, NodeRegistration};
-use hammer_core::error::CoreResult;
-use hammer_core::protocol::ip::{write_ipv4_push_header, write_ipv6_push_header};
-use hammer_core::protocol::tcp::tcp_header;
 use hammer_runtime::{
     DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
 };
+use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use super::{TcpOutputError, read_tcp_egress_endpoints};
 use hammer_service::opaque::NetworkOpaque;
 use std::mem::transmute;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 pub const DEFAULT_TCP_OUTPUT_PAYLOAD_LEN: usize = 1_440;
-pub const TCP_FLAG_FIN: u8 = 0x01;
-pub const TCP_FLAG_SYN: u8 = 0x02;
-pub const TCP_FLAG_PSH: u8 = 0x08;
-pub const TCP_FLAG_ACK: u8 = 0x10;
+
+pub(crate) type IpOutputFunctions = RRef<'static, hammer_runtime::IpOutput_CTO<'static, 'static>>;
+
+pub(crate) fn plugin_functions(
+    plugin_main: &hammer_runtime::PluginMain,
+) -> RuntimeResult<IpOutputFunctions> {
+    plugin_main
+        .plugin("ip")?
+        .ip_output()
+        .into_option()
+        .ok_or_else(|| RuntimeError::invariant("plugin `ip` exports no IP output functions"))
+}
 
 #[hammer_component_macros::node_next]
 pub enum TcpOutputNext {
@@ -46,7 +59,7 @@ impl TcpOutputNode {
     }
 }
 
-pub fn register_tcp_output(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+pub fn register_tcp_output(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
     if let Some(node) = runtime.nodes().node_by_name(TcpOutputNode::NODE_NAME) {
         return Ok(node);
     }
@@ -68,7 +81,7 @@ impl Node for TcpOutputNode {
     }
 
     #[inline]
-    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
         Ok(NodeRuntimeData::default())
     }
 }
@@ -100,15 +113,17 @@ fn tcp_output_node_process_frame(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
 ) -> NodeResult {
+    let output = crate::TCP_MAIN.load_full().map(|main| main.ip_output());
     hammer_runtime::process_frame!(runtime, frame, |index| {
-        tcp_output_next_for_index(runtime, index).unwrap_or(TcpOutputNext::Drop)
+        tcp_output_next_for_index(runtime, index, output).unwrap_or(TcpOutputNext::Drop)
     })
 }
 
 fn tcp_output_next_for_index(
     runtime: &DataPlaneRuntime,
     index: Index,
-) -> CoreResult<TcpOutputNext> {
+    output: Option<IpOutputFunctions>,
+) -> RuntimeResult<TcpOutputNext> {
     let buffer = runtime.get_buffer(index)?;
     let header = buffer.current();
     if tcp_header(header).is_err() {
@@ -126,11 +141,11 @@ fn tcp_output_next_for_index(
 
     match (local, remote) {
         (IpAddr::V4(src), IpAddr::V4(dst)) => {
-            tcp_output_push_ipv4(runtime, index, src, dst, tcp_len)?;
+            tcp_output_push_ipv4(runtime, index, src, dst, tcp_len, output)?;
             Ok(TcpOutputNext::Lookup)
         }
         (IpAddr::V6(src), IpAddr::V6(dst)) => {
-            tcp_output_push_ipv6(runtime, index, src, dst, tcp_len)?;
+            tcp_output_push_ipv6(runtime, index, src, dst, tcp_len, output)?;
             Ok(TcpOutputNext::Lookup)
         }
         _ => {
@@ -147,15 +162,15 @@ fn tcp_output_push_ipv4(
     src: Ipv4Addr,
     dst: Ipv4Addr,
     tcp_len: usize,
-) -> CoreResult<()> {
+    output: Option<IpOutputFunctions>,
+) -> RuntimeResult<()> {
     const IPV4_HEADER_LEN: usize = 20;
-    let total_len = u16::try_from(IPV4_HEADER_LEN + tcp_len).map_err(|_| {
-        hammer_core::error::CoreError::internal("tcp-output ipv4 total length overflow")
-    })?;
+    let total_len = u16::try_from(IPV4_HEADER_LEN + tcp_len)
+        .map_err(|_| RuntimeError::invariant("tcp-output ipv4 total length overflow"))?;
     let mut buffer = runtime.get_buffer_mut(index)?;
     {
         let header = buffer.prepend_mut(IPV4_HEADER_LEN)?;
-        write_ipv4_push_header(header, src, dst, 6, total_len)?;
+        write_ipv4_header(header, src, dst, 6, total_len, output)?;
     }
     let packet_len = buffer.current().len();
     let tcp_header_len = tcp_header(&buffer.current()[IPV4_HEADER_LEN..])
@@ -181,15 +196,15 @@ fn tcp_output_push_ipv6(
     src: Ipv6Addr,
     dst: Ipv6Addr,
     tcp_len: usize,
-) -> CoreResult<()> {
+    output: Option<IpOutputFunctions>,
+) -> RuntimeResult<()> {
     const IPV6_HEADER_LEN: usize = 40;
-    let payload_len = u16::try_from(tcp_len).map_err(|_| {
-        hammer_core::error::CoreError::internal("tcp-output ipv6 payload length overflow")
-    })?;
+    let payload_len = u16::try_from(tcp_len)
+        .map_err(|_| RuntimeError::invariant("tcp-output ipv6 payload length overflow"))?;
     let mut buffer = runtime.get_buffer_mut(index)?;
     {
         let header = buffer.prepend_mut(IPV6_HEADER_LEN)?;
-        write_ipv6_push_header(header, src, dst, 6, payload_len)?;
+        write_ipv6_header(header, src, dst, 6, payload_len, output)?;
     }
     let packet_len = buffer.current().len();
     let tcp_header_len = tcp_header(&buffer.current()[IPV6_HEADER_LEN..])
@@ -205,6 +220,105 @@ fn tcp_output_push_ipv6(
     );
     network.ip_mut().set_ip_version(Some(6));
     network.ip_mut().set_ip_protocol(Some(6));
+    Ok(())
+}
+
+fn write_ipv4_header(
+    header: &mut [u8],
+    source: Ipv4Addr,
+    destination: Ipv4Addr,
+    protocol: u8,
+    total_len: u16,
+    output: Option<IpOutputFunctions>,
+) -> RuntimeResult<()> {
+    #[cfg(test)]
+    if output.is_none() {
+        return write_ipv4_header_for_test(header, source, destination, protocol, total_len);
+    }
+    let output =
+        output.ok_or_else(|| RuntimeError::invariant("IP output functions are unavailable"))?;
+    if output.get().write_ipv4_header(
+        RSliceMut::from_mut_slice(header),
+        RSlice::from_slice(&source.octets()),
+        RSlice::from_slice(&destination.octets()),
+        protocol,
+        total_len,
+    ) {
+        Ok(())
+    } else {
+        Err(RuntimeError::invariant("IP output rejected IPv4 header"))
+    }
+}
+
+fn write_ipv6_header(
+    header: &mut [u8],
+    source: Ipv6Addr,
+    destination: Ipv6Addr,
+    next_header: u8,
+    payload_len: u16,
+    output: Option<IpOutputFunctions>,
+) -> RuntimeResult<()> {
+    #[cfg(test)]
+    if output.is_none() {
+        return write_ipv6_header_for_test(header, source, destination, next_header, payload_len);
+    }
+    let output =
+        output.ok_or_else(|| RuntimeError::invariant("IP output functions are unavailable"))?;
+    if output.get().write_ipv6_header(
+        RSliceMut::from_mut_slice(header),
+        RSlice::from_slice(&source.octets()),
+        RSlice::from_slice(&destination.octets()),
+        next_header,
+        payload_len,
+    ) {
+        Ok(())
+    } else {
+        Err(RuntimeError::invariant("IP output rejected IPv6 header"))
+    }
+}
+
+#[cfg(test)]
+fn write_ipv4_header_for_test(
+    header: &mut [u8],
+    source: Ipv4Addr,
+    destination: Ipv4Addr,
+    protocol: u8,
+    total_len: u16,
+) -> RuntimeResult<()> {
+    let header = header
+        .get_mut(..20)
+        .ok_or_else(|| RuntimeError::invariant("test IPv4 header is truncated"))?;
+    header.fill(0);
+    header[0] = 0x45;
+    header[2..4].copy_from_slice(&total_len.to_be_bytes());
+    header[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+    header[8] = 255;
+    header[9] = protocol;
+    header[12..16].copy_from_slice(&source.octets());
+    header[16..20].copy_from_slice(&destination.octets());
+    let checksum = hammer_infra::checksum::internet_checksum(header);
+    header[10..12].copy_from_slice(&checksum.to_be_bytes());
+    Ok(())
+}
+
+#[cfg(test)]
+fn write_ipv6_header_for_test(
+    header: &mut [u8],
+    source: Ipv6Addr,
+    destination: Ipv6Addr,
+    next_header: u8,
+    payload_len: u16,
+) -> RuntimeResult<()> {
+    let header = header
+        .get_mut(..40)
+        .ok_or_else(|| RuntimeError::invariant("test IPv6 header is truncated"))?;
+    header.fill(0);
+    header[0] = 0x60;
+    header[4..6].copy_from_slice(&payload_len.to_be_bytes());
+    header[6] = next_header;
+    header[7] = 255;
+    header[8..24].copy_from_slice(&source.octets());
+    header[24..40].copy_from_slice(&destination.octets());
     Ok(())
 }
 
@@ -263,15 +377,15 @@ pub const fn tcp_output_sequence_len(flags: u8, payload_len: usize) -> u32 {
 
 #[inline]
 pub fn tcp_output_next_sequence(sequence: u32, sequence_len: u32) -> u32 {
-    let sequence: hammer_core::protocol::tcp::TcpSeq = sequence.into();
+    let sequence: crate::TcpSeq = sequence.into();
     sequence.advance(sequence_len).raw()
 }
 
 #[inline]
 fn tcp_inflight_sequence_len(snd_una: u32, snd_nxt: u32) -> u32 {
     if snd_una != 0 && snd_nxt != 0 {
-        let snd_una: hammer_core::protocol::tcp::TcpSeq = snd_una.into();
-        let snd_nxt: hammer_core::protocol::tcp::TcpSeq = snd_nxt.into();
+        let snd_una: crate::TcpSeq = snd_una.into();
+        let snd_nxt: crate::TcpSeq = snd_nxt.into();
         snd_una.distance_to(snd_nxt)
     } else {
         0
@@ -283,8 +397,8 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex, OnceLock};
 
+    use crate::{TcpCapabilities, TcpSegmentFlags};
     use hammer_core::data_plane::BufferFrame;
-    use hammer_core::protocol::tcp::{TcpCapabilities, TcpSegmentFlags};
     use hammer_runtime::NodeProcessFn;
 
     use super::*;
@@ -319,7 +433,7 @@ mod tests {
             capture_process
         }
 
-        fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
             Ok(self.runtime_data)
         }
     }
@@ -368,11 +482,11 @@ mod tests {
     ) {
         let runtime =
             hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
-                buffers: hammer_core::data_plane::DataPlaneBufferConfig {
+                buffers: hammer_runtime::DataPlaneBufferConfig {
                     buffer_slot_capacity: 2048,
                     buffer_slots: 16,
                     frame_slots: 8,
-                    ..hammer_core::data_plane::DataPlaneBufferConfig::default()
+                    ..hammer_runtime::DataPlaneBufferConfig::default()
                 },
             });
         let lookup_state = Arc::new(Mutex::new(CaptureState::default()));
@@ -437,11 +551,7 @@ mod tests {
             u16::from_be_bytes([packet[2], packet[3]]) as usize,
             packet.len()
         );
-        assert!(
-            hammer_core::protocol::ip::read_ipv4_flags_fragment(&packet[..20]).expect("flags")
-                & hammer_core::protocol::ip::IPV4_FLAG_DONT_FRAGMENT
-                != 0
-        );
+        assert!(u16::from_be_bytes([packet[6], packet[7]]) & 0x4000 != 0);
         assert_eq!(packet[8], 255); // VPP push_ip4 ttl
         assert_eq!(packet[9], 6); // TCP
         assert_eq!(&packet[12..16], &[192, 0, 2, 10]);

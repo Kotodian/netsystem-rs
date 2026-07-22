@@ -1,7 +1,7 @@
 //! Device class abstraction for VPP-aligned hardware interface drivers.
 //!
 //! Mirrors VPP `vnet_device_class_t` + `vnet_hw_if_rxq`/`txq` + polling/interrupt
-//! input node layer. Each device class (TUN, future af_packet, WireGuard tun, ...)
+//! input node layer. Each device class (TUN, future af_packet, ...)
 //! bundles its input/output driver node ids, a `DeviceMain` queue registry, and
 //! per-slot node-runtime state via `DeviceRuntimeSlot<T>`.
 //!
@@ -31,7 +31,7 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 
 use hammer_core::data_plane::{BufferFrame, NodeId};
-use hammer_core::error::{CoreError, CoreResult, HammerResult};
+use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, Engine, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
 };
@@ -93,8 +93,18 @@ pub enum DriverScheduleMode {
 
 /// Device queue ownership registry, analogous to VPP's hardware RX/TX queues.
 pub struct DeviceMain {
+    devices: UnsafeCell<Vec<DeviceRegistration>>,
     rx_queues: UnsafeCell<Vec<DeviceRxQueue>>,
     tx_queues: UnsafeCell<Vec<DeviceTxQueue>>,
+}
+
+/// One device instance owned by the service-wide device registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceRegistration {
+    pub instance: u32,
+    pub interface_index: u32,
+    pub input_node: NodeId,
+    pub output_node: NodeId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,9 +145,44 @@ impl DeviceMain {
     #[inline]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
+            devices: UnsafeCell::new(Vec::new()),
             rx_queues: UnsafeCell::new(Vec::new()),
             tx_queues: UnsafeCell::new(Vec::new()),
         })
+    }
+
+    /// Allocate and publish one device instance before registering its queues.
+    pub fn register_device(
+        &self,
+        interface_index: u32,
+        input_node: NodeId,
+        output_node: NodeId,
+    ) -> RuntimeResult<DeviceRegistration> {
+        let devices = unsafe { &mut *self.devices.get() };
+        if devices
+            .iter()
+            .any(|device| device.interface_index == interface_index)
+        {
+            return Err(RuntimeError::invariant(
+                "interface already has a device instance",
+            ));
+        }
+        let instance = u32::try_from(devices.len())
+            .map_err(|_| RuntimeError::invariant("device instance overflow"))?;
+        let registration = DeviceRegistration {
+            instance,
+            interface_index,
+            input_node,
+            output_node,
+        };
+        devices.push(registration);
+        Ok(registration)
+    }
+
+    #[inline]
+    pub fn device(&self, instance: u32) -> Option<DeviceRegistration> {
+        let devices = unsafe { &*self.devices.get() };
+        devices.get(instance as usize).copied()
     }
 
     pub fn register_rx_queue(
@@ -146,13 +191,20 @@ impl DeviceMain {
         queue_id: u32,
         owner: DataWorkerId,
         mode: DriverScheduleMode,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
+        if self.device(device_instance).is_none() {
+            return Err(RuntimeError::invariant(
+                "device RX queue has no registered device",
+            ));
+        }
         let queues = unsafe { &mut *self.rx_queues.get() };
         if queues
             .iter()
             .any(|queue| queue.device_instance == device_instance && queue.queue_id == queue_id)
         {
-            return Err(CoreError::internal("device RX queue is already registered"));
+            return Err(RuntimeError::invariant(
+                "device RX queue is already registered",
+            ));
         }
         queues.push(DeviceRxQueue {
             device_instance,
@@ -170,13 +222,25 @@ impl DeviceMain {
         queue_id: u32,
         owner: DataWorkerId,
         output_node: NodeId,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
+        let Some(device) = self.device(device_instance) else {
+            return Err(RuntimeError::invariant(
+                "device TX queue has no registered device",
+            ));
+        };
+        if device.interface_index != interface_index {
+            return Err(RuntimeError::invariant(
+                "device TX queue interface does not match device",
+            ));
+        }
         let queues = unsafe { &mut *self.tx_queues.get() };
         if queues
             .iter()
             .any(|queue| queue.device_instance == device_instance && queue.queue_id == queue_id)
         {
-            return Err(CoreError::internal("device TX queue is already registered"));
+            return Err(RuntimeError::invariant(
+                "device TX queue is already registered",
+            ));
         }
         queues.push(DeviceTxQueue {
             interface_index,
@@ -193,12 +257,12 @@ impl DeviceMain {
         device_instance: u32,
         queue_id: u32,
         worker: DataWorkerId,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         let queues = unsafe { &mut *self.tx_queues.get() };
         let queue = queues
             .iter_mut()
             .find(|queue| queue.device_instance == device_instance && queue.queue_id == queue_id)
-            .ok_or_else(|| CoreError::internal("device TX queue is not registered"))?;
+            .ok_or_else(|| RuntimeError::invariant("device TX queue is not registered"))?;
         if !queue.assigned_workers.contains(&worker) {
             queue.assigned_workers.push(worker);
         }
@@ -242,20 +306,19 @@ impl DeviceMain {
     /// Queue assignment is published by the control plane before workers start.
     /// The plugin calls this service-owned method during worker init; it cannot
     /// select output nodes or mutate another worker's graph directly.
-    pub fn install_worker_output_runtime(&self, engine: &mut Engine) -> HammerResult<()> {
+    pub fn install_worker_output_runtime(&self, engine: &mut Engine) -> RuntimeResult<()> {
         let worker = engine.data_worker_id()?;
         let interface_output = engine
             .runtime
             .node_by_name(InterfaceOutputNode::NODE_NAME)
-            .ok_or_else(|| CoreError::internal("interface-output is not registered"))?;
+            .ok_or_else(|| RuntimeError::invariant("interface-output is not registered"))?;
         let mut output =
             InterfaceOutputControlPlane::new().with_nodes(engine.runtime.nodes().clone());
         let tx_queues = self.tx_queues_for_worker(worker);
         output.install_worker_runtime(engine, interface_output, &tx_queues)
     }
 }
-
 #[hammer_component_macros::init_function(name = "device_init")]
-fn init_device() -> HammerResult<Arc<DeviceMain>> {
+fn init_device() -> RuntimeResult<Arc<DeviceMain>> {
     Ok(DeviceMain::new())
 }

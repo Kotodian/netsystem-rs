@@ -1,10 +1,8 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use hammer_core::config::Config;
-use hammer_core::data_plane::DataPlaneBufferConfig;
-use hammer_core::error::HammerResult;
-use hammer_core::registry::RuntimeRegistry;
+use hammer_runtime::DataPlaneBufferConfig;
+use hammer_runtime::RuntimeRegistry;
+use hammer_runtime::RuntimeResult;
 use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, Engine};
 
 hammer_runtime::__declare_registration_image!();
@@ -12,7 +10,7 @@ hammer_runtime::__declare_registration_image!();
 static INIT_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 #[hammer_component_macros::init_function(name = "incremental_lifecycle_probe")]
-fn incremental_lifecycle_probe() -> HammerResult<()> {
+fn incremental_lifecycle_probe() -> RuntimeResult<()> {
     INIT_CALLS.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
@@ -26,9 +24,7 @@ fn test_engine() -> Engine {
             ..DataPlaneBufferConfig::default()
         },
     });
-    let registry = RuntimeRegistry::new();
-    registry.set(Arc::new(Config::default()));
-    Engine::new(runtime, registry)
+    Engine::new(runtime, RuntimeRegistry::new())
 }
 
 #[test]

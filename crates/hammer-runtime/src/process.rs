@@ -12,14 +12,14 @@ use std::sync::Arc;
 use std::thread::{self, ThreadId};
 use std::time::Duration;
 
-use hammer_core::error::{HammerError, HammerResult};
-use hammer_core::registry::RuntimeRegistry;
+use crate::error::{RuntimeError, RuntimeResult};
+use hammer_runtime::RuntimeRegistry;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, LocalSet};
 
 use crate::DataPlaneRuntime;
 
-pub type ProcessFuture = Pin<Box<dyn Future<Output = HammerResult<()>> + 'static>>;
+pub type ProcessFuture = Pin<Box<dyn Future<Output = RuntimeResult<()>> + 'static>>;
 
 #[derive(Clone, Copy)]
 pub struct ProcessEntry {
@@ -105,7 +105,7 @@ impl ProcessContext {
     }
 
     #[inline]
-    pub fn require<T>(&self) -> HammerResult<Arc<T>>
+    pub fn require<T>(&self) -> RuntimeResult<Arc<T>>
     where
         T: Send + Sync + 'static,
     {
@@ -172,16 +172,16 @@ impl ProcessHandle {
         self.name
     }
 
-    pub fn signal(&self, event_type: u64, data: u64) -> HammerResult<()> {
+    pub fn signal(&self, event_type: u64, data: u64) -> RuntimeResult<()> {
         self.events
             .send(ProcessSignal { event_type, data })
-            .map_err(|_| HammerError::service_closed())
+            .map_err(|_| RuntimeError::service_closed())
     }
 }
 
 struct RunningProcess {
     handle: ProcessHandle,
-    task: JoinHandle<HammerResult<()>>,
+    task: JoinHandle<RuntimeResult<()>>,
 }
 
 pub(crate) struct ProcessMain {
@@ -206,11 +206,11 @@ impl ProcessMain {
         self.started
     }
 
-    fn ensure_owner(&self) -> HammerResult<()> {
+    fn ensure_owner(&self) -> RuntimeResult<()> {
         if thread::current().id() == self.owner {
             Ok(())
         } else {
-            Err(HammerError::internal(
+            Err(RuntimeError::invariant(
                 "Process Nodes must be controlled by their main thread",
             ))
         }
@@ -220,13 +220,13 @@ impl ProcessMain {
         &mut self,
         registry: Arc<RuntimeRegistry>,
         runtime: DataPlaneRuntime,
-    ) -> HammerResult<()> {
+        entries: Vec<ProcessEntry>,
+    ) -> RuntimeResult<()> {
         self.ensure_owner()?;
-        let entries = crate::registration::process_nodes();
         let mut names = Vec::with_capacity(entries.len());
         for entry in &entries {
             if names.contains(&entry.name) {
-                return Err(HammerError::internal(format!(
+                return Err(RuntimeError::invariant(format!(
                     "duplicate Process Node `{}`",
                     entry.name
                 )));
@@ -247,7 +247,7 @@ impl ProcessMain {
                 ProcessContext::new(entry.name, Arc::clone(&registry), runtime.clone(), receiver);
             let future =
                 catch_unwind(AssertUnwindSafe(|| (entry.start)(context))).map_err(|_| {
-                    HammerError::internal(format!(
+                    RuntimeError::invariant(format!(
                         "Process Node `{}` panicked during start",
                         entry.name
                     ))
@@ -282,7 +282,7 @@ impl ProcessMain {
         self.local.block_on(runtime, future)
     }
 
-    pub(crate) fn shutdown(&mut self, runtime: &tokio::runtime::Runtime) -> HammerResult<()> {
+    pub(crate) fn shutdown(&mut self, runtime: &tokio::runtime::Runtime) -> RuntimeResult<()> {
         self.ensure_owner()?;
         let mut running = core::mem::take(&mut self.running);
         for process in &running {

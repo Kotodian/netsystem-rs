@@ -2,15 +2,15 @@ use std::mem::transmute;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use hammer_core::data_plane::{
-    BufferFrame, BufferPacketCursor, DataPlaneBufferConfig, Index, NodeId,
+    BufferFrame, BufferPacketCursor, Index, NodeId,
 };
-use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 use hammer_plugin_tcp::{TcpResetNext, TcpResetNode};
 use hammer_runtime::{
-    DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node, NodeProcessFn, NodeResult,
-    NodeRuntimeData,
+    DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node,
+    NodeProcessFn, NodeResult, NodeRuntimeData,
 };
+use hammer_runtime::{RuntimeError, RuntimeResult};
 use hammer_service::opaque::NetworkOpaque;
 
 fn test_runtime_configured(
@@ -42,7 +42,7 @@ impl CaptureNode {
     fn new(state: Arc<Mutex<CaptureState>>) -> Self {
         let mut states = capture_states()
             .lock()
-            .map_err(|_| CoreError::internal("capture state registry poisoned"))
+            .map_err(|_| RuntimeError::invariant("capture state registry poisoned"))
             .expect("capture state registry");
         let slot = states.len();
         states.push(state);
@@ -64,7 +64,7 @@ impl Node for CaptureNode {
     }
 
     #[inline]
-    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
         Ok(self.runtime_data)
     }
 }
@@ -188,8 +188,6 @@ fn tcp_reset_reply_reverses_ip_tuple_and_addrs() {
 
 #[test]
 fn tcp_reset_sets_ipv4_dont_fragment_when_pmtu_enabled() {
-    use hammer_core::protocol::ip::{IPV4_FLAG_DONT_FRAGMENT, read_ipv4_flags_fragment};
-
     let (runtime, reset, lookup_state, _) = reset_graph();
     let packet = ipv4_tcp_packet(0x10, 1_000, 9_000, &[]);
     schedule_packet(&runtime, reset, &packet);
@@ -198,8 +196,8 @@ fn tcp_reset_sets_ipv4_dont_fragment_when_pmtu_enabled() {
 
     let reply = lookup_state.lock().unwrap().packets.clone();
     assert_eq!(reply.len(), 1);
-    let flags = read_ipv4_flags_fragment(&reply[0]).expect("flags");
-    assert_eq!(flags & IPV4_FLAG_DONT_FRAGMENT, IPV4_FLAG_DONT_FRAGMENT);
+    let flags = u16::from_be_bytes([reply[0][6], reply[0][7]]);
+    assert_eq!(flags & 0x4000, 0x4000);
 }
 
 fn reset_graph() -> (

@@ -1,6 +1,6 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use hammer_core::data_plane::{
-    BufferPool, DEFAULT_BUFFER_FRAME_CAPACITY, DataPlaneBufferConfig, Index, NodeId,
+    BufferPool, DEFAULT_BUFFER_FRAME_CAPACITY, Index, NodeId,
 };
 use hammer_runtime::{DataPlaneHandoff, DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId};
 

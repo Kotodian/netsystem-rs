@@ -6,12 +6,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use hammer_app::attach::AttachClient;
-use hammer_app::remote_session::RemoteAppSession;
-use hammer_core::error::{AttachError, CoreError};
+use hammer_app::attach::{AttachClient, AttachClientError};
+use hammer_app::remote_session::{RemoteAppSession, RemoteAppSessionError};
 use hammer_infra::segment::{Segment, Svm};
 use hammer_runtime::app::{AppSessionConfig, SessionEventQueue, SessionHandle};
 use hammer_runtime::attach::{AttachServer, AttachedApp};
+use hammer_runtime::{AttachError, RuntimeError};
 
 static SOCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -160,7 +160,7 @@ fn assert_attach_server_failure_releases_created_descriptors() {
     );
     assert!(matches!(
         result,
-        Err(CoreError::Attach(AttachError::Send { .. }))
+        Err(RuntimeError::Attach(AttachError::Send { .. }))
     ));
 
     drop(server);
@@ -180,6 +180,15 @@ fn assert_attach_client_drop_releases_received_svm_backing_descriptor() {
     let _ = std::fs::remove_file(path);
 }
 
+fn assert_missing_attach_server_returns_client_error() {
+    let path = socket_path("missing-server");
+    let result = AttachClient::connect(
+        path.to_str().expect("socket path"),
+        SessionHandle::new(1, 0),
+    );
+    assert!(matches!(result, Err(AttachClientError::Connect { .. })));
+}
+
 fn assert_malformed_attach_closes_received_descriptor_before_returning_error() {
     let path = socket_path("malformed-owner");
     let listener = UnixListener::bind(&path).expect("bind malformed attach server");
@@ -197,15 +206,40 @@ fn assert_malformed_attach_closes_received_descriptor_before_returning_error() {
     );
     assert!(matches!(
         result,
-        Err(CoreError::Attach(AttachError::DescriptorCount {
+        Err(AttachClientError::DescriptorCount {
             expected: 3,
             actual: 1
-        }))
+        })
     ));
     let mut peer = server_thread.join().expect("join malformed server");
     peer.set_nonblocking(true).expect("set peer nonblocking");
     let mut byte = [0_u8; 1];
     assert_eq!(peer.read(&mut byte).expect("received descriptor closed"), 0);
+    let _ = std::fs::remove_file(path);
+}
+
+fn assert_offset_overflow_closes_every_received_descriptor() {
+    let path = socket_path("offset-overflow-owner");
+    let listener = UnixListener::bind(&path).expect("bind offset overflow attach server");
+    let server_thread = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept offset overflow client");
+        let (sent, peer) = UnixStream::pair().expect("descriptor pair");
+        let identity = descriptor_identity(sent.as_raw_fd()).expect("descriptor identity");
+        let baseline = count_open_identity(identity);
+        let fds = [sent.as_raw_fd(); 3];
+        send_fds(&stream, &fds, [0, 0, 0, u64::MAX]);
+        (sent, peer, identity, baseline)
+    });
+
+    let result = AttachClient::connect(
+        path.to_str().expect("socket path"),
+        SessionHandle::new(1, 0),
+    );
+    assert!(matches!(result, Err(AttachClientError::OffsetOverflow)));
+    let (sent, peer, identity, baseline) = server_thread.join().expect("join offset server");
+    assert_eq!(count_open_identity(identity), baseline);
+    drop(sent);
+    drop(peer);
     let _ = std::fs::remove_file(path);
 }
 
@@ -226,14 +260,25 @@ fn assert_mapping_failure_closes_every_received_descriptor() {
         path.to_str().expect("socket path"),
         SessionHandle::new(1, 0),
     );
-    assert!(matches!(
-        result,
-        Err(CoreError::Attach(AttachError::SegmentMap { .. }))
-    ));
+    assert!(matches!(result, Err(AttachClientError::SegmentMap { .. })));
     let (sent, peer, identity, baseline) = server_thread.join().expect("join mapping server");
     assert_eq!(count_open_identity(identity), baseline);
     drop(sent);
     drop(peer);
+    let _ = std::fs::remove_file(path);
+}
+
+fn assert_remote_session_requires_read_signal() {
+    let (client, attached, path, _) = attach_pair("remote-session-missing-signal");
+    let session = Arc::new(attached.session);
+    let result = RemoteAppSession::new(Arc::clone(&session));
+    assert!(matches!(
+        result,
+        Err(RemoteAppSessionError::SessionSignalMissing)
+    ));
+
+    drop(session);
+    drop(client);
     let _ = std::fs::remove_file(path);
 }
 
@@ -282,7 +327,10 @@ fn attach_descriptor_lifetimes_follow_raii_ownership() {
     assert_attach_client_drop_releases_received_svm_backing_descriptor();
     assert_attach_server_releases_sender_side_signal_endpoint_after_transfer();
     assert_attach_server_failure_releases_created_descriptors();
+    assert_missing_attach_server_returns_client_error();
     assert_malformed_attach_closes_received_descriptor_before_returning_error();
+    assert_offset_overflow_closes_every_received_descriptor();
     assert_mapping_failure_closes_every_received_descriptor();
+    assert_remote_session_requires_read_signal();
     assert_remote_session_duplicate_is_cloexec_and_drops_independently();
 }

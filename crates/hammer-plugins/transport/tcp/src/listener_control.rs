@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use hammer_core::error::{HammerError, HammerResult};
-use hammer_core::protocol::tcp::TcpCapabilities;
+use crate::TcpCapabilities;
 use hammer_runtime::DataWorkerId;
+use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use super::TcpInputControlPlane;
 use super::lookup::{
@@ -86,13 +86,13 @@ impl TcpListenerControlState {
         bind: SocketAddr,
         owner_worker: DataWorkerId,
         capabilities: TcpCapabilities,
-    ) -> HammerResult<TcpLookupId> {
+    ) -> RuntimeResult<TcpLookupId> {
         if self
             .tcp_listeners
             .iter()
             .any(|registration| registration.bind == bind)
         {
-            return Err(HammerError::internal(format!(
+            return Err(RuntimeError::invariant(format!(
                 "tcp listener {bind} is already registered"
             )));
         }
@@ -110,13 +110,13 @@ impl TcpListenerControlState {
         Ok(lookup_id)
     }
 
-    fn close_tcp_listener(&mut self, lookup_id: TcpLookupId) -> HammerResult<()> {
+    fn close_tcp_listener(&mut self, lookup_id: TcpLookupId) -> RuntimeResult<()> {
         let slot = self
             .tcp_listener_slots
             .get(&u64::from(lookup_id))
             .copied()
             .ok_or_else(|| {
-                HammerError::internal(format!(
+                RuntimeError::invariant(format!(
                     "tcp listener {lookup_id} is not registered in tcp main"
                 ))
             })?;
@@ -128,16 +128,16 @@ impl TcpListenerControlState {
         self.publish_tcp_lookup()
     }
 
-    fn alloc_tcp_lookup_id(&mut self) -> HammerResult<TcpLookupId> {
+    fn alloc_tcp_lookup_id(&mut self) -> RuntimeResult<TcpLookupId> {
         let id = self.next_tcp_lookup_id;
         self.next_tcp_lookup_id = self
             .next_tcp_lookup_id
             .checked_add(1)
-            .ok_or_else(|| HammerError::internal("tcp lookup id overflow"))?;
+            .ok_or_else(|| RuntimeError::invariant("tcp lookup id overflow"))?;
         Ok(id)
     }
 
-    fn publish_tcp_lookup(&mut self) -> HammerResult<()> {
+    fn publish_tcp_lookup(&mut self) -> RuntimeResult<()> {
         let mut snapshot = TcpLookupSnapshot::empty();
         for registration in self.tcp_listeners.iter().cloned() {
             let value = TcpLookupValue {
@@ -149,7 +149,9 @@ impl TcpListenerControlState {
         }
         self.tcp_control
             .publish_lookup(snapshot.clone())
-            .map_err(|err| HammerError::internal(format!("publish tcp lookup snapshot: {err}")))?;
+            .map_err(|err| {
+                RuntimeError::invariant(format!("publish tcp lookup snapshot: {err}"))
+            })?;
         self.tcp_lookup = snapshot;
         Ok(())
     }
@@ -207,13 +209,13 @@ impl TcpListenerControlHandle {
         bind: SocketAddr,
         owner_worker: DataWorkerId,
         capabilities: TcpCapabilities,
-    ) -> HammerResult<TcpLookupId> {
+    ) -> RuntimeResult<TcpLookupId> {
         let state = unsafe { self.state.get_mut() };
         state.bind_tcp_listener(bind, owner_worker, capabilities)
     }
 
     #[cfg(test)]
-    pub(super) fn close(&self, lookup_id: TcpLookupId) -> HammerResult<()> {
+    pub(super) fn close(&self, lookup_id: TcpLookupId) -> RuntimeResult<()> {
         let state = unsafe { self.state.get_mut() };
         state.close_tcp_listener(lookup_id)
     }

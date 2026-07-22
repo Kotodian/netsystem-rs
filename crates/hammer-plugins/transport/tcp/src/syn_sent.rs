@@ -4,7 +4,7 @@ use hammer_core::data_plane::{
 };
 use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
 
-use hammer_core::error::{CoreError, CoreResult};
+use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use super::TcpNodeError;
 use super::segment::tcp_packet;
@@ -41,11 +41,11 @@ impl TcpSynSentNode {
     }
 }
 
-pub fn register_tcp_syn_sent(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+pub fn register_tcp_syn_sent(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
     runtime
         .nodes()
         .node_by_name("tcp-syn-sent")
-        .ok_or_else(|| CoreError::internal("TCP worker graph is not registered"))
+        .ok_or_else(|| RuntimeError::invariant("TCP worker graph is not registered"))
 }
 
 impl Node for TcpSynSentNode {
@@ -130,7 +130,7 @@ fn emit_local(
     out_len: &mut usize,
     next: TcpSynSentNext,
     index: Index,
-) -> CoreResult<()> {
+) -> RuntimeResult<()> {
     if *out_len == DEFAULT_BUFFER_FRAME_CAPACITY {
         runtime.enqueue_to_next(frame, &nexts[..*out_len]);
         *out_len = 0;
@@ -148,7 +148,7 @@ fn tcp_syn_sent_index<C, Seg>(
     out_frame: &mut BufferFrame,
     nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
     out_len: &mut usize,
-) -> CoreResult<bool>
+) -> RuntimeResult<bool>
 where
     C: CongestionController + 'static,
     Seg: TcpWorkerStore<C>,

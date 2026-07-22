@@ -1,12 +1,8 @@
-use std::sync::Arc;
-
-use hammer_core::config::Config;
-use hammer_core::registry::RuntimeRegistry;
 use hammer_plugin_ip::{
     IcmpEchoRequestNext, IcmpErrorNext, IcmpInputNext, IpInputNext, IpLocalNext, IpLookupNext,
     IpReassemblyNext, reset_ip_main_for_test,
 };
-use hammer_runtime::init::run_init_functions;
+use hammer_runtime::RuntimeRegistry;
 use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, Engine};
 
 #[test]
@@ -15,11 +11,20 @@ fn ip_plugin_installs_its_vpp_style_packet_graph() {
     reset_ip_main_for_test();
 
     let registry = RuntimeRegistry::new();
-    registry.set(Arc::new(Config::default()));
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let mut engine = Engine::new(runtime, registry);
 
-    run_init_functions(&mut engine).expect("initialize the packet graph");
+    engine
+        .plugin_main_mut()
+        .register_builtin_image(hammer_service::registration_image());
+    let plugin = hammer_plugin_ip::plugin_module();
+    engine
+        .plugin_main_mut()
+        .register_builtin_image(plugin.registration_image().get());
+    engine.configure_early("").expect("configure graph owners");
+    engine
+        .load_plugins(&[], "")
+        .expect("materialize the packet graph");
 
     for name in [
         "device-input",

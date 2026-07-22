@@ -1,9 +1,9 @@
 use std::time::{Duration, Instant};
 
-use hammer_core::error::CoreResult;
 use hammer_infra::fifo_queue::FifoQueue;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
+use hammer_runtime::RuntimeResult;
 
 use super::TcpNodeError;
 use super::connection::TcpConnection;
@@ -141,7 +141,7 @@ impl TcpTimers {
         state: &mut TcpTimerState,
         kind: TcpTimerKind,
         interval: Duration,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         if state.is_armed(kind) {
             return Ok(());
         }
@@ -157,7 +157,7 @@ impl TcpTimers {
         Ok(())
     }
 
-    pub(super) fn validate_interval(&self, interval: Duration) -> CoreResult<()> {
+    pub(super) fn validate_interval(&self, interval: Duration) -> RuntimeResult<()> {
         let ticks = self.duration_ticks(interval);
         if ticks > TCP_TIMER_WHEEL_MAX_INTERVAL_TICKS
             || self.wheel.current_tick().checked_add(ticks).is_none()
@@ -185,7 +185,7 @@ impl TcpTimers {
         state: &mut TcpTimerState,
         kind: TcpTimerKind,
         interval: Duration,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         self.wheel
             .update_timer(
                 index.slot(),

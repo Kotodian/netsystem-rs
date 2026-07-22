@@ -2,31 +2,30 @@ use std::mem::{size_of, transmute};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::forwarding::{
+    Adjacency, AdjacencyIndex, DpoProto, DpoType, FibLookupResult, FibTable, FibTableBuilder,
+    FibTableHandle, ForwardingMetadata,
+};
+use crate::protocol::icmp::IcmpErrorMetadata;
+use crate::protocol::ip::{
+    IPV4_FLAG_DONT_FRAGMENT, IpInputError, IpInputTarget, IpProtocol, IpVersion, Ipv4MtuAction,
+    ParsedIpPacket, ipv4_mtu_check, read_ipv4_flags_fragment,
+};
 use arc_swap::ArcSwapOption;
-use hammer_core::config::{Config, Route, RouteAction};
 use hammer_core::data_plane::{
     BufferFrame, BufferPacketCursor, Index, NodeId, NodeNext, NodeRegistration, SecondaryOpaque,
 };
-use hammer_core::error::{CoreError, CoreResult, HammerResult};
-use hammer_core::forwarding::{
-    Adjacency, AdjacencyIndex, DpoProto, DpoType, FibLookupResult, FibTable, FibTableBuilder,
-};
-use hammer_core::protocol::icmp::IcmpErrorMetadata;
-use hammer_core::protocol::ip::{IpProtocol, IpVersion, ParsedIpPacket};
-use hammer_core::registry::RuntimeRegistry;
 use hammer_runtime::{ControlThreadHandle, DataPlaneBarrierHandle};
 use hammer_runtime::{
-    DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
-    TraceFormatter, add_packet_trace, unlikely,
+    DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
+    TraceFormatter, add_packet_trace, format_packet_trace, unlikely,
 };
+use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use hammer_service::data_plane::set_index_node_error_code;
-use hammer_service::net::fib::FibTableHandle;
-use hammer_service::opaque::{ForwardingMetadata, NetworkOpaque, TapEthernetMetadata};
-use hammer_service::trace::codec::{
-    TraceDecodeCursor, put_option_dpo_type, put_option_u16, put_option_u32, put_u16, put_u32,
-    put_usize,
-};
+use hammer_service::opaque::{NetworkOpaque, TapEthernetMetadata};
+
+use crate::config::{NetworkIpConfig, Route, RouteAction};
 
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
@@ -38,7 +37,7 @@ struct LookupOpaque {
 
 const _: () = assert!(size_of::<LookupOpaque>() == size_of::<SecondaryOpaque>());
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct IpLookupTrace {
     pub fib_index: u32,
     pub route_dpo_type: Option<DpoType>,
@@ -50,83 +49,13 @@ pub struct IpLookupTrace {
     pub next: u16,
 }
 
-impl IpLookupTrace {
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let mut cursor = TraceDecodeCursor::new(bytes);
-        let trace = Self {
-            fib_index: cursor.read_u32()?,
-            route_dpo_type: cursor.read_option_dpo_type()?,
-            route_dpo_index: cursor.read_option_u32()?,
-            load_balance_index: cursor.read_option_u32()?,
-            bucket_index: cursor.read_option_u16()?,
-            dpo_type: cursor.read_option_dpo_type()?,
-            dpo_index: cursor.read_option_u32()?,
-            next: cursor.read_u16()?,
-        };
-        cursor.is_empty().then_some(trace)
-    }
-}
-
-impl PacketTrace for IpLookupTrace {
-    #[inline]
-    fn encode_trace(&self, out: &mut Vec<u8>) {
-        put_u32(out, self.fib_index);
-        put_option_dpo_type(out, self.route_dpo_type);
-        put_option_u32(out, self.route_dpo_index);
-        put_option_u32(out, self.load_balance_index);
-        put_option_u16(out, self.bucket_index);
-        put_option_dpo_type(out, self.dpo_type);
-        put_option_u32(out, self.dpo_index);
-        put_u16(out, self.next);
-    }
-}
-
-fn format_ip_lookup_trace(bytes: &[u8]) -> String {
-    match IpLookupTrace::decode(bytes) {
-        Some(trace) => format!("{trace:?}"),
-        None => format!("IpLookupTrace invalid={bytes:?}"),
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct AdjacencyRewriteTrace {
     pub dpo_index: Option<u32>,
     pub egress_interface: Option<u32>,
     pub rewrite_len: usize,
     pub error: Option<u16>,
     pub next: Option<u16>,
-}
-
-impl AdjacencyRewriteTrace {
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let mut cursor = TraceDecodeCursor::new(bytes);
-        let trace = Self {
-            dpo_index: cursor.read_option_u32()?,
-            egress_interface: cursor.read_option_u32()?,
-            rewrite_len: cursor.read_usize()?,
-            error: cursor.read_option_u16()?,
-            next: cursor.read_option_u16()?,
-        };
-        cursor.is_empty().then_some(trace)
-    }
-}
-
-impl PacketTrace for AdjacencyRewriteTrace {
-    #[inline]
-    fn encode_trace(&self, out: &mut Vec<u8>) {
-        put_option_u32(out, self.dpo_index);
-        put_option_u32(out, self.egress_interface);
-        put_usize(out, self.rewrite_len);
-        put_option_u16(out, self.error);
-        put_option_u16(out, self.next);
-    }
-}
-
-fn format_adjacency_rewrite_trace(bytes: &[u8]) -> String {
-    match AdjacencyRewriteTrace::decode(bytes) {
-        Some(trace) => format!("{trace:?}"),
-        None => format!("AdjacencyRewriteTrace invalid={bytes:?}"),
-    }
 }
 
 pub struct IpLookupControlPlane {
@@ -177,7 +106,7 @@ impl IpLookupControlPlane {
     }
 
     #[inline]
-    pub fn publish(&self, table: FibTable<u16>) -> HammerResult<()> {
+    pub fn publish(&self, table: FibTable<u16>) -> RuntimeResult<()> {
         let table_handle = self.table.clone();
         let barrier = self.barrier.clone();
         let publish = move || {
@@ -220,12 +149,12 @@ impl IpMain {
         Self { routes }
     }
 
-    fn build_table(&self) -> CoreResult<FibTable<u16>> {
+    fn build_table(&self) -> RuntimeResult<FibTable<u16>> {
         let mut builder = FibTableBuilder::<u16>::new(NodeNext::slot(IpLookupNext::Drop));
         for route in self.routes.iter() {
             if let RouteAction::Drop = route
                 .action()
-                .map_err(|err| CoreError::internal(err.to_string()))?
+                .map_err(|err| RuntimeError::invariant(err.to_string()))?
             {
                 builder.add_drop_route(route.prefix);
             }
@@ -233,7 +162,7 @@ impl IpMain {
         Ok(builder.build())
     }
 
-    pub fn register_node(&self, rt: &DataPlaneRuntime) -> CoreResult<NodeId> {
+    pub fn register_node(&self, rt: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
         let table = self.build_table()?;
         let node = IpLookupControlPlane::new(table).node(IpLookupNext::nodes(NodeId::new(0)));
         rt.nodes()
@@ -247,9 +176,15 @@ pub fn reset_for_test() {
     IP_MAIN.store(None);
 }
 
-pub fn init(reg: &RuntimeRegistry) -> HammerResult<()> {
-    let config = reg.require::<Config>()?;
-    let routes = Arc::<[_]>::from(config.network.route.as_slice());
+#[hammer_component_macros::config_function(
+    name = "ip_config",
+    section = "network",
+    early = true,
+    runs_after = ["runtime_worker_config"]
+)]
+fn configure_ip(config: NetworkIpConfig) -> RuntimeResult<()> {
+    config.validate()?;
+    let routes = Arc::<[_]>::from(config.route);
     IP_MAIN.store(Some(Arc::new(IpMain::new(routes))));
     hammer_service::net::pmtu::publish_path_mtu_cache(
         hammer_service::net::pmtu::PathMtuCache::new(),
@@ -261,15 +196,19 @@ pub fn init(reg: &RuntimeRegistry) -> HammerResult<()> {
     name = "ip_init",
     runs_before = ["install_packet_graph"]
 )]
-fn init_ip(engine: &mut hammer_runtime::Engine) -> HammerResult<()> {
-    init(&engine.registry)
+fn init_ip(engine: &mut hammer_runtime::Engine) -> RuntimeResult<()> {
+    if IP_MAIN.load().is_none() {
+        return Err(RuntimeError::invariant("IP configuration was not installed").into());
+    }
+    let _ = engine;
+    Ok(())
 }
 
-pub fn register_ip_lookup(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+pub fn register_ip_lookup(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
     IP_MAIN
         .load()
         .as_deref()
-        .ok_or_else(|| CoreError::internal("ip main not initialized"))?
+        .ok_or_else(|| RuntimeError::invariant("ip main not initialized"))?
         .register_node(runtime)
 }
 
@@ -376,7 +315,7 @@ impl Node for IpLookupNode {
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_ip_lookup_trace)
+        Some(format_packet_trace!(IpLookupTrace))
     }
 
     #[inline]
@@ -385,7 +324,7 @@ impl Node for IpLookupNode {
     }
 
     #[inline]
-    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
         Ok(self.runtime_data)
     }
 }
@@ -589,7 +528,7 @@ impl Node for AdjacencyRewriteNode {
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_adjacency_rewrite_trace)
+        Some(format_packet_trace!(AdjacencyRewriteTrace))
     }
 
     #[inline]
@@ -598,7 +537,7 @@ impl Node for AdjacencyRewriteNode {
     }
 
     #[inline]
-    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
         Ok(self.runtime_data)
     }
 }
@@ -661,24 +600,24 @@ fn register_adjacency_rewrite_runtime(table: FibTableHandle) -> NodeRuntimeData 
     NodeRuntimeData::from_usize(slot).expect("adjacency rewrite runtime slot overflow")
 }
 
-fn ip_lookup_runtime(data: NodeRuntimeData) -> CoreResult<LookupRuntime> {
+fn ip_lookup_runtime(data: NodeRuntimeData) -> RuntimeResult<LookupRuntime> {
     let slot = data.usize_word(0)?;
     lookup_runtimes()
         .lock()
-        .map_err(|_| CoreError::internal("IP lookup runtime registry poisoned"))?
+        .map_err(|_| RuntimeError::invariant("IP lookup runtime registry poisoned"))?
         .get(slot)
         .cloned()
-        .ok_or_else(|| CoreError::internal("IP lookup runtime slot is invalid"))
+        .ok_or_else(|| RuntimeError::invariant("IP lookup runtime slot is invalid"))
 }
 
-fn adjacency_rewrite_runtime(data: NodeRuntimeData) -> CoreResult<AdjacencyRewriteRuntime> {
+fn adjacency_rewrite_runtime(data: NodeRuntimeData) -> RuntimeResult<AdjacencyRewriteRuntime> {
     let slot = data.usize_word(0)?;
     adjacency_rewrite_runtimes()
         .lock()
-        .map_err(|_| CoreError::internal("adjacency rewrite runtime registry poisoned"))?
+        .map_err(|_| RuntimeError::invariant("adjacency rewrite runtime registry poisoned"))?
         .get(slot)
         .cloned()
-        .ok_or_else(|| CoreError::internal("adjacency rewrite runtime slot is invalid"))
+        .ok_or_else(|| RuntimeError::invariant("adjacency rewrite runtime slot is invalid"))
 }
 
 fn ip_lookup_process(
@@ -790,17 +729,13 @@ fn adjacency_mtu_divert(
         } else {
             u16::try_from(current.len()).unwrap_or(u16::MAX)
         };
-        let dont_fragment = hammer_core::protocol::ip::read_ipv4_flags_fragment(current)
-            .is_some_and(|flags| flags & hammer_core::protocol::ip::IPV4_FLAG_DONT_FRAGMENT != 0);
-        hammer_core::protocol::ip::ipv4_mtu_check(
-            packet_len,
-            adjacency.max_l3_packet_bytes,
-            dont_fragment,
-        )
+        let dont_fragment = read_ipv4_flags_fragment(current)
+            .is_some_and(|flags| flags & IPV4_FLAG_DONT_FRAGMENT != 0);
+        ipv4_mtu_check(packet_len, adjacency.max_l3_packet_bytes, dont_fragment)
     };
     match action {
-        hammer_core::protocol::ip::Ipv4MtuAction::Ok => None,
-        hammer_core::protocol::ip::Ipv4MtuAction::IcmpFragNeeded { mtu } => {
+        Ipv4MtuAction::Ok => None,
+        Ipv4MtuAction::IcmpFragNeeded { mtu } => {
             let next = icmp_error_next?;
             let mut buffer = runtime.get_buffer_mut(index).ok()?;
             let opaque = unsafe { transmute::<_, &mut LookupOpaque>(buffer.opaque2_mut()) };
@@ -810,7 +745,7 @@ fn adjacency_mtu_divert(
             ));
             Some(next)
         }
-        hammer_core::protocol::ip::Ipv4MtuAction::Fragment { .. } => fragment_next,
+        Ipv4MtuAction::Fragment { .. } => fragment_next,
     }
 }
 
@@ -819,14 +754,14 @@ fn apply_adjacency_rewrite(
     runtime: &DataPlaneRuntime,
     index: Index,
     adjacency: Adjacency<u16>,
-) -> CoreResult<()> {
+) -> RuntimeResult<()> {
     let rewrite = adjacency.rewrite.as_slice();
     let mut buffer = runtime.get_buffer_mut(index)?;
     if !rewrite.is_empty() {
-        buffer.advance(
-            -isize::try_from(rewrite.len())
-                .map_err(|_| CoreError::internal("adjacency rewrite length exceeds isize"))?,
-        )?;
+        buffer
+            .advance(-isize::try_from(rewrite.len()).map_err(|_| {
+                RuntimeError::invariant("adjacency rewrite length exceeds isize")
+            })?)?;
         buffer.current_mut()[..rewrite.len()].copy_from_slice(rewrite);
     }
     if !rewrite.is_empty() {
@@ -932,8 +867,8 @@ fn packet_from_cached_metadata(
     Some(ParsedIpPacket {
         version,
         protocol,
-        input_target: hammer_core::protocol::ip::IpInputTarget::Lookup,
-        input_error: hammer_core::protocol::ip::IpInputError::None,
+        input_target: IpInputTarget::Lookup,
+        input_error: IpInputError::None,
         source,
         destination,
         packet_len: cursor.packet_len(),

@@ -4,16 +4,13 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::{Deref, DerefMut};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::{TcpCapabilities, TcpConnectionId, TcpFastOpenCookie, TcpTimestampOption};
 use crossbeam_utils::CachePadded;
-use hammer_core::protocol::tcp::{
-    TcpCapabilities, TcpConnectionId, TcpFastOpenCookie, TcpTimestampOption,
-};
-use hammer_core::protocol::transport::TransportConnectionKey;
 use hammer_infra::bihash::{Bihash, BihashKey, FREE_U64};
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_runtime::DataWorkerId;
 
-use crate::{TcpConnection, TcpInputNext, TcpState};
+use crate::{TcpConnection, TcpInputNext, TcpState, TransportConnectionKey};
 use hammer_service::session::SessionId;
 use hammer_service::transport::congestion::CongestionController;
 
@@ -2047,7 +2044,7 @@ mod tests {
         TcpLookupState, TcpLookupValue, TcpV4ListenerKey, pool_index_from_bihash_value,
         pool_index_to_bihash_value, write_bytes,
     };
-    use hammer_core::protocol::tcp::{TcpCapabilities, TcpFastOpenCookie};
+    use crate::{TcpCapabilities, TcpFastOpenCookie};
     use hammer_infra::bihash::Bihash;
     use hammer_infra::pool::Index as PoolIndex;
     use hammer_runtime::DataWorkerId;

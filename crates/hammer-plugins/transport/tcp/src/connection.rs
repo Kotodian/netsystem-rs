@@ -10,16 +10,16 @@ use super::recovery::{TcpRecoveryAck, TcpRecoveryState};
 use super::sack::TcpSackState;
 use super::segment::TcpSegment;
 use super::timers::{TcpTimerKind, TcpTimerState, TcpTimers};
-use crossbeam_utils::CachePadded;
-use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::protocol::ip_ecn::IpEcnCodepoint;
-use hammer_core::protocol::tcp::{
+use crate::protocol::TcpEcnCodepoint;
+use crate::{
     TcpCapabilities, TcpCloseReason, TcpConnectionId, TcpError, TcpFastOpenCookie,
     TcpNegotiatedOptions, TcpPacket, TcpSackBlock, TcpSegmentFlags, TcpSeq, TcpState,
     TcpTimestampOption,
 };
+use crossbeam_utils::CachePadded;
 use hammer_infra::pool::Index as PoolIndex;
 use hammer_runtime::DataWorkerId;
+use hammer_runtime::{RuntimeError, RuntimeResult};
 use hammer_service::session::runtime::RxDelivery;
 use hammer_service::transport::congestion::CongestionController;
 use thiserror::Error;
@@ -76,7 +76,7 @@ impl From<TcpConnectionError> for TcpError {
     }
 }
 
-impl From<TcpConnectionError> for CoreError {
+impl From<TcpConnectionError> for RuntimeError {
     #[inline]
     fn from(error: TcpConnectionError) -> Self {
         TcpError::from(error).into()
@@ -654,7 +654,7 @@ where
         index: PoolIndex,
         timers: &mut TcpTimers,
         now: Instant,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         self.keepalive.last_activity_at = now;
         self.keepalive.probes_sent = 0;
         if self.state == TcpState::Established {
@@ -685,7 +685,7 @@ where
         timers: &mut TcpTimers,
         now: Instant,
         recovery_timing_changed: bool,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         if self.snd_wnd == 0 && self.recovery.has_unacked_data() {
             let interval = self.persist_interval();
             timers.set(index, &mut self.timers, TcpTimerKind::Persist, interval)?;
@@ -807,7 +807,7 @@ where
                 .pending_signals
                 .remove(TcpPendingSignals::ECE_ACK | TcpPendingSignals::ECN_CE);
         }
-        if matches!(packet.ip_ecn, Some(IpEcnCodepoint::Ce)) && self.negotiated_options().ecn {
+        if matches!(packet.ip_ecn, Some(TcpEcnCodepoint::Ce)) && self.negotiated_options().ecn {
             self.ecn.received_ce_counter = self.ecn.received_ce_counter.saturating_add(1);
             self.ecn.pending_signals.insert(TcpPendingSignals::ECE_ACK);
         }
@@ -830,7 +830,7 @@ where
                 self.ecn.pending_signals.remove(TcpPendingSignals::ECN_CE);
             }
         }
-        if matches!(packet.ip_ecn, Some(IpEcnCodepoint::Ce)) {
+        if matches!(packet.ip_ecn, Some(TcpEcnCodepoint::Ce)) {
             self.ecn.received_ce_counter = self.ecn.received_ce_counter.saturating_add(1);
         }
     }
@@ -853,11 +853,11 @@ where
     }
 
     #[inline]
-    fn output_ip_ecn(&self, payload_len: usize, retransmit: bool) -> Option<IpEcnCodepoint> {
+    fn output_ip_ecn(&self, payload_len: usize, retransmit: bool) -> Option<TcpEcnCodepoint> {
         if !self.negotiated_options().ecn || payload_len == 0 || retransmit {
             return None;
         }
-        Some(IpEcnCodepoint::Ect0)
+        Some(TcpEcnCodepoint::Ect0)
     }
 
     #[inline]
@@ -996,7 +996,7 @@ where
         &mut self,
         index: PoolIndex,
         timers: &mut TcpTimers,
-    ) -> CoreResult<bool> {
+    ) -> RuntimeResult<bool> {
         if self.timers.is_active(TcpTimerKind::DelayedAck) {
             timers.reset(index, &mut self.timers, TcpTimerKind::DelayedAck);
             return Ok(true);
@@ -1096,7 +1096,7 @@ where
     }
 
     #[inline]
-    pub(crate) fn ensure_state(&self, state: TcpState) -> CoreResult<()> {
+    pub(crate) fn ensure_state(&self, state: TcpState) -> RuntimeResult<()> {
         if self.state != state {
             return Err(TcpConnectionError::InvalidState.into());
         }
@@ -1128,7 +1128,7 @@ where
         timestamp: Option<TcpTimestampOption>,
         accepted_payload_len: usize,
         local_capabilities: TcpCapabilities,
-    ) -> CoreResult<Option<TcpSegment>> {
+    ) -> RuntimeResult<Option<TcpSegment>> {
         if !flags.contains(TcpSegmentFlags::SYN)
             || flags.intersects(TcpSegmentFlags::ACK | TcpSegmentFlags::RST)
         {
@@ -1166,7 +1166,7 @@ where
         packet: &TcpPacket,
         local_capabilities: TcpCapabilities,
         now: Instant,
-    ) -> CoreResult<Option<TcpSegment>> {
+    ) -> RuntimeResult<Option<TcpSegment>> {
         self.ensure_state(TcpState::SynSent)?;
 
         if let Some(acknowledgment) = packet.acknowledgment
@@ -1276,7 +1276,7 @@ where
         timers: &mut TcpTimers,
         packet: &TcpPacket,
         now: Instant,
-    ) -> CoreResult<Option<TcpSegment>> {
+    ) -> RuntimeResult<Option<TcpSegment>> {
         self.ensure_state(TcpState::SynRcvd)?;
         if !self.observe_inbound_timestamp(
             packet.flags,
@@ -1375,7 +1375,7 @@ where
         &mut self,
         payload_len: usize,
         local_capabilities: TcpCapabilities,
-    ) -> CoreResult<TcpSegment> {
+    ) -> RuntimeResult<TcpSegment> {
         if self.state == TcpState::SynSent {
             let local = self
                 .local()
@@ -1436,7 +1436,11 @@ where
         ))
     }
 
-    pub(crate) fn commit_payload_tx(&mut self, payload_len: usize, now: Instant) -> CoreResult<()> {
+    pub(crate) fn commit_payload_tx(
+        &mut self,
+        payload_len: usize,
+        now: Instant,
+    ) -> RuntimeResult<()> {
         if self.state == TcpState::SynSent {
             if self.tx_intent_sequence.is_some() {
                 self.clear_tx_intent();
@@ -1505,7 +1509,7 @@ where
         index: PoolIndex,
         timers: &mut TcpTimers,
         now: Instant,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         let retransmit = self.retransmit_timeout().retransmit_timeout();
         timers.validate_interval(retransmit)?;
         if self.state != TcpState::Established {
@@ -1570,7 +1574,7 @@ where
         advertised_window: u16,
         sack_blocks: &[TcpSackBlock],
         now: Instant,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         let acknowledgment = TcpSeq::from(acknowledgment);
         let ack_accepted = self.accepts_ack(acknowledgment);
         let snd_una_before = self.snd_una;
@@ -1606,7 +1610,7 @@ where
         timers: &mut TcpTimers,
         packet: &TcpPacket,
         now: Instant,
-    ) -> CoreResult<Option<TcpSegment>> {
+    ) -> RuntimeResult<Option<TcpSegment>> {
         self.ensure_state(TcpState::Established)?;
         if !self.observe_inbound_timestamp(
             packet.flags,
@@ -1635,7 +1639,10 @@ where
         self.receive_fin_in_established(packet)
     }
 
-    fn receive_fin_in_established(&mut self, packet: &TcpPacket) -> CoreResult<Option<TcpSegment>> {
+    fn receive_fin_in_established(
+        &mut self,
+        packet: &TcpPacket,
+    ) -> RuntimeResult<Option<TcpSegment>> {
         if packet.flags.contains(TcpSegmentFlags::FIN)
             && packet.sequence.advance(packet.payload_len as u32) == self.rcv_nxt
         {
@@ -1658,7 +1665,7 @@ where
         timers: &mut TcpTimers,
         packet: &TcpPacket,
         now: Instant,
-    ) -> CoreResult<Option<TcpSegment>> {
+    ) -> RuntimeResult<Option<TcpSegment>> {
         if !self.observe_inbound_timestamp(
             packet.flags,
             packet.timestamp,
@@ -1924,7 +1931,7 @@ where
         has_pending_tx: bool,
         local_capabilities: TcpCapabilities,
         _: Instant,
-    ) -> CoreResult<Option<TcpSegment>> {
+    ) -> RuntimeResult<Option<TcpSegment>> {
         if self.state == TcpState::Established {
             if self.recovery.has_unacked_data() || has_pending_tx {
                 let interval = self.retransmit_timeout().retransmit_timeout();
@@ -1996,7 +2003,7 @@ where
         kind: TcpTimerKind,
         local_capabilities: TcpCapabilities,
         now: Instant,
-    ) -> CoreResult<Option<TcpSegment>> {
+    ) -> RuntimeResult<Option<TcpSegment>> {
         if !self.timer_dispatch_pending(kind) {
             return Ok(None);
         }
@@ -2507,7 +2514,7 @@ mod tests {
     fn receive_close_side_for_test<C: CongestionController>(
         connection: &mut TcpConnection<C>,
         packet: &TcpPacket,
-    ) -> CoreResult<Option<TcpSegment>> {
+    ) -> RuntimeResult<Option<TcpSegment>> {
         let mut timers = TcpTimers::new(Instant::now(), Duration::from_millis(10));
         connection.receive_close_side(PoolIndex::new(0, 0), &mut timers, packet, Instant::now())
     }
@@ -3606,7 +3613,7 @@ mod tests {
         let header_len = segment.write_header(&mut header).expect("write header");
         let parsed =
             etherparse::TcpSlice::from_slice(&header[..header_len]).expect("parse tcp header");
-        let options = hammer_core::protocol::tcp::tcp_options_from_bytes(parsed.options());
+        let options = crate::tcp_options_from_bytes(parsed.options());
 
         assert_eq!(segment.payload_len(), 5);
         assert!(parsed.syn());
@@ -3805,7 +3812,7 @@ mod tests {
         let header_len = segment.write_header(&mut header).expect("write header");
         let parsed =
             etherparse::TcpSlice::from_slice(&header[..header_len]).expect("parse tcp header");
-        let options = hammer_core::protocol::tcp::tcp_options_from_bytes(parsed.options());
+        let options = crate::tcp_options_from_bytes(parsed.options());
         let timestamp = options.timestamp.expect("timestamp");
 
         assert_eq!(timestamp.tsecr, 55);
@@ -3861,7 +3868,7 @@ mod tests {
         let header_len = segment.write_header(&mut header).expect("write header");
         let parsed =
             etherparse::TcpSlice::from_slice(&header[..header_len]).expect("parse tcp header");
-        let options = hammer_core::protocol::tcp::tcp_options_from_bytes(parsed.options());
+        let options = crate::tcp_options_from_bytes(parsed.options());
         let timestamp = options.timestamp.expect("timestamp");
 
         assert_eq!(timestamp.tsecr, 88);
@@ -4080,7 +4087,7 @@ mod tests {
         let header_len = segment.write_header(&mut header).expect("write header");
         let parsed =
             etherparse::TcpSlice::from_slice(&header[..header_len]).expect("parse tcp header");
-        let options = hammer_core::protocol::tcp::tcp_options_from_bytes(parsed.options());
+        let options = crate::tcp_options_from_bytes(parsed.options());
         let timestamp = options.timestamp.expect("timestamp");
 
         assert_eq!(timestamp.tsecr, 88);
@@ -4478,7 +4485,7 @@ mod tests {
             sack_blocks: Vec::new().into(),
             timestamp: None,
             fast_open_cookie: None,
-            ip_ecn: Some(IpEcnCodepoint::Ce),
+            ip_ecn: Some(TcpEcnCodepoint::Ce),
             payload_offset: 0,
             payload_len: 0,
         });
@@ -4562,7 +4569,7 @@ mod tests {
             sack_blocks: Vec::new().into(),
             timestamp: None,
             fast_open_cookie: None,
-            ip_ecn: Some(IpEcnCodepoint::Ce),
+            ip_ecn: Some(TcpEcnCodepoint::Ce),
             payload_offset: 0,
             payload_len: 0,
         });
@@ -4596,7 +4603,7 @@ mod tests {
             sack_blocks: Vec::new().into(),
             timestamp: None,
             fast_open_cookie: None,
-            ip_ecn: Some(IpEcnCodepoint::Ce),
+            ip_ecn: Some(TcpEcnCodepoint::Ce),
             payload_offset: 0,
             payload_len: 0,
         });

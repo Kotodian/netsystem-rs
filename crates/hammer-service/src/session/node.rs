@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::time::Instant;
 
 use hammer_core::data_plane::{BufferFrame, Index, NodeId, NodeRegistration};
-use hammer_core::error::{CoreError, CoreResult};
+use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
 use hammer_runtime::{
     DataPlaneRuntime, DriverNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
 };
@@ -35,7 +35,7 @@ pub type SessionQueueDispatchFn = fn(
     Instant,
     &mut BufferFrame,
     &mut SessionQueueOutput,
-) -> CoreResult<()>;
+) -> RuntimeResult<()>;
 
 /// Accumulates Session Queue TX indexes on the driver Frame and records one
 /// local next per entry. Graph Fanout runs once at [`Self::flush`].
@@ -80,7 +80,7 @@ impl SessionQueueOutput {
         frame: &mut BufferFrame,
         next: SessionQueueNext,
         index: Index,
-    ) -> CoreResult<bool> {
+    ) -> RuntimeResult<bool> {
         if self.io_count >= SESSION_QUEUE_IO_BUDGET {
             return Ok(false);
         }
@@ -123,7 +123,7 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
-pub fn register_session_queue_node(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+pub fn register_session_queue_node(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
     if let Some(node) = runtime.nodes().node_by_name("session-queue") {
         return Ok(node);
     }
@@ -132,7 +132,7 @@ pub fn register_session_queue_node(runtime: &DataPlaneRuntime, _: usize) -> Core
 }
 
 impl SessionQueueNode {
-    pub fn new() -> CoreResult<Self> {
+    pub fn new() -> RuntimeResult<Self> {
         SESSION_QUEUE_NODES.with(|nodes| {
             let mut nodes = nodes.borrow_mut();
             let slot = nodes.len();
@@ -147,7 +147,7 @@ impl SessionQueueNode {
         runtime: &DataPlaneRuntime,
         consumer: NodeId,
         output_node: NodeId,
-    ) -> CoreResult<SessionQueueNext> {
+    ) -> RuntimeResult<SessionQueueNext> {
         let slot = runtime.nodes().add_node_next_slot(consumer, output_node)?;
         Ok(SessionQueueNext::from_slot(slot))
     }
@@ -160,18 +160,20 @@ impl SessionQueueNode {
         runtime: &DataPlaneRuntime,
         consumer: NodeId,
         output_node: NodeId,
-    ) -> CoreResult<SessionQueueNext> {
+    ) -> RuntimeResult<SessionQueueNext> {
         let mut slot = 0usize;
         loop {
             match runtime.nodes().node_next_slot(consumer, slot) {
                 Ok(node) if node == output_node => {
                     return u16::try_from(slot)
                         .map(SessionQueueNext::from_slot)
-                        .map_err(|_| CoreError::internal("session queue next slot overflows u16"));
+                        .map_err(|_| {
+                            RuntimeError::invariant("session queue next slot overflows u16")
+                        });
                 }
                 Ok(_) => slot += 1,
                 Err(_) => {
-                    return Err(CoreError::internal(
+                    return Err(RuntimeError::invariant(
                         "session queue output is not registered",
                     ));
                 }
@@ -187,15 +189,15 @@ impl SessionQueueNode {
         runtime_data: NodeRuntimeData,
         output_next: SessionQueueNext,
         dispatch: SessionQueueDispatchFn,
-    ) -> CoreResult<()> {
+    ) -> RuntimeResult<()> {
         let attachment_slot = runtime_data.usize_word(0)?;
         SESSION_QUEUE_NODES.with(|nodes| {
             let mut nodes = nodes
                 .try_borrow_mut()
-                .map_err(|_| CoreError::internal("session queue nodes borrowed"))?;
+                .map_err(|_| RuntimeError::invariant("session queue nodes borrowed"))?;
             let node = nodes
                 .get_mut(attachment_slot)
-                .ok_or_else(|| CoreError::internal("session queue node slot is invalid"))?;
+                .ok_or_else(|| RuntimeError::invariant("session queue node slot is invalid"))?;
             node.push(SessionQueueAttachment {
                 output_next,
                 dispatch,
@@ -216,7 +218,7 @@ impl Node for SessionQueueNode {
     }
 
     #[inline]
-    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
         Ok(self.runtime_data)
     }
 }
@@ -257,7 +259,7 @@ fn session_queue_node_process(
             frame,
             &mut output,
         )
-        .map_err(CoreError::from)
+        .map_err(RuntimeError::from)
         .map_err(|err| {
             let _ = runtime.record_current_node_error(SessionQueueError::DispatchFailed.code());
             err

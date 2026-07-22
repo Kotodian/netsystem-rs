@@ -1,9 +1,8 @@
 use std::sync::Arc;
 
+use crate::session::SessionBackend;
 use arc_swap::ArcSwapOption;
-use hammer_core::config::SessionBackend;
-use hammer_core::error::HammerResult;
-use hammer_core::registry::RuntimeRegistry;
+use hammer_runtime::RuntimeResult;
 
 pub mod congestion;
 
@@ -43,12 +42,8 @@ pub fn reset_for_test() {
     TRANSPORT_MAIN.store(None);
 }
 
-pub fn init(reg: &RuntimeRegistry) -> HammerResult<()> {
-    init_transport(reg.require::<hammer_core::config::Config>()?)
-}
-
 #[hammer_component_macros::init_function(name = "transport_init")]
-fn init_transport(_config: Arc<hammer_core::config::Config>) -> HammerResult<()> {
+fn init_transport() -> RuntimeResult<()> {
     // Defaults only when no plugin has published yet (config phase may already have).
     if TRANSPORT_MAIN.load().is_none() {
         TRANSPORT_MAIN.store(Some(Arc::new(

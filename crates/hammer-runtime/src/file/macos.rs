@@ -1,7 +1,7 @@
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-use hammer_core::error::{HammerError, HammerResult};
+use crate::error::{RuntimeError, RuntimeResult};
 
 use super::{POLL_BATCH_SIZE, PollEvent, PollSpec, Readiness, decode_index, encode_index};
 
@@ -10,7 +10,7 @@ pub(super) struct Poller {
 }
 
 impl Poller {
-    pub(super) fn new() -> HammerResult<Self> {
+    pub(super) fn new() -> RuntimeResult<Self> {
         // SAFETY: `kqueue` takes no pointers and returns a fresh descriptor or
         // -1 with errno set.
         let fd = unsafe { libc::kqueue() };
@@ -22,19 +22,19 @@ impl Poller {
         Ok(Self { kqueue })
     }
 
-    pub(super) fn add(&self, spec: PollSpec) -> HammerResult<()> {
+    pub(super) fn add(&self, spec: PollSpec) -> RuntimeResult<()> {
         self.update(None, Some(spec))
     }
 
-    pub(super) fn modify(&self, before: PollSpec, after: PollSpec) -> HammerResult<()> {
+    pub(super) fn modify(&self, before: PollSpec, after: PollSpec) -> RuntimeResult<()> {
         self.update(Some(before), Some(after))
     }
 
-    pub(super) fn delete(&self, spec: PollSpec) -> HammerResult<()> {
+    pub(super) fn delete(&self, spec: PollSpec) -> RuntimeResult<()> {
         self.update(Some(spec), None)
     }
 
-    pub(super) fn poll(&self, ready: &mut [PollEvent; POLL_BATCH_SIZE]) -> HammerResult<usize> {
+    pub(super) fn poll(&self, ready: &mut [PollEvent; POLL_BATCH_SIZE]) -> RuntimeResult<usize> {
         let mut events = [empty_event(); POLL_BATCH_SIZE];
         let timeout = libc::timespec {
             tv_sec: 0,
@@ -57,7 +57,7 @@ impl Poller {
             if error.kind() == io::ErrorKind::Interrupted {
                 return Ok(0);
             }
-            return Err(HammerError::internal(format!("poll kqueue: {error}")));
+            return Err(RuntimeError::invariant(format!("poll kqueue: {error}")));
         }
 
         let count = count as usize;
@@ -81,9 +81,9 @@ impl Poller {
         Ok(count)
     }
 
-    fn update(&self, before: Option<PollSpec>, after: Option<PollSpec>) -> HammerResult<()> {
+    fn update(&self, before: Option<PollSpec>, after: Option<PollSpec>) -> RuntimeResult<()> {
         let spec = after.or(before).ok_or_else(|| {
-            HammerError::internal("kqueue update requires an old or new File poll spec")
+            RuntimeError::invariant("kqueue update requires an old or new File poll spec")
         })?;
         let mut changes = [empty_event(); 2];
         let mut count = 0;
@@ -150,6 +150,6 @@ const fn empty_event() -> libc::kevent {
     }
 }
 
-fn os_error(operation: &str) -> HammerError {
-    HammerError::internal(format!("{operation}: {}", io::Error::last_os_error()))
+fn os_error(operation: &str) -> RuntimeError {
+    RuntimeError::invariant(format!("{operation}: {}", io::Error::last_os_error()))
 }

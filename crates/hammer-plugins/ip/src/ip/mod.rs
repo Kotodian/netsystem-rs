@@ -5,14 +5,14 @@ pub mod reassembly;
 
 use std::net::IpAddr;
 
-use hammer_core::data_plane::BufferPacketCursor;
-use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::protocol::ip::{
+use crate::protocol::ip::{
     IpFragmentKey, IpInputError, IpInputTarget, IpProtocol, IpVersion, Ipv4Header, Ipv6Header,
     ParsedIpFragment, ParsedIpPacket, parse_ip_fragment_with_chain_len, parse_ip_header,
 };
-use hammer_core::protocol::wire::read_header;
+use crate::protocol::wire::read_header;
+use hammer_core::data_plane::BufferPacketCursor;
 use hammer_runtime::Network;
+use hammer_runtime::{RuntimeError, RuntimeResult};
 
 pub use icmp::{
     IcmpEchoRequestNext, IcmpEchoRequestNode, IcmpEchoRequestTrace, IcmpErrorNext, IcmpErrorNode,
@@ -41,12 +41,15 @@ pub(crate) fn network_for_protocol(protocol: IpProtocol) -> Option<Network> {
 }
 
 #[inline(always)]
-pub(crate) fn ip_header(packet: &[u8], cursor: BufferPacketCursor) -> CoreResult<ParsedIpPacket> {
+pub(crate) fn ip_header(
+    packet: &[u8],
+    cursor: BufferPacketCursor,
+) -> RuntimeResult<ParsedIpPacket> {
     if cursor.packet_len() == 0 {
-        return Err(CoreError::internal("missing cached IP packet cursor"));
+        return Err(RuntimeError::invariant("missing cached IP packet cursor"));
     }
     let Some(version_byte) = packet.get(cursor.network_header_offset()).copied() else {
-        return Err(CoreError::internal("missing cached IP header"));
+        return Err(RuntimeError::invariant("missing cached IP header"));
     };
     let (version, protocol, source, destination) = match version_byte >> 4 {
         4 => {
@@ -65,7 +68,7 @@ pub(crate) fn ip_header(packet: &[u8], cursor: BufferPacketCursor) -> CoreResult
             {
                 header.next_protocol()
             } else {
-                read_header::<hammer_core::protocol::ip::Ipv6FragmentHeader>(
+                read_header::<crate::protocol::ip::Ipv6FragmentHeader>(
                     packet,
                     cursor.transport_header_offset().saturating_sub(8),
                 )
@@ -79,7 +82,7 @@ pub(crate) fn ip_header(packet: &[u8], cursor: BufferPacketCursor) -> CoreResult
                 IpAddr::V6(header.destination()),
             )
         }
-        _ => return Err(CoreError::internal("unsupported cached IP version")),
+        _ => return Err(RuntimeError::invariant("unsupported cached IP version")),
     };
     Ok(ParsedIpPacket {
         version,

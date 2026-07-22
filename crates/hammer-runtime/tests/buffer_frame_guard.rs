@@ -1,7 +1,10 @@
 use hammer_core::data_plane::{
-    BufferFrame, DataPlaneBufferConfig, DataPlaneBuffers, NodeId, NodeRegistration,
+    BufferFrame, DataPlaneBuffers, NodeId, NodeRegistration,
 };
-use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node, NodeResult};
+use hammer_runtime::{
+    DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node,
+    NodeResult,
+};
 
 #[derive(Debug, Clone, Copy)]
 struct GuardNode;
@@ -34,7 +37,11 @@ fn test_buffer_config(buffer_slot_capacity: usize, buffer_slots: usize) -> DataP
 }
 
 fn test_buffers(buffer_slot_capacity: usize, buffer_slots: usize) -> DataPlaneBuffers {
-    DataPlaneBuffers::new(test_buffer_config(buffer_slot_capacity, buffer_slots))
+    DataPlaneRuntime::new(DataPlaneRuntimeConfig {
+        buffers: test_buffer_config(buffer_slot_capacity, buffer_slots),
+    })
+    .buffers()
+    .clone()
 }
 
 fn test_runtime(buffer_slot_capacity: usize, buffer_slots: usize) -> DataPlaneRuntime {
