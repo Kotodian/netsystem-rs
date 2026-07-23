@@ -448,10 +448,16 @@ pub(crate) fn map_hugetlb(
     }
     let total =
         checked_align_up(size, alignment).ok_or(PhysmemError::PageSizeOverflow { requested })?;
-    let directory = PathBuf::from(format!(
+    let mut directory = PathBuf::from(format!(
         "/sys/devices/system/node/node{numa_node}/hugepages/hugepages-{}kB",
         page_size / 1024
     ));
+    if numa_node == 0 && !directory.is_dir() {
+        directory = PathBuf::from(format!(
+            "/sys/kernel/mm/hugepages/hugepages-{}kB",
+            page_size / 1024
+        ));
+    }
     if !directory.is_dir() {
         return Err(PhysmemError::HugePageUnsupported {
             requested,

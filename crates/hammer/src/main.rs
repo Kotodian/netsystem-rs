@@ -72,11 +72,13 @@ fn main() {
     let memory = early.memory;
     drop(early);
     drop(bootstrap_document);
+    drop(config_path);
     hammer_runtime::memory::ensure_main_heap(&memory).unwrap_or_else(|error| {
         eprintln!("Failed to initialize main heap: {error}");
         std::process::exit(1);
     });
 
+    let config_path = config_path_from_args();
     let config = read_config(&config_path).unwrap_or_else(|error| {
         eprintln!(
             "Failed to read config {} on the main heap: {error}",
