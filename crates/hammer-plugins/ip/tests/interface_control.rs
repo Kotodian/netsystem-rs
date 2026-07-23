@@ -5,7 +5,7 @@ use std::time::Duration;
 use hammer_core::data_plane::{BufferFrame, NodeRegistration};
 use hammer_runtime::{
     DataPlaneRuntime, InternalNode, Node, NodeResult, TraceControlPlane, TraceInputPolicy,
-    TracePolicy, config::Worker, new_worker_runtime, spawn::DataRuntime,
+    TracePolicy, config::Worker, spawn::DataRuntime,
 };
 use hammer_service::interface::{
     InterfaceControlPlane, InterfaceMtu, InterfaceMtuKind, InterfaceOutputControlPlane,
@@ -30,7 +30,9 @@ impl InternalNode for InterfaceTxSinkNode {
 }
 
 fn test_runtime() -> DataPlaneRuntime {
-    new_worker_runtime(&Worker::default()).expect("create worker runtime")
+    Worker::default()
+        .create_runtime()
+        .expect("create worker runtime")
 }
 
 #[test]

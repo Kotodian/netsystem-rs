@@ -16,7 +16,7 @@ use hammer_runtime::{
     DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
     TraceControlPlane, TraceInputPolicy, TracePolicy,
 };
-use hammer_runtime::{config::Worker, new_worker_runtime, spawn::DataRuntime};
+use hammer_runtime::{config::Worker, spawn::DataRuntime};
 use hammer_service::data_plane::DropNode;
 use hammer_service::opaque::{NetworkOpaque, TapEthernetMetadata};
 use ipnet::{Ipv4Net, Ipv6Net};
@@ -34,7 +34,9 @@ const _: () =
     assert!(core::mem::size_of::<LookupTestOpaque>() == core::mem::size_of::<SecondaryOpaque>());
 
 fn test_runtime() -> DataPlaneRuntime {
-    new_worker_runtime(&Worker::default()).expect("create worker runtime")
+    Worker::default()
+        .create_runtime()
+        .expect("create worker runtime")
 }
 
 #[derive(Default)]

@@ -166,7 +166,7 @@ impl Engine {
 
     pub fn new_configured(registry: Arc<RuntimeRegistry>, worker: Worker) -> RuntimeResult<Self> {
         worker.validate()?;
-        let runtime = crate::new_worker_runtime(&worker)?;
+        let runtime = worker.create_runtime()?;
         let mut engine = Self::new(runtime, registry);
         engine.worker_config = worker;
         engine.memory_initialized = true;
@@ -402,7 +402,7 @@ impl Engine {
             };
         }
         worker.validate()?;
-        self.runtime = crate::new_worker_runtime(&worker)?;
+        self.runtime = worker.create_runtime()?;
         self.worker_config = worker;
         self.memory_initialized = true;
         Ok(())

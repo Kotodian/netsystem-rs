@@ -812,53 +812,53 @@ impl DataPlaneRuntime {
     }
 }
 
-pub fn new_worker_runtime(config: &Worker) -> RuntimeResult<DataPlaneRuntime> {
-    let buffer = &config.buffer;
-    let instruction_set = parse_instruction_set(&config.instruction_set)?;
-    if !instruction_set.is_supported() {
-        return Err(RuntimeError::invariant(format!(
-            "configured instruction set {instruction_set:?} is not supported by this CPU"
-        )));
-    }
-    let numa_nodes = config.buffer_numa_nodes()?;
-    let create = |page_size| -> DataPlaneResult<DataPlaneRuntime> {
-        let buffers = DataPlaneBufferConfig {
-            buffer_slot_capacity: buffer.slot_bytes,
-            buffer_slots: buffer.slots_per_numa,
-            frame_slots: buffer.frame_pool_size,
-            active_numa_node: numa_nodes[0],
-            page_size,
-            ..DataPlaneBufferConfig::default()
+impl Worker {
+    pub fn create_runtime(&self) -> RuntimeResult<DataPlaneRuntime> {
+        let buffer = &self.buffer;
+        let instruction_set = parse_instruction_set(&self.instruction_set)?;
+        if !instruction_set.is_supported() {
+            return Err(RuntimeError::invariant(format!(
+                "configured instruction set {instruction_set:?} is not supported by this CPU"
+            )));
         }
-        .create_buffers(numa_nodes.iter().copied())?;
-        Ok(DataPlaneRuntime::from_buffers_with_instruction_set(
-            buffers,
-            instruction_set,
-        ))
-    };
+        let numa_nodes = self.buffer_numa_nodes()?;
+        let create = |page_size| -> DataPlaneResult<DataPlaneRuntime> {
+            let buffers = DataPlaneBufferConfig {
+                buffer_slot_capacity: buffer.slot_bytes,
+                buffer_slots: buffer.slots_per_numa,
+                frame_slots: buffer.frame_pool_size,
+                active_numa_node: numa_nodes[0],
+                page_size,
+                ..DataPlaneBufferConfig::default()
+            }
+            .create_buffers(numa_nodes.iter().copied())?;
+            Ok(DataPlaneRuntime::from_buffers_with_instruction_set(
+                buffers,
+                instruction_set,
+            ))
+        };
 
-    match buffer.page_size {
-        Some(page_size) => create(page_size).map_err(Into::into),
-        None => {
-            #[cfg(target_os = "linux")]
-            {
-                match create(PageSize::DefaultHuge) {
-                    Ok(runtime) => Ok(runtime),
-                    Err(source) => {
-                        tracing::warn!(%source, "default HugeTLB Buffer Arena unavailable; using ordinary pages");
-                        create(PageSize::Default).map_err(Into::into)
+        match buffer.page_size {
+            Some(page_size) => create(page_size).map_err(Into::into),
+            None => {
+                #[cfg(target_os = "linux")]
+                {
+                    match create(PageSize::DefaultHuge) {
+                        Ok(runtime) => Ok(runtime),
+                        Err(source) => {
+                            tracing::warn!(%source, "default HugeTLB Buffer Arena unavailable; using ordinary pages");
+                            create(PageSize::Default).map_err(Into::into)
+                        }
                     }
                 }
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                create(PageSize::Default).map_err(Into::into)
+                #[cfg(not(target_os = "linux"))]
+                {
+                    create(PageSize::Default).map_err(Into::into)
+                }
             }
         }
     }
-}
 
-impl Worker {
     fn buffer_numa_nodes(&self) -> RuntimeResult<Vec<u32>> {
         #[cfg(target_os = "linux")]
         {

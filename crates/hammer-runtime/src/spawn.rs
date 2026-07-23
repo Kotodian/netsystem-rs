@@ -42,9 +42,8 @@ use hammer_runtime::node::NodeRuntimeStatsRow;
 use hammer_runtime::{TraceControlHandle, TraceRecordSink};
 
 use crate::config::Worker;
-use crate::data_plane::{RuntimeDataPlaneRuntime, new_worker_runtime};
+use crate::data_plane::RuntimeDataPlaneRuntime;
 use crate::error::{RuntimeError, RuntimeResult};
-use crate::worker_thread::apply_worker_thread_setup;
 use hammer_runtime::DataPlaneRuntime;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle as TokioJoinHandle;
@@ -117,7 +116,7 @@ pub(crate) fn current_worker_idle_slice() -> Duration {
 fn init_data_plane_runtime(config: &Worker) -> RuntimeResult<()> {
     DATA_PLANE_RUNTIME.with(|runtime| {
         if runtime.borrow().is_none() {
-            *runtime.borrow_mut() = Some(new_worker_runtime(config)?);
+            *runtime.borrow_mut() = Some(config.create_runtime()?);
         }
         Ok(())
     })
@@ -181,7 +180,7 @@ impl DataRuntime {
                 .stack_size(thread_stack_size);
             let join = builder
                 .spawn(move || {
-                    if let Err(error) = apply_worker_thread_setup(&worker_config, index) {
+                    if let Err(error) = worker_config.apply_current_thread_setup(index) {
                         let _ = handle_tx.send(Err(format!(
                             "set up data runtime worker {worker_name}: {error}"
                         )));

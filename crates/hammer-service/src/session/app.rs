@@ -346,7 +346,7 @@ impl SessionAppRuntime<Local> {
                 .map_err(|_| SessionAppRuntimeError::TxEventQueue)?,
         );
         let config = hammer_runtime::config::Worker::default();
-        let runtime = hammer_runtime::new_worker_runtime(&config)?;
+        let runtime = config.create_runtime()?;
         Ok(Self::new(
             1024,
             runtime.buffers().clone(),
