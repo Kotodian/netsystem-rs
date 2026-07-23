@@ -1,10 +1,13 @@
 use std::fmt;
-use std::os::fd::RawFd;
+use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 use crate::error::{RuntimeError, RuntimeResult};
 use hammer_infra::fifo::Fifo;
 use hammer_infra::segment::{Local, Svm};
+use thiserror::Error;
+use tokio::io::unix::AsyncFd;
+use tokio::sync::OnceCell;
 
 use crate::app::SessionHandle;
 use crate::app::SessionOffsets;
@@ -25,6 +28,26 @@ pub struct AppSession<S: SessionSegment> {
     evt_q: Arc<S::EventQueue>,
     tx_evt_q: Arc<S::EventQueue>,
     handle: SessionHandle,
+    async_fd: OnceCell<AsyncFd<OwnedFd>>,
+}
+
+/// Errors returned by the independent app-side async session methods.
+#[derive(Debug, Error)]
+pub enum AppSessionAsyncError {
+    #[error("app session requires a signal-read descriptor")]
+    SessionSignalMissing,
+    #[error("failed to duplicate app session signal descriptor")]
+    SessionSignalDuplicate {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to register app session readiness")]
+    SessionReadiness {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(transparent)]
+    Runtime(#[from] RuntimeError),
 }
 
 impl<S: SessionSegment> AppSession<S> {
@@ -44,6 +67,7 @@ impl<S: SessionSegment> AppSession<S> {
             evt_q,
             tx_evt_q,
             handle,
+            async_fd: OnceCell::new(),
         }
     }
     #[inline]
@@ -254,6 +278,88 @@ impl<S: SessionSegment> AppSession<S> {
         self.tx_fifo.clear();
         self.evt_q.clear();
     }
+
+    /// App-side async receive. Waits for the RX FIFO to become readable and
+    /// copies up to `out.len()` bytes, advancing the FIFO head.
+    pub async fn recv(&self, out: &mut [u8]) -> Result<usize, AppSessionAsyncError> {
+        loop {
+            let read = self.rx_fifo.peek(0, out.len(), out);
+            if read != 0 || out.is_empty() {
+                self.rx_fifo.dequeue_drop(read);
+                return Ok(read);
+            }
+            self.rx_fifo.want_notification();
+            if self.rx_fifo.max_dequeue() != 0 {
+                self.rx_fifo.clear_notification();
+                continue;
+            }
+            let wait_result = self.wait_for_event().await;
+            self.rx_fifo.clear_notification();
+            wait_result?;
+        }
+    }
+
+    /// App-side async send. Applies backpressure while the TX FIFO is full.
+    pub async fn send_all(&self, bytes: &[u8]) -> Result<usize, AppSessionAsyncError> {
+        let mut written = 0usize;
+        while written < bytes.len() {
+            let accepted = self.send_bytes(&bytes[written..])?;
+            if accepted != 0 {
+                written += accepted;
+                continue;
+            }
+            self.tx_fifo.want_deq_notification();
+            if self.tx_fifo.max_enqueue() != 0 {
+                self.tx_fifo.clear_deq_notification();
+                continue;
+            }
+            let wait_result = self.wait_for_event().await;
+            self.tx_fifo.clear_deq_notification();
+            wait_result?;
+        }
+        Ok(written)
+    }
+
+    /// App-side async event receive from the session event queue.
+    pub async fn next_event(&self) -> Result<SessionEvt, AppSessionAsyncError> {
+        loop {
+            if let Some(event) = self.evt_q.dequeue() {
+                return Ok(event);
+            }
+            self.wait_for_event().await?;
+        }
+    }
+
+    async fn wait_for_event(&self) -> Result<(), AppSessionAsyncError> {
+        let mut guard = self
+            .async_fd()
+            .await?
+            .readable()
+            .await
+            .map_err(|source| AppSessionAsyncError::SessionReadiness { source })?;
+        self.evt_q.drain();
+        guard.clear_ready();
+        Ok(())
+    }
+
+    async fn async_fd(&self) -> Result<&AsyncFd<OwnedFd>, AppSessionAsyncError> {
+        self.async_fd
+            .get_or_try_init(|| async {
+                let read_fd = self
+                    .evt_q
+                    .read_fd()
+                    .ok_or(AppSessionAsyncError::SessionSignalMissing)?;
+                // SAFETY: the queue owns the live descriptor for the session
+                // lifetime; this borrow is used only to make an owned duplicate.
+                let borrowed = unsafe { BorrowedFd::borrow_raw(read_fd) };
+                let owned = borrowed
+                    .try_clone_to_owned()
+                    .map_err(|source| AppSessionAsyncError::SessionSignalDuplicate { source })?;
+                AsyncFd::new(owned)
+                    .map_err(|source| AppSessionAsyncError::SessionReadiness { source })
+            })
+            .await
+    }
 }
 
 impl AppSession<Svm> {
@@ -297,6 +403,7 @@ impl AppSession<Svm> {
             evt_q,
             tx_evt_q,
             handle,
+            async_fd: OnceCell::new(),
         }
     }
 }
@@ -329,6 +436,7 @@ impl AppSession<Local> {
             evt_q,
             tx_evt_q,
             handle,
+            async_fd: OnceCell::new(),
         })
     }
 }

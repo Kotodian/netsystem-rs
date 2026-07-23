@@ -31,7 +31,7 @@ Workspace root: `crates/`. Dependency direction is strictly one-way to avoid cyc
 | `hammer-component-macros` | Proc macros: `#[graph_node]`, `#[init_function]`, `#[worker_init_function]` for declarative packet-graph node registration via `linkme` distributed slices. |
 | `hammer-runtime` | Runtime engine — worker thread spawning, engine main loop with VPP fixed-schedule step order, barrier synchronization (`control_call_with_barrier`), `RuntimeRegistry` (typed service registry), session/app handle types. |
 | `hammer-service` | Protocol-neutral network infrastructure — interface, session, device, and feature-arc contracts used by independent plugins. |
-| `hammer-app` | Application-plane interface — app/session boundary for local and cross-process (shared-memory) sessions. `AttachClient` (Unix socket + SCM_RIGHTS), `RemoteAppSession` (tokio AsyncFd). Echo helpers for testing. |
+| `hammer-app` | Application-plane interface — app/session boundary for local and cross-process (shared-memory) sessions. `AppClient` (Unix socket + SCM_RIGHTS) returns `AppSession<Svm>`; independent apps use its async methods. Echo helpers for testing. |
 | `hammer-ipc` | Daemon ↔ CLI IPC protocol — length-prefixed frame format, request/reply message types, `#[ipc_handler]` registration via `linkme`, sync `IpcClient`. |
 | `hammer` | Daemon binary (analogous to VPP's `vpp`). Loads TOML config, initializes runtime engine + worker graph, binds IPC TCP socket (default `127.0.0.1:7299`, overridable via `HAMMER_IPC_ADDR`), runs the data-plane main loop. |
 | `hammerctl` | CLI control tool (analogous to `vppctl`). Subcommands: `Pause`, `Wake`, `ResetNetwork`, `Shutdown`, `Status`, `Send` (raw handler dispatch). |

@@ -3,13 +3,11 @@ use std::net::Shutdown;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use hammer_app::attach::{AppClient, AppClientError};
-use hammer_app::remote_session::{RemoteAppSession, RemoteAppSessionError};
 use hammer_infra::segment::{Segment, Svm};
-use hammer_runtime::app::{AppSessionConfig, SessionEventQueue, SessionHandle};
+use hammer_runtime::app::{AppSession, AppSessionConfig, SessionEventQueue, SessionHandle};
 use hammer_runtime::attach::{AppServer, AppSessionResources};
 use hammer_runtime::{AttachError, RuntimeError};
 
@@ -59,7 +57,7 @@ struct DescriptorBaseline {
 fn attach_pair(
     name: &str,
 ) -> (
-    AppClient,
+    AppSession<Svm>,
     AppSessionResources<Svm>,
     PathBuf,
     DescriptorBaseline,
@@ -179,6 +177,7 @@ fn assert_attach_server_failure_releases_created_descriptors() {
 fn assert_attach_client_drop_releases_received_svm_backing_descriptor() {
     let (client, attached, path, baseline) = attach_pair("client-svm-owner");
     assert_eq!(count_open_identity(baseline.identity), baseline.count + 1);
+    assert!(client.evt_q().read_fd().is_some());
 
     drop(client);
 
@@ -275,60 +274,6 @@ fn assert_mapping_failure_closes_every_received_descriptor() {
     let _ = std::fs::remove_file(path);
 }
 
-fn assert_remote_session_requires_read_signal() {
-    let (client, attached, path, _) = attach_pair("remote-session-missing-signal");
-    let session = Arc::new(attached.session);
-    let result = RemoteAppSession::new(Arc::clone(&session));
-    assert!(matches!(
-        result,
-        Err(RemoteAppSessionError::SessionSignalMissing)
-    ));
-
-    drop(session);
-    drop(client);
-    let _ = std::fs::remove_file(path);
-}
-
-fn assert_remote_session_duplicate_is_cloexec_and_drops_independently() {
-    let (client, attached, path, _) = attach_pair("remote-session-owner");
-    let session = Arc::new(hammer_app::AppSession::from_parts(
-        Arc::clone(client.session.rx_fifo()),
-        Arc::clone(client.session.tx_fifo()),
-        Arc::clone(client.session.evt_q()),
-        Arc::clone(client.session.tx_evt_q()),
-        client.session.session_handle(),
-    ));
-    let queue_fd = session
-        .evt_q()
-        .read_fd()
-        .expect("app queue signal-read endpoint");
-    let queue_identity = descriptor_identity(queue_fd).expect("queue endpoint identity");
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("Tokio runtime");
-    let runtime_guard = runtime.enter();
-    let remote = RemoteAppSession::new(Arc::clone(&session)).expect("remote session");
-    drop(runtime_guard);
-
-    // SAFETY: fcntl only queries the live descriptor owned by RemoteAppSession.
-    let status_flags = unsafe { libc::fcntl(remote.as_raw_fd(), libc::F_GETFL) };
-    // SAFETY: as above, F_GETFD only queries descriptor flags.
-    let descriptor_flags = unsafe { libc::fcntl(remote.as_raw_fd(), libc::F_GETFD) };
-    assert_ne!(status_flags & libc::O_NONBLOCK, 0);
-    assert_ne!(descriptor_flags & libc::FD_CLOEXEC, 0);
-
-    drop(remote);
-    assert_eq!(
-        descriptor_identity(queue_fd).expect("queue endpoint remains open"),
-        queue_identity
-    );
-    drop(session);
-    drop(client);
-    drop(attached);
-    let _ = std::fs::remove_file(path);
-}
-
 #[test]
 fn attach_descriptor_lifetimes_follow_raii_ownership() {
     assert_attach_client_drop_releases_received_svm_backing_descriptor();
@@ -338,6 +283,4 @@ fn attach_descriptor_lifetimes_follow_raii_ownership() {
     assert_malformed_attach_closes_received_descriptor_before_returning_error();
     assert_offset_overflow_closes_every_received_descriptor();
     assert_mapping_failure_closes_every_received_descriptor();
-    assert_remote_session_requires_read_signal();
-    assert_remote_session_duplicate_is_cloexec_and_drops_independently();
 }

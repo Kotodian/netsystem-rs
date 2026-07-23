@@ -6,9 +6,8 @@ use crate::{TcpCapabilities, TcpConnectionId, TcpPacket, TcpSegmentFlags, TcpSta
 use hammer_core::data_plane::NodeId;
 use hammer_infra::pool::Index;
 use hammer_infra::segment::Local;
-use hammer_runtime::app::{AppContext, AppSession, AppSessionConfig, SessionHandle};
+use hammer_runtime::app::{AppSession, AppSessionConfig, SessionHandle};
 use hammer_runtime::app::{SessionEvt, SessionEvtType};
-use hammer_runtime::spawn::DataRuntimeContext;
 use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId};
 
 use hammer_service::data_plane::DropNode;
@@ -118,35 +117,18 @@ fn poll_app_events(app: &AppSession<Local>) -> Vec<SessionEvtType> {
 }
 
 #[test]
-fn with_app_context_retains_custom_app_session_config() {
-    let data_runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("data runtime");
+fn with_session_config_retains_custom_app_session_config() {
     let config = AppSessionConfig::new(512, 8);
-    let app_context = AppContext::new(
-        DataRuntimeContext::new(data_runtime.handle().clone()),
-        config,
-    );
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let worker = DataWorkerId::new(0);
-    let sessions = hammer_service::session::SessionWorker::with_app_context(
+    let sessions = hammer_service::session::SessionWorker::with_session_config(
         worker,
         runtime.buffers().clone(),
-        app_context,
+        config,
     );
     let state = TcpWorkerState::new(sessions, TcpWorker::<BbrController>::new(worker));
 
-    assert_eq!(
-        (
-            state.sessions.app_session_config(),
-            state
-                .sessions
-                .app_context()
-                .map(AppContext::app_session_config),
-        ),
-        (config, Some(config))
-    );
+    assert_eq!(state.sessions.app_session_config(), config);
 }
 
 #[test]

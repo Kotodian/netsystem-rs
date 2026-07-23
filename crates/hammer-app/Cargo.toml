@@ -8,9 +8,7 @@ publish.workspace = true
 name = "hammer_app"
 
 [dependencies]
-hammer-core = { path = "../hammer-core" }
 hammer-infra = { path = "../hammer-infra" }
 hammer-runtime = { path = "../hammer-runtime" }
 libc = { workspace = true }
-tokio = { workspace = true }
 thiserror = { workspace = true }

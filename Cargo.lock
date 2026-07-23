@@ -591,12 +591,10 @@ dependencies = [
 name = "hammer-app"
 version = "0.1.0"
 dependencies = [
- "hammer-core",
  "hammer-infra",
  "hammer-runtime",
  "libc",
  "thiserror",
- "tokio",
 ]
 
 [[package]]
