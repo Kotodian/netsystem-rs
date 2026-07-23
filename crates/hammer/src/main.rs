@@ -6,9 +6,9 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use hammer_runtime::RuntimeRegistry;
-use hammer_runtime::config::Memory;
+use hammer_runtime::config::{Memory, Worker};
 use hammer_runtime::engine::{Engine, EnginePool};
-use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, RuntimeError, RuntimeResult};
+use hammer_runtime::{RuntimeError, RuntimeResult};
 
 // Shared device/interface/transport/session infrastructure contributes host
 // builtins; loadable protocol and device-driver code comes only from DSOs.
@@ -26,6 +26,14 @@ static STARTUP_CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
 #[serde(default)]
 struct DaemonEarlyConfig {
     memory: Memory,
+    worker: Worker,
+}
+
+impl DaemonEarlyConfig {
+    fn validate(&self) -> RuntimeResult<()> {
+        self.memory.validate()?;
+        self.worker.validate()
+    }
 }
 
 /// Daemon-owned process options. Plugin schemas are not part of this type.
@@ -41,13 +49,28 @@ fn main() {
         eprintln!("Failed to read config {}: {error}", config_path.display());
         std::process::exit(1);
     });
-    let memory = parse_early_memory(&bootstrap_document).unwrap_or_else(|error| {
+    let early: DaemonEarlyConfig = toml::from_str(&bootstrap_document).unwrap_or_else(|error| {
         eprintln!(
-            "Failed to deserialize memory config {}: {error}",
+            "Failed to deserialize early config {}: {error}",
             config_path.display()
         );
         std::process::exit(1);
     });
+    early.validate().unwrap_or_else(|error| {
+        eprintln!("Invalid early config {}: {error}", config_path.display());
+        std::process::exit(1);
+    });
+    #[cfg(target_os = "linux")]
+    if let Some(core) = early.worker.cpu.main_core {
+        let available = core_affinity::get_core_ids()
+            .is_some_and(|cores| cores.into_iter().any(|candidate| candidate.id == core));
+        if !available || !core_affinity::set_for_current(core_affinity::CoreId { id: core }) {
+            eprintln!("Failed to pin main thread to configured core {core}");
+            std::process::exit(1);
+        }
+    }
+    let memory = early.memory;
+    drop(early);
     drop(bootstrap_document);
     hammer_runtime::memory::ensure_main_heap(&memory).unwrap_or_else(|error| {
         eprintln!("Failed to initialize main heap: {error}");
@@ -68,12 +91,21 @@ fn main() {
         );
         std::process::exit(1);
     });
+    let worker = toml::from_str::<DaemonEarlyConfig>(&config)
+        .map(|config| config.worker)
+        .unwrap_or_else(|error| {
+            eprintln!(
+                "Failed to deserialize worker config {}: {error}",
+                config_path.display()
+            );
+            std::process::exit(1);
+        });
     if STARTUP_CONFIG_PATH.set(config_path).is_err() {
         eprintln!("startup configuration path was initialized more than once");
         std::process::exit(1);
     }
 
-    run(config, roots);
+    run(config, roots, worker);
 }
 
 fn config_path_from_args() -> PathBuf {
@@ -86,10 +118,12 @@ fn config_path_from_args() -> PathBuf {
         })
 }
 
-fn run(config: String, roots: Vec<String>) {
+fn run(config: String, roots: Vec<String>, worker: Worker) {
     let registry = Arc::new(RuntimeRegistry::new());
-    let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let engine = Engine::new(runtime, Arc::clone(&registry));
+    let engine = Engine::new_configured(Arc::clone(&registry), worker).unwrap_or_else(|error| {
+        eprintln!("Failed to construct configured runtime: {error}");
+        std::process::exit(1);
+    });
     let mut pool = EnginePool::new(engine);
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -137,13 +171,6 @@ fn read_config(path: &Path) -> RuntimeResult<String> {
     })
 }
 
-fn parse_early_memory(document: &str) -> RuntimeResult<Memory> {
-    let config: DaemonEarlyConfig = toml::from_str(document)
-        .map_err(|error| RuntimeError::config_parse(format!("parse startup TOML: {error}")))?;
-    config.memory.validate()?;
-    Ok(config.memory)
-}
-
 fn parse_startup_config(document: &str) -> RuntimeResult<Vec<String>> {
     let config: DaemonStartupConfig = toml::from_str(document)
         .map_err(|error| RuntimeError::config_parse(format!("parse startup TOML: {error}")))?;
@@ -181,7 +208,7 @@ fn bind_ipc_socket() -> tokio::net::TcpListener {
 mod tests {
     #[test]
     fn early_deserialization_ignores_later_owner_sections() {
-        let memory = super::parse_early_memory(
+        let config: super::DaemonEarlyConfig = toml::from_str(
             r#"
 [memory]
 main_heap_size = "256 MiB"
@@ -190,8 +217,8 @@ main_heap_size = "256 MiB"
 mss = "validated by tcp"
 "#,
         )
-        .expect("deserialize memory only");
+        .expect("deserialize early config");
 
-        assert_eq!(memory.main_heap_size, 256 << 20);
+        assert_eq!(config.memory.main_heap_size.as_u64(), 256 << 20);
     }
 }

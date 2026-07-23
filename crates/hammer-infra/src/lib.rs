@@ -29,3 +29,5 @@ pub mod simd;
 pub mod spinlock;
 pub mod svm_region;
 pub mod timer_wheel;
+
+pub use main_heap::PageSize;

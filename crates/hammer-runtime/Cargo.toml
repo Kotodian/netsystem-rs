@@ -34,6 +34,7 @@ metrics-derive = { workspace = true }
 ipnet = { workspace = true }
 serde = { workspace = true }
 humantime-serde = { workspace = true }
+byte-unit = { workspace = true }
 libc = { workspace = true }
 libloading = { workspace = true }
 object = { workspace = true }

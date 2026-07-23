@@ -8,7 +8,8 @@ use hammer_core::data_plane::{
     DEFAULT_BUFFER_FRAME_POOL_SIZE, DataPlaneBuffers, Frame, FrameBatchWidth, Index, Next,
     NodeHandle, NodeId, NodeNext, NodeRegistration, Pending,
 };
-use hammer_core::error::DataPlaneError;
+use hammer_core::error::{DataPlaneError, DataPlaneResult};
+use hammer_infra::PageSize;
 
 use crate::config::Worker;
 use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HANDOFF_SLOT_CAPACITY, HandoffSlot};
@@ -33,6 +34,7 @@ pub struct DataPlaneBufferConfig {
     pub numa_nodes: &'static [u32],
     pub thread_index: u32,
     pub active_numa_node: u32,
+    pub page_size: PageSize,
 }
 
 impl Default for DataPlaneBufferConfig {
@@ -45,25 +47,34 @@ impl Default for DataPlaneBufferConfig {
             numa_nodes: &[0],
             thread_index: 0,
             active_numa_node: 0,
+            page_size: PageSize::Default,
         }
     }
 }
 
-impl From<DataPlaneBufferConfig> for DataPlaneBuffers {
-    fn from(config: DataPlaneBufferConfig) -> Self {
-        let arenas = config.numa_nodes.iter().copied().map(|numa_node| {
-            BufferPoolArena::with_capacity_on_numa(
-                config.buffer_slot_capacity,
-                config.buffer_slots,
-                numa_node,
-            )
-        });
-        DataPlaneBuffers::from_arenas(
+impl TryFrom<DataPlaneBufferConfig> for DataPlaneBuffers {
+    type Error = DataPlaneError;
+
+    fn try_from(config: DataPlaneBufferConfig) -> Result<Self, Self::Error> {
+        let arenas = config
+            .numa_nodes
+            .iter()
+            .copied()
+            .map(|numa_node| {
+                BufferPoolArena::with_capacity_on_numa(
+                    config.buffer_slot_capacity,
+                    config.buffer_slots,
+                    config.page_size,
+                    numa_node,
+                )
+            })
+            .collect::<DataPlaneResult<Vec<_>>>()?;
+        Ok(DataPlaneBuffers::from_arenas(
             arenas,
             config.frame_slots,
             config.thread_index,
             config.active_numa_node,
-        )
+        ))
     }
 }
 
@@ -228,10 +239,12 @@ impl From<DataPlaneRuntimeWorkerConfig> for DataPlaneRuntime {
 impl DataPlaneRuntime {
     #[inline]
     pub fn new(config: DataPlaneRuntimeConfig) -> Self {
-        Self::from_buffers_with_instruction_set(
-            config.buffers.into(),
-            DataPlaneInstructionSet::native(),
-        )
+        Self::try_new(config).expect("create ordinary-page data-plane runtime")
+    }
+
+    #[inline]
+    pub fn try_new(config: DataPlaneRuntimeConfig) -> DataPlaneResult<Self> {
+        Self::try_new_with_instruction_set(config, DataPlaneInstructionSet::native())
     }
 
     #[inline]
@@ -239,7 +252,19 @@ impl DataPlaneRuntime {
         config: DataPlaneRuntimeConfig,
         instruction_set: DataPlaneInstructionSet,
     ) -> Self {
-        Self::from_buffers_with_instruction_set(config.buffers.into(), instruction_set)
+        Self::try_new_with_instruction_set(config, instruction_set)
+            .expect("create ordinary-page data-plane runtime")
+    }
+
+    #[inline]
+    pub fn try_new_with_instruction_set(
+        config: DataPlaneRuntimeConfig,
+        instruction_set: DataPlaneInstructionSet,
+    ) -> DataPlaneResult<Self> {
+        Ok(Self::from_buffers_with_instruction_set(
+            config.buffers.try_into()?,
+            instruction_set,
+        ))
     }
 
     #[inline]
@@ -782,22 +807,37 @@ impl DataPlaneRuntime {
 
 pub fn new_worker_runtime(config: &Worker) -> RuntimeResult<DataPlaneRuntime> {
     let buffer = &config.buffer;
-    let buffers = DataPlaneBufferConfig {
-        buffer_slot_capacity: buffer.slot_bytes,
-        buffer_slots: buffer.slots_per_numa,
-        frame_slots: buffer.frame_pool_size,
-        ..DataPlaneBufferConfig::default()
-    };
     let instruction_set = parse_instruction_set(&config.instruction_set)?;
     if !instruction_set.is_supported() {
         return Err(RuntimeError::invariant(format!(
             "configured instruction set {instruction_set:?} is not supported by this CPU"
         )));
     }
-    Ok(DataPlaneRuntime::new_with_instruction_set(
-        DataPlaneRuntimeConfig { buffers },
-        instruction_set,
-    ))
+    let create = |page_size| {
+        DataPlaneRuntime::try_new_with_instruction_set(
+            DataPlaneRuntimeConfig {
+                buffers: DataPlaneBufferConfig {
+                    buffer_slot_capacity: buffer.slot_bytes,
+                    buffer_slots: buffer.slots_per_numa,
+                    frame_slots: buffer.frame_pool_size,
+                    page_size,
+                    ..DataPlaneBufferConfig::default()
+                },
+            },
+            instruction_set,
+        )
+    };
+
+    match buffer.page_size {
+        Some(page_size) => create(page_size).map_err(Into::into),
+        None => match create(PageSize::DefaultHuge) {
+            Ok(runtime) => Ok(runtime),
+            Err(source) => {
+                tracing::warn!(%source, "default HugeTLB Buffer Arena unavailable; using ordinary pages");
+                create(PageSize::Default).map_err(Into::into)
+            }
+        },
+    }
 }
 
 fn parse_instruction_set(value: &str) -> RuntimeResult<DataPlaneInstructionSet> {

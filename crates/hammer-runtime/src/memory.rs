@@ -5,7 +5,11 @@ use hammer_component_macros::config_function;
 
 pub fn ensure_main_heap(config: &Memory) -> RuntimeResult<()> {
     config.validate()?;
-    hammer_infra::main_heap::init(config.main_heap_size)?;
+    hammer_infra::main_heap::init_with(
+        config.main_heap_size_bytes()?,
+        config.main_heap_page_size,
+        None,
+    )?;
     Ok(())
 }
 

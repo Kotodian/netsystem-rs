@@ -121,7 +121,10 @@ enum ExampleError {
 
 fn main() -> Result<(), ExampleError> {
     let memory = parse_early_memory(EXAMPLE_CONFIG)?;
-    let main_heap_capacity = hammer_infra::main_heap::init(memory.main_heap_size)?;
+    memory.validate()?;
+    let main_heap_size = usize::try_from(memory.main_heap_size)
+        .map_err(|_| RuntimeError::config_validation("memory.main_heap_size overflows usize"))?;
+    let main_heap_capacity = hammer_infra::main_heap::init(main_heap_size)?;
     let roots = parse_startup_roots(EXAMPLE_CONFIG)?;
     exercise_post_ready_allocations(&roots)?;
 

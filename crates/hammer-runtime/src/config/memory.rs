@@ -1,75 +1,101 @@
 //! `[memory]` config for the VPP-shaped fixed-capacity main heap.
 
-use serde::{Deserialize, de::Error as _};
+use byte_unit::Byte;
+use hammer_infra::PageSize;
 
 use crate::error::{RuntimeError, RuntimeResult};
 
 pub const DEFAULT_MAIN_HEAP_SIZE: usize = hammer_infra::main_heap::DEFAULT_MAIN_HEAP_SIZE;
+pub const DEFAULT_MAIN_HEAP_PAGE_SIZE: PageSize = PageSize::Default;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Memory {
-    #[serde(deserialize_with = "deserialize_memory_size")]
-    pub main_heap_size: usize,
+    pub main_heap_size: Byte,
+    pub main_heap_page_size: PageSize,
 }
 
 impl Default for Memory {
     fn default() -> Self {
         Self {
-            main_heap_size: DEFAULT_MAIN_HEAP_SIZE,
+            main_heap_size: Byte::from_u64(DEFAULT_MAIN_HEAP_SIZE as u64),
+            main_heap_page_size: DEFAULT_MAIN_HEAP_PAGE_SIZE,
         }
     }
 }
 
 impl Memory {
     pub fn validate(&self) -> RuntimeResult<()> {
+        let requested = self.main_heap_size_bytes()?;
         let minimum = hammer_infra::main_heap::minimum_capacity();
-        if self.main_heap_size < minimum {
+        if requested < minimum {
             return Err(RuntimeError::config_validation(format!(
                 "memory.main_heap_size must be at least {} bytes",
                 minimum
             )));
         }
+        self.main_heap_page_size
+            .validate_main_heap()
+            .map_err(|source| {
+                RuntimeError::config_validation(format!(
+                    "memory.main_heap_page_size is invalid: {source}"
+                ))
+            })?;
         Ok(())
     }
-}
 
-#[derive(serde::Deserialize)]
-#[serde(untagged)]
-enum MemorySize {
-    Bytes(usize),
-    Text(String),
-}
-
-fn deserialize_memory_size<'de, D>(deserializer: D) -> Result<usize, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    match MemorySize::deserialize(deserializer)? {
-        MemorySize::Bytes(bytes) => Ok(bytes),
-        MemorySize::Text(text) => parse_memory_size(&text).map_err(D::Error::custom),
+    pub(crate) fn main_heap_size_bytes(&self) -> RuntimeResult<usize> {
+        usize::try_from(self.main_heap_size)
+            .map_err(|_| RuntimeError::config_validation("memory.main_heap_size overflows usize"))
     }
 }
 
-fn parse_memory_size(text: &str) -> Result<usize, String> {
-    let trimmed = text.trim();
-    let suffix_index = trimmed
-        .find(|character: char| !character.is_ascii_digit() && character != '_')
-        .unwrap_or(trimmed.len());
-    let number = trimmed[..suffix_index]
-        .replace('_', "")
-        .parse::<usize>()
-        .map_err(|error| format!("invalid memory size `{text}`: {error}"))?;
-    let suffix = trimmed[suffix_index..].trim().to_ascii_lowercase();
-    let multiplier = match suffix.as_str() {
-        "" | "b" => 1,
-        "k" | "kb" | "kib" => 1usize << 10,
-        "m" | "mb" | "mib" => 1usize << 20,
-        "g" | "gb" | "gib" => 1usize << 30,
-        "t" | "tb" | "tib" => 1usize << 40,
-        _ => return Err(format!("unsupported memory size suffix in `{text}`")),
-    };
-    number
-        .checked_mul(multiplier)
-        .ok_or_else(|| format!("memory size `{text}` overflows usize"))
+#[cfg(test)]
+mod tests {
+    use byte_unit::Byte;
+    use hammer_infra::PageSize;
+
+    use super::Memory;
+
+    #[test]
+    fn memory_config_parses_main_heap_page_size() {
+        let memory: Memory = toml::from_str(
+            r#"
+main_heap_size = "256 MiB"
+main_heap_page_size = "default-hugepage"
+"#,
+        )
+        .expect("parse memory config");
+
+        assert_eq!(memory.main_heap_size, Byte::from_u64(256 << 20));
+        assert_eq!(memory.main_heap_page_size, PageSize::DefaultHuge);
+    }
+
+    #[test]
+    fn memory_config_defaults_to_ordinary_pages() {
+        let memory: Memory = toml::from_str(
+            r#"
+main_heap_size = "256 MiB"
+"#,
+        )
+        .expect("parse memory config");
+
+        assert_eq!(memory.main_heap_page_size, PageSize::Default);
+    }
+
+    #[test]
+    fn memory_config_accepts_explicit_binary_page_size() {
+        let memory: Memory = toml::from_str(
+            r#"
+main_heap_size = "256 MiB"
+main_heap_page_size = "2 MiB"
+"#,
+        )
+        .expect("parse memory config");
+
+        assert_eq!(
+            memory.main_heap_page_size,
+            PageSize::Bytes(Byte::from_u64(2 << 20))
+        );
+    }
 }

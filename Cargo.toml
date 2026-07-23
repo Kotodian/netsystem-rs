@@ -51,6 +51,10 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["r
 metrics = "0.24"
 metrics-derive = "0.1"
 humantime-serde = "1.1"
+byte-unit = { version = "5.2.5", features = ["serde"] }
+parse-display = "0.11.0"
+procfs = { version = "0.18.0", default-features = false }
+serde_with = { version = "3.21.0", default-features = false, features = ["macros"] }
 bytes = "1.11"
 crossbeam-queue = "0.3"
 crossbeam-utils = "0.8.21"

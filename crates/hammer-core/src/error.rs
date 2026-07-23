@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use hammer_infra::physmem::PhysmemError;
+
 /// Buffer-state failures representable by the packet-graph ABI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum BufferInvariant {
@@ -55,6 +57,15 @@ pub enum DataPlaneError {
     BufferInvariant(#[from] BufferInvariant),
     #[error("buffer frame capacity exceeded")]
     BufferFrameCapacityExceeded,
+    #[error("buffer arena must contain at least one usable slot")]
+    BufferArenaSlotsZero,
+    #[error("buffer arena size overflow")]
+    BufferArenaSizeOverflow,
+    #[error("buffer arena mapping failed")]
+    BufferArenaMapping {
+        #[source]
+        source: PhysmemError,
+    },
     #[error("frame pool exhausted")]
     FramePoolExhausted,
     #[error("frame slot is checked out")]
