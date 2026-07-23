@@ -238,7 +238,7 @@ impl DataPlaneHandoffWorker {
 #[cfg(test)]
 mod tests {
     use crate::{DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig};
-    use hammer_core::data_plane::{NodeId};
+    use hammer_core::data_plane::NodeId;
 
     use super::*;
 

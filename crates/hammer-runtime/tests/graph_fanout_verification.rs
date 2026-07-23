@@ -3,8 +3,8 @@
 use std::sync::Mutex;
 
 use hammer_core::data_plane::{
-    BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Frame, Index, Next, NodeId,
-    NodeKind, NodeRegistration,
+    BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Frame, Index, Next, NodeId, NodeKind,
+    NodeRegistration,
 };
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::node::{NodeDescriptor, NodeProcessFn, NodeResult, NodeRuntimeData};

@@ -1,8 +1,7 @@
 use std::mem::transmute;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use hammer_core::data_plane::{
-    BufferFrame, BufferNodeError, BufferPacketCursor, };
+use hammer_core::data_plane::{BufferFrame, BufferNodeError, BufferPacketCursor};
 use hammer_infra::checksum::internet_checksum_parts;
 use hammer_plugin_udp::{UdpInputControlPlane, UdpInputError, UdpInputNext, UdpInputTrace};
 use hammer_runtime::RuntimeRegistry;

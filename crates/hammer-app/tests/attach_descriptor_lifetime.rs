@@ -6,11 +6,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use hammer_app::attach::{AttachClient, AttachClientError};
+use hammer_app::attach::{AppClient, AppClientError};
 use hammer_app::remote_session::{RemoteAppSession, RemoteAppSessionError};
 use hammer_infra::segment::{Segment, Svm};
 use hammer_runtime::app::{AppSessionConfig, SessionEventQueue, SessionHandle};
-use hammer_runtime::attach::{AttachServer, AttachedApp};
+use hammer_runtime::attach::{AppServer, AppSessionResources};
 use hammer_runtime::{AttachError, RuntimeError};
 
 static SOCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -56,10 +56,17 @@ struct DescriptorBaseline {
     count: usize,
 }
 
-fn attach_pair(name: &str) -> (AttachClient, AttachedApp<Svm>, PathBuf, DescriptorBaseline) {
+fn attach_pair(
+    name: &str,
+) -> (
+    AppClient,
+    AppSessionResources<Svm>,
+    PathBuf,
+    DescriptorBaseline,
+) {
     let path = socket_path(name);
     let path_text = path.to_str().expect("socket path").to_owned();
-    let server = AttachServer::bind(&path_text).expect("bind attach server");
+    let server = AppServer::bind(&path_text).expect("bind app server");
     let segment_id = SOCKET_COUNTER.fetch_add(1, Ordering::Relaxed);
     let segment = Svm::create(
         &format!("ha{}-{segment_id}", std::process::id()),
@@ -76,7 +83,7 @@ fn attach_pair(name: &str) -> (AttachClient, AttachedApp<Svm>, PathBuf, Descript
     let server_thread =
         std::thread::spawn(move || server.accept(AppSessionConfig::new(256, 16), &segment, handle));
 
-    let client = AttachClient::connect(&path_text, handle).expect("attach client");
+    let client = AppClient::connect(&path_text, handle).expect("attach client");
     let attached = server_thread
         .join()
         .expect("join attach server")
@@ -144,7 +151,7 @@ fn assert_attach_server_failure_releases_created_descriptors() {
     let baseline = count_open_descriptors();
     let path = socket_path("sender-failure-owner");
     let path_text = path.to_str().expect("socket path").to_owned();
-    let server = AttachServer::bind(&path_text).expect("bind attach server");
+    let server = AppServer::bind(&path_text).expect("bind app server");
     let segment = Svm::create(&format!("hf{}", std::process::id()), 16 * 1024 * 1024)
         .expect("create SVM segment");
     let client = UnixStream::connect(&path).expect("connect attach client");
@@ -182,11 +189,11 @@ fn assert_attach_client_drop_releases_received_svm_backing_descriptor() {
 
 fn assert_missing_attach_server_returns_client_error() {
     let path = socket_path("missing-server");
-    let result = AttachClient::connect(
+    let result = AppClient::connect(
         path.to_str().expect("socket path"),
         SessionHandle::new(1, 0),
     );
-    assert!(matches!(result, Err(AttachClientError::Connect { .. })));
+    assert!(matches!(result, Err(AppClientError::Connect { .. })));
 }
 
 fn assert_malformed_attach_closes_received_descriptor_before_returning_error() {
@@ -200,13 +207,13 @@ fn assert_malformed_attach_closes_received_descriptor_before_returning_error() {
         peer
     });
 
-    let result = AttachClient::connect(
+    let result = AppClient::connect(
         path.to_str().expect("socket path"),
         SessionHandle::new(1, 0),
     );
     assert!(matches!(
         result,
-        Err(AttachClientError::DescriptorCount {
+        Err(AppClientError::DescriptorCount {
             expected: 3,
             actual: 1
         })
@@ -231,11 +238,11 @@ fn assert_offset_overflow_closes_every_received_descriptor() {
         (sent, peer, identity, baseline)
     });
 
-    let result = AttachClient::connect(
+    let result = AppClient::connect(
         path.to_str().expect("socket path"),
         SessionHandle::new(1, 0),
     );
-    assert!(matches!(result, Err(AttachClientError::OffsetOverflow)));
+    assert!(matches!(result, Err(AppClientError::OffsetOverflow)));
     let (sent, peer, identity, baseline) = server_thread.join().expect("join offset server");
     assert_eq!(count_open_identity(identity), baseline);
     drop(sent);
@@ -256,11 +263,11 @@ fn assert_mapping_failure_closes_every_received_descriptor() {
         (sent, peer, identity, baseline)
     });
 
-    let result = AttachClient::connect(
+    let result = AppClient::connect(
         path.to_str().expect("socket path"),
         SessionHandle::new(1, 0),
     );
-    assert!(matches!(result, Err(AttachClientError::SegmentMap { .. })));
+    assert!(matches!(result, Err(AppClientError::SegmentMap { .. })));
     let (sent, peer, identity, baseline) = server_thread.join().expect("join mapping server");
     assert_eq!(count_open_identity(identity), baseline);
     drop(sent);

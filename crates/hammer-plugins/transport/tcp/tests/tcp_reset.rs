@@ -1,9 +1,7 @@
 use std::mem::transmute;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use hammer_core::data_plane::{
-    BufferFrame, BufferPacketCursor, Index, NodeId,
-};
+use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 use hammer_plugin_tcp::{TcpResetNext, TcpResetNode};
 use hammer_runtime::{

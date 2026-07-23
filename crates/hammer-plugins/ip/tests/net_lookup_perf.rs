@@ -5,9 +5,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use hammer_core::data_plane::{
-    BufferFrame, BufferPacketCursor, Index, SecondaryOpaque,
-};
+use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, SecondaryOpaque};
 use hammer_plugin_ip::forwarding::{DpoProto, FibTableBuilder, ForwardingMetadata};
 use hammer_plugin_ip::{
     IpInputNext, IpInputNode, IpLookupControlPlane, IpLookupNext, IpUnicastArc,

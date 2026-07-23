@@ -1795,10 +1795,7 @@ enum InitOutput {
     OptionalArc,
 }
 
-fn expand_registered_function(
-    args: InitFnArgs,
-    mut function: ItemFn,
-) -> Result<TokenStream2> {
+fn expand_registered_function(args: InitFnArgs, mut function: ItemFn) -> Result<TokenStream2> {
     validate_init_function_qualifiers(&function)?;
     let arguments = init_arguments(&mut function)?;
     let output = init_output(&function)?;
@@ -2284,8 +2281,8 @@ pub fn main_loop_enter_function(args: TokenStream, input: TokenStream) -> TokenS
     }
     let fn_item = parse_macro_input!(input as syn::ItemFn);
     expand_main_loop_function(fn_item)
-    .unwrap_or_else(Error::into_compile_error)
-    .into()
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
 }
 
 /// Registers a function to run at main-loop-exit time.
@@ -2301,8 +2298,8 @@ pub fn main_loop_exit_function(args: TokenStream, input: TokenStream) -> TokenSt
     }
     let fn_item = parse_macro_input!(input as syn::ItemFn);
     expand_main_loop_function(fn_item)
-    .unwrap_or_else(Error::into_compile_error)
-    .into()
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
 }
 
 fn expand_main_loop_function(function: ItemFn) -> Result<TokenStream2> {
@@ -2329,8 +2326,8 @@ pub fn worker_init_function(args: TokenStream, input: TokenStream) -> TokenStrea
     let args = parse_macro_input!(args as InitFnArgs);
     let fn_item = parse_macro_input!(input as syn::ItemFn);
     expand_registered_function(args, fn_item)
-    .unwrap_or_else(Error::into_compile_error)
-    .into()
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
 }
 
 struct PluginArgs {
@@ -2576,8 +2573,8 @@ mod tests {
         let arguments = syn::parse_str::<InitFnArgs>(arguments).expect("parse init arguments");
         let function = syn::parse_str::<ItemFn>(function).expect("parse init function");
         expand_registered_function(arguments, function)
-        .expect("expand init function")
-        .to_string()
+            .expect("expand init function")
+            .to_string()
     }
 
     #[test]
@@ -2701,8 +2698,8 @@ mod tests {
         )
         .expect("parse main-loop function");
         let expanded = expand_main_loop_function(function)
-        .expect("expand main-loop function")
-        .to_string();
+            .expect("expand main-loop function")
+            .to_string();
 
         assert!(expanded.contains("static __INIT_FN_START_WORKERS"));
         assert!(expanded.contains("registry . require :: < HandoffMain > () ?"));

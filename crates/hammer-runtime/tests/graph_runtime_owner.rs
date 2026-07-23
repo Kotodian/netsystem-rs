@@ -2,9 +2,8 @@ use hammer_core::data_plane::{BufferFrame, NodeNext, NodeRegistration};
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
     DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, DriverNode, Node,
-    NodeDescriptor, NodeProcessFn, NodeResult, NodeRuntimeData, TraceControlPlane,
-    TraceFormatter, TraceInputPolicy, TracePolicy, add_packet_trace, format_packet_trace,
-    process_frame,
+    NodeDescriptor, NodeProcessFn, NodeResult, NodeRuntimeData, TraceControlPlane, TraceFormatter,
+    TraceInputPolicy, TracePolicy, add_packet_trace, format_packet_trace, process_frame,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 

@@ -1,9 +1,6 @@
-use hammer_core::data_plane::{
-    BufferFrame, DataPlaneBuffers, NodeId, NodeRegistration,
-};
+use hammer_core::data_plane::{BufferFrame, DataPlaneBuffers, NodeId, NodeRegistration};
 use hammer_runtime::{
-    DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node,
-    NodeResult,
+    DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node, NodeResult,
 };
 
 #[derive(Debug, Clone, Copy)]

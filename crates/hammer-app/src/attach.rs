@@ -8,8 +8,8 @@ use thiserror::Error;
 
 /// Failures while an app client receives an attached shared-memory session.
 #[derive(Debug, Error)]
-pub enum AttachClientError {
-    #[error("failed to connect to attach server at {path}")]
+pub enum AppClientError {
+    #[error("failed to connect to app server at {path}")]
     Connect {
         path: PathBuf,
         #[source]
@@ -51,10 +51,10 @@ pub enum AttachClientError {
     },
 }
 
-/// Client side of the attach protocol.
+/// Client side of the application-session protocol.
 /// Connects to the dataplane's Unix socket, receives shared-memory fds
 /// and layout offsets, and reconstructs the app-side [`AppSession`].
-pub struct AttachClient {
+pub struct AppClient {
     pub session: AppSession<Svm>,
     pub offsets: SessionOffsets,
 }
@@ -62,7 +62,7 @@ pub struct AttachClient {
 /// Parse a SCM_RIGHTS message, returning the received fds and raw data.
 fn recv_attach_message(
     stream: &UnixStream,
-) -> Result<([OwnedFd; 3], SessionOffsets), AttachClientError> {
+) -> Result<([OwnedFd; 3], SessionOffsets), AppClientError> {
     let mut offsets_bytes = [0u64; 4];
     let mut cmsg_buf = [0u8; 64];
     let mut iov = libc::iovec {
@@ -78,7 +78,7 @@ fn recv_attach_message(
     // SAFETY: message points to writable data and control buffers for recvmsg.
     let ret = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, 0) };
     if ret < 0 {
-        return Err(AttachClientError::Receive {
+        return Err(AppClientError::Receive {
             source: std::io::Error::last_os_error(),
         });
     }
@@ -90,17 +90,17 @@ fn recv_attach_message(
         let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
         while !cmsg.is_null() {
             if (*cmsg).cmsg_level != libc::SOL_SOCKET || (*cmsg).cmsg_type != libc::SCM_RIGHTS {
-                return Err(AttachClientError::UnexpectedControl);
+                return Err(AppClientError::UnexpectedControl);
             }
             rights_headers += 1;
             let header_len = libc::CMSG_LEN(0) as usize;
             let cmsg_len = (*cmsg).cmsg_len as usize;
             if cmsg_len < header_len {
-                return Err(AttachClientError::InvalidControlHeader);
+                return Err(AppClientError::InvalidControlHeader);
             }
             let payload_len = cmsg_len - header_len;
             if payload_len % std::mem::size_of::<RawFd>() != 0 {
-                return Err(AttachClientError::InvalidDescriptorPayload);
+                return Err(AppClientError::InvalidDescriptorPayload);
             }
             let fd_count = payload_len / std::mem::size_of::<RawFd>();
             let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
@@ -114,16 +114,16 @@ fn recv_attach_message(
         }
     }
     if ret as usize != std::mem::size_of_val(&offsets_bytes) {
-        return Err(AttachClientError::MetadataLength {
+        return Err(AppClientError::MetadataLength {
             expected: std::mem::size_of_val(&offsets_bytes),
             actual: ret as usize,
         });
     }
     if msg.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0 {
-        return Err(AttachClientError::ControlTruncated);
+        return Err(AppClientError::ControlTruncated);
     }
     if rights_headers != 1 || received.len() != 3 {
-        return Err(AttachClientError::DescriptorCount {
+        return Err(AppClientError::DescriptorCount {
             expected: 3,
             actual: received.len(),
         });
@@ -132,23 +132,24 @@ fn recv_attach_message(
         // SAFETY: fcntl only queries a live received descriptor.
         let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
         if flags < 0 {
-            return Err(AttachClientError::ReceivedDescriptorFlags {
+            return Err(AppClientError::ReceivedDescriptorFlags {
                 source: std::io::Error::last_os_error(),
             });
         }
         // SAFETY: queried descriptor flags are valid for F_SETFD.
         if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
-            return Err(AttachClientError::ReceivedDescriptorCloseOnExec {
+            return Err(AppClientError::ReceivedDescriptorCloseOnExec {
                 source: std::io::Error::last_os_error(),
             });
         }
     }
-    let fds: [OwnedFd; 3] = received.try_into().map_err(|received: Vec<OwnedFd>| {
-        AttachClientError::DescriptorCount {
-            expected: 3,
-            actual: received.len(),
-        }
-    })?;
+    let fds: [OwnedFd; 3] =
+        received
+            .try_into()
+            .map_err(|received: Vec<OwnedFd>| AppClientError::DescriptorCount {
+                expected: 3,
+                actual: received.len(),
+            })?;
 
     let offsets = SessionOffsets {
         rx_fifo_off: offsets_bytes[0],
@@ -160,11 +161,11 @@ fn recv_attach_message(
     Ok((fds, offsets))
 }
 
-impl AttachClient {
-    /// Connect to the dataplane's attach socket at `path` and set up
+impl AppClient {
+    /// Connect to the dataplane's app socket at `path` and set up
     /// the app-side half of a shared-memory session.
-    pub fn connect(path: &str, handle: SessionHandle) -> Result<Self, AttachClientError> {
-        let stream = UnixStream::connect(path).map_err(|source| AttachClientError::Connect {
+    pub fn connect(path: &str, handle: SessionHandle) -> Result<Self, AppClientError> {
+        let stream = UnixStream::connect(path).map_err(|source| AppClientError::Connect {
             path: path.into(),
             source,
         })?;
@@ -178,10 +179,10 @@ impl AttachClient {
         let seg_size = offsets
             .tx_evt_q_off
             .checked_add(4096)
-            .ok_or(AttachClientError::OffsetOverflow)? as usize;
+            .ok_or(AppClientError::OffsetOverflow)? as usize;
 
         let seg = Svm::from_fd(shm_fd.as_raw_fd(), seg_size)
-            .map_err(|source| AttachClientError::SegmentMap { source })?;
+            .map_err(|source| AppClientError::SegmentMap { source })?;
 
         let session = unsafe {
             AppSession::<Svm>::from_segment(

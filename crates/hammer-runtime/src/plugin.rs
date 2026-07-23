@@ -14,8 +14,8 @@ use abi_stable::{
 };
 use libloading::Library;
 use object::{Object, ObjectSection};
-use serde::Deserialize;
 use semver::Version;
+use serde::Deserialize;
 
 use crate::error::RuntimeError;
 use crate::init::{ConfigFunction, InitFunction};
@@ -93,7 +93,10 @@ impl PluginMetadata {
 
     #[inline]
     pub fn load_after(&self) -> impl Iterator<Item = &str> {
-        self.load_after.as_slice().iter().map(|dependency| dependency.as_str())
+        self.load_after
+            .as_slice()
+            .iter()
+            .map(|dependency| dependency.as_str())
     }
 }
 
@@ -346,7 +349,9 @@ impl PluginMain {
         if active.library_index_by_name.contains_key(name) || resolved.contains(name) {
             return Ok(());
         }
-        let path = plugin_path.join(libloading::library_filename(format!("hammer_plugin_{name}")));
+        let path = plugin_path.join(libloading::library_filename(format!(
+            "hammer_plugin_{name}"
+        )));
         if !visiting.insert(name.to_owned()) {
             return Err(PluginError::Cycle { path });
         }
@@ -367,10 +372,12 @@ impl PluginMain {
                     .is_ok_and(|name| matches!(name, "__hammer_plugin" | ".hammer_plugin"))
             })
             .ok_or_else(|| PluginError::ManifestMissing { path: path.clone() })?;
-        let data = section.data().map_err(|source| PluginError::ManifestObject {
-            path: path.clone(),
-            message: source.to_string(),
-        })?;
+        let data = section
+            .data()
+            .map_err(|source| PluginError::ManifestObject {
+                path: path.clone(),
+                message: source.to_string(),
+            })?;
         let data = std::str::from_utf8(data).map_err(|source| PluginError::ManifestObject {
             path: path.clone(),
             message: source.to_string(),
@@ -403,7 +410,11 @@ impl PluginMain {
         Ok(())
     }
 
-    fn load_one(&mut self, plugin_path: &Path, manifest: &PluginManifest) -> Result<(), PluginError> {
+    fn load_one(
+        &mut self,
+        plugin_path: &Path,
+        manifest: &PluginManifest,
+    ) -> Result<(), PluginError> {
         let path = plugin_path.join(libloading::library_filename(format!(
             "hammer_plugin_{}",
             manifest.name
@@ -423,7 +434,9 @@ impl PluginMain {
         if metadata.name() != manifest.name
             || metadata.version() != manifest.version
             || metadata.version_required() != manifest.version_required
-            || metadata.load_after().ne(manifest.load_after.iter().map(String::as_str))
+            || metadata
+                .load_after()
+                .ne(manifest.load_after.iter().map(String::as_str))
         {
             return Err(PluginError::ManifestMetadataMismatch { path });
         }

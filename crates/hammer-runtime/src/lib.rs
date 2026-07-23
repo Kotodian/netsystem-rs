@@ -4,11 +4,11 @@ mod registration;
 
 #[doc(hidden)]
 pub mod __private {
+    pub use crate::registration::RegistrationImage;
+    pub use abi_stable::RRef;
     pub use abi_stable::export_root_module;
     pub use abi_stable::prefix_type::PrefixTypeTrait;
-    pub use abi_stable::RRef;
     pub use abi_stable::std_types::{ROption, RSlice, RStr};
-    pub use crate::registration::RegistrationImage;
 }
 
 crate::__declare_registration_image!(
@@ -73,8 +73,8 @@ pub use node::{
     default_prefetch_indices,
 };
 pub use plugin::{
-    IpOutput, IpOutput_CTO, PluginError, PluginMain, PluginMetadata, PluginModule,
-    PluginModuleRef, host_meets_plugin_requirement,
+    IpOutput, IpOutput_CTO, PluginError, PluginMain, PluginMetadata, PluginModule, PluginModuleRef,
+    host_meets_plugin_requirement,
 };
 pub use process::{
     ProcessContext, ProcessEntry, ProcessEventBatch, ProcessFuture, ProcessHandle, ProcessWake,

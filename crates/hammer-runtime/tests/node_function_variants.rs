@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use hammer_core::data_plane::{BufferFrame};
+use hammer_core::data_plane::BufferFrame;
 use hammer_runtime::RuntimeRegistry;
 use hammer_runtime::config::Worker;
 use hammer_runtime::graph::install_packet_graph;

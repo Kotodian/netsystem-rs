@@ -9,8 +9,12 @@ A worker-local directed graph of packet-processing graph nodes. Packets move thr
 _Avoid_: pipeline, middleware chain, callback stack, async task graph
 
 **Graph Node**:
-A packet graph module that consumes a Pending Frame and may enqueue packet indexes to one or more Next Frames. A graph node owns packet classification or transformation for one graph step, not application I/O policy.
-_Avoid_: service, handler, processor, callback
+A packet graph module with one static Node contract, one declared kind, and one declared typed worker-local state that consumes a Pending Frame and may enqueue packet indexes to one or more Next Frames. Driver and Internal are kind values, not parallel trait families. A graph node owns packet classification or transformation for one graph step, not application I/O policy.
+_Avoid_: service, handler, processor, callback, driver-node trait, internal-node trait, opaque runtime-data words
+
+**Graph Node State**:
+The typed worker-local state declared by a Graph Node and owned by Graph Runtime. Graph snapshots clone it through the Node contract, and worker initialization may replace it with state for that worker; Graph Nodes access it directly during dispatch rather than resolving an encoded slot through a process-global registry.
+_Avoid_: `NodeRuntimeData`, fixed word payload, global state vector plus slot, dispatch-time downcast, public erased-state carrier
 
 **Driver Node**:
 A graph node that brings packets or external readiness into the data plane. Driver nodes are runtime roles, not protocol business roles.
@@ -80,9 +84,9 @@ _Avoid_: submit frame, `submit_frame`, `NextFrame` carrier, node-attached frame
 The concrete state payload inside a frame. `Next` and `Pending` are state bodies that own frame fields directly, not marker types and not tags for a separate storage enum.
 _Avoid_: marker-backed frame state, separate frame storage, separate frame owner
 
-**Node Dispatch Result**:
-The outcome of running a graph node over a Pending Frame. Next Frames are acquired and put during node execution; they are not carried back as the node dispatch result.
-_Avoid_: `NodeNextFrames`, `NextFrame` carrier, `Current(NodeId)`, forwarding result carrier, node returns next frames
+**Node Dispatch**:
+Running a Graph Node function over a Pending Frame inside Graph Runtime. Dispatch completes without a result carrier; frame ownership, Graph Fanout, error attribution, and scheduling are committed through their owning runtime capabilities.
+_Avoid_: `NodeResult`, `NodeNextFrames`, `NextFrame` carrier, `Current(NodeId)`, forwarding result carrier, node returns next frames
 
 ## Runtime
 
@@ -102,17 +106,45 @@ _Avoid_: queue drain in readiness callback, protocol work in poller, observer-ow
 The crate-seam operation that maps an owner-local typed failure while preserving its category and source. Presentation text is not semantic identity, and a lower-layer failure must not be flattened into a string by a layer that does not own it.
 _Avoid_: `Internal(format!(...))` at every seam, message matching, universal business error
 
+**Data-Plane Failure**:
+The single Core failure category for packet-graph identity, Buffer, Index, Frame, and ownership invariants. Buffer-state invariants remain a distinct subcategory, but Core does not wrap the same failure in an additional one-variant packet-graph error.
+_Avoid_: transparent one-variant error layer, repeated error renaming at adjacent crate seams, string-only invariant failure
+
 **Data Worker**:
 A worker that owns data-plane hot-path state for one execution lane. Data-plane state is worker-local unless a handoff or control-plane barrier explicitly crosses the seam.
 _Avoid_: tokio worker, control thread, generic thread
 
 **Main Loop Step**:
-One fixed-order pass through worker scheduling, ready graph nodes, local tasks, driver polling, timers, and exit checks. Step order is part of the runtime semantics.
-_Avoid_: event loop tick, reactor pass, arbitrary scheduler iteration
+One synchronous fixed-order pass through barrier handling, File readiness, Handoff, ready Graph Nodes, driver polling, timers, and exit checks. Step order is part of the runtime semantics. A Data Worker repeatedly executes Main Loop Steps; it does not host a general task executor or Future runtime.
+_Avoid_: event loop tick, reactor pass, worker Future queue, async packet path, arbitrary scheduler iteration
+
+**Process Node**:
+A main-thread cooperative runtime role that may suspend until a clock or typed event wakes it. A Process Node does not run in a Data Worker, consume packet Frames, or introduce async task scheduling into the packet path.
+_Avoid_: data-worker task, Graph Node with no Frame, protocol timer callback on a worker executor, background packet Future
+
+**Process Event**:
+One main-thread Process Node wake event containing an event type and the pending data batch for that type. A clock wake is the absence of an event, not a parallel result type or another event record.
+_Avoid_: process wake enum plus event-batch carrier, data-worker event, one record per datum
 
 **Graph Runtime**:
-The runtime-owned execution context for a Data Worker's Packet Graph, including graph node state, next-arc resolution, pending-frame scheduling, readiness, dispatch, and graph runtime statistics.
-_Avoid_: adapter graph runtime, scheduler helper, node registry wrapper
+The narrow runtime authority for a Data Worker's Packet Graph, including graph node state, next-arc resolution, pending-frame scheduling, readiness, dispatch, and graph runtime statistics. Control modules may receive this authority when they must compile or rebind graph relationships, without gaining the Data Worker's Buffer, trace, Handoff, or File capabilities.
+_Avoid_: adapter graph runtime, scheduler helper, node registry wrapper, generic graph-control port, full Data-Plane Runtime clone
+
+**Data-Plane Runtime**:
+The worker-local execution context presented to Graph Nodes and File callbacks. It composes the Buffer, Graph Fanout, trace, error, Handoff, scheduling, instruction-set, and File observation capabilities required by one Data Worker, while Graph Runtime remains its separately shareable narrow graph authority. Non-owning runtime consumers borrow this context; they do not clone another Data-Plane Runtime authority.
+_Avoid_: Buffer facade, runtime configuration wrapper, generic task runtime, cloneable control-plane authority
+
+**Runtime Engine**:
+The single main-thread authority for runtime configuration, plugin activation and registration, lifecycle ordering, Data Worker lifecycle, Process Node lifecycle, and coordinated shutdown. The daemon owns its IPC listener and other presentation resources separately, and lets the Runtime Engine drive Process Nodes while waiting for the next daemon event. Plugins consume concrete Engine capabilities rather than observing the Engine's plugin inventory or lifecycle dispatcher; Data Workers are Engine-owned execution lanes, not independently exposed Engine values in a pool.
+_Avoid_: Engine pool containing only the main Engine, public plugin main, public lifecycle dispatcher, daemon listener stored in Runtime, global current-Engine pointer, public Engine synchronization fields
+
+**Runtime Configuration**:
+The startup document dispatched by the Runtime Engine to the module that owns each declared section. Section schemas are owner-private; the daemon supplies the original document and does not assemble, retain, or depend on a public aggregate configuration object. Data Worker configuration contains only Data Worker policy, while app-process configuration belongs to the independent app plane.
+_Avoid_: public runtime config type family, retained parsed document, daemon-owned plugin schema, app session or app CPU fields under worker configuration, compatibility aliases for renamed fields
+
+**Runtime Capability**:
+A typed main-thread authority or immutable handle produced during lifecycle initialization and requested by dependent registrations or Process Nodes. The Runtime Engine owns capability storage; consumers request the concrete domain capability and never receive a generic registry object.
+_Avoid_: public runtime registry, registry constructor parameter, service-locator handle passed through the system
 
 **Graph Fanout Layer Contract**:
 - `hammer-core` owns Index/Frame/Buffer and graph identity (`NodeId`, `NodeHandle`, `NodeNext` as local `u16` slots). It does not enqueue or resolve next arcs.
@@ -124,24 +156,30 @@ _Avoid_: adapter graph runtime, scheduler helper, node registry wrapper
 _Avoid_: `NodeNextStorage`, `runtime_nexts`, production `current_node_next(s)`, protocol target-node routing, compatibility wrappers for removed surfaces
 
 **File Readiness**:
-The worker-local registry that maps operating-system fd readiness to callbacks using the existing generation-bearing Pool Index. A File contains descriptor ownership, worker ownership, one read/write/error File Functions table, private data, description, and event counters; it is not a packet-I/O adapter.
-_Avoid_: File-specific Index, `AsyncFd`, TUN I/O backend, runtime platform enum, packet read/write callback
+The worker-local registry that maps operating-system fd readiness to callbacks using the existing generation-bearing Pool Index. A File contains descriptor ownership, callbacks, private data, description, and event counters; the receiving worker Runtime Engine determines its worker ownership. File is not a packet-I/O adapter, and the registry itself is not a public capability.
+_Avoid_: public FileMain, File callback-table type, duplicated worker identity in File, File-specific Index, `AsyncFd`, TUN I/O backend, runtime platform enum, packet read/write callback
 
 **File Readiness Layer Contract**:
 - `hammer-runtime` owns File lifetime, worker ownership, generation checks, readiness counters, callback dispatch, and the fixed Main Loop Step where readiness is polled.
 - Platform adapters are crate-private and may only add, modify, cancel, and collect readiness for existing File records. macOS uses kqueue; Linux uses io_uring without epoll or fallback.
+- File registration, removal, and readiness-interest changes cross the Runtime Engine interface; callers never receive the worker File registry.
 - Device implementations own device identity and all packet `readv`/`writev` operations; after registration, File owns the descriptor handle lifetime. A File callback may only schedule or mark worker-local runtime work; it must not read or write packet payload.
-- Graph Nodes own packet receive/transmit and Buffer Chain handling after readiness schedules them.
+- A File callback receives only the current worker's Graph Runtime scheduling capability; it never acquires the worker Engine. Graph Nodes own packet receive/transmit and Buffer Chain handling after readiness schedules them, and may temporarily observe a registered descriptor only through FileMain using its existing generation-bearing Pool Index.
 - SVM and Physmem backing descriptors never enter FileMain. A Session Message Queue may expose its signal-read endpoint for an independently owned File duplicate; Session Runtime owns that registration and the queue remains the signal endpoint authority.
 - File removal cancels backend interest before its descriptor drops. Queue originals, File duplicates, and app `AsyncFd` duplicates each close through their own Handle Owner.
+_Avoid_: Engine thread-local pointer, callback access to mutable Engine, descriptor owner wrapper outside FileMain, retained raw descriptor as ownership
 
 **Barrier Synchronization**:
-The control-plane mechanism that pauses data workers at a known point so control changes can observe a stable data-plane state. It is not a lock taken around hot-path packet processing.
-_Avoid_: global mutex, graph lock, packet-path synchronization
+The control-plane capability that runs one control mutation while all Data Workers are paused at a known Main Loop Step. Barrier lifetime and release are runtime internals; callers submit the mutation as one operation rather than manually retaining a public pause guard.
+_Avoid_: global mutex, graph lock, packet-path synchronization, public barrier guard, manually paired pause and release
+
+**Control Mutation**:
+A main-thread Runtime Engine operation that changes control-owned state directly. When the changed snapshot is observed by Data Workers, the operation publishes it under Barrier Synchronization; otherwise it completes on the main thread without another dispatcher. Periodic main-thread work belongs to a Process Node.
+_Avoid_: second control thread, generic control executor, async control closure queue, test-only control owner, unsafe shared state justified by a dispatcher that production never starts
 
 **Handoff**:
-A data-plane transfer of packet ownership from one worker to another through worker-owned slots and a handoff graph node. Handoff moves buffer indexes, not protocol payload copies. Graph Runtime may resolve a current-node-local next into destination `NodeId` continuation state while enqueueing; service nodes pass the local next and must not resolve target node identities themselves.
-_Avoid_: crossbeam channel payload, TCP migration copy, app queue transfer, service-side `current_node_next` / resolved-next arrays
+A data-plane transfer of packet ownership from one worker to another through worker-owned slots and a handoff graph node. Handoff moves buffer indexes, not protocol payload copies. Graph Runtime may resolve a current-node-local next into destination `NodeId` continuation state while enqueueing; service nodes pass the local next and must not resolve target node identities themselves. Runtime Engine startup owns Handoff construction and worker queue installation; callers observe only Data Worker identity and invoke the Data-Plane Runtime transfer capability.
+_Avoid_: public handoff queue or worker-handle family, crossbeam channel payload, TCP migration copy, app queue transfer, service-side `current_node_next` / resolved-next arrays
 
 ## Buffer And Memory
 
@@ -154,24 +192,36 @@ The temporary allocation domain used only before Main Heap initialization to dis
 _Avoid_: secondary heap, main-heap overflow fallback, plugin bootstrap allocation
 
 **Data-Plane Primitive**:
-A packet-path data structure that represents Hammer's shared buffer, frame, packet cursor, frame ownership, or graph identity vocabulary. Data-plane primitives are domain primitives built from generic infrastructure, not generic collections or runtime scheduling policy.
-_Avoid_: infra container, runtime scheduler state, helper object
+A packet-path data structure that represents Hammer's shared buffer, frame, packet cursor, frame ownership, or graph identity vocabulary. Data-plane primitives are domain primitives built from generic infrastructure, not generic collections or runtime scheduling policy. Core exposes semantic primitives and required cross-DSO layout facts, not cacheline subrecords, thread-cache records, or tuning thresholds that callers cannot use independently.
+_Avoid_: infra container, runtime scheduler state, helper object, public buffer implementation detail
 
 **Data-Plane Buffer**:
 A VPP-style packet buffer with header state and inline packet storage. Protocol code may move the current window, prepend headers, append bytes, and link buffers by buffer-header state.
 _Avoid_: `Vec<u8>` packet, packet object, protocol-owned payload copy
+
+**Buffer Arena**:
+The shared fixed-capacity storage and pool identity for Data-Plane Buffers. A Data Worker accesses an Arena only through its worker-facing buffer authority; the worker-local cache view is an implementation detail, not a third public owner or API family.
+_Avoid_: public worker cache pool, duplicate alloc/get/chain API, protocol-owned arena view
 
 **Index**:
 A copyable data-plane identity containing pool, slot, and generation facts. Buffer and frame pools use the same concrete value, but only pools construct it. Index does not own release policy; buffer ownership belongs to the Frame or other domain owner that contains the identity.
 _Avoid_: pool-specific index family, index alias, per-index owner, per-index release context
 
 **Buffer Chain**:
-A packet represented by linked data-plane buffers using buffer-header state. Sharing or chaining is represented by buffer metadata, not by feature-specific owner records.
-_Avoid_: TCP chain wrapper, single-buffer owner wrapper, payload segment list
+A packet represented by linked data-plane buffers using buffer-header state. Sharing or chaining is represented by buffer metadata, not by feature-specific owner records. Traversal is an iterator capability over that state, not another public chain owner.
+_Avoid_: TCP chain wrapper, single-buffer owner wrapper, named traversal owner, payload segment list
 
 **Frame Ownership**:
 The worker-local ownership of all buffer references contained in a Pending Frame or Next Frame. Moving indexes between Frames transfers this ownership as a batch, and dropping the owning Frame releases the references that remain in it. Production Frames store indexes in a Main Heap-backed standard `Vec` with a fixed logical maximum of 256; Frame-pool size remains the only buffer-frame tuning knob.
 _Avoid_: per-index owner, manual buffer free, borrowed input ownership, configurable production frame capacity
+
+**Frame Batch Width**:
+The single runtime-selected Core lane-count value used to specialize repeated Buffer Frame index work. Pair, Quad, and Octo are width values, not Runtime-specific duplicates, distinct batch records, cursors, or ownership types.
+_Avoid_: runtime batch-width duplicate, width-specific batch object family, width-conversion trait, public cursor type per lane count
+
+**Packet Trace**:
+A serialized observation attached to one packet as it moves through Graph Nodes. Graph Nodes mark an input packet and append typed observations through Data-Plane Runtime; trace policy, worker publication, storage, and collection remain Runtime Engine internals until a concrete presentation consumer requires a read interface.
+_Avoid_: public trace-control type family, blanket packet-trace marker trait, caller-supplied current node, trace policy passed through Graph Nodes
 
 **Packet Cursor**:
 Packet metadata that records parsed network and transport offsets for a data-plane buffer. It is a parsed-position fact, not a replacement for buffer header state.
@@ -188,6 +238,14 @@ _Avoid_: AppRing, SQE, CQE, submission queue, completion queue, TCP-owned payloa
 **Session Message Queue**:
 The VPP-shaped app/session signaling queue: a producer-locked multi-ring message queue (descriptor queue plus IO and CTRL rings) that carries Session Events, not payload bytes. Producers choose the ring via enqueue API (`enqueue_io` / `enqueue_ctrl`); Local and SVM backends share the same logical layout, with backend-specific wake signaling beside the shared header.
 _Avoid_: flat SessionEvt ring, payload channel, async stream, per-protocol event bus, matching `evt_type` inside a universal enqueue
+
+**Process-Local Readiness Ownership**:
+Each process owns the readiness handle duplicates it creates for its own event loop. Daemon runtime ownership and app-process readiness ownership are independent; neither process borrows the other's descriptor lifecycle.
+_Avoid_: daemon-owned descriptor across process boundaries, one global readiness owner, session object silently closing another process's handle
+
+**Single App Session Surface**:
+The app-facing model has one concrete session object, `AppSession<S>`, for both local and attached storage backends. `AppClient` and session configuration are construction/connection support; a second remote-session facade is not a domain concept.
+_Avoid_: parallel local/remote session objects, wrapper-of-wrapper app facades, session lookup context presented as another session type
 
 ## Session And Transport
 

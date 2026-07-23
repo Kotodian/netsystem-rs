@@ -1,10 +1,9 @@
 use hammer_core::data_plane::{
-    BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Index, NodeKind, NodeNext,
-    NodeRegistration,
+    BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Index, NodeKind, NodeNext, NodeRegistration,
 };
 use hammer_runtime::{
-    DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, NodeDescriptor,
-    NodeProcessFn, NodeResult, NodeRuntimeData, process_frame,
+    DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, NodeDescriptor, NodeProcessFn,
+    NodeResult, NodeRuntimeData, process_frame,
 };
 
 fn test_runtime(buffer_slot_capacity: usize, buffer_slots: usize) -> DataPlaneRuntime {

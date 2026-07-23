@@ -1,8 +1,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use hammer_core::data_plane::{
-    BufferFrame, BufferNodeError, BufferPacketCursor, };
+use hammer_core::data_plane::{BufferFrame, BufferNodeError, BufferPacketCursor};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 use hammer_plugin_ip::protocol::ip::IpVersion;
 use hammer_plugin_ip::{IcmpInputControlPlane, IcmpInputError, IcmpInputTrace};

@@ -14,11 +14,11 @@ use std::process::Command;
 use std::sync::Arc;
 
 use hammer_core::data_plane::NodeId;
-use hammer_runtime::{PluginError, RuntimeError};
 use hammer_runtime::RuntimeRegistry;
 use hammer_runtime::config::Memory;
 use hammer_runtime::engine::{Engine, EnginePool};
 use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig};
+use hammer_runtime::{PluginError, RuntimeError};
 
 // Shared device/interface/transport/session registrations remain host-owned.
 use hammer_service as _;
@@ -304,7 +304,9 @@ fn verify_shared_allocator_images(plugin_path: &Path) -> Result<(), ExampleError
         )));
     }
     for name in PLUGIN_NAMES {
-        consumers.push(plugin_path.join(libloading::library_filename(format!("hammer_plugin_{name}"))));
+        consumers.push(plugin_path.join(libloading::library_filename(format!(
+            "hammer_plugin_{name}"
+        ))));
     }
 
     for path in consumers {
