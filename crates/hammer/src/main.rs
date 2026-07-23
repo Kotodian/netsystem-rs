@@ -73,7 +73,7 @@ fn main() {
     drop(early);
     drop(bootstrap_document);
     drop(config_path);
-    hammer_runtime::memory::ensure_main_heap(&memory).unwrap_or_else(|error| {
+    memory.ensure_main_heap().unwrap_or_else(|error| {
         eprintln!("Failed to initialize main heap: {error}");
         std::process::exit(1);
     });
