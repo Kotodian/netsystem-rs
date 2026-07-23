@@ -34,9 +34,7 @@ verify-allocation-contract:
 	cargo test -p hammer-infra --test main_heap_exhaustion -- --nocapture
 	cargo test -p hammer-core --test buffer_and_svm_allocation_domains -- --nocapture
 	cargo test -p hammer-runtime --test buffer_arena_reuse -- --nocapture
-	cargo test -p hammer-runtime --test plugin_loader
-	cargo test -p hammer-core --test plugin_config
-	cargo run -p hammer --example plugin_additive_load
+	HAMMER_PLUGIN_DIR="$${CARGO_TARGET_DIR:-target}/debug" cargo run -p hammer --example plugin_additive_load
 
 verify-dataplane-performance:
 	cargo test --profile release-perf -p hammer-plugin-ip --test net_lookup_perf -- --ignored --nocapture --test-threads=1

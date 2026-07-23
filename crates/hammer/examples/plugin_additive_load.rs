@@ -3,7 +3,7 @@
 //! Run with:
 //!
 //! ```text
-//! cargo run -p hammer --example plugin_additive_load
+//! HAMMER_PLUGIN_DIR=target/debug cargo run -p hammer --example plugin_additive_load
 //! ```
 //!
 
@@ -132,6 +132,9 @@ fn main() -> Result<(), ExampleError> {
 
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let mut pool = EnginePool::new(Engine::new(runtime, RuntimeRegistry::new()));
+    pool.main_engine_mut()
+        .plugin_main_mut()
+        .register_builtin_image(hammer_service::registration_image());
     pool.main_engine_mut().install_current();
 
     let example_result = run_example(
