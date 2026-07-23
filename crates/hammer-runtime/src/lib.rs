@@ -59,8 +59,8 @@ pub mod trace;
 pub use data_plane::{
     DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, new_worker_runtime,
 };
-pub use handoff::{DataPlaneHandoff, DataPlaneHandoffWorker, DataWorkerId};
 pub use hammer_core::data_plane::FrameBatchWidth;
+pub use handoff::{DataPlaneHandoff, DataPlaneHandoffWorker, DataWorkerId};
 pub use instruction_set::DataPlaneInstructionSet;
 pub use metrics::{
     MetricCounter, MetricGauge, MetricKind, MetricLabel, MetricSample, MetricsRegistry,
