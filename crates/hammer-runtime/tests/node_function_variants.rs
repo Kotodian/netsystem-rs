@@ -9,7 +9,39 @@ use hammer_runtime::{
     Engine, Node, NodeResult, NodeRuntimeData, spawn::DataRuntime,
 };
 
-hammer_runtime::__declare_registration_image!();
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+hammer_runtime::__declare_registration_image!(
+    init_functions = [];
+    config_functions = [];
+    early_config_functions = [];
+    main_loop_enter_functions = [];
+    main_loop_exit_functions = [];
+    worker_init_functions = [];
+    graph_nodes = [__MULTIARCH_GRAPH_NODE_MULTIARCH_NODE];
+    node_functions = [
+        __NODE_FUNCTION_MULTIARCH_PROCESS_SCALAR,
+        __NODE_FUNCTION_MULTIARCH_PROCESS_SSE2,
+        __NODE_FUNCTION_MULTIARCH_PROCESS_AVX2,
+        __NODE_FUNCTION_MULTIARCH_PROCESS_AVX512,
+    ];
+    process_nodes = [];
+);
+
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+hammer_runtime::__declare_registration_image!(
+    init_functions = [];
+    config_functions = [];
+    early_config_functions = [];
+    main_loop_enter_functions = [];
+    main_loop_exit_functions = [];
+    worker_init_functions = [];
+    graph_nodes = [__MULTIARCH_GRAPH_NODE_MULTIARCH_NODE];
+    node_functions = [
+        __NODE_FUNCTION_MULTIARCH_PROCESS_SCALAR,
+        __NODE_FUNCTION_MULTIARCH_PROCESS_NEON,
+    ];
+    process_nodes = [];
+);
 
 static DISPATCH_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -55,6 +87,9 @@ fn node_function_selection_changes_dispatch_without_changing_topology() {
         ),
         RuntimeRegistry::new(),
     );
+    scalar
+        .plugin_main_mut()
+        .register_builtin_image(&__HAMMER_REGISTRATION_IMAGE);
     install_packet_graph(&mut scalar).expect("initialize scalar graph");
     let scalar_node = scalar
         .runtime
@@ -103,6 +138,9 @@ fn node_function_selection_changes_dispatch_without_changing_topology() {
         ),
         RuntimeRegistry::new(),
     );
+    native
+        .plugin_main_mut()
+        .register_builtin_image(&__HAMMER_REGISTRATION_IMAGE);
     install_packet_graph(&mut native).expect("initialize native graph");
     let native_node = native
         .runtime

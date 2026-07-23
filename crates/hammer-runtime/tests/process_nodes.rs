@@ -10,7 +10,20 @@ use hammer_runtime::{
     DataPlaneRuntime, DataPlaneRuntimeConfig, Engine, ProcessContext, ProcessWake,
 };
 
-hammer_runtime::__declare_registration_image!();
+hammer_runtime::__declare_registration_image!(
+    init_functions = [];
+    config_functions = [];
+    early_config_functions = [];
+    main_loop_enter_functions = [];
+    main_loop_exit_functions = [];
+    worker_init_functions = [];
+    graph_nodes = [];
+    node_functions = [];
+    process_nodes = [
+        __PROCESS_NODE_PANICKING_PROCESS_RUNTIME_TEST,
+        __PROCESS_NODE_PROCESS_RUNTIME_TEST,
+    ];
+);
 
 static OBSERVED_THREADS: OnceLock<Mutex<Vec<ThreadId>>> = OnceLock::new();
 static PANICKING_PROCESS_RAN: AtomicBool = AtomicBool::new(false);
@@ -60,7 +73,11 @@ fn test_engine() -> Engine {
         },
         ..DataPlaneRuntimeConfig::default()
     });
-    Engine::new(runtime, RuntimeRegistry::new())
+    let mut engine = Engine::new(runtime, RuntimeRegistry::new());
+    engine
+        .plugin_main_mut()
+        .register_builtin_image(&__HAMMER_REGISTRATION_IMAGE);
+    engine
 }
 
 #[test]

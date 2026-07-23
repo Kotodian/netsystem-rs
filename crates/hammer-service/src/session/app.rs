@@ -368,7 +368,10 @@ mod tests {
     fn checked_add_ooo_accepted_rejects_overflow() {
         let error =
             checked_add_ooo_accepted(u32::MAX, 1).expect_err("overflow must return an error");
-        assert_eq!(error.to_string(), "ooo rx accepted length overflow");
+        assert!(matches!(
+            error,
+            RuntimeError::Invariant { ref detail } if detail == "ooo rx accepted length overflow"
+        ));
     }
 
     #[test]

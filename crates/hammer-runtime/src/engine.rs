@@ -12,6 +12,7 @@ use hammer_runtime::RuntimeRegistry;
 
 use crate::config::Worker;
 use crate::data_plane::{DataPlaneRuntimeWorkerConfig, DataPlaneRuntimeWorkerSeed};
+use crate::init::InitFunction;
 use crate::node::{NodeRuntimeData, NodeRuntimeInner};
 use crate::process::ProcessMain;
 use crate::{DataPlaneHandoffWorker, DataWorkerId, FileMain, PluginMain, ProcessHandle};
@@ -26,11 +27,18 @@ pub(crate) struct EngineWorkerSeed {
     wait_at_barrier: Arc<AtomicU32>,
     workers_at_barrier: Arc<AtomicU32>,
     main_loop_exit_now: Arc<AtomicBool>,
-    pending_worker_graph: Arc<Mutex<Option<NodeRuntimeInner>>>,
+    pending_worker_graph: Arc<Mutex<Option<WorkerGraphUpdate>>>,
     workers_updating_graph: Arc<AtomicU32>,
     worker_graph_update_error: Arc<Mutex<Option<RuntimeError>>>,
+    worker_init_functions: Vec<InitFunction>,
     memory_initialized: bool,
     worker_config: Worker,
+}
+
+#[derive(Clone)]
+struct WorkerGraphUpdate {
+    graph: NodeRuntimeInner,
+    worker_init_functions: Vec<InitFunction>,
 }
 
 #[repr(align(64))]
@@ -45,7 +53,10 @@ pub struct Engine {
     pub main_loop_exit_now: Arc<AtomicBool>,
     pub main_loop_exit_status: Mutex<i32>,
     pub(crate) memory_initialized: bool,
+    // Process futures may hold DSO code; drop them before PluginMain unloads libraries.
+    processes: ProcessMain,
     plugin_main: PluginMain,
+    worker_init_functions: Vec<InitFunction>,
     worker_config: Worker,
     pub(crate) called_init_functions: HashSet<&'static str>,
     pub(crate) called_worker_init_functions: HashSet<&'static str>,
@@ -55,13 +66,12 @@ pub struct Engine {
     pub(crate) called_main_loop_exit_functions: HashSet<&'static str>,
     pub(crate) main_loop_entered: bool,
     materialized_registration_generation: u64,
-    pending_worker_graph: Arc<Mutex<Option<NodeRuntimeInner>>>,
+    pending_worker_graph: Arc<Mutex<Option<WorkerGraphUpdate>>>,
     workers_updating_graph: Arc<AtomicU32>,
     worker_graph_update_error: Arc<Mutex<Option<RuntimeError>>>,
     main_loop_exit_functions_called: bool,
     file_main: Option<FileMain>,
     worker_threads: Mutex<Vec<JoinHandle<()>>>,
-    processes: ProcessMain,
 }
 
 impl Engine {
@@ -72,9 +82,10 @@ impl Engine {
         wait_at_barrier: Arc<AtomicU32>,
         workers_at_barrier: Arc<AtomicU32>,
         main_loop_exit_now: Arc<AtomicBool>,
-        pending_worker_graph: Arc<Mutex<Option<NodeRuntimeInner>>>,
+        pending_worker_graph: Arc<Mutex<Option<WorkerGraphUpdate>>>,
         workers_updating_graph: Arc<AtomicU32>,
         worker_graph_update_error: Arc<Mutex<Option<RuntimeError>>>,
+        worker_init_functions: Vec<InitFunction>,
         memory_initialized: bool,
         worker_config: Worker,
         index: u32,
@@ -96,6 +107,7 @@ impl Engine {
             main_loop_exit_status: Mutex::new(0),
             memory_initialized,
             plugin_main: PluginMain::default(),
+            worker_init_functions,
             worker_config,
             called_init_functions: HashSet::new(),
             called_worker_init_functions: HashSet::new(),
@@ -131,6 +143,7 @@ impl Engine {
             main_loop_exit_status: Mutex::new(0),
             memory_initialized: false,
             plugin_main: PluginMain::default(),
+            worker_init_functions: Vec::new(),
             worker_config: Worker::default(),
             called_init_functions: HashSet::new(),
             called_worker_init_functions: HashSet::new(),
@@ -237,7 +250,10 @@ impl Engine {
         if self.workers_updating_graph.load(Ordering::Acquire) != 0 {
             return Err(RuntimeError::WorkerGraphUpdateAlreadyPending);
         }
-        let graph = self.runtime.nodes().snapshot();
+        let update = WorkerGraphUpdate {
+            graph: self.runtime.nodes().snapshot(),
+            worker_init_functions: self.plugin_main.worker_init_functions(),
+        };
         let mut published = self
             .pending_worker_graph
             .lock()
@@ -250,7 +266,7 @@ impl Engine {
             .lock()
             .map_err(|_| RuntimeError::WorkerGraphUpdateStatePoisoned)?;
         *error = None;
-        *published = Some(graph);
+        *published = Some(update);
         self.workers_updating_graph
             .store(worker_count, Ordering::Release);
         Ok(())
@@ -290,10 +306,11 @@ impl Engine {
                     .cloned()
                     .ok_or(RuntimeError::WorkerGraphUpdateMissing)
             })
-            .and_then(|graph| {
+            .and_then(|update| {
                 self.runtime
                     .nodes()
-                    .replace_graph_preserving_worker_state(graph)?;
+                    .replace_graph_preserving_worker_state(update.graph)?;
+                self.worker_init_functions = update.worker_init_functions;
                 crate::init::run_worker_init_functions(self)
             });
         let succeeded = result.is_ok();
@@ -328,6 +345,7 @@ impl Engine {
             Arc::clone(&self.pending_worker_graph),
             Arc::clone(&self.workers_updating_graph),
             Arc::clone(&self.worker_graph_update_error),
+            self.plugin_main.worker_init_functions(),
             self.memory_initialized,
             self.worker_config.clone(),
             index,
@@ -353,6 +371,14 @@ impl Engine {
     #[inline]
     pub(crate) fn worker_config(&self) -> &Worker {
         &self.worker_config
+    }
+
+    pub(crate) fn worker_init_functions(&self) -> Vec<InitFunction> {
+        if self.thread_index == 0 {
+            self.plugin_main.worker_init_functions()
+        } else {
+            self.worker_init_functions.clone()
+        }
     }
 
     pub(crate) fn apply_worker_config(&mut self, worker: Worker) -> RuntimeResult<()> {
@@ -404,6 +430,7 @@ impl Engine {
             pending_worker_graph: Arc::clone(&self.pending_worker_graph),
             workers_updating_graph: Arc::clone(&self.workers_updating_graph),
             worker_graph_update_error: Arc::clone(&self.worker_graph_update_error),
+            worker_init_functions: self.plugin_main.worker_init_functions(),
             memory_initialized: self.memory_initialized,
             worker_config: self.worker_config.clone(),
         }
@@ -518,6 +545,7 @@ impl EngineWorkerSeed {
             pending_worker_graph,
             workers_updating_graph,
             worker_graph_update_error,
+            worker_init_functions,
             memory_initialized,
             worker_config,
         } = self;
@@ -539,6 +567,7 @@ impl EngineWorkerSeed {
             pending_worker_graph,
             workers_updating_graph,
             worker_graph_update_error,
+            worker_init_functions,
             memory_initialized,
             worker_config,
             index,

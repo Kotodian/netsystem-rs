@@ -5,7 +5,17 @@ use hammer_runtime::RuntimeRegistry;
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, Engine, EnginePool};
 
-hammer_runtime::__declare_registration_image!();
+hammer_runtime::__declare_registration_image!(
+    init_functions = [];
+    config_functions = [];
+    early_config_functions = [];
+    main_loop_enter_functions = [];
+    main_loop_exit_functions = [__INIT_FN_OBSERVE_MAIN_LOOP_EXIT];
+    worker_init_functions = [];
+    graph_nodes = [];
+    node_functions = [];
+    process_nodes = [];
+);
 
 static EXIT_CALLS: AtomicUsize = AtomicUsize::new(0);
 
@@ -23,7 +33,11 @@ fn engine_pool() -> EnginePool {
         ..DataPlaneBufferConfig::default()
     };
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig { buffers });
-    EnginePool::new(Engine::new(runtime, RuntimeRegistry::new()))
+    let mut engine = Engine::new(runtime, RuntimeRegistry::new());
+    engine
+        .plugin_main_mut()
+        .register_builtin_image(&__HAMMER_REGISTRATION_IMAGE);
+    EnginePool::new(engine)
 }
 
 #[test]

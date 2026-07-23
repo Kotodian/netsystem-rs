@@ -12,7 +12,17 @@ use hammer_runtime::{
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
-hammer_runtime::__declare_registration_image!();
+hammer_runtime::__declare_registration_image!(
+    init_functions = [];
+    config_functions = [];
+    early_config_functions = [];
+    main_loop_enter_functions = [];
+    main_loop_exit_functions = [];
+    worker_init_functions = [__INIT_FN_VERIFY_WORKER_STARTUP_CONTRACT];
+    graph_nodes = [];
+    node_functions = [];
+    process_nodes = [];
+);
 
 const READY: usize = 0;
 const INIT_FAILURE: usize = 1;
@@ -80,7 +90,11 @@ fn engine_pool() -> EnginePool {
         .nodes()
         .set_node_state(node, NodeState::Disabled)
         .expect("canonical startup node state");
-    EnginePool::new(Engine::new(runtime, RuntimeRegistry::new()))
+    let mut engine = Engine::new(runtime, RuntimeRegistry::new());
+    engine
+        .plugin_main_mut()
+        .register_builtin_image(&__HAMMER_REGISTRATION_IMAGE);
+    EnginePool::new(engine)
 }
 
 fn stop_workers(pool: &mut EnginePool) {
