@@ -7,9 +7,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use hammer_app::SessionHandle;
 use hammer_app::attach::{AppClient, AppClientError};
-use hammer_app::remote_session::{RemoteAppSession, RemoteAppSessionError};
+use hammer_app::{AppSession, AppSessionAsyncError, SessionHandle};
+use hammer_infra::segment::Svm;
 use hammer_runtime::app::SessionEvtType;
 use hammer_runtime::engine::{Engine, EnginePool};
 use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, RuntimeError, RuntimeRegistry};
@@ -85,7 +85,7 @@ enum EchoError {
     #[error(transparent)]
     Attach(#[from] AppClientError),
     #[error(transparent)]
-    RemoteSession(#[from] RemoteAppSessionError),
+    Session(#[from] AppSessionAsyncError),
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
     #[error("failed to resolve the Cargo example executable")]
@@ -174,31 +174,25 @@ fn stage_plugin_artifacts() -> Result<(), EchoError> {
 
 fn run_attached_echo() -> Result<(), EchoError> {
     let handle = SessionHandle::new(0, 0);
-    let attached = AppClient::connect(ATTACH_SOCKET, handle)?;
+    let session = AppClient::connect(ATTACH_SOCKET, handle)?;
     let tokio_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .build()
         .map_err(|source| EchoError::TokioRuntime { source })?;
-    let session = {
-        let runtime_guard = tokio_runtime.enter();
-        let session = RemoteAppSession::new(Arc::new(attached.session))?;
-        drop(runtime_guard);
-        session
-    };
-    tokio_runtime.block_on(run_echo(session, handle))
+    tokio_runtime.block_on(run_echo(&session, handle))
 }
 
-async fn run_echo(session: RemoteAppSession, handle: SessionHandle) -> Result<(), EchoError> {
+async fn run_echo(session: &AppSession<Svm>, handle: SessionHandle) -> Result<(), EchoError> {
     let mut buffer = vec![0; ECHO_BUFFER_BYTES];
     loop {
-        let event = session.next_event().await;
+        let event = session.next_event().await?;
         if event.session_index() != handle.session_index() {
             continue;
         }
         match event.evt_type {
             SessionEvtType::Connect | SessionEvtType::TxDeq => {}
             SessionEvtType::RxEnq => {
-                let read = session.recv(&mut buffer).await;
+                let read = session.recv(&mut buffer).await?;
                 if read != 0 {
                     session.send_all(&buffer[..read]).await?;
                 }

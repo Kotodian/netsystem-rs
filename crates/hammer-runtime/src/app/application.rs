@@ -10,9 +10,7 @@ use tokio::sync::Notify;
 
 use crate::app::handle::SessionHandle;
 use crate::app::session::{AppSession, AppSessionConfig};
-use crate::app::session_msg_queue::{
-    SessionEventQueue, SessionEvt, SessionMsgQueue, SessionSegment,
-};
+use crate::app::session_msg_queue::{SessionEvt, SessionMsgQueue, SessionSegment};
 
 struct SessionNotify {
     rx_readable: Notify,

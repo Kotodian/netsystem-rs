@@ -8,8 +8,8 @@ use hammer_infra::fifo_queue::FifoQueue;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::segment::{Local, Segment, Svm};
 use hammer_runtime::app::{
-    AppContext, AppSessionConfig, SessionEventQueue, SessionEvtType, SessionHandle,
-    SessionMsgQueue, SessionSegment, with_current_app_worker,
+    AppSessionConfig, SessionEventQueue, SessionEvtType, SessionHandle, SessionMsgQueue,
+    SessionSegment, with_current_app_worker,
 };
 use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
 use hammer_runtime::{DataPlaneRuntime, DataWorkerId, Engine, File, FileFunctions};
@@ -107,7 +107,6 @@ pub struct SessionWorker<Index, Seg: SessionSegment = Local> {
     worker: DataWorkerId,
     entries: Pool<SessionEntry<Index>>,
     app: SessionAppRuntime<Seg>,
-    app_context: Option<AppContext<Local>>,
     app_session_config: AppSessionConfig,
     buffers: DataPlaneBuffers,
     session_work: Vec<SessionId>,
@@ -135,7 +134,6 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
                 worker_index,
                 seg,
             ),
-            app_context: None,
             app_session_config,
             buffers,
             session_work: Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
@@ -168,11 +166,6 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
     #[inline]
     pub fn app_session_config(&self) -> AppSessionConfig {
         self.app_session_config
-    }
-
-    #[inline]
-    pub fn app_context(&self) -> Option<&AppContext<Local>> {
-        self.app_context.as_ref()
     }
 
     /// Registers the session queue signal with the worker FileMain.
@@ -462,23 +455,22 @@ impl<Index: Copy + Eq> SessionWorker<Index, Local> {
         )
     }
 
-    pub fn with_app_context(
+    pub fn with_session_config(
         worker: DataWorkerId,
         buffers: DataPlaneBuffers,
-        app_context: AppContext<Local>,
+        app_session_config: AppSessionConfig,
     ) -> Self {
         let cap = DEFAULT_SESSION_TX_EVENT_CAPACITY.next_power_of_two().max(2) as u32;
         let tx_evt_q =
             Arc::new(SessionMsgQueue::with_cfg(cap, cap.max(2)).expect("local tx_evt_q"));
-        let mut sessions = Self::with_app_session_config(
+        let sessions = Self::with_app_session_config(
             worker,
             buffers,
-            app_context.app_session_config(),
+            app_session_config,
             Local::default(),
             worker.slot(),
             tx_evt_q,
         );
-        sessions.app_context = Some(app_context);
         sessions
     }
 }

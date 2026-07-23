@@ -54,10 +54,7 @@ pub enum AppClientError {
 /// Client side of the application-session protocol.
 /// Connects to the dataplane's Unix socket, receives shared-memory fds
 /// and layout offsets, and reconstructs the app-side [`AppSession`].
-pub struct AppClient {
-    pub session: AppSession<Svm>,
-    pub offsets: SessionOffsets,
-}
+pub struct AppClient;
 
 /// Parse a SCM_RIGHTS message, returning the received fds and raw data.
 fn recv_attach_message(
@@ -164,7 +161,7 @@ fn recv_attach_message(
 impl AppClient {
     /// Connect to the dataplane's app socket at `path` and set up
     /// the app-side half of a shared-memory session.
-    pub fn connect(path: &str, handle: SessionHandle) -> Result<Self, AppClientError> {
+    pub fn connect(path: &str, handle: SessionHandle) -> Result<AppSession<Svm>, AppClientError> {
         let stream = UnixStream::connect(path).map_err(|source| AppClientError::Connect {
             path: path.into(),
             source,
@@ -196,6 +193,6 @@ impl AppClient {
             )
         };
 
-        Ok(Self { session, offsets })
+        Ok(session)
     }
 }
