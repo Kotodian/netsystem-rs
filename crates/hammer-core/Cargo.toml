@@ -10,11 +10,6 @@ crate-type = ["dylib", "rlib"]
 
 [features]
 default = []
-# Platform-specific config/runtime surfaces. Selected automatically by
-# target_os via cfg; the Cargo feature is a mirror so downstream crates can
-# require it explicitly. Do not enable both linux-platform and macos-platform.
-linux-platform = []
-macos-platform = []
 
 [dependencies]
 hammer-infra = { path = "../hammer-infra" }

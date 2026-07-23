@@ -82,8 +82,6 @@ impl NodeRegistration {
     }
 }
 
-pub const MAX_NODE_NEXT_SLOTS: usize = 16;
-
 pub trait NodeNext: Copy + Eq {
     fn slot(self) -> u16;
 }

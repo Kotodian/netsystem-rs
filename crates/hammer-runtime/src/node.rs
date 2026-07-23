@@ -8,8 +8,8 @@ use std::time::Instant;
 
 use crate::error::{RuntimeError, RuntimeResult};
 use hammer_core::data_plane::{
-    BufferFrame, BufferNodeError, Frame, MAX_NODE_NEXT_SLOTS, NodeHandle, NodeId, NodeKind,
-    NodeNext, NodeRegistration, NodeState, Pending,
+    BufferFrame, BufferNodeError, Frame, NodeHandle, NodeId, NodeKind, NodeNext, NodeRegistration,
+    NodeState, Pending,
 };
 use hammer_core::error::DataPlaneError;
 
