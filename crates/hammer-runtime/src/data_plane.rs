@@ -4,8 +4,8 @@ use std::rc::Rc;
 
 use crate::error::{RuntimeError, RuntimeResult};
 use hammer_core::data_plane::{
-    BufferFrame, BufferFrameBatchWidth, BufferFrameBatchWidthPolicy, BufferNodeError, BufferRef,
-    BufferRefMut, BufferPoolArena, DataPlaneBufferChain, DataPlaneBuffers,
+    BufferFrame, BufferNodeError, BufferPoolArena, BufferRef, BufferRefMut, DataPlaneBufferChain,
+    DataPlaneBuffers, FrameBatchWidth,
     BUFFER_CACHE_LINE_SIZE, DEFAULT_BUFFER_FRAME_POOL_SIZE, Frame, Index, Next, NodeHandle,
     NodeId, NodeNext, NodeRegistration, Pending,
 };
@@ -13,20 +13,9 @@ use hammer_core::error::DataPlaneError;
 
 use crate::config::Worker;
 use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HANDOFF_SLOT_CAPACITY, HandoffSlot};
-use crate::instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
+use crate::instruction_set::DataPlaneInstructionSet;
 use crate::node::{NodeEntry, NodeFunctionRegistration, NodeRuntime, NodeRuntimeInner};
 use crate::trace::{DataPlaneTrace, PacketTrace, TraceControlHandle};
-
-impl BufferFrameBatchWidthPolicy for FrameBatchWidth {
-    #[inline]
-    fn buffer_frame_batch_width(self) -> BufferFrameBatchWidth {
-        match self {
-            Self::Pair => BufferFrameBatchWidth::Pair,
-            Self::Quad => BufferFrameBatchWidth::Quad,
-            Self::Octo => BufferFrameBatchWidth::Octo,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Default)]
 pub struct DataPlaneRuntimeConfig {

@@ -991,21 +991,10 @@ pub struct Frame<State> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum BufferFrameBatchWidth {
+pub enum FrameBatchWidth {
     Pair,
     Quad,
     Octo,
-}
-
-pub trait BufferFrameBatchWidthPolicy: Copy {
-    fn buffer_frame_batch_width(self) -> BufferFrameBatchWidth;
-}
-
-impl BufferFrameBatchWidthPolicy for BufferFrameBatchWidth {
-    #[inline]
-    fn buffer_frame_batch_width(self) -> BufferFrameBatchWidth {
-        self
-    }
 }
 
 #[derive(Clone)]
@@ -2991,7 +2980,7 @@ pub struct BufferFrameQuadBatchCursor<'frame> {
 pub struct BufferFrameBatchCursor<'frame> {
     indices: &'frame [Index],
     offset: usize,
-    width: BufferFrameBatchWidth,
+    width: FrameBatchWidth,
 }
 
 macro_rules! retain_ladder {
@@ -3215,14 +3204,11 @@ impl BufferFrame {
     }
 
     #[inline]
-    pub fn batch_cursor(
-        &self,
-        width: impl BufferFrameBatchWidthPolicy,
-    ) -> BufferFrameBatchCursor<'_> {
+    pub fn batch_cursor(&self, width: FrameBatchWidth) -> BufferFrameBatchCursor<'_> {
         BufferFrameBatchCursor {
             indices: self.pending_indices(),
             offset: 0,
-            width: width.buffer_frame_batch_width(),
+            width,
         }
     }
 
@@ -3267,31 +3253,31 @@ impl BufferFrame {
     #[inline(always)]
     pub fn retain_indices_batched(
         &mut self,
-        width: impl BufferFrameBatchWidthPolicy,
+        width: FrameBatchWidth,
         mut keep: impl FnMut(Index) -> PacketGraphResult<bool>,
     ) -> PacketGraphResult<()> {
-        match width.buffer_frame_batch_width() {
-            BufferFrameBatchWidth::Octo => self.retain_indices_octo(&mut keep),
-            BufferFrameBatchWidth::Quad => self.retain_indices_quad(&mut keep),
-            BufferFrameBatchWidth::Pair => self.retain_indices_pair(&mut keep),
+        match width {
+            FrameBatchWidth::Octo => self.retain_indices_octo(&mut keep),
+            FrameBatchWidth::Quad => self.retain_indices_quad(&mut keep),
+            FrameBatchWidth::Pair => self.retain_indices_pair(&mut keep),
         }
     }
 
     #[inline(always)]
     pub fn retain_indices_batched_with_prefetch(
         &mut self,
-        width: impl BufferFrameBatchWidthPolicy,
+        width: FrameBatchWidth,
         mut prefetch: impl FnMut(Index),
         mut keep: impl FnMut(Index) -> PacketGraphResult<bool>,
     ) -> PacketGraphResult<()> {
-        match width.buffer_frame_batch_width() {
-            BufferFrameBatchWidth::Quad => {
+        match width {
+            FrameBatchWidth::Quad => {
                 self.retain_indices_quad_with_prefetch(&mut prefetch, &mut keep)
             }
-            BufferFrameBatchWidth::Pair => {
+            FrameBatchWidth::Pair => {
                 self.retain_indices_pair_with_prefetch(&mut prefetch, &mut keep)
             }
-            BufferFrameBatchWidth::Octo => {
+            FrameBatchWidth::Octo => {
                 self.retain_indices_quad_with_prefetch(&mut prefetch, &mut keep)
             }
         }
@@ -3300,19 +3286,19 @@ impl BufferFrame {
     #[inline(always)]
     pub fn retain_indices_batched_with_prefetch_state<S>(
         &mut self,
-        width: impl BufferFrameBatchWidthPolicy,
+        width: FrameBatchWidth,
         state: &mut S,
         mut prefetch: impl FnMut(&mut S, Index),
         mut keep: impl FnMut(&mut S, Index) -> PacketGraphResult<bool>,
     ) -> PacketGraphResult<()> {
-        match width.buffer_frame_batch_width() {
-            BufferFrameBatchWidth::Quad => {
+        match width {
+            FrameBatchWidth::Quad => {
                 self.retain_indices_quad_with_prefetch_state(state, &mut prefetch, &mut keep)
             }
-            BufferFrameBatchWidth::Pair => {
+            FrameBatchWidth::Pair => {
                 self.retain_indices_pair_with_prefetch_state(state, &mut prefetch, &mut keep)
             }
-            BufferFrameBatchWidth::Octo => {
+            FrameBatchWidth::Octo => {
                 self.retain_indices_quad_with_prefetch_state(state, &mut prefetch, &mut keep)
             }
         }
@@ -3321,19 +3307,19 @@ impl BufferFrame {
     #[inline(always)]
     pub fn buffer_node_inline<S>(
         &mut self,
-        width: impl BufferFrameBatchWidthPolicy,
+        width: FrameBatchWidth,
         state: &mut S,
         mut prefetch: impl FnMut(&mut S, Index),
         mut keep: impl FnMut(&mut S, Index) -> PacketGraphResult<bool>,
     ) -> PacketGraphResult<()> {
-        match width.buffer_frame_batch_width() {
-            BufferFrameBatchWidth::Quad => {
+        match width {
+            FrameBatchWidth::Quad => {
                 self.retain_indices_quad_with_prefetch_state_lazy(state, &mut prefetch, &mut keep)
             }
-            BufferFrameBatchWidth::Pair => {
+            FrameBatchWidth::Pair => {
                 self.retain_indices_pair_with_prefetch_state_lazy(state, &mut prefetch, &mut keep)
             }
-            BufferFrameBatchWidth::Octo => {
+            FrameBatchWidth::Octo => {
                 self.retain_indices_quad_with_prefetch_state_lazy(state, &mut prefetch, &mut keep)
             }
         }
@@ -3342,13 +3328,13 @@ impl BufferFrame {
     #[inline(always)]
     pub fn rewrite_indices_batched(
         &mut self,
-        width: impl BufferFrameBatchWidthPolicy,
+        width: FrameBatchWidth,
         mut rewrite: impl FnMut(Index) -> PacketGraphResult<Option<Index>>,
     ) -> PacketGraphResult<()> {
-        match width.buffer_frame_batch_width() {
-            BufferFrameBatchWidth::Quad => self.rewrite_indices_quad(&mut rewrite),
-            BufferFrameBatchWidth::Pair => self.rewrite_indices_pair(&mut rewrite),
-            BufferFrameBatchWidth::Octo => self.rewrite_indices_octo(&mut rewrite),
+        match width {
+            FrameBatchWidth::Quad => self.rewrite_indices_quad(&mut rewrite),
+            FrameBatchWidth::Pair => self.rewrite_indices_pair(&mut rewrite),
+            FrameBatchWidth::Octo => self.rewrite_indices_octo(&mut rewrite),
         }
     }
 
@@ -3824,9 +3810,9 @@ impl BufferFrameBatchCursor<'_> {
     #[inline]
     pub fn prefetch_next_with(&self, mut prefetch: impl FnMut(Index)) {
         let width = match self.width {
-            BufferFrameBatchWidth::Octo => 8,
-            BufferFrameBatchWidth::Quad => 4,
-            BufferFrameBatchWidth::Pair => 2,
+            FrameBatchWidth::Octo => 8,
+            FrameBatchWidth::Quad => 4,
+            FrameBatchWidth::Pair => 2,
         };
         for index in self.indices[self.offset..].iter().take(width).copied() {
             prefetch(index);
@@ -3841,7 +3827,7 @@ impl Iterator for BufferFrameBatchCursor<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         let remaining = self.indices.len().saturating_sub(self.offset);
         match self.width {
-            BufferFrameBatchWidth::Octo | BufferFrameBatchWidth::Quad if remaining >= 4 => {
+            FrameBatchWidth::Octo | FrameBatchWidth::Quad if remaining >= 4 => {
                 let batch = BufferFrameBatch::Quad([
                     self.indices[self.offset],
                     self.indices[self.offset + 1],
