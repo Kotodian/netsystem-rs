@@ -73,6 +73,7 @@ Use Rust 2024 conventions and rustfmt defaults: 4-space indentation, `snake_case
 
 When working on VPP-related refactors in this repository:
 - Always research and reference VPP for dataplane, session, transport, and TCP design decisions before proposing or changing architecture.
+- Use the vendored VPP source under `third_party/vpp/` as the first and default VPP reference. Search it locally before consulting any network source; use external VPP sources only when the required code is absent from the vendored tree.
 - Treat VPP as a semantic and ownership reference, not as a 1:1 API, data-structure, or naming template. Hammer's app/session boundary is VPP-style session FIFO + message queue (`svm_fifo`/`svm_msg_q`) semantics; do not reintroduce io_uring-style `AppRing`, SQE, CQE, submission, or completion surfaces for dataplane app/session exchange.
 - Use data structures from the `hammer-infra` crate by default. If `hammer-infra` lacks a required generic API, add the API there instead of falling back to `std` or creating local one-off utilities.
 - Route all ordinary Rust and third-party production allocations through the process-global fixed-capacity Hammer Main Heap. Standard collections are the ordinary collection family; use explicit `hammer-infra` primitives when their VPP/data-plane semantics are required. SVM regions and Buffer Arena packet storage are the only allocation backends exempt from the Main Heap, and neither may fall back to it.

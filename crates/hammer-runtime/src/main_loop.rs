@@ -119,9 +119,9 @@ mod tests {
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
 
+    use crate::DataPlaneBufferConfig;
     use crate::engine::Engine;
     use crate::spawn::DataRemoteLocalQueue;
-    use crate::DataPlaneBufferConfig;
     use hammer_runtime::RuntimeRegistry;
     use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, File, FileFunctions};
 

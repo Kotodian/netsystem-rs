@@ -258,7 +258,7 @@ impl<S: SessionSegment> AppSession<S> {
 
 impl AppSession<Svm> {
     /// Reconstruct an app session from a pre-allocated shared segment.
-    /// Called by AttachClient (app process) after receiving offsets over
+    /// Called by AppClient (app process) after receiving offsets over
     /// the Unix socket. The segment must already contain valid Fifo /
     /// Session Message Queue headers at the given offsets; the signal fds
     /// must be open for reading.

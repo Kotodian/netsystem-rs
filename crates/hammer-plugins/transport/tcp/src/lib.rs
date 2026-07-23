@@ -1117,16 +1117,59 @@ pub enum TcpInputNext {
 mod init_tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+    use abi_stable::{
+        RRef,
+        sabi_trait::TD_Opaque,
+        std_types::{RSlice, RSliceMut},
+    };
+    use hammer_runtime::IpOutput;
     use hammer_runtime::RuntimeRegistry;
     use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, Engine};
 
     use super::*;
 
+    struct TestIpOutput;
+
+    impl IpOutput for TestIpOutput {
+        fn write_ipv4_header(
+            &self,
+            _: RSliceMut<'_, u8>,
+            _: RSlice<'_, u8>,
+            _: RSlice<'_, u8>,
+            _: u8,
+            _: u16,
+        ) -> bool {
+            false
+        }
+
+        fn write_ipv6_header(
+            &self,
+            _: RSliceMut<'_, u8>,
+            _: RSlice<'_, u8>,
+            _: RSlice<'_, u8>,
+            _: u8,
+            _: u16,
+        ) -> bool {
+            false
+        }
+    }
+
+    static TEST_IP_OUTPUT: hammer_runtime::IpOutput_CTO<'static, 'static> =
+        hammer_runtime::IpOutput_CTO::from_const(&TestIpOutput, TD_Opaque);
+
     fn test_engine() -> Engine {
-        Engine::new(
+        let mut engine = Engine::new(
             DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()),
             RuntimeRegistry::new(),
-        )
+        );
+        engine
+            .plugin_main_mut()
+            .register_builtin_image(hammer_service::registration_image());
+        let plugin = crate::plugin_module();
+        engine
+            .plugin_main_mut()
+            .register_builtin_image(plugin.registration_image().get());
+        engine
     }
 
     #[test]
@@ -1143,10 +1186,13 @@ address = "10.0.0.1:7"
             )
             .expect("dispatch tcp config");
 
-        let entry = TCP_MAIN
-            .load()
-            .as_deref()
-            .expect("tcp main")
+        let config = engine
+            .registry
+            .require::<crate::config::TcpPluginConfig>()
+            .expect("published TCP config");
+        let main = configured_tcp_main(config.as_ref(), RRef::new(&TEST_IP_OUTPUT))
+            .expect("build configured TCP main");
+        let entry = main
             .control()
             .lookup_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 7));
         assert!(entry.is_some(), "configured listen must be in lookup");

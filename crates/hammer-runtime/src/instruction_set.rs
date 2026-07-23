@@ -1,9 +1,4 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum FrameBatchWidth {
-    Pair,
-    Quad,
-    Octo,
-}
+use hammer_core::data_plane::FrameBatchWidth;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

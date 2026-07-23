@@ -3,7 +3,7 @@
 //! Run with:
 //!
 //! ```text
-//! cargo run -p hammer --example plugin_additive_load
+//! HAMMER_PLUGIN_DIR=target/debug cargo run -p hammer --example plugin_additive_load
 //! ```
 //!
 
@@ -14,11 +14,11 @@ use std::process::Command;
 use std::sync::Arc;
 
 use hammer_core::data_plane::NodeId;
-use hammer_runtime::{PluginError, RuntimeError};
 use hammer_runtime::RuntimeRegistry;
 use hammer_runtime::config::Memory;
 use hammer_runtime::engine::{Engine, EnginePool};
 use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig};
+use hammer_runtime::{PluginError, RuntimeError};
 
 // Shared device/interface/transport/session registrations remain host-owned.
 use hammer_service as _;
@@ -132,6 +132,9 @@ fn main() -> Result<(), ExampleError> {
 
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let mut pool = EnginePool::new(Engine::new(runtime, RuntimeRegistry::new()));
+    pool.main_engine_mut()
+        .plugin_main_mut()
+        .register_builtin_image(hammer_service::registration_image());
     pool.main_engine_mut().install_current();
 
     let example_result = run_example(
@@ -304,7 +307,9 @@ fn verify_shared_allocator_images(plugin_path: &Path) -> Result<(), ExampleError
         )));
     }
     for name in PLUGIN_NAMES {
-        consumers.push(plugin_path.join(libloading::library_filename(format!("hammer_plugin_{name}"))));
+        consumers.push(plugin_path.join(libloading::library_filename(format!(
+            "hammer_plugin_{name}"
+        ))));
     }
 
     for path in consumers {

@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::data_plane::NodeId;
-use crate::error::{BufferInvariant, DataPlaneError, PacketGraphError, PacketGraphResult};
+use crate::error::{BufferInvariant, DataPlaneError, DataPlaneResult};
 use hammer_infra::{
     align::align_up,
     physmem::PhysmemMap,
@@ -30,20 +30,20 @@ pub const DEFAULT_BUFFER_FRAME_CAPACITY: usize = 256;
 pub const DEFAULT_BUFFER_FRAME_POOL_SIZE: usize = 64;
 pub const BUFFER_CACHE_LINE_SIZE: usize = 64;
 pub const DEFAULT_PACKET_HEADROOM: usize = 256;
-pub const DEFAULT_PRE_DATA_SIZE: usize = 128;
-pub const BUFFER_INVALID_INDEX: u32 = u32::MAX;
+const DEFAULT_PRE_DATA_SIZE: usize = 128;
+const BUFFER_INVALID_INDEX: u32 = u32::MAX;
 
 /// Number of free slots moved between the per-thread cache and the arena free
 /// list in a single batch. Batching amortises the `Rc<RefCell>` borrow across
 /// this many alloc/free operations.
-pub const BUFFER_THREAD_CACHE_BATCH: usize = 32;
+const BUFFER_THREAD_CACHE_BATCH: usize = 32;
 /// High-water mark at which the thread cache returns a batch back to the
 /// arena free list, preventing unbounded cache growth and keeping arena free
 /// list non-empty for other consumers.
-pub const BUFFER_THREAD_CACHE_HIGH_WATER: usize = 512;
+const BUFFER_THREAD_CACHE_HIGH_WATER: usize = 512;
 /// `in_use` is folded from the lazy `in_use_delta` counter once its absolute
 /// value exceeds this threshold or when the count is read.
-pub const BUFFER_IN_USE_FOLD_THRESHOLD: i32 = 64;
+const BUFFER_IN_USE_FOLD_THRESHOLD: i32 = 64;
 
 #[derive(Clone, Copy)]
 #[repr(C, align(8))]
@@ -181,7 +181,7 @@ impl BufferFlags {
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C, align(64))]
-pub struct BufferHeaderCacheline0 {
+struct BufferHeaderCacheline0 {
     pub current_data: i16,
     pub current_length: u16,
     pub flags: BufferFlags,
@@ -216,7 +216,7 @@ impl Default for BufferHeaderCacheline0 {
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C, align(64))]
-pub struct BufferHeaderCacheline1 {
+struct BufferHeaderCacheline1 {
     pub trace_handle: u32,
     pub total_length_not_including_first: u32,
     pub opaque2: SecondaryOpaque,
@@ -373,13 +373,13 @@ const _: () = assert!(mem::align_of::<Buffer>() == BUFFER_CACHE_LINE_SIZE);
 const _: () = assert!(mem::size_of::<Buffer>() == BUFFER_CACHE_LINE_SIZE * 2);
 
 #[inline]
-pub const fn buffer_data_offset() -> usize {
+const fn buffer_data_offset() -> usize {
     mem::size_of::<Buffer>() + DEFAULT_PRE_DATA_SIZE
 }
 
 impl Buffer {
     #[inline]
-    fn reset(&mut self, data_size: usize, bytes: &[u8]) -> PacketGraphResult<()> {
+    fn reset(&mut self, data_size: usize, bytes: &[u8]) -> DataPlaneResult<()> {
         if bytes.len() > data_size {
             return Err(BufferInvariant::BytesExceedCapacity {
                 length: bytes.len(),
@@ -387,8 +387,8 @@ impl Buffer {
             }
             .into());
         }
-        let current_len = u16::try_from(bytes.len())
-            .map_err(|_| BufferInvariant::CurrentLengthOutOfRange)?;
+        let current_len =
+            u16::try_from(bytes.len()).map_err(|_| BufferInvariant::CurrentLengthOutOfRange)?;
         self.cacheline0 = BufferHeaderCacheline0::default();
         self.cacheline0.current_data = 0;
         self.cacheline0.current_length = current_len;
@@ -409,7 +409,7 @@ impl Buffer {
     }
 
     #[inline]
-    fn reset_empty(&mut self, data_size: usize, headroom: usize) -> PacketGraphResult<()> {
+    fn reset_empty(&mut self, data_size: usize, headroom: usize) -> DataPlaneResult<()> {
         if headroom > data_size {
             return Err(BufferInvariant::HeadroomExceedsCapacity.into());
         }
@@ -427,7 +427,7 @@ impl Buffer {
     /// already zeroed from the previous free. Returns the headroom/length pair
     /// the alloc fast path needs.
     #[inline]
-    fn reset_empty_fast(&mut self, data_size: usize, headroom: usize) -> PacketGraphResult<()> {
+    fn reset_empty_fast(&mut self, data_size: usize, headroom: usize) -> DataPlaneResult<()> {
         if headroom > data_size {
             return Err(BufferInvariant::HeadroomExceedsCapacity.into());
         }
@@ -603,7 +603,7 @@ impl Buffer {
     }
 
     #[inline]
-    pub fn commit_writable_tail(&mut self, len: usize) -> PacketGraphResult<()> {
+    pub fn commit_writable_tail(&mut self, len: usize) -> DataPlaneResult<()> {
         if len > self.available_tail_with_data_size(self.data_capacity()) {
             return Err(BufferInvariant::CommitExceedsWritableTail.into());
         }
@@ -612,7 +612,7 @@ impl Buffer {
     }
 
     #[inline]
-    pub fn truncate(&mut self, len: usize) -> PacketGraphResult<()> {
+    pub fn truncate(&mut self, len: usize) -> DataPlaneResult<()> {
         if len > self.current_len() {
             return Err(BufferInvariant::TruncateExtendsCurrentLength.into());
         }
@@ -620,7 +620,7 @@ impl Buffer {
     }
 
     #[inline]
-    pub fn advance(&mut self, displacement: isize) -> PacketGraphResult<()> {
+    pub fn advance(&mut self, displacement: isize) -> DataPlaneResult<()> {
         if displacement == 0 {
             return Ok(());
         }
@@ -658,13 +658,13 @@ impl Buffer {
     }
 
     #[inline]
-    pub fn prepend(&mut self, bytes: &[u8]) -> PacketGraphResult<()> {
+    pub fn prepend(&mut self, bytes: &[u8]) -> DataPlaneResult<()> {
         self.prepend_mut(bytes.len())?.copy_from_slice(bytes);
         Ok(())
     }
 
     #[inline]
-    pub fn prepend_mut(&mut self, len: usize) -> PacketGraphResult<&mut [u8]> {
+    pub fn prepend_mut(&mut self, len: usize) -> DataPlaneResult<&mut [u8]> {
         if len > self.available_headroom() {
             return Err(BufferInvariant::PrependExceedsHeadroom.into());
         }
@@ -709,21 +709,21 @@ impl Buffer {
     }
 
     #[inline]
-    fn set_current_data_offset(&mut self, offset: isize) -> PacketGraphResult<()> {
+    fn set_current_data_offset(&mut self, offset: isize) -> DataPlaneResult<()> {
         let lower_bound =
             -isize::try_from(DEFAULT_PRE_DATA_SIZE).expect("default pre-data size fits isize");
         if offset < lower_bound {
             return Err(BufferInvariant::CurrentDataExceedsPreData.into());
         }
-        self.cacheline0.current_data = i16::try_from(offset)
-            .map_err(|_| BufferInvariant::CurrentDataOutOfRange)?;
+        self.cacheline0.current_data =
+            i16::try_from(offset).map_err(|_| BufferInvariant::CurrentDataOutOfRange)?;
         Ok(())
     }
 
     #[inline]
-    fn set_current_len(&mut self, len: usize) -> PacketGraphResult<()> {
-        self.cacheline0.current_length = u16::try_from(len)
-            .map_err(|_| BufferInvariant::CurrentLengthOutOfRange)?;
+    fn set_current_len(&mut self, len: usize) -> DataPlaneResult<()> {
+        self.cacheline0.current_length =
+            u16::try_from(len).map_err(|_| BufferInvariant::CurrentLengthOutOfRange)?;
         Ok(())
     }
 
@@ -748,10 +748,10 @@ impl Buffer {
     }
 
     #[inline]
-    fn set_total_len_not_including_first(&mut self, len: usize) -> PacketGraphResult<()> {
+    fn set_total_len_not_including_first(&mut self, len: usize) -> DataPlaneResult<()> {
         self.cacheline0.flags.remove(BufferFlags::SLOT_CLEAN);
-        self.cacheline1.total_length_not_including_first = u32::try_from(len)
-            .map_err(|_| BufferInvariant::ChainTailLengthOutOfRange)?;
+        self.cacheline1.total_length_not_including_first =
+            u32::try_from(len).map_err(|_| BufferInvariant::ChainTailLengthOutOfRange)?;
         Ok(())
     }
 
@@ -893,7 +893,7 @@ impl DerefMut for BufferRefMut<'_> {
 }
 
 #[derive(Debug, Clone)]
-pub struct BufferThreadCache {
+struct BufferThreadCache {
     cached_slots: [u32; BUFFER_THREAD_CACHE_HIGH_WATER],
     len: usize,
 }
@@ -908,7 +908,7 @@ impl BufferThreadCache {
     }
 
     #[inline]
-    pub fn cached_free_len(&self) -> usize {
+    fn cached_free_len(&self) -> usize {
         self.len
     }
 
@@ -938,7 +938,7 @@ impl BufferThreadCache {
 }
 
 #[derive(Debug)]
-pub struct BufferPool {
+struct BufferPool {
     arena: BufferPoolArena,
     thread_cache: Rc<RefCell<BufferThreadCache>>,
 }
@@ -991,21 +991,10 @@ pub struct Frame<State> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum BufferFrameBatchWidth {
+pub enum FrameBatchWidth {
     Pair,
     Quad,
     Octo,
-}
-
-pub trait BufferFrameBatchWidthPolicy: Copy {
-    fn buffer_frame_batch_width(self) -> BufferFrameBatchWidth;
-}
-
-impl BufferFrameBatchWidthPolicy for BufferFrameBatchWidth {
-    #[inline]
-    fn buffer_frame_batch_width(self) -> BufferFrameBatchWidth {
-        self
-    }
 }
 
 #[derive(Clone)]
@@ -1079,7 +1068,7 @@ impl Frame<Next> {
     }
 
     #[inline]
-    pub fn into_pending(mut self) -> PacketGraphResult<Frame<Pending>> {
+    pub fn into_pending(mut self) -> DataPlaneResult<Frame<Pending>> {
         let frame = self
             .state
             .frame
@@ -1210,7 +1199,7 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    pub fn try_buffers(&self) -> PacketGraphResult<&BufferPool> {
+    fn try_buffers(&self) -> DataPlaneResult<&BufferPool> {
         self.buffer_pools
             .get(self.active_numa_node)
             .ok_or(DataPlaneError::ActiveNumaBufferPoolMissing.into())
@@ -1249,12 +1238,12 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    pub fn alloc_index(&self) -> PacketGraphResult<Index> {
+    pub fn alloc_index(&self) -> DataPlaneResult<Index> {
         self.try_buffers()?.alloc_index()
     }
 
     #[inline]
-    pub fn alloc_index_with_bytes(&self, bytes: &[u8]) -> PacketGraphResult<Index> {
+    pub fn alloc_index_with_bytes(&self, bytes: &[u8]) -> DataPlaneResult<Index> {
         self.try_buffers()?.alloc_index_with_bytes(bytes)
     }
 
@@ -1292,12 +1281,12 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    pub fn attach_clone(&self, head: Index, tail: Index) -> PacketGraphResult<()> {
+    pub fn attach_clone(&self, head: Index, tail: Index) -> DataPlaneResult<()> {
         self.try_buffers()?.attach_clone(head, tail)
     }
 
     #[inline]
-    pub fn chain_buffer(&self, head: Index, tail: Index) -> PacketGraphResult<()> {
+    pub fn chain_buffer(&self, head: Index, tail: Index) -> DataPlaneResult<()> {
         self.try_buffers()?.chain_buffer(head, tail)
     }
 
@@ -1351,7 +1340,7 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    fn alloc_frame(&self) -> PacketGraphResult<(Index, BufferFrame)> {
+    fn alloc_frame(&self) -> DataPlaneResult<(Index, BufferFrame)> {
         let index = self.frames.alloc_index()?;
         match self.frames.take_index(index) {
             Ok(frame) => Ok((index, frame)),
@@ -1364,7 +1353,7 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    pub fn get_next_frame(&self, next: NodeId) -> PacketGraphResult<Frame<Next>> {
+    pub fn get_next_frame(&self, next: NodeId) -> DataPlaneResult<Frame<Next>> {
         let (index, frame) = self.alloc_frame()?;
         Ok(Frame {
             state: Next {
@@ -1377,42 +1366,42 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    pub fn get_buffer(&self, index: Index) -> PacketGraphResult<BufferRef<'_>> {
+    pub fn get_buffer(&self, index: Index) -> DataPlaneResult<BufferRef<'_>> {
         self.try_buffers()?.get(index)
     }
 
     #[inline]
-    pub fn get_buffer_mut(&self, index: Index) -> PacketGraphResult<BufferRefMut<'_>> {
+    pub fn get_buffer_mut(&self, index: Index) -> DataPlaneResult<BufferRefMut<'_>> {
         self.try_buffers()?.get_mut(index)
     }
 
     #[inline]
-    pub fn chain(&self, index: Index) -> DataPlaneBufferChain<'_> {
-        DataPlaneBufferChain::new(self.try_buffers(), index)
+    pub fn chain(&self, index: Index) -> impl Iterator<Item = DataPlaneResult<BufferRef<'_>>> + '_ {
+        BufferChain::new(self.try_buffers(), index)
     }
 
     #[inline]
-    pub fn node_error_code(&self, index: Index) -> PacketGraphResult<Option<u16>> {
+    pub fn node_error_code(&self, index: Index) -> DataPlaneResult<Option<u16>> {
         self.try_buffers()?.node_error_code(index)
     }
 
     #[inline]
-    pub fn current_config(&self, index: Index) -> PacketGraphResult<NodeId> {
+    pub fn current_config(&self, index: Index) -> DataPlaneResult<NodeId> {
         self.try_buffers()?.current_config(index)
     }
 
     #[inline]
-    pub fn set_current_config(&self, index: Index, next: NodeId) -> PacketGraphResult<()> {
+    pub fn set_current_config(&self, index: Index, next: NodeId) -> DataPlaneResult<()> {
         self.try_buffers()?.set_current_config(index, next)
     }
 
     #[inline]
-    pub fn advance(&self, index: Index, displacement: isize) -> PacketGraphResult<()> {
+    pub fn advance(&self, index: Index, displacement: isize) -> DataPlaneResult<()> {
         self.try_buffers()?.advance(index, displacement)
     }
 
     #[inline]
-    pub fn append(&self, index: Index, bytes: &[u8]) -> PacketGraphResult<()> {
+    pub fn append(&self, index: Index, bytes: &[u8]) -> DataPlaneResult<()> {
         self.try_buffers()?.append(index, bytes)
     }
 
@@ -1434,7 +1423,7 @@ impl DataPlaneBuffers {
 
     #[inline]
     pub fn buffer_arenas(&self) -> impl Iterator<Item = BufferPoolArena> + '_ {
-        self.buffer_pools.iter().map(|(_, pool)| pool.arena())
+        self.buffer_pools.iter().map(|(_, pool)| pool.arena.clone())
     }
 
     #[inline]
@@ -1533,46 +1522,41 @@ impl BufferPoolArena {
 }
 
 impl BufferPool {
+    #[cfg(test)]
     #[inline]
-    pub fn with_capacity(slot_capacity: usize, slots: usize) -> Self {
+    fn with_capacity(slot_capacity: usize, slots: usize) -> Self {
         Self::with_arena(BufferPoolArena::with_capacity(slot_capacity, slots))
     }
 
     #[inline]
-    pub fn with_arena(arena: BufferPoolArena) -> Self {
+    fn with_arena(arena: BufferPoolArena) -> Self {
         Self {
             arena,
             thread_cache: Rc::new(RefCell::new(BufferThreadCache::new())),
         }
     }
 
+    #[cfg(test)]
     #[inline]
-    pub fn arena(&self) -> BufferPoolArena {
-        self.arena.clone()
-    }
-
-    #[inline]
-    pub fn pool_id(&self) -> u64 {
+    fn pool_id(&self) -> u64 {
         self.arena.pool_id()
     }
 
+    #[cfg(test)]
     #[inline]
-    pub fn numa_node(&self) -> u32 {
-        self.arena.numa_node()
-    }
-
-    #[inline]
-    pub fn slot_stride(&self) -> usize {
+    fn slot_stride(&self) -> usize {
         self.arena.inner.read().slot_stride
     }
 
+    #[cfg(test)]
     #[inline]
-    pub fn base_ptr(&self) -> *const u8 {
+    fn base_ptr(&self) -> *const u8 {
         self.arena.inner.read().region.base() as *const u8
     }
 
+    #[cfg(test)]
     #[inline]
-    pub fn buffer_raw_ptr(&self, slot: u32) -> *const Buffer {
+    fn buffer_raw_ptr(&self, slot: u32) -> *const Buffer {
         self.arena
             .inner
             .read()
@@ -1581,8 +1565,9 @@ impl BufferPool {
             .cast_const()
     }
 
+    #[cfg(test)]
     #[inline]
-    pub fn data_raw_ptr(&self, slot: u32) -> *const u8 {
+    fn data_raw_ptr(&self, slot: u32) -> *const u8 {
         self.arena
             .inner
             .read()
@@ -1592,53 +1577,53 @@ impl BufferPool {
     }
 
     #[inline]
-    pub fn cached_free_len(&self) -> usize {
+    fn cached_free_len(&self) -> usize {
         self.thread_cache.borrow().cached_free_len()
     }
 
     #[inline]
-    pub fn in_use(&self) -> usize {
+    fn in_use(&self) -> usize {
         let mut arena = self.arena.inner.write();
         arena.fold_in_use();
         arena.in_use
     }
 
     #[inline]
-    pub fn alloc_index(&self) -> PacketGraphResult<Index> {
+    fn alloc_index(&self) -> DataPlaneResult<Index> {
         let mut cache = self.thread_cache.borrow_mut();
         let mut arena = self.arena.inner.write();
         arena.alloc_empty_chain(&mut cache)
     }
 
     #[inline]
-    pub fn alloc_index_with_bytes(&self, bytes: &[u8]) -> PacketGraphResult<Index> {
+    fn alloc_index_with_bytes(&self, bytes: &[u8]) -> DataPlaneResult<Index> {
         let mut cache = self.thread_cache.borrow_mut();
         let mut arena = self.arena.inner.write();
         arena.alloc_chain(&mut cache, bytes)
     }
 
     #[inline]
-    pub fn attach_clone(&self, head: Index, tail: Index) -> PacketGraphResult<()> {
+    fn attach_clone(&self, head: Index, tail: Index) -> DataPlaneResult<()> {
         self.arena.inner.write().attach_clone(head, tail)
     }
 
     #[inline]
-    pub fn chain_buffer(&self, head: Index, tail: Index) -> PacketGraphResult<()> {
+    fn chain_buffer(&self, head: Index, tail: Index) -> DataPlaneResult<()> {
         self.arena.inner.write().chain_buffer(head, tail)
     }
 
     #[inline]
-    pub fn prefetch_header(&self, index: Index) {
+    fn prefetch_header(&self, index: Index) {
         self.arena.inner.read().prefetch_header(index);
     }
 
     #[inline]
-    pub fn prefetch_read(&self, index: Index) {
+    fn prefetch_read(&self, index: Index) {
         self.arena.inner.read().prefetch_read(index);
     }
 
     #[inline]
-    pub fn prefetch_write(&self, index: Index) {
+    fn prefetch_write(&self, index: Index) {
         self.arena.inner.read().prefetch_write(index);
     }
 
@@ -1653,7 +1638,7 @@ impl BufferPool {
     }
 
     #[inline]
-    pub fn get(&self, index: Index) -> PacketGraphResult<BufferRef<'_>> {
+    fn get(&self, index: Index) -> DataPlaneResult<BufferRef<'_>> {
         let guard = self.arena.inner.read();
         guard.buffer(index)?;
         Ok(BufferRef {
@@ -1665,7 +1650,7 @@ impl BufferPool {
     }
 
     #[inline]
-    pub fn get_mut(&self, index: Index) -> PacketGraphResult<BufferRefMut<'_>> {
+    fn get_mut(&self, index: Index) -> DataPlaneResult<BufferRefMut<'_>> {
         let mut guard = self.arena.inner.write();
         guard.ensure_writable(index)?;
         guard.buffer_mut(index)?;
@@ -1678,63 +1663,12 @@ impl BufferPool {
     }
 
     #[inline]
-    pub fn chain(
-        &self,
-        index: Index,
-    ) -> impl Iterator<Item = PacketGraphResult<BufferRef<'_>>> + '_ {
-        let mut next = Some(index);
-        let mut failed = false;
-        std::iter::from_fn(move || {
-            if failed {
-                return None;
-            }
-            let current = next?;
-            let guard = self.arena.inner.read();
-            next = match guard.next_buffer(current) {
-                Ok(next) => next,
-                Err(err) => {
-                    failed = true;
-                    return Some(Err(err));
-                }
-            };
-            Some(Ok(BufferRef {
-                guard: spinning_top::guard::RwSpinlockReadGuard::map(guard, |pool| {
-                    pool.buffer(current)
-                        .expect("buffer index was validated before mapping")
-                }),
-            }))
-        })
-    }
-
-    #[inline]
-    pub fn current_data(&self, index: Index) -> PacketGraphResult<usize> {
-        Ok(self.arena.inner.read().buffer(index)?.current_data())
-    }
-
-    #[inline]
-    pub fn current_len(&self, index: Index) -> PacketGraphResult<usize> {
-        Ok(self.arena.inner.read().buffer(index)?.current_len())
-    }
-
-    #[inline]
-    pub fn current_ptr(&self, index: Index) -> PacketGraphResult<*const u8> {
-        Ok(self.arena.inner.read().buffer(index)?.current_ptr())
-    }
-
-    #[inline]
-    pub fn current_mut_ptr(&self, index: Index) -> PacketGraphResult<*mut u8> {
-        let mut guard = self.arena.inner.write();
-        guard.ensure_writable(index)?;
-        Ok(guard.buffer_mut(index)?.current_mut_ptr())
-    }
-
-    #[inline]
-    pub fn current_config(&self, index: Index) -> PacketGraphResult<NodeId> {
+    fn current_config(&self, index: Index) -> DataPlaneResult<NodeId> {
         Ok(self.arena.inner.read().buffer(index)?.current_config())
     }
 
     #[inline]
-    pub fn set_current_config(&self, index: Index, next: NodeId) -> PacketGraphResult<()> {
+    fn set_current_config(&self, index: Index, next: NodeId) -> DataPlaneResult<()> {
         let mut guard = self.arena.inner.write();
         guard.ensure_header_exclusive(index)?;
         guard.buffer_mut(index)?.set_current_config(next);
@@ -1742,72 +1676,18 @@ impl BufferPool {
     }
 
     #[inline]
-    pub fn node_error_code(&self, index: Index) -> PacketGraphResult<Option<u16>> {
+    fn node_error_code(&self, index: Index) -> DataPlaneResult<Option<u16>> {
         Ok(self.arena.inner.read().buffer(index)?.node_error_code())
     }
 
     #[inline]
-    pub fn advance(&self, index: Index, displacement: isize) -> PacketGraphResult<()> {
+    fn advance(&self, index: Index, displacement: isize) -> DataPlaneResult<()> {
         let mut pool = self.arena.inner.write();
         pool.advance(index, displacement)
     }
 
     #[inline]
-    pub fn truncate_current(&self, index: Index, len: usize) -> PacketGraphResult<()> {
-        let mut pool = self.arena.inner.write();
-        pool.ensure_writable(index)?;
-
-        let mut walked = 0usize;
-        let mut current = Some(index);
-        let mut cut_buffer: Option<Index> = None;
-        let mut cut_remainder = 0usize;
-        while let Some(current_index) = current {
-            let current_len = pool.buffer(current_index)?.current_len();
-            if walked + current_len >= len {
-                cut_buffer = Some(current_index);
-                cut_remainder = len - walked;
-                break;
-            }
-            walked += current_len;
-            current = pool.next_buffer(current_index)?;
-        }
-
-        let cut_buffer = cut_buffer
-            .ok_or(BufferInvariant::TruncateExtendsCurrentLength)?;
-        if cut_buffer != index {
-            pool.ensure_header_exclusive(cut_buffer)?;
-        }
-
-        let head_current_len = pool.buffer(index)?.current_len();
-        let head_had_next = pool.next_buffer(index)?.is_some();
-
-        pool.buffer_mut(cut_buffer)?
-            .set_current_len(cut_remainder)?;
-
-        if cut_buffer == index {
-            if head_had_next {
-                pool.buffer_mut(index)?.set_next_buffer(None);
-                pool.buffer_mut(index)?
-                    .set_total_len_not_including_first(0)?;
-            }
-        } else {
-            pool.buffer_mut(cut_buffer)?.set_next_buffer(None);
-            let new_total_tail = len - head_current_len;
-            pool.buffer_mut(index)?
-                .set_total_len_not_including_first(new_total_tail)?;
-        }
-        Ok(())
-    }
-
-    #[inline]
-    pub fn prepend(&self, index: Index, bytes: &[u8]) -> PacketGraphResult<()> {
-        let mut pool = self.arena.inner.write();
-        pool.ensure_writable(index)?;
-        pool.buffer_mut(index)?.prepend(bytes)
-    }
-
-    #[inline]
-    pub fn append(&self, index: Index, bytes: &[u8]) -> PacketGraphResult<()> {
+    fn append(&self, index: Index, bytes: &[u8]) -> DataPlaneResult<()> {
         let mut cache = self.thread_cache.borrow_mut();
         self.arena
             .inner
@@ -1850,12 +1730,12 @@ impl FramePool {
     }
 
     #[inline]
-    fn alloc_index(&self) -> PacketGraphResult<Index> {
+    fn alloc_index(&self) -> DataPlaneResult<Index> {
         self.inner.borrow_mut().alloc_index()
     }
 
     #[inline]
-    fn return_index(&self, buffers: &BufferPool, index: Index) -> PacketGraphResult<()> {
+    fn return_index(&self, buffers: &BufferPool, index: Index) -> DataPlaneResult<()> {
         let mut pool = self.inner.borrow_mut();
         let frame = pool.frame_mut(index)?;
         buffers.drop_frame_indices(frame);
@@ -1864,12 +1744,12 @@ impl FramePool {
     }
 
     #[inline]
-    fn take_index(&self, index: Index) -> PacketGraphResult<BufferFrame> {
+    fn take_index(&self, index: Index) -> DataPlaneResult<BufferFrame> {
         self.inner.borrow_mut().take_frame(index)
     }
 
     #[inline]
-    fn return_taken_index(&self, index: Index, frame: BufferFrame) -> PacketGraphResult<()> {
+    fn return_taken_index(&self, index: Index, frame: BufferFrame) -> DataPlaneResult<()> {
         self.inner
             .borrow_mut()
             .return_frame_and_release(index, frame)
@@ -1878,7 +1758,7 @@ impl FramePool {
 
 impl FramePoolInner {
     #[inline]
-    fn alloc_index(&mut self) -> PacketGraphResult<Index> {
+    fn alloc_index(&mut self) -> DataPlaneResult<Index> {
         loop {
             if self.available_len == 0 {
                 return Err(DataPlaneError::FramePoolExhausted.into());
@@ -1911,7 +1791,7 @@ impl FramePoolInner {
     }
 
     #[inline]
-    fn validate_index(&self, index: Index) -> PacketGraphResult<()> {
+    fn validate_index(&self, index: Index) -> DataPlaneResult<()> {
         if index.pool_id != self.pool_id {
             return Err(DataPlaneError::ForeignIndex {
                 expected_pool_id: self.pool_id,
@@ -1923,7 +1803,7 @@ impl FramePoolInner {
     }
 
     #[inline]
-    fn entry_mut(&mut self, index: Index) -> PacketGraphResult<&mut FrameSlot> {
+    fn entry_mut(&mut self, index: Index) -> DataPlaneResult<&mut FrameSlot> {
         self.validate_index(index)?;
         let pool_id = self.pool_id;
         let entry = self.slots.get_mut(index.slot as usize).ok_or(
@@ -1951,7 +1831,7 @@ impl FramePoolInner {
     }
 
     #[inline]
-    fn frame_mut(&mut self, index: Index) -> PacketGraphResult<&mut BufferFrame> {
+    fn frame_mut(&mut self, index: Index) -> DataPlaneResult<&mut BufferFrame> {
         self.entry_mut(index)?
             .frame
             .as_mut()
@@ -1959,7 +1839,7 @@ impl FramePoolInner {
     }
 
     #[inline]
-    fn take_frame(&mut self, index: Index) -> PacketGraphResult<BufferFrame> {
+    fn take_frame(&mut self, index: Index) -> DataPlaneResult<BufferFrame> {
         self.entry_mut(index)?
             .frame
             .take()
@@ -1967,7 +1847,7 @@ impl FramePoolInner {
     }
 
     #[inline]
-    fn release_index(&mut self, index: Index) -> PacketGraphResult<()> {
+    fn release_index(&mut self, index: Index) -> DataPlaneResult<()> {
         let entry = self.entry_mut(index)?;
         if entry.frame.is_none() {
             return Err(DataPlaneError::FrameSlotCheckedOut.into());
@@ -1987,7 +1867,7 @@ impl FramePoolInner {
         &mut self,
         index: Index,
         frame: BufferFrame,
-    ) -> PacketGraphResult<()> {
+    ) -> DataPlaneResult<()> {
         let entry = self.entry_mut(index)?;
         if entry.frame.is_some() {
             return Err(DataPlaneError::FrameSlotAlreadyHasFrame.into());
@@ -2034,7 +1914,7 @@ impl DerefMut for Frame<Pending> {
 
 impl BufferPoolInner {
     #[inline]
-    fn slot_index(&self, slot: u32) -> PacketGraphResult<usize> {
+    fn slot_index(&self, slot: u32) -> DataPlaneResult<usize> {
         let slot_usize = usize::try_from(slot).expect("buffer slot index fits usize");
         if slot_usize >= self.total_slots {
             return Err(DataPlaneError::IndexSlotOutOfBounds {
@@ -2047,20 +1927,20 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn slot_offset(&self, slot: u32) -> PacketGraphResult<usize> {
+    fn slot_offset(&self, slot: u32) -> DataPlaneResult<usize> {
         let slot = self.slot_index(slot)?;
         slot.checked_mul(self.slot_stride)
             .ok_or(BufferInvariant::SlotOffsetOverflow.into())
     }
 
     #[inline]
-    fn slot_state(&self, slot: u32) -> PacketGraphResult<&BufferSlot> {
+    fn slot_state(&self, slot: u32) -> DataPlaneResult<&BufferSlot> {
         let slot = self.slot_index(slot)?;
         Ok(&self.slot_states[slot])
     }
 
     #[inline]
-    fn slot_state_mut(&mut self, slot: u32) -> PacketGraphResult<&mut BufferSlot> {
+    fn slot_state_mut(&mut self, slot: u32) -> DataPlaneResult<&mut BufferSlot> {
         let slot = self.slot_index(slot)?;
         Ok(&mut self.slot_states[slot])
     }
@@ -2078,15 +1958,16 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn buffer_raw_ptr(&self, slot: u32) -> PacketGraphResult<*mut Buffer> {
+    fn buffer_raw_ptr(&self, slot: u32) -> DataPlaneResult<*mut Buffer> {
         let offset = self.slot_offset(slot)?;
         // SAFETY: `offset` is validated to land within the arena region and
         // each slot begins with an inline `Buffer` header.
         Ok(unsafe { self.region.base().add(offset).cast::<Buffer>() })
     }
 
+    #[cfg(test)]
     #[inline]
-    fn data_raw_ptr(&self, slot: u32) -> PacketGraphResult<*mut u8> {
+    fn data_raw_ptr(&self, slot: u32) -> DataPlaneResult<*mut u8> {
         let offset = self
             .slot_offset(slot)?
             .checked_add(buffer_data_offset())
@@ -2097,7 +1978,7 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn buffer_at_slot(&self, slot: u32) -> PacketGraphResult<&Buffer> {
+    fn buffer_at_slot(&self, slot: u32) -> DataPlaneResult<&Buffer> {
         let ptr = self.buffer_raw_ptr(slot)?;
         // SAFETY: the slot layout guarantees that `ptr` addresses a live inline
         // `Buffer` header for the lifetime of `&self`.
@@ -2105,7 +1986,7 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn buffer_at_slot_mut(&mut self, slot: u32) -> PacketGraphResult<&mut Buffer> {
+    fn buffer_at_slot_mut(&mut self, slot: u32) -> DataPlaneResult<&mut Buffer> {
         let ptr = self.buffer_raw_ptr(slot)?;
         // SAFETY: the mutable borrow of `self` guarantees unique access to the
         // slot's inline `Buffer` header.
@@ -2128,7 +2009,7 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn next_buffer(&self, index: Index) -> PacketGraphResult<Option<Index>> {
+    fn next_buffer(&self, index: Index) -> DataPlaneResult<Option<Index>> {
         Ok(self
             .buffer(index)?
             .next_buffer_slot()
@@ -2136,7 +2017,7 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn advance(&mut self, index: Index, displacement: isize) -> PacketGraphResult<()> {
+    fn advance(&mut self, index: Index, displacement: isize) -> DataPlaneResult<()> {
         if displacement == 0 {
             return Ok(());
         }
@@ -2240,7 +2121,7 @@ impl BufferPoolInner {
         &mut self,
         cache: &mut BufferThreadCache,
         bytes: &[u8],
-    ) -> PacketGraphResult<Index> {
+    ) -> DataPlaneResult<Index> {
         if self.slot_capacity == 0 {
             return Err(BufferInvariant::SlotCapacityZero.into());
         }
@@ -2271,7 +2152,7 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn alloc_empty_chain(&mut self, cache: &mut BufferThreadCache) -> PacketGraphResult<Index> {
+    fn alloc_empty_chain(&mut self, cache: &mut BufferThreadCache) -> DataPlaneResult<Index> {
         if self.slot_capacity == 0 {
             return Err(BufferInvariant::SlotCapacityZero.into());
         }
@@ -2283,7 +2164,7 @@ impl BufferPoolInner {
         &mut self,
         cache: &mut BufferThreadCache,
         bytes: &[u8],
-    ) -> PacketGraphResult<Index> {
+    ) -> DataPlaneResult<Index> {
         if bytes.len() > self.slot_capacity {
             return Err(BufferInvariant::BytesExceedCapacity {
                 length: bytes.len(),
@@ -2298,16 +2179,14 @@ impl BufferPoolInner {
     fn alloc_slot_with(
         &mut self,
         cache: &mut BufferThreadCache,
-        reset: impl FnOnce(&mut Buffer, usize) -> PacketGraphResult<()>,
-    ) -> PacketGraphResult<Index> {
+        reset: impl FnOnce(&mut Buffer, usize) -> DataPlaneResult<()>,
+    ) -> DataPlaneResult<Index> {
         let (slot, generation) = loop {
             let slot = match cache.pop() {
                 Some(slot) => slot,
                 None => {
                     self.refill_cache_batch(cache);
-                    cache
-                        .pop()
-                        .ok_or(BufferInvariant::PoolExhausted)?
+                    cache.pop().ok_or(BufferInvariant::PoolExhausted)?
                 }
             };
             let entry = self.slot_state_mut(slot)?;
@@ -2349,15 +2228,13 @@ impl BufferPoolInner {
         &mut self,
         cache: &mut BufferThreadCache,
         headroom: usize,
-    ) -> PacketGraphResult<Index> {
+    ) -> DataPlaneResult<Index> {
         let (slot, generation) = loop {
             let slot = match cache.pop() {
                 Some(slot) => slot,
                 None => {
                     self.refill_cache_batch(cache);
-                    cache
-                        .pop()
-                        .ok_or(BufferInvariant::PoolExhausted)?
+                    cache.pop().ok_or(BufferInvariant::PoolExhausted)?
                 }
             };
             let entry = self.slot_state_mut(slot)?;
@@ -2401,7 +2278,7 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn validate_pool_index(&self, index: Index) -> PacketGraphResult<()> {
+    fn validate_pool_index(&self, index: Index) -> DataPlaneResult<()> {
         if index.pool_id != self.pool_id {
             return Err(DataPlaneError::ForeignIndex {
                 expected_pool_id: self.pool_id,
@@ -2413,7 +2290,7 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn validate_allocated_index(&self, index: Index) -> PacketGraphResult<()> {
+    fn validate_allocated_index(&self, index: Index) -> DataPlaneResult<()> {
         self.validate_pool_index(index)?;
         let entry = self.slot_state(index.slot)?;
         if entry.generation != index.generation {
@@ -2435,19 +2312,19 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn buffer(&self, index: Index) -> PacketGraphResult<&Buffer> {
+    fn buffer(&self, index: Index) -> DataPlaneResult<&Buffer> {
         self.validate_allocated_index(index)?;
         self.buffer_at_slot(index.slot)
     }
 
     #[inline]
-    fn buffer_mut(&mut self, index: Index) -> PacketGraphResult<&mut Buffer> {
+    fn buffer_mut(&mut self, index: Index) -> DataPlaneResult<&mut Buffer> {
         self.validate_allocated_index(index)?;
         self.buffer_at_slot_mut(index.slot)
     }
 
     #[inline]
-    fn ensure_header_exclusive(&self, index: Index) -> PacketGraphResult<()> {
+    fn ensure_header_exclusive(&self, index: Index) -> DataPlaneResult<()> {
         let buffer = self.buffer(index)?;
         if buffer.ref_count() == 1 {
             return Ok(());
@@ -2456,7 +2333,7 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn ensure_writable(&self, index: Index) -> PacketGraphResult<()> {
+    fn ensure_writable(&self, index: Index) -> DataPlaneResult<()> {
         self.ensure_header_exclusive(index)
     }
 
@@ -2688,7 +2565,7 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn attach_clone(&mut self, head: Index, tail: Index) -> PacketGraphResult<()> {
+    fn attach_clone(&mut self, head: Index, tail: Index) -> DataPlaneResult<()> {
         if head == tail {
             return Err(BufferInvariant::CloneRequiresDistinctBuffers.into());
         }
@@ -2728,7 +2605,7 @@ impl BufferPoolInner {
         cache: &mut BufferThreadCache,
         index: Index,
         bytes: &[u8],
-    ) -> PacketGraphResult<()> {
+    ) -> DataPlaneResult<()> {
         self.ensure_writable(index)?;
         let mut tail = index;
         while let Some(next) = self.next_buffer(tail)? {
@@ -2763,7 +2640,7 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn chain_buffer(&mut self, head: Index, tail: Index) -> PacketGraphResult<()> {
+    fn chain_buffer(&mut self, head: Index, tail: Index) -> DataPlaneResult<()> {
         self.ensure_writable(head)?;
         self.buffer(tail)?;
         let tail_len = {
@@ -2823,16 +2700,16 @@ fn prefetch_buffer_data_write(buffer: &Buffer) {
     }
 }
 
-pub struct DataPlaneBufferChain<'pool> {
+struct BufferChain<'pool> {
     pool: Option<&'pool BufferPool>,
     next: Option<Index>,
     failed: bool,
-    error: Option<PacketGraphError>,
+    error: Option<DataPlaneError>,
 }
 
-impl<'pool> DataPlaneBufferChain<'pool> {
+impl<'pool> BufferChain<'pool> {
     #[inline]
-    fn new(pool: PacketGraphResult<&'pool BufferPool>, index: Index) -> Self {
+    fn new(pool: DataPlaneResult<&'pool BufferPool>, index: Index) -> Self {
         match pool {
             Ok(pool) => Self {
                 pool: Some(pool),
@@ -2850,8 +2727,8 @@ impl<'pool> DataPlaneBufferChain<'pool> {
     }
 }
 
-impl<'pool> Iterator for DataPlaneBufferChain<'pool> {
-    type Item = PacketGraphResult<BufferRef<'pool>>;
+impl<'pool> Iterator for BufferChain<'pool> {
+    type Item = DataPlaneResult<BufferRef<'pool>>;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -2886,112 +2763,6 @@ pub struct BufferFrame {
     /// Logical graph Frame maximum. Independent of the growable vector's
     /// reserved capacity.
     limit: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BufferFramePairBatch {
-    Pair([Index; 2]),
-    Single(Index),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BufferFrameQuadBatch {
-    Quad([Index; 4]),
-    Pair([Index; 2]),
-    Single(Index),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BufferFrameBatch {
-    Quad([Index; 4]),
-    Pair([Index; 2]),
-    Single(Index),
-}
-
-impl BufferFramePairBatch {
-    #[inline]
-    pub fn indices(self) -> BufferFrameBatchIndices {
-        match self {
-            Self::Pair(indices) => BufferFrameBatchIndices::new(&indices),
-            Self::Single(index) => BufferFrameBatchIndices::new(&[index]),
-        }
-    }
-}
-
-impl BufferFrameQuadBatch {
-    #[inline]
-    pub fn indices(self) -> BufferFrameBatchIndices {
-        match self {
-            Self::Quad(indices) => BufferFrameBatchIndices::new(&indices),
-            Self::Pair(indices) => BufferFrameBatchIndices::new(&indices),
-            Self::Single(index) => BufferFrameBatchIndices::new(&[index]),
-        }
-    }
-}
-
-impl BufferFrameBatch {
-    #[inline]
-    pub fn indices(self) -> BufferFrameBatchIndices {
-        match self {
-            Self::Quad(indices) => BufferFrameBatchIndices::new(&indices),
-            Self::Pair(indices) => BufferFrameBatchIndices::new(&indices),
-            Self::Single(index) => BufferFrameBatchIndices::new(&[index]),
-        }
-    }
-}
-
-pub struct BufferFrameBatchIndices {
-    indices: [Option<Index>; 4],
-    len: usize,
-    offset: usize,
-}
-
-impl BufferFrameBatchIndices {
-    #[inline]
-    fn new(indices: &[Index]) -> Self {
-        let mut values = [None; 4];
-        for (offset, index) in indices.iter().copied().enumerate() {
-            values[offset] = Some(index);
-        }
-        Self {
-            indices: values,
-            len: indices.len(),
-            offset: 0,
-        }
-    }
-}
-
-impl Iterator for BufferFrameBatchIndices {
-    type Item = Index;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.offset == self.len {
-            return None;
-        }
-        let index = self.indices[self.offset];
-        self.offset += 1;
-        index
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct BufferFramePairBatchCursor<'frame> {
-    indices: &'frame [Index],
-    offset: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct BufferFrameQuadBatchCursor<'frame> {
-    indices: &'frame [Index],
-    offset: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct BufferFrameBatchCursor<'frame> {
-    indices: &'frame [Index],
-    offset: usize,
-    width: BufferFrameBatchWidth,
 }
 
 macro_rules! retain_ladder {
@@ -3119,7 +2890,7 @@ impl BufferFrame {
     }
 
     #[inline]
-    pub fn push_index(&mut self, index: Index) -> PacketGraphResult<()> {
+    pub fn push_index(&mut self, index: Index) -> DataPlaneResult<()> {
         if self.indices.len() == self.limit {
             return Err(DataPlaneError::BufferFrameCapacityExceeded.into());
         }
@@ -3131,7 +2902,7 @@ impl BufferFrame {
     pub fn push_indices(
         &mut self,
         indices: impl IntoIterator<Item = Index>,
-    ) -> PacketGraphResult<()> {
+    ) -> DataPlaneResult<()> {
         let indices = indices.into_iter();
         let (lower, upper) = indices.size_hint();
         if let Some(upper) = upper {
@@ -3199,34 +2970,6 @@ impl BufferFrame {
     }
 
     #[inline]
-    pub fn pair_batch_cursor(&self) -> BufferFramePairBatchCursor<'_> {
-        BufferFramePairBatchCursor {
-            indices: self.pending_indices(),
-            offset: 0,
-        }
-    }
-
-    #[inline]
-    pub fn quad_batch_cursor(&self) -> BufferFrameQuadBatchCursor<'_> {
-        BufferFrameQuadBatchCursor {
-            indices: self.pending_indices(),
-            offset: 0,
-        }
-    }
-
-    #[inline]
-    pub fn batch_cursor(
-        &self,
-        width: impl BufferFrameBatchWidthPolicy,
-    ) -> BufferFrameBatchCursor<'_> {
-        BufferFrameBatchCursor {
-            indices: self.pending_indices(),
-            offset: 0,
-            width: width.buffer_frame_batch_width(),
-        }
-    }
-
-    #[inline]
     pub fn iter_indices(&self) -> slice::Iter<'_, Index> {
         self.indices.iter()
     }
@@ -3248,8 +2991,8 @@ impl BufferFrame {
     #[inline]
     pub fn retain_indices(
         &mut self,
-        mut keep: impl FnMut(Index) -> PacketGraphResult<bool>,
-    ) -> PacketGraphResult<()> {
+        mut keep: impl FnMut(Index) -> DataPlaneResult<bool>,
+    ) -> DataPlaneResult<()> {
         let mut write = 0usize;
         for read in 0..self.indices.len() {
             let index = self.indices[read];
@@ -3267,31 +3010,31 @@ impl BufferFrame {
     #[inline(always)]
     pub fn retain_indices_batched(
         &mut self,
-        width: impl BufferFrameBatchWidthPolicy,
-        mut keep: impl FnMut(Index) -> PacketGraphResult<bool>,
-    ) -> PacketGraphResult<()> {
-        match width.buffer_frame_batch_width() {
-            BufferFrameBatchWidth::Octo => self.retain_indices_octo(&mut keep),
-            BufferFrameBatchWidth::Quad => self.retain_indices_quad(&mut keep),
-            BufferFrameBatchWidth::Pair => self.retain_indices_pair(&mut keep),
+        width: FrameBatchWidth,
+        mut keep: impl FnMut(Index) -> DataPlaneResult<bool>,
+    ) -> DataPlaneResult<()> {
+        match width {
+            FrameBatchWidth::Octo => self.retain_indices_octo(&mut keep),
+            FrameBatchWidth::Quad => self.retain_indices_quad(&mut keep),
+            FrameBatchWidth::Pair => self.retain_indices_pair(&mut keep),
         }
     }
 
     #[inline(always)]
     pub fn retain_indices_batched_with_prefetch(
         &mut self,
-        width: impl BufferFrameBatchWidthPolicy,
+        width: FrameBatchWidth,
         mut prefetch: impl FnMut(Index),
-        mut keep: impl FnMut(Index) -> PacketGraphResult<bool>,
-    ) -> PacketGraphResult<()> {
-        match width.buffer_frame_batch_width() {
-            BufferFrameBatchWidth::Quad => {
+        mut keep: impl FnMut(Index) -> DataPlaneResult<bool>,
+    ) -> DataPlaneResult<()> {
+        match width {
+            FrameBatchWidth::Quad => {
                 self.retain_indices_quad_with_prefetch(&mut prefetch, &mut keep)
             }
-            BufferFrameBatchWidth::Pair => {
+            FrameBatchWidth::Pair => {
                 self.retain_indices_pair_with_prefetch(&mut prefetch, &mut keep)
             }
-            BufferFrameBatchWidth::Octo => {
+            FrameBatchWidth::Octo => {
                 self.retain_indices_quad_with_prefetch(&mut prefetch, &mut keep)
             }
         }
@@ -3300,19 +3043,19 @@ impl BufferFrame {
     #[inline(always)]
     pub fn retain_indices_batched_with_prefetch_state<S>(
         &mut self,
-        width: impl BufferFrameBatchWidthPolicy,
+        width: FrameBatchWidth,
         state: &mut S,
         mut prefetch: impl FnMut(&mut S, Index),
-        mut keep: impl FnMut(&mut S, Index) -> PacketGraphResult<bool>,
-    ) -> PacketGraphResult<()> {
-        match width.buffer_frame_batch_width() {
-            BufferFrameBatchWidth::Quad => {
+        mut keep: impl FnMut(&mut S, Index) -> DataPlaneResult<bool>,
+    ) -> DataPlaneResult<()> {
+        match width {
+            FrameBatchWidth::Quad => {
                 self.retain_indices_quad_with_prefetch_state(state, &mut prefetch, &mut keep)
             }
-            BufferFrameBatchWidth::Pair => {
+            FrameBatchWidth::Pair => {
                 self.retain_indices_pair_with_prefetch_state(state, &mut prefetch, &mut keep)
             }
-            BufferFrameBatchWidth::Octo => {
+            FrameBatchWidth::Octo => {
                 self.retain_indices_quad_with_prefetch_state(state, &mut prefetch, &mut keep)
             }
         }
@@ -3321,19 +3064,19 @@ impl BufferFrame {
     #[inline(always)]
     pub fn buffer_node_inline<S>(
         &mut self,
-        width: impl BufferFrameBatchWidthPolicy,
+        width: FrameBatchWidth,
         state: &mut S,
         mut prefetch: impl FnMut(&mut S, Index),
-        mut keep: impl FnMut(&mut S, Index) -> PacketGraphResult<bool>,
-    ) -> PacketGraphResult<()> {
-        match width.buffer_frame_batch_width() {
-            BufferFrameBatchWidth::Quad => {
+        mut keep: impl FnMut(&mut S, Index) -> DataPlaneResult<bool>,
+    ) -> DataPlaneResult<()> {
+        match width {
+            FrameBatchWidth::Quad => {
                 self.retain_indices_quad_with_prefetch_state_lazy(state, &mut prefetch, &mut keep)
             }
-            BufferFrameBatchWidth::Pair => {
+            FrameBatchWidth::Pair => {
                 self.retain_indices_pair_with_prefetch_state_lazy(state, &mut prefetch, &mut keep)
             }
-            BufferFrameBatchWidth::Octo => {
+            FrameBatchWidth::Octo => {
                 self.retain_indices_quad_with_prefetch_state_lazy(state, &mut prefetch, &mut keep)
             }
         }
@@ -3342,21 +3085,21 @@ impl BufferFrame {
     #[inline(always)]
     pub fn rewrite_indices_batched(
         &mut self,
-        width: impl BufferFrameBatchWidthPolicy,
-        mut rewrite: impl FnMut(Index) -> PacketGraphResult<Option<Index>>,
-    ) -> PacketGraphResult<()> {
-        match width.buffer_frame_batch_width() {
-            BufferFrameBatchWidth::Quad => self.rewrite_indices_quad(&mut rewrite),
-            BufferFrameBatchWidth::Pair => self.rewrite_indices_pair(&mut rewrite),
-            BufferFrameBatchWidth::Octo => self.rewrite_indices_octo(&mut rewrite),
+        width: FrameBatchWidth,
+        mut rewrite: impl FnMut(Index) -> DataPlaneResult<Option<Index>>,
+    ) -> DataPlaneResult<()> {
+        match width {
+            FrameBatchWidth::Quad => self.rewrite_indices_quad(&mut rewrite),
+            FrameBatchWidth::Pair => self.rewrite_indices_pair(&mut rewrite),
+            FrameBatchWidth::Octo => self.rewrite_indices_octo(&mut rewrite),
         }
     }
 
     #[inline(always)]
     fn retain_indices_quad(
         &mut self,
-        keep: &mut impl FnMut(Index) -> PacketGraphResult<bool>,
-    ) -> PacketGraphResult<()> {
+        keep: &mut impl FnMut(Index) -> DataPlaneResult<bool>,
+    ) -> DataPlaneResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
         let mut write = 0usize;
@@ -3403,8 +3146,8 @@ impl BufferFrame {
     fn retain_indices_quad_with_prefetch(
         &mut self,
         prefetch: &mut impl FnMut(Index),
-        keep: &mut impl FnMut(Index) -> PacketGraphResult<bool>,
-    ) -> PacketGraphResult<()> {
+        keep: &mut impl FnMut(Index) -> DataPlaneResult<bool>,
+    ) -> DataPlaneResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
         let mut write = 0usize;
@@ -3418,8 +3161,8 @@ impl BufferFrame {
     #[inline(always)]
     fn retain_indices_pair(
         &mut self,
-        keep: &mut impl FnMut(Index) -> PacketGraphResult<bool>,
-    ) -> PacketGraphResult<()> {
+        keep: &mut impl FnMut(Index) -> DataPlaneResult<bool>,
+    ) -> DataPlaneResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
         let mut write = 0usize;
@@ -3433,8 +3176,8 @@ impl BufferFrame {
     #[inline(always)]
     fn retain_indices_octo(
         &mut self,
-        keep: &mut impl FnMut(Index) -> PacketGraphResult<bool>,
-    ) -> PacketGraphResult<()> {
+        keep: &mut impl FnMut(Index) -> DataPlaneResult<bool>,
+    ) -> DataPlaneResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
         let mut write = 0usize;
@@ -3521,8 +3264,8 @@ impl BufferFrame {
     fn retain_indices_pair_with_prefetch(
         &mut self,
         prefetch: &mut impl FnMut(Index),
-        keep: &mut impl FnMut(Index) -> PacketGraphResult<bool>,
-    ) -> PacketGraphResult<()> {
+        keep: &mut impl FnMut(Index) -> DataPlaneResult<bool>,
+    ) -> DataPlaneResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
         let mut write = 0usize;
@@ -3538,8 +3281,8 @@ impl BufferFrame {
         &mut self,
         state: &mut S,
         prefetch: &mut impl FnMut(&mut S, Index),
-        keep: &mut impl FnMut(&mut S, Index) -> PacketGraphResult<bool>,
-    ) -> PacketGraphResult<()> {
+        keep: &mut impl FnMut(&mut S, Index) -> DataPlaneResult<bool>,
+    ) -> DataPlaneResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
         let mut write = 0usize;
@@ -3555,8 +3298,8 @@ impl BufferFrame {
         &mut self,
         state: &mut S,
         prefetch: &mut impl FnMut(&mut S, Index),
-        keep: &mut impl FnMut(&mut S, Index) -> PacketGraphResult<bool>,
-    ) -> PacketGraphResult<()> {
+        keep: &mut impl FnMut(&mut S, Index) -> DataPlaneResult<bool>,
+    ) -> DataPlaneResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
         let mut write = 0usize;
@@ -3572,8 +3315,8 @@ impl BufferFrame {
         &mut self,
         state: &mut S,
         prefetch: &mut impl FnMut(&mut S, Index),
-        keep: &mut impl FnMut(&mut S, Index) -> PacketGraphResult<bool>,
-    ) -> PacketGraphResult<()> {
+        keep: &mut impl FnMut(&mut S, Index) -> DataPlaneResult<bool>,
+    ) -> DataPlaneResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
         let mut write = None;
@@ -3589,8 +3332,8 @@ impl BufferFrame {
         &mut self,
         state: &mut S,
         prefetch: &mut impl FnMut(&mut S, Index),
-        keep: &mut impl FnMut(&mut S, Index) -> PacketGraphResult<bool>,
-    ) -> PacketGraphResult<()> {
+        keep: &mut impl FnMut(&mut S, Index) -> DataPlaneResult<bool>,
+    ) -> DataPlaneResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
         let mut write = None;
@@ -3604,8 +3347,8 @@ impl BufferFrame {
     #[inline(always)]
     fn rewrite_indices_quad(
         &mut self,
-        rewrite: &mut impl FnMut(Index) -> PacketGraphResult<Option<Index>>,
-    ) -> PacketGraphResult<()> {
+        rewrite: &mut impl FnMut(Index) -> DataPlaneResult<Option<Index>>,
+    ) -> DataPlaneResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
         let mut write = 0usize;
@@ -3619,8 +3362,8 @@ impl BufferFrame {
     #[inline(always)]
     fn rewrite_indices_octo(
         &mut self,
-        rewrite: &mut impl FnMut(Index) -> PacketGraphResult<Option<Index>>,
-    ) -> PacketGraphResult<()> {
+        rewrite: &mut impl FnMut(Index) -> DataPlaneResult<Option<Index>>,
+    ) -> DataPlaneResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
         let mut write = 0usize;
@@ -3634,8 +3377,8 @@ impl BufferFrame {
     #[inline(always)]
     fn rewrite_indices_pair(
         &mut self,
-        rewrite: &mut impl FnMut(Index) -> PacketGraphResult<Option<Index>>,
-    ) -> PacketGraphResult<()> {
+        rewrite: &mut impl FnMut(Index) -> DataPlaneResult<Option<Index>>,
+    ) -> DataPlaneResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
         let mut write = 0usize;
@@ -3651,8 +3394,8 @@ impl BufferFrame {
         &mut self,
         read: usize,
         write: &mut usize,
-        keep: &mut impl FnMut(Index) -> PacketGraphResult<bool>,
-    ) -> PacketGraphResult<()> {
+        keep: &mut impl FnMut(Index) -> DataPlaneResult<bool>,
+    ) -> DataPlaneResult<()> {
         let index = self.indices[read];
         if keep(index)? {
             self.indices[*write] = index;
@@ -3667,8 +3410,8 @@ impl BufferFrame {
         read: usize,
         write: &mut usize,
         state: &mut S,
-        keep: &mut impl FnMut(&mut S, Index) -> PacketGraphResult<bool>,
-    ) -> PacketGraphResult<()> {
+        keep: &mut impl FnMut(&mut S, Index) -> DataPlaneResult<bool>,
+    ) -> DataPlaneResult<()> {
         let index = self.indices[read];
         if keep(state, index)? {
             self.indices[*write] = index;
@@ -3683,8 +3426,8 @@ impl BufferFrame {
         read: usize,
         write: &mut Option<usize>,
         state: &mut S,
-        keep: &mut impl FnMut(&mut S, Index) -> PacketGraphResult<bool>,
-    ) -> PacketGraphResult<()> {
+        keep: &mut impl FnMut(&mut S, Index) -> DataPlaneResult<bool>,
+    ) -> DataPlaneResult<()> {
         let index = self.indices[read];
         if keep(state, index)? {
             if let Some(write) = write {
@@ -3702,8 +3445,8 @@ impl BufferFrame {
         &mut self,
         read: usize,
         write: &mut usize,
-        rewrite: &mut impl FnMut(Index) -> PacketGraphResult<Option<Index>>,
-    ) -> PacketGraphResult<()> {
+        rewrite: &mut impl FnMut(Index) -> DataPlaneResult<Option<Index>>,
+    ) -> DataPlaneResult<()> {
         let index = self.indices[read];
         if let Some(index) = rewrite(index)? {
             self.indices[*write] = index;
@@ -3747,132 +3490,49 @@ impl BufferFrame {
     }
 }
 
-impl BufferFramePairBatchCursor<'_> {
-    #[inline]
-    pub fn prefetch_next_pair_with(&self, mut prefetch: impl FnMut(Index)) {
-        for index in self.indices[self.offset..].iter().take(2).copied() {
-            prefetch(index);
-        }
-    }
-}
-
-impl Iterator for BufferFramePairBatchCursor<'_> {
-    type Item = BufferFramePairBatch;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        let remaining = self.indices.len().saturating_sub(self.offset);
-        if remaining >= 2 {
-            let batch = BufferFramePairBatch::Pair([
-                self.indices[self.offset],
-                self.indices[self.offset + 1],
-            ]);
-            self.offset += 2;
-            Some(batch)
-        } else if remaining == 1 {
-            let batch = BufferFramePairBatch::Single(self.indices[self.offset]);
-            self.offset += 1;
-            Some(batch)
-        } else {
-            None
-        }
-    }
-}
-
-impl BufferFrameQuadBatchCursor<'_> {
-    #[inline]
-    pub fn prefetch_next_quad_with(&self, mut prefetch: impl FnMut(Index)) {
-        for index in self.indices[self.offset..].iter().take(4).copied() {
-            prefetch(index);
-        }
-    }
-}
-
-impl Iterator for BufferFrameQuadBatchCursor<'_> {
-    type Item = BufferFrameQuadBatch;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        let remaining = self.indices.len().saturating_sub(self.offset);
-        if remaining >= 4 {
-            let batch = BufferFrameQuadBatch::Quad([
-                self.indices[self.offset],
-                self.indices[self.offset + 1],
-                self.indices[self.offset + 2],
-                self.indices[self.offset + 3],
-            ]);
-            self.offset += 4;
-            Some(batch)
-        } else if remaining >= 2 {
-            let batch = BufferFrameQuadBatch::Pair([
-                self.indices[self.offset],
-                self.indices[self.offset + 1],
-            ]);
-            self.offset += 2;
-            Some(batch)
-        } else if remaining == 1 {
-            let batch = BufferFrameQuadBatch::Single(self.indices[self.offset]);
-            self.offset += 1;
-            Some(batch)
-        } else {
-            None
-        }
-    }
-}
-
-impl BufferFrameBatchCursor<'_> {
-    #[inline]
-    pub fn prefetch_next_with(&self, mut prefetch: impl FnMut(Index)) {
-        let width = match self.width {
-            BufferFrameBatchWidth::Octo => 8,
-            BufferFrameBatchWidth::Quad => 4,
-            BufferFrameBatchWidth::Pair => 2,
-        };
-        for index in self.indices[self.offset..].iter().take(width).copied() {
-            prefetch(index);
-        }
-    }
-}
-
-impl Iterator for BufferFrameBatchCursor<'_> {
-    type Item = BufferFrameBatch;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        let remaining = self.indices.len().saturating_sub(self.offset);
-        match self.width {
-            BufferFrameBatchWidth::Octo | BufferFrameBatchWidth::Quad if remaining >= 4 => {
-                let batch = BufferFrameBatch::Quad([
-                    self.indices[self.offset],
-                    self.indices[self.offset + 1],
-                    self.indices[self.offset + 2],
-                    self.indices[self.offset + 3],
-                ]);
-                self.offset += 4;
-                Some(batch)
-            }
-            _ if remaining >= 2 => {
-                let batch = BufferFrameBatch::Pair([
-                    self.indices[self.offset],
-                    self.indices[self.offset + 1],
-                ]);
-                self.offset += 2;
-                Some(batch)
-            }
-            _ if remaining == 1 => {
-                let batch = BufferFrameBatch::Single(self.indices[self.offset]);
-                self.offset += 1;
-                Some(batch)
-            }
-            _ => None,
-        }
-    }
-}
-
 #[cfg(test)]
 mod index_identity_tests {
     use super::*;
-    use crate::error::PacketGraphError;
+
+    #[test]
+    fn private_buffer_layout_and_cache_policy_are_consistent() {
+        assert_eq!(
+            mem::size_of::<BufferHeaderCacheline0>(),
+            BUFFER_CACHE_LINE_SIZE
+        );
+        assert_eq!(
+            mem::align_of::<BufferHeaderCacheline0>(),
+            BUFFER_CACHE_LINE_SIZE
+        );
+        assert_eq!(
+            mem::size_of::<BufferHeaderCacheline1>(),
+            BUFFER_CACHE_LINE_SIZE
+        );
+        assert_eq!(
+            mem::align_of::<BufferHeaderCacheline1>(),
+            BUFFER_CACHE_LINE_SIZE
+        );
+        assert_eq!(
+            buffer_data_offset(),
+            mem::size_of::<Buffer>() + DEFAULT_PRE_DATA_SIZE
+        );
+        assert_eq!(BUFFER_INVALID_INDEX, u32::MAX);
+        assert!(BUFFER_THREAD_CACHE_BATCH <= BUFFER_THREAD_CACHE_HIGH_WATER);
+        assert!(BUFFER_IN_USE_FOLD_THRESHOLD > 0);
+    }
+
+    #[test]
+    fn buffer_arena_storage_stays_outside_main_heap() {
+        let pool = BufferPool::with_capacity(2048, 16);
+        let index = pool.alloc_index().expect("allocate buffer from arena");
+        let arena_base = pool.base_ptr();
+        let buffer_header = pool.buffer_raw_ptr(index.slot()).cast::<u8>();
+        let buffer_payload = pool.data_raw_ptr(index.slot());
+        let arena_size = pool.slot_stride() * 17;
+
+        assert!((buffer_header as usize).wrapping_sub(arena_base as usize) < arena_size);
+        assert!((buffer_payload as usize).wrapping_sub(arena_base as usize) < arena_size);
+    }
 
     #[test]
     fn advance_generation_retires_at_max() {
@@ -3890,7 +3550,7 @@ mod index_identity_tests {
             generation: 1,
         };
         match pool.get(foreign).map(|_| ()).unwrap_err() {
-            PacketGraphError::DataPlane(DataPlaneError::IndexSlotOutOfBounds { pool_id, slot }) => {
+            DataPlaneError::IndexSlotOutOfBounds { pool_id, slot } => {
                 assert_eq!(pool_id, pool.pool_id());
                 assert_eq!(slot, 99);
             }

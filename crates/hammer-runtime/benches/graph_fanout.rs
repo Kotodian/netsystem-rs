@@ -6,15 +6,17 @@
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use hammer_core::data_plane::{
-    BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Frame, Index, Next, NodeId,
-    NodeKind, NodeRegistration,
+    BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Frame, Index, Next, NodeId, NodeKind,
+    NodeRegistration,
 };
 use hammer_infra::mask_compare::{
     mask_compare_u16_arch, mask_compare_u16_scalar, mask_compare_u16_words,
 };
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::node::{NodeDescriptor, NodeResult, NodeRuntimeData};
-use hammer_runtime::{DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig};
+use hammer_runtime::{
+    DataPlaneBufferConfig, DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig,
+};
 
 fn test_runtime(frame_slots: usize, buffer_slots: usize) -> DataPlaneRuntime {
     DataPlaneRuntime::new(DataPlaneRuntimeConfig {

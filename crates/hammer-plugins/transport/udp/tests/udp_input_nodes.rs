@@ -1,8 +1,7 @@
 use std::mem::transmute;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use hammer_core::data_plane::{
-    BufferFrame, BufferNodeError, BufferPacketCursor, };
+use hammer_core::data_plane::{BufferFrame, BufferNodeError, BufferPacketCursor};
 use hammer_infra::checksum::internet_checksum_parts;
 use hammer_plugin_udp::{UdpInputControlPlane, UdpInputError, UdpInputNext, UdpInputTrace};
 use hammer_runtime::RuntimeRegistry;
@@ -32,9 +31,15 @@ fn test_runtime_configured(
 
 #[test]
 fn udp_graph_contribution_initializes_with_existing_drop_node() {
-    _ = hammer_plugin_udp::plugin_module();
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let mut engine = Engine::new(runtime, RuntimeRegistry::new());
+    engine
+        .plugin_main_mut()
+        .register_builtin_image(hammer_service::registration_image());
+    let plugin = hammer_plugin_udp::plugin_module();
+    engine
+        .plugin_main_mut()
+        .register_builtin_image(plugin.registration_image().get());
 
     // The statically linked UDP image has no IP dependency image in this test,
     // so the full service graph may stop at an unresolved IP next. All image

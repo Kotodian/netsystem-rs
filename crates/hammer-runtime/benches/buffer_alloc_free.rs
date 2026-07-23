@@ -1,8 +1,8 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use hammer_core::data_plane::{
-    BufferPool, DEFAULT_BUFFER_FRAME_CAPACITY, Index, NodeId,
+    BufferPoolArena, DEFAULT_BUFFER_FRAME_CAPACITY, DataPlaneBuffers, Index, NodeId,
 };
-use hammer_runtime::{DataPlaneHandoff, DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId};
+use hammer_runtime::{DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig};
 
 fn test_runtime(
     buffer_slot_capacity: usize,
@@ -20,27 +20,28 @@ fn test_runtime(
     DataPlaneRuntime::new(config)
 }
 
-fn cleanup_runtime_for_pool(pool: &BufferPool, queue_capacity: usize) -> DataPlaneRuntime {
-    let handoff = DataPlaneHandoff::new_shared_buffer_arena(1, queue_capacity.max(1), pool.arena());
-    DataPlaneRuntime::attach_handoff_worker(
-        test_runtime(1, 1, 1),
-        DataWorkerId::new(0),
-        handoff.worker(DataWorkerId::new(0)),
+fn test_buffers(buffer_slot_capacity: usize, buffer_slots: usize) -> DataPlaneBuffers {
+    DataPlaneBuffers::from_arenas(
+        [BufferPoolArena::with_capacity(
+            buffer_slot_capacity,
+            buffer_slots,
+        )],
+        1,
+        0,
+        0,
     )
 }
 
-fn drop_owned_index(runtime: &DataPlaneRuntime, index: Index) {
-    let mut frame = runtime
-        .buffers()
+fn drop_owned_index(buffers: &DataPlaneBuffers, index: Index) {
+    let mut frame = buffers
         .get_next_frame(NodeId::new(0))
         .expect("cleanup frame");
     frame.push_index(index).expect("cleanup push index");
 }
 
-fn drop_owned_indices(runtime: &DataPlaneRuntime, indices: Vec<Index>) {
+fn drop_owned_indices(buffers: &DataPlaneBuffers, indices: Vec<Index>) {
     for chunk in indices.chunks(DEFAULT_BUFFER_FRAME_CAPACITY) {
-        let mut frame = runtime
-            .buffers()
+        let mut frame = buffers
             .get_next_frame(NodeId::new(0))
             .expect("cleanup frame");
         frame
@@ -55,14 +56,10 @@ fn bench_alloc_free_single(c: &mut Criterion) {
     let mut group = c.benchmark_group("alloc_free_single");
     group.bench_function("empty", |b| {
         b.iter_batched(
-            || {
-                let pool = BufferPool::with_capacity(2048, 4096);
-                let cleanup = cleanup_runtime_for_pool(&pool, 1);
-                (pool, cleanup)
-            },
-            |(pool, cleanup)| {
-                let index = pool.alloc_index().expect("alloc");
-                drop_owned_index(&cleanup, index);
+            || test_buffers(2048, 4096),
+            |buffers| {
+                let index = buffers.alloc_index().expect("alloc");
+                drop_owned_index(&buffers, index);
             },
             criterion::BatchSize::SmallInput,
         );
@@ -70,14 +67,10 @@ fn bench_alloc_free_single(c: &mut Criterion) {
     group.bench_function("with_bytes_1500", |b| {
         let payload = [0u8; 1500];
         b.iter_batched(
-            || {
-                let pool = BufferPool::with_capacity(2048, 4096);
-                let cleanup = cleanup_runtime_for_pool(&pool, 1);
-                (pool, cleanup)
-            },
-            |(pool, cleanup)| {
-                let index = pool.alloc_index_with_bytes(&payload).expect("alloc");
-                drop_owned_index(&cleanup, index);
+            || test_buffers(2048, 4096),
+            |buffers| {
+                let index = buffers.alloc_index_with_bytes(&payload).expect("alloc");
+                drop_owned_index(&buffers, index);
             },
             criterion::BatchSize::SmallInput,
         );
@@ -93,17 +86,13 @@ fn bench_alloc_free_batch256(c: &mut Criterion) {
     for &batch in &[64usize, 256, 1024] {
         group.bench_with_input(BenchmarkId::new("empty", batch), &batch, |b, &batch| {
             b.iter_batched(
-                || {
-                    let pool = BufferPool::with_capacity(2048, batch.max(4096));
-                    let cleanup = cleanup_runtime_for_pool(&pool, batch);
-                    (pool, cleanup)
-                },
-                |(pool, cleanup)| {
+                || test_buffers(2048, batch.max(4096)),
+                |buffers| {
                     let mut indices = Vec::with_capacity(batch);
                     for _ in 0..batch {
-                        indices.push(pool.alloc_index().expect("alloc"));
+                        indices.push(buffers.alloc_index().expect("alloc"));
                     }
-                    drop_owned_indices(&cleanup, indices);
+                    drop_owned_indices(&buffers, indices);
                 },
                 criterion::BatchSize::SmallInput,
             );
@@ -114,17 +103,13 @@ fn bench_alloc_free_batch256(c: &mut Criterion) {
             |b, &batch| {
                 let payload = [0u8; 1500];
                 b.iter_batched(
-                    || {
-                        let pool = BufferPool::with_capacity(2048, batch.max(4096));
-                        let cleanup = cleanup_runtime_for_pool(&pool, batch);
-                        (pool, cleanup)
-                    },
-                    |(pool, cleanup)| {
+                    || test_buffers(2048, batch.max(4096)),
+                    |buffers| {
                         let mut indices = Vec::with_capacity(batch);
                         for _ in 0..batch {
-                            indices.push(pool.alloc_index_with_bytes(&payload).expect("alloc"));
+                            indices.push(buffers.alloc_index_with_bytes(&payload).expect("alloc"));
                         }
-                        drop_owned_indices(&cleanup, indices);
+                        drop_owned_indices(&buffers, indices);
                     },
                     criterion::BatchSize::SmallInput,
                 );
@@ -141,14 +126,12 @@ fn bench_chain_alloc_free(c: &mut Criterion) {
     let mut group = c.benchmark_group("chain_alloc_free");
     group.bench_function("9000B", |b| {
         b.iter_batched(
-            || {
-                let pool = BufferPool::with_capacity(2048, 4096);
-                let cleanup = cleanup_runtime_for_pool(&pool, 1);
-                (pool, cleanup)
-            },
-            |(pool, cleanup)| {
-                let index = pool.alloc_index_with_bytes(&payload).expect("chain alloc");
-                drop_owned_index(&cleanup, index);
+            || test_buffers(2048, 4096),
+            |buffers| {
+                let index = buffers
+                    .alloc_index_with_bytes(&payload)
+                    .expect("chain alloc");
+                drop_owned_index(&buffers, index);
             },
             criterion::BatchSize::SmallInput,
         );
@@ -165,7 +148,7 @@ fn bench_runtime_alloc_free(c: &mut Criterion) {
             || test_runtime(2048, 4096, 256),
             |runtime| {
                 let index = runtime.alloc_index().expect("alloc");
-                drop_owned_index(&runtime, index);
+                drop_owned_index(runtime.buffers(), index);
             },
             criterion::BatchSize::SmallInput,
         );
@@ -178,7 +161,7 @@ fn bench_runtime_alloc_free(c: &mut Criterion) {
                 for _ in 0..256 {
                     indices.push(runtime.alloc_index().expect("alloc"));
                 }
-                drop_owned_indices(&runtime, indices);
+                drop_owned_indices(runtime.buffers(), indices);
             },
             criterion::BatchSize::SmallInput,
         );

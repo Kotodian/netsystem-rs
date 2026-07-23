@@ -160,7 +160,7 @@ pub fn run_init_functions(engine: &mut Engine) -> RuntimeResult<()> {
 }
 
 pub fn run_worker_init_functions(engine: &mut Engine) -> RuntimeResult<()> {
-    let functions = engine.plugin_main().worker_init_functions();
+    let functions = engine.worker_init_functions();
     let mut called = std::mem::take(&mut engine.called_worker_init_functions);
     let result = dispatch_init(functions, &mut called, engine);
     engine.called_worker_init_functions = called;

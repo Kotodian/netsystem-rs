@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use hammer_runtime::attach::AttachServer;
+use hammer_runtime::attach::AppServer;
 use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
 
 pub mod app;
@@ -39,7 +39,7 @@ fn configure_session(config: config::NetworkSessionConfig) -> RuntimeResult<Opti
 #[hammer_component_macros::init_function(name = "session_attach_server")]
 fn configure_attach_server(
     #[inject(optional)] session: Arc<Session>,
-) -> RuntimeResult<Option<Arc<AttachServer>>> {
+) -> RuntimeResult<Option<Arc<AppServer>>> {
     if session.backend == SessionBackend::Local {
         return Ok(None);
     }
@@ -48,7 +48,6 @@ fn configure_attach_server(
             "network.session.attach_socket_path is required for the SVM backend",
         )
     })?;
-    let server = Arc::new(AttachServer::bind(path)?);
-    tracing::info!(path, "session attach server bound");
+    let server = Arc::new(AppServer::bind(path)?);
     Ok(Some(server))
 }

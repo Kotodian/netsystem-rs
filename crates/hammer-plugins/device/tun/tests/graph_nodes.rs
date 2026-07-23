@@ -13,9 +13,15 @@ fn tun_input_matches_device_input_next_layout() {
 
 #[test]
 fn tun_graph_nodes_install_from_the_link_image() {
-    _ = hammer_plugin_tun::plugin_module();
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let mut engine = Engine::new(runtime, RuntimeRegistry::new());
+    engine
+        .plugin_main_mut()
+        .register_builtin_image(hammer_service::registration_image());
+    let plugin = hammer_plugin_tun::plugin_module();
+    engine
+        .plugin_main_mut()
+        .register_builtin_image(plugin.registration_image().get());
 
     // The service image references protocol-plugin nodes that are not linked
     // into this focused test. Node creation precedes named-next resolution.

@@ -1,23 +1,20 @@
 use std::mem::{align_of, size_of};
 
 use hammer_core::data_plane::{
-    BUFFER_CACHE_LINE_SIZE, BUFFER_IN_USE_FOLD_THRESHOLD, BUFFER_INVALID_INDEX,
-    BUFFER_THREAD_CACHE_BATCH, BUFFER_THREAD_CACHE_HIGH_WATER, Buffer, BufferFlags, BufferFrame,
-    BufferFrameBatch, BufferFrameBatchCursor, BufferFrameBatchIndices, BufferFrameBatchWidth,
-    BufferFrameBatchWidthPolicy, BufferFramePairBatch, BufferFramePairBatchCursor,
-    BufferFrameQuadBatch, BufferFrameQuadBatchCursor, BufferHeaderCacheline0,
-    BufferHeaderCacheline1, BufferNodeError, BufferPacketCursor, BufferPool, BufferPoolArena,
-    BufferRef, BufferRefMut, BufferThreadCache, DEFAULT_BUFFER_FRAME_CAPACITY,
-    DEFAULT_BUFFER_FRAME_POOL_SIZE, DEFAULT_PACKET_HEADROOM, DEFAULT_PRE_DATA_SIZE,
-    DataPlaneBufferChain, DataPlaneBuffers, Frame, Index, Next, NodeId,
-    PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES, Pending, PrimaryOpaque, SecondaryOpaque,
-    buffer_data_offset,
+    BUFFER_CACHE_LINE_SIZE, Buffer, BufferFlags, BufferFrame, BufferNodeError, BufferPacketCursor,
+    BufferPoolArena, BufferRef, BufferRefMut, DEFAULT_BUFFER_FRAME_CAPACITY,
+    DEFAULT_BUFFER_FRAME_POOL_SIZE, DEFAULT_PACKET_HEADROOM, DataPlaneBuffers, Frame,
+    FrameBatchWidth, Index, Next, NodeId, PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES, Pending,
+    PrimaryOpaque, SecondaryOpaque,
 };
-use hammer_core::error::{BufferInvariant, DataPlaneError, PacketGraphError};
+use hammer_core::error::{BufferInvariant, DataPlaneError, DataPlaneResult};
 
 fn test_buffers(buffer_slot_capacity: usize, buffer_slots: usize) -> DataPlaneBuffers {
     DataPlaneBuffers::from_arenas(
-        [BufferPoolArena::with_capacity(buffer_slot_capacity, buffer_slots)],
+        [BufferPoolArena::with_capacity(
+            buffer_slot_capacity,
+            buffer_slots,
+        )],
         2,
         0,
         0,
@@ -34,14 +31,13 @@ fn chain_bytes(buffers: &DataPlaneBuffers, index: Index) -> Vec<u8> {
 
 #[test]
 fn buffer_invariant_failure_is_structured() {
-    let buffers = BufferPool::with_capacity(4, 1);
+    let buffers = test_buffers(4, 1);
     let index = buffers.alloc_index().expect("buffer");
+    let failure: DataPlaneResult<()> = buffers.attach_clone(index, index);
 
     assert!(matches!(
-        buffers.attach_clone(index, index).unwrap_err(),
-        PacketGraphError::DataPlane(DataPlaneError::BufferInvariant(
-            BufferInvariant::CloneRequiresDistinctBuffers
-        ))
+        failure.unwrap_err(),
+        DataPlaneError::BufferInvariant(BufferInvariant::CloneRequiresDistinctBuffers)
     ));
 }
 
@@ -52,59 +48,32 @@ fn core_exports_buffer_and_frame_value_primitives() {
     assert!(size_of::<BufferPacketCursor>() <= 32);
     assert!(DEFAULT_BUFFER_FRAME_CAPACITY > 0);
     assert!(DEFAULT_BUFFER_FRAME_POOL_SIZE > 0);
-    assert!(DEFAULT_PACKET_HEADROOM >= DEFAULT_PRE_DATA_SIZE);
-    assert_eq!(BUFFER_INVALID_INDEX, u32::MAX);
-    assert!(BUFFER_THREAD_CACHE_BATCH <= BUFFER_THREAD_CACHE_HIGH_WATER);
-    assert!(BUFFER_IN_USE_FOLD_THRESHOLD > 0);
+    assert!(DEFAULT_PACKET_HEADROOM > 0);
     assert_eq!(PRIMARY_OPAQUE_BYTES, size_of::<PrimaryOpaque>());
     assert_eq!(PRIMARY_OPAQUE_ALIGN, align_of::<PrimaryOpaque>());
     assert!(size_of::<SecondaryOpaque>() >= PRIMARY_OPAQUE_BYTES);
-    assert_eq!(align_of::<BufferHeaderCacheline0>(), BUFFER_CACHE_LINE_SIZE);
-    assert_eq!(align_of::<BufferHeaderCacheline1>(), BUFFER_CACHE_LINE_SIZE);
-    assert_eq!(
-        buffer_data_offset(),
-        size_of::<Buffer>() + DEFAULT_PRE_DATA_SIZE
-    );
-    assert_eq!(
-        BufferFrameBatchWidth::Pair.buffer_frame_batch_width(),
-        BufferFrameBatchWidth::Pair
-    );
+    let _ = size_of::<FrameBatchWidth>();
 
     type CoreFrameNext = Frame<Next>;
     type CoreFramePending = Frame<Pending>;
-    type CoreBufferFramePairBatchCursor<'a> = BufferFramePairBatchCursor<'a>;
-    type CoreBufferFrameQuadBatchCursor<'a> = BufferFrameQuadBatchCursor<'a>;
-    type CoreBufferFrameBatchCursor<'a> = BufferFrameBatchCursor<'a>;
     type CoreBufferRef<'a> = BufferRef<'a>;
     type CoreBufferRefMut<'a> = BufferRefMut<'a>;
     let _ = size_of::<BufferFlags>();
     let _ = size_of::<BufferFrame>();
-    let _ = size_of::<BufferFrameBatch>();
-    let _ = size_of::<BufferFrameBatchIndices>();
-    let _ = size_of::<BufferFramePairBatch>();
-    let _ = size_of::<BufferFrameQuadBatch>();
-    let _ = size_of::<BufferPool>();
     let _ = size_of::<BufferPoolArena>();
-    let _ = size_of::<BufferThreadCache>();
-    let _ = size_of::<DataPlaneBufferChain>();
     let _ = size_of::<CoreFrameNext>();
     let _ = size_of::<CoreFramePending>();
-    let _ = size_of::<CoreBufferFramePairBatchCursor<'static>>();
-    let _ = size_of::<CoreBufferFrameQuadBatchCursor<'static>>();
-    let _ = size_of::<CoreBufferFrameBatchCursor<'static>>();
     let _ = size_of::<CoreBufferRef<'static>>();
     let _ = size_of::<CoreBufferRefMut<'static>>();
 
-    let buffers = test_buffers(128, 1);
+    let arena = BufferPoolArena::with_capacity(128, 1);
+    let buffers = DataPlaneBuffers::from_arenas([arena.clone()], 2, 0, 0);
     let first = buffers
         .alloc_index_with_bytes(b"first")
         .expect("first buffer");
     let mut frame = buffers.get_next_frame(NodeId::new(7)).expect("next frame");
 
-    assert_eq!(
-        first.pool_id(),
-        buffers.try_buffers().expect("pool").pool_id()
-    );
+    assert_eq!(first.pool_id(), arena.pool_id());
     assert_eq!(first.slot(), 1);
     assert_eq!(first.generation(), 1);
     assert_eq!(frame.next(), NodeId::new(7));
@@ -299,4 +268,68 @@ fn core_frame_retain_preserves_stable_order() {
     drop(frame);
     drop(cleanup);
     assert_eq!(buffers.in_use_buffers(), 0);
+}
+
+#[test]
+fn frame_batch_widths_retain_and_rewrite_equivalently() {
+    let buffers = test_buffers(64, 9);
+    let indices: Vec<_> = (0..9)
+        .map(|value| {
+            buffers
+                .alloc_index_with_bytes(&[value])
+                .expect("allocate index")
+        })
+        .collect();
+
+    for width in [
+        FrameBatchWidth::Pair,
+        FrameBatchWidth::Quad,
+        FrameBatchWidth::Octo,
+    ] {
+        let mut retained = BufferFrame::with_capacity(9);
+        retained
+            .push_indices(indices.iter().copied())
+            .expect("seed retained frame");
+        retained
+            .retain_indices_batched(width, |index| {
+                Ok(index != indices[1] && index != indices[4] && index != indices[7])
+            })
+            .expect("retain selected indices");
+        assert_eq!(
+            retained.indices(),
+            &[
+                indices[0], indices[2], indices[3], indices[5], indices[6], indices[8]
+            ]
+        );
+
+        let mut rewritten = BufferFrame::with_capacity(9);
+        rewritten
+            .push_indices(indices.iter().copied())
+            .expect("seed rewritten frame");
+        rewritten
+            .rewrite_indices_batched(width, |index| {
+                if index == indices[2] {
+                    Ok(None)
+                } else if index == indices[5] {
+                    Ok(Some(indices[8]))
+                } else {
+                    Ok(Some(index))
+                }
+            })
+            .expect("rewrite selected indices");
+        assert_eq!(
+            rewritten.indices(),
+            &[
+                indices[0], indices[1], indices[3], indices[4], indices[8], indices[6], indices[7],
+                indices[8]
+            ]
+        );
+    }
+
+    let mut cleanup = buffers
+        .get_next_frame(NodeId::new(9))
+        .expect("cleanup frame");
+    cleanup
+        .push_indices(indices)
+        .expect("own allocated indexes");
 }

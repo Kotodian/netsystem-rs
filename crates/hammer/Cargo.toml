@@ -8,6 +8,10 @@ publish = false
 name = "hammer"
 path = "src/main.rs"
 
+[[example]]
+name = "tun_tcp_echo"
+path = "../../examples/tun/tcp_echo.rs"
+
 [dependencies]
 hammer-runtime = { path = "../hammer-runtime" }
 hammer-infra = { path = "../hammer-infra" }
@@ -26,6 +30,7 @@ linkme = { workspace = true }
 libloading = { workspace = true }
 
 [dev-dependencies]
+hammer-app = { path = "../hammer-app" }
 hammer-plugin-ip = { path = "../hammer-plugins/ip" }
 hammer-plugin-tcp = { path = "../hammer-plugins/transport/tcp" }
 hammer-plugin-udp = { path = "../hammer-plugins/transport/udp" }

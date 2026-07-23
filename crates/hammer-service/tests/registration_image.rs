@@ -14,6 +14,9 @@ fn service_builtin_image_installs_through_runtime_authority() {
         },
     });
     let mut engine = Engine::new(runtime, RuntimeRegistry::new());
+    engine
+        .plugin_main_mut()
+        .register_builtin_image(hammer_service::registration_image());
 
     // The service graph references protocol-plugin nodes, so resolving all
     // named next arcs requires those plugins. Registration and node creation

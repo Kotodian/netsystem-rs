@@ -11,13 +11,16 @@ use crate::app::{
 /// Server side of the Unix-domain-socket attach protocol.
 /// The dataplane binds a listener, accepts app connections, and sends
 /// shared-memory segment fds + offset layout to the app process.
-pub struct AttachServer {
+pub struct AppServer {
     listener: std::os::unix::net::UnixListener,
 }
 
-/// Result of a successful attach: the dataplane-side session object and
-/// the metadata needed by the app process to reconstruct the session.
-pub struct AttachedApp<S: SessionSegment> {
+/// Server-owned resources for one application session.
+///
+/// The session itself remains [`AppSession`]; the segment type only selects
+/// its storage backend. The layout and descriptor fields are protocol
+/// metadata needed by the application process.
+pub struct AppSessionResources<S: SessionSegment> {
     pub session: AppSession<S>,
     pub offsets: SessionOffsets,
     pub shm_fd: RawFd,
@@ -132,7 +135,7 @@ fn send_attach_message(
     }
 }
 
-impl AttachServer {
+impl AppServer {
     /// Bind to a Unix domain socket at `path`.
     pub fn bind(path: &str) -> RuntimeResult<Self> {
         let _ = std::fs::remove_file(path);
@@ -145,14 +148,14 @@ impl AttachServer {
     }
 
     /// Accept a single app process connection and set up a shared-memory
-    /// session. Returns an [`AttachedApp`] with the dataplane-side session
+    /// session. Returns the [`AppSessionResources`] held by the dataplane and
     /// and the metadata the app process needs to reconstruct its side.
     pub fn accept(
         &self,
         config: AppSessionConfig,
         seg: &Svm,
         handle: SessionHandle,
-    ) -> RuntimeResult<AttachedApp<Svm>> {
+    ) -> RuntimeResult<AppSessionResources<Svm>> {
         let offsets =
             SessionOffsets::allocate(seg, config.fifo_capacity as u32, config.evt_q_capacity);
 
@@ -203,7 +206,7 @@ impl AttachServer {
             &offsets,
         )?;
 
-        Ok(AttachedApp {
+        Ok(AppSessionResources {
             session,
             offsets,
             shm_fd,

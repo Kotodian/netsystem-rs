@@ -179,15 +179,14 @@ mod tests {
     use std::sync::Mutex;
 
     use hammer_core::data_plane::{
-        DEFAULT_BUFFER_FRAME_CAPACITY, Index, NodeId, NodeKind, NodeNext,
-        NodeRegistration,
+        DEFAULT_BUFFER_FRAME_CAPACITY, Index, NodeId, NodeKind, NodeNext, NodeRegistration,
     };
     use hammer_runtime::RuntimeResult;
 
     use super::*;
     use crate::{
-        DataPlaneBufferConfig, DataPlaneRuntimeConfig, NodeDescriptor, NodeProcessFn,
-        NodeResult, NodeRuntimeData,
+        DataPlaneBufferConfig, DataPlaneRuntimeConfig, NodeDescriptor, NodeProcessFn, NodeResult,
+        NodeRuntimeData,
     };
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());

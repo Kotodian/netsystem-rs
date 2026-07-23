@@ -106,7 +106,7 @@ fn plugin_command_error(error: RuntimeError) -> PluginCommandError {
         RuntimeError::ConfigParse { .. } | RuntimeError::ConfigValidation { .. } => {
             PluginCommandError::Configuration
         }
-        RuntimeError::PacketGraph(_) => PluginCommandError::GraphMaterialization,
+        RuntimeError::DataPlane(_) => PluginCommandError::GraphMaterialization,
         RuntimeError::Attach(_)
         | RuntimeError::MainHeap(_)
         | RuntimeError::Lifecycle { .. }

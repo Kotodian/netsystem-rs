@@ -12,15 +12,14 @@ use abi_stable::{
     sabi_trait,
     std_types::{ROption, RSlice, RSliceMut, RStr},
 };
-use libloading::Library;
 use object::{Object, ObjectSection};
-use serde::Deserialize;
 use semver::Version;
+use serde::Deserialize;
 
 use crate::error::RuntimeError;
 use crate::init::{ConfigFunction, InitFunction};
 use crate::node::{NodeEntry, NodeFunctionRegistration};
-use crate::plugin_loader::read_plugin_module;
+use crate::plugin_loader::{PluginLibrary, read_plugin_module};
 use crate::process::ProcessEntry;
 use crate::registration::RegistrationImage;
 
@@ -93,7 +92,10 @@ impl PluginMetadata {
 
     #[inline]
     pub fn load_after(&self) -> impl Iterator<Item = &str> {
-        self.load_after.as_slice().iter().map(|dependency| dependency.as_str())
+        self.load_after
+            .as_slice()
+            .iter()
+            .map(|dependency| dependency.as_str())
     }
 }
 
@@ -210,16 +212,17 @@ pub enum PluginError {
 
 /// Main-thread plugin authority, corresponding to VPP's `plugin_main_t`.
 ///
-/// The process-global library table owns every activated DSO handle, matching
-/// VPP's `vlib_plugin_main`. Failed load transactions never enter this table and
-/// unload before returning their error.
+/// The library table indexes every activated DSO, matching VPP's
+/// `vlib_plugin_main`. Opened Rust plugin images and loader handles remain live
+/// until process exit; failed transactions never publish their modules into
+/// this active table.
 pub struct PluginMain {
     modules_by_plugin: HashMap<String, PluginModuleRef>,
     library_index_by_name: HashMap<String, usize>,
     load_order: Vec<String>,
     builtin_registration_images: Vec<&'static RegistrationImage>,
     // Drop last so every DSO-backed root module remains valid while indexes drop.
-    libraries: Vec<Library>,
+    libraries: Vec<PluginLibrary>,
 }
 
 impl Default for PluginMain {
@@ -267,8 +270,9 @@ impl PluginMain {
 
     /// Load configured roots and their transitive `load_after` dependencies.
     ///
-    /// A failed transaction drops its DSO handles. A successful dependency
-    /// closure remains mapped until exit.
+    /// Failed transactions publish no runtime state. Every image opened during
+    /// either a failed or successful transaction remains mapped until process
+    /// exit because active Rust DSO unload has no proven teardown protocol.
     pub fn load(&mut self, host_version: &str, roots: &[String]) -> Result<(), PluginError> {
         let plugin_path = self.directory()?;
         if roots.is_empty() {
@@ -346,7 +350,9 @@ impl PluginMain {
         if active.library_index_by_name.contains_key(name) || resolved.contains(name) {
             return Ok(());
         }
-        let path = plugin_path.join(libloading::library_filename(format!("hammer_plugin_{name}")));
+        let path = plugin_path.join(libloading::library_filename(format!(
+            "hammer_plugin_{name}"
+        )));
         if !visiting.insert(name.to_owned()) {
             return Err(PluginError::Cycle { path });
         }
@@ -367,10 +373,12 @@ impl PluginMain {
                     .is_ok_and(|name| matches!(name, "__hammer_plugin" | ".hammer_plugin"))
             })
             .ok_or_else(|| PluginError::ManifestMissing { path: path.clone() })?;
-        let data = section.data().map_err(|source| PluginError::ManifestObject {
-            path: path.clone(),
-            message: source.to_string(),
-        })?;
+        let data = section
+            .data()
+            .map_err(|source| PluginError::ManifestObject {
+                path: path.clone(),
+                message: source.to_string(),
+            })?;
         let data = std::str::from_utf8(data).map_err(|source| PluginError::ManifestObject {
             path: path.clone(),
             message: source.to_string(),
@@ -403,18 +411,19 @@ impl PluginMain {
         Ok(())
     }
 
-    fn load_one(&mut self, plugin_path: &Path, manifest: &PluginManifest) -> Result<(), PluginError> {
+    fn load_one(
+        &mut self,
+        plugin_path: &Path,
+        manifest: &PluginManifest,
+    ) -> Result<(), PluginError> {
         let path = plugin_path.join(libloading::library_filename(format!(
             "hammer_plugin_{}",
             manifest.name
         )));
-        // SAFETY: PluginMain retains each successfully opened library until
-        // shutdown, so its ABI root and registration image remain valid.
-        let library =
-            unsafe { Library::new(&path) }.map_err(|source| PluginError::LibraryOpen {
-                path: path.clone(),
-                source,
-            })?;
+        let library = PluginLibrary::open(&path).map_err(|source| PluginError::LibraryOpen {
+            path: path.clone(),
+            source,
+        })?;
         let module = read_plugin_module(&library).map_err(|source| PluginError::RootModule {
             path: path.clone(),
             source,
@@ -423,7 +432,9 @@ impl PluginMain {
         if metadata.name() != manifest.name
             || metadata.version() != manifest.version
             || metadata.version_required() != manifest.version_required
-            || metadata.load_after().ne(manifest.load_after.iter().map(String::as_str))
+            || metadata
+                .load_after()
+                .ne(manifest.load_after.iter().map(String::as_str))
         {
             return Err(PluginError::ManifestMetadataMismatch { path });
         }
