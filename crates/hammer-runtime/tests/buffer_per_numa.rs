@@ -1,4 +1,5 @@
 use hammer_core::data_plane::{BufferPoolArena, DataPlaneBuffers, NodeId};
+use hammer_infra::PageSize;
 use hammer_runtime::{
     DataPlaneBufferConfig, DataPlaneHandoff, DataPlaneInstructionSet, DataPlaneRuntime,
     DataPlaneRuntimeConfig, DataWorkerId,
@@ -82,8 +83,10 @@ macro_rules! drop_owned_index {
 
 #[test]
 fn arenas_keep_their_arena_numa_identity() {
-    let a0 = BufferPoolArena::with_capacity_on_numa(1024, 32, 0);
-    let a1 = BufferPoolArena::with_capacity_on_numa(1024, 32, 1);
+    let a0 = BufferPoolArena::with_capacity_on_numa(1024, 32, PageSize::Default, 0)
+        .expect("create NUMA 0 arena");
+    let a1 = BufferPoolArena::with_capacity_on_numa(1024, 32, PageSize::Default, 1)
+        .expect("create NUMA 1 arena");
     let b0 = DataPlaneBuffers::from_arenas([a0.clone()], 1, 0, 0);
     let b1 = DataPlaneBuffers::from_arenas([a1.clone()], 1, 0, 1);
 
@@ -139,7 +142,8 @@ fn config_constructor_resolves_active_numa_to_configured_node() {
 
 #[test]
 fn handoff_arena_constructor_uses_arena_numa_identity() {
-    let arena = BufferPoolArena::with_capacity_on_numa(1024, 16, 3);
+    let arena = BufferPoolArena::with_capacity_on_numa(1024, 16, PageSize::Default, 3)
+        .expect("create NUMA 3 arena");
     let runtime = runtime_with_handoff_arena(arena, 4, DataPlaneInstructionSet::Scalar);
     let buffers = runtime.buffers();
 
@@ -153,7 +157,8 @@ fn handoff_capacities_preserve_handoff_arena_numa_identity() {
     let handoff = DataPlaneHandoff::new_shared_buffer_arena(
         2,
         4,
-        BufferPoolArena::with_capacity_on_numa(1024, 16, 3),
+        BufferPoolArena::with_capacity_on_numa(1024, 16, PageSize::Default, 3)
+            .expect("create NUMA 3 arena"),
     );
     let runtime = DataPlaneRuntime::attach_handoff_worker(
         DataPlaneRuntime::new_with_instruction_set(
@@ -173,7 +178,8 @@ fn handoff_worker_runtime_falls_back_to_configured_nonzero_numa_arena() {
     let handoff = DataPlaneHandoff::new_shared_buffer_arena(
         2,
         4,
-        BufferPoolArena::with_capacity_on_numa(1024, 16, 3),
+        BufferPoolArena::with_capacity_on_numa(1024, 16, PageSize::Default, 3)
+            .expect("create NUMA 3 arena"),
     );
     let runtime = DataPlaneRuntime::attach_handoff_worker(
         DataPlaneRuntime::new_with_instruction_set(

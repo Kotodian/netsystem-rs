@@ -4,10 +4,10 @@ use std::time::Duration;
 use hammer_core::data_plane::{BufferFrame, NodeRegistration};
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::config::Worker;
+use hammer_runtime::spawn::DataRuntime;
 use hammer_runtime::{
     DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
 };
-use hammer_runtime::{new_worker_runtime, spawn::DataRuntime};
 use hammer_service::data_plane::{
     Feature, FeatureArc, FeatureArcControl, FeatureArcSpec, FeatureArcStartHandle,
     FeatureArcStartNode, FeatureArcStartSlot, next_feature_frame,
@@ -50,7 +50,7 @@ fn test_runtime() -> DataPlaneRuntime {
     let mut worker = Worker::default();
     worker.buffer.slots_per_numa = 64;
     worker.buffer.frame_pool_size = 32;
-    new_worker_runtime(&worker).expect("create worker runtime")
+    worker.create_runtime().expect("create worker runtime")
 }
 
 fn push_packet(runtime: &DataPlaneRuntime, frame: &mut BufferFrame, sw_if_index: u32) {

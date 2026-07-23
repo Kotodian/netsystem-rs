@@ -11,6 +11,7 @@ use std::sync::Arc;
 use crate::data_plane::NodeId;
 use crate::error::{BufferInvariant, DataPlaneError, DataPlaneResult};
 use hammer_infra::{
+    PageSize,
     align::align_up,
     physmem::PhysmemMap,
     prefetch::{prefetch_read_l1, prefetch_read_l2, prefetch_write_l1},
@@ -1450,31 +1451,38 @@ impl DataPlaneBuffers {
 impl BufferPoolArena {
     #[inline]
     pub fn with_capacity(slot_capacity: usize, slots: usize) -> Self {
-        Self::with_capacity_on_numa(slot_capacity, slots, 0)
+        Self::with_capacity_on_numa(slot_capacity, slots, PageSize::Default, 0)
+            .expect("create ordinary-page buffer arena")
     }
 
     #[inline]
-    pub fn with_capacity_on_numa(slot_capacity: usize, slots: usize, numa_node: u32) -> Self {
-        assert!(slot_capacity > 0, "buffer slot capacity must be non-zero");
-        assert!(
-            slots > 0,
-            "buffer pool must contain at least one usable slot"
-        );
+    pub fn with_capacity_on_numa(
+        slot_capacity: usize,
+        slots: usize,
+        page_size: PageSize,
+        numa_node: u32,
+    ) -> DataPlaneResult<Self> {
+        if slot_capacity == 0 {
+            return Err(BufferInvariant::SlotCapacityZero.into());
+        }
+        if slots == 0 {
+            return Err(DataPlaneError::BufferArenaSlotsZero);
+        }
 
         let total_slots = slots
             .checked_add(1)
-            .expect("buffer arena slot count overflow");
+            .ok_or(DataPlaneError::BufferArenaSizeOverflow)?;
         let slot_stride = align_up(
             buffer_data_offset()
                 .checked_add(slot_capacity)
-                .expect("buffer slot size overflow"),
+                .ok_or(DataPlaneError::BufferArenaSizeOverflow)?,
             BUFFER_CACHE_LINE_SIZE,
         );
         let region_size = slot_stride
             .checked_mul(total_slots)
-            .expect("buffer arena size overflow");
-        let region = PhysmemMap::create("buffers", region_size, 0, numa_node)
-            .expect("buffer arena physmem map");
+            .ok_or(DataPlaneError::BufferArenaSizeOverflow)?;
+        let region = PhysmemMap::create("buffers", region_size, page_size, numa_node)
+            .map_err(|source| DataPlaneError::BufferArenaMapping { source })?;
         unsafe {
             ptr::write_bytes(region.base(), 0, region.size());
         }
@@ -1493,7 +1501,7 @@ impl BufferPoolArena {
             available_stack.push(slot);
         }
 
-        Self {
+        Ok(Self {
             inner: Arc::new(RwSpinlock::new(BufferPoolInner {
                 pool_id: next_pool_id(),
                 numa_node,
@@ -1507,7 +1515,7 @@ impl BufferPoolArena {
                 in_use: 0,
                 in_use_delta: 0,
             })),
-        }
+        })
     }
 
     #[inline]

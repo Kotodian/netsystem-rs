@@ -29,6 +29,9 @@ bincode = { workspace = true }
 linkme = { workspace = true }
 libloading = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+core_affinity = { workspace = true }
+
 [dev-dependencies]
 hammer-app = { path = "../hammer-app" }
 hammer-plugin-ip = { path = "../hammer-plugins/ip" }

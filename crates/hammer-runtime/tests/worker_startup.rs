@@ -8,7 +8,6 @@ use hammer_runtime::config::Worker;
 use hammer_runtime::start_workers::start_workers;
 use hammer_runtime::{
     DataPlaneRuntime, Engine, EnginePool, NodeDescriptor, NodeResult, NodeRuntimeData,
-    new_worker_runtime,
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
@@ -72,7 +71,7 @@ fn engine_pool() -> EnginePool {
     worker.count = 2;
     worker.buffer.slots_per_numa = 64;
     worker.instruction_set = "scalar".to_owned();
-    let runtime = new_worker_runtime(&worker).expect("configured runtime");
+    let runtime = worker.create_runtime().expect("configured runtime");
     let node = runtime
         .nodes()
         .try_register_descriptor(

@@ -129,3 +129,21 @@ jobs:
         run: >-
           cargo test -p hammer-infra --release --test bihash_read_scaling
           -- --ignored --nocapture
+
+  hugetlb-linux:
+    name: HugeTLB [linux]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout [linux]
+        uses: actions/checkout@v4
+      - name: Install Rust [linux]
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+      - name: Cache Cargo [linux]
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: hugetlb-linux
+      - name: Verify strict Linux HugeTLB behavior
+        run: sudo env "PATH=$PATH" "HOME=$HOME" make verify-hugepages

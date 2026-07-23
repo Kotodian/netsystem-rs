@@ -10,8 +10,14 @@ crate-type = ["dylib", "rlib"]
 
 [dependencies]
 crossbeam-utils = { workspace = true }
+byte-unit = { workspace = true }
 libc = { workspace = true }
 libmimalloc-sys = { workspace = true }
+parse-display = { workspace = true }
 serde = { workspace = true }
+serde_with = { workspace = true }
 spinning_top = { workspace = true }
 talc = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+procfs = { workspace = true }

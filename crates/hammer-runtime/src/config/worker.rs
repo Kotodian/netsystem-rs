@@ -20,6 +20,8 @@
 
 use std::time::Duration;
 
+use hammer_infra::PageSize;
+
 use crate::error::{RuntimeError, RuntimeResult};
 
 // hammer-service/src/service.rs
@@ -146,6 +148,9 @@ pub struct WorkerBuffer {
     pub slots_per_numa: usize,
     /// Initial buffer frame pool size (`hammer_core::data_plane::DEFAULT_BUFFER_FRAME_POOL_SIZE`).
     pub frame_pool_size: usize,
+    /// Packet storage page policy. Omission requests default HugeTLB with
+    /// runtime-owned ordinary-page fallback.
+    pub page_size: Option<PageSize>,
 }
 
 impl Default for WorkerBuffer {
@@ -154,6 +159,7 @@ impl Default for WorkerBuffer {
             slot_bytes: BUFFER_SLOT_BYTES,
             slots_per_numa: BUFFER_SLOTS_PER_NUMA,
             frame_pool_size: BUFFER_FRAME_POOL_SIZE,
+            page_size: None,
         }
     }
 }
@@ -173,6 +179,14 @@ impl WorkerBuffer {
         if self.frame_pool_size == 0 {
             return Err(RuntimeError::config_validation(
                 "worker.buffer.frame_pool_size must be non-zero",
+            ));
+        }
+        if self
+            .page_size
+            .is_some_and(|page_size| !page_size.is_supported_on_current_platform())
+        {
+            return Err(RuntimeError::config_validation(
+                "worker.buffer.page_size is unsupported on this platform",
             ));
         }
         Ok(())
@@ -421,6 +435,7 @@ mod tests {
         assert_eq!(worker.buffer.slot_bytes, BUFFER_SLOT_BYTES);
         assert_eq!(worker.buffer.slots_per_numa, BUFFER_SLOTS_PER_NUMA);
         assert_eq!(worker.buffer.frame_pool_size, BUFFER_FRAME_POOL_SIZE);
+        assert_eq!(worker.buffer.page_size, None);
         assert_eq!(worker.handoff.queue_capacity, HANDOFF_QUEUE_CAPACITY);
         assert_eq!(worker.app_session.fifo_capacity, APP_SESSION_FIFO_CAPACITY);
         assert_eq!(
@@ -434,6 +449,21 @@ mod tests {
         let worker: Worker = toml::from_str("count = 4\n").expect("parse");
         assert_eq!(worker.count, 4);
         assert_eq!(worker.stack_size, WORKER_STACK_SIZE);
+    }
+
+    #[test]
+    fn worker_buffer_distinguishes_omitted_and_explicit_default_page_size() {
+        let omitted: Worker = toml::from_str("").expect("parse omitted page size");
+        let explicit: Worker = toml::from_str(
+            r#"
+[buffer]
+page_size = "default"
+"#,
+        )
+        .expect("parse explicit page size");
+
+        assert_eq!(omitted.buffer.page_size, None);
+        assert_eq!(explicit.buffer.page_size, Some(PageSize::Default));
     }
 
     #[test]

@@ -5,7 +5,12 @@
 
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
+#[cfg(target_os = "linux")]
+use crate::error::RuntimeError;
 use crate::error::RuntimeResult;
+
+#[cfg(target_os = "linux")]
+use std::path::Path;
 
 /// Return the NUMA node index for the current CPU, when available.
 #[cfg(target_os = "linux")]
@@ -27,9 +32,14 @@ pub fn bind_current_thread_memory_to_numa(node: u32) -> RuntimeResult<()> {
     bind_current_thread_memory_to_numa_impl(node)
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn node_for_cpu(cpu: usize) -> RuntimeResult<u32> {
+    node_for_cpu_in(Path::new("/sys/devices/system/cpu"), cpu)
+}
+
 #[cfg(not(target_os = "linux"))]
 #[inline]
-pub fn bind_current_thread_memory_to_numa(_node: u32) -> RuntimeResult<()> {
+pub fn bind_current_thread_memory_to_numa(_: u32) -> RuntimeResult<()> {
     Ok(())
 }
 
@@ -49,8 +59,67 @@ fn current_numa_node_impl() -> Option<u32> {
 }
 
 #[cfg(target_os = "linux")]
-fn bind_current_thread_memory_to_numa_impl(_node: u32) -> RuntimeResult<()> {
+fn bind_current_thread_memory_to_numa_impl(node: u32) -> RuntimeResult<()> {
+    const MAX_NUMA_NODES: usize = 1024;
+
+    let node = node as usize;
+    if node >= MAX_NUMA_NODES {
+        return Err(RuntimeError::lifecycle(
+            "bind worker NUMA memory",
+            format!("NUMA node {node} exceeds the Linux nodemask limit"),
+        ));
+    }
+
+    let mut mask = [0 as libc::c_ulong; MAX_NUMA_NODES / libc::c_ulong::BITS as usize];
+    mask[node / libc::c_ulong::BITS as usize] =
+        (1 as libc::c_ulong) << (node % libc::c_ulong::BITS as usize);
+    // SAFETY: `mask` remains live for the syscall and contains exactly the
+    // requested NUMA node.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_set_mempolicy,
+            libc::MPOL_BIND,
+            mask.as_ptr(),
+            MAX_NUMA_NODES as libc::c_ulong,
+        )
+    } != 0
+    {
+        return Err(RuntimeError::lifecycle(
+            "bind worker NUMA memory",
+            std::io::Error::last_os_error().to_string(),
+        ));
+    }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn node_for_cpu_in(root: &Path, cpu: usize) -> RuntimeResult<u32> {
+    let directory = root.join(format!("cpu{cpu}"));
+    let entries = std::fs::read_dir(&directory).map_err(|error| {
+        RuntimeError::lifecycle(
+            "resolve worker NUMA node",
+            format!("read {}: {error}", directory.display()),
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            RuntimeError::lifecycle(
+                "resolve worker NUMA node",
+                format!("read entry in {}: {error}", directory.display()),
+            )
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(node) = name.strip_prefix("node") else {
+            continue;
+        };
+        if let Ok(node) = node.parse::<u32>() {
+            return Ok(node);
+        }
+    }
+    Ok(0)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -59,12 +128,15 @@ fn current_numa_node_impl() -> Option<u32> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn bind_current_thread_memory_to_numa_impl(_node: u32) -> RuntimeResult<()> {
+fn bind_current_thread_memory_to_numa_impl(_: u32) -> RuntimeResult<()> {
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use std::fs;
+
     use super::*;
 
     #[test]
@@ -73,7 +145,26 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "linux"))]
     fn numa_bind_stub_is_noop_on_unsupported_platforms() {
         bind_current_thread_memory_to_numa(0).expect("bind stub");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn numa_bind_rejects_nodes_outside_the_linux_mask() {
+        bind_current_thread_memory_to_numa(1024).expect_err("reject out-of-range NUMA node");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cpu_topology_resolves_node_directory() {
+        let root = std::env::temp_dir().join(format!("hammer-cpu-topology-{}", std::process::id()));
+        let cpu = root.join("cpu7");
+        fs::create_dir_all(cpu.join("node3")).expect("create CPU topology fixture");
+
+        assert_eq!(node_for_cpu_in(&root, 7).expect("resolve fixture"), 3);
+
+        fs::remove_dir_all(root).expect("remove CPU topology fixture");
     }
 }

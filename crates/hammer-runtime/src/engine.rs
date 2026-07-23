@@ -164,6 +164,15 @@ impl Engine {
         }
     }
 
+    pub fn new_configured(registry: Arc<RuntimeRegistry>, worker: Worker) -> RuntimeResult<Self> {
+        worker.validate()?;
+        let runtime = worker.create_runtime()?;
+        let mut engine = Self::new(runtime, registry);
+        engine.worker_config = worker;
+        engine.memory_initialized = true;
+        Ok(engine)
+    }
+
     pub fn loaded_plugins(&self) -> Vec<String> {
         self.plugin_main.loaded_plugins()
     }
@@ -384,12 +393,16 @@ impl Engine {
 
     pub(crate) fn apply_worker_config(&mut self, worker: Worker) -> RuntimeResult<()> {
         if self.memory_initialized {
-            return Err(RuntimeError::invariant(
-                "worker configuration cannot change after runtime initialization",
-            ));
+            return if self.worker_config == worker {
+                Ok(())
+            } else {
+                Err(RuntimeError::invariant(
+                    "worker configuration cannot change after runtime initialization",
+                ))
+            };
         }
         worker.validate()?;
-        self.runtime = crate::new_worker_runtime(&worker)?;
+        self.runtime = worker.create_runtime()?;
         self.worker_config = worker;
         self.memory_initialized = true;
         Ok(())
@@ -686,6 +699,54 @@ mod tests {
 
     fn test_engine() -> Engine {
         Engine::new(test_runtime(), RuntimeRegistry::new())
+    }
+
+    #[test]
+    fn configured_engine_keeps_arenas_for_the_same_worker_config() {
+        let mut worker = Worker::default();
+        worker.buffer.slot_bytes = 64;
+        worker.buffer.slots_per_numa = 16;
+        worker.buffer.frame_pool_size = 16;
+        worker.buffer.page_size = Some(hammer_infra::PageSize::Default);
+        let mut engine = Engine::new_configured(RuntimeRegistry::new(), worker.clone())
+            .expect("configured engine");
+        let pool_id = engine
+            .runtime
+            .buffers()
+            .buffer_arenas()
+            .next()
+            .expect("buffer arena")
+            .pool_id();
+
+        engine
+            .apply_worker_config(worker)
+            .expect("same worker config");
+
+        assert_eq!(
+            engine
+                .runtime
+                .buffers()
+                .buffer_arenas()
+                .next()
+                .expect("buffer arena")
+                .pool_id(),
+            pool_id
+        );
+    }
+
+    #[test]
+    fn configured_engine_rejects_a_different_worker_config() {
+        let mut worker = Worker::default();
+        worker.buffer.slot_bytes = 64;
+        worker.buffer.slots_per_numa = 16;
+        worker.buffer.frame_pool_size = 16;
+        worker.buffer.page_size = Some(hammer_infra::PageSize::Default);
+        let mut engine = Engine::new_configured(RuntimeRegistry::new(), worker.clone())
+            .expect("configured engine");
+        let mut changed = worker;
+        changed.buffer.frame_pool_size += 1;
+
+        assert!(engine.apply_worker_config(changed).is_err());
     }
 
     #[test]

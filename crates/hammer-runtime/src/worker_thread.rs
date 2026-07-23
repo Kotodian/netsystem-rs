@@ -7,46 +7,48 @@ use crate::config::WorkerCpu;
 #[cfg(target_os = "linux")]
 use crate::numa;
 
-/// Apply platform worker-thread setup before the dataplane loop runs.
-pub fn apply_worker_thread_setup(worker: &Worker, index: usize) {
-    #[cfg(target_os = "linux")]
-    {
-        apply_linux_cpu_affinity(index, &worker.cpu);
-        apply_linux_scheduler(&worker.scheduler);
-        if worker.numa.enabled {
-            if let Some(node) = numa::current_numa_node() {
-                let _ = numa::bind_current_thread_memory_to_numa(node);
+impl Worker {
+    /// Apply this worker's platform thread setup before its dataplane loop runs.
+    pub(crate) fn apply_current_thread_setup(&self, index: usize) -> crate::RuntimeResult<()> {
+        #[cfg(target_os = "linux")]
+        {
+            apply_cpu_affinity(index, &self.cpu);
+            apply_scheduler(&self.scheduler);
+            if self.numa.enabled {
+                if let Some(node) = numa::current_numa_node() {
+                    numa::bind_current_thread_memory_to_numa(node)?;
+                }
             }
+            let _ = index;
         }
-        let _ = index;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        apply_macos_qos(&worker.scheduler);
-        let _ = index;
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = (worker, index);
+        #[cfg(target_os = "macos")]
+        {
+            apply_qos(&self.scheduler);
+            let _ = index;
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (self, index);
+        }
+        Ok(())
     }
 }
 
 #[cfg(target_os = "linux")]
-fn apply_linux_cpu_affinity(index: usize, cpu: &WorkerCpu) {
+fn apply_cpu_affinity(index: usize, cpu: &WorkerCpu) {
     use core_affinity::{CoreId, set_for_current};
 
-    let core = if !cpu.worker_cores.is_empty() {
-        cpu.worker_cores.get(index).copied()
-    } else {
-        auto_worker_core(index, cpu)
-    };
+    let core = worker_core(index, cpu);
     if let Some(id) = core {
         set_for_current(CoreId { id });
     }
 }
 
 #[cfg(target_os = "linux")]
-fn auto_worker_core(index: usize, cpu: &WorkerCpu) -> Option<usize> {
+pub(crate) fn worker_core(index: usize, cpu: &WorkerCpu) -> Option<usize> {
+    if !cpu.worker_cores.is_empty() {
+        return cpu.worker_cores.get(index).copied();
+    }
     let cores = core_affinity::get_core_ids()?;
     let reserved: std::collections::HashSet<usize> =
         cpu.main_core.into_iter().chain(cpu.app_core).collect();
@@ -58,7 +60,7 @@ fn auto_worker_core(index: usize, cpu: &WorkerCpu) -> Option<usize> {
 }
 
 #[cfg(target_os = "linux")]
-fn apply_linux_scheduler(scheduler: &crate::config::WorkerScheduler) {
+fn apply_scheduler(scheduler: &crate::config::WorkerScheduler) {
     use crate::config::SchedulerPolicy;
     use thread_priority::{
         NormalThreadSchedulePolicy, RealtimeThreadSchedulePolicy, ThreadPriority,
@@ -87,7 +89,7 @@ fn apply_linux_scheduler(scheduler: &crate::config::WorkerScheduler) {
 }
 
 #[cfg(target_os = "macos")]
-fn apply_macos_qos(scheduler: &crate::config::WorkerScheduler) {
+fn apply_qos(scheduler: &crate::config::WorkerScheduler) {
     use crate::config::QosClass;
 
     let qos = match scheduler.qos {
@@ -109,7 +111,9 @@ mod tests {
 
     #[test]
     fn worker_thread_setup_accepts_default_worker() {
-        apply_worker_thread_setup(&Worker::default(), 0);
+        Worker::default()
+            .apply_current_thread_setup(0)
+            .expect("apply default worker setup");
     }
 
     #[cfg(target_os = "linux")]
@@ -125,7 +129,9 @@ mod tests {
         let mut worker = Worker::default();
         worker.count = 1;
         worker.cpu.worker_cores = vec![target];
-        apply_worker_thread_setup(&worker, 0);
+        worker
+            .apply_current_thread_setup(0)
+            .expect("apply pinned worker setup");
         assert_eq!(
             get_core_ids()
                 .map(|cores| { cores.into_iter().map(|core| core.id).collect::<Vec<_>>() }),
@@ -140,6 +146,8 @@ mod tests {
 
         let mut worker = Worker::default();
         worker.scheduler.qos = QosClass::UserInteractive;
-        apply_worker_thread_setup(&worker, 0);
+        worker
+            .apply_current_thread_setup(0)
+            .expect("apply worker QoS");
     }
 }

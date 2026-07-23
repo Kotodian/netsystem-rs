@@ -3,9 +3,7 @@ use std::mem::transmute;
 use hammer_core::data_plane::{BufferFrame, NodeId, NodeRegistration};
 use hammer_runtime::RuntimeRegistry;
 use hammer_runtime::config::Worker;
-use hammer_runtime::{
-    DataPlaneRuntime, Engine, InternalNode, Node, NodeResult, new_worker_runtime,
-};
+use hammer_runtime::{DataPlaneRuntime, Engine, InternalNode, Node, NodeResult};
 use hammer_service::data_plane::DropNode;
 use hammer_service::device::DeviceMain;
 use hammer_service::interface::InterfaceOutputControlPlane;
@@ -28,7 +26,7 @@ impl InternalNode for TxSinkNode {
 
 #[test]
 fn worker_output_runtimes_only_install_their_assigned_tx_queues() {
-    let runtime = new_worker_runtime(&Worker::default()).expect("runtime");
+    let runtime = Worker::default().create_runtime().expect("runtime");
     let engine = Engine::new(runtime, RuntimeRegistry::new());
     let _ = engine.runtime.nodes().register_internal(DropNode::new());
     let sink = engine.runtime.nodes().register_internal(TxSinkNode);

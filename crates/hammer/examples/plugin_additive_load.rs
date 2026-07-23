@@ -53,8 +53,6 @@ struct ExampleStartupConfig {
 #[derive(Debug, thiserror::Error)]
 enum ExampleError {
     #[error(transparent)]
-    MainHeap(#[from] hammer_infra::main_heap::MainHeapError),
-    #[error(transparent)]
     Hammer(#[from] RuntimeError),
     #[error("required image does not exist: {path}")]
     ImageMissing { path: PathBuf },
@@ -120,9 +118,12 @@ enum ExampleError {
 }
 
 fn main() -> Result<(), ExampleError> {
-    let memory = parse_early_memory(EXAMPLE_CONFIG)?;
-    let main_heap_capacity = hammer_infra::main_heap::init(memory.main_heap_size)?;
-    let roots = parse_startup_roots(EXAMPLE_CONFIG)?;
+    let early: ExampleEarlyConfig = toml::from_str(EXAMPLE_CONFIG)
+        .map_err(|error| RuntimeError::config_parse(format!("parse example TOML: {error}")))?;
+    let main_heap_capacity = early.memory.ensure_main_heap()?;
+    let roots = toml::from_str::<ExampleStartupConfig>(EXAMPLE_CONFIG)
+        .map_err(|error| RuntimeError::config_parse(format!("parse example TOML: {error}")))?
+        .plugins;
     exercise_post_ready_allocations(&roots)?;
 
     let process_runtime = tokio::runtime::Builder::new_current_thread()
@@ -229,19 +230,6 @@ fn run_example(
     println!("host and plugin images share libhammer_infra allocator authority");
     println!("main graph and live worker update completed");
     Ok(())
-}
-
-fn parse_early_memory(document: &str) -> Result<Memory, ExampleError> {
-    let config: ExampleEarlyConfig = toml::from_str(document)
-        .map_err(|error| RuntimeError::config_parse(format!("parse example TOML: {error}")))?;
-    config.memory.validate()?;
-    Ok(config.memory)
-}
-
-fn parse_startup_roots(document: &str) -> Result<Vec<String>, ExampleError> {
-    let config: ExampleStartupConfig = toml::from_str(document)
-        .map_err(|error| RuntimeError::config_parse(format!("parse example TOML: {error}")))?;
-    Ok(config.plugins)
 }
 
 fn exercise_post_ready_allocations(roots: &[String]) -> Result<(), ExampleError> {

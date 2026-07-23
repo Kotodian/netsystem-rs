@@ -44,7 +44,9 @@ pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
             .spawn(move || {
                 let initialized: Result<_, String> = (|| {
                     let worker_slot = worker.slot();
-                    crate::worker_thread::apply_worker_thread_setup(&worker_config, worker_slot);
+                    worker_config
+                        .apply_current_thread_setup(worker_slot)
+                        .map_err(|error| error.to_string())?;
                     let numa_node = crate::numa::current_numa_node().unwrap_or(0);
                     let mut engine = worker_seed
                         .spawn_on_numa(thread_index, numa_node, handoff)

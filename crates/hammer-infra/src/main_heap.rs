@@ -10,13 +10,21 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::ffi::c_void;
 use std::fmt;
 use std::hint::spin_loop;
+use std::io;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 
+use byte_unit::Byte;
+#[cfg(target_os = "linux")]
+use libmimalloc_sys::mi_manage_os_memory_ex;
 use libmimalloc_sys::{
     mi_arena_id_t, mi_arena_min_size, mi_free, mi_malloc_aligned, mi_option_limit_os_alloc,
     mi_option_set_enabled, mi_realloc_aligned, mi_reserve_os_memory_ex, mi_zalloc_aligned,
 };
+
+use crate::physmem::PhysmemError;
+#[cfg(target_os = "linux")]
+use crate::physmem::map_hugetlb;
 
 mod interpose;
 
@@ -27,9 +35,93 @@ unsafe extern "C" {
 
 pub const DEFAULT_MAIN_HEAP_SIZE: usize = 1 << 30;
 
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    parse_display::Display,
+    parse_display::FromStr,
+    serde_with::DeserializeFromStr,
+    serde_with::SerializeDisplay,
+)]
+pub enum PageSize {
+    #[display("default")]
+    Default,
+    #[display("default-hugepage")]
+    DefaultHuge,
+    #[display("{0}")]
+    Bytes(Byte),
+}
+
+impl PageSize {
+    pub(crate) fn bytes(self) -> io::Result<usize> {
+        match self {
+            Self::Default => {
+                // SAFETY: sysconf reads process-global kernel configuration.
+                let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+                if value <= 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                usize::try_from(value)
+                    .map_err(|_| io::Error::other("OS page size does not fit usize"))
+            }
+            Self::Bytes(bytes) => usize::try_from(bytes.as_u64())
+                .map_err(|_| io::Error::other("configured page size does not fit usize")),
+            Self::DefaultHuge => {
+                #[cfg(target_os = "linux")]
+                {
+                    use procfs::Current;
+
+                    procfs::Meminfo::current()
+                        .map_err(io::Error::other)?
+                        .hugepagesize
+                        .and_then(|value| usize::try_from(value).ok())
+                        .ok_or_else(|| {
+                            io::Error::other("Hugepagesize is absent from /proc/meminfo")
+                        })
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "default HugeTLB pages are Linux-only",
+                    ))
+                }
+            }
+        }
+    }
+
+    pub fn is_supported_on_current_platform(self) -> bool {
+        if matches!(self, Self::Bytes(bytes) if bytes.as_u64() == 0 || !bytes.as_u64().is_power_of_two())
+        {
+            return false;
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            true
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let ordinary_page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            match self {
+                Self::Default => true,
+                Self::Bytes(bytes) => {
+                    ordinary_page_size > 0 && bytes.as_u64() == ordinary_page_size as u64
+                }
+                Self::DefaultHuge => false,
+            }
+        }
+    }
+}
+
 const UNINITIALIZED: u8 = 0;
 const INITIALIZING: u8 = 1;
 const READY: u8 = 2;
+const FAILED: u8 = 3;
 
 static STATE: AtomicU8 = AtomicU8::new(UNINITIALIZED);
 static ARENA_ID: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
@@ -41,12 +133,47 @@ struct HammerMainHeap;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: HammerMainHeap = HammerMainHeap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum MainHeapError {
-    InvalidSize { requested: usize },
-    SizeOverflow { requested: usize },
-    AlreadyInitialized { current: usize, requested: usize },
-    ReserveFailed { size: usize, code: i32 },
+    InvalidSize {
+        requested: usize,
+    },
+    UnsupportedPageSize {
+        page_size: PageSize,
+    },
+    SizeOverflow {
+        requested: usize,
+    },
+    AlreadyInitialized {
+        current: usize,
+        requested: usize,
+    },
+    ReserveFailed {
+        size: usize,
+        code: i32,
+    },
+    PageSizeQuery {
+        page_size: PageSize,
+        source: io::Error,
+    },
+    NumaNodeQuery {
+        source: io::Error,
+    },
+    Mapping {
+        source: PhysmemError,
+    },
+    RegistrationFailed {
+        size: usize,
+        page_size: usize,
+        numa_node: u32,
+    },
+    ArenaMismatch {
+        requested_base: usize,
+        requested_size: usize,
+        actual_base: usize,
+        actual_size: usize,
+    },
+    PreviousInitializationFailed,
 }
 
 impl fmt::Display for MainHeapError {
@@ -56,6 +183,10 @@ impl fmt::Display for MainHeapError {
                 formatter,
                 "main heap size {requested} is smaller than the {}-byte arena minimum",
                 minimum_capacity()
+            ),
+            Self::UnsupportedPageSize { page_size } => write!(
+                formatter,
+                "main heap page size `{page_size}` is unsupported on this platform"
             ),
             Self::SizeOverflow { requested } => {
                 write!(
@@ -73,11 +204,52 @@ impl fmt::Display for MainHeapError {
                     "failed to reserve {size}-byte main heap arena: {code}"
                 )
             }
+            Self::PageSizeQuery { page_size, source } => {
+                write!(
+                    formatter,
+                    "failed to determine `{page_size}` bytes: {source}"
+                )
+            }
+            Self::NumaNodeQuery { source } => {
+                write!(formatter, "failed to query the current NUMA node: {source}")
+            }
+            Self::Mapping { source } => write!(formatter, "main heap mapping failed: {source}"),
+            Self::RegistrationFailed {
+                size,
+                page_size,
+                numa_node,
+            } => write!(
+                formatter,
+                "mimalloc rejected the {size}-byte Main Heap mapping with {page_size}-byte pages on NUMA node {numa_node}"
+            ),
+            Self::ArenaMismatch {
+                requested_base,
+                requested_size,
+                actual_base,
+                actual_size,
+            } => write!(
+                formatter,
+                "mimalloc arena {actual_base:#x}+{actual_size} does not match Main Heap mapping {requested_base:#x}+{requested_size}"
+            ),
+            Self::PreviousInitializationFailed => {
+                write!(
+                    formatter,
+                    "a previous Main Heap initialization failed after registration"
+                )
+            }
         }
     }
 }
 
-impl std::error::Error for MainHeapError {}
+impl std::error::Error for MainHeapError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::PageSizeQuery { source, .. } | Self::NumaNodeQuery { source } => Some(source),
+            Self::Mapping { source } => Some(source),
+            _ => None,
+        }
+    }
+}
 
 /// Reserve and publish the process Main Heap.
 ///
@@ -100,6 +272,7 @@ pub fn init(requested: usize) -> Result<usize, MainHeapError> {
                 };
             }
             INITIALIZING => spin_loop(),
+            FAILED => return Err(MainHeapError::PreviousInitializationFailed),
             UNINITIALIZED => {
                 if STATE
                     .compare_exchange(
@@ -114,6 +287,175 @@ pub fn init(requested: usize) -> Result<usize, MainHeapError> {
                 }
             }
             _ => unreachable!("invalid main heap state"),
+        }
+    }
+}
+
+pub fn init_with(
+    requested: usize,
+    page_size: PageSize,
+    numa_node: Option<u32>,
+) -> Result<usize, MainHeapError> {
+    if !page_size.is_supported_on_current_platform() {
+        return Err(MainHeapError::UnsupportedPageSize { page_size });
+    }
+    let ordinary_page_size =
+        PageSize::Default
+            .bytes()
+            .map_err(|source| MainHeapError::PageSizeQuery {
+                page_size: PageSize::Default,
+                source,
+            })?;
+    let selected_page_size = page_size
+        .bytes()
+        .map_err(|source| MainHeapError::PageSizeQuery { page_size, source })?;
+    if selected_page_size == ordinary_page_size {
+        return init(requested);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = numa_node;
+        unreachable!("platform validation rejected HugeTLB before initialization");
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: this query has no preconditions and does not allocate.
+        let alignment = unsafe { mi_arena_min_alignment() }.max(selected_page_size);
+        let size = aligned_capacity(requested)?;
+        let size = size
+            .checked_add(alignment - 1)
+            .map(|value| value / alignment * alignment)
+            .ok_or(MainHeapError::SizeOverflow { requested })?;
+        let numa_node = match numa_node {
+            Some(numa_node) => numa_node,
+            None => {
+                let mut cpu: libc::c_uint = 0;
+                let mut node: libc::c_uint = 0;
+                // SAFETY: both output pointers are writable and getcpu does
+                // not retain them.
+                if unsafe {
+                    libc::syscall(
+                        libc::SYS_getcpu,
+                        &mut cpu,
+                        &mut node,
+                        std::ptr::null_mut::<libc::c_void>(),
+                    )
+                } != 0
+                {
+                    return Err(MainHeapError::NumaNodeQuery {
+                        source: io::Error::last_os_error(),
+                    });
+                }
+                node
+            }
+        };
+
+        loop {
+            match STATE.load(Ordering::Acquire) {
+                READY => {
+                    let current = CAPACITY.load(Ordering::Acquire);
+                    return if current == size {
+                        Ok(current)
+                    } else {
+                        Err(MainHeapError::AlreadyInitialized {
+                            current,
+                            requested: size,
+                        })
+                    };
+                }
+                INITIALIZING => spin_loop(),
+                FAILED => return Err(MainHeapError::PreviousInitializationFailed),
+                UNINITIALIZED => {
+                    if STATE
+                        .compare_exchange(
+                            UNINITIALIZED,
+                            INITIALIZING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+
+                    let mapping = match map_hugetlb(
+                        size,
+                        page_size,
+                        selected_page_size,
+                        numa_node,
+                        false,
+                        alignment,
+                    ) {
+                        Ok(mapping) => mapping,
+                        Err(source) => {
+                            STATE.store(UNINITIALIZED, Ordering::Release);
+                            return Err(MainHeapError::Mapping { source });
+                        }
+                    };
+                    let mut arena_id: mi_arena_id_t = ptr::null_mut();
+                    let numa_node_for_mimalloc = i32::try_from(numa_node).map_err(|_| {
+                        STATE.store(UNINITIALIZED, Ordering::Release);
+                        MainHeapError::NumaNodeQuery {
+                            source: io::Error::other("NUMA node does not fit i32"),
+                        }
+                    })?;
+                    // SAFETY: `mapping` owns a committed, zeroed, pinned
+                    // region aligned for mimalloc. It remains live until the
+                    // registration result has been validated.
+                    let registered = unsafe {
+                        mi_manage_os_memory_ex(
+                            mapping.base().cast(),
+                            mapping.size(),
+                            true,
+                            true,
+                            true,
+                            numa_node_for_mimalloc,
+                            false,
+                            ptr::from_mut(&mut arena_id),
+                        )
+                    };
+                    if !registered || arena_id.is_null() {
+                        STATE.store(UNINITIALIZED, Ordering::Release);
+                        return Err(MainHeapError::RegistrationFailed {
+                            size: mapping.size(),
+                            page_size: selected_page_size,
+                            numa_node,
+                        });
+                    }
+
+                    let mut actual_size = 0usize;
+                    // SAFETY: successful registration returned a valid arena
+                    // id and `actual_size` is writable.
+                    let actual_base =
+                        unsafe { mi_arena_area(arena_id, ptr::from_mut(&mut actual_size)) };
+                    if actual_base != mapping.base().cast() || actual_size != mapping.size() {
+                        let error = MainHeapError::ArenaMismatch {
+                            requested_base: mapping.base() as usize,
+                            requested_size: mapping.size(),
+                            actual_base: actual_base as usize,
+                            actual_size,
+                        };
+                        mapping.retain_for_process_lifetime();
+                        STATE.store(FAILED, Ordering::Release);
+                        return Err(error);
+                    }
+
+                    let base = mapping.base();
+                    let capacity = mapping.size();
+                    mapping.retain_for_process_lifetime();
+                    // SAFETY: the verified external arena is now mimalloc's
+                    // sole process allocation source.
+                    unsafe { mi_option_set_enabled(mi_option_limit_os_alloc, true) };
+                    ARENA_ID.store(arena_id, Ordering::Release);
+                    ARENA_BASE.store(base, Ordering::Release);
+                    CAPACITY.store(capacity, Ordering::Release);
+                    STATE.store(READY, Ordering::Release);
+                    return Ok(capacity);
+                }
+                _ => unreachable!("invalid main heap state"),
+            }
         }
     }
 }
@@ -296,5 +638,46 @@ unsafe impl GlobalAlloc for HammerMainHeap {
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         // SAFETY: preserves the GlobalAlloc pointer/layout contract.
         unsafe { reallocate(pointer, layout, new_size) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use byte_unit::Byte;
+
+    use super::PageSize;
+
+    #[test]
+    fn page_size_uses_derive_backed_string_forms() {
+        assert_eq!(PageSize::from_str("default"), Ok(PageSize::Default));
+        assert_eq!(
+            PageSize::from_str("default-hugepage"),
+            Ok(PageSize::DefaultHuge)
+        );
+        assert_eq!(
+            PageSize::from_str("2 MiB"),
+            Ok(PageSize::Bytes(Byte::from_u64(2 << 20)))
+        );
+        assert_eq!(
+            PageSize::from_str("1 GiB"),
+            Ok(PageSize::Bytes(Byte::from_u64(1 << 30)))
+        );
+        assert_eq!(
+            PageSize::from_str("2mb"),
+            Ok(PageSize::Bytes(Byte::from_u64(250_000)))
+        );
+    }
+
+    #[test]
+    fn page_size_validation_rejects_zero_and_non_power_of_two_values() {
+        assert!(!PageSize::Bytes(Byte::from_u64(0)).is_supported_on_current_platform());
+        assert!(!PageSize::Bytes(Byte::from_u64(3 << 20)).is_supported_on_current_platform());
+        assert!(
+            !PageSize::from_str("2mb")
+                .expect("byte-unit parses lowercase b as bits")
+                .is_supported_on_current_platform()
+        );
     }
 }
