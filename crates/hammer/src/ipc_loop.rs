@@ -1,6 +1,6 @@
-use tokio::net::TcpListener;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use tokio::net::TcpListener;
 
 pub async fn clnt_loop(listener: TcpListener) {
     loop {
@@ -66,6 +66,13 @@ async fn conn_loop(stream: tokio::net::TcpStream) {
                         {
                             tracing::error!("IPC write error: {e}");
                             break;
+                        }
+                        if hammer_runtime::engine::Engine::with_current(|engine| {
+                            engine.main_loop_exit_now.load(Ordering::Relaxed)
+                        })
+                        .unwrap_or(true)
+                        {
+                            return;
                         }
                     }
                     Err(e) => {
