@@ -1,6 +1,5 @@
 use hammer_runtime::DataPlaneBufferConfig;
 use hammer_runtime::RuntimeRegistry;
-use hammer_runtime::config::Worker;
 use hammer_runtime::{DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig, Engine};
 
 fn runtime_config(numa_nodes: &'static [u32], active_numa_node: u32) -> DataPlaneRuntimeConfig {
@@ -18,18 +17,6 @@ fn runtime_config(numa_nodes: &'static [u32], active_numa_node: u32) -> DataPlan
 
 #[test]
 fn memory_init_materializes_the_configured_buffer_and_instruction_set_policy() {
-    let mut expected_worker = Worker::default();
-    expected_worker.buffer.slot_bytes = 4096;
-    expected_worker.buffer.slots_per_numa = 7;
-    expected_worker.buffer.frame_pool_size = 5;
-    expected_worker.instruction_set = "scalar".to_owned();
-    let expected =
-        hammer_runtime::new_worker_runtime(&expected_worker).expect("configured runtime");
-    let expected_stride = expected
-        .buffers()
-        .try_buffers()
-        .expect("configured buffer pool")
-        .slot_stride();
     let registry = RuntimeRegistry::new();
     let mut engine = Engine::new(DataPlaneRuntime::new(runtime_config(&[0], 0)), registry);
 
@@ -52,16 +39,12 @@ frame_pool_size = 5
         DataPlaneInstructionSet::Scalar
     );
     assert_eq!(engine.runtime.buffers().frame_slots(), 5);
-    assert_eq!(
-        engine
-            .runtime
-            .buffers()
-            .try_buffers()
-            .unwrap()
-            .slot_stride(),
-        expected_stride
-    );
-    for _ in 0..7 {
+    engine
+        .runtime
+        .buffers()
+        .alloc_index_with_bytes(&vec![0; 4096])
+        .expect("configured buffer slot bytes");
+    for _ in 1..7 {
         engine
             .runtime
             .alloc_index()

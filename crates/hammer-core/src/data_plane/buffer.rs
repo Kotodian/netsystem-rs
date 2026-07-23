@@ -30,20 +30,20 @@ pub const DEFAULT_BUFFER_FRAME_CAPACITY: usize = 256;
 pub const DEFAULT_BUFFER_FRAME_POOL_SIZE: usize = 64;
 pub const BUFFER_CACHE_LINE_SIZE: usize = 64;
 pub const DEFAULT_PACKET_HEADROOM: usize = 256;
-pub const DEFAULT_PRE_DATA_SIZE: usize = 128;
-pub const BUFFER_INVALID_INDEX: u32 = u32::MAX;
+const DEFAULT_PRE_DATA_SIZE: usize = 128;
+const BUFFER_INVALID_INDEX: u32 = u32::MAX;
 
 /// Number of free slots moved between the per-thread cache and the arena free
 /// list in a single batch. Batching amortises the `Rc<RefCell>` borrow across
 /// this many alloc/free operations.
-pub const BUFFER_THREAD_CACHE_BATCH: usize = 32;
+const BUFFER_THREAD_CACHE_BATCH: usize = 32;
 /// High-water mark at which the thread cache returns a batch back to the
 /// arena free list, preventing unbounded cache growth and keeping arena free
 /// list non-empty for other consumers.
-pub const BUFFER_THREAD_CACHE_HIGH_WATER: usize = 512;
+const BUFFER_THREAD_CACHE_HIGH_WATER: usize = 512;
 /// `in_use` is folded from the lazy `in_use_delta` counter once its absolute
 /// value exceeds this threshold or when the count is read.
-pub const BUFFER_IN_USE_FOLD_THRESHOLD: i32 = 64;
+const BUFFER_IN_USE_FOLD_THRESHOLD: i32 = 64;
 
 #[derive(Clone, Copy)]
 #[repr(C, align(8))]
@@ -181,7 +181,7 @@ impl BufferFlags {
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C, align(64))]
-pub struct BufferHeaderCacheline0 {
+struct BufferHeaderCacheline0 {
     pub current_data: i16,
     pub current_length: u16,
     pub flags: BufferFlags,
@@ -216,7 +216,7 @@ impl Default for BufferHeaderCacheline0 {
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C, align(64))]
-pub struct BufferHeaderCacheline1 {
+struct BufferHeaderCacheline1 {
     pub trace_handle: u32,
     pub total_length_not_including_first: u32,
     pub opaque2: SecondaryOpaque,
@@ -373,7 +373,7 @@ const _: () = assert!(mem::align_of::<Buffer>() == BUFFER_CACHE_LINE_SIZE);
 const _: () = assert!(mem::size_of::<Buffer>() == BUFFER_CACHE_LINE_SIZE * 2);
 
 #[inline]
-pub const fn buffer_data_offset() -> usize {
+const fn buffer_data_offset() -> usize {
     mem::size_of::<Buffer>() + DEFAULT_PRE_DATA_SIZE
 }
 
@@ -387,8 +387,8 @@ impl Buffer {
             }
             .into());
         }
-        let current_len = u16::try_from(bytes.len())
-            .map_err(|_| BufferInvariant::CurrentLengthOutOfRange)?;
+        let current_len =
+            u16::try_from(bytes.len()).map_err(|_| BufferInvariant::CurrentLengthOutOfRange)?;
         self.cacheline0 = BufferHeaderCacheline0::default();
         self.cacheline0.current_data = 0;
         self.cacheline0.current_length = current_len;
@@ -715,15 +715,15 @@ impl Buffer {
         if offset < lower_bound {
             return Err(BufferInvariant::CurrentDataExceedsPreData.into());
         }
-        self.cacheline0.current_data = i16::try_from(offset)
-            .map_err(|_| BufferInvariant::CurrentDataOutOfRange)?;
+        self.cacheline0.current_data =
+            i16::try_from(offset).map_err(|_| BufferInvariant::CurrentDataOutOfRange)?;
         Ok(())
     }
 
     #[inline]
     fn set_current_len(&mut self, len: usize) -> DataPlaneResult<()> {
-        self.cacheline0.current_length = u16::try_from(len)
-            .map_err(|_| BufferInvariant::CurrentLengthOutOfRange)?;
+        self.cacheline0.current_length =
+            u16::try_from(len).map_err(|_| BufferInvariant::CurrentLengthOutOfRange)?;
         Ok(())
     }
 
@@ -750,8 +750,8 @@ impl Buffer {
     #[inline]
     fn set_total_len_not_including_first(&mut self, len: usize) -> DataPlaneResult<()> {
         self.cacheline0.flags.remove(BufferFlags::SLOT_CLEAN);
-        self.cacheline1.total_length_not_including_first = u32::try_from(len)
-            .map_err(|_| BufferInvariant::ChainTailLengthOutOfRange)?;
+        self.cacheline1.total_length_not_including_first =
+            u32::try_from(len).map_err(|_| BufferInvariant::ChainTailLengthOutOfRange)?;
         Ok(())
     }
 
@@ -893,7 +893,7 @@ impl DerefMut for BufferRefMut<'_> {
 }
 
 #[derive(Debug, Clone)]
-pub struct BufferThreadCache {
+struct BufferThreadCache {
     cached_slots: [u32; BUFFER_THREAD_CACHE_HIGH_WATER],
     len: usize,
 }
@@ -908,7 +908,7 @@ impl BufferThreadCache {
     }
 
     #[inline]
-    pub fn cached_free_len(&self) -> usize {
+    fn cached_free_len(&self) -> usize {
         self.len
     }
 
@@ -938,7 +938,7 @@ impl BufferThreadCache {
 }
 
 #[derive(Debug)]
-pub struct BufferPool {
+struct BufferPool {
     arena: BufferPoolArena,
     thread_cache: Rc<RefCell<BufferThreadCache>>,
 }
@@ -1199,7 +1199,7 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    pub fn try_buffers(&self) -> DataPlaneResult<&BufferPool> {
+    fn try_buffers(&self) -> DataPlaneResult<&BufferPool> {
         self.buffer_pools
             .get(self.active_numa_node)
             .ok_or(DataPlaneError::ActiveNumaBufferPoolMissing.into())
@@ -1376,8 +1376,8 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    pub fn chain(&self, index: Index) -> DataPlaneBufferChain<'_> {
-        DataPlaneBufferChain::new(self.try_buffers(), index)
+    pub fn chain(&self, index: Index) -> impl Iterator<Item = DataPlaneResult<BufferRef<'_>>> + '_ {
+        BufferChain::new(self.try_buffers(), index)
     }
 
     #[inline]
@@ -1423,7 +1423,7 @@ impl DataPlaneBuffers {
 
     #[inline]
     pub fn buffer_arenas(&self) -> impl Iterator<Item = BufferPoolArena> + '_ {
-        self.buffer_pools.iter().map(|(_, pool)| pool.arena())
+        self.buffer_pools.iter().map(|(_, pool)| pool.arena.clone())
     }
 
     #[inline]
@@ -1522,46 +1522,41 @@ impl BufferPoolArena {
 }
 
 impl BufferPool {
+    #[cfg(test)]
     #[inline]
-    pub fn with_capacity(slot_capacity: usize, slots: usize) -> Self {
+    fn with_capacity(slot_capacity: usize, slots: usize) -> Self {
         Self::with_arena(BufferPoolArena::with_capacity(slot_capacity, slots))
     }
 
     #[inline]
-    pub fn with_arena(arena: BufferPoolArena) -> Self {
+    fn with_arena(arena: BufferPoolArena) -> Self {
         Self {
             arena,
             thread_cache: Rc::new(RefCell::new(BufferThreadCache::new())),
         }
     }
 
+    #[cfg(test)]
     #[inline]
-    pub fn arena(&self) -> BufferPoolArena {
-        self.arena.clone()
-    }
-
-    #[inline]
-    pub fn pool_id(&self) -> u64 {
+    fn pool_id(&self) -> u64 {
         self.arena.pool_id()
     }
 
+    #[cfg(test)]
     #[inline]
-    pub fn numa_node(&self) -> u32 {
-        self.arena.numa_node()
-    }
-
-    #[inline]
-    pub fn slot_stride(&self) -> usize {
+    fn slot_stride(&self) -> usize {
         self.arena.inner.read().slot_stride
     }
 
+    #[cfg(test)]
     #[inline]
-    pub fn base_ptr(&self) -> *const u8 {
+    fn base_ptr(&self) -> *const u8 {
         self.arena.inner.read().region.base() as *const u8
     }
 
+    #[cfg(test)]
     #[inline]
-    pub fn buffer_raw_ptr(&self, slot: u32) -> *const Buffer {
+    fn buffer_raw_ptr(&self, slot: u32) -> *const Buffer {
         self.arena
             .inner
             .read()
@@ -1570,8 +1565,9 @@ impl BufferPool {
             .cast_const()
     }
 
+    #[cfg(test)]
     #[inline]
-    pub fn data_raw_ptr(&self, slot: u32) -> *const u8 {
+    fn data_raw_ptr(&self, slot: u32) -> *const u8 {
         self.arena
             .inner
             .read()
@@ -1581,53 +1577,53 @@ impl BufferPool {
     }
 
     #[inline]
-    pub fn cached_free_len(&self) -> usize {
+    fn cached_free_len(&self) -> usize {
         self.thread_cache.borrow().cached_free_len()
     }
 
     #[inline]
-    pub fn in_use(&self) -> usize {
+    fn in_use(&self) -> usize {
         let mut arena = self.arena.inner.write();
         arena.fold_in_use();
         arena.in_use
     }
 
     #[inline]
-    pub fn alloc_index(&self) -> DataPlaneResult<Index> {
+    fn alloc_index(&self) -> DataPlaneResult<Index> {
         let mut cache = self.thread_cache.borrow_mut();
         let mut arena = self.arena.inner.write();
         arena.alloc_empty_chain(&mut cache)
     }
 
     #[inline]
-    pub fn alloc_index_with_bytes(&self, bytes: &[u8]) -> DataPlaneResult<Index> {
+    fn alloc_index_with_bytes(&self, bytes: &[u8]) -> DataPlaneResult<Index> {
         let mut cache = self.thread_cache.borrow_mut();
         let mut arena = self.arena.inner.write();
         arena.alloc_chain(&mut cache, bytes)
     }
 
     #[inline]
-    pub fn attach_clone(&self, head: Index, tail: Index) -> DataPlaneResult<()> {
+    fn attach_clone(&self, head: Index, tail: Index) -> DataPlaneResult<()> {
         self.arena.inner.write().attach_clone(head, tail)
     }
 
     #[inline]
-    pub fn chain_buffer(&self, head: Index, tail: Index) -> DataPlaneResult<()> {
+    fn chain_buffer(&self, head: Index, tail: Index) -> DataPlaneResult<()> {
         self.arena.inner.write().chain_buffer(head, tail)
     }
 
     #[inline]
-    pub fn prefetch_header(&self, index: Index) {
+    fn prefetch_header(&self, index: Index) {
         self.arena.inner.read().prefetch_header(index);
     }
 
     #[inline]
-    pub fn prefetch_read(&self, index: Index) {
+    fn prefetch_read(&self, index: Index) {
         self.arena.inner.read().prefetch_read(index);
     }
 
     #[inline]
-    pub fn prefetch_write(&self, index: Index) {
+    fn prefetch_write(&self, index: Index) {
         self.arena.inner.read().prefetch_write(index);
     }
 
@@ -1642,7 +1638,7 @@ impl BufferPool {
     }
 
     #[inline]
-    pub fn get(&self, index: Index) -> DataPlaneResult<BufferRef<'_>> {
+    fn get(&self, index: Index) -> DataPlaneResult<BufferRef<'_>> {
         let guard = self.arena.inner.read();
         guard.buffer(index)?;
         Ok(BufferRef {
@@ -1654,7 +1650,7 @@ impl BufferPool {
     }
 
     #[inline]
-    pub fn get_mut(&self, index: Index) -> DataPlaneResult<BufferRefMut<'_>> {
+    fn get_mut(&self, index: Index) -> DataPlaneResult<BufferRefMut<'_>> {
         let mut guard = self.arena.inner.write();
         guard.ensure_writable(index)?;
         guard.buffer_mut(index)?;
@@ -1667,63 +1663,12 @@ impl BufferPool {
     }
 
     #[inline]
-    pub fn chain(
-        &self,
-        index: Index,
-    ) -> impl Iterator<Item = DataPlaneResult<BufferRef<'_>>> + '_ {
-        let mut next = Some(index);
-        let mut failed = false;
-        std::iter::from_fn(move || {
-            if failed {
-                return None;
-            }
-            let current = next?;
-            let guard = self.arena.inner.read();
-            next = match guard.next_buffer(current) {
-                Ok(next) => next,
-                Err(err) => {
-                    failed = true;
-                    return Some(Err(err));
-                }
-            };
-            Some(Ok(BufferRef {
-                guard: spinning_top::guard::RwSpinlockReadGuard::map(guard, |pool| {
-                    pool.buffer(current)
-                        .expect("buffer index was validated before mapping")
-                }),
-            }))
-        })
-    }
-
-    #[inline]
-    pub fn current_data(&self, index: Index) -> DataPlaneResult<usize> {
-        Ok(self.arena.inner.read().buffer(index)?.current_data())
-    }
-
-    #[inline]
-    pub fn current_len(&self, index: Index) -> DataPlaneResult<usize> {
-        Ok(self.arena.inner.read().buffer(index)?.current_len())
-    }
-
-    #[inline]
-    pub fn current_ptr(&self, index: Index) -> DataPlaneResult<*const u8> {
-        Ok(self.arena.inner.read().buffer(index)?.current_ptr())
-    }
-
-    #[inline]
-    pub fn current_mut_ptr(&self, index: Index) -> DataPlaneResult<*mut u8> {
-        let mut guard = self.arena.inner.write();
-        guard.ensure_writable(index)?;
-        Ok(guard.buffer_mut(index)?.current_mut_ptr())
-    }
-
-    #[inline]
-    pub fn current_config(&self, index: Index) -> DataPlaneResult<NodeId> {
+    fn current_config(&self, index: Index) -> DataPlaneResult<NodeId> {
         Ok(self.arena.inner.read().buffer(index)?.current_config())
     }
 
     #[inline]
-    pub fn set_current_config(&self, index: Index, next: NodeId) -> DataPlaneResult<()> {
+    fn set_current_config(&self, index: Index, next: NodeId) -> DataPlaneResult<()> {
         let mut guard = self.arena.inner.write();
         guard.ensure_header_exclusive(index)?;
         guard.buffer_mut(index)?.set_current_config(next);
@@ -1731,72 +1676,18 @@ impl BufferPool {
     }
 
     #[inline]
-    pub fn node_error_code(&self, index: Index) -> DataPlaneResult<Option<u16>> {
+    fn node_error_code(&self, index: Index) -> DataPlaneResult<Option<u16>> {
         Ok(self.arena.inner.read().buffer(index)?.node_error_code())
     }
 
     #[inline]
-    pub fn advance(&self, index: Index, displacement: isize) -> DataPlaneResult<()> {
+    fn advance(&self, index: Index, displacement: isize) -> DataPlaneResult<()> {
         let mut pool = self.arena.inner.write();
         pool.advance(index, displacement)
     }
 
     #[inline]
-    pub fn truncate_current(&self, index: Index, len: usize) -> DataPlaneResult<()> {
-        let mut pool = self.arena.inner.write();
-        pool.ensure_writable(index)?;
-
-        let mut walked = 0usize;
-        let mut current = Some(index);
-        let mut cut_buffer: Option<Index> = None;
-        let mut cut_remainder = 0usize;
-        while let Some(current_index) = current {
-            let current_len = pool.buffer(current_index)?.current_len();
-            if walked + current_len >= len {
-                cut_buffer = Some(current_index);
-                cut_remainder = len - walked;
-                break;
-            }
-            walked += current_len;
-            current = pool.next_buffer(current_index)?;
-        }
-
-        let cut_buffer = cut_buffer
-            .ok_or(BufferInvariant::TruncateExtendsCurrentLength)?;
-        if cut_buffer != index {
-            pool.ensure_header_exclusive(cut_buffer)?;
-        }
-
-        let head_current_len = pool.buffer(index)?.current_len();
-        let head_had_next = pool.next_buffer(index)?.is_some();
-
-        pool.buffer_mut(cut_buffer)?
-            .set_current_len(cut_remainder)?;
-
-        if cut_buffer == index {
-            if head_had_next {
-                pool.buffer_mut(index)?.set_next_buffer(None);
-                pool.buffer_mut(index)?
-                    .set_total_len_not_including_first(0)?;
-            }
-        } else {
-            pool.buffer_mut(cut_buffer)?.set_next_buffer(None);
-            let new_total_tail = len - head_current_len;
-            pool.buffer_mut(index)?
-                .set_total_len_not_including_first(new_total_tail)?;
-        }
-        Ok(())
-    }
-
-    #[inline]
-    pub fn prepend(&self, index: Index, bytes: &[u8]) -> DataPlaneResult<()> {
-        let mut pool = self.arena.inner.write();
-        pool.ensure_writable(index)?;
-        pool.buffer_mut(index)?.prepend(bytes)
-    }
-
-    #[inline]
-    pub fn append(&self, index: Index, bytes: &[u8]) -> DataPlaneResult<()> {
+    fn append(&self, index: Index, bytes: &[u8]) -> DataPlaneResult<()> {
         let mut cache = self.thread_cache.borrow_mut();
         self.arena
             .inner
@@ -2074,6 +1965,7 @@ impl BufferPoolInner {
         Ok(unsafe { self.region.base().add(offset).cast::<Buffer>() })
     }
 
+    #[cfg(test)]
     #[inline]
     fn data_raw_ptr(&self, slot: u32) -> DataPlaneResult<*mut u8> {
         let offset = self
@@ -2294,9 +2186,7 @@ impl BufferPoolInner {
                 Some(slot) => slot,
                 None => {
                     self.refill_cache_batch(cache);
-                    cache
-                        .pop()
-                        .ok_or(BufferInvariant::PoolExhausted)?
+                    cache.pop().ok_or(BufferInvariant::PoolExhausted)?
                 }
             };
             let entry = self.slot_state_mut(slot)?;
@@ -2344,9 +2234,7 @@ impl BufferPoolInner {
                 Some(slot) => slot,
                 None => {
                     self.refill_cache_batch(cache);
-                    cache
-                        .pop()
-                        .ok_or(BufferInvariant::PoolExhausted)?
+                    cache.pop().ok_or(BufferInvariant::PoolExhausted)?
                 }
             };
             let entry = self.slot_state_mut(slot)?;
@@ -2812,14 +2700,14 @@ fn prefetch_buffer_data_write(buffer: &Buffer) {
     }
 }
 
-pub struct DataPlaneBufferChain<'pool> {
+struct BufferChain<'pool> {
     pool: Option<&'pool BufferPool>,
     next: Option<Index>,
     failed: bool,
     error: Option<DataPlaneError>,
 }
 
-impl<'pool> DataPlaneBufferChain<'pool> {
+impl<'pool> BufferChain<'pool> {
     #[inline]
     fn new(pool: DataPlaneResult<&'pool BufferPool>, index: Index) -> Self {
         match pool {
@@ -2839,7 +2727,7 @@ impl<'pool> DataPlaneBufferChain<'pool> {
     }
 }
 
-impl<'pool> Iterator for DataPlaneBufferChain<'pool> {
+impl<'pool> Iterator for BufferChain<'pool> {
     type Item = DataPlaneResult<BufferRef<'pool>>;
 
     #[inline]
@@ -3605,6 +3493,46 @@ impl BufferFrame {
 #[cfg(test)]
 mod index_identity_tests {
     use super::*;
+
+    #[test]
+    fn private_buffer_layout_and_cache_policy_are_consistent() {
+        assert_eq!(
+            mem::size_of::<BufferHeaderCacheline0>(),
+            BUFFER_CACHE_LINE_SIZE
+        );
+        assert_eq!(
+            mem::align_of::<BufferHeaderCacheline0>(),
+            BUFFER_CACHE_LINE_SIZE
+        );
+        assert_eq!(
+            mem::size_of::<BufferHeaderCacheline1>(),
+            BUFFER_CACHE_LINE_SIZE
+        );
+        assert_eq!(
+            mem::align_of::<BufferHeaderCacheline1>(),
+            BUFFER_CACHE_LINE_SIZE
+        );
+        assert_eq!(
+            buffer_data_offset(),
+            mem::size_of::<Buffer>() + DEFAULT_PRE_DATA_SIZE
+        );
+        assert_eq!(BUFFER_INVALID_INDEX, u32::MAX);
+        assert!(BUFFER_THREAD_CACHE_BATCH <= BUFFER_THREAD_CACHE_HIGH_WATER);
+        assert!(BUFFER_IN_USE_FOLD_THRESHOLD > 0);
+    }
+
+    #[test]
+    fn buffer_arena_storage_stays_outside_main_heap() {
+        let pool = BufferPool::with_capacity(2048, 16);
+        let index = pool.alloc_index().expect("allocate buffer from arena");
+        let arena_base = pool.base_ptr();
+        let buffer_header = pool.buffer_raw_ptr(index.slot()).cast::<u8>();
+        let buffer_payload = pool.data_raw_ptr(index.slot());
+        let arena_size = pool.slot_stride() * 17;
+
+        assert!((buffer_header as usize).wrapping_sub(arena_base as usize) < arena_size);
+        assert!((buffer_payload as usize).wrapping_sub(arena_base as usize) < arena_size);
+    }
 
     #[test]
     fn advance_generation_retires_at_max() {

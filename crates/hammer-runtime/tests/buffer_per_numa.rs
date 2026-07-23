@@ -1,4 +1,4 @@
-use hammer_core::data_plane::{BufferPool, BufferPoolArena, NodeId};
+use hammer_core::data_plane::{BufferPoolArena, DataPlaneBuffers, NodeId};
 use hammer_runtime::{
     DataPlaneBufferConfig, DataPlaneHandoff, DataPlaneInstructionSet, DataPlaneRuntime,
     DataPlaneRuntimeConfig, DataWorkerId,
@@ -57,14 +57,9 @@ trait CleanupOwner {
     fn drop_index_owned(&self, index: hammer_core::data_plane::Index);
 }
 
-impl CleanupOwner for BufferPool {
+impl CleanupOwner for DataPlaneBuffers {
     fn drop_index_owned(&self, index: hammer_core::data_plane::Index) {
-        let runtime =
-            runtime_with_handoff_arena(self.arena(), 1, DataPlaneInstructionSet::native());
-        let mut frame = runtime
-            .buffers()
-            .get_next_frame(NodeId::new(0))
-            .expect("cleanup frame");
+        let mut frame = self.get_next_frame(NodeId::new(0)).expect("cleanup frame");
         frame.push_index(index).expect("cleanup push index");
     }
 }
@@ -89,16 +84,20 @@ macro_rules! drop_owned_index {
 fn arenas_keep_their_arena_numa_identity() {
     let a0 = BufferPoolArena::with_capacity_on_numa(1024, 32, 0);
     let a1 = BufferPoolArena::with_capacity_on_numa(1024, 32, 1);
-    let p0 = BufferPool::with_arena(a0);
-    let p1 = BufferPool::with_arena(a1);
+    let b0 = DataPlaneBuffers::from_arenas([a0.clone()], 1, 0, 0);
+    let b1 = DataPlaneBuffers::from_arenas([a1.clone()], 1, 0, 1);
 
-    let i0 = p0.alloc_index().expect("numa0 alloc");
-    let i1 = p1.alloc_index().expect("numa1 alloc");
+    let i0 = b0.alloc_index().expect("numa0 alloc");
+    let i1 = b1.alloc_index().expect("numa1 alloc");
 
-    assert_eq!(p0.numa_node(), 0);
-    assert_eq!(p1.numa_node(), 1);
-    assert_ne!(p0.pool_id(), p1.pool_id());
-    assert_ne!(p0.buffer_raw_ptr(i0.slot()), p1.buffer_raw_ptr(i1.slot()));
+    assert_eq!(a0.numa_node(), 0);
+    assert_eq!(a1.numa_node(), 1);
+    assert_eq!(i0.pool_id(), a0.pool_id());
+    assert_eq!(i1.pool_id(), a1.pool_id());
+    assert_ne!(i0.pool_id(), i1.pool_id());
+
+    drop_owned_index!(&b0, i0);
+    drop_owned_index!(&b1, i1);
 }
 
 #[test]
@@ -114,14 +113,6 @@ fn default_numa_configuration_uses_numa_zero() {
 
     assert_eq!(runtime.active_numa_node(), 0);
     assert_eq!(runtime.buffers().active_numa_node(), 0);
-    assert_eq!(
-        runtime
-            .buffers()
-            .try_buffers()
-            .expect("active buffer pool")
-            .numa_node(),
-        0
-    );
 
     drop_owned_index!(&runtime, index);
 }
@@ -142,23 +133,8 @@ fn config_constructor_resolves_active_numa_to_configured_node() {
     let runtime = runtime_with_numa(1024, 16, &[3]);
 
     assert_eq!(buffers.active_numa_node(), 3);
-    assert_eq!(
-        buffers
-            .try_buffers()
-            .expect("active buffer pool")
-            .numa_node(),
-        3
-    );
     assert_eq!(runtime.active_numa_node(), 3);
     assert_eq!(runtime.buffers().active_numa_node(), 3);
-    assert_eq!(
-        runtime
-            .buffers()
-            .try_buffers()
-            .expect("active buffer pool")
-            .numa_node(),
-        3
-    );
 }
 
 #[test]
@@ -168,23 +144,8 @@ fn handoff_arena_constructor_uses_arena_numa_identity() {
     let buffers = runtime.buffers();
 
     assert_eq!(buffers.active_numa_node(), 3);
-    assert_eq!(
-        buffers
-            .try_buffers()
-            .expect("active buffer pool")
-            .numa_node(),
-        3
-    );
     assert_eq!(runtime.active_numa_node(), 3);
     assert_eq!(runtime.buffers().active_numa_node(), 3);
-    assert_eq!(
-        runtime
-            .buffers()
-            .try_buffers()
-            .expect("active buffer pool")
-            .numa_node(),
-        3
-    );
 }
 
 #[test]
@@ -205,14 +166,6 @@ fn handoff_capacities_preserve_handoff_arena_numa_identity() {
 
     assert_eq!(runtime.active_numa_node(), 3);
     assert_eq!(runtime.buffers().active_numa_node(), 3);
-    assert_eq!(
-        runtime
-            .buffers()
-            .try_buffers()
-            .expect("active buffer pool")
-            .numa_node(),
-        3
-    );
 }
 
 #[test]
@@ -237,14 +190,6 @@ fn handoff_worker_runtime_falls_back_to_configured_nonzero_numa_arena() {
 
     assert_eq!(worker.active_numa_node(), 3);
     assert_eq!(worker.buffers().active_numa_node(), 3);
-    assert_eq!(
-        worker
-            .buffers()
-            .try_buffers()
-            .expect("active buffer pool")
-            .numa_node(),
-        3
-    );
     assert_eq!(main_index.pool_id(), worker_index.pool_id());
 
     drop_owned_index!(&worker, worker_index);

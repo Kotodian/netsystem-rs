@@ -4,10 +4,9 @@ use std::rc::Rc;
 
 use crate::error::{RuntimeError, RuntimeResult};
 use hammer_core::data_plane::{
-    BufferFrame, BufferNodeError, BufferPoolArena, BufferRef, BufferRefMut, DataPlaneBufferChain,
-    DataPlaneBuffers, FrameBatchWidth,
-    BUFFER_CACHE_LINE_SIZE, DEFAULT_BUFFER_FRAME_POOL_SIZE, Frame, Index, Next, NodeHandle,
-    NodeId, NodeNext, NodeRegistration, Pending,
+    BUFFER_CACHE_LINE_SIZE, BufferFrame, BufferNodeError, BufferPoolArena, BufferRef, BufferRefMut,
+    DEFAULT_BUFFER_FRAME_POOL_SIZE, DataPlaneBuffers, Frame, FrameBatchWidth, Index, Next,
+    NodeHandle, NodeId, NodeNext, NodeRegistration, Pending,
 };
 use hammer_core::error::DataPlaneError;
 
@@ -208,12 +207,8 @@ impl From<DataPlaneRuntimeWorkerConfig> for DataPlaneRuntime {
             handoff,
             handoff_node_handle,
         } = seed;
-        let buffers = DataPlaneBuffers::from_arenas(
-            buffer_arenas,
-            frame_slots,
-            thread_index,
-            numa_node,
-        );
+        let buffers =
+            DataPlaneBuffers::from_arenas(buffer_arenas, frame_slots, thread_index, numa_node);
         let mut runtime = Self::from_buffers_with_instruction_set(buffers, instruction_set);
         runtime.nodes = nodes.into();
         runtime.handoff = handoff;
@@ -244,10 +239,7 @@ impl DataPlaneRuntime {
         config: DataPlaneRuntimeConfig,
         instruction_set: DataPlaneInstructionSet,
     ) -> Self {
-        Self::from_buffers_with_instruction_set(
-            config.buffers.into(),
-            instruction_set,
-        )
+        Self::from_buffers_with_instruction_set(config.buffers.into(), instruction_set)
     }
 
     #[inline]
@@ -374,7 +366,10 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    pub fn chain(&self, index: Index) -> DataPlaneBufferChain<'_> {
+    pub fn chain(
+        &self,
+        index: Index,
+    ) -> impl Iterator<Item = Result<BufferRef<'_>, DataPlaneError>> + '_ {
         self.buffers.chain(index)
     }
 
