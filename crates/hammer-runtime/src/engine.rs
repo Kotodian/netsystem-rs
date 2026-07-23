@@ -53,9 +53,7 @@ pub struct Engine {
     pub main_loop_exit_now: Arc<AtomicBool>,
     pub main_loop_exit_status: Mutex<i32>,
     pub(crate) memory_initialized: bool,
-    // Process futures may hold DSO code; drop them before PluginMain unloads libraries.
     processes: ProcessMain,
-    plugin_main: PluginMain,
     worker_init_functions: Vec<InitFunction>,
     worker_config: Worker,
     pub(crate) called_init_functions: HashSet<&'static str>,
@@ -72,6 +70,9 @@ pub struct Engine {
     main_loop_exit_functions_called: bool,
     file_main: Option<FileMain>,
     worker_threads: Mutex<Vec<JoinHandle<()>>>,
+    // Drop after every owner that may retain DSO code or Drop glue. Plugin
+    // images themselves remain mapped for the full process lifetime.
+    plugin_main: PluginMain,
 }
 
 impl Engine {

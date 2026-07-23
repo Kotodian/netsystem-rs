@@ -12,7 +12,6 @@ use abi_stable::{
     sabi_trait,
     std_types::{ROption, RSlice, RSliceMut, RStr},
 };
-use libloading::Library;
 use object::{Object, ObjectSection};
 use semver::Version;
 use serde::Deserialize;
@@ -20,7 +19,7 @@ use serde::Deserialize;
 use crate::error::RuntimeError;
 use crate::init::{ConfigFunction, InitFunction};
 use crate::node::{NodeEntry, NodeFunctionRegistration};
-use crate::plugin_loader::read_plugin_module;
+use crate::plugin_loader::{PluginLibrary, read_plugin_module};
 use crate::process::ProcessEntry;
 use crate::registration::RegistrationImage;
 
@@ -213,16 +212,17 @@ pub enum PluginError {
 
 /// Main-thread plugin authority, corresponding to VPP's `plugin_main_t`.
 ///
-/// The process-global library table owns every activated DSO handle, matching
-/// VPP's `vlib_plugin_main`. Failed load transactions never enter this table and
-/// unload before returning their error.
+/// The library table indexes every activated DSO, matching VPP's
+/// `vlib_plugin_main`. Opened Rust plugin images and loader handles remain live
+/// until process exit; failed transactions never publish their modules into
+/// this active table.
 pub struct PluginMain {
     modules_by_plugin: HashMap<String, PluginModuleRef>,
     library_index_by_name: HashMap<String, usize>,
     load_order: Vec<String>,
     builtin_registration_images: Vec<&'static RegistrationImage>,
     // Drop last so every DSO-backed root module remains valid while indexes drop.
-    libraries: Vec<Library>,
+    libraries: Vec<PluginLibrary>,
 }
 
 impl Default for PluginMain {
@@ -270,8 +270,9 @@ impl PluginMain {
 
     /// Load configured roots and their transitive `load_after` dependencies.
     ///
-    /// A failed transaction drops its DSO handles. A successful dependency
-    /// closure remains mapped until exit.
+    /// Failed transactions publish no runtime state. Every image opened during
+    /// either a failed or successful transaction remains mapped until process
+    /// exit because active Rust DSO unload has no proven teardown protocol.
     pub fn load(&mut self, host_version: &str, roots: &[String]) -> Result<(), PluginError> {
         let plugin_path = self.directory()?;
         if roots.is_empty() {
@@ -419,13 +420,10 @@ impl PluginMain {
             "hammer_plugin_{}",
             manifest.name
         )));
-        // SAFETY: PluginMain retains each successfully opened library until
-        // shutdown, so its ABI root and registration image remain valid.
-        let library =
-            unsafe { Library::new(&path) }.map_err(|source| PluginError::LibraryOpen {
-                path: path.clone(),
-                source,
-            })?;
+        let library = PluginLibrary::open(&path).map_err(|source| PluginError::LibraryOpen {
+            path: path.clone(),
+            source,
+        })?;
         let module = read_plugin_module(&library).map_err(|source| PluginError::RootModule {
             path: path.clone(),
             source,

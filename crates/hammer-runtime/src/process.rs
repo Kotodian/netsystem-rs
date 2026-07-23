@@ -3,7 +3,8 @@
 //! Process Nodes do not consume packet frames and never run in a Data Worker
 //! graph. A main-thread [`tokio::task::LocalSet`] polls their futures; waiting
 //! for a clock or event suspends only that process. Shutdown aborts and joins
-//! every future before plugin code may be unloaded.
+//! every future before plugin authority teardown; active plugin images remain
+//! mapped for the process lifetime.
 
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
