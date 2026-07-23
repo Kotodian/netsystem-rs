@@ -91,6 +91,10 @@ impl Daemon {
 
     fn shutdown(mut self) {
         let _ = request(self.address, "shutdown", Vec::new());
+        self.wait_for_exit();
+    }
+
+    fn wait_for_exit(&mut self) {
         let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
         loop {
             if self
@@ -140,6 +144,22 @@ mss = 1200
     daemon.load_plugins(&["udp", "tun"]);
     assert_eq!(daemon.plugin_names(), ["ip", "tcp", "udp", "tun"]);
     daemon.shutdown();
+}
+
+#[test]
+fn daemon_exits_after_shutdown_response_when_client_keeps_connection_open() {
+    let mut daemon = Daemon::start(
+        r#"
+plugins = []
+
+[memory]
+main_heap_size = "256 MiB"
+"#,
+    );
+
+    let (stream, _) = request_while_connection_remains_open(daemon.address, "shutdown", Vec::new());
+    daemon.wait_for_exit();
+    drop(stream);
 }
 
 #[test]
@@ -236,6 +256,15 @@ fn daemon_binary_directory() -> PathBuf {
 }
 
 fn request(address: SocketAddr, name: &str, payload: Vec<u8>) -> Vec<u8> {
+    let (_, payload) = request_while_connection_remains_open(address, name, payload);
+    payload
+}
+
+fn request_while_connection_remains_open(
+    address: SocketAddr,
+    name: &str,
+    payload: Vec<u8>,
+) -> (TcpStream, Vec<u8>) {
     let mut stream = TcpStream::connect(address).expect("connect to hammer IPC");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -253,9 +282,10 @@ fn request(address: SocketAddr, name: &str, payload: Vec<u8>) -> Vec<u8> {
     )
     .expect("write hammer IPC request");
     let response = read_frame(&mut stream).expect("read hammer IPC response");
-    bincode::deserialize::<IpcResponse>(&response)
+    let payload = bincode::deserialize::<IpcResponse>(&response)
         .expect("deserialize hammer IPC response")
-        .payload
+        .payload;
+    (stream, payload)
 }
 
 fn unused_address() -> SocketAddr {
