@@ -116,14 +116,6 @@ impl PageSize {
             }
         }
     }
-
-    pub fn validate_main_heap(self) -> Result<(), MainHeapError> {
-        if self.is_supported_on_current_platform() {
-            Ok(())
-        } else {
-            Err(MainHeapError::UnsupportedPageSize { page_size: self })
-        }
-    }
 }
 
 const UNINITIALIZED: u8 = 0;
@@ -304,7 +296,9 @@ pub fn init_with(
     page_size: PageSize,
     numa_node: Option<u32>,
 ) -> Result<usize, MainHeapError> {
-    page_size.validate_main_heap()?;
+    if !page_size.is_supported_on_current_platform() {
+        return Err(MainHeapError::UnsupportedPageSize { page_size });
+    }
     let ordinary_page_size =
         PageSize::Default
             .bytes()
@@ -644,5 +638,46 @@ unsafe impl GlobalAlloc for HammerMainHeap {
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         // SAFETY: preserves the GlobalAlloc pointer/layout contract.
         unsafe { reallocate(pointer, layout, new_size) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use byte_unit::Byte;
+
+    use super::PageSize;
+
+    #[test]
+    fn page_size_uses_derive_backed_string_forms() {
+        assert_eq!(PageSize::from_str("default"), Ok(PageSize::Default));
+        assert_eq!(
+            PageSize::from_str("default-hugepage"),
+            Ok(PageSize::DefaultHuge)
+        );
+        assert_eq!(
+            PageSize::from_str("2 MiB"),
+            Ok(PageSize::Bytes(Byte::from_u64(2 << 20)))
+        );
+        assert_eq!(
+            PageSize::from_str("1 GiB"),
+            Ok(PageSize::Bytes(Byte::from_u64(1 << 30)))
+        );
+        assert_eq!(
+            PageSize::from_str("2mb"),
+            Ok(PageSize::Bytes(Byte::from_u64(250_000)))
+        );
+    }
+
+    #[test]
+    fn page_size_validation_rejects_zero_and_non_power_of_two_values() {
+        assert!(!PageSize::Bytes(Byte::from_u64(0)).is_supported_on_current_platform());
+        assert!(!PageSize::Bytes(Byte::from_u64(3 << 20)).is_supported_on_current_platform());
+        assert!(
+            !PageSize::from_str("2mb")
+                .expect("byte-unit parses lowercase b as bits")
+                .is_supported_on_current_platform()
+        );
     }
 }

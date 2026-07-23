@@ -56,24 +56,31 @@ impl TryFrom<DataPlaneBufferConfig> for DataPlaneBuffers {
     type Error = DataPlaneError;
 
     fn try_from(config: DataPlaneBufferConfig) -> Result<Self, Self::Error> {
-        let arenas = config
-            .numa_nodes
-            .iter()
-            .copied()
+        config.create_buffers(config.numa_nodes.iter().copied())
+    }
+}
+
+impl DataPlaneBufferConfig {
+    fn create_buffers(
+        &self,
+        numa_nodes: impl IntoIterator<Item = u32>,
+    ) -> DataPlaneResult<DataPlaneBuffers> {
+        let arenas = numa_nodes
+            .into_iter()
             .map(|numa_node| {
                 BufferPoolArena::with_capacity_on_numa(
-                    config.buffer_slot_capacity,
-                    config.buffer_slots,
-                    config.page_size,
+                    self.buffer_slot_capacity,
+                    self.buffer_slots,
+                    self.page_size,
                     numa_node,
                 )
             })
             .collect::<DataPlaneResult<Vec<_>>>()?;
         Ok(DataPlaneBuffers::from_arenas(
             arenas,
-            config.frame_slots,
-            config.thread_index,
-            config.active_numa_node,
+            self.frame_slots,
+            self.thread_index,
+            self.active_numa_node,
         ))
     }
 }
@@ -813,30 +820,78 @@ pub fn new_worker_runtime(config: &Worker) -> RuntimeResult<DataPlaneRuntime> {
             "configured instruction set {instruction_set:?} is not supported by this CPU"
         )));
     }
-    let create = |page_size| {
-        DataPlaneRuntime::try_new_with_instruction_set(
-            DataPlaneRuntimeConfig {
-                buffers: DataPlaneBufferConfig {
-                    buffer_slot_capacity: buffer.slot_bytes,
-                    buffer_slots: buffer.slots_per_numa,
-                    frame_slots: buffer.frame_pool_size,
-                    page_size,
-                    ..DataPlaneBufferConfig::default()
-                },
-            },
+    let numa_nodes = config.buffer_numa_nodes()?;
+    let create = |page_size| -> DataPlaneResult<DataPlaneRuntime> {
+        let buffers = DataPlaneBufferConfig {
+            buffer_slot_capacity: buffer.slot_bytes,
+            buffer_slots: buffer.slots_per_numa,
+            frame_slots: buffer.frame_pool_size,
+            active_numa_node: numa_nodes[0],
+            page_size,
+            ..DataPlaneBufferConfig::default()
+        }
+        .create_buffers(numa_nodes.iter().copied())?;
+        Ok(DataPlaneRuntime::from_buffers_with_instruction_set(
+            buffers,
             instruction_set,
-        )
+        ))
     };
 
     match buffer.page_size {
         Some(page_size) => create(page_size).map_err(Into::into),
-        None => match create(PageSize::DefaultHuge) {
-            Ok(runtime) => Ok(runtime),
-            Err(source) => {
-                tracing::warn!(%source, "default HugeTLB Buffer Arena unavailable; using ordinary pages");
+        None => {
+            #[cfg(target_os = "linux")]
+            {
+                match create(PageSize::DefaultHuge) {
+                    Ok(runtime) => Ok(runtime),
+                    Err(source) => {
+                        tracing::warn!(%source, "default HugeTLB Buffer Arena unavailable; using ordinary pages");
+                        create(PageSize::Default).map_err(Into::into)
+                    }
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
                 create(PageSize::Default).map_err(Into::into)
             }
-        },
+        }
+    }
+}
+
+impl Worker {
+    fn buffer_numa_nodes(&self) -> RuntimeResult<Vec<u32>> {
+        #[cfg(target_os = "linux")]
+        {
+            if self.numa.enabled {
+                return self.buffer_numa_nodes_with(crate::numa::node_for_cpu);
+            }
+        }
+        Ok(vec![0])
+    }
+
+    #[cfg(target_os = "linux")]
+    fn buffer_numa_nodes_with(
+        &self,
+        mut node_for_cpu: impl FnMut(usize) -> RuntimeResult<u32>,
+    ) -> RuntimeResult<Vec<u32>> {
+        let mut nodes = Vec::with_capacity(self.count);
+        for worker in 0..self.count {
+            let core = crate::worker_thread::worker_core(worker, &self.cpu).ok_or_else(|| {
+                RuntimeError::config_validation(format!(
+                    "worker {worker} has no available CPU core"
+                ))
+            })?;
+            let node = node_for_cpu(core)?;
+            if node >= 32 {
+                return Err(RuntimeError::config_validation(format!(
+                    "worker CPU {core} resolves to unsupported NUMA node {node}"
+                )));
+            }
+            nodes.push(node);
+        }
+        nodes.sort_unstable();
+        nodes.dedup();
+        Ok(nodes)
     }
 }
 
@@ -857,5 +912,30 @@ fn parse_instruction_set(value: &str) -> RuntimeResult<DataPlaneInstructionSet> 
         Err(RuntimeError::invariant(format!(
             "unknown instruction set `{value}`"
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "linux")]
+    use crate::config::Worker;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_buffer_nodes_follow_configured_worker_cores() {
+        let mut worker = Worker::default();
+        worker.count = 3;
+        worker.numa.enabled = true;
+        worker.cpu.worker_cores = vec![2, 4, 6];
+
+        let nodes = worker
+            .buffer_numa_nodes_with(|core| match core {
+                2 | 6 => Ok(1),
+                4 => Ok(3),
+                _ => unreachable!("unexpected configured core"),
+            })
+            .expect("resolve worker NUMA nodes");
+
+        assert_eq!(nodes, vec![1, 3]);
     }
 }

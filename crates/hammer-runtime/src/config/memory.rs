@@ -34,13 +34,12 @@ impl Memory {
                 minimum
             )));
         }
-        self.main_heap_page_size
-            .validate_main_heap()
-            .map_err(|source| {
-                RuntimeError::config_validation(format!(
-                    "memory.main_heap_page_size is invalid: {source}"
-                ))
-            })?;
+        if !self.main_heap_page_size.is_supported_on_current_platform() {
+            return Err(RuntimeError::config_validation(format!(
+                "memory.main_heap_page_size `{}` is unsupported on this platform",
+                self.main_heap_page_size
+            )));
+        }
         Ok(())
     }
 

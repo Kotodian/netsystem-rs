@@ -181,7 +181,13 @@ impl DataRuntime {
                 .stack_size(thread_stack_size);
             let join = builder
                 .spawn(move || {
-                    apply_worker_thread_setup(&worker_config, index);
+                    if let Err(error) = apply_worker_thread_setup(&worker_config, index) {
+                        let _ = handle_tx.send(Err(format!(
+                            "set up data runtime worker {worker_name}: {error}"
+                        )));
+                        let _ = done_tx.send(());
+                        return;
+                    }
                     DATA_WORKER_IDLE_SLICE.with(|slot| slot.set(idle_slice));
                     if let Err(error) = init_data_plane_runtime(&worker_config) {
                         let _ = handle_tx.send(Err(format!(

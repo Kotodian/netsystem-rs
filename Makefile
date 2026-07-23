@@ -42,4 +42,9 @@ verify-dataplane-performance:
 	cargo bench --profile release-perf -p hammer-runtime --bench graph_fanout -- --noplot --sample-size 10 --warm-up-time 0.1 --measurement-time 0.2
 
 verify-hugepages:
-	cargo test -p hammer-infra --test hugepages -- --ignored --nocapture --test-threads=1
+	cargo test -p hammer-infra --test hugepages automatic_pool_growth_and_buffer_backing_use_2_mib_hugetlb -- --ignored --exact --nocapture
+	cargo test -p hammer-infra --test hugepages buffer_backing_uses_1_gib_hugetlb_when_advertised -- --ignored --exact --nocapture
+	cargo test -p hammer-infra --test hugepages main_heap_uses_2_mib_hugetlb_and_never_falls_back -- --ignored --exact --nocapture
+	cargo test -p hammer-infra --test hugepages main_heap_uses_1_gib_hugetlb_when_advertised -- --ignored --exact --nocapture
+	cargo test -p hammer-infra --test hugepages unsupported_explicit_hugepage_requests_fail_without_fallback -- --ignored --exact --nocapture
+	cargo test -p hammer-infra --test hugepages transparent_hugepage_hint_is_not_reported_as_hugetlb -- --ignored --exact --nocapture

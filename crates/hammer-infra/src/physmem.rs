@@ -7,6 +7,8 @@ use std::ffi::CString;
 use std::fmt;
 use std::io;
 use std::os::fd::RawFd;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -47,12 +49,15 @@ pub enum PhysmemError {
         path: PathBuf,
     },
     HugePagePool {
+        operation: &'static str,
+        path: PathBuf,
         requested: PageSize,
         page_size: usize,
         numa_node: u32,
         required: usize,
         free: usize,
         current: usize,
+        attempted: Option<usize>,
         source: io::Error,
     },
     NumaPolicy {
@@ -114,17 +119,27 @@ impl fmt::Display for PhysmemError {
                 path.display()
             ),
             Self::HugePagePool {
+                operation,
+                path,
                 page_size,
                 numa_node,
                 required,
                 free,
                 current,
+                attempted,
                 source,
                 ..
-            } => write!(
-                formatter,
-                "failed to provision {required} HugeTLB pages of {page_size} bytes on NUMA node {numa_node} (free {free}, current {current}): {source}"
-            ),
+            } => {
+                write!(
+                    formatter,
+                    "HugeTLB pool operation `{operation}` at {} failed for {required} pages of {page_size} bytes on NUMA node {numa_node} (free {free}, current {current}",
+                    path.display()
+                )?;
+                if let Some(attempted) = attempted {
+                    write!(formatter, ", attempted {attempted}")?;
+                }
+                write!(formatter, "): {source}")
+            }
             Self::NumaPolicy {
                 operation,
                 numa_node,
@@ -424,6 +439,130 @@ fn checked_align_up(value: usize, alignment: usize) -> Option<usize> {
 }
 
 #[cfg(target_os = "linux")]
+fn provision_hugepages(
+    directory: &Path,
+    requested: PageSize,
+    page_size: usize,
+    numa_node: u32,
+    required: usize,
+) -> Result<(), PhysmemError> {
+    let free_path = directory.join("free_hugepages");
+    let current_path = directory.join("nr_hugepages");
+    let free = std::fs::read_to_string(&free_path)
+        .and_then(|value| {
+            value
+                .trim()
+                .parse::<usize>()
+                .map_err(|source| io::Error::new(io::ErrorKind::InvalidData, source))
+        })
+        .map_err(|source| PhysmemError::HugePagePool {
+            operation: "read free",
+            path: free_path.clone(),
+            requested,
+            page_size,
+            numa_node,
+            required,
+            free: 0,
+            current: 0,
+            attempted: None,
+            source,
+        })?;
+    let current = std::fs::read_to_string(&current_path)
+        .and_then(|value| {
+            value
+                .trim()
+                .parse::<usize>()
+                .map_err(|source| io::Error::new(io::ErrorKind::InvalidData, source))
+        })
+        .map_err(|source| PhysmemError::HugePagePool {
+            operation: "read current",
+            path: current_path.clone(),
+            requested,
+            page_size,
+            numa_node,
+            required,
+            free,
+            current: 0,
+            attempted: None,
+            source,
+        })?;
+    if free >= required {
+        return Ok(());
+    }
+
+    let attempted = current
+        .checked_add(required - free)
+        .ok_or(PhysmemError::PageSizeOverflow { requested })?;
+    std::fs::write(&current_path, attempted.to_string()).map_err(|source| {
+        PhysmemError::HugePagePool {
+            operation: "grow",
+            path: current_path.clone(),
+            requested,
+            page_size,
+            numa_node,
+            required,
+            free,
+            current,
+            attempted: Some(attempted),
+            source,
+        }
+    })?;
+    let available = std::fs::read_to_string(&free_path)
+        .and_then(|value| {
+            value
+                .trim()
+                .parse::<usize>()
+                .map_err(|source| io::Error::new(io::ErrorKind::InvalidData, source))
+        })
+        .map_err(|source| PhysmemError::HugePagePool {
+            operation: "re-read free",
+            path: free_path,
+            requested,
+            page_size,
+            numa_node,
+            required,
+            free,
+            current,
+            attempted: Some(attempted),
+            source,
+        })?;
+    let provisioned = std::fs::read_to_string(&current_path)
+        .and_then(|value| {
+            value
+                .trim()
+                .parse::<usize>()
+                .map_err(|source| io::Error::new(io::ErrorKind::InvalidData, source))
+        })
+        .map_err(|source| PhysmemError::HugePagePool {
+            operation: "re-read current",
+            path: current_path.clone(),
+            requested,
+            page_size,
+            numa_node,
+            required,
+            free: available,
+            current,
+            attempted: Some(attempted),
+            source,
+        })?;
+    if available < required {
+        return Err(PhysmemError::HugePagePool {
+            operation: "confirm",
+            path: current_path,
+            requested,
+            page_size,
+            numa_node,
+            required,
+            free: available,
+            current: provisioned,
+            attempted: Some(attempted),
+            source: io::Error::other("kernel did not make the requested pages available"),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn map_hugetlb(
     size: usize,
     requested: PageSize,
@@ -467,99 +606,7 @@ pub(crate) fn map_hugetlb(
     }
 
     let required = total / page_size;
-    let free_path = directory.join("free_hugepages");
-    let current_path = directory.join("nr_hugepages");
-    let free = std::fs::read_to_string(&free_path)
-        .and_then(|value| {
-            value
-                .trim()
-                .parse::<usize>()
-                .map_err(|source| io::Error::new(io::ErrorKind::InvalidData, source))
-        })
-        .map_err(|source| PhysmemError::HugePagePool {
-            requested,
-            page_size,
-            numa_node,
-            required,
-            free: 0,
-            current: 0,
-            source,
-        })?;
-    let current = std::fs::read_to_string(&current_path)
-        .and_then(|value| {
-            value
-                .trim()
-                .parse::<usize>()
-                .map_err(|source| io::Error::new(io::ErrorKind::InvalidData, source))
-        })
-        .map_err(|source| PhysmemError::HugePagePool {
-            requested,
-            page_size,
-            numa_node,
-            required,
-            free,
-            current: 0,
-            source,
-        })?;
-    if free < required {
-        let attempted = current
-            .checked_add(required - free)
-            .ok_or(PhysmemError::PageSizeOverflow { requested })?;
-        std::fs::write(&current_path, attempted.to_string()).map_err(|source| {
-            PhysmemError::HugePagePool {
-                requested,
-                page_size,
-                numa_node,
-                required,
-                free,
-                current,
-                source,
-            }
-        })?;
-        let available = std::fs::read_to_string(&free_path)
-            .and_then(|value| {
-                value
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(|source| io::Error::new(io::ErrorKind::InvalidData, source))
-            })
-            .map_err(|source| PhysmemError::HugePagePool {
-                requested,
-                page_size,
-                numa_node,
-                required,
-                free,
-                current,
-                source,
-            })?;
-        let provisioned = std::fs::read_to_string(&current_path)
-            .and_then(|value| {
-                value
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(|source| io::Error::new(io::ErrorKind::InvalidData, source))
-            })
-            .map_err(|source| PhysmemError::HugePagePool {
-                requested,
-                page_size,
-                numa_node,
-                required,
-                free: available,
-                current: attempted,
-                source,
-            })?;
-        if available < required {
-            return Err(PhysmemError::HugePagePool {
-                requested,
-                page_size,
-                numa_node,
-                required,
-                free: available,
-                current: provisioned,
-                source: io::Error::other("kernel did not make the requested pages available"),
-            });
-        }
-    }
+    provision_hugepages(&directory, requested, page_size, numa_node, required)?;
 
     let mut previous_mode: libc::c_int = 0;
     let mut previous_mask = [0 as libc::c_ulong; MAX_NUMA_NODES / libc::c_ulong::BITS as usize];
@@ -819,6 +866,12 @@ pub(crate) fn map_hugetlb(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use std::fs;
+
+    #[cfg(target_os = "linux")]
+    use byte_unit::Byte;
+
     use super::*;
 
     #[test]
@@ -831,6 +884,74 @@ mod tests {
             PageSize::Default.bytes().expect("OS page size")
         );
         assert!(!mapping.is_hugetlb());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hugepage_pool_growth_writes_only_the_shortfall_and_confirms_free_pages() {
+        let directory = fixture_pool("growth", 1, 2);
+
+        let error = provision_hugepages(
+            &directory,
+            PageSize::Bytes(Byte::from_u64(2 << 20)),
+            2 << 20,
+            3,
+            3,
+        )
+        .expect_err("fixture cannot make written pages free");
+
+        assert_eq!(
+            fs::read_to_string(directory.join("nr_hugepages")).expect("read attempted pool size"),
+            "4"
+        );
+        assert!(matches!(
+            error,
+            PhysmemError::HugePagePool {
+                operation: "confirm",
+                required: 3,
+                free: 1,
+                current: 4,
+                attempted: Some(4),
+                ..
+            }
+        ));
+        fs::remove_dir_all(directory).expect("remove fixture");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hugepage_pool_with_enough_free_pages_is_not_modified() {
+        let directory = fixture_pool("no-growth", 4, 7);
+
+        provision_hugepages(
+            &directory,
+            PageSize::Bytes(Byte::from_u64(2 << 20)),
+            2 << 20,
+            0,
+            3,
+        )
+        .expect("existing free pages satisfy request");
+
+        assert_eq!(
+            fs::read_to_string(directory.join("nr_hugepages")).expect("read unchanged pool size"),
+            "7"
+        );
+        fs::remove_dir_all(directory).expect("remove fixture");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fixture_pool(name: &str, free: usize, current: usize) -> PathBuf {
+        let counter = PHYSMEM_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "hammer-hugetlb-{name}-{}-{counter}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).expect("create fixture pool");
+        fs::write(directory.join("free_hugepages"), free.to_string())
+            .expect("write fixture free pages");
+        fs::write(directory.join("nr_hugepages"), current.to_string())
+            .expect("write fixture pool size");
+        directory
     }
 
     #[cfg(not(target_os = "linux"))]

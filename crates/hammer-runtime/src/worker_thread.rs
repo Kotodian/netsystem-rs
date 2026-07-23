@@ -8,14 +8,14 @@ use crate::config::WorkerCpu;
 use crate::numa;
 
 /// Apply platform worker-thread setup before the dataplane loop runs.
-pub fn apply_worker_thread_setup(worker: &Worker, index: usize) {
+pub fn apply_worker_thread_setup(worker: &Worker, index: usize) -> crate::RuntimeResult<()> {
     #[cfg(target_os = "linux")]
     {
         apply_linux_cpu_affinity(index, &worker.cpu);
         apply_linux_scheduler(&worker.scheduler);
         if worker.numa.enabled {
             if let Some(node) = numa::current_numa_node() {
-                let _ = numa::bind_current_thread_memory_to_numa(node);
+                numa::bind_current_thread_memory_to_numa(node)?;
             }
         }
         let _ = index;
@@ -29,24 +29,24 @@ pub fn apply_worker_thread_setup(worker: &Worker, index: usize) {
     {
         let _ = (worker, index);
     }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
 fn apply_linux_cpu_affinity(index: usize, cpu: &WorkerCpu) {
     use core_affinity::{CoreId, set_for_current};
 
-    let core = if !cpu.worker_cores.is_empty() {
-        cpu.worker_cores.get(index).copied()
-    } else {
-        auto_worker_core(index, cpu)
-    };
+    let core = worker_core(index, cpu);
     if let Some(id) = core {
         set_for_current(CoreId { id });
     }
 }
 
 #[cfg(target_os = "linux")]
-fn auto_worker_core(index: usize, cpu: &WorkerCpu) -> Option<usize> {
+pub(crate) fn worker_core(index: usize, cpu: &WorkerCpu) -> Option<usize> {
+    if !cpu.worker_cores.is_empty() {
+        return cpu.worker_cores.get(index).copied();
+    }
     let cores = core_affinity::get_core_ids()?;
     let reserved: std::collections::HashSet<usize> =
         cpu.main_core.into_iter().chain(cpu.app_core).collect();
@@ -109,7 +109,7 @@ mod tests {
 
     #[test]
     fn worker_thread_setup_accepts_default_worker() {
-        apply_worker_thread_setup(&Worker::default(), 0);
+        apply_worker_thread_setup(&Worker::default(), 0).expect("apply default worker setup");
     }
 
     #[cfg(target_os = "linux")]
@@ -125,7 +125,7 @@ mod tests {
         let mut worker = Worker::default();
         worker.count = 1;
         worker.cpu.worker_cores = vec![target];
-        apply_worker_thread_setup(&worker, 0);
+        apply_worker_thread_setup(&worker, 0).expect("apply pinned worker setup");
         assert_eq!(
             get_core_ids()
                 .map(|cores| { cores.into_iter().map(|core| core.id).collect::<Vec<_>>() }),
@@ -140,6 +140,6 @@ mod tests {
 
         let mut worker = Worker::default();
         worker.scheduler.qos = QosClass::UserInteractive;
-        apply_worker_thread_setup(&worker, 0);
+        apply_worker_thread_setup(&worker, 0).expect("apply worker QoS");
     }
 }
