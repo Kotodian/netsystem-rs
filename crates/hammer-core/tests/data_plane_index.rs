@@ -1,7 +1,7 @@
 use hammer_core::data_plane::{
     BufferPool, BufferPoolArena, DataPlaneBuffers, Index, NodeId,
 };
-use hammer_core::error::{DataPlaneError, PacketGraphError};
+use hammer_core::error::DataPlaneError;
 
 fn release(buffers: &DataPlaneBuffers, index: Index) {
     let mut frame = buffers
@@ -56,10 +56,10 @@ fn buffer_validation_reports_structured_foreign_stale_and_free_facts() {
     let index = first_buffers.alloc_index_with_bytes(b"x").expect("alloc");
 
     match second.get(index).map(|_| ()).unwrap_err() {
-        PacketGraphError::DataPlane(DataPlaneError::ForeignIndex {
+        DataPlaneError::ForeignIndex {
             expected_pool_id,
             actual_pool_id,
-        }) => {
+        } => {
             assert_eq!(expected_pool_id, second.pool_id());
             assert_eq!(actual_pool_id, first.pool_id());
         }
@@ -68,7 +68,7 @@ fn buffer_validation_reports_structured_foreign_stale_and_free_facts() {
 
     release(&first_buffers, index);
     match first.get(index).map(|_| ()).unwrap_err() {
-        PacketGraphError::DataPlane(DataPlaneError::IndexSlotFree { pool_id, slot }) => {
+        DataPlaneError::IndexSlotFree { pool_id, slot } => {
             assert_eq!(pool_id, first.pool_id());
             assert_eq!(slot, index.slot());
         }
@@ -79,11 +79,11 @@ fn buffer_validation_reports_structured_foreign_stale_and_free_facts() {
     assert_eq!(reused.slot(), index.slot());
     assert_ne!(reused.generation(), index.generation());
     match first.get(index).map(|_| ()).unwrap_err() {
-        PacketGraphError::DataPlane(DataPlaneError::StaleIndex {
+        DataPlaneError::StaleIndex {
             slot,
             index_generation,
             current_generation,
-        }) => {
+        } => {
             assert_eq!(slot, index.slot());
             assert_eq!(index_generation, index.generation());
             assert_eq!(current_generation, reused.generation());

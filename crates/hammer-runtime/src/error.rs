@@ -1,11 +1,11 @@
-use hammer_core::error::{DataPlaneError, PacketGraphError};
+use hammer_core::error::DataPlaneError;
 use thiserror::Error;
 
 /// Failures owned by graph execution, process lifecycle, and plugin loading.
 #[derive(Debug, Error)]
 pub enum RuntimeError {
     #[error(transparent)]
-    PacketGraph(#[from] PacketGraphError),
+    DataPlane(#[from] DataPlaneError),
     #[error("parse TOML: {message}")]
     ConfigParse { message: String },
     #[error("invalid runtime configuration: {message}")]
@@ -34,12 +34,6 @@ pub enum RuntimeError {
     Attach(#[from] AttachError),
     #[error("runtime invariant violated: {detail}")]
     Invariant { detail: String },
-}
-
-impl From<DataPlaneError> for RuntimeError {
-    fn from(error: DataPlaneError) -> Self {
-        PacketGraphError::from(error).into()
-    }
 }
 
 #[derive(Debug, Error)]

@@ -10,7 +10,7 @@ use hammer_core::data_plane::{
     PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES, Pending, PrimaryOpaque, SecondaryOpaque,
     buffer_data_offset,
 };
-use hammer_core::error::{BufferInvariant, DataPlaneError, PacketGraphError};
+use hammer_core::error::{BufferInvariant, DataPlaneError, DataPlaneResult};
 
 fn test_buffers(buffer_slot_capacity: usize, buffer_slots: usize) -> DataPlaneBuffers {
     DataPlaneBuffers::from_arenas(
@@ -33,12 +33,11 @@ fn chain_bytes(buffers: &DataPlaneBuffers, index: Index) -> Vec<u8> {
 fn buffer_invariant_failure_is_structured() {
     let buffers = BufferPool::with_capacity(4, 1);
     let index = buffers.alloc_index().expect("buffer");
+    let failure: DataPlaneResult<()> = buffers.attach_clone(index, index);
 
     assert!(matches!(
-        buffers.attach_clone(index, index).unwrap_err(),
-        PacketGraphError::DataPlane(DataPlaneError::BufferInvariant(
-            BufferInvariant::CloneRequiresDistinctBuffers
-        ))
+        failure.unwrap_err(),
+        DataPlaneError::BufferInvariant(BufferInvariant::CloneRequiresDistinctBuffers)
     ));
 }
 

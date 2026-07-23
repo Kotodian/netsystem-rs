@@ -1,19 +1,5 @@
 use thiserror::Error;
 
-/// Failures intrinsic to the cross-DSO packet graph and buffer ABI.
-#[derive(Debug, Error)]
-pub enum PacketGraphError {
-    #[error(transparent)]
-    DataPlane(#[from] DataPlaneError),
-}
-
-impl From<BufferInvariant> for PacketGraphError {
-    #[inline]
-    fn from(error: BufferInvariant) -> Self {
-        DataPlaneError::from(error).into()
-    }
-}
-
 /// Buffer-state failures representable by the packet-graph ABI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum BufferInvariant {
@@ -124,4 +110,4 @@ pub enum DataPlaneError {
     StaticBufferArenaMissing { thread_index: u32, numa_node: u32 },
 }
 
-pub type PacketGraphResult<T> = Result<T, PacketGraphError>;
+pub type DataPlaneResult<T> = Result<T, DataPlaneError>;
