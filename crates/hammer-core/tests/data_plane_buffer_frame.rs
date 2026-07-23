@@ -3,11 +3,8 @@ use std::mem::{align_of, size_of};
 use hammer_core::data_plane::{
     BUFFER_CACHE_LINE_SIZE, BUFFER_IN_USE_FOLD_THRESHOLD, BUFFER_INVALID_INDEX,
     BUFFER_THREAD_CACHE_BATCH, BUFFER_THREAD_CACHE_HIGH_WATER, Buffer, BufferFlags, BufferFrame,
-    BufferFrameBatch, BufferFrameBatchCursor, BufferFrameBatchIndices, BufferFramePairBatch,
-    BufferFramePairBatchCursor,
-    BufferFrameQuadBatch, BufferFrameQuadBatchCursor, BufferHeaderCacheline0,
-    BufferHeaderCacheline1, BufferNodeError, BufferPacketCursor, BufferPool, BufferPoolArena,
-    BufferRef, BufferRefMut, BufferThreadCache, DEFAULT_BUFFER_FRAME_CAPACITY,
+    BufferHeaderCacheline0, BufferHeaderCacheline1, BufferNodeError, BufferPacketCursor, BufferPool,
+    BufferPoolArena, BufferRef, BufferRefMut, BufferThreadCache, DEFAULT_BUFFER_FRAME_CAPACITY,
     DEFAULT_BUFFER_FRAME_POOL_SIZE, DEFAULT_PACKET_HEADROOM, DEFAULT_PRE_DATA_SIZE,
     DataPlaneBufferChain, DataPlaneBuffers, Frame, FrameBatchWidth, Index, Next, NodeId,
     PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES, Pending, PrimaryOpaque, SecondaryOpaque,
@@ -69,26 +66,16 @@ fn core_exports_buffer_and_frame_value_primitives() {
 
     type CoreFrameNext = Frame<Next>;
     type CoreFramePending = Frame<Pending>;
-    type CoreBufferFramePairBatchCursor<'a> = BufferFramePairBatchCursor<'a>;
-    type CoreBufferFrameQuadBatchCursor<'a> = BufferFrameQuadBatchCursor<'a>;
-    type CoreBufferFrameBatchCursor<'a> = BufferFrameBatchCursor<'a>;
     type CoreBufferRef<'a> = BufferRef<'a>;
     type CoreBufferRefMut<'a> = BufferRefMut<'a>;
     let _ = size_of::<BufferFlags>();
     let _ = size_of::<BufferFrame>();
-    let _ = size_of::<BufferFrameBatch>();
-    let _ = size_of::<BufferFrameBatchIndices>();
-    let _ = size_of::<BufferFramePairBatch>();
-    let _ = size_of::<BufferFrameQuadBatch>();
     let _ = size_of::<BufferPool>();
     let _ = size_of::<BufferPoolArena>();
     let _ = size_of::<BufferThreadCache>();
     let _ = size_of::<DataPlaneBufferChain>();
     let _ = size_of::<CoreFrameNext>();
     let _ = size_of::<CoreFramePending>();
-    let _ = size_of::<CoreBufferFramePairBatchCursor<'static>>();
-    let _ = size_of::<CoreBufferFrameQuadBatchCursor<'static>>();
-    let _ = size_of::<CoreBufferFrameBatchCursor<'static>>();
     let _ = size_of::<CoreBufferRef<'static>>();
     let _ = size_of::<CoreBufferRefMut<'static>>();
 
@@ -296,4 +283,66 @@ fn core_frame_retain_preserves_stable_order() {
     drop(frame);
     drop(cleanup);
     assert_eq!(buffers.in_use_buffers(), 0);
+}
+
+#[test]
+fn frame_batch_widths_retain_and_rewrite_equivalently() {
+    let buffers = test_buffers(64, 9);
+    let indices: Vec<_> = (0..9)
+        .map(|value| {
+            buffers
+                .alloc_index_with_bytes(&[value])
+                .expect("allocate index")
+        })
+        .collect();
+
+    for width in [
+        FrameBatchWidth::Pair,
+        FrameBatchWidth::Quad,
+        FrameBatchWidth::Octo,
+    ] {
+        let mut retained = BufferFrame::with_capacity(9);
+        retained
+            .push_indices(indices.iter().copied())
+            .expect("seed retained frame");
+        retained
+            .retain_indices_batched(width, |index| {
+                Ok(index != indices[1] && index != indices[4] && index != indices[7])
+            })
+            .expect("retain selected indices");
+        assert_eq!(
+            retained.indices(),
+            &[
+                indices[0], indices[2], indices[3], indices[5], indices[6], indices[8]
+            ]
+        );
+
+        let mut rewritten = BufferFrame::with_capacity(9);
+        rewritten
+            .push_indices(indices.iter().copied())
+            .expect("seed rewritten frame");
+        rewritten
+            .rewrite_indices_batched(width, |index| {
+                if index == indices[2] {
+                    Ok(None)
+                } else if index == indices[5] {
+                    Ok(Some(indices[8]))
+                } else {
+                    Ok(Some(index))
+                }
+            })
+            .expect("rewrite selected indices");
+        assert_eq!(
+            rewritten.indices(),
+            &[
+                indices[0], indices[1], indices[3], indices[4], indices[8], indices[6],
+                indices[7], indices[8]
+            ]
+        );
+    }
+
+    let mut cleanup = buffers.get_next_frame(NodeId::new(9)).expect("cleanup frame");
+    cleanup
+        .push_indices(indices)
+        .expect("own allocated indexes");
 }

@@ -4,10 +4,8 @@ mod memory;
 pub use buffer::{
     BUFFER_CACHE_LINE_SIZE, BUFFER_IN_USE_FOLD_THRESHOLD, BUFFER_INVALID_INDEX,
     BUFFER_THREAD_CACHE_BATCH, BUFFER_THREAD_CACHE_HIGH_WATER, Buffer, BufferFlags, BufferFrame,
-    BufferFrameBatch, BufferFrameBatchCursor, BufferFrameBatchIndices, BufferFramePairBatch,
-    BufferFramePairBatchCursor,
-    BufferFrameQuadBatch, BufferFrameQuadBatchCursor, BufferHeaderCacheline0,
-    BufferHeaderCacheline1, BufferNodeError, BufferPacketCursor, BufferPool, BufferPoolArena,
+    BufferHeaderCacheline0, BufferHeaderCacheline1, BufferNodeError, BufferPacketCursor, BufferPool,
+    BufferPoolArena,
     BufferRef, BufferRefMut, BufferThreadCache, DEFAULT_BUFFER_FRAME_CAPACITY,
     DEFAULT_BUFFER_FRAME_POOL_SIZE, DEFAULT_PACKET_HEADROOM, DEFAULT_PRE_DATA_SIZE,
     DataPlaneBufferChain, DataPlaneBuffers, Frame, FrameBatchWidth, Index, Next,
