@@ -596,8 +596,8 @@ fn descriptor_registration_validates_declared_next_shape() {
     assert!(matches!(
         err,
         RuntimeError::InitialNextCountMismatch {
-            declared: 1,
-            actual: 2
+            declared: 2,
+            actual: 1
         }
     ));
 }
@@ -752,12 +752,16 @@ fn try_register_descriptor_registers_erased_descriptor() {
 #[test]
 fn try_register_descriptor_rejects_next_count_mismatch() {
     let runtime = test_runtime(64, 4, 2);
-    let empty_nexts: &[NodeId] = &[];
+    let target = runtime.nodes().register_internal(DescriptorNode::plain(
+        count_process,
+        NodeRuntimeData::empty(),
+    ));
+    let incomplete_nexts = [target];
     let descriptor = NodeDescriptor::new(
         count_process,
         NodeRuntimeData::empty(),
         NodeRegistration::next("erased-bad", TestNext::COUNT),
-        empty_nexts,
+        &incomplete_nexts,
         None,
     );
 
@@ -769,7 +773,7 @@ fn try_register_descriptor_rejects_next_count_mismatch() {
         err,
         RuntimeError::InitialNextCountMismatch {
             declared: TestNext::COUNT,
-            actual: 0
+            actual: 1
         }
     ));
 }
