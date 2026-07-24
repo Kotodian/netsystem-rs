@@ -67,6 +67,10 @@ Use Rust 2024 conventions and rustfmt defaults: 4-space indentation, `snake_case
 
 - Do **not** introduce underscore-prefixed variable names such as `_value`. If a parameter or pattern slot is intentionally unused, use the bare `_` pattern. If a local binding is unused, delete it and the work that produced it.
 - Enforce architectural boundaries with visibility, traits, and narrow re-exports instead of comments or convention.
+- Express access to an existing value with Rust's ownership and borrowing
+  primitives: `&T`, `&mut T`, slices, iterators, and guards. Do not introduce a
+  wrapper type merely to observe, borrow, or re-expose another value, or to
+  cache pointers and offsets into storage owned elsewhere.
 - Non-trivial designs must document the layer isolation contract: what each layer may call, what it must not call, which APIs cross the boundary, and which commands verify the boundary.
 
 ### Naming rules
@@ -115,9 +119,11 @@ Use Rust 2024 conventions and rustfmt defaults: 4-space indentation, `snake_case
   error.
 - Function and type names must state the domain operation or owned state. Avoid
   generic suffixes such as `Helper`, `Util`, `Manager`, `Handler`, `Thing`,
-  `Data`, `Context`, `Kind`, or `Type` unless that term is the established
-  domain concept. Do not add a wrapper merely to create a place for a vague
-  name.
+  `Data`, `Context`, `Kind`, `Type`, or `View` unless that term is the
+  established domain concept. `View` is forbidden for borrowed access,
+  observation, or a bundle of cached pointers/offsets; use Rust borrows or name
+  a genuine parsed/domain result precisely, such as `ParsedTcpSegment`. Do not
+  add a wrapper merely to create a place for a vague name.
 
 ### Error handling rules
 
