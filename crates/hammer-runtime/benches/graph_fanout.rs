@@ -15,7 +15,7 @@ use hammer_infra::mask_compare::{
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::node::{NodeDescriptor, NodeResult, NodeRuntimeData};
 use hammer_runtime::{
-    DataPlaneBufferConfig, DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig,
+    DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig,
 };
 
 fn test_runtime(frame_slots: usize, buffer_slots: usize) -> DataPlaneRuntime {
@@ -135,8 +135,7 @@ enum FanoutPattern {
 }
 
 fn bench_fanout_256(c: &mut Criterion) {
-    let isa = DataPlaneInstructionSet::native();
-    let mut group = c.benchmark_group(format!("fanout_256/{isa:?}"));
+    let mut group = c.benchmark_group("fanout_256/native");
     for (name, pattern) in [
         ("single_next", FanoutPattern::Single),
         ("alternating_two_next", FanoutPattern::Alternating),

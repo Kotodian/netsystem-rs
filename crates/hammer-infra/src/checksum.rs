@@ -1,166 +1,180 @@
-use core::ptr;
+use core::{hash::Hasher, mem::size_of, ptr};
+#[cfg(target_arch = "x86_64")]
+use std::sync::OnceLock;
+
+use crate::simd::Simd;
+
+type ChecksumParts = fn(&[&[u8]]) -> u16;
+const ACCUMULATE_CHUNK_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy)]
+pub struct InternetChecksum<const SIMD_BYTES: usize = 1> {
+    sum: u64,
+    trailing_high: Option<u8>,
+}
+
+impl<const SIMD_BYTES: usize> Default for InternetChecksum<SIMD_BYTES> {
+    #[inline]
+    fn default() -> Self {
+        const {
+            assert!(matches!(SIMD_BYTES, 1 | 16 | 32 | 64));
+        }
+        Self {
+            sum: 0,
+            trailing_high: None,
+        }
+    }
+}
+
+impl<const SIMD_BYTES: usize> Hasher for InternetChecksum<SIMD_BYTES> {
+    #[inline]
+    fn finish(&self) -> u64 {
+        let mut sum = self.sum;
+        if let Some(high) = self.trailing_high {
+            sum = sum.wrapping_add(u64::from(high) << 8);
+        }
+        u64::from(finish_checksum(sum))
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut start = 0usize;
+        if let Some(high) = self.trailing_high.take() {
+            let Some(&low) = bytes.first() else {
+                self.trailing_high = Some(high);
+                return;
+            };
+            self.sum = self
+                .sum
+                .wrapping_add(u64::from(u16::from_be_bytes([high, low])));
+            start = 1;
+        }
+
+        let remainder = &bytes[start..];
+        let even_len = remainder.len() & !1;
+        for chunk in remainder[..even_len].chunks(ACCUMULATE_CHUNK_BYTES) {
+            self.sum = fold_checksum_sum(
+                self.sum
+                    .wrapping_add(accumulate_for_simd::<SIMD_BYTES>(chunk)),
+            );
+        }
+        self.trailing_high = remainder.get(even_len).copied();
+    }
+}
 
 #[inline]
 pub fn internet_checksum(bytes: &[u8]) -> u16 {
-    let even_len = bytes.len() & !1;
-    let mut sum = accumulate_even_words(&bytes[..even_len]);
-    if let Some(&high) = bytes.get(even_len) {
-        sum = sum.wrapping_add(u64::from(high) << 8);
-    }
-    finish_checksum(sum)
+    internet_checksum_parts(&[bytes])
 }
 
 #[inline]
 pub fn internet_checksum_parts(parts: &[&[u8]]) -> u16 {
-    let mut sum = 0u64;
-    let mut high = None;
+    native_checksum_parts()(parts)
+}
+
+#[inline(always)]
+fn checksum_parts_with_simd<const SIMD_BYTES: usize>(parts: &[&[u8]]) -> u16 {
+    let mut checksum = InternetChecksum::<SIMD_BYTES>::default();
     for part in parts {
-        let mut start = 0usize;
-        if let Some(hi) = high.take() {
-            if let Some(&lo) = part.first() {
-                sum = sum.wrapping_add(u64::from(u16::from_be_bytes([hi, lo])));
-                start = 1;
-            } else {
-                high = Some(hi);
-                continue;
-            }
-        }
-        let remainder = &part[start..];
-        let even_len = remainder.len() & !1;
-        sum = sum.wrapping_add(accumulate_even_words(&remainder[..even_len]));
-        if let Some(&trailing_high) = remainder.get(even_len) {
-            high = Some(trailing_high);
-        }
+        checksum.write(part);
     }
-    if let Some(hi) = high {
-        sum = sum.wrapping_add(u64::from(hi) << 8);
-    }
-    finish_checksum(sum)
+    checksum.finish() as u16
 }
 
 #[inline]
-fn finish_checksum(mut sum: u64) -> u16 {
+fn fold_checksum_sum(mut sum: u64) -> u64 {
     while (sum >> 16) != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
-    !(sum as u16)
+    sum
+}
+
+#[inline]
+fn finish_checksum(sum: u64) -> u16 {
+    !(fold_checksum_sum(sum) as u16)
+}
+
+#[inline(always)]
+fn accumulate_simd<const LANES: usize>(bytes: &[u8]) -> u64 {
+    const {
+        assert!(LANES > 0);
+    }
+    let vector_bytes = LANES * size_of::<u16>();
+    let mut total = 0u64;
+    let mut index = 0usize;
+    while index + vector_bytes <= bytes.len() {
+        let values =
+            unsafe { ptr::read_unaligned(bytes.as_ptr().add(index).cast::<[u16; LANES]>()) };
+        let words = Simd::from_array(values);
+        #[cfg(target_endian = "little")]
+        let words = words.swap_bytes();
+        let widened: Simd<u32, LANES> = words.into();
+        total = total.wrapping_add(u64::from(widened.reduce_sum()));
+        index += vector_bytes;
+    }
+    total.wrapping_add(accumulate_u64_words(&bytes[index..]))
+}
+
+#[inline(always)]
+fn accumulate_for_simd<const SIMD_BYTES: usize>(bytes: &[u8]) -> u64 {
+    match SIMD_BYTES {
+        64 => accumulate_simd::<32>(bytes),
+        32 => accumulate_simd::<16>(bytes),
+        16 => accumulate_simd::<8>(bytes),
+        1 => accumulate_u64_words(bytes),
+        _ => unreachable!("unsupported SIMD width"),
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn accumulate_avx512(bytes: &[u8]) -> u64 {
-    use core::arch::x86_64::{
-        __m512i, _mm512_add_epi32, _mm512_loadu_si512, _mm512_or_si512, _mm512_setzero_si512,
-        _mm512_slli_epi16, _mm512_srli_epi16, _mm512_storeu_si512, _mm512_unpackhi_epi16,
-        _mm512_unpacklo_epi16,
-    };
+fn native_checksum_parts() -> ChecksumParts {
+    static CHECKSUM: OnceLock<ChecksumParts> = OnceLock::new();
+    *CHECKSUM.get_or_init(|| {
+        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+            checksum_avx512
+        } else if is_x86_feature_detected!("avx2") {
+            checksum_avx2
+        } else {
+            checksum_sse2
+        }
+    })
+}
 
-    let mut sum = _mm512_setzero_si512();
-    let mut index = 0usize;
-    while index + 64 <= bytes.len() {
-        let vector = _mm512_loadu_si512(bytes.as_ptr().add(index).cast::<__m512i>());
-        let swapped = _mm512_or_si512(_mm512_slli_epi16(vector, 8), _mm512_srli_epi16(vector, 8));
-        let zero = _mm512_setzero_si512();
-        sum = _mm512_add_epi32(sum, _mm512_unpacklo_epi16(swapped, zero));
-        sum = _mm512_add_epi32(sum, _mm512_unpackhi_epi16(swapped, zero));
-        index += 64;
-    }
-    let mut lanes = [0u32; 16];
-    _mm512_storeu_si512(lanes.as_mut_ptr().cast::<__m512i>(), sum);
-    let mut total = lanes.into_iter().map(u64::from).sum::<u64>();
-    total = total.wrapping_add(accumulate_u64_words(&bytes[index..]));
-    total
+#[cfg(target_arch = "x86_64")]
+fn checksum_avx512(parts: &[&[u8]]) -> u16 {
+    unsafe { checksum_avx512_inner(parts) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn checksum_avx512_inner(parts: &[&[u8]]) -> u16 {
+    checksum_parts_with_simd::<64>(parts)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn checksum_avx2(parts: &[&[u8]]) -> u16 {
+    unsafe { checksum_avx2_inner(parts) }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn accumulate_avx2(bytes: &[u8]) -> u64 {
-    use core::arch::x86_64::{
-        __m256i, _mm256_add_epi32, _mm256_loadu_si256, _mm256_or_si256, _mm256_setzero_si256,
-        _mm256_slli_epi16, _mm256_srli_epi16, _mm256_storeu_si256, _mm256_unpackhi_epi16,
-        _mm256_unpacklo_epi16,
-    };
-
-    let mut sum = _mm256_setzero_si256();
-    let mut index = 0usize;
-    while index + 32 <= bytes.len() {
-        let vector = _mm256_loadu_si256(bytes.as_ptr().add(index).cast::<__m256i>());
-        let swapped = _mm256_or_si256(_mm256_slli_epi16(vector, 8), _mm256_srli_epi16(vector, 8));
-        let zero = _mm256_setzero_si256();
-        sum = _mm256_add_epi32(sum, _mm256_unpacklo_epi16(swapped, zero));
-        sum = _mm256_add_epi32(sum, _mm256_unpackhi_epi16(swapped, zero));
-        index += 32;
-    }
-    let mut lanes = [0u32; 8];
-    _mm256_storeu_si256(lanes.as_mut_ptr().cast::<__m256i>(), sum);
-    let mut total = lanes.into_iter().map(u64::from).sum::<u64>();
-    total = total.wrapping_add(accumulate_u64_words(&bytes[index..]));
-    total
+unsafe fn checksum_avx2_inner(parts: &[&[u8]]) -> u16 {
+    checksum_parts_with_simd::<32>(parts)
 }
 
 #[cfg(target_arch = "x86_64")]
-#[inline]
-fn accumulate_even_words(bytes: &[u8]) -> u64 {
-    use core::arch::x86_64::{
-        __m128i, _mm_add_epi32, _mm_loadu_si128, _mm_or_si128, _mm_setzero_si128, _mm_slli_epi16,
-        _mm_srli_epi16, _mm_storeu_si128, _mm_unpackhi_epi16, _mm_unpacklo_epi16,
-    };
-
-    if is_x86_feature_detected!("avx512f") {
-        unsafe { accumulate_avx512(bytes) }
-    } else if is_x86_feature_detected!("avx2") {
-        unsafe { accumulate_avx2(bytes) }
-    } else {
-        unsafe {
-            let mut sum = _mm_setzero_si128();
-            let mut index = 0usize;
-            while index + 16 <= bytes.len() {
-                let vector = _mm_loadu_si128(bytes.as_ptr().add(index).cast::<__m128i>());
-                let swapped = _mm_or_si128(_mm_slli_epi16(vector, 8), _mm_srli_epi16(vector, 8));
-                let zero = _mm_setzero_si128();
-                sum = _mm_add_epi32(sum, _mm_unpacklo_epi16(swapped, zero));
-                sum = _mm_add_epi32(sum, _mm_unpackhi_epi16(swapped, zero));
-                index += 16;
-            }
-            let mut lanes = [0u32; 4];
-            _mm_storeu_si128(lanes.as_mut_ptr().cast::<__m128i>(), sum);
-            let mut total = lanes.into_iter().map(u64::from).sum::<u64>();
-            total = total.wrapping_add(accumulate_u64_words(&bytes[index..]));
-            total
-        }
-    }
+fn checksum_sse2(parts: &[&[u8]]) -> u16 {
+    checksum_parts_with_simd::<16>(parts)
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline]
-fn accumulate_even_words(bytes: &[u8]) -> u64 {
-    use core::arch::aarch64::{
-        uint16x8_t, uint32x4_t, vaddlvq_u32, vaddq_u32, vget_high_u16, vget_low_u16, vld1q_u8,
-        vmovl_u16, vreinterpretq_u16_u8, vrev16q_u8,
-    };
-
-    unsafe {
-        let mut sum: uint32x4_t = core::mem::zeroed();
-        let mut index = 0usize;
-        while index + 16 <= bytes.len() {
-            let vector = vld1q_u8(bytes.as_ptr().add(index));
-            let swapped: uint16x8_t = vreinterpretq_u16_u8(vrev16q_u8(vector));
-            let lo = vmovl_u16(vget_low_u16(swapped));
-            let hi = vmovl_u16(vget_high_u16(swapped));
-            sum = vaddq_u32(sum, lo);
-            sum = vaddq_u32(sum, hi);
-            index += 16;
-        }
-        let mut total = u64::from(vaddlvq_u32(sum));
-        total = total.wrapping_add(accumulate_u64_words(&bytes[index..]));
-        total
-    }
+fn native_checksum_parts() -> ChecksumParts {
+    checksum_parts_with_simd::<16>
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-#[inline]
-fn accumulate_even_words(bytes: &[u8]) -> u64 {
-    accumulate_u64_words(bytes)
+fn native_checksum_parts() -> ChecksumParts {
+    checksum_parts_with_simd::<1>
 }
 
 #[inline]
@@ -194,7 +208,11 @@ const fn swap_bytes_in_each_u16(value: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{accumulate_u64_words, internet_checksum, internet_checksum_parts};
+    use core::hash::Hasher;
+
+    use super::{
+        InternetChecksum, accumulate_u64_words, internet_checksum, internet_checksum_parts,
+    };
 
     fn scalar_internet_checksum(bytes: &[u8]) -> u16 {
         let mut sum = 0u32;
@@ -233,6 +251,29 @@ mod tests {
         assert_eq!(
             internet_checksum_parts(&[&first, &second, &third]),
             scalar_internet_checksum(&combined)
+        );
+    }
+
+    #[test]
+    fn internet_checksum_hasher_preserves_words_across_odd_parts() {
+        let parts: [&[u8]; 5] = [&[0x01], &[], &[0x02, 0x03], &[0x04], &[0x05]];
+        let mut checksum = InternetChecksum::default();
+        for part in parts {
+            checksum.write(part);
+        }
+        assert_eq!(checksum.finish() as u16, internet_checksum(&[1, 2, 3, 4, 5]));
+    }
+
+    #[test]
+    fn internet_checksum_hasher_folds_long_incremental_input() {
+        let payload: Vec<u8> = (0..200_003).map(|value| value as u8).collect();
+        let mut checksum = InternetChecksum::default();
+        for part in payload.chunks(997) {
+            checksum.write(part);
+        }
+        assert_eq!(
+            checksum.finish() as u16,
+            scalar_internet_checksum(&payload)
         );
     }
 

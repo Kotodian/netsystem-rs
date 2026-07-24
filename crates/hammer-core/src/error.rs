@@ -105,8 +105,11 @@ pub enum DataPlaneError {
     HandoffNodeHandleMissing,
     #[error("named next fallback node is not registered")]
     NamedNextFallbackMissing,
-    #[error("configured data-plane instruction set is unsupported")]
-    UnsupportedDataPlaneInstructionSet,
+    #[error("duplicate node function for `{node}` at SIMD width {simd_bytes} bytes")]
+    DuplicateNodeFunction {
+        node: &'static str,
+        simd_bytes: usize,
+    },
     #[error("constructor-published graph registration is unnamed")]
     UnnamedGraphRegistration,
     #[error("active NUMA buffer pool is missing")]

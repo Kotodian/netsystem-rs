@@ -74,8 +74,6 @@ enum TunError {
     InterfaceNotRegistered { name: String },
     #[error("TUN interface {interface_index} has no MTU")]
     InterfaceMtuMissing { interface_index: u32 },
-    #[error("TUN RX queue for device {device_instance} has no TX queue on worker {worker}")]
-    RxQueueWithoutTx { device_instance: u32, worker: u32 },
     #[error("interface {interface_index} has no TUN TX queue on this worker")]
     TxQueueUnavailable { interface_index: u32 },
     #[error("TUN transmit packet is empty")]
@@ -243,25 +241,25 @@ impl TunControl {
             .map_err(|_| TunError::ControlRegistryPoisoned)?;
         let mut worker_rx_queues = Vec::with_capacity(rx_queues.len());
         let mut worker_tx_queues = Vec::with_capacity(assigned_tx_queues.len());
-        for queue in assigned_tx_queues {
-            let device = control_devices
-                .iter_mut()
-                .find(|device| device.device_instance == queue.device_instance)
-                .ok_or(TunError::Device(DeviceError::DeviceNotRegistered {
-                    device_instance: queue.device_instance,
-                }))?;
+        for device in control_devices.iter_mut() {
+            let rx_queue = rx_queues
+                .iter()
+                .find(|queue| queue.device_instance == device.device_instance)
+                .copied();
+            let has_tx_queue = assigned_tx_queues
+                .iter()
+                .any(|queue| queue.device_instance == device.device_instance);
+            if rx_queue.is_none() && !has_tx_queue {
+                continue;
+            }
             let fd = device
                 .worker_files
                 .get_mut(worker.slot())
                 .and_then(Option::take)
                 .ok_or(TunError::WorkerFileUnavailable {
-                    device_instance: queue.device_instance,
+                    device_instance: device.device_instance,
                     worker: worker.slot() as u32,
                 })?;
-            let rx_queue = rx_queues
-                .iter()
-                .find(|rx_queue| rx_queue.device_instance == queue.device_instance)
-                .copied();
             let queue_index = worker_rx_queues.len();
             let file_index = engine.file_main_mut().add(File::new(
                 fd,
@@ -291,21 +289,15 @@ impl TunControl {
                     pending: false,
                 });
             }
-            worker_tx_queues.push(TunTxQueue {
-                queue,
-                file_index,
-                tx_lock: Arc::clone(&device.tx_lock),
-                tx_iovecs: Vec::new(),
-            });
-        }
-        for queue in rx_queues {
-            if !worker_rx_queues.iter().any(|worker_queue| {
-                worker_queue.queue.device_instance == queue.device_instance
-                    && worker_queue.queue.queue_id == queue.queue_id
-            }) {
-                return Err(TunError::RxQueueWithoutTx {
-                    device_instance: queue.device_instance,
-                    worker: worker.slot() as u32,
+            for queue in assigned_tx_queues
+                .iter()
+                .filter(|queue| queue.device_instance == device.device_instance)
+            {
+                worker_tx_queues.push(TunTxQueue {
+                    queue: queue.clone(),
+                    file_index,
+                    tx_lock: Arc::clone(&device.tx_lock),
+                    tx_iovecs: Vec::new(),
                 });
             }
         }

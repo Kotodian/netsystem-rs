@@ -5,7 +5,9 @@ use abi_stable::{
     RRef,
     std_types::{RSlice, RSliceMut},
 };
+use core::hash::Hasher;
 use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId};
+use hammer_infra::checksum::InternetChecksum;
 #[cfg(test)]
 use hammer_runtime::InternalNode;
 use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
@@ -16,6 +18,8 @@ use hammer_service::opaque::NetworkOpaque;
 use std::mem::transmute;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 pub const DEFAULT_TCP_OUTPUT_PAYLOAD_LEN: usize = 1_440;
+const TCP_CHECKSUM_OFFSET: usize = 16;
+const TCP_PROTOCOL: u8 = 6;
 
 pub(crate) type IpOutputFunctions = RRef<'static, hammer_runtime::IpOutput_CTO<'static, 'static>>;
 
@@ -57,7 +61,7 @@ pub fn register_tcp_output(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> 
 impl Node for TcpOutputNode {
     #[inline(always)]
     fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
-        tcp_output_node_process_frame(runtime, frame)
+        tcp_output_node_process_frame::<1>(runtime, frame)
     }
 
     #[inline]
@@ -76,20 +80,30 @@ fn tcp_output_node_process(
     _: NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> NodeResult {
-    tcp_output_node_process_frame(runtime, frame)
+    tcp_output_node_process_frame::<1>(runtime, frame)
 }
 
-fn tcp_output_node_process_frame(
+#[hammer_component_macros::node_function(node = TcpOutputNode)]
+fn tcp_output_node_process_simd<const SIMD_BYTES: usize>(
+    runtime: &DataPlaneRuntime,
+    _: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> NodeResult {
+    tcp_output_node_process_frame::<SIMD_BYTES>(runtime, frame)
+}
+
+fn tcp_output_node_process_frame<const SIMD_BYTES: usize>(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
 ) -> NodeResult {
     let output = crate::TCP_MAIN.load_full().map(|main| main.ip_output());
     hammer_runtime::process_frame!(runtime, frame, |index| {
-        tcp_output_next_for_index(runtime, index, output).unwrap_or(TcpOutputNext::Drop)
+        tcp_output_next_for_index::<SIMD_BYTES>(runtime, index, output)
+            .unwrap_or(TcpOutputNext::Drop)
     })
 }
 
-fn tcp_output_next_for_index(
+fn tcp_output_next_for_index<const SIMD_BYTES: usize>(
     runtime: &DataPlaneRuntime,
     index: Index,
     output: Option<IpOutputFunctions>,
@@ -100,9 +114,16 @@ fn tcp_output_next_for_index(
         let _ = runtime.record_current_node_error(TcpOutputError::NoTcpHeader.code());
         return Ok(TcpOutputNext::Drop);
     }
-    let tcp_len = header.len();
+    let tcp_len = buffer
+        .current_len()
+        .checked_add(buffer.total_len_not_including_first());
     let endpoints = read_tcp_egress_endpoints(buffer.opaque2());
     drop(buffer);
+
+    let Some(tcp_len) = tcp_len else {
+        let _ = runtime.record_current_node_error(TcpOutputError::SegmentTooLong.code());
+        return Ok(TcpOutputNext::Drop);
+    };
 
     let Some((local, remote)) = endpoints else {
         let _ = runtime.record_current_node_error(TcpOutputError::MissingEgressEndpoints.code());
@@ -111,11 +132,22 @@ fn tcp_output_next_for_index(
 
     match (local, remote) {
         (IpAddr::V4(src), IpAddr::V4(dst)) => {
-            tcp_output_push_ipv4(runtime, index, src, dst, tcp_len, output)?;
+            let Some(total_len) = tcp_len
+                .checked_add(20)
+                .and_then(|length| u16::try_from(length).ok())
+            else {
+                let _ = runtime.record_current_node_error(TcpOutputError::SegmentTooLong.code());
+                return Ok(TcpOutputNext::Drop);
+            };
+            tcp_output_push_ipv4::<SIMD_BYTES>(runtime, index, src, dst, total_len, output)?;
             Ok(TcpOutputNext::Lookup)
         }
         (IpAddr::V6(src), IpAddr::V6(dst)) => {
-            tcp_output_push_ipv6(runtime, index, src, dst, tcp_len, output)?;
+            let Ok(payload_len) = u16::try_from(tcp_len) else {
+                let _ = runtime.record_current_node_error(TcpOutputError::SegmentTooLong.code());
+                return Ok(TcpOutputNext::Drop);
+            };
+            tcp_output_push_ipv6::<SIMD_BYTES>(runtime, index, src, dst, payload_len, output)?;
             Ok(TcpOutputNext::Lookup)
         }
         _ => {
@@ -126,23 +158,29 @@ fn tcp_output_next_for_index(
 }
 
 /// VPP `tcp_output_push_ip` → `vlib_buffer_push_ip4(..., is_df=1)`.
-fn tcp_output_push_ipv4(
+fn tcp_output_push_ipv4<const SIMD_BYTES: usize>(
     runtime: &DataPlaneRuntime,
     index: Index,
     src: Ipv4Addr,
     dst: Ipv4Addr,
-    tcp_len: usize,
+    total_len: u16,
     output: Option<IpOutputFunctions>,
 ) -> RuntimeResult<()> {
     const IPV4_HEADER_LEN: usize = 20;
-    let total_len = u16::try_from(IPV4_HEADER_LEN + tcp_len)
-        .map_err(|_| RuntimeError::invariant("tcp-output ipv4 total length overflow"))?;
+    let tcp_len = total_len - IPV4_HEADER_LEN as u16;
+    let mut checksum = InternetChecksum::<SIMD_BYTES>::default();
+    checksum.write(&src.octets());
+    checksum.write(&dst.octets());
+    checksum.write(&[0, TCP_PROTOCOL]);
+    checksum.write(&tcp_len.to_be_bytes());
+    set_tcp_checksum(runtime, index, checksum)?;
+
     let mut buffer = runtime.get_buffer_mut(index)?;
     {
         let header = buffer.prepend_mut(IPV4_HEADER_LEN)?;
-        write_ipv4_header(header, src, dst, 6, total_len, output)?;
+        write_ipv4_header(header, src, dst, TCP_PROTOCOL, total_len, output)?;
     }
-    let packet_len = buffer.current().len();
+    let packet_len = usize::from(total_len);
     let tcp_header_len = tcp_header(&buffer.current()[IPV4_HEADER_LEN..])
         .map(|tcp| tcp.header_len())
         .unwrap_or(20);
@@ -161,23 +199,28 @@ fn tcp_output_push_ipv4(
 }
 
 /// VPP `tcp_output_push_ip` IPv6 path (`vlib_buffer_push_ip6_custom`).
-fn tcp_output_push_ipv6(
+fn tcp_output_push_ipv6<const SIMD_BYTES: usize>(
     runtime: &DataPlaneRuntime,
     index: Index,
     src: Ipv6Addr,
     dst: Ipv6Addr,
-    tcp_len: usize,
+    payload_len: u16,
     output: Option<IpOutputFunctions>,
 ) -> RuntimeResult<()> {
     const IPV6_HEADER_LEN: usize = 40;
-    let payload_len = u16::try_from(tcp_len)
-        .map_err(|_| RuntimeError::invariant("tcp-output ipv6 payload length overflow"))?;
+    let mut checksum = InternetChecksum::<SIMD_BYTES>::default();
+    checksum.write(&src.octets());
+    checksum.write(&dst.octets());
+    checksum.write(&u32::from(payload_len).to_be_bytes());
+    checksum.write(&[0, 0, 0, TCP_PROTOCOL]);
+    set_tcp_checksum(runtime, index, checksum)?;
+
     let mut buffer = runtime.get_buffer_mut(index)?;
     {
         let header = buffer.prepend_mut(IPV6_HEADER_LEN)?;
-        write_ipv6_header(header, src, dst, 6, payload_len, output)?;
+        write_ipv6_header(header, src, dst, TCP_PROTOCOL, payload_len, output)?;
     }
-    let packet_len = buffer.current().len();
+    let packet_len = IPV6_HEADER_LEN + usize::from(payload_len);
     let tcp_header_len = tcp_header(&buffer.current()[IPV6_HEADER_LEN..])
         .map(|tcp| tcp.header_len())
         .unwrap_or(20);
@@ -192,6 +235,25 @@ fn tcp_output_push_ipv6(
     );
     network.ip_mut().set_ip_version(Some(6));
     network.ip_mut().set_ip_protocol(Some(6));
+    Ok(())
+}
+
+fn set_tcp_checksum<const SIMD_BYTES: usize>(
+    runtime: &DataPlaneRuntime,
+    index: Index,
+    mut checksum: InternetChecksum<SIMD_BYTES>,
+) -> RuntimeResult<()> {
+    {
+        let mut buffer = runtime.get_buffer_mut(index)?;
+        buffer.current_mut()[TCP_CHECKSUM_OFFSET..TCP_CHECKSUM_OFFSET + 2].fill(0);
+    }
+    for buffer in runtime.chain(index) {
+        checksum.write(buffer?.current());
+    }
+    let value = checksum.finish() as u16;
+    let mut buffer = runtime.get_buffer_mut(index)?;
+    buffer.current_mut()[TCP_CHECKSUM_OFFSET..TCP_CHECKSUM_OFFSET + 2]
+        .copy_from_slice(&value.to_be_bytes());
     Ok(())
 }
 
@@ -371,6 +433,7 @@ mod tests {
 
     use crate::{TcpCapabilities, TcpSegmentFlags};
     use hammer_core::data_plane::BufferFrame;
+    use hammer_infra::checksum::internet_checksum_parts;
     use hammer_runtime::NodeProcessFn;
 
     use super::*;
@@ -434,12 +497,15 @@ mod tests {
             Err(_) => return NodeResult::drop(),
         };
         for &index in frame.pending_indices() {
-            let packet = match runtime.get_buffer(index) {
-                Ok(buf) => buf.current().to_vec(),
-                Err(_) => return NodeResult::drop(),
-            };
+            let mut packet = Vec::new();
+            for buffer in runtime.chain(index) {
+                let Ok(buffer) = buffer else {
+                    return NodeResult::drop();
+                };
+                packet.extend_from_slice(buffer.current());
+            }
             match state.lock() {
-                Ok(mut guard) => guard.packets.push(packet.into()),
+                Ok(mut guard) => guard.packets.push(packet),
                 Err(_) => return NodeResult::drop(),
             }
         }
@@ -544,6 +610,104 @@ mod tests {
         assert_eq!(tcp[13] & TCP_FLAG_PSH, TCP_FLAG_PSH);
         assert_eq!(&tcp[14..16], &[0x10, 0x00]);
         assert_eq!(&tcp[20..], b"hello");
+        assert_eq!(
+            internet_checksum_parts(&[
+                &packet[12..16],
+                &packet[16..20],
+                &[0, TCP_PROTOCOL],
+                &(tcp.len() as u16).to_be_bytes(),
+                tcp,
+            ]),
+            0
+        );
+    }
+
+    #[test]
+    fn tcp_output_checksums_payload_across_an_odd_buffer_chain_boundary() {
+        let (runtime, lookup_state, drop_state, output) = output_graph();
+        let head = runtime.alloc_index().expect("head buffer");
+        runtime
+            .buffers()
+            .append(head, b"abc")
+            .expect("head payload");
+        test_segment(7)
+            .write_to_buffer(runtime.buffers(), head)
+            .expect("write segment");
+        let tail = runtime
+            .alloc_index_with_bytes(b"defg")
+            .expect("tail buffer");
+        runtime
+            .buffers()
+            .chain_buffer(head, tail)
+            .expect("chain payload");
+
+        send_to_output(&runtime, output, head);
+        assert_eq!(runtime.run_ready_nodes().expect("run output"), 2);
+
+        assert!(drop_state.lock().unwrap().packets.is_empty());
+        let packets = &lookup_state.lock().unwrap().packets;
+        assert_eq!(packets.len(), 1);
+        let packet = &packets[0];
+        assert_eq!(usize::from(u16::from_be_bytes([packet[2], packet[3]])), 47);
+        assert_eq!(&packet[40..], b"abcdefg");
+        assert_eq!(
+            internet_checksum_parts(&[
+                &packet[12..16],
+                &packet[16..20],
+                &[0, TCP_PROTOCOL],
+                &27u16.to_be_bytes(),
+                &packet[20..],
+            ]),
+            0
+        );
+    }
+
+    #[test]
+    fn tcp_output_checksums_ipv6_pseudo_header() {
+        let (runtime, lookup_state, drop_state, output) = output_graph();
+        let index = runtime.alloc_index().expect("buffer");
+        runtime
+            .buffers()
+            .append(index, b"hello")
+            .expect("payload");
+        TcpSegment::new(
+            "[2001:db8::10]:50000".parse().expect("local"),
+            "[2001:db8::20]:443".parse().expect("remote"),
+            100,
+            200,
+            4096,
+            TcpSegmentFlags::ACK | TcpSegmentFlags::PSH,
+            TcpCapabilities::default(),
+            None,
+            None,
+            None,
+            None,
+            5,
+        )
+        .write_to_buffer(runtime.buffers(), index)
+        .expect("write segment");
+
+        send_to_output(&runtime, output, index);
+        assert_eq!(runtime.run_ready_nodes().expect("run output"), 2);
+
+        assert!(drop_state.lock().unwrap().packets.is_empty());
+        let packets = &lookup_state.lock().unwrap().packets;
+        assert_eq!(packets.len(), 1);
+        let packet = &packets[0];
+        assert_eq!(packet[0] >> 4, 6);
+        assert_eq!(u16::from_be_bytes([packet[4], packet[5]]), 25);
+        assert_eq!(packet[6], TCP_PROTOCOL);
+        assert_eq!(packet[7], 255);
+        assert_eq!(
+            internet_checksum_parts(&[
+                &packet[8..24],
+                &packet[24..40],
+                &25u32.to_be_bytes(),
+                &[0, 0, 0, TCP_PROTOCOL],
+                &packet[40..],
+            ]),
+            0
+        );
     }
 
     #[test]

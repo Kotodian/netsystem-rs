@@ -14,7 +14,7 @@ use hammer_core::data_plane::{
 use hammer_core::error::DataPlaneError;
 
 use crate::trace::TraceFormatter;
-use crate::{DataPlaneInstructionSet, DataPlaneRuntime};
+use crate::{DataPlaneRuntime, Simd};
 
 pub mod next;
 
@@ -152,7 +152,7 @@ type NodeFunction = unsafe fn(&DataPlaneRuntime, NodeRuntimeData, &mut BufferFra
 #[doc(hidden)]
 pub struct NodeFunctionRegistration {
     node_name: &'static str,
-    instruction_set: DataPlaneInstructionSet,
+    simd_bytes: usize,
     function: NodeFunction,
 }
 
@@ -160,17 +160,18 @@ impl NodeFunctionRegistration {
     /// Creates a Node Function registration used by `#[node_function]`.
     ///
     /// # Safety
-    /// `function` must have no CPU requirements beyond `instruction_set` and
-    /// must obey the [`NodeFunction`] calling contract.
+    /// `function` must have no CPU requirements beyond `simd` and must obey
+    /// the [`NodeFunction`] calling contract.
     #[doc(hidden)]
-    pub const unsafe fn new(
+    pub const unsafe fn new<const LANES: usize>(
         node_name: &'static str,
-        instruction_set: DataPlaneInstructionSet,
+        _: Simd<u8, LANES>,
         function: unsafe fn(&DataPlaneRuntime, NodeRuntimeData, &mut BufferFrame) -> NodeResult,
     ) -> Self {
+        assert!(matches!(LANES, 1 | 16 | 32 | 64));
         Self {
             node_name,
-            instruction_set,
+            simd_bytes: core::mem::size_of::<Simd<u8, LANES>>(),
             function,
         }
     }
@@ -1013,36 +1014,31 @@ impl From<NodeRuntimeInner> for NodeRuntime {
 
 fn preferred_node_function<'registration>(
     node_name: &str,
-    instruction_set: DataPlaneInstructionSet,
+    max_simd_bytes: usize,
     registrations: &'registration [NodeFunctionRegistration],
 ) -> RuntimeResult<Option<&'registration NodeFunctionRegistration>> {
-    let mut seen = [false; DataPlaneInstructionSet::VARIANT_COUNT];
     let mut selected = None;
-    let mut selected_priority = 0;
 
-    for registration in registrations
-        .iter()
-        .filter(|registration| registration.node_name == node_name)
-    {
-        let slot = registration.instruction_set.slot();
-        if seen[slot] {
-            return Err(RuntimeError::invariant(format!(
-                "duplicate Node Function for `{node_name}` and {:?}",
-                registration.instruction_set
-            )));
-        }
-        seen[slot] = true;
-
-        if !registration.instruction_set.is_supported() {
+    for (offset, registration) in registrations.iter().enumerate() {
+        if registration.node_name != node_name {
             continue;
         }
-        let Some(priority) = instruction_set.candidate_priority(registration.instruction_set)
-        else {
+        if registrations[..offset].iter().any(|previous| {
+            previous.node_name == node_name && previous.simd_bytes == registration.simd_bytes
+        }) {
+            return Err(DataPlaneError::DuplicateNodeFunction {
+                node: registration.node_name,
+                simd_bytes: registration.simd_bytes,
+            }
+            .into());
+        }
+        if registration.simd_bytes > max_simd_bytes {
             continue;
-        };
-        if selected.is_none() || priority > selected_priority {
+        }
+        if selected.is_none_or(|current: &NodeFunctionRegistration| {
+            registration.simd_bytes > current.simd_bytes
+        }) {
             selected = Some(registration);
-            selected_priority = priority;
         }
     }
 
@@ -1098,23 +1094,34 @@ mod node_function_tests {
     }
 
     #[test]
-    fn duplicate_instruction_set_is_rejected() {
+    fn duplicate_simd_width_is_rejected() {
         let duplicate = NodeFunctionRegistration {
             node_name: "fixture",
-            instruction_set: DataPlaneInstructionSet::Scalar,
+            simd_bytes: 1,
             function: missing_node_process,
         };
 
-        let error = match preferred_node_function(
-            "fixture",
-            DataPlaneInstructionSet::Scalar,
-            &[duplicate, duplicate],
-        ) {
+        let error = match preferred_node_function("fixture", 1, &[duplicate, duplicate]) {
             Err(error) => error,
             Ok(_) => panic!("duplicate Node Function must fail"),
         };
 
-        assert!(error.to_string().contains("duplicate Node Function"));
+        assert!(error.to_string().contains("duplicate node function"));
+    }
+
+    #[test]
+    fn node_function_selects_the_widest_candidate_within_runtime_capacity() {
+        let candidates = [1, 16, 32, 64].map(|simd_bytes| NodeFunctionRegistration {
+            node_name: "fixture",
+            simd_bytes,
+            function: missing_node_process,
+        });
+
+        let selected = preferred_node_function("fixture", 32, &candidates)
+            .expect("select Node Function")
+            .expect("matching Node Function");
+
+        assert_eq!(selected.simd_bytes, 32);
     }
 
     #[test]
@@ -1310,7 +1317,7 @@ impl NodeRuntime {
     pub(crate) fn install_node_function(
         &self,
         node: NodeId,
-        instruction_set: DataPlaneInstructionSet,
+        simd_bytes: usize,
         registrations: &[NodeFunctionRegistration],
     ) -> RuntimeResult<()> {
         self.ensure_topology_owner()?;
@@ -1318,7 +1325,7 @@ impl NodeRuntime {
             return Ok(());
         };
         let Some(registration) =
-            preferred_node_function(node_name, instruction_set, registrations)?
+            preferred_node_function(node_name, simd_bytes, registrations)?
         else {
             return Ok(());
         };

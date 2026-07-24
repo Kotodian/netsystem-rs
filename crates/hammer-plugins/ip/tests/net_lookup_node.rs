@@ -8,8 +8,8 @@ use hammer_plugin_ip::forwarding::{
 };
 use hammer_plugin_ip::protocol::icmp::IcmpErrorMetadata;
 use hammer_plugin_ip::{
-    AdjacencyRewriteNode, AdjacencyRewriteTrace, IpInputNext, IpInputNode, IpLocalControlPlane,
-    IpLocalNext, IpLookupControlPlane, IpLookupTrace, IpUnicastArc,
+    AdjacencyRewriteNext, AdjacencyRewriteNode, AdjacencyRewriteTrace, IpInputNext, IpInputNode,
+    IpLocalControlPlane, IpLocalNext, IpLookupControlPlane, IpLookupTrace, IpUnicastArc,
 };
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
@@ -939,7 +939,10 @@ fn adjacency_rewrite_node_drops_missing_forwarding_and_missing_adjacency() {
     let rewrite_node = runtime
         .nodes()
         .register_internal(AdjacencyRewriteNode::new(control.table_handle()));
-    next_slot(&runtime, rewrite_node, drop);
+    runtime
+        .nodes()
+        .set_node_next(rewrite_node, AdjacencyRewriteNext::Drop, drop)
+        .expect("register rewrite drop next");
     let mut frame = runtime
         .buffers()
         .get_next_frame(rewrite_node)

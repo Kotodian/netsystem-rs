@@ -1,17 +1,10 @@
 use hammer_core::data_plane::{BufferPoolArena, DataPlaneBuffers, NodeId};
 use hammer_infra::PageSize;
 use hammer_runtime::{
-    DataPlaneBufferConfig, DataPlaneHandoff, DataPlaneInstructionSet, DataPlaneRuntime,
-    DataPlaneRuntimeConfig, DataWorkerId,
+    DataPlaneBufferConfig, DataPlaneHandoff, DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId,
 };
 
-fn runtime_config(
-    slot_capacity: usize,
-    slots: usize,
-    frame_slots: usize,
-    instruction_set: DataPlaneInstructionSet,
-) -> DataPlaneRuntimeConfig {
-    let _ = instruction_set;
+fn runtime_config(slot_capacity: usize, slots: usize, frame_slots: usize) -> DataPlaneRuntimeConfig {
     DataPlaneRuntimeConfig {
         buffers: DataPlaneBufferConfig {
             buffer_slot_capacity: slot_capacity,
@@ -41,14 +34,10 @@ fn runtime_with_numa(
 fn runtime_with_handoff_arena(
     arena: BufferPoolArena,
     frame_slots: usize,
-    instruction_set: DataPlaneInstructionSet,
 ) -> DataPlaneRuntime {
     let handoff = DataPlaneHandoff::new_shared_buffer_arena(1, frame_slots.max(1), arena);
     DataPlaneRuntime::attach_handoff_worker(
-        DataPlaneRuntime::new_with_instruction_set(
-            runtime_config(1, 1, frame_slots, instruction_set),
-            instruction_set,
-        ),
+        DataPlaneRuntime::new(runtime_config(1, 1, frame_slots)),
         handoff.worker(DataWorkerId::new(0)),
     )
 }
@@ -143,7 +132,7 @@ fn config_constructor_resolves_active_numa_to_configured_node() {
 fn handoff_arena_constructor_uses_arena_numa_identity() {
     let arena = BufferPoolArena::with_capacity_on_numa(1024, 16, PageSize::Default, 3)
         .expect("create NUMA 3 arena");
-    let runtime = runtime_with_handoff_arena(arena, 4, DataPlaneInstructionSet::Scalar);
+    let runtime = runtime_with_handoff_arena(arena, 4);
     let buffers = runtime.buffers();
 
     assert_eq!(buffers.active_numa_node(), 3);
@@ -160,10 +149,7 @@ fn handoff_capacities_preserve_handoff_arena_numa_identity() {
             .expect("create NUMA 3 arena"),
     );
     let runtime = DataPlaneRuntime::attach_handoff_worker(
-        DataPlaneRuntime::new_with_instruction_set(
-            runtime_config(1, 1, 4, DataPlaneInstructionSet::Scalar),
-            DataPlaneInstructionSet::Scalar,
-        ),
+        DataPlaneRuntime::new(runtime_config(1, 1, 4)),
         handoff.worker(DataWorkerId::new(0)),
     );
 
@@ -180,10 +166,7 @@ fn handoff_worker_runtime_falls_back_to_configured_nonzero_numa_arena() {
             .expect("create NUMA 3 arena"),
     );
     let runtime = DataPlaneRuntime::attach_handoff_worker(
-        DataPlaneRuntime::new_with_instruction_set(
-            runtime_config(1, 1, 4, DataPlaneInstructionSet::Scalar),
-            DataPlaneInstructionSet::Scalar,
-        ),
+        DataPlaneRuntime::new(runtime_config(1, 1, 4)),
         handoff.worker(DataWorkerId::new(0)),
     );
 

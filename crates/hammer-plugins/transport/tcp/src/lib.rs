@@ -18,7 +18,12 @@ hammer_component_macros::declare_plugin!(
         rcv_process::__TCP_WORKER_GRAPH_NODE_TCP_RCV_PROCESS_NODE,
         syn_sent::__TCP_WORKER_GRAPH_NODE_TCP_SYN_SENT_NODE,
     ],
-    node_functions = [],
+    node_functions = [
+        output::__NODE_FUNCTION_TCP_OUTPUT_NODE_PROCESS_SIMD_SCALAR,
+        output::__NODE_FUNCTION_TCP_OUTPUT_NODE_PROCESS_SIMD_SIMD128,
+        output::__NODE_FUNCTION_TCP_OUTPUT_NODE_PROCESS_SIMD_SIMD256,
+        output::__NODE_FUNCTION_TCP_OUTPUT_NODE_PROCESS_SIMD_SIMD512,
+    ],
     process_nodes = [],
 );
 
@@ -772,6 +777,8 @@ pub enum TcpOutputError {
     UnsupportedEgress,
     #[error("IP output service is unavailable")]
     IpOutputUnavailable,
+    #[error("TCP segment is too long for its IP packet")]
+    SegmentTooLong,
 }
 
 impl TcpOutputError {

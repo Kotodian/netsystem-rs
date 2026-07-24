@@ -8,8 +8,8 @@ use hammer_runtime::RuntimeRegistry;
 use hammer_runtime::config::Worker;
 use hammer_runtime::start_workers::start_workers;
 use hammer_runtime::{
-    DataPlaneInstructionSet, DataPlaneRuntime, Engine, EnginePool, InternalNode, Node,
-    NodeDescriptor, NodeProcessFn, NodeResult, NodeRuntimeData, RuntimeError, RuntimeResult,
+    DataPlaneRuntime, Engine, EnginePool, InternalNode, Node, NodeDescriptor, NodeProcessFn,
+    NodeResult, NodeRuntimeData, RuntimeError, RuntimeResult,
 };
 
 hammer_runtime::__declare_registration_image!(
@@ -103,10 +103,6 @@ fn verify_worker_startup_contract(engine: &mut Engine) -> RuntimeResult<()> {
         engine.runtime.nodes().node_state(node)?,
         NodeState::Disabled
     );
-    assert_eq!(
-        engine.runtime.instruction_set(),
-        DataPlaneInstructionSet::Scalar
-    );
     assert_eq!(engine.runtime.buffers().frame_slots(), 5);
 
     let topology_error = engine
@@ -181,7 +177,6 @@ fn engine_pool() -> EnginePool {
     worker.buffer.slots_per_numa = 64;
     worker.buffer.frame_pool_size = 5;
     worker.buffer.page_size = Some(hammer_infra::PageSize::Default);
-    worker.instruction_set = "scalar".to_owned();
     let mut engine =
         Engine::new_configured(RuntimeRegistry::new(), worker).expect("configured main engine");
     let sink = engine

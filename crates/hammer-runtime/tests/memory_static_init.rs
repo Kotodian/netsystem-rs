@@ -1,6 +1,6 @@
 use hammer_runtime::DataPlaneBufferConfig;
 use hammer_runtime::RuntimeRegistry;
-use hammer_runtime::{DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig, Engine};
+use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, Engine};
 
 fn runtime_config(numa_nodes: &'static [u32], active_numa_node: u32) -> DataPlaneRuntimeConfig {
     DataPlaneRuntimeConfig {
@@ -16,7 +16,7 @@ fn runtime_config(numa_nodes: &'static [u32], active_numa_node: u32) -> DataPlan
 }
 
 #[test]
-fn memory_init_materializes_the_configured_buffer_and_instruction_set_policy() {
+fn memory_init_materializes_the_configured_buffer_policy() {
     let registry = RuntimeRegistry::new();
     let mut engine = Engine::new(DataPlaneRuntime::new(runtime_config(&[0], 0)), registry);
 
@@ -24,8 +24,6 @@ fn memory_init_materializes_the_configured_buffer_and_instruction_set_policy() {
         .configure_early(
             r#"
 [worker]
-instruction_set = "scalar"
-
 [worker.buffer]
 slot_bytes = 4096
 slots_per_numa = 7
@@ -34,10 +32,6 @@ frame_pool_size = 5
         )
         .expect("configured worker config dispatch");
 
-    assert_eq!(
-        engine.runtime.instruction_set(),
-        DataPlaneInstructionSet::Scalar
-    );
     assert_eq!(engine.runtime.buffers().frame_slots(), 5);
     engine
         .runtime

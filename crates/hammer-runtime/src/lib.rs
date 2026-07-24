@@ -46,20 +46,20 @@ pub mod registry;
 
 pub use error::{AttachError, RuntimeError, RuntimeResult};
 pub use hammer_infra::hint::unlikely;
+pub use hammer_infra::simd::Simd;
 
 pub mod app;
 pub mod attach;
 mod control_thread;
 pub mod data_plane;
 pub mod handoff;
-pub mod instruction_set;
+mod runtime_simd;
 pub mod network;
 pub mod node;
 pub mod trace;
 pub use data_plane::{DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig};
 pub use hammer_core::data_plane::FrameBatchWidth;
 pub use handoff::{DataPlaneHandoff, DataPlaneHandoffWorker, DataWorkerId};
-pub use instruction_set::DataPlaneInstructionSet;
 pub use metrics::{
     MetricCounter, MetricGauge, MetricKind, MetricLabel, MetricSample, MetricsRegistry,
     MetricsScope, RegistryRecorder,

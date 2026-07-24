@@ -10,8 +10,8 @@ use hammer_plugin_ip::forwarding::{DpoProto, FibTableBuilder, ForwardingMetadata
 use hammer_plugin_ip::{IpInputNext, IpInputNode, IpLookupControlPlane, IpUnicastArc};
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
-    DataPlaneBufferConfig, DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig,
-    InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
+    DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node,
+    NodeProcessFn, NodeResult, NodeRuntimeData,
 };
 use hammer_service::data_plane::DropNode;
 use hammer_service::opaque::{NetworkOpaque, TapEthernetMetadata};
@@ -22,11 +22,10 @@ const FRAME_ROUNDS: usize = 512;
 const SAMPLE_COUNT: usize = 5;
 static PERF_PROBE_LOCK: Mutex<()> = Mutex::new(());
 
-fn test_runtime_configured_instruction_set(
+fn test_runtime(
     buffer_slot_capacity: usize,
     buffer_slots: usize,
     frame_slots: usize,
-    instruction_set: DataPlaneInstructionSet,
 ) -> DataPlaneRuntime {
     let config = DataPlaneRuntimeConfig {
         buffers: DataPlaneBufferConfig {
@@ -36,7 +35,7 @@ fn test_runtime_configured_instruction_set(
             ..DataPlaneBufferConfig::default()
         },
     };
-    DataPlaneRuntime::new_with_instruction_set(config, instruction_set)
+    DataPlaneRuntime::new(config)
 }
 
 #[derive(Clone, Copy, Default)]
@@ -147,27 +146,19 @@ fn ip_lookup_frame_batch_perf_probe() {
     ];
     for scenario in scenarios {
         let packet_scalar = measure_packet_scalar_samples(scenario);
-        let frame_pair = measure_lookup_samples(scenario, DataPlaneInstructionSet::Scalar);
-        let frame_native = measure_lookup_samples(scenario, DataPlaneInstructionSet::native());
+        let frame_native = measure_lookup_samples(scenario);
         assert_eq!(packet_scalar.best.packets, FRAME_PACKETS * FRAME_ROUNDS);
-        assert_eq!(frame_pair.best.packets, packet_scalar.best.packets);
         assert_eq!(frame_native.best.packets, packet_scalar.best.packets);
-        assert_eq!(frame_pair.best.checksum, packet_scalar.best.checksum);
         assert_eq!(frame_native.best.checksum, packet_scalar.best.checksum);
 
         eprintln!(
-            "{scenario:?}: samples={SAMPLE_COUNT} rounds={FRAME_ROUNDS} frame_packets={FRAME_PACKETS} packet_scalar_best={:.2} packet_scalar_median={:.2} ns/packet frame_pair_best={:.2} frame_pair_median={:.2} ns/packet frame_native({:?})_best={:.2} frame_native_median={:.2} ns/packet vector_vs_packet_best_ratio={:.3} native_vs_pair_best_ratio={:.3} checksum={} / {} / {}",
+            "{scenario:?}: samples={SAMPLE_COUNT} rounds={FRAME_ROUNDS} frame_packets={FRAME_PACKETS} packet_scalar_best={:.2} packet_scalar_median={:.2} ns/packet frame_native_best={:.2} frame_native_median={:.2} ns/packet vector_vs_packet_best_ratio={:.3} checksum={} / {}",
             packet_scalar.best.ns_per_packet(),
             packet_scalar.median.ns_per_packet(),
-            frame_pair.best.ns_per_packet(),
-            frame_pair.median.ns_per_packet(),
-            DataPlaneInstructionSet::native(),
             frame_native.best.ns_per_packet(),
             frame_native.median.ns_per_packet(),
             frame_native.best.ns_per_packet() / packet_scalar.best.ns_per_packet(),
-            frame_native.best.ns_per_packet() / frame_pair.best.ns_per_packet(),
             packet_scalar.best.checksum,
-            frame_pair.best.checksum,
             frame_native.best.checksum,
         );
     }
@@ -184,22 +175,13 @@ fn ip_input_lookup_frame_batch_perf_probe() {
         Scenario::Ipv6SameNext,
     ];
     for scenario in scenarios {
-        let pipeline_pair = measure_input_lookup_samples(scenario, DataPlaneInstructionSet::Scalar);
-        let pipeline_native =
-            measure_input_lookup_samples(scenario, DataPlaneInstructionSet::native());
-        assert_eq!(pipeline_pair.best.packets, FRAME_PACKETS * FRAME_ROUNDS);
-        assert_eq!(pipeline_native.best.packets, pipeline_pair.best.packets);
-        assert_eq!(pipeline_native.best.checksum, pipeline_pair.best.checksum);
+        let pipeline_native = measure_input_lookup_samples(scenario);
+        assert_eq!(pipeline_native.best.packets, FRAME_PACKETS * FRAME_ROUNDS);
 
         eprintln!(
-            "InputLookup::{scenario:?}: samples={SAMPLE_COUNT} rounds={FRAME_ROUNDS} frame_packets={FRAME_PACKETS} pipeline_pair_best={:.2} pipeline_pair_median={:.2} ns/packet pipeline_native({:?})_best={:.2} pipeline_native_median={:.2} ns/packet native_vs_pair_best_ratio={:.3} checksum={} / {}",
-            pipeline_pair.best.ns_per_packet(),
-            pipeline_pair.median.ns_per_packet(),
-            DataPlaneInstructionSet::native(),
+            "InputLookup::{scenario:?}: samples={SAMPLE_COUNT} rounds={FRAME_ROUNDS} frame_packets={FRAME_PACKETS} pipeline_native_best={:.2} pipeline_native_median={:.2} ns/packet checksum={}",
             pipeline_native.best.ns_per_packet(),
             pipeline_native.median.ns_per_packet(),
-            pipeline_native.best.ns_per_packet() / pipeline_pair.best.ns_per_packet(),
-            pipeline_pair.best.checksum,
             pipeline_native.best.checksum,
         );
     }
@@ -222,13 +204,10 @@ fn measure_packet_scalar_samples(scenario: Scenario) -> ProbeSummary {
     }
 }
 
-fn measure_lookup_samples(
-    scenario: Scenario,
-    instruction_set: DataPlaneInstructionSet,
-) -> ProbeSummary {
+fn measure_lookup_samples(scenario: Scenario) -> ProbeSummary {
     let mut samples = Vec::with_capacity(SAMPLE_COUNT);
     for _ in 0..SAMPLE_COUNT {
-        samples.push(measure_lookup(scenario, instruction_set));
+        samples.push(measure_lookup(scenario));
     }
     samples.sort_by(|left, right| {
         left.ns_per_packet()
@@ -241,13 +220,10 @@ fn measure_lookup_samples(
     }
 }
 
-fn measure_input_lookup_samples(
-    scenario: Scenario,
-    instruction_set: DataPlaneInstructionSet,
-) -> ProbeSummary {
+fn measure_input_lookup_samples(scenario: Scenario) -> ProbeSummary {
     let mut samples = Vec::with_capacity(SAMPLE_COUNT);
     for _ in 0..SAMPLE_COUNT {
-        samples.push(measure_input_lookup(scenario, instruction_set));
+        samples.push(measure_input_lookup(scenario));
     }
     samples.sort_by(|left, right| {
         left.ns_per_packet()
@@ -261,8 +237,7 @@ fn measure_input_lookup_samples(
 }
 
 fn measure_packet_scalar(scenario: Scenario) -> ProbeStats {
-    let runtime =
-        test_runtime_configured_instruction_set(2048, 1, 2, DataPlaneInstructionSet::Scalar);
+    let runtime = test_runtime(2048, 1, 2);
     let counters = Arc::new(SinkCounters::default());
     let lookup = build_lookup(&runtime, scenario, &counters);
     let packets_by_frame = build_packets(scenario);
@@ -290,8 +265,8 @@ fn measure_packet_scalar(scenario: Scenario) -> ProbeStats {
     }
 }
 
-fn measure_lookup(scenario: Scenario, instruction_set: DataPlaneInstructionSet) -> ProbeStats {
-    let runtime = test_runtime_configured_instruction_set(2048, FRAME_PACKETS, 32, instruction_set);
+fn measure_lookup(scenario: Scenario) -> ProbeStats {
+    let runtime = test_runtime(2048, FRAME_PACKETS, 32);
     let counters = Arc::new(SinkCounters::default());
     let lookup = build_lookup(&runtime, scenario, &counters);
     let packets_by_frame = build_packets(scenario);
@@ -319,11 +294,8 @@ fn measure_lookup(scenario: Scenario, instruction_set: DataPlaneInstructionSet) 
     }
 }
 
-fn measure_input_lookup(
-    scenario: Scenario,
-    instruction_set: DataPlaneInstructionSet,
-) -> ProbeStats {
-    let runtime = test_runtime_configured_instruction_set(2048, FRAME_PACKETS, 32, instruction_set);
+fn measure_input_lookup(scenario: Scenario) -> ProbeStats {
+    let runtime = test_runtime(2048, FRAME_PACKETS, 32);
     let counters = Arc::new(SinkCounters::default());
     let input = build_input_lookup(&runtime, scenario, &counters);
     let packets_by_frame = build_packets(scenario);
