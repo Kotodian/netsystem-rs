@@ -939,6 +939,7 @@ fn adjacency_rewrite_node_drops_missing_forwarding_and_missing_adjacency() {
     let rewrite_node = runtime
         .nodes()
         .register_internal(AdjacencyRewriteNode::new(control.table_handle()));
+    next_slot(&runtime, rewrite_node, drop);
     let mut frame = runtime
         .buffers()
         .get_next_frame(rewrite_node)
