@@ -10,8 +10,9 @@ use abi_stable::{
     RRef, StableAbi,
     library::RootModule,
     sabi_trait,
-    std_types::{ROption, RSlice, RSliceMut, RStr},
+    std_types::{RBoxError, ROption, RResult, RSlice, RSliceMut, RStr},
 };
+use hammer_core::data_plane::NodeId;
 use object::{Object, ObjectSection};
 use semver::Version;
 use serde::Deserialize;
@@ -23,7 +24,7 @@ use crate::plugin_loader::{PluginLibrary, read_plugin_module};
 use crate::process::ProcessEntry;
 use crate::registration::RegistrationImage;
 
-/// The two IP header writers exposed to transport plugins.
+/// IP protocol dispatch and header writers exposed to transport plugins.
 ///
 /// The implementation belongs to the IP plugin. This interface is part of
 /// Runtime's single dynamic-plugin root contract so `PluginMain` can retain it
@@ -47,6 +48,12 @@ pub trait IpOutput: Send + Sync {
         next_header: u8,
         payload_len: u16,
     ) -> bool;
+
+    /// Connects IP local delivery to `node` while the main thread owns graph
+    /// topology. IP owns the resulting next slot; the transport observes only
+    /// success or the source-preserving cross-DSO error.
+    #[sabi(last_prefix_field)]
+    fn register_protocol(&self, protocol: u8, node: NodeId) -> RResult<(), RBoxError>;
 }
 
 /// Metadata owned by one dynamically loaded plugin module.
@@ -101,9 +108,9 @@ impl PluginMetadata {
 
 /// The sole `abi_stable` root module exported by every Hammer plugin DSO.
 ///
-/// IP is currently the only plugin exposing a callable cross-plugin service,
-/// and it exposes exactly its IPv4 and IPv6 header writers. Other plugins
-/// publish `ROption::RNone`.
+/// IP is currently the only plugin exposing a callable cross-plugin service.
+/// Its interface owns IPv4/IPv6 header construction and protocol dispatch;
+/// other plugins publish `ROption::RNone`.
 #[repr(C)]
 #[derive(StableAbi)]
 #[sabi(kind(Prefix(prefix_ref = PluginModuleRef)))]

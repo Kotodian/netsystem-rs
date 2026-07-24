@@ -269,9 +269,18 @@ pub struct UdpInputNode {
 
 fn register_udp_input(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     let control = UdpInputControlPlane::new();
-    runtime
+    let node = runtime
         .nodes()
-        .try_register_internal_with_next_names(control.node(), &UdpInputNext::NEXT_NAMES)
+        .try_register_internal_with_next_names(control.node(), &UdpInputNext::NEXT_NAMES)?;
+    let output = super::IP_OUTPUT.get().ok_or_else(|| {
+        RuntimeError::lifecycle("udp graph registration", "IP output is unavailable")
+    })?;
+    output
+        .get()
+        .register_protocol(17, node)
+        .into_result()
+        .map_err(|error| RuntimeError::subsystem("ip protocol registration", error))?;
+    Ok(node)
 }
 
 impl Node for UdpInputNode {

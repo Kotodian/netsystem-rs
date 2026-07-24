@@ -416,10 +416,18 @@ fn configured_tcp_main(
 }
 
 pub fn register_tcp_input(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
-    runtime
-        .nodes()
-        .node_by_name("tcp-input")
-        .ok_or_else(|| RuntimeError::invariant("TCP worker graph is not registered"))
+    let node = runtime.nodes().node_by_name("tcp-input").ok_or_else(|| {
+        RuntimeError::lifecycle("tcp graph registration", "tcp-input is not registered")
+    })?;
+    let main = TCP_MAIN.load_full().ok_or_else(|| {
+        RuntimeError::lifecycle("tcp graph registration", "TCP main is not initialized")
+    })?;
+    main.ip_output()
+        .get()
+        .register_protocol(6, node)
+        .into_result()
+        .map_err(|error| RuntimeError::subsystem("ip protocol registration", error))?;
+    Ok(node)
 }
 
 fn register_typed_main_graph<C, Seg>(
@@ -1115,8 +1123,9 @@ mod init_tests {
     use abi_stable::{
         RRef,
         sabi_trait::TD_Opaque,
-        std_types::{RSlice, RSliceMut},
+        std_types::{RBoxError, ROk, RResult, RSlice, RSliceMut},
     };
+    use hammer_core::data_plane::NodeId;
     use hammer_runtime::IpOutput;
     use hammer_runtime::RuntimeRegistry;
     use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, Engine};
@@ -1126,6 +1135,10 @@ mod init_tests {
     struct TestIpOutput;
 
     impl IpOutput for TestIpOutput {
+        fn register_protocol(&self, _: u8, _: NodeId) -> RResult<(), RBoxError> {
+            ROk(())
+        }
+
         fn write_ipv4_header(
             &self,
             _: RSliceMut<'_, u8>,

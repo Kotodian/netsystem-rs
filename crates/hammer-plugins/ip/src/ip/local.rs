@@ -39,10 +39,6 @@ pub enum IpLocalNext {
     Drop,
     #[next("drop")]
     Punt,
-    #[next("drop")]
-    Tcp,
-    #[next("drop")]
-    Udp,
     #[next("icmp-input")]
     Icmp,
     #[next("ip-reassembly")]
@@ -94,6 +90,7 @@ impl Default for IpLocalSourceCheck {
     }
 }
 
+#[derive(Clone)]
 pub struct IpLocalControlPlane {
     inner: Arc<ArcSwap<IpLocalState>>,
 }
@@ -122,18 +119,13 @@ impl IpLocalControlPlane {
         IpReceiveNode::new(IpLocalStateHandle::new(Arc::clone(&self.inner)))
     }
 
-    /// Publish a consumer-local next slot for `protocol`.
-    ///
-    /// Control registers the target via `add_node_next_slot` on the IpLocal
-    /// consumer, then stores only the returned `u16` in the snapshot.
     #[inline]
-    pub fn register_protocol(&self, protocol: u8, slot: u16) -> RuntimeResult<()> {
+    fn publish_protocol_slot(&self, protocol: u8, slot: u16) {
         self.inner.rcu(|current| {
             let mut next = IpLocalState::clone(current);
             next.protocol_nexts[protocol as usize] = Some(slot);
             next
         });
-        Ok(())
     }
 
     #[inline]
@@ -240,6 +232,24 @@ std::thread_local! {
     static PENDING_IP_LOCAL_CONTROL: RefCell<Option<IpLocalControlPlane>> = const {
         RefCell::new(None)
     };
+    static IP_LOCAL_PROTOCOL_REGISTRATION: RefCell<
+        Option<(IpLocalControlPlane, hammer_runtime::node::NodeRuntime, NodeId)>,
+    > = const { RefCell::new(None) };
+}
+
+pub(crate) fn register_protocol(protocol: u8, node: NodeId) -> RuntimeResult<()> {
+    IP_LOCAL_PROTOCOL_REGISTRATION.with(|registration| {
+        let registration = registration.borrow();
+        let (control, nodes, consumer) = registration.as_ref().ok_or_else(|| {
+            RuntimeError::lifecycle(
+                "ip protocol registration",
+                "ip-local graph node is not registered",
+            )
+        })?;
+        let slot = nodes.add_node_next_slot(*consumer, node)?;
+        control.publish_protocol_slot(protocol, slot);
+        Ok(())
+    })
 }
 
 fn register_ip_local(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
@@ -247,6 +257,9 @@ fn register_ip_local(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     let node = runtime
         .nodes()
         .try_register_internal_with_next_names(control.node(), &IpLocalNext::NEXT_NAMES)?;
+    IP_LOCAL_PROTOCOL_REGISTRATION.with(|registration| {
+        *registration.borrow_mut() = Some((control.clone(), runtime.nodes().clone(), node));
+    });
     PENDING_IP_LOCAL_CONTROL.with(|pending| {
         *pending.borrow_mut() = Some(control);
     });
@@ -755,10 +768,10 @@ fn ip_protocol_number(protocol: IpProtocol) -> u8 {
 #[inline(always)]
 fn default_protocol_slot(protocol: IpProtocol) -> u16 {
     match protocol {
-        IpProtocol::Tcp => NodeNext::slot(IpLocalNext::Tcp),
-        IpProtocol::Udp => NodeNext::slot(IpLocalNext::Udp),
         IpProtocol::Icmpv4 | IpProtocol::Icmpv6 => NodeNext::slot(IpLocalNext::Icmp),
-        IpProtocol::Other(_) => NodeNext::slot(IpLocalNext::Punt),
+        IpProtocol::Tcp | IpProtocol::Udp | IpProtocol::Other(_) => {
+            NodeNext::slot(IpLocalNext::Punt)
+        }
     }
 }
 
@@ -798,7 +811,7 @@ mod tests {
 
         assert_eq!(
             state.protocol_next_slot(IpProtocol::Tcp),
-            NodeNext::slot(IpLocalNext::Tcp)
+            NodeNext::slot(IpLocalNext::Punt)
         );
         assert_eq!(
             state.protocol_next_slot(IpProtocol::Other(99)),

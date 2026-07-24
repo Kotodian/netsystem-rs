@@ -2,8 +2,9 @@
 
 use abi_stable::{
     sabi_trait::TD_Opaque,
-    std_types::{RSlice, RSliceMut},
+    std_types::{RBoxError, RErr, ROk, RResult, RSlice, RSliceMut},
 };
+use hammer_core::data_plane::NodeId;
 use hammer_runtime::IpOutput;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -48,6 +49,13 @@ pub mod protocol;
 struct IpOutputService;
 
 impl IpOutput for IpOutputService {
+    fn register_protocol(&self, protocol: u8, node: NodeId) -> RResult<(), RBoxError> {
+        match ip::local::register_protocol(protocol, node) {
+            Ok(()) => ROk(()),
+            Err(error) => RErr(RBoxError::new(error)),
+        }
+    }
+
     fn write_ipv4_header(
         &self,
         mut output: RSliceMut<'_, u8>,

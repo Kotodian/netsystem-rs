@@ -443,7 +443,7 @@ fn ip_lookup_node_routes_receive_dpo_to_local_next() {
     let local = runtime.nodes().register_internal(local_control.node());
     for (next, target) in IpLocalNext::VARIANTS
         .into_iter()
-        .zip(IpLocalNext::nodes(drop, drop, drop, udp, drop, drop))
+        .zip(IpLocalNext::nodes(drop, udp, drop, drop))
     {
         runtime
             .nodes()
@@ -497,7 +497,7 @@ fn ip_lookup_node_routes_direct_receive_dpo_to_local_next() {
     let local = runtime.nodes().register_internal(local_control.node());
     for (next, target) in IpLocalNext::VARIANTS
         .into_iter()
-        .zip(IpLocalNext::nodes(drop, drop, drop, udp, drop, drop))
+        .zip(IpLocalNext::nodes(drop, udp, drop, drop))
     {
         runtime
             .nodes()

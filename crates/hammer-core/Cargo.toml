@@ -12,6 +12,7 @@ crate-type = ["dylib", "rlib"]
 default = []
 
 [dependencies]
+abi_stable = { workspace = true }
 hammer-infra = { path = "../hammer-infra" }
 thiserror = { workspace = true }
 spinning_top = { workspace = true }

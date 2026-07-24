@@ -755,6 +755,7 @@ dependencies = [
 name = "hammer-core"
 version = "0.1.0"
 dependencies = [
+ "abi_stable",
  "hammer-infra",
  "spinning_top",
  "thiserror",
