@@ -95,20 +95,11 @@ pub enum DeviceError {
     #[error("device instance {device_instance} is not registered")]
     DeviceNotRegistered { device_instance: u32 },
     #[error("RX queue {queue_id} is already registered for device {device_instance}")]
-    RxQueueAlreadyRegistered {
-        device_instance: u32,
-        queue_id: u32,
-    },
+    RxQueueAlreadyRegistered { device_instance: u32, queue_id: u32 },
     #[error("TX queue {queue_id} is already registered for device {device_instance}")]
-    TxQueueAlreadyRegistered {
-        device_instance: u32,
-        queue_id: u32,
-    },
+    TxQueueAlreadyRegistered { device_instance: u32, queue_id: u32 },
     #[error("TX queue {queue_id} is not registered for device {device_instance}")]
-    TxQueueNotRegistered {
-        device_instance: u32,
-        queue_id: u32,
-    },
+    TxQueueNotRegistered { device_instance: u32, queue_id: u32 },
     #[error("required graph node `{name}` is not registered")]
     GraphNodeMissing { name: &'static str },
     #[error(transparent)]
@@ -252,9 +243,9 @@ impl DeviceMain {
         }
         let interface_output = self
             .nodes
-            .node_by_name(InterfaceOutputNode::NODE_NAME)
+            .node_by_name("interface-output")
             .ok_or(DeviceError::GraphNodeMissing {
-                name: InterfaceOutputNode::NODE_NAME,
+                name: "interface-output",
             })?;
         let drop = self
             .nodes
@@ -263,9 +254,7 @@ impl DeviceMain {
         let output_slot = self
             .nodes
             .add_node_next_slot(interface_output, device.output_node)?;
-        let drop_slot = self
-            .nodes
-            .add_node_next_slot(interface_output, drop)?;
+        let drop_slot = self.nodes.add_node_next_slot(interface_output, drop)?;
         let mut assigned_workers = Bitmap::new();
         assigned_workers.set(owner);
         queues.push(DeviceTxQueue {

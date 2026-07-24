@@ -71,8 +71,7 @@ fn interface_name(name: &[libc::c_char; libc::IFNAMSIZ]) -> Result<String> {
 }
 
 fn set_mtu(request: &mut libc::ifreq, mtu: u32) -> Result<()> {
-    let mtu = libc::c_int::try_from(mtu)
-        .map_err(|_| TunError::MtuOutOfRange)?;
+    let mtu = libc::c_int::try_from(mtu).map_err(|_| TunError::MtuOutOfRange)?;
     // SAFETY: socket has no pointer arguments. A successful descriptor is
     // transferred immediately into OwnedFd and therefore closed exactly once.
     let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };

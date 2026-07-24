@@ -94,9 +94,7 @@ fn rebuild_graph_renumbers_nodes_and_invalidates_old_node_ids() {
     assert_eq!(old_beta.slot(), 1);
 
     // Shrink the graph so the previous high slot becomes out of range.
-    runtime
-        .rebuild_graph(&[entry("gamma")])
-        .expect("rebuild");
+    runtime.rebuild_graph(&[entry("gamma")]).expect("rebuild");
 
     assert!(
         runtime.nodes().node_name(old_beta).is_err(),
@@ -143,9 +141,7 @@ fn worker_runtime_after_rebuild_matches_main_topology() {
     runtime
         .init_graph(&[entry("alpha"), entry("beta")])
         .expect("init");
-    runtime
-        .rebuild_graph(&[entry("gamma")])
-        .expect("rebuild");
+    runtime.rebuild_graph(&[entry("gamma")]).expect("rebuild");
 
     let worker = runtime.for_worker(1, 0).expect("worker runtime fork");
     assert_eq!(

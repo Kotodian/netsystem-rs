@@ -3,7 +3,7 @@ use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 use std::time::Instant;
 
-use hammer_core::data_plane::{BufferFrame, DataPlaneBuffers, Frame, Index, Next};
+use hammer_core::data_plane::{BufferFrame, DataPlaneBuffers, Index};
 use hammer_infra::fifo_queue::FifoQueue;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::segment::{Local, Segment, Svm};

@@ -124,8 +124,8 @@ fn set_nonblocking(fd: RawFd) -> Result<()> {
 
 fn kernel_name(fd: RawFd) -> Result<String> {
     let mut name = [0u8; libc::IFNAMSIZ];
-    let mut length = libc::socklen_t::try_from(name.len())
-        .map_err(|_| TunError::InterfaceNameLengthInvalid)?;
+    let mut length =
+        libc::socklen_t::try_from(name.len()).map_err(|_| TunError::InterfaceNameLengthInvalid)?;
     // SAFETY: name is writable for length bytes and length itself is a live
     // socklen_t out-parameter for this call.
     if unsafe {
@@ -143,8 +143,7 @@ fn kernel_name(fd: RawFd) -> Result<String> {
             source: io::Error::last_os_error(),
         });
     }
-    let length = usize::try_from(length)
-        .map_err(|_| TunError::InterfaceNameLengthInvalid)?;
+    let length = usize::try_from(length).map_err(|_| TunError::InterfaceNameLengthInvalid)?;
     let bytes = name
         .get(..length)
         .ok_or(TunError::InterfaceNameLengthInvalid)?;
@@ -155,8 +154,7 @@ fn kernel_name(fd: RawFd) -> Result<String> {
 }
 
 fn set_mtu(name: &str, mtu: u32) -> Result<()> {
-    let mtu = libc::c_int::try_from(mtu)
-        .map_err(|_| TunError::MtuOutOfRange)?;
+    let mtu = libc::c_int::try_from(mtu).map_err(|_| TunError::MtuOutOfRange)?;
     if name.len() >= libc::IFNAMSIZ {
         return Err(TunError::InvalidInterfaceName);
     }

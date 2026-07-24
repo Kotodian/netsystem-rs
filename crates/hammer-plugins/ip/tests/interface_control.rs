@@ -149,12 +149,16 @@ fn interface_output_dispatches_to_registered_tx_node() {
         .runtime
         .nodes()
         .register_internal(hammer_service::data_plane::DropNode::new());
-    let tx = engine.runtime.nodes().register_internal(InterfaceTxSinkNode);
-    let output_node = engine.runtime.nodes().register_internal(InterfaceOutputNode);
+    let tx = engine
+        .runtime
+        .nodes()
+        .register_internal(InterfaceTxSinkNode);
+    let output_node = engine
+        .runtime
+        .nodes()
+        .register_internal(InterfaceOutputNode);
     let devices = DeviceMain::new(engine.runtime.nodes().clone());
-    let device = devices
-        .register_device(0, tx, tx)
-        .expect("register device");
+    let device = devices.register_device(0, tx, tx).expect("register device");
     devices
         .register_tx_queue(device.instance, 0, DataWorkerId::new(0))
         .expect("register TX queue");
@@ -222,12 +226,16 @@ fn interface_output_drops_missing_egress_or_tx_mapping() {
         .runtime
         .nodes()
         .register_internal(hammer_service::data_plane::DropNode::new());
-    let tx = engine.runtime.nodes().register_internal(InterfaceTxSinkNode);
-    let output_node = engine.runtime.nodes().register_internal(InterfaceOutputNode);
+    let tx = engine
+        .runtime
+        .nodes()
+        .register_internal(InterfaceTxSinkNode);
+    let output_node = engine
+        .runtime
+        .nodes()
+        .register_internal(InterfaceOutputNode);
     let devices = DeviceMain::new(engine.runtime.nodes().clone());
-    let device = devices
-        .register_device(7, tx, tx)
-        .expect("register device");
+    let device = devices.register_device(7, tx, tx).expect("register device");
     devices
         .register_tx_queue(device.instance, 0, DataWorkerId::new(0))
         .expect("register TX queue");

@@ -25,9 +25,7 @@ fn tx_queue_affinity_is_published_by_interface_and_owner() {
     let runtime = Worker::default().create_runtime().expect("runtime");
     runtime.nodes().register_internal(DropNode::new());
     let sink = runtime.nodes().register_internal(TxSink);
-    runtime
-        .nodes()
-        .register_internal(InterfaceOutputNode);
+    runtime.nodes().register_internal(InterfaceOutputNode);
     let devices = DeviceMain::new(runtime.nodes().clone());
     let first_worker = DataWorkerId::new(0);
     let second_worker = DataWorkerId::new(1);
@@ -77,9 +75,7 @@ fn device_main_allocates_instances_and_rejects_unregistered_queues() {
     let runtime = Worker::default().create_runtime().expect("runtime");
     runtime.nodes().register_internal(DropNode::new());
     let sink = runtime.nodes().register_internal(TxSink);
-    runtime
-        .nodes()
-        .register_internal(InterfaceOutputNode);
+    runtime.nodes().register_internal(InterfaceOutputNode);
     let devices = DeviceMain::new(runtime.nodes().clone());
     assert!(
         devices

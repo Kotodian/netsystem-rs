@@ -182,8 +182,8 @@ fn engine_pool() -> EnginePool {
     worker.buffer.frame_pool_size = 5;
     worker.buffer.page_size = Some(hammer_infra::PageSize::Default);
     worker.instruction_set = "scalar".to_owned();
-    let mut engine = Engine::new_configured(RuntimeRegistry::new(), worker)
-        .expect("configured main engine");
+    let mut engine =
+        Engine::new_configured(RuntimeRegistry::new(), worker).expect("configured main engine");
     let sink = engine
         .runtime
         .nodes()

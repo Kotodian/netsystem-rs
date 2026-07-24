@@ -4,8 +4,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::forwarding::{
-    Adjacency, AdjacencyIndex, AdjacencyRewrite, DpoProto, DpoType, FibLookupResult, FibTable,
-    FibSource, FibTableBuilder, FibTableHandle, ForwardingMetadata,
+    Adjacency, AdjacencyIndex, AdjacencyRewrite, DpoProto, DpoType, FibLookupResult, FibSource,
+    FibTable, FibTableBuilder, FibTableHandle, ForwardingMetadata,
 };
 use crate::protocol::icmp::IcmpErrorMetadata;
 use crate::protocol::ip::{
@@ -282,9 +282,7 @@ impl IpMain {
         Self::compile_contributions(&contributions)
     }
 
-    fn compile_contributions(
-        contributions: &FibContributions,
-    ) -> RuntimeResult<FibTable<u16>> {
+    fn compile_contributions(contributions: &FibContributions) -> RuntimeResult<FibTable<u16>> {
         let drop_next = NodeNext::slot(IpLookupNext::Drop);
         let receive_next = NodeNext::slot(IpLookupNext::Receive);
         let rewrite_next = NodeNext::slot(IpLookupNext::AdjacencyRewrite);
@@ -303,15 +301,13 @@ impl IpMain {
                 FibContribution::Receive => {
                     builder.add_receive_route(*prefix, receive_next);
                 }
-                FibContribution::Paths(paths) if paths.len() == 1 => {
-                    Self::add_adjacency_route(
-                        &mut builder,
-                        *prefix,
-                        paths[0],
-                        rewrite_next,
-                        rewrite_output_next,
-                    )?
-                }
+                FibContribution::Paths(paths) if paths.len() == 1 => Self::add_adjacency_route(
+                    &mut builder,
+                    *prefix,
+                    paths[0],
+                    rewrite_next,
+                    rewrite_output_next,
+                )?,
                 FibContribution::Paths(paths) => Self::add_load_balance_route(
                     &mut builder,
                     *prefix,
@@ -456,11 +452,9 @@ impl IpMain {
         }
         let control = Arc::new(IpLookupControlPlane::new(self.build_table()?));
         if self.control.set(Arc::clone(&control)).is_err() {
-            return self
-                .control
-                .get()
-                .cloned()
-                .ok_or_else(|| RuntimeError::invariant("IP lookup control plane was not installed"));
+            return self.control.get().cloned().ok_or_else(|| {
+                RuntimeError::invariant("IP lookup control plane was not installed")
+            });
         }
         Ok(control)
     }
@@ -510,10 +504,7 @@ pub fn reset_for_test() {
     early = true,
     runs_after = ["runtime_worker_config"]
 )]
-fn configure_ip(
-    config: NetworkIpConfig,
-    engine: &mut hammer_runtime::Engine,
-) -> RuntimeResult<()> {
+fn configure_ip(config: NetworkIpConfig, engine: &mut hammer_runtime::Engine) -> RuntimeResult<()> {
     config.validate()?;
     let routes = Arc::<[_]>::from(config.route);
     let interfaces = engine
@@ -779,11 +770,7 @@ impl AdjacencyRewriteNode {
             return Ok(None);
         };
         if forwarding.dpo_type != DpoType::ADJACENCY {
-            set_index_node_error_code(
-                runtime,
-                index,
-                AdjacencyRewriteNodeError::WrongDpo.code(),
-            )?;
+            set_index_node_error_code(runtime, index, AdjacencyRewriteNodeError::WrongDpo.code())?;
             let _ = add_packet_trace!(
                 runtime,
                 index,
@@ -1086,8 +1073,8 @@ fn adjacency_mtu_divert(
     match action {
         Ipv4MtuAction::Ok => Ok(None),
         Ipv4MtuAction::IcmpFragNeeded { mtu } => {
-            let next = icmp_error_next
-                .unwrap_or_else(|| NodeNext::slot(AdjacencyRewriteNext::Drop));
+            let next =
+                icmp_error_next.unwrap_or_else(|| NodeNext::slot(AdjacencyRewriteNext::Drop));
             let mut buffer = runtime.get_buffer_mut(index)?;
             let opaque = unsafe { transmute::<_, &mut LookupOpaque>(buffer.opaque2_mut()) };
             opaque.icmp_error = Some(IcmpErrorMetadata::ipv4_destination_unreachable(
@@ -1096,9 +1083,11 @@ fn adjacency_mtu_divert(
             ));
             Ok(Some(next))
         }
-        Ipv4MtuAction::Fragment { .. } => Ok(Some(
-            fragment_next.unwrap_or_else(|| NodeNext::slot(AdjacencyRewriteNext::Drop)),
-        )),
+        Ipv4MtuAction::Fragment { .. } => {
+            Ok(Some(fragment_next.unwrap_or_else(|| {
+                NodeNext::slot(AdjacencyRewriteNext::Drop)
+            })))
+        }
     }
 }
 
@@ -1279,8 +1268,8 @@ mod tests {
     fn interface_address_compiles_local_and_connected_routes() {
         let (interfaces, interface) = interface_with_address();
         let handle = interfaces.handle();
-        let main = IpMain::new(Arc::<[Route]>::from(Vec::new()), Some(handle))
-            .expect("build IP main");
+        let main =
+            IpMain::new(Arc::<[Route]>::from(Vec::new()), Some(handle)).expect("build IP main");
         let table = main.build_table().expect("build FIB");
 
         let local = table

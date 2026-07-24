@@ -7,7 +7,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwapOption;
 use hammer_core::data_plane::{BufferFrame, Index, NodeId, NodeRegistration};
 use hammer_runtime::DataPlaneBarrierHandle;
-use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
+use hammer_runtime::{RuntimeError, RuntimeResult};
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
     add_packet_trace,
@@ -278,7 +278,9 @@ impl InterfaceControlPlane {
             let next_index = u32::try_from(next.interfaces.len())
                 .map_err(|_| RuntimeError::invariant("interface index space is exhausted"))?;
             if next_index == u32::MAX {
-                return Err(RuntimeError::invariant("interface index space is exhausted"));
+                return Err(RuntimeError::invariant(
+                    "interface index space is exhausted",
+                ));
             }
             next.interfaces.push(InterfaceRecord {
                 name: name.clone(),
@@ -474,7 +476,6 @@ impl InterfaceState {
     }
 
     #[inline]
-    #[inline]
     fn interface_mut(&mut self, index: u32) -> Option<&mut InterfaceRecord> {
         self.interfaces.get_mut(index as usize)
     }
@@ -586,10 +587,7 @@ thread_local! {
 }
 
 impl InterfaceOutputNode {
-    pub(crate) fn install_worker_queues(
-        worker: DataWorkerId,
-        tx_queues: &[DeviceTxQueue],
-    ) {
+    pub(crate) fn install_worker_queues(worker: DataWorkerId, tx_queues: &[DeviceTxQueue]) {
         let mut state = InterfaceOutputState::default();
         for queue in tx_queues {
             state.drop_slot = Some(queue.drop_slot);
@@ -750,7 +748,7 @@ impl InternalNode for InterfaceOutputNode {
     where
         Self: Sized,
     {
-        NodeRegistration::next(Self::NODE_NAME, 0)
+        NodeRegistration::next("interface-output", 0)
     }
 }
 

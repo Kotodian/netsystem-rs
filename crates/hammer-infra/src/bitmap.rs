@@ -108,7 +108,9 @@ impl Bitmap<usize> {
 
     #[inline]
     pub fn next_set(&self, index: usize) -> Option<usize> {
-        index.checked_add(1).and_then(|next| self.next_set_from(next))
+        index
+            .checked_add(1)
+            .and_then(|next| self.next_set_from(next))
     }
 
     #[inline]
@@ -177,7 +179,7 @@ mod tests {
 
     #[test]
     fn bitmap_first_and_next_set_follow_dense_ready_indices() {
-        let mut bitmap = Bitmap::with_capacity(130);
+        let mut bitmap: Bitmap = Bitmap::with_capacity(130);
         assert_eq!(bitmap.first_set(), None);
 
         assert!(bitmap.set(3));
@@ -192,7 +194,7 @@ mod tests {
 
     #[test]
     fn bitmap_clear_removes_bits_without_touching_neighbors() {
-        let mut bitmap = Bitmap::new();
+        let mut bitmap: Bitmap = Bitmap::new();
         bitmap.set(1);
         bitmap.set(2);
         bitmap.set(63);
@@ -205,7 +207,7 @@ mod tests {
 
     #[test]
     fn bitmap_clear_all_preserves_word_capacity_and_clears_iteration_state() {
-        let mut bitmap = Bitmap::with_capacity(130);
+        let mut bitmap: Bitmap = Bitmap::with_capacity(130);
         bitmap.set(5);
         bitmap.set(64);
         bitmap.set(129);
@@ -222,7 +224,7 @@ mod tests {
 
     #[test]
     fn bitmap_counts_and_iterates_set_bits() {
-        let mut bitmap = Bitmap::new();
+        let mut bitmap: Bitmap = Bitmap::new();
         bitmap.set(2);
         bitmap.set(65);
 

@@ -7,7 +7,7 @@ use hammer_infra::segment::{Local, Segment, Svm};
 use hammer_runtime::app::{
     AppSession, SessionEventQueue, SessionEvt, SessionEvtType, SessionMsgQueue, SessionSegment,
 };
-use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
+use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use crate::session::SessionId;
 

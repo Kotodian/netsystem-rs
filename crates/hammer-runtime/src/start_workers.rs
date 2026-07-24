@@ -1,6 +1,6 @@
 use core::hint::spin_loop;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 use std::thread::JoinHandle;
 
@@ -148,8 +148,9 @@ pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
 fn resolve_worker_startup(engine: &Engine) -> RuntimeResult<(Worker, u32)> {
     let worker = engine.worker_config().clone();
     worker.validate()?;
-    let count = u32::try_from(worker.count)
-        .map_err(|_| RuntimeError::WorkerCountOverflow { count: worker.count })?;
+    let count = u32::try_from(worker.count).map_err(|_| RuntimeError::WorkerCountOverflow {
+        count: worker.count,
+    })?;
     Ok((worker, count))
 }
 

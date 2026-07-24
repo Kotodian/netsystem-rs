@@ -273,10 +273,7 @@ impl DataPlaneRuntime {
         config: DataPlaneRuntimeConfig,
         instruction_set: DataPlaneInstructionSet,
     ) -> RuntimeResult<Self> {
-        Self::from_buffers_with_instruction_set(
-            config.buffers.try_into()?,
-            instruction_set,
-        )
+        Self::from_buffers_with_instruction_set(config.buffers.try_into()?, instruction_set)
     }
 
     #[inline]

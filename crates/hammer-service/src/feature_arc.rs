@@ -11,7 +11,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use hammer_core::data_plane::{BufferFrame, Index, NodeId};
 use hammer_runtime::node::NodeRuntime;
-use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
+use hammer_runtime::{RuntimeError, RuntimeResult};
 use hammer_runtime::{DataPlaneBarrierHandle, DataPlaneRuntime, NodeResult};
 
 use crate::opaque::NetworkOpaque;

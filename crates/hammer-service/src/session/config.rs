@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
+use hammer_runtime::{RuntimeError, RuntimeResult};
 
 const SESSION_TIMER_TICK: Duration = Duration::from_millis(10);
 const SESSION_POOL_CAPACITY: usize = 1_024;

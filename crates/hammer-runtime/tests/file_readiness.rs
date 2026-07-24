@@ -74,12 +74,8 @@ fn deleted_file_index_does_not_resolve_after_pool_slot_reuse() {
     assert!(files.delete(first.index).expect("delete first file"));
     assert!(files.get(first.index).is_none());
 
-    let replacement = RegisteredSocket::register(
-        &mut files,
-        "replacement",
-        0,
-        FileFunctions::default(),
-    );
+    let replacement =
+        RegisteredSocket::register(&mut files, "replacement", 0, FileFunctions::default());
 
     assert_eq!(replacement.index.slot(), first.index.slot());
     assert_ne!(replacement.index.generation(), first.index.generation());
@@ -110,7 +106,10 @@ fn readable_file_dispatches_callback() {
     );
 
     socket.make_readable();
-    assert_eq!(files.poll(&NodeRuntime::default()).expect("poll FileMain"), 1);
+    assert_eq!(
+        files.poll(&NodeRuntime::default()).expect("poll FileMain"),
+        1
+    );
 
     let file = files.get(socket.index).expect("registered file");
     assert_eq!(file.private_data(), 42);
@@ -147,9 +146,19 @@ fn readable_file_dispatches_across_repeated_readiness_cycles() {
     );
 
     socket.make_readable();
-    assert_eq!(files.poll(&NodeRuntime::default()).expect("poll first readiness"), 1);
+    assert_eq!(
+        files
+            .poll(&NodeRuntime::default())
+            .expect("poll first readiness"),
+        1
+    );
     socket.make_readable();
-    assert_eq!(files.poll(&NodeRuntime::default()).expect("poll second readiness"), 1);
+    assert_eq!(
+        files
+            .poll(&NodeRuntime::default())
+            .expect("poll second readiness"),
+        1
+    );
 
     let file = files.get(socket.index).expect("registered file");
     assert_eq!(file.private_data(), 2);
@@ -205,7 +214,12 @@ fn linux_eventfd_readiness_dispatches_through_file_main() {
         )
     };
     assert_eq!(count, std::mem::size_of::<u64>() as isize);
-    assert_eq!(files.poll(&NodeRuntime::default()).expect("poll eventfd readiness"), 1);
+    assert_eq!(
+        files
+            .poll(&NodeRuntime::default())
+            .expect("poll eventfd readiness"),
+        1
+    );
 
     let file = files.get(index).expect("registered eventfd");
     assert_eq!(file.private_data(), value);
@@ -233,7 +247,10 @@ fn write_interest_changes_without_replacing_file_index() {
             .set_data_available_to_write(socket.index, true)
             .expect("enable write interest")
     );
-    assert_eq!(files.poll(&NodeRuntime::default()).expect("poll FileMain"), 1);
+    assert_eq!(
+        files.poll(&NodeRuntime::default()).expect("poll FileMain"),
+        1
+    );
 
     let file = files.get(socket.index).expect("same registered file");
     assert_eq!(file.private_data(), 7);
@@ -260,7 +277,12 @@ fn error_callback_runs_before_delete_closes_the_descriptor() {
     );
 
     socket.close_peer();
-    assert_eq!(files.poll(&NodeRuntime::default()).expect("poll peer close"), 1);
+    assert_eq!(
+        files
+            .poll(&NodeRuntime::default())
+            .expect("poll peer close"),
+        1
+    );
     let file = files.get(socket.index).expect("registered file");
     assert_eq!(file.private_data(), 1);
     assert_eq!(file.error_events(), 1);
@@ -306,7 +328,10 @@ fn queued_event_for_deleted_generation_does_not_reach_reused_slot() {
 
     assert_eq!(current.index.slot(), stale.index.slot());
     assert_ne!(current.index.generation(), stale.index.generation());
-    assert_eq!(files.poll(&NodeRuntime::default()).expect("poll FileMain"), 0);
+    assert_eq!(
+        files.poll(&NodeRuntime::default()).expect("poll FileMain"),
+        0
+    );
     let file = files.get(current.index).expect("replacement file");
     assert_eq!(file.private_data(), 0);
     assert_eq!(file.read_events(), 0);
@@ -326,7 +351,12 @@ fn unhandled_error_deletes_file_and_closes_descriptor() {
     );
 
     socket.close_peer();
-    assert_eq!(files.poll(&NodeRuntime::default()).expect("poll peer close"), 0);
+    assert_eq!(
+        files
+            .poll(&NodeRuntime::default())
+            .expect("poll peer close"),
+        0
+    );
     assert!(files.get(socket.index).is_none());
     // SAFETY: F_GETFD only queries the descriptor number.
     assert_eq!(unsafe { libc::fcntl(socket.raw_fd, libc::F_GETFD) }, -1);

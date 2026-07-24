@@ -619,12 +619,10 @@ fn adjacency_rewrite_node_prepends_rewrite_and_sets_egress_interface() {
     let sink = register_sink(&runtime, &state);
     let drop_node = runtime.nodes().register_internal(DropNode::new());
     let (control, _lookup) = placeholder_lookup(&runtime);
-    let rewrite_node = runtime
-        .nodes()
-        .register_internal(AdjacencyRewriteNode::new(
-            control.table_handle(),
-            AdjacencyRewriteNext::nodes(NodeId::new(0)),
-        ));
+    let rewrite_node = runtime.nodes().register_internal(AdjacencyRewriteNode::new(
+        control.table_handle(),
+        AdjacencyRewriteNext::nodes(NodeId::new(0)),
+    ));
     let drop_slot = next_slot(&runtime, rewrite_node, drop_node);
     let sink_slot = next_slot(&runtime, rewrite_node, sink);
     let mut builder = FibTableBuilder::new(drop_slot);
@@ -858,12 +856,10 @@ fn adjacency_rewrite_node_prepends_rewrite_when_packet_has_headroom() {
     let sink = register_sink(&runtime, &state);
     let drop_node = runtime.nodes().register_internal(DropNode::new());
     let (control, _lookup) = placeholder_lookup(&runtime);
-    let rewrite_node = runtime
-        .nodes()
-        .register_internal(AdjacencyRewriteNode::new(
-            control.table_handle(),
-            AdjacencyRewriteNext::nodes(NodeId::new(0)),
-        ));
+    let rewrite_node = runtime.nodes().register_internal(AdjacencyRewriteNode::new(
+        control.table_handle(),
+        AdjacencyRewriteNext::nodes(NodeId::new(0)),
+    ));
     let drop_node_slot = next_slot(&runtime, rewrite_node, drop_node);
     let sink_slot = next_slot(&runtime, rewrite_node, sink);
     let mut builder = FibTableBuilder::new(drop_node_slot);
@@ -933,12 +929,10 @@ fn adjacency_rewrite_node_drops_missing_forwarding_and_missing_adjacency() {
     control
         .publish(FibTableBuilder::new(drop_slot).build())
         .expect("publish fib");
-    let rewrite_node = runtime
-        .nodes()
-        .register_internal(AdjacencyRewriteNode::new(
-            control.table_handle(),
-            AdjacencyRewriteNext::nodes(NodeId::new(0)),
-        ));
+    let rewrite_node = runtime.nodes().register_internal(AdjacencyRewriteNode::new(
+        control.table_handle(),
+        AdjacencyRewriteNext::nodes(NodeId::new(0)),
+    ));
     let mut frame = runtime
         .buffers()
         .get_next_frame(rewrite_node)

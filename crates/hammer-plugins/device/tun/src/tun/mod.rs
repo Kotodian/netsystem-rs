@@ -4,9 +4,7 @@ use std::mem::transmute;
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex};
 
-use hammer_core::data_plane::{
-    BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, NodeId, NodeState,
-};
+use hammer_core::data_plane::{BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, NodeId, NodeState};
 use hammer_infra::spinlock::Spinlock;
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, File, FileFunctions, Node, NodeProcessFn, NodeResult,
@@ -18,9 +16,7 @@ use hammer_service::device::{
     DeviceError, DeviceInputNext, DeviceInputNode, DeviceMain, DeviceRxQueue, DeviceTxQueue,
     DriverScheduleMode,
 };
-use hammer_service::interface::{
-    InterfaceConfig, InterfaceControlPlane, configure_interfaces,
-};
+use hammer_service::interface::{InterfaceConfig, InterfaceControlPlane, configure_interfaces};
 use hammer_service::opaque::NetworkOpaque;
 
 #[derive(Debug, thiserror::Error)]
@@ -64,10 +60,7 @@ enum TunError {
     #[error(transparent)]
     Device(#[from] DeviceError),
     #[error("TUN File for device {device_instance} is unavailable on worker {worker}")]
-    WorkerFileUnavailable {
-        device_instance: u32,
-        worker: u32,
-    },
+    WorkerFileUnavailable { device_instance: u32, worker: u32 },
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
     #[error("required graph node `{name}` is not registered")]
@@ -77,10 +70,7 @@ enum TunError {
     #[error("TUN interface {interface_index} has no MTU")]
     InterfaceMtuMissing { interface_index: u32 },
     #[error("TUN RX queue for device {device_instance} has no TX queue on worker {worker}")]
-    RxQueueWithoutTx {
-        device_instance: u32,
-        worker: u32,
-    },
+    RxQueueWithoutTx { device_instance: u32, worker: u32 },
     #[error("interface {interface_index} has no TUN TX queue on this worker")]
     TxQueueUnavailable { interface_index: u32 },
     #[error("TUN transmit packet is empty")]
@@ -178,8 +168,8 @@ impl TunControl {
         input_node: NodeId,
         output_node: NodeId,
     ) -> Result<(), TunError> {
-        let worker_count = u32::try_from(worker_count)
-            .map_err(|_| TunError::WorkerCountOutOfRange)?;
+        let worker_count =
+            u32::try_from(worker_count).map_err(|_| TunError::WorkerCountOutOfRange)?;
         if worker_count == 0 {
             return Err(TunError::NoDataWorkers);
         }
@@ -213,11 +203,8 @@ impl TunControl {
             owner,
             DriverScheduleMode::Interrupt,
         )?;
-        self.device_main.register_tx_queue(
-            device_instance,
-            0,
-            owner,
-        )?;
+        self.device_main
+            .register_tx_queue(device_instance, 0, owner)?;
         for worker in 0..worker_count {
             self.device_main.assign_tx_queue_to_worker(
                 device_instance,
@@ -271,28 +258,26 @@ impl TunControl {
                 .find(|rx_queue| rx_queue.device_instance == queue.device_instance)
                 .copied();
             let queue_index = worker_rx_queues.len();
-            let file_index = engine
-                .file_main_mut()
-                .add(File::new(
-                    fd,
-                    format!(
-                        "TUN interface {} (logical {}, kernel {})",
-                        device.interface_index, device.requested_name, device.kernel_name
-                    ),
-                    if rx_queue.is_some() {
-                        queue_index as u64
+            let file_index = engine.file_main_mut().add(File::new(
+                fd,
+                format!(
+                    "TUN interface {} (logical {}, kernel {})",
+                    device.interface_index, device.requested_name, device.kernel_name
+                ),
+                if rx_queue.is_some() {
+                    queue_index as u64
+                } else {
+                    0
+                },
+                FileFunctions {
+                    read: if rx_queue.is_some() {
+                        Some(schedule_tun_input)
                     } else {
-                        0
+                        None
                     },
-                    FileFunctions {
-                        read: if rx_queue.is_some() {
-                            Some(schedule_tun_input)
-                        } else {
-                            None
-                        },
-                        ..FileFunctions::default()
-                    },
-                ))?;
+                    ..FileFunctions::default()
+                },
+            ))?;
             if let Some(rx_queue) = rx_queue {
                 worker_rx_queues.push(TunRxQueue {
                     queue: rx_queue,
@@ -309,13 +294,10 @@ impl TunControl {
             });
         }
         for queue in rx_queues {
-            if !worker_rx_queues
-                .iter()
-                .any(|worker_queue| {
-                    worker_queue.queue.device_instance == queue.device_instance
-                        && worker_queue.queue.queue_id == queue.queue_id
-                })
-            {
+            if !worker_rx_queues.iter().any(|worker_queue| {
+                worker_queue.queue.device_instance == queue.device_instance
+                    && worker_queue.queue.queue_id == queue.queue_id
+            }) {
                 return Err(TunError::RxQueueWithoutTx {
                     device_instance: queue.device_instance,
                     worker: worker.slot() as u32,
@@ -336,9 +318,7 @@ impl TunControl {
     early = true,
     runs_before = ["ip_config"]
 )]
-fn configure_tun_interfaces(
-    tun_cfg: TunPluginConfig,
-) -> RuntimeResult<Arc<InterfaceControlPlane>> {
+fn configure_tun_interfaces(tun_cfg: TunPluginConfig) -> RuntimeResult<Arc<InterfaceControlPlane>> {
     configure_interfaces(&tun_cfg.interfaces)
 }
 
@@ -404,17 +384,14 @@ fn configure_tun_worker(
             })?;
         control.device_main.install_worker_output_runtime(worker);
         let runtime = control.take_worker_runtime(engine, worker, tun_input)?;
-        engine
-            .runtime
-            .nodes()
-            .set_node_state(
-                tun_input,
-                if runtime.has_rx_queues() {
-                    NodeState::Interrupt
-                } else {
-                    NodeState::Disabled
-                },
-            )?;
+        engine.runtime.nodes().set_node_state(
+            tun_input,
+            if runtime.has_rx_queues() {
+                NodeState::Interrupt
+            } else {
+                NodeState::Disabled
+            },
+        )?;
         TUN_WORKER_RUNTIME.with(|slot| {
             slot.replace(Some(runtime));
         });
@@ -544,13 +521,7 @@ impl TunWorkerRuntime {
     ) -> NodeResult {
         let pending = frame.pending_len();
         for index in frame.pending_indices() {
-            let _ = add_packet_trace!(
-                runtime,
-                *index,
-                TunOutputTrace {
-                    pending,
-                },
-            );
+            let _ = add_packet_trace!(runtime, *index, TunOutputTrace { pending },);
             if let Err(error) = self.send_packet(runtime, *index) {
                 let code = error.code();
                 if let Err(source) = runtime.record_current_node_error(code) {
@@ -573,8 +544,7 @@ impl TunWorkerRuntime {
             }
             queue.pending = false;
             while frame.remaining_capacity() > 0 {
-                let index = runtime
-                    .alloc_index()?;
+                let index = runtime.alloc_index()?;
                 let received = (|| {
                     let mut buffer = runtime.get_buffer_mut(index)?;
                     let writable = buffer.writable_tail_mut();
@@ -624,8 +594,7 @@ impl TunWorkerRuntime {
                             }
                             Some(length) => {
                                 let family = u32::from_be_bytes(family);
-                                if family != libc::AF_INET as u32
-                                    && family != libc::AF_INET6 as u32
+                                if family != libc::AF_INET as u32 && family != libc::AF_INET6 as u32
                                 {
                                     return Err(TunError::UnsupportedAddressFamily { family });
                                 }
@@ -660,22 +629,16 @@ impl TunWorkerRuntime {
                 let received = match received {
                     Ok(received) => received,
                     Err(error) => {
-                        runtime
-                            .buffers()
-                            .drop_index_owned_with_trace(index, |_| {});
+                        runtime.buffers().drop_index_owned_with_trace(index, |_| {});
                         return Err(error);
                     }
                 };
                 if !received {
-                    runtime
-                        .buffers()
-                        .drop_index_owned_with_trace(index, |_| {});
+                    runtime.buffers().drop_index_owned_with_trace(index, |_| {});
                     break;
                 }
                 if let Err(source) = frame.push_index(index) {
-                    runtime
-                        .buffers()
-                        .drop_index_owned_with_trace(index, |_| {});
+                    runtime.buffers().drop_index_owned_with_trace(index, |_| {});
                     return Err(RuntimeError::from(source).into());
                 }
                 if let Some(node) = runtime.current_node() {
@@ -721,8 +684,7 @@ impl TunWorkerRuntime {
         let mut version = None;
         let mut chain = runtime.chain(index);
         while let Some(buffer) = chain.next() {
-            let buffer = buffer
-                .map_err(RuntimeError::from)?;
+            let buffer = buffer.map_err(RuntimeError::from)?;
             if version.is_none() {
                 version = buffer.current().first().map(|first| first >> 4);
             }
@@ -763,10 +725,7 @@ impl TunWorkerRuntime {
             .try_fold(0usize, |length, vector| length.checked_add(vector.iov_len))
             .ok_or(TunError::PacketLengthOutOfRange)?;
         let files = runtime.file_main();
-        let tx_guard = queue
-            .queue
-            .is_shared()
-            .then(|| queue.tx_lock.lock());
+        let tx_guard = queue.queue.is_shared().then(|| queue.tx_lock.lock());
         // SAFETY: every payload iovec points into a live data-plane buffer
         // chain, the optional Darwin header remains live, and FileMain writes
         // synchronously before this function can release or mutate either.

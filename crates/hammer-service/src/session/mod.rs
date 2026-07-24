@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use hammer_runtime::attach::AppServer;
-use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
+use hammer_runtime::{RuntimeError, RuntimeResult};
 
 pub mod app;
 pub mod config;

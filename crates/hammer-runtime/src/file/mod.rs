@@ -182,10 +182,7 @@ impl FileMain {
 
     /// Registers a File and returns its existing `hammer-infra` Pool Index.
     pub fn add(&mut self, file: File) -> RuntimeResult<Index> {
-        let index = self
-            .files
-            .insert(file)
-            .ok_or(RuntimeError::FilePoolFull)?;
+        let index = self.files.insert(file).ok_or(RuntimeError::FilePoolFull)?;
         let spec = self
             .files
             .get(index)

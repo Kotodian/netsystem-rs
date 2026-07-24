@@ -1106,7 +1106,9 @@ fn worker_graph_rejects_worker_local_next_slot_mutation() {
         NodeRuntimeData::empty(),
     ));
     let first = runtime.for_worker(1, 0).expect("first worker runtime fork");
-    let second = runtime.for_worker(2, 0).expect("second worker runtime fork");
+    let second = runtime
+        .for_worker(2, 0)
+        .expect("second worker runtime fork");
 
     let error = first
         .nodes()
