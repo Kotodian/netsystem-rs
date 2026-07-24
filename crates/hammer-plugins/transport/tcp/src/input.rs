@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use crate::{TcpError, TcpInputFlags, TcpSegmentFlags, tcp_header};
 use arc_swap::ArcSwap;
-use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeHandle, SecondaryOpaque};
+use hammer_core::data_plane::{
+    BufferFrame, BufferPacketCursor, Index, NodeHandle, SecondaryOpaque,
+};
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
     TraceFormatter, add_packet_trace, format_packet_trace,

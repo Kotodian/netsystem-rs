@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
-use hammer_core::data_plane::{BufferFrame, NodeState};
+use hammer_core::data_plane::{BufferFrame, NodeId, NodeState};
 use hammer_infra::pool::Index;
 use hammer_infra::segment::{Local, Svm};
 use hammer_runtime::RuntimeRegistry;
@@ -14,7 +14,9 @@ use hammer_runtime::{
     NodeResult, NodeRuntimeData,
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
-use hammer_service::session::node::{SessionQueueNext, SessionQueueNode, SessionQueueOutput};
+use hammer_service::session::node::{
+    SessionQueueNext, SessionQueueNode, SessionQueueOutput, register_session_queue_node,
+};
 use hammer_service::session::runtime::{
     SessionTransport, SessionTransportId, SessionWorker, TransportInternalTransport,
     TransportInternalTx, dispatch_session_queue_pending,
@@ -145,32 +147,37 @@ fn dispatch_test_worker(
     })
 }
 
-fn worker_engine() -> Engine {
+fn worker_engine() -> (Engine, NodeId, NodeRuntimeData, SessionQueueNext) {
     let main = Engine::new(
         DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()),
         RuntimeRegistry::new(),
     );
-    main.spawn(1).expect("spawn data worker")
-}
-
-fn register_session_queue(
-    engine: &mut Engine,
-) -> (hammer_core::data_plane::NodeId, NodeRuntimeData) {
-    let node = SessionQueueNode::new().expect("session queue node");
-    let data = node.node_runtime_data().expect("session queue data");
-    let id = engine
-        .runtime
+    let session_queue = register_session_queue_node(&main.runtime).expect("register session queue");
+    let sink = main.runtime.nodes().register_internal(BlackholeNode);
+    SessionQueueNode::compile_output_next(&main.runtime, session_queue, sink)
+        .expect("compile session queue transport edge");
+    main.runtime
         .nodes()
-        .try_register_driver(node)
-        .expect("register session queue node");
-    (id, data)
+        .set_node_state(session_queue, NodeState::Disabled)
+        .expect("disable main session queue");
+
+    let mut worker = main.spawn(1).expect("spawn data worker");
+    let worker_node = SessionQueueNode::new().expect("worker session queue node");
+    let node_data = worker_node
+        .node_runtime_data()
+        .expect("worker session queue data");
+    worker
+        .set_worker_node_runtime_data(session_queue, node_data)
+        .expect("install worker session queue data");
+    let output_next = SessionQueueNode::existing_output_next(&worker.runtime, session_queue, sink)
+        .expect("resolve worker session queue transport edge");
+    (worker, session_queue, node_data, output_next)
 }
 
 #[test]
 fn local_session_worker_does_not_register_file_readiness() {
-    let mut engine = worker_engine();
+    let (mut engine, session_queue, _, _) = worker_engine();
     let worker = engine.data_worker_id().expect("data worker id");
-    let (session_queue, _) = register_session_queue(&mut engine);
     let mut sessions = SessionWorker::<Index, Local>::new(worker, engine.runtime.buffers().clone());
 
     sessions
@@ -189,13 +196,9 @@ fn local_session_worker_does_not_register_file_readiness() {
 
 #[test]
 fn svm_readiness_schedules_session_queue_before_the_node_drains_events() {
-    let mut engine = worker_engine();
+    let (mut engine, session_queue, node_data, output_next) = worker_engine();
     let worker = engine.data_worker_id().expect("data worker id");
     let events = Arc::new(Mutex::new(Vec::new()));
-    let (session_queue, node_data) = register_session_queue(&mut engine);
-    let sink = engine.runtime.nodes().register_internal(BlackholeNode);
-    let output_next = SessionQueueNode::compile_output_next(&engine.runtime, session_queue, sink)
-        .expect("compile session queue transport edge");
     SessionQueueNode::install_worker_attachment(node_data, output_next, dispatch_test_worker)
         .expect("install session queue transport dispatch");
 
@@ -216,8 +219,8 @@ fn svm_readiness_schedules_session_queue_before_the_node_drains_events() {
     engine
         .runtime
         .nodes()
-        .set_node_state(session_queue, NodeState::Polling)
-        .expect("poll session queue");
+        .set_node_state(session_queue, NodeState::Interrupt)
+        .expect("enable session queue interrupts");
 
     with_test_worker_mut(|worker| {
         worker
@@ -255,9 +258,8 @@ fn svm_readiness_schedules_session_queue_before_the_node_drains_events() {
 
 #[test]
 fn replacing_svm_session_worker_removes_the_old_file_before_queue_release() {
-    let mut engine = worker_engine();
+    let (mut engine, session_queue, _, _) = worker_engine();
     let worker = engine.data_worker_id().expect("data worker id");
-    let (session_queue, _) = register_session_queue(&mut engine);
     let mut first = SessionWorker::<Index, Svm>::new_svm(
         worker,
         engine.runtime.buffers().clone(),
@@ -321,9 +323,8 @@ fn replacing_svm_session_worker_removes_the_old_file_before_queue_release() {
 #[test]
 fn worker_teardown_closes_session_queue_and_file_descriptors() {
     let (descriptor, identity) = thread::spawn(|| {
-        let mut engine = worker_engine();
+        let (mut engine, session_queue, _, _) = worker_engine();
         let worker = engine.data_worker_id().expect("data worker id");
-        let (session_queue, _) = register_session_queue(&mut engine);
         let mut sessions = SessionWorker::<Index, Svm>::new_svm(
             worker,
             engine.runtime.buffers().clone(),

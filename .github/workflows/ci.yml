@@ -111,11 +111,15 @@ jobs:
             -p hammer-plugin-ip \
             -p hammer-plugin-tcp \
             -p hammer-plugin-udp
+      - name: Locate Rust runtime libraries [macOS]
+        id: rust_runtime
+        run: echo "libdir=$(rustc --print target-libdir)" >> "$GITHUB_OUTPUT"
       - name: Start production TCP Lab [macOS]
         env:
           TCP_LAB_BINARY: ${{ github.workspace }}/target/debug/hammer
           TCP_LAB_CONFIG: ${{ github.workspace }}/examples/tun-tcp-echo.toml
           TCP_LAB_PLUGIN_DIR: ${{ github.workspace }}/target/debug
+          TCP_LAB_RUST_LIBDIR: ${{ steps.rust_runtime.outputs.libdir }}
         run: |
           set -euo pipefail
           if [[ ! -x "$TCP_LAB_BINARY" ]]; then
@@ -131,7 +135,9 @@ jobs:
               ipc_address=$3
               binary=$4
               config=$5
+              rust_libdir=$6
               nohup env \
+                DYLD_LIBRARY_PATH="$rust_libdir" \
                 HAMMER_PLUGIN_DIR="$plugin_dir" \
                 HAMMER_IPC_ADDR="$ipc_address" \
                 "$binary" "$config" \
@@ -142,7 +148,8 @@ jobs:
               "$TCP_LAB_PLUGIN_DIR" \
               "$TCP_LAB_IPC_ADDRESS" \
               "$TCP_LAB_BINARY" \
-              "$TCP_LAB_CONFIG"
+              "$TCP_LAB_CONFIG" \
+              "$TCP_LAB_RUST_LIBDIR"
           )"
           if [[ ! "$tcp_lab_pid" =~ ^[0-9]+$ ]]; then
             echo "invalid TCP Lab PID: $tcp_lab_pid" >&2

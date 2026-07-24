@@ -679,16 +679,14 @@ impl TunWorkerRuntime {
             .find(|queue| queue.queue.interface_index == interface_index)
             .ok_or(TunError::TxQueueUnavailable { interface_index })?;
         queue.tx_iovecs.clear();
-        queue.tx_iovecs.reserve(platform::TX_HEADER_IOVECS);
-        for _ in 0..platform::TX_HEADER_IOVECS {
-            queue.tx_iovecs.push(libc::iovec {
-                iov_base: std::ptr::null_mut(),
-                iov_len: 0,
-            });
-        }
+        #[cfg(target_os = "macos")]
+        queue.tx_iovecs.push(libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        });
         let mut version = None;
         let mut chain = runtime.chain(index);
-        while let Some(buffer) = chain.next() {
+        for buffer in chain.by_ref() {
             let buffer = buffer.map_err(RuntimeError::from)?;
             if version.is_none() {
                 version = buffer.current().first().map(|first| first >> 4);

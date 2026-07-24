@@ -395,11 +395,13 @@ impl IpMain {
                 )
             })
             .collect::<Vec<_>>();
-        let load_balance = builder.try_add_load_balance(proto, buckets).map_err(|error| {
-            RuntimeError::config_validation(format!(
-                "FIB paths for {prefix} cannot form a load balance: {error:?}"
-            ))
-        })?;
+        let load_balance = builder
+            .try_add_load_balance(proto, buckets)
+            .map_err(|error| {
+                RuntimeError::config_validation(format!(
+                    "FIB paths for {prefix} cannot form a load balance: {error:?}"
+                ))
+            })?;
         builder.add_route(prefix, load_balance);
         Ok(())
     }
@@ -1380,11 +1382,7 @@ mod tests {
         let prefix = "203.0.113.0/24".parse().expect("prefix");
         let mut contributions = FibContributions::default();
         let error = contributions
-            .insert(
-                prefix,
-                FibSource::Api,
-                FibContribution::Paths(Vec::new()),
-            )
+            .insert(prefix, FibSource::Api, FibContribution::Paths(Vec::new()))
             .expect_err("empty contribution");
         assert!(matches!(error, RuntimeError::ConfigValidation { .. }));
         assert!(!contributions.by_prefix.contains_key(&prefix));

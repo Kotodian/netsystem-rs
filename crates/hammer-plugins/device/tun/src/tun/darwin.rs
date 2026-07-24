@@ -8,7 +8,6 @@ const CONTROL_NAME: &[u8] = b"com.apple.net.utun_control";
 const CTLIOCGINFO: libc::c_ulong = 0xc064_4e03;
 const SIOCSIFMTU: libc::c_ulong = 0x8020_6934;
 pub(super) const UTUN_HEADER_LEN: usize = 4;
-pub(super) const TX_HEADER_IOVECS: usize = 1;
 
 type Result<T> = std::result::Result<T, TunError>;
 

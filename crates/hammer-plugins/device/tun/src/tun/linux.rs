@@ -4,7 +4,6 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use super::TunError;
 
 const TUN_DEVICE: &[u8] = b"/dev/net/tun\0";
-pub(super) const TX_HEADER_IOVECS: usize = 0;
 
 type Result<T> = std::result::Result<T, TunError>;
 
