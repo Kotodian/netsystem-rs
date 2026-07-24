@@ -114,6 +114,9 @@ jobs:
       - name: Locate Rust runtime libraries [macOS]
         id: rust_runtime
         run: echo "libdir=$(rustc --print target-libdir)" >> "$GITHUB_OUTPUT"
+      - name: Snapshot Darwin interfaces [macOS]
+        id: darwin_interfaces
+        run: echo "before=$(ifconfig -l)" >> "$GITHUB_OUTPUT"
       - name: Start production TCP Lab [macOS]
         env:
           TCP_LAB_BINARY: ${{ github.workspace }}/target/debug/hammer
@@ -158,6 +161,8 @@ jobs:
           echo "TCP_LAB_PID=$tcp_lab_pid" >> "$GITHUB_ENV"
       - name: Wait for Darwin utun [macOS]
         timeout-minutes: 2
+        env:
+          TCP_LAB_INTERFACES_BEFORE: ${{ steps.darwin_interfaces.outputs.before }}
         run: |
           set -euo pipefail
           for _ in {1..90}; do
@@ -167,15 +172,15 @@ jobs:
               exit 1
             fi
 
-            interface="$(
-              sed -n -E 's/.*(utun[0-9]+).*/\1/p' \
-                "$RUNNER_TEMP/hammer-tcp-lab.log" | tail -n 1
-            )"
-            if [[ -n "$interface" ]]; then
-              echo "TCP_LAB_INTERFACE=$interface" >> "$GITHUB_ENV"
-              echo "TCP Lab opened $interface"
-              exit 0
-            fi
+            for interface in $(ifconfig -l); do
+              if [[ "$interface" =~ ^utun[0-9]+$ ]] \
+                && [[ " $TCP_LAB_INTERFACES_BEFORE " != *" $interface "* ]]
+              then
+                echo "TCP_LAB_INTERFACE=$interface" >> "$GITHUB_ENV"
+                echo "TCP Lab opened $interface"
+                exit 0
+              fi
+            done
             sleep 1
           done
 

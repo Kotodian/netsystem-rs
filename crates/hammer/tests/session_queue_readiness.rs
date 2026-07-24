@@ -195,7 +195,7 @@ fn local_session_worker_does_not_register_file_readiness() {
 }
 
 #[test]
-fn svm_readiness_schedules_session_queue_before_the_node_drains_events() {
+fn svm_readiness_marks_session_queue_before_main_loop_dispatch() {
     let (mut engine, session_queue, node_data, output_next) = worker_engine();
     let worker = engine.data_worker_id().expect("data worker id");
     let events = Arc::new(Mutex::new(Vec::new()));
@@ -244,8 +244,20 @@ fn svm_readiness_schedules_session_queue_before_the_node_drains_events() {
         .expect("poll SVM queue readiness");
 
     assert_eq!(callbacks, 1);
-    assert!(engine.runtime.nodes().has_pending());
+    assert!(!engine.runtime.nodes().has_pending());
+    assert!(
+        !engine
+            .runtime
+            .nodes()
+            .mark_interrupt_pending(session_queue)
+            .expect("readiness interrupt coalesces")
+    );
     assert!(events.lock().expect("events").is_empty());
+    engine
+        .runtime
+        .schedule_empty_frame(session_queue)
+        .expect("main loop schedules marked session queue");
+    assert!(engine.runtime.nodes().has_pending());
     assert!(engine.runtime.run_ready_nodes().expect("run session queue") >= 1);
     assert_eq!(*events.lock().expect("events"), vec!["time", "close"]);
 
