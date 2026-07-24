@@ -44,6 +44,106 @@ pub enum RuntimeError {
     WorkerGraphUpdateStatePoisoned,
     #[error("worker graph update is not additive")]
     WorkerGraphUpdateNotAdditive,
+    #[error("plugin `{plugin}` state is not initialized")]
+    PluginStateNotInitialized { plugin: &'static str },
+    #[error("thread {thread_index} is not a data worker")]
+    DataWorkerIdUnavailable { thread_index: u32 },
+    #[error("worker configuration cannot change after runtime initialization")]
+    WorkerConfigurationAlreadyInitialized,
+    #[error("worker thread registry is poisoned")]
+    WorkerThreadRegistryPoisoned,
+    #[error("data workers are already started")]
+    DataWorkersAlreadyStarted,
+    #[error("Process Nodes can only start on the main Runtime Engine")]
+    ProcessNodesRequireMainEngine,
+    #[error("Process Nodes must be controlled by their owner thread")]
+    ProcessControlWrongThread,
+    #[error("duplicate Process Node `{name}`")]
+    DuplicateProcessNode { name: &'static str },
+    #[error("data worker {worker:?} does not match Handoff owner {handoff_owner:?}")]
+    HandoffWorkerMismatch {
+        worker: crate::DataWorkerId,
+        handoff_owner: crate::DataWorkerId,
+    },
+    #[error("Graph Node `{node}` initialization failed")]
+    GraphNodeInitialization {
+        node: &'static str,
+        #[source]
+        source: Box<RuntimeError>,
+    },
+    #[error("packet trace serialization failed")]
+    PacketTraceSerialization {
+        #[source]
+        source: bincode::Error,
+    },
+    #[error("node error recording requires an active Graph Node dispatch")]
+    NodeDispatchContextMissing,
+    #[error("Handoff continuation requires an active Graph Node dispatch")]
+    HandoffDispatchContextMissing,
+    #[error("required runtime capability `{type_name}` is not registered")]
+    RuntimeCapabilityMissing { type_name: &'static str },
+    #[error("data worker exited before reaching the {phase} barrier")]
+    WorkerExitedBeforeStartupBarrier { phase: &'static str },
+    #[error("data worker requested exit during initialization")]
+    WorkerRequestedExitDuringInitialization,
+    #[error("node runtime data value {value} does not fit u64")]
+    NodeRuntimeDataOverflow { value: usize },
+    #[error("node runtime data word {word} value {value} does not fit usize")]
+    NodeRuntimeDataWordOutOfRange { word: usize, value: u64 },
+    #[error("graph node next count {count} does not fit a u16 slot")]
+    NodeNextCountOverflow { count: usize },
+    #[error("named-next registration cannot also supply resolved next nodes")]
+    NamedNextWithResolvedTargets,
+    #[error("named-next registration requires a declared next-node registration")]
+    NamedNextRegistrationKindInvalid,
+    #[error("named-next count {actual} does not match declared count {declared}")]
+    NamedNextCountMismatch { declared: usize, actual: usize },
+    #[error("plain node registration cannot declare {count} initial next nodes")]
+    PlainNodeHasInitialNexts { count: usize },
+    #[error("sibling node registration cannot declare {count} initial next nodes")]
+    SiblingNodeHasInitialNexts { count: usize },
+    #[error("initial next count {actual} does not match declared count {declared}")]
+    InitialNextCountMismatch { declared: usize, actual: usize },
+    #[error("graph node name `{name}` is already registered")]
+    NodeNameAlreadyRegistered { name: &'static str },
+    #[error("graph node `{node}` references unregistered sibling owner `{owner}`")]
+    SiblingOwnerNotRegistered {
+        node: &'static str,
+        owner: &'static str,
+    },
+    #[error("graph node {node:?} is not registered")]
+    NodeNotRegistered { node: hammer_core::data_plane::NodeId },
+    #[error("graph node {node:?} next slot {slot} is not registered")]
+    NodeNextSlotNotRegistered {
+        node: hammer_core::data_plane::NodeId,
+        slot: usize,
+    },
+    #[error("graph node {node:?} next slot {slot} is outside next count {next_count}")]
+    NodeNextSlotOutOfRange {
+        node: hammer_core::data_plane::NodeId,
+        slot: usize,
+        next_count: usize,
+    },
+    #[error("data worker cannot mutate graph topology")]
+    GraphTopologyMutationFromWorker,
+    #[error("graph node handle {handle:?} is already registered")]
+    NodeHandleAlreadyRegistered {
+        handle: hammer_core::data_plane::NodeHandle,
+    },
+    #[error("graph node handle {handle:?} is not registered")]
+    NodeHandleNotRegistered {
+        handle: hammer_core::data_plane::NodeHandle,
+    },
+    #[error("graph node index {slot} does not fit u32")]
+    NodeIdOverflow { slot: usize },
+    #[error("graph node {node:?} is not a driver node")]
+    NodeNotDriver {
+        node: hammer_core::data_plane::NodeId,
+    },
+    #[error("node error table exhausted its u16 encoding space")]
+    NodeErrorSlotOverflow,
+    #[error(transparent)]
+    Init(#[from] crate::init::InitError),
     #[error(transparent)]
     Attach(#[from] AttachError),
     #[error("{subsystem} subsystem failed")]

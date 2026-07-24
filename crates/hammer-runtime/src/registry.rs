@@ -36,11 +36,8 @@ impl RuntimeRegistry {
     }
 
     pub fn require<T: Any + Send + Sync>(&self) -> Result<Arc<T>, RuntimeError> {
-        self.get::<T>().ok_or_else(|| {
-            RuntimeError::invariant(format!(
-                "required service not registered in RuntimeRegistry: {}",
-                type_name::<T>()
-            ))
+        self.get::<T>().ok_or(RuntimeError::RuntimeCapabilityMissing {
+            type_name: type_name::<T>(),
         })
     }
 }

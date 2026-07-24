@@ -225,7 +225,7 @@ impl Engine {
             let count = self
                 .worker_threads
                 .lock()
-                .map_err(|_| RuntimeError::invariant("worker thread registry poisoned"))?
+                .map_err(|_| RuntimeError::WorkerThreadRegistryPoisoned)?
                 .len();
             u32::try_from(count).map_err(|_| RuntimeError::WorkerCountOverflow { count })?
         } else {
@@ -335,10 +335,10 @@ impl Engine {
         let succeeded = result.is_ok();
         if let Err(error) = result {
             self.main_loop_exit_now.store(true, Ordering::Release);
-            if let Ok(mut first_error) = self.worker_graph_update_error.lock()
-                && first_error.is_none()
+            if let Ok(mut graph_update_error) = self.worker_graph_update_error.lock()
+                && graph_update_error.is_none()
             {
-                *first_error = Some(error);
+                *graph_update_error = Some(error);
             }
         }
 
@@ -378,7 +378,9 @@ impl Engine {
         self.thread_index
             .checked_sub(1)
             .map(DataWorkerId::new)
-            .ok_or_else(|| RuntimeError::invariant("main thread has no data worker id"))
+            .ok_or(RuntimeError::DataWorkerIdUnavailable {
+                thread_index: self.thread_index,
+            })
     }
 
     /// The configured number of data workers. This is runtime state, not a
@@ -406,9 +408,7 @@ impl Engine {
             return if self.worker_config == worker {
                 Ok(())
             } else {
-                Err(RuntimeError::invariant(
-                    "worker configuration cannot change after runtime initialization",
-                ))
+                Err(RuntimeError::WorkerConfigurationAlreadyInitialized)
             };
         }
         worker.validate()?;
@@ -538,9 +538,9 @@ impl Engine {
         let mut retained = self
             .worker_threads
             .lock()
-            .map_err(|_| RuntimeError::invariant("worker thread registry poisoned"))?;
+            .map_err(|_| RuntimeError::WorkerThreadRegistryPoisoned)?;
         if !retained.is_empty() {
-            return Err(RuntimeError::invariant("data workers are already started"));
+            return Err(RuntimeError::DataWorkersAlreadyStarted);
         }
         retained.extend(threads.drain(..));
         Ok(())
@@ -548,9 +548,7 @@ impl Engine {
 
     pub fn start_process_nodes(&mut self) -> RuntimeResult<()> {
         if self.thread_index != 0 {
-            return Err(RuntimeError::invariant(
-                "Process Nodes can only start on the main thread",
-            ));
+            return Err(RuntimeError::ProcessNodesRequireMainEngine);
         }
         self.processes.start(
             Arc::clone(&self.registry),
@@ -582,21 +580,17 @@ impl Engine {
             .worker_threads
             .lock()
             .map(|mut threads| std::mem::take(&mut *threads))
-            .map_err(|_| RuntimeError::invariant("worker thread registry poisoned"))?;
-        let mut first_error = None;
+            .map_err(|_| RuntimeError::WorkerThreadRegistryPoisoned)?;
+        let mut worker_error = None;
+        let mut unwind_payload = None;
         for (worker, thread) in threads.into_iter().enumerate() {
             match thread.join() {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) if first_error.is_none() => first_error = Some(error),
+                Ok(Err(error)) if worker_error.is_none() => worker_error = Some(error),
                 Ok(Err(error)) => {
                     tracing::error!(worker, %error, "data worker failed during shutdown");
                 }
-                Err(payload) if first_error.is_none() => {
-                    first_error = Some(RuntimeError::invariant(format!(
-                        "data worker {worker} panicked: {}",
-                        thread_panic_message(payload)
-                    )));
-                }
+                Err(payload) if unwind_payload.is_none() => unwind_payload = Some(payload),
                 Err(payload) => {
                     tracing::error!(
                         worker,
@@ -606,7 +600,10 @@ impl Engine {
                 }
             }
         }
-        match first_error {
+        if let Some(payload) = unwind_payload {
+            std::panic::resume_unwind(payload);
+        }
+        match worker_error {
             Some(error) => Err(error),
             None => Ok(()),
         }
@@ -685,10 +682,12 @@ impl EngineWorkerSeed {
             index,
             numa_node,
         )?;
-        if engine.data_worker_id()? != handoff_owner {
-            return Err(RuntimeError::invariant(
-                "data worker identity does not match its Handoff owner",
-            ));
+        let worker = engine.data_worker_id()?;
+        if worker != handoff_owner {
+            return Err(RuntimeError::HandoffWorkerMismatch {
+                worker,
+                handoff_owner,
+            });
         }
         Ok(engine)
     }

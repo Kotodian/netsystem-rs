@@ -86,7 +86,7 @@ pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
         match launched {
             Ok(thread) => threads.push(thread),
             Err(error) => {
-                let fallback = RuntimeError::lifecycle(
+                let startup_error = RuntimeError::lifecycle(
                     format!("spawn data worker {thread_index}"),
                     error.to_string(),
                 );
@@ -95,7 +95,7 @@ pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
                     &workers,
                     &engine.main_loop_exit_now,
                     threads,
-                    fallback,
+                    startup_error,
                 ));
             }
         }
@@ -112,7 +112,7 @@ pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
             &workers,
             &engine.main_loop_exit_now,
             threads,
-            RuntimeError::invariant("worker exited before reaching the launch barrier"),
+            RuntimeError::WorkerExitedBeforeStartupBarrier { phase: "launch" },
         ));
     }
 
@@ -132,7 +132,7 @@ pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
             &workers,
             &engine.main_loop_exit_now,
             threads,
-            RuntimeError::invariant("worker exited before reaching the main-loop barrier"),
+            RuntimeError::WorkerExitedBeforeStartupBarrier { phase: "main-loop" },
         ));
     }
     if engine.main_loop_exit_now.load(Ordering::Acquire) {
@@ -141,7 +141,7 @@ pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
             &workers,
             &engine.main_loop_exit_now,
             threads,
-            RuntimeError::invariant("worker requested exit during initialization"),
+            RuntimeError::WorkerRequestedExitDuringInitialization,
         ));
     }
     if let Err(error) = engine.retain_worker_threads(&mut threads) {
@@ -198,31 +198,29 @@ fn abort_workers(
     workers: &AtomicU32,
     exit: &AtomicBool,
     threads: Vec<JoinHandle<RuntimeResult<()>>>,
-    fallback: RuntimeError,
+    startup_error: RuntimeError,
 ) -> RuntimeError {
     exit.store(true, Ordering::Release);
     barrier::barrier_release(wait, workers);
-    let mut first_failure = None;
+    let mut unwind_payload = None;
     for (worker, thread) in threads.into_iter().enumerate() {
         match thread.join() {
             Ok(Ok(())) => {}
-            Ok(Err(error)) if first_failure.is_none() => first_failure = Some(error),
             Ok(Err(error)) => {
                 tracing::error!(worker, %error, "data worker failed while startup aborted");
             }
-            Err(payload) => {
-                let panic = crate::engine::thread_panic_message(payload);
-                if first_failure.is_none() {
-                    first_failure = Some(RuntimeError::invariant(format!(
-                        "data worker {worker} panicked: {panic}"
-                    )));
-                } else {
-                    tracing::error!(worker, %panic, "data worker panicked while startup aborted");
-                }
-            }
+            Err(payload) if unwind_payload.is_none() => unwind_payload = Some(payload),
+            Err(payload) => tracing::error!(
+                worker,
+                panic = %crate::engine::thread_panic_message(payload),
+                "data worker panicked while startup aborted"
+            ),
         }
     }
-    first_failure.unwrap_or(fallback)
+    if let Some(payload) = unwind_payload {
+        std::panic::resume_unwind(payload);
+    }
+    startup_error
 }
 
 #[cfg(test)]

@@ -69,6 +69,106 @@ Use Rust 2024 conventions and rustfmt defaults: 4-space indentation, `snake_case
 - Enforce architectural boundaries with visibility, traits, and narrow re-exports instead of comments or convention.
 - Non-trivial designs must document the layer isolation contract: what each layer may call, what it must not call, which APIs cross the boundary, and which commands verify the boundary.
 
+### Naming rules
+
+- Name a value by its domain role, owner, and lifecycle phase, not by the order in
+  which an implementation happened to observe it. Use names such as
+  `startup_error`, `graph_update_error`, `worker_error`, and `unwind_payload`.
+  Do not prefix retained failure state with vague chronological adjectives.
+- Use `first` and `last` only when ordering is part of the domain contract, such
+  as a packet range, sequence interval, or ordered collection operation. Include
+  the ordered subject in the name; `first_sequence` is meaningful while
+  `first_result` is not.
+- Distinguish failure mechanisms in names. A returned `Error`, a panic's unwind
+  `payload`, a cancellation, and an exit `status` are not interchangeable. Do
+  not call all of them `failure`, `result`, or `outcome` when the concrete state
+  is known.
+- Name cleanup precedence explicitly. Use `primary_error` and `cleanup_error`
+  only when the API defines that precedence; otherwise name each error after the
+  operation that produced it. Cleanup must not replace the primary operation's
+  error.
+- Function and type names must state the domain operation or owned state. Avoid
+  generic suffixes such as `Helper`, `Util`, `Manager`, `Handler`, `Thing`, or
+  `Data` unless that term is the established domain concept. Do not add a
+  wrapper merely to create a place for a vague name.
+
+### Error handling rules
+
+Hammer follows VPP's separation between packet-processing errors, recoverable
+control-plane failures, and programmer bugs. Before changing an error path,
+identify the failure class, its owning module, the caller that can act on it,
+and the state that must remain unchanged or be rolled back.
+
+- Expected per-packet failures belong to the Graph Node or protocol that
+  classifies them. Record a typed node error/drop/punt counter and choose the
+  appropriate next arc; do not allocate an error, format a string, or return a
+  control-plane `Result` for every packet. This follows VPP's
+  `vlib_register_errors`, buffer error assignment, and node counters.
+- Invalid configuration, resource exhaustion, OS failures, rejected lifecycle
+  transitions, stale external handles, and plugin input are recoverable only
+  when a defined caller can respond. Represent them with an owner-local typed
+  `Result<T, E>` whose variant carries the relevant facts and, for underlying
+  failures, the original `#[source]`.
+- Absence uses `Option<T>` only when absence is an ordinary successful outcome.
+  Do not use `None`, sentinel values, empty strings, or a logged warning to hide
+  a failure that the caller must handle.
+- An impossible state produced solely by a bug in the owning module is a local
+  assertion or panic with the violated condition and relevant identity facts.
+  Do not turn programmer bugs into recoverable errors and let execution
+  continue over corrupted graph, pool, frame, queue, or ownership state. Never
+  unwind across an FFI or plugin ABI boundary; contain it at the owning runtime
+  boundary or terminate that execution scope according to its lifecycle.
+- Do not define or use catch-all production variants such as
+  `Invariant { detail: String }`, `Internal(String)`, `Other`, `Message`, or a
+  generic `Subsystem { name, source }`. Renaming one of these does not make it
+  typed. Every recoverable variant must name one actionable failure category;
+  display text is presentation, not semantic identity.
+- Error types live with the authority that owns the failed operation:
+  `hammer-infra` owns generic allocation/mapping/queue failures,
+  `hammer-core` owns failures intrinsic to packet-graph ABI values,
+  `hammer-runtime` owns graph execution, FileMain, worker, barrier, plugin-load,
+  and lifecycle failures, `hammer-service` owns interface/device/session
+  failures, and each plugin owns its protocol or device failures. Do not move a
+  business error downward merely to share its type or create a dependency
+  cycle for error conversion.
+- Translate an error at most once at a real crate, process, or ABI seam. Preserve
+  both its category and source chain; use `#[from]` only when the semantic
+  category is unchanged, otherwise construct the destination variant
+  explicitly. Do not use `to_string()`, `format!("{error}")`, message matching,
+  or repeated wrapper enums as propagation.
+- `Box<dyn Error>`, `anyhow`, and ABI carriers such as `RBoxError` may carry an
+  otherwise unnameable source at a process or DSO boundary, but they are not a
+  domain error model. The receiving owner must immediately attach the source to
+  a concrete typed category that states which operation failed. Do not expose a
+  universal boxed-error helper to internal callers.
+- Error context must be structured. Include identities needed to diagnose or
+  retry, such as node, slot, generation, worker, lifecycle stage, path, protocol,
+  or requested capacity, without embedding secrets or duplicating the source's
+  display text. Variant names and fields, not prose, are the stable contract.
+- Fallible mutation must be failure-atomic. Validate every participant before
+  mutating shared graph/topology/registry state; after the first mutation,
+  either complete infallibly or use an owner-scoped rollback guard. Never leave
+  sibling tables, pending registrations, descriptor interest, worker state, or
+  plugin publication partially updated after returning `Err`.
+- Do not discard errors with `let _ =`, `.ok()`, a wildcard arm, or log-only
+  handling unless dropping that exact failure is part of the documented domain
+  semantics. Cleanup paths must retain the primary operation's error while
+  still attempting all required releases; secondary cleanup failures must be
+  observable without replacing the primary cause.
+- At async, thread, worker, and plugin boundaries, distinguish cancellation,
+  timeout, channel closure, panic, worker exit, and the inner operation's typed
+  failure. These states have different recovery behavior and must not collapse
+  into `Lifecycle(String)` or another message-only category.
+- Tests must match concrete variants and relevant fields, verify preserved
+  `Error::source()` chains at translation seams, and assert failure atomicity or
+  retry behavior. A display-string assertion alone is not an error-contract
+  test. Expected panics are tested only for genuinely impossible internal
+  states; malformed input and resource failures must return typed errors.
+- Before adding a new public error type, variant family, conversion, helper, or
+  result alias in non-trivial VPP/TCP work, state the owner, recovery action,
+  boundary consumers, and why an existing owner-local type is insufficient,
+  then obtain the same explicit approval required for other new APIs.
+
 ## VPP Refactor Principles
 
 When working on VPP-related refactors in this repository:
@@ -104,6 +204,12 @@ Add integration tests near the crate whose behavior changes. Test files live in 
 Do not write source-text assertion tests that read `.rs`, `Cargo.toml`, or other implementation files and use `contains`, regular expressions, or string matching to claim behavioral or architectural correctness. Such tests do not prove that code compiles, symbols are registered, dynamic libraries export the required inventory, generic dispatch is preserved, or runtime state is installed. Verify those properties through compile-time type checks, real `dlopen`/`dlsym` integration tests, callable lifecycle hooks, and observable runtime graph/state assertions. Source inspection is allowed only in dedicated repository-policy tooling when the property is inherently textual and cannot be expressed through compilation or behavior; it must not substitute for an executable test.
 
 The project follows a TDD rhythm (RED → GREEN → commit) documented in `docs/superpowers/plans/`. Run `cargo test --workspace` before a PR; use `cargo test -p <crate>` while iterating.
+
+TUN/TCP lab integration is CI-only. The GitHub Actions workflow owns creation,
+configuration, diagnostics, and cleanup of the host-side utun/TUN interface;
+agents must not create the host interface or run the daemon/lab locally. Keep
+focused compile, lint, unit, integration, and lab jobs separate so a host
+capability failure cannot hide a Rust or graph-behavior failure.
 
 ## Commit & Pull Request Guidelines
 

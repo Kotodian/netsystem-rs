@@ -160,6 +160,20 @@ impl RootModule for PluginModuleRef {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PluginError {
+    #[error("plugin `{name}` is not loaded")]
+    NotLoaded { name: String },
+    #[error("plugin `{plugin}` does not export `{capability}`")]
+    CapabilityMissing {
+        plugin: &'static str,
+        capability: &'static str,
+    },
+    #[error("plugin `{plugin}` capability `{capability}` failed")]
+    CapabilityCall {
+        plugin: &'static str,
+        capability: &'static str,
+        #[source]
+        source: RBoxError,
+    },
     #[error("duplicate plugin roots at indexes {first} and {duplicate}")]
     DuplicateRoot { first: usize, duplicate: usize },
     #[error("plugin load_after cycle while loading `{path}`")]
@@ -517,7 +531,10 @@ impl PluginMain {
         self.modules_by_plugin
             .get(name)
             .copied()
-            .ok_or_else(|| RuntimeError::invariant(format!("plugin `{name}` is not loaded")))
+            .ok_or_else(|| PluginError::NotLoaded {
+                name: name.to_owned(),
+            })
+            .map_err(RuntimeError::from)
     }
 }
 

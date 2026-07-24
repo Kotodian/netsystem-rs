@@ -444,11 +444,11 @@ impl DataPlaneRuntime {
             .iter()
             .filter(|entry| matches!(entry.registration, NodeRegistration::Sibling { .. }));
         for entry in owners.chain(siblings) {
-            let node = (entry.init)(self).map_err(|err| {
-                RuntimeError::invariant(format!(
-                    "init graph node `{}`: {err}",
-                    entry.registration.name().unwrap_or("?")
-                ))
+            let node = (entry.init)(self).map_err(|source| {
+                RuntimeError::GraphNodeInitialization {
+                    node: entry.registration.name().unwrap_or("?"),
+                    source: Box::new(source),
+                }
             })?;
             self.nodes
                 .install_node_function(node, self.simd_bytes, node_functions)?;
@@ -571,9 +571,8 @@ impl DataPlaneRuntime {
         };
         let node_name = self.nodes.node_name(node)?;
         let formatter = self.nodes.node_trace_formatter(node)?;
-        let payload_bytes = bincode::serialize(&trace).map_err(|error| {
-            RuntimeError::invariant(format!("packet trace serialization failed: {error}"))
-        })?;
+        let payload_bytes = bincode::serialize(&trace)
+            .map_err(|source| RuntimeError::PacketTraceSerialization { source })?;
         self.trace
             .add_entry(handle, node, node_name, formatter, payload_bytes);
         Ok(())
@@ -590,7 +589,7 @@ impl DataPlaneRuntime {
     pub fn record_current_node_error(&self, code: u16) -> RuntimeResult<u16> {
         let node = self
             .current_node()
-            .ok_or_else(|| RuntimeError::invariant("node error set outside node processing"))?;
+            .ok_or(RuntimeError::NodeDispatchContextMissing)?;
         self.nodes.increment_node_error(node, code)
     }
 
@@ -752,9 +751,9 @@ impl DataPlaneRuntime {
         continuation: Option<N>,
     ) -> RuntimeResult<()> {
         if let Some(next) = continuation {
-            let node = self.current_node().ok_or_else(|| {
-                RuntimeError::invariant("handoff continuation outside node processing")
-            })?;
+            let node = self
+                .current_node()
+                .ok_or(RuntimeError::HandoffDispatchContextMissing)?;
             let resolved = self.nodes.node_next(node, next)?;
             self.get_buffer_mut(index)?.set_current_config(resolved);
         }

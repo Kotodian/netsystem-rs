@@ -211,9 +211,7 @@ impl ProcessMain {
         if thread::current().id() == self.owner {
             Ok(())
         } else {
-            Err(RuntimeError::invariant(
-                "Process Nodes must be controlled by their main thread",
-            ))
+            Err(RuntimeError::ProcessControlWrongThread)
         }
     }
 
@@ -227,10 +225,7 @@ impl ProcessMain {
         let mut names = Vec::with_capacity(entries.len());
         for entry in &entries {
             if names.contains(&entry.name) {
-                return Err(RuntimeError::invariant(format!(
-                    "duplicate Process Node `{}`",
-                    entry.name
-                )));
+                return Err(RuntimeError::DuplicateProcessNode { name: entry.name });
             }
             names.push(entry.name);
         }
@@ -246,13 +241,10 @@ impl ProcessMain {
             let (events, receiver) = mpsc::unbounded_channel();
             let context =
                 ProcessContext::new(entry.name, Arc::clone(&registry), runtime.clone(), receiver);
-            let future =
-                catch_unwind(AssertUnwindSafe(|| (entry.start)(context))).map_err(|_| {
-                    RuntimeError::invariant(format!(
-                        "Process Node `{}` panicked during start",
-                        entry.name
-                    ))
-                })?;
+            let future = match catch_unwind(AssertUnwindSafe(|| (entry.start)(context))) {
+                Ok(future) => future,
+                Err(payload) => std::panic::resume_unwind(payload),
+            };
             prepared.push((entry, events, future));
         }
         for (entry, events, future) in prepared {

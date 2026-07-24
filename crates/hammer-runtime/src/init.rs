@@ -20,12 +20,6 @@ pub enum InitError {
     Cycle { cycle: String },
 }
 
-impl From<InitError> for RuntimeError {
-    fn from(err: InitError) -> Self {
-        RuntimeError::invariant(err.to_string())
-    }
-}
-
 pub trait Ordered {
     fn name(&self) -> &'static str;
     fn runs_before(&self) -> &'static [&'static str] {
@@ -144,9 +138,10 @@ fn dispatch_init(
             continue;
         }
         called.insert(function.name);
-        catch_unwind(AssertUnwindSafe(|| (function.func)(engine))).map_err(|_| {
-            RuntimeError::invariant(format!("init function `{}` panicked", function.name))
-        })??;
+        match catch_unwind(AssertUnwindSafe(|| (function.func)(engine))) {
+            Ok(result) => result?,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
     Ok(())
 }
@@ -197,9 +192,10 @@ fn dispatch_config(
         if called.contains(function.name) {
             continue;
         }
-        catch_unwind(AssertUnwindSafe(|| (function.func)(document, engine))).map_err(|_| {
-            RuntimeError::invariant(format!("config function `{}` panicked", function.name))
-        })??;
+        match catch_unwind(AssertUnwindSafe(|| (function.func)(document, engine))) {
+            Ok(result) => result?,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
         called.insert(function.name);
     }
     Ok(())
