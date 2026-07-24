@@ -6,13 +6,14 @@ use std::time::Duration;
 use arc_swap::ArcSwapOption;
 
 use crate::config::{CongestionAlgorithm, TcpPluginConfig};
+use crate::congestion;
 
 /// Snapshot of `[plugin.tcp]` knobs consumed by TCP connections and timers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct TcpPolicy {
     pub mss: usize,
     pub receive_window: u32,
-    pub congestion: CongestionAlgorithm,
+    pub(crate) congestion: &'static congestion::Algorithm,
     pub nagle: bool,
     pub time_wait: Duration,
     pub paws_idle: Duration,
@@ -30,7 +31,7 @@ impl TcpPolicy {
         Self {
             mss: tcp.mss,
             receive_window: tcp.receive_window,
-            congestion: tcp.congestion,
+            congestion: congestion::resolve(tcp.congestion),
             nagle: tcp.nagle,
             time_wait: tcp.time_wait,
             paws_idle: tcp.paws_idle,
@@ -50,7 +51,7 @@ impl TcpPolicy {
         Self {
             mss: 1_440,
             receive_window: u16::MAX as u32,
-            congestion: CongestionAlgorithm::Bbr,
+            congestion: congestion::resolve(CongestionAlgorithm::Bbr),
             nagle: true,
             time_wait: Duration::from_secs(60),
             paws_idle: Duration::from_secs(24 * 60 * 60),
@@ -64,6 +65,26 @@ impl TcpPolicy {
         }
     }
 }
+
+impl PartialEq for TcpPolicy {
+    fn eq(&self, other: &Self) -> bool {
+        self.mss == other.mss
+            && self.receive_window == other.receive_window
+            && std::ptr::eq(self.congestion, other.congestion)
+            && self.nagle == other.nagle
+            && self.time_wait == other.time_wait
+            && self.paws_idle == other.paws_idle
+            && self.retransmit_initial == other.retransmit_initial
+            && self.retransmit_min == other.retransmit_min
+            && self.retransmit_max == other.retransmit_max
+            && self.keepalive_idle == other.keepalive_idle
+            && self.keepalive_probe_interval == other.keepalive_probe_interval
+            && self.keepalive_probe_limit == other.keepalive_probe_limit
+            && self.pmtu_enabled == other.pmtu_enabled
+    }
+}
+
+impl Eq for TcpPolicy {}
 
 pub static TCP_POLICY: ArcSwapOption<TcpPolicy> = ArcSwapOption::const_empty();
 

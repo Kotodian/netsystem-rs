@@ -72,11 +72,10 @@ Use Rust 2024 conventions and rustfmt defaults: 4-space indentation, `snake_case
 ### Naming rules
 
 - Follow the Rust API Guidelines naming conventions and RFC 430. Let the module
-  path provide domain context instead of repeating it in every item name: use
-  `congestion::Controller`, not `congestion::ConfiguredCongestionController`.
-  Keep word order consistent with related standard-library and crate-local
-  names. References: <https://rust-lang.github.io/api-guidelines/naming.html>
-  and <https://rust-lang.github.io/rfcs/0430-finalizing-naming-conventions.html>.
+  path provide domain context instead of repeating it in every item name. Keep
+  word order consistent with related standard-library and crate-local names.
+  References: <https://rust-lang.github.io/api-guidelines/naming.html> and
+  <https://rust-lang.github.io/rfcs/0430-finalizing-naming-conventions.html>.
 - Name types and values by what they are in the domain, not by how or when the
   implementation produced them. Prefixes such as `Configured`, `Registered`,
   `Resolved`, `Dynamic`, and `Runtime` are forbidden unless two simultaneously
@@ -212,7 +211,12 @@ When working on VPP-related refactors in this repository:
 
 For TCP, session, dataplane buffer, and recovery work:
 - Session runtime owns node scheduling. Congestion control must not schedule nodes, and current code must not introduce a congestion-control sibling/node unless explicitly approved.
-- Congestion control remains transport-agnostic and is owned through the TCP connection generic (`TcpConnection<S, C>`). It is updated through typed TCP events; it must not special-case ownership of TCP session/runtime state.
+- Congestion control remains transport-agnostic and is owned by one concrete
+  `TcpConnection` as private connection-local state. Configuration selects an
+  immutable algorithm operations table once; connections retain that table and
+  fixed aligned private state. Congestion control is updated through typed TCP
+  events and must not parameterize TCP workers or Graph Nodes, select Session
+  backends, or own TCP Session/runtime state.
 - Session owns TX byte retention and the app/session copy boundary. TCP owns sequence, ACK, loss, recovery, and timer decisions. TCP output owns TCP header prepending. Session/runtime must not know TCP header fields or TCP segment internals.
 - App-to-session data may be copied because the app boundary is designed for future cross-process operation. TCP must not retain app-ring descriptors or private payload copies for recovery; retransmit packetizes from session-owned TX FIFO bytes.
 - The app/session boundary is the only place where payload bytes may be copied into session ownership. After bytes enter the session TX FIFO, session/TCP/recovery/output/buffer/runtime/congestion-control code must not create intermediate payload `Vec`s or private payload copies; pass FIFO offsets, `BufferIndex`, buffer-chain links, timer tokens, or typed TCP facts instead.

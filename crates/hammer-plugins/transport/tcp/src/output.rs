@@ -68,7 +68,9 @@ pub fn register_tcp_output(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> 
         .node_by_name("session-queue")
         .expect("Session Queue Graph Node must be registered before TCP output");
     SessionQueueNode::compile_output_next(runtime, session_queue, node)?;
-    runtime.nodes().set_node_state(session_queue, NodeState::Disabled)?;
+    runtime
+        .nodes()
+        .set_node_state(session_queue, NodeState::Disabled)?;
     Ok(node)
 }
 

@@ -6,7 +6,6 @@ use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRunt
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use hammer_service::session::runtime::RxDelivery;
-use hammer_service::transport::congestion::CongestionController;
 
 use super::TcpNodeError;
 use super::segment::tcp_packet;
@@ -55,23 +54,21 @@ impl Node for TcpRcvProcessNode {
     }
 }
 
-pub(crate) fn tcp_rcv_process_process<C, Seg>(
+pub(crate) fn tcp_rcv_process_process<Seg>(
     runtime: &DataPlaneRuntime,
     _: NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> NodeResult
 where
-    C: CongestionController + 'static,
-    Seg: TcpWorkerStore<C>,
+    Seg: TcpWorkerStore,
     hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
-    tcp_rcv_process_frame::<C, Seg>(runtime, frame)
+    tcp_rcv_process_frame::<Seg>(runtime, frame)
 }
 
-fn tcp_rcv_process_frame<C, Seg>(runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult
+fn tcp_rcv_process_frame<Seg>(runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult
 where
-    C: CongestionController + 'static,
-    Seg: TcpWorkerStore<C>,
+    Seg: TcpWorkerStore,
     hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let input_len = frame.len();
@@ -86,7 +83,7 @@ where
     let mut out_len = 0usize;
     for offset in 0..input_len {
         let index = unsafe { inputs[offset].assume_init() };
-        if tcp_rcv_process_index(runtime, index, frame, &mut nexts, &mut out_len).is_err() {
+        if tcp_rcv_process_index::<Seg>(runtime, index, frame, &mut nexts, &mut out_len).is_err() {
             let _ = emit_local(
                 runtime,
                 frame,
@@ -123,7 +120,7 @@ fn emit_local(
     Ok(())
 }
 
-fn tcp_rcv_process_index<C, Seg>(
+fn tcp_rcv_process_index<Seg>(
     runtime: &DataPlaneRuntime,
     index: Index,
     out_frame: &mut BufferFrame,
@@ -131,12 +128,11 @@ fn tcp_rcv_process_index<C, Seg>(
     out_len: &mut usize,
 ) -> RuntimeResult<()>
 where
-    C: CongestionController + 'static,
-    Seg: TcpWorkerStore<C>,
+    Seg: TcpWorkerStore,
     hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let packet = tcp_packet(runtime, index)?;
-    let control = with_tcp_worker_mut::<C, Seg, _>(|state| {
+    let control = with_tcp_worker_mut::<Seg, _>(|state| {
         let session_id = read_session_id(runtime, index)?.ok_or_else(|| {
             let _ = runtime
                 .record_current_node_error(TcpNodeError::RcvProcessSessionRouteMissing.code());

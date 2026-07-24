@@ -4,8 +4,7 @@ use hammer_plugin_tcp::DEFAULT_TCP_OUTPUT_PAYLOAD_LEN;
 use hammer_plugin_tcp::connection::TcpConnection;
 use hammer_runtime::DataWorkerId;
 use hammer_service::transport::congestion::{
-    AckedPacket, BbrController, BbrMode, CongestionController, CongestionMetrics, LostPacket,
-    PacketNumber, RttSample,
+    AckedPacket, BbrController, BbrMode, CongestionController, RttSample,
 };
 
 const MSS: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
@@ -65,86 +64,10 @@ fn bbr_controller_reduces_cwnd_when_ack_reports_ce_feedback() {
     assert!(controller.congestion_window() < initial_cwnd + MSS * 4);
 }
 
-#[derive(Clone, Debug)]
-struct TestController(BbrController);
-
-impl CongestionController for TestController {
-    fn new(max_datagram_size: u32) -> Self {
-        Self(BbrController::new(max_datagram_size))
-    }
-
-    fn metrics(&self) -> CongestionMetrics {
-        self.0.metrics()
-    }
-
-    fn max_datagram_size(&self) -> u32 {
-        self.0.max_datagram_size()
-    }
-
-    fn congestion_window(&self) -> u32 {
-        self.0.congestion_window()
-    }
-
-    fn pacing_rate_bytes_per_second(&self) -> Option<u64> {
-        self.0.pacing_rate_bytes_per_second()
-    }
-
-    fn delivered(&self) -> u64 {
-        self.0.delivered()
-    }
-
-    fn min_rtt(&self) -> Option<Duration> {
-        self.0.min_rtt()
-    }
-
-    fn max_bandwidth_bytes_per_second(&self) -> u64 {
-        self.0.max_bandwidth_bytes_per_second()
-    }
-
-    fn on_packet_sent(
-        &mut self,
-        packet_number: PacketNumber,
-        bytes_sent: u32,
-        bytes_in_flight: u32,
-        now: Instant,
-    ) {
-        self.0
-            .on_packet_sent(packet_number, bytes_sent, bytes_in_flight, now);
-    }
-
-    fn on_ack(&mut self, now: Instant, acked: AckedPacket, rtt: RttSample, bytes_in_flight: u32) {
-        self.0.on_ack(now, acked, rtt, bytes_in_flight);
-    }
-
-    fn on_end_acks(
-        &mut self,
-        now: Instant,
-        bytes_in_flight: u32,
-        app_limited: bool,
-        largest_acked_packet: PacketNumber,
-    ) {
-        self.0
-            .on_end_acks(now, bytes_in_flight, app_limited, largest_acked_packet);
-    }
-
-    fn on_loss(&mut self, now: Instant, lost: LostPacket, persistent_congestion: bool) {
-        self.0.on_loss(now, lost, persistent_congestion);
-    }
-
-    fn on_mtu_update(&mut self, max_datagram_size: u32) {
-        self.0.on_mtu_update(max_datagram_size);
-    }
-
-    fn next_send_delay(&self, pending_bytes: u32) -> Option<Duration> {
-        self.0.next_send_delay(pending_bytes)
-    }
-}
-
 #[test]
-fn tcp_connection_uses_left_hand_congestion_controller_type() {
+fn tcp_connection_reports_congestion_without_exposing_controller_type() {
     let remote = "127.0.0.1:443".parse().expect("remote");
-    let connection: TcpConnection<TestController> =
-        TcpConnection::new(None, DataWorkerId::new(0), 10_000, None, remote);
+    let connection = TcpConnection::new(None, DataWorkerId::new(0), 10_000, None, remote);
 
-    assert_eq!(connection.congestion().max_datagram_size(), MSS);
+    assert_eq!(connection.congestion_metrics().congestion_window, MSS * 10);
 }

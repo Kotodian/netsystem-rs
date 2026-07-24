@@ -20,6 +20,7 @@ const KEEPALIVE_PROBE_LIMIT: u8 = 8;
 #[serde(rename_all = "lowercase")]
 pub enum CongestionAlgorithm {
     Bbr,
+    Cubic,
 }
 
 impl Default for CongestionAlgorithm {
@@ -290,6 +291,13 @@ address = "10.66.77.1:7300"
         assert_eq!(tcp.retransmit.initial, Duration::from_millis(100));
         assert_eq!(tcp.keepalive.probe_limit, 4);
         assert_eq!(tcp.listen.len(), 1);
+    }
+
+    #[test]
+    fn tcp_plugin_parses_cubic_congestion() {
+        let tcp = parse_tcp("congestion = \"cubic\"");
+
+        assert_eq!(tcp.congestion, CongestionAlgorithm::Cubic);
     }
 
     #[test]

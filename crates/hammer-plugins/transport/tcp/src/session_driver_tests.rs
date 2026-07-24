@@ -13,26 +13,16 @@ use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId};
 use hammer_service::data_plane::DropNode;
 use hammer_service::session::node::{SessionQueueNext, SessionQueueNode};
 use hammer_service::session::runtime::dispatch_session_queue_once;
-use hammer_service::transport::congestion::{BbrController, CongestionController};
 
 use crate::{TcpConnection, TcpWorker, TcpWorkerState, insert_tcp_session, rollback_tcp_session};
 use hammer_service::session::SessionId;
 
-fn tcp_session<C>(
-    state: &TcpWorkerState<C, Local>,
-    session_id: SessionId,
-) -> Option<&TcpConnection<C>>
-where
-    C: CongestionController + 'static,
-{
+fn tcp_session(state: &TcpWorkerState<Local>, session_id: SessionId) -> Option<&TcpConnection> {
     let (_, index) = state.sessions.session_transport(session_id)?;
     state.tcp.connections.get(index)
 }
 
-fn established_connection<C>(session_id: SessionId) -> TcpConnection<C>
-where
-    C: CongestionController,
-{
+fn established_connection(session_id: SessionId) -> TcpConnection {
     let local = "192.0.2.10:443".parse().expect("local address");
     let remote = "198.51.100.20:50001".parse().expect("remote address");
     TcpConnection::established_with_sack_for_test(
@@ -44,10 +34,7 @@ where
     )
 }
 
-fn worker_state<C>(runtime: &DataPlaneRuntime) -> TcpWorkerState<C, Local>
-where
-    C: CongestionController + 'static,
-{
+fn worker_state(runtime: &DataPlaneRuntime) -> TcpWorkerState<Local> {
     let worker = DataWorkerId::new(0);
     TcpWorkerState::new(
         hammer_service::session::SessionWorker::new(worker, runtime.buffers().clone()),
@@ -55,13 +42,7 @@ where
     )
 }
 
-fn attach_app<C>(
-    state: &mut TcpWorkerState<C, Local>,
-    session_id: SessionId,
-) -> Arc<AppSession<Local>>
-where
-    C: CongestionController + 'static,
-{
+fn attach_app(state: &mut TcpWorkerState<Local>, session_id: SessionId) -> Arc<AppSession<Local>> {
     let app = Arc::new(
         AppSession::new_in_segment(
             Local::default(),
@@ -92,14 +73,12 @@ fn session_queue(runtime: &DataPlaneRuntime) -> (NodeId, SessionQueueNext) {
     (owner, SessionQueueNext::from_slot(slot))
 }
 
-fn dispatch_session_queue<C>(
+fn dispatch_session_queue(
     runtime: &DataPlaneRuntime,
-    state: &mut TcpWorkerState<C, Local>,
+    state: &mut TcpWorkerState<Local>,
     owner: NodeId,
     output_next: SessionQueueNext,
-) where
-    C: CongestionController + 'static,
-{
+) {
     dispatch_session_queue_once(
         runtime,
         owner,
@@ -126,7 +105,7 @@ fn with_session_config_retains_custom_app_session_config() {
         runtime.buffers().clone(),
         config,
     );
-    let state = TcpWorkerState::new(sessions, TcpWorker::<BbrController>::new(worker));
+    let state = TcpWorkerState::new(sessions, TcpWorker::new(worker));
 
     assert_eq!(state.sessions.app_session_config(), config);
 }
@@ -134,7 +113,7 @@ fn with_session_config_retains_custom_app_session_config() {
 #[test]
 fn app_close_is_recorded_before_tcp_disconnect() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let mut state = worker_state::<BbrController>(&runtime);
+    let mut state = worker_state(&runtime);
     let session_id =
         insert_tcp_session(&mut state, established_connection).expect("insert TCP session");
     let app = attach_app(&mut state, session_id);
@@ -162,7 +141,7 @@ fn app_close_is_recorded_before_tcp_disconnect() {
 #[test]
 fn tcp_closed_publication_notifies_app_once_before_cleanup() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let mut state = worker_state::<BbrController>(&runtime);
+    let mut state = worker_state(&runtime);
     let session_id =
         insert_tcp_session(&mut state, established_connection).expect("insert TCP session");
     let app = attach_app(&mut state, session_id);
@@ -223,7 +202,7 @@ fn tcp_closed_publication_notifies_app_once_before_cleanup() {
 #[test]
 fn rollback_discards_unpublished_session_without_close_notification() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let mut state = worker_state::<BbrController>(&runtime);
+    let mut state = worker_state(&runtime);
     let session_id =
         insert_tcp_session(&mut state, established_connection).expect("insert TCP session");
     let app = attach_app(&mut state, session_id);

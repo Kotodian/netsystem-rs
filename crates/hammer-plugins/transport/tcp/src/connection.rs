@@ -3,6 +3,7 @@ use std::ops::{Deref, DerefMut};
 use std::time::{Duration, Instant};
 
 use super::TcpInputNext;
+use super::congestion::State;
 use super::output::{
     DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, tcp_effective_output_payload_len, tcp_send_goal_size,
 };
@@ -21,7 +22,7 @@ use hammer_infra::pool::Index as PoolIndex;
 use hammer_runtime::DataWorkerId;
 use hammer_runtime::{RuntimeError, RuntimeResult};
 use hammer_service::session::runtime::RxDelivery;
-use hammer_service::transport::congestion::CongestionController;
+use hammer_service::transport::congestion::{CongestionController, CongestionMetrics};
 use thiserror::Error;
 
 use hammer_service::session::SessionId;
@@ -251,17 +252,14 @@ struct TcpConnectionCacheline1 {
 }
 
 #[derive(Debug, Clone)]
-pub struct TcpConnection<C>
-where
-    C: CongestionController,
-{
+pub struct TcpConnection {
     cacheline0: CachePadded<TcpConnectionCacheline0>,
     cacheline1: CachePadded<TcpConnectionCacheline1>,
     retransmit_timeout: TcpRetransmitTimeoutState,
     timestamps: TcpTimestampState,
     keepalive: TcpKeepaliveState,
     ecn: TcpEcnState,
-    congestion: C,
+    congestion: State,
     recovery: TcpRecoveryState,
     sack: TcpSackState,
     time_wait: Duration,
@@ -271,10 +269,7 @@ where
     path_mtu_retransmit: bool,
 }
 
-impl<C> Deref for TcpConnection<C>
-where
-    C: CongestionController,
-{
+impl Deref for TcpConnection {
     type Target = TcpConnectionCacheline0;
 
     #[inline]
@@ -283,20 +278,14 @@ where
     }
 }
 
-impl<C> DerefMut for TcpConnection<C>
-where
-    C: CongestionController,
-{
+impl DerefMut for TcpConnection {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.cacheline0
     }
 }
 
-impl<C> TcpConnection<C>
-where
-    C: CongestionController,
-{
+impl TcpConnection {
     #[inline]
     pub(super) fn timer_state(&self) -> &TcpTimerState {
         &self.timers
@@ -351,7 +340,7 @@ where
             timestamps: TcpTimestampState::default(),
             keepalive: TcpKeepaliveState::new(Instant::now()),
             ecn: TcpEcnState::default(),
-            congestion: C::new(mss.max(1)),
+            congestion: State::new(policy.congestion, mss.max(1)),
             recovery: TcpRecoveryState::new(),
             sack: TcpSackState::default(),
             time_wait: policy.time_wait,
@@ -514,8 +503,13 @@ where
     }
 
     #[inline]
-    pub fn congestion(&self) -> &C {
+    pub(crate) fn congestion(&self) -> &State {
         &self.congestion
+    }
+
+    #[inline]
+    pub fn congestion_metrics(&self) -> CongestionMetrics {
+        self.congestion.metrics()
     }
 
     #[inline]
@@ -2472,15 +2466,15 @@ fn ace_delta(previous: u8, next: u8) -> u8 {
 mod tests {
 
     use super::*;
+    use crate::congestion::{Algorithm, State};
     use crate::timers::TcpTimers;
     use hammer_infra::pool::Pool;
     use hammer_service::session::runtime::{OooSpan, RxDelivery};
-    use hammer_service::transport::congestion::BbrController;
     use hammer_service::transport::congestion::{
         AckedPacket, CongestionMetrics, LostPacket, PacketNumber, RttSample,
     };
     use std::num::NonZeroU32;
-    fn established_connection() -> TcpConnection<BbrController> {
+    fn established_connection() -> TcpConnection {
         let local: SocketAddr = "192.0.2.10:443".parse().expect("local");
         let remote: SocketAddr = "198.51.100.20:50001".parse().expect("remote");
         TcpConnection::established_with_sack_for_test(
@@ -2493,7 +2487,7 @@ mod tests {
     }
 
     fn timer_policy_connection() -> (
-        Pool<TcpConnection<BbrController>>,
+        Pool<TcpConnection>,
         hammer_infra::pool::Index,
         TcpTimers,
         Instant,
@@ -2511,17 +2505,15 @@ mod tests {
         )
     }
 
-    fn receive_close_side_for_test<C: CongestionController>(
-        connection: &mut TcpConnection<C>,
+    fn receive_close_side_for_test(
+        connection: &mut TcpConnection,
         packet: &TcpPacket,
     ) -> RuntimeResult<Option<TcpSegment>> {
         let mut timers = TcpTimers::new(Instant::now(), Duration::from_millis(10));
         connection.receive_close_side(PoolIndex::new(0, 0), &mut timers, packet, Instant::now())
     }
 
-    fn start_local_close_for_test<C: CongestionController>(
-        connection: &mut TcpConnection<C>,
-    ) -> TcpSegment {
+    fn start_local_close_for_test(connection: &mut TcpConnection) -> TcpSegment {
         let now = Instant::now();
         let index = PoolIndex::new(0, 0);
         let mut timers = TcpTimers::new(now, Duration::from_millis(10));
@@ -2763,15 +2755,7 @@ mod tests {
         let now = Instant::now();
         let mut connections = Pool::with_capacity(1);
         let index = connections
-            .insert(
-                TcpConnection::<PacingTestCongestionController>::established_for_test(
-                    Some(TcpConnectionId::new(1)),
-                    DataWorkerId::new(0),
-                    443,
-                    Some("192.0.2.10:443".parse().expect("local")),
-                    "198.51.100.20:50001".parse().expect("remote"),
-                ),
-            )
+            .insert(established_connection_with_pacing_controller())
             .expect("insert TCP connection");
         let mut timers = TcpTimers::new(now, Duration::from_millis(10));
         {
@@ -3343,16 +3327,20 @@ mod tests {
         }
     }
 
-    fn established_connection_with_test_controller() -> TcpConnection<TestCongestionController> {
+    static TEST_CONGESTION: Algorithm = Algorithm::for_test::<TestCongestionController>("test");
+
+    fn established_connection_with_test_controller() -> TcpConnection {
         let local: SocketAddr = "192.0.2.10:443".parse().expect("local");
         let remote: SocketAddr = "198.51.100.20:50001".parse().expect("remote");
-        TcpConnection::established_for_test(
+        let mut connection = TcpConnection::established_for_test(
             Some(TcpConnectionId::new(1)),
             DataWorkerId::new(0),
             local.port(),
             Some(local),
             remote,
-        )
+        );
+        connection.congestion = State::new(&TEST_CONGESTION, DEFAULT_TCP_MAX_SEGMENT_SIZE);
+        connection
     }
 
     #[test]
@@ -3498,17 +3486,21 @@ mod tests {
         }
     }
 
-    fn established_connection_with_pacing_controller()
-    -> TcpConnection<PacingTestCongestionController> {
+    static PACING_CONGESTION: Algorithm =
+        Algorithm::for_test::<PacingTestCongestionController>("pacing-test");
+
+    fn established_connection_with_pacing_controller() -> TcpConnection {
         let local: SocketAddr = "192.0.2.10:443".parse().expect("local");
         let remote: SocketAddr = "198.51.100.20:50001".parse().expect("remote");
-        TcpConnection::established_for_test(
+        let mut connection = TcpConnection::established_for_test(
             Some(TcpConnectionId::new(11)),
             DataWorkerId::new(0),
             local.port(),
             Some(local),
             remote,
-        )
+        );
+        connection.congestion = State::new(&PACING_CONGESTION, DEFAULT_TCP_MAX_SEGMENT_SIZE);
+        connection
     }
 
     #[test]
@@ -3533,7 +3525,7 @@ mod tests {
     fn tcp_syn_retransmit_sets_classic_ecn_handshake_flags() {
         let local: SocketAddr = "192.0.2.10:443".parse().expect("local");
         let remote: SocketAddr = "198.51.100.20:50001".parse().expect("remote");
-        let mut connection = TcpConnection::<BbrController>::new(
+        let mut connection = TcpConnection::new(
             Some(TcpConnectionId::new(1)),
             DataWorkerId::new(0),
             local.port(),
@@ -3571,7 +3563,7 @@ mod tests {
     fn tcp_syn_data_retransmit_preserves_payload_len_and_cookie() {
         let local: SocketAddr = "192.0.2.10:443".parse().expect("local");
         let remote: SocketAddr = "198.51.100.20:50001".parse().expect("remote");
-        let mut connection = TcpConnection::<BbrController>::new(
+        let mut connection = TcpConnection::new(
             Some(TcpConnectionId::new(1)),
             DataWorkerId::new(0),
             local.port(),
@@ -3624,7 +3616,7 @@ mod tests {
     fn tcp_syn_data_ack_releases_payload_without_consuming_syn_control_byte() {
         let local: SocketAddr = "192.0.2.10:443".parse().expect("local");
         let remote: SocketAddr = "198.51.100.20:50001".parse().expect("remote");
-        let mut connection = TcpConnection::<BbrController>::new(
+        let mut connection = TcpConnection::new(
             Some(TcpConnectionId::new(1)),
             DataWorkerId::new(0),
             local.port(),
@@ -3651,7 +3643,7 @@ mod tests {
 
         let local: SocketAddr = "192.0.2.10:443".parse().expect("local");
         let remote: SocketAddr = "198.51.100.20:50001".parse().expect("remote");
-        let connection = TcpConnection::<BbrController>::new(
+        let connection = TcpConnection::new(
             Some(TcpConnectionId::new(1)),
             DataWorkerId::new(0),
             local.port(),
@@ -3751,7 +3743,7 @@ mod tests {
     fn tcp_receive_syn_echoes_peer_timestamp_in_syn_ack() {
         let local: SocketAddr = "192.0.2.10:443".parse().expect("local");
         let remote: SocketAddr = "198.51.100.20:50001".parse().expect("remote");
-        let mut connection = TcpConnection::<BbrController>::new(
+        let mut connection = TcpConnection::new(
             Some(TcpConnectionId::new(9)),
             DataWorkerId::new(0),
             local.port(),
@@ -4659,24 +4651,15 @@ mod tests {
     use hammer_infra::segment::Local;
     use hammer_service::session::SessionId;
 
-    fn session<C>(
-        state: &TcpWorkerState<C, Local>,
-        session_id: SessionId,
-    ) -> Option<&TcpConnection<C>>
-    where
-        C: CongestionController + 'static,
-    {
+    fn session(state: &TcpWorkerState<Local>, session_id: SessionId) -> Option<&TcpConnection> {
         let (_, index) = state.sessions.session_transport(session_id)?;
         state.tcp.connections.get(index)
     }
 
-    fn session_mut<C>(
-        state: &mut TcpWorkerState<C, Local>,
+    fn session_mut(
+        state: &mut TcpWorkerState<Local>,
         session_id: SessionId,
-    ) -> Option<&mut TcpConnection<C>>
-    where
-        C: CongestionController + 'static,
-    {
+    ) -> Option<&mut TcpConnection> {
         let (_, index) = state.sessions.session_transport(session_id)?;
         state.tcp.connections.get_mut(index)
     }
@@ -4704,14 +4687,12 @@ mod tests {
         }
     }
 
-    fn drive_fin_ack_to_time_wait<C>(
-        driver: &mut TcpWorkerState<C, Local>,
+    fn drive_fin_ack_to_time_wait(
+        driver: &mut TcpWorkerState<Local>,
         session_id: SessionId,
         local: SocketAddr,
         remote: SocketAddr,
-    ) where
-        C: CongestionController + 'static,
-    {
+    ) {
         let (_, index) = driver
             .sessions
             .session_transport(session_id)
@@ -4756,7 +4737,7 @@ mod tests {
     }
 
     fn enter_close_wait_for_passive_close_test(
-        driver: &mut TcpWorkerState<BbrController, Local>,
+        driver: &mut TcpWorkerState<Local>,
         session_id: SessionId,
         local: SocketAddr,
         remote: SocketAddr,
@@ -4786,7 +4767,7 @@ mod tests {
 
     #[test]
     fn tcp_passive_close_fin_in_established_enters_close_wait_and_acks() {
-        let (mut driver, session_id, local, remote) = closing_session_for_test::<BbrController>();
+        let (mut driver, session_id, local, remote) = closing_session_for_test();
 
         let (rcv_nxt, snd_nxt) = {
             let connection = session(&driver, session_id).expect("connection");
@@ -4817,7 +4798,7 @@ mod tests {
 
     #[test]
     fn tcp_passive_close_local_close_after_peer_fin_enters_last_ack() {
-        let (mut driver, session_id, local, remote) = closing_session_for_test::<BbrController>();
+        let (mut driver, session_id, local, remote) = closing_session_for_test();
 
         enter_close_wait_for_passive_close_test(&mut driver, session_id, local, remote);
 
@@ -4833,7 +4814,7 @@ mod tests {
 
     #[test]
     fn tcp_passive_close_peer_ack_final_fin_closes() {
-        let (mut driver, session_id, local, remote) = closing_session_for_test::<BbrController>();
+        let (mut driver, session_id, local, remote) = closing_session_for_test();
 
         enter_close_wait_for_passive_close_test(&mut driver, session_id, local, remote);
 
@@ -4868,7 +4849,7 @@ mod tests {
 
     #[test]
     fn tcp_fin_path_enters_time_wait_and_retains_session_until_expiry() {
-        let (mut driver, session_id, local, remote) = closing_session_for_test::<BbrController>();
+        let (mut driver, session_id, local, remote) = closing_session_for_test();
 
         drive_fin_ack_to_time_wait(&mut driver, session_id, local, remote);
 
@@ -4879,7 +4860,7 @@ mod tests {
 
     #[test]
     fn tcp_time_wait_duplicate_fin_reacks_and_rearms_timer() {
-        let (mut driver, session_id, local, remote) = closing_session_for_test::<BbrController>();
+        let (mut driver, session_id, local, remote) = closing_session_for_test();
 
         drive_fin_ack_to_time_wait(&mut driver, session_id, local, remote);
 

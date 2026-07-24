@@ -9,7 +9,6 @@ use hammer_service::session::runtime::RxDelivery;
 use super::TcpNodeError;
 use super::segment::tcp_packet;
 use hammer_service::session::app::SessionAppRuntimeCreate;
-use hammer_service::transport::congestion::CongestionController;
 
 #[hammer_component_macros::node_next]
 pub enum TcpEstablishedNext {
@@ -54,23 +53,21 @@ impl Node for TcpEstablishedNode {
     }
 }
 
-pub(crate) fn tcp_established_process<C, Seg>(
+pub(crate) fn tcp_established_process<Seg>(
     runtime: &DataPlaneRuntime,
     _: NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> NodeResult
 where
-    C: CongestionController + 'static,
-    Seg: TcpWorkerStore<C>,
+    Seg: TcpWorkerStore,
     hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
-    tcp_established_frame::<C, Seg>(runtime, frame)
+    tcp_established_frame::<Seg>(runtime, frame)
 }
 
-fn tcp_established_frame<C, Seg>(runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult
+fn tcp_established_frame<Seg>(runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult
 where
-    C: CongestionController + 'static,
-    Seg: TcpWorkerStore<C>,
+    Seg: TcpWorkerStore,
     hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let input_len = frame.len();
@@ -85,7 +82,7 @@ where
     let mut out_len = 0usize;
     for offset in 0..input_len {
         let index = unsafe { inputs[offset].assume_init() };
-        if tcp_established_index(runtime, index, frame, &mut nexts, &mut out_len).is_err() {
+        if tcp_established_index::<Seg>(runtime, index, frame, &mut nexts, &mut out_len).is_err() {
             let _ = emit_local(
                 runtime,
                 frame,
@@ -122,7 +119,7 @@ fn emit_local(
     Ok(())
 }
 
-fn tcp_established_index<C, Seg>(
+fn tcp_established_index<Seg>(
     runtime: &DataPlaneRuntime,
     index: Index,
     out_frame: &mut BufferFrame,
@@ -130,12 +127,11 @@ fn tcp_established_index<C, Seg>(
     out_len: &mut usize,
 ) -> RuntimeResult<()>
 where
-    C: CongestionController + 'static,
-    Seg: TcpWorkerStore<C>,
+    Seg: TcpWorkerStore,
     hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let packet = tcp_packet(runtime, index)?;
-    let tx_segment = with_tcp_worker_mut::<C, Seg, _>(|state| {
+    let tx_segment = with_tcp_worker_mut::<Seg, _>(|state| {
         let session_id = read_session_id(runtime, index)?.ok_or_else(|| {
             let _ = runtime
                 .record_current_node_error(TcpNodeError::EstablishedSessionRouteMissing.code());

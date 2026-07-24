@@ -18,23 +18,15 @@ use hammer_service::session::runtime::{
     SessionPacketizedTransport, SessionPacketizedTx, SessionTransport, SessionTransportId,
     SessionWorker, TransportSendFlags, TransportSendParams, TxBatchBuffer,
 };
-use hammer_service::transport::congestion::CongestionController;
-
 const DEFAULT_TCP_CONNECTION_CAPACITY: usize = 1024;
 
-pub struct TcpWorker<C>
-where
-    C: CongestionController,
-{
-    pub(crate) connections: Pool<TcpConnection<C>>,
+pub struct TcpWorker {
+    pub(crate) connections: Pool<TcpConnection>,
     pub(crate) lookup: TcpLookupState,
     pub(super) timers: TcpTimers,
 }
 
-impl<C> TcpWorker<C>
-where
-    C: CongestionController + 'static,
-{
+impl TcpWorker {
     #[inline]
     pub fn new(worker: DataWorkerId) -> Self {
         Self {
@@ -50,27 +42,24 @@ where
     }
 
     #[inline]
-    pub(crate) fn insert_connection(
-        &mut self,
-        connection: TcpConnection<C>,
-    ) -> RuntimeResult<Index> {
+    pub(crate) fn insert_connection(&mut self, connection: TcpConnection) -> RuntimeResult<Index> {
         self.connections
             .insert(connection)
             .ok_or_else(|| RuntimeError::invariant("TCP connection pool capacity exhausted"))
     }
 
     #[inline]
-    pub(crate) fn connection(&self, index: Index) -> Option<&TcpConnection<C>> {
+    pub(crate) fn connection(&self, index: Index) -> Option<&TcpConnection> {
         self.connections.get(index)
     }
 
     #[inline]
-    pub(crate) fn connection_mut(&mut self, index: Index) -> Option<&mut TcpConnection<C>> {
+    pub(crate) fn connection_mut(&mut self, index: Index) -> Option<&mut TcpConnection> {
         self.connections.get_mut(index)
     }
 
     #[inline]
-    pub(crate) fn remove_connection(&mut self, index: Index) -> Option<TcpConnection<C>> {
+    pub(crate) fn remove_connection(&mut self, index: Index) -> Option<TcpConnection> {
         self.connections.remove(index)
     }
 
@@ -162,9 +151,8 @@ where
     }
 }
 
-impl<C, Seg> SessionTransport<Index, Seg> for TcpWorker<C>
+impl<Seg> SessionTransport<Index, Seg> for TcpWorker
 where
-    C: CongestionController + 'static,
     Seg: SessionSegment,
     SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
@@ -247,9 +235,8 @@ where
     }
 }
 
-impl<C, Seg> SessionPacketizedTransport<Index, Seg> for TcpWorker<C>
+impl<Seg> SessionPacketizedTransport<Index, Seg> for TcpWorker
 where
-    C: CongestionController + 'static,
     Seg: SessionSegment,
     SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {

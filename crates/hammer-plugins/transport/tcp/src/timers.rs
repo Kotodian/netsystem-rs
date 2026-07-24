@@ -7,7 +7,6 @@ use hammer_runtime::RuntimeResult;
 
 use super::TcpNodeError;
 use super::connection::TcpConnection;
-use hammer_service::transport::congestion::CongestionController;
 
 const TCP_TIMER_MAX_TICKS_PER_UPDATE: u32 = 1_024;
 const TCP_TIMER_EXPIRY_BUDGET: usize = 256;
@@ -198,10 +197,7 @@ impl TcpTimers {
         Ok(())
     }
 
-    pub(super) fn advance<C>(&mut self, now: Instant, connections: &mut Pool<TcpConnection<C>>)
-    where
-        C: CongestionController,
-    {
+    pub(super) fn advance(&mut self, now: Instant, connections: &mut Pool<TcpConnection>) {
         let elapsed_ticks = self.elapsed_ticks(now);
         if elapsed_ticks == 0 {
             return;
@@ -238,13 +234,10 @@ impl TcpTimers {
         }
     }
 
-    pub(super) fn take_pending<C>(
+    pub(super) fn take_pending(
         &mut self,
-        connections: &mut Pool<TcpConnection<C>>,
-    ) -> Option<TcpTimerToken>
-    where
-        C: CongestionController,
-    {
+        connections: &mut Pool<TcpConnection>,
+    ) -> Option<TcpTimerToken> {
         while let Some(token) = self.pending.pop_front() {
             let Some(connection) = connections.get_mut(token.index) else {
                 continue;
@@ -298,14 +291,12 @@ mod tests {
         TcpTimers,
     };
     use crate::TcpConnection;
-    use hammer_service::transport::congestion::BbrController;
-
-    fn test_connection() -> TcpConnection<BbrController> {
+    fn test_connection() -> TcpConnection {
         let remote: SocketAddr = "198.51.100.20:443".parse().expect("remote address");
         TcpConnection::new(None, DataWorkerId::new(0), 0, None, remote)
     }
 
-    fn test_connections() -> (Pool<TcpConnection<BbrController>>, Index) {
+    fn test_connections() -> (Pool<TcpConnection>, Index) {
         let mut connections = Pool::with_capacity(1);
         let index = connections
             .insert(test_connection())
@@ -313,10 +304,7 @@ mod tests {
         (connections, index)
     }
 
-    fn test_timer_state<C>(connections: &Pool<TcpConnection<C>>, index: Index) -> TcpTimerState
-    where
-        C: hammer_service::transport::congestion::CongestionController,
-    {
+    fn test_timer_state(connections: &Pool<TcpConnection>, index: Index) -> TcpTimerState {
         *connections
             .get(index)
             .expect("test connection")

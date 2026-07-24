@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use super::types::{AckedPacket, CongestionMetrics, LostPacket, PacketNumber, RttSample};
 
-pub trait CongestionController: Clone + core::fmt::Debug {
+pub trait CongestionController: Clone + core::fmt::Debug + Send + Sync + 'static {
     fn new(max_datagram_size: u32) -> Self
     where
         Self: Sized;

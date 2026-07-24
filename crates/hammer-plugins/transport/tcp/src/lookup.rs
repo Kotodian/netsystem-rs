@@ -12,7 +12,6 @@ use hammer_runtime::DataWorkerId;
 
 use crate::{TcpConnection, TcpInputNext, TcpState, TransportConnectionKey};
 use hammer_service::session::SessionId;
-use hammer_service::transport::congestion::CongestionController;
 
 pub type TcpLookupId = u32;
 
@@ -1406,14 +1405,11 @@ impl TcpLookupState {
     }
 
     #[inline]
-    pub(crate) fn publish_connection<C>(
+    pub(crate) fn publish_connection(
         &mut self,
         session_id: SessionId,
-        connection: &TcpConnection<C>,
-    ) -> bool
-    where
-        C: CongestionController + 'static,
-    {
+        connection: &TcpConnection,
+    ) -> bool {
         let pending_capabilities = self.pending.capabilities_by_session(session_id);
         self.forget_session(session_id);
         self.forget_pending_open(session_id);

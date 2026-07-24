@@ -888,11 +888,10 @@ mod tests {
         let error = main
             .set_worker_node_runtime_data(NodeId::new(0), NodeRuntimeData::empty())
             .expect_err("main thread must not bind worker runtime data");
-        assert!(
-            error
-                .to_string()
-                .contains("main thread has no data worker id")
-        );
+        assert!(matches!(
+            error,
+            RuntimeError::DataWorkerIdUnavailable { thread_index: 0 }
+        ));
     }
 
     #[test]

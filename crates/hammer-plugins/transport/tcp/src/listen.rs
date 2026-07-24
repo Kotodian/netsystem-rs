@@ -19,7 +19,6 @@ use hammer_service::opaque::NetworkOpaque;
 use hammer_service::session::SessionId;
 use hammer_service::session::app::SessionAppRuntimeCreate;
 use hammer_service::session::runtime::RxDelivery;
-use hammer_service::transport::congestion::CongestionController;
 
 const TCP_LISTENER_BACKLOG: usize = 128;
 
@@ -133,32 +132,30 @@ impl Node for TcpListenNode {
     }
 }
 
-pub(crate) fn tcp_listen_process<C, Seg>(
+pub(crate) fn tcp_listen_process<Seg>(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> NodeResult
 where
-    C: CongestionController + 'static,
-    Seg: TcpWorkerStore<C>,
+    Seg: TcpWorkerStore,
     hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let control = match tcp_listen_control(data) {
         Ok(c) => c,
         Err(_) => return NodeResult::drop(),
     };
-    tcp_listen_process_frame::<C, Seg>(runtime, frame, &control)
+    tcp_listen_process_frame::<Seg>(runtime, frame, &control)
 }
 
 #[inline]
-fn tcp_listen_process_frame<C, Seg>(
+fn tcp_listen_process_frame<Seg>(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
     control: &TcpInputControlPlane,
 ) -> NodeResult
 where
-    C: CongestionController + 'static,
-    Seg: TcpWorkerStore<C>,
+    Seg: TcpWorkerStore,
     hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let input_len = frame.len();
@@ -173,7 +170,9 @@ where
     let mut out_len = 0usize;
     for offset in 0..input_len {
         let index = unsafe { inputs[offset].assume_init() };
-        if tcp_listen_index(runtime, index, control, frame, &mut nexts, &mut out_len).is_err() {
+        if tcp_listen_index::<Seg>(runtime, index, control, frame, &mut nexts, &mut out_len)
+            .is_err()
+        {
             let _ = emit_local(
                 runtime,
                 frame,
@@ -210,7 +209,7 @@ fn emit_local(
     Ok(())
 }
 
-fn tcp_listen_index<C, Seg>(
+fn tcp_listen_index<Seg>(
     runtime: &DataPlaneRuntime,
     index: Index,
     control: &TcpInputControlPlane,
@@ -219,8 +218,7 @@ fn tcp_listen_index<C, Seg>(
     out_len: &mut usize,
 ) -> RuntimeResult<()>
 where
-    C: CongestionController + 'static,
-    Seg: TcpWorkerStore<C>,
+    Seg: TcpWorkerStore,
     hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let packet = tcp_packet(runtime, index)?;
@@ -228,8 +226,8 @@ where
         let _ = runtime.record_current_node_error(TcpNodeError::NoListener.code());
         TcpError::NoListener
     })?;
-    let (control_segment, established_session) = with_tcp_worker_mut::<C, Seg, _>(|state| {
-        let (control, session_id) = tcp_handle_listener_packet(
+    let (control_segment, established_session) = with_tcp_worker_mut::<Seg, _>(|state| {
+        let (control, session_id) = tcp_handle_listener_packet::<Seg>(
             runtime,
             index,
             state,
@@ -279,21 +277,20 @@ where
     Ok(())
 }
 
-fn tcp_handle_listener_packet<C, Seg>(
+fn tcp_handle_listener_packet<Seg>(
     runtime: &DataPlaneRuntime,
     index: Index,
-    state: &mut TcpWorkerState<C, Seg>,
+    state: &mut TcpWorkerState<Seg>,
     listener_id: u32,
     capabilities: crate::TcpCapabilities,
     packet: &TcpPacket,
 ) -> RuntimeResult<(Option<TcpSegment>, Option<SessionId>)>
 where
-    C: CongestionController + 'static,
-    Seg: TcpWorkerStore<C>,
+    Seg: TcpWorkerStore,
     hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     if packet.flags == TcpSegmentFlags::SYN {
-        return tcp_issue_listener_challenge(
+        return tcp_issue_listener_challenge::<Seg>(
             runtime,
             index,
             state,
@@ -303,22 +300,21 @@ where
         );
     }
     if packet.flags.contains(TcpSegmentFlags::ACK) && !packet.flags.contains(TcpSegmentFlags::RST) {
-        return tcp_complete_listener_open(state, listener_id, capabilities, packet);
+        return tcp_complete_listener_open::<Seg>(state, listener_id, capabilities, packet);
     }
     Ok((None, None))
 }
 
-fn tcp_issue_listener_challenge<C, Seg>(
+fn tcp_issue_listener_challenge<Seg>(
     runtime: &DataPlaneRuntime,
     index: Index,
-    state: &mut TcpWorkerState<C, Seg>,
+    state: &mut TcpWorkerState<Seg>,
     listener_id: u32,
     capabilities: crate::TcpCapabilities,
     packet: &TcpPacket,
 ) -> RuntimeResult<(Option<TcpSegment>, Option<SessionId>)>
 where
-    C: CongestionController + 'static,
-    Seg: TcpWorkerStore<C>,
+    Seg: TcpWorkerStore,
     hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let fast_open_valid = if packet.payload_len != 0 && capabilities.fast_open {
@@ -335,7 +331,7 @@ where
         false
     };
     if fast_open_valid {
-        return tcp_accept_listener_fast_open(
+        return tcp_accept_listener_fast_open::<Seg>(
             runtime,
             index,
             state,
@@ -402,17 +398,16 @@ where
     ))
 }
 
-fn tcp_accept_listener_fast_open<C, Seg>(
+fn tcp_accept_listener_fast_open<Seg>(
     runtime: &DataPlaneRuntime,
     index: Index,
-    state: &mut TcpWorkerState<C, Seg>,
+    state: &mut TcpWorkerState<Seg>,
     listener_id: u32,
     capabilities: crate::TcpCapabilities,
     packet: &TcpPacket,
 ) -> RuntimeResult<(Option<TcpSegment>, Option<SessionId>)>
 where
-    C: CongestionController + 'static,
-    Seg: TcpWorkerStore<C>,
+    Seg: TcpWorkerStore,
     hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let worker_id = state.sessions.worker();
@@ -473,15 +468,14 @@ where
     result
 }
 
-fn tcp_complete_listener_open<C, Seg>(
-    state: &mut TcpWorkerState<C, Seg>,
+fn tcp_complete_listener_open<Seg>(
+    state: &mut TcpWorkerState<Seg>,
     listener_id: u32,
     capabilities: crate::TcpCapabilities,
     packet: &TcpPacket,
 ) -> RuntimeResult<(Option<TcpSegment>, Option<SessionId>)>
 where
-    C: CongestionController + 'static,
-    Seg: TcpWorkerStore<C>,
+    Seg: TcpWorkerStore,
     hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let Some(acknowledgment) = packet.acknowledgment else {
