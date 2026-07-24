@@ -77,11 +77,7 @@ pub fn barrier_sync(
     BarrierGuard::new(wait, workers, caller)
 }
 
-fn barrier_release_from(
-    wait: &AtomicU32,
-    workers: &AtomicU32,
-    caller: &'static Location<'static>,
-) {
+fn barrier_release_from(wait: &AtomicU32, workers: &AtomicU32, caller: &'static Location<'static>) {
     let recursion_level = wait.fetch_sub(1, Ordering::Release);
     if recursion_level == 0 {
         barrier_deadlock_at("barrier release without matching sync", 1, 0, caller);

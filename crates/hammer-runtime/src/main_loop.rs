@@ -51,9 +51,6 @@ pub fn engine_main_loop(
         {
             return 1;
         }
-        if let Some(status) = requested_exit_status(engine) {
-            return status;
-        }
 
         // Step 2: Poll worker-local File readiness before graph dispatch.
         match engine.poll_file_readiness() {

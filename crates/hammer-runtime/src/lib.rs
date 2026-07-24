@@ -15,7 +15,7 @@ crate::__declare_registration_image!(
     init_functions = [graph::install::__INIT_FN_INSTALL_PACKET_GRAPH];
     config_functions = [trace::__CONFIG_FN_RUNTIME_TRACE_CONFIG];
     early_config_functions = [memory::__CONFIG_FN_RUNTIME_WORKER_CONFIG];
-    main_loop_enter_functions = [];
+    main_loop_enter_functions = [start_workers::__INIT_FN_START_WORKERS];
     main_loop_exit_functions = [];
     worker_init_functions = [];
     graph_nodes = [];

@@ -297,3 +297,23 @@ fn data_worker_startup_is_transactional() {
     assert_eq!(ABORT_OBSERVED.load(Ordering::Acquire), 1);
     stop_workers(&mut pool);
 }
+
+#[test]
+fn runtime_main_loop_enter_catalog_starts_workers() {
+    reset(READY);
+    let mut pool = engine_pool();
+
+    hammer_runtime::init::run_main_loop_enter(pool.main_engine_mut())
+        .expect("run runtime main-loop-enter catalog");
+
+    assert_eq!(INITIALIZED.load(Ordering::Acquire), 0b11);
+    assert_eq!(DISPATCHED.load(Ordering::Acquire), 0b11);
+    assert_eq!(
+        pool.main_engine()
+            .worker_runtime_stats_snapshot()
+            .expect("snapshot workers started by runtime lifecycle")
+            .len(),
+        2
+    );
+    stop_workers(&mut pool);
+}
