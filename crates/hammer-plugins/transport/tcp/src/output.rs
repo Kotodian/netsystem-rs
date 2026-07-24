@@ -1,16 +1,14 @@
 #[cfg(test)]
 use crate::{TCP_FLAG_ACK, TCP_FLAG_PSH};
-#[cfg(test)]
-use hammer_runtime::InternalNode;
 use crate::{TCP_FLAG_FIN, TCP_FLAG_SYN, tcp_header};
 use abi_stable::{
     RRef,
     std_types::{RSlice, RSliceMut},
 };
 use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId};
-use hammer_runtime::{
-    DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
-};
+#[cfg(test)]
+use hammer_runtime::InternalNode;
+use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use super::{TcpOutputError, read_tcp_egress_endpoints};
@@ -51,10 +49,9 @@ pub fn register_tcp_output(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> 
     if let Some(node) = runtime.nodes().node_by_name(TcpOutputNode::NODE_NAME) {
         return Ok(node);
     }
-    runtime.nodes().try_register_internal_with_next_names(
-        TcpOutputNode::new(),
-        &TcpOutputNext::NEXT_NAMES,
-    )
+    runtime
+        .nodes()
+        .try_register_internal_with_next_names(TcpOutputNode::new(), &TcpOutputNext::NEXT_NAMES)
 }
 
 impl Node for TcpOutputNode {

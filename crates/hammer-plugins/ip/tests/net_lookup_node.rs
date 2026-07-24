@@ -1091,12 +1091,9 @@ fn ip_input_to_lookup_graph_routes_packet_by_fib() {
     let input = runtime
         .nodes()
         .register_internal(IpInputNode::<IpUnicastArc>::new());
-    for (next, target) in IpInputNext::VARIANTS
-        .into_iter()
-        .zip(IpInputNext::nodes(
-            drop, drop, drop, lookup, drop, drop, drop,
-        ))
-    {
+    for (next, target) in IpInputNext::VARIANTS.into_iter().zip(IpInputNext::nodes(
+        drop, drop, drop, lookup, drop, drop, drop,
+    )) {
         runtime
             .nodes()
             .set_node_next(input, next, target)
@@ -1132,9 +1129,7 @@ fn ip_input_batches_lookup_packets_into_one_scheduled_next_frame() {
         .register_internal(IpInputNode::<IpUnicastArc>::new());
     for (next, target) in IpInputNext::VARIANTS
         .into_iter()
-        .zip(IpInputNext::nodes(
-            drop, drop, drop, sink, drop, drop, drop,
-        ))
+        .zip(IpInputNext::nodes(drop, drop, drop, sink, drop, drop, drop))
     {
         runtime
             .nodes()
@@ -1195,12 +1190,9 @@ fn ip_lookup_uses_ip_input_cursor_without_reparsing_current_header() {
     let input = runtime
         .nodes()
         .register_internal(IpInputNode::<IpUnicastArc>::new());
-    for (next, target) in IpInputNext::VARIANTS
-        .into_iter()
-        .zip(IpInputNext::nodes(
-            drop, drop, drop, corrupt, drop, drop, drop,
-        ))
-    {
+    for (next, target) in IpInputNext::VARIANTS.into_iter().zip(IpInputNext::nodes(
+        drop, drop, drop, corrupt, drop, drop, drop,
+    )) {
         runtime
             .nodes()
             .set_node_next(input, next, target)

@@ -21,10 +21,9 @@ pub enum TcpResetNext {
 pub struct TcpResetNode;
 
 pub fn register_tcp_reset(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
-    runtime.nodes().try_register_internal_with_next_names(
-        TcpResetNode::new(),
-        &TcpResetNext::NEXT_NAMES,
-    )
+    runtime
+        .nodes()
+        .try_register_internal_with_next_names(TcpResetNode::new(), &TcpResetNext::NEXT_NAMES)
 }
 
 impl Node for TcpResetNode {

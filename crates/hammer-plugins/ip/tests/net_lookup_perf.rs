@@ -430,12 +430,9 @@ fn build_input_lookup(
     let input = runtime
         .nodes()
         .register_internal(IpInputNode::<IpUnicastArc>::new());
-    for (next, target) in IpInputNext::VARIANTS
-        .into_iter()
-        .zip(IpInputNext::nodes(
-            drop, drop, drop, lookup, drop, drop, drop,
-        ))
-    {
+    for (next, target) in IpInputNext::VARIANTS.into_iter().zip(IpInputNext::nodes(
+        drop, drop, drop, lookup, drop, drop, drop,
+    )) {
         runtime
             .nodes()
             .set_node_next(input, next, target)

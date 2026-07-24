@@ -6,9 +6,7 @@ use std::sync::Arc;
 
 use crate::{TcpError, TcpInputFlags, TcpSegmentFlags, tcp_header};
 use arc_swap::ArcSwap;
-use hammer_core::data_plane::{
-    BufferFrame, BufferPacketCursor, Index, NodeHandle, NodeId, SecondaryOpaque,
-};
+use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeHandle, SecondaryOpaque};
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
     TraceFormatter, add_packet_trace, format_packet_trace,
@@ -80,10 +78,7 @@ impl TcpInputControlPlane {
     }
 
     #[inline]
-    pub(crate) fn node<C, Seg>(
-        &self,
-        handoff: Option<(NodeHandle, DataWorkerId)>,
-    ) -> TcpInputNode
+    pub(crate) fn node<C, Seg>(&self, handoff: Option<(NodeHandle, DataWorkerId)>) -> TcpInputNode
     where
         C: CongestionController + 'static,
         Seg: TcpWorkerStore<C>,
@@ -115,15 +110,16 @@ pub struct TcpInputNode {
 }
 
 impl TcpInputNode {
-    pub(crate) fn for_worker<C, Seg>(
-        snapshot: Arc<ArcSwap<TcpLookupSnapshot>>,
-    ) -> Self
+    pub(crate) fn for_worker<C, Seg>(snapshot: Arc<ArcSwap<TcpLookupSnapshot>>) -> Self
     where
         C: CongestionController + 'static,
         Seg: TcpWorkerStore<C>,
         hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
     {
-        Self::new(register_tcp_input_runtime(snapshot), tcp_input_process::<C, Seg>)
+        Self::new(
+            register_tcp_input_runtime(snapshot),
+            tcp_input_process::<C, Seg>,
+        )
     }
 }
 

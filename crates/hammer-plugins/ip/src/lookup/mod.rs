@@ -183,6 +183,11 @@ impl FibContributions {
         source: FibSource,
         contribution: FibContribution,
     ) -> RuntimeResult<()> {
+        if matches!(&contribution, FibContribution::Paths(paths) if paths.is_empty()) {
+            return Err(RuntimeError::config_validation(format!(
+                "FIB source {source:?} for {prefix} must contribute at least one path"
+            )));
+        }
         let sources = self.by_prefix.entry(prefix).or_default();
         match (sources.get_mut(&source), contribution) {
             (None, contribution) => {
@@ -390,7 +395,11 @@ impl IpMain {
                 )
             })
             .collect::<Vec<_>>();
-        let load_balance = builder.add_load_balance(proto, buckets);
+        let load_balance = builder.try_add_load_balance(proto, buckets).map_err(|error| {
+            RuntimeError::config_validation(format!(
+                "FIB paths for {prefix} cannot form a load balance: {error:?}"
+            ))
+        })?;
         builder.add_route(prefix, load_balance);
         Ok(())
     }
@@ -888,8 +897,9 @@ impl Node for AdjacencyRewriteNode {
 }
 
 pub fn register_adjacency_rewrite(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
-    let main = IP_MAIN
-        .load()
+    let main_guard = IP_MAIN.load();
+    let main = main_guard
+        .as_ref()
         .ok_or_else(|| RuntimeError::invariant("ip main not initialized"))?;
     let control = main.control_plane()?;
     runtime.nodes().try_register_internal_with_next_names(
@@ -1276,6 +1286,117 @@ mod tests {
             .adjacency(connected.dpo.adjacency_index().expect("adjacency"))
             .expect("adjacency record");
         assert_eq!(adjacency.egress_interface, Some(interface));
+    }
+
+    #[test]
+    fn interface_source_wins_and_api_source_returns_after_withdrawal() {
+        let prefix = "198.51.100.0/24".parse().expect("prefix");
+        let mut contributions = FibContributions::default();
+        contributions
+            .insert(prefix, FibSource::Api, FibContribution::Drop)
+            .expect("API contribution");
+        contributions
+            .insert(
+                prefix,
+                FibSource::Interface,
+                FibContribution::Paths(vec![FibPath {
+                    interface_index: 7,
+                    next_hop: None,
+                }]),
+            )
+            .expect("interface contribution");
+
+        let table = IpMain::compile_contributions(&contributions).expect("compile FIB");
+        let interface = table
+            .lookup_packet(&parsed("198.51.100.9"))
+            .expect("interface route");
+        assert_eq!(interface.dpo.kind(), DpoType::ADJACENCY);
+        let adjacency = table
+            .adjacency(interface.dpo.adjacency_index().expect("adjacency"))
+            .expect("adjacency record");
+        assert_eq!(adjacency.egress_interface, Some(7));
+
+        assert!(contributions.remove(prefix, FibSource::Interface));
+        let table = IpMain::compile_contributions(&contributions).expect("compile fallback FIB");
+        let fallback = table
+            .lookup_packet(&parsed("198.51.100.9"))
+            .expect("API fallback route");
+        assert_eq!(fallback.dpo.kind(), DpoType::DROP);
+    }
+
+    #[test]
+    fn same_source_paths_compile_to_distinct_ecmp_adjacencies() {
+        let prefix = "203.0.113.0/24".parse().expect("prefix");
+        let mut contributions = FibContributions::default();
+        for (interface_index, next_hop) in [
+            (10, "192.0.2.1".parse().expect("first next hop")),
+            (11, "192.0.2.2".parse().expect("second next hop")),
+        ] {
+            contributions
+                .insert(
+                    prefix,
+                    FibSource::Api,
+                    FibContribution::Paths(vec![FibPath {
+                        interface_index,
+                        next_hop: Some(next_hop),
+                    }]),
+                )
+                .expect("path contribution");
+        }
+
+        let table = IpMain::compile_contributions(&contributions).expect("compile FIB");
+        let route = table
+            .lookup_packet(&parsed("203.0.113.9"))
+            .expect("ECMP route");
+        let load_balance = table
+            .load_balance(route.route_dpo.load_balance_index().expect("load balance"))
+            .expect("load-balance record");
+        assert_eq!(load_balance.bucket_count(), 2);
+        let first = load_balance.buckets()[0]
+            .adjacency_index()
+            .expect("first adjacency");
+        let second = load_balance.buckets()[1]
+            .adjacency_index()
+            .expect("second adjacency");
+        assert_ne!(first, second);
+        assert_eq!(
+            table
+                .adjacency(first)
+                .expect("first adjacency record")
+                .egress_interface,
+            Some(10)
+        );
+        assert_eq!(
+            table
+                .adjacency(second)
+                .expect("second adjacency record")
+                .egress_interface,
+            Some(11)
+        );
+    }
+
+    #[test]
+    fn empty_path_contribution_is_rejected_without_building_a_load_balance() {
+        let prefix = "203.0.113.0/24".parse().expect("prefix");
+        let mut contributions = FibContributions::default();
+        let error = contributions
+            .insert(
+                prefix,
+                FibSource::Api,
+                FibContribution::Paths(Vec::new()),
+            )
+            .expect_err("empty contribution");
+        assert!(matches!(error, RuntimeError::ConfigValidation { .. }));
+        assert!(!contributions.by_prefix.contains_key(&prefix));
+
+        contributions
+            .by_prefix
+            .entry(prefix)
+            .or_default()
+            .insert(FibSource::Api, FibContribution::Paths(Vec::new()));
+        let error = IpMain::compile_contributions(&contributions)
+            .expect_err("empty load balance must not compile");
+        assert!(matches!(error, RuntimeError::ConfigValidation { .. }));
     }
 
     #[test]

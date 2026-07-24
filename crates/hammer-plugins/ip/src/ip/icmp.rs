@@ -704,10 +704,9 @@ pub struct IcmpErrorNode {
 }
 
 fn register_icmp_error(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
-    runtime.nodes().try_register_internal_with_next_names(
-        IcmpErrorNode::new(),
-        &IcmpErrorNext::NEXT_NAMES,
-    )
+    runtime
+        .nodes()
+        .try_register_internal_with_next_names(IcmpErrorNode::new(), &IcmpErrorNext::NEXT_NAMES)
 }
 
 impl IcmpErrorNode {

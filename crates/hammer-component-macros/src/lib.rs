@@ -732,26 +732,24 @@ fn expand_node(
     } else {
         quote!()
     };
-    let initial_nexts_inherent_impl = if args.role.is_some()
-        && args.next.is_some()
-        && store_initial_nexts
-    {
-        quote! {
-            #[inline]
-            pub fn node_initial_nexts(&self) -> &[::hammer_core::data_plane::NodeId] {
-                &self.next
+    let initial_nexts_inherent_impl =
+        if args.role.is_some() && args.next.is_some() && store_initial_nexts {
+            quote! {
+                #[inline]
+                pub fn node_initial_nexts(&self) -> &[::hammer_core::data_plane::NodeId] {
+                    &self.next
+                }
             }
-        }
-    } else if args.role.is_some() {
-        quote! {
-            #[inline]
-            pub fn node_initial_nexts(&self) -> &[::hammer_core::data_plane::NodeId] {
-                &[]
+        } else if args.role.is_some() {
+            quote! {
+                #[inline]
+                pub fn node_initial_nexts(&self) -> &[::hammer_core::data_plane::NodeId] {
+                    &[]
+                }
             }
-        }
-    } else {
-        quote!()
-    };
+        } else {
+            quote!()
+        };
 
     let fields_named: FieldsNamed = parse_quote!({
         #(#output_fields),*
