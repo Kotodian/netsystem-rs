@@ -2,10 +2,11 @@
 
 use std::sync::Arc;
 
+use hammer_core::data_plane::NodeState;
 use hammer_infra::pool::Index as PoolIndex;
 use hammer_runtime::app::AppSessionConfig;
 use hammer_runtime::attach::AppServer;
-use hammer_runtime::{Engine, NodeState, RuntimeError, RuntimeResult};
+use hammer_runtime::{Engine, RuntimeError, RuntimeResult};
 
 pub mod app;
 pub mod config;

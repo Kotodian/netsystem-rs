@@ -3,7 +3,7 @@ use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 use std::time::Instant;
 
-use hammer_core::data_plane::{BufferFrame, DataPlaneBuffers, Index};
+use hammer_core::data_plane::{BufferFrame, DataPlaneBuffers, Index as BufferIndex};
 use hammer_infra::align::CacheLine;
 use hammer_infra::fifo_queue::FifoQueue;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
@@ -198,7 +198,7 @@ impl SessionApp {
         session_id: SessionId,
         offset: usize,
         len: usize,
-        index: Index,
+        index: BufferIndex,
     ) -> RuntimeResult<()> {
         match self {
             Self::Local(app) => app.copy_tx_to_buffer(buffers, session_id, offset, len, index),
@@ -210,7 +210,7 @@ impl SessionApp {
         &self,
         session_id: SessionId,
         buffers: &DataPlaneBuffers,
-        index: Index,
+        index: BufferIndex,
         urgent: bool,
     ) -> RuntimeResult<(u32, u32)> {
         match self {
@@ -223,7 +223,7 @@ impl SessionApp {
         &self,
         session_id: SessionId,
         buffers: &DataPlaneBuffers,
-        index: Index,
+        index: BufferIndex,
         offset: u32,
     ) -> RuntimeResult<(u32, Option<(u32, u32)>)> {
         match self {
@@ -596,7 +596,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         &self,
         buffers: &DataPlaneBuffers,
         session_id: SessionId,
-        index: hammer_core::data_plane::Index,
+        index: BufferIndex,
         offset: u32,
         urgent: bool,
     ) -> RuntimeResult<RxDelivery> {
@@ -664,7 +664,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         session_id: SessionId,
         offset: usize,
         len: usize,
-        index: Index,
+        index: BufferIndex,
     ) -> RuntimeResult<()> {
         self.app
             .copy_tx_to_buffer(buffers, session_id, offset, len, index)
@@ -742,7 +742,7 @@ pub struct TransportSendParams {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TxBatchBuffer {
-    pub index: Index,
+    pub index: BufferIndex,
     pub tx_offset: usize,
     pub payload_len: usize,
 }
