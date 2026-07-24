@@ -96,11 +96,11 @@ pub enum RuntimeError {
     DataWorkerStartupCanceled { worker: usize },
     #[error("data worker {worker} exited without returning its result")]
     DataWorkerResultCanceled { worker: usize },
-    #[error("data worker {worker} task failed")]
-    DataWorkerTaskJoin {
+    #[error("data worker {worker} local task failed")]
+    DataWorkerLocalTask {
         worker: usize,
         #[source]
-        source: tokio::task::JoinError,
+        source: crate::spawn::DataLocalJoinError,
     },
     #[error("data worker {worker} control call panicked")]
     DataWorkerCallPanicked { worker: usize },

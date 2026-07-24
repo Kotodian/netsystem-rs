@@ -477,7 +477,7 @@ impl DataRuntimeContext {
                 drop(spawn_local(move || async move {
                     let result = join
                         .await
-                        .map_err(|source| RuntimeError::DataWorkerTaskJoin { worker, source });
+                        .map_err(|source| RuntimeError::DataWorkerLocalTask { worker, source });
                     complete_state.complete(result);
                 }));
             }),
