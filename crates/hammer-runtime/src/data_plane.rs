@@ -128,6 +128,7 @@ pub(crate) struct DataPlaneRuntimeWorkerSeed {
     simd_bytes: usize,
     handoff: Option<DataPlaneHandoffWorker>,
     handoff_node_handle: Option<NodeHandle>,
+    trace_control: Option<TraceControlHandle>,
 }
 
 pub(crate) struct DataPlaneRuntimeWorkerConfig {
@@ -209,6 +210,7 @@ impl From<&DataPlaneRuntime> for DataPlaneRuntimeWorkerSeed {
             simd_bytes: runtime.simd_bytes,
             handoff: runtime.handoff.clone(),
             handoff_node_handle: runtime.handoff_node_handle,
+            trace_control: runtime.trace.control(),
         }
     }
 }
@@ -229,6 +231,7 @@ impl TryFrom<DataPlaneRuntimeWorkerConfig> for DataPlaneRuntime {
             simd_bytes,
             handoff,
             handoff_node_handle,
+            trace_control,
         } = seed;
         let buffers =
             DataPlaneBuffers::from_arenas(buffer_arenas, frame_slots, thread_index, numa_node);
@@ -236,6 +239,7 @@ impl TryFrom<DataPlaneRuntimeWorkerConfig> for DataPlaneRuntime {
         runtime.nodes = nodes.into();
         runtime.handoff = handoff;
         runtime.handoff_node_handle = handoff_node_handle;
+        runtime.trace.set_control(trace_control);
         let configured_arena = runtime
             .handoff
             .as_ref()
@@ -504,8 +508,8 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    pub fn set_trace_control(&self, control: Option<TraceControlHandle>, packet_capacity: usize) {
-        self.trace.set_control(control, packet_capacity);
+    pub fn set_trace_control(&self, control: Option<TraceControlHandle>) {
+        self.trace.set_control(control);
     }
 
     #[inline]

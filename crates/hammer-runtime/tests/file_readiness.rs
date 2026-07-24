@@ -116,6 +116,16 @@ fn readable_file_dispatches_callback() {
     assert_eq!(file.read_events(), 1);
     assert_eq!(file.write_events(), 0);
     assert_eq!(file.error_events(), 0);
+
+    let stats = files.runtime_stats_snapshot();
+    assert_eq!(stats.len(), 1);
+    assert_eq!(stats[0].index, socket.index);
+    assert_eq!(stats[0].description, "readable");
+    assert!(stats[0].read_enabled);
+    assert!(!stats[0].write_enabled);
+    assert_eq!(stats[0].read_events, 1);
+    assert_eq!(stats[0].write_events, 0);
+    assert_eq!(stats[0].error_events, 0);
 }
 
 #[test]

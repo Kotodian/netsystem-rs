@@ -8,6 +8,7 @@ use std::sync::OnceLock;
 use hammer_runtime::RuntimeRegistry;
 use hammer_runtime::config::{Memory, Worker};
 use hammer_runtime::engine::{Engine, EnginePool};
+use hammer_runtime::log::Level;
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
 // Shared device/interface/transport/session infrastructure contributes host
@@ -27,6 +28,13 @@ static STARTUP_CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
 struct DaemonEarlyConfig {
     memory: Memory,
     worker: Worker,
+    log: DaemonLogConfig,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default)]
+struct DaemonLogConfig {
+    level: Level,
 }
 
 impl DaemonEarlyConfig {
@@ -69,12 +77,20 @@ fn main() {
             std::process::exit(1);
         }
     }
-    let memory = early.memory;
-    drop(early);
+    let DaemonEarlyConfig {
+        memory,
+        worker: _,
+        log,
+    } = early;
+    let log_level = log.level;
     drop(bootstrap_document);
     drop(config_path);
     memory.ensure_main_heap().unwrap_or_else(|error| {
         eprintln!("Failed to initialize main heap: {error}");
+        std::process::exit(1);
+    });
+    install_tracing(log_level).unwrap_or_else(|error| {
+        eprintln!("Failed to initialize logging: {error}");
         std::process::exit(1);
     });
 
@@ -108,6 +124,33 @@ fn main() {
     }
 
     run(config, roots, worker);
+}
+
+fn install_tracing(default_level: Level) -> Result<(), String> {
+    let directive = match std::env::var("HAMMER_LOG") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => match std::env::var("RUST_LOG") {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => match default_level {
+                Level::Panic | Level::Fatal | Level::Error => "error".to_owned(),
+                Level::Warn => "warn".to_owned(),
+                Level::Info => "info".to_owned(),
+                Level::Debug => "debug".to_owned(),
+                Level::Trace => "trace".to_owned(),
+            },
+            Err(error) => return Err(format!("RUST_LOG is not valid Unicode: {error}")),
+        },
+        Err(error) => return Err(format!("HAMMER_LOG is not valid Unicode: {error}")),
+    };
+    let filter = tracing_subscriber::EnvFilter::try_new(&directive)
+        .map_err(|error| format!("invalid log directive `{directive}`: {error}"))?;
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_thread_names(true)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)
+        .map_err(|error| format!("install global tracing subscriber: {error}"))
 }
 
 fn config_path_from_args() -> PathBuf {

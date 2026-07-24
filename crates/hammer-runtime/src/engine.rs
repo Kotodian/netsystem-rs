@@ -12,8 +12,9 @@ use hammer_runtime::RuntimeRegistry;
 
 use crate::config::Worker;
 use crate::data_plane::{DataPlaneRuntimeWorkerConfig, DataPlaneRuntimeWorkerSeed};
+use crate::file::FileRuntimeStatsRow;
 use crate::init::InitFunction;
-use crate::node::{NodeRuntimeData, NodeRuntimeInner};
+use crate::node::{NodeRuntimeData, NodeRuntimeInner, NodeRuntimeStatsRow};
 use crate::process::ProcessMain;
 use crate::{DataPlaneHandoffWorker, DataWorkerId, FileMain, PluginMain, ProcessHandle};
 
@@ -30,6 +31,7 @@ pub(crate) struct EngineWorkerSeed {
     pending_worker_graph: Arc<Mutex<Option<WorkerGraphUpdate>>>,
     workers_updating_graph: Arc<AtomicU32>,
     worker_graph_update_error: Arc<Mutex<Option<RuntimeError>>>,
+    worker_runtime_stats: Arc<Vec<Mutex<Option<WorkerRuntimeStats>>>>,
     worker_init_functions: Vec<InitFunction>,
     memory_initialized: bool,
     worker_config: Worker,
@@ -39,6 +41,15 @@ pub(crate) struct EngineWorkerSeed {
 struct WorkerGraphUpdate {
     graph: NodeRuntimeInner,
     worker_init_functions: Vec<InitFunction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerRuntimeStats {
+    pub thread_index: u32,
+    pub numa_node: u32,
+    pub main_loop_count: u32,
+    pub nodes: Vec<NodeRuntimeStatsRow>,
+    pub files: Vec<FileRuntimeStatsRow>,
 }
 
 #[repr(align(64))]
@@ -67,6 +78,7 @@ pub struct Engine {
     pending_worker_graph: Arc<Mutex<Option<WorkerGraphUpdate>>>,
     workers_updating_graph: Arc<AtomicU32>,
     worker_graph_update_error: Arc<Mutex<Option<RuntimeError>>>,
+    worker_runtime_stats: Arc<Vec<Mutex<Option<WorkerRuntimeStats>>>>,
     main_loop_exit_functions_called: bool,
     worker_threads: Mutex<Vec<JoinHandle<RuntimeResult<()>>>>,
     // Drop after every owner that may retain DSO code or Drop glue. Plugin
@@ -85,6 +97,7 @@ impl Engine {
         pending_worker_graph: Arc<Mutex<Option<WorkerGraphUpdate>>>,
         workers_updating_graph: Arc<AtomicU32>,
         worker_graph_update_error: Arc<Mutex<Option<RuntimeError>>>,
+        worker_runtime_stats: Arc<Vec<Mutex<Option<WorkerRuntimeStats>>>>,
         worker_init_functions: Vec<InitFunction>,
         memory_initialized: bool,
         worker_config: Worker,
@@ -116,6 +129,7 @@ impl Engine {
             pending_worker_graph,
             workers_updating_graph,
             worker_graph_update_error,
+            worker_runtime_stats,
             main_loop_exit_functions_called: false,
             worker_threads: Mutex::new(Vec::new()),
             processes: ProcessMain::new(),
@@ -152,6 +166,7 @@ impl Engine {
             pending_worker_graph,
             workers_updating_graph,
             worker_graph_update_error,
+            worker_runtime_stats: Arc::new(Vec::new()),
             main_loop_exit_functions_called: false,
             worker_threads: Mutex::new(Vec::new()),
             processes: ProcessMain::new(),
@@ -349,6 +364,7 @@ impl Engine {
             Arc::clone(&self.pending_worker_graph),
             Arc::clone(&self.workers_updating_graph),
             Arc::clone(&self.worker_graph_update_error),
+            Arc::clone(&self.worker_runtime_stats),
             self.plugin_main.worker_init_functions(),
             self.memory_initialized,
             self.worker_config.clone(),
@@ -439,10 +455,79 @@ impl Engine {
             pending_worker_graph: Arc::clone(&self.pending_worker_graph),
             workers_updating_graph: Arc::clone(&self.workers_updating_graph),
             worker_graph_update_error: Arc::clone(&self.worker_graph_update_error),
+            worker_runtime_stats: Arc::clone(&self.worker_runtime_stats),
             worker_init_functions: self.plugin_main.worker_init_functions(),
             memory_initialized: self.memory_initialized,
             worker_config: self.worker_config.clone(),
         }
+    }
+
+    pub(crate) fn prepare_worker_runtime_stats(&mut self, worker_count: usize) {
+        self.worker_runtime_stats = Arc::new(
+            (0..worker_count)
+                .map(|_| Mutex::new(None))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    pub(crate) fn publish_worker_runtime_stats(&self) {
+        let Some(slot) = self
+            .thread_index
+            .checked_sub(1)
+            .and_then(|index| self.worker_runtime_stats.get(index as usize))
+        else {
+            return;
+        };
+        let snapshot = WorkerRuntimeStats {
+            thread_index: self.thread_index,
+            numa_node: self.numa_node,
+            main_loop_count: self.main_loop_count.load(Ordering::Relaxed),
+            nodes: self.runtime.nodes().node_runtime_stats_snapshot(),
+            files: self.file_main().runtime_stats_snapshot(),
+        };
+        *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
+    }
+
+    pub fn worker_runtime_stats_snapshot(&self) -> RuntimeResult<Vec<WorkerRuntimeStats>> {
+        if self.thread_index != 0 {
+            return Err(RuntimeError::lifecycle(
+                "snapshot worker runtime statistics",
+                "only the main Runtime Engine can synchronize data workers",
+            ));
+        }
+        let worker_count = self.worker_runtime_stats.len();
+        if worker_count == 0 {
+            return Ok(Vec::new());
+        }
+        let worker_count = u32::try_from(worker_count).map_err(|_| {
+            RuntimeError::WorkerCountOverflow {
+                count: self.worker_runtime_stats.len(),
+            }
+        })?;
+        let barrier = crate::barrier::barrier_sync(
+            &self.wait_at_barrier,
+            &self.workers_at_barrier,
+            worker_count,
+        );
+        let snapshots = self
+            .worker_runtime_stats
+            .iter()
+            .enumerate()
+            .map(|(slot, snapshot)| {
+                snapshot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+                    .ok_or_else(|| {
+                        RuntimeError::lifecycle(
+                            "snapshot worker runtime statistics",
+                            format!("data worker {} did not publish its state", slot + 1),
+                        )
+                    })
+            })
+            .collect();
+        drop(barrier);
+        snapshots
     }
 
     pub(crate) fn retain_worker_threads(
@@ -570,6 +655,7 @@ impl EngineWorkerSeed {
             pending_worker_graph,
             workers_updating_graph,
             worker_graph_update_error,
+            worker_runtime_stats,
             worker_init_functions,
             memory_initialized,
             worker_config,
@@ -591,6 +677,7 @@ impl EngineWorkerSeed {
             pending_worker_graph,
             workers_updating_graph,
             worker_graph_update_error,
+            worker_runtime_stats,
             worker_init_functions,
             memory_initialized,
             worker_config,

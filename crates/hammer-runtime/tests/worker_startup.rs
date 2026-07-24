@@ -246,6 +246,17 @@ fn data_worker_startup_is_transactional() {
     start_workers(pool.main_engine_mut()).expect("transactional worker startup");
     assert_eq!(INITIALIZED.load(Ordering::Acquire), 0b11);
     assert_eq!(DISPATCHED.load(Ordering::Acquire), 0b11);
+    let worker_stats = pool
+        .main_engine()
+        .worker_runtime_stats_snapshot()
+        .expect("snapshot live worker runtime state");
+    assert_eq!(worker_stats.len(), 2);
+    assert!(worker_stats.iter().all(|worker| {
+        worker
+            .nodes
+            .iter()
+            .any(|node| node.node_name == Some("startup-node") && node.calls == 1)
+    }));
     assert_eq!(
         pool.main_engine()
             .runtime

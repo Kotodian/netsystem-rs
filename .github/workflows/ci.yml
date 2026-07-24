@@ -109,6 +109,7 @@ jobs:
         run: |
           cargo build --locked \
             -p hammer \
+            -p hammerctl \
             -p hammer-plugin-tun \
             -p hammer-plugin-ip \
             -p hammer-plugin-tcp \
@@ -118,7 +119,10 @@ jobs:
         run: echo "libdir=$(rustc --print target-libdir)" >> "$GITHUB_OUTPUT"
       - name: Snapshot Darwin interfaces [macOS]
         id: darwin_interfaces
-        run: echo "before=$(ifconfig -l)" >> "$GITHUB_OUTPUT"
+        run: |
+          mkdir -p "$RUNNER_TEMP/hammer-tcp-lab-diagnostics"
+          ifconfig -l > "$RUNNER_TEMP/hammer-tcp-lab-diagnostics/interfaces-before.txt"
+          echo "before=$(ifconfig -l)" >> "$GITHUB_OUTPUT"
       - name: Start production TCP Lab [macOS]
         env:
           TCP_LAB_BINARY: ${{ github.workspace }}/target/debug/hammer
@@ -131,7 +135,7 @@ jobs:
             echo "missing TCP Lab binary: $TCP_LAB_BINARY" >&2
             exit 1
           fi
-          : > "$RUNNER_TEMP/hammer-tcp-lab.log"
+          : > "$RUNNER_TEMP/hammer-tcp-lab-diagnostics/daemon.log"
           sudo -n rm -f "$TCP_LAB_ATTACH_SOCKET"
           tcp_lab_pid="$(
             sudo -n /bin/sh -c '
@@ -145,11 +149,13 @@ jobs:
                 DYLD_LIBRARY_PATH="$rust_libdir" \
                 HAMMER_PLUGIN_DIR="$plugin_dir" \
                 HAMMER_IPC_ADDR="$ipc_address" \
+                HAMMER_LOG="debug" \
+                RUST_BACKTRACE="1" \
                 "$binary" "$config" \
                 </dev/null >>"$log" 2>&1 &
               echo $!
             ' hammer-tcp-lab \
-              "$RUNNER_TEMP/hammer-tcp-lab.log" \
+              "$RUNNER_TEMP/hammer-tcp-lab-diagnostics/daemon.log" \
               "$TCP_LAB_PLUGIN_DIR" \
               "$TCP_LAB_IPC_ADDRESS" \
               "$TCP_LAB_BINARY" \
@@ -169,7 +175,7 @@ jobs:
           set -euo pipefail
           for _ in {1..90}; do
             if ! sudo -n kill -0 "$TCP_LAB_PID" 2>/dev/null; then
-              cat "$RUNNER_TEMP/hammer-tcp-lab.log" >&2
+              cat "$RUNNER_TEMP/hammer-tcp-lab-diagnostics/daemon.log" >&2
               echo "TCP Lab exited before reporting a Darwin utun device" >&2
               exit 1
             fi
@@ -186,7 +192,7 @@ jobs:
             sleep 1
           done
 
-          cat "$RUNNER_TEMP/hammer-tcp-lab.log" >&2
+          cat "$RUNNER_TEMP/hammer-tcp-lab-diagnostics/daemon.log" >&2
           echo "TCP Lab did not report a Darwin utun device within 90 seconds" >&2
           exit 1
       - name: Configure host-side Darwin utun [macOS]
@@ -204,6 +210,50 @@ jobs:
             netmask "$TCP_LAB_NETMASK" up
           sudo -n route -n add -net "$TCP_LAB_ROUTE_PREFIX" \
             -interface "$TCP_LAB_INTERFACE"
+      - name: Start TCP Lab packet capture [macOS]
+        run: |
+          set -euo pipefail
+          tcpdump_pid="$(
+            sudo -n /bin/sh -c '
+              interface=$1
+              capture=$2
+              log=$3
+              nohup tcpdump -U -n -i "$interface" -w "$capture" \
+                </dev/null >>"$log" 2>&1 &
+              echo $!
+            ' hammer-tcpdump \
+              "$TCP_LAB_INTERFACE" \
+              "$RUNNER_TEMP/hammer-tcp-lab-diagnostics/traffic.pcap" \
+              "$RUNNER_TEMP/hammer-tcp-lab-diagnostics/tcpdump.log"
+          )"
+          if [[ ! "$tcpdump_pid" =~ ^[0-9]+$ ]]; then
+            echo "invalid tcpdump PID: $tcpdump_pid" >&2
+            exit 1
+          fi
+          echo "TCP_LAB_TCPDUMP_PID=$tcpdump_pid" >> "$GITHUB_ENV"
+          sleep 1
+          if ! sudo -n kill -0 "$tcpdump_pid" 2>/dev/null; then
+            cat "$RUNNER_TEMP/hammer-tcp-lab-diagnostics/tcpdump.log" >&2 || true
+            echo "tcpdump exited before the TCP Lab probe" >&2
+            exit 1
+          fi
+      - name: Capture TCP Lab state before probe [macOS]
+        run: |
+          set +e
+          target/debug/hammerctl --addr "$TCP_LAB_IPC_ADDRESS" status \
+            > "$RUNNER_TEMP/hammer-tcp-lab-diagnostics/status-before.txt" 2>&1
+          sudo -n ps -ww -o pid,ppid,state,%cpu,%mem,etime,command -p "$TCP_LAB_PID" \
+            > "$RUNNER_TEMP/hammer-tcp-lab-diagnostics/process-before-probe.txt" 2>&1
+          sudo -n lsof -nP -p "$TCP_LAB_PID" \
+            > "$RUNNER_TEMP/hammer-tcp-lab-diagnostics/files-before-probe.txt" 2>&1
+          ifconfig "$TCP_LAB_INTERFACE" \
+            > "$RUNNER_TEMP/hammer-tcp-lab-diagnostics/interface-before-probe.txt" 2>&1
+          netstat -ibn -I "$TCP_LAB_INTERFACE" \
+            > "$RUNNER_TEMP/hammer-tcp-lab-diagnostics/interface-counters-before-probe.txt" 2>&1
+          netstat -rn \
+            > "$RUNNER_TEMP/hammer-tcp-lab-diagnostics/routes-before-probe.txt" 2>&1
+          route -n get "$TCP_LAB_ADDRESS" \
+            > "$RUNNER_TEMP/hammer-tcp-lab-diagnostics/route-get-before-probe.txt" 2>&1
       - name: Probe TCP reachability [macOS]
         run: >-
           python3 scripts/tcp-connect-probe.py
@@ -212,16 +262,50 @@ jobs:
           --attempts 30
           --connect-timeout 2
           --retry-delay 1
-      - name: Print TCP Lab log on failure [macOS]
-        if: failure()
+      - name: Capture TCP Lab state after probe [macOS]
+        if: always()
         run: |
-          if [[ -f "$RUNNER_TEMP/hammer-tcp-lab.log" ]]; then
-            cat "$RUNNER_TEMP/hammer-tcp-lab.log"
+          set +e
+          target/debug/hammerctl --addr "$TCP_LAB_IPC_ADDRESS" status \
+            > "$RUNNER_TEMP/hammer-tcp-lab-diagnostics/status-after.txt" 2>&1
+          sudo -n ps -ww -o pid,ppid,state,%cpu,%mem,etime,command -p "$TCP_LAB_PID" \
+            > "$RUNNER_TEMP/hammer-tcp-lab-diagnostics/process-after-probe.txt" 2>&1
+          sudo -n lsof -nP -p "$TCP_LAB_PID" \
+            > "$RUNNER_TEMP/hammer-tcp-lab-diagnostics/files-after-probe.txt" 2>&1
+          ifconfig "$TCP_LAB_INTERFACE" \
+            > "$RUNNER_TEMP/hammer-tcp-lab-diagnostics/interface-after-probe.txt" 2>&1
+          netstat -ibn -I "$TCP_LAB_INTERFACE" \
+            > "$RUNNER_TEMP/hammer-tcp-lab-diagnostics/interface-counters-after-probe.txt" 2>&1
+          netstat -rn \
+            > "$RUNNER_TEMP/hammer-tcp-lab-diagnostics/routes-after-probe.txt" 2>&1
+          route -n get "$TCP_LAB_ADDRESS" \
+            > "$RUNNER_TEMP/hammer-tcp-lab-diagnostics/route-get-after-probe.txt" 2>&1
+          if [[ -f "$RUNNER_TEMP/hammer-tcp-lab-diagnostics/daemon.log" ]]; then
+            cat "$RUNNER_TEMP/hammer-tcp-lab-diagnostics/daemon.log"
           fi
       - name: Clean up TCP Lab [macOS]
         if: always()
         run: |
           set +e
+
+          if [[ "${TCP_LAB_TCPDUMP_PID:-}" =~ ^[0-9]+$ ]] \
+            && sudo -n kill -0 "$TCP_LAB_TCPDUMP_PID" 2>/dev/null
+          then
+            sudo -n kill -INT "$TCP_LAB_TCPDUMP_PID" 2>/dev/null || true
+            for _ in {1..20}; do
+              sudo -n kill -0 "$TCP_LAB_TCPDUMP_PID" 2>/dev/null || break
+              sleep 0.25
+            done
+            if sudo -n kill -0 "$TCP_LAB_TCPDUMP_PID" 2>/dev/null; then
+              sudo -n kill -KILL "$TCP_LAB_TCPDUMP_PID" 2>/dev/null || true
+            fi
+          fi
+
+          if [[ -f "$RUNNER_TEMP/hammer-tcp-lab-diagnostics/traffic.pcap" ]]; then
+            sudo -n tcpdump -nn -tttt \
+              -r "$RUNNER_TEMP/hammer-tcp-lab-diagnostics/traffic.pcap" \
+              > "$RUNNER_TEMP/hammer-tcp-lab-diagnostics/traffic.txt" 2>&1 || true
+          fi
 
           if [[ "${TCP_LAB_INTERFACE:-}" =~ ^utun[0-9]+$ ]]; then
             sudo -n route -n delete -net "$TCP_LAB_ROUTE_PREFIX" \
@@ -241,13 +325,14 @@ jobs:
             fi
           fi
           sudo -n rm -f "$TCP_LAB_ATTACH_SOCKET"
-      - name: Upload TCP Lab log [macOS]
+          sudo -n chmod -R a+rX "$RUNNER_TEMP/hammer-tcp-lab-diagnostics" || true
+      - name: Upload TCP Lab diagnostics [macOS]
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: tcp-lab-macos-log
-          path: ${{ runner.temp }}/hammer-tcp-lab.log
-          if-no-files-found: ignore
+          name: tcp-lab-macos-diagnostics
+          path: ${{ runner.temp }}/hammer-tcp-lab-diagnostics
+          if-no-files-found: error
 
   dataplane-performance:
     name: dataplane performance [${{ matrix.platform }}]

@@ -215,7 +215,7 @@ fn udp_input_dispatches_registered_port_by_local_slot() {
         }]
         .into(),
     });
-    runtime.set_trace_control(Some(trace_control.handle()), 2);
+    runtime.set_trace_control(Some(trace_control.handle()));
 
     let packet = ipv4_udp_packet(12_345, 53, b"dns");
     let mut frame = runtime

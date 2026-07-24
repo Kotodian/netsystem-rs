@@ -19,6 +19,7 @@ pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
     engine.wait_at_barrier = Arc::clone(&wait);
     engine.workers_at_barrier = Arc::clone(&workers);
     engine.main_loop_exit_now.store(false, Ordering::Release);
+    engine.prepare_worker_runtime_stats(worker_config.count);
 
     let handoff = DataPlaneHandoff::new(worker_config.count, worker_config.handoff.queue_capacity);
     let mut threads = Vec::with_capacity(worker_config.count);

@@ -176,7 +176,7 @@ fn interface_output_dispatches_to_registered_tx_node() {
         }]
         .into(),
     });
-    runtime.set_trace_control(Some(trace.handle()), 4);
+    runtime.set_trace_control(Some(trace.handle()));
     let mut frame = runtime
         .buffers()
         .get_next_frame(output_node)

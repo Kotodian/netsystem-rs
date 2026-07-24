@@ -16,9 +16,7 @@ fn configure_trace(
     trace.validate()?;
     let control = Arc::new(TraceControlPlane::new(trace.record_capacity));
     control.publish_options(&trace, |name| engine.runtime.node_by_name(name))?;
-    engine
-        .runtime
-        .set_trace_control(Some(control.handle()), trace.packet_capacity);
+    engine.runtime.set_trace_control(Some(control.handle()));
     Ok(control)
 }
 
@@ -273,16 +271,29 @@ impl TraceControlPlane {
         state.ring.drain(..).collect()
     }
 
+    pub fn records(&self) -> Vec<TraceRecord> {
+        self.inner
+            .state
+            .lock()
+            .expect("trace control lock poisoned")
+            .ring
+            .iter()
+            .cloned()
+            .collect()
+    }
+
     pub fn dropped_completed(&self) -> usize {
         self.inner.dropped_completed.load(Ordering::Acquire)
     }
 }
 
 impl DataPlaneTrace {
-    pub fn set_control(&self, control: Option<TraceControlHandle>, packet_capacity: usize) {
-        let mut state = self.inner.borrow_mut();
-        let _ = packet_capacity;
-        state.control = control;
+    pub fn set_control(&self, control: Option<TraceControlHandle>) {
+        self.inner.borrow_mut().control = control;
+    }
+
+    pub(crate) fn control(&self) -> Option<TraceControlHandle> {
+        self.inner.borrow().control.clone()
     }
 
     pub fn try_mark(&self, node: NodeId, node_name: Option<&'static str>) -> Option<u32> {
@@ -517,6 +528,12 @@ fn format_trace_record(record: &TraceRecord) -> String {
         line.push_str(&entry.format_payload());
     }
     line
+}
+
+impl std::fmt::Display for TraceRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&format_trace_record(self))
+    }
 }
 
 fn node_label(node: NodeId, name: Option<&'static str>) -> String {

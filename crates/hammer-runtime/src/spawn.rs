@@ -16,12 +16,12 @@
 //! spawned data tasks carry that context through Tokio task-local storage.
 //! Calls made outside a service context — for example from `#[tokio::test]`
 //! integration tests that never construct a service — fall back to the
-//! ambient runtime via `tokio::spawn`, preserving prior behaviour for tests.
+//! ambient runtime via `tokio::spawn` and use the process default subscriber.
 //!
 //! Use `crate::spawn::spawn(future)` everywhere we'd otherwise call
 //! `tokio::spawn`. Forgetting it does not corrupt routing — it only causes
-//! the task's events to be dropped (no global default subscriber is
-//! installed) — but it should still be considered a bug.
+//! the task to lose its service-specific dispatch — but it should still be
+//! considered a bug.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -405,12 +405,10 @@ impl DataRuntimeContext {
     pub fn set_trace_control_on_workers(
         &self,
         control: Option<TraceControlHandle>,
-        packet_capacity: usize,
     ) -> RuntimeResult<()> {
-        let _ = packet_capacity;
         self.for_each_worker(move |_| {
             with_data_plane_runtime(|runtime| {
-                runtime.set_trace_control(control.clone(), 0);
+                runtime.set_trace_control(control.clone());
             });
         })
         .map(|_| ())
@@ -1545,7 +1543,7 @@ mod tests {
         });
 
         context
-            .set_trace_control_on_workers(Some(control.handle()), 2)
+            .set_trace_control_on_workers(Some(control.handle()))
             .expect("set trace control");
         let marks = context
             .for_each_worker(|_| {

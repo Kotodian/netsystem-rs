@@ -521,6 +521,22 @@ impl NodeErrorCounters {
     pub fn get(&self, code: u16) -> u64 {
         self.counters.get(code as usize).copied().unwrap_or(0)
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = (u16, u64)> + '_ {
+        self.counters
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(code, count)| {
+                if count == 0 {
+                    return None;
+                }
+                Some((
+                    u16::try_from(code).expect("node error code fits u16"),
+                    count,
+                ))
+            })
+    }
 }
 
 struct ScheduledFrame {

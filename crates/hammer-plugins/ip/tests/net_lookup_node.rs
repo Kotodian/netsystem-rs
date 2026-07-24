@@ -243,7 +243,7 @@ fn ip_lookup_node_uses_ipv4_mtrie_longest_prefix_match() {
         }]
         .into(),
     });
-    runtime.set_trace_control(Some(trace.handle()), 4);
+    runtime.set_trace_control(Some(trace.handle()));
 
     let mut frame = runtime
         .buffers()
@@ -661,7 +661,7 @@ fn adjacency_rewrite_node_prepends_rewrite_and_sets_egress_interface() {
         }]
         .into(),
     });
-    runtime.set_trace_control(Some(trace.handle()), 4);
+    runtime.set_trace_control(Some(trace.handle()));
     let mut frame = runtime
         .buffers()
         .get_next_frame(rewrite_node)

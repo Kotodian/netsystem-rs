@@ -11,6 +11,15 @@ plugins = [
 [log]
 level = "debug"
 
+[trace]
+enabled = true
+record_capacity = 64
+packet_capacity = 16
+
+[[trace.inputs]]
+node = "tun-input"
+count = 32
+
 # VPP: cpu { workers 1 } / unix { poll-sleep-usec 50000 }
 [worker]
 workers = 1
