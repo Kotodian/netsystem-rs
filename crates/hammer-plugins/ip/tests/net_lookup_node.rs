@@ -982,7 +982,7 @@ fn adjacency_rewrite_node_drops_missing_forwarding_and_missing_adjacency() {
 
     runtime.put_next_frame(frame).expect("schedule");
 
-    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 1);
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }
