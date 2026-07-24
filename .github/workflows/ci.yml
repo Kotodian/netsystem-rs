@@ -88,6 +88,8 @@ jobs:
     timeout-minutes: 25
     env:
       TCP_LAB_ADDRESS: 10.66.77.1
+      TCP_LAB_HOST_ADDRESS: 10.66.77.2
+      TCP_LAB_NETMASK: 255.255.255.252
       TCP_LAB_PORT: "7300"
       TCP_LAB_ROUTE_PREFIX: 10.66.77.0/30
       TCP_LAB_ATTACH_SOCKET: /tmp/hammer-tun-tcp-lab.attach.sock
@@ -187,7 +189,7 @@ jobs:
           cat "$RUNNER_TEMP/hammer-tcp-lab.log" >&2
           echo "TCP Lab did not report a Darwin utun device within 90 seconds" >&2
           exit 1
-      - name: Route TCP Lab subnet [macOS]
+      - name: Configure host-side Darwin utun [macOS]
         run: |
           set -euo pipefail
           if [[ ! "$TCP_LAB_INTERFACE" =~ ^utun[0-9]+$ ]]; then
@@ -197,6 +199,9 @@ jobs:
 
           sudo -n route -n delete -net "$TCP_LAB_ROUTE_PREFIX" \
             -interface "$TCP_LAB_INTERFACE" >/dev/null 2>&1 || true
+          sudo -n ifconfig "$TCP_LAB_INTERFACE" \
+            inet "$TCP_LAB_HOST_ADDRESS" "$TCP_LAB_ADDRESS" \
+            netmask "$TCP_LAB_NETMASK" up
           sudo -n route -n add -net "$TCP_LAB_ROUTE_PREFIX" \
             -interface "$TCP_LAB_INTERFACE"
       - name: Probe TCP reachability [macOS]
