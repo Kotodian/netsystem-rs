@@ -425,7 +425,9 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     }
 
     pub fn ack_tx_up_to(&mut self, session_id: SessionId, bytes: usize) -> RuntimeResult<()> {
-        self.app.discard_acked_tx_bytes(session_id, bytes)
+        self.app
+            .discard_acked_tx_bytes(session_id, bytes)
+            .map(|_| ())
     }
 
     pub fn enqueue_rx(

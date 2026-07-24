@@ -2,7 +2,6 @@ use std::fmt;
 use std::sync::Arc;
 
 use hammer_core::data_plane::{DataPlaneBuffers, Index};
-use hammer_infra::fifo::Fifo;
 use hammer_infra::segment::Segment;
 use hammer_runtime::app::{
     AppSession, SessionEventQueue, SessionEvt, SessionEvtType, SessionMsgQueue,

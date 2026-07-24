@@ -44,11 +44,7 @@ fn init_session(engine: &mut Engine) -> RuntimeResult<Arc<runtime::SessionMain>>
 }
 
 #[hammer_component_macros::worker_init_function(name = "session_worker_init")]
-fn init_session_worker(
-    engine: &mut Engine,
-    session: Arc<Session>,
-    main: Arc<runtime::SessionMain>,
-) -> RuntimeResult<()> {
+fn init_session_worker(engine: &mut Engine, main: Arc<runtime::SessionMain>) -> RuntimeResult<()> {
     let worker = engine.data_worker_id()?;
     let session_queue = engine
         .runtime
