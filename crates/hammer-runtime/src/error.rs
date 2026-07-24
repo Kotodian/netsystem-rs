@@ -30,6 +30,20 @@ pub enum RuntimeError {
         #[source]
         source: std::io::Error,
     },
+    #[error("File poller does not support required operation `{operation}`")]
+    FilePollerOperationUnsupported { operation: &'static str },
+    #[error("File poller completion queue is full while {operation}")]
+    FileCompletionQueueFull { operation: &'static str },
+    #[error("File poller multishot probe produced no completion")]
+    FilePollerProbeCompletionMissing,
+    #[error("File poller submission queue is full")]
+    FileSubmissionQueueFull,
+    #[error("{operation}")]
+    FilePollerIo {
+        operation: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
     #[error(transparent)]
     MainHeap(#[from] hammer_infra::main_heap::MainHeapError),
     #[error(transparent)]
@@ -58,6 +72,18 @@ pub enum RuntimeError {
     ProcessNodesRequireMainEngine,
     #[error("Process Nodes must be controlled by their owner thread")]
     ProcessControlWrongThread,
+    #[error("control timer interval must be non-zero")]
+    ControlTimerIntervalZero,
+    #[error("control thread is stopped")]
+    ControlThreadStopped,
+    #[error("control command panicked")]
+    ControlCommandPanicked,
+    #[error("control command was canceled")]
+    ControlCommandCanceled,
+    #[error("control command timed out")]
+    ControlCommandTimedOut,
+    #[error("control worker barrier is not configured")]
+    ControlBarrierUnavailable,
     #[error("duplicate Process Node `{name}`")]
     DuplicateProcessNode { name: &'static str },
     #[error("data worker {worker:?} does not match Handoff owner {handoff_owner:?}")]
