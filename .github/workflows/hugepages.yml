@@ -1,0 +1,32 @@
+name: Huge Pages
+run-name: Verify huge pages for ${{ github.ref_name }} (${{ github.event_name }})
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hugepages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: HugeTLB behavior [Linux]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout [Linux]
+        uses: actions/checkout@v4
+      - name: Install Rust [Linux]
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+      - name: Cache Cargo [Linux]
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: hugetlb-linux
+      - name: Verify strict Linux HugeTLB behavior
+        run: sudo env "PATH=$PATH" "HOME=$HOME" make verify-hugepages
