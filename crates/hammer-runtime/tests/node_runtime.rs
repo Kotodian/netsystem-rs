@@ -3,11 +3,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use hammer_core::data_plane::{
     BufferFrame, NodeHandle, NodeId, NodeKind, NodeNext, NodeRegistration, NodeState,
 };
-use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
     DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, DriverNode, InternalNode,
-    Node, NodeDescriptor, NodeEntry, NodeProcessFn, NodeResult, NodeRuntimeData, TraceFormatter,
-    process_frame,
+    Node, NodeDescriptor, NodeEntry, NodeProcessFn, NodeResult, NodeRuntimeData, RuntimeError,
+    RuntimeResult, TraceFormatter, process_frame,
 };
 
 static NODE_CALLS_BY_WORD: [AtomicU64; 128] = [const { AtomicU64::new(0) }; 128];
@@ -594,7 +593,13 @@ fn descriptor_registration_validates_declared_next_shape() {
         )
         .expect_err("next count mismatch must fail");
 
-    assert!(err.to_string().contains("node initial next count mismatch"));
+    assert!(matches!(
+        err,
+        RuntimeError::InitialNextCountMismatch {
+            declared: 1,
+            actual: 2
+        }
+    ));
 }
 
 #[test]
@@ -617,7 +622,10 @@ fn descriptor_registration_with_handle_registers_handle_once() {
             DescriptorNode::plain(count_process, NodeRuntimeData::empty()),
         )
         .expect_err("duplicate handle must fail");
-    assert!(err.to_string().contains("node handle already registered"));
+    assert!(matches!(
+        err,
+        RuntimeError::NodeHandleAlreadyRegistered { handle: HANDLE }
+    ));
 }
 
 #[test]
@@ -757,7 +765,13 @@ fn try_register_descriptor_rejects_next_count_mismatch() {
         .nodes()
         .try_register_descriptor(NodeKind::Internal, descriptor)
         .expect_err("initial next count mismatch must fail");
-    assert!(err.to_string().contains("node initial next count mismatch"));
+    assert!(matches!(
+        err,
+        RuntimeError::InitialNextCountMismatch {
+            declared: TestNext::COUNT,
+            actual: 0
+        }
+    ));
 }
 
 #[test]
@@ -1115,7 +1129,10 @@ fn worker_graph_rejects_worker_local_next_slot_mutation() {
         .add_node_next_slot(sibling, dynamic)
         .expect_err("worker must not add a graph next slot");
 
-    assert!(error.to_string().contains("cannot mutate graph topology"));
+    assert!(matches!(
+        error,
+        RuntimeError::GraphTopologyMutationFromWorker
+    ));
     assert!(first.nodes().node_next_slot(owner, 2).is_err());
     assert!(first.nodes().node_next_slot(sibling, 2).is_err());
     assert!(runtime.nodes().node_next_slot(owner, 2).is_err());

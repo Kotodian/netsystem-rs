@@ -291,6 +291,9 @@ mod tests {
     fn init_error_converts_to_core_error() {
         let err = InitError::DuplicateName("foo");
         let core: RuntimeError = err.into();
-        assert!(core.to_string().contains("duplicate"));
+        assert!(matches!(
+            core,
+            RuntimeError::Init(InitError::DuplicateName("foo"))
+        ));
     }
 }

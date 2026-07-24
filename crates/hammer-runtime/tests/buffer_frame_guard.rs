@@ -1,6 +1,7 @@
 use hammer_core::data_plane::{BufferFrame, DataPlaneBuffers, NodeId, NodeRegistration};
 use hammer_runtime::{
-    DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node, NodeResult,
+    DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node,
+    NodeResult, RuntimeError,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -102,7 +103,10 @@ fn put_next_frame_failure_drops_typed_owner_resources() {
         .put_next_frame(frame)
         .expect_err("invalid node must fail");
 
-    assert!(err.to_string().contains("node id out of bounds"));
+    let RuntimeError::NodeNotRegistered { node } = err else {
+        panic!("expected NodeNotRegistered, got {err:?}");
+    };
+    assert_eq!(node, NodeId::new(99));
     assert_eq!(runtime.in_use_buffers(), 0);
     assert_eq!(runtime.frames_in_use(), 0);
 }

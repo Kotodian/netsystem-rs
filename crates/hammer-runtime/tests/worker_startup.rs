@@ -119,11 +119,10 @@ fn verify_worker_startup_contract(engine: &mut Engine) -> RuntimeResult<()> {
             ),
         )
         .expect_err("worker init must not mutate graph topology");
-    assert!(
-        topology_error
-            .to_string()
-            .contains("cannot mutate graph topology")
-    );
+    assert!(matches!(
+        topology_error,
+        RuntimeError::GraphTopologyMutationFromWorker
+    ));
 
     engine.set_worker_node_runtime_data(
         node,
@@ -293,7 +292,10 @@ fn data_worker_startup_is_transactional() {
     reset(EARLY_EXIT);
     let mut pool = engine_pool();
     let error = start_workers(pool.main_engine_mut()).expect_err("early exit must fail startup");
-    assert!(error.to_string().contains("main-loop barrier"));
+    assert!(matches!(
+        error,
+        RuntimeError::WorkerExitedBeforeStartupBarrier { phase: "main-loop" }
+    ));
     assert_eq!(ABORT_OBSERVED.load(Ordering::Acquire), 1);
     stop_workers(&mut pool);
 }
