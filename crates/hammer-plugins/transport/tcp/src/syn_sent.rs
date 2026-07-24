@@ -30,22 +30,19 @@ pub struct TcpSynSentNode {
     process: NodeProcessFn,
 }
 
-impl TcpSynSentNode {
-    pub(crate) fn for_worker<C, Seg>() -> Self
-    where
-        C: CongestionController + 'static,
-        Seg: TcpWorkerStore<C>,
-        hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-    {
-        Self::new(tcp_syn_sent_process::<C, Seg>)
-    }
-}
-
 pub fn register_tcp_syn_sent(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+    let main = crate::TCP_MAIN
+        .load_full()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
+    if let Some(node) = runtime.nodes().node_by_name("tcp-syn-sent") {
+        return Ok(node);
+    }
     runtime
         .nodes()
-        .node_by_name("tcp-syn-sent")
-        .ok_or_else(|| RuntimeError::invariant("TCP worker graph is not registered"))
+        .try_register_internal_with_next_names(
+            TcpSynSentNode::new(main.syn_sent_process),
+            &TcpSynSentNext::NEXT_NAMES,
+        )
 }
 
 impl Node for TcpSynSentNode {
@@ -60,7 +57,7 @@ impl Node for TcpSynSentNode {
     }
 }
 
-fn tcp_syn_sent_process<C, Seg>(
+pub(crate) fn tcp_syn_sent_process<C, Seg>(
     runtime: &DataPlaneRuntime,
     _: NodeRuntimeData,
     frame: &mut BufferFrame,

@@ -30,22 +30,19 @@ pub struct TcpRcvProcessNode {
     process: NodeProcessFn,
 }
 
-impl TcpRcvProcessNode {
-    pub(crate) fn for_worker<C, Seg>() -> Self
-    where
-        C: CongestionController + 'static,
-        Seg: TcpWorkerStore<C>,
-        hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-    {
-        Self::new(tcp_rcv_process_process::<C, Seg>)
-    }
-}
-
 pub fn register_tcp_rcv_process(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+    let main = crate::TCP_MAIN
+        .load_full()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
+    if let Some(node) = runtime.nodes().node_by_name("tcp-rcv-process") {
+        return Ok(node);
+    }
     runtime
         .nodes()
-        .node_by_name("tcp-rcv-process")
-        .ok_or_else(|| RuntimeError::invariant("TCP worker graph is not registered"))
+        .try_register_internal_with_next_names(
+            TcpRcvProcessNode::new(main.rcv_process),
+            &TcpRcvProcessNext::NEXT_NAMES,
+        )
 }
 
 impl Node for TcpRcvProcessNode {
@@ -60,7 +57,7 @@ impl Node for TcpRcvProcessNode {
     }
 }
 
-fn tcp_rcv_process_process<C, Seg>(
+pub(crate) fn tcp_rcv_process_process<C, Seg>(
     runtime: &DataPlaneRuntime,
     _: NodeRuntimeData,
     frame: &mut BufferFrame,

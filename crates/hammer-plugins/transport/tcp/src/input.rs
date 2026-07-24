@@ -80,13 +80,15 @@ impl TcpInputControlPlane {
     }
 
     #[inline]
-    pub(crate) fn node<C, Seg>(&self, handoff: Option<(NodeHandle, DataWorkerId)>) -> TcpInputNode
-    where
-        C: CongestionController + 'static,
-        Seg: TcpWorkerStore<C>,
-        hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-    {
-        let mut node = TcpInputNode::for_worker::<C, Seg>(Arc::clone(&self.inner));
+    pub(crate) fn node(
+        &self,
+        process: NodeProcessFn,
+        handoff: Option<(NodeHandle, DataWorkerId)>,
+    ) -> TcpInputNode {
+        let mut node = TcpInputNode::new(
+            register_tcp_input_runtime(Arc::clone(&self.inner)),
+            process,
+        );
         if let Some((handoff, worker)) = handoff {
             node.handoff = Some(handoff);
             node.handoff_worker = Some(worker);
@@ -109,20 +111,6 @@ pub struct TcpInputNode {
     handoff: Option<NodeHandle>,
     #[node(default)]
     handoff_worker: Option<DataWorkerId>,
-}
-
-impl TcpInputNode {
-    pub(crate) fn for_worker<C, Seg>(snapshot: Arc<ArcSwap<TcpLookupSnapshot>>) -> Self
-    where
-        C: CongestionController + 'static,
-        Seg: TcpWorkerStore<C>,
-        hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-    {
-        Self::new(
-            register_tcp_input_runtime(snapshot),
-            tcp_input_process::<C, Seg>,
-        )
-    }
 }
 
 impl Node for TcpInputNode {
@@ -204,7 +192,7 @@ fn sync_tcp_input_runtime(
     })
 }
 
-fn tcp_input_process<C, Seg>(
+pub(crate) fn tcp_input_process<C, Seg>(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,

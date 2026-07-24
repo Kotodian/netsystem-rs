@@ -29,22 +29,19 @@ pub struct TcpEstablishedNode {
     process: NodeProcessFn,
 }
 
-impl TcpEstablishedNode {
-    pub(crate) fn for_worker<C, Seg>() -> Self
-    where
-        C: CongestionController + 'static,
-        Seg: TcpWorkerStore<C>,
-        hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-    {
-        Self::new(tcp_established_process::<C, Seg>)
-    }
-}
-
 pub fn register_tcp_established(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+    let main = crate::TCP_MAIN
+        .load_full()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
+    if let Some(node) = runtime.nodes().node_by_name("tcp-established") {
+        return Ok(node);
+    }
     runtime
         .nodes()
-        .node_by_name("tcp-established")
-        .ok_or_else(|| RuntimeError::invariant("TCP worker graph is not registered"))
+        .try_register_internal_with_next_names(
+            TcpEstablishedNode::new(main.established_process),
+            &TcpEstablishedNext::NEXT_NAMES,
+        )
 }
 
 impl Node for TcpEstablishedNode {
@@ -59,7 +56,7 @@ impl Node for TcpEstablishedNode {
     }
 }
 
-fn tcp_established_process<C, Seg>(
+pub(crate) fn tcp_established_process<C, Seg>(
     runtime: &DataPlaneRuntime,
     _: NodeRuntimeData,
     frame: &mut BufferFrame,

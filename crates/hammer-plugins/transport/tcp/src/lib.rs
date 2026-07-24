@@ -35,7 +35,8 @@ use std::sync::Arc;
 use arc_swap::ArcSwapOption;
 use hammer_core::data_plane::{BufferPacketCursor, NodeHandle, NodeId, NodeState, SecondaryOpaque};
 use hammer_runtime::{
-    DataPlaneRuntime, DataWorkerId, Engine, Node, NodeRuntimeData, RuntimeError, RuntimeResult,
+    DataPlaneRuntime, DataWorkerId, Engine, Node, NodeRuntimeData, PluginError, RuntimeError,
+    RuntimeResult,
 };
 use thiserror::Error;
 
@@ -290,29 +291,44 @@ where
 }
 
 pub struct TcpMain {
-    congestion: config::CongestionController,
     control: TcpInputControlPlane,
     listeners: listener_control::TcpListenerControlHandle,
     ip_output: output::IpOutputFunctions,
+    input_process: NodeProcessFn,
+    listen_process: NodeProcessFn,
+    established_process: NodeProcessFn,
+    rcv_process: NodeProcessFn,
+    syn_sent_process: NodeProcessFn,
+    bind_worker: fn(&mut Engine) -> RuntimeResult<()>,
 }
 
 impl TcpMain {
-    pub fn new(
-        congestion: config::CongestionController,
+    fn new<C, Seg>(
         ip_output: output::IpOutputFunctions,
-    ) -> Self {
+        bind_worker: fn(&mut Engine) -> RuntimeResult<()>,
+    ) -> Self
+    where
+        C: CongestionController + 'static,
+        Seg: TcpWorkerStore<C>,
+        hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
+    {
         let control = TcpInputControlPlane::new();
         let listeners = listener_control::TcpListenerControlHandle::new(control.clone());
         Self {
-            congestion,
             control,
             listeners,
             ip_output,
+            input_process: input::tcp_input_process::<C, Seg>,
+            listen_process: listen::tcp_listen_process::<C, Seg>,
+            established_process: established::tcp_established_process::<C, Seg>,
+            rcv_process: rcv_process::tcp_rcv_process_process::<C, Seg>,
+            syn_sent_process: syn_sent::tcp_syn_sent_process::<C, Seg>,
+            bind_worker,
         }
     }
 
-    pub fn congestion(&self) -> config::CongestionController {
-        self.congestion
+    fn bind_worker(&self, engine: &mut Engine) -> RuntimeResult<()> {
+        (self.bind_worker)(engine)
     }
 
     pub fn control(&self) -> &TcpInputControlPlane {
@@ -332,25 +348,6 @@ impl TcpMain {
         self.listeners.bind(bind, owner_worker, capabilities)
     }
 
-    /// Register the configured `TcpInputNode<C, Seg>` in the main graph.
-    ///
-    /// Per-worker TCP state remains in plugin-local worker storage; `TcpMain`
-    /// only supplies the cross-worker control plane shared by every clone.
-    fn register_tcp_input<C, Seg>(
-        &self,
-        runtime: &DataPlaneRuntime,
-        handoff: Option<(NodeHandle, DataWorkerId)>,
-    ) -> RuntimeResult<NodeId>
-    where
-        C: CongestionController + 'static,
-        Seg: TcpWorkerStore<C>,
-        hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-    {
-        let node = self.control.node::<C, Seg>(handoff);
-        runtime
-            .nodes()
-            .try_register_internal_with_next_names(node, &TcpInputNext::NEXT_NAMES)
-    }
 }
 
 // VPP alignment: `tcp_main_t tcp_main;` is a file-scope global in VPP's
@@ -391,11 +388,6 @@ fn init_tcp(engine: &mut Engine, config: Arc<crate::config::TcpPluginConfig>) ->
         output::plugin_functions(engine.plugin_main())?,
     )?);
     TCP_MAIN.store(Some(Arc::clone(&main)));
-    register_configured_main_graph(
-        &engine.runtime,
-        main.as_ref(),
-        hammer_service::transport::session_backend().unwrap_or_default(),
-    )?;
     Ok(())
 }
 
@@ -404,7 +396,22 @@ fn configured_tcp_main(
     ip_output: output::IpOutputFunctions,
 ) -> RuntimeResult<TcpMain> {
     publish_tcp_policy(TcpPolicy::from_plugin_config(tcp));
-    let main = TcpMain::new(tcp.congestion, ip_output);
+    use crate::config::CongestionController as CongestionKind;
+
+    let main = match tcp.congestion {
+        CongestionKind::Bbr => {
+            match hammer_service::transport::session_backend().unwrap_or_default() {
+                SessionBackend::Local => TcpMain::new::<BbrController, Local>(
+                    ip_output,
+                    bind_local_worker::<BbrController>,
+                ),
+                SessionBackend::Svm => TcpMain::new::<BbrController, Svm>(
+                    ip_output,
+                    bind_svm_worker::<BbrController>,
+                ),
+            }
+        }
+    };
     for entry in &tcp.listen {
         main.bind_tcp_listener(
             entry.address,
@@ -416,82 +423,29 @@ fn configured_tcp_main(
 }
 
 pub fn register_tcp_input(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
-    let node = runtime.nodes().node_by_name("tcp-input").ok_or_else(|| {
-        RuntimeError::lifecycle("tcp graph registration", "tcp-input is not registered")
-    })?;
-    let main = TCP_MAIN.load_full().ok_or_else(|| {
-        RuntimeError::lifecycle("tcp graph registration", "TCP main is not initialized")
-    })?;
+    let main = TCP_MAIN
+        .load_full()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
+    let node = if let Some(node) = runtime.nodes().node_by_name("tcp-input") {
+        node
+    } else {
+        runtime.nodes().try_register_internal_with_next_names(
+            main.control().node(main.input_process, None),
+            &TcpInputNext::NEXT_NAMES,
+        )?
+    };
     main.ip_output()
         .get()
         .register_protocol(6, node)
         .into_result()
-        .map_err(|error| RuntimeError::subsystem("ip protocol registration", error))?;
+        .map_err(|source| {
+            RuntimeError::from(PluginError::CapabilityCall {
+                plugin: "ip",
+                capability: "register protocol",
+                source,
+            })
+        })?;
     Ok(node)
-}
-
-fn register_typed_main_graph<C, Seg>(
-    runtime: &DataPlaneRuntime,
-    main: &TcpMain,
-) -> RuntimeResult<()>
-where
-    C: CongestionController + 'static,
-    Seg: TcpWorkerStore<C>,
-    hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-{
-    // The main graph carries only the monomorphized process function and edge
-    // shape. Its Session Queue stays disabled until each worker binds state.
-    let tcp_output = output::register_tcp_output(runtime)?;
-    let session_queue = hammer_service::session::node::register_session_queue_node(runtime)?;
-    main.register_tcp_input::<C, Seg>(runtime, None)?;
-    let control = main.control().clone();
-    runtime.nodes().try_register_internal_with_next_names(
-        TcpListenNode::for_worker::<C, Seg>(control),
-        &TcpListenNext::NEXT_NAMES,
-    )?;
-    runtime.nodes().try_register_internal_with_next_names(
-        TcpEstablishedNode::for_worker::<C, Seg>(),
-        &TcpEstablishedNext::NEXT_NAMES,
-    )?;
-    runtime.nodes().try_register_internal_with_next_names(
-        TcpRcvProcessNode::for_worker::<C, Seg>(),
-        &TcpRcvProcessNext::NEXT_NAMES,
-    )?;
-    runtime.nodes().try_register_internal_with_next_names(
-        TcpSynSentNode::for_worker::<C, Seg>(),
-        &TcpSynSentNext::NEXT_NAMES,
-    )?;
-    let _ = SessionQueueNode::compile_output_next(runtime, session_queue, tcp_output)?;
-    runtime
-        .nodes()
-        .set_node_state(session_queue, NodeState::Disabled)?;
-    Ok(())
-}
-
-fn register_configured_main_graph(
-    runtime: &DataPlaneRuntime,
-    main: &TcpMain,
-    backend: SessionBackend,
-) -> RuntimeResult<()> {
-    use crate::config::CongestionController as CongestionKind;
-    use hammer_service::transport::congestion::BbrController;
-
-    let congestion = main.congestion();
-    match congestion {
-        CongestionKind::Bbr => match backend {
-            SessionBackend::Local => {
-                type C = BbrController;
-                type Seg = hammer_infra::segment::Local;
-                register_typed_main_graph::<C, Seg>(runtime, main)?;
-            }
-            SessionBackend::Svm => {
-                type C = BbrController;
-                type Seg = hammer_infra::segment::Svm;
-                register_typed_main_graph::<C, Seg>(runtime, main)?;
-            }
-        },
-    }
-    Ok(())
 }
 
 fn bind_typed_worker_graph<C, Seg>(
@@ -549,13 +503,13 @@ where
         .ok_or_else(|| RuntimeError::invariant("tcp main not initialized"))?;
     let input_data = main
         .control()
-        .node::<C, Seg>(Some((handoff, worker)))
+        .node(main.input_process, Some((handoff, worker)))
         .node_runtime_data()?;
     let control = main.control().clone();
-    let listen_data = TcpListenNode::for_worker::<C, Seg>(control).node_runtime_data()?;
-    let established_data = TcpEstablishedNode::for_worker::<C, Seg>().node_runtime_data()?;
-    let rcv_process_data = TcpRcvProcessNode::for_worker::<C, Seg>().node_runtime_data()?;
-    let syn_sent_data = TcpSynSentNode::for_worker::<C, Seg>().node_runtime_data()?;
+    let listen_data = TcpListenNode::new(control, main.listen_process).node_runtime_data()?;
+    let established_data = TcpEstablishedNode::new(main.established_process).node_runtime_data()?;
+    let rcv_process_data = TcpRcvProcessNode::new(main.rcv_process).node_runtime_data()?;
+    let syn_sent_data = TcpSynSentNode::new(main.syn_sent_process).node_runtime_data()?;
 
     // A worker graph clone can retain the old polling state. Keep the node
     // dormant until its replacement SessionWorker owns a live readiness file.
@@ -616,46 +570,44 @@ where
     Ok(())
 }
 
+fn bind_local_worker<C>(engine: &mut Engine) -> RuntimeResult<()>
+where
+    C: CongestionController + 'static,
+    Local: TcpWorkerStore<C>,
+    hammer_service::session::SessionAppRuntime<Local>: SessionAppRuntimeCreate<Local>,
+{
+    let worker = engine.data_worker_id()?;
+    let state = TcpWorkerState::new(
+        SessionWorker::new(worker, engine.runtime.buffers().clone()),
+        TcpWorker::new(worker),
+    );
+    bind_typed_worker_graph::<C, Local>(engine, state)
+}
+
+fn bind_svm_worker<C>(engine: &mut Engine) -> RuntimeResult<()>
+where
+    C: CongestionController + 'static,
+    Svm: TcpWorkerStore<C>,
+    hammer_service::session::SessionAppRuntime<Svm>: SessionAppRuntimeCreate<Svm>,
+{
+    let worker = engine.data_worker_id()?;
+    let state = TcpWorkerState::new(
+        SessionWorker::new_svm(
+            worker,
+            engine.runtime.buffers().clone(),
+            hammer_runtime::app::AppSessionConfig::default(),
+        ),
+        TcpWorker::new(worker),
+    );
+    bind_typed_worker_graph::<C, Svm>(engine, state)
+}
+
 #[hammer_component_macros::worker_init_function(name = "tcp_worker_init")]
 fn init_tcp_worker(engine: &mut Engine) -> RuntimeResult<()> {
-    use crate::config::CongestionController as CongestionKind;
-    use hammer_service::transport::congestion::BbrController;
-
-    let worker = engine.data_worker_id()?;
-    let tcp_main = TCP_MAIN.load();
-    let congestion = tcp_main
-        .as_deref()
-        .ok_or_else(|| RuntimeError::invariant("tcp main not initialized"))?
-        .congestion();
-    let backend = hammer_service::transport::session_backend().unwrap_or_default();
-
-    match congestion {
-        CongestionKind::Bbr => match backend {
-            SessionBackend::Local => {
-                type C = BbrController;
-                type Seg = hammer_infra::segment::Local;
-                let state = TcpWorkerState::new(
-                    SessionWorker::new(worker, engine.runtime.buffers().clone()),
-                    TcpWorker::new(worker),
-                );
-                bind_typed_worker_graph::<C, Seg>(engine, state)?;
-            }
-            SessionBackend::Svm => {
-                type C = BbrController;
-                type Seg = hammer_infra::segment::Svm;
-                let state = TcpWorkerState::new(
-                    SessionWorker::new_svm(
-                        worker,
-                        engine.runtime.buffers().clone(),
-                        hammer_runtime::app::AppSessionConfig::default(),
-                    ),
-                    TcpWorker::new(worker),
-                );
-                bind_typed_worker_graph::<C, Seg>(engine, state)?;
-            }
-        },
-    }
-    Ok(())
+    TCP_MAIN
+        .load_full()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?
+        .bind_worker(engine)
 }
 
 fn tcp_session_queue_dispatch<C, Seg>(

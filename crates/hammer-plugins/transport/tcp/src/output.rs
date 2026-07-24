@@ -11,7 +11,8 @@ use hammer_infra::checksum::InternetChecksum;
 #[cfg(test)]
 use hammer_runtime::InternalNode;
 use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
-use hammer_runtime::{RuntimeError, RuntimeResult};
+use hammer_runtime::{PluginError, RuntimeError, RuntimeResult};
+use hammer_service::session::node::SessionQueueNode;
 
 use super::{TcpOutputError, read_tcp_egress_endpoints};
 use hammer_service::opaque::NetworkOpaque;
@@ -30,7 +31,13 @@ pub(crate) fn plugin_functions(
         .plugin("ip")?
         .ip_output()
         .into_option()
-        .ok_or_else(|| RuntimeError::invariant("plugin `ip` exports no IP output functions"))
+        .ok_or_else(|| {
+            PluginError::CapabilityMissing {
+                plugin: "ip",
+                capability: "IP output functions",
+            }
+            .into()
+        })
 }
 
 #[hammer_component_macros::node_next]
@@ -53,9 +60,18 @@ pub fn register_tcp_output(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> 
     if let Some(node) = runtime.nodes().node_by_name(TcpOutputNode::NODE_NAME) {
         return Ok(node);
     }
+    let node = runtime
+        .nodes()
+        .try_register_internal_with_next_names(TcpOutputNode::new(), &TcpOutputNext::NEXT_NAMES)?;
+    let session_queue = runtime
+        .nodes()
+        .node_by_name("session-queue")
+        .expect("Session Queue Graph Node must be registered before TCP output");
+    SessionQueueNode::compile_output_next(runtime, session_queue, node)?;
     runtime
         .nodes()
-        .try_register_internal_with_next_names(TcpOutputNode::new(), &TcpOutputNext::NEXT_NAMES)
+        .set_node_state(session_queue, hammer_core::data_plane::NodeState::Disabled)?;
+    Ok(node)
 }
 
 impl Node for TcpOutputNode {

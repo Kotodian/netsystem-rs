@@ -46,22 +46,19 @@ pub struct TcpListenNode {
     control_slot: Cell<Option<usize>>,
 }
 
-impl TcpListenNode {
-    pub(crate) fn for_worker<C, Seg>(control: TcpInputControlPlane) -> Self
-    where
-        C: CongestionController + 'static,
-        Seg: TcpWorkerStore<C>,
-        hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-    {
-        Self::new(control, tcp_listen_process::<C, Seg>)
-    }
-}
-
 pub fn register_tcp_listen(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+    let main = crate::TCP_MAIN
+        .load_full()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
+    if let Some(node) = runtime.nodes().node_by_name("tcp-listen") {
+        return Ok(node);
+    }
     runtime
         .nodes()
-        .node_by_name("tcp-listen")
-        .ok_or_else(|| RuntimeError::invariant("TCP worker graph is not registered"))
+        .try_register_internal_with_next_names(
+            TcpListenNode::new(main.control().clone(), main.listen_process),
+            &TcpListenNext::NEXT_NAMES,
+        )
 }
 
 thread_local! {
@@ -138,7 +135,7 @@ impl Node for TcpListenNode {
     }
 }
 
-fn tcp_listen_process<C, Seg>(
+pub(crate) fn tcp_listen_process<C, Seg>(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
