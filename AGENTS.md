@@ -82,8 +82,9 @@ Use Rust 2024 conventions and rustfmt defaults: 4-space indentation, `snake_case
   <https://rust-lang.github.io/rfcs/0430-finalizing-naming-conventions.html>.
 - Name types and values by what they are in the domain, not by how or when the
   implementation produced them. Prefixes such as `Configured`, `Registered`,
-  `Resolved`, `Dynamic`, and `Runtime` are forbidden unless two simultaneously
-  valid domain states with different behavior require that distinction.
+  `Resolved`, `Parsed`, `Dynamic`, and `Runtime` are forbidden unless two
+  simultaneously valid domain states with different behavior require that
+  distinction.
 - Use role suffixes with one fixed meaning: `Config` is parsed input, `Policy`
   is a validated published decision, `State` is mutable state-machine data,
   `Handle` is a cloneable identity or capability, `Registration` is a
@@ -121,9 +122,10 @@ Use Rust 2024 conventions and rustfmt defaults: 4-space indentation, `snake_case
   generic suffixes such as `Helper`, `Util`, `Manager`, `Handler`, `Thing`,
   `Data`, `Context`, `Kind`, `Type`, or `View` unless that term is the
   established domain concept. `View` is forbidden for borrowed access,
-  observation, or a bundle of cached pointers/offsets; use Rust borrows or name
-  a genuine parsed/domain result precisely, such as `ParsedTcpSegment`. Do not
-  add a wrapper merely to create a place for a vague name.
+  observation, or a bundle of cached pointers/offsets; use Rust borrows. If a
+  distinct value is required, name it by the domain fact it owns, not by the
+  operation or lifecycle phase that produced it. Do not add a wrapper merely
+  to create a place for a vague name.
 
 ### Error handling rules
 
