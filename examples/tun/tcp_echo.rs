@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use hammer_app::attach::{AppClient, AppClientError};
-use hammer_app::{AppSession, AppSessionAsyncError, SessionHandle};
+use hammer_app::{AppSession, AppSessionError, SessionHandle};
 use hammer_infra::segment::Svm;
 use hammer_runtime::app::SessionEvtType;
 use hammer_runtime::engine::{Engine, EnginePool};
@@ -85,7 +85,7 @@ enum EchoError {
     #[error(transparent)]
     Attach(#[from] AppClientError),
     #[error(transparent)]
-    Session(#[from] AppSessionAsyncError),
+    Session(#[from] AppSessionError),
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
     #[error("failed to resolve the Cargo example executable")]

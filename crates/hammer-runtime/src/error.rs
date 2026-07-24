@@ -68,6 +68,46 @@ pub enum RuntimeError {
     WorkerThreadRegistryPoisoned,
     #[error("data workers are already started")]
     DataWorkersAlreadyStarted,
+    #[error("data worker {worker} thread setup failed")]
+    DataWorkerThreadSetup {
+        worker: usize,
+        #[source]
+        source: Box<RuntimeError>,
+    },
+    #[error("data worker {worker} data-plane runtime initialization failed")]
+    DataWorkerRuntimeInitialization {
+        worker: usize,
+        #[source]
+        source: Box<RuntimeError>,
+    },
+    #[error("failed to spawn data worker {worker} thread")]
+    DataWorkerThreadSpawn {
+        worker: usize,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to build async runtime for data worker {worker}")]
+    DataWorkerRuntimeBuild {
+        worker: usize,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("data worker {worker} exited before publishing its runtime handle")]
+    DataWorkerStartupCanceled { worker: usize },
+    #[error("data worker {worker} exited without returning its result")]
+    DataWorkerResultCanceled { worker: usize },
+    #[error("data worker {worker} task failed")]
+    DataWorkerTaskJoin {
+        worker: usize,
+        #[source]
+        source: tokio::task::JoinError,
+    },
+    #[error("data worker {worker} control call panicked")]
+    DataWorkerCallPanicked { worker: usize },
+    #[error("data worker {worker} control call was canceled")]
+    DataWorkerCallCanceled { worker: usize },
+    #[error("data worker index {worker} is outside configured worker count {worker_count}")]
+    DataWorkerIndexOutOfRange { worker: usize, worker_count: usize },
     #[error("Process Nodes can only start on the main Runtime Engine")]
     ProcessNodesRequireMainEngine,
     #[error("Process Nodes must be controlled by their owner thread")]
@@ -84,6 +124,8 @@ pub enum RuntimeError {
     ControlCommandTimedOut,
     #[error("control worker barrier is not configured")]
     ControlBarrierUnavailable,
+    #[error(transparent)]
+    AppSession(#[from] crate::app::AppSessionError),
     #[error("duplicate Process Node `{name}`")]
     DuplicateProcessNode { name: &'static str },
     #[error("data worker {worker:?} does not match Handoff owner {handoff_owner:?}")]

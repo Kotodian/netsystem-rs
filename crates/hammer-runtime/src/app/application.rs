@@ -4,12 +4,11 @@ use std::fmt;
 use std::sync::Arc;
 use std::task::Waker;
 
-use crate::error::{RuntimeError, RuntimeResult};
 use hammer_infra::segment::Local;
 use tokio::sync::Notify;
 
 use crate::app::handle::SessionHandle;
-use crate::app::session::{AppSession, AppSessionConfig};
+use crate::app::session::{AppSession, AppSessionConfig, AppSessionError};
 use crate::app::session_msg_queue::{SessionEvt, SessionMsgQueue, SessionSegment};
 
 struct SessionNotify {
@@ -114,17 +113,15 @@ impl AppWorker<Local> {
         &mut self,
         handle: SessionHandle,
         config: AppSessionConfig,
-    ) -> RuntimeResult<Arc<AppSession<Local>>> {
+    ) -> Result<Arc<AppSession<Local>>, AppSessionError> {
         if self.sessions.contains_key(&handle.raw()) {
-            return Err(RuntimeError::invariant(format!(
-                "app worker {} already has session {}",
-                self.worker_index,
-                handle.raw()
-            )));
+            return Err(AppSessionError::AlreadyAttached {
+                app_worker: self.worker_index,
+                session: handle.raw(),
+            });
         }
         let tx_evt_q: Arc<SessionMsgQueue> = Arc::new(
-            SessionMsgQueue::with_cfg(64, 64)
-                .map_err(|_| RuntimeError::invariant("invalid tx_evt_q capacity"))?,
+            SessionMsgQueue::with_cfg(64, 64).expect("fixed app worker TX event queue config"),
         );
         let session = Arc::new(AppSession::<Local>::new_in_segment(
             Local::default(),
@@ -147,13 +144,12 @@ impl AppWorker<Local> {
         handle: SessionHandle,
         config: AppSessionConfig,
         runtime_tx_evt_q: Arc<SessionMsgQueue>,
-    ) -> RuntimeResult<Arc<AppSession<Local>>> {
+    ) -> Result<Arc<AppSession<Local>>, AppSessionError> {
         if self.sessions.contains_key(&handle.raw()) {
-            return Err(RuntimeError::invariant(format!(
-                "app worker {} already has session {}",
-                self.worker_index,
-                handle.raw()
-            )));
+            return Err(AppSessionError::AlreadyAttached {
+                app_worker: self.worker_index,
+                session: handle.raw(),
+            });
         }
         let session = Arc::new(AppSession::<Local>::new_in_segment(
             Local::default(),
@@ -169,12 +165,19 @@ impl AppWorker<Local> {
 
     /// App-side async send via worker. Applies FIFO backpressure and completes
     /// only after every byte has entered the session-owned TX FIFO.
-    pub async fn send_all(&self, handle: SessionHandle, bytes: &[u8]) -> RuntimeResult<usize> {
-        let session = self
-            .sessions
-            .get(&handle.raw())
-            .cloned()
-            .ok_or_else(|| RuntimeError::invariant("app session not found"))?;
+    pub async fn send_all(
+        &self,
+        handle: SessionHandle,
+        bytes: &[u8],
+    ) -> Result<usize, AppSessionError> {
+        let session =
+            self.sessions
+                .get(&handle.raw())
+                .cloned()
+                .ok_or(AppSessionError::NotFound {
+                    app_worker: self.worker_index,
+                    session: handle.raw(),
+                })?;
         let notify = self.notify_entry(handle);
         let mut written = 0usize;
         while written < bytes.len() {
@@ -331,10 +334,15 @@ mod tests {
         worker
             .attach_session_local(handle, AppSessionConfig::default())
             .expect("first attach");
-        assert!(
-            worker
-                .attach_session_local(handle, AppSessionConfig::default())
-                .is_err()
-        );
+        let error = worker
+            .attach_session_local(handle, AppSessionConfig::default())
+            .expect_err("duplicate session must be rejected");
+        assert!(matches!(
+            error,
+            AppSessionError::AlreadyAttached {
+                app_worker: 0,
+                session,
+            } if session == handle.raw()
+        ));
     }
 }

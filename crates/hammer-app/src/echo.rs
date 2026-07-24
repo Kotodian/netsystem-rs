@@ -1,9 +1,11 @@
 use hammer_infra::segment::Local;
-use hammer_runtime::RuntimeResult;
 
-use crate::AppSession;
+use crate::{AppSession, AppSessionError};
 
-pub fn echo_once(session: &AppSession<Local>, scratch: &mut [u8]) -> RuntimeResult<usize> {
+pub fn echo_once(
+    session: &AppSession<Local>,
+    scratch: &mut [u8],
+) -> Result<usize, AppSessionError> {
     let read = session.recv_bytes(scratch);
     if read == 0 {
         return Ok(0);
@@ -16,7 +18,7 @@ pub fn run_echo_loop(
     session: &AppSession<Local>,
     scratch: &mut [u8],
     iterations: usize,
-) -> RuntimeResult<usize> {
+) -> Result<usize, AppSessionError> {
     let mut total = 0;
     for _ in 0..iterations {
         let wrote = echo_once(session, scratch)?;
