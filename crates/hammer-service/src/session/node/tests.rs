@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use hammer_core::data_plane::{BufferFrame, DataPlaneBuffers, NodeRegistration};
 use hammer_infra::pool::Index;
-use hammer_infra::segment::Local;
+use hammer_infra::segment::Segment;
 use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
 use hammer_runtime::{
     DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, InternalNode, Node, NodeProcessFn,
@@ -141,10 +141,10 @@ fn session_queue_updates_transport_before_control_and_io() {
 fn attach_local_app_session(
     sessions: &mut SessionWorker<Index>,
     session_id: crate::session::SessionId,
-) -> Arc<AppSession<Local>> {
+) -> Arc<AppSession> {
     let app_session = Arc::new(
         AppSession::new_in_segment(
-            Local::default(),
+            Segment::default(),
             AppSessionConfig::new(256, 16),
             SessionHandle::new(session_id.pool_index().slot(), 0),
             sessions.local_app().tx_evt_q().clone(),

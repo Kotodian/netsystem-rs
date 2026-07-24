@@ -12,25 +12,9 @@ const OOO_CAPACITY: usize = 8;
 const SESSION_BUFFER_SLOT_BYTES: usize = 2_048;
 const SESSION_BUFFER_SLOTS: usize = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SessionBackend {
-    Local,
-    #[serde(rename = "svm")]
-    Svm,
-}
-
-impl Default for SessionBackend {
-    fn default() -> Self {
-        Self::Local
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Session {
-    #[serde(default)]
-    pub backend: SessionBackend,
     #[serde(default)]
     pub attach_socket_path: Option<String>,
     #[serde(with = "humantime_serde")]
@@ -47,7 +31,6 @@ pub struct Session {
 impl Default for Session {
     fn default() -> Self {
         Self {
-            backend: SessionBackend::default(),
             attach_socket_path: None,
             timer_tick: SESSION_TIMER_TICK,
             pool_capacity: SESSION_POOL_CAPACITY,

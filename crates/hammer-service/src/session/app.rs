@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use hammer_core::data_plane::{DataPlaneBuffers, Index};
 use hammer_infra::fifo::Fifo;
-use hammer_infra::segment::{Local, Segment, Svm};
+use hammer_infra::segment::Segment;
 use hammer_runtime::app::{
-    AppSession, SessionEventQueue, SessionEvt, SessionEvtType, SessionMsgQueue, SessionSegment,
+    AppSession, SessionEventQueue, SessionEvt, SessionEvtType, SessionMsgQueue,
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
@@ -30,14 +30,14 @@ fn checked_add_ooo_accepted(total: u32, accepted: u32) -> RuntimeResult<u32> {
         .ok_or_else(|| RuntimeError::invariant("ooo rx accepted length overflow"))
 }
 
-pub struct SessionAppRuntime<S: SessionSegment> {
-    session_slots: Vec<Option<(SessionId, Arc<AppSession<S>>)>>,
-    tx_evt_q: Arc<S::EventQueue>,
+pub struct SessionAppRuntime {
+    session_slots: Vec<Option<(SessionId, Arc<AppSession>)>>,
+    tx_evt_q: Arc<SessionMsgQueue>,
     worker_index: usize,
-    seg: S,
+    seg: Segment,
 }
 
-impl<S: SessionSegment> fmt::Debug for SessionAppRuntime<S> {
+impl fmt::Debug for SessionAppRuntime {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SessionAppRuntime")
             .field("session_slots", &self.session_slots)
@@ -46,13 +46,13 @@ impl<S: SessionSegment> fmt::Debug for SessionAppRuntime<S> {
     }
 }
 
-impl<S: SessionSegment> SessionAppRuntime<S> {
+impl SessionAppRuntime {
     #[inline]
     pub fn new(
         session_capacity: usize,
-        tx_evt_q: Arc<S::EventQueue>,
+        tx_evt_q: Arc<SessionMsgQueue>,
         worker_index: usize,
-        seg: S,
+        seg: Segment,
     ) -> Self {
         Self {
             session_slots: vec![None; session_capacity],
@@ -66,16 +66,16 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
     /// `attach_session_local_with_runtime_tx` shares this same queue, so the
     /// dataplane side can drain all sessions' TX events from one ring.
     #[inline]
-    pub fn tx_evt_q(&self) -> &Arc<S::EventQueue> {
+    pub fn tx_evt_q(&self) -> &Arc<SessionMsgQueue> {
         &self.tx_evt_q
     }
 
-    pub fn attach_session(&mut self, session_id: SessionId, session: Arc<AppSession<S>>) {
+    pub fn attach_session(&mut self, session_id: SessionId, session: Arc<AppSession>) {
         let slot = session_id.pool_index().slot() as usize;
         self.session_slots[slot] = Some((session_id, session));
     }
 
-    pub fn detach_session(&mut self, session_id: SessionId) -> Option<Arc<AppSession<S>>> {
+    pub fn detach_session(&mut self, session_id: SessionId) -> Option<Arc<AppSession>> {
         let slot = session_id.pool_index().slot() as usize;
         let entry = self.session_slots.get_mut(slot)?;
         if entry
@@ -88,7 +88,7 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
     }
 
     #[inline(always)]
-    fn session(&self, session_id: SessionId) -> Option<&Arc<AppSession<S>>> {
+    fn session(&self, session_id: SessionId) -> Option<&Arc<AppSession>> {
         let slot = session_id.pool_index().slot() as usize;
         self.session_slots
             .get(slot)?
@@ -96,10 +96,7 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
             .and_then(|(stored, session)| (*stored == session_id).then_some(session))
     }
 
-    pub fn connected(&self, session_id: SessionId) -> RuntimeResult<()>
-    where
-        Self: SessionAppRuntimeCreate<S>,
-    {
+    pub fn connected(&self, session_id: SessionId) -> RuntimeResult<()> {
         let Some(session) = self.session(session_id) else {
             return Ok(());
         };
@@ -110,10 +107,7 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
         Ok(())
     }
 
-    pub fn closed(&self, session_id: SessionId) -> RuntimeResult<()>
-    where
-        Self: SessionAppRuntimeCreate<S>,
-    {
+    pub fn closed(&self, session_id: SessionId) -> RuntimeResult<()> {
         let Some(session) = self.session(session_id) else {
             return Ok(());
         };
@@ -128,10 +122,7 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
         &mut self,
         session_id: SessionId,
         len: usize,
-    ) -> RuntimeResult<bool>
-    where
-        Self: SessionAppRuntimeCreate<S>,
-    {
+    ) -> RuntimeResult<bool> {
         let Some(session) = self.session(session_id) else {
             return Ok(false);
         };
@@ -194,10 +185,7 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
         buffers: &DataPlaneBuffers,
         index: Index,
         urgent: bool,
-    ) -> RuntimeResult<(u32, u32)>
-    where
-        Self: SessionAppRuntimeCreate<S>,
-    {
+    ) -> RuntimeResult<(u32, u32)> {
         let Some(session) = self.session(session_id) else {
             return Ok((0, 0));
         };
@@ -335,14 +323,14 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
     }
 }
 
-impl SessionAppRuntime<Local> {
+impl SessionAppRuntime {
     #[inline]
     pub fn default_local() -> RuntimeResult<Self> {
         let tx_evt_q: Arc<SessionMsgQueue> = Arc::new(
             SessionMsgQueue::with_cfg(2048, 1024)
                 .map_err(|_| SessionAppRuntimeError::TxEventQueue)?,
         );
-        Ok(Self::new(1024, tx_evt_q, 0, Local::default()))
+        Ok(Self::new(1024, tx_evt_q, 0, Segment::default()))
     }
 }
 
@@ -373,7 +361,7 @@ mod tests {
 
     #[test]
     fn drain_drops_events_for_unmapped_session_slot() {
-        let app = SessionAppRuntime::<Local>::default_local().expect("app runtime");
+        let app = SessionAppRuntime::default_local().expect("app runtime");
         app.tx_evt_q()
             .enqueue_ctrl(SessionEvt::ctrl(3, 0, SessionEvtType::Close))
             .expect("enqueue close");
@@ -395,11 +383,11 @@ mod tests {
 
     #[test]
     fn drain_drops_close_when_worker_index_mismatches() {
-        let mut app = SessionAppRuntime::<Local>::default_local().expect("app runtime");
+        let mut app = SessionAppRuntime::default_local().expect("app runtime");
         let session_id = SessionId::from(PoolIndex::new(5, 1));
         let session = Arc::new(
             AppSession::new_in_segment(
-                Local::default(),
+                Segment::default(),
                 AppSessionConfig::new(64, 4),
                 SessionHandle::new(5, 0),
                 app.tx_evt_q().clone(),
@@ -425,11 +413,11 @@ mod tests {
 
     #[test]
     fn drain_dispatches_close_with_matching_session_handle() {
-        let mut app = SessionAppRuntime::<Local>::default_local().expect("app runtime");
+        let mut app = SessionAppRuntime::default_local().expect("app runtime");
         let session_id = SessionId::from(PoolIndex::new(5, 1));
         let session = Arc::new(
             AppSession::new_in_segment(
-                Local::default(),
+                Segment::default(),
                 AppSessionConfig::new(64, 4),
                 SessionHandle::new(5, 0),
                 app.tx_evt_q().clone(),
@@ -456,93 +444,27 @@ mod tests {
     }
 }
 
-impl SessionAppRuntime<Svm> {}
-
-pub trait SessionAppRuntimeCreate<S: SessionSegment> {
-    fn create_app_session(
-        &self,
-        handle: hammer_runtime::app::SessionHandle,
-        config: hammer_runtime::app::AppSessionConfig,
-        tx_evt_q: Arc<S::EventQueue>,
-    ) -> RuntimeResult<Arc<AppSession<S>>>;
-
-    fn notify_rx(&self, session: &AppSession<S>);
-    fn notify_tx(&self, session: &AppSession<S>);
-    fn notify_evt(&self, session: &AppSession<S>);
-}
-
-impl SessionAppRuntimeCreate<Local> for SessionAppRuntime<Local> {
-    fn create_app_session(
+impl SessionAppRuntime {
+    pub fn create_app_session(
         &self,
         handle: hammer_runtime::app::SessionHandle,
         config: hammer_runtime::app::AppSessionConfig,
         tx_evt_q: Arc<SessionMsgQueue>,
-    ) -> RuntimeResult<Arc<AppSession<Local>>> {
-        hammer_runtime::app::with_current_app_worker(self.worker_index, |worker| {
-            worker
-                .attach_session_local_with_runtime_tx(handle, config, tx_evt_q)
-                .map_err(RuntimeError::from)
-        })
+    ) -> RuntimeResult<Arc<AppSession>> {
+        AppSession::new_in_segment(self.seg.clone(), config, handle, tx_evt_q)
+            .map(Arc::new)
+            .map_err(RuntimeError::from)
     }
 
-    fn notify_rx(&self, session: &AppSession<Local>) {
-        let handle = session.session_handle();
-        hammer_runtime::app::with_current_app_worker(self.worker_index, |w| w.wake_rx(handle));
-    }
-
-    fn notify_tx(&self, session: &AppSession<Local>) {
-        let handle = session.session_handle();
-        hammer_runtime::app::with_current_app_worker(self.worker_index, |w| w.wake_tx(handle));
-    }
-
-    fn notify_evt(&self, session: &AppSession<Local>) {
-        let handle = session.session_handle();
-        hammer_runtime::app::with_current_app_worker(self.worker_index, |w| w.wake_evt(handle));
-    }
-}
-
-impl SessionAppRuntimeCreate<Svm> for SessionAppRuntime<Svm> {
-    fn create_app_session(
-        &self,
-        handle: hammer_runtime::app::SessionHandle,
-        config: hammer_runtime::app::AppSessionConfig,
-        tx_evt_q: Arc<SessionMsgQueue<Svm>>,
-    ) -> RuntimeResult<Arc<AppSession<Svm>>> {
-        let rx_fifo = Arc::new(
-            Fifo::<Svm>::new(self.seg.clone(), config.fifo_capacity)
-                .map_err(|_| RuntimeError::invariant("svm rx fifo allocation failed"))?,
-        );
-        let tx_fifo = Arc::new(
-            Fifo::<Svm>::new(self.seg.clone(), config.fifo_capacity)
-                .map_err(|_| RuntimeError::invariant("svm tx fifo allocation failed"))?,
-        );
-        let ring_nitems = config.evt_q_capacity.max(1) as u32;
-        let q_nitems = (config.evt_q_capacity + 1).next_power_of_two().max(2) as u32;
-        let layout = SessionMsgQueue::<Svm>::layout_bytes(q_nitems, ring_nitems)
-            .map_err(|_| RuntimeError::invariant("invalid svm evt_q layout"))?;
-        let evt_off = self.seg.alloc(layout, 64);
-        let evt_q = Arc::new(
-            unsafe {
-                SessionMsgQueue::<Svm>::init_at(self.seg.clone(), evt_off, q_nitems, ring_nitems)
-            }
-            .map_err(|_| RuntimeError::invariant("svm event queue initialization failed"))?,
-        );
-
-        let session = Arc::new(AppSession::<Svm>::from_parts(
-            rx_fifo, tx_fifo, evt_q, tx_evt_q, handle,
-        ));
-        Ok(session)
-    }
-
-    fn notify_rx(&self, session: &AppSession<Svm>) {
+    fn notify_rx(&self, session: &AppSession) {
         session.evt_q().fire();
     }
 
-    fn notify_tx(&self, session: &AppSession<Svm>) {
+    fn notify_tx(&self, session: &AppSession) {
         session.tx_evt_q().fire();
     }
 
-    fn notify_evt(&self, session: &AppSession<Svm>) {
+    fn notify_evt(&self, session: &AppSession) {
         session.evt_q().fire();
     }
 }

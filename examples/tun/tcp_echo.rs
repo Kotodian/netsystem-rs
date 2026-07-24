@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use hammer_app::attach::{AppClient, AppClientError};
 use hammer_app::{AppSession, AppSessionError, SessionHandle};
-use hammer_infra::segment::Svm;
 use hammer_runtime::app::SessionEvtType;
 use hammer_runtime::engine::{Engine, EnginePool};
 use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, RuntimeError, RuntimeRegistry};
@@ -32,7 +31,6 @@ data_size = 2048
 buffers_per_numa = 2048
 
 [network.session]
-backend = "svm"
 attach_socket_path = "/tmp/hammer-tun-tcp-lab.attach.sock"
 preallocated_sessions = 64
 event_queue_length = 256
@@ -182,7 +180,7 @@ fn run_attached_echo() -> Result<(), EchoError> {
     tokio_runtime.block_on(run_echo(&session, handle))
 }
 
-async fn run_echo(session: &AppSession<Svm>, handle: SessionHandle) -> Result<(), EchoError> {
+async fn run_echo(session: &AppSession, handle: SessionHandle) -> Result<(), EchoError> {
     let mut buffer = vec![0; ECHO_BUFFER_BYTES];
     loop {
         let event = session.next_event().await?;

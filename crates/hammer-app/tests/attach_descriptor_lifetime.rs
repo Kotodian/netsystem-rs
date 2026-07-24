@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use hammer_app::attach::{AppClient, AppClientError};
-use hammer_infra::segment::{Segment, Svm};
+use hammer_infra::segment::Segment;
 use hammer_runtime::app::{AppSession, AppSessionConfig, SessionEventQueue, SessionHandle};
 use hammer_runtime::attach::{AppServer, AppSessionResources};
 use hammer_runtime::{AttachError, RuntimeError};
@@ -54,24 +54,17 @@ struct DescriptorBaseline {
     count: usize,
 }
 
-fn attach_pair(
-    name: &str,
-) -> (
-    AppSession<Svm>,
-    AppSessionResources<Svm>,
-    PathBuf,
-    DescriptorBaseline,
-) {
+fn attach_pair(name: &str) -> (AppSession, AppSessionResources, PathBuf, DescriptorBaseline) {
     let path = socket_path(name);
     let path_text = path.to_str().expect("socket path").to_owned();
     let server = AppServer::bind(&path_text).expect("bind app server");
     let segment_id = SOCKET_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let segment = Svm::create(
+    let segment = Segment::shared(
         &format!("ha{}-{segment_id}", std::process::id()),
         16 * 1024 * 1024,
     )
     .expect("create SVM segment");
-    let segment_fd = segment.fd().expect("SVM backing descriptor");
+    let segment_fd = segment.shared_fd().expect("SVM backing descriptor");
     let identity = descriptor_identity(segment_fd).expect("SVM descriptor identity");
     let baseline = DescriptorBaseline {
         identity,
@@ -89,10 +82,10 @@ fn attach_pair(
     (client, attached, path, baseline)
 }
 
-fn send_fds(stream: &UnixStream, fds: &[RawFd], offsets: [u64; 4]) {
+fn send_fds(stream: &UnixStream, fds: &[RawFd], metadata: [u64; 5]) {
     let iov = libc::iovec {
-        iov_base: offsets.as_ptr().cast_mut().cast::<libc::c_void>(),
-        iov_len: std::mem::size_of_val(&offsets),
+        iov_base: metadata.as_ptr().cast_mut().cast::<libc::c_void>(),
+        iov_len: std::mem::size_of_val(&metadata),
     };
     let mut control = [0_u8; 64];
     // SAFETY: zero is a valid initial value for every msghdr field.
@@ -116,7 +109,7 @@ fn send_fds(stream: &UnixStream, fds: &[RawFd], offsets: [u64; 4]) {
             fds.len(),
         );
         message.msg_controllen = (*header).cmsg_len;
-        assert_eq!(libc::sendmsg(stream.as_raw_fd(), &message, 0), 32);
+        assert_eq!(libc::sendmsg(stream.as_raw_fd(), &message, 0), 40);
     }
 }
 
@@ -150,7 +143,7 @@ fn assert_attach_server_failure_releases_created_descriptors() {
     let path = socket_path("sender-failure-owner");
     let path_text = path.to_str().expect("socket path").to_owned();
     let server = AppServer::bind(&path_text).expect("bind app server");
-    let segment = Svm::create(&format!("hf{}", std::process::id()), 16 * 1024 * 1024)
+    let segment = Segment::shared(&format!("hf{}", std::process::id()), 16 * 1024 * 1024)
         .expect("create SVM segment");
     let client = UnixStream::connect(&path).expect("connect attach client");
     client
@@ -201,7 +194,7 @@ fn assert_malformed_attach_closes_received_descriptor_before_returning_error() {
     let server_thread = std::thread::spawn(move || {
         let (stream, _) = listener.accept().expect("accept malformed client");
         let (sent, peer) = UnixStream::pair().expect("descriptor pair");
-        send_fds(&stream, &[sent.as_raw_fd()], [0; 4]);
+        send_fds(&stream, &[sent.as_raw_fd()], [0; 5]);
         drop(sent);
         peer
     });
@@ -233,7 +226,7 @@ fn assert_offset_overflow_closes_every_received_descriptor() {
         let identity = descriptor_identity(sent.as_raw_fd()).expect("descriptor identity");
         let baseline = count_open_identity(identity);
         let fds = [sent.as_raw_fd(); 3];
-        send_fds(&stream, &fds, [0, 0, 0, u64::MAX]);
+        send_fds(&stream, &fds, [0, 0, 0, 0, u64::MAX]);
         (sent, peer, identity, baseline)
     });
 
@@ -258,7 +251,7 @@ fn assert_mapping_failure_closes_every_received_descriptor() {
         let identity = descriptor_identity(sent.as_raw_fd()).expect("descriptor identity");
         let baseline = count_open_identity(identity);
         let fds = [sent.as_raw_fd(); 3];
-        send_fds(&stream, &fds, [0; 4]);
+        send_fds(&stream, &fds, [0; 5]);
         (sent, peer, identity, baseline)
     });
 

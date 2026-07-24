@@ -7,17 +7,14 @@ use hammer_core::data_plane::{BufferFrame, DataPlaneBuffers, Index as BufferInde
 use hammer_infra::align::CacheLine;
 use hammer_infra::fifo_queue::FifoQueue;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
-use hammer_infra::segment::{Local, Segment, Svm};
+use hammer_infra::segment::Segment;
 use hammer_infra::thread_owned::ThreadOwned;
 use hammer_runtime::app::{
     AppSessionConfig, SessionEventQueue, SessionEvtType, SessionHandle, SessionMsgQueue,
-    with_current_app_worker,
 };
 use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
 use hammer_runtime::{DataPlaneRuntime, DataWorkerId, Engine, File, FileFunctions};
 
-use crate::session::app::SessionAppRuntimeCreate;
-use crate::session::config::SessionBackend;
 use crate::session::error::SessionQueueError;
 use crate::session::state::SessionState;
 use crate::session::{SessionAppRuntime, SessionId, SessionQueueNext};
@@ -107,150 +104,10 @@ impl<Index> SessionEntry<Index> {
     }
 }
 
-enum SessionApp {
-    Local(SessionAppRuntime<Local>),
-    Svm(SessionAppRuntime<Svm>),
-}
-
-impl SessionApp {
-    fn signal_read_fd(&self) -> Option<std::os::fd::RawFd> {
-        match self {
-            Self::Local(app) => app.tx_evt_q().read_fd(),
-            Self::Svm(app) => app.tx_evt_q().read_fd(),
-        }
-    }
-
-    fn signal(&self) {
-        match self {
-            Self::Local(app) => app.tx_evt_q().fire(),
-            Self::Svm(app) => app.tx_evt_q().fire(),
-        }
-    }
-
-    fn create_session(
-        &mut self,
-        session_id: SessionId,
-        handle: SessionHandle,
-        config: AppSessionConfig,
-    ) -> RuntimeResult<()> {
-        match self {
-            Self::Local(app) => {
-                let session = app.create_app_session(handle, config, app.tx_evt_q().clone())?;
-                app.attach_session(session_id, session);
-            }
-            Self::Svm(app) => {
-                let session = app.create_app_session(handle, config, app.tx_evt_q().clone())?;
-                app.attach_session(session_id, session);
-            }
-        }
-        Ok(())
-    }
-
-    fn detach_session(&mut self, session_id: SessionId) {
-        match self {
-            Self::Local(app) => {
-                app.discard_all_tx_bytes_for_session(session_id);
-                let _ = app.detach_session(session_id);
-            }
-            Self::Svm(app) => {
-                app.discard_all_tx_bytes_for_session(session_id);
-                let _ = app.detach_session(session_id);
-            }
-        }
-    }
-
-    fn connected(&self, session_id: SessionId) -> RuntimeResult<()> {
-        match self {
-            Self::Local(app) => app.connected(session_id),
-            Self::Svm(app) => app.connected(session_id),
-        }
-    }
-
-    fn closed(&self, session_id: SessionId) -> RuntimeResult<()> {
-        match self {
-            Self::Local(app) => app.closed(session_id),
-            Self::Svm(app) => app.closed(session_id),
-        }
-    }
-
-    fn discard_acked_tx_bytes(&mut self, session_id: SessionId, len: usize) -> RuntimeResult<()> {
-        match self {
-            Self::Local(app) => {
-                let _ = app.discard_acked_tx_bytes(session_id, len)?;
-            }
-            Self::Svm(app) => {
-                let _ = app.discard_acked_tx_bytes(session_id, len)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn pending_send_len(&self, session_id: SessionId) -> RuntimeResult<Option<usize>> {
-        match self {
-            Self::Local(app) => app.pending_send_len(session_id),
-            Self::Svm(app) => app.pending_send_len(session_id),
-        }
-    }
-
-    fn copy_tx_to_buffer(
-        &self,
-        buffers: &DataPlaneBuffers,
-        session_id: SessionId,
-        offset: usize,
-        len: usize,
-        index: BufferIndex,
-    ) -> RuntimeResult<()> {
-        match self {
-            Self::Local(app) => app.copy_tx_to_buffer(buffers, session_id, offset, len, index),
-            Self::Svm(app) => app.copy_tx_to_buffer(buffers, session_id, offset, len, index),
-        }
-    }
-
-    fn copy_rx_from_buffer(
-        &self,
-        session_id: SessionId,
-        buffers: &DataPlaneBuffers,
-        index: BufferIndex,
-        urgent: bool,
-    ) -> RuntimeResult<(u32, u32)> {
-        match self {
-            Self::Local(app) => app.copy_rx_from_buffer(session_id, buffers, index, urgent),
-            Self::Svm(app) => app.copy_rx_from_buffer(session_id, buffers, index, urgent),
-        }
-    }
-
-    fn copy_rx_from_buffer_ooo(
-        &self,
-        session_id: SessionId,
-        buffers: &DataPlaneBuffers,
-        index: BufferIndex,
-        offset: u32,
-    ) -> RuntimeResult<(u32, Option<(u32, u32)>)> {
-        match self {
-            Self::Local(app) => app.copy_rx_from_buffer_ooo(session_id, buffers, index, offset),
-            Self::Svm(app) => app.copy_rx_from_buffer_ooo(session_id, buffers, index, offset),
-        }
-    }
-
-    fn rx_available_len(&self, session_id: SessionId) -> Option<usize> {
-        match self {
-            Self::Local(app) => app.rx_available_len(session_id),
-            Self::Svm(app) => app.rx_available_len(session_id),
-        }
-    }
-
-    fn drain_tx_events_to(&self, dispatch: impl FnMut(SessionId, SessionEvtType)) -> usize {
-        match self {
-            Self::Local(app) => app.drain_tx_events_to(dispatch),
-            Self::Svm(app) => app.drain_tx_events_to(dispatch),
-        }
-    }
-}
-
 pub struct SessionWorker<Index> {
     worker: DataWorkerId,
     entries: Pool<SessionEntry<Index>>,
-    app: SessionApp,
+    app: SessionAppRuntime,
     app_session_config: AppSessionConfig,
     session_work: Vec<SessionId>,
     session_work_scratch: Vec<SessionId>,
@@ -331,23 +188,6 @@ pub fn install_session_worker(
 }
 
 impl<Index: Copy + Eq> SessionWorker<Index> {
-    fn with_app_session_config(
-        worker: DataWorkerId,
-        app_session_config: AppSessionConfig,
-        app: SessionApp,
-    ) -> Self {
-        Self {
-            worker,
-            entries: Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
-            app,
-            app_session_config,
-            session_work: Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
-            session_work_scratch: Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
-            control_events: FifoQueue::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
-            readiness_file: None,
-        }
-    }
-
     #[inline]
     pub const fn worker(&self) -> DataWorkerId {
         self.worker
@@ -360,28 +200,22 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
 
     #[inline]
     pub fn queue_signal_descriptor(&self) -> Option<std::os::fd::RawFd> {
-        self.app.signal_read_fd()
+        self.app.tx_evt_q().read_fd()
     }
 
     #[inline]
     pub fn signal_queue(&self) {
-        self.app.signal();
+        self.app.tx_evt_q().fire();
     }
 
     #[cfg(test)]
-    pub(crate) fn local_app(&self) -> &SessionAppRuntime<Local> {
-        let SessionApp::Local(app) = &self.app else {
-            panic!("local Session app required by test");
-        };
-        app
+    pub(crate) fn local_app(&self) -> &SessionAppRuntime {
+        &self.app
     }
 
     #[cfg(test)]
-    pub(crate) fn local_app_mut(&mut self) -> &mut SessionAppRuntime<Local> {
-        let SessionApp::Local(app) = &mut self.app else {
-            panic!("local Session app required by test");
-        };
-        app
+    pub(crate) fn local_app_mut(&mut self) -> &mut SessionAppRuntime {
+        &mut self.app
     }
 
     /// Registers the session queue signal with the worker FileMain.
@@ -394,7 +228,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         session_queue: hammer_core::data_plane::NodeId,
     ) -> RuntimeResult<()> {
         self.remove_queue_readiness(engine)?;
-        let Some(signal_read_fd) = self.app.signal_read_fd() else {
+        let Some(signal_read_fd) = self.app.tx_evt_q().read_fd() else {
             return Ok(());
         };
         // SAFETY: the queue retains its original read endpoint while FileMain
@@ -405,7 +239,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         engine.data_worker_id()?;
         let file = engine.file_main_mut().add(File::new(
             signal_read,
-            "SVM session queue app-to-dataplane signal".to_owned(),
+            "app-to-session queue signal".to_owned(),
             u64::from(session_queue.slot()),
             FileFunctions {
                 read: Some(schedule_session_queue),
@@ -457,8 +291,13 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
 
     pub fn create_app_session(&mut self, session_id: SessionId) -> RuntimeResult<()> {
         let handle = SessionHandle::new(session_id.pool_index().slot(), self.worker.slot() as u32);
-        self.app
-            .create_session(session_id, handle, self.app_session_config)
+        let session = self.app.create_app_session(
+            handle,
+            self.app_session_config,
+            self.app.tx_evt_q().clone(),
+        )?;
+        self.app.attach_session(session_id, session);
+        Ok(())
     }
 
     pub fn finish_session_creation(
@@ -488,11 +327,8 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     }
 
     pub fn remove_session_entry(&mut self, session_id: SessionId) -> bool {
-        self.app.detach_session(session_id);
-        let handle = SessionHandle::new(session_id.pool_index().slot(), self.worker.slot() as u32);
-        with_current_app_worker(self.worker.slot(), |worker| {
-            let _ = worker.detach_session(handle);
-        });
+        self.app.discard_all_tx_bytes_for_session(session_id);
+        let _ = self.app.detach_session(session_id);
         self.entries.remove(session_id.pool_index()).is_some()
     }
 
@@ -680,47 +516,40 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
 
 impl<Index: Copy + Eq> SessionWorker<Index> {
     pub fn new(worker: DataWorkerId) -> Self {
-        Self::with_session_config(worker, SessionBackend::Local, AppSessionConfig::default())
+        Self::with_app_session_config(worker, AppSessionConfig::default())
     }
 
-    pub fn with_session_config(
+    pub fn with_app_session_config(
         worker: DataWorkerId,
-        backend: SessionBackend,
         app_session_config: AppSessionConfig,
     ) -> Self {
-        match backend {
-            SessionBackend::Local => Self::new_local(worker, app_session_config),
-            SessionBackend::Svm => Self::new_svm(worker, app_session_config),
-        }
-    }
-
-    fn new_local(worker: DataWorkerId, app_session_config: AppSessionConfig) -> Self {
         let cap = DEFAULT_SESSION_TX_EVENT_CAPACITY.next_power_of_two().max(2) as u32;
-        let tx_evt_q =
-            Arc::new(SessionMsgQueue::with_cfg(cap, cap.max(2)).expect("local tx_evt_q"));
+        let segment = Segment::default();
+        let layout = SessionMsgQueue::layout_bytes(cap, cap.max(2))
+            .expect("fixed session TX event queue layout");
+        let offset = segment.alloc(layout, 64);
+        let tx_evt_q = Arc::new(
+            unsafe {
+                SessionMsgQueue::init_at_with_signal(segment.clone(), offset, cap, cap.max(2))
+            }
+            .expect("fixed session TX event queue configuration"),
+        );
         let app = SessionAppRuntime::new(
             DEFAULT_SESSION_POOL_CAPACITY,
             tx_evt_q,
             worker.slot(),
-            Local::default(),
+            segment,
         );
-        Self::with_app_session_config(worker, app_session_config, SessionApp::Local(app))
-    }
-
-    fn new_svm(worker: DataWorkerId, app_session_config: AppSessionConfig) -> Self {
-        let seg = Svm::default();
-        let cap = DEFAULT_SESSION_TX_EVENT_CAPACITY.next_power_of_two().max(2) as u32;
-        let layout = SessionMsgQueue::<Svm>::layout_bytes(cap, cap.max(2)).expect("tx layout");
-        let off = seg.alloc(layout, 64);
-        let tx_evt_q = Arc::new(
-            unsafe {
-                SessionMsgQueue::<Svm>::init_at_with_signal(seg.clone(), off, cap, cap.max(2))
-            }
-            .expect("svm tx_evt_q"),
-        );
-        let app =
-            SessionAppRuntime::new(DEFAULT_SESSION_POOL_CAPACITY, tx_evt_q, worker.slot(), seg);
-        Self::with_app_session_config(worker, app_session_config, SessionApp::Svm(app))
+        Self {
+            worker,
+            entries: Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
+            app,
+            app_session_config,
+            session_work: Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
+            session_work_scratch: Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
+            control_events: FifoQueue::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
+            readiness_file: None,
+        }
     }
 }
 

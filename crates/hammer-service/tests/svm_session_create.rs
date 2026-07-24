@@ -1,5 +1,5 @@
 use hammer_infra::fifo::Fifo;
-use hammer_infra::segment::Svm;
+use hammer_infra::segment::Segment;
 use hammer_runtime::app::{
     AppSession, AppSessionConfig, SessionEvt, SessionEvtType, SessionHandle, SessionMsgQueue,
     SessionOffsets,
@@ -11,32 +11,33 @@ fn session_queue_sizes(config: AppSessionConfig) -> (u32, u32) {
     (q_nitems, ring_nitems)
 }
 
-unsafe fn init_svm_session_queues(seg: &Svm, offsets: &SessionOffsets, config: AppSessionConfig) {
-    Fifo::<Svm>::init_at(seg.clone(), offsets.rx_fifo_off, config.fifo_capacity)
-        .expect("init rx fifo");
-    Fifo::<Svm>::init_at(seg.clone(), offsets.tx_fifo_off, config.fifo_capacity)
-        .expect("init tx fifo");
+unsafe fn init_svm_session_queues(
+    seg: &Segment,
+    offsets: &SessionOffsets,
+    config: AppSessionConfig,
+) {
+    Fifo::init_at(seg.clone(), offsets.rx_fifo_off, config.fifo_capacity).expect("init rx fifo");
+    Fifo::init_at(seg.clone(), offsets.tx_fifo_off, config.fifo_capacity).expect("init tx fifo");
     let (q_nitems, ring_nitems) = session_queue_sizes(config);
-    SessionMsgQueue::<Svm>::init_at(seg.clone(), offsets.evt_q_off, q_nitems, ring_nitems)
+    SessionMsgQueue::init_at(seg.clone(), offsets.evt_q_off, q_nitems, ring_nitems)
         .expect("init evt_q");
-    SessionMsgQueue::<Svm>::init_at(seg.clone(), offsets.tx_evt_q_off, 64, 64)
-        .expect("init tx_evt_q");
+    SessionMsgQueue::init_at(seg.clone(), offsets.tx_evt_q_off, 64, 64).expect("init tx_evt_q");
 }
 
 #[test]
 fn svm_session_create_and_fifo_round_trip() {
-    let seg = Svm::default();
+    let seg = Segment::shared_default();
     let config = AppSessionConfig::new(128, 16);
     let handle = SessionHandle::new(0, 0);
 
-    let offsets =
-        SessionOffsets::allocate(&seg, config.fifo_capacity as u32, config.evt_q_capacity);
+    let offsets = SessionOffsets::allocate(&seg, config.fifo_capacity, config.evt_q_capacity)
+        .expect("session layout");
     unsafe {
         init_svm_session_queues(&seg, &offsets, config);
     }
 
     let session =
-        unsafe { AppSession::<Svm>::from_segment(handle, &seg, &offsets, None, None, None, None) };
+        unsafe { AppSession::from_segment(handle, &seg, &offsets, None, None, None, None) };
 
     let written = session.rx_fifo().enqueue(b"hello");
     assert_eq!(written, 5);
@@ -49,18 +50,18 @@ fn svm_session_create_and_fifo_round_trip() {
 
 #[test]
 fn svm_session_multi_ring_evt_q_io_and_ctrl_round_trip() {
-    let seg = Svm::default();
+    let seg = Segment::shared_default();
     let config = AppSessionConfig::new(128, 16);
     let handle = SessionHandle::new(3, 2);
 
-    let offsets =
-        SessionOffsets::allocate(&seg, config.fifo_capacity as u32, config.evt_q_capacity);
+    let offsets = SessionOffsets::allocate(&seg, config.fifo_capacity, config.evt_q_capacity)
+        .expect("session layout");
     unsafe {
         init_svm_session_queues(&seg, &offsets, config);
     }
 
     let session =
-        unsafe { AppSession::<Svm>::from_segment(handle, &seg, &offsets, None, None, None, None) };
+        unsafe { AppSession::from_segment(handle, &seg, &offsets, None, None, None, None) };
 
     session
         .push_event(SessionEvtType::Connect)
@@ -85,13 +86,13 @@ fn svm_session_multi_ring_evt_q_io_and_ctrl_round_trip() {
 
 #[test]
 fn svm_segment_supports_multiple_sessions() {
-    let seg = Svm::default();
+    let seg = Segment::shared_default();
     let config = AppSessionConfig::new(64, 8);
 
-    let offsets1 =
-        SessionOffsets::allocate(&seg, config.fifo_capacity as u32, config.evt_q_capacity);
-    let offsets2 =
-        SessionOffsets::allocate(&seg, config.fifo_capacity as u32, config.evt_q_capacity);
+    let offsets1 = SessionOffsets::allocate(&seg, config.fifo_capacity, config.evt_q_capacity)
+        .expect("first session layout");
+    let offsets2 = SessionOffsets::allocate(&seg, config.fifo_capacity, config.evt_q_capacity)
+        .expect("second session layout");
 
     assert_ne!(offsets1.rx_fifo_off, offsets2.rx_fifo_off);
     assert!(offsets2.rx_fifo_off > offsets1.tx_evt_q_off);

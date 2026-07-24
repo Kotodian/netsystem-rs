@@ -2,7 +2,7 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
-use hammer_infra::segment::Svm;
+use hammer_infra::segment::Segment;
 use hammer_runtime::app::{AppSession, SessionHandle, SessionOffsets};
 use thiserror::Error;
 
@@ -59,12 +59,12 @@ pub struct AppClient;
 /// Parse a SCM_RIGHTS message, returning the received fds and raw data.
 fn recv_attach_message(
     stream: &UnixStream,
-) -> Result<([OwnedFd; 3], SessionOffsets), AppClientError> {
-    let mut offsets_bytes = [0u64; 4];
+) -> Result<([OwnedFd; 3], SessionOffsets, usize), AppClientError> {
+    let mut metadata = [0u64; 5];
     let mut cmsg_buf = [0u8; 64];
     let mut iov = libc::iovec {
-        iov_base: offsets_bytes.as_mut_ptr() as *mut libc::c_void,
-        iov_len: std::mem::size_of_val(&offsets_bytes),
+        iov_base: metadata.as_mut_ptr() as *mut libc::c_void,
+        iov_len: std::mem::size_of_val(&metadata),
     };
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov as *mut _;
@@ -110,9 +110,9 @@ fn recv_attach_message(
             cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
         }
     }
-    if ret as usize != std::mem::size_of_val(&offsets_bytes) {
+    if ret as usize != std::mem::size_of_val(&metadata) {
         return Err(AppClientError::MetadataLength {
-            expected: std::mem::size_of_val(&offsets_bytes),
+            expected: std::mem::size_of_val(&metadata),
             actual: ret as usize,
         });
     }
@@ -149,40 +149,33 @@ fn recv_attach_message(
             })?;
 
     let offsets = SessionOffsets {
-        rx_fifo_off: offsets_bytes[0],
-        tx_fifo_off: offsets_bytes[1],
-        evt_q_off: offsets_bytes[2],
-        tx_evt_q_off: offsets_bytes[3],
+        rx_fifo_off: metadata[0],
+        tx_fifo_off: metadata[1],
+        evt_q_off: metadata[2],
+        tx_evt_q_off: metadata[3],
     };
+    let segment_size = usize::try_from(metadata[4]).map_err(|_| AppClientError::OffsetOverflow)?;
 
-    Ok((fds, offsets))
+    Ok((fds, offsets, segment_size))
 }
 
 impl AppClient {
     /// Connect to the dataplane's app socket at `path` and set up
     /// the app-side half of a shared-memory session.
-    pub fn connect(path: &str, handle: SessionHandle) -> Result<AppSession<Svm>, AppClientError> {
+    pub fn connect(path: &str, handle: SessionHandle) -> Result<AppSession, AppClientError> {
         let stream = UnixStream::connect(path).map_err(|source| AppClientError::Connect {
             path: path.into(),
             source,
         })?;
 
-        let (fds, offsets) = recv_attach_message(&stream)?;
+        let (fds, offsets, segment_size) = recv_attach_message(&stream)?;
         let [shm_fd, evt_q_read_fd, tx_evt_q_write_fd] = fds;
 
-        // Determine the segment size from the allocated offsets.
-        // The last byte used is tx_evt_q_off + msgq_size; use the
-        // offsets as a hint for the size.
-        let seg_size = offsets
-            .tx_evt_q_off
-            .checked_add(4096)
-            .ok_or(AppClientError::OffsetOverflow)? as usize;
-
-        let seg = Svm::from_fd(shm_fd.as_raw_fd(), seg_size)
+        let seg = Segment::from_fd(shm_fd.as_raw_fd(), segment_size)
             .map_err(|source| AppClientError::SegmentMap { source })?;
 
         let session = unsafe {
-            AppSession::<Svm>::from_segment(
+            AppSession::from_segment(
                 handle,
                 &seg,
                 &offsets,

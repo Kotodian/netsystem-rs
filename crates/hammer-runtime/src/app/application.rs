@@ -4,12 +4,12 @@ use std::fmt;
 use std::sync::Arc;
 use std::task::Waker;
 
-use hammer_infra::segment::Local;
+use hammer_infra::segment::Segment;
 use tokio::sync::Notify;
 
 use crate::app::handle::SessionHandle;
 use crate::app::session::{AppSession, AppSessionConfig, AppSessionError};
-use crate::app::session_msg_queue::{SessionEvt, SessionMsgQueue, SessionSegment};
+use crate::app::session_msg_queue::{SessionEvt, SessionMsgQueue};
 
 struct SessionNotify {
     rx_readable: Notify,
@@ -31,16 +31,18 @@ impl SessionNotify {
 /// plus the worker-level event queue poll loop.
 /// The registry itself stays on the owning data worker thread.
 #[derive(Clone)]
-pub struct AppWorker<S: SessionSegment> {
+pub struct AppWorker {
     worker_index: usize,
-    sessions: HashMap<u64, Arc<AppSession<S>>>,
+    segment: Segment,
+    sessions: HashMap<u64, Arc<AppSession>>,
     notifies: HashMap<u64, Arc<SessionNotify>>,
 }
 
-impl<S: SessionSegment> AppWorker<S> {
-    pub fn new(worker_index: usize) -> Self {
+impl AppWorker {
+    pub fn new(worker_index: usize, segment: Segment) -> Self {
         Self {
             worker_index,
+            segment,
             sessions: HashMap::new(),
             notifies: HashMap::new(),
         }
@@ -53,12 +55,12 @@ impl<S: SessionSegment> AppWorker<S> {
 
     /// Look up a session handle without detaching.
     #[inline]
-    pub fn session(&self, handle: SessionHandle) -> Option<Arc<AppSession<S>>> {
+    pub fn session(&self, handle: SessionHandle) -> Option<Arc<AppSession>> {
         self.sessions.get(&handle.raw()).cloned()
     }
 
     /// Remove a session. Mirrors VPP `app_worker_del_session`.
-    pub fn detach_session(&mut self, handle: SessionHandle) -> Option<Arc<AppSession<S>>> {
+    pub fn detach_session(&mut self, handle: SessionHandle) -> Option<Arc<AppSession>> {
         self.notifies.remove(&handle.raw());
         self.sessions.remove(&handle.raw())
     }
@@ -97,7 +99,7 @@ impl<S: SessionSegment> AppWorker<S> {
     }
 }
 
-impl<S: SessionSegment> fmt::Debug for AppWorker<S> {
+impl fmt::Debug for AppWorker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AppWorker")
             .field("worker_index", &self.worker_index)
@@ -106,14 +108,14 @@ impl<S: SessionSegment> fmt::Debug for AppWorker<S> {
     }
 }
 
-impl AppWorker<Local> {
+impl AppWorker {
     /// Create a fresh per-session FIFO/msgq object and register it.
     /// Mirrors VPP `app_worker_add_session` (in-process variant).
     pub fn attach_session_local(
         &mut self,
         handle: SessionHandle,
         config: AppSessionConfig,
-    ) -> Result<Arc<AppSession<Local>>, AppSessionError> {
+    ) -> Result<Arc<AppSession>, AppSessionError> {
         if self.sessions.contains_key(&handle.raw()) {
             return Err(AppSessionError::AlreadyAttached {
                 app_worker: self.worker_index,
@@ -123,8 +125,8 @@ impl AppWorker<Local> {
         let tx_evt_q: Arc<SessionMsgQueue> = Arc::new(
             SessionMsgQueue::with_cfg(64, 64).expect("fixed app worker TX event queue config"),
         );
-        let session = Arc::new(AppSession::<Local>::new_in_segment(
-            Local::default(),
+        let session = Arc::new(AppSession::new_in_segment(
+            self.segment.clone(),
             config,
             handle,
             tx_evt_q,
@@ -144,15 +146,15 @@ impl AppWorker<Local> {
         handle: SessionHandle,
         config: AppSessionConfig,
         runtime_tx_evt_q: Arc<SessionMsgQueue>,
-    ) -> Result<Arc<AppSession<Local>>, AppSessionError> {
+    ) -> Result<Arc<AppSession>, AppSessionError> {
         if self.sessions.contains_key(&handle.raw()) {
             return Err(AppSessionError::AlreadyAttached {
                 app_worker: self.worker_index,
                 session: handle.raw(),
             });
         }
-        let session = Arc::new(AppSession::<Local>::new_in_segment(
-            Local::default(),
+        let session = Arc::new(AppSession::new_in_segment(
+            self.segment.clone(),
             config,
             handle,
             runtime_tx_evt_q,
@@ -273,9 +275,9 @@ impl AppWorker<Local> {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct AppWorkerRegistry {
-    by_worker: HashMap<usize, AppWorker<Local>>,
+    by_worker: HashMap<usize, AppWorker>,
 }
 
 impl AppWorkerRegistry {
@@ -285,10 +287,10 @@ impl AppWorkerRegistry {
         }
     }
 
-    fn get_or_insert(&mut self, worker_index: usize) -> &mut AppWorker<Local> {
+    fn get_or_insert(&mut self, worker_index: usize) -> &mut AppWorker {
         self.by_worker
             .entry(worker_index)
-            .or_insert_with(|| AppWorker::<Local>::new(worker_index))
+            .or_insert_with(|| AppWorker::new(worker_index, Segment::default()))
     }
 }
 
@@ -298,10 +300,7 @@ thread_local! {
 
 /// Access the app-worker registry on the current data worker thread.
 #[inline]
-pub fn with_current_app_worker<R>(
-    worker_index: usize,
-    f: impl FnOnce(&mut AppWorker<Local>) -> R,
-) -> R {
+pub fn with_current_app_worker<R>(worker_index: usize, f: impl FnOnce(&mut AppWorker) -> R) -> R {
     APP_WORKERS.with(|slot| {
         let mut registry = slot.borrow_mut();
         let worker = registry.get_or_insert(worker_index);
@@ -312,11 +311,9 @@ pub fn with_current_app_worker<R>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hammer_infra::segment::Local;
-
     #[test]
     fn app_worker_attach_detach_round_trips() {
-        let mut worker = AppWorker::<Local>::new(0);
+        let mut worker = AppWorker::new(0, Segment::default());
         let handle = SessionHandle::new(1, 7);
         let session = worker
             .attach_session_local(handle, AppSessionConfig::default())
@@ -329,7 +326,7 @@ mod tests {
 
     #[test]
     fn app_worker_attach_rejects_duplicate() {
-        let mut worker = AppWorker::<Local>::new(0);
+        let mut worker = AppWorker::new(0, Segment::default());
         let handle = SessionHandle::new(1, 7);
         worker
             .attach_session_local(handle, AppSessionConfig::default())

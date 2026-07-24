@@ -13,7 +13,6 @@ use hammer_runtime::{
     NodeResult, NodeRuntimeData,
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
-use hammer_service::session::SessionBackend;
 use hammer_service::session::node::{
     SessionQueueNext, SessionQueueNode, SessionQueueOutput, register_session_queue_node,
 };
@@ -175,21 +174,21 @@ fn worker_engine() -> (Engine, NodeId, NodeRuntimeData, SessionQueueNext) {
 }
 
 #[test]
-fn local_session_worker_does_not_register_file_readiness() {
+fn session_worker_readiness_is_idle_before_signal() {
     let (mut engine, session_queue, _, _) = worker_engine();
     let worker = engine.data_worker_id().expect("data worker id");
     let mut sessions = SessionWorker::<Index>::new(worker);
 
     sessions
         .install_queue_readiness(&mut engine, session_queue)
-        .expect("install local queue readiness");
+        .expect("install queue readiness");
     let graph = engine.runtime.nodes().clone();
 
     assert_eq!(
         engine
             .file_main_mut()
             .poll(&graph)
-            .expect("poll local session runtime"),
+            .expect("poll idle session runtime"),
         0
     );
 }
@@ -202,11 +201,8 @@ fn svm_readiness_marks_session_queue_before_main_loop_dispatch() {
     SessionQueueNode::install_worker_attachment(node_data, output_next, dispatch_test_worker)
         .expect("install session queue transport dispatch");
 
-    let mut sessions = SessionWorker::<Index>::with_session_config(
-        worker,
-        SessionBackend::Svm,
-        AppSessionConfig::default(),
-    );
+    let mut sessions =
+        SessionWorker::<Index>::with_app_session_config(worker, AppSessionConfig::default());
     let session_id = sessions.insert_session_for_test(RecordingTransport::ID, Index::new(7, 1));
     sessions.schedule_disconnect(session_id);
     sessions
@@ -263,11 +259,8 @@ fn svm_readiness_marks_session_queue_before_main_loop_dispatch() {
 fn replacing_svm_session_worker_removes_the_old_file_before_queue_release() {
     let (mut engine, session_queue, _, _) = worker_engine();
     let worker = engine.data_worker_id().expect("data worker id");
-    let mut first = SessionWorker::<Index>::with_session_config(
-        worker,
-        SessionBackend::Svm,
-        AppSessionConfig::default(),
-    );
+    let mut first =
+        SessionWorker::<Index>::with_app_session_config(worker, AppSessionConfig::default());
     first.signal_queue();
     first
         .install_queue_readiness(&mut engine, session_queue)
@@ -277,11 +270,8 @@ fn replacing_svm_session_worker_removes_the_old_file_before_queue_release() {
         .expect("remove first readiness before queue release");
     drop(first);
 
-    let mut second = SessionWorker::<Index>::with_session_config(
-        worker,
-        SessionBackend::Svm,
-        AppSessionConfig::default(),
-    );
+    let mut second =
+        SessionWorker::<Index>::with_app_session_config(worker, AppSessionConfig::default());
     second
         .install_queue_readiness(&mut engine, session_queue)
         .expect("install replacement readiness");
@@ -312,11 +302,8 @@ fn worker_teardown_closes_session_queue_and_file_descriptors() {
     let (descriptor, identity) = thread::spawn(|| {
         let (mut engine, session_queue, _, _) = worker_engine();
         let worker = engine.data_worker_id().expect("data worker id");
-        let mut sessions = SessionWorker::<Index>::with_session_config(
-            worker,
-            SessionBackend::Svm,
-            AppSessionConfig::default(),
-        );
+        let mut sessions =
+            SessionWorker::<Index>::with_app_session_config(worker, AppSessionConfig::default());
         let descriptor = sessions
             .queue_signal_descriptor()
             .expect("SVM queue read descriptor");

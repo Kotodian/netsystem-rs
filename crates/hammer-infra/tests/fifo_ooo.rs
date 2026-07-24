@@ -1,9 +1,9 @@
 use hammer_infra::fifo::Fifo;
-use hammer_infra::segment::Local;
+use hammer_infra::segment::Segment;
 
-fn fifo(cap: usize) -> Fifo<Local> {
-    let seg = Local::new(cap * 16 + (1 << 20));
-    Fifo::<Local>::new(seg, cap).expect("fifo")
+fn fifo(cap: usize) -> Fifo {
+    let segment = Segment::local(cap * 16 + (1 << 20));
+    Fifo::new(segment, cap).expect("fifo")
 }
 
 #[test]

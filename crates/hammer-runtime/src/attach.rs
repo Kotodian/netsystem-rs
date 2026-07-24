@@ -2,11 +2,9 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 
 use crate::{AttachError, RuntimeResult};
 use hammer_infra::fifo::Fifo;
-use hammer_infra::segment::{Segment, Svm};
+use hammer_infra::segment::Segment;
 
-use crate::app::{
-    AppSession, AppSessionConfig, SessionHandle, SessionMsgQueue, SessionOffsets, SessionSegment,
-};
+use crate::app::{AppSession, AppSessionConfig, SessionHandle, SessionMsgQueue, SessionOffsets};
 
 /// Server side of the Unix-domain-socket attach protocol.
 /// The dataplane binds a listener, accepts app connections, and sends
@@ -17,11 +15,10 @@ pub struct AppServer {
 
 /// Server-owned resources for one application session.
 ///
-/// The session itself remains [`AppSession`]; the segment type only selects
-/// its storage backend. The layout and descriptor fields are protocol
-/// metadata needed by the application process.
-pub struct AppSessionResources<S: SessionSegment> {
-    pub session: AppSession<S>,
+/// The session itself remains [`AppSession`]. The layout and descriptor fields
+/// are protocol metadata needed by the application process.
+pub struct AppSessionResources {
+    pub session: AppSession,
     pub offsets: SessionOffsets,
     pub shm_fd: RawFd,
 }
@@ -91,18 +88,20 @@ fn send_attach_message(
     evt_q_read_fd: RawFd,
     tx_evt_q_write_fd: RawFd,
     offsets: &SessionOffsets,
+    segment_size: usize,
 ) -> RuntimeResult<()> {
     let fds = [shm_fd, evt_q_read_fd, tx_evt_q_write_fd];
-    let offsets_bytes: [u64; 4] = [
+    let metadata: [u64; 5] = [
         offsets.rx_fifo_off,
         offsets.tx_fifo_off,
         offsets.evt_q_off,
         offsets.tx_evt_q_off,
+        segment_size as u64,
     ];
 
     let iov = libc::iovec {
-        iov_base: offsets_bytes.as_ptr() as *mut libc::c_void,
-        iov_len: std::mem::size_of_val(&offsets_bytes),
+        iov_base: metadata.as_ptr() as *mut libc::c_void,
+        iov_len: std::mem::size_of_val(&metadata),
     };
 
     let mut cmsg_buf = [0u8; 80];
@@ -153,25 +152,25 @@ impl AppServer {
     pub fn accept(
         &self,
         config: AppSessionConfig,
-        seg: &Svm,
+        seg: &Segment,
         handle: SessionHandle,
-    ) -> RuntimeResult<AppSessionResources<Svm>> {
-        let offsets =
-            SessionOffsets::allocate(seg, config.fifo_capacity as u32, config.evt_q_capacity);
+    ) -> RuntimeResult<AppSessionResources> {
+        let offsets = SessionOffsets::allocate(seg, config.fifo_capacity, config.evt_q_capacity)
+            .map_err(|source| AttachError::SessionLayout { source })?;
 
         unsafe {
-            Fifo::<Svm>::init_at(seg.clone(), offsets.rx_fifo_off, config.fifo_capacity)
+            Fifo::init_at(seg.clone(), offsets.rx_fifo_off, config.fifo_capacity)
                 .map_err(|_| AttachError::RxFifoInvalid)?;
-            Fifo::<Svm>::init_at(seg.clone(), offsets.tx_fifo_off, config.fifo_capacity)
+            Fifo::init_at(seg.clone(), offsets.tx_fifo_off, config.fifo_capacity)
                 .map_err(|_| AttachError::TxFifoInvalid)?;
         }
 
         let ring_nitems = config.evt_q_capacity.max(1) as u32;
         let q_nitems = (config.evt_q_capacity + 1).next_power_of_two().max(2) as u32;
         unsafe {
-            SessionMsgQueue::<Svm>::init_at(seg.clone(), offsets.evt_q_off, q_nitems, ring_nitems)
+            SessionMsgQueue::init_at(seg.clone(), offsets.evt_q_off, q_nitems, ring_nitems)
                 .map_err(|_| AttachError::EventQueueInvalid)?;
-            SessionMsgQueue::<Svm>::init_at(seg.clone(), offsets.tx_evt_q_off, 64, 64)
+            SessionMsgQueue::init_at(seg.clone(), offsets.tx_evt_q_off, 64, 64)
                 .map_err(|_| AttachError::TxEventQueueInvalid)?;
         }
 
@@ -180,7 +179,7 @@ impl AppServer {
         let (tx_evt_q_read, tx_evt_q_write) = create_pipe_flags()?;
 
         let session = unsafe {
-            AppSession::<Svm>::from_segment(
+            AppSession::from_segment(
                 handle,
                 seg,
                 &offsets,
@@ -196,7 +195,9 @@ impl AppServer {
             .accept()
             .map_err(|source| AttachError::Accept { source })?;
 
-        let shm_fd = seg.fd().ok_or(AttachError::SegmentDescriptorMissing)?;
+        let shm_fd = seg
+            .shared_fd()
+            .ok_or(AttachError::SegmentDescriptorMissing)?;
 
         send_attach_message(
             &stream,
@@ -204,6 +205,7 @@ impl AppServer {
             evt_q_read.as_raw_fd(),
             tx_evt_q_write.as_raw_fd(),
             &offsets,
+            seg.size(),
         )?;
 
         Ok(AppSessionResources {

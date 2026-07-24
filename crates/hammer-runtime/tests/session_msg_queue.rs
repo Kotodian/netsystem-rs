@@ -110,7 +110,7 @@ fn adr0010_io_index_only_ctrl_handle_packing() {
 
 #[test]
 fn svm_session_msg_queue_pipe_signal_wakes_consumer() {
-    use hammer_infra::segment::{Segment, Svm};
+    use hammer_infra::segment::Segment;
     use hammer_runtime::app::SessionEventQueue;
 
     fn pipe_nonblock() -> (RawFd, RawFd) {
@@ -126,14 +126,13 @@ fn svm_session_msg_queue_pipe_signal_wakes_consumer() {
     }
 
     let (read_fd, write_fd) = pipe_nonblock();
-    let seg = Svm::default();
-    let bytes = SessionMsgQueue::<Svm>::layout_bytes(8, 4).expect("layout");
+    let seg = Segment::shared_default();
+    let bytes = SessionMsgQueue::layout_bytes(8, 4).expect("layout");
     let off = seg.alloc(bytes, 64);
-    drop(unsafe { SessionMsgQueue::<Svm>::init_at(seg.clone(), off, 8, 4) }.expect("init"));
+    drop(unsafe { SessionMsgQueue::init_at(seg.clone(), off, 8, 4) }.expect("init"));
 
-    let producer =
-        unsafe { SessionMsgQueue::<Svm>::from_shared(seg.clone(), off, None, Some(write_fd)) };
-    let consumer = unsafe { SessionMsgQueue::<Svm>::from_shared(seg, off, Some(read_fd), None) };
+    let producer = unsafe { SessionMsgQueue::from_shared(seg.clone(), off, None, Some(write_fd)) };
+    let consumer = unsafe { SessionMsgQueue::from_shared(seg, off, Some(read_fd), None) };
 
     assert!(!consumer.read_signal());
     producer
@@ -145,7 +144,7 @@ fn svm_session_msg_queue_pipe_signal_wakes_consumer() {
 
 #[test]
 fn svm_session_msg_queue_owns_attached_signal_descriptors() {
-    use hammer_infra::segment::{Segment, Svm};
+    use hammer_infra::segment::Segment;
 
     let mut fds = [0i32; 2];
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
@@ -154,12 +153,12 @@ fn svm_session_msg_queue_owns_attached_signal_descriptors() {
         descriptor_identity(fds[1]).expect("pipe write descriptor identity"),
     ];
 
-    let seg = Svm::default();
-    let bytes = SessionMsgQueue::<Svm>::layout_bytes(8, 4).expect("layout");
+    let seg = Segment::shared_default();
+    let bytes = SessionMsgQueue::layout_bytes(8, 4).expect("layout");
     let off = seg.alloc(bytes, 64);
-    drop(unsafe { SessionMsgQueue::<Svm>::init_at(seg.clone(), off, 8, 4) }.expect("init"));
+    drop(unsafe { SessionMsgQueue::init_at(seg.clone(), off, 8, 4) }.expect("init"));
 
-    drop(unsafe { SessionMsgQueue::<Svm>::from_shared(seg, off, Some(fds[0]), Some(fds[1])) });
+    drop(unsafe { SessionMsgQueue::from_shared(seg, off, Some(fds[0]), Some(fds[1])) });
 
     for (fd, identity) in fds.into_iter().zip(identities) {
         match descriptor_identity(fd) {
@@ -171,14 +170,14 @@ fn svm_session_msg_queue_owns_attached_signal_descriptors() {
 
 #[test]
 fn file_readiness_duplicate_closes_independently_of_queue_signal_owner() {
-    use hammer_infra::segment::{Segment, Svm};
+    use hammer_infra::segment::Segment;
     use hammer_runtime::app::SessionEventQueue;
 
-    let seg = Svm::default();
-    let bytes = SessionMsgQueue::<Svm>::layout_bytes(8, 4).expect("layout");
+    let seg = Segment::shared_default();
+    let bytes = SessionMsgQueue::layout_bytes(8, 4).expect("layout");
     let off = seg.alloc(bytes, 64);
-    let queue = unsafe { SessionMsgQueue::<Svm>::init_at_with_signal(seg, off, 8, 4) }
-        .expect("queue with signal");
+    let queue =
+        unsafe { SessionMsgQueue::init_at_with_signal(seg, off, 8, 4) }.expect("queue with signal");
     let queue_fd = queue.read_fd().expect("queue signal-read descriptor");
     let queue_identity = descriptor_identity(queue_fd).expect("queue descriptor identity");
 

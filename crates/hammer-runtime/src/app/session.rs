@@ -3,7 +3,7 @@ use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 use hammer_infra::fifo::Fifo;
-use hammer_infra::segment::{Local, Svm};
+use hammer_infra::segment::Segment;
 use thiserror::Error;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::OnceCell;
@@ -11,7 +11,7 @@ use tokio::sync::OnceCell;
 use crate::app::SessionHandle;
 use crate::app::SessionOffsets;
 use crate::app::session_msg_queue::{
-    SessionEventQueue, SessionEvt, SessionEvtFlags, SessionEvtType, SessionMsgQueue, SessionSegment,
+    SessionEventQueue, SessionEvt, SessionEvtFlags, SessionEvtType, SessionMsgQueue,
 };
 
 /// VPP-style app/session object: per-session byte FIFOs plus event queue.
@@ -21,11 +21,11 @@ use crate::app::session_msg_queue::{
 ///          network; app peeks + dequeue_drops after consuming).
 ///   tx_fifo: app → transport  (app enqueues bytes to send; transport peeks
 ///          at the read window and dequeue_drops on ACK).
-pub struct AppSession<S: SessionSegment> {
-    rx_fifo: Arc<Fifo<S>>,
-    tx_fifo: Arc<Fifo<S>>,
-    evt_q: Arc<S::EventQueue>,
-    tx_evt_q: Arc<S::EventQueue>,
+pub struct AppSession {
+    rx_fifo: Arc<Fifo>,
+    tx_fifo: Arc<Fifo>,
+    evt_q: Arc<SessionMsgQueue>,
+    tx_evt_q: Arc<SessionMsgQueue>,
     handle: SessionHandle,
     async_fd: OnceCell<AsyncFd<OwnedFd>>,
 }
@@ -61,15 +61,14 @@ pub enum AppSessionError {
     },
 }
 
-impl<S: SessionSegment> AppSession<S> {
+impl AppSession {
     /// Construct an `AppSession` from pre-created FIFOs and event queues.
-    /// Used by `SessionAppRuntime<Svm>::create_app_session` to assemble a session
-    /// from individually allocated shared-memory queues.
+    /// Used by Session Runtime to assemble a session from allocated queues.
     pub fn from_parts(
-        rx_fifo: Arc<Fifo<S>>,
-        tx_fifo: Arc<Fifo<S>>,
-        evt_q: Arc<S::EventQueue>,
-        tx_evt_q: Arc<S::EventQueue>,
+        rx_fifo: Arc<Fifo>,
+        tx_fifo: Arc<Fifo>,
+        evt_q: Arc<SessionMsgQueue>,
+        tx_evt_q: Arc<SessionMsgQueue>,
         handle: SessionHandle,
     ) -> Self {
         Self {
@@ -93,26 +92,26 @@ impl<S: SessionSegment> AppSession<S> {
 
     /// Transport side: FIFO into which received bytes are copied.
     #[inline]
-    pub fn rx_fifo(&self) -> &Arc<Fifo<S>> {
+    pub fn rx_fifo(&self) -> &Arc<Fifo> {
         &self.rx_fifo
     }
 
     /// Transport side: FIFO from which send bytes are peeked.
     #[inline]
-    pub fn tx_fifo(&self) -> &Arc<Fifo<S>> {
+    pub fn tx_fifo(&self) -> &Arc<Fifo> {
         &self.tx_fifo
     }
 
     /// Both sides: shared event queue for this session.
     #[inline]
-    pub fn evt_q(&self) -> &Arc<S::EventQueue> {
+    pub fn evt_q(&self) -> &Arc<SessionMsgQueue> {
         &self.evt_q
     }
 
     /// Accessor for the transport-side tx event queue consumer.
     /// Used by SessionAppRuntime to drain tx completion events.
     #[inline]
-    pub fn tx_evt_q(&self) -> &Arc<S::EventQueue> {
+    pub fn tx_evt_q(&self) -> &Arc<SessionMsgQueue> {
         &self.tx_evt_q
     }
 
@@ -380,7 +379,7 @@ impl<S: SessionSegment> AppSession<S> {
     }
 }
 
-impl AppSession<Svm> {
+impl AppSession {
     /// Reconstruct an app session from a pre-allocated shared segment.
     /// Called by AppClient (app process) after receiving offsets over
     /// the Unix socket. The segment must already contain valid Fifo /
@@ -392,7 +391,7 @@ impl AppSession<Svm> {
     /// correctly initialised queue headers.
     pub unsafe fn from_segment(
         handle: SessionHandle,
-        seg: &Svm,
+        seg: &Segment,
         offsets: &SessionOffsets,
         evt_q_read: Option<RawFd>,
         evt_q_write: Option<RawFd>,
@@ -400,15 +399,10 @@ impl AppSession<Svm> {
         tx_evt_q_write: Option<RawFd>,
     ) -> Self {
         let evt_q = Arc::new(unsafe {
-            SessionMsgQueue::<Svm>::from_shared(
-                seg.clone(),
-                offsets.evt_q_off,
-                evt_q_read,
-                evt_q_write,
-            )
+            SessionMsgQueue::from_shared(seg.clone(), offsets.evt_q_off, evt_q_read, evt_q_write)
         });
         let tx_evt_q = Arc::new(unsafe {
-            SessionMsgQueue::<Svm>::from_shared(
+            SessionMsgQueue::from_shared(
                 seg.clone(),
                 offsets.tx_evt_q_off,
                 tx_evt_q_read,
@@ -426,33 +420,40 @@ impl AppSession<Svm> {
     }
 }
 
-impl AppSession<Local> {
-    /// Local session: FIFOs on a Local segment; Session Message Queue for evt/tx rings.
+impl AppSession {
+    /// Construct a session in an application-owned Segment.
     pub fn new_in_segment(
-        seg: Local,
+        seg: Segment,
         config: AppSessionConfig,
         handle: SessionHandle,
         tx_evt_q: Arc<SessionMsgQueue>,
     ) -> Result<Self, AppSessionError> {
-        let mut rx_fifo = Fifo::<Local>::new(seg.clone(), config.fifo_capacity).map_err(|_| {
+        let mut rx_fifo = Fifo::new(seg.clone(), config.fifo_capacity).map_err(|_| {
             AppSessionError::RxFifoCapacityInvalid {
                 capacity: config.fifo_capacity,
             }
         })?;
         rx_fifo.enable_ooo();
         let rx_fifo = Arc::new(rx_fifo);
-        let tx_fifo = Arc::new(Fifo::<Local>::new(seg, config.fifo_capacity).map_err(|_| {
+        let tx_fifo = Arc::new(Fifo::new(seg.clone(), config.fifo_capacity).map_err(|_| {
             AppSessionError::TxFifoCapacityInvalid {
                 capacity: config.fifo_capacity,
             }
         })?);
         let ring_nitems = config.evt_q_capacity.max(1) as u32;
         let q_nitems = (config.evt_q_capacity + 1).next_power_of_two().max(2) as u32;
+        let evt_q_bytes = SessionMsgQueue::layout_bytes(q_nitems, ring_nitems).map_err(|_| {
+            AppSessionError::EventQueueCapacityInvalid {
+                capacity: config.evt_q_capacity,
+            }
+        })?;
+        let evt_q_offset = seg.alloc(evt_q_bytes, 64);
         let evt_q = Arc::new(
-            SessionMsgQueue::with_cfg(q_nitems, ring_nitems).map_err(|_| {
-                AppSessionError::EventQueueCapacityInvalid {
-                    capacity: config.evt_q_capacity,
-                }
+            unsafe {
+                SessionMsgQueue::init_at_with_signal(seg, evt_q_offset, q_nitems, ring_nitems)
+            }
+            .map_err(|_| AppSessionError::EventQueueCapacityInvalid {
+                capacity: config.evt_q_capacity,
             })?,
         );
         Ok(Self {
@@ -466,7 +467,7 @@ impl AppSession<Local> {
     }
 }
 
-impl<S: SessionSegment> fmt::Debug for AppSession<S> {
+impl fmt::Debug for AppSession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AppSession")
             .field("session_index", &self.handle.session_index())
@@ -509,14 +510,13 @@ impl Default for AppSessionConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hammer_infra::segment::Local;
+    use hammer_infra::segment::Segment;
 
-    fn new_session(config: AppSessionConfig, session_index: u32) -> AppSession<Local> {
+    fn new_session(config: AppSessionConfig, session_index: u32) -> AppSession {
         let handle = SessionHandle::new(session_index, 0);
         let tx_evt_q: Arc<SessionMsgQueue> =
             Arc::new(SessionMsgQueue::with_cfg(64, 64).expect("tx_evt_q"));
-        AppSession::<Local>::new_in_segment(Local::default(), config, handle, tx_evt_q)
-            .expect("session")
+        AppSession::new_in_segment(Segment::default(), config, handle, tx_evt_q).expect("session")
     }
 
     #[test]
@@ -526,8 +526,8 @@ mod tests {
         tx_evt_q
             .enqueue_io(SessionEvt::io(99, SessionEvtType::TxDeq))
             .expect("fill io ring");
-        let session = AppSession::<Local>::new_in_segment(
-            Local::default(),
+        let session = AppSession::new_in_segment(
+            Segment::default(),
             AppSessionConfig::new(64, 4),
             SessionHandle::new(1, 0),
             Arc::clone(&tx_evt_q),
@@ -648,8 +648,8 @@ mod tests {
         let handle = SessionHandle::new(11, 7);
         let tx_evt_q: Arc<SessionMsgQueue> =
             Arc::new(SessionMsgQueue::with_cfg(64, 64).expect("tx_evt_q"));
-        let session = AppSession::<Local>::new_in_segment(
-            Local::default(),
+        let session = AppSession::new_in_segment(
+            Segment::default(),
             AppSessionConfig::new(64, 4),
             handle,
             tx_evt_q,
@@ -716,8 +716,8 @@ mod tests {
     fn app_session_rejects_invalid_fifo_capacity() {
         let tx_evt_q: Arc<SessionMsgQueue> =
             Arc::new(SessionMsgQueue::with_cfg(64, 64).expect("tx_evt_q"));
-        let error = AppSession::<Local>::new_in_segment(
-            Local::default(),
+        let error = AppSession::new_in_segment(
+            Segment::default(),
             AppSessionConfig::new(3, 4),
             SessionHandle::new(0, 0),
             tx_evt_q,
