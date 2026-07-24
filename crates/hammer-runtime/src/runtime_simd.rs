@@ -1,5 +1,5 @@
-use hammer_core::data_plane::FrameBatchWidth;
 use crate::Simd;
+use hammer_core::data_plane::FrameBatchWidth;
 
 pub(crate) const SCALAR_SIMD_BYTES: usize = 1;
 

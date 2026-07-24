@@ -57,7 +57,10 @@ fn node_function_selection_changes_dispatch_without_changing_topology() {
             ..DataPlaneBufferConfig::default()
         },
     };
-    let mut engine = Engine::new(DataPlaneRuntime::new(runtime_config), RuntimeRegistry::new());
+    let mut engine = Engine::new(
+        DataPlaneRuntime::new(runtime_config),
+        RuntimeRegistry::new(),
+    );
     engine
         .plugin_main_mut()
         .register_builtin_image(&__HAMMER_REGISTRATION_IMAGE);
@@ -68,21 +71,9 @@ fn node_function_selection_changes_dispatch_without_changing_topology() {
         .expect("multiarch graph node");
     let topology = (
         node,
-        engine
-            .runtime
-            .nodes()
-            .node_name(node)
-            .expect("node name"),
-        engine
-            .runtime
-            .nodes()
-            .node_kind(node)
-            .expect("node kind"),
-        engine
-            .runtime
-            .nodes()
-            .node_state(node)
-            .expect("node state"),
+        engine.runtime.nodes().node_name(node).expect("node name"),
+        engine.runtime.nodes().node_kind(node).expect("node kind"),
+        engine.runtime.nodes().node_state(node).expect("node state"),
         engine
             .runtime
             .nodes()
@@ -98,10 +89,7 @@ fn node_function_selection_changes_dispatch_without_changing_topology() {
             .schedule_empty_frame(node)
             .expect("schedule fixture");
     }
-    engine
-        .runtime
-        .run_ready_nodes()
-        .expect("dispatch fixture");
+    engine.runtime.run_ready_nodes().expect("dispatch fixture");
     assert_eq!(DISPATCH_COUNT.load(Ordering::Relaxed), 2);
 
     assert_eq!(

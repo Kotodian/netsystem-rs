@@ -4,7 +4,11 @@ use hammer_runtime::{
     DataPlaneBufferConfig, DataPlaneHandoff, DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId,
 };
 
-fn runtime_config(slot_capacity: usize, slots: usize, frame_slots: usize) -> DataPlaneRuntimeConfig {
+fn runtime_config(
+    slot_capacity: usize,
+    slots: usize,
+    frame_slots: usize,
+) -> DataPlaneRuntimeConfig {
     DataPlaneRuntimeConfig {
         buffers: DataPlaneBufferConfig {
             buffer_slot_capacity: slot_capacity,
@@ -31,10 +35,7 @@ fn runtime_with_numa(
     DataPlaneRuntime::new(config)
 }
 
-fn runtime_with_handoff_arena(
-    arena: BufferPoolArena,
-    frame_slots: usize,
-) -> DataPlaneRuntime {
+fn runtime_with_handoff_arena(arena: BufferPoolArena, frame_slots: usize) -> DataPlaneRuntime {
     let handoff = DataPlaneHandoff::new_shared_buffer_arena(1, frame_slots.max(1), arena);
     DataPlaneRuntime::attach_handoff_worker(
         DataPlaneRuntime::new(runtime_config(1, 1, frame_slots)),

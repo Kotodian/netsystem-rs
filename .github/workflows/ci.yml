@@ -116,7 +116,10 @@ jobs:
             -p hammer-plugin-udp
       - name: Locate Rust runtime libraries [macOS]
         id: rust_runtime
-        run: echo "libdir=$(rustc --print target-libdir)" >> "$GITHUB_OUTPUT"
+        run: |
+          rust_libdir="$(rustc --print target-libdir)"
+          echo "libdir=$rust_libdir" >> "$GITHUB_OUTPUT"
+          echo "DYLD_LIBRARY_PATH=$rust_libdir" >> "$GITHUB_ENV"
       - name: Snapshot Darwin interfaces [macOS]
         id: darwin_interfaces
         run: |

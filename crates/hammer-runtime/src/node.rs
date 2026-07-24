@@ -1340,8 +1340,7 @@ impl NodeRuntime {
         let Some(node_name) = self.node_name(node)? else {
             return Ok(());
         };
-        let Some(registration) =
-            preferred_node_function(node_name, simd_bytes, registrations)?
+        let Some(registration) = preferred_node_function(node_name, simd_bytes, registrations)?
         else {
             return Ok(());
         };

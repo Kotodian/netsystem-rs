@@ -14,9 +14,7 @@ use hammer_infra::mask_compare::{
 };
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::node::{NodeDescriptor, NodeResult, NodeRuntimeData};
-use hammer_runtime::{
-    DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig,
-};
+use hammer_runtime::{DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig};
 
 fn test_runtime(frame_slots: usize, buffer_slots: usize) -> DataPlaneRuntime {
     DataPlaneRuntime::new(DataPlaneRuntimeConfig {

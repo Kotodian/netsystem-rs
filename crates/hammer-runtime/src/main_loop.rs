@@ -47,8 +47,7 @@ pub fn engine_main_loop(
         // Step 1: Barrier check — VPP threads.c:296
         if barrier::barrier_check_and_report(&wait, &workers, || {
             engine.publish_worker_runtime_stats();
-        })
-            && !engine.apply_worker_graph_update_after_barrier()
+        }) && !engine.apply_worker_graph_update_after_barrier()
         {
             return 1;
         }

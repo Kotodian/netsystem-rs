@@ -485,7 +485,9 @@ impl Engine {
             nodes: self.runtime.nodes().node_runtime_stats_snapshot(),
             files: self.file_main().runtime_stats_snapshot(),
         };
-        *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
+        *slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
     }
 
     pub fn worker_runtime_stats_snapshot(&self) -> RuntimeResult<Vec<WorkerRuntimeStats>> {
@@ -499,11 +501,10 @@ impl Engine {
         if worker_count == 0 {
             return Ok(Vec::new());
         }
-        let worker_count = u32::try_from(worker_count).map_err(|_| {
-            RuntimeError::WorkerCountOverflow {
+        let worker_count =
+            u32::try_from(worker_count).map_err(|_| RuntimeError::WorkerCountOverflow {
                 count: self.worker_runtime_stats.len(),
-            }
-        })?;
+            })?;
         let barrier = crate::barrier::barrier_sync(
             &self.wait_at_barrier,
             &self.workers_at_barrier,

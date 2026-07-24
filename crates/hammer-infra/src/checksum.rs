@@ -257,24 +257,24 @@ mod tests {
     #[test]
     fn internet_checksum_hasher_preserves_words_across_odd_parts() {
         let parts: [&[u8]; 5] = [&[0x01], &[], &[0x02, 0x03], &[0x04], &[0x05]];
-        let mut checksum = InternetChecksum::default();
+        let mut checksum = InternetChecksum::<1>::default();
         for part in parts {
             checksum.write(part);
         }
-        assert_eq!(checksum.finish() as u16, internet_checksum(&[1, 2, 3, 4, 5]));
+        assert_eq!(
+            checksum.finish() as u16,
+            internet_checksum(&[1, 2, 3, 4, 5])
+        );
     }
 
     #[test]
     fn internet_checksum_hasher_folds_long_incremental_input() {
         let payload: Vec<u8> = (0..200_003).map(|value| value as u8).collect();
-        let mut checksum = InternetChecksum::default();
+        let mut checksum = InternetChecksum::<1>::default();
         for part in payload.chunks(997) {
             checksum.write(part);
         }
-        assert_eq!(
-            checksum.finish() as u16,
-            scalar_internet_checksum(&payload)
-        );
+        assert_eq!(checksum.finish() as u16, scalar_internet_checksum(&payload));
     }
 
     #[test]

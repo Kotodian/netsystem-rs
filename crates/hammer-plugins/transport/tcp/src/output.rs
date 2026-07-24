@@ -666,10 +666,7 @@ mod tests {
     fn tcp_output_checksums_ipv6_pseudo_header() {
         let (runtime, lookup_state, drop_state, output) = output_graph();
         let index = runtime.alloc_index().expect("buffer");
-        runtime
-            .buffers()
-            .append(index, b"hello")
-            .expect("payload");
+        runtime.buffers().append(index, b"hello").expect("payload");
         TcpSegment::new(
             "[2001:db8::10]:50000".parse().expect("local"),
             "[2001:db8::20]:443".parse().expect("remote"),
