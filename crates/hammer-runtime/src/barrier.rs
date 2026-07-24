@@ -1,30 +1,53 @@
+//! VPP-style main/control-thread barrier.
+//!
+//! Main/control code may synchronize and release; workers only acknowledge
+//! from their runtime loop. A missed deadline is a process-fatal worker
+//! deadlock, not a recoverable runtime error.
+
 use core::hint::spin_loop;
+use std::panic::Location;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
+
+#[cfg(debug_assertions)]
+pub(crate) const BARRIER_SYNC_TIMEOUT: Duration = Duration::from_millis(600_100);
+#[cfg(not(debug_assertions))]
+pub(crate) const BARRIER_SYNC_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// RAII guard that releases the barrier when dropped.
 /// The control thread holds this while mutating shared state.
 #[must_use]
-pub struct BarrierGuard(Arc<AtomicU32>, Arc<AtomicU32>);
+#[derive(Debug)]
+pub struct BarrierGuard {
+    wait: Arc<AtomicU32>,
+    workers: Arc<AtomicU32>,
+    caller: &'static Location<'static>,
+}
 
 impl BarrierGuard {
-    fn new(wait: &Arc<AtomicU32>, workers: &Arc<AtomicU32>) -> Self {
-        BarrierGuard(Arc::clone(wait), Arc::clone(workers))
+    fn new(
+        wait: &Arc<AtomicU32>,
+        workers: &Arc<AtomicU32>,
+        caller: &'static Location<'static>,
+    ) -> Self {
+        Self {
+            wait: Arc::clone(wait),
+            workers: Arc::clone(workers),
+            caller,
+        }
     }
 }
 
-/// Release workers from the barrier. Called by BarrierGuard::drop and
-/// DataPlaneBarrierGuard::drop.
+/// Release workers from the barrier.
+#[track_caller]
 pub fn barrier_release(wait: &AtomicU32, workers: &AtomicU32) {
-    wait.store(0, Ordering::Release);
-    while workers.load(Ordering::Acquire) > 0 {
-        spin_loop();
-    }
+    barrier_release_from(wait, workers, Location::caller());
 }
 
 impl Drop for BarrierGuard {
     fn drop(&mut self) {
-        barrier_release(&self.0, &self.1);
+        barrier_release_from(&self.wait, &self.workers, self.caller);
     }
 }
 
@@ -34,17 +57,83 @@ impl Drop for BarrierGuard {
 /// Memory ordering mirrors VPP threads.c:296 barrier_check:
 /// - wait_at_barrier: release-store (main), acquire-load (workers)
 /// - workers_at_barrier: fetch_add Release (workers), load Acquire (main)
+#[track_caller]
 pub fn barrier_sync(
     wait: &Arc<AtomicU32>,
     workers: &Arc<AtomicU32>,
     n_workers: u32,
 ) -> BarrierGuard {
-    wait.store(1, Ordering::SeqCst);
-    std::sync::atomic::compiler_fence(Ordering::SeqCst);
-    while workers.load(Ordering::Acquire) != n_workers {
+    let caller = Location::caller();
+    let recursion_level = wait.fetch_add(1, Ordering::Release);
+    if recursion_level == 0 {
+        wait_for_worker_count(
+            workers,
+            n_workers,
+            Instant::now() + BARRIER_SYNC_TIMEOUT,
+            "barrier sync",
+            caller,
+        );
+    }
+    BarrierGuard::new(wait, workers, caller)
+}
+
+fn barrier_release_from(
+    wait: &AtomicU32,
+    workers: &AtomicU32,
+    caller: &'static Location<'static>,
+) {
+    let recursion_level = wait.fetch_sub(1, Ordering::Release);
+    if recursion_level == 0 {
+        barrier_deadlock_at("barrier release without matching sync", 1, 0, caller);
+    }
+    if recursion_level > 1 {
+        return;
+    }
+    wait_for_worker_count(
+        workers,
+        0,
+        Instant::now() + BARRIER_SYNC_TIMEOUT,
+        "barrier release",
+        caller,
+    );
+}
+
+fn wait_for_worker_count(
+    workers: &AtomicU32,
+    expected: u32,
+    deadline: Instant,
+    phase: &'static str,
+    caller: &'static Location<'static>,
+) {
+    loop {
+        let observed = workers.load(Ordering::Acquire);
+        if observed == expected {
+            return;
+        }
+        if Instant::now() > deadline {
+            barrier_deadlock_at(phase, expected, observed, caller);
+        }
         spin_loop();
     }
-    BarrierGuard::new(wait, workers)
+}
+
+#[track_caller]
+pub(crate) fn barrier_deadlock(phase: &'static str, expected: u32, observed: u32) -> ! {
+    barrier_deadlock_at(phase, expected, observed, Location::caller())
+}
+
+#[cold]
+#[inline(never)]
+fn barrier_deadlock_at(
+    phase: &'static str,
+    expected: u32,
+    observed: u32,
+    caller: &'static Location<'static>,
+) -> ! {
+    eprintln!(
+        "{phase}: worker thread deadlock; caller={caller}; workers_at_barrier={observed}; expected={expected}"
+    );
+    std::process::abort();
 }
 
 /// Called by workers in their main loop. If the wait flag is set,
@@ -77,6 +166,7 @@ pub(crate) fn barrier_check_and_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
     use std::thread;
@@ -100,8 +190,7 @@ mod tests {
             flag_c.store(true, Ordering::Release);
         });
 
-        wait.store(1, Ordering::SeqCst);
-        std::sync::atomic::compiler_fence(Ordering::SeqCst);
+        wait.store(1, Ordering::Release);
         tx.send(()).unwrap();
 
         while workers.load(Ordering::Acquire) != 1 {
@@ -159,8 +248,7 @@ mod tests {
             }));
         }
 
-        wait.store(1, Ordering::SeqCst);
-        std::sync::atomic::compiler_fence(Ordering::SeqCst);
+        wait.store(1, Ordering::Release);
         barrier_armed.store(true, Ordering::Release);
 
         while workers_at_barrier.load(Ordering::Acquire) != n as u32 {
@@ -204,5 +292,60 @@ mod tests {
         worker.join().expect("worker");
         releaser.join().expect("releaser");
         assert_eq!(workers.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn recursive_barrier_releases_workers_only_at_outer_drop() {
+        let wait = Arc::new(AtomicU32::new(0));
+        let workers = Arc::new(AtomicU32::new(0));
+        let resumed = Arc::new(AtomicBool::new(false));
+
+        let worker_wait = Arc::clone(&wait);
+        let worker_count = Arc::clone(&workers);
+        let worker_resumed = Arc::clone(&resumed);
+        let worker = thread::spawn(move || {
+            barrier_check(&worker_wait, &worker_count);
+            worker_resumed.store(true, Ordering::Release);
+        });
+
+        let outer = barrier_sync(&wait, &workers, 1);
+        let inner = barrier_sync(&wait, &workers, 1);
+        drop(inner);
+        assert!(!resumed.load(Ordering::Acquire));
+        assert_eq!(wait.load(Ordering::Acquire), 1);
+
+        drop(outer);
+        worker.join().expect("worker");
+        assert!(resumed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn barrier_deadlock_is_fail_stop() {
+        const CHILD_ENV: &str = "HAMMER_BARRIER_DEADLOCK_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            wait_for_worker_count(
+                &AtomicU32::new(0),
+                1,
+                Instant::now(),
+                "barrier sync",
+                Location::caller(),
+            );
+        }
+
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "barrier::tests::barrier_deadlock_is_fail_stop",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("run barrier deadlock child");
+
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("barrier sync: worker thread deadlock")
+        );
     }
 }

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use crate::error::{RuntimeError, RuntimeResult};
 
@@ -100,7 +101,12 @@ pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
         }
     }
 
-    if !wait_for_workers_at_barrier(&workers, worker_count, &threads) {
+    if !wait_for_workers_at_barrier(
+        &workers,
+        worker_count,
+        &threads,
+        "worker launch barrier sync",
+    ) {
         return Err(abort_workers(
             &wait,
             &workers,
@@ -115,7 +121,12 @@ pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
     // after worker-local initialization has completed.
     barrier::barrier_release(&wait, &workers);
     arm_barrier(&wait);
-    if !wait_for_workers_at_barrier(&workers, worker_count, &threads) {
+    if !wait_for_workers_at_barrier(
+        &workers,
+        worker_count,
+        &threads,
+        "worker main-loop barrier sync",
+    ) {
         return Err(abort_workers(
             &wait,
             &workers,
@@ -156,22 +167,30 @@ fn resolve_worker_startup(engine: &Engine) -> RuntimeResult<(Worker, u32)> {
 }
 
 fn arm_barrier(wait: &AtomicU32) {
-    wait.store(1, Ordering::SeqCst);
-    std::sync::atomic::compiler_fence(Ordering::SeqCst);
+    wait.store(1, Ordering::Release);
 }
 
+#[track_caller]
 fn wait_for_workers_at_barrier(
     workers: &AtomicU32,
     worker_count: u32,
     threads: &[JoinHandle<RuntimeResult<()>>],
+    phase: &'static str,
 ) -> bool {
-    while workers.load(Ordering::Acquire) != worker_count {
+    let deadline = Instant::now() + barrier::BARRIER_SYNC_TIMEOUT;
+    loop {
+        let observed = workers.load(Ordering::Acquire);
+        if observed == worker_count {
+            return true;
+        }
         if threads.iter().any(JoinHandle::is_finished) {
             return false;
         }
+        if Instant::now() > deadline {
+            barrier::barrier_deadlock(phase, worker_count, observed);
+        }
         spin_loop();
     }
-    true
 }
 
 fn abort_workers(

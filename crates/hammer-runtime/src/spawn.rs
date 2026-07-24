@@ -641,41 +641,30 @@ pub struct DataPlaneBarrierHandle {
 }
 
 impl DataPlaneBarrierHandle {
-    pub fn sync(&self) -> RuntimeResult<DataPlaneBarrierGuard> {
-        self.wait.store(1, Ordering::SeqCst);
-        std::sync::atomic::compiler_fence(Ordering::SeqCst);
-        while self.workers.load(Ordering::Acquire) != self.n_workers {
-            core::hint::spin_loop();
-        }
-        Ok(DataPlaneBarrierGuard {
-            wait: Arc::clone(&self.wait),
-            workers: Arc::clone(&self.workers),
+    #[track_caller]
+    pub fn sync(&self) -> DataPlaneBarrierGuard {
+        DataPlaneBarrierGuard {
+            barrier: crate::barrier::barrier_sync(&self.wait, &self.workers, self.n_workers),
             n_workers: self.n_workers,
-        })
+        }
     }
 
+    #[track_caller]
     pub fn synchronize<R>(&self, operation: impl FnOnce() -> RuntimeResult<R>) -> RuntimeResult<R> {
-        let _guard = self.sync()?;
+        let _guard = self.sync();
         operation()
     }
 }
 
 #[derive(Debug)]
 pub struct DataPlaneBarrierGuard {
-    wait: Arc<AtomicU32>,
-    workers: Arc<AtomicU32>,
+    barrier: crate::barrier::BarrierGuard,
     n_workers: u32,
 }
 
 impl DataPlaneBarrierGuard {
     pub fn paused_workers(&self) -> usize {
         self.n_workers as usize
-    }
-}
-
-impl Drop for DataPlaneBarrierGuard {
-    fn drop(&mut self) {
-        crate::barrier::barrier_release(&self.wait, &self.workers);
     }
 }
 
