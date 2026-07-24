@@ -82,7 +82,6 @@ impl TcpInputControlPlane {
     #[inline]
     pub(crate) fn node<C, Seg>(
         &self,
-        next: [NodeId; TcpInputNext::COUNT],
         handoff: Option<(NodeHandle, DataWorkerId)>,
     ) -> TcpInputNode
     where
@@ -90,7 +89,7 @@ impl TcpInputControlPlane {
         Seg: TcpWorkerStore<C>,
         hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
     {
-        let mut node = TcpInputNode::for_worker::<C, Seg>(Arc::clone(&self.inner), next);
+        let mut node = TcpInputNode::for_worker::<C, Seg>(Arc::clone(&self.inner));
         if let Some((handoff, worker)) = handoff {
             node.handoff = Some(handoff);
             node.handoff_worker = Some(worker);
@@ -118,18 +117,13 @@ pub struct TcpInputNode {
 impl TcpInputNode {
     pub(crate) fn for_worker<C, Seg>(
         snapshot: Arc<ArcSwap<TcpLookupSnapshot>>,
-        next: [NodeId; TcpInputNext::COUNT],
     ) -> Self
     where
         C: CongestionController + 'static,
         Seg: TcpWorkerStore<C>,
         hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
     {
-        Self::new(
-            register_tcp_input_runtime(snapshot),
-            tcp_input_process::<C, Seg>,
-            next,
-        )
+        Self::new(register_tcp_input_runtime(snapshot), tcp_input_process::<C, Seg>)
     }
 }
 

@@ -54,7 +54,7 @@ pub struct IpInputNode<A: FeatureArcSpec = IpUnicastArc> {
 
 fn register_ip_input(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_internal_with_next_names(
-        IpInputNode::<IpUnicastArc>::new([NodeId::new(0); IpInputNext::COUNT]),
+        IpInputNode::<IpUnicastArc>::new(),
         &IpInputNext::NEXT_NAMES,
     )
 }

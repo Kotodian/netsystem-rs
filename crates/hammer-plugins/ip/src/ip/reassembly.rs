@@ -315,7 +315,7 @@ impl IpReassemblyNode {
 
 fn register_ip_reassembly(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_internal_with_next_names(
-        IpReassemblyNode::new([NodeId::new(0); IpReassemblyNext::COUNT]),
+        IpReassemblyNode::new(),
         &IpReassemblyNext::NEXT_NAMES,
     )
 }

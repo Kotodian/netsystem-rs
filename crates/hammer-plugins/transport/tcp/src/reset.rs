@@ -18,14 +18,11 @@ pub enum TcpResetNext {
     role = internal,
 )]
 #[derive(Clone, Copy)]
-pub struct TcpResetNode {
-    #[node(default)]
-    cached_next: Option<NodeId>,
-}
+pub struct TcpResetNode;
 
 pub fn register_tcp_reset(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_internal_with_next_names(
-        TcpResetNode::new([NodeId::new(0); TcpResetNext::COUNT]),
+        TcpResetNode::new(),
         &TcpResetNext::NEXT_NAMES,
     )
 }
@@ -551,9 +548,15 @@ mod tests {
         let lookup = runtime
             .nodes()
             .register_internal(CaptureNode::new(Arc::clone(&lookup_state)));
-        let reset = runtime
+        let reset = runtime.nodes().register_internal(TcpResetNode::new());
+        runtime
             .nodes()
-            .register_internal(TcpResetNode::new(TcpResetNext::nodes(drop_node, lookup)));
+            .set_node_next(reset, TcpResetNext::Drop, drop_node)
+            .expect("wire TCP reset drop");
+        runtime
+            .nodes()
+            .set_node_next(reset, TcpResetNext::Lookup, lookup)
+            .expect("wire TCP reset lookup");
         let mut frame = runtime
             .buffers()
             .get_next_frame(reset)

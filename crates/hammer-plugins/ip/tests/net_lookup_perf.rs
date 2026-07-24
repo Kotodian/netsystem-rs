@@ -7,9 +7,7 @@ use std::time::{Duration, Instant};
 
 use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, SecondaryOpaque};
 use hammer_plugin_ip::forwarding::{DpoProto, FibTableBuilder, ForwardingMetadata};
-use hammer_plugin_ip::{
-    IpInputNext, IpInputNode, IpLookupControlPlane, IpLookupNext, IpUnicastArc,
-};
+use hammer_plugin_ip::{IpInputNext, IpInputNode, IpLookupControlPlane, IpUnicastArc};
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
     DataPlaneBufferConfig, DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig,
@@ -371,9 +369,7 @@ fn build_lookup_with_drop(
     drop: hammer_core::data_plane::NodeId,
 ) -> hammer_core::data_plane::NodeId {
     let control = IpLookupControlPlane::new(FibTableBuilder::new(u16::MAX).build());
-    let lookup = runtime
-        .nodes()
-        .register_internal(control.node(IpLookupNext::nodes(drop)));
+    let lookup = runtime.nodes().register_internal(control.node());
     let drop_slot = runtime
         .nodes()
         .add_node_next_slot(lookup, drop)
@@ -431,11 +427,21 @@ fn build_input_lookup(
 ) -> hammer_core::data_plane::NodeId {
     let drop = runtime.nodes().register_internal(DropNode::new());
     let lookup = build_lookup_with_drop(runtime, scenario, counters, drop);
-    runtime
+    let input = runtime
         .nodes()
-        .register_internal(IpInputNode::<IpUnicastArc>::new(IpInputNext::nodes(
+        .register_internal(IpInputNode::<IpUnicastArc>::new());
+    for (next, target) in IpInputNext::VARIANTS
+        .into_iter()
+        .zip(IpInputNext::nodes(
             drop, drop, drop, lookup, drop, drop, drop,
-        )))
+        ))
+    {
+        runtime
+            .nodes()
+            .set_node_next(input, next, target)
+            .expect("wire IP input");
+    }
+    input
 }
 
 fn register_sink(

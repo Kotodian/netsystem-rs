@@ -8,9 +8,8 @@ use hammer_plugin_ip::forwarding::{
 };
 use hammer_plugin_ip::protocol::icmp::IcmpErrorMetadata;
 use hammer_plugin_ip::{
-    AdjacencyRewriteNext, AdjacencyRewriteNode, AdjacencyRewriteTrace, IpInputNext, IpInputNode,
-    IpLocalControlPlane, IpLocalNext, IpLookupControlPlane, IpLookupNext, IpLookupTrace,
-    IpUnicastArc,
+    AdjacencyRewriteNode, AdjacencyRewriteTrace, IpInputNext, IpInputNode, IpLocalControlPlane,
+    IpLocalNext, IpLookupControlPlane, IpLookupTrace, IpUnicastArc,
 };
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
@@ -210,7 +209,7 @@ fn ip_lookup_node_uses_ipv4_mtrie_longest_prefix_match() {
     let drop = runtime.nodes().register_internal(DropNode::new());
 
     let (control, lookup) = placeholder_lookup(&runtime);
-    assert_internal_node(&control.node(IpLookupNext::nodes(drop)));
+    assert_internal_node(&control.node());
     let drop_slot = next_slot(&runtime, lookup, drop);
     let default_slot = next_slot(&runtime, lookup, default);
     let specific_slot = next_slot(&runtime, lookup, specific);
@@ -440,9 +439,17 @@ fn ip_lookup_node_routes_receive_dpo_to_local_next() {
     let state = Arc::new(Mutex::new(SinkState::default()));
     let drop = runtime.nodes().register_internal(DropNode::new());
     let udp = register_sink(&runtime, &state);
-    let local_control =
-        IpLocalControlPlane::new(IpLocalNext::nodes(drop, drop, drop, udp, drop, drop));
-    runtime.nodes().register_internal(local_control.node());
+    let local_control = IpLocalControlPlane::new();
+    let local = runtime.nodes().register_internal(local_control.node());
+    for (next, target) in IpLocalNext::VARIANTS
+        .into_iter()
+        .zip(IpLocalNext::nodes(drop, drop, drop, udp, drop, drop))
+    {
+        runtime
+            .nodes()
+            .set_node_next(local, next, target)
+            .expect("wire IP local");
+    }
     let receive = runtime
         .nodes()
         .register_internal(local_control.receive_node());
@@ -486,9 +493,17 @@ fn ip_lookup_node_routes_direct_receive_dpo_to_local_next() {
     let state = Arc::new(Mutex::new(SinkState::default()));
     let drop = runtime.nodes().register_internal(DropNode::new());
     let udp = register_sink(&runtime, &state);
-    let local_control =
-        IpLocalControlPlane::new(IpLocalNext::nodes(drop, drop, drop, udp, drop, drop));
-    runtime.nodes().register_internal(local_control.node());
+    let local_control = IpLocalControlPlane::new();
+    let local = runtime.nodes().register_internal(local_control.node());
+    for (next, target) in IpLocalNext::VARIANTS
+        .into_iter()
+        .zip(IpLocalNext::nodes(drop, drop, drop, udp, drop, drop))
+    {
+        runtime
+            .nodes()
+            .set_node_next(local, next, target)
+            .expect("wire IP local");
+    }
     let receive = runtime
         .nodes()
         .register_internal(local_control.receive_node());
@@ -619,10 +634,9 @@ fn adjacency_rewrite_node_prepends_rewrite_and_sets_egress_interface() {
     let sink = register_sink(&runtime, &state);
     let drop_node = runtime.nodes().register_internal(DropNode::new());
     let (control, _lookup) = placeholder_lookup(&runtime);
-    let rewrite_node = runtime.nodes().register_internal(AdjacencyRewriteNode::new(
-        control.table_handle(),
-        AdjacencyRewriteNext::nodes(NodeId::new(0)),
-    ));
+    let rewrite_node = runtime
+        .nodes()
+        .register_internal(AdjacencyRewriteNode::new(control.table_handle()));
     let drop_slot = next_slot(&runtime, rewrite_node, drop_node);
     let sink_slot = next_slot(&runtime, rewrite_node, sink);
     let mut builder = FibTableBuilder::new(drop_slot);
@@ -719,10 +733,7 @@ fn adjacency_rewrite_df_mtu_exceed_diverts_to_icmp_frag_needed() {
     let icmp_sink = register_sink(&runtime, &icmp_state);
     let drop_node = runtime.nodes().register_internal(DropNode::new());
     let (control, _lookup) = placeholder_lookup(&runtime);
-    let rewrite_obj = AdjacencyRewriteNode::new(
-        control.table_handle(),
-        AdjacencyRewriteNext::nodes(NodeId::new(0)),
-    );
+    let rewrite_obj = AdjacencyRewriteNode::new(control.table_handle());
     let rewrite_runtime = rewrite_obj.runtime_data_handle();
     let rewrite_node = runtime.nodes().register_internal(rewrite_obj);
     let drop_slot = next_slot(&runtime, rewrite_node, drop_node);
@@ -792,10 +803,7 @@ fn adjacency_rewrite_non_df_mtu_exceed_diverts_to_fragment_next() {
     let fragment_sink = register_sink(&runtime, &fragment_state);
     let drop_node = runtime.nodes().register_internal(DropNode::new());
     let (control, _lookup) = placeholder_lookup(&runtime);
-    let rewrite_obj = AdjacencyRewriteNode::new(
-        control.table_handle(),
-        AdjacencyRewriteNext::nodes(NodeId::new(0)),
-    );
+    let rewrite_obj = AdjacencyRewriteNode::new(control.table_handle());
     let rewrite_runtime = rewrite_obj.runtime_data_handle();
     let rewrite_node = runtime.nodes().register_internal(rewrite_obj);
     let drop_slot = next_slot(&runtime, rewrite_node, drop_node);
@@ -856,10 +864,9 @@ fn adjacency_rewrite_node_prepends_rewrite_when_packet_has_headroom() {
     let sink = register_sink(&runtime, &state);
     let drop_node = runtime.nodes().register_internal(DropNode::new());
     let (control, _lookup) = placeholder_lookup(&runtime);
-    let rewrite_node = runtime.nodes().register_internal(AdjacencyRewriteNode::new(
-        control.table_handle(),
-        AdjacencyRewriteNext::nodes(NodeId::new(0)),
-    ));
+    let rewrite_node = runtime
+        .nodes()
+        .register_internal(AdjacencyRewriteNode::new(control.table_handle()));
     let drop_node_slot = next_slot(&runtime, rewrite_node, drop_node);
     let sink_slot = next_slot(&runtime, rewrite_node, sink);
     let mut builder = FibTableBuilder::new(drop_node_slot);
@@ -929,10 +936,9 @@ fn adjacency_rewrite_node_drops_missing_forwarding_and_missing_adjacency() {
     control
         .publish(FibTableBuilder::new(drop_slot).build())
         .expect("publish fib");
-    let rewrite_node = runtime.nodes().register_internal(AdjacencyRewriteNode::new(
-        control.table_handle(),
-        AdjacencyRewriteNext::nodes(NodeId::new(0)),
-    ));
+    let rewrite_node = runtime
+        .nodes()
+        .register_internal(AdjacencyRewriteNode::new(control.table_handle()));
     let mut frame = runtime
         .buffers()
         .get_next_frame(rewrite_node)
@@ -1084,9 +1090,18 @@ fn ip_input_to_lookup_graph_routes_packet_by_fib() {
     control.publish(builder.build()).expect("publish fib");
     let input = runtime
         .nodes()
-        .register_internal(IpInputNode::<IpUnicastArc>::new(IpInputNext::nodes(
+        .register_internal(IpInputNode::<IpUnicastArc>::new());
+    for (next, target) in IpInputNext::VARIANTS
+        .into_iter()
+        .zip(IpInputNext::nodes(
             drop, drop, drop, lookup, drop, drop, drop,
-        )));
+        ))
+    {
+        runtime
+            .nodes()
+            .set_node_next(input, next, target)
+            .expect("wire IP input");
+    }
     let mut frame = runtime
         .buffers()
         .get_next_frame(input)
@@ -1114,9 +1129,18 @@ fn ip_input_batches_lookup_packets_into_one_scheduled_next_frame() {
     let drop = runtime.nodes().register_internal(DropNode::new());
     let input = runtime
         .nodes()
-        .register_internal(IpInputNode::<IpUnicastArc>::new(IpInputNext::nodes(
+        .register_internal(IpInputNode::<IpUnicastArc>::new());
+    for (next, target) in IpInputNext::VARIANTS
+        .into_iter()
+        .zip(IpInputNext::nodes(
             drop, drop, drop, sink, drop, drop, drop,
-        )));
+        ))
+    {
+        runtime
+            .nodes()
+            .set_node_next(input, next, target)
+            .expect("wire IP input");
+    }
     let mut frame = runtime
         .buffers()
         .get_next_frame(input)
@@ -1170,9 +1194,18 @@ fn ip_lookup_uses_ip_input_cursor_without_reparsing_current_header() {
         .register_internal(CorruptCurrentHeaderNode::new(lookup));
     let input = runtime
         .nodes()
-        .register_internal(IpInputNode::<IpUnicastArc>::new(IpInputNext::nodes(
+        .register_internal(IpInputNode::<IpUnicastArc>::new());
+    for (next, target) in IpInputNext::VARIANTS
+        .into_iter()
+        .zip(IpInputNext::nodes(
             drop, drop, drop, corrupt, drop, drop, drop,
-        )));
+        ))
+    {
+        runtime
+            .nodes()
+            .set_node_next(input, next, target)
+            .expect("wire IP input");
+    }
     let mut frame = runtime
         .buffers()
         .get_next_frame(input)
@@ -1219,11 +1252,8 @@ fn next_slot(
 fn placeholder_lookup(
     runtime: &DataPlaneRuntime,
 ) -> (IpLookupControlPlane, hammer_core::data_plane::NodeId) {
-    let drop = runtime.node_by_name("drop").expect("drop node");
     let control = IpLookupControlPlane::new(FibTableBuilder::new(u16::MAX).build());
-    let lookup = runtime
-        .nodes()
-        .register_internal(control.node(IpLookupNext::nodes(drop)));
+    let lookup = runtime.nodes().register_internal(control.node());
     (control, lookup)
 }
 

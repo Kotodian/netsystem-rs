@@ -708,6 +708,7 @@ impl NodeRuntimeInner {
             ));
         }
         if next_names.is_none()
+            && !initial_nexts.is_empty()
             && let NodeRegistration::Next { next_count, .. } = registration
             && next_count != initial_nexts.len()
         {
@@ -736,6 +737,8 @@ impl NodeRuntimeInner {
                     self.next_nodes[id.slot() as usize] = vec![None; next_count];
                     self.pending_next_names[id.slot() as usize] =
                         next_names.iter().copied().map(Some).collect();
+                } else if initial_nexts.is_empty() {
+                    self.next_nodes[id.slot() as usize] = vec![None; next_count];
                 } else {
                     self.next_nodes[id.slot() as usize] = initial_nexts
                         .iter()
@@ -1205,6 +1208,35 @@ mod node_function_tests {
             target
         );
     }
+
+    #[test]
+    fn declared_next_slots_can_be_wired_after_registration() {
+        let runtime = NodeRuntime::default();
+        let target = runtime
+            .try_register_internal_with_next_names(
+                NamedNextProbe {
+                    name: "target",
+                    next_count: 0,
+                },
+                &[],
+            )
+            .expect("register target");
+        let source = runtime
+            .try_register_internal(NamedNextProbe {
+                name: "source",
+                next_count: 1,
+            })
+            .expect("register source");
+
+        assert!(runtime.node_next_slot(source, 0).is_err());
+        runtime
+            .set_node_next_slot(source, 0, target)
+            .expect("wire declared next slot");
+        assert_eq!(
+            runtime.node_next_slot(source, 0).expect("resolved next"),
+            target
+        );
+    }
 }
 
 impl NodeRuntime {
@@ -1374,10 +1406,9 @@ impl NodeRuntime {
     /// type being known at the call site, mirroring VPP's `vlib_node_t`
     /// registration where every node is stored as a type-erased record.
     ///
-    /// The descriptor's `initial_nexts` must satisfy the contract enforced by
-    /// `register_descriptor`: for `NodeRegistration::Next { next_count, .. }`
-    /// its length must equal `next_count` (use placeholder `NodeId`s when edges
-    /// are resolved later by name via `set_node_next_slot`).
+    /// For `NodeRegistration::Next`, `initial_nexts` may either contain every
+    /// resolved target or be empty while the topology owner wires the declared
+    /// slots through `set_node_next_slot` before dispatch.
     #[inline]
     pub fn try_register_descriptor(
         &self,

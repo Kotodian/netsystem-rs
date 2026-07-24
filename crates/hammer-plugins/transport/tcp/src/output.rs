@@ -1,13 +1,15 @@
 #[cfg(test)]
 use crate::{TCP_FLAG_ACK, TCP_FLAG_PSH};
+#[cfg(test)]
+use hammer_runtime::InternalNode;
 use crate::{TCP_FLAG_FIN, TCP_FLAG_SYN, tcp_header};
 use abi_stable::{
     RRef,
     std_types::{RSlice, RSliceMut},
 };
-use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId, NodeRegistration};
+use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId};
 use hammer_runtime::{
-    DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
+    DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
@@ -40,31 +42,17 @@ pub enum TcpOutputNext {
     graph = tcp_worker,
     init = crate::output::register_tcp_output,
     next = TcpOutputNext,
+    role = internal,
 )]
 #[derive(Clone, Copy)]
-pub struct TcpOutputNode {
-    next: [NodeId; TcpOutputNext::COUNT],
-    cached_next: Option<NodeId>,
-}
-
-impl TcpOutputNode {
-    pub const NODE_NAME: &'static str = "tcp-output";
-
-    #[inline]
-    pub fn new(next: [NodeId; TcpOutputNext::COUNT]) -> Self {
-        Self {
-            next,
-            cached_next: None,
-        }
-    }
-}
+pub struct TcpOutputNode;
 
 pub fn register_tcp_output(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     if let Some(node) = runtime.nodes().node_by_name(TcpOutputNode::NODE_NAME) {
         return Ok(node);
     }
     runtime.nodes().try_register_internal_with_next_names(
-        TcpOutputNode::new([NodeId::new(0); TcpOutputNext::COUNT]),
+        TcpOutputNode::new(),
         &TcpOutputNext::NEXT_NAMES,
     )
 }
@@ -83,21 +71,6 @@ impl Node for TcpOutputNode {
     #[inline]
     fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
         Ok(NodeRuntimeData::default())
-    }
-}
-
-impl InternalNode for TcpOutputNode {
-    #[inline]
-    fn node_registration(&self) -> NodeRegistration
-    where
-        Self: Sized,
-    {
-        NodeRegistration::next(Self::NODE_NAME, TcpOutputNext::COUNT)
-    }
-
-    #[inline]
-    fn node_initial_nexts(&self) -> &[NodeId] {
-        &self.next
     }
 }
 
@@ -499,9 +472,15 @@ mod tests {
         let drop = runtime
             .nodes()
             .register_internal(CaptureNode::new(Arc::clone(&drop_state)));
-        let output = runtime
+        let output = runtime.nodes().register_internal(TcpOutputNode::new());
+        runtime
             .nodes()
-            .register_internal(TcpOutputNode::new(TcpOutputNext::nodes(drop, lookup)));
+            .set_node_next(output, TcpOutputNext::Drop, drop)
+            .expect("wire TCP output drop");
+        runtime
+            .nodes()
+            .set_node_next(output, TcpOutputNext::Lookup, lookup)
+            .expect("wire TCP output lookup");
         (runtime, lookup_state, drop_state, output)
     }
 

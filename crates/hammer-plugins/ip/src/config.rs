@@ -1,7 +1,6 @@
 //! IP-plugin configuration read from `[network]`.
 
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::time::Duration;
 
 use hammer_runtime::{RuntimeError, RuntimeResult};

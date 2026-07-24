@@ -47,16 +47,13 @@ pub struct TcpListenNode {
 }
 
 impl TcpListenNode {
-    pub(crate) fn for_worker<C, Seg>(
-        control: TcpInputControlPlane,
-        next: [NodeId; TcpListenNext::COUNT],
-    ) -> Self
+    pub(crate) fn for_worker<C, Seg>(control: TcpInputControlPlane) -> Self
     where
         C: CongestionController + 'static,
         Seg: TcpWorkerStore<C>,
         hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
     {
-        Self::new(control, tcp_listen_process::<C, Seg>, next)
+        Self::new(control, tcp_listen_process::<C, Seg>)
     }
 }
 

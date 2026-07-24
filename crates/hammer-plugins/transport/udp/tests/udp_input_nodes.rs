@@ -173,9 +173,20 @@ fn wire_udp_input(
     let icmp_error = runtime
         .nodes()
         .register_internal(CaptureNode::new(Arc::clone(&icmp_state)));
-    let mut control =
-        UdpInputControlPlane::new([drop, punt, icmp_error]).with_nodes(runtime.nodes().clone());
+    let mut control = UdpInputControlPlane::new().with_nodes(runtime.nodes().clone());
     let udp_input = runtime.nodes().register_internal(control.node());
+    runtime
+        .nodes()
+        .set_node_next(udp_input, UdpInputNext::Drop, drop)
+        .expect("wire UDP input drop");
+    runtime
+        .nodes()
+        .set_node_next(udp_input, UdpInputNext::Punt, punt)
+        .expect("wire UDP input punt");
+    runtime
+        .nodes()
+        .set_node_next(udp_input, UdpInputNext::IcmpError, icmp_error)
+        .expect("wire UDP input ICMP error");
     control
         .attach_consumer(udp_input)
         .expect("attach udp input");

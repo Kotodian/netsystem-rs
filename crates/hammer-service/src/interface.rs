@@ -7,11 +7,11 @@ use std::sync::Arc;
 use arc_swap::ArcSwapOption;
 use hammer_core::data_plane::{BufferFrame, Index, NodeId, NodeRegistration};
 use hammer_runtime::DataPlaneBarrierHandle;
-use hammer_runtime::{RuntimeError, RuntimeResult};
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
     add_packet_trace,
 };
+use hammer_runtime::{RuntimeError, RuntimeResult};
 use ipnet::IpNet;
 
 use crate::data_plane::set_index_node_error_code;

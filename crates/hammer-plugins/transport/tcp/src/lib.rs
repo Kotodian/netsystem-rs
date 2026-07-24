@@ -341,8 +341,7 @@ impl TcpMain {
         Seg: TcpWorkerStore<C>,
         hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
     {
-        let next = [NodeId::new(0); TcpInputNext::COUNT];
-        let node = self.control.node::<C, Seg>(next, handoff);
+        let node = self.control.node::<C, Seg>(handoff);
         runtime
             .nodes()
             .try_register_internal_with_next_names(node, &TcpInputNext::NEXT_NAMES)
@@ -429,24 +428,24 @@ where
 {
     // The main graph carries only the monomorphized process function and edge
     // shape. Its Session Queue stays disabled until each worker binds state.
-    let tcp_output = output::register_tcp_output(runtime, 0)?;
-    let session_queue = hammer_service::session::node::register_session_queue_node(runtime, 0)?;
+    let tcp_output = output::register_tcp_output(runtime)?;
+    let session_queue = hammer_service::session::node::register_session_queue_node(runtime)?;
     main.register_tcp_input::<C, Seg>(runtime, None)?;
     let control = main.control().clone();
     runtime.nodes().try_register_internal_with_next_names(
-        TcpListenNode::for_worker::<C, Seg>(control, [NodeId::new(0); TcpListenNext::COUNT]),
+        TcpListenNode::for_worker::<C, Seg>(control),
         &TcpListenNext::NEXT_NAMES,
     )?;
     runtime.nodes().try_register_internal_with_next_names(
-        TcpEstablishedNode::for_worker::<C, Seg>([NodeId::new(0); TcpEstablishedNext::COUNT]),
+        TcpEstablishedNode::for_worker::<C, Seg>(),
         &TcpEstablishedNext::NEXT_NAMES,
     )?;
     runtime.nodes().try_register_internal_with_next_names(
-        TcpRcvProcessNode::for_worker::<C, Seg>([NodeId::new(0); TcpRcvProcessNext::COUNT]),
+        TcpRcvProcessNode::for_worker::<C, Seg>(),
         &TcpRcvProcessNext::NEXT_NAMES,
     )?;
     runtime.nodes().try_register_internal_with_next_names(
-        TcpSynSentNode::for_worker::<C, Seg>([NodeId::new(0); TcpSynSentNext::COUNT]),
+        TcpSynSentNode::for_worker::<C, Seg>(),
         &TcpSynSentNext::NEXT_NAMES,
     )?;
     let _ = SessionQueueNode::compile_output_next(runtime, session_queue, tcp_output)?;
@@ -537,24 +536,13 @@ where
         .ok_or_else(|| RuntimeError::invariant("tcp main not initialized"))?;
     let input_data = main
         .control()
-        .node::<C, Seg>(
-            [NodeId::new(0); TcpInputNext::COUNT],
-            Some((handoff, worker)),
-        )
+        .node::<C, Seg>(Some((handoff, worker)))
         .node_runtime_data()?;
     let control = main.control().clone();
-    let listen_data =
-        TcpListenNode::for_worker::<C, Seg>(control, [NodeId::new(0); TcpListenNext::COUNT])
-            .node_runtime_data()?;
-    let established_data =
-        TcpEstablishedNode::for_worker::<C, Seg>([NodeId::new(0); TcpEstablishedNext::COUNT])
-            .node_runtime_data()?;
-    let rcv_process_data =
-        TcpRcvProcessNode::for_worker::<C, Seg>([NodeId::new(0); TcpRcvProcessNext::COUNT])
-            .node_runtime_data()?;
-    let syn_sent_data =
-        TcpSynSentNode::for_worker::<C, Seg>([NodeId::new(0); TcpSynSentNext::COUNT])
-            .node_runtime_data()?;
+    let listen_data = TcpListenNode::for_worker::<C, Seg>(control).node_runtime_data()?;
+    let established_data = TcpEstablishedNode::for_worker::<C, Seg>().node_runtime_data()?;
+    let rcv_process_data = TcpRcvProcessNode::for_worker::<C, Seg>().node_runtime_data()?;
+    let syn_sent_data = TcpSynSentNode::for_worker::<C, Seg>().node_runtime_data()?;
 
     // A worker graph clone can retain the old polling state. Keep the node
     // dormant until its replacement SessionWorker owns a live readiness file.

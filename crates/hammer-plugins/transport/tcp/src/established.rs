@@ -30,13 +30,13 @@ pub struct TcpEstablishedNode {
 }
 
 impl TcpEstablishedNode {
-    pub(crate) fn for_worker<C, Seg>(next: [NodeId; TcpEstablishedNext::COUNT]) -> Self
+    pub(crate) fn for_worker<C, Seg>() -> Self
     where
         C: CongestionController + 'static,
         Seg: TcpWorkerStore<C>,
         hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
     {
-        Self::new(tcp_established_process::<C, Seg>, next)
+        Self::new(tcp_established_process::<C, Seg>)
     }
 }
 

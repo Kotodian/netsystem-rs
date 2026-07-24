@@ -241,12 +241,12 @@ impl DeviceMain {
                 queue_id,
             });
         }
-        let interface_output = self
-            .nodes
-            .node_by_name("interface-output")
-            .ok_or(DeviceError::GraphNodeMissing {
-                name: "interface-output",
-            })?;
+        let interface_output =
+            self.nodes
+                .node_by_name("interface-output")
+                .ok_or(DeviceError::GraphNodeMissing {
+                    name: "interface-output",
+                })?;
         let drop = self
             .nodes
             .node_by_name("drop")

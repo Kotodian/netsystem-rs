@@ -276,7 +276,8 @@ impl IcmpInputControlPlane {
             .nodes
             .as_ref()
             .ok_or_else(|| RuntimeError::invariant("icmp input attach requires node runtime"))?;
-        let ip4_slot = nodes.add_node_next_slot(consumer, self.ip4_default_node)?;
+        nodes.set_node_next(consumer, IcmpInputNext::Drop, self.ip4_default_node)?;
+        let ip4_slot = NodeNext::slot(IcmpInputNext::Drop);
         let ip6_slot = if self.ip6_default_node == self.ip4_default_node {
             ip4_slot
         } else {
@@ -290,10 +291,7 @@ impl IcmpInputControlPlane {
 
     #[inline]
     pub fn node(&self) -> IcmpInputNode {
-        IcmpInputNode::new(
-            IcmpInputSnapshotHandle::new(Arc::clone(&self.inner)),
-            IcmpInputNext::nodes(self.ip4_default_node),
-        )
+        IcmpInputNode::new(IcmpInputSnapshotHandle::new(Arc::clone(&self.inner)))
     }
 
     #[inline]
@@ -536,7 +534,7 @@ fn register_icmp_input(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
         IcmpInputSnapshot::new(drop_slot, drop_slot),
     )));
     runtime.nodes().try_register_internal_with_next_names(
-        IcmpInputNode::new(snapshot, IcmpInputNext::nodes(NodeId::new(0))),
+        IcmpInputNode::new(snapshot),
         &IcmpInputNext::NEXT_NAMES,
     )
 }
@@ -707,7 +705,7 @@ pub struct IcmpErrorNode {
 
 fn register_icmp_error(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_internal_with_next_names(
-        IcmpErrorNode::new([NodeId::new(0); IcmpErrorNext::COUNT]),
+        IcmpErrorNode::new(),
         &IcmpErrorNext::NEXT_NAMES,
     )
 }

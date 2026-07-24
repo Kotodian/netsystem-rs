@@ -81,17 +81,15 @@ pub enum UdpIpProtocol {
 
 pub struct UdpInputControlPlane {
     inner: Arc<ArcSwap<UdpInputSnapshot>>,
-    next: [NodeId; UdpInputNext::COUNT],
     nodes: Option<hammer_runtime::node::NodeRuntime>,
     consumer: Option<NodeId>,
 }
 
 impl UdpInputControlPlane {
     #[inline]
-    pub fn new(nexts: [NodeId; UdpInputNext::COUNT]) -> Self {
+    pub fn new() -> Self {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(UdpInputSnapshot::new())),
-            next: nexts,
             nodes: None,
             consumer: None,
         }
@@ -152,10 +150,7 @@ impl UdpInputControlPlane {
 
     #[inline]
     pub fn node(&self) -> UdpInputNode {
-        UdpInputNode::new(
-            UdpInputSnapshotHandle::new(Arc::clone(&self.inner)),
-            self.next,
-        )
+        UdpInputNode::new(UdpInputSnapshotHandle::new(Arc::clone(&self.inner)))
     }
 }
 
@@ -273,7 +268,7 @@ pub struct UdpInputNode {
 }
 
 fn register_udp_input(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
-    let control = UdpInputControlPlane::new([NodeId::new(0); UdpInputNext::COUNT]);
+    let control = UdpInputControlPlane::new();
     runtime
         .nodes()
         .try_register_internal_with_next_names(control.node(), &UdpInputNext::NEXT_NAMES)

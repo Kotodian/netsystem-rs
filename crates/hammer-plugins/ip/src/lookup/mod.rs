@@ -103,8 +103,8 @@ impl IpLookupControlPlane {
     }
 
     #[inline]
-    pub fn node(&self, next: [NodeId; IpLookupNext::COUNT]) -> IpLookupNode {
-        IpLookupNode::new(self.table_handle(), next)
+    pub fn node(&self) -> IpLookupNode {
+        IpLookupNode::new(self.table_handle())
     }
 
     #[inline]
@@ -461,9 +461,8 @@ impl IpMain {
 
     pub fn register_node(&self, rt: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
         let control = self.control_plane()?;
-        let node = control.node(IpLookupNext::nodes(NodeId::new(0)));
         rt.nodes()
-            .try_register_internal_with_next_names(node, &IpLookupNext::NEXT_NAMES)
+            .try_register_internal_with_next_names(control.node(), &IpLookupNext::NEXT_NAMES)
     }
 }
 
@@ -662,11 +661,6 @@ impl InternalNode for IpLookupNode {
         Self: Sized,
     {
         NodeRegistration::next(Self::NODE_NAME, IpLookupNext::COUNT)
-    }
-
-    #[inline]
-    fn node_initial_nexts(&self) -> &[NodeId] {
-        &self.next
     }
 }
 
@@ -899,10 +893,7 @@ pub fn register_adjacency_rewrite(runtime: &DataPlaneRuntime) -> RuntimeResult<N
         .ok_or_else(|| RuntimeError::invariant("ip main not initialized"))?;
     let control = main.control_plane()?;
     runtime.nodes().try_register_internal_with_next_names(
-        AdjacencyRewriteNode::new(
-            control.table_handle(),
-            AdjacencyRewriteNext::nodes(NodeId::new(0)),
-        ),
+        AdjacencyRewriteNode::new(control.table_handle()),
         &AdjacencyRewriteNext::NEXT_NAMES,
     )
 }

@@ -29,12 +29,15 @@ enum TunError {
     },
     #[error("invalid TUN interface name")]
     InvalidInterfaceName,
+    #[cfg(target_os = "linux")]
     #[error("TUN interface name is not terminated")]
     InterfaceNameNotTerminated,
+    #[cfg(target_os = "linux")]
     #[error("TUN interface name is empty")]
     InterfaceNameEmpty,
     #[error("TUN interface name is not UTF-8")]
     InterfaceNameNotUtf8,
+    #[cfg(target_os = "macos")]
     #[error("TUN interface name length is invalid")]
     InterfaceNameLengthInvalid,
     #[error("TUN MTU is out of range")]
@@ -43,10 +46,12 @@ enum TunError {
     PacketLengthOutOfRange,
     #[error("TUN packet has no L3 payload")]
     EmptyPacket,
+    #[cfg(target_os = "macos")]
     #[error("TUN packet has unsupported address family {family}")]
     UnsupportedAddressFamily { family: u32 },
     #[error("TUN packet has unsupported L3 version {version}")]
     UnsupportedIpVersion { version: u8 },
+    #[cfg(target_os = "macos")]
     #[error("TUN address family {family} does not match L3 version {version}")]
     AddressFamilyMismatch { family: u32, version: u8 },
     #[error("partial TUN packet write: wrote {actual} of {expected} bytes")]
@@ -87,10 +92,10 @@ impl TunError {
             Self::WouldBlock => 3,
             Self::EmptyPacket
             | Self::EmptyTxPacket
-            | Self::UnsupportedAddressFamily { .. }
             | Self::UnsupportedIpVersion { .. }
-            | Self::AddressFamilyMismatch { .. }
             | Self::PartialWrite { .. } => 4,
+            #[cfg(target_os = "macos")]
+            Self::UnsupportedAddressFamily { .. } | Self::AddressFamilyMismatch { .. } => 4,
             Self::Io { .. } => 5,
             _ => 6,
         }

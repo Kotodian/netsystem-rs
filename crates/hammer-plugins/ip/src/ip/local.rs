@@ -96,15 +96,13 @@ impl Default for IpLocalSourceCheck {
 
 pub struct IpLocalControlPlane {
     inner: Arc<ArcSwap<IpLocalState>>,
-    next: [NodeId; IpLocalNext::COUNT],
 }
 
 impl IpLocalControlPlane {
     #[inline]
-    pub fn new(next: [NodeId; IpLocalNext::COUNT]) -> Self {
+    pub fn new() -> Self {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(IpLocalState::new())),
-            next,
         }
     }
 
@@ -116,7 +114,7 @@ impl IpLocalControlPlane {
 
     #[inline]
     pub fn node(&self) -> IpLocalNode {
-        IpLocalNode::new(IpLocalStateHandle::new(Arc::clone(&self.inner)), self.next)
+        IpLocalNode::new(IpLocalStateHandle::new(Arc::clone(&self.inner)))
     }
 
     #[inline]
@@ -245,7 +243,7 @@ std::thread_local! {
 }
 
 fn register_ip_local(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
-    let control = IpLocalControlPlane::new([NodeId::new(0); IpLocalNext::COUNT]);
+    let control = IpLocalControlPlane::new();
     let node = runtime
         .nodes()
         .try_register_internal_with_next_names(control.node(), &IpLocalNext::NEXT_NAMES)?;

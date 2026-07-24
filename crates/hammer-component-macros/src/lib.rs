@@ -398,7 +398,7 @@ fn parse_ident_array(input: ParseStream<'_>) -> Result<Vec<Ident>> {
 pub fn node(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as NodeArgs);
     let item = parse_macro_input!(input as ItemStruct);
-    expand_node(args, item, None, true)
+    expand_node(args, item, None, true, true)
         .unwrap_or_else(Error::into_compile_error)
         .into()
 }
@@ -549,6 +549,7 @@ fn expand_node(
     item: ItemStruct,
     declared_name: Option<LitStr>,
     allow_name_override: bool,
+    store_initial_nexts: bool,
 ) -> Result<TokenStream2> {
     let attrs = item.attrs;
     let vis = item.vis;
@@ -610,7 +611,7 @@ fn expand_node(
     if args.next.is_some() && has_field(&output_fields, "next") {
         return Err(Error::new(
             Span::call_site(),
-            "`node(next = ...)` injects a `next` field; remove the field from the struct",
+            "`node(next = ...)` owns the `next` field; remove it from the struct",
         ));
     }
     if args.next_node && has_field(&output_fields, "next") {
@@ -643,12 +644,15 @@ fn expand_node(
             output_fields.push(name_field);
             constructor_inits.push(quote!(node_name: Self::NODE_NAME));
         }
-        let field: Field = parse_quote! {
-            next: [::hammer_core::data_plane::NodeId; #next::COUNT]
-        };
-        output_fields.push(field);
-        constructor_params.push(quote!(next: [::hammer_core::data_plane::NodeId; #next::COUNT]));
-        constructor_inits.push(quote!(next));
+        if store_initial_nexts {
+            let field: Field = parse_quote! {
+                next: [::hammer_core::data_plane::NodeId; #next::COUNT]
+            };
+            output_fields.push(field);
+            constructor_params
+                .push(quote!(next: [::hammer_core::data_plane::NodeId; #next::COUNT]));
+            constructor_inits.push(quote!(next));
+        }
         next_impl = quote! {
             pub const NODE_NEXT_COUNT: usize = #next::COUNT;
         };
@@ -728,7 +732,10 @@ fn expand_node(
     } else {
         quote!()
     };
-    let initial_nexts_inherent_impl = if args.role.is_some() && args.next.is_some() {
+    let initial_nexts_inherent_impl = if args.role.is_some()
+        && args.next.is_some()
+        && store_initial_nexts
+    {
         quote! {
             #[inline]
             pub fn node_initial_nexts(&self) -> &[::hammer_core::data_plane::NodeId] {
@@ -752,7 +759,7 @@ fn expand_node(
 
     let role_impl = match args.role {
         Some(NodeRole::Internal) => {
-            let initial_nexts = if args.next.is_some() {
+            let initial_nexts = if args.next.is_some() && store_initial_nexts {
                 quote! {
                     #[inline]
                     fn node_initial_nexts(&self) -> &[::hammer_core::data_plane::NodeId] {
@@ -776,7 +783,7 @@ fn expand_node(
             }
         }
         Some(NodeRole::Driver) => {
-            let initial_nexts = if args.next.is_some() {
+            let initial_nexts = if args.next.is_some() && store_initial_nexts {
                 quote! {
                     #[inline]
                     fn node_initial_nexts(&self) -> &[::hammer_core::data_plane::NodeId] {
@@ -1307,14 +1314,7 @@ fn generated_graph_node_init(
         graph_label,
         to_snake_case(&ident.to_string()),
     );
-    let constructor = if let Some(next) = &args.next {
-        quote!(#ident::new([
-            ::hammer_core::data_plane::NodeId::new(0);
-            #next::COUNT
-        ]))
-    } else {
-        quote!(#ident::new())
-    };
+    let constructor = quote!(#ident::new());
     let register = match (role, args.next.as_ref()) {
         (NodeRole::Driver, Some(next)) => quote!(
             runtime
@@ -1459,7 +1459,7 @@ fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<T
             role: effective_role,
             start_arc: args.start_arc.clone(),
         };
-        let node_output = expand_node(node_args, struct_item, args.name.clone(), false)?;
+        let node_output = expand_node(node_args, struct_item, args.name.clone(), false, false)?;
         Ok(quote! {
             #node_output
             #generated_init
@@ -2779,7 +2779,7 @@ mod tests {
         let args =
             syn::parse_str::<NodeArgs>("role = internal, next = OwnerNext").expect("parse next");
         let item = syn::parse_str::<ItemStruct>("pub struct OwnerNode;").expect("parse item");
-        let expanded = expand_node(args, item, None, true)
+        let expanded = expand_node(args, item, None, true, true)
             .expect("expand node")
             .to_string();
 
@@ -2797,7 +2797,7 @@ mod tests {
     fn plain_node_expansion_does_not_inject_node_name_override() {
         let args = syn::parse_str::<NodeArgs>("").expect("parse plain");
         let item = syn::parse_str::<ItemStruct>("pub struct PlainNode;").expect("parse item");
-        let expanded = expand_node(args, item, None, true)
+        let expanded = expand_node(args, item, None, true, true)
             .expect("expand node")
             .to_string();
 
@@ -2872,6 +2872,14 @@ mod tests {
         assert!(
             expanded.contains("try_register_driver_with_next_names"),
             "missing generated named-next registration: {expanded}"
+        );
+        assert!(
+            !expanded.contains("NodeId :: new (0)"),
+            "named-next graph init must not construct placeholder node ids: {expanded}"
+        );
+        assert!(
+            !expanded.contains("next : ["),
+            "named-next graph node must not store resolved next ids: {expanded}"
         );
         assert!(
             expanded.contains("NodeState :: Disabled"),

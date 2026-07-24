@@ -213,9 +213,15 @@ fn reset_graph() -> (
     let lookup = runtime
         .nodes()
         .register_internal(CaptureNode::new(Arc::clone(&lookup_state)));
-    let reset = runtime
+    let reset = runtime.nodes().register_internal(TcpResetNode::new());
+    runtime
         .nodes()
-        .register_internal(TcpResetNode::new(TcpResetNext::nodes(drop, lookup)));
+        .set_node_next(reset, TcpResetNext::Drop, drop)
+        .expect("wire TCP reset drop");
+    runtime
+        .nodes()
+        .set_node_next(reset, TcpResetNext::Lookup, lookup)
+        .expect("wire TCP reset lookup");
     (runtime, reset, lookup_state, drop_state)
 }
 
