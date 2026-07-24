@@ -271,7 +271,7 @@ fn configure_tcp(
 
 #[hammer_component_macros::init_function(
     name = "tcp_init",
-    runs_after = ["transport_init"],
+    runs_after = ["transport_init", "session_init"],
     runs_before = ["install_packet_graph"]
 )]
 fn init_tcp(
