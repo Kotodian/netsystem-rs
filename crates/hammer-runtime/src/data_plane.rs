@@ -444,12 +444,11 @@ impl DataPlaneRuntime {
             .iter()
             .filter(|entry| matches!(entry.registration, NodeRegistration::Sibling { .. }));
         for entry in owners.chain(siblings) {
-            let node = (entry.init)(self).map_err(|source| {
-                RuntimeError::GraphNodeInitialization {
+            let node =
+                (entry.init)(self).map_err(|source| RuntimeError::GraphNodeInitialization {
                     node: entry.registration.name().unwrap_or("?"),
                     source: Box::new(source),
-                }
-            })?;
+                })?;
             self.nodes
                 .install_node_function(node, self.simd_bytes, node_functions)?;
         }

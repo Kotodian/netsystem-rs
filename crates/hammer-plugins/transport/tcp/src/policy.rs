@@ -5,13 +5,14 @@ use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
 
-use crate::config::TcpPluginConfig;
+use crate::config::{CongestionAlgorithm, TcpPluginConfig};
 
 /// Snapshot of `[plugin.tcp]` knobs consumed by TCP connections and timers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpPolicy {
     pub mss: usize,
     pub receive_window: u32,
+    pub congestion: CongestionAlgorithm,
     pub nagle: bool,
     pub time_wait: Duration,
     pub paws_idle: Duration,
@@ -29,6 +30,7 @@ impl TcpPolicy {
         Self {
             mss: tcp.mss,
             receive_window: tcp.receive_window,
+            congestion: tcp.congestion,
             nagle: tcp.nagle,
             time_wait: tcp.time_wait,
             paws_idle: tcp.paws_idle,
@@ -48,6 +50,7 @@ impl TcpPolicy {
         Self {
             mss: 1_440,
             receive_window: u16::MAX as u32,
+            congestion: CongestionAlgorithm::Bbr,
             nagle: true,
             time_wait: Duration::from_secs(60),
             paws_idle: Duration::from_secs(24 * 60 * 60),

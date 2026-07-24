@@ -53,12 +53,10 @@ pub fn register_tcp_listen(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> 
     if let Some(node) = runtime.nodes().node_by_name("tcp-listen") {
         return Ok(node);
     }
-    runtime
-        .nodes()
-        .try_register_internal_with_next_names(
-            TcpListenNode::new(main.control().clone(), main.listen_process),
-            &TcpListenNext::NEXT_NAMES,
-        )
+    runtime.nodes().try_register_internal_with_next_names(
+        TcpListenNode::new(main.control().clone(), main.listen_process),
+        &TcpListenNext::NEXT_NAMES,
+    )
 }
 
 thread_local! {

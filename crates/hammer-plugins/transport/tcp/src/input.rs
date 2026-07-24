@@ -85,10 +85,8 @@ impl TcpInputControlPlane {
         process: NodeProcessFn,
         handoff: Option<(NodeHandle, DataWorkerId)>,
     ) -> TcpInputNode {
-        let mut node = TcpInputNode::new(
-            register_tcp_input_runtime(Arc::clone(&self.inner)),
-            process,
-        );
+        let mut node =
+            TcpInputNode::new(register_tcp_input_runtime(Arc::clone(&self.inner)), process);
         if let Some((handoff, worker)) = handoff {
             node.handoff = Some(handoff);
             node.handoff_worker = Some(worker);

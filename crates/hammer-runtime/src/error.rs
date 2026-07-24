@@ -112,7 +112,9 @@ pub enum RuntimeError {
         owner: &'static str,
     },
     #[error("graph node {node:?} is not registered")]
-    NodeNotRegistered { node: hammer_core::data_plane::NodeId },
+    NodeNotRegistered {
+        node: hammer_core::data_plane::NodeId,
+    },
     #[error("graph node {node:?} next slot {slot} is not registered")]
     NodeNextSlotNotRegistered {
         node: hammer_core::data_plane::NodeId,

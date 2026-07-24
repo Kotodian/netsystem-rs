@@ -36,9 +36,10 @@ impl RuntimeRegistry {
     }
 
     pub fn require<T: Any + Send + Sync>(&self) -> Result<Arc<T>, RuntimeError> {
-        self.get::<T>().ok_or(RuntimeError::RuntimeCapabilityMissing {
-            type_name: type_name::<T>(),
-        })
+        self.get::<T>()
+            .ok_or(RuntimeError::RuntimeCapabilityMissing {
+                type_name: type_name::<T>(),
+            })
     }
 }
 

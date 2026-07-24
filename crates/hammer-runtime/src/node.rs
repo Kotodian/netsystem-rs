@@ -773,14 +773,12 @@ impl NodeRuntimeInner {
                 Ok(id)
             }
             NodeRegistration::Sibling { name, sibling_of } => {
-                let owner = self
-                    .declared_nodes
-                    .get(sibling_of)
-                    .copied()
-                    .ok_or(RuntimeError::SiblingOwnerNotRegistered {
+                let owner = self.declared_nodes.get(sibling_of).copied().ok_or(
+                    RuntimeError::SiblingOwnerNotRegistered {
                         node: name,
                         owner: sibling_of,
-                    })?;
+                    },
+                )?;
                 let owner_nexts = self
                     .next_nodes
                     .get(owner.slot() as usize)
@@ -932,8 +930,8 @@ impl NodeRuntimeInner {
             .get(node.slot() as usize)
             .map(Vec::len)
             .ok_or(RuntimeError::NodeNotRegistered { node })?;
-        let slot = u16::try_from(slot)
-            .map_err(|_| RuntimeError::NodeNextCountOverflow { count: slot })?;
+        let slot =
+            u16::try_from(slot).map_err(|_| RuntimeError::NodeNextCountOverflow { count: slot })?;
         let mut group = self.siblings[node.slot() as usize].clone();
         group.push(node);
         for &sibling in &group {
@@ -1073,7 +1071,9 @@ mod local_next_slot_tests {
             1
         );
         assert_eq!(inner.pending_next_names[source.slot() as usize].len(), 2);
-        inner.resolve_named_next_nodes().expect("resolve named nexts");
+        inner
+            .resolve_named_next_nodes()
+            .expect("resolve named nexts");
         assert_eq!(
             inner.node_next_slot(source, 0).expect("resolved target"),
             target

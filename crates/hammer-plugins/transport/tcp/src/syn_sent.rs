@@ -37,12 +37,10 @@ pub fn register_tcp_syn_sent(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId
     if let Some(node) = runtime.nodes().node_by_name("tcp-syn-sent") {
         return Ok(node);
     }
-    runtime
-        .nodes()
-        .try_register_internal_with_next_names(
-            TcpSynSentNode::new(main.syn_sent_process),
-            &TcpSynSentNext::NEXT_NAMES,
-        )
+    runtime.nodes().try_register_internal_with_next_names(
+        TcpSynSentNode::new(main.syn_sent_process),
+        &TcpSynSentNext::NEXT_NAMES,
+    )
 }
 
 impl Node for TcpSynSentNode {

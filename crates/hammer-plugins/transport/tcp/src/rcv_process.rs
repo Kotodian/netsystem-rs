@@ -37,12 +37,10 @@ pub fn register_tcp_rcv_process(runtime: &DataPlaneRuntime) -> RuntimeResult<Nod
     if let Some(node) = runtime.nodes().node_by_name("tcp-rcv-process") {
         return Ok(node);
     }
-    runtime
-        .nodes()
-        .try_register_internal_with_next_names(
-            TcpRcvProcessNode::new(main.rcv_process),
-            &TcpRcvProcessNext::NEXT_NAMES,
-        )
+    runtime.nodes().try_register_internal_with_next_names(
+        TcpRcvProcessNode::new(main.rcv_process),
+        &TcpRcvProcessNext::NEXT_NAMES,
+    )
 }
 
 impl Node for TcpRcvProcessNode {

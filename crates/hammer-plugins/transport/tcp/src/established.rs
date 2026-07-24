@@ -36,12 +36,10 @@ pub fn register_tcp_established(runtime: &DataPlaneRuntime) -> RuntimeResult<Nod
     if let Some(node) = runtime.nodes().node_by_name("tcp-established") {
         return Ok(node);
     }
-    runtime
-        .nodes()
-        .try_register_internal_with_next_names(
-            TcpEstablishedNode::new(main.established_process),
-            &TcpEstablishedNext::NEXT_NAMES,
-        )
+    runtime.nodes().try_register_internal_with_next_names(
+        TcpEstablishedNode::new(main.established_process),
+        &TcpEstablishedNext::NEXT_NAMES,
+    )
 }
 
 impl Node for TcpEstablishedNode {

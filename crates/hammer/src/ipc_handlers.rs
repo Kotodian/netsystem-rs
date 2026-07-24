@@ -198,7 +198,6 @@ fn encode_plugin_reply(reply: PluginCommandReply<'_>) -> Vec<u8> {
 fn plugin_command_error(error: RuntimeError) -> PluginCommandError {
     match error {
         RuntimeError::MemoryNotInitialized => PluginCommandError::MemoryNotInitialized,
-        RuntimeError::Plugin(_) => PluginCommandError::Lifecycle,
         RuntimeError::WorkerCountOverflow { .. } => PluginCommandError::WorkerCountOverflow,
         RuntimeError::WorkerGraphUpdateAlreadyPending => {
             PluginCommandError::WorkerGraphUpdatePending
@@ -209,16 +208,9 @@ fn plugin_command_error(error: RuntimeError) -> PluginCommandError {
         RuntimeError::ConfigParse { .. } | RuntimeError::ConfigValidation { .. } => {
             PluginCommandError::Configuration
         }
-        RuntimeError::DataPlane(_) => PluginCommandError::GraphMaterialization,
-        RuntimeError::Attach(_)
-        | RuntimeError::MainHeap(_)
-        | RuntimeError::Lifecycle { .. }
-        | RuntimeError::ServiceClosed
-        | RuntimeError::FilePoolFull
-        | RuntimeError::FileIndexInvalid { .. }
-        | RuntimeError::FileRead { .. }
-        | RuntimeError::FileWrite { .. }
-        | RuntimeError::Subsystem { .. }
-        | RuntimeError::Invariant { .. } => PluginCommandError::Lifecycle,
+        RuntimeError::DataPlane(_) | RuntimeError::GraphNodeInitialization { .. } => {
+            PluginCommandError::GraphMaterialization
+        }
+        _ => PluginCommandError::Lifecycle,
     }
 }

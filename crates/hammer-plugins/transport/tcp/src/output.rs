@@ -6,7 +6,7 @@ use abi_stable::{
     std_types::{RSlice, RSliceMut},
 };
 use core::hash::Hasher;
-use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId};
+use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId, NodeState};
 use hammer_infra::checksum::InternetChecksum;
 #[cfg(test)]
 use hammer_runtime::InternalNode;
@@ -68,9 +68,7 @@ pub fn register_tcp_output(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> 
         .node_by_name("session-queue")
         .expect("Session Queue Graph Node must be registered before TCP output");
     SessionQueueNode::compile_output_next(runtime, session_queue, node)?;
-    runtime
-        .nodes()
-        .set_node_state(session_queue, hammer_core::data_plane::NodeState::Disabled)?;
+    runtime.nodes().set_node_state(session_queue, NodeState::Disabled)?;
     Ok(node)
 }
 

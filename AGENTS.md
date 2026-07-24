@@ -71,6 +71,33 @@ Use Rust 2024 conventions and rustfmt defaults: 4-space indentation, `snake_case
 
 ### Naming rules
 
+- Follow the Rust API Guidelines naming conventions and RFC 430. Let the module
+  path provide domain context instead of repeating it in every item name: use
+  `congestion::Controller`, not `congestion::ConfiguredCongestionController`.
+  Keep word order consistent with related standard-library and crate-local
+  names. References: <https://rust-lang.github.io/api-guidelines/naming.html>
+  and <https://rust-lang.github.io/rfcs/0430-finalizing-naming-conventions.html>.
+- Name types and values by what they are in the domain, not by how or when the
+  implementation produced them. Prefixes such as `Configured`, `Registered`,
+  `Resolved`, `Dynamic`, and `Runtime` are forbidden unless two simultaneously
+  valid domain states with different behavior require that distinction.
+- Use role suffixes with one fixed meaning: `Config` is parsed input, `Policy`
+  is a validated published decision, `State` is mutable state-machine data,
+  `Handle` is a cloneable identity or capability, `Registration` is a
+  declaration awaiting installation, `Controller` actively makes domain
+  decisions, and `Error` is a typed failure. Do not use a role suffix merely to
+  make a name unique.
+- A selection enum names the selected domain concept, normally `Algorithm`,
+  `Mode`, `Backend`, or `State`. Do not use `Kind` or `Type` when a precise
+  domain noun exists. Concrete implementations use their established algorithm
+  names, such as `Bbr` and `Cubic`.
+- Trait names describe the capability or domain role they require. Concrete
+  types describe the state they own. Do not encode `Impl`, `Dyn`, `Generic`, or
+  a trait name plus an implementation-detail adjective into a concrete type.
+- Constructors and conversions follow the Rust API Guidelines: `new` for the
+  general constructor, `with_*` for additional input, `from_*` for conversion,
+  and `as_*`/`to_*`/`into_*` according to ownership and cost. Getters omit a
+  `get_` prefix unless `get` is the established checked lookup operation.
 - Name a value by its domain role, owner, and lifecycle phase, not by the order in
   which an implementation happened to observe it. Use names such as
   `startup_error`, `graph_update_error`, `worker_error`, and `unwind_payload`.
@@ -88,9 +115,10 @@ Use Rust 2024 conventions and rustfmt defaults: 4-space indentation, `snake_case
   operation that produced it. Cleanup must not replace the primary operation's
   error.
 - Function and type names must state the domain operation or owned state. Avoid
-  generic suffixes such as `Helper`, `Util`, `Manager`, `Handler`, `Thing`, or
-  `Data` unless that term is the established domain concept. Do not add a
-  wrapper merely to create a place for a vague name.
+  generic suffixes such as `Helper`, `Util`, `Manager`, `Handler`, `Thing`,
+  `Data`, `Context`, `Kind`, or `Type` unless that term is the established
+  domain concept. Do not add a wrapper merely to create a place for a vague
+  name.
 
 ### Error handling rules
 
