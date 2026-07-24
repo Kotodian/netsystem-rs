@@ -796,9 +796,9 @@ pub trait SessionPacketizedTransport<Index>: SessionTransport<Index> {
 
     fn tx_action(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
         index: Index,
         batch: &[TxBatchBuffer],
+        buffers: &DataPlaneBuffers,
         now: Instant,
     ) -> RuntimeResult<()>;
 }
@@ -899,7 +899,7 @@ where
                 batch_offset += payload_len;
                 remaining_space -= payload_len;
             }
-            transport.tx_action(sessions, index, batch.as_slice(), now)?;
+            transport.tx_action(index, batch.as_slice(), runtime.buffers(), now)?;
             for item in batch.as_slice() {
                 if !output.try_enqueue_io(frame, output_next, item.index)? {
                     sessions.mark_ready(session_id);

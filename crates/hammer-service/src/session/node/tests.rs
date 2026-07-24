@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use hammer_core::data_plane::{BufferFrame, NodeRegistration};
+use hammer_core::data_plane::{BufferFrame, DataPlaneBuffers, NodeRegistration};
 use hammer_infra::pool::Index;
 use hammer_infra::segment::Local;
 use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
@@ -414,9 +414,9 @@ impl SessionPacketizedTransport<Index> for FailingPacketizedTransport {
 
     fn tx_action(
         &mut self,
-        _: &mut SessionWorker<Index>,
         _: Index,
         _: &[TxBatchBuffer],
+        _: &DataPlaneBuffers,
         _: Instant,
     ) -> RuntimeResult<()> {
         Err(RuntimeError::invariant(
@@ -492,9 +492,9 @@ impl SessionPacketizedTransport<Index> for RecordingPacketizedTransport {
 
     fn tx_action(
         &mut self,
-        _: &mut SessionWorker<Index>,
         _: Index,
         batch: &[TxBatchBuffer],
+        _: &DataPlaneBuffers,
         _: Instant,
     ) -> RuntimeResult<()> {
         let _ = self.runtime.run_ready_nodes()?;

@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 use crate::TcpPacket;
 use crate::{TcpSeq, TcpState};
+use hammer_core::data_plane::DataPlaneBuffers;
 use hammer_infra::pool::{Index, Pool};
 use hammer_runtime::{DataPlaneRuntime, DataWorkerId};
 use hammer_runtime::{RuntimeError, RuntimeResult};
@@ -273,9 +274,9 @@ impl SessionPacketizedTransport<Index> for TcpWorker {
 
     fn tx_action(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
         index: Index,
         batch: &[TxBatchBuffer],
+        buffers: &DataPlaneBuffers,
         now: Instant,
     ) -> RuntimeResult<()> {
         let connection = self
@@ -290,7 +291,7 @@ impl SessionPacketizedTransport<Index> for TcpWorker {
         let mut candidate = connection.clone();
         for entry in batch {
             let segment = candidate.tx_segment(entry.payload_len, capabilities)?;
-            segment.write_to_buffer(sessions.buffers(), entry.index)?;
+            segment.write_to_buffer(buffers, entry.index)?;
             candidate.commit_payload_tx(entry.payload_len, now)?;
         }
         *candidate.timer_state_mut() = previous_timer_state;
