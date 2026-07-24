@@ -40,7 +40,7 @@ impl TcpEstablishedNode {
     }
 }
 
-pub fn register_tcp_established(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
+pub fn register_tcp_established(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     runtime
         .nodes()
         .node_by_name("tcp-established")

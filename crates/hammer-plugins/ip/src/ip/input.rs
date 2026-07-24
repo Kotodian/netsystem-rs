@@ -52,7 +52,7 @@ pub struct IpInputNode<A: FeatureArcSpec = IpUnicastArc> {
     runtime_data: NodeRuntimeData,
 }
 
-fn register_ip_input(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
+fn register_ip_input(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_internal_with_next_names(
         IpInputNode::<IpUnicastArc>::new([NodeId::new(0); IpInputNext::COUNT]),
         &IpInputNext::NEXT_NAMES,
@@ -279,7 +279,7 @@ fn next_slot_for_index(
                     let buffer = runtime.get_buffer(index)?;
                     let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
                     let interface_index = network.sw_if_index[0];
-                    (interface_index != 0).then_some(interface_index)
+                    (interface_index != u32::MAX).then_some(interface_index)
                 }) else {
                     return Ok(default_next);
                 };

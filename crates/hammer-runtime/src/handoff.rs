@@ -22,6 +22,13 @@ impl DataWorkerId {
     }
 }
 
+impl From<DataWorkerId> for usize {
+    #[inline]
+    fn from(worker: DataWorkerId) -> Self {
+        worker.slot()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DataPlaneHandoff {
     inner: Arc<DataPlaneHandoffInner>,
@@ -287,7 +294,6 @@ mod tests {
                     ..DataPlaneBufferConfig::default()
                 },
             }),
-            DataWorkerId::new(0),
             handoff.worker(DataWorkerId::new(0)),
         );
         let continuation = runtime

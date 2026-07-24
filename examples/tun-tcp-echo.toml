@@ -24,7 +24,7 @@ buffers_per_numa = 2048
 # VPP: session { enable use-app-socket-api preallocated-sessions event-queue-length }
 [network.session]
 backend = "svm"
-attach_socket_path = "/var/run/hammer/attach.sock"
+attach_socket_path = "/tmp/hammer-tun-tcp-lab.attach.sock"
 preallocated_sessions = 64
 event_queue_length = 256
 ooo_capacity = 32

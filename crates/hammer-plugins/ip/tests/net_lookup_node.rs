@@ -2,14 +2,15 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use hammer_core::data_plane::{BufferFrame, SecondaryOpaque};
+use hammer_core::data_plane::{BufferFrame, NodeId, SecondaryOpaque};
 use hammer_plugin_ip::forwarding::{
     AdjacencyRewrite, Dpo, DpoId, DpoProto, DpoType, FibTableBuilder, ForwardingMetadata,
 };
 use hammer_plugin_ip::protocol::icmp::IcmpErrorMetadata;
 use hammer_plugin_ip::{
-    AdjacencyRewriteNode, AdjacencyRewriteTrace, IpInputNext, IpInputNode, IpLocalControlPlane,
-    IpLocalNext, IpLookupControlPlane, IpLookupNext, IpLookupTrace, IpUnicastArc,
+    AdjacencyRewriteNext, AdjacencyRewriteNode, AdjacencyRewriteTrace, IpInputNext, IpInputNode,
+    IpLocalControlPlane, IpLocalNext, IpLookupControlPlane, IpLookupNext, IpLookupTrace,
+    IpUnicastArc,
 };
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
@@ -151,7 +152,7 @@ fn sink_process(
             let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
             let opaque = unsafe { transmute::<_, &LookupTestOpaque>(buffer.opaque2()) };
             (
-                Some(network.sw_if_index[1]).filter(|value| *value != 0),
+                Some(network.sw_if_index[1]).filter(|value| *value != u32::MAX),
                 opaque.forwarding,
                 opaque.icmp_error,
             )
@@ -620,7 +621,10 @@ fn adjacency_rewrite_node_prepends_rewrite_and_sets_egress_interface() {
     let (control, _lookup) = placeholder_lookup(&runtime);
     let rewrite_node = runtime
         .nodes()
-        .register_internal(AdjacencyRewriteNode::new(control.table_handle()));
+        .register_internal(AdjacencyRewriteNode::new(
+            control.table_handle(),
+            AdjacencyRewriteNext::nodes(NodeId::new(0)),
+        ));
     let drop_slot = next_slot(&runtime, rewrite_node, drop_node);
     let sink_slot = next_slot(&runtime, rewrite_node, sink);
     let mut builder = FibTableBuilder::new(drop_slot);
@@ -717,7 +721,10 @@ fn adjacency_rewrite_df_mtu_exceed_diverts_to_icmp_frag_needed() {
     let icmp_sink = register_sink(&runtime, &icmp_state);
     let drop_node = runtime.nodes().register_internal(DropNode::new());
     let (control, _lookup) = placeholder_lookup(&runtime);
-    let rewrite_obj = AdjacencyRewriteNode::new(control.table_handle());
+    let rewrite_obj = AdjacencyRewriteNode::new(
+        control.table_handle(),
+        AdjacencyRewriteNext::nodes(NodeId::new(0)),
+    );
     let rewrite_runtime = rewrite_obj.runtime_data_handle();
     let rewrite_node = runtime.nodes().register_internal(rewrite_obj);
     let drop_slot = next_slot(&runtime, rewrite_node, drop_node);
@@ -787,7 +794,10 @@ fn adjacency_rewrite_non_df_mtu_exceed_diverts_to_fragment_next() {
     let fragment_sink = register_sink(&runtime, &fragment_state);
     let drop_node = runtime.nodes().register_internal(DropNode::new());
     let (control, _lookup) = placeholder_lookup(&runtime);
-    let rewrite_obj = AdjacencyRewriteNode::new(control.table_handle());
+    let rewrite_obj = AdjacencyRewriteNode::new(
+        control.table_handle(),
+        AdjacencyRewriteNext::nodes(NodeId::new(0)),
+    );
     let rewrite_runtime = rewrite_obj.runtime_data_handle();
     let rewrite_node = runtime.nodes().register_internal(rewrite_obj);
     let drop_slot = next_slot(&runtime, rewrite_node, drop_node);
@@ -850,7 +860,10 @@ fn adjacency_rewrite_node_prepends_rewrite_when_packet_has_headroom() {
     let (control, _lookup) = placeholder_lookup(&runtime);
     let rewrite_node = runtime
         .nodes()
-        .register_internal(AdjacencyRewriteNode::new(control.table_handle()));
+        .register_internal(AdjacencyRewriteNode::new(
+            control.table_handle(),
+            AdjacencyRewriteNext::nodes(NodeId::new(0)),
+        ));
     let drop_node_slot = next_slot(&runtime, rewrite_node, drop_node);
     let sink_slot = next_slot(&runtime, rewrite_node, sink);
     let mut builder = FibTableBuilder::new(drop_node_slot);
@@ -922,7 +935,10 @@ fn adjacency_rewrite_node_drops_missing_forwarding_and_missing_adjacency() {
         .expect("publish fib");
     let rewrite_node = runtime
         .nodes()
-        .register_internal(AdjacencyRewriteNode::new(control.table_handle()));
+        .register_internal(AdjacencyRewriteNode::new(
+            control.table_handle(),
+            AdjacencyRewriteNext::nodes(NodeId::new(0)),
+        ));
     let mut frame = runtime
         .buffers()
         .get_next_frame(rewrite_node)

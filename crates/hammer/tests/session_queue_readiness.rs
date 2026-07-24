@@ -176,12 +176,12 @@ fn local_session_worker_does_not_register_file_readiness() {
     sessions
         .install_queue_readiness(&mut engine, session_queue)
         .expect("install local queue readiness");
+    let graph = engine.runtime.nodes().clone();
 
     assert_eq!(
         engine
             .file_main_mut()
-            .expect("worker FileMain")
-            .poll()
+            .poll(&graph)
             .expect("poll local session runtime"),
         0
     );
@@ -234,13 +234,11 @@ fn svm_readiness_schedules_session_queue_before_the_node_drains_events() {
     })
     .expect("queue close event");
 
-    engine.install_current();
+    let graph = engine.runtime.nodes().clone();
     let callbacks = engine
         .file_main_mut()
-        .expect("worker FileMain")
-        .poll()
+        .poll(&graph)
         .expect("poll SVM queue readiness");
-    Engine::uninstall_current();
 
     assert_eq!(callbacks, 1);
     assert!(engine.runtime.nodes().has_pending());
@@ -291,12 +289,11 @@ fn replacing_svm_session_worker_removes_the_old_file_before_queue_release() {
         .install_queue_readiness(&mut engine, session_queue)
         .expect("install replacement readiness");
 
-    engine.install_current();
+    let graph = engine.runtime.nodes().clone();
     assert_eq!(
         engine
             .file_main_mut()
-            .expect("worker FileMain")
-            .poll()
+            .poll(&graph)
             .expect("old readiness must be removed"),
         0
     );
@@ -312,12 +309,10 @@ fn replacing_svm_session_worker_removes_the_old_file_before_queue_release() {
     assert_eq!(
         engine
             .file_main_mut()
-            .expect("worker FileMain")
-            .poll()
+            .poll(&graph)
             .expect("poll replacement readiness"),
         1
     );
-    Engine::uninstall_current();
     second
         .remove_queue_readiness(&mut engine)
         .expect("remove replacement readiness");

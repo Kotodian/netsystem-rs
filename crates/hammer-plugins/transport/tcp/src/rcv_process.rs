@@ -41,7 +41,7 @@ impl TcpRcvProcessNode {
     }
 }
 
-pub fn register_tcp_rcv_process(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
+pub fn register_tcp_rcv_process(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     runtime
         .nodes()
         .node_by_name("tcp-rcv-process")

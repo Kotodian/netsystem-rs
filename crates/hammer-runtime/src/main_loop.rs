@@ -50,15 +50,23 @@ pub fn engine_main_loop(
         {
             return 1;
         }
+        if let Some(status) = requested_exit_status(engine) {
+            return status;
+        }
 
         // Step 2: Poll worker-local File readiness before graph dispatch.
-        match engine.file_main_mut().and_then(|files| files.poll()) {
+        match engine.poll_file_readiness() {
             Ok(dispatched) => progress |= dispatched != 0,
             Err(error) => {
                 tracing::error!(worker = engine.thread_index, %error, "File poll failed");
                 return 1;
             }
         }
+        with_data_plane_runtime(|rt| {
+            if let Ok(scheduled) = rt.schedule_interrupt_driver_nodes() {
+                progress |= scheduled != 0;
+            }
+        });
 
         // Step 3: Drain handoff queues, run ready nodes, poll remote/local tasks
         with_data_plane_runtime(|rt| {
@@ -103,14 +111,22 @@ pub fn engine_main_loop(
         engine.main_loop_count.fetch_add(1, Ordering::Relaxed);
 
         // Step 9: Exit check
-        if engine.main_loop_exit_now.load(Ordering::Relaxed) {
-            let status = *engine
-                .main_loop_exit_status
-                .lock()
-                .expect("engine_main_loop: poisoned exit status mutex");
+        if let Some(status) = requested_exit_status(engine) {
             return status;
         }
     }
+}
+
+fn requested_exit_status(engine: &Engine) -> Option<i32> {
+    if !engine.main_loop_exit_now.load(Ordering::Acquire) {
+        return None;
+    }
+    Some(
+        *engine
+            .main_loop_exit_status
+            .lock()
+            .expect("engine_main_loop: poisoned exit status mutex"),
+    )
 }
 
 #[cfg(test)]
@@ -172,18 +188,15 @@ mod tests {
 
         let main = Engine::new(rt, RuntimeRegistry::new());
         let mut engine = main.spawn(1).expect("spawn data worker");
-        let worker = engine.data_worker_id().expect("data worker id");
         let (registered, mut peer) = UnixStream::pair().expect("create socket pair");
         let index = engine
             .file_main_mut()
-            .expect("worker FileMain")
             .add(File::new(
                 OwnedFd::from(registered),
-                worker,
                 "main-loop readiness".to_owned(),
                 0,
                 FileFunctions {
-                    read: Some(|file| {
+                    read: Some(|_, file| {
                         file.set_private_data(1);
                         Ok(())
                     }),
@@ -210,7 +223,6 @@ mod tests {
         assert_eq!(
             engine
                 .file_main()
-                .expect("worker FileMain")
                 .get(index)
                 .expect("registered file")
                 .private_data(),

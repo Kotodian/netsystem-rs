@@ -272,7 +272,7 @@ pub struct UdpInputNode {
     snapshot: UdpInputSnapshotHandle,
 }
 
-fn register_udp_input(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
+fn register_udp_input(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     let control = UdpInputControlPlane::new([NodeId::new(0); UdpInputNext::COUNT]);
     runtime
         .nodes()

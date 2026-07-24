@@ -123,6 +123,11 @@ impl Worker {
                 "worker.stack_size must be non-zero",
             ));
         }
+        if self.max_blocking_threads == 0 {
+            return Err(RuntimeError::config_validation(
+                "worker.max_blocking_threads must be non-zero",
+            ));
+        }
         self.buffer.validate()?;
         self.handoff.validate()?;
         self.app_session.validate()?;

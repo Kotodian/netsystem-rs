@@ -1340,7 +1340,6 @@ fn generated_graph_node_init(
     let generated = quote! {
         fn #init_ident(
             runtime: &::hammer_runtime::DataPlaneRuntime,
-            _: usize,
         ) -> ::hammer_runtime::RuntimeResult<::hammer_core::data_plane::NodeId> {
             let node = #constructor;
             let node_id = #register;

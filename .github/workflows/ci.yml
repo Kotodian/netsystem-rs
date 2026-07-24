@@ -82,6 +82,156 @@ jobs:
       - name: Run workspace tests [${{ matrix.platform }}]
         run: cargo test --workspace
 
+  tcp-lab-macos:
+    name: TCP Lab reachability [macOS]
+    runs-on: macos-15
+    timeout-minutes: 25
+    env:
+      TCP_LAB_ADDRESS: 10.66.77.1
+      TCP_LAB_PORT: "7300"
+      TCP_LAB_ROUTE_PREFIX: 10.66.77.0/30
+      TCP_LAB_ATTACH_SOCKET: /tmp/hammer-tun-tcp-lab.attach.sock
+      TCP_LAB_IPC_ADDRESS: 127.0.0.1:7399
+    steps:
+      - name: Checkout [macOS TCP Lab]
+        uses: actions/checkout@v4
+      - name: Install Rust [macOS TCP Lab]
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+      - name: Cache Cargo [macOS TCP Lab]
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: tcp-lab-macos
+      - name: Build production TCP Lab [macOS]
+        run: |
+          cargo build --locked \
+            -p hammer \
+            -p hammer-plugin-tun \
+            -p hammer-plugin-ip \
+            -p hammer-plugin-tcp \
+            -p hammer-plugin-udp
+      - name: Start production TCP Lab [macOS]
+        env:
+          TCP_LAB_BINARY: ${{ github.workspace }}/target/debug/hammer
+          TCP_LAB_CONFIG: ${{ github.workspace }}/examples/tun-tcp-echo.toml
+          TCP_LAB_PLUGIN_DIR: ${{ github.workspace }}/target/debug
+        run: |
+          set -euo pipefail
+          if [[ ! -x "$TCP_LAB_BINARY" ]]; then
+            echo "missing TCP Lab binary: $TCP_LAB_BINARY" >&2
+            exit 1
+          fi
+          : > "$RUNNER_TEMP/hammer-tcp-lab.log"
+          sudo -n rm -f "$TCP_LAB_ATTACH_SOCKET"
+          tcp_lab_pid="$(
+            sudo -n /bin/sh -c '
+              log=$1
+              plugin_dir=$2
+              ipc_address=$3
+              binary=$4
+              config=$5
+              nohup env \
+                HAMMER_PLUGIN_DIR="$plugin_dir" \
+                HAMMER_IPC_ADDR="$ipc_address" \
+                "$binary" "$config" \
+                </dev/null >>"$log" 2>&1 &
+              echo $!
+            ' hammer-tcp-lab \
+              "$RUNNER_TEMP/hammer-tcp-lab.log" \
+              "$TCP_LAB_PLUGIN_DIR" \
+              "$TCP_LAB_IPC_ADDRESS" \
+              "$TCP_LAB_BINARY" \
+              "$TCP_LAB_CONFIG"
+          )"
+          if [[ ! "$tcp_lab_pid" =~ ^[0-9]+$ ]]; then
+            echo "invalid TCP Lab PID: $tcp_lab_pid" >&2
+            exit 1
+          fi
+          echo "TCP_LAB_PID=$tcp_lab_pid" >> "$GITHUB_ENV"
+      - name: Wait for Darwin utun [macOS]
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          for _ in {1..90}; do
+            if ! sudo -n kill -0 "$TCP_LAB_PID" 2>/dev/null; then
+              cat "$RUNNER_TEMP/hammer-tcp-lab.log" >&2
+              echo "TCP Lab exited before reporting a Darwin utun device" >&2
+              exit 1
+            fi
+
+            interface="$(
+              sed -n -E 's/.*(utun[0-9]+).*/\1/p' \
+                "$RUNNER_TEMP/hammer-tcp-lab.log" | tail -n 1
+            )"
+            if [[ -n "$interface" ]]; then
+              echo "TCP_LAB_INTERFACE=$interface" >> "$GITHUB_ENV"
+              echo "TCP Lab opened $interface"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          cat "$RUNNER_TEMP/hammer-tcp-lab.log" >&2
+          echo "TCP Lab did not report a Darwin utun device within 90 seconds" >&2
+          exit 1
+      - name: Route TCP Lab subnet [macOS]
+        run: |
+          set -euo pipefail
+          if [[ ! "$TCP_LAB_INTERFACE" =~ ^utun[0-9]+$ ]]; then
+            echo "invalid TCP Lab interface: $TCP_LAB_INTERFACE" >&2
+            exit 1
+          fi
+
+          sudo -n route -n delete -net "$TCP_LAB_ROUTE_PREFIX" \
+            -interface "$TCP_LAB_INTERFACE" >/dev/null 2>&1 || true
+          sudo -n route -n add -net "$TCP_LAB_ROUTE_PREFIX" \
+            -interface "$TCP_LAB_INTERFACE"
+      - name: Probe TCP reachability [macOS]
+        run: >-
+          python3 scripts/tcp-connect-probe.py
+          --host "$TCP_LAB_ADDRESS"
+          --port "$TCP_LAB_PORT"
+          --attempts 30
+          --connect-timeout 2
+          --retry-delay 1
+      - name: Print TCP Lab log on failure [macOS]
+        if: failure()
+        run: |
+          if [[ -f "$RUNNER_TEMP/hammer-tcp-lab.log" ]]; then
+            cat "$RUNNER_TEMP/hammer-tcp-lab.log"
+          fi
+      - name: Clean up TCP Lab [macOS]
+        if: always()
+        run: |
+          set +e
+
+          if [[ "${TCP_LAB_INTERFACE:-}" =~ ^utun[0-9]+$ ]]; then
+            sudo -n route -n delete -net "$TCP_LAB_ROUTE_PREFIX" \
+              -interface "$TCP_LAB_INTERFACE" >/dev/null 2>&1 || true
+          fi
+
+          if [[ "${TCP_LAB_PID:-}" =~ ^[0-9]+$ ]] \
+            && sudo -n kill -0 "$TCP_LAB_PID" 2>/dev/null
+          then
+            sudo -n kill -TERM "$TCP_LAB_PID" 2>/dev/null || true
+            for _ in {1..20}; do
+              sudo -n kill -0 "$TCP_LAB_PID" 2>/dev/null || break
+              sleep 0.25
+            done
+            if sudo -n kill -0 "$TCP_LAB_PID" 2>/dev/null; then
+              sudo -n kill -KILL "$TCP_LAB_PID" 2>/dev/null || true
+            fi
+          fi
+          sudo -n rm -f "$TCP_LAB_ATTACH_SOCKET"
+      - name: Upload TCP Lab log [macOS]
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tcp-lab-macos-log
+          path: ${{ runner.temp }}/hammer-tcp-lab.log
+          if-no-files-found: ignore
+
   dataplane-performance:
     name: dataplane performance [${{ matrix.platform }}]
     runs-on: ${{ matrix.runner }}

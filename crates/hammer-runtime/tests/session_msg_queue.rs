@@ -6,7 +6,7 @@ use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use hammer_runtime::app::session_msg_queue::{
     SessionEvt, SessionEvtType, SessionMsgQueue, SessionMsgQueueError,
 };
-use hammer_runtime::{DataWorkerId, File, FileFunctions, FileMain};
+use hammer_runtime::{File, FileFunctions, FileMain};
 
 fn descriptor_identity(fd: RawFd) -> std::io::Result<(libc::dev_t, libc::ino_t)> {
     let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -190,16 +190,14 @@ fn file_readiness_duplicate_closes_independently_of_queue_signal_owner() {
         descriptor_identity(duplicated).expect("File duplicate descriptor identity");
     // SAFETY: fcntl returned a fresh descriptor and File becomes its sole owner.
     let file_fd = unsafe { OwnedFd::from_raw_fd(duplicated) };
-    let worker = DataWorkerId::new(0);
-    let mut files = FileMain::new(worker).expect("FileMain");
+    let mut files = FileMain::new().expect("FileMain");
     let file_index = files
         .add(File::new(
             file_fd,
-            worker,
             "SVM queue readiness duplicate".to_owned(),
             0,
             FileFunctions {
-                read: Some(|_| Ok(())),
+                read: Some(|_, _| Ok(())),
                 ..FileFunctions::default()
             },
         ))

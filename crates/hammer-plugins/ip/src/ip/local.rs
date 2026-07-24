@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::mem::transmute;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -237,32 +238,27 @@ pub struct IpReceiveNode {
     state: IpLocalStateHandle,
 }
 
-fn pending_ip_local_controls() -> &'static Mutex<Vec<(usize, IpLocalControlPlane)>> {
-    static CONTROLS: OnceLock<Mutex<Vec<(usize, IpLocalControlPlane)>>> = OnceLock::new();
-    CONTROLS.get_or_init(|| Mutex::new(Vec::new()))
+std::thread_local! {
+    static PENDING_IP_LOCAL_CONTROL: RefCell<Option<IpLocalControlPlane>> = const {
+        RefCell::new(None)
+    };
 }
 
-fn register_ip_local(runtime: &DataPlaneRuntime, worker: usize) -> RuntimeResult<NodeId> {
+fn register_ip_local(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     let control = IpLocalControlPlane::new([NodeId::new(0); IpLocalNext::COUNT]);
     let node = runtime
         .nodes()
         .try_register_internal_with_next_names(control.node(), &IpLocalNext::NEXT_NAMES)?;
-    pending_ip_local_controls()
-        .lock()
-        .map_err(|_| RuntimeError::invariant("IP local initializer registry poisoned"))?
-        .push((worker, control));
+    PENDING_IP_LOCAL_CONTROL.with(|pending| {
+        *pending.borrow_mut() = Some(control);
+    });
     Ok(node)
 }
 
-fn register_ip_receive(runtime: &DataPlaneRuntime, worker: usize) -> RuntimeResult<NodeId> {
-    let mut controls = pending_ip_local_controls()
-        .lock()
-        .map_err(|_| RuntimeError::invariant("IP local initializer registry poisoned"))?;
-    let position = controls
-        .iter()
-        .position(|(registered_worker, _)| *registered_worker == worker)
+fn register_ip_receive(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+    let control = PENDING_IP_LOCAL_CONTROL
+        .with(|pending| pending.borrow_mut().take())
         .ok_or_else(|| RuntimeError::invariant("IP local sibling initialized before its owner"))?;
-    let (_, control) = controls.remove(position);
     runtime
         .nodes()
         .try_register_internal(control.receive_node())
@@ -603,7 +599,7 @@ fn process_index(
                 let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
                 network.sw_if_index[0]
             };
-            let resolved = if interface_index == 0 {
+            let resolved = if interface_index == u32::MAX {
                 default_slot
             } else {
                 feature_arc.start_for_interface_or(runtime, index, interface_index, default_slot)

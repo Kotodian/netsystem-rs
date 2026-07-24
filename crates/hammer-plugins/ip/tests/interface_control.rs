@@ -4,11 +4,12 @@ use std::time::Duration;
 
 use hammer_core::data_plane::{BufferFrame, NodeRegistration};
 use hammer_runtime::{
-    DataPlaneRuntime, InternalNode, Node, NodeResult, TraceControlPlane, TraceInputPolicy,
-    TracePolicy, config::Worker, spawn::DataRuntime,
+    DataPlaneRuntime, DataWorkerId, Engine, InternalNode, Node, NodeResult, RuntimeRegistry,
+    TraceControlPlane, TraceInputPolicy, TracePolicy, config::Worker, spawn::DataRuntime,
 };
+use hammer_service::device::DeviceMain;
 use hammer_service::interface::{
-    InterfaceControlPlane, InterfaceMtu, InterfaceMtuKind, InterfaceOutputControlPlane,
+    InterfaceControlPlane, InterfaceMtu, InterfaceMtuKind, InterfaceOutputNode,
     InterfaceOutputTrace,
 };
 use hammer_service::opaque::NetworkOpaque;
@@ -143,17 +144,23 @@ fn interface_mtu_updates_run_through_configured_runtime_data_plane_barrier() {
 
 #[test]
 fn interface_output_dispatches_to_registered_tx_node() {
-    let runtime = test_runtime();
-    let _ = runtime
+    let engine = Engine::new(test_runtime(), RuntimeRegistry::new());
+    let _ = engine
+        .runtime
         .nodes()
         .register_internal(hammer_service::data_plane::DropNode::new());
-    let tx = runtime.nodes().register_internal(InterfaceTxSinkNode);
-    let mut output_control = InterfaceOutputControlPlane::new().with_nodes(runtime.nodes().clone());
-    let output_node = runtime.nodes().register_internal(output_control.node());
-    output_control
-        .attach_consumer(output_node)
-        .expect("attach interface output");
-    let tx_slot = output_control.register_tx(7, tx).expect("register tx node");
+    let tx = engine.runtime.nodes().register_internal(InterfaceTxSinkNode);
+    let output_node = engine.runtime.nodes().register_internal(InterfaceOutputNode);
+    let devices = DeviceMain::new(engine.runtime.nodes().clone());
+    let device = devices
+        .register_device(0, tx, tx)
+        .expect("register device");
+    devices
+        .register_tx_queue(device.instance, 0, DataWorkerId::new(0))
+        .expect("register TX queue");
+    let worker = engine.spawn(1).expect("worker");
+    devices.install_worker_output_runtime(DataWorkerId::new(0));
+    let runtime = &worker.runtime;
     let trace = TraceControlPlane::new(8);
     trace.publish(TracePolicy {
         enabled: true,
@@ -177,7 +184,8 @@ fn interface_output_dispatches_to_registered_tx_node() {
     {
         let mut buffer = runtime.get_buffer_mut(index).expect("buffer mut");
         let opaque = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
-        opaque.sw_if_index[1] = 7;
+        *opaque = NetworkOpaque::default();
+        opaque.sw_if_index[1] = 0;
     }
     runtime
         .try_mark_trace(output_node, index)
@@ -209,54 +217,35 @@ fn interface_output_dispatches_to_registered_tx_node() {
 
 #[test]
 fn interface_output_drops_missing_egress_or_tx_mapping() {
-    let runtime = test_runtime();
-    let _ = runtime
+    let engine = Engine::new(test_runtime(), RuntimeRegistry::new());
+    let _ = engine
+        .runtime
         .nodes()
         .register_internal(hammer_service::data_plane::DropNode::new());
-    let mut output_control = InterfaceOutputControlPlane::new().with_nodes(runtime.nodes().clone());
-    let output_node = runtime.nodes().register_internal(output_control.node());
-    output_control
-        .attach_consumer(output_node)
-        .expect("attach interface output");
+    let tx = engine.runtime.nodes().register_internal(InterfaceTxSinkNode);
+    let output_node = engine.runtime.nodes().register_internal(InterfaceOutputNode);
+    let devices = DeviceMain::new(engine.runtime.nodes().clone());
+    let device = devices
+        .register_device(7, tx, tx)
+        .expect("register device");
+    devices
+        .register_tx_queue(device.instance, 0, DataWorkerId::new(0))
+        .expect("register TX queue");
+    let worker = engine.spawn(1).expect("worker");
+    devices.install_worker_output_runtime(DataWorkerId::new(0));
+    let runtime = &worker.runtime;
     let mut frame = runtime
         .buffers()
         .get_next_frame(output_node)
         .expect("alloc frame");
-    push_packet_with_egress(&runtime, &mut frame, None, b"no-egress");
-    push_packet_with_egress(&runtime, &mut frame, Some(99), b"no-tx");
+    push_packet_with_egress(runtime, &mut frame, None, b"no-egress");
+    push_packet_with_egress(runtime, &mut frame, Some(99), b"no-tx");
 
     runtime.put_next_frame(frame).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
-}
-
-#[test]
-fn interface_output_tx_updates_run_through_configured_runtime_data_plane_barrier() {
-    let data_runtime =
-        DataRuntime::new(1, "interface-output-barrier-test", 512 * 1024, 2).expect("data runtime");
-    let barrier = data_runtime.data_plane_barrier();
-    let runtime = test_runtime();
-    let _ = runtime
-        .nodes()
-        .register_internal(hammer_service::data_plane::DropNode::new());
-    let tx = runtime.nodes().register_internal(InterfaceTxSinkNode);
-    let mut output_control = InterfaceOutputControlPlane::new()
-        .with_data_plane_barrier(barrier.clone())
-        .with_nodes(runtime.nodes().clone());
-    let output_node = runtime.nodes().register_internal(output_control.node());
-    output_control
-        .attach_consumer(output_node)
-        .expect("attach interface output");
-    let output_handle = output_control.handle();
-
-    let tx_slot = output_control.register_tx(7, tx).expect("register tx");
-    assert_eq!(output_handle.tx_slot(7), Some(tx_slot));
-    output_control.unregister_tx(7).expect("unregister tx");
-
-    assert_eq!(output_handle.tx_slot(7), None);
-    data_runtime.shutdown_timeout(Duration::from_secs(1));
 }
 
 fn push_packet_with_egress(
@@ -269,9 +258,10 @@ fn push_packet_with_egress(
     let index = runtime
         .alloc_index_with_bytes(&packet)
         .expect("alloc packet");
+    let mut buffer = runtime.get_buffer_mut(index).expect("buffer mut");
+    let opaque = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+    *opaque = NetworkOpaque::default();
     if let Some(egress_interface) = egress_interface {
-        let mut buffer = runtime.get_buffer_mut(index).expect("buffer mut");
-        let opaque = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
         opaque.sw_if_index[1] = egress_interface;
     }
     frame.push_index(index).expect("push packet");

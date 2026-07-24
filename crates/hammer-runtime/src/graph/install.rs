@@ -18,6 +18,6 @@ pub fn install_packet_graph(engine: &mut Engine) -> RuntimeResult<()> {
     let functions = engine.plugin_main().node_functions();
     engine
         .runtime
-        .init_graph_with_node_functions(0, &entries, &functions)?;
+        .init_graph_with_node_functions(&entries, &functions)?;
     Ok(())
 }

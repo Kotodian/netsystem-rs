@@ -41,7 +41,7 @@ impl TcpSynSentNode {
     }
 }
 
-pub fn register_tcp_syn_sent(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
+pub fn register_tcp_syn_sent(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     runtime
         .nodes()
         .node_by_name("tcp-syn-sent")

@@ -530,7 +530,7 @@ pub struct IcmpInputNode {
     snapshot: IcmpInputSnapshotHandle,
 }
 
-fn register_icmp_input(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
+fn register_icmp_input(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     let drop_slot = NodeNext::slot(IcmpInputNext::Drop);
     let snapshot = IcmpInputSnapshotHandle::new(Arc::new(ArcSwap::from_pointee(
         IcmpInputSnapshot::new(drop_slot, drop_slot),
@@ -705,7 +705,7 @@ pub struct IcmpErrorNode {
     source_table: Option<IcmpErrorSourceTableHandle>,
 }
 
-fn register_icmp_error(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
+fn register_icmp_error(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_internal_with_next_names(
         IcmpErrorNode::new([NodeId::new(0); IcmpErrorNext::COUNT]),
         &IcmpErrorNext::NEXT_NAMES,
@@ -1151,7 +1151,7 @@ fn next_for_icmp_error_index(
     };
     let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
     let interface_index = network.sw_if_index[0];
-    if interface_index == 0 {
+    if interface_index == u32::MAX {
         let error = IcmpNodeError::MissingIngressInterface.code();
         set_index_node_error_code(runtime, index, error)?;
         let next = IcmpErrorNext::Drop;

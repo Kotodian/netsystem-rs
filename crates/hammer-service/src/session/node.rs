@@ -123,7 +123,7 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
-pub fn register_session_queue_node(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
+pub fn register_session_queue_node(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     if let Some(node) = runtime.nodes().node_by_name("session-queue") {
         return Ok(node);
     }

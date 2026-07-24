@@ -60,7 +60,7 @@ impl TcpListenNode {
     }
 }
 
-pub fn register_tcp_listen(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
+pub fn register_tcp_listen(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     runtime
         .nodes()
         .node_by_name("tcp-listen")

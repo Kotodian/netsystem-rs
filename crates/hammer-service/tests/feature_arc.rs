@@ -58,6 +58,7 @@ fn push_packet(runtime: &DataPlaneRuntime, frame: &mut BufferFrame, sw_if_index:
     {
         let mut buffer = runtime.get_buffer_mut(index).expect("buffer");
         let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+        *network = NetworkOpaque::default();
         network.sw_if_index[0] = sw_if_index;
     }
     frame.push_index(index).expect("push");
@@ -139,7 +140,7 @@ fn start_node_process(
                     let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
                     network.sw_if_index[0]
                 };
-                if interface_index == 0 {
+                if interface_index == u32::MAX {
                     state.default_next
                 } else {
                     handle.start_for_interface_or(

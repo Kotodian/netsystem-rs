@@ -411,7 +411,7 @@ fn configured_tcp_main(
     Ok(main)
 }
 
-pub fn register_tcp_input(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
+pub fn register_tcp_input(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     runtime
         .nodes()
         .node_by_name("tcp-input")

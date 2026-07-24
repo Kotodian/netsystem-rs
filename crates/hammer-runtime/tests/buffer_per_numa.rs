@@ -49,7 +49,6 @@ fn runtime_with_handoff_arena(
             runtime_config(1, 1, frame_slots, instruction_set),
             instruction_set,
         ),
-        DataWorkerId::new(0),
         handoff.worker(DataWorkerId::new(0)),
     )
 }
@@ -165,7 +164,6 @@ fn handoff_capacities_preserve_handoff_arena_numa_identity() {
             runtime_config(1, 1, 4, DataPlaneInstructionSet::Scalar),
             DataPlaneInstructionSet::Scalar,
         ),
-        DataWorkerId::new(0),
         handoff.worker(DataWorkerId::new(0)),
     );
 
@@ -186,11 +184,10 @@ fn handoff_worker_runtime_falls_back_to_configured_nonzero_numa_arena() {
             runtime_config(1, 1, 4, DataPlaneInstructionSet::Scalar),
             DataPlaneInstructionSet::Scalar,
         ),
-        DataWorkerId::new(0),
         handoff.worker(DataWorkerId::new(0)),
     );
 
-    let worker = runtime.for_worker(1, 1);
+    let worker = runtime.for_worker(1, 1).expect("worker runtime fork");
     let main_index = runtime.alloc_index().expect("main handoff alloc");
     let worker_index = worker.alloc_index().expect("worker handoff alloc");
 
@@ -205,7 +202,7 @@ fn handoff_worker_runtime_falls_back_to_configured_nonzero_numa_arena() {
 #[test]
 fn same_numa_worker_runtime_shares_arena_but_not_thread_cache() {
     let runtime = runtime_with_numa(1024, 4, &[0]);
-    let worker = runtime.for_worker(1, 0);
+    let worker = runtime.for_worker(1, 0).expect("worker runtime fork");
 
     let main_index = runtime.alloc_index().expect("main alloc");
     drop_owned_index!(&runtime, main_index);

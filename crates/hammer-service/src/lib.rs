@@ -3,7 +3,6 @@ extern crate self as hammer_service;
 hammer_runtime::__declare_registration_image!(
     init_functions = [
         device::__INIT_FN_DEVICE_INIT,
-        interface::__INIT_FN_INTERFACE_OUTPUT_GRAPH_INIT,
         session::__INIT_FN_SESSION_ATTACH_SERVER,
         transport::__INIT_FN_TRANSPORT_INIT,
     ];
@@ -16,6 +15,7 @@ hammer_runtime::__declare_registration_image!(
         data_plane::__SERVICE_GRAPH_NODE_DROP_NODE,
         data_plane::__SERVICE_GRAPH_NODE_HANDOFF_NODE,
         device::__SERVICE_GRAPH_NODE_DEVICE_INPUT_NODE,
+        interface::__SERVICE_GRAPH_NODE_INTERFACE_OUTPUT_NODE,
         session::node::__TCP_WORKER_GRAPH_NODE_SESSION_QUEUE_NODE,
     ];
     node_functions = [];

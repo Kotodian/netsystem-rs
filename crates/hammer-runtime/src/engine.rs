@@ -1,5 +1,5 @@
 use core::hint::spin_loop;
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell, RefMut};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -68,8 +68,7 @@ pub struct Engine {
     workers_updating_graph: Arc<AtomicU32>,
     worker_graph_update_error: Arc<Mutex<Option<RuntimeError>>>,
     main_loop_exit_functions_called: bool,
-    file_main: Option<FileMain>,
-    worker_threads: Mutex<Vec<JoinHandle<()>>>,
+    worker_threads: Mutex<Vec<JoinHandle<RuntimeResult<()>>>>,
     // Drop after every owner that may retain DSO code or Drop glue. Plugin
     // images themselves remain mapped for the full process lifetime.
     plugin_main: PluginMain,
@@ -92,11 +91,7 @@ impl Engine {
         index: u32,
         numa_node: u32,
     ) -> RuntimeResult<Self> {
-        let worker = index
-            .checked_sub(1)
-            .map(DataWorkerId::new)
-            .ok_or_else(|| RuntimeError::invariant("data worker thread index must be non-zero"))?;
-        Ok(Self {
+        let engine = Self {
             thread_index: index,
             numa_node,
             main_loop_count: AtomicU32::new(0),
@@ -122,10 +117,10 @@ impl Engine {
             workers_updating_graph,
             worker_graph_update_error,
             main_loop_exit_functions_called: false,
-            file_main: Some(FileMain::new(worker)?),
             worker_threads: Mutex::new(Vec::new()),
             processes: ProcessMain::new(),
-        })
+        };
+        Ok(engine)
     }
 
     pub fn new(runtime: DataPlaneRuntime, registry: Arc<RuntimeRegistry>) -> Self {
@@ -158,7 +153,6 @@ impl Engine {
             workers_updating_graph,
             worker_graph_update_error,
             main_loop_exit_functions_called: false,
-            file_main: None,
             worker_threads: Mutex::new(Vec::new()),
             processes: ProcessMain::new(),
         }
@@ -237,7 +231,7 @@ impl Engine {
         let entries = self.plugin_main.graph_nodes();
         let functions = self.plugin_main.node_functions();
         self.runtime
-            .extend_graph_with_node_functions(0, &entries, &functions)?;
+            .extend_graph_with_node_functions(&entries, &functions)?;
         crate::init::run_config_functions(self, false, config)?;
         if worker_count != 0 {
             self.publish_worker_graph(worker_count)?;
@@ -347,7 +341,7 @@ impl Engine {
 
     pub fn spawn_on_numa(&self, index: u32, numa_node: u32) -> RuntimeResult<Self> {
         Self::worker_with_runtime(
-            self.runtime.for_worker(index, numa_node),
+            self.runtime.for_worker(index, numa_node)?,
             Arc::clone(&self.registry),
             Arc::clone(&self.wait_at_barrier),
             Arc::clone(&self.workers_at_barrier),
@@ -422,16 +416,17 @@ impl Engine {
         self.runtime.nodes().set_node_runtime_data(node, data)
     }
 
-    pub fn file_main(&self) -> RuntimeResult<&FileMain> {
-        self.file_main
-            .as_ref()
-            .ok_or_else(|| RuntimeError::invariant("main thread has no FileMain"))
+    pub fn file_main(&self) -> Ref<'_, FileMain> {
+        self.runtime.file_main()
     }
 
-    pub fn file_main_mut(&mut self) -> RuntimeResult<&mut FileMain> {
-        self.file_main
-            .as_mut()
-            .ok_or_else(|| RuntimeError::invariant("main thread has no FileMain"))
+    pub fn file_main_mut(&self) -> RefMut<'_, FileMain> {
+        self.runtime.file_main_mut()
+    }
+
+    pub(crate) fn poll_file_readiness(&mut self) -> RuntimeResult<usize> {
+        let graph = self.runtime.nodes();
+        self.file_main_mut().poll(graph)
     }
 
     pub(crate) fn worker_seed(&self) -> EngineWorkerSeed {
@@ -452,7 +447,7 @@ impl Engine {
 
     pub(crate) fn retain_worker_threads(
         &self,
-        threads: &mut Vec<JoinHandle<()>>,
+        threads: &mut Vec<JoinHandle<RuntimeResult<()>>>,
     ) -> RuntimeResult<()> {
         let mut retained = self
             .worker_threads
@@ -496,19 +491,38 @@ impl Engine {
         self.processes.shutdown(runtime)
     }
 
-    fn join_worker_threads(&self) {
+    fn join_worker_threads(&self) -> RuntimeResult<()> {
         let threads = self
             .worker_threads
             .lock()
-            .map(|mut threads| std::mem::take(&mut *threads));
-        let Ok(threads) = threads else {
-            tracing::error!("worker thread registry poisoned during shutdown");
-            return;
-        };
-        for thread in threads {
-            if thread.join().is_err() {
-                tracing::error!("data worker panicked during shutdown");
+            .map(|mut threads| std::mem::take(&mut *threads))
+            .map_err(|_| RuntimeError::invariant("worker thread registry poisoned"))?;
+        let mut first_error = None;
+        for (worker, thread) in threads.into_iter().enumerate() {
+            match thread.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) if first_error.is_none() => first_error = Some(error),
+                Ok(Err(error)) => {
+                    tracing::error!(worker, %error, "data worker failed during shutdown");
+                }
+                Err(payload) if first_error.is_none() => {
+                    first_error = Some(RuntimeError::invariant(format!(
+                        "data worker {worker} panicked: {}",
+                        thread_panic_message(payload)
+                    )));
+                }
+                Err(payload) => {
+                    tracing::error!(
+                        worker,
+                        panic = %thread_panic_message(payload),
+                        "data worker panicked during shutdown"
+                    );
+                }
             }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 
@@ -546,10 +560,7 @@ impl EngineWorkerSeed {
         numa_node: u32,
         handoff: DataPlaneHandoffWorker,
     ) -> RuntimeResult<Engine> {
-        let worker = index
-            .checked_sub(1)
-            .map(DataWorkerId::new)
-            .ok_or_else(|| RuntimeError::invariant("data worker thread index must be non-zero"))?;
+        let handoff_owner = handoff.worker();
         let Self {
             runtime_seed,
             registry,
@@ -564,15 +575,14 @@ impl EngineWorkerSeed {
             worker_config,
         } = self;
         let runtime = DataPlaneRuntime::attach_handoff_worker(
-            DataPlaneRuntime::from(DataPlaneRuntimeWorkerConfig {
+            DataPlaneRuntime::try_from(DataPlaneRuntimeWorkerConfig {
                 seed: runtime_seed,
                 thread_index: index,
                 numa_node,
-            }),
-            worker,
+            })?,
             handoff,
         );
-        Engine::worker_with_runtime(
+        let engine = Engine::worker_with_runtime(
             runtime,
             registry,
             wait_at_barrier,
@@ -586,7 +596,13 @@ impl EngineWorkerSeed {
             worker_config,
             index,
             numa_node,
-        )
+        )?;
+        if engine.data_worker_id()? != handoff_owner {
+            return Err(RuntimeError::invariant(
+                "data worker identity does not match its Handoff owner",
+            ));
+        }
+        Ok(engine)
     }
 }
 
@@ -662,7 +678,7 @@ impl EnginePool {
 
     pub fn close(&mut self) -> RuntimeResult<()> {
         Self::main_loop_exit(self.main_engine());
-        self.main_engine().join_worker_threads();
+        let worker_result = self.main_engine().join_worker_threads();
         let exit_result = {
             let main = self.main_engine_mut();
             if main.main_loop_exit_functions_called {
@@ -675,7 +691,17 @@ impl EnginePool {
         if let Some(listener) = self.ipc_listener.take() {
             drop(listener);
         }
-        exit_result
+        worker_result.and(exit_result)
+    }
+}
+
+pub(crate) fn thread_panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(message) => *message,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(message) => (*message).to_owned(),
+            Err(_) => "non-string panic payload".to_owned(),
+        },
     }
 }
 

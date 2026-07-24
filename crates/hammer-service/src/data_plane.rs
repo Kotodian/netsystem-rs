@@ -73,11 +73,11 @@ impl HandoffNode {
     }
 }
 
-pub fn register_drop(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
+pub fn register_drop(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_internal(DropNode)
 }
 
-pub fn register_handoff(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
+pub fn register_handoff(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     runtime
         .nodes()
         .register_internal_with_handle(runtime.handoff_node_handle()?, HandoffNode)

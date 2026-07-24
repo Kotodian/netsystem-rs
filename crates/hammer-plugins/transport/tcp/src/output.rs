@@ -59,7 +59,7 @@ impl TcpOutputNode {
     }
 }
 
-pub fn register_tcp_output(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
+pub fn register_tcp_output(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     if let Some(node) = runtime.nodes().node_by_name(TcpOutputNode::NODE_NAME) {
         return Ok(node);
     }
@@ -177,6 +177,7 @@ fn tcp_output_push_ipv4(
         .map(|tcp| tcp.header_len())
         .unwrap_or(20);
     let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+    network.sw_if_index = [u32::MAX; 2];
     network.set_packet_cursor(
         BufferPacketCursor::new()
             .with_packet_len(packet_len)
@@ -211,6 +212,7 @@ fn tcp_output_push_ipv6(
         .map(|tcp| tcp.header_len())
         .unwrap_or(20);
     let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+    network.sw_if_index = [u32::MAX; 2];
     network.set_packet_cursor(
         BufferPacketCursor::new()
             .with_packet_len(packet_len)

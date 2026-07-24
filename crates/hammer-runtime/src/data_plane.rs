@@ -12,6 +12,7 @@ use hammer_core::error::{DataPlaneError, DataPlaneResult};
 use hammer_infra::PageSize;
 
 use crate::config::Worker;
+use crate::file::FileMain;
 use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HANDOFF_SLOT_CAPACITY, HandoffSlot};
 use crate::instruction_set::DataPlaneInstructionSet;
 use crate::node::{NodeEntry, NodeFunctionRegistration, NodeRuntime, NodeRuntimeInner};
@@ -96,6 +97,7 @@ pub struct DataPlaneRuntime {
     active_numa_node: u32,
     trace: DataPlaneTrace,
     instruction_set: DataPlaneInstructionSet,
+    file_main: Rc<RefCell<FileMain>>,
 }
 
 impl fmt::Debug for DataPlaneRuntime {
@@ -193,6 +195,7 @@ impl Clone for DataPlaneRuntime {
             active_numa_node: self.active_numa_node,
             trace: self.trace.clone(),
             instruction_set: self.instruction_set,
+            file_main: self.file_main.clone(),
         }
     }
 }
@@ -210,8 +213,10 @@ impl From<&DataPlaneRuntime> for DataPlaneRuntimeWorkerSeed {
     }
 }
 
-impl From<DataPlaneRuntimeWorkerConfig> for DataPlaneRuntime {
-    fn from(config: DataPlaneRuntimeWorkerConfig) -> Self {
+impl TryFrom<DataPlaneRuntimeWorkerConfig> for DataPlaneRuntime {
+    type Error = RuntimeError;
+
+    fn try_from(config: DataPlaneRuntimeWorkerConfig) -> RuntimeResult<Self> {
         let DataPlaneRuntimeWorkerConfig {
             seed,
             thread_index,
@@ -227,7 +232,7 @@ impl From<DataPlaneRuntimeWorkerConfig> for DataPlaneRuntime {
         } = seed;
         let buffers =
             DataPlaneBuffers::from_arenas(buffer_arenas, frame_slots, thread_index, numa_node);
-        let mut runtime = Self::from_buffers_with_instruction_set(buffers, instruction_set);
+        let mut runtime = Self::from_buffers_with_instruction_set(buffers, instruction_set)?;
         runtime.nodes = nodes.into();
         runtime.handoff = handoff;
         runtime.handoff_node_handle = handoff_node_handle;
@@ -239,7 +244,7 @@ impl From<DataPlaneRuntimeWorkerConfig> for DataPlaneRuntime {
             runtime.buffers = runtime.buffers.with_active_buffer_arena(arena);
             runtime.active_numa_node = runtime.buffers.active_numa_node();
         }
-        runtime
+        Ok(runtime)
     }
 }
 
@@ -250,7 +255,7 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    pub fn try_new(config: DataPlaneRuntimeConfig) -> DataPlaneResult<Self> {
+    pub fn try_new(config: DataPlaneRuntimeConfig) -> RuntimeResult<Self> {
         Self::try_new_with_instruction_set(config, DataPlaneInstructionSet::native())
     }
 
@@ -267,19 +272,19 @@ impl DataPlaneRuntime {
     pub fn try_new_with_instruction_set(
         config: DataPlaneRuntimeConfig,
         instruction_set: DataPlaneInstructionSet,
-    ) -> DataPlaneResult<Self> {
-        Ok(Self::from_buffers_with_instruction_set(
+    ) -> RuntimeResult<Self> {
+        Self::from_buffers_with_instruction_set(
             config.buffers.try_into()?,
             instruction_set,
-        ))
+        )
     }
 
     #[inline]
     fn from_buffers_with_instruction_set(
         buffers: DataPlaneBuffers,
         instruction_set: DataPlaneInstructionSet,
-    ) -> Self {
-        Self {
+    ) -> RuntimeResult<Self> {
+        Ok(Self {
             active_numa_node: buffers.active_numa_node(),
             buffers,
             nodes: NodeRuntime::default(),
@@ -291,26 +296,22 @@ impl DataPlaneRuntime {
             handoff_node_handle: None,
             trace: DataPlaneTrace::default(),
             instruction_set,
-        }
+            file_main: Rc::new(RefCell::new(FileMain::new()?)),
+        })
     }
 
     #[inline]
-    pub fn for_worker(&self, thread_index: u32, numa_node: u32) -> Self {
+    pub fn for_worker(&self, thread_index: u32, numa_node: u32) -> RuntimeResult<Self> {
         DataPlaneRuntimeWorkerConfig {
             seed: DataPlaneRuntimeWorkerSeed::from(self),
             thread_index,
             numa_node,
         }
-        .into()
+        .try_into()
     }
 
     #[inline]
-    pub fn attach_handoff_worker(
-        mut runtime: Self,
-        worker: DataWorkerId,
-        handoff: DataPlaneHandoffWorker,
-    ) -> Self {
-        debug_assert_eq!(worker, handoff.worker());
+    pub fn attach_handoff_worker(mut runtime: Self, handoff: DataPlaneHandoffWorker) -> Self {
         if let Some(arena) = handoff.configured_buffer_arena() {
             runtime.buffers = runtime.buffers.with_active_buffer_arena(arena);
             runtime.active_numa_node = runtime.buffers.active_numa_node();
@@ -435,16 +436,23 @@ impl DataPlaneRuntime {
         &self.nodes
     }
 
-    pub fn init_graph(&self, worker: usize, entries: &[NodeEntry]) -> RuntimeResult<()> {
+    pub fn file_main(&self) -> std::cell::Ref<'_, FileMain> {
+        self.file_main.borrow()
+    }
+
+    pub fn file_main_mut(&self) -> std::cell::RefMut<'_, FileMain> {
+        self.file_main.borrow_mut()
+    }
+
+    pub fn init_graph(&self, entries: &[NodeEntry]) -> RuntimeResult<()> {
         let node_functions = crate::builtin_registration_image()
             .node_functions()
             .to_vec();
-        self.init_graph_with_node_functions(worker, entries, &node_functions)
+        self.init_graph_with_node_functions(entries, &node_functions)
     }
 
     pub fn init_graph_with_node_functions(
         &self,
-        worker: usize,
         entries: &[NodeEntry],
         node_functions: &[NodeFunctionRegistration],
     ) -> RuntimeResult<()> {
@@ -461,7 +469,7 @@ impl DataPlaneRuntime {
             .iter()
             .filter(|entry| matches!(entry.registration, NodeRegistration::Sibling { .. }));
         for entry in owners.chain(siblings) {
-            let node = (entry.init)(self, worker).map_err(|err| {
+            let node = (entry.init)(self).map_err(|err| {
                 RuntimeError::invariant(format!(
                     "init graph node `{}`: {err}",
                     entry.registration.name().unwrap_or("?")
@@ -475,7 +483,6 @@ impl DataPlaneRuntime {
 
     pub(crate) fn extend_graph_with_node_functions(
         &self,
-        worker: usize,
         entries: &[NodeEntry],
         node_functions: &[NodeFunctionRegistration],
     ) -> RuntimeResult<()> {
@@ -496,7 +503,7 @@ impl DataPlaneRuntime {
                 if self.nodes.node_by_name(name).is_some() {
                     continue;
                 }
-                let node = (entry.init)(self, worker)?;
+                let node = (entry.init)(self)?;
                 self.nodes
                     .install_node_function(node, self.instruction_set, node_functions)?;
             }
@@ -512,22 +519,21 @@ impl DataPlaneRuntime {
     /// This is a graph transaction, not a plugin unload operation; it neither
     /// changes the registration authority nor releases DSO handles. Business
     /// state must rebind by name, not `NodeId`.
-    pub fn rebuild_graph(&self, worker: usize, entries: &[NodeEntry]) -> RuntimeResult<()> {
+    pub fn rebuild_graph(&self, entries: &[NodeEntry]) -> RuntimeResult<()> {
         let node_functions = crate::builtin_registration_image()
             .node_functions()
             .to_vec();
-        self.rebuild_graph_with_node_functions(worker, entries, &node_functions)
+        self.rebuild_graph_with_node_functions(entries, &node_functions)
     }
 
     pub fn rebuild_graph_with_node_functions(
         &self,
-        worker: usize,
         entries: &[NodeEntry],
         node_functions: &[NodeFunctionRegistration],
     ) -> RuntimeResult<()> {
         self.set_current_node(None);
-        self.nodes.detach_graph_for_rebuild();
-        self.init_graph_with_node_functions(worker, entries, node_functions)
+        self.nodes.detach_graph_for_rebuild()?;
+        self.init_graph_with_node_functions(entries, node_functions)
     }
 
     #[inline]
@@ -654,6 +660,17 @@ impl DataPlaneRuntime {
         let scheduled = nodes.len();
         for node in nodes {
             self.schedule_empty_frame(node)?;
+        }
+        Ok(scheduled)
+    }
+
+    pub(crate) fn schedule_interrupt_driver_nodes(&self) -> RuntimeResult<usize> {
+        let mut scheduled = 0;
+        let mut start = 0;
+        while let Some(node) = self.nodes.next_interrupt_pending(start) {
+            start = node.slot() as usize + 1;
+            self.schedule_empty_frame(node)?;
+            scheduled += 1;
         }
         Ok(scheduled)
     }
@@ -822,8 +839,8 @@ impl Worker {
             )));
         }
         let numa_nodes = self.buffer_numa_nodes()?;
-        let create = |page_size| -> DataPlaneResult<DataPlaneRuntime> {
-            let buffers = DataPlaneBufferConfig {
+        let create_buffers = |page_size| -> DataPlaneResult<DataPlaneBuffers> {
+            DataPlaneBufferConfig {
                 buffer_slot_capacity: buffer.slot_bytes,
                 buffer_slots: buffer.slots_per_numa,
                 frame_slots: buffer.frame_pool_size,
@@ -831,32 +848,29 @@ impl Worker {
                 page_size,
                 ..DataPlaneBufferConfig::default()
             }
-            .create_buffers(numa_nodes.iter().copied())?;
-            Ok(DataPlaneRuntime::from_buffers_with_instruction_set(
-                buffers,
-                instruction_set,
-            ))
+            .create_buffers(numa_nodes.iter().copied())
         };
 
-        match buffer.page_size {
-            Some(page_size) => create(page_size).map_err(Into::into),
+        let buffers = match buffer.page_size {
+            Some(page_size) => create_buffers(page_size)?,
             None => {
                 #[cfg(target_os = "linux")]
                 {
-                    match create(PageSize::DefaultHuge) {
-                        Ok(runtime) => Ok(runtime),
+                    match create_buffers(PageSize::DefaultHuge) {
+                        Ok(buffers) => buffers,
                         Err(source) => {
                             tracing::warn!(%source, "default HugeTLB Buffer Arena unavailable; using ordinary pages");
-                            create(PageSize::Default).map_err(Into::into)
+                            create_buffers(PageSize::Default)?
                         }
                     }
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    create(PageSize::Default).map_err(Into::into)
+                    create_buffers(PageSize::Default)?
                 }
             }
-        }
+        };
+        DataPlaneRuntime::from_buffers_with_instruction_set(buffers, instruction_set)
     }
 
     fn buffer_numa_nodes(&self) -> RuntimeResult<Vec<u32>> {

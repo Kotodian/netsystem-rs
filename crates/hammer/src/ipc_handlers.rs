@@ -111,6 +111,11 @@ fn plugin_command_error(error: RuntimeError) -> PluginCommandError {
         | RuntimeError::MainHeap(_)
         | RuntimeError::Lifecycle { .. }
         | RuntimeError::ServiceClosed
+        | RuntimeError::FilePoolFull
+        | RuntimeError::FileIndexInvalid { .. }
+        | RuntimeError::FileRead { .. }
+        | RuntimeError::FileWrite { .. }
+        | RuntimeError::Subsystem { .. }
         | RuntimeError::Invariant { .. } => PluginCommandError::Lifecycle,
     }
 }

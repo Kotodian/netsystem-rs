@@ -16,6 +16,20 @@ pub enum RuntimeError {
     ServiceClosed,
     #[error("memory initialization has not completed")]
     MemoryNotInitialized,
+    #[error("File registry is full")]
+    FilePoolFull,
+    #[error("File index {index:?} is stale or not registered")]
+    FileIndexInvalid { index: hammer_infra::pool::Index },
+    #[error("read File descriptor")]
+    FileRead {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("write File descriptor")]
+    FileWrite {
+        #[source]
+        source: std::io::Error,
+    },
     #[error(transparent)]
     MainHeap(#[from] hammer_infra::main_heap::MainHeapError),
     #[error(transparent)]
@@ -32,6 +46,12 @@ pub enum RuntimeError {
     WorkerGraphUpdateNotAdditive,
     #[error(transparent)]
     Attach(#[from] AttachError),
+    #[error("{subsystem} subsystem failed")]
+    Subsystem {
+        subsystem: &'static str,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[error("runtime invariant violated: {detail}")]
     Invariant { detail: String },
 }
@@ -117,6 +137,15 @@ impl RuntimeError {
     }
     pub const fn service_closed() -> Self {
         Self::ServiceClosed
+    }
+    pub fn subsystem(
+        subsystem: &'static str,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::Subsystem {
+            subsystem,
+            source: Box::new(source),
+        }
     }
     pub fn invariant(detail: impl Into<String>) -> Self {
         Self::Invariant {

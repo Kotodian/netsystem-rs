@@ -296,7 +296,7 @@ pub trait InternalNode {
 pub struct NodeEntry {
     pub registration: NodeRegistration,
     pub kind: NodeKind,
-    pub init: fn(&DataPlaneRuntime, usize) -> RuntimeResult<NodeId>,
+    pub init: fn(&DataPlaneRuntime) -> RuntimeResult<NodeId>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -327,6 +327,7 @@ pub struct NodeRuntime {
     inner: Rc<RefCell<NodeRuntimeInner>>,
     queue: Rc<RefCell<ScheduledFrameQueue>>,
     readiness: Rc<NodeReadiness>,
+    topology_owner: bool,
 }
 
 impl Clone for NodeRuntime {
@@ -335,6 +336,7 @@ impl Clone for NodeRuntime {
             inner: Rc::clone(&self.inner),
             queue: Rc::clone(&self.queue),
             readiness: Rc::clone(&self.readiness),
+            topology_owner: self.topology_owner,
         }
     }
 }
@@ -980,6 +982,7 @@ impl Default for NodeRuntime {
                 DEFAULT_SCHEDULED_FRAME_QUEUE_CAPACITY,
             ))),
             readiness: Rc::new(NodeReadiness::default()),
+            topology_owner: true,
         }
     }
 }
@@ -1000,6 +1003,7 @@ impl From<NodeRuntimeInner> for NodeRuntime {
                 queue_capacity,
             ))),
             readiness: Rc::new(NodeReadiness::default()),
+            topology_owner: false,
         }
     }
 }
@@ -1204,12 +1208,24 @@ mod node_function_tests {
 }
 
 impl NodeRuntime {
+    #[inline]
+    fn ensure_topology_owner(&self) -> RuntimeResult<()> {
+        if self.topology_owner {
+            Ok(())
+        } else {
+            Err(RuntimeError::invariant(
+                "data worker cannot mutate graph topology",
+            ))
+        }
+    }
+
     /// Drain scheduled frames and clear topology so `init_graph` can renumber.
     ///
     /// VPP analogue: barrier-held main-thread graph mutation before workers
     /// install a clone of the updated graph.
     /// Old `NodeId` values become unreachable after this returns.
-    pub fn detach_graph_for_rebuild(&self) {
+    pub(crate) fn detach_graph_for_rebuild(&self) -> RuntimeResult<()> {
+        self.ensure_topology_owner()?;
         {
             let mut queue = self.queue.borrow_mut();
             queue.drain_all();
@@ -1237,6 +1253,7 @@ impl NodeRuntime {
             sibling_owners: Vec::new(),
             siblings: Vec::new(),
         };
+        Ok(())
     }
 
     pub(crate) fn snapshot(&self) -> NodeRuntimeInner {
@@ -1264,6 +1281,7 @@ impl NodeRuntime {
         instruction_set: DataPlaneInstructionSet,
         registrations: &[NodeFunctionRegistration],
     ) -> RuntimeResult<()> {
+        self.ensure_topology_owner()?;
         let Some(node_name) = self.node_name(node)? else {
             return Ok(());
         };
@@ -1390,6 +1408,7 @@ impl NodeRuntime {
         handle: NodeHandle,
         descriptor: NodeDescriptor<'_>,
     ) -> RuntimeResult<NodeId> {
+        self.ensure_topology_owner()?;
         let mut inner = self.inner.borrow_mut();
         if inner.handles.contains_key(&handle) {
             return Err(RuntimeError::invariant("node handle already registered"));
@@ -1416,6 +1435,7 @@ impl NodeRuntime {
         initial_nexts: &[NodeId],
         trace_formatter: Option<TraceFormatter>,
     ) -> RuntimeResult<NodeId> {
+        self.ensure_topology_owner()?;
         let mut inner = self.inner.borrow_mut();
         inner.register_function_declared(
             kind,
@@ -1439,6 +1459,7 @@ impl NodeRuntime {
     where
         N: InternalNode + Node,
     {
+        self.ensure_topology_owner()?;
         let mut inner = self.inner.borrow_mut();
         inner.register_function_declared(
             NodeKind::Internal,
@@ -1462,6 +1483,7 @@ impl NodeRuntime {
     where
         N: DriverNode + Node,
     {
+        self.ensure_topology_owner()?;
         let mut inner = self.inner.borrow_mut();
         inner.register_function_declared(
             NodeKind::Driver,
@@ -1478,6 +1500,7 @@ impl NodeRuntime {
     /// Resolve pending next-node names into `NodeId`s after all graph nodes
     /// are registered (VPP `vlib_node_main_init` name-resolution pass).
     pub fn resolve_named_next_nodes(&self) -> RuntimeResult<()> {
+        self.ensure_topology_owner()?;
         self.inner.borrow_mut().resolve_named_next_nodes()
     }
 
@@ -1569,7 +1592,7 @@ impl NodeRuntime {
         Ok(())
     }
 
-    pub(crate) fn mark_interrupt_pending(&self, node: NodeId) -> RuntimeResult<bool> {
+    pub fn mark_interrupt_pending(&self, node: NodeId) -> RuntimeResult<bool> {
         let mut inner = self.inner.borrow_mut();
         inner.validate_node(node)?;
         let slot = node.slot() as usize;
@@ -1587,6 +1610,16 @@ impl NodeRuntime {
                 }
             }
         }
+    }
+
+    pub(crate) fn next_interrupt_pending(&self, start: usize) -> Option<NodeId> {
+        self.inner
+            .borrow()
+            .interrupt_pending
+            .iter()
+            .enumerate()
+            .skip(start)
+            .find_map(|(slot, pending)| pending.then_some(NodeId::new(slot as u32)))
     }
 
     pub(crate) fn clear_interrupt_pending(&self, node: NodeId) -> RuntimeResult<()> {
@@ -1696,6 +1729,7 @@ impl NodeRuntime {
     }
 
     pub fn set_node_next_slot(&self, node: NodeId, slot: usize, next: NodeId) -> RuntimeResult<()> {
+        self.ensure_topology_owner()?;
         let mut inner = self.inner.borrow_mut();
         inner.validate_node(node)?;
         inner.validate_node(next)?;
@@ -1703,6 +1737,7 @@ impl NodeRuntime {
     }
 
     pub fn add_node_next_slot(&self, node: NodeId, next: NodeId) -> RuntimeResult<u16> {
+        self.ensure_topology_owner()?;
         let mut inner = self.inner.borrow_mut();
         inner.add_node_next_slot(node, next)
     }

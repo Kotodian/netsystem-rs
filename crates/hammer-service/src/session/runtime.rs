@@ -186,10 +186,9 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
         let signal_read = unsafe { BorrowedFd::borrow_raw(signal_read_fd) }
             .try_clone_to_owned()
             .map_err(|source| AttachError::SessionSignalDuplicate { source })?;
-        let worker = engine.data_worker_id()?;
-        let file = engine.file_main_mut()?.add(File::new(
+        engine.data_worker_id()?;
+        let file = engine.file_main_mut().add(File::new(
             signal_read,
-            worker,
             "SVM session queue app-to-dataplane signal".to_owned(),
             u64::from(session_queue.slot()),
             FileFunctions {
@@ -206,7 +205,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
         let Some(file) = self.readiness_file else {
             return Ok(());
         };
-        let _ = engine.file_main_mut()?.delete(file)?;
+        let _ = engine.file_main_mut().delete(file)?;
         self.readiness_file = None;
         Ok(())
     }
@@ -806,10 +805,12 @@ where
     Ok(SessionQueueStep { scheduled_sessions })
 }
 
-fn schedule_session_queue(file: &mut File) -> RuntimeResult<()> {
+fn schedule_session_queue(
+    graph: &hammer_runtime::NodeRuntime,
+    file: &mut File,
+) -> RuntimeResult<()> {
     let node = hammer_core::data_plane::NodeId::new(file.private_data() as u32);
-    Engine::with_current(|engine| engine.runtime.schedule_empty_frame(node))
-        .expect("File callbacks run on their polling Engine")?;
+    let _ = graph.mark_interrupt_pending(node)?;
     Ok(())
 }
 

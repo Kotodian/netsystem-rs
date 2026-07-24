@@ -77,9 +77,9 @@ fn engine_spawn_uses_initialized_runtime_view_for_inherited_numa() {
 #[test]
 fn runtime_config_builds_per_numa_worker_views_without_global_lookup() {
     let runtime = DataPlaneRuntime::new(runtime_config(&[0, 1], 0));
-    let main = runtime.for_worker(0, 0);
-    let worker_same_numa = runtime.for_worker(3, 0);
-    let worker_other_numa = runtime.for_worker(4, 1);
+    let main = runtime.for_worker(0, 0).expect("main runtime fork");
+    let worker_same_numa = runtime.for_worker(3, 0).expect("same-NUMA runtime fork");
+    let worker_other_numa = runtime.for_worker(4, 1).expect("other-NUMA runtime fork");
 
     assert_eq!(main.active_numa_node(), 0);
     assert_eq!(worker_same_numa.active_numa_node(), 0);
