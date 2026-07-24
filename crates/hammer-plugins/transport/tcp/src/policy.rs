@@ -101,7 +101,3 @@ pub fn active_tcp_policy() -> TcpPolicy {
 pub fn publish_tcp_policy(policy: TcpPolicy) {
     TCP_POLICY.store(Some(Arc::new(policy)));
 }
-
-pub fn reset_tcp_policy_for_test() {
-    TCP_POLICY.store(None);
-}

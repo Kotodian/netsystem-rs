@@ -28,6 +28,7 @@ pub mod segment;
 pub mod simd;
 pub mod spinlock;
 pub mod svm_region;
+pub mod thread_owned;
 pub mod timer_wheel;
 
 pub use main_heap::PageSize;

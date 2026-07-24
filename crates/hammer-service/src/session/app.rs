@@ -31,7 +31,6 @@ fn checked_add_ooo_accepted(total: u32, accepted: u32) -> RuntimeResult<u32> {
 }
 
 pub struct SessionAppRuntime<S: SessionSegment> {
-    buffers: DataPlaneBuffers,
     session_slots: Vec<Option<(SessionId, Arc<AppSession<S>>)>>,
     tx_evt_q: Arc<S::EventQueue>,
     worker_index: usize,
@@ -41,7 +40,6 @@ pub struct SessionAppRuntime<S: SessionSegment> {
 impl<S: SessionSegment> fmt::Debug for SessionAppRuntime<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SessionAppRuntime")
-            .field("buffers", &self.buffers)
             .field("session_slots", &self.session_slots)
             .field("msg_queue_slots", &self.session_slots.len())
             .finish_non_exhaustive()
@@ -52,13 +50,11 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
     #[inline]
     pub fn new(
         session_capacity: usize,
-        buffers: DataPlaneBuffers,
         tx_evt_q: Arc<S::EventQueue>,
         worker_index: usize,
         seg: S,
     ) -> Self {
         Self {
-            buffers,
             session_slots: vec![None; session_capacity],
             tx_evt_q,
             worker_index,
@@ -165,6 +161,7 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
 
     pub fn copy_tx_to_buffer(
         &self,
+        buffers: &DataPlaneBuffers,
         session_id: SessionId,
         tx_offset: usize,
         payload_len: usize,
@@ -177,10 +174,10 @@ impl<S: SessionSegment> SessionAppRuntime<S> {
             .tx_fifo()
             .peek_segments(tx_offset, payload_len, |first, second| {
                 if !first.is_empty() {
-                    self.buffers.append(index, first)?;
+                    buffers.append(index, first)?;
                 }
                 if !second.is_empty() {
-                    self.buffers.append(index, second)?;
+                    buffers.append(index, second)?;
                 }
                 RuntimeResult::Ok(first.len() + second.len())
             })
@@ -345,15 +342,7 @@ impl SessionAppRuntime<Local> {
             SessionMsgQueue::with_cfg(2048, 1024)
                 .map_err(|_| SessionAppRuntimeError::TxEventQueue)?,
         );
-        let config = hammer_runtime::config::Worker::default();
-        let runtime = config.create_runtime()?;
-        Ok(Self::new(
-            1024,
-            runtime.buffers().clone(),
-            tx_evt_q,
-            0,
-            Local::default(),
-        ))
+        Ok(Self::new(1024, tx_evt_q, 0, Local::default()))
     }
 }
 

@@ -2,8 +2,10 @@
 
 use std::sync::Arc;
 
+use hammer_infra::pool::Index as PoolIndex;
+use hammer_runtime::app::AppSessionConfig;
 use hammer_runtime::attach::AppServer;
-use hammer_runtime::{RuntimeError, RuntimeResult};
+use hammer_runtime::{Engine, NodeState, RuntimeError, RuntimeResult};
 
 pub mod app;
 pub mod config;
@@ -27,13 +29,40 @@ pub use runtime::SessionWorker;
     early = true,
     runs_after = ["runtime_worker_config"]
 )]
-fn configure_session(config: config::NetworkSessionConfig) -> RuntimeResult<Option<Arc<Session>>> {
-    let Some(session) = config.session else {
-        return Ok(None);
-    };
+fn configure_session(config: config::NetworkSessionConfig) -> RuntimeResult<Arc<Session>> {
+    let session = config.session.unwrap_or_default();
     session.validate()?;
-    crate::transport::publish_session_backend(session.backend);
-    Ok(Some(Arc::new(session)))
+    Ok(Arc::new(session))
+}
+
+#[hammer_component_macros::init_function(name = "session_init")]
+fn init_session(engine: &mut Engine) -> RuntimeResult<Arc<runtime::SessionMain>> {
+    Ok(Arc::new(runtime::SessionMain::new(
+        engine.configured_worker_count(),
+    )))
+}
+
+#[hammer_component_macros::worker_init_function(name = "session_worker_init")]
+fn init_session_worker(
+    engine: &mut Engine,
+    session: Arc<Session>,
+    main: Arc<runtime::SessionMain>,
+) -> RuntimeResult<()> {
+    let worker = engine.data_worker_id()?;
+    let session_queue = engine
+        .runtime
+        .node_by_name("session-queue")
+        .ok_or_else(|| RuntimeError::subsystem("session", error::SessionQueueError::NodeMissing))?;
+    engine
+        .runtime
+        .nodes()
+        .set_node_state(session_queue, NodeState::Disabled)?;
+    let sessions = SessionWorker::<PoolIndex>::with_session_config(
+        worker,
+        session.backend,
+        AppSessionConfig::default(),
+    );
+    runtime::install_session_worker(&main, engine, session_queue, sessions)
 }
 
 #[hammer_component_macros::init_function(name = "session_attach_server")]

@@ -6,14 +6,14 @@ use std::time::Instant;
 
 use hammer_core::data_plane::{BufferFrame, NodeId, NodeState};
 use hammer_infra::pool::Index;
-use hammer_infra::segment::{Local, Svm};
 use hammer_runtime::RuntimeRegistry;
-use hammer_runtime::app::{AppSessionConfig, SessionEventQueue, SessionEvt, SessionEvtType};
+use hammer_runtime::app::AppSessionConfig;
 use hammer_runtime::{
     DataPlaneRuntime, DataPlaneRuntimeConfig, Engine, InternalNode, Node, NodeProcessFn,
     NodeResult, NodeRuntimeData,
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
+use hammer_service::session::SessionBackend;
 use hammer_service::session::node::{
     SessionQueueNext, SessionQueueNode, SessionQueueOutput, register_session_queue_node,
 };
@@ -51,14 +51,14 @@ fn descriptor_identity(fd: RawFd) -> std::io::Result<(libc::dev_t, libc::ino_t)>
 
 struct RecordingTransport(Arc<Mutex<Vec<&'static str>>>);
 
-impl SessionTransport<Index, Svm> for RecordingTransport {
+impl SessionTransport<Index> for RecordingTransport {
     type Tx = TransportInternalTx;
 
     const ID: SessionTransportId = SessionTransportId::new(1);
 
     fn update_time(
         &mut self,
-        _: &mut SessionWorker<Index, Svm>,
+        _: &mut SessionWorker<Index>,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
         _: &mut BufferFrame,
@@ -71,7 +71,7 @@ impl SessionTransport<Index, Svm> for RecordingTransport {
 
     fn disconnect(
         &mut self,
-        _: &mut SessionWorker<Index, Svm>,
+        _: &mut SessionWorker<Index>,
         _: Index,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
@@ -84,10 +84,10 @@ impl SessionTransport<Index, Svm> for RecordingTransport {
     }
 }
 
-impl TransportInternalTransport<Index, Svm> for RecordingTransport {
+impl TransportInternalTransport<Index> for RecordingTransport {
     fn internal_tx(
         &mut self,
-        _: &mut SessionWorker<Index, Svm>,
+        _: &mut SessionWorker<Index>,
         _: Index,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
@@ -100,7 +100,7 @@ impl TransportInternalTransport<Index, Svm> for RecordingTransport {
 }
 
 struct TestWorker {
-    sessions: SessionWorker<Index, Svm>,
+    sessions: SessionWorker<Index>,
     transport: RecordingTransport,
 }
 
@@ -178,7 +178,7 @@ fn worker_engine() -> (Engine, NodeId, NodeRuntimeData, SessionQueueNext) {
 fn local_session_worker_does_not_register_file_readiness() {
     let (mut engine, session_queue, _, _) = worker_engine();
     let worker = engine.data_worker_id().expect("data worker id");
-    let mut sessions = SessionWorker::<Index, Local>::new(worker, engine.runtime.buffers().clone());
+    let mut sessions = SessionWorker::<Index>::new(worker);
 
     sessions
         .install_queue_readiness(&mut engine, session_queue)
@@ -202,9 +202,9 @@ fn svm_readiness_marks_session_queue_before_main_loop_dispatch() {
     SessionQueueNode::install_worker_attachment(node_data, output_next, dispatch_test_worker)
         .expect("install session queue transport dispatch");
 
-    let mut sessions = SessionWorker::<Index, Svm>::new_svm(
+    let mut sessions = SessionWorker::<Index>::with_session_config(
         worker,
-        engine.runtime.buffers().clone(),
+        SessionBackend::Svm,
         AppSessionConfig::default(),
     );
     let session_id = sessions.insert_session_for_test(RecordingTransport::ID, Index::new(7, 1));
@@ -223,16 +223,7 @@ fn svm_readiness_marks_session_queue_before_main_loop_dispatch() {
         .expect("enable session queue interrupts");
 
     with_test_worker_mut(|worker| {
-        worker
-            .sessions
-            .app()
-            .tx_evt_q()
-            .enqueue_ctrl(SessionEvt::ctrl(
-                session_id.pool_index().slot(),
-                worker.sessions.worker().slot() as u32,
-                SessionEvtType::Close,
-            ))
-            .expect("app writes close event");
+        worker.sessions.signal_queue();
         Ok(())
     })
     .expect("queue close event");
@@ -272,20 +263,12 @@ fn svm_readiness_marks_session_queue_before_main_loop_dispatch() {
 fn replacing_svm_session_worker_removes_the_old_file_before_queue_release() {
     let (mut engine, session_queue, _, _) = worker_engine();
     let worker = engine.data_worker_id().expect("data worker id");
-    let mut first = SessionWorker::<Index, Svm>::new_svm(
+    let mut first = SessionWorker::<Index>::with_session_config(
         worker,
-        engine.runtime.buffers().clone(),
+        SessionBackend::Svm,
         AppSessionConfig::default(),
     );
-    first
-        .app()
-        .tx_evt_q()
-        .enqueue_ctrl(SessionEvt::ctrl(
-            1,
-            worker.slot() as u32,
-            SessionEvtType::Close,
-        ))
-        .expect("signal first worker");
+    first.signal_queue();
     first
         .install_queue_readiness(&mut engine, session_queue)
         .expect("install first readiness");
@@ -294,9 +277,9 @@ fn replacing_svm_session_worker_removes_the_old_file_before_queue_release() {
         .expect("remove first readiness before queue release");
     drop(first);
 
-    let mut second = SessionWorker::<Index, Svm>::new_svm(
+    let mut second = SessionWorker::<Index>::with_session_config(
         worker,
-        engine.runtime.buffers().clone(),
+        SessionBackend::Svm,
         AppSessionConfig::default(),
     );
     second
@@ -311,15 +294,7 @@ fn replacing_svm_session_worker_removes_the_old_file_before_queue_release() {
             .expect("old readiness must be removed"),
         0
     );
-    second
-        .app()
-        .tx_evt_q()
-        .enqueue_ctrl(SessionEvt::ctrl(
-            2,
-            worker.slot() as u32,
-            SessionEvtType::Close,
-        ))
-        .expect("signal replacement worker");
+    second.signal_queue();
     assert_eq!(
         engine
             .file_main_mut()
@@ -337,15 +312,13 @@ fn worker_teardown_closes_session_queue_and_file_descriptors() {
     let (descriptor, identity) = thread::spawn(|| {
         let (mut engine, session_queue, _, _) = worker_engine();
         let worker = engine.data_worker_id().expect("data worker id");
-        let mut sessions = SessionWorker::<Index, Svm>::new_svm(
+        let mut sessions = SessionWorker::<Index>::with_session_config(
             worker,
-            engine.runtime.buffers().clone(),
+            SessionBackend::Svm,
             AppSessionConfig::default(),
         );
         let descriptor = sessions
-            .app()
-            .tx_evt_q()
-            .read_fd()
+            .queue_signal_descriptor()
             .expect("SVM queue read descriptor");
         let identity = descriptor_identity(descriptor).expect("queue descriptor identity");
         sessions

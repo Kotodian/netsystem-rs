@@ -2,10 +2,16 @@
 
 ## Status
 
-Proposed. This document is the approval gate for the new interfaces listed in
-the final section. It does not preserve the current TCP worker TLS, the
-Session TX strategy trait family, or generic `TcpConnection<C>` worker
-instantiations.
+Rejected and superseded for worker-state ownership. Do not implement the typed
+Graph Node State or shared graph-state capability proposed below. Vendored VPP
+keeps graph dispatch runtime in `vlib_node_runtime_t`, Session worker state in
+`session_main.wrk[thread]`, and TCP worker state in `tcp_main.wrk[thread]`; it
+does not provide a generic graph-owned registry for Session or transport
+business state.
+
+The congestion-selection analysis remains historical design context. The
+Graph Node State, shared TCP state capability, and transport-registration
+interfaces in this document are not approved implementation guidance.
 
 This proposal intentionally changes the current `AGENTS.md` rule requiring
 `TcpConnection<S, C>`. That rule cannot coexist with runtime congestion

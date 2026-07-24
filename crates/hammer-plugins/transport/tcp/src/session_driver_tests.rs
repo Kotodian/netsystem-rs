@@ -1,25 +1,25 @@
 //! TCP/session lifecycle tests through the adjacent worker state.
 
-use std::sync::Arc;
-
 use crate::{TcpCapabilities, TcpConnectionId, TcpPacket, TcpSegmentFlags, TcpState};
 use hammer_core::data_plane::NodeId;
 use hammer_infra::pool::Index;
-use hammer_infra::segment::Local;
-use hammer_runtime::app::{AppSession, AppSessionConfig, SessionHandle};
-use hammer_runtime::app::{SessionEvt, SessionEvtType};
 use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId};
 
 use hammer_service::data_plane::DropNode;
 use hammer_service::session::node::{SessionQueueNext, SessionQueueNode};
 use hammer_service::session::runtime::dispatch_session_queue_once;
 
-use crate::{TcpConnection, TcpWorker, TcpWorkerState, insert_tcp_session, rollback_tcp_session};
+use crate::{TcpConnection, TcpWorker, insert_tcp_session, rollback_tcp_session};
 use hammer_service::session::SessionId;
+use hammer_service::session::SessionWorker;
 
-fn tcp_session(state: &TcpWorkerState<Local>, session_id: SessionId) -> Option<&TcpConnection> {
-    let (_, index) = state.sessions.session_transport(session_id)?;
-    state.tcp.connections.get(index)
+fn tcp_session<'a>(
+    sessions: &SessionWorker<Index>,
+    tcp: &'a TcpWorker,
+    session_id: SessionId,
+) -> Option<&'a TcpConnection> {
+    let (_, index) = sessions.session_transport(session_id)?;
+    tcp.connections.get(index)
 }
 
 fn established_connection(session_id: SessionId) -> TcpConnection {
@@ -34,29 +34,12 @@ fn established_connection(session_id: SessionId) -> TcpConnection {
     )
 }
 
-fn worker_state(runtime: &DataPlaneRuntime) -> TcpWorkerState<Local> {
+fn worker_state(runtime: &DataPlaneRuntime) -> (SessionWorker<Index>, TcpWorker) {
     let worker = DataWorkerId::new(0);
-    TcpWorkerState::new(
-        hammer_service::session::SessionWorker::new(worker, runtime.buffers().clone()),
+    (
+        hammer_service::session::SessionWorker::new(worker),
         TcpWorker::new(worker),
     )
-}
-
-fn attach_app(state: &mut TcpWorkerState<Local>, session_id: SessionId) -> Arc<AppSession<Local>> {
-    let app = Arc::new(
-        AppSession::new_in_segment(
-            Local::default(),
-            AppSessionConfig::new(256, 16),
-            SessionHandle::new(session_id.pool_index().slot(), 0),
-            state.sessions.app().tx_evt_q().clone(),
-        )
-        .expect("app session"),
-    );
-    state
-        .sessions
-        .app_mut()
-        .attach_session(session_id, Arc::clone(&app));
-    app
 }
 
 fn session_queue(runtime: &DataPlaneRuntime) -> (NodeId, SessionQueueNext) {
@@ -75,78 +58,43 @@ fn session_queue(runtime: &DataPlaneRuntime) -> (NodeId, SessionQueueNext) {
 
 fn dispatch_session_queue(
     runtime: &DataPlaneRuntime,
-    state: &mut TcpWorkerState<Local>,
+    sessions: &mut SessionWorker<Index>,
+    tcp: &mut TcpWorker,
     owner: NodeId,
     output_next: SessionQueueNext,
 ) {
-    dispatch_session_queue_once(
-        runtime,
-        owner,
-        &mut state.sessions,
-        &mut state.tcp,
-        output_next,
-    )
-    .expect("dispatch session queue");
-}
-
-fn poll_app_events(app: &AppSession<Local>) -> Vec<SessionEvtType> {
-    let mut events = [SessionEvt::io(0, SessionEvtType::Connect); 4];
-    let count = app.poll_events(&mut events);
-    events[..count].iter().map(|event| event.evt_type).collect()
-}
-
-#[test]
-fn with_session_config_retains_custom_app_session_config() {
-    let config = AppSessionConfig::new(512, 8);
-    let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let worker = DataWorkerId::new(0);
-    let sessions = hammer_service::session::SessionWorker::with_session_config(
-        worker,
-        runtime.buffers().clone(),
-        config,
-    );
-    let state = TcpWorkerState::new(sessions, TcpWorker::new(worker));
-
-    assert_eq!(state.sessions.app_session_config(), config);
+    dispatch_session_queue_once(runtime, owner, sessions, tcp, output_next)
+        .expect("dispatch session queue");
 }
 
 #[test]
 fn app_close_is_recorded_before_tcp_disconnect() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let mut state = worker_state(&runtime);
-    let session_id =
-        insert_tcp_session(&mut state, established_connection).expect("insert TCP session");
-    let app = attach_app(&mut state, session_id);
-    app.tx_evt_q()
-        .enqueue_ctrl(SessionEvt::ctrl(
-            session_id.pool_index().slot(),
-            0,
-            SessionEvtType::Close,
-        ))
-        .expect("queue app close");
+    let (mut sessions, mut tcp) = worker_state(&runtime);
+    let session_id = insert_tcp_session(&mut sessions, &mut tcp, established_connection)
+        .expect("insert TCP session");
+    sessions.schedule_disconnect(session_id);
 
     let (owner, output_next) = session_queue(&runtime);
-    dispatch_session_queue(&runtime, &mut state, owner, output_next);
+    dispatch_session_queue(&runtime, &mut sessions, &mut tcp, owner, output_next);
 
-    assert!(state.sessions.has_session(session_id));
+    assert!(sessions.has_session(session_id));
     assert_eq!(
-        tcp_session(&state, session_id)
+        tcp_session(&sessions, &tcp, session_id)
             .expect("TCP connection")
             .state(),
         TcpState::FinWait1
     );
-    assert!(poll_app_events(&app).is_empty());
 }
 
 #[test]
 fn tcp_closed_publication_notifies_app_once_before_cleanup() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let mut state = worker_state(&runtime);
-    let session_id =
-        insert_tcp_session(&mut state, established_connection).expect("insert TCP session");
-    let app = attach_app(&mut state, session_id);
+    let (mut sessions, mut tcp) = worker_state(&runtime);
+    let session_id = insert_tcp_session(&mut sessions, &mut tcp, established_connection)
+        .expect("insert TCP session");
     let reset = {
-        let connection = tcp_session(&state, session_id).expect("TCP connection");
+        let connection = tcp_session(&sessions, &tcp, session_id).expect("TCP connection");
         TcpPacket {
             local: connection.remote(),
             remote: connection.local().expect("local address"),
@@ -163,53 +111,40 @@ fn tcp_closed_publication_notifies_app_once_before_cleanup() {
             payload_len: 0,
         }
     };
-    let (_, connection_index) = state
-        .sessions
+    let (_, connection_index) = sessions
         .session_transport(session_id)
         .expect("session transport");
-    state
-        .tcp
-        .receive_close_side_for_test(connection_index, &reset)
+    tcp.receive_close_side_for_test(connection_index, &reset)
         .expect("receive reset");
     assert_eq!(
-        tcp_session(&state, session_id)
+        tcp_session(&sessions, &tcp, session_id)
             .expect("TCP connection")
             .state(),
         TcpState::Closed
     );
-    state.sessions.mark_ready(session_id);
+    sessions.mark_ready(session_id);
 
     let (owner, output_next) = session_queue(&runtime);
-    dispatch_session_queue(&runtime, &mut state, owner, output_next);
+    dispatch_session_queue(&runtime, &mut sessions, &mut tcp, owner, output_next);
 
-    assert!(state.sessions.has_session(session_id));
-    assert!(tcp_session(&state, session_id).is_none());
-    assert_eq!(poll_app_events(&app), vec![SessionEvtType::Close]);
+    assert!(sessions.has_session(session_id));
+    assert!(tcp_session(&sessions, &tcp, session_id).is_none());
 
-    app.tx_evt_q()
-        .enqueue_ctrl(SessionEvt::ctrl(
-            session_id.pool_index().slot(),
-            0,
-            SessionEvtType::Close,
-        ))
-        .expect("queue app cleanup");
-    dispatch_session_queue(&runtime, &mut state, owner, output_next);
+    sessions.schedule_disconnect(session_id);
+    dispatch_session_queue(&runtime, &mut sessions, &mut tcp, owner, output_next);
 
-    assert!(!state.sessions.has_session(session_id));
-    assert!(poll_app_events(&app).is_empty());
+    assert!(!sessions.has_session(session_id));
 }
 
 #[test]
 fn rollback_discards_unpublished_session_without_close_notification() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let mut state = worker_state(&runtime);
-    let session_id =
-        insert_tcp_session(&mut state, established_connection).expect("insert TCP session");
-    let app = attach_app(&mut state, session_id);
+    let (mut sessions, mut tcp) = worker_state(&runtime);
+    let session_id = insert_tcp_session(&mut sessions, &mut tcp, established_connection)
+        .expect("insert TCP session");
 
-    assert!(rollback_tcp_session(&mut state, session_id).expect("rollback session"));
+    assert!(rollback_tcp_session(&mut sessions, &mut tcp, session_id).expect("rollback session"));
 
-    assert!(!state.sessions.has_session(session_id));
-    assert!(tcp_session(&state, session_id).is_none());
-    assert!(poll_app_events(&app).is_empty());
+    assert!(!sessions.has_session(session_id));
+    assert!(tcp_session(&sessions, &tcp, session_id).is_none());
 }

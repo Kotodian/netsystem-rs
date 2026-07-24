@@ -1,4 +1,5 @@
 use core::hint::spin_loop;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hammer_core::data_plane::{
@@ -269,22 +270,21 @@ fn data_worker_startup_is_transactional() {
     reset(INIT_FAILURE);
     let mut pool = engine_pool();
     let error = start_workers(pool.main_engine_mut()).expect_err("worker init must fail startup");
-    assert!(
-        error
-            .to_string()
-            .contains("injected worker initialization failure")
-    );
+    assert!(matches!(
+        error,
+        RuntimeError::WorkerExitedBeforeStartupBarrier { phase: "main-loop" }
+    ));
     assert_eq!(INITIALIZED.load(Ordering::Acquire), 0b01);
     assert_eq!(ABORT_OBSERVED.load(Ordering::Acquire), 1);
     stop_workers(&mut pool);
 
     reset(PANIC);
     let mut pool = engine_pool();
-    let error = start_workers(pool.main_engine_mut()).expect_err("worker panic must fail startup");
-    assert!(
-        error
-            .to_string()
-            .contains("init function `verify_worker_startup_contract` panicked")
+    let panic = catch_unwind(AssertUnwindSafe(|| start_workers(pool.main_engine_mut())))
+        .expect_err("worker panic must unwind startup");
+    assert_eq!(
+        panic.downcast_ref::<&str>().copied(),
+        Some("injected worker initialization panic")
     );
     assert_eq!(ABORT_OBSERVED.load(Ordering::Acquire), 1);
     stop_workers(&mut pool);

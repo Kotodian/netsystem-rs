@@ -4,15 +4,12 @@ use std::time::{Duration, Instant};
 use crate::TcpPacket;
 use crate::{TcpSeq, TcpState};
 use hammer_infra::pool::{Index, Pool};
-use hammer_runtime::app::SessionSegment;
 use hammer_runtime::{DataPlaneRuntime, DataWorkerId};
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use super::lookup::TcpLookupState;
 use super::timers::{TcpTimerKind, TcpTimers};
 use super::{TcpConnection, TcpNodeError, enqueue_tcp_segment};
-use hammer_service::session::SessionAppRuntime;
-use hammer_service::session::app::SessionAppRuntimeCreate;
 use hammer_service::session::node::{SessionQueueNext, SessionQueueOutput};
 use hammer_service::session::runtime::{
     SessionPacketizedTransport, SessionPacketizedTx, SessionTransport, SessionTransportId,
@@ -81,14 +78,11 @@ impl TcpWorker {
         Ok(())
     }
 
-    fn remove_closed_connection<Seg: SessionSegment>(
+    fn remove_closed_connection(
         &mut self,
-        sessions: &mut SessionWorker<Index, Seg>,
+        sessions: &mut SessionWorker<Index>,
         index: Index,
-    ) -> RuntimeResult<()>
-    where
-        SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-    {
+    ) -> RuntimeResult<()> {
         let Some(connection) = self.connections.get(index) else {
             return Ok(());
         };
@@ -104,19 +98,16 @@ impl TcpWorker {
         Ok(())
     }
 
-    fn control_output<Seg: SessionSegment>(
+    fn control_output(
         &mut self,
-        sessions: &mut SessionWorker<Index, Seg>,
+        sessions: &mut SessionWorker<Index>,
         index: Index,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
         frame: &mut hammer_core::data_plane::BufferFrame,
         output: &mut SessionQueueOutput,
         now: Instant,
-    ) -> RuntimeResult<()>
-    where
-        SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-    {
+    ) -> RuntimeResult<()> {
         let (session_id, segment, has_pending_sack) = {
             let Self {
                 connections,
@@ -127,7 +118,7 @@ impl TcpWorker {
                 .get_mut(index)
                 .ok_or(TcpNodeError::SessionMissing)?;
             let session_id = connection.session_id();
-            let has_pending_tx = sessions.app().has_pending_send(session_id);
+            let has_pending_tx = sessions.has_pending_send(session_id);
             let capabilities = lookup
                 .pending_open_capabilities(session_id)
                 .unwrap_or_default();
@@ -142,7 +133,7 @@ impl TcpWorker {
                 sessions.mark_ready(session_id);
             }
         }
-        let has_pending_tx = sessions.app().has_pending_send(session_id);
+        let has_pending_tx = sessions.has_pending_send(session_id);
         if segment.is_none() && !has_pending_tx && has_pending_sack {
             sessions.mark_ready(session_id);
         }
@@ -151,18 +142,14 @@ impl TcpWorker {
     }
 }
 
-impl<Seg> SessionTransport<Index, Seg> for TcpWorker
-where
-    Seg: SessionSegment,
-    SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-{
+impl SessionTransport<Index> for TcpWorker {
     type Tx = SessionPacketizedTx;
 
     const ID: SessionTransportId = SessionTransportId::new(1);
 
     fn update_time(
         &mut self,
-        sessions: &mut SessionWorker<Index, Seg>,
+        sessions: &mut SessionWorker<Index>,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
         frame: &mut hammer_core::data_plane::BufferFrame,
@@ -216,7 +203,7 @@ where
 
     fn disconnect(
         &mut self,
-        sessions: &mut SessionWorker<Index, Seg>,
+        sessions: &mut SessionWorker<Index>,
         index: Index,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
@@ -235,15 +222,11 @@ where
     }
 }
 
-impl<Seg> SessionPacketizedTransport<Index, Seg> for TcpWorker
-where
-    Seg: SessionSegment,
-    SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-{
+impl SessionPacketizedTransport<Index> for TcpWorker {
     #[inline]
     fn control_tx(
         &mut self,
-        sessions: &mut SessionWorker<Index, Seg>,
+        sessions: &mut SessionWorker<Index>,
         index: Index,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
@@ -256,7 +239,7 @@ where
 
     fn send_params(
         &mut self,
-        _: &mut SessionWorker<Index, Seg>,
+        _: &mut SessionWorker<Index>,
         index: Index,
         pending_len: usize,
         now: Instant,
@@ -290,7 +273,7 @@ where
 
     fn tx_action(
         &mut self,
-        sessions: &mut SessionWorker<Index, Seg>,
+        sessions: &mut SessionWorker<Index>,
         index: Index,
         batch: &[TxBatchBuffer],
         now: Instant,

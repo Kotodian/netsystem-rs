@@ -4647,21 +4647,27 @@ mod tests {
         assert_eq!(ace_delta(6, 1), 3);
     }
 
-    use crate::{TcpWorkerState, closing_session_for_test};
-    use hammer_infra::segment::Local;
+    use crate::{TcpWorker, closing_session_for_test};
+    use hammer_infra::pool::Index as PoolIndex;
     use hammer_service::session::SessionId;
+    use hammer_service::session::SessionWorker;
 
-    fn session(state: &TcpWorkerState<Local>, session_id: SessionId) -> Option<&TcpConnection> {
-        let (_, index) = state.sessions.session_transport(session_id)?;
-        state.tcp.connections.get(index)
+    fn session<'a>(
+        sessions: &SessionWorker<PoolIndex>,
+        tcp: &'a TcpWorker,
+        session_id: SessionId,
+    ) -> Option<&'a TcpConnection> {
+        let (_, index) = sessions.session_transport(session_id)?;
+        tcp.connections.get(index)
     }
 
-    fn session_mut(
-        state: &mut TcpWorkerState<Local>,
+    fn session_mut<'a>(
+        sessions: &SessionWorker<PoolIndex>,
+        tcp: &'a mut TcpWorker,
         session_id: SessionId,
-    ) -> Option<&mut TcpConnection> {
-        let (_, index) = state.sessions.session_transport(session_id)?;
-        state.tcp.connections.get_mut(index)
+    ) -> Option<&'a mut TcpConnection> {
+        let (_, index) = sessions.session_transport(session_id)?;
+        tcp.connections.get_mut(index)
     }
 
     fn peer_fin_packet(
@@ -4688,17 +4694,17 @@ mod tests {
     }
 
     fn drive_fin_ack_to_time_wait(
-        driver: &mut TcpWorkerState<Local>,
+        sessions: &SessionWorker<PoolIndex>,
+        tcp: &mut TcpWorker,
         session_id: SessionId,
         local: SocketAddr,
         remote: SocketAddr,
     ) {
-        let (_, index) = driver
-            .sessions
+        let (_, index) = sessions
             .session_transport(session_id)
             .expect("session transport");
         {
-            let worker = &mut driver.tcp;
+            let worker = &mut *tcp;
             let connection = worker.connections.get_mut(index).expect("connection");
             connection.on_session_close(index, &mut worker.timers);
             let _ = connection
@@ -4712,7 +4718,7 @@ mod tests {
                 .expect("prepare final output");
         }
         let (rcv_nxt, snd_nxt) = {
-            let connection = session(driver, session_id).expect("connection");
+            let connection = session(sessions, tcp, session_id).expect("connection");
             (connection.rcv_nxt(), connection.snd_nxt())
         };
         let packet = TcpPacket {
@@ -4730,29 +4736,27 @@ mod tests {
             payload_offset: 0,
             payload_len: 0,
         };
-        driver
-            .tcp
-            .receive_close_side_for_test(index, &packet)
+        tcp.receive_close_side_for_test(index, &packet)
             .expect("receive fin ack");
     }
 
     fn enter_close_wait_for_passive_close_test(
-        driver: &mut TcpWorkerState<Local>,
+        sessions: &SessionWorker<PoolIndex>,
+        tcp: &mut TcpWorker,
         session_id: SessionId,
         local: SocketAddr,
         remote: SocketAddr,
     ) {
         let (rcv_nxt, snd_nxt) = {
-            let connection = session(driver, session_id).expect("connection");
+            let connection = session(sessions, tcp, session_id).expect("connection");
             (connection.rcv_nxt(), connection.snd_nxt())
         };
         let packet = peer_fin_packet(local, remote, rcv_nxt, snd_nxt);
-        let (_, index) = driver
-            .sessions
+        let (_, index) = sessions
             .session_transport(session_id)
             .expect("session transport");
         let now = Instant::now();
-        let worker = &mut driver.tcp;
+        let worker = tcp;
         let connection = worker.connections.get_mut(index).expect("connection");
         let segment = connection
             .receive_established_with_timers(index, &mut worker.timers, &packet, now)
@@ -4767,19 +4771,18 @@ mod tests {
 
     #[test]
     fn tcp_passive_close_fin_in_established_enters_close_wait_and_acks() {
-        let (mut driver, session_id, local, remote) = closing_session_for_test();
+        let (sessions, mut tcp, session_id, local, remote) = closing_session_for_test();
 
         let (rcv_nxt, snd_nxt) = {
-            let connection = session(&driver, session_id).expect("connection");
+            let connection = session(&sessions, &tcp, session_id).expect("connection");
             (connection.rcv_nxt(), connection.snd_nxt())
         };
         let packet = peer_fin_packet(local, remote, rcv_nxt, snd_nxt);
-        let (_, index) = driver
-            .sessions
+        let (_, index) = sessions
             .session_transport(session_id)
             .expect("session transport");
         let now = Instant::now();
-        let worker = &mut driver.tcp;
+        let worker = &mut tcp;
         let connection = worker.connections.get_mut(index).expect("connection");
         let segment = connection
             .receive_established_with_timers(index, &mut worker.timers, &packet, now)
@@ -4798,15 +4801,14 @@ mod tests {
 
     #[test]
     fn tcp_passive_close_local_close_after_peer_fin_enters_last_ack() {
-        let (mut driver, session_id, local, remote) = closing_session_for_test();
+        let (sessions, mut tcp, session_id, local, remote) = closing_session_for_test();
 
-        enter_close_wait_for_passive_close_test(&mut driver, session_id, local, remote);
+        enter_close_wait_for_passive_close_test(&sessions, &mut tcp, session_id, local, remote);
 
-        let (_, index) = driver
-            .sessions
+        let (_, index) = sessions
             .session_transport(session_id)
             .expect("session transport");
-        let worker = &mut driver.tcp;
+        let worker = &mut tcp;
         let connection = worker.connections.get_mut(index).expect("connection");
         connection.on_session_close(index, &mut worker.timers);
         assert_eq!(connection.state(), TcpState::LastAck);
@@ -4814,15 +4816,14 @@ mod tests {
 
     #[test]
     fn tcp_passive_close_peer_ack_final_fin_closes() {
-        let (mut driver, session_id, local, remote) = closing_session_for_test();
+        let (sessions, mut tcp, session_id, local, remote) = closing_session_for_test();
 
-        enter_close_wait_for_passive_close_test(&mut driver, session_id, local, remote);
+        enter_close_wait_for_passive_close_test(&sessions, &mut tcp, session_id, local, remote);
 
-        let (_, index) = driver
-            .sessions
+        let (_, index) = sessions
             .session_transport(session_id)
             .expect("session transport");
-        let worker = &mut driver.tcp;
+        let worker = &mut tcp;
         let connection = worker.connections.get_mut(index).expect("connection");
         connection.on_session_close(index, &mut worker.timers);
         assert_eq!(connection.state(), TcpState::LastAck);
@@ -4849,23 +4850,23 @@ mod tests {
 
     #[test]
     fn tcp_fin_path_enters_time_wait_and_retains_session_until_expiry() {
-        let (mut driver, session_id, local, remote) = closing_session_for_test();
+        let (sessions, mut tcp, session_id, local, remote) = closing_session_for_test();
 
-        drive_fin_ack_to_time_wait(&mut driver, session_id, local, remote);
+        drive_fin_ack_to_time_wait(&sessions, &mut tcp, session_id, local, remote);
 
-        let connection = session(&driver, session_id).expect("session");
+        let connection = session(&sessions, &tcp, session_id).expect("session");
         assert_eq!(connection.state(), TcpState::TimeWait);
         assert!(connection.timer_state().is_active(TcpTimerKind::TimeWait));
     }
 
     #[test]
     fn tcp_time_wait_duplicate_fin_reacks_and_rearms_timer() {
-        let (mut driver, session_id, local, remote) = closing_session_for_test();
+        let (sessions, mut tcp, session_id, local, remote) = closing_session_for_test();
 
-        drive_fin_ack_to_time_wait(&mut driver, session_id, local, remote);
+        drive_fin_ack_to_time_wait(&sessions, &mut tcp, session_id, local, remote);
 
         let (rcv_nxt, snd_nxt) = {
-            let connection = session(&driver, session_id).expect("connection");
+            let connection = session(&sessions, &tcp, session_id).expect("connection");
             (connection.rcv_nxt(), connection.snd_nxt())
         };
         let duplicate_fin = TcpPacket {
@@ -4884,7 +4885,7 @@ mod tests {
             payload_len: 0,
         };
         let segment = receive_close_side_for_test(
-            session_mut(&mut driver, session_id).expect("connection"),
+            session_mut(&sessions, &mut tcp, session_id).expect("connection"),
             &duplicate_fin,
         )
         .expect("receive duplicate fin")
@@ -4894,7 +4895,7 @@ mod tests {
         let parsed = etherparse::TcpSlice::from_slice(&header[..header_len]).expect("parse tcp");
 
         assert!(parsed.ack());
-        let connection = session(&driver, session_id).expect("session");
+        let connection = session(&sessions, &tcp, session_id).expect("session");
         assert_eq!(connection.state(), TcpState::TimeWait);
         assert!(connection.timer_state().is_active(TcpTimerKind::TimeWait));
     }
