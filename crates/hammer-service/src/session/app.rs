@@ -14,13 +14,13 @@ use hammer_runtime::{RuntimeError, RuntimeResult};
 use crate::session::SessionId;
 
 #[derive(Debug, thiserror::Error)]
-enum SessionAppRuntimeError {
+enum AppWorkerError {
     #[error("session TX event queue allocation failed")]
     TxEventQueue,
 }
 
-impl From<SessionAppRuntimeError> for RuntimeError {
-    fn from(error: SessionAppRuntimeError) -> Self {
+impl From<AppWorkerError> for RuntimeError {
+    fn from(error: AppWorkerError) -> Self {
         RuntimeError::lifecycle("session app", error.to_string())
     }
 }
@@ -32,7 +32,7 @@ fn checked_add_ooo_accepted(total: u32, accepted: u32) -> RuntimeResult<u32> {
         .ok_or_else(|| RuntimeError::invariant("ooo rx accepted length overflow"))
 }
 
-pub struct SessionAppRuntime {
+pub struct AppWorker {
     session_slots: Vec<Option<(SessionId, Arc<AppSession>)>>,
     session_listeners: Vec<Option<u32>>,
     tx_evt_q: Arc<SessionMsgQueue>,
@@ -194,16 +194,16 @@ impl SegmentManager {
     }
 }
 
-impl fmt::Debug for SessionAppRuntime {
+impl fmt::Debug for AppWorker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SessionAppRuntime")
+        f.debug_struct("AppWorker")
             .field("session_slots", &self.session_slots)
             .field("msg_queue_slots", &self.session_slots.len())
             .finish_non_exhaustive()
     }
 }
 
-impl SessionAppRuntime {
+impl AppWorker {
     #[inline]
     pub fn new(
         session_capacity: usize,
@@ -487,12 +487,11 @@ impl SessionAppRuntime {
     }
 }
 
-impl SessionAppRuntime {
+impl AppWorker {
     #[inline]
     pub fn default_local() -> RuntimeResult<Self> {
         let tx_evt_q: Arc<SessionMsgQueue> = Arc::new(
-            SessionMsgQueue::with_cfg(2048, 1024)
-                .map_err(|_| SessionAppRuntimeError::TxEventQueue)?,
+            SessionMsgQueue::with_cfg(2048, 1024).map_err(|_| AppWorkerError::TxEventQueue)?,
         );
         Ok(Self::new(1024, tx_evt_q, 0))
     }
@@ -525,7 +524,7 @@ mod tests {
 
     #[test]
     fn drain_drops_events_for_unmapped_session_slot() {
-        let app = SessionAppRuntime::default_local().expect("app runtime");
+        let app = AppWorker::default_local().expect("app worker");
         app.tx_evt_q()
             .enqueue_ctrl(SessionEvt::ctrl(3, 0, SessionEvtType::Close))
             .expect("enqueue close");
@@ -547,7 +546,7 @@ mod tests {
 
     #[test]
     fn drain_drops_close_when_worker_index_mismatches() {
-        let mut app = SessionAppRuntime::default_local().expect("app runtime");
+        let mut app = AppWorker::default_local().expect("app worker");
         let session_id = SessionId::from(PoolIndex::new(5, 1));
         let session = Arc::new(
             AppSession::new_in_segment(
@@ -577,7 +576,7 @@ mod tests {
 
     #[test]
     fn drain_dispatches_close_with_matching_session_handle() {
-        let mut app = SessionAppRuntime::default_local().expect("app runtime");
+        let mut app = AppWorker::default_local().expect("app worker");
         let session_id = SessionId::from(PoolIndex::new(5, 1));
         let session = Arc::new(
             AppSession::new_in_segment(
@@ -606,9 +605,68 @@ mod tests {
             vec![(session_id.get(), SessionEvtType::Close)]
         );
     }
+
+    #[test]
+    fn listener_sessions_share_one_segment_manager() {
+        let mut app = AppWorker::default_local().expect("app worker");
+        let config = AppSessionConfig::new(64, 4);
+        for slot in 0..2 {
+            let session_id = SessionId::from(PoolIndex::new(slot, 1));
+            let handle = SessionHandle::new(slot, 0);
+            let session = app
+                .create_app_session(7, handle, config, app.tx_evt_q().clone())
+                .expect("listener session");
+            app.attach_session(session_id, session);
+        }
+
+        assert_eq!(app.listeners.len(), 1);
+        assert_eq!(app.listeners[&7].segments.len(), 1);
+    }
+
+    #[test]
+    fn listeners_have_independent_segment_managers() {
+        let mut app = AppWorker::default_local().expect("app worker");
+        let config = AppSessionConfig::new(64, 4);
+        for (slot, listener) in [(0, 7), (1, 9)] {
+            let session_id = SessionId::from(PoolIndex::new(slot, 1));
+            let handle = SessionHandle::new(slot, 0);
+            let session = app
+                .create_app_session(listener, handle, config, app.tx_evt_q().clone())
+                .expect("listener session");
+            app.attach_session(session_id, session);
+        }
+
+        assert_eq!(app.listeners.len(), 2);
+        assert_eq!(app.listeners[&7].segments.len(), 1);
+        assert_eq!(app.listeners[&9].segments.len(), 1);
+    }
+
+    #[test]
+    fn detached_session_storage_waits_for_last_session_reference() {
+        let mut app = AppWorker::default_local().expect("app worker");
+        let config = AppSessionConfig::new(64, 4);
+        let session_id = SessionId::from(PoolIndex::new(0, 1));
+        let handle = SessionHandle::new(0, 0);
+        let session = app
+            .create_app_session(7, handle, config, app.tx_evt_q().clone())
+            .expect("listener session");
+        app.attach_session(session_id, Arc::clone(&session));
+
+        let detached = app.detach_session(session_id).expect("detached session");
+        assert_eq!(app.listeners[&7].retired.len(), 1);
+        drop(detached);
+        drop(session);
+
+        let replacement = app
+            .create_app_session(7, handle, config, app.tx_evt_q().clone())
+            .expect("replacement session");
+        assert!(app.listeners[&7].retired.is_empty());
+        assert_eq!(app.listeners[&7].segments.len(), 1);
+        drop(replacement);
+    }
 }
 
-impl SessionAppRuntime {
+impl AppWorker {
     pub fn create_app_session(
         &mut self,
         listener: u32,

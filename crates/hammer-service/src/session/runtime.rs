@@ -17,7 +17,7 @@ use hammer_runtime::{DataPlaneRuntime, DataWorkerId, Engine, File, FileFunctions
 
 use crate::session::error::SessionQueueError;
 use crate::session::state::SessionState;
-use crate::session::{SessionAppRuntime, SessionId, SessionQueueNext};
+use crate::session::{AppWorker, SessionId, SessionQueueNext};
 
 const DEFAULT_SESSION_POOL_CAPACITY: usize = 1024;
 const DEFAULT_SESSION_TX_EVENT_CAPACITY: usize = 2048;
@@ -107,7 +107,7 @@ impl<Index> SessionEntry<Index> {
 pub struct SessionWorker<Index> {
     worker: DataWorkerId,
     entries: Pool<SessionEntry<Index>>,
-    app: SessionAppRuntime,
+    app: AppWorker,
     app_session_config: AppSessionConfig,
     session_work: Vec<SessionId>,
     session_work_scratch: Vec<SessionId>,
@@ -209,12 +209,12 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     }
 
     #[cfg(test)]
-    pub(crate) fn local_app(&self) -> &SessionAppRuntime {
+    pub(crate) fn local_app(&self) -> &AppWorker {
         &self.app
     }
 
     #[cfg(test)]
-    pub(crate) fn local_app_mut(&mut self) -> &mut SessionAppRuntime {
+    pub(crate) fn local_app_mut(&mut self) -> &mut AppWorker {
         &mut self.app
     }
 
@@ -545,7 +545,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             }
             .expect("fixed session TX event queue configuration"),
         );
-        let app = SessionAppRuntime::new(DEFAULT_SESSION_POOL_CAPACITY, tx_evt_q, worker.slot());
+        let app = AppWorker::new(DEFAULT_SESSION_POOL_CAPACITY, tx_evt_q, worker.slot());
         Self {
             worker,
             entries: Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),

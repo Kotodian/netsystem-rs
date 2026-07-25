@@ -155,6 +155,9 @@ fn recv_attach_message(
         tx_evt_q_off: metadata[3],
     };
     let segment_size = usize::try_from(metadata[4]).map_err(|_| AppClientError::OffsetOverflow)?;
+    if segment_size > isize::MAX as usize {
+        return Err(AppClientError::OffsetOverflow);
+    }
 
     Ok((fds, offsets, segment_size))
 }

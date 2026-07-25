@@ -17,7 +17,7 @@ pub mod protocol;
 pub mod runtime;
 pub mod state;
 
-pub use app::SessionAppRuntime;
+pub use app::AppWorker;
 pub use config::Session;
 pub use error::SessionQueueError;
 pub use id::SessionId;

@@ -109,7 +109,7 @@ impl AppSession {
     }
 
     /// Accessor for the transport-side tx event queue consumer.
-    /// Used by SessionAppRuntime to drain tx completion events.
+    /// Used by the session-layer AppWorker to drain tx completion events.
     #[inline]
     pub fn tx_evt_q(&self) -> &Arc<SessionMsgQueue> {
         &self.tx_evt_q
