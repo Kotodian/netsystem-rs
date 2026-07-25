@@ -40,21 +40,29 @@ jobs:
         run: make verify-dataplane-performance
 
   bihash-read-scaling:
-    name: Bihash read scaling [Linux]
-    runs-on: ubuntu-24.04
+    name: Bihash read scaling [${{ matrix.platform }}]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: Linux
+            runner: ubuntu-24.04
+          - platform: macOS
+            runner: macos-15
     steps:
-      - name: Checkout [Linux]
+      - name: Checkout [${{ matrix.platform }}]
         uses: actions/checkout@v4
-      - name: Install Rust [Linux]
+      - name: Install Rust [${{ matrix.platform }}]
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.96.0
-      - name: Cache Cargo [Linux]
+      - name: Cache Cargo [${{ matrix.platform }}]
         uses: Swatinem/rust-cache@v2
         with:
-          key: bihash-read-scaling-linux
-      - name: Check Bihash read scaling [Linux]
+          key: bihash-read-scaling-${{ matrix.platform }}
+      - name: Check Bihash read scaling [${{ matrix.platform }}]
         env:
           RUSTFLAGS: ""
         run: >-

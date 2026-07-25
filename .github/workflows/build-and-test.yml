@@ -14,18 +14,26 @@ concurrency:
 
 jobs:
   formatting:
-    name: Formatting [Linux]
-    runs-on: ubuntu-24.04
+    name: Formatting [${{ matrix.platform }}]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: Linux
+            runner: ubuntu-24.04
+          - platform: macOS
+            runner: macos-15
     steps:
-      - name: Checkout [Linux]
+      - name: Checkout [${{ matrix.platform }}]
         uses: actions/checkout@v4
-      - name: Install Rust [Linux]
+      - name: Install Rust [${{ matrix.platform }}]
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.96.0
           components: rustfmt
-      - name: Check formatting [Linux]
+      - name: Check formatting [${{ matrix.platform }}]
         run: cargo fmt --all -- --check
 
   workspace-build:

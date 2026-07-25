@@ -13,7 +13,7 @@ use hammer_runtime::app::SessionEvtType;
 use hammer_runtime::engine::{Engine, EnginePool};
 use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, RuntimeError, RuntimeRegistry};
 
-const ATTACH_SOCKET: &str = "/tmp/hammer-tun-tcp-lab.attach.sock";
+const ATTACH_SOCKET: &str = "/tmp/hammer-tcp-integration.attach.sock";
 const ECHO_BUFFER_BYTES: usize = 64 * 1024;
 const PLUGINS: [&str; 4] = ["tun", "ip", "tcp", "udp"];
 const LAB_CONFIG: &str = r#"
@@ -31,7 +31,7 @@ data_size = 2048
 buffers_per_numa = 2048
 
 [network.session]
-attach_socket_path = "/tmp/hammer-tun-tcp-lab.attach.sock"
+attach_socket_path = "/tmp/hammer-tcp-integration.attach.sock"
 preallocated_sessions = 64
 event_queue_length = 256
 ooo_capacity = 32
