@@ -35,7 +35,7 @@ jobs:
       TCP_TEST_ROUTE_PREFIX: 10.66.77.0/30
       TCP_TEST_ATTACH_SOCKET: /tmp/hammer-tcp-integration.attach.sock
       TCP_TEST_IPC_ADDRESS: 127.0.0.1:7399
-      TCP_TEST_DIAGNOSTICS: ${{ runner.temp }}/hammer-tcp-integration
+      TCP_TEST_DIAGNOSTICS: $RUNNER_TEMP/hammer-tcp-integration
     steps:
       - name: Checkout [${{ matrix.platform }}]
         uses: actions/checkout@v4
