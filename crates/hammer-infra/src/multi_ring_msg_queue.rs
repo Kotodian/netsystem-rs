@@ -82,7 +82,9 @@ impl MultiRingMsgQueue {
         validate_cfg(&cfg)?;
         let bytes = Self::layout_bytes(&cfg);
         let seg = Segment::local(bytes + 64);
-        let hdr_off = seg.alloc(bytes, 8);
+        let hdr_off = seg
+            .alloc(bytes, 8)
+            .expect("fresh queue segment has exact layout capacity");
         unsafe { Self::init_at(seg, hdr_off, &cfg) }
     }
 }
@@ -105,8 +107,14 @@ impl MultiRingMsgQueue {
         cfg: &MultiRingMsgQueueCfg<'_>,
     ) -> Result<Self, MultiRingMsgQueueError> {
         validate_cfg(cfg)?;
+        let layout = layout_bytes(cfg);
+        let hdr_offset = usize::try_from(hdr_offset).expect("queue offset exceeds usize");
+        let end = hdr_offset
+            .checked_add(layout)
+            .expect("queue layout end overflows usize");
+        assert!(end <= seg.size(), "queue layout exceeds segment bounds");
         let base = seg.base();
-        let hdr = unsafe { base.add(hdr_offset as usize) as *mut QueueHeader };
+        let hdr = unsafe { base.add(hdr_offset) as *mut QueueHeader };
         unsafe {
             std::ptr::write(
                 hdr,
@@ -122,7 +130,7 @@ impl MultiRingMsgQueue {
             );
         }
 
-        let mut offset = hdr_offset as usize + std::mem::size_of::<QueueHeader>();
+        let mut offset = hdr_offset + std::mem::size_of::<QueueHeader>();
         let descs = unsafe { base.add(offset) as *mut MsgDesc };
         offset += cfg.q_nitems as usize * std::mem::size_of::<MsgDesc>();
 

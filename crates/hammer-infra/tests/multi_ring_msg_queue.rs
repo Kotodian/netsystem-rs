@@ -235,7 +235,7 @@ fn svm_init_at_and_from_shared_roundtrip_preserves_payload() {
     };
     let bytes = MultiRingMsgQueue::layout_bytes(&cfg);
     let seg = Segment::shared_default();
-    let off = seg.alloc(bytes, 64);
+    let off = seg.alloc(bytes, 64).expect("queue allocation");
 
     let producer = unsafe { MultiRingMsgQueue::init_at(seg.clone(), off, &cfg) }.expect("init_at");
     write_u64(&producer, 0, 0x1111_2222_3333_4444).expect("io");

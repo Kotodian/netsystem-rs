@@ -125,10 +125,7 @@ impl Fifo {
 
     pub fn new(seg: Segment, capacity: usize) -> Result<Self, FifoError> {
         let bytes = Self::layout_bytes(capacity)?;
-        let hdr_off = seg.alloc(bytes, 64);
-        if hdr_off == u64::MAX {
-            return Err(FifoError::SegmentExhausted);
-        }
+        let hdr_off = seg.alloc(bytes, 64).ok_or(FifoError::SegmentExhausted)?;
         unsafe { Self::init_at(seg, hdr_off, capacity) }
     }
 
@@ -141,9 +138,14 @@ impl Fifo {
         hdr_offset: u64,
         capacity: usize,
     ) -> Result<Self, FifoError> {
-        Self::layout_bytes(capacity)?;
+        let layout = Self::layout_bytes(capacity)?;
+        let offset = usize::try_from(hdr_offset).expect("FIFO offset exceeds usize");
+        let end = offset
+            .checked_add(layout)
+            .expect("FIFO layout end overflows usize");
+        assert!(end <= seg.size(), "FIFO layout exceeds segment bounds");
         let base = seg.base();
-        let hdr = unsafe { base.add(hdr_offset as usize) as *mut FifoHeader };
+        let hdr = unsafe { base.add(offset) as *mut FifoHeader };
         let chunk_size = Self::chunk_data_size(capacity);
         let chunk_count = capacity / chunk_size;
         let first_chunk_off = hdr_offset + std::mem::size_of::<FifoHeader>() as u64;

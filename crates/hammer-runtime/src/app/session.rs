@@ -447,7 +447,11 @@ impl AppSession {
                 capacity: config.evt_q_capacity,
             }
         })?;
-        let evt_q_offset = seg.alloc(evt_q_bytes, 64);
+        let evt_q_offset =
+            seg.alloc(evt_q_bytes, 64)
+                .ok_or(AppSessionError::EventQueueCapacityInvalid {
+                    capacity: config.evt_q_capacity,
+                })?;
         let evt_q = Arc::new(
             unsafe {
                 SessionMsgQueue::init_at_with_signal(seg, evt_q_offset, q_nitems, ring_nitems)

@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use hammer_core::data_plane::{DataPlaneBuffers, Index};
+use hammer_infra::align::align_up;
+use hammer_infra::fifo::Fifo;
 use hammer_infra::segment::Segment;
 use hammer_runtime::app::{
     AppSession, SessionEventQueue, SessionEvt, SessionEvtType, SessionMsgQueue,
@@ -31,9 +34,164 @@ fn checked_add_ooo_accepted(total: u32, accepted: u32) -> RuntimeResult<u32> {
 
 pub struct SessionAppRuntime {
     session_slots: Vec<Option<(SessionId, Arc<AppSession>)>>,
+    session_listeners: Vec<Option<u32>>,
     tx_evt_q: Arc<SessionMsgQueue>,
     worker_index: usize,
-    seg: Segment,
+    listeners: HashMap<u32, SegmentManager>,
+}
+
+struct SegmentManager {
+    segments: Vec<Segment>,
+    allocations: HashMap<u64, SessionAllocation>,
+    retired: Vec<SessionAllocation>,
+}
+
+struct SessionAllocation {
+    segment: usize,
+    offset: u64,
+    bytes: usize,
+    session: Weak<AppSession>,
+}
+
+impl SegmentManager {
+    fn new() -> Self {
+        Self {
+            segments: Vec::new(),
+            allocations: HashMap::new(),
+            retired: Vec::new(),
+        }
+    }
+
+    fn create_session(
+        &mut self,
+        handle: hammer_runtime::app::SessionHandle,
+        config: hammer_runtime::app::AppSessionConfig,
+        tx_evt_q: Arc<SessionMsgQueue>,
+    ) -> Result<Arc<AppSession>, hammer_runtime::app::AppSessionError> {
+        let mut index = 0;
+        while index < self.retired.len() {
+            if self.retired[index].session.strong_count() == 0 {
+                let allocation = self.retired.swap_remove(index);
+                self.segments[allocation.segment].free(allocation.offset, allocation.bytes);
+            } else {
+                index += 1;
+            }
+        }
+        let fifo_bytes = align_up(
+            Fifo::layout_bytes(config.fifo_capacity).map_err(|_| {
+                hammer_runtime::app::AppSessionError::RxFifoCapacityInvalid {
+                    capacity: config.fifo_capacity,
+                }
+            })?,
+            64,
+        );
+        let ring_nitems = config.evt_q_capacity.max(1) as u32;
+        let q_nitems = (config.evt_q_capacity + 1).next_power_of_two().max(2) as u32;
+        let event_queue_bytes = align_up(
+            SessionMsgQueue::layout_bytes(q_nitems, ring_nitems).map_err(|_| {
+                hammer_runtime::app::AppSessionError::EventQueueCapacityInvalid {
+                    capacity: config.evt_q_capacity,
+                }
+            })?,
+            64,
+        );
+        let session_bytes = fifo_bytes
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(event_queue_bytes))
+            .expect("session segment layout exceeds addressable memory");
+        let allocation = self
+            .segments
+            .iter()
+            .enumerate()
+            .find_map(|(segment, storage)| {
+                storage
+                    .alloc(session_bytes, 64)
+                    .map(|offset| (segment, offset))
+            });
+        let (segment_index, offset) = match allocation {
+            Some(allocation) => allocation,
+            None => {
+                let segment_bytes = (1024 * 1024).max(
+                    session_bytes
+                        .checked_add(128)
+                        .expect("session segment size exceeds addressable memory"),
+                );
+                let segment = Segment::local(segment_bytes);
+                let offset = segment
+                    .alloc(session_bytes, 64)
+                    .expect("new listener segment has session layout capacity");
+                self.segments.push(segment);
+                (self.segments.len() - 1, offset)
+            }
+        };
+        let segment = self.segments[segment_index].clone();
+        let tx_fifo_offset = offset + fifo_bytes as u64;
+        let event_queue_offset = tx_fifo_offset + fifo_bytes as u64;
+        let session = (|| {
+            let mut rx_fifo =
+                unsafe { Fifo::init_at(segment.clone(), offset, config.fifo_capacity) }.map_err(
+                    |_| hammer_runtime::app::AppSessionError::RxFifoCapacityInvalid {
+                        capacity: config.fifo_capacity,
+                    },
+                )?;
+            rx_fifo.enable_ooo();
+            let tx_fifo =
+                unsafe { Fifo::init_at(segment.clone(), tx_fifo_offset, config.fifo_capacity) }
+                    .map_err(
+                        |_| hammer_runtime::app::AppSessionError::TxFifoCapacityInvalid {
+                            capacity: config.fifo_capacity,
+                        },
+                    )?;
+            let event_queue = unsafe {
+                SessionMsgQueue::init_at_with_signal(
+                    segment,
+                    event_queue_offset,
+                    q_nitems,
+                    ring_nitems,
+                )
+            }
+            .map_err(|_| {
+                hammer_runtime::app::AppSessionError::EventQueueCapacityInvalid {
+                    capacity: config.evt_q_capacity,
+                }
+            })?;
+            Ok::<_, hammer_runtime::app::AppSessionError>(Arc::new(AppSession::from_parts(
+                Arc::new(rx_fifo),
+                Arc::new(tx_fifo),
+                Arc::new(event_queue),
+                tx_evt_q,
+                handle,
+            )))
+        })();
+        let session = match session {
+            Ok(session) => session,
+            Err(error) => {
+                self.segments[segment_index].free(offset, session_bytes);
+                return Err(error);
+            }
+        };
+        self.allocations.insert(
+            handle.raw(),
+            SessionAllocation {
+                segment: segment_index,
+                offset,
+                bytes: session_bytes,
+                session: Arc::downgrade(&session),
+            },
+        );
+        Ok(session)
+    }
+
+    fn release_session(&mut self, handle: hammer_runtime::app::SessionHandle) {
+        let Some(allocation) = self.allocations.remove(&handle.raw()) else {
+            return;
+        };
+        if allocation.session.strong_count() == 0 {
+            self.segments[allocation.segment].free(allocation.offset, allocation.bytes);
+        } else {
+            self.retired.push(allocation);
+        }
+    }
 }
 
 impl fmt::Debug for SessionAppRuntime {
@@ -51,13 +209,13 @@ impl SessionAppRuntime {
         session_capacity: usize,
         tx_evt_q: Arc<SessionMsgQueue>,
         worker_index: usize,
-        seg: Segment,
     ) -> Self {
         Self {
             session_slots: vec![None; session_capacity],
+            session_listeners: vec![None; session_capacity],
             tx_evt_q,
             worker_index,
-            seg,
+            listeners: HashMap::new(),
         }
     }
 
@@ -81,7 +239,14 @@ impl SessionAppRuntime {
             .as_ref()
             .is_some_and(|(stored, _)| *stored == session_id)
         {
-            return entry.take().map(|(_, session)| session);
+            let session = entry.take().map(|(_, session)| session);
+            let listener = self.session_listeners[slot].take();
+            if let (Some(session), Some(listener)) = (&session, listener)
+                && let Some(manager) = self.listeners.get_mut(&listener)
+            {
+                manager.release_session(session.session_handle());
+            }
+            return session;
         }
         None
     }
@@ -329,7 +494,7 @@ impl SessionAppRuntime {
             SessionMsgQueue::with_cfg(2048, 1024)
                 .map_err(|_| SessionAppRuntimeError::TxEventQueue)?,
         );
-        Ok(Self::new(1024, tx_evt_q, 0, Segment::default()))
+        Ok(Self::new(1024, tx_evt_q, 0))
     }
 }
 
@@ -445,14 +610,20 @@ mod tests {
 
 impl SessionAppRuntime {
     pub fn create_app_session(
-        &self,
+        &mut self,
+        listener: u32,
         handle: hammer_runtime::app::SessionHandle,
         config: hammer_runtime::app::AppSessionConfig,
         tx_evt_q: Arc<SessionMsgQueue>,
     ) -> RuntimeResult<Arc<AppSession>> {
-        AppSession::new_in_segment(self.seg.clone(), config, handle, tx_evt_q)
-            .map(Arc::new)
-            .map_err(RuntimeError::from)
+        let session = self
+            .listeners
+            .entry(listener)
+            .or_insert_with(SegmentManager::new)
+            .create_session(handle, config, tx_evt_q)
+            .map_err(RuntimeError::from)?;
+        self.session_listeners[handle.session_index() as usize] = Some(listener);
+        Ok(session)
     }
 
     fn notify_rx(&self, session: &AppSession) {

@@ -128,7 +128,7 @@ fn svm_session_msg_queue_pipe_signal_wakes_consumer() {
     let (read_fd, write_fd) = pipe_nonblock();
     let seg = Segment::shared_default();
     let bytes = SessionMsgQueue::layout_bytes(8, 4).expect("layout");
-    let off = seg.alloc(bytes, 64);
+    let off = seg.alloc(bytes, 64).expect("queue allocation");
     drop(unsafe { SessionMsgQueue::init_at(seg.clone(), off, 8, 4) }.expect("init"));
 
     let producer = unsafe { SessionMsgQueue::from_shared(seg.clone(), off, None, Some(write_fd)) };
@@ -155,7 +155,7 @@ fn svm_session_msg_queue_owns_attached_signal_descriptors() {
 
     let seg = Segment::shared_default();
     let bytes = SessionMsgQueue::layout_bytes(8, 4).expect("layout");
-    let off = seg.alloc(bytes, 64);
+    let off = seg.alloc(bytes, 64).expect("queue allocation");
     drop(unsafe { SessionMsgQueue::init_at(seg.clone(), off, 8, 4) }.expect("init"));
 
     drop(unsafe { SessionMsgQueue::from_shared(seg, off, Some(fds[0]), Some(fds[1])) });
@@ -175,7 +175,7 @@ fn file_readiness_duplicate_closes_independently_of_queue_signal_owner() {
 
     let seg = Segment::shared_default();
     let bytes = SessionMsgQueue::layout_bytes(8, 4).expect("layout");
-    let off = seg.alloc(bytes, 64);
+    let off = seg.alloc(bytes, 64).expect("queue allocation");
     let queue =
         unsafe { SessionMsgQueue::init_at_with_signal(seg, off, 8, 4) }.expect("queue with signal");
     let queue_fd = queue.read_fd().expect("queue signal-read descriptor");

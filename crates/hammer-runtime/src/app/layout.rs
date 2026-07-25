@@ -43,10 +43,7 @@ impl SessionOffsets {
             .ok_or(FifoError::CapacityOutOfRange {
                 capacity: fifo_capacity,
             })?;
-        let rx_fifo_off = seg.alloc(bytes, 64);
-        if rx_fifo_off == u64::MAX {
-            return Err(FifoError::SegmentExhausted);
-        }
+        let rx_fifo_off = seg.alloc(bytes, 64).ok_or(FifoError::SegmentExhausted)?;
         let tx_fifo_off = rx_fifo_off + fifo_total as u64;
         let evt_q_off = tx_fifo_off + fifo_total as u64;
         let tx_evt_q_off = evt_q_off + evt_msgq_total as u64;

@@ -71,7 +71,7 @@ fn dispatch_session_queue(
 fn app_close_is_recorded_before_tcp_disconnect() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let (mut sessions, mut tcp) = worker_state(&runtime);
-    let session_id = insert_tcp_session(&mut sessions, &mut tcp, established_connection)
+    let session_id = insert_tcp_session(&mut sessions, &mut tcp, 0, established_connection)
         .expect("insert TCP session");
     sessions.schedule_disconnect(session_id);
 
@@ -91,7 +91,7 @@ fn app_close_is_recorded_before_tcp_disconnect() {
 fn tcp_closed_publication_notifies_app_once_before_cleanup() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let (mut sessions, mut tcp) = worker_state(&runtime);
-    let session_id = insert_tcp_session(&mut sessions, &mut tcp, established_connection)
+    let session_id = insert_tcp_session(&mut sessions, &mut tcp, 0, established_connection)
         .expect("insert TCP session");
     let reset = {
         let connection = tcp_session(&sessions, &tcp, session_id).expect("TCP connection");
@@ -140,7 +140,7 @@ fn tcp_closed_publication_notifies_app_once_before_cleanup() {
 fn rollback_discards_unpublished_session_without_close_notification() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let (mut sessions, mut tcp) = worker_state(&runtime);
-    let session_id = insert_tcp_session(&mut sessions, &mut tcp, established_connection)
+    let session_id = insert_tcp_session(&mut sessions, &mut tcp, 0, established_connection)
         .expect("insert TCP session");
 
     assert!(rollback_tcp_session(&mut sessions, &mut tcp, session_id).expect("rollback session"));

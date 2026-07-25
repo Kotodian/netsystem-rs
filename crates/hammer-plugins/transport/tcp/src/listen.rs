@@ -390,7 +390,7 @@ fn tcp_accept_listener_fast_open(
     packet: &TcpPacket,
 ) -> RuntimeResult<(Option<TcpSegment>, Option<SessionId>)> {
     let worker_id = sessions.worker();
-    let session_id = insert_tcp_session(sessions, tcp, |session_id: SessionId| {
+    let session_id = insert_tcp_session(sessions, tcp, listener_id, |session_id: SessionId| {
         let connection_id = TcpConnectionId::new(session_id.get());
         TcpConnection::new(
             Some(connection_id),
@@ -481,7 +481,7 @@ fn tcp_complete_listener_open(
         return Ok((None, None));
     };
     let worker_id = sessions.worker();
-    let session_id = insert_tcp_session(sessions, tcp, |session_id: SessionId| {
+    let session_id = insert_tcp_session(sessions, tcp, listener_id, |session_id: SessionId| {
         let connection_id = TcpConnectionId::new(session_id.get());
         let mut connection = TcpConnection::new(
             Some(connection_id),

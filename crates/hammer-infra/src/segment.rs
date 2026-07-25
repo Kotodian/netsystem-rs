@@ -80,7 +80,7 @@ impl Segment {
     }
 
     #[inline]
-    pub fn alloc(&self, bytes: usize, align: usize) -> u64 {
+    pub fn alloc(&self, bytes: usize, align: usize) -> Option<u64> {
         self.region.alloc(bytes, align)
     }
 
@@ -119,8 +119,8 @@ mod tests {
     #[test]
     fn local_allocation_returns_aligned_offsets() {
         let segment = Segment::local(4096);
-        let first = segment.alloc(128, 64);
-        let second = segment.alloc(128, 64);
+        let first = segment.alloc(128, 64).expect("first allocation");
+        let second = segment.alloc(128, 64).expect("second allocation");
         assert_eq!(first % 64, 0);
         assert_eq!(second % 64, 0);
         assert!(segment.shared_fd().is_none());
@@ -135,7 +135,7 @@ mod tests {
     #[test]
     fn attached_segment_observes_shared_bytes() {
         let owner = Segment::shared("hammer-test-attach", 4096).expect("shared segment");
-        let offset = owner.alloc(8, 8);
+        let offset = owner.alloc(8, 8).expect("shared allocation");
         unsafe {
             owner
                 .base()

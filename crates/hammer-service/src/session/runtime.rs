@@ -289,13 +289,16 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             .ok_or_else(|| RuntimeError::invariant("session pool capacity exhausted"))
     }
 
-    pub fn create_app_session(&mut self, session_id: SessionId) -> RuntimeResult<()> {
+    pub fn create_app_session(
+        &mut self,
+        session_id: SessionId,
+        listener: u32,
+    ) -> RuntimeResult<()> {
         let handle = SessionHandle::new(session_id.pool_index().slot(), self.worker.slot() as u32);
-        let session = self.app.create_app_session(
-            handle,
-            self.app_session_config,
-            self.app.tx_evt_q().clone(),
-        )?;
+        let tx_evt_q = self.app.tx_evt_q().clone();
+        let session =
+            self.app
+                .create_app_session(listener, handle, self.app_session_config, tx_evt_q)?;
         self.app.attach_session(session_id, session);
         Ok(())
     }
@@ -526,22 +529,23 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         app_session_config: AppSessionConfig,
     ) -> Self {
         let cap = DEFAULT_SESSION_TX_EVENT_CAPACITY.next_power_of_two().max(2) as u32;
-        let segment = Segment::default();
         let layout = SessionMsgQueue::layout_bytes(cap, cap.max(2))
             .expect("fixed session TX event queue layout");
-        let offset = segment.alloc(layout, 64);
+        let segment = Segment::local(
+            layout
+                .checked_add(128)
+                .expect("session event queue layout exceeds addressable memory"),
+        );
+        let offset = segment
+            .alloc(layout, 64)
+            .expect("session event queue segment capacity");
         let tx_evt_q = Arc::new(
             unsafe {
                 SessionMsgQueue::init_at_with_signal(segment.clone(), offset, cap, cap.max(2))
             }
             .expect("fixed session TX event queue configuration"),
         );
-        let app = SessionAppRuntime::new(
-            DEFAULT_SESSION_POOL_CAPACITY,
-            tx_evt_q,
-            worker.slot(),
-            segment,
-        );
+        let app = SessionAppRuntime::new(DEFAULT_SESSION_POOL_CAPACITY, tx_evt_q, worker.slot());
         Self {
             worker,
             entries: Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),

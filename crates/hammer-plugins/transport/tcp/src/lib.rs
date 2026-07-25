@@ -113,6 +113,7 @@ enum TcpWorkerError {
 pub(crate) fn insert_tcp_session<F>(
     sessions: &mut SessionWorker<PoolIndex>,
     tcp: &mut TcpWorker,
+    listener: u32,
     create: F,
 ) -> RuntimeResult<SessionId>
 where
@@ -120,7 +121,7 @@ where
 {
     let session_id =
         sessions.insert_creating_session(<TcpWorker as SessionTransport<PoolIndex>>::ID)?;
-    if let Err(error) = sessions.create_app_session(session_id) {
+    if let Err(error) = sessions.create_app_session(session_id, listener) {
         sessions.remove_session_entry(session_id);
         return Err(error);
     }
@@ -869,7 +870,7 @@ pub(crate) fn closing_session_for_test() -> (
     });
     let mut sessions = SessionWorker::new(worker);
     let mut tcp = TcpWorker::new(worker);
-    let session_id = insert_tcp_session(&mut sessions, &mut tcp, |session_id: SessionId| {
+    let session_id = insert_tcp_session(&mut sessions, &mut tcp, 0, |session_id: SessionId| {
         TcpConnection::established_for_time_wait_test(
             Some(crate::TcpConnectionId::new(session_id.get())),
             worker,
