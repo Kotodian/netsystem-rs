@@ -140,16 +140,16 @@ fn bench_fanout_256(c: &mut Criterion) {
         ("multi_next", FanoutPattern::Multi),
     ] {
         group.bench_function(BenchmarkId::from_parameter(name), |b| {
-            b.iter_batched(
+            b.iter_batched_ref(
                 || build_fixture(pattern),
-                |mut fixture| {
+                |fixture| {
                     fixture.runtime.with_current_node(fixture.owner, || {
                         fixture
                             .runtime
                             .enqueue_to_next(&mut fixture.frame, &fixture.nexts);
                     });
                 },
-                criterion::BatchSize::LargeInput,
+                criterion::BatchSize::PerIteration,
             );
         });
     }

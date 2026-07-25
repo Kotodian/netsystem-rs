@@ -41,7 +41,7 @@ pub struct AppWorker {
 }
 
 struct SegmentManager {
-    segments: Vec<Segment>,
+    segments: Vec<Option<Segment>>,
     allocations: HashMap<u64, SessionAllocation>,
     retired: Vec<SessionAllocation>,
 }
@@ -72,7 +72,7 @@ impl SegmentManager {
         while index < self.retired.len() {
             if self.retired[index].session.strong_count() == 0 {
                 let allocation = self.retired.swap_remove(index);
-                self.segments[allocation.segment].free(allocation.offset, allocation.bytes);
+                self.deallocate(allocation);
             } else {
                 index += 1;
             }
@@ -103,10 +103,12 @@ impl SegmentManager {
             .segments
             .iter()
             .enumerate()
-            .find_map(|(segment, storage)| {
-                storage
-                    .alloc(session_bytes, 64)
-                    .map(|offset| (segment, offset))
+            .find_map(|(segment, entry)| {
+                entry.as_ref().and_then(|storage| {
+                    storage
+                        .alloc(session_bytes, 64)
+                        .map(|offset| (segment, offset))
+                })
             });
         let (segment_index, offset) = match allocation {
             Some(allocation) => allocation,
@@ -120,11 +122,23 @@ impl SegmentManager {
                 let offset = segment
                     .alloc(session_bytes, 64)
                     .expect("new listener segment has session layout capacity");
-                self.segments.push(segment);
-                (self.segments.len() - 1, offset)
+                let segment_index = match self.segments.iter().position(Option::is_none) {
+                    Some(index) => {
+                        self.segments[index] = Some(segment);
+                        index
+                    }
+                    None => {
+                        self.segments.push(Some(segment));
+                        self.segments.len() - 1
+                    }
+                };
+                (segment_index, offset)
             }
         };
-        let segment = self.segments[segment_index].clone();
+        let segment = self.segments[segment_index]
+            .as_ref()
+            .expect("allocated listener segment is present")
+            .clone();
         let tx_fifo_offset = offset + fifo_bytes as u64;
         let event_queue_offset = tx_fifo_offset + fifo_bytes as u64;
         let session = (|| {
@@ -166,7 +180,10 @@ impl SegmentManager {
         let session = match session {
             Ok(session) => session,
             Err(error) => {
-                self.segments[segment_index].free(offset, session_bytes);
+                self.segments[segment_index]
+                    .as_ref()
+                    .expect("allocated listener segment is present")
+                    .free(offset, session_bytes);
                 return Err(error);
             }
         };
@@ -187,9 +204,25 @@ impl SegmentManager {
             return;
         };
         if allocation.session.strong_count() == 0 {
-            self.segments[allocation.segment].free(allocation.offset, allocation.bytes);
+            self.deallocate(allocation);
         } else {
             self.retired.push(allocation);
+        }
+    }
+
+    fn deallocate(&mut self, allocation: SessionAllocation) {
+        let segment_index = allocation.segment;
+        let entry = self.segments[segment_index]
+            .as_ref()
+            .expect("session allocation refers to a live listener segment");
+        entry.free(allocation.offset, allocation.bytes);
+        let segment_in_use = self
+            .allocations
+            .values()
+            .chain(self.retired.iter())
+            .any(|allocation| allocation.segment == segment_index);
+        if segment_index != 0 && !segment_in_use {
+            self.segments[segment_index] = None;
         }
     }
 }
@@ -663,6 +696,30 @@ mod tests {
         assert!(app.listeners[&7].retired.is_empty());
         assert_eq!(app.listeners[&7].segments.len(), 1);
         drop(replacement);
+    }
+
+    #[test]
+    fn listener_manager_keeps_segment_zero_and_releases_empty_growth_segment() {
+        let app = AppWorker::default_local().expect("app worker");
+        let mut manager = SegmentManager::new();
+        let config = AppSessionConfig::new(700_000, 4);
+        let segment_zero_handle = SessionHandle::new(0, 0);
+        let growth_segment_handle = SessionHandle::new(1, 0);
+        let segment_zero_session = manager
+            .create_session(segment_zero_handle, config, app.tx_evt_q().clone())
+            .expect("session in segment zero");
+        let growth_segment_session = manager
+            .create_session(growth_segment_handle, config, app.tx_evt_q().clone())
+            .expect("session in growth segment");
+
+        assert_eq!(manager.segments.len(), 2);
+        drop(growth_segment_session);
+        manager.release_session(growth_segment_handle);
+        assert!(manager.segments[1].is_none());
+
+        drop(segment_zero_session);
+        manager.release_session(segment_zero_handle);
+        assert!(manager.segments[0].is_some());
     }
 }
 

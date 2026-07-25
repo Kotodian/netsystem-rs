@@ -8,6 +8,7 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use crate::PageSize;
 use crate::segment::Segment;
 
 /// Configuration for one message data ring.
@@ -81,10 +82,16 @@ impl MultiRingMsgQueue {
     pub fn with_cfg(cfg: MultiRingMsgQueueCfg<'_>) -> Result<Self, MultiRingMsgQueueError> {
         validate_cfg(&cfg)?;
         let bytes = Self::layout_bytes(&cfg);
-        let seg = Segment::local(bytes + 64);
+        let page_size = PageSize::Default
+            .bytes()
+            .map_err(|_| MultiRingMsgQueueError::InvalidConfig)?;
+        let segment_bytes = bytes
+            .checked_add(page_size)
+            .ok_or(MultiRingMsgQueueError::InvalidConfig)?;
+        let seg = Segment::local(segment_bytes);
         let hdr_off = seg
             .alloc(bytes, 8)
-            .expect("fresh queue segment has exact layout capacity");
+            .expect("fresh queue segment has queue layout capacity");
         unsafe { Self::init_at(seg, hdr_off, &cfg) }
     }
 }

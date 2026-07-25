@@ -10,7 +10,7 @@ use crate::segment::Segment;
 #[repr(C)]
 struct Chunk {
     start_byte: u32,
-    length: u32,
+    length: AtomicU32,
     next: AtomicU64,
 }
 
@@ -27,10 +27,10 @@ pub struct FifoHeader {
     has_deq_ntf: AtomicU32,
     deq_thresh: AtomicU32,
     _pad0: [u8; 64 - (8 + 4 + 4 + 4 + 4 + 4 + 4 + 4)],
-    head_chunk: u64,
+    head_chunk: AtomicU64,
     head: AtomicU32,
     _pad1: [u8; 64 - (8 + 4)],
-    tail_chunk: u64,
+    tail_chunk: AtomicU64,
     tail: AtomicU32,
     _pad2: [u8; 64 - (8 + 4)],
 }
@@ -168,10 +168,10 @@ impl Fifo {
                     has_deq_ntf: AtomicU32::new(0),
                     deq_thresh: AtomicU32::new(0),
                     _pad0: [0; 64 - (8 + 4 + 4 + 4 + 4 + 4 + 4 + 4)],
-                    head_chunk: first_chunk_off,
+                    head_chunk: AtomicU64::new(first_chunk_off),
                     head: AtomicU32::new(0),
                     _pad1: [0; 64 - (8 + 4)],
-                    tail_chunk: first_chunk_off,
+                    tail_chunk: AtomicU64::new(first_chunk_off),
                     tail: AtomicU32::new(0),
                     _pad2: [0; 64 - (8 + 4)],
                 },
@@ -187,7 +187,7 @@ impl Fifo {
                     base.add(chunk_off as usize) as *mut Chunk,
                     Chunk {
                         start_byte: 0,
-                        length: 0,
+                        length: AtomicU32::new(0),
                         next: AtomicU64::new(if index == 0 { 0 } else { next }),
                     },
                 );
@@ -228,7 +228,7 @@ impl Fifo {
                             self.base.add(chunk_off as usize).cast::<Chunk>(),
                             Chunk {
                                 start_byte,
-                                length: 0,
+                                length: AtomicU32::new(0),
                                 next: AtomicU64::new(0),
                             },
                         );
@@ -268,6 +268,9 @@ impl Fifo {
         unsafe {
             let head = (*hdr).head.load(Ordering::Acquire);
             let tail = (*hdr).tail.load(Ordering::Relaxed);
+            if head == tail {
+                self.prepare_empty_tail_chunk(tail);
+            }
             let used = tail.wrapping_sub(head);
             let free = ((*hdr).size - used) as usize;
             let to_write = src.len().min(free);
@@ -303,12 +306,12 @@ impl Fifo {
                 return 0;
             }
             let logical_pos = head + offset as u32;
-            let mut chunk_off = (*hdr).head_chunk;
+            let mut chunk_off = (*hdr).head_chunk.load(Ordering::Relaxed);
             let mut copied = 0usize;
             let mut pos = logical_pos;
             while copied < to_copy && chunk_off != 0 {
                 let chunk = &*(self.base.add(chunk_off as usize) as *mut Chunk);
-                let chunk_end = chunk.start_byte + chunk.length;
+                let chunk_end = chunk.start_byte + chunk.length.load(Ordering::Relaxed);
                 if pos >= chunk.start_byte && pos < chunk_end {
                     let data_off = (pos - chunk.start_byte) as usize;
                     let chunk_avail = (chunk_end - pos) as usize;
@@ -348,10 +351,10 @@ impl Fifo {
                 return Some(f(&[], &[]));
             }
             let logical_pos = head + offset as u32;
-            let mut chunk_off = (*hdr).head_chunk;
+            let mut chunk_off = (*hdr).head_chunk.load(Ordering::Relaxed);
             while chunk_off != 0 {
                 let chunk = &*(self.base.add(chunk_off as usize) as *mut Chunk);
-                let chunk_end = chunk.start_byte + chunk.length;
+                let chunk_end = chunk.start_byte + chunk.length.load(Ordering::Relaxed);
                 if logical_pos >= chunk.start_byte && logical_pos < chunk_end {
                     let data_off = (logical_pos - chunk.start_byte) as usize;
                     let chunk_avail = (chunk_end - logical_pos) as usize;
@@ -368,7 +371,7 @@ impl Fifo {
                     let next_off = chunk.next.load(Ordering::Acquire);
                     if next_off != 0 {
                         let next_chunk = &*(self.base.add(next_off as usize) as *mut Chunk);
-                        let second_avail = next_chunk.length as usize;
+                        let second_avail = next_chunk.length.load(Ordering::Relaxed) as usize;
                         let second_actual = second_len.min(second_avail);
                         let second_slice = std::slice::from_raw_parts(
                             self.base.add(next_off as usize + CHUNK_HEADER_SIZE),
@@ -396,31 +399,40 @@ impl Fifo {
                 return 0;
             }
             let new_head = head + to_drop as u32;
-            let mut chunk_off = (*hdr).head_chunk;
+            let mut chunk_off = (*hdr).head_chunk.load(Ordering::Relaxed);
             while chunk_off != 0 {
                 let chunk = &*(self.base.add(chunk_off as usize) as *mut Chunk);
-                if new_head >= chunk.start_byte + chunk.length {
-                    if chunk_off == (*hdr).tail_chunk {
+                if new_head >= chunk.start_byte + chunk.length.load(Ordering::Relaxed) {
+                    if chunk_off == (*hdr).tail_chunk.load(Ordering::Acquire) {
                         break;
                     }
                     let next_off = chunk.next.load(Ordering::Acquire);
                     if next_off == 0 {
                         break;
                     }
-                    (*hdr).head_chunk = next_off;
+                    (*hdr).head_chunk.store(next_off, Ordering::Release);
                     self.release_chunk(chunk_off);
                     chunk_off = next_off;
                 } else {
                     break;
                 }
             }
-            if new_head == tail && (*hdr).head_chunk == (*hdr).tail_chunk {
-                let chunk = &mut *self.base.add((*hdr).head_chunk as usize).cast::<Chunk>();
-                chunk.start_byte = new_head;
-                chunk.length = 0;
-            }
             (*hdr).head.store(new_head, Ordering::Release);
             to_drop
+        }
+    }
+
+    // Rebase after observing the released head without discarding future OOO bytes.
+    unsafe fn prepare_empty_tail_chunk(&self, tail: u32) {
+        let chunk_off = unsafe { (*self.hdr).tail_chunk.load(Ordering::Relaxed) };
+        if chunk_off == 0 {
+            return;
+        }
+        let chunk = unsafe { &mut *self.base.add(chunk_off as usize).cast::<Chunk>() };
+        let visible_len = tail.wrapping_sub(chunk.start_byte);
+        if chunk.start_byte != tail && chunk.length.load(Ordering::Relaxed) <= visible_len {
+            chunk.start_byte = tail;
+            chunk.length.store(0, Ordering::Relaxed);
         }
     }
 
@@ -434,15 +446,15 @@ impl Fifo {
             let mut written = 0usize;
             let mut remaining_offset = offset;
             let mut remaining_src = src;
-            let mut chunk_off = (*hdr).tail_chunk;
+            let mut chunk_off = (*hdr).tail_chunk.load(Ordering::Relaxed);
 
             while !remaining_src.is_empty() {
                 if chunk_off == 0 {
                     let Some(new_off) = self.acquire_chunk(remaining_offset) else {
                         return written;
                     };
-                    (*hdr).head_chunk = new_off;
-                    (*hdr).tail_chunk = new_off;
+                    (*hdr).head_chunk.store(new_off, Ordering::Release);
+                    (*hdr).tail_chunk.store(new_off, Ordering::Release);
                     chunk_off = new_off;
                 }
 
@@ -453,7 +465,7 @@ impl Fifo {
                     if next_off != 0 {
                         let next = &*(self.base.add(next_off as usize) as *mut Chunk);
                         if remaining_offset >= next.start_byte {
-                            (*hdr).tail_chunk = next_off;
+                            (*hdr).tail_chunk.store(next_off, Ordering::Release);
                             chunk_off = next_off;
                             continue;
                         }
@@ -468,7 +480,7 @@ impl Fifo {
                     let new_chunk = &*self.base.add(new_off as usize).cast::<Chunk>();
                     new_chunk.next.store(next_off, Ordering::Relaxed);
                     chunk.next.store(new_off, Ordering::Release);
-                    (*hdr).tail_chunk = new_off;
+                    (*hdr).tail_chunk.store(new_off, Ordering::Release);
                     chunk_off = new_off;
                     continue;
                 }
@@ -487,8 +499,8 @@ impl Fifo {
                     to_write,
                 );
                 let new_used = data_off + to_write;
-                if new_used > chunk.length as usize {
-                    chunk.length = new_used as u32;
+                if new_used > chunk.length.load(Ordering::Relaxed) as usize {
+                    chunk.length.store(new_used as u32, Ordering::Relaxed);
                 }
                 written += to_write;
                 remaining_offset += to_write as u32;
@@ -509,7 +521,7 @@ impl Fifo {
             let mut remaining_offset = offset;
             let mut remaining_src = src;
 
-            let mut chunk_off = (*hdr).head_chunk;
+            let mut chunk_off = (*hdr).tail_chunk.load(Ordering::Acquire);
             let mut prev_off = 0u64;
 
             // Seek to the chunk covering remaining_offset
@@ -535,8 +547,8 @@ impl Fifo {
                             prev.next.store(new_off, Ordering::Release);
                         }
                     } else {
-                        (*hdr).head_chunk = new_off;
-                        (*hdr).tail_chunk = new_off;
+                        (*hdr).head_chunk.store(new_off, Ordering::Release);
+                        (*hdr).tail_chunk.store(new_off, Ordering::Release);
                     }
                     chunk_off = new_off;
                 }
@@ -554,8 +566,8 @@ impl Fifo {
                         to_write,
                     );
                     let new_used = data_off + to_write;
-                    if new_used > chunk.length as usize {
-                        chunk.length = new_used as u32;
+                    if new_used > chunk.length.load(Ordering::Relaxed) as usize {
+                        chunk.length.store(new_used as u32, Ordering::Relaxed);
                     }
                     written += to_write;
                     remaining_offset += to_write as u32;
@@ -695,7 +707,7 @@ impl Fifo {
     pub fn clear(&self) {
         let hdr = self.hdr;
         unsafe {
-            let mut chunk_off = (*hdr).head_chunk;
+            let mut chunk_off = (*hdr).head_chunk.load(Ordering::Relaxed);
             while chunk_off != 0 {
                 let chunk = &*(self.base.add(chunk_off as usize) as *mut Chunk);
                 let next_off = chunk.next.load(Ordering::Acquire);
@@ -707,8 +719,8 @@ impl Fifo {
                 .expect("a valid FIFO always retains at least one chunk");
             (*hdr).head.store(0, Ordering::Relaxed);
             (*hdr).tail.store(0, Ordering::Relaxed);
-            (*hdr).head_chunk = first_chunk;
-            (*hdr).tail_chunk = first_chunk;
+            (*hdr).head_chunk.store(first_chunk, Ordering::Relaxed);
+            (*hdr).tail_chunk.store(first_chunk, Ordering::Relaxed);
             (*hdr).has_event.store(0, Ordering::Relaxed);
             (*hdr).want_ntf.store(0, Ordering::Relaxed);
             (*hdr).want_deq_ntf.store(0, Ordering::Relaxed);
@@ -763,6 +775,10 @@ impl Fifo {
             return Err(());
         }
         let tail = unsafe { (*self.hdr).tail.load(Ordering::Acquire) };
+        let head = unsafe { (*self.hdr).head.load(Ordering::Acquire) };
+        if head == tail {
+            unsafe { self.prepare_empty_tail_chunk(tail) };
+        }
         bk.base = tail;
         let base = bk.base;
         let abs_pos = tail.wrapping_add(offset);
