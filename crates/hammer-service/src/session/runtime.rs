@@ -95,7 +95,7 @@ struct SessionEntry<Index> {
     schedule_pending: bool,
 }
 
-impl<Index> SessionEntry<Index> {
+impl<Index: Copy + Eq> SessionEntry<Index> {
     #[inline]
     const fn creating(transport: SessionTransportId) -> Self {
         Self {

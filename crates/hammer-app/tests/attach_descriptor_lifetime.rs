@@ -63,16 +63,12 @@ struct PublishedSession {
 /// offsets in shared segments, matching the daemon's listener layout.
 fn build_publication(handle: SessionHandle) -> PublishedSession {
     let counter = NAME_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let session_segment = Segment::shared(
-        &format!("hs{}-{counter}", std::process::id()),
-        1024 * 1024,
-    )
-    .expect("session segment");
-    let tx_event_segment = Segment::shared(
-        &format!("ht{}-{counter}", std::process::id()),
-        1024 * 1024,
-    )
-    .expect("tx event segment");
+    let session_segment =
+        Segment::shared(&format!("hs{}-{counter}", std::process::id()), 1024 * 1024)
+            .expect("session segment");
+    let tx_event_segment =
+        Segment::shared(&format!("ht{}-{counter}", std::process::id()), 1024 * 1024)
+            .expect("tx event segment");
 
     let ring_nitems = EVT_Q_CAPACITY as u32;
     let q_nitems = (EVT_Q_CAPACITY + 1).next_power_of_two() as u32;
@@ -227,7 +223,10 @@ fn assert_publish_then_connect_round_trips_handle_and_descriptors() {
     // App -> dataplane across the tx fifo and worker tx event queue.
     assert_eq!(client.send_bytes(b"pong").expect("client send"), 4);
     let mut echoed = [0_u8; 16];
-    let read = published.session.tx_fifo().peek(0, echoed.len(), &mut echoed);
+    let read = published
+        .session
+        .tx_fifo()
+        .peek(0, echoed.len(), &mut echoed);
     assert_eq!(&echoed[..read], b"pong");
     let event = published.session.tx_evt_q().dequeue().expect("tx event");
     assert_eq!(event.session_index(), handle.session_index());

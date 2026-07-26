@@ -516,7 +516,7 @@ impl<A: FeatureArcSpec> FeatureArcControl<A> {
             .as_ref()
             .ok_or(FeatureArcError::DataPlaneBarrierUnavailable)?;
         let mut published = None;
-        barrier.synchronize(|| {
+        barrier.synchronize(|| -> FeatureArcResult<()> {
             state.rebuild(nodes)?;
             published = Some(state.clone());
             inner.replace_after_barrier(state);

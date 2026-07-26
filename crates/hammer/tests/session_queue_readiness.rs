@@ -177,7 +177,7 @@ fn worker_engine() -> (Engine, NodeId, NodeRuntimeData, SessionQueueNext) {
 fn session_worker_readiness_is_idle_before_signal() {
     let (mut engine, session_queue, _, _) = worker_engine();
     let worker = engine.data_worker_id().expect("data worker id");
-    let mut sessions = SessionWorker::<Index>::new(worker);
+    let mut sessions = SessionWorker::<Index>::new(worker).expect("session worker for test");
 
     sessions
         .install_queue_readiness(&mut engine, session_queue)

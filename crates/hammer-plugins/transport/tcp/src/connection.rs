@@ -2055,7 +2055,9 @@ impl TcpConnection {
             TcpTimerKind::Retransmit => self.on_retransmit_timer_expiry(local_capabilities),
             TcpTimerKind::Rack => self.on_rack_timer_expiry(),
             TcpTimerKind::Tlp => self.on_tlp_timer_expiry(),
-            TcpTimerKind::DelayedAck => TcpTimerOutcome::segment(self.on_delayed_ack_timer_expiry()),
+            TcpTimerKind::DelayedAck => {
+                TcpTimerOutcome::segment(self.on_delayed_ack_timer_expiry())
+            }
             TcpTimerKind::Persist => self.on_persist_timer_expiry(),
             TcpTimerKind::KeepAlive => self.on_keepalive_timer_expiry(),
             TcpTimerKind::TimeWait => TcpTimerOutcome::segment(self.on_time_wait_timer_expiry()),

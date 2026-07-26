@@ -8,7 +8,7 @@ use hammer_infra::fifo::Fifo;
 use hammer_infra::segment::Segment;
 use hammer_runtime::app::{
     AppSession, AppSessionConfig, AppSessionError, SessionEventQueue, SessionEvt, SessionEvtType,
-    SessionHandle, SessionMsgQueue, SessionOffsets,
+    SessionHandle, SessionMsgQueue, SessionMsgQueueError, SessionOffsets,
 };
 use hammer_runtime::attach::{AppSessionPublication, AppSessionPublisher};
 use hammer_runtime::{RuntimeError, RuntimeResult};

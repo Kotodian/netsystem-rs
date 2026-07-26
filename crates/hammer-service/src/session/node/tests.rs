@@ -116,7 +116,7 @@ fn session_queue_updates_transport_before_control_and_io() {
     let worker = DataWorkerId::new(0);
     let events = Arc::new(Mutex::new(Vec::new()));
     let sampled_times = Arc::new(Mutex::new(Vec::new()));
-    let mut sessions = SessionWorker::<Index>::new(worker);
+    let mut sessions = SessionWorker::<Index>::new(worker).expect("session worker for test");
     let mut transport = TcpRecordingTransport(RecordingState {
         events: Arc::clone(&events),
         sampled_times: Arc::clone(&sampled_times),
@@ -307,7 +307,8 @@ fn quic_shaped_internal_tx_can_fan_close_out_to_stream_sessions() {
         .nodes()
         .register_internal(PayloadCaptureNode::new(Arc::clone(&captured_payloads)));
     let transport_index = Index::new(12, 4);
-    let mut sessions = SessionWorker::<Index>::new(DataWorkerId::new(0));
+    let mut sessions =
+        SessionWorker::<Index>::new(DataWorkerId::new(0)).expect("session worker for test");
     let mut transport = QuicShapedTransport {
         streams: Arc::clone(&streams),
         observed_fifo_lengths: Arc::clone(&observed_fifo_lengths),
@@ -592,7 +593,8 @@ fn session_tx_dispatch_commits_batch_before_graph_visibility() {
         tx_action_calls: 0,
         batches: Vec::new(),
     };
-    let mut sessions = SessionWorker::<Index>::new(DataWorkerId::new(0));
+    let mut sessions =
+        SessionWorker::<Index>::new(DataWorkerId::new(0)).expect("session worker for test");
     let mut transport = transport;
     let session_id =
         sessions.insert_session_for_test(RecordingPacketizedTransport::ID, Index::new(5, 1));
@@ -644,7 +646,8 @@ fn session_tx_deschedules_without_tx_action_when_send_space_is_zero() {
         tx_action_calls: 0,
         batches: Vec::new(),
     };
-    let mut sessions = SessionWorker::<Index>::new(DataWorkerId::new(0));
+    let mut sessions =
+        SessionWorker::<Index>::new(DataWorkerId::new(0)).expect("session worker for test");
     let mut transport = transport;
     let session_id =
         sessions.insert_session_for_test(RecordingPacketizedTransport::ID, Index::new(6, 1));
@@ -673,7 +676,8 @@ fn session_tx_deschedules_without_tx_action_when_send_space_is_zero() {
 #[test]
 fn failed_session_packetized_tx_action_keeps_fifo_and_graph_unchanged() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let mut sessions = SessionWorker::<Index>::new(DataWorkerId::new(0));
+    let mut sessions =
+        SessionWorker::<Index>::new(DataWorkerId::new(0)).expect("session worker for test");
     let mut transport = FailingPacketizedTransport;
     let session_id =
         sessions.insert_session_for_test(FailingPacketizedTransport::ID, Index::new(2, 1));
@@ -703,7 +707,8 @@ fn failed_session_packetized_tx_action_keeps_fifo_and_graph_unchanged() {
 fn transport_deleted_then_queued_app_close_releases_the_session_slot() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let transport_index = Index::new(3, 9);
-    let mut sessions = SessionWorker::<Index>::new(DataWorkerId::new(0));
+    let mut sessions =
+        SessionWorker::<Index>::new(DataWorkerId::new(0)).expect("session worker for test");
     let mut transport = FailingPacketizedTransport;
     let session_id =
         sessions.insert_session_for_test(FailingPacketizedTransport::ID, transport_index);
