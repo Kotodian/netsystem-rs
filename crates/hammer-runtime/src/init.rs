@@ -3,7 +3,7 @@ use petgraph::graphmap::DiGraphMap;
 use std::collections::HashSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use crate::error::{RuntimeError, RuntimeResult};
+use crate::error::RuntimeResult;
 
 use crate::engine::Engine;
 
@@ -219,6 +219,7 @@ pub fn run_config_functions(engine: &mut Engine, early: bool, document: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::RuntimeError;
 
     fn mock(
         specs: &[(
