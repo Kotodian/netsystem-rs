@@ -740,6 +740,7 @@ dependencies = [
  "hammer-runtime",
  "libc",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
