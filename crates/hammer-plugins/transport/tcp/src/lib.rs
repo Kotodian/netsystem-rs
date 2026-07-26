@@ -283,12 +283,24 @@ fn configured_tcp_main(
 ) -> RuntimeResult<TcpMain> {
     publish_tcp_policy(TcpPolicy::from_plugin_config(tcp));
     let main = TcpMain::new(worker_count, sessions, ip_output);
+    // VPP `tcp_make_syn_options` always offers MSS, window scale, timestamps,
+    // and SACK; `tcp_window_compute_scale` picks the smallest scale that fits
+    // the configured receive window in the 16-bit window field.
+    let mut window_scale = 0u8;
+    while window_scale < connection::TCP_MAX_WINDOW_SCALE
+        && (tcp.receive_window >> window_scale) > u32::from(u16::MAX)
+    {
+        window_scale += 1;
+    }
+    let capabilities = TcpCapabilities {
+        max_segment_size: Some(u16::try_from(tcp.mss).unwrap_or(u16::MAX)),
+        window_scale: Some(window_scale),
+        sack: true,
+        timestamps: true,
+        ..TcpCapabilities::default()
+    };
     for entry in &tcp.listen {
-        main.bind_tcp_listener(
-            entry.address,
-            DataWorkerId::new(0),
-            TcpCapabilities::default(),
-        )?;
+        main.bind_tcp_listener(entry.address, DataWorkerId::new(0), capabilities)?;
     }
     Ok(main)
 }

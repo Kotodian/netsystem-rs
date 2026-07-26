@@ -27,7 +27,7 @@ use thiserror::Error;
 
 use hammer_service::session::SessionId;
 
-const TCP_MAX_WINDOW_SCALE: u8 = 14;
+pub(crate) const TCP_MAX_WINDOW_SCALE: u8 = 14;
 const DEFAULT_TCP_WINDOW: u32 = u16::MAX as u32;
 const DEFAULT_TCP_MAX_SEGMENT_SIZE: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
 

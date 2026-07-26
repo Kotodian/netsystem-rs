@@ -242,6 +242,20 @@ impl<'a> TcpListener<'a> {
         if fast_open_valid {
             return self.accept_fast_open(runtime, index, packet);
         }
+        // VPP `tcp_make_synack_options`: always advertise the local MSS, but
+        // echo window scale, timestamps, SACK, ECN, and fast-open only when
+        // the SYN offered them, matching what `tcp_negotiate_options` accepts
+        // once the handshake completes.
+        let offered = packet.capabilities;
+        let capabilities = TcpCapabilities {
+            max_segment_size: self.capabilities.max_segment_size,
+            window_scale: offered.window_scale.and(self.capabilities.window_scale),
+            sack: self.capabilities.sack && offered.sack,
+            timestamps: self.capabilities.timestamps && offered.timestamps,
+            ecn: self.capabilities.ecn && offered.ecn,
+            accurate_ecn: self.capabilities.accurate_ecn && offered.accurate_ecn,
+            fast_open: self.capabilities.fast_open && offered.fast_open,
+        };
         let (begin_ok, sequence, fast_open_cookie) = {
             let lookup = &mut self.tcp.lookup;
             let begin_ok = lookup.begin_listener_pending(
@@ -263,7 +277,7 @@ impl<'a> TcpListener<'a> {
                     packet.remote,
                     packet.sequence.raw(),
                 );
-                let fast_open_cookie = self.capabilities.fast_open.then(|| {
+                let fast_open_cookie = capabilities.fast_open.then(|| {
                     lookup.fast_open_cookie_for_listener(self.id, packet.local, packet.remote)
                 });
                 (true, sequence, fast_open_cookie)
@@ -272,7 +286,7 @@ impl<'a> TcpListener<'a> {
         if !begin_ok {
             return Ok((None, None));
         }
-        let flags = if self.capabilities.ecn {
+        let flags = if capabilities.ecn {
             TcpSegmentFlags::SYN | TcpSegmentFlags::ACK | TcpSegmentFlags::ECE
         } else {
             TcpSegmentFlags::SYN | TcpSegmentFlags::ACK
@@ -285,7 +299,7 @@ impl<'a> TcpListener<'a> {
                 packet.sequence.advance(1).raw(),
                 packet.advertised_window,
                 flags,
-                self.capabilities,
+                capabilities,
                 None,
                 packet.timestamp.map(|timestamp| crate::TcpTimestampOption {
                     tsval: timestamp.tsecr.max(1),
