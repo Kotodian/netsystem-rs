@@ -1,9 +1,9 @@
 //! External attached TCP echo app.
 //!
-//! Connects to a running Hammer daemon over the attach socket. The first
-//! publication delivers the listener session; every following connect blocks
-//! until the daemon accepts a TCP session and publishes its FIFO/event-queue
-//! descriptors. Each accepted session is echoed until it closes.
+//! Connects to a running Hammer daemon over the attach socket. Each connect
+//! blocks until the daemon accepts a TCP session and publishes its
+//! FIFO/event-queue descriptors. Each accepted session is echoed until it
+//! closes, then the app re-attaches for the next accept.
 //!
 //! ```text
 //! cargo run -p hammer --example tun_tcp_echo -- /tmp/hammer-tcp-integration.attach.sock
@@ -33,18 +33,16 @@ fn main() -> Result<(), EchoError> {
     let socket_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| DEFAULT_ATTACH_SOCKET.to_owned());
-    let listener = AppClient::connect(&socket_path)?;
-    eprintln!(
-        "attached session handle {:?} via {socket_path}",
-        listener.session_handle()
-    );
     let tokio_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .build()
         .map_err(|source| EchoError::TokioRuntime { source })?;
     loop {
         let session = AppClient::connect(&socket_path)?;
-        eprintln!("accepted session handle {:?}", session.session_handle());
+        eprintln!(
+            "accepted session handle {:?} via {socket_path}",
+            session.session_handle()
+        );
         tokio_runtime.block_on(run_echo(&session))?;
         eprintln!("closed session handle {:?}", session.session_handle());
     }

@@ -66,7 +66,6 @@ fn svm_session_multi_ring_evt_q_io_and_ctrl_round_trip() {
     session
         .push_event(SessionEvtType::Connect)
         .expect("push connect");
-    session.want_rx_notification();
     assert_eq!(session.enqueue_rx(b"hi").expect("enqueue rx"), 2);
 
     let mut out = [SessionEvt::io(0, SessionEvtType::Close); 4];

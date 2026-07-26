@@ -127,10 +127,23 @@ impl AppSession {
 
     /// App-side convenience: copy received bytes out (transport → app). Returns
     /// number of bytes copied into `out`; caller calls `consume_rx` after
-    /// processing.
+    /// processing. On an empty fifo this clears the rx event flag and
+    /// re-checks for racing enqueues before reporting 0, mirroring the VPP
+    /// VCL `svm_fifo_unset_event` drain discipline, so a fresh RxEnq is
+    /// posted for the next burst of data.
     #[inline]
     pub fn recv_bytes(&self, out: &mut [u8]) -> usize {
-        self.rx_fifo.peek(0, out.len(), out)
+        loop {
+            let read = self.rx_fifo.peek(0, out.len(), out);
+            if read != 0 || out.is_empty() {
+                return read;
+            }
+            self.rx_fifo.unset_event();
+            if self.rx_fifo.max_dequeue() == 0 {
+                return 0;
+            }
+            self.rx_fifo.set_event();
+        }
     }
 
     /// App-side convenience: drop `len` bytes from the head of `rx_fifo` after
@@ -155,19 +168,19 @@ impl AppSession {
     }
 
     /// Transport-side convenience: enqueue received bytes and emit a
-    /// `SessionEvtType::RxEnq` event with edge-triggered signal semantics.
-    /// Returns bytes enqueued. The event is only signalled if the fifo
-    /// transitioned empty → non-empty this call AND the app had set
-    /// `want_notification`.
+    /// `SessionEvtType::RxEnq` event. Returns bytes enqueued. Events are
+    /// coalesced on the fifo event flag: one RxEnq is posted when the flag
+    /// transitions unset → set, and the app clears the flag once it drains the
+    /// fifo empty. Mirrors VPP `session_enqueue_notify` gating on
+    /// `SESSION_F_RX_EVT` with `svm_fifo_unset_event` on the consumer side.
     #[inline]
     pub fn enqueue_rx(&self, bytes: &[u8]) -> Result<usize, AppSessionError> {
         self.enqueue_rx_with_flags(bytes, SessionEvtFlags::empty())
     }
 
     /// Like [`Self::enqueue_rx`], but attaches [`SessionEvtFlags`] on the RxEnq
-    /// event. Urgent delivery always posts an event (still requires
-    /// `want_notification`) so the app observes the mark even when the FIFO
-    /// was already non-empty.
+    /// event. Urgent delivery always posts an event so the app observes the
+    /// mark even when a coalesced RxEnq is already pending.
     #[inline]
     pub fn enqueue_rx_with_flags(
         &self,
@@ -179,8 +192,11 @@ impl AppSession {
             return Ok(0);
         }
         let urgent = flags.contains(SessionEvtFlags::URGENT);
-        if urgent || self.rx_fifo.should_signal(wrote) {
-            self.push_event_with_flags(SessionEvtType::RxEnq, flags)?;
+        if self.rx_fifo.set_event() || urgent {
+            if let Err(error) = self.push_event_with_flags(SessionEvtType::RxEnq, flags) {
+                self.rx_fifo.unset_event();
+                return Err(error);
+            }
         }
         Ok(wrote)
     }
@@ -266,20 +282,7 @@ impl AppSession {
         Ok(())
     }
 
-    /// App-side: ask the runtime to wake the app when the fifo transitions
-    /// empty → non-empty. Mirrors VPP `svm_fifo_set_event`.
-    #[inline]
-    pub fn want_rx_notification(&self) {
-        self.rx_fifo.want_notification();
-    }
-
-    /// App-side: clear the want-notification flag before sleeping.
-    #[inline]
-    pub fn clear_rx_notification(&self) {
-        self.rx_fifo.clear_notification();
-    }
-
-    /// Same for tx (app wants wake when tx fifo has space again).
+    /// Tx-space notification (app wants wake when tx fifo has space again).
     #[inline]
     pub fn want_tx_notification(&self) {
         self.tx_fifo.want_deq_notification();
@@ -298,7 +301,9 @@ impl AppSession {
     }
 
     /// App-side async receive. Waits for the RX FIFO to become readable and
-    /// copies up to `out.len()` bytes, advancing the FIFO head.
+    /// copies up to `out.len()` bytes, advancing the FIFO head. Clears the rx
+    /// event flag before sleeping on an empty fifo and re-checks for racing
+    /// enqueues, mirroring the VPP VCL `svm_fifo_unset_event` discipline.
     pub async fn recv(&self, out: &mut [u8]) -> Result<usize, AppSessionError> {
         loop {
             let read = self.rx_fifo.peek(0, out.len(), out);
@@ -306,14 +311,12 @@ impl AppSession {
                 self.rx_fifo.dequeue_drop(read);
                 return Ok(read);
             }
-            self.rx_fifo.want_notification();
+            self.rx_fifo.unset_event();
             if self.rx_fifo.max_dequeue() != 0 {
-                self.rx_fifo.clear_notification();
+                self.rx_fifo.set_event();
                 continue;
             }
-            let wait_result = self.wait_for_event().await;
-            self.rx_fifo.clear_notification();
-            wait_result?;
+            self.wait_for_event().await?;
         }
     }
 
@@ -612,9 +615,8 @@ mod tests {
     }
 
     #[test]
-    fn app_session_enqueue_rx_emits_edge_triggered_signal() {
+    fn app_session_enqueue_rx_signals_first_event_only() {
         let session = new_session(AppSessionConfig::new(64, 4), 1);
-        session.want_rx_notification();
         assert_eq!(session.enqueue_rx(b"abc").expect("enqueue rx"), 3);
         assert!(session.read_signal());
         assert!(!session.read_signal());
@@ -623,54 +625,58 @@ mod tests {
     }
 
     #[test]
-    fn app_session_enqueue_rx_emits_rx_event_when_requested() {
+    fn app_session_enqueue_rx_coalesces_until_drained() {
         let session = new_session(AppSessionConfig::new(64, 4), 1);
         assert_eq!(session.enqueue_rx(b"abc").expect("enqueue rx"), 3);
-        assert_eq!(
-            session.poll_events(&mut [SessionEvt::io(0, SessionEvtType::Close)]),
-            0
-        );
-
-        session.want_rx_notification();
         assert_eq!(session.enqueue_rx(b"def").expect("enqueue rx"), 3);
-        assert_eq!(
-            session.poll_events(&mut [SessionEvt::io(0, SessionEvtType::Close)]),
-            0
-        );
+        let mut out = [SessionEvt::io(0, SessionEvtType::Close); 4];
+        assert_eq!(session.poll_events(&mut out), 1);
+        assert_eq!(out[0].evt_type, SessionEvtType::RxEnq);
 
+        let mut buf = [0u8; 16];
+        assert_eq!(session.recv_bytes(&mut buf), 6);
         assert_eq!(session.consume_rx(6), 6);
-        session.want_rx_notification();
+        assert_eq!(session.recv_bytes(&mut buf), 0);
+
         assert_eq!(session.enqueue_rx(b"ghi").expect("enqueue rx"), 3);
-        let mut out = [SessionEvt::io(0, SessionEvtType::Close)];
         assert_eq!(session.poll_events(&mut out), 1);
         assert_eq!(out[0].evt_type, SessionEvtType::RxEnq);
     }
 
     #[test]
-    fn app_session_enqueue_rx_urgent_marks_rx_event_flag() {
+    fn app_session_enqueue_rx_urgent_bypasses_coalescing() {
         use crate::app::SessionEvtFlags;
 
         let session = new_session(AppSessionConfig::new(64, 4), 1);
-        session.want_rx_notification();
+        assert_eq!(session.enqueue_rx(b"abc").expect("enqueue rx"), 3);
         assert_eq!(
             session
                 .enqueue_rx_with_flags(b"urg", SessionEvtFlags::URGENT)
                 .expect("enqueue urgent"),
             3
         );
-        let mut out = [SessionEvt::io(0, SessionEvtType::Close)];
-        assert_eq!(session.poll_events(&mut out), 1);
-        assert_eq!(out[0].evt_type, SessionEvtType::RxEnq);
-        assert!(out[0].flags().contains(SessionEvtFlags::URGENT));
-
-        // Non-urgent path keeps flags clear (edge-triggered: may not fire while data pending).
-        assert_eq!(session.consume_rx(3), 3);
-        session.want_rx_notification();
-        assert_eq!(session.enqueue_rx(b"ok").expect("enqueue"), 2);
-        let mut out = [SessionEvt::io(0, SessionEvtType::Close)];
-        assert_eq!(session.poll_events(&mut out), 1);
+        let mut out = [SessionEvt::io(0, SessionEvtType::Close); 4];
+        assert_eq!(session.poll_events(&mut out), 2);
         assert_eq!(out[0].evt_type, SessionEvtType::RxEnq);
         assert!(out[0].flags().is_empty());
+        assert_eq!(out[1].evt_type, SessionEvtType::RxEnq);
+        assert!(out[1].flags().contains(SessionEvtFlags::URGENT));
+    }
+
+    #[test]
+    fn app_session_enqueue_rx_clears_event_when_evt_q_full() {
+        let session = new_session(AppSessionConfig::new(64, 4), 1);
+        while session.push_event(SessionEvtType::RxEnq).is_ok() {}
+
+        let error = session
+            .enqueue_rx(b"x")
+            .expect_err("full event queue must reject rx notification");
+        assert!(matches!(error, AppSessionError::EventQueueFull { .. }));
+        assert!(!session.rx_fifo().has_event());
+
+        assert!(session.evt_q().dequeue().is_some());
+        assert_eq!(session.enqueue_rx(b"y").expect("retry after drain"), 1);
+        assert!(session.rx_fifo().has_event());
     }
 
     #[test]

@@ -22,11 +22,10 @@ pub struct FifoHeader {
     size: u32,
     min_alloc: u32,
     has_event: AtomicU32,
-    want_ntf: AtomicU32,
     want_deq_ntf: AtomicU32,
     has_deq_ntf: AtomicU32,
     deq_thresh: AtomicU32,
-    _pad0: [u8; 64 - (8 + 4 + 4 + 4 + 4 + 4 + 4 + 4)],
+    _pad0: [u8; 64 - (8 + 4 + 4 + 4 + 4 + 4 + 4)],
     head_chunk: AtomicU64,
     head: AtomicU32,
     _pad1: [u8; 64 - (8 + 4)],
@@ -186,11 +185,10 @@ impl Fifo {
                     size: capacity as u32,
                     min_alloc: chunk_size as u32,
                     has_event: AtomicU32::new(0),
-                    want_ntf: AtomicU32::new(0),
                     want_deq_ntf: AtomicU32::new(0),
                     has_deq_ntf: AtomicU32::new(0),
                     deq_thresh: AtomicU32::new(0),
-                    _pad0: [0; 64 - (8 + 4 + 4 + 4 + 4 + 4 + 4 + 4)],
+                    _pad0: [0; 64 - (8 + 4 + 4 + 4 + 4 + 4 + 4)],
                     head_chunk: AtomicU64::new(first_chunk_off),
                     head: AtomicU32::new(0),
                     _pad1: [0; 64 - (8 + 4)],
@@ -624,34 +622,6 @@ impl Fifo {
     }
 
     #[inline]
-    pub fn should_signal(&self, wrote: usize) -> bool {
-        if wrote == 0 {
-            return false;
-        }
-        let hdr = self.hdr;
-        unsafe {
-            let tail = (*hdr).tail.load(Ordering::Acquire);
-            let tail_before = tail.wrapping_sub(wrote as u32);
-            let head = (*hdr).head.load(Ordering::Acquire);
-            if head != tail_before {
-                return false;
-            }
-            loop {
-                if (*hdr)
-                    .want_ntf
-                    .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    return true;
-                }
-                if (*hdr).want_ntf.load(Ordering::Acquire) == 0 {
-                    return false;
-                }
-            }
-        }
-    }
-
-    #[inline]
     pub fn needs_deq_notification(&self, dropped: usize) -> bool {
         if dropped == 0 {
             return false;
@@ -679,20 +649,6 @@ impl Fifo {
     pub fn unset_event(&self) {
         unsafe {
             (*self.hdr).has_event.store(0, Ordering::Release);
-        }
-    }
-
-    #[inline]
-    pub fn want_notification(&self) {
-        unsafe {
-            (*self.hdr).want_ntf.store(1, Ordering::Release);
-        }
-    }
-
-    #[inline]
-    pub fn clear_notification(&self) {
-        unsafe {
-            (*self.hdr).want_ntf.store(0, Ordering::Release);
         }
     }
 
@@ -745,7 +701,6 @@ impl Fifo {
             (*hdr).head_chunk.store(first_chunk, Ordering::Relaxed);
             (*hdr).tail_chunk.store(first_chunk, Ordering::Relaxed);
             (*hdr).has_event.store(0, Ordering::Relaxed);
-            (*hdr).want_ntf.store(0, Ordering::Relaxed);
             (*hdr).want_deq_ntf.store(0, Ordering::Relaxed);
             (*hdr).has_deq_ntf.store(0, Ordering::Relaxed);
         }
@@ -1107,11 +1062,12 @@ mod tests {
     }
 
     #[test]
-    fn should_signal_edge_triggered() {
+    fn set_event_reports_transition_once() {
         let f = fifo(4096);
-        f.want_notification();
-        assert!(f.should_signal(f.enqueue(&[1])));
-        assert!(!f.should_signal(f.enqueue(&[2])));
+        assert!(f.set_event());
+        assert!(!f.set_event());
+        f.unset_event();
+        assert!(f.set_event());
     }
 
     #[test]
