@@ -1519,9 +1519,17 @@ impl TcpConnection {
             return Ok(());
         }
         self.ensure_state(TcpState::Established)?;
-        if self.tx_intent_sequence.is_some() {
+        if let Some(intent_sequence) = self.tx_intent_sequence {
             self.clear_tx_intent();
-            return Ok(());
+            // An intent below `snd_nxt` retransmits scoreboard-tracked bytes;
+            // like VPP's retransmit path it must not re-record or move
+            // `snd_nxt`. An intent at `snd_nxt` (persist probe with nothing in
+            // flight) is a first transmission and falls through to be recorded
+            // like any new data, otherwise the probe byte leaves the stack
+            // unaccounted and the ack for it is rejected as a future ack.
+            if intent_sequence != self.snd_nxt {
+                return Ok(());
+            }
         }
         let payload_len =
             u32::try_from(payload_len).map_err(|_| TcpConnectionError::PayloadLengthOverflow)?;
@@ -2329,11 +2337,14 @@ impl TcpConnection {
         {
             return None;
         }
+        // VPP releases pacer-gated bytes through the normal send path
+        // (`tcp_available_cc_snd_space` + pacer), never through the
+        // retransmit machinery. Raising `pacing_ready` lets the next
+        // `tx_payload_budget` call pass the pacing gate and send new data
+        // from `snd_nxt` with full loss-recovery accounting; routing it
+        // through a tx intent would transmit bytes the scoreboard never
+        // records, freezing `snd_una` on the ack for them.
         self.pacing_ready = true;
-        if self.tx_intent_sequence.is_none() {
-            self.tx_intent_sequence = Some(self.snd_nxt);
-            self.tx_intent_payload_len = self.output_payload_len() as u32;
-        }
         None
     }
 
