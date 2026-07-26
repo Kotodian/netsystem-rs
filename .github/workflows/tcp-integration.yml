@@ -312,7 +312,9 @@ jobs:
               interface=$1
               capture=$2
               log=$3
-              nohup tcpdump -U -n -i "$interface" -w "$capture" \
+              # -Z root: Debian-family tcpdump drops to the tcpdump user before
+              # opening -w output, which cannot write root-owned scratch dirs.
+              nohup tcpdump -Z root -U -n -i "$interface" -w "$capture" \
                 </dev/null >>"$log" 2>&1 &
               echo $!
             ' hammer-tcpdump \
