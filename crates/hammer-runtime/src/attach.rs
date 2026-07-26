@@ -118,8 +118,7 @@ impl AppServer {
             .map_err(|source| AttachError::ListenerRegistration { source })?;
         let listener = tokio::net::UnixListener::from_std(listener)
             .map_err(|source| AttachError::ListenerRegistration { source })?;
-        let mut clients: VecDeque<tokio::net::UnixStream> =
-            VecDeque::with_capacity(self.capacity);
+        let mut clients: VecDeque<tokio::net::UnixStream> = VecDeque::with_capacity(self.capacity);
         let mut publication: Option<AppSessionPublication> = None;
 
         loop {
