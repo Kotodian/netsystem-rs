@@ -626,7 +626,7 @@ pub fn write_ipv6_push_header(
     dst: Ipv6Addr,
     next_header: u8,
     payload_len: u16,
-) -> RuntimeResult<()> {
+) -> Result<(), IpInputError> {
     let ptr = header_mut_ptr::<Ipv6Header>(output, 0)?;
     // SAFETY: same as `write_ipv4_push_header` — packed wire layout, byte fields only.
     let header = unsafe { &mut *ptr };

@@ -113,7 +113,7 @@ impl IpLookupControlPlane {
         let barrier = self.barrier.clone();
         let publish = move || {
             if let Some(barrier) = barrier {
-                barrier.synchronize(|| {
+                barrier.synchronize(|| -> RuntimeResult<()> {
                     table_handle.replace_after_barrier(table);
                     Ok(())
                 })
