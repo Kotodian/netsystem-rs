@@ -669,11 +669,11 @@ fn refresh_udp_cursor(
     cursor: BufferPacketCursor,
 ) -> RuntimeResult<()> {
     let transport_header_offset = cursor.transport_header_offset();
-    let transport_payload_offset = transport_header_offset
-        .checked_add(UDP_HEADER_LEN)
-        .ok_or(UdpControlError::HeaderOutOfRange {
+    let transport_payload_offset = transport_header_offset.checked_add(UDP_HEADER_LEN).ok_or(
+        UdpControlError::HeaderOutOfRange {
             offset: transport_header_offset,
-        })?;
+        },
+    )?;
     let mut buffer = runtime.get_buffer_mut(index)?;
     let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
     network.set_packet_cursor(

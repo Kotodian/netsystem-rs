@@ -287,18 +287,17 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         let session_id = self.insert_creating_session(transport)?;
         let handle = SessionHandle::new(session_id.pool_index().slot(), self.worker.slot() as u32);
         let tx_evt_q = self.app.tx_evt_q().clone();
-        let app_session = match self.app.create_app_session(
-            listener,
-            handle,
-            self.app_session_config,
-            tx_evt_q,
-        ) {
-            Ok(session) => session,
-            Err(error) => {
-                self.remove_session_entry(session_id);
-                return Err(error);
-            }
-        };
+        let app_session =
+            match self
+                .app
+                .create_app_session(listener, handle, self.app_session_config, tx_evt_q)
+            {
+                Ok(session) => session,
+                Err(error) => {
+                    self.remove_session_entry(session_id);
+                    return Err(error);
+                }
+            };
         self.app.attach_session(session_id, app_session);
         if let Err(error) = self.finish_session_creation(session_id, index) {
             self.remove_session_entry(session_id);
@@ -518,10 +517,9 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         let rx_available = self.rx_available_u32(session_id);
         Ok(match NonZeroU32::new(accepted) {
             Some(accepted) => {
-                let (start, len) =
-                    newest.ok_or(SessionError::OooSpanMissing { session_id })?;
-                let len = NonZeroU32::new(len)
-                    .ok_or(SessionError::OooSpanInvalid { session_id })?;
+                let (start, len) = newest.ok_or(SessionError::OooSpanMissing { session_id })?;
+                let len =
+                    NonZeroU32::new(len).ok_or(SessionError::OooSpanInvalid { session_id })?;
                 RxDelivery::OutOfOrder {
                     accepted,
                     newest: OooSpan::new(start, len),

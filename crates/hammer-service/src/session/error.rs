@@ -95,9 +95,7 @@ pub(crate) enum SessionError {
         tx_offset: usize,
         available: usize,
     },
-    #[error(
-        "session {session_id:?} TX FIFO has no {payload_len} bytes at offset {tx_offset}"
-    )]
+    #[error("session {session_id:?} TX FIFO has no {payload_len} bytes at offset {tx_offset}")]
     TxFifoRangeInvalid {
         session_id: SessionId,
         tx_offset: usize,

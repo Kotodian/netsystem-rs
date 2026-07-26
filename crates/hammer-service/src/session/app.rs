@@ -188,19 +188,18 @@ impl SegmentManager {
         let tx_fifo_offset = offset + fifo_bytes as u64;
         let event_queue_offset = tx_fifo_offset + fifo_bytes as u64;
         let session = (|| {
-            let mut rx_fifo = unsafe {
-                Fifo::init_at(segment.clone(), offset, config.fifo_capacity)
-            }
-            .map_err(|_| AppSessionError::RxFifoCapacityInvalid {
-                capacity: config.fifo_capacity,
-            })?;
+            let mut rx_fifo =
+                unsafe { Fifo::init_at(segment.clone(), offset, config.fifo_capacity) }.map_err(
+                    |_| AppSessionError::RxFifoCapacityInvalid {
+                        capacity: config.fifo_capacity,
+                    },
+                )?;
             rx_fifo.enable_ooo();
-            let tx_fifo = unsafe {
-                Fifo::init_at(segment.clone(), tx_fifo_offset, config.fifo_capacity)
-            }
-            .map_err(|_| AppSessionError::TxFifoCapacityInvalid {
-                capacity: config.fifo_capacity,
-            })?;
+            let tx_fifo =
+                unsafe { Fifo::init_at(segment.clone(), tx_fifo_offset, config.fifo_capacity) }
+                    .map_err(|_| AppSessionError::TxFifoCapacityInvalid {
+                        capacity: config.fifo_capacity,
+                    })?;
             let event_queue = unsafe {
                 SessionMsgQueue::init_at_with_signal(
                     segment.clone(),

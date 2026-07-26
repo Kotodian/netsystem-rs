@@ -476,12 +476,7 @@ impl<'a> TcpListener<'a> {
         }
         self.finish_pending(packet);
         let result = (|| {
-            let output = prepare(
-                session_id,
-                connection_index,
-                self.sessions,
-                self.tcp,
-            )?;
+            let output = prepare(session_id, connection_index, self.sessions, self.tcp)?;
             publish_tcp_connection(self.sessions, self.tcp, session_id)?;
             self.sessions.connected(session_id)?;
             Ok((output, session_id))

@@ -4,11 +4,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 use hammer_plugin_tcp::{TcpResetNext, TcpResetNode};
+use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
     DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node,
     NodeProcessFn, NodeResult, NodeRuntimeData,
 };
-use hammer_runtime::RuntimeResult;
 use hammer_service::opaque::NetworkOpaque;
 
 fn test_runtime_configured(

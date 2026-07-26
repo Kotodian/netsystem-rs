@@ -86,12 +86,11 @@ impl AppServer {
             return Err(AttachError::PublicationCapacityInvalid.into());
         }
         let _ = std::fs::remove_file(path);
-        let listener = std::os::unix::net::UnixListener::bind(path).map_err(|source| {
-            AttachError::Bind {
+        let listener =
+            std::os::unix::net::UnixListener::bind(path).map_err(|source| AttachError::Bind {
                 path: path.into(),
                 source,
-            }
-        })?;
+            })?;
         listener
             .set_nonblocking(true)
             .map_err(|source| AttachError::ListenerNonblocking { source })?;

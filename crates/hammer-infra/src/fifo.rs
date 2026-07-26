@@ -792,15 +792,15 @@ impl Fifo {
         let ooo = unsafe { &mut *self.ooo.get() };
         let bk = ooo.as_mut().ok_or(FifoError::OutOfOrderDisabled)?;
 
-        let total_len = u32::try_from(src.len()).map_err(|_| {
-            FifoError::OutOfOrderLengthOutOfRange { length: src.len() }
-        })?;
-        let end_offset = offset
-            .checked_add(total_len)
-            .ok_or(FifoError::OutOfOrderOffsetOverflow {
-                offset,
-                length: total_len,
-            })?;
+        let total_len = u32::try_from(src.len())
+            .map_err(|_| FifoError::OutOfOrderLengthOutOfRange { length: src.len() })?;
+        let end_offset =
+            offset
+                .checked_add(total_len)
+                .ok_or(FifoError::OutOfOrderOffsetOverflow {
+                    offset,
+                    length: total_len,
+                })?;
         let available = self.max_enqueue();
         if end_offset as usize > available {
             return Err(FifoError::OutOfOrderCapacityExceeded {

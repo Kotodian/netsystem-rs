@@ -395,10 +395,7 @@ fn parse_ipv4_packet_header(packet: &[u8]) -> Result<ParsedIpPacket, IpInputErro
 }
 
 #[inline(always)]
-fn parse_ipv4_fragment(
-    packet: &[u8],
-    chain_len: usize,
-) -> Result<ParsedIpFragment, IpInputError> {
+fn parse_ipv4_fragment(packet: &[u8], chain_len: usize) -> Result<ParsedIpFragment, IpInputError> {
     let header = read_header::<Ipv4Header>(packet, 0)?;
     if header.version() != 4 {
         return Err(IpInputError::Version);
@@ -512,10 +509,7 @@ fn parse_ipv6_packet_header(packet: &[u8]) -> Result<ParsedIpPacket, IpInputErro
 }
 
 #[inline(always)]
-fn parse_ipv6_fragment(
-    packet: &[u8],
-    chain_len: usize,
-) -> Result<ParsedIpFragment, IpInputError> {
+fn parse_ipv6_fragment(packet: &[u8], chain_len: usize) -> Result<ParsedIpFragment, IpInputError> {
     let header = read_header::<Ipv6Header>(packet, 0)?;
     if header.version() != 6 {
         return Err(IpInputError::Version);

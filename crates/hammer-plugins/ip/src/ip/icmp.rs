@@ -11,11 +11,11 @@ use arc_swap::ArcSwap;
 use hammer_core::data_plane::{
     BufferFrame, BufferPacketCursor, Index, NodeId, NodeNext, SecondaryOpaque,
 };
+use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
     DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, TraceFormatter,
     add_packet_trace, format_packet_trace,
 };
-use hammer_runtime::RuntimeResult;
 
 use hammer_service::data_plane::set_index_node_error_code;
 use hammer_service::opaque::NetworkOpaque;
@@ -272,12 +272,12 @@ impl IcmpInputControlPlane {
 
     /// Wire default nexts into the ICMP-input local-next table and publish slots.
     pub fn attach_consumer(&mut self, consumer: NodeId) -> RuntimeResult<()> {
-        let nodes = self
-            .nodes
-            .as_ref()
-            .ok_or(crate::ip::IpControlError::NodeRuntimeUnavailable {
-                operation: crate::ip::IpControlOperation::IcmpConsumerAttach,
-            })?;
+        let nodes =
+            self.nodes
+                .as_ref()
+                .ok_or(crate::ip::IpControlError::NodeRuntimeUnavailable {
+                    operation: crate::ip::IpControlOperation::IcmpConsumerAttach,
+                })?;
         nodes.set_node_next(consumer, IcmpInputNext::Drop, self.ip4_default_node)?;
         let ip4_slot = NodeNext::slot(IcmpInputNext::Drop);
         let ip6_slot = if self.ip6_default_node == self.ip4_default_node {
@@ -306,12 +306,12 @@ impl IcmpInputControlPlane {
         let consumer = self
             .consumer
             .ok_or(crate::ip::IpControlError::ConsumerNotAttached)?;
-        let nodes = self
-            .nodes
-            .as_ref()
-            .ok_or(crate::ip::IpControlError::NodeRuntimeUnavailable {
-                operation: crate::ip::IpControlOperation::IcmpTypeRegistration,
-            })?;
+        let nodes =
+            self.nodes
+                .as_ref()
+                .ok_or(crate::ip::IpControlError::NodeRuntimeUnavailable {
+                    operation: crate::ip::IpControlOperation::IcmpTypeRegistration,
+                })?;
         let slot = nodes.add_node_next_slot(consumer, node)?;
         self.inner.rcu(|current| {
             let mut next = IcmpInputSnapshot::clone(current);

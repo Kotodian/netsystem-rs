@@ -807,6 +807,7 @@ dependencies = [
  "ipnet",
  "linkme",
  "serde",
+ "thiserror",
  "toml",
 ]
 
@@ -866,6 +867,7 @@ dependencies = [
  "hammer-service",
  "linkme",
  "serde",
+ "thiserror",
  "tracing",
 ]
 

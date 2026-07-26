@@ -6,11 +6,11 @@ use hammer_infra::pool::Index;
 use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId};
 
 use hammer_service::data_plane::DropNode;
+use hammer_service::session::SessionId;
 use hammer_service::session::node::{SessionQueueNext, SessionQueueNode};
 use hammer_service::session::runtime::{
     SessionTransport, SessionWorker, dispatch_session_queue_once,
 };
-use hammer_service::session::SessionId;
 
 use crate::{TcpConnection, TcpWorker};
 
@@ -75,10 +75,8 @@ fn app_close_is_recorded_before_tcp_disconnect() {
     let connection_index = tcp
         .insert_connection(established_connection())
         .expect("insert TCP connection");
-    let session_id = sessions.insert_session_for_test(
-        <TcpWorker as SessionTransport<Index>>::ID,
-        connection_index,
-    );
+    let session_id = sessions
+        .insert_session_for_test(<TcpWorker as SessionTransport<Index>>::ID, connection_index);
     tcp.connection_mut(connection_index)
         .expect("TCP connection")
         .attach_session(session_id)
@@ -104,10 +102,8 @@ fn tcp_closed_publication_notifies_app_once_before_cleanup() {
     let connection_index = tcp
         .insert_connection(established_connection())
         .expect("insert TCP connection");
-    let session_id = sessions.insert_session_for_test(
-        <TcpWorker as SessionTransport<Index>>::ID,
-        connection_index,
-    );
+    let session_id = sessions
+        .insert_session_for_test(<TcpWorker as SessionTransport<Index>>::ID, connection_index);
     tcp.connection_mut(connection_index)
         .expect("TCP connection")
         .attach_session(session_id)

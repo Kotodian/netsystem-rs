@@ -5,8 +5,7 @@ use std::path::PathBuf;
 use hammer_infra::segment::Segment;
 use hammer_runtime::app::{AppSession, SessionHandle, SessionOffsets};
 use hammer_runtime::attach::{
-    ATTACH_DESCRIPTOR_COUNT, ATTACH_METADATA_BYTES, ATTACH_METADATA_WORDS,
-    ATTACH_PROTOCOL_VERSION,
+    ATTACH_DESCRIPTOR_COUNT, ATTACH_METADATA_BYTES, ATTACH_METADATA_WORDS, ATTACH_PROTOCOL_VERSION,
 };
 use thiserror::Error;
 
@@ -152,14 +151,13 @@ impl AppClient {
                 });
             }
         }
-        let [session_fd, tx_event_fd, event_read_fd, tx_event_write_fd]:
-            [OwnedFd; ATTACH_DESCRIPTOR_COUNT] =
-            received.try_into().map_err(|received: Vec<OwnedFd>| {
-                AppClientError::DescriptorCount {
-                    expected: ATTACH_DESCRIPTOR_COUNT,
-                    actual: received.len(),
-                }
-            })?;
+        let [session_fd, tx_event_fd, event_read_fd, tx_event_write_fd]: [OwnedFd;
+            ATTACH_DESCRIPTOR_COUNT] = received.try_into().map_err(|received: Vec<OwnedFd>| {
+            AppClientError::DescriptorCount {
+                expected: ATTACH_DESCRIPTOR_COUNT,
+                actual: received.len(),
+            }
+        })?;
 
         let mut words = [0_u64; ATTACH_METADATA_WORDS];
         for (word, chunk) in words
@@ -177,10 +175,10 @@ impl AppClient {
         if words[0] != ATTACH_PROTOCOL_VERSION {
             return Err(AppClientError::ProtocolVersion { actual: words[0] });
         }
-        let session_segment_size = usize::try_from(words[2])
-            .map_err(|_| AppClientError::OffsetOverflow)?;
-        let tx_event_segment_size = usize::try_from(words[3])
-            .map_err(|_| AppClientError::OffsetOverflow)?;
+        let session_segment_size =
+            usize::try_from(words[2]).map_err(|_| AppClientError::OffsetOverflow)?;
+        let tx_event_segment_size =
+            usize::try_from(words[3]).map_err(|_| AppClientError::OffsetOverflow)?;
         if session_segment_size == 0
             || session_segment_size > isize::MAX as usize
             || tx_event_segment_size == 0

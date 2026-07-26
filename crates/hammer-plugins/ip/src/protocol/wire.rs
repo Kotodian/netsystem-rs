@@ -45,11 +45,7 @@ where
 }
 
 #[inline(always)]
-pub fn write_header<T>(
-    packet: &mut [u8],
-    offset: usize,
-    header: T,
-) -> Result<(), IpInputError>
+pub fn write_header<T>(packet: &mut [u8], offset: usize, header: T) -> Result<(), IpInputError>
 where
     T: Copy,
 {

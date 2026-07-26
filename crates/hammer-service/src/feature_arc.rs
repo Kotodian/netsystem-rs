@@ -10,9 +10,9 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use hammer_core::data_plane::{BufferFrame, Index, NodeId};
+use hammer_runtime::RuntimeError;
 use hammer_runtime::node::NodeRuntime;
 use hammer_runtime::{DataPlaneBarrierHandle, DataPlaneRuntime, NodeResult};
-use hammer_runtime::RuntimeError;
 
 use crate::opaque::NetworkOpaque;
 

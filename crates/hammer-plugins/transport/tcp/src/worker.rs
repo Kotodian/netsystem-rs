@@ -5,8 +5,8 @@ use crate::TcpPacket;
 use crate::{TcpSeq, TcpState};
 use hammer_core::data_plane::DataPlaneBuffers;
 use hammer_infra::pool::{Index, Pool};
-use hammer_runtime::{DataPlaneRuntime, DataWorkerId};
 use hammer_runtime::RuntimeResult;
+use hammer_runtime::{DataPlaneRuntime, DataWorkerId};
 
 use super::lookup::TcpLookupState;
 use super::timers::{TcpTimerKind, TcpTimers};

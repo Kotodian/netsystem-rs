@@ -240,11 +240,12 @@ std::thread_local! {
 pub(crate) fn register_protocol(protocol: u8, node: NodeId) -> RuntimeResult<()> {
     IP_LOCAL_PROTOCOL_REGISTRATION.with(|registration| {
         let registration = registration.borrow();
-        let (control, nodes, consumer) = registration.as_ref().ok_or(
-            crate::ip::IpControlError::NodeRuntimeUnavailable {
-                operation: crate::ip::IpControlOperation::IpProtocolRegistration,
-            },
-        )?;
+        let (control, nodes, consumer) =
+            registration
+                .as_ref()
+                .ok_or(crate::ip::IpControlError::NodeRuntimeUnavailable {
+                    operation: crate::ip::IpControlOperation::IpProtocolRegistration,
+                })?;
         let slot = nodes.add_node_next_slot(*consumer, node)?;
         control.publish_protocol_slot(protocol, slot);
         Ok(())

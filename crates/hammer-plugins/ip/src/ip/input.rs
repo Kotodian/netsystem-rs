@@ -2,11 +2,11 @@ use std::mem::transmute;
 use std::sync::{Mutex, OnceLock};
 
 use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId};
+use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
     DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, TraceFormatter,
     add_packet_trace, format_packet_trace, unlikely,
 };
-use hammer_runtime::RuntimeResult;
 
 use crate::ip::{
     IpInputError, IpInputTarget, IpProtocol, IpVersion, network_for_protocol, parse_ip_header,

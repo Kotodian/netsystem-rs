@@ -1143,10 +1143,10 @@ fn apply_adjacency_rewrite(
     let rewrite = adjacency.rewrite.as_slice();
     let mut buffer = runtime.get_buffer_mut(index)?;
     if !rewrite.is_empty() {
-        buffer
-            .advance(-isize::try_from(rewrite.len()).map_err(|_| {
-                IpLookupError::RewriteTooLong { len: rewrite.len() }
-            })?)?;
+        buffer.advance(
+            -isize::try_from(rewrite.len())
+                .map_err(|_| IpLookupError::RewriteTooLong { len: rewrite.len() })?,
+        )?;
         buffer.current_mut()[..rewrite.len()].copy_from_slice(rewrite);
     }
     if !rewrite.is_empty() {

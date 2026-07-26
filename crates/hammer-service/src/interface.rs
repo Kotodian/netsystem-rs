@@ -369,11 +369,7 @@ impl InterfaceControlPlane {
         })
     }
 
-    pub fn remove_address(
-        &self,
-        interface_index: u32,
-        address: IpNet,
-    ) -> InterfaceResult<bool> {
+    pub fn remove_address(&self, interface_index: u32, address: IpNet) -> InterfaceResult<bool> {
         self.ensure_interface(interface_index)?;
         self.synchronize(|| {
             let current = self.inner.state();
@@ -410,10 +406,7 @@ impl InterfaceControlPlane {
     }
 
     #[inline]
-    fn synchronize<R>(
-        &self,
-        operation: impl FnOnce() -> InterfaceResult<R>,
-    ) -> InterfaceResult<R> {
+    fn synchronize<R>(&self, operation: impl FnOnce() -> InterfaceResult<R>) -> InterfaceResult<R> {
         if let Some(barrier) = &self.barrier {
             barrier.synchronize(operation)
         } else {

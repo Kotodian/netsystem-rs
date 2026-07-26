@@ -855,9 +855,10 @@ pub(crate) fn closing_session_for_test() -> (
         .expect("TCP connection")
         .attach_session(session_id)
         .expect("attach stream session");
-    publish_tcp_connection(&mut sessions, &mut tcp, session_id)
-        .expect("publish TCP connection");
-    sessions.connected(session_id).expect("notify accepted session");
+    publish_tcp_connection(&mut sessions, &mut tcp, session_id).expect("publish TCP connection");
+    sessions
+        .connected(session_id)
+        .expect("notify accepted session");
     (sessions, tcp, session_id, local, remote)
 }
 

@@ -197,11 +197,12 @@ impl SessionQueueNode {
             let mut nodes = nodes
                 .try_borrow_mut()
                 .map_err(|_| SessionQueueError::AttachmentRegistryBorrowed)?;
-            let node = nodes
-                .get_mut(attachment_slot)
-                .ok_or(SessionQueueError::AttachmentSlotMissing {
-                    slot: attachment_slot,
-                })?;
+            let node =
+                nodes
+                    .get_mut(attachment_slot)
+                    .ok_or(SessionQueueError::AttachmentSlotMissing {
+                        slot: attachment_slot,
+                    })?;
             node.push(SessionQueueAttachment {
                 output_next,
                 dispatch,
