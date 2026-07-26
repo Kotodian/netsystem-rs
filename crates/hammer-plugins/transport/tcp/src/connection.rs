@@ -127,6 +127,47 @@ impl TcpKeepaliveState {
     }
 }
 
+/// Effective work a timer expiry actually performed: a recovery sample was
+/// selected or a probe segment/TX intent was produced. Stale tokens, missing
+/// samples, and state mismatches yield no action and must not be counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TcpTimerAction {
+    RtoRetransmit,
+    RackRetransmit,
+    TlpProbe,
+    PersistProbe,
+    KeepaliveProbe,
+}
+
+#[derive(Debug)]
+pub(crate) struct TcpTimerOutcome {
+    pub(crate) segment: Option<TcpSegment>,
+    pub(crate) action: Option<TcpTimerAction>,
+}
+
+impl TcpTimerOutcome {
+    const fn none() -> Self {
+        Self {
+            segment: None,
+            action: None,
+        }
+    }
+
+    const fn segment(segment: Option<TcpSegment>) -> Self {
+        Self {
+            segment,
+            action: None,
+        }
+    }
+
+    const fn acted(action: TcpTimerAction, segment: Option<TcpSegment>) -> Self {
+        Self {
+            segment,
+            action: Some(action),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpRetransmitTimeoutState {
     srtt: Option<Duration>,
@@ -2006,19 +2047,19 @@ impl TcpConnection {
         kind: TcpTimerKind,
         local_capabilities: TcpCapabilities,
         now: Instant,
-    ) -> RuntimeResult<Option<TcpSegment>> {
+    ) -> RuntimeResult<TcpTimerOutcome> {
         if !self.timer_dispatch_pending(kind) {
-            return Ok(None);
+            return Ok(TcpTimerOutcome::none());
         }
-        let segment = match kind {
+        let outcome = match kind {
             TcpTimerKind::Retransmit => self.on_retransmit_timer_expiry(local_capabilities),
             TcpTimerKind::Rack => self.on_rack_timer_expiry(),
             TcpTimerKind::Tlp => self.on_tlp_timer_expiry(),
-            TcpTimerKind::DelayedAck => self.on_delayed_ack_timer_expiry(),
+            TcpTimerKind::DelayedAck => TcpTimerOutcome::segment(self.on_delayed_ack_timer_expiry()),
             TcpTimerKind::Persist => self.on_persist_timer_expiry(),
             TcpTimerKind::KeepAlive => self.on_keepalive_timer_expiry(),
-            TcpTimerKind::TimeWait => self.on_time_wait_timer_expiry(),
-            TcpTimerKind::Pacing => self.on_pacing_timer_expiry(),
+            TcpTimerKind::TimeWait => TcpTimerOutcome::segment(self.on_time_wait_timer_expiry()),
+            TcpTimerKind::Pacing => TcpTimerOutcome::segment(self.on_pacing_timer_expiry()),
         };
 
         match kind {
@@ -2078,7 +2119,7 @@ impl TcpConnection {
             }
             TcpTimerKind::DelayedAck | TcpTimerKind::TimeWait => {}
         }
-        Ok(segment)
+        Ok(outcome)
     }
 
     fn timer_dispatch_pending(&self, kind: TcpTimerKind) -> bool {
@@ -2096,90 +2137,110 @@ impl TcpConnection {
     fn on_retransmit_timer_expiry(
         &mut self,
         local_capabilities: TcpCapabilities,
-    ) -> Option<TcpSegment> {
+    ) -> TcpTimerOutcome {
         if self.state == TcpState::SynSent {
             self.observe_retransmit_timeout();
-            let local = self.local?;
+            let Some(local) = self.local else {
+                return TcpTimerOutcome::none();
+            };
             let capabilities = normalize_tcp_capabilities(local_capabilities);
             let flags = if capabilities.ecn {
                 TcpSegmentFlags::SYN | TcpSegmentFlags::ECE | TcpSegmentFlags::CWR
             } else {
                 TcpSegmentFlags::SYN
             };
-            return Some(TcpSegment::new(
-                local,
-                self.remote,
-                self.iss.raw(),
-                self.rcv_nxt.raw(),
-                self.advertised_receive_window(self.rcv_wnd),
-                flags,
-                capabilities,
-                None,
-                self.next_local_timestamp(capabilities.timestamps),
-                self.fast_open_cookie(),
-                None,
-                self.fast_open_syn_payload_len as usize,
-            ));
+            return TcpTimerOutcome::acted(
+                TcpTimerAction::RtoRetransmit,
+                Some(TcpSegment::new(
+                    local,
+                    self.remote,
+                    self.iss.raw(),
+                    self.rcv_nxt.raw(),
+                    self.advertised_receive_window(self.rcv_wnd),
+                    flags,
+                    capabilities,
+                    None,
+                    self.next_local_timestamp(capabilities.timestamps),
+                    self.fast_open_cookie(),
+                    None,
+                    self.fast_open_syn_payload_len as usize,
+                )),
+            );
         }
         match self.state {
             TcpState::Established => {
                 let now = Instant::now();
-                let sample = self.recovery.on_retransmission_timeout(
+                let Some(sample) = self.recovery.on_retransmission_timeout(
                     now,
                     self.snd_nxt,
                     &mut self.congestion,
-                )?;
+                ) else {
+                    return TcpTimerOutcome::none();
+                };
                 self.observe_retransmit_timeout();
                 self.tx_intent_sequence = Some(sample.sequence);
                 self.tx_intent_payload_len = sample.payload_len;
                 self.pacing_ready = true;
-                None
+                TcpTimerOutcome::acted(TcpTimerAction::RtoRetransmit, None)
             }
             TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck => {
                 self.observe_retransmit_timeout();
-                let local = self.local?;
-                Some(TcpSegment::new(
-                    local,
-                    self.remote,
-                    self.snd_una.raw(),
-                    self.rcv_nxt.raw(),
-                    self.advertised_receive_window(self.rcv_wnd),
-                    TcpSegmentFlags::ACK | TcpSegmentFlags::FIN,
-                    self.output_capabilities(),
-                    None,
-                    self.next_local_timestamp(self.negotiated_options().timestamps),
-                    None,
-                    None,
-                    0,
-                ))
+                let Some(local) = self.local else {
+                    return TcpTimerOutcome::none();
+                };
+                TcpTimerOutcome::acted(
+                    TcpTimerAction::RtoRetransmit,
+                    Some(TcpSegment::new(
+                        local,
+                        self.remote,
+                        self.snd_una.raw(),
+                        self.rcv_nxt.raw(),
+                        self.advertised_receive_window(self.rcv_wnd),
+                        TcpSegmentFlags::ACK | TcpSegmentFlags::FIN,
+                        self.output_capabilities(),
+                        None,
+                        self.next_local_timestamp(self.negotiated_options().timestamps),
+                        None,
+                        None,
+                        0,
+                    )),
+                )
             }
-            _ => None,
+            _ => TcpTimerOutcome::none(),
         }
     }
 
-    fn on_rack_timer_expiry(&mut self) -> Option<TcpSegment> {
-        self.ensure_state(TcpState::Established).ok()?;
+    fn on_rack_timer_expiry(&mut self) -> TcpTimerOutcome {
+        if self.ensure_state(TcpState::Established).is_err() {
+            return TcpTimerOutcome::none();
+        }
         let now = Instant::now();
         self.recovery
             .on_rack_timeout(now, self.snd_nxt, &mut self.congestion);
-        let sample = self.recovery.take_rack_retransmit()?;
+        let Some(sample) = self.recovery.take_rack_retransmit() else {
+            return TcpTimerOutcome::none();
+        };
         self.recovery.on_retransmit_sent(sample.bytes);
         self.tx_intent_sequence = Some(sample.sequence);
         self.tx_intent_payload_len = sample.payload_len;
         self.pacing_ready = true;
-        None
+        TcpTimerOutcome::acted(TcpTimerAction::RackRetransmit, None)
     }
 
-    fn on_tlp_timer_expiry(&mut self) -> Option<TcpSegment> {
-        self.ensure_state(TcpState::Established).ok()?;
-        let sample = self.recovery.take_tlp_probe()?;
+    fn on_tlp_timer_expiry(&mut self) -> TcpTimerOutcome {
+        if self.ensure_state(TcpState::Established).is_err() {
+            return TcpTimerOutcome::none();
+        }
+        let Some(sample) = self.recovery.take_tlp_probe() else {
+            return TcpTimerOutcome::none();
+        };
         if self.recovery.in_recovery() {
             self.recovery.on_retransmit_sent(sample.bytes);
         }
         self.tx_intent_sequence = Some(sample.sequence);
         self.tx_intent_payload_len = sample.payload_len;
         self.pacing_ready = true;
-        None
+        TcpTimerOutcome::acted(TcpTimerAction::TlpProbe, None)
     }
 
     fn on_delayed_ack_timer_expiry(&mut self) -> Option<TcpSegment> {
@@ -2201,20 +2262,22 @@ impl TcpConnection {
         ))
     }
 
-    fn on_persist_timer_expiry(&mut self) -> Option<TcpSegment> {
-        self.ensure_state(TcpState::Established).ok()?;
+    fn on_persist_timer_expiry(&mut self) -> TcpTimerOutcome {
+        if self.ensure_state(TcpState::Established).is_err() {
+            return TcpTimerOutcome::none();
+        }
         if self.snd_wnd != 0 {
             self.cacheline1.persist_attempts = 0;
-            return None;
+            return TcpTimerOutcome::none();
         }
         self.cacheline1.persist_attempts = self.cacheline1.persist_attempts.saturating_add(1);
         if self.tx_intent_sequence.is_some() {
-            return None;
+            return TcpTimerOutcome::none();
         }
         self.tx_intent_sequence = Some(self.snd_una);
         self.tx_intent_payload_len = 1;
         self.pacing_ready = true;
-        None
+        TcpTimerOutcome::acted(TcpTimerAction::PersistProbe, None)
     }
 
     fn on_time_wait_timer_expiry(&mut self) -> Option<TcpSegment> {
@@ -2223,29 +2286,36 @@ impl TcpConnection {
         None
     }
 
-    fn on_keepalive_timer_expiry(&mut self) -> Option<TcpSegment> {
-        self.ensure_state(TcpState::Established).ok()?;
+    fn on_keepalive_timer_expiry(&mut self) -> TcpTimerOutcome {
+        if self.ensure_state(TcpState::Established).is_err() {
+            return TcpTimerOutcome::none();
+        }
         if self.keepalive.probes_sent >= self.keepalive.config.probe_limit {
             self.cacheline1.close_reason = Some(TcpCloseReason::KeepAliveTimeout);
             self.state = TcpState::Closed;
-            return None;
+            return TcpTimerOutcome::none();
         }
         self.keepalive.probes_sent = self.keepalive.probes_sent.saturating_add(1);
-        let local = self.local?;
-        Some(TcpSegment::new(
-            local,
-            self.remote(),
-            self.snd_nxt().wrapping_sub(1),
-            self.rcv_nxt(),
-            self.advertised_receive_window(self.rcv_wnd),
-            self.output_flags(TcpSegmentFlags::ACK),
-            self.output_capabilities(),
-            None,
-            self.next_local_timestamp(self.negotiated_options().timestamps),
-            None,
-            None,
-            0,
-        ))
+        let Some(local) = self.local else {
+            return TcpTimerOutcome::none();
+        };
+        TcpTimerOutcome::acted(
+            TcpTimerAction::KeepaliveProbe,
+            Some(TcpSegment::new(
+                local,
+                self.remote(),
+                self.snd_nxt().wrapping_sub(1),
+                self.rcv_nxt(),
+                self.advertised_receive_window(self.rcv_wnd),
+                self.output_flags(TcpSegmentFlags::ACK),
+                self.output_capabilities(),
+                None,
+                self.next_local_timestamp(self.negotiated_options().timestamps),
+                None,
+                None,
+                0,
+            )),
+        )
     }
 
     fn on_pacing_timer_expiry(&mut self) -> Option<TcpSegment> {
@@ -2569,6 +2639,7 @@ mod tests {
                 now + Duration::from_millis(10),
             )
             .expect("dispatch delayed ACK")
+            .segment
             .expect("ACK output");
         assert_eq!(ack.payload_len(), 0);
         assert!(timers.take_pending(&mut connections).is_none());
@@ -3225,7 +3296,7 @@ mod tests {
         timers.advance(now + Duration::from_millis(10), &mut connections);
         let rack = timers.take_pending(&mut connections).expect("RACK expiry");
         assert_eq!(rack.kind, TcpTimerKind::Rack);
-        connections
+        let rack_outcome = connections
             .get_mut(rack.index)
             .expect("RACK connection")
             .on_typed_timer_expiry(
@@ -3236,6 +3307,7 @@ mod tests {
                 now + Duration::from_millis(10),
             )
             .expect("dispatch RACK");
+        assert_eq!(rack_outcome.action, Some(TcpTimerAction::RackRetransmit));
         assert_eq!(
             connections
                 .get(rack_index)
@@ -3247,7 +3319,7 @@ mod tests {
         timers.advance(now + Duration::from_millis(20), &mut connections);
         let tlp = timers.take_pending(&mut connections).expect("TLP expiry");
         assert_eq!(tlp.kind, TcpTimerKind::Tlp);
-        connections
+        let tlp_outcome = connections
             .get_mut(tlp.index)
             .expect("TLP connection")
             .on_typed_timer_expiry(
@@ -3258,6 +3330,7 @@ mod tests {
                 now + Duration::from_millis(20),
             )
             .expect("dispatch TLP");
+        assert_eq!(tlp_outcome.action, Some(TcpTimerAction::TlpProbe));
         assert_eq!(
             connections
                 .get(tlp_index)
@@ -3609,6 +3682,7 @@ mod tests {
                 now,
             )
             .expect("dispatch retransmit")
+            .segment
             .expect("retransmit");
         let mut header = [0u8; 64];
         let header_len = segment.write_header(&mut header).expect("write header");

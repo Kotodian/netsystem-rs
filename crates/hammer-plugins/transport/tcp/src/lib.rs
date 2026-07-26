@@ -494,20 +494,22 @@ pub enum TcpNodeError {
     NoListener,
     #[error("connection create failed")]
     ConnectionCreate,
-    #[error("RACK timeout")]
-    RackTimeout,
+    #[error("RACK retransmit")]
+    RackRetransmit,
     #[error("TLP probe")]
     TlpProbe,
-    #[error("retransmit")]
+    #[error("RTO retransmit")]
     Retransmit,
     #[error("pacing limited")]
     PacingLimited,
-    #[error("persist timer")]
-    PersistTimer,
+    #[error("persist probe")]
+    PersistProbe,
     #[error("BBR congestion")]
     BbrCongestion,
     #[error("bad window")]
     BadWindow,
+    #[error("keepalive probe")]
+    KeepaliveProbe,
 }
 
 impl TcpNodeError {
@@ -531,12 +533,13 @@ impl From<TcpNodeError> for TcpError {
             | TcpNodeError::ConnectionCreate => TcpError::InvalidConnection,
             TcpNodeError::TimerUpdateFailed
             | TcpNodeError::TxOffsetOverflow
-            | TcpNodeError::RackTimeout
+            | TcpNodeError::RackRetransmit
             | TcpNodeError::TlpProbe
             | TcpNodeError::Retransmit
             | TcpNodeError::PacingLimited
-            | TcpNodeError::PersistTimer
-            | TcpNodeError::BbrCongestion => TcpError::Dispatch,
+            | TcpNodeError::PersistProbe
+            | TcpNodeError::BbrCongestion
+            | TcpNodeError::KeepaliveProbe => TcpError::Dispatch,
             TcpNodeError::BadChecksum | TcpNodeError::BadSegment => TcpError::SegmentInvalid,
             TcpNodeError::ResetReceived => TcpError::ConnectionClosed,
             TcpNodeError::NoListener => TcpError::NoListener,

@@ -8,6 +8,7 @@ use hammer_infra::pool::{Index, Pool};
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{DataPlaneRuntime, DataWorkerId};
 
+use super::connection::TcpTimerAction;
 use super::lookup::TcpLookupState;
 use super::timers::{TcpTimerKind, TcpTimers};
 use super::{TcpConnection, TcpNodeError, enqueue_tcp_segment};
@@ -159,7 +160,7 @@ impl SessionTransport<Index> for TcpWorker {
     ) -> RuntimeResult<()> {
         self.timers.advance(now, &mut self.connections);
         while let Some(token) = self.timers.take_pending(&mut self.connections) {
-            let (session_id, segment) = {
+            let (session_id, outcome) = {
                 let Self {
                     connections,
                     lookup,
@@ -172,16 +173,26 @@ impl SessionTransport<Index> for TcpWorker {
                 let capabilities = lookup
                     .pending_open_capabilities(session_id)
                     .unwrap_or_default();
-                let segment = connection.on_typed_timer_expiry(
+                let outcome = connection.on_typed_timer_expiry(
                     token.index,
                     timers,
                     token.kind,
                     capabilities,
                     now,
                 )?;
-                (session_id, segment)
+                (session_id, outcome)
             };
-            if let Some(segment) = segment {
+            if let Some(action) = outcome.action {
+                let counter = match action {
+                    TcpTimerAction::RtoRetransmit => TcpNodeError::Retransmit,
+                    TcpTimerAction::RackRetransmit => TcpNodeError::RackRetransmit,
+                    TcpTimerAction::TlpProbe => TcpNodeError::TlpProbe,
+                    TcpTimerAction::PersistProbe => TcpNodeError::PersistProbe,
+                    TcpTimerAction::KeepaliveProbe => TcpNodeError::KeepaliveProbe,
+                };
+                let _ = runtime.record_current_node_error(counter.code());
+            }
+            if let Some(segment) = outcome.segment {
                 if segment.payload_len() == 0 {
                     enqueue_tcp_segment(runtime, frame, output_next, output, segment)?;
                 } else {
