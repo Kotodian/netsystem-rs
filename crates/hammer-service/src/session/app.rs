@@ -794,7 +794,7 @@ mod tests {
     fn listener_manager_keeps_segment_zero_and_releases_empty_growth_segment() {
         let app = AppWorker::default_local().expect("app worker");
         let mut manager = SegmentManager::new(None);
-        let config = AppSessionConfig::new(700_000, 4);
+        let config = AppSessionConfig::new(524_288, 4);
         let segment_zero_handle = SessionHandle::new(0, 0);
         let growth_segment_handle = SessionHandle::new(1, 0);
         let segment_zero_session = manager

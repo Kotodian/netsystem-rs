@@ -53,6 +53,15 @@ fn count_open_identity(identity: (libc::dev_t, libc::ino_t)) -> usize {
         .count()
 }
 
+/// Exact descriptor counting needs distinct fstat identities per object;
+/// macOS reports degenerate shared identities for shm and socket
+/// descriptors, so only Linux asserts the count.
+fn assert_identity_count(identity: (libc::dev_t, libc::ino_t), expected: usize) {
+    if cfg!(target_os = "linux") {
+        assert_eq!(count_open_identity(identity), expected);
+    }
+}
+
 struct PublishedSession {
     session: Arc<AppSession>,
     publication: AppSessionPublication,
@@ -208,7 +217,7 @@ fn assert_publish_then_connect_round_trips_handle_and_descriptors() {
 
     let client = AppClient::connect(&path_text).expect("attach client");
     assert_eq!(client.session_handle(), handle);
-    assert_eq!(count_open_identity(identity), baseline + 1);
+    assert_identity_count(identity, baseline + 1);
 
     // Dataplane -> app across the shared session segment and event queue.
     published
@@ -233,7 +242,7 @@ fn assert_publish_then_connect_round_trips_handle_and_descriptors() {
     assert_eq!(event.evt_type, SessionEvtType::TxDeq);
 
     drop(client);
-    assert_eq!(count_open_identity(identity), baseline);
+    assert_identity_count(identity, baseline);
     let _ = std::fs::remove_file(path);
 }
 
@@ -363,7 +372,7 @@ fn assert_offset_overflow_closes_every_received_descriptor() {
     let result = AppClient::connect(path.to_str().expect("socket path"));
     assert!(matches!(result, Err(AppClientError::OffsetOverflow)));
     let (sent, peer, identity, baseline) = server_thread.join().expect("join offset server");
-    assert_eq!(count_open_identity(identity), baseline);
+    assert_identity_count(identity, baseline);
     drop(sent);
     drop(peer);
     let _ = std::fs::remove_file(path);
@@ -388,7 +397,7 @@ fn assert_mapping_failure_closes_every_received_descriptor() {
         Err(AppClientError::SessionSegmentMap { .. })
     ));
     let (sent, peer, identity, baseline) = server_thread.join().expect("join mapping server");
-    assert_eq!(count_open_identity(identity), baseline);
+    assert_identity_count(identity, baseline);
     drop(sent);
     drop(peer);
     let _ = std::fs::remove_file(path);
