@@ -176,9 +176,15 @@ fn handle_plugin_load(engine: &mut Engine, request: &[u8]) -> Vec<u8> {
             ));
         }
     };
-    let result =
-        super::load_current_config().and_then(|config| engine.load_plugins(&roots, &config));
-    match result {
+    let config = match super::load_current_config() {
+        Ok(config) => config,
+        Err(_) => {
+            return encode_plugin_reply(PluginCommandReply::Error(
+                PluginCommandError::Configuration,
+            ));
+        }
+    };
+    match engine.load_plugins(&roots, &config) {
         Ok(()) => {
             let names = engine.loaded_plugins();
             let names = names.iter().map(String::as_str).collect();

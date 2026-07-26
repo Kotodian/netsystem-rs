@@ -18,6 +18,22 @@ use super::lookup::{
     TcpLookupId, TcpLookupSnapshot, TcpLookupValue, TcpV4ListenerKey, TcpV6ListenerKey,
 };
 
+#[derive(Debug, thiserror::Error)]
+pub enum TcpListenerControlError {
+    #[error("tcp listener {bind} is already registered")]
+    AlreadyRegistered { bind: SocketAddr },
+    #[error("tcp listener {lookup_id} is not registered")]
+    NotRegistered { lookup_id: TcpLookupId },
+    #[error("tcp lookup id space is exhausted")]
+    LookupIdExhausted,
+}
+
+impl From<TcpListenerControlError> for RuntimeError {
+    fn from(error: TcpListenerControlError) -> Self {
+        Self::subsystem("tcp", error)
+    }
+}
+
 #[derive(Clone)]
 struct TcpListenerRegistration {
     lookup_id: TcpLookupId,
@@ -92,9 +108,7 @@ impl TcpListenerControlState {
             .iter()
             .any(|registration| registration.bind == bind)
         {
-            return Err(RuntimeError::invariant(format!(
-                "tcp listener {bind} is already registered"
-            )));
+            return Err(TcpListenerControlError::AlreadyRegistered { bind }.into());
         }
 
         let lookup_id = self.alloc_tcp_lookup_id()?;
@@ -115,11 +129,7 @@ impl TcpListenerControlState {
             .tcp_listener_slots
             .get(&u64::from(lookup_id))
             .copied()
-            .ok_or_else(|| {
-                RuntimeError::invariant(format!(
-                    "tcp listener {lookup_id} is not registered in tcp main"
-                ))
-            })?;
+            .ok_or(TcpListenerControlError::NotRegistered { lookup_id })?;
         self.tcp_listeners
             .drain(slot..slot + 1)
             .next()
@@ -133,7 +143,7 @@ impl TcpListenerControlState {
         self.next_tcp_lookup_id = self
             .next_tcp_lookup_id
             .checked_add(1)
-            .ok_or_else(|| RuntimeError::invariant("tcp lookup id overflow"))?;
+            .ok_or(TcpListenerControlError::LookupIdExhausted)?;
         Ok(id)
     }
 
@@ -147,11 +157,7 @@ impl TcpListenerControlState {
             };
             insert_tcp_listener_key(&mut snapshot, registration.bind, value);
         }
-        self.tcp_control
-            .publish_lookup(snapshot.clone())
-            .map_err(|err| {
-                RuntimeError::invariant(format!("publish tcp lookup snapshot: {err}"))
-            })?;
+        self.tcp_control.publish_lookup(snapshot.clone())?;
         self.tcp_lookup = snapshot;
         Ok(())
     }

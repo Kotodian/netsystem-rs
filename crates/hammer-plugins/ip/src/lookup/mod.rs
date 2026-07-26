@@ -199,9 +199,7 @@ impl FibContributions {
             (Some(FibContribution::Drop), FibContribution::Drop)
             | (Some(FibContribution::Receive), FibContribution::Receive) => {}
             (Some(_), _) => {
-                return Err(RuntimeError::invariant(
-                    "one FIB source contributed incompatible route semantics",
-                ));
+                return Err(IpLookupError::FibSourceConflict { prefix }.into());
             }
         }
         Ok(())
@@ -283,7 +281,7 @@ impl IpMain {
         let contributions = self
             .contributions
             .lock()
-            .map_err(|_| RuntimeError::invariant("IP FIB contribution state is poisoned"))?;
+            .map_err(|_| IpLookupError::FibContributionsPoisoned)?;
         Self::compile_contributions(&contributions)
     }
 
@@ -295,9 +293,7 @@ impl IpMain {
         let mut builder = FibTableBuilder::<u16>::new(drop_next);
         for (prefix, sources) in &contributions.by_prefix {
             let Some((_, action)) = sources.iter().next() else {
-                return Err(RuntimeError::invariant(
-                    "IP FIB prefix has no source contribution",
-                ));
+                return Err(IpLookupError::FibPrefixEmpty { prefix: *prefix }.into());
             };
             match action {
                 FibContribution::Drop => {
@@ -431,7 +427,7 @@ impl IpMain {
             }
             interface_index = interface_index
                 .checked_add(1)
-                .ok_or_else(|| RuntimeError::invariant("interface index space is exhausted"))?;
+                .ok_or(IpLookupError::InterfaceIndexSpaceExhausted)?;
         }
         Ok(())
     }
@@ -444,7 +440,7 @@ impl IpMain {
         let mut current = self
             .contributions
             .lock()
-            .map_err(|_| RuntimeError::invariant("IP FIB contribution state is poisoned"))?;
+            .map_err(|_| IpLookupError::FibContributionsPoisoned)?;
         let mut next = current.clone();
         if !next.remove(prefix, source) {
             return Ok(false);
@@ -463,9 +459,11 @@ impl IpMain {
         }
         let control = Arc::new(IpLookupControlPlane::new(self.build_table()?));
         if self.control.set(Arc::clone(&control)).is_err() {
-            return self.control.get().cloned().ok_or_else(|| {
-                RuntimeError::invariant("IP lookup control plane was not installed")
-            });
+            return self
+                .control
+                .get()
+                .cloned()
+                .ok_or_else(|| IpLookupError::ControlPlaneMissing.into());
         }
         Ok(control)
     }
@@ -477,15 +475,41 @@ impl IpMain {
     }
 }
 
-fn host_prefix(address: ipnet::IpNet) -> RuntimeResult<ipnet::IpNet> {
-    match address {
-        ipnet::IpNet::V4(address) => ipnet::Ipv4Net::new(address.addr(), 32)
-            .map(ipnet::IpNet::V4)
-            .map_err(|error| RuntimeError::invariant(format!("invalid IPv4 host prefix: {error}"))),
-        ipnet::IpNet::V6(address) => ipnet::Ipv6Net::new(address.addr(), 128)
-            .map(ipnet::IpNet::V6)
-            .map_err(|error| RuntimeError::invariant(format!("invalid IPv6 host prefix: {error}"))),
+/// Recoverable IP FIB/lookup control-plane failures.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum IpLookupError {
+    #[error("FIB prefix {prefix} received incompatible route semantics from one source")]
+    FibSourceConflict { prefix: ipnet::IpNet },
+    #[error("FIB prefix {prefix} has no source contribution")]
+    FibPrefixEmpty { prefix: ipnet::IpNet },
+    #[error("interface index space is exhausted")]
+    InterfaceIndexSpaceExhausted,
+    #[error("IP lookup control plane was not installed")]
+    ControlPlaneMissing,
+    #[error("FIB contribution table lock is poisoned")]
+    FibContributionsPoisoned,
+    #[error("host prefix for {address} is invalid")]
+    HostPrefixInvalid {
+        address: ipnet::IpNet,
+        #[source]
+        source: ipnet::PrefixLenError,
+    },
+    #[error("adjacency rewrite length {len} exceeds isize")]
+    RewriteTooLong { len: usize },
+}
+
+impl From<IpLookupError> for RuntimeError {
+    fn from(error: IpLookupError) -> Self {
+        Self::subsystem("ip", error)
     }
+}
+
+fn host_prefix(address: ipnet::IpNet) -> RuntimeResult<ipnet::IpNet> {
+    let host = match address {
+        ipnet::IpNet::V4(net) => ipnet::Ipv4Net::new(net.addr(), 32).map(ipnet::IpNet::V4),
+        ipnet::IpNet::V6(net) => ipnet::Ipv6Net::new(net.addr(), 128).map(ipnet::IpNet::V6),
+    };
+    host.map_err(|source| IpLookupError::HostPrefixInvalid { address, source }.into())
 }
 
 fn validate_via_family(prefix: ipnet::IpNet, via: IpAddr) -> RuntimeResult<()> {
@@ -535,7 +559,7 @@ fn configure_ip(config: NetworkIpConfig, engine: &mut hammer_runtime::Engine) ->
 )]
 fn init_ip() -> RuntimeResult<()> {
     if IP_MAIN.load().is_none() {
-        return Err(RuntimeError::invariant("IP configuration was not installed").into());
+        return Err(RuntimeError::PluginStateNotInitialized { plugin: "ip" });
     }
     Ok(())
 }
@@ -544,7 +568,7 @@ pub fn register_ip_lookup(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     IP_MAIN
         .load()
         .as_deref()
-        .ok_or_else(|| RuntimeError::invariant("ip main not initialized"))?
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "ip" })?
         .register_node(runtime)
 }
 
@@ -902,7 +926,7 @@ pub fn register_adjacency_rewrite(runtime: &DataPlaneRuntime) -> RuntimeResult<N
     let main_guard = IP_MAIN.load();
     let main = main_guard
         .as_ref()
-        .ok_or_else(|| RuntimeError::invariant("ip main not initialized"))?;
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "ip" })?;
     let control = main.control_plane()?;
     runtime.nodes().try_register_internal_with_next_names(
         AdjacencyRewriteNode::new(control.table_handle()),
@@ -962,20 +986,36 @@ fn ip_lookup_runtime(data: NodeRuntimeData) -> RuntimeResult<LookupRuntime> {
     let slot = data.usize_word(0)?;
     lookup_runtimes()
         .lock()
-        .map_err(|_| RuntimeError::invariant("IP lookup runtime registry poisoned"))?
+        .map_err(|_| crate::ip::IpControlError::RuntimeRegistryPoisoned {
+            registry: crate::ip::IpRuntimeRegistry::IpLookup,
+        })?
         .get(slot)
         .cloned()
-        .ok_or_else(|| RuntimeError::invariant("IP lookup runtime slot is invalid"))
+        .ok_or_else(|| {
+            crate::ip::IpControlError::RuntimeSlotInvalid {
+                registry: crate::ip::IpRuntimeRegistry::IpLookup,
+                slot,
+            }
+            .into()
+        })
 }
 
 fn adjacency_rewrite_runtime(data: NodeRuntimeData) -> RuntimeResult<AdjacencyRewriteRuntime> {
     let slot = data.usize_word(0)?;
     adjacency_rewrite_runtimes()
         .lock()
-        .map_err(|_| RuntimeError::invariant("adjacency rewrite runtime registry poisoned"))?
+        .map_err(|_| crate::ip::IpControlError::RuntimeRegistryPoisoned {
+            registry: crate::ip::IpRuntimeRegistry::AdjacencyRewrite,
+        })?
         .get(slot)
         .cloned()
-        .ok_or_else(|| RuntimeError::invariant("adjacency rewrite runtime slot is invalid"))
+        .ok_or_else(|| {
+            crate::ip::IpControlError::RuntimeSlotInvalid {
+                registry: crate::ip::IpRuntimeRegistry::AdjacencyRewrite,
+                slot,
+            }
+            .into()
+        })
 }
 
 fn ip_lookup_process(
@@ -1105,7 +1145,7 @@ fn apply_adjacency_rewrite(
     if !rewrite.is_empty() {
         buffer
             .advance(-isize::try_from(rewrite.len()).map_err(|_| {
-                RuntimeError::invariant("adjacency rewrite length exceeds isize")
+                IpLookupError::RewriteTooLong { len: rewrite.len() }
             })?)?;
         buffer.current_mut()[..rewrite.len()].copy_from_slice(rewrite);
     }

@@ -7,6 +7,7 @@ use crate::app::session_msg_queue::SessionMsgQueue;
 /// Offsets for the four session queues within a shared segment.
 /// These are filled in by the dataplane when it pre-allocates session
 /// resources, then sent to the app process via SCM_RIGHTS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionOffsets {
     pub rx_fifo_off: u64,
     pub tx_fifo_off: u64,

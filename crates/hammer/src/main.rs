@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use hammer_runtime::RuntimeRegistry;
+use hammer_runtime::attach::AppServer;
 use hammer_runtime::config::{Memory, Worker};
 use hammer_runtime::engine::{Engine, EnginePool};
 use hammer_runtime::log::Level;
@@ -164,7 +165,7 @@ fn config_path_from_args() -> PathBuf {
 }
 
 fn run(config: String, roots: Vec<String>, worker: Worker) {
-    let registry = Arc::new(RuntimeRegistry::new());
+    let registry = RuntimeRegistry::new();
     let engine = Engine::new_configured(Arc::clone(&registry), worker).unwrap_or_else(|error| {
         eprintln!("Failed to construct configured runtime: {error}");
         std::process::exit(1);
@@ -195,10 +196,24 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
     drop(config);
 
     let listener = pool.take_ipc_listener().expect("IPC listener configured");
+    let attach_server = registry.get::<AppServer>();
 
     tracing::info!("hammer started");
 
-    rt.block_on(ipc_loop::clnt_loop(listener));
+    rt.block_on(async move {
+        if let Some(server) = attach_server {
+            tokio::select! {
+                () = ipc_loop::clnt_loop(listener) => {}
+                result = server.serve() => {
+                    if let Err(error) = result {
+                        tracing::error!(%error, "application attach server failed");
+                    }
+                }
+            }
+        } else {
+            ipc_loop::clnt_loop(listener).await;
+        }
+    });
 
     let pool_engine = pool.main_engine_mut();
     EnginePool::main_loop_exit(pool_engine);
@@ -210,10 +225,8 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
     Engine::uninstall_current();
 }
 
-fn read_config(path: &Path) -> RuntimeResult<String> {
-    std::fs::read_to_string(path).map_err(|error| {
-        RuntimeError::invariant(format!("read config {}: {error}", path.display()))
-    })
+fn read_config(path: &Path) -> std::io::Result<String> {
+    std::fs::read_to_string(path)
 }
 
 fn parse_startup_config(document: &str) -> RuntimeResult<Vec<String>> {
@@ -222,10 +235,14 @@ fn parse_startup_config(document: &str) -> RuntimeResult<Vec<String>> {
     Ok(config.plugins)
 }
 
-pub(crate) fn load_current_config() -> RuntimeResult<String> {
+#[derive(Debug, thiserror::Error)]
+#[error("startup configuration path is not initialized")]
+struct StartupConfigPathUnset;
+
+pub(crate) fn load_current_config() -> std::io::Result<String> {
     let path = STARTUP_CONFIG_PATH
         .get()
-        .ok_or_else(|| RuntimeError::invariant("startup configuration path is not initialized"))?;
+        .ok_or_else(|| std::io::Error::other(StartupConfigPathUnset))?;
     read_config(path)
 }
 

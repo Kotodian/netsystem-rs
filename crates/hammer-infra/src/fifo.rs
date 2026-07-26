@@ -40,6 +40,10 @@ pub enum FifoError {
     InvalidCapacity,
     CapacityOutOfRange { capacity: usize },
     SegmentExhausted,
+    OutOfOrderDisabled,
+    OutOfOrderLengthOutOfRange { length: usize },
+    OutOfOrderOffsetOverflow { offset: u32, length: u32 },
+    OutOfOrderCapacityExceeded { end_offset: u32, available: usize },
 }
 
 impl fmt::Display for FifoError {
@@ -56,6 +60,25 @@ impl fmt::Display for FifoError {
             }
             Self::SegmentExhausted => {
                 f.write_str("segment has insufficient space for FIFO storage")
+            }
+            Self::OutOfOrderDisabled => f.write_str("out-of-order FIFO delivery is disabled"),
+            Self::OutOfOrderLengthOutOfRange { length } => {
+                write!(f, "out-of-order FIFO length {length} exceeds u32")
+            }
+            Self::OutOfOrderOffsetOverflow { offset, length } => {
+                write!(
+                    f,
+                    "out-of-order FIFO offset {offset} plus length {length} overflows u32"
+                )
+            }
+            Self::OutOfOrderCapacityExceeded {
+                end_offset,
+                available,
+            } => {
+                write!(
+                    f,
+                    "out-of-order FIFO end offset {end_offset} exceeds available capacity {available}"
+                )
             }
         }
     }
@@ -765,14 +788,25 @@ impl Fifo {
         }));
     }
 
-    pub fn enqueue_ooo(&self, offset: u32, src: &[u8]) -> Result<OooResult, ()> {
+    pub fn enqueue_ooo(&self, offset: u32, src: &[u8]) -> Result<OooResult, FifoError> {
         let ooo = unsafe { &mut *self.ooo.get() };
-        let bk = ooo.as_mut().ok_or(())?;
+        let bk = ooo.as_mut().ok_or(FifoError::OutOfOrderDisabled)?;
 
-        let total_len = u32::try_from(src.len()).map_err(|_| ())?;
-        let end_offset = offset.checked_add(total_len).ok_or(())?;
-        if end_offset as usize > self.max_enqueue() {
-            return Err(());
+        let total_len = u32::try_from(src.len()).map_err(|_| {
+            FifoError::OutOfOrderLengthOutOfRange { length: src.len() }
+        })?;
+        let end_offset = offset
+            .checked_add(total_len)
+            .ok_or(FifoError::OutOfOrderOffsetOverflow {
+                offset,
+                length: total_len,
+            })?;
+        let available = self.max_enqueue();
+        if end_offset as usize > available {
+            return Err(FifoError::OutOfOrderCapacityExceeded {
+                end_offset,
+                available,
+            });
         }
         let tail = unsafe { (*self.hdr).tail.load(Ordering::Acquire) };
         let head = unsafe { (*self.hdr).head.load(Ordering::Acquire) };

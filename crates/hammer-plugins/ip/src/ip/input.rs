@@ -6,7 +6,7 @@ use hammer_runtime::{
     DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, TraceFormatter,
     add_packet_trace, format_packet_trace, unlikely,
 };
-use hammer_runtime::{RuntimeError, RuntimeResult};
+use hammer_runtime::RuntimeResult;
 
 use crate::ip::{
     IpInputError, IpInputTarget, IpProtocol, IpVersion, network_for_protocol, parse_ip_header,
@@ -149,12 +149,17 @@ fn sync_ip_input_runtime(
     feature_arc: Option<FeatureArcStartHandle>,
 ) -> RuntimeResult<()> {
     let slot = data.usize_word(0)?;
-    let mut runtimes = ip_input_runtimes()
-        .lock()
-        .map_err(|_| RuntimeError::invariant("IP input runtime registry poisoned"))?;
+    let mut runtimes = ip_input_runtimes().lock().map_err(|_| {
+        crate::ip::IpControlError::RuntimeRegistryPoisoned {
+            registry: crate::ip::IpRuntimeRegistry::IpInput,
+        }
+    })?;
     let runtime = runtimes
         .get_mut(slot)
-        .ok_or_else(|| RuntimeError::invariant("IP input runtime slot is invalid"))?;
+        .ok_or(crate::ip::IpControlError::RuntimeSlotInvalid {
+            registry: crate::ip::IpRuntimeRegistry::IpInput,
+            slot,
+        })?;
     runtime.feature_arc = feature_arc;
     Ok(())
 }
@@ -163,10 +168,18 @@ fn ip_input_runtime(data: NodeRuntimeData) -> RuntimeResult<IpInputRuntime> {
     let slot = data.usize_word(0)?;
     ip_input_runtimes()
         .lock()
-        .map_err(|_| RuntimeError::invariant("IP input runtime registry poisoned"))?
+        .map_err(|_| crate::ip::IpControlError::RuntimeRegistryPoisoned {
+            registry: crate::ip::IpRuntimeRegistry::IpInput,
+        })?
         .get(slot)
         .cloned()
-        .ok_or_else(|| RuntimeError::invariant("IP input runtime slot is invalid"))
+        .ok_or_else(|| {
+            crate::ip::IpControlError::RuntimeSlotInvalid {
+                registry: crate::ip::IpRuntimeRegistry::IpInput,
+                slot,
+            }
+            .into()
+        })
 }
 
 fn ip_input_process<A: FeatureArcSpec>(

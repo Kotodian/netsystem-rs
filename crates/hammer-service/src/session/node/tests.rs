@@ -11,6 +11,7 @@ use hammer_runtime::{
 };
 
 use super::{SessionQueueNext, SessionQueueNode};
+use crate::session::error::SessionQueueError;
 use crate::session::runtime::{
     SessionPacketizedTransport, SessionPacketizedTx, SessionTransport, SessionTransportId,
     SessionWorker, TransportInternalTransport, TransportInternalTx, TransportSendFlags,
@@ -419,9 +420,7 @@ impl SessionPacketizedTransport<Index> for FailingPacketizedTransport {
         _: &DataPlaneBuffers,
         _: Instant,
     ) -> RuntimeResult<()> {
-        Err(RuntimeError::invariant(
-            "forced packetized transport failure",
-        ))
+        Err(SessionQueueError::DispatchFailed.into())
     }
 }
 
@@ -688,8 +687,8 @@ fn failed_session_packetized_tx_action_keeps_fifo_and_graph_unchanged() {
         .expect_err("tx action must fail");
 
     assert!(matches!(
-        error,
-        RuntimeError::Invariant { ref detail } if detail == "forced packetized transport failure"
+        &error,
+        RuntimeError::Subsystem { subsystem, .. } if *subsystem == "session queue"
     ));
     assert_eq!(
         sessions

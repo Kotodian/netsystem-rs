@@ -398,20 +398,59 @@ impl AppSession {
         tx_evt_q_read: Option<RawFd>,
         tx_evt_q_write: Option<RawFd>,
     ) -> Self {
+        unsafe {
+            Self::from_segments(
+                handle,
+                seg,
+                seg,
+                offsets,
+                evt_q_read,
+                evt_q_write,
+                tx_evt_q_read,
+                tx_evt_q_write,
+            )
+        }
+    }
+
+    /// Reconstruct an app session whose per-session queues and worker TX queue
+    /// live in separate shared segments.
+    ///
+    /// # Safety
+    /// Both segments and all offsets must refer to initialized objects with the
+    /// layouts expected by `Fifo` and `SessionMsgQueue`.
+    pub unsafe fn from_segments(
+        handle: SessionHandle,
+        session_segment: &Segment,
+        tx_event_segment: &Segment,
+        offsets: &SessionOffsets,
+        evt_q_read: Option<RawFd>,
+        evt_q_write: Option<RawFd>,
+        tx_evt_q_read: Option<RawFd>,
+        tx_evt_q_write: Option<RawFd>,
+    ) -> Self {
         let evt_q = Arc::new(unsafe {
-            SessionMsgQueue::from_shared(seg.clone(), offsets.evt_q_off, evt_q_read, evt_q_write)
+            SessionMsgQueue::from_shared(
+                session_segment.clone(),
+                offsets.evt_q_off,
+                evt_q_read,
+                evt_q_write,
+            )
         });
         let tx_evt_q = Arc::new(unsafe {
             SessionMsgQueue::from_shared(
-                seg.clone(),
+                tx_event_segment.clone(),
                 offsets.tx_evt_q_off,
                 tx_evt_q_read,
                 tx_evt_q_write,
             )
         });
         Self {
-            rx_fifo: Arc::new(unsafe { Fifo::from_shared(seg.clone(), offsets.rx_fifo_off) }),
-            tx_fifo: Arc::new(unsafe { Fifo::from_shared(seg.clone(), offsets.tx_fifo_off) }),
+            rx_fifo: Arc::new(unsafe {
+                Fifo::from_shared(session_segment.clone(), offsets.rx_fifo_off)
+            }),
+            tx_fifo: Arc::new(unsafe {
+                Fifo::from_shared(session_segment.clone(), offsets.tx_fifo_off)
+            }),
             evt_q,
             tx_evt_q,
             handle,

@@ -202,7 +202,8 @@ fn svm_readiness_marks_session_queue_before_main_loop_dispatch() {
         .expect("install session queue transport dispatch");
 
     let mut sessions =
-        SessionWorker::<Index>::with_app_session_config(worker, AppSessionConfig::default());
+        SessionWorker::<Index>::with_app_session_config(worker, AppSessionConfig::default())
+        .expect("session worker for test");
     let session_id = sessions.insert_session_for_test(RecordingTransport::ID, Index::new(7, 1));
     sessions.schedule_disconnect(session_id);
     sessions
@@ -260,7 +261,8 @@ fn replacing_svm_session_worker_removes_the_old_file_before_queue_release() {
     let (mut engine, session_queue, _, _) = worker_engine();
     let worker = engine.data_worker_id().expect("data worker id");
     let mut first =
-        SessionWorker::<Index>::with_app_session_config(worker, AppSessionConfig::default());
+        SessionWorker::<Index>::with_app_session_config(worker, AppSessionConfig::default())
+        .expect("session worker for test");
     first.signal_queue();
     first
         .install_queue_readiness(&mut engine, session_queue)
@@ -271,7 +273,8 @@ fn replacing_svm_session_worker_removes_the_old_file_before_queue_release() {
     drop(first);
 
     let mut second =
-        SessionWorker::<Index>::with_app_session_config(worker, AppSessionConfig::default());
+        SessionWorker::<Index>::with_app_session_config(worker, AppSessionConfig::default())
+        .expect("session worker for test");
     second
         .install_queue_readiness(&mut engine, session_queue)
         .expect("install replacement readiness");
@@ -303,7 +306,8 @@ fn worker_teardown_closes_session_queue_and_file_descriptors() {
         let (mut engine, session_queue, _, _) = worker_engine();
         let worker = engine.data_worker_id().expect("data worker id");
         let mut sessions =
-            SessionWorker::<Index>::with_app_session_config(worker, AppSessionConfig::default());
+            SessionWorker::<Index>::with_app_session_config(worker, AppSessionConfig::default())
+        .expect("session worker for test");
         let descriptor = sessions
             .queue_signal_descriptor()
             .expect("SVM queue read descriptor");

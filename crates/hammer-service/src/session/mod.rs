@@ -54,8 +54,15 @@ fn init_session_worker(engine: &mut Engine, main: Arc<runtime::SessionMain>) -> 
         .runtime
         .nodes()
         .set_node_state(session_queue, NodeState::Disabled)?;
-    let sessions =
-        SessionWorker::<PoolIndex>::with_app_session_config(worker, AppSessionConfig::default());
+    let sessions = if let Some(server) = engine.registry.get::<AppServer>() {
+        SessionWorker::<PoolIndex>::with_app_session_attach(
+            worker,
+            AppSessionConfig::default(),
+            server.publisher(),
+        )?
+    } else {
+        SessionWorker::<PoolIndex>::with_app_session_config(worker, AppSessionConfig::default())?
+    };
     runtime::install_session_worker(&main, engine, session_queue, sessions)
 }
 
@@ -66,6 +73,6 @@ fn configure_attach_server(
     let Some(path) = session.attach_socket_path.as_deref() else {
         return Ok(None);
     };
-    let server = Arc::new(AppServer::bind(path)?);
+    let server = Arc::new(AppServer::bind(path, session.app_session_capacity)?);
     Ok(Some(server))
 }

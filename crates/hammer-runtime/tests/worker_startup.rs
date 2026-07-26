@@ -84,15 +84,15 @@ fn verify_worker_startup_contract(engine: &mut Engine) -> RuntimeResult<()> {
     let sink = engine
         .runtime
         .node_by_name("startup-sink")
-        .ok_or_else(|| RuntimeError::invariant("worker clone is missing startup-sink"))?;
+        .expect("worker clone contains startup-sink");
     let node = engine
         .runtime
         .node_by_name("startup-node")
-        .ok_or_else(|| RuntimeError::invariant("worker clone is missing startup-node"))?;
+        .expect("worker clone contains startup-node");
     let sibling = engine
         .runtime
         .node_by_name("startup-sibling")
-        .ok_or_else(|| RuntimeError::invariant("worker clone is missing startup-sibling"))?;
+        .expect("worker clone contains startup-sibling");
 
     assert_eq!(sink, NodeId::new(0));
     assert_eq!(node, NodeId::new(1));
@@ -121,7 +121,7 @@ fn verify_worker_startup_contract(engine: &mut Engine) -> RuntimeResult<()> {
         )
         .expect_err("worker init must not mutate graph topology");
     assert!(matches!(
-        topology_error,
+        &topology_error,
         RuntimeError::GraphTopologyMutationFromWorker
     ));
 
@@ -152,11 +152,7 @@ fn verify_worker_startup_contract(engine: &mut Engine) -> RuntimeResult<()> {
         ABORT_OBSERVED.fetch_or(1, Ordering::Release);
     } else {
         match case {
-            INIT_FAILURE if worker.slot() == 1 => {
-                return Err(RuntimeError::invariant(
-                    "injected worker initialization failure",
-                ));
-            }
+            INIT_FAILURE if worker.slot() == 1 => return Err(topology_error),
             PANIC if worker.slot() == 1 => panic!("injected worker initialization panic"),
             EARLY_EXIT if worker.slot() == 1 => {
                 engine.main_loop_exit_now.store(true, Ordering::Release);

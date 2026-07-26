@@ -3,7 +3,7 @@
 use std::sync::OnceLock;
 
 use abi_stable::RRef;
-use hammer_runtime::{Engine, IpOutput_CTO, RuntimeError, RuntimeResult};
+use hammer_runtime::{Engine, IpOutput_CTO, RuntimeResult};
 
 pub mod input;
 mod wire;
@@ -36,10 +36,11 @@ fn init_udp(engine: &mut Engine) -> RuntimeResult<()> {
         .plugin("ip")?
         .ip_output()
         .into_option()
-        .ok_or_else(|| RuntimeError::lifecycle("udp initialization", "IP output is unavailable"))?;
-    IP_OUTPUT.set(output).map_err(|_| {
-        RuntimeError::lifecycle("udp initialization", "IP output is already initialized")
-    })
+        .ok_or(input::UdpControlError::IpOutputUnavailable)?;
+    IP_OUTPUT
+        .set(output)
+        .map_err(|_| input::UdpControlError::IpOutputAlreadyInitialized)?;
+    Ok(())
 }
 
 pub use input::{UdpInputControlPlane, UdpInputError, UdpInputNext, UdpInputNode, UdpInputTrace};

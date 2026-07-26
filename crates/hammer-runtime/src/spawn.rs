@@ -604,7 +604,7 @@ impl DataPlaneBarrierHandle {
     }
 
     #[track_caller]
-    pub fn synchronize<R>(&self, operation: impl FnOnce() -> RuntimeResult<R>) -> RuntimeResult<R> {
+    pub fn synchronize<R, E>(&self, operation: impl FnOnce() -> Result<R, E>) -> Result<R, E> {
         let _guard = self.sync();
         operation()
     }

@@ -378,6 +378,15 @@ impl TcpConnection {
         self.cacheline1.session_id
     }
 
+    pub(crate) fn attach_session(&mut self, session_id: SessionId) -> RuntimeResult<()> {
+        if self.cacheline1.connection_id.is_some() {
+            return Err(TcpConnectionError::InvalidState.into());
+        }
+        self.cacheline1.session_id = session_id;
+        self.cacheline1.connection_id = Some(TcpConnectionId::new(session_id.get()));
+        Ok(())
+    }
+
     #[inline]
     pub fn owner_worker(&self) -> DataWorkerId {
         self.cacheline1.owner_worker

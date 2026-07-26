@@ -19,5 +19,6 @@ hammer-component-macros = { path = "../../hammer-component-macros" }
 linkme = { workspace = true }
 ipnet = { workspace = true }
 serde = { workspace = true }
+thiserror = { workspace = true }
 toml = { workspace = true }
 humantime-serde = { workspace = true }

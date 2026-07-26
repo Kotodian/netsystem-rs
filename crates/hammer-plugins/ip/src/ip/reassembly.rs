@@ -247,15 +247,38 @@ fn configure_ip_reassembly(
     Ok(())
 }
 
+/// Recoverable IP reassembly failures surfaced to the node drop path.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum IpReassemblyError {
+    #[error("IP reassembly context pool is exhausted")]
+    ContextPoolExhausted,
+    #[error("IP fragment context is missing")]
+    FragmentContextMissing,
+    #[error("IP fragment payload range overflows")]
+    FragmentRangeOverflow,
+    #[error("reassembled IP packet has an invalid fragment header")]
+    FragmentHeaderInvalid,
+    #[error("reassembled IP packet exceeds the maximum IP length")]
+    PacketTooLarge,
+    #[error("IP fragments have no zero-offset first fragment")]
+    FirstFragmentMissing,
+    #[error("reassembled IP packet carries unsupported transport protocol {protocol}")]
+    UnsupportedTransportProtocol { protocol: u8 },
+}
+
+impl From<IpReassemblyError> for RuntimeError {
+    fn from(error: IpReassemblyError) -> Self {
+        Self::subsystem("ip", error)
+    }
+}
+
 #[hammer_component_macros::init_function(
     name = "ip_reassembly_init",
     runs_before = ["install_packet_graph"]
 )]
 fn init_ip_reassembly() -> RuntimeResult<()> {
     if IP_REASSEMBLY_MAIN.load().is_none() {
-        return Err(
-            RuntimeError::invariant("IP reassembly configuration was not installed").into(),
-        );
+        return Err(RuntimeError::PluginStateNotInitialized { plugin: "ip" });
     }
     Ok(())
 }
@@ -503,7 +526,7 @@ impl IpReassemblyWorker {
                 let ctx_index = self
                     .contexts
                     .insert(FragmentContext::new(key, fragment.version, now))
-                    .ok_or_else(|| RuntimeError::invariant("reassembly pool full"))?;
+                    .ok_or(IpReassemblyError::ContextPoolExhausted)?;
                 if let Some(directory) = directory {
                     let (owner, created) =
                         directory.claim_or_lookup(key, ctx_index, current_worker);
@@ -554,7 +577,7 @@ impl IpReassemblyWorker {
             let context = self
                 .contexts
                 .get_mut(pool_index)
-                .ok_or_else(|| RuntimeError::invariant("missing fragment context"))?;
+                .ok_or(IpReassemblyError::FragmentContextMissing)?;
             if fragment.payload_offset == 0 {
                 context.sendout_worker = Some(current_worker);
             }
@@ -771,7 +794,7 @@ impl FragmentContext {
         let start = fragment.payload_offset;
         let end = start
             .checked_add(fragment.payload_len)
-            .ok_or_else(|| RuntimeError::invariant("fragment payload length overflow"))?;
+            .ok_or(IpReassemblyError::FragmentRangeOverflow)?;
         if start == end {
             return Ok(ReassemblyInsert::Drop(index));
         }
@@ -859,13 +882,13 @@ impl FragmentContext {
         if header_len < IPV4_HEADER_MIN_LEN
             || runtime.get_buffer(first.index)?.current_len() < header_len
         {
-            return Err(RuntimeError::invariant("invalid IPv4 fragment header"));
+            return Err(IpReassemblyError::FragmentHeaderInvalid.into());
         }
         let total_len = header_len
             .checked_add(total_payload_len)
-            .ok_or_else(|| RuntimeError::invariant("IPv4 reassembled length overflow"))?;
+            .ok_or(IpReassemblyError::FragmentRangeOverflow)?;
         if total_len > u16::MAX as usize {
-            return Err(RuntimeError::invariant("IPv4 reassembled packet too large"));
+            return Err(IpReassemblyError::PacketTooLarge.into());
         }
 
         let complete = first.index;
@@ -884,7 +907,7 @@ impl FragmentContext {
             let mut buffer = runtime.get_buffer_mut(complete)?;
             let header = buffer.current();
             if header.len() < header_len {
-                return Err(RuntimeError::invariant("invalid IPv4 reassembled header"));
+                return Err(IpReassemblyError::FragmentHeaderInvalid.into());
             }
             let header = &mut buffer.current_mut()[..header_len];
             header[IPV4_TOTAL_LENGTH_OFFSET..IPV4_TOTAL_LENGTH_OFFSET + 2]
@@ -907,11 +930,11 @@ impl FragmentContext {
         if runtime.get_buffer(first.index)?.current_len()
             < IPV6_HEADER_LEN + IPV6_FRAGMENT_HEADER_LEN
         {
-            return Err(RuntimeError::invariant("invalid IPv6 fragment header"));
+            return Err(IpReassemblyError::FragmentHeaderInvalid.into());
         }
         let payload_len = total_payload_len;
         if payload_len > u16::MAX as usize {
-            return Err(RuntimeError::invariant("IPv6 reassembled packet too large"));
+            return Err(IpReassemblyError::PacketTooLarge.into());
         }
         let complete = first.index;
         let fragment_next_header = {
@@ -954,7 +977,7 @@ impl FragmentContext {
         self.fragments
             .iter()
             .position(|fragment| fragment.start == 0)
-            .ok_or_else(|| RuntimeError::invariant("missing first IP fragment"))
+            .ok_or_else(|| IpReassemblyError::FirstFragmentMissing.into())
     }
 
     #[inline]
@@ -994,15 +1017,14 @@ fn refresh_metadata(runtime: &DataPlaneRuntime, index: Index) -> RuntimeResult<(
     match network_for_protocol(parsed.protocol) {
         Some(_) => Ok(()),
         None => {
-            let IpProtocol::Other(protocol) = parsed.protocol else {
-                return Err(RuntimeError::invariant(format!(
-                    "unsupported reassembled transport protocol: {:?}",
-                    parsed.protocol
-                )));
+            let protocol = match parsed.protocol {
+                IpProtocol::Other(protocol) => protocol,
+                IpProtocol::Icmpv4 => 1,
+                IpProtocol::Tcp => 6,
+                IpProtocol::Udp => 17,
+                IpProtocol::Icmpv6 => 58,
             };
-            Err(RuntimeError::invariant(format!(
-                "unsupported reassembled transport protocol: {protocol}"
-            )))
+            Err(IpReassemblyError::UnsupportedTransportProtocol { protocol }.into())
         }
     }
 }

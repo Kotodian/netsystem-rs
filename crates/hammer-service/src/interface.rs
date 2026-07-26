@@ -52,6 +52,29 @@ impl Default for InterfaceConfigMtu {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum InterfaceError {
+    #[error("interface name is empty")]
+    NameEmpty,
+    #[error("interface index space is exhausted at {interface_count} interfaces")]
+    IndexSpaceExhausted { interface_count: usize },
+    #[error("interface {interface_index} is not registered")]
+    NotRegistered { interface_index: u32 },
+    #[error(transparent)]
+    Runtime(#[from] RuntimeError),
+}
+
+pub type InterfaceResult<T> = Result<T, InterfaceError>;
+
+impl From<InterfaceError> for RuntimeError {
+    fn from(error: InterfaceError) -> Self {
+        match error {
+            InterfaceError::Runtime(error) => error,
+            other => Self::subsystem("interface", other),
+        }
+    }
+}
+
 impl InterfaceConfig {
     fn validate(&self) -> RuntimeResult<()> {
         if self.name.is_empty() {
@@ -254,7 +277,7 @@ impl InterfaceControlPlane {
         InterfaceControlHandle::new(Arc::clone(&self.inner))
     }
 
-    pub fn register_interface(&self, name: impl Into<String>) -> RuntimeResult<u32> {
+    pub fn register_interface(&self, name: impl Into<String>) -> InterfaceResult<u32> {
         self.register_interface_with_mtu(name, InterfaceMtu::default())
     }
 
@@ -262,50 +285,43 @@ impl InterfaceControlPlane {
         &self,
         name: impl Into<String>,
         mtu: InterfaceMtu,
-    ) -> RuntimeResult<u32> {
+    ) -> InterfaceResult<u32> {
         let name = name.into();
         if name.is_empty() {
-            return Err(RuntimeError::invariant("interface name is empty"));
+            return Err(InterfaceError::NameEmpty);
         }
-        let mut index = None;
         self.synchronize(|| {
             let current = self.inner.state();
             if let Some(current_index) = current.interface_index(&name) {
-                index = Some(current_index);
-                return Ok(());
+                return Ok(current_index);
             }
             let mut next = InterfaceState::clone(&current);
-            let next_index = u32::try_from(next.interfaces.len())
-                .map_err(|_| RuntimeError::invariant("interface index space is exhausted"))?;
+            let interface_count = next.interfaces.len();
+            let next_index = u32::try_from(interface_count)
+                .map_err(|_| InterfaceError::IndexSpaceExhausted { interface_count })?;
             if next_index == u32::MAX {
-                return Err(RuntimeError::invariant(
-                    "interface index space is exhausted",
-                ));
+                return Err(InterfaceError::IndexSpaceExhausted { interface_count });
             }
             next.interfaces.push(InterfaceRecord {
                 name: name.clone(),
                 addresses: Vec::new(),
                 mtu,
             });
-            index = Some(next_index);
-            self.publish(next)?;
-            Ok(())
-        })?;
-        index.ok_or_else(|| {
-            RuntimeError::invariant("interface registration did not publish an index")
+            self.publish(next);
+            Ok(next_index)
         })
     }
 
-    pub fn set_mtu(&self, interface_index: u32, mtu: InterfaceMtu) -> RuntimeResult<()> {
+    pub fn set_mtu(&self, interface_index: u32, mtu: InterfaceMtu) -> InterfaceResult<()> {
         self.ensure_interface(interface_index)?;
         self.synchronize(|| {
             let current = self.inner.state();
             let mut next = InterfaceState::clone(current);
-            let interface = next.interface_mut(interface_index).ok_or_else(|| {
-                RuntimeError::invariant(format!("interface {interface_index} is not registered"))
-            })?;
+            let interface = next
+                .interface_mut(interface_index)
+                .ok_or(InterfaceError::NotRegistered { interface_index })?;
             interface.mtu = mtu;
-            self.publish(next)?;
+            self.publish(next);
             Ok(())
         })
     }
@@ -315,28 +331,26 @@ impl InterfaceControlPlane {
         interface_index: u32,
         kind: InterfaceMtuKind,
         value: u32,
-    ) -> RuntimeResult<()> {
+    ) -> InterfaceResult<()> {
         self.ensure_interface(interface_index)?;
         self.synchronize(|| {
             let current = self.inner.state();
             let mut next = InterfaceState::clone(current);
-            let interface = next.interface_mut(interface_index).ok_or_else(|| {
-                RuntimeError::invariant(format!("interface {interface_index} is not registered"))
-            })?;
+            let interface = next
+                .interface_mut(interface_index)
+                .ok_or(InterfaceError::NotRegistered { interface_index })?;
             interface.mtu.set(kind, value);
-            self.publish(next)?;
+            self.publish(next);
             Ok(())
         })
     }
 
-    pub fn add_address(&self, interface_index: u32, address: IpNet) -> RuntimeResult<u32> {
+    pub fn add_address(&self, interface_index: u32, address: IpNet) -> InterfaceResult<u32> {
         self.ensure_interface(interface_index)?;
-        let mut address_index = None;
         self.synchronize(|| {
             let current = self.inner.state();
             if let Some(current_index) = current.interface_address_index(interface_index, address) {
-                address_index = Some(current_index);
-                return Ok(());
+                return Ok(current_index);
             }
             let mut next = InterfaceState::clone(&current);
             let index = next.addresses.len() as u32;
@@ -350,22 +364,22 @@ impl InterfaceControlPlane {
             next.interfaces[interface_index as usize]
                 .addresses
                 .push(index);
-            address_index = Some(index);
-            self.publish(next)?;
-            Ok(())
-        })?;
-        address_index
-            .ok_or_else(|| RuntimeError::invariant("interface address did not publish an index"))
+            self.publish(next);
+            Ok(index)
+        })
     }
 
-    pub fn remove_address(&self, interface_index: u32, address: IpNet) -> RuntimeResult<bool> {
+    pub fn remove_address(
+        &self,
+        interface_index: u32,
+        address: IpNet,
+    ) -> InterfaceResult<bool> {
         self.ensure_interface(interface_index)?;
-        let mut removed = false;
         self.synchronize(|| {
             let current = self.inner.state();
             let Some(address_index) = current.interface_address_index(interface_index, address)
             else {
-                return Ok(());
+                return Ok(false);
             };
             let mut next = InterfaceState::clone(&current);
             if let Some(address) = next.addresses.get_mut(address_index as usize) {
@@ -381,26 +395,25 @@ impl InterfaceControlPlane {
                 interface.addresses = addresses;
             }
             next.rebuild_address_index();
-            removed = true;
-            self.publish(next)?;
-            Ok(())
-        })?;
-        Ok(removed)
+            self.publish(next);
+            Ok(true)
+        })
     }
 
     #[inline]
-    fn ensure_interface(&self, interface_index: u32) -> RuntimeResult<()> {
+    fn ensure_interface(&self, interface_index: u32) -> InterfaceResult<()> {
         if self.inner.state().interface(interface_index).is_some() {
             Ok(())
         } else {
-            Err(RuntimeError::invariant(format!(
-                "interface {interface_index} is not registered"
-            )))
+            Err(InterfaceError::NotRegistered { interface_index })
         }
     }
 
     #[inline]
-    fn synchronize<R>(&self, operation: impl FnOnce() -> RuntimeResult<R>) -> RuntimeResult<R> {
+    fn synchronize<R>(
+        &self,
+        operation: impl FnOnce() -> InterfaceResult<R>,
+    ) -> InterfaceResult<R> {
         if let Some(barrier) = &self.barrier {
             barrier.synchronize(operation)
         } else {
@@ -409,9 +422,8 @@ impl InterfaceControlPlane {
     }
 
     #[inline]
-    fn publish(&self, state: InterfaceState) -> RuntimeResult<()> {
+    fn publish(&self, state: InterfaceState) {
         self.inner.replace_after_barrier(state);
-        Ok(())
     }
 }
 

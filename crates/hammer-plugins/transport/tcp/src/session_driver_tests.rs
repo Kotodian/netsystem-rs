@@ -1,17 +1,18 @@
 //! TCP/session lifecycle tests through the adjacent worker state.
 
-use crate::{TcpCapabilities, TcpConnectionId, TcpPacket, TcpSegmentFlags, TcpState};
+use crate::{TcpCapabilities, TcpPacket, TcpSegmentFlags, TcpState};
 use hammer_core::data_plane::NodeId;
 use hammer_infra::pool::Index;
 use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId};
 
 use hammer_service::data_plane::DropNode;
 use hammer_service::session::node::{SessionQueueNext, SessionQueueNode};
-use hammer_service::session::runtime::dispatch_session_queue_once;
-
-use crate::{TcpConnection, TcpWorker, insert_tcp_session, rollback_tcp_session};
+use hammer_service::session::runtime::{
+    SessionTransport, SessionWorker, dispatch_session_queue_once,
+};
 use hammer_service::session::SessionId;
-use hammer_service::session::SessionWorker;
+
+use crate::{TcpConnection, TcpWorker};
 
 fn tcp_session<'a>(
     sessions: &SessionWorker<Index>,
@@ -22,11 +23,11 @@ fn tcp_session<'a>(
     tcp.connections.get(index)
 }
 
-fn established_connection(session_id: SessionId) -> TcpConnection {
+fn established_connection() -> TcpConnection {
     let local = "192.0.2.10:443".parse().expect("local address");
     let remote = "198.51.100.20:50001".parse().expect("remote address");
     TcpConnection::established_with_sack_for_test(
-        Some(TcpConnectionId::new(session_id.get())),
+        None,
         DataWorkerId::new(0),
         443,
         Some(local),
@@ -37,7 +38,7 @@ fn established_connection(session_id: SessionId) -> TcpConnection {
 fn worker_state(runtime: &DataPlaneRuntime) -> (SessionWorker<Index>, TcpWorker) {
     let worker = DataWorkerId::new(0);
     (
-        hammer_service::session::SessionWorker::new(worker),
+        hammer_service::session::SessionWorker::new(worker).expect("session worker for test"),
         TcpWorker::new(worker),
     )
 }
@@ -71,8 +72,17 @@ fn dispatch_session_queue(
 fn app_close_is_recorded_before_tcp_disconnect() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let (mut sessions, mut tcp) = worker_state(&runtime);
-    let session_id = insert_tcp_session(&mut sessions, &mut tcp, 0, established_connection)
-        .expect("insert TCP session");
+    let connection_index = tcp
+        .insert_connection(established_connection())
+        .expect("insert TCP connection");
+    let session_id = sessions.insert_session_for_test(
+        <TcpWorker as SessionTransport<Index>>::ID,
+        connection_index,
+    );
+    tcp.connection_mut(connection_index)
+        .expect("TCP connection")
+        .attach_session(session_id)
+        .expect("attach stream session");
     sessions.schedule_disconnect(session_id);
 
     let (owner, output_next) = session_queue(&runtime);
@@ -91,8 +101,17 @@ fn app_close_is_recorded_before_tcp_disconnect() {
 fn tcp_closed_publication_notifies_app_once_before_cleanup() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let (mut sessions, mut tcp) = worker_state(&runtime);
-    let session_id = insert_tcp_session(&mut sessions, &mut tcp, 0, established_connection)
-        .expect("insert TCP session");
+    let connection_index = tcp
+        .insert_connection(established_connection())
+        .expect("insert TCP connection");
+    let session_id = sessions.insert_session_for_test(
+        <TcpWorker as SessionTransport<Index>>::ID,
+        connection_index,
+    );
+    tcp.connection_mut(connection_index)
+        .expect("TCP connection")
+        .attach_session(session_id)
+        .expect("attach stream session");
     let reset = {
         let connection = tcp_session(&sessions, &tcp, session_id).expect("TCP connection");
         TcpPacket {
@@ -140,11 +159,27 @@ fn tcp_closed_publication_notifies_app_once_before_cleanup() {
 fn rollback_discards_unpublished_session_without_close_notification() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let (mut sessions, mut tcp) = worker_state(&runtime);
-    let session_id = insert_tcp_session(&mut sessions, &mut tcp, 0, established_connection)
-        .expect("insert TCP session");
-
-    assert!(rollback_tcp_session(&mut sessions, &mut tcp, session_id).expect("rollback session"));
+    let connection_index = tcp
+        .insert_connection(established_connection())
+        .expect("insert TCP connection");
+    let session_id = sessions
+        .stream_accept(
+            <TcpWorker as SessionTransport<Index>>::ID,
+            connection_index,
+            0,
+        )
+        .expect("accept stream session");
+    tcp.connection_mut(connection_index)
+        .expect("TCP connection")
+        .attach_session(session_id)
+        .expect("attach stream session");
+    let connection_index = sessions
+        .rollback_session_creation(session_id)
+        .expect("rollback session")
+        .expect("TCP connection index");
+    let removed = tcp.remove_connection(connection_index);
 
     assert!(!sessions.has_session(session_id));
-    assert!(tcp_session(&sessions, &tcp, session_id).is_none());
+    assert!(removed.is_some());
+    assert!(tcp.connection(connection_index).is_none());
 }

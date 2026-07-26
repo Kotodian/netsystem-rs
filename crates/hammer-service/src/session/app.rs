@@ -7,43 +7,82 @@ use hammer_infra::align::align_up;
 use hammer_infra::fifo::Fifo;
 use hammer_infra::segment::Segment;
 use hammer_runtime::app::{
-    AppSession, SessionEventQueue, SessionEvt, SessionEvtType, SessionMsgQueue,
+    AppSession, AppSessionConfig, AppSessionError, SessionEventQueue, SessionEvt, SessionEvtType,
+    SessionHandle, SessionMsgQueue, SessionOffsets,
 };
+use hammer_runtime::attach::{AppSessionPublication, AppSessionPublisher};
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use crate::session::SessionId;
+use crate::session::error::SessionError;
 
 #[derive(Debug, thiserror::Error)]
-enum AppWorkerError {
-    #[error("session TX event queue allocation failed")]
-    TxEventQueue,
+pub(crate) enum AppWorkerError {
+    #[error("session TX event queue configuration rejected: {error:?}")]
+    TxEventQueue { error: SessionMsgQueueError },
+    #[error("session TX event queue layout exceeds addressable memory")]
+    TxEventQueueLayoutOverflow,
+    #[error("session TX event queue segment capacity exhausted")]
+    TxEventQueueSegmentExhausted,
+    #[error("failed to create shared listener session segment")]
+    SessionSegment {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("session segment layout exceeds addressable memory")]
+    SessionSegmentSizeOverflow,
+    #[error("listener segment cannot hold the session layout")]
+    SessionSegmentExhausted,
 }
 
 impl From<AppWorkerError> for RuntimeError {
     fn from(error: AppWorkerError) -> Self {
-        RuntimeError::lifecycle("session app", error.to_string())
+        RuntimeError::subsystem("session app", error)
     }
-}
-
-#[inline]
-fn checked_add_ooo_accepted(total: u32, accepted: u32) -> RuntimeResult<u32> {
-    total
-        .checked_add(accepted)
-        .ok_or_else(|| RuntimeError::invariant("ooo rx accepted length overflow"))
 }
 
 pub struct AppWorker {
     session_slots: Vec<Option<(SessionId, Arc<AppSession>)>>,
+    pending_publications: Vec<Option<AppSessionPublication>>,
     session_listeners: Vec<Option<u32>>,
     tx_evt_q: Arc<SessionMsgQueue>,
     worker_index: usize,
     listeners: HashMap<u32, SegmentManager>,
+    attach: Option<AppWorkerAttach>,
+}
+
+pub(crate) struct AppWorkerAttach {
+    publisher: AppSessionPublisher,
+    tx_event_segment: Segment,
+    tx_event_offset: u64,
+}
+
+impl AppWorkerAttach {
+    pub(crate) fn new(
+        publisher: AppSessionPublisher,
+        tx_event_segment: Segment,
+        tx_event_offset: u64,
+    ) -> Self {
+        Self {
+            publisher,
+            tx_event_segment,
+            tx_event_offset,
+        }
+    }
 }
 
 struct SegmentManager {
     segments: Vec<Option<Segment>>,
     allocations: HashMap<u64, SessionAllocation>,
     retired: Vec<SessionAllocation>,
+    shared_name_prefix: Option<String>,
+    next_segment: usize,
+}
+
+struct CreatedAppSession {
+    session: Arc<AppSession>,
+    segment: Segment,
+    offsets: SessionOffsets,
 }
 
 struct SessionAllocation {
@@ -54,20 +93,23 @@ struct SessionAllocation {
 }
 
 impl SegmentManager {
-    fn new() -> Self {
+    fn new(shared_name_prefix: Option<String>) -> Self {
         Self {
             segments: Vec::new(),
             allocations: HashMap::new(),
             retired: Vec::new(),
+            shared_name_prefix,
+            next_segment: 0,
         }
     }
 
     fn create_session(
         &mut self,
-        handle: hammer_runtime::app::SessionHandle,
-        config: hammer_runtime::app::AppSessionConfig,
+        handle: SessionHandle,
+        config: AppSessionConfig,
         tx_evt_q: Arc<SessionMsgQueue>,
-    ) -> Result<Arc<AppSession>, hammer_runtime::app::AppSessionError> {
+        tx_event_offset: u64,
+    ) -> RuntimeResult<CreatedAppSession> {
         let mut index = 0;
         while index < self.retired.len() {
             if self.retired[index].session.strong_count() == 0 {
@@ -77,9 +119,10 @@ impl SegmentManager {
                 index += 1;
             }
         }
+
         let fifo_bytes = align_up(
             Fifo::layout_bytes(config.fifo_capacity).map_err(|_| {
-                hammer_runtime::app::AppSessionError::RxFifoCapacityInvalid {
+                AppSessionError::RxFifoCapacityInvalid {
                     capacity: config.fifo_capacity,
                 }
             })?,
@@ -89,7 +132,7 @@ impl SegmentManager {
         let q_nitems = (config.evt_q_capacity + 1).next_power_of_two().max(2) as u32;
         let event_queue_bytes = align_up(
             SessionMsgQueue::layout_bytes(q_nitems, ring_nitems).map_err(|_| {
-                hammer_runtime::app::AppSessionError::EventQueueCapacityInvalid {
+                AppSessionError::EventQueueCapacityInvalid {
                     capacity: config.evt_q_capacity,
                 }
             })?,
@@ -98,7 +141,7 @@ impl SegmentManager {
         let session_bytes = fifo_bytes
             .checked_mul(2)
             .and_then(|bytes| bytes.checked_add(event_queue_bytes))
-            .expect("session segment layout exceeds addressable memory");
+            .ok_or(AppWorkerError::SessionSegmentSizeOverflow)?;
         let allocation = self
             .segments
             .iter()
@@ -107,69 +150,69 @@ impl SegmentManager {
                 entry.as_ref().and_then(|storage| {
                     storage
                         .alloc(session_bytes, 64)
-                        .map(|offset| (segment, offset))
+                        .map(|offset| (segment, offset, storage.clone()))
                 })
             });
-        let (segment_index, offset) = match allocation {
+        let (segment_index, offset, segment) = match allocation {
             Some(allocation) => allocation,
             None => {
                 let segment_bytes = (1024 * 1024).max(
                     session_bytes
                         .checked_add(128)
-                        .expect("session segment size exceeds addressable memory"),
+                        .ok_or(AppWorkerError::SessionSegmentSizeOverflow)?,
                 );
-                let segment = Segment::local(segment_bytes);
+                let segment = if let Some(prefix) = &self.shared_name_prefix {
+                    let name = format!("{prefix}-{}", self.next_segment);
+                    self.next_segment += 1;
+                    Segment::shared(&name, segment_bytes)
+                        .map_err(|source| AppWorkerError::SessionSegment { source })?
+                } else {
+                    Segment::local(segment_bytes)
+                };
                 let offset = segment
                     .alloc(session_bytes, 64)
-                    .expect("new listener segment has session layout capacity");
+                    .ok_or(AppWorkerError::SessionSegmentExhausted)?;
                 let segment_index = match self.segments.iter().position(Option::is_none) {
                     Some(index) => {
-                        self.segments[index] = Some(segment);
+                        self.segments[index] = Some(segment.clone());
                         index
                     }
                     None => {
-                        self.segments.push(Some(segment));
+                        self.segments.push(Some(segment.clone()));
                         self.segments.len() - 1
                     }
                 };
-                (segment_index, offset)
+                (segment_index, offset, segment)
             }
         };
-        let segment = self.segments[segment_index]
-            .as_ref()
-            .expect("allocated listener segment is present")
-            .clone();
         let tx_fifo_offset = offset + fifo_bytes as u64;
         let event_queue_offset = tx_fifo_offset + fifo_bytes as u64;
         let session = (|| {
-            let mut rx_fifo =
-                unsafe { Fifo::init_at(segment.clone(), offset, config.fifo_capacity) }.map_err(
-                    |_| hammer_runtime::app::AppSessionError::RxFifoCapacityInvalid {
-                        capacity: config.fifo_capacity,
-                    },
-                )?;
+            let mut rx_fifo = unsafe {
+                Fifo::init_at(segment.clone(), offset, config.fifo_capacity)
+            }
+            .map_err(|_| AppSessionError::RxFifoCapacityInvalid {
+                capacity: config.fifo_capacity,
+            })?;
             rx_fifo.enable_ooo();
-            let tx_fifo =
-                unsafe { Fifo::init_at(segment.clone(), tx_fifo_offset, config.fifo_capacity) }
-                    .map_err(
-                        |_| hammer_runtime::app::AppSessionError::TxFifoCapacityInvalid {
-                            capacity: config.fifo_capacity,
-                        },
-                    )?;
+            let tx_fifo = unsafe {
+                Fifo::init_at(segment.clone(), tx_fifo_offset, config.fifo_capacity)
+            }
+            .map_err(|_| AppSessionError::TxFifoCapacityInvalid {
+                capacity: config.fifo_capacity,
+            })?;
             let event_queue = unsafe {
                 SessionMsgQueue::init_at_with_signal(
-                    segment,
+                    segment.clone(),
                     event_queue_offset,
                     q_nitems,
                     ring_nitems,
                 )
             }
-            .map_err(|_| {
-                hammer_runtime::app::AppSessionError::EventQueueCapacityInvalid {
-                    capacity: config.evt_q_capacity,
-                }
+            .map_err(|_| AppSessionError::EventQueueCapacityInvalid {
+                capacity: config.evt_q_capacity,
             })?;
-            Ok::<_, hammer_runtime::app::AppSessionError>(Arc::new(AppSession::from_parts(
+            Ok::<_, AppSessionError>(Arc::new(AppSession::from_parts(
                 Arc::new(rx_fifo),
                 Arc::new(tx_fifo),
                 Arc::new(event_queue),
@@ -180,11 +223,8 @@ impl SegmentManager {
         let session = match session {
             Ok(session) => session,
             Err(error) => {
-                self.segments[segment_index]
-                    .as_ref()
-                    .expect("allocated listener segment is present")
-                    .free(offset, session_bytes);
-                return Err(error);
+                segment.free(offset, session_bytes);
+                return Err(error.into());
             }
         };
         self.allocations.insert(
@@ -196,7 +236,16 @@ impl SegmentManager {
                 session: Arc::downgrade(&session),
             },
         );
-        Ok(session)
+        Ok(CreatedAppSession {
+            session,
+            segment,
+            offsets: SessionOffsets {
+                rx_fifo_off: offset,
+                tx_fifo_off: tx_fifo_offset,
+                evt_q_off: event_queue_offset,
+                tx_evt_q_off: tx_event_offset,
+            },
+        })
     }
 
     fn release_session(&mut self, handle: hammer_runtime::app::SessionHandle) {
@@ -245,10 +294,29 @@ impl AppWorker {
     ) -> Self {
         Self {
             session_slots: vec![None; session_capacity],
+            pending_publications: vec![None; session_capacity],
             session_listeners: vec![None; session_capacity],
             tx_evt_q,
             worker_index,
             listeners: HashMap::new(),
+            attach: None,
+        }
+    }
+
+    pub(crate) fn with_attach(
+        session_capacity: usize,
+        tx_evt_q: Arc<SessionMsgQueue>,
+        worker_index: usize,
+        attach: AppWorkerAttach,
+    ) -> Self {
+        Self {
+            session_slots: vec![None; session_capacity],
+            pending_publications: vec![None; session_capacity],
+            session_listeners: vec![None; session_capacity],
+            tx_evt_q,
+            worker_index,
+            listeners: HashMap::new(),
+            attach: Some(attach),
         }
     }
 
@@ -272,6 +340,7 @@ impl AppWorker {
             .as_ref()
             .is_some_and(|(stored, _)| *stored == session_id)
         {
+            self.pending_publications[slot] = None;
             let session = entry.take().map(|(_, session)| session);
             let listener = self.session_listeners[slot].take();
             if let (Some(session), Some(listener)) = (&session, listener)
@@ -293,14 +362,21 @@ impl AppWorker {
             .and_then(|(stored, session)| (*stored == session_id).then_some(session))
     }
 
-    pub fn connected(&self, session_id: SessionId) -> RuntimeResult<()> {
-        let Some(session) = self.session(session_id) else {
+    pub fn connected(&mut self, session_id: SessionId) -> RuntimeResult<()> {
+        let slot = session_id.pool_index().slot() as usize;
+        let Some(session) = self.session(session_id).cloned() else {
             return Ok(());
         };
         session
             .push_event(SessionEvtType::Connect)
             .map_err(RuntimeError::from)?;
         self.notify_evt(&session);
+        if let Some(publication) = self.pending_publications[slot].as_ref()
+            && let Some(attach) = &self.attach
+        {
+            attach.publisher.try_publish(publication)?;
+            self.pending_publications[slot] = None;
+        }
         Ok(())
     }
 
@@ -357,7 +433,7 @@ impl AppWorker {
     ) -> RuntimeResult<()> {
         let session = self
             .session(session_id)
-            .ok_or_else(|| RuntimeError::invariant("app session is missing"))?;
+            .ok_or(SessionError::SessionMissing { session_id })?;
         let written = session
             .tx_fifo()
             .peek_segments(tx_offset, payload_len, |first, second| {
@@ -369,9 +445,18 @@ impl AppWorker {
                 }
                 RuntimeResult::Ok(first.len() + second.len())
             })
-            .ok_or_else(|| RuntimeError::invariant("app session tx fifo ended early"))??;
+            .ok_or(SessionError::TxFifoRangeInvalid {
+                session_id,
+                tx_offset,
+                payload_len,
+            })??;
         if written != payload_len {
-            return Err(RuntimeError::invariant("app session tx fifo ended early"));
+            return Err(SessionError::TxFifoRangeInvalid {
+                session_id,
+                tx_offset,
+                payload_len,
+            }
+            .into());
         }
         Ok(())
     }
@@ -394,7 +479,7 @@ impl AppWorker {
             let buffer = buffer?;
             let chunk = buffer.current();
             let chunk_len = u32::try_from(chunk.len())
-                .map_err(|_| RuntimeError::invariant("rx buffer length overflow"))?;
+                .map_err(|_| SessionError::RxLengthOverflow { session_id })?;
             if accepted == total {
                 let rx_available_before = session.rx_fifo().max_enqueue();
                 let flags = if urgent_pending {
@@ -410,14 +495,14 @@ impl AppWorker {
                 let promoted_now = wrote.saturating_sub(accepted_now);
                 accepted = accepted
                     .checked_add(accepted_now as u32)
-                    .ok_or_else(|| RuntimeError::invariant("rx accepted length overflow"))?;
+                    .ok_or(SessionError::RxLengthOverflow { session_id })?;
                 promoted = promoted
                     .checked_add(promoted_now as u32)
-                    .ok_or_else(|| RuntimeError::invariant("rx promoted length overflow"))?;
+                    .ok_or(SessionError::RxLengthOverflow { session_id })?;
             }
             total = total
                 .checked_add(chunk_len)
-                .ok_or_else(|| RuntimeError::invariant("rx buffer length overflow"))?;
+                .ok_or(SessionError::RxLengthOverflow { session_id })?;
         }
         if accepted != 0 || promoted != 0 {
             self.notify_rx(session);
@@ -442,18 +527,28 @@ impl AppWorker {
         for buf in buffers.chain(index) {
             let buf = buf?;
             let current = buf.current();
-            let chunk_offset = offset
-                .checked_add(total_len)
-                .ok_or_else(|| RuntimeError::invariant("ooo rx offset overflow"))?;
+            let chunk_offset = offset.checked_add(total_len).ok_or({
+                SessionError::RxOutOfOrderOffsetOverflow {
+                    session_id,
+                    offset,
+                    buffered_len: total_len,
+                }
+            })?;
             let result = session
                 .rx_fifo()
                 .enqueue_ooo(chunk_offset, current)
-                .map_err(|_| RuntimeError::invariant("ooo enqueue failed"))?;
-            accepted = checked_add_ooo_accepted(accepted, result.accepted)?;
+                .map_err(|source| SessionError::RxOutOfOrderEnqueue {
+                    session_id,
+                    offset: chunk_offset,
+                    source,
+                })?;
+            accepted = accepted
+                .checked_add(result.accepted)
+                .ok_or(SessionError::RxLengthOverflow { session_id })?;
             if let Some(start) = result.start {
                 let end = start
                     .checked_add(result.len)
-                    .ok_or_else(|| RuntimeError::invariant("ooo span end overflow"))?;
+                    .ok_or(SessionError::OooSpanInvalid { session_id })?;
                 newest_start = Some(match newest_start {
                     Some(existing) => existing.min(start),
                     None => start,
@@ -465,13 +560,13 @@ impl AppWorker {
             }
             total_len = total_len
                 .checked_add(current.len() as u32)
-                .ok_or_else(|| RuntimeError::invariant("ooo rx buffer length overflow"))?;
+                .ok_or(SessionError::RxLengthOverflow { session_id })?;
         }
         let newest = match (newest_start, newest_end) {
             (Some(start), Some(end)) => Some((
                 start,
                 end.checked_sub(start)
-                    .ok_or_else(|| RuntimeError::invariant("ooo span length underflow"))?,
+                    .ok_or(SessionError::OooSpanInvalid { session_id })?,
             )),
             _ => None,
         };
@@ -524,7 +619,8 @@ impl AppWorker {
     #[inline]
     pub fn default_local() -> RuntimeResult<Self> {
         let tx_evt_q: Arc<SessionMsgQueue> = Arc::new(
-            SessionMsgQueue::with_cfg(2048, 1024).map_err(|_| AppWorkerError::TxEventQueue)?,
+            SessionMsgQueue::with_cfg(2048, 1024)
+                .map_err(|error| AppWorkerError::TxEventQueue { error })?,
         );
         Ok(Self::new(1024, tx_evt_q, 0))
     }
@@ -536,24 +632,6 @@ mod tests {
     use hammer_infra::pool::Index as PoolIndex;
     use hammer_runtime::app::{AppSessionConfig, SessionEvt, SessionEvtType, SessionHandle};
     use std::sync::Mutex;
-
-    #[test]
-    fn checked_add_ooo_accepted_rejects_overflow() {
-        let error =
-            checked_add_ooo_accepted(u32::MAX, 1).expect_err("overflow must return an error");
-        assert!(matches!(
-            error,
-            RuntimeError::Invariant { ref detail } if detail == "ooo rx accepted length overflow"
-        ));
-    }
-
-    #[test]
-    fn checked_add_ooo_accepted_accumulates_without_overflow() {
-        assert_eq!(
-            checked_add_ooo_accepted(7, 11).expect("sum without overflow"),
-            18
-        );
-    }
 
     #[test]
     fn drain_drops_events_for_unmapped_session_slot() {
@@ -701,15 +779,15 @@ mod tests {
     #[test]
     fn listener_manager_keeps_segment_zero_and_releases_empty_growth_segment() {
         let app = AppWorker::default_local().expect("app worker");
-        let mut manager = SegmentManager::new();
+        let mut manager = SegmentManager::new(None);
         let config = AppSessionConfig::new(700_000, 4);
         let segment_zero_handle = SessionHandle::new(0, 0);
         let growth_segment_handle = SessionHandle::new(1, 0);
         let segment_zero_session = manager
-            .create_session(segment_zero_handle, config, app.tx_evt_q().clone())
+            .create_session(segment_zero_handle, config, app.tx_evt_q().clone(), 0)
             .expect("session in segment zero");
         let growth_segment_session = manager
-            .create_session(growth_segment_handle, config, app.tx_evt_q().clone())
+            .create_session(growth_segment_handle, config, app.tx_evt_q().clone(), 0)
             .expect("session in growth segment");
 
         assert_eq!(manager.segments.len(), 2);
@@ -727,18 +805,44 @@ impl AppWorker {
     pub fn create_app_session(
         &mut self,
         listener: u32,
-        handle: hammer_runtime::app::SessionHandle,
-        config: hammer_runtime::app::AppSessionConfig,
+        handle: SessionHandle,
+        config: AppSessionConfig,
         tx_evt_q: Arc<SessionMsgQueue>,
     ) -> RuntimeResult<Arc<AppSession>> {
-        let session = self
+        let shared_name_prefix = self
+            .attach
+            .as_ref()
+            .map(|_| format!("hammer-session-w{}-l{listener}", self.worker_index));
+        let tx_event_offset = self
+            .attach
+            .as_ref()
+            .map_or(0, |attach| attach.tx_event_offset);
+        let created = self
             .listeners
             .entry(listener)
-            .or_insert_with(SegmentManager::new)
-            .create_session(handle, config, tx_evt_q)
-            .map_err(RuntimeError::from)?;
-        self.session_listeners[handle.session_index() as usize] = Some(listener);
-        Ok(session)
+            .or_insert_with(|| SegmentManager::new(shared_name_prefix))
+            .create_session(handle, config, tx_evt_q, tx_event_offset)?;
+        let slot = handle.session_index() as usize;
+        if let Some(attach) = &self.attach {
+            let publication = match AppSessionPublication::new(
+                Arc::clone(&created.session),
+                created.segment,
+                attach.tx_event_segment.clone(),
+                created.offsets,
+            ) {
+                Ok(publication) => publication,
+                Err(error) => {
+                    if let Some(manager) = self.listeners.get_mut(&listener) {
+                        manager.release_session(handle);
+                    }
+                    drop(created.session);
+                    return Err(error);
+                }
+            };
+            self.pending_publications[slot] = Some(publication);
+        }
+        self.session_listeners[slot] = Some(listener);
+        Ok(created.session)
     }
 
     fn notify_rx(&self, session: &AppSession) {

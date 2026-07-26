@@ -167,15 +167,17 @@ impl SessionQueueNode {
                 Ok(node) if node == output_node => {
                     return u16::try_from(slot)
                         .map(SessionQueueNext::from_slot)
-                        .map_err(|_| {
-                            RuntimeError::invariant("session queue next slot overflows u16")
+                        .map_err(|_| RuntimeError::NodeNextCountOverflow {
+                            count: slot.saturating_add(1),
                         });
                 }
                 Ok(_) => slot += 1,
                 Err(_) => {
-                    return Err(RuntimeError::invariant(
-                        "session queue output is not registered",
-                    ));
+                    return Err(SessionQueueError::OutputMissing {
+                        consumer,
+                        output_node,
+                    }
+                    .into());
                 }
             }
         }
@@ -194,10 +196,12 @@ impl SessionQueueNode {
         SESSION_QUEUE_NODES.with(|nodes| {
             let mut nodes = nodes
                 .try_borrow_mut()
-                .map_err(|_| RuntimeError::invariant("session queue nodes borrowed"))?;
+                .map_err(|_| SessionQueueError::AttachmentRegistryBorrowed)?;
             let node = nodes
                 .get_mut(attachment_slot)
-                .ok_or_else(|| RuntimeError::invariant("session queue node slot is invalid"))?;
+                .ok_or(SessionQueueError::AttachmentSlotMissing {
+                    slot: attachment_slot,
+                })?;
             node.push(SessionQueueAttachment {
                 output_next,
                 dispatch,

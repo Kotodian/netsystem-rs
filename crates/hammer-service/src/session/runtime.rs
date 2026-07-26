@@ -12,10 +12,12 @@ use hammer_infra::thread_owned::ThreadOwned;
 use hammer_runtime::app::{
     AppSessionConfig, SessionEventQueue, SessionEvtType, SessionHandle, SessionMsgQueue,
 };
+use hammer_runtime::attach::AppSessionPublisher;
 use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
 use hammer_runtime::{DataPlaneRuntime, DataWorkerId, Engine, File, FileFunctions};
 
-use crate::session::error::SessionQueueError;
+use crate::session::app::{AppWorkerAttach, AppWorkerError};
+use crate::session::error::{SessionError, SessionQueueError};
 use crate::session::state::SessionState;
 use crate::session::{AppWorker, SessionId, SessionQueueNext};
 
@@ -98,7 +100,7 @@ impl<Index> SessionEntry<Index> {
     const fn creating(transport: SessionTransportId) -> Self {
         Self {
             transport,
-            state: SessionState::TransportDeleted,
+            state: SessionState::creating(),
             schedule_pending: false,
         }
     }
@@ -276,7 +278,36 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         self.entries.prefetch_slot(session_id.pool_index());
     }
 
-    pub fn insert_creating_session(
+    pub fn stream_accept(
+        &mut self,
+        transport: SessionTransportId,
+        index: Index,
+        listener: u32,
+    ) -> RuntimeResult<SessionId> {
+        let session_id = self.insert_creating_session(transport)?;
+        let handle = SessionHandle::new(session_id.pool_index().slot(), self.worker.slot() as u32);
+        let tx_evt_q = self.app.tx_evt_q().clone();
+        let app_session = match self.app.create_app_session(
+            listener,
+            handle,
+            self.app_session_config,
+            tx_evt_q,
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                self.remove_session_entry(session_id);
+                return Err(error);
+            }
+        };
+        self.app.attach_session(session_id, app_session);
+        if let Err(error) = self.finish_session_creation(session_id, index) {
+            self.remove_session_entry(session_id);
+            return Err(error);
+        }
+        Ok(session_id)
+    }
+
+    fn insert_creating_session(
         &mut self,
         transport: SessionTransportId,
     ) -> RuntimeResult<SessionId> {
@@ -286,24 +317,15 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
                 SessionEntry::creating(transport)
             })
             .map(SessionId::from)
-            .ok_or_else(|| RuntimeError::invariant("session pool capacity exhausted"))
+            .ok_or_else(|| {
+                SessionError::CapacityExhausted {
+                    capacity: self.entries.capacity(),
+                }
+                .into()
+            })
     }
 
-    pub fn create_app_session(
-        &mut self,
-        session_id: SessionId,
-        listener: u32,
-    ) -> RuntimeResult<()> {
-        let handle = SessionHandle::new(session_id.pool_index().slot(), self.worker.slot() as u32);
-        let tx_evt_q = self.app.tx_evt_q().clone();
-        let session =
-            self.app
-                .create_app_session(listener, handle, self.app_session_config, tx_evt_q)?;
-        self.app.attach_session(session_id, session);
-        Ok(())
-    }
-
-    pub fn finish_session_creation(
+    fn finish_session_creation(
         &mut self,
         session_id: SessionId,
         index: Index,
@@ -311,9 +333,41 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         let entry = self
             .entries
             .get_mut(session_id.pool_index())
-            .ok_or_else(|| RuntimeError::invariant("session is missing"))?;
-        entry.state = SessionState::active(index);
+            .ok_or(SessionError::SessionMissing { session_id })?;
+        entry.state = entry
+            .state
+            .finish_creation(index)
+            .ok_or(SessionError::NotCreating { session_id })?;
         Ok(())
+    }
+
+    pub fn connection_published(&mut self, session_id: SessionId) -> RuntimeResult<bool> {
+        let entry = self
+            .entries
+            .get_mut(session_id.pool_index())
+            .ok_or(SessionError::SessionMissing { session_id })?;
+        let (state, initial) = entry
+            .state
+            .on_connection_published()
+            .ok_or(SessionError::PublicationRejected { session_id })?;
+        entry.state = state;
+        Ok(initial)
+    }
+
+    pub fn rollback_session_creation(
+        &mut self,
+        session_id: SessionId,
+    ) -> RuntimeResult<Option<Index>> {
+        let entry = self
+            .entries
+            .get(session_id.pool_index())
+            .ok_or(SessionError::SessionMissing { session_id })?;
+        let index = entry
+            .state
+            .rollback_index()
+            .map_err(|_| SessionError::RollbackRejected { session_id })?;
+        self.remove_session_entry(session_id);
+        Ok(index)
     }
 
     pub fn insert_session_for_test(
@@ -326,10 +380,13 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             .expect("session pool capacity exhausted");
         self.finish_session_creation(session_id, index)
             .expect("finish session creation");
+        self.connection_published(session_id)
+            .expect("publish session connection");
+        self.connected(session_id).expect("connect session");
         session_id
     }
 
-    pub fn remove_session_entry(&mut self, session_id: SessionId) -> bool {
+    fn remove_session_entry(&mut self, session_id: SessionId) -> bool {
         self.app.discard_all_tx_bytes_for_session(session_id);
         let _ = self.app.detach_session(session_id);
         self.entries.remove(session_id.pool_index()).is_some()
@@ -461,14 +518,10 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         let rx_available = self.rx_available_u32(session_id);
         Ok(match NonZeroU32::new(accepted) {
             Some(accepted) => {
-                let (start, len) = newest.ok_or_else(|| {
-                    RuntimeError::invariant("accepted OOO delivery must report a retained span")
-                })?;
-                let len = NonZeroU32::new(len).ok_or_else(|| {
-                    RuntimeError::invariant(
-                        "accepted OOO delivery must report non-zero span length",
-                    )
-                })?;
+                let (start, len) =
+                    newest.ok_or(SessionError::OooSpanMissing { session_id })?;
+                let len = NonZeroU32::new(len)
+                    .ok_or(SessionError::OooSpanInvalid { session_id })?;
                 RxDelivery::OutOfOrder {
                     accepted,
                     newest: OooSpan::new(start, len),
@@ -494,9 +547,18 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         self.pending_send_len(session_id).ok().flatten().is_some()
     }
 
-    #[inline]
-    pub fn connected(&self, session_id: SessionId) -> RuntimeResult<()> {
-        self.app.connected(session_id)
+    pub fn connected(&mut self, session_id: SessionId) -> RuntimeResult<()> {
+        let Self { entries, app, .. } = self;
+        let entry = entries
+            .get_mut(session_id.pool_index())
+            .ok_or(SessionError::SessionMissing { session_id })?;
+        let connected = entry
+            .state
+            .on_connected()
+            .ok_or(SessionError::NotPublished { session_id })?;
+        app.connected(session_id)?;
+        entry.state = connected;
+        Ok(())
     }
 
     pub fn copy_tx_to_buffer(
@@ -520,32 +582,71 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
 }
 
 impl<Index: Copy + Eq> SessionWorker<Index> {
-    pub fn new(worker: DataWorkerId) -> Self {
+    pub fn new(worker: DataWorkerId) -> RuntimeResult<Self> {
         Self::with_app_session_config(worker, AppSessionConfig::default())
     }
 
     pub fn with_app_session_config(
         worker: DataWorkerId,
         app_session_config: AppSessionConfig,
-    ) -> Self {
+    ) -> RuntimeResult<Self> {
         let cap = DEFAULT_SESSION_TX_EVENT_CAPACITY.next_power_of_two().max(2) as u32;
         let layout = SessionMsgQueue::layout_bytes(cap, cap.max(2))
-            .expect("fixed session TX event queue layout");
+            .map_err(|error| AppWorkerError::TxEventQueue { error })?;
         let segment = Segment::local(
             layout
                 .checked_add(128)
-                .expect("session event queue layout exceeds addressable memory"),
+                .ok_or(AppWorkerError::TxEventQueueLayoutOverflow)?,
         );
         let offset = segment
             .alloc(layout, 64)
-            .expect("session event queue segment capacity");
+            .ok_or(AppWorkerError::TxEventQueueSegmentExhausted)?;
+        let tx_evt_q = Arc::new(
+            unsafe { SessionMsgQueue::init_at_with_signal(segment, offset, cap, cap.max(2)) }
+                .map_err(|error| AppWorkerError::TxEventQueue { error })?,
+        );
+        let app = AppWorker::new(DEFAULT_SESSION_POOL_CAPACITY, tx_evt_q, worker.slot());
+        Ok(Self::from_app(worker, app_session_config, app))
+    }
+
+    pub(crate) fn with_app_session_attach(
+        worker: DataWorkerId,
+        app_session_config: AppSessionConfig,
+        publisher: AppSessionPublisher,
+    ) -> RuntimeResult<Self> {
+        let cap = DEFAULT_SESSION_TX_EVENT_CAPACITY.next_power_of_two().max(2) as u32;
+        let layout = SessionMsgQueue::layout_bytes(cap, cap.max(2))
+            .map_err(|error| AppWorkerError::TxEventQueue { error })?;
+        let segment = Segment::shared(
+            &format!("hammer-tx-event-w{}", worker.slot()),
+            layout
+                .checked_add(128)
+                .ok_or(AppWorkerError::TxEventQueueLayoutOverflow)?,
+        )
+        .map_err(|source| RuntimeError::subsystem("session", source))?;
+        let offset = segment
+            .alloc(layout, 64)
+            .ok_or(AppWorkerError::TxEventQueueSegmentExhausted)?;
         let tx_evt_q = Arc::new(
             unsafe {
                 SessionMsgQueue::init_at_with_signal(segment.clone(), offset, cap, cap.max(2))
             }
-            .expect("fixed session TX event queue configuration"),
+            .map_err(|error| AppWorkerError::TxEventQueue { error })?,
         );
-        let app = AppWorker::new(DEFAULT_SESSION_POOL_CAPACITY, tx_evt_q, worker.slot());
+        let app = AppWorker::with_attach(
+            DEFAULT_SESSION_POOL_CAPACITY,
+            tx_evt_q,
+            worker.slot(),
+            AppWorkerAttach::new(publisher, segment, offset),
+        );
+        Ok(Self::from_app(worker, app_session_config, app))
+    }
+
+    fn from_app(
+        worker: DataWorkerId,
+        app_session_config: AppSessionConfig,
+        app: AppWorker,
+    ) -> Self {
         Self {
             worker,
             entries: Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
@@ -693,9 +794,12 @@ where
         };
         let params = transport.send_params(sessions, index, total_len, now)?;
         if params.tx_offset > total_len {
-            return Err(RuntimeError::invariant(
-                "session tx offset exceeds chain length",
-            ));
+            return Err(SessionError::TxOffsetOutOfRange {
+                session_id,
+                tx_offset: params.tx_offset,
+                available: total_len,
+            }
+            .into());
         }
         let mut batch_offset = params.tx_offset;
         let mut remaining_space = params.snd_space;

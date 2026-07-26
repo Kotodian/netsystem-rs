@@ -6,7 +6,7 @@ use crate::{TcpSeq, TcpState};
 use hammer_core::data_plane::DataPlaneBuffers;
 use hammer_infra::pool::{Index, Pool};
 use hammer_runtime::{DataPlaneRuntime, DataWorkerId};
-use hammer_runtime::{RuntimeError, RuntimeResult};
+use hammer_runtime::RuntimeResult;
 
 use super::lookup::TcpLookupState;
 use super::timers::{TcpTimerKind, TcpTimers};
@@ -43,7 +43,7 @@ impl TcpWorker {
     pub(crate) fn insert_connection(&mut self, connection: TcpConnection) -> RuntimeResult<Index> {
         self.connections
             .insert(connection)
-            .ok_or_else(|| RuntimeError::invariant("TCP connection pool capacity exhausted"))
+            .ok_or_else(|| TcpNodeError::ConnectionCreate.into())
     }
 
     #[inline]

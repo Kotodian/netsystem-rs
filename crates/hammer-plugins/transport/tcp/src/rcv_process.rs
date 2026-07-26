@@ -119,76 +119,75 @@ fn tcp_rcv_process_index(
     out_len: &mut usize,
 ) -> RuntimeResult<()> {
     let packet = tcp_packet(runtime, index)?;
-    let control = crate::TCP_MAIN
+    let main = crate::TCP_MAIN
         .load_full()
-        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?
-        .with_worker(runtime, |sessions, tcp| {
-            let session_id = read_session_id(runtime, index)?.ok_or_else(|| {
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
+    let control = main.with_worker(runtime, |sessions, tcp| {
+        let session_id = read_session_id(runtime, index)?.ok_or_else(|| {
+            let _ = runtime
+                .record_current_node_error(TcpNodeError::RcvProcessSessionRouteMissing.code());
+            TcpNodeError::RcvProcessSessionRouteMissing
+        })?;
+        // Warm the session pool slot cacheline before the `session_mut`
+        // borrow; the `receive_close_side` work below gives the prefetch
+        // lead time.
+        sessions.prefetch_session(session_id);
+        let (_, connection_index) = sessions
+            .session_transport(session_id)
+            .ok_or(TcpNodeError::RcvProcessSessionMissing)?;
+        let (control, ack_advanced, acked_tx_len, established, established_with_payload) = {
+            let crate::worker::TcpWorker {
+                connections,
+                timers,
+                ..
+            } = tcp;
+            let connection = connections.get_mut(connection_index).ok_or_else(|| {
                 let _ = runtime
-                    .record_current_node_error(TcpNodeError::RcvProcessSessionRouteMissing.code());
-                TcpNodeError::RcvProcessSessionRouteMissing
+                    .record_current_node_error(TcpNodeError::RcvProcessSessionMissing.code());
+                TcpNodeError::RcvProcessSessionMissing
             })?;
-            // Warm the session pool slot cacheline before the `session_mut`
-            // borrow; the `receive_close_side` work below gives the prefetch
-            // lead time.
-            sessions.prefetch_session(session_id);
-            let (_, connection_index) = sessions
-                .session_transport(session_id)
-                .ok_or(TcpNodeError::RcvProcessSessionMissing)?;
-            let (control, ack_advanced, acked_tx_len, established, established_with_payload) = {
-                let crate::worker::TcpWorker {
-                    connections,
-                    timers,
-                    ..
-                } = tcp;
-                let connection = connections.get_mut(connection_index).ok_or_else(|| {
-                    let _ = runtime
-                        .record_current_node_error(TcpNodeError::RcvProcessSessionMissing.code());
-                    TcpNodeError::RcvProcessSessionMissing
-                })?;
-                let previous_state = connection.state();
-                let previous_snd_una = connection.snd_una();
-                let control = connection.receive_close_side(
-                    connection_index,
-                    timers,
-                    &packet,
-                    std::time::Instant::now(),
-                )?;
-                let established = connection.state() == crate::TcpState::Established;
-                (
-                    control,
-                    connection.snd_una() != previous_snd_una,
-                    connection.take_acked_tx_len(previous_snd_una),
-                    established,
-                    previous_state == crate::TcpState::SynRcvd
-                        && established
-                        && packet.payload_len != 0,
-                )
-            };
-            if acked_tx_len != 0 {
-                sessions.ack_tx_up_to(session_id, acked_tx_len as usize)?;
+            let previous_state = connection.state();
+            let previous_snd_una = connection.snd_una();
+            let control = connection.receive_close_side(
+                connection_index,
+                timers,
+                &packet,
+                std::time::Instant::now(),
+            )?;
+            let established = connection.state() == crate::TcpState::Established;
+            (
+                control,
+                connection.snd_una() != previous_snd_una,
+                connection.take_acked_tx_len(previous_snd_una),
+                established,
+                previous_state == crate::TcpState::SynRcvd
+                    && established
+                    && packet.payload_len != 0,
+            )
+        };
+        if acked_tx_len != 0 {
+            sessions.ack_tx_up_to(session_id, acked_tx_len as usize)?;
+        }
+        if ack_advanced && sessions.pending_send_len(session_id)?.is_some() {
+            sessions.mark_ready(session_id);
+        }
+        if established_with_payload {
+            {
+                let mut buffer = runtime.buffers().get_buffer_mut(index)?;
+                buffer.advance(packet.payload_offset as isize)?;
+                buffer.truncate(packet.payload_len)?;
             }
-            if ack_advanced && sessions.pending_send_len(session_id)?.is_some() {
+            let enqueue = sessions.enqueue_rx(runtime.buffers(), session_id, index, 0, false)?;
+            if matches!(enqueue, RxDelivery::InOrder { .. }) {
                 sessions.mark_ready(session_id);
             }
-            if established_with_payload {
-                {
-                    let mut buffer = runtime.buffers().get_buffer_mut(index)?;
-                    buffer.advance(packet.payload_offset as isize)?;
-                    buffer.truncate(packet.payload_len)?;
-                }
-                let enqueue =
-                    sessions.enqueue_rx(runtime.buffers(), session_id, index, 0, false)?;
-                if matches!(enqueue, RxDelivery::InOrder { .. }) {
-                    sessions.mark_ready(session_id);
-                }
-            }
-            publish_tcp_connection(sessions, tcp, session_id)?;
-            if established {
-                sessions.connected(session_id)?;
-            }
-            Ok(control)
-        })?;
+        }
+        publish_tcp_connection(sessions, tcp, session_id)?;
+        if established {
+            sessions.connected(session_id)?;
+        }
+        Ok(control)
+    })?;
     if let Some(segment) = control {
         let allocated = runtime.buffers().alloc_index()?;
         segment.write_to_buffer(runtime.buffers(), allocated)?;

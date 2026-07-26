@@ -173,6 +173,7 @@ pub trait SessionEventQueue: Send + Sync {
     fn clear(&self);
     fn is_empty(&self) -> bool;
     fn read_fd(&self) -> Option<RawFd>;
+    fn write_fd(&self) -> Option<RawFd>;
 }
 
 fn session_ring_cfg(q_nitems: u32, ring_nitems: u32) -> Result<[RingCfg; 2], SessionMsgQueueError> {
@@ -436,10 +437,11 @@ impl SessionEventQueue for SessionMsgQueue {
     }
 
     fn read_fd(&self) -> Option<RawFd> {
-        match &self.signal_read {
-            Some(signal_read) => Some(signal_read.as_raw_fd()),
-            None => None,
-        }
+        self.signal_read.as_ref().map(|signal| signal.as_raw_fd())
+    }
+
+    fn write_fd(&self) -> Option<RawFd> {
+        self.signal_write.as_ref().map(|signal| signal.as_raw_fd())
     }
 }
 

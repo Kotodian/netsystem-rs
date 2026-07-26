@@ -105,11 +105,11 @@ pub enum TcpError {
 }
 
 // TCP is a plugin-owned domain. Graph and runtime callbacks still cross the
-// Core result boundary, so retain only a textual boundary conversion here.
+// Core result boundary, so preserve the typed TCP source at that boundary.
 impl From<TcpError> for RuntimeError {
     #[inline]
     fn from(error: TcpError) -> Self {
-        Self::invariant(error.to_string())
+        Self::subsystem("tcp", error)
     }
 }
 

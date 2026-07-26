@@ -8,7 +8,7 @@ use hammer_runtime::{
     DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node,
     NodeProcessFn, NodeResult, NodeRuntimeData,
 };
-use hammer_runtime::{RuntimeError, RuntimeResult};
+use hammer_runtime::RuntimeResult;
 use hammer_service::opaque::NetworkOpaque;
 
 fn test_runtime_configured(
@@ -38,10 +38,7 @@ struct CaptureNode {
 
 impl CaptureNode {
     fn new(state: Arc<Mutex<CaptureState>>) -> Self {
-        let mut states = capture_states()
-            .lock()
-            .map_err(|_| RuntimeError::invariant("capture state registry poisoned"))
-            .expect("capture state registry");
+        let mut states = capture_states().lock().expect("capture state registry");
         let slot = states.len();
         states.push(state);
         Self {

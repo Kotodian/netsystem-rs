@@ -3,7 +3,6 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use super::wire::{header_mut_ptr, read_header};
 use hammer_infra::bihash::{BihashKey, hash_words, splitmix64};
 use hammer_infra::checksum::internet_checksum;
-use hammer_runtime::{RuntimeError, RuntimeResult};
 
 const IPV4_HEADER_MIN_LEN: usize = 20;
 const IPV6_HEADER_LEN: usize = 40;
@@ -34,16 +33,27 @@ pub enum IpInputTarget {
     Reassembly,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, thiserror::Error,
+)]
 pub enum IpInputError {
+    #[error("no IP input error")]
     None,
+    #[error("unsupported IP version")]
     Version,
+    #[error("IP header is too short")]
     HeaderTooShort,
+    #[error("invalid IP options")]
     Options,
+    #[error("bad IP checksum")]
     BadChecksum,
+    #[error("IP time to live expired")]
     TimeExpired,
+    #[error("IP fragment offset one")]
     FragmentOffsetOne,
+    #[error("IP packet is too short")]
     TooShort,
+    #[error("inconsistent IP packet length")]
     BadLength,
 }
 
@@ -51,6 +61,13 @@ impl IpInputError {
     #[inline(always)]
     pub const fn code(self) -> u16 {
         self as u16
+    }
+}
+
+impl From<IpInputError> for hammer_runtime::RuntimeError {
+    #[inline]
+    fn from(error: IpInputError) -> Self {
+        Self::subsystem("ip", error)
     }
 }
 
@@ -288,55 +305,50 @@ impl Ipv6FragmentHeader {
     }
 }
 
-pub fn parse_ip_header(packet: &[u8]) -> RuntimeResult<ParsedIpPacket> {
+pub fn parse_ip_header(packet: &[u8]) -> Result<ParsedIpPacket, IpInputError> {
     let Some(first) = packet.first().copied() else {
-        return Err(RuntimeError::invariant("empty IP packet"));
+        return Err(IpInputError::HeaderTooShort);
     };
     match first >> 4 {
         4 => parse_ipv4_packet_header(packet),
         6 => parse_ipv6_packet_header(packet),
-        other => Err(RuntimeError::invariant(format!(
-            "unsupported IP version: {other}"
-        ))),
+        _ => Err(IpInputError::Version),
     }
 }
 
-pub fn parse_ip_fragment(packet: &[u8]) -> RuntimeResult<ParsedIpFragment> {
+pub fn parse_ip_fragment(packet: &[u8]) -> Result<ParsedIpFragment, IpInputError> {
     parse_ip_fragment_with_chain_len(packet, 0)
 }
 
 pub fn parse_ip_fragment_with_chain_len(
     packet: &[u8],
     tail_len: usize,
-) -> RuntimeResult<ParsedIpFragment> {
+) -> Result<ParsedIpFragment, IpInputError> {
     let Some(first) = packet.first().copied() else {
-        return Err(RuntimeError::invariant("empty IP packet"));
+        return Err(IpInputError::HeaderTooShort);
     };
     let chain_len = packet.len().saturating_add(tail_len);
     match first >> 4 {
         4 => parse_ipv4_fragment(packet, chain_len),
         6 => parse_ipv6_fragment(packet, chain_len),
-        other => Err(RuntimeError::invariant(format!(
-            "unsupported IP version: {other}"
-        ))),
+        _ => Err(IpInputError::Version),
     }
 }
 
 #[inline(always)]
-fn parse_ipv4_packet_header(packet: &[u8]) -> RuntimeResult<ParsedIpPacket> {
-    let header = read_header::<Ipv4Header>(packet, 0)
-        .map_err(|_| RuntimeError::invariant("ipv4 header is too short"))?;
+fn parse_ipv4_packet_header(packet: &[u8]) -> Result<ParsedIpPacket, IpInputError> {
+    let header = read_header::<Ipv4Header>(packet, 0)?;
     if header.version() != 4 {
-        return Err(RuntimeError::invariant("invalid ipv4 version"));
+        return Err(IpInputError::Version);
     }
     let ihl = header.header_len();
     if ihl < IPV4_HEADER_MIN_LEN || packet.len() < ihl {
-        return Err(RuntimeError::invariant("invalid ipv4 header length"));
+        return Err(IpInputError::HeaderTooShort);
     }
 
     let total_len = header.total_len();
     if total_len < ihl {
-        return Err(RuntimeError::invariant("invalid ipv4 packet length"));
+        return Err(IpInputError::BadLength);
     }
 
     let fragment = header.flags_fragment();
@@ -383,20 +395,22 @@ fn parse_ipv4_packet_header(packet: &[u8]) -> RuntimeResult<ParsedIpPacket> {
 }
 
 #[inline(always)]
-fn parse_ipv4_fragment(packet: &[u8], chain_len: usize) -> RuntimeResult<ParsedIpFragment> {
-    let header = read_header::<Ipv4Header>(packet, 0)
-        .map_err(|_| RuntimeError::invariant("ipv4 fragment header is too short"))?;
+fn parse_ipv4_fragment(
+    packet: &[u8],
+    chain_len: usize,
+) -> Result<ParsedIpFragment, IpInputError> {
+    let header = read_header::<Ipv4Header>(packet, 0)?;
     if header.version() != 4 {
-        return Err(RuntimeError::invariant("invalid ipv4 version"));
+        return Err(IpInputError::Version);
     }
     let ihl = header.header_len();
     if ihl < IPV4_HEADER_MIN_LEN || packet.len() < ihl {
-        return Err(RuntimeError::invariant("invalid ipv4 header length"));
+        return Err(IpInputError::HeaderTooShort);
     }
 
     let total_len = header.total_len();
     if total_len < ihl || total_len > chain_len {
-        return Err(RuntimeError::invariant("invalid ipv4 fragment length"));
+        return Err(IpInputError::BadLength);
     }
 
     let fragment = header.flags_fragment();
@@ -404,7 +418,7 @@ fn parse_ipv4_fragment(packet: &[u8], chain_len: usize) -> RuntimeResult<ParsedI
     let payload_offset = usize::from(fragment & IPV4_FRAGMENT_OFFSET_MASK) * 8;
     let more_fragments = fragment & IPV4_FLAG_MORE_FRAGMENTS != 0;
     if payload_offset == 0 && !more_fragments {
-        return Err(RuntimeError::invariant("ipv4 packet is not fragmented"));
+        return Err(IpInputError::BadLength);
     }
 
     Ok(ParsedIpFragment {
@@ -423,30 +437,28 @@ fn parse_ipv4_fragment(packet: &[u8], chain_len: usize) -> RuntimeResult<ParsedI
 }
 
 #[inline(always)]
-fn parse_ipv6_packet_header(packet: &[u8]) -> RuntimeResult<ParsedIpPacket> {
-    let header = read_header::<Ipv6Header>(packet, 0)
-        .map_err(|_| RuntimeError::invariant("ipv6 header is too short"))?;
+fn parse_ipv6_packet_header(packet: &[u8]) -> Result<ParsedIpPacket, IpInputError> {
+    let header = read_header::<Ipv6Header>(packet, 0)?;
     if header.version() != 6 {
-        return Err(RuntimeError::invariant("invalid ipv6 version"));
+        return Err(IpInputError::Version);
     }
     if packet.len() < IPV6_HEADER_LEN {
-        return Err(RuntimeError::invariant("ipv6 header is truncated"));
+        return Err(IpInputError::HeaderTooShort);
     }
 
     let payload_len = header.payload_len();
     let total_len = IPV6_HEADER_LEN
         .checked_add(payload_len)
-        .ok_or_else(|| RuntimeError::invariant("ipv6 payload length overflow"))?;
+        .ok_or(IpInputError::BadLength)?;
 
     let source = header.source();
     let destination = header.destination();
     let (protocol, input_target, input_error, transport_offset) =
         if header.next_header == IPV6_NEXT_HEADER_FRAGMENT {
             if payload_len < IPV6_FRAGMENT_HEADER_LEN {
-                return Err(RuntimeError::invariant("ipv6 fragment header is truncated"));
+                return Err(IpInputError::HeaderTooShort);
             }
-            let fragment = read_header::<Ipv6FragmentHeader>(packet, IPV6_HEADER_LEN)
-                .map_err(|_| RuntimeError::invariant("ipv6 fragment header is missing"))?;
+            let fragment = read_header::<Ipv6FragmentHeader>(packet, IPV6_HEADER_LEN)?;
             (
                 fragment.next_header,
                 if header.hop_limit < 1 {
@@ -500,40 +512,39 @@ fn parse_ipv6_packet_header(packet: &[u8]) -> RuntimeResult<ParsedIpPacket> {
 }
 
 #[inline(always)]
-fn parse_ipv6_fragment(packet: &[u8], chain_len: usize) -> RuntimeResult<ParsedIpFragment> {
-    let header = read_header::<Ipv6Header>(packet, 0)
-        .map_err(|_| RuntimeError::invariant("ipv6 header is too short"))?;
+fn parse_ipv6_fragment(
+    packet: &[u8],
+    chain_len: usize,
+) -> Result<ParsedIpFragment, IpInputError> {
+    let header = read_header::<Ipv6Header>(packet, 0)?;
     if header.version() != 6 {
-        return Err(RuntimeError::invariant("invalid ipv6 version"));
+        return Err(IpInputError::Version);
     }
     if packet.len() < IPV6_HEADER_LEN + IPV6_FRAGMENT_HEADER_LEN {
-        return Err(RuntimeError::invariant("ipv6 fragment header is truncated"));
+        return Err(IpInputError::HeaderTooShort);
     }
 
     let payload_len = header.payload_len();
     let total_len = IPV6_HEADER_LEN
         .checked_add(payload_len)
-        .ok_or_else(|| RuntimeError::invariant("ipv6 payload length overflow"))?;
+        .ok_or(IpInputError::BadLength)?;
     if total_len > chain_len {
-        return Err(RuntimeError::invariant("invalid ipv6 fragment length"));
+        return Err(IpInputError::BadLength);
     }
     if payload_len < IPV6_FRAGMENT_HEADER_LEN {
-        return Err(RuntimeError::invariant(
-            "ipv6 fragment payload is too short",
-        ));
+        return Err(IpInputError::HeaderTooShort);
     }
     if header.next_header != IPV6_NEXT_HEADER_FRAGMENT {
-        return Err(RuntimeError::invariant("ipv6 packet is not fragmented"));
+        return Err(IpInputError::BadLength);
     }
 
-    let fragment = read_header::<Ipv6FragmentHeader>(packet, IPV6_HEADER_LEN)
-        .map_err(|_| RuntimeError::invariant("ipv6 fragment header is missing"))?;
+    let fragment = read_header::<Ipv6FragmentHeader>(packet, IPV6_HEADER_LEN)?;
     let offset_more = fragment.offset_more();
     let payload_len = payload_len - IPV6_FRAGMENT_HEADER_LEN;
     let payload_offset = usize::from(offset_more >> 3) * 8;
     let more_fragments = offset_more & 1 != 0;
     if payload_offset == 0 && !more_fragments {
-        return Err(RuntimeError::invariant("ipv6 packet is not fragmented"));
+        return Err(IpInputError::BadLength);
     }
 
     Ok(ParsedIpFragment {
@@ -587,7 +598,7 @@ pub fn write_ipv4_push_header(
     dst: Ipv4Addr,
     protocol: u8,
     total_len: u16,
-) -> RuntimeResult<()> {
+) -> Result<(), IpInputError> {
     let ptr = header_mut_ptr::<Ipv4Header>(output, 0)?;
     // SAFETY: `header_mut_ptr` checked the range; `Ipv4Header` fields are only
     // byte arrays so mutable field access cannot create unaligned multi-byte refs.

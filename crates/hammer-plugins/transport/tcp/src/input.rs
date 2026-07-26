@@ -160,6 +160,12 @@ fn register_tcp_input_runtime(snapshot: Arc<ArcSwap<TcpLookupSnapshot>>) -> Node
     })
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("TCP input runtime slot {slot} is not registered")]
+struct TcpInputSlotInvalid {
+    slot: usize,
+}
+
 fn tcp_input_runtime(data: NodeRuntimeData) -> RuntimeResult<TcpInputRuntime> {
     let slot = data.usize_word(0)?;
     TCP_INPUT_RUNTIMES.with(|runtimes| {
@@ -167,7 +173,7 @@ fn tcp_input_runtime(data: NodeRuntimeData) -> RuntimeResult<TcpInputRuntime> {
             .borrow()
             .get(slot)
             .cloned()
-            .ok_or_else(|| RuntimeError::invariant("TCP input runtime slot is invalid"))
+            .ok_or_else(|| RuntimeError::subsystem("tcp", TcpInputSlotInvalid { slot }))
     })
 }
 
@@ -181,7 +187,7 @@ fn sync_tcp_input_runtime(
         let mut runtimes = runtimes.borrow_mut();
         let runtime = runtimes
             .get_mut(slot)
-            .ok_or_else(|| RuntimeError::invariant("TCP input runtime slot is invalid"))?;
+            .ok_or_else(|| RuntimeError::subsystem("tcp", TcpInputSlotInvalid { slot }))?;
         runtime.handoff = handoff;
         runtime.handoff_worker = handoff_worker;
         Ok(())

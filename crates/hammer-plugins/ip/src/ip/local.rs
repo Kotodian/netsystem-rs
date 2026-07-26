@@ -240,12 +240,11 @@ std::thread_local! {
 pub(crate) fn register_protocol(protocol: u8, node: NodeId) -> RuntimeResult<()> {
     IP_LOCAL_PROTOCOL_REGISTRATION.with(|registration| {
         let registration = registration.borrow();
-        let (control, nodes, consumer) = registration.as_ref().ok_or_else(|| {
-            RuntimeError::lifecycle(
-                "ip protocol registration",
-                "ip-local graph node is not registered",
-            )
-        })?;
+        let (control, nodes, consumer) = registration.as_ref().ok_or(
+            crate::ip::IpControlError::NodeRuntimeUnavailable {
+                operation: crate::ip::IpControlOperation::IpProtocolRegistration,
+            },
+        )?;
         let slot = nodes.add_node_next_slot(*consumer, node)?;
         control.publish_protocol_slot(protocol, slot);
         Ok(())
@@ -269,7 +268,9 @@ fn register_ip_local(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
 fn register_ip_receive(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     let control = PENDING_IP_LOCAL_CONTROL
         .with(|pending| pending.borrow_mut().take())
-        .ok_or_else(|| RuntimeError::invariant("IP local sibling initialized before its owner"))?;
+        .ok_or(crate::ip::IpControlError::NodeRuntimeUnavailable {
+            operation: crate::ip::IpControlOperation::IpReceiveRegistration,
+        })?;
     runtime
         .nodes()
         .try_register_internal(control.receive_node())
@@ -376,12 +377,17 @@ fn sync_ip_local_runtime(
     feature_arc: Option<FeatureArcStartHandle>,
 ) -> RuntimeResult<()> {
     let slot = data.usize_word(0)?;
-    let mut runtimes = ip_local_runtimes()
-        .lock()
-        .map_err(|_| RuntimeError::invariant("IP local runtime registry poisoned"))?;
+    let mut runtimes = ip_local_runtimes().lock().map_err(|_| {
+        crate::ip::IpControlError::RuntimeRegistryPoisoned {
+            registry: crate::ip::IpRuntimeRegistry::IpLocal,
+        }
+    })?;
     let runtime = runtimes
         .get_mut(slot)
-        .ok_or_else(|| RuntimeError::invariant("IP local runtime slot is invalid"))?;
+        .ok_or(crate::ip::IpControlError::RuntimeSlotInvalid {
+            registry: crate::ip::IpRuntimeRegistry::IpLocal,
+            slot,
+        })?;
     runtime.state = state;
     runtime.feature_arc = feature_arc;
     Ok(())
@@ -391,10 +397,18 @@ fn ip_local_runtime(data: NodeRuntimeData) -> RuntimeResult<IpLocalRuntime> {
     let slot = data.usize_word(0)?;
     ip_local_runtimes()
         .lock()
-        .map_err(|_| RuntimeError::invariant("IP local runtime registry poisoned"))?
+        .map_err(|_| crate::ip::IpControlError::RuntimeRegistryPoisoned {
+            registry: crate::ip::IpRuntimeRegistry::IpLocal,
+        })?
         .get(slot)
         .cloned()
-        .ok_or_else(|| RuntimeError::invariant("IP local runtime slot is invalid"))
+        .ok_or_else(|| {
+            crate::ip::IpControlError::RuntimeSlotInvalid {
+                registry: crate::ip::IpRuntimeRegistry::IpLocal,
+                slot,
+            }
+            .into()
+        })
 }
 
 fn ip_local_process(
@@ -538,7 +552,7 @@ fn process_index(
     let first_len = current.len().min(parsed.packet_len);
     let packet = current
         .get(..first_len)
-        .ok_or_else(|| RuntimeError::invariant("invalid local packet length"))?;
+        .ok_or_else(|| RuntimeError::from(crate::protocol::ip::IpInputError::BadLength))?;
     let transport = match packet.get(parsed.transport_header_offset..parsed.packet_len) {
         Some(transport) => transport,
         None => {

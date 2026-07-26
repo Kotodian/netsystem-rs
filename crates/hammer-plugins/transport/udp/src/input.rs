@@ -54,6 +54,30 @@ impl UdpInputError {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum UdpControlError {
+    #[error("IP output is unavailable")]
+    IpOutputUnavailable,
+    #[error("IP output is already initialized")]
+    IpOutputAlreadyInitialized,
+    #[error("UDP input consumer is not attached")]
+    ConsumerNotAttached,
+    #[error("UDP input node runtime is unavailable")]
+    NodeRuntimeUnavailable,
+    #[error("UDP input runtime registry is poisoned")]
+    RuntimeRegistryPoisoned,
+    #[error("UDP input runtime slot {slot} is not registered")]
+    RuntimeSlotInvalid { slot: usize },
+    #[error("UDP header at offset {offset} is truncated or out of range")]
+    HeaderOutOfRange { offset: usize },
+}
+
+impl From<UdpControlError> for RuntimeError {
+    fn from(error: UdpControlError) -> Self {
+        Self::subsystem("udp", error)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct UdpInputTrace {
     pub version: Option<UdpIpVersion>,
@@ -103,9 +127,7 @@ impl UdpInputControlPlane {
 
     pub fn attach_consumer(&mut self, consumer: NodeId) -> RuntimeResult<()> {
         if self.nodes.is_none() {
-            return Err(RuntimeError::invariant(
-                "udp input attach requires node runtime",
-            ));
+            return Err(UdpControlError::NodeRuntimeUnavailable.into());
         }
         self.consumer = Some(consumer);
         Ok(())
@@ -113,12 +135,11 @@ impl UdpInputControlPlane {
 
     #[inline]
     pub fn register_port(&self, port: u16, node: NodeId) -> RuntimeResult<u16> {
-        let consumer = self.consumer.ok_or_else(|| {
-            RuntimeError::invariant("udp input register_port requires attach_consumer")
-        })?;
-        let nodes = self.nodes.as_ref().ok_or_else(|| {
-            RuntimeError::invariant("udp input register_port requires node runtime")
-        })?;
+        let consumer = self.consumer.ok_or(UdpControlError::ConsumerNotAttached)?;
+        let nodes = self
+            .nodes
+            .as_ref()
+            .ok_or(UdpControlError::NodeRuntimeUnavailable)?;
         let slot = nodes.add_node_next_slot(consumer, node)?;
         self.inner.rcu(|current| {
             let mut next = UdpInputSnapshot::clone(current);
@@ -235,10 +256,10 @@ fn udp_input_runtime(data: NodeRuntimeData) -> RuntimeResult<UdpInputRuntime> {
     let slot = data.usize_word(0)?;
     udp_input_runtimes()
         .lock()
-        .map_err(|_| RuntimeError::invariant("UDP input runtime registry poisoned"))?
+        .map_err(|_| UdpControlError::RuntimeRegistryPoisoned)?
         .get(slot)
         .cloned()
-        .ok_or_else(|| RuntimeError::invariant("UDP input runtime slot is invalid"))
+        .ok_or_else(|| UdpControlError::RuntimeSlotInvalid { slot }.into())
 }
 
 fn udp_input_process(
@@ -272,14 +293,14 @@ fn register_udp_input(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     let node = runtime
         .nodes()
         .try_register_internal_with_next_names(control.node(), &UdpInputNext::NEXT_NAMES)?;
-    let output = super::IP_OUTPUT.get().ok_or_else(|| {
-        RuntimeError::lifecycle("udp graph registration", "IP output is unavailable")
-    })?;
+    let output = super::IP_OUTPUT
+        .get()
+        .ok_or(UdpControlError::IpOutputUnavailable)?;
     output
         .get()
         .register_protocol(17, node)
         .into_result()
-        .map_err(|error| RuntimeError::subsystem("ip protocol registration", error))?;
+        .map_err(|error| RuntimeError::subsystem("udp", error))?;
     Ok(node)
 }
 
@@ -650,7 +671,9 @@ fn refresh_udp_cursor(
     let transport_header_offset = cursor.transport_header_offset();
     let transport_payload_offset = transport_header_offset
         .checked_add(UDP_HEADER_LEN)
-        .ok_or_else(|| RuntimeError::invariant("UDP transport payload offset overflows"))?;
+        .ok_or(UdpControlError::HeaderOutOfRange {
+            offset: transport_header_offset,
+        })?;
     let mut buffer = runtime.get_buffer_mut(index)?;
     let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
     network.set_packet_cursor(
@@ -679,10 +702,10 @@ fn port_unreachable_metadata(version: UdpIpVersion) -> Option<NonZeroU64> {
 fn read_udp_header(packet: &[u8], offset: usize) -> RuntimeResult<UdpHeader> {
     let end = offset
         .checked_add(size_of::<UdpHeader>())
-        .ok_or_else(|| RuntimeError::invariant("UDP header offset overflows"))?;
+        .ok_or(UdpControlError::HeaderOutOfRange { offset })?;
     let bytes = packet
         .get(offset..end)
-        .ok_or_else(|| RuntimeError::invariant("UDP header is truncated"))?;
+        .ok_or(UdpControlError::HeaderOutOfRange { offset })?;
     // SAFETY: `bytes` has exactly the size of `UdpHeader`; unaligned reads are
     // valid because network headers may start at arbitrary buffer offsets.
     Ok(unsafe { bytes.as_ptr().cast::<UdpHeader>().read_unaligned() })

@@ -15,7 +15,7 @@ use hammer_runtime::{
     DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, TraceFormatter,
     add_packet_trace, format_packet_trace,
 };
-use hammer_runtime::{RuntimeError, RuntimeResult};
+use hammer_runtime::RuntimeResult;
 
 use hammer_service::data_plane::set_index_node_error_code;
 use hammer_service::opaque::NetworkOpaque;
@@ -275,7 +275,9 @@ impl IcmpInputControlPlane {
         let nodes = self
             .nodes
             .as_ref()
-            .ok_or_else(|| RuntimeError::invariant("icmp input attach requires node runtime"))?;
+            .ok_or(crate::ip::IpControlError::NodeRuntimeUnavailable {
+                operation: crate::ip::IpControlOperation::IcmpConsumerAttach,
+            })?;
         nodes.set_node_next(consumer, IcmpInputNext::Drop, self.ip4_default_node)?;
         let ip4_slot = NodeNext::slot(IcmpInputNext::Drop);
         let ip6_slot = if self.ip6_default_node == self.ip4_default_node {
@@ -301,12 +303,15 @@ impl IcmpInputControlPlane {
         icmp_type: u8,
         node: NodeId,
     ) -> RuntimeResult<u16> {
-        let consumer = self.consumer.ok_or_else(|| {
-            RuntimeError::invariant("icmp input register_type requires attach_consumer")
-        })?;
-        let nodes = self.nodes.as_ref().ok_or_else(|| {
-            RuntimeError::invariant("icmp input register_type requires node runtime")
-        })?;
+        let consumer = self
+            .consumer
+            .ok_or(crate::ip::IpControlError::ConsumerNotAttached)?;
+        let nodes = self
+            .nodes
+            .as_ref()
+            .ok_or(crate::ip::IpControlError::NodeRuntimeUnavailable {
+                operation: crate::ip::IpControlOperation::IcmpTypeRegistration,
+            })?;
         let slot = nodes.add_node_next_slot(consumer, node)?;
         self.inner.rcu(|current| {
             let mut next = IcmpInputSnapshot::clone(current);
@@ -634,10 +639,18 @@ fn icmp_input_runtime(data: NodeRuntimeData) -> RuntimeResult<IcmpInputRuntime> 
     let slot = data.usize_word(0)?;
     icmp_input_runtimes()
         .lock()
-        .map_err(|_| RuntimeError::invariant("ICMP input runtime registry poisoned"))?
+        .map_err(|_| crate::ip::IpControlError::RuntimeRegistryPoisoned {
+            registry: crate::ip::IpRuntimeRegistry::IcmpInput,
+        })?
         .get(slot)
         .cloned()
-        .ok_or_else(|| RuntimeError::invariant("ICMP input runtime slot is invalid"))
+        .ok_or_else(|| {
+            crate::ip::IpControlError::RuntimeSlotInvalid {
+                registry: crate::ip::IpRuntimeRegistry::IcmpInput,
+                slot,
+            }
+            .into()
+        })
 }
 
 fn icmp_input_process(
@@ -773,12 +786,17 @@ fn sync_icmp_error_runtime(
     source_table: Option<IcmpErrorSourceTableHandle>,
 ) -> RuntimeResult<()> {
     let slot = data.usize_word(0)?;
-    let mut runtimes = icmp_error_runtimes()
-        .lock()
-        .map_err(|_| RuntimeError::invariant("ICMP error runtime registry poisoned"))?;
+    let mut runtimes = icmp_error_runtimes().lock().map_err(|_| {
+        crate::ip::IpControlError::RuntimeRegistryPoisoned {
+            registry: crate::ip::IpRuntimeRegistry::IcmpError,
+        }
+    })?;
     let runtime = runtimes
         .get_mut(slot)
-        .ok_or_else(|| RuntimeError::invariant("ICMP error runtime slot is invalid"))?;
+        .ok_or(crate::ip::IpControlError::RuntimeSlotInvalid {
+            registry: crate::ip::IpRuntimeRegistry::IcmpError,
+            slot,
+        })?;
     runtime.source_table = source_table;
     Ok(())
 }
@@ -787,10 +805,18 @@ fn icmp_error_runtime(data: NodeRuntimeData) -> RuntimeResult<IcmpErrorRuntime> 
     let slot = data.usize_word(0)?;
     icmp_error_runtimes()
         .lock()
-        .map_err(|_| RuntimeError::invariant("ICMP error runtime registry poisoned"))?
+        .map_err(|_| crate::ip::IpControlError::RuntimeRegistryPoisoned {
+            registry: crate::ip::IpRuntimeRegistry::IcmpError,
+        })?
         .get(slot)
         .cloned()
-        .ok_or_else(|| RuntimeError::invariant("ICMP error runtime slot is invalid"))
+        .ok_or_else(|| {
+            crate::ip::IpControlError::RuntimeSlotInvalid {
+                registry: crate::ip::IpRuntimeRegistry::IcmpError,
+                slot,
+            }
+            .into()
+        })
 }
 
 fn icmp_error_process(

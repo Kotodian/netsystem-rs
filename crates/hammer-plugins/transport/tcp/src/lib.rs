@@ -110,48 +110,33 @@ enum TcpWorkerError {
     },
 }
 
-pub(crate) fn insert_tcp_session<F>(
-    sessions: &mut SessionWorker<PoolIndex>,
-    tcp: &mut TcpWorker,
-    listener: u32,
-    create: F,
-) -> RuntimeResult<SessionId>
-where
-    F: FnOnce(SessionId) -> TcpConnection,
-{
-    let session_id =
-        sessions.insert_creating_session(<TcpWorker as SessionTransport<PoolIndex>>::ID)?;
-    if let Err(error) = sessions.create_app_session(session_id, listener) {
-        sessions.remove_session_entry(session_id);
-        return Err(error);
-    }
-    let index = match tcp.insert_connection(create(session_id)) {
-        Ok(index) => index,
-        Err(error) => {
-            sessions.remove_session_entry(session_id);
-            return Err(error);
-        }
-    };
-    if let Err(error) = sessions.finish_session_creation(session_id, index) {
-        let _ = tcp.remove_connection(index);
-        sessions.remove_session_entry(session_id);
-        return Err(error);
-    }
-    Ok(session_id)
-}
-
-pub(crate) fn rollback_tcp_session(
+pub(crate) fn publish_tcp_connection(
     sessions: &mut SessionWorker<PoolIndex>,
     tcp: &mut TcpWorker,
     session_id: SessionId,
-) -> RuntimeResult<bool> {
-    let Some((_, index)) = sessions.session_transport(session_id) else {
-        return Ok(false);
+) -> RuntimeResult<()> {
+    let (_, index) = sessions
+        .session_transport(session_id)
+        .ok_or(TcpNodeError::SessionMissing)?;
+    let close = {
+        let TcpWorker {
+            connections,
+            lookup,
+            ..
+        } = tcp;
+        let connection = connections.get(index).ok_or(TcpNodeError::SessionMissing)?;
+        lookup.publish_connection(session_id, connection)
     };
-    tcp.lookup.forget_session(session_id);
-    tcp.lookup.forget_pending_open(session_id);
-    let _ = tcp.remove_connection(index);
-    Ok(sessions.remove_session_entry(session_id))
+    let initial = sessions.connection_published(session_id)?;
+    if close {
+        if initial {
+            return Err(TcpError::ConnectionClosed.into());
+        }
+        sessions.notify_transport_closed(session_id, index)?;
+        let _ = tcp.remove_connection(index);
+        sessions.notify_transport_deleted(session_id, index);
+    }
+    Ok(())
 }
 
 pub struct TcpMain {
@@ -413,8 +398,7 @@ fn bind_worker_graph(engine: &mut Engine) -> RuntimeResult<()> {
         .control()
         .node(main.input_process, Some((handoff, worker)))
         .node_runtime_data()?;
-    let control = main.control().clone();
-    let listen_data = TcpListenNode::new(control, main.listen_process).node_runtime_data()?;
+    let listen_data = TcpListenNode::new(main.listen_process).node_runtime_data()?;
     let established_data = TcpEstablishedNode::new(main.established_process).node_runtime_data()?;
     let rcv_process_data = TcpRcvProcessNode::new(main.rcv_process).node_runtime_data()?;
     let syn_sent_data = TcpSynSentNode::new(main.syn_sent_process).node_runtime_data()?;
@@ -581,12 +565,21 @@ pub enum TcpOutputError {
     IpOutputUnavailable,
     #[error("TCP segment is too long for its IP packet")]
     SegmentTooLong,
+    #[error("IP output rejected the prepended IP header")]
+    IpHeaderRejected,
 }
 
 impl TcpOutputError {
     #[inline(always)]
     pub const fn code(self) -> u16 {
         self as u16
+    }
+}
+
+impl From<TcpOutputError> for RuntimeError {
+    #[inline]
+    fn from(error: TcpOutputError) -> Self {
+        Self::subsystem("tcp", error)
     }
 }
 
@@ -823,31 +816,6 @@ fn enqueue_tcp_segment(
     Ok(())
 }
 
-fn publish_tcp_connection(
-    sessions: &mut SessionWorker<PoolIndex>,
-    tcp: &mut TcpWorker,
-    session_id: SessionId,
-) -> RuntimeResult<()> {
-    let (_, index) = sessions
-        .session_transport(session_id)
-        .ok_or(TcpNodeError::SessionMissing)?;
-    let close = {
-        let TcpWorker {
-            connections,
-            lookup,
-            ..
-        } = tcp;
-        let connection = connections.get(index).ok_or(TcpNodeError::SessionMissing)?;
-        lookup.publish_connection(session_id, connection)
-    };
-    if close {
-        sessions.notify_transport_closed(session_id, index)?;
-        let _ = tcp.remove_connection(index);
-        sessions.notify_transport_deleted(session_id, index);
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 #[doc(hidden)]
 pub(crate) fn closing_session_for_test() -> (
@@ -868,19 +836,28 @@ pub(crate) fn closing_session_for_test() -> (
             ..hammer_runtime::DataPlaneBufferConfig::default()
         },
     });
-    let mut sessions = SessionWorker::new(worker);
+    let mut sessions = SessionWorker::new(worker).expect("session worker for test");
     let mut tcp = TcpWorker::new(worker);
-    let session_id = insert_tcp_session(&mut sessions, &mut tcp, 0, |session_id: SessionId| {
-        TcpConnection::established_for_time_wait_test(
-            Some(crate::TcpConnectionId::new(session_id.get())),
-            worker,
-            local.port(),
-            Some(local),
-            remote,
-        )
-    })
-    .expect("insert session");
-    publish_tcp_connection(&mut sessions, &mut tcp, session_id).expect("refresh session route");
+    let connection = TcpConnection::established_for_time_wait_test(
+        None,
+        worker,
+        local.port(),
+        Some(local),
+        remote,
+    );
+    let connection_index = tcp
+        .insert_connection(connection)
+        .expect("insert TCP connection");
+    let session_id = sessions
+        .stream_accept(TcpWorker::ID, connection_index, 0)
+        .expect("accept stream session");
+    tcp.connection_mut(connection_index)
+        .expect("TCP connection")
+        .attach_session(session_id)
+        .expect("attach stream session");
+    publish_tcp_connection(&mut sessions, &mut tcp, session_id)
+        .expect("publish TCP connection");
+    sessions.connected(session_id).expect("notify accepted session");
     (sessions, tcp, session_id, local, remote)
 }
 

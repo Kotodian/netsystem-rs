@@ -222,8 +222,6 @@ pub enum RuntimeError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-    #[error("runtime invariant violated: {detail}")]
-    Invariant { detail: String },
 }
 
 #[derive(Debug, Error)]
@@ -260,6 +258,24 @@ pub enum AttachError {
         #[source]
         source: std::io::Error,
     },
+    #[error("attach publication capacity must be non-zero")]
+    PublicationCapacityInvalid,
+    #[error("attach publication queue is full")]
+    PublicationQueueFull,
+    #[error("attach publication queue is closed")]
+    PublicationQueueClosed,
+    #[error("attach server is already running")]
+    ServerAlreadyRunning,
+    #[error("failed to set attach listener nonblocking status")]
+    ListenerNonblocking {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to register attach listener with Tokio")]
+    ListenerRegistration {
+        #[source]
+        source: std::io::Error,
+    },
     #[error("failed to bind attach server at {path}")]
     Bind {
         path: String,
@@ -286,6 +302,10 @@ pub enum AttachError {
     },
     #[error("attach segment has no backing descriptor")]
     SegmentDescriptorMissing,
+    #[error("attach session event queue has no read signal descriptor")]
+    SessionSignalMissing,
+    #[error("attach worker TX event queue has no write signal descriptor")]
+    TxEventSignalMissing,
     #[error("failed to duplicate remote app session signal descriptor")]
     SessionSignalDuplicate {
         #[source]
@@ -320,11 +340,6 @@ impl RuntimeError {
         Self::Subsystem {
             subsystem,
             source: Box::new(source),
-        }
-    }
-    pub fn invariant(detail: impl Into<String>) -> Self {
-        Self::Invariant {
-            detail: detail.into(),
         }
     }
 }

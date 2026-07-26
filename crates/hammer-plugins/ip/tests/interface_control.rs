@@ -9,7 +9,7 @@ use hammer_runtime::{
 };
 use hammer_service::device::DeviceMain;
 use hammer_service::interface::{
-    InterfaceControlPlane, InterfaceMtu, InterfaceMtuKind, InterfaceOutputNode,
+    InterfaceControlPlane, InterfaceError, InterfaceMtu, InterfaceMtuKind, InterfaceOutputNode,
     InterfaceOutputTrace,
 };
 use hammer_service::opaque::NetworkOpaque;
@@ -88,7 +88,12 @@ fn control_plane_rejects_addresses_for_missing_interfaces() {
         .add_address(99, address)
         .expect_err("missing interface should be rejected");
 
-    assert!(err.to_string().contains("interface 99 is not registered"));
+    assert!(matches!(
+        err,
+        InterfaceError::NotRegistered {
+            interface_index: 99
+        }
+    ));
 }
 
 #[test]
@@ -122,7 +127,12 @@ fn control_plane_rejects_mtu_updates_for_missing_interfaces() {
         .set_protocol_mtu(99, InterfaceMtuKind::L3, 1500)
         .expect_err("missing interface should be rejected");
 
-    assert!(err.to_string().contains("interface 99 is not registered"));
+    assert!(matches!(
+        err,
+        InterfaceError::NotRegistered {
+            interface_index: 99
+        }
+    ));
 }
 
 #[test]

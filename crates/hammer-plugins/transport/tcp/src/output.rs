@@ -11,7 +11,7 @@ use hammer_infra::checksum::InternetChecksum;
 #[cfg(test)]
 use hammer_runtime::InternalNode;
 use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
-use hammer_runtime::{PluginError, RuntimeError, RuntimeResult};
+use hammer_runtime::{PluginError, RuntimeResult};
 use hammer_service::session::node::SessionQueueNode;
 
 use super::{TcpOutputError, read_tcp_egress_endpoints};
@@ -285,19 +285,17 @@ fn write_ipv4_header(
     if output.is_none() {
         return write_ipv4_header_for_test(header, source, destination, protocol, total_len);
     }
-    let output =
-        output.ok_or_else(|| RuntimeError::invariant("IP output functions are unavailable"))?;
-    if output.get().write_ipv4_header(
+    let output = output.ok_or(TcpOutputError::IpOutputUnavailable)?;
+    if !output.get().write_ipv4_header(
         RSliceMut::from_mut_slice(header),
         RSlice::from_slice(&source.octets()),
         RSlice::from_slice(&destination.octets()),
         protocol,
         total_len,
     ) {
-        Ok(())
-    } else {
-        Err(RuntimeError::invariant("IP output rejected IPv4 header"))
+        return Err(TcpOutputError::IpHeaderRejected.into());
     }
+    Ok(())
 }
 
 fn write_ipv6_header(
@@ -312,19 +310,17 @@ fn write_ipv6_header(
     if output.is_none() {
         return write_ipv6_header_for_test(header, source, destination, next_header, payload_len);
     }
-    let output =
-        output.ok_or_else(|| RuntimeError::invariant("IP output functions are unavailable"))?;
-    if output.get().write_ipv6_header(
+    let output = output.ok_or(TcpOutputError::IpOutputUnavailable)?;
+    if !output.get().write_ipv6_header(
         RSliceMut::from_mut_slice(header),
         RSlice::from_slice(&source.octets()),
         RSlice::from_slice(&destination.octets()),
         next_header,
         payload_len,
     ) {
-        Ok(())
-    } else {
-        Err(RuntimeError::invariant("IP output rejected IPv6 header"))
+        return Err(TcpOutputError::IpHeaderRejected.into());
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -337,7 +333,7 @@ fn write_ipv4_header_for_test(
 ) -> RuntimeResult<()> {
     let header = header
         .get_mut(..20)
-        .ok_or_else(|| RuntimeError::invariant("test IPv4 header is truncated"))?;
+        .expect("TCP IPv4 test header buffer must be at least 20 bytes");
     header.fill(0);
     header[0] = 0x45;
     header[2..4].copy_from_slice(&total_len.to_be_bytes());
@@ -361,7 +357,7 @@ fn write_ipv6_header_for_test(
 ) -> RuntimeResult<()> {
     let header = header
         .get_mut(..40)
-        .ok_or_else(|| RuntimeError::invariant("test IPv6 header is truncated"))?;
+        .expect("TCP IPv6 test header buffer must be at least 40 bytes");
     header.fill(0);
     header[0] = 0x60;
     header[4..6].copy_from_slice(&payload_len.to_be_bytes());
