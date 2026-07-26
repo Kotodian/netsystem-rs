@@ -42,13 +42,28 @@ impl From<AppWorkerError> for RuntimeError {
 }
 
 pub struct AppWorker {
-    session_slots: Vec<Option<(SessionId, Arc<AppSession>)>>,
-    pending_publications: Vec<Option<AppSessionPublication>>,
-    session_listeners: Vec<Option<u32>>,
+    /// Hot per-packet lookup array: 16 bytes per occupied slot so
+    /// `session()`/`drain_tx_events_to` stay cache-dense. Cold attach
+    /// metadata lives in `attach_slots` at the same index.
+    session_slots: Vec<Option<SessionSlot>>,
+    /// Cold accept/detach-only metadata; never read on the packet path.
+    attach_slots: Vec<AttachSlot>,
     tx_evt_q: Arc<SessionMsgQueue>,
     worker_index: usize,
     listeners: HashMap<u32, SegmentManager>,
     attach: Option<AppWorkerAttach>,
+}
+
+#[derive(Clone)]
+struct SessionSlot {
+    session_id: SessionId,
+    session: Arc<AppSession>,
+}
+
+#[derive(Clone, Default)]
+struct AttachSlot {
+    listener: Option<u32>,
+    publication: Option<AppSessionPublication>,
 }
 
 pub(crate) struct AppWorkerAttach {
@@ -278,8 +293,11 @@ impl SegmentManager {
 impl fmt::Debug for AppWorker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AppWorker")
-            .field("session_slots", &self.session_slots)
-            .field("msg_queue_slots", &self.session_slots.len())
+            .field("session_capacity", &self.session_slots.len())
+            .field(
+                "active_sessions",
+                &self.session_slots.iter().flatten().count(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -293,8 +311,7 @@ impl AppWorker {
     ) -> Self {
         Self {
             session_slots: vec![None; session_capacity],
-            pending_publications: vec![None; session_capacity],
-            session_listeners: vec![None; session_capacity],
+            attach_slots: vec![AttachSlot::default(); session_capacity],
             tx_evt_q,
             worker_index,
             listeners: HashMap::new(),
@@ -310,8 +327,7 @@ impl AppWorker {
     ) -> Self {
         Self {
             session_slots: vec![None; session_capacity],
-            pending_publications: vec![None; session_capacity],
-            session_listeners: vec![None; session_capacity],
+            attach_slots: vec![AttachSlot::default(); session_capacity],
             tx_evt_q,
             worker_index,
             listeners: HashMap::new(),
@@ -329,40 +345,41 @@ impl AppWorker {
 
     pub fn attach_session(&mut self, session_id: SessionId, session: Arc<AppSession>) {
         let slot = session_id.pool_index().slot() as usize;
-        self.session_slots[slot] = Some((session_id, session));
+        self.session_slots[slot] = Some(SessionSlot {
+            session_id,
+            session,
+        });
     }
 
     pub fn detach_session(&mut self, session_id: SessionId) -> Option<Arc<AppSession>> {
-        let slot = session_id.pool_index().slot() as usize;
-        let entry = self.session_slots.get_mut(slot)?;
+        let index = session_id.pool_index().slot() as usize;
+        let entry = self.session_slots.get_mut(index)?;
         if entry
             .as_ref()
-            .is_some_and(|(stored, _)| *stored == session_id)
+            .is_some_and(|slot| slot.session_id == session_id)
         {
-            self.pending_publications[slot] = None;
-            let session = entry.take().map(|(_, session)| session);
-            let listener = self.session_listeners[slot].take();
-            if let (Some(session), Some(listener)) = (&session, listener)
+            let slot = entry.take()?;
+            let attach_slot = std::mem::take(&mut self.attach_slots[index]);
+            if let Some(listener) = attach_slot.listener
                 && let Some(manager) = self.listeners.get_mut(&listener)
             {
-                manager.release_session(session.session_handle());
+                manager.release_session(slot.session.session_handle());
             }
-            return session;
+            return Some(slot.session);
         }
         None
     }
 
     #[inline(always)]
     fn session(&self, session_id: SessionId) -> Option<&Arc<AppSession>> {
-        let slot = session_id.pool_index().slot() as usize;
         self.session_slots
-            .get(slot)?
+            .get(session_id.pool_index().slot() as usize)?
             .as_ref()
-            .and_then(|(stored, session)| (*stored == session_id).then_some(session))
+            .and_then(|slot| (slot.session_id == session_id).then_some(&slot.session))
     }
 
     pub fn connected(&mut self, session_id: SessionId) -> RuntimeResult<()> {
-        let slot = session_id.pool_index().slot() as usize;
+        let index = session_id.pool_index().slot() as usize;
         let Some(session) = self.session(session_id).cloned() else {
             return Ok(());
         };
@@ -370,11 +387,11 @@ impl AppWorker {
             .push_event(SessionEvtType::Connect)
             .map_err(RuntimeError::from)?;
         self.notify_evt(&session);
-        if let Some(publication) = self.pending_publications[slot].as_ref()
-            && let Some(attach) = &self.attach
+        let attach_slot = &mut self.attach_slots[index];
+        if let (Some(publication), Some(attach)) = (attach_slot.publication.as_ref(), &self.attach)
         {
             attach.publisher.try_publish(publication)?;
-            self.pending_publications[slot] = None;
+            attach_slot.publication = None;
         }
         Ok(())
     }
@@ -595,16 +612,14 @@ impl AppWorker {
                 if evt.evt_type == SessionEvtType::Close && evt.worker_index() != worker_index {
                     continue;
                 }
-                let Some(Some((session_id, session))) =
-                    self.session_slots.get(evt.session_index() as usize)
-                else {
+                let Some(Some(slot)) = self.session_slots.get(evt.session_index() as usize) else {
                     continue;
                 };
                 if evt.evt_type == SessionEvtType::TxDeq {
-                    session.clear_tx_event();
+                    slot.session.clear_tx_event();
                     scheduled += 1;
                 }
-                dispatch_event(*session_id, evt.evt_type);
+                dispatch_event(slot.session_id, evt.evt_type);
             }
             if count < batch.len() {
                 break;
@@ -822,14 +837,14 @@ impl AppWorker {
             .or_insert_with(|| SegmentManager::new(shared_name_prefix))
             .create_session(handle, config, tx_evt_q, tx_event_offset)?;
         let slot = handle.session_index() as usize;
-        if let Some(attach) = &self.attach {
-            let publication = match AppSessionPublication::new(
+        let publication = if let Some(attach) = &self.attach {
+            match AppSessionPublication::new(
                 Arc::clone(&created.session),
                 created.segment,
                 attach.tx_event_segment.clone(),
                 created.offsets,
             ) {
-                Ok(publication) => publication,
+                Ok(publication) => Some(publication),
                 Err(error) => {
                     if let Some(manager) = self.listeners.get_mut(&listener) {
                         manager.release_session(handle);
@@ -837,10 +852,14 @@ impl AppWorker {
                     drop(created.session);
                     return Err(error);
                 }
-            };
-            self.pending_publications[slot] = Some(publication);
-        }
-        self.session_listeners[slot] = Some(listener);
+            }
+        } else {
+            None
+        };
+        self.attach_slots[slot] = AttachSlot {
+            listener: Some(listener),
+            publication,
+        };
         Ok(created.session)
     }
 
