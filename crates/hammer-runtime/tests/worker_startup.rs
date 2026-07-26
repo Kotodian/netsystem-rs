@@ -31,6 +31,16 @@ const PANIC: usize = 2;
 const EARLY_EXIT: usize = 3;
 const STARTUP_NODE_HANDLE: NodeHandle = NodeHandle::new(41);
 
+/// Both tests drive worker startup through the shared CASE/INITIALIZED/
+/// DISPATCHED statics; the parallel test harness must not interleave them.
+static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serialize_test() -> std::sync::MutexGuard<'static, ()> {
+    TEST_SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 static CASE: AtomicUsize = AtomicUsize::new(READY);
 static INITIALIZED: AtomicUsize = AtomicUsize::new(0);
 static DISPATCHED: AtomicUsize = AtomicUsize::new(0);
@@ -237,6 +247,7 @@ fn stop_workers(pool: &mut EnginePool) {
 
 #[test]
 fn data_worker_startup_is_transactional() {
+    let _serial = serialize_test();
     reset(READY);
     let mut pool = engine_pool();
     start_workers(pool.main_engine_mut()).expect("transactional worker startup");
@@ -298,6 +309,7 @@ fn data_worker_startup_is_transactional() {
 
 #[test]
 fn runtime_main_loop_enter_catalog_starts_workers() {
+    let _serial = serialize_test();
     reset(READY);
     let mut pool = engine_pool();
 
