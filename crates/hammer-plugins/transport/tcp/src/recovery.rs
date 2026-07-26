@@ -186,7 +186,9 @@ struct TcpScoreboard {
 
 impl Clone for TcpScoreboard {
     fn clone(&self) -> Self {
-        let mut holes = RbTree::with_capacity(self.holes.len().max(1));
+        // Keep the source capacity so a clone of a grown scoreboard does not
+        // shrink and immediately re-grow on the next rebuild.
+        let mut holes = RbTree::with_capacity(self.holes.capacity());
         for (start, hole) in self.holes.iter() {
             let _ = holes.insert(*start, *hole);
         }
@@ -218,9 +220,9 @@ impl TcpScoreboard {
 
     #[inline]
     fn clear(&mut self) {
-        // Preserve a minimum capacity so a subsequent rebuild with more holes
-        // than the previous one does not exhaust the fixed-size node pool.
-        let capacity = self.holes.len().max(32);
+        // Preserve the grown capacity so a subsequent rebuild with as many
+        // holes as the previous one does not have to grow again.
+        let capacity = self.holes.capacity().max(32);
         self.holes = RbTree::with_capacity(capacity);
         self.high_sacked = 0u32.into();
         self.high_rxt = 0u32.into();
@@ -230,6 +232,25 @@ impl TcpScoreboard {
         {
             self.clears = self.clears.saturating_add(1);
         }
+    }
+
+    /// Make room for one more hole. Hole entries are plain data (nothing
+    /// stores node indices into the tree), so replacement-growth is safe
+    /// anywhere no holes iteration is live.
+    #[inline]
+    fn ensure_hole_capacity(&mut self) {
+        if self.holes.len() == self.holes.capacity() {
+            self.grow_holes();
+        }
+    }
+
+    #[cold]
+    fn grow_holes(&mut self) {
+        let mut holes = RbTree::with_capacity(self.holes.capacity().saturating_mul(2).max(64));
+        for (start, hole) in self.holes.iter() {
+            let _ = holes.insert(*start, *hole);
+        }
+        self.holes = holes;
     }
 }
 
@@ -315,6 +336,10 @@ impl TcpRecoveryState {
         packet_number
     }
 
+    /// Returns false when sample storage cannot hold the new sample even
+    /// after growth; the caller must treat the transmission as unaccounted
+    /// and drop it.
+    #[must_use]
     pub fn record_sent(
         &mut self,
         packet_number: PacketNumber,
@@ -323,24 +348,26 @@ impl TcpRecoveryState {
         bytes: u32,
         payload_len: u32,
         sent_at: Instant,
-    ) {
+    ) -> bool {
+        if !self.ensure_sample_capacity(1) {
+            return false;
+        }
         let prev = self.sample_tail;
-        let sample_index = self
-            .sent_samples
-            .insert(TcpSentSample {
-                packet_number,
-                sequence,
-                end_sequence,
-                bytes,
-                payload_len,
-                retransmitted: false,
-                lost: false,
-                rack_deadline: None,
-                sent_at,
-                prev,
-                next: None,
-            })
-            .expect("tcp recovery sample pool exhausted");
+        let Some(sample_index) = self.sent_samples.insert(TcpSentSample {
+            packet_number,
+            sequence,
+            end_sequence,
+            bytes,
+            payload_len,
+            retransmitted: false,
+            lost: false,
+            rack_deadline: None,
+            sent_at,
+            prev,
+            next: None,
+        }) else {
+            return false;
+        };
         if let Some(prev_index) = prev {
             self.sent_sample_mut(prev_index).next = Some(sample_index);
         } else {
@@ -354,6 +381,84 @@ impl TcpRecoveryState {
             "tcp recovery sample lookup key should remain unique"
         );
         self.tlp_timer_armed = true;
+        true
+    }
+
+    /// Make room for `additional` samples, growing the fixed-capacity storage
+    /// like VPP's `tcp_bt.c` build-tracking pool, which grows without bound
+    /// through `pool_get_zero`. Growth remaps every sample `PoolIndex`, so
+    /// this must only run from entry points that hold no sample indices.
+    fn ensure_sample_capacity(&mut self, additional: usize) -> bool {
+        let needed = self.sent_samples.len().saturating_add(additional);
+        if needed <= self.sent_samples.capacity() {
+            return true;
+        }
+        let new_capacity = needed
+            .max(self.sent_samples.capacity().saturating_mul(2))
+            .max(64);
+        self.grow_sample_storage(new_capacity)
+    }
+
+    /// Move every sample into fresh storage with `new_capacity` slots. On the
+    /// structurally unreachable copy failure the existing storage is kept
+    /// untouched and false is returned.
+    #[cold]
+    fn grow_sample_storage(&mut self, new_capacity: usize) -> bool {
+        let (samples, lookup, head, tail) = self.copied_sample_storage(new_capacity);
+        if samples.len() != self.sent_samples.len() {
+            return false;
+        }
+        self.sent_samples = samples;
+        self.sample_lookup = lookup;
+        self.sample_head = head;
+        self.sample_tail = tail;
+        true
+    }
+
+    /// Copy the sent samples in linked-list order into fresh storage with
+    /// `capacity` slots, rebuilding the prev/next links and sequence lookup
+    /// around the new slot indices. A sample that fails to copy (only
+    /// possible if `capacity` is below the sample count) truncates the copy
+    /// instead of panicking; `grow_sample_storage` detects this by length.
+    fn copied_sample_storage(
+        &self,
+        capacity: usize,
+    ) -> (
+        Pool<TcpSentSample>,
+        RbTree<TcpSeq, PoolIndex>,
+        Option<PoolIndex>,
+        Option<PoolIndex>,
+    ) {
+        let mut samples = Pool::with_capacity(capacity);
+        let mut lookup = RbTree::with_capacity(capacity);
+        let mut head = None;
+        let mut tail: Option<PoolIndex> = None;
+        let mut cursor = self.sample_head;
+        while let Some(index) = cursor {
+            let Some(sample) = self.sent_samples.get(index).copied() else {
+                break;
+            };
+            cursor = sample.next;
+            let Some(copied_index) = samples.insert(TcpSentSample {
+                prev: tail,
+                next: None,
+                ..sample
+            }) else {
+                break;
+            };
+            match tail {
+                Some(tail_index) => {
+                    if let Some(tail_sample) = samples.get_mut(tail_index) {
+                        tail_sample.next = Some(copied_index);
+                    }
+                }
+                None => head = Some(copied_index),
+            }
+            tail = Some(copied_index);
+            let replaced = lookup.insert(sample.sequence, copied_index);
+            debug_assert!(replaced.is_none());
+        }
+        (samples, lookup, head, tail)
     }
 
     pub fn bytes_in_flight(&self) -> u32 {
@@ -418,6 +523,12 @@ impl TcpRecoveryState {
         congestion: &mut C,
     ) -> Option<Duration> {
         self.ack_floor = ack.acknowledgment;
+        // A block whose left edge lands mid-sample splits that sample, which
+        // needs one free slot. Growth cannot run inside the walks below (they
+        // hold sample indices), so reserve the worst case up front; if the
+        // structurally unreachable growth failure occurs, `split_sample`
+        // degrades to leaving samples whole.
+        let _ = self.ensure_sample_capacity(blocks.len());
         let (mut acked, mut acked_bytes) = self.take_acked_segments(ack.acknowledgment);
         acked.reserve(blocks.len());
         let mut highest_sacked_right = ack.acknowledgment;
@@ -954,6 +1065,13 @@ impl TcpRecoveryState {
     }
 
     fn split_sample(&mut self, index: PoolIndex, split_start: TcpSeq) {
+        if self.sent_samples.len() == self.sent_samples.capacity() {
+            // Cannot grow here: the SACK walk holds live sample indices and
+            // growth remaps them all. Leave the sample whole; its bytes stay
+            // outstanding for a later cumulative ACK or RTO. Unreachable in
+            // practice behind the `on_sack_blocks` reservation.
+            return;
+        }
         let sample = self.sent_sample(index);
         let (prefix, suffix) = sample.split(split_start);
 
@@ -971,7 +1089,18 @@ impl TcpRecoveryState {
         let replaced = self.sample_lookup.insert(suffix.sequence, index);
         debug_assert!(replaced.is_none());
 
-        let prefix_index = self.insert_sample_before(index, prefix);
+        let Some(prefix_index) = self.insert_sample_before(index, prefix) else {
+            // Structurally unreachable behind the capacity guard above; undo
+            // the suffix re-key so the sample stays whole rather than losing
+            // the prefix bytes.
+            let current = self.sent_sample_mut(index);
+            current.sequence = sample.sequence;
+            current.bytes = sample.bytes;
+            current.payload_len = sample.payload_len;
+            let _ = self.sample_lookup.remove(&suffix.sequence);
+            let _ = self.sample_lookup.insert(sample.sequence, index);
+            return;
+        };
         if !self.sample_is_lost(sample)
             && let Some(deadline) = sample.rack_deadline
         {
@@ -1007,14 +1136,11 @@ impl TcpRecoveryState {
         &mut self,
         next_index: PoolIndex,
         mut sample: TcpSentSample,
-    ) -> PoolIndex {
+    ) -> Option<PoolIndex> {
         let next = self.sent_sample(next_index);
         sample.prev = next.prev;
         sample.next = Some(next_index);
-        let sample_index = self
-            .sent_samples
-            .insert(sample)
-            .expect("tcp recovery sample pool exhausted");
+        let sample_index = self.sent_samples.insert(sample)?;
         if let Some(prev_index) = next.prev {
             self.sent_sample_mut(prev_index).next = Some(sample_index);
         } else {
@@ -1023,7 +1149,7 @@ impl TcpRecoveryState {
         self.sent_sample_mut(next_index).prev = Some(sample_index);
         let replaced = self.sample_lookup.insert(sample.sequence, sample_index);
         debug_assert!(replaced.is_none());
-        sample_index
+        Some(sample_index)
     }
 
     fn rebuild_scoreboard(
@@ -1056,6 +1182,7 @@ impl TcpRecoveryState {
                 let start = hole_start;
                 let end = sample.sequence.min(self.scoreboard.high_sacked);
                 if end > start {
+                    self.scoreboard.ensure_hole_capacity();
                     let _ = self
                         .scoreboard
                         .holes
@@ -1069,6 +1196,7 @@ impl TcpRecoveryState {
         }
 
         if hole_start < self.scoreboard.high_sacked {
+            self.scoreboard.ensure_hole_capacity();
             let _ = self.scoreboard.holes.insert(
                 hole_start,
                 TcpScoreboardHole {
@@ -1155,6 +1283,7 @@ impl TcpRecoveryState {
                         }
                     }
                     None => {
+                        self.scoreboard.ensure_hole_capacity();
                         let _ = self.scoreboard.holes.insert(
                             acknowledgment,
                             TcpScoreboardHole {
@@ -1349,57 +1478,32 @@ impl TcpRecoveryState {
 
 impl Clone for TcpRecoveryState {
     fn clone(&self) -> Self {
-        let mut cloned = Self::new();
-        cloned.next_packet_number = self.next_packet_number;
-        cloned.ack_floor = self.ack_floor;
-        cloned.scoreboard = self.scoreboard.clone();
-        cloned.recovery_active = self.recovery_active;
-        cloned.recovery_window = self.recovery_window;
-        cloned.recovery_prev_window = self.recovery_prev_window;
-        cloned.recovery_delivered = self.recovery_delivered;
-        cloned.recovery_retransmitted = self.recovery_retransmitted;
-        cloned.recovery_new_data = self.recovery_new_data;
-        cloned.recovery_end_sequence = self.recovery_end_sequence;
-        #[cfg(test)]
-        {
-            cloned.force_full_rebuild_on_ack = self.force_full_rebuild_on_ack;
+        // Keep the source capacity so a clone of a grown state (the TX path
+        // clones per batch) does not shrink and immediately re-grow.
+        let (sent_samples, sample_lookup, sample_head, sample_tail) =
+            self.copied_sample_storage(self.sent_samples.capacity());
+        Self {
+            next_packet_number: self.next_packet_number,
+            sent_samples,
+            sample_lookup,
+            sample_head,
+            sample_tail,
+            bytes_in_flight: self.bytes_in_flight,
+            ack_floor: self.ack_floor,
+            scoreboard: self.scoreboard.clone(),
+            rack_index: self.rack_index,
+            rack_timer_armed: self.rack_timer_armed,
+            tlp_timer_armed: self.tlp_timer_armed,
+            recovery_active: self.recovery_active,
+            recovery_window: self.recovery_window,
+            recovery_prev_window: self.recovery_prev_window,
+            recovery_delivered: self.recovery_delivered,
+            recovery_retransmitted: self.recovery_retransmitted,
+            recovery_new_data: self.recovery_new_data,
+            recovery_end_sequence: self.recovery_end_sequence,
+            #[cfg(test)]
+            force_full_rebuild_on_ack: self.force_full_rebuild_on_ack,
         }
-        let mut cursor = self.sample_head;
-        while let Some(index) = cursor {
-            let sample = self.sent_sample(index);
-            cloned.record_sent(
-                sample.packet_number,
-                sample.sequence,
-                sample.end_sequence,
-                sample.bytes,
-                sample.payload_len,
-                sample.sent_at,
-            );
-            cursor = sample.next;
-        }
-
-        let mut cursor = self.sample_head;
-        while let Some(index) = cursor {
-            let sample = self.sent_sample(index);
-            let next = sample.next;
-            let cloned_index = cloned
-                .sample_lookup
-                .get(&sample.sequence)
-                .copied()
-                .expect("cloned sample lookup should contain copied sample");
-            {
-                let cloned_sample = cloned.sent_sample_mut(cloned_index);
-                cloned_sample.retransmitted = sample.retransmitted;
-                cloned_sample.lost = sample.lost;
-                cloned_sample.rack_deadline = sample.rack_deadline;
-            }
-            cursor = next;
-        }
-        cloned.rack_timer_armed = self.rack_timer_armed;
-        cloned.tlp_timer_armed = self.tlp_timer_armed;
-        cloned.rack_index = RackDeadlineIndex::default();
-        cloned.rack_rescan_earliest();
-        cloned
     }
 }
 
@@ -1610,14 +1714,14 @@ mod tests {
         bytes: u32,
         sent_at: Instant,
     ) {
-        recovery.record_sent(
+        assert!(recovery.record_sent(
             packet_number,
             TcpSeq::from(sequence),
             TcpSeq::from(end_sequence),
             bytes,
             0,
             sent_at,
-        );
+        ));
     }
 
     #[test]

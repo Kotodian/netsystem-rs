@@ -63,6 +63,8 @@ enum TcpConnectionError {
     MissingLocalAddress,
     #[error("dispatch error")]
     PayloadLengthOverflow,
+    #[error("dispatch error")]
+    RecoverySampleExhausted,
 }
 
 impl From<TcpConnectionError> for TcpError {
@@ -72,7 +74,8 @@ impl From<TcpConnectionError> for TcpError {
             TcpConnectionError::InvalidState | TcpConnectionError::MissingLocalAddress => {
                 TcpError::InvalidConnection
             }
-            TcpConnectionError::PayloadLengthOverflow => TcpError::Dispatch,
+            TcpConnectionError::PayloadLengthOverflow
+            | TcpConnectionError::RecoverySampleExhausted => TcpError::Dispatch,
         }
     }
 }
@@ -655,8 +658,14 @@ impl TcpConnection {
         let end = sequence.advance(bytes);
         self.snd_nxt = end;
         let packet_number = self.recovery.next_packet_number();
-        self.recovery
-            .record_sent(packet_number, sequence, end, bytes, bytes, Instant::now());
+        assert!(self.recovery.record_sent(
+            packet_number,
+            sequence,
+            end,
+            bytes,
+            bytes,
+            Instant::now()
+        ));
         self.refresh_bytes_in_flight_cached();
     }
 
@@ -1498,14 +1507,16 @@ impl TcpConnection {
                 .raw();
             let bytes_in_flight = self.bytes_in_flight_cached;
             let packet_number = self.recovery.next_packet_number();
-            self.recovery.record_sent(
+            if !self.recovery.record_sent(
                 packet_number,
                 TcpSeq::from(sequence),
                 TcpSeq::from(end_sequence),
                 payload_len,
                 payload_len,
                 now,
-            );
+            ) {
+                return Err(TcpConnectionError::RecoverySampleExhausted.into());
+            }
             self.refresh_bytes_in_flight_cached();
             self.congestion.on_packet_sent(
                 packet_number,
@@ -1537,14 +1548,16 @@ impl TcpConnection {
         let end_sequence = TcpSeq::from(sequence).advance(payload_len).raw();
         let bytes_in_flight = self.bytes_in_flight_cached;
         let packet_number = self.recovery.next_packet_number();
-        self.recovery.record_sent(
+        if !self.recovery.record_sent(
             packet_number,
             TcpSeq::from(sequence),
             TcpSeq::from(end_sequence),
             payload_len,
             payload_len,
             now,
-        );
+        ) {
+            return Err(TcpConnectionError::RecoverySampleExhausted.into());
+        }
         self.recovery.on_new_data_sent(payload_len);
         self.refresh_bytes_in_flight_cached();
         self.congestion
@@ -2888,14 +2901,14 @@ mod tests {
         let (mut connections, index, mut timers, now) = timer_policy_connection();
         let packet = {
             let connection = connections.get_mut(index).expect("connection");
-            connection.recovery.record_sent(
+            assert!(connection.recovery.record_sent(
                 1,
                 TcpSeq::from(connection.snd_una()),
                 TcpSeq::from(connection.snd_una()).advance(1),
                 1,
                 1,
                 now,
-            );
+            ));
             connection.snd_nxt = TcpSeq::from(connection.snd_una()).advance(1);
             timers
                 .update(
@@ -2952,12 +2965,19 @@ mod tests {
             let connection = connections.get_mut(index).expect("connection");
             let snd_una = TcpSeq::from(connection.snd_una());
             connection.snd_nxt = snd_una.advance(2);
-            connection
-                .recovery
-                .record_sent(1, snd_una, snd_una.advance(1), 1, 1, now);
-            connection
-                .recovery
-                .record_sent(2, snd_una.advance(1), snd_una.advance(2), 1, 1, now);
+            assert!(
+                connection
+                    .recovery
+                    .record_sent(1, snd_una, snd_una.advance(1), 1, 1, now)
+            );
+            assert!(connection.recovery.record_sent(
+                2,
+                snd_una.advance(1),
+                snd_una.advance(2),
+                1,
+                1,
+                now
+            ));
             let rto = connection.retransmit_timeout().retransmit_timeout();
             timers
                 .update(
@@ -3035,9 +3055,11 @@ mod tests {
             let connection = connections.get_mut(index).expect("connection");
             let snd_una = TcpSeq::from(connection.snd_una());
             connection.snd_nxt = snd_una.advance(1);
-            connection
-                .recovery
-                .record_sent(1, snd_una, snd_una.advance(1), 1, 1, now);
+            assert!(
+                connection
+                    .recovery
+                    .record_sent(1, snd_una, snd_una.advance(1), 1, 1, now)
+            );
             connection.keepalive.config.idle = Duration::from_secs(24 * 60 * 60);
             timers
                 .update(
@@ -3077,22 +3099,22 @@ mod tests {
             let connection = connections.get_mut(index).expect("connection");
             let snd_una = TcpSeq::from(connection.snd_una());
             connection.snd_nxt = snd_una.advance(2_000);
-            connection.recovery.record_sent(
+            assert!(connection.recovery.record_sent(
                 1,
                 snd_una,
                 snd_una.advance(1_000),
                 1_000,
                 1_000,
                 now - Duration::from_secs(2),
-            );
-            connection.recovery.record_sent(
+            ));
+            assert!(connection.recovery.record_sent(
                 2,
                 snd_una.advance(1_000),
                 snd_una.advance(2_000),
                 1_000,
                 1_000,
                 now - Duration::from_secs(1),
-            );
+            ));
             connection.recovery.on_sack_blocks(
                 TcpRecoveryAck {
                     acknowledgment: snd_una,
@@ -3170,9 +3192,11 @@ mod tests {
             let connection = connections.get_mut(index).expect("connection");
             let snd_una = TcpSeq::from(connection.snd_una());
             connection.snd_nxt = snd_una.advance(1);
-            connection
-                .recovery
-                .record_sent(1, snd_una, snd_una.advance(1), 1, 1, now);
+            assert!(
+                connection
+                    .recovery
+                    .record_sent(1, snd_una, snd_una.advance(1), 1, 1, now)
+            );
             timers
                 .update(
                     index,
@@ -3234,22 +3258,22 @@ mod tests {
         let mut rack_connection = established_connection_with_test_controller();
         rack_connection.snd_una = TcpSeq::from(1_000);
         rack_connection.snd_nxt = TcpSeq::from(3_000);
-        rack_connection.recovery.record_sent(
+        assert!(rack_connection.recovery.record_sent(
             1,
             TcpSeq::from(1_000),
             TcpSeq::from(2_000),
             1_000,
             1_000,
             now - Duration::from_secs(2),
-        );
-        rack_connection.recovery.record_sent(
+        ));
+        assert!(rack_connection.recovery.record_sent(
             2,
             TcpSeq::from(2_000),
             TcpSeq::from(3_000),
             1_000,
             1_000,
             now - Duration::from_secs(1),
-        );
+        ));
         rack_connection.recovery.on_sack_blocks(
             TcpRecoveryAck {
                 acknowledgment: TcpSeq::from(1_000),
@@ -3271,14 +3295,14 @@ mod tests {
         let mut tlp_connection = established_connection_with_test_controller();
         let tlp_sequence = TcpSeq::from(tlp_connection.snd_nxt());
         tlp_connection.snd_nxt = tlp_sequence.advance(1_000);
-        tlp_connection.recovery.record_sent(
+        assert!(tlp_connection.recovery.record_sent(
             1,
             tlp_sequence,
             tlp_sequence.advance(1_000),
             1_000,
             1_000,
             now,
-        );
+        ));
         let tlp_index = connections
             .insert(tlp_connection)
             .expect("insert TLP connection");
@@ -4187,9 +4211,14 @@ mod tests {
         let mut connection = established_connection();
         let baseline = connection.retransmit_timeout().retransmit_timeout();
 
-        connection
-            .recovery
-            .record_sent(1, TcpSeq::from(1_000), TcpSeq::from(2_000), 1_000, 0, now);
+        assert!(connection.recovery.record_sent(
+            1,
+            TcpSeq::from(1_000),
+            TcpSeq::from(2_000),
+            1_000,
+            0,
+            now
+        ));
         let _ = connection.recovery.take_tlp_probe().expect("tlp probe");
         let packet = TcpPacket {
             local: connection.remote(),
@@ -4235,14 +4264,14 @@ mod tests {
         let sent = connection
             .next_local_timestamp(true)
             .expect("local timestamp for outbound packet");
-        connection.recovery.record_sent(
+        assert!(connection.recovery.record_sent(
             1,
             TcpSeq::from(sequence),
             TcpSeq::from(end_sequence),
             1,
             0,
             now,
-        );
+        ));
         let _ = connection.recovery.take_tlp_probe().expect("tlp probe");
         let packet = TcpPacket {
             local: connection.remote(),
