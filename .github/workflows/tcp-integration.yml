@@ -52,7 +52,6 @@ jobs:
             echo_bytes: 200000
             idle_seconds: "5"
             fault: none
-            mss: "1000"
           - scenario: attached-echo-keepalive
             platform: macOS
             id: keepalive-macos
@@ -62,9 +61,6 @@ jobs:
             echo_bytes: 200000
             idle_seconds: "5"
             fault: none
-            # Darwin rejects a pre-connect TCP_MAXSEG above the unconnected
-            # default (~536), so the macOS probe must not shape its MSS.
-            mss: "0"
           - scenario: congestion-bbr
             platform: Linux
             id: congestion-bbr
@@ -74,7 +70,6 @@ jobs:
             echo_bytes: 1000000
             idle_seconds: "0"
             fault: none
-            mss: "1000"
           - scenario: congestion-cubic
             platform: Linux
             id: congestion-cubic
@@ -84,7 +79,6 @@ jobs:
             echo_bytes: 1000000
             idle_seconds: "0"
             fault: none
-            mss: "1000"
           - scenario: receiver-sack
             platform: Linux
             id: receiver-sack
@@ -95,7 +89,6 @@ jobs:
             idle_seconds: "0"
             fault: client-egress
             fault_offset: 4000
-            mss: "1000"
           - scenario: sender-rack
             platform: Linux
             id: sender-rack
@@ -106,7 +99,6 @@ jobs:
             idle_seconds: "0"
             fault: server-ingress
             fault_offset: 4000
-            mss: "1000"
           - scenario: sender-tlp
             platform: Linux
             id: sender-tlp
@@ -117,7 +109,6 @@ jobs:
             idle_seconds: "0"
             fault: server-ingress
             fault_offset: 5000
-            mss: "1000"
     env:
       TCP_TEST_ADDRESS: 10.66.77.1
       TCP_TEST_HOST_ADDRESS: 10.66.77.2
@@ -126,7 +117,7 @@ jobs:
       TCP_TEST_ROUTE_PREFIX: 10.66.77.0/30
       TCP_TEST_ATTACH_SOCKET: /tmp/hammer-tcp-integration.attach.sock
       TCP_TEST_IPC_ADDRESS: 127.0.0.1:7399
-      TCP_TEST_MSS: ${{ matrix.mss }}
+      TCP_TEST_MSS: "1000"
     steps:
       - name: Checkout [${{ matrix.id }}]
         uses: actions/checkout@v4
