@@ -4,6 +4,8 @@
 //! operation lifecycle. Portable algorithm semantics remain in
 //! `hammer-infra`; `hammer-runtime` does not participate in this boundary.
 
+pub mod exchange;
+
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;

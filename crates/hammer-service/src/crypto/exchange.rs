@@ -1,0 +1,166 @@
+//! Statically typed, synchronous cryptographic exchanges.
+
+use std::marker::PhantomData;
+use std::rc::Rc;
+
+use super::Engine;
+
+/// One protocol-owned cryptographic negotiation.
+pub trait Protocol<C>: Sized {
+    /// Caller-supplied parameters used to begin one exchange.
+    type Parameters;
+    /// Protocol-private state carried between transitions.
+    type State;
+    /// Protocol-specific result produced after authentication and establishment.
+    type Established;
+    /// Protocol-specific rejection or transition failure.
+    type Error;
+
+    /// Starts an exchange and writes its first protocol message to caller-owned memory.
+    fn start(
+        &mut self,
+        engine: &Engine,
+        parameters: Self::Parameters,
+        crypto: &mut C,
+        output: &mut [u8],
+    ) -> Result<(Self::State, usize), Self::Error>;
+
+    /// Consumes one peer message and advances the protocol synchronously.
+    fn advance(
+        &mut self,
+        engine: &Engine,
+        state: Self::State,
+        crypto: &mut C,
+        peer_input: &[u8],
+        output: &mut [u8],
+    ) -> Result<Transition<Self::State, Self::Established>, Self::Error>;
+}
+
+/// The result of one synchronous Exchange transition.
+#[derive(Debug, Eq, PartialEq)]
+pub enum Transition<S, E> {
+    /// The protocol produced another message and retained typed state.
+    Continue {
+        /// State consumed by the next transition.
+        state: S,
+        /// Bytes initialized in caller-owned output.
+        written: usize,
+    },
+    /// The protocol completed and produced its typed established result.
+    Established {
+        /// Protocol-specific established result.
+        result: E,
+        /// Bytes initialized in caller-owned output.
+        written: usize,
+    },
+}
+
+/// One Main Thread-owned, protocol-typed cryptographic exchange.
+///
+/// Exchange state cannot migrate to another thread:
+///
+/// ```compile_fail
+/// use hammer_infra::crypto::InstructionSet;
+/// use hammer_service::crypto::Engine;
+/// use hammer_service::crypto::exchange::{Protocol, Transition};
+///
+/// struct Handshake;
+///
+/// impl Protocol<()> for Handshake {
+///     type Parameters = ();
+///     type State = ();
+///     type Established = ();
+///     type Error = ();
+///
+///     fn start(
+///         &mut self,
+///         _: &Engine,
+///         _: (),
+///         _: &mut (),
+///         _: &mut [u8],
+///     ) -> Result<((), usize), ()> {
+///         Ok(((), 0))
+///     }
+///
+///     fn advance(
+///         &mut self,
+///         _: &Engine,
+///         _: (),
+///         _: &mut (),
+///         _: &[u8],
+///         _: &mut [u8],
+///     ) -> Result<Transition<(), ()>, ()> {
+///         Ok(Transition::Established { result: (), written: 0 })
+///     }
+/// }
+///
+/// let engine = Engine::new(InstructionSet::empty());
+/// let (exchange, _) = engine
+///     .start_exchange(Handshake, (), (), &mut [])
+///     .unwrap();
+/// std::thread::spawn(move || drop(exchange));
+/// ```
+pub struct Exchange<P, C>
+where
+    P: Protocol<C>,
+{
+    protocol: P,
+    state: P::State,
+    crypto: C,
+    thread_bound: PhantomData<Rc<()>>,
+}
+
+impl Engine {
+    /// Starts one protocol-typed exchange over caller-owned output memory.
+    pub fn start_exchange<P, C>(
+        &self,
+        mut protocol: P,
+        parameters: P::Parameters,
+        mut crypto: C,
+        output: &mut [u8],
+    ) -> Result<(Exchange<P, C>, usize), P::Error>
+    where
+        P: Protocol<C>,
+    {
+        let (state, written) = protocol.start(self, parameters, &mut crypto, output)?;
+        Ok((
+            Exchange {
+                protocol,
+                state,
+                crypto,
+                thread_bound: PhantomData,
+            },
+            written,
+        ))
+    }
+
+    /// Advances one exchange and returns either its next typed state or established result.
+    pub fn advance_exchange<P, C>(
+        &self,
+        mut exchange: Exchange<P, C>,
+        peer_input: &[u8],
+        output: &mut [u8],
+    ) -> Result<Transition<Exchange<P, C>, P::Established>, P::Error>
+    where
+        P: Protocol<C>,
+    {
+        match exchange.protocol.advance(
+            self,
+            exchange.state,
+            &mut exchange.crypto,
+            peer_input,
+            output,
+        )? {
+            Transition::Continue { state, written } => {
+                exchange.state = state;
+                Ok(Transition::Continue {
+                    state: exchange,
+                    written,
+                })
+            }
+            Transition::Established { result, written } => {
+                Ok(Transition::Established { result, written })
+            }
+        }
+    }
+}
