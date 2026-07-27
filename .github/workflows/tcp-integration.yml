@@ -326,6 +326,13 @@ jobs:
           sudo -n ip link set dev "$TCP_TEST_INTERFACE" up
           sudo -n ip route replace "$TCP_TEST_ROUTE_PREFIX" \
             dev "$TCP_TEST_INTERFACE"
+      - name: Disable Linux TUN segmentation offloads
+        if: runner.os == 'Linux' && matrix.fault != 'none'
+        run: |
+          set -euo pipefail
+          sudo -n ethtool -K "$TCP_TEST_INTERFACE" tso off gso off gro off
+          ethtool -k "$TCP_TEST_INTERFACE" \
+            > "$TCP_TEST_DIAGNOSTICS/interface-features.txt"
       - name: Configure macOS utun host
         if: runner.os == 'macOS'
         run: |
