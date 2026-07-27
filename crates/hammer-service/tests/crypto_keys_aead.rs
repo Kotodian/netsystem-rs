@@ -2,7 +2,7 @@ use std::error::Error;
 
 use hammer_infra::crypto::AeadError;
 use hammer_service::crypto::{
-    Aead, AeadDirection, AeadInput, AeadOperation, AeadStatus, Batch, ContextError, Engine, Hash,
+    Aead, AeadDirection, AeadOperation, AeadStatus, Batch, ContextError, Engine, Hash, Input,
     KeyError, KeyOperations, KeyPolicy,
 };
 
@@ -34,7 +34,7 @@ fn aead_context_executes_scatter_gather_seal_batch() {
     let mut output = [0; 16];
     let mut tag = [0; 16];
     let mut operations = [AeadOperation::seal(
-        AeadInput::Scatter(&fragments),
+        Input::Scatter(&fragments),
         &[0; 12],
         &[],
         &mut output,
@@ -65,7 +65,7 @@ fn aead_authentication_failure_is_per_operation_and_exposes_no_plaintext() {
     invalid_tag[0] ^= 1;
     let mut output = [0xa5; 16];
     let mut operations = [AeadOperation::open(
-        AeadInput::Contiguous(&CIPHERTEXT),
+        Input::Contiguous(&CIPHERTEXT),
         &[0; 12],
         &[],
         &invalid_tag,
@@ -195,7 +195,7 @@ fn aead_batch_reports_operation_policy_denial_without_mutating_output() {
         .expect("key permits AES-128-GCM seal");
     let mut output = [0xa5; 16];
     let mut operations = [AeadOperation::open(
-        AeadInput::Contiguous(&CIPHERTEXT),
+        Input::Contiguous(&CIPHERTEXT),
         &[0; 12],
         &[],
         &TAG,

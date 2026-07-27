@@ -1,4 +1,4 @@
-use hammer_infra::crypto::{HashError, sha256};
+use hammer_infra::crypto::{HashAlgorithm, HashError, hash};
 
 const SHA256_ABC: [u8; 32] = [
     0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
@@ -9,7 +9,8 @@ const SHA256_ABC: [u8; 32] = [
 fn sha256_writes_the_known_digest_to_caller_memory() {
     let mut output = [0; 32];
 
-    sha256(&[b"abc"], &mut output).expect("SHA-256 output has the required capacity");
+    hash(HashAlgorithm::Sha256, &[b"abc"], &mut output)
+        .expect("SHA-256 output has the required capacity");
 
     assert_eq!(output, SHA256_ABC);
 }
@@ -18,7 +19,8 @@ fn sha256_writes_the_known_digest_to_caller_memory() {
 fn sha256_hashes_scatter_gather_input_without_joining_it() {
     let mut output = [0; 32];
 
-    sha256(&[b"a", b"b", b"c"], &mut output).expect("SHA-256 output has the required capacity");
+    hash(HashAlgorithm::Sha256, &[b"a", b"b", b"c"], &mut output)
+        .expect("SHA-256 output has the required capacity");
 
     assert_eq!(output, SHA256_ABC);
 }
@@ -27,7 +29,8 @@ fn sha256_hashes_scatter_gather_input_without_joining_it() {
 fn sha256_rejects_insufficient_caller_output() {
     let mut output = [0; 31];
 
-    let error = sha256(&[b"abc"], &mut output).expect_err("output is one byte too short");
+    let error = hash(HashAlgorithm::Sha256, &[b"abc"], &mut output)
+        .expect_err("output is one byte too short");
 
     assert_eq!(
         error,

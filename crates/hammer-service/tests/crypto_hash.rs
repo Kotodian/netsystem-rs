@@ -1,4 +1,4 @@
-use hammer_service::crypto::{Batch, Engine, Hash, HashInput, HashOperation, HashStatus};
+use hammer_service::crypto::{Batch, Engine, Hash, HashOperation, HashStatus, Input};
 
 const SHA256_ABC: [u8; 32] = [
     0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
@@ -15,10 +15,7 @@ fn hash_context_executes_a_singleton_batch_synchronously() {
         .context(algorithm)
         .expect("portable SHA-256 is available");
     let mut output = [0; 32];
-    let mut operations = [HashOperation::new(
-        HashInput::Contiguous(b"abc"),
-        &mut output,
-    )];
+    let mut operations = [HashOperation::new(Input::Contiguous(b"abc"), &mut output)];
     let mut batch = Batch::new(&mut operations);
 
     context.execute(&mut batch);
@@ -40,8 +37,8 @@ fn hash_batch_records_success_and_failure_per_operation() {
     let mut valid_output = [0; 32];
     let mut short_output = [0; 31];
     let mut operations = [
-        HashOperation::new(HashInput::Scatter(&chunks), &mut valid_output),
-        HashOperation::new(HashInput::Contiguous(b"abc"), &mut short_output),
+        HashOperation::new(Input::Scatter(&chunks), &mut valid_output),
+        HashOperation::new(Input::Contiguous(b"abc"), &mut short_output),
     ];
     let mut batch = Batch::new(&mut operations);
 
