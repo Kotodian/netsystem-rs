@@ -14,6 +14,7 @@ arc-swap = { workspace = true }
 async-trait = { workspace = true }
 bitflags = "2.10"
 crossbeam-utils = { workspace = true }
+getrandom = { workspace = true }
 hammer-core = { path = "../hammer-core" }
 hammer-infra = { path = "../hammer-infra" }
 hammer-component-macros = { path = "../hammer-component-macros" }
@@ -23,6 +24,7 @@ nom = { workspace = true }
 etherparse = { workspace = true }
 tokio = { workspace = true, features = ["signal"] }
 tracing = { workspace = true }
+zeroize = { workspace = true }
 smoltcp = { workspace = true }
 thiserror = { workspace = true }
 linkme = { workspace = true }
@@ -33,3 +35,9 @@ humantime-serde = { workspace = true }
 toml = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
+hex = "0.4"
+
+[[bench]]
+name = "crypto_hash"
+harness = false
