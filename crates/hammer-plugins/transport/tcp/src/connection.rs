@@ -277,6 +277,7 @@ pub struct TcpConnectionCacheline0 {
     snd_wnd: u32,
     rcv_nxt: TcpSeq,
     rcv_wnd: u32,
+    zero_receive_window_sent: bool,
     negotiated_options: TcpNegotiatedOptions,
     tx_intent_sequence: Option<TcpSeq>,
     tx_intent_payload_len: u32,
@@ -365,6 +366,7 @@ impl TcpConnection {
                 snd_wnd: policy.receive_window,
                 rcv_nxt: TcpSeq::from(0),
                 rcv_wnd: policy.receive_window,
+                zero_receive_window_sent: false,
                 negotiated_options: TcpNegotiatedOptions::default(),
                 tx_intent_sequence: None,
                 tx_intent_payload_len: 0,
@@ -518,6 +520,20 @@ impl TcpConnection {
     #[inline]
     pub fn advertised_receive_window(&self, receive_window: u32) -> u16 {
         advertised_window_from_receive(receive_window, self.effective_receive_window_scale())
+    }
+
+    #[inline]
+    pub(crate) fn zero_receive_window_sent(&self) -> bool {
+        self.zero_receive_window_sent
+    }
+
+    #[inline]
+    fn output_receive_window(&mut self, flags: TcpSegmentFlags) -> u16 {
+        let advertised = self.advertised_receive_window(self.rcv_wnd);
+        if flags.contains(TcpSegmentFlags::ACK) {
+            self.zero_receive_window_sent = advertised == 0;
+        }
+        advertised
     }
 
     #[inline]
@@ -1100,12 +1116,13 @@ impl TcpConnection {
             self.negotiated_options().timestamps,
             flags,
         );
+        let advertised_window = self.output_receive_window(flags);
         TcpSegment::new(
             local,
             remote,
             reset_sequence.unwrap_or_else(|| self.output_sequence(flags)),
             self.output_acknowledgment(flags),
-            self.advertised_receive_window(self.rcv_wnd),
+            advertised_window,
             flags,
             capabilities,
             sack_blocks.as_ref().map(|(blocks, len)| &blocks[..*len]),
@@ -1117,6 +1134,24 @@ impl TcpConnection {
             None,
             0,
         )
+    }
+
+    pub(crate) fn receive_window_update_segment(
+        &mut self,
+        rx_available: usize,
+    ) -> RuntimeResult<TcpSegment> {
+        self.ensure_state(TcpState::Established)?;
+        let local = self
+            .local()
+            .ok_or(TcpConnectionError::MissingLocalAddress)?;
+        self.set_rcv_wnd(rx_available);
+        Ok(self.control_segment(
+            local,
+            self.remote(),
+            TcpSegmentFlags::ACK,
+            None,
+            TcpCapabilities::default(),
+        ))
     }
 
     #[inline]
@@ -1440,12 +1475,13 @@ impl TcpConnection {
                 TcpSegmentFlags::SYN
             };
             let sequence = self.tx_payload_sequence();
+            let advertised_window = self.output_receive_window(flags);
             return Ok(TcpSegment::new(
                 local,
                 self.remote(),
                 sequence.raw(),
                 self.rcv_nxt(),
-                self.advertised_receive_window(self.rcv_wnd),
+                advertised_window,
                 flags,
                 capabilities,
                 None,
@@ -1473,12 +1509,13 @@ impl TcpConnection {
         let retransmit = self
             .tx_intent_sequence
             .is_some_and(|sequence| sequence != self.snd_nxt);
+        let advertised_window = self.output_receive_window(flags);
         Ok(TcpSegment::new(
             local,
             self.remote(),
             sequence.raw(),
             self.rcv_nxt(),
-            self.advertised_receive_window(self.rcv_wnd),
+            advertised_window,
             flags,
             self.output_capabilities(),
             sack_blocks.as_ref().map(|(blocks, len)| &blocks[..*len]),
@@ -1932,23 +1969,27 @@ impl TcpConnection {
         let local = self.local?;
         match self.state {
             TcpState::Established if !has_pending_tx && self.has_pending_sack_output() => {
+                let flags = self.output_flags(TcpSegmentFlags::ACK);
+                let sequence = self.output_sequence(flags);
+                let acknowledgment = self.rcv_nxt();
+                let advertised_window = self.output_receive_window(flags);
+                let capabilities = self.output_capabilities();
+                let sack_blocks = self.sack.take_output(
+                    self.negotiated_options().sack,
+                    self.negotiated_options().timestamps,
+                    flags,
+                );
+                let timestamp = self.next_local_timestamp(self.negotiated_options().timestamps);
                 Some(TcpSegment::new(
                     local,
                     self.remote(),
-                    self.output_sequence(TcpSegmentFlags::ACK),
-                    self.rcv_nxt(),
-                    self.advertised_receive_window(self.rcv_wnd),
-                    self.output_flags(TcpSegmentFlags::ACK),
-                    self.output_capabilities(),
-                    self.sack
-                        .take_output(
-                            self.negotiated_options().sack,
-                            self.negotiated_options().timestamps,
-                            TcpSegmentFlags::ACK,
-                        )
-                        .as_ref()
-                        .map(|(blocks, len)| &blocks[..*len]),
-                    self.next_local_timestamp(self.negotiated_options().timestamps),
+                    sequence,
+                    acknowledgment,
+                    advertised_window,
+                    flags,
+                    capabilities,
+                    sack_blocks.as_ref().map(|(blocks, len)| &blocks[..*len]),
+                    timestamp,
                     None,
                     None,
                     0,
@@ -1956,13 +1997,15 @@ impl TcpConnection {
             }
             TcpState::FinWait1 | TcpState::LastAck if self.snd_una == self.snd_nxt => {
                 self.snd_nxt = self.snd_nxt.advance(1);
+                let flags = TcpSegmentFlags::ACK | TcpSegmentFlags::FIN;
+                let advertised_window = self.output_receive_window(flags);
                 Some(TcpSegment::new(
                     local,
                     self.remote(),
                     self.snd_una(),
                     self.rcv_nxt(),
-                    self.advertised_receive_window(self.rcv_wnd),
-                    TcpSegmentFlags::ACK | TcpSegmentFlags::FIN,
+                    advertised_window,
+                    flags,
                     self.output_capabilities(),
                     None,
                     self.next_local_timestamp(self.negotiated_options().timestamps),
@@ -1971,20 +2014,24 @@ impl TcpConnection {
                     0,
                 ))
             }
-            TcpState::FinWait1 | TcpState::LastAck => Some(TcpSegment::new(
-                local,
-                self.remote(),
-                self.snd_una(),
-                self.rcv_nxt(),
-                self.advertised_receive_window(self.rcv_wnd),
-                TcpSegmentFlags::ACK | TcpSegmentFlags::FIN,
-                self.output_capabilities(),
-                None,
-                self.next_local_timestamp(self.negotiated_options().timestamps),
-                None,
-                None,
-                0,
-            )),
+            TcpState::FinWait1 | TcpState::LastAck => {
+                let flags = TcpSegmentFlags::ACK | TcpSegmentFlags::FIN;
+                let advertised_window = self.output_receive_window(flags);
+                Some(TcpSegment::new(
+                    local,
+                    self.remote(),
+                    self.snd_una(),
+                    self.rcv_nxt(),
+                    advertised_window,
+                    flags,
+                    self.output_capabilities(),
+                    None,
+                    self.next_local_timestamp(self.negotiated_options().timestamps),
+                    None,
+                    None,
+                    0,
+                ))
+            }
             _ => None,
         }
     }
@@ -2172,6 +2219,7 @@ impl TcpConnection {
             } else {
                 TcpSegmentFlags::SYN
             };
+            let advertised_window = self.output_receive_window(flags);
             return TcpTimerOutcome::acted(
                 TcpTimerAction::RtoRetransmit,
                 Some(TcpSegment::new(
@@ -2179,7 +2227,7 @@ impl TcpConnection {
                     self.remote,
                     self.iss.raw(),
                     self.rcv_nxt.raw(),
-                    self.advertised_receive_window(self.rcv_wnd),
+                    advertised_window,
                     flags,
                     capabilities,
                     None,
@@ -2211,6 +2259,8 @@ impl TcpConnection {
                 let Some(local) = self.local else {
                     return TcpTimerOutcome::none();
                 };
+                let flags = TcpSegmentFlags::ACK | TcpSegmentFlags::FIN;
+                let advertised_window = self.output_receive_window(flags);
                 TcpTimerOutcome::acted(
                     TcpTimerAction::RtoRetransmit,
                     Some(TcpSegment::new(
@@ -2218,8 +2268,8 @@ impl TcpConnection {
                         self.remote,
                         self.snd_una.raw(),
                         self.rcv_nxt.raw(),
-                        self.advertised_receive_window(self.rcv_wnd),
-                        TcpSegmentFlags::ACK | TcpSegmentFlags::FIN,
+                        advertised_window,
+                        flags,
                         self.output_capabilities(),
                         None,
                         self.next_local_timestamp(self.negotiated_options().timestamps),
@@ -2269,13 +2319,15 @@ impl TcpConnection {
     fn on_delayed_ack_timer_expiry(&mut self) -> Option<TcpSegment> {
         self.ensure_state(TcpState::Established).ok()?;
         let local = self.local?;
+        let flags = self.output_flags(TcpSegmentFlags::ACK);
+        let advertised_window = self.output_receive_window(flags);
         Some(TcpSegment::new(
             local,
             self.remote(),
             self.snd_nxt(),
             self.rcv_nxt(),
-            self.advertised_receive_window(self.rcv_wnd),
-            self.output_flags(TcpSegmentFlags::ACK),
+            advertised_window,
+            flags,
             self.output_capabilities(),
             None,
             self.next_local_timestamp(self.negotiated_options().timestamps),
@@ -2322,6 +2374,8 @@ impl TcpConnection {
         let Some(local) = self.local else {
             return TcpTimerOutcome::none();
         };
+        let flags = self.output_flags(TcpSegmentFlags::ACK);
+        let advertised_window = self.output_receive_window(flags);
         TcpTimerOutcome::acted(
             TcpTimerAction::KeepaliveProbe,
             Some(TcpSegment::new(
@@ -2329,8 +2383,8 @@ impl TcpConnection {
                 self.remote(),
                 self.snd_nxt().wrapping_sub(1),
                 self.rcv_nxt(),
-                self.advertised_receive_window(self.rcv_wnd),
-                self.output_flags(TcpSegmentFlags::ACK),
+                advertised_window,
+                flags,
                 self.output_capabilities(),
                 None,
                 self.next_local_timestamp(self.negotiated_options().timestamps),
@@ -3985,6 +4039,43 @@ mod tests {
 
         assert_eq!(timestamp.tsecr, 88);
         assert_ne!(timestamp.tsval, 0);
+    }
+
+    #[test]
+    fn tcp_app_rx_window_update_reopens_advertised_receive_window() {
+        let mut connection = established_connection();
+        let local = connection.local().expect("local");
+        let remote = connection.remote();
+        connection.set_rcv_wnd(0);
+
+        let zero_window = connection.control_segment(
+            local,
+            remote,
+            TcpSegmentFlags::ACK,
+            None,
+            TcpCapabilities::default(),
+        );
+        let mut zero_header = [0u8; 64];
+        let zero_len = zero_window
+            .write_header(&mut zero_header)
+            .expect("write zero-window ACK");
+        let zero_tcp =
+            etherparse::TcpSlice::from_slice(&zero_header[..zero_len]).expect("parse zero ACK");
+        assert_eq!(zero_tcp.window_size(), 0);
+        assert!(connection.zero_receive_window_sent());
+
+        let update = connection
+            .receive_window_update_segment(8 << 10)
+            .expect("window update ACK");
+        let mut update_header = [0u8; 64];
+        let update_len = update
+            .write_header(&mut update_header)
+            .expect("write window update ACK");
+        let update_tcp = etherparse::TcpSlice::from_slice(&update_header[..update_len])
+            .expect("parse window update ACK");
+        assert_ne!(update_tcp.window_size(), 0);
+        assert_eq!(connection.rcv_wnd(), 8 << 10);
+        assert!(!connection.zero_receive_window_sent());
     }
 
     #[test]

@@ -150,7 +150,9 @@ impl AppSession {
     /// the app has consumed them. Mirrors VPP `svm_fifo_dequeue`.
     #[inline]
     pub fn consume_rx(&self, len: usize) -> usize {
-        self.rx_fifo.dequeue_drop(len)
+        let dropped = self.rx_fifo.dequeue_drop(len);
+        self.notify_rx_dequeue(dropped);
+        dropped
     }
 
     /// App-side convenience: drain up to `out.len()` events from this session's
@@ -220,9 +222,10 @@ impl AppSession {
     /// Transport-side convenience: post a session event to the app's queue.
     /// Used by session runtime on RX enqueue / connect / close.
     ///
-    /// IO events (`RxEnq` / `TxDeq`) carry session index only. Control events
-    /// (`Connect` / `Close`) carry the full Session Handle, matching VPP
-    /// `session_event_t` identity rules.
+    /// IO events (`RxEnq` / `TxDeq`) carry session index only. `RxDeq` is
+    /// app-to-session only and is rejected here. Control events (`Connect` /
+    /// `Close`) carry the full Session Handle, matching VPP `session_event_t`
+    /// identity rules.
     #[inline]
     pub fn push_event(&self, evt_type: SessionEvtType) -> Result<(), AppSessionError> {
         self.push_event_with_flags(evt_type, SessionEvtFlags::empty())
@@ -243,6 +246,9 @@ impl AppSession {
                         session: self.handle.raw(),
                         event: evt_type,
                     })?;
+            }
+            SessionEvtType::RxDeq => {
+                panic!("RxDeq is an app-to-session event")
             }
             SessionEvtType::Connect | SessionEvtType::Close => {
                 let evt = SessionEvt::ctrl(
@@ -282,6 +288,23 @@ impl AppSession {
         Ok(())
     }
 
+    #[inline]
+    fn notify_rx_dequeue(&self, dropped: usize) {
+        if !self.rx_fifo.needs_deq_notification(dropped) {
+            return;
+        }
+        let event = SessionEvt::io(self.handle.session_index(), SessionEvtType::RxDeq);
+        loop {
+            match self.tx_evt_q.enqueue_io(event) {
+                Ok(()) => return,
+                Err(crate::app::SessionMsgQueueError::Full(_)) => std::thread::yield_now(),
+                Err(error) => {
+                    panic!("valid app session TX event queue rejected RX dequeue: {error:?}")
+                }
+            }
+        }
+    }
+
     /// Tx-space notification (app wants wake when tx fifo has space again).
     #[inline]
     pub fn want_tx_notification(&self) {
@@ -308,7 +331,8 @@ impl AppSession {
         loop {
             let read = self.rx_fifo.peek(0, out.len(), out);
             if read != 0 || out.is_empty() {
-                self.rx_fifo.dequeue_drop(read);
+                let dropped = self.rx_fifo.dequeue_drop(read);
+                self.notify_rx_dequeue(dropped);
                 return Ok(read);
             }
             self.rx_fifo.unset_event();
@@ -612,6 +636,24 @@ mod tests {
         assert_eq!(&out[..5], b"hello");
         assert_eq!(session.consume_rx(5), 5);
         assert_eq!(session.recv_bytes(&mut out), 0);
+    }
+
+    #[test]
+    fn app_session_rx_dequeue_notifies_runtime_only_when_requested() {
+        let session = new_session(AppSessionConfig::new(64, 4), 7);
+        assert_eq!(session.enqueue_rx(b"abcdef").expect("enqueue rx"), 6);
+
+        assert_eq!(session.consume_rx(1), 1);
+        assert!(session.tx_evt_q().dequeue().is_none());
+
+        session.rx_fifo().want_deq_notification();
+        assert_eq!(session.consume_rx(2), 2);
+        let event = session.tx_evt_q().dequeue().expect("rx dequeue event");
+        assert_eq!(event.evt_type, SessionEvtType::RxDeq);
+        assert_eq!(event.session_index(), 7);
+
+        assert_eq!(session.consume_rx(1), 1);
+        assert!(session.tx_evt_q().dequeue().is_none());
     }
 
     #[test]

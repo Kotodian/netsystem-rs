@@ -113,6 +113,7 @@ pub struct SessionWorker<Index> {
     app_session_config: AppSessionConfig,
     session_work: Vec<SessionId>,
     session_work_scratch: Vec<SessionId>,
+    app_rx_events: FifoQueue<SessionId>,
     control_events: FifoQueue<SessionControlEvent>,
     readiness_file: Option<PoolIndex>,
 }
@@ -448,6 +449,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     pub fn poll_app(&mut self) -> RuntimeResult<()> {
         let entries = &mut self.entries;
         let session_work = &mut self.session_work;
+        let app_rx_events = &mut self.app_rx_events;
         let control_events = &mut self.control_events;
         self.app
             .drain_tx_events_to(|session_id, evt_type| match evt_type {
@@ -462,6 +464,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
                 SessionEvtType::Close => {
                     control_events.push_back(SessionControlEvent::Disconnect(session_id));
                 }
+                SessionEvtType::RxDeq => app_rx_events.push_back(session_id),
                 SessionEvtType::RxEnq | SessionEvtType::Connect => {}
             });
         Ok(())
@@ -502,20 +505,24 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
                 .app
                 .copy_rx_from_buffer(session_id, buffers, index, urgent)?;
             let rx_available = self.rx_available_u32(session_id);
-            return Ok(match NonZeroU32::new(accepted) {
+            let delivery = match NonZeroU32::new(accepted) {
                 Some(accepted) => RxDelivery::InOrder {
                     accepted,
                     promoted,
                     rx_available,
                 },
                 None => RxDelivery::NotAccepted { rx_available },
-            });
+            };
+            if rx_available == 0 {
+                self.app.request_rx_dequeue_notification(session_id);
+            }
+            return Ok(delivery);
         }
         let (accepted, newest) = self
             .app
             .copy_rx_from_buffer_ooo(session_id, buffers, index, offset)?;
         let rx_available = self.rx_available_u32(session_id);
-        Ok(match NonZeroU32::new(accepted) {
+        let delivery = match NonZeroU32::new(accepted) {
             Some(accepted) => {
                 let (start, len) = newest.ok_or(SessionError::OooSpanMissing { session_id })?;
                 let len =
@@ -527,7 +534,11 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
                 }
             }
             None => RxDelivery::NotAccepted { rx_available },
-        })
+        };
+        if rx_available == 0 {
+            self.app.request_rx_dequeue_notification(session_id);
+        }
+        Ok(delivery)
     }
 
     #[inline]
@@ -652,6 +663,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             app_session_config,
             session_work: Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
             session_work_scratch: Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
+            app_rx_events: FifoQueue::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
             control_events: FifoQueue::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
             readiness_file: None,
         }
@@ -685,6 +697,24 @@ pub trait SessionTransport<Index>: Sized {
     type Tx: SessionTxStrategy<Self, Index>;
 
     const ID: SessionTransportId;
+
+    /// Handles an application dequeue from the session-owned RX FIFO.
+    ///
+    /// Returning `true` asks Session Runtime to arm the next RX dequeue
+    /// notification. The transport receives FIFO capacity facts but no FIFO
+    /// or app scheduling authority.
+    fn app_rx_evt(
+        &mut self,
+        _: Index,
+        _: usize,
+        _: usize,
+        _: &DataPlaneRuntime,
+        _: SessionQueueNext,
+        _: &mut BufferFrame,
+        _: &mut crate::session::node::SessionQueueOutput,
+    ) -> RuntimeResult<bool> {
+        Ok(false)
+    }
 
     fn update_time(
         &mut self,
@@ -918,6 +948,39 @@ where
 {
     transport.update_time(sessions, runtime, output_next, frame, output, now)?;
     sessions.poll_app()?;
+
+    let app_rx_event_count = sessions.app_rx_events.len();
+    for _ in 0..app_rx_event_count {
+        if output.remaining_io_budget() == 0 {
+            break;
+        }
+        let Some(&session_id) = sessions.app_rx_events.front() else {
+            break;
+        };
+        let Some((transport_id, index)) = sessions.session_transport(session_id) else {
+            let _ = sessions.app_rx_events.pop_front();
+            continue;
+        };
+        if transport_id != T::ID {
+            let _ = sessions.app_rx_events.pop_front();
+            continue;
+        }
+        let rx_available = sessions.rx_available_len(session_id).unwrap_or(0);
+        let rx_capacity = sessions.app_session_config.fifo_capacity;
+        let request_notification = transport.app_rx_evt(
+            index,
+            rx_available,
+            rx_capacity,
+            runtime,
+            output_next,
+            frame,
+            output,
+        )?;
+        let _ = sessions.app_rx_events.pop_front();
+        if request_notification {
+            sessions.app.request_rx_dequeue_notification(session_id);
+        }
+    }
 
     let control_count = sessions.control_events.len();
     for _ in 0..control_count {

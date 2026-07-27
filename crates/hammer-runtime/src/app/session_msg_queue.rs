@@ -28,7 +28,7 @@ pub enum SessionMqRing {
 ///
 /// # Identity rules (VPP / ADR-0010)
 ///
-/// - **IO events** (`RxEnq`, `TxDeq`): construct with [`SessionEvt::io`]. Only
+/// - **IO events** (`RxEnq`, `TxDeq`, `RxDeq`): construct with [`SessionEvt::io`]. Only
 ///   the session index is significant; worker bits are zero.
 /// - **Control events** (`Connect`, `Close`): construct with [`SessionEvt::ctrl`].
 ///   Identity is the VPP-shaped Session Handle packing
@@ -148,6 +148,7 @@ pub enum SessionEvtType {
     TxDeq,
     Connect,
     Close,
+    RxDeq,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

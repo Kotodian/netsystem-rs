@@ -8,6 +8,15 @@ use hammer_runtime::app::session_msg_queue::{
 };
 use hammer_runtime::{File, FileFunctions, FileMain};
 
+#[test]
+fn existing_session_event_discriminants_remain_stable() {
+    assert_eq!(SessionEvtType::RxEnq as u8, 0);
+    assert_eq!(SessionEvtType::TxDeq as u8, 1);
+    assert_eq!(SessionEvtType::Connect as u8, 2);
+    assert_eq!(SessionEvtType::Close as u8, 3);
+    assert_eq!(SessionEvtType::RxDeq as u8, 4);
+}
+
 fn descriptor_identity(fd: RawFd) -> std::io::Result<(libc::dev_t, libc::ino_t)> {
     let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: `status` is writable storage for one `stat`; a successful

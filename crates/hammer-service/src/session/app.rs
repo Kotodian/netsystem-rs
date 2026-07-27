@@ -435,6 +435,13 @@ impl AppWorker {
     }
 
     #[inline]
+    pub(crate) fn request_rx_dequeue_notification(&self, session_id: SessionId) {
+        if let Some(session) = self.session(session_id) {
+            session.rx_fifo().want_deq_notification();
+        }
+    }
+
+    #[inline]
     pub fn has_pending_send(&self, session_id: SessionId) -> bool {
         self.pending_send_len(session_id).ok().flatten().is_some()
     }
@@ -498,6 +505,9 @@ impl AppWorker {
                 .map_err(|_| SessionError::RxLengthOverflow { session_id })?;
             if accepted == total {
                 let rx_available_before = session.rx_fifo().max_enqueue();
+                if chunk.len() >= rx_available_before {
+                    session.rx_fifo().want_deq_notification();
+                }
                 let flags = if urgent_pending {
                     urgent_pending = false;
                     hammer_runtime::app::SessionEvtFlags::URGENT
@@ -645,6 +655,7 @@ mod tests {
     use super::*;
     use hammer_infra::pool::Index as PoolIndex;
     use hammer_runtime::app::{AppSessionConfig, SessionEvt, SessionEvtType, SessionHandle};
+    use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig};
     use std::sync::Mutex;
 
     #[test]
@@ -729,6 +740,36 @@ mod tests {
             *dispatched.lock().expect("dispatched"),
             vec![(session_id.get(), SessionEvtType::Close)]
         );
+    }
+
+    #[test]
+    fn filling_rx_fifo_arms_app_dequeue_before_rx_notification() {
+        let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
+        let mut app = AppWorker::default_local().expect("app worker");
+        let session_id = SessionId::from(PoolIndex::new(5, 1));
+        let session = Arc::new(
+            AppSession::new_in_segment(
+                Segment::default(),
+                AppSessionConfig::new(64, 4),
+                SessionHandle::new(5, 0),
+                app.tx_evt_q().clone(),
+            )
+            .expect("app session"),
+        );
+        app.attach_session(session_id, Arc::clone(&session));
+        let index = runtime
+            .alloc_index_with_bytes(&[0xab; 64])
+            .expect("RX buffer");
+
+        let delivery = app
+            .copy_rx_from_buffer(session_id, runtime.buffers(), index, false)
+            .expect("copy RX");
+        assert_eq!(delivery, (64, 0));
+        assert_eq!(session.consume_rx(1), 1);
+
+        let event = app.tx_evt_q().dequeue().expect("RX dequeue event");
+        assert_eq!(event.evt_type, SessionEvtType::RxDeq);
+        assert_eq!(event.session_index(), 5);
     }
 
     #[test]

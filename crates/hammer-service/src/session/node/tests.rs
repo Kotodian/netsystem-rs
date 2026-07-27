@@ -65,6 +65,20 @@ impl SessionTransport<Index> for TcpRecordingTransport {
 
     const ID: SessionTransportId = SessionTransportId::new(1);
 
+    fn app_rx_evt(
+        &mut self,
+        _: Index,
+        _: usize,
+        _: usize,
+        _: &DataPlaneRuntime,
+        _: SessionQueueNext,
+        _: &mut BufferFrame,
+        _: &mut super::SessionQueueOutput,
+    ) -> RuntimeResult<bool> {
+        self.0.events.lock().expect("events").push("app_rx");
+        Ok(false)
+    }
+
     fn update_time(
         &mut self,
         _: &mut SessionWorker<Index>,
@@ -122,6 +136,10 @@ fn session_queue_updates_transport_before_control_and_io() {
         sampled_times: Arc::clone(&sampled_times),
     });
     let session_id = sessions.insert_session_for_test(TcpRecordingTransport::ID, Index::new(9, 3));
+    let app = attach_local_app_session(&mut sessions, session_id);
+    app.tx_evt_q()
+        .enqueue_io(SessionEvt::io(app.session_index(), SessionEvtType::RxDeq))
+        .expect("enqueue rx dequeue");
     sessions.schedule_disconnect(session_id);
     sessions.mark_ready(session_id);
     let sink = runtime.nodes().register_internal(BlackholeNode);
@@ -133,7 +151,7 @@ fn session_queue_updates_transport_before_control_and_io() {
     assert_eq!(step.scheduled_sessions, 1);
     assert_eq!(
         *events.lock().expect("events"),
-        vec!["tcp_time", "control", "io"]
+        vec!["tcp_time", "app_rx", "control", "io"]
     );
     let times = sampled_times.lock().expect("times");
     assert_eq!(times.len(), 1);

@@ -56,7 +56,7 @@ async fn run_echo(session: &AppSession) -> Result<(), EchoError> {
             continue;
         }
         match event.evt_type {
-            SessionEvtType::Connect | SessionEvtType::TxDeq => {}
+            SessionEvtType::Connect | SessionEvtType::TxDeq | SessionEvtType::RxDeq => {}
             SessionEvtType::RxEnq => loop {
                 let read = session.recv_bytes(&mut buffer);
                 if read == 0 {

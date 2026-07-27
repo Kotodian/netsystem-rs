@@ -18,6 +18,8 @@ use hammer_service::session::runtime::{
     SessionWorker, TransportSendFlags, TransportSendParams, TxBatchBuffer,
 };
 const DEFAULT_TCP_CONNECTION_CAPACITY: usize = 1024;
+const TCP_APP_RX_MIN_FREE: usize = 4 << 10;
+const TCP_APP_RX_MAX_FREE: usize = 128 << 10;
 
 pub struct TcpWorker {
     pub(crate) connections: Pool<TcpConnection>,
@@ -148,6 +150,37 @@ impl SessionTransport<Index> for TcpWorker {
     type Tx = SessionPacketizedTx;
 
     const ID: SessionTransportId = SessionTransportId::new(1);
+
+    fn app_rx_evt(
+        &mut self,
+        index: Index,
+        rx_available: usize,
+        rx_capacity: usize,
+        runtime: &DataPlaneRuntime,
+        output_next: SessionQueueNext,
+        frame: &mut hammer_core::data_plane::BufferFrame,
+        output: &mut SessionQueueOutput,
+    ) -> RuntimeResult<bool> {
+        let connection = self
+            .connections
+            .get(index)
+            .ok_or(TcpNodeError::SessionMissing)?;
+        if !connection.zero_receive_window_sent() {
+            return Ok(false);
+        }
+        let min_free = (rx_capacity >> 3).clamp(TCP_APP_RX_MIN_FREE, TCP_APP_RX_MAX_FREE);
+        if rx_available < min_free {
+            return Ok(true);
+        }
+        let mut candidate = connection.clone();
+        let segment = candidate.receive_window_update_segment(rx_available)?;
+        enqueue_tcp_segment(runtime, frame, output_next, output, segment)?;
+        *self
+            .connections
+            .get_mut(index)
+            .ok_or(TcpNodeError::SessionMissing)? = candidate;
+        Ok(false)
+    }
 
     fn update_time(
         &mut self,
