@@ -35,6 +35,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--chunk-bytes", type=int, default=4096)
     parser.add_argument("--write-delay-seconds", type=float, default=0.0)
+    parser.add_argument("--pause-after-bytes", type=int, default=0)
+    parser.add_argument("--pause-file")
+    parser.add_argument("--resume-file")
     parser.add_argument(
         "--window-bytes",
         type=int,
@@ -91,6 +94,9 @@ def run_echo(connection: socket.socket, args: argparse.Namespace) -> None:
     sent = 0
     received = 0
     deadline = time.monotonic() + args.echo_timeout
+    pause_file = Path(args.pause_file) if args.pause_file else None
+    resume_file = Path(args.resume_file) if args.resume_file else None
+    paused = False
     connection.setblocking(False)
     while received < total:
         if time.monotonic() > deadline:
@@ -129,6 +135,14 @@ def run_echo(connection: socket.socket, args: argparse.Namespace) -> None:
                 sent += written
                 if written > 0 and args.write_delay_seconds > 0:
                     time.sleep(args.write_delay_seconds)
+                if (
+                    not paused
+                    and args.pause_after_bytes > 0
+                    and sent >= args.pause_after_bytes
+                ):
+                    pause_file.touch()
+                    wait_for_file(resume_file, args.continue_timeout)
+                    paused = True
     print(f"echo verified: {received} bytes matched exactly", flush=True)
 
 
@@ -154,10 +168,15 @@ def main() -> None:
         or args.chunk_bytes <= 0
         or args.window_bytes <= 0
         or args.write_delay_seconds < 0
+        or args.pause_after_bytes < 0
     ):
         raise SystemExit(
             "--echo-bytes/write-delay-seconds must be >= 0; "
             "--chunk-bytes/--window-bytes must be > 0"
+        )
+    if args.pause_after_bytes > 0 and (not args.pause_file or not args.resume_file):
+        raise SystemExit(
+            "--pause-file and --resume-file are required with --pause-after-bytes"
         )
     connection = connect(args)
     with connection:

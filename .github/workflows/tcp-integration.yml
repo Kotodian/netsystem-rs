@@ -441,9 +441,18 @@ jobs:
         timeout-minutes: 5
         run: |
           set -euo pipefail
+          fault_pause_file="$RUNNER_TEMP/fault-pause"
+          fault_resume_file="$RUNNER_TEMP/fault-resume"
+          rm -f "$fault_pause_file" "$fault_resume_file"
           probe_args=()
           if [[ "${{ matrix.scenario }}" == "receiver-sack" ]]; then
-            probe_args+=(--chunk-bytes "$TCP_TEST_MSS" --write-delay-seconds 0.001)
+            probe_args+=(
+              --chunk-bytes "$TCP_TEST_MSS"
+              --write-delay-seconds 0.001
+              --pause-after-bytes 6000
+              --pause-file "$fault_pause_file"
+              --resume-file "$fault_resume_file"
+            )
           fi
           ready_file="$RUNNER_TEMP/probe-ready"
           continue_file="$RUNNER_TEMP/probe-continue"
@@ -497,8 +506,6 @@ jobs:
             "print((int('$fault_base') + ${{ matrix.fault_offset }}) % (2 ** 32))")"
           echo "fault target sequence: $target_seq (${{ matrix.fault }})"
           echo "TCP_TEST_TARGET_SEQ=$target_seq" >> "$GITHUB_ENV"
-          # The policers drop the first exact-sequence match and pass matches
-          # until their token bucket refills, so retransmissions are not lost.
           case "${{ matrix.fault }}" in
             client-egress)
               fault_backend=tc
@@ -512,8 +519,7 @@ jobs:
                 match ip dport "$TCP_TEST_PORT" 0xffff \
                 match u16 "$packet_len" 0xffff at 2 \
                 match u32 "$target_seq_hex" 0xffffffff at 24 \
-                action police pkts_rate 1 pkts_burst 1 \
-                conform-exceed ok/drop
+                action drop
               ;;
             server-ingress)
               fault_backend=nft
@@ -532,18 +538,39 @@ jobs:
             --addr "$TCP_TEST_IPC_ADDRESS" status \
             > "$TCP_TEST_DIAGNOSTICS/status-before-fault.txt" 2>&1 || true
           touch "$continue_file"
+          if [[ "$fault_backend" == "tc" ]]; then
+            for _ in {1..1000}; do
+              [[ -f "$fault_pause_file" ]] && break
+              sleep 0.01
+            done
+            if [[ ! -f "$fault_pause_file" ]]; then
+              kill "$probe_pid" 2>/dev/null || true
+              wait "$probe_pid" 2>/dev/null || true
+              cat "$TCP_TEST_DIAGNOSTICS/probe.log" >&2
+              echo "probe did not pause after the fault segment" >&2
+              exit 1
+            fi
+            sudo -n tc -s filter show dev "$TCP_TEST_INTERFACE" \
+              egress pref 10 \
+              > "$TCP_TEST_DIAGNOSTICS/fault-rule.txt" 2>&1 || true
+            hits="$(sed -n 's/.*Sent [0-9][0-9]* bytes \([0-9][0-9]*\) pkt.*/\1/p' \
+              "$TCP_TEST_DIAGNOSTICS/fault-rule.txt" | head -1)"
+            drops="$(sed -n 's/.*dropped \([0-9][0-9]*\).*/\1/p' \
+              "$TCP_TEST_DIAGNOSTICS/fault-rule.txt" | head -1)"
+            sudo -n tc qdisc delete dev "$TCP_TEST_INTERFACE" clsact
+            if [[ "${hits:-0}" -lt 1 || "${drops:-0}" -lt 1 ]]; then
+              kill "$probe_pid" 2>/dev/null || true
+              wait "$probe_pid" 2>/dev/null || true
+              cat "$TCP_TEST_DIAGNOSTICS/fault-rule.txt" >&2
+              echo "fault rule never dropped target sequence $target_seq" >&2
+              exit 1
+            fi
+            touch "$fault_resume_file"
+          fi
           probe_status=0
           wait "$probe_pid" || probe_status=$?
           case "$fault_backend" in
-            tc)
-              sudo -n tc -s filter show dev "$TCP_TEST_INTERFACE" \
-                egress pref 10 \
-                > "$TCP_TEST_DIAGNOSTICS/fault-rule.txt" 2>&1 || true
-              hits="$(sed -n 's/.*Sent [0-9][0-9]* bytes \([0-9][0-9]*\) pkt.*/\1/p' \
-                "$TCP_TEST_DIAGNOSTICS/fault-rule.txt" | head -1)"
-              drops="$(sed -n 's/.*dropped \([0-9][0-9]*\).*/\1/p' \
-                "$TCP_TEST_DIAGNOSTICS/fault-rule.txt" | head -1)"
-              ;;
+            tc) ;;
             nft)
               sudo -n nft list table "$fault_family" tcplab \
                 > "$TCP_TEST_DIAGNOSTICS/fault-rule.txt" 2>&1 || true
