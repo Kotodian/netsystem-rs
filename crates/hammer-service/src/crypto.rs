@@ -5,6 +5,7 @@
 //! `hammer-infra`; `hammer-runtime` does not participate in this boundary.
 
 use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::marker::PhantomData;
 use std::rc::Rc;
@@ -25,13 +26,13 @@ pub trait Family: private::Sealed + Sized + 'static {
     const KEY_FAMILY: u8;
 
     #[doc(hidden)]
-    fn algorithm(engine: &Engine, name: &str) -> Option<AlgorithmId<Self>>;
+    fn registry(engine: &Engine) -> &FamilyRegistry<Self>;
 
     #[doc(hidden)]
-    fn unkeyed_context(
-        engine: &Engine,
-        algorithm: AlgorithmId<Self>,
-    ) -> Option<(Self::Dispatch, Self::Prepared)>;
+    fn registry_mut(engine: &mut Engine) -> &mut FamilyRegistry<Self>;
+
+    #[doc(hidden)]
+    fn prepare_unkeyed() -> Option<Self::Prepared>;
 }
 
 mod private {
@@ -55,15 +56,16 @@ impl Family for Hash {
 
     const KEY_FAMILY: u8 = 2;
 
-    fn algorithm(engine: &Engine, name: &str) -> Option<AlgorithmId<Self>> {
-        (engine.sha256_name == name).then_some(AlgorithmId::new(0))
+    fn registry(engine: &Engine) -> &FamilyRegistry<Self> {
+        &engine.hashes
     }
 
-    fn unkeyed_context(
-        engine: &Engine,
-        algorithm: AlgorithmId<Self>,
-    ) -> Option<(Self::Dispatch, Self::Prepared)> {
-        (algorithm.slot == 0).then_some((engine.sha256_dispatch, HashPrepared))
+    fn registry_mut(engine: &mut Engine) -> &mut FamilyRegistry<Self> {
+        &mut engine.hashes
+    }
+
+    fn prepare_unkeyed() -> Option<Self::Prepared> {
+        Some(HashPrepared)
     }
 }
 
@@ -87,15 +89,301 @@ impl Family for Aead {
 
     const KEY_FAMILY: u8 = 1;
 
-    fn algorithm(engine: &Engine, name: &str) -> Option<AlgorithmId<Self>> {
-        (engine.aes128_gcm_name == name).then_some(AlgorithmId::new(0))
+    fn registry(engine: &Engine) -> &FamilyRegistry<Self> {
+        &engine.aeads
     }
 
-    fn unkeyed_context(
-        _: &Engine,
-        _: AlgorithmId<Self>,
-    ) -> Option<(Self::Dispatch, Self::Prepared)> {
+    fn registry_mut(engine: &mut Engine) -> &mut FamilyRegistry<Self> {
+        &mut engine.aeads
+    }
+
+    fn prepare_unkeyed() -> Option<Self::Prepared> {
         None
+    }
+}
+
+macro_rules! define_pending_family {
+    ($family:ident, $field:ident, $key:expr) => {
+        #[doc = concat!("The ", stringify!($family), " operation family.")]
+        #[derive(Debug)]
+        pub struct $family;
+
+        impl private::Sealed for $family {}
+
+        impl Family for $family {
+            type Operation<'a> = ();
+            type Prepared = ();
+            type Dispatch = for<'a> fn(&mut (), &mut [()]);
+
+            const KEY_FAMILY: u8 = $key;
+
+            fn registry(engine: &Engine) -> &FamilyRegistry<Self> {
+                &engine.$field
+            }
+
+            fn registry_mut(engine: &mut Engine) -> &mut FamilyRegistry<Self> {
+                &mut engine.$field
+            }
+
+            fn prepare_unkeyed() -> Option<Self::Prepared> {
+                None
+            }
+        }
+    };
+}
+
+define_pending_family!(Cipher, ciphers, 3);
+define_pending_family!(Mac, macs, 4);
+define_pending_family!(Kdf, kdfs, 5);
+define_pending_family!(Kx, key_exchanges, 6);
+define_pending_family!(Sign, signers, 7);
+define_pending_family!(Verify, verifiers, 8);
+
+bitflags::bitflags! {
+    /// Input and output shapes supported by a cryptographic implementation.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct Capabilities: u16 {
+        /// Accept one contiguous input slice.
+        const CONTIGUOUS_INPUT = 1 << 0;
+        /// Accept ordered scatter-gather input.
+        const SCATTER_INPUT = 1 << 1;
+        /// Transform caller-owned memory in place.
+        const IN_PLACE = 1 << 2;
+        /// Write results to separate caller-owned memory.
+        const OUT_OF_PLACE = 1 << 3;
+        /// Authenticate caller-provided associated data.
+        const ASSOCIATED_DATA = 1 << 4;
+    }
+}
+
+/// One algorithm declaration awaiting failure-atomic publication.
+pub struct AlgorithmRegistration<F: Family> {
+    name: String,
+    required: Capabilities,
+    family: PhantomData<fn() -> F>,
+}
+
+impl<F: Family> AlgorithmRegistration<F> {
+    /// Declares canonical algorithm semantics and required operation shapes.
+    pub fn new(name: impl Into<String>, required: Capabilities) -> Self {
+        Self {
+            name: name.into(),
+            required,
+            family: PhantomData,
+        }
+    }
+}
+
+/// One implementation declaration awaiting failure-atomic publication.
+pub struct ImplementationRegistration<F: Family> {
+    name: String,
+    algorithms: Vec<String>,
+    capabilities: Capabilities,
+    priority: i32,
+    available: bool,
+    dispatch: F::Dispatch,
+}
+
+impl<F: Family> ImplementationRegistration<F> {
+    /// Declares one implementation and the algorithms it can execute.
+    pub fn new(
+        name: impl Into<String>,
+        algorithms: &[&str],
+        capabilities: Capabilities,
+        priority: i32,
+        available: bool,
+        dispatch: F::Dispatch,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            algorithms: algorithms.iter().map(|name| (*name).to_owned()).collect(),
+            capabilities,
+            priority,
+            available,
+            dispatch,
+        }
+    }
+}
+
+/// A family-typed algorithm and implementation publication bundle.
+pub struct Registration<F: Family> {
+    algorithms: Vec<AlgorithmRegistration<F>>,
+    implementations: Vec<ImplementationRegistration<F>>,
+}
+
+impl<F: Family> Registration<F> {
+    /// Creates an empty publication bundle.
+    pub fn new() -> Self {
+        Self {
+            algorithms: Vec::new(),
+            implementations: Vec::new(),
+        }
+    }
+
+    /// Adds one algorithm declaration to the bundle.
+    pub fn with_algorithm(mut self, algorithm: AlgorithmRegistration<F>) -> Self {
+        self.algorithms.push(algorithm);
+        self
+    }
+
+    /// Adds one implementation declaration to the bundle.
+    pub fn with_implementation(mut self, implementation: ImplementationRegistration<F>) -> Self {
+        self.implementations.push(implementation);
+        self
+    }
+}
+
+impl<F: Family> Default for Registration<F> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Immutable implementation admission policy used for new Contexts.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SelectionPolicy {
+    allowed: Option<BTreeSet<String>>,
+}
+
+impl SelectionPolicy {
+    /// Allows every registered implementation.
+    pub fn allow_all() -> Self {
+        Self::default()
+    }
+
+    /// Allows only the named implementations.
+    pub fn only<I, S>(names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            allowed: Some(names.into_iter().map(Into::into).collect()),
+        }
+    }
+
+    fn permits(&self, name: &str) -> bool {
+        self.allowed
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains(name))
+    }
+}
+
+#[derive(Debug)]
+struct AlgorithmRecord {
+    name: String,
+    required: Capabilities,
+}
+
+struct ImplementationRecord<F: Family> {
+    name: String,
+    algorithms: Vec<u32>,
+    capabilities: Capabilities,
+    priority: i32,
+    available: bool,
+    dispatch: F::Dispatch,
+}
+
+/// Family-private registry storage exposed only to the sealed [`Family`] contract.
+#[doc(hidden)]
+pub struct FamilyRegistry<F: Family> {
+    algorithms: Vec<AlgorithmRecord>,
+    algorithm_names: HashMap<String, u32>,
+    implementations: Vec<ImplementationRecord<F>>,
+    implementation_names: HashMap<String, usize>,
+}
+
+impl<F: Family> FamilyRegistry<F> {
+    fn new() -> Self {
+        Self {
+            algorithms: Vec::new(),
+            algorithm_names: HashMap::new(),
+            implementations: Vec::new(),
+            implementation_names: HashMap::new(),
+        }
+    }
+
+    fn algorithm(&self, name: &str) -> Option<AlgorithmId<F>> {
+        self.algorithm_names
+            .get(name)
+            .copied()
+            .map(AlgorithmId::new)
+    }
+
+    fn algorithm_record(&self, algorithm: AlgorithmId<F>) -> Option<&AlgorithmRecord> {
+        self.algorithms.get(algorithm.slot as usize)
+    }
+
+    fn select(
+        &self,
+        algorithm: AlgorithmId<F>,
+        policy: &SelectionPolicy,
+    ) -> Option<(&str, F::Dispatch)> {
+        let required = self.algorithm_record(algorithm)?.required;
+        self.implementations
+            .iter()
+            .filter(|implementation| {
+                implementation.available
+                    && policy.permits(&implementation.name)
+                    && implementation.algorithms.contains(&algorithm.slot)
+                    && implementation.capabilities.contains(required)
+            })
+            .min_by(|left, right| {
+                right
+                    .priority
+                    .cmp(&left.priority)
+                    .then_with(|| left.name.cmp(&right.name))
+            })
+            .map(|implementation| (implementation.name.as_str(), implementation.dispatch))
+    }
+
+    fn set_availability(&mut self, name: &str, available: bool) -> Result<(), RegistryError> {
+        let index = self
+            .implementation_names
+            .get(name)
+            .copied()
+            .ok_or_else(|| RegistryError::ImplementationUnknown {
+                name: name.to_owned(),
+            })?;
+        self.implementations[index].available = available;
+        Ok(())
+    }
+
+    fn publish(&mut self, registration: Registration<F>) {
+        let first_slot = self.algorithms.len();
+        for (offset, algorithm) in registration.algorithms.into_iter().enumerate() {
+            let slot = u32::try_from(first_slot + offset)
+                .expect("registry capacity was validated before publication");
+            self.algorithm_names.insert(algorithm.name.clone(), slot);
+            self.algorithms.push(AlgorithmRecord {
+                name: algorithm.name,
+                required: algorithm.required,
+            });
+        }
+
+        for implementation in registration.implementations {
+            let algorithms = implementation
+                .algorithms
+                .iter()
+                .map(|name| {
+                    *self
+                        .algorithm_names
+                        .get(name)
+                        .expect("implementation algorithms were validated before publication")
+                })
+                .collect();
+            let index = self.implementations.len();
+            self.implementation_names
+                .insert(implementation.name.clone(), index);
+            self.implementations.push(ImplementationRecord {
+                name: implementation.name,
+                algorithms,
+                capabilities: implementation.capabilities,
+                priority: implementation.priority,
+                available: implementation.available,
+                dispatch: implementation.dispatch,
+            });
+        }
     }
 }
 
@@ -433,10 +721,15 @@ struct ContextKeyRef {
 
 /// The owner of cryptographic registries and implementation selection.
 pub struct Engine {
-    sha256_name: String,
-    sha256_dispatch: <Hash as Family>::Dispatch,
-    aes128_gcm_name: String,
-    aes128_gcm_dispatch: <Aead as Family>::Dispatch,
+    aeads: FamilyRegistry<Aead>,
+    ciphers: FamilyRegistry<Cipher>,
+    hashes: FamilyRegistry<Hash>,
+    macs: FamilyRegistry<Mac>,
+    kdfs: FamilyRegistry<Kdf>,
+    key_exchanges: FamilyRegistry<Kx>,
+    signers: FamilyRegistry<Sign>,
+    verifiers: FamilyRegistry<Verify>,
+    selection_policy: SelectionPolicy,
     keys: Rc<RefCell<Pool<KeyEntry>>>,
 }
 
@@ -444,12 +737,30 @@ impl fmt::Debug for Engine {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Engine")
+            .field("aead_algorithms", &self.aeads.algorithms.len())
+            .field("hash_algorithms", &self.hashes.algorithms.len())
             .field("key_count", &self.keys.borrow().len())
             .finish_non_exhaustive()
     }
 }
 
 impl Engine {
+    /// Creates an Engine with empty family registries.
+    pub fn new() -> Self {
+        Self {
+            aeads: FamilyRegistry::new(),
+            ciphers: FamilyRegistry::new(),
+            hashes: FamilyRegistry::new(),
+            macs: FamilyRegistry::new(),
+            kdfs: FamilyRegistry::new(),
+            key_exchanges: FamilyRegistry::new(),
+            signers: FamilyRegistry::new(),
+            verifiers: FamilyRegistry::new(),
+            selection_policy: SelectionPolicy::allow_all(),
+            keys: Rc::new(RefCell::new(Pool::with_capacity(1024))),
+        }
+    }
+
     /// Creates an Engine containing Hammer's standard built-in algorithms.
     ///
     /// # Errors
@@ -457,20 +768,82 @@ impl Engine {
     /// Returns [`RegistryError::MalformedAlgorithmName`] if a built-in name no
     /// longer satisfies the canonical algorithm-name contract.
     pub fn with_builtins() -> Result<Self, RegistryError> {
-        let sha256_name = validate_standard_algorithm_name("sha-256")?.to_owned();
-        let aes128_gcm_name = validate_standard_algorithm_name("aes-128-gcm")?.to_owned();
-        Ok(Self {
-            sha256_name,
-            sha256_dispatch: execute_sha256,
-            aes128_gcm_name,
-            aes128_gcm_dispatch: execute_aes128_gcm,
-            keys: Rc::new(RefCell::new(Pool::with_capacity(1024))),
-        })
+        let hash_capabilities = Capabilities::CONTIGUOUS_INPUT
+            | Capabilities::SCATTER_INPUT
+            | Capabilities::OUT_OF_PLACE;
+        let aead_capabilities =
+            hash_capabilities | Capabilities::IN_PLACE | Capabilities::ASSOCIATED_DATA;
+        let mut engine = Self::new();
+        engine.publish(
+            Registration::new()
+                .with_algorithm(AlgorithmRegistration::<Hash>::new(
+                    "sha-256",
+                    hash_capabilities,
+                ))
+                .with_implementation(ImplementationRegistration::<Hash>::new(
+                    "hammer:sha-256-portable",
+                    &["sha-256"],
+                    hash_capabilities,
+                    0,
+                    true,
+                    execute_sha256,
+                )),
+        )?;
+        engine.publish(
+            Registration::new()
+                .with_algorithm(AlgorithmRegistration::<Aead>::new(
+                    "aes-128-gcm",
+                    aead_capabilities,
+                ))
+                .with_implementation(ImplementationRegistration::<Aead>::new(
+                    "hammer:aes-128-gcm-portable",
+                    &["aes-128-gcm"],
+                    aead_capabilities,
+                    0,
+                    true,
+                    execute_aes128_gcm,
+                )),
+        )?;
+        Ok(engine)
+    }
+
+    /// Publishes one family-typed registration as a failure-atomic bundle.
+    ///
+    /// # Errors
+    ///
+    /// Returns a concrete naming, collision, capability, or capacity failure
+    /// without changing any registry.
+    pub fn publish<F: Family>(
+        &mut self,
+        registration: Registration<F>,
+    ) -> Result<(), RegistryError> {
+        validate_registration(self, &registration)?;
+        F::registry_mut(self).publish(registration);
+        Ok(())
     }
 
     /// Resolves a canonical name to a family-typed process-local identity.
     pub fn algorithm<F: Family>(&self, name: &str) -> Option<AlgorithmId<F>> {
-        F::algorithm(self, name)
+        F::registry(self).algorithm(name)
+    }
+
+    /// Replaces the immutable policy used for subsequent Context creation.
+    pub fn set_selection_policy(&mut self, policy: SelectionPolicy) {
+        self.selection_policy = policy;
+    }
+
+    /// Changes whether one implementation may be selected by new Contexts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::ImplementationUnknown`] when `name` is absent
+    /// from this operation family.
+    pub fn set_implementation_availability<F: Family>(
+        &mut self,
+        name: &str,
+        available: bool,
+    ) -> Result<(), RegistryError> {
+        F::registry_mut(self).set_availability(name, available)
     }
 
     /// Creates a thread-bound Context and selects its implementation once.
@@ -483,12 +856,17 @@ impl Engine {
         &self,
         algorithm: AlgorithmId<F>,
     ) -> Result<Context<F>, ContextError> {
-        let (dispatch, prepared) =
-            F::unkeyed_context(self, algorithm).ok_or(ContextError::AlgorithmUnavailable {
+        let (implementation, dispatch) = F::registry(self)
+            .select(algorithm, &self.selection_policy)
+            .ok_or(ContextError::AlgorithmUnavailable {
                 algorithm: algorithm.slot,
             })?;
+        let prepared = F::prepare_unkeyed().ok_or(ContextError::KeyRequired {
+            algorithm: algorithm.slot,
+        })?;
         Ok(Context {
             algorithm,
+            implementation: implementation.to_owned(),
             dispatch,
             prepared,
             key_ref: None,
@@ -571,7 +949,19 @@ impl Engine {
         algorithm: AlgorithmId<Aead>,
         key: KeyHandle,
     ) -> Result<Context<Aead>, ContextError> {
-        if algorithm.slot != 0 {
+        let registry = Aead::registry(self);
+        let algorithm_record =
+            registry
+                .algorithm_record(algorithm)
+                .ok_or(ContextError::AlgorithmUnavailable {
+                    algorithm: algorithm.slot,
+                })?;
+        let (implementation, dispatch) = registry.select(algorithm, &self.selection_policy).ok_or(
+            ContextError::AlgorithmUnavailable {
+                algorithm: algorithm.slot,
+            },
+        )?;
+        if algorithm_record.name != "aes-128-gcm" {
             return Err(ContextError::AlgorithmUnavailable {
                 algorithm: algorithm.slot,
             });
@@ -611,7 +1001,8 @@ impl Engine {
 
         Ok(Context {
             algorithm,
-            dispatch: self.aes128_gcm_dispatch,
+            implementation: implementation.to_owned(),
+            dispatch,
             prepared,
             key_ref: Some(ContextKeyRef {
                 keys: Rc::clone(&self.keys),
@@ -619,6 +1010,34 @@ impl Engine {
             }),
             thread_bound: PhantomData,
         })
+    }
+
+    fn algorithm_name_exists(&self, name: &str) -> bool {
+        self.aeads.algorithm_names.contains_key(name)
+            || self.ciphers.algorithm_names.contains_key(name)
+            || self.hashes.algorithm_names.contains_key(name)
+            || self.macs.algorithm_names.contains_key(name)
+            || self.kdfs.algorithm_names.contains_key(name)
+            || self.key_exchanges.algorithm_names.contains_key(name)
+            || self.signers.algorithm_names.contains_key(name)
+            || self.verifiers.algorithm_names.contains_key(name)
+    }
+
+    fn implementation_name_exists(&self, name: &str) -> bool {
+        self.aeads.implementation_names.contains_key(name)
+            || self.ciphers.implementation_names.contains_key(name)
+            || self.hashes.implementation_names.contains_key(name)
+            || self.macs.implementation_names.contains_key(name)
+            || self.kdfs.implementation_names.contains_key(name)
+            || self.key_exchanges.implementation_names.contains_key(name)
+            || self.signers.implementation_names.contains_key(name)
+            || self.verifiers.implementation_names.contains_key(name)
+    }
+}
+
+impl Default for Engine {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -637,11 +1056,19 @@ impl Engine {
 #[derive(Debug)]
 pub struct Context<F: Family> {
     algorithm: AlgorithmId<F>,
+    implementation: String,
     dispatch: F::Dispatch,
     prepared: F::Prepared,
     key_ref: Option<ContextKeyRef>,
     // Rc is deliberately part of the marker: Context must be neither Send nor Sync.
     thread_bound: PhantomData<Rc<()>>,
+}
+
+impl<F: Family> Context<F> {
+    /// Returns the implementation permanently bound to this Context.
+    pub fn implementation_name(&self) -> &str {
+        &self.implementation
+    }
 }
 
 impl Context<Hash> {
@@ -684,15 +1111,70 @@ impl<F: Family> Drop for Context<F> {
     }
 }
 
-/// A failure while publishing the built-in registry.
+/// A failure while publishing a cryptographic registry.
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 pub enum RegistryError {
-    /// A built-in algorithm violated the canonical naming contract.
-    #[error("malformed standard algorithm name `{name}`")]
+    /// An algorithm violated the canonical naming contract.
+    #[error("malformed algorithm name `{name}`")]
     MalformedAlgorithmName {
         /// Rejected name.
         name: String,
     },
+    /// An implementation name omitted or violated its namespace contract.
+    #[error("malformed implementation name `{name}`")]
+    MalformedImplementationName {
+        /// Rejected name.
+        name: String,
+    },
+    /// An Algorithm Name is already published or repeated in one bundle.
+    #[error("algorithm `{name}` is already registered")]
+    AlgorithmCollision {
+        /// Colliding canonical name.
+        name: String,
+    },
+    /// A Crypto Implementation Name is already published or repeated.
+    #[error("implementation `{name}` is already registered")]
+    ImplementationCollision {
+        /// Colliding canonical name.
+        name: String,
+    },
+    /// An implementation advertises an algorithm absent from the bundle and registry.
+    #[error("implementation `{implementation}` references unknown algorithm `{algorithm}`")]
+    UnknownAlgorithm {
+        /// Rejected implementation.
+        implementation: String,
+        /// Missing Algorithm Name.
+        algorithm: String,
+    },
+    /// An implementation does not support every shape required by an algorithm.
+    #[error(
+        "implementation `{implementation}` capabilities {provided:?} do not satisfy algorithm `{algorithm}` requirements {required:?}"
+    )]
+    CapabilityMismatch {
+        /// Rejected implementation.
+        implementation: String,
+        /// Algorithm whose contract was not satisfied.
+        algorithm: String,
+        /// Shapes required by the algorithm.
+        required: Capabilities,
+        /// Shapes advertised by the implementation.
+        provided: Capabilities,
+    },
+    /// An implementation declared no executable algorithm.
+    #[error("implementation `{name}` declares no algorithms")]
+    ImplementationWithoutAlgorithms {
+        /// Rejected implementation.
+        name: String,
+    },
+    /// The named implementation is absent from the selected family.
+    #[error("implementation `{name}` is not registered")]
+    ImplementationUnknown {
+        /// Missing implementation name.
+        name: String,
+    },
+    /// The process-local Algorithm ID space cannot represent another bundle.
+    #[error("algorithm registry capacity is exhausted")]
+    AlgorithmCapacityExhausted,
 }
 
 /// A failure while creating an implementation-bound Context.
@@ -701,6 +1183,12 @@ pub enum ContextError {
     /// No currently available implementation supports the algorithm.
     #[error("algorithm slot {algorithm} has no available implementation")]
     AlgorithmUnavailable {
+        /// Process-local algorithm slot.
+        algorithm: u32,
+    },
+    /// The selected operation family requires an opaque key.
+    #[error("algorithm slot {algorithm} requires a Key Handle")]
+    KeyRequired {
         /// Process-local algorithm slot.
         algorithm: u32,
     },
@@ -784,21 +1272,114 @@ pub enum KeyError {
     },
 }
 
-fn validate_standard_algorithm_name(name: &str) -> Result<&str, RegistryError> {
-    let valid = !name.is_empty()
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        && !name.starts_with('-')
-        && !name.ends_with('-')
-        && !name.contains("--");
+fn validate_registration<F: Family>(
+    engine: &Engine,
+    registration: &Registration<F>,
+) -> Result<(), RegistryError> {
+    let registry = F::registry(engine);
+    if registry
+        .algorithms
+        .len()
+        .checked_add(registration.algorithms.len())
+        .is_none_or(|len| u32::try_from(len.saturating_sub(1)).is_err())
+    {
+        return Err(RegistryError::AlgorithmCapacityExhausted);
+    }
+
+    let mut algorithms = HashMap::new();
+    for algorithm in &registration.algorithms {
+        validate_algorithm_name(&algorithm.name)?;
+        if engine.algorithm_name_exists(&algorithm.name)
+            || algorithms
+                .insert(algorithm.name.as_str(), algorithm.required)
+                .is_some()
+        {
+            return Err(RegistryError::AlgorithmCollision {
+                name: algorithm.name.clone(),
+            });
+        }
+    }
+
+    let mut implementations = BTreeSet::new();
+    for implementation in &registration.implementations {
+        validate_implementation_name(&implementation.name)?;
+        if engine.implementation_name_exists(&implementation.name)
+            || !implementations.insert(implementation.name.as_str())
+        {
+            return Err(RegistryError::ImplementationCollision {
+                name: implementation.name.clone(),
+            });
+        }
+        if implementation.algorithms.is_empty() {
+            return Err(RegistryError::ImplementationWithoutAlgorithms {
+                name: implementation.name.clone(),
+            });
+        }
+        for algorithm_name in &implementation.algorithms {
+            let required = algorithms
+                .get(algorithm_name.as_str())
+                .copied()
+                .or_else(|| {
+                    registry
+                        .algorithm(algorithm_name)
+                        .and_then(|algorithm| registry.algorithm_record(algorithm))
+                        .map(|algorithm| algorithm.required)
+                });
+            let required = required.ok_or_else(|| RegistryError::UnknownAlgorithm {
+                implementation: implementation.name.clone(),
+                algorithm: algorithm_name.clone(),
+            })?;
+            if !implementation.capabilities.contains(required) {
+                return Err(RegistryError::CapabilityMismatch {
+                    implementation: implementation.name.clone(),
+                    algorithm: algorithm_name.clone(),
+                    required,
+                    provided: implementation.capabilities,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_algorithm_name(name: &str) -> Result<(), RegistryError> {
+    let mut components = name.split(':');
+    let first = components.next().unwrap_or_default();
+    let second = components.next();
+    let valid = valid_name_component(first)
+        && second.is_none_or(valid_name_component)
+        && components.next().is_none();
     if valid {
-        Ok(name)
+        Ok(())
     } else {
         Err(RegistryError::MalformedAlgorithmName {
             name: name.to_owned(),
         })
     }
+}
+
+fn validate_implementation_name(name: &str) -> Result<(), RegistryError> {
+    let mut components = name.split(':');
+    let valid = components.next().is_some_and(valid_name_component)
+        && components.next().is_some_and(valid_name_component)
+        && components.next().is_none();
+    if valid {
+        Ok(())
+    } else {
+        Err(RegistryError::MalformedImplementationName {
+            name: name.to_owned(),
+        })
+    }
+}
+
+fn valid_name_component(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
 }
 
 fn execute_sha256(_: &mut HashPrepared, operations: &mut [HashOperation<'_>]) {
