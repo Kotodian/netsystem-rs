@@ -14,7 +14,6 @@ use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
-use hammer_component_macros::{Aead, Cipher, Kdf, Kx, Mac, Sign, Verify};
 use hammer_infra::crypto::InstructionSet;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use zeroize::Zeroizing;
@@ -69,6 +68,53 @@ pub trait Family: private::Sealed + Sized + 'static {
 mod private {
     pub trait Sealed {}
 }
+
+mod families {
+    use super::*;
+    use hammer_component_macros::{Aead, Cipher, Hash, Kdf, Kx, Mac, Sign, Verify};
+
+    /// The hash operation family.
+    #[Hash]
+    #[derive(Debug)]
+    pub struct Hash;
+
+    /// The authenticated-encryption operation family.
+    #[Aead]
+    #[derive(Debug)]
+    pub struct Aead;
+
+    /// The message-authentication operation family.
+    #[Mac]
+    #[derive(Debug)]
+    pub struct Mac;
+
+    /// The key-derivation operation family.
+    #[Kdf]
+    #[derive(Debug)]
+    pub struct Kdf;
+
+    /// The key-establishment operation family.
+    #[Kx]
+    #[derive(Debug)]
+    pub struct Kx;
+
+    /// The digital-signing operation family.
+    #[Sign]
+    #[derive(Debug)]
+    pub struct Sign;
+
+    /// The digital-signature verification operation family.
+    #[Verify]
+    #[derive(Debug)]
+    pub struct Verify;
+
+    /// The unauthenticated-cipher operation family.
+    #[Cipher]
+    #[derive(Debug)]
+    pub struct Cipher;
+}
+
+pub use families::{Aead, Cipher, Hash, Kdf, Kx, Mac, Sign, Verify};
 
 struct OwnedState {
     value: NonNull<()>,
@@ -127,11 +173,6 @@ impl Drop for OwnedState {
     }
 }
 
-/// The hash operation family.
-#[hammer_component_macros::Hash]
-#[derive(Debug)]
-pub struct Hash;
-
 /// Prepared state for a hash Context.
 #[derive(Debug)]
 pub struct HashPrepared;
@@ -172,11 +213,6 @@ impl HashPrepared {
         Ok(())
     }
 }
-
-/// The authenticated-encryption operation family.
-#[Aead]
-#[derive(Debug)]
-pub struct Aead;
 
 /// Prepared state for an authenticated-encryption Context.
 #[derive(Debug)]
@@ -270,11 +306,6 @@ impl AeadPrepared {
     }
 }
 
-/// The message-authentication operation family.
-#[Mac]
-#[derive(Debug)]
-pub struct Mac;
-
 /// Prepared state for a message-authentication Context.
 #[derive(Debug)]
 pub struct MacPrepared {
@@ -298,11 +329,6 @@ impl MacPrepared {
         Ok(())
     }
 }
-
-/// The key-derivation operation family.
-#[Kdf]
-#[derive(Debug)]
-pub struct Kdf;
 
 /// Prepared state for a key-derivation Context.
 #[derive(Debug)]
@@ -358,11 +384,6 @@ impl KdfPrepared {
         Ok(())
     }
 }
-
-/// The key-establishment operation family.
-#[Kx]
-#[derive(Debug)]
-pub struct Kx;
 
 /// Prepared state for a key-establishment Context.
 #[derive(Debug)]
@@ -633,11 +654,6 @@ impl KxPrepared {
     }
 }
 
-/// The digital-signing operation family.
-#[Sign]
-#[derive(Debug)]
-pub struct Sign;
-
 /// Prepared state for a signing Context.
 pub struct SignPrepared {
     private_key: Zeroizing<Vec<u8>>,
@@ -672,11 +688,6 @@ impl SignPrepared {
     }
 }
 
-/// The digital-signature verification operation family.
-#[Verify]
-#[derive(Debug)]
-pub struct Verify;
-
 /// Prepared state for a verification Context.
 #[derive(Debug)]
 pub struct VerifyPrepared;
@@ -695,11 +706,6 @@ impl VerifyPrepared {
         Ok(())
     }
 }
-
-/// The unauthenticated-cipher operation family.
-#[Cipher]
-#[derive(Debug)]
-pub struct Cipher;
 
 bitflags::bitflags! {
     /// Input and output shapes supported by a cryptographic implementation.
