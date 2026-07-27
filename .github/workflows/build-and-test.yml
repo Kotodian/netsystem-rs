@@ -55,12 +55,27 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.96.0
+      - name: Install nextest [${{ matrix.platform }}]
+        uses: taiki-e/install-action@nextest
       - name: Cache Cargo [${{ matrix.platform }}]
         uses: Swatinem/rust-cache@v2
         with:
           key: workspace-build-${{ matrix.platform }}
       - name: Build workspace [${{ matrix.platform }}]
         run: cargo build --locked --workspace --all-targets
+      - name: Run doc tests [${{ matrix.platform }}]
+        run: cargo test --locked --workspace --doc
+      - name: Archive test binaries [${{ matrix.platform }}]
+        run: >-
+          cargo nextest archive --locked --workspace
+          --archive-file target/workspace-tests-${{ matrix.platform }}.tar.zst
+      - name: Upload test binaries [${{ matrix.platform }}]
+        uses: actions/upload-artifact@v4
+        with:
+          name: workspace-tests-${{ matrix.platform }}
+          path: target/workspace-tests-${{ matrix.platform }}.tar.zst
+          compression-level: 0
+          retention-days: 1
 
   clippy:
     name: Clippy [${{ matrix.platform }}]
@@ -91,10 +106,12 @@ jobs:
 
   workspace-tests:
     name: Workspace tests [${{ matrix.platform }}]
+    needs: workspace-build
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         include:
           - platform: Linux
@@ -104,13 +121,14 @@ jobs:
     steps:
       - name: Checkout [${{ matrix.platform }}]
         uses: actions/checkout@v4
-      - name: Install Rust [${{ matrix.platform }}]
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install nextest [${{ matrix.platform }}]
+        uses: taiki-e/install-action@nextest
+      - name: Download test binaries [${{ matrix.platform }}]
+        uses: actions/download-artifact@v4
         with:
-          toolchain: 1.96.0
-      - name: Cache Cargo [${{ matrix.platform }}]
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: workspace-tests-${{ matrix.platform }}
+          name: workspace-tests-${{ matrix.platform }}
+          path: .nextest-archive
       - name: Run workspace tests [${{ matrix.platform }}]
-        run: cargo test --locked --workspace
+        run: >-
+          cargo nextest run
+          --archive-file .nextest-archive/workspace-tests-${{ matrix.platform }}.tar.zst

@@ -13,34 +13,75 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  tcp-protocol-semantics:
-    name: TCP protocol semantics
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.96.0
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: tcp-protocol-semantics
-      - name: TCP connection, SACK/DSACK, RACK/TLP, keepalive, timer, BBR tests
-        run: cargo test --locked -p hammer-plugin-tcp
-      - name: Congestion controller state tests
-        run: cargo test --locked -p hammer-service transport::congestion
-      - name: Attach and session package tests
-        run: cargo test --locked -p hammer-app -p hammer-runtime
-
-  tun:
-    name: TUN ${{ matrix.scenario }} [${{ matrix.platform }}]
+  tcp-lab-binaries:
+    name: TCP lab binaries [${{ matrix.platform }}]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
+      matrix:
+        include:
+          - platform: Linux
+            runner: ubuntu-24.04
+          - platform: macOS
+            runner: macos-15
+    steps:
+      - name: Checkout [${{ matrix.platform }}]
+        uses: actions/checkout@v4
+      - name: Install Rust [${{ matrix.platform }}]
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+      - name: Cache Cargo [${{ matrix.platform }}]
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: tcp-lab-binaries-${{ matrix.platform }}
+      - name: Build TCP lab binaries [${{ matrix.platform }}]
+        run: |
+          cargo build --locked \
+            -p hammer \
+            -p hammerctl \
+            -p hammer-plugin-tun \
+            -p hammer-plugin-ip \
+            -p hammer-plugin-tcp \
+            -p hammer-plugin-udp
+          cargo build --locked -p hammer --example tun_tcp_echo
+      - name: Package TCP lab binaries [${{ matrix.platform }}]
+        run: |
+          set -euo pipefail
+          package="$RUNNER_TEMP/tcp-lab-binaries"
+          mkdir -p "$package/bin" "$package/plugins" "$package/rustlib"
+          cp target/debug/hammer target/debug/hammerctl "$package/bin/"
+          cp target/debug/examples/tun_tcp_echo "$package/bin/"
+          case "$RUNNER_OS" in
+            Linux) plugin_extension=so ;;
+            macOS) plugin_extension=dylib ;;
+          esac
+          cp target/debug/libhammer_plugin_tun."$plugin_extension" "$package/plugins/"
+          cp target/debug/libhammer_plugin_ip."$plugin_extension" "$package/plugins/"
+          cp target/debug/libhammer_plugin_tcp."$plugin_extension" "$package/plugins/"
+          cp target/debug/libhammer_plugin_udp."$plugin_extension" "$package/plugins/"
+          rust_libdir="$(rustc --print target-libdir)"
+          find "$rust_libdir" -maxdepth 1 -type f \
+            \( -name '*.so' -o -name '*.dylib' \) \
+            -exec cp {} "$package/rustlib/" \;
+          tar -C "$package" -czf "$RUNNER_TEMP/tcp-lab-binaries-${{ matrix.platform }}.tar.gz" .
+      - name: Upload TCP lab binaries [${{ matrix.platform }}]
+        uses: actions/upload-artifact@v4
+        with:
+          name: tcp-lab-binaries-${{ matrix.platform }}
+          path: ${{ runner.temp }}/tcp-lab-binaries-${{ matrix.platform }}.tar.gz
+          compression-level: 0
+          retention-days: 1
+
+  tun:
+    name: TUN ${{ matrix.scenario }} [${{ matrix.platform }}]
+    needs: tcp-lab-binaries
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 1
       matrix:
         include:
           - scenario: attached-echo-keepalive
@@ -130,36 +171,24 @@ jobs:
     steps:
       - name: Checkout [${{ matrix.id }}]
         uses: actions/checkout@v4
-      - name: Install Rust [${{ matrix.id }}]
-        uses: dtolnay/rust-toolchain@stable
+      - name: Download TCP lab binaries [${{ matrix.id }}]
+        uses: actions/download-artifact@v4
         with:
-          toolchain: 1.96.0
-      - name: Cache Cargo [${{ matrix.id }}]
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: tcp-integration-${{ matrix.id }}
+          name: tcp-lab-binaries-${{ matrix.platform }}
+          path: ${{ runner.temp }}/tcp-lab-download
+      - name: Extract TCP lab binaries [${{ matrix.id }}]
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/tcp-lab-binaries"
+          tar -C "$RUNNER_TEMP/tcp-lab-binaries" -xzf \
+            "$RUNNER_TEMP/tcp-lab-download/tcp-lab-binaries-${{ matrix.platform }}.tar.gz"
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/tcp-lab-binaries/rustlib" >> "$GITHUB_ENV"
+          echo "DYLD_LIBRARY_PATH=$RUNNER_TEMP/tcp-lab-binaries/rustlib" >> "$GITHUB_ENV"
       - name: Prepare diagnostics [${{ matrix.id }}]
         run: |
           set -euo pipefail
           echo "TCP_TEST_DIAGNOSTICS=$RUNNER_TEMP/hammer-tcp-integration" >> "$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/hammer-tcp-integration"
-      - name: Build TCP integration binaries [${{ matrix.id }}]
-        run: |
-          cargo build --locked \
-            -p hammer \
-            -p hammerctl \
-            -p hammer-plugin-tun \
-            -p hammer-plugin-ip \
-            -p hammer-plugin-tcp \
-            -p hammer-plugin-udp
-          cargo build --locked -p hammer --example tun_tcp_echo
-      - name: Locate Rust runtime libraries [${{ matrix.id }}]
-        id: rust_runtime
-        run: |
-          rust_libdir="$(rustc --print target-libdir)"
-          echo "libdir=$rust_libdir" >> "$GITHUB_OUTPUT"
-          echo "LD_LIBRARY_PATH=$rust_libdir" >> "$GITHUB_ENV"
-          echo "DYLD_LIBRARY_PATH=$rust_libdir" >> "$GITHUB_ENV"
       - name: Generate scenario config [${{ matrix.id }}]
         run: |
           set -euo pipefail
@@ -196,9 +225,9 @@ jobs:
           echo "before=$(ifconfig -l)" >> "$GITHUB_OUTPUT"
       - name: Start Hammer [${{ matrix.id }}]
         env:
-          HAMMER_BINARY: ${{ github.workspace }}/target/debug/hammer
-          HAMMER_PLUGIN_DIR: ${{ github.workspace }}/target/debug
-          HAMMER_RUST_LIBDIR: ${{ steps.rust_runtime.outputs.libdir }}
+          HAMMER_BINARY: ${{ runner.temp }}/tcp-lab-binaries/bin/hammer
+          HAMMER_PLUGIN_DIR: ${{ runner.temp }}/tcp-lab-binaries/plugins
+          HAMMER_RUST_LIBDIR: ${{ runner.temp }}/tcp-lab-binaries/rustlib
         run: |
           set -euo pipefail
           if [[ ! -x "$HAMMER_BINARY" ]]; then
@@ -335,8 +364,8 @@ jobs:
           fi
       - name: Start attached echo app [${{ matrix.id }}]
         env:
-          ECHO_BINARY: ${{ github.workspace }}/target/debug/examples/tun_tcp_echo
-          HAMMER_RUST_LIBDIR: ${{ steps.rust_runtime.outputs.libdir }}
+          ECHO_BINARY: ${{ runner.temp }}/tcp-lab-binaries/bin/tun_tcp_echo
+          HAMMER_RUST_LIBDIR: ${{ runner.temp }}/tcp-lab-binaries/rustlib
         run: |
           set -euo pipefail
           if [[ ! -x "$ECHO_BINARY" ]]; then
@@ -370,7 +399,8 @@ jobs:
       - name: Capture state before probe [${{ matrix.id }}]
         run: |
           set +e
-          target/debug/hammerctl --addr "$TCP_TEST_IPC_ADDRESS" status \
+          "$RUNNER_TEMP/tcp-lab-binaries/bin/hammerctl" \
+            --addr "$TCP_TEST_IPC_ADDRESS" status \
             > "$TCP_TEST_DIAGNOSTICS/status-before.txt" 2>&1
           sudo -n ps -ww -o pid,ppid,state,%cpu,%mem,etime,command -p "$HAMMER_PID" \
             > "$TCP_TEST_DIAGNOSTICS/process-before-probe.txt" 2>&1
@@ -481,7 +511,8 @@ jobs:
                 limit rate 1/hour burst 1 packets counter drop
               ;;
           esac
-          target/debug/hammerctl --addr "$TCP_TEST_IPC_ADDRESS" status \
+          "$RUNNER_TEMP/tcp-lab-binaries/bin/hammerctl" \
+            --addr "$TCP_TEST_IPC_ADDRESS" status \
             > "$TCP_TEST_DIAGNOSTICS/status-before-fault.txt" 2>&1 || true
           touch "$continue_file"
           probe_status=0
@@ -503,7 +534,8 @@ jobs:
         if: always()
         run: |
           set +e
-          target/debug/hammerctl --addr "$TCP_TEST_IPC_ADDRESS" status \
+          "$RUNNER_TEMP/tcp-lab-binaries/bin/hammerctl" \
+            --addr "$TCP_TEST_IPC_ADDRESS" status \
             > "$TCP_TEST_DIAGNOSTICS/status-after.txt" 2>&1
           sudo -n ps -ww -o pid,ppid,state,%cpu,%mem,etime,command -p "${HAMMER_PID:-0}" \
             > "$TCP_TEST_DIAGNOSTICS/process-after-probe.txt" 2>&1
