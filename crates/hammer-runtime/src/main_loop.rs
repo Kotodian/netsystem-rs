@@ -1,4 +1,3 @@
-use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::task::Context;
@@ -12,16 +11,6 @@ use crate::barrier;
 use crate::engine::Engine;
 use crate::spawn;
 use crate::spawn::{DATA_LOCAL_DRIVER_WAKER, DATA_WORKER_IDLE_SLICE, with_data_plane_runtime};
-
-/// Borrowed view of the File poller wake descriptor; the poller owns the fd
-/// for the engine's whole lifetime, which outlives the main loop.
-struct IoWakeFd(RawFd);
-
-impl AsRawFd for IoWakeFd {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0
-    }
-}
 
 /// VPP-style fixed-schedule engine main loop.
 ///
@@ -55,14 +44,23 @@ pub fn engine_main_loop(
 
     let io_wake = {
         let _reactor = runtime.enter();
-        let wake_fd = IoWakeFd(engine.file_main().io_wake_fd());
-        match AsyncFd::with_interest(wake_fd, Interest::READABLE) {
-            Ok(wake) => Some(wake),
+        match engine.file_main().io_wake_fd() {
+            Ok(wake_fd) => match AsyncFd::with_interest(wake_fd, Interest::READABLE) {
+                Ok(wake) => Some(wake),
+                Err(error) => {
+                    tracing::warn!(
+                        worker = engine.thread_index,
+                        %error,
+                        "File wake fd registration failed; idle sleep is fixed-slice"
+                    );
+                    None
+                }
+            },
             Err(error) => {
                 tracing::warn!(
                     worker = engine.thread_index,
                     %error,
-                    "File wake fd registration failed; idle sleep is fixed-slice"
+                    "File wake fd duplication failed; idle sleep is fixed-slice"
                 );
                 None
             }

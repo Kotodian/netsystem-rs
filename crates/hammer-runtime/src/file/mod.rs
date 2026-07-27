@@ -194,8 +194,13 @@ impl FileMain {
 
     /// Descriptor that becomes readable when File readiness is pending, so an
     /// idle main loop can sleep in the tokio reactor yet wake for I/O.
-    pub(crate) fn io_wake_fd(&self) -> RawFd {
-        self.poller.wake_fd()
+    pub(crate) fn io_wake_fd(&self) -> RuntimeResult<OwnedFd> {
+        self.poller
+            .try_clone_wake()
+            .map_err(|source| RuntimeError::FilePollerIo {
+                operation: "duplicate worker File wake descriptor",
+                source,
+            })
     }
 
     /// Consumes the wake signal after an idle wake-up; the next [`Self::poll`]

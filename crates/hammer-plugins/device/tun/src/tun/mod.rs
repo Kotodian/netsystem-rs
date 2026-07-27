@@ -661,8 +661,9 @@ impl TunWorkerRuntime {
         if refill_pending {
             // The readiness edge is consumed: io_uring posts no new completion
             // until the peer transmits again, so a frame-limited pass must
-            // re-raise its own interrupt to keep draining, like VPP virtio
-            // input empties the whole vring per dispatch.
+            // schedule another drain. VPP af-packet similarly retains
+            // `is_rx_pending` and keeps its input node polling when a frame
+            // cannot consume the whole ready block.
             runtime.set_node_interrupt_pending(self.input_node)?;
         }
         Ok(())

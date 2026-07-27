@@ -1,5 +1,5 @@
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use crate::error::{RuntimeError, RuntimeResult};
 use hammer_infra::pool::Index;
@@ -83,8 +83,8 @@ impl Poller {
     /// Becomes readable whenever the ring posts a completion; lets the idle
     /// loop sleep in the tokio reactor yet wake on File readiness, matching
     /// VPP sleeping inside `epoll_wait` (`vlib_file_poll`).
-    pub(super) fn wake_fd(&self) -> RawFd {
-        self.wake.as_raw_fd()
+    pub(super) fn try_clone_wake(&self) -> io::Result<OwnedFd> {
+        self.wake.try_clone()
     }
 
     pub(super) fn clear_wake(&self) {
