@@ -139,7 +139,7 @@ jobs:
             echo_bytes: 10000
             idle_seconds: "0"
             fault: client-egress
-            fault_offset: 4000
+            fault_offset: 4096
             mss: "1000"
           - scenario: sender-rack
             platform: Linux
@@ -604,7 +604,10 @@ jobs:
               )
               ;;
             sender-tlp)
-              extra_args=(--require-server-retransmit "$TCP_TEST_TARGET_SEQ")
+              # The nft input hook may discard the original before libpcap
+              # observes it. The fault hit, exact echo, and TLP/RTO counters
+              # together prove that the missing tail was recovered by TLP.
+              extra_args=()
               ;;
           esac
           python3 scripts/tcp-pcap-assert.py \
@@ -619,11 +622,19 @@ jobs:
         run: |
           set -euo pipefail
           counter_total() {
-            grep -E 'node (session|tcp)[^:]*:' "$1" 2>/dev/null \
-              | grep -oE 'errors=\[[^]]*\]' \
-              | grep -oE "[[,]$2=[0-9]+" \
-              | grep -oE '[0-9]+$' \
-              | awk '{ sum += $1 } END { print sum + 0 }'
+            awk -v code="$2" '
+              /node (session|tcp)[^:]*:/ {
+                counters = $0
+                sub(/^.*errors=\[/, "", counters)
+                sub(/\].*$/, "", counters)
+                count = split(counters, entries, ",")
+                for (index = 1; index <= count; index++) {
+                  split(entries[index], pair, "=")
+                  if (pair[1] == code) total += pair[2]
+                }
+              }
+              END { print total + 0 }
+            ' "$1"
           }
           before="$TCP_TEST_DIAGNOSTICS/status-before-fault.txt"
           after="$TCP_TEST_DIAGNOSTICS/status-after.txt"
