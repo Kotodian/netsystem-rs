@@ -34,7 +34,11 @@ pub trait Family: private::Sealed + Sized + 'static {
     fn registry_mut(engine: &mut Engine) -> &mut FamilyRegistry<Self>;
 
     #[doc(hidden)]
-    fn prepare_unkeyed(prepare: Self::Prepare) -> Option<Self::Prepared>;
+    fn prepare_unkeyed(
+        prepare: Self::Prepare,
+        engine: &Engine,
+        algorithm: AlgorithmId<Self>,
+    ) -> Option<Self::Prepared>;
 
     #[doc(hidden)]
     fn key_operations() -> KeyOperations {
@@ -82,7 +86,11 @@ impl Family for Hash {
         &mut engine.hashes
     }
 
-    fn prepare_unkeyed(_: Self::Prepare) -> Option<Self::Prepared> {
+    fn prepare_unkeyed(
+        _: Self::Prepare,
+        _: &Engine,
+        _: AlgorithmId<Self>,
+    ) -> Option<Self::Prepared> {
         Some(())
     }
 }
@@ -141,7 +149,11 @@ impl Family for Aead {
         &mut engine.aeads
     }
 
-    fn prepare_unkeyed(_: Self::Prepare) -> Option<Self::Prepared> {
+    fn prepare_unkeyed(
+        _: Self::Prepare,
+        _: &Engine,
+        _: AlgorithmId<Self>,
+    ) -> Option<Self::Prepared> {
         None
     }
 
@@ -197,7 +209,11 @@ impl Family for Mac {
         &mut engine.macs
     }
 
-    fn prepare_unkeyed(_: Self::Prepare) -> Option<Self::Prepared> {
+    fn prepare_unkeyed(
+        _: Self::Prepare,
+        _: &Engine,
+        _: AlgorithmId<Self>,
+    ) -> Option<Self::Prepared> {
         None
     }
 
@@ -264,7 +280,11 @@ impl Family for Kdf {
         &mut engine.kdfs
     }
 
-    fn prepare_unkeyed(_: Self::Prepare) -> Option<Self::Prepared> {
+    fn prepare_unkeyed(
+        _: Self::Prepare,
+        _: &Engine,
+        _: AlgorithmId<Self>,
+    ) -> Option<Self::Prepared> {
         None
     }
 
@@ -286,6 +306,287 @@ impl Family for Kdf {
             policy,
             Rc::clone(&engine.keys),
         ))
+    }
+}
+
+/// The key-establishment operation family.
+#[derive(Debug)]
+pub struct Kx;
+
+/// Prepared state for a key-establishment Context.
+#[derive(Debug)]
+pub struct KxPrepared {
+    algorithm: hammer_infra::crypto::KeyEstablishmentAlgorithm,
+    policy_algorithm: PolicyAlgorithm,
+    keys: Rc<RefCell<Pool<KeyEntry>>>,
+}
+
+impl KxPrepared {
+    fn new(
+        algorithm: hammer_infra::crypto::KeyEstablishmentAlgorithm,
+        policy_algorithm: AlgorithmId<Kx>,
+        keys: Rc<RefCell<Pool<KeyEntry>>>,
+    ) -> Self {
+        Self {
+            algorithm,
+            policy_algorithm: PolicyAlgorithm::new(policy_algorithm),
+            keys,
+        }
+    }
+
+    fn execute(&mut self, operations: &mut [KxOperation<'_>]) {
+        for operation in operations {
+            operation.status = match &mut operation.request {
+                KxRequest::Generate { policy, public_key } => {
+                    self.generate_keypair(policy, public_key)
+                }
+                KxRequest::Agree {
+                    private_key,
+                    peer_public_key,
+                    target,
+                } => self.agree(*private_key, peer_public_key, *target),
+                KxRequest::Encapsulate {
+                    peer_public_key,
+                    policy,
+                    ciphertext,
+                } => self.encapsulate(peer_public_key, policy, ciphertext),
+                KxRequest::Decapsulate {
+                    private_key,
+                    ciphertext,
+                    target,
+                } => self.decapsulate(*private_key, ciphertext, *target),
+            };
+        }
+    }
+
+    fn generate_keypair(&self, policy: &KeyPolicy, public_key: &mut [u8]) -> KxStatus {
+        if !policy.applies_to(self.policy_algorithm) {
+            return KxStatus::GenerationPolicyDenied;
+        }
+
+        let public_len = self.algorithm.public_key_len();
+        if public_key.len() < public_len {
+            return KxStatus::OutputTooSmall {
+                output: hammer_infra::crypto::KeyEstablishmentOutput::PublicKey,
+                required: public_len,
+                provided: public_key.len(),
+            };
+        }
+        if let Some(capacity) = self.full_key_pool_capacity() {
+            return KxStatus::KeyPoolFull { capacity };
+        }
+
+        let mut entropy = Zeroizing::new(vec![0; self.algorithm.key_generation_entropy_len()]);
+        let mut private_key = Zeroizing::new(vec![0; self.algorithm.private_key_len()]);
+        let mut public_key_result = vec![0; public_len];
+        loop {
+            if let Err(source) = getrandom::getrandom(&mut entropy) {
+                return KxStatus::EntropyUnavailable { source };
+            }
+            match hammer_infra::crypto::generate_keypair(
+                self.algorithm,
+                &entropy,
+                &mut private_key,
+                &mut public_key_result,
+            ) {
+                Ok(()) => break,
+                Err(hammer_infra::crypto::KeyEstablishmentError::InvalidPrivateKey) => continue,
+                Err(error) => return kx_status(error),
+            }
+        }
+
+        let key = match self.install_key(private_key, policy.clone()) {
+            Ok(key) => key,
+            Err(status) => return status,
+        };
+        public_key[..public_len].copy_from_slice(&public_key_result);
+        KxStatus::Generated {
+            key,
+            public_written: public_len,
+        }
+    }
+
+    fn agree(
+        &self,
+        private_key: KeyHandle,
+        peer_public_key: &[u8],
+        target: PolicyAlgorithm,
+    ) -> KxStatus {
+        let mut shared_secret = Zeroizing::new(vec![0; self.algorithm.shared_secret_len()]);
+        let policy = {
+            let keys = self.keys.borrow();
+            let Some(entry) = keys.get(private_key.index) else {
+                return KxStatus::StaleKey { key: private_key };
+            };
+            if !entry.policy.applies_to(self.policy_algorithm)
+                || !entry.policy.operations.contains(KeyOperations::KX_AGREE)
+            {
+                return KxStatus::PolicyDenied { key: private_key };
+            }
+            let Some(policy) = entry.policy.derived_policy(target) else {
+                return KxStatus::DerivationDenied { key: private_key };
+            };
+            if keys.len() == keys.capacity() {
+                return KxStatus::KeyPoolFull {
+                    capacity: keys.capacity(),
+                };
+            }
+            if let Err(error) = hammer_infra::crypto::agree(
+                self.algorithm,
+                &entry.material,
+                peer_public_key,
+                &mut shared_secret,
+            ) {
+                return kx_status(error);
+            }
+            policy
+        };
+
+        match self.install_key(shared_secret, policy) {
+            Ok(key) => KxStatus::SharedSecret { key },
+            Err(status) => status,
+        }
+    }
+
+    fn encapsulate(
+        &self,
+        peer_public_key: &[u8],
+        policy: &KeyPolicy,
+        ciphertext: &mut [u8],
+    ) -> KxStatus {
+        let Some(ciphertext_len) = self.algorithm.ciphertext_len() else {
+            return KxStatus::OperationUnsupported;
+        };
+        if ciphertext.len() < ciphertext_len {
+            return KxStatus::OutputTooSmall {
+                output: hammer_infra::crypto::KeyEstablishmentOutput::Ciphertext,
+                required: ciphertext_len,
+                provided: ciphertext.len(),
+            };
+        }
+        if let Some(capacity) = self.full_key_pool_capacity() {
+            return KxStatus::KeyPoolFull { capacity };
+        }
+
+        let mut entropy = Zeroizing::new(vec![0; 32]);
+        if let Err(source) = getrandom::getrandom(&mut entropy) {
+            return KxStatus::EntropyUnavailable { source };
+        }
+        let mut ciphertext_result = vec![0; ciphertext_len];
+        let mut shared_secret = Zeroizing::new(vec![0; self.algorithm.shared_secret_len()]);
+        if let Err(error) = hammer_infra::crypto::encapsulate(
+            self.algorithm,
+            peer_public_key,
+            &entropy,
+            &mut ciphertext_result,
+            &mut shared_secret,
+        ) {
+            return kx_status(error);
+        }
+
+        let key = match self.install_key(shared_secret, policy.clone()) {
+            Ok(key) => key,
+            Err(status) => return status,
+        };
+        ciphertext[..ciphertext_len].copy_from_slice(&ciphertext_result);
+        KxStatus::Encapsulated {
+            key,
+            ciphertext_written: ciphertext_len,
+        }
+    }
+
+    fn decapsulate(
+        &self,
+        private_key: KeyHandle,
+        ciphertext: &[u8],
+        target: PolicyAlgorithm,
+    ) -> KxStatus {
+        let mut shared_secret = Zeroizing::new(vec![0; self.algorithm.shared_secret_len()]);
+        let policy = {
+            let keys = self.keys.borrow();
+            let Some(entry) = keys.get(private_key.index) else {
+                return KxStatus::StaleKey { key: private_key };
+            };
+            if !entry.policy.applies_to(self.policy_algorithm)
+                || !entry
+                    .policy
+                    .operations
+                    .contains(KeyOperations::KX_DECAPSULATE)
+            {
+                return KxStatus::PolicyDenied { key: private_key };
+            }
+            let Some(policy) = entry.policy.derived_policy(target) else {
+                return KxStatus::DerivationDenied { key: private_key };
+            };
+            if keys.len() == keys.capacity() {
+                return KxStatus::KeyPoolFull {
+                    capacity: keys.capacity(),
+                };
+            }
+            if let Err(error) = hammer_infra::crypto::decapsulate(
+                self.algorithm,
+                &entry.material,
+                ciphertext,
+                &mut shared_secret,
+            ) {
+                return kx_status(error);
+            }
+            policy
+        };
+
+        match self.install_key(shared_secret, policy) {
+            Ok(key) => KxStatus::SharedSecret { key },
+            Err(status) => status,
+        }
+    }
+
+    fn full_key_pool_capacity(&self) -> Option<usize> {
+        let keys = self.keys.borrow();
+        (keys.len() == keys.capacity()).then_some(keys.capacity())
+    }
+
+    fn install_key(
+        &self,
+        material: Zeroizing<Vec<u8>>,
+        policy: KeyPolicy,
+    ) -> Result<KeyHandle, KxStatus> {
+        let mut keys = self.keys.borrow_mut();
+        let capacity = keys.capacity();
+        let index = keys
+            .insert(KeyEntry {
+                material,
+                policy,
+                contexts: 0,
+            })
+            .ok_or(KxStatus::KeyPoolFull { capacity })?;
+        Ok(KeyHandle { index })
+    }
+}
+
+impl private::Sealed for Kx {}
+
+impl Family for Kx {
+    type Operation<'a> = KxOperation<'a>;
+    type Prepared = KxPrepared;
+    type Prepare = hammer_infra::crypto::KeyEstablishmentAlgorithm;
+    type Dispatch = for<'a> fn(&mut KxPrepared, &mut [KxOperation<'a>]);
+
+    const KEY_FAMILY: u8 = 6;
+
+    fn registry(engine: &Engine) -> &FamilyRegistry<Self> {
+        &engine.key_exchanges
+    }
+
+    fn registry_mut(engine: &mut Engine) -> &mut FamilyRegistry<Self> {
+        &mut engine.key_exchanges
+    }
+
+    fn prepare_unkeyed(
+        prepare: Self::Prepare,
+        engine: &Engine,
+        algorithm: AlgorithmId<Self>,
+    ) -> Option<Self::Prepared> {
+        Some(KxPrepared::new(prepare, algorithm, Rc::clone(&engine.keys)))
     }
 }
 
@@ -313,7 +614,11 @@ macro_rules! define_pending_family {
                 &mut engine.$field
             }
 
-            fn prepare_unkeyed(_: Self::Prepare) -> Option<Self::Prepared> {
+            fn prepare_unkeyed(
+                _: Self::Prepare,
+                _: &Engine,
+                _: AlgorithmId<Self>,
+            ) -> Option<Self::Prepared> {
                 None
             }
         }
@@ -321,7 +626,6 @@ macro_rules! define_pending_family {
 }
 
 define_pending_family!(Cipher, ciphers, 3);
-define_pending_family!(Kx, key_exchanges, 6);
 define_pending_family!(Sign, signers, 7);
 define_pending_family!(Verify, verifiers, 8);
 
@@ -788,6 +1092,190 @@ impl<'a> KdfOperation<'a> {
     }
 }
 
+/// The independent completion state of one key-establishment operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KxStatus {
+    /// The operation has not yet been executed.
+    Pending,
+    /// A private key was installed and its public key was written.
+    Generated {
+        /// Opaque identity of the generated private key.
+        key: KeyHandle,
+        /// Number of public-key bytes written.
+        public_written: usize,
+    },
+    /// A shared secret was installed in the Engine key authority.
+    SharedSecret {
+        /// Opaque identity of the established secret.
+        key: KeyHandle,
+    },
+    /// An ML-KEM secret was installed and its ciphertext was written.
+    Encapsulated {
+        /// Opaque identity of the encapsulated secret.
+        key: KeyHandle,
+        /// Number of ciphertext bytes written.
+        ciphertext_written: usize,
+    },
+    /// A generated private-key policy names a different algorithm.
+    GenerationPolicyDenied,
+    /// A referenced Key Handle is stale.
+    StaleKey {
+        /// Rejected key identity.
+        key: KeyHandle,
+    },
+    /// A private-key policy does not permit the requested operation.
+    PolicyDenied {
+        /// Rejected private-key identity.
+        key: KeyHandle,
+    },
+    /// A private-key policy does not permit the requested shared-secret policy.
+    DerivationDenied {
+        /// Rejected private-key identity.
+        key: KeyHandle,
+    },
+    /// Private-key material is invalid for the selected algorithm.
+    InvalidPrivateKey,
+    /// Private-key material has the wrong serialized length.
+    InvalidPrivateKeyLength {
+        /// Required private-key bytes.
+        required: usize,
+        /// Supplied private-key bytes.
+        provided: usize,
+    },
+    /// Peer public-key input is invalid for the selected algorithm.
+    InvalidPeerPublicKey,
+    /// Peer public-key input has the wrong serialized length.
+    InvalidPeerPublicKeyLength {
+        /// Required public-key bytes.
+        required: usize,
+        /// Supplied public-key bytes.
+        provided: usize,
+    },
+    /// X25519 rejected a non-contributory peer public key.
+    SmallOrderPeerPublicKey,
+    /// ML-KEM ciphertext input has an invalid length.
+    InvalidCiphertext {
+        /// Required ciphertext bytes.
+        required: usize,
+        /// Supplied ciphertext bytes.
+        provided: usize,
+    },
+    /// Caller output cannot hold the complete public result.
+    OutputTooSmall {
+        /// Rejected output role.
+        output: hammer_infra::crypto::KeyEstablishmentOutput,
+        /// Required output bytes.
+        required: usize,
+        /// Supplied output bytes.
+        provided: usize,
+    },
+    /// The operating system could not provide cryptographic entropy.
+    EntropyUnavailable {
+        /// Original entropy-source failure.
+        source: getrandom::Error,
+    },
+    /// The Engine key authority has no free slot for the result.
+    KeyPoolFull {
+        /// Configured fixed capacity.
+        capacity: usize,
+    },
+    /// The selected algorithm does not define this operation.
+    OperationUnsupported,
+}
+
+#[derive(Debug)]
+enum KxRequest<'a> {
+    Generate {
+        policy: KeyPolicy,
+        public_key: &'a mut [u8],
+    },
+    Agree {
+        private_key: KeyHandle,
+        peer_public_key: &'a [u8],
+        target: PolicyAlgorithm,
+    },
+    Encapsulate {
+        peer_public_key: &'a [u8],
+        policy: KeyPolicy,
+        ciphertext: &'a mut [u8],
+    },
+    Decapsulate {
+        private_key: KeyHandle,
+        ciphertext: &'a [u8],
+        target: PolicyAlgorithm,
+    },
+}
+
+/// One synchronous key-establishment request.
+#[derive(Debug)]
+pub struct KxOperation<'a> {
+    request: KxRequest<'a>,
+    status: KxStatus,
+}
+
+impl<'a> KxOperation<'a> {
+    /// Creates a pending private-key generation operation.
+    pub fn generate_keypair(policy: KeyPolicy, public_key: &'a mut [u8]) -> Self {
+        Self {
+            request: KxRequest::Generate { policy, public_key },
+            status: KxStatus::Pending,
+        }
+    }
+
+    /// Creates a pending ECDH agreement operation.
+    pub fn agree<F: Family>(
+        private_key: KeyHandle,
+        peer_public_key: &'a [u8],
+        target: AlgorithmId<F>,
+    ) -> Self {
+        Self {
+            request: KxRequest::Agree {
+                private_key,
+                peer_public_key,
+                target: PolicyAlgorithm::new(target),
+            },
+            status: KxStatus::Pending,
+        }
+    }
+
+    /// Creates a pending ML-KEM encapsulation operation.
+    pub fn encapsulate(
+        peer_public_key: &'a [u8],
+        policy: KeyPolicy,
+        ciphertext: &'a mut [u8],
+    ) -> Self {
+        Self {
+            request: KxRequest::Encapsulate {
+                peer_public_key,
+                policy,
+                ciphertext,
+            },
+            status: KxStatus::Pending,
+        }
+    }
+
+    /// Creates a pending ML-KEM decapsulation operation.
+    pub fn decapsulate<F: Family>(
+        private_key: KeyHandle,
+        ciphertext: &'a [u8],
+        target: AlgorithmId<F>,
+    ) -> Self {
+        Self {
+            request: KxRequest::Decapsulate {
+                private_key,
+                ciphertext,
+                target: PolicyAlgorithm::new(target),
+            },
+            status: KxStatus::Pending,
+        }
+    }
+
+    /// Returns this operation's independent completion state.
+    pub fn status(&self) -> KxStatus {
+        self.status
+    }
+}
+
 /// The authenticated-encryption operation being requested.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AeadDirection {
@@ -967,6 +1455,10 @@ bitflags::bitflags! {
         const DERIVE = 1 << 2;
         /// Compute a message authenticator.
         const MAC_AUTHENTICATE = 1 << 3;
+        /// Establish an ECDH shared secret.
+        const KX_AGREE = 1 << 4;
+        /// Decapsulate an ML-KEM shared secret.
+        const KX_DECAPSULATE = 1 << 5;
     }
 }
 
@@ -1044,6 +1536,10 @@ impl KeyPolicy {
 
     fn permits<F: Family>(&self, algorithm: AlgorithmId<F>) -> bool {
         self.family == F::KEY_FAMILY && self.algorithm == algorithm.slot
+    }
+
+    fn applies_to(&self, algorithm: PolicyAlgorithm) -> bool {
+        self.family == algorithm.family && self.algorithm == algorithm.algorithm
     }
 
     fn derived_policy(&self, target: PolicyAlgorithm) -> Option<Self> {
@@ -1145,6 +1641,7 @@ impl Engine {
         let aead_capabilities =
             hash_capabilities | Capabilities::IN_PLACE | Capabilities::ASSOCIATED_DATA;
         let kdf_capabilities = Capabilities::CONTIGUOUS_INPUT | Capabilities::SCATTER_INPUT;
+        let kx_capabilities = Capabilities::CONTIGUOUS_INPUT | Capabilities::OUT_OF_PLACE;
         let mut engine = Self::new();
         engine.publish(
             Registration::new()
@@ -1285,6 +1782,43 @@ impl Engine {
                         ),
                 ),
         )?;
+        engine.publish(
+            Registration::new()
+                .with_algorithm(AlgorithmRegistration::<Kx>::new("x25519", kx_capabilities))
+                .with_algorithm(AlgorithmRegistration::<Kx>::new("p-256", kx_capabilities))
+                .with_algorithm(AlgorithmRegistration::<Kx>::new("p-384", kx_capabilities))
+                .with_algorithm(AlgorithmRegistration::<Kx>::new(
+                    "ml-kem-768",
+                    kx_capabilities,
+                ))
+                .with_implementation(
+                    ImplementationRegistration::<Kx>::new("hammer:kx-portable", 0, true)
+                        .with_algorithm(
+                            "x25519",
+                            kx_capabilities,
+                            hammer_infra::crypto::KeyEstablishmentAlgorithm::X25519,
+                            KxPrepared::execute,
+                        )
+                        .with_algorithm(
+                            "p-256",
+                            kx_capabilities,
+                            hammer_infra::crypto::KeyEstablishmentAlgorithm::P256,
+                            KxPrepared::execute,
+                        )
+                        .with_algorithm(
+                            "p-384",
+                            kx_capabilities,
+                            hammer_infra::crypto::KeyEstablishmentAlgorithm::P384,
+                            KxPrepared::execute,
+                        )
+                        .with_algorithm(
+                            "ml-kem-768",
+                            kx_capabilities,
+                            hammer_infra::crypto::KeyEstablishmentAlgorithm::MlKem768,
+                            KxPrepared::execute,
+                        ),
+                ),
+        )?;
         Ok(engine)
     }
 
@@ -1342,9 +1876,10 @@ impl Engine {
             .ok_or(ContextError::AlgorithmUnavailable {
                 algorithm: algorithm.slot,
             })?;
-        let prepared = F::prepare_unkeyed(prepare).ok_or(ContextError::KeyRequired {
-            algorithm: algorithm.slot,
-        })?;
+        let prepared =
+            F::prepare_unkeyed(prepare, self, algorithm).ok_or(ContextError::KeyRequired {
+                algorithm: algorithm.slot,
+            })?;
         Ok(Context {
             algorithm,
             implementation: implementation.to_owned(),
@@ -1586,6 +2121,18 @@ impl Context<Kdf> {
 
     /// Returns the algorithm permanently bound to this Context.
     pub fn algorithm(&self) -> AlgorithmId<Kdf> {
+        self.algorithm
+    }
+}
+
+impl Context<Kx> {
+    /// Executes all operations synchronously through one batch dispatch.
+    pub fn execute(&mut self, batch: &mut Batch<'_, '_, Kx>) {
+        (self.dispatch)(&mut self.prepared, batch.operations);
+    }
+
+    /// Returns the algorithm permanently bound to this Context.
+    pub fn algorithm(&self) -> AlgorithmId<Kx> {
         self.algorithm
     }
 }
@@ -2047,6 +2594,47 @@ fn execute_hkdf(prepared: &mut KdfPrepared, operations: &mut [KdfOperation<'_>])
         operation.status = KdfStatus::Complete {
             key: KeyHandle { index },
         };
+    }
+}
+
+fn kx_status(error: hammer_infra::crypto::KeyEstablishmentError) -> KxStatus {
+    match error {
+        hammer_infra::crypto::KeyEstablishmentError::InvalidEntropyLength { .. } => {
+            unreachable!("key-establishment entropy storage has the required length")
+        }
+        hammer_infra::crypto::KeyEstablishmentError::InvalidPrivateKeyLength {
+            required,
+            provided,
+        } => KxStatus::InvalidPrivateKeyLength { required, provided },
+        hammer_infra::crypto::KeyEstablishmentError::InvalidPrivateKey => {
+            KxStatus::InvalidPrivateKey
+        }
+        hammer_infra::crypto::KeyEstablishmentError::InvalidPublicKeyLength {
+            required,
+            provided,
+        } => KxStatus::InvalidPeerPublicKeyLength { required, provided },
+        hammer_infra::crypto::KeyEstablishmentError::InvalidPublicKey => {
+            KxStatus::InvalidPeerPublicKey
+        }
+        hammer_infra::crypto::KeyEstablishmentError::SmallOrderPublicKey => {
+            KxStatus::SmallOrderPeerPublicKey
+        }
+        hammer_infra::crypto::KeyEstablishmentError::InvalidCiphertextLength {
+            required,
+            provided,
+        } => KxStatus::InvalidCiphertext { required, provided },
+        hammer_infra::crypto::KeyEstablishmentError::OutputTooSmall {
+            output,
+            required,
+            provided,
+        } => KxStatus::OutputTooSmall {
+            output,
+            required,
+            provided,
+        },
+        hammer_infra::crypto::KeyEstablishmentError::OperationUnsupported { .. } => {
+            KxStatus::OperationUnsupported
+        }
     }
 }
 

@@ -41,8 +41,13 @@ abi_stable = "0.11.3"
 aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "zeroize"] }
 blake2 = { version = "0.10.6", default-features = false }
 chacha20poly1305 = { version = "0.10.1", default-features = false }
+getrandom = "0.2.17"
 hmac = { version = "0.12.1", default-features = false }
 hkdf = { version = "0.12.4", default-features = false }
+ml-kem = { version = "0.3.2", default-features = false, features = ["alloc", "hazmat", "zeroize"] }
+p256 = { version = "0.14.0", default-features = false, features = ["arithmetic", "ecdh"] }
+p384 = { version = "0.14.0", default-features = false, features = ["arithmetic", "ecdh"] }
+x25519-dalek = { version = "3.0.0", default-features = false, features = ["static_secrets", "zeroize"] }
 tokio = { version = "1.52", features = ["rt-multi-thread", "sync", "macros", "time", "io-util", "net"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_path_to_error = "0.1"

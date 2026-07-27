@@ -665,3 +665,429 @@ impl Hkdf {
         Ok(length)
     }
 }
+
+/// One standard key-establishment algorithm.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyEstablishmentAlgorithm {
+    /// X25519 Diffie-Hellman.
+    X25519,
+    /// ECDH over NIST P-256.
+    P256,
+    /// ECDH over NIST P-384.
+    P384,
+    /// ML-KEM-768 encapsulation.
+    MlKem768,
+}
+
+impl KeyEstablishmentAlgorithm {
+    /// Returns the serialized private-key length.
+    pub fn private_key_len(self) -> usize {
+        match self {
+            Self::X25519 | Self::P256 => 32,
+            Self::P384 => 48,
+            Self::MlKem768 => 64,
+        }
+    }
+
+    /// Returns the canonical serialized public-key length.
+    pub fn public_key_len(self) -> usize {
+        match self {
+            Self::X25519 => 32,
+            Self::P256 => 65,
+            Self::P384 => 97,
+            Self::MlKem768 => 1184,
+        }
+    }
+
+    /// Returns the established shared-secret length.
+    pub fn shared_secret_len(self) -> usize {
+        match self {
+            Self::X25519 | Self::P256 | Self::MlKem768 => 32,
+            Self::P384 => 48,
+        }
+    }
+
+    /// Returns the random input required to generate a private key.
+    pub fn key_generation_entropy_len(self) -> usize {
+        self.private_key_len()
+    }
+
+    /// Returns the ML-KEM ciphertext length, if this is an encapsulation algorithm.
+    pub fn ciphertext_len(self) -> Option<usize> {
+        match self {
+            Self::MlKem768 => Some(1088),
+            Self::X25519 | Self::P256 | Self::P384 => None,
+        }
+    }
+}
+
+/// One output role used to report a key-establishment capacity failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyEstablishmentOutput {
+    /// Serialized private key.
+    PrivateKey,
+    /// Serialized public key.
+    PublicKey,
+    /// Established secret.
+    SharedSecret,
+    /// Encapsulated ML-KEM value.
+    Ciphertext,
+}
+
+/// A failure produced by a key-establishment implementation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyEstablishmentError {
+    /// Random input has the wrong length for the selected algorithm.
+    InvalidEntropyLength {
+        /// Required random bytes.
+        required: usize,
+        /// Supplied random bytes.
+        provided: usize,
+    },
+    /// Private-key input has the wrong serialized length.
+    InvalidPrivateKeyLength {
+        /// Required private-key bytes.
+        required: usize,
+        /// Supplied private-key bytes.
+        provided: usize,
+    },
+    /// Private-key input is not a valid scalar or seed.
+    InvalidPrivateKey,
+    /// Public-key input has the wrong serialized length.
+    InvalidPublicKeyLength {
+        /// Required public-key bytes.
+        required: usize,
+        /// Supplied public-key bytes.
+        provided: usize,
+    },
+    /// Public-key input is not a valid encoding for the selected algorithm.
+    InvalidPublicKey,
+    /// X25519 rejected a non-contributory small-order public key.
+    SmallOrderPublicKey,
+    /// ML-KEM ciphertext input has the wrong serialized length.
+    InvalidCiphertextLength {
+        /// Required ciphertext bytes.
+        required: usize,
+        /// Supplied ciphertext bytes.
+        provided: usize,
+    },
+    /// Caller output cannot hold the complete result.
+    OutputTooSmall {
+        /// Output whose capacity was rejected.
+        output: KeyEstablishmentOutput,
+        /// Required output bytes.
+        required: usize,
+        /// Supplied output bytes.
+        provided: usize,
+    },
+    /// The selected algorithm does not define the requested operation.
+    OperationUnsupported {
+        /// Selected algorithm.
+        algorithm: KeyEstablishmentAlgorithm,
+    },
+}
+
+impl fmt::Display for KeyEstablishmentError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidEntropyLength { required, provided } => write!(
+                formatter,
+                "key generation requires {required} random bytes but caller provided {provided}"
+            ),
+            Self::InvalidPrivateKeyLength { required, provided } => write!(
+                formatter,
+                "private key requires {required} bytes but caller provided {provided}"
+            ),
+            Self::InvalidPrivateKey => formatter.write_str("private key is invalid"),
+            Self::InvalidPublicKeyLength { required, provided } => write!(
+                formatter,
+                "public key requires {required} bytes but caller provided {provided}"
+            ),
+            Self::InvalidPublicKey => formatter.write_str("public key encoding is invalid"),
+            Self::SmallOrderPublicKey => {
+                formatter.write_str("X25519 public key is non-contributory")
+            }
+            Self::InvalidCiphertextLength { required, provided } => write!(
+                formatter,
+                "ML-KEM ciphertext requires {required} bytes but caller provided {provided}"
+            ),
+            Self::OutputTooSmall {
+                output,
+                required,
+                provided,
+            } => write!(
+                formatter,
+                "{output:?} output requires {required} bytes but caller provided {provided}"
+            ),
+            Self::OperationUnsupported { algorithm } => {
+                write!(formatter, "operation is not defined for {algorithm:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for KeyEstablishmentError {}
+
+/// Generates one standard key pair from caller-supplied random bytes.
+///
+/// # Errors
+///
+/// Returns a typed input or capacity failure before modifying either output.
+pub fn generate_keypair(
+    algorithm: KeyEstablishmentAlgorithm,
+    entropy: &[u8],
+    private_key_output: &mut [u8],
+    public_key_output: &mut [u8],
+) -> Result<(), KeyEstablishmentError> {
+    let entropy_len = algorithm.key_generation_entropy_len();
+    if entropy.len() != entropy_len {
+        return Err(KeyEstablishmentError::InvalidEntropyLength {
+            required: entropy_len,
+            provided: entropy.len(),
+        });
+    }
+    validate_key_establishment_output(
+        KeyEstablishmentOutput::PrivateKey,
+        algorithm.private_key_len(),
+        private_key_output,
+    )?;
+    validate_key_establishment_output(
+        KeyEstablishmentOutput::PublicKey,
+        algorithm.public_key_len(),
+        public_key_output,
+    )?;
+
+    public_key(algorithm, entropy, public_key_output)?;
+    private_key_output[..entropy_len].copy_from_slice(entropy);
+    Ok(())
+}
+
+/// Derives the canonical public key for caller-supplied private-key bytes.
+///
+/// # Errors
+///
+/// Returns a typed key or capacity failure without modifying `output`.
+pub fn public_key(
+    algorithm: KeyEstablishmentAlgorithm,
+    private_key: &[u8],
+    output: &mut [u8],
+) -> Result<usize, KeyEstablishmentError> {
+    validate_private_key_len(algorithm, private_key)?;
+    let output_len = algorithm.public_key_len();
+    validate_key_establishment_output(KeyEstablishmentOutput::PublicKey, output_len, output)?;
+
+    match algorithm {
+        KeyEstablishmentAlgorithm::X25519 => {
+            let secret = x25519_dalek::StaticSecret::from(array_32(private_key));
+            output[..output_len].copy_from_slice(x25519_dalek::PublicKey::from(&secret).as_bytes());
+        }
+        KeyEstablishmentAlgorithm::P256 => {
+            let secret = p256::SecretKey::from_slice(private_key)
+                .map_err(|_| KeyEstablishmentError::InvalidPrivateKey)?;
+            let encoded = p256::Sec1Point::from(secret.public_key());
+            output[..output_len].copy_from_slice(encoded.as_bytes());
+        }
+        KeyEstablishmentAlgorithm::P384 => {
+            let secret = p384::SecretKey::from_slice(private_key)
+                .map_err(|_| KeyEstablishmentError::InvalidPrivateKey)?;
+            let encoded = p384::Sec1Point::from(secret.public_key());
+            output[..output_len].copy_from_slice(encoded.as_bytes());
+        }
+        KeyEstablishmentAlgorithm::MlKem768 => {
+            use ml_kem::KeyExport;
+
+            let seed = ml_kem::Seed::try_from(private_key)
+                .map_err(|_| KeyEstablishmentError::InvalidPrivateKey)?;
+            let private_key = ml_kem::ml_kem_768::DecapsulationKey::from_seed(seed);
+            let encoded = private_key.encapsulation_key().to_bytes();
+            output[..output_len].copy_from_slice(encoded.as_slice());
+        }
+    }
+    Ok(output_len)
+}
+
+/// Establishes an ECDH secret from private and peer-public key bytes.
+///
+/// # Errors
+///
+/// Returns typed length, encoding, small-order, or capacity failures without
+/// exposing a partial secret.
+pub fn agree(
+    algorithm: KeyEstablishmentAlgorithm,
+    private_key: &[u8],
+    peer_public_key: &[u8],
+    output: &mut [u8],
+) -> Result<usize, KeyEstablishmentError> {
+    validate_private_key_len(algorithm, private_key)?;
+    let output_len = algorithm.shared_secret_len();
+    validate_key_establishment_output(KeyEstablishmentOutput::SharedSecret, output_len, output)?;
+
+    match algorithm {
+        KeyEstablishmentAlgorithm::X25519 => {
+            if peer_public_key.len() != 32 {
+                return Err(KeyEstablishmentError::InvalidPublicKeyLength {
+                    required: 32,
+                    provided: peer_public_key.len(),
+                });
+            }
+            let secret = x25519_dalek::StaticSecret::from(array_32(private_key));
+            let peer = x25519_dalek::PublicKey::from(array_32(peer_public_key));
+            let shared = secret.diffie_hellman(&peer);
+            if !shared.was_contributory() {
+                return Err(KeyEstablishmentError::SmallOrderPublicKey);
+            }
+            output[..output_len].copy_from_slice(shared.as_bytes());
+        }
+        KeyEstablishmentAlgorithm::P256 => {
+            let secret = p256::SecretKey::from_slice(private_key)
+                .map_err(|_| KeyEstablishmentError::InvalidPrivateKey)?;
+            let peer = p256::PublicKey::from_sec1_bytes(peer_public_key)
+                .map_err(|_| KeyEstablishmentError::InvalidPublicKey)?;
+            let shared = p256::ecdh::diffie_hellman(secret.to_nonzero_scalar(), peer.as_affine());
+            output[..output_len].copy_from_slice(shared.raw_secret_bytes());
+        }
+        KeyEstablishmentAlgorithm::P384 => {
+            let secret = p384::SecretKey::from_slice(private_key)
+                .map_err(|_| KeyEstablishmentError::InvalidPrivateKey)?;
+            let peer = p384::PublicKey::from_sec1_bytes(peer_public_key)
+                .map_err(|_| KeyEstablishmentError::InvalidPublicKey)?;
+            let shared = p384::ecdh::diffie_hellman(secret.to_nonzero_scalar(), peer.as_affine());
+            output[..output_len].copy_from_slice(shared.raw_secret_bytes());
+        }
+        KeyEstablishmentAlgorithm::MlKem768 => {
+            return Err(KeyEstablishmentError::OperationUnsupported { algorithm });
+        }
+    }
+    Ok(output_len)
+}
+
+/// Encapsulates an ML-KEM secret using caller-supplied random bytes.
+///
+/// # Errors
+///
+/// Returns typed input or capacity failures before modifying either output.
+pub fn encapsulate(
+    algorithm: KeyEstablishmentAlgorithm,
+    peer_public_key: &[u8],
+    entropy: &[u8],
+    ciphertext: &mut [u8],
+    shared_secret: &mut [u8],
+) -> Result<(), KeyEstablishmentError> {
+    if algorithm != KeyEstablishmentAlgorithm::MlKem768 {
+        return Err(KeyEstablishmentError::OperationUnsupported { algorithm });
+    }
+    if peer_public_key.len() != algorithm.public_key_len() {
+        return Err(KeyEstablishmentError::InvalidPublicKeyLength {
+            required: algorithm.public_key_len(),
+            provided: peer_public_key.len(),
+        });
+    }
+    if entropy.len() != 32 {
+        return Err(KeyEstablishmentError::InvalidEntropyLength {
+            required: 32,
+            provided: entropy.len(),
+        });
+    }
+    let ciphertext_len = algorithm
+        .ciphertext_len()
+        .expect("ML-KEM defines a ciphertext length");
+    validate_key_establishment_output(
+        KeyEstablishmentOutput::Ciphertext,
+        ciphertext_len,
+        ciphertext,
+    )?;
+    validate_key_establishment_output(
+        KeyEstablishmentOutput::SharedSecret,
+        algorithm.shared_secret_len(),
+        shared_secret,
+    )?;
+
+    use ml_kem::TryKeyInit;
+
+    let peer = ml_kem::ml_kem_768::EncapsulationKey::new_from_slice(peer_public_key)
+        .map_err(|_| KeyEstablishmentError::InvalidPublicKey)?;
+    let entropy =
+        ml_kem::B32::try_from(entropy).expect("ML-KEM encapsulation entropy length was validated");
+    let (encapsulated, secret) = peer.encapsulate_deterministic(&entropy);
+    ciphertext[..ciphertext_len].copy_from_slice(encapsulated.as_slice());
+    shared_secret[..secret.len()].copy_from_slice(secret.as_slice());
+    Ok(())
+}
+
+/// Decapsulates an ML-KEM secret from serialized private key and ciphertext bytes.
+///
+/// # Errors
+///
+/// Returns typed length or capacity failures without modifying `shared_secret`.
+pub fn decapsulate(
+    algorithm: KeyEstablishmentAlgorithm,
+    private_key: &[u8],
+    ciphertext: &[u8],
+    shared_secret: &mut [u8],
+) -> Result<usize, KeyEstablishmentError> {
+    if algorithm != KeyEstablishmentAlgorithm::MlKem768 {
+        return Err(KeyEstablishmentError::OperationUnsupported { algorithm });
+    }
+    validate_private_key_len(algorithm, private_key)?;
+    let ciphertext_len = algorithm
+        .ciphertext_len()
+        .expect("ML-KEM defines a ciphertext length");
+    if ciphertext.len() != ciphertext_len {
+        return Err(KeyEstablishmentError::InvalidCiphertextLength {
+            required: ciphertext_len,
+            provided: ciphertext.len(),
+        });
+    }
+    let output_len = algorithm.shared_secret_len();
+    validate_key_establishment_output(
+        KeyEstablishmentOutput::SharedSecret,
+        output_len,
+        shared_secret,
+    )?;
+
+    use ml_kem::Decapsulate;
+
+    let seed = ml_kem::Seed::try_from(private_key)
+        .map_err(|_| KeyEstablishmentError::InvalidPrivateKey)?;
+    let private_key = ml_kem::ml_kem_768::DecapsulationKey::from_seed(seed);
+    let ciphertext = ml_kem::ml_kem_768::Ciphertext::try_from(ciphertext)
+        .expect("ML-KEM ciphertext length was validated");
+    let secret = private_key.decapsulate(&ciphertext);
+    shared_secret[..output_len].copy_from_slice(secret.as_slice());
+    Ok(output_len)
+}
+
+fn validate_private_key_len(
+    algorithm: KeyEstablishmentAlgorithm,
+    private_key: &[u8],
+) -> Result<(), KeyEstablishmentError> {
+    let required = algorithm.private_key_len();
+    if private_key.len() != required {
+        return Err(KeyEstablishmentError::InvalidPrivateKeyLength {
+            required,
+            provided: private_key.len(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_key_establishment_output(
+    role: KeyEstablishmentOutput,
+    required: usize,
+    output: &[u8],
+) -> Result<(), KeyEstablishmentError> {
+    if output.len() < required {
+        return Err(KeyEstablishmentError::OutputTooSmall {
+            output: role,
+            required,
+            provided: output.len(),
+        });
+    }
+    Ok(())
+}
+
+fn array_32(input: &[u8]) -> [u8; 32] {
+    input
+        .try_into()
+        .expect("32-byte input length was validated before conversion")
+}
