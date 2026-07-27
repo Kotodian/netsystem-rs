@@ -65,98 +65,73 @@ mod private {
 }
 
 /// The hash operation family.
+#[hammer_component_macros::Hash]
 #[derive(Debug)]
 pub struct Hash;
 
 /// Prepared state for a hash Context.
 #[derive(Debug)]
-pub struct HashPrepared {
-    algorithm: hammer_infra::crypto::HashAlgorithm,
-}
+pub struct HashPrepared;
 
 impl HashPrepared {
-    fn new(algorithm: hammer_infra::crypto::HashAlgorithm) -> Self {
-        Self { algorithm }
-    }
-
-    fn execute(&mut self, operations: &mut [HashOperation<'_>]) {
+    /// Executes a batch through one statically selected digest implementation.
+    pub fn execute<A>(&mut self, operations: &mut [HashOperation<'_>])
+    where
+        A: hammer_infra::crypto::hash::Algorithm,
+    {
         for operation in operations {
-            let result = operation.input.with_fragments(|input| {
-                hammer_infra::crypto::hash(self.algorithm, input, operation.output)
-            });
-            operation.status = match result {
-                Ok(written) => HashStatus::Complete { written },
-                Err(hammer_infra::crypto::HashError::OutputTooSmall { required, provided }) => {
-                    HashStatus::OutputTooSmall { required, provided }
-                }
-            };
+            operation.result = Some(
+                operation
+                    .input
+                    .with_fragments(|input| A::default().digest(input, operation.output)),
+            );
         }
     }
 }
 
-impl private::Sealed for Hash {}
-
-impl Family for Hash {
-    type Operation<'a> = HashOperation<'a>;
-    type Prepared = HashPrepared;
-    type Prepare = hammer_infra::crypto::HashAlgorithm;
-    type Dispatch = for<'a> fn(&mut HashPrepared, &mut [HashOperation<'a>]);
-
-    const KEY_FAMILY: u8 = 2;
-
-    fn registry(engine: &Engine) -> &FamilyRegistry<Self> {
-        &engine.hashes
-    }
-
-    fn registry_mut(engine: &mut Engine) -> &mut FamilyRegistry<Self> {
-        &mut engine.hashes
-    }
-
-    fn prepare_unkeyed(
-        prepare: Self::Prepare,
-        _: &Engine,
-        _: AlgorithmId<Self>,
-    ) -> Option<Self::Prepared> {
-        Some(HashPrepared::new(prepare))
-    }
-}
-
 /// The authenticated-encryption operation family.
+#[hammer_component_macros::Aead]
 #[derive(Debug)]
 pub struct Aead;
 
 /// Prepared state for an authenticated-encryption Context.
 #[derive(Debug)]
 pub struct AeadPrepared {
-    cipher: hammer_infra::crypto::AeadCipher,
+    key: Zeroizing<Vec<u8>>,
     operations: KeyOperations,
 }
 
 impl AeadPrepared {
     fn new(
-        algorithm: hammer_infra::crypto::AeadAlgorithm,
+        required: usize,
         key: KeyHandle,
         material: &[u8],
         operations: KeyOperations,
     ) -> Result<Self, ContextError> {
-        let cipher =
-            hammer_infra::crypto::AeadCipher::new(algorithm, material).map_err(|source| {
-                let hammer_infra::crypto::AeadError::InvalidKeyLength { required, provided } =
-                    source
-                else {
-                    unreachable!("AEAD Context preparation only validates key length")
-                };
-                ContextError::InvalidKeyLength {
-                    key,
+        if material.len() != required {
+            return Err(ContextError::InvalidKeyLength {
+                key,
+                required,
+                provided: material.len(),
+                source: hammer_infra::crypto::aead::Error::InvalidKeyLength {
                     required,
-                    provided,
-                    source,
-                }
-            })?;
-        Ok(Self { cipher, operations })
+                    provided: material.len(),
+                },
+            });
+        }
+        Ok(Self {
+            key: Zeroizing::new(material.to_vec()),
+            operations,
+        })
     }
 
-    fn execute(&mut self, operations: &mut [AeadOperation<'_>]) {
+    /// Executes a batch through one statically selected AEAD implementation.
+    pub fn execute<A>(&mut self, operations: &mut [AeadOperation<'_>])
+    where
+        A: hammer_infra::crypto::aead::Algorithm,
+    {
+        let cipher =
+            A::new(&self.key).expect("AEAD key length was validated while preparing the Context");
         for operation in operations {
             let required = match operation.direction {
                 AeadDirection::Seal => KeyOperations::AEAD_SEAL,
@@ -179,7 +154,7 @@ impl AeadPrepared {
                     AeadPayload::OutOfPlace { input, output },
                     AeadTag::Output(tag),
                 ) => (*input).with_fragments(|fragments| {
-                    self.cipher.seal(
+                    cipher.seal(
                         fragments,
                         operation.nonce,
                         operation.associated_data,
@@ -192,7 +167,7 @@ impl AeadPrepared {
                     AeadPayload::OutOfPlace { input, output },
                     AeadTag::Input(tag),
                 ) => (*input).with_fragments(|fragments| {
-                    self.cipher.open(
+                    cipher.open(
                         fragments,
                         operation.nonce,
                         operation.associated_data,
@@ -200,194 +175,87 @@ impl AeadPrepared {
                         output,
                     )
                 }),
-                (AeadDirection::Seal, AeadPayload::InPlace(payload), AeadTag::Output(tag)) => self
-                    .cipher
-                    .seal_in_place(payload, operation.nonce, operation.associated_data, tag),
-                (AeadDirection::Open, AeadPayload::InPlace(payload), AeadTag::Input(tag)) => self
-                    .cipher
-                    .open_in_place(payload, operation.nonce, operation.associated_data, tag),
+                (AeadDirection::Seal, AeadPayload::InPlace(payload), AeadTag::Output(tag)) => {
+                    cipher.seal_in_place(payload, operation.nonce, operation.associated_data, tag)
+                }
+                (AeadDirection::Open, AeadPayload::InPlace(payload), AeadTag::Input(tag)) => {
+                    cipher.open_in_place(payload, operation.nonce, operation.associated_data, tag)
+                }
                 _ => unreachable!("AEAD constructors preserve direction, payload, and tag shape"),
             };
-            operation.status = aead_status(result);
+            operation.status = AeadStatus::Executed(result);
         }
     }
 }
 
-impl private::Sealed for Aead {}
-
-impl Family for Aead {
-    type Operation<'a> = AeadOperation<'a>;
-    type Prepared = AeadPrepared;
-    type Prepare = hammer_infra::crypto::AeadAlgorithm;
-    type Dispatch = for<'a> fn(&mut AeadPrepared, &mut [AeadOperation<'a>]);
-
-    const KEY_FAMILY: u8 = 1;
-
-    fn registry(engine: &Engine) -> &FamilyRegistry<Self> {
-        &engine.aeads
-    }
-
-    fn registry_mut(engine: &mut Engine) -> &mut FamilyRegistry<Self> {
-        &mut engine.aeads
-    }
-
-    fn prepare_unkeyed(
-        _: Self::Prepare,
-        _: &Engine,
-        _: AlgorithmId<Self>,
-    ) -> Option<Self::Prepared> {
-        None
-    }
-
-    fn key_operations() -> KeyOperations {
-        KeyOperations::AEAD_SEAL | KeyOperations::AEAD_OPEN
-    }
-
-    fn prepare_keyed(
-        algorithm: Self::Prepare,
-        _: &Engine,
-        _: AlgorithmId<Self>,
-        key: KeyHandle,
-        material: &[u8],
-        policy: &KeyPolicy,
-    ) -> Result<Self::Prepared, ContextError> {
-        AeadPrepared::new(algorithm, key, material, policy.operations)
-    }
-}
-
 /// The message-authentication operation family.
+#[hammer_component_macros::Mac]
 #[derive(Debug)]
 pub struct Mac;
 
 /// Prepared state for a message-authentication Context.
 #[derive(Debug)]
 pub struct MacPrepared {
-    mac: hammer_infra::crypto::Hmac,
+    key: Zeroizing<Vec<u8>>,
 }
 
 impl MacPrepared {
-    fn new(algorithm: hammer_infra::crypto::Sha2Algorithm, material: &[u8]) -> Self {
-        Self {
-            mac: hammer_infra::crypto::Hmac::new(algorithm, material),
-        }
-    }
-
-    fn execute(&mut self, operations: &mut [MacOperation<'_>]) {
+    /// Executes a batch through one statically selected MAC implementation.
+    pub fn execute<A>(&mut self, operations: &mut [MacOperation<'_>])
+    where
+        A: hammer_infra::crypto::mac::Algorithm,
+    {
+        let mac = A::new(&self.key);
         for operation in operations {
-            let result = operation
-                .input
-                .with_fragments(|input| self.mac.authenticate(input, operation.output));
-            operation.status = match result {
-                Ok(written) => MacStatus::Complete { written },
-                Err(hammer_infra::crypto::MacError::OutputTooSmall { required, provided }) => {
-                    MacStatus::OutputTooSmall { required, provided }
-                }
-            };
+            operation.result = Some(
+                operation
+                    .input
+                    .with_fragments(|input| mac.authenticate(input, operation.output)),
+            );
         }
-    }
-}
-
-impl private::Sealed for Mac {}
-
-impl Family for Mac {
-    type Operation<'a> = MacOperation<'a>;
-    type Prepared = MacPrepared;
-    type Prepare = hammer_infra::crypto::Sha2Algorithm;
-    type Dispatch = for<'a> fn(&mut MacPrepared, &mut [MacOperation<'a>]);
-
-    const KEY_FAMILY: u8 = 4;
-
-    fn registry(engine: &Engine) -> &FamilyRegistry<Self> {
-        &engine.macs
-    }
-
-    fn registry_mut(engine: &mut Engine) -> &mut FamilyRegistry<Self> {
-        &mut engine.macs
-    }
-
-    fn prepare_unkeyed(
-        _: Self::Prepare,
-        _: &Engine,
-        _: AlgorithmId<Self>,
-    ) -> Option<Self::Prepared> {
-        None
-    }
-
-    fn key_operations() -> KeyOperations {
-        KeyOperations::MAC_AUTHENTICATE
-    }
-
-    fn prepare_keyed(
-        algorithm: Self::Prepare,
-        _: &Engine,
-        _: AlgorithmId<Self>,
-        _: KeyHandle,
-        material: &[u8],
-        _: &KeyPolicy,
-    ) -> Result<Self::Prepared, ContextError> {
-        Ok(MacPrepared::new(algorithm, material))
     }
 }
 
 /// The key-derivation operation family.
+#[hammer_component_macros::Kdf]
 #[derive(Debug)]
 pub struct Kdf;
 
 /// Prepared state for a key-derivation Context.
 #[derive(Debug)]
 pub struct KdfPrepared {
-    algorithm: hammer_infra::crypto::Sha2Algorithm,
     material: Zeroizing<Vec<u8>>,
     policy: KeyPolicy,
     keys: Rc<RefCell<Pool<KeyEntry>>>,
 }
 
 impl KdfPrepared {
-    fn new(
-        algorithm: hammer_infra::crypto::Sha2Algorithm,
-        material: &[u8],
-        policy: &KeyPolicy,
-        keys: Rc<RefCell<Pool<KeyEntry>>>,
-    ) -> Self {
-        Self {
-            algorithm,
-            material: Zeroizing::new(material.to_vec()),
-            policy: policy.clone(),
-            keys,
-        }
-    }
-
-    fn execute(&mut self, operations: &mut [KdfOperation<'_>]) {
+    /// Executes a batch through one statically selected KDF implementation.
+    pub fn execute<A>(&mut self, operations: &mut [KdfOperation<'_>])
+    where
+        A: hammer_infra::crypto::kdf::Algorithm,
+    {
         for operation in operations {
             let Some(policy) = self.policy.derived_policy(operation.target) else {
                 operation.status = KdfStatus::DerivationDenied;
                 continue;
             };
-            let maximum = 255 * self.algorithm.output_len();
+            let maximum = 255 * A::OUTPUT_LEN;
             if operation.length > maximum {
-                operation.status = KdfStatus::OutputTooLong {
-                    requested: operation.length,
-                    maximum,
-                };
+                operation.status =
+                    KdfStatus::Algorithm(hammer_infra::crypto::kdf::Error::OutputTooLong {
+                        requested: operation.length,
+                        maximum,
+                    });
                 continue;
             }
 
             let mut material = Zeroizing::new(vec![0; operation.length]);
-            let hkdf =
-                hammer_infra::crypto::Hkdf::new(self.algorithm, operation.salt, &self.material);
-            let result = operation
+            let hkdf = A::new(operation.salt, &self.material);
+            operation
                 .info
-                .with_fragments(|info| hkdf.expand(info, operation.length, &mut material));
-            match result {
-                Ok(_) => {}
-                Err(hammer_infra::crypto::KdfError::OutputTooLong { requested, maximum }) => {
-                    operation.status = KdfStatus::OutputTooLong { requested, maximum };
-                    continue;
-                }
-                Err(hammer_infra::crypto::KdfError::OutputTooSmall { .. }) => {
-                    unreachable!("HKDF output storage has the exact requested length")
-                }
-            }
+                .with_fragments(|info| hkdf.expand(info, operation.length, &mut material))
+                .expect("KDF length and output storage were validated before expansion");
 
             let mut keys = self.keys.borrow_mut();
             let capacity = keys.capacity();
@@ -406,136 +274,92 @@ impl KdfPrepared {
     }
 }
 
-impl private::Sealed for Kdf {}
-
-impl Family for Kdf {
-    type Operation<'a> = KdfOperation<'a>;
-    type Prepared = KdfPrepared;
-    type Prepare = hammer_infra::crypto::Sha2Algorithm;
-    type Dispatch = for<'a> fn(&mut KdfPrepared, &mut [KdfOperation<'a>]);
-
-    const KEY_FAMILY: u8 = 5;
-
-    fn registry(engine: &Engine) -> &FamilyRegistry<Self> {
-        &engine.kdfs
-    }
-
-    fn registry_mut(engine: &mut Engine) -> &mut FamilyRegistry<Self> {
-        &mut engine.kdfs
-    }
-
-    fn prepare_unkeyed(
-        _: Self::Prepare,
-        _: &Engine,
-        _: AlgorithmId<Self>,
-    ) -> Option<Self::Prepared> {
-        None
-    }
-
-    fn key_operations() -> KeyOperations {
-        KeyOperations::DERIVE
-    }
-
-    fn prepare_keyed(
-        algorithm: Self::Prepare,
-        engine: &Engine,
-        _: AlgorithmId<Self>,
-        _: KeyHandle,
-        material: &[u8],
-        policy: &KeyPolicy,
-    ) -> Result<Self::Prepared, ContextError> {
-        Ok(KdfPrepared::new(
-            algorithm,
-            material,
-            policy,
-            Rc::clone(&engine.keys),
-        ))
-    }
-}
-
 /// The key-establishment operation family.
+#[hammer_component_macros::Kx]
 #[derive(Debug)]
 pub struct Kx;
 
 /// Prepared state for a key-establishment Context.
 #[derive(Debug)]
 pub struct KxPrepared {
-    algorithm: hammer_infra::crypto::KeyEstablishmentAlgorithm,
     policy_algorithm: PolicyAlgorithm,
     keys: Rc<RefCell<Pool<KeyEntry>>>,
 }
 
 impl KxPrepared {
-    fn new(
-        algorithm: hammer_infra::crypto::KeyEstablishmentAlgorithm,
-        policy_algorithm: AlgorithmId<Kx>,
-        keys: Rc<RefCell<Pool<KeyEntry>>>,
-    ) -> Self {
-        Self {
-            algorithm,
-            policy_algorithm: PolicyAlgorithm::new(policy_algorithm),
-            keys,
-        }
-    }
-
-    fn execute(&mut self, operations: &mut [KxOperation<'_>]) {
+    /// Executes a batch through one statically selected key-establishment implementation.
+    pub fn execute<A>(&mut self, operations: &mut [KxOperation<'_>])
+    where
+        A: hammer_infra::crypto::key_establishment::Algorithm,
+    {
+        let algorithm = A::default();
         for operation in operations {
             operation.status = match &mut operation.request {
                 KxRequest::Generate { policy, public_key } => {
-                    self.generate_keypair(policy, public_key)
+                    self.generate_keypair(&algorithm, policy, public_key)
                 }
                 KxRequest::Agree {
                     private_key,
                     peer_public_key,
                     target,
-                } => self.agree(*private_key, peer_public_key, *target),
+                } => self.agree(&algorithm, *private_key, peer_public_key, *target),
                 KxRequest::Encapsulate {
                     peer_public_key,
                     policy,
                     ciphertext,
-                } => self.encapsulate(peer_public_key, policy, ciphertext),
+                } => self.encapsulate(&algorithm, peer_public_key, policy, ciphertext),
                 KxRequest::Decapsulate {
                     private_key,
                     ciphertext,
                     target,
-                } => self.decapsulate(*private_key, ciphertext, *target),
+                } => self.decapsulate(&algorithm, *private_key, ciphertext, *target),
             };
         }
     }
 
-    fn generate_keypair(&self, policy: &KeyPolicy, public_key: &mut [u8]) -> KxStatus {
+    fn generate_keypair<A>(
+        &self,
+        algorithm: &A,
+        policy: &KeyPolicy,
+        public_key: &mut [u8],
+    ) -> KxStatus
+    where
+        A: hammer_infra::crypto::key_establishment::Algorithm,
+    {
         if !policy.applies_to(self.policy_algorithm) {
             return KxStatus::GenerationPolicyDenied;
         }
 
-        let public_len = self.algorithm.public_key_len();
+        let public_len = A::PUBLIC_KEY_LEN;
         if public_key.len() < public_len {
-            return KxStatus::OutputTooSmall {
-                output: hammer_infra::crypto::KeyEstablishmentOutput::PublicKey,
-                required: public_len,
-                provided: public_key.len(),
-            };
+            return KxStatus::Algorithm(
+                hammer_infra::crypto::key_establishment::Error::OutputTooSmall {
+                    output: hammer_infra::crypto::key_establishment::Output::PublicKey,
+                    required: public_len,
+                    provided: public_key.len(),
+                },
+            );
         }
-        if let Some(capacity) = self.full_key_pool_capacity() {
-            return KxStatus::KeyPoolFull { capacity };
+        {
+            let keys = self.keys.borrow();
+            if keys.len() == keys.capacity() {
+                return KxStatus::KeyPoolFull {
+                    capacity: keys.capacity(),
+                };
+            }
         }
 
-        let mut entropy = Zeroizing::new(vec![0; self.algorithm.private_key_len()]);
-        let mut private_key = Zeroizing::new(vec![0; self.algorithm.private_key_len()]);
+        let mut entropy = Zeroizing::new(vec![0; A::PRIVATE_KEY_LEN]);
+        let mut private_key = Zeroizing::new(vec![0; A::PRIVATE_KEY_LEN]);
         let mut public_key_result = vec![0; public_len];
         loop {
             if let Err(source) = getrandom::getrandom(&mut entropy) {
                 return KxStatus::EntropyUnavailable { source };
             }
-            match hammer_infra::crypto::generate_keypair(
-                self.algorithm,
-                &entropy,
-                &mut private_key,
-                &mut public_key_result,
-            ) {
+            match algorithm.generate_keypair(&entropy, &mut private_key, &mut public_key_result) {
                 Ok(()) => break,
-                Err(hammer_infra::crypto::KeyEstablishmentError::InvalidPrivateKey) => continue,
-                Err(error) => return kx_status(error),
+                Err(hammer_infra::crypto::key_establishment::Error::InvalidPrivateKey) => continue,
+                Err(error) => return KxStatus::Algorithm(error),
             }
         }
 
@@ -550,13 +374,17 @@ impl KxPrepared {
         }
     }
 
-    fn agree(
+    fn agree<A>(
         &self,
+        algorithm: &A,
         private_key: KeyHandle,
         peer_public_key: &[u8],
         target: PolicyAlgorithm,
-    ) -> KxStatus {
-        let mut shared_secret = Zeroizing::new(vec![0; self.algorithm.shared_secret_len()]);
+    ) -> KxStatus
+    where
+        A: hammer_infra::crypto::key_establishment::Algorithm,
+    {
+        let mut shared_secret = Zeroizing::new(vec![0; A::SHARED_SECRET_LEN]);
         let policy = {
             let keys = self.keys.borrow();
             let Some(entry) = keys.get(private_key.index) else {
@@ -575,13 +403,10 @@ impl KxPrepared {
                     capacity: keys.capacity(),
                 };
             }
-            if let Err(error) = hammer_infra::crypto::agree(
-                self.algorithm,
-                &entry.material,
-                peer_public_key,
-                &mut shared_secret,
-            ) {
-                return kx_status(error);
+            if let Err(error) =
+                algorithm.agree(&entry.material, peer_public_key, &mut shared_secret)
+            {
+                return KxStatus::Algorithm(error);
             }
             policy
         };
@@ -592,40 +417,52 @@ impl KxPrepared {
         }
     }
 
-    fn encapsulate(
+    fn encapsulate<A>(
         &self,
+        algorithm: &A,
         peer_public_key: &[u8],
         policy: &KeyPolicy,
         ciphertext: &mut [u8],
-    ) -> KxStatus {
-        let Some(ciphertext_len) = self.algorithm.ciphertext_len() else {
-            return KxStatus::OperationUnsupported;
+    ) -> KxStatus
+    where
+        A: hammer_infra::crypto::key_establishment::Algorithm,
+    {
+        let Some(ciphertext_len) = A::CIPHERTEXT_LEN else {
+            return KxStatus::Algorithm(
+                hammer_infra::crypto::key_establishment::Error::OperationUnsupported,
+            );
         };
         if ciphertext.len() < ciphertext_len {
-            return KxStatus::OutputTooSmall {
-                output: hammer_infra::crypto::KeyEstablishmentOutput::Ciphertext,
-                required: ciphertext_len,
-                provided: ciphertext.len(),
-            };
+            return KxStatus::Algorithm(
+                hammer_infra::crypto::key_establishment::Error::OutputTooSmall {
+                    output: hammer_infra::crypto::key_establishment::Output::Ciphertext,
+                    required: ciphertext_len,
+                    provided: ciphertext.len(),
+                },
+            );
         }
-        if let Some(capacity) = self.full_key_pool_capacity() {
-            return KxStatus::KeyPoolFull { capacity };
+        {
+            let keys = self.keys.borrow();
+            if keys.len() == keys.capacity() {
+                return KxStatus::KeyPoolFull {
+                    capacity: keys.capacity(),
+                };
+            }
         }
 
-        let mut entropy = Zeroizing::new(vec![0; 32]);
+        let mut entropy = Zeroizing::new(vec![0; A::ENCAPSULATION_ENTROPY_LEN]);
         if let Err(source) = getrandom::getrandom(&mut entropy) {
             return KxStatus::EntropyUnavailable { source };
         }
         let mut ciphertext_result = vec![0; ciphertext_len];
-        let mut shared_secret = Zeroizing::new(vec![0; self.algorithm.shared_secret_len()]);
-        if let Err(error) = hammer_infra::crypto::encapsulate(
-            self.algorithm,
+        let mut shared_secret = Zeroizing::new(vec![0; A::SHARED_SECRET_LEN]);
+        if let Err(error) = algorithm.encapsulate(
             peer_public_key,
             &entropy,
             &mut ciphertext_result,
             &mut shared_secret,
         ) {
-            return kx_status(error);
+            return KxStatus::Algorithm(error);
         }
 
         let key = match self.install_key(shared_secret, policy.clone()) {
@@ -639,13 +476,17 @@ impl KxPrepared {
         }
     }
 
-    fn decapsulate(
+    fn decapsulate<A>(
         &self,
+        algorithm: &A,
         private_key: KeyHandle,
         ciphertext: &[u8],
         target: PolicyAlgorithm,
-    ) -> KxStatus {
-        let mut shared_secret = Zeroizing::new(vec![0; self.algorithm.shared_secret_len()]);
+    ) -> KxStatus
+    where
+        A: hammer_infra::crypto::key_establishment::Algorithm,
+    {
+        let mut shared_secret = Zeroizing::new(vec![0; A::SHARED_SECRET_LEN]);
         let policy = {
             let keys = self.keys.borrow();
             let Some(entry) = keys.get(private_key.index) else {
@@ -667,13 +508,10 @@ impl KxPrepared {
                     capacity: keys.capacity(),
                 };
             }
-            if let Err(error) = hammer_infra::crypto::decapsulate(
-                self.algorithm,
-                &entry.material,
-                ciphertext,
-                &mut shared_secret,
-            ) {
-                return kx_status(error);
+            if let Err(error) =
+                algorithm.decapsulate(&entry.material, ciphertext, &mut shared_secret)
+            {
+                return KxStatus::Algorithm(error);
             }
             policy
         };
@@ -682,11 +520,6 @@ impl KxPrepared {
             Ok(key) => KxStatus::SharedSecret { key },
             Err(status) => status,
         }
-    }
-
-    fn full_key_pool_capacity(&self) -> Option<usize> {
-        let keys = self.keys.borrow();
-        (keys.len() == keys.capacity()).then_some(keys.capacity())
     }
 
     fn install_key(
@@ -707,71 +540,71 @@ impl KxPrepared {
     }
 }
 
-impl private::Sealed for Kx {}
+/// The digital-signing operation family.
+#[hammer_component_macros::Sign]
+#[derive(Debug)]
+pub struct Sign;
 
-impl Family for Kx {
-    type Operation<'a> = KxOperation<'a>;
-    type Prepared = KxPrepared;
-    type Prepare = hammer_infra::crypto::KeyEstablishmentAlgorithm;
-    type Dispatch = for<'a> fn(&mut KxPrepared, &mut [KxOperation<'a>]);
+/// Prepared state for a signing Context.
+pub struct SignPrepared {
+    private_key: Zeroizing<Vec<u8>>,
+}
 
-    const KEY_FAMILY: u8 = 6;
-
-    fn registry(engine: &Engine) -> &FamilyRegistry<Self> {
-        &engine.key_exchanges
-    }
-
-    fn registry_mut(engine: &mut Engine) -> &mut FamilyRegistry<Self> {
-        &mut engine.key_exchanges
-    }
-
-    fn prepare_unkeyed(
-        prepare: Self::Prepare,
-        engine: &Engine,
-        algorithm: AlgorithmId<Self>,
-    ) -> Option<Self::Prepared> {
-        Some(KxPrepared::new(prepare, algorithm, Rc::clone(&engine.keys)))
+impl fmt::Debug for SignPrepared {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SignPrepared")
+            .field("private_key_len", &self.private_key.len())
+            .finish_non_exhaustive()
     }
 }
 
-macro_rules! define_pending_family {
-    ($family:ident, $field:ident, $key:expr) => {
-        #[doc = concat!("The ", stringify!($family), " operation family.")]
-        #[derive(Debug)]
-        pub struct $family;
-
-        impl private::Sealed for $family {}
-
-        impl Family for $family {
-            type Operation<'a> = ();
-            type Prepared = ();
-            type Prepare = fn() -> ();
-            type Dispatch = for<'a> fn(&mut (), &mut [()]);
-
-            const KEY_FAMILY: u8 = $key;
-
-            fn registry(engine: &Engine) -> &FamilyRegistry<Self> {
-                &engine.$field
-            }
-
-            fn registry_mut(engine: &mut Engine) -> &mut FamilyRegistry<Self> {
-                &mut engine.$field
-            }
-
-            fn prepare_unkeyed(
-                _: Self::Prepare,
-                _: &Engine,
-                _: AlgorithmId<Self>,
-            ) -> Option<Self::Prepared> {
-                None
-            }
+impl SignPrepared {
+    /// Executes a batch through one statically selected signature implementation.
+    pub fn execute<A>(&mut self, operations: &mut [SignOperation<'_>])
+    where
+        A: hammer_infra::crypto::signature::Algorithm,
+    {
+        for operation in operations {
+            operation.result = Some(match &mut operation.request {
+                SignRequest::PublicKey { output } => {
+                    A::default().public_key(&self.private_key, output)
+                }
+                SignRequest::Sign { input, output } => input.with_fragments(|message| {
+                    A::default().sign(&self.private_key, message, output)
+                }),
+            });
         }
-    };
+    }
 }
 
-define_pending_family!(Cipher, ciphers, 3);
-define_pending_family!(Sign, signers, 7);
-define_pending_family!(Verify, verifiers, 8);
+/// The digital-signature verification operation family.
+#[hammer_component_macros::Verify]
+#[derive(Debug)]
+pub struct Verify;
+
+/// Prepared state for a verification Context.
+#[derive(Debug)]
+pub struct VerifyPrepared;
+
+impl VerifyPrepared {
+    /// Executes a batch through one statically selected signature implementation.
+    pub fn execute<A>(&mut self, operations: &mut [VerifyOperation<'_>])
+    where
+        A: hammer_infra::crypto::signature::Algorithm,
+    {
+        for operation in operations {
+            operation.result = Some(operation.input.with_fragments(|message| {
+                A::default().verify(operation.public_key, message, operation.signature)
+            }));
+        }
+    }
+}
+
+/// The unauthenticated-cipher operation family.
+#[hammer_component_macros::Cipher]
+#[derive(Debug)]
+pub struct Cipher;
 
 bitflags::bitflags! {
     /// Input and output shapes supported by a cryptographic implementation.
@@ -787,24 +620,6 @@ bitflags::bitflags! {
         const OUT_OF_PLACE = 1 << 3;
         /// Authenticate caller-provided associated data.
         const ASSOCIATED_DATA = 1 << 4;
-    }
-}
-
-/// One algorithm declaration awaiting failure-atomic publication.
-pub struct AlgorithmRegistration<F: Family> {
-    name: String,
-    required: Capabilities,
-    family: PhantomData<fn() -> F>,
-}
-
-impl<F: Family> AlgorithmRegistration<F> {
-    /// Declares canonical algorithm semantics and required operation shapes.
-    pub fn new(name: impl Into<String>, required: Capabilities) -> Self {
-        Self {
-            name: name.into(),
-            required,
-            family: PhantomData,
-        }
     }
 }
 
@@ -854,7 +669,7 @@ impl<F: Family> ImplementationRegistration<F> {
 
 /// A family-typed algorithm and implementation publication bundle.
 pub struct Registration<F: Family> {
-    algorithms: Vec<AlgorithmRegistration<F>>,
+    algorithms: Vec<(String, Capabilities)>,
     implementations: Vec<ImplementationRegistration<F>>,
 }
 
@@ -867,9 +682,9 @@ impl<F: Family> Registration<F> {
         }
     }
 
-    /// Adds one algorithm declaration to the bundle.
-    pub fn with_algorithm(mut self, algorithm: AlgorithmRegistration<F>) -> Self {
-        self.algorithms.push(algorithm);
+    /// Adds one canonical algorithm declaration to the bundle.
+    pub fn with_algorithm(mut self, name: impl Into<String>, required: Capabilities) -> Self {
+        self.algorithms.push((name.into(), required));
         self
     }
 
@@ -992,11 +807,11 @@ impl<F: Family> FamilyRegistry<F> {
 
     fn publish(&mut self, registration: Registration<F>) {
         let first_slot = self.algorithms.len();
-        for (offset, algorithm) in registration.algorithms.into_iter().enumerate() {
+        for (offset, (name, required)) in registration.algorithms.into_iter().enumerate() {
             let slot = u32::try_from(first_slot + offset)
                 .expect("registry capacity was validated before publication");
-            self.algorithm_names.insert(algorithm.name.clone(), slot);
-            self.algorithms.push(algorithm.required);
+            self.algorithm_names.insert(name, slot);
+            self.algorithms.push(required);
         }
 
         for implementation in registration.implementations {
@@ -1068,31 +883,12 @@ impl Input<'_> {
     }
 }
 
-/// The independent completion state of one hash operation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HashStatus {
-    /// The operation has not yet been executed.
-    Pending,
-    /// The complete digest was written to caller memory.
-    Complete {
-        /// Number of output bytes written.
-        written: usize,
-    },
-    /// Caller output was too short and remained unchanged.
-    OutputTooSmall {
-        /// Digest size required by the algorithm.
-        required: usize,
-        /// Capacity supplied by the caller.
-        provided: usize,
-    },
-}
-
 /// One synchronous hash request and its caller-owned output.
 #[derive(Debug)]
 pub struct HashOperation<'a> {
     input: Input<'a>,
     output: &'a mut [u8],
-    status: HashStatus,
+    result: Option<Result<usize, hammer_infra::crypto::hash::Error>>,
 }
 
 impl<'a> HashOperation<'a> {
@@ -1101,33 +897,14 @@ impl<'a> HashOperation<'a> {
         Self {
             input,
             output,
-            status: HashStatus::Pending,
+            result: None,
         }
     }
 
-    /// Returns the operation's current completion state.
-    pub fn status(&self) -> HashStatus {
-        self.status
+    /// Returns `None` until execution, then the exact digest result.
+    pub fn status(&self) -> Option<Result<usize, hammer_infra::crypto::hash::Error>> {
+        self.result
     }
-}
-
-/// The independent completion state of one message-authentication operation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MacStatus {
-    /// The operation has not yet been executed.
-    Pending,
-    /// The complete authenticator was written to caller memory.
-    Complete {
-        /// Number of output bytes written.
-        written: usize,
-    },
-    /// Caller output cannot hold the complete authenticator.
-    OutputTooSmall {
-        /// Required output size.
-        required: usize,
-        /// Caller-provided output size.
-        provided: usize,
-    },
 }
 
 /// One synchronous message-authentication request.
@@ -1135,7 +912,7 @@ pub enum MacStatus {
 pub struct MacOperation<'a> {
     input: Input<'a>,
     output: &'a mut [u8],
-    status: MacStatus,
+    result: Option<Result<usize, hammer_infra::crypto::mac::Error>>,
 }
 
 impl<'a> MacOperation<'a> {
@@ -1144,13 +921,13 @@ impl<'a> MacOperation<'a> {
         Self {
             input,
             output,
-            status: MacStatus::Pending,
+            result: None,
         }
     }
 
-    /// Returns this operation's independent completion state.
-    pub fn status(&self) -> MacStatus {
-        self.status
+    /// Returns `None` until execution, then the exact authentication result.
+    pub fn status(&self) -> Option<Result<usize, hammer_infra::crypto::mac::Error>> {
+        self.result
     }
 }
 
@@ -1171,13 +948,8 @@ pub enum KdfStatus {
         /// Configured fixed capacity.
         capacity: usize,
     },
-    /// The selected KDF cannot produce the requested length.
-    OutputTooLong {
-        /// Requested output size.
-        requested: usize,
-        /// Algorithm maximum output size.
-        maximum: usize,
-    },
+    /// The selected algorithm rejected the requested derivation.
+    Algorithm(hammer_infra::crypto::kdf::Error),
 }
 
 /// One synchronous key-derivation request.
@@ -1254,42 +1026,8 @@ pub enum KxStatus {
         /// Rejected private-key identity.
         key: KeyHandle,
     },
-    /// Private-key material is invalid for the selected algorithm.
-    InvalidPrivateKey,
-    /// Private-key material has the wrong serialized length.
-    InvalidPrivateKeyLength {
-        /// Required private-key bytes.
-        required: usize,
-        /// Supplied private-key bytes.
-        provided: usize,
-    },
-    /// Peer public-key input is invalid for the selected algorithm.
-    InvalidPeerPublicKey,
-    /// Peer public-key input has the wrong serialized length.
-    InvalidPeerPublicKeyLength {
-        /// Required public-key bytes.
-        required: usize,
-        /// Supplied public-key bytes.
-        provided: usize,
-    },
-    /// X25519 rejected a non-contributory peer public key.
-    SmallOrderPeerPublicKey,
-    /// ML-KEM ciphertext input has an invalid length.
-    InvalidCiphertext {
-        /// Required ciphertext bytes.
-        required: usize,
-        /// Supplied ciphertext bytes.
-        provided: usize,
-    },
-    /// Caller output cannot hold the complete public result.
-    OutputTooSmall {
-        /// Rejected output role.
-        output: hammer_infra::crypto::KeyEstablishmentOutput,
-        /// Required output bytes.
-        required: usize,
-        /// Supplied output bytes.
-        provided: usize,
-    },
+    /// The selected algorithm rejected an operation or its caller-owned memory.
+    Algorithm(hammer_infra::crypto::key_establishment::Error),
     /// The operating system could not provide cryptographic entropy.
     EntropyUnavailable {
         /// Original entropy-source failure.
@@ -1300,8 +1038,6 @@ pub enum KxStatus {
         /// Configured fixed capacity.
         capacity: usize,
     },
-    /// The selected algorithm does not define this operation.
-    OperationUnsupported,
 }
 
 #[derive(Debug)]
@@ -1397,6 +1133,73 @@ impl<'a> KxOperation<'a> {
     }
 }
 
+#[derive(Debug)]
+enum SignRequest<'a> {
+    PublicKey {
+        output: &'a mut [u8],
+    },
+    Sign {
+        input: Input<'a>,
+        output: &'a mut [u8],
+    },
+}
+
+/// One synchronous signing request.
+#[derive(Debug)]
+pub struct SignOperation<'a> {
+    request: SignRequest<'a>,
+    result: Option<Result<usize, hammer_infra::crypto::signature::SignError>>,
+}
+
+impl<'a> SignOperation<'a> {
+    /// Creates a pending public-key derivation request.
+    pub fn public_key(output: &'a mut [u8]) -> Self {
+        Self {
+            request: SignRequest::PublicKey { output },
+            result: None,
+        }
+    }
+
+    /// Creates a pending signature request.
+    pub fn sign(input: Input<'a>, output: &'a mut [u8]) -> Self {
+        Self {
+            request: SignRequest::Sign { input, output },
+            result: None,
+        }
+    }
+
+    /// Returns `None` until execution, then the written length or signing error.
+    pub fn status(&self) -> Option<Result<usize, hammer_infra::crypto::signature::SignError>> {
+        self.result
+    }
+}
+
+/// One synchronous signature-verification request.
+#[derive(Debug)]
+pub struct VerifyOperation<'a> {
+    public_key: &'a [u8],
+    input: Input<'a>,
+    signature: &'a [u8],
+    result: Option<Result<(), hammer_infra::crypto::signature::VerifyError>>,
+}
+
+impl<'a> VerifyOperation<'a> {
+    /// Creates a pending signature-verification request.
+    pub fn verify(public_key: &'a [u8], input: Input<'a>, signature: &'a [u8]) -> Self {
+        Self {
+            public_key,
+            input,
+            signature,
+            result: None,
+        }
+    }
+
+    /// Returns `None` until execution, then the verification result.
+    pub fn status(&self) -> Option<Result<(), hammer_infra::crypto::signature::VerifyError>> {
+        self.result
+    }
+}
+
 /// The authenticated-encryption operation being requested.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AeadDirection {
@@ -1411,36 +1214,8 @@ pub enum AeadDirection {
 pub enum AeadStatus {
     /// The operation has not yet been executed.
     Pending,
-    /// The complete payload was written or transformed in place.
-    Complete {
-        /// Number of payload bytes written.
-        written: usize,
-    },
-    /// Caller output was too short and remained unchanged.
-    OutputTooSmall {
-        /// Payload size required by the operation.
-        required: usize,
-        /// Capacity supplied by the caller.
-        provided: usize,
-    },
-    /// The nonce length is invalid for the selected algorithm.
-    InvalidNonceLength {
-        /// Nonce size required by the algorithm.
-        required: usize,
-        /// Nonce size supplied by the caller.
-        provided: usize,
-    },
-    /// The detached tag memory has an invalid length.
-    InvalidTagLength {
-        /// Tag size required by the algorithm.
-        required: usize,
-        /// Tag size supplied by the caller.
-        provided: usize,
-    },
-    /// The authentication tag did not validate and no plaintext was retained.
-    AuthenticationFailed,
-    /// The payload exceeded the selected algorithm's size limit.
-    InputTooLong,
+    /// The selected implementation completed and retained its exact typed result.
+    Executed(Result<usize, hammer_infra::crypto::aead::Error>),
     /// The key policy denied this operation.
     PolicyDenied {
         /// Operation denied by the immutable policy.
@@ -1551,19 +1326,6 @@ impl<'a> AeadOperation<'a> {
     }
 }
 
-/// A typed set of operations dispatched synchronously as one unit.
-#[derive(Debug)]
-pub struct Batch<'batch, 'data, F: Family> {
-    operations: &'batch mut [F::Operation<'data>],
-}
-
-impl<'batch, 'data, F: Family> Batch<'batch, 'data, F> {
-    /// Borrows the operations that comprise this batch.
-    pub fn new(operations: &'batch mut [F::Operation<'data>]) -> Self {
-        Self { operations }
-    }
-}
-
 bitflags::bitflags! {
     /// Operations permitted by an immutable Key Policy.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1580,6 +1342,8 @@ bitflags::bitflags! {
         const KX_AGREE = 1 << 4;
         /// Decapsulate an ML-KEM shared secret.
         const KX_DECAPSULATE = 1 << 5;
+        /// Produce digital signatures with a private key.
+        const SIGN = 1 << 6;
     }
 }
 
@@ -1762,203 +1526,278 @@ impl Engine {
         let mut engine = Self::new();
         engine.publish(
             Registration::new()
-                .with_algorithm(AlgorithmRegistration::<Hash>::new(
-                    "sha-256",
-                    hash_capabilities,
-                ))
-                .with_algorithm(AlgorithmRegistration::<Hash>::new(
-                    "sha-384",
-                    hash_capabilities,
-                ))
-                .with_algorithm(AlgorithmRegistration::<Hash>::new(
-                    "sha-512",
-                    hash_capabilities,
-                ))
-                .with_algorithm(AlgorithmRegistration::<Hash>::new(
-                    "blake2s-256",
-                    hash_capabilities,
-                ))
-                .with_algorithm(AlgorithmRegistration::<Hash>::new(
-                    "blake2b-512",
-                    hash_capabilities,
-                ))
+                .with_algorithm("sha-256", hash_capabilities)
+                .with_algorithm("sha-384", hash_capabilities)
+                .with_algorithm("sha-512", hash_capabilities)
+                .with_algorithm("blake2s-256", hash_capabilities)
+                .with_algorithm("blake2b-512", hash_capabilities)
                 .with_implementation(
                     ImplementationRegistration::<Hash>::new("hammer:hash-portable", 0, true)
                         .with_algorithm(
                             "sha-256",
                             hash_capabilities,
-                            hammer_infra::crypto::HashAlgorithm::Sha256,
-                            HashPrepared::execute,
+                            (),
+                            HashPrepared::execute::<hammer_infra::crypto::hash::Sha256>,
                         )
                         .with_algorithm(
                             "sha-384",
                             hash_capabilities,
-                            hammer_infra::crypto::HashAlgorithm::Sha384,
-                            HashPrepared::execute,
+                            (),
+                            HashPrepared::execute::<hammer_infra::crypto::hash::Sha384>,
                         )
                         .with_algorithm(
                             "sha-512",
                             hash_capabilities,
-                            hammer_infra::crypto::HashAlgorithm::Sha512,
-                            HashPrepared::execute,
+                            (),
+                            HashPrepared::execute::<hammer_infra::crypto::hash::Sha512>,
                         )
                         .with_algorithm(
                             "blake2s-256",
                             hash_capabilities,
-                            hammer_infra::crypto::HashAlgorithm::Blake2s,
-                            HashPrepared::execute,
+                            (),
+                            HashPrepared::execute::<hammer_infra::crypto::hash::Blake2s256>,
                         )
                         .with_algorithm(
                             "blake2b-512",
                             hash_capabilities,
-                            hammer_infra::crypto::HashAlgorithm::Blake2b,
-                            HashPrepared::execute,
+                            (),
+                            HashPrepared::execute::<hammer_infra::crypto::hash::Blake2b512>,
                         ),
                 ),
         )?;
         engine.publish(
             Registration::new()
-                .with_algorithm(AlgorithmRegistration::<Aead>::new(
-                    "aes-128-gcm",
-                    aead_capabilities,
-                ))
-                .with_algorithm(AlgorithmRegistration::<Aead>::new(
-                    "aes-256-gcm",
-                    aead_capabilities,
-                ))
-                .with_algorithm(AlgorithmRegistration::<Aead>::new(
-                    "chacha20-poly1305",
-                    aead_capabilities,
-                ))
+                .with_algorithm("aes-128-gcm", aead_capabilities)
+                .with_algorithm("aes-256-gcm", aead_capabilities)
+                .with_algorithm("chacha20-poly1305", aead_capabilities)
                 .with_implementation(
                     ImplementationRegistration::<Aead>::new("hammer:aead-portable", 0, true)
                         .with_algorithm(
                             "aes-128-gcm",
                             aead_capabilities,
-                            hammer_infra::crypto::AeadAlgorithm::Aes128Gcm,
-                            AeadPrepared::execute,
+                            <hammer_infra::crypto::aead::Aes128Gcm as hammer_infra::crypto::aead::Algorithm>::KEY_LEN,
+                            AeadPrepared::execute::<hammer_infra::crypto::aead::Aes128Gcm>,
                         )
                         .with_algorithm(
                             "aes-256-gcm",
                             aead_capabilities,
-                            hammer_infra::crypto::AeadAlgorithm::Aes256Gcm,
-                            AeadPrepared::execute,
+                            <hammer_infra::crypto::aead::Aes256Gcm as hammer_infra::crypto::aead::Algorithm>::KEY_LEN,
+                            AeadPrepared::execute::<hammer_infra::crypto::aead::Aes256Gcm>,
                         )
                         .with_algorithm(
                             "chacha20-poly1305",
                             aead_capabilities,
-                            hammer_infra::crypto::AeadAlgorithm::ChaCha20Poly1305,
-                            AeadPrepared::execute,
+                            <hammer_infra::crypto::aead::ChaCha20Poly1305 as hammer_infra::crypto::aead::Algorithm>::KEY_LEN,
+                            AeadPrepared::execute::<hammer_infra::crypto::aead::ChaCha20Poly1305>,
                         ),
                 ),
         )?;
         engine.publish(
             Registration::new()
-                .with_algorithm(AlgorithmRegistration::<Mac>::new(
-                    "hmac-sha-256",
-                    hash_capabilities,
-                ))
-                .with_algorithm(AlgorithmRegistration::<Mac>::new(
-                    "hmac-sha-384",
-                    hash_capabilities,
-                ))
-                .with_algorithm(AlgorithmRegistration::<Mac>::new(
-                    "hmac-sha-512",
-                    hash_capabilities,
-                ))
+                .with_algorithm("hmac-sha-256", hash_capabilities)
+                .with_algorithm("hmac-sha-384", hash_capabilities)
+                .with_algorithm("hmac-sha-512", hash_capabilities)
                 .with_implementation(
                     ImplementationRegistration::<Mac>::new("hammer:hmac-portable", 0, true)
                         .with_algorithm(
                             "hmac-sha-256",
                             hash_capabilities,
-                            hammer_infra::crypto::Sha2Algorithm::Sha256,
-                            MacPrepared::execute,
+                            (),
+                            MacPrepared::execute::<hammer_infra::crypto::mac::HmacSha256>,
                         )
                         .with_algorithm(
                             "hmac-sha-384",
                             hash_capabilities,
-                            hammer_infra::crypto::Sha2Algorithm::Sha384,
-                            MacPrepared::execute,
+                            (),
+                            MacPrepared::execute::<hammer_infra::crypto::mac::HmacSha384>,
                         )
                         .with_algorithm(
                             "hmac-sha-512",
                             hash_capabilities,
-                            hammer_infra::crypto::Sha2Algorithm::Sha512,
-                            MacPrepared::execute,
+                            (),
+                            MacPrepared::execute::<hammer_infra::crypto::mac::HmacSha512>,
                         ),
                 ),
         )?;
         engine.publish(
             Registration::new()
-                .with_algorithm(AlgorithmRegistration::<Kdf>::new(
-                    "hkdf-sha-256",
-                    kdf_capabilities,
-                ))
-                .with_algorithm(AlgorithmRegistration::<Kdf>::new(
-                    "hkdf-sha-384",
-                    kdf_capabilities,
-                ))
-                .with_algorithm(AlgorithmRegistration::<Kdf>::new(
-                    "hkdf-sha-512",
-                    kdf_capabilities,
-                ))
+                .with_algorithm("hkdf-sha-256", kdf_capabilities)
+                .with_algorithm("hkdf-sha-384", kdf_capabilities)
+                .with_algorithm("hkdf-sha-512", kdf_capabilities)
                 .with_implementation(
                     ImplementationRegistration::<Kdf>::new("hammer:hkdf-portable", 0, true)
                         .with_algorithm(
                             "hkdf-sha-256",
                             kdf_capabilities,
-                            hammer_infra::crypto::Sha2Algorithm::Sha256,
-                            KdfPrepared::execute,
+                            (),
+                            KdfPrepared::execute::<hammer_infra::crypto::kdf::HkdfSha256>,
                         )
                         .with_algorithm(
                             "hkdf-sha-384",
                             kdf_capabilities,
-                            hammer_infra::crypto::Sha2Algorithm::Sha384,
-                            KdfPrepared::execute,
+                            (),
+                            KdfPrepared::execute::<hammer_infra::crypto::kdf::HkdfSha384>,
                         )
                         .with_algorithm(
                             "hkdf-sha-512",
                             kdf_capabilities,
-                            hammer_infra::crypto::Sha2Algorithm::Sha512,
-                            KdfPrepared::execute,
+                            (),
+                            KdfPrepared::execute::<hammer_infra::crypto::kdf::HkdfSha512>,
                         ),
                 ),
         )?;
         engine.publish(
             Registration::new()
-                .with_algorithm(AlgorithmRegistration::<Kx>::new("x25519", kx_capabilities))
-                .with_algorithm(AlgorithmRegistration::<Kx>::new("p-256", kx_capabilities))
-                .with_algorithm(AlgorithmRegistration::<Kx>::new("p-384", kx_capabilities))
-                .with_algorithm(AlgorithmRegistration::<Kx>::new(
-                    "ml-kem-768",
-                    kx_capabilities,
-                ))
+                .with_algorithm("x25519", kx_capabilities)
+                .with_algorithm("p-256", kx_capabilities)
+                .with_algorithm("p-384", kx_capabilities)
+                .with_algorithm("ml-kem-768", kx_capabilities)
                 .with_implementation(
                     ImplementationRegistration::<Kx>::new("hammer:kx-portable", 0, true)
                         .with_algorithm(
                             "x25519",
                             kx_capabilities,
-                            hammer_infra::crypto::KeyEstablishmentAlgorithm::X25519,
-                            KxPrepared::execute,
+                            (),
+                            KxPrepared::execute::<hammer_infra::crypto::key_establishment::X25519>,
                         )
                         .with_algorithm(
                             "p-256",
                             kx_capabilities,
-                            hammer_infra::crypto::KeyEstablishmentAlgorithm::P256,
-                            KxPrepared::execute,
+                            (),
+                            KxPrepared::execute::<hammer_infra::crypto::key_establishment::P256>,
                         )
                         .with_algorithm(
                             "p-384",
                             kx_capabilities,
-                            hammer_infra::crypto::KeyEstablishmentAlgorithm::P384,
-                            KxPrepared::execute,
+                            (),
+                            KxPrepared::execute::<hammer_infra::crypto::key_establishment::P384>,
                         )
                         .with_algorithm(
                             "ml-kem-768",
                             kx_capabilities,
-                            hammer_infra::crypto::KeyEstablishmentAlgorithm::MlKem768,
-                            KxPrepared::execute,
+                            (),
+                            KxPrepared::execute::<hammer_infra::crypto::key_establishment::MlKem768>,
                         ),
+                ),
+        )?;
+        engine.publish(
+            Registration::new()
+                .with_algorithm("ed25519", hash_capabilities)
+                .with_algorithm("ecdsa-p-256-sha-256", hash_capabilities)
+                .with_algorithm("ecdsa-p-384-sha-384", hash_capabilities)
+                .with_algorithm("rsa-pss-sha-256", hash_capabilities)
+                .with_algorithm("rsa-pss-sha-384", hash_capabilities)
+                .with_algorithm("rsa-pss-sha-512", hash_capabilities)
+                .with_implementation(
+                    ImplementationRegistration::<Sign>::new("hammer:sign-portable", 0, true)
+                        .with_algorithm(
+                            "ed25519",
+                            hash_capabilities,
+                            (),
+                            SignPrepared::execute::<hammer_infra::crypto::signature::Ed25519>,
+                        )
+                        .with_algorithm(
+                            "ecdsa-p-256-sha-256",
+                            hash_capabilities,
+                            (),
+                            SignPrepared::execute::<
+                                hammer_infra::crypto::signature::EcdsaP256Sha256,
+                            >,
+                        )
+                        .with_algorithm(
+                            "ecdsa-p-384-sha-384",
+                            hash_capabilities,
+                            (),
+                            SignPrepared::execute::<
+                                hammer_infra::crypto::signature::EcdsaP384Sha384,
+                            >,
+                        )
+                        .with_algorithm(
+                            "rsa-pss-sha-256",
+                            hash_capabilities,
+                            (),
+                            SignPrepared::execute::<
+                                hammer_infra::crypto::signature::RsaPssSha256,
+                            >,
+                        )
+                        .with_algorithm(
+                            "rsa-pss-sha-384",
+                            hash_capabilities,
+                            (),
+                            SignPrepared::execute::<
+                                hammer_infra::crypto::signature::RsaPssSha384,
+                            >,
+                        )
+                        .with_algorithm(
+                            "rsa-pss-sha-512",
+                            hash_capabilities,
+                            (),
+                            SignPrepared::execute::<
+                                hammer_infra::crypto::signature::RsaPssSha512,
+                            >,
+                        ),
+                ),
+        )?;
+        engine.publish(
+            Registration::new()
+                .with_algorithm("ed25519", hash_capabilities)
+                .with_algorithm("ecdsa-p-256-sha-256", hash_capabilities)
+                .with_algorithm("ecdsa-p-384-sha-384", hash_capabilities)
+                .with_algorithm("rsa-pss-sha-256", hash_capabilities)
+                .with_algorithm("rsa-pss-sha-384", hash_capabilities)
+                .with_algorithm("rsa-pss-sha-512", hash_capabilities)
+                .with_implementation(
+                    ImplementationRegistration::<Verify>::new(
+                        "hammer:verify-portable",
+                        0,
+                        true,
+                    )
+                    .with_algorithm(
+                        "ed25519",
+                        hash_capabilities,
+                        (),
+                        VerifyPrepared::execute::<hammer_infra::crypto::signature::Ed25519>,
+                    )
+                    .with_algorithm(
+                        "ecdsa-p-256-sha-256",
+                        hash_capabilities,
+                        (),
+                        VerifyPrepared::execute::<
+                            hammer_infra::crypto::signature::EcdsaP256Sha256,
+                        >,
+                    )
+                    .with_algorithm(
+                        "ecdsa-p-384-sha-384",
+                        hash_capabilities,
+                        (),
+                        VerifyPrepared::execute::<
+                            hammer_infra::crypto::signature::EcdsaP384Sha384,
+                        >,
+                    )
+                    .with_algorithm(
+                        "rsa-pss-sha-256",
+                        hash_capabilities,
+                        (),
+                        VerifyPrepared::execute::<
+                            hammer_infra::crypto::signature::RsaPssSha256,
+                        >,
+                    )
+                    .with_algorithm(
+                        "rsa-pss-sha-384",
+                        hash_capabilities,
+                        (),
+                        VerifyPrepared::execute::<
+                            hammer_infra::crypto::signature::RsaPssSha384,
+                        >,
+                    )
+                    .with_algorithm(
+                        "rsa-pss-sha-512",
+                        hash_capabilities,
+                        (),
+                        VerifyPrepared::execute::<
+                            hammer_infra::crypto::signature::RsaPssSha512,
+                        >,
+                    ),
                 ),
         )?;
         Ok(engine)
@@ -2163,17 +2002,6 @@ impl Engine {
             thread_bound: PhantomData,
         })
     }
-
-    fn implementation_name_exists(&self, name: &str) -> bool {
-        self.aeads.implementation_names.contains_key(name)
-            || self.ciphers.implementation_names.contains_key(name)
-            || self.hashes.implementation_names.contains_key(name)
-            || self.macs.implementation_names.contains_key(name)
-            || self.kdfs.implementation_names.contains_key(name)
-            || self.key_exchanges.implementation_names.contains_key(name)
-            || self.signers.implementation_names.contains_key(name)
-            || self.verifiers.implementation_names.contains_key(name)
-    }
 }
 
 impl Default for Engine {
@@ -2217,11 +2045,11 @@ impl<F: Family> Context<F> {
     }
 
     /// Executes all operations synchronously through one batch dispatch.
-    pub fn execute<'data>(&mut self, batch: &mut Batch<'_, 'data, F>)
+    pub fn execute<'data>(&mut self, operations: &mut [F::Operation<'data>])
     where
         F::Dispatch: Fn(&mut F::Prepared, &mut [F::Operation<'data>]),
     {
-        (self.dispatch)(&mut self.prepared, batch.operations);
+        (self.dispatch)(&mut self.prepared, operations);
     }
 }
 
@@ -2371,7 +2199,7 @@ pub enum ContextError {
         provided: usize,
         /// Portable algorithm preparation failure.
         #[source]
-        source: hammer_infra::crypto::AeadError,
+        source: hammer_infra::crypto::aead::Error,
     },
 }
 
@@ -2434,23 +2262,66 @@ impl Engine {
         }
 
         let mut algorithms = HashMap::new();
-        for algorithm in &registration.algorithms {
-            validate_algorithm_name(&algorithm.name)?;
-            if registry.algorithm_names.contains_key(&algorithm.name)
-                || algorithms
-                    .insert(algorithm.name.as_str(), algorithm.required)
-                    .is_some()
+        for (name, required) in &registration.algorithms {
+            let mut components = name.split(':');
+            let first = components.next().unwrap_or_default();
+            let second = components.next();
+            let valid = valid_name_component(first)
+                && second.is_none_or(valid_name_component)
+                && components.next().is_none();
+            if !valid {
+                return Err(RegistryError::MalformedAlgorithmName { name: name.clone() });
+            }
+            if registry.algorithm_names.contains_key(name)
+                || algorithms.insert(name.as_str(), *required).is_some()
             {
-                return Err(RegistryError::AlgorithmCollision {
-                    name: algorithm.name.clone(),
-                });
+                return Err(RegistryError::AlgorithmCollision { name: name.clone() });
             }
         }
 
         let mut implementations = BTreeSet::new();
         for implementation in &registration.implementations {
-            validate_implementation_name(&implementation.name)?;
-            if self.implementation_name_exists(&implementation.name)
+            let mut components = implementation.name.split(':');
+            let valid = components.next().is_some_and(valid_name_component)
+                && components.next().is_some_and(valid_name_component)
+                && components.next().is_none();
+            if !valid {
+                return Err(RegistryError::MalformedImplementationName {
+                    name: implementation.name.clone(),
+                });
+            }
+            if self
+                .aeads
+                .implementation_names
+                .contains_key(&implementation.name)
+                || self
+                    .ciphers
+                    .implementation_names
+                    .contains_key(&implementation.name)
+                || self
+                    .hashes
+                    .implementation_names
+                    .contains_key(&implementation.name)
+                || self
+                    .macs
+                    .implementation_names
+                    .contains_key(&implementation.name)
+                || self
+                    .kdfs
+                    .implementation_names
+                    .contains_key(&implementation.name)
+                || self
+                    .key_exchanges
+                    .implementation_names
+                    .contains_key(&implementation.name)
+                || self
+                    .signers
+                    .implementation_names
+                    .contains_key(&implementation.name)
+                || self
+                    .verifiers
+                    .implementation_names
+                    .contains_key(&implementation.name)
                 || !implementations.insert(implementation.name.as_str())
             {
                 return Err(RegistryError::ImplementationCollision {
@@ -2496,36 +2367,6 @@ impl Engine {
     }
 }
 
-fn validate_algorithm_name(name: &str) -> Result<(), RegistryError> {
-    let mut components = name.split(':');
-    let first = components.next().unwrap_or_default();
-    let second = components.next();
-    let valid = valid_name_component(first)
-        && second.is_none_or(valid_name_component)
-        && components.next().is_none();
-    if valid {
-        Ok(())
-    } else {
-        Err(RegistryError::MalformedAlgorithmName {
-            name: name.to_owned(),
-        })
-    }
-}
-
-fn validate_implementation_name(name: &str) -> Result<(), RegistryError> {
-    let mut components = name.split(':');
-    let valid = components.next().is_some_and(valid_name_component)
-        && components.next().is_some_and(valid_name_component)
-        && components.next().is_none();
-    if valid {
-        Ok(())
-    } else {
-        Err(RegistryError::MalformedImplementationName {
-            name: name.to_owned(),
-        })
-    }
-}
-
 fn valid_name_component(name: &str) -> bool {
     !name.is_empty()
         && name
@@ -2534,70 +2375,4 @@ fn valid_name_component(name: &str) -> bool {
         && !name.starts_with('-')
         && !name.ends_with('-')
         && !name.contains("--")
-}
-
-fn kx_status(error: hammer_infra::crypto::KeyEstablishmentError) -> KxStatus {
-    match error {
-        hammer_infra::crypto::KeyEstablishmentError::InvalidEntropyLength { .. } => {
-            unreachable!("key-establishment entropy storage has the required length")
-        }
-        hammer_infra::crypto::KeyEstablishmentError::InvalidPrivateKeyLength {
-            required,
-            provided,
-        } => KxStatus::InvalidPrivateKeyLength { required, provided },
-        hammer_infra::crypto::KeyEstablishmentError::InvalidPrivateKey => {
-            KxStatus::InvalidPrivateKey
-        }
-        hammer_infra::crypto::KeyEstablishmentError::InvalidPublicKeyLength {
-            required,
-            provided,
-        } => KxStatus::InvalidPeerPublicKeyLength { required, provided },
-        hammer_infra::crypto::KeyEstablishmentError::InvalidPublicKey => {
-            KxStatus::InvalidPeerPublicKey
-        }
-        hammer_infra::crypto::KeyEstablishmentError::SmallOrderPublicKey => {
-            KxStatus::SmallOrderPeerPublicKey
-        }
-        hammer_infra::crypto::KeyEstablishmentError::InvalidCiphertextLength {
-            required,
-            provided,
-        } => KxStatus::InvalidCiphertext { required, provided },
-        hammer_infra::crypto::KeyEstablishmentError::OutputTooSmall {
-            output,
-            required,
-            provided,
-        } => KxStatus::OutputTooSmall {
-            output,
-            required,
-            provided,
-        },
-        hammer_infra::crypto::KeyEstablishmentError::OperationUnsupported { .. } => {
-            KxStatus::OperationUnsupported
-        }
-    }
-}
-
-fn aead_status(result: Result<usize, hammer_infra::crypto::AeadError>) -> AeadStatus {
-    match result {
-        Ok(written) => AeadStatus::Complete { written },
-        Err(hammer_infra::crypto::AeadError::OutputTooSmall { required, provided }) => {
-            AeadStatus::OutputTooSmall { required, provided }
-        }
-        Err(hammer_infra::crypto::AeadError::InvalidNonceLength { required, provided }) => {
-            AeadStatus::InvalidNonceLength { required, provided }
-        }
-        Err(hammer_infra::crypto::AeadError::InvalidTagLength { required, provided }) => {
-            AeadStatus::InvalidTagLength { required, provided }
-        }
-        Err(hammer_infra::crypto::AeadError::AuthenticationFailed) => {
-            AeadStatus::AuthenticationFailed
-        }
-        Err(
-            hammer_infra::crypto::AeadError::InputLengthOverflow
-            | hammer_infra::crypto::AeadError::InputTooLong,
-        ) => AeadStatus::InputTooLong,
-        Err(hammer_infra::crypto::AeadError::InvalidKeyLength { .. }) => {
-            unreachable!("AEAD key length is validated while preparing the Context")
-        }
-    }
 }

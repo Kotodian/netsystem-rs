@@ -1,9 +1,9 @@
 use std::error::Error;
 
-use hammer_infra::crypto::AeadError;
+use hammer_infra::crypto::aead::Error as AeadError;
 use hammer_service::crypto::{
-    Aead, AeadDirection, AeadOperation, AeadStatus, Batch, ContextError, Engine, Hash, Input,
-    KeyError, KeyOperations, KeyPolicy,
+    Aead, AeadDirection, AeadOperation, AeadStatus, ContextError, Engine, Hash, Input, KeyError,
+    KeyOperations, KeyPolicy,
 };
 
 const CIPHERTEXT: [u8; 16] = [
@@ -40,11 +40,9 @@ fn aead_context_executes_scatter_gather_seal_batch() {
         &mut output,
         &mut tag,
     )];
-    let mut batch = Batch::new(&mut operations);
+    context.execute(&mut operations);
 
-    context.execute(&mut batch);
-
-    assert_eq!(operations[0].status(), AeadStatus::Complete { written: 16 });
+    assert_eq!(operations[0].status(), AeadStatus::Executed(Ok(16)));
     assert_eq!((output, tag), (CIPHERTEXT, TAG));
 }
 
@@ -71,11 +69,12 @@ fn aead_authentication_failure_is_per_operation_and_exposes_no_plaintext() {
         &invalid_tag,
         &mut output,
     )];
-    let mut batch = Batch::new(&mut operations);
+    context.execute(&mut operations);
 
-    context.execute(&mut batch);
-
-    assert_eq!(operations[0].status(), AeadStatus::AuthenticationFailed);
+    assert_eq!(
+        operations[0].status(),
+        AeadStatus::Executed(Err(AeadError::AuthenticationFailed))
+    );
     assert_eq!(output, [0; 16]);
 }
 
@@ -163,8 +162,8 @@ fn aead_context_round_trips_in_place_with_associated_data() {
             b"associated-data",
             &mut tag,
         )];
-        context.execute(&mut Batch::new(&mut operations));
-        assert_eq!(operations[0].status(), AeadStatus::Complete { written: 17 });
+        context.execute(&mut operations);
+        assert_eq!(operations[0].status(), AeadStatus::Executed(Ok(17)));
     }
     {
         let mut operations = [AeadOperation::open_in_place(
@@ -173,8 +172,8 @@ fn aead_context_round_trips_in_place_with_associated_data() {
             b"associated-data",
             &tag,
         )];
-        context.execute(&mut Batch::new(&mut operations));
-        assert_eq!(operations[0].status(), AeadStatus::Complete { written: 17 });
+        context.execute(&mut operations);
+        assert_eq!(operations[0].status(), AeadStatus::Executed(Ok(17)));
     }
 
     assert_eq!(payload, original);
@@ -202,7 +201,7 @@ fn aead_batch_reports_operation_policy_denial_without_mutating_output() {
         &mut output,
     )];
 
-    context.execute(&mut Batch::new(&mut operations));
+    context.execute(&mut operations);
 
     assert_eq!(
         operations[0].status(),

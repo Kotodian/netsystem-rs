@@ -1,6 +1,6 @@
-use hammer_infra::crypto::KeyEstablishmentOutput;
+use hammer_infra::crypto::key_establishment::{Error as KeyEstablishmentError, Output};
 use hammer_service::crypto::{
-    Batch, Engine, Kdf, KeyError, KeyOperations, KeyPolicy, Kx, KxOperation, KxStatus,
+    Engine, Kdf, KeyError, KeyOperations, KeyPolicy, Kx, KxOperation, KxStatus,
 };
 
 const X25519_PRIVATE: [u8; 32] = [
@@ -49,7 +49,7 @@ fn x25519_context_matches_the_rfc_7748_shared_secret() {
         .expect("X25519 Context is prepared");
     let mut operations = [KxOperation::agree(private_key, &X25519_PEER_PUBLIC, target)];
 
-    context.execute(&mut Batch::new(&mut operations));
+    context.execute(&mut operations);
 
     let status = operations[0].status();
     let KxStatus::SharedSecret { key: shared_key } = status else {
@@ -86,7 +86,7 @@ fn nist_curve_contexts_generate_opaque_keys_and_agree_symmetrically() {
                 private_policy.clone(),
                 &mut alice_public,
             )];
-            context.execute(&mut Batch::new(&mut operations));
+            context.execute(&mut operations);
             let status = operations[0].status();
             let KxStatus::Generated { key, .. } = status else {
                 panic!("key generation did not return an opaque private key: {status:?}")
@@ -98,7 +98,7 @@ fn nist_curve_contexts_generate_opaque_keys_and_agree_symmetrically() {
                 private_policy.clone(),
                 &mut bob_public,
             )];
-            context.execute(&mut Batch::new(&mut operations));
+            context.execute(&mut operations);
             let status = operations[0].status();
             let KxStatus::Generated { key, .. } = status else {
                 panic!("key generation did not return an opaque private key: {status:?}")
@@ -107,7 +107,7 @@ fn nist_curve_contexts_generate_opaque_keys_and_agree_symmetrically() {
         };
         let alice_shared = {
             let mut operations = [KxOperation::agree(alice_key, &bob_public, target)];
-            context.execute(&mut Batch::new(&mut operations));
+            context.execute(&mut operations);
             let status = operations[0].status();
             let KxStatus::SharedSecret { key } = status else {
                 panic!("agreement did not return an opaque shared secret: {status:?}")
@@ -116,7 +116,7 @@ fn nist_curve_contexts_generate_opaque_keys_and_agree_symmetrically() {
         };
         let bob_shared = {
             let mut operations = [KxOperation::agree(bob_key, &alice_public, target)];
-            context.execute(&mut Batch::new(&mut operations));
+            context.execute(&mut operations);
             let status = operations[0].status();
             let KxStatus::SharedSecret { key } = status else {
                 panic!("agreement did not return an opaque shared secret: {status:?}")
@@ -157,7 +157,7 @@ fn ml_kem_context_round_trips_without_returning_secret_bytes() {
             private_policy,
             &mut public_key,
         )];
-        context.execute(&mut Batch::new(&mut operations));
+        context.execute(&mut operations);
         let status = operations[0].status();
         let KxStatus::Generated { key, .. } = status else {
             panic!("key generation did not return an opaque private key: {status:?}")
@@ -171,7 +171,7 @@ fn ml_kem_context_round_trips_without_returning_secret_bytes() {
             shared_policy,
             &mut ciphertext,
         )];
-        context.execute(&mut Batch::new(&mut operations));
+        context.execute(&mut operations);
         let KxStatus::Encapsulated { key, .. } = operations[0].status() else {
             panic!("encapsulation did not return an opaque secret")
         };
@@ -179,7 +179,7 @@ fn ml_kem_context_round_trips_without_returning_secret_bytes() {
     };
     let receiver_key = {
         let mut operations = [KxOperation::decapsulate(private_key, &ciphertext, target)];
-        context.execute(&mut Batch::new(&mut operations));
+        context.execute(&mut operations);
         let status = operations[0].status();
         let KxStatus::SharedSecret { key } = status else {
             panic!("decapsulation did not return an opaque shared secret: {status:?}")
@@ -222,7 +222,7 @@ fn key_agreement_reports_policy_denial_without_creating_a_secret() {
         .expect("X25519 Context is prepared");
     let mut operations = [KxOperation::agree(private_key, &X25519_PEER_PUBLIC, target)];
 
-    context.execute(&mut Batch::new(&mut operations));
+    context.execute(&mut operations);
 
     assert_eq!(
         operations[0].status(),
@@ -253,7 +253,7 @@ fn key_agreement_reports_a_stale_private_key_handle() {
         .expect("X25519 Context is prepared");
     let mut operations = [KxOperation::agree(private_key, &X25519_PEER_PUBLIC, target)];
 
-    context.execute(&mut Batch::new(&mut operations));
+    context.execute(&mut operations);
 
     assert_eq!(
         operations[0].status(),
@@ -276,15 +276,15 @@ fn key_generation_capacity_failure_leaves_public_output_unchanged() {
         &mut public_key,
     )];
 
-    context.execute(&mut Batch::new(&mut operations));
+    context.execute(&mut operations);
 
     assert_eq!(
         operations[0].status(),
-        KxStatus::OutputTooSmall {
-            output: KeyEstablishmentOutput::PublicKey,
+        KxStatus::Algorithm(KeyEstablishmentError::OutputTooSmall {
+            output: Output::PublicKey,
             required: 32,
             provided: 31,
-        }
+        })
     );
     assert_eq!(public_key, [0xa5; 31]);
 }
@@ -305,7 +305,7 @@ fn key_generation_rejects_a_policy_for_another_algorithm() {
         &mut public_key,
     )];
 
-    context.execute(&mut Batch::new(&mut operations));
+    context.execute(&mut operations);
 
     assert_eq!(operations[0].status(), KxStatus::GenerationPolicyDenied);
     assert_eq!(public_key, [0xa5; 32]);
@@ -329,7 +329,7 @@ fn ml_kem_ciphertext_capacity_failure_leaves_output_unchanged() {
             KeyPolicy::new(algorithm, KeyOperations::KX_DECAPSULATE, false),
             &mut public_key,
         )];
-        context.execute(&mut Batch::new(&mut operations));
+        context.execute(&mut operations);
         let status = operations[0].status();
         assert!(
             matches!(status, KxStatus::Generated { .. }),
@@ -343,15 +343,15 @@ fn ml_kem_ciphertext_capacity_failure_leaves_output_unchanged() {
         &mut ciphertext,
     )];
 
-    context.execute(&mut Batch::new(&mut operations));
+    context.execute(&mut operations);
 
     assert_eq!(
         operations[0].status(),
-        KxStatus::OutputTooSmall {
-            output: KeyEstablishmentOutput::Ciphertext,
+        KxStatus::Algorithm(KeyEstablishmentError::OutputTooSmall {
+            output: Output::Ciphertext,
             required: 1088,
             provided: 1087,
-        }
+        })
     );
     assert_eq!(ciphertext, vec![0xa5; 1087]);
 }
@@ -376,7 +376,7 @@ fn ml_kem_decapsulation_reports_invalid_ciphertext_length() {
             private_policy,
             &mut public_key,
         )];
-        context.execute(&mut Batch::new(&mut operations));
+        context.execute(&mut operations);
         let status = operations[0].status();
         let KxStatus::Generated { key, .. } = status else {
             panic!("key generation did not return an opaque private key: {status:?}")
@@ -385,14 +385,14 @@ fn ml_kem_decapsulation_reports_invalid_ciphertext_length() {
     };
     let mut operations = [KxOperation::decapsulate(private_key, &[0; 1087], target)];
 
-    context.execute(&mut Batch::new(&mut operations));
+    context.execute(&mut operations);
 
     assert_eq!(
         operations[0].status(),
-        KxStatus::InvalidCiphertext {
+        KxStatus::Algorithm(KeyEstablishmentError::InvalidCiphertextLength {
             required: 1088,
             provided: 1087,
-        }
+        })
     );
 }
 
@@ -420,9 +420,12 @@ fn x25519_small_order_peer_key_is_rejected() {
         .expect("X25519 Context is prepared");
     let mut operations = [KxOperation::agree(private_key, &[0; 32], target)];
 
-    context.execute(&mut Batch::new(&mut operations));
+    context.execute(&mut operations);
 
-    assert_eq!(operations[0].status(), KxStatus::SmallOrderPeerPublicKey);
+    assert_eq!(
+        operations[0].status(),
+        KxStatus::Algorithm(KeyEstablishmentError::SmallOrderPublicKey)
+    );
 }
 
 #[test]
@@ -448,7 +451,7 @@ fn established_secret_remains_non_exportable_when_target_policy_denies_export() 
         .context(algorithm)
         .expect("X25519 Context is prepared");
     let mut operations = [KxOperation::agree(private_key, &X25519_PEER_PUBLIC, target)];
-    context.execute(&mut Batch::new(&mut operations));
+    context.execute(&mut operations);
     let status = operations[0].status();
     let KxStatus::SharedSecret { key: shared_key } = status else {
         panic!("agreement did not return an opaque shared secret: {status:?}")

@@ -2591,6 +2591,370 @@ fn expand_plugin(args: PluginArgs, module: &mut ItemMod) -> Result<TokenStream2>
     })
 }
 
+#[derive(Clone, Copy)]
+enum CryptoFamily {
+    Aead,
+    Hash,
+    Mac,
+    Kdf,
+    Kx,
+    Cipher,
+    Sign,
+    Verify,
+}
+
+impl CryptoFamily {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Aead => "Aead",
+            Self::Hash => "Hash",
+            Self::Mac => "Mac",
+            Self::Kdf => "Kdf",
+            Self::Kx => "Kx",
+            Self::Cipher => "Cipher",
+            Self::Sign => "Sign",
+            Self::Verify => "Verify",
+        }
+    }
+}
+
+fn expand_crypto_family(
+    family: CryptoFamily,
+    args: TokenStream,
+    input: TokenStream,
+) -> TokenStream {
+    if !args.is_empty() {
+        return Error::new(
+            Span::call_site(),
+            "crypto family attributes accept no arguments",
+        )
+        .into_compile_error()
+        .into();
+    }
+    let item = parse_macro_input!(input as ItemStruct);
+    let expected = family.name();
+    if item.ident != expected {
+        return Error::new_spanned(
+            &item.ident,
+            format!("`#[{expected}]` must annotate `struct {expected};`"),
+        )
+        .into_compile_error()
+        .into();
+    }
+    if !item.generics.params.is_empty() || !matches!(item.fields, Fields::Unit) {
+        return Error::new_spanned(
+            &item,
+            format!("`#[{expected}]` requires a non-generic unit struct"),
+        )
+        .into_compile_error()
+        .into();
+    }
+    expand_crypto_family_item(family, item).into()
+}
+
+fn expand_crypto_family_item(family: CryptoFamily, item: ItemStruct) -> TokenStream2 {
+    let ident = &item.ident;
+    let implementation = match family {
+        CryptoFamily::Aead => quote! {
+            impl Family for Aead {
+                type Operation<'a> = AeadOperation<'a>;
+                type Prepared = AeadPrepared;
+                type Prepare = usize;
+                type Dispatch = for<'a> fn(&mut AeadPrepared, &mut [AeadOperation<'a>]);
+
+                const KEY_FAMILY: u8 = 1;
+
+                fn registry(engine: &Engine) -> &FamilyRegistry<Self> { &engine.aeads }
+                fn registry_mut(engine: &mut Engine) -> &mut FamilyRegistry<Self> {
+                    &mut engine.aeads
+                }
+                fn prepare_unkeyed(
+                    _: Self::Prepare,
+                    _: &Engine,
+                    _: AlgorithmId<Self>,
+                ) -> Option<Self::Prepared> {
+                    None
+                }
+                fn key_operations() -> KeyOperations {
+                    KeyOperations::AEAD_SEAL | KeyOperations::AEAD_OPEN
+                }
+                fn prepare_keyed(
+                    required: Self::Prepare,
+                    _: &Engine,
+                    _: AlgorithmId<Self>,
+                    key: KeyHandle,
+                    material: &[u8],
+                    policy: &KeyPolicy,
+                ) -> Result<Self::Prepared, ContextError> {
+                    AeadPrepared::new(required, key, material, policy.operations)
+                }
+            }
+        },
+        CryptoFamily::Hash => quote! {
+            impl Family for Hash {
+                type Operation<'a> = HashOperation<'a>;
+                type Prepared = HashPrepared;
+                type Prepare = ();
+                type Dispatch = for<'a> fn(&mut HashPrepared, &mut [HashOperation<'a>]);
+
+                const KEY_FAMILY: u8 = 2;
+
+                fn registry(engine: &Engine) -> &FamilyRegistry<Self> { &engine.hashes }
+                fn registry_mut(engine: &mut Engine) -> &mut FamilyRegistry<Self> {
+                    &mut engine.hashes
+                }
+                fn prepare_unkeyed(
+                    _: Self::Prepare,
+                    _: &Engine,
+                    _: AlgorithmId<Self>,
+                ) -> Option<Self::Prepared> {
+                    Some(HashPrepared)
+                }
+            }
+        },
+        CryptoFamily::Cipher => quote! {
+            impl Family for Cipher {
+                type Operation<'a> = ();
+                type Prepared = ();
+                type Prepare = ();
+                type Dispatch = for<'a> fn(&mut (), &mut [()]);
+
+                const KEY_FAMILY: u8 = 3;
+
+                fn registry(engine: &Engine) -> &FamilyRegistry<Self> { &engine.ciphers }
+                fn registry_mut(engine: &mut Engine) -> &mut FamilyRegistry<Self> {
+                    &mut engine.ciphers
+                }
+                fn prepare_unkeyed(
+                    _: Self::Prepare,
+                    _: &Engine,
+                    _: AlgorithmId<Self>,
+                ) -> Option<Self::Prepared> {
+                    None
+                }
+            }
+        },
+        CryptoFamily::Mac => quote! {
+            impl Family for Mac {
+                type Operation<'a> = MacOperation<'a>;
+                type Prepared = MacPrepared;
+                type Prepare = ();
+                type Dispatch = for<'a> fn(&mut MacPrepared, &mut [MacOperation<'a>]);
+
+                const KEY_FAMILY: u8 = 4;
+
+                fn registry(engine: &Engine) -> &FamilyRegistry<Self> { &engine.macs }
+                fn registry_mut(engine: &mut Engine) -> &mut FamilyRegistry<Self> {
+                    &mut engine.macs
+                }
+                fn prepare_unkeyed(
+                    _: Self::Prepare,
+                    _: &Engine,
+                    _: AlgorithmId<Self>,
+                ) -> Option<Self::Prepared> {
+                    None
+                }
+                fn key_operations() -> KeyOperations { KeyOperations::MAC_AUTHENTICATE }
+                fn prepare_keyed(
+                    _: Self::Prepare,
+                    _: &Engine,
+                    _: AlgorithmId<Self>,
+                    _: KeyHandle,
+                    material: &[u8],
+                    _: &KeyPolicy,
+                ) -> Result<Self::Prepared, ContextError> {
+                    Ok(MacPrepared {
+                        key: Zeroizing::new(material.to_vec()),
+                    })
+                }
+            }
+        },
+        CryptoFamily::Kdf => quote! {
+            impl Family for Kdf {
+                type Operation<'a> = KdfOperation<'a>;
+                type Prepared = KdfPrepared;
+                type Prepare = ();
+                type Dispatch = for<'a> fn(&mut KdfPrepared, &mut [KdfOperation<'a>]);
+
+                const KEY_FAMILY: u8 = 5;
+
+                fn registry(engine: &Engine) -> &FamilyRegistry<Self> { &engine.kdfs }
+                fn registry_mut(engine: &mut Engine) -> &mut FamilyRegistry<Self> {
+                    &mut engine.kdfs
+                }
+                fn prepare_unkeyed(
+                    _: Self::Prepare,
+                    _: &Engine,
+                    _: AlgorithmId<Self>,
+                ) -> Option<Self::Prepared> {
+                    None
+                }
+                fn key_operations() -> KeyOperations { KeyOperations::DERIVE }
+                fn prepare_keyed(
+                    _: Self::Prepare,
+                    engine: &Engine,
+                    _: AlgorithmId<Self>,
+                    _: KeyHandle,
+                    material: &[u8],
+                    policy: &KeyPolicy,
+                ) -> Result<Self::Prepared, ContextError> {
+                    Ok(KdfPrepared {
+                        material: Zeroizing::new(material.to_vec()),
+                        policy: policy.clone(),
+                        keys: Rc::clone(&engine.keys),
+                    })
+                }
+            }
+        },
+        CryptoFamily::Kx => quote! {
+            impl Family for Kx {
+                type Operation<'a> = KxOperation<'a>;
+                type Prepared = KxPrepared;
+                type Prepare = ();
+                type Dispatch = for<'a> fn(&mut KxPrepared, &mut [KxOperation<'a>]);
+
+                const KEY_FAMILY: u8 = 6;
+
+                fn registry(engine: &Engine) -> &FamilyRegistry<Self> {
+                    &engine.key_exchanges
+                }
+                fn registry_mut(engine: &mut Engine) -> &mut FamilyRegistry<Self> {
+                    &mut engine.key_exchanges
+                }
+                fn prepare_unkeyed(
+                    _: Self::Prepare,
+                    engine: &Engine,
+                    algorithm: AlgorithmId<Self>,
+                ) -> Option<Self::Prepared> {
+                    Some(KxPrepared {
+                        policy_algorithm: PolicyAlgorithm::new(algorithm),
+                        keys: Rc::clone(&engine.keys),
+                    })
+                }
+            }
+        },
+        CryptoFamily::Sign => quote! {
+            impl Family for Sign {
+                type Operation<'a> = SignOperation<'a>;
+                type Prepared = SignPrepared;
+                type Prepare = ();
+                type Dispatch = for<'a> fn(&mut SignPrepared, &mut [SignOperation<'a>]);
+
+                const KEY_FAMILY: u8 = 7;
+
+                fn registry(engine: &Engine) -> &FamilyRegistry<Self> { &engine.signers }
+                fn registry_mut(engine: &mut Engine) -> &mut FamilyRegistry<Self> {
+                    &mut engine.signers
+                }
+                fn prepare_unkeyed(
+                    _: Self::Prepare,
+                    _: &Engine,
+                    _: AlgorithmId<Self>,
+                ) -> Option<Self::Prepared> {
+                    None
+                }
+                fn key_operations() -> KeyOperations { KeyOperations::SIGN }
+                fn prepare_keyed(
+                    _: Self::Prepare,
+                    _: &Engine,
+                    _: AlgorithmId<Self>,
+                    _: KeyHandle,
+                    material: &[u8],
+                    _: &KeyPolicy,
+                ) -> Result<Self::Prepared, ContextError> {
+                    Ok(SignPrepared {
+                        private_key: Zeroizing::new(material.to_vec()),
+                    })
+                }
+            }
+        },
+        CryptoFamily::Verify => quote! {
+            impl Family for Verify {
+                type Operation<'a> = VerifyOperation<'a>;
+                type Prepared = VerifyPrepared;
+                type Prepare = ();
+                type Dispatch = for<'a> fn(&mut VerifyPrepared, &mut [VerifyOperation<'a>]);
+
+                const KEY_FAMILY: u8 = 8;
+
+                fn registry(engine: &Engine) -> &FamilyRegistry<Self> { &engine.verifiers }
+                fn registry_mut(engine: &mut Engine) -> &mut FamilyRegistry<Self> {
+                    &mut engine.verifiers
+                }
+                fn prepare_unkeyed(
+                    _: Self::Prepare,
+                    _: &Engine,
+                    _: AlgorithmId<Self>,
+                ) -> Option<Self::Prepared> {
+                    Some(VerifyPrepared)
+                }
+            }
+        },
+    };
+
+    quote! {
+        #item
+        impl private::Sealed for #ident {}
+        #implementation
+    }
+}
+
+/// Declares the authenticated-encryption operation family.
+#[allow(non_snake_case)]
+#[proc_macro_attribute]
+pub fn Aead(args: TokenStream, input: TokenStream) -> TokenStream {
+    expand_crypto_family(CryptoFamily::Aead, args, input)
+}
+
+/// Declares the digest operation family.
+#[allow(non_snake_case)]
+#[proc_macro_attribute]
+pub fn Hash(args: TokenStream, input: TokenStream) -> TokenStream {
+    expand_crypto_family(CryptoFamily::Hash, args, input)
+}
+
+/// Declares the message-authentication operation family.
+#[allow(non_snake_case)]
+#[proc_macro_attribute]
+pub fn Mac(args: TokenStream, input: TokenStream) -> TokenStream {
+    expand_crypto_family(CryptoFamily::Mac, args, input)
+}
+
+/// Declares the key-derivation operation family.
+#[allow(non_snake_case)]
+#[proc_macro_attribute]
+pub fn Kdf(args: TokenStream, input: TokenStream) -> TokenStream {
+    expand_crypto_family(CryptoFamily::Kdf, args, input)
+}
+
+/// Declares the key-establishment operation family.
+#[allow(non_snake_case)]
+#[proc_macro_attribute]
+pub fn Kx(args: TokenStream, input: TokenStream) -> TokenStream {
+    expand_crypto_family(CryptoFamily::Kx, args, input)
+}
+
+/// Declares the unauthenticated-cipher operation family.
+#[allow(non_snake_case)]
+#[proc_macro_attribute]
+pub fn Cipher(args: TokenStream, input: TokenStream) -> TokenStream {
+    expand_crypto_family(CryptoFamily::Cipher, args, input)
+}
+
+/// Declares the digital-signing operation family.
+#[allow(non_snake_case)]
+#[proc_macro_attribute]
+pub fn Sign(args: TokenStream, input: TokenStream) -> TokenStream {
+    expand_crypto_family(CryptoFamily::Sign, args, input)
+}
+
+/// Declares the signature-verification operation family.
+#[allow(non_snake_case)]
+#[proc_macro_attribute]
+pub fn Verify(args: TokenStream, input: TokenStream) -> TokenStream {
+    expand_crypto_family(CryptoFamily::Verify, args, input)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

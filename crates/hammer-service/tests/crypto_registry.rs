@@ -1,6 +1,5 @@
-use hammer_infra::crypto::HashAlgorithm;
 use hammer_service::crypto::{
-    Aead, AlgorithmRegistration, Capabilities, Cipher, Engine, Hash, HashOperation, HashPrepared,
+    Aead, Capabilities, Cipher, Engine, Hash, HashOperation, HashPrepared,
     ImplementationRegistration, Kdf, Kx, Mac, Registration, RegistryError, SelectionPolicy, Sign,
     Verify,
 };
@@ -18,66 +17,28 @@ fn registry_supports_each_closed_operation_family() {
     let mut engine = Engine::new();
 
     engine
-        .publish(
-            Registration::<Aead>::new().with_algorithm(AlgorithmRegistration::new(
-                "test:aead",
-                Capabilities::empty(),
-            )),
-        )
+        .publish(Registration::<Aead>::new().with_algorithm("test:aead", Capabilities::empty()))
         .expect("AEAD family accepts an algorithm registration");
     engine
-        .publish(
-            Registration::<Cipher>::new().with_algorithm(AlgorithmRegistration::new(
-                "test:cipher",
-                Capabilities::empty(),
-            )),
-        )
+        .publish(Registration::<Cipher>::new().with_algorithm("test:cipher", Capabilities::empty()))
         .expect("Cipher family accepts an algorithm registration");
     engine
-        .publish(
-            Registration::<Hash>::new().with_algorithm(AlgorithmRegistration::new(
-                "test:hash",
-                Capabilities::empty(),
-            )),
-        )
+        .publish(Registration::<Hash>::new().with_algorithm("test:hash", Capabilities::empty()))
         .expect("Hash family accepts an algorithm registration");
     engine
-        .publish(
-            Registration::<Mac>::new().with_algorithm(AlgorithmRegistration::new(
-                "test:mac",
-                Capabilities::empty(),
-            )),
-        )
+        .publish(Registration::<Mac>::new().with_algorithm("test:mac", Capabilities::empty()))
         .expect("MAC family accepts an algorithm registration");
     engine
-        .publish(
-            Registration::<Kdf>::new().with_algorithm(AlgorithmRegistration::new(
-                "test:kdf",
-                Capabilities::empty(),
-            )),
-        )
+        .publish(Registration::<Kdf>::new().with_algorithm("test:kdf", Capabilities::empty()))
         .expect("KDF family accepts an algorithm registration");
     engine
-        .publish(
-            Registration::<Kx>::new()
-                .with_algorithm(AlgorithmRegistration::new("test:kx", Capabilities::empty())),
-        )
+        .publish(Registration::<Kx>::new().with_algorithm("test:kx", Capabilities::empty()))
         .expect("KX family accepts an algorithm registration");
     engine
-        .publish(
-            Registration::<Sign>::new().with_algorithm(AlgorithmRegistration::new(
-                "test:sign",
-                Capabilities::empty(),
-            )),
-        )
+        .publish(Registration::<Sign>::new().with_algorithm("test:sign", Capabilities::empty()))
         .expect("Sign family accepts an algorithm registration");
     engine
-        .publish(
-            Registration::<Verify>::new().with_algorithm(AlgorithmRegistration::new(
-                "test:verify",
-                Capabilities::empty(),
-            )),
-        )
+        .publish(Registration::<Verify>::new().with_algorithm("test:verify", Capabilities::empty()))
         .expect("Verify family accepts an algorithm registration");
 
     assert!(engine.algorithm::<Aead>("test:aead").is_some());
@@ -96,18 +57,12 @@ fn algorithm_names_are_unique_within_each_family() {
 
     engine
         .publish(
-            Registration::<Sign>::new().with_algorithm(AlgorithmRegistration::new(
-                "test:signature",
-                Capabilities::empty(),
-            )),
+            Registration::<Sign>::new().with_algorithm("test:signature", Capabilities::empty()),
         )
         .expect("Sign family publishes its canonical signature name");
     engine
         .publish(
-            Registration::<Verify>::new().with_algorithm(AlgorithmRegistration::new(
-                "test:signature",
-                Capabilities::empty(),
-            )),
+            Registration::<Verify>::new().with_algorithm("test:signature", Capabilities::empty()),
         )
         .expect("Verify family independently publishes the same canonical signature name");
 
@@ -119,15 +74,12 @@ fn algorithm_names_are_unique_within_each_family() {
 fn registration_bundle_rolls_back_on_implementation_name_failure() {
     let mut engine = Engine::new();
     let registration = Registration::new()
-        .with_algorithm(AlgorithmRegistration::<Hash>::new(
-            "test-hash",
-            HASH_CAPABILITIES,
-        ))
+        .with_algorithm("test-hash", HASH_CAPABILITIES)
         .with_implementation(
             ImplementationRegistration::<Hash>::new("malformed", 10, true).with_algorithm(
                 "test-hash",
                 HASH_CAPABILITIES,
-                HashAlgorithm::Sha256,
+                (),
                 implementation_a,
             ),
         );
@@ -149,22 +101,14 @@ fn registration_bundle_rolls_back_on_implementation_name_failure() {
 fn algorithm_collision_rolls_back_other_bundle_declarations() {
     let mut engine = Engine::new();
     engine
-        .publish(
-            Registration::<Hash>::new().with_algorithm(AlgorithmRegistration::new(
-                "existing-hash",
-                HASH_CAPABILITIES,
-            )),
-        )
+        .publish(Registration::<Hash>::new().with_algorithm("existing-hash", HASH_CAPABILITIES))
         .expect("initial algorithm publishes");
 
     let error = engine
         .publish(
             Registration::<Hash>::new()
-                .with_algorithm(AlgorithmRegistration::new("new-hash", HASH_CAPABILITIES))
-                .with_algorithm(AlgorithmRegistration::new(
-                    "existing-hash",
-                    HASH_CAPABILITIES,
-                )),
+                .with_algorithm("new-hash", HASH_CAPABILITIES)
+                .with_algorithm("existing-hash", HASH_CAPABILITIES),
         )
         .expect_err("published names cannot collide");
 
@@ -181,15 +125,12 @@ fn algorithm_collision_rolls_back_other_bundle_declarations() {
 fn registration_rejects_capability_mismatch_without_partial_publication() {
     let mut engine = Engine::new();
     let registration = Registration::new()
-        .with_algorithm(AlgorithmRegistration::<Hash>::new(
-            "test-hash",
-            HASH_CAPABILITIES,
-        ))
+        .with_algorithm("test-hash", HASH_CAPABILITIES)
         .with_implementation(
             ImplementationRegistration::<Hash>::new("test:incomplete", 10, true).with_algorithm(
                 "test-hash",
                 Capabilities::CONTIGUOUS_INPUT,
-                HashAlgorithm::Sha256,
+                (),
                 implementation_a,
             ),
         );
@@ -214,24 +155,11 @@ fn registration_rejects_capability_mismatch_without_partial_publication() {
 fn registration_rejects_repeated_algorithm_function_tables() {
     let mut engine = Engine::new();
     let registration = Registration::new()
-        .with_algorithm(AlgorithmRegistration::<Hash>::new(
-            "test-hash",
-            HASH_CAPABILITIES,
-        ))
+        .with_algorithm("test-hash", HASH_CAPABILITIES)
         .with_implementation(
             ImplementationRegistration::<Hash>::new("test:duplicate", 10, true)
-                .with_algorithm(
-                    "test-hash",
-                    HASH_CAPABILITIES,
-                    HashAlgorithm::Sha256,
-                    implementation_a,
-                )
-                .with_algorithm(
-                    "test-hash",
-                    HASH_CAPABILITIES,
-                    HashAlgorithm::Sha256,
-                    implementation_b,
-                ),
+                .with_algorithm("test-hash", HASH_CAPABILITIES, (), implementation_a)
+                .with_algorithm("test-hash", HASH_CAPABILITIES, (), implementation_b),
         );
 
     let error = engine
@@ -254,35 +182,22 @@ fn deterministic_selection_uses_priority_then_implementation_name() {
     engine
         .publish(
             Registration::new()
-                .with_algorithm(AlgorithmRegistration::<Hash>::new(
-                    "test-hash",
-                    HASH_CAPABILITIES,
-                ))
+                .with_algorithm("test-hash", HASH_CAPABILITIES)
                 .with_implementation(
                     ImplementationRegistration::<Hash>::new("test:z-low", 10, true).with_algorithm(
                         "test-hash",
                         HASH_CAPABILITIES,
-                        HashAlgorithm::Sha256,
+                        (),
                         implementation_a,
                     ),
                 )
                 .with_implementation(
                     ImplementationRegistration::<Hash>::new("test:b-high", 20, true)
-                        .with_algorithm(
-                            "test-hash",
-                            HASH_CAPABILITIES,
-                            HashAlgorithm::Sha256,
-                            implementation_b,
-                        ),
+                        .with_algorithm("test-hash", HASH_CAPABILITIES, (), implementation_b),
                 )
                 .with_implementation(
                     ImplementationRegistration::<Hash>::new("test:a-high", 20, true)
-                        .with_algorithm(
-                            "test-hash",
-                            HASH_CAPABILITIES,
-                            HashAlgorithm::Sha256,
-                            implementation_a,
-                        ),
+                        .with_algorithm("test-hash", HASH_CAPABILITIES, (), implementation_a),
                 ),
         )
         .expect("valid registration publishes");
@@ -302,27 +217,14 @@ fn availability_and_policy_changes_affect_only_new_contexts() {
     engine
         .publish(
             Registration::new()
-                .with_algorithm(AlgorithmRegistration::<Hash>::new(
-                    "test-hash",
-                    HASH_CAPABILITIES,
-                ))
+                .with_algorithm("test-hash", HASH_CAPABILITIES)
                 .with_implementation(
                     ImplementationRegistration::<Hash>::new("test:preferred", 20, true)
-                        .with_algorithm(
-                            "test-hash",
-                            HASH_CAPABILITIES,
-                            HashAlgorithm::Sha256,
-                            implementation_b,
-                        ),
+                        .with_algorithm("test-hash", HASH_CAPABILITIES, (), implementation_b),
                 )
                 .with_implementation(
                     ImplementationRegistration::<Hash>::new("test:portable", 10, true)
-                        .with_algorithm(
-                            "test-hash",
-                            HASH_CAPABILITIES,
-                            HashAlgorithm::Sha256,
-                            implementation_a,
-                        ),
+                        .with_algorithm("test-hash", HASH_CAPABILITIES, (), implementation_a),
                 ),
         )
         .expect("valid registration publishes");
@@ -347,10 +249,7 @@ fn availability_and_policy_changes_affect_only_new_contexts() {
 fn names_enforce_algorithm_and_implementation_namespaces() {
     let mut engine = Engine::new();
     let malformed_algorithm = engine
-        .publish(
-            Registration::<Hash>::new()
-                .with_algorithm(AlgorithmRegistration::new("Vendor:Hash", HASH_CAPABILITIES)),
-        )
+        .publish(Registration::<Hash>::new().with_algorithm("Vendor:Hash", HASH_CAPABILITIES))
         .expect_err("algorithm name is not canonical");
     assert_eq!(
         malformed_algorithm,
@@ -362,16 +261,13 @@ fn names_enforce_algorithm_and_implementation_namespaces() {
     engine
         .publish(
             Registration::new()
-                .with_algorithm(AlgorithmRegistration::<Hash>::new(
-                    "vendor:test-hash",
-                    HASH_CAPABILITIES,
-                ))
+                .with_algorithm("vendor:test-hash", HASH_CAPABILITIES)
                 .with_implementation(
                     ImplementationRegistration::<Hash>::new("vendor:portable", 0, true)
                         .with_algorithm(
                             "vendor:test-hash",
                             HASH_CAPABILITIES,
-                            HashAlgorithm::Sha256,
+                            (),
                             implementation_a,
                         ),
                 ),

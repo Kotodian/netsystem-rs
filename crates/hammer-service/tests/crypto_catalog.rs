@@ -1,6 +1,6 @@
 use hammer_service::crypto::{
-    Aead, AeadOperation, AeadStatus, Batch, Engine, Hash, Input, Kdf, KdfOperation, KdfStatus,
-    KeyOperations, KeyPolicy, Mac, MacOperation, MacStatus,
+    Aead, AeadOperation, AeadStatus, Engine, Hash, Input, Kdf, KdfOperation, KdfStatus,
+    KeyOperations, KeyPolicy, Mac, MacOperation,
 };
 
 #[test]
@@ -61,8 +61,8 @@ fn all_builtin_aead_algorithms_execute_through_resolved_function_tables() {
             &mut ciphertext,
             &mut tag,
         )];
-        context.execute(&mut Batch::new(&mut operations));
-        assert_eq!(operations[0].status(), AeadStatus::Complete { written: 3 });
+        context.execute(&mut operations);
+        assert_eq!(operations[0].status(), AeadStatus::Executed(Ok(3)));
     }
 }
 
@@ -87,9 +87,9 @@ fn hmac_sha256_executes_as_a_keyed_batch() {
         &mut output,
     )];
 
-    context.execute(&mut Batch::new(&mut operations));
+    context.execute(&mut operations);
 
-    assert_eq!(operations[0].status(), MacStatus::Complete { written: 32 });
+    assert_eq!(operations[0].status(), Some(Ok(32)));
     assert_eq!(
         output,
         [
@@ -131,7 +131,7 @@ fn hkdf_installs_policy_limited_derived_keys_without_exposing_secret_bytes() {
         target,
     )];
 
-    context.execute(&mut Batch::new(&mut operations));
+    context.execute(&mut operations);
 
     let KdfStatus::Complete { key } = operations[0].status() else {
         panic!("derivation must return an opaque key")
@@ -184,7 +184,7 @@ fn hkdf_rejects_a_derived_algorithm_absent_from_the_parent_policy() {
         denied,
     )];
 
-    context.execute(&mut Batch::new(&mut operations));
+    context.execute(&mut operations);
 
     assert_eq!(operations[0].status(), KdfStatus::DerivationDenied);
 }
