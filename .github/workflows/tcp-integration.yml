@@ -510,6 +510,7 @@ jobs:
                 '{ type filter hook output priority 0 ; }'
               sudo -n nft add rule ip tcplab fault \
                 ip daddr "$TCP_TEST_ADDRESS" tcp dport "$TCP_TEST_PORT" \
+                ip length 41-65535 \
                 tcp sequence "$target_seq" \
                 limit rate 1/hour burst 1 packets counter drop
               ;;
