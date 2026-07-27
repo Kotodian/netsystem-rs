@@ -29,6 +29,7 @@ pub fn registration_image() -> &'static hammer_runtime::__private::RegistrationI
 }
 
 pub mod app;
+pub mod crypto;
 pub mod data_plane;
 /// Device-class abstraction. Concrete drivers live under `hammer-plugins/device/`.
 pub mod device;
