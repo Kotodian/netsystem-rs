@@ -497,25 +497,28 @@ jobs:
             "print((int('$fault_base') + ${{ matrix.fault_offset }}) % (2 ** 32))")"
           echo "fault target sequence: $target_seq (${{ matrix.fault }})"
           echo "TCP_TEST_TARGET_SEQ=$target_seq" >> "$GITHUB_ENV"
-          # One-shot absolute-sequence drop: an nftables `tcp sequence` rule
-          # with a 1-packet limit disarms itself after the first hit, so the
-          # later retransmission of the same sequence passes without racing a
-          # rule deletion against RACK's reordering window.
-          command -v nft >/dev/null || sudo -n apt-get install -y nftables
+          # The policers drop the first exact-sequence match and pass matches
+          # until their token bucket refills, so retransmissions are not lost.
           case "${{ matrix.fault }}" in
             client-egress)
-              fault_family=ip
-              sudo -n nft add table ip tcplab
-              sudo -n nft add chain ip tcplab fault \
-                '{ type filter hook output priority 0 ; }'
-              sudo -n nft add rule ip tcplab fault \
-                ip daddr "$TCP_TEST_ADDRESS" tcp dport "$TCP_TEST_PORT" \
-                ip length 41-65535 \
-                tcp sequence "$target_seq" \
-                limit rate 1/hour burst 1 packets counter drop
+              fault_backend=tc
+              target_seq_hex="$(printf '0x%08x' "$target_seq")"
+              packet_len=$(( TCP_TEST_MSS + 40 ))
+              sudo -n tc qdisc add dev "$TCP_TEST_INTERFACE" clsact
+              sudo -n tc filter add dev "$TCP_TEST_INTERFACE" egress \
+                protocol ip pref 10 u32 \
+                match ip dst "$TCP_TEST_ADDRESS/32" \
+                match ip protocol 6 0xff \
+                match ip dport "$TCP_TEST_PORT" 0xffff \
+                match u16 "$packet_len" 0xffff at 2 \
+                match u32 "$target_seq_hex" 0xffffffff at 24 \
+                action police pkts_rate 1 pkts_burst 1 \
+                conform-exceed ok/drop
               ;;
             server-ingress)
+              fault_backend=nft
               fault_family=ip
+              command -v nft >/dev/null || sudo -n apt-get install -y nftables
               sudo -n nft add table ip tcplab
               sudo -n nft add chain ip tcplab fault \
                 '{ type filter hook input priority 0 ; }'
@@ -531,18 +534,32 @@ jobs:
           touch "$continue_file"
           probe_status=0
           wait "$probe_pid" || probe_status=$?
-          sudo -n nft list table "$fault_family" tcplab \
-            > "$TCP_TEST_DIAGNOSTICS/fault-rule.txt" 2>&1 || true
+          case "$fault_backend" in
+            tc)
+              sudo -n tc -s filter show dev "$TCP_TEST_INTERFACE" \
+                egress pref 10 \
+                > "$TCP_TEST_DIAGNOSTICS/fault-rule.txt" 2>&1 || true
+              hits="$(sed -n 's/.*Sent [0-9][0-9]* bytes \([0-9][0-9]*\) pkt.*/\1/p' \
+                "$TCP_TEST_DIAGNOSTICS/fault-rule.txt" | head -1)"
+              drops="$(sed -n 's/.*dropped \([0-9][0-9]*\).*/\1/p' \
+                "$TCP_TEST_DIAGNOSTICS/fault-rule.txt" | head -1)"
+              ;;
+            nft)
+              sudo -n nft list table "$fault_family" tcplab \
+                > "$TCP_TEST_DIAGNOSTICS/fault-rule.txt" 2>&1 || true
+              hits="$(grep -oE 'counter packets [0-9]+' \
+                "$TCP_TEST_DIAGNOSTICS/fault-rule.txt" \
+                | grep -oE '[0-9]+' | head -1)"
+              drops="$hits"
+              ;;
+          esac
           cat "$TCP_TEST_DIAGNOSTICS/probe.log"
           cat "$TCP_TEST_DIAGNOSTICS/fault-rule.txt"
-          hits="$(grep -oE 'counter packets [0-9]+' \
-            "$TCP_TEST_DIAGNOSTICS/fault-rule.txt" \
-            | grep -oE '[0-9]+' | head -1)"
-          if [[ "${hits:-0}" -lt 1 ]]; then
+          if [[ "${hits:-0}" -lt 1 || "${drops:-0}" -lt 1 ]]; then
             echo "fault rule never matched target sequence $target_seq" >&2
             exit 1
           fi
-          echo "fault rule hits: $hits"
+          echo "fault rule hits: $hits, drops: $drops"
           exit "$probe_status"
       - name: Capture state after probe [${{ matrix.id }}]
         if: always()
@@ -673,9 +690,12 @@ jobs:
       - name: Remove fault rules
         if: ${{ always() && runner.os == 'Linux' }}
         run: |
+          if [[ -n "${TCP_TEST_INTERFACE:-}" ]] && command -v tc >/dev/null; then
+            sudo -n tc qdisc delete dev "$TCP_TEST_INTERFACE" clsact \
+              2>/dev/null || true
+          fi
           if command -v nft >/dev/null; then
             sudo -n nft delete table ip tcplab 2>/dev/null || true
-            sudo -n nft delete table netdev tcplab 2>/dev/null || true
           fi
       - name: Remove Linux host route
         if: ${{ always() && runner.os == 'Linux' }}
