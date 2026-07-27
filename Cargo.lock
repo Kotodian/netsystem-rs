@@ -1326,6 +1326,7 @@ dependencies = [
  "hammer-core",
  "hammer-infra",
  "hammer-runtime",
+ "hex",
  "humantime-serde",
  "ipnet",
  "libc",

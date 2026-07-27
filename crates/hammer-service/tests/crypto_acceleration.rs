@@ -1,11 +1,49 @@
 use hammer_infra::crypto::InstructionSet;
 use hammer_service::crypto::{
-    Capabilities, ContextError, Engine, Hash, HashOperation, HashPrepared,
+    Capabilities, Context, ContextError, Engine, Hash, HashOperation, HashPrepared,
     ImplementationRegistration, Input, Registration, SelectionPolicy,
 };
 
-fn hash_capabilities() -> Capabilities {
-    Capabilities::CONTIGUOUS_INPUT | Capabilities::SCATTER_INPUT | Capabilities::OUT_OF_PLACE
+const SHA256_ABC: [u8; 32] = [
+    0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+    0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+];
+const HASH_CAPABILITIES: Capabilities = Capabilities::CONTIGUOUS_INPUT
+    .union(Capabilities::SCATTER_INPUT)
+    .union(Capabilities::OUT_OF_PLACE);
+
+fn assert_sha256_conformance(context: &mut Context<Hash>) {
+    let mut singleton_output = [0u8; 32];
+    let mut singleton = [HashOperation::new(
+        Input::Contiguous(b"abc"),
+        &mut singleton_output,
+    )];
+    context
+        .execute(&mut singleton)
+        .expect("singleton batch dispatches synchronously");
+    assert_eq!(singleton[0].status(), Some(Ok(32)));
+    assert_eq!(singleton_output, SHA256_ABC);
+
+    let fragments: &[&[u8]] = &[b"a", b"b", b"c"];
+    let mut scatter_output = [0u8; 32];
+    let mut short_output = [0xa5; 31];
+    let mut batch = [
+        HashOperation::new(Input::Scatter(fragments), &mut scatter_output),
+        HashOperation::new(Input::Contiguous(b"abc"), &mut short_output),
+    ];
+    context
+        .execute(&mut batch)
+        .expect("mixed multi-operation batch dispatches synchronously");
+    assert_eq!(batch[0].status(), Some(Ok(32)));
+    assert_eq!(
+        batch[1].status(),
+        Some(Err(hammer_infra::crypto::hash::Error::OutputTooSmall {
+            required: 32,
+            provided: 31,
+        }))
+    );
+    assert_eq!(scatter_output, SHA256_ABC);
+    assert_eq!(short_output, [0xa5; 31]);
 }
 
 #[test]
@@ -40,7 +78,7 @@ fn injected_instruction_set_controls_implementation_selection() {
 
 #[test]
 fn bound_context_reports_implementation_loss_without_fallback() {
-    let capabilities = hash_capabilities();
+    let capabilities = HASH_CAPABILITIES;
     let mut engine = Engine::new(InstructionSet::empty());
     engine
         .publish(
@@ -93,7 +131,7 @@ fn bound_context_reports_implementation_loss_without_fallback() {
 
 #[test]
 fn priority_changes_affect_only_new_contexts() {
-    let capabilities = hash_capabilities();
+    let capabilities = HASH_CAPABILITIES;
     let mut engine = Engine::new(InstructionSet::empty());
     engine
         .publish(
@@ -132,18 +170,12 @@ fn priority_changes_affect_only_new_contexts() {
 }
 
 #[test]
-fn accelerated_and_portable_hashes_have_identical_results_and_failures() {
+fn sha256_implementations_obey_one_conformance_suite() {
     let instructions = InstructionSet::detect();
-    if !instructions.contains(InstructionSet::SHA2) {
-        return;
-    }
-
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     let accelerated_name = "hammer:sha-256-sha-ni";
     #[cfg(target_arch = "aarch64")]
     let accelerated_name = "hammer:sha-256-armv8";
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
-    return;
 
     let mut engine = Engine::with_builtins(instructions).expect("built-ins publish");
     let algorithm = engine
@@ -152,52 +184,12 @@ fn accelerated_and_portable_hashes_have_identical_results_and_failures() {
 
     engine.set_selection_policy(SelectionPolicy::only(["hammer:hash-portable"]));
     let mut portable = engine.context(algorithm).expect("portable Context");
-    engine.set_selection_policy(SelectionPolicy::only([accelerated_name]));
-    let mut accelerated = engine.context(algorithm).expect("accelerated Context");
+    assert_sha256_conformance(&mut portable);
 
-    let fragments: &[&[u8]] = &[b"cross-", b"implementation"];
-    let mut portable_output = [0u8; 32];
-    let mut accelerated_output = [0u8; 32];
-    let mut portable_operations = [HashOperation::new(
-        Input::Scatter(fragments),
-        &mut portable_output,
-    )];
-    let mut accelerated_operations = [HashOperation::new(
-        Input::Scatter(fragments),
-        &mut accelerated_output,
-    )];
-    portable
-        .execute(&mut portable_operations)
-        .expect("portable execution");
-    accelerated
-        .execute(&mut accelerated_operations)
-        .expect("accelerated execution");
-    assert_eq!(portable_operations[0].status(), Ok(32).into());
-    assert_eq!(
-        accelerated_operations[0].status(),
-        portable_operations[0].status()
-    );
-    assert_eq!(accelerated_output, portable_output);
-
-    let mut portable_short = [0u8; 31];
-    let mut accelerated_short = [0u8; 31];
-    let mut portable_operations = [HashOperation::new(
-        Input::Contiguous(b"failure"),
-        &mut portable_short,
-    )];
-    let mut accelerated_operations = [HashOperation::new(
-        Input::Contiguous(b"failure"),
-        &mut accelerated_short,
-    )];
-    portable
-        .execute(&mut portable_operations)
-        .expect("portable dispatch");
-    accelerated
-        .execute(&mut accelerated_operations)
-        .expect("accelerated dispatch");
-    assert_eq!(
-        accelerated_operations[0].status(),
-        portable_operations[0].status()
-    );
-    assert_eq!(accelerated_short, portable_short);
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+    if instructions.contains(InstructionSet::SHA2) {
+        engine.set_selection_policy(SelectionPolicy::only([accelerated_name]));
+        let mut accelerated = engine.context(algorithm).expect("accelerated Context");
+        assert_sha256_conformance(&mut accelerated);
+    }
 }

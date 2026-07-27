@@ -1,16 +1,21 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use hammer_infra::crypto::InstructionSet;
+use hammer_infra::crypto::{InstructionSet, mac::Algorithm as _};
 use hammer_service::crypto::{
-    AlgorithmId, Capabilities, ContextError, Engine, ImplementationRegistration, Input, KeyError,
-    KeyHandle, KeyOperations, KeyPolicy, Mac, MacOperation, Registration, RegistryError,
+    AlgorithmId, Capabilities, Context, ContextError, Engine, ImplementationRegistration, Input,
+    KeyError, KeyHandle, KeyOperations, KeyPolicy, Mac, MacOperation, Registration, RegistryError,
+    SelectionPolicy,
 };
 
 const IMPLEMENTATION: &str = "test:hardware-mac";
 const CAPABILITIES: Capabilities = Capabilities::CONTIGUOUS_INPUT
     .union(Capabilities::SCATTER_INPUT)
     .union(Capabilities::OUT_OF_PLACE);
+const HMAC_SHA256: [u8; 32] = [
+    0xb0, 0x34, 0x4c, 0x61, 0xd8, 0xdb, 0x38, 0x53, 0x5c, 0xa8, 0xaf, 0xce, 0xaf, 0x0b, 0xf1, 0x2b,
+    0x88, 0x1d, 0xc2, 0x00, 0xc9, 0x83, 0x3d, 0xa7, 0x26, 0xe9, 0x37, 0x6c, 0x2e, 0x32, 0xcf, 0xf7,
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Event {
@@ -85,7 +90,7 @@ impl Hardware {
 
     fn execute(
         &mut self,
-        context: &mut HardwareContext,
+        _: &mut HardwareContext,
         operations: &mut [MacOperation<'_>],
     ) -> Result<(), ContextError> {
         if !self.0.borrow().session_available {
@@ -99,23 +104,12 @@ impl Hardware {
             });
         }
 
+        let algorithm = hammer_infra::crypto::mac::HmacSha256::new(&[0x0b; 20]);
         for operation in operations {
-            let checksum = operation.input().with_fragments(|fragments| {
-                fragments
-                    .iter()
-                    .flat_map(|fragment| fragment.iter())
-                    .fold(context.key as u8, |sum, byte| sum.wrapping_add(*byte))
-            });
-            let output = operation.output();
-            if output.is_empty() {
-                operation.complete(Err(hammer_infra::crypto::mac::Error::OutputTooSmall {
-                    required: 1,
-                    provided: 0,
-                }));
-            } else {
-                output[0] = checksum;
-                operation.complete(Ok(1));
-            }
+            let input = operation.input();
+            let result = input
+                .with_fragments(|fragments| algorithm.authenticate(fragments, operation.output()));
+            operation.complete(result);
         }
         Ok(())
     }
@@ -177,6 +171,71 @@ fn engine(hardware: Hardware, operations: KeyOperations) -> (Engine, AlgorithmId
         .algorithm::<Mac>("hmac-sha-256")
         .expect("HMAC-SHA-256 is built in");
     (engine, algorithm)
+}
+
+fn assert_hmac_sha256_conformance(context: &mut Context<Mac>) {
+    let mut singleton_output = [0u8; 32];
+    let mut singleton = [MacOperation::authenticate(
+        Input::Contiguous(b"Hi There"),
+        &mut singleton_output,
+    )];
+    context
+        .execute(&mut singleton)
+        .expect("singleton batch dispatches synchronously");
+    assert_eq!(singleton[0].status(), Some(Ok(32)));
+    assert_eq!(singleton_output, HMAC_SHA256);
+
+    let fragments: &[&[u8]] = &[b"Hi ", b"There"];
+    let mut scatter_output = [0u8; 32];
+    let mut short_output = [0xa5; 31];
+    let mut batch = [
+        MacOperation::authenticate(Input::Scatter(fragments), &mut scatter_output),
+        MacOperation::authenticate(Input::Contiguous(b"Hi There"), &mut short_output),
+    ];
+    context
+        .execute(&mut batch)
+        .expect("mixed multi-operation batch dispatches synchronously");
+    assert_eq!(batch[0].status(), Some(Ok(32)));
+    assert_eq!(
+        batch[1].status(),
+        Some(Err(hammer_infra::crypto::mac::Error::OutputTooSmall {
+            required: 32,
+            provided: 31,
+        }))
+    );
+    assert_eq!(scatter_output, HMAC_SHA256);
+    assert_eq!(short_output, [0xa5; 31]);
+}
+
+#[test]
+fn portable_and_hardware_hmac_sha256_obey_one_conformance_suite() {
+    let hardware = Hardware::new(1);
+    let (mut engine, algorithm) = engine(hardware, KeyOperations::MAC_AUTHENTICATE);
+
+    engine.set_selection_policy(SelectionPolicy::only(["hammer:hmac-portable"]));
+    let software_key = engine
+        .create_key(
+            &[0x0b; 20],
+            KeyPolicy::new(algorithm, KeyOperations::MAC_AUTHENTICATE, false),
+        )
+        .expect("software key installs");
+    let mut portable = engine
+        .context_with_key(algorithm, software_key)
+        .expect("portable HMAC Context");
+
+    engine.set_selection_policy(SelectionPolicy::only([IMPLEMENTATION]));
+    let hardware_key = engine
+        .generate_key(
+            algorithm,
+            KeyPolicy::new(algorithm, KeyOperations::MAC_AUTHENTICATE, false),
+        )
+        .expect("hardware key generation succeeds");
+    let mut hardware = engine
+        .context_with_key(algorithm, hardware_key)
+        .expect("hardware HMAC Context");
+
+    assert_hmac_sha256_conformance(&mut portable);
+    assert_hmac_sha256_conformance(&mut hardware);
 }
 
 #[test]
@@ -324,45 +383,6 @@ fn hardware_key_is_non_exportable_and_shared_by_multiple_contexts() {
             Event::KeyReleased(1),
         ]
     );
-}
-
-#[test]
-fn hardware_context_executes_the_existing_typed_batch_contract() {
-    let hardware = Hardware::new(1);
-    let (engine, algorithm) = engine(hardware, KeyOperations::MAC_AUTHENTICATE);
-    let key = engine
-        .generate_key(
-            algorithm,
-            KeyPolicy::new(algorithm, KeyOperations::MAC_AUTHENTICATE, false),
-        )
-        .expect("hardware key generation succeeds");
-    let mut context = engine
-        .context_with_key(algorithm, key)
-        .expect("hardware Context is prepared");
-    let fragments: &[&[u8]] = &[b"hard", b"ware"];
-    let mut contiguous_output = [0u8; 1];
-    let mut scatter_output = [0u8; 1];
-    let mut short_output = [];
-    let mut operations = [
-        MacOperation::authenticate(Input::Contiguous(b"hardware"), &mut contiguous_output),
-        MacOperation::authenticate(Input::Scatter(fragments), &mut scatter_output),
-        MacOperation::authenticate(Input::Contiguous(b"short"), &mut short_output),
-    ];
-
-    context
-        .execute(&mut operations)
-        .expect("hardware batch executes synchronously");
-
-    assert_eq!(operations[0].status(), Some(Ok(1)));
-    assert_eq!(operations[1].status(), Some(Ok(1)));
-    assert_eq!(
-        operations[2].status(),
-        Some(Err(hammer_infra::crypto::mac::Error::OutputTooSmall {
-            required: 1,
-            provided: 0,
-        }))
-    );
-    assert_eq!(contiguous_output, scatter_output);
 }
 
 #[test]

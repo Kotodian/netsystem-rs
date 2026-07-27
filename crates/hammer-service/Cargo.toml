@@ -36,6 +36,7 @@ toml = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+hex = "0.4"
 
 [[bench]]
 name = "crypto_hash"
