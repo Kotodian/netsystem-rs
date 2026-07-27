@@ -6,10 +6,12 @@
 
 pub mod exchange;
 
+use std::any::{TypeId, type_name};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::marker::PhantomData;
+use std::ptr::NonNull;
 use std::rc::Rc;
 
 use hammer_infra::crypto::InstructionSet;
@@ -65,6 +67,63 @@ pub trait Family: private::Sealed + Sized + 'static {
 
 mod private {
     pub trait Sealed {}
+}
+
+struct OwnedState {
+    value: NonNull<()>,
+    value_type: TypeId,
+    type_name: &'static str,
+    release: unsafe fn(NonNull<()>),
+}
+
+impl OwnedState {
+    fn new<T: 'static>(value: T) -> Self {
+        Self {
+            value: NonNull::from(Box::leak(Box::new(value))).cast(),
+            value_type: TypeId::of::<T>(),
+            type_name: type_name::<T>(),
+            release: Self::release_value::<T>,
+        }
+    }
+
+    fn value<T: 'static>(&self) -> Option<&T> {
+        (self.value_type == TypeId::of::<T>()).then(|| {
+            // SAFETY: `value_type` is recorded with the allocation in `new`, and
+            // `&self` keeps the allocation alive and prevents mutable access.
+            unsafe { self.value.cast::<T>().as_ref() }
+        })
+    }
+
+    fn value_mut<T: 'static>(&mut self) -> Option<&mut T> {
+        (self.value_type == TypeId::of::<T>()).then(|| {
+            // SAFETY: `value_type` is recorded with the allocation in `new`, and
+            // `&mut self` provides exclusive access to the allocation.
+            unsafe { self.value.cast::<T>().as_mut() }
+        })
+    }
+
+    unsafe fn release_value<T>(value: NonNull<()>) {
+        // SAFETY: `new` allocated this pointer as `Box<T>`, and `OwnedState::drop`
+        // invokes the matching monomorphized release function exactly once.
+        unsafe { drop(Box::from_raw(value.cast::<T>().as_ptr())) };
+    }
+}
+
+impl fmt::Debug for OwnedState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OwnedState")
+            .field("type_name", &self.type_name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for OwnedState {
+    fn drop(&mut self) {
+        // SAFETY: `release` was paired with this allocation by `new` and this is
+        // the unique owning value, so the allocation has not been released yet.
+        unsafe { (self.release)(self.value) };
+    }
 }
 
 /// The hash operation family.
@@ -340,9 +399,10 @@ impl KdfPrepared {
             let mut keys = self.keys.borrow_mut();
             let capacity = keys.capacity();
             let Some(index) = keys.insert(KeyEntry {
-                material,
+                state: OwnedState::new(material),
                 policy,
                 contexts: 0,
+                provenance: None,
             }) else {
                 operation.status = KdfStatus::KeyPoolFull { capacity };
                 continue;
@@ -485,9 +545,12 @@ impl KxPrepared {
                     capacity: keys.capacity(),
                 };
             }
-            if let Err(error) =
-                algorithm.agree(&entry.material, peer_public_key, &mut shared_secret)
-            {
+            let material = entry
+                .state
+                .value::<Zeroizing<Vec<u8>>>()
+                .map(|material| material.as_slice())
+                .expect("portable key establishment receives software keys");
+            if let Err(error) = algorithm.agree(material, peer_public_key, &mut shared_secret) {
                 return KxStatus::Algorithm(error);
             }
             policy
@@ -590,9 +653,12 @@ impl KxPrepared {
                     capacity: keys.capacity(),
                 };
             }
-            if let Err(error) =
-                algorithm.decapsulate(&entry.material, ciphertext, &mut shared_secret)
-            {
+            let material = entry
+                .state
+                .value::<Zeroizing<Vec<u8>>>()
+                .map(|material| material.as_slice())
+                .expect("portable key establishment receives software keys");
+            if let Err(error) = algorithm.decapsulate(material, ciphertext, &mut shared_secret) {
                 return KxStatus::Algorithm(error);
             }
             policy
@@ -613,9 +679,10 @@ impl KxPrepared {
         let capacity = keys.capacity();
         let index = keys
             .insert(KeyEntry {
-                material,
+                state: OwnedState::new(material),
                 policy,
                 contexts: 0,
+                provenance: None,
             })
             .ok_or(KxStatus::KeyPoolFull { capacity })?;
         Ok(KeyHandle { index })
@@ -707,23 +774,242 @@ bitflags::bitflags! {
     }
 }
 
+type PrepareContext<F> = for<'a> fn(
+    &OwnedState,
+    &RefCell<OwnedState>,
+    &Engine,
+    AlgorithmId<F>,
+    Option<(KeyHandle, &'a OwnedState, &'a KeyPolicy)>,
+) -> Result<OwnedState, ContextError>;
+type DispatchBatch<F> = for<'a> fn(
+    &OwnedState,
+    &RefCell<OwnedState>,
+    &mut OwnedState,
+    &mut [<F as Family>::Operation<'a>],
+) -> Result<(), ContextError>;
+type GenerateKey = fn(&OwnedState, &RefCell<OwnedState>) -> Result<OwnedState, KeyError>;
+
+/// Prepares implementation-private state for an unkeyed Context.
+pub type UnkeyedContextPrepare<F, I, P> =
+    fn(&mut I, &Engine, AlgorithmId<F>) -> Result<P, ContextError>;
+/// Prepares implementation-private state for a keyed Context.
+pub type KeyedContextPrepare<F, I, K, P> =
+    fn(&mut I, &Engine, AlgorithmId<F>, KeyHandle, &K, &KeyPolicy) -> Result<P, ContextError>;
+/// Executes one typed batch through implementation-private Context state.
+pub type ContextDispatch<F, I, P> =
+    for<'a> fn(&mut I, &mut P, &mut [<F as Family>::Operation<'a>]) -> Result<(), ContextError>;
+
+struct AlgorithmFunctions<F: Family> {
+    state: OwnedState,
+    prepare: PrepareContext<F>,
+    dispatch: DispatchBatch<F>,
+    key_type: Option<TypeId>,
+}
+
+struct FamilyFunctions<F: Family> {
+    prepare: F::Prepare,
+    dispatch: F::Dispatch,
+}
+
+impl<F: Family> FamilyFunctions<F>
+where
+    F::Prepared: 'static,
+    F::Prepare: 'static,
+    F::Dispatch:
+        'static + for<'a> Fn(&mut F::Prepared, &mut [F::Operation<'a>]) -> Result<(), ContextError>,
+{
+    fn prepare(
+        functions: &OwnedState,
+        _: &RefCell<OwnedState>,
+        engine: &Engine,
+        algorithm: AlgorithmId<F>,
+        key: Option<(KeyHandle, &OwnedState, &KeyPolicy)>,
+    ) -> Result<OwnedState, ContextError> {
+        let functions = functions
+            .value::<Self>()
+            .expect("published family functions retain their concrete type");
+        let prepared = match key {
+            Some((handle, state, policy)) => {
+                let key = state
+                    .value::<Zeroizing<Vec<u8>>>()
+                    .expect("built-in keyed implementations receive software keys");
+                F::prepare_keyed(
+                    functions.prepare,
+                    engine,
+                    algorithm,
+                    handle,
+                    key.as_slice(),
+                    policy,
+                )?
+            }
+            None => F::prepare_unkeyed(functions.prepare, engine, algorithm).ok_or(
+                ContextError::KeyRequired {
+                    algorithm: algorithm.slot,
+                },
+            )?,
+        };
+        Ok(OwnedState::new(prepared))
+    }
+
+    fn dispatch<'data>(
+        functions: &OwnedState,
+        _: &RefCell<OwnedState>,
+        prepared: &mut OwnedState,
+        operations: &mut [F::Operation<'data>],
+    ) -> Result<(), ContextError> {
+        let functions = functions
+            .value::<Self>()
+            .expect("published family functions retain their concrete type");
+        let prepared = prepared
+            .value_mut::<F::Prepared>()
+            .expect("built-in Context retains its concrete prepared state");
+        (functions.dispatch)(prepared, operations)
+    }
+}
+
+struct UnkeyedFunctions<F: Family, I, P> {
+    prepare: UnkeyedContextPrepare<F, I, P>,
+    dispatch: ContextDispatch<F, I, P>,
+}
+
+impl<F: Family, I: 'static, P: 'static> UnkeyedFunctions<F, I, P> {
+    fn prepare(
+        functions: &OwnedState,
+        implementation: &RefCell<OwnedState>,
+        engine: &Engine,
+        algorithm: AlgorithmId<F>,
+        key: Option<(KeyHandle, &OwnedState, &KeyPolicy)>,
+    ) -> Result<OwnedState, ContextError> {
+        if key.is_some() {
+            return Err(ContextError::KeyUnsupported {
+                algorithm: algorithm.slot,
+            });
+        }
+        let functions = functions
+            .value::<Self>()
+            .expect("published functions retain their concrete type");
+        let mut implementation = implementation.borrow_mut();
+        let implementation = implementation
+            .value_mut::<I>()
+            .expect("published implementation state retains its concrete type");
+        (functions.prepare)(implementation, engine, algorithm).map(OwnedState::new)
+    }
+
+    fn dispatch<'data>(
+        functions: &OwnedState,
+        implementation: &RefCell<OwnedState>,
+        prepared: &mut OwnedState,
+        operations: &mut [F::Operation<'data>],
+    ) -> Result<(), ContextError> {
+        let functions = functions
+            .value::<Self>()
+            .expect("published functions retain their concrete type");
+        let mut implementation = implementation.borrow_mut();
+        let implementation = implementation
+            .value_mut::<I>()
+            .expect("published implementation state retains its concrete type");
+        let prepared = prepared
+            .value_mut::<P>()
+            .expect("Context retains its implementation-private prepared type");
+        (functions.dispatch)(implementation, prepared, operations)
+    }
+}
+
+struct KeyedFunctions<F: Family, I, K, P> {
+    prepare: KeyedContextPrepare<F, I, K, P>,
+    dispatch: ContextDispatch<F, I, P>,
+}
+
+impl<F: Family, I: 'static, K: 'static, P: 'static> KeyedFunctions<F, I, K, P> {
+    fn prepare(
+        functions: &OwnedState,
+        implementation: &RefCell<OwnedState>,
+        engine: &Engine,
+        algorithm: AlgorithmId<F>,
+        key: Option<(KeyHandle, &OwnedState, &KeyPolicy)>,
+    ) -> Result<OwnedState, ContextError> {
+        let (handle, key, policy) = key.ok_or(ContextError::KeyRequired {
+            algorithm: algorithm.slot,
+        })?;
+        let functions = functions
+            .value::<Self>()
+            .expect("published functions retain their concrete type");
+        let key = key
+            .value::<K>()
+            .expect("selected implementation receives its registered key type");
+        let mut implementation = implementation.borrow_mut();
+        let implementation = implementation
+            .value_mut::<I>()
+            .expect("published implementation state retains its concrete type");
+        (functions.prepare)(implementation, engine, algorithm, handle, key, policy)
+            .map(OwnedState::new)
+    }
+
+    fn dispatch<'data>(
+        functions: &OwnedState,
+        implementation: &RefCell<OwnedState>,
+        prepared: &mut OwnedState,
+        operations: &mut [F::Operation<'data>],
+    ) -> Result<(), ContextError> {
+        let functions = functions
+            .value::<Self>()
+            .expect("published functions retain their concrete type");
+        let mut implementation = implementation.borrow_mut();
+        let implementation = implementation
+            .value_mut::<I>()
+            .expect("published implementation state retains its concrete type");
+        let prepared = prepared
+            .value_mut::<P>()
+            .expect("Context retains its implementation-private prepared type");
+        (functions.dispatch)(implementation, prepared, operations)
+    }
+}
+
+struct KeyGenerationFunctions<I, K> {
+    generate: fn(&mut I) -> Result<K, KeyError>,
+}
+
+impl<I: 'static, K: 'static> KeyGenerationFunctions<I, K> {
+    fn generate(
+        functions: &OwnedState,
+        implementation: &RefCell<OwnedState>,
+    ) -> Result<OwnedState, KeyError> {
+        let functions = functions
+            .value::<Self>()
+            .expect("published key functions retain their concrete type");
+        let mut implementation = implementation.borrow_mut();
+        let implementation = implementation
+            .value_mut::<I>()
+            .expect("published implementation state retains its concrete type");
+        (functions.generate)(implementation).map(OwnedState::new)
+    }
+}
+
+struct KeyGenerationRegistration {
+    functions: OwnedState,
+    generate: GenerateKey,
+    key_type: TypeId,
+    operations: KeyOperations,
+}
+
 /// One implementation declaration awaiting failure-atomic publication.
-pub struct ImplementationRegistration<F: Family> {
+pub struct ImplementationRegistration<F: Family, I: 'static = ()> {
     name: String,
     algorithms: Vec<AlgorithmImplementationRegistration<F>>,
     priority: i32,
     available: bool,
     instructions: InstructionSet,
+    state: I,
+    key_generation: Option<KeyGenerationRegistration>,
 }
 
 struct AlgorithmImplementationRegistration<F: Family> {
     name: String,
     capabilities: Capabilities,
-    prepare: F::Prepare,
-    dispatch: F::Dispatch,
+    functions: AlgorithmFunctions<F>,
 }
 
-impl<F: Family> ImplementationRegistration<F> {
+impl<F: Family> ImplementationRegistration<F, ()> {
     /// Declares one implementation before adding its algorithm function tables.
     pub fn new(name: impl Into<String>, priority: i32, available: bool) -> Self {
         Self {
@@ -732,9 +1018,26 @@ impl<F: Family> ImplementationRegistration<F> {
             priority,
             available,
             instructions: InstructionSet::empty(),
+            state: (),
+            key_generation: None,
         }
     }
 
+    /// Installs the state shared by this implementation's key and Context functions.
+    pub fn with_state<I: 'static>(self, state: I) -> ImplementationRegistration<F, I> {
+        ImplementationRegistration {
+            name: self.name,
+            algorithms: self.algorithms,
+            priority: self.priority,
+            available: self.available,
+            instructions: self.instructions,
+            state,
+            key_generation: self.key_generation,
+        }
+    }
+}
+
+impl<F: Family, I: 'static> ImplementationRegistration<F, I> {
     /// Declares the CPU instructions required before this implementation may be selected.
     pub fn with_instruction_set(mut self, instructions: InstructionSet) -> Self {
         self.instructions = instructions;
@@ -748,21 +1051,112 @@ impl<F: Family> ImplementationRegistration<F> {
         capabilities: Capabilities,
         prepare: F::Prepare,
         dispatch: F::Dispatch,
+    ) -> Self
+    where
+        F::Prepared: 'static,
+        F::Prepare: 'static,
+        F::Dispatch: 'static
+            + for<'a> Fn(&mut F::Prepared, &mut [F::Operation<'a>]) -> Result<(), ContextError>,
+    {
+        let key_type =
+            (!F::key_operations().is_empty()).then_some(TypeId::of::<Zeroizing<Vec<u8>>>());
+        self.algorithms.push(AlgorithmImplementationRegistration {
+            name: name.into(),
+            capabilities,
+            functions: AlgorithmFunctions {
+                state: OwnedState::new(FamilyFunctions::<F> { prepare, dispatch }),
+                prepare: FamilyFunctions::<F>::prepare,
+                dispatch: FamilyFunctions::<F>::dispatch,
+                key_type,
+            },
+        });
+        self
+    }
+
+    /// Adds an unkeyed algorithm backed by implementation-private prepared state.
+    pub fn with_unkeyed_algorithm<P: 'static>(
+        mut self,
+        name: impl Into<String>,
+        capabilities: Capabilities,
+        prepare: UnkeyedContextPrepare<F, I, P>,
+        dispatch: ContextDispatch<F, I, P>,
     ) -> Self {
         self.algorithms.push(AlgorithmImplementationRegistration {
             name: name.into(),
             capabilities,
-            prepare,
-            dispatch,
+            functions: AlgorithmFunctions {
+                state: OwnedState::new(UnkeyedFunctions::<F, I, P> { prepare, dispatch }),
+                prepare: UnkeyedFunctions::<F, I, P>::prepare,
+                dispatch: UnkeyedFunctions::<F, I, P>::dispatch,
+                key_type: None,
+            },
         });
         self
     }
+
+    /// Adds a keyed algorithm backed by implementation-private prepared state.
+    pub fn with_keyed_algorithm<K: 'static, P: 'static>(
+        mut self,
+        name: impl Into<String>,
+        capabilities: Capabilities,
+        prepare: KeyedContextPrepare<F, I, K, P>,
+        dispatch: ContextDispatch<F, I, P>,
+    ) -> Self {
+        self.algorithms.push(AlgorithmImplementationRegistration {
+            name: name.into(),
+            capabilities,
+            functions: AlgorithmFunctions {
+                state: OwnedState::new(KeyedFunctions::<F, I, K, P> { prepare, dispatch }),
+                prepare: KeyedFunctions::<F, I, K, P>::prepare,
+                dispatch: KeyedFunctions::<F, I, K, P>::dispatch,
+                key_type: Some(TypeId::of::<K>()),
+            },
+        });
+        self
+    }
+
+    /// Enables implementation-owned, non-exportable key generation.
+    pub fn with_key_generation<K: 'static>(
+        mut self,
+        operations: KeyOperations,
+        generate: fn(&mut I) -> Result<K, KeyError>,
+    ) -> Self {
+        self.key_generation = Some(KeyGenerationRegistration {
+            functions: OwnedState::new(KeyGenerationFunctions::<I, K> { generate }),
+            generate: KeyGenerationFunctions::<I, K>::generate,
+            key_type: TypeId::of::<K>(),
+            operations,
+        });
+        self
+    }
+
+    fn into_declaration(self) -> ImplementationDeclaration<F> {
+        ImplementationDeclaration {
+            name: self.name,
+            algorithms: self.algorithms,
+            priority: self.priority,
+            available: self.available,
+            instructions: self.instructions,
+            state: OwnedState::new(self.state),
+            key_generation: self.key_generation,
+        }
+    }
+}
+
+struct ImplementationDeclaration<F: Family> {
+    name: String,
+    algorithms: Vec<AlgorithmImplementationRegistration<F>>,
+    priority: i32,
+    available: bool,
+    instructions: InstructionSet,
+    state: OwnedState,
+    key_generation: Option<KeyGenerationRegistration>,
 }
 
 /// A family-typed algorithm and implementation publication bundle.
 pub struct Registration<F: Family> {
     algorithms: Vec<(String, Capabilities)>,
-    implementations: Vec<ImplementationRegistration<F>>,
+    implementations: Vec<ImplementationDeclaration<F>>,
 }
 
 impl<F: Family> Registration<F> {
@@ -781,8 +1175,11 @@ impl<F: Family> Registration<F> {
     }
 
     /// Adds one implementation declaration to the bundle.
-    pub fn with_implementation(mut self, implementation: ImplementationRegistration<F>) -> Self {
-        self.implementations.push(implementation);
+    pub fn with_implementation<I: 'static>(
+        mut self,
+        implementation: ImplementationRegistration<F, I>,
+    ) -> Self {
+        self.implementations.push(implementation.into_declaration());
         self
     }
 }
@@ -824,13 +1221,14 @@ struct ImplementationRecord<F: Family> {
     priority: i32,
     available: Rc<Cell<bool>>,
     instructions: InstructionSet,
+    state: Rc<RefCell<OwnedState>>,
+    key_generation: Option<KeyGenerationRegistration>,
 }
 
 struct AlgorithmImplementation<F: Family> {
     algorithm: u32,
     capabilities: Capabilities,
-    prepare: F::Prepare,
-    dispatch: F::Dispatch,
+    functions: Rc<AlgorithmFunctions<F>>,
 }
 
 /// Family-private registry storage exposed only to the sealed [`Family`] contract.
@@ -857,7 +1255,9 @@ impl<F: Family> FamilyRegistry<F> {
         algorithm: AlgorithmId<F>,
         policy: &SelectionPolicy,
         instructions: InstructionSet,
-    ) -> Option<(&str, F::Prepare, F::Dispatch, Rc<Cell<bool>>)> {
+        key_type: Option<TypeId>,
+        owner: Option<&Rc<RefCell<OwnedState>>>,
+    ) -> Option<(&ImplementationRecord<F>, &AlgorithmImplementation<F>)> {
         let required = *self.algorithms.get(algorithm.slot as usize)?;
         self.implementations
             .iter()
@@ -865,12 +1265,14 @@ impl<F: Family> FamilyRegistry<F> {
                 if !implementation.available.get()
                     || !instructions.contains(implementation.instructions)
                     || !policy.permits(&implementation.name)
+                    || owner.is_some_and(|owner| !Rc::ptr_eq(owner, &implementation.state))
                 {
                     return None;
                 }
                 let functions = implementation.algorithms.iter().find(|functions| {
                     functions.algorithm == algorithm.slot
                         && functions.capabilities.contains(required)
+                        && functions.functions.key_type == key_type
                 })?;
                 Some((implementation, functions))
             })
@@ -881,13 +1283,38 @@ impl<F: Family> FamilyRegistry<F> {
                     .cmp(&left.0.priority)
                     .then_with(|| left.0.name.cmp(&right.0.name))
             })
-            .map(|(implementation, functions)| {
-                (
-                    implementation.name.as_str(),
-                    functions.prepare,
-                    functions.dispatch,
-                    Rc::clone(&implementation.available),
-                )
+    }
+
+    fn select_key_generation(
+        &self,
+        algorithm: AlgorithmId<F>,
+        policy: &SelectionPolicy,
+        instructions: InstructionSet,
+    ) -> Option<(&ImplementationRecord<F>, &KeyGenerationRegistration)> {
+        let required = *self.algorithms.get(algorithm.slot as usize)?;
+        self.implementations
+            .iter()
+            .filter_map(|implementation| {
+                if !implementation.available.get()
+                    || !instructions.contains(implementation.instructions)
+                    || !policy.permits(&implementation.name)
+                {
+                    return None;
+                }
+                let key_generation = implementation.key_generation.as_ref()?;
+                implementation.algorithms.iter().find(|functions| {
+                    functions.algorithm == algorithm.slot
+                        && functions.capabilities.contains(required)
+                        && functions.functions.key_type == Some(key_generation.key_type)
+                })?;
+                Some((implementation, key_generation))
+            })
+            .min_by(|left, right| {
+                right
+                    .0
+                    .priority
+                    .cmp(&left.0.priority)
+                    .then_with(|| left.0.name.cmp(&right.0.name))
             })
     }
 
@@ -925,6 +1352,7 @@ impl<F: Family> FamilyRegistry<F> {
         }
 
         for implementation in registration.implementations {
+            let state = Rc::new(RefCell::new(implementation.state));
             let algorithms = implementation
                 .algorithms
                 .into_iter()
@@ -934,8 +1362,7 @@ impl<F: Family> FamilyRegistry<F> {
                         .get(&functions.name)
                         .expect("implementation algorithms were validated before publication"),
                     capabilities: functions.capabilities,
-                    prepare: functions.prepare,
-                    dispatch: functions.dispatch,
+                    functions: Rc::new(functions.functions),
                 })
                 .collect();
             let index = self.implementations.len();
@@ -947,6 +1374,8 @@ impl<F: Family> FamilyRegistry<F> {
                 priority: implementation.priority,
                 available: Rc::new(Cell::new(implementation.available)),
                 instructions: implementation.instructions,
+                state,
+                key_generation: implementation.key_generation,
             });
         }
     }
@@ -986,7 +1415,8 @@ pub enum Input<'a> {
 }
 
 impl Input<'_> {
-    fn with_fragments<T>(self, operation: impl FnOnce(&[&[u8]]) -> T) -> T {
+    /// Presents contiguous and scatter-gather input as one ordered fragment slice.
+    pub fn with_fragments<T>(self, operation: impl FnOnce(&[&[u8]]) -> T) -> T {
         match self {
             Self::Contiguous(input) => operation(&[input]),
             Self::Scatter(input) => operation(input),
@@ -1039,6 +1469,21 @@ impl<'a> MacOperation<'a> {
     /// Returns `None` until execution, then the exact authentication result.
     pub fn status(&self) -> Option<Result<usize, hammer_infra::crypto::mac::Error>> {
         self.result
+    }
+
+    /// Returns the caller-owned input selected for this operation.
+    pub fn input(&self) -> Input<'a> {
+        self.input
+    }
+
+    /// Returns the caller-owned output selected for this operation.
+    pub fn output(&mut self) -> &mut [u8] {
+        self.output
+    }
+
+    /// Records this operation's independent completion result.
+    pub fn complete(&mut self, result: Result<usize, hammer_infra::crypto::mac::Error>) {
+        self.result = Some(result);
     }
 }
 
@@ -1547,6 +1992,14 @@ impl KeyPolicy {
             derivations: Vec::new(),
         })
     }
+
+    fn restrict_to(&mut self, operations: KeyOperations) {
+        self.operations &= operations;
+        self.secret_export = false;
+        if !self.operations.contains(KeyOperations::DERIVE) {
+            self.derivations.clear();
+        }
+    }
 }
 
 /// A generation-bearing opaque identity for Engine-owned key material.
@@ -1555,27 +2008,53 @@ pub struct KeyHandle {
     index: PoolIndex,
 }
 
+struct KeyProvenance {
+    name: String,
+    state: Rc<RefCell<OwnedState>>,
+}
+
 struct KeyEntry {
-    material: Zeroizing<Vec<u8>>,
+    state: OwnedState,
     policy: KeyPolicy,
     contexts: usize,
+    provenance: Option<KeyProvenance>,
 }
 
 impl fmt::Debug for KeyEntry {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("KeyEntry")
-            .field("material_len", &self.material.len())
+            .field("state", &self.state)
             .field("policy", &self.policy)
             .field("contexts", &self.contexts)
+            .field(
+                "implementation",
+                &self
+                    .provenance
+                    .as_ref()
+                    .map(|implementation| implementation.name.as_str()),
+            )
             .finish()
     }
 }
 
 #[derive(Debug)]
-struct ContextKeyRef {
+struct KeyRetention {
     keys: Rc<RefCell<Pool<KeyEntry>>>,
     key: KeyHandle,
+}
+
+impl Drop for KeyRetention {
+    fn drop(&mut self) {
+        let mut keys = self.keys.borrow_mut();
+        let entry = keys
+            .get_mut(self.key.index)
+            .expect("live Context must retain a live key generation");
+        entry.contexts = entry
+            .contexts
+            .checked_sub(1)
+            .expect("key Context reference count must be positive");
+    }
 }
 
 /// The owner of cryptographic registries and implementation selection.
@@ -2005,22 +2484,33 @@ impl Engine {
         &self,
         algorithm: AlgorithmId<F>,
     ) -> Result<Context<F>, ContextError> {
-        let (implementation, prepare, dispatch, available) = F::registry(self)
-            .select(algorithm, &self.selection_policy, self.instructions)
+        let (implementation, algorithm_functions) = F::registry(self)
+            .select(
+                algorithm,
+                &self.selection_policy,
+                self.instructions,
+                None,
+                None,
+            )
             .ok_or(ContextError::AlgorithmUnavailable {
                 algorithm: algorithm.slot,
             })?;
-        let prepared =
-            F::prepare_unkeyed(prepare, self, algorithm).ok_or(ContextError::KeyRequired {
-                algorithm: algorithm.slot,
-            })?;
+        let functions = Rc::clone(&algorithm_functions.functions);
+        let prepared = (functions.prepare)(
+            &functions.state,
+            &implementation.state,
+            self,
+            algorithm,
+            None,
+        )?;
         Ok(Context {
             algorithm,
-            implementation: implementation.to_owned(),
-            dispatch,
+            implementation: implementation.name.clone(),
+            implementation_state: Rc::clone(&implementation.state),
+            functions,
             prepared,
-            key_ref: None,
-            available,
+            key_retention: None,
+            available: Rc::clone(&implementation.available),
             thread_bound: PhantomData,
         })
     }
@@ -2036,9 +2526,50 @@ impl Engine {
         let capacity = keys.capacity();
         let index = keys
             .insert(KeyEntry {
-                material: Zeroizing::new(material.to_vec()),
+                state: OwnedState::new(Zeroizing::new(material.to_vec())),
                 policy,
                 contexts: 0,
+                provenance: None,
+            })
+            .ok_or(KeyError::PoolFull { capacity })?;
+        Ok(KeyHandle { index })
+    }
+
+    /// Generates a non-exportable key through one selected implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed policy, availability, implementation-resource, or Engine
+    /// key-capacity failure without publishing a partial key.
+    pub fn generate_key<F: Family>(
+        &self,
+        algorithm: AlgorithmId<F>,
+        mut policy: KeyPolicy,
+    ) -> Result<KeyHandle, KeyError> {
+        if !policy.applies_to(PolicyAlgorithm::new(algorithm)) {
+            return Err(KeyError::GenerationPolicyDenied {
+                algorithm: algorithm.slot,
+            });
+        }
+        let (implementation, key_generation) = F::registry(self)
+            .select_key_generation(algorithm, &self.selection_policy, self.instructions)
+            .ok_or(KeyError::GenerationUnavailable {
+                algorithm: algorithm.slot,
+            })?;
+        let state = (key_generation.generate)(&key_generation.functions, &implementation.state)?;
+        policy.restrict_to(key_generation.operations);
+
+        let mut keys = self.keys.borrow_mut();
+        let capacity = keys.capacity();
+        let index = keys
+            .insert(KeyEntry {
+                state,
+                policy,
+                contexts: 0,
+                provenance: Some(KeyProvenance {
+                    name: implementation.name.clone(),
+                    state: Rc::clone(&implementation.state),
+                }),
             })
             .ok_or(KeyError::PoolFull { capacity })?;
         Ok(KeyHandle { index })
@@ -2078,15 +2609,19 @@ impl Engine {
         if !entry.policy.secret_export {
             return Err(KeyError::SecretExportDenied { key });
         }
-        if output.len() < entry.material.len() {
+        let material = entry
+            .state
+            .value::<Zeroizing<Vec<u8>>>()
+            .expect("exportable keys retain Engine-owned software material");
+        if output.len() < material.len() {
             return Err(KeyError::OutputTooSmall {
                 key,
-                required: entry.material.len(),
+                required: material.len(),
                 provided: output.len(),
             });
         }
-        output[..entry.material.len()].copy_from_slice(&entry.material);
-        Ok(entry.material.len())
+        output[..material.len()].copy_from_slice(material);
+        Ok(material.len())
     }
 
     /// Creates a thread-bound family-typed Context using an opaque key.
@@ -2100,13 +2635,6 @@ impl Engine {
         algorithm: AlgorithmId<F>,
         key: KeyHandle,
     ) -> Result<Context<F>, ContextError> {
-        let registry = F::registry(self);
-        let (implementation, prepare, dispatch, available) = registry
-            .select(algorithm, &self.selection_policy, self.instructions)
-            .ok_or(ContextError::AlgorithmUnavailable {
-                algorithm: algorithm.slot,
-            })?;
-
         let mut keys = self.keys.borrow_mut();
         let entry = keys
             .get_mut(key.index)
@@ -2126,13 +2654,37 @@ impl Engine {
         if !entry.policy.operations.intersects(required) {
             return Err(ContextError::OperationsDenied { key, required });
         }
-        let prepared = F::prepare_keyed(
-            prepare,
+        let owner = entry
+            .provenance
+            .as_ref()
+            .map(|implementation| &implementation.state);
+        let selection = F::registry(self).select(
+            algorithm,
+            &self.selection_policy,
+            self.instructions,
+            Some(entry.state.value_type),
+            owner,
+        );
+        let (implementation, algorithm_functions) = match selection {
+            Some(selection) => selection,
+            None => {
+                return Err(match &entry.provenance {
+                    Some(implementation) => ContextError::ImplementationUnavailable {
+                        implementation: implementation.name.clone(),
+                    },
+                    None => ContextError::AlgorithmUnavailable {
+                        algorithm: algorithm.slot,
+                    },
+                });
+            }
+        };
+        let functions = Rc::clone(&algorithm_functions.functions);
+        let prepared = (functions.prepare)(
+            &functions.state,
+            &implementation.state,
             self,
             algorithm,
-            key,
-            &entry.material,
-            &entry.policy,
+            Some((key, &entry.state, &entry.policy)),
         )?;
         entry.contexts = entry
             .contexts
@@ -2142,14 +2694,15 @@ impl Engine {
 
         Ok(Context {
             algorithm,
-            implementation: implementation.to_owned(),
-            dispatch,
+            implementation: implementation.name.clone(),
+            implementation_state: Rc::clone(&implementation.state),
+            functions,
             prepared,
-            key_ref: Some(ContextKeyRef {
+            key_retention: Some(KeyRetention {
                 keys: Rc::clone(&self.keys),
                 key,
             }),
-            available,
+            available: Rc::clone(&implementation.available),
             thread_bound: PhantomData,
         })
     }
@@ -2167,16 +2720,28 @@ impl Engine {
 /// let context = engine.context(algorithm).unwrap();
 /// std::thread::spawn(move || drop(context));
 /// ```
-#[derive(Debug)]
 pub struct Context<F: Family> {
     algorithm: AlgorithmId<F>,
     implementation: String,
-    dispatch: F::Dispatch,
-    prepared: F::Prepared,
-    key_ref: Option<ContextKeyRef>,
+    prepared: OwnedState,
+    key_retention: Option<KeyRetention>,
+    implementation_state: Rc<RefCell<OwnedState>>,
+    functions: Rc<AlgorithmFunctions<F>>,
     available: Rc<Cell<bool>>,
     // Rc is deliberately part of the marker: Context must be neither Send nor Sync.
     thread_bound: PhantomData<Rc<()>>,
+}
+
+impl<F: Family> fmt::Debug for Context<F> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Context")
+            .field("algorithm", &self.algorithm.slot)
+            .field("implementation", &self.implementation)
+            .field("prepared", &self.prepared)
+            .field("key_retention", &self.key_retention)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<F: Family> Context<F> {
@@ -2194,32 +2759,18 @@ impl<F: Family> Context<F> {
     pub fn execute<'data>(
         &mut self,
         operations: &mut [F::Operation<'data>],
-    ) -> Result<(), ContextError>
-    where
-        F::Dispatch: Fn(&mut F::Prepared, &mut [F::Operation<'data>]) -> Result<(), ContextError>,
-    {
+    ) -> Result<(), ContextError> {
         if !self.available.get() {
             return Err(ContextError::ImplementationUnavailable {
                 implementation: self.implementation.clone(),
             });
         }
-        (self.dispatch)(&mut self.prepared, operations)
-    }
-}
-
-impl<F: Family> Drop for Context<F> {
-    fn drop(&mut self) {
-        let Some(key_ref) = &self.key_ref else {
-            return;
-        };
-        let mut keys = key_ref.keys.borrow_mut();
-        let entry = keys
-            .get_mut(key_ref.key.index)
-            .expect("live Context must retain a live key generation");
-        entry.contexts = entry
-            .contexts
-            .checked_sub(1)
-            .expect("key Context reference count must be positive");
+        (self.functions.dispatch)(
+            &self.functions.state,
+            &self.implementation_state,
+            &mut self.prepared,
+            operations,
+        )
     }
 }
 
@@ -2288,6 +2839,24 @@ pub enum RegistryError {
         /// Rejected implementation.
         name: String,
     },
+    /// Key generation permits operations outside this operation family.
+    #[error(
+        "implementation `{implementation}` key generation permits {provided:?}, outside family operations {supported:?}"
+    )]
+    KeyGenerationOperationsUnsupported {
+        /// Rejected Crypto Implementation Name.
+        implementation: String,
+        /// Operations declared by the implementation.
+        provided: KeyOperations,
+        /// Operations owned by this family.
+        supported: KeyOperations,
+    },
+    /// Key generation produces a key type accepted by none of the implementation's algorithms.
+    #[error("implementation `{implementation}` key generation has no matching keyed algorithm")]
+    KeyGenerationWithoutAlgorithm {
+        /// Rejected Crypto Implementation Name.
+        implementation: String,
+    },
     /// The named implementation is absent from the selected family.
     #[error("implementation `{name}` is not registered")]
     ImplementationUnknown {
@@ -2323,6 +2892,18 @@ pub enum ContextError {
         required: InstructionSet,
         /// Instructions detected immediately before dispatch.
         available: InstructionSet,
+    },
+    /// The selected implementation cannot currently open or use its session.
+    #[error("implementation `{implementation}` has no available cryptographic session")]
+    SessionUnavailable {
+        /// Permanently selected Crypto Implementation Name.
+        implementation: String,
+    },
+    /// The selected implementation rejected this batch without executing it.
+    #[error("implementation `{implementation}` rejected the cryptographic operation batch")]
+    OperationRejected {
+        /// Permanently selected Crypto Implementation Name.
+        implementation: String,
     },
     /// The selected operation family requires an opaque key.
     #[error("algorithm slot {algorithm} requires a Key Handle")]
@@ -2374,12 +2955,34 @@ pub enum ContextError {
 }
 
 /// A failure owned by the Engine's opaque key lifecycle.
-#[derive(Clone, Copy, Debug, thiserror::Error, Eq, PartialEq)]
+#[derive(Clone, Debug, thiserror::Error, Eq, PartialEq)]
 pub enum KeyError {
     /// The fixed-capacity key authority has no free slot.
     #[error("key pool capacity {capacity} is exhausted")]
     PoolFull {
         /// Configured fixed capacity.
+        capacity: usize,
+    },
+    /// No selected implementation can generate a key for this algorithm.
+    #[error("algorithm slot {algorithm} has no available key-generating implementation")]
+    GenerationUnavailable {
+        /// Process-local algorithm slot.
+        algorithm: u32,
+    },
+    /// The supplied policy belongs to another family or algorithm.
+    #[error("key-generation policy does not permit algorithm slot {algorithm}")]
+    GenerationPolicyDenied {
+        /// Rejected process-local algorithm slot.
+        algorithm: u32,
+    },
+    /// The selected implementation exhausted its own key resources.
+    #[error(
+        "implementation `{implementation}` exhausted its cryptographic resource capacity {capacity}"
+    )]
+    ImplementationResourcesExhausted {
+        /// Selected Crypto Implementation Name.
+        implementation: String,
+        /// Implementation-owned capacity.
         capacity: usize,
     },
     /// The Key Handle generation is absent or has already been destroyed.
@@ -2529,6 +3132,27 @@ impl Engine {
                         algorithm: functions.name.clone(),
                         required,
                         provided: functions.capabilities,
+                    });
+                }
+            }
+            if let Some(key_generation) = &implementation.key_generation {
+                let supported = F::key_operations();
+                if key_generation.operations.is_empty()
+                    || !supported.contains(key_generation.operations)
+                {
+                    return Err(RegistryError::KeyGenerationOperationsUnsupported {
+                        implementation: implementation.name.clone(),
+                        provided: key_generation.operations,
+                        supported,
+                    });
+                }
+                if !implementation
+                    .algorithms
+                    .iter()
+                    .any(|algorithm| algorithm.functions.key_type == Some(key_generation.key_type))
+                {
+                    return Err(RegistryError::KeyGenerationWithoutAlgorithm {
+                        implementation: implementation.name.clone(),
                     });
                 }
             }
