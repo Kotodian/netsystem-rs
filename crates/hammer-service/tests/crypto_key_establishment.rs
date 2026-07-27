@@ -1,4 +1,7 @@
-use hammer_infra::crypto::key_establishment::{Error as KeyEstablishmentError, Output};
+use hammer_infra::crypto::{
+    InstructionSet,
+    key_establishment::{Error as KeyEstablishmentError, Output},
+};
 use hammer_service::crypto::{
     Engine, Kdf, KeyError, KeyOperations, KeyPolicy, Kx, KxOperation, KxStatus,
 };
@@ -18,7 +21,8 @@ const X25519_SHARED_SECRET: [u8; 32] = [
 
 #[test]
 fn builtins_publish_the_common_key_establishment_catalog() {
-    let engine = Engine::with_builtins().expect("built-in catalog publishes");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in catalog publishes");
 
     for name in ["x25519", "p-256", "p-384", "ml-kem-768"] {
         assert!(engine.algorithm::<Kx>(name).is_some(), "missing {name}");
@@ -27,7 +31,8 @@ fn builtins_publish_the_common_key_establishment_catalog() {
 
 #[test]
 fn x25519_context_matches_the_rfc_7748_shared_secret() {
-    let engine = Engine::with_builtins().expect("built-in catalog publishes");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in catalog publishes");
     let algorithm = engine
         .algorithm::<Kx>("x25519")
         .expect("X25519 is registered");
@@ -49,7 +54,9 @@ fn x25519_context_matches_the_rfc_7748_shared_secret() {
         .expect("X25519 Context is prepared");
     let mut operations = [KxOperation::agree(private_key, &X25519_PEER_PUBLIC, target)];
 
-    context.execute(&mut operations);
+    context
+        .execute(&mut operations)
+        .expect("Context remains available");
 
     let status = operations[0].status();
     let KxStatus::SharedSecret { key: shared_key } = status else {
@@ -64,7 +71,8 @@ fn x25519_context_matches_the_rfc_7748_shared_secret() {
 
 #[test]
 fn nist_curve_contexts_generate_opaque_keys_and_agree_symmetrically() {
-    let engine = Engine::with_builtins().expect("built-in catalog publishes");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in catalog publishes");
     let target = engine
         .algorithm::<Kdf>("hkdf-sha-384")
         .expect("HKDF-SHA-384 is registered");
@@ -86,7 +94,9 @@ fn nist_curve_contexts_generate_opaque_keys_and_agree_symmetrically() {
                 private_policy.clone(),
                 &mut alice_public,
             )];
-            context.execute(&mut operations);
+            context
+                .execute(&mut operations)
+                .expect("Context remains available");
             let status = operations[0].status();
             let KxStatus::Generated { key, .. } = status else {
                 panic!("key generation did not return an opaque private key: {status:?}")
@@ -98,7 +108,9 @@ fn nist_curve_contexts_generate_opaque_keys_and_agree_symmetrically() {
                 private_policy.clone(),
                 &mut bob_public,
             )];
-            context.execute(&mut operations);
+            context
+                .execute(&mut operations)
+                .expect("Context remains available");
             let status = operations[0].status();
             let KxStatus::Generated { key, .. } = status else {
                 panic!("key generation did not return an opaque private key: {status:?}")
@@ -107,7 +119,9 @@ fn nist_curve_contexts_generate_opaque_keys_and_agree_symmetrically() {
         };
         let alice_shared = {
             let mut operations = [KxOperation::agree(alice_key, &bob_public, target)];
-            context.execute(&mut operations);
+            context
+                .execute(&mut operations)
+                .expect("Context remains available");
             let status = operations[0].status();
             let KxStatus::SharedSecret { key } = status else {
                 panic!("agreement did not return an opaque shared secret: {status:?}")
@@ -116,7 +130,9 @@ fn nist_curve_contexts_generate_opaque_keys_and_agree_symmetrically() {
         };
         let bob_shared = {
             let mut operations = [KxOperation::agree(bob_key, &alice_public, target)];
-            context.execute(&mut operations);
+            context
+                .execute(&mut operations)
+                .expect("Context remains available");
             let status = operations[0].status();
             let KxStatus::SharedSecret { key } = status else {
                 panic!("agreement did not return an opaque shared secret: {status:?}")
@@ -138,7 +154,8 @@ fn nist_curve_contexts_generate_opaque_keys_and_agree_symmetrically() {
 
 #[test]
 fn ml_kem_context_round_trips_without_returning_secret_bytes() {
-    let engine = Engine::with_builtins().expect("built-in catalog publishes");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in catalog publishes");
     let algorithm = engine
         .algorithm::<Kx>("ml-kem-768")
         .expect("ML-KEM-768 is registered");
@@ -157,7 +174,9 @@ fn ml_kem_context_round_trips_without_returning_secret_bytes() {
             private_policy,
             &mut public_key,
         )];
-        context.execute(&mut operations);
+        context
+            .execute(&mut operations)
+            .expect("Context remains available");
         let status = operations[0].status();
         let KxStatus::Generated { key, .. } = status else {
             panic!("key generation did not return an opaque private key: {status:?}")
@@ -171,7 +190,9 @@ fn ml_kem_context_round_trips_without_returning_secret_bytes() {
             shared_policy,
             &mut ciphertext,
         )];
-        context.execute(&mut operations);
+        context
+            .execute(&mut operations)
+            .expect("Context remains available");
         let KxStatus::Encapsulated { key, .. } = operations[0].status() else {
             panic!("encapsulation did not return an opaque secret")
         };
@@ -179,7 +200,9 @@ fn ml_kem_context_round_trips_without_returning_secret_bytes() {
     };
     let receiver_key = {
         let mut operations = [KxOperation::decapsulate(private_key, &ciphertext, target)];
-        context.execute(&mut operations);
+        context
+            .execute(&mut operations)
+            .expect("Context remains available");
         let status = operations[0].status();
         let KxStatus::SharedSecret { key } = status else {
             panic!("decapsulation did not return an opaque shared secret: {status:?}")
@@ -200,7 +223,8 @@ fn ml_kem_context_round_trips_without_returning_secret_bytes() {
 
 #[test]
 fn key_agreement_reports_policy_denial_without_creating_a_secret() {
-    let engine = Engine::with_builtins().expect("built-in catalog publishes");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in catalog publishes");
     let algorithm = engine
         .algorithm::<Kx>("x25519")
         .expect("X25519 is registered");
@@ -222,7 +246,9 @@ fn key_agreement_reports_policy_denial_without_creating_a_secret() {
         .expect("X25519 Context is prepared");
     let mut operations = [KxOperation::agree(private_key, &X25519_PEER_PUBLIC, target)];
 
-    context.execute(&mut operations);
+    context
+        .execute(&mut operations)
+        .expect("Context remains available");
 
     assert_eq!(
         operations[0].status(),
@@ -232,7 +258,8 @@ fn key_agreement_reports_policy_denial_without_creating_a_secret() {
 
 #[test]
 fn key_agreement_reports_a_stale_private_key_handle() {
-    let engine = Engine::with_builtins().expect("built-in catalog publishes");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in catalog publishes");
     let algorithm = engine
         .algorithm::<Kx>("x25519")
         .expect("X25519 is registered");
@@ -253,7 +280,9 @@ fn key_agreement_reports_a_stale_private_key_handle() {
         .expect("X25519 Context is prepared");
     let mut operations = [KxOperation::agree(private_key, &X25519_PEER_PUBLIC, target)];
 
-    context.execute(&mut operations);
+    context
+        .execute(&mut operations)
+        .expect("Context remains available");
 
     assert_eq!(
         operations[0].status(),
@@ -263,7 +292,8 @@ fn key_agreement_reports_a_stale_private_key_handle() {
 
 #[test]
 fn key_generation_capacity_failure_leaves_public_output_unchanged() {
-    let engine = Engine::with_builtins().expect("built-in catalog publishes");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in catalog publishes");
     let algorithm = engine
         .algorithm::<Kx>("x25519")
         .expect("X25519 is registered");
@@ -276,7 +306,9 @@ fn key_generation_capacity_failure_leaves_public_output_unchanged() {
         &mut public_key,
     )];
 
-    context.execute(&mut operations);
+    context
+        .execute(&mut operations)
+        .expect("Context remains available");
 
     assert_eq!(
         operations[0].status(),
@@ -291,7 +323,8 @@ fn key_generation_capacity_failure_leaves_public_output_unchanged() {
 
 #[test]
 fn key_generation_rejects_a_policy_for_another_algorithm() {
-    let engine = Engine::with_builtins().expect("built-in catalog publishes");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in catalog publishes");
     let x25519 = engine
         .algorithm::<Kx>("x25519")
         .expect("X25519 is registered");
@@ -305,7 +338,9 @@ fn key_generation_rejects_a_policy_for_another_algorithm() {
         &mut public_key,
     )];
 
-    context.execute(&mut operations);
+    context
+        .execute(&mut operations)
+        .expect("Context remains available");
 
     assert_eq!(operations[0].status(), KxStatus::GenerationPolicyDenied);
     assert_eq!(public_key, [0xa5; 32]);
@@ -313,7 +348,8 @@ fn key_generation_rejects_a_policy_for_another_algorithm() {
 
 #[test]
 fn ml_kem_ciphertext_capacity_failure_leaves_output_unchanged() {
-    let engine = Engine::with_builtins().expect("built-in catalog publishes");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in catalog publishes");
     let algorithm = engine
         .algorithm::<Kx>("ml-kem-768")
         .expect("ML-KEM-768 is registered");
@@ -329,7 +365,9 @@ fn ml_kem_ciphertext_capacity_failure_leaves_output_unchanged() {
             KeyPolicy::new(algorithm, KeyOperations::KX_DECAPSULATE, false),
             &mut public_key,
         )];
-        context.execute(&mut operations);
+        context
+            .execute(&mut operations)
+            .expect("Context remains available");
         let status = operations[0].status();
         assert!(
             matches!(status, KxStatus::Generated { .. }),
@@ -343,7 +381,9 @@ fn ml_kem_ciphertext_capacity_failure_leaves_output_unchanged() {
         &mut ciphertext,
     )];
 
-    context.execute(&mut operations);
+    context
+        .execute(&mut operations)
+        .expect("Context remains available");
 
     assert_eq!(
         operations[0].status(),
@@ -358,7 +398,8 @@ fn ml_kem_ciphertext_capacity_failure_leaves_output_unchanged() {
 
 #[test]
 fn ml_kem_decapsulation_reports_invalid_ciphertext_length() {
-    let engine = Engine::with_builtins().expect("built-in catalog publishes");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in catalog publishes");
     let algorithm = engine
         .algorithm::<Kx>("ml-kem-768")
         .expect("ML-KEM-768 is registered");
@@ -376,7 +417,9 @@ fn ml_kem_decapsulation_reports_invalid_ciphertext_length() {
             private_policy,
             &mut public_key,
         )];
-        context.execute(&mut operations);
+        context
+            .execute(&mut operations)
+            .expect("Context remains available");
         let status = operations[0].status();
         let KxStatus::Generated { key, .. } = status else {
             panic!("key generation did not return an opaque private key: {status:?}")
@@ -385,7 +428,9 @@ fn ml_kem_decapsulation_reports_invalid_ciphertext_length() {
     };
     let mut operations = [KxOperation::decapsulate(private_key, &[0; 1087], target)];
 
-    context.execute(&mut operations);
+    context
+        .execute(&mut operations)
+        .expect("Context remains available");
 
     assert_eq!(
         operations[0].status(),
@@ -398,7 +443,8 @@ fn ml_kem_decapsulation_reports_invalid_ciphertext_length() {
 
 #[test]
 fn x25519_small_order_peer_key_is_rejected() {
-    let engine = Engine::with_builtins().expect("built-in catalog publishes");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in catalog publishes");
     let algorithm = engine
         .algorithm::<Kx>("x25519")
         .expect("X25519 is registered");
@@ -420,7 +466,9 @@ fn x25519_small_order_peer_key_is_rejected() {
         .expect("X25519 Context is prepared");
     let mut operations = [KxOperation::agree(private_key, &[0; 32], target)];
 
-    context.execute(&mut operations);
+    context
+        .execute(&mut operations)
+        .expect("Context remains available");
 
     assert_eq!(
         operations[0].status(),
@@ -430,7 +478,8 @@ fn x25519_small_order_peer_key_is_rejected() {
 
 #[test]
 fn established_secret_remains_non_exportable_when_target_policy_denies_export() {
-    let engine = Engine::with_builtins().expect("built-in catalog publishes");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in catalog publishes");
     let algorithm = engine
         .algorithm::<Kx>("x25519")
         .expect("X25519 is registered");
@@ -451,7 +500,9 @@ fn established_secret_remains_non_exportable_when_target_policy_denies_export() 
         .context(algorithm)
         .expect("X25519 Context is prepared");
     let mut operations = [KxOperation::agree(private_key, &X25519_PEER_PUBLIC, target)];
-    context.execute(&mut operations);
+    context
+        .execute(&mut operations)
+        .expect("Context remains available");
     let status = operations[0].status();
     let KxStatus::SharedSecret { key: shared_key } = status else {
         panic!("agreement did not return an opaque shared secret: {status:?}")

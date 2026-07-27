@@ -1,3 +1,4 @@
+use hammer_infra::crypto::InstructionSet;
 use hammer_service::crypto::{
     Aead, Capabilities, Cipher, Engine, Hash, HashOperation, HashPrepared,
     ImplementationRegistration, Kdf, Kx, Mac, Registration, RegistryError, SelectionPolicy, Sign,
@@ -8,13 +9,23 @@ const HASH_CAPABILITIES: Capabilities = Capabilities::CONTIGUOUS_INPUT
     .union(Capabilities::SCATTER_INPUT)
     .union(Capabilities::OUT_OF_PLACE);
 
-fn implementation_a(_: &mut HashPrepared, _: &mut [HashOperation<'_>]) {}
+fn implementation_a(
+    _: &mut HashPrepared,
+    _: &mut [HashOperation<'_>],
+) -> Result<(), hammer_service::crypto::ContextError> {
+    Ok(())
+}
 
-fn implementation_b(_: &mut HashPrepared, _: &mut [HashOperation<'_>]) {}
+fn implementation_b(
+    _: &mut HashPrepared,
+    _: &mut [HashOperation<'_>],
+) -> Result<(), hammer_service::crypto::ContextError> {
+    Ok(())
+}
 
 #[test]
 fn registry_supports_each_closed_operation_family() {
-    let mut engine = Engine::new();
+    let mut engine = Engine::new(InstructionSet::empty());
 
     engine
         .publish(Registration::<Aead>::new().with_algorithm("test:aead", Capabilities::empty()))
@@ -53,7 +64,7 @@ fn registry_supports_each_closed_operation_family() {
 
 #[test]
 fn algorithm_names_are_unique_within_each_family() {
-    let mut engine = Engine::new();
+    let mut engine = Engine::new(InstructionSet::empty());
 
     engine
         .publish(
@@ -72,7 +83,7 @@ fn algorithm_names_are_unique_within_each_family() {
 
 #[test]
 fn registration_bundle_rolls_back_on_implementation_name_failure() {
-    let mut engine = Engine::new();
+    let mut engine = Engine::new(InstructionSet::empty());
     let registration = Registration::new()
         .with_algorithm("test-hash", HASH_CAPABILITIES)
         .with_implementation(
@@ -99,7 +110,7 @@ fn registration_bundle_rolls_back_on_implementation_name_failure() {
 
 #[test]
 fn algorithm_collision_rolls_back_other_bundle_declarations() {
-    let mut engine = Engine::new();
+    let mut engine = Engine::new(InstructionSet::empty());
     engine
         .publish(Registration::<Hash>::new().with_algorithm("existing-hash", HASH_CAPABILITIES))
         .expect("initial algorithm publishes");
@@ -123,7 +134,7 @@ fn algorithm_collision_rolls_back_other_bundle_declarations() {
 
 #[test]
 fn registration_rejects_capability_mismatch_without_partial_publication() {
-    let mut engine = Engine::new();
+    let mut engine = Engine::new(InstructionSet::empty());
     let registration = Registration::new()
         .with_algorithm("test-hash", HASH_CAPABILITIES)
         .with_implementation(
@@ -153,7 +164,7 @@ fn registration_rejects_capability_mismatch_without_partial_publication() {
 
 #[test]
 fn registration_rejects_repeated_algorithm_function_tables() {
-    let mut engine = Engine::new();
+    let mut engine = Engine::new(InstructionSet::empty());
     let registration = Registration::new()
         .with_algorithm("test-hash", HASH_CAPABILITIES)
         .with_implementation(
@@ -178,7 +189,7 @@ fn registration_rejects_repeated_algorithm_function_tables() {
 
 #[test]
 fn deterministic_selection_uses_priority_then_implementation_name() {
-    let mut engine = Engine::new();
+    let mut engine = Engine::new(InstructionSet::empty());
     engine
         .publish(
             Registration::new()
@@ -213,7 +224,7 @@ fn deterministic_selection_uses_priority_then_implementation_name() {
 
 #[test]
 fn availability_and_policy_changes_affect_only_new_contexts() {
-    let mut engine = Engine::new();
+    let mut engine = Engine::new(InstructionSet::empty());
     engine
         .publish(
             Registration::new()
@@ -247,7 +258,7 @@ fn availability_and_policy_changes_affect_only_new_contexts() {
 
 #[test]
 fn names_enforce_algorithm_and_implementation_namespaces() {
-    let mut engine = Engine::new();
+    let mut engine = Engine::new(InstructionSet::empty());
     let malformed_algorithm = engine
         .publish(Registration::<Hash>::new().with_algorithm("Vendor:Hash", HASH_CAPABILITIES))
         .expect_err("algorithm name is not canonical");

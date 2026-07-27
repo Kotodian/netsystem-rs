@@ -37,6 +37,28 @@ pub trait Algorithm: Default + fmt::Debug + 'static {
 
     /// Computes a digest over ordered fragments into caller-owned output.
     fn digest(&self, input: &[&[u8]], output: &mut [u8]) -> Result<usize, Error>;
+
+    /// Computes a digest in a function compiled for x86 SHA instructions.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support the `sha` target feature.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sha")]
+    unsafe fn digest_sha_ni(&self, input: &[&[u8]], output: &mut [u8]) -> Result<usize, Error> {
+        self.digest(input, output)
+    }
+
+    /// Computes a digest in a function compiled for Armv8 SHA-2 instructions.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support the `sha2` target feature.
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "sha2")]
+    unsafe fn digest_sha2_armv8(&self, input: &[&[u8]], output: &mut [u8]) -> Result<usize, Error> {
+        self.digest(input, output)
+    }
 }
 
 /// Digest semantics shared by algorithms implemented through the Rust digest traits.

@@ -1318,6 +1318,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "bitflags 2.11.1",
+ "criterion",
  "crossbeam-utils",
  "etherparse",
  "getrandom 0.2.17",

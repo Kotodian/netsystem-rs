@@ -1,6 +1,6 @@
 use std::error::Error;
 
-use hammer_infra::crypto::aead::Error as AeadError;
+use hammer_infra::crypto::{InstructionSet, aead::Error as AeadError};
 use hammer_service::crypto::{
     Aead, AeadDirection, AeadOperation, AeadStatus, ContextError, Engine, Hash, Input, KeyError,
     KeyOperations, KeyPolicy,
@@ -15,7 +15,8 @@ const TAG: [u8; 16] = [
 
 #[test]
 fn aead_context_executes_scatter_gather_seal_batch() {
-    let engine = Engine::with_builtins().expect("built-in crypto registry is valid");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in crypto registry is valid");
     let algorithm = engine
         .algorithm::<Aead>("aes-128-gcm")
         .expect("AES-128-GCM is built in");
@@ -40,7 +41,9 @@ fn aead_context_executes_scatter_gather_seal_batch() {
         &mut output,
         &mut tag,
     )];
-    context.execute(&mut operations);
+    context
+        .execute(&mut operations)
+        .expect("Context remains available");
 
     assert_eq!(operations[0].status(), AeadStatus::Executed(Ok(16)));
     assert_eq!((output, tag), (CIPHERTEXT, TAG));
@@ -48,7 +51,8 @@ fn aead_context_executes_scatter_gather_seal_batch() {
 
 #[test]
 fn aead_authentication_failure_is_per_operation_and_exposes_no_plaintext() {
-    let engine = Engine::with_builtins().expect("built-in crypto registry is valid");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in crypto registry is valid");
     let algorithm = engine
         .algorithm::<Aead>("aes-128-gcm")
         .expect("AES-128-GCM is built in");
@@ -69,7 +73,9 @@ fn aead_authentication_failure_is_per_operation_and_exposes_no_plaintext() {
         &invalid_tag,
         &mut output,
     )];
-    context.execute(&mut operations);
+    context
+        .execute(&mut operations)
+        .expect("Context remains available");
 
     assert_eq!(
         operations[0].status(),
@@ -80,7 +86,8 @@ fn aead_authentication_failure_is_per_operation_and_exposes_no_plaintext() {
 
 #[test]
 fn key_destruction_waits_for_context_release_and_rejects_stale_handle() {
-    let engine = Engine::with_builtins().expect("built-in crypto registry is valid");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in crypto registry is valid");
     let algorithm = engine
         .algorithm::<Aead>("aes-128-gcm")
         .expect("AES-128-GCM is built in");
@@ -109,7 +116,8 @@ fn key_destruction_waits_for_context_release_and_rejects_stale_handle() {
 
 #[test]
 fn secret_export_requires_explicit_policy_permission() {
-    let engine = Engine::with_builtins().expect("built-in crypto registry is valid");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in crypto registry is valid");
     let algorithm = engine
         .algorithm::<Aead>("aes-128-gcm")
         .expect("AES-128-GCM is built in");
@@ -136,7 +144,8 @@ fn secret_export_requires_explicit_policy_permission() {
 
 #[test]
 fn aead_context_round_trips_in_place_with_associated_data() {
-    let engine = Engine::with_builtins().expect("built-in crypto registry is valid");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in crypto registry is valid");
     let algorithm = engine
         .algorithm::<Aead>("aes-128-gcm")
         .expect("AES-128-GCM is built in");
@@ -162,7 +171,9 @@ fn aead_context_round_trips_in_place_with_associated_data() {
             b"associated-data",
             &mut tag,
         )];
-        context.execute(&mut operations);
+        context
+            .execute(&mut operations)
+            .expect("Context remains available");
         assert_eq!(operations[0].status(), AeadStatus::Executed(Ok(17)));
     }
     {
@@ -172,7 +183,9 @@ fn aead_context_round_trips_in_place_with_associated_data() {
             b"associated-data",
             &tag,
         )];
-        context.execute(&mut operations);
+        context
+            .execute(&mut operations)
+            .expect("Context remains available");
         assert_eq!(operations[0].status(), AeadStatus::Executed(Ok(17)));
     }
 
@@ -181,7 +194,8 @@ fn aead_context_round_trips_in_place_with_associated_data() {
 
 #[test]
 fn aead_batch_reports_operation_policy_denial_without_mutating_output() {
-    let engine = Engine::with_builtins().expect("built-in crypto registry is valid");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in crypto registry is valid");
     let algorithm = engine
         .algorithm::<Aead>("aes-128-gcm")
         .expect("AES-128-GCM is built in");
@@ -201,7 +215,9 @@ fn aead_batch_reports_operation_policy_denial_without_mutating_output() {
         &mut output,
     )];
 
-    context.execute(&mut operations);
+    context
+        .execute(&mut operations)
+        .expect("Context remains available");
 
     assert_eq!(
         operations[0].status(),
@@ -214,7 +230,8 @@ fn aead_batch_reports_operation_policy_denial_without_mutating_output() {
 
 #[test]
 fn key_policy_rejects_an_algorithm_from_another_family() {
-    let engine = Engine::with_builtins().expect("built-in crypto registry is valid");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in crypto registry is valid");
     let hash = engine
         .algorithm::<Hash>("sha-256")
         .expect("SHA-256 is built in");
@@ -237,7 +254,8 @@ fn key_policy_rejects_an_algorithm_from_another_family() {
 
 #[test]
 fn invalid_key_context_creation_is_failure_atomic() {
-    let engine = Engine::with_builtins().expect("built-in crypto registry is valid");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in crypto registry is valid");
     let algorithm = engine
         .algorithm::<Aead>("aes-128-gcm")
         .expect("AES-128-GCM is built in");
@@ -276,7 +294,8 @@ fn invalid_key_context_creation_is_failure_atomic() {
 
 #[test]
 fn opaque_key_handle_can_cross_threads_without_key_material() {
-    let engine = Engine::with_builtins().expect("built-in crypto registry is valid");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in crypto registry is valid");
     let algorithm = engine
         .algorithm::<Aead>("aes-128-gcm")
         .expect("AES-128-GCM is built in");

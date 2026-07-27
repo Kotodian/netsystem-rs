@@ -1,4 +1,7 @@
-use hammer_infra::crypto::signature::{SignError, VerifyError};
+use hammer_infra::crypto::{
+    InstructionSet,
+    signature::{SignError, VerifyError},
+};
 use hammer_service::crypto::{
     ContextError, Engine, Input, KeyOperations, KeyPolicy, Sign, SignOperation, Verify,
     VerifyOperation,
@@ -6,7 +9,8 @@ use hammer_service::crypto::{
 
 #[test]
 fn builtin_signature_catalog_resolves_in_both_operation_families() {
-    let engine = Engine::with_builtins().expect("built-in crypto registry is valid");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in crypto registry is valid");
 
     for name in [
         "ed25519",
@@ -29,7 +33,8 @@ fn builtin_signature_catalog_resolves_in_both_operation_families() {
 
 #[test]
 fn builtin_ed25519_signs_and_verifies_through_registered_contexts() {
-    let engine = Engine::with_builtins().expect("built-in crypto registry is valid");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in crypto registry is valid");
     let sign_algorithm = engine
         .algorithm::<Sign>("ed25519")
         .expect("Ed25519 signing is built in");
@@ -61,7 +66,9 @@ fn builtin_ed25519_signs_and_verifies_through_registered_contexts() {
         assert_eq!(sign_operations[0].status(), None);
         assert_eq!(sign_operations[1].status(), None);
 
-        sign_context.execute(&mut sign_operations);
+        sign_context
+            .execute(&mut sign_operations)
+            .expect("Context remains available");
 
         assert_eq!(sign_operations[0].status(), Some(Ok(32)));
         assert_eq!(sign_operations[1].status(), Some(Ok(64)));
@@ -76,7 +83,9 @@ fn builtin_ed25519_signs_and_verifies_through_registered_contexts() {
             Input::Scatter(&message),
             &signature,
         )];
-        verify_context.execute(&mut verify_operations);
+        verify_context
+            .execute(&mut verify_operations)
+            .expect("Context remains available");
         assert_eq!(verify_operations[0].status(), Some(Ok(())));
     }
 
@@ -86,7 +95,9 @@ fn builtin_ed25519_signs_and_verifies_through_registered_contexts() {
         Input::Scatter(&message),
         &signature,
     )];
-    verify_context.execute(&mut invalid_operations);
+    verify_context
+        .execute(&mut invalid_operations)
+        .expect("Context remains available");
     assert_eq!(
         invalid_operations[0].status(),
         Some(Err(VerifyError::SignatureMismatch))
@@ -95,7 +106,8 @@ fn builtin_ed25519_signs_and_verifies_through_registered_contexts() {
 
 #[test]
 fn signing_context_preserves_policy_stale_key_and_key_encoding_failures() {
-    let engine = Engine::with_builtins().expect("built-in crypto registry is valid");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in crypto registry is valid");
     let ed25519 = engine
         .algorithm::<Sign>("ed25519")
         .expect("Ed25519 signing is built in");
@@ -142,7 +154,9 @@ fn signing_context_preserves_policy_stale_key_and_key_encoding_failures() {
         .expect("key material remains opaque until the selected operation executes");
     let mut public_key = [0_u8; 65];
     let mut operations = [SignOperation::public_key(&mut public_key)];
-    context.execute(&mut operations);
+    context
+        .execute(&mut operations)
+        .expect("Context remains available");
     assert_eq!(
         operations[0].status(),
         Some(Err(SignError::InvalidPrivateKey))

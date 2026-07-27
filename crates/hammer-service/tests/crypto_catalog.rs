@@ -1,3 +1,4 @@
+use hammer_infra::crypto::InstructionSet;
 use hammer_service::crypto::{
     Aead, AeadOperation, AeadStatus, Engine, Hash, Input, Kdf, KdfOperation, KdfStatus,
     KeyOperations, KeyPolicy, Mac, MacOperation,
@@ -5,7 +6,8 @@ use hammer_service::crypto::{
 
 #[test]
 fn builtins_publish_the_common_symmetric_digest_mac_and_kdf_catalog() {
-    let engine = Engine::with_builtins().expect("built-in catalog publishes");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in catalog publishes");
 
     for name in ["aes-128-gcm", "aes-256-gcm", "chacha20-poly1305"] {
         assert!(engine.algorithm::<Aead>(name).is_some(), "missing {name}");
@@ -29,7 +31,8 @@ fn builtins_publish_the_common_symmetric_digest_mac_and_kdf_catalog() {
 
 #[test]
 fn all_builtin_aead_algorithms_execute_through_resolved_function_tables() {
-    let engine = Engine::with_builtins().expect("built-in catalog publishes");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in catalog publishes");
 
     for (name, key) in [
         ("aes-128-gcm", &[0_u8; 16][..]),
@@ -61,14 +64,17 @@ fn all_builtin_aead_algorithms_execute_through_resolved_function_tables() {
             &mut ciphertext,
             &mut tag,
         )];
-        context.execute(&mut operations);
+        context
+            .execute(&mut operations)
+            .expect("Context remains available");
         assert_eq!(operations[0].status(), AeadStatus::Executed(Ok(3)));
     }
 }
 
 #[test]
 fn hmac_sha256_executes_as_a_keyed_batch() {
-    let engine = Engine::with_builtins().expect("built-in catalog publishes");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in catalog publishes");
     let algorithm = engine
         .algorithm::<Mac>("hmac-sha-256")
         .expect("HMAC-SHA-256 is registered");
@@ -87,7 +93,9 @@ fn hmac_sha256_executes_as_a_keyed_batch() {
         &mut output,
     )];
 
-    context.execute(&mut operations);
+    context
+        .execute(&mut operations)
+        .expect("Context remains available");
 
     assert_eq!(operations[0].status(), Some(Ok(32)));
     assert_eq!(
@@ -102,7 +110,8 @@ fn hmac_sha256_executes_as_a_keyed_batch() {
 
 #[test]
 fn hkdf_installs_policy_limited_derived_keys_without_exposing_secret_bytes() {
-    let engine = Engine::with_builtins().expect("built-in catalog publishes");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in catalog publishes");
     let kdf = engine
         .algorithm::<Kdf>("hkdf-sha-256")
         .expect("HKDF-SHA-256 is registered");
@@ -131,7 +140,9 @@ fn hkdf_installs_policy_limited_derived_keys_without_exposing_secret_bytes() {
         target,
     )];
 
-    context.execute(&mut operations);
+    context
+        .execute(&mut operations)
+        .expect("Context remains available");
 
     let KdfStatus::Complete { key } = operations[0].status() else {
         panic!("derivation must return an opaque key")
@@ -154,7 +165,8 @@ fn hkdf_installs_policy_limited_derived_keys_without_exposing_secret_bytes() {
 
 #[test]
 fn hkdf_rejects_a_derived_algorithm_absent_from_the_parent_policy() {
-    let engine = Engine::with_builtins().expect("built-in catalog publishes");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in catalog publishes");
     let kdf = engine
         .algorithm::<Kdf>("hkdf-sha-256")
         .expect("HKDF-SHA-256 is registered");
@@ -184,7 +196,9 @@ fn hkdf_rejects_a_derived_algorithm_absent_from_the_parent_policy() {
         denied,
     )];
 
-    context.execute(&mut operations);
+    context
+        .execute(&mut operations)
+        .expect("Context remains available");
 
     assert_eq!(operations[0].status(), KdfStatus::DerivationDenied);
 }

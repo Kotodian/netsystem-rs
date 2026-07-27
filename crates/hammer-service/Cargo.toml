@@ -35,3 +35,8 @@ humantime-serde = { workspace = true }
 toml = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "crypto_hash"
+harness = false

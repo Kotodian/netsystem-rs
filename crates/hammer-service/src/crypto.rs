@@ -4,12 +4,13 @@
 //! operation lifecycle. Portable algorithm semantics remain in
 //! `hammer-infra`; `hammer-runtime` does not participate in this boundary.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
+use hammer_infra::crypto::InstructionSet;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use zeroize::Zeroizing;
 
@@ -75,7 +76,7 @@ pub struct HashPrepared;
 
 impl HashPrepared {
     /// Executes a batch through one statically selected digest implementation.
-    pub fn execute<A>(&mut self, operations: &mut [HashOperation<'_>])
+    pub fn execute<A>(&mut self, operations: &mut [HashOperation<'_>]) -> Result<(), ContextError>
     where
         A: hammer_infra::crypto::hash::Algorithm,
     {
@@ -86,6 +87,81 @@ impl HashPrepared {
                     .with_fragments(|input| A::default().digest(input, operation.output)),
             );
         }
+        Ok(())
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    fn execute_sha_ni<A>(
+        &mut self,
+        operations: &mut [HashOperation<'_>],
+    ) -> Result<(), ContextError>
+    where
+        A: hammer_infra::crypto::hash::Algorithm,
+    {
+        let available = InstructionSet::detect();
+        if !available.contains(InstructionSet::SHA2) {
+            return Err(ContextError::InstructionsUnavailable {
+                required: InstructionSet::SHA2,
+                available,
+            });
+        }
+        // SAFETY: SHA-NI support was detected on this CPU immediately above.
+        unsafe { self.execute_sha_ni_unchecked::<A>(operations) }
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sha")]
+    unsafe fn execute_sha_ni_unchecked<A>(
+        &mut self,
+        operations: &mut [HashOperation<'_>],
+    ) -> Result<(), ContextError>
+    where
+        A: hammer_infra::crypto::hash::Algorithm,
+    {
+        for operation in operations {
+            operation.result = Some(operation.input.with_fragments(|input| {
+                // SAFETY: the safe batch entry point detects SHA-NI before calling this method.
+                unsafe { A::default().digest_sha_ni(input, operation.output) }
+            }));
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn execute_sha2_armv8<A>(
+        &mut self,
+        operations: &mut [HashOperation<'_>],
+    ) -> Result<(), ContextError>
+    where
+        A: hammer_infra::crypto::hash::Algorithm,
+    {
+        let available = InstructionSet::detect();
+        if !available.contains(InstructionSet::SHA2) {
+            return Err(ContextError::InstructionsUnavailable {
+                required: InstructionSet::SHA2,
+                available,
+            });
+        }
+        // SAFETY: Armv8 SHA-2 support was detected on this CPU immediately above.
+        unsafe { self.execute_sha2_armv8_unchecked::<A>(operations) }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "sha2")]
+    unsafe fn execute_sha2_armv8_unchecked<A>(
+        &mut self,
+        operations: &mut [HashOperation<'_>],
+    ) -> Result<(), ContextError>
+    where
+        A: hammer_infra::crypto::hash::Algorithm,
+    {
+        for operation in operations {
+            operation.result = Some(operation.input.with_fragments(|input| {
+                // SAFETY: the safe batch entry point detects Armv8 SHA-2 before calling this method.
+                unsafe { A::default().digest_sha2_armv8(input, operation.output) }
+            }));
+        }
+        Ok(())
     }
 }
 
@@ -126,7 +202,7 @@ impl AeadPrepared {
     }
 
     /// Executes a batch through one statically selected AEAD implementation.
-    pub fn execute<A>(&mut self, operations: &mut [AeadOperation<'_>])
+    pub fn execute<A>(&mut self, operations: &mut [AeadOperation<'_>]) -> Result<(), ContextError>
     where
         A: hammer_infra::crypto::aead::Algorithm,
     {
@@ -185,6 +261,7 @@ impl AeadPrepared {
             };
             operation.status = AeadStatus::Executed(result);
         }
+        Ok(())
     }
 }
 
@@ -201,7 +278,7 @@ pub struct MacPrepared {
 
 impl MacPrepared {
     /// Executes a batch through one statically selected MAC implementation.
-    pub fn execute<A>(&mut self, operations: &mut [MacOperation<'_>])
+    pub fn execute<A>(&mut self, operations: &mut [MacOperation<'_>]) -> Result<(), ContextError>
     where
         A: hammer_infra::crypto::mac::Algorithm,
     {
@@ -213,6 +290,7 @@ impl MacPrepared {
                     .with_fragments(|input| mac.authenticate(input, operation.output)),
             );
         }
+        Ok(())
     }
 }
 
@@ -231,7 +309,7 @@ pub struct KdfPrepared {
 
 impl KdfPrepared {
     /// Executes a batch through one statically selected KDF implementation.
-    pub fn execute<A>(&mut self, operations: &mut [KdfOperation<'_>])
+    pub fn execute<A>(&mut self, operations: &mut [KdfOperation<'_>]) -> Result<(), ContextError>
     where
         A: hammer_infra::crypto::kdf::Algorithm,
     {
@@ -271,6 +349,7 @@ impl KdfPrepared {
                 key: KeyHandle { index },
             };
         }
+        Ok(())
     }
 }
 
@@ -288,7 +367,7 @@ pub struct KxPrepared {
 
 impl KxPrepared {
     /// Executes a batch through one statically selected key-establishment implementation.
-    pub fn execute<A>(&mut self, operations: &mut [KxOperation<'_>])
+    pub fn execute<A>(&mut self, operations: &mut [KxOperation<'_>]) -> Result<(), ContextError>
     where
         A: hammer_infra::crypto::key_establishment::Algorithm,
     {
@@ -315,6 +394,7 @@ impl KxPrepared {
                 } => self.decapsulate(&algorithm, *private_key, ciphertext, *target),
             };
         }
+        Ok(())
     }
 
     fn generate_keypair<A>(
@@ -561,7 +641,7 @@ impl fmt::Debug for SignPrepared {
 
 impl SignPrepared {
     /// Executes a batch through one statically selected signature implementation.
-    pub fn execute<A>(&mut self, operations: &mut [SignOperation<'_>])
+    pub fn execute<A>(&mut self, operations: &mut [SignOperation<'_>]) -> Result<(), ContextError>
     where
         A: hammer_infra::crypto::signature::Algorithm,
     {
@@ -575,6 +655,7 @@ impl SignPrepared {
                 }),
             });
         }
+        Ok(())
     }
 }
 
@@ -589,7 +670,7 @@ pub struct VerifyPrepared;
 
 impl VerifyPrepared {
     /// Executes a batch through one statically selected signature implementation.
-    pub fn execute<A>(&mut self, operations: &mut [VerifyOperation<'_>])
+    pub fn execute<A>(&mut self, operations: &mut [VerifyOperation<'_>]) -> Result<(), ContextError>
     where
         A: hammer_infra::crypto::signature::Algorithm,
     {
@@ -598,6 +679,7 @@ impl VerifyPrepared {
                 A::default().verify(operation.public_key, message, operation.signature)
             }));
         }
+        Ok(())
     }
 }
 
@@ -629,6 +711,7 @@ pub struct ImplementationRegistration<F: Family> {
     algorithms: Vec<AlgorithmImplementationRegistration<F>>,
     priority: i32,
     available: bool,
+    instructions: InstructionSet,
 }
 
 struct AlgorithmImplementationRegistration<F: Family> {
@@ -646,7 +729,14 @@ impl<F: Family> ImplementationRegistration<F> {
             algorithms: Vec::new(),
             priority,
             available,
+            instructions: InstructionSet::empty(),
         }
+    }
+
+    /// Declares the CPU instructions required before this implementation may be selected.
+    pub fn with_instruction_set(mut self, instructions: InstructionSet) -> Self {
+        self.instructions = instructions;
+        self
     }
 
     /// Adds the direct Context preparation and batch dispatch table for one algorithm.
@@ -730,7 +820,8 @@ struct ImplementationRecord<F: Family> {
     name: String,
     algorithms: Vec<AlgorithmImplementation<F>>,
     priority: i32,
-    available: bool,
+    available: Rc<Cell<bool>>,
+    instructions: InstructionSet,
 }
 
 struct AlgorithmImplementation<F: Family> {
@@ -763,12 +854,16 @@ impl<F: Family> FamilyRegistry<F> {
         &self,
         algorithm: AlgorithmId<F>,
         policy: &SelectionPolicy,
-    ) -> Option<(&str, F::Prepare, F::Dispatch)> {
+        instructions: InstructionSet,
+    ) -> Option<(&str, F::Prepare, F::Dispatch, Rc<Cell<bool>>)> {
         let required = *self.algorithms.get(algorithm.slot as usize)?;
         self.implementations
             .iter()
             .filter_map(|implementation| {
-                if !implementation.available || !policy.permits(&implementation.name) {
+                if !implementation.available.get()
+                    || !instructions.contains(implementation.instructions)
+                    || !policy.permits(&implementation.name)
+                {
                     return None;
                 }
                 let functions = implementation.algorithms.iter().find(|functions| {
@@ -789,6 +884,7 @@ impl<F: Family> FamilyRegistry<F> {
                     implementation.name.as_str(),
                     functions.prepare,
                     functions.dispatch,
+                    Rc::clone(&implementation.available),
                 )
             })
     }
@@ -801,7 +897,19 @@ impl<F: Family> FamilyRegistry<F> {
             .ok_or_else(|| RegistryError::ImplementationUnknown {
                 name: name.to_owned(),
             })?;
-        self.implementations[index].available = available;
+        self.implementations[index].available.set(available);
+        Ok(())
+    }
+
+    fn set_priority(&mut self, name: &str, priority: i32) -> Result<(), RegistryError> {
+        let index = self
+            .implementation_names
+            .get(name)
+            .copied()
+            .ok_or_else(|| RegistryError::ImplementationUnknown {
+                name: name.to_owned(),
+            })?;
+        self.implementations[index].priority = priority;
         Ok(())
     }
 
@@ -835,7 +943,8 @@ impl<F: Family> FamilyRegistry<F> {
                 name: implementation.name,
                 algorithms,
                 priority: implementation.priority,
-                available: implementation.available,
+                available: Rc::new(Cell::new(implementation.available)),
+                instructions: implementation.instructions,
             });
         }
     }
@@ -1477,6 +1586,7 @@ pub struct Engine {
     key_exchanges: FamilyRegistry<Kx>,
     signers: FamilyRegistry<Sign>,
     verifiers: FamilyRegistry<Verify>,
+    instructions: InstructionSet,
     selection_policy: SelectionPolicy,
     keys: Rc<RefCell<Pool<KeyEntry>>>,
 }
@@ -1487,6 +1597,7 @@ impl fmt::Debug for Engine {
             .debug_struct("Engine")
             .field("aead_algorithms", &self.aeads.algorithms.len())
             .field("hash_algorithms", &self.hashes.algorithms.len())
+            .field("instructions", &self.instructions)
             .field("key_count", &self.keys.borrow().len())
             .finish_non_exhaustive()
     }
@@ -1494,7 +1605,7 @@ impl fmt::Debug for Engine {
 
 impl Engine {
     /// Creates an Engine with empty family registries.
-    pub fn new() -> Self {
+    pub fn new(instructions: InstructionSet) -> Self {
         Self {
             aeads: FamilyRegistry::new(),
             ciphers: FamilyRegistry::new(),
@@ -1504,6 +1615,7 @@ impl Engine {
             key_exchanges: FamilyRegistry::new(),
             signers: FamilyRegistry::new(),
             verifiers: FamilyRegistry::new(),
+            instructions,
             selection_policy: SelectionPolicy::default(),
             keys: Rc::new(RefCell::new(Pool::with_capacity(1024))),
         }
@@ -1515,7 +1627,7 @@ impl Engine {
     ///
     /// Returns [`RegistryError::MalformedAlgorithmName`] if a built-in name no
     /// longer satisfies the canonical algorithm-name contract.
-    pub fn with_builtins() -> Result<Self, RegistryError> {
+    pub fn with_builtins(instructions: InstructionSet) -> Result<Self, RegistryError> {
         let hash_capabilities = Capabilities::CONTIGUOUS_INPUT
             | Capabilities::SCATTER_INPUT
             | Capabilities::OUT_OF_PLACE;
@@ -1523,48 +1635,69 @@ impl Engine {
             hash_capabilities | Capabilities::IN_PLACE | Capabilities::ASSOCIATED_DATA;
         let kdf_capabilities = Capabilities::CONTIGUOUS_INPUT | Capabilities::SCATTER_INPUT;
         let kx_capabilities = Capabilities::CONTIGUOUS_INPUT | Capabilities::OUT_OF_PLACE;
-        let mut engine = Self::new();
-        engine.publish(
-            Registration::new()
-                .with_algorithm("sha-256", hash_capabilities)
-                .with_algorithm("sha-384", hash_capabilities)
-                .with_algorithm("sha-512", hash_capabilities)
-                .with_algorithm("blake2s-256", hash_capabilities)
-                .with_algorithm("blake2b-512", hash_capabilities)
-                .with_implementation(
-                    ImplementationRegistration::<Hash>::new("hammer:hash-portable", 0, true)
-                        .with_algorithm(
-                            "sha-256",
-                            hash_capabilities,
-                            (),
-                            HashPrepared::execute::<hammer_infra::crypto::hash::Sha256>,
-                        )
-                        .with_algorithm(
-                            "sha-384",
-                            hash_capabilities,
-                            (),
-                            HashPrepared::execute::<hammer_infra::crypto::hash::Sha384>,
-                        )
-                        .with_algorithm(
-                            "sha-512",
-                            hash_capabilities,
-                            (),
-                            HashPrepared::execute::<hammer_infra::crypto::hash::Sha512>,
-                        )
-                        .with_algorithm(
-                            "blake2s-256",
-                            hash_capabilities,
-                            (),
-                            HashPrepared::execute::<hammer_infra::crypto::hash::Blake2s256>,
-                        )
-                        .with_algorithm(
-                            "blake2b-512",
-                            hash_capabilities,
-                            (),
-                            HashPrepared::execute::<hammer_infra::crypto::hash::Blake2b512>,
-                        ),
+        let mut engine = Self::new(instructions);
+        let hash_registration = Registration::new()
+            .with_algorithm("sha-256", hash_capabilities)
+            .with_algorithm("sha-384", hash_capabilities)
+            .with_algorithm("sha-512", hash_capabilities)
+            .with_algorithm("blake2s-256", hash_capabilities)
+            .with_algorithm("blake2b-512", hash_capabilities)
+            .with_implementation(
+                ImplementationRegistration::<Hash>::new("hammer:hash-portable", 0, true)
+                    .with_algorithm(
+                        "sha-256",
+                        hash_capabilities,
+                        (),
+                        HashPrepared::execute::<hammer_infra::crypto::hash::Sha256>,
+                    )
+                    .with_algorithm(
+                        "sha-384",
+                        hash_capabilities,
+                        (),
+                        HashPrepared::execute::<hammer_infra::crypto::hash::Sha384>,
+                    )
+                    .with_algorithm(
+                        "sha-512",
+                        hash_capabilities,
+                        (),
+                        HashPrepared::execute::<hammer_infra::crypto::hash::Sha512>,
+                    )
+                    .with_algorithm(
+                        "blake2s-256",
+                        hash_capabilities,
+                        (),
+                        HashPrepared::execute::<hammer_infra::crypto::hash::Blake2s256>,
+                    )
+                    .with_algorithm(
+                        "blake2b-512",
+                        hash_capabilities,
+                        (),
+                        HashPrepared::execute::<hammer_infra::crypto::hash::Blake2b512>,
+                    ),
+            );
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        let hash_registration = hash_registration.with_implementation(
+            ImplementationRegistration::<Hash>::new("hammer:sha-256-sha-ni", 100, true)
+                .with_instruction_set(InstructionSet::SHA2)
+                .with_algorithm(
+                    "sha-256",
+                    hash_capabilities,
+                    (),
+                    HashPrepared::execute_sha_ni::<hammer_infra::crypto::hash::Sha256>,
                 ),
-        )?;
+        );
+        #[cfg(target_arch = "aarch64")]
+        let hash_registration = hash_registration.with_implementation(
+            ImplementationRegistration::<Hash>::new("hammer:sha-256-armv8", 100, true)
+                .with_instruction_set(InstructionSet::SHA2)
+                .with_algorithm(
+                    "sha-256",
+                    hash_capabilities,
+                    (),
+                    HashPrepared::execute_sha2_armv8::<hammer_infra::crypto::hash::Sha256>,
+                ),
+        );
+        engine.publish(hash_registration)?;
         engine.publish(
             Registration::new()
                 .with_algorithm("aes-128-gcm", aead_capabilities)
@@ -1846,6 +1979,20 @@ impl Engine {
         F::registry_mut(self).set_availability(name, available)
     }
 
+    /// Changes selection priority for new Contexts without migrating existing Contexts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::ImplementationUnknown`] when `name` is absent
+    /// from this operation family.
+    pub fn set_implementation_priority<F: Family>(
+        &mut self,
+        name: &str,
+        priority: i32,
+    ) -> Result<(), RegistryError> {
+        F::registry_mut(self).set_priority(name, priority)
+    }
+
     /// Creates a thread-bound Context and selects its implementation once.
     ///
     /// # Errors
@@ -1856,8 +2003,8 @@ impl Engine {
         &self,
         algorithm: AlgorithmId<F>,
     ) -> Result<Context<F>, ContextError> {
-        let (implementation, prepare, dispatch) = F::registry(self)
-            .select(algorithm, &self.selection_policy)
+        let (implementation, prepare, dispatch, available) = F::registry(self)
+            .select(algorithm, &self.selection_policy, self.instructions)
             .ok_or(ContextError::AlgorithmUnavailable {
                 algorithm: algorithm.slot,
             })?;
@@ -1871,6 +2018,7 @@ impl Engine {
             dispatch,
             prepared,
             key_ref: None,
+            available,
             thread_bound: PhantomData,
         })
     }
@@ -1951,8 +2099,8 @@ impl Engine {
         key: KeyHandle,
     ) -> Result<Context<F>, ContextError> {
         let registry = F::registry(self);
-        let (implementation, prepare, dispatch) = registry
-            .select(algorithm, &self.selection_policy)
+        let (implementation, prepare, dispatch, available) = registry
+            .select(algorithm, &self.selection_policy, self.instructions)
             .ok_or(ContextError::AlgorithmUnavailable {
                 algorithm: algorithm.slot,
             })?;
@@ -1999,14 +2147,9 @@ impl Engine {
                 keys: Rc::clone(&self.keys),
                 key,
             }),
+            available,
             thread_bound: PhantomData,
         })
-    }
-}
-
-impl Default for Engine {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -2017,7 +2160,7 @@ impl Default for Engine {
 /// ```compile_fail
 /// use hammer_service::crypto::{Engine, Hash};
 ///
-/// let engine = Engine::with_builtins().unwrap();
+/// let engine = Engine::with_builtins(hammer_infra::crypto::InstructionSet::detect()).unwrap();
 /// let algorithm = engine.algorithm::<Hash>("sha-256").unwrap();
 /// let context = engine.context(algorithm).unwrap();
 /// std::thread::spawn(move || drop(context));
@@ -2029,6 +2172,7 @@ pub struct Context<F: Family> {
     dispatch: F::Dispatch,
     prepared: F::Prepared,
     key_ref: Option<ContextKeyRef>,
+    available: Rc<Cell<bool>>,
     // Rc is deliberately part of the marker: Context must be neither Send nor Sync.
     thread_bound: PhantomData<Rc<()>>,
 }
@@ -2045,11 +2189,19 @@ impl<F: Family> Context<F> {
     }
 
     /// Executes all operations synchronously through one batch dispatch.
-    pub fn execute<'data>(&mut self, operations: &mut [F::Operation<'data>])
+    pub fn execute<'data>(
+        &mut self,
+        operations: &mut [F::Operation<'data>],
+    ) -> Result<(), ContextError>
     where
-        F::Dispatch: Fn(&mut F::Prepared, &mut [F::Operation<'data>]),
+        F::Dispatch: Fn(&mut F::Prepared, &mut [F::Operation<'data>]) -> Result<(), ContextError>,
     {
-        (self.dispatch)(&mut self.prepared, operations);
+        if !self.available.get() {
+            return Err(ContextError::ImplementationUnavailable {
+                implementation: self.implementation.clone(),
+            });
+        }
+        (self.dispatch)(&mut self.prepared, operations)
     }
 }
 
@@ -2146,13 +2298,29 @@ pub enum RegistryError {
 }
 
 /// A failure while creating an implementation-bound Context.
-#[derive(Clone, Copy, Debug, thiserror::Error, Eq, PartialEq)]
+#[derive(Clone, Debug, thiserror::Error, Eq, PartialEq)]
 pub enum ContextError {
     /// No currently available implementation supports the algorithm.
     #[error("algorithm slot {algorithm} has no available implementation")]
     AlgorithmUnavailable {
         /// Process-local algorithm slot.
         algorithm: u32,
+    },
+    /// A Context's permanently bound implementation is no longer available.
+    #[error("implementation `{implementation}` is unavailable for its bound Context")]
+    ImplementationUnavailable {
+        /// Crypto Implementation Name selected when the Context was created.
+        implementation: String,
+    },
+    /// Injected capability facts selected an instruction implementation that this CPU cannot run.
+    #[error(
+        "required cryptographic instructions {required:?} are absent from detected set {available:?}"
+    )]
+    InstructionsUnavailable {
+        /// Instructions required by the selected implementation.
+        required: InstructionSet,
+        /// Instructions detected immediately before dispatch.
+        available: InstructionSet,
     },
     /// The selected operation family requires an opaque key.
     #[error("algorithm slot {algorithm} requires a Key Handle")]

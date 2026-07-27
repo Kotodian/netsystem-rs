@@ -2660,7 +2660,10 @@ fn expand_crypto_family_item(family: CryptoFamily, item: ItemStruct) -> TokenStr
                 type Operation<'a> = AeadOperation<'a>;
                 type Prepared = AeadPrepared;
                 type Prepare = usize;
-                type Dispatch = for<'a> fn(&mut AeadPrepared, &mut [AeadOperation<'a>]);
+                type Dispatch = for<'a> fn(
+                    &mut AeadPrepared,
+                    &mut [AeadOperation<'a>],
+                ) -> Result<(), ContextError>;
 
                 const KEY_FAMILY: u8 = 1;
 
@@ -2695,7 +2698,10 @@ fn expand_crypto_family_item(family: CryptoFamily, item: ItemStruct) -> TokenStr
                 type Operation<'a> = HashOperation<'a>;
                 type Prepared = HashPrepared;
                 type Prepare = ();
-                type Dispatch = for<'a> fn(&mut HashPrepared, &mut [HashOperation<'a>]);
+                type Dispatch = for<'a> fn(
+                    &mut HashPrepared,
+                    &mut [HashOperation<'a>],
+                ) -> Result<(), ContextError>;
 
                 const KEY_FAMILY: u8 = 2;
 
@@ -2717,7 +2723,7 @@ fn expand_crypto_family_item(family: CryptoFamily, item: ItemStruct) -> TokenStr
                 type Operation<'a> = ();
                 type Prepared = ();
                 type Prepare = ();
-                type Dispatch = for<'a> fn(&mut (), &mut [()]);
+                type Dispatch = for<'a> fn(&mut (), &mut [()]) -> Result<(), ContextError>;
 
                 const KEY_FAMILY: u8 = 3;
 
@@ -2739,7 +2745,10 @@ fn expand_crypto_family_item(family: CryptoFamily, item: ItemStruct) -> TokenStr
                 type Operation<'a> = MacOperation<'a>;
                 type Prepared = MacPrepared;
                 type Prepare = ();
-                type Dispatch = for<'a> fn(&mut MacPrepared, &mut [MacOperation<'a>]);
+                type Dispatch = for<'a> fn(
+                    &mut MacPrepared,
+                    &mut [MacOperation<'a>],
+                ) -> Result<(), ContextError>;
 
                 const KEY_FAMILY: u8 = 4;
 
@@ -2774,7 +2783,10 @@ fn expand_crypto_family_item(family: CryptoFamily, item: ItemStruct) -> TokenStr
                 type Operation<'a> = KdfOperation<'a>;
                 type Prepared = KdfPrepared;
                 type Prepare = ();
-                type Dispatch = for<'a> fn(&mut KdfPrepared, &mut [KdfOperation<'a>]);
+                type Dispatch = for<'a> fn(
+                    &mut KdfPrepared,
+                    &mut [KdfOperation<'a>],
+                ) -> Result<(), ContextError>;
 
                 const KEY_FAMILY: u8 = 5;
 
@@ -2811,7 +2823,10 @@ fn expand_crypto_family_item(family: CryptoFamily, item: ItemStruct) -> TokenStr
                 type Operation<'a> = KxOperation<'a>;
                 type Prepared = KxPrepared;
                 type Prepare = ();
-                type Dispatch = for<'a> fn(&mut KxPrepared, &mut [KxOperation<'a>]);
+                type Dispatch = for<'a> fn(
+                    &mut KxPrepared,
+                    &mut [KxOperation<'a>],
+                ) -> Result<(), ContextError>;
 
                 const KEY_FAMILY: u8 = 6;
 
@@ -2838,7 +2853,10 @@ fn expand_crypto_family_item(family: CryptoFamily, item: ItemStruct) -> TokenStr
                 type Operation<'a> = SignOperation<'a>;
                 type Prepared = SignPrepared;
                 type Prepare = ();
-                type Dispatch = for<'a> fn(&mut SignPrepared, &mut [SignOperation<'a>]);
+                type Dispatch = for<'a> fn(
+                    &mut SignPrepared,
+                    &mut [SignOperation<'a>],
+                ) -> Result<(), ContextError>;
 
                 const KEY_FAMILY: u8 = 7;
 
@@ -2873,7 +2891,10 @@ fn expand_crypto_family_item(family: CryptoFamily, item: ItemStruct) -> TokenStr
                 type Operation<'a> = VerifyOperation<'a>;
                 type Prepared = VerifyPrepared;
                 type Prepare = ();
-                type Dispatch = for<'a> fn(&mut VerifyPrepared, &mut [VerifyOperation<'a>]);
+                type Dispatch = for<'a> fn(
+                    &mut VerifyPrepared,
+                    &mut [VerifyOperation<'a>],
+                ) -> Result<(), ContextError>;
 
                 const KEY_FAMILY: u8 = 8;
 

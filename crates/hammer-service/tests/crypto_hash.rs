@@ -1,4 +1,4 @@
-use hammer_infra::crypto::hash::Error;
+use hammer_infra::crypto::{InstructionSet, hash::Error};
 use hammer_service::crypto::{Engine, Hash, HashOperation, Input};
 
 const SHA256_ABC: [u8; 32] = [
@@ -8,7 +8,8 @@ const SHA256_ABC: [u8; 32] = [
 
 #[test]
 fn hash_context_executes_a_singleton_batch_synchronously() {
-    let engine = Engine::with_builtins().expect("built-in crypto registry is valid");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in crypto registry is valid");
     let algorithm = engine
         .algorithm::<Hash>("sha-256")
         .expect("SHA-256 is built in");
@@ -17,7 +18,9 @@ fn hash_context_executes_a_singleton_batch_synchronously() {
         .expect("portable SHA-256 is available");
     let mut output = [0; 32];
     let mut operations = [HashOperation::new(Input::Contiguous(b"abc"), &mut output)];
-    context.execute(&mut operations);
+    context
+        .execute(&mut operations)
+        .expect("Context remains available");
 
     assert_eq!(operations[0].status(), Some(Ok(32)));
     assert_eq!(output, SHA256_ABC);
@@ -25,7 +28,8 @@ fn hash_context_executes_a_singleton_batch_synchronously() {
 
 #[test]
 fn hash_batch_records_success_and_failure_per_operation() {
-    let engine = Engine::with_builtins().expect("built-in crypto registry is valid");
+    let engine =
+        Engine::with_builtins(InstructionSet::detect()).expect("built-in crypto registry is valid");
     let algorithm = engine
         .algorithm::<Hash>("sha-256")
         .expect("SHA-256 is built in");
@@ -39,7 +43,9 @@ fn hash_batch_records_success_and_failure_per_operation() {
         HashOperation::new(Input::Scatter(&chunks), &mut valid_output),
         HashOperation::new(Input::Contiguous(b"abc"), &mut short_output),
     ];
-    context.execute(&mut operations);
+    context
+        .execute(&mut operations)
+        .expect("Context remains available");
 
     assert_eq!(operations[0].status(), Some(Ok(32)));
     assert_eq!(
