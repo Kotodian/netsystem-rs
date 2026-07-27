@@ -192,6 +192,18 @@ impl FileMain {
         })
     }
 
+    /// Descriptor that becomes readable when File readiness is pending, so an
+    /// idle main loop can sleep in the tokio reactor yet wake for I/O.
+    pub(crate) fn io_wake_fd(&self) -> RawFd {
+        self.poller.wake_fd()
+    }
+
+    /// Consumes the wake signal after an idle wake-up; the next [`Self::poll`]
+    /// collects the readiness that raised it.
+    pub(crate) fn clear_io_wake(&self) {
+        self.poller.clear_wake();
+    }
+
     /// Registers a File and returns its existing `hammer-infra` Pool Index.
     pub fn add(&mut self, file: File) -> RuntimeResult<Index> {
         let index = self.files.insert(file).ok_or(RuntimeError::FilePoolFull)?;

@@ -1,13 +1,27 @@
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::thread;
 use std::time::Instant;
 
+use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
+
 use crate::barrier;
 use crate::engine::Engine;
 use crate::spawn;
 use crate::spawn::{DATA_LOCAL_DRIVER_WAKER, DATA_WORKER_IDLE_SLICE, with_data_plane_runtime};
+
+/// Borrowed view of the File poller wake descriptor; the poller owns the fd
+/// for the engine's whole lifetime, which outlives the main loop.
+struct IoWakeFd(RawFd);
+
+impl AsRawFd for IoWakeFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
+}
 
 /// VPP-style fixed-schedule engine main loop.
 ///
@@ -38,6 +52,22 @@ pub fn engine_main_loop(
     DATA_LOCAL_DRIVER_WAKER.with(|slot| {
         *slot.borrow_mut() = Some(worker_waker.clone());
     });
+
+    let io_wake = {
+        let _reactor = runtime.enter();
+        let wake_fd = IoWakeFd(engine.file_main().io_wake_fd());
+        match AsyncFd::with_interest(wake_fd, Interest::READABLE) {
+            Ok(wake) => Some(wake),
+            Err(error) => {
+                tracing::warn!(
+                    worker = engine.thread_index,
+                    %error,
+                    "File wake fd registration failed; idle sleep is fixed-slice"
+                );
+                None
+            }
+        }
+    };
 
     let mut last_poll_drivers_at = Instant::now();
 
@@ -76,14 +106,29 @@ pub fn engine_main_loop(
             let _ = rt.run_ready_nodes();
         });
 
-        // Step 4: Tokio reactor tick
+        // Step 4: Tokio reactor tick. VPP sleeps inside `epoll_wait`
+        // (`vlib_file_poll`) so device readiness ends the idle wait
+        // immediately; select the File wake fd against the idle slice for the
+        // same behavior.
         if progress {
             runtime.block_on(async {
                 tokio::task::yield_now().await;
             });
         } else {
             runtime.block_on(async {
-                tokio::time::sleep(idle_slice).await;
+                match &io_wake {
+                    Some(wake) => tokio::select! {
+                        guard = wake.readable() => match guard {
+                            Ok(mut guard) => {
+                                engine.file_main().clear_io_wake();
+                                guard.clear_ready();
+                            }
+                            Err(_) => tokio::time::sleep(idle_slice).await,
+                        },
+                        _ = tokio::time::sleep(idle_slice) => {}
+                    },
+                    None => tokio::time::sleep(idle_slice).await,
+                }
             });
         }
 

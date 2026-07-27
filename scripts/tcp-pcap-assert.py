@@ -1,4 +1,9 @@
-"""Assert TCP lab packet behavior from `tcpdump -nn -S` text output.
+"""Assert TCP lab packet behavior from a pcap file or `tcpdump -nn -S` text.
+
+The input format is auto-detected from the pcap magic bytes. Binary pcap is
+authoritative: tcpdump's one-line text omits `seq` on zero-length pure ACKs,
+which makes keepalive probes (zero-length segments at SND.NXT - 1)
+unobservable in text form.
 
 Parses absolute sequence numbers, direction, flags, lengths, and SACK blocks
 for the probe<->Hammer flow, always prints a machine-readable handshake
@@ -19,9 +24,21 @@ the workflow; this script only proves on-the-wire packet shape.
 
 import argparse
 import re
+import struct
 from pathlib import Path
 
 SEQ_MOD = 1 << 32
+
+# Magic -> (struct byte order, timestamp ticks per second).
+PCAP_FORMATS = {
+    0xA1B2C3D4: (">", 1_000_000),
+    0xD4C3B2A1: ("<", 1_000_000),
+    0xA1B23C4D: (">", 1_000_000_000),
+    0x4D3CB2A1: ("<", 1_000_000_000),
+}
+LINKTYPE_NULL = 0  # 4-byte address-family header (macOS utun captures)
+LINKTYPE_ETHERNET = 1
+LINKTYPE_RAW = 101  # bare IP (Linux TUN captures)
 
 LINE_RE = re.compile(
     r"(?P<time>\d{2}:\d{2}:\d{2}\.\d+)\s+IP\s+"
@@ -57,9 +74,105 @@ def parse_time(text: str) -> float:
     return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
 
-def parse_packets(path: Path, server: str, port: int) -> list[Packet]:
+def tcp_packet_from_frame(frame, linktype, time_seconds, server, port) -> Packet | None:
+    if linktype == LINKTYPE_RAW:
+        ip = frame
+    elif linktype == LINKTYPE_NULL:
+        ip = frame[4:]
+    elif linktype == LINKTYPE_ETHERNET:
+        if len(frame) < 14 or frame[12:14] != b"\x08\x00":
+            return None
+        ip = frame[14:]
+    else:
+        raise SystemExit(f"unsupported pcap linktype {linktype}")
+
+    if len(ip) < 20 or ip[0] >> 4 != 4:
+        return None
+    header_len = (ip[0] & 0x0F) * 4
+    total_length = int.from_bytes(ip[2:4], "big")
+    if ip[9] != 6 or len(ip) < header_len + 20 or total_length < header_len + 20:
+        return None
+    src = ".".join(str(byte) for byte in ip[12:16])
+    dst = ".".join(str(byte) for byte in ip[16:20])
+
+    tcp = ip[header_len:]
+    sport, dport, seq, ack = struct.unpack_from(">HHII", tcp, 0)
+    src_is_server = src == server and sport == port
+    dst_is_server = dst == server and dport == port
+    if not src_is_server and not dst_is_server:
+        return None
+    data_offset = (tcp[12] >> 4) * 4
+    flag_bits = tcp[13]
+    flags = "".join(
+        letter
+        for bit, letter in ((0x02, "S"), (0x01, "F"), (0x04, "R"), (0x08, "P"), (0x20, "U"))
+        if flag_bits & bit
+    )
+    if flag_bits & 0x10:
+        flags += "."
+    length = max(total_length - header_len - data_offset, 0)
+
+    sack_blocks = []
+    options = tcp[20:data_offset]
+    cursor = 0
+    while cursor < len(options):
+        kind = options[cursor]
+        if kind == 0:  # end of option list
+            break
+        if kind == 1:  # no-op pad
+            cursor += 1
+            continue
+        if cursor + 2 > len(options):
+            break
+        option_len = options[cursor + 1]
+        if option_len < 2 or cursor + option_len > len(options):
+            break
+        if kind == 5:  # SACK: pairs of absolute 32-bit block edges
+            block = options[cursor + 2 : cursor + option_len]
+            for start in range(0, len(block) - 7, 8):
+                sack_blocks.append(struct.unpack_from(">II", block, start))
+        cursor += option_len
+
+    return Packet(
+        time_seconds=time_seconds,
+        from_server=src_is_server,
+        flags=flags,
+        seq=seq,
+        seq_end=(seq + length) % SEQ_MOD,
+        ack=ack if flag_bits & 0x10 else None,
+        length=length,
+        sack_blocks=sack_blocks,
+    )
+
+
+def parse_pcap_packets(data: bytes, server: str, port: int) -> list[Packet]:
+    if len(data) < 24:
+        raise SystemExit("pcap file is truncated before the end of its header")
+    byte_order, ticks_per_second = PCAP_FORMATS[int.from_bytes(data[:4], "big")]
+    linktype = struct.unpack_from(byte_order + "I", data, 20)[0]
     packets = []
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    offset = 24
+    while offset + 16 <= len(data):
+        seconds, fraction, incl_len, _ = struct.unpack_from(byte_order + "IIII", data, offset)
+        offset += 16
+        if offset + incl_len > len(data):
+            break  # live capture cut mid-record
+        frame = data[offset : offset + incl_len]
+        offset += incl_len
+        packet = tcp_packet_from_frame(
+            frame, linktype, seconds + fraction / ticks_per_second, server, port
+        )
+        if packet is not None:
+            packets.append(packet)
+    return packets
+
+
+def parse_packets(path: Path, server: str, port: int) -> list[Packet]:
+    data = path.read_bytes()
+    if int.from_bytes(data[:4], "big") in PCAP_FORMATS:
+        return parse_pcap_packets(data, server, port)
+    packets = []
+    for line in data.decode(encoding="utf-8", errors="replace").splitlines():
         match = LINE_RE.search(line)
         if match is None:
             continue
@@ -194,7 +307,9 @@ def assert_server_retransmit(packets, target_seq: int, within_seconds: float | N
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Assert TCP lab packets from tcpdump -nn -S text")
+    parser = argparse.ArgumentParser(
+        description="Assert TCP lab packets from a pcap file or tcpdump -nn -S text"
+    )
     parser.add_argument("--input", required=True)
     parser.add_argument("--server", required=True, help="Hammer listener IPv4 address")
     parser.add_argument("--port", required=True, type=int)

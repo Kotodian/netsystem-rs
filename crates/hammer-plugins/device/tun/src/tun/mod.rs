@@ -535,11 +535,13 @@ impl TunWorkerRuntime {
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
     ) -> Result<(), TunError> {
+        let mut refill_pending = false;
         for queue in &mut self.rx_queues {
             if queue.queue.mode == DriverScheduleMode::Interrupt && !queue.pending {
                 continue;
             }
             queue.pending = false;
+            let mut drained = false;
             while frame.remaining_capacity() > 0 {
                 let index = runtime.alloc_index()?;
                 let received = (|| {
@@ -632,6 +634,7 @@ impl TunWorkerRuntime {
                 };
                 if !received {
                     runtime.buffers().drop_index_owned_with_trace(index, |_| {});
+                    drained = true;
                     break;
                 }
                 if let Err(source) = frame.push_index(index) {
@@ -650,6 +653,17 @@ impl TunWorkerRuntime {
                     },
                 );
             }
+            if queue.queue.mode == DriverScheduleMode::Interrupt && !drained {
+                queue.pending = true;
+                refill_pending = true;
+            }
+        }
+        if refill_pending {
+            // The readiness edge is consumed: io_uring posts no new completion
+            // until the peer transmits again, so a frame-limited pass must
+            // re-raise its own interrupt to keep draining, like VPP virtio
+            // input empties the whole vring per dispatch.
+            runtime.set_node_interrupt_pending(self.input_node)?;
         }
         Ok(())
     }

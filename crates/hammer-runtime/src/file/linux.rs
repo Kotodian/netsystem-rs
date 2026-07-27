@@ -1,5 +1,5 @@
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use crate::error::{RuntimeError, RuntimeResult};
 use hammer_infra::pool::Index;
@@ -29,6 +29,7 @@ pub(super) struct Poller {
     current_tokens: [u64; FILE_POOL_CAPACITY],
     request_sequence: u32,
     multishot: bool,
+    wake: OwnedFd,
 }
 
 impl Poller {
@@ -53,6 +54,21 @@ impl Poller {
         }
 
         let multishot = probe_multishot(&mut ring)?;
+
+        // SAFETY: eventfd returns a fresh descriptor or -1 with errno set.
+        let wake = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if wake < 0 {
+            return Err(io_error(
+                "create worker io_uring wake eventfd",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: ownership of the fresh eventfd descriptor is transferred once.
+        let wake = unsafe { OwnedFd::from_raw_fd(wake) };
+        ring.submitter()
+            .register_eventfd(wake.as_raw_fd())
+            .map_err(|error| io_error("register worker io_uring wake eventfd", error))?;
+
         let pending_capacity = ring.completion().capacity().saturating_mul(2);
         Ok(Self {
             ring,
@@ -60,7 +76,22 @@ impl Poller {
             current_tokens: [0; FILE_POOL_CAPACITY],
             request_sequence: 0,
             multishot,
+            wake,
         })
+    }
+
+    /// Becomes readable whenever the ring posts a completion; lets the idle
+    /// loop sleep in the tokio reactor yet wake on File readiness, matching
+    /// VPP sleeping inside `epoll_wait` (`vlib_file_poll`).
+    pub(super) fn wake_fd(&self) -> RawFd {
+        self.wake.as_raw_fd()
+    }
+
+    pub(super) fn clear_wake(&self) {
+        let mut count = [0u8; 8];
+        // SAFETY: the eventfd is live and the buffer holds the 8-byte counter;
+        // EAGAIN when already clear is expected and ignored.
+        let _ = unsafe { libc::read(self.wake.as_raw_fd(), count.as_mut_ptr().cast(), 8) };
     }
 
     pub(super) fn add(&mut self, spec: PollSpec) -> RuntimeResult<()> {

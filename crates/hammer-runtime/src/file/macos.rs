@@ -1,5 +1,5 @@
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use crate::error::{RuntimeError, RuntimeResult};
 
@@ -20,6 +20,17 @@ impl Poller {
         // SAFETY: ownership of the fresh kqueue descriptor is transferred once.
         let kqueue = unsafe { OwnedFd::from_raw_fd(fd) };
         Ok(Self { kqueue })
+    }
+
+    /// The kqueue descriptor itself is readable while events are pending; the
+    /// idle loop sleeps in the tokio reactor yet wakes on File readiness,
+    /// matching VPP sleeping inside `epoll_wait` (`vlib_file_poll`).
+    pub(super) fn wake_fd(&self) -> RawFd {
+        self.kqueue.as_raw_fd()
+    }
+
+    pub(super) fn clear_wake(&self) {
+        // The next kevent poll consumes pending events; nothing to drain here.
     }
 
     pub(super) fn add(&self, spec: PollSpec) -> RuntimeResult<()> {

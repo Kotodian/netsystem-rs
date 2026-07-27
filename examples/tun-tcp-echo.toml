@@ -35,7 +35,6 @@ buffers_per_numa = 2048
 attach_socket_path = "/tmp/hammer-tcp-integration.attach.sock"
 preallocated_sessions = 64
 event_queue_length = 256
-ooo_capacity = 32
 
 [network.session.buffer]
 slot_bytes = 2048

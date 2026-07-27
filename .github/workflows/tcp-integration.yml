@@ -436,10 +436,8 @@ jobs:
           client_first=""
           server_first=""
           for _ in {1..50}; do
-            sudo -n tcpdump -nn -S -r "$TCP_TEST_DIAGNOSTICS/traffic.pcap" \
-              > "$TCP_TEST_DIAGNOSTICS/handshake-decode.txt" 2>/dev/null || true
             summary="$(python3 scripts/tcp-pcap-assert.py \
-              --input "$TCP_TEST_DIAGNOSTICS/handshake-decode.txt" \
+              --input "$TCP_TEST_DIAGNOSTICS/traffic.pcap" \
               --server "$TCP_TEST_ADDRESS" \
               --port "$TCP_TEST_PORT" || true)"
             client_first="$(sed -n 's/^client_first_data_seq=//p' <<<"$summary")"
@@ -572,7 +570,7 @@ jobs:
               ;;
           esac
           python3 scripts/tcp-pcap-assert.py \
-            --input "$TCP_TEST_DIAGNOSTICS/decode.txt" \
+            --input "$TCP_TEST_DIAGNOSTICS/traffic.pcap" \
             --server "$TCP_TEST_ADDRESS" \
             --port "$TCP_TEST_PORT" \
             --assert-handshake \

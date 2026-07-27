@@ -43,6 +43,7 @@ pub enum FifoError {
     OutOfOrderLengthOutOfRange { length: usize },
     OutOfOrderOffsetOverflow { offset: u32, length: u32 },
     OutOfOrderCapacityExceeded { end_offset: u32, available: usize },
+    OutOfOrderStorageExhausted { entries: usize },
 }
 
 impl fmt::Display for FifoError {
@@ -79,6 +80,12 @@ impl fmt::Display for FifoError {
                     "out-of-order FIFO end offset {end_offset} exceeds available capacity {available}"
                 )
             }
+            Self::OutOfOrderStorageExhausted { entries } => {
+                write!(
+                    f,
+                    "out-of-order FIFO segment storage exhausted at {entries} entries"
+                )
+            }
         }
     }
 }
@@ -107,6 +114,39 @@ impl OooBookkeeping {
     fn remove_ooo_entry(&mut self, offset: u32) -> Option<OooSegment> {
         let idx = self.index.remove(&offset)?;
         self.entries.remove(idx)
+    }
+
+    /// Grows segment storage before an enqueue can exhaust it, mirroring VPP
+    /// `svm_fifo` whose ooo segment pool grows on demand (`pool_get`). Both
+    /// containers are rebuilt, so callers must not hold pool indices across
+    /// this call.
+    fn ensure_capacity(&mut self, needed: usize) -> Result<(), FifoError> {
+        if self.entries.capacity() >= needed && self.index.capacity() >= needed {
+            return Ok(());
+        }
+        let new_capacity = self
+            .entries
+            .capacity()
+            .saturating_mul(2)
+            .max(needed)
+            .next_power_of_two();
+        let mut entries = Pool::with_capacity(new_capacity);
+        let mut index = RbTree::with_capacity(new_capacity);
+        while let Some((&offset, &idx)) = self.index.first() {
+            self.index.remove(&offset);
+            let Some(segment) = self.entries.remove(idx) else {
+                continue;
+            };
+            let Some(new_idx) = entries.insert(segment) else {
+                return Err(FifoError::OutOfOrderStorageExhausted {
+                    entries: entries.capacity(),
+                });
+            };
+            index.insert(offset, new_idx);
+        }
+        self.entries = entries;
+        self.index = index;
+        Ok(())
     }
 }
 
@@ -736,16 +776,24 @@ impl Fifo {
 
 impl Fifo {
     pub fn enable_ooo(&mut self) {
+        // VPP's `svm_fifo` starts with no configured OOO segment limit and
+        // grows `ooo_segments` through `pool_get` as segments arrive. Hammer's
+        // fixed-capacity Pool is rebuilt on demand by `ensure_capacity`, so
+        // this is only the first slab size, not a session policy.
+        const INITIAL_OOO_SEGMENTS: usize = 4;
         *self.ooo.get_mut() = Some(Box::new(OooBookkeeping {
             base: 0,
-            entries: Pool::with_capacity(8),
-            index: RbTree::with_capacity(8),
+            entries: Pool::with_capacity(INITIAL_OOO_SEGMENTS),
+            index: RbTree::with_capacity(INITIAL_OOO_SEGMENTS),
         }));
     }
 
     pub fn enqueue_ooo(&self, offset: u32, src: &[u8]) -> Result<OooResult, FifoError> {
         let ooo = unsafe { &mut *self.ooo.get() };
         let bk = ooo.as_mut().ok_or(FifoError::OutOfOrderDisabled)?;
+        // One call nets at most one new segment (the split site removes before
+        // inserting); +2 keeps a slot of headroom in both containers.
+        bk.ensure_capacity(bk.entries.len().saturating_add(2))?;
 
         let total_len = u32::try_from(src.len())
             .map_err(|_| FifoError::OutOfOrderLengthOutOfRange { length: src.len() })?;
@@ -881,13 +929,14 @@ impl Fifo {
                 let new_key = seg_end_full;
                 let new_len = succ_end.wrapping_sub(new_key);
                 if new_len > 0 {
-                    let new_idx = bk
-                        .entries
-                        .insert(OooSegment {
-                            offset: new_key,
-                            len: new_len,
-                        })
-                        .expect("ooo pool exhausted");
+                    let Some(new_idx) = bk.entries.insert(OooSegment {
+                        offset: new_key,
+                        len: new_len,
+                    }) else {
+                        return Err(FifoError::OutOfOrderStorageExhausted {
+                            entries: bk.entries.capacity(),
+                        });
+                    };
                     bk.index.insert(new_key, new_idx);
                 }
                 break;
@@ -896,13 +945,14 @@ impl Fifo {
 
         // Insert our segment
         let seg_len = seg_end_full.wrapping_sub(seg_start);
-        let idx = bk
-            .entries
-            .insert(OooSegment {
-                offset: seg_start,
-                len: seg_len,
-            })
-            .expect("ooo pool exhausted");
+        let Some(idx) = bk.entries.insert(OooSegment {
+            offset: seg_start,
+            len: seg_len,
+        }) else {
+            return Err(FifoError::OutOfOrderStorageExhausted {
+                entries: bk.entries.capacity(),
+            });
+        };
         bk.index.insert(seg_start, idx);
 
         // Contiguous check
@@ -926,8 +976,10 @@ impl Fifo {
             let first = bk.index.first().map(|(&k, &v)| (k, v));
             match first {
                 Some((first_key, first_idx)) if first_key == bk.base => {
-                    let seg = bk.entries.remove(first_idx).expect("ooo entry exists");
                     bk.index.remove(&first_key);
+                    let Some(seg) = bk.entries.remove(first_idx) else {
+                        break;
+                    };
                     bk.base = bk.base.wrapping_add(seg.len);
                     delivered = delivered.wrapping_add(seg.len);
                 }

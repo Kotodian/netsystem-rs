@@ -8,7 +8,6 @@ const SESSION_TIMER_TICK: Duration = Duration::from_millis(10);
 const SESSION_POOL_CAPACITY: usize = 1_024;
 const READY_QUEUE_CAPACITY: usize = 1_024;
 const APP_SESSION_CAPACITY: usize = 1_024;
-const OOO_CAPACITY: usize = 8;
 const SESSION_BUFFER_SLOT_BYTES: usize = 2_048;
 const SESSION_BUFFER_SLOTS: usize = 1;
 
@@ -24,7 +23,6 @@ pub struct Session {
     #[serde(alias = "event_queue_length")]
     pub ready_queue_capacity: usize,
     pub app_session_capacity: usize,
-    pub ooo_capacity: usize,
     pub buffer: SessionBuffer,
 }
 
@@ -36,7 +34,6 @@ impl Default for Session {
             pool_capacity: SESSION_POOL_CAPACITY,
             ready_queue_capacity: READY_QUEUE_CAPACITY,
             app_session_capacity: APP_SESSION_CAPACITY,
-            ooo_capacity: OOO_CAPACITY,
             buffer: SessionBuffer::default(),
         }
     }
