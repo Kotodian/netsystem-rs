@@ -161,18 +161,26 @@ impl SessionTransport<Index> for TcpWorker {
         frame: &mut hammer_core::data_plane::BufferFrame,
         output: &mut SessionQueueOutput,
     ) -> RuntimeResult<bool> {
-        let connection = self
-            .connections
-            .get(index)
-            .ok_or(TcpNodeError::SessionMissing)?;
-        if !connection.zero_receive_window_sent() {
+        let zero_receive_window_sent = {
+            let connection = self
+                .connections
+                .get_mut(index)
+                .ok_or(TcpNodeError::SessionMissing)?;
+            connection.set_rcv_wnd(rx_available);
+            connection.zero_receive_window_sent()
+        };
+        if !zero_receive_window_sent {
             return Ok(false);
         }
         let min_free = (rx_capacity >> 3).clamp(TCP_APP_RX_MIN_FREE, TCP_APP_RX_MAX_FREE);
         if rx_available < min_free {
             return Ok(true);
         }
-        let mut candidate = connection.clone();
+        let mut candidate = self
+            .connections
+            .get(index)
+            .ok_or(TcpNodeError::SessionMissing)?
+            .clone();
         let segment = candidate.receive_window_update_segment(rx_available)?;
         enqueue_tcp_segment(runtime, frame, output_next, output, segment)?;
         *self

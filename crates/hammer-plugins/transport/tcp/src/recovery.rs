@@ -481,7 +481,9 @@ impl TcpRecoveryState {
     }
 
     pub fn tlp_timeout(&self, srtt: Option<Duration>, rto: Duration) -> Option<Duration> {
-        if !self.tlp_timer_armed || !self.has_unacked_data() {
+        // A SACK-confirmed gap has a concrete RACK deadline. TLP remains the
+        // fallback only while there is no stronger loss signal to service.
+        if !self.tlp_timer_armed || !self.has_unacked_data() || self.has_pending_rack_deadline() {
             return None;
         }
         let srtt = srtt.unwrap_or(rto);
@@ -1846,6 +1848,39 @@ mod tests {
         );
         assert_eq!(controller.lost.len(), 1);
         assert_eq!(controller.lost[0].packet_number, 1);
+    }
+
+    #[test]
+    fn rack_candidate_suppresses_tail_loss_probe_timeout() {
+        let now = Instant::now();
+        let mut recovery = TcpRecoveryState::new();
+        let mut controller = RecordingController::new(1_460);
+        record_sent_for_test(&mut recovery, 1, 1_000, 2_000, 1_000, now);
+        record_sent_for_test(
+            &mut recovery,
+            2,
+            2_000,
+            3_000,
+            1_000,
+            now + Duration::from_millis(1),
+        );
+        recovery.on_sack_blocks(
+            ack(1_000, now + Duration::from_millis(30), 40),
+            &[TcpSackBlock {
+                left_edge: TcpSeq::from(2_000),
+                right_edge: TcpSeq::from(3_000),
+            }],
+            &mut controller,
+        );
+
+        assert_eq!(
+            recovery.rack_timeout(now + Duration::from_millis(30)),
+            Some(Duration::from_millis(10))
+        );
+        assert_eq!(
+            recovery.tlp_timeout(Some(Duration::from_millis(20)), Duration::from_secs(1)),
+            None
+        );
     }
 
     #[test]

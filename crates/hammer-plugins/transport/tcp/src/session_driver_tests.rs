@@ -1,13 +1,13 @@
 //! TCP/session lifecycle tests through the adjacent worker state.
 
 use crate::{TcpCapabilities, TcpPacket, TcpSegmentFlags, TcpState};
-use hammer_core::data_plane::NodeId;
+use hammer_core::data_plane::{BufferFrame, NodeId};
 use hammer_infra::pool::Index;
 use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId};
 
 use hammer_service::data_plane::DropNode;
 use hammer_service::session::SessionId;
-use hammer_service::session::node::{SessionQueueNext, SessionQueueNode};
+use hammer_service::session::node::{SessionQueueNext, SessionQueueNode, SessionQueueOutput};
 use hammer_service::session::runtime::{
     SessionTransport, SessionWorker, dispatch_session_queue_once,
 };
@@ -178,4 +178,82 @@ fn rollback_discards_unpublished_session_without_close_notification() {
     assert!(!sessions.has_session(session_id));
     assert!(removed.is_some());
     assert!(tcp.connection(connection_index).is_none());
+}
+
+#[test]
+fn app_rx_event_refreshes_window_before_zero_window_is_advertised() {
+    let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
+    let (_, mut tcp) = worker_state(&runtime);
+    let connection_index = tcp
+        .insert_connection(established_connection())
+        .expect("insert TCP connection");
+    tcp.connection_mut(connection_index)
+        .expect("TCP connection")
+        .set_rcv_wnd(0);
+    let mut frame = BufferFrame::with_capacity(1);
+    let mut output = SessionQueueOutput::default();
+
+    let request_notification = <TcpWorker as SessionTransport<Index>>::app_rx_evt(
+        &mut tcp,
+        connection_index,
+        8 << 10,
+        64 << 10,
+        &runtime,
+        SessionQueueNext::from_slot(0),
+        &mut frame,
+        &mut output,
+    )
+    .expect("process app RX event");
+
+    assert!(!request_notification);
+    assert_eq!(
+        tcp.connection(connection_index)
+            .expect("TCP connection")
+            .rcv_wnd(),
+        8 << 10
+    );
+}
+
+#[test]
+fn app_rx_event_refreshes_window_before_rearming_dequeue_notification() {
+    let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
+    let (_, mut tcp) = worker_state(&runtime);
+    let connection_index = tcp
+        .insert_connection(established_connection())
+        .expect("insert TCP connection");
+    let connection = tcp
+        .connection_mut(connection_index)
+        .expect("TCP connection");
+    connection.set_rcv_wnd(0);
+    let local = connection.local().expect("local address");
+    let remote = connection.remote();
+    connection.control_segment(
+        local,
+        remote,
+        TcpSegmentFlags::ACK,
+        None,
+        TcpCapabilities::default(),
+    );
+    let mut frame = BufferFrame::with_capacity(1);
+    let mut output = SessionQueueOutput::default();
+
+    let request_notification = <TcpWorker as SessionTransport<Index>>::app_rx_evt(
+        &mut tcp,
+        connection_index,
+        1 << 10,
+        64 << 10,
+        &runtime,
+        SessionQueueNext::from_slot(0),
+        &mut frame,
+        &mut output,
+    )
+    .expect("process app RX event");
+
+    assert!(request_notification);
+    assert_eq!(
+        tcp.connection(connection_index)
+            .expect("TCP connection")
+            .rcv_wnd(),
+        1 << 10
+    );
 }

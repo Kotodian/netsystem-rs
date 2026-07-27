@@ -17,10 +17,11 @@ from the session-owned RX FIFO. It follows VPP's `SESSION_IO_EVT_RX` path:
    to the owning worker's Session Message Queue.
 3. Session Queue dispatch calls `SessionTransport::app_rx_evt` with the current
    free capacity and configured FIFO capacity.
-4. TCP acts only after it has emitted an ACK advertising a zero receive window.
-   Below the VPP free-space threshold it asks Session Runtime to re-arm the FIFO;
-   at or above the threshold it emits a pure window-update ACK through the
-   existing Session Queue Graph Fanout.
+4. TCP always refreshes its cached receive window from the delivered FIFO
+   capacity. It emits a window-update ACK only after an ACK has advertised a
+   zero receive window. Below the VPP free-space threshold it asks Session
+   Runtime to re-arm the FIFO; at or above the threshold it emits a pure
+   window-update ACK through the existing Session Queue Graph Fanout.
 
 `TxDeq` remains the opposite-direction event: app TX data is ready for Session
 Runtime to packetize. It must not be reused for RX-space recovery.

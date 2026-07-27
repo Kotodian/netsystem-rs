@@ -497,17 +497,20 @@ jobs:
           # later retransmission of the same sequence passes without racing a
           # rule deletion against RACK's reordering window.
           command -v nft >/dev/null || sudo -n apt-get install -y nftables
-          sudo -n nft add table ip tcplab
           case "${{ matrix.fault }}" in
             client-egress)
-              sudo -n nft add chain ip tcplab fault \
-                '{ type filter hook output priority 0 ; }'
-              sudo -n nft add rule ip tcplab fault \
+              fault_family=netdev
+              sudo -n nft add table netdev tcplab
+              sudo -n nft add chain netdev tcplab fault \
+                "{ type filter hook egress device \"$TCP_TEST_INTERFACE\" priority 0 ; }"
+              sudo -n nft add rule netdev tcplab fault \
                 ip daddr "$TCP_TEST_ADDRESS" tcp dport "$TCP_TEST_PORT" \
                 tcp sequence "$target_seq" \
                 limit rate 1/hour burst 1 packets counter drop
               ;;
             server-ingress)
+              fault_family=ip
+              sudo -n nft add table ip tcplab
               sudo -n nft add chain ip tcplab fault \
                 '{ type filter hook input priority 0 ; }'
               sudo -n nft add rule ip tcplab fault \
@@ -522,7 +525,7 @@ jobs:
           touch "$continue_file"
           probe_status=0
           wait "$probe_pid" || probe_status=$?
-          sudo -n nft list table ip tcplab \
+          sudo -n nft list table "$fault_family" tcplab \
             > "$TCP_TEST_DIAGNOSTICS/fault-rule.txt" 2>&1 || true
           cat "$TCP_TEST_DIAGNOSTICS/probe.log"
           cat "$TCP_TEST_DIAGNOSTICS/fault-rule.txt"
@@ -628,8 +631,8 @@ jobs:
                 sub(/^.*errors=\[/, "", counters)
                 sub(/\].*$/, "", counters)
                 count = split(counters, entries, ",")
-                for (index = 1; index <= count; index++) {
-                  split(entries[index], pair, "=")
+                for (entry_index = 1; entry_index <= count; entry_index++) {
+                  split(entries[entry_index], pair, "=")
                   if (pair[1] == code) total += pair[2]
                 }
               }
@@ -666,6 +669,7 @@ jobs:
         run: |
           if command -v nft >/dev/null; then
             sudo -n nft delete table ip tcplab 2>/dev/null || true
+            sudo -n nft delete table netdev tcplab 2>/dev/null || true
           fi
       - name: Remove Linux host route
         if: ${{ always() && runner.os == 'Linux' }}
