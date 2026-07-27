@@ -34,10 +34,6 @@ def parse_args() -> argparse.Namespace:
         "--echo-bytes", type=int, default=0, help="exact echo payload size (0 = no data phase)"
     )
     parser.add_argument("--chunk-bytes", type=int, default=4096)
-    parser.add_argument("--write-delay-seconds", type=float, default=0.0)
-    parser.add_argument("--pause-after-bytes", type=int, default=0)
-    parser.add_argument("--pause-file")
-    parser.add_argument("--resume-file")
     parser.add_argument(
         "--window-bytes",
         type=int,
@@ -94,9 +90,6 @@ def run_echo(connection: socket.socket, args: argparse.Namespace) -> None:
     sent = 0
     received = 0
     deadline = time.monotonic() + args.echo_timeout
-    pause_file = Path(args.pause_file) if args.pause_file else None
-    resume_file = Path(args.resume_file) if args.resume_file else None
-    paused = False
     connection.setblocking(False)
     while received < total:
         if time.monotonic() > deadline:
@@ -131,18 +124,7 @@ def run_echo(connection: socket.socket, args: argparse.Namespace) -> None:
         if writable:
             budget = min(args.chunk_bytes, total - sent, args.window_bytes - (sent - received))
             if budget > 0:
-                written = connection.send(payload_slice(sent, budget))
-                sent += written
-                if written > 0 and args.write_delay_seconds > 0:
-                    time.sleep(args.write_delay_seconds)
-                if (
-                    not paused
-                    and args.pause_after_bytes > 0
-                    and sent >= args.pause_after_bytes
-                ):
-                    pause_file.touch()
-                    wait_for_file(resume_file, args.continue_timeout)
-                    paused = True
+                sent += connection.send(payload_slice(sent, budget))
     print(f"echo verified: {received} bytes matched exactly", flush=True)
 
 
@@ -167,21 +149,14 @@ def main() -> None:
         args.echo_bytes < 0
         or args.chunk_bytes <= 0
         or args.window_bytes <= 0
-        or args.write_delay_seconds < 0
-        or args.pause_after_bytes < 0
     ):
         raise SystemExit(
-            "--echo-bytes/write-delay-seconds must be >= 0; "
-            "--chunk-bytes/--window-bytes must be > 0"
-        )
-    if args.pause_after_bytes > 0 and (not args.pause_file or not args.resume_file):
-        raise SystemExit(
-            "--pause-file and --resume-file are required with --pause-after-bytes"
+            "--echo-bytes must be >= 0; --chunk-bytes/--window-bytes must be > 0"
         )
     connection = connect(args)
     with connection:
         if args.ready_file:
-            Path(args.ready_file).touch()
+            Path(args.ready_file).write_text(f"{connection.getsockname()[1]}\n")
         if args.continue_file:
             wait_for_file(Path(args.continue_file), args.continue_timeout)
         if args.echo_bytes > 0:
