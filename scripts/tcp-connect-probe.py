@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
         "--echo-bytes", type=int, default=0, help="exact echo payload size (0 = no data phase)"
     )
     parser.add_argument("--chunk-bytes", type=int, default=4096)
+    parser.add_argument("--write-delay-seconds", type=float, default=0.0)
     parser.add_argument(
         "--window-bytes",
         type=int,
@@ -124,7 +125,10 @@ def run_echo(connection: socket.socket, args: argparse.Namespace) -> None:
         if writable:
             budget = min(args.chunk_bytes, total - sent, args.window_bytes - (sent - received))
             if budget > 0:
-                sent += connection.send(payload_slice(sent, budget))
+                written = connection.send(payload_slice(sent, budget))
+                sent += written
+                if written > 0 and args.write_delay_seconds > 0:
+                    time.sleep(args.write_delay_seconds)
     print(f"echo verified: {received} bytes matched exactly", flush=True)
 
 
@@ -145,8 +149,16 @@ def run_idle(connection: socket.socket, idle_seconds: float) -> None:
 
 def main() -> None:
     args = parse_args()
-    if args.echo_bytes < 0 or args.chunk_bytes <= 0 or args.window_bytes <= 0:
-        raise SystemExit("--echo-bytes must be >= 0; --chunk-bytes/--window-bytes must be > 0")
+    if (
+        args.echo_bytes < 0
+        or args.chunk_bytes <= 0
+        or args.window_bytes <= 0
+        or args.write_delay_seconds < 0
+    ):
+        raise SystemExit(
+            "--echo-bytes/write-delay-seconds must be >= 0; "
+            "--chunk-bytes/--window-bytes must be > 0"
+        )
     connection = connect(args)
     with connection:
         if args.ready_file:
