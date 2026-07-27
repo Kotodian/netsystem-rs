@@ -504,11 +504,11 @@ jobs:
           command -v nft >/dev/null || sudo -n apt-get install -y nftables
           case "${{ matrix.fault }}" in
             client-egress)
-              fault_family=netdev
-              sudo -n nft add table netdev tcplab
-              sudo -n nft add chain netdev tcplab fault \
-                "{ type filter hook egress device \"$TCP_TEST_INTERFACE\" priority 0 ; }"
-              sudo -n nft add rule netdev tcplab fault \
+              fault_family=ip
+              sudo -n nft add table ip tcplab
+              sudo -n nft add chain ip tcplab fault \
+                '{ type filter hook output priority 0 ; }'
+              sudo -n nft add rule ip tcplab fault \
                 ip daddr "$TCP_TEST_ADDRESS" tcp dport "$TCP_TEST_PORT" \
                 tcp sequence "$target_seq" \
                 limit rate 1/hour burst 1 packets counter drop
