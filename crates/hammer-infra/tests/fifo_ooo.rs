@@ -172,5 +172,5 @@ fn ooo_segment_storage_grows_on_demand() {
         assert_eq!(result.accepted, 1);
     }
 
-    assert_eq!(f.ooo_segment_count(), 17);
+    assert_eq!(f.ooo_enqueued(), 17);
 }
