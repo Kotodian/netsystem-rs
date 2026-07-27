@@ -61,6 +61,10 @@ jobs:
           cp target/debug/libhammer_plugin_ip."$plugin_extension" "$package/plugins/"
           cp target/debug/libhammer_plugin_tcp."$plugin_extension" "$package/plugins/"
           cp target/debug/libhammer_plugin_udp."$plugin_extension" "$package/plugins/"
+          cp target/debug/libhammer_infra."$plugin_extension" "$package/rustlib/"
+          cp target/debug/libhammer_core."$plugin_extension" "$package/rustlib/"
+          cp target/debug/libhammer_runtime."$plugin_extension" "$package/rustlib/"
+          cp target/debug/libhammer_service."$plugin_extension" "$package/rustlib/"
           rust_libdir="$(rustc --print target-libdir)"
           find "$rust_libdir" -maxdepth 1 -type f \
             \( -name '*.so' -o -name '*.dylib' \) \
