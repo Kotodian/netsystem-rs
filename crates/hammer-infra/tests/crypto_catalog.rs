@@ -2,10 +2,6 @@ use hammer_infra::crypto::{
     AeadAlgorithm, AeadCipher, HashAlgorithm, Hkdf, Hmac, KdfError, MacError, Sha2Algorithm, hash,
 };
 
-fn bytes(value: &str) -> Vec<u8> {
-    hex::decode(value).expect("test vector is valid hexadecimal")
-}
-
 #[test]
 fn digest_catalog_matches_empty_message_vectors() {
     let vectors = [
@@ -32,7 +28,7 @@ fn digest_catalog_matches_empty_message_vectors() {
     ];
 
     for (algorithm, expected) in vectors {
-        let expected = bytes(expected);
+        let expected = hex::decode(expected).expect("digest vector is valid hexadecimal");
         let mut output = vec![0; expected.len()];
         let written =
             hash(algorithm, &[b"", b""], &mut output).expect("digest output has exact capacity");
@@ -52,17 +48,26 @@ fn aes_256_gcm_matches_nist_zero_vector() {
         .seal(&[&[0; 16]], &[0; 12], &[], &mut output, &mut tag)
         .expect("NIST vector is valid");
 
-    assert_eq!(output.as_slice(), bytes("cea7403d4d606b6e074ec5d3baf39d18"));
-    assert_eq!(tag.as_slice(), bytes("d0d1c8a799996bf0265b98b5d48ab919"));
+    assert_eq!(
+        output.as_slice(),
+        hex::decode("cea7403d4d606b6e074ec5d3baf39d18")
+            .expect("NIST ciphertext is valid hexadecimal")
+    );
+    assert_eq!(
+        tag.as_slice(),
+        hex::decode("d0d1c8a799996bf0265b98b5d48ab919").expect("NIST tag is valid hexadecimal")
+    );
 }
 
 #[test]
 fn chacha20_poly1305_matches_rfc_8439_vector() {
-    let key = bytes("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f");
+    let key = hex::decode("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+        .expect("RFC key is valid hexadecimal");
     let cipher =
         AeadCipher::new(AeadAlgorithm::ChaCha20Poly1305, &key).expect("ChaCha20 key has 32 bytes");
-    let nonce = bytes("070000004041424344454647");
-    let associated_data = bytes("50515253c0c1c2c3c4c5c6c7");
+    let nonce = hex::decode("070000004041424344454647").expect("RFC nonce is valid hexadecimal");
+    let associated_data =
+        hex::decode("50515253c0c1c2c3c4c5c6c7").expect("RFC associated data is valid hexadecimal");
     let plaintext = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
     let mut output = vec![0; plaintext.len()];
     let mut tag = [0; 16];
@@ -79,11 +84,15 @@ fn chacha20_poly1305_matches_rfc_8439_vector() {
 
     assert_eq!(
         output,
-        bytes(
+        hex::decode(
             "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b6116"
         )
+        .expect("RFC ciphertext is valid hexadecimal")
     );
-    assert_eq!(tag.as_slice(), bytes("1ae10b594f09e26a7e902ecbd0600691"));
+    assert_eq!(
+        tag.as_slice(),
+        hex::decode("1ae10b594f09e26a7e902ecbd0600691").expect("RFC tag is valid hexadecimal")
+    );
 }
 
 #[test]
@@ -104,7 +113,7 @@ fn hmac_sha2_catalog_matches_rfc_4231_case_one() {
     ];
 
     for (algorithm, expected) in vectors {
-        let expected = bytes(expected);
+        let expected = hex::decode(expected).expect("HMAC vector is valid hexadecimal");
         let hmac = Hmac::new(algorithm, &[0x0b; 20]);
         let mut output = vec![0; expected.len()];
         let written = hmac
@@ -118,20 +127,25 @@ fn hmac_sha2_catalog_matches_rfc_4231_case_one() {
 #[test]
 fn hkdf_sha256_matches_rfc_5869_case_one() {
     let input_key_material = [0x0b; 22];
-    let salt = bytes("000102030405060708090a0b0c");
+    let salt = hex::decode("000102030405060708090a0b0c").expect("RFC salt is valid hexadecimal");
     let hkdf = Hkdf::new(Sha2Algorithm::Sha256, Some(&salt), &input_key_material);
     let mut output = [0; 42];
 
     let written = hkdf
-        .expand(&[&bytes("f0f1f2f3f4f5f6f7f8f9")], 42, &mut output)
+        .expand(
+            &[&hex::decode("f0f1f2f3f4f5f6f7f8f9").expect("RFC info is valid hexadecimal")],
+            42,
+            &mut output,
+        )
         .expect("RFC output length is valid");
 
     assert_eq!(written, 42);
     assert_eq!(
         output.as_slice(),
-        bytes(
+        hex::decode(
             "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
         )
+        .expect("RFC output is valid hexadecimal")
     );
 }
 

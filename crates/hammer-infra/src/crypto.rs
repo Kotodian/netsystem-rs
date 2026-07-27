@@ -7,11 +7,9 @@
 use std::fmt;
 
 use aes_gcm::aead::{AeadInPlace, KeyInit};
-use aes_gcm::{Aes128Gcm as RustCryptoAes128Gcm, Aes256Gcm as RustCryptoAes256Gcm, Nonce, Tag};
+use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce, Tag};
 use blake2::{Blake2b512, Blake2s256};
-use chacha20poly1305::ChaCha20Poly1305 as RustCryptoChaCha20Poly1305;
-use hkdf::Hkdf as RustCryptoHkdf;
-use hmac::Hmac as RustCryptoHmac;
+use chacha20poly1305::ChaCha20Poly1305;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
 const AES_GCM_NONCE_LEN: usize = 12;
@@ -105,9 +103,9 @@ impl AeadAlgorithm {
 }
 
 enum AeadState {
-    Aes128Gcm(RustCryptoAes128Gcm),
-    Aes256Gcm(RustCryptoAes256Gcm),
-    ChaCha20Poly1305(Box<RustCryptoChaCha20Poly1305>),
+    Aes128Gcm(Box<Aes128Gcm>),
+    Aes256Gcm(Box<Aes256Gcm>),
+    ChaCha20Poly1305(Box<ChaCha20Poly1305>),
 }
 
 /// Prepared state for one standard authenticated-encryption algorithm.
@@ -134,13 +132,13 @@ impl AeadCipher {
     /// algorithm's required length.
     pub fn new(algorithm: AeadAlgorithm, key: &[u8]) -> Result<Self, AeadError> {
         let state = match algorithm {
-            AeadAlgorithm::Aes128Gcm => {
-                RustCryptoAes128Gcm::new_from_slice(key).map(AeadState::Aes128Gcm)
-            }
-            AeadAlgorithm::Aes256Gcm => {
-                RustCryptoAes256Gcm::new_from_slice(key).map(AeadState::Aes256Gcm)
-            }
-            AeadAlgorithm::ChaCha20Poly1305 => RustCryptoChaCha20Poly1305::new_from_slice(key)
+            AeadAlgorithm::Aes128Gcm => Aes128Gcm::new_from_slice(key)
+                .map(Box::new)
+                .map(AeadState::Aes128Gcm),
+            AeadAlgorithm::Aes256Gcm => Aes256Gcm::new_from_slice(key)
+                .map(Box::new)
+                .map(AeadState::Aes256Gcm),
+            AeadAlgorithm::ChaCha20Poly1305 => ChaCha20Poly1305::new_from_slice(key)
                 .map(Box::new)
                 .map(AeadState::ChaCha20Poly1305),
         }
@@ -483,9 +481,9 @@ impl fmt::Display for MacError {
 impl std::error::Error for MacError {}
 
 enum HmacState {
-    Sha256(RustCryptoHmac<Sha256>),
-    Sha384(RustCryptoHmac<Sha384>),
-    Sha512(RustCryptoHmac<Sha512>),
+    Sha256(hmac::Hmac<Sha256>),
+    Sha384(hmac::Hmac<Sha384>),
+    Sha512(hmac::Hmac<Sha512>),
 }
 
 /// Prepared state for HMAC with one standard SHA-2 algorithm.
@@ -508,15 +506,15 @@ impl Hmac {
     pub fn new(algorithm: Sha2Algorithm, key: &[u8]) -> Self {
         let state = match algorithm {
             Sha2Algorithm::Sha256 => HmacState::Sha256(
-                <RustCryptoHmac<Sha256> as hmac::Mac>::new_from_slice(key)
+                <hmac::Hmac<Sha256> as hmac::Mac>::new_from_slice(key)
                     .expect("HMAC accepts keys of every length"),
             ),
             Sha2Algorithm::Sha384 => HmacState::Sha384(
-                <RustCryptoHmac<Sha384> as hmac::Mac>::new_from_slice(key)
+                <hmac::Hmac<Sha384> as hmac::Mac>::new_from_slice(key)
                     .expect("HMAC accepts keys of every length"),
             ),
             Sha2Algorithm::Sha512 => HmacState::Sha512(
-                <RustCryptoHmac<Sha512> as hmac::Mac>::new_from_slice(key)
+                <hmac::Hmac<Sha512> as hmac::Mac>::new_from_slice(key)
                     .expect("HMAC accepts keys of every length"),
             ),
         };
@@ -594,9 +592,9 @@ impl fmt::Display for KdfError {
 impl std::error::Error for KdfError {}
 
 enum HkdfState {
-    Sha256(RustCryptoHkdf<Sha256>),
-    Sha384(RustCryptoHkdf<Sha384>),
-    Sha512(RustCryptoHkdf<Sha512>),
+    Sha256(hkdf::Hkdf<Sha256>),
+    Sha384(hkdf::Hkdf<Sha384>),
+    Sha512(hkdf::Hkdf<Sha512>),
 }
 
 /// Extracted state for HKDF with one standard SHA-2 algorithm.
@@ -618,15 +616,9 @@ impl Hkdf {
     /// Extracts HKDF state from input key material and an optional salt.
     pub fn new(algorithm: Sha2Algorithm, salt: Option<&[u8]>, input_key_material: &[u8]) -> Self {
         let state = match algorithm {
-            Sha2Algorithm::Sha256 => {
-                HkdfState::Sha256(RustCryptoHkdf::new(salt, input_key_material))
-            }
-            Sha2Algorithm::Sha384 => {
-                HkdfState::Sha384(RustCryptoHkdf::new(salt, input_key_material))
-            }
-            Sha2Algorithm::Sha512 => {
-                HkdfState::Sha512(RustCryptoHkdf::new(salt, input_key_material))
-            }
+            Sha2Algorithm::Sha256 => HkdfState::Sha256(hkdf::Hkdf::new(salt, input_key_material)),
+            Sha2Algorithm::Sha384 => HkdfState::Sha384(hkdf::Hkdf::new(salt, input_key_material)),
+            Sha2Algorithm::Sha512 => HkdfState::Sha512(hkdf::Hkdf::new(salt, input_key_material)),
         };
         Self { algorithm, state }
     }
@@ -705,11 +697,6 @@ impl KeyEstablishmentAlgorithm {
             Self::X25519 | Self::P256 | Self::MlKem768 => 32,
             Self::P384 => 48,
         }
-    }
-
-    /// Returns the random input required to generate a private key.
-    pub fn key_generation_entropy_len(self) -> usize {
-        self.private_key_len()
     }
 
     /// Returns the ML-KEM ciphertext length, if this is an encapsulation algorithm.
@@ -839,7 +826,7 @@ pub fn generate_keypair(
     private_key_output: &mut [u8],
     public_key_output: &mut [u8],
 ) -> Result<(), KeyEstablishmentError> {
-    let entropy_len = algorithm.key_generation_entropy_len();
+    let entropy_len = algorithm.private_key_len();
     if entropy.len() != entropy_len {
         return Err(KeyEstablishmentError::InvalidEntropyLength {
             required: entropy_len,

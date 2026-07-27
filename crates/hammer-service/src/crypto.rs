@@ -68,13 +68,39 @@ mod private {
 #[derive(Debug)]
 pub struct Hash;
 
+/// Prepared state for a hash Context.
+#[derive(Debug)]
+pub struct HashPrepared {
+    algorithm: hammer_infra::crypto::HashAlgorithm,
+}
+
+impl HashPrepared {
+    fn new(algorithm: hammer_infra::crypto::HashAlgorithm) -> Self {
+        Self { algorithm }
+    }
+
+    fn execute(&mut self, operations: &mut [HashOperation<'_>]) {
+        for operation in operations {
+            let result = operation.input.with_fragments(|input| {
+                hammer_infra::crypto::hash(self.algorithm, input, operation.output)
+            });
+            operation.status = match result {
+                Ok(written) => HashStatus::Complete { written },
+                Err(hammer_infra::crypto::HashError::OutputTooSmall { required, provided }) => {
+                    HashStatus::OutputTooSmall { required, provided }
+                }
+            };
+        }
+    }
+}
+
 impl private::Sealed for Hash {}
 
 impl Family for Hash {
     type Operation<'a> = HashOperation<'a>;
-    type Prepared = ();
-    type Prepare = ();
-    type Dispatch = for<'a> fn(&mut (), &mut [HashOperation<'a>]);
+    type Prepared = HashPrepared;
+    type Prepare = hammer_infra::crypto::HashAlgorithm;
+    type Dispatch = for<'a> fn(&mut HashPrepared, &mut [HashOperation<'a>]);
 
     const KEY_FAMILY: u8 = 2;
 
@@ -87,11 +113,11 @@ impl Family for Hash {
     }
 
     fn prepare_unkeyed(
-        _: Self::Prepare,
+        prepare: Self::Prepare,
         _: &Engine,
         _: AlgorithmId<Self>,
     ) -> Option<Self::Prepared> {
-        Some(())
+        Some(HashPrepared::new(prepare))
     }
 }
 
@@ -129,6 +155,62 @@ impl AeadPrepared {
             })?;
         Ok(Self { cipher, operations })
     }
+
+    fn execute(&mut self, operations: &mut [AeadOperation<'_>]) {
+        for operation in operations {
+            let required = match operation.direction {
+                AeadDirection::Seal => KeyOperations::AEAD_SEAL,
+                AeadDirection::Open => KeyOperations::AEAD_OPEN,
+            };
+            if !self.operations.contains(required) {
+                operation.status = AeadStatus::PolicyDenied {
+                    operation: operation.direction,
+                };
+                continue;
+            }
+
+            let result = match (
+                operation.direction,
+                &mut operation.payload,
+                &mut operation.tag,
+            ) {
+                (
+                    AeadDirection::Seal,
+                    AeadPayload::OutOfPlace { input, output },
+                    AeadTag::Output(tag),
+                ) => (*input).with_fragments(|fragments| {
+                    self.cipher.seal(
+                        fragments,
+                        operation.nonce,
+                        operation.associated_data,
+                        output,
+                        tag,
+                    )
+                }),
+                (
+                    AeadDirection::Open,
+                    AeadPayload::OutOfPlace { input, output },
+                    AeadTag::Input(tag),
+                ) => (*input).with_fragments(|fragments| {
+                    self.cipher.open(
+                        fragments,
+                        operation.nonce,
+                        operation.associated_data,
+                        tag,
+                        output,
+                    )
+                }),
+                (AeadDirection::Seal, AeadPayload::InPlace(payload), AeadTag::Output(tag)) => self
+                    .cipher
+                    .seal_in_place(payload, operation.nonce, operation.associated_data, tag),
+                (AeadDirection::Open, AeadPayload::InPlace(payload), AeadTag::Input(tag)) => self
+                    .cipher
+                    .open_in_place(payload, operation.nonce, operation.associated_data, tag),
+                _ => unreachable!("AEAD constructors preserve direction, payload, and tag shape"),
+            };
+            operation.status = aead_status(result);
+        }
+    }
 }
 
 impl private::Sealed for Aead {}
@@ -136,7 +218,7 @@ impl private::Sealed for Aead {}
 impl Family for Aead {
     type Operation<'a> = AeadOperation<'a>;
     type Prepared = AeadPrepared;
-    type Prepare = fn(KeyHandle, &[u8], KeyOperations) -> Result<AeadPrepared, ContextError>;
+    type Prepare = hammer_infra::crypto::AeadAlgorithm;
     type Dispatch = for<'a> fn(&mut AeadPrepared, &mut [AeadOperation<'a>]);
 
     const KEY_FAMILY: u8 = 1;
@@ -162,14 +244,14 @@ impl Family for Aead {
     }
 
     fn prepare_keyed(
-        prepare: Self::Prepare,
+        algorithm: Self::Prepare,
         _: &Engine,
         _: AlgorithmId<Self>,
         key: KeyHandle,
         material: &[u8],
         policy: &KeyPolicy,
     ) -> Result<Self::Prepared, ContextError> {
-        prepare(key, material, policy.operations)
+        AeadPrepared::new(algorithm, key, material, policy.operations)
     }
 }
 
@@ -189,6 +271,20 @@ impl MacPrepared {
             mac: hammer_infra::crypto::Hmac::new(algorithm, material),
         }
     }
+
+    fn execute(&mut self, operations: &mut [MacOperation<'_>]) {
+        for operation in operations {
+            let result = operation
+                .input
+                .with_fragments(|input| self.mac.authenticate(input, operation.output));
+            operation.status = match result {
+                Ok(written) => MacStatus::Complete { written },
+                Err(hammer_infra::crypto::MacError::OutputTooSmall { required, provided }) => {
+                    MacStatus::OutputTooSmall { required, provided }
+                }
+            };
+        }
+    }
 }
 
 impl private::Sealed for Mac {}
@@ -196,7 +292,7 @@ impl private::Sealed for Mac {}
 impl Family for Mac {
     type Operation<'a> = MacOperation<'a>;
     type Prepared = MacPrepared;
-    type Prepare = fn(&[u8]) -> MacPrepared;
+    type Prepare = hammer_infra::crypto::Sha2Algorithm;
     type Dispatch = for<'a> fn(&mut MacPrepared, &mut [MacOperation<'a>]);
 
     const KEY_FAMILY: u8 = 4;
@@ -222,14 +318,14 @@ impl Family for Mac {
     }
 
     fn prepare_keyed(
-        prepare: Self::Prepare,
+        algorithm: Self::Prepare,
         _: &Engine,
         _: AlgorithmId<Self>,
         _: KeyHandle,
         material: &[u8],
         _: &KeyPolicy,
     ) -> Result<Self::Prepared, ContextError> {
-        Ok(prepare(material))
+        Ok(MacPrepared::new(algorithm, material))
     }
 }
 
@@ -258,6 +354,54 @@ impl KdfPrepared {
             material: Zeroizing::new(material.to_vec()),
             policy: policy.clone(),
             keys,
+        }
+    }
+
+    fn execute(&mut self, operations: &mut [KdfOperation<'_>]) {
+        for operation in operations {
+            let Some(policy) = self.policy.derived_policy(operation.target) else {
+                operation.status = KdfStatus::DerivationDenied;
+                continue;
+            };
+            let maximum = 255 * self.algorithm.output_len();
+            if operation.length > maximum {
+                operation.status = KdfStatus::OutputTooLong {
+                    requested: operation.length,
+                    maximum,
+                };
+                continue;
+            }
+
+            let mut material = Zeroizing::new(vec![0; operation.length]);
+            let hkdf =
+                hammer_infra::crypto::Hkdf::new(self.algorithm, operation.salt, &self.material);
+            let result = operation
+                .info
+                .with_fragments(|info| hkdf.expand(info, operation.length, &mut material));
+            match result {
+                Ok(_) => {}
+                Err(hammer_infra::crypto::KdfError::OutputTooLong { requested, maximum }) => {
+                    operation.status = KdfStatus::OutputTooLong { requested, maximum };
+                    continue;
+                }
+                Err(hammer_infra::crypto::KdfError::OutputTooSmall { .. }) => {
+                    unreachable!("HKDF output storage has the exact requested length")
+                }
+            }
+
+            let mut keys = self.keys.borrow_mut();
+            let capacity = keys.capacity();
+            let Some(index) = keys.insert(KeyEntry {
+                material,
+                policy,
+                contexts: 0,
+            }) else {
+                operation.status = KdfStatus::KeyPoolFull { capacity };
+                continue;
+            };
+            operation.status = KdfStatus::Complete {
+                key: KeyHandle { index },
+            };
         }
     }
 }
@@ -376,7 +520,7 @@ impl KxPrepared {
             return KxStatus::KeyPoolFull { capacity };
         }
 
-        let mut entropy = Zeroizing::new(vec![0; self.algorithm.key_generation_entropy_len()]);
+        let mut entropy = Zeroizing::new(vec![0; self.algorithm.private_key_len()]);
         let mut private_key = Zeroizing::new(vec![0; self.algorithm.private_key_len()]);
         let mut public_key_result = vec![0; public_len];
         loop {
@@ -749,11 +893,6 @@ pub struct SelectionPolicy {
 }
 
 impl SelectionPolicy {
-    /// Allows every registered implementation.
-    pub fn allow_all() -> Self {
-        Self::default()
-    }
-
     /// Allows only the named implementations.
     pub fn only<I, S>(names: I) -> Self
     where
@@ -770,11 +909,6 @@ impl SelectionPolicy {
             .as_ref()
             .is_none_or(|allowed| allowed.contains(name))
     }
-}
-
-#[derive(Debug)]
-struct AlgorithmRecord {
-    required: Capabilities,
 }
 
 struct ImplementationRecord<F: Family> {
@@ -794,7 +928,7 @@ struct AlgorithmImplementation<F: Family> {
 /// Family-private registry storage exposed only to the sealed [`Family`] contract.
 #[doc(hidden)]
 pub struct FamilyRegistry<F: Family> {
-    algorithms: Vec<AlgorithmRecord>,
+    algorithms: Vec<Capabilities>,
     algorithm_names: HashMap<String, u32>,
     implementations: Vec<ImplementationRecord<F>>,
     implementation_names: HashMap<String, usize>,
@@ -810,23 +944,12 @@ impl<F: Family> FamilyRegistry<F> {
         }
     }
 
-    fn algorithm(&self, name: &str) -> Option<AlgorithmId<F>> {
-        self.algorithm_names
-            .get(name)
-            .copied()
-            .map(AlgorithmId::new)
-    }
-
-    fn algorithm_record(&self, algorithm: AlgorithmId<F>) -> Option<&AlgorithmRecord> {
-        self.algorithms.get(algorithm.slot as usize)
-    }
-
     fn select(
         &self,
         algorithm: AlgorithmId<F>,
         policy: &SelectionPolicy,
     ) -> Option<(&str, F::Prepare, F::Dispatch)> {
-        let required = self.algorithm_record(algorithm)?.required;
+        let required = *self.algorithms.get(algorithm.slot as usize)?;
         self.implementations
             .iter()
             .filter_map(|implementation| {
@@ -873,9 +996,7 @@ impl<F: Family> FamilyRegistry<F> {
             let slot = u32::try_from(first_slot + offset)
                 .expect("registry capacity was validated before publication");
             self.algorithm_names.insert(algorithm.name.clone(), slot);
-            self.algorithms.push(AlgorithmRecord {
-                required: algorithm.required,
-            });
+            self.algorithms.push(algorithm.required);
         }
 
         for implementation in registration.implementations {
@@ -1534,10 +1655,6 @@ impl KeyPolicy {
         self
     }
 
-    fn permits<F: Family>(&self, algorithm: AlgorithmId<F>) -> bool {
-        self.family == F::KEY_FAMILY && self.algorithm == algorithm.slot
-    }
-
     fn applies_to(&self, algorithm: PolicyAlgorithm) -> bool {
         self.family == algorithm.family && self.algorithm == algorithm.algorithm
     }
@@ -1623,7 +1740,7 @@ impl Engine {
             key_exchanges: FamilyRegistry::new(),
             signers: FamilyRegistry::new(),
             verifiers: FamilyRegistry::new(),
-            selection_policy: SelectionPolicy::allow_all(),
+            selection_policy: SelectionPolicy::default(),
             keys: Rc::new(RefCell::new(Pool::with_capacity(1024))),
         }
     }
@@ -1667,11 +1784,36 @@ impl Engine {
                 ))
                 .with_implementation(
                     ImplementationRegistration::<Hash>::new("hammer:hash-portable", 0, true)
-                        .with_algorithm("sha-256", hash_capabilities, (), execute_sha256)
-                        .with_algorithm("sha-384", hash_capabilities, (), execute_sha384)
-                        .with_algorithm("sha-512", hash_capabilities, (), execute_sha512)
-                        .with_algorithm("blake2s-256", hash_capabilities, (), execute_blake2s)
-                        .with_algorithm("blake2b-512", hash_capabilities, (), execute_blake2b),
+                        .with_algorithm(
+                            "sha-256",
+                            hash_capabilities,
+                            hammer_infra::crypto::HashAlgorithm::Sha256,
+                            HashPrepared::execute,
+                        )
+                        .with_algorithm(
+                            "sha-384",
+                            hash_capabilities,
+                            hammer_infra::crypto::HashAlgorithm::Sha384,
+                            HashPrepared::execute,
+                        )
+                        .with_algorithm(
+                            "sha-512",
+                            hash_capabilities,
+                            hammer_infra::crypto::HashAlgorithm::Sha512,
+                            HashPrepared::execute,
+                        )
+                        .with_algorithm(
+                            "blake2s-256",
+                            hash_capabilities,
+                            hammer_infra::crypto::HashAlgorithm::Blake2s,
+                            HashPrepared::execute,
+                        )
+                        .with_algorithm(
+                            "blake2b-512",
+                            hash_capabilities,
+                            hammer_infra::crypto::HashAlgorithm::Blake2b,
+                            HashPrepared::execute,
+                        ),
                 ),
         )?;
         engine.publish(
@@ -1693,20 +1835,20 @@ impl Engine {
                         .with_algorithm(
                             "aes-128-gcm",
                             aead_capabilities,
-                            prepare_aes128_gcm,
-                            execute_aead,
+                            hammer_infra::crypto::AeadAlgorithm::Aes128Gcm,
+                            AeadPrepared::execute,
                         )
                         .with_algorithm(
                             "aes-256-gcm",
                             aead_capabilities,
-                            prepare_aes256_gcm,
-                            execute_aead,
+                            hammer_infra::crypto::AeadAlgorithm::Aes256Gcm,
+                            AeadPrepared::execute,
                         )
                         .with_algorithm(
                             "chacha20-poly1305",
                             aead_capabilities,
-                            prepare_chacha20_poly1305,
-                            execute_aead,
+                            hammer_infra::crypto::AeadAlgorithm::ChaCha20Poly1305,
+                            AeadPrepared::execute,
                         ),
                 ),
         )?;
@@ -1729,20 +1871,20 @@ impl Engine {
                         .with_algorithm(
                             "hmac-sha-256",
                             hash_capabilities,
-                            prepare_hmac_sha256,
-                            execute_hmac,
+                            hammer_infra::crypto::Sha2Algorithm::Sha256,
+                            MacPrepared::execute,
                         )
                         .with_algorithm(
                             "hmac-sha-384",
                             hash_capabilities,
-                            prepare_hmac_sha384,
-                            execute_hmac,
+                            hammer_infra::crypto::Sha2Algorithm::Sha384,
+                            MacPrepared::execute,
                         )
                         .with_algorithm(
                             "hmac-sha-512",
                             hash_capabilities,
-                            prepare_hmac_sha512,
-                            execute_hmac,
+                            hammer_infra::crypto::Sha2Algorithm::Sha512,
+                            MacPrepared::execute,
                         ),
                 ),
         )?;
@@ -1766,19 +1908,19 @@ impl Engine {
                             "hkdf-sha-256",
                             kdf_capabilities,
                             hammer_infra::crypto::Sha2Algorithm::Sha256,
-                            execute_hkdf,
+                            KdfPrepared::execute,
                         )
                         .with_algorithm(
                             "hkdf-sha-384",
                             kdf_capabilities,
                             hammer_infra::crypto::Sha2Algorithm::Sha384,
-                            execute_hkdf,
+                            KdfPrepared::execute,
                         )
                         .with_algorithm(
                             "hkdf-sha-512",
                             kdf_capabilities,
                             hammer_infra::crypto::Sha2Algorithm::Sha512,
-                            execute_hkdf,
+                            KdfPrepared::execute,
                         ),
                 ),
         )?;
@@ -1832,14 +1974,18 @@ impl Engine {
         &mut self,
         registration: Registration<F>,
     ) -> Result<(), RegistryError> {
-        validate_registration(self, &registration)?;
+        self.validate_registration(&registration)?;
         F::registry_mut(self).publish(registration);
         Ok(())
     }
 
     /// Resolves a canonical name to a family-typed process-local identity.
     pub fn algorithm<F: Family>(&self, name: &str) -> Option<AlgorithmId<F>> {
-        F::registry(self).algorithm(name)
+        F::registry(self)
+            .algorithm_names
+            .get(name)
+            .copied()
+            .map(AlgorithmId::new)
     }
 
     /// Replaces the immutable policy used for subsequent Context creation.
@@ -1976,7 +2122,7 @@ impl Engine {
         let entry = keys
             .get_mut(key.index)
             .ok_or(ContextError::StaleKey { key })?;
-        if !entry.policy.permits(algorithm) {
+        if !entry.policy.applies_to(PolicyAlgorithm::new(algorithm)) {
             return Err(ContextError::AlgorithmDenied {
                 key,
                 algorithm: algorithm.slot,
@@ -2016,17 +2162,6 @@ impl Engine {
             }),
             thread_bound: PhantomData,
         })
-    }
-
-    fn algorithm_name_exists(&self, name: &str) -> bool {
-        self.aeads.algorithm_names.contains_key(name)
-            || self.ciphers.algorithm_names.contains_key(name)
-            || self.hashes.algorithm_names.contains_key(name)
-            || self.macs.algorithm_names.contains_key(name)
-            || self.kdfs.algorithm_names.contains_key(name)
-            || self.key_exchanges.algorithm_names.contains_key(name)
-            || self.signers.algorithm_names.contains_key(name)
-            || self.verifiers.algorithm_names.contains_key(name)
     }
 
     fn implementation_name_exists(&self, name: &str) -> bool {
@@ -2075,65 +2210,18 @@ impl<F: Family> Context<F> {
     pub fn implementation_name(&self) -> &str {
         &self.implementation
     }
-}
-
-impl Context<Hash> {
-    /// Executes all operations synchronously through one batch dispatch.
-    pub fn execute(&mut self, batch: &mut Batch<'_, '_, Hash>) {
-        (self.dispatch)(&mut self.prepared, batch.operations);
-    }
 
     /// Returns the algorithm permanently bound to this Context.
-    pub fn algorithm(&self) -> AlgorithmId<Hash> {
+    pub fn algorithm(&self) -> AlgorithmId<F> {
         self.algorithm
     }
-}
 
-impl Context<Aead> {
     /// Executes all operations synchronously through one batch dispatch.
-    pub fn execute(&mut self, batch: &mut Batch<'_, '_, Aead>) {
+    pub fn execute<'data>(&mut self, batch: &mut Batch<'_, 'data, F>)
+    where
+        F::Dispatch: Fn(&mut F::Prepared, &mut [F::Operation<'data>]),
+    {
         (self.dispatch)(&mut self.prepared, batch.operations);
-    }
-
-    /// Returns the algorithm permanently bound to this Context.
-    pub fn algorithm(&self) -> AlgorithmId<Aead> {
-        self.algorithm
-    }
-}
-
-impl Context<Mac> {
-    /// Executes all operations synchronously through one batch dispatch.
-    pub fn execute(&mut self, batch: &mut Batch<'_, '_, Mac>) {
-        (self.dispatch)(&mut self.prepared, batch.operations);
-    }
-
-    /// Returns the algorithm permanently bound to this Context.
-    pub fn algorithm(&self) -> AlgorithmId<Mac> {
-        self.algorithm
-    }
-}
-
-impl Context<Kdf> {
-    /// Executes all operations synchronously through one batch dispatch.
-    pub fn execute(&mut self, batch: &mut Batch<'_, '_, Kdf>) {
-        (self.dispatch)(&mut self.prepared, batch.operations);
-    }
-
-    /// Returns the algorithm permanently bound to this Context.
-    pub fn algorithm(&self) -> AlgorithmId<Kdf> {
-        self.algorithm
-    }
-}
-
-impl Context<Kx> {
-    /// Executes all operations synchronously through one batch dispatch.
-    pub fn execute(&mut self, batch: &mut Batch<'_, '_, Kx>) {
-        (self.dispatch)(&mut self.prepared, batch.operations);
-    }
-
-    /// Returns the algorithm permanently bound to this Context.
-    pub fn algorithm(&self) -> AlgorithmId<Kx> {
-        self.algorithm
     }
 }
 
@@ -2330,81 +2418,82 @@ pub enum KeyError {
     },
 }
 
-fn validate_registration<F: Family>(
-    engine: &Engine,
-    registration: &Registration<F>,
-) -> Result<(), RegistryError> {
-    let registry = F::registry(engine);
-    if registry
-        .algorithms
-        .len()
-        .checked_add(registration.algorithms.len())
-        .is_none_or(|len| u32::try_from(len.saturating_sub(1)).is_err())
-    {
-        return Err(RegistryError::AlgorithmCapacityExhausted);
-    }
-
-    let mut algorithms = HashMap::new();
-    for algorithm in &registration.algorithms {
-        validate_algorithm_name(&algorithm.name)?;
-        if engine.algorithm_name_exists(&algorithm.name)
-            || algorithms
-                .insert(algorithm.name.as_str(), algorithm.required)
-                .is_some()
+impl Engine {
+    fn validate_registration<F: Family>(
+        &self,
+        registration: &Registration<F>,
+    ) -> Result<(), RegistryError> {
+        let registry = F::registry(self);
+        if registry
+            .algorithms
+            .len()
+            .checked_add(registration.algorithms.len())
+            .is_none_or(|len| u32::try_from(len.saturating_sub(1)).is_err())
         {
-            return Err(RegistryError::AlgorithmCollision {
-                name: algorithm.name.clone(),
-            });
+            return Err(RegistryError::AlgorithmCapacityExhausted);
         }
-    }
 
-    let mut implementations = BTreeSet::new();
-    for implementation in &registration.implementations {
-        validate_implementation_name(&implementation.name)?;
-        if engine.implementation_name_exists(&implementation.name)
-            || !implementations.insert(implementation.name.as_str())
-        {
-            return Err(RegistryError::ImplementationCollision {
-                name: implementation.name.clone(),
-            });
-        }
-        if implementation.algorithms.is_empty() {
-            return Err(RegistryError::ImplementationWithoutAlgorithms {
-                name: implementation.name.clone(),
-            });
-        }
-        let mut implementation_algorithms = BTreeSet::new();
-        for functions in &implementation.algorithms {
-            if !implementation_algorithms.insert(functions.name.as_str()) {
-                return Err(RegistryError::ImplementationAlgorithmCollision {
-                    implementation: implementation.name.clone(),
-                    algorithm: functions.name.clone(),
-                });
-            }
-            let required = algorithms
-                .get(functions.name.as_str())
-                .copied()
-                .or_else(|| {
-                    registry
-                        .algorithm(&functions.name)
-                        .and_then(|algorithm| registry.algorithm_record(algorithm))
-                        .map(|algorithm| algorithm.required)
-                });
-            let required = required.ok_or_else(|| RegistryError::UnknownAlgorithm {
-                implementation: implementation.name.clone(),
-                algorithm: functions.name.clone(),
-            })?;
-            if !functions.capabilities.contains(required) {
-                return Err(RegistryError::CapabilityMismatch {
-                    implementation: implementation.name.clone(),
-                    algorithm: functions.name.clone(),
-                    required,
-                    provided: functions.capabilities,
+        let mut algorithms = HashMap::new();
+        for algorithm in &registration.algorithms {
+            validate_algorithm_name(&algorithm.name)?;
+            if registry.algorithm_names.contains_key(&algorithm.name)
+                || algorithms
+                    .insert(algorithm.name.as_str(), algorithm.required)
+                    .is_some()
+            {
+                return Err(RegistryError::AlgorithmCollision {
+                    name: algorithm.name.clone(),
                 });
             }
         }
+
+        let mut implementations = BTreeSet::new();
+        for implementation in &registration.implementations {
+            validate_implementation_name(&implementation.name)?;
+            if self.implementation_name_exists(&implementation.name)
+                || !implementations.insert(implementation.name.as_str())
+            {
+                return Err(RegistryError::ImplementationCollision {
+                    name: implementation.name.clone(),
+                });
+            }
+            if implementation.algorithms.is_empty() {
+                return Err(RegistryError::ImplementationWithoutAlgorithms {
+                    name: implementation.name.clone(),
+                });
+            }
+            let mut implementation_algorithms = BTreeSet::new();
+            for functions in &implementation.algorithms {
+                if !implementation_algorithms.insert(functions.name.as_str()) {
+                    return Err(RegistryError::ImplementationAlgorithmCollision {
+                        implementation: implementation.name.clone(),
+                        algorithm: functions.name.clone(),
+                    });
+                }
+                let required = algorithms
+                    .get(functions.name.as_str())
+                    .copied()
+                    .or_else(|| {
+                        self.algorithm::<F>(&functions.name)
+                            .and_then(|algorithm| registry.algorithms.get(algorithm.slot as usize))
+                            .copied()
+                    });
+                let required = required.ok_or_else(|| RegistryError::UnknownAlgorithm {
+                    implementation: implementation.name.clone(),
+                    algorithm: functions.name.clone(),
+                })?;
+                if !functions.capabilities.contains(required) {
+                    return Err(RegistryError::CapabilityMismatch {
+                        implementation: implementation.name.clone(),
+                        algorithm: functions.name.clone(),
+                        required,
+                        provided: functions.capabilities,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 fn validate_algorithm_name(name: &str) -> Result<(), RegistryError> {
@@ -2447,156 +2536,6 @@ fn valid_name_component(name: &str) -> bool {
         && !name.contains("--")
 }
 
-fn prepare_aes128_gcm(
-    key: KeyHandle,
-    material: &[u8],
-    operations: KeyOperations,
-) -> Result<AeadPrepared, ContextError> {
-    AeadPrepared::new(
-        hammer_infra::crypto::AeadAlgorithm::Aes128Gcm,
-        key,
-        material,
-        operations,
-    )
-}
-
-fn prepare_aes256_gcm(
-    key: KeyHandle,
-    material: &[u8],
-    operations: KeyOperations,
-) -> Result<AeadPrepared, ContextError> {
-    AeadPrepared::new(
-        hammer_infra::crypto::AeadAlgorithm::Aes256Gcm,
-        key,
-        material,
-        operations,
-    )
-}
-
-fn prepare_chacha20_poly1305(
-    key: KeyHandle,
-    material: &[u8],
-    operations: KeyOperations,
-) -> Result<AeadPrepared, ContextError> {
-    AeadPrepared::new(
-        hammer_infra::crypto::AeadAlgorithm::ChaCha20Poly1305,
-        key,
-        material,
-        operations,
-    )
-}
-
-fn prepare_hmac_sha256(material: &[u8]) -> MacPrepared {
-    MacPrepared::new(hammer_infra::crypto::Sha2Algorithm::Sha256, material)
-}
-
-fn prepare_hmac_sha384(material: &[u8]) -> MacPrepared {
-    MacPrepared::new(hammer_infra::crypto::Sha2Algorithm::Sha384, material)
-}
-
-fn prepare_hmac_sha512(material: &[u8]) -> MacPrepared {
-    MacPrepared::new(hammer_infra::crypto::Sha2Algorithm::Sha512, material)
-}
-
-fn execute_hash(
-    algorithm: hammer_infra::crypto::HashAlgorithm,
-    operations: &mut [HashOperation<'_>],
-) {
-    for operation in operations {
-        let result = operation
-            .input
-            .with_fragments(|input| hammer_infra::crypto::hash(algorithm, input, operation.output));
-        operation.status = match result {
-            Ok(written) => HashStatus::Complete { written },
-            Err(hammer_infra::crypto::HashError::OutputTooSmall { required, provided }) => {
-                HashStatus::OutputTooSmall { required, provided }
-            }
-        };
-    }
-}
-
-fn execute_sha256(_: &mut (), operations: &mut [HashOperation<'_>]) {
-    execute_hash(hammer_infra::crypto::HashAlgorithm::Sha256, operations);
-}
-
-fn execute_sha384(_: &mut (), operations: &mut [HashOperation<'_>]) {
-    execute_hash(hammer_infra::crypto::HashAlgorithm::Sha384, operations);
-}
-
-fn execute_sha512(_: &mut (), operations: &mut [HashOperation<'_>]) {
-    execute_hash(hammer_infra::crypto::HashAlgorithm::Sha512, operations);
-}
-
-fn execute_blake2s(_: &mut (), operations: &mut [HashOperation<'_>]) {
-    execute_hash(hammer_infra::crypto::HashAlgorithm::Blake2s, operations);
-}
-
-fn execute_blake2b(_: &mut (), operations: &mut [HashOperation<'_>]) {
-    execute_hash(hammer_infra::crypto::HashAlgorithm::Blake2b, operations);
-}
-
-fn execute_hmac(prepared: &mut MacPrepared, operations: &mut [MacOperation<'_>]) {
-    for operation in operations {
-        let result = operation
-            .input
-            .with_fragments(|input| prepared.mac.authenticate(input, operation.output));
-        operation.status = match result {
-            Ok(written) => MacStatus::Complete { written },
-            Err(hammer_infra::crypto::MacError::OutputTooSmall { required, provided }) => {
-                MacStatus::OutputTooSmall { required, provided }
-            }
-        };
-    }
-}
-
-fn execute_hkdf(prepared: &mut KdfPrepared, operations: &mut [KdfOperation<'_>]) {
-    for operation in operations {
-        let Some(policy) = prepared.policy.derived_policy(operation.target) else {
-            operation.status = KdfStatus::DerivationDenied;
-            continue;
-        };
-        let maximum = 255 * prepared.algorithm.output_len();
-        if operation.length > maximum {
-            operation.status = KdfStatus::OutputTooLong {
-                requested: operation.length,
-                maximum,
-            };
-            continue;
-        }
-
-        let mut material = Zeroizing::new(vec![0; operation.length]);
-        let hkdf =
-            hammer_infra::crypto::Hkdf::new(prepared.algorithm, operation.salt, &prepared.material);
-        let result = operation
-            .info
-            .with_fragments(|info| hkdf.expand(info, operation.length, &mut material));
-        match result {
-            Ok(_) => {}
-            Err(hammer_infra::crypto::KdfError::OutputTooLong { requested, maximum }) => {
-                operation.status = KdfStatus::OutputTooLong { requested, maximum };
-                continue;
-            }
-            Err(hammer_infra::crypto::KdfError::OutputTooSmall { .. }) => {
-                unreachable!("HKDF output storage has the exact requested length")
-            }
-        }
-
-        let mut keys = prepared.keys.borrow_mut();
-        let capacity = keys.capacity();
-        let Some(index) = keys.insert(KeyEntry {
-            material,
-            policy,
-            contexts: 0,
-        }) else {
-            operation.status = KdfStatus::KeyPoolFull { capacity };
-            continue;
-        };
-        operation.status = KdfStatus::Complete {
-            key: KeyHandle { index },
-        };
-    }
-}
-
 fn kx_status(error: hammer_infra::crypto::KeyEstablishmentError) -> KxStatus {
     match error {
         hammer_infra::crypto::KeyEstablishmentError::InvalidEntropyLength { .. } => {
@@ -2635,62 +2574,6 @@ fn kx_status(error: hammer_infra::crypto::KeyEstablishmentError) -> KxStatus {
         hammer_infra::crypto::KeyEstablishmentError::OperationUnsupported { .. } => {
             KxStatus::OperationUnsupported
         }
-    }
-}
-
-fn execute_aead(prepared: &mut AeadPrepared, operations: &mut [AeadOperation<'_>]) {
-    for operation in operations {
-        let required = match operation.direction {
-            AeadDirection::Seal => KeyOperations::AEAD_SEAL,
-            AeadDirection::Open => KeyOperations::AEAD_OPEN,
-        };
-        if !prepared.operations.contains(required) {
-            operation.status = AeadStatus::PolicyDenied {
-                operation: operation.direction,
-            };
-            continue;
-        }
-
-        let result = match (
-            operation.direction,
-            &mut operation.payload,
-            &mut operation.tag,
-        ) {
-            (
-                AeadDirection::Seal,
-                AeadPayload::OutOfPlace { input, output },
-                AeadTag::Output(tag),
-            ) => (*input).with_fragments(|fragments| {
-                prepared.cipher.seal(
-                    fragments,
-                    operation.nonce,
-                    operation.associated_data,
-                    output,
-                    tag,
-                )
-            }),
-            (
-                AeadDirection::Open,
-                AeadPayload::OutOfPlace { input, output },
-                AeadTag::Input(tag),
-            ) => (*input).with_fragments(|fragments| {
-                prepared.cipher.open(
-                    fragments,
-                    operation.nonce,
-                    operation.associated_data,
-                    tag,
-                    output,
-                )
-            }),
-            (AeadDirection::Seal, AeadPayload::InPlace(payload), AeadTag::Output(tag)) => prepared
-                .cipher
-                .seal_in_place(payload, operation.nonce, operation.associated_data, tag),
-            (AeadDirection::Open, AeadPayload::InPlace(payload), AeadTag::Input(tag)) => prepared
-                .cipher
-                .open_in_place(payload, operation.nonce, operation.associated_data, tag),
-            _ => unreachable!("AEAD constructors preserve direction, payload, and tag shape"),
-        };
-        operation.status = aead_status(result);
     }
 }
 

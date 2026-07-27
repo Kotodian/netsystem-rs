@@ -68,7 +68,7 @@ fn nist_curve_key_agreement_is_symmetric_for_canonical_public_keys() {
 #[test]
 fn ml_kem_768_deterministic_keypair_encapsulation_and_decapsulation_round_trip() {
     let algorithm = KeyEstablishmentAlgorithm::MlKem768;
-    let key_entropy: Vec<u8> = (0..algorithm.key_generation_entropy_len())
+    let key_entropy: Vec<u8> = (0..algorithm.private_key_len())
         .map(|value| value as u8)
         .collect();
     let encapsulation_entropy = [0x5a; 32];
