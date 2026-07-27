@@ -27,6 +27,7 @@ rsa = { workspace = true }
 serde = { workspace = true }
 serde_with = { workspace = true }
 sha2 = { workspace = true }
+sha2-accelerated = { workspace = true }
 spinning_top = { workspace = true }
 talc = { workspace = true }
 x25519-dalek = { workspace = true }

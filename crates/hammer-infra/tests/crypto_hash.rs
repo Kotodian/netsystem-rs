@@ -9,7 +9,7 @@ const SHA256_ABC: [u8; 32] = [
 fn sha256_writes_the_known_digest_to_caller_memory() {
     let mut output = [0; 32];
 
-    Sha256::default()
+    Sha256
         .digest(&[b"abc"], &mut output)
         .expect("SHA-256 output has the required capacity");
 
@@ -20,7 +20,7 @@ fn sha256_writes_the_known_digest_to_caller_memory() {
 fn sha256_hashes_scatter_gather_input_without_joining_it() {
     let mut output = [0; 32];
 
-    Sha256::default()
+    Sha256
         .digest(&[b"a", b"b", b"c"], &mut output)
         .expect("SHA-256 output has the required capacity");
 
@@ -31,7 +31,7 @@ fn sha256_hashes_scatter_gather_input_without_joining_it() {
 fn sha256_rejects_insufficient_caller_output() {
     let mut output = [0; 31];
 
-    let error = Sha256::default()
+    let error = Sha256
         .digest(&[b"abc"], &mut output)
         .expect_err("output is one byte too short");
 

@@ -37,28 +37,6 @@ pub trait Algorithm: Default + fmt::Debug + 'static {
 
     /// Computes a digest over ordered fragments into caller-owned output.
     fn digest(&self, input: &[&[u8]], output: &mut [u8]) -> Result<usize, Error>;
-
-    /// Computes a digest in a function compiled for x86 SHA instructions.
-    ///
-    /// # Safety
-    ///
-    /// The current CPU must support the `sha` target feature.
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "sha")]
-    unsafe fn digest_sha_ni(&self, input: &[&[u8]], output: &mut [u8]) -> Result<usize, Error> {
-        self.digest(input, output)
-    }
-
-    /// Computes a digest in a function compiled for Armv8 SHA-2 instructions.
-    ///
-    /// # Safety
-    ///
-    /// The current CPU must support the `sha2` target feature.
-    #[cfg(target_arch = "aarch64")]
-    #[target_feature(enable = "sha2")]
-    unsafe fn digest_sha2_armv8(&self, input: &[&[u8]], output: &mut [u8]) -> Result<usize, Error> {
-        self.digest(input, output)
-    }
 }
 
 /// Digest semantics shared by algorithms implemented through the Rust digest traits.
@@ -112,8 +90,39 @@ where
     }
 }
 
-/// SHA-256.
-pub type Sha256 = Digest<sha2::Sha256, 32>;
+/// SHA-256 with separate portable and instruction-selected execution methods.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Sha256;
+
+impl Algorithm for Sha256 {
+    const OUTPUT_LEN: usize = 32;
+
+    fn digest(&self, input: &[&[u8]], output: &mut [u8]) -> Result<usize, Error> {
+        Digest::<sha2::Sha256, 32>::default().digest(input, output)
+    }
+}
+
+impl Sha256 {
+    /// Computes SHA-256 through the architecture-selected SHA-2 instruction backend.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+    pub fn digest_sha2(&self, input: &[&[u8]], output: &mut [u8]) -> Result<usize, Error> {
+        const OUTPUT_LEN: usize = 32;
+        if output.len() < OUTPUT_LEN {
+            return Err(Error::OutputTooSmall {
+                required: OUTPUT_LEN,
+                provided: output.len(),
+            });
+        }
+        use sha2_accelerated::Digest as _;
+        let mut digest = sha2_accelerated::Sha256::new();
+        for fragment in input {
+            digest.update(fragment);
+        }
+        output[..OUTPUT_LEN].copy_from_slice(&digest.finalize());
+        Ok(OUTPUT_LEN)
+    }
+}
+
 /// SHA-384.
 pub type Sha384 = Digest<sha2::Sha384, 48>;
 /// SHA-512.

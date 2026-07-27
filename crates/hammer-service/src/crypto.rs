@@ -14,6 +14,7 @@ use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
+use hammer_component_macros::{Aead, Cipher, Kdf, Kx, Mac, Sign, Verify};
 use hammer_infra::crypto::InstructionSet;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use zeroize::Zeroizing;
@@ -151,14 +152,8 @@ impl HashPrepared {
         Ok(())
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    fn execute_sha_ni<A>(
-        &mut self,
-        operations: &mut [HashOperation<'_>],
-    ) -> Result<(), ContextError>
-    where
-        A: hammer_infra::crypto::hash::Algorithm,
-    {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+    fn execute_sha2(&mut self, operations: &mut [HashOperation<'_>]) -> Result<(), ContextError> {
         let available = InstructionSet::detect();
         if !available.contains(InstructionSet::SHA2) {
             return Err(ContextError::InstructionsUnavailable {
@@ -166,68 +161,20 @@ impl HashPrepared {
                 available,
             });
         }
-        // SAFETY: SHA-NI support was detected on this CPU immediately above.
-        unsafe { self.execute_sha_ni_unchecked::<A>(operations) }
-    }
-
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "sha")]
-    unsafe fn execute_sha_ni_unchecked<A>(
-        &mut self,
-        operations: &mut [HashOperation<'_>],
-    ) -> Result<(), ContextError>
-    where
-        A: hammer_infra::crypto::hash::Algorithm,
-    {
+        let algorithm = hammer_infra::crypto::hash::Sha256;
         for operation in operations {
-            operation.result = Some(operation.input.with_fragments(|input| {
-                // SAFETY: the safe batch entry point detects SHA-NI before calling this method.
-                unsafe { A::default().digest_sha_ni(input, operation.output) }
-            }));
-        }
-        Ok(())
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    fn execute_sha2_armv8<A>(
-        &mut self,
-        operations: &mut [HashOperation<'_>],
-    ) -> Result<(), ContextError>
-    where
-        A: hammer_infra::crypto::hash::Algorithm,
-    {
-        let available = InstructionSet::detect();
-        if !available.contains(InstructionSet::SHA2) {
-            return Err(ContextError::InstructionsUnavailable {
-                required: InstructionSet::SHA2,
-                available,
-            });
-        }
-        // SAFETY: Armv8 SHA-2 support was detected on this CPU immediately above.
-        unsafe { self.execute_sha2_armv8_unchecked::<A>(operations) }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[target_feature(enable = "sha2")]
-    unsafe fn execute_sha2_armv8_unchecked<A>(
-        &mut self,
-        operations: &mut [HashOperation<'_>],
-    ) -> Result<(), ContextError>
-    where
-        A: hammer_infra::crypto::hash::Algorithm,
-    {
-        for operation in operations {
-            operation.result = Some(operation.input.with_fragments(|input| {
-                // SAFETY: the safe batch entry point detects Armv8 SHA-2 before calling this method.
-                unsafe { A::default().digest_sha2_armv8(input, operation.output) }
-            }));
+            operation.result = Some(
+                operation
+                    .input
+                    .with_fragments(|input| algorithm.digest_sha2(input, operation.output)),
+            );
         }
         Ok(())
     }
 }
 
 /// The authenticated-encryption operation family.
-#[hammer_component_macros::Aead]
+#[Aead]
 #[derive(Debug)]
 pub struct Aead;
 
@@ -270,55 +217,52 @@ impl AeadPrepared {
         let cipher =
             A::new(&self.key).expect("AEAD key length was validated while preparing the Context");
         for operation in operations {
-            let required = match operation.direction {
-                AeadDirection::Seal => KeyOperations::AEAD_SEAL,
-                AeadDirection::Open => KeyOperations::AEAD_OPEN,
+            let (direction, required) = match &operation.request {
+                AeadRequest::Seal { .. } | AeadRequest::SealInPlace { .. } => {
+                    (AeadDirection::Seal, KeyOperations::AEAD_SEAL)
+                }
+                AeadRequest::Open { .. } | AeadRequest::OpenInPlace { .. } => {
+                    (AeadDirection::Open, KeyOperations::AEAD_OPEN)
+                }
             };
             if !self.operations.contains(required) {
                 operation.status = AeadStatus::PolicyDenied {
-                    operation: operation.direction,
+                    operation: direction,
                 };
                 continue;
             }
 
-            let result = match (
-                operation.direction,
-                &mut operation.payload,
-                &mut operation.tag,
-            ) {
-                (
-                    AeadDirection::Seal,
-                    AeadPayload::OutOfPlace { input, output },
-                    AeadTag::Output(tag),
-                ) => (*input).with_fragments(|fragments| {
-                    cipher.seal(
-                        fragments,
-                        operation.nonce,
-                        operation.associated_data,
-                        output,
-                        tag,
-                    )
+            let result = match &mut operation.request {
+                AeadRequest::Seal {
+                    input,
+                    nonce,
+                    associated_data,
+                    output,
+                    tag,
+                } => (*input).with_fragments(|fragments| {
+                    cipher.seal(fragments, nonce, associated_data, output, tag)
                 }),
-                (
-                    AeadDirection::Open,
-                    AeadPayload::OutOfPlace { input, output },
-                    AeadTag::Input(tag),
-                ) => (*input).with_fragments(|fragments| {
-                    cipher.open(
-                        fragments,
-                        operation.nonce,
-                        operation.associated_data,
-                        tag,
-                        output,
-                    )
+                AeadRequest::Open {
+                    input,
+                    nonce,
+                    associated_data,
+                    tag,
+                    output,
+                } => (*input).with_fragments(|fragments| {
+                    cipher.open(fragments, nonce, associated_data, tag, output)
                 }),
-                (AeadDirection::Seal, AeadPayload::InPlace(payload), AeadTag::Output(tag)) => {
-                    cipher.seal_in_place(payload, operation.nonce, operation.associated_data, tag)
-                }
-                (AeadDirection::Open, AeadPayload::InPlace(payload), AeadTag::Input(tag)) => {
-                    cipher.open_in_place(payload, operation.nonce, operation.associated_data, tag)
-                }
-                _ => unreachable!("AEAD constructors preserve direction, payload, and tag shape"),
+                AeadRequest::SealInPlace {
+                    payload,
+                    nonce,
+                    associated_data,
+                    tag,
+                } => cipher.seal_in_place(payload, nonce, associated_data, tag),
+                AeadRequest::OpenInPlace {
+                    payload,
+                    nonce,
+                    associated_data,
+                    tag,
+                } => cipher.open_in_place(payload, nonce, associated_data, tag),
             };
             operation.status = AeadStatus::Executed(result);
         }
@@ -327,7 +271,7 @@ impl AeadPrepared {
 }
 
 /// The message-authentication operation family.
-#[hammer_component_macros::Mac]
+#[Mac]
 #[derive(Debug)]
 pub struct Mac;
 
@@ -356,7 +300,7 @@ impl MacPrepared {
 }
 
 /// The key-derivation operation family.
-#[hammer_component_macros::Kdf]
+#[Kdf]
 #[derive(Debug)]
 pub struct Kdf;
 
@@ -416,7 +360,7 @@ impl KdfPrepared {
 }
 
 /// The key-establishment operation family.
-#[hammer_component_macros::Kx]
+#[Kx]
 #[derive(Debug)]
 pub struct Kx;
 
@@ -690,7 +634,7 @@ impl KxPrepared {
 }
 
 /// The digital-signing operation family.
-#[hammer_component_macros::Sign]
+#[Sign]
 #[derive(Debug)]
 pub struct Sign;
 
@@ -729,7 +673,7 @@ impl SignPrepared {
 }
 
 /// The digital-signature verification operation family.
-#[hammer_component_macros::Verify]
+#[Verify]
 #[derive(Debug)]
 pub struct Verify;
 
@@ -753,7 +697,7 @@ impl VerifyPrepared {
 }
 
 /// The unauthenticated-cipher operation family.
-#[hammer_component_macros::Cipher]
+#[Cipher]
 #[derive(Debug)]
 pub struct Cipher;
 
@@ -1780,28 +1724,39 @@ pub enum AeadStatus {
 }
 
 #[derive(Debug)]
-enum AeadPayload<'a> {
-    OutOfPlace {
+enum AeadRequest<'a> {
+    Seal {
         input: Input<'a>,
+        nonce: &'a [u8],
+        associated_data: &'a [u8],
+        output: &'a mut [u8],
+        tag: &'a mut [u8],
+    },
+    Open {
+        input: Input<'a>,
+        nonce: &'a [u8],
+        associated_data: &'a [u8],
+        tag: &'a [u8],
         output: &'a mut [u8],
     },
-    InPlace(&'a mut [u8]),
-}
-
-#[derive(Debug)]
-enum AeadTag<'a> {
-    Input(&'a [u8]),
-    Output(&'a mut [u8]),
+    SealInPlace {
+        payload: &'a mut [u8],
+        nonce: &'a [u8],
+        associated_data: &'a [u8],
+        tag: &'a mut [u8],
+    },
+    OpenInPlace {
+        payload: &'a mut [u8],
+        nonce: &'a [u8],
+        associated_data: &'a [u8],
+        tag: &'a [u8],
+    },
 }
 
 /// One synchronous authenticated-encryption request.
 #[derive(Debug)]
 pub struct AeadOperation<'a> {
-    direction: AeadDirection,
-    nonce: &'a [u8],
-    associated_data: &'a [u8],
-    payload: AeadPayload<'a>,
-    tag: AeadTag<'a>,
+    request: AeadRequest<'a>,
     status: AeadStatus,
 }
 
@@ -1815,11 +1770,13 @@ impl<'a> AeadOperation<'a> {
         tag: &'a mut [u8],
     ) -> Self {
         Self {
-            direction: AeadDirection::Seal,
-            nonce,
-            associated_data,
-            payload: AeadPayload::OutOfPlace { input, output },
-            tag: AeadTag::Output(tag),
+            request: AeadRequest::Seal {
+                input,
+                nonce,
+                associated_data,
+                output,
+                tag,
+            },
             status: AeadStatus::Pending,
         }
     }
@@ -1833,11 +1790,13 @@ impl<'a> AeadOperation<'a> {
         output: &'a mut [u8],
     ) -> Self {
         Self {
-            direction: AeadDirection::Open,
-            nonce,
-            associated_data,
-            payload: AeadPayload::OutOfPlace { input, output },
-            tag: AeadTag::Input(tag),
+            request: AeadRequest::Open {
+                input,
+                nonce,
+                associated_data,
+                tag,
+                output,
+            },
             status: AeadStatus::Pending,
         }
     }
@@ -1850,11 +1809,12 @@ impl<'a> AeadOperation<'a> {
         tag: &'a mut [u8],
     ) -> Self {
         Self {
-            direction: AeadDirection::Seal,
-            nonce,
-            associated_data,
-            payload: AeadPayload::InPlace(payload),
-            tag: AeadTag::Output(tag),
+            request: AeadRequest::SealInPlace {
+                payload,
+                nonce,
+                associated_data,
+                tag,
+            },
             status: AeadStatus::Pending,
         }
     }
@@ -1867,11 +1827,12 @@ impl<'a> AeadOperation<'a> {
         tag: &'a [u8],
     ) -> Self {
         Self {
-            direction: AeadDirection::Open,
-            nonce,
-            associated_data,
-            payload: AeadPayload::InPlace(payload),
-            tag: AeadTag::Input(tag),
+            request: AeadRequest::OpenInPlace {
+                payload,
+                nonce,
+                associated_data,
+                tag,
+            },
             status: AeadStatus::Pending,
         }
     }
@@ -2160,23 +2121,13 @@ impl Engine {
         let hash_registration = hash_registration.with_implementation(
             ImplementationRegistration::<Hash>::new("hammer:sha-256-sha-ni", 100, true)
                 .with_instruction_set(InstructionSet::SHA2)
-                .with_algorithm(
-                    "sha-256",
-                    hash_capabilities,
-                    (),
-                    HashPrepared::execute_sha_ni::<hammer_infra::crypto::hash::Sha256>,
-                ),
+                .with_algorithm("sha-256", hash_capabilities, (), HashPrepared::execute_sha2),
         );
         #[cfg(target_arch = "aarch64")]
         let hash_registration = hash_registration.with_implementation(
             ImplementationRegistration::<Hash>::new("hammer:sha-256-armv8", 100, true)
                 .with_instruction_set(InstructionSet::SHA2)
-                .with_algorithm(
-                    "sha-256",
-                    hash_capabilities,
-                    (),
-                    HashPrepared::execute_sha2_armv8::<hammer_infra::crypto::hash::Sha256>,
-                ),
+                .with_algorithm("sha-256", hash_capabilities, (), HashPrepared::execute_sha2),
         );
         engine.publish(hash_registration)?;
         engine.publish(
@@ -3025,6 +2976,15 @@ impl Engine {
         registration: &Registration<F>,
     ) -> Result<(), RegistryError> {
         let registry = F::registry(self);
+        let valid_name_component = |name: &str| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                && !name.starts_with('-')
+                && !name.ends_with('-')
+                && !name.contains("--")
+        };
         if registry
             .algorithms
             .len()
@@ -3159,14 +3119,4 @@ impl Engine {
         }
         Ok(())
     }
-}
-
-fn valid_name_component(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        && !name.starts_with('-')
-        && !name.ends_with('-')
-        && !name.contains("--")
 }
