@@ -23,6 +23,7 @@ nom = { workspace = true }
 etherparse = { workspace = true }
 tokio = { workspace = true, features = ["signal"] }
 tracing = { workspace = true }
+zeroize = { workspace = true }
 smoltcp = { workspace = true }
 thiserror = { workspace = true }
 linkme = { workspace = true }

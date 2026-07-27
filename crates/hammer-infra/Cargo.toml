@@ -9,6 +9,7 @@ name = "hammer_infra"
 crate-type = ["dylib", "rlib"]
 
 [dependencies]
+aes-gcm = { workspace = true }
 crossbeam-utils = { workspace = true }
 byte-unit = { workspace = true }
 libc = { workspace = true }
