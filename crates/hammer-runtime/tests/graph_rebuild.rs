@@ -26,7 +26,7 @@ fn noop_process(
     NodeResult::drop()
 }
 
-fn init_named(name: &'static str) -> fn(&DataPlaneRuntime, usize) -> RuntimeResult<NodeId> {
+fn init_named(name: &'static str) -> fn(&DataPlaneRuntime) -> RuntimeResult<NodeId> {
     match name {
         "alpha" => init_alpha,
         "beta" => init_beta,
@@ -35,7 +35,7 @@ fn init_named(name: &'static str) -> fn(&DataPlaneRuntime, usize) -> RuntimeResu
     }
 }
 
-fn init_alpha(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
+fn init_alpha(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_descriptor(
         NodeKind::Internal,
         NodeDescriptor::new(
@@ -48,7 +48,7 @@ fn init_alpha(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
     )
 }
 
-fn init_beta(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
+fn init_beta(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_descriptor(
         NodeKind::Internal,
         NodeDescriptor::new(
@@ -61,7 +61,7 @@ fn init_beta(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
     )
 }
 
-fn init_gamma(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
+fn init_gamma(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_descriptor(
         NodeKind::Internal,
         NodeDescriptor::new(
@@ -86,7 +86,7 @@ fn entry(name: &'static str) -> NodeEntry {
 fn rebuild_graph_renumbers_nodes_and_invalidates_old_node_ids() {
     let runtime = test_runtime();
     runtime
-        .init_graph(0, &[entry("alpha"), entry("beta")])
+        .init_graph(&[entry("alpha"), entry("beta")])
         .expect("init");
     let old_alpha = runtime.node_by_name("alpha").expect("alpha");
     let old_beta = runtime.node_by_name("beta").expect("beta");
@@ -94,9 +94,7 @@ fn rebuild_graph_renumbers_nodes_and_invalidates_old_node_ids() {
     assert_eq!(old_beta.slot(), 1);
 
     // Shrink the graph so the previous high slot becomes out of range.
-    runtime
-        .rebuild_graph(0, &[entry("gamma")])
-        .expect("rebuild");
+    runtime.rebuild_graph(&[entry("gamma")]).expect("rebuild");
 
     assert!(
         runtime.nodes().node_name(old_beta).is_err(),
@@ -122,12 +120,12 @@ fn rebuild_graph_renumbers_nodes_and_invalidates_old_node_ids() {
 fn rebuild_graph_rebinds_surviving_nodes_by_name() {
     let runtime = test_runtime();
     runtime
-        .init_graph(0, &[entry("alpha"), entry("beta")])
+        .init_graph(&[entry("alpha"), entry("beta")])
         .expect("init");
     let old_beta = runtime.node_by_name("beta").expect("beta");
 
     runtime
-        .rebuild_graph(0, &[entry("beta"), entry("gamma")])
+        .rebuild_graph(&[entry("beta"), entry("gamma")])
         .expect("rebuild");
 
     let new_beta = runtime.node_by_name("beta").expect("beta rebound by name");
@@ -141,13 +139,11 @@ fn rebuild_graph_rebinds_surviving_nodes_by_name() {
 fn worker_runtime_after_rebuild_matches_main_topology() {
     let runtime = test_runtime();
     runtime
-        .init_graph(0, &[entry("alpha"), entry("beta")])
+        .init_graph(&[entry("alpha"), entry("beta")])
         .expect("init");
-    runtime
-        .rebuild_graph(0, &[entry("gamma")])
-        .expect("rebuild");
+    runtime.rebuild_graph(&[entry("gamma")]).expect("rebuild");
 
-    let worker = runtime.for_worker(1, 0);
+    let worker = runtime.for_worker(1, 0).expect("worker runtime fork");
     assert_eq!(
         worker.node_by_name("gamma").map(|id| id.slot()),
         runtime.node_by_name("gamma").map(|id| id.slot())

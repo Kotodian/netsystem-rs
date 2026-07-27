@@ -8,40 +8,52 @@ use crate::config::WorkerCpu;
 use crate::numa;
 
 impl Worker {
-    /// Apply this worker's platform thread setup before its dataplane loop runs.
-    pub(crate) fn apply_current_thread_setup(&self, index: usize) -> crate::RuntimeResult<()> {
-        #[cfg(target_os = "linux")]
-        {
-            apply_cpu_affinity(index, &self.cpu);
-            apply_scheduler(&self.scheduler);
-            if self.numa.enabled {
-                if let Some(node) = numa::current_numa_node() {
-                    numa::bind_current_thread_memory_to_numa(node)?;
-                }
-            }
-            let _ = index;
+    /// Apply this worker's platform thread setup before its dataplane loop runs
+    /// and return the NUMA node selected for its worker-local runtime view.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn apply_current_thread_setup(&self, index: usize) -> crate::RuntimeResult<u32> {
+        apply_cpu_affinity(index, &self.cpu)?;
+        apply_scheduler(&self.scheduler)?;
+        if self.numa.enabled {
+            let numa_node = numa::current_numa_node().ok_or_else(|| {
+                crate::RuntimeError::lifecycle(
+                    "probe data worker NUMA node",
+                    "getcpu did not return a NUMA node",
+                )
+            })?;
+            numa::bind_current_thread_memory_to_numa(numa_node)?;
+            Ok(numa_node)
+        } else {
+            Ok(numa::current_numa_node().unwrap_or(0))
         }
-        #[cfg(target_os = "macos")]
-        {
-            apply_qos(&self.scheduler);
-            let _ = index;
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            let _ = (self, index);
-        }
-        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn apply_current_thread_setup(&self, _: usize) -> crate::RuntimeResult<u32> {
+        apply_qos(&self.scheduler)?;
+        Ok(0)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn apply_current_thread_setup(&self, _: usize) -> crate::RuntimeResult<u32> {
+        Ok(0)
     }
 }
 
 #[cfg(target_os = "linux")]
-fn apply_cpu_affinity(index: usize, cpu: &WorkerCpu) {
+fn apply_cpu_affinity(index: usize, cpu: &WorkerCpu) -> crate::RuntimeResult<()> {
     use core_affinity::{CoreId, set_for_current};
 
     let core = worker_core(index, cpu);
-    if let Some(id) = core {
-        set_for_current(CoreId { id });
+    if let Some(id) = core
+        && !set_for_current(CoreId { id })
+    {
+        return Err(crate::RuntimeError::lifecycle(
+            "set data worker CPU affinity",
+            format!("failed to select CPU core {id}"),
+        ));
     }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -60,7 +72,7 @@ pub(crate) fn worker_core(index: usize, cpu: &WorkerCpu) -> Option<usize> {
 }
 
 #[cfg(target_os = "linux")]
-fn apply_scheduler(scheduler: &crate::config::WorkerScheduler) {
+fn apply_scheduler(scheduler: &crate::config::WorkerScheduler) -> crate::RuntimeResult<()> {
     use crate::config::SchedulerPolicy;
     use thread_priority::{
         NormalThreadSchedulePolicy, RealtimeThreadSchedulePolicy, ThreadPriority,
@@ -85,11 +97,13 @@ fn apply_scheduler(scheduler: &crate::config::WorkerScheduler) {
             .map(ThreadPriority::Crossplatform)
             .unwrap_or(ThreadPriority::Min),
     };
-    let _ = set_thread_priority_and_policy(thread_native_id(), priority, policy);
+    set_thread_priority_and_policy(thread_native_id(), priority, policy).map_err(|error| {
+        crate::RuntimeError::lifecycle("set data worker scheduler", error.to_string())
+    })
 }
 
 #[cfg(target_os = "macos")]
-fn apply_qos(scheduler: &crate::config::WorkerScheduler) {
+fn apply_qos(scheduler: &crate::config::WorkerScheduler) -> crate::RuntimeResult<()> {
     use crate::config::QosClass;
 
     let qos = match scheduler.qos {
@@ -99,8 +113,14 @@ fn apply_qos(scheduler: &crate::config::WorkerScheduler) {
         QosClass::Utility => libc::qos_class_t::QOS_CLASS_UTILITY,
         QosClass::Background => libc::qos_class_t::QOS_CLASS_BACKGROUND,
     };
-    unsafe {
-        libc::pthread_set_qos_class_self_np(qos, 0);
+    let result = unsafe { libc::pthread_set_qos_class_self_np(qos, 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(crate::RuntimeError::lifecycle(
+            "set data worker QoS",
+            std::io::Error::from_raw_os_error(result).to_string(),
+        ))
     }
 }
 

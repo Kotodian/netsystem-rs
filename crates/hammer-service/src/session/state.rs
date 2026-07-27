@@ -1,4 +1,14 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CreatedState<Index> {
+    index: Index,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PublishedState<Index> {
+    index: Index,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ActiveState<Index> {
     index: Index,
 }
@@ -20,6 +30,9 @@ pub(crate) struct ClosedState<Index> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionState<Index> {
+    Creating,
+    Created(CreatedState<Index>),
+    Published(PublishedState<Index>),
     Active(ActiveState<Index>),
     AppClosed(AppClosedState<Index>),
     TransportClosed(TransportClosedState<Index>),
@@ -29,13 +42,55 @@ pub(crate) enum SessionState<Index> {
 
 impl<Index: Copy + Eq> SessionState<Index> {
     #[inline]
-    pub(crate) const fn active(index: Index) -> Self {
-        Self::Active(ActiveState { index })
+    pub(crate) const fn creating() -> Self {
+        Self::Creating
+    }
+
+    #[inline]
+    pub(crate) const fn finish_creation(self, index: Index) -> Option<Self> {
+        match self {
+            Self::Creating => Some(Self::Created(CreatedState { index })),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn on_connection_published(self) -> Option<(Self, bool)> {
+        match self {
+            Self::Created(state) => {
+                Some((Self::Published(PublishedState { index: state.index }), true))
+            }
+            Self::Active(_) | Self::AppClosed(_) | Self::TransportClosed(_) | Self::Closed(_) => {
+                Some((self, false))
+            }
+            Self::Creating | Self::Published(_) | Self::TransportDeleted => None,
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn on_connected(self) -> Option<Self> {
+        match self {
+            Self::Published(state) => Some(Self::Active(ActiveState { index: state.index })),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn rollback_index(self) -> Result<Option<Index>, Self> {
+        match self {
+            Self::Creating => Ok(None),
+            Self::Created(state) => Ok(Some(state.index)),
+            Self::Published(state) => Ok(Some(state.index)),
+            _ => Err(self),
+        }
     }
 
     #[inline]
     pub(crate) const fn transport_index(self) -> Option<Index> {
         match self {
+            Self::Creating => None,
+            Self::Created(state) => Some(state.index),
+            Self::Published(state) => Some(state.index),
             Self::Active(state) => Some(state.index),
             Self::AppClosed(state) => Some(state.index),
             Self::TransportClosed(state) => Some(state.index),
@@ -56,7 +111,11 @@ impl<Index: Copy + Eq> SessionState<Index> {
                 false
             }
             Self::TransportDeleted => true,
-            Self::AppClosed(_) | Self::Closed(_) => false,
+            Self::Creating
+            | Self::Created(_)
+            | Self::Published(_)
+            | Self::AppClosed(_)
+            | Self::Closed(_) => false,
         }
     }
 
@@ -74,7 +133,12 @@ impl<Index: Copy + Eq> SessionState<Index> {
                 *self = Self::Closed(ClosedState { index: state.index });
                 false
             }
-            Self::TransportClosed(_) | Self::Closed(_) | Self::TransportDeleted => false,
+            Self::Creating
+            | Self::Created(_)
+            | Self::Published(_)
+            | Self::TransportClosed(_)
+            | Self::Closed(_)
+            | Self::TransportDeleted => false,
         }
     }
 
@@ -89,7 +153,9 @@ impl<Index: Copy + Eq> SessionState<Index> {
                 false
             }
             Self::AppClosed(_) | Self::Closed(_) => true,
-            Self::TransportDeleted => false,
+            Self::Creating | Self::Created(_) | Self::Published(_) | Self::TransportDeleted => {
+                false
+            }
         }
     }
 }
@@ -103,7 +169,7 @@ mod tests {
     #[test]
     fn session_lifecycle_app_first_close_retains_index_until_transport_deleted() {
         let index = Index::new(4, 7);
-        let mut state = SessionState::active(index);
+        let mut state = active_state(index);
 
         assert!(!state.on_app_close());
         assert!(matches!(state, SessionState::AppClosed(_)));
@@ -117,7 +183,7 @@ mod tests {
     #[test]
     fn session_lifecycle_transport_first_close_retains_index_until_cleanup() {
         let index = Index::new(5, 11);
-        let mut state = SessionState::active(index);
+        let mut state = active_state(index);
         let mut app_close_notifications = 0;
 
         if state.on_transport_close(index) {
@@ -139,7 +205,7 @@ mod tests {
     fn stale_transport_deleted_notification_preserves_the_current_index() {
         let stale = Index::new(8, 1);
         let current = Index::new(8, 2);
-        let mut state = SessionState::active(current);
+        let mut state = active_state(current);
 
         assert!(!state.on_transport_deleted(stale));
         assert!(matches!(state, SessionState::Active(_)));
@@ -149,10 +215,43 @@ mod tests {
     #[test]
     fn transport_deleted_then_app_close_removes_session() {
         let index = Index::new(3, 9);
-        let mut state = SessionState::active(index);
+        let mut state = active_state(index);
 
         assert!(!state.on_transport_deleted(index));
         assert!(matches!(state, SessionState::TransportDeleted));
         assert!(state.on_app_close());
+    }
+
+    #[test]
+    fn accepted_session_transitions_create_publish_notify_in_order() {
+        let index = Index::new(7, 13);
+        let creating = SessionState::creating();
+        assert!(creating.on_connection_published().is_none());
+        assert!(creating.on_connected().is_none());
+
+        let created = creating.finish_creation(index).expect("created session");
+        assert_eq!(created.rollback_index(), Ok(Some(index)));
+        assert!(created.on_connected().is_none());
+
+        let (published, initial) = created
+            .on_connection_published()
+            .expect("published session");
+        assert!(initial);
+        assert!(published.on_connection_published().is_none());
+
+        let active = published.on_connected().expect("active session");
+        assert!(active.rollback_index().is_err());
+        assert_eq!(active.transport_index(), Some(index));
+    }
+
+    fn active_state(index: Index) -> SessionState<Index> {
+        SessionState::creating()
+            .finish_creation(index)
+            .expect("created session")
+            .on_connection_published()
+            .expect("published session")
+            .0
+            .on_connected()
+            .expect("active session")
     }
 }

@@ -4,7 +4,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hammer_core::data_plane::{NodeHandle, NodeId, NodeNext};
+use hammer_core::data_plane::{NodeHandle, NodeNext};
 use hammer_infra::pool::Index as PoolIndex;
 use hammer_plugin_ip::protocol::ip::IpFragmentKey;
 use hammer_plugin_ip::{
@@ -103,7 +103,7 @@ fn failed_reassembly_does_not_sticky_deny_same_key() {
 fn expire_on_fresh_node_is_safe_without_global_mutex_runtime() {
     let runtime = test_runtime();
     let directory = Arc::new(IpReassemblyDirectory::new(32));
-    let mut node = IpReassemblyNode::new([NodeId::new(0); IpReassemblyNext::COUNT])
+    let mut node = IpReassemblyNode::new()
         .with_timeout(Duration::from_millis(1))
         .with_directory(Arc::clone(&directory));
     let expired = node.expire(&runtime, Instant::now());

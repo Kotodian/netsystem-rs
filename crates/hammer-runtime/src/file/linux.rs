@@ -29,6 +29,7 @@ pub(super) struct Poller {
     current_tokens: [u64; FILE_POOL_CAPACITY],
     request_sequence: u32,
     multishot: bool,
+    wake: OwnedFd,
 }
 
 impl Poller {
@@ -48,13 +49,26 @@ impl Poller {
             ("poll-remove", opcode::PollRemove::CODE),
         ] {
             if !probe.is_supported(code) {
-                return Err(RuntimeError::invariant(format!(
-                    "worker io_uring does not support required {name} operation"
-                )));
+                return Err(RuntimeError::FilePollerOperationUnsupported { operation: name });
             }
         }
 
         let multishot = probe_multishot(&mut ring)?;
+
+        // SAFETY: eventfd returns a fresh descriptor or -1 with errno set.
+        let wake = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if wake < 0 {
+            return Err(io_error(
+                "create worker io_uring wake eventfd",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: ownership of the fresh eventfd descriptor is transferred once.
+        let wake = unsafe { OwnedFd::from_raw_fd(wake) };
+        ring.submitter()
+            .register_eventfd(wake.as_raw_fd())
+            .map_err(|error| io_error("register worker io_uring wake eventfd", error))?;
+
         let pending_capacity = ring.completion().capacity().saturating_mul(2);
         Ok(Self {
             ring,
@@ -62,7 +76,22 @@ impl Poller {
             current_tokens: [0; FILE_POOL_CAPACITY],
             request_sequence: 0,
             multishot,
+            wake,
         })
+    }
+
+    /// Becomes readable whenever the ring posts a completion; lets the idle
+    /// loop sleep in the tokio reactor yet wake on File readiness, matching
+    /// VPP sleeping inside `epoll_wait` (`vlib_file_poll`).
+    pub(super) fn try_clone_wake(&self) -> io::Result<OwnedFd> {
+        self.wake.try_clone()
+    }
+
+    pub(super) fn clear_wake(&self) {
+        let mut count = [0u8; 8];
+        // SAFETY: the eventfd is live and the buffer holds the 8-byte counter;
+        // EAGAIN when already clear is expected and ignored.
+        let _ = unsafe { libc::read(self.wake.as_raw_fd(), count.as_mut_ptr().cast(), 8) };
     }
 
     pub(super) fn add(&mut self, spec: PollSpec) -> RuntimeResult<()> {
@@ -122,9 +151,9 @@ impl Poller {
                     count += 1;
                 }
             } else if pending.try_push(completion).is_err() {
-                return Err(RuntimeError::invariant(
-                    "worker io_uring pending completion ring is full",
-                ));
+                return Err(RuntimeError::FileCompletionQueueFull {
+                    operation: "collecting readiness",
+                });
             }
         }
         Ok(count)
@@ -156,9 +185,9 @@ impl Poller {
                 if completion.user_data == CONTROL_TOKEN {
                     result = Some(completion.result);
                 } else if completion.user_data != token && pending.try_push(completion).is_err() {
-                    return Err(RuntimeError::invariant(
-                        "worker io_uring pending completion ring is full while cancelling",
-                    ));
+                    return Err(RuntimeError::FileCompletionQueueFull {
+                        operation: "canceling readiness",
+                    });
                 }
             }
             drop(completions);
@@ -218,9 +247,7 @@ fn probe_multishot(ring: &mut IoUring) -> RuntimeResult<bool> {
     let completion = ring
         .completion()
         .find(|completion| completion.user_data() == PROBE_TOKEN)
-        .ok_or_else(|| {
-            RuntimeError::invariant("io_uring multishot probe produced no completion")
-        })?;
+        .ok_or(RuntimeError::FilePollerProbeCompletionMissing)?;
     if completion.result() == -libc::EINVAL {
         return Ok(false);
     }
@@ -317,8 +344,7 @@ fn decode_poll_token(token: u64) -> Option<Index> {
 fn push(ring: &mut IoUring, entry: squeue::Entry) -> RuntimeResult<()> {
     let mut submissions = ring.submission();
     // SAFETY: probe entries contain no borrowed userspace buffer.
-    unsafe { submissions.push(&entry) }
-        .map_err(|_| RuntimeError::invariant("worker io_uring submission queue is full"))
+    unsafe { submissions.push(&entry) }.map_err(|_| RuntimeError::FileSubmissionQueueFull)
 }
 
 fn submit(ring: &IoUring) -> RuntimeResult<usize> {
@@ -343,10 +369,35 @@ fn submit_and_wait(ring: &IoUring) -> RuntimeResult<()> {
     }
 }
 
-fn completion_error(operation: &str, result: i32) -> RuntimeError {
+fn completion_error(operation: &'static str, result: i32) -> RuntimeError {
     io_error(operation, io::Error::from_raw_os_error(-result))
 }
 
-fn io_error(operation: &str, error: io::Error) -> RuntimeError {
-    RuntimeError::invariant(format!("{operation}: {error}"))
+fn io_error(operation: &'static str, source: io::Error) -> RuntimeError {
+    RuntimeError::FilePollerIo { operation, source }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use super::*;
+
+    #[test]
+    fn poller_io_error_preserves_os_source() {
+        let error = io_error(
+            "test File poller operation",
+            io::Error::from_raw_os_error(libc::EBADF),
+        );
+
+        let RuntimeError::FilePollerIo { operation, .. } = &error else {
+            panic!("unexpected error: {error}");
+        };
+        assert_eq!(*operation, "test File poller operation");
+        let source = error
+            .source()
+            .and_then(|source| source.downcast_ref::<io::Error>())
+            .expect("File poller error source");
+        assert_eq!(source.raw_os_error(), Some(libc::EBADF),);
+    }
 }

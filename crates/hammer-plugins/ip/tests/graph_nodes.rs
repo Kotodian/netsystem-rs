@@ -1,6 +1,6 @@
 use hammer_plugin_ip::{
-    IcmpEchoRequestNext, IcmpErrorNext, IcmpInputNext, IpInputNext, IpLocalNext, IpLookupNext,
-    IpReassemblyNext, reset_ip_main_for_test,
+    AdjacencyRewriteNext, IcmpEchoRequestNext, IcmpErrorNext, IcmpInputNext, IpInputNext,
+    IpLocalNext, IpLookupNext, IpReassemblyNext, reset_ip_main_for_test,
 };
 use hammer_runtime::RuntimeRegistry;
 use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, Engine};
@@ -30,6 +30,8 @@ fn ip_plugin_installs_its_vpp_style_packet_graph() {
         "device-input",
         "ip-input",
         "ip-lookup",
+        "adjacency-rewrite",
+        "interface-output",
         "ip-local",
         "ip-receive",
         "icmp-input",
@@ -48,6 +50,8 @@ fn ip_plugin_installs_its_vpp_style_packet_graph() {
     let nodes = engine.runtime.nodes();
     let drop = node("drop");
     let lookup = node("ip-lookup");
+    let adjacency_rewrite = node("adjacency-rewrite");
+    let interface_output = node("interface-output");
     let input = node("ip-input");
     let local = node("ip-local");
     let receive = node("ip-receive");
@@ -94,4 +98,26 @@ fn ip_plugin_installs_its_vpp_style_packet_graph() {
         drop
     );
     assert_eq!(nodes.node_next(lookup, IpLookupNext::Drop).unwrap(), drop);
+    assert_eq!(
+        nodes.node_next(lookup, IpLookupNext::Receive).unwrap(),
+        receive
+    );
+    assert_eq!(
+        nodes
+            .node_next(lookup, IpLookupNext::AdjacencyRewrite)
+            .unwrap(),
+        adjacency_rewrite
+    );
+    assert_eq!(
+        nodes
+            .node_next(adjacency_rewrite, AdjacencyRewriteNext::Output)
+            .unwrap(),
+        interface_output
+    );
+    assert_eq!(
+        nodes
+            .node_next(adjacency_rewrite, AdjacencyRewriteNext::Drop)
+            .unwrap(),
+        drop
+    );
 }

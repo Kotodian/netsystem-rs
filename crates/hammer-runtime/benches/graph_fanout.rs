@@ -14,9 +14,7 @@ use hammer_infra::mask_compare::{
 };
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::node::{NodeDescriptor, NodeResult, NodeRuntimeData};
-use hammer_runtime::{
-    DataPlaneBufferConfig, DataPlaneInstructionSet, DataPlaneRuntime, DataPlaneRuntimeConfig,
-};
+use hammer_runtime::{DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig};
 
 fn test_runtime(frame_slots: usize, buffer_slots: usize) -> DataPlaneRuntime {
     DataPlaneRuntime::new(DataPlaneRuntimeConfig {
@@ -135,24 +133,23 @@ enum FanoutPattern {
 }
 
 fn bench_fanout_256(c: &mut Criterion) {
-    let isa = DataPlaneInstructionSet::native();
-    let mut group = c.benchmark_group(format!("fanout_256/{isa:?}"));
+    let mut group = c.benchmark_group("fanout_256/native");
     for (name, pattern) in [
         ("single_next", FanoutPattern::Single),
         ("alternating_two_next", FanoutPattern::Alternating),
         ("multi_next", FanoutPattern::Multi),
     ] {
         group.bench_function(BenchmarkId::from_parameter(name), |b| {
-            b.iter_batched(
+            b.iter_batched_ref(
                 || build_fixture(pattern),
-                |mut fixture| {
+                |fixture| {
                     fixture.runtime.with_current_node(fixture.owner, || {
                         fixture
                             .runtime
                             .enqueue_to_next(&mut fixture.frame, &fixture.nexts);
                     });
                 },
-                criterion::BatchSize::LargeInput,
+                criterion::BatchSize::PerIteration,
             );
         });
     }

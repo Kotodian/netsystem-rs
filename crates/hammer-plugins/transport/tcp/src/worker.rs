@@ -3,38 +3,31 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 use crate::TcpPacket;
 use crate::{TcpSeq, TcpState};
+use hammer_core::data_plane::DataPlaneBuffers;
 use hammer_infra::pool::{Index, Pool};
-use hammer_runtime::app::SessionSegment;
+use hammer_runtime::RuntimeResult;
 use hammer_runtime::{DataPlaneRuntime, DataWorkerId};
-use hammer_runtime::{RuntimeError, RuntimeResult};
 
+use super::connection::TcpTimerAction;
 use super::lookup::TcpLookupState;
 use super::timers::{TcpTimerKind, TcpTimers};
 use super::{TcpConnection, TcpNodeError, enqueue_tcp_segment};
-use hammer_service::session::SessionAppRuntime;
-use hammer_service::session::app::SessionAppRuntimeCreate;
 use hammer_service::session::node::{SessionQueueNext, SessionQueueOutput};
 use hammer_service::session::runtime::{
     SessionPacketizedTransport, SessionPacketizedTx, SessionTransport, SessionTransportId,
     SessionWorker, TransportSendFlags, TransportSendParams, TxBatchBuffer,
 };
-use hammer_service::transport::congestion::CongestionController;
-
 const DEFAULT_TCP_CONNECTION_CAPACITY: usize = 1024;
+const TCP_APP_RX_MIN_FREE: usize = 4 << 10;
+const TCP_APP_RX_MAX_FREE: usize = 128 << 10;
 
-pub struct TcpWorker<C>
-where
-    C: CongestionController,
-{
-    pub(crate) connections: Pool<TcpConnection<C>>,
+pub struct TcpWorker {
+    pub(crate) connections: Pool<TcpConnection>,
     pub(crate) lookup: TcpLookupState,
     pub(super) timers: TcpTimers,
 }
 
-impl<C> TcpWorker<C>
-where
-    C: CongestionController + 'static,
-{
+impl TcpWorker {
     #[inline]
     pub fn new(worker: DataWorkerId) -> Self {
         Self {
@@ -50,27 +43,24 @@ where
     }
 
     #[inline]
-    pub(crate) fn insert_connection(
-        &mut self,
-        connection: TcpConnection<C>,
-    ) -> RuntimeResult<Index> {
+    pub(crate) fn insert_connection(&mut self, connection: TcpConnection) -> RuntimeResult<Index> {
         self.connections
             .insert(connection)
-            .ok_or_else(|| RuntimeError::invariant("TCP connection pool capacity exhausted"))
+            .ok_or_else(|| TcpNodeError::ConnectionCreate.into())
     }
 
     #[inline]
-    pub(crate) fn connection(&self, index: Index) -> Option<&TcpConnection<C>> {
+    pub(crate) fn connection(&self, index: Index) -> Option<&TcpConnection> {
         self.connections.get(index)
     }
 
     #[inline]
-    pub(crate) fn connection_mut(&mut self, index: Index) -> Option<&mut TcpConnection<C>> {
+    pub(crate) fn connection_mut(&mut self, index: Index) -> Option<&mut TcpConnection> {
         self.connections.get_mut(index)
     }
 
     #[inline]
-    pub(crate) fn remove_connection(&mut self, index: Index) -> Option<TcpConnection<C>> {
+    pub(crate) fn remove_connection(&mut self, index: Index) -> Option<TcpConnection> {
         self.connections.remove(index)
     }
 
@@ -92,14 +82,11 @@ where
         Ok(())
     }
 
-    fn remove_closed_connection<Seg: SessionSegment>(
+    fn remove_closed_connection(
         &mut self,
-        sessions: &mut SessionWorker<Index, Seg>,
+        sessions: &mut SessionWorker<Index>,
         index: Index,
-    ) -> RuntimeResult<()>
-    where
-        SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-    {
+    ) -> RuntimeResult<()> {
         let Some(connection) = self.connections.get(index) else {
             return Ok(());
         };
@@ -115,19 +102,16 @@ where
         Ok(())
     }
 
-    fn control_output<Seg: SessionSegment>(
+    fn control_output(
         &mut self,
-        sessions: &mut SessionWorker<Index, Seg>,
+        sessions: &mut SessionWorker<Index>,
         index: Index,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
         frame: &mut hammer_core::data_plane::BufferFrame,
         output: &mut SessionQueueOutput,
         now: Instant,
-    ) -> RuntimeResult<()>
-    where
-        SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-    {
+    ) -> RuntimeResult<()> {
         let (session_id, segment, has_pending_sack) = {
             let Self {
                 connections,
@@ -138,7 +122,7 @@ where
                 .get_mut(index)
                 .ok_or(TcpNodeError::SessionMissing)?;
             let session_id = connection.session_id();
-            let has_pending_tx = sessions.app().has_pending_send(session_id);
+            let has_pending_tx = sessions.has_pending_send(session_id);
             let capabilities = lookup
                 .pending_open_capabilities(session_id)
                 .unwrap_or_default();
@@ -153,7 +137,7 @@ where
                 sessions.mark_ready(session_id);
             }
         }
-        let has_pending_tx = sessions.app().has_pending_send(session_id);
+        let has_pending_tx = sessions.has_pending_send(session_id);
         if segment.is_none() && !has_pending_tx && has_pending_sack {
             sessions.mark_ready(session_id);
         }
@@ -162,19 +146,53 @@ where
     }
 }
 
-impl<C, Seg> SessionTransport<Index, Seg> for TcpWorker<C>
-where
-    C: CongestionController + 'static,
-    Seg: SessionSegment,
-    SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-{
+impl SessionTransport<Index> for TcpWorker {
     type Tx = SessionPacketizedTx;
 
     const ID: SessionTransportId = SessionTransportId::new(1);
 
+    fn app_rx_evt(
+        &mut self,
+        index: Index,
+        rx_available: usize,
+        rx_capacity: usize,
+        runtime: &DataPlaneRuntime,
+        output_next: SessionQueueNext,
+        frame: &mut hammer_core::data_plane::BufferFrame,
+        output: &mut SessionQueueOutput,
+    ) -> RuntimeResult<bool> {
+        let zero_receive_window_sent = {
+            let connection = self
+                .connections
+                .get_mut(index)
+                .ok_or(TcpNodeError::SessionMissing)?;
+            connection.set_rcv_wnd(rx_available);
+            connection.zero_receive_window_sent()
+        };
+        if !zero_receive_window_sent {
+            return Ok(false);
+        }
+        let min_free = (rx_capacity >> 3).clamp(TCP_APP_RX_MIN_FREE, TCP_APP_RX_MAX_FREE);
+        if rx_available < min_free {
+            return Ok(true);
+        }
+        let mut candidate = self
+            .connections
+            .get(index)
+            .ok_or(TcpNodeError::SessionMissing)?
+            .clone();
+        let segment = candidate.receive_window_update_segment(rx_available)?;
+        enqueue_tcp_segment(runtime, frame, output_next, output, segment)?;
+        *self
+            .connections
+            .get_mut(index)
+            .ok_or(TcpNodeError::SessionMissing)? = candidate;
+        Ok(false)
+    }
+
     fn update_time(
         &mut self,
-        sessions: &mut SessionWorker<Index, Seg>,
+        sessions: &mut SessionWorker<Index>,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
         frame: &mut hammer_core::data_plane::BufferFrame,
@@ -183,7 +201,7 @@ where
     ) -> RuntimeResult<()> {
         self.timers.advance(now, &mut self.connections);
         while let Some(token) = self.timers.take_pending(&mut self.connections) {
-            let (session_id, segment) = {
+            let (session_id, outcome) = {
                 let Self {
                     connections,
                     lookup,
@@ -196,16 +214,26 @@ where
                 let capabilities = lookup
                     .pending_open_capabilities(session_id)
                     .unwrap_or_default();
-                let segment = connection.on_typed_timer_expiry(
+                let outcome = connection.on_typed_timer_expiry(
                     token.index,
                     timers,
                     token.kind,
                     capabilities,
                     now,
                 )?;
-                (session_id, segment)
+                (session_id, outcome)
             };
-            if let Some(segment) = segment {
+            if let Some(action) = outcome.action {
+                let counter = match action {
+                    TcpTimerAction::RtoRetransmit => TcpNodeError::Retransmit,
+                    TcpTimerAction::RackRetransmit => TcpNodeError::RackRetransmit,
+                    TcpTimerAction::TlpProbe => TcpNodeError::TlpProbe,
+                    TcpTimerAction::PersistProbe => TcpNodeError::PersistProbe,
+                    TcpTimerAction::KeepaliveProbe => TcpNodeError::KeepaliveProbe,
+                };
+                let _ = runtime.record_current_node_error(counter.code());
+            }
+            if let Some(segment) = outcome.segment {
                 if segment.payload_len() == 0 {
                     enqueue_tcp_segment(runtime, frame, output_next, output, segment)?;
                 } else {
@@ -228,7 +256,7 @@ where
 
     fn disconnect(
         &mut self,
-        sessions: &mut SessionWorker<Index, Seg>,
+        sessions: &mut SessionWorker<Index>,
         index: Index,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
@@ -247,16 +275,11 @@ where
     }
 }
 
-impl<C, Seg> SessionPacketizedTransport<Index, Seg> for TcpWorker<C>
-where
-    C: CongestionController + 'static,
-    Seg: SessionSegment,
-    SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-{
+impl SessionPacketizedTransport<Index> for TcpWorker {
     #[inline]
     fn control_tx(
         &mut self,
-        sessions: &mut SessionWorker<Index, Seg>,
+        sessions: &mut SessionWorker<Index>,
         index: Index,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
@@ -269,7 +292,7 @@ where
 
     fn send_params(
         &mut self,
-        _: &mut SessionWorker<Index, Seg>,
+        _: &mut SessionWorker<Index>,
         index: Index,
         pending_len: usize,
         now: Instant,
@@ -303,9 +326,9 @@ where
 
     fn tx_action(
         &mut self,
-        sessions: &mut SessionWorker<Index, Seg>,
         index: Index,
         batch: &[TxBatchBuffer],
+        buffers: &DataPlaneBuffers,
         now: Instant,
     ) -> RuntimeResult<()> {
         let connection = self
@@ -320,7 +343,7 @@ where
         let mut candidate = connection.clone();
         for entry in batch {
             let segment = candidate.tx_segment(entry.payload_len, capabilities)?;
-            segment.write_to_buffer(sessions.buffers(), entry.index)?;
+            segment.write_to_buffer(buffers, entry.index)?;
             candidate.commit_payload_tx(entry.payload_len, now)?;
         }
         *candidate.timer_state_mut() = previous_timer_state;

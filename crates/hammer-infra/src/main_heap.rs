@@ -648,6 +648,8 @@ mod tests {
     use byte_unit::Byte;
 
     use super::PageSize;
+    #[cfg(not(target_os = "linux"))]
+    use super::{MainHeapError, init_with, minimum_capacity};
 
     #[test]
     fn page_size_uses_derive_backed_string_forms() {
@@ -679,5 +681,19 @@ mod tests {
                 .expect("byte-unit parses lowercase b as bits")
                 .is_supported_on_current_platform()
         );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn explicit_hugepage_is_rejected_on_unsupported_platform() {
+        let error = init_with(minimum_capacity(), PageSize::DefaultHuge, None)
+            .expect_err("explicit HugeTLB must fail");
+
+        assert!(matches!(
+            error,
+            MainHeapError::UnsupportedPageSize {
+                page_size: PageSize::DefaultHuge
+            }
+        ));
     }
 }

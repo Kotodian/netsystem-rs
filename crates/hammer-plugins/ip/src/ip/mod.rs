@@ -12,7 +12,76 @@ use crate::protocol::ip::{
 use crate::protocol::wire::read_header;
 use hammer_core::data_plane::BufferPacketCursor;
 use hammer_runtime::Network;
-use hammer_runtime::{RuntimeError, RuntimeResult};
+use hammer_runtime::RuntimeError;
+
+/// Runtime registries owned by the IP plugin. Mirrors VPP's per-node error
+/// enumeration style: the registry identity is a typed discriminant, not a
+/// string payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IpRuntimeRegistry {
+    IpInput,
+    IpLocal,
+    IpLookup,
+    IcmpInput,
+    IcmpError,
+    AdjacencyRewrite,
+}
+
+impl std::fmt::Display for IpRuntimeRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::IpInput => "ip-input",
+            Self::IpLocal => "ip-local",
+            Self::IpLookup => "ip-lookup",
+            Self::IcmpInput => "icmp-input",
+            Self::IcmpError => "icmp-error",
+            Self::AdjacencyRewrite => "adjacency-rewrite",
+        })
+    }
+}
+
+/// Control-plane operations that require IP plugin runtime state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IpControlOperation {
+    IcmpConsumerAttach,
+    IcmpTypeRegistration,
+    IpReceiveRegistration,
+    IpProtocolRegistration,
+}
+
+impl std::fmt::Display for IpControlOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::IcmpConsumerAttach => "icmp consumer attach",
+            Self::IcmpTypeRegistration => "icmp type registration",
+            Self::IpReceiveRegistration => "ip-receive registration",
+            Self::IpProtocolRegistration => "ip protocol registration",
+        })
+    }
+}
+
+/// Recoverable control-plane failures shared by IP graph-node registration,
+/// worker sync, and per-node runtime registry access.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum IpControlError {
+    #[error("{registry} runtime registry is poisoned")]
+    RuntimeRegistryPoisoned { registry: IpRuntimeRegistry },
+    #[error("{registry} runtime slot {slot} is not registered")]
+    RuntimeSlotInvalid {
+        registry: IpRuntimeRegistry,
+        slot: usize,
+    },
+    #[error("{operation} requires a node runtime")]
+    NodeRuntimeUnavailable { operation: IpControlOperation },
+    #[error("ICMP type registration requires an attached input consumer")]
+    ConsumerNotAttached,
+}
+
+impl From<IpControlError> for RuntimeError {
+    fn from(error: IpControlError) -> Self {
+        Self::subsystem("ip", error)
+    }
+}
 
 pub use icmp::{
     IcmpEchoRequestNext, IcmpEchoRequestNode, IcmpEchoRequestTrace, IcmpErrorNext, IcmpErrorNode,
@@ -44,12 +113,12 @@ pub(crate) fn network_for_protocol(protocol: IpProtocol) -> Option<Network> {
 pub(crate) fn ip_header(
     packet: &[u8],
     cursor: BufferPacketCursor,
-) -> RuntimeResult<ParsedIpPacket> {
+) -> Result<ParsedIpPacket, IpInputError> {
     if cursor.packet_len() == 0 {
-        return Err(RuntimeError::invariant("missing cached IP packet cursor"));
+        return Err(IpInputError::BadLength);
     }
     let Some(version_byte) = packet.get(cursor.network_header_offset()).copied() else {
-        return Err(RuntimeError::invariant("missing cached IP header"));
+        return Err(IpInputError::HeaderTooShort);
     };
     let (version, protocol, source, destination) = match version_byte >> 4 {
         4 => {
@@ -82,7 +151,7 @@ pub(crate) fn ip_header(
                 IpAddr::V6(header.destination()),
             )
         }
-        _ => return Err(RuntimeError::invariant("unsupported cached IP version")),
+        _ => return Err(IpInputError::Version),
     };
     Ok(ParsedIpPacket {
         version,

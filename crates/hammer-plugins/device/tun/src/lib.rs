@@ -9,7 +9,7 @@ hammer_component_macros::declare_plugin!(
     load_after = ["ip"],
     init_functions = [],
     config_functions = [tun::__CONFIG_FN_TUN_CONFIG],
-    early_config_functions = [],
+    early_config_functions = [tun::__CONFIG_FN_TUN_INTERFACES_CONFIG],
     main_loop_enter_functions = [],
     main_loop_exit_functions = [],
     worker_init_functions = [tun::__INIT_FN_TUN_WORKER_INIT],

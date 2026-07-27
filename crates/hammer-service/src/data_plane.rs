@@ -1,8 +1,5 @@
-use std::cell::UnsafeCell;
-use std::sync::Arc;
-
 use hammer_core::data_plane::{Buffer, BufferFrame, Index, NodeId, NodeRegistration};
-use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
+use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
     DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, add_packet_trace,
 };
@@ -73,11 +70,11 @@ impl HandoffNode {
     }
 }
 
-pub fn register_drop(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
+pub fn register_drop(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_internal(DropNode)
 }
 
-pub fn register_handoff(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
+pub fn register_handoff(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     runtime
         .nodes()
         .register_internal_with_handle(runtime.handoff_node_handle()?, HandoffNode)

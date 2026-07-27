@@ -6,7 +6,7 @@ use hammer_runtime::config::Worker;
 use hammer_runtime::{DataPlaneRuntime, Engine, InternalNode, Node, NodeResult};
 use hammer_service::data_plane::DropNode;
 use hammer_service::device::DeviceMain;
-use hammer_service::interface::InterfaceOutputControlPlane;
+use hammer_service::interface::InterfaceOutputNode;
 use hammer_service::opaque::NetworkOpaque;
 
 #[derive(Clone, Copy)]
@@ -33,9 +33,9 @@ fn worker_output_runtimes_only_install_their_assigned_tx_queues() {
     let output = engine
         .runtime
         .nodes()
-        .register_internal(InterfaceOutputControlPlane::new().node());
+        .register_internal(InterfaceOutputNode);
 
-    let devices = DeviceMain::new();
+    let devices = DeviceMain::new(engine.runtime.nodes().clone());
     let first_device = devices
         .register_device(11, NodeId::new(0), sink)
         .expect("register first device");
@@ -44,20 +44,16 @@ fn worker_output_runtimes_only_install_their_assigned_tx_queues() {
         .expect("register second device");
     devices
         .register_tx_queue(
-            11,
             first_device.instance,
             0,
             hammer_runtime::DataWorkerId::new(0),
-            sink,
         )
         .expect("single-worker TX queue");
     devices
         .register_tx_queue(
-            12,
             second_device.instance,
             0,
             hammer_runtime::DataWorkerId::new(0),
-            sink,
         )
         .expect("shared TX queue");
     devices
@@ -68,22 +64,18 @@ fn worker_output_runtimes_only_install_their_assigned_tx_queues() {
         )
         .expect("share TX queue");
 
-    let mut first_worker = engine.spawn(1).expect("first worker");
-    let mut second_worker = engine.spawn(2).expect("second worker");
-    devices
-        .install_worker_output_runtime(&mut first_worker)
-        .expect("first runtime");
-    devices
-        .install_worker_output_runtime(&mut second_worker)
-        .expect("second runtime");
+    let first_worker = engine.spawn(1).expect("first worker");
+    let second_worker = engine.spawn(2).expect("second worker");
+    devices.install_worker_output_runtime(hammer_runtime::DataWorkerId::new(0));
 
     dispatch_to_interface(&first_worker.runtime, output, 11);
     assert_eq!(node_vectors(&first_worker.runtime, sink), Some(1));
-    dispatch_to_interface(&second_worker.runtime, output, 11);
-    assert_eq!(node_vectors(&second_worker.runtime, sink), None);
-
     dispatch_to_interface(&first_worker.runtime, output, 12);
     assert_eq!(node_vectors(&first_worker.runtime, sink), Some(2));
+
+    devices.install_worker_output_runtime(hammer_runtime::DataWorkerId::new(1));
+    dispatch_to_interface(&second_worker.runtime, output, 11);
+    assert_eq!(node_vectors(&second_worker.runtime, sink), None);
     dispatch_to_interface(&second_worker.runtime, output, 12);
     assert_eq!(node_vectors(&second_worker.runtime, sink), Some(1));
 }
@@ -98,6 +90,7 @@ fn dispatch_to_interface(runtime: &DataPlaneRuntime, output: NodeId, interface_i
         // SAFETY: NetworkOpaque is the established view of the primary opaque
         // region and its compile-time layout check guarantees that it fits.
         let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+        *network = NetworkOpaque::default();
         network.sw_if_index[1] = interface_index;
     }
     frame.push_index(index).expect("push packet");

@@ -258,15 +258,15 @@ impl SvmRegion {
         self.inner.allocator.is_some()
     }
 
-    pub fn alloc(&self, bytes: usize, align: usize) -> u64 {
+    pub fn alloc(&self, bytes: usize, align: usize) -> Option<u64> {
         if !self.is_allocation_owner() {
-            return u64::MAX;
+            return None;
         }
         if bytes == 0 || !align.is_power_of_two() {
-            return u64::MAX;
+            return None;
         }
         let Some((layout, layout_align)) = offset_alloc_layout(bytes, align) else {
-            return u64::MAX;
+            return None;
         };
         self.alloc_layout(layout)
             .and_then(|raw_ptr| {
@@ -278,7 +278,6 @@ impl SvmRegion {
                 Some(user_ptr)
             })
             .and_then(|ptr| self.ptr_to_offset(ptr))
-            .unwrap_or(u64::MAX)
     }
 
     pub(crate) fn alloc_layout(&self, layout: Layout) -> Option<NonNull<u8>> {

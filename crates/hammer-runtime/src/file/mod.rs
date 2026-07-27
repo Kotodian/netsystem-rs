@@ -1,16 +1,17 @@
 //! Worker-local file readiness, corresponding to VPP's `clib_file_t` and
 //! `clib_file_main_t`.
 //!
-//! This module owns descriptor readiness and callback dispatch. Device and
-//! Graph Node code remains responsible for reading and writing packet data.
+//! This module owns descriptors, readiness dispatch, and indexed synchronous
+//! descriptor I/O. Device queues own packet and queue semantics.
 
 use std::fmt;
+use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
 use crate::error::{RuntimeError, RuntimeResult};
 use hammer_infra::pool::{Index, Pool};
 
-use crate::DataWorkerId;
+use crate::NodeRuntime;
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -22,7 +23,7 @@ mod linux;
 use linux::Poller;
 
 /// Worker-local callback invoked for one ready descriptor event.
-pub type FileFunction = fn(&mut File) -> RuntimeResult<()>;
+pub type FileFunction = fn(&NodeRuntime, &mut File) -> RuntimeResult<()>;
 
 /// Functions dispatched for one File's read, write, and error readiness.
 #[derive(Clone, Copy, Debug, Default)]
@@ -35,7 +36,6 @@ pub struct FileFunctions {
 /// Readiness metadata, callback state, and ownership for one descriptor.
 pub struct File {
     fd: OwnedFd,
-    polling_worker: DataWorkerId,
     description: String,
     private_data: u64,
     functions: FileFunctions,
@@ -53,14 +53,12 @@ impl File {
     /// [`FileMain::set_data_available_to_write`].
     pub fn new(
         fd: OwnedFd,
-        polling_worker: DataWorkerId,
         description: String,
         private_data: u64,
         functions: FileFunctions,
     ) -> Self {
         Self {
             fd,
-            polling_worker,
             description,
             private_data,
             functions,
@@ -75,12 +73,6 @@ impl File {
     /// Returns the registered descriptor without transferring ownership.
     pub fn fd(&self) -> RawFd {
         self.fd.as_raw_fd()
-    }
-
-    #[inline]
-    /// Returns the only Data Worker allowed to poll this File.
-    pub fn polling_worker(&self) -> DataWorkerId {
-        self.polling_worker
     }
 
     #[inline]
@@ -129,12 +121,12 @@ impl File {
         }
     }
 
-    fn dispatch(&mut self, readiness: Readiness) -> RuntimeResult<usize> {
+    fn dispatch(&mut self, graph: &NodeRuntime, readiness: Readiness) -> RuntimeResult<usize> {
         if readiness.contains(Readiness::ERROR)
             && let Some(function) = self.functions.error
         {
             self.error_events += 1;
-            function(self)?;
+            function(graph, self)?;
             return Ok(1);
         }
 
@@ -143,7 +135,7 @@ impl File {
             && let Some(function) = self.functions.read
         {
             self.read_events += 1;
-            function(self)?;
+            function(graph, self)?;
             dispatched += 1;
         }
         if readiness.contains(Readiness::WRITE)
@@ -151,7 +143,7 @@ impl File {
             && let Some(function) = self.functions.write
         {
             self.write_events += 1;
-            function(self)?;
+            function(graph, self)?;
             dispatched += 1;
         }
         Ok(dispatched)
@@ -163,7 +155,6 @@ impl fmt::Debug for File {
         formatter
             .debug_struct("File")
             .field("fd", &self.fd())
-            .field("polling_worker", &self.polling_worker)
             .field("description", &self.description)
             .field("private_data", &self.private_data)
             .field("write_enabled", &self.write_enabled)
@@ -176,39 +167,56 @@ impl fmt::Debug for File {
 
 /// Generation-safe File registry and readiness dispatcher for one Data Worker.
 pub struct FileMain {
-    polling_worker: DataWorkerId,
     poller: Poller,
     files: Pool<File>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRuntimeStatsRow {
+    pub index: Index,
+    pub fd: RawFd,
+    pub description: String,
+    pub read_enabled: bool,
+    pub write_enabled: bool,
+    pub read_events: u64,
+    pub write_events: u64,
+    pub error_events: u64,
+}
+
 impl FileMain {
     /// Creates the platform poller and empty File registry for one Data Worker.
-    pub fn new(polling_worker: DataWorkerId) -> RuntimeResult<Self> {
+    pub fn new() -> RuntimeResult<Self> {
         Ok(Self {
-            polling_worker,
             poller: Poller::new()?,
             files: Pool::with_capacity(FILE_POOL_CAPACITY),
         })
     }
 
+    /// Descriptor that becomes readable when File readiness is pending, so an
+    /// idle main loop can sleep in the tokio reactor yet wake for I/O.
+    pub(crate) fn io_wake_fd(&self) -> RuntimeResult<OwnedFd> {
+        self.poller
+            .try_clone_wake()
+            .map_err(|source| RuntimeError::FilePollerIo {
+                operation: "duplicate worker File wake descriptor",
+                source,
+            })
+    }
+
+    /// Consumes the wake signal after an idle wake-up; the next [`Self::poll`]
+    /// collects the readiness that raised it.
+    pub(crate) fn clear_io_wake(&self) {
+        self.poller.clear_wake();
+    }
+
     /// Registers a File and returns its existing `hammer-infra` Pool Index.
     pub fn add(&mut self, file: File) -> RuntimeResult<Index> {
-        if file.polling_worker != self.polling_worker {
-            return Err(RuntimeError::invariant(format!(
-                "file polling worker {:?} does not match FileMain worker {:?}",
-                file.polling_worker, self.polling_worker
-            )));
-        }
-
-        let index = self
-            .files
-            .insert(file)
-            .ok_or_else(|| RuntimeError::invariant("FileMain pool is full"))?;
+        let index = self.files.insert(file).ok_or(RuntimeError::FilePoolFull)?;
         let spec = self
             .files
             .get(index)
             .map(|file| file.poll_spec(index))
-            .ok_or_else(|| RuntimeError::invariant("new File index did not resolve"))?;
+            .expect("newly inserted File must resolve");
         if let Err(error) = self.poller.add(spec) {
             self.files.remove(index);
             return Err(error);
@@ -220,6 +228,86 @@ impl FileMain {
     /// Looks up a live File, rejecting stale generations.
     pub fn get(&self, index: Index) -> Option<&File> {
         self.files.get(index)
+    }
+
+    pub fn runtime_stats_snapshot(&self) -> Vec<FileRuntimeStatsRow> {
+        self.files
+            .iter()
+            .map(|(index, file)| FileRuntimeStatsRow {
+                index,
+                fd: file.fd(),
+                description: file.description.clone(),
+                read_enabled: file.functions.read.is_some() || file.functions.error.is_some(),
+                write_enabled: file.write_enabled,
+                read_events: file.read_events,
+                write_events: file.write_events,
+                error_events: file.error_events,
+            })
+            .collect()
+    }
+
+    /// Reads into vectors through the live File selected by its Index.
+    ///
+    /// # Safety
+    /// Every iovec must reference writable memory for its declared length and
+    /// remain valid until this synchronous call returns.
+    pub unsafe fn readv(
+        &self,
+        index: Index,
+        vectors: &mut [libc::iovec],
+    ) -> RuntimeResult<Option<usize>> {
+        let file = self
+            .files
+            .get(index)
+            .ok_or(RuntimeError::FileIndexInvalid { index })?;
+        let count = libc::c_int::try_from(vectors.len())
+            .expect("File iovec count is bounded by data-plane capacity");
+        loop {
+            // SAFETY: the caller upholds the iovec validity contract and File
+            // owns the descriptor for the duration of this synchronous call.
+            let read = unsafe { libc::readv(file.fd(), vectors.as_ptr(), count) };
+            if read >= 0 {
+                return Ok(Some(read as usize));
+            }
+            let source = io::Error::last_os_error();
+            match source.kind() {
+                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::WouldBlock => return Ok(None),
+                _ => return Err(RuntimeError::FileRead { source }),
+            }
+        }
+    }
+
+    /// Writes vectors through the live File selected by its Index.
+    ///
+    /// # Safety
+    /// Every iovec must reference readable memory for its declared length and
+    /// remain valid and unmodified until this synchronous call returns.
+    pub unsafe fn writev(
+        &self,
+        index: Index,
+        vectors: &[libc::iovec],
+    ) -> RuntimeResult<Option<usize>> {
+        let file = self
+            .files
+            .get(index)
+            .ok_or(RuntimeError::FileIndexInvalid { index })?;
+        let count = libc::c_int::try_from(vectors.len())
+            .expect("File iovec count is bounded by data-plane capacity");
+        loop {
+            // SAFETY: the caller upholds the iovec validity contract and File
+            // owns the descriptor for the duration of this synchronous call.
+            let written = unsafe { libc::writev(file.fd(), vectors.as_ptr(), count) };
+            if written >= 0 {
+                return Ok(Some(written as usize));
+            }
+            let source = io::Error::last_os_error();
+            match source.kind() {
+                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::WouldBlock => return Ok(None),
+                _ => return Err(RuntimeError::FileWrite { source }),
+            }
+        }
     }
 
     /// Removes backend interest before releasing the File record.
@@ -239,9 +327,7 @@ impl FileMain {
         available: bool,
     ) -> RuntimeResult<bool> {
         let Some(file) = self.files.get(index) else {
-            return Err(RuntimeError::invariant(
-                "File index is stale or not registered",
-            ));
+            return Err(RuntimeError::FileIndexInvalid { index });
         };
         let previous = file.write_enabled;
         if previous == available {
@@ -252,16 +338,14 @@ impl FileMain {
         after.write = available;
         self.poller.modify(before, after)?;
         let Some(file) = self.files.get_mut(index) else {
-            return Err(RuntimeError::invariant(
-                "File disappeared while updating write readiness",
-            ));
+            return Err(RuntimeError::FileIndexInvalid { index });
         };
         file.write_enabled = available;
         Ok(previous)
     }
 
     /// Performs one nonblocking readiness poll and dispatches live callbacks.
-    pub fn poll(&mut self) -> RuntimeResult<usize> {
+    pub fn poll(&mut self, graph: &NodeRuntime) -> RuntimeResult<usize> {
         let mut events = [PollEvent::default(); POLL_BATCH_SIZE];
         let count = self.poller.poll(&mut events)?;
         let mut dispatched = 0;
@@ -276,15 +360,13 @@ impl FileMain {
                 self.delete(index)?;
                 continue;
             }
-            dispatched += file.dispatch(event.readiness)?;
+            dispatched += file.dispatch(graph, event.readiness)?;
             if event.rearm {
                 let spec = self
                     .files
                     .get(index)
                     .map(|file| file.poll_spec(index))
-                    .ok_or_else(|| {
-                        RuntimeError::invariant("File disappeared while rearming readiness")
-                    })?;
+                    .expect("callback dispatch cannot remove its File");
                 self.poller.add(spec)?;
             }
         }

@@ -4,6 +4,9 @@ use std::task::Context;
 use std::thread;
 use std::time::Instant;
 
+use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
+
 use crate::barrier;
 use crate::engine::Engine;
 use crate::spawn;
@@ -39,26 +42,57 @@ pub fn engine_main_loop(
         *slot.borrow_mut() = Some(worker_waker.clone());
     });
 
+    let io_wake = {
+        let _reactor = runtime.enter();
+        match engine.file_main().io_wake_fd() {
+            Ok(wake_fd) => match AsyncFd::with_interest(wake_fd, Interest::READABLE) {
+                Ok(wake) => Some(wake),
+                Err(error) => {
+                    tracing::warn!(
+                        worker = engine.thread_index,
+                        %error,
+                        "File wake fd registration failed; idle sleep is fixed-slice"
+                    );
+                    None
+                }
+            },
+            Err(error) => {
+                tracing::warn!(
+                    worker = engine.thread_index,
+                    %error,
+                    "File wake fd duplication failed; idle sleep is fixed-slice"
+                );
+                None
+            }
+        }
+    };
+
     let mut last_poll_drivers_at = Instant::now();
 
     loop {
         let mut progress = false;
 
         // Step 1: Barrier check — VPP threads.c:296
-        if barrier::barrier_check_and_report(&wait, &workers)
-            && !engine.apply_worker_graph_update_after_barrier()
+        if barrier::barrier_check_and_report(&wait, &workers, || {
+            engine.publish_worker_runtime_stats();
+        }) && !engine.apply_worker_graph_update_after_barrier()
         {
             return 1;
         }
 
         // Step 2: Poll worker-local File readiness before graph dispatch.
-        match engine.file_main_mut().and_then(|files| files.poll()) {
+        match engine.poll_file_readiness() {
             Ok(dispatched) => progress |= dispatched != 0,
             Err(error) => {
                 tracing::error!(worker = engine.thread_index, %error, "File poll failed");
                 return 1;
             }
         }
+        with_data_plane_runtime(|rt| {
+            if let Ok(scheduled) = rt.schedule_interrupt_driver_nodes() {
+                progress |= scheduled != 0;
+            }
+        });
 
         // Step 3: Drain handoff queues, run ready nodes, poll remote/local tasks
         with_data_plane_runtime(|rt| {
@@ -70,14 +104,29 @@ pub fn engine_main_loop(
             let _ = rt.run_ready_nodes();
         });
 
-        // Step 4: Tokio reactor tick
+        // Step 4: Tokio reactor tick. VPP sleeps inside `epoll_wait`
+        // (`vlib_file_poll`) so device readiness ends the idle wait
+        // immediately; select the File wake fd against the idle slice for the
+        // same behavior.
         if progress {
             runtime.block_on(async {
                 tokio::task::yield_now().await;
             });
         } else {
             runtime.block_on(async {
-                tokio::time::sleep(idle_slice).await;
+                match &io_wake {
+                    Some(wake) => tokio::select! {
+                        guard = wake.readable() => match guard {
+                            Ok(mut guard) => {
+                                engine.file_main().clear_io_wake();
+                                guard.clear_ready();
+                            }
+                            Err(_) => tokio::time::sleep(idle_slice).await,
+                        },
+                        _ = tokio::time::sleep(idle_slice) => {}
+                    },
+                    None => tokio::time::sleep(idle_slice).await,
+                }
             });
         }
 
@@ -103,14 +152,22 @@ pub fn engine_main_loop(
         engine.main_loop_count.fetch_add(1, Ordering::Relaxed);
 
         // Step 9: Exit check
-        if engine.main_loop_exit_now.load(Ordering::Relaxed) {
-            let status = *engine
-                .main_loop_exit_status
-                .lock()
-                .expect("engine_main_loop: poisoned exit status mutex");
+        if let Some(status) = requested_exit_status(engine) {
             return status;
         }
     }
+}
+
+fn requested_exit_status(engine: &Engine) -> Option<i32> {
+    if !engine.main_loop_exit_now.load(Ordering::Acquire) {
+        return None;
+    }
+    Some(
+        *engine
+            .main_loop_exit_status
+            .lock()
+            .expect("engine_main_loop: poisoned exit status mutex"),
+    )
 }
 
 #[cfg(test)]
@@ -172,18 +229,15 @@ mod tests {
 
         let main = Engine::new(rt, RuntimeRegistry::new());
         let mut engine = main.spawn(1).expect("spawn data worker");
-        let worker = engine.data_worker_id().expect("data worker id");
         let (registered, mut peer) = UnixStream::pair().expect("create socket pair");
         let index = engine
             .file_main_mut()
-            .expect("worker FileMain")
             .add(File::new(
                 OwnedFd::from(registered),
-                worker,
                 "main-loop readiness".to_owned(),
                 0,
                 FileFunctions {
-                    read: Some(|file| {
+                    read: Some(|_, file| {
                         file.set_private_data(1);
                         Ok(())
                     }),
@@ -210,7 +264,6 @@ mod tests {
         assert_eq!(
             engine
                 .file_main()
-                .expect("worker FileMain")
                 .get(index)
                 .expect("registered file")
                 .private_data(),

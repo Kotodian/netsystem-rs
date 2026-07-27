@@ -115,7 +115,7 @@ fn runtime_owner_registers_dispatches_traces_and_reports_stats() -> RuntimeResul
     );
 
     let trace = TraceControlPlane::new(8);
-    runtime.set_trace_control(Some(trace.handle()), 4);
+    runtime.set_trace_control(Some(trace.handle()));
     trace.publish(TracePolicy {
         enabled: true,
         record_capacity: 8,
@@ -125,6 +125,8 @@ fn runtime_owner_registers_dispatches_traces_and_reports_stats() -> RuntimeResul
             count: 1,
         }]),
     });
+    let worker = runtime.for_worker(1, 0)?;
+    assert!(worker.may_mark_trace(driver));
 
     let mut frame = runtime.buffers().get_next_frame(driver)?;
     frame.push_index(runtime.alloc_index_with_bytes(b"pkt")?)?;
@@ -147,6 +149,8 @@ fn runtime_owner_registers_dispatches_traces_and_reports_stats() -> RuntimeResul
     assert_eq!(driver_row.error_counters.get(5), 1);
 
     assert_eq!(trace.drain_completed(), 1);
+    assert_eq!(trace.records().len(), 1);
+    assert_eq!(trace.records().len(), 1);
     let records = trace.take_records();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].input_node, driver);

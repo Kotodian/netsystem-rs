@@ -1,9 +1,9 @@
 use hammer_infra::fifo::Fifo;
-use hammer_infra::segment::Local;
+use hammer_infra::segment::Segment;
 
-fn fifo(cap: usize) -> Fifo<Local> {
-    let seg = Local::new(cap * 16 + (1 << 20));
-    Fifo::<Local>::new(seg, cap).expect("fifo")
+fn fifo(cap: usize) -> Fifo {
+    let segment = Segment::local(cap * 16 + (1 << 20));
+    Fifo::new(segment, cap).expect("fifo")
 }
 
 #[test]
@@ -160,4 +160,17 @@ fn partial_overlap_ooo_enqueue_reports_retained_span_len() {
     assert_eq!(overlap.delivered, 0);
     assert_eq!(overlap.start, Some(5));
     assert_eq!(overlap.len, 7);
+}
+
+#[test]
+fn ooo_segment_storage_grows_on_demand() {
+    let mut f = fifo(1 << 16);
+    f.enable_ooo();
+
+    for offset in (1..=17).map(|index| index * 2) {
+        let result = f.enqueue_ooo(offset, &[offset as u8]).expect("ooo enqueue");
+        assert_eq!(result.accepted, 1);
+    }
+
+    assert_eq!(f.ooo_enqueued(), 17);
 }

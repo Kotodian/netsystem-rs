@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 const ROOT_BANNED_RUNTIME_IMPORTS: &[&str] = &[
     "DataPlaneRuntime",
     "DataPlaneRuntimeConfig",
-    "DataPlaneInstructionSet",
     "FrameBatchWidth",
     "DataWorkerId",
     "DataPlaneHandoff",
@@ -57,7 +56,6 @@ const RETIRED_ADAPTER_CONTRACT_IMPORTS: &[&str] = &[
 const DIRECT_BANNED_RUNTIME_OWNER_PATHS: &[&str] = &[
     "hammer_adapter::DataPlaneRuntime",
     "hammer_adapter::DataPlaneRuntimeConfig",
-    "hammer_adapter::DataPlaneInstructionSet",
     "hammer_adapter::FrameBatchWidth",
     "hammer_adapter::DataWorkerId",
     "hammer_adapter::DataPlaneHandoff",
@@ -90,7 +88,6 @@ const DIRECT_BANNED_RUNTIME_OWNER_PATHS: &[&str] = &[
     "hammer_adapter::add_packet_trace",
     "hammer_adapter::node::",
     "hammer_adapter::handoff::",
-    "hammer_adapter::instruction_set::",
     "hammer_adapter::trace::",
     "hammer_adapter::SocketProtector",
     "hammer_adapter::RuntimePlatform",
@@ -361,5 +358,5 @@ fn strip_alias(item: &str) -> &str {
 }
 
 fn is_banned_group_module(module: &str) -> bool {
-    matches!(module, "node" | "handoff" | "instruction_set" | "trace")
+    matches!(module, "node" | "handoff" | "trace")
 }

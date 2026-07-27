@@ -223,7 +223,7 @@ const _: () = assert!(align_of::<NetworkOpaque>() <= PRIMARY_OPAQUE_ALIGN);
 impl Default for NetworkOpaque {
     fn default() -> Self {
         Self {
-            sw_if_index: [0; 2],
+            sw_if_index: [u32::MAX; 2],
             l2_hdr_offset: 0,
             l3_hdr_offset: 0,
             l4_hdr_offset: 0,

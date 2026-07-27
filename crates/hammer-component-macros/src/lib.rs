@@ -40,9 +40,10 @@ impl Parse for NodeFunctionArgs {
 
 /// Registers multiarch Node Function candidates for an existing Graph Node.
 ///
-/// The function is compiled once per instruction-set variant supported by the
-/// target architecture. Conditional compilation attributes on the function gate
-/// every generated variant.
+/// The function is compiled once per supported SIMD width. A function may
+/// declare one `const SIMD_BYTES: usize` generic to receive that width.
+/// Conditional compilation attributes on the function gate every generated
+/// variant.
 #[proc_macro_attribute]
 pub fn node_function(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as NodeFunctionArgs);
@@ -53,6 +54,39 @@ pub fn node_function(args: TokenStream, input: TokenStream) -> TokenStream {
 fn expand_node_function(args: NodeFunctionArgs, function: ItemFn) -> TokenStream2 {
     let node = &args.node;
     let function_name = function.sig.ident.clone();
+    let has_simd_generic = match function.sig.generics.params.len() {
+        0 => false,
+        1 => match function.sig.generics.params.first() {
+            Some(GenericParam::Const(_)) => true,
+            _ => {
+                return Error::new_spanned(
+                    &function.sig.generics,
+                    "`node_function` only accepts a const SIMD-width generic",
+                )
+                .to_compile_error();
+            }
+        },
+        _ => {
+            return Error::new_spanned(
+                &function.sig.generics,
+                "`node_function` accepts at most one const SIMD-width generic",
+            )
+            .to_compile_error();
+        }
+    };
+    if has_simd_generic
+        && !matches!(
+            function.sig.generics.params.first(),
+            Some(GenericParam::Const(parameter))
+                if matches!(&parameter.ty, Type::Path(path) if path.path.is_ident("usize"))
+        )
+    {
+        return Error::new_spanned(
+            &function.sig.generics,
+            "the `node_function` SIMD-width generic must be `const ...: usize`",
+        )
+        .to_compile_error();
+    }
     // VPP recompiles one VLIB_NODE_FN body for each enabled march variant.
     // Generate the equivalent private symbols from one Rust declaration.
     let scalar = expand_node_function_variant(
@@ -60,54 +94,46 @@ fn expand_node_function(args: NodeFunctionArgs, function: ItemFn) -> TokenStream
         &function,
         function_name,
         "scalar",
-        quote!(::hammer_runtime::DataPlaneInstructionSet::Scalar),
+        1,
+        has_simd_generic,
         quote!(),
-        quote!(),
     );
-    let x86_architecture = quote!(#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]);
-    let sse2 = expand_node_function_variant(
+    let simd128 = expand_node_function_variant(
         node,
         &function,
-        format_ident!("__{}_sse2", function.sig.ident),
-        "sse2",
-        quote!(::hammer_runtime::DataPlaneInstructionSet::Sse2),
-        x86_architecture.clone(),
-        quote!(#[target_feature(enable = "sse2")]),
+        format_ident!("__{}_simd128", function.sig.ident),
+        "simd128",
+        16,
+        has_simd_generic,
+        quote!(
+            #[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "sse2"))]
+            #[cfg_attr(any(target_arch = "arm", target_arch = "aarch64"), target_feature(enable = "neon"))]
+        ),
     );
-    let avx2 = expand_node_function_variant(
+    let simd256 = expand_node_function_variant(
         node,
         &function,
-        format_ident!("__{}_avx2", function.sig.ident),
-        "avx2",
-        quote!(::hammer_runtime::DataPlaneInstructionSet::Avx2),
-        x86_architecture.clone(),
-        quote!(#[target_feature(enable = "avx2")]),
+        format_ident!("__{}_simd256", function.sig.ident),
+        "simd256",
+        32,
+        has_simd_generic,
+        quote!(#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx2"))]),
     );
-    let avx512 = expand_node_function_variant(
+    let simd512 = expand_node_function_variant(
         node,
         &function,
-        format_ident!("__{}_avx512", function.sig.ident),
-        "avx512",
-        quote!(::hammer_runtime::DataPlaneInstructionSet::Avx512),
-        x86_architecture,
-        quote!(#[target_feature(enable = "avx512f")]),
-    );
-    let neon = expand_node_function_variant(
-        node,
-        &function,
-        format_ident!("__{}_neon", function.sig.ident),
-        "neon",
-        quote!(::hammer_runtime::DataPlaneInstructionSet::Neon),
-        quote!(#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]),
-        quote!(#[target_feature(enable = "neon")]),
+        format_ident!("__{}_simd512", function.sig.ident),
+        "simd512",
+        64,
+        has_simd_generic,
+        quote!(#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx512f,avx512bw"))]),
     );
 
     quote! {
         #scalar
-        #sse2
-        #avx2
-        #avx512
-        #neon
+        #simd128
+        #simd256
+        #simd512
     }
 }
 
@@ -116,8 +142,8 @@ fn expand_node_function_variant(
     function: &ItemFn,
     function_name: Ident,
     suffix: &str,
-    instruction_set: TokenStream2,
-    architecture: TokenStream2,
+    simd_bytes: usize,
+    has_simd_generic: bool,
     target_feature: TokenStream2,
 ) -> TokenStream2 {
     let mut variant_function = function.clone();
@@ -133,19 +159,22 @@ fn expand_node_function_variant(
         function.sig.ident.to_string().to_ascii_uppercase(),
         suffix.to_ascii_uppercase(),
     );
+    let registered_function = if has_simd_generic {
+        quote!(#function_name::<#simd_bytes>)
+    } else {
+        quote!(#function_name)
+    };
     quote! {
-        #architecture
         #target_feature
         #variant_function
 
-        #architecture
         #(#input_cfg)*
         pub(crate) static #static_name: ::hammer_runtime::node::NodeFunctionRegistration =
             unsafe {
                 ::hammer_runtime::node::NodeFunctionRegistration::new(
                 #node::NODE_NAME,
-                #instruction_set,
-                #function_name,
+                ::hammer_runtime::Simd::<u8, #simd_bytes>::splat(0),
+                #registered_function,
                 )
             };
     }
@@ -398,7 +427,7 @@ fn parse_ident_array(input: ParseStream<'_>) -> Result<Vec<Ident>> {
 pub fn node(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as NodeArgs);
     let item = parse_macro_input!(input as ItemStruct);
-    expand_node(args, item, None, true)
+    expand_node(args, item, None, true, true)
         .unwrap_or_else(Error::into_compile_error)
         .into()
 }
@@ -549,6 +578,7 @@ fn expand_node(
     item: ItemStruct,
     declared_name: Option<LitStr>,
     allow_name_override: bool,
+    store_initial_nexts: bool,
 ) -> Result<TokenStream2> {
     let attrs = item.attrs;
     let vis = item.vis;
@@ -610,7 +640,7 @@ fn expand_node(
     if args.next.is_some() && has_field(&output_fields, "next") {
         return Err(Error::new(
             Span::call_site(),
-            "`node(next = ...)` injects a `next` field; remove the field from the struct",
+            "`node(next = ...)` owns the `next` field; remove it from the struct",
         ));
     }
     if args.next_node && has_field(&output_fields, "next") {
@@ -643,12 +673,15 @@ fn expand_node(
             output_fields.push(name_field);
             constructor_inits.push(quote!(node_name: Self::NODE_NAME));
         }
-        let field: Field = parse_quote! {
-            next: [::hammer_core::data_plane::NodeId; #next::COUNT]
-        };
-        output_fields.push(field);
-        constructor_params.push(quote!(next: [::hammer_core::data_plane::NodeId; #next::COUNT]));
-        constructor_inits.push(quote!(next));
+        if store_initial_nexts {
+            let field: Field = parse_quote! {
+                next: [::hammer_core::data_plane::NodeId; #next::COUNT]
+            };
+            output_fields.push(field);
+            constructor_params
+                .push(quote!(next: [::hammer_core::data_plane::NodeId; #next::COUNT]));
+            constructor_inits.push(quote!(next));
+        }
         next_impl = quote! {
             pub const NODE_NEXT_COUNT: usize = #next::COUNT;
         };
@@ -728,23 +761,24 @@ fn expand_node(
     } else {
         quote!()
     };
-    let initial_nexts_inherent_impl = if args.role.is_some() && args.next.is_some() {
-        quote! {
-            #[inline]
-            pub fn node_initial_nexts(&self) -> &[::hammer_core::data_plane::NodeId] {
-                &self.next
+    let initial_nexts_inherent_impl =
+        if args.role.is_some() && args.next.is_some() && store_initial_nexts {
+            quote! {
+                #[inline]
+                pub fn node_initial_nexts(&self) -> &[::hammer_core::data_plane::NodeId] {
+                    &self.next
+                }
             }
-        }
-    } else if args.role.is_some() {
-        quote! {
-            #[inline]
-            pub fn node_initial_nexts(&self) -> &[::hammer_core::data_plane::NodeId] {
-                &[]
+        } else if args.role.is_some() {
+            quote! {
+                #[inline]
+                pub fn node_initial_nexts(&self) -> &[::hammer_core::data_plane::NodeId] {
+                    &[]
+                }
             }
-        }
-    } else {
-        quote!()
-    };
+        } else {
+            quote!()
+        };
 
     let fields_named: FieldsNamed = parse_quote!({
         #(#output_fields),*
@@ -752,7 +786,7 @@ fn expand_node(
 
     let role_impl = match args.role {
         Some(NodeRole::Internal) => {
-            let initial_nexts = if args.next.is_some() {
+            let initial_nexts = if args.next.is_some() && store_initial_nexts {
                 quote! {
                     #[inline]
                     fn node_initial_nexts(&self) -> &[::hammer_core::data_plane::NodeId] {
@@ -776,7 +810,7 @@ fn expand_node(
             }
         }
         Some(NodeRole::Driver) => {
-            let initial_nexts = if args.next.is_some() {
+            let initial_nexts = if args.next.is_some() && store_initial_nexts {
                 quote! {
                     #[inline]
                     fn node_initial_nexts(&self) -> &[::hammer_core::data_plane::NodeId] {
@@ -1307,14 +1341,7 @@ fn generated_graph_node_init(
         graph_label,
         to_snake_case(&ident.to_string()),
     );
-    let constructor = if let Some(next) = &args.next {
-        quote!(#ident::new([
-            ::hammer_core::data_plane::NodeId::new(0);
-            #next::COUNT
-        ]))
-    } else {
-        quote!(#ident::new())
-    };
+    let constructor = quote!(#ident::new());
     let register = match (role, args.next.as_ref()) {
         (NodeRole::Driver, Some(next)) => quote!(
             runtime
@@ -1340,7 +1367,6 @@ fn generated_graph_node_init(
     let generated = quote! {
         fn #init_ident(
             runtime: &::hammer_runtime::DataPlaneRuntime,
-            _: usize,
         ) -> ::hammer_runtime::RuntimeResult<::hammer_core::data_plane::NodeId> {
             let node = #constructor;
             let node_id = #register;
@@ -1460,7 +1486,7 @@ fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<T
             role: effective_role,
             start_arc: args.start_arc.clone(),
         };
-        let node_output = expand_node(node_args, struct_item, args.name.clone(), false)?;
+        let node_output = expand_node(node_args, struct_item, args.name.clone(), false, false)?;
         Ok(quote! {
             #node_output
             #generated_init
@@ -2717,8 +2743,8 @@ mod tests {
         .expect("parse Node Function");
         let expanded = expand_node_function(args, function).to_string();
 
-        assert!(expanded.contains("DataPlaneInstructionSet :: Scalar"));
-        assert!(expanded.contains("target_arch = \"x86_64\""));
+        assert!(expanded.contains("Simd :: < u8 , 1usize > :: splat (0)"));
+        assert!(expanded.contains("SIMD128"));
         assert!(expanded.contains("target_feature (enable = \"avx2\")"));
         assert!(expanded.contains("target_feature (enable = \"neon\")"));
         assert!(expanded.contains("NodeFunctionRegistration :: new"));
@@ -2727,19 +2753,19 @@ mod tests {
     }
 
     #[test]
-    fn node_function_rejects_instruction_set_at_call_site() {
-        let error =
-            match syn::parse_str::<NodeFunctionArgs>("node = DeviceTxNode, instruction_set = sse2")
-            {
-                Ok(_) => panic!("Node Function march variants belong to the macro"),
-                Err(error) => error,
-            };
+    fn node_function_passes_simd_width_to_const_generic_body() {
+        let args = syn::parse_str::<NodeFunctionArgs>("node = DeviceTxNode")
+            .expect("parse Node Function args");
+        let function = syn::parse_str::<ItemFn>(
+            "fn device_tx<const SIMD_BYTES: usize>(runtime: &Runtime, data: Data, frame: &mut Frame) -> Result { body::<SIMD_BYTES>() }",
+        )
+        .expect("parse generic Node Function");
+        let expanded = expand_node_function(args, function).to_string();
 
-        assert!(
-            error
-                .to_string()
-                .contains("unknown `node_function` argument")
-        );
+        assert!(expanded.contains("device_tx :: < 1usize >"));
+        assert!(expanded.contains("__device_tx_simd128 :: < 16usize >"));
+        assert!(expanded.contains("__device_tx_simd256 :: < 32usize >"));
+        assert!(expanded.contains("__device_tx_simd512 :: < 64usize >"));
     }
 
     #[test]
@@ -2780,7 +2806,7 @@ mod tests {
         let args =
             syn::parse_str::<NodeArgs>("role = internal, next = OwnerNext").expect("parse next");
         let item = syn::parse_str::<ItemStruct>("pub struct OwnerNode;").expect("parse item");
-        let expanded = expand_node(args, item, None, true)
+        let expanded = expand_node(args, item, None, true, true)
             .expect("expand node")
             .to_string();
 
@@ -2798,7 +2824,7 @@ mod tests {
     fn plain_node_expansion_does_not_inject_node_name_override() {
         let args = syn::parse_str::<NodeArgs>("").expect("parse plain");
         let item = syn::parse_str::<ItemStruct>("pub struct PlainNode;").expect("parse item");
-        let expanded = expand_node(args, item, None, true)
+        let expanded = expand_node(args, item, None, true, true)
             .expect("expand node")
             .to_string();
 
@@ -2873,6 +2899,14 @@ mod tests {
         assert!(
             expanded.contains("try_register_driver_with_next_names"),
             "missing generated named-next registration: {expanded}"
+        );
+        assert!(
+            !expanded.contains("NodeId :: new (0)"),
+            "named-next graph init must not construct placeholder node ids: {expanded}"
+        );
+        assert!(
+            !expanded.contains("next : ["),
+            "named-next graph node must not store resolved next ids: {expanded}"
         );
         assert!(
             expanded.contains("NodeState :: Disabled"),

@@ -1,215 +1,255 @@
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::collections::VecDeque;
+use std::io;
+use std::os::fd::{AsRawFd, RawFd};
+use std::sync::{Arc, Weak};
 
+use crossbeam_queue::ArrayQueue;
+use hammer_infra::segment::Segment;
+use tokio::io::Interest;
+use tokio::sync::Notify;
+
+use crate::app::{AppSession, SessionEventQueue, SessionOffsets};
 use crate::{AttachError, RuntimeResult};
-use hammer_infra::fifo::Fifo;
-use hammer_infra::segment::{Segment, Svm};
 
-use crate::app::{
-    AppSession, AppSessionConfig, SessionHandle, SessionMsgQueue, SessionOffsets, SessionSegment,
-};
+pub const ATTACH_PROTOCOL_VERSION: u64 = 1;
+pub const ATTACH_DESCRIPTOR_COUNT: usize = 4;
+pub const ATTACH_METADATA_WORDS: usize = 8;
+pub const ATTACH_METADATA_BYTES: usize = ATTACH_METADATA_WORDS * size_of::<u64>();
 
-/// Server side of the Unix-domain-socket attach protocol.
-/// The dataplane binds a listener, accepts app connections, and sends
-/// shared-memory segment fds + offset layout to the app process.
-pub struct AppServer {
-    listener: std::os::unix::net::UnixListener,
+#[derive(Clone)]
+pub struct AppSessionPublication {
+    session: Arc<AppSession>,
+    session_segment: Segment,
+    tx_event_segment: Segment,
+    offsets: SessionOffsets,
 }
 
-/// Server-owned resources for one application session.
-///
-/// The session itself remains [`AppSession`]; the segment type only selects
-/// its storage backend. The layout and descriptor fields are protocol
-/// metadata needed by the application process.
-pub struct AppSessionResources<S: SessionSegment> {
-    pub session: AppSession<S>,
-    pub offsets: SessionOffsets,
-    pub shm_fd: RawFd,
+impl AppSessionPublication {
+    pub fn new(
+        session: Arc<AppSession>,
+        session_segment: Segment,
+        tx_event_segment: Segment,
+        offsets: SessionOffsets,
+    ) -> RuntimeResult<Self> {
+        if session_segment.shared_fd().is_none() || tx_event_segment.shared_fd().is_none() {
+            return Err(AttachError::SegmentDescriptorMissing.into());
+        }
+        if session.evt_q().read_fd().is_none() {
+            return Err(AttachError::SessionSignalMissing.into());
+        }
+        if session.tx_evt_q().write_fd().is_none() {
+            return Err(AttachError::TxEventSignalMissing.into());
+        }
+        Ok(Self {
+            session,
+            session_segment,
+            tx_event_segment,
+            offsets,
+        })
+    }
 }
 
-fn create_pipe_flags() -> RuntimeResult<(OwnedFd, OwnedFd)> {
-    let mut fds = [0i32; 2];
-    // SAFETY: fds is writable for two descriptors. Fresh descriptors are
-    // transferred into OwnedFd immediately on success.
-    let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
-    if ret != 0 {
-        return Err(AttachError::SignalPipeCreate {
-            source: std::io::Error::last_os_error(),
-        }
-        .into());
-    }
-    // SAFETY: pipe returned two fresh descriptors with unique ownership.
-    let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-    // SAFETY: ownership of the distinct write descriptor transfers once.
-    let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-    for fd in [&read, &write] {
-        // SAFETY: fcntl only queries the live descriptor owned above.
-        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
-        if flags < 0 {
-            return Err(AttachError::SignalStatusFlags {
-                source: std::io::Error::last_os_error(),
-            }
-            .into());
-        }
-        // SAFETY: queried flags are valid for this live descriptor.
-        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-            return Err(AttachError::SignalNonblocking {
-                source: std::io::Error::last_os_error(),
-            }
-            .into());
-        }
-        // SAFETY: fcntl only queries descriptor flags.
-        let descriptor_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
-        if descriptor_flags < 0 {
-            return Err(AttachError::SignalDescriptorFlags {
-                source: std::io::Error::last_os_error(),
-            }
-            .into());
-        }
-        // SAFETY: queried flags are valid for this live descriptor.
-        if unsafe {
-            libc::fcntl(
-                fd.as_raw_fd(),
-                libc::F_SETFD,
-                descriptor_flags | libc::FD_CLOEXEC,
-            )
-        } < 0
-        {
-            return Err(AttachError::SignalCloseOnExec {
-                source: std::io::Error::last_os_error(),
-            }
-            .into());
-        }
-    }
-    Ok((read, write))
+struct AppSessionPublicationQueue {
+    entries: ArrayQueue<AppSessionPublication>,
+    ready: Notify,
 }
 
-/// Pack the fds needed by the app process into a SCM_RIGHTS message
-/// and send them together with the offset layout over `stream`.
-fn send_attach_message(
-    stream: &std::os::unix::net::UnixStream,
-    shm_fd: RawFd,
-    evt_q_read_fd: RawFd,
-    tx_evt_q_write_fd: RawFd,
-    offsets: &SessionOffsets,
-) -> RuntimeResult<()> {
-    let fds = [shm_fd, evt_q_read_fd, tx_evt_q_write_fd];
-    let offsets_bytes: [u64; 4] = [
-        offsets.rx_fifo_off,
-        offsets.tx_fifo_off,
-        offsets.evt_q_off,
-        offsets.tx_evt_q_off,
-    ];
+#[derive(Clone)]
+pub struct AppSessionPublisher {
+    queue: Weak<AppSessionPublicationQueue>,
+}
 
-    let iov = libc::iovec {
-        iov_base: offsets_bytes.as_ptr() as *mut libc::c_void,
-        iov_len: std::mem::size_of_val(&offsets_bytes),
-    };
-
-    let mut cmsg_buf = [0u8; 80];
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &iov as *const _ as *mut _;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut _;
-    msg.msg_controllen = cmsg_buf.len() as _;
-
-    unsafe {
-        let cmsg = libc::CMSG_FIRSTHDR(&msg);
-        if cmsg.is_null() {
-            return Err(AttachError::ControlHeaderMissing.into());
-        }
-        (*cmsg).cmsg_level = libc::SOL_SOCKET;
-        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len = libc::CMSG_LEN((fds.len() * std::mem::size_of::<RawFd>()) as u32) as _;
-        std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(cmsg) as *mut RawFd, fds.len());
-        msg.msg_controllen = (*cmsg).cmsg_len as _;
-    }
-
-    let ret = unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, 0) };
-    if ret < 0 {
-        Err(AttachError::Send {
-            source: std::io::Error::last_os_error(),
-        }
-        .into())
-    } else {
+impl AppSessionPublisher {
+    pub fn try_publish(&self, publication: &AppSessionPublication) -> RuntimeResult<()> {
+        let queue = self
+            .queue
+            .upgrade()
+            .ok_or(AttachError::PublicationQueueClosed)?;
+        queue
+            .entries
+            .push(publication.clone())
+            .map_err(|_| AttachError::PublicationQueueFull)?;
+        queue.ready.notify_one();
         Ok(())
     }
 }
 
+pub struct AppServer {
+    listener: std::os::unix::net::UnixListener,
+    publications: Arc<AppSessionPublicationQueue>,
+    capacity: usize,
+}
+
 impl AppServer {
-    /// Bind to a Unix domain socket at `path`.
-    pub fn bind(path: &str) -> RuntimeResult<Self> {
+    pub fn bind(path: &str, capacity: usize) -> RuntimeResult<Self> {
+        if capacity == 0 {
+            return Err(AttachError::PublicationCapacityInvalid.into());
+        }
         let _ = std::fs::remove_file(path);
         let listener =
             std::os::unix::net::UnixListener::bind(path).map_err(|source| AttachError::Bind {
                 path: path.into(),
                 source,
             })?;
-        Ok(Self { listener })
+        listener
+            .set_nonblocking(true)
+            .map_err(|source| AttachError::ListenerNonblocking { source })?;
+        Ok(Self {
+            listener,
+            publications: Arc::new(AppSessionPublicationQueue {
+                entries: ArrayQueue::new(capacity),
+                ready: Notify::new(),
+            }),
+            capacity,
+        })
     }
 
-    /// Accept a single app process connection and set up a shared-memory
-    /// session. Returns the [`AppSessionResources`] held by the dataplane and
-    /// and the metadata the app process needs to reconstruct its side.
-    pub fn accept(
-        &self,
-        config: AppSessionConfig,
-        seg: &Svm,
-        handle: SessionHandle,
-    ) -> RuntimeResult<AppSessionResources<Svm>> {
-        let offsets =
-            SessionOffsets::allocate(seg, config.fifo_capacity as u32, config.evt_q_capacity);
-
-        unsafe {
-            Fifo::<Svm>::init_at(seg.clone(), offsets.rx_fifo_off, config.fifo_capacity)
-                .map_err(|_| AttachError::RxFifoInvalid)?;
-            Fifo::<Svm>::init_at(seg.clone(), offsets.tx_fifo_off, config.fifo_capacity)
-                .map_err(|_| AttachError::TxFifoInvalid)?;
+    #[inline]
+    pub fn publisher(&self) -> AppSessionPublisher {
+        AppSessionPublisher {
+            queue: Arc::downgrade(&self.publications),
         }
+    }
 
-        let ring_nitems = config.evt_q_capacity.max(1) as u32;
-        let q_nitems = (config.evt_q_capacity + 1).next_power_of_two().max(2) as u32;
-        unsafe {
-            SessionMsgQueue::<Svm>::init_at(seg.clone(), offsets.evt_q_off, q_nitems, ring_nitems)
-                .map_err(|_| AttachError::EventQueueInvalid)?;
-            SessionMsgQueue::<Svm>::init_at(seg.clone(), offsets.tx_evt_q_off, 64, 64)
-                .map_err(|_| AttachError::TxEventQueueInvalid)?;
-        }
-
-        // Create signal pipe pairs for cross-process notification.
-        let (evt_q_read, evt_q_write) = create_pipe_flags()?;
-        let (tx_evt_q_read, tx_evt_q_write) = create_pipe_flags()?;
-
-        let session = unsafe {
-            AppSession::<Svm>::from_segment(
-                handle,
-                seg,
-                &offsets,
-                None,
-                Some(evt_q_write.into_raw_fd()),
-                Some(tx_evt_q_read.into_raw_fd()),
-                None,
-            )
-        };
-
-        let (stream, _) = self
+    pub async fn serve(self: Arc<Self>) -> RuntimeResult<()> {
+        let listener = self
             .listener
-            .accept()
-            .map_err(|source| AttachError::Accept { source })?;
+            .try_clone()
+            .map_err(|source| AttachError::ListenerRegistration { source })?;
+        let listener = tokio::net::UnixListener::from_std(listener)
+            .map_err(|source| AttachError::ListenerRegistration { source })?;
+        let mut clients: VecDeque<tokio::net::UnixStream> = VecDeque::with_capacity(self.capacity);
+        let mut publication: Option<AppSessionPublication> = None;
 
-        let shm_fd = seg.fd().ok_or(AttachError::SegmentDescriptorMissing)?;
+        loop {
+            if publication.is_some() && !clients.is_empty() {
+                let (Some(client), Some(current)) = (clients.pop_front(), publication.take())
+                else {
+                    continue;
+                };
+                let attach_result: RuntimeResult<()> = async {
+                    let descriptors: [RawFd; ATTACH_DESCRIPTOR_COUNT] = [
+                        current
+                            .session_segment
+                            .shared_fd()
+                            .ok_or(AttachError::SegmentDescriptorMissing)?,
+                        current
+                            .tx_event_segment
+                            .shared_fd()
+                            .ok_or(AttachError::SegmentDescriptorMissing)?,
+                        current
+                            .session
+                            .evt_q()
+                            .read_fd()
+                            .ok_or(AttachError::SessionSignalMissing)?,
+                        current
+                            .session
+                            .tx_evt_q()
+                            .write_fd()
+                            .ok_or(AttachError::TxEventSignalMissing)?,
+                    ];
+                    let words = [
+                        ATTACH_PROTOCOL_VERSION,
+                        current.session.session_handle().raw(),
+                        current.session_segment.size() as u64,
+                        current.tx_event_segment.size() as u64,
+                        current.offsets.rx_fifo_off,
+                        current.offsets.tx_fifo_off,
+                        current.offsets.evt_q_off,
+                        current.offsets.tx_evt_q_off,
+                    ];
+                    let mut metadata = [0_u8; ATTACH_METADATA_BYTES];
+                    for (chunk, word) in metadata.chunks_exact_mut(size_of::<u64>()).zip(words) {
+                        chunk.copy_from_slice(&word.to_le_bytes());
+                    }
 
-        send_attach_message(
-            &stream,
-            shm_fd,
-            evt_q_read.as_raw_fd(),
-            tx_evt_q_write.as_raw_fd(),
-            &offsets,
-        )?;
+                    loop {
+                        client
+                            .writable()
+                            .await
+                            .map_err(|source| AttachError::Send { source })?;
+                        let sent = client.try_io(Interest::WRITABLE, || {
+                            let iov = libc::iovec {
+                                iov_base: metadata.as_ptr().cast_mut().cast::<libc::c_void>(),
+                                iov_len: metadata.len(),
+                            };
+                            let mut control = [0_u8; 128];
+                            let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+                            message.msg_iov = std::ptr::from_ref(&iov).cast_mut();
+                            message.msg_iovlen = 1;
+                            message.msg_control = control.as_mut_ptr().cast::<libc::c_void>();
+                            message.msg_controllen = control.len() as _;
 
-        Ok(AppSessionResources {
-            session,
-            offsets,
-            shm_fd,
-        })
+                            unsafe {
+                                let header = libc::CMSG_FIRSTHDR(&message);
+                                if header.is_null() {
+                                    return Err(io::Error::other(
+                                        "attach control header is missing",
+                                    ));
+                                }
+                                (*header).cmsg_level = libc::SOL_SOCKET;
+                                (*header).cmsg_type = libc::SCM_RIGHTS;
+                                (*header).cmsg_len = libc::CMSG_LEN(
+                                    std::mem::size_of_val(&descriptors) as u32,
+                                ) as _;
+                                std::ptr::copy_nonoverlapping(
+                                    descriptors.as_ptr(),
+                                    libc::CMSG_DATA(header).cast::<RawFd>(),
+                                    descriptors.len(),
+                                );
+                                message.msg_controllen = (*header).cmsg_len;
+                            }
+
+                            let sent = unsafe { libc::sendmsg(client.as_raw_fd(), &message, 0) };
+                            if sent < 0 {
+                                Err(io::Error::last_os_error())
+                            } else {
+                                Ok(sent as usize)
+                            }
+                        });
+                        match sent {
+                            Ok(sent) if sent == metadata.len() => break,
+                            Ok(sent) => {
+                                return Err(AttachError::Send {
+                                    source: io::Error::new(
+                                        io::ErrorKind::WriteZero,
+                                        format!(
+                                            "attach metadata write was partial: expected {}, sent {sent}",
+                                            metadata.len()
+                                        ),
+                                    ),
+                                }
+                                .into());
+                            }
+                            Err(source) if source.kind() == io::ErrorKind::WouldBlock => continue,
+                            Err(source) => return Err(AttachError::Send { source }.into()),
+                        }
+                    }
+                    Ok(())
+                }
+                .await;
+
+                if let Err(error) = attach_result {
+                    tracing::warn!(%error, "failed to attach application client");
+                    publication = Some(current);
+                }
+                continue;
+            }
+
+            if publication.is_none() {
+                publication = self.publications.entries.pop();
+                if publication.is_some() {
+                    continue;
+                }
+            }
+
+            tokio::select! {
+                accepted = listener.accept(), if clients.len() < self.capacity => {
+                    let (client, _) = accepted.map_err(|source| AttachError::Accept { source })?;
+                    clients.push_back(client);
+                }
+                () = self.publications.ready.notified(), if publication.is_none() => {}
+            }
+        }
     }
 }

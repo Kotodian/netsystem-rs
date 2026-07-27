@@ -3,20 +3,23 @@ use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 use std::time::Instant;
 
-use hammer_core::data_plane::{BufferFrame, DataPlaneBuffers, Frame, Index, Next};
+use hammer_core::data_plane::{BufferFrame, DataPlaneBuffers, Index as BufferIndex};
+use hammer_infra::align::CacheLine;
 use hammer_infra::fifo_queue::FifoQueue;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
-use hammer_infra::segment::{Local, Segment, Svm};
+use hammer_infra::segment::Segment;
+use hammer_infra::thread_owned::ThreadOwned;
 use hammer_runtime::app::{
     AppSessionConfig, SessionEventQueue, SessionEvtType, SessionHandle, SessionMsgQueue,
-    SessionSegment, with_current_app_worker,
 };
+use hammer_runtime::attach::AppSessionPublisher;
 use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
 use hammer_runtime::{DataPlaneRuntime, DataWorkerId, Engine, File, FileFunctions};
 
-use crate::session::app::SessionAppRuntimeCreate;
+use crate::session::app::{AppWorkerAttach, AppWorkerError};
+use crate::session::error::{SessionError, SessionQueueError};
 use crate::session::state::SessionState;
-use crate::session::{SessionAppRuntime, SessionId, SessionQueueNext};
+use crate::session::{AppWorker, SessionId, SessionQueueNext};
 
 const DEFAULT_SESSION_POOL_CAPACITY: usize = 1024;
 const DEFAULT_SESSION_TX_EVENT_CAPACITY: usize = 2048;
@@ -92,80 +95,130 @@ struct SessionEntry<Index> {
     schedule_pending: bool,
 }
 
-impl<Index> SessionEntry<Index> {
+impl<Index: Copy + Eq> SessionEntry<Index> {
     #[inline]
     const fn creating(transport: SessionTransportId) -> Self {
         Self {
             transport,
-            state: SessionState::TransportDeleted,
+            state: SessionState::creating(),
             schedule_pending: false,
         }
     }
 }
 
-pub struct SessionWorker<Index, Seg: SessionSegment = Local> {
+pub struct SessionWorker<Index> {
     worker: DataWorkerId,
     entries: Pool<SessionEntry<Index>>,
-    app: SessionAppRuntime<Seg>,
+    app: AppWorker,
     app_session_config: AppSessionConfig,
-    buffers: DataPlaneBuffers,
     session_work: Vec<SessionId>,
     session_work_scratch: Vec<SessionId>,
+    app_rx_events: FifoQueue<SessionId>,
     control_events: FifoQueue<SessionControlEvent>,
     readiness_file: Option<PoolIndex>,
 }
 
-impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
-    fn with_app_session_config(
-        worker: DataWorkerId,
-        buffers: DataPlaneBuffers,
-        app_session_config: AppSessionConfig,
-        seg: Seg,
-        worker_index: usize,
-        tx_evt_q: Arc<Seg::EventQueue>,
-    ) -> Self {
-        Self {
-            worker,
-            entries: Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
-            app: SessionAppRuntime::new(
-                DEFAULT_SESSION_POOL_CAPACITY,
-                buffers.clone(),
-                tx_evt_q,
-                worker_index,
-                seg,
-            ),
-            app_session_config,
-            buffers,
-            session_work: Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
-            session_work_scratch: Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
-            control_events: FifoQueue::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
-            readiness_file: None,
-        }
+pub struct SessionMain {
+    workers: Box<[CacheLine<ThreadOwned<SessionWorker<PoolIndex>>>]>,
+}
+
+fn session_worker_error(error: SessionQueueError) -> RuntimeError {
+    RuntimeError::subsystem("session", error)
+}
+
+impl SessionMain {
+    pub fn new(worker_count: usize) -> Self {
+        let workers = (0..worker_count)
+            .map(|_| CacheLine::new(ThreadOwned::new()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self { workers }
     }
 
+    fn worker(
+        &self,
+        worker: DataWorkerId,
+    ) -> RuntimeResult<&ThreadOwned<SessionWorker<PoolIndex>>> {
+        self.workers
+            .get(worker.slot())
+            .map(|slot| &**slot)
+            .ok_or_else(|| {
+                session_worker_error(SessionQueueError::WorkerOutOfRange {
+                    worker: worker.slot(),
+                })
+            })
+    }
+
+    pub fn with_worker_mut<R>(
+        &self,
+        runtime: &DataPlaneRuntime,
+        operation: impl FnOnce(&mut SessionWorker<PoolIndex>) -> RuntimeResult<R>,
+    ) -> RuntimeResult<R> {
+        let thread_index = runtime.thread_index();
+        let worker = thread_index
+            .checked_sub(1)
+            .map(DataWorkerId::new)
+            .ok_or_else(|| {
+                session_worker_error(SessionQueueError::WorkerUnavailable { thread_index })
+            })?;
+        self.worker(worker)?.with_mut(operation).map_err(|source| {
+            session_worker_error(SessionQueueError::WorkerAccess {
+                worker: worker.slot(),
+                source,
+            })
+        })?
+    }
+}
+
+pub fn install_session_worker(
+    main: &SessionMain,
+    engine: &mut Engine,
+    session_queue: hammer_core::data_plane::NodeId,
+    mut worker: SessionWorker<PoolIndex>,
+) -> RuntimeResult<()> {
+    worker.install_queue_readiness(engine, session_queue)?;
+    let worker_id = worker.worker();
+    let slot = main.worker(worker_id)?;
+    if let Err(mut worker) = slot.install(worker) {
+        worker.remove_queue_readiness(engine)?;
+        return Err(session_worker_error(
+            SessionQueueError::WorkerAlreadyInstalled {
+                worker: worker_id.slot(),
+            },
+        ));
+    }
+    Ok(())
+}
+
+impl<Index: Copy + Eq> SessionWorker<Index> {
     #[inline]
     pub const fn worker(&self) -> DataWorkerId {
         self.worker
     }
 
     #[inline]
-    pub fn app(&self) -> &SessionAppRuntime<Seg> {
+    pub fn app_session_config(&self) -> AppSessionConfig {
+        self.app_session_config
+    }
+
+    #[inline]
+    pub fn queue_signal_descriptor(&self) -> Option<std::os::fd::RawFd> {
+        self.app.tx_evt_q().read_fd()
+    }
+
+    #[inline]
+    pub fn signal_queue(&self) {
+        self.app.tx_evt_q().fire();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_app(&self) -> &AppWorker {
         &self.app
     }
 
-    #[inline]
-    pub fn app_mut(&mut self) -> &mut SessionAppRuntime<Seg> {
+    #[cfg(test)]
+    pub(crate) fn local_app_mut(&mut self) -> &mut AppWorker {
         &mut self.app
-    }
-
-    #[inline]
-    pub fn buffers(&self) -> &DataPlaneBuffers {
-        &self.buffers
-    }
-
-    #[inline]
-    pub fn app_session_config(&self) -> AppSessionConfig {
-        self.app_session_config
     }
 
     /// Registers the session queue signal with the worker FileMain.
@@ -186,11 +239,10 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
         let signal_read = unsafe { BorrowedFd::borrow_raw(signal_read_fd) }
             .try_clone_to_owned()
             .map_err(|source| AttachError::SessionSignalDuplicate { source })?;
-        let worker = engine.data_worker_id()?;
-        let file = engine.file_main_mut()?.add(File::new(
+        engine.data_worker_id()?;
+        let file = engine.file_main_mut().add(File::new(
             signal_read,
-            worker,
-            "SVM session queue app-to-dataplane signal".to_owned(),
+            "app-to-session queue signal".to_owned(),
             u64::from(session_queue.slot()),
             FileFunctions {
                 read: Some(schedule_session_queue),
@@ -206,7 +258,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
         let Some(file) = self.readiness_file else {
             return Ok(());
         };
-        let _ = engine.file_main_mut()?.delete(file)?;
+        let _ = engine.file_main_mut().delete(file)?;
         self.readiness_file = None;
         Ok(())
     }
@@ -227,7 +279,35 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
         self.entries.prefetch_slot(session_id.pool_index());
     }
 
-    pub fn insert_creating_session(
+    pub fn stream_accept(
+        &mut self,
+        transport: SessionTransportId,
+        index: Index,
+        listener: u32,
+    ) -> RuntimeResult<SessionId> {
+        let session_id = self.insert_creating_session(transport)?;
+        let handle = SessionHandle::new(session_id.pool_index().slot(), self.worker.slot() as u32);
+        let tx_evt_q = self.app.tx_evt_q().clone();
+        let app_session =
+            match self
+                .app
+                .create_app_session(listener, handle, self.app_session_config, tx_evt_q)
+            {
+                Ok(session) => session,
+                Err(error) => {
+                    self.remove_session_entry(session_id);
+                    return Err(error);
+                }
+            };
+        self.app.attach_session(session_id, app_session);
+        if let Err(error) = self.finish_session_creation(session_id, index) {
+            self.remove_session_entry(session_id);
+            return Err(error);
+        }
+        Ok(session_id)
+    }
+
+    fn insert_creating_session(
         &mut self,
         transport: SessionTransportId,
     ) -> RuntimeResult<SessionId> {
@@ -237,10 +317,15 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
                 SessionEntry::creating(transport)
             })
             .map(SessionId::from)
-            .ok_or_else(|| RuntimeError::invariant("session pool capacity exhausted"))
+            .ok_or_else(|| {
+                SessionError::CapacityExhausted {
+                    capacity: self.entries.capacity(),
+                }
+                .into()
+            })
     }
 
-    pub fn finish_session_creation(
+    fn finish_session_creation(
         &mut self,
         session_id: SessionId,
         index: Index,
@@ -248,9 +333,41 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
         let entry = self
             .entries
             .get_mut(session_id.pool_index())
-            .ok_or_else(|| RuntimeError::invariant("session is missing"))?;
-        entry.state = SessionState::active(index);
+            .ok_or(SessionError::SessionMissing { session_id })?;
+        entry.state = entry
+            .state
+            .finish_creation(index)
+            .ok_or(SessionError::NotCreating { session_id })?;
         Ok(())
+    }
+
+    pub fn connection_published(&mut self, session_id: SessionId) -> RuntimeResult<bool> {
+        let entry = self
+            .entries
+            .get_mut(session_id.pool_index())
+            .ok_or(SessionError::SessionMissing { session_id })?;
+        let (state, initial) = entry
+            .state
+            .on_connection_published()
+            .ok_or(SessionError::PublicationRejected { session_id })?;
+        entry.state = state;
+        Ok(initial)
+    }
+
+    pub fn rollback_session_creation(
+        &mut self,
+        session_id: SessionId,
+    ) -> RuntimeResult<Option<Index>> {
+        let entry = self
+            .entries
+            .get(session_id.pool_index())
+            .ok_or(SessionError::SessionMissing { session_id })?;
+        let index = entry
+            .state
+            .rollback_index()
+            .map_err(|_| SessionError::RollbackRejected { session_id })?;
+        self.remove_session_entry(session_id);
+        Ok(index)
     }
 
     pub fn insert_session_for_test(
@@ -263,16 +380,15 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
             .expect("session pool capacity exhausted");
         self.finish_session_creation(session_id, index)
             .expect("finish session creation");
+        self.connection_published(session_id)
+            .expect("publish session connection");
+        self.connected(session_id).expect("connect session");
         session_id
     }
 
-    pub fn remove_session_entry(&mut self, session_id: SessionId) -> bool {
+    fn remove_session_entry(&mut self, session_id: SessionId) -> bool {
         self.app.discard_all_tx_bytes_for_session(session_id);
         let _ = self.app.detach_session(session_id);
-        let handle = SessionHandle::new(session_id.pool_index().slot(), self.worker.slot() as u32);
-        with_current_app_worker(self.worker.slot(), |worker| {
-            let _ = worker.detach_session(handle);
-        });
         self.entries.remove(session_id.pool_index()).is_some()
     }
 
@@ -280,10 +396,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
         &mut self,
         session_id: SessionId,
         index: Index,
-    ) -> RuntimeResult<()>
-    where
-        SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-    {
+    ) -> RuntimeResult<()> {
         let notify_app = self
             .entries
             .get_mut(session_id.pool_index())
@@ -336,6 +449,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
     pub fn poll_app(&mut self) -> RuntimeResult<()> {
         let entries = &mut self.entries;
         let session_work = &mut self.session_work;
+        let app_rx_events = &mut self.app_rx_events;
         let control_events = &mut self.control_events;
         self.app
             .drain_tx_events_to(|session_id, evt_type| match evt_type {
@@ -350,6 +464,7 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
                 SessionEvtType::Close => {
                     control_events.push_back(SessionControlEvent::Disconnect(session_id));
                 }
+                SessionEvtType::RxDeq => app_rx_events.push_back(session_id),
                 SessionEvtType::RxEnq | SessionEvtType::Connect => {}
             });
         Ok(())
@@ -371,52 +486,47 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
         self.session_work_scratch = work;
     }
 
-    pub fn ack_tx_up_to(&mut self, session_id: SessionId, bytes: usize) -> RuntimeResult<()>
-    where
-        SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-    {
-        let _ = self.app.discard_acked_tx_bytes(session_id, bytes)?;
-        Ok(())
+    pub fn ack_tx_up_to(&mut self, session_id: SessionId, bytes: usize) -> RuntimeResult<()> {
+        self.app
+            .discard_acked_tx_bytes(session_id, bytes)
+            .map(|_| ())
     }
 
     pub fn enqueue_rx(
         &self,
+        buffers: &DataPlaneBuffers,
         session_id: SessionId,
-        index: hammer_core::data_plane::Index,
+        index: BufferIndex,
         offset: u32,
         urgent: bool,
-    ) -> RuntimeResult<RxDelivery>
-    where
-        SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-    {
+    ) -> RuntimeResult<RxDelivery> {
         if offset == 0 {
-            let (accepted, promoted) =
-                self.app
-                    .copy_rx_from_buffer(session_id, &self.buffers, index, urgent)?;
+            let (accepted, promoted) = self
+                .app
+                .copy_rx_from_buffer(session_id, buffers, index, urgent)?;
             let rx_available = self.rx_available_u32(session_id);
-            return Ok(match NonZeroU32::new(accepted) {
+            let delivery = match NonZeroU32::new(accepted) {
                 Some(accepted) => RxDelivery::InOrder {
                     accepted,
                     promoted,
                     rx_available,
                 },
                 None => RxDelivery::NotAccepted { rx_available },
-            });
+            };
+            if rx_available == 0 {
+                self.app.request_rx_dequeue_notification(session_id);
+            }
+            return Ok(delivery);
         }
-        let (accepted, newest) =
-            self.app
-                .copy_rx_from_buffer_ooo(session_id, &self.buffers, index, offset)?;
+        let (accepted, newest) = self
+            .app
+            .copy_rx_from_buffer_ooo(session_id, buffers, index, offset)?;
         let rx_available = self.rx_available_u32(session_id);
-        Ok(match NonZeroU32::new(accepted) {
+        let delivery = match NonZeroU32::new(accepted) {
             Some(accepted) => {
-                let (start, len) = newest.ok_or_else(|| {
-                    RuntimeError::invariant("accepted OOO delivery must report a retained span")
-                })?;
-                let len = NonZeroU32::new(len).ok_or_else(|| {
-                    RuntimeError::invariant(
-                        "accepted OOO delivery must report non-zero span length",
-                    )
-                })?;
+                let (start, len) = newest.ok_or(SessionError::OooSpanMissing { session_id })?;
+                let len =
+                    NonZeroU32::new(len).ok_or(SessionError::OooSpanInvalid { session_id })?;
                 RxDelivery::OutOfOrder {
                     accepted,
                     newest: OooSpan::new(start, len),
@@ -424,12 +534,52 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
                 }
             }
             None => RxDelivery::NotAccepted { rx_available },
-        })
+        };
+        if rx_available == 0 {
+            self.app.request_rx_dequeue_notification(session_id);
+        }
+        Ok(delivery)
     }
 
     #[inline]
     pub fn rx_available_len(&self, session_id: SessionId) -> Option<usize> {
         self.app.rx_available_len(session_id)
+    }
+
+    #[inline]
+    pub fn pending_send_len(&self, session_id: SessionId) -> RuntimeResult<Option<usize>> {
+        self.app.pending_send_len(session_id)
+    }
+
+    #[inline]
+    pub fn has_pending_send(&self, session_id: SessionId) -> bool {
+        self.pending_send_len(session_id).ok().flatten().is_some()
+    }
+
+    pub fn connected(&mut self, session_id: SessionId) -> RuntimeResult<()> {
+        let Self { entries, app, .. } = self;
+        let entry = entries
+            .get_mut(session_id.pool_index())
+            .ok_or(SessionError::SessionMissing { session_id })?;
+        let connected = entry
+            .state
+            .on_connected()
+            .ok_or(SessionError::NotPublished { session_id })?;
+        app.connected(session_id)?;
+        entry.state = connected;
+        Ok(())
+    }
+
+    pub fn copy_tx_to_buffer(
+        &self,
+        buffers: &DataPlaneBuffers,
+        session_id: SessionId,
+        offset: usize,
+        len: usize,
+        index: BufferIndex,
+    ) -> RuntimeResult<()> {
+        self.app
+            .copy_tx_to_buffer(buffers, session_id, offset, len, index)
     }
 
     #[inline]
@@ -440,65 +590,83 @@ impl<Index: Copy + Eq, Seg: SessionSegment> SessionWorker<Index, Seg> {
     }
 }
 
-impl<Index: Copy + Eq> SessionWorker<Index, Local> {
-    pub fn new(worker: DataWorkerId, buffers: DataPlaneBuffers) -> Self {
-        let cap = DEFAULT_SESSION_TX_EVENT_CAPACITY.next_power_of_two().max(2) as u32;
-        let tx_evt_q =
-            Arc::new(SessionMsgQueue::with_cfg(cap, cap.max(2)).expect("local tx_evt_q"));
-        Self::with_app_session_config(
-            worker,
-            buffers,
-            AppSessionConfig::default(),
-            Local::default(),
-            worker.slot(),
-            tx_evt_q,
-        )
+impl<Index: Copy + Eq> SessionWorker<Index> {
+    pub fn new(worker: DataWorkerId) -> RuntimeResult<Self> {
+        Self::with_app_session_config(worker, AppSessionConfig::default())
     }
 
-    pub fn with_session_config(
+    pub fn with_app_session_config(
         worker: DataWorkerId,
-        buffers: DataPlaneBuffers,
         app_session_config: AppSessionConfig,
-    ) -> Self {
+    ) -> RuntimeResult<Self> {
         let cap = DEFAULT_SESSION_TX_EVENT_CAPACITY.next_power_of_two().max(2) as u32;
-        let tx_evt_q =
-            Arc::new(SessionMsgQueue::with_cfg(cap, cap.max(2)).expect("local tx_evt_q"));
-        let sessions = Self::with_app_session_config(
-            worker,
-            buffers,
-            app_session_config,
-            Local::default(),
-            worker.slot(),
-            tx_evt_q,
+        let layout = SessionMsgQueue::layout_bytes(cap, cap.max(2))
+            .map_err(|error| AppWorkerError::TxEventQueue { error })?;
+        let segment = Segment::local(
+            layout
+                .checked_add(128)
+                .ok_or(AppWorkerError::TxEventQueueLayoutOverflow)?,
         );
-        sessions
+        let offset = segment
+            .alloc(layout, 64)
+            .ok_or(AppWorkerError::TxEventQueueSegmentExhausted)?;
+        let tx_evt_q = Arc::new(
+            unsafe { SessionMsgQueue::init_at_with_signal(segment, offset, cap, cap.max(2)) }
+                .map_err(|error| AppWorkerError::TxEventQueue { error })?,
+        );
+        let app = AppWorker::new(DEFAULT_SESSION_POOL_CAPACITY, tx_evt_q, worker.slot());
+        Ok(Self::from_app(worker, app_session_config, app))
     }
-}
 
-impl<Index: Copy + Eq> SessionWorker<Index, Svm> {
-    pub fn new_svm(
+    pub(crate) fn with_app_session_attach(
         worker: DataWorkerId,
-        buffers: DataPlaneBuffers,
         app_session_config: AppSessionConfig,
-    ) -> Self {
-        let seg = Svm::default();
+        publisher: AppSessionPublisher,
+    ) -> RuntimeResult<Self> {
         let cap = DEFAULT_SESSION_TX_EVENT_CAPACITY.next_power_of_two().max(2) as u32;
-        let layout = SessionMsgQueue::<Svm>::layout_bytes(cap, cap.max(2)).expect("tx layout");
-        let off = seg.alloc(layout, 64);
+        let layout = SessionMsgQueue::layout_bytes(cap, cap.max(2))
+            .map_err(|error| AppWorkerError::TxEventQueue { error })?;
+        let segment = Segment::shared(
+            &format!("hammer-tx-event-w{}", worker.slot()),
+            layout
+                .checked_add(128)
+                .ok_or(AppWorkerError::TxEventQueueLayoutOverflow)?,
+        )
+        .map_err(|source| RuntimeError::subsystem("session", source))?;
+        let offset = segment
+            .alloc(layout, 64)
+            .ok_or(AppWorkerError::TxEventQueueSegmentExhausted)?;
         let tx_evt_q = Arc::new(
             unsafe {
-                SessionMsgQueue::<Svm>::init_at_with_signal(seg.clone(), off, cap, cap.max(2))
+                SessionMsgQueue::init_at_with_signal(segment.clone(), offset, cap, cap.max(2))
             }
-            .expect("svm tx_evt_q"),
+            .map_err(|error| AppWorkerError::TxEventQueue { error })?,
         );
-        Self::with_app_session_config(
-            worker,
-            buffers,
-            app_session_config,
-            seg,
-            worker.slot(),
+        let app = AppWorker::with_attach(
+            DEFAULT_SESSION_POOL_CAPACITY,
             tx_evt_q,
-        )
+            worker.slot(),
+            AppWorkerAttach::new(publisher, segment, offset),
+        );
+        Ok(Self::from_app(worker, app_session_config, app))
+    }
+
+    fn from_app(
+        worker: DataWorkerId,
+        app_session_config: AppSessionConfig,
+        app: AppWorker,
+    ) -> Self {
+        Self {
+            worker,
+            entries: Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
+            app,
+            app_session_config,
+            session_work: Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
+            session_work_scratch: Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
+            app_rx_events: FifoQueue::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
+            control_events: FifoQueue::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
+            readiness_file: None,
+        }
     }
 }
 
@@ -520,19 +688,37 @@ pub struct TransportSendParams {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TxBatchBuffer {
-    pub index: Index,
+    pub index: BufferIndex,
     pub tx_offset: usize,
     pub payload_len: usize,
 }
 
-pub trait SessionTransport<Index, Seg: SessionSegment>: Sized {
-    type Tx: SessionTxStrategy<Self, Index, Seg>;
+pub trait SessionTransport<Index>: Sized {
+    type Tx: SessionTxStrategy<Self, Index>;
 
     const ID: SessionTransportId;
 
+    /// Handles an application dequeue from the session-owned RX FIFO.
+    ///
+    /// Returning `true` asks Session Runtime to arm the next RX dequeue
+    /// notification. The transport receives FIFO capacity facts but no FIFO
+    /// or app scheduling authority.
+    fn app_rx_evt(
+        &mut self,
+        _: Index,
+        _: usize,
+        _: usize,
+        _: &DataPlaneRuntime,
+        _: SessionQueueNext,
+        _: &mut BufferFrame,
+        _: &mut crate::session::node::SessionQueueOutput,
+    ) -> RuntimeResult<bool> {
+        Ok(false)
+    }
+
     fn update_time(
         &mut self,
-        sessions: &mut SessionWorker<Index, Seg>,
+        sessions: &mut SessionWorker<Index>,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
         frame: &mut BufferFrame,
@@ -542,7 +728,7 @@ pub trait SessionTransport<Index, Seg: SessionSegment>: Sized {
 
     fn disconnect(
         &mut self,
-        sessions: &mut SessionWorker<Index, Seg>,
+        sessions: &mut SessionWorker<Index>,
         index: Index,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
@@ -552,12 +738,10 @@ pub trait SessionTransport<Index, Seg: SessionSegment>: Sized {
     ) -> RuntimeResult<()>;
 }
 
-pub trait SessionPacketizedTransport<Index, Seg: SessionSegment>:
-    SessionTransport<Index, Seg>
-{
+pub trait SessionPacketizedTransport<Index>: SessionTransport<Index> {
     fn control_tx(
         &mut self,
-        sessions: &mut SessionWorker<Index, Seg>,
+        sessions: &mut SessionWorker<Index>,
         index: Index,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
@@ -568,7 +752,7 @@ pub trait SessionPacketizedTransport<Index, Seg: SessionSegment>:
 
     fn send_params(
         &mut self,
-        sessions: &mut SessionWorker<Index, Seg>,
+        sessions: &mut SessionWorker<Index>,
         index: Index,
         pending_len: usize,
         now: Instant,
@@ -576,19 +760,17 @@ pub trait SessionPacketizedTransport<Index, Seg: SessionSegment>:
 
     fn tx_action(
         &mut self,
-        sessions: &mut SessionWorker<Index, Seg>,
         index: Index,
         batch: &[TxBatchBuffer],
+        buffers: &DataPlaneBuffers,
         now: Instant,
     ) -> RuntimeResult<()>;
 }
 
-pub trait TransportInternalTransport<Index, Seg: SessionSegment>:
-    SessionTransport<Index, Seg>
-{
+pub trait TransportInternalTransport<Index>: SessionTransport<Index> {
     fn internal_tx(
         &mut self,
-        sessions: &mut SessionWorker<Index, Seg>,
+        sessions: &mut SessionWorker<Index>,
         index: Index,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
@@ -598,13 +780,13 @@ pub trait TransportInternalTransport<Index, Seg: SessionSegment>:
     ) -> RuntimeResult<()>;
 }
 
-pub trait SessionTxStrategy<T, Index, Seg: SessionSegment>
+pub trait SessionTxStrategy<T, Index>
 where
-    T: SessionTransport<Index, Seg>,
+    T: SessionTransport<Index>,
 {
     fn dispatch(
         transport: &mut T,
-        sessions: &mut SessionWorker<Index, Seg>,
+        sessions: &mut SessionWorker<Index>,
         index: Index,
         session_id: SessionId,
         runtime: &DataPlaneRuntime,
@@ -618,16 +800,14 @@ where
 pub struct SessionPacketizedTx;
 pub struct TransportInternalTx;
 
-impl<T, Index, Seg> SessionTxStrategy<T, Index, Seg> for SessionPacketizedTx
+impl<T, Index> SessionTxStrategy<T, Index> for SessionPacketizedTx
 where
-    T: SessionPacketizedTransport<Index, Seg>,
+    T: SessionPacketizedTransport<Index>,
     Index: Copy + Eq,
-    Seg: SessionSegment,
-    SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     fn dispatch(
         transport: &mut T,
-        sessions: &mut SessionWorker<Index, Seg>,
+        sessions: &mut SessionWorker<Index>,
         index: Index,
         session_id: SessionId,
         runtime: &DataPlaneRuntime,
@@ -637,14 +817,17 @@ where
         now: Instant,
     ) -> RuntimeResult<()> {
         transport.control_tx(sessions, index, runtime, output_next, frame, output, now)?;
-        let Some(total_len) = sessions.app.pending_send_len(session_id)? else {
+        let Some(total_len) = sessions.pending_send_len(session_id)? else {
             return Ok(());
         };
         let params = transport.send_params(sessions, index, total_len, now)?;
         if params.tx_offset > total_len {
-            return Err(RuntimeError::invariant(
-                "session tx offset exceeds chain length",
-            ));
+            return Err(SessionError::TxOffsetOutOfRange {
+                session_id,
+                tx_offset: params.tx_offset,
+                available: total_len,
+            }
+            .into());
         }
         let mut batch_offset = params.tx_offset;
         let mut remaining_space = params.snd_space;
@@ -667,10 +850,14 @@ where
                 if payload_len == 0 {
                     break;
                 }
-                let buffer = sessions.buffers.alloc_index()?;
-                sessions
-                    .app
-                    .copy_tx_to_buffer(session_id, batch_offset, payload_len, buffer)?;
+                let buffer = runtime.buffers().alloc_index()?;
+                sessions.copy_tx_to_buffer(
+                    runtime.buffers(),
+                    session_id,
+                    batch_offset,
+                    payload_len,
+                    buffer,
+                )?;
                 batch.push(TxBatchBuffer {
                     index: buffer,
                     tx_offset: batch_offset,
@@ -679,7 +866,7 @@ where
                 batch_offset += payload_len;
                 remaining_space -= payload_len;
             }
-            transport.tx_action(sessions, index, batch.as_slice(), now)?;
+            transport.tx_action(index, batch.as_slice(), runtime.buffers(), now)?;
             for item in batch.as_slice() {
                 if !output.try_enqueue_io(frame, output_next, item.index)? {
                     sessions.mark_ready(session_id);
@@ -697,16 +884,15 @@ where
     }
 }
 
-impl<T, Index, Seg> SessionTxStrategy<T, Index, Seg> for TransportInternalTx
+impl<T, Index> SessionTxStrategy<T, Index> for TransportInternalTx
 where
-    T: TransportInternalTransport<Index, Seg>,
+    T: TransportInternalTransport<Index>,
     Index: Copy + Eq,
-    Seg: SessionSegment,
 {
     #[inline]
     fn dispatch(
         transport: &mut T,
-        sessions: &mut SessionWorker<Index, Seg>,
+        sessions: &mut SessionWorker<Index>,
         index: Index,
         _: SessionId,
         runtime: &DataPlaneRuntime,
@@ -719,18 +905,16 @@ where
     }
 }
 
-pub fn dispatch_session_queue_once<T, Seg, Index>(
+pub fn dispatch_session_queue_once<T, Index>(
     runtime: &DataPlaneRuntime,
     owner: hammer_core::data_plane::NodeId,
-    sessions: &mut SessionWorker<Index, Seg>,
+    sessions: &mut SessionWorker<Index>,
     transport: &mut T,
     output_next: SessionQueueNext,
 ) -> RuntimeResult<SessionQueueStep>
 where
-    T: SessionTransport<Index, Seg>,
-    Seg: SessionSegment,
+    T: SessionTransport<Index>,
     Index: Copy + Eq,
-    SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     let now = Instant::now();
     let mut staging =
@@ -749,9 +933,9 @@ where
     Ok(step)
 }
 
-pub fn dispatch_session_queue_pending<T, Seg, Index>(
+pub fn dispatch_session_queue_pending<T, Index>(
     runtime: &DataPlaneRuntime,
-    sessions: &mut SessionWorker<Index, Seg>,
+    sessions: &mut SessionWorker<Index>,
     transport: &mut T,
     output_next: SessionQueueNext,
     frame: &mut BufferFrame,
@@ -759,13 +943,44 @@ pub fn dispatch_session_queue_pending<T, Seg, Index>(
     now: Instant,
 ) -> RuntimeResult<SessionQueueStep>
 where
-    T: SessionTransport<Index, Seg>,
-    Seg: SessionSegment,
+    T: SessionTransport<Index>,
     Index: Copy + Eq,
-    SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
 {
     transport.update_time(sessions, runtime, output_next, frame, output, now)?;
     sessions.poll_app()?;
+
+    let app_rx_event_count = sessions.app_rx_events.len();
+    for _ in 0..app_rx_event_count {
+        if output.remaining_io_budget() == 0 {
+            break;
+        }
+        let Some(&session_id) = sessions.app_rx_events.front() else {
+            break;
+        };
+        let Some((transport_id, index)) = sessions.session_transport(session_id) else {
+            let _ = sessions.app_rx_events.pop_front();
+            continue;
+        };
+        if transport_id != T::ID {
+            let _ = sessions.app_rx_events.pop_front();
+            continue;
+        }
+        let rx_available = sessions.rx_available_len(session_id).unwrap_or(0);
+        let rx_capacity = sessions.app_session_config.fifo_capacity;
+        let request_notification = transport.app_rx_evt(
+            index,
+            rx_available,
+            rx_capacity,
+            runtime,
+            output_next,
+            frame,
+            output,
+        )?;
+        let _ = sessions.app_rx_events.pop_front();
+        if request_notification {
+            sessions.app.request_rx_dequeue_notification(session_id);
+        }
+    }
 
     let control_count = sessions.control_events.len();
     for _ in 0..control_count {
@@ -789,7 +1004,7 @@ where
             continue;
         };
         if transport_id == T::ID {
-            <T::Tx as SessionTxStrategy<T, Index, Seg>>::dispatch(
+            <T::Tx as SessionTxStrategy<T, Index>>::dispatch(
                 transport,
                 sessions,
                 index,
@@ -806,10 +1021,12 @@ where
     Ok(SessionQueueStep { scheduled_sessions })
 }
 
-fn schedule_session_queue(file: &mut File) -> RuntimeResult<()> {
+fn schedule_session_queue(
+    graph: &hammer_runtime::NodeRuntime,
+    file: &mut File,
+) -> RuntimeResult<()> {
     let node = hammer_core::data_plane::NodeId::new(file.private_data() as u32);
-    Engine::with_current(|engine| engine.runtime.schedule_empty_frame(node))
-        .expect("File callbacks run on their polling Engine")?;
+    let _ = graph.mark_interrupt_pending(node)?;
     Ok(())
 }
 

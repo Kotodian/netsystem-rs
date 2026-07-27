@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::mem::transmute;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -38,10 +39,6 @@ pub enum IpLocalNext {
     Drop,
     #[next("drop")]
     Punt,
-    #[next("drop")]
-    Tcp,
-    #[next("drop")]
-    Udp,
     #[next("icmp-input")]
     Icmp,
     #[next("ip-reassembly")]
@@ -93,17 +90,16 @@ impl Default for IpLocalSourceCheck {
     }
 }
 
+#[derive(Clone)]
 pub struct IpLocalControlPlane {
     inner: Arc<ArcSwap<IpLocalState>>,
-    next: [NodeId; IpLocalNext::COUNT],
 }
 
 impl IpLocalControlPlane {
     #[inline]
-    pub fn new(next: [NodeId; IpLocalNext::COUNT]) -> Self {
+    pub fn new() -> Self {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(IpLocalState::new())),
-            next,
         }
     }
 
@@ -115,7 +111,7 @@ impl IpLocalControlPlane {
 
     #[inline]
     pub fn node(&self) -> IpLocalNode {
-        IpLocalNode::new(IpLocalStateHandle::new(Arc::clone(&self.inner)), self.next)
+        IpLocalNode::new(IpLocalStateHandle::new(Arc::clone(&self.inner)))
     }
 
     #[inline]
@@ -123,18 +119,13 @@ impl IpLocalControlPlane {
         IpReceiveNode::new(IpLocalStateHandle::new(Arc::clone(&self.inner)))
     }
 
-    /// Publish a consumer-local next slot for `protocol`.
-    ///
-    /// Control registers the target via `add_node_next_slot` on the IpLocal
-    /// consumer, then stores only the returned `u16` in the snapshot.
     #[inline]
-    pub fn register_protocol(&self, protocol: u8, slot: u16) -> RuntimeResult<()> {
+    fn publish_protocol_slot(&self, protocol: u8, slot: u16) {
         self.inner.rcu(|current| {
             let mut next = IpLocalState::clone(current);
             next.protocol_nexts[protocol as usize] = Some(slot);
             next
         });
-        Ok(())
     }
 
     #[inline]
@@ -237,32 +228,50 @@ pub struct IpReceiveNode {
     state: IpLocalStateHandle,
 }
 
-fn pending_ip_local_controls() -> &'static Mutex<Vec<(usize, IpLocalControlPlane)>> {
-    static CONTROLS: OnceLock<Mutex<Vec<(usize, IpLocalControlPlane)>>> = OnceLock::new();
-    CONTROLS.get_or_init(|| Mutex::new(Vec::new()))
+std::thread_local! {
+    static PENDING_IP_LOCAL_CONTROL: RefCell<Option<IpLocalControlPlane>> = const {
+        RefCell::new(None)
+    };
+    static IP_LOCAL_PROTOCOL_REGISTRATION: RefCell<
+        Option<(IpLocalControlPlane, hammer_runtime::node::NodeRuntime, NodeId)>,
+    > = const { RefCell::new(None) };
 }
 
-fn register_ip_local(runtime: &DataPlaneRuntime, worker: usize) -> RuntimeResult<NodeId> {
-    let control = IpLocalControlPlane::new([NodeId::new(0); IpLocalNext::COUNT]);
+pub(crate) fn register_protocol(protocol: u8, node: NodeId) -> RuntimeResult<()> {
+    IP_LOCAL_PROTOCOL_REGISTRATION.with(|registration| {
+        let registration = registration.borrow();
+        let (control, nodes, consumer) =
+            registration
+                .as_ref()
+                .ok_or(crate::ip::IpControlError::NodeRuntimeUnavailable {
+                    operation: crate::ip::IpControlOperation::IpProtocolRegistration,
+                })?;
+        let slot = nodes.add_node_next_slot(*consumer, node)?;
+        control.publish_protocol_slot(protocol, slot);
+        Ok(())
+    })
+}
+
+fn register_ip_local(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+    let control = IpLocalControlPlane::new();
     let node = runtime
         .nodes()
         .try_register_internal_with_next_names(control.node(), &IpLocalNext::NEXT_NAMES)?;
-    pending_ip_local_controls()
-        .lock()
-        .map_err(|_| RuntimeError::invariant("IP local initializer registry poisoned"))?
-        .push((worker, control));
+    IP_LOCAL_PROTOCOL_REGISTRATION.with(|registration| {
+        *registration.borrow_mut() = Some((control.clone(), runtime.nodes().clone(), node));
+    });
+    PENDING_IP_LOCAL_CONTROL.with(|pending| {
+        *pending.borrow_mut() = Some(control);
+    });
     Ok(node)
 }
 
-fn register_ip_receive(runtime: &DataPlaneRuntime, worker: usize) -> RuntimeResult<NodeId> {
-    let mut controls = pending_ip_local_controls()
-        .lock()
-        .map_err(|_| RuntimeError::invariant("IP local initializer registry poisoned"))?;
-    let position = controls
-        .iter()
-        .position(|(registered_worker, _)| *registered_worker == worker)
-        .ok_or_else(|| RuntimeError::invariant("IP local sibling initialized before its owner"))?;
-    let (_, control) = controls.remove(position);
+fn register_ip_receive(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+    let control = PENDING_IP_LOCAL_CONTROL
+        .with(|pending| pending.borrow_mut().take())
+        .ok_or(crate::ip::IpControlError::NodeRuntimeUnavailable {
+            operation: crate::ip::IpControlOperation::IpReceiveRegistration,
+        })?;
     runtime
         .nodes()
         .try_register_internal(control.receive_node())
@@ -369,12 +378,17 @@ fn sync_ip_local_runtime(
     feature_arc: Option<FeatureArcStartHandle>,
 ) -> RuntimeResult<()> {
     let slot = data.usize_word(0)?;
-    let mut runtimes = ip_local_runtimes()
-        .lock()
-        .map_err(|_| RuntimeError::invariant("IP local runtime registry poisoned"))?;
+    let mut runtimes = ip_local_runtimes().lock().map_err(|_| {
+        crate::ip::IpControlError::RuntimeRegistryPoisoned {
+            registry: crate::ip::IpRuntimeRegistry::IpLocal,
+        }
+    })?;
     let runtime = runtimes
         .get_mut(slot)
-        .ok_or_else(|| RuntimeError::invariant("IP local runtime slot is invalid"))?;
+        .ok_or(crate::ip::IpControlError::RuntimeSlotInvalid {
+            registry: crate::ip::IpRuntimeRegistry::IpLocal,
+            slot,
+        })?;
     runtime.state = state;
     runtime.feature_arc = feature_arc;
     Ok(())
@@ -384,10 +398,18 @@ fn ip_local_runtime(data: NodeRuntimeData) -> RuntimeResult<IpLocalRuntime> {
     let slot = data.usize_word(0)?;
     ip_local_runtimes()
         .lock()
-        .map_err(|_| RuntimeError::invariant("IP local runtime registry poisoned"))?
+        .map_err(|_| crate::ip::IpControlError::RuntimeRegistryPoisoned {
+            registry: crate::ip::IpRuntimeRegistry::IpLocal,
+        })?
         .get(slot)
         .cloned()
-        .ok_or_else(|| RuntimeError::invariant("IP local runtime slot is invalid"))
+        .ok_or_else(|| {
+            crate::ip::IpControlError::RuntimeSlotInvalid {
+                registry: crate::ip::IpRuntimeRegistry::IpLocal,
+                slot,
+            }
+            .into()
+        })
 }
 
 fn ip_local_process(
@@ -531,7 +553,7 @@ fn process_index(
     let first_len = current.len().min(parsed.packet_len);
     let packet = current
         .get(..first_len)
-        .ok_or_else(|| RuntimeError::invariant("invalid local packet length"))?;
+        .ok_or_else(|| RuntimeError::from(crate::protocol::ip::IpInputError::BadLength))?;
     let transport = match packet.get(parsed.transport_header_offset..parsed.packet_len) {
         Some(transport) => transport,
         None => {
@@ -603,7 +625,7 @@ fn process_index(
                 let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
                 network.sw_if_index[0]
             };
-            let resolved = if interface_index == 0 {
+            let resolved = if interface_index == u32::MAX {
                 default_slot
             } else {
                 feature_arc.start_for_interface_or(runtime, index, interface_index, default_slot)
@@ -761,10 +783,10 @@ fn ip_protocol_number(protocol: IpProtocol) -> u8 {
 #[inline(always)]
 fn default_protocol_slot(protocol: IpProtocol) -> u16 {
     match protocol {
-        IpProtocol::Tcp => NodeNext::slot(IpLocalNext::Tcp),
-        IpProtocol::Udp => NodeNext::slot(IpLocalNext::Udp),
         IpProtocol::Icmpv4 | IpProtocol::Icmpv6 => NodeNext::slot(IpLocalNext::Icmp),
-        IpProtocol::Other(_) => NodeNext::slot(IpLocalNext::Punt),
+        IpProtocol::Tcp | IpProtocol::Udp | IpProtocol::Other(_) => {
+            NodeNext::slot(IpLocalNext::Punt)
+        }
     }
 }
 
@@ -804,7 +826,7 @@ mod tests {
 
         assert_eq!(
             state.protocol_next_slot(IpProtocol::Tcp),
-            NodeNext::slot(IpLocalNext::Tcp)
+            NodeNext::slot(IpLocalNext::Punt)
         );
         assert_eq!(
             state.protocol_next_slot(IpProtocol::Other(99)),

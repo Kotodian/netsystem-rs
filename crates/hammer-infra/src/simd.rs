@@ -1,3 +1,80 @@
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Simd<T, const LANES: usize>([T; LANES]);
+
+impl<T, const LANES: usize> Simd<T, LANES> {
+    #[inline(always)]
+    pub const fn from_array(values: [T; LANES]) -> Self {
+        Self(values)
+    }
+
+    #[inline(always)]
+    pub fn to_array(self) -> [T; LANES] {
+        self.0
+    }
+
+    #[inline]
+    pub fn is_supported() -> bool {
+        if LANES == 0 {
+            return false;
+        }
+        let vector_bytes = core::mem::size_of::<Self>();
+        if vector_bytes <= 1 {
+            return true;
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            return match vector_bytes {
+                16 => std::is_x86_feature_detected!("sse2"),
+                32 => std::is_x86_feature_detected!("avx2"),
+                64 => {
+                    std::is_x86_feature_detected!("avx512f")
+                        && std::is_x86_feature_detected!("avx512bw")
+                }
+                _ => false,
+            };
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            return vector_bytes == 16;
+        }
+        #[cfg(target_arch = "arm")]
+        {
+            return vector_bytes == 16 && cfg!(target_feature = "neon");
+        }
+        #[allow(unreachable_code)]
+        false
+    }
+}
+
+impl<T: Copy, const LANES: usize> Simd<T, LANES> {
+    #[inline(always)]
+    pub const fn splat(value: T) -> Self {
+        Self([value; LANES])
+    }
+}
+
+impl<const LANES: usize> Simd<u16, LANES> {
+    #[inline(always)]
+    pub fn swap_bytes(self) -> Self {
+        Self(self.0.map(u16::swap_bytes))
+    }
+}
+
+impl<const LANES: usize> From<Simd<u16, LANES>> for Simd<u32, LANES> {
+    #[inline(always)]
+    fn from(value: Simd<u16, LANES>) -> Self {
+        Self(value.0.map(u32::from))
+    }
+}
+
+impl<const LANES: usize> Simd<u32, LANES> {
+    #[inline(always)]
+    pub fn reduce_sum(self) -> u32 {
+        self.0.into_iter().sum()
+    }
+}
+
 // ── movemask_4 : 4 bools → 4-bit mask ──────────────────────────
 
 /// Pack 4 booleans into a 4-bit mask (bit 0 = kept[0]).
@@ -111,6 +188,13 @@ pub fn copy_bytes_simd(dst: &mut [u8], src: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simd_widens_and_reduces_lanes() {
+        let words = Simd::from_array([1u16, 2, 3, 4]);
+        let widened: Simd<u32, 4> = words.into();
+        assert_eq!(widened.reduce_sum(), 10);
+    }
 
     #[test]
     fn movemask_4_all_kept() {

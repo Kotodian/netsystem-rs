@@ -11,11 +11,11 @@ use arc_swap::ArcSwap;
 use hammer_core::data_plane::{
     BufferFrame, BufferPacketCursor, Index, NodeId, NodeNext, SecondaryOpaque,
 };
+use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
     DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, TraceFormatter,
     add_packet_trace, format_packet_trace,
 };
-use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use hammer_service::data_plane::set_index_node_error_code;
 use hammer_service::opaque::NetworkOpaque;
@@ -272,11 +272,14 @@ impl IcmpInputControlPlane {
 
     /// Wire default nexts into the ICMP-input local-next table and publish slots.
     pub fn attach_consumer(&mut self, consumer: NodeId) -> RuntimeResult<()> {
-        let nodes = self
-            .nodes
-            .as_ref()
-            .ok_or_else(|| RuntimeError::invariant("icmp input attach requires node runtime"))?;
-        let ip4_slot = nodes.add_node_next_slot(consumer, self.ip4_default_node)?;
+        let nodes =
+            self.nodes
+                .as_ref()
+                .ok_or(crate::ip::IpControlError::NodeRuntimeUnavailable {
+                    operation: crate::ip::IpControlOperation::IcmpConsumerAttach,
+                })?;
+        nodes.set_node_next(consumer, IcmpInputNext::Drop, self.ip4_default_node)?;
+        let ip4_slot = NodeNext::slot(IcmpInputNext::Drop);
         let ip6_slot = if self.ip6_default_node == self.ip4_default_node {
             ip4_slot
         } else {
@@ -290,10 +293,7 @@ impl IcmpInputControlPlane {
 
     #[inline]
     pub fn node(&self) -> IcmpInputNode {
-        IcmpInputNode::new(
-            IcmpInputSnapshotHandle::new(Arc::clone(&self.inner)),
-            IcmpInputNext::nodes(self.ip4_default_node),
-        )
+        IcmpInputNode::new(IcmpInputSnapshotHandle::new(Arc::clone(&self.inner)))
     }
 
     #[inline]
@@ -303,12 +303,15 @@ impl IcmpInputControlPlane {
         icmp_type: u8,
         node: NodeId,
     ) -> RuntimeResult<u16> {
-        let consumer = self.consumer.ok_or_else(|| {
-            RuntimeError::invariant("icmp input register_type requires attach_consumer")
-        })?;
-        let nodes = self.nodes.as_ref().ok_or_else(|| {
-            RuntimeError::invariant("icmp input register_type requires node runtime")
-        })?;
+        let consumer = self
+            .consumer
+            .ok_or(crate::ip::IpControlError::ConsumerNotAttached)?;
+        let nodes =
+            self.nodes
+                .as_ref()
+                .ok_or(crate::ip::IpControlError::NodeRuntimeUnavailable {
+                    operation: crate::ip::IpControlOperation::IcmpTypeRegistration,
+                })?;
         let slot = nodes.add_node_next_slot(consumer, node)?;
         self.inner.rcu(|current| {
             let mut next = IcmpInputSnapshot::clone(current);
@@ -530,13 +533,13 @@ pub struct IcmpInputNode {
     snapshot: IcmpInputSnapshotHandle,
 }
 
-fn register_icmp_input(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
+fn register_icmp_input(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     let drop_slot = NodeNext::slot(IcmpInputNext::Drop);
     let snapshot = IcmpInputSnapshotHandle::new(Arc::new(ArcSwap::from_pointee(
         IcmpInputSnapshot::new(drop_slot, drop_slot),
     )));
     runtime.nodes().try_register_internal_with_next_names(
-        IcmpInputNode::new(snapshot, IcmpInputNext::nodes(NodeId::new(0))),
+        IcmpInputNode::new(snapshot),
         &IcmpInputNext::NEXT_NAMES,
     )
 }
@@ -636,10 +639,18 @@ fn icmp_input_runtime(data: NodeRuntimeData) -> RuntimeResult<IcmpInputRuntime> 
     let slot = data.usize_word(0)?;
     icmp_input_runtimes()
         .lock()
-        .map_err(|_| RuntimeError::invariant("ICMP input runtime registry poisoned"))?
+        .map_err(|_| crate::ip::IpControlError::RuntimeRegistryPoisoned {
+            registry: crate::ip::IpRuntimeRegistry::IcmpInput,
+        })?
         .get(slot)
         .cloned()
-        .ok_or_else(|| RuntimeError::invariant("ICMP input runtime slot is invalid"))
+        .ok_or_else(|| {
+            crate::ip::IpControlError::RuntimeSlotInvalid {
+                registry: crate::ip::IpRuntimeRegistry::IcmpInput,
+                slot,
+            }
+            .into()
+        })
 }
 
 fn icmp_input_process(
@@ -705,11 +716,10 @@ pub struct IcmpErrorNode {
     source_table: Option<IcmpErrorSourceTableHandle>,
 }
 
-fn register_icmp_error(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
-    runtime.nodes().try_register_internal_with_next_names(
-        IcmpErrorNode::new([NodeId::new(0); IcmpErrorNext::COUNT]),
-        &IcmpErrorNext::NEXT_NAMES,
-    )
+fn register_icmp_error(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+    runtime
+        .nodes()
+        .try_register_internal_with_next_names(IcmpErrorNode::new(), &IcmpErrorNext::NEXT_NAMES)
 }
 
 impl IcmpErrorNode {
@@ -776,12 +786,17 @@ fn sync_icmp_error_runtime(
     source_table: Option<IcmpErrorSourceTableHandle>,
 ) -> RuntimeResult<()> {
     let slot = data.usize_word(0)?;
-    let mut runtimes = icmp_error_runtimes()
-        .lock()
-        .map_err(|_| RuntimeError::invariant("ICMP error runtime registry poisoned"))?;
+    let mut runtimes = icmp_error_runtimes().lock().map_err(|_| {
+        crate::ip::IpControlError::RuntimeRegistryPoisoned {
+            registry: crate::ip::IpRuntimeRegistry::IcmpError,
+        }
+    })?;
     let runtime = runtimes
         .get_mut(slot)
-        .ok_or_else(|| RuntimeError::invariant("ICMP error runtime slot is invalid"))?;
+        .ok_or(crate::ip::IpControlError::RuntimeSlotInvalid {
+            registry: crate::ip::IpRuntimeRegistry::IcmpError,
+            slot,
+        })?;
     runtime.source_table = source_table;
     Ok(())
 }
@@ -790,10 +805,18 @@ fn icmp_error_runtime(data: NodeRuntimeData) -> RuntimeResult<IcmpErrorRuntime> 
     let slot = data.usize_word(0)?;
     icmp_error_runtimes()
         .lock()
-        .map_err(|_| RuntimeError::invariant("ICMP error runtime registry poisoned"))?
+        .map_err(|_| crate::ip::IpControlError::RuntimeRegistryPoisoned {
+            registry: crate::ip::IpRuntimeRegistry::IcmpError,
+        })?
         .get(slot)
         .cloned()
-        .ok_or_else(|| RuntimeError::invariant("ICMP error runtime slot is invalid"))
+        .ok_or_else(|| {
+            crate::ip::IpControlError::RuntimeSlotInvalid {
+                registry: crate::ip::IpRuntimeRegistry::IcmpError,
+                slot,
+            }
+            .into()
+        })
 }
 
 fn icmp_error_process(
@@ -1151,7 +1174,7 @@ fn next_for_icmp_error_index(
     };
     let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
     let interface_index = network.sw_if_index[0];
-    if interface_index == 0 {
+    if interface_index == u32::MAX {
         let error = IcmpNodeError::MissingIngressInterface.code();
         set_index_node_error_code(runtime, index, error)?;
         let next = IcmpErrorNext::Drop;

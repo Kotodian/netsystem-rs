@@ -3,11 +3,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use hammer_core::data_plane::{
     BufferFrame, NodeHandle, NodeId, NodeKind, NodeNext, NodeRegistration, NodeState,
 };
-use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
     DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, DriverNode, InternalNode,
-    Node, NodeDescriptor, NodeEntry, NodeProcessFn, NodeResult, NodeRuntimeData, TraceFormatter,
-    process_frame,
+    Node, NodeDescriptor, NodeEntry, NodeProcessFn, NodeResult, NodeRuntimeData, RuntimeError,
+    RuntimeResult, TraceFormatter, process_frame,
 };
 
 static NODE_CALLS_BY_WORD: [AtomicU64; 128] = [const { AtomicU64::new(0) }; 128];
@@ -34,7 +33,7 @@ fn test_runtime(
     DataPlaneRuntime::new(DataPlaneRuntimeConfig { buffers })
 }
 
-fn init_graph_owner(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
+fn init_graph_owner(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_descriptor(
         NodeKind::Internal,
         NodeDescriptor::new(
@@ -47,7 +46,7 @@ fn init_graph_owner(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeI
     )
 }
 
-fn init_graph_sibling(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
+fn init_graph_sibling(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_descriptor(
         NodeKind::Internal,
         NodeDescriptor::new(
@@ -77,7 +76,7 @@ fn init_graph_registers_sibling_owner_before_sibling() {
     ];
 
     runtime
-        .init_graph(0, &entries)
+        .init_graph(&entries)
         .expect("owner must be registered before sibling regardless of linkme order");
 
     let owner = runtime
@@ -594,7 +593,13 @@ fn descriptor_registration_validates_declared_next_shape() {
         )
         .expect_err("next count mismatch must fail");
 
-    assert!(err.to_string().contains("node initial next count mismatch"));
+    assert!(matches!(
+        err,
+        RuntimeError::InitialNextCountMismatch {
+            declared: 2,
+            actual: 1
+        }
+    ));
 }
 
 #[test]
@@ -617,7 +622,10 @@ fn descriptor_registration_with_handle_registers_handle_once() {
             DescriptorNode::plain(count_process, NodeRuntimeData::empty()),
         )
         .expect_err("duplicate handle must fail");
-    assert!(err.to_string().contains("node handle already registered"));
+    assert!(matches!(
+        err,
+        RuntimeError::NodeHandleAlreadyRegistered { handle: HANDLE }
+    ));
 }
 
 #[test]
@@ -744,12 +752,16 @@ fn try_register_descriptor_registers_erased_descriptor() {
 #[test]
 fn try_register_descriptor_rejects_next_count_mismatch() {
     let runtime = test_runtime(64, 4, 2);
-    let empty_nexts: &[NodeId] = &[];
+    let target = runtime.nodes().register_internal(DescriptorNode::plain(
+        count_process,
+        NodeRuntimeData::empty(),
+    ));
+    let incomplete_nexts = [target];
     let descriptor = NodeDescriptor::new(
         count_process,
         NodeRuntimeData::empty(),
         NodeRegistration::next("erased-bad", TestNext::COUNT),
-        empty_nexts,
+        &incomplete_nexts,
         None,
     );
 
@@ -757,7 +769,13 @@ fn try_register_descriptor_rejects_next_count_mismatch() {
         .nodes()
         .try_register_descriptor(NodeKind::Internal, descriptor)
         .expect_err("initial next count mismatch must fail");
-    assert!(err.to_string().contains("node initial next count mismatch"));
+    assert!(matches!(
+        err,
+        RuntimeError::InitialNextCountMismatch {
+            declared: TestNext::COUNT,
+            actual: 1
+        }
+    ));
 }
 
 #[test]
@@ -965,7 +983,7 @@ fn worker_runtime_materializes_the_registered_graph_without_rebinding_nodes() {
         NodeRuntimeData::from_words([74, 0, 0, 0]),
     ));
 
-    let worker = runtime.for_worker(1, 0);
+    let worker = runtime.for_worker(1, 0).expect("worker runtime fork");
 
     assert_eq!(worker.node_by_name("worker-owner"), Some(owner));
     assert_eq!(worker.node_by_name("worker-sibling"), Some(sibling));
@@ -994,17 +1012,24 @@ fn worker_runtime_materializes_the_registered_graph_without_rebinding_nodes() {
     assert_eq!(worker.run_ready_nodes().expect("run worker node"), 1);
     assert_eq!(calls_for(73), 1);
 
-    let duplicate = worker.nodes().try_register_internal(DescriptorNode::next(
-        "worker-owner",
+    let registration = worker.nodes().try_register_internal(DescriptorNode::next(
+        "worker-added-node",
         count_process,
         NodeRuntimeData::from_words([99, 0, 0, 0]),
         [drop, drop],
     ));
     assert!(
-        duplicate
-            .expect_err("registration must not become worker binding")
+        registration
+            .expect_err("worker registration must not mutate inherited graph")
             .to_string()
-            .contains("node name is already registered")
+            .contains("cannot mutate graph topology")
+    );
+    assert!(
+        worker
+            .rebuild_graph(&[])
+            .expect_err("worker rebuild must not replace inherited graph")
+            .to_string()
+            .contains("cannot mutate graph topology")
     );
 }
 
@@ -1047,7 +1072,7 @@ fn worker_runtime_resets_execution_state_but_keeps_configured_node_state() {
     );
     assert!(runtime.nodes().has_pending());
 
-    let worker = runtime.for_worker(1, 0);
+    let worker = runtime.for_worker(1, 0).expect("worker runtime fork");
 
     assert!(!worker.nodes().has_pending());
     assert_eq!(worker.current_node(), None);
@@ -1076,7 +1101,7 @@ fn worker_runtime_resets_execution_state_but_keeps_configured_node_state() {
 }
 
 #[test]
-fn worker_sibling_next_updates_are_local_to_that_worker_graph() {
+fn worker_graph_rejects_worker_local_next_slot_mutation() {
     let runtime = test_runtime(64, 8, 4);
     let initial = runtime.nodes().register_internal(DescriptorNode::plain(
         count_process,
@@ -1098,41 +1123,24 @@ fn worker_sibling_next_updates_are_local_to_that_worker_graph() {
         count_process,
         NodeRuntimeData::empty(),
     ));
-    let first = runtime.for_worker(1, 0);
-    let second = runtime.for_worker(2, 0);
+    let first = runtime.for_worker(1, 0).expect("first worker runtime fork");
+    let second = runtime
+        .for_worker(2, 0)
+        .expect("second worker runtime fork");
 
-    let slot = first
+    let error = first
         .nodes()
         .add_node_next_slot(sibling, dynamic)
-        .expect("add worker-local sibling next");
+        .expect_err("worker must not add a graph next slot");
 
-    assert_eq!(slot, 2);
-    assert_eq!(
-        first
-            .nodes()
-            .node_next_slot(owner, usize::from(slot))
-            .unwrap(),
-        dynamic
-    );
-    assert_eq!(
-        first
-            .nodes()
-            .node_next_slot(sibling, usize::from(slot))
-            .unwrap(),
-        dynamic
-    );
-    assert!(
-        runtime
-            .nodes()
-            .node_next_slot(owner, usize::from(slot))
-            .is_err()
-    );
-    assert!(
-        second
-            .nodes()
-            .node_next_slot(owner, usize::from(slot))
-            .is_err()
-    );
+    assert!(matches!(
+        error,
+        RuntimeError::GraphTopologyMutationFromWorker
+    ));
+    assert!(first.nodes().node_next_slot(owner, 2).is_err());
+    assert!(first.nodes().node_next_slot(sibling, 2).is_err());
+    assert!(runtime.nodes().node_next_slot(owner, 2).is_err());
+    assert!(second.nodes().node_next_slot(owner, 2).is_err());
 }
 
 fn push_packet(runtime: &DataPlaneRuntime, frame: &mut BufferFrame, payload: &[u8]) {

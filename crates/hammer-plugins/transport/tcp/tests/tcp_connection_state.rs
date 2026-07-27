@@ -6,7 +6,7 @@ use hammer_plugin_tcp::{TcpConnectionId, TcpState};
 use hammer_runtime::DataWorkerId;
 use hammer_service::transport::congestion::{BbrController, CongestionController};
 
-fn connection(connection_id: TcpConnectionId, local_port: u16) -> TcpConnection<BbrController> {
+fn connection(connection_id: TcpConnectionId, local_port: u16) -> TcpConnection {
     let local: SocketAddr = format!("192.0.2.10:{local_port}")
         .parse()
         .expect("test local");
@@ -43,31 +43,31 @@ fn tcp_connections_own_independent_congestion_state() {
 
     assert_ne!(first.connection_id(), second.connection_id());
     assert_eq!(
-        first.congestion().delivered(),
-        second.congestion().delivered()
+        first.congestion_metrics().delivered,
+        second.congestion_metrics().delivered
     );
     assert_eq!(
-        first.congestion().congestion_window(),
-        second.congestion().congestion_window()
+        first.congestion_metrics().congestion_window,
+        second.congestion_metrics().congestion_window
     );
 }
 
 #[test]
-fn tcp_connection_exposes_owned_congestion_control() {
+fn tcp_connection_exposes_congestion_metrics_without_controller_type() {
     let connection = connection(TcpConnectionId::new(3), 50_003);
 
     assert_eq!(
-        connection.congestion().max_datagram_size(),
-        DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32
+        connection.congestion_metrics().congestion_window,
+        10 * DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32
     );
-    assert_eq!(connection.congestion().delivered(), 0);
+    assert_eq!(connection.congestion_metrics().delivered, 0);
 }
 
 #[test]
 fn tcp_connection_starts_closed_then_connects_to_syn_sent() {
     let local: SocketAddr = "192.0.2.10:50004".parse().expect("local");
     let remote: SocketAddr = "198.51.100.10:443".parse().expect("remote");
-    let mut connection: TcpConnection<BbrController> = TcpConnection::new(
+    let mut connection = TcpConnection::new(
         Some(TcpConnectionId::new(4)),
         DataWorkerId::new(0),
         local.port(),

@@ -18,11 +18,15 @@ hammer_component_macros::declare_plugin!(
         rcv_process::__TCP_WORKER_GRAPH_NODE_TCP_RCV_PROCESS_NODE,
         syn_sent::__TCP_WORKER_GRAPH_NODE_TCP_SYN_SENT_NODE,
     ],
-    node_functions = [],
+    node_functions = [
+        output::__NODE_FUNCTION_TCP_OUTPUT_NODE_PROCESS_SIMD_SCALAR,
+        output::__NODE_FUNCTION_TCP_OUTPUT_NODE_PROCESS_SIMD_SIMD128,
+        output::__NODE_FUNCTION_TCP_OUTPUT_NODE_PROCESS_SIMD_SIMD256,
+        output::__NODE_FUNCTION_TCP_OUTPUT_NODE_PROCESS_SIMD_SIMD512,
+    ],
     process_nodes = [],
 );
 
-use std::cell::RefCell;
 use std::mem::transmute;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -30,20 +34,19 @@ use std::sync::Arc;
 use arc_swap::ArcSwapOption;
 use hammer_core::data_plane::{BufferPacketCursor, NodeHandle, NodeId, NodeState, SecondaryOpaque};
 use hammer_runtime::{
-    DataPlaneRuntime, DataWorkerId, Engine, Node, NodeRuntimeData, RuntimeError, RuntimeResult,
+    DataPlaneRuntime, DataWorkerId, Engine, Node, NodeProcessFn, NodeRuntimeData, PluginError,
+    RuntimeError, RuntimeResult,
 };
 use thiserror::Error;
 
+use hammer_infra::align::CacheLine;
 use hammer_infra::pool::Index as PoolIndex;
-use hammer_infra::segment::{Local, Svm};
-use hammer_runtime::app::SessionSegment;
-use hammer_service::session::app::SessionAppRuntimeCreate;
+use hammer_infra::thread_owned::{ThreadOwned, ThreadOwnedError};
 use hammer_service::session::node::{SessionQueueNode, SessionQueueOutput};
 use hammer_service::session::runtime::{
-    SessionTransport, SessionWorker, dispatch_session_queue_pending,
+    SessionMain, SessionTransport, SessionWorker, dispatch_session_queue_pending,
 };
-use hammer_service::session::{SessionBackend, SessionId, SessionQueueNext};
-use hammer_service::transport::congestion::{BbrController, CongestionController};
+use hammer_service::session::{SessionId, SessionQueueNext};
 
 pub mod config;
 pub mod congestion;
@@ -89,225 +92,131 @@ pub use worker::TcpWorker;
 #[cfg(test)]
 mod session_driver_tests;
 
-pub(crate) struct TcpWorkerState<C, Seg>
-where
-    C: CongestionController,
-    Seg: SessionSegment,
-{
-    pub(crate) sessions: SessionWorker<PoolIndex, Seg>,
-    pub(crate) tcp: TcpWorker<C>,
+#[derive(Debug, Error)]
+enum TcpWorkerError {
+    #[error("required graph node `{name}` is not registered")]
+    NodeMissing { name: &'static str },
+    #[error("runtime thread {thread_index} is not a data worker")]
+    WorkerUnavailable { thread_index: u32 },
+    #[error("TCP worker {worker} is outside the configured worker range")]
+    WorkerOutOfRange { worker: usize },
+    #[error("TCP worker {worker} is already installed")]
+    WorkerAlreadyInstalled { worker: usize },
+    #[error("TCP worker {worker} cannot be accessed")]
+    WorkerAccess {
+        worker: usize,
+        #[source]
+        source: ThreadOwnedError,
+    },
 }
 
-impl<C, Seg> TcpWorkerState<C, Seg>
-where
-    C: CongestionController + 'static,
-    Seg: SessionSegment,
-{
-    fn new(sessions: SessionWorker<PoolIndex, Seg>, tcp: TcpWorker<C>) -> Self {
-        Self { sessions, tcp }
-    }
-}
-
-// VPP keeps session worker state and TCP worker state adjacent for each data
-// worker. The plugin owns the TCP half; `SessionWorker` owns queue readiness
-// and removes its FileMain record before this state is replaced.
-thread_local! {
-    static TCP_WORKER_STATE: RefCell<Option<TcpWorkerState<BbrController, Local>>> = const { RefCell::new(None) };
-    static TCP_WORKER_STATE_SVM: RefCell<Option<TcpWorkerState<BbrController, Svm>>> = const { RefCell::new(None) };
-}
-
-pub(crate) trait TcpWorkerStore<C>: SessionSegment
-where
-    C: CongestionController + 'static,
-{
-    fn take_worker() -> RuntimeResult<Option<TcpWorkerState<C, Self>>>
-    where
-        Self: Sized;
-
-    fn install_worker(state: &mut Option<TcpWorkerState<C, Self>>) -> RuntimeResult<()>
-    where
-        Self: Sized;
-
-    fn with_worker_mut<R>(
-        f: impl FnOnce(&mut TcpWorkerState<C, Self>) -> RuntimeResult<R>,
-    ) -> RuntimeResult<R>
-    where
-        Self: Sized;
-}
-
-impl TcpWorkerStore<BbrController> for Local {
-    fn take_worker() -> RuntimeResult<Option<TcpWorkerState<BbrController, Self>>> {
-        TCP_WORKER_STATE.with(|slot| {
-            slot.try_borrow_mut()
-                .map_err(|_| RuntimeError::from(TcpError::Dispatch))
-                .map(|mut state| state.take())
-        })
-    }
-
-    fn install_worker(
-        state: &mut Option<TcpWorkerState<BbrController, Self>>,
-    ) -> RuntimeResult<()> {
-        TCP_WORKER_STATE.with(|slot| {
-            let mut slot = slot
-                .try_borrow_mut()
-                .map_err(|_| RuntimeError::from(TcpError::Dispatch))?;
-            if slot.is_some() {
-                return Err(RuntimeError::from(TcpError::Dispatch));
-            }
-            *slot = state.take();
-            Ok(())
-        })
-    }
-
-    fn with_worker_mut<R>(
-        f: impl FnOnce(&mut TcpWorkerState<BbrController, Self>) -> RuntimeResult<R>,
-    ) -> RuntimeResult<R> {
-        TCP_WORKER_STATE.with(|slot| {
-            let mut slot = slot
-                .try_borrow_mut()
-                .map_err(|_| RuntimeError::from(TcpError::Dispatch))?;
-            f(slot
-                .as_mut()
-                .ok_or_else(|| RuntimeError::from(TcpError::Dispatch))?)
-        })
-    }
-}
-
-impl TcpWorkerStore<BbrController> for Svm {
-    fn take_worker() -> RuntimeResult<Option<TcpWorkerState<BbrController, Self>>> {
-        TCP_WORKER_STATE_SVM.with(|slot| {
-            slot.try_borrow_mut()
-                .map_err(|_| RuntimeError::from(TcpError::Dispatch))
-                .map(|mut state| state.take())
-        })
-    }
-
-    fn install_worker(
-        state: &mut Option<TcpWorkerState<BbrController, Self>>,
-    ) -> RuntimeResult<()> {
-        TCP_WORKER_STATE_SVM.with(|slot| {
-            let mut slot = slot
-                .try_borrow_mut()
-                .map_err(|_| RuntimeError::from(TcpError::Dispatch))?;
-            if slot.is_some() {
-                return Err(RuntimeError::from(TcpError::Dispatch));
-            }
-            *slot = state.take();
-            Ok(())
-        })
-    }
-
-    fn with_worker_mut<R>(
-        f: impl FnOnce(&mut TcpWorkerState<BbrController, Self>) -> RuntimeResult<R>,
-    ) -> RuntimeResult<R> {
-        TCP_WORKER_STATE_SVM.with(|slot| {
-            let mut slot = slot
-                .try_borrow_mut()
-                .map_err(|_| RuntimeError::from(TcpError::Dispatch))?;
-            f(slot
-                .as_mut()
-                .ok_or_else(|| RuntimeError::from(TcpError::Dispatch))?)
-        })
-    }
-}
-
-pub(crate) fn with_tcp_worker_mut<C, Seg, R>(
-    f: impl FnOnce(&mut TcpWorkerState<C, Seg>) -> RuntimeResult<R>,
-) -> RuntimeResult<R>
-where
-    C: CongestionController + 'static,
-    Seg: TcpWorkerStore<C>,
-{
-    Seg::with_worker_mut(f)
-}
-
-pub(crate) fn insert_tcp_session<C, Seg, F>(
-    state: &mut TcpWorkerState<C, Seg>,
-    create: F,
-) -> RuntimeResult<SessionId>
-where
-    C: CongestionController + 'static,
-    Seg: SessionSegment,
-    hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-    F: FnOnce(SessionId) -> TcpConnection<C>,
-{
-    let session_id = state.sessions.insert_creating_session(TcpWorker::<C>::ID)?;
-    let handle = hammer_runtime::app::SessionHandle::new(
-        session_id.pool_index().slot(),
-        state.sessions.worker().slot() as u32,
-    );
-    let app_session = match state.sessions.app().create_app_session(
-        handle,
-        state.sessions.app_session_config(),
-        state.sessions.app().tx_evt_q().clone(),
-    ) {
-        Ok(session) => session,
-        Err(error) => {
-            state.sessions.remove_session_entry(session_id);
-            return Err(error);
-        }
-    };
-    state
-        .sessions
-        .app_mut()
-        .attach_session(session_id, app_session);
-    let index = match state.tcp.insert_connection(create(session_id)) {
-        Ok(index) => index,
-        Err(error) => {
-            state.sessions.remove_session_entry(session_id);
-            return Err(error);
-        }
-    };
-    if let Err(error) = state.sessions.finish_session_creation(session_id, index) {
-        let _ = state.tcp.remove_connection(index);
-        state.sessions.remove_session_entry(session_id);
-        return Err(error);
-    }
-    Ok(session_id)
-}
-
-pub(crate) fn rollback_tcp_session<C, Seg>(
-    state: &mut TcpWorkerState<C, Seg>,
+pub(crate) fn publish_tcp_connection(
+    sessions: &mut SessionWorker<PoolIndex>,
+    tcp: &mut TcpWorker,
     session_id: SessionId,
-) -> RuntimeResult<bool>
-where
-    C: CongestionController + 'static,
-    Seg: SessionSegment,
-    hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-{
-    let Some((_, index)) = state.sessions.session_transport(session_id) else {
-        return Ok(false);
+) -> RuntimeResult<()> {
+    let (_, index) = sessions
+        .session_transport(session_id)
+        .ok_or(TcpNodeError::SessionMissing)?;
+    let close = {
+        let TcpWorker {
+            connections,
+            lookup,
+            ..
+        } = tcp;
+        let connection = connections.get(index).ok_or(TcpNodeError::SessionMissing)?;
+        lookup.publish_connection(session_id, connection)
     };
-    state.tcp.lookup.forget_session(session_id);
-    state.tcp.lookup.forget_pending_open(session_id);
-    let _ = state.tcp.remove_connection(index);
-    Ok(state.sessions.remove_session_entry(session_id))
+    let initial = sessions.connection_published(session_id)?;
+    if close {
+        if initial {
+            return Err(TcpError::ConnectionClosed.into());
+        }
+        sessions.notify_transport_closed(session_id, index)?;
+        let _ = tcp.remove_connection(index);
+        sessions.notify_transport_deleted(session_id, index);
+    }
+    Ok(())
 }
 
 pub struct TcpMain {
-    congestion: config::CongestionController,
     control: TcpInputControlPlane,
     listeners: listener_control::TcpListenerControlHandle,
     ip_output: output::IpOutputFunctions,
+    input_process: NodeProcessFn,
+    listen_process: NodeProcessFn,
+    established_process: NodeProcessFn,
+    rcv_process: NodeProcessFn,
+    syn_sent_process: NodeProcessFn,
+    sessions: Arc<SessionMain>,
+    workers: Box<[CacheLine<ThreadOwned<TcpWorker>>]>,
 }
 
 impl TcpMain {
-    pub fn new(
-        congestion: config::CongestionController,
+    fn new(
+        worker_count: usize,
+        sessions: Arc<SessionMain>,
         ip_output: output::IpOutputFunctions,
     ) -> Self {
         let control = TcpInputControlPlane::new();
         let listeners = listener_control::TcpListenerControlHandle::new(control.clone());
+        let workers = (0..worker_count)
+            .map(|_| CacheLine::new(ThreadOwned::new()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Self {
-            congestion,
             control,
             listeners,
             ip_output,
+            input_process: input::tcp_input_process,
+            listen_process: listen::tcp_listen_process,
+            established_process: established::tcp_established_process,
+            rcv_process: rcv_process::tcp_rcv_process_process,
+            syn_sent_process: syn_sent::tcp_syn_sent_process,
+            sessions,
+            workers,
         }
     }
 
-    pub fn congestion(&self) -> config::CongestionController {
-        self.congestion
+    fn worker(&self, worker: DataWorkerId) -> RuntimeResult<&ThreadOwned<TcpWorker>> {
+        self.workers
+            .get(worker.slot())
+            .map(|slot| &**slot)
+            .ok_or_else(|| {
+                RuntimeError::subsystem(
+                    "tcp",
+                    TcpWorkerError::WorkerOutOfRange {
+                        worker: worker.slot(),
+                    },
+                )
+            })
+    }
+
+    fn with_worker<R>(
+        &self,
+        runtime: &DataPlaneRuntime,
+        operation: impl FnOnce(&mut SessionWorker<PoolIndex>, &mut TcpWorker) -> RuntimeResult<R>,
+    ) -> RuntimeResult<R> {
+        let thread_index = runtime.thread_index();
+        let worker = thread_index
+            .checked_sub(1)
+            .map(DataWorkerId::new)
+            .ok_or_else(|| {
+                RuntimeError::subsystem("tcp", TcpWorkerError::WorkerUnavailable { thread_index })
+            })?;
+        self.sessions.with_worker_mut(runtime, |sessions| {
+            self.worker(worker)?
+                .with_mut(|tcp| operation(sessions, tcp))
+                .map_err(|source| {
+                    RuntimeError::subsystem(
+                        "tcp",
+                        TcpWorkerError::WorkerAccess {
+                            worker: worker.slot(),
+                            source,
+                        },
+                    )
+                })?
+        })
     }
 
     pub fn control(&self) -> &TcpInputControlPlane {
@@ -326,42 +235,12 @@ impl TcpMain {
     ) -> RuntimeResult<lookup::TcpLookupId> {
         self.listeners.bind(bind, owner_worker, capabilities)
     }
-
-    /// Register the configured `TcpInputNode<C, Seg>` in the main graph.
-    ///
-    /// Per-worker TCP state remains in plugin-local worker storage; `TcpMain`
-    /// only supplies the cross-worker control plane shared by every clone.
-    fn register_tcp_input<C, Seg>(
-        &self,
-        runtime: &DataPlaneRuntime,
-        handoff: Option<(NodeHandle, DataWorkerId)>,
-    ) -> RuntimeResult<NodeId>
-    where
-        C: CongestionController + 'static,
-        Seg: TcpWorkerStore<C>,
-        hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-    {
-        let next = [NodeId::new(0); TcpInputNext::COUNT];
-        let node = self.control.node::<C, Seg>(next, handoff);
-        runtime
-            .nodes()
-            .try_register_internal_with_next_names(node, &TcpInputNext::NEXT_NAMES)
-    }
 }
 
 // VPP alignment: `tcp_main_t tcp_main;` is a file-scope global in VPP's
-// `tcp.c`; nodes read it via `&tcp_main` (lock-free direct deref). `tcp_init`
-// fills it once and `vlib_test_cleanup` resets it between tests. The Rust
-// mirror is a `pub static ArcSwapOption<TcpMain>`: `.load()` is lock-free on
-// the hot path, and `store(None)` makes it resettable for test isolation —
-// neither of which `OnceLock` provides.
+// `tcp.c`; nodes read it directly and `tcp_init` publishes the configured
+// instance before workers start.
 pub static TCP_MAIN: ArcSwapOption<TcpMain> = ArcSwapOption::const_empty();
-
-#[cfg(test)]
-pub fn reset_for_test() {
-    TCP_MAIN.store(None);
-    policy::reset_tcp_policy_for_test();
-}
 
 #[hammer_component_macros::config_function(
     name = "tcp_config",
@@ -378,149 +257,141 @@ fn configure_tcp(
 
 #[hammer_component_macros::init_function(
     name = "tcp_init",
-    runs_after = ["transport_init"],
+    runs_after = ["transport_init", "session_init"],
     runs_before = ["install_packet_graph"]
 )]
-fn init_tcp(engine: &mut Engine, config: Arc<crate::config::TcpPluginConfig>) -> RuntimeResult<()> {
+fn init_tcp(
+    engine: &mut Engine,
+    config: Arc<crate::config::TcpPluginConfig>,
+    sessions: Arc<SessionMain>,
+) -> RuntimeResult<()> {
     let main = Arc::new(configured_tcp_main(
         config.as_ref(),
+        engine.configured_worker_count(),
+        sessions,
         output::plugin_functions(engine.plugin_main())?,
     )?);
     TCP_MAIN.store(Some(Arc::clone(&main)));
-    register_configured_main_graph(
-        &engine.runtime,
-        main.as_ref(),
-        hammer_service::transport::session_backend().unwrap_or_default(),
-    )?;
     Ok(())
 }
 
 fn configured_tcp_main(
     tcp: &crate::config::TcpPluginConfig,
+    worker_count: usize,
+    sessions: Arc<SessionMain>,
     ip_output: output::IpOutputFunctions,
 ) -> RuntimeResult<TcpMain> {
     publish_tcp_policy(TcpPolicy::from_plugin_config(tcp));
-    let main = TcpMain::new(tcp.congestion, ip_output);
+    let main = TcpMain::new(worker_count, sessions, ip_output);
+    // VPP `tcp_make_syn_options` always offers MSS, window scale, timestamps,
+    // and SACK; `tcp_window_compute_scale` picks the smallest scale that fits
+    // the configured receive window in the 16-bit window field.
+    let mut window_scale = 0u8;
+    while window_scale < connection::TCP_MAX_WINDOW_SCALE
+        && (tcp.receive_window >> window_scale) > u32::from(u16::MAX)
+    {
+        window_scale += 1;
+    }
+    let capabilities = TcpCapabilities {
+        max_segment_size: Some(u16::try_from(tcp.mss).unwrap_or(u16::MAX)),
+        window_scale: Some(window_scale),
+        sack: true,
+        timestamps: true,
+        ..TcpCapabilities::default()
+    };
     for entry in &tcp.listen {
-        main.bind_tcp_listener(
-            entry.address,
-            DataWorkerId::new(0),
-            TcpCapabilities::default(),
-        )?;
+        main.bind_tcp_listener(entry.address, DataWorkerId::new(0), capabilities)?;
     }
     Ok(main)
 }
 
-pub fn register_tcp_input(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
-    runtime
-        .nodes()
-        .node_by_name("tcp-input")
-        .ok_or_else(|| RuntimeError::invariant("TCP worker graph is not registered"))
+pub fn register_tcp_input(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+    let main = TCP_MAIN
+        .load_full()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
+    let node = if let Some(node) = runtime.nodes().node_by_name("tcp-input") {
+        node
+    } else {
+        runtime.nodes().try_register_internal_with_next_names(
+            main.control().node(main.input_process, None),
+            &TcpInputNext::NEXT_NAMES,
+        )?
+    };
+    main.ip_output()
+        .get()
+        .register_protocol(6, node)
+        .into_result()
+        .map_err(|source| {
+            RuntimeError::from(PluginError::CapabilityCall {
+                plugin: "ip",
+                capability: "register protocol",
+                source,
+            })
+        })?;
+    Ok(node)
 }
 
-fn register_typed_main_graph<C, Seg>(
-    runtime: &DataPlaneRuntime,
-    main: &TcpMain,
-) -> RuntimeResult<()>
-where
-    C: CongestionController + 'static,
-    Seg: TcpWorkerStore<C>,
-    hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-{
-    // The main graph carries only the monomorphized process function and edge
-    // shape. Its Session Queue stays disabled until each worker binds state.
-    let tcp_output = output::register_tcp_output(runtime, 0)?;
-    let session_queue = hammer_service::session::node::register_session_queue_node(runtime, 0)?;
-    main.register_tcp_input::<C, Seg>(runtime, None)?;
-    let control = main.control().clone();
-    runtime.nodes().try_register_internal_with_next_names(
-        TcpListenNode::for_worker::<C, Seg>(control, [NodeId::new(0); TcpListenNext::COUNT]),
-        &TcpListenNext::NEXT_NAMES,
-    )?;
-    runtime.nodes().try_register_internal_with_next_names(
-        TcpEstablishedNode::for_worker::<C, Seg>([NodeId::new(0); TcpEstablishedNext::COUNT]),
-        &TcpEstablishedNext::NEXT_NAMES,
-    )?;
-    runtime.nodes().try_register_internal_with_next_names(
-        TcpRcvProcessNode::for_worker::<C, Seg>([NodeId::new(0); TcpRcvProcessNext::COUNT]),
-        &TcpRcvProcessNext::NEXT_NAMES,
-    )?;
-    runtime.nodes().try_register_internal_with_next_names(
-        TcpSynSentNode::for_worker::<C, Seg>([NodeId::new(0); TcpSynSentNext::COUNT]),
-        &TcpSynSentNext::NEXT_NAMES,
-    )?;
-    let _ = SessionQueueNode::compile_output_next(runtime, session_queue, tcp_output)?;
-    runtime
-        .nodes()
-        .set_node_state(session_queue, NodeState::Disabled)?;
-    Ok(())
-}
-
-fn register_configured_main_graph(
-    runtime: &DataPlaneRuntime,
-    main: &TcpMain,
-    backend: SessionBackend,
-) -> RuntimeResult<()> {
-    use crate::config::CongestionController as CongestionKind;
-    use hammer_service::transport::congestion::BbrController;
-
-    let congestion = main.congestion();
-    match congestion {
-        CongestionKind::Bbr => match backend {
-            SessionBackend::Local => {
-                type C = BbrController;
-                type Seg = hammer_infra::segment::Local;
-                register_typed_main_graph::<C, Seg>(runtime, main)?;
-            }
-            SessionBackend::Svm => {
-                type C = BbrController;
-                type Seg = hammer_infra::segment::Svm;
-                register_typed_main_graph::<C, Seg>(runtime, main)?;
-            }
-        },
-    }
-    Ok(())
-}
-
-fn bind_typed_worker_graph<C, Seg>(
-    engine: &mut Engine,
-    state: TcpWorkerState<C, Seg>,
-) -> RuntimeResult<()>
-where
-    C: CongestionController + 'static,
-    Seg: TcpWorkerStore<C>,
-    hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-{
+fn bind_worker_graph(engine: &mut Engine) -> RuntimeResult<()> {
     let worker = engine.data_worker_id()?;
     let handoff = engine.runtime.handoff_node_handle()?;
     let session_queue = engine
         .runtime
         .node_by_name("session-queue")
-        .ok_or_else(|| RuntimeError::invariant("session-queue is not registered"))?;
+        .ok_or_else(|| {
+            RuntimeError::subsystem(
+                "tcp",
+                TcpWorkerError::NodeMissing {
+                    name: "session-queue",
+                },
+            )
+        })?;
     let tcp_output = engine
         .runtime
         .node_by_name(TcpOutputNode::NODE_NAME)
-        .ok_or_else(|| RuntimeError::invariant("tcp-output is not registered"))?;
-    let tcp_input = engine
-        .runtime
-        .node_by_name("tcp-input")
-        .ok_or_else(|| RuntimeError::invariant("tcp-input is not registered"))?;
-    let tcp_listen = engine
-        .runtime
-        .node_by_name("tcp-listen")
-        .ok_or_else(|| RuntimeError::invariant("tcp-listen is not registered"))?;
+        .ok_or_else(|| {
+            RuntimeError::subsystem(
+                "tcp",
+                TcpWorkerError::NodeMissing {
+                    name: TcpOutputNode::NODE_NAME,
+                },
+            )
+        })?;
+    let tcp_input = engine.runtime.node_by_name("tcp-input").ok_or_else(|| {
+        RuntimeError::subsystem("tcp", TcpWorkerError::NodeMissing { name: "tcp-input" })
+    })?;
+    let tcp_listen = engine.runtime.node_by_name("tcp-listen").ok_or_else(|| {
+        RuntimeError::subsystem("tcp", TcpWorkerError::NodeMissing { name: "tcp-listen" })
+    })?;
     let tcp_established = engine
         .runtime
         .node_by_name("tcp-established")
-        .ok_or_else(|| RuntimeError::invariant("tcp-established is not registered"))?;
+        .ok_or_else(|| {
+            RuntimeError::subsystem(
+                "tcp",
+                TcpWorkerError::NodeMissing {
+                    name: "tcp-established",
+                },
+            )
+        })?;
     let tcp_rcv_process = engine
         .runtime
         .node_by_name("tcp-rcv-process")
-        .ok_or_else(|| RuntimeError::invariant("tcp-rcv-process is not registered"))?;
-    let tcp_syn_sent = engine
-        .runtime
-        .node_by_name("tcp-syn-sent")
-        .ok_or_else(|| RuntimeError::invariant("tcp-syn-sent is not registered"))?;
+        .ok_or_else(|| {
+            RuntimeError::subsystem(
+                "tcp",
+                TcpWorkerError::NodeMissing {
+                    name: "tcp-rcv-process",
+                },
+            )
+        })?;
+    let tcp_syn_sent = engine.runtime.node_by_name("tcp-syn-sent").ok_or_else(|| {
+        RuntimeError::subsystem(
+            "tcp",
+            TcpWorkerError::NodeMissing {
+                name: "tcp-syn-sent",
+            },
+        )
+    })?;
 
     let session_queue_node = SessionQueueNode::new()?;
     let session_queue_data = session_queue_node.node_runtime_data()?;
@@ -529,32 +400,20 @@ where
     SessionQueueNode::install_worker_attachment(
         session_queue_data,
         session_queue_output,
-        tcp_session_queue_dispatch::<C, Seg>,
+        tcp_session_queue_dispatch,
     )?;
     let main_guard = TCP_MAIN.load();
     let main = main_guard
         .as_deref()
-        .ok_or_else(|| RuntimeError::invariant("tcp main not initialized"))?;
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
     let input_data = main
         .control()
-        .node::<C, Seg>(
-            [NodeId::new(0); TcpInputNext::COUNT],
-            Some((handoff, worker)),
-        )
+        .node(main.input_process, Some((handoff, worker)))
         .node_runtime_data()?;
-    let control = main.control().clone();
-    let listen_data =
-        TcpListenNode::for_worker::<C, Seg>(control, [NodeId::new(0); TcpListenNext::COUNT])
-            .node_runtime_data()?;
-    let established_data =
-        TcpEstablishedNode::for_worker::<C, Seg>([NodeId::new(0); TcpEstablishedNext::COUNT])
-            .node_runtime_data()?;
-    let rcv_process_data =
-        TcpRcvProcessNode::for_worker::<C, Seg>([NodeId::new(0); TcpRcvProcessNext::COUNT])
-            .node_runtime_data()?;
-    let syn_sent_data =
-        TcpSynSentNode::for_worker::<C, Seg>([NodeId::new(0); TcpSynSentNext::COUNT])
-            .node_runtime_data()?;
+    let listen_data = TcpListenNode::new(main.listen_process).node_runtime_data()?;
+    let established_data = TcpEstablishedNode::new(main.established_process).node_runtime_data()?;
+    let rcv_process_data = TcpRcvProcessNode::new(main.rcv_process).node_runtime_data()?;
+    let syn_sent_data = TcpSynSentNode::new(main.syn_sent_process).node_runtime_data()?;
 
     // A worker graph clone can retain the old polling state. Keep the node
     // dormant until its replacement SessionWorker owns a live readiness file.
@@ -569,44 +428,17 @@ where
     engine.set_worker_node_runtime_data(tcp_rcv_process, rcv_process_data)?;
     engine.set_worker_node_runtime_data(tcp_syn_sent, syn_sent_data)?;
 
-    // Keep the old record live until the replacement has registered its own
-    // descriptor. The queue node stays disabled throughout this transition,
-    // so neither record can dispatch while ownership changes hands.
-    let mut replacement = Some(state);
-    let Some(replacement_state) = replacement.as_mut() else {
-        return Err(RuntimeError::from(TcpError::Dispatch));
-    };
-    replacement_state
-        .sessions
-        .install_queue_readiness(engine, session_queue)?;
-
-    let previous = match Seg::take_worker() {
-        Ok(previous) => previous,
-        Err(error) => {
-            let Some(replacement_state) = replacement.as_mut() else {
-                return Err(error);
-            };
-            replacement_state.sessions.remove_queue_readiness(engine)?;
-            return Err(error);
-        }
-    };
-    if let Some(mut previous) = previous {
-        if let Err(error) = previous.sessions.remove_queue_readiness(engine) {
-            let Some(replacement_state) = replacement.as_mut() else {
-                return Err(error);
-            };
-            replacement_state.sessions.remove_queue_readiness(engine)?;
-            let mut restore = Some(previous);
-            Seg::install_worker(&mut restore)?;
-            return Err(error);
-        }
-    }
-    if let Err(error) = Seg::install_worker(&mut replacement) {
-        let Some(replacement_state) = replacement.as_mut() else {
-            return Err(error);
-        };
-        replacement_state.sessions.remove_queue_readiness(engine)?;
-        return Err(error);
+    if main
+        .worker(worker)?
+        .install(TcpWorker::new(worker))
+        .is_err()
+    {
+        return Err(RuntimeError::subsystem(
+            "tcp",
+            TcpWorkerError::WorkerAlreadyInstalled {
+                worker: worker.slot(),
+            },
+        ));
     }
     engine
         .runtime
@@ -615,73 +447,32 @@ where
     Ok(())
 }
 
-#[hammer_component_macros::worker_init_function(name = "tcp_worker_init")]
+#[hammer_component_macros::worker_init_function(
+    name = "tcp_worker_init",
+    runs_after = ["session_worker_init"]
+)]
 fn init_tcp_worker(engine: &mut Engine) -> RuntimeResult<()> {
-    use crate::config::CongestionController as CongestionKind;
-    use hammer_service::transport::congestion::BbrController;
-
-    let worker = engine.data_worker_id()?;
-    let tcp_main = TCP_MAIN.load();
-    let congestion = tcp_main
-        .as_deref()
-        .ok_or_else(|| RuntimeError::invariant("tcp main not initialized"))?
-        .congestion();
-    let backend = hammer_service::transport::session_backend().unwrap_or_default();
-
-    match congestion {
-        CongestionKind::Bbr => match backend {
-            SessionBackend::Local => {
-                type C = BbrController;
-                type Seg = hammer_infra::segment::Local;
-                let state = TcpWorkerState::new(
-                    SessionWorker::new(worker, engine.runtime.buffers().clone()),
-                    TcpWorker::new(worker),
-                );
-                bind_typed_worker_graph::<C, Seg>(engine, state)?;
-            }
-            SessionBackend::Svm => {
-                type C = BbrController;
-                type Seg = hammer_infra::segment::Svm;
-                let state = TcpWorkerState::new(
-                    SessionWorker::new_svm(
-                        worker,
-                        engine.runtime.buffers().clone(),
-                        hammer_runtime::app::AppSessionConfig::default(),
-                    ),
-                    TcpWorker::new(worker),
-                );
-                bind_typed_worker_graph::<C, Seg>(engine, state)?;
-            }
-        },
-    }
-    Ok(())
+    TCP_MAIN
+        .load_full()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
+    bind_worker_graph(engine)
 }
 
-fn tcp_session_queue_dispatch<C, Seg>(
+fn tcp_session_queue_dispatch(
     runtime: &DataPlaneRuntime,
     _: NodeRuntimeData,
     output_next: SessionQueueNext,
     now: std::time::Instant,
     frame: &mut hammer_core::data_plane::BufferFrame,
     output: &mut SessionQueueOutput,
-) -> RuntimeResult<()>
-where
-    C: CongestionController + 'static,
-    Seg: TcpWorkerStore<C>,
-    hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-{
-    with_tcp_worker_mut::<C, Seg, _>(|state| {
-        dispatch_session_queue_pending(
-            runtime,
-            &mut state.sessions,
-            &mut state.tcp,
-            output_next,
-            frame,
-            output,
-            now,
-        )
-        .map(|_| ())
-    })
+) -> RuntimeResult<()> {
+    TCP_MAIN
+        .load_full()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?
+        .with_worker(runtime, |sessions, tcp| {
+            dispatch_session_queue_pending(runtime, sessions, tcp, output_next, frame, output, now)
+                .map(|_| ())
+        })
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -715,20 +506,22 @@ pub enum TcpNodeError {
     NoListener,
     #[error("connection create failed")]
     ConnectionCreate,
-    #[error("RACK timeout")]
-    RackTimeout,
+    #[error("RACK retransmit")]
+    RackRetransmit,
     #[error("TLP probe")]
     TlpProbe,
-    #[error("retransmit")]
+    #[error("RTO retransmit")]
     Retransmit,
     #[error("pacing limited")]
     PacingLimited,
-    #[error("persist timer")]
-    PersistTimer,
+    #[error("persist probe")]
+    PersistProbe,
     #[error("BBR congestion")]
     BbrCongestion,
     #[error("bad window")]
     BadWindow,
+    #[error("keepalive probe")]
+    KeepaliveProbe,
 }
 
 impl TcpNodeError {
@@ -752,12 +545,13 @@ impl From<TcpNodeError> for TcpError {
             | TcpNodeError::ConnectionCreate => TcpError::InvalidConnection,
             TcpNodeError::TimerUpdateFailed
             | TcpNodeError::TxOffsetOverflow
-            | TcpNodeError::RackTimeout
+            | TcpNodeError::RackRetransmit
             | TcpNodeError::TlpProbe
             | TcpNodeError::Retransmit
             | TcpNodeError::PacingLimited
-            | TcpNodeError::PersistTimer
-            | TcpNodeError::BbrCongestion => TcpError::Dispatch,
+            | TcpNodeError::PersistProbe
+            | TcpNodeError::BbrCongestion
+            | TcpNodeError::KeepaliveProbe => TcpError::Dispatch,
             TcpNodeError::BadChecksum | TcpNodeError::BadSegment => TcpError::SegmentInvalid,
             TcpNodeError::ResetReceived => TcpError::ConnectionClosed,
             TcpNodeError::NoListener => TcpError::NoListener,
@@ -784,12 +578,23 @@ pub enum TcpOutputError {
     UnsupportedEgress,
     #[error("IP output service is unavailable")]
     IpOutputUnavailable,
+    #[error("TCP segment is too long for its IP packet")]
+    SegmentTooLong,
+    #[error("IP output rejected the prepended IP header")]
+    IpHeaderRejected,
 }
 
 impl TcpOutputError {
     #[inline(always)]
     pub const fn code(self) -> u16 {
         self as u16
+    }
+}
+
+impl From<TcpOutputError> for RuntimeError {
+    #[inline]
+    fn from(error: TcpOutputError) -> Self {
+        Self::subsystem("tcp", error)
     }
 }
 
@@ -1026,47 +831,15 @@ fn enqueue_tcp_segment(
     Ok(())
 }
 
-fn publish_tcp_connection<C, Seg>(
-    state: &mut TcpWorkerState<C, Seg>,
-    session_id: SessionId,
-) -> RuntimeResult<()>
-where
-    C: CongestionController + 'static,
-    Seg: SessionSegment,
-    hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-{
-    let (_, index) = state
-        .sessions
-        .session_transport(session_id)
-        .ok_or(TcpNodeError::SessionMissing)?;
-    let close = {
-        let TcpWorker {
-            connections,
-            lookup,
-            ..
-        } = &mut state.tcp;
-        let connection = connections.get(index).ok_or(TcpNodeError::SessionMissing)?;
-        lookup.publish_connection(session_id, connection)
-    };
-    if close {
-        state.sessions.notify_transport_closed(session_id, index)?;
-        let _ = state.tcp.remove_connection(index);
-        state.sessions.notify_transport_deleted(session_id, index);
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 #[doc(hidden)]
-pub(crate) fn closing_session_for_test<C>() -> (
-    TcpWorkerState<C, Local>,
+pub(crate) fn closing_session_for_test() -> (
+    SessionWorker<PoolIndex>,
+    TcpWorker,
     SessionId,
     std::net::SocketAddr,
     std::net::SocketAddr,
-)
-where
-    C: CongestionController + 'static,
-{
+) {
     let local: std::net::SocketAddr = "192.0.2.10:443".parse().expect("local");
     let remote: std::net::SocketAddr = "198.51.100.20:50001".parse().expect("remote");
     let worker = DataWorkerId::new(0);
@@ -1078,22 +851,30 @@ where
             ..hammer_runtime::DataPlaneBufferConfig::default()
         },
     });
-    let mut state = TcpWorkerState::new(
-        SessionWorker::new(worker, runtime.buffers().clone()),
-        TcpWorker::new(worker),
+    let mut sessions = SessionWorker::new(worker).expect("session worker for test");
+    let mut tcp = TcpWorker::new(worker);
+    let connection = TcpConnection::established_for_time_wait_test(
+        None,
+        worker,
+        local.port(),
+        Some(local),
+        remote,
     );
-    let session_id = insert_tcp_session(&mut state, |session_id: SessionId| {
-        TcpConnection::established_for_time_wait_test(
-            Some(crate::TcpConnectionId::new(session_id.get())),
-            worker,
-            local.port(),
-            Some(local),
-            remote,
-        )
-    })
-    .expect("insert session");
-    publish_tcp_connection(&mut state, session_id).expect("refresh session route");
-    (state, session_id, local, remote)
+    let connection_index = tcp
+        .insert_connection(connection)
+        .expect("insert TCP connection");
+    let session_id = sessions
+        .stream_accept(TcpWorker::ID, connection_index, 0)
+        .expect("accept stream session");
+    tcp.connection_mut(connection_index)
+        .expect("TCP connection")
+        .attach_session(session_id)
+        .expect("attach stream session");
+    publish_tcp_connection(&mut sessions, &mut tcp, session_id).expect("publish TCP connection");
+    sessions
+        .connected(session_id)
+        .expect("notify accepted session");
+    (sessions, tcp, session_id, local, remote)
 }
 
 #[hammer_component_macros::node_next]
@@ -1120,8 +901,9 @@ mod init_tests {
     use abi_stable::{
         RRef,
         sabi_trait::TD_Opaque,
-        std_types::{RSlice, RSliceMut},
+        std_types::{RBoxError, ROk, RResult, RSlice, RSliceMut},
     };
+    use hammer_core::data_plane::NodeId;
     use hammer_runtime::IpOutput;
     use hammer_runtime::RuntimeRegistry;
     use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, Engine};
@@ -1131,6 +913,10 @@ mod init_tests {
     struct TestIpOutput;
 
     impl IpOutput for TestIpOutput {
+        fn register_protocol(&self, _: u8, _: NodeId) -> RResult<(), RBoxError> {
+            ROk(())
+        }
+
         fn write_ipv4_header(
             &self,
             _: RSliceMut<'_, u8>,
@@ -1174,8 +960,6 @@ mod init_tests {
 
     #[test]
     fn tcp_config_binds_configured_listens() {
-        hammer_service::reset_subsystem_mains_for_plugin_test();
-        reset_for_test();
         let mut engine = test_engine();
         engine
             .configure_early(
@@ -1190,47 +974,17 @@ address = "10.0.0.1:7"
             .registry
             .require::<crate::config::TcpPluginConfig>()
             .expect("published TCP config");
-        let main = configured_tcp_main(config.as_ref(), RRef::new(&TEST_IP_OUTPUT))
-            .expect("build configured TCP main");
+        let main = configured_tcp_main(
+            config.as_ref(),
+            1,
+            Arc::new(SessionMain::new(1)),
+            RRef::new(&TEST_IP_OUTPUT),
+        )
+        .expect("build configured TCP main");
         let entry = main
             .control()
             .lookup_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 7));
         assert!(entry.is_some(), "configured listen must be in lookup");
         assert_eq!(entry.unwrap().id, 1);
-    }
-
-    #[test]
-    fn tcp_graph_backend_follows_session_config() {
-        hammer_service::reset_subsystem_mains_for_plugin_test();
-        reset_for_test();
-        let mut local = test_engine();
-        local
-            .configure_early(
-                r#"
-[network.session]
-backend = "local"
-"#,
-            )
-            .expect("dispatch local session config");
-        assert_eq!(
-            hammer_service::transport::session_backend(),
-            Some(SessionBackend::Local)
-        );
-
-        hammer_service::reset_subsystem_mains_for_plugin_test();
-        reset_for_test();
-        let mut svm = test_engine();
-        svm.configure_early(
-            r#"
-[network.session]
-backend = "svm"
-attach_socket_path = "/tmp/hammer-session.sock"
-"#,
-        )
-        .expect("dispatch SVM session config");
-        assert_eq!(
-            hammer_service::transport::session_backend(),
-            Some(SessionBackend::Svm)
-        );
     }
 }

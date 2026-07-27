@@ -1,4 +1,4 @@
-use crate::{TcpWorkerStore, publish_tcp_connection, read_session_id, with_tcp_worker_mut};
+use crate::{publish_tcp_connection, read_session_id};
 use hammer_core::data_plane::{
     BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Index, NodeId, NodeNext,
 };
@@ -8,9 +8,7 @@ use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use super::TcpNodeError;
 use super::segment::tcp_packet;
-use hammer_service::session::app::SessionAppRuntimeCreate;
 use hammer_service::session::runtime::RxDelivery;
-use hammer_service::transport::congestion::CongestionController;
 
 #[hammer_component_macros::node_next]
 pub enum TcpSynSentNext {
@@ -30,22 +28,17 @@ pub struct TcpSynSentNode {
     process: NodeProcessFn,
 }
 
-impl TcpSynSentNode {
-    pub(crate) fn for_worker<C, Seg>(next: [NodeId; TcpSynSentNext::COUNT]) -> Self
-    where
-        C: CongestionController + 'static,
-        Seg: TcpWorkerStore<C>,
-        hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-    {
-        Self::new(tcp_syn_sent_process::<C, Seg>, next)
+pub fn register_tcp_syn_sent(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+    let main = crate::TCP_MAIN
+        .load_full()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
+    if let Some(node) = runtime.nodes().node_by_name("tcp-syn-sent") {
+        return Ok(node);
     }
-}
-
-pub fn register_tcp_syn_sent(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
-    runtime
-        .nodes()
-        .node_by_name("tcp-syn-sent")
-        .ok_or_else(|| RuntimeError::invariant("TCP worker graph is not registered"))
+    runtime.nodes().try_register_internal_with_next_names(
+        TcpSynSentNode::new(main.syn_sent_process),
+        &TcpSynSentNext::NEXT_NAMES,
+    )
 }
 
 impl Node for TcpSynSentNode {
@@ -60,25 +53,15 @@ impl Node for TcpSynSentNode {
     }
 }
 
-fn tcp_syn_sent_process<C, Seg>(
+pub(crate) fn tcp_syn_sent_process(
     runtime: &DataPlaneRuntime,
     _: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> NodeResult
-where
-    C: CongestionController + 'static,
-    Seg: TcpWorkerStore<C>,
-    hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-{
-    tcp_syn_sent_frame::<C, Seg>(runtime, frame)
+) -> NodeResult {
+    tcp_syn_sent_frame(runtime, frame)
 }
 
-fn tcp_syn_sent_frame<C, Seg>(runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult
-where
-    C: CongestionController + 'static,
-    Seg: TcpWorkerStore<C>,
-    hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-{
+fn tcp_syn_sent_frame(runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
     let input_len = frame.len();
     debug_assert!(input_len <= DEFAULT_BUFFER_FRAME_CAPACITY);
     let mut inputs = [core::mem::MaybeUninit::<Index>::uninit(); DEFAULT_BUFFER_FRAME_CAPACITY];
@@ -142,28 +125,25 @@ fn emit_local(
     Ok(())
 }
 
-fn tcp_syn_sent_index<C, Seg>(
+fn tcp_syn_sent_index(
     runtime: &DataPlaneRuntime,
     index: Index,
     out_frame: &mut BufferFrame,
     nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
     out_len: &mut usize,
-) -> RuntimeResult<bool>
-where
-    C: CongestionController + 'static,
-    Seg: TcpWorkerStore<C>,
-    hammer_service::session::SessionAppRuntime<Seg>: SessionAppRuntimeCreate<Seg>,
-{
+) -> RuntimeResult<bool> {
     let packet = tcp_packet(runtime, index)?;
-    let (keep_current, control_segment) = with_tcp_worker_mut::<C, Seg, _>(|state| {
+    let main = crate::TCP_MAIN
+        .load_full()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
+    let (keep_current, control_segment) = main.with_worker(runtime, |sessions, tcp| {
         let mut keep_current = true;
         let session_id = read_session_id(runtime, index)?.ok_or_else(|| {
             let _ =
                 runtime.record_current_node_error(TcpNodeError::SynSentSessionRouteMissing.code());
             TcpNodeError::SynSentSessionRouteMissing
         })?;
-        let (_, connection_index) = state
-            .sessions
+        let (_, connection_index) = sessions
             .session_transport(session_id)
             .ok_or(TcpNodeError::SynSentSessionMissing)?;
         let (control, acked_tx_len, established, established_with_payload) = {
@@ -171,7 +151,7 @@ where
                 connections,
                 lookup,
                 timers,
-            } = &mut state.tcp;
+            } = tcp;
             let local_capabilities = lookup
                 .pending_open_capabilities(session_id)
                 .unwrap_or_default();
@@ -200,12 +180,10 @@ where
             )
         };
         if acked_tx_len != 0 {
-            state
-                .sessions
-                .ack_tx_up_to(session_id, acked_tx_len as usize)?;
+            sessions.ack_tx_up_to(session_id, acked_tx_len as usize)?;
         }
         if let Some(cookie) = packet.fast_open_cookie.filter(|cookie| !cookie.is_empty()) {
-            state.tcp.lookup.remember_fast_open_cookie(
+            tcp.lookup.remember_fast_open_cookie(
                 packet.local,
                 packet.remote,
                 cookie,
@@ -218,15 +196,15 @@ where
                 buffer.advance(packet.payload_offset as isize)?;
                 buffer.truncate(packet.payload_len)?;
             }
-            let enqueue = state.sessions.enqueue_rx(session_id, index, 0, false)?;
+            let enqueue = sessions.enqueue_rx(runtime.buffers(), session_id, index, 0, false)?;
             if matches!(enqueue, RxDelivery::InOrder { .. }) {
-                state.sessions.mark_ready(session_id);
+                sessions.mark_ready(session_id);
             }
             keep_current = false;
         };
-        publish_tcp_connection(state, session_id)?;
+        publish_tcp_connection(sessions, tcp, session_id)?;
         if established {
-            state.sessions.app().connected(session_id)?;
+            sessions.connected(session_id)?;
         }
         Ok((keep_current, control))
     })?;

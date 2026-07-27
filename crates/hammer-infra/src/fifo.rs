@@ -1,45 +1,96 @@
 use std::cell::UnsafeCell;
+use std::fmt;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::pool::{Index as PoolIndex, Pool};
 use crate::rbtree::RbTree;
-use crate::segment::{Local, Segment};
+use crate::segment::Segment;
 
 #[repr(C)]
 struct Chunk {
     start_byte: u32,
-    length: u32,
+    length: AtomicU32,
     next: AtomicU64,
-    refcount: AtomicU32,
 }
 
 const CHUNK_HEADER_SIZE: usize = std::mem::size_of::<Chunk>();
 
 #[repr(C, align(64))]
 pub struct FifoHeader {
-    start_chunk: u64,
-    end_chunk: u64,
+    free_chunk: AtomicU64,
     size: u32,
     min_alloc: u32,
     has_event: AtomicU32,
-    want_ntf: AtomicU32,
     want_deq_ntf: AtomicU32,
     has_deq_ntf: AtomicU32,
     deq_thresh: AtomicU32,
-    _pad0: [u8; 64 - (8 + 8 + 4 + 4 + 4 + 4 + 4 + 4 + 4)],
-    head_chunk: u64,
+    _pad0: [u8; 64 - (8 + 4 + 4 + 4 + 4 + 4 + 4)],
+    head_chunk: AtomicU64,
     head: AtomicU32,
     _pad1: [u8; 64 - (8 + 4)],
-    tail_chunk: u64,
+    tail_chunk: AtomicU64,
     tail: AtomicU32,
     _pad2: [u8; 64 - (8 + 4)],
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FifoError {
     InvalidCapacity,
+    CapacityOutOfRange { capacity: usize },
+    SegmentExhausted,
+    OutOfOrderDisabled,
+    OutOfOrderLengthOutOfRange { length: usize },
+    OutOfOrderOffsetOverflow { offset: u32, length: u32 },
+    OutOfOrderCapacityExceeded { end_offset: u32, available: usize },
+    OutOfOrderStorageExhausted { entries: usize },
 }
+
+impl fmt::Display for FifoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidCapacity => {
+                f.write_str("FIFO capacity must be a power of two and at least 2")
+            }
+            Self::CapacityOutOfRange { capacity } => {
+                write!(
+                    f,
+                    "FIFO capacity {capacity} exceeds the shared layout range"
+                )
+            }
+            Self::SegmentExhausted => {
+                f.write_str("segment has insufficient space for FIFO storage")
+            }
+            Self::OutOfOrderDisabled => f.write_str("out-of-order FIFO delivery is disabled"),
+            Self::OutOfOrderLengthOutOfRange { length } => {
+                write!(f, "out-of-order FIFO length {length} exceeds u32")
+            }
+            Self::OutOfOrderOffsetOverflow { offset, length } => {
+                write!(
+                    f,
+                    "out-of-order FIFO offset {offset} plus length {length} overflows u32"
+                )
+            }
+            Self::OutOfOrderCapacityExceeded {
+                end_offset,
+                available,
+            } => {
+                write!(
+                    f,
+                    "out-of-order FIFO end offset {end_offset} exceeds available capacity {available}"
+                )
+            }
+            Self::OutOfOrderStorageExhausted { entries } => {
+                write!(
+                    f,
+                    "out-of-order FIFO segment storage exhausted at {entries} entries"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for FifoError {}
 
 pub struct OooResult {
     pub accepted: u32,
@@ -64,115 +115,144 @@ impl OooBookkeeping {
         let idx = self.index.remove(&offset)?;
         self.entries.remove(idx)
     }
+
+    /// Grows segment storage before an enqueue can exhaust it, mirroring VPP
+    /// `svm_fifo` whose ooo segment pool grows on demand (`pool_get`). Both
+    /// containers are rebuilt, so callers must not hold pool indices across
+    /// this call.
+    fn ensure_capacity(&mut self, needed: usize) -> Result<(), FifoError> {
+        if self.entries.capacity() >= needed && self.index.capacity() >= needed {
+            return Ok(());
+        }
+        let new_capacity = self
+            .entries
+            .capacity()
+            .saturating_mul(2)
+            .max(needed)
+            .next_power_of_two();
+        let mut entries = Pool::with_capacity(new_capacity);
+        let mut index = RbTree::with_capacity(new_capacity);
+        while let Some((&offset, &idx)) = self.index.first() {
+            self.index.remove(&offset);
+            let Some(segment) = self.entries.remove(idx) else {
+                continue;
+            };
+            let Some(new_idx) = entries.insert(segment) else {
+                return Err(FifoError::OutOfOrderStorageExhausted {
+                    entries: entries.capacity(),
+                });
+            };
+            index.insert(offset, new_idx);
+        }
+        self.entries = entries;
+        self.index = index;
+        Ok(())
+    }
 }
 
-pub struct Fifo<S: Segment> {
-    seg: S,
+pub struct Fifo {
+    seg: Segment,
     base: *mut u8,
     hdr: *mut FifoHeader,
     hdr_off: u64,
     ooo: UnsafeCell<Option<Box<OooBookkeeping>>>,
 }
 
-unsafe impl<S: Segment> Send for Fifo<S> {}
-unsafe impl<S: Segment> Sync for Fifo<S> {}
+unsafe impl Send for Fifo {}
+unsafe impl Sync for Fifo {}
 
-impl<S: Segment> Fifo<S> {
-    pub fn new(seg: S, capacity: usize) -> Result<Self, FifoError> {
+impl Fifo {
+    const fn chunk_data_size(capacity: usize) -> usize {
+        if capacity < 4096 { capacity } else { 4096 }
+    }
+
+    pub const fn layout_bytes(capacity: usize) -> Result<usize, FifoError> {
         if capacity < 2 || !capacity.is_power_of_two() {
             return Err(FifoError::InvalidCapacity);
         }
-        let hdr_off = seg.alloc(std::mem::size_of::<FifoHeader>(), 64);
-        let base = seg.base();
-        let hdr = unsafe { base.add(hdr_off as usize) as *mut FifoHeader };
-        let chunk_size = capacity.min(4096);
-        let chunk_off = seg.alloc(CHUNK_HEADER_SIZE + chunk_size, 64);
-        unsafe {
-            std::ptr::write(
-                hdr,
-                FifoHeader {
-                    start_chunk: chunk_off,
-                    end_chunk: chunk_off,
-                    size: capacity as u32,
-                    min_alloc: chunk_size as u32,
-                    has_event: AtomicU32::new(0),
-                    want_ntf: AtomicU32::new(0),
-                    want_deq_ntf: AtomicU32::new(0),
-                    has_deq_ntf: AtomicU32::new(0),
-                    deq_thresh: AtomicU32::new(0),
-                    _pad0: [0; 64 - (8 + 8 + 4 + 4 + 4 + 4 + 4 + 4 + 4)],
-                    head_chunk: chunk_off,
-                    head: AtomicU32::new(0),
-                    _pad1: [0; 64 - (8 + 4)],
-                    tail_chunk: chunk_off,
-                    tail: AtomicU32::new(0),
-                    _pad2: [0; 64 - (8 + 4)],
-                },
-            );
-            let chunk = base.add(chunk_off as usize) as *mut Chunk;
-            std::ptr::write(
-                chunk,
-                Chunk {
-                    start_byte: 0,
-                    length: 0,
-                    next: AtomicU64::new(0),
-                    refcount: AtomicU32::new(1),
-                },
-            );
+        if capacity > u32::MAX as usize {
+            return Err(FifoError::CapacityOutOfRange { capacity });
         }
-        Ok(Self {
-            seg,
-            base,
-            hdr,
-            hdr_off,
-            ooo: UnsafeCell::new(None),
-        })
+        let chunk_data_size = Self::chunk_data_size(capacity);
+        let chunk_count = capacity / chunk_data_size;
+        let Some(chunks_bytes) = chunk_count.checked_mul(CHUNK_HEADER_SIZE + chunk_data_size)
+        else {
+            return Err(FifoError::CapacityOutOfRange { capacity });
+        };
+        let Some(bytes) = std::mem::size_of::<FifoHeader>().checked_add(chunks_bytes) else {
+            return Err(FifoError::CapacityOutOfRange { capacity });
+        };
+        Ok(bytes)
+    }
+
+    pub fn new(seg: Segment, capacity: usize) -> Result<Self, FifoError> {
+        let bytes = Self::layout_bytes(capacity)?;
+        let hdr_off = seg.alloc(bytes, 64).ok_or(FifoError::SegmentExhausted)?;
+        unsafe { Self::init_at(seg, hdr_off, capacity) }
     }
 
     /// Initialise a [`Fifo`] header at a pre-allocated offset in `seg`.
-    /// The caller must guarantee that `seg` has `sizeof(FifoHeader) +
-    /// CHUNK_HEADER_SIZE + capacity` bytes available at `hdr_offset` and
-    /// that no other [`Fifo`] uses the same region.
-    pub unsafe fn init_at(seg: S, hdr_offset: u64, capacity: usize) -> Result<Self, FifoError> {
-        if capacity < 2 || !capacity.is_power_of_two() {
-            return Err(FifoError::InvalidCapacity);
-        }
+    /// The caller must guarantee that `seg` has [`Self::layout_bytes`] bytes
+    /// available at `hdr_offset` and that no other [`Fifo`] uses the same
+    /// region.
+    pub unsafe fn init_at(
+        seg: Segment,
+        hdr_offset: u64,
+        capacity: usize,
+    ) -> Result<Self, FifoError> {
+        let layout = Self::layout_bytes(capacity)?;
+        let offset = usize::try_from(hdr_offset).expect("FIFO offset exceeds usize");
+        let end = offset
+            .checked_add(layout)
+            .expect("FIFO layout end overflows usize");
+        assert!(end <= seg.size(), "FIFO layout exceeds segment bounds");
         let base = seg.base();
-        let hdr = unsafe { base.add(hdr_offset as usize) as *mut FifoHeader };
-        let chunk_size = capacity.min(4096) as u32;
-        let chunk_off = hdr_offset + std::mem::size_of::<FifoHeader>() as u64;
+        let hdr = unsafe { base.add(offset) as *mut FifoHeader };
+        let chunk_size = Self::chunk_data_size(capacity);
+        let chunk_count = capacity / chunk_size;
+        let first_chunk_off = hdr_offset + std::mem::size_of::<FifoHeader>() as u64;
+        let chunk_stride = (CHUNK_HEADER_SIZE + chunk_size) as u64;
+        let free_chunk = if chunk_count > 1 {
+            first_chunk_off + chunk_stride
+        } else {
+            0
+        };
         unsafe {
             std::ptr::write(
                 hdr,
                 FifoHeader {
-                    start_chunk: chunk_off,
-                    end_chunk: chunk_off,
+                    free_chunk: AtomicU64::new(free_chunk),
                     size: capacity as u32,
-                    min_alloc: chunk_size,
+                    min_alloc: chunk_size as u32,
                     has_event: AtomicU32::new(0),
-                    want_ntf: AtomicU32::new(0),
                     want_deq_ntf: AtomicU32::new(0),
                     has_deq_ntf: AtomicU32::new(0),
                     deq_thresh: AtomicU32::new(0),
-                    _pad0: [0; 64 - (8 + 8 + 4 + 4 + 4 + 4 + 4 + 4 + 4)],
-                    head_chunk: chunk_off,
+                    _pad0: [0; 64 - (8 + 4 + 4 + 4 + 4 + 4 + 4)],
+                    head_chunk: AtomicU64::new(first_chunk_off),
                     head: AtomicU32::new(0),
                     _pad1: [0; 64 - (8 + 4)],
-                    tail_chunk: chunk_off,
+                    tail_chunk: AtomicU64::new(first_chunk_off),
                     tail: AtomicU32::new(0),
                     _pad2: [0; 64 - (8 + 4)],
                 },
             );
-            let chunk = base.add(chunk_off as usize) as *mut Chunk;
-            std::ptr::write(
-                chunk,
-                Chunk {
-                    start_byte: 0,
-                    length: 0,
-                    next: AtomicU64::new(0),
-                    refcount: AtomicU32::new(1),
-                },
-            );
+            for index in 0..chunk_count {
+                let chunk_off = first_chunk_off + index as u64 * chunk_stride;
+                let next = if index + 1 < chunk_count {
+                    chunk_off + chunk_stride
+                } else {
+                    0
+                };
+                std::ptr::write(
+                    base.add(chunk_off as usize) as *mut Chunk,
+                    Chunk {
+                        start_byte: 0,
+                        length: AtomicU32::new(0),
+                        next: AtomicU64::new(if index == 0 { 0 } else { next }),
+                    },
+                );
+            }
         }
         Ok(Self {
             seg,
@@ -191,6 +271,55 @@ impl<S: Segment> Fifo<S> {
         self.hdr_off
     }
 
+    unsafe fn acquire_chunk(&self, start_byte: u32) -> Option<u64> {
+        let free_chunk = unsafe { &(*self.hdr).free_chunk };
+        let mut chunk_off = free_chunk.load(Ordering::Acquire);
+        while chunk_off != 0 {
+            let chunk = unsafe { &*self.base.add(chunk_off as usize).cast::<Chunk>() };
+            let next = chunk.next.load(Ordering::Relaxed);
+            match free_chunk.compare_exchange_weak(
+                chunk_off,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    unsafe {
+                        std::ptr::write(
+                            self.base.add(chunk_off as usize).cast::<Chunk>(),
+                            Chunk {
+                                start_byte,
+                                length: AtomicU32::new(0),
+                                next: AtomicU64::new(0),
+                            },
+                        );
+                    }
+                    return Some(chunk_off);
+                }
+                Err(current) => chunk_off = current,
+            }
+        }
+        None
+    }
+
+    unsafe fn release_chunk(&self, chunk_off: u64) {
+        let chunk = unsafe { &*self.base.add(chunk_off as usize).cast::<Chunk>() };
+        let free_chunk = unsafe { &(*self.hdr).free_chunk };
+        let mut head = free_chunk.load(Ordering::Acquire);
+        loop {
+            chunk.next.store(head, Ordering::Relaxed);
+            match free_chunk.compare_exchange_weak(
+                head,
+                chunk_off,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(current) => head = current,
+            }
+        }
+    }
+
     #[inline]
     pub fn enqueue(&self, src: &[u8]) -> usize {
         if src.is_empty() {
@@ -200,6 +329,9 @@ impl<S: Segment> Fifo<S> {
         unsafe {
             let head = (*hdr).head.load(Ordering::Acquire);
             let tail = (*hdr).tail.load(Ordering::Relaxed);
+            if head == tail {
+                self.prepare_empty_tail_chunk(tail);
+            }
             let used = tail.wrapping_sub(head);
             let free = ((*hdr).size - used) as usize;
             let to_write = src.len().min(free);
@@ -235,12 +367,12 @@ impl<S: Segment> Fifo<S> {
                 return 0;
             }
             let logical_pos = head + offset as u32;
-            let mut chunk_off = (*hdr).head_chunk;
+            let mut chunk_off = (*hdr).head_chunk.load(Ordering::Relaxed);
             let mut copied = 0usize;
             let mut pos = logical_pos;
             while copied < to_copy && chunk_off != 0 {
                 let chunk = &*(self.base.add(chunk_off as usize) as *mut Chunk);
-                let chunk_end = chunk.start_byte + chunk.length;
+                let chunk_end = chunk.start_byte + chunk.length.load(Ordering::Relaxed);
                 if pos >= chunk.start_byte && pos < chunk_end {
                     let data_off = (pos - chunk.start_byte) as usize;
                     let chunk_avail = (chunk_end - pos) as usize;
@@ -280,10 +412,10 @@ impl<S: Segment> Fifo<S> {
                 return Some(f(&[], &[]));
             }
             let logical_pos = head + offset as u32;
-            let mut chunk_off = (*hdr).head_chunk;
+            let mut chunk_off = (*hdr).head_chunk.load(Ordering::Relaxed);
             while chunk_off != 0 {
                 let chunk = &*(self.base.add(chunk_off as usize) as *mut Chunk);
-                let chunk_end = chunk.start_byte + chunk.length;
+                let chunk_end = chunk.start_byte + chunk.length.load(Ordering::Relaxed);
                 if logical_pos >= chunk.start_byte && logical_pos < chunk_end {
                     let data_off = (logical_pos - chunk.start_byte) as usize;
                     let chunk_avail = (chunk_end - logical_pos) as usize;
@@ -300,7 +432,7 @@ impl<S: Segment> Fifo<S> {
                     let next_off = chunk.next.load(Ordering::Acquire);
                     if next_off != 0 {
                         let next_chunk = &*(self.base.add(next_off as usize) as *mut Chunk);
-                        let second_avail = next_chunk.length as usize;
+                        let second_avail = next_chunk.length.load(Ordering::Relaxed) as usize;
                         let second_actual = second_len.min(second_avail);
                         let second_slice = std::slice::from_raw_parts(
                             self.base.add(next_off as usize + CHUNK_HEADER_SIZE),
@@ -328,23 +460,19 @@ impl<S: Segment> Fifo<S> {
                 return 0;
             }
             let new_head = head + to_drop as u32;
-            let mut chunk_off = (*hdr).head_chunk;
+            let mut chunk_off = (*hdr).head_chunk.load(Ordering::Relaxed);
             while chunk_off != 0 {
                 let chunk = &*(self.base.add(chunk_off as usize) as *mut Chunk);
-                if new_head >= chunk.start_byte + chunk.length {
-                    if chunk_off == (*hdr).tail_chunk {
+                if new_head >= chunk.start_byte + chunk.length.load(Ordering::Relaxed) {
+                    if chunk_off == (*hdr).tail_chunk.load(Ordering::Acquire) {
                         break;
                     }
                     let next_off = chunk.next.load(Ordering::Acquire);
                     if next_off == 0 {
                         break;
                     }
-                    let prev = chunk.refcount.fetch_sub(1, Ordering::Relaxed);
-                    if prev == 1 {
-                        self.seg
-                            .free(chunk_off, CHUNK_HEADER_SIZE + (*hdr).min_alloc as usize);
-                    }
-                    (*hdr).head_chunk = next_off;
+                    (*hdr).head_chunk.store(next_off, Ordering::Release);
+                    self.release_chunk(chunk_off);
                     chunk_off = next_off;
                 } else {
                     break;
@@ -352,6 +480,20 @@ impl<S: Segment> Fifo<S> {
             }
             (*hdr).head.store(new_head, Ordering::Release);
             to_drop
+        }
+    }
+
+    // Rebase after observing the released head without discarding future OOO bytes.
+    unsafe fn prepare_empty_tail_chunk(&self, tail: u32) {
+        let chunk_off = unsafe { (*self.hdr).tail_chunk.load(Ordering::Relaxed) };
+        if chunk_off == 0 {
+            return;
+        }
+        let chunk = unsafe { &mut *self.base.add(chunk_off as usize).cast::<Chunk>() };
+        let visible_len = tail.wrapping_sub(chunk.start_byte);
+        if chunk.start_byte != tail && chunk.length.load(Ordering::Relaxed) <= visible_len {
+            chunk.start_byte = tail;
+            chunk.length.store(0, Ordering::Relaxed);
         }
     }
 
@@ -365,24 +507,15 @@ impl<S: Segment> Fifo<S> {
             let mut written = 0usize;
             let mut remaining_offset = offset;
             let mut remaining_src = src;
-            let mut chunk_off = (*hdr).tail_chunk;
+            let mut chunk_off = (*hdr).tail_chunk.load(Ordering::Relaxed);
 
             while !remaining_src.is_empty() {
                 if chunk_off == 0 {
-                    let new_off = self.seg.alloc(CHUNK_HEADER_SIZE + chunk_data_size, 64);
-                    std::ptr::write(
-                        self.base.add(new_off as usize) as *mut Chunk,
-                        Chunk {
-                            start_byte: remaining_offset,
-                            length: 0,
-                            next: AtomicU64::new(0),
-                            refcount: AtomicU32::new(1),
-                        },
-                    );
-                    (*hdr).start_chunk = new_off;
-                    (*hdr).end_chunk = new_off;
-                    (*hdr).head_chunk = new_off;
-                    (*hdr).tail_chunk = new_off;
+                    let Some(new_off) = self.acquire_chunk(remaining_offset) else {
+                        return written;
+                    };
+                    (*hdr).head_chunk.store(new_off, Ordering::Release);
+                    (*hdr).tail_chunk.store(new_off, Ordering::Release);
                     chunk_off = new_off;
                 }
 
@@ -393,7 +526,7 @@ impl<S: Segment> Fifo<S> {
                     if next_off != 0 {
                         let next = &*(self.base.add(next_off as usize) as *mut Chunk);
                         if remaining_offset >= next.start_byte {
-                            (*hdr).tail_chunk = next_off;
+                            (*hdr).tail_chunk.store(next_off, Ordering::Release);
                             chunk_off = next_off;
                             continue;
                         }
@@ -402,21 +535,13 @@ impl<S: Segment> Fifo<S> {
                         return written;
                     }
 
-                    let new_off = self.seg.alloc(CHUNK_HEADER_SIZE + chunk_data_size, 64);
-                    std::ptr::write(
-                        self.base.add(new_off as usize) as *mut Chunk,
-                        Chunk {
-                            start_byte: remaining_offset,
-                            length: 0,
-                            next: AtomicU64::new(next_off),
-                            refcount: AtomicU32::new(1),
-                        },
-                    );
+                    let Some(new_off) = self.acquire_chunk(remaining_offset) else {
+                        return written;
+                    };
+                    let new_chunk = &*self.base.add(new_off as usize).cast::<Chunk>();
+                    new_chunk.next.store(next_off, Ordering::Relaxed);
                     chunk.next.store(new_off, Ordering::Release);
-                    if next_off == 0 {
-                        (*hdr).end_chunk = new_off;
-                    }
-                    (*hdr).tail_chunk = new_off;
+                    (*hdr).tail_chunk.store(new_off, Ordering::Release);
                     chunk_off = new_off;
                     continue;
                 }
@@ -435,8 +560,8 @@ impl<S: Segment> Fifo<S> {
                     to_write,
                 );
                 let new_used = data_off + to_write;
-                if new_used > chunk.length as usize {
-                    chunk.length = new_used as u32;
+                if new_used > chunk.length.load(Ordering::Relaxed) as usize {
+                    chunk.length.store(new_used as u32, Ordering::Relaxed);
                 }
                 written += to_write;
                 remaining_offset += to_write as u32;
@@ -457,7 +582,7 @@ impl<S: Segment> Fifo<S> {
             let mut remaining_offset = offset;
             let mut remaining_src = src;
 
-            let mut chunk_off = (*hdr).head_chunk;
+            let mut chunk_off = (*hdr).tail_chunk.load(Ordering::Acquire);
             let mut prev_off = 0u64;
 
             // Seek to the chunk covering remaining_offset
@@ -471,32 +596,20 @@ impl<S: Segment> Fifo<S> {
                 chunk_off = chunk.next.load(Ordering::Acquire);
             }
 
-            // Write across chunks, allocating new ones at the end
+            // Write across chunks, taking preallocated chunks at the end.
             while !remaining_src.is_empty() {
                 if chunk_off == 0 {
-                    let new_off = self.seg.alloc(CHUNK_HEADER_SIZE + chunk_data_size, 64);
-                    std::ptr::write(
-                        self.base.add(new_off as usize) as *mut Chunk,
-                        Chunk {
-                            start_byte: remaining_offset,
-                            length: 0,
-                            next: AtomicU64::new(0),
-                            refcount: AtomicU32::new(1),
-                        },
-                    );
+                    let Some(new_off) = self.acquire_chunk(remaining_offset) else {
+                        return written;
+                    };
                     if prev_off != 0 {
                         let prev = &mut *(self.base.add(prev_off as usize) as *mut Chunk);
                         if prev.next.load(Ordering::Acquire) == 0 {
                             prev.next.store(new_off, Ordering::Release);
                         }
-                        if prev_off == (*hdr).end_chunk {
-                            (*hdr).end_chunk = new_off;
-                        }
                     } else {
-                        (*hdr).start_chunk = new_off;
-                        (*hdr).end_chunk = new_off;
-                        (*hdr).head_chunk = new_off;
-                        (*hdr).tail_chunk = new_off;
+                        (*hdr).head_chunk.store(new_off, Ordering::Release);
+                        (*hdr).tail_chunk.store(new_off, Ordering::Release);
                     }
                     chunk_off = new_off;
                 }
@@ -514,8 +627,8 @@ impl<S: Segment> Fifo<S> {
                         to_write,
                     );
                     let new_used = data_off + to_write;
-                    if new_used > chunk.length as usize {
-                        chunk.length = new_used as u32;
+                    if new_used > chunk.length.load(Ordering::Relaxed) as usize {
+                        chunk.length.store(new_used as u32, Ordering::Relaxed);
                     }
                     written += to_write;
                     remaining_offset += to_write as u32;
@@ -549,34 +662,6 @@ impl<S: Segment> Fifo<S> {
     }
 
     #[inline]
-    pub fn should_signal(&self, wrote: usize) -> bool {
-        if wrote == 0 {
-            return false;
-        }
-        let hdr = self.hdr;
-        unsafe {
-            let tail = (*hdr).tail.load(Ordering::Acquire);
-            let tail_before = tail.wrapping_sub(wrote as u32);
-            let head = (*hdr).head.load(Ordering::Acquire);
-            if head != tail_before {
-                return false;
-            }
-            loop {
-                if (*hdr)
-                    .want_ntf
-                    .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    return true;
-                }
-                if (*hdr).want_ntf.load(Ordering::Acquire) == 0 {
-                    return false;
-                }
-            }
-        }
-    }
-
-    #[inline]
     pub fn needs_deq_notification(&self, dropped: usize) -> bool {
         if dropped == 0 {
             return false;
@@ -604,20 +689,6 @@ impl<S: Segment> Fifo<S> {
     pub fn unset_event(&self) {
         unsafe {
             (*self.hdr).has_event.store(0, Ordering::Release);
-        }
-    }
-
-    #[inline]
-    pub fn want_notification(&self) {
-        unsafe {
-            (*self.hdr).want_ntf.store(1, Ordering::Release);
-        }
-    }
-
-    #[inline]
-    pub fn clear_notification(&self) {
-        unsafe {
-            (*self.hdr).want_ntf.store(0, Ordering::Release);
         }
     }
 
@@ -655,25 +726,21 @@ impl<S: Segment> Fifo<S> {
     pub fn clear(&self) {
         let hdr = self.hdr;
         unsafe {
-            let mut chunk_off = (*hdr).head_chunk;
+            let mut chunk_off = (*hdr).head_chunk.load(Ordering::Relaxed);
             while chunk_off != 0 {
                 let chunk = &*(self.base.add(chunk_off as usize) as *mut Chunk);
                 let next_off = chunk.next.load(Ordering::Acquire);
-                let prev = chunk.refcount.fetch_sub(1, Ordering::Relaxed);
-                if prev == 1 {
-                    self.seg
-                        .free(chunk_off, CHUNK_HEADER_SIZE + (*hdr).min_alloc as usize);
-                }
+                self.release_chunk(chunk_off);
                 chunk_off = next_off;
             }
+            let first_chunk = self
+                .acquire_chunk(0)
+                .expect("a valid FIFO always retains at least one chunk");
             (*hdr).head.store(0, Ordering::Relaxed);
             (*hdr).tail.store(0, Ordering::Relaxed);
-            (*hdr).start_chunk = 0;
-            (*hdr).end_chunk = 0;
-            (*hdr).head_chunk = 0;
-            (*hdr).tail_chunk = 0;
+            (*hdr).head_chunk.store(first_chunk, Ordering::Relaxed);
+            (*hdr).tail_chunk.store(first_chunk, Ordering::Relaxed);
             (*hdr).has_event.store(0, Ordering::Relaxed);
-            (*hdr).want_ntf.store(0, Ordering::Relaxed);
             (*hdr).want_deq_ntf.store(0, Ordering::Relaxed);
             (*hdr).has_deq_ntf.store(0, Ordering::Relaxed);
         }
@@ -688,13 +755,13 @@ impl<S: Segment> Fifo<S> {
     }
 
     pub fn segment_fd(&self) -> Option<RawFd> {
-        self.seg.fd()
+        self.seg.shared_fd()
     }
 
     /// Reconstruct a [`Fifo`] from a shared-memory segment at the given
     /// header offset. The caller must guarantee that the segment contains a
     /// valid, initialised `FifoHeader` at `hdr_offset`.
-    pub unsafe fn from_shared(seg: S, hdr_offset: u64) -> Self {
+    pub unsafe fn from_shared(seg: Segment, hdr_offset: u64) -> Self {
         let base = seg.base();
         let hdr = unsafe { base.add(hdr_offset as usize) as *mut FifoHeader };
         Self {
@@ -707,25 +774,48 @@ impl<S: Segment> Fifo<S> {
     }
 }
 
-impl<S: Segment> Fifo<S> {
+impl Fifo {
     pub fn enable_ooo(&mut self) {
+        // VPP's `svm_fifo` starts with no configured OOO segment limit and
+        // grows `ooo_segments` through `pool_get` as segments arrive. Hammer's
+        // fixed-capacity Pool is rebuilt on demand by `ensure_capacity`, so
+        // this is only the first slab size, not a session policy.
+        const INITIAL_OOO_SEGMENTS: usize = 4;
         *self.ooo.get_mut() = Some(Box::new(OooBookkeeping {
             base: 0,
-            entries: Pool::with_capacity(8),
-            index: RbTree::with_capacity(8),
+            entries: Pool::with_capacity(INITIAL_OOO_SEGMENTS),
+            index: RbTree::with_capacity(INITIAL_OOO_SEGMENTS),
         }));
     }
 
-    pub fn enqueue_ooo(&self, offset: u32, src: &[u8]) -> Result<OooResult, ()> {
+    pub fn enqueue_ooo(&self, offset: u32, src: &[u8]) -> Result<OooResult, FifoError> {
         let ooo = unsafe { &mut *self.ooo.get() };
-        let bk = ooo.as_mut().ok_or(())?;
+        let bk = ooo.as_mut().ok_or(FifoError::OutOfOrderDisabled)?;
+        // One call nets at most one new segment (the split site removes before
+        // inserting); +2 keeps a slot of headroom in both containers.
+        bk.ensure_capacity(bk.entries.len().saturating_add(2))?;
 
-        let total_len = u32::try_from(src.len()).map_err(|_| ())?;
-        let end_offset = offset.checked_add(total_len).ok_or(())?;
-        if end_offset as usize > self.max_enqueue() {
-            return Err(());
+        let total_len = u32::try_from(src.len())
+            .map_err(|_| FifoError::OutOfOrderLengthOutOfRange { length: src.len() })?;
+        let end_offset =
+            offset
+                .checked_add(total_len)
+                .ok_or(FifoError::OutOfOrderOffsetOverflow {
+                    offset,
+                    length: total_len,
+                })?;
+        let available = self.max_enqueue();
+        if end_offset as usize > available {
+            return Err(FifoError::OutOfOrderCapacityExceeded {
+                end_offset,
+                available,
+            });
         }
         let tail = unsafe { (*self.hdr).tail.load(Ordering::Acquire) };
+        let head = unsafe { (*self.hdr).head.load(Ordering::Acquire) };
+        if head == tail {
+            unsafe { self.prepare_empty_tail_chunk(tail) };
+        }
         bk.base = tail;
         let base = bk.base;
         let abs_pos = tail.wrapping_add(offset);
@@ -839,13 +929,14 @@ impl<S: Segment> Fifo<S> {
                 let new_key = seg_end_full;
                 let new_len = succ_end.wrapping_sub(new_key);
                 if new_len > 0 {
-                    let new_idx = bk
-                        .entries
-                        .insert(OooSegment {
-                            offset: new_key,
-                            len: new_len,
-                        })
-                        .expect("ooo pool exhausted");
+                    let Some(new_idx) = bk.entries.insert(OooSegment {
+                        offset: new_key,
+                        len: new_len,
+                    }) else {
+                        return Err(FifoError::OutOfOrderStorageExhausted {
+                            entries: bk.entries.capacity(),
+                        });
+                    };
                     bk.index.insert(new_key, new_idx);
                 }
                 break;
@@ -854,13 +945,14 @@ impl<S: Segment> Fifo<S> {
 
         // Insert our segment
         let seg_len = seg_end_full.wrapping_sub(seg_start);
-        let idx = bk
-            .entries
-            .insert(OooSegment {
-                offset: seg_start,
-                len: seg_len,
-            })
-            .expect("ooo pool exhausted");
+        let Some(idx) = bk.entries.insert(OooSegment {
+            offset: seg_start,
+            len: seg_len,
+        }) else {
+            return Err(FifoError::OutOfOrderStorageExhausted {
+                entries: bk.entries.capacity(),
+            });
+        };
         bk.index.insert(seg_start, idx);
 
         // Contiguous check
@@ -884,8 +976,10 @@ impl<S: Segment> Fifo<S> {
             let first = bk.index.first().map(|(&k, &v)| (k, v));
             match first {
                 Some((first_key, first_idx)) if first_key == bk.base => {
-                    let seg = bk.entries.remove(first_idx).expect("ooo entry exists");
                     bk.index.remove(&first_key);
+                    let Some(seg) = bk.entries.remove(first_idx) else {
+                        break;
+                    };
                     bk.base = bk.base.wrapping_add(seg.len);
                     delivered = delivered.wrapping_add(seg.len);
                 }
@@ -929,14 +1023,11 @@ impl<S: Segment> Fifo<S> {
     }
 }
 
-impl Fifo<Local> {
-    /// Convenience constructor: creates a heap-backed [`Fifo`] with the given
-    /// chunk capacity. The underlying `Local` segment is sized to hold
-    /// `capacity` chunks plus the header.
+impl Fifo {
+    /// Convenience constructor backed by a process-local Segment.
     pub fn with_capacity(capacity: usize) -> Result<Self, FifoError> {
-        let chunk_data_size = capacity.min(4096);
-        let seg =
-            Local::new(size_of::<FifoHeader>() + capacity * (size_of::<Chunk>() + chunk_data_size));
+        let bytes = Self::layout_bytes(capacity)?;
+        let seg = Segment::local(bytes.saturating_add(256));
         Self::new(seg, capacity)
     }
 }
@@ -944,52 +1035,12 @@ impl Fifo<Local> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::segment::Local;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::thread;
 
-    fn fifo(cap: usize) -> Fifo<Local> {
-        let seg = Local::new(cap * 16 + (1 << 20));
-        Fifo::<Local>::new(seg, cap).expect("fifo")
-    }
-
-    #[derive(Clone)]
-    struct CountingSegment {
-        inner: Local,
-        frees: Arc<AtomicUsize>,
-    }
-
-    impl CountingSegment {
-        fn new(size: usize) -> Self {
-            Self {
-                inner: Local::new(size),
-                frees: Arc::new(AtomicUsize::new(0)),
-            }
-        }
-
-        fn frees(&self) -> usize {
-            self.frees.load(AtomicOrdering::Relaxed)
-        }
-    }
-
-    impl Segment for CountingSegment {
-        fn base(&self) -> *mut u8 {
-            self.inner.base()
-        }
-
-        fn alloc(&self, bytes: usize, align: usize) -> u64 {
-            self.inner.alloc(bytes, align)
-        }
-
-        fn free(&self, offset: u64, bytes: usize) {
-            self.frees.fetch_add(1, AtomicOrdering::Relaxed);
-            self.inner.free(offset, bytes);
-        }
-
-        fn fd(&self) -> Option<RawFd> {
-            self.inner.fd()
-        }
+    fn fifo(cap: usize) -> Fifo {
+        let seg = Segment::local(cap * 16 + (1 << 20));
+        Fifo::new(seg, cap).expect("fifo")
     }
 
     #[test]
@@ -1015,25 +1066,9 @@ mod tests {
     }
 
     #[test]
-    fn dequeue_drop_reclaims_consumed_non_tail_chunks_only() {
-        let seg = CountingSegment::new(1 << 20);
-        let f = Fifo::<CountingSegment>::new(seg.clone(), 1 << 16).expect("fifo");
-        let first_chunk = vec![0xA5; 4096];
-        let second_chunk = vec![0x5A; 128];
-
-        assert_eq!(f.enqueue(&first_chunk), first_chunk.len());
-        assert_eq!(f.enqueue(&second_chunk), second_chunk.len());
-        assert_eq!(f.dequeue_drop(first_chunk.len()), first_chunk.len());
-        assert_eq!(seg.frees(), 1);
-
-        assert_eq!(f.dequeue_drop(second_chunk.len()), second_chunk.len());
-        assert_eq!(seg.frees(), 1);
-    }
-
-    #[test]
     fn dequeue_drop_keeps_tail_chunk_before_future_ooo_successor() {
-        let seg = CountingSegment::new(1 << 20);
-        let mut f = Fifo::<CountingSegment>::new(seg.clone(), 1 << 16).expect("fifo");
+        let segment = Segment::local(1 << 20);
+        let mut f = Fifo::new(segment, 1 << 16).expect("fifo");
         f.enable_ooo();
         let first_chunk = vec![0xA5; 4096];
         let gap_chunk = vec![0x5A; 4096];
@@ -1041,14 +1076,37 @@ mod tests {
         assert_eq!(f.enqueue(&first_chunk), first_chunk.len());
         f.enqueue_ooo(4096, b"future").expect("ooo enqueue");
         assert_eq!(f.dequeue_drop(first_chunk.len()), first_chunk.len());
-        assert_eq!(seg.frees(), 0);
-
         assert_eq!(f.enqueue(&gap_chunk), gap_chunk.len() + b"future".len());
         assert_eq!(f.enqueue(b"!"), 1);
     }
 
     #[test]
-    fn peek_segments_two_part_view() {
+    fn attached_fifo_reuses_preallocated_chunks_without_segment_allocation() {
+        let capacity = 1 << 14;
+        let bytes = Fifo::layout_bytes(capacity).expect("FIFO layout");
+        let owner_segment =
+            Segment::shared("hammer-fifo-attach", bytes + 256).expect("shared segment");
+        let owner = Fifo::new(owner_segment.clone(), capacity).expect("owner FIFO");
+        let attached_segment = Segment::from_fd(
+            owner_segment.shared_fd().expect("shared descriptor"),
+            owner_segment.size(),
+        )
+        .expect("attached segment");
+        let attached = unsafe { Fifo::from_shared(attached_segment, owner.hdr_offset()) };
+
+        let first = vec![0xA5; capacity];
+        assert_eq!(attached.enqueue(&first), capacity);
+        assert_eq!(owner.dequeue_drop(capacity), capacity);
+
+        let second = vec![0x5A; capacity];
+        assert_eq!(attached.enqueue(&second), capacity);
+        let mut received = vec![0; capacity];
+        assert_eq!(owner.peek(0, capacity, &mut received), capacity);
+        assert_eq!(received, second);
+    }
+
+    #[test]
+    fn peek_segments_returns_two_slices() {
         let f = fifo(4096);
         f.enqueue(b"hello");
         let total = f.peek_segments(0, 5, |a, b| a.len() + b.len());
@@ -1056,11 +1114,12 @@ mod tests {
     }
 
     #[test]
-    fn should_signal_edge_triggered() {
+    fn set_event_reports_transition_once() {
         let f = fifo(4096);
-        f.want_notification();
-        assert!(f.should_signal(f.enqueue(&[1])));
-        assert!(!f.should_signal(f.enqueue(&[2])));
+        assert!(f.set_event());
+        assert!(!f.set_event());
+        f.unset_event();
+        assert!(f.set_event());
     }
 
     #[test]

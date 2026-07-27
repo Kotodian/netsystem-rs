@@ -52,9 +52,15 @@ fn setup_output() -> (DataPlaneRuntime, hammer_core::data_plane::NodeId) {
     let runtime = test_runtime_configured(2048, 16, 8);
     let drop = runtime.nodes().register_internal(BlackholeNode);
     let lookup = runtime.nodes().register_internal(BlackholeNode);
-    let output = runtime
+    let output = runtime.nodes().register_internal(TcpOutputNode::new());
+    runtime
         .nodes()
-        .register_internal(TcpOutputNode::new(TcpOutputNext::nodes(drop, lookup)));
+        .set_node_next(output, TcpOutputNext::Drop, drop)
+        .expect("wire TCP output drop");
+    runtime
+        .nodes()
+        .set_node_next(output, TcpOutputNext::Lookup, lookup)
+        .expect("wire TCP output lookup");
     (runtime, output)
 }
 

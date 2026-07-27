@@ -740,6 +740,7 @@ dependencies = [
  "hammer-runtime",
  "libc",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -755,6 +756,7 @@ dependencies = [
 name = "hammer-core"
 version = "0.1.0"
 dependencies = [
+ "abi_stable",
  "hammer-infra",
  "spinning_top",
  "thiserror",
@@ -806,6 +808,7 @@ dependencies = [
  "ipnet",
  "linkme",
  "serde",
+ "thiserror",
  "toml",
 ]
 
@@ -847,6 +850,7 @@ dependencies = [
  "libc",
  "linkme",
  "serde",
+ "thiserror",
  "toml",
  "tracing",
 ]
@@ -864,6 +868,7 @@ dependencies = [
  "hammer-service",
  "linkme",
  "serde",
+ "thiserror",
  "tracing",
 ]
 

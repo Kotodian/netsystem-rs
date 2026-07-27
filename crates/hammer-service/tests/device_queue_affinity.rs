@@ -1,14 +1,36 @@
-use hammer_core::data_plane::NodeId;
-use hammer_runtime::DataWorkerId;
+use hammer_core::data_plane::{BufferFrame, NodeRegistration};
+use hammer_runtime::config::Worker;
+use hammer_runtime::{DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeResult};
+use hammer_service::data_plane::DropNode;
 use hammer_service::device::{DeviceMain, DriverScheduleMode};
+use hammer_service::interface::InterfaceOutputNode;
+
+#[derive(Clone, Copy)]
+struct TxSink;
+
+impl Node for TxSink {
+    fn process(&mut self, _: &DataPlaneRuntime, _: &mut BufferFrame) -> NodeResult {
+        NodeResult::drop()
+    }
+}
+
+impl InternalNode for TxSink {
+    fn node_registration(&self) -> NodeRegistration {
+        NodeRegistration::next("device-queue-affinity-sink", 0)
+    }
+}
 
 #[test]
 fn tx_queue_affinity_is_published_by_interface_and_owner() {
-    let devices = DeviceMain::new();
+    let runtime = Worker::default().create_runtime().expect("runtime");
+    runtime.nodes().register_internal(DropNode::new());
+    let sink = runtime.nodes().register_internal(TxSink);
+    runtime.nodes().register_internal(InterfaceOutputNode);
+    let devices = DeviceMain::new(runtime.nodes().clone());
     let first_worker = DataWorkerId::new(0);
     let second_worker = DataWorkerId::new(1);
     let device = devices
-        .register_device(9, NodeId::new(11), NodeId::new(12))
+        .register_device(9, sink, sink)
         .expect("register device");
 
     devices
@@ -20,7 +42,7 @@ fn tx_queue_affinity_is_published_by_interface_and_owner() {
         )
         .expect("register RX queue");
     devices
-        .register_tx_queue(9, device.instance, 0, first_worker, NodeId::new(12))
+        .register_tx_queue(device.instance, 0, first_worker)
         .expect("register TX queue");
     devices
         .assign_tx_queue_to_worker(device.instance, 0, second_worker)
@@ -32,8 +54,8 @@ fn tx_queue_affinity_is_published_by_interface_and_owner() {
         .expect("interface TX queue");
     assert_eq!(tx_queue.device_instance, device.instance);
     assert_eq!(tx_queue.queue_id, 0);
-    assert_eq!(tx_queue.output_node, NodeId::new(12));
-    assert_eq!(tx_queue.assigned_workers(), &[first_worker, second_worker]);
+    assert!(tx_queue.is_assigned_to(first_worker));
+    assert!(tx_queue.is_assigned_to(second_worker));
     assert!(tx_queue.is_shared());
     assert!(devices.tx_queues_for_interface(10).is_empty());
     assert_eq!(
@@ -50,25 +72,32 @@ fn tx_queue_affinity_is_published_by_interface_and_owner() {
 
 #[test]
 fn device_main_allocates_instances_and_rejects_unregistered_queues() {
-    let devices = DeviceMain::new();
+    let runtime = Worker::default().create_runtime().expect("runtime");
+    runtime.nodes().register_internal(DropNode::new());
+    let sink = runtime.nodes().register_internal(TxSink);
+    runtime.nodes().register_internal(InterfaceOutputNode);
+    let devices = DeviceMain::new(runtime.nodes().clone());
     assert!(
         devices
             .register_rx_queue(0, 0, DataWorkerId::new(0), DriverScheduleMode::Poll)
             .is_err()
     );
+    assert!(
+        devices
+            .register_tx_queue(0, 0, DataWorkerId::new(0))
+            .is_err()
+    );
 
     let first = devices
-        .register_device(1, NodeId::new(2), NodeId::new(3))
+        .register_device(1, sink, sink)
         .expect("register first device");
     let second = devices
-        .register_device(2, NodeId::new(4), NodeId::new(5))
+        .register_device(2, sink, sink)
         .expect("register second device");
     assert_eq!(first.instance, 0);
     assert_eq!(second.instance, 1);
     assert_eq!(devices.device(first.instance), Some(first));
-    assert!(
-        devices
-            .register_tx_queue(2, first.instance, 0, DataWorkerId::new(0), NodeId::new(5))
-            .is_err()
-    );
+    devices
+        .register_tx_queue(first.instance, 0, DataWorkerId::new(0))
+        .expect("register first TX queue");
 }

@@ -22,6 +22,17 @@ impl Poller {
         Ok(Self { kqueue })
     }
 
+    /// The kqueue descriptor itself is readable while events are pending; the
+    /// idle loop sleeps in the tokio reactor yet wakes on File readiness,
+    /// matching VPP sleeping inside `epoll_wait` (`vlib_file_poll`).
+    pub(super) fn try_clone_wake(&self) -> io::Result<OwnedFd> {
+        self.kqueue.try_clone()
+    }
+
+    pub(super) fn clear_wake(&self) {
+        // The next kevent poll consumes pending events; nothing to drain here.
+    }
+
     pub(super) fn add(&self, spec: PollSpec) -> RuntimeResult<()> {
         self.update(None, Some(spec))
     }
@@ -57,7 +68,10 @@ impl Poller {
             if error.kind() == io::ErrorKind::Interrupted {
                 return Ok(0);
             }
-            return Err(RuntimeError::invariant(format!("poll kqueue: {error}")));
+            return Err(RuntimeError::FilePollerIo {
+                operation: "poll kqueue",
+                source: error,
+            });
         }
 
         let count = count as usize;
@@ -82,9 +96,9 @@ impl Poller {
     }
 
     fn update(&self, before: Option<PollSpec>, after: Option<PollSpec>) -> RuntimeResult<()> {
-        let spec = after.or(before).ok_or_else(|| {
-            RuntimeError::invariant("kqueue update requires an old or new File poll spec")
-        })?;
+        let Some(spec) = after.or(before) else {
+            unreachable!("kqueue update requires an old or new File poll spec");
+        };
         let mut changes = [empty_event(); 2];
         let mut count = 0;
 
@@ -150,6 +164,9 @@ const fn empty_event() -> libc::kevent {
     }
 }
 
-fn os_error(operation: &str) -> RuntimeError {
-    RuntimeError::invariant(format!("{operation}: {}", io::Error::last_os_error()))
+fn os_error(operation: &'static str) -> RuntimeError {
+    RuntimeError::FilePollerIo {
+        operation,
+        source: io::Error::last_os_error(),
+    }
 }

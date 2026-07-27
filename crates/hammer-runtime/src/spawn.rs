@@ -16,12 +16,12 @@
 //! spawned data tasks carry that context through Tokio task-local storage.
 //! Calls made outside a service context — for example from `#[tokio::test]`
 //! integration tests that never construct a service — fall back to the
-//! ambient runtime via `tokio::spawn`, preserving prior behaviour for tests.
+//! ambient runtime via `tokio::spawn` and use the process default subscriber.
 //!
 //! Use `crate::spawn::spawn(future)` everywhere we'd otherwise call
 //! `tokio::spawn`. Forgetting it does not corrupt routing — it only causes
-//! the task's events to be dropped (no global default subscriber is
-//! installed) — but it should still be considered a bug.
+//! the task to lose its service-specific dispatch — but it should still be
+//! considered a bug.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -148,12 +148,6 @@ impl DataRuntime {
     }
 
     fn spawn_workers(worker: &Worker, thread_name: &str) -> RuntimeResult<Self> {
-        if worker.count == 0 {
-            return Err(RuntimeError::invariant(
-                "data runtime must have at least one worker thread",
-            ));
-        }
-
         let worker_threads = worker.count;
         let thread_stack_size = worker.stack_size;
         let max_blocking_threads = worker.max_blocking_threads;
@@ -172,7 +166,7 @@ impl DataRuntime {
             let worker_config = worker_config.clone();
             let worker_wait_at_barrier = Arc::clone(&wait_at_barrier);
             let worker_workers_at_barrier = Arc::clone(&workers_at_barrier);
-            let (handle_tx, handle_rx) = std::sync::mpsc::channel::<Result<Handle, String>>();
+            let (handle_tx, handle_rx) = std::sync::mpsc::channel::<RuntimeResult<Handle>>();
             let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
             let builder = thread::Builder::new()
@@ -181,17 +175,20 @@ impl DataRuntime {
             let join = builder
                 .spawn(move || {
                     if let Err(error) = worker_config.apply_current_thread_setup(index) {
-                        let _ = handle_tx.send(Err(format!(
-                            "set up data runtime worker {worker_name}: {error}"
-                        )));
+                        let _ = handle_tx.send(Err(RuntimeError::DataWorkerThreadSetup {
+                            worker: index,
+                            source: Box::new(error),
+                        }));
                         let _ = done_tx.send(());
                         return;
                     }
                     DATA_WORKER_IDLE_SLICE.with(|slot| slot.set(idle_slice));
                     if let Err(error) = init_data_plane_runtime(&worker_config) {
-                        let _ = handle_tx.send(Err(format!(
-                            "init data runtime worker {worker_name}: {error}"
-                        )));
+                        let _ =
+                            handle_tx.send(Err(RuntimeError::DataWorkerRuntimeInitialization {
+                                worker: index,
+                                source: Box::new(error),
+                            }));
                         let _ = done_tx.send(());
                         return;
                     }
@@ -217,21 +214,22 @@ impl DataRuntime {
                             DATA_PLANE_RUNTIME.with(|slot| *slot.borrow_mut() = None);
                         }
                         Err(err) => {
-                            let _ = handle_tx.send(Err(format!(
-                                "init data runtime worker {worker_name}: {err}"
-                            )));
+                            let _ = handle_tx.send(Err(RuntimeError::DataWorkerRuntimeBuild {
+                                worker: index,
+                                source: err,
+                            }));
                         }
                     }
                     let _ = done_tx.send(());
                 })
-                .map_err(|err| {
-                    RuntimeError::invariant(format!("spawn data runtime worker: {err}"))
+                .map_err(|source| RuntimeError::DataWorkerThreadSpawn {
+                    worker: index,
+                    source,
                 })?;
 
-            let handle = handle_rx.recv().map_err(|err| {
-                RuntimeError::invariant(format!("receive data runtime handle: {err}"))
-            })?;
-            let handle = handle.map_err(RuntimeError::invariant)?;
+            let handle = handle_rx
+                .recv()
+                .map_err(|_| RuntimeError::DataWorkerStartupCanceled { worker: index })??;
             context_workers.push(DataRuntimeContextWorker {
                 handle,
                 remote_local,
@@ -346,52 +344,29 @@ impl DataRuntimeContext {
         R: Send + 'static,
     {
         let f = Arc::new(f);
-        let (tx, rx) = std::sync::mpsc::channel();
+        let mut receivers = Vec::with_capacity(self.inner.workers.len());
         for (index, worker) in self.inner.workers.iter().cloned().enumerate() {
-            let tx = tx.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
             let f = Arc::clone(&f);
             let context = self.clone();
             drop(
                 worker
                     .handle
                     .spawn(TASK_DATA_CONTEXT.scope(context, async move {
-                        let _ = tx.send((index, f(index)));
+                        let _ = tx.send(f(index));
                     })),
             );
-        }
-        drop(tx);
-
-        let mut results = (0..self.inner.workers.len())
-            .map(|_| None)
-            .collect::<Vec<_>>();
-        for _ in 0..results.len() {
-            let (index, result) = rx.recv().map_err(|err| {
-                RuntimeError::invariant(format!("receive data worker initializer result: {err}"))
-            })?;
-            let slot = results.get_mut(index).ok_or_else(|| {
-                RuntimeError::invariant(format!(
-                    "data worker initializer index out of range: {index}"
-                ))
-            })?;
-            if slot.is_some() {
-                return Err(RuntimeError::invariant(format!(
-                    "duplicate data worker initializer result: {index}"
-                )));
-            }
-            *slot = Some(result);
+            receivers.push((index, rx));
         }
 
-        results
-            .into_iter()
-            .enumerate()
-            .map(|(index, result)| {
-                result.ok_or_else(|| {
-                    RuntimeError::invariant(format!(
-                        "missing data worker initializer result: {index}"
-                    ))
-                })
-            })
-            .collect()
+        let mut results = Vec::with_capacity(receivers.len());
+        for (worker, rx) in receivers {
+            results.push(
+                rx.recv()
+                    .map_err(|_| RuntimeError::DataWorkerResultCanceled { worker })?,
+            );
+        }
+        Ok(results)
     }
 
     pub fn install_on_workers<F, R>(&self, f: F) -> RuntimeResult<Vec<R>>
@@ -405,12 +380,10 @@ impl DataRuntimeContext {
     pub fn set_trace_control_on_workers(
         &self,
         control: Option<TraceControlHandle>,
-        packet_capacity: usize,
     ) -> RuntimeResult<()> {
-        let _ = packet_capacity;
         self.for_each_worker(move |_| {
             with_data_plane_runtime(|runtime| {
-                runtime.set_trace_control(control.clone(), 0);
+                runtime.set_trace_control(control.clone());
             });
         })
         .map(|_| ())
@@ -445,41 +418,20 @@ impl DataRuntimeContext {
                         let rows = with_data_plane_runtime(|runtime| {
                             runtime.nodes().node_runtime_stats_snapshot()
                         });
-                        let _ = tx.send((index, rows));
+                        let _ = tx.send(rows);
                     })),
             );
-            receivers.push(rx);
+            receivers.push((index, rx));
         }
 
-        let mut results = (0..self.inner.workers.len())
-            .map(|_| None)
-            .collect::<Vec<_>>();
-        for rx in receivers {
-            let (index, rows) = rx.await.map_err(|err| {
-                RuntimeError::invariant(format!("receive data worker runtime stats: {err}"))
-            })?;
-            let slot = results.get_mut(index).ok_or_else(|| {
-                RuntimeError::invariant(format!(
-                    "data worker runtime stats index out of range: {index}"
-                ))
-            })?;
-            if slot.is_some() {
-                return Err(RuntimeError::invariant(format!(
-                    "duplicate data worker runtime stats: {index}"
-                )));
-            }
-            *slot = Some((index, rows));
+        let mut results = Vec::with_capacity(receivers.len());
+        for (worker, rx) in receivers {
+            let rows = rx
+                .await
+                .map_err(|_| RuntimeError::DataWorkerResultCanceled { worker })?;
+            results.push((worker, rows));
         }
-
-        results
-            .into_iter()
-            .enumerate()
-            .map(|(index, result)| {
-                result.ok_or_else(|| {
-                    RuntimeError::invariant(format!("missing data worker runtime stats: {index}"))
-                })
-            })
-            .collect()
+        Ok(results)
     }
 
     pub(crate) fn worker_count(&self) -> usize {
@@ -523,9 +475,9 @@ impl DataRuntimeContext {
                 let join = spawn_local(factory);
                 let complete_state = Arc::clone(&complete_state);
                 drop(spawn_local(move || async move {
-                    let result = join.await.map_err(|err| {
-                        RuntimeError::invariant(format!("join worker-local task: {err}"))
-                    });
+                    let result = join
+                        .await
+                        .map_err(|source| RuntimeError::DataWorkerLocalTask { worker, source });
                     complete_state.complete(result);
                 }));
             }),
@@ -547,14 +499,14 @@ impl DataRuntimeContext {
             Box::new(move || {
                 let result = match catch_unwind(AssertUnwindSafe(f)) {
                     Ok(result) => result,
-                    Err(_) => Err(RuntimeError::invariant("data worker closure panicked")),
+                    Err(_) => Err(RuntimeError::DataWorkerCallPanicked { worker }),
                 };
                 let _ = done_tx.send(result);
             }),
         )?;
         done_rx
             .recv()
-            .map_err(|_| RuntimeError::invariant("data worker closure canceled"))?
+            .map_err(|_| RuntimeError::DataWorkerCallCanceled { worker })?
     }
 
     fn spawn_send_on_worker<F>(&self, worker: usize, future: F) -> JoinHandle<F::Output>
@@ -602,10 +554,10 @@ impl DataRuntimeContext {
         task: RemoteDataLocalTask,
     ) -> RuntimeResult<()> {
         if worker >= self.inner.workers.len() {
-            return Err(RuntimeError::invariant(format!(
-                "invalid app worker {worker}; worker_count={}",
-                self.inner.workers.len()
-            )));
+            return Err(RuntimeError::DataWorkerIndexOutOfRange {
+                worker,
+                worker_count: self.inner.workers.len(),
+            });
         }
         self.inner.workers[worker].remote_local.push(task);
         Ok(())
@@ -643,41 +595,30 @@ pub struct DataPlaneBarrierHandle {
 }
 
 impl DataPlaneBarrierHandle {
-    pub fn sync(&self) -> RuntimeResult<DataPlaneBarrierGuard> {
-        self.wait.store(1, Ordering::SeqCst);
-        std::sync::atomic::compiler_fence(Ordering::SeqCst);
-        while self.workers.load(Ordering::Acquire) != self.n_workers {
-            core::hint::spin_loop();
-        }
-        Ok(DataPlaneBarrierGuard {
-            wait: Arc::clone(&self.wait),
-            workers: Arc::clone(&self.workers),
+    #[track_caller]
+    pub fn sync(&self) -> DataPlaneBarrierGuard {
+        DataPlaneBarrierGuard {
+            barrier: crate::barrier::barrier_sync(&self.wait, &self.workers, self.n_workers),
             n_workers: self.n_workers,
-        })
+        }
     }
 
-    pub fn synchronize<R>(&self, operation: impl FnOnce() -> RuntimeResult<R>) -> RuntimeResult<R> {
-        let _guard = self.sync()?;
+    #[track_caller]
+    pub fn synchronize<R, E>(&self, operation: impl FnOnce() -> Result<R, E>) -> Result<R, E> {
+        let _guard = self.sync();
         operation()
     }
 }
 
 #[derive(Debug)]
 pub struct DataPlaneBarrierGuard {
-    wait: Arc<AtomicU32>,
-    workers: Arc<AtomicU32>,
+    barrier: crate::barrier::BarrierGuard,
     n_workers: u32,
 }
 
 impl DataPlaneBarrierGuard {
     pub fn paused_workers(&self) -> usize {
         self.n_workers as usize
-    }
-}
-
-impl Drop for DataPlaneBarrierGuard {
-    fn drop(&mut self) {
-        crate::barrier::barrier_release(&self.wait, &self.workers);
     }
 }
 
@@ -1492,6 +1433,26 @@ mod tests {
     }
 
     #[test]
+    fn local_spawn_rejects_worker_index_outside_runtime() {
+        let _guard = test_lock();
+        let data_runtime =
+            DataRuntime::new(1, "spawn-test-worker-index", 512 * 1024, 2).expect("data runtime");
+        let error = data_runtime
+            .context()
+            .spawn_local_on_worker(1, || async {})
+            .expect_err("worker index must be checked");
+
+        assert!(matches!(
+            error,
+            RuntimeError::DataWorkerIndexOutOfRange {
+                worker: 1,
+                worker_count: 1,
+            }
+        ));
+        data_runtime.shutdown_timeout(Duration::from_secs(1));
+    }
+
+    #[test]
     fn data_thread_exposes_thread_local_data_plane_runtime() {
         let _guard = test_lock();
         let data_runtime =
@@ -1545,7 +1506,7 @@ mod tests {
         });
 
         context
-            .set_trace_control_on_workers(Some(control.handle()), 2)
+            .set_trace_control_on_workers(Some(control.handle()))
             .expect("set trace control");
         let marks = context
             .for_each_worker(|_| {

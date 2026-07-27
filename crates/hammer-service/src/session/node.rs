@@ -1,11 +1,11 @@
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::time::Instant;
 
 use hammer_core::data_plane::{BufferFrame, Index, NodeId, NodeRegistration};
-use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
 use hammer_runtime::{
     DataPlaneRuntime, DriverNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
 };
+use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use crate::session::SessionQueueError;
 
@@ -123,7 +123,7 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
-pub fn register_session_queue_node(runtime: &DataPlaneRuntime, _: usize) -> RuntimeResult<NodeId> {
+pub fn register_session_queue_node(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     if let Some(node) = runtime.nodes().node_by_name("session-queue") {
         return Ok(node);
     }
@@ -167,15 +167,17 @@ impl SessionQueueNode {
                 Ok(node) if node == output_node => {
                     return u16::try_from(slot)
                         .map(SessionQueueNext::from_slot)
-                        .map_err(|_| {
-                            RuntimeError::invariant("session queue next slot overflows u16")
+                        .map_err(|_| RuntimeError::NodeNextCountOverflow {
+                            count: slot.saturating_add(1),
                         });
                 }
                 Ok(_) => slot += 1,
                 Err(_) => {
-                    return Err(RuntimeError::invariant(
-                        "session queue output is not registered",
-                    ));
+                    return Err(SessionQueueError::OutputMissing {
+                        consumer,
+                        output_node,
+                    }
+                    .into());
                 }
             }
         }
@@ -194,10 +196,13 @@ impl SessionQueueNode {
         SESSION_QUEUE_NODES.with(|nodes| {
             let mut nodes = nodes
                 .try_borrow_mut()
-                .map_err(|_| RuntimeError::invariant("session queue nodes borrowed"))?;
-            let node = nodes
-                .get_mut(attachment_slot)
-                .ok_or_else(|| RuntimeError::invariant("session queue node slot is invalid"))?;
+                .map_err(|_| SessionQueueError::AttachmentRegistryBorrowed)?;
+            let node =
+                nodes
+                    .get_mut(attachment_slot)
+                    .ok_or(SessionQueueError::AttachmentSlotMissing {
+                        slot: attachment_slot,
+                    })?;
             node.push(SessionQueueAttachment {
                 output_next,
                 dispatch,

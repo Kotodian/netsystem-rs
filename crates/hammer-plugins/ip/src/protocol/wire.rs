@@ -1,14 +1,14 @@
 use std::mem::{size_of, transmute};
 
-use hammer_runtime::{RuntimeError, RuntimeResult};
+use super::ip::IpInputError;
 
 #[inline(always)]
-pub fn header_ptr<T>(packet: &[u8], offset: usize) -> RuntimeResult<*const T> {
+pub fn header_ptr<T>(packet: &[u8], offset: usize) -> Result<*const T, IpInputError> {
     let end = offset
         .checked_add(size_of::<T>())
-        .ok_or_else(|| RuntimeError::invariant("wire header offset overflow"))?;
+        .ok_or(IpInputError::HeaderTooShort)?;
     if packet.get(offset..end).is_none() {
-        return Err(RuntimeError::invariant("wire header is truncated"));
+        return Err(IpInputError::HeaderTooShort);
     }
     // SAFETY: The range check above proves that `offset` points to
     // `size_of::<T>()` initialized bytes inside `packet`. The returned raw
@@ -18,12 +18,12 @@ pub fn header_ptr<T>(packet: &[u8], offset: usize) -> RuntimeResult<*const T> {
 }
 
 #[inline(always)]
-pub fn header_mut_ptr<T>(packet: &mut [u8], offset: usize) -> RuntimeResult<*mut T> {
+pub fn header_mut_ptr<T>(packet: &mut [u8], offset: usize) -> Result<*mut T, IpInputError> {
     let end = offset
         .checked_add(size_of::<T>())
-        .ok_or_else(|| RuntimeError::invariant("wire header offset overflow"))?;
+        .ok_or(IpInputError::HeaderTooShort)?;
     if packet.get_mut(offset..end).is_none() {
-        return Err(RuntimeError::invariant("wire header is truncated"));
+        return Err(IpInputError::HeaderTooShort);
     }
     // SAFETY: The range check above proves that `offset` points to
     // `size_of::<T>()` initialized bytes inside `packet`. The returned raw
@@ -33,7 +33,7 @@ pub fn header_mut_ptr<T>(packet: &mut [u8], offset: usize) -> RuntimeResult<*mut
 }
 
 #[inline(always)]
-pub fn read_header<T>(packet: &[u8], offset: usize) -> RuntimeResult<T>
+pub fn read_header<T>(packet: &[u8], offset: usize) -> Result<T, IpInputError>
 where
     T: Copy,
 {
@@ -45,7 +45,7 @@ where
 }
 
 #[inline(always)]
-pub fn write_header<T>(packet: &mut [u8], offset: usize, header: T) -> RuntimeResult<()>
+pub fn write_header<T>(packet: &mut [u8], offset: usize, header: T) -> Result<(), IpInputError>
 where
     T: Copy,
 {

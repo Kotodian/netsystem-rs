@@ -36,12 +36,10 @@ impl RuntimeRegistry {
     }
 
     pub fn require<T: Any + Send + Sync>(&self) -> Result<Arc<T>, RuntimeError> {
-        self.get::<T>().ok_or_else(|| {
-            RuntimeError::invariant(format!(
-                "required service not registered in RuntimeRegistry: {}",
-                type_name::<T>()
-            ))
-        })
+        self.get::<T>()
+            .ok_or(RuntimeError::RuntimeCapabilityMissing {
+                type_name: type_name::<T>(),
+            })
     }
 }
 
@@ -86,12 +84,11 @@ mod tests {
     fn require_missing_service_yields_error() {
         let registry = RuntimeRegistry::new();
         let error = registry.require::<CountingManager>().unwrap_err();
-        let message = error.to_string();
-        assert!(
-            message.contains("required service not registered"),
-            "got = {message}"
-        );
-        assert!(message.contains("CountingManager"), "got = {message}");
+        assert!(matches!(
+            error,
+            RuntimeError::RuntimeCapabilityMissing { type_name }
+                if type_name == std::any::type_name::<CountingManager>()
+        ));
     }
 
     #[test]

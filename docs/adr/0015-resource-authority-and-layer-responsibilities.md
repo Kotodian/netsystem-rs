@@ -104,6 +104,27 @@ use the app/session seam. Daemon and IPC surfaces translate control failures and
 present state; they do not acquire data-plane resource ownership. CLI owns only
 its client connection and presentation values.
 
+## Runtime observability contract
+
+Runtime statistics follow VPP's `show runtime`, `show trace`, and `show files`
+ownership model:
+
+- `hammer-runtime` owns worker-local Node and File counters, bounded Packet
+  Trace collection, and publication of a consistent worker snapshot before a
+  Data Worker acknowledges the existing barrier.
+- Runtime snapshots use the existing VPP-style worker barrier without a second
+  timeout, generation, or diagnostic synchronization protocol.
+- The daemon may request and format runtime snapshots through the Runtime
+  Engine. It must not inspect worker-local state directly, add packet-path
+  logging, or introduce device/protocol-specific runtime observation types.
+- CI owns host evidence outside the process: interface and route state, process
+  and descriptor state, packet capture, and daemon logs. Host setup and capture
+  do not move descriptor or packet-I/O ownership out of the TUN plugin.
+
+This split keeps counters and trace state with the Data Worker that produces
+them, while preserving host evidence when the process cannot publish a barrier
+snapshot.
+
 ## File callback contract
 
 A callback may validate its File identity, update callback-private readiness

@@ -7,7 +7,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 
 use hammer_infra::pool::Index;
-use hammer_runtime::{DataWorkerId, File, FileFunctions, FileMain};
+use hammer_runtime::{File, FileFunctions, FileMain, NodeRuntime};
 
 struct RegisteredSocket {
     index: Index,
@@ -18,7 +18,6 @@ struct RegisteredSocket {
 impl RegisteredSocket {
     fn register(
         files: &mut FileMain,
-        worker: DataWorkerId,
         description: &str,
         private_data: u64,
         functions: FileFunctions,
@@ -29,7 +28,6 @@ impl RegisteredSocket {
         let index = files
             .add(File::new(
                 fd,
-                worker,
                 description.to_owned(),
                 private_data,
                 functions,
@@ -70,21 +68,14 @@ fn descriptor_identity(fd: RawFd) -> std::io::Result<(libc::dev_t, libc::ino_t)>
 
 #[test]
 fn deleted_file_index_does_not_resolve_after_pool_slot_reuse() {
-    let worker = DataWorkerId::new(0);
-    let mut files = FileMain::new(worker).expect("create FileMain");
-    let first =
-        RegisteredSocket::register(&mut files, worker, "first", 0, FileFunctions::default());
+    let mut files = FileMain::new().expect("create FileMain");
+    let first = RegisteredSocket::register(&mut files, "first", 0, FileFunctions::default());
 
     assert!(files.delete(first.index).expect("delete first file"));
     assert!(files.get(first.index).is_none());
 
-    let replacement = RegisteredSocket::register(
-        &mut files,
-        worker,
-        "replacement",
-        0,
-        FileFunctions::default(),
-    );
+    let replacement =
+        RegisteredSocket::register(&mut files, "replacement", 0, FileFunctions::default());
 
     assert_eq!(replacement.index.slot(), first.index.slot());
     assert_ne!(replacement.index.generation(), first.index.generation());
@@ -99,16 +90,14 @@ fn deleted_file_index_does_not_resolve_after_pool_slot_reuse() {
 }
 
 #[test]
-fn readable_file_dispatches_on_its_polling_worker() {
-    let worker = DataWorkerId::new(0);
-    let mut files = FileMain::new(worker).expect("create FileMain");
+fn readable_file_dispatches_callback() {
+    let mut files = FileMain::new().expect("create FileMain");
     let mut socket = RegisteredSocket::register(
         &mut files,
-        worker,
         "readable",
         41,
         FileFunctions {
-            read: Some(|file| {
+            read: Some(|_, file| {
                 file.set_private_data(file.private_data() + 1);
                 Ok(())
             }),
@@ -117,27 +106,37 @@ fn readable_file_dispatches_on_its_polling_worker() {
     );
 
     socket.make_readable();
-    assert_eq!(files.poll().expect("poll FileMain"), 1);
+    assert_eq!(
+        files.poll(&NodeRuntime::default()).expect("poll FileMain"),
+        1
+    );
 
     let file = files.get(socket.index).expect("registered file");
-    assert_eq!(file.polling_worker(), worker);
     assert_eq!(file.private_data(), 42);
     assert_eq!(file.read_events(), 1);
     assert_eq!(file.write_events(), 0);
     assert_eq!(file.error_events(), 0);
+
+    let stats = files.runtime_stats_snapshot();
+    assert_eq!(stats.len(), 1);
+    assert_eq!(stats[0].index, socket.index);
+    assert_eq!(stats[0].description, "readable");
+    assert!(stats[0].read_enabled);
+    assert!(!stats[0].write_enabled);
+    assert_eq!(stats[0].read_events, 1);
+    assert_eq!(stats[0].write_events, 0);
+    assert_eq!(stats[0].error_events, 0);
 }
 
 #[test]
 fn readable_file_dispatches_across_repeated_readiness_cycles() {
-    let worker = DataWorkerId::new(0);
-    let mut files = FileMain::new(worker).expect("create FileMain");
+    let mut files = FileMain::new().expect("create FileMain");
     let mut socket = RegisteredSocket::register(
         &mut files,
-        worker,
         "repeated readable",
         0,
         FileFunctions {
-            read: Some(|file| {
+            read: Some(|_, file| {
                 let mut byte = 0_u8;
                 // SAFETY: `byte` is writable for one byte and File retains the
                 // live descriptor for the duration of callback dispatch.
@@ -157,9 +156,19 @@ fn readable_file_dispatches_across_repeated_readiness_cycles() {
     );
 
     socket.make_readable();
-    assert_eq!(files.poll().expect("poll first readiness"), 1);
+    assert_eq!(
+        files
+            .poll(&NodeRuntime::default())
+            .expect("poll first readiness"),
+        1
+    );
     socket.make_readable();
-    assert_eq!(files.poll().expect("poll second readiness"), 1);
+    assert_eq!(
+        files
+            .poll(&NodeRuntime::default())
+            .expect("poll second readiness"),
+        1
+    );
 
     let file = files.get(socket.index).expect("registered file");
     assert_eq!(file.private_data(), 2);
@@ -169,8 +178,7 @@ fn readable_file_dispatches_across_repeated_readiness_cycles() {
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_eventfd_readiness_dispatches_through_file_main() {
-    let worker = DataWorkerId::new(0);
-    let mut files = FileMain::new(worker).expect("create FileMain");
+    let mut files = FileMain::new().expect("create FileMain");
     // SAFETY: eventfd returns a fresh descriptor or -1 with errno set.
     let raw_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     assert!(
@@ -183,11 +191,10 @@ fn linux_eventfd_readiness_dispatches_through_file_main() {
     let index = files
         .add(File::new(
             fd,
-            worker,
             "linux eventfd".to_owned(),
             0,
             FileFunctions {
-                read: Some(|file| {
+                read: Some(|_, file| {
                     let mut value = 0_u64;
                     // SAFETY: `value` is writable for eight bytes and File
                     // retains the descriptor during callback dispatch.
@@ -217,7 +224,12 @@ fn linux_eventfd_readiness_dispatches_through_file_main() {
         )
     };
     assert_eq!(count, std::mem::size_of::<u64>() as isize);
-    assert_eq!(files.poll().expect("poll eventfd readiness"), 1);
+    assert_eq!(
+        files
+            .poll(&NodeRuntime::default())
+            .expect("poll eventfd readiness"),
+        1
+    );
 
     let file = files.get(index).expect("registered eventfd");
     assert_eq!(file.private_data(), value);
@@ -226,15 +238,13 @@ fn linux_eventfd_readiness_dispatches_through_file_main() {
 
 #[test]
 fn write_interest_changes_without_replacing_file_index() {
-    let worker = DataWorkerId::new(0);
-    let mut files = FileMain::new(worker).expect("create FileMain");
+    let mut files = FileMain::new().expect("create FileMain");
     let socket = RegisteredSocket::register(
         &mut files,
-        worker,
         "writable",
         0,
         FileFunctions {
-            write: Some(|file| {
+            write: Some(|_, file| {
                 file.set_private_data(7);
                 Ok(())
             }),
@@ -247,7 +257,10 @@ fn write_interest_changes_without_replacing_file_index() {
             .set_data_available_to_write(socket.index, true)
             .expect("enable write interest")
     );
-    assert_eq!(files.poll().expect("poll FileMain"), 1);
+    assert_eq!(
+        files.poll(&NodeRuntime::default()).expect("poll FileMain"),
+        1
+    );
 
     let file = files.get(socket.index).expect("same registered file");
     assert_eq!(file.private_data(), 7);
@@ -256,15 +269,13 @@ fn write_interest_changes_without_replacing_file_index() {
 
 #[test]
 fn error_callback_runs_before_delete_closes_the_descriptor() {
-    let worker = DataWorkerId::new(0);
-    let mut files = FileMain::new(worker).expect("create FileMain");
+    let mut files = FileMain::new().expect("create FileMain");
     let mut socket = RegisteredSocket::register(
         &mut files,
-        worker,
         "peer close",
         0,
         FileFunctions {
-            error: Some(|file| {
+            error: Some(|_, file| {
                 // SAFETY: F_GETFD only queries the descriptor retained by File
                 // for the full callback duration.
                 assert!(unsafe { libc::fcntl(file.fd(), libc::F_GETFD) } >= 0);
@@ -276,7 +287,12 @@ fn error_callback_runs_before_delete_closes_the_descriptor() {
     );
 
     socket.close_peer();
-    assert_eq!(files.poll().expect("poll peer close"), 1);
+    assert_eq!(
+        files
+            .poll(&NodeRuntime::default())
+            .expect("poll peer close"),
+        1
+    );
     let file = files.get(socket.index).expect("registered file");
     assert_eq!(file.private_data(), 1);
     assert_eq!(file.error_events(), 1);
@@ -291,15 +307,13 @@ fn error_callback_runs_before_delete_closes_the_descriptor() {
 
 #[test]
 fn queued_event_for_deleted_generation_does_not_reach_reused_slot() {
-    let worker = DataWorkerId::new(0);
-    let mut files = FileMain::new(worker).expect("create FileMain");
+    let mut files = FileMain::new().expect("create FileMain");
     let mut stale = RegisteredSocket::register(
         &mut files,
-        worker,
         "stale",
         0,
         FileFunctions {
-            read: Some(|file| {
+            read: Some(|_, file| {
                 file.set_private_data(1);
                 Ok(())
             }),
@@ -311,11 +325,10 @@ fn queued_event_for_deleted_generation_does_not_reach_reused_slot() {
 
     let current = RegisteredSocket::register(
         &mut files,
-        worker,
         "current",
         0,
         FileFunctions {
-            read: Some(|file| {
+            read: Some(|_, file| {
                 file.set_private_data(2);
                 Ok(())
             }),
@@ -325,7 +338,10 @@ fn queued_event_for_deleted_generation_does_not_reach_reused_slot() {
 
     assert_eq!(current.index.slot(), stale.index.slot());
     assert_ne!(current.index.generation(), stale.index.generation());
-    assert_eq!(files.poll().expect("poll FileMain"), 0);
+    assert_eq!(
+        files.poll(&NodeRuntime::default()).expect("poll FileMain"),
+        0
+    );
     let file = files.get(current.index).expect("replacement file");
     assert_eq!(file.private_data(), 0);
     assert_eq!(file.read_events(), 0);
@@ -333,21 +349,24 @@ fn queued_event_for_deleted_generation_does_not_reach_reused_slot() {
 
 #[test]
 fn unhandled_error_deletes_file_and_closes_descriptor() {
-    let worker = DataWorkerId::new(0);
-    let mut files = FileMain::new(worker).expect("create FileMain");
+    let mut files = FileMain::new().expect("create FileMain");
     let mut socket = RegisteredSocket::register(
         &mut files,
-        worker,
         "unhandled peer close",
         0,
         FileFunctions {
-            read: Some(|_| Ok(())),
+            read: Some(|_, _| Ok(())),
             ..FileFunctions::default()
         },
     );
 
     socket.close_peer();
-    assert_eq!(files.poll().expect("poll peer close"), 0);
+    assert_eq!(
+        files
+            .poll(&NodeRuntime::default())
+            .expect("poll peer close"),
+        0
+    );
     assert!(files.get(socket.index).is_none());
     // SAFETY: F_GETFD only queries the descriptor number.
     assert_eq!(unsafe { libc::fcntl(socket.raw_fd, libc::F_GETFD) }, -1);

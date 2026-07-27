@@ -11,6 +11,15 @@ plugins = [
 [log]
 level = "debug"
 
+[trace]
+enabled = true
+record_capacity = 64
+packet_capacity = 16
+
+[[trace.inputs]]
+node = "tun-input"
+count = 32
+
 # VPP: cpu { workers 1 } / unix { poll-sleep-usec 50000 }
 [worker]
 workers = 1
@@ -23,11 +32,9 @@ buffers_per_numa = 2048
 
 # VPP: session { enable use-app-socket-api preallocated-sessions event-queue-length }
 [network.session]
-backend = "svm"
-attach_socket_path = "/var/run/hammer/attach.sock"
+attach_socket_path = "/tmp/hammer-tcp-integration.attach.sock"
 preallocated_sessions = 64
 event_queue_length = 256
-ooo_capacity = 32
 
 [network.session.buffer]
 slot_bytes = 2048

@@ -86,9 +86,7 @@ impl ControlThreadHandle {
         Fut: Future<Output = ()> + Send + 'static,
     {
         if interval.is_zero() {
-            return Err(RuntimeError::invariant(
-                "control timer interval must be non-zero",
-            ));
+            return Err(RuntimeError::ControlTimerIntervalZero);
         }
         self.schedule_timer(ControlTimerRegistration::interval(
             self.next_timer_id(),
@@ -115,7 +113,7 @@ impl ControlThreadHandle {
         let id = registration.id();
         self.command_tx
             .send(ControlCommand::RegisterTimer(registration))
-            .map_err(|_| RuntimeError::invariant("control thread stopped"))?;
+            .map_err(|_| RuntimeError::ControlThreadStopped)?;
         Ok(ControlTimerHandle::new(id, self.command_tx.clone()))
     }
 
@@ -146,14 +144,14 @@ impl ControlThreadHandle {
             .send(ControlCommand::Call(Box::new(move || {
                 let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
                     Ok(value) => Ok(value),
-                    Err(_) => Err(RuntimeError::invariant("control closure panicked")),
+                    Err(_) => Err(RuntimeError::ControlCommandPanicked),
                 };
                 let _ = done_tx.send(outcome);
             })))
-            .map_err(|_| RuntimeError::invariant("control thread stopped"))?;
+            .map_err(|_| RuntimeError::ControlThreadStopped)?;
         done_rx
             .recv()
-            .map_err(|_| RuntimeError::invariant("control command canceled"))?
+            .map_err(|_| RuntimeError::ControlCommandCanceled)?
     }
 
     pub fn call_with_timeout<R>(
@@ -169,19 +167,15 @@ impl ControlThreadHandle {
             .send(ControlCommand::Call(Box::new(move || {
                 let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
                     Ok(value) => Ok(value),
-                    Err(_) => Err(RuntimeError::invariant("control closure panicked")),
+                    Err(_) => Err(RuntimeError::ControlCommandPanicked),
                 };
                 let _ = done_tx.send(outcome);
             })))
-            .map_err(|_| RuntimeError::invariant("control thread stopped"))?;
+            .map_err(|_| RuntimeError::ControlThreadStopped)?;
         match done_rx.recv_timeout(timeout) {
             Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                Err(RuntimeError::invariant("control command timed out"))
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                Err(RuntimeError::invariant("control command canceled"))
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(RuntimeError::ControlCommandTimedOut),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(RuntimeError::ControlCommandCanceled),
         }
     }
 
@@ -206,21 +200,15 @@ impl ControlThreadHandle {
                         let _ = done_tx.send(Err(err));
                     }
                     Err(_) => {
-                        let _ = done_tx.send(Err(RuntimeError::invariant(
-                            "control async closure panicked",
-                        )));
+                        let _ = done_tx.send(Err(RuntimeError::ControlCommandPanicked));
                     }
                 }
             })))
-            .map_err(|_| RuntimeError::invariant("control thread stopped"))?;
+            .map_err(|_| RuntimeError::ControlThreadStopped)?;
         match done_rx.recv_timeout(timeout) {
             Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                Err(RuntimeError::invariant("control async command timed out"))
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                Err(RuntimeError::invariant("control async command canceled"))
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(RuntimeError::ControlCommandTimedOut),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(RuntimeError::ControlCommandCanceled),
         }
     }
 
@@ -241,9 +229,9 @@ impl ControlThreadHandle {
     {
         let (wait, workers, n_workers) = {
             let guard = self.barrier_state.lock().expect("barrier_state lock");
-            let s = guard.as_ref().ok_or_else(|| {
-                RuntimeError::invariant("control_call_with_barrier: barrier not configured")
-            })?;
+            let s = guard
+                .as_ref()
+                .ok_or(RuntimeError::ControlBarrierUnavailable)?;
             (Arc::clone(&s.wait), Arc::clone(&s.workers), s.n_workers)
         };
 

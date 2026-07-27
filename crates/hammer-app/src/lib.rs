@@ -8,4 +8,4 @@ pub mod echo;
 pub mod tcp;
 pub mod udp;
 
-pub use hammer_runtime::app::{AppSession, AppSessionAsyncError, AppSessionConfig, SessionHandle};
+pub use hammer_runtime::app::{AppSession, AppSessionConfig, AppSessionError, SessionHandle};

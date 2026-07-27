@@ -1,321 +1,151 @@
 use std::io;
 use std::os::fd::RawFd;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::align::align_up;
 use crate::svm_region::SvmRegion;
 
-pub trait Segment: Send + Sync + Clone + 'static {
-    fn base(&self) -> *mut u8;
-    fn alloc(&self, bytes: usize, align: usize) -> u64;
-    fn free(&self, offset: u64, bytes: usize);
-    fn fd(&self) -> Option<RawFd>;
-}
-
-pub struct Local {
-    inner: Arc<LocalInner>,
-}
-
-struct LocalInner {
-    buf: Box<[u8]>,
-    bump: AtomicU64,
-    base_offset: u64,
-}
-
-impl Local {
-    /// Create a heap-backed segment with at least `size` usable bytes.
-    /// The base address is aligned to 64 bytes (cache line).
-    pub fn new(size: usize) -> Self {
-        let extra = 64usize;
-        let total = size
-            .checked_add(extra)
-            .expect("Local segment size overflow");
-        let mut buf = vec![0u8; total].into_boxed_slice();
-        let base_raw = buf.as_mut_ptr() as usize;
-        let base_aligned = align_up(base_raw, 64);
-        let base_offset = (base_aligned - base_raw) as u64;
-        Self {
-            inner: Arc::new(LocalInner {
-                buf,
-                bump: AtomicU64::new(0),
-                base_offset,
-            }),
-        }
-    }
-}
-
-impl Default for Local {
-    fn default() -> Self {
-        Self::new(65536)
-    }
-}
-
-impl Clone for Local {
-    fn clone(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-        }
-    }
-}
-
-impl Segment for Local {
-    fn base(&self) -> *mut u8 {
-        unsafe { self.inner.buf.as_ptr().add(self.inner.base_offset as usize) as *mut u8 }
-    }
-
-    fn alloc(&self, bytes: usize, align: usize) -> u64 {
-        let total = self.inner.buf.len();
-        let bo = self.inner.base_offset;
-        loop {
-            let current = self.inner.bump.load(Ordering::Relaxed);
-            let aligned = align_up(current as usize, align) as u64;
-            let next = aligned + bytes as u64;
-            if bo + next > total as u64 {
-                panic!(
-                    "Local segment exhausted: requested {bytes} at {aligned}, size {}",
-                    total - bo as usize
-                );
-            }
-            if self
-                .inner
-                .bump
-                .compare_exchange(current, next, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                return aligned;
-            }
-        }
-    }
-
-    fn free(&self, _: u64, _: usize) {
-        // Local uses bump allocation; offsets return when the segment drops.
-    }
-
-    fn fd(&self) -> Option<RawFd> {
-        None
-    }
-}
-unsafe impl Send for Local {}
-unsafe impl Sync for Local {}
-
-static SVM_DEFAULT_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-pub struct Svm {
+/// Memory domain backing application FIFOs and message queues.
+///
+/// Local and cross-process applications use the same Segment semantics. The
+/// application attach path decides whether the mapping may be exported; users
+/// of FIFO and message-queue storage do not carry that choice in their types.
+#[derive(Clone)]
+pub struct Segment {
     region: SvmRegion,
+    shareable: bool,
 }
 
-impl Svm {
-    #[cfg(target_os = "linux")]
-    pub fn create(name: &str, size: usize) -> Result<Self, io::Error> {
-        let c_name = std::ffi::CString::new(name)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name contains nul"))?;
-        let fd = unsafe { libc::syscall(libc::SYS_memfd_create, c_name.as_ptr(), 0) };
+impl Segment {
+    /// Create a process-local Segment.
+    pub fn local(size: usize) -> Self {
+        Self {
+            region: SvmRegion::with_size(size),
+            shareable: false,
+        }
+    }
+
+    /// Create a Segment whose mapping can be attached by another process.
+    pub fn shared(name: &str, size: usize) -> Result<Self, io::Error> {
+        let name = std::ffi::CString::new(if cfg!(target_os = "linux") {
+            name.to_owned()
+        } else {
+            format!("/{name}")
+        })
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name contains nul"))?;
+
+        #[cfg(target_os = "linux")]
+        let fd = unsafe { libc::syscall(libc::SYS_memfd_create, name.as_ptr(), libc::MFD_CLOEXEC) };
+        #[cfg(not(target_os = "linux"))]
+        let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
         let fd = fd as RawFd;
-        let ret = unsafe { libc::ftruncate(fd, size as libc::off_t) };
-        if ret != 0 {
-            unsafe {
-                libc::close(fd);
-            }
-            return Err(io::Error::last_os_error());
-        }
-        let region =
-            SvmRegion::from_created_fd_owned(fd, size).ok_or_else(|| io::Error::last_os_error())?;
-        Ok(Self { region })
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub fn create(name: &str, size: usize) -> Result<Self, io::Error> {
-        let c_name = std::ffi::CString::new(format!("/{name}"))
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name contains nul"))?;
-        let fd = unsafe { libc::shm_open(c_name.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        #[cfg(not(target_os = "linux"))]
         unsafe {
-            libc::shm_unlink(c_name.as_ptr());
+            libc::shm_unlink(name.as_ptr());
         }
-        let ret = unsafe { libc::ftruncate(fd, size as libc::off_t) };
-        if ret != 0 {
-            unsafe {
-                libc::close(fd);
-            }
-            return Err(io::Error::last_os_error());
+        if unsafe { libc::ftruncate(fd, size as libc::off_t) } != 0 {
+            let source = io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(source);
         }
         let region =
-            SvmRegion::from_created_fd_owned(fd, size).ok_or_else(|| io::Error::last_os_error())?;
-        Ok(Self { region })
+            SvmRegion::from_created_fd_owned(fd, size).ok_or_else(io::Error::last_os_error)?;
+        Ok(Self {
+            region,
+            shareable: true,
+        })
     }
 
     /// Attach to a shared mapping through a borrowed descriptor.
     ///
-    /// The returned segment owns a close-on-exec duplicate, so the caller may
-    /// close the supplied descriptor immediately without invalidating
-    /// [`Segment::fd`].
+    /// The Segment owns a close-on-exec duplicate, so the caller may close the
+    /// supplied descriptor immediately after this operation returns.
     pub fn from_fd(fd: RawFd, size: usize) -> Result<Self, io::Error> {
-        SvmRegion::from_fd(fd, size)
-            .map(|region| Self { region })
-            .ok_or_else(io::Error::last_os_error)
+        let region = SvmRegion::from_fd(fd, size).ok_or_else(io::Error::last_os_error)?;
+        Ok(Self {
+            region,
+            shareable: true,
+        })
     }
-}
 
-impl Default for Svm {
-    fn default() -> Self {
-        let pid = std::process::id();
-        let counter = SVM_DEFAULT_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let name = format!("hammer-{pid}-{counter}");
-        let size = 256 * 1024 * 1024;
-        Self::create(&name, size)
-            .unwrap_or_else(|e| panic!("Svm::default: failed to create shared memory segment: {e}"))
+    #[inline]
+    pub fn base(&self) -> *mut u8 {
+        self.region.base()
     }
-}
 
-impl Svm {
+    #[inline]
     pub fn size(&self) -> usize {
         self.region.size()
     }
-}
 
-impl Clone for Svm {
-    fn clone(&self) -> Self {
+    #[inline]
+    pub fn alloc(&self, bytes: usize, align: usize) -> Option<u64> {
+        self.region.alloc(bytes, align)
+    }
+
+    #[inline]
+    pub fn free(&self, offset: u64, bytes: usize) {
+        self.region.release_offset(offset, bytes);
+    }
+
+    /// Backing descriptor for cross-process attach.
+    #[inline]
+    pub fn shared_fd(&self) -> Option<RawFd> {
+        self.shareable.then(|| self.region.fd())
+    }
+
+    pub fn shared_default() -> Self {
         Self {
-            region: self.region.clone(),
+            region: SvmRegion::default(),
+            shareable: true,
         }
     }
 }
 
-impl Segment for Svm {
-    fn base(&self) -> *mut u8 {
-        self.region.base()
-    }
-
-    fn alloc(&self, bytes: usize, align: usize) -> u64 {
-        self.region.alloc(bytes, align)
-    }
-
-    fn free(&self, offset: u64, bytes: usize) {
-        self.region.release_offset(offset, bytes);
-    }
-
-    fn fd(&self) -> Option<RawFd> {
-        Some(self.region.fd())
+impl Default for Segment {
+    fn default() -> Self {
+        Self::local(65_536)
     }
 }
-unsafe impl Send for Svm {}
-unsafe impl Sync for Svm {}
+
+unsafe impl Send for Segment {}
+unsafe impl Sync for Segment {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn local_alloc_returns_aligned_offsets() {
-        let seg = Local::new(4096);
-        let off1 = seg.alloc(128, 64);
-        assert_eq!(off1, 0);
-        assert_eq!(off1 % 64, 0);
-        let off2 = seg.alloc(128, 64);
-        assert_eq!(off2, 128);
-        assert_eq!(off2 % 64, 0);
+    fn local_allocation_returns_aligned_offsets() {
+        let segment = Segment::local(4096);
+        let first = segment.alloc(128, 64).expect("first allocation");
+        let second = segment.alloc(128, 64).expect("second allocation");
+        assert_eq!(first % 64, 0);
+        assert_eq!(second % 64, 0);
+        assert!(segment.shared_fd().is_none());
     }
 
     #[test]
-    fn local_base_writable() {
-        let seg = Local::new(256);
-        let off = seg.alloc(8, 1);
+    fn shared_segment_exposes_backing_descriptor() {
+        let segment = Segment::shared("hammer-test-segment", 4096).expect("shared segment");
+        assert!(segment.shared_fd().is_some());
+    }
+
+    #[test]
+    fn attached_segment_observes_shared_bytes() {
+        let owner = Segment::shared("hammer-test-attach", 4096).expect("shared segment");
+        let offset = owner.alloc(8, 8).expect("shared allocation");
         unsafe {
-            std::ptr::write_bytes(seg.base().add(off as usize), 0xAB, 8);
-            assert_eq!(*seg.base().add(off as usize), 0xAB);
+            owner
+                .base()
+                .add(offset as usize)
+                .cast::<u64>()
+                .write(0x1234);
         }
-    }
-
-    #[test]
-    fn local_fd_is_none() {
-        let seg = Local::new(64);
-        assert!(seg.fd().is_none());
-    }
-
-    #[test]
-    fn local_clone_shares_base() {
-        let seg = Local::new(256);
-        let clone = seg.clone();
-        assert_eq!(seg.base(), clone.base());
-    }
-
-    #[test]
-    fn svm_create_and_write_read() {
-        let seg = Svm::create("hammer_test_rw", 4096).expect("create");
-        let off = seg.alloc(64, 8);
-        unsafe {
-            std::ptr::write_bytes(seg.base().add(off as usize), 0xCD, 64);
-            assert_eq!(*seg.base().add(off as usize), 0xCD);
-        }
-        assert!(seg.fd().is_some());
-    }
-
-    #[test]
-    fn svm_heap_returns_aligned_offset() {
-        let seg = Svm::create("hammer_test_align", 4096).expect("create");
-        let off = seg.alloc(128, 64);
-        assert_eq!(off % 64, 0);
-    }
-
-    #[test]
-    fn svm_release_then_reuse() {
-        let seg = Svm::create("hammer_test_release", 4096).expect("create");
-        let off1 = seg.alloc(4096, 64);
-        seg.free(off1, 4096);
-        let off2 = seg.alloc(4096, 64);
-        assert_eq!(off1, off2);
-    }
-
-    #[test]
-    fn svm_default_creates_valid_segment() {
-        let seg = Svm::default();
-        assert!(seg.size() > 0);
-        assert!(seg.fd().is_some());
-        let off = seg.alloc(128, 64);
-        assert_eq!(off % 64, 0);
-        assert!((off as usize) < seg.size());
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn svm_cross_process_via_fd() {
-        let seg = Svm::create("hammer_test_fork", 4096).expect("create");
-        let off = seg.alloc(8, 1);
-        unsafe {
-            std::ptr::write_bytes(seg.base().add(off as usize), 0x42, 8);
-        }
-        let fd = seg.fd().unwrap();
-        let pid = unsafe { libc::fork() };
-        if pid == 0 {
-            let child_seg = Svm::from_fd(fd, 4096).expect("attach");
-            let val = unsafe { *child_seg.base().add(off as usize) };
-            std::process::exit(if val == 0x42 { 0 } else { 1 });
-        }
-        let mut status = 0;
-        unsafe {
-            libc::waitpid(pid, &mut status, 0);
-        }
-        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
-    }
-
-    #[test]
-    fn svm_create_closes_its_fd_on_drop() {
-        let svm = Svm::default();
-        let fd = svm.fd().expect("Svm exposes its fd");
-        drop(svm);
-        unsafe {
-            let r = libc::fcntl(fd, libc::F_GETFL);
-            assert!(r < 0, "fd must be closed after Svm drop");
-            assert_eq!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(libc::EBADF)
-            );
-        }
+        let attached = Segment::from_fd(owner.shared_fd().expect("shared fd"), owner.size())
+            .expect("attach segment");
+        let value = unsafe { attached.base().add(offset as usize).cast::<u64>().read() };
+        assert_eq!(value, 0x1234);
     }
 }

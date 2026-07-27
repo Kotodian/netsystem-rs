@@ -40,10 +40,6 @@ const HANDOFF_QUEUE_CAPACITY: usize = 1_024;
 const APP_SESSION_FIFO_CAPACITY: usize = 64 * 1024;
 const APP_SESSION_EVENT_QUEUE_CAPACITY: usize = 16;
 
-fn default_instruction_set() -> String {
-    "native".to_string()
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Worker {
@@ -68,11 +64,6 @@ pub struct Worker {
     pub buffer: WorkerBuffer,
     pub handoff: WorkerHandoff,
     pub app_session: WorkerAppSession,
-    /// CPU instruction set for dataplane batch processing.
-    /// Accepted values: "native" (CPU feature-detect), "scalar", "sse2",
-    /// "avx2", "avx512", "neon". Default: "native".
-    #[serde(default = "default_instruction_set")]
-    pub instruction_set: String,
     /// CPU pinning. Linux only; absent on macOS (XNU has no thread
     /// affinity). The three cores are independent: `main_core` runs the
     /// control thread, `app_core` runs the app session/ring runtime, and
@@ -97,7 +88,6 @@ impl Default for Worker {
             buffer: WorkerBuffer::default(),
             handoff: WorkerHandoff::default(),
             app_session: WorkerAppSession::default(),
-            instruction_set: default_instruction_set(),
             #[cfg(target_os = "linux")]
             cpu: WorkerCpu::default(),
             scheduler: WorkerScheduler::default(),
@@ -121,6 +111,11 @@ impl Worker {
         if self.stack_size == 0 {
             return Err(RuntimeError::config_validation(
                 "worker.stack_size must be non-zero",
+            ));
+        }
+        if self.max_blocking_threads == 0 {
+            return Err(RuntimeError::config_validation(
+                "worker.max_blocking_threads must be non-zero",
             ));
         }
         self.buffer.validate()?;
@@ -544,24 +539,6 @@ priority = 10
         assert_eq!(worker.scheduler.policy, SchedulerPolicy::Fifo);
         assert_eq!(worker.scheduler.priority, 10);
         worker.validate().expect("valid fifo scheduler");
-    }
-
-    #[test]
-    fn instruction_set_defaults_to_native() {
-        let worker = Worker::default();
-        assert_eq!(worker.instruction_set, "native");
-    }
-
-    #[test]
-    fn instruction_set_accepts_native() {
-        let worker: Worker = toml::from_str("instruction_set = \"native\"").unwrap();
-        assert_eq!(worker.instruction_set, "native");
-    }
-
-    #[test]
-    fn instruction_set_accepts_avx512() {
-        let worker: Worker = toml::from_str("instruction_set = \"avx512\"").unwrap();
-        assert_eq!(worker.instruction_set, "avx512");
     }
 
     #[cfg(target_os = "macos")]

@@ -158,7 +158,7 @@ fn icmp_input_dispatches_ipv4_echo_request_by_type() {
         }]
         .into(),
     });
-    runtime.set_trace_control(Some(trace_control.handle()), 2);
+    runtime.set_trace_control(Some(trace_control.handle()));
     let packet = ipv4_icmp_packet(8, 0, b"echo4");
     let mut frame = runtime
         .buffers()

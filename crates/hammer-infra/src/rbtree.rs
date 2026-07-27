@@ -59,6 +59,11 @@ where
     }
 
     #[inline]
+    pub fn capacity(&self) -> usize {
+        self.nodes.capacity()
+    }
+
+    #[inline]
     pub fn contains_key(&self, key: &K) -> bool {
         self.find_node(*key).is_some()
     }

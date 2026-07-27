@@ -1,17 +1,17 @@
-use std::cell::UnsafeCell;
+use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::fmt;
 use std::mem::transmute;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
 use hammer_core::data_plane::{BufferFrame, Index, NodeId, NodeRegistration};
 use hammer_runtime::DataPlaneBarrierHandle;
-use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
 use hammer_runtime::{
-    DataPlaneRuntime, Engine, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
+    DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
     add_packet_trace,
 };
+use hammer_runtime::{RuntimeError, RuntimeResult};
 use ipnet::IpNet;
 
 use crate::data_plane::set_index_node_error_code;
@@ -48,6 +48,29 @@ impl Default for InterfaceConfigMtu {
             ip4: DEFAULT_INTERFACE_MTU,
             ip6: DEFAULT_INTERFACE_MTU,
             mpls: DEFAULT_INTERFACE_MTU,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum InterfaceError {
+    #[error("interface name is empty")]
+    NameEmpty,
+    #[error("interface index space is exhausted at {interface_count} interfaces")]
+    IndexSpaceExhausted { interface_count: usize },
+    #[error("interface {interface_index} is not registered")]
+    NotRegistered { interface_index: u32 },
+    #[error(transparent)]
+    Runtime(#[from] RuntimeError),
+}
+
+pub type InterfaceResult<T> = Result<T, InterfaceError>;
+
+impl From<InterfaceError> for RuntimeError {
+    fn from(error: InterfaceError) -> Self {
+        match error {
+            InterfaceError::Runtime(error) => error,
+            other => Self::subsystem("interface", other),
         }
     }
 }
@@ -254,7 +277,7 @@ impl InterfaceControlPlane {
         InterfaceControlHandle::new(Arc::clone(&self.inner))
     }
 
-    pub fn register_interface(&self, name: impl Into<String>) -> RuntimeResult<u32> {
+    pub fn register_interface(&self, name: impl Into<String>) -> InterfaceResult<u32> {
         self.register_interface_with_mtu(name, InterfaceMtu::default())
     }
 
@@ -262,44 +285,43 @@ impl InterfaceControlPlane {
         &self,
         name: impl Into<String>,
         mtu: InterfaceMtu,
-    ) -> RuntimeResult<u32> {
+    ) -> InterfaceResult<u32> {
         let name = name.into();
         if name.is_empty() {
-            return Err(RuntimeError::invariant("interface name is empty"));
+            return Err(InterfaceError::NameEmpty);
         }
-        let mut index = None;
         self.synchronize(|| {
             let current = self.inner.state();
             if let Some(current_index) = current.interface_index(&name) {
-                index = Some(current_index);
-                return Ok(());
+                return Ok(current_index);
             }
             let mut next = InterfaceState::clone(&current);
-            let next_index = next.interfaces.len() as u32;
+            let interface_count = next.interfaces.len();
+            let next_index = u32::try_from(interface_count)
+                .map_err(|_| InterfaceError::IndexSpaceExhausted { interface_count })?;
+            if next_index == u32::MAX {
+                return Err(InterfaceError::IndexSpaceExhausted { interface_count });
+            }
             next.interfaces.push(InterfaceRecord {
                 name: name.clone(),
                 addresses: Vec::new(),
                 mtu,
             });
-            index = Some(next_index);
-            self.publish(next)?;
-            Ok(())
-        })?;
-        index.ok_or_else(|| {
-            RuntimeError::invariant("interface registration did not publish an index")
+            self.publish(next);
+            Ok(next_index)
         })
     }
 
-    pub fn set_mtu(&self, interface_index: u32, mtu: InterfaceMtu) -> RuntimeResult<()> {
+    pub fn set_mtu(&self, interface_index: u32, mtu: InterfaceMtu) -> InterfaceResult<()> {
         self.ensure_interface(interface_index)?;
         self.synchronize(|| {
             let current = self.inner.state();
             let mut next = InterfaceState::clone(current);
-            let interface = next.interface_mut(interface_index).ok_or_else(|| {
-                RuntimeError::invariant(format!("interface {interface_index} is not registered"))
-            })?;
+            let interface = next
+                .interface_mut(interface_index)
+                .ok_or(InterfaceError::NotRegistered { interface_index })?;
             interface.mtu = mtu;
-            self.publish(next)?;
+            self.publish(next);
             Ok(())
         })
     }
@@ -309,28 +331,26 @@ impl InterfaceControlPlane {
         interface_index: u32,
         kind: InterfaceMtuKind,
         value: u32,
-    ) -> RuntimeResult<()> {
+    ) -> InterfaceResult<()> {
         self.ensure_interface(interface_index)?;
         self.synchronize(|| {
             let current = self.inner.state();
             let mut next = InterfaceState::clone(current);
-            let interface = next.interface_mut(interface_index).ok_or_else(|| {
-                RuntimeError::invariant(format!("interface {interface_index} is not registered"))
-            })?;
+            let interface = next
+                .interface_mut(interface_index)
+                .ok_or(InterfaceError::NotRegistered { interface_index })?;
             interface.mtu.set(kind, value);
-            self.publish(next)?;
+            self.publish(next);
             Ok(())
         })
     }
 
-    pub fn add_address(&self, interface_index: u32, address: IpNet) -> RuntimeResult<u32> {
+    pub fn add_address(&self, interface_index: u32, address: IpNet) -> InterfaceResult<u32> {
         self.ensure_interface(interface_index)?;
-        let mut address_index = None;
         self.synchronize(|| {
             let current = self.inner.state();
             if let Some(current_index) = current.interface_address_index(interface_index, address) {
-                address_index = Some(current_index);
-                return Ok(());
+                return Ok(current_index);
             }
             let mut next = InterfaceState::clone(&current);
             let index = next.addresses.len() as u32;
@@ -344,22 +364,18 @@ impl InterfaceControlPlane {
             next.interfaces[interface_index as usize]
                 .addresses
                 .push(index);
-            address_index = Some(index);
-            self.publish(next)?;
-            Ok(())
-        })?;
-        address_index
-            .ok_or_else(|| RuntimeError::invariant("interface address did not publish an index"))
+            self.publish(next);
+            Ok(index)
+        })
     }
 
-    pub fn remove_address(&self, interface_index: u32, address: IpNet) -> RuntimeResult<bool> {
+    pub fn remove_address(&self, interface_index: u32, address: IpNet) -> InterfaceResult<bool> {
         self.ensure_interface(interface_index)?;
-        let mut removed = false;
         self.synchronize(|| {
             let current = self.inner.state();
             let Some(address_index) = current.interface_address_index(interface_index, address)
             else {
-                return Ok(());
+                return Ok(false);
             };
             let mut next = InterfaceState::clone(&current);
             if let Some(address) = next.addresses.get_mut(address_index as usize) {
@@ -375,26 +391,22 @@ impl InterfaceControlPlane {
                 interface.addresses = addresses;
             }
             next.rebuild_address_index();
-            removed = true;
-            self.publish(next)?;
-            Ok(())
-        })?;
-        Ok(removed)
+            self.publish(next);
+            Ok(true)
+        })
     }
 
     #[inline]
-    fn ensure_interface(&self, interface_index: u32) -> RuntimeResult<()> {
+    fn ensure_interface(&self, interface_index: u32) -> InterfaceResult<()> {
         if self.inner.state().interface(interface_index).is_some() {
             Ok(())
         } else {
-            Err(RuntimeError::invariant(format!(
-                "interface {interface_index} is not registered"
-            )))
+            Err(InterfaceError::NotRegistered { interface_index })
         }
     }
 
     #[inline]
-    fn synchronize<R>(&self, operation: impl FnOnce() -> RuntimeResult<R>) -> RuntimeResult<R> {
+    fn synchronize<R>(&self, operation: impl FnOnce() -> InterfaceResult<R>) -> InterfaceResult<R> {
         if let Some(barrier) = &self.barrier {
             barrier.synchronize(operation)
         } else {
@@ -403,9 +415,8 @@ impl InterfaceControlPlane {
     }
 
     #[inline]
-    fn publish(&self, state: InterfaceState) -> RuntimeResult<()> {
+    fn publish(&self, state: InterfaceState) {
         self.inner.replace_after_barrier(state);
-        Ok(())
     }
 }
 
@@ -575,214 +586,25 @@ impl InterfaceAddressKey {
     }
 }
 
-struct InterfaceOutputStateSlot {
-    state: UnsafeCell<InterfaceOutputState>,
+thread_local! {
+    static INTERFACE_OUTPUT_STATE: RefCell<InterfaceOutputState> =
+        RefCell::new(InterfaceOutputState::default());
 }
 
-impl InterfaceOutputStateSlot {
-    #[inline]
-    fn new(state: InterfaceOutputState) -> Self {
-        Self {
-            state: UnsafeCell::new(state),
-        }
-    }
-
-    #[inline]
-    fn state(&self) -> &InterfaceOutputState {
-        // SAFETY: Interface output map writes are serialized by the runtime
-        // data-plane barrier before publication. Data-plane nodes only read an
-        // immutable snapshot while workers are running.
-        unsafe { &*self.state.get() }
-    }
-
-    #[inline]
-    fn replace_after_barrier(&self, state: InterfaceOutputState) {
-        // SAFETY: callers replace state either under the runtime barrier or
-        // during single-threaded graph setup in tests.
-        unsafe {
-            *self.state.get() = state;
-        }
-    }
-}
-
-impl fmt::Debug for InterfaceOutputStateSlot {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("InterfaceOutputStateSlot")
-            .finish_non_exhaustive()
-    }
-}
-
-unsafe impl Send for InterfaceOutputStateSlot {}
-unsafe impl Sync for InterfaceOutputStateSlot {}
-
-#[derive(Debug, Clone)]
-pub struct InterfaceOutputHandle {
-    inner: Arc<InterfaceOutputStateSlot>,
-}
-
-impl InterfaceOutputHandle {
-    #[inline]
-    fn new(inner: Arc<InterfaceOutputStateSlot>) -> Self {
-        Self { inner }
-    }
-
-    #[inline]
-    pub fn tx_slot(&self, interface_index: u32) -> Option<u16> {
-        self.inner.state().tx_slot(interface_index)
-    }
-
-    #[inline]
-    pub fn drop_slot(&self) -> Option<u16> {
-        self.inner.state().drop_slot
-    }
-}
-
-pub struct InterfaceOutputControlPlane {
-    inner: Arc<InterfaceOutputStateSlot>,
-    barrier: Option<DataPlaneBarrierHandle>,
-    nodes: Option<hammer_runtime::node::NodeRuntime>,
-    consumer: Option<NodeId>,
-}
-
-impl Default for InterfaceOutputControlPlane {
-    #[inline]
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl InterfaceOutputControlPlane {
-    #[inline]
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(InterfaceOutputStateSlot::new(
-                InterfaceOutputState::default(),
-            )),
-            barrier: None,
-            nodes: None,
-            consumer: None,
-        }
-    }
-
-    #[inline]
-    pub fn with_data_plane_barrier(mut self, barrier: DataPlaneBarrierHandle) -> Self {
-        self.barrier = Some(barrier);
-        self
-    }
-
-    #[inline]
-    pub fn with_nodes(mut self, nodes: hammer_runtime::node::NodeRuntime) -> Self {
-        self.nodes = Some(nodes);
-        self
-    }
-
-    #[inline]
-    pub fn handle(&self) -> InterfaceOutputHandle {
-        InterfaceOutputHandle::new(Arc::clone(&self.inner))
-    }
-
-    #[inline]
-    pub fn node(&self) -> InterfaceOutputNode {
-        InterfaceOutputNode::new(self.handle())
-    }
-
-    /// Wire Drop into the interface-output local-next table.
-    pub fn attach_consumer(&mut self, consumer: NodeId) -> RuntimeResult<()> {
-        let nodes = self.nodes.as_ref().ok_or_else(|| {
-            RuntimeError::invariant("interface output attach requires node runtime")
-        })?;
-        let drop = nodes
-            .node_by_name("drop")
-            .ok_or_else(|| RuntimeError::invariant("interface output attach requires drop node"))?;
-        let drop_slot = nodes.add_node_next_slot(consumer, drop)?;
-        self.consumer = Some(consumer);
-        self.synchronize(|| {
-            let current = self.inner.state();
-            let mut next = InterfaceOutputState::clone(current);
-            next.drop_slot = Some(drop_slot);
-            self.publish(next);
-            Ok(())
-        })
-    }
-
-    pub fn register_tx(&self, interface_index: u32, node: NodeId) -> RuntimeResult<u16> {
-        let consumer = self.consumer.ok_or_else(|| {
-            RuntimeError::invariant("interface output register_tx requires attach_consumer")
-        })?;
-        let nodes = self.nodes.as_ref().ok_or_else(|| {
-            RuntimeError::invariant("interface output register_tx requires node runtime")
-        })?;
-        let slot = nodes.add_node_next_slot(consumer, node)?;
-        self.synchronize(|| {
-            let current = self.inner.state();
-            let mut next = InterfaceOutputState::clone(current);
-            next.set_tx_slot(interface_index, Some(slot));
-            self.publish(next);
-            Ok(slot)
-        })
-    }
-
-    pub fn unregister_tx(&self, interface_index: u32) -> RuntimeResult<bool> {
-        let mut removed = false;
-        self.synchronize(|| {
-            let current = self.inner.state();
-            removed = current.tx_slot(interface_index).is_some();
-            if !removed {
-                return Ok(());
-            }
-            let mut next = InterfaceOutputState::clone(current);
-            next.set_tx_slot(interface_index, None);
-            self.publish(next);
-            Ok(())
-        })?;
-        Ok(removed)
-    }
-
-    #[inline]
-    fn synchronize<R>(&self, operation: impl FnOnce() -> RuntimeResult<R>) -> RuntimeResult<R> {
-        if let Some(barrier) = &self.barrier {
-            barrier.synchronize(operation)
-        } else {
-            operation()
-        }
-    }
-
-    #[inline]
-    fn publish(&self, state: InterfaceOutputState) {
-        self.inner.replace_after_barrier(state);
-    }
-}
-
-impl InterfaceOutputControlPlane {
-    pub(crate) fn install_worker_runtime(
-        &mut self,
-        engine: &mut Engine,
-        interface_output: NodeId,
-        tx_queues: &[DeviceTxQueue],
-    ) -> RuntimeResult<()> {
-        self.attach_consumer(interface_output)?;
-
-        let mut installed = Vec::new();
+impl InterfaceOutputNode {
+    pub(crate) fn install_worker_queues(worker: DataWorkerId, tx_queues: &[DeviceTxQueue]) {
+        let mut state = InterfaceOutputState::default();
         for queue in tx_queues {
-            if let Some((_, node)) = installed
-                .iter()
-                .find(|(interface_index, _)| *interface_index == queue.interface_index)
-            {
-                if *node != queue.output_node {
-                    return Err(RuntimeError::invariant(
-                        "interface TX queues must use one output node per interface",
-                    ));
-                }
+            state.drop_slot = Some(queue.drop_slot);
+            if !queue.is_assigned_to(worker) {
                 continue;
             }
-            self.register_tx(queue.interface_index, queue.output_node)?;
-            installed.push((queue.interface_index, queue.output_node));
+            state.set_tx_slot(queue.interface_index, Some(queue.output_slot));
         }
 
-        engine.set_worker_node_runtime_data(
-            interface_output,
-            register_interface_output_runtime(self.handle()),
-        )
+        INTERFACE_OUTPUT_STATE.with(|worker_state| {
+            worker_state.replace(state);
+        });
     }
 }
 
@@ -835,29 +657,22 @@ pub struct InterfaceOutputTrace {
     pub next: Option<u16>,
 }
 
-#[hammer_component_macros::node]
-pub struct InterfaceOutputNode {
-    #[node(default = register_interface_output_runtime(output.clone()))]
-    runtime_data: NodeRuntimeData,
-    output: InterfaceOutputHandle,
-}
-
-#[hammer_component_macros::init_function(
-    name = "interface_output_graph_init",
-    runs_after = ["install_packet_graph"]
+#[hammer_component_macros::graph_node(
+    graph = service,
+    init = register_interface_output_graph,
+    name = "interface-output",
 )]
-fn install_interface_output_graph(engine: &mut Engine) -> RuntimeResult<()> {
-    engine
-        .runtime
-        .nodes()
-        .try_register_internal(InterfaceOutputControlPlane::new().node())?;
-    Ok(())
+#[derive(Debug, Clone, Copy)]
+pub struct InterfaceOutputNode;
+
+fn register_interface_output_graph(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+    runtime.nodes().try_register_internal(InterfaceOutputNode)
 }
 
 impl InterfaceOutputNode {
     #[inline(always)]
     fn tx_for_index(
-        output: &InterfaceOutputHandle,
+        output: &InterfaceOutputState,
         runtime: &DataPlaneRuntime,
         index: Index,
         drop_next: u16,
@@ -867,7 +682,7 @@ impl InterfaceOutputNode {
             let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
             network.sw_if_index[1]
         };
-        if interface_index == 0 {
+        if interface_index == u32::MAX {
             set_index_node_error_code(
                 runtime,
                 index,
@@ -920,17 +735,15 @@ impl InterfaceOutputNode {
 impl Node for InterfaceOutputNode {
     #[inline(always)]
     fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
-        interface_output_process_frame(runtime, frame, &self.output)
+        INTERFACE_OUTPUT_STATE.with(|state| {
+            let state = state.borrow();
+            interface_output_process_frame(runtime, frame, &state)
+        })
     }
 
     #[inline]
     fn node_process(&self) -> NodeProcessFn {
         interface_output_process
-    }
-
-    #[inline]
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
-        Ok(self.runtime_data)
     }
 }
 
@@ -940,58 +753,28 @@ impl InternalNode for InterfaceOutputNode {
     where
         Self: Sized,
     {
-        NodeRegistration::next(Self::NODE_NAME, 0)
+        NodeRegistration::next("interface-output", 0)
     }
-}
-
-#[derive(Clone)]
-struct InterfaceOutputRuntime {
-    output: InterfaceOutputHandle,
-}
-
-fn interface_output_runtimes() -> &'static Mutex<Vec<InterfaceOutputRuntime>> {
-    static RUNTIMES: OnceLock<Mutex<Vec<InterfaceOutputRuntime>>> = OnceLock::new();
-    RUNTIMES.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-fn register_interface_output_runtime(output: InterfaceOutputHandle) -> NodeRuntimeData {
-    let mut runtimes = interface_output_runtimes()
-        .lock()
-        .expect("interface output runtime registry poisoned");
-    let slot = runtimes.len();
-    runtimes.push(InterfaceOutputRuntime { output });
-    NodeRuntimeData::from_usize(slot).expect("interface output runtime slot overflow")
-}
-
-fn interface_output_runtime(data: NodeRuntimeData) -> RuntimeResult<InterfaceOutputRuntime> {
-    let slot = data.usize_word(0)?;
-    interface_output_runtimes()
-        .lock()
-        .map_err(|_| RuntimeError::invariant("interface output runtime registry poisoned"))?
-        .get(slot)
-        .cloned()
-        .ok_or_else(|| RuntimeError::invariant("interface output runtime slot is invalid"))
 }
 
 fn interface_output_process(
     runtime: &DataPlaneRuntime,
-    data: NodeRuntimeData,
+    _: NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> NodeResult {
-    let state = match interface_output_runtime(data) {
-        Ok(state) => state,
-        Err(_) => return NodeResult::drop(),
-    };
-    interface_output_process_frame(runtime, frame, &state.output)
+    INTERFACE_OUTPUT_STATE.with(|state| {
+        let state = state.borrow();
+        interface_output_process_frame(runtime, frame, &state)
+    })
 }
 
 #[inline(always)]
 fn interface_output_process_frame(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
-    output: &InterfaceOutputHandle,
+    output: &InterfaceOutputState,
 ) -> NodeResult {
-    let Some(drop_next) = output.drop_slot() else {
+    let Some(drop_next) = output.drop_slot else {
         return NodeResult::drop();
     };
     hammer_runtime::process_frame!(runtime, frame, |index| {

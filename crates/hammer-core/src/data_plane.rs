@@ -1,3 +1,5 @@
+use abi_stable::StableAbi;
+
 mod buffer;
 mod memory;
 
@@ -9,7 +11,8 @@ pub use buffer::{
     PrimaryOpaque, SecondaryOpaque,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, StableAbi)]
+#[repr(transparent)]
 pub struct NodeId(u32);
 
 impl NodeId {

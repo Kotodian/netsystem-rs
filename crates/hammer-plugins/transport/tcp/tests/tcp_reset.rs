@@ -4,11 +4,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 use hammer_plugin_tcp::{TcpResetNext, TcpResetNode};
+use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
     DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, InternalNode, Node,
     NodeProcessFn, NodeResult, NodeRuntimeData,
 };
-use hammer_runtime::{RuntimeError, RuntimeResult};
 use hammer_service::opaque::NetworkOpaque;
 
 fn test_runtime_configured(
@@ -38,10 +38,7 @@ struct CaptureNode {
 
 impl CaptureNode {
     fn new(state: Arc<Mutex<CaptureState>>) -> Self {
-        let mut states = capture_states()
-            .lock()
-            .map_err(|_| RuntimeError::invariant("capture state registry poisoned"))
-            .expect("capture state registry");
+        let mut states = capture_states().lock().expect("capture state registry");
         let slot = states.len();
         states.push(state);
         Self {
@@ -213,9 +210,15 @@ fn reset_graph() -> (
     let lookup = runtime
         .nodes()
         .register_internal(CaptureNode::new(Arc::clone(&lookup_state)));
-    let reset = runtime
+    let reset = runtime.nodes().register_internal(TcpResetNode::new());
+    runtime
         .nodes()
-        .register_internal(TcpResetNode::new(TcpResetNext::nodes(drop, lookup)));
+        .set_node_next(reset, TcpResetNext::Drop, drop)
+        .expect("wire TCP reset drop");
+    runtime
+        .nodes()
+        .set_node_next(reset, TcpResetNext::Lookup, lookup)
+        .expect("wire TCP reset lookup");
     (runtime, reset, lookup_state, drop_state)
 }
 

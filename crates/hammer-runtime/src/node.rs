@@ -14,7 +14,7 @@ use hammer_core::data_plane::{
 use hammer_core::error::DataPlaneError;
 
 use crate::trace::TraceFormatter;
-use crate::{DataPlaneInstructionSet, DataPlaneRuntime};
+use crate::{DataPlaneRuntime, Simd};
 
 pub mod next;
 
@@ -123,8 +123,7 @@ impl NodeRuntimeData {
     #[inline]
     pub fn from_usize(value: usize) -> RuntimeResult<Self> {
         Ok(Self::from_words([
-            u64::try_from(value)
-                .map_err(|_| RuntimeError::invariant("node runtime data overflow"))?,
+            u64::try_from(value).map_err(|_| RuntimeError::NodeRuntimeDataOverflow { value })?,
             0,
             0,
             0,
@@ -138,8 +137,9 @@ impl NodeRuntimeData {
 
     #[inline]
     pub fn usize_word(self, index: usize) -> RuntimeResult<usize> {
-        usize::try_from(self.word(index))
-            .map_err(|_| RuntimeError::invariant("node runtime data word does not fit usize"))
+        let value = self.word(index);
+        usize::try_from(value)
+            .map_err(|_| RuntimeError::NodeRuntimeDataWordOutOfRange { word: index, value })
     }
 }
 
@@ -152,7 +152,7 @@ type NodeFunction = unsafe fn(&DataPlaneRuntime, NodeRuntimeData, &mut BufferFra
 #[doc(hidden)]
 pub struct NodeFunctionRegistration {
     node_name: &'static str,
-    instruction_set: DataPlaneInstructionSet,
+    simd_bytes: usize,
     function: NodeFunction,
 }
 
@@ -160,17 +160,18 @@ impl NodeFunctionRegistration {
     /// Creates a Node Function registration used by `#[node_function]`.
     ///
     /// # Safety
-    /// `function` must have no CPU requirements beyond `instruction_set` and
-    /// must obey the [`NodeFunction`] calling contract.
+    /// `function` must have no CPU requirements beyond `simd` and must obey
+    /// the [`NodeFunction`] calling contract.
     #[doc(hidden)]
-    pub const unsafe fn new(
+    pub const unsafe fn new<const LANES: usize>(
         node_name: &'static str,
-        instruction_set: DataPlaneInstructionSet,
+        _: Simd<u8, LANES>,
         function: unsafe fn(&DataPlaneRuntime, NodeRuntimeData, &mut BufferFrame) -> NodeResult,
     ) -> Self {
+        assert!(matches!(LANES, 1 | 16 | 32 | 64));
         Self {
             node_name,
-            instruction_set,
+            simd_bytes: core::mem::size_of::<Simd<u8, LANES>>(),
             function,
         }
     }
@@ -296,7 +297,7 @@ pub trait InternalNode {
 pub struct NodeEntry {
     pub registration: NodeRegistration,
     pub kind: NodeKind,
-    pub init: fn(&DataPlaneRuntime, usize) -> RuntimeResult<NodeId>,
+    pub init: fn(&DataPlaneRuntime) -> RuntimeResult<NodeId>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -327,6 +328,7 @@ pub struct NodeRuntime {
     inner: Rc<RefCell<NodeRuntimeInner>>,
     queue: Rc<RefCell<ScheduledFrameQueue>>,
     readiness: Rc<NodeReadiness>,
+    topology_owner: bool,
 }
 
 impl Clone for NodeRuntime {
@@ -335,6 +337,7 @@ impl Clone for NodeRuntime {
             inner: Rc::clone(&self.inner),
             queue: Rc::clone(&self.queue),
             readiness: Rc::clone(&self.readiness),
+            topology_owner: self.topology_owner,
         }
     }
 }
@@ -518,6 +521,22 @@ impl NodeErrorCounters {
     pub fn get(&self, code: u16) -> u64 {
         self.counters.get(code as usize).copied().unwrap_or(0)
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = (u16, u64)> + '_ {
+        self.counters
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(code, count)| {
+                if count == 0 {
+                    return None;
+                }
+                Some((
+                    u16::try_from(code).expect("node error code fits u16"),
+                    count,
+                ))
+            })
+    }
 }
 
 struct ScheduledFrame {
@@ -670,23 +689,22 @@ impl NodeRuntimeInner {
         next_names: Option<&[&'static str]>,
     ) -> RuntimeResult<NodeId> {
         if initial_nexts.len() > usize::from(u16::MAX) + 1 {
-            return Err(RuntimeError::invariant(
-                "node next slot cannot be represented as u16",
-            ));
+            return Err(RuntimeError::NodeNextCountOverflow {
+                count: initial_nexts.len(),
+            });
         }
         if let Some(next_names) = next_names {
             if !initial_nexts.is_empty() {
-                return Err(RuntimeError::invariant(
-                    "named next registration cannot also supply resolved initial next nodes",
-                ));
+                return Err(RuntimeError::NamedNextWithResolvedTargets);
             }
             let NodeRegistration::Next { next_count, .. } = registration else {
-                return Err(RuntimeError::invariant(
-                    "named next registration requires a declared next node",
-                ));
+                return Err(RuntimeError::NamedNextRegistrationKindInvalid);
             };
             if next_names.len() != next_count {
-                return Err(RuntimeError::invariant("node named next count mismatch"));
+                return Err(RuntimeError::NamedNextCountMismatch {
+                    declared: next_count,
+                    actual: next_names.len(),
+                });
             }
         } else {
             let mut index = 0usize;
@@ -696,25 +714,29 @@ impl NodeRuntimeInner {
             }
         }
         if matches!(registration, NodeRegistration::Plain) && !initial_nexts.is_empty() {
-            return Err(RuntimeError::invariant(
-                "plain node cannot declare initial next nodes",
-            ));
+            return Err(RuntimeError::PlainNodeHasInitialNexts {
+                count: initial_nexts.len(),
+            });
         }
         if matches!(registration, NodeRegistration::Sibling { .. }) && !initial_nexts.is_empty() {
-            return Err(RuntimeError::invariant(
-                "node sibling cannot declare initial next nodes",
-            ));
+            return Err(RuntimeError::SiblingNodeHasInitialNexts {
+                count: initial_nexts.len(),
+            });
         }
         if next_names.is_none()
+            && !initial_nexts.is_empty()
             && let NodeRegistration::Next { next_count, .. } = registration
             && next_count != initial_nexts.len()
         {
-            return Err(RuntimeError::invariant("node initial next count mismatch"));
+            return Err(RuntimeError::InitialNextCountMismatch {
+                declared: next_count,
+                actual: initial_nexts.len(),
+            });
         }
         if let Some(name) = registration.name()
             && self.declared_nodes.contains_key(name)
         {
-            return Err(RuntimeError::invariant("node name is already registered"));
+            return Err(RuntimeError::NodeNameAlreadyRegistered { name });
         }
 
         match registration {
@@ -734,6 +756,8 @@ impl NodeRuntimeInner {
                     self.next_nodes[id.slot() as usize] = vec![None; next_count];
                     self.pending_next_names[id.slot() as usize] =
                         next_names.iter().copied().map(Some).collect();
+                } else if initial_nexts.is_empty() {
+                    self.next_nodes[id.slot() as usize] = vec![None; next_count];
                 } else {
                     self.next_nodes[id.slot() as usize] = initial_nexts
                         .iter()
@@ -749,18 +773,17 @@ impl NodeRuntimeInner {
                 Ok(id)
             }
             NodeRegistration::Sibling { name, sibling_of } => {
-                let owner = self
-                    .declared_nodes
-                    .get(sibling_of)
-                    .copied()
-                    .ok_or_else(|| {
-                        RuntimeError::invariant("node sibling owner is not registered")
-                    })?;
+                let owner = self.declared_nodes.get(sibling_of).copied().ok_or(
+                    RuntimeError::SiblingOwnerNotRegistered {
+                        node: name,
+                        owner: sibling_of,
+                    },
+                )?;
                 let owner_nexts = self
                     .next_nodes
                     .get(owner.slot() as usize)
                     .cloned()
-                    .ok_or_else(|| RuntimeError::invariant("node id out of bounds"))?;
+                    .ok_or(RuntimeError::NodeNotRegistered { node: owner })?;
                 let id = self.push_function_node(kind, process, runtime_data);
                 self.node_names[id.slot() as usize] = Some(name);
                 self.node_trace_formatters[id.slot() as usize] = trace_formatter;
@@ -791,9 +814,11 @@ impl NodeRuntimeInner {
                 slot += 1;
                 continue;
             }
-            if self.pending_next_names[slot].len() != self.next_nodes[slot].len() {
-                return Err(RuntimeError::invariant("pending next name slot mismatch"));
-            }
+            assert_eq!(
+                self.pending_next_names[slot].len(),
+                self.next_nodes[slot].len(),
+                "pending named-next table must stay aligned with graph next slots"
+            );
             let mut index = 0usize;
             while index < self.pending_next_names[slot].len() {
                 let Some(name) = self.pending_next_names[slot][index] else {
@@ -834,7 +859,7 @@ impl NodeRuntimeInner {
 
     fn validate_node(&self, node: NodeId) -> RuntimeResult<()> {
         if self.nodes.get(node.slot() as usize).is_none() {
-            return Err(RuntimeError::invariant("node id out of bounds"));
+            return Err(RuntimeError::NodeNotRegistered { node });
         }
         Ok(())
     }
@@ -846,7 +871,7 @@ impl NodeRuntimeInner {
             .and_then(|nexts| nexts.get(slot))
             .copied()
             .flatten()
-            .ok_or_else(|| RuntimeError::invariant("node next slot is not registered"))
+            .ok_or(RuntimeError::NodeNextSlotNotRegistered { node, slot })
     }
 
     fn set_node_next_slot(&mut self, node: NodeId, slot: usize, next: NodeId) -> RuntimeResult<()> {
@@ -854,14 +879,38 @@ impl NodeRuntimeInner {
             .next_nodes
             .get(node.slot() as usize)
             .map(Vec::len)
-            .ok_or_else(|| RuntimeError::invariant("node id out of bounds"))?;
+            .ok_or(RuntimeError::NodeNotRegistered { node })?;
         if slot >= next_count {
-            return Err(RuntimeError::invariant("node next slot out of range"));
+            return Err(RuntimeError::NodeNextSlotOutOfRange {
+                node,
+                slot,
+                next_count,
+            });
         }
         let mut group = self.siblings[node.slot() as usize].clone();
         group.push(node);
+        for &sibling in &group {
+            let sibling_slot = sibling.slot() as usize;
+            assert_eq!(
+                self.next_nodes[sibling_slot].len(),
+                next_count,
+                "graph siblings must have identical next counts"
+            );
+            let pending = &self.pending_next_names[sibling_slot];
+            if !pending.is_empty() {
+                assert_eq!(
+                    pending.len(),
+                    next_count,
+                    "pending named-next table must stay aligned with graph next slots"
+                );
+            }
+        }
         for sibling in group {
-            self.next_nodes[sibling.slot() as usize][slot] = Some(next);
+            let sibling_slot = sibling.slot() as usize;
+            if !self.pending_next_names[sibling_slot].is_empty() {
+                self.pending_next_names[sibling_slot][slot] = None;
+            }
+            self.next_nodes[sibling_slot][slot] = Some(next);
         }
         Ok(())
     }
@@ -873,28 +922,41 @@ impl NodeRuntimeInner {
             .iter()
             .position(|target| *target == Some(next))
         {
-            return u16::try_from(slot).map_err(|_| {
-                RuntimeError::invariant("node next slot cannot be represented as u16")
-            });
+            return Ok(u16::try_from(slot)
+                .expect("registered graph next slot must fit its u16 representation"));
         }
         let slot = self
             .next_nodes
             .get(node.slot() as usize)
             .map(Vec::len)
-            .ok_or_else(|| RuntimeError::invariant("node id out of bounds"))?;
-        let slot = u16::try_from(slot)
-            .map_err(|_| RuntimeError::invariant("node next slot cannot be represented as u16"))?;
+            .ok_or(RuntimeError::NodeNotRegistered { node })?;
+        let slot =
+            u16::try_from(slot).map_err(|_| RuntimeError::NodeNextCountOverflow { count: slot })?;
         let mut group = self.siblings[node.slot() as usize].clone();
         group.push(node);
-        for sibling in group {
-            let sibling_nexts = self
-                .next_nodes
-                .get_mut(sibling.slot() as usize)
-                .ok_or_else(|| RuntimeError::invariant("node id out of bounds"))?;
-            if sibling_nexts.len() != usize::from(slot) {
-                return Err(RuntimeError::invariant("node sibling next count mismatch"));
+        for &sibling in &group {
+            let sibling_slot = sibling.slot() as usize;
+            let sibling_nexts = &self.next_nodes[sibling_slot];
+            assert_eq!(
+                sibling_nexts.len(),
+                usize::from(slot),
+                "graph siblings must have identical next counts"
+            );
+            let pending = &self.pending_next_names[sibling_slot];
+            if !pending.is_empty() {
+                assert_eq!(
+                    pending.len(),
+                    usize::from(slot),
+                    "pending named-next table must stay aligned with graph next slots"
+                );
             }
-            sibling_nexts.push(Some(next));
+        }
+        for sibling in group {
+            let sibling_slot = sibling.slot() as usize;
+            if !self.pending_next_names[sibling_slot].is_empty() {
+                self.pending_next_names[sibling_slot].push(None);
+            }
+            self.next_nodes[sibling_slot].push(Some(next));
         }
         Ok(slot)
     }
@@ -950,8 +1012,76 @@ mod local_next_slot_tests {
         let err = inner
             .add_node_next_slot(NodeId::new(0), NodeId::new(2))
             .expect_err("slot past u16 must fail");
-        assert!(err.to_string().contains("cannot be represented as u16"));
+        assert!(matches!(
+            err,
+            RuntimeError::NodeNextCountOverflow { count }
+                if count == usize::from(u16::MAX) + 1
+        ));
         assert_eq!(inner.next_nodes[0].len(), before);
+    }
+
+    #[test]
+    fn dynamic_next_added_before_named_resolution_keeps_slots_aligned() {
+        let process: NodeProcessFn = |_, _, _| NodeResult::drop();
+        let mut inner = Rc::try_unwrap(NodeRuntime::default().inner)
+            .ok()
+            .expect("default node runtime has one owner")
+            .into_inner();
+        let source = inner
+            .register_function_declared(
+                NodeKind::Internal,
+                process,
+                NodeRuntimeData::empty(),
+                NodeRegistration::next("source", 1),
+                &[],
+                None,
+                None,
+                Some(&["target"]),
+            )
+            .expect("register named-next source");
+        let target = inner
+            .register_function_declared(
+                NodeKind::Internal,
+                process,
+                NodeRuntimeData::empty(),
+                NodeRegistration::next("target", 0),
+                &[],
+                None,
+                None,
+                Some(&[]),
+            )
+            .expect("register named target");
+        let dynamic = inner
+            .register_function_declared(
+                NodeKind::Internal,
+                process,
+                NodeRuntimeData::empty(),
+                NodeRegistration::next("dynamic", 0),
+                &[],
+                None,
+                None,
+                Some(&[]),
+            )
+            .expect("register dynamic target");
+
+        assert_eq!(
+            inner
+                .add_node_next_slot(source, dynamic)
+                .expect("append dynamic next"),
+            1
+        );
+        assert_eq!(inner.pending_next_names[source.slot() as usize].len(), 2);
+        inner
+            .resolve_named_next_nodes()
+            .expect("resolve named nexts");
+        assert_eq!(
+            inner.node_next_slot(source, 0).expect("resolved target"),
+            target
+        );
+        assert_eq!(
+            inner.node_next_slot(source, 1).expect("dynamic target"),
+            dynamic
+        );
     }
 }
 
@@ -980,6 +1110,7 @@ impl Default for NodeRuntime {
                 DEFAULT_SCHEDULED_FRAME_QUEUE_CAPACITY,
             ))),
             readiness: Rc::new(NodeReadiness::default()),
+            topology_owner: true,
         }
     }
 }
@@ -1000,42 +1131,38 @@ impl From<NodeRuntimeInner> for NodeRuntime {
                 queue_capacity,
             ))),
             readiness: Rc::new(NodeReadiness::default()),
+            topology_owner: false,
         }
     }
 }
 
 fn preferred_node_function<'registration>(
     node_name: &str,
-    instruction_set: DataPlaneInstructionSet,
+    max_simd_bytes: usize,
     registrations: &'registration [NodeFunctionRegistration],
 ) -> RuntimeResult<Option<&'registration NodeFunctionRegistration>> {
-    let mut seen = [false; DataPlaneInstructionSet::VARIANT_COUNT];
     let mut selected = None;
-    let mut selected_priority = 0;
 
-    for registration in registrations
-        .iter()
-        .filter(|registration| registration.node_name == node_name)
-    {
-        let slot = registration.instruction_set.slot();
-        if seen[slot] {
-            return Err(RuntimeError::invariant(format!(
-                "duplicate Node Function for `{node_name}` and {:?}",
-                registration.instruction_set
-            )));
-        }
-        seen[slot] = true;
-
-        if !registration.instruction_set.is_supported() {
+    for (offset, registration) in registrations.iter().enumerate() {
+        if registration.node_name != node_name {
             continue;
         }
-        let Some(priority) = instruction_set.candidate_priority(registration.instruction_set)
-        else {
+        if registrations[..offset].iter().any(|previous| {
+            previous.node_name == node_name && previous.simd_bytes == registration.simd_bytes
+        }) {
+            return Err(DataPlaneError::DuplicateNodeFunction {
+                node: registration.node_name,
+                simd_bytes: registration.simd_bytes,
+            }
+            .into());
+        }
+        if registration.simd_bytes > max_simd_bytes {
             continue;
-        };
-        if selected.is_none() || priority > selected_priority {
+        }
+        if selected.is_none_or(|current: &NodeFunctionRegistration| {
+            registration.simd_bytes > current.simd_bytes
+        }) {
             selected = Some(registration);
-            selected_priority = priority;
         }
     }
 
@@ -1091,23 +1218,34 @@ mod node_function_tests {
     }
 
     #[test]
-    fn duplicate_instruction_set_is_rejected() {
+    fn duplicate_simd_width_is_rejected() {
         let duplicate = NodeFunctionRegistration {
             node_name: "fixture",
-            instruction_set: DataPlaneInstructionSet::Scalar,
+            simd_bytes: 1,
             function: missing_node_process,
         };
 
-        let error = match preferred_node_function(
-            "fixture",
-            DataPlaneInstructionSet::Scalar,
-            &[duplicate, duplicate],
-        ) {
+        let error = match preferred_node_function("fixture", 1, &[duplicate, duplicate]) {
             Err(error) => error,
             Ok(_) => panic!("duplicate Node Function must fail"),
         };
 
-        assert!(error.to_string().contains("duplicate Node Function"));
+        assert!(error.to_string().contains("duplicate node function"));
+    }
+
+    #[test]
+    fn node_function_selects_the_widest_candidate_within_runtime_capacity() {
+        let candidates = [1, 16, 32, 64].map(|simd_bytes| NodeFunctionRegistration {
+            node_name: "fixture",
+            simd_bytes,
+            function: missing_node_process,
+        });
+
+        let selected = preferred_node_function("fixture", 32, &candidates)
+            .expect("select Node Function")
+            .expect("matching Node Function");
+
+        assert_eq!(selected.simd_bytes, 32);
     }
 
     #[test]
@@ -1201,15 +1339,54 @@ mod node_function_tests {
             target
         );
     }
+
+    #[test]
+    fn declared_next_slots_can_be_wired_after_registration() {
+        let runtime = NodeRuntime::default();
+        let target = runtime
+            .try_register_internal_with_next_names(
+                NamedNextProbe {
+                    name: "target",
+                    next_count: 0,
+                },
+                &[],
+            )
+            .expect("register target");
+        let source = runtime
+            .try_register_internal(NamedNextProbe {
+                name: "source",
+                next_count: 1,
+            })
+            .expect("register source");
+
+        assert!(runtime.node_next_slot(source, 0).is_err());
+        runtime
+            .set_node_next_slot(source, 0, target)
+            .expect("wire declared next slot");
+        assert_eq!(
+            runtime.node_next_slot(source, 0).expect("resolved next"),
+            target
+        );
+    }
 }
 
 impl NodeRuntime {
+    #[inline]
+    fn ensure_topology_owner(&self) -> RuntimeResult<()> {
+        if self.topology_owner {
+            Ok(())
+        } else {
+            Err(RuntimeError::GraphTopologyMutationFromWorker)
+        }
+    }
+
     /// Drain scheduled frames and clear topology so `init_graph` can renumber.
     ///
     /// VPP analogue: barrier-held main-thread graph mutation before workers
     /// install a clone of the updated graph.
     /// Old `NodeId` values become unreachable after this returns.
-    pub fn detach_graph_for_rebuild(&self) {
+    pub(crate) fn detach_graph_for_rebuild(&self) -> RuntimeResult<()> {
+        self.ensure_topology_owner()?;
         {
             let mut queue = self.queue.borrow_mut();
             queue.drain_all();
@@ -1237,6 +1414,7 @@ impl NodeRuntime {
             sibling_owners: Vec::new(),
             siblings: Vec::new(),
         };
+        Ok(())
     }
 
     pub(crate) fn snapshot(&self) -> NodeRuntimeInner {
@@ -1261,14 +1439,14 @@ impl NodeRuntime {
     pub(crate) fn install_node_function(
         &self,
         node: NodeId,
-        instruction_set: DataPlaneInstructionSet,
+        simd_bytes: usize,
         registrations: &[NodeFunctionRegistration],
     ) -> RuntimeResult<()> {
+        self.ensure_topology_owner()?;
         let Some(node_name) = self.node_name(node)? else {
             return Ok(());
         };
-        let Some(registration) =
-            preferred_node_function(node_name, instruction_set, registrations)?
+        let Some(registration) = preferred_node_function(node_name, simd_bytes, registrations)?
         else {
             return Ok(());
         };
@@ -1356,10 +1534,9 @@ impl NodeRuntime {
     /// type being known at the call site, mirroring VPP's `vlib_node_t`
     /// registration where every node is stored as a type-erased record.
     ///
-    /// The descriptor's `initial_nexts` must satisfy the contract enforced by
-    /// `register_descriptor`: for `NodeRegistration::Next { next_count, .. }`
-    /// its length must equal `next_count` (use placeholder `NodeId`s when edges
-    /// are resolved later by name via `set_node_next_slot`).
+    /// For `NodeRegistration::Next`, `initial_nexts` may either contain every
+    /// resolved target or be empty while the topology owner wires the declared
+    /// slots through `set_node_next_slot` before dispatch.
     #[inline]
     pub fn try_register_descriptor(
         &self,
@@ -1390,9 +1567,10 @@ impl NodeRuntime {
         handle: NodeHandle,
         descriptor: NodeDescriptor<'_>,
     ) -> RuntimeResult<NodeId> {
+        self.ensure_topology_owner()?;
         let mut inner = self.inner.borrow_mut();
         if inner.handles.contains_key(&handle) {
-            return Err(RuntimeError::invariant("node handle already registered"));
+            return Err(RuntimeError::NodeHandleAlreadyRegistered { handle });
         }
         let id = inner.register_function_declared(
             kind,
@@ -1416,6 +1594,7 @@ impl NodeRuntime {
         initial_nexts: &[NodeId],
         trace_formatter: Option<TraceFormatter>,
     ) -> RuntimeResult<NodeId> {
+        self.ensure_topology_owner()?;
         let mut inner = self.inner.borrow_mut();
         inner.register_function_declared(
             kind,
@@ -1439,6 +1618,7 @@ impl NodeRuntime {
     where
         N: InternalNode + Node,
     {
+        self.ensure_topology_owner()?;
         let mut inner = self.inner.borrow_mut();
         inner.register_function_declared(
             NodeKind::Internal,
@@ -1462,6 +1642,7 @@ impl NodeRuntime {
     where
         N: DriverNode + Node,
     {
+        self.ensure_topology_owner()?;
         let mut inner = self.inner.borrow_mut();
         inner.register_function_declared(
             NodeKind::Driver,
@@ -1478,6 +1659,7 @@ impl NodeRuntime {
     /// Resolve pending next-node names into `NodeId`s after all graph nodes
     /// are registered (VPP `vlib_node_main_init` name-resolution pass).
     pub fn resolve_named_next_nodes(&self) -> RuntimeResult<()> {
+        self.ensure_topology_owner()?;
         self.inner.borrow_mut().resolve_named_next_nodes()
     }
 
@@ -1488,7 +1670,7 @@ impl NodeRuntime {
             .handles
             .get(&handle)
             .copied()
-            .ok_or_else(|| RuntimeError::invariant("node handle is not registered"))
+            .ok_or(RuntimeError::NodeHandleNotRegistered { handle })
     }
 
     pub fn node_runtime_stats_snapshot(&self) -> Vec<NodeRuntimeStatsRow> {
@@ -1541,7 +1723,7 @@ impl NodeRuntime {
             if node.kind == NodeKind::Driver && inner.node_states[slot] == NodeState::Polling {
                 let id = u32::try_from(slot)
                     .map(NodeId::new)
-                    .map_err(|_| RuntimeError::invariant("node id overflow"))?;
+                    .map_err(|_| RuntimeError::NodeIdOverflow { slot })?;
                 nodes.push(id);
             }
             slot += 1;
@@ -1569,12 +1751,12 @@ impl NodeRuntime {
         Ok(())
     }
 
-    pub(crate) fn mark_interrupt_pending(&self, node: NodeId) -> RuntimeResult<bool> {
+    pub fn mark_interrupt_pending(&self, node: NodeId) -> RuntimeResult<bool> {
         let mut inner = self.inner.borrow_mut();
         inner.validate_node(node)?;
         let slot = node.slot() as usize;
         if inner.nodes[slot].kind != NodeKind::Driver {
-            return Err(RuntimeError::invariant("node is not a driver node"));
+            return Err(RuntimeError::NodeNotDriver { node });
         }
         match inner.node_states[slot] {
             NodeState::Disabled | NodeState::Polling => Ok(false),
@@ -1587,6 +1769,16 @@ impl NodeRuntime {
                 }
             }
         }
+    }
+
+    pub(crate) fn next_interrupt_pending(&self, start: usize) -> Option<NodeId> {
+        self.inner
+            .borrow()
+            .interrupt_pending
+            .iter()
+            .enumerate()
+            .skip(start)
+            .find_map(|(slot, pending)| pending.then_some(NodeId::new(slot as u32)))
     }
 
     pub(crate) fn clear_interrupt_pending(&self, node: NodeId) -> RuntimeResult<()> {
@@ -1634,7 +1826,7 @@ impl NodeRuntime {
         inner
             .error_counters
             .get_mut(node.slot() as usize)
-            .ok_or_else(|| RuntimeError::invariant("node id out of bounds"))?
+            .ok_or(RuntimeError::NodeNotRegistered { node })?
             .increment(code);
         let key = NodeRuntimeInner::error_key(node, code);
         if let Some(encoded) = inner.error_ids.get(&key).copied() {
@@ -1645,7 +1837,7 @@ impl NodeRuntime {
             .len()
             .checked_add(1)
             .and_then(|value| u16::try_from(value).ok())
-            .ok_or_else(|| RuntimeError::invariant("node error slot overflow"))?;
+            .ok_or(RuntimeError::NodeErrorSlotOverflow)?;
         inner.error_slots.push(BufferNodeError::new(node, code));
         inner.error_ids.insert(key, next);
         Ok(next)
@@ -1658,7 +1850,7 @@ impl NodeRuntime {
             .borrow()
             .error_counters
             .get(node.slot() as usize)
-            .ok_or_else(|| RuntimeError::invariant("node id out of bounds"))?
+            .ok_or(RuntimeError::NodeNotRegistered { node })?
             .get(code))
     }
 
@@ -1696,6 +1888,7 @@ impl NodeRuntime {
     }
 
     pub fn set_node_next_slot(&self, node: NodeId, slot: usize, next: NodeId) -> RuntimeResult<()> {
+        self.ensure_topology_owner()?;
         let mut inner = self.inner.borrow_mut();
         inner.validate_node(node)?;
         inner.validate_node(next)?;
@@ -1703,6 +1896,7 @@ impl NodeRuntime {
     }
 
     pub fn add_node_next_slot(&self, node: NodeId, next: NodeId) -> RuntimeResult<u16> {
+        self.ensure_topology_owner()?;
         let mut inner = self.inner.borrow_mut();
         inner.add_node_next_slot(node, next)
     }
@@ -1714,7 +1908,7 @@ impl NodeRuntime {
             .siblings
             .get(node.slot() as usize)
             .cloned()
-            .ok_or_else(|| RuntimeError::invariant("node id out of bounds"))
+            .ok_or(RuntimeError::NodeNotRegistered { node })
     }
 
     pub(crate) fn schedule_frame(
@@ -1781,7 +1975,7 @@ impl NodeRuntime {
         let stats = inner
             .runtime_stats
             .get_mut(node.slot() as usize)
-            .ok_or_else(|| RuntimeError::invariant("node id out of bounds"))?;
+            .ok_or(RuntimeError::NodeNotRegistered { node })?;
         stats.calls = stats.calls.saturating_add(1);
         stats.vectors = stats.vectors.saturating_add(vectors as u64);
         stats.total_elapsed_ns = stats.total_elapsed_ns.saturating_add(elapsed_ns);
@@ -1799,7 +1993,7 @@ impl NodeRuntime {
             .nodes
             .get(node.slot() as usize)
             .copied()
-            .ok_or_else(|| RuntimeError::invariant("node id out of bounds"))
+            .ok_or(RuntimeError::NodeNotRegistered { node })
     }
 
     fn pop_scheduled(&self) -> Option<ScheduledFrame> {

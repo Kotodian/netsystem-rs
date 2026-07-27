@@ -2,8 +2,9 @@
 
 use abi_stable::{
     sabi_trait::TD_Opaque,
-    std_types::{RSlice, RSliceMut},
+    std_types::{RBoxError, RErr, ROk, RResult, RSlice, RSliceMut},
 };
+use hammer_core::data_plane::NodeId;
 use hammer_runtime::IpOutput;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -33,6 +34,7 @@ hammer_component_macros::declare_plugin!(
         ip::local::__IP_GRAPH_NODE_IP_LOCAL_NODE,
         ip::local::__IP_GRAPH_NODE_IP_RECEIVE_NODE,
         lookup::__SERVICE_GRAPH_NODE_IP_LOOKUP_NODE,
+        lookup::__SERVICE_GRAPH_NODE_ADJACENCY_REWRITE_NODE,
     ],
     node_functions = [],
     process_nodes = [ip::reassembly::__PROCESS_NODE_IP_REASSEMBLY_EXPIRE_WALK],
@@ -47,6 +49,13 @@ pub mod protocol;
 struct IpOutputService;
 
 impl IpOutput for IpOutputService {
+    fn register_protocol(&self, protocol: u8, node: NodeId) -> RResult<(), RBoxError> {
+        match ip::local::register_protocol(protocol, node) {
+            Ok(()) => ROk(()),
+            Err(error) => RErr(RBoxError::new(error)),
+        }
+    }
+
     fn write_ipv4_header(
         &self,
         mut output: RSliceMut<'_, u8>,
@@ -110,8 +119,8 @@ pub use ip::{
     pack_fragment_owner_value, unpack_fragment_owner_value,
 };
 pub use lookup::{
-    AdjacencyRewriteNode, AdjacencyRewriteNodeError, AdjacencyRewriteTrace, IpLookupControlPlane,
-    IpLookupNext, IpLookupNode, IpLookupTrace,
+    AdjacencyRewriteNext, AdjacencyRewriteNode, AdjacencyRewriteNodeError, AdjacencyRewriteTrace,
+    IpLookupControlPlane, IpLookupNext, IpLookupNode, IpLookupTrace,
 };
 pub fn reset_ip_main_for_test() {
     lookup::reset_for_test();

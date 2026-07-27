@@ -19,3 +19,4 @@ linkme = { workspace = true }
 arc-swap = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
+thiserror = { workspace = true }

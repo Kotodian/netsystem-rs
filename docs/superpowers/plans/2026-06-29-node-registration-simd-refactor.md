@@ -881,18 +881,18 @@ git commit -m "hammer-adapter(Feat): SIMD-accelerated index compaction + Octo ba
 ```rust
 fn drop_node_process(
     runtime: &DataPlaneRuntime,
-    _data: hammer_adapter::node::NodeRuntimeData,
+    _: hammer_adapter::node::NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> CoreResult<NodeResult> {
     let dropped = frame.pending_len();
-    let mut first_error = None;
+    let mut buffer_release_error = None;
     let result = hammer_adapter::vlib_process_frame!(runtime, frame, |index, next_frames| {
         // no next node — drop: free the index
         match runtime.free_index(index) {
             Ok(()) | Err(CoreError::InvalidBufferIndex { .. }) => {}
-            Err(e) => {
-                if first_error.is_none() {
-                    first_error = Some(e);
+            Err(error) => {
+                if buffer_release_error.is_none() {
+                    buffer_release_error = Some(error);
                 }
             }
         }
@@ -900,7 +900,9 @@ fn drop_node_process(
         Err(CoreError::internal("placeholder for full trace logic"))
     })?;
     // Report dropped count (existing logic)
-    let _ = first_error; // handle error
+    if let Some(error) = buffer_release_error {
+        return Err(error);
+    }
     result
 }
 ```

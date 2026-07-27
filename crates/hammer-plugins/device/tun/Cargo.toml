@@ -20,3 +20,4 @@ serde = { workspace = true }
 toml = { workspace = true }
 linkme = { workspace = true }
 tracing = { workspace = true }
+thiserror = { workspace = true }

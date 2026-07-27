@@ -18,11 +18,12 @@ const KEEPALIVE_PROBE_LIMIT: u8 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
-pub enum CongestionController {
+pub enum CongestionAlgorithm {
     Bbr,
+    Cubic,
 }
 
-impl Default for CongestionController {
+impl Default for CongestionAlgorithm {
     fn default() -> Self {
         Self::Bbr
     }
@@ -34,7 +35,7 @@ impl Default for CongestionController {
 pub struct TcpPluginConfig {
     pub mss: usize,
     pub receive_window: u32,
-    pub congestion: CongestionController,
+    pub congestion: CongestionAlgorithm,
     pub nagle: bool,
     #[serde(with = "humantime_serde")]
     pub time_wait: Duration,
@@ -52,7 +53,7 @@ impl Default for TcpPluginConfig {
         Self {
             mss: TCP_MSS,
             receive_window: TCP_WINDOW,
-            congestion: CongestionController::Bbr,
+            congestion: CongestionAlgorithm::Bbr,
             nagle: true,
             time_wait: TCP_TIME_WAIT,
             paws_idle: TCP_PAWS_IDLE,
@@ -282,7 +283,7 @@ address = "10.66.77.1:7300"
 
         assert_eq!(tcp.mss, 1200);
         assert_eq!(tcp.receive_window, 32768);
-        assert_eq!(tcp.congestion, CongestionController::Bbr);
+        assert_eq!(tcp.congestion, CongestionAlgorithm::Bbr);
         assert!(!tcp.nagle);
         assert!(!tcp.pmtu.enabled);
         assert_eq!(tcp.time_wait, Duration::from_secs(30));
@@ -290,6 +291,13 @@ address = "10.66.77.1:7300"
         assert_eq!(tcp.retransmit.initial, Duration::from_millis(100));
         assert_eq!(tcp.keepalive.probe_limit, 4);
         assert_eq!(tcp.listen.len(), 1);
+    }
+
+    #[test]
+    fn tcp_plugin_parses_cubic_congestion() {
+        let tcp = parse_tcp("congestion = \"cubic\"");
+
+        assert_eq!(tcp.congestion, CongestionAlgorithm::Cubic);
     }
 
     #[test]

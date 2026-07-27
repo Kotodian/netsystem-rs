@@ -5,7 +5,7 @@ fn svm_memory_stays_outside_main_heap() {
     hammer_infra::main_heap::init(256 << 20).expect("initialize fixed main heap");
 
     let svm_region = SvmRegion::with_size(1 << 20);
-    let svm_offset = svm_region.alloc(512, 64);
+    let svm_offset = svm_region.alloc(512, 64).expect("SVM allocation");
     assert_ne!(svm_offset, u64::MAX);
     // SAFETY: a successful SVM allocation returns an offset inside this live
     // mapping, and the pointer is used only for range inspection.

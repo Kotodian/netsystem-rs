@@ -1,3 +1,5 @@
+use core::hint::spin_loop;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hammer_core::data_plane::{
@@ -7,9 +9,9 @@ use hammer_runtime::RuntimeRegistry;
 use hammer_runtime::config::Worker;
 use hammer_runtime::start_workers::start_workers;
 use hammer_runtime::{
-    DataPlaneRuntime, Engine, EnginePool, NodeDescriptor, NodeResult, NodeRuntimeData,
+    DataPlaneRuntime, Engine, EnginePool, InternalNode, Node, NodeDescriptor, NodeProcessFn,
+    NodeResult, NodeRuntimeData, RuntimeError, RuntimeResult,
 };
-use hammer_runtime::{RuntimeError, RuntimeResult};
 
 hammer_runtime::__declare_registration_image!(
     init_functions = [];
@@ -26,40 +28,148 @@ hammer_runtime::__declare_registration_image!(
 const READY: usize = 0;
 const INIT_FAILURE: usize = 1;
 const PANIC: usize = 2;
+const EARLY_EXIT: usize = 3;
+const STARTUP_NODE_HANDLE: NodeHandle = NodeHandle::new(41);
+
+/// Both tests drive worker startup through the shared CASE/INITIALIZED/
+/// DISPATCHED statics; the parallel test harness must not interleave them.
+static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serialize_test() -> std::sync::MutexGuard<'static, ()> {
+    TEST_SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 static CASE: AtomicUsize = AtomicUsize::new(READY);
 static INITIALIZED: AtomicUsize = AtomicUsize::new(0);
+static DISPATCHED: AtomicUsize = AtomicUsize::new(0);
+static ABORT_OBSERVED: AtomicUsize = AtomicUsize::new(0);
 
 fn startup_node_process(
     _: &DataPlaneRuntime,
-    _: NodeRuntimeData,
+    data: NodeRuntimeData,
     _: &mut BufferFrame,
 ) -> NodeResult {
+    let worker = usize::try_from(data.word(0) - 1).expect("worker runtime data fits usize");
+    DISPATCHED.fetch_or(1 << worker, Ordering::Release);
     NodeResult::drop()
+}
+
+struct StartupNode {
+    next: [NodeId; 1],
+}
+
+impl Node for StartupNode {
+    fn process(&mut self, _: &DataPlaneRuntime, _: &mut BufferFrame) -> NodeResult {
+        NodeResult::drop()
+    }
+
+    fn node_process(&self) -> NodeProcessFn {
+        startup_node_process
+    }
+
+    fn node_registration(&self) -> NodeRegistration {
+        NodeRegistration::next("startup-node", 1)
+    }
+
+    fn node_initial_nexts(&self) -> &[NodeId] {
+        &self.next
+    }
+}
+
+impl InternalNode for StartupNode {
+    fn node_registration(&self) -> NodeRegistration {
+        NodeRegistration::next("startup-node", 1)
+    }
+
+    fn node_initial_nexts(&self) -> &[NodeId] {
+        &self.next
+    }
 }
 
 #[hammer_component_macros::worker_init_function(name = "verify_worker_startup_contract")]
 fn verify_worker_startup_contract(engine: &mut Engine) -> RuntimeResult<()> {
     let worker = engine.data_worker_id()?;
+    let sink = engine
+        .runtime
+        .node_by_name("startup-sink")
+        .expect("worker clone contains startup-sink");
     let node = engine
         .runtime
         .node_by_name("startup-node")
-        .ok_or_else(|| RuntimeError::invariant("worker clone is missing startup-node"))?;
-    assert_eq!(node, NodeId::new(0));
+        .expect("worker clone contains startup-node");
+    let sibling = engine
+        .runtime
+        .node_by_name("startup-sibling")
+        .expect("worker clone contains startup-sibling");
+
+    assert_eq!(sink, NodeId::new(0));
+    assert_eq!(node, NodeId::new(1));
+    assert_eq!(sibling, NodeId::new(2));
+    assert_eq!(engine.runtime.nodes().node_next_slot(node, 0)?, sink);
+    assert_eq!(engine.runtime.nodes().node_next_slot(sibling, 0)?, sink);
+    assert_eq!(engine.runtime.nodes().node_siblings(node)?, vec![sibling]);
+    assert_eq!(
+        engine.runtime.nodes().node_state(node)?,
+        NodeState::Disabled
+    );
+    assert_eq!(engine.runtime.buffers().frame_slots(), 5);
+
+    let topology_error = engine
+        .runtime
+        .nodes()
+        .try_register_descriptor(
+            NodeKind::Internal,
+            NodeDescriptor::new(
+                startup_node_process,
+                NodeRuntimeData::empty(),
+                NodeRegistration::next("worker-added-node", 0),
+                &[],
+                None,
+            ),
+        )
+        .expect_err("worker init must not mutate graph topology");
+    assert!(matches!(
+        &topology_error,
+        RuntimeError::GraphTopologyMutationFromWorker
+    ));
+
+    engine.set_worker_node_runtime_data(
+        node,
+        NodeRuntimeData::from_words([
+            u64::try_from(worker.slot()).expect("worker slot fits u64") + 1,
+            0,
+            0,
+            0,
+        ]),
+    )?;
     engine
         .runtime
         .nodes()
         .set_node_state(node, NodeState::Polling)?;
+    let index = engine.runtime.alloc_index_with_bytes(&[0; 128])?;
     engine
         .runtime
-        .handoff_indices(worker, NodeHandle::new(0), std::iter::empty())?;
+        .handoff_indices(worker, STARTUP_NODE_HANDLE, std::iter::once(index))?;
+    assert_eq!(engine.runtime.run_ready_nodes()?, 1);
 
-    match CASE.load(Ordering::Acquire) {
-        INIT_FAILURE if worker.slot() == 1 => {
-            return Err(RuntimeError::invariant("injected worker initialization failure").into());
+    let case = CASE.load(Ordering::Acquire);
+    if case != READY && worker.slot() == 0 {
+        while !engine.main_loop_exit_now.load(Ordering::Acquire) {
+            spin_loop();
         }
-        PANIC if worker.slot() == 1 => panic!("injected worker initialization panic"),
-        _ => {}
+        ABORT_OBSERVED.fetch_or(1, Ordering::Release);
+    } else {
+        match case {
+            INIT_FAILURE if worker.slot() == 1 => return Err(topology_error),
+            PANIC if worker.slot() == 1 => panic!("injected worker initialization panic"),
+            EARLY_EXIT if worker.slot() == 1 => {
+                engine.main_loop_exit_now.store(true, Ordering::Release);
+                return Ok(());
+            }
+            _ => {}
+        }
     }
 
     INITIALIZED.fetch_or(1 << worker.slot(), Ordering::Release);
@@ -69,31 +179,65 @@ fn verify_worker_startup_contract(engine: &mut Engine) -> RuntimeResult<()> {
 fn engine_pool() -> EnginePool {
     let mut worker = Worker::default();
     worker.count = 2;
+    worker.buffer.slot_bytes = 128;
     worker.buffer.slots_per_numa = 64;
-    worker.instruction_set = "scalar".to_owned();
-    let runtime = worker.create_runtime().expect("configured runtime");
-    let node = runtime
+    worker.buffer.frame_pool_size = 5;
+    worker.buffer.page_size = Some(hammer_infra::PageSize::Default);
+    let mut engine =
+        Engine::new_configured(RuntimeRegistry::new(), worker).expect("configured main engine");
+    let sink = engine
+        .runtime
         .nodes()
         .try_register_descriptor(
             NodeKind::Internal,
             NodeDescriptor::new(
                 startup_node_process,
                 NodeRuntimeData::empty(),
-                NodeRegistration::next("startup-node", 0),
+                NodeRegistration::next("startup-sink", 0),
                 &[],
                 None,
             ),
         )
-        .expect("canonical startup graph");
-    runtime
+        .expect("canonical startup sink");
+    let node = engine
+        .runtime
+        .nodes()
+        .register_internal_with_handle(STARTUP_NODE_HANDLE, StartupNode { next: [sink] })
+        .expect("canonical startup node");
+    let sibling = engine
+        .runtime
+        .nodes()
+        .try_register_descriptor(
+            NodeKind::Internal,
+            NodeDescriptor::new(
+                startup_node_process,
+                NodeRuntimeData::empty(),
+                NodeRegistration::sibling_of("startup-sibling", "startup-node"),
+                &[],
+                None,
+            ),
+        )
+        .expect("canonical startup sibling");
+    assert_eq!(sink, NodeId::new(0));
+    assert_eq!(node, NodeId::new(1));
+    assert_eq!(sibling, NodeId::new(2));
+    engine
+        .runtime
         .nodes()
         .set_node_state(node, NodeState::Disabled)
         .expect("canonical startup node state");
-    let mut engine = Engine::new(runtime, RuntimeRegistry::new());
+
     engine
         .plugin_main_mut()
         .register_builtin_image(&__HAMMER_REGISTRATION_IMAGE);
     EnginePool::new(engine)
+}
+
+fn reset(case: usize) {
+    CASE.store(case, Ordering::Release);
+    INITIALIZED.store(0, Ordering::Release);
+    DISPATCHED.store(0, Ordering::Release);
+    ABORT_OBSERVED.store(0, Ordering::Release);
 }
 
 fn stop_workers(pool: &mut EnginePool) {
@@ -103,41 +247,83 @@ fn stop_workers(pool: &mut EnginePool) {
 
 #[test]
 fn data_worker_startup_is_transactional() {
-    CASE.store(READY, Ordering::Release);
-    INITIALIZED.store(0, Ordering::Release);
+    let _serial = serialize_test();
+    reset(READY);
     let mut pool = engine_pool();
     start_workers(pool.main_engine_mut()).expect("transactional worker startup");
     assert_eq!(INITIALIZED.load(Ordering::Acquire), 0b11);
+    assert_eq!(DISPATCHED.load(Ordering::Acquire), 0b11);
+    let worker_stats = pool
+        .main_engine()
+        .worker_runtime_stats_snapshot()
+        .expect("snapshot live worker runtime state");
+    assert_eq!(worker_stats.len(), 2);
+    assert!(worker_stats.iter().all(|worker| {
+        worker
+            .nodes
+            .iter()
+            .any(|node| node.node_name == Some("startup-node") && node.calls == 1)
+    }));
     assert_eq!(
         pool.main_engine()
             .runtime
             .nodes()
-            .node_state(NodeId::new(0))
+            .node_state(NodeId::new(1))
             .expect("main node state"),
         NodeState::Disabled
     );
     stop_workers(&mut pool);
 
-    CASE.store(INIT_FAILURE, Ordering::Release);
-    INITIALIZED.store(0, Ordering::Release);
+    reset(INIT_FAILURE);
     let mut pool = engine_pool();
     let error = start_workers(pool.main_engine_mut()).expect_err("worker init must fail startup");
-    assert!(
-        error
-            .to_string()
-            .contains("injected worker initialization failure")
-    );
+    assert!(matches!(
+        error,
+        RuntimeError::WorkerExitedBeforeStartupBarrier { phase: "main-loop" }
+    ));
     assert_eq!(INITIALIZED.load(Ordering::Acquire), 0b01);
+    assert_eq!(ABORT_OBSERVED.load(Ordering::Acquire), 1);
     stop_workers(&mut pool);
 
-    CASE.store(PANIC, Ordering::Release);
-    INITIALIZED.store(0, Ordering::Release);
+    reset(PANIC);
     let mut pool = engine_pool();
-    let error = start_workers(pool.main_engine_mut()).expect_err("worker panic must fail startup");
-    assert!(
-        error
-            .to_string()
-            .contains("init function `verify_worker_startup_contract` panicked")
+    let panic = catch_unwind(AssertUnwindSafe(|| start_workers(pool.main_engine_mut())))
+        .expect_err("worker panic must unwind startup");
+    assert_eq!(
+        panic.downcast_ref::<&str>().copied(),
+        Some("injected worker initialization panic")
+    );
+    assert_eq!(ABORT_OBSERVED.load(Ordering::Acquire), 1);
+    stop_workers(&mut pool);
+
+    reset(EARLY_EXIT);
+    let mut pool = engine_pool();
+    let error = start_workers(pool.main_engine_mut()).expect_err("early exit must fail startup");
+    assert!(matches!(
+        error,
+        RuntimeError::WorkerExitedBeforeStartupBarrier { phase: "main-loop" }
+    ));
+    assert_eq!(ABORT_OBSERVED.load(Ordering::Acquire), 1);
+    stop_workers(&mut pool);
+}
+
+#[test]
+fn runtime_main_loop_enter_catalog_starts_workers() {
+    let _serial = serialize_test();
+    reset(READY);
+    let mut pool = engine_pool();
+
+    hammer_runtime::init::run_main_loop_enter(pool.main_engine_mut())
+        .expect("run runtime main-loop-enter catalog");
+
+    assert_eq!(INITIALIZED.load(Ordering::Acquire), 0b11);
+    assert_eq!(DISPATCHED.load(Ordering::Acquire), 0b11);
+    assert_eq!(
+        pool.main_engine()
+            .worker_runtime_stats_snapshot()
+            .expect("snapshot workers started by runtime lifecycle")
+            .len(),
+        2
     );
     stop_workers(&mut pool);
 }
