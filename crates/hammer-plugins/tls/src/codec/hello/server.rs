@@ -1,7 +1,7 @@
 use core::mem::{size_of, transmute};
 
 use super::{HelloError, HelloPrefix, LEGACY_HELLO_VERSION};
-use crate::codec::extension::{self, Extension};
+use crate::codec::extension;
 
 const TLS_AES_128_GCM_SHA256: [u8; 2] = [0x13, 0x01];
 const TLS_AES_256_GCM_SHA384: [u8; 2] = [0x13, 0x02];
@@ -22,7 +22,7 @@ pub(crate) struct ServerHello<'a> {
     pub(crate) random: [u8; 32],
     pub(crate) session_id: &'a [u8],
     pub(crate) cipher_suite: [u8; 2],
-    extensions: &'a [u8],
+    pub(crate) extensions: &'a [u8],
 }
 
 impl<'a> ServerHello<'a> {
@@ -162,13 +162,6 @@ impl<'a> ServerHello<'a> {
         offset += size_of::<ServerHelloSuffix>();
         output[offset..offset + self.extensions.len()].copy_from_slice(self.extensions);
         Ok(encoded_len)
-    }
-
-    pub(crate) fn extension<T>(self) -> Result<Option<T>, T::Error>
-    where
-        T: Extension<'a>,
-    {
-        extension::find(self.extensions)
     }
 }
 

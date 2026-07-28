@@ -25,7 +25,7 @@ impl<'a> Extension<'a> for SupportedVersions<'a> {
 
     const TYPE: u16 = SUPPORTED_VERSIONS;
 
-    fn decode(body: &'a [u8]) -> Result<Self, Self::Error> {
+    fn decode_body(body: &'a [u8]) -> Result<Self, Self::Error> {
         let (&declared, versions) = body
             .split_first()
             .ok_or(SupportedVersionsError::LengthTruncated)?;
@@ -40,6 +40,16 @@ impl<'a> Extension<'a> for SupportedVersions<'a> {
             });
         }
         Ok(Self { versions })
+    }
+
+    fn body_len(&self) -> usize {
+        1 + self.versions.len()
+    }
+
+    fn encode_body(&self, output: &mut [u8]) {
+        output[0] =
+            u8::try_from(self.versions.len()).expect("validated supported_versions length fits u8");
+        output[1..].copy_from_slice(self.versions);
     }
 }
 
@@ -59,10 +69,18 @@ impl<'a> Extension<'a> for SelectedVersion {
 
     const TYPE: u16 = SUPPORTED_VERSIONS;
 
-    fn decode(body: &'a [u8]) -> Result<Self, Self::Error> {
+    fn decode_body(body: &'a [u8]) -> Result<Self, Self::Error> {
         let version = <[u8; 2]>::try_from(body)
             .map_err(|_| SupportedVersionsError::SelectedLength { length: body.len() })?;
         Ok(Self { version })
+    }
+
+    fn body_len(&self) -> usize {
+        self.version.len()
+    }
+
+    fn encode_body(&self, output: &mut [u8]) {
+        output.copy_from_slice(&self.version);
     }
 }
 
@@ -97,7 +115,7 @@ mod tests {
     #[test]
     fn server_version_requires_one_protocol_version() {
         assert_eq!(
-            SelectedVersion::decode(&[0x03]),
+            SelectedVersion::decode_body(&[0x03]),
             Err(SupportedVersionsError::SelectedLength { length: 1 })
         );
     }

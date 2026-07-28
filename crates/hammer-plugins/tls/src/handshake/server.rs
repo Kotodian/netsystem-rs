@@ -7,6 +7,7 @@ use hammer_service::crypto::{
 };
 use thiserror::Error;
 
+use crate::codec::extension;
 use crate::codec::extension::key_share::{
     KeyShareError, OfferedKeyShares, SelectedKeyShare, X25519,
 };
@@ -214,8 +215,7 @@ impl Protocol<ServerCrypto> for ServerHandshake<'_> {
         }
         let client_hello =
             ClientHello::decode(message.body()).map_err(|source| ServerError::Hello { source })?;
-        let supported_versions = client_hello
-            .extension::<SupportedVersions>()
+        let supported_versions = extension::find::<SupportedVersions>(client_hello.extensions)
             .map_err(|source| ServerError::SupportedVersions { source })?
             .ok_or(ServerError::SupportedVersionsMissing)?;
         if !supported_versions.contains(TLS_1_3) {
@@ -233,8 +233,7 @@ impl Protocol<ServerCrypto> for ServerHandshake<'_> {
                 cipher_suite: self.hello.cipher_suite,
             });
         }
-        let key_shares = client_hello
-            .extension::<OfferedKeyShares>()
+        let key_shares = extension::find::<OfferedKeyShares>(client_hello.extensions)
             .map_err(|source| ServerError::KeyShare { source })?
             .ok_or(ServerError::KeyShareMissing)?;
         let client_key_exchange = key_shares
@@ -245,16 +244,13 @@ impl Protocol<ServerCrypto> for ServerHandshake<'_> {
             <[u8; 32]>::try_from(client_key_exchange).map_err(|_| ServerError::X25519Length {
                 length: client_key_exchange.len(),
             })?;
-        let signature_algorithms = client_hello
-            .extension::<SignatureAlgorithms>()
+        let signature_algorithms = extension::find::<SignatureAlgorithms>(client_hello.extensions)
             .map_err(|source| ServerError::SignatureAlgorithms { source })?
             .ok_or(ServerError::SignatureAlgorithmsMissing)?;
         if !signature_algorithms.contains(ED25519) {
             return Err(ServerError::Ed25519NotOffered);
         }
-        let selected_key_share = self
-            .hello
-            .extension::<SelectedKeyShare>()
+        let selected_key_share = extension::find::<SelectedKeyShare>(self.hello.extensions)
             .map_err(|source| ServerError::KeyShare { source })?
             .ok_or(ServerError::ServerKeyShareMissing)?;
         if selected_key_share.group() != X25519 {

@@ -2,7 +2,7 @@ use core::mem::{size_of, transmute};
 
 use thiserror::Error;
 
-use super::extension::{self, Extension, ExtensionError};
+use super::extension::{self, ExtensionError};
 
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
@@ -14,7 +14,7 @@ const _: () = assert!(size_of::<ExtensionsLength>() == 2);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct EncryptedExtensions<'a> {
-    extensions: &'a [u8],
+    pub(crate) extensions: &'a [u8],
 }
 
 impl<'a> EncryptedExtensions<'a> {
@@ -65,13 +65,6 @@ impl<'a> EncryptedExtensions<'a> {
         unsafe { transmute::<_, *mut ExtensionsLength>(output.as_mut_ptr()).write_unaligned(wire) };
         output[size_of::<ExtensionsLength>()..required].copy_from_slice(self.extensions);
         Ok(required)
-    }
-
-    pub(crate) fn extension<T>(self) -> Result<Option<T>, T::Error>
-    where
-        T: Extension<'a>,
-    {
-        extension::find(self.extensions)
     }
 }
 

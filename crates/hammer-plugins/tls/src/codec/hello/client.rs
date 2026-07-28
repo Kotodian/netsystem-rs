@@ -1,7 +1,7 @@
 use core::mem::{size_of, transmute};
 
 use super::{ExtensionsLength, HelloError, HelloPrefix, LEGACY_HELLO_VERSION};
-use crate::codec::extension::{self, Extension};
+use crate::codec::extension;
 
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
@@ -25,7 +25,7 @@ pub(crate) struct ClientHello<'a> {
     pub(crate) session_id: &'a [u8],
     pub(crate) cipher_suites: &'a [u8],
     pub(crate) compression_methods: &'a [u8],
-    extensions: &'a [u8],
+    pub(crate) extensions: &'a [u8],
 }
 
 impl<'a> ClientHello<'a> {
@@ -250,13 +250,6 @@ impl<'a> ClientHello<'a> {
         offset += size_of::<ExtensionsLength>();
         output[offset..offset + self.extensions.len()].copy_from_slice(self.extensions);
         Ok(encoded_len)
-    }
-
-    pub(crate) fn extension<T>(self) -> Result<Option<T>, T::Error>
-    where
-        T: Extension<'a>,
-    {
-        extension::find(self.extensions)
     }
 }
 

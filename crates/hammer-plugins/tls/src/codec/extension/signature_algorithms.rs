@@ -24,7 +24,7 @@ impl<'a> Extension<'a> for SignatureAlgorithms<'a> {
 
     const TYPE: u16 = SIGNATURE_ALGORITHMS;
 
-    fn decode(body: &'a [u8]) -> Result<Self, Self::Error> {
+    fn decode_body(body: &'a [u8]) -> Result<Self, Self::Error> {
         let length_bytes = body
             .get(..2)
             .ok_or(SignatureAlgorithmsError::LengthTruncated)?;
@@ -42,6 +42,17 @@ impl<'a> Extension<'a> for SignatureAlgorithms<'a> {
             });
         }
         Ok(Self { schemes })
+    }
+
+    fn body_len(&self) -> usize {
+        2 + self.schemes.len()
+    }
+
+    fn encode_body(&self, output: &mut [u8]) {
+        let length = u16::try_from(self.schemes.len())
+            .expect("validated signature_algorithms length fits u16");
+        output[..2].copy_from_slice(&length.to_be_bytes());
+        output[2..].copy_from_slice(self.schemes);
     }
 }
 

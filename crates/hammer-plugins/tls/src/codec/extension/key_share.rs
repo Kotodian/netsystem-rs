@@ -40,7 +40,7 @@ impl<'a> Extension<'a> for OfferedKeyShares<'a> {
 
     const TYPE: u16 = KEY_SHARE;
 
-    fn decode(body: &'a [u8]) -> Result<Self, Self::Error> {
+    fn decode_body(body: &'a [u8]) -> Result<Self, Self::Error> {
         let length_bytes = body.get(..2).ok_or(KeyShareError::ListLengthTruncated)?;
         let declared = usize::from(u16::from_be_bytes([length_bytes[0], length_bytes[1]]));
         let entries = body.get(2..).expect("two-byte key share length exists");
@@ -56,6 +56,17 @@ impl<'a> Extension<'a> for OfferedKeyShares<'a> {
             remaining = &remaining[consumed..];
         }
         Ok(Self { entries })
+    }
+
+    fn body_len(&self) -> usize {
+        2 + self.entries.len()
+    }
+
+    fn encode_body(&self, output: &mut [u8]) {
+        let length =
+            u16::try_from(self.entries.len()).expect("validated key_share list length fits u16");
+        output[..2].copy_from_slice(&length.to_be_bytes());
+        output[2..].copy_from_slice(self.entries);
     }
 }
 
@@ -80,7 +91,7 @@ impl<'a> Extension<'a> for SelectedKeyShare<'a> {
 
     const TYPE: u16 = KEY_SHARE;
 
-    fn decode(body: &'a [u8]) -> Result<Self, Self::Error> {
+    fn decode_body(body: &'a [u8]) -> Result<Self, Self::Error> {
         let (group, key_exchange, consumed) = decode_entry(body)?;
         if consumed != body.len() {
             return Err(KeyShareError::TrailingData {
@@ -91,6 +102,23 @@ impl<'a> Extension<'a> for SelectedKeyShare<'a> {
             group,
             key_exchange,
         })
+    }
+
+    fn body_len(&self) -> usize {
+        size_of::<EntryHeader>() + self.key_exchange.len()
+    }
+
+    fn encode_body(&self, output: &mut [u8]) {
+        let length = u16::try_from(self.key_exchange.len())
+            .expect("validated key_share key exchange length fits u16");
+        let header = EntryHeader {
+            group: self.group,
+            length: length.to_be_bytes(),
+        };
+        // SAFETY: framing passes an exact body slice large enough for the
+        // packed header and the pointer is only written unaligned.
+        unsafe { transmute::<_, *mut EntryHeader>(output.as_mut_ptr()).write_unaligned(header) };
+        output[size_of::<EntryHeader>()..].copy_from_slice(self.key_exchange);
     }
 }
 
@@ -165,7 +193,7 @@ mod tests {
         let body = [0x00, 0x1d, 0x00, 0x01, 7, 8];
 
         assert_eq!(
-            SelectedKeyShare::decode(&body),
+            SelectedKeyShare::decode_body(&body),
             Err(KeyShareError::TrailingData { trailing: 1 })
         );
     }

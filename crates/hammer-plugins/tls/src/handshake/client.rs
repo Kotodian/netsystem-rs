@@ -7,6 +7,7 @@ use hammer_service::crypto::{
 };
 use thiserror::Error;
 
+use crate::codec::extension;
 use crate::codec::extension::key_share::{KeyShareError, SelectedKeyShare, X25519};
 use crate::codec::extension::signature_algorithms::ED25519;
 use crate::codec::extension::supported_versions::{
@@ -135,8 +136,7 @@ impl Protocol<ClientCrypto> for ClientHandshake<'_> {
         }
         let hello =
             ServerHello::decode(message.body()).map_err(|source| ClientError::Hello { source })?;
-        let selected_version = hello
-            .extension::<SelectedVersion>()
+        let selected_version = extension::find::<SelectedVersion>(hello.extensions)
             .map_err(|source| ClientError::SupportedVersions { source })?
             .ok_or(ClientError::SupportedVersionsMissing)?;
         if !selected_version.is(TLS_1_3) {
@@ -155,8 +155,7 @@ impl Protocol<ClientCrypto> for ClientHandshake<'_> {
                 cipher_suite: hello.cipher_suite,
             });
         }
-        let selected_key_share = hello
-            .extension::<SelectedKeyShare>()
+        let selected_key_share = extension::find::<SelectedKeyShare>(hello.extensions)
             .map_err(|source| ClientError::KeyShare { source })?
             .ok_or(ClientError::KeyShareMissing)?;
         if selected_key_share.group() != X25519 {
