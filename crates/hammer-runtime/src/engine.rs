@@ -25,22 +25,21 @@ thread_local! {
 pub(crate) struct EngineWorkerSeed {
     runtime_seed: DataPlaneRuntimeWorkerSeed,
     registry: Arc<RuntimeRegistry>,
-    wait_at_barrier: Arc<AtomicU32>,
-    workers_at_barrier: Arc<AtomicU32>,
+    barrier: crate::barrier::WorkerBarrier,
     main_loop_exit_now: Arc<AtomicBool>,
-    pending_worker_graph: Arc<Mutex<Option<WorkerGraphUpdate>>>,
+    worker_graph: Arc<crate::barrier::Barrier<Option<WorkerGraphUpdate>>>,
     workers_updating_graph: Arc<AtomicU32>,
-    worker_graph_update_error: Arc<Mutex<Option<RuntimeError>>>,
-    worker_runtime_stats: Arc<Vec<Mutex<Option<WorkerRuntimeStats>>>>,
+    worker_graph_errors: Arc<[crate::barrier::Barrier<Option<RuntimeError>>]>,
+    worker_runtime_stats: Arc<[crate::barrier::Barrier<Option<WorkerRuntimeStats>>]>,
     worker_init_functions: Vec<InitFunction>,
     memory_initialized: bool,
     worker_config: Worker,
 }
 
 #[derive(Clone)]
-struct WorkerGraphUpdate {
-    graph: NodeRuntimeInner,
-    worker_init_functions: Vec<InitFunction>,
+pub(crate) struct WorkerGraphUpdate {
+    pub(crate) graph: NodeRuntimeInner,
+    pub(crate) worker_init_functions: Vec<InitFunction>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,13 +58,12 @@ pub struct Engine {
     pub main_loop_count: AtomicU32,
     pub runtime: DataPlaneRuntime,
     pub registry: Arc<RuntimeRegistry>,
-    pub wait_at_barrier: Arc<AtomicU32>,
-    pub workers_at_barrier: Arc<AtomicU32>,
+    pub(crate) barrier: crate::barrier::WorkerBarrier,
     pub main_loop_exit_now: Arc<AtomicBool>,
     pub main_loop_exit_status: Mutex<i32>,
     pub(crate) memory_initialized: bool,
     processes: ProcessMain,
-    worker_init_functions: Vec<InitFunction>,
+    pub(crate) worker_init_functions: Vec<InitFunction>,
     worker_config: Worker,
     pub(crate) called_init_functions: HashSet<&'static str>,
     pub(crate) called_worker_init_functions: HashSet<&'static str>,
@@ -75,10 +73,10 @@ pub struct Engine {
     pub(crate) called_main_loop_exit_functions: HashSet<&'static str>,
     pub(crate) main_loop_entered: bool,
     materialized_registration_generation: u64,
-    pending_worker_graph: Arc<Mutex<Option<WorkerGraphUpdate>>>,
-    workers_updating_graph: Arc<AtomicU32>,
-    worker_graph_update_error: Arc<Mutex<Option<RuntimeError>>>,
-    worker_runtime_stats: Arc<Vec<Mutex<Option<WorkerRuntimeStats>>>>,
+    pub(crate) worker_graph: Arc<crate::barrier::Barrier<Option<WorkerGraphUpdate>>>,
+    pub(crate) workers_updating_graph: Arc<AtomicU32>,
+    pub(crate) worker_graph_errors: Arc<[crate::barrier::Barrier<Option<RuntimeError>>]>,
+    worker_runtime_stats: Arc<[crate::barrier::Barrier<Option<WorkerRuntimeStats>>]>,
     main_loop_exit_functions_called: bool,
     worker_threads: Mutex<Vec<JoinHandle<RuntimeResult<()>>>>,
     // Drop after every owner that may retain DSO code or Drop glue. Plugin
@@ -91,13 +89,12 @@ impl Engine {
     fn worker_with_runtime(
         runtime: DataPlaneRuntime,
         registry: Arc<RuntimeRegistry>,
-        wait_at_barrier: Arc<AtomicU32>,
-        workers_at_barrier: Arc<AtomicU32>,
+        barrier: crate::barrier::WorkerBarrier,
         main_loop_exit_now: Arc<AtomicBool>,
-        pending_worker_graph: Arc<Mutex<Option<WorkerGraphUpdate>>>,
+        worker_graph: Arc<crate::barrier::Barrier<Option<WorkerGraphUpdate>>>,
         workers_updating_graph: Arc<AtomicU32>,
-        worker_graph_update_error: Arc<Mutex<Option<RuntimeError>>>,
-        worker_runtime_stats: Arc<Vec<Mutex<Option<WorkerRuntimeStats>>>>,
+        worker_graph_errors: Arc<[crate::barrier::Barrier<Option<RuntimeError>>]>,
+        worker_runtime_stats: Arc<[crate::barrier::Barrier<Option<WorkerRuntimeStats>>]>,
         worker_init_functions: Vec<InitFunction>,
         memory_initialized: bool,
         worker_config: Worker,
@@ -110,8 +107,7 @@ impl Engine {
             main_loop_count: AtomicU32::new(0),
             runtime,
             registry,
-            wait_at_barrier,
-            workers_at_barrier,
+            barrier,
             main_loop_exit_now,
             main_loop_exit_status: Mutex::new(0),
             memory_initialized,
@@ -126,9 +122,9 @@ impl Engine {
             called_main_loop_exit_functions: HashSet::new(),
             main_loop_entered: false,
             materialized_registration_generation: 0,
-            pending_worker_graph,
+            worker_graph,
             workers_updating_graph,
-            worker_graph_update_error,
+            worker_graph_errors,
             worker_runtime_stats,
             main_loop_exit_functions_called: false,
             worker_threads: Mutex::new(Vec::new()),
@@ -138,17 +134,13 @@ impl Engine {
     }
 
     pub fn new(runtime: DataPlaneRuntime, registry: Arc<RuntimeRegistry>) -> Self {
-        let pending_worker_graph = Arc::new(Mutex::new(None));
-        let workers_updating_graph = Arc::new(AtomicU32::new(0));
-        let worker_graph_update_error = Arc::new(Mutex::new(None));
         Self {
             thread_index: 0,
             numa_node: 0,
             main_loop_count: AtomicU32::new(0),
             runtime,
             registry,
-            wait_at_barrier: Arc::new(AtomicU32::new(0)),
-            workers_at_barrier: Arc::new(AtomicU32::new(0)),
+            barrier: crate::barrier::WorkerBarrier::new(0),
             main_loop_exit_now: Arc::new(AtomicBool::new(false)),
             main_loop_exit_status: Mutex::new(0),
             memory_initialized: false,
@@ -163,10 +155,10 @@ impl Engine {
             called_main_loop_exit_functions: HashSet::new(),
             main_loop_entered: false,
             materialized_registration_generation: 0,
-            pending_worker_graph,
-            workers_updating_graph,
-            worker_graph_update_error,
-            worker_runtime_stats: Arc::new(Vec::new()),
+            worker_graph: Arc::new(crate::barrier::Barrier::new(None)),
+            workers_updating_graph: Arc::new(AtomicU32::new(0)),
+            worker_graph_errors: Arc::from([]),
+            worker_runtime_stats: Arc::from([]),
             main_loop_exit_functions_called: false,
             worker_threads: Mutex::new(Vec::new()),
             processes: ProcessMain::new(),
@@ -222,36 +214,25 @@ impl Engine {
         }
 
         let worker_count = if resume_main_loop {
-            let count = self
-                .worker_threads
-                .lock()
-                .map_err(|_| RuntimeError::WorkerThreadRegistryPoisoned)?
-                .len();
-            u32::try_from(count).map_err(|_| RuntimeError::WorkerCountOverflow { count })?
+            self.barrier.worker_count()
         } else {
             0
         };
-        let barrier_guard = if worker_count == 0 {
-            None
-        } else {
-            Some(crate::barrier::barrier_sync(
-                &self.wait_at_barrier,
-                &self.workers_at_barrier,
-                worker_count,
-            ))
-        };
-
-        crate::init::run_config_functions(self, true, config)?;
-        crate::init::run_init_functions(self)?;
-        let entries = self.plugin_main.graph_nodes();
-        let functions = self.plugin_main.node_functions();
-        self.runtime
-            .extend_graph_with_node_functions(&entries, &functions)?;
-        crate::init::run_config_functions(self, false, config)?;
-        if worker_count != 0 {
-            self.publish_worker_graph(worker_count)?;
-        }
-        drop(barrier_guard);
+        let barrier = self.barrier.clone();
+        barrier.sync(self, |engine| -> RuntimeResult<()> {
+            crate::init::run_config_functions(engine, true, config)?;
+            crate::init::run_init_functions(engine)?;
+            let entries = engine.plugin_main.graph_nodes();
+            let functions = engine.plugin_main.node_functions();
+            engine
+                .runtime
+                .extend_graph_with_node_functions(&entries, &functions)?;
+            crate::init::run_config_functions(engine, false, config)?;
+            if worker_count != 0 {
+                engine.publish_worker_graph(worker_count)?;
+            }
+            Ok(())
+        })?;
         if worker_count != 0 {
             self.finish_worker_graph_update()?;
         }
@@ -266,6 +247,7 @@ impl Engine {
     }
 
     fn publish_worker_graph(&self, worker_count: u32) -> RuntimeResult<()> {
+        assert_ne!(worker_count, 0, "worker graph publication requires workers");
         if self.workers_updating_graph.load(Ordering::Acquire) != 0 {
             return Err(RuntimeError::WorkerGraphUpdateAlreadyPending);
         }
@@ -273,19 +255,14 @@ impl Engine {
             graph: self.runtime.nodes().snapshot(),
             worker_init_functions: self.plugin_main.worker_init_functions(),
         };
-        let mut published = self
-            .pending_worker_graph
-            .lock()
-            .map_err(|_| RuntimeError::WorkerGraphUpdateStatePoisoned)?;
-        if published.is_some() {
-            return Err(RuntimeError::WorkerGraphUpdateAlreadyPending);
+        // SAFETY: the main Engine calls this only while every worker is held at
+        // `self.barrier`, before the refork completion count is published.
+        unsafe {
+            *self.worker_graph.get_mut_unchecked() = Some(update);
+            for error in self.worker_graph_errors.iter() {
+                *error.get_mut_unchecked() = None;
+            }
         }
-        let mut error = self
-            .worker_graph_update_error
-            .lock()
-            .map_err(|_| RuntimeError::WorkerGraphUpdateStatePoisoned)?;
-        *error = None;
-        *published = Some(update);
         self.workers_updating_graph
             .store(worker_count, Ordering::Release);
         Ok(())
@@ -295,55 +272,66 @@ impl Engine {
         while self.workers_updating_graph.load(Ordering::Acquire) != 0 {
             spin_loop();
         }
-        let error = self
-            .worker_graph_update_error
-            .lock()
-            .map_err(|_| RuntimeError::WorkerGraphUpdateStatePoisoned)?
-            .take();
-        self.pending_worker_graph
-            .lock()
-            .map_err(|_| RuntimeError::WorkerGraphUpdateStatePoisoned)?
-            .take();
-        match error {
-            Some(error) => Err(error),
-            None => Ok(()),
+
+        // SAFETY: every worker completed its refork before decrementing the
+        // counter to zero, so none can still access the graph or error slots.
+        if unsafe { self.worker_graph.get_unchecked() }.is_none() {
+            return Err(RuntimeError::WorkerGraphUpdateMissing);
         }
+
+        let mut graph_update_error = None;
+        for (worker, slot) in self.worker_graph_errors.iter().enumerate() {
+            // SAFETY: the refork completion count is zero, so the worker that
+            // owns this slot can no longer read or write it.
+            if let Some(error) = unsafe { slot.get_mut_unchecked() }.take() {
+                if graph_update_error.is_none() {
+                    graph_update_error = Some(error);
+                } else {
+                    tracing::error!(worker, %error, "additional worker graph update failed");
+                }
+            }
+        }
+        graph_update_error.map_or(Ok(()), Err)
     }
 
-    pub(crate) fn apply_worker_graph_update_after_barrier(&mut self) -> bool {
+    pub(crate) fn refork_worker_graph(&mut self) -> bool {
         if self.workers_updating_graph.load(Ordering::Acquire) == 0 {
             return true;
         }
 
+        // SAFETY: the main Engine published this value before releasing the
+        // barrier and retains it until every worker completes the refork.
+        let update = unsafe { self.worker_graph.get_unchecked() }
+            .as_ref()
+            .expect("published worker graph must be present")
+            .clone();
         let result = self
-            .pending_worker_graph
-            .lock()
-            .map_err(|_| RuntimeError::WorkerGraphUpdateStatePoisoned)
-            .and_then(|published| {
-                published
-                    .as_ref()
-                    .cloned()
-                    .ok_or(RuntimeError::WorkerGraphUpdateMissing)
-            })
-            .and_then(|update| {
-                self.runtime
-                    .nodes()
-                    .replace_graph_preserving_worker_state(update.graph)?;
+            .runtime
+            .nodes()
+            .replace_graph_preserving_worker_state(update.graph)
+            .and_then(|()| {
                 self.worker_init_functions = update.worker_init_functions;
                 crate::init::run_worker_init_functions(self)
             });
         let succeeded = result.is_ok();
         if let Err(error) = result {
             self.main_loop_exit_now.store(true, Ordering::Release);
-            if let Ok(mut graph_update_error) = self.worker_graph_update_error.lock()
-                && graph_update_error.is_none()
-            {
-                *graph_update_error = Some(error);
+            let worker = self
+                .data_worker_id()
+                .expect("worker graph update runs only on a Data Worker");
+            let slot = self
+                .worker_graph_errors
+                .get(worker.slot())
+                .expect("worker graph error slot must exist");
+            // SAFETY: each Data Worker owns exactly one error slot throughout
+            // the refork; the main Engine reads it only after completion.
+            unsafe {
+                *slot.get_mut_unchecked() = Some(error);
             }
         }
 
-        let previous = self.workers_updating_graph.fetch_sub(1, Ordering::AcqRel);
-        debug_assert_ne!(previous, 0);
+        let updating = self.workers_updating_graph.fetch_sub(1, Ordering::AcqRel);
+        assert_ne!(updating, 0, "worker graph completion count underflow");
         while self.workers_updating_graph.load(Ordering::Acquire) != 0 {
             spin_loop();
         }
@@ -358,12 +346,11 @@ impl Engine {
         Self::worker_with_runtime(
             self.runtime.for_worker(index, numa_node)?,
             Arc::clone(&self.registry),
-            Arc::clone(&self.wait_at_barrier),
-            Arc::clone(&self.workers_at_barrier),
+            self.barrier.clone(),
             Arc::clone(&self.main_loop_exit_now),
-            Arc::clone(&self.pending_worker_graph),
+            Arc::clone(&self.worker_graph),
             Arc::clone(&self.workers_updating_graph),
-            Arc::clone(&self.worker_graph_update_error),
+            Arc::clone(&self.worker_graph_errors),
             Arc::clone(&self.worker_runtime_stats),
             self.plugin_main.worker_init_functions(),
             self.memory_initialized,
@@ -449,12 +436,11 @@ impl Engine {
         EngineWorkerSeed {
             runtime_seed: DataPlaneRuntimeWorkerSeed::from(&self.runtime),
             registry: Arc::clone(&self.registry),
-            wait_at_barrier: Arc::clone(&self.wait_at_barrier),
-            workers_at_barrier: Arc::clone(&self.workers_at_barrier),
+            barrier: self.barrier.clone(),
             main_loop_exit_now: Arc::clone(&self.main_loop_exit_now),
-            pending_worker_graph: Arc::clone(&self.pending_worker_graph),
+            worker_graph: Arc::clone(&self.worker_graph),
             workers_updating_graph: Arc::clone(&self.workers_updating_graph),
-            worker_graph_update_error: Arc::clone(&self.worker_graph_update_error),
+            worker_graph_errors: Arc::clone(&self.worker_graph_errors),
             worker_runtime_stats: Arc::clone(&self.worker_runtime_stats),
             worker_init_functions: self.plugin_main.worker_init_functions(),
             memory_initialized: self.memory_initialized,
@@ -463,11 +449,14 @@ impl Engine {
     }
 
     pub(crate) fn prepare_worker_runtime_stats(&mut self, worker_count: usize) {
-        self.worker_runtime_stats = Arc::new(
-            (0..worker_count)
-                .map(|_| Mutex::new(None))
-                .collect::<Vec<_>>(),
-        );
+        self.worker_runtime_stats = (0..worker_count)
+            .map(|_| crate::barrier::Barrier::new(None))
+            .collect::<Vec<_>>()
+            .into();
+        self.worker_graph_errors = (0..worker_count)
+            .map(|_| crate::barrier::Barrier::new(None))
+            .collect::<Vec<_>>()
+            .into();
     }
 
     pub(crate) fn publish_worker_runtime_stats(&self) {
@@ -485,9 +474,12 @@ impl Engine {
             nodes: self.runtime.nodes().node_runtime_stats_snapshot(),
             files: self.file_main().runtime_stats_snapshot(),
         };
-        *slot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
+        // SAFETY: each worker owns exactly one slot and replaces it before
+        // acknowledging the barrier. The main Engine reads only after every
+        // worker has acknowledged.
+        unsafe {
+            *slot.get_mut_unchecked() = Some(snapshot);
+        }
     }
 
     pub fn worker_runtime_stats_snapshot(&self) -> RuntimeResult<Vec<WorkerRuntimeStats>> {
@@ -501,34 +493,24 @@ impl Engine {
         if worker_count == 0 {
             return Ok(Vec::new());
         }
-        let worker_count =
-            u32::try_from(worker_count).map_err(|_| RuntimeError::WorkerCountOverflow {
-                count: self.worker_runtime_stats.len(),
-            })?;
-        let barrier = crate::barrier::barrier_sync(
-            &self.wait_at_barrier,
-            &self.workers_at_barrier,
-            worker_count,
-        );
-        let snapshots = self
-            .worker_runtime_stats
-            .iter()
-            .enumerate()
-            .map(|(slot, snapshot)| {
-                snapshot
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone()
-                    .ok_or_else(|| {
+        debug_assert_eq!(self.barrier.worker_count() as usize, worker_count);
+        let mut stats = Arc::clone(&self.worker_runtime_stats);
+        self.barrier.sync(&mut stats, |stats| {
+            stats
+                .iter()
+                .enumerate()
+                .map(|(slot, snapshot)| {
+                    // SAFETY: the enclosing worker barrier is held, so no
+                    // worker can replace its statistics slot.
+                    unsafe { snapshot.get_unchecked() }.clone().ok_or_else(|| {
                         RuntimeError::lifecycle(
                             "snapshot worker runtime statistics",
                             format!("data worker {} did not publish its state", slot + 1),
                         )
                     })
-            })
-            .collect();
-        drop(barrier);
-        snapshots
+                })
+                .collect()
+        })
     }
 
     pub(crate) fn retain_worker_threads(
@@ -647,12 +629,11 @@ impl EngineWorkerSeed {
         let Self {
             runtime_seed,
             registry,
-            wait_at_barrier,
-            workers_at_barrier,
+            barrier,
             main_loop_exit_now,
-            pending_worker_graph,
+            worker_graph,
             workers_updating_graph,
-            worker_graph_update_error,
+            worker_graph_errors,
             worker_runtime_stats,
             worker_init_functions,
             memory_initialized,
@@ -669,12 +650,11 @@ impl EngineWorkerSeed {
         let engine = Engine::worker_with_runtime(
             runtime,
             registry,
-            wait_at_barrier,
-            workers_at_barrier,
+            barrier,
             main_loop_exit_now,
-            pending_worker_graph,
+            worker_graph,
             workers_updating_graph,
-            worker_graph_update_error,
+            worker_graph_errors,
             worker_runtime_stats,
             worker_init_functions,
             memory_initialized,
@@ -891,17 +871,6 @@ mod tests {
         assert!(matches!(
             error,
             RuntimeError::DataWorkerIdUnavailable { thread_index: 0 }
-        ));
-    }
-
-    #[test]
-    fn spawn_shares_barrier_arcs() {
-        let main = test_engine();
-        let worker = main.spawn(1).expect("spawn worker");
-        assert!(Arc::ptr_eq(&main.wait_at_barrier, &worker.wait_at_barrier));
-        assert!(Arc::ptr_eq(
-            &main.workers_at_barrier,
-            &worker.workers_at_barrier
         ));
     }
 

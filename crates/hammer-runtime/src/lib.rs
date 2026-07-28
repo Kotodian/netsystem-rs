@@ -43,6 +43,7 @@ pub mod plugin;
 pub mod plugin_loader;
 mod process;
 pub mod registry;
+pub mod sync;
 
 pub use error::{AttachError, RuntimeError, RuntimeResult};
 pub use hammer_infra::hint::unlikely;
@@ -89,5 +90,6 @@ pub mod spawn;
 pub mod start_workers;
 mod worker_thread;
 
+pub use barrier::{Barrier, WorkerBarrier};
 pub use control_thread::{ControlThread, ControlThreadHandle, ControlTimerHandle};
-pub use spawn::{DataPlaneBarrierGuard, DataPlaneBarrierHandle, with_data_plane_runtime};
+pub use spawn::with_data_plane_runtime;

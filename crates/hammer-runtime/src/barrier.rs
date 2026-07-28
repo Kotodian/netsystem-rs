@@ -5,6 +5,7 @@
 //! deadlock, not a recoverable runtime error.
 
 use core::hint::spin_loop;
+use std::cell::UnsafeCell;
 use std::panic::Location;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -15,83 +16,160 @@ pub(crate) const BARRIER_SYNC_TIMEOUT: Duration = Duration::from_millis(600_100)
 #[cfg(not(debug_assertions))]
 pub(crate) const BARRIER_SYNC_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// RAII guard that releases the barrier when dropped.
-/// The control thread holds this while mutating shared state.
-#[must_use]
-#[derive(Debug)]
-pub struct BarrierGuard {
-    wait: Arc<AtomicU32>,
-    workers: Arc<AtomicU32>,
-    caller: &'static Location<'static>,
+struct State {
+    wait: AtomicU32,
+    workers: AtomicU32,
 }
 
-impl BarrierGuard {
-    fn new(
-        wait: &Arc<AtomicU32>,
-        workers: &Arc<AtomicU32>,
-        caller: &'static Location<'static>,
-    ) -> Self {
+/// Value whose access is ordered by an associated worker barrier.
+pub struct Barrier<T> {
+    value: UnsafeCell<T>,
+}
+
+impl<T> Barrier<T> {
+    #[inline]
+    pub(crate) const fn new(value: T) -> Self {
         Self {
-            wait: Arc::clone(wait),
-            workers: Arc::clone(workers),
-            caller,
+            value: UnsafeCell::new(value),
         }
     }
-}
 
-/// Release workers from the barrier.
-#[track_caller]
-pub fn barrier_release(wait: &AtomicU32, workers: &AtomicU32) {
-    barrier_release_from(wait, workers, Location::caller());
-}
+    /// # Safety
+    /// The caller must hold the worker barrier or otherwise prove that no
+    /// writer can access this value for the returned reference's lifetime.
+    #[inline]
+    pub(crate) unsafe fn get_unchecked(&self) -> &T {
+        // SAFETY: upheld by the caller's barrier-phase contract.
+        unsafe { &*self.value.get() }
+    }
 
-impl Drop for BarrierGuard {
-    fn drop(&mut self) {
-        barrier_release_from(&self.wait, &self.workers, self.caller);
+    /// # Safety
+    /// The caller must have exclusive barrier-phase ownership of this value.
+    #[inline]
+    pub(crate) unsafe fn get_mut_unchecked(&self) -> &mut T {
+        // SAFETY: upheld by the caller's barrier-phase contract.
+        unsafe { &mut *self.value.get() }
     }
 }
 
-/// Synchronize all workers: set the wait flag, then spin until all workers
-/// have acknowledged. Returns a guard that releases the barrier on drop.
-///
-/// Memory ordering mirrors VPP threads.c:296 barrier_check:
-/// - wait_at_barrier: release-store (main), acquire-load (workers)
-/// - workers_at_barrier: fetch_add Release (workers), load Acquire (main)
-#[track_caller]
-pub fn barrier_sync(
-    wait: &Arc<AtomicU32>,
-    workers: &Arc<AtomicU32>,
-    n_workers: u32,
-) -> BarrierGuard {
-    let caller = Location::caller();
-    let recursion_level = wait.fetch_add(1, Ordering::Release);
-    if recursion_level == 0 {
+// SAFETY: `Barrier<T>` exposes its `UnsafeCell` only through crate-private
+// operations whose callers must establish the worker-barrier phase. Moving or
+// dropping the shared value remains valid when `T: Send`.
+unsafe impl<T: Send> Sync for Barrier<T> {}
+
+/// VPP-style synchronization shared by the main thread and Data Workers.
+#[derive(Clone)]
+pub struct WorkerBarrier {
+    state: Arc<State>,
+    worker_count: u32,
+}
+
+impl WorkerBarrier {
+    #[inline]
+    pub(crate) fn new(worker_count: u32) -> Self {
+        Self {
+            state: Arc::new(State {
+                wait: AtomicU32::new(0),
+                workers: AtomicU32::new(0),
+            }),
+            worker_count,
+        }
+    }
+
+    /// Pauses every worker while `operation` has mutable access to `value`.
+    #[track_caller]
+    pub fn sync<T: ?Sized, R>(&self, value: &mut T, operation: impl FnOnce(&mut T) -> R) -> R {
+        let caller = Location::caller();
+        self.pause(caller);
+        let release = Release {
+            barrier: self.clone(),
+            caller,
+        };
+        let result = operation(value);
+        drop(release);
+        result
+    }
+
+    #[inline]
+    pub(crate) const fn worker_count(&self) -> u32 {
+        self.worker_count
+    }
+
+    #[inline]
+    pub(crate) fn is_pending(&self) -> bool {
+        self.state.wait.load(Ordering::Acquire) != 0
+    }
+
+    /// Acknowledges an armed barrier and waits for release.
+    pub(crate) fn check(&self) {
+        if !self.is_pending() {
+            return;
+        }
+        self.state.workers.fetch_add(1, Ordering::Release);
+        while self.state.wait.load(Ordering::Acquire) != 0 {
+            spin_loop();
+        }
+        self.state.workers.fetch_sub(1, Ordering::Release);
+    }
+
+    #[track_caller]
+    pub(crate) fn arm(&self) {
+        let previous = self.state.wait.fetch_add(1, Ordering::Release);
+        if previous != 0 {
+            barrier_deadlock_at("arm startup barrier", 0, previous, Location::caller());
+        }
+    }
+
+    #[inline]
+    pub(crate) fn paused_workers(&self) -> u32 {
+        self.state.workers.load(Ordering::Acquire)
+    }
+
+    #[track_caller]
+    pub(crate) fn release(&self) {
+        self.release_from(Location::caller());
+    }
+
+    fn pause(&self, caller: &'static Location<'static>) {
+        let recursion_level = self.state.wait.fetch_add(1, Ordering::Release);
+        if recursion_level == 0 {
+            wait_for_worker_count(
+                &self.state.workers,
+                self.worker_count,
+                Instant::now() + BARRIER_SYNC_TIMEOUT,
+                "barrier sync",
+                caller,
+            );
+        }
+    }
+
+    fn release_from(&self, caller: &'static Location<'static>) {
+        let recursion_level = self.state.wait.fetch_sub(1, Ordering::Release);
+        if recursion_level == 0 {
+            barrier_deadlock_at("barrier release without matching sync", 1, 0, caller);
+        }
+        if recursion_level > 1 {
+            return;
+        }
         wait_for_worker_count(
-            workers,
-            n_workers,
+            &self.state.workers,
+            0,
             Instant::now() + BARRIER_SYNC_TIMEOUT,
-            "barrier sync",
+            "barrier release",
             caller,
         );
     }
-    BarrierGuard::new(wait, workers, caller)
 }
 
-fn barrier_release_from(wait: &AtomicU32, workers: &AtomicU32, caller: &'static Location<'static>) {
-    let recursion_level = wait.fetch_sub(1, Ordering::Release);
-    if recursion_level == 0 {
-        barrier_deadlock_at("barrier release without matching sync", 1, 0, caller);
+struct Release {
+    barrier: WorkerBarrier,
+    caller: &'static Location<'static>,
+}
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        self.barrier.release_from(self.caller);
     }
-    if recursion_level > 1 {
-        return;
-    }
-    wait_for_worker_count(
-        workers,
-        0,
-        Instant::now() + BARRIER_SYNC_TIMEOUT,
-        "barrier release",
-        caller,
-    );
 }
 
 fn wait_for_worker_count(
@@ -132,33 +210,6 @@ fn barrier_deadlock_at(
     std::process::abort();
 }
 
-/// Called by workers in their main loop. If the wait flag is set,
-/// acknowledge and spin until released.
-pub fn barrier_check(wait: &AtomicU32, workers: &AtomicU32) {
-    _ = barrier_check_and_report(wait, workers, || {});
-}
-
-/// Runtime-internal barrier check that reports whether this worker crossed a
-/// barrier release and must inspect a published graph update before dispatch
-/// resumes.
-pub(crate) fn barrier_check_and_report(
-    wait: &AtomicU32,
-    workers: &AtomicU32,
-    before_wait: impl FnOnce(),
-) -> bool {
-    if wait.load(Ordering::Acquire) > 0 {
-        before_wait();
-        workers.fetch_add(1, Ordering::Release);
-        while wait.load(Ordering::Acquire) > 0 {
-            spin_loop();
-        }
-        workers.fetch_sub(1, Ordering::Release);
-        true
-    } else {
-        false
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,32 +221,30 @@ mod tests {
 
     #[test]
     fn barrier_check_arms_worker() {
-        let wait = Arc::new(AtomicU32::new(0));
-        let workers = Arc::new(AtomicU32::new(0));
+        let barrier = WorkerBarrier::new(1);
         let flag = Arc::new(AtomicBool::new(false));
 
-        let wait_c = Arc::clone(&wait);
-        let workers_c = Arc::clone(&workers);
+        let worker_barrier = barrier.clone();
         let flag_c = Arc::clone(&flag);
 
         let (tx, rx) = mpsc::channel();
 
         let worker = thread::spawn(move || {
             rx.recv().unwrap();
-            barrier_check(&wait_c, &workers_c);
+            worker_barrier.check();
             flag_c.store(true, Ordering::Release);
         });
 
-        wait.store(1, Ordering::Release);
+        barrier.arm();
         tx.send(()).unwrap();
 
-        while workers.load(Ordering::Acquire) != 1 {
+        while barrier.paused_workers() != 1 {
             spin_loop();
         }
 
         assert!(!flag.load(Ordering::Acquire));
 
-        barrier_release(&wait, &workers);
+        barrier.release();
 
         worker.join().unwrap();
         assert!(flag.load(Ordering::Acquire));
@@ -203,57 +252,78 @@ mod tests {
 
     #[test]
     fn barrier_sync_guards_workers() {
-        let wait = Arc::new(AtomicU32::new(0));
-        let workers = Arc::new(AtomicU32::new(0));
-
-        let wait_c = Arc::clone(&wait);
-        let workers_c = Arc::clone(&workers);
+        let barrier = WorkerBarrier::new(1);
+        let worker_barrier = barrier.clone();
 
         let worker = thread::spawn(move || {
             thread::sleep(Duration::from_millis(100));
-            barrier_check(&wait_c, &workers_c);
+            worker_barrier.check();
         });
 
-        let guard = barrier_sync(&wait, &workers, 1);
-        assert!(workers.load(Ordering::Acquire) >= 1);
-        drop(guard);
+        let mut value = ();
+        barrier.sync(&mut value, |_| {
+            assert_eq!(barrier.paused_workers(), 1);
+        });
 
         worker.join().unwrap();
     }
 
     #[test]
+    fn typed_barrier_releases_after_protected_mutation() {
+        let barrier = WorkerBarrier::new(1);
+        let published = Arc::new(AtomicU32::new(1));
+
+        let worker_barrier = barrier.clone();
+        let worker_published = Arc::clone(&published);
+        let worker = thread::spawn(move || {
+            while !worker_barrier.is_pending() {
+                spin_loop();
+            }
+            worker_barrier.check();
+            worker_published.load(Ordering::Acquire)
+        });
+
+        let mut next = 1_u32;
+        barrier.sync(&mut next, |next| {
+            *next = 2;
+            published.store(*next, Ordering::Release);
+        });
+
+        assert_eq!(worker.join().expect("worker"), 2);
+        assert_eq!(next, 2);
+    }
+
+    #[test]
     fn barrier_concurrent_workers() {
         let n = 4;
-        let wait = Arc::new(AtomicU32::new(0));
-        let workers_at_barrier = Arc::new(AtomicU32::new(0));
+        let barrier = WorkerBarrier::new(n);
         let counter = Arc::new(AtomicU32::new(0));
         let barrier_armed = Arc::new(AtomicBool::new(false));
 
         let mut handles = Vec::new();
         for _ in 0..n {
-            let w = Arc::clone(&wait);
-            let wk = Arc::clone(&workers_at_barrier);
+            let worker_barrier = barrier.clone();
             let c = Arc::clone(&counter);
             let armed = Arc::clone(&barrier_armed);
             handles.push(thread::spawn(move || {
                 while !armed.load(Ordering::Acquire) {
                     spin_loop();
                 }
-                barrier_check(&w, &wk);
+                worker_barrier.check();
                 c.fetch_add(1, Ordering::Relaxed);
             }));
         }
 
-        wait.store(1, Ordering::Release);
+        barrier.arm();
         barrier_armed.store(true, Ordering::Release);
 
-        while workers_at_barrier.load(Ordering::Acquire) != n as u32 {
+        while barrier.paused_workers() != n {
             spin_loop();
         }
 
         assert_eq!(counter.load(Ordering::Acquire), 0);
 
-        barrier_release(&wait, &workers_at_barrier);
+        barrier.release();
 
         for h in handles {
             h.join().unwrap();
@@ -263,54 +333,54 @@ mod tests {
 
     #[test]
     fn barrier_release_waits_for_worker_owned_count_to_reach_zero() {
-        let wait = Arc::new(AtomicU32::new(1));
-        let workers = Arc::new(AtomicU32::new(1));
+        let barrier = WorkerBarrier::new(1);
+        barrier.state.wait.store(1, Ordering::Release);
+        barrier.state.workers.store(1, Ordering::Release);
         let (released_tx, released_rx) = mpsc::channel();
         let (exit_tx, exit_rx) = mpsc::channel();
 
-        let worker_wait = Arc::clone(&wait);
-        let worker_count = Arc::clone(&workers);
+        let worker_barrier = barrier.clone();
         let worker = thread::spawn(move || {
-            while worker_wait.load(Ordering::Acquire) > 0 {
+            while worker_barrier.is_pending() {
                 spin_loop();
             }
             released_tx.send(()).expect("report barrier release");
             exit_rx.recv().expect("leave barrier");
-            worker_count.fetch_sub(1, Ordering::Release);
+            worker_barrier.state.workers.fetch_sub(1, Ordering::Release);
         });
 
-        let release_wait = Arc::clone(&wait);
-        let release_count = Arc::clone(&workers);
-        let releaser = thread::spawn(move || barrier_release(&release_wait, &release_count));
+        let release_barrier = barrier.clone();
+        let releaser = thread::spawn(move || release_barrier.release());
 
         released_rx.recv().expect("worker observed release");
         exit_tx.send(()).expect("allow worker exit");
         worker.join().expect("worker");
         releaser.join().expect("releaser");
-        assert_eq!(workers.load(Ordering::Acquire), 0);
+        assert_eq!(barrier.paused_workers(), 0);
     }
 
     #[test]
     fn recursive_barrier_releases_workers_only_at_outer_drop() {
-        let wait = Arc::new(AtomicU32::new(0));
-        let workers = Arc::new(AtomicU32::new(0));
+        let barrier = WorkerBarrier::new(1);
         let resumed = Arc::new(AtomicBool::new(false));
 
-        let worker_wait = Arc::clone(&wait);
-        let worker_count = Arc::clone(&workers);
+        let worker_barrier = barrier.clone();
         let worker_resumed = Arc::clone(&resumed);
         let worker = thread::spawn(move || {
-            barrier_check(&worker_wait, &worker_count);
+            while !worker_barrier.is_pending() {
+                spin_loop();
+            }
+            worker_barrier.check();
             worker_resumed.store(true, Ordering::Release);
         });
 
-        let outer = barrier_sync(&wait, &workers, 1);
-        let inner = barrier_sync(&wait, &workers, 1);
-        drop(inner);
-        assert!(!resumed.load(Ordering::Acquire));
-        assert_eq!(wait.load(Ordering::Acquire), 1);
-
-        drop(outer);
+        let mut outer_value = ();
+        let mut inner_value = ();
+        barrier.sync(&mut outer_value, |_| {
+            barrier.sync(&mut inner_value, |_| {});
+            assert!(!resumed.load(Ordering::Acquire));
+            assert!(barrier.is_pending());
+        });
         worker.join().expect("worker");
         assert!(resumed.load(Ordering::Acquire));
     }

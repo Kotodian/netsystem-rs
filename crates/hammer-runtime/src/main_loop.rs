@@ -7,7 +7,6 @@ use std::time::Instant;
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 
-use crate::barrier;
 use crate::engine::Engine;
 use crate::spawn;
 use crate::spawn::{DATA_LOCAL_DRIVER_WAKER, DATA_WORKER_IDLE_SLICE, with_data_plane_runtime};
@@ -29,8 +28,6 @@ pub fn engine_main_loop(
     runtime: &tokio::runtime::Runtime,
     remote_local: &spawn::DataRemoteLocalQueue,
 ) -> i32 {
-    let wait = Arc::clone(&engine.wait_at_barrier);
-    let workers = Arc::clone(&engine.workers_at_barrier);
     let idle_slice = DATA_WORKER_IDLE_SLICE.with(|s| s.get());
 
     let worker_waker = Arc::new(spawn::DataWorkerThreadWake {
@@ -73,11 +70,12 @@ pub fn engine_main_loop(
         let mut progress = false;
 
         // Step 1: Barrier check — VPP threads.c:296
-        if barrier::barrier_check_and_report(&wait, &workers, || {
+        if engine.barrier.is_pending() {
             engine.publish_worker_runtime_stats();
-        }) && !engine.apply_worker_graph_update_after_barrier()
-        {
-            return 1;
+            engine.barrier.check();
+            if !engine.refork_worker_graph() {
+                return 1;
+            }
         }
 
         // Step 2: Poll worker-local File readiness before graph dispatch.
