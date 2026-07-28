@@ -290,40 +290,36 @@ impl InterfaceControlPlane {
         if name.is_empty() {
             return Err(InterfaceError::NameEmpty);
         }
-        self.synchronize(|| {
-            let current = self.inner.state();
-            if let Some(current_index) = current.interface_index(&name) {
-                return Ok(current_index);
-            }
-            let mut next = InterfaceState::clone(&current);
-            let interface_count = next.interfaces.len();
-            let next_index = u32::try_from(interface_count)
-                .map_err(|_| InterfaceError::IndexSpaceExhausted { interface_count })?;
-            if next_index == u32::MAX {
-                return Err(InterfaceError::IndexSpaceExhausted { interface_count });
-            }
-            next.interfaces.push(InterfaceRecord {
-                name: name.clone(),
-                addresses: Vec::new(),
-                mtu,
-            });
-            self.publish(next);
-            Ok(next_index)
-        })
+        let current = self.inner.state();
+        if let Some(current_index) = current.interface_index(&name) {
+            return Ok(current_index);
+        }
+        let mut next = InterfaceState::clone(&current);
+        let interface_count = next.interfaces.len();
+        let next_index = u32::try_from(interface_count)
+            .map_err(|_| InterfaceError::IndexSpaceExhausted { interface_count })?;
+        if next_index == u32::MAX {
+            return Err(InterfaceError::IndexSpaceExhausted { interface_count });
+        }
+        next.interfaces.push(InterfaceRecord {
+            name,
+            addresses: Vec::new(),
+            mtu,
+        });
+        self.publish(next);
+        Ok(next_index)
     }
 
     pub fn set_mtu(&self, interface_index: u32, mtu: InterfaceMtu) -> InterfaceResult<()> {
         self.ensure_interface(interface_index)?;
-        self.synchronize(|| {
-            let current = self.inner.state();
-            let mut next = InterfaceState::clone(current);
-            let interface = next
-                .interface_mut(interface_index)
-                .ok_or(InterfaceError::NotRegistered { interface_index })?;
-            interface.mtu = mtu;
-            self.publish(next);
-            Ok(())
-        })
+        let current = self.inner.state();
+        let mut next = InterfaceState::clone(current);
+        let interface = next
+            .interface_mut(interface_index)
+            .ok_or(InterfaceError::NotRegistered { interface_index })?;
+        interface.mtu = mtu;
+        self.publish(next);
+        Ok(())
     }
 
     pub fn set_protocol_mtu(
@@ -333,67 +329,60 @@ impl InterfaceControlPlane {
         value: u32,
     ) -> InterfaceResult<()> {
         self.ensure_interface(interface_index)?;
-        self.synchronize(|| {
-            let current = self.inner.state();
-            let mut next = InterfaceState::clone(current);
-            let interface = next
-                .interface_mut(interface_index)
-                .ok_or(InterfaceError::NotRegistered { interface_index })?;
-            interface.mtu.set(kind, value);
-            self.publish(next);
-            Ok(())
-        })
+        let current = self.inner.state();
+        let mut next = InterfaceState::clone(current);
+        let interface = next
+            .interface_mut(interface_index)
+            .ok_or(InterfaceError::NotRegistered { interface_index })?;
+        interface.mtu.set(kind, value);
+        self.publish(next);
+        Ok(())
     }
 
     pub fn add_address(&self, interface_index: u32, address: IpNet) -> InterfaceResult<u32> {
         self.ensure_interface(interface_index)?;
-        self.synchronize(|| {
-            let current = self.inner.state();
-            if let Some(current_index) = current.interface_address_index(interface_index, address) {
-                return Ok(current_index);
-            }
-            let mut next = InterfaceState::clone(&current);
-            let index = next.addresses.len() as u32;
-            next.address_to_index
-                .insert(InterfaceAddressKey::new(interface_index, address), index);
-            next.addresses.push(InterfaceAddressRecord {
-                interface_index,
-                address,
-                removed: false,
-            });
-            next.interfaces[interface_index as usize]
-                .addresses
-                .push(index);
-            self.publish(next);
-            Ok(index)
-        })
+        let current = self.inner.state();
+        if let Some(current_index) = current.interface_address_index(interface_index, address) {
+            return Ok(current_index);
+        }
+        let mut next = InterfaceState::clone(&current);
+        let index = next.addresses.len() as u32;
+        next.address_to_index
+            .insert(InterfaceAddressKey::new(interface_index, address), index);
+        next.addresses.push(InterfaceAddressRecord {
+            interface_index,
+            address,
+            removed: false,
+        });
+        next.interfaces[interface_index as usize]
+            .addresses
+            .push(index);
+        self.publish(next);
+        Ok(index)
     }
 
     pub fn remove_address(&self, interface_index: u32, address: IpNet) -> InterfaceResult<bool> {
         self.ensure_interface(interface_index)?;
-        self.synchronize(|| {
-            let current = self.inner.state();
-            let Some(address_index) = current.interface_address_index(interface_index, address)
-            else {
-                return Ok(false);
-            };
-            let mut next = InterfaceState::clone(&current);
-            if let Some(address) = next.addresses.get_mut(address_index as usize) {
-                address.removed = true;
-            }
-            if let Some(interface) = next.interfaces.get_mut(interface_index as usize) {
-                let addresses = interface
-                    .addresses
-                    .iter()
-                    .copied()
-                    .filter(|index| *index != address_index)
-                    .collect::<Vec<_>>();
-                interface.addresses = addresses;
-            }
-            next.rebuild_address_index();
-            self.publish(next);
-            Ok(true)
-        })
+        let current = self.inner.state();
+        let Some(address_index) = current.interface_address_index(interface_index, address) else {
+            return Ok(false);
+        };
+        let mut next = InterfaceState::clone(&current);
+        if let Some(address) = next.addresses.get_mut(address_index as usize) {
+            address.removed = true;
+        }
+        if let Some(interface) = next.interfaces.get_mut(interface_index as usize) {
+            let addresses = interface
+                .addresses
+                .iter()
+                .copied()
+                .filter(|index| *index != address_index)
+                .collect::<Vec<_>>();
+            interface.addresses = addresses;
+        }
+        next.rebuild_address_index();
+        self.publish(next);
+        Ok(true)
     }
 
     #[inline]
@@ -406,17 +395,22 @@ impl InterfaceControlPlane {
     }
 
     #[inline]
-    fn synchronize<R>(&self, operation: impl FnOnce() -> InterfaceResult<R>) -> InterfaceResult<R> {
-        if let Some(barrier) = &self.barrier {
-            barrier.synchronize(operation)
-        } else {
-            operation()
-        }
-    }
-
-    #[inline]
     fn publish(&self, state: InterfaceState) {
-        self.inner.replace_after_barrier(state);
+        let mut state = Some(state);
+        if let Some(barrier) = &self.barrier {
+            let mut state = barrier.sync(&mut state);
+            self.inner.replace_after_barrier(
+                state
+                    .take()
+                    .expect("interface barrier retains candidate state"),
+            );
+        } else {
+            self.inner.replace_after_barrier(
+                state
+                    .take()
+                    .expect("interface publication retains candidate state"),
+            );
+        }
     }
 }
 
