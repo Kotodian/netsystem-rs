@@ -1,5 +1,4 @@
 use std::cell::UnsafeCell;
-use std::fmt;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -34,63 +33,31 @@ pub struct FifoHeader {
     _pad2: [u8; 64 - (8 + 4)],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum FifoError {
+    #[error("FIFO capacity must be a power of two and at least 2")]
     InvalidCapacity,
+    #[error("FIFO capacity {capacity} exceeds the shared layout range")]
     CapacityOutOfRange { capacity: usize },
+    #[error("segment has insufficient space for FIFO storage")]
     SegmentExhausted,
+    #[error("FIFO has {available} writable bytes for {requested} requested bytes")]
+    InsufficientCapacity { requested: usize, available: usize },
+    #[error("FIFO writable reservation length {requested} exceeds {max_len}")]
+    ReservationTooLong { requested: usize, max_len: usize },
+    #[error("FIFO commit initialized {initialized} bytes for reservation of {reserved}")]
+    CommitExceedsReservation { initialized: usize, reserved: usize },
+    #[error("out-of-order FIFO delivery is disabled")]
     OutOfOrderDisabled,
+    #[error("out-of-order FIFO length {length} exceeds u32")]
     OutOfOrderLengthOutOfRange { length: usize },
+    #[error("out-of-order FIFO offset {offset} plus length {length} overflows u32")]
     OutOfOrderOffsetOverflow { offset: u32, length: u32 },
+    #[error("out-of-order FIFO end offset {end_offset} exceeds available capacity {available}")]
     OutOfOrderCapacityExceeded { end_offset: u32, available: usize },
+    #[error("out-of-order FIFO segment storage exhausted at {entries} entries")]
     OutOfOrderStorageExhausted { entries: usize },
 }
-
-impl fmt::Display for FifoError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidCapacity => {
-                f.write_str("FIFO capacity must be a power of two and at least 2")
-            }
-            Self::CapacityOutOfRange { capacity } => {
-                write!(
-                    f,
-                    "FIFO capacity {capacity} exceeds the shared layout range"
-                )
-            }
-            Self::SegmentExhausted => {
-                f.write_str("segment has insufficient space for FIFO storage")
-            }
-            Self::OutOfOrderDisabled => f.write_str("out-of-order FIFO delivery is disabled"),
-            Self::OutOfOrderLengthOutOfRange { length } => {
-                write!(f, "out-of-order FIFO length {length} exceeds u32")
-            }
-            Self::OutOfOrderOffsetOverflow { offset, length } => {
-                write!(
-                    f,
-                    "out-of-order FIFO offset {offset} plus length {length} overflows u32"
-                )
-            }
-            Self::OutOfOrderCapacityExceeded {
-                end_offset,
-                available,
-            } => {
-                write!(
-                    f,
-                    "out-of-order FIFO end offset {end_offset} exceeds available capacity {available}"
-                )
-            }
-            Self::OutOfOrderStorageExhausted { entries } => {
-                write!(
-                    f,
-                    "out-of-order FIFO segment storage exhausted at {entries} entries"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for FifoError {}
 
 pub struct OooResult {
     pub accepted: u32,
@@ -108,6 +75,24 @@ struct OooBookkeeping {
     base: u32,
     entries: Pool<OooSegment>,
     index: RbTree<u32, PoolIndex>,
+}
+
+#[derive(Clone, Copy)]
+struct ReservedChunk {
+    off: u64,
+    data_offset: usize,
+    original_len: u32,
+    reserved_len: usize,
+}
+
+pub struct FifoWriteReservation<'a> {
+    fifo: &'a Fifo,
+    start_tail: u32,
+    original_tail_chunk: u64,
+    first: Option<ReservedChunk>,
+    second: Option<ReservedChunk>,
+    reserved_len: usize,
+    complete: bool,
 }
 
 impl OooBookkeeping {
@@ -147,6 +132,125 @@ impl OooBookkeeping {
         self.entries = entries;
         self.index = index;
         Ok(())
+    }
+}
+
+impl<'a> FifoWriteReservation<'a> {
+    pub fn reserved_len(&self) -> usize {
+        self.reserved_len
+    }
+
+    pub fn segments_mut(&mut self) -> (&mut [u8], &mut [u8]) {
+        unsafe {
+            let first = match self.first {
+                Some(chunk) => {
+                    let ptr = self
+                        .fifo
+                        .base
+                        .add(chunk.off as usize + CHUNK_HEADER_SIZE + chunk.data_offset);
+                    std::slice::from_raw_parts_mut(ptr, chunk.reserved_len)
+                }
+                None => &mut [],
+            };
+            let second = match self.second {
+                Some(chunk) => {
+                    let ptr = self
+                        .fifo
+                        .base
+                        .add(chunk.off as usize + CHUNK_HEADER_SIZE + chunk.data_offset);
+                    std::slice::from_raw_parts_mut(ptr, chunk.reserved_len)
+                }
+                None => &mut [],
+            };
+            (first, second)
+        }
+    }
+
+    pub fn commit(&mut self, initialized: usize) -> Result<usize, FifoError> {
+        if initialized > self.reserved_len {
+            return Err(FifoError::CommitExceedsReservation {
+                initialized,
+                reserved: self.reserved_len,
+            });
+        }
+
+        self.publish_initialized(initialized);
+        self.complete = true;
+        Ok(initialized)
+    }
+
+    pub fn cancel(&mut self) {
+        self.rollback();
+        self.complete = true;
+    }
+
+    fn publish_initialized(&mut self, initialized: usize) {
+        unsafe {
+            self.set_visible_len(initialized);
+            let tail = self.start_tail.wrapping_add(initialized as u32);
+            (*self.fifo.hdr)
+                .tail_chunk
+                .store(self.published_tail_chunk(initialized), Ordering::Release);
+            (*self.fifo.hdr).tail.store(tail, Ordering::Release);
+            let collected = self.fifo.promote_contiguous_from(tail);
+            (*self.fifo.hdr)
+                .tail
+                .store(tail.wrapping_add(collected), Ordering::Release);
+        }
+    }
+
+    fn published_tail_chunk(&self, initialized: usize) -> u64 {
+        match (self.first, self.second) {
+            (_, Some(second)) if initialized > self.first.map_or(0, |first| first.reserved_len) => {
+                second.off
+            }
+            (Some(first), _) => first.off,
+            (None, _) => self.original_tail_chunk,
+        }
+    }
+
+    unsafe fn set_visible_len(&self, initialized: usize) {
+        let mut remaining = initialized;
+        if let Some(first) = self.first {
+            let visible = remaining.min(first.reserved_len);
+            unsafe { self.set_chunk_len(first, visible) };
+            remaining -= visible;
+        }
+        if let Some(second) = self.second {
+            let visible = remaining.min(second.reserved_len);
+            unsafe { self.set_chunk_len(second, visible) };
+        }
+    }
+
+    unsafe fn set_chunk_len(&self, chunk: ReservedChunk, visible: usize) {
+        let chunk_ref = unsafe { &*self.fifo.base.add(chunk.off as usize).cast::<Chunk>() };
+        let len = chunk.data_offset + visible;
+        let restored = (len as u32).max(chunk.original_len.min(chunk.data_offset as u32));
+        chunk_ref.length.store(restored, Ordering::Relaxed);
+    }
+
+    fn rollback(&mut self) {
+        unsafe {
+            if let Some(first) = self.first {
+                let chunk = &*self.fifo.base.add(first.off as usize).cast::<Chunk>();
+                chunk.length.store(first.original_len, Ordering::Relaxed);
+            }
+            if let Some(second) = self.second {
+                let chunk = &*self.fifo.base.add(second.off as usize).cast::<Chunk>();
+                chunk.length.store(second.original_len, Ordering::Relaxed);
+            }
+            (*self.fifo.hdr)
+                .tail_chunk
+                .store(self.original_tail_chunk, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for FifoWriteReservation<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.rollback();
+        }
     }
 }
 
@@ -661,6 +765,244 @@ impl Fifo {
         }
     }
 
+    pub fn reserve_write(&self, len: usize) -> Result<FifoWriteReservation<'_>, FifoError> {
+        let hdr = self.hdr;
+        unsafe {
+            let head = (*hdr).head.load(Ordering::Acquire);
+            let tail = (*hdr).tail.load(Ordering::Relaxed);
+            if head == tail {
+                self.prepare_empty_tail_chunk(tail);
+            }
+            let used = tail.wrapping_sub(head);
+            let available = ((*hdr).size - used) as usize;
+            if len > available {
+                return Err(FifoError::InsufficientCapacity {
+                    requested: len,
+                    available,
+                });
+            }
+
+            let original_tail_chunk = (*hdr).tail_chunk.load(Ordering::Relaxed);
+            if len == 0 {
+                return Ok(FifoWriteReservation {
+                    fifo: self,
+                    start_tail: tail,
+                    original_tail_chunk,
+                    first: None,
+                    second: None,
+                    reserved_len: 0,
+                    complete: false,
+                });
+            }
+
+            self.reserve_write_at_tail(tail, len, original_tail_chunk)
+        }
+    }
+
+    unsafe fn reserve_write_at_tail(
+        &self,
+        tail: u32,
+        len: usize,
+        original_tail_chunk: u64,
+    ) -> Result<FifoWriteReservation<'_>, FifoError> {
+        let chunk_data_size = unsafe { (*self.hdr).min_alloc as usize };
+        let first_off = unsafe { self.tail_chunk_for_write(tail, original_tail_chunk)? };
+        let (first, remaining) = unsafe { self.reserve_chunk_prefix(first_off, tail, len) };
+
+        if remaining > chunk_data_size {
+            unsafe { self.abort_reservation(original_tail_chunk, first, None) };
+            return Err(FifoError::ReservationTooLong {
+                requested: len,
+                max_len: first.reserved_len + chunk_data_size,
+            });
+        }
+
+        let second = if remaining == 0 {
+            None
+        } else {
+            match unsafe { self.reserve_following_chunk(first.off, remaining) } {
+                Ok(second) => Some(second),
+                Err(err) => {
+                    unsafe { self.abort_reservation(original_tail_chunk, first, None) };
+                    return Err(err);
+                }
+            }
+        };
+
+        Ok(FifoWriteReservation {
+            fifo: self,
+            start_tail: tail,
+            original_tail_chunk,
+            first: Some(first),
+            second,
+            reserved_len: len,
+            complete: false,
+        })
+    }
+
+    unsafe fn tail_chunk_for_write(
+        &self,
+        tail: u32,
+        original_tail_chunk: u64,
+    ) -> Result<u64, FifoError> {
+        let hdr = self.hdr;
+        let chunk_data_size = unsafe { (*hdr).min_alloc };
+        let mut chunk_off = unsafe { (*hdr).tail_chunk.load(Ordering::Relaxed) };
+
+        loop {
+            if chunk_off == 0 {
+                let Some(new_off) = (unsafe { self.acquire_chunk(tail) }) else {
+                    return Err(FifoError::SegmentExhausted);
+                };
+                unsafe {
+                    (*hdr).head_chunk.store(new_off, Ordering::Release);
+                    (*hdr).tail_chunk.store(new_off, Ordering::Release);
+                }
+                return Ok(new_off);
+            }
+
+            let chunk = unsafe { &*self.base.add(chunk_off as usize).cast::<Chunk>() };
+            if tail < chunk.start_byte {
+                unsafe { self.restore_tail_chunk(original_tail_chunk) };
+                return Err(FifoError::SegmentExhausted);
+            }
+
+            let chunk_end = chunk.start_byte + chunk_data_size;
+            if tail < chunk_end {
+                unsafe { self.restore_tail_chunk(chunk_off) };
+                return Ok(chunk_off);
+            }
+
+            let next_off = chunk.next.load(Ordering::Acquire);
+            if next_off != 0 {
+                let next = unsafe { &*self.base.add(next_off as usize).cast::<Chunk>() };
+                if tail >= next.start_byte {
+                    unsafe { self.restore_tail_chunk(next_off) };
+                    chunk_off = next_off;
+                    continue;
+                }
+            }
+
+            if tail > chunk_end {
+                unsafe { self.restore_tail_chunk(original_tail_chunk) };
+                return Err(FifoError::SegmentExhausted);
+            }
+
+            let Some(new_off) = (unsafe { self.acquire_chunk(tail) }) else {
+                unsafe { self.restore_tail_chunk(original_tail_chunk) };
+                return Err(FifoError::SegmentExhausted);
+            };
+            let new_chunk = unsafe { &*self.base.add(new_off as usize).cast::<Chunk>() };
+            new_chunk.next.store(next_off, Ordering::Relaxed);
+            chunk.next.store(new_off, Ordering::Release);
+            unsafe { self.restore_tail_chunk(new_off) };
+            return Ok(new_off);
+        }
+    }
+
+    unsafe fn reserve_chunk_prefix(
+        &self,
+        chunk_off: u64,
+        logical_pos: u32,
+        len: usize,
+    ) -> (ReservedChunk, usize) {
+        let chunk_data_size = unsafe { (*self.hdr).min_alloc as usize };
+        let chunk = unsafe { &*self.base.add(chunk_off as usize).cast::<Chunk>() };
+        let data_offset = logical_pos.wrapping_sub(chunk.start_byte) as usize;
+        let reserved_len = len.min(chunk_data_size - data_offset);
+        let original_len = chunk.length.load(Ordering::Relaxed);
+        let visible_len = data_offset + reserved_len;
+        if visible_len > original_len as usize {
+            chunk.length.store(visible_len as u32, Ordering::Relaxed);
+        }
+        (
+            ReservedChunk {
+                off: chunk_off,
+                data_offset,
+                original_len,
+                reserved_len,
+            },
+            len - reserved_len,
+        )
+    }
+
+    unsafe fn reserve_following_chunk(
+        &self,
+        prev_off: u64,
+        len: usize,
+    ) -> Result<ReservedChunk, FifoError> {
+        let prev = unsafe { &*self.base.add(prev_off as usize).cast::<Chunk>() };
+        let next_start = prev.start_byte + unsafe { (*self.hdr).min_alloc };
+        let next_off = prev.next.load(Ordering::Acquire);
+        let chunk_off = unsafe { self.following_chunk_for_write(prev_off, next_start, next_off)? };
+        unsafe { self.restore_tail_chunk(chunk_off) };
+
+        let chunk = unsafe { &*self.base.add(chunk_off as usize).cast::<Chunk>() };
+        let original_len = chunk.length.load(Ordering::Relaxed);
+        if len > original_len as usize {
+            chunk.length.store(len as u32, Ordering::Relaxed);
+        }
+        Ok(ReservedChunk {
+            off: chunk_off,
+            data_offset: 0,
+            original_len,
+            reserved_len: len,
+        })
+    }
+
+    unsafe fn following_chunk_for_write(
+        &self,
+        prev_off: u64,
+        start_byte: u32,
+        next_off: u64,
+    ) -> Result<u64, FifoError> {
+        let prev = unsafe { &*self.base.add(prev_off as usize).cast::<Chunk>() };
+        if next_off != 0 {
+            let next = unsafe { &*self.base.add(next_off as usize).cast::<Chunk>() };
+            if next.start_byte == start_byte {
+                return Ok(next_off);
+            }
+            if next.start_byte < start_byte {
+                return Err(FifoError::SegmentExhausted);
+            }
+        }
+
+        let Some(new_off) = (unsafe { self.acquire_chunk(start_byte) }) else {
+            return Err(FifoError::SegmentExhausted);
+        };
+        let new_chunk = unsafe { &*self.base.add(new_off as usize).cast::<Chunk>() };
+        new_chunk.next.store(next_off, Ordering::Relaxed);
+        prev.next.store(new_off, Ordering::Release);
+        Ok(new_off)
+    }
+
+    unsafe fn abort_reservation(
+        &self,
+        tail_chunk: u64,
+        first: ReservedChunk,
+        second: Option<ReservedChunk>,
+    ) {
+        unsafe {
+            let first_chunk = &*self.base.add(first.off as usize).cast::<Chunk>();
+            first_chunk
+                .length
+                .store(first.original_len, Ordering::Relaxed);
+            if let Some(second) = second {
+                let second_chunk = &*self.base.add(second.off as usize).cast::<Chunk>();
+                second_chunk
+                    .length
+                    .store(second.original_len, Ordering::Relaxed);
+            }
+            self.restore_tail_chunk(tail_chunk);
+        }
+    }
+
+    unsafe fn restore_tail_chunk(&self, chunk_off: u64) {
+        unsafe {
+            (*self.hdr).tail_chunk.store(chunk_off, Ordering::Release);
+        }
+    }
+
     #[inline]
     pub fn needs_deq_notification(&self, dropped: usize) -> bool {
         if dropped == 0 {
@@ -1111,6 +1453,232 @@ mod tests {
         f.enqueue(b"hello");
         let total = f.peek_segments(0, 5, |a, b| a.len() + b.len());
         assert_eq!(total, Some(5));
+    }
+
+    #[test]
+    fn writable_reservation_commits_contiguous_bytes() {
+        let f = fifo(4096);
+        let mut reservation = f.reserve_write(5).expect("reservation");
+        assert_eq!(reservation.reserved_len(), 5);
+        {
+            let (first, second) = reservation.segments_mut();
+            assert_eq!(first.len(), 5);
+            assert!(second.is_empty());
+            first.copy_from_slice(b"hello");
+        }
+        assert_eq!(reservation.commit(5), Ok(5));
+
+        let mut out = [0; 8];
+        assert_eq!(f.peek(0, 5, &mut out), 5);
+        assert_eq!(&out[..5], b"hello");
+    }
+
+    #[test]
+    fn writable_reservation_commits_split_bytes() {
+        let f = fifo(1 << 13);
+        let prefix = vec![0xA5; 4090];
+        assert_eq!(f.enqueue(&prefix), prefix.len());
+
+        let mut reservation = f.reserve_write(12).expect("split reservation");
+        {
+            let (first, second) = reservation.segments_mut();
+            assert_eq!(first.len(), 6);
+            assert_eq!(second.len(), 6);
+            first.copy_from_slice(b"abcdef");
+            second.copy_from_slice(b"ghijkl");
+        }
+        assert_eq!(reservation.commit(12), Ok(12));
+
+        let mut out = vec![0; prefix.len() + 12];
+        assert_eq!(f.peek(0, out.len(), &mut out), out.len());
+        assert_eq!(&out[..prefix.len()], prefix.as_slice());
+        assert_eq!(&out[prefix.len()..], b"abcdefghijkl");
+    }
+
+    #[test]
+    fn writable_reservation_partial_commit_publishes_initialized_prefix_only() {
+        let f = fifo(1 << 13);
+        let prefix = vec![0xA5; 4090];
+        assert_eq!(f.enqueue(&prefix), prefix.len());
+
+        let mut reservation = f.reserve_write(12).expect("split reservation");
+        {
+            let (first, second) = reservation.segments_mut();
+            first.copy_from_slice(b"abcdef");
+            second.copy_from_slice(b"ghijkl");
+        }
+        assert_eq!(reservation.commit(4), Ok(4));
+
+        assert_eq!(f.max_dequeue(), prefix.len() + 4);
+        let mut out = vec![0; prefix.len() + 4];
+        assert_eq!(f.peek(0, out.len(), &mut out), out.len());
+        assert_eq!(&out[prefix.len()..], b"abcd");
+        assert_eq!(f.enqueue(b"EFGH"), 4);
+        let mut tail = [0; 8];
+        assert_eq!(f.peek(prefix.len(), 8, &mut tail), 8);
+        assert_eq!(&tail, b"abcdEFGH");
+    }
+
+    #[test]
+    fn writable_reservation_cancel_leaves_fifo_unchanged() {
+        let f = fifo(4096);
+        assert_eq!(f.enqueue(b"seed"), 4);
+        let mut reservation = f.reserve_write(4).expect("reservation");
+        {
+            let (first, _) = reservation.segments_mut();
+            first.copy_from_slice(b"junk");
+        }
+        reservation.cancel();
+
+        assert_eq!(f.max_dequeue(), 4);
+        let mut out = [0; 8];
+        assert_eq!(f.peek(0, 8, &mut out), 4);
+        assert_eq!(&out[..4], b"seed");
+        assert_eq!(f.enqueue(b"next"), 4);
+        assert_eq!(f.peek(0, 8, &mut out), 8);
+        assert_eq!(&out, b"seednext");
+    }
+
+    #[test]
+    fn writable_reservation_drop_leaves_split_fifo_unchanged_and_retriable() {
+        let f = fifo(1 << 13);
+        let prefix = vec![0xA5; 4090];
+        assert_eq!(f.enqueue(&prefix), prefix.len());
+        {
+            let mut reservation = f.reserve_write(12).expect("split reservation");
+            let (first, second) = reservation.segments_mut();
+            first.fill(0x11);
+            second.fill(0x22);
+        }
+
+        assert_eq!(f.max_dequeue(), prefix.len());
+        assert_eq!(f.enqueue(b"abcdef"), 6);
+        let mut out = vec![0; prefix.len() + 6];
+        assert_eq!(f.peek(0, out.len(), &mut out), out.len());
+        assert_eq!(&out[prefix.len()..], b"abcdef");
+    }
+
+    #[test]
+    fn invalid_writable_commit_is_typed_and_drop_rolls_back() {
+        let f = fifo(4096);
+        let err = {
+            let mut reservation = f.reserve_write(4).expect("reservation");
+            let (first, _) = reservation.segments_mut();
+            first.copy_from_slice(b"junk");
+            reservation.commit(5).expect_err("invalid commit length")
+        };
+        assert_eq!(
+            err,
+            FifoError::CommitExceedsReservation {
+                initialized: 5,
+                reserved: 4
+            }
+        );
+        assert_eq!(f.max_dequeue(), 0);
+        assert_eq!(f.enqueue(b"next"), 4);
+        let mut out = [0; 4];
+        assert_eq!(f.peek(0, 4, &mut out), 4);
+        assert_eq!(&out, b"next");
+    }
+
+    #[test]
+    fn writable_reservation_rejects_full_fifo_without_mutation() {
+        let f = fifo(4096);
+        let full = vec![0xA5; 4096];
+        assert_eq!(f.enqueue(&full), full.len());
+        let err = match f.reserve_write(1) {
+            Ok(_) => panic!("full FIFO accepted writable reservation"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err,
+            FifoError::InsufficientCapacity {
+                requested: 1,
+                available: 0
+            }
+        );
+        assert_eq!(f.max_dequeue(), full.len());
+        assert_eq!(f.dequeue_drop(full.len()), full.len());
+        assert_eq!(f.enqueue(b"ok"), 2);
+    }
+
+    #[test]
+    fn writable_reservation_rejects_more_than_two_segments_without_mutation() {
+        let f = fifo(1 << 14);
+        let first_chunk = vec![0xA5; 4096];
+        assert_eq!(f.enqueue(&first_chunk), first_chunk.len());
+
+        let err = match f.reserve_write(8193) {
+            Ok(_) => panic!("oversized writable reservation succeeded"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err,
+            FifoError::ReservationTooLong {
+                requested: 8193,
+                max_len: 8192
+            }
+        );
+        assert_eq!(f.max_dequeue(), first_chunk.len());
+        assert_eq!(f.enqueue(b"next"), 4);
+        let mut out = vec![0; first_chunk.len() + 4];
+        assert_eq!(f.peek(0, out.len(), &mut out), out.len());
+        assert_eq!(&out[..first_chunk.len()], first_chunk.as_slice());
+        assert_eq!(&out[first_chunk.len()..], b"next");
+    }
+
+    #[test]
+    fn writable_reservation_inserts_gap_before_future_ooo_chunk() {
+        let segment = Segment::local(1 << 20);
+        let mut f = Fifo::new(segment, 1 << 16).expect("fifo");
+        f.enable_ooo();
+        let first_chunk = vec![0xA5; 4096];
+        let gap_chunk = vec![0x5A; 4096];
+
+        assert_eq!(f.enqueue(&first_chunk), first_chunk.len());
+        f.enqueue_ooo(4096, b"future").expect("ooo enqueue");
+
+        let mut reservation = f.reserve_write(gap_chunk.len()).expect("gap reservation");
+        let (first, second) = reservation.segments_mut();
+        assert_eq!(first.len(), gap_chunk.len());
+        assert!(second.is_empty());
+        first.copy_from_slice(&gap_chunk);
+        assert_eq!(reservation.commit(gap_chunk.len()), Ok(gap_chunk.len()));
+
+        let expected_len = first_chunk.len() + gap_chunk.len() + b"future".len();
+        assert_eq!(f.max_dequeue(), expected_len);
+        let mut out = vec![0; expected_len];
+        assert_eq!(f.peek(0, out.len(), &mut out), out.len());
+        assert_eq!(&out[..first_chunk.len()], first_chunk.as_slice());
+        assert_eq!(
+            &out[first_chunk.len()..first_chunk.len() + gap_chunk.len()],
+            gap_chunk.as_slice()
+        );
+        assert_eq!(&out[first_chunk.len() + gap_chunk.len()..], b"future");
+    }
+
+    #[test]
+    fn writable_reservation_reuses_released_chunk_after_wraparound() {
+        let f = fifo(1 << 13);
+        let first = vec![0xA5; 4096];
+        let second = vec![0x5A; 512];
+        assert_eq!(f.enqueue(&first), first.len());
+        assert_eq!(f.enqueue(&second), second.len());
+        assert_eq!(f.dequeue_drop(first.len()), first.len());
+
+        let mut reservation = f.reserve_write(4096).expect("wrap reservation");
+        let (first_segment, second_segment) = reservation.segments_mut();
+        assert_eq!(first_segment.len(), 3584);
+        assert_eq!(second_segment.len(), 512);
+        first_segment.fill(0x11);
+        second_segment.fill(0x22);
+        assert_eq!(reservation.commit(4096), Ok(4096));
+
+        let mut out = vec![0; second.len() + 4096];
+        assert_eq!(f.peek(0, out.len(), &mut out), out.len());
+        assert_eq!(&out[..second.len()], second.as_slice());
+        assert_eq!(&out[second.len()..second.len() + 3584], &[0x11; 3584]);
+        assert_eq!(&out[second.len() + 3584..], &[0x22; 512]);
     }
 
     #[test]

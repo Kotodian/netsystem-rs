@@ -30,6 +30,7 @@ sha2 = { workspace = true }
 sha2-accelerated = { workspace = true }
 spinning_top = { workspace = true }
 talc = { workspace = true }
+thiserror = { workspace = true }
 x25519-dalek = { workspace = true }
 
 [dev-dependencies]

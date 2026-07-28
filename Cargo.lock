@@ -1180,6 +1180,7 @@ dependencies = [
  "sha2 0.11.0",
  "spinning_top",
  "talc",
+ "thiserror",
  "x25519-dalek",
 ]
 
