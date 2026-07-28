@@ -29,7 +29,7 @@ Workspace root: `crates/`. Dependency direction is strictly one-way to avoid cyc
 | `hammer-infra` | Bottom-layer infrastructure — the process-global fixed-capacity Main Heap authority plus lock-free data structures and memory primitives (cache-aligned). FIFO with OOO delivery, `Pool<T>` with generation counters, `TimerWheel1t2w2048sl`, VPP-style Bihash, `RbTree`, `Segment` (Local heap / Svm shared-memory mmap), internet checksum, SIMD primitives, ring buffers. Analogous to VPP's `vppinfra`. |
 | `hammer-core` | Minimal cross-DSO packet-graph ABI — Node/Frame/Buffer/Index/Next primitives and errors intrinsic to them. |
 | `hammer-component-macros` | Proc macros: `#[graph_node]`, `#[init_function]`, `#[worker_init_function]` for declarative packet-graph node registration via `linkme` distributed slices. |
-| `hammer-runtime` | Runtime engine — worker thread spawning, engine main loop with VPP fixed-schedule step order, barrier synchronization (`control_call_with_barrier`), `RuntimeRegistry` (typed service registry), session/app handle types. |
+| `hammer-runtime` | Runtime engine — worker thread spawning, engine main loop with VPP fixed-schedule step order, VPP-style worker barriers and synchronization primitives, `RuntimeRegistry` (typed service registry), session/app handle types. |
 | `hammer-service` | Protocol-neutral network infrastructure — interface, session, device, and feature-arc contracts used by independent plugins. |
 | `hammer-app` | Application-plane interface — app/session boundary for local and cross-process (shared-memory) sessions. `AppClient` (Unix socket + SCM_RIGHTS) returns `AppSession<Svm>`; independent apps use its async methods. Echo helpers for testing. |
 | `hammer-ipc` | Daemon ↔ CLI IPC protocol — length-prefixed frame format, request/reply message types, `#[ipc_handler]` registration via `linkme`, sync `IpcClient`. |
@@ -72,6 +72,57 @@ Use Rust 2024 conventions and rustfmt defaults: 4-space indentation, `snake_case
   wrapper type merely to observe, borrow, or re-expose another value, or to
   cache pointers and offsets into storage owned elsewhere.
 - Non-trivial designs must document the layer isolation contract: what each layer may call, what it must not call, which APIs cross the boundary, and which commands verify the boundary.
+
+### Synchronization rules
+
+- Prefer ownership over synchronization. Keep packet-path state worker-owned and
+  pass `&T`/`&mut T`; use `ThreadOwned<T>` only for indexed access to values
+  that remain owned by individual workers. Do not add a lock merely to satisfy
+  `Send` or `Sync`.
+- Project-owned generic synchronization primitives live in
+  `hammer_runtime::sync`. Do not define or re-export another generic spin lock,
+  reader-writer lock, fence wrapper, or barrier in another module or crate.
+- Use `WorkerBarrier` when the main/control thread must stop every Data Worker
+  before publishing graph, topology, registry, or other worker-visible state.
+  The barrier acknowledgement is the synchronization boundary: mutate the
+  barrier-owned value directly while workers are stopped. Do not add a
+  `Mutex`, `RwLock`, `AtomicPtr`, publication handle, or a second completion
+  protocol around that value. The only separate completion counter permitted
+  is for work that continues after release, such as VPP-style graph refork.
+- Use atomics for independent scalar state such as flags, counters, sequence
+  numbers, and queue indices when the complete invariant fits the atomic
+  transition. `Relaxed` is for statistics or thread-local ordering only;
+  publication normally uses a release operation paired with an acquire
+  operation, and read-modify-write transitions use `AcqRel` when both sides are
+  required. Document the value being published and the matching observer. An
+  atomic pointer is not an ownership model and must not replace a barrier-owned
+  value.
+- Use `compiler_barrier`, `release_fence`, `store_barrier`, and
+  `memory_barrier` only inside a documented low-level publication, device, FFI,
+  non-temporal-store, or lock-free protocol. State which accesses the fence
+  orders and identify the matching atomic/device operation. A compiler barrier
+  does not synchronize CPUs, and a hardware fence does not make a Rust data
+  race valid.
+- Use `SpinLock<T>` only for a bounded critical section between OS threads when
+  sleeping would be more expensive than the protected work. While holding it,
+  do not await, perform I/O or syscalls, invoke an unknown callback, allocate
+  unpredictably, or enter a worker barrier. Do not put an always-contended spin
+  lock on the normal packet hot path; partition state by worker first.
+- Use runtime `RwLock<T>` only for short, read-dominant access with rare bounded
+  writes. It is a reader-preferring spin lock matching VPP and can starve a
+  writer, so it is not suitable for lifecycle transitions, long readers, or
+  work that may block. It must not be layered around worker-barrier publication.
+- Use `std::sync::Mutex`/`RwLock` for control-plane or lifecycle state whose
+  critical section may outlast a short spin, accepting OS blocking and poison
+  handling. Never hold a synchronous guard across `.await`. Use a Tokio lock
+  only when shared async state genuinely must remain guarded across `.await`;
+  it is forbidden in the Data Worker packet loop.
+- Prefer bounded channels, lock-free rings, or handoff queues when ownership
+  moves between threads. The producer must stop accessing an item after
+  transfer, and backpressure/drop behavior must be part of the interface.
+- Keep critical sections local and use RAII guards. Do not expose manual unlock
+  methods, return references that outlive a guard, or nest synchronization
+  primitives without a documented global acquisition order.
 
 ### Naming rules
 
