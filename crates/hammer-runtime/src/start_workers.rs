@@ -1,6 +1,5 @@
 use core::hint::spin_loop;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -15,10 +14,9 @@ use crate::{DataPlaneHandoff, DataWorkerId, barrier};
 #[hammer_component_macros::main_loop_enter_function]
 pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
     let (worker_config, worker_count) = resolve_worker_startup(engine)?;
-    let wait = Arc::new(AtomicU32::new(1));
-    let workers = Arc::new(AtomicU32::new(0));
-    engine.wait_at_barrier = Arc::clone(&wait);
-    engine.workers_at_barrier = Arc::clone(&workers);
+    let barrier = barrier::WorkerBarrier::new(worker_count);
+    barrier.arm();
+    engine.barrier = barrier.clone();
     engine.main_loop_exit_now.store(false, Ordering::Release);
     engine.prepare_worker_runtime_stats(worker_config.count);
 
@@ -31,16 +29,15 @@ pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
         let worker_seed = engine.worker_seed();
         let worker_config = worker_config.clone();
         let handoff = handoff.worker(worker);
-        let worker_wait = Arc::clone(&wait);
-        let workers_at_barrier = Arc::clone(&workers);
-        let worker_exit = Arc::clone(&engine.main_loop_exit_now);
+        let worker_barrier = barrier.clone();
+        let worker_exit = std::sync::Arc::clone(&engine.main_loop_exit_now);
         let launched = thread::Builder::new()
             .name(format!("hammer-worker-{thread_index}"))
             .stack_size(worker_config.stack_size)
             .spawn(move || -> RuntimeResult<()> {
                 // VPP workers stop at the launch barrier before constructing
                 // any thread-local runtime state.
-                barrier::barrier_check(&worker_wait, &workers_at_barrier);
+                worker_barrier.check();
                 if worker_exit.load(Ordering::Acquire) {
                     return Ok(());
                 }
@@ -91,8 +88,7 @@ pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
                     error.to_string(),
                 );
                 return Err(abort_workers(
-                    &wait,
-                    &workers,
+                    &barrier,
                     &engine.main_loop_exit_now,
                     threads,
                     startup_error,
@@ -101,15 +97,9 @@ pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
         }
     }
 
-    if !wait_for_workers_at_barrier(
-        &workers,
-        worker_count,
-        &threads,
-        "worker launch barrier sync",
-    ) {
+    if !wait_for_workers_at_barrier(&barrier, &threads, "worker launch barrier sync") {
         return Err(abort_workers(
-            &wait,
-            &workers,
+            &barrier,
             &engine.main_loop_exit_now,
             threads,
             RuntimeError::WorkerExitedBeforeStartupBarrier { phase: "launch" },
@@ -119,17 +109,11 @@ pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
     // Release the launch barrier, then immediately arm VPP's second initial
     // barrier. A worker can acknowledge this one only from its main-loop entry,
     // after worker-local initialization has completed.
-    barrier::barrier_release(&wait, &workers);
-    arm_barrier(&wait);
-    if !wait_for_workers_at_barrier(
-        &workers,
-        worker_count,
-        &threads,
-        "worker main-loop barrier sync",
-    ) {
+    barrier.release();
+    barrier.arm();
+    if !wait_for_workers_at_barrier(&barrier, &threads, "worker main-loop barrier sync") {
         return Err(abort_workers(
-            &wait,
-            &workers,
+            &barrier,
             &engine.main_loop_exit_now,
             threads,
             RuntimeError::WorkerExitedBeforeStartupBarrier { phase: "main-loop" },
@@ -137,8 +121,7 @@ pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
     }
     if engine.main_loop_exit_now.load(Ordering::Acquire) {
         return Err(abort_workers(
-            &wait,
-            &workers,
+            &barrier,
             &engine.main_loop_exit_now,
             threads,
             RuntimeError::WorkerRequestedExitDuringInitialization,
@@ -146,14 +129,13 @@ pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
     }
     if let Err(error) = engine.retain_worker_threads(&mut threads) {
         return Err(abort_workers(
-            &wait,
-            &workers,
+            &barrier,
             &engine.main_loop_exit_now,
             threads,
             error,
         ));
     }
-    barrier::barrier_release(&wait, &workers);
+    barrier.release();
     Ok(())
 }
 
@@ -166,42 +148,36 @@ fn resolve_worker_startup(engine: &Engine) -> RuntimeResult<(Worker, u32)> {
     Ok((worker, count))
 }
 
-fn arm_barrier(wait: &AtomicU32) {
-    wait.store(1, Ordering::Release);
-}
-
 #[track_caller]
 fn wait_for_workers_at_barrier(
-    workers: &AtomicU32,
-    worker_count: u32,
+    barrier: &barrier::WorkerBarrier,
     threads: &[JoinHandle<RuntimeResult<()>>],
     phase: &'static str,
 ) -> bool {
     let deadline = Instant::now() + barrier::BARRIER_SYNC_TIMEOUT;
     loop {
-        let observed = workers.load(Ordering::Acquire);
-        if observed == worker_count {
+        let observed = barrier.paused_workers();
+        if observed == barrier.worker_count() {
             return true;
         }
         if threads.iter().any(JoinHandle::is_finished) {
             return false;
         }
         if Instant::now() > deadline {
-            barrier::barrier_deadlock(phase, worker_count, observed);
+            barrier::barrier_deadlock(phase, barrier.worker_count(), observed);
         }
         spin_loop();
     }
 }
 
 fn abort_workers(
-    wait: &AtomicU32,
-    workers: &AtomicU32,
+    barrier: &barrier::WorkerBarrier,
     exit: &AtomicBool,
     threads: Vec<JoinHandle<RuntimeResult<()>>>,
     startup_error: RuntimeError,
 ) -> RuntimeError {
     exit.store(true, Ordering::Release);
-    barrier::barrier_release(wait, workers);
+    barrier.release();
     let mut unwind_payload = None;
     for (worker, thread) in threads.into_iter().enumerate() {
         match thread.join() {

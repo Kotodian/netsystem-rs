@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
 use hammer_core::data_plane::{BufferFrame, Index, NodeId, NodeRegistration};
-use hammer_runtime::DataPlaneBarrierHandle;
+use hammer_runtime::WorkerBarrier;
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
     add_packet_trace,
@@ -247,7 +247,7 @@ impl InterfaceControlHandle {
 
 pub struct InterfaceControlPlane {
     inner: Arc<InterfaceStateSlot>,
-    barrier: Option<DataPlaneBarrierHandle>,
+    barrier: Option<WorkerBarrier>,
 }
 
 impl Default for InterfaceControlPlane {
@@ -267,7 +267,7 @@ impl InterfaceControlPlane {
     }
 
     #[inline]
-    pub fn with_data_plane_barrier(mut self, barrier: DataPlaneBarrierHandle) -> Self {
+    pub fn with_barrier(mut self, barrier: WorkerBarrier) -> Self {
         self.barrier = Some(barrier);
         self
     }
@@ -396,20 +396,11 @@ impl InterfaceControlPlane {
 
     #[inline]
     fn publish(&self, state: InterfaceState) {
-        let mut state = Some(state);
         if let Some(barrier) = &self.barrier {
-            let mut state = barrier.sync(&mut state);
-            self.inner.replace_after_barrier(
-                state
-                    .take()
-                    .expect("interface barrier retains candidate state"),
-            );
+            let mut inner = Arc::clone(&self.inner);
+            barrier.sync(&mut inner, |inner| inner.publish(state));
         } else {
-            self.inner.replace_after_barrier(
-                state
-                    .take()
-                    .expect("interface publication retains candidate state"),
-            );
+            self.inner.publish(state);
         }
     }
 }
@@ -443,7 +434,7 @@ impl InterfaceStateSlot {
     }
 
     #[inline]
-    fn replace_after_barrier(&self, state: InterfaceState) {
+    fn publish(&self, state: InterfaceState) {
         // SAFETY: callers replace state either while the runtime data-plane
         // barrier is held, or during single-threaded setup in tests.
         unsafe {

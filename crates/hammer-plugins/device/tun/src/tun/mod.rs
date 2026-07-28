@@ -5,7 +5,7 @@ use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex};
 
 use hammer_core::data_plane::{BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, NodeId, NodeState};
-use hammer_infra::spinlock::Spinlock;
+use hammer_runtime::sync::SpinLock;
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, File, FileFunctions, Node, NodeProcessFn, NodeResult,
     NodeRuntimeData, TraceFormatter, add_packet_trace, format_packet_trace,
@@ -131,7 +131,7 @@ struct TunControlDevice {
     requested_name: String,
     kernel_name: String,
     worker_files: Vec<Option<OwnedFd>>,
-    tx_lock: Arc<Spinlock<()>>,
+    tx_lock: Arc<SpinLock<()>>,
 }
 
 struct TunWorkerRuntime {
@@ -150,7 +150,7 @@ struct TunRxQueue {
 struct TunTxQueue {
     queue: DeviceTxQueue,
     file_index: hammer_infra::pool::Index,
-    tx_lock: Arc<Spinlock<()>>,
+    tx_lock: Arc<SpinLock<()>>,
     tx_iovecs: Vec<libc::iovec>,
 }
 
@@ -221,7 +221,7 @@ impl TunControl {
             requested_name: interface_name.to_owned(),
             kernel_name,
             worker_files,
-            tx_lock: Arc::new(Spinlock::new(())),
+            tx_lock: Arc::new(SpinLock::new(())),
         });
         Ok(())
     }

@@ -1051,7 +1051,7 @@ fn ip_lookup_control_plane_publish_replaces_forwarding_table() {
 fn ip_lookup_control_plane_publish_runs_through_runtime_data_plane_barrier() {
     let data_runtime =
         DataRuntime::new(1, "ip-lookup-barrier-test", 512 * 1024, 2).expect("data runtime");
-    let barrier = data_runtime.data_plane_barrier();
+    let barrier = data_runtime.barrier();
     let runtime = test_runtime();
     let drop = runtime.nodes().register_internal(DropNode::new());
     let (control, lookup) = placeholder_lookup(&runtime);

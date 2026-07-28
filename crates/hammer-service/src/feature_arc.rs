@@ -12,7 +12,7 @@ use arc_swap::ArcSwap;
 use hammer_core::data_plane::{BufferFrame, Index, NodeId};
 use hammer_runtime::RuntimeError;
 use hammer_runtime::node::NodeRuntime;
-use hammer_runtime::{DataPlaneBarrierHandle, DataPlaneRuntime, NodeResult};
+use hammer_runtime::{DataPlaneRuntime, NodeResult, WorkerBarrier};
 
 use crate::opaque::NetworkOpaque;
 
@@ -33,7 +33,7 @@ pub struct FeatureArcStartSlot<A: FeatureArcSpec> {
 pub struct FeatureArcControl<A: FeatureArcSpec> {
     inner: Arc<FeatureArcInner<A>>,
     state: FeatureArcState<A>,
-    barrier: Option<DataPlaneBarrierHandle>,
+    barrier: Option<WorkerBarrier>,
     nodes: Option<NodeRuntime>,
     start_nodes: Vec<NodeId>,
     default_end: Option<NodeId>,
@@ -347,7 +347,7 @@ impl<A: FeatureArcSpec> FeatureArcControl<A> {
     }
 
     #[inline]
-    pub fn with_data_plane_barrier(mut self, barrier: DataPlaneBarrierHandle) -> Self {
+    pub fn with_barrier(mut self, barrier: WorkerBarrier) -> Self {
         self.barrier = Some(barrier);
         self
     }
@@ -503,7 +503,7 @@ impl<A: FeatureArcSpec> FeatureArcControl<A> {
 
     #[inline]
     fn publish(&mut self) -> FeatureArcResult<()> {
-        let inner = Arc::clone(&self.inner);
+        let mut inner = Arc::clone(&self.inner);
         let mut state = self.state.clone();
         state.start_nodes = self.start_nodes.clone();
         state.default_end = self.default_end;
@@ -517,13 +517,7 @@ impl<A: FeatureArcSpec> FeatureArcControl<A> {
             .ok_or(FeatureArcError::DataPlaneBarrierUnavailable)?;
         state.rebuild(nodes)?;
         self.state = state.clone();
-        let mut state = Some(state);
-        let mut state = barrier.sync(&mut state);
-        inner.replace_after_barrier(
-            state
-                .take()
-                .expect("feature arc barrier retains candidate state"),
-        );
+        barrier.sync(&mut inner, |inner| inner.publish(state));
         Ok(())
     }
 }
@@ -546,7 +540,7 @@ impl<A: FeatureArcSpec> FeatureArcInner<A> {
     }
 
     #[inline]
-    fn replace_after_barrier(&self, state: FeatureArcState<A>) {
+    fn publish(&self, state: FeatureArcState<A>) {
         self.start_state.store(Arc::new(state.start_state()));
         // SAFETY: callers replace state either while the runtime data-plane
         // barrier is held, or during single-threaded graph setup in tests.
