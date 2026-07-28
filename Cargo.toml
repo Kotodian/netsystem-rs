@@ -10,6 +10,7 @@ members = [
     "crates/hammer-plugins/ip",
     "crates/hammer-plugins/transport/tcp",
     "crates/hammer-plugins/transport/udp",
+    "crates/hammer-plugins/tls",
     "crates/hammer-app",
     "crates/hammer-ipc",
     "crates/hammer",

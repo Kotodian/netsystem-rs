@@ -3,6 +3,7 @@ use std::io::Read;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -11,6 +12,7 @@ use hammer_ipc::{read_frame, write_frame};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct Daemon {
     child: Child,
@@ -143,6 +145,22 @@ mss = 1200
     assert_eq!(daemon.plugin_names(), ["ip", "tcp"]);
     daemon.load_plugins(&["udp", "tun"]);
     assert_eq!(daemon.plugin_names(), ["ip", "tcp", "udp", "tun"]);
+    daemon.shutdown();
+}
+
+#[test]
+fn daemon_discovers_tls_plugin_through_dynamic_lifecycle() {
+    let daemon = Daemon::start(
+        r#"
+plugins = []
+
+[memory]
+main_heap_size = "256 MiB"
+"#,
+    );
+
+    daemon.load_plugins(&["tls"]);
+    assert_eq!(daemon.plugin_names(), ["tls"]);
     daemon.shutdown();
 }
 
@@ -304,7 +322,11 @@ fn unique_temp_directory(prefix: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system clock")
         .as_nanos();
-    std::env::temp_dir().join(format!("{prefix}-{}-{nonce}", std::process::id()))
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "{prefix}-{}-{nonce}-{sequence}",
+        std::process::id()
+    ))
 }
 
 fn child_stderr(child: &mut Child) -> String {
