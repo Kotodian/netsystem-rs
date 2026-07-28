@@ -100,18 +100,16 @@ impl WorkerBarrier {
         self.state.wait.load(Ordering::Acquire) != 0
     }
 
-    /// Acknowledges an armed barrier, waits for release, and reports whether a
-    /// barrier was crossed.
-    pub(crate) fn check(&self) -> bool {
+    /// Acknowledges an armed barrier and waits for release.
+    pub(crate) fn check(&self) {
         if !self.is_pending() {
-            return false;
+            return;
         }
         self.state.workers.fetch_add(1, Ordering::Release);
         while self.state.wait.load(Ordering::Acquire) != 0 {
             spin_loop();
         }
         self.state.workers.fetch_sub(1, Ordering::Release);
-        true
     }
 
     #[track_caller]
@@ -172,62 +170,6 @@ impl Drop for Release {
     fn drop(&mut self) {
         self.barrier.release_from(self.caller);
     }
-}
-
-/// Crosses the runtime barrier and activates any graph publication before the
-/// worker can dispatch another frame.
-pub(crate) fn check(engine: &mut crate::engine::Engine) -> bool {
-    if !engine.barrier.is_pending() {
-        return true;
-    }
-
-    engine.publish_worker_runtime_stats();
-    if !engine.barrier.check() {
-        return true;
-    }
-
-    if engine.workers_updating_graph.load(Ordering::Acquire) == 0 {
-        return true;
-    }
-
-    // SAFETY: the main Engine published this value before releasing the
-    // barrier and retains it until every worker completes the refork.
-    let update = unsafe { engine.worker_graph.get_unchecked() }
-        .as_ref()
-        .expect("published worker graph must be present")
-        .clone();
-    let result = engine
-        .runtime
-        .nodes()
-        .replace_graph_preserving_worker_state(update.graph)
-        .and_then(|()| {
-            engine.worker_init_functions = update.worker_init_functions;
-            crate::init::run_worker_init_functions(engine)
-        });
-    let succeeded = result.is_ok();
-    if let Err(error) = result {
-        engine.main_loop_exit_now.store(true, Ordering::Release);
-        let worker = engine
-            .data_worker_id()
-            .expect("worker graph update runs only on a Data Worker");
-        let slot = engine
-            .worker_graph_errors
-            .get(worker.slot())
-            .expect("worker graph error slot must exist");
-        // SAFETY: each Data Worker owns exactly one error slot throughout the
-        // refork phase; the main Engine reads slots only after the completion
-        // count reaches zero.
-        unsafe {
-            *slot.get_mut_unchecked() = Some(error);
-        }
-    }
-
-    let updating = engine.workers_updating_graph.fetch_sub(1, Ordering::AcqRel);
-    assert_ne!(updating, 0, "worker graph completion count underflow");
-    while engine.workers_updating_graph.load(Ordering::Acquire) != 0 {
-        spin_loop();
-    }
-    succeeded && !engine.main_loop_exit_now.load(Ordering::Acquire)
 }
 
 fn wait_for_worker_count(

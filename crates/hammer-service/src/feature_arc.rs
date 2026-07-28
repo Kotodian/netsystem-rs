@@ -61,7 +61,7 @@ pub enum FeatureArcError {
     #[error("feature arc publish requires a node runtime")]
     NodeRuntimeUnavailable,
     #[error("feature arc publish requires a data-plane barrier")]
-    DataPlaneBarrierUnavailable,
+    BarrierUnavailable,
     #[error("feature arc chain for interface {interface_index} requires an end node")]
     EndNodeUnavailable { interface_index: u32 },
     #[error("feature order constraints contain a cycle")]
@@ -514,7 +514,7 @@ impl<A: FeatureArcSpec> FeatureArcControl<A> {
         let barrier = self
             .barrier
             .as_ref()
-            .ok_or(FeatureArcError::DataPlaneBarrierUnavailable)?;
+            .ok_or(FeatureArcError::BarrierUnavailable)?;
         state.rebuild(nodes)?;
         self.state = state.clone();
         barrier.sync(&mut inner, |inner| inner.publish(state));

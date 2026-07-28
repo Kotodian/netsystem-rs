@@ -294,6 +294,50 @@ impl Engine {
         graph_update_error.map_or(Ok(()), Err)
     }
 
+    pub(crate) fn refork_worker_graph(&mut self) -> bool {
+        if self.workers_updating_graph.load(Ordering::Acquire) == 0 {
+            return true;
+        }
+
+        // SAFETY: the main Engine published this value before releasing the
+        // barrier and retains it until every worker completes the refork.
+        let update = unsafe { self.worker_graph.get_unchecked() }
+            .as_ref()
+            .expect("published worker graph must be present")
+            .clone();
+        let result = self
+            .runtime
+            .nodes()
+            .replace_graph_preserving_worker_state(update.graph)
+            .and_then(|()| {
+                self.worker_init_functions = update.worker_init_functions;
+                crate::init::run_worker_init_functions(self)
+            });
+        let succeeded = result.is_ok();
+        if let Err(error) = result {
+            self.main_loop_exit_now.store(true, Ordering::Release);
+            let worker = self
+                .data_worker_id()
+                .expect("worker graph update runs only on a Data Worker");
+            let slot = self
+                .worker_graph_errors
+                .get(worker.slot())
+                .expect("worker graph error slot must exist");
+            // SAFETY: each Data Worker owns exactly one error slot throughout
+            // the refork; the main Engine reads it only after completion.
+            unsafe {
+                *slot.get_mut_unchecked() = Some(error);
+            }
+        }
+
+        let updating = self.workers_updating_graph.fetch_sub(1, Ordering::AcqRel);
+        assert_ne!(updating, 0, "worker graph completion count underflow");
+        while self.workers_updating_graph.load(Ordering::Acquire) != 0 {
+            spin_loop();
+        }
+        succeeded && !self.main_loop_exit_now.load(Ordering::Acquire)
+    }
+
     pub fn spawn(&self, index: u32) -> RuntimeResult<Self> {
         self.spawn_on_numa(index, self.numa_node)
     }
