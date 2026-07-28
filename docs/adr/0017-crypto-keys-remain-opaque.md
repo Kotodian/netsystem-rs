@@ -1,0 +1,3 @@
+# Cryptographic keys remain opaque
+
+Hammer's Crypto Engine owns key material and exposes generation-bearing Key Handles rather than requiring raw private or traffic-key bytes. Secret-producing key generation, key exchange, encapsulation, decapsulation, and derivation return Key Handles; only an explicit Secret Export may write secret-derived bytes, and it succeeds only when both the immutable Key Policy and selected Crypto Implementation permit it. This keeps the same interface valid for software implementations, CPU instruction implementations, Secure Enclave, HSM, and other non-exportable hardware while requiring rustls-derived algorithms and Exchange Protocols to request operations through the Engine without implicit export, copying, or software fallback.

@@ -1106,6 +1106,7 @@ dependencies = [
  "hammer-ipc",
  "hammer-plugin-ip",
  "hammer-plugin-tcp",
+ "hammer-plugin-tls",
  "hammer-plugin-tun",
  "hammer-plugin-udp",
  "hammer-runtime",
@@ -1179,6 +1180,7 @@ dependencies = [
  "sha2 0.11.0",
  "spinning_top",
  "talc",
+ "thiserror",
  "x25519-dalek",
 ]
 
@@ -1239,6 +1241,18 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+]
+
+[[package]]
+name = "hammer-plugin-tls"
+version = "0.1.0"
+dependencies = [
+ "abi_stable",
+ "hammer-component-macros",
+ "hammer-infra",
+ "hammer-runtime",
+ "hammer-service",
+ "thiserror",
 ]
 
 [[package]]
