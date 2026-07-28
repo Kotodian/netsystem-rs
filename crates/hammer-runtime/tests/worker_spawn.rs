@@ -1,13 +1,11 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 
 use hammer_runtime::DataPlaneBufferConfig;
 use hammer_runtime::RuntimeRegistry;
-use hammer_runtime::barrier;
 use hammer_runtime::engine::Engine;
-use hammer_runtime::spawn::DataRemoteLocalQueue;
+use hammer_runtime::spawn::{DataRemoteLocalQueue, DataRuntime};
 use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig};
 
 fn test_runtime(thread_index: u32) -> DataPlaneRuntime {
@@ -56,34 +54,14 @@ fn worker_spawn_engine_main_loop_exits() {
 
 #[test]
 fn worker_spawn_barrier_sync() {
-    let n_workers = 2u32;
-    let wait = Arc::new(AtomicU32::new(0));
-    let workers_at_barrier = Arc::new(AtomicU32::new(0));
-    let exit = Arc::new(AtomicBool::new(false));
-
-    let handles: Vec<_> = (0..n_workers)
-        .map(|_| {
-            let w = Arc::clone(&wait);
-            let wk = Arc::clone(&workers_at_barrier);
-            let e = Arc::clone(&exit);
-            thread::spawn(move || {
-                while !e.load(Ordering::Acquire) {
-                    barrier::barrier_check(&w, &wk);
-                }
-            })
-        })
-        .collect();
-
-    thread::sleep(Duration::from_millis(50));
-
-    {
-        let _guard = barrier::barrier_sync(&wait, &workers_at_barrier, n_workers);
+    let runtime =
+        DataRuntime::new(2, "barrier-worker", 2 * 1024 * 1024, 1).expect("spawn data runtime");
+    let barrier = runtime.barrier();
+    let mut value = 1;
+    barrier.sync(&mut value, |value| {
         // All workers are parked at the barrier while the guard is held.
-    }
-
-    exit.store(true, Ordering::Release);
-
-    for h in handles {
-        h.join().unwrap();
-    }
+        *value = 2;
+    });
+    assert_eq!(value, 2);
+    runtime.shutdown_timeout(Duration::from_secs(1));
 }

@@ -27,8 +27,8 @@ impl FibTableHandle {
     }
 
     #[inline]
-    pub fn replace_after_barrier(&self, table: FibTable<u16>) {
-        self.inner.replace_after_barrier(table);
+    pub fn publish(&self, table: FibTable<u16>) {
+        self.inner.publish(table);
     }
 }
 
@@ -55,7 +55,7 @@ impl FibTableSlot {
     }
 
     #[inline]
-    fn replace_after_barrier(&self, table: FibTable<u16>) {
+    fn publish(&self, table: FibTable<u16>) {
         // SAFETY: callers replace the table either while the runtime
         // data-plane barrier is held, or during single-threaded graph setup in
         // tests before packets are processed.
@@ -65,7 +65,7 @@ impl FibTableSlot {
     }
 }
 
-// SAFETY: FibTableSlot mutation is restricted to replace_after_barrier; packet
+// SAFETY: FibTableSlot mutation is restricted to publish; packet
 // workers only read immutable snapshots while the barrier is released.
 unsafe impl Send for FibTableSlot {}
 // SAFETY: See the Send implementation. Concurrent access is read-only outside

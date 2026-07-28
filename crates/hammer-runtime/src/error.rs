@@ -122,8 +122,6 @@ pub enum RuntimeError {
     ControlCommandCanceled,
     #[error("control command timed out")]
     ControlCommandTimedOut,
-    #[error("control worker barrier is not configured")]
-    ControlBarrierUnavailable,
     #[error(transparent)]
     AppSession(#[from] crate::app::AppSessionError),
     #[error("duplicate Process Node `{name}`")]

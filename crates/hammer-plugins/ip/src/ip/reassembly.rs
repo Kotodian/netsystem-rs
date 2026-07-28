@@ -9,7 +9,7 @@ use hammer_core::data_plane::{
 use hammer_infra::bihash::{Bihash, FREE_U64};
 use hammer_infra::checksum::internet_checksum;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
-use hammer_infra::spinlock::Spinlock;
+use hammer_runtime::sync::SpinLock;
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
     TraceFormatter, add_packet_trace, format_packet_trace,
@@ -179,7 +179,7 @@ struct IpReassemblyWorker {
 }
 
 struct IpReassemblyMain {
-    per_thread_data: Vec<Spinlock<IpReassemblyWorker>>,
+    per_thread_data: Vec<SpinLock<IpReassemblyWorker>>,
 }
 
 static IP_REASSEMBLY_MAIN: ArcSwapOption<IpReassemblyMain> = ArcSwapOption::const_empty();
@@ -191,7 +191,7 @@ impl IpReassemblyMain {
         ));
         let mut per_thread_data = Vec::with_capacity(worker_count);
         for worker in 0..worker_count {
-            per_thread_data.push(Spinlock::new(IpReassemblyWorker {
+            per_thread_data.push(SpinLock::new(IpReassemblyWorker {
                 worker: DataWorkerId::new(worker as u32),
                 contexts: Pool::with_capacity(config.max_reassemblies),
                 directory: Some(Arc::clone(&directory)),

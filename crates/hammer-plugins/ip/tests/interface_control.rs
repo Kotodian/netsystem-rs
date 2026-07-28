@@ -139,8 +139,8 @@ fn control_plane_rejects_mtu_updates_for_missing_interfaces() {
 fn interface_mtu_updates_run_through_configured_runtime_data_plane_barrier() {
     let data_runtime =
         DataRuntime::new(1, "interface-mtu-barrier-test", 512 * 1024, 2).expect("data runtime");
-    let barrier = data_runtime.data_plane_barrier();
-    let control = InterfaceControlPlane::new().with_data_plane_barrier(barrier.clone());
+    let barrier = data_runtime.barrier();
+    let control = InterfaceControlPlane::new().with_barrier(barrier.clone());
     let handle = control.handle();
     let tun0 = control.register_interface("tun0").expect("register tun0");
 

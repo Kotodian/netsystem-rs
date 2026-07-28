@@ -321,10 +321,10 @@ impl InternalNode for EndSink {
 
 fn build_control(
     runtime: &DataPlaneRuntime,
-    barrier: hammer_runtime::DataPlaneBarrierHandle,
+    barrier: hammer_runtime::WorkerBarrier,
 ) -> FeatureArcControl<TestArc> {
     FeatureArcControl::<TestArc>::new()
-        .with_data_plane_barrier(barrier)
+        .with_barrier(barrier)
         .with_nodes(runtime.nodes().clone())
 }
 
@@ -356,7 +356,7 @@ fn empty_chain_preserves_caller_default_next() {
     let end = runtime
         .nodes()
         .register_internal(EndSink::new("end", Arc::clone(&visits)));
-    let mut control = build_control(&runtime, data_runtime.data_plane_barrier());
+    let mut control = build_control(&runtime, data_runtime.barrier());
     control.set_default_end_node(end).expect("default end");
     let start_id = register_start(&runtime, &mut control, &visits, "start-a", end);
 
@@ -377,7 +377,7 @@ fn two_feature_chain_traverses_in_order_through_graph_runtime() {
         .nodes()
         .register_internal(EndSink::new("end", Arc::clone(&visits)));
     let handle_slot = Arc::new(Mutex::new(None::<FeatureArcStartHandle>));
-    let mut control = build_control(&runtime, data_runtime.data_plane_barrier());
+    let mut control = build_control(&runtime, data_runtime.barrier());
     control.set_default_end_node(end).expect("default end");
 
     let first = runtime.nodes().register_internal(LazyAdvance::new(
@@ -431,7 +431,7 @@ fn per_interface_end_override_compiles_on_final_predecessor() {
         .nodes()
         .register_internal(EndSink::new("override-end", Arc::clone(&visits)));
     let handle_slot = Arc::new(Mutex::new(None::<FeatureArcStartHandle>));
-    let mut control = build_control(&runtime, data_runtime.data_plane_barrier());
+    let mut control = build_control(&runtime, data_runtime.barrier());
     control
         .set_default_end_node(default_end)
         .expect("default end");
@@ -472,7 +472,7 @@ fn multiple_start_nodes_compile_distinct_first_transitions() {
         .nodes()
         .register_internal(EndSink::new("end", Arc::clone(&visits)));
     let handle_slot = Arc::new(Mutex::new(None::<FeatureArcStartHandle>));
-    let mut control = build_control(&runtime, data_runtime.data_plane_barrier());
+    let mut control = build_control(&runtime, data_runtime.barrier());
     control.set_default_end_node(end).expect("default end");
 
     let first = runtime.nodes().register_internal(LazyAdvance::new(

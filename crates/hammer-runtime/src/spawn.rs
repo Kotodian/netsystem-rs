@@ -31,7 +31,7 @@ use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
@@ -74,8 +74,7 @@ struct DataRuntimeContextWorker {
 pub struct DataRuntime {
     context: DataRuntimeContext,
     workers: Vec<DataRuntimeWorker>,
-    wait_at_barrier: Arc<AtomicU32>,
-    workers_at_barrier: Arc<AtomicU32>,
+    barrier: crate::barrier::WorkerBarrier,
 }
 
 struct DataRuntimeWorker {
@@ -155,8 +154,11 @@ impl DataRuntime {
         let worker_config = worker.clone();
 
         let context_id = next_data_runtime_context_id();
-        let wait_at_barrier = Arc::new(AtomicU32::new(0));
-        let workers_at_barrier = Arc::new(AtomicU32::new(0));
+        let worker_count =
+            u32::try_from(worker_threads).map_err(|_| RuntimeError::WorkerCountOverflow {
+                count: worker_threads,
+            })?;
+        let barrier = crate::barrier::WorkerBarrier::new(worker_count);
         let mut context_workers = Vec::with_capacity(worker_threads);
         let mut workers = Vec::with_capacity(worker_threads);
         for index in 0..worker_threads {
@@ -164,8 +166,7 @@ impl DataRuntime {
             let remote_local = DataRemoteLocalQueue::default();
             let worker_remote_local = remote_local.clone();
             let worker_config = worker_config.clone();
-            let worker_wait_at_barrier = Arc::clone(&wait_at_barrier);
-            let worker_workers_at_barrier = Arc::clone(&workers_at_barrier);
+            let worker_barrier = barrier.clone();
             let (handle_tx, handle_rx) = std::sync::mpsc::channel::<RuntimeResult<Handle>>();
             let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -205,8 +206,7 @@ impl DataRuntime {
                                 &worker_remote_local,
                                 &runtime,
                                 shutdown_rx,
-                                &worker_wait_at_barrier,
-                                &worker_workers_at_barrier,
+                                &worker_barrier,
                             );
                             DATA_LOCAL_TASKS.with(|tasks| tasks.borrow_mut().clear());
                             DATA_LOCAL_DRIVER_WAKER.with(|waker| waker.borrow_mut().take());
@@ -242,10 +242,9 @@ impl DataRuntime {
         }
 
         Ok(Self {
-            context: DataRuntimeContext::from_workers_with_barrier(context_id, context_workers),
+            context: DataRuntimeContext::from_workers(context_id, context_workers),
             workers,
-            wait_at_barrier,
-            workers_at_barrier,
+            barrier,
         })
     }
 
@@ -257,12 +256,8 @@ impl DataRuntime {
         self.context.executor()
     }
 
-    pub fn data_plane_barrier(&self) -> DataPlaneBarrierHandle {
-        DataPlaneBarrierHandle {
-            wait: Arc::clone(&self.wait_at_barrier),
-            workers: Arc::clone(&self.workers_at_barrier),
-            n_workers: self.context.inner.workers.len() as u32,
-        }
+    pub fn barrier(&self) -> crate::barrier::WorkerBarrier {
+        self.barrier.clone()
     }
 
     pub fn shutdown_timeout(mut self, timeout: Duration) {
@@ -309,10 +304,6 @@ impl DataRuntimeContext {
     }
 
     fn from_workers(id: usize, workers: Vec<DataRuntimeContextWorker>) -> Self {
-        Self::from_workers_with_barrier(id, workers)
-    }
-
-    fn from_workers_with_barrier(id: usize, workers: Vec<DataRuntimeContextWorker>) -> Self {
         assert!(
             !workers.is_empty(),
             "data runtime context requires at least one worker"
@@ -582,22 +573,6 @@ impl DataRuntimeContext {
             }
             _ => None,
         })
-    }
-}
-
-/// Barrier handle for control-plane thread synchronization.
-/// Wraps the VPP-style atomic barrier.
-#[derive(Clone)]
-pub struct DataPlaneBarrierHandle {
-    wait: Arc<AtomicU32>,
-    workers: Arc<AtomicU32>,
-    n_workers: u32,
-}
-
-impl DataPlaneBarrierHandle {
-    #[track_caller]
-    pub fn sync<'a, T: ?Sized>(&self, value: &'a mut T) -> crate::barrier::Barrier<'a, T> {
-        crate::barrier::Barrier::new(value, &self.wait, &self.workers, self.n_workers)
     }
 }
 
@@ -1046,8 +1021,7 @@ fn run_data_worker_loop(
     remote_local: &DataRemoteLocalQueue,
     runtime: &tokio::runtime::Runtime,
     mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
-    wait_at_barrier: &AtomicU32,
-    workers_at_barrier: &AtomicU32,
+    barrier: &crate::barrier::WorkerBarrier,
 ) {
     let worker_waker = Waker::from(Arc::new(DataWorkerThreadWake {
         thread: thread::current(),
@@ -1067,8 +1041,7 @@ fn run_data_worker_loop(
             remote_local,
             &worker_waker,
             &mut next_polling_driver_at,
-            wait_at_barrier,
-            workers_at_barrier,
+            barrier,
         );
         drive_tokio_worker_once(runtime, local_progress);
 
@@ -1083,15 +1056,14 @@ fn poll_data_worker_once(
     remote_local: &DataRemoteLocalQueue,
     worker_waker: &Waker,
     next_polling_driver_at: &mut Instant,
-    wait_at_barrier: &AtomicU32,
-    workers_at_barrier: &AtomicU32,
+    barrier: &crate::barrier::WorkerBarrier,
 ) -> bool {
     let mut cx = Context::from_waker(worker_waker);
     DATA_LOCAL_DRIVER_WAKER.with(|slot| {
         *slot.borrow_mut() = Some(worker_waker.clone());
     });
 
-    crate::barrier::barrier_check(wait_at_barrier, workers_at_barrier);
+    barrier.check();
 
     let now = Instant::now();
     let mut progressed = false;
