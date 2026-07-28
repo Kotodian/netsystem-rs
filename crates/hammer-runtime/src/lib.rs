@@ -89,5 +89,6 @@ pub mod spawn;
 pub mod start_workers;
 mod worker_thread;
 
+pub use barrier::Barrier;
 pub use control_thread::{ControlThread, ControlThreadHandle, ControlTimerHandle};
-pub use spawn::{DataPlaneBarrierGuard, DataPlaneBarrierHandle, with_data_plane_runtime};
+pub use spawn::{DataPlaneBarrierHandle, with_data_plane_runtime};

@@ -5,6 +5,7 @@
 //! deadlock, not a recoverable runtime error.
 
 use core::hint::spin_loop;
+use core::ops::{Deref, DerefMut};
 use std::panic::Location;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -48,6 +49,57 @@ pub fn barrier_release(wait: &AtomicU32, workers: &AtomicU32) {
 impl Drop for BarrierGuard {
     fn drop(&mut self) {
         barrier_release_from(&self.wait, &self.workers, self.caller);
+    }
+}
+
+/// Mutable access to a value while all Data Workers are synchronized.
+///
+/// The type makes the barrier requirement part of the protected mutation:
+/// access ends before the contained guard releases the workers.
+#[must_use]
+pub struct Barrier<'a, T: ?Sized> {
+    value: &'a mut T,
+    guard: BarrierGuard,
+}
+
+impl<'a, T: ?Sized> Barrier<'a, T> {
+    /// Synchronizes every configured Data Worker before granting mutable access.
+    #[track_caller]
+    pub fn sync(value: &'a mut T, engine: &crate::engine::Engine) -> Self {
+        let worker_count = u32::try_from(engine.configured_worker_count())
+            .expect("configured Data Worker count must fit in u32");
+        Self::new(
+            value,
+            &engine.wait_at_barrier,
+            &engine.workers_at_barrier,
+            worker_count,
+        )
+    }
+
+    #[track_caller]
+    pub(crate) fn new(
+        value: &'a mut T,
+        wait: &Arc<AtomicU32>,
+        workers: &Arc<AtomicU32>,
+        worker_count: u32,
+    ) -> Self {
+        let guard = barrier_sync(wait, workers, worker_count);
+        Self { value, guard }
+    }
+}
+
+impl<T: ?Sized> Deref for Barrier<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        debug_assert_eq!(self.guard.wait.load(Ordering::Acquire), 1);
+        self.value
+    }
+}
+
+impl<T: ?Sized> DerefMut for Barrier<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.value
     }
 }
 
@@ -222,6 +274,34 @@ mod tests {
     }
 
     #[test]
+    fn typed_barrier_releases_after_protected_mutation() {
+        let wait = Arc::new(AtomicU32::new(0));
+        let workers = Arc::new(AtomicU32::new(0));
+        let published = Arc::new(AtomicU32::new(1));
+
+        let worker_wait = Arc::clone(&wait);
+        let worker_count = Arc::clone(&workers);
+        let worker_published = Arc::clone(&published);
+        let worker = thread::spawn(move || {
+            while worker_wait.load(Ordering::Acquire) == 0 {
+                spin_loop();
+            }
+            barrier_check(&worker_wait, &worker_count);
+            worker_published.load(Ordering::Acquire)
+        });
+
+        let mut next = 1_u32;
+        {
+            let mut update = Barrier::new(&mut next, &wait, &workers, 1);
+            *update = 2;
+            published.store(*update, Ordering::Release);
+        }
+
+        assert_eq!(worker.join().expect("worker"), 2);
+        assert_eq!(next, 2);
+    }
+
+    #[test]
     fn barrier_concurrent_workers() {
         let n = 4;
         let wait = Arc::new(AtomicU32::new(0));
@@ -300,6 +380,9 @@ mod tests {
         let worker_count = Arc::clone(&workers);
         let worker_resumed = Arc::clone(&resumed);
         let worker = thread::spawn(move || {
+            while worker_wait.load(Ordering::Acquire) == 0 {
+                spin_loop();
+            }
             barrier_check(&worker_wait, &worker_count);
             worker_resumed.store(true, Ordering::Release);
         });

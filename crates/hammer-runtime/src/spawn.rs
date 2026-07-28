@@ -596,29 +596,16 @@ pub struct DataPlaneBarrierHandle {
 
 impl DataPlaneBarrierHandle {
     #[track_caller]
-    pub fn sync(&self) -> DataPlaneBarrierGuard {
-        DataPlaneBarrierGuard {
-            barrier: crate::barrier::barrier_sync(&self.wait, &self.workers, self.n_workers),
-            n_workers: self.n_workers,
-        }
+    pub fn sync<'a, T: ?Sized>(&self, value: &'a mut T) -> crate::barrier::Barrier<'a, T> {
+        crate::barrier::Barrier::new(value, &self.wait, &self.workers, self.n_workers)
     }
 
     #[track_caller]
     pub fn synchronize<R, E>(&self, operation: impl FnOnce() -> Result<R, E>) -> Result<R, E> {
-        let _guard = self.sync();
-        operation()
-    }
-}
-
-#[derive(Debug)]
-pub struct DataPlaneBarrierGuard {
-    barrier: crate::barrier::BarrierGuard,
-    n_workers: u32,
-}
-
-impl DataPlaneBarrierGuard {
-    pub fn paused_workers(&self) -> usize {
-        self.n_workers as usize
+        let guard = crate::barrier::barrier_sync(&self.wait, &self.workers, self.n_workers);
+        let result = operation();
+        drop(guard);
+        result
     }
 }
 
