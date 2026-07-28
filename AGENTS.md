@@ -67,6 +67,12 @@ Use Rust 2024 conventions and rustfmt defaults: 4-space indentation, `snake_case
 
 - Do **not** introduce underscore-prefixed variable names such as `_value`. If a parameter or pattern slot is intentionally unused, use the bare `_` pattern. If a local binding is unused, delete it and the work that produced it.
 - Enforce architectural boundaries with visibility, traits, and narrow re-exports instead of comments or convention.
+- Do not introduce `thread_local!` state. Thread-bound state must be owned
+  directly by the runtime, worker, Graph Node, or other value that owns that
+  thread lifecycle. Use `hammer_infra::thread_owned::ThreadOwned` only when a
+  shared main structure needs indexed access to worker-owned `T: Send` values;
+  do not add locks, weaken its `Send`/`Sync` contract, or force a thread-bound
+  value to implement `Send` merely to fit that container.
 - Express access to an existing value with Rust's ownership and borrowing
   primitives: `&T`, `&mut T`, slices, iterators, and guards. Do not introduce a
   wrapper type merely to observe, borrow, or re-expose another value, or to
