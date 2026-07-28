@@ -113,14 +113,15 @@ impl IpLookupControlPlane {
         let barrier = self.barrier.clone();
         let publish = move || {
             if let Some(barrier) = barrier {
-                barrier.synchronize(|| -> RuntimeResult<()> {
-                    table_handle.replace_after_barrier(table);
-                    Ok(())
-                })
+                let mut table = Some(table);
+                let mut table = barrier.sync(&mut table);
+                table_handle.replace_after_barrier(
+                    table.take().expect("FIB barrier retains candidate table"),
+                );
             } else {
                 table_handle.replace_after_barrier(table);
-                Ok(())
             }
+            RuntimeResult::Ok(())
         };
         if let Some(control_handle) = &self.control_handle {
             control_handle.call(publish)??;

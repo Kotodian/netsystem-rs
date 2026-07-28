@@ -515,14 +515,15 @@ impl<A: FeatureArcSpec> FeatureArcControl<A> {
             .barrier
             .as_ref()
             .ok_or(FeatureArcError::DataPlaneBarrierUnavailable)?;
-        let mut published = None;
-        barrier.synchronize(|| -> FeatureArcResult<()> {
-            state.rebuild(nodes)?;
-            published = Some(state.clone());
-            inner.replace_after_barrier(state);
-            Ok(())
-        })?;
-        self.state = published.expect("feature arc publish produced state");
+        state.rebuild(nodes)?;
+        self.state = state.clone();
+        let mut state = Some(state);
+        let mut state = barrier.sync(&mut state);
+        inner.replace_after_barrier(
+            state
+                .take()
+                .expect("feature arc barrier retains candidate state"),
+        );
         Ok(())
     }
 }

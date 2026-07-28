@@ -599,14 +599,6 @@ impl DataPlaneBarrierHandle {
     pub fn sync<'a, T: ?Sized>(&self, value: &'a mut T) -> crate::barrier::Barrier<'a, T> {
         crate::barrier::Barrier::new(value, &self.wait, &self.workers, self.n_workers)
     }
-
-    #[track_caller]
-    pub fn synchronize<R, E>(&self, operation: impl FnOnce() -> Result<R, E>) -> Result<R, E> {
-        let guard = crate::barrier::barrier_sync(&self.wait, &self.workers, self.n_workers);
-        let result = operation();
-        drop(guard);
-        result
-    }
 }
 
 impl DataRemoteLocalQueue {
