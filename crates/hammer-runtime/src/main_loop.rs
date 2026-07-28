@@ -7,7 +7,6 @@ use std::time::Instant;
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 
-use crate::barrier;
 use crate::engine::Engine;
 use crate::spawn;
 use crate::spawn::{DATA_LOCAL_DRIVER_WAKER, DATA_WORKER_IDLE_SLICE, with_data_plane_runtime};
@@ -71,8 +70,12 @@ pub fn engine_main_loop(
         let mut progress = false;
 
         // Step 1: Barrier check — VPP threads.c:296
-        if !barrier::check(engine) {
-            return 1;
+        if engine.barrier.is_pending() {
+            engine.publish_worker_runtime_stats();
+            engine.barrier.check();
+            if !engine.refork_worker_graph() {
+                return 1;
+            }
         }
 
         // Step 2: Poll worker-local File readiness before graph dispatch.
