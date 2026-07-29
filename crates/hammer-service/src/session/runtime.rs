@@ -4,13 +4,15 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use hammer_core::data_plane::{BufferFrame, DataPlaneBuffers, Index as BufferIndex};
-use hammer_infra::align::CacheLine;
+use hammer_infra::align::{CacheLine, align_up};
+use hammer_infra::fifo::Fifo;
 use hammer_infra::fifo_queue::FifoQueue;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::segment::Segment;
 use hammer_infra::thread_owned::ThreadOwned;
 use hammer_runtime::app::{
-    AppSessionConfig, SessionEventQueue, SessionEvtType, SessionHandle, SessionMsgQueue,
+    AppSession, AppSessionConfig, AppSessionError, SessionEventQueue, SessionEvt, SessionEvtType,
+    SessionHandle, SessionMsgQueue,
 };
 use hammer_runtime::attach::AppSessionPublisher;
 use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
@@ -19,7 +21,9 @@ use hammer_runtime::{DataPlaneRuntime, DataWorkerId, Engine, File, FileFunctions
 use crate::session::app::{AppWorkerAttach, AppWorkerError};
 use crate::session::error::{SessionError, SessionQueueError};
 use crate::session::state::SessionState;
-use crate::session::{AppWorker, SessionId, SessionQueueNext};
+use crate::session::{
+    AppWorker, Plaintext, ProtocolChain, ProtocolChainIo, SessionId, SessionQueueNext,
+};
 
 const DEFAULT_SESSION_POOL_CAPACITY: usize = 1024;
 const DEFAULT_SESSION_TX_EVENT_CAPACITY: usize = 2048;
@@ -88,11 +92,12 @@ pub struct SessionQueueStep {
     pub scheduled_sessions: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 struct SessionEntry<Index> {
     transport: SessionTransportId,
     state: SessionState<Index>,
     schedule_pending: bool,
+    protocol_chain: Option<ProtocolChain<Plaintext, ProtocolChain<()>>>,
 }
 
 impl<Index: Copy + Eq> SessionEntry<Index> {
@@ -102,6 +107,7 @@ impl<Index: Copy + Eq> SessionEntry<Index> {
             transport,
             state: SessionState::creating(),
             schedule_pending: false,
+            protocol_chain: None,
         }
     }
 }
@@ -110,9 +116,11 @@ pub struct SessionWorker<Index> {
     worker: DataWorkerId,
     entries: Pool<SessionEntry<Index>>,
     app: AppWorker,
+    lower_tx_evt_q: Arc<SessionMsgQueue>,
     app_session_config: AppSessionConfig,
     session_work: Vec<SessionId>,
     session_work_scratch: Vec<SessionId>,
+    transport_dispatches: Vec<Index>,
     app_rx_events: FifoQueue<SessionId>,
     control_events: FifoQueue<SessionControlEvent>,
     readiness_file: Option<PoolIndex>,
@@ -216,11 +224,6 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         &self.app
     }
 
-    #[cfg(test)]
-    pub(crate) fn local_app_mut(&mut self) -> &mut AppWorker {
-        &mut self.app
-    }
-
     /// Registers the session queue signal with the worker FileMain.
     ///
     /// The queue retains its original endpoint. FileMain owns a duplicated
@@ -287,20 +290,64 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     ) -> RuntimeResult<SessionId> {
         let session_id = self.insert_creating_session(transport)?;
         let handle = SessionHandle::new(session_id.pool_index().slot(), self.worker.slot() as u32);
-        let tx_evt_q = self.app.tx_evt_q().clone();
-        let app_session =
-            match self
-                .app
-                .create_app_session(listener, handle, self.app_session_config, tx_evt_q)
-            {
-                Ok(session) => session,
-                Err(error) => {
-                    self.remove_session_entry(session_id);
-                    return Err(error);
+        let fifo_bytes = align_up(
+            Fifo::layout_bytes(self.app_session_config.fifo_capacity).map_err(|_| {
+                AppSessionError::RxFifoCapacityInvalid {
+                    capacity: self.app_session_config.fifo_capacity,
                 }
-            };
-        self.app.attach_session(session_id, app_session);
-        if let Err(error) = self.finish_session_creation(session_id, index) {
+            })?,
+            64,
+        );
+        let ring_nitems = self.app_session_config.evt_q_capacity.max(1) as u32;
+        let q_nitems = (self.app_session_config.evt_q_capacity + 1)
+            .next_power_of_two()
+            .max(2) as u32;
+        let event_queue_bytes = align_up(
+            SessionMsgQueue::layout_bytes(q_nitems, ring_nitems).map_err(|_| {
+                AppSessionError::EventQueueCapacityInvalid {
+                    capacity: self.app_session_config.evt_q_capacity,
+                }
+            })?,
+            64,
+        );
+        let lower_segment_bytes = fifo_bytes
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(event_queue_bytes))
+            .and_then(|bytes| bytes.checked_add(128))
+            .ok_or(AppWorkerError::SessionSegmentSizeOverflow)?;
+        let lower_session = match AppSession::new_in_segment(
+            Segment::local(lower_segment_bytes),
+            self.app_session_config,
+            handle,
+            Arc::clone(&self.lower_tx_evt_q),
+        ) {
+            Ok(session) => Arc::new(session),
+            Err(error) => {
+                self.remove_session_entry(session_id);
+                return Err(error.into());
+            }
+        };
+        let upper_tx_evt_q = self.app.tx_evt_q().clone();
+        let upper_session = match self.app.create_app_session(
+            listener,
+            handle,
+            self.app_session_config,
+            upper_tx_evt_q,
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                self.remove_session_entry(session_id);
+                return Err(error);
+            }
+        };
+        let protocol_chain = ProtocolChain::new(
+            Arc::clone(&upper_session),
+            Plaintext,
+            ProtocolChain::transport(Arc::clone(&lower_session)),
+        );
+        self.app
+            .attach_session(session_id, lower_session, upper_session);
+        if let Err(error) = self.finish_session_creation(session_id, index, protocol_chain) {
             self.remove_session_entry(session_id);
             return Err(error);
         }
@@ -312,10 +359,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         transport: SessionTransportId,
     ) -> RuntimeResult<SessionId> {
         self.entries
-            .insert_with(|index| {
-                let _ = index;
-                SessionEntry::creating(transport)
-            })
+            .insert_with(|_| SessionEntry::creating(transport))
             .map(SessionId::from)
             .ok_or_else(|| {
                 SessionError::CapacityExhausted {
@@ -329,6 +373,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         &mut self,
         session_id: SessionId,
         index: Index,
+        protocol_chain: ProtocolChain<Plaintext, ProtocolChain<()>>,
     ) -> RuntimeResult<()> {
         let entry = self
             .entries
@@ -338,6 +383,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             .state
             .finish_creation(index)
             .ok_or(SessionError::NotCreating { session_id })?;
+        entry.protocol_chain = Some(protocol_chain);
         Ok(())
     }
 
@@ -376,10 +422,8 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         index: Index,
     ) -> SessionId {
         let session_id = self
-            .insert_creating_session(transport)
-            .expect("session pool capacity exhausted");
-        self.finish_session_creation(session_id, index)
-            .expect("finish session creation");
+            .stream_accept(transport, index, 0)
+            .expect("accept test session");
         self.connection_published(session_id)
             .expect("publish session connection");
         self.connected(session_id).expect("connect session");
@@ -449,11 +493,10 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     pub fn poll_app(&mut self) -> RuntimeResult<()> {
         let entries = &mut self.entries;
         let session_work = &mut self.session_work;
-        let app_rx_events = &mut self.app_rx_events;
         let control_events = &mut self.control_events;
         self.app
             .drain_tx_events_to(|session_id, evt_type| match evt_type {
-                SessionEvtType::TxDeq => {
+                SessionEvtType::TxDeq | SessionEvtType::RxDeq => {
                     if let Some(entry) = entries.get_mut(session_id.pool_index())
                         && !entry.schedule_pending
                     {
@@ -464,9 +507,73 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
                 SessionEvtType::Close => {
                     control_events.push_back(SessionControlEvent::Disconnect(session_id));
                 }
-                SessionEvtType::RxDeq => app_rx_events.push_back(session_id),
                 SessionEvtType::RxEnq | SessionEvtType::Connect => {}
             });
+        Ok(())
+    }
+
+    fn poll_lower_session_events(&mut self, protocol_work: &[SessionId]) {
+        let mut batch = [SessionEvt::io(0, SessionEvtType::Connect); 64];
+        loop {
+            let count = self.lower_tx_evt_q.dequeue_batch(&mut batch);
+            if count == 0 {
+                return;
+            }
+            for event in &batch[..count] {
+                let Some(session_id) = self.app.session_id(event.session_index()) else {
+                    continue;
+                };
+                match event.evt_type {
+                    SessionEvtType::TxDeq => {
+                        if let Some(session) = self.app.transport_session(session_id) {
+                            session.clear_tx_event();
+                        }
+                        if !protocol_work.contains(&session_id) {
+                            self.mark_ready(session_id);
+                        }
+                    }
+                    SessionEvtType::RxDeq => self.app_rx_events.push_back(session_id),
+                    SessionEvtType::Close => {
+                        self.control_events
+                            .push_back(SessionControlEvent::Disconnect(session_id));
+                    }
+                    SessionEvtType::RxEnq | SessionEvtType::Connect => {}
+                }
+            }
+            if count < batch.len() {
+                return;
+            }
+        }
+    }
+
+    fn advance_protocol_chain(&mut self, session_id: SessionId) -> RuntimeResult<()> {
+        let lower = self
+            .app
+            .transport_session(session_id)
+            .cloned()
+            .ok_or(SessionError::SessionMissing { session_id })?;
+        let mut events = [SessionEvt::io(0, SessionEvtType::Connect); 16];
+        loop {
+            let count = lower.evt_q().dequeue_batch(&mut events);
+            if count < events.len() {
+                break;
+            }
+        }
+        {
+            let entry = self
+                .entries
+                .get_mut(session_id.pool_index())
+                .ok_or(SessionError::SessionMissing { session_id })?;
+            let protocol_chain = entry
+                .protocol_chain
+                .as_mut()
+                .ok_or(SessionError::NotPublished { session_id })?;
+            protocol_chain.ingress()?;
+            protocol_chain.egress()?;
+        }
+        if lower.rx_fifo().max_dequeue() == 0 {
+            lower.rx_fifo().unset_event();
+        }
         Ok(())
     }
 
@@ -487,13 +594,14 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     }
 
     pub fn ack_tx_up_to(&mut self, session_id: SessionId, bytes: usize) -> RuntimeResult<()> {
-        self.app
-            .discard_acked_tx_bytes(session_id, bytes)
-            .map(|_| ())
+        if self.app.discard_acked_tx_bytes(session_id, bytes)? {
+            self.mark_ready(session_id);
+        }
+        Ok(())
     }
 
     pub fn enqueue_rx(
-        &self,
+        &mut self,
         buffers: &DataPlaneBuffers,
         session_id: SessionId,
         index: BufferIndex,
@@ -515,6 +623,9 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             };
             if rx_available == 0 {
                 self.app.request_rx_dequeue_notification(session_id);
+            }
+            if matches!(delivery, RxDelivery::InOrder { .. }) {
+                self.mark_ready(session_id);
             }
             return Ok(delivery);
         }
@@ -614,8 +725,17 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             unsafe { SessionMsgQueue::init_at_with_signal(segment, offset, cap, cap.max(2)) }
                 .map_err(|error| AppWorkerError::TxEventQueue { error })?,
         );
+        let lower_tx_evt_q = Arc::new(
+            SessionMsgQueue::with_cfg(cap, cap.max(2))
+                .map_err(|error| AppWorkerError::TxEventQueue { error })?,
+        );
         let app = AppWorker::new(DEFAULT_SESSION_POOL_CAPACITY, tx_evt_q, worker.slot());
-        Ok(Self::from_app(worker, app_session_config, app))
+        Ok(Self::from_app(
+            worker,
+            app_session_config,
+            app,
+            lower_tx_evt_q,
+        ))
     }
 
     pub(crate) fn with_app_session_attach(
@@ -648,21 +768,33 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             worker.slot(),
             AppWorkerAttach::new(publisher, segment, offset),
         );
-        Ok(Self::from_app(worker, app_session_config, app))
+        let lower_tx_evt_q = Arc::new(
+            SessionMsgQueue::with_cfg(cap, cap.max(2))
+                .map_err(|error| AppWorkerError::TxEventQueue { error })?,
+        );
+        Ok(Self::from_app(
+            worker,
+            app_session_config,
+            app,
+            lower_tx_evt_q,
+        ))
     }
 
     fn from_app(
         worker: DataWorkerId,
         app_session_config: AppSessionConfig,
         app: AppWorker,
+        lower_tx_evt_q: Arc<SessionMsgQueue>,
     ) -> Self {
         Self {
             worker,
             entries: Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
             app,
+            lower_tx_evt_q,
             app_session_config,
             session_work: Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
             session_work_scratch: Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
+            transport_dispatches: Vec::with_capacity(DEFAULT_TX_DISPATCH_BUDGET),
             app_rx_events: FifoQueue::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
             control_events: FifoQueue::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
             readiness_file: None,
@@ -948,6 +1080,16 @@ where
 {
     transport.update_time(sessions, runtime, output_next, frame, output, now)?;
     sessions.poll_app()?;
+    sessions.poll_lower_session_events(&[]);
+
+    let work = sessions.take_scheduled_work();
+    let scheduled_sessions = work.len();
+    for session_id in work.as_slice() {
+        if sessions.has_session(*session_id) {
+            sessions.advance_protocol_chain(*session_id)?;
+        }
+    }
+    sessions.poll_lower_session_events(work.as_slice());
 
     let app_rx_event_count = sessions.app_rx_events.len();
     for _ in 0..app_rx_event_count {
@@ -997,13 +1139,13 @@ where
         }
     }
 
-    let work = sessions.take_scheduled_work();
-    let scheduled_sessions = work.len();
+    sessions.transport_dispatches.clear();
     for session_id in work.as_slice() {
         let Some((transport_id, index)) = sessions.session_transport(*session_id) else {
             continue;
         };
-        if transport_id == T::ID {
+        if transport_id == T::ID && !sessions.transport_dispatches.contains(&index) {
+            sessions.transport_dispatches.push(index);
             <T::Tx as SessionTxStrategy<T, Index>>::dispatch(
                 transport,
                 sessions,

@@ -56,8 +56,15 @@ impl AppSessionProtocol for Plaintext {
 }
 
 fn transfer_plaintext(source: &Fifo, destination: &Fifo) -> RuntimeResult<(usize, usize)> {
-    if source.max_dequeue() == 0 || destination.max_enqueue() == 0 {
+    if source.max_dequeue() == 0 {
         return Ok((0, 0));
+    }
+    if destination.max_enqueue() == 0 {
+        destination.want_deq_notification();
+        if destination.max_enqueue() == 0 {
+            return Ok((0, 0));
+        }
+        destination.clear_deq_notification();
     }
     let mut source = source;
     let bytes = source
