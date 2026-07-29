@@ -77,6 +77,10 @@ Use Rust 2024 conventions and rustfmt defaults: 4-space indentation, `snake_case
   primitives: `&T`, `&mut T`, slices, iterators, and guards. Do not introduce a
   wrapper type merely to observe, borrow, or re-expose another value, or to
   cache pointers and offsets into storage owned elsewhere.
+- Do not introduce `dyn` trait objects or dynamic dispatch in production code.
+  Cross-plugin cryptographic exchanges must retain concrete, monomorphized
+  protocol state and use registration functions with explicit ownership; they
+  must not erase state behind a trait object.
 - Non-trivial designs must document the layer isolation contract: what each layer may call, what it must not call, which APIs cross the boundary, and which commands verify the boundary.
 
 ### Synchronization rules
