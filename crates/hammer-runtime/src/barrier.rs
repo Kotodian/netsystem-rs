@@ -44,11 +44,12 @@ impl<T> Barrier<T> {
     }
 
     /// # Safety
-    /// The caller must have exclusive barrier-phase ownership of this value.
+    /// The caller must have exclusive barrier-phase ownership of this value
+    /// for the duration of `operation`.
     #[inline]
-    pub(crate) unsafe fn get_mut_unchecked(&self) -> &mut T {
+    pub(crate) unsafe fn with_mut_unchecked<R>(&self, operation: impl FnOnce(&mut T) -> R) -> R {
         // SAFETY: upheld by the caller's barrier-phase contract.
-        unsafe { &mut *self.value.get() }
+        operation(unsafe { &mut *self.value.get() })
     }
 }
 

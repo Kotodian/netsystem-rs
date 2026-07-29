@@ -258,9 +258,10 @@ impl Engine {
         // SAFETY: the main Engine calls this only while every worker is held at
         // `self.barrier`, before the refork completion count is published.
         unsafe {
-            *self.worker_graph.get_mut_unchecked() = Some(update);
+            self.worker_graph
+                .with_mut_unchecked(|graph| *graph = Some(update));
             for error in self.worker_graph_errors.iter() {
-                *error.get_mut_unchecked() = None;
+                error.with_mut_unchecked(|error| *error = None);
             }
         }
         self.workers_updating_graph
@@ -283,7 +284,7 @@ impl Engine {
         for (worker, slot) in self.worker_graph_errors.iter().enumerate() {
             // SAFETY: the refork completion count is zero, so the worker that
             // owns this slot can no longer read or write it.
-            if let Some(error) = unsafe { slot.get_mut_unchecked() }.take() {
+            if let Some(error) = unsafe { slot.with_mut_unchecked(Option::take) } {
                 if graph_update_error.is_none() {
                     graph_update_error = Some(error);
                 } else {
@@ -326,7 +327,7 @@ impl Engine {
             // SAFETY: each Data Worker owns exactly one error slot throughout
             // the refork; the main Engine reads it only after completion.
             unsafe {
-                *slot.get_mut_unchecked() = Some(error);
+                slot.with_mut_unchecked(|slot| *slot = Some(error));
             }
         }
 
@@ -478,7 +479,7 @@ impl Engine {
         // acknowledging the barrier. The main Engine reads only after every
         // worker has acknowledged.
         unsafe {
-            *slot.get_mut_unchecked() = Some(snapshot);
+            slot.with_mut_unchecked(|slot| *slot = Some(snapshot));
         }
     }
 
