@@ -14,15 +14,15 @@ use hammer_runtime::RuntimeResult;
 
 use super::{Engine, RegistryError};
 
-/// The identity of one immutable Crypto Engine catalog.
+/// The identity of one immutable Crypto Engine registration.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct CryptoEngineEpoch(u64);
 
 impl CryptoEngineEpoch {
-    /// The catalog installed during service initialization.
+    /// The registration installed during service initialization.
     pub const INITIAL: Self = Self(1);
 
-    /// Returns the monotonically increasing catalog identity.
+    /// Returns the monotonically increasing registration identity.
     #[inline]
     pub const fn value(self) -> u64 {
         self.0
@@ -71,7 +71,7 @@ fn create_builtin_engine(_: u32, instructions: InstructionSet) -> Result<Engine,
 const BUILTIN_CRYPTO_ENGINE_REGISTRATION: CryptoEngineRegistration =
     CryptoEngineRegistration::new("builtin", create_builtin_engine);
 
-/// Main Thread authority for the Crypto Engine catalog selected at startup.
+/// Main Thread authority for the Crypto Engine registration selected at startup.
 #[derive(Debug)]
 pub struct CryptoEngineMain {
     epoch: CryptoEngineEpoch,
@@ -79,7 +79,7 @@ pub struct CryptoEngineMain {
 }
 
 impl CryptoEngineMain {
-    /// Creates the immutable startup catalog.
+    /// Creates the immutable startup registration.
     #[inline]
     pub const fn new(registration: CryptoEngineRegistration) -> Self {
         Self {
@@ -88,7 +88,7 @@ impl CryptoEngineMain {
         }
     }
 
-    /// Returns the installed catalog identity.
+    /// Returns the installed registration identity.
     #[inline]
     pub const fn epoch(&self) -> CryptoEngineEpoch {
         self.epoch
@@ -123,7 +123,7 @@ impl CryptoEngineThread {
         })
     }
 
-    /// Returns the catalog used to initialize this thread.
+    /// Returns the registration used to initialize this thread.
     #[inline]
     pub const fn epoch(&self) -> CryptoEngineEpoch {
         self.epoch
@@ -179,7 +179,7 @@ mod tests {
             .register_builtin_image(&__HAMMER_REGISTRATION_IMAGE);
 
         hammer_runtime::init::run_init_functions(&mut runtime)
-            .expect("initialize Crypto Engine catalog");
+            .expect("initialize Crypto Engine registration");
 
         let main = runtime
             .registry

@@ -54,9 +54,9 @@ pub enum Transition<S, E> {
 
 /// One protocol-typed cryptographic exchange.
 ///
-/// A protocol that owns thread-bound cryptographic state carries that state in
-/// `P`, `P::State`, or `C`. The Main Thread owner, rather than a marker field,
-/// keeps handshake exchanges on the Main Thread.
+/// A protocol plugin owns thread-bound cryptographic state in `P`,
+/// `P::State`, or `C`. Its Main Thread or Data Worker owner keeps the exchange
+/// on that thread; crypto only supplies the synchronous algorithm operations.
 pub struct Exchange<P, C>
 where
     P: Protocol<C>,

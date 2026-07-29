@@ -1976,6 +1976,20 @@ pub struct KeyHandle {
     index: PoolIndex,
 }
 
+impl From<PoolIndex> for KeyHandle {
+    #[inline]
+    fn from(index: PoolIndex) -> Self {
+        Self { index }
+    }
+}
+
+impl From<KeyHandle> for PoolIndex {
+    #[inline]
+    fn from(key: KeyHandle) -> Self {
+        key.index
+    }
+}
+
 struct KeyProvenance {
     name: String,
     state: Rc<RefCell<OwnedState>>,

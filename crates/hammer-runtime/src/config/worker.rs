@@ -36,6 +36,8 @@ const BUFFER_SLOTS_PER_NUMA: usize = 4_096;
 const BUFFER_FRAME_POOL_SIZE: usize = 64;
 // hammer-runtime/src/handoff.rs (DataPlaneHandoff::new(workers, cap))
 const HANDOFF_QUEUE_CAPACITY: usize = 1_024;
+// hammer-runtime/src/spawn.rs (DataRemoteLocalQueue::new(cap))
+const WORKER_CONTROL_QUEUE_CAPACITY: usize = 1_024;
 // hammer-runtime/src/app/session.rs AppSessionConfig::DEFAULT
 const APP_SESSION_FIFO_CAPACITY: usize = 64 * 1024;
 const APP_SESSION_EVENT_QUEUE_CAPACITY: usize = 16;
@@ -63,6 +65,7 @@ pub struct Worker {
     pub idle_slice: Duration,
     pub buffer: WorkerBuffer,
     pub handoff: WorkerHandoff,
+    pub control: WorkerControl,
     pub app_session: WorkerAppSession,
     /// CPU pinning. Linux only; absent on macOS (XNU has no thread
     /// affinity). The three cores are independent: `main_core` runs the
@@ -87,6 +90,7 @@ impl Default for Worker {
             idle_slice: WORKER_IDLE_SLICE,
             buffer: WorkerBuffer::default(),
             handoff: WorkerHandoff::default(),
+            control: WorkerControl::default(),
             app_session: WorkerAppSession::default(),
             #[cfg(target_os = "linux")]
             cpu: WorkerCpu::default(),
@@ -120,6 +124,7 @@ impl Worker {
         }
         self.buffer.validate()?;
         self.handoff.validate()?;
+        self.control.validate()?;
         self.app_session.validate()?;
         #[cfg(target_os = "linux")]
         {
@@ -191,10 +196,36 @@ impl WorkerBuffer {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct WorkerHandoff {
-    /// Per-worker handoff queue capacity (`DataPlaneHandoff::new(workers, cap)`).
+    /// Per-worker packet handoff queue capacity.
     pub queue_capacity: usize,
     /// Registered internal node handle for the handoff ingress node.
     pub node_handle: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct WorkerControl {
+    /// Per-worker Main Thread to Data Worker control queue capacity.
+    pub queue_capacity: usize,
+}
+
+impl Default for WorkerControl {
+    fn default() -> Self {
+        Self {
+            queue_capacity: WORKER_CONTROL_QUEUE_CAPACITY,
+        }
+    }
+}
+
+impl WorkerControl {
+    fn validate(&self) -> RuntimeResult<()> {
+        if self.queue_capacity == 0 {
+            return Err(RuntimeError::config_validation(
+                "worker.control.queue_capacity must be non-zero",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for WorkerHandoff {
@@ -432,6 +463,7 @@ mod tests {
         assert_eq!(worker.buffer.frame_pool_size, BUFFER_FRAME_POOL_SIZE);
         assert_eq!(worker.buffer.page_size, None);
         assert_eq!(worker.handoff.queue_capacity, HANDOFF_QUEUE_CAPACITY);
+        assert_eq!(worker.control.queue_capacity, WORKER_CONTROL_QUEUE_CAPACITY);
         assert_eq!(worker.app_session.fifo_capacity, APP_SESSION_FIFO_CAPACITY);
         assert_eq!(
             worker.app_session.evt_q_capacity,
@@ -444,6 +476,30 @@ mod tests {
         let worker: Worker = toml::from_str("count = 4\n").expect("parse");
         assert_eq!(worker.count, 4);
         assert_eq!(worker.stack_size, WORKER_STACK_SIZE);
+    }
+
+    #[test]
+    fn parse_worker_control_queue_capacity() {
+        let worker: Worker = toml::from_str(
+            r#"
+            [control]
+            queue_capacity = 8
+            "#,
+        )
+        .expect("parse worker control queue capacity");
+        assert_eq!(worker.control.queue_capacity, 8);
+
+        let invalid: Worker = toml::from_str(
+            r#"
+            [control]
+            queue_capacity = 0
+            "#,
+        )
+        .expect("parse zero worker control queue capacity");
+        let error = invalid
+            .validate()
+            .expect_err("reject zero worker control queue capacity");
+        assert!(matches!(error, RuntimeError::ConfigValidation { .. }));
     }
 
     #[test]
