@@ -2,6 +2,7 @@ extern crate self as hammer_service;
 
 hammer_runtime::__declare_registration_image!(
     init_functions = [
+        crypto::main::__INIT_FN_CRYPTO_INIT,
         device::__INIT_FN_DEVICE_INIT,
         session::__INIT_FN_SESSION_INIT,
         session::__INIT_FN_SESSION_ATTACH_SERVER,
@@ -10,8 +11,11 @@ hammer_runtime::__declare_registration_image!(
     config_functions = [];
     early_config_functions = [session::__CONFIG_FN_SESSION_CONFIG];
     main_loop_enter_functions = [];
-    main_loop_exit_functions = [];
-    worker_init_functions = [session::__INIT_FN_SESSION_WORKER_INIT];
+    main_loop_exit_functions = [crypto::main::__INIT_FN_CRYPTO_EXIT];
+    worker_init_functions = [
+        crypto::main::__INIT_FN_CRYPTO_WORKER_INIT,
+        session::__INIT_FN_SESSION_WORKER_INIT,
+    ];
     graph_nodes = [
         data_plane::__SERVICE_GRAPH_NODE_DROP_NODE,
         data_plane::__SERVICE_GRAPH_NODE_HANDOFF_NODE,
