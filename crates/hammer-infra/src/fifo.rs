@@ -1,4 +1,5 @@
 use std::cell::UnsafeCell;
+use std::io::{self, BufRead, Read, Write};
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -264,6 +265,76 @@ pub struct Fifo {
 
 unsafe impl Send for Fifo {}
 unsafe impl Sync for Fifo {}
+
+impl Read for &Fifo {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.max_dequeue() == 0 {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+
+        let read = self.peek(0, buf.len(), buf);
+        assert_eq!(
+            self.dequeue_drop(read),
+            read,
+            "FIFO readable bytes changed while held by its consumer"
+        );
+        Ok(read)
+    }
+}
+
+impl BufRead for &Fifo {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        self.readable_segment()
+            .ok_or_else(|| io::ErrorKind::WouldBlock.into())
+    }
+
+    fn consume(&mut self, amount: usize) {
+        let readable = self.readable_segment().map_or(0, <[u8]>::len);
+        assert!(
+            amount <= readable,
+            "cannot consume {amount} bytes from a FIFO segment containing {readable} bytes"
+        );
+        assert_eq!(
+            self.dequeue_drop(amount),
+            amount,
+            "FIFO readable bytes changed while held by its consumer"
+        );
+    }
+}
+
+impl Write for &Fifo {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let available = self.max_enqueue();
+        if available == 0 {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        let requested = buf.len().min(available);
+        let mut reservation = match self.reserve_write(requested) {
+            Ok(reservation) => reservation,
+            Err(FifoError::ReservationTooLong { max_len, .. }) => {
+                self.reserve_write(max_len).map_err(io::Error::other)?
+            }
+            Err(error) => return Err(io::Error::other(error)),
+        };
+        let written = reservation.reserved_len();
+        let (first, second) = reservation.segments_mut();
+        let first_len = first.len();
+        first.copy_from_slice(&buf[..first_len]);
+        second.copy_from_slice(&buf[first_len..written]);
+        reservation.commit(written).map_err(io::Error::other)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 impl Fifo {
     const fn chunk_data_size(capacity: usize) -> usize {
@@ -545,6 +616,34 @@ impl Fifo {
                         return Some(f(first_slice, second_slice));
                     }
                     return Some(f(first_slice, &[]));
+                }
+                chunk_off = chunk.next.load(Ordering::Acquire);
+            }
+            None
+        }
+    }
+
+    fn readable_segment(&self) -> Option<&[u8]> {
+        let hdr = self.hdr;
+        unsafe {
+            let head = (*hdr).head.load(Ordering::Relaxed);
+            let tail = (*hdr).tail.load(Ordering::Acquire);
+            if head == tail {
+                return None;
+            }
+
+            let mut chunk_off = (*hdr).head_chunk.load(Ordering::Relaxed);
+            while chunk_off != 0 {
+                let chunk = &*self.base.add(chunk_off as usize).cast::<Chunk>();
+                let chunk_end = chunk.start_byte + chunk.length.load(Ordering::Relaxed);
+                if head >= chunk.start_byte && head < chunk_end {
+                    let data_offset = (head - chunk.start_byte) as usize;
+                    let available = (chunk_end - head).min(tail.wrapping_sub(head)) as usize;
+                    return Some(std::slice::from_raw_parts(
+                        self.base
+                            .add(chunk_off as usize + CHUNK_HEADER_SIZE + data_offset),
+                        available,
+                    ));
                 }
                 chunk_off = chunk.next.load(Ordering::Acquire);
             }

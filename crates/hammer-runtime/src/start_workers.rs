@@ -1,4 +1,5 @@
 use core::hint::spin_loop;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::thread::JoinHandle;
@@ -21,6 +22,11 @@ pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
     engine.prepare_worker_runtime_stats(worker_config.count);
 
     let handoff = DataPlaneHandoff::new(worker_config.count, worker_config.handoff.queue_capacity);
+    let worker_control_queues: std::sync::Arc<[spawn::DataRemoteLocalQueue]> = (0..worker_count)
+        .map(|_| spawn::DataRemoteLocalQueue::new(worker_config.control.queue_capacity))
+        .collect::<Vec<_>>()
+        .into();
+    engine.install_worker_control_queues(std::sync::Arc::clone(&worker_control_queues));
     let mut threads = Vec::with_capacity(worker_config.count);
 
     for worker_slot in 0..worker_count {
@@ -29,24 +35,25 @@ pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
         let worker_seed = engine.worker_seed();
         let worker_config = worker_config.clone();
         let handoff = handoff.worker(worker);
+        let remote_local = worker_control_queues[worker.slot()].clone();
         let worker_barrier = barrier.clone();
         let worker_exit = std::sync::Arc::clone(&engine.main_loop_exit_now);
         let launched = thread::Builder::new()
             .name(format!("hammer-worker-{thread_index}"))
             .stack_size(worker_config.stack_size)
             .spawn(move || -> RuntimeResult<()> {
-                // VPP workers stop at the launch barrier before constructing
-                // any thread-local runtime state.
-                worker_barrier.check();
-                if worker_exit.load(Ordering::Acquire) {
-                    return Ok(());
-                }
+                let result = catch_unwind(AssertUnwindSafe(|| -> RuntimeResult<()> {
+                    // VPP workers stop at the launch barrier before constructing
+                    // any thread-local runtime state.
+                    worker_barrier.check();
+                    if worker_exit.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
 
-                let numa_node = worker_config.apply_current_thread_setup(worker.slot())?;
-                let mut engine = worker_seed.spawn_on_numa(thread_index, numa_node, handoff)?;
-                spawn::set_data_plane_runtime(engine.runtime.clone());
-                spawn::apply_worker_idle_slice(worker_config.idle_slice);
-                let result = (|| {
+                    let numa_node = worker_config.apply_current_thread_setup(worker.slot())?;
+                    let mut engine = worker_seed.spawn_on_numa(thread_index, numa_node, handoff)?;
+                    spawn::set_data_plane_runtime(engine.runtime.clone());
+                    spawn::apply_worker_idle_slice(worker_config.idle_slice);
                     crate::init::run_worker_init_functions(&mut engine)?;
                     if worker_exit.load(Ordering::Acquire) {
                         return Ok(());
@@ -62,7 +69,6 @@ pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
                                 error.to_string(),
                             )
                         })?;
-                    let remote_local = spawn::DataRemoteLocalQueue::default();
                     remote_local.attach_current_thread();
                     let exit_status =
                         crate::main_loop::engine_main_loop(&mut engine, &tokio, &remote_local);
@@ -75,9 +81,13 @@ pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
                             format!("exited with status {exit_status}"),
                         ))
                     }
-                })();
+                }));
+                remote_local.close();
                 spawn::cleanup_thread_local();
-                result
+                match result {
+                    Ok(result) => result,
+                    Err(payload) => std::panic::resume_unwind(payload),
+                }
             });
 
         match launched {

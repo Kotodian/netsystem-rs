@@ -4,9 +4,7 @@ use hammer_infra::fifo::Fifo;
 use hammer_infra::segment::Segment;
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::app::{AppSession, AppSessionConfig, SessionHandle, SessionMsgQueue};
-use hammer_service::session::{
-    AppSessionProtocol, ProtocolChain, ProtocolChainIo, ProtocolFifoAdvance,
-};
+use hammer_service::session::{AppSessionProtocol, Plaintext, ProtocolChain, ProtocolChainIo};
 
 const TLS_REQUEST_RECORD: &[u8] = b"encrypted HTTP request";
 const HTTP_REQUEST: &[u8] = b"POST /session HTTP/1.1\r\n\r\nrequest";
@@ -14,6 +12,7 @@ const APPLICATION_REQUEST: &[u8] = b"request";
 const APPLICATION_RESPONSE: &[u8] = b"response";
 const HTTP_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\n\r\nresponse";
 const TLS_RESPONSE_RECORD: &[u8] = b"encrypted HTTP response";
+const FIFO_PADDING: &[u8; 63] = &[0; 63];
 
 fn app_session(index: u32) -> Arc<AppSession> {
     let tx_events = Arc::new(SessionMsgQueue::with_cfg(64, 64).expect("TX event queue"));
@@ -57,11 +56,115 @@ fn publish_protocol_message(source: &Fifo, destination: &Fifo, input: &[u8], out
 }
 
 #[test]
-fn plaintext_exposes_the_existing_app_session_directly() {
-    let session = app_session(1);
-    let chain = ProtocolChain::plaintext(Arc::clone(&session));
+fn plaintext_transfers_between_transport_and_application_sessions() {
+    let transport_session = app_session(1);
+    let application_session = app_session(2);
+    let transport = ProtocolChain::transport(Arc::clone(&transport_session));
+    let mut chain = ProtocolChain::new(Arc::clone(&application_session), Plaintext, transport);
 
-    assert!(Arc::ptr_eq(chain.app_session(), &session));
+    assert!(Arc::ptr_eq(chain.app_session(), &application_session));
+    transport_session
+        .enqueue_rx(APPLICATION_REQUEST)
+        .expect("transport ingress");
+    chain.ingress().expect("plaintext ingress");
+    assert_fifo_message(application_session.rx_fifo(), APPLICATION_REQUEST);
+
+    application_session
+        .send_bytes(APPLICATION_RESPONSE)
+        .expect("application egress");
+    chain.egress().expect("plaintext egress");
+    assert_fifo_message(transport_session.tx_fifo(), APPLICATION_RESPONSE);
+}
+
+struct TlsRecordProtocol;
+
+impl AppSessionProtocol for TlsRecordProtocol {
+    fn ingress(
+        &mut self,
+        lower_rx_fifo: &Fifo,
+        upper_rx_fifo: &Fifo,
+    ) -> RuntimeResult<(usize, usize)> {
+        if lower_rx_fifo.max_dequeue() == 0 || upper_rx_fifo.max_enqueue() == 0 {
+            return Ok((0, 0));
+        }
+        let transferred = lower_rx_fifo
+            .peek_segments(0, 1, |first, second| {
+                let source = if first.is_empty() { second } else { first };
+                upper_rx_fifo.enqueue(source)
+            })
+            .unwrap_or(0);
+        assert_eq!(lower_rx_fifo.dequeue_drop(transferred), transferred);
+        Ok((transferred, transferred))
+    }
+
+    fn egress(&mut self, _: &Fifo, _: &Fifo) -> RuntimeResult<(usize, usize)> {
+        Ok((0, 0))
+    }
+}
+
+#[test]
+fn protocol_chain_drains_current_input_before_returning() {
+    let transport_session = app_session(3);
+    let application_session = app_session(4);
+    let transport = ProtocolChain::transport(Arc::clone(&transport_session));
+    let mut chain = ProtocolChain::new(
+        Arc::clone(&application_session),
+        TlsRecordProtocol,
+        transport,
+    );
+    transport_session
+        .enqueue_rx(b"ab")
+        .expect("transport ingress");
+
+    chain.ingress().expect("session queue drain");
+    assert_fifo_message(application_session.rx_fifo(), b"ab");
+    assert_eq!(transport_session.rx_fifo().max_dequeue(), 0);
+}
+
+#[test]
+fn protocol_chain_drains_wrapped_current_input_before_returning() {
+    let transport_session = app_session(5);
+    let application_session = app_session(6);
+    let transport = ProtocolChain::transport(Arc::clone(&transport_session));
+    let mut chain = ProtocolChain::new(
+        Arc::clone(&application_session),
+        TlsRecordProtocol,
+        transport,
+    );
+    assert_eq!(transport_session.rx_fifo().enqueue(FIFO_PADDING), 63);
+    assert_eq!(transport_session.rx_fifo().dequeue_drop(63), 63);
+    transport_session
+        .enqueue_rx(b"ab")
+        .expect("wrapped transport ingress");
+
+    chain.ingress().expect("wrapped session queue drain");
+    assert_fifo_message(application_session.rx_fifo(), b"ab");
+    assert_eq!(transport_session.rx_fifo().max_dequeue(), 0);
+}
+
+#[test]
+fn protocol_chain_resumes_current_input_after_application_backpressure() {
+    let transport_session = app_session(7);
+    let application_session = app_session(8);
+    let transport = ProtocolChain::transport(Arc::clone(&transport_session));
+    let mut chain = ProtocolChain::new(
+        Arc::clone(&application_session),
+        TlsRecordProtocol,
+        transport,
+    );
+    assert_eq!(application_session.rx_fifo().enqueue(FIFO_PADDING), 63);
+    transport_session
+        .enqueue_rx(b"ab")
+        .expect("transport ingress");
+
+    chain.ingress().expect("backpressured session queue drain");
+    assert_eq!(transport_session.rx_fifo().max_dequeue(), 1);
+    assert_eq!(application_session.rx_fifo().max_dequeue(), 64);
+
+    assert_eq!(application_session.consume_rx(64), 64);
+    chain.ingress().expect("resumed session queue drain");
+    assert_fifo_message(application_session.rx_fifo(), b"b");
+    assert_eq!(transport_session.rx_fifo().max_dequeue(), 0);
 }
 
 struct TlsProtocol;
@@ -71,34 +174,34 @@ impl AppSessionProtocol for TlsProtocol {
         &mut self,
         lower_rx_fifo: &Fifo,
         upper_rx_fifo: &Fifo,
-    ) -> RuntimeResult<ProtocolFifoAdvance> {
+    ) -> RuntimeResult<(usize, usize)> {
+        if lower_rx_fifo.max_dequeue() < TLS_REQUEST_RECORD.len() {
+            return Ok((0, 0));
+        }
         publish_protocol_message(
             lower_rx_fifo,
             upper_rx_fifo,
             TLS_REQUEST_RECORD,
             HTTP_REQUEST,
         );
-        Ok(ProtocolFifoAdvance::new(
-            TLS_REQUEST_RECORD.len(),
-            HTTP_REQUEST.len(),
-        ))
+        Ok((TLS_REQUEST_RECORD.len(), HTTP_REQUEST.len()))
     }
 
     fn egress(
         &mut self,
         upper_tx_fifo: &Fifo,
         lower_tx_fifo: &Fifo,
-    ) -> RuntimeResult<ProtocolFifoAdvance> {
+    ) -> RuntimeResult<(usize, usize)> {
+        if upper_tx_fifo.max_dequeue() < HTTP_RESPONSE.len() {
+            return Ok((0, 0));
+        }
         publish_protocol_message(
             upper_tx_fifo,
             lower_tx_fifo,
             HTTP_RESPONSE,
             TLS_RESPONSE_RECORD,
         );
-        Ok(ProtocolFifoAdvance::new(
-            HTTP_RESPONSE.len(),
-            TLS_RESPONSE_RECORD.len(),
-        ))
+        Ok((HTTP_RESPONSE.len(), TLS_RESPONSE_RECORD.len()))
     }
 }
 
@@ -109,34 +212,34 @@ impl AppSessionProtocol for HttpProtocol {
         &mut self,
         lower_rx_fifo: &Fifo,
         upper_rx_fifo: &Fifo,
-    ) -> RuntimeResult<ProtocolFifoAdvance> {
+    ) -> RuntimeResult<(usize, usize)> {
+        if lower_rx_fifo.max_dequeue() < HTTP_REQUEST.len() {
+            return Ok((0, 0));
+        }
         publish_protocol_message(
             lower_rx_fifo,
             upper_rx_fifo,
             HTTP_REQUEST,
             APPLICATION_REQUEST,
         );
-        Ok(ProtocolFifoAdvance::new(
-            HTTP_REQUEST.len(),
-            APPLICATION_REQUEST.len(),
-        ))
+        Ok((HTTP_REQUEST.len(), APPLICATION_REQUEST.len()))
     }
 
     fn egress(
         &mut self,
         upper_tx_fifo: &Fifo,
         lower_tx_fifo: &Fifo,
-    ) -> RuntimeResult<ProtocolFifoAdvance> {
+    ) -> RuntimeResult<(usize, usize)> {
+        if upper_tx_fifo.max_dequeue() < APPLICATION_RESPONSE.len() {
+            return Ok((0, 0));
+        }
         publish_protocol_message(
             upper_tx_fifo,
             lower_tx_fifo,
             APPLICATION_RESPONSE,
             HTTP_RESPONSE,
         );
-        Ok(ProtocolFifoAdvance::new(
-            APPLICATION_RESPONSE.len(),
-            HTTP_RESPONSE.len(),
-        ))
+        Ok((APPLICATION_RESPONSE.len(), HTTP_RESPONSE.len()))
     }
 }
 
@@ -146,8 +249,8 @@ fn application_selects_tls_then_http_protocols() {
     let http_transport_session = app_session(11);
     let application_session = app_session(12);
 
-    let plaintext = ProtocolChain::plaintext(Arc::clone(&transport_session));
-    let tls = ProtocolChain::new(Arc::clone(&http_transport_session), TlsProtocol, plaintext);
+    let transport = ProtocolChain::transport(Arc::clone(&transport_session));
+    let tls = ProtocolChain::new(Arc::clone(&http_transport_session), TlsProtocol, transport);
     let mut chain = ProtocolChain::new(Arc::clone(&application_session), HttpProtocol, tls);
 
     assert!(Arc::ptr_eq(chain.app_session(), &application_session));

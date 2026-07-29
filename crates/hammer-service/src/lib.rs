@@ -2,7 +2,6 @@ extern crate self as hammer_service;
 
 hammer_runtime::__declare_registration_image!(
     init_functions = [
-        crypto::main::__INIT_FN_CRYPTO_INIT,
         device::__INIT_FN_DEVICE_INIT,
         session::__INIT_FN_SESSION_INIT,
         session::__INIT_FN_SESSION_ATTACH_SERVER,
@@ -32,7 +31,6 @@ pub fn registration_image() -> &'static hammer_runtime::__private::RegistrationI
 }
 
 pub mod app;
-pub mod crypto;
 pub mod data_plane;
 /// Device-class abstraction. Concrete drivers live under `hammer-plugins/device/`.
 pub mod device;
