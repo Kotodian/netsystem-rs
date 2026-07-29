@@ -121,10 +121,42 @@ fn init_data_plane_runtime(config: &Worker) -> RuntimeResult<()> {
     })
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct DataRemoteLocalQueue {
-    tasks: Arc<Mutex<VecDeque<RemoteDataLocalTask>>>,
+    tasks: Arc<Mutex<DataRemoteLocalQueueState>>,
     thread: Arc<Mutex<Option<thread::Thread>>>,
+}
+
+struct DataRemoteLocalQueueState {
+    accepting: bool,
+    capacity: usize,
+    tasks: VecDeque<RemoteDataLocalTask>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DataRemoteLocalQueueError {
+    Closed,
+    Full { capacity: usize },
+}
+
+impl Default for DataRemoteLocalQueue {
+    fn default() -> Self {
+        Self::new(1_024)
+    }
+}
+
+impl DataRemoteLocalQueue {
+    pub(crate) fn new(capacity: usize) -> Self {
+        assert_ne!(capacity, 0, "remote-local queue capacity must be non-zero");
+        Self {
+            tasks: Arc::new(Mutex::new(DataRemoteLocalQueueState {
+                accepting: false,
+                capacity,
+                tasks: VecDeque::with_capacity(capacity),
+            })),
+            thread: Arc::new(Mutex::new(None)),
+        }
+    }
 }
 
 impl DataRuntime {
@@ -163,7 +195,7 @@ impl DataRuntime {
         let mut workers = Vec::with_capacity(worker_threads);
         for index in 0..worker_threads {
             let worker_name = format!("{thread_name}-{index}");
-            let remote_local = DataRemoteLocalQueue::default();
+            let remote_local = DataRemoteLocalQueue::new(worker.control.queue_capacity);
             let worker_remote_local = remote_local.clone();
             let worker_config = worker_config.clone();
             let worker_barrier = barrier.clone();
@@ -208,6 +240,7 @@ impl DataRuntime {
                                 shutdown_rx,
                                 &worker_barrier,
                             );
+                            worker_remote_local.close();
                             DATA_LOCAL_TASKS.with(|tasks| tasks.borrow_mut().clear());
                             DATA_LOCAL_DRIVER_WAKER.with(|waker| waker.borrow_mut().take());
                             CURRENT_DATA_WORKER.with(|slot| slot.set(None));
@@ -550,8 +583,24 @@ impl DataRuntimeContext {
                 worker_count: self.inner.workers.len(),
             });
         }
-        self.inner.workers[worker].remote_local.push(task);
-        Ok(())
+        self.inner.workers[worker]
+            .remote_local
+            .push(task)
+            .map_err(|error| match error {
+                DataRemoteLocalQueueError::Closed => RuntimeError::WorkerControlClosed {
+                    worker: crate::DataWorkerId::new(
+                        u32::try_from(worker).expect("worker index fits u32"),
+                    ),
+                },
+                DataRemoteLocalQueueError::Full { capacity } => {
+                    RuntimeError::WorkerControlQueueFull {
+                        worker: crate::DataWorkerId::new(
+                            u32::try_from(worker).expect("worker index fits u32"),
+                        ),
+                        capacity,
+                    }
+                }
+            })
     }
 
     fn spawn_worker_index(&self) -> usize {
@@ -578,17 +627,31 @@ impl DataRuntimeContext {
 
 impl DataRemoteLocalQueue {
     pub fn attach_current_thread(&self) {
+        self.tasks
+            .lock()
+            .expect("remote local queue poisoned")
+            .accepting = true;
         *self
             .thread
             .lock()
             .expect("remote local thread handle poisoned") = Some(thread::current());
     }
 
-    fn push(&self, task: RemoteDataLocalTask) {
-        self.tasks
-            .lock()
-            .expect("remote local queue poisoned")
-            .push_back(task);
+    pub(crate) fn push(
+        &self,
+        task: impl FnOnce() + Send + 'static,
+    ) -> Result<(), DataRemoteLocalQueueError> {
+        let mut state = self.tasks.lock().expect("remote local queue poisoned");
+        if !state.accepting {
+            return Err(DataRemoteLocalQueueError::Closed);
+        }
+        if state.tasks.len() == state.capacity {
+            return Err(DataRemoteLocalQueueError::Full {
+                capacity: state.capacity,
+            });
+        }
+        state.tasks.push_back(Box::new(task));
+        drop(state);
         if let Some(thread) = self
             .thread
             .lock()
@@ -598,11 +661,24 @@ impl DataRemoteLocalQueue {
         {
             thread.unpark();
         }
+        Ok(())
+    }
+
+    pub(crate) fn close(&self) {
+        let mut state = self.tasks.lock().expect("remote local queue poisoned");
+        state.accepting = false;
+        let tasks = std::mem::take(&mut state.tasks);
+        drop(state);
+        *self
+            .thread
+            .lock()
+            .expect("remote local thread handle poisoned") = None;
+        drop(tasks);
     }
 
     pub(crate) fn drain(&self) -> VecDeque<RemoteDataLocalTask> {
-        let mut tasks = self.tasks.lock().expect("remote local queue poisoned");
-        std::mem::take(&mut *tasks)
+        let mut state = self.tasks.lock().expect("remote local queue poisoned");
+        std::mem::take(&mut state.tasks)
     }
 }
 

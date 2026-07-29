@@ -121,7 +121,7 @@ impl AppSession {
     #[inline]
     pub fn send_bytes(&self, bytes: &[u8]) -> Result<usize, AppSessionError> {
         let wrote = self.tx_fifo.enqueue(bytes);
-        self.notify_tx_event(wrote)?;
+        self.publish_tx_enqueue(wrote)?;
         Ok(wrote)
     }
 
@@ -151,7 +151,7 @@ impl AppSession {
     #[inline]
     pub fn consume_rx(&self, len: usize) -> usize {
         let dropped = self.rx_fifo.dequeue_drop(len);
-        self.notify_rx_dequeue(dropped);
+        self.publish_rx_dequeue(dropped);
         dropped
     }
 
@@ -190,8 +190,25 @@ impl AppSession {
         flags: SessionEvtFlags,
     ) -> Result<usize, AppSessionError> {
         let wrote = self.rx_fifo.enqueue(bytes);
-        if wrote == 0 {
-            return Ok(0);
+        self.publish_rx_enqueue_with_flags(wrote, flags)?;
+        Ok(wrote)
+    }
+
+    /// Publishes an RX enqueue already committed directly to [`Self::rx_fifo`].
+    /// `produced` is the number of newly visible FIFO elements.
+    #[inline]
+    pub fn publish_rx_enqueue(&self, produced: usize) -> Result<(), AppSessionError> {
+        self.publish_rx_enqueue_with_flags(produced, SessionEvtFlags::empty())
+    }
+
+    #[inline]
+    fn publish_rx_enqueue_with_flags(
+        &self,
+        produced: usize,
+        flags: SessionEvtFlags,
+    ) -> Result<(), AppSessionError> {
+        if produced == 0 {
+            return Ok(());
         }
         let urgent = flags.contains(SessionEvtFlags::URGENT);
         if self.rx_fifo.set_event() || urgent {
@@ -200,7 +217,7 @@ impl AppSession {
                 return Err(error);
             }
         }
-        Ok(wrote)
+        Ok(())
     }
 
     /// Transport-side convenience: drop acked bytes from tx_fifo and emit
@@ -208,10 +225,18 @@ impl AppSession {
     #[inline]
     pub fn drop_tx_acked(&self, len: usize) -> Result<usize, AppSessionError> {
         let dropped = self.tx_fifo.dequeue_drop(len);
-        if dropped > 0 && self.tx_fifo.needs_deq_notification(dropped) {
+        self.publish_tx_dequeue(dropped)?;
+        Ok(dropped)
+    }
+
+    /// Publishes a TX dequeue already applied directly to [`Self::tx_fifo`].
+    /// `consumed` is the number of FIFO elements just removed.
+    #[inline]
+    pub fn publish_tx_dequeue(&self, consumed: usize) -> Result<(), AppSessionError> {
+        if consumed > 0 && self.tx_fifo.needs_deq_notification(consumed) {
             self.push_event(SessionEvtType::TxDeq)?;
         }
-        Ok(dropped)
+        Ok(())
     }
 
     #[inline]
@@ -267,9 +292,11 @@ impl AppSession {
         Ok(())
     }
 
+    /// Publishes a TX enqueue already committed directly to [`Self::tx_fifo`].
+    /// `produced` is the number of newly visible FIFO elements.
     #[inline]
-    fn notify_tx_event(&self, wrote: usize) -> Result<(), AppSessionError> {
-        if wrote == 0 || !self.tx_fifo.set_event() {
+    pub fn publish_tx_enqueue(&self, produced: usize) -> Result<(), AppSessionError> {
+        if produced == 0 || !self.tx_fifo.set_event() {
             return Ok(());
         }
         if self
@@ -288,9 +315,11 @@ impl AppSession {
         Ok(())
     }
 
+    /// Publishes an RX dequeue already applied directly to [`Self::rx_fifo`].
+    /// `consumed` is the number of FIFO elements just removed.
     #[inline]
-    fn notify_rx_dequeue(&self, dropped: usize) {
-        if !self.rx_fifo.needs_deq_notification(dropped) {
+    pub fn publish_rx_dequeue(&self, consumed: usize) {
+        if !self.rx_fifo.needs_deq_notification(consumed) {
             return;
         }
         let event = SessionEvt::io(self.handle.session_index(), SessionEvtType::RxDeq);
@@ -332,7 +361,7 @@ impl AppSession {
             let read = self.rx_fifo.peek(0, out.len(), out);
             if read != 0 || out.is_empty() {
                 let dropped = self.rx_fifo.dequeue_drop(read);
-                self.notify_rx_dequeue(dropped);
+                self.publish_rx_dequeue(dropped);
                 return Ok(read);
             }
             self.rx_fifo.unset_event();

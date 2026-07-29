@@ -244,12 +244,12 @@ Each process owns the readiness handle duplicates it creates for its own event l
 _Avoid_: daemon-owned descriptor across process boundaries, one global readiness owner, session object silently closing another process's handle
 
 **Single App Session Surface**:
-The app-side model has one concrete session abstraction, `AppSession<S>`, for both local and attached storage backends and for both external-App and builtin-plugin drivers. `AppClient` and session configuration are construction/connection support; a second remote-session or TLS-session facade is not a domain concept.
+The app-side model has one concrete session abstraction, `AppSession<S>`, for both local and attached storage backends and at every level of an App Session Stack. `AppClient` and session configuration are construction/connection support; a second remote-session or TLS-session facade is not a domain concept.
 _Avoid_: parallel local/remote session objects, TLS-specific app session, wrapper-of-wrapper app facades, session lookup context presented as another session type
 
-**App Session Driver**:
-The owner that produces TX bytes and consumes RX bytes through one App Session. App connection policy selects the driver when constructing the Session stack: the external App drives a direct Session, while a builtin plugin such as TLS drives its lower Session and presents another ordinary App Session to the external App. The App Session neither interprets its bytes nor knows which driver owns them.
-_Avoid_: TLS mode in App Session, protocol-aware FIFO, mutable driver switch, transport-specific app interface
+**App Session Stack**:
+An ordered protocol composition fixed when a connection is constructed. `session::ProtocolChain<P, L>` owns the App-facing App Session, one concrete protocol state, and the complete lower chain. Protocol state receives only the source and destination FIFO adjacent to its layer; it neither owns nor inspects the lower chain. Each App Session exchanges only the protocol data of its two adjacent layers, and the innermost App Session connects to transport. Session Runtime schedules the statically composed chain without interpreting or erasing concrete protocol state.
+_Avoid_: App Session driver binding, TLS mode in App Session, protocol-aware FIFO, mutable layer switch, transport-specific app interface
 
 ## Session And Transport
 
@@ -364,16 +364,16 @@ _Avoid_: all-timer sweep, timer-kind discovery, guessed expired timer
 ## Cryptography
 
 **TLS Connection**:
-An application-selected secure byte-stream connection terminated by the trusted Hammer daemon at the App/Session Seam. The external App drives an ordinary plaintext App Session; the TLS plugin drives an ordinary lower App Session containing TLS records as a builtin App. The TLS plugin consumes and produces bytes only through the transport-neutral Session interface; it requires ordered reliable stream semantics without depending on or accessing a concrete transport implementation.
-_Avoid_: app-process TLS termination, TCP-owned TLS, concrete-transport dependency, TLS over UDP, secure socket wrapper, TLS-specific app session, App-Session-owned TLS mode
+An application-selected rustls connection terminated by the trusted Hammer daemon at the App/Session Seam. The Main Thread retains immutable `Arc<ClientConfig>` or `Arc<ServerConfig>` policy while one Data Worker exclusively owns and advances each concrete `rustls::Connection`. Its adjacent lower App Session FIFO carries TLS records, and its adjacent upper App Session FIFO carries the protocol data of the immediately higher layer. Hammer does not implement a TLS state machine, transcript, key schedule, record protection, key registry, or Crypto Engine.
+_Avoid_: Hammer TLS state machine, app-process TLS termination, TCP-owned TLS, concrete-transport dependency, TLS-specific App Session, Key Handle, Crypto Context, crypto registry
 
-**TLS FIFO Transform**:
-The worker-local conversion between an upper plaintext App Session FIFO and a lower TLS-record App Session FIFO. Source bytes are borrowed from one FIFO and transformed directly into reserved destination FIFO space; Data-Plane Buffers remain below the lower Session at the Packet Graph seam.
-_Avoid_: TLS Buffer, Data-Plane Buffer between App Sessions, temporary payload vector, partially published TLS record
+**TLS FIFO I/O**:
+The worker-local transfer between rustls and the two adjacent App Session FIFOs. `Fifo` implements nonblocking standard `Read`, `BufRead`, and `Write`; TLS records pass directly through `rustls::Connection::read_tls` and `write_tls`, while rustls plaintext `Reader` and `Writer` exchange the current FIFO segment. Bytes accepted into rustls become rustls-owned buffered protocol state and are no longer retained in the source App Session FIFO. Data-Plane Buffers remain below the lower Session at the Packet Graph seam.
+_Avoid_: TLS Buffer, FIFO peek retained by TLS, pending FIFO-consumption counter, Data-Plane Buffer between App Sessions, temporary payload vector
 
-**TLS Profile**:
-An immutable App-selected policy snapshot for establishing a TLS Connection, including authentication, trust, certificate identity, SNI, ALPN, and allowed protocol choices. The TLS plugin owns its interpretation and references cryptographic keys through Key Handles; the Crypto Engine does not interpret TLS policy.
-_Avoid_: crypto-engine TLS configuration, mutable live-connection policy, raw certificate private key, transport configuration
+**TLS Configuration**:
+An immutable rustls `ClientConfig` or `ServerConfig` constructed on the Main Thread from App-selected authentication, trust, identity, SNI, ALPN, and protocol policy. Data Workers clone only its `Arc` when constructing a concrete connection; Hammer does not wrap it in another profile or registration type.
+_Avoid_: Hammer TLS profile wrapper, worker-mutated configuration, transport configuration, per-connection configuration copy
 
 **DTLS Association**:
 An application-selected secure datagram relationship that uses DTLS records over UDP packets while preserving datagram semantics. It does not require UDP to adopt the Session FIFO model.
@@ -382,78 +382,6 @@ _Avoid_: UDP TLS connection, stream session, encrypted UDP helper
 **QUIC Connection**:
 A secure multiplexed transport over UDP packets that uses the TLS 1.3 handshake but owns QUIC packet protection, reliability, congestion control, and stream state. It does not use the TLS or DTLS record layer.
 _Avoid_: TLS record transport, UDP session, DTLS stream
-
-**Crypto Engine**:
-The protocol-neutral authority that performs synchronous cryptographic operations and drives complete cryptographic exchanges over caller-provided memory. Exchange Protocols such as TLS, Noise, and IKEv2 retain their protocol-specific states and wire semantics while the Crypto Engine selects them and drives their registered transitions without knowing how bytes are transported.
-_Avoid_: cipher-only dispatcher, TLS-only engine, fixed protocol enum, protocol switch in the framework, network runtime
-
-**Cryptographic Exchange**:
-One Main Thread-owned stateful negotiation that authenticates peers and establishes or renews protected communication state from caller-provided messages. Each transition and all cryptographic operations it requests complete synchronously; Data Workers and message delivery remain outside the exchange.
-_Avoid_: Data Worker handshake state, one-shot key exchange call, async crypto operation, cipher context, transport connection
-
-**Exchange Protocol**:
-A registered implementation of one cryptographic exchange family, such as TLS, Noise, or IKEv2. It owns its wire grammar, negotiation rules, authentication rules, protocol state, and rekey decisions while exposing the Main Thread-driven Crypto Engine lifecycle.
-_Avoid_: hard-coded protocol branch, Data Worker state machine, cipher suite, transport callback, session adapter
-
-**Key Handle**:
-A generation-bearing opaque identity for cryptographic key material owned by the Crypto Engine. Secret-producing key generation, key exchange, encapsulation, decapsulation, and derivation return Key Handles; callers receive secret bytes only through an explicitly permitted Secret Export.
-_Avoid_: raw private-key bytes, exportable-key requirement, pointer as key identity, caller-owned engine key
-
-**Worker Key Provisioning**:
-The Crypto Engine-owned installation of an opaque key capability into one owning Data Worker so that the worker can create a thread-bound Crypto Context without exposing secret material to the protocol plugin. Provisioning is identified by Key Handle and connection/key generations rather than by exported key bytes.
-_Avoid_: TLS-owned traffic key bytes, cross-thread Crypto Context, implicit Secret Export, per-record Main Thread crypto
-
-**Key Policy**:
-The immutable permissions attached to a Key Handle that constrain its allowed algorithms, operations, derivations, and Secret Export. A Crypto Implementation may impose stricter restrictions but may never widen the policy.
-_Avoid_: caller convention, implementation fallback rule, mutable permission flag
-
-**Secret Export**:
-An explicit Crypto Engine operation that writes key material or secret-derived bytes to caller-provided memory only when the source Key Policy and Crypto Implementation both permit it. Public keys, hashes, signatures, and authentication tags are public operation results rather than Secret Exports.
-_Avoid_: implicit KDF byte output, software fallback, raw-key getter, protocol-owned secret copy
-
-**Crypto Context**:
-The Crypto Engine-owned state prepared to perform one allowed family of operations with selected Key Handles. A Crypto Context is bound to one cryptographic implementation and its creating execution thread; it never migrates, crosses threads, or silently falls back to another implementation.
-_Avoid_: raw expanded key, movable hardware session, cross-thread context, per-call implementation lookup, silent software fallback
-
-**Crypto Catalog Epoch**:
-One immutable, process-wide publication of registered cryptographic algorithms, implementations, and selection policy. Catalog evolution is additive; existing Crypto Contexts remain bound to their original implementation while new Contexts use the latest committed epoch.
-_Avoid_: mutable worker registry, implementation replacement, context migration, silent fallback
-
-**TLS Traffic Key Epoch**:
-One connection-local generation of direction-specific TLS traffic protection Key Handles and worker-local Crypto Contexts. An epoch becomes active only in TLS record order after its owning Data Worker has prepared it; stale connection generations or epochs are rejected.
-_Avoid_: global TLS key generation, all-worker traffic-key barrier, unordered key swap
-
-**Crypto Batch**:
-A typed collection of operations from one Operation Family that completes synchronously and records each operation's status independently. A single operation is represented by a one-element Crypto Batch, preserving the same execution contract for software, instruction-accelerated, and hardware implementations.
-_Avoid_: per-packet crypto method, untyped operation field bag, batch-wide success flag, async crypto frame
-
-**Operation Family**:
-One of the closed cryptographic operation categories `Aead`, `Cipher`, `Hash`, `Mac`, `Kdf`, `Kx`, `Sign`, and `Verify`, defining the valid operation and status shape for its algorithms. Plugins extend algorithms and implementations within these families rather than creating untyped operation categories.
-_Avoid_: algorithm enum, plugin-defined operation shape, universal operation record, family string
-
-**Exchange Transition**:
-One typed advancement of an Exchange Protocol's private state that consumes peer input and either returns the next protocol state or its protocol-specific established result. The common Engine may erase its concrete types only at the dynamic plugin seam.
-_Avoid_: generic status field bag, protocol enum, string-tagged result, DSO-wide dynamic state machine
-
-**Algorithm Name**:
-The canonical lowercase ASCII kebab-case name of cryptographic semantics, independent of protocols, implementations, and execution shapes. Unqualified names such as `aes-128-gcm` and `x25519` are reserved for the standard catalog; plugin-defined semantics use `<plugin>:<algorithm>`.
-_Avoid_: protocol codepoint, cipher suite name, implementation name, execution-shape suffix, alias
-
-**Algorithm ID**:
-A compact process-local identity assigned when an Algorithm Name is registered successfully and typed by its Operation Family. It is never a persistent identifier, configuration value, protocol codepoint, or cross-process contract.
-_Avoid_: stable algorithm number, wire algorithm ID, serialized registry index
-
-**Crypto Implementation Name**:
-The canonical `<plugin>:<implementation>` identity of one registered cryptographic execution implementation, kept separate from the Algorithm Names and capabilities it supports. Examples include `hammer:aes-gcm-armv8` and `qat:aes-gcm`.
-_Avoid_: backend encoded in Algorithm Name, unqualified implementation name, implementation alias
-
-**Crypto Implementation**:
-A registered execution capability for one or more cryptographic algorithms, with its own supported operation shapes, availability probe, and selection priority. Software function tables, CPU instruction implementations, and hardware providers occupy the same Engine role without requiring an additional wrapper concept.
-_Avoid_: algorithm semantics, protocol implementation, Adapter type, backend encoded in Algorithm Name
-
-**Standard Algorithm Catalog**:
-The deliberately small set of currently common cryptographic semantics supplied by `hammer-infra` for modern TLS, Noise, and IKEv2 use. It is a baseline rather than an exhaustive standards registry; compatibility, legacy, and specialized algorithms belong in plugins.
-_Avoid_: complete IANA catalog, legacy compatibility bundle, closed algorithm enum
 
 ## IP Reassembly
 

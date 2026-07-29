@@ -62,6 +62,8 @@ pub enum RuntimeError {
     PluginStateNotInitialized { plugin: &'static str },
     #[error("thread {thread_index} is not a data worker")]
     DataWorkerIdUnavailable { thread_index: u32 },
+    #[error("only the main Runtime Engine can schedule worker control work")]
+    WorkerControlRequiresMainEngine,
     #[error("worker configuration cannot change after runtime initialization")]
     WorkerConfigurationAlreadyInitialized,
     #[error("data workers are already started")]
@@ -106,6 +108,15 @@ pub enum RuntimeError {
     DataWorkerCallCanceled { worker: usize },
     #[error("data worker index {worker} is outside configured worker count {worker_count}")]
     DataWorkerIndexOutOfRange { worker: usize, worker_count: usize },
+    #[error("worker control queue for {worker:?} is unavailable before worker startup")]
+    WorkerControlUnavailable { worker: crate::DataWorkerId },
+    #[error("worker control queue for {worker:?} is closed")]
+    WorkerControlClosed { worker: crate::DataWorkerId },
+    #[error("worker control queue for {worker:?} reached capacity {capacity}")]
+    WorkerControlQueueFull {
+        worker: crate::DataWorkerId,
+        capacity: usize,
+    },
     #[error("Process Nodes can only start on the main Runtime Engine")]
     ProcessNodesRequireMainEngine,
     #[error("Process Nodes must be controlled by their owner thread")]

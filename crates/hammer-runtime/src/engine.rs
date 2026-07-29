@@ -16,6 +16,7 @@ use crate::file::FileRuntimeStatsRow;
 use crate::init::InitFunction;
 use crate::node::{NodeRuntimeData, NodeRuntimeInner, NodeRuntimeStatsRow};
 use crate::process::ProcessMain;
+use crate::spawn::{DataRemoteLocalQueue, DataRemoteLocalQueueError};
 use crate::{DataPlaneHandoffWorker, DataWorkerId, FileMain, PluginMain, ProcessHandle};
 
 thread_local! {
@@ -79,6 +80,7 @@ pub struct Engine {
     worker_runtime_stats: Arc<[crate::barrier::Barrier<Option<WorkerRuntimeStats>>]>,
     main_loop_exit_functions_called: bool,
     worker_threads: Vec<JoinHandle<RuntimeResult<()>>>,
+    worker_control_queues: Arc<[DataRemoteLocalQueue]>,
     // Drop after every owner that may retain DSO code or Drop glue. Plugin
     // images themselves remain mapped for the full process lifetime.
     plugin_main: PluginMain,
@@ -128,6 +130,7 @@ impl Engine {
             worker_runtime_stats,
             main_loop_exit_functions_called: false,
             worker_threads: Vec::new(),
+            worker_control_queues: Arc::from([]),
             processes: ProcessMain::new(),
         };
         Ok(engine)
@@ -161,6 +164,7 @@ impl Engine {
             worker_runtime_stats: Arc::from([]),
             main_loop_exit_functions_called: false,
             worker_threads: Vec::new(),
+            worker_control_queues: Arc::from([]),
             processes: ProcessMain::new(),
         }
     }
@@ -378,9 +382,44 @@ impl Engine {
         self.worker_config.count
     }
 
+    /// Schedules bounded control work on one running Data Worker.
+    ///
+    /// Runtime owns the queue and worker lifecycle only. The task runs on the
+    /// selected worker and may reach that worker's concrete plugin state through
+    /// the plugin's own ownership path; Runtime neither stores nor erases it.
+    pub fn schedule_on_worker(
+        &self,
+        worker: DataWorkerId,
+        task: impl FnOnce() + Send + 'static,
+    ) -> RuntimeResult<()> {
+        if self.thread_index != 0 {
+            return Err(RuntimeError::WorkerControlRequiresMainEngine);
+        }
+        if worker.slot() >= self.worker_config.count {
+            return Err(RuntimeError::DataWorkerIndexOutOfRange {
+                worker: worker.slot(),
+                worker_count: self.worker_config.count,
+            });
+        }
+        let queue = self
+            .worker_control_queues
+            .get(worker.slot())
+            .ok_or(RuntimeError::WorkerControlUnavailable { worker })?;
+        queue.push(task).map_err(|error| match error {
+            DataRemoteLocalQueueError::Closed => RuntimeError::WorkerControlClosed { worker },
+            DataRemoteLocalQueueError::Full { capacity } => {
+                RuntimeError::WorkerControlQueueFull { worker, capacity }
+            }
+        })
+    }
+
     #[inline]
     pub(crate) fn worker_config(&self) -> &Worker {
         &self.worker_config
+    }
+
+    pub(crate) fn install_worker_control_queues(&mut self, queues: Arc<[DataRemoteLocalQueue]>) {
+        self.worker_control_queues = queues;
     }
 
     pub(crate) fn worker_init_functions(&self) -> Vec<InitFunction> {

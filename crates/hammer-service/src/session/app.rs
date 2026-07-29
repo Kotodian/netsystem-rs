@@ -42,9 +42,8 @@ impl From<AppWorkerError> for RuntimeError {
 }
 
 pub struct AppWorker {
-    /// Hot per-packet lookup array: 16 bytes per occupied slot so
-    /// `session()`/`drain_tx_events_to` stay cache-dense. Cold attach
-    /// metadata lives in `attach_slots` at the same index.
+    /// Hot per-packet lookup array. Cold accept/detach-only metadata lives in
+    /// `attach_slots` at the same index.
     session_slots: Vec<Option<SessionSlot>>,
     /// Cold accept/detach-only metadata; never read on the packet path.
     attach_slots: Vec<AttachSlot>,
@@ -57,7 +56,8 @@ pub struct AppWorker {
 #[derive(Clone)]
 struct SessionSlot {
     session_id: SessionId,
-    session: Arc<AppSession>,
+    transport_session: Arc<AppSession>,
+    app_session: Arc<AppSession>,
 }
 
 #[derive(Clone, Default)]
@@ -343,15 +343,21 @@ impl AppWorker {
         &self.tx_evt_q
     }
 
-    pub fn attach_session(&mut self, session_id: SessionId, session: Arc<AppSession>) {
+    pub(crate) fn attach_session(
+        &mut self,
+        session_id: SessionId,
+        transport_session: Arc<AppSession>,
+        app_session: Arc<AppSession>,
+    ) {
         let slot = session_id.pool_index().slot() as usize;
         self.session_slots[slot] = Some(SessionSlot {
             session_id,
-            session,
+            transport_session,
+            app_session,
         });
     }
 
-    pub fn detach_session(&mut self, session_id: SessionId) -> Option<Arc<AppSession>> {
+    pub(crate) fn detach_session(&mut self, session_id: SessionId) -> Option<Arc<AppSession>> {
         let index = session_id.pool_index().slot() as usize;
         let entry = self.session_slots.get_mut(index)?;
         if entry
@@ -363,24 +369,40 @@ impl AppWorker {
             if let Some(listener) = attach_slot.listener
                 && let Some(manager) = self.listeners.get_mut(&listener)
             {
-                manager.release_session(slot.session.session_handle());
+                manager.release_session(slot.app_session.session_handle());
             }
-            return Some(slot.session);
+            return Some(slot.app_session);
         }
         None
     }
 
     #[inline(always)]
-    fn session(&self, session_id: SessionId) -> Option<&Arc<AppSession>> {
+    pub(crate) fn transport_session(&self, session_id: SessionId) -> Option<&Arc<AppSession>> {
         self.session_slots
             .get(session_id.pool_index().slot() as usize)?
             .as_ref()
-            .and_then(|slot| (slot.session_id == session_id).then_some(&slot.session))
+            .and_then(|slot| (slot.session_id == session_id).then_some(&slot.transport_session))
+    }
+
+    #[inline(always)]
+    pub(crate) fn app_session(&self, session_id: SessionId) -> Option<&Arc<AppSession>> {
+        self.session_slots
+            .get(session_id.pool_index().slot() as usize)?
+            .as_ref()
+            .and_then(|slot| (slot.session_id == session_id).then_some(&slot.app_session))
+    }
+
+    #[inline(always)]
+    pub(crate) fn session_id(&self, session_index: u32) -> Option<SessionId> {
+        self.session_slots
+            .get(session_index as usize)?
+            .as_ref()
+            .map(|slot| slot.session_id)
     }
 
     pub fn connected(&mut self, session_id: SessionId) -> RuntimeResult<()> {
         let index = session_id.pool_index().slot() as usize;
-        let Some(session) = self.session(session_id).cloned() else {
+        let Some(session) = self.app_session(session_id).cloned() else {
             return Ok(());
         };
         session
@@ -397,7 +419,7 @@ impl AppWorker {
     }
 
     pub fn closed(&self, session_id: SessionId) -> RuntimeResult<()> {
-        let Some(session) = self.session(session_id) else {
+        let Some(session) = self.app_session(session_id) else {
             return Ok(());
         };
         session
@@ -412,7 +434,7 @@ impl AppWorker {
         session_id: SessionId,
         len: usize,
     ) -> RuntimeResult<bool> {
-        let Some(session) = self.session(session_id) else {
+        let Some(session) = self.transport_session(session_id) else {
             return Ok(false);
         };
         let dropped = session.drop_tx_acked(len).map_err(RuntimeError::from)?;
@@ -424,19 +446,19 @@ impl AppWorker {
 
     pub fn pending_send_len(&self, session_id: SessionId) -> RuntimeResult<Option<usize>> {
         Ok(self
-            .session(session_id)
+            .transport_session(session_id)
             .map(|session| session.tx_fifo().max_dequeue())
             .filter(|len| *len != 0))
     }
 
     pub fn rx_available_len(&self, session_id: SessionId) -> Option<usize> {
-        self.session(session_id)
+        self.transport_session(session_id)
             .map(|session| session.rx_fifo().max_enqueue())
     }
 
     #[inline]
     pub(crate) fn request_rx_dequeue_notification(&self, session_id: SessionId) {
-        if let Some(session) = self.session(session_id) {
+        if let Some(session) = self.transport_session(session_id) {
             session.rx_fifo().want_deq_notification();
         }
     }
@@ -455,7 +477,7 @@ impl AppWorker {
         index: Index,
     ) -> RuntimeResult<()> {
         let session = self
-            .session(session_id)
+            .transport_session(session_id)
             .ok_or(SessionError::SessionMissing { session_id })?;
         let written = session
             .tx_fifo()
@@ -491,7 +513,7 @@ impl AppWorker {
         index: Index,
         urgent: bool,
     ) -> RuntimeResult<(u32, u32)> {
-        let Some(session) = self.session(session_id) else {
+        let Some(session) = self.transport_session(session_id) else {
             return Ok((0, 0));
         };
         let mut total = 0u32;
@@ -543,7 +565,7 @@ impl AppWorker {
         index: Index,
         offset: u32,
     ) -> RuntimeResult<(u32, Option<(u32, u32)>)> {
-        let Some(session) = self.session(session_id) else {
+        let Some(session) = self.transport_session(session_id) else {
             return Ok((0, None));
         };
         let mut total_len = 0u32;
@@ -600,12 +622,12 @@ impl AppWorker {
     }
 
     pub fn discard_all_tx_bytes_for_session(&mut self, session_id: SessionId) {
-        if let Some(session) = self.session(session_id) {
+        if let Some(session) = self.transport_session(session_id) {
             let _ = session.drop_tx_acked(session.tx_fifo().max_dequeue());
         }
     }
 
-    pub fn drain_tx_events_to(
+    pub(crate) fn drain_tx_events_to(
         &self,
         mut dispatch_event: impl FnMut(SessionId, SessionEvtType),
     ) -> usize {
@@ -626,7 +648,7 @@ impl AppWorker {
                     continue;
                 };
                 if evt.evt_type == SessionEvtType::TxDeq {
-                    slot.session.clear_tx_event();
+                    slot.app_session.clear_tx_event();
                     scheduled += 1;
                 }
                 dispatch_event(slot.session_id, evt.evt_type);
@@ -693,7 +715,7 @@ mod tests {
             )
             .expect("app session"),
         );
-        app.attach_session(session_id, session);
+        app.attach_session(session_id, Arc::clone(&session), session);
         app.tx_evt_q()
             .enqueue_ctrl(SessionEvt::ctrl(5, 9, SessionEvtType::Close))
             .expect("enqueue close for wrong worker");
@@ -723,7 +745,7 @@ mod tests {
             )
             .expect("app session"),
         );
-        app.attach_session(session_id, session);
+        app.attach_session(session_id, Arc::clone(&session), session);
         app.tx_evt_q()
             .enqueue_ctrl(SessionEvt::ctrl(5, 0, SessionEvtType::Close))
             .expect("enqueue close");
@@ -756,7 +778,7 @@ mod tests {
             )
             .expect("app session"),
         );
-        app.attach_session(session_id, Arc::clone(&session));
+        app.attach_session(session_id, Arc::clone(&session), Arc::clone(&session));
         let index = runtime
             .alloc_index_with_bytes(&[0xab; 64])
             .expect("RX buffer");
@@ -782,7 +804,7 @@ mod tests {
             let session = app
                 .create_app_session(7, handle, config, app.tx_evt_q().clone())
                 .expect("listener session");
-            app.attach_session(session_id, session);
+            app.attach_session(session_id, Arc::clone(&session), session);
         }
 
         assert_eq!(app.listeners.len(), 1);
@@ -799,7 +821,7 @@ mod tests {
             let session = app
                 .create_app_session(listener, handle, config, app.tx_evt_q().clone())
                 .expect("listener session");
-            app.attach_session(session_id, session);
+            app.attach_session(session_id, Arc::clone(&session), session);
         }
 
         assert_eq!(app.listeners.len(), 2);
@@ -816,7 +838,7 @@ mod tests {
         let session = app
             .create_app_session(7, handle, config, app.tx_evt_q().clone())
             .expect("listener session");
-        app.attach_session(session_id, Arc::clone(&session));
+        app.attach_session(session_id, Arc::clone(&session), Arc::clone(&session));
 
         let detached = app.detach_session(session_id).expect("detached session");
         assert_eq!(app.listeners[&7].retired.len(), 1);
@@ -857,7 +879,7 @@ mod tests {
 }
 
 impl AppWorker {
-    pub fn create_app_session(
+    pub(crate) fn create_app_session(
         &mut self,
         listener: u32,
         handle: SessionHandle,

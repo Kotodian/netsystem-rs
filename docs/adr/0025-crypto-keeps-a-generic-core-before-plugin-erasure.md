@@ -1,5 +1,7 @@
 # Crypto keeps a generic core in the owning plugin
 
+Status: superseded by ADR 0026
+
 The primitive core uses the closed `Family` markers `Aead`, `Cipher`, `Hash`,
 `Mac`, `Kdf`, `Kx`, `Sign`, and `Verify` to parameterize `AlgorithmId<F>`,
 `Context<F>`, and `Batch<'_, F>`, while plugins keep the algorithm and

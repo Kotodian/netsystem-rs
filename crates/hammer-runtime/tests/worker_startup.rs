@@ -1,6 +1,8 @@
 use core::hint::spin_loop;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use hammer_core::data_plane::{
     BufferFrame, NodeHandle, NodeId, NodeKind, NodeRegistration, NodeState,
@@ -9,8 +11,8 @@ use hammer_runtime::RuntimeRegistry;
 use hammer_runtime::config::Worker;
 use hammer_runtime::start_workers::start_workers;
 use hammer_runtime::{
-    DataPlaneRuntime, Engine, EnginePool, InternalNode, Node, NodeDescriptor, NodeProcessFn,
-    NodeResult, NodeRuntimeData, RuntimeError, RuntimeResult,
+    DataPlaneRuntime, DataWorkerId, Engine, EnginePool, InternalNode, Node, NodeDescriptor,
+    NodeProcessFn, NodeResult, NodeRuntimeData, RuntimeError, RuntimeResult,
 };
 
 hammer_runtime::__declare_registration_image!(
@@ -183,6 +185,7 @@ fn engine_pool() -> EnginePool {
     worker.buffer.slots_per_numa = 64;
     worker.buffer.frame_pool_size = 5;
     worker.buffer.page_size = Some(hammer_infra::PageSize::Default);
+    worker.control.queue_capacity = 1;
     let mut engine =
         Engine::new_configured(RuntimeRegistry::new(), worker).expect("configured main engine");
     let sink = engine
@@ -326,4 +329,78 @@ fn runtime_main_loop_enter_catalog_starts_workers() {
         2
     );
     stop_workers(&mut pool);
+}
+
+#[test]
+fn main_engine_schedules_bounded_control_work_on_the_selected_worker() {
+    let _serial = serialize_test();
+    reset(READY);
+    let mut pool = engine_pool();
+    let error = pool
+        .main_engine()
+        .schedule_on_worker(DataWorkerId::new(0), || {})
+        .expect_err("reject control work before worker startup");
+    assert!(matches!(
+        error,
+        RuntimeError::WorkerControlUnavailable { worker } if worker == DataWorkerId::new(0)
+    ));
+    start_workers(pool.main_engine_mut()).expect("start data workers");
+
+    let error = pool
+        .main_engine()
+        .schedule_on_worker(DataWorkerId::new(2), || {})
+        .expect_err("reject control work for an unconfigured worker");
+    assert!(matches!(
+        error,
+        RuntimeError::DataWorkerIndexOutOfRange {
+            worker: 2,
+            worker_count: 2,
+        }
+    ));
+
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    pool.main_engine()
+        .schedule_on_worker(DataWorkerId::new(0), move || {
+            let thread = std::thread::current();
+            started_tx
+                .send(thread.name().expect("named Data Worker").to_owned())
+                .expect("report selected worker");
+            release_rx.recv().expect("release blocked worker task");
+        })
+        .expect("schedule worker control task");
+
+    assert_eq!(
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("selected worker started control task"),
+        "hammer-worker-1"
+    );
+
+    pool.main_engine()
+        .schedule_on_worker(DataWorkerId::new(0), || {})
+        .expect("fill bounded worker control queue");
+    let error = pool
+        .main_engine()
+        .schedule_on_worker(DataWorkerId::new(0), || {})
+        .expect_err("reject control work beyond configured capacity");
+    assert!(matches!(
+        error,
+        RuntimeError::WorkerControlQueueFull {
+            worker,
+            capacity: 1,
+        } if worker == DataWorkerId::new(0)
+    ));
+
+    release_tx.send(()).expect("release blocked worker task");
+    EnginePool::main_loop_exit(pool.main_engine());
+    pool.close().expect("close worker pool");
+    let error = pool
+        .main_engine()
+        .schedule_on_worker(DataWorkerId::new(0), || {})
+        .expect_err("reject control work after worker exit");
+    assert!(matches!(
+        error,
+        RuntimeError::WorkerControlClosed { worker } if worker == DataWorkerId::new(0)
+    ));
 }
