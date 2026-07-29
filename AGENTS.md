@@ -314,6 +314,10 @@ capability failure cannot hide a Rust or graph-behavior failure.
 
 ## Commit & Pull Request Guidelines
 
+Branch names use `bug/<issue>`, `feature/<issue>`, or `enhance/<issue>`.
+Use the issue number as the path component and do not add agent, author, or
+implementation-detail prefixes.
+
 Recent commits use scoped messages such as `hammer-runtime(Feat): per-node error counters` and `hammer-infra(Feat): add SIMD primitives`. Follow `<scope>(<Type>): <imperative summary>`, with types like `Feat`, `Fix`, `Refactor`, `Debug`, `Test`, or `docs`.
 
 PRs should include a behavior summary, affected crates, test commands run, and any daemon, CLI, or protocol impact. Link related issues when available.
