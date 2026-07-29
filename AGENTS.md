@@ -81,6 +81,15 @@ Use Rust 2024 conventions and rustfmt defaults: 4-space indentation, `snake_case
   Cross-plugin cryptographic exchanges must retain concrete, monomorphized
   protocol state and use registration functions with explicit ownership; they
   must not erase state behind a trait object.
+- App Session protocol state is owned by its Data Worker and advanced through
+  `&mut` access. Protocol Chains and protocol tests must not add locks, atomics,
+  or shared observer state around that state. A protocol may access only the
+  source and destination `Fifo` adjacent to its layer; it must borrow source
+  segments and transform directly into a destination write reservation. It
+  must not receive an entire `AppSession`, allocate an intermediate payload,
+  or copy payload through a stack buffer, `Vec`, private record, or Data-Plane
+  Buffer. Destination commit precedes source consumption, and an error leaves
+  both visible FIFO positions unchanged.
 - Non-trivial designs must document the layer isolation contract: what each layer may call, what it must not call, which APIs cross the boundary, and which commands verify the boundary.
 
 ### Synchronization rules
@@ -136,6 +145,14 @@ Use Rust 2024 conventions and rustfmt defaults: 4-space indentation, `snake_case
 
 ### Naming rules
 
+- Every word in an identifier must express a domain role, fact, operation,
+  state, policy, protocol, or invariant at the layer that owns it. This rule
+  applies equally to production code, tests, benchmarks, examples, and test
+  doubles. Do not name an item after a testing trick, data representation, or
+  implementation technique when that is not the domain concept being modeled;
+  names such as `PrefixLayer`, `ByteTagProtocol`, `Foo`, `Helper`, and `Wrapper`
+  are forbidden for domain state. A test double must use the domain role it
+  stands in, such as `TlsProtocol`, `HttpProtocol`, or `TcpTransport`.
 - Follow the Rust API Guidelines naming conventions and RFC 430. Let the module
   path provide domain context instead of repeating it in every item name. Keep
   word order consistent with related standard-library and crate-local names.

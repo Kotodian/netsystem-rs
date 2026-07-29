@@ -244,12 +244,12 @@ Each process owns the readiness handle duplicates it creates for its own event l
 _Avoid_: daemon-owned descriptor across process boundaries, one global readiness owner, session object silently closing another process's handle
 
 **Single App Session Surface**:
-The app-side model has one concrete session abstraction, `AppSession<S>`, for both local and attached storage backends and for both external-App and builtin-plugin drivers. `AppClient` and session configuration are construction/connection support; a second remote-session or TLS-session facade is not a domain concept.
+The app-side model has one concrete session abstraction, `AppSession<S>`, for both local and attached storage backends and at every level of an App Session Stack. `AppClient` and session configuration are construction/connection support; a second remote-session or TLS-session facade is not a domain concept.
 _Avoid_: parallel local/remote session objects, TLS-specific app session, wrapper-of-wrapper app facades, session lookup context presented as another session type
 
-**App Session Driver**:
-The owner that produces TX bytes and consumes RX bytes through one App Session. App connection policy selects the driver when constructing the Session stack: the external App drives a direct Session, while a builtin plugin such as TLS drives its lower Session and presents another ordinary App Session to the external App. The App Session neither interprets its bytes nor knows which driver owns them.
-_Avoid_: TLS mode in App Session, protocol-aware FIFO, mutable driver switch, transport-specific app interface
+**App Session Stack**:
+An ordered protocol composition fixed when a connection is constructed. `session::ProtocolChain<P, L>` owns the App-facing App Session, one concrete protocol state, and the complete lower chain. Protocol state receives only the source and destination FIFO adjacent to its layer; it neither owns nor inspects the lower chain. Each App Session exchanges only the protocol data of its two adjacent layers, and the innermost App Session connects to transport. Session Runtime schedules the statically composed chain without interpreting or erasing concrete protocol state.
+_Avoid_: App Session driver binding, TLS mode in App Session, protocol-aware FIFO, mutable layer switch, transport-specific app interface
 
 ## Session And Transport
 
@@ -364,7 +364,7 @@ _Avoid_: all-timer sweep, timer-kind discovery, guessed expired timer
 ## Cryptography
 
 **TLS Connection**:
-An application-selected secure byte-stream connection terminated by the trusted Hammer daemon at the App/Session Seam. The external App drives an ordinary plaintext App Session; the TLS plugin drives an ordinary lower App Session containing TLS records as a builtin App. The TLS plugin consumes and produces bytes only through the transport-neutral Session interface; it requires ordered reliable stream semantics without depending on or accessing a concrete transport implementation.
+An application-selected secure byte-stream connection terminated by the trusted Hammer daemon at the App/Session Seam. The TLS plugin owns only its TLS state. Its adjacent lower App Session FIFO carries TLS records, and its adjacent upper App Session FIFO carries the protocol data of the immediately higher layer. The TLS plugin consumes and produces only through those FIFO borrows; it requires ordered reliable stream semantics without depending on or accessing a concrete transport implementation.
 _Avoid_: app-process TLS termination, TCP-owned TLS, concrete-transport dependency, TLS over UDP, secure socket wrapper, TLS-specific app session, App-Session-owned TLS mode
 
 **TLS FIFO Transform**:
