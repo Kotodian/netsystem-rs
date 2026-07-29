@@ -1,3 +1,10 @@
 # Cryptographic Exchanges run on the Main Thread
 
-The Crypto Engine creates and advances every TLS, Noise, IKEv2, or future Cryptographic Exchange only on Hammer's Main Thread; Data Workers never own or execute exchange state machines. Each transition and every primitive operation it requests still completes synchronously over caller-provided memory, while receipt and delivery of protocol messages stay outside the Engine. This centralizes negotiation, authentication, rekey policy, and plugin-owned protocol state without coupling Exchange Protocols to Session, Packet Graph, or transport scheduling.
+Each protocol plugin owns and advances its own TLS, Noise, IKEv2, or future
+cryptographic-exchange state machine on the Main Thread. The plugin defines the
+concrete state enum and retains it in its own Main owner; Data Workers never
+own or execute that state machine. `hammer-service::crypto` supplies algorithm
+selection, Key Handles, and thread-bound Contexts for those transitions, but it
+does not register, erase, retain, or dispatch protocol state. Receipt and
+delivery of protocol messages remain outside crypto and the plugin does not
+couple its state machine to Session, Packet Graph, or transport scheduling.
