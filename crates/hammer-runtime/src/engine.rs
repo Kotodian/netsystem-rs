@@ -1,9 +1,6 @@
 use core::hint::spin_loop;
-use std::any::{TypeId, type_name};
 use std::cell::{Ref, RefCell, RefMut};
 use std::collections::HashSet;
-use std::mem::ManuallyDrop;
-use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -45,64 +42,6 @@ pub(crate) struct WorkerGraphUpdate {
     pub(crate) worker_init_functions: Vec<InitFunction>,
 }
 
-type WorkerMainLoopCallback = fn(&mut Engine) -> RuntimeResult<()>;
-
-struct ThreadState {
-    value: NonNull<()>,
-    value_type: TypeId,
-    release: unsafe fn(NonNull<()>),
-}
-
-impl ThreadState {
-    fn new<T: 'static>(value: T) -> Self {
-        Self {
-            value: NonNull::from(Box::leak(Box::new(value))).cast(),
-            value_type: TypeId::of::<T>(),
-            release: Self::release_value::<T>,
-        }
-    }
-
-    #[inline]
-    fn value<T: 'static>(&self) -> Option<&T> {
-        (self.value_type == TypeId::of::<T>()).then(|| {
-            // SAFETY: `new` records the allocation's concrete type, and the
-            // shared borrow prevents mutable access for the returned lifetime.
-            unsafe { self.value.cast::<T>().as_ref() }
-        })
-    }
-
-    #[inline]
-    fn value_mut<T: 'static>(&mut self) -> Option<&mut T> {
-        (self.value_type == TypeId::of::<T>()).then(|| {
-            // SAFETY: `new` records the allocation's concrete type, and the
-            // exclusive borrow prevents any other access for this lifetime.
-            unsafe { self.value.cast::<T>().as_mut() }
-        })
-    }
-
-    fn into_value<T: 'static>(self) -> Option<T> {
-        if self.value_type != TypeId::of::<T>() {
-            return None;
-        }
-        let state = ManuallyDrop::new(self);
-        // SAFETY: the matching TypeId proves that `new` allocated a `Box<T>`.
-        // `ManuallyDrop` prevents the erased release function from running.
-        Some(unsafe { *Box::from_raw(state.value.cast::<T>().as_ptr()) })
-    }
-
-    unsafe fn release_value<T>(value: NonNull<()>) {
-        // SAFETY: `new` pairs this monomorphized function with one `Box<T>`.
-        unsafe { drop(Box::from_raw(value.cast::<T>().as_ptr())) };
-    }
-}
-
-impl Drop for ThreadState {
-    fn drop(&mut self) {
-        // SAFETY: this record uniquely owns the allocation created by `new`.
-        unsafe { (self.release)(self.value) };
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerRuntimeStats {
     pub thread_index: u32,
@@ -140,8 +79,6 @@ pub struct Engine {
     worker_runtime_stats: Arc<[crate::barrier::Barrier<Option<WorkerRuntimeStats>>]>,
     main_loop_exit_functions_called: bool,
     worker_threads: Vec<JoinHandle<RuntimeResult<()>>>,
-    worker_main_loop_callbacks: Vec<WorkerMainLoopCallback>,
-    thread_states: Vec<ThreadState>,
     // Drop after every owner that may retain DSO code or Drop glue. Plugin
     // images themselves remain mapped for the full process lifetime.
     plugin_main: PluginMain,
@@ -191,8 +128,6 @@ impl Engine {
             worker_runtime_stats,
             main_loop_exit_functions_called: false,
             worker_threads: Vec::new(),
-            worker_main_loop_callbacks: Vec::new(),
-            thread_states: Vec::new(),
             processes: ProcessMain::new(),
         };
         Ok(engine)
@@ -226,8 +161,6 @@ impl Engine {
             worker_runtime_stats: Arc::from([]),
             main_loop_exit_functions_called: false,
             worker_threads: Vec::new(),
-            worker_main_loop_callbacks: Vec::new(),
-            thread_states: Vec::new(),
             processes: ProcessMain::new(),
         }
     }
@@ -443,101 +376,6 @@ impl Engine {
     #[inline]
     pub fn configured_worker_count(&self) -> usize {
         self.worker_config.count
-    }
-
-    /// Runs one Main Thread mutation while every Data Worker is paused.
-    ///
-    /// The worker barrier is the publication boundary. Worker main-loop
-    /// callbacks run immediately after release and before File or Packet Graph
-    /// dispatch, matching VPP's `worker_thread_main_loop_callbacks` ordering.
-    pub fn synchronize_workers<R>(
-        &mut self,
-        operation: impl FnOnce(&mut Self) -> R,
-    ) -> RuntimeResult<R> {
-        if self.thread_index != 0 {
-            return Err(RuntimeError::WorkerBarrierMainThreadRequired {
-                thread_index: self.thread_index,
-            });
-        }
-        let expected = self.configured_worker_count();
-        let active = self.barrier.worker_count() as usize;
-        if active != expected {
-            return Err(RuntimeError::WorkerBarrierUnavailable { expected, active });
-        }
-        let barrier = self.barrier.clone();
-        Ok(barrier.sync(self, operation))
-    }
-
-    /// Installs state whose lifetime and thread affinity are owned by this
-    /// Runtime Engine.
-    pub fn install_thread_state<T: 'static>(&mut self, value: T) -> RuntimeResult<()> {
-        let value_type = TypeId::of::<T>();
-        if self
-            .thread_states
-            .iter()
-            .any(|state| state.value_type == value_type)
-        {
-            return Err(RuntimeError::ThreadStateAlreadyInstalled {
-                type_name: type_name::<T>(),
-                thread_index: self.thread_index,
-            });
-        }
-        self.thread_states.push(ThreadState::new(value));
-        Ok(())
-    }
-
-    /// Borrows state owned by this Runtime Engine's thread lifecycle.
-    #[inline]
-    pub fn thread_state<T: 'static>(&self) -> RuntimeResult<&T> {
-        self.thread_states
-            .iter()
-            .find_map(ThreadState::value::<T>)
-            .ok_or(RuntimeError::ThreadStateMissing {
-                type_name: type_name::<T>(),
-                thread_index: self.thread_index,
-            })
-    }
-
-    /// Mutably borrows state owned by this Runtime Engine's thread lifecycle.
-    #[inline]
-    pub fn thread_state_mut<T: 'static>(&mut self) -> RuntimeResult<&mut T> {
-        self.thread_states
-            .iter_mut()
-            .find_map(ThreadState::value_mut::<T>)
-            .ok_or(RuntimeError::ThreadStateMissing {
-                type_name: type_name::<T>(),
-                thread_index: self.thread_index,
-            })
-    }
-
-    /// Removes and returns thread-bound state during orderly teardown.
-    pub fn remove_thread_state<T: 'static>(&mut self) -> Option<T> {
-        let position = self
-            .thread_states
-            .iter()
-            .position(|state| state.value_type == TypeId::of::<T>())?;
-        self.thread_states.remove(position).into_value()
-    }
-
-    /// Registers work invoked at the top of this Data Worker's main loop.
-    ///
-    /// The callback remains owned by this worker and therefore need not be
-    /// `Send` or `Sync`. It runs after barrier/refork handling and before File
-    /// readiness or Packet Graph dispatch.
-    pub fn register_worker_main_loop_callback(
-        &mut self,
-        callback: WorkerMainLoopCallback,
-    ) -> RuntimeResult<()> {
-        self.data_worker_id()?;
-        self.worker_main_loop_callbacks.push(callback);
-        Ok(())
-    }
-
-    pub(crate) fn run_worker_main_loop_callbacks(&mut self) -> RuntimeResult<()> {
-        let callbacks = self.worker_main_loop_callbacks.clone();
-        callbacks
-            .into_iter()
-            .try_for_each(|callback| callback(self))
     }
 
     #[inline]
@@ -933,8 +771,6 @@ mod tests {
     use crate::DataPlaneBufferConfig;
     use hammer_runtime::RuntimeRegistry;
     use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig};
-    use std::cell::Cell;
-    use std::rc::Rc;
     use std::sync::Arc;
 
     fn test_runtime() -> DataPlaneRuntime {
@@ -949,64 +785,6 @@ mod tests {
 
     fn test_engine() -> Engine {
         Engine::new(test_runtime(), RuntimeRegistry::new())
-    }
-
-    #[test]
-    fn runtime_engine_owns_non_send_thread_state() {
-        let mut engine = test_engine();
-        let value = Rc::new(Cell::new(41usize));
-
-        engine
-            .install_thread_state(Rc::clone(&value))
-            .expect("install thread-bound value");
-        engine
-            .thread_state::<Rc<Cell<usize>>>()
-            .expect("borrow thread-bound value")
-            .set(42);
-        assert_eq!(value.get(), 42);
-        assert!(matches!(
-            engine.install_thread_state(Rc::new(Cell::new(0usize))),
-            Err(RuntimeError::ThreadStateAlreadyInstalled { .. })
-        ));
-
-        let removed = engine
-            .remove_thread_state::<Rc<Cell<usize>>>()
-            .expect("remove thread-bound value");
-        assert_eq!(removed.get(), 42);
-        assert!(matches!(
-            engine.thread_state::<Rc<Cell<usize>>>(),
-            Err(RuntimeError::ThreadStateMissing { .. })
-        ));
-    }
-
-    #[test]
-    fn worker_main_loop_callbacks_borrow_worker_owned_values() {
-        let main = test_engine();
-        let mut worker = main.spawn(1).expect("spawn worker Runtime Engine");
-        worker
-            .install_thread_state(Rc::new(Cell::new(0usize)))
-            .expect("install worker value");
-        worker
-            .register_worker_main_loop_callback(|runtime| {
-                let value = runtime.thread_state::<Rc<Cell<usize>>>()?;
-                value.set(value.get() + 1);
-                Ok(())
-            })
-            .expect("register worker callback");
-
-        worker
-            .run_worker_main_loop_callbacks()
-            .expect("first callback pass");
-        worker
-            .run_worker_main_loop_callbacks()
-            .expect("second callback pass");
-        assert_eq!(
-            worker
-                .thread_state::<Rc<Cell<usize>>>()
-                .expect("worker value remains installed")
-                .get(),
-            2
-        );
     }
 
     #[test]
