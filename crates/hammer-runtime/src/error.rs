@@ -146,6 +146,20 @@ pub enum RuntimeError {
     HandoffDispatchContextMissing,
     #[error("required runtime capability `{type_name}` is not registered")]
     RuntimeCapabilityMissing { type_name: &'static str },
+    #[error("worker barrier is unavailable: {active} Data Workers are active, expected {expected}")]
+    WorkerBarrierUnavailable { expected: usize, active: usize },
+    #[error("thread {thread_index} cannot synchronize Data Workers")]
+    WorkerBarrierMainThreadRequired { thread_index: u32 },
+    #[error("thread-bound state `{type_name}` is already installed on thread {thread_index}")]
+    ThreadStateAlreadyInstalled {
+        type_name: &'static str,
+        thread_index: u32,
+    },
+    #[error("thread-bound state `{type_name}` is not installed on thread {thread_index}")]
+    ThreadStateMissing {
+        type_name: &'static str,
+        thread_index: u32,
+    },
     #[error("data worker exited before reaching the {phase} barrier")]
     WorkerExitedBeforeStartupBarrier { phase: &'static str },
     #[error("data worker requested exit during initialization")]

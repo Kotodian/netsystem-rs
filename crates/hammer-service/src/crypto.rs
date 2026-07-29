@@ -5,6 +5,7 @@
 //! `hammer-infra`; `hammer-runtime` does not participate in this boundary.
 
 pub mod exchange;
+pub mod main;
 
 use std::any::{TypeId, type_name};
 use std::cell::{Cell, RefCell};

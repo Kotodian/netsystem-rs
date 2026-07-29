@@ -15,14 +15,14 @@ use crate::spawn::{DATA_LOCAL_DRIVER_WAKER, DATA_WORKER_IDLE_SLICE, with_data_pl
 ///
 /// Step order mirrors VPP `main.c:1442-1693`:
 /// 1. Barrier check (workers_at_barrier / wait_at_barrier)
-/// 2. Poll worker-local File readiness
-/// 3. Drain handoff + run ready nodes, poll remote-local queue, poll DataLocalTask futures
-/// 4. Tokio reactor tick — drive transport/session futures
-/// 5. Schedule polling-state driver nodes (periodically)
-/// 6. Run ready nodes (handles interrupt frames + newly-scheduled polling frames)
-/// 7. Dispatch timer nodes (no timer wheel in data-plane yet)
-/// 8. Advance timers, increment main_loop_count
-/// 9. Exit if main_loop_exit_now
+/// 2. Run worker main-loop callbacks
+/// 3. Poll worker-local File readiness
+/// 4. Drain handoff + run ready nodes, poll remote-local queue, poll DataLocalTask futures
+/// 5. Tokio reactor tick — drive transport/session futures
+/// 6. Schedule polling-state driver nodes (periodically)
+/// 7. Run ready nodes (handles interrupt frames + newly-scheduled polling frames)
+/// 8. Dispatch timer nodes (no timer wheel in data-plane yet)
+/// 9. Advance timers, increment main_loop_count and check exit
 pub fn engine_main_loop(
     engine: &mut Engine,
     runtime: &tokio::runtime::Runtime,
@@ -78,7 +78,16 @@ pub fn engine_main_loop(
             }
         }
 
-        // Step 2: Poll worker-local File readiness before graph dispatch.
+        // Step 2: VPP worker_thread_main_loop_callbacks. Publication owners
+        // use this point for work that must finish after barrier release and
+        // before packet dispatch resumes.
+        if let Err(error) = engine.run_worker_main_loop_callbacks() {
+            engine.main_loop_exit_now.store(true, Ordering::Release);
+            tracing::error!(worker = engine.thread_index, %error, "worker main-loop callback failed");
+            return 1;
+        }
+
+        // Step 3: Poll worker-local File readiness before graph dispatch.
         match engine.poll_file_readiness() {
             Ok(dispatched) => progress |= dispatched != 0,
             Err(error) => {

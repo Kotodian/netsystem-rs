@@ -28,7 +28,7 @@ pub struct Barrier<T> {
 
 impl<T> Barrier<T> {
     #[inline]
-    pub(crate) const fn new(value: T) -> Self {
+    pub const fn new(value: T) -> Self {
         Self {
             value: UnsafeCell::new(value),
         }
@@ -47,15 +47,15 @@ impl<T> Barrier<T> {
     /// The caller must have exclusive barrier-phase ownership of this value
     /// for the duration of `operation`.
     #[inline]
-    pub(crate) unsafe fn with_mut_unchecked<R>(&self, operation: impl FnOnce(&mut T) -> R) -> R {
+    pub unsafe fn with_mut_unchecked<R>(&self, operation: impl FnOnce(&mut T) -> R) -> R {
         // SAFETY: upheld by the caller's barrier-phase contract.
         operation(unsafe { &mut *self.value.get() })
     }
 }
 
-// SAFETY: `Barrier<T>` exposes its `UnsafeCell` only through crate-private
-// operations whose callers must establish the worker-barrier phase. Moving or
-// dropping the shared value remains valid when `T: Send`.
+// SAFETY: `Barrier<T>` exposes its `UnsafeCell` only through unsafe operations
+// whose callers must establish the worker-barrier or completion phase. Moving
+// or dropping the shared value remains valid when `T: Send`.
 unsafe impl<T: Send> Sync for Barrier<T> {}
 
 /// VPP-style synchronization shared by the main thread and Data Workers.
