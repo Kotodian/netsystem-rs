@@ -64,8 +64,6 @@ pub enum RuntimeError {
     DataWorkerIdUnavailable { thread_index: u32 },
     #[error("worker configuration cannot change after runtime initialization")]
     WorkerConfigurationAlreadyInitialized,
-    #[error("worker thread registry is poisoned")]
-    WorkerThreadRegistryPoisoned,
     #[error("data workers are already started")]
     DataWorkersAlreadyStarted,
     #[error("data worker {worker} thread setup failed")]

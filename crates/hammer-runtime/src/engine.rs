@@ -78,7 +78,7 @@ pub struct Engine {
     pub(crate) worker_graph_errors: Arc<[crate::barrier::Barrier<Option<RuntimeError>>]>,
     worker_runtime_stats: Arc<[crate::barrier::Barrier<Option<WorkerRuntimeStats>>]>,
     main_loop_exit_functions_called: bool,
-    worker_threads: Mutex<Vec<JoinHandle<RuntimeResult<()>>>>,
+    worker_threads: Vec<JoinHandle<RuntimeResult<()>>>,
     // Drop after every owner that may retain DSO code or Drop glue. Plugin
     // images themselves remain mapped for the full process lifetime.
     plugin_main: PluginMain,
@@ -127,7 +127,7 @@ impl Engine {
             worker_graph_errors,
             worker_runtime_stats,
             main_loop_exit_functions_called: false,
-            worker_threads: Mutex::new(Vec::new()),
+            worker_threads: Vec::new(),
             processes: ProcessMain::new(),
         };
         Ok(engine)
@@ -160,7 +160,7 @@ impl Engine {
             worker_graph_errors: Arc::from([]),
             worker_runtime_stats: Arc::from([]),
             main_loop_exit_functions_called: false,
-            worker_threads: Mutex::new(Vec::new()),
+            worker_threads: Vec::new(),
             processes: ProcessMain::new(),
         }
     }
@@ -515,17 +515,13 @@ impl Engine {
     }
 
     pub(crate) fn retain_worker_threads(
-        &self,
+        &mut self,
         threads: &mut Vec<JoinHandle<RuntimeResult<()>>>,
     ) -> RuntimeResult<()> {
-        let mut retained = self
-            .worker_threads
-            .lock()
-            .map_err(|_| RuntimeError::WorkerThreadRegistryPoisoned)?;
-        if !retained.is_empty() {
+        if !self.worker_threads.is_empty() {
             return Err(RuntimeError::DataWorkersAlreadyStarted);
         }
-        retained.extend(threads.drain(..));
+        self.worker_threads.extend(threads.drain(..));
         Ok(())
     }
 
@@ -558,12 +554,8 @@ impl Engine {
         self.processes.shutdown(runtime)
     }
 
-    fn join_worker_threads(&self) -> RuntimeResult<()> {
-        let threads = self
-            .worker_threads
-            .lock()
-            .map(|mut threads| std::mem::take(&mut *threads))
-            .map_err(|_| RuntimeError::WorkerThreadRegistryPoisoned)?;
+    fn join_worker_threads(&mut self) -> RuntimeResult<()> {
+        let threads = std::mem::take(&mut self.worker_threads);
         let mut worker_error = None;
         let mut unwind_payload = None;
         for (worker, thread) in threads.into_iter().enumerate() {
@@ -746,7 +738,7 @@ impl EnginePool {
 
     pub fn close(&mut self) -> RuntimeResult<()> {
         Self::main_loop_exit(self.main_engine());
-        let worker_result = self.main_engine().join_worker_threads();
+        let worker_result = self.main_engine_mut().join_worker_threads();
         let exit_result = {
             let main = self.main_engine_mut();
             if main.main_loop_exit_functions_called {
