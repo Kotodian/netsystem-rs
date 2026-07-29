@@ -125,7 +125,7 @@ impl TransportInternalTransport<Index> for TcpRecordingTransport {
 }
 
 #[test]
-fn session_queue_updates_transport_before_control_and_io() {
+fn session_queue_updates_transport_before_control_and_io_and_without_events() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let worker = DataWorkerId::new(0);
     let events = Arc::new(Mutex::new(Vec::new()));
@@ -155,6 +155,13 @@ fn session_queue_updates_transport_before_control_and_io() {
     );
     let times = sampled_times.lock().expect("times");
     assert_eq!(times.len(), 1);
+    drop(times);
+
+    events.lock().expect("events").clear();
+    dispatch_session_queue_once(&runtime, owner, &mut sessions, &mut transport, next)
+        .expect("dispatch empty queue");
+    assert_eq!(*events.lock().expect("events"), vec!["tcp_time"]);
+    assert_eq!(sampled_times.lock().expect("times").len(), 2);
 }
 
 fn attach_local_app_session(

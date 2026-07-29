@@ -1,5 +1,7 @@
 //! TCP/session lifecycle tests through the adjacent worker state.
 
+use std::time::{Duration, Instant};
+
 use crate::{TcpCapabilities, TcpPacket, TcpSegmentFlags, TcpState};
 use hammer_core::data_plane::{BufferFrame, NodeId};
 use hammer_infra::pool::Index;
@@ -9,9 +11,10 @@ use hammer_service::data_plane::DropNode;
 use hammer_service::session::SessionId;
 use hammer_service::session::node::{SessionQueueNext, SessionQueueNode, SessionQueueOutput};
 use hammer_service::session::runtime::{
-    SessionTransport, SessionWorker, dispatch_session_queue_once,
+    SessionTransport, SessionWorker, dispatch_session_queue_once, dispatch_session_queue_pending,
 };
 
+use crate::timers::{TcpTimerKind, TcpTimers};
 use crate::{TcpConnection, TcpWorker};
 
 fn tcp_session<'a>(
@@ -35,7 +38,7 @@ fn established_connection() -> TcpConnection {
     )
 }
 
-fn worker_state(runtime: &DataPlaneRuntime) -> (SessionWorker<Index>, TcpWorker) {
+fn worker_state() -> (SessionWorker<Index>, TcpWorker) {
     let worker = DataWorkerId::new(0);
     (
         hammer_service::session::SessionWorker::new(worker).expect("session worker for test"),
@@ -69,9 +72,66 @@ fn dispatch_session_queue(
 }
 
 #[test]
+fn session_queue_dispatch_advances_tcp_timers_without_session_events() {
+    let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
+    let (mut sessions, mut tcp) = worker_state();
+    let now = Instant::now();
+    let resolution = Duration::from_millis(10);
+    tcp.timers = TcpTimers::new(now, resolution);
+    let connection_index = tcp
+        .insert_connection(established_connection())
+        .expect("insert TCP connection");
+    let session_id = sessions
+        .insert_session_for_test(<TcpWorker as SessionTransport<Index>>::ID, connection_index);
+    tcp.connection_mut(connection_index)
+        .expect("TCP connection")
+        .attach_session(session_id)
+        .expect("attach stream session");
+    {
+        let TcpWorker {
+            connections,
+            timers,
+            ..
+        } = &mut tcp;
+        let timer_state = connections
+            .get_mut(connection_index)
+            .expect("TCP connection")
+            .timer_state_mut();
+        timers
+            .set(
+                connection_index,
+                timer_state,
+                TcpTimerKind::DelayedAck,
+                resolution,
+            )
+            .expect("arm delayed ACK timer");
+    }
+    let mut frame = BufferFrame::with_capacity(1);
+    let mut output = SessionQueueOutput::default();
+
+    dispatch_session_queue_pending(
+        &runtime,
+        &mut sessions,
+        &mut tcp,
+        SessionQueueNext::from_slot(0),
+        &mut frame,
+        &mut output,
+        now + resolution,
+    )
+    .expect("dispatch session queue");
+
+    assert!(
+        !tcp.connection(connection_index)
+            .expect("TCP connection")
+            .timer_state()
+            .is_active(TcpTimerKind::DelayedAck)
+    );
+}
+
+#[test]
 fn app_close_is_recorded_before_tcp_disconnect() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let (mut sessions, mut tcp) = worker_state(&runtime);
+    let (mut sessions, mut tcp) = worker_state();
     let connection_index = tcp
         .insert_connection(established_connection())
         .expect("insert TCP connection");
@@ -98,7 +158,7 @@ fn app_close_is_recorded_before_tcp_disconnect() {
 #[test]
 fn tcp_closed_publication_notifies_app_once_before_cleanup() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let (mut sessions, mut tcp) = worker_state(&runtime);
+    let (mut sessions, mut tcp) = worker_state();
     let connection_index = tcp
         .insert_connection(established_connection())
         .expect("insert TCP connection");
@@ -154,7 +214,7 @@ fn tcp_closed_publication_notifies_app_once_before_cleanup() {
 #[test]
 fn rollback_discards_unpublished_session_without_close_notification() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let (mut sessions, mut tcp) = worker_state(&runtime);
+    let (mut sessions, mut tcp) = worker_state();
     let connection_index = tcp
         .insert_connection(established_connection())
         .expect("insert TCP connection");
@@ -183,7 +243,7 @@ fn rollback_discards_unpublished_session_without_close_notification() {
 #[test]
 fn app_rx_event_refreshes_window_before_zero_window_is_advertised() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let (_, mut tcp) = worker_state(&runtime);
+    let (_, mut tcp) = worker_state();
     let connection_index = tcp
         .insert_connection(established_connection())
         .expect("insert TCP connection");
@@ -217,7 +277,7 @@ fn app_rx_event_refreshes_window_before_zero_window_is_advertised() {
 #[test]
 fn app_rx_event_refreshes_window_before_rearming_dequeue_notification() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let (_, mut tcp) = worker_state(&runtime);
+    let (_, mut tcp) = worker_state();
     let connection_index = tcp
         .insert_connection(established_connection())
         .expect("insert TCP connection");

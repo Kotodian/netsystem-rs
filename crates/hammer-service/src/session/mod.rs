@@ -23,7 +23,7 @@ pub use config::Session;
 pub use error::SessionQueueError;
 pub use id::SessionId;
 pub use node::{SESSION_QUEUE_IO_BUDGET, SessionQueueNext, SessionQueueNode};
-pub use protocol_chain::{AppSessionProtocol, ProtocolChain, ProtocolChainIo, ProtocolFifoAdvance};
+pub use protocol_chain::{AppSessionProtocol, Plaintext, ProtocolChain, ProtocolChainIo};
 pub use runtime::SessionWorker;
 
 #[hammer_component_macros::config_function(

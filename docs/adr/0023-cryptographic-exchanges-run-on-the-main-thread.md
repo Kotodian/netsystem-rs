@@ -1,5 +1,7 @@
 # Cryptographic Exchanges run on the Main Thread
 
+Status: superseded by ADR 0026
+
 Each protocol plugin owns and advances its own TLS, Noise, IKEv2, or future
 cryptographic-exchange state machine on the Main Thread. The plugin defines the
 concrete state enum and retains it in its own Main owner; Data Workers never

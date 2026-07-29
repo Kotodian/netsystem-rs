@@ -9,32 +9,16 @@ name = "hammer_infra"
 crate-type = ["dylib", "rlib"]
 
 [dependencies]
-aes-gcm = { workspace = true }
-blake2 = { workspace = true }
-chacha20poly1305 = { workspace = true }
 crossbeam-utils = { workspace = true }
 byte-unit = { workspace = true }
-ed25519-dalek = { workspace = true }
 libc = { workspace = true }
-hmac = { workspace = true }
-hkdf = { workspace = true }
 libmimalloc-sys = { workspace = true }
-ml-kem = { workspace = true }
 parse-display = { workspace = true }
-p256 = { workspace = true }
-p384 = { workspace = true }
-rsa = { workspace = true }
 serde = { workspace = true }
 serde_with = { workspace = true }
-sha2 = { workspace = true }
-sha2-accelerated = { workspace = true }
 spinning_top = { workspace = true }
 talc = { workspace = true }
 thiserror = { workspace = true }
-x25519-dalek = { workspace = true }
-
-[dev-dependencies]
-hex = "0.4"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs = { workspace = true }

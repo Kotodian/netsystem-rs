@@ -8,7 +8,6 @@ pub mod align;
 pub mod bihash;
 pub mod bitmap;
 pub mod checksum;
-pub mod crypto;
 pub mod descriptor;
 pub mod fifo;
 pub mod fifo_queue;
