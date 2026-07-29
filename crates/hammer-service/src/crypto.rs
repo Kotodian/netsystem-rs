@@ -2469,7 +2469,6 @@ impl Engine {
             prepared,
             key_retention: None,
             available: Rc::clone(&implementation.available),
-            thread_bound: PhantomData,
         })
     }
 
@@ -2661,7 +2660,6 @@ impl Engine {
                 key,
             }),
             available: Rc::clone(&implementation.available),
-            thread_bound: PhantomData,
         })
     }
 }
@@ -2686,8 +2684,6 @@ pub struct Context<F: Family> {
     implementation_state: Rc<RefCell<OwnedState>>,
     functions: Rc<AlgorithmFunctions<F>>,
     available: Rc<Cell<bool>>,
-    // Rc is deliberately part of the marker: Context must be neither Send nor Sync.
-    thread_bound: PhantomData<Rc<()>>,
 }
 
 impl<F: Family> fmt::Debug for Context<F> {

@@ -1,8 +1,5 @@
 //! Statically typed, synchronous cryptographic exchanges.
 
-use std::marker::PhantomData;
-use std::rc::Rc;
-
 use super::Engine;
 
 /// One protocol-owned cryptographic negotiation.
@@ -55,51 +52,11 @@ pub enum Transition<S, E> {
     },
 }
 
-/// One Main Thread-owned, protocol-typed cryptographic exchange.
+/// One protocol-typed cryptographic exchange.
 ///
-/// Exchange state cannot migrate to another thread:
-///
-/// ```compile_fail
-/// use hammer_infra::crypto::InstructionSet;
-/// use hammer_service::crypto::Engine;
-/// use hammer_service::crypto::exchange::{Protocol, Transition};
-///
-/// struct Handshake;
-///
-/// impl Protocol<()> for Handshake {
-///     type Parameters = ();
-///     type State = ();
-///     type Established = ();
-///     type Error = ();
-///
-///     fn start(
-///         &mut self,
-///         _: &Engine,
-///         _: (),
-///         _: &mut (),
-///         _: &mut [u8],
-///     ) -> Result<((), usize), ()> {
-///         Ok(((), 0))
-///     }
-///
-///     fn advance(
-///         &mut self,
-///         _: &Engine,
-///         _: (),
-///         _: &mut (),
-///         _: &[u8],
-///         _: &mut [u8],
-///     ) -> Result<Transition<(), ()>, ()> {
-///         Ok(Transition::Established { result: (), written: 0 })
-///     }
-/// }
-///
-/// let engine = Engine::new(InstructionSet::empty());
-/// let (exchange, _) = engine
-///     .start_exchange(Handshake, (), (), &mut [])
-///     .unwrap();
-/// std::thread::spawn(move || drop(exchange));
-/// ```
+/// A protocol that owns thread-bound cryptographic state carries that state in
+/// `P`, `P::State`, or `C`. The Main Thread owner, rather than a marker field,
+/// keeps handshake exchanges on the Main Thread.
 pub struct Exchange<P, C>
 where
     P: Protocol<C>,
@@ -107,7 +64,6 @@ where
     protocol: P,
     state: P::State,
     crypto: C,
-    thread_bound: PhantomData<Rc<()>>,
 }
 
 impl Engine {
@@ -128,7 +84,6 @@ impl Engine {
                 protocol,
                 state,
                 crypto,
-                thread_bound: PhantomData,
             },
             written,
         ))
