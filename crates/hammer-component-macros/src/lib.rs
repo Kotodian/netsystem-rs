@@ -1484,6 +1484,8 @@ pub fn app_session_protocol(args: TokenStream, input: TokenStream) -> TokenStrea
     let create_ident = format_ident!("{static_ident}_CREATE");
     let ingress_ident = format_ident!("{static_ident}_INGRESS");
     let egress_ident = format_ident!("{static_ident}_EGRESS");
+    let claim_ready_ident = format_ident!("{static_ident}_CLAIM_READY");
+    let sessions_ident = format_ident!("{static_ident}_SESSIONS");
     let destroy_ident = format_ident!("{static_ident}_DESTROY");
     let name = args.name;
     let lower = args.lower;
@@ -1502,6 +1504,8 @@ pub fn app_session_protocol(args: TokenStream, input: TokenStream) -> TokenStrea
             __hammer_role: ::hammer_runtime::app::AppSessionProtocolRole,
             __hammer_protocol_id: ::std::option::Option<u64>,
             __hammer_server_name: ::std::option::Option<&str>,
+            __hammer_session_handle: ::hammer_runtime::app::SessionHandle,
+            __hammer_app_session_handle: ::hammer_runtime::app::SessionHandle,
         ) -> ::hammer_runtime::RuntimeResult<
             ::hammer_runtime::app::AppSessionProtocolConnectionId
         > {
@@ -1516,7 +1520,13 @@ pub fn app_session_protocol(args: TokenStream, input: TokenStream) -> TokenStrea
                     __hammer_worker_count,
                     <#ident as ::hammer_runtime::app::AppSessionProtocol>::CONNECTION_CAPACITY,
                 )
-            }).insert(__hammer_worker, __hammer_worker_count, __hammer_protocol)
+            }).insert(
+                __hammer_worker,
+                __hammer_worker_count,
+                __hammer_protocol,
+                __hammer_session_handle,
+                __hammer_app_session_handle,
+            )
         }
 
         fn #ingress_ident(
@@ -1556,10 +1566,31 @@ pub fn app_session_protocol(args: TokenStream, input: TokenStream) -> TokenStrea
         fn #destroy_ident(
             __hammer_worker: ::hammer_runtime::DataWorkerId,
             __hammer_connection: ::hammer_runtime::app::AppSessionProtocolConnectionId,
-        ) -> ::hammer_runtime::RuntimeResult<()> {
+        ) {
             #connections_ident.get()
                 .expect("App Session protocol connection storage exists after construction")
                 .remove(__hammer_worker, __hammer_connection)
+        }
+
+        fn #claim_ready_ident(
+            __hammer_worker: ::hammer_runtime::DataWorkerId,
+            __hammer_connection: ::hammer_runtime::app::AppSessionProtocolConnectionId,
+        ) -> ::hammer_runtime::RuntimeResult<bool> {
+            #connections_ident.get()
+                .expect("App Session protocol connection storage exists after construction")
+                .claim_ready(__hammer_worker, __hammer_connection)
+        }
+
+        fn #sessions_ident(
+            __hammer_worker: ::hammer_runtime::DataWorkerId,
+            __hammer_connection: ::hammer_runtime::app::AppSessionProtocolConnectionId,
+        ) -> ::hammer_runtime::RuntimeResult<(
+            ::hammer_runtime::app::SessionHandle,
+            ::hammer_runtime::app::SessionHandle,
+        )> {
+            #connections_ident.get()
+                .expect("App Session protocol connection storage exists after construction")
+                .sessions(__hammer_worker, __hammer_connection)
         }
 
         pub(crate) static #static_ident: ::hammer_runtime::app::AppSessionProtocolEntry =
@@ -1570,6 +1601,8 @@ pub fn app_session_protocol(args: TokenStream, input: TokenStream) -> TokenStrea
                 #create_ident,
                 #ingress_ident,
                 #egress_ident,
+                #claim_ready_ident,
+                #sessions_ident,
                 #destroy_ident,
             );
     }
@@ -1579,23 +1612,29 @@ pub fn app_session_protocol(args: TokenStream, input: TokenStream) -> TokenStrea
 struct SessionTransportArgs {
     name: LitStr,
     upper: LitStr,
+    start_listen: Option<Path>,
+    stop_listen: Option<Path>,
 }
 
 impl Parse for SessionTransportArgs {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let mut name = None;
         let mut upper = None;
+        let mut start_listen = None;
+        let mut stop_listen = None;
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             input.parse::<Token![=]>()?;
             match key.to_string().as_str() {
                 "name" => name = Some(input.parse()?),
                 "upper" => upper = Some(input.parse()?),
+                "start_listen" => start_listen = Some(input.parse()?),
+                "stop_listen" => stop_listen = Some(input.parse()?),
                 other => {
                     return Err(Error::new(
                         key.span(),
                         format!(
-                            "unknown `session_transport` argument `{other}`; expected `name` or `upper`"
+                            "unknown `session_transport` argument `{other}`; expected `name`, `upper`, `start_listen`, or `stop_listen`"
                         ),
                     ));
                 }
@@ -1608,6 +1647,8 @@ impl Parse for SessionTransportArgs {
             name: name.ok_or_else(|| Error::new(Span::call_site(), "missing `name` argument"))?,
             upper: upper
                 .ok_or_else(|| Error::new(Span::call_site(), "missing `upper` argument"))?,
+            start_listen,
+            stop_listen,
         })
     }
 }
@@ -1634,11 +1675,32 @@ pub fn session_transport(args: TokenStream, input: TokenStream) -> TokenStream {
     );
     let name = args.name;
     let upper = args.upper;
+    let registration = match (args.start_listen, args.stop_listen) {
+        (Some(start_listen), Some(stop_listen)) => quote! {
+            ::hammer_runtime::SessionTransportRegistration::with_listener_operations(
+                #name,
+                #upper,
+                #start_listen,
+                #stop_listen,
+            )
+        },
+        (None, None) => quote! {
+            ::hammer_runtime::SessionTransportRegistration::new(#name, #upper)
+        },
+        _ => {
+            return Error::new(
+                ident.span(),
+                "`start_listen` and `stop_listen` must be specified together",
+            )
+            .to_compile_error()
+            .into();
+        }
+    };
     quote! {
         #item
 
-        pub(crate) static #static_ident: ::hammer_runtime::app::SessionTransportRegistration =
-            ::hammer_runtime::app::SessionTransportRegistration::new(#name, #upper);
+        pub(crate) static #static_ident: ::hammer_runtime::SessionTransportRegistration =
+            #registration;
     }
     .into()
 }

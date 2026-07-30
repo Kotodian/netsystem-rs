@@ -1714,6 +1714,13 @@ impl NodeRuntime {
         Ok(inner.node_states[node.slot() as usize])
     }
 
+    #[inline]
+    pub fn node_runtime_data(&self, node: NodeId) -> RuntimeResult<NodeRuntimeData> {
+        let inner = self.inner.borrow();
+        inner.validate_node(node)?;
+        Ok(inner.nodes[node.slot() as usize].runtime_data)
+    }
+
     pub fn polling_driver_nodes(&self) -> RuntimeResult<Vec<NodeId>> {
         let inner = self.inner.borrow();
         let mut nodes = Vec::new();

@@ -1,6 +1,7 @@
 use hammer_core::data_plane::NodeId;
 use hammer_infra::fifo::FifoError;
 use hammer_runtime::RuntimeError;
+use hammer_runtime::SessionListenerId;
 use hammer_runtime::app::ApplicationConnectionId;
 use thiserror::Error;
 
@@ -65,8 +66,6 @@ pub(crate) enum SessionError {
     CapacityExhausted { capacity: usize },
     #[error("session {session_id:?} is not in the session pool")]
     SessionMissing { session_id: SessionId },
-    #[error("session {session_id:?} is not in the creating state")]
-    NotCreating { session_id: SessionId },
     #[error("session {session_id:?} cannot publish its connection in its current state")]
     PublicationRejected { session_id: SessionId },
     #[error("session {session_id:?} is active and cannot be rolled back")]
@@ -112,14 +111,16 @@ pub(crate) enum SessionError {
         "Application connection {connection:?} requires an Application Main on this Data Worker"
     )]
     ApplicationMainMissingForConnection { connection: ApplicationConnectionId },
-    #[error(
-        "Application connection {connection:?} selected Session Transport `{selected}` but `{actual}` opened the connection"
-    )]
-    ConnectionTransportSelectionMismatch {
-        connection: ApplicationConnectionId,
-        selected: &'static str,
-        actual: &'static str,
-    },
+    #[error("Session listener state is unavailable on this Data Worker")]
+    ListenerMainMissing,
+    #[error("Session listener {listener:?} is not registered")]
+    ListenerMissing { listener: SessionListenerId },
+    #[error("Session listener capacity {capacity} is exhausted")]
+    ListenerCapacityExhausted { capacity: usize },
+    #[error("Session listener control is owned by another thread")]
+    ListenerControlWrongThread,
+    #[error("Session transport `{transport}` does not register listener operations")]
+    TransportListenUnsupported { transport: &'static str },
 }
 
 impl From<SessionError> for RuntimeError {

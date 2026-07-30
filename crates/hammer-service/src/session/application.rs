@@ -9,7 +9,7 @@ use hammer_infra::pool::{Index, Pool};
 use hammer_runtime::Engine;
 use hammer_runtime::app::{
     AppSessionPolicy, AppSessionProtocolEntry, ApplicationConnectionId, ApplicationId,
-    ApplicationListenerId, SessionTransportRegistration,
+    ApplicationListenerId, ORDERED_RELIABLE_BYTE_STREAM,
 };
 use hammer_runtime::binary_api::BinaryApiContext;
 use prost::Message;
@@ -23,13 +23,11 @@ struct ApplicationState {
 
 pub(crate) struct ApplicationListener {
     application: ApplicationId,
-    transport: SessionTransportRegistration,
     protocols: Box<[ApplicationProtocol]>,
 }
 
 pub(crate) struct ApplicationConnection {
     application: ApplicationId,
-    transport: SessionTransportRegistration,
     protocols: Box<[ApplicationProtocol]>,
     server_name: Option<String>,
     completion: AtomicU8,
@@ -45,11 +43,6 @@ impl ApplicationListener {
     #[inline]
     pub(crate) const fn application(&self) -> ApplicationId {
         self.application
-    }
-
-    #[inline]
-    pub(crate) const fn transport(&self) -> SessionTransportRegistration {
-        self.transport
     }
 
     #[inline]
@@ -77,11 +70,6 @@ impl ApplicationConnection {
     }
 
     #[inline]
-    pub(crate) const fn transport(&self) -> SessionTransportRegistration {
-        self.transport
-    }
-
-    #[inline]
     pub(crate) fn protocols(&self) -> &[ApplicationProtocol] {
         &self.protocols
     }
@@ -99,7 +87,6 @@ const CONNECTION_COMPLETED: u8 = 1;
 pub struct ApplicationMain {
     owner: ThreadId,
     state: UnsafeCell<ApplicationState>,
-    transports: Box<[SessionTransportRegistration]>,
     protocols: Box<[AppSessionProtocolEntry]>,
 }
 
@@ -113,19 +100,11 @@ unsafe impl Sync for ApplicationMain {}
 
 impl ApplicationMain {
     pub fn new(capacity: usize) -> Arc<Self> {
-        Self::with_inventory(capacity, [], [])
+        Self::with_protocols(capacity, [])
     }
 
     pub fn with_protocols(
         capacity: usize,
-        protocols: impl IntoIterator<Item = AppSessionProtocolEntry>,
-    ) -> Arc<Self> {
-        Self::with_inventory(capacity, [], protocols)
-    }
-
-    pub fn with_inventory(
-        capacity: usize,
-        transports: impl IntoIterator<Item = SessionTransportRegistration>,
         protocols: impl IntoIterator<Item = AppSessionProtocolEntry>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -135,10 +114,6 @@ impl ApplicationMain {
                 listeners: Pool::with_capacity(capacity),
                 connections: Pool::with_capacity(capacity),
             }),
-            transports: transports
-                .into_iter()
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
             protocols: protocols.into_iter().collect::<Vec<_>>().into_boxed_slice(),
         })
     }
@@ -241,10 +216,9 @@ impl ApplicationMain {
     ) -> Result<ApplicationConnectionId, ApplicationError> {
         self.ensure_active(application)?;
         self.reap_connections()?;
-        let (transport, protocols) = self.resolve_policy(policy)?;
+        let protocols = self.resolve_policy(policy)?;
         let connection = ApplicationConnection {
             application,
-            transport,
             protocols,
             server_name,
             completion: AtomicU8::new(CONNECTION_PENDING),
@@ -352,10 +326,9 @@ impl ApplicationMain {
         application: ApplicationId,
         policy: &AppSessionPolicy,
     ) -> Result<ApplicationListener, ApplicationError> {
-        let (transport, protocols) = self.resolve_policy(policy)?;
+        let protocols = self.resolve_policy(policy)?;
         Ok(ApplicationListener {
             application,
-            transport,
             protocols,
         })
     }
@@ -363,11 +336,10 @@ impl ApplicationMain {
     fn resolve_policy(
         &self,
         policy: &AppSessionPolicy,
-    ) -> Result<(SessionTransportRegistration, Box<[ApplicationProtocol]>), ApplicationError> {
-        let transport = unique_transport(&self.transports, policy.transport())?;
+    ) -> Result<Box<[ApplicationProtocol]>, ApplicationError> {
         let mut protocols = Vec::with_capacity(policy.protocols().len());
-        let mut semantics = transport.upper();
-        let mut lower_name = transport.name();
+        let mut semantics = ORDERED_RELIABLE_BYTE_STREAM;
+        let mut lower_name = "session";
         for selection in policy.protocols() {
             let entry = unique_protocol(&self.protocols, selection.protocol())?;
             let registration = entry.registration();
@@ -386,7 +358,7 @@ impl ApplicationMain {
             semantics = registration.upper();
             lower_name = registration.name();
         }
-        Ok((transport, protocols.into_boxed_slice()))
+        Ok(protocols.into_boxed_slice())
     }
 
     fn ensure_active(&self, application: ApplicationId) -> Result<(), ApplicationError> {
@@ -489,9 +461,9 @@ impl Drop for ApplicationRegistration {
         let Some(application) = self.application.take() else {
             return;
         };
-        if let Err(error) = self.main.detach(application) {
-            tracing::error!(%error, ?application, "failed to detach Local Application");
-        }
+        self.main
+            .detach(application)
+            .expect("Local Application registration is detached on its owning Main Thread");
     }
 }
 
@@ -503,10 +475,6 @@ pub enum ApplicationError {
     Missing { application: ApplicationId },
     #[error("Application state is owned by another thread")]
     WrongThread,
-    #[error("Session Transport `{transport}` is not registered")]
-    TransportMissing { transport: String },
-    #[error("Session Transport `{transport}` is registered more than once")]
-    TransportDuplicate { transport: String },
     #[error("App Session protocol `{protocol}` is not registered")]
     ProtocolMissing { protocol: String },
     #[error("App Session protocol `{protocol}` is registered more than once")]
@@ -596,17 +564,21 @@ fn attach_application(
             if context.attach_application(application) {
                 attach_reply(ApplicationApiStatus::Ok, application.raw())
             } else {
-                let status = Engine::with_current(|engine| {
+                let rollback = Engine::with_current(|engine| {
                     engine
                         .registry
                         .require::<ApplicationMain>()
-                        .ok()
-                        .and_then(|main| main.detach(application).err())
+                        .map_err(|_| ApplicationApiStatus::MainThreadUnavailable)
+                        .and_then(|main| {
+                            main.detach(application)
+                                .map_err(|_| ApplicationApiStatus::CleanupFailed)
+                        })
                 });
-                if let Some(Some(error)) = status {
-                    tracing::error!(%error, ?application, "failed to roll back Application attach");
+                match rollback {
+                    Some(Ok(())) => attach_reply(ApplicationApiStatus::AlreadyAttached, 0),
+                    Some(Err(status)) => attach_reply(status, 0),
+                    None => attach_reply(ApplicationApiStatus::MainThreadUnavailable, 0),
                 }
-                attach_reply(ApplicationApiStatus::AlreadyAttached, 0)
             }
         }
         Err(status) => attach_reply(status, 0),
@@ -649,9 +621,7 @@ fn application_api_status(error: ApplicationError) -> ApplicationApiStatus {
         }
         ApplicationError::Missing { .. } => ApplicationApiStatus::NotAttached,
         ApplicationError::WrongThread => ApplicationApiStatus::WrongThread,
-        ApplicationError::TransportMissing { .. }
-        | ApplicationError::TransportDuplicate { .. }
-        | ApplicationError::ProtocolMissing { .. }
+        ApplicationError::ProtocolMissing { .. }
         | ApplicationError::ProtocolDuplicate { .. }
         | ApplicationError::SemanticsMismatch { .. }
         | ApplicationError::ListenerMissing { .. }
@@ -705,27 +675,6 @@ fn application_connection_id(index: Index) -> ApplicationConnectionId {
 #[inline]
 fn application_connection_index(connection: ApplicationConnectionId) -> Index {
     Index::new(connection.slot(), connection.generation())
-}
-
-fn unique_transport(
-    transports: &[SessionTransportRegistration],
-    name: &str,
-) -> Result<SessionTransportRegistration, ApplicationError> {
-    let mut found = None;
-    for transport in transports.iter().copied() {
-        if transport.name() != name {
-            continue;
-        }
-        if found.is_some() {
-            return Err(ApplicationError::TransportDuplicate {
-                transport: name.to_owned(),
-            });
-        }
-        found = Some(transport);
-    }
-    found.ok_or_else(|| ApplicationError::TransportMissing {
-        transport: name.to_owned(),
-    })
 }
 
 fn unique_protocol(

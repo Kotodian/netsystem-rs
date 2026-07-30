@@ -9,8 +9,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use crate::TcpCapabilities;
-use hammer_runtime::DataWorkerId;
-use hammer_runtime::{RuntimeError, RuntimeResult};
+use hammer_runtime::{DataWorkerId, RuntimeError, RuntimeResult, SessionListenerId};
 
 use super::TcpInputControlPlane;
 use super::lookup::{
@@ -24,6 +23,8 @@ pub enum TcpListenerControlError {
     AlreadyRegistered { bind: SocketAddr },
     #[error("tcp listener {lookup_id} is not registered")]
     NotRegistered { lookup_id: TcpLookupId },
+    #[error("session listener {listener:?} is not registered by tcp")]
+    SessionListenerNotRegistered { listener: SessionListenerId },
     #[error("tcp lookup id space is exhausted")]
     LookupIdExhausted,
 }
@@ -37,6 +38,7 @@ impl From<TcpListenerControlError> for RuntimeError {
 #[derive(Clone)]
 struct TcpListenerRegistration {
     lookup_id: TcpLookupId,
+    session_listener: Option<SessionListenerId>,
     owner_worker: DataWorkerId,
     bind: SocketAddr,
     capabilities: TcpCapabilities,
@@ -102,6 +104,7 @@ impl TcpListenerControlState {
         bind: SocketAddr,
         owner_worker: DataWorkerId,
         capabilities: TcpCapabilities,
+        session_listener: Option<SessionListenerId>,
     ) -> RuntimeResult<TcpLookupId> {
         if self
             .tcp_listeners
@@ -114,6 +117,7 @@ impl TcpListenerControlState {
         let lookup_id = self.alloc_tcp_lookup_id()?;
         self.tcp_listeners.push(TcpListenerRegistration {
             lookup_id,
+            session_listener,
             owner_worker,
             bind,
             capabilities,
@@ -138,6 +142,17 @@ impl TcpListenerControlState {
         self.publish_tcp_lookup()
     }
 
+    fn close_session_listener(&mut self, listener: SessionListenerId) -> RuntimeResult<()> {
+        let lookup_id = self
+            .tcp_listeners
+            .iter()
+            .find_map(|registration| {
+                (registration.session_listener == Some(listener)).then_some(registration.lookup_id)
+            })
+            .ok_or(TcpListenerControlError::SessionListenerNotRegistered { listener })?;
+        self.close_tcp_listener(lookup_id)
+    }
+
     fn alloc_tcp_lookup_id(&mut self) -> RuntimeResult<TcpLookupId> {
         let id = self.next_tcp_lookup_id;
         self.next_tcp_lookup_id = self
@@ -152,6 +167,7 @@ impl TcpListenerControlState {
         for registration in self.tcp_listeners.iter().cloned() {
             let value = TcpLookupValue {
                 id: registration.lookup_id,
+                session_listener: registration.session_listener,
                 owner_worker: registration.owner_worker,
                 capabilities: registration.capabilities,
             };
@@ -215,15 +231,20 @@ impl TcpListenerControlHandle {
         bind: SocketAddr,
         owner_worker: DataWorkerId,
         capabilities: TcpCapabilities,
+        session_listener: Option<SessionListenerId>,
     ) -> RuntimeResult<TcpLookupId> {
         let state = unsafe { self.state.get_mut() };
-        state.bind_tcp_listener(bind, owner_worker, capabilities)
+        state.bind_tcp_listener(bind, owner_worker, capabilities, session_listener)
     }
 
-    #[cfg(test)]
     pub(super) fn close(&self, lookup_id: TcpLookupId) -> RuntimeResult<()> {
         let state = unsafe { self.state.get_mut() };
         state.close_tcp_listener(lookup_id)
+    }
+
+    pub(super) fn close_session_listener(&self, listener: SessionListenerId) -> RuntimeResult<()> {
+        let state = unsafe { self.state.get_mut() };
+        state.close_session_listener(listener)
     }
 
     #[cfg(test)]
@@ -253,7 +274,12 @@ mod tests {
 
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 7300);
         let lookup_id = handle
-            .bind(bind, DataWorkerId::new(0), TcpCapabilities::default())
+            .bind(
+                bind,
+                DataWorkerId::new(0),
+                TcpCapabilities::default(),
+                Some(SessionListenerId::new(7, 3)),
+            )
             .expect("bind tcp listener");
 
         let snapshot = handle.snapshot_for_test();
@@ -269,6 +295,10 @@ mod tests {
             ));
         assert!(lookup_entry.is_some(), "listener must appear in lookup");
         assert_eq!(lookup_entry.unwrap().id, lookup_id);
+        assert_eq!(
+            lookup_entry.unwrap().session_listener,
+            Some(SessionListenerId::new(7, 3))
+        );
 
         handle.close(lookup_id).expect("close tcp listener");
         let snapshot = handle.snapshot_for_test();

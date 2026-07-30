@@ -185,6 +185,20 @@ impl<T, const ALIGN: usize> Pool<T, ALIGN> {
         self.validate(index).is_some()
     }
 
+    /// Returns the current live index at `slot`.
+    ///
+    /// Index-only event queues intentionally omit generations. Consumers use
+    /// this operation to resolve the slot to whichever pool entry is live when
+    /// the event is dispatched.
+    #[inline]
+    pub fn index_at_slot(&self, slot: u32) -> Option<Index> {
+        let slot_index = slot as usize;
+        (slot_index < self.capacity && !self.free_bitmap.is_set(slot_index)).then(|| Index {
+            slot,
+            generation: self.generations[slot_index],
+        })
+    }
+
     #[inline]
     pub fn iter(&self) -> PoolIter<'_, T, ALIGN> {
         PoolIter {

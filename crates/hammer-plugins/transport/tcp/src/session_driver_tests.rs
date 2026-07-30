@@ -213,16 +213,45 @@ fn tcp_closed_publication_notifies_app_once_before_cleanup() {
 
 #[test]
 fn rollback_discards_unpublished_session_without_close_notification() {
-    let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let (mut sessions, mut tcp) = worker_state();
     let connection_index = tcp
         .insert_connection(established_connection())
         .expect("insert TCP connection");
+    let applications = hammer_service::session::ApplicationMain::new(1);
+    let application = applications.attach().expect("attach test Application");
+    let policy = hammer_runtime::app::AppSessionPolicy::new(
+        hammer_runtime::app::APP_SESSION_POLICY_VERSION,
+        [],
+    )
+    .expect("direct App Session policy is valid");
+    let application_listener = applications
+        .register_listener(application, &policy)
+        .expect("register test Application listener");
+    let session_main = std::sync::Arc::new(hammer_service::session::runtime::SessionMain::new(
+        1,
+        applications,
+    ));
+    sessions.set_listener_main(std::sync::Arc::clone(&session_main));
+    let listener = session_main
+        .listen(
+            application_listener,
+            hammer_runtime::SessionTransportRegistration::with_listener_operations(
+                "test-session",
+                hammer_runtime::app::ORDERED_RELIABLE_BYTE_STREAM,
+                |_, _| Ok(()),
+                |_| Ok(()),
+            ),
+            hammer_runtime::SessionListenEndpoint::new(
+                "127.0.0.1:0".parse().expect("test endpoint"),
+                sessions.worker(),
+            ),
+        )
+        .expect("register test Session listener");
     let session_id = sessions
         .stream_accept(
             <TcpWorker as SessionTransport<Index>>::ID,
             connection_index,
-            0,
+            listener,
         )
         .expect("accept stream session");
     tcp.connection_mut(connection_index)

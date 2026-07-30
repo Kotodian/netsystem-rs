@@ -23,7 +23,7 @@ crate::__declare_registration_image!(
     node_functions = [];
     process_nodes = [];
     session_transports = [];
-    app_session_protocols = [app::__APP_SESSION_PROTOCOL_PLAINTEXT];
+    app_session_protocols = [];
     binary_api_methods = [];
 );
 
@@ -48,6 +48,7 @@ pub mod plugin;
 pub mod plugin_loader;
 mod process;
 pub mod registry;
+pub mod session;
 pub mod sync;
 
 pub use error::{AttachError, RuntimeError, RuntimeResult};
@@ -84,6 +85,10 @@ pub use process::{
     ProcessContext, ProcessEntry, ProcessEventBatch, ProcessFuture, ProcessHandle, ProcessWake,
 };
 pub use registry::RuntimeRegistry;
+pub use session::{
+    SessionListenEndpoint, SessionListenerId, SessionTransportRegistration,
+    SessionTransportStartListen, SessionTransportStopListen,
+};
 pub use trace::{
     PacketTrace, TraceControlHandle, TraceControlPlane, TraceEntry, TraceFormatter,
     TraceInputPolicy, TracePolicy, TraceRecord, TraceRecordSink,

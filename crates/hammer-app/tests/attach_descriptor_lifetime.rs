@@ -252,7 +252,7 @@ fn assert_publish_then_connect_round_trips_handle_and_descriptors() {
     assert_eq!(&echoed[..read], b"pong");
     let event = published.session.tx_evt_q().dequeue().expect("tx event");
     assert_eq!(event.session_index(), handle.session_index());
-    assert_eq!(event.evt_type, SessionEvtType::TxDeq);
+    assert_eq!(event.evt_type, SessionEvtType::TxEnq);
 
     drop(client_session);
     drop(client);

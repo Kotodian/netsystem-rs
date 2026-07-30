@@ -4,10 +4,9 @@ use hammer_runtime::app::{
 };
 
 #[test]
-fn policy_preserves_independent_transport_and_ordered_protocol_chain() {
+fn policy_preserves_the_ordered_protocol_chain_and_each_protocol_config_id() {
     let policy = AppSessionPolicy::new(
         APP_SESSION_POLICY_VERSION,
-        "tcp",
         [
             AppSessionProtocolSelection::with_id("tls", 41),
             AppSessionProtocolSelection::new("http2"),
@@ -15,7 +14,6 @@ fn policy_preserves_independent_transport_and_ordered_protocol_chain() {
     )
     .expect("valid application policy");
 
-    assert_eq!(policy.transport(), "tcp");
     let selected = policy.protocols();
     assert_eq!(
         selected
@@ -30,12 +28,8 @@ fn policy_preserves_independent_transport_and_ordered_protocol_chain() {
 
 #[test]
 fn policy_rejects_an_unsupported_version() {
-    let error = AppSessionPolicy::new(
-        APP_SESSION_POLICY_VERSION + 1,
-        "tcp",
-        [AppSessionProtocolSelection::new("plaintext")],
-    )
-    .expect_err("unsupported policy version");
+    let error = AppSessionPolicy::new(APP_SESSION_POLICY_VERSION + 1, [])
+        .expect_err("unsupported policy version");
 
     assert!(matches!(
         error,

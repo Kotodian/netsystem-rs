@@ -36,7 +36,7 @@ use arc_swap::ArcSwapOption;
 use hammer_core::data_plane::{BufferPacketCursor, NodeId, NodeState, SecondaryOpaque};
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, Engine, Node, NodeProcessFn, NodeRuntimeData, PluginError,
-    RuntimeError, RuntimeResult,
+    RuntimeError, RuntimeResult, SessionListenEndpoint, SessionListenerId,
 };
 use thiserror::Error;
 
@@ -44,8 +44,10 @@ use hammer_infra::align::CacheLine;
 use hammer_infra::pool::Index as PoolIndex;
 use hammer_infra::thread_owned::{ThreadOwned, ThreadOwnedError};
 use hammer_service::session::node::{SessionQueueNode, SessionQueueOutput};
+#[cfg(test)]
+use hammer_service::session::runtime::SessionTransport;
 use hammer_service::session::runtime::{
-    SessionMain, SessionTransport, SessionWorker, dispatch_session_queue_pending,
+    SessionMain, SessionWorker, dispatch_session_queue_pending,
 };
 use hammer_service::session::{SessionId, SessionQueueNext};
 
@@ -135,7 +137,7 @@ pub(crate) fn publish_tcp_connection(
         }
         sessions.notify_transport_closed(session_id, index)?;
         let _ = tcp.remove_connection(index);
-        sessions.notify_transport_deleted(session_id, index);
+        sessions.notify_transport_deleted(session_id, index)?;
     }
     Ok(())
 }
@@ -233,8 +235,10 @@ impl TcpMain {
         bind: SocketAddr,
         owner_worker: DataWorkerId,
         capabilities: TcpCapabilities,
+        session_listener: Option<SessionListenerId>,
     ) -> RuntimeResult<lookup::TcpLookupId> {
-        self.listeners.bind(bind, owner_worker, capabilities)
+        self.listeners
+            .bind(bind, owner_worker, capabilities, session_listener)
     }
 }
 
@@ -242,6 +246,29 @@ impl TcpMain {
 // `tcp.c`; nodes read it directly and `tcp_init` publishes the configured
 // instance before workers start.
 pub static TCP_MAIN: ArcSwapOption<TcpMain> = ArcSwapOption::const_empty();
+
+pub(crate) fn start_listen(
+    listener: SessionListenerId,
+    endpoint: SessionListenEndpoint,
+) -> RuntimeResult<()> {
+    let main = TCP_MAIN
+        .load_full()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
+    main.bind_tcp_listener(
+        endpoint.local(),
+        endpoint.worker(),
+        listener_capabilities(),
+        Some(listener),
+    )
+    .map(drop)
+}
+
+pub(crate) fn stop_listen(listener: SessionListenerId) -> RuntimeResult<()> {
+    let main = TCP_MAIN
+        .load_full()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
+    main.listeners.close_session_listener(listener)
+}
 
 #[hammer_component_macros::config_function(
     name = "tcp_config",
@@ -287,23 +314,28 @@ fn configured_tcp_main(
     // VPP `tcp_make_syn_options` always offers MSS, window scale, timestamps,
     // and SACK; `tcp_window_compute_scale` picks the smallest scale that fits
     // the configured receive window in the 16-bit window field.
+    let capabilities = listener_capabilities();
+    for entry in &tcp.listen {
+        main.bind_tcp_listener(entry.address, DataWorkerId::new(0), capabilities, None)?;
+    }
+    Ok(main)
+}
+
+fn listener_capabilities() -> TcpCapabilities {
+    let policy = active_tcp_policy();
     let mut window_scale = 0u8;
     while window_scale < connection::TCP_MAX_WINDOW_SCALE
-        && (tcp.receive_window >> window_scale) > u32::from(u16::MAX)
+        && (policy.receive_window >> window_scale) > u32::from(u16::MAX)
     {
         window_scale += 1;
     }
-    let capabilities = TcpCapabilities {
-        max_segment_size: Some(u16::try_from(tcp.mss).unwrap_or(u16::MAX)),
+    TcpCapabilities {
+        max_segment_size: Some(u16::try_from(policy.mss).unwrap_or(u16::MAX)),
         window_scale: Some(window_scale),
         sack: true,
         timestamps: true,
         ..TcpCapabilities::default()
-    };
-    for entry in &tcp.listen {
-        main.bind_tcp_listener(entry.address, DataWorkerId::new(0), capabilities)?;
     }
-    Ok(main)
 }
 
 pub fn register_tcp_input(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
@@ -394,8 +426,7 @@ fn bind_worker_graph(engine: &mut Engine) -> RuntimeResult<()> {
         )
     })?;
 
-    let session_queue_node = SessionQueueNode::new()?;
-    let session_queue_data = session_queue_node.node_runtime_data()?;
+    let session_queue_data = engine.runtime.nodes().node_runtime_data(session_queue)?;
     let session_queue_output =
         SessionQueueNode::existing_output_next(&engine.runtime, session_queue, tcp_output)?;
     SessionQueueNode::install_worker_attachment(
@@ -422,7 +453,6 @@ fn bind_worker_graph(engine: &mut Engine) -> RuntimeResult<()> {
         .runtime
         .nodes()
         .set_node_state(session_queue, NodeState::Disabled)?;
-    engine.set_worker_node_runtime_data(session_queue, session_queue_data)?;
     engine.set_worker_node_runtime_data(tcp_input, input_data)?;
     engine.set_worker_node_runtime_data(tcp_listen, listen_data)?;
     engine.set_worker_node_runtime_data(tcp_established, established_data)?;
@@ -481,6 +511,8 @@ fn tcp_session_queue_dispatch(
 pub enum TcpNodeError {
     #[error("invalid connection")]
     SessionMissing,
+    #[error("TCP listener is not attached to a Session listener")]
+    SessionListenerMissing,
     #[error("invalid connection")]
     EstablishedSessionMissing,
     #[error("invalid connection")]
@@ -537,6 +569,7 @@ impl From<TcpNodeError> for TcpError {
     fn from(error: TcpNodeError) -> Self {
         match error {
             TcpNodeError::SessionMissing
+            | TcpNodeError::SessionListenerMissing
             | TcpNodeError::EstablishedSessionMissing
             | TcpNodeError::EstablishedSessionRouteMissing
             | TcpNodeError::RcvProcessSessionMissing
@@ -844,14 +877,6 @@ pub(crate) fn closing_session_for_test() -> (
     let local: std::net::SocketAddr = "192.0.2.10:443".parse().expect("local");
     let remote: std::net::SocketAddr = "198.51.100.20:50001".parse().expect("remote");
     let worker = DataWorkerId::new(0);
-    let runtime = hammer_runtime::DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig {
-        buffers: hammer_runtime::DataPlaneBufferConfig {
-            buffer_slot_capacity: 2048,
-            buffer_slots: 4,
-            frame_slots: 4,
-            ..hammer_runtime::DataPlaneBufferConfig::default()
-        },
-    });
     let mut sessions = SessionWorker::new(worker).expect("session worker for test");
     let mut tcp = TcpWorker::new(worker);
     let connection = TcpConnection::established_for_time_wait_test(
@@ -864,8 +889,32 @@ pub(crate) fn closing_session_for_test() -> (
     let connection_index = tcp
         .insert_connection(connection)
         .expect("insert TCP connection");
+    let applications = hammer_service::session::ApplicationMain::new(1);
+    let application = applications.attach().expect("attach test Application");
+    let policy = hammer_runtime::app::AppSessionPolicy::new(
+        hammer_runtime::app::APP_SESSION_POLICY_VERSION,
+        [],
+    )
+    .expect("direct App Session policy is valid");
+    let application_listener = applications
+        .register_listener(application, &policy)
+        .expect("register test Application listener");
+    let session_main = Arc::new(SessionMain::new(1, applications));
+    sessions.set_listener_main(Arc::clone(&session_main));
+    let listener = session_main
+        .listen(
+            application_listener,
+            hammer_runtime::SessionTransportRegistration::with_listener_operations(
+                "test-session",
+                hammer_runtime::app::ORDERED_RELIABLE_BYTE_STREAM,
+                |_, _| Ok(()),
+                |_| Ok(()),
+            ),
+            SessionListenEndpoint::new("127.0.0.1:0".parse().expect("test endpoint"), worker),
+        )
+        .expect("register test Session listener");
     let session_id = sessions
-        .stream_accept(TcpWorker::ID, connection_index, 0)
+        .stream_accept(TcpWorker::ID, connection_index, listener)
         .expect("accept stream session");
     tcp.connection_mut(connection_index)
         .expect("TCP connection")
@@ -978,7 +1027,10 @@ address = "10.0.0.1:7"
         let main = configured_tcp_main(
             config.as_ref(),
             1,
-            Arc::new(SessionMain::new(1)),
+            Arc::new(SessionMain::new(
+                1,
+                hammer_service::session::ApplicationMain::new(1),
+            )),
             RRef::new(&TEST_IP_OUTPUT),
         )
         .expect("build configured TCP main");

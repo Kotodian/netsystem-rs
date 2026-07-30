@@ -30,6 +30,7 @@ use hammer_service::session::SessionId;
 pub(crate) const TCP_MAX_WINDOW_SCALE: u8 = 14;
 const DEFAULT_TCP_WINDOW: u32 = u16::MAX as u32;
 const DEFAULT_TCP_MAX_SEGMENT_SIZE: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
+const IPV4_TCP_BASE_HEADER_BYTES: u16 = 40;
 
 pub const TCP_INITIAL_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(50);
 pub const TCP_MIN_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(50);
@@ -620,7 +621,7 @@ impl TcpConnection {
         if !self.pmtu_enabled {
             return false;
         }
-        let mss = hammer_service::net::pmtu::ipv4_path_mtu_to_mss(path_mtu);
+        let mss = path_mtu.saturating_sub(IPV4_TCP_BASE_HEADER_BYTES).max(1);
         let current = self
             .negotiated_options
             .send_max_segment_size

@@ -1,0 +1,4 @@
+interface:
+  display_name: "VPP Session Event Alignment"
+  short_description: "Align Hammer session events with VPP ownership."
+  default_prompt: "Align this Hammer session change with VPP session event ownership."

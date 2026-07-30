@@ -144,8 +144,14 @@ fn tcp_listen_index(
             TcpError::NoListener
         })?;
     let (control_segment, established_session) = main.with_worker(runtime, |sessions, tcp| {
-        TcpListener::new(sessions, tcp, listener.id, listener.capabilities)
-            .handle_packet(runtime, index, &packet)
+        TcpListener::new(
+            sessions,
+            tcp,
+            listener.id,
+            listener.session_listener,
+            listener.capabilities,
+        )
+        .handle_packet(runtime, index, &packet)
     })?;
 
     if let Some(segment) = control_segment {
@@ -188,6 +194,7 @@ struct TcpListener<'a> {
     sessions: &'a mut SessionWorker<PoolIndex>,
     tcp: &'a mut crate::TcpWorker,
     id: u32,
+    session_listener: Option<hammer_runtime::SessionListenerId>,
     capabilities: TcpCapabilities,
 }
 
@@ -196,12 +203,14 @@ impl<'a> TcpListener<'a> {
         sessions: &'a mut SessionWorker<PoolIndex>,
         tcp: &'a mut crate::TcpWorker,
         id: u32,
+        session_listener: Option<hammer_runtime::SessionListenerId>,
         capabilities: TcpCapabilities,
     ) -> Self {
         Self {
             sessions,
             tcp,
             id,
+            session_listener,
             capabilities,
         }
     }
@@ -467,10 +476,18 @@ impl<'a> TcpListener<'a> {
                 return Err(error);
             }
         };
+        let listener = match self.session_listener {
+            Some(listener) => listener,
+            None => {
+                let _ = self.tcp.remove_connection(connection_index);
+                self.finish_pending(packet);
+                return Err(TcpNodeError::SessionListenerMissing.into());
+            }
+        };
         let session_id = match self.sessions.stream_accept(
             <crate::TcpWorker as SessionTransport<PoolIndex>>::ID,
             connection_index,
-            self.id,
+            listener,
         ) {
             Ok(session_id) => session_id,
             Err(error) => {

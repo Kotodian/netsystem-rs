@@ -57,9 +57,9 @@ struct RecordingState {
 }
 
 #[derive(Clone)]
-struct TcpRecordingTransport(RecordingState);
+struct RecordingTransport(RecordingState);
 
-impl SessionTransport<Index> for TcpRecordingTransport {
+impl SessionTransport<Index> for RecordingTransport {
     type Tx = TransportInternalTx;
 
     const ID: SessionTransportId = SessionTransportId::new(1);
@@ -87,7 +87,7 @@ impl SessionTransport<Index> for TcpRecordingTransport {
         _: &mut super::SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()> {
-        self.0.events.lock().expect("events").push("tcp_time");
+        self.0.events.lock().expect("events").push("transport_time");
         self.0.sampled_times.lock().expect("times").push(now);
         Ok(())
     }
@@ -107,10 +107,11 @@ impl SessionTransport<Index> for TcpRecordingTransport {
     }
 }
 
-impl TransportInternalTransport<Index> for TcpRecordingTransport {
+impl TransportInternalTransport<Index> for RecordingTransport {
     fn internal_tx(
         &mut self,
         _: &mut SessionWorker<Index>,
+        _: crate::session::SessionId,
         _: Index,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
@@ -130,20 +131,16 @@ fn session_queue_updates_transport_before_control_and_io_and_without_events() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let sampled_times = Arc::new(Mutex::new(Vec::new()));
     let mut sessions = SessionWorker::<Index>::new(worker).expect("session worker for test");
-    let mut transport = TcpRecordingTransport(RecordingState {
+    let mut transport = RecordingTransport(RecordingState {
         events: Arc::clone(&events),
         sampled_times: Arc::clone(&sampled_times),
     });
-    let session_id = sessions.insert_session_for_test(TcpRecordingTransport::ID, Index::new(9, 3));
+    let session_id = sessions.insert_session_for_test(RecordingTransport::ID, Index::new(9, 3));
     let app = attach_local_app_session(&mut sessions, session_id);
-    let lower = sessions
-        .local_app()
-        .transport_session(session_id)
-        .cloned()
-        .expect("transport App Session");
-    assert_eq!(lower.rx_fifo().enqueue(b"x"), 1);
-    lower.rx_fifo().want_deq_notification();
-    assert_eq!(lower.consume_rx(1), 1);
+    let session_rx_fifo = Arc::clone(sessions.session_fifos(session_id).expect("Session FIFOs").0);
+    assert_eq!(session_rx_fifo.enqueue(b"x"), 1);
+    session_rx_fifo.want_deq_notification();
+    assert_eq!(session_rx_fifo.dequeue_drop(1), 1);
     app.tx_evt_q()
         .enqueue_io(SessionEvt::io(app.session_index(), SessionEvtType::RxDeq))
         .expect("enqueue rx dequeue");
@@ -158,7 +155,7 @@ fn session_queue_updates_transport_before_control_and_io_and_without_events() {
     assert_eq!(step.scheduled_sessions, 1);
     assert_eq!(
         *events.lock().expect("events"),
-        vec!["tcp_time", "app_rx", "control", "io"]
+        vec!["transport_time", "app_rx", "control", "io"]
     );
     let times = sampled_times.lock().expect("times");
     assert_eq!(times.len(), 1);
@@ -167,7 +164,7 @@ fn session_queue_updates_transport_before_control_and_io_and_without_events() {
     events.lock().expect("events").clear();
     dispatch_session_queue_once(&runtime, owner, &mut sessions, &mut transport, next)
         .expect("dispatch empty queue");
-    assert_eq!(*events.lock().expect("events"), vec!["tcp_time"]);
+    assert_eq!(*events.lock().expect("events"), vec!["transport_time"]);
     assert_eq!(sampled_times.lock().expect("times").len(), 2);
 }
 
@@ -187,7 +184,7 @@ fn attach_local_app_session(
 }
 
 #[test]
-fn session_queue_plaintext_connects_transport_and_application_sessions() {
+fn session_queue_connects_transport_session_directly_to_application() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let mut sessions = SessionWorker::<Index>::with_app_session_config(
         DataWorkerId::new(0),
@@ -196,18 +193,18 @@ fn session_queue_plaintext_connects_transport_and_application_sessions() {
     .expect("session worker");
     let events = Arc::new(Mutex::new(Vec::new()));
     let sampled_times = Arc::new(Mutex::new(Vec::new()));
-    let mut transport = TcpRecordingTransport(RecordingState {
+    let mut transport = RecordingTransport(RecordingState {
         events,
         sampled_times,
     });
-    let session_id = sessions.insert_session_for_test(TcpRecordingTransport::ID, Index::new(10, 1));
+    let session_id = sessions.insert_session_for_test(RecordingTransport::ID, Index::new(10, 1));
     let application = attach_local_app_session(&mut sessions, session_id);
-    let lower = sessions
-        .local_app()
-        .transport_session(session_id)
-        .cloned()
-        .expect("transport App Session");
-    assert!(!Arc::ptr_eq(&application, &lower));
+    let (session_rx_fifo, session_tx_fifo) = {
+        let (rx_fifo, tx_fifo) = sessions.session_fifos(session_id).expect("Session FIFOs");
+        (Arc::clone(rx_fifo), Arc::clone(tx_fifo))
+    };
+    assert!(Arc::ptr_eq(application.rx_fifo(), &session_rx_fifo));
+    assert!(Arc::ptr_eq(application.tx_fifo(), &session_tx_fifo));
     let sink = runtime.nodes().register_internal(BlackholeNode);
     let (owner, next) = test_session_queue_next(&runtime, sink);
 
@@ -223,7 +220,7 @@ fn session_queue_plaintext_connects_transport_and_application_sessions() {
     let mut received = [0_u8; 8];
     assert_eq!(application.recv_bytes(&mut received), 7);
     assert_eq!(&received[..7], b"request");
-    assert_eq!(lower.rx_fifo().max_dequeue(), 0);
+    assert_eq!(session_rx_fifo.max_dequeue(), 7);
     assert_eq!(application.consume_rx(7), 7);
 
     application.send_bytes(b"reply").expect("application TX");
@@ -231,72 +228,44 @@ fn session_queue_plaintext_connects_transport_and_application_sessions() {
         .expect("egress dispatch");
     let mut transmitted = [0_u8; 5];
     assert_eq!(
-        lower.tx_fifo().peek(0, transmitted.len(), &mut transmitted),
+        session_tx_fifo.peek(0, transmitted.len(), &mut transmitted),
         5
     );
     assert_eq!(&transmitted, b"reply");
-    assert_eq!(application.tx_fifo().max_dequeue(), 0);
+    assert_eq!(application.tx_fifo().max_dequeue(), 5);
 }
 
 #[test]
-fn session_queue_plaintext_resumes_after_adjacent_fifo_backpressure() {
-    let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
+fn direct_session_notifies_application_after_tx_space_opens() {
     let mut sessions = SessionWorker::<Index>::with_app_session_config(
         DataWorkerId::new(0),
         hammer_runtime::app::AppSessionConfig::new(8, 16),
     )
     .expect("session worker");
-    let mut transport = TcpRecordingTransport(RecordingState {
-        events: Arc::new(Mutex::new(Vec::new())),
-        sampled_times: Arc::new(Mutex::new(Vec::new())),
-    });
-    let session_id = sessions.insert_session_for_test(TcpRecordingTransport::ID, Index::new(11, 1));
+    let session_id = sessions.insert_session_for_test(RecordingTransport::ID, Index::new(11, 1));
     let application = attach_local_app_session(&mut sessions, session_id);
-    let lower = sessions
-        .local_app()
-        .transport_session(session_id)
-        .cloned()
-        .expect("transport App Session");
-    let sink = runtime.nodes().register_internal(BlackholeNode);
-    let (owner, next) = test_session_queue_next(&runtime, sink);
+    let session_tx_fifo = Arc::clone(sessions.session_fifos(session_id).expect("Session FIFOs").1);
 
-    application.enqueue_rx(b"12345678").expect("fill upper RX");
-    let ingress = runtime
-        .alloc_index_with_bytes(b"ab")
-        .expect("transport RX buffer");
-    sessions
-        .enqueue_rx(runtime.buffers(), session_id, ingress, 0, false)
-        .expect("transport RX enqueue");
-    dispatch_session_queue_once(&runtime, owner, &mut sessions, &mut transport, next)
-        .expect("blocked ingress dispatch");
-    assert_eq!(lower.rx_fifo().max_dequeue(), 2);
-
-    assert_eq!(application.consume_rx(8), 8);
-    dispatch_session_queue_once(&runtime, owner, &mut sessions, &mut transport, next)
-        .expect("resumed ingress dispatch");
-    let mut received = [0_u8; 2];
-    assert_eq!(application.recv_bytes(&mut received), 2);
-    assert_eq!(&received, b"ab");
-    assert_eq!(lower.rx_fifo().max_dequeue(), 0);
-
-    assert_eq!(lower.tx_fifo().enqueue(b"12345678"), 8);
-    application.send_bytes(b"cd").expect("application TX");
-    dispatch_session_queue_once(&runtime, owner, &mut sessions, &mut transport, next)
-        .expect("blocked egress dispatch");
-    assert_eq!(application.tx_fifo().max_dequeue(), 2);
+    assert_eq!(
+        application.send_bytes(b"12345678").expect("fill TX FIFO"),
+        8
+    );
+    application.want_tx_notification();
+    assert_eq!(application.send_bytes(b"cd").expect("full TX FIFO"), 0);
 
     sessions
         .ack_tx_up_to(session_id, 8)
         .expect("transport TX dequeue");
-    dispatch_session_queue_once(&runtime, owner, &mut sessions, &mut transport, next)
-        .expect("resumed egress dispatch");
+    let mut events = [SessionEvt::io(0, SessionEvtType::Connect)];
+    assert_eq!(application.poll_events(&mut events), 1);
+    assert_eq!(events[0].evt_type, SessionEvtType::TxDeq);
+    assert_eq!(application.send_bytes(b"cd").expect("retry TX"), 2);
     let mut transmitted = [0_u8; 2];
     assert_eq!(
-        lower.tx_fifo().peek(0, transmitted.len(), &mut transmitted),
+        session_tx_fifo.peek(0, transmitted.len(), &mut transmitted),
         2
     );
     assert_eq!(&transmitted, b"cd");
-    assert_eq!(application.tx_fifo().max_dequeue(), 0);
 }
 
 struct PayloadCaptureNode {
@@ -372,7 +341,6 @@ fn payload_capture_process(
 }
 
 struct QuicShapedTransport {
-    streams: Arc<Mutex<Vec<crate::session::SessionId>>>,
     observed_fifo_lengths: Arc<Mutex<Vec<usize>>>,
 }
 
@@ -411,6 +379,7 @@ impl TransportInternalTransport<Index> for QuicShapedTransport {
     fn internal_tx(
         &mut self,
         sessions: &mut SessionWorker<Index>,
+        session_id: crate::session::SessionId,
         index: Index,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
@@ -418,30 +387,25 @@ impl TransportInternalTransport<Index> for QuicShapedTransport {
         output: &mut super::SessionQueueOutput,
         _: Instant,
     ) -> RuntimeResult<()> {
-        let streams = self.streams.lock().expect("streams").clone();
-        for session_id in streams {
-            let len = sessions.pending_send_len(session_id)?.unwrap_or(0);
-            self.observed_fifo_lengths
-                .lock()
-                .expect("observed lengths")
-                .push(len);
-            if len != 0 {
-                let buffer = runtime.buffers().alloc_index()?;
-                sessions.copy_tx_to_buffer(runtime.buffers(), session_id, 0, len, buffer)?;
-                if !output.try_enqueue_io(frame, output_next, buffer)? {
-                    break;
-                }
+        let len = sessions.pending_send_len(session_id)?.unwrap_or(0);
+        self.observed_fifo_lengths
+            .lock()
+            .expect("observed lengths")
+            .push(len);
+        if len != 0 {
+            let buffer = runtime.buffers().alloc_index()?;
+            sessions.copy_tx_to_buffer(runtime.buffers(), session_id, 0, len, buffer)?;
+            if output.try_enqueue_io(frame, output_next, buffer)? {
+                sessions.notify_transport_closed(session_id, index)?;
             }
-            sessions.notify_transport_closed(session_id, index)?;
         }
         Ok(())
     }
 }
 
 #[test]
-fn quic_shaped_internal_tx_can_fan_close_out_to_stream_sessions() {
+fn internal_tx_dispatches_each_session_sharing_a_transport_connection_once() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let streams = Arc::new(Mutex::new(Vec::new()));
     let observed_fifo_lengths = Arc::new(Mutex::new(Vec::new()));
     let captured_payloads = Arc::new(Mutex::new(Vec::new()));
     let output = runtime
@@ -451,12 +415,10 @@ fn quic_shaped_internal_tx_can_fan_close_out_to_stream_sessions() {
     let mut sessions =
         SessionWorker::<Index>::new(DataWorkerId::new(0)).expect("session worker for test");
     let mut transport = QuicShapedTransport {
-        streams: Arc::clone(&streams),
         observed_fifo_lengths: Arc::clone(&observed_fifo_lengths),
     };
     let first = sessions.insert_session_for_test(QuicShapedTransport::ID, transport_index);
     let second = sessions.insert_session_for_test(QuicShapedTransport::ID, transport_index);
-    *streams.lock().expect("streams") = vec![first, second];
     let first_app = attach_local_app_session(&mut sessions, first);
     let second_app = attach_local_app_session(&mut sessions, second);
     first_app.send_bytes(b"one").expect("first stream send");
@@ -854,10 +816,12 @@ fn transport_deleted_then_queued_app_close_releases_the_session_slot() {
     let session_id =
         sessions.insert_session_for_test(FailingPacketizedTransport::ID, transport_index);
     let app = attach_local_app_session(&mut sessions, session_id);
-    sessions.notify_transport_deleted(session_id, transport_index);
+    sessions
+        .notify_transport_deleted(session_id, transport_index)
+        .expect("delete transport Session");
     app.tx_evt_q()
         .enqueue_ctrl(SessionEvt::ctrl(
-            session_id.pool_index().slot(),
+            app.session_index(),
             0,
             SessionEvtType::Close,
         ))

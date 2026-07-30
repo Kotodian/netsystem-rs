@@ -207,6 +207,11 @@ impl AppSessionProtocol for Connection {
         source.consume(consumed);
         Ok((consumed, 0))
     }
+
+    #[inline]
+    fn ready(&self) -> bool {
+        !self.connection.is_handshaking()
+    }
 }
 
 #[hammer_component_macros::init_function(name = "tls_init")]

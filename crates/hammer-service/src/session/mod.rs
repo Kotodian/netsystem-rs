@@ -15,9 +15,7 @@ pub mod error;
 pub mod id;
 pub mod node;
 pub mod protocol;
-pub mod protocol_chain;
 pub mod runtime;
-mod stack;
 pub mod state;
 
 pub use app::AppWorker;
@@ -28,10 +26,9 @@ pub use application::{
 };
 pub use config::Session;
 pub use error::SessionQueueError;
-pub use hammer_runtime::app::{AppSessionProtocol, Plaintext};
+pub use hammer_runtime::app::AppSessionProtocol;
 pub use id::SessionId;
-pub use node::{SESSION_QUEUE_IO_BUDGET, SessionQueueNext, SessionQueueNode};
-pub use protocol_chain::{ProtocolChain, ProtocolChainIo};
+pub use node::{AppSessionInputNode, SESSION_QUEUE_IO_BUDGET, SessionQueueNext, SessionQueueNode};
 pub use runtime::SessionWorker;
 
 #[hammer_component_macros::config_function(
@@ -47,9 +44,13 @@ fn configure_session(config: config::NetworkSessionConfig) -> RuntimeResult<Arc<
 }
 
 #[hammer_component_macros::init_function(name = "session_init")]
-fn init_session(engine: &mut Engine) -> RuntimeResult<Arc<runtime::SessionMain>> {
+fn init_session(
+    engine: &mut Engine,
+    applications: Arc<ApplicationMain>,
+) -> RuntimeResult<Arc<runtime::SessionMain>> {
     Ok(Arc::new(runtime::SessionMain::new(
         engine.configured_worker_count(),
+        applications,
     )))
 }
 
@@ -58,9 +59,8 @@ fn init_application(
     engine: &mut Engine,
     session: Arc<Session>,
 ) -> RuntimeResult<Arc<ApplicationMain>> {
-    Ok(ApplicationMain::with_inventory(
+    Ok(ApplicationMain::with_protocols(
         session.app_session_capacity,
-        engine.plugin_main().session_transports(),
         engine.plugin_main().app_session_protocols(),
     ))
 }
@@ -80,7 +80,15 @@ fn init_session_worker(
         .runtime
         .nodes()
         .set_node_state(session_queue, NodeState::Disabled)?;
-    let sessions = if let Some(server) = engine.registry.get::<AppServer>() {
+    let app_session_input = engine
+        .runtime
+        .node_by_name("appsl-rx-mqs-input")
+        .ok_or_else(|| RuntimeError::subsystem("session", error::SessionQueueError::NodeMissing))?;
+    engine
+        .runtime
+        .nodes()
+        .set_node_state(app_session_input, NodeState::Disabled)?;
+    let mut sessions = if let Some(server) = engine.registry.get::<AppServer>() {
         SessionWorker::<PoolIndex>::with_app_session_attach(
             worker,
             engine.configured_worker_count(),
@@ -96,7 +104,8 @@ fn init_session_worker(
             applications,
         )?
     };
-    runtime::install_session_worker(&main, engine, session_queue, sessions)
+    sessions.set_listener_main(Arc::clone(&main));
+    runtime::install_session_worker(&main, engine, app_session_input, session_queue, sessions)
 }
 
 #[hammer_component_macros::init_function(name = "session_attach_server")]

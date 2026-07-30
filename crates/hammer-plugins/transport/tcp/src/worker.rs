@@ -21,7 +21,12 @@ const DEFAULT_TCP_CONNECTION_CAPACITY: usize = 1024;
 const TCP_APP_RX_MIN_FREE: usize = 4 << 10;
 const TCP_APP_RX_MAX_FREE: usize = 128 << 10;
 
-#[hammer_component_macros::session_transport(name = "tcp", upper = "ordered-reliable-byte-stream")]
+#[hammer_component_macros::session_transport(
+    name = "tcp",
+    upper = "ordered-reliable-byte-stream",
+    start_listen = crate::start_listen,
+    stop_listen = crate::stop_listen
+)]
 pub struct TcpWorker {
     pub(crate) connections: Pool<TcpConnection>,
     pub(crate) lookup: TcpLookupState,
@@ -99,7 +104,7 @@ impl TcpWorker {
         self.lookup.forget_session(session_id);
         self.lookup.forget_pending_open(session_id);
         let _ = self.connections.remove(index);
-        sessions.notify_transport_deleted(session_id, index);
+        sessions.notify_transport_deleted(session_id, index)?;
         Ok(())
     }
 

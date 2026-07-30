@@ -69,47 +69,29 @@ impl AppSessionProtocolSelection {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct AppSessionPolicy {
     version: u32,
-    transport: String,
     protocols: Box<[AppSessionProtocolSelection]>,
 }
 
 impl AppSessionPolicy {
     pub fn new(
         version: u32,
-        transport: impl Into<String>,
         protocols: impl IntoIterator<Item = AppSessionProtocolSelection>,
     ) -> Result<Self, AppSessionPolicyError> {
         if version != APP_SESSION_POLICY_VERSION {
             return Err(AppSessionPolicyError::UnsupportedVersion { actual: version });
         }
-        let transport = transport.into();
-        if transport.trim().is_empty() {
-            return Err(AppSessionPolicyError::TransportNameEmpty);
-        }
         let protocols = protocols.into_iter().collect::<Vec<_>>().into_boxed_slice();
-        if protocols.is_empty() {
-            return Err(AppSessionPolicyError::ProtocolSequenceEmpty);
-        }
         for (index, selection) in protocols.iter().enumerate() {
             if selection.protocol.trim().is_empty() {
                 return Err(AppSessionPolicyError::ProtocolNameEmpty { index });
             }
         }
-        Ok(Self {
-            version,
-            transport,
-            protocols,
-        })
+        Ok(Self { version, protocols })
     }
 
     #[inline]
     pub const fn version(&self) -> u32 {
         self.version
-    }
-
-    #[inline]
-    pub fn transport(&self) -> &str {
-        &self.transport
     }
 
     #[inline]
@@ -122,10 +104,6 @@ impl AppSessionPolicy {
 pub enum AppSessionPolicyError {
     #[error("App Session Policy version {actual} is unsupported")]
     UnsupportedVersion { actual: u32 },
-    #[error("App Session Policy Transport name is empty")]
-    TransportNameEmpty,
-    #[error("App Session Policy protocol sequence is empty")]
-    ProtocolSequenceEmpty,
     #[error("App Session Policy protocol at index {index} has an empty name")]
     ProtocolNameEmpty { index: usize },
 }

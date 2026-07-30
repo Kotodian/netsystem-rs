@@ -28,8 +28,8 @@ pub enum SessionMqRing {
 ///
 /// # Identity rules (VPP / ADR-0010)
 ///
-/// - **IO events** (`RxEnq`, `TxDeq`, `RxDeq`): construct with [`SessionEvt::io`]. Only
-///   the session index is significant; worker bits are zero.
+/// - **IO events** (`RxEnq`, `RxDeq`, `TxEnq`, `TxDeq`, `ProtocolOutput`): construct with
+///   [`SessionEvt::io`]. Only the session index is significant; worker bits are zero.
 /// - **Control events** (`Connect`, `Close`): construct with [`SessionEvt::ctrl`].
 ///   Identity is the VPP-shaped Session Handle packing
 ///   `(session_index as u64) | ((worker_index as u64) << 32)`.
@@ -144,11 +144,13 @@ const SESSION_EVT_BYTES: usize = size_of::<SessionEvt>();
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SessionEvtType {
-    RxEnq,
-    TxDeq,
-    Connect,
-    Close,
-    RxDeq,
+    RxEnq = 0,
+    TxDeq = 1,
+    Connect = 2,
+    Close = 3,
+    RxDeq = 4,
+    TxEnq = 5,
+    ProtocolOutput = 6,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,0 +1,4 @@
+interface:
+  display_name: "FIFO Layer Isolation"
+  short_description: "Audit adjacent FIFO protocol layer contracts."
+  default_prompt: "Review this Hammer protocol change for FIFO layer isolation."

@@ -1,5 +1,3 @@
-use std::io::{BufRead, Write};
-
 use hammer_infra::fifo::Fifo;
 use hammer_infra::pool::{Index, Pool};
 use hammer_infra::thread_owned::{ThreadOwned, ThreadOwnedError};
@@ -7,7 +5,7 @@ use thiserror::Error;
 
 use crate::{DataWorkerId, RuntimeError, RuntimeResult};
 
-use super::ApplicationId;
+use super::{ApplicationId, SessionHandle};
 
 /// Session semantics supplied or produced at one protocol boundary.
 pub type AppSessionSemantics = &'static str;
@@ -67,6 +65,12 @@ pub trait AppSessionProtocol: Sized + Send + 'static {
         upper_tx_fifo: &Fifo,
         lower_tx_fifo: &Fifo,
     ) -> RuntimeResult<(usize, usize)>;
+
+    /// Reports whether this connection may expose its upper Session.
+    #[inline]
+    fn ready(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Error)]
@@ -96,8 +100,15 @@ enum AppSessionProtocolConnectionError {
 
 #[doc(hidden)]
 pub struct AppSessionProtocolConnections<P> {
-    workers: Box<[ThreadOwned<Pool<P>>]>,
+    workers: Box<[ThreadOwned<Pool<AppSessionProtocolConnection<P>>>]>,
     capacity: usize,
+}
+
+struct AppSessionProtocolConnection<P> {
+    protocol: P,
+    session_handle: SessionHandle,
+    app_session_handle: SessionHandle,
+    ready: bool,
 }
 
 impl<P> AppSessionProtocolConnections<P>
@@ -119,6 +130,8 @@ where
         worker: DataWorkerId,
         worker_count: usize,
         protocol: P,
+        session_handle: SessionHandle,
+        app_session_handle: SessionHandle,
     ) -> RuntimeResult<AppSessionProtocolConnectionId> {
         let connections = self.worker(worker, worker_count)?;
         match connections.with_mut(|_| ()) {
@@ -133,7 +146,12 @@ where
         connections
             .with_mut(|connections| {
                 connections
-                    .insert(protocol)
+                    .insert(AppSessionProtocolConnection {
+                        protocol,
+                        session_handle,
+                        app_session_handle,
+                        ready: false,
+                    })
                     .map(protocol_connection_id)
                     .ok_or(AppSessionProtocolConnectionError::CapacityExhausted {
                         worker: worker.slot(),
@@ -159,22 +177,23 @@ where
                         worker: worker.slot(),
                         connection,
                     })?;
-                operation(protocol).map_err(ProtocolConnectionOperationError::Operation)
+                operation(&mut protocol.protocol)
+                    .map_err(ProtocolConnectionOperationError::Operation)
             })
             .map_err(|source| protocol_worker_access(worker, source))??)
     }
 
-    pub fn remove(
+    pub fn sessions(
         &self,
         worker: DataWorkerId,
         connection: AppSessionProtocolConnectionId,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeResult<(SessionHandle, SessionHandle)> {
         let connections = self.worker(worker, self.workers.len())?;
         connections
             .with_mut(|connections| {
                 connections
-                    .remove(protocol_connection_index(connection))
-                    .map(drop)
+                    .get(protocol_connection_index(connection))
+                    .map(|connection| (connection.session_handle, connection.app_session_handle))
                     .ok_or(AppSessionProtocolConnectionError::Missing {
                         worker: worker.slot(),
                         connection,
@@ -184,11 +203,55 @@ where
             .map_err(RuntimeError::from)
     }
 
+    pub fn claim_ready(
+        &self,
+        worker: DataWorkerId,
+        connection: AppSessionProtocolConnectionId,
+    ) -> RuntimeResult<bool>
+    where
+        P: AppSessionProtocol,
+    {
+        let connections = self.worker(worker, self.workers.len())?;
+        connections
+            .with_mut(
+                |connections| -> Result<bool, AppSessionProtocolConnectionError> {
+                    let connection = connections
+                        .get_mut(protocol_connection_index(connection))
+                        .ok_or(AppSessionProtocolConnectionError::Missing {
+                            worker: worker.slot(),
+                            connection,
+                        })?;
+                    if connection.ready || !connection.protocol.ready() {
+                        return Ok(false);
+                    }
+                    connection.ready = true;
+                    Ok(true)
+                },
+            )
+            .map_err(|source| protocol_worker_access(worker, source))?
+            .map_err(RuntimeError::from)
+    }
+
+    pub fn remove(&self, worker: DataWorkerId, connection: AppSessionProtocolConnectionId) {
+        let connections = self
+            .workers
+            .get(worker.slot())
+            .expect("App Session protocol connection worker exists");
+        connections
+            .with_mut(|connections| {
+                connections
+                    .remove(protocol_connection_index(connection))
+                    .map(drop)
+                    .expect("App Session protocol connection is removed exactly once");
+            })
+            .expect("App Session protocol connection is removed by its owning Data Worker");
+    }
+
     fn worker(
         &self,
         worker: DataWorkerId,
         worker_count: usize,
-    ) -> RuntimeResult<&ThreadOwned<Pool<P>>> {
+    ) -> RuntimeResult<&ThreadOwned<Pool<AppSessionProtocolConnection<P>>>> {
         if self.workers.len() != worker_count {
             return Err(RuntimeError::from(
                 AppSessionProtocolConnectionError::WorkerCountMismatch {
@@ -284,6 +347,8 @@ pub struct AppSessionProtocolEntry {
         AppSessionProtocolRole,
         Option<u64>,
         Option<&str>,
+        SessionHandle,
+        SessionHandle,
     ) -> RuntimeResult<AppSessionProtocolConnectionId>,
     ingress: fn(
         DataWorkerId,
@@ -297,7 +362,12 @@ pub struct AppSessionProtocolEntry {
         &Fifo,
         &Fifo,
     ) -> RuntimeResult<(usize, usize)>,
-    destroy: fn(DataWorkerId, AppSessionProtocolConnectionId) -> RuntimeResult<()>,
+    claim_ready: fn(DataWorkerId, AppSessionProtocolConnectionId) -> RuntimeResult<bool>,
+    sessions: fn(
+        DataWorkerId,
+        AppSessionProtocolConnectionId,
+    ) -> RuntimeResult<(SessionHandle, SessionHandle)>,
+    destroy: fn(DataWorkerId, AppSessionProtocolConnectionId),
 }
 
 impl AppSessionProtocolEntry {
@@ -314,6 +384,8 @@ impl AppSessionProtocolEntry {
             AppSessionProtocolRole,
             Option<u64>,
             Option<&str>,
+            SessionHandle,
+            SessionHandle,
         ) -> RuntimeResult<AppSessionProtocolConnectionId>,
         ingress: fn(
             DataWorkerId,
@@ -327,13 +399,20 @@ impl AppSessionProtocolEntry {
             &Fifo,
             &Fifo,
         ) -> RuntimeResult<(usize, usize)>,
-        destroy: fn(DataWorkerId, AppSessionProtocolConnectionId) -> RuntimeResult<()>,
+        claim_ready: fn(DataWorkerId, AppSessionProtocolConnectionId) -> RuntimeResult<bool>,
+        sessions: fn(
+            DataWorkerId,
+            AppSessionProtocolConnectionId,
+        ) -> RuntimeResult<(SessionHandle, SessionHandle)>,
+        destroy: fn(DataWorkerId, AppSessionProtocolConnectionId),
     ) -> Self {
         Self {
             registration: AppSessionProtocolRegistration::new(name, lower, upper),
             create,
             ingress,
             egress,
+            claim_ready,
+            sessions,
             destroy,
         }
     }
@@ -352,8 +431,19 @@ impl AppSessionProtocolEntry {
         role: AppSessionProtocolRole,
         id: Option<u64>,
         server_name: Option<&str>,
+        session_handle: SessionHandle,
+        app_session_handle: SessionHandle,
     ) -> RuntimeResult<AppSessionProtocolConnectionId> {
-        (self.create)(worker, worker_count, application, role, id, server_name)
+        (self.create)(
+            worker,
+            worker_count,
+            application,
+            role,
+            id,
+            server_name,
+            session_handle,
+            app_session_handle,
+        )
     }
 
     pub fn ingress(
@@ -376,54 +466,26 @@ impl AppSessionProtocolEntry {
         (self.egress)(worker, connection, upper_tx_fifo, lower_tx_fifo)
     }
 
-    pub fn destroy(
+    #[inline]
+    pub fn claim_ready(
         self,
         worker: DataWorkerId,
         connection: AppSessionProtocolConnectionId,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeResult<bool> {
+        (self.claim_ready)(worker, connection)
+    }
+
+    #[inline]
+    pub fn sessions(
+        self,
+        worker: DataWorkerId,
+        connection: AppSessionProtocolConnectionId,
+    ) -> RuntimeResult<(SessionHandle, SessionHandle)> {
+        (self.sessions)(worker, connection)
+    }
+
+    pub fn destroy(self, worker: DataWorkerId, connection: AppSessionProtocolConnectionId) {
         (self.destroy)(worker, connection)
-    }
-}
-
-/// The App Session protocol that transfers bytes without changing them.
-#[hammer_component_macros::app_session_protocol(
-    name = "plaintext",
-    lower = "ordered-reliable-byte-stream",
-    upper = "ordered-reliable-byte-stream"
-)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Plaintext;
-
-#[doc(hidden)]
-#[inline]
-pub const fn plaintext_protocol_entry() -> AppSessionProtocolEntry {
-    __APP_SESSION_PROTOCOL_PLAINTEXT
-}
-
-impl AppSessionProtocol for Plaintext {
-    fn create(
-        _: Option<ApplicationId>,
-        _: AppSessionProtocolRole,
-        _: Option<u64>,
-        _: Option<&str>,
-    ) -> RuntimeResult<Self> {
-        Ok(Self)
-    }
-
-    fn ingress(
-        &mut self,
-        lower_rx_fifo: &Fifo,
-        upper_rx_fifo: &Fifo,
-    ) -> RuntimeResult<(usize, usize)> {
-        transfer_plaintext(lower_rx_fifo, upper_rx_fifo)
-    }
-
-    fn egress(
-        &mut self,
-        upper_tx_fifo: &Fifo,
-        lower_tx_fifo: &Fifo,
-    ) -> RuntimeResult<(usize, usize)> {
-        transfer_plaintext(upper_tx_fifo, lower_tx_fifo)
     }
 }
 
@@ -435,27 +497,4 @@ fn protocol_connection_id(index: Index) -> AppSessionProtocolConnectionId {
 #[inline]
 fn protocol_connection_index(connection: AppSessionProtocolConnectionId) -> Index {
     Index::new(connection.slot(), connection.generation())
-}
-
-fn transfer_plaintext(source: &Fifo, destination: &Fifo) -> RuntimeResult<(usize, usize)> {
-    if source.max_dequeue() == 0 {
-        return Ok((0, 0));
-    }
-    if destination.max_enqueue() == 0 {
-        destination.want_deq_notification();
-        if destination.max_enqueue() == 0 {
-            return Ok((0, 0));
-        }
-        destination.clear_deq_notification();
-    }
-    let mut source = source;
-    let bytes = source
-        .fill_buf()
-        .map_err(|source| RuntimeError::subsystem("plaintext", source))?;
-    let mut destination = destination;
-    let transferred = destination
-        .write(bytes)
-        .map_err(|source| RuntimeError::subsystem("plaintext", source))?;
-    source.consume(transferred);
-    Ok((transferred, transferred))
 }

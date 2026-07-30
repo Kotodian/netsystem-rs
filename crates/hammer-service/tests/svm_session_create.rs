@@ -78,8 +78,8 @@ fn svm_session_multi_ring_evt_q_io_and_ctrl_round_trip() {
     assert_eq!(out[1].worker_index(), 0);
 
     assert_eq!(session.send_bytes(b"x").expect("send"), 1);
-    let tx = session.tx_evt_q().dequeue().expect("tx deq");
-    assert_eq!(tx.evt_type, SessionEvtType::TxDeq);
+    let tx = session.tx_evt_q().dequeue().expect("tx enqueue");
+    assert_eq!(tx.evt_type, SessionEvtType::TxEnq);
     assert_eq!(tx.session_index(), 3);
 }
 

@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use hammer_infra::segment::Segment;
-use hammer_runtime::app::{AppSession, AppSessionConfig, SessionHandle, SessionMsgQueue};
-use hammer_service::session::{ProtocolChain, ProtocolChainIo};
+use hammer_runtime::app::{
+    AppSession, AppSessionConfig, AppSessionProtocol, SessionHandle, SessionMsgQueue,
+};
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 
@@ -63,23 +64,48 @@ fn transfer_transport(source: &AppSession, destination: &AppSession) -> usize {
     accepted
 }
 
-fn drive<C, S>(
-    client: &mut C,
+fn advance_ingress(
+    connection: &mut Connection,
+    transport: &AppSession,
+    application: &AppSession,
+) -> hammer_runtime::RuntimeResult<()> {
+    loop {
+        let (consumed, produced) =
+            connection.ingress(transport.rx_fifo(), application.rx_fifo())?;
+        if consumed == 0 && produced == 0 {
+            return Ok(());
+        }
+    }
+}
+
+fn advance_egress(
+    connection: &mut Connection,
+    application: &AppSession,
+    transport: &AppSession,
+) -> hammer_runtime::RuntimeResult<()> {
+    loop {
+        let (consumed, produced) = connection.egress(application.tx_fifo(), transport.tx_fifo())?;
+        if consumed == 0 && produced == 0 {
+            return Ok(());
+        }
+    }
+}
+
+fn drive(
+    client: &mut Connection,
+    client_application: &AppSession,
     client_transport: &AppSession,
-    server: &mut S,
+    server: &mut Connection,
+    server_application: &AppSession,
     server_transport: &AppSession,
-) -> usize
-where
-    C: ProtocolChainIo,
-    S: ProtocolChainIo,
-{
+) -> usize {
     let mut transferred = 0;
-    client.egress().expect("client egress");
+    advance_egress(client, client_application, client_transport).expect("client egress");
     transferred += transfer_transport(client_transport, server_transport);
-    server.ingress().expect("server ingress");
-    server.egress().expect("server egress");
+    advance_ingress(server, server_transport, server_application).expect("server ingress");
+    advance_egress(server, server_application, server_transport).expect("server egress");
     transferred += transfer_transport(server_transport, client_transport);
-    client.ingress().expect("client ingress");
+    advance_ingress(client, client_transport, client_application).expect("client ingress");
     transferred
 }
 
@@ -106,29 +132,21 @@ fn rustls_connection_handshakes_and_transfers_both_directions_through_small_fifo
     let server_transport = app_session(3);
     let server_application = app_session(4);
 
-    let client_tls = Connection::client(
+    let mut client = Connection::client(
         client_config,
         ServerName::try_from("localhost").expect("server name"),
     )
     .expect("client connection");
-    let server_tls = Connection::server(server_config).expect("server connection");
-    let mut client = ProtocolChain::new(
-        Arc::clone(&client_application),
-        client_tls,
-        ProtocolChain::transport(Arc::clone(&client_transport)),
-    );
-    let mut server = ProtocolChain::new(
-        Arc::clone(&server_application),
-        server_tls,
-        ProtocolChain::transport(Arc::clone(&server_transport)),
-    );
+    let mut server = Connection::server(server_config).expect("server connection");
 
     let mut request_received = false;
     for _ in 0..256 {
         drive(
             &mut client,
+            &client_application,
             &client_transport,
             &mut server,
+            &server_application,
             &server_transport,
         );
     }
@@ -141,8 +159,10 @@ fn rustls_connection_handshakes_and_transfers_both_directions_through_small_fifo
     for _ in 0..256 {
         drive(
             &mut client,
+            &client_application,
             &client_transport,
             &mut server,
+            &server_application,
             &server_transport,
         );
         if receive(&server_application, request) {
@@ -163,8 +183,10 @@ fn rustls_connection_handshakes_and_transfers_both_directions_through_small_fifo
     for _ in 0..256 {
         drive(
             &mut client,
+            &client_application,
             &client_transport,
             &mut server,
+            &server_application,
             &server_transport,
         );
         if receive(&client_application, response) {
@@ -184,37 +206,30 @@ fn certificate_error_leaves_the_alert_available_for_transport() {
     let client_application = app_session(12);
     let server_transport = app_session(13);
     let server_application = app_session(14);
-    let client_tls = Connection::client(
+    let mut client = Connection::client(
         client_config,
         ServerName::try_from("localhost").expect("server name"),
     )
     .expect("client connection");
-    let server_tls = Connection::server(server_config).expect("server connection");
-    let mut client = ProtocolChain::new(
-        client_application,
-        client_tls,
-        ProtocolChain::transport(Arc::clone(&client_transport)),
-    );
-    let mut server = ProtocolChain::new(
-        server_application,
-        server_tls,
-        ProtocolChain::transport(Arc::clone(&server_transport)),
-    );
+    let mut server = Connection::server(server_config).expect("server connection");
 
     let mut certificate_rejected = false;
     for _ in 0..256 {
-        client.egress().expect("client handshake records");
+        advance_egress(&mut client, &client_application, &client_transport)
+            .expect("client handshake records");
         transfer_transport(&client_transport, &server_transport);
-        server.ingress().expect("server handshake ingress");
-        server.egress().expect("server handshake records");
+        advance_ingress(&mut server, &server_transport, &server_application)
+            .expect("server handshake ingress");
+        advance_egress(&mut server, &server_application, &server_transport)
+            .expect("server handshake records");
         transfer_transport(&server_transport, &client_transport);
-        if client.ingress().is_err() {
+        if advance_ingress(&mut client, &client_transport, &client_application).is_err() {
             certificate_rejected = true;
             break;
         }
     }
     assert!(certificate_rejected);
 
-    client.egress().expect("client TLS alert");
+    advance_egress(&mut client, &client_application, &client_transport).expect("client TLS alert");
     assert_ne!(client_transport.tx_fifo().max_dequeue(), 0);
 }

@@ -17,7 +17,7 @@ use object::{Object, ObjectSection};
 use semver::Version;
 use serde::Deserialize;
 
-use crate::app::{AppSessionProtocolEntry, SessionTransportRegistration};
+use crate::app::AppSessionProtocolEntry;
 use crate::binary_api::BinaryApiMethodEntry;
 use crate::error::RuntimeError;
 use crate::init::{ConfigFunction, InitFunction};
@@ -25,6 +25,7 @@ use crate::node::{NodeEntry, NodeFunctionRegistration};
 use crate::plugin_loader::{PluginLibrary, read_plugin_module};
 use crate::process::ProcessEntry;
 use crate::registration::RegistrationImage;
+use crate::session::SessionTransportRegistration;
 
 /// IP protocol dispatch and header writers exposed to transport plugins.
 ///

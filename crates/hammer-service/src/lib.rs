@@ -24,7 +24,8 @@ hammer_runtime::__declare_registration_image!(
         data_plane::__SERVICE_GRAPH_NODE_HANDOFF_NODE,
         device::__SERVICE_GRAPH_NODE_DEVICE_INPUT_NODE,
         interface::__SERVICE_GRAPH_NODE_INTERFACE_OUTPUT_NODE,
-        session::node::__TCP_WORKER_GRAPH_NODE_SESSION_QUEUE_NODE,
+        session::node::__SESSION_GRAPH_NODE_APP_SESSION_INPUT_NODE,
+        session::node::__SESSION_GRAPH_NODE_SESSION_QUEUE_NODE,
     ];
     node_functions = [];
     process_nodes = [];

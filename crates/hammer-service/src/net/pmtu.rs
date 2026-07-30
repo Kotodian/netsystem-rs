@@ -5,11 +5,8 @@
 //! - Attached neighbors clamp adjacency via `adj_nbr_set_mtu` →
 //!   `rewrite_header.max_l3_packet_bytes`.
 //! - Egress enforces MTU in `ip4_mtu_check` at rewrite (DF → Frag-Needed).
-//! - Core VPP TCP does **not** yet consume ICMP for PMTU (`TODO consider PMTU
-//!   discovery`); Hammer extends that gap by feeding Frag-Needed into this
-//!   same IP-owned update path, then TCP reads the cache to clamp MSS.
-//!
-//! Do not store per-destination MTU inside `TcpConnection`.
+//! - Transport-specific payload limits consume this cache through their own
+//!   protocol-owned policy; this module does not define those limits.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
@@ -19,9 +16,6 @@ use hammer_infra::bihash::Bihash;
 
 /// IPv4 absolute minimum MTU (RFC 791).
 pub const IPV4_MIN_PATH_MTU: u16 = 68;
-
-/// Base IPv4(20) + TCP(20) overhead used when converting path MTU → MSS.
-pub const IPV4_TCP_BASE_OVERHEAD: u16 = 40;
 
 /// Published IP-owned path MTU cache (VPP `ip_pmtu_db` stand-in).
 pub static PATH_MTU_CACHE: ArcSwapOption<PathMtuCache> = ArcSwapOption::const_empty();
@@ -69,12 +63,6 @@ impl PathMtuCache {
             IpAddr::V6(_) => None,
         }
     }
-}
-
-/// Convert an IPv4 path MTU into a TCP MSS using base header overhead.
-#[inline]
-pub fn ipv4_path_mtu_to_mss(path_mtu: u16) -> u16 {
-    path_mtu.saturating_sub(IPV4_TCP_BASE_OVERHEAD).max(1)
 }
 
 /// Publish the process-wide path MTU cache (IP init / tests).

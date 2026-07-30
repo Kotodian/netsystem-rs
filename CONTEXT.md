@@ -270,7 +270,7 @@ Each process owns the readiness handle duplicates it creates for its own event l
 _Avoid_: daemon-owned descriptor across process boundaries, one global readiness owner, session object silently closing another process's handle
 
 **Single App Session Surface**:
-The app-side model has one concrete session abstraction, `AppSession<S>`, for both local and attached storage backends and at every level of an App Session Stack. `AppClient` and session configuration are construction/connection support; a second remote-session or TLS-session facade is not a domain concept.
+The app-side model has one concrete session abstraction, `AppSession<S>`, for both local and attached storage backends. `AppClient` and session configuration are construction/connection support; a second remote-session or TLS-session facade is not a domain concept.
 _Avoid_: parallel local/remote session objects, TLS-specific app session, wrapper-of-wrapper app facades, session lookup context presented as another session type
 
 **Application Listener**:
@@ -278,12 +278,12 @@ An Application-owned accepted-connection destination. The Application fixes its 
 _Avoid_: TCP listener as Application identity, Transport-owned TLS mode, SVM segment key as listener semantics
 
 **App Session Policy**:
-The immutable Transport selection and ordered App Session protocol chain supplied by an Application when it listens or connects. Transport selection is independent from the protocol chain. Session Runtime resolves the registered Transport and protocols before constructing or publishing any session in the App Session Stack. A DSO registers its Transports and App Session protocols internally; the Application does not name or select the containing plugin.
+The immutable ordered App Session protocol selection supplied by an Application when it listens or connects. Application Main resolves this policy once and retains it with the Application Listener or Application Connection. Transport selection is a separate listen/connect decision. A DSO registers its Transport and App Session protocol behavior internally; the Application does not name or select the containing plugin.
 _Avoid_: TCP TLS option, mutable session mode, protocol selection inside AppSession, plugin-selected Application policy
 
-**App Session Stack**:
-An ordered protocol composition fixed when a connection is constructed. `session::ProtocolChain<P, L>` owns the App-facing App Session, one concrete protocol state, and the complete lower chain. Protocol state receives only the source and destination FIFO adjacent to its layer; it neither owns nor inspects the lower chain. Each App Session exchanges only the protocol data of its two adjacent layers, and the innermost App Session connects to transport. Session Runtime schedules the statically composed chain without interpreting or erasing concrete protocol state.
-_Avoid_: App Session driver binding, TLS mode in App Session, protocol-aware FIFO, mutable layer switch, transport-specific app interface
+**App Session Protocol Connection**:
+A worker-owned concrete protocol state created while applying one Application policy selection. Its connection record owns the two Session Handles on which that behavior operates. Each of those Sessions independently owns RX/TX FIFOs and selects the behavior invoked by a Session Event. Application policy order is used only while constructing these Session relationships; Session Worker stores no protocol order, adjacency table, or Application reverse index. FIFO writes produce `RxEnq` or `TxEnq`, capacity release produces `RxDeq` or `TxDeq`, and protocol-state output produces the Session-internal `ProtocolOutput` event. One event resolves one Session pool slot and invokes only that Session's selected behavior.
+_Avoid_: ordered Session container, recursive protocol traversal, whole-Session scan, per-protocol work queue, TLS mode in App Session, protocol-aware FIFO, mutable protocol switch, transport-specific app interface
 
 **Transport Listener**:
 A Transport-owned endpoint lookup registration that accepts Transport Connections and retains Transport-specific capabilities. It routes an accepted connection to an opaque Application Listener identity but neither selects nor interprets the Application's App Session Policy.
@@ -344,7 +344,7 @@ The VPP-shaped app/runtime routing identity for a session: session index plus wo
 _Avoid_: generation-bearing session handle, SessionId-as-app-handle, opaque cookie without worker index
 
 **Session Event**:
-An app↔session Session Message Queue event aligned with VPP `session_event_t`. IO events (`RxEnq` / `TxDeq`) use the IO ring and carry session index only; control Session Events (`Connect` / `Close`) use the CTRL ring and carry a Session Handle. Consume paths drop events whose session slot is free or unmapped. Slot reuse after free may still target a replacement session; that window matches VPP and is not closed by adding generation to the event. These are not worker-local Session Control Events.
+An app↔session or Session-internal Session Message Queue event aligned with VPP `session_event_t`. IO events (`RxEnq`, `RxDeq`, `TxEnq`, `TxDeq`, and `ProtocolOutput`) use the IO ring and carry session index only; control Session Events (`Connect` / `Close`) use the CTRL ring and carry a Session Handle. `ProtocolOutput` is produced and consumed only inside Session Runtime; an external App cannot use it to drive a protocol binding. Consume paths drop events whose session slot is free or unmapped. Slot reuse after free may still target a replacement session; that window matches VPP and is not closed by adding generation to the event. These are not worker-local Session Control Events.
 _Avoid_: generation-safe SessionEvt, Index-in-event as ownership proof, one identity field for every event kind, confusing MQ CTRL-ring events with Session Control Events
 
 **Session Control Event**:
@@ -402,11 +402,11 @@ _Avoid_: all-timer sweep, timer-kind discovery, guessed expired timer
 ## Cryptography
 
 **TLS Connection**:
-An application-selected rustls connection terminated by the trusted Hammer daemon at the App/Session Seam. The Main Thread retains immutable `Arc<ClientConfig>` or `Arc<ServerConfig>` policy while one Data Worker exclusively owns and advances each concrete `rustls::Connection`. Its adjacent lower App Session FIFO carries TLS records, and its adjacent upper App Session FIFO carries the protocol data of the immediately higher layer. Hammer does not implement a TLS state machine, transcript, key schedule, record protection, key registry, or Crypto Engine.
+An application-selected rustls connection terminated by the trusted Hammer daemon at the App/Session Seam. The Main Thread retains immutable `Arc<ClientConfig>` or `Arc<ServerConfig>` policy while one Data Worker exclusively owns and advances each concrete `rustls::Connection`. The plugin connection owns a TLS-record Session Handle and an application-data Session Handle. Hammer does not implement a TLS state machine, transcript, key schedule, record protection, key registry, or Crypto Engine.
 _Avoid_: Hammer TLS state machine, app-process TLS termination, TCP-owned TLS, concrete-transport dependency, TLS-specific App Session, Key Handle, Crypto Context, crypto registry
 
 **TLS FIFO I/O**:
-The worker-local transfer between rustls and the two adjacent App Session FIFOs. `Fifo` implements nonblocking standard `Read`, `BufRead`, and `Write`; TLS records pass directly through `rustls::Connection::read_tls` and `write_tls`, while rustls plaintext `Reader` and `Writer` exchange the current FIFO segment. Bytes accepted into rustls become rustls-owned buffered protocol state and are no longer retained in the source App Session FIFO. Data-Plane Buffers remain below the lower Session at the Packet Graph seam.
+The worker-local transfer between rustls and the TLS-record and application-data Session FIFOs. A protocol operation may borrow only those FIFO segments. It reserves output storage, transforms directly into that reservation, commits the output, and only then consumes input. An error leaves both visible FIFO positions unchanged. Data-Plane Buffers remain on the Transport side of the Session seam.
 _Avoid_: TLS Buffer, FIFO peek retained by TLS, pending FIFO-consumption counter, Data-Plane Buffer between App Sessions, temporary payload vector
 
 **TLS Configuration**:

@@ -247,10 +247,10 @@ impl AppSession {
     /// Transport-side convenience: post a session event to the app's queue.
     /// Used by session runtime on RX enqueue / connect / close.
     ///
-    /// IO events (`RxEnq` / `TxDeq`) carry session index only. `RxDeq` is
-    /// app-to-session only and is rejected here. Control events (`Connect` /
-    /// `Close`) carry the full Session Handle, matching VPP `session_event_t`
-    /// identity rules.
+    /// IO events (`RxEnq`, `TxDeq`, `TxEnq`) carry session index only. `RxDeq`
+    /// is app-to-session only and `ProtocolOutput` is Session-internal; both are
+    /// rejected here. Control events (`Connect` / `Close`) carry the full
+    /// Session Handle, matching VPP `session_event_t` identity rules.
     #[inline]
     pub fn push_event(&self, evt_type: SessionEvtType) -> Result<(), AppSessionError> {
         self.push_event_with_flags(evt_type, SessionEvtFlags::empty())
@@ -263,7 +263,7 @@ impl AppSession {
         flags: SessionEvtFlags,
     ) -> Result<(), AppSessionError> {
         match evt_type {
-            SessionEvtType::RxEnq | SessionEvtType::TxDeq => {
+            SessionEvtType::RxEnq | SessionEvtType::TxDeq | SessionEvtType::TxEnq => {
                 let evt = SessionEvt::io_with_flags(self.handle.session_index(), evt_type, flags);
                 self.evt_q
                     .enqueue_io(evt)
@@ -274,6 +274,9 @@ impl AppSession {
             }
             SessionEvtType::RxDeq => {
                 panic!("RxDeq is an app-to-session event")
+            }
+            SessionEvtType::ProtocolOutput => {
+                panic!("ProtocolOutput is a Session-internal event")
             }
             SessionEvtType::Connect | SessionEvtType::Close => {
                 let evt = SessionEvt::ctrl(
@@ -303,7 +306,7 @@ impl AppSession {
             .tx_evt_q
             .enqueue_io(SessionEvt::io(
                 self.handle.session_index(),
-                SessionEvtType::TxDeq,
+                SessionEvtType::TxEnq,
             ))
             .is_err()
         {
@@ -646,8 +649,8 @@ mod tests {
         assert!(tx_evt_q.dequeue().is_some());
         assert_eq!(session.send_bytes(b"y").expect("retry after drain"), 1);
         assert!(session.tx_fifo().has_event());
-        let evt = tx_evt_q.dequeue().expect("tx deq after retry");
-        assert_eq!(evt.evt_type, SessionEvtType::TxDeq);
+        let evt = tx_evt_q.dequeue().expect("tx enqueue after retry");
+        assert_eq!(evt.evt_type, SessionEvtType::TxEnq);
         assert_eq!(evt.session_index(), 1);
     }
 

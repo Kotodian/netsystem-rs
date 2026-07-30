@@ -49,7 +49,6 @@ fn component_protocol_registration_is_collected_by_plugin_main() {
         .map(|entry| entry.registration().name())
         .collect::<Vec<_>>();
 
-    assert!(names.contains(&"plaintext"));
     assert!(names.contains(&"test-protocol"));
     let registration = plugins
         .app_session_protocol("test-protocol")
@@ -58,13 +57,6 @@ fn component_protocol_registration_is_collected_by_plugin_main() {
     assert_eq!(registration.name(), "test-protocol");
     assert_eq!(registration.lower(), ORDERED_RELIABLE_BYTE_STREAM);
     assert_eq!(registration.upper(), ORDERED_RELIABLE_BYTE_STREAM);
-
-    let plaintext = plugins
-        .app_session_protocol("plaintext")
-        .expect("resolve plaintext protocol")
-        .registration();
-    assert_eq!(plaintext.lower(), ORDERED_RELIABLE_BYTE_STREAM);
-    assert_eq!(plaintext.upper(), ORDERED_RELIABLE_BYTE_STREAM);
 }
 
 #[test]

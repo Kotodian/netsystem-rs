@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Weak};
 
-use hammer_core::data_plane::{DataPlaneBuffers, Index};
 use hammer_infra::align::align_up;
 use hammer_infra::fifo::Fifo;
 use hammer_infra::segment::Segment;
@@ -14,12 +13,11 @@ use hammer_runtime::attach::{AppSessionPublication, AppSessionPublisher};
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use crate::session::SessionId;
-use crate::session::error::SessionError;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AppWorkerError {
-    #[error("session TX event queue configuration rejected: {error:?}")]
-    TxEventQueue { error: SessionMsgQueueError },
+    #[error("session message queue configuration rejected: {error:?}")]
+    SessionEventQueue { error: SessionMsgQueueError },
     #[error("session TX event queue layout exceeds addressable memory")]
     TxEventQueueLayoutOverflow,
     #[error("session TX event queue segment capacity exhausted")]
@@ -56,7 +54,6 @@ pub struct AppWorker {
 #[derive(Clone)]
 struct SessionSlot {
     session_id: SessionId,
-    transport_session: Arc<AppSession>,
     app_session: Arc<AppSession>,
 }
 
@@ -343,16 +340,10 @@ impl AppWorker {
         &self.tx_evt_q
     }
 
-    pub(crate) fn attach_session(
-        &mut self,
-        session_id: SessionId,
-        transport_session: Arc<AppSession>,
-        app_session: Arc<AppSession>,
-    ) {
+    pub(crate) fn attach_session(&mut self, session_id: SessionId, app_session: Arc<AppSession>) {
         let slot = session_id.pool_index().slot() as usize;
         self.session_slots[slot] = Some(SessionSlot {
             session_id,
-            transport_session,
             app_session,
         });
     }
@@ -365,7 +356,8 @@ impl AppWorker {
             .is_some_and(|slot| slot.session_id == session_id)
         {
             let slot = entry.take()?;
-            let attach_slot = std::mem::take(&mut self.attach_slots[index]);
+            let app_session_index = slot.app_session.session_handle().session_index() as usize;
+            let attach_slot = std::mem::take(&mut self.attach_slots[app_session_index]);
             if let Some(owner) = attach_slot.allocation_owner
                 && let Some(manager) = self.segments_by_owner.get_mut(&owner)
             {
@@ -387,14 +379,6 @@ impl AppWorker {
     }
 
     #[inline(always)]
-    pub(crate) fn transport_session(&self, session_id: SessionId) -> Option<&Arc<AppSession>> {
-        self.session_slots
-            .get(session_id.pool_index().slot() as usize)?
-            .as_ref()
-            .and_then(|slot| (slot.session_id == session_id).then_some(&slot.transport_session))
-    }
-
-    #[inline(always)]
     pub(crate) fn app_session(&self, session_id: SessionId) -> Option<&Arc<AppSession>> {
         self.session_slots
             .get(session_id.pool_index().slot() as usize)?
@@ -402,16 +386,7 @@ impl AppWorker {
             .and_then(|slot| (slot.session_id == session_id).then_some(&slot.app_session))
     }
 
-    #[inline(always)]
-    pub(crate) fn session_id(&self, session_index: u32) -> Option<SessionId> {
-        self.session_slots
-            .get(session_index as usize)?
-            .as_ref()
-            .map(|slot| slot.session_id)
-    }
-
     pub fn connected(&mut self, session_id: SessionId) -> RuntimeResult<()> {
-        let index = session_id.pool_index().slot() as usize;
         let Some(session) = self.app_session(session_id).cloned() else {
             return Ok(());
         };
@@ -419,7 +394,7 @@ impl AppWorker {
             .push_event(SessionEvtType::Connect)
             .map_err(RuntimeError::from)?;
         self.notify_evt(&session);
-        let attach_slot = &mut self.attach_slots[index];
+        let attach_slot = &mut self.attach_slots[session.session_handle().session_index() as usize];
         if let (Some(publication), Some(attach)) = (attach_slot.publication.as_ref(), &self.attach)
         {
             attach.publisher.try_publish(publication)?;
@@ -439,209 +414,8 @@ impl AppWorker {
         Ok(())
     }
 
-    pub fn discard_acked_tx_bytes(
-        &mut self,
-        session_id: SessionId,
-        len: usize,
-    ) -> RuntimeResult<bool> {
-        let Some(session) = self.transport_session(session_id) else {
-            return Ok(false);
-        };
-        let dropped = session.drop_tx_acked(len).map_err(RuntimeError::from)?;
-        if dropped != 0 {
-            self.notify_tx(&session);
-        }
-        Ok(dropped != 0)
-    }
-
-    pub fn pending_send_len(&self, session_id: SessionId) -> RuntimeResult<Option<usize>> {
-        Ok(self
-            .transport_session(session_id)
-            .map(|session| session.tx_fifo().max_dequeue())
-            .filter(|len| *len != 0))
-    }
-
-    pub fn rx_available_len(&self, session_id: SessionId) -> Option<usize> {
-        self.transport_session(session_id)
-            .map(|session| session.rx_fifo().max_enqueue())
-    }
-
-    #[inline]
-    pub(crate) fn request_rx_dequeue_notification(&self, session_id: SessionId) {
-        if let Some(session) = self.transport_session(session_id) {
-            session.rx_fifo().want_deq_notification();
-        }
-    }
-
-    #[inline]
-    pub fn has_pending_send(&self, session_id: SessionId) -> bool {
-        self.pending_send_len(session_id).ok().flatten().is_some()
-    }
-
-    pub fn copy_tx_to_buffer(
-        &self,
-        buffers: &DataPlaneBuffers,
-        session_id: SessionId,
-        tx_offset: usize,
-        payload_len: usize,
-        index: Index,
-    ) -> RuntimeResult<()> {
-        let session = self
-            .transport_session(session_id)
-            .ok_or(SessionError::SessionMissing { session_id })?;
-        let written = session
-            .tx_fifo()
-            .peek_segments(tx_offset, payload_len, |first, second| {
-                if !first.is_empty() {
-                    buffers.append(index, first)?;
-                }
-                if !second.is_empty() {
-                    buffers.append(index, second)?;
-                }
-                RuntimeResult::Ok(first.len() + second.len())
-            })
-            .ok_or(SessionError::TxFifoRangeInvalid {
-                session_id,
-                tx_offset,
-                payload_len,
-            })??;
-        if written != payload_len {
-            return Err(SessionError::TxFifoRangeInvalid {
-                session_id,
-                tx_offset,
-                payload_len,
-            }
-            .into());
-        }
-        Ok(())
-    }
-
-    pub fn copy_rx_from_buffer(
-        &self,
-        session_id: SessionId,
-        buffers: &DataPlaneBuffers,
-        index: Index,
-        urgent: bool,
-    ) -> RuntimeResult<(u32, u32)> {
-        let Some(session) = self.transport_session(session_id) else {
-            return Ok((0, 0));
-        };
-        let mut total = 0u32;
-        let mut accepted = 0u32;
-        let mut promoted = 0u32;
-        let mut urgent_pending = urgent;
-        for buffer in buffers.chain(index) {
-            let buffer = buffer?;
-            let chunk = buffer.current();
-            let chunk_len = u32::try_from(chunk.len())
-                .map_err(|_| SessionError::RxLengthOverflow { session_id })?;
-            if accepted == total {
-                let rx_available_before = session.rx_fifo().max_enqueue();
-                if chunk.len() >= rx_available_before {
-                    session.rx_fifo().want_deq_notification();
-                }
-                let flags = if urgent_pending {
-                    urgent_pending = false;
-                    hammer_runtime::app::SessionEvtFlags::URGENT
-                } else {
-                    hammer_runtime::app::SessionEvtFlags::empty()
-                };
-                let wrote = session
-                    .enqueue_rx_with_flags(chunk, flags)
-                    .map_err(RuntimeError::from)?;
-                let accepted_now = wrote.min(chunk.len()).min(rx_available_before);
-                let promoted_now = wrote.saturating_sub(accepted_now);
-                accepted = accepted
-                    .checked_add(accepted_now as u32)
-                    .ok_or(SessionError::RxLengthOverflow { session_id })?;
-                promoted = promoted
-                    .checked_add(promoted_now as u32)
-                    .ok_or(SessionError::RxLengthOverflow { session_id })?;
-            }
-            total = total
-                .checked_add(chunk_len)
-                .ok_or(SessionError::RxLengthOverflow { session_id })?;
-        }
-        if accepted != 0 || promoted != 0 {
-            self.notify_rx(session);
-        }
-        Ok((accepted, promoted))
-    }
-
-    pub fn copy_rx_from_buffer_ooo(
-        &self,
-        session_id: SessionId,
-        buffers: &DataPlaneBuffers,
-        index: Index,
-        offset: u32,
-    ) -> RuntimeResult<(u32, Option<(u32, u32)>)> {
-        let Some(session) = self.transport_session(session_id) else {
-            return Ok((0, None));
-        };
-        let mut total_len = 0u32;
-        let mut accepted = 0u32;
-        let mut newest_start: Option<u32> = None;
-        let mut newest_end: Option<u32> = None;
-        for buf in buffers.chain(index) {
-            let buf = buf?;
-            let current = buf.current();
-            let chunk_offset = offset.checked_add(total_len).ok_or({
-                SessionError::RxOutOfOrderOffsetOverflow {
-                    session_id,
-                    offset,
-                    buffered_len: total_len,
-                }
-            })?;
-            let result = session
-                .rx_fifo()
-                .enqueue_ooo(chunk_offset, current)
-                .map_err(|source| SessionError::RxOutOfOrderEnqueue {
-                    session_id,
-                    offset: chunk_offset,
-                    source,
-                })?;
-            accepted = accepted
-                .checked_add(result.accepted)
-                .ok_or(SessionError::RxLengthOverflow { session_id })?;
-            if let Some(start) = result.start {
-                let end = start
-                    .checked_add(result.len)
-                    .ok_or(SessionError::OooSpanInvalid { session_id })?;
-                newest_start = Some(match newest_start {
-                    Some(existing) => existing.min(start),
-                    None => start,
-                });
-                newest_end = Some(match newest_end {
-                    Some(existing) => existing.max(end),
-                    None => end,
-                });
-            }
-            total_len = total_len
-                .checked_add(current.len() as u32)
-                .ok_or(SessionError::RxLengthOverflow { session_id })?;
-        }
-        let newest = match (newest_start, newest_end) {
-            (Some(start), Some(end)) => Some((
-                start,
-                end.checked_sub(start)
-                    .ok_or(SessionError::OooSpanInvalid { session_id })?,
-            )),
-            _ => None,
-        };
-        Ok((accepted, newest))
-    }
-
-    pub fn discard_all_tx_bytes_for_session(&mut self, session_id: SessionId) {
-        if let Some(session) = self.transport_session(session_id) {
-            let _ = session.drop_tx_acked(session.tx_fifo().max_dequeue());
-        }
-    }
-
-    pub(crate) fn drain_tx_events_to(
-        &self,
-        mut dispatch_event: impl FnMut(SessionId, SessionEvtType),
-    ) -> usize {
-        let mut scheduled = 0usize;
+    pub(crate) fn drain_tx_events_to(&self, mut dispatch_event: impl FnMut(SessionEvt)) -> usize {
+        let mut dispatched = 0usize;
         let mut batch = [SessionEvt::io(0, SessionEvtType::Connect); 64];
         let worker_index = self.worker_index as u32;
         loop {
@@ -654,20 +428,14 @@ impl AppWorker {
                 if evt.evt_type == SessionEvtType::Close && evt.worker_index() != worker_index {
                     continue;
                 }
-                let Some(Some(slot)) = self.session_slots.get(evt.session_index() as usize) else {
-                    continue;
-                };
-                if evt.evt_type == SessionEvtType::TxDeq {
-                    slot.app_session.clear_tx_event();
-                    scheduled += 1;
-                }
-                dispatch_event(slot.session_id, evt.evt_type);
+                dispatch_event(*evt);
+                dispatched += 1;
             }
             if count < batch.len() {
                 break;
             }
         }
-        scheduled
+        dispatched
     }
 }
 
@@ -676,7 +444,7 @@ impl AppWorker {
     pub fn default_local() -> RuntimeResult<Self> {
         let tx_evt_q: Arc<SessionMsgQueue> = Arc::new(
             SessionMsgQueue::with_cfg(2048, 1024)
-                .map_err(|error| AppWorkerError::TxEventQueue { error })?,
+                .map_err(|error| AppWorkerError::SessionEventQueue { error })?,
         );
         Ok(Self::new(1024, tx_evt_q, 0))
     }
@@ -687,29 +455,31 @@ mod tests {
     use super::*;
     use hammer_infra::pool::Index as PoolIndex;
     use hammer_runtime::app::{AppSessionConfig, SessionEvt, SessionEvtType, SessionHandle};
-    use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig};
     use std::sync::Mutex;
 
     #[test]
-    fn drain_drops_events_for_unmapped_session_slot() {
+    fn drain_forwards_events_without_a_root_session_lookup() {
         let app = AppWorker::default_local().expect("app worker");
         app.tx_evt_q()
             .enqueue_ctrl(SessionEvt::ctrl(3, 0, SessionEvtType::Close))
             .expect("enqueue close");
         app.tx_evt_q()
-            .enqueue_io(SessionEvt::io(3, SessionEvtType::TxDeq))
-            .expect("enqueue txdeq");
+            .enqueue_io(SessionEvt::io(3, SessionEvtType::TxEnq))
+            .expect("enqueue tx enqueue");
 
         let dispatched = Mutex::new(Vec::new());
-        let scheduled = app.drain_tx_events_to(|session_id, evt_type| {
+        let dispatched_count = app.drain_tx_events_to(|evt| {
             dispatched
                 .lock()
                 .expect("dispatched")
-                .push((session_id.get(), evt_type));
+                .push((evt.session_index(), evt.evt_type));
         });
 
-        assert_eq!(scheduled, 0);
-        assert!(dispatched.lock().expect("dispatched").is_empty());
+        assert_eq!(dispatched_count, 2);
+        assert_eq!(
+            *dispatched.lock().expect("dispatched"),
+            vec![(3, SessionEvtType::Close), (3, SessionEvtType::TxEnq)]
+        );
     }
 
     #[test]
@@ -725,20 +495,20 @@ mod tests {
             )
             .expect("app session"),
         );
-        app.attach_session(session_id, Arc::clone(&session), session);
+        app.attach_session(session_id, session);
         app.tx_evt_q()
             .enqueue_ctrl(SessionEvt::ctrl(5, 9, SessionEvtType::Close))
             .expect("enqueue close for wrong worker");
 
         let dispatched = Mutex::new(Vec::new());
-        let scheduled = app.drain_tx_events_to(|session_id, evt_type| {
+        let dispatched_count = app.drain_tx_events_to(|evt| {
             dispatched
                 .lock()
                 .expect("dispatched")
-                .push((session_id.get(), evt_type));
+                .push((evt.session_index(), evt.evt_type));
         });
 
-        assert_eq!(scheduled, 0);
+        assert_eq!(dispatched_count, 0);
         assert!(dispatched.lock().expect("dispatched").is_empty());
     }
 
@@ -755,53 +525,23 @@ mod tests {
             )
             .expect("app session"),
         );
-        app.attach_session(session_id, Arc::clone(&session), session);
+        app.attach_session(session_id, session);
         app.tx_evt_q()
             .enqueue_ctrl(SessionEvt::ctrl(5, 0, SessionEvtType::Close))
             .expect("enqueue close");
 
         let dispatched = Mutex::new(Vec::new());
-        app.drain_tx_events_to(|id, evt_type| {
+        app.drain_tx_events_to(|evt| {
             dispatched
                 .lock()
                 .expect("dispatched")
-                .push((id.get(), evt_type));
+                .push((evt.session_index(), evt.evt_type));
         });
 
         assert_eq!(
             *dispatched.lock().expect("dispatched"),
-            vec![(session_id.get(), SessionEvtType::Close)]
+            vec![(5, SessionEvtType::Close)]
         );
-    }
-
-    #[test]
-    fn filling_rx_fifo_arms_app_dequeue_before_rx_notification() {
-        let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-        let mut app = AppWorker::default_local().expect("app worker");
-        let session_id = SessionId::from(PoolIndex::new(5, 1));
-        let session = Arc::new(
-            AppSession::new_in_segment(
-                Segment::default(),
-                AppSessionConfig::new(64, 4),
-                SessionHandle::new(5, 0),
-                app.tx_evt_q().clone(),
-            )
-            .expect("app session"),
-        );
-        app.attach_session(session_id, Arc::clone(&session), Arc::clone(&session));
-        let index = runtime
-            .alloc_index_with_bytes(&[0xab; 64])
-            .expect("RX buffer");
-
-        let delivery = app
-            .copy_rx_from_buffer(session_id, runtime.buffers(), index, false)
-            .expect("copy RX");
-        assert_eq!(delivery, (64, 0));
-        assert_eq!(session.consume_rx(1), 1);
-
-        let event = app.tx_evt_q().dequeue().expect("RX dequeue event");
-        assert_eq!(event.evt_type, SessionEvtType::RxDeq);
-        assert_eq!(event.session_index(), 5);
     }
 
     #[test]
@@ -814,7 +554,7 @@ mod tests {
             let session = app
                 .create_app_session(7, None, handle, config, app.tx_evt_q().clone())
                 .expect("listener session");
-            app.attach_session(session_id, Arc::clone(&session), session);
+            app.attach_session(session_id, session);
         }
 
         assert_eq!(app.segments_by_owner.len(), 1);
@@ -831,7 +571,7 @@ mod tests {
             let session = app
                 .create_app_session(listener, None, handle, config, app.tx_evt_q().clone())
                 .expect("listener session");
-            app.attach_session(session_id, Arc::clone(&session), session);
+            app.attach_session(session_id, session);
         }
 
         assert_eq!(app.segments_by_owner.len(), 2);
@@ -848,7 +588,7 @@ mod tests {
         let session = app
             .create_app_session(7, None, handle, config, app.tx_evt_q().clone())
             .expect("listener session");
-        app.attach_session(session_id, Arc::clone(&session), Arc::clone(&session));
+        app.attach_session(session_id, Arc::clone(&session));
 
         let detached = app.detach_session(session_id).expect("detached session");
         assert_eq!(app.segments_by_owner[&7].retired.len(), 1);
@@ -911,6 +651,9 @@ impl AppWorker {
             .or_insert_with(|| SegmentManager::new(shared_name_prefix))
             .create_session(handle, config, tx_evt_q, tx_event_offset)?;
         let slot = handle.session_index() as usize;
+        if self.attach_slots.len() <= slot {
+            self.attach_slots.resize_with(slot + 1, AttachSlot::default);
+        }
         let publication = if let (Some(attach), Some(application)) = (&self.attach, application) {
             match AppSessionPublication::new(
                 Arc::clone(&created.session),
@@ -936,14 +679,6 @@ impl AppWorker {
             publication,
         };
         Ok(created.session)
-    }
-
-    fn notify_rx(&self, session: &AppSession) {
-        session.evt_q().fire();
-    }
-
-    fn notify_tx(&self, session: &AppSession) {
-        session.tx_evt_q().fire();
     }
 
     fn notify_evt(&self, session: &AppSession) {

@@ -87,6 +87,7 @@ impl TransportInternalTransport<Index> for RecordingTransport {
     fn internal_tx(
         &mut self,
         _: &mut SessionWorker<Index>,
+        _: hammer_service::session::SessionId,
         _: Index,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,

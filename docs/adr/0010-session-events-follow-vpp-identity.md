@@ -23,16 +23,29 @@ from the session-owned RX FIFO. It follows VPP's `SESSION_IO_EVT_RX` path:
    Runtime to re-arm the FIFO; at or above the threshold it emits a pure
    window-update ACK through the existing Session Queue Graph Fanout.
 
-`TxDeq` remains the opposite-direction event: app TX data is ready for Session
-Runtime to packetize. It must not be reused for RX-space recovery.
+`TxEnq` is the opposite-direction event: bytes were enqueued into a TX FIFO and
+the exact consumer Session should run. That Session dispatches its selected
+Transport or App Session protocol behavior. `TxDeq` reports that TX FIFO
+capacity was released and dispatches the Application behavior selected by that
+same Session. Neither TX event is reused for RX-space recovery, and Session
+Worker does not walk or scan a protocol composition.
+
+`ProtocolOutput` is a Session-internal IO event for protocol state that may
+have produced reverse-direction output without an application TX FIFO enqueue, such
+as TLS handshake records after record ingress. It targets one exact Session
+and invokes the protocol connection selected by that Session.
+It is not accepted from an external App and is not a substitute for a real
+`TxEnq` after bytes become visible in a TX FIFO.
 
 ## Layer contract
 
-- `hammer-runtime::app` owns shared FIFO dequeue notification and IO-event
-  publication. It may report `RxDeq`; it must not inspect transport state.
+- `hammer-runtime::app` owns shared FIFO enqueue/dequeue notification and
+  IO-event publication. It may report `RxDeq`, `TxEnq`, and `TxDeq`; it must
+  not inspect transport state or protocol ordering.
 - `hammer-service::session` owns RX FIFO capacity, notification arming, worker
-  event delivery, and Session Queue scheduling. It may pass capacity facts to a
-  transport; it must not inspect TCP windows or construct TCP segments.
+  event delivery, `ProtocolOutput`, and Session Queue scheduling. It may pass
+  capacity facts to a transport; it must not inspect TCP windows or construct
+  TCP segments.
 - A `SessionTransport` owns protocol decisions following `app_rx_evt`. It may
   request another notification or emit protocol output through the supplied
   Session Queue output capability; it must not retain app/FIFO pointers or
@@ -41,7 +54,7 @@ Runtime to packetize. It must not be reused for RX-space recovery.
   `clamp(fifo_size / 8, 4 KiB, 128 KiB)` reopening threshold, receive-window
   state, and the window-update ACK.
 
-The production API additions for this chain are limited to
+The production interface additions for this dispatch are limited to
 `SessionEvtType::RxDeq` and `SessionTransport::app_rx_evt`.
 
 ## Verification

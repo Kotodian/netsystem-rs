@@ -4,11 +4,12 @@
 //! collects its registrations after dependency-ordered loading. No DSO load
 //! constructor, destructor, global registry, or synchronization is involved.
 
-use crate::app::{AppSessionProtocolEntry, SessionTransportRegistration};
+use crate::app::AppSessionProtocolEntry;
 use crate::binary_api::BinaryApiMethodEntry;
 use crate::init::{ConfigFunction, InitFunction};
 use crate::node::{NodeEntry, NodeFunctionRegistration};
 use crate::process::ProcessEntry;
+use crate::session::SessionTransportRegistration;
 use abi_stable::StableAbi;
 
 /// The existing registration catalog for one link image.

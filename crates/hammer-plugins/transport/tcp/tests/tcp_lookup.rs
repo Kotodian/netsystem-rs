@@ -18,6 +18,7 @@ fn tcp_lookup_returns_owner_worker_for_ipv4_listener() {
         listener_key,
         TcpLookupValue {
             id: 10,
+            session_listener: None,
             owner_worker: DataWorkerId::new(3),
             capabilities: TcpCapabilities::default(),
         },
@@ -41,6 +42,7 @@ fn tcp_lookup_returns_owner_worker_for_ipv6_listener() {
         listener_key,
         TcpLookupValue {
             id: 101,
+            session_listener: None,
             owner_worker: DataWorkerId::new(11),
             capabilities: TcpCapabilities::default(),
         },
@@ -67,6 +69,7 @@ fn tcp_lookup_listener_table_grows_beyond_initial_listener_count() {
                 TcpV4ListenerKey::new(0, Ipv4Addr::new(192, 0, 2, 10), 10_000 + id as u16),
                 TcpLookupValue {
                     id,
+                    session_listener: None,
                     owner_worker: DataWorkerId::new(id),
                     capabilities: TcpCapabilities::default(),
                 },

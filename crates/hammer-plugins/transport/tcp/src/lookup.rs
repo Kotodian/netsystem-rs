@@ -8,7 +8,7 @@ use crate::{TcpCapabilities, TcpConnectionId, TcpFastOpenCookie, TcpTimestampOpt
 use crossbeam_utils::CachePadded;
 use hammer_infra::bihash::{Bihash, BihashKey, FREE_U64};
 use hammer_infra::pool::{Index as PoolIndex, Pool};
-use hammer_runtime::DataWorkerId;
+use hammer_runtime::{DataWorkerId, SessionListenerId};
 
 use crate::{TcpConnection, TcpInputNext, TcpState, TransportConnectionKey};
 use hammer_service::session::SessionId;
@@ -151,6 +151,7 @@ impl TcpPendingRouteEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpLookupValue {
     pub id: TcpLookupId,
+    pub session_listener: Option<SessionListenerId>,
     pub owner_worker: DataWorkerId,
     pub capabilities: TcpCapabilities,
 }
@@ -1839,6 +1840,7 @@ impl TcpLookupState {
     fn value(&self, id: TcpLookupId, capabilities: TcpCapabilities) -> TcpLookupValue {
         TcpLookupValue {
             id,
+            session_listener: None,
             owner_worker: self.owner_worker,
             capabilities,
         }
@@ -2130,6 +2132,7 @@ mod tests {
         let key = TcpV4ListenerKey::new(0, Ipv4Addr::new(127, 0, 0, 1), 7300);
         let value = TcpLookupValue {
             id: 7,
+            session_listener: None,
             owner_worker: DataWorkerId::new(2),
             capabilities: TcpCapabilities {
                 max_segment_size: Some(1200),

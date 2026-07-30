@@ -1,0 +1,4 @@
+interface:
+  display_name: "Session Transport Decoupling"
+  short_description: "Keep app policy separate from transport plugins."
+  default_prompt: "Decouple this Hammer session design from transport ownership."

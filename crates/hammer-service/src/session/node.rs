@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::sync::Arc;
 use std::time::Instant;
 
 use hammer_core::data_plane::{BufferFrame, Index, NodeId, NodeRegistration};
@@ -8,9 +9,83 @@ use hammer_runtime::{
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use crate::session::SessionQueueError;
+use crate::session::runtime::{SessionMain, SessionWorker};
 
 /// Shared Session Queue IO allowance for normal and custom TX in one dispatch.
 pub const SESSION_QUEUE_IO_BUDGET: usize = 128;
+
+#[hammer_component_macros::graph_node(
+    graph = session,
+    init = crate::session::node::register_app_session_input_node,
+    name = "appsl-rx-mqs-input",
+    kind = driver,
+)]
+#[derive(Clone, Copy, Default)]
+pub struct AppSessionInputNode;
+
+pub fn register_app_session_input_node(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+    if let Some(node) = runtime.nodes().node_by_name("appsl-rx-mqs-input") {
+        return Ok(node);
+    }
+    runtime.nodes().try_register_driver(AppSessionInputNode)
+}
+
+impl AppSessionInputNode {
+    pub fn worker_runtime_data(
+        session_queue_data: NodeRuntimeData,
+        session_queue: NodeId,
+    ) -> NodeRuntimeData {
+        NodeRuntimeData::from_words([
+            session_queue_data.word(0),
+            u64::from(session_queue.slot()),
+            0,
+            0,
+        ])
+    }
+}
+
+impl Node for AppSessionInputNode {
+    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
+        app_session_input_node_process(runtime, NodeRuntimeData::empty(), frame)
+    }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        app_session_input_node_process
+    }
+}
+
+impl DriverNode for AppSessionInputNode {
+    #[inline]
+    fn node_registration(&self) -> NodeRegistration
+    where
+        Self: Sized,
+    {
+        NodeRegistration::next("appsl-rx-mqs-input", 0)
+    }
+}
+
+fn app_session_input_node_process(
+    runtime: &DataPlaneRuntime,
+    data: NodeRuntimeData,
+    _: &mut BufferFrame,
+) -> NodeResult {
+    let result = (|| {
+        let handled = SessionQueueNode::poll_app(runtime, data)?;
+        if handled != 0 {
+            let session_queue = NodeId::new(
+                u32::try_from(data.word(1))
+                    .expect("Session Queue node identity is stored as a u32"),
+            );
+            let _ = runtime.set_node_interrupt_pending(session_queue)?;
+        }
+        Ok::<(), RuntimeError>(())
+    })();
+    if result.is_err() {
+        let _ = runtime.record_current_node_error(SessionQueueError::DispatchFailed.code());
+    }
+    NodeResult::drop()
+}
 
 /// Current-node-local next slot for Session Queue generated output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,7 +183,7 @@ struct SessionQueueAttachment {
 }
 
 #[hammer_component_macros::graph_node(
-    graph = tcp_worker,
+    graph = session,
     init = crate::session::node::register_session_queue_node,
     name = "session-queue",
     kind = driver,
@@ -119,7 +194,7 @@ pub struct SessionQueueNode {
 }
 
 thread_local! {
-    static SESSION_QUEUE_NODES: RefCell<Vec<Vec<SessionQueueAttachment>>> =
+    static SESSION_QUEUE_NODES: RefCell<Vec<(Option<Arc<SessionMain>>, Vec<SessionQueueAttachment>)>> =
         const { RefCell::new(Vec::new()) };
 }
 
@@ -137,8 +212,60 @@ impl SessionQueueNode {
             let mut nodes = nodes.borrow_mut();
             let slot = nodes.len();
             let runtime_data = NodeRuntimeData::from_usize(slot)?;
-            nodes.push(Vec::new());
+            nodes.push((None, Vec::new()));
             Ok(Self { runtime_data })
+        })
+    }
+
+    pub fn install_worker_session(
+        runtime_data: NodeRuntimeData,
+        main: Arc<SessionMain>,
+    ) -> RuntimeResult<()> {
+        let slot = runtime_data.usize_word(0)?;
+        SESSION_QUEUE_NODES.with(|nodes| {
+            let mut nodes = nodes
+                .try_borrow_mut()
+                .map_err(|_| SessionQueueError::AttachmentRegistryBorrowed)?;
+            let (session, _) = nodes
+                .get_mut(slot)
+                .ok_or(SessionQueueError::AttachmentSlotMissing { slot })?;
+            *session = Some(main);
+            Ok(())
+        })
+    }
+
+    fn poll_app(runtime: &DataPlaneRuntime, runtime_data: NodeRuntimeData) -> RuntimeResult<usize> {
+        let slot = runtime_data.usize_word(0)?;
+        SESSION_QUEUE_NODES.with(|nodes| {
+            let nodes = nodes
+                .try_borrow()
+                .map_err(|_| SessionQueueError::AttachmentRegistryBorrowed)?;
+            let (session, _) = nodes
+                .get(slot)
+                .ok_or(SessionQueueError::AttachmentSlotMissing { slot })?;
+            let session = session
+                .as_ref()
+                .ok_or(SessionQueueError::AttachmentSlotMissing { slot })?;
+            session.with_worker_mut(runtime, SessionWorker::poll_app)
+        })
+    }
+
+    fn poll_session_events(
+        runtime: &DataPlaneRuntime,
+        runtime_data: NodeRuntimeData,
+    ) -> RuntimeResult<()> {
+        let slot = runtime_data.usize_word(0)?;
+        SESSION_QUEUE_NODES.with(|nodes| {
+            let nodes = nodes
+                .try_borrow()
+                .map_err(|_| SessionQueueError::AttachmentRegistryBorrowed)?;
+            let (session, _) = nodes
+                .get(slot)
+                .ok_or(SessionQueueError::AttachmentSlotMissing { slot })?;
+            let Some(session) = session.as_ref() else {
+                return Ok(());
+            };
+            session.with_worker_mut(runtime, |sessions| sessions.poll_session_events().map(drop))
         })
     }
 
@@ -197,13 +324,13 @@ impl SessionQueueNode {
             let mut nodes = nodes
                 .try_borrow_mut()
                 .map_err(|_| SessionQueueError::AttachmentRegistryBorrowed)?;
-            let node =
+            let (_, attachments) =
                 nodes
                     .get_mut(attachment_slot)
                     .ok_or(SessionQueueError::AttachmentSlotMissing {
                         slot: attachment_slot,
                     })?;
-            node.push(SessionQueueAttachment {
+            attachments.push(SessionQueueAttachment {
                 output_next,
                 dispatch,
             });
@@ -249,11 +376,15 @@ fn session_queue_node_process(
     };
     let now = Instant::now();
     let mut output = SessionQueueOutput::default();
+    if SessionQueueNode::poll_session_events(runtime, data).is_err() {
+        let _ = runtime.record_current_node_error(SessionQueueError::DispatchFailed.code());
+        return NodeResult::drop();
+    }
     let mut index = 0usize;
     loop {
         let attachment = SESSION_QUEUE_NODES.with(|nodes| {
             let nodes = nodes.try_borrow().ok()?;
-            nodes.get(slot)?.get(index).copied()
+            nodes.get(slot)?.1.get(index).copied()
         });
         let Some(attachment) = attachment else { break };
         if (attachment.dispatch)(
