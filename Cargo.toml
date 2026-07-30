@@ -76,6 +76,7 @@ rustls = { version = "=0.23.31", default-features = false, features = ["ring", "
 criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
 linkme = "0.3"
 petgraph = "0.6"
+prost = "0.14.4"
 clap = "4"
 bincode = "1"
 libmimalloc-sys = { version = "0.1.49", features = ["arena", "extended"] }

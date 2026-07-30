@@ -4,6 +4,8 @@
 //! collects its registrations after dependency-ordered loading. No DSO load
 //! constructor, destructor, global registry, or synchronization is involved.
 
+use crate::app::{AppSessionProtocolEntry, SessionTransportRegistration};
+use crate::binary_api::BinaryApiMethodEntry;
 use crate::init::{ConfigFunction, InitFunction};
 use crate::node::{NodeEntry, NodeFunctionRegistration};
 use crate::process::ProcessEntry;
@@ -27,6 +29,9 @@ pub struct RegistrationImage {
     graph_nodes: &'static [NodeEntry],
     node_functions: &'static [NodeFunctionRegistration],
     process_nodes: &'static [ProcessEntry],
+    session_transports: &'static [SessionTransportRegistration],
+    app_session_protocols: &'static [AppSessionProtocolEntry],
+    binary_api_methods: &'static [BinaryApiMethodEntry],
 }
 
 impl RegistrationImage {
@@ -42,6 +47,9 @@ impl RegistrationImage {
         graph_nodes: &'static [NodeEntry],
         node_functions: &'static [NodeFunctionRegistration],
         process_nodes: &'static [ProcessEntry],
+        session_transports: &'static [SessionTransportRegistration],
+        app_session_protocols: &'static [AppSessionProtocolEntry],
+        binary_api_methods: &'static [BinaryApiMethodEntry],
     ) -> Self {
         Self {
             init_functions,
@@ -53,6 +61,9 @@ impl RegistrationImage {
             graph_nodes,
             node_functions,
             process_nodes,
+            session_transports,
+            app_session_protocols,
+            binary_api_methods,
         }
     }
 
@@ -99,6 +110,21 @@ impl RegistrationImage {
     pub(crate) fn process_nodes(&self) -> &'static [ProcessEntry] {
         self.process_nodes
     }
+
+    #[inline]
+    pub(crate) fn session_transports(&self) -> &'static [SessionTransportRegistration] {
+        self.session_transports
+    }
+
+    #[inline]
+    pub(crate) fn app_session_protocols(&self) -> &'static [AppSessionProtocolEntry] {
+        self.app_session_protocols
+    }
+
+    #[inline]
+    pub(crate) fn binary_api_methods(&self) -> &'static [BinaryApiMethodEntry] {
+        self.binary_api_methods
+    }
 }
 
 #[doc(hidden)]
@@ -115,6 +141,9 @@ macro_rules! __declare_registration_image {
             graph_nodes = [];
             node_functions = [];
             process_nodes = [];
+            session_transports = [];
+            app_session_protocols = [];
+            binary_api_methods = [];
         );
     };
     (
@@ -127,6 +156,9 @@ macro_rules! __declare_registration_image {
         graph_nodes = [$($graph_node:path),* $(,)?];
         node_functions = [$($node_function:path),* $(,)?];
         process_nodes = [$($process_node:path),* $(,)?];
+        session_transports = [$($session_transport:path),* $(,)?];
+        app_session_protocols = [$($app_session_protocol:path),* $(,)?];
+        binary_api_methods = [$($binary_api_method:path),* $(,)?];
     ) => {
         static __HAMMER_REGISTRATION_IMAGE: $crate::__private::RegistrationImage =
             $crate::__private::RegistrationImage::new(
@@ -139,6 +171,9 @@ macro_rules! __declare_registration_image {
                 &[$($graph_node),*],
                 &[$($node_function),*],
                 &[$($process_node),*],
+                &[$($session_transport),*],
+                &[$($app_session_protocol),*],
+                &[$($binary_api_method),*],
             );
     };
 }

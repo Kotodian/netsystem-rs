@@ -1,6 +1,7 @@
 use hammer_core::data_plane::NodeId;
 use hammer_infra::fifo::FifoError;
 use hammer_runtime::RuntimeError;
+use hammer_runtime::app::ApplicationConnectionId;
 use thiserror::Error;
 
 use super::SessionId;
@@ -107,6 +108,18 @@ pub(crate) enum SessionError {
     OooSpanMissing { session_id: SessionId },
     #[error("session {session_id:?} accepted OOO delivery reported an invalid span")]
     OooSpanInvalid { session_id: SessionId },
+    #[error(
+        "Application connection {connection:?} requires an Application Main on this Data Worker"
+    )]
+    ApplicationMainMissingForConnection { connection: ApplicationConnectionId },
+    #[error(
+        "Application connection {connection:?} selected Session Transport `{selected}` but `{actual}` opened the connection"
+    )]
+    ConnectionTransportSelectionMismatch {
+        connection: ApplicationConnectionId,
+        selected: &'static str,
+        actual: &'static str,
+    },
 }
 
 impl From<SessionError> for RuntimeError {

@@ -23,6 +23,9 @@ hammer_runtime::__declare_registration_image!(
         __PROCESS_NODE_PANICKING_PROCESS_RUNTIME_TEST,
         __PROCESS_NODE_PROCESS_RUNTIME_TEST,
     ];
+    session_transports = [];
+    app_session_protocols = [];
+    binary_api_methods = [];
 );
 
 static OBSERVED_THREADS: OnceLock<Mutex<Vec<ThreadId>>> = OnceLock::new();

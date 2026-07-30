@@ -15,6 +15,9 @@ hammer_runtime::__declare_registration_image!(
     graph_nodes = [];
     node_functions = [];
     process_nodes = [];
+    session_transports = [];
+    app_session_protocols = [];
+    binary_api_methods = [];
 );
 
 static EXIT_CALLS: AtomicUsize = AtomicUsize::new(0);

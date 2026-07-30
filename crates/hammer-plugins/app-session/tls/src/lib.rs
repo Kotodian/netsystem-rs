@@ -10,9 +10,18 @@ use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
 use hammer_infra::fifo::Fifo;
+use hammer_runtime::app::{AppSessionProtocol, AppSessionProtocolRole, ApplicationId};
 use hammer_runtime::{RuntimeError, RuntimeResult};
-use hammer_service::session::AppSessionProtocol;
 use rustls::pki_types::ServerName;
+
+mod config;
+
+pub use config::{
+    ClientConfig, ConfigError, ConfigId, RegisterClientConfigReply, RegisterClientConfigRequest,
+    RegisterServerConfigReply, RegisterServerConfigRequest, RemoveConfigReply, RemoveConfigRequest,
+    ServerConfig, TlsApiStatus, TlsMain, register_client_config, register_server_config,
+    remove_config,
+};
 
 #[derive(Debug, thiserror::Error)]
 enum Error {
@@ -44,6 +53,11 @@ enum Error {
 }
 
 /// A TLS connection owned and advanced by one Data Worker.
+#[hammer_component_macros::app_session_protocol(
+    name = "tls",
+    lower = "ordered-reliable-byte-stream",
+    upper = "ordered-reliable-byte-stream"
+)]
 #[derive(Debug)]
 pub struct Connection {
     connection: rustls::Connection,
@@ -55,11 +69,10 @@ impl Connection {
     pub fn client(
         config: Arc<rustls::ClientConfig>,
         server_name: ServerName<'static>,
-        buffer_limit: usize,
     ) -> Result<Self, rustls::Error> {
         let mut connection =
             rustls::Connection::Client(rustls::ClientConnection::new(config, server_name)?);
-        connection.set_buffer_limit(Some(buffer_limit));
+        connection.set_buffer_limit(Some(config::TLS_BUFFER_LIMIT));
         Ok(Self {
             connection,
             peer_closed: false,
@@ -67,12 +80,9 @@ impl Connection {
     }
 
     /// Creates a server connection from Main Thread-owned configuration.
-    pub fn server(
-        config: Arc<rustls::ServerConfig>,
-        buffer_limit: usize,
-    ) -> Result<Self, rustls::Error> {
+    pub fn server(config: Arc<rustls::ServerConfig>) -> Result<Self, rustls::Error> {
         let mut connection = rustls::Connection::Server(rustls::ServerConnection::new(config)?);
-        connection.set_buffer_limit(Some(buffer_limit));
+        connection.set_buffer_limit(Some(config::TLS_BUFFER_LIMIT));
         Ok(Self {
             connection,
             peer_closed: false,
@@ -91,6 +101,34 @@ impl Connection {
 }
 
 impl AppSessionProtocol for Connection {
+    fn create(
+        application: Option<ApplicationId>,
+        role: AppSessionProtocolRole,
+        id: Option<u64>,
+        server_name: Option<&str>,
+    ) -> RuntimeResult<Self> {
+        let application = application.ok_or(config::ConfigError::ApplicationRequired)?;
+        let config_id = id
+            .map(config::ConfigId::from_raw)
+            .ok_or(config::ConfigError::ConfigurationRequired)?;
+        match role {
+            AppSessionProtocolRole::Client => {
+                let server_name = server_name.ok_or(config::ConfigError::ServerNameRequired)?;
+                let server_name = ServerName::try_from(server_name.to_owned())
+                    .map_err(|_| config::ConfigError::ServerNameInvalid)?;
+                Self::client(
+                    config::main()?.client_config(application, config_id)?,
+                    server_name,
+                )
+                .map_err(|source| RuntimeError::subsystem("tls", source))
+            }
+            AppSessionProtocolRole::Server => {
+                Self::server(config::main()?.server_config(application, config_id)?)
+                    .map_err(|source| RuntimeError::subsystem("tls", source))
+            }
+        }
+    }
+
     fn ingress(
         &mut self,
         lower_rx_fifo: &Fifo,
@@ -171,10 +209,15 @@ impl AppSessionProtocol for Connection {
     }
 }
 
+#[hammer_component_macros::init_function(name = "tls_init")]
+fn init_tls() -> RuntimeResult<Arc<TlsMain>> {
+    config::init()
+}
+
 hammer_component_macros::declare_plugin!(
     name = "tls",
     load_after = [],
-    init_functions = [],
+    init_functions = [__INIT_FN_TLS_INIT],
     config_functions = [],
     early_config_functions = [],
     main_loop_enter_functions = [],
@@ -183,4 +226,10 @@ hammer_component_macros::declare_plugin!(
     graph_nodes = [],
     node_functions = [],
     process_nodes = [],
+    app_session_protocols = [__APP_SESSION_PROTOCOL_CONNECTION],
+    binary_api_methods = [
+        config::__BINARY_API_REGISTER_SERVER_CONFIG_API,
+        config::__BINARY_API_REGISTER_CLIENT_CONFIG_API,
+        config::__BINARY_API_REMOVE_CONFIG_API,
+    ],
 );

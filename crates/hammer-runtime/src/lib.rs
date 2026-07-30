@@ -4,6 +4,7 @@ mod registration;
 
 #[doc(hidden)]
 pub mod __private {
+    pub use crate::binary_api::{BinaryApiContext, BinaryApiMethodEntry, BinaryApiMethodReply};
     pub use crate::registration::RegistrationImage;
     pub use abi_stable::RRef;
     pub use abi_stable::export_root_module;
@@ -21,6 +22,9 @@ crate::__declare_registration_image!(
     graph_nodes = [];
     node_functions = [];
     process_nodes = [];
+    session_transports = [];
+    app_session_protocols = [app::__APP_SESSION_PROTOCOL_PLAINTEXT];
+    binary_api_methods = [];
 );
 
 pub(crate) fn builtin_registration_image() -> &'static registration::RegistrationImage {
@@ -34,6 +38,7 @@ pub mod config;
 pub mod file;
 pub use file::{File, FileFunction, FileFunctions, FileMain};
 pub mod barrier;
+pub mod binary_api;
 pub mod init;
 pub mod log;
 pub mod main_loop;

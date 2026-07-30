@@ -23,6 +23,9 @@ hammer_runtime::__declare_registration_image!(
         __NODE_FUNCTION_MULTIARCH_PROCESS_SIMD512,
     ];
     process_nodes = [];
+    session_transports = [];
+    app_session_protocols = [];
+    binary_api_methods = [];
 );
 
 static DISPATCH_COUNT: AtomicU64 = AtomicU64::new(0);

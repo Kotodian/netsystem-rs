@@ -197,21 +197,77 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
 
     let listener = pool.take_ipc_listener().expect("IPC listener configured");
     let attach_server = registry.get::<AppServer>();
+    let binary_api = registry.get::<hammer_service::binary_api::BinaryApiMain>();
+    let applications = registry.get::<hammer_service::session::ApplicationMain>();
 
     tracing::info!("hammer started");
 
     rt.block_on(async move {
-        if let Some(server) = attach_server {
-            tokio::select! {
-                () = ipc_loop::clnt_loop(listener) => {}
-                result = server.serve() => {
-                    if let Err(error) = result {
-                        tracing::error!(%error, "application attach server failed");
+        match (attach_server, binary_api) {
+            (Some(attach), Some(binary_api)) => {
+                let attach_applications = applications
+                    .as_ref()
+                    .cloned()
+                    .expect("Application Main is initialized with attach server");
+                let detach_applications = Arc::clone(&attach_applications);
+                tokio::select! {
+                    () = ipc_loop::clnt_loop(listener) => {}
+                    result = attach.serve(
+                        move |application| attach_applications.contains(application).unwrap_or(false),
+                        move |application| {
+                            if detach_applications.contains(application).unwrap_or(false)
+                                && let Err(error) = detach_applications.detach(application)
+                            {
+                                tracing::error!(%error, ?application, "failed to detach Application after attach connection closed");
+                            }
+                        },
+                    ) => {
+                        if let Err(error) = result {
+                            tracing::error!(%error, "application attach server failed");
+                        }
+                    }
+                    result = binary_api.serve() => {
+                        if let Err(error) = result {
+                            tracing::error!(%error, "Binary API server failed");
+                        }
                     }
                 }
             }
-        } else {
-            ipc_loop::clnt_loop(listener).await;
+            (Some(attach), None) => {
+                let attach_applications = applications
+                    .as_ref()
+                    .cloned()
+                    .expect("Application Main is initialized with attach server");
+                let detach_applications = Arc::clone(&attach_applications);
+                tokio::select! {
+                    () = ipc_loop::clnt_loop(listener) => {}
+                    result = attach.serve(
+                        move |application| attach_applications.contains(application).unwrap_or(false),
+                        move |application| {
+                            if detach_applications.contains(application).unwrap_or(false)
+                                && let Err(error) = detach_applications.detach(application)
+                            {
+                                tracing::error!(%error, ?application, "failed to detach Application after attach connection closed");
+                            }
+                        },
+                    ) => {
+                        if let Err(error) = result {
+                            tracing::error!(%error, "application attach server failed");
+                        }
+                    }
+                }
+            }
+            (None, Some(binary_api)) => {
+                tokio::select! {
+                    () = ipc_loop::clnt_loop(listener) => {}
+                    result = binary_api.serve() => {
+                        if let Err(error) = result {
+                            tracing::error!(%error, "Binary API server failed");
+                        }
+                    }
+                }
+            }
+            (None, None) => ipc_loop::clnt_loop(listener).await,
         }
     });
 

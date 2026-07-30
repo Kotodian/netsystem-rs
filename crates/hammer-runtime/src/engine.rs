@@ -190,6 +190,12 @@ impl Engine {
         &mut self.plugin_main
     }
 
+    /// Returns the synchronization authority for publishing worker-visible state.
+    #[inline]
+    pub fn worker_barrier(&self) -> crate::barrier::WorkerBarrier {
+        self.barrier.clone()
+    }
+
     /// Add plugin roots and materialize their newly published runtime state.
     ///
     /// This is the sole plugin-loading interface. The main thread owns DSO

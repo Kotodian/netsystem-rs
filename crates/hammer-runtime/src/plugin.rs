@@ -17,6 +17,8 @@ use object::{Object, ObjectSection};
 use semver::Version;
 use serde::Deserialize;
 
+use crate::app::{AppSessionProtocolEntry, SessionTransportRegistration};
+use crate::binary_api::BinaryApiMethodEntry;
 use crate::error::RuntimeError;
 use crate::init::{ConfigFunction, InitFunction};
 use crate::node::{NodeEntry, NodeFunctionRegistration};
@@ -167,6 +169,18 @@ pub enum PluginError {
         plugin: &'static str,
         capability: &'static str,
     },
+    #[error("App Session protocol `{name}` is not registered")]
+    AppSessionProtocolMissing { name: String },
+    #[error("App Session protocol `{name}` is registered more than once")]
+    AppSessionProtocolDuplicate { name: String },
+    #[error("Session Transport `{name}` is not registered")]
+    SessionTransportMissing { name: String },
+    #[error("Session Transport `{name}` is registered more than once")]
+    SessionTransportDuplicate { name: String },
+    #[error("Binary API method `{name}` is not registered")]
+    BinaryApiMethodMissing { name: String },
+    #[error("Binary API method `{name}` is registered more than once")]
+    BinaryApiMethodDuplicate { name: String },
     #[error("plugin `{plugin}` capability `{capability}` failed")]
     CapabilityCall {
         plugin: &'static str,
@@ -524,6 +538,75 @@ impl PluginMain {
 
     pub(crate) fn process_nodes(&self) -> Vec<ProcessEntry> {
         self.collect_registrations(RegistrationImage::process_nodes)
+    }
+
+    pub fn session_transports(&self) -> Vec<SessionTransportRegistration> {
+        self.collect_registrations(RegistrationImage::session_transports)
+    }
+
+    pub fn session_transport(
+        &self,
+        name: &str,
+    ) -> Result<SessionTransportRegistration, PluginError> {
+        let mut found = None;
+        for transport in self.session_transports() {
+            if transport.name() != name {
+                continue;
+            }
+            if found.is_some() {
+                return Err(PluginError::SessionTransportDuplicate {
+                    name: name.to_owned(),
+                });
+            }
+            found = Some(transport);
+        }
+        found.ok_or_else(|| PluginError::SessionTransportMissing {
+            name: name.to_owned(),
+        })
+    }
+
+    pub fn app_session_protocols(&self) -> Vec<AppSessionProtocolEntry> {
+        self.collect_registrations(RegistrationImage::app_session_protocols)
+    }
+
+    pub fn app_session_protocol(&self, name: &str) -> Result<AppSessionProtocolEntry, PluginError> {
+        let mut found = None;
+        for entry in self.app_session_protocols() {
+            if entry.registration().name() != name {
+                continue;
+            }
+            if found.is_some() {
+                return Err(PluginError::AppSessionProtocolDuplicate {
+                    name: name.to_owned(),
+                });
+            }
+            found = Some(entry);
+        }
+        found.ok_or_else(|| PluginError::AppSessionProtocolMissing {
+            name: name.to_owned(),
+        })
+    }
+
+    pub fn binary_api_methods(&self) -> Vec<BinaryApiMethodEntry> {
+        self.collect_registrations(RegistrationImage::binary_api_methods)
+    }
+
+    pub fn binary_api_method(&self, name: &str) -> Result<BinaryApiMethodEntry, PluginError> {
+        let mut found = None;
+        for entry in self.binary_api_methods() {
+            if entry.name() != name {
+                continue;
+            }
+            if found.is_some() {
+                return Err(PluginError::BinaryApiMethodDuplicate {
+                    name: name.to_owned(),
+                });
+            }
+            found = Some(entry);
+        }
+        found.ok_or_else(|| PluginError::BinaryApiMethodMissing {
+            name: name.to_owned(),
+        })
     }
 
     /// Resolves one activated plugin module retained by this `PluginMain`.

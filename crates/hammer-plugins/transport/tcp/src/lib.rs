@@ -25,6 +25,7 @@ hammer_component_macros::declare_plugin!(
         output::__NODE_FUNCTION_TCP_OUTPUT_NODE_PROCESS_SIMD_SIMD512,
     ],
     process_nodes = [],
+    session_transports = [worker::__SESSION_TRANSPORT_TCP_WORKER],
 );
 
 use std::mem::transmute;
@@ -32,7 +33,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
-use hammer_core::data_plane::{BufferPacketCursor, NodeHandle, NodeId, NodeState, SecondaryOpaque};
+use hammer_core::data_plane::{BufferPacketCursor, NodeId, NodeState, SecondaryOpaque};
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, Engine, Node, NodeProcessFn, NodeRuntimeData, PluginError,
     RuntimeError, RuntimeResult,

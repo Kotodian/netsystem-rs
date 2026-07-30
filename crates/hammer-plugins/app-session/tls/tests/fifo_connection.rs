@@ -109,10 +109,9 @@ fn rustls_connection_handshakes_and_transfers_both_directions_through_small_fifo
     let client_tls = Connection::client(
         client_config,
         ServerName::try_from("localhost").expect("server name"),
-        FIFO_CAPACITY,
     )
     .expect("client connection");
-    let server_tls = Connection::server(server_config, FIFO_CAPACITY).expect("server connection");
+    let server_tls = Connection::server(server_config).expect("server connection");
     let mut client = ProtocolChain::new(
         Arc::clone(&client_application),
         client_tls,
@@ -188,10 +187,9 @@ fn certificate_error_leaves_the_alert_available_for_transport() {
     let client_tls = Connection::client(
         client_config,
         ServerName::try_from("localhost").expect("server name"),
-        FIFO_CAPACITY,
     )
     .expect("client connection");
-    let server_tls = Connection::server(server_config, FIFO_CAPACITY).expect("server connection");
+    let server_tls = Connection::server(server_config).expect("server connection");
     let mut client = ProtocolChain::new(
         client_application,
         client_tls,

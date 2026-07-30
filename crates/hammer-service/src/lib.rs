@@ -2,13 +2,18 @@ extern crate self as hammer_service;
 
 hammer_runtime::__declare_registration_image!(
     init_functions = [
+        binary_api::__INIT_FN_BINARY_API_INIT,
+        session::__INIT_FN_APPLICATION_INIT,
         device::__INIT_FN_DEVICE_INIT,
         session::__INIT_FN_SESSION_INIT,
         session::__INIT_FN_SESSION_ATTACH_SERVER,
         transport::__INIT_FN_TRANSPORT_INIT,
     ];
     config_functions = [];
-    early_config_functions = [session::__CONFIG_FN_SESSION_CONFIG];
+    early_config_functions = [
+        binary_api::__CONFIG_FN_BINARY_API_CONFIG,
+        session::__CONFIG_FN_SESSION_CONFIG,
+    ];
     main_loop_enter_functions = [];
     main_loop_exit_functions = [];
     worker_init_functions = [
@@ -23,6 +28,12 @@ hammer_runtime::__declare_registration_image!(
     ];
     node_functions = [];
     process_nodes = [];
+    session_transports = [];
+    app_session_protocols = [];
+    binary_api_methods = [
+        session::application::__BINARY_API_ATTACH_APPLICATION,
+        session::application::__BINARY_API_DETACH_APPLICATION,
+    ];
 );
 
 #[doc(hidden)]
@@ -31,6 +42,7 @@ pub fn registration_image() -> &'static hammer_runtime::__private::RegistrationI
 }
 
 pub mod app;
+pub mod binary_api;
 pub mod data_plane;
 /// Device-class abstraction. Concrete drivers live under `hammer-plugins/device/`.
 pub mod device;
