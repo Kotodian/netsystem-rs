@@ -7,8 +7,8 @@ use hammer_infra::align::align_up;
 use hammer_infra::fifo::Fifo;
 use hammer_infra::segment::Segment;
 use hammer_runtime::app::{
-    AppSession, AppSessionConfig, AppSessionError, SessionEventQueue, SessionEvt, SessionEvtType,
-    SessionHandle, SessionMsgQueue, SessionMsgQueueError, SessionOffsets,
+    AppSession, AppSessionConfig, AppSessionError, ApplicationId, SessionEventQueue, SessionEvt,
+    SessionEvtType, SessionHandle, SessionMsgQueue, SessionMsgQueueError, SessionOffsets,
 };
 use hammer_runtime::attach::{AppSessionPublication, AppSessionPublisher};
 use hammer_runtime::{RuntimeError, RuntimeResult};
@@ -49,7 +49,7 @@ pub struct AppWorker {
     attach_slots: Vec<AttachSlot>,
     tx_evt_q: Arc<SessionMsgQueue>,
     worker_index: usize,
-    listeners: HashMap<u32, SegmentManager>,
+    segments_by_owner: HashMap<u64, SegmentManager>,
     attach: Option<AppWorkerAttach>,
 }
 
@@ -62,7 +62,7 @@ struct SessionSlot {
 
 #[derive(Clone, Default)]
 struct AttachSlot {
-    listener: Option<u32>,
+    allocation_owner: Option<u64>,
     publication: Option<AppSessionPublication>,
 }
 
@@ -314,7 +314,7 @@ impl AppWorker {
             attach_slots: vec![AttachSlot::default(); session_capacity],
             tx_evt_q,
             worker_index,
-            listeners: HashMap::new(),
+            segments_by_owner: HashMap::new(),
             attach: None,
         }
     }
@@ -330,7 +330,7 @@ impl AppWorker {
             attach_slots: vec![AttachSlot::default(); session_capacity],
             tx_evt_q,
             worker_index,
-            listeners: HashMap::new(),
+            segments_by_owner: HashMap::new(),
             attach: Some(attach),
         }
     }
@@ -366,14 +366,24 @@ impl AppWorker {
         {
             let slot = entry.take()?;
             let attach_slot = std::mem::take(&mut self.attach_slots[index]);
-            if let Some(listener) = attach_slot.listener
-                && let Some(manager) = self.listeners.get_mut(&listener)
+            if let Some(owner) = attach_slot.allocation_owner
+                && let Some(manager) = self.segments_by_owner.get_mut(&owner)
             {
                 manager.release_session(slot.app_session.session_handle());
             }
             return Some(slot.app_session);
         }
         None
+    }
+
+    pub(crate) fn discard_app_session(&mut self, session: &AppSession) {
+        let index = session.session_handle().session_index() as usize;
+        let attach_slot = std::mem::take(&mut self.attach_slots[index]);
+        if let Some(owner) = attach_slot.allocation_owner
+            && let Some(manager) = self.segments_by_owner.get_mut(&owner)
+        {
+            manager.release_session(session.session_handle());
+        }
     }
 
     #[inline(always)]
@@ -802,13 +812,13 @@ mod tests {
             let session_id = SessionId::from(PoolIndex::new(slot, 1));
             let handle = SessionHandle::new(slot, 0);
             let session = app
-                .create_app_session(7, handle, config, app.tx_evt_q().clone())
+                .create_app_session(7, None, handle, config, app.tx_evt_q().clone())
                 .expect("listener session");
             app.attach_session(session_id, Arc::clone(&session), session);
         }
 
-        assert_eq!(app.listeners.len(), 1);
-        assert_eq!(app.listeners[&7].segments.len(), 1);
+        assert_eq!(app.segments_by_owner.len(), 1);
+        assert_eq!(app.segments_by_owner[&7].segments.len(), 1);
     }
 
     #[test]
@@ -819,14 +829,14 @@ mod tests {
             let session_id = SessionId::from(PoolIndex::new(slot, 1));
             let handle = SessionHandle::new(slot, 0);
             let session = app
-                .create_app_session(listener, handle, config, app.tx_evt_q().clone())
+                .create_app_session(listener, None, handle, config, app.tx_evt_q().clone())
                 .expect("listener session");
             app.attach_session(session_id, Arc::clone(&session), session);
         }
 
-        assert_eq!(app.listeners.len(), 2);
-        assert_eq!(app.listeners[&7].segments.len(), 1);
-        assert_eq!(app.listeners[&9].segments.len(), 1);
+        assert_eq!(app.segments_by_owner.len(), 2);
+        assert_eq!(app.segments_by_owner[&7].segments.len(), 1);
+        assert_eq!(app.segments_by_owner[&9].segments.len(), 1);
     }
 
     #[test]
@@ -836,20 +846,20 @@ mod tests {
         let session_id = SessionId::from(PoolIndex::new(0, 1));
         let handle = SessionHandle::new(0, 0);
         let session = app
-            .create_app_session(7, handle, config, app.tx_evt_q().clone())
+            .create_app_session(7, None, handle, config, app.tx_evt_q().clone())
             .expect("listener session");
         app.attach_session(session_id, Arc::clone(&session), Arc::clone(&session));
 
         let detached = app.detach_session(session_id).expect("detached session");
-        assert_eq!(app.listeners[&7].retired.len(), 1);
+        assert_eq!(app.segments_by_owner[&7].retired.len(), 1);
         drop(detached);
         drop(session);
 
         let replacement = app
-            .create_app_session(7, handle, config, app.tx_evt_q().clone())
+            .create_app_session(7, None, handle, config, app.tx_evt_q().clone())
             .expect("replacement session");
-        assert!(app.listeners[&7].retired.is_empty());
-        assert_eq!(app.listeners[&7].segments.len(), 1);
+        assert!(app.segments_by_owner[&7].retired.is_empty());
+        assert_eq!(app.segments_by_owner[&7].segments.len(), 1);
         drop(replacement);
     }
 
@@ -881,7 +891,8 @@ mod tests {
 impl AppWorker {
     pub(crate) fn create_app_session(
         &mut self,
-        listener: u32,
+        allocation_owner: u64,
+        application: Option<ApplicationId>,
         handle: SessionHandle,
         config: AppSessionConfig,
         tx_evt_q: Arc<SessionMsgQueue>,
@@ -889,27 +900,28 @@ impl AppWorker {
         let shared_name_prefix = self
             .attach
             .as_ref()
-            .map(|_| format!("hammer-session-w{}-l{listener}", self.worker_index));
+            .map(|_| format!("hammer-session-w{}-o{allocation_owner}", self.worker_index));
         let tx_event_offset = self
             .attach
             .as_ref()
             .map_or(0, |attach| attach.tx_event_offset);
         let created = self
-            .listeners
-            .entry(listener)
+            .segments_by_owner
+            .entry(allocation_owner)
             .or_insert_with(|| SegmentManager::new(shared_name_prefix))
             .create_session(handle, config, tx_evt_q, tx_event_offset)?;
         let slot = handle.session_index() as usize;
-        let publication = if let Some(attach) = &self.attach {
+        let publication = if let (Some(attach), Some(application)) = (&self.attach, application) {
             match AppSessionPublication::new(
                 Arc::clone(&created.session),
+                application,
                 created.segment,
                 attach.tx_event_segment.clone(),
                 created.offsets,
             ) {
                 Ok(publication) => Some(publication),
                 Err(error) => {
-                    if let Some(manager) = self.listeners.get_mut(&listener) {
+                    if let Some(manager) = self.segments_by_owner.get_mut(&allocation_owner) {
                         manager.release_session(handle);
                     }
                     drop(created.session);
@@ -920,7 +932,7 @@ impl AppWorker {
             None
         };
         self.attach_slots[slot] = AttachSlot {
-            listener: Some(listener),
+            allocation_owner: Some(allocation_owner),
             publication,
         };
         Ok(created.session)

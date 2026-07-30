@@ -2,7 +2,7 @@
 //! reconstruction from the four transferred descriptors, and descriptor
 //! lifetime on every failure path.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -14,7 +14,7 @@ use hammer_app::attach::{AppClient, AppClientError};
 use hammer_infra::fifo::Fifo;
 use hammer_infra::segment::Segment;
 use hammer_runtime::app::{
-    AppSession, SessionEvtType, SessionHandle, SessionMsgQueue, SessionOffsets,
+    AppSession, ApplicationId, SessionEvtType, SessionHandle, SessionMsgQueue, SessionOffsets,
 };
 use hammer_runtime::attach::{AppServer, AppSessionPublication};
 use hammer_runtime::{AttachError, RuntimeError};
@@ -70,7 +70,7 @@ struct PublishedSession {
 
 /// Build a server-side session whose FIFOs and event queues live at known
 /// offsets in shared segments, matching the daemon's listener layout.
-fn build_publication(handle: SessionHandle) -> PublishedSession {
+fn build_publication(application: ApplicationId, handle: SessionHandle) -> PublishedSession {
     let counter = NAME_COUNTER.fetch_add(1, Ordering::Relaxed);
     let session_segment =
         Segment::shared(&format!("hs{}-{counter}", std::process::id()), 1024 * 1024)
@@ -139,6 +139,7 @@ fn build_publication(handle: SessionHandle) -> PublishedSession {
     };
     let publication = AppSessionPublication::new(
         Arc::clone(&session),
+        application,
         session_segment.clone(),
         tx_event_segment,
         offsets,
@@ -157,7 +158,7 @@ fn spawn_serve(server: Arc<AppServer>) {
             .enable_all()
             .build()
             .expect("serve runtime");
-        let _ = runtime.block_on(server.serve());
+        let _ = runtime.block_on(server.serve(|_| true, |_| {}));
     });
 }
 
@@ -196,13 +197,24 @@ fn send_fds(stream: &UnixStream, fds: &[RawFd], metadata: [u64; 8]) {
     }
 }
 
+fn accept_application(stream: &mut UnixStream) {
+    let mut registration = [0_u8; 16];
+    stream
+        .read_exact(&mut registration)
+        .expect("read Application attach registration");
+    stream
+        .write_all(&[hammer_runtime::attach::ATTACH_APPLICATION_ACCEPTED])
+        .expect("accept Application attach registration");
+}
+
 fn assert_publish_then_connect_round_trips_handle_and_descriptors() {
     let path = socket_path("publish-first");
     let path_text = path.to_str().expect("socket path").to_owned();
     let server = Arc::new(AppServer::bind(&path_text, 4).expect("bind app server"));
     let publisher = server.publisher();
+    let application = ApplicationId::from_raw(1);
     let handle = SessionHandle::new(5, 2);
-    let published = build_publication(handle);
+    let published = build_publication(application, handle);
     publisher
         .try_publish(&published.publication)
         .expect("publish before client");
@@ -215,8 +227,9 @@ fn assert_publish_then_connect_round_trips_handle_and_descriptors() {
     let identity = descriptor_identity(segment_fd).expect("segment identity");
     let baseline = count_open_identity(identity);
 
-    let client = AppClient::connect(&path_text).expect("attach client");
-    assert_eq!(client.session_handle(), handle);
+    let client = AppClient::connect(&path_text, application).expect("attach client");
+    let client_session = client.accept().expect("accept App Session");
+    assert_eq!(client_session.session_handle(), handle);
     assert_identity_count(identity, baseline + 1);
 
     // Dataplane -> app across the shared session segment and event queue.
@@ -225,12 +238,12 @@ fn assert_publish_then_connect_round_trips_handle_and_descriptors() {
         .enqueue_rx(b"ping")
         .expect("enqueue server rx");
     let mut buffer = [0_u8; 16];
-    let read = client.recv_bytes(&mut buffer);
+    let read = client_session.recv_bytes(&mut buffer);
     assert_eq!(&buffer[..read], b"ping");
-    assert_eq!(client.consume_rx(read), read);
+    assert_eq!(client_session.consume_rx(read), read);
 
     // App -> dataplane across the tx fifo and worker tx event queue.
-    assert_eq!(client.send_bytes(b"pong").expect("client send"), 4);
+    assert_eq!(client_session.send_bytes(b"pong").expect("client send"), 4);
     let mut echoed = [0_u8; 16];
     let read = published
         .session
@@ -241,6 +254,7 @@ fn assert_publish_then_connect_round_trips_handle_and_descriptors() {
     assert_eq!(event.session_index(), handle.session_index());
     assert_eq!(event.evt_type, SessionEvtType::TxDeq);
 
+    drop(client_session);
     drop(client);
     assert_identity_count(identity, baseline);
     let _ = std::fs::remove_file(path);
@@ -251,14 +265,18 @@ fn assert_connect_before_publish_completes_after_publication() {
     let path_text = path.to_str().expect("socket path").to_owned();
     let server = Arc::new(AppServer::bind(&path_text, 4).expect("bind app server"));
     let publisher = server.publisher();
+    let application = ApplicationId::from_raw(2);
     spawn_serve(Arc::clone(&server));
 
     let client_path = path_text.clone();
-    let client_thread = std::thread::spawn(move || AppClient::connect(&client_path));
+    let client_thread = std::thread::spawn(move || {
+        let client = AppClient::connect(&client_path, application)?;
+        client.accept()
+    });
     std::thread::sleep(Duration::from_millis(100));
 
     let handle = SessionHandle::new(9, 0);
-    let published = build_publication(handle);
+    let published = build_publication(application, handle);
     publisher
         .try_publish(&published.publication)
         .expect("publish after client");
@@ -276,6 +294,7 @@ fn assert_failed_attach_requeues_publication_for_next_client() {
     let path_text = path.to_str().expect("socket path").to_owned();
     let server = Arc::new(AppServer::bind(&path_text, 4).expect("bind app server"));
     let publisher = server.publisher();
+    let application = ApplicationId::from_raw(3);
     spawn_serve(Arc::clone(&server));
 
     let dead = UnixStream::connect(&path).expect("connect doomed client");
@@ -285,13 +304,14 @@ fn assert_failed_attach_requeues_publication_for_next_client() {
     std::thread::sleep(Duration::from_millis(100));
 
     let handle = SessionHandle::new(3, 1);
-    let published = build_publication(handle);
+    let published = build_publication(application, handle);
     publisher
         .try_publish(&published.publication)
         .expect("publish after doomed client");
 
-    let client = AppClient::connect(&path_text).expect("attach surviving client");
-    assert_eq!(client.session_handle(), handle);
+    let client = AppClient::connect(&path_text, application).expect("attach surviving client");
+    let client_session = client.accept().expect("accept surviving App Session");
+    assert_eq!(client_session.session_handle(), handle);
     let _ = std::fs::remove_file(path);
 }
 
@@ -300,7 +320,7 @@ fn assert_publication_queue_reports_full_and_closed() {
     let path_text = path.to_str().expect("socket path").to_owned();
     let server = AppServer::bind(&path_text, 1).expect("bind app server");
     let publisher = server.publisher();
-    let published = build_publication(SessionHandle::new(1, 0));
+    let published = build_publication(ApplicationId::from_raw(4), SessionHandle::new(1, 0));
 
     publisher
         .try_publish(&published.publication)
@@ -326,7 +346,10 @@ fn assert_publication_queue_reports_full_and_closed() {
 
 fn assert_missing_attach_server_returns_client_error() {
     let path = socket_path("missing-server");
-    let result = AppClient::connect(path.to_str().expect("socket path"));
+    let result = AppClient::connect(
+        path.to_str().expect("socket path"),
+        ApplicationId::from_raw(5),
+    );
     assert!(matches!(result, Err(AppClientError::Connect { .. })));
 }
 
@@ -334,14 +357,19 @@ fn assert_malformed_attach_closes_received_descriptor_before_returning_error() {
     let path = socket_path("malformed");
     let listener = UnixListener::bind(&path).expect("bind malformed attach server");
     let server_thread = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().expect("accept malformed client");
+        let (mut stream, _) = listener.accept().expect("accept malformed client");
+        accept_application(&mut stream);
         let (sent, peer) = UnixStream::pair().expect("descriptor pair");
         send_fds(&stream, &[sent.as_raw_fd()], [0; 8]);
         drop(sent);
         peer
     });
 
-    let result = AppClient::connect(path.to_str().expect("socket path"));
+    let result = AppClient::connect(
+        path.to_str().expect("socket path"),
+        ApplicationId::from_raw(6),
+    )
+    .and_then(|client| client.accept());
     assert!(matches!(
         result,
         Err(AppClientError::DescriptorCount {
@@ -360,7 +388,8 @@ fn assert_offset_overflow_closes_every_received_descriptor() {
     let path = socket_path("offset-overflow");
     let listener = UnixListener::bind(&path).expect("bind offset overflow attach server");
     let server_thread = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().expect("accept offset overflow client");
+        let (mut stream, _) = listener.accept().expect("accept offset overflow client");
+        accept_application(&mut stream);
         let (sent, peer) = UnixStream::pair().expect("descriptor pair");
         let identity = descriptor_identity(sent.as_raw_fd()).expect("descriptor identity");
         let baseline = count_open_identity(identity);
@@ -369,7 +398,11 @@ fn assert_offset_overflow_closes_every_received_descriptor() {
         (sent, peer, identity, baseline)
     });
 
-    let result = AppClient::connect(path.to_str().expect("socket path"));
+    let result = AppClient::connect(
+        path.to_str().expect("socket path"),
+        ApplicationId::from_raw(7),
+    )
+    .and_then(|client| client.accept());
     assert!(matches!(result, Err(AppClientError::OffsetOverflow)));
     let (sent, peer, identity, baseline) = server_thread.join().expect("join offset server");
     assert_identity_count(identity, baseline);
@@ -382,7 +415,8 @@ fn assert_mapping_failure_closes_every_received_descriptor() {
     let path = socket_path("mapping-failure");
     let listener = UnixListener::bind(&path).expect("bind mapping failure attach server");
     let server_thread = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().expect("accept mapping failure client");
+        let (mut stream, _) = listener.accept().expect("accept mapping failure client");
+        accept_application(&mut stream);
         let (sent, peer) = UnixStream::pair().expect("descriptor pair");
         let identity = descriptor_identity(sent.as_raw_fd()).expect("descriptor identity");
         let baseline = count_open_identity(identity);
@@ -391,7 +425,11 @@ fn assert_mapping_failure_closes_every_received_descriptor() {
         (sent, peer, identity, baseline)
     });
 
-    let result = AppClient::connect(path.to_str().expect("socket path"));
+    let result = AppClient::connect(
+        path.to_str().expect("socket path"),
+        ApplicationId::from_raw(8),
+    )
+    .and_then(|client| client.accept());
     assert!(matches!(
         result,
         Err(AppClientError::SessionSegmentMap { .. })
@@ -413,4 +451,48 @@ fn attach_protocol_round_trips_and_releases_descriptors() {
     assert_malformed_attach_closes_received_descriptor_before_returning_error();
     assert_offset_overflow_closes_every_received_descriptor();
     assert_mapping_failure_closes_every_received_descriptor();
+}
+
+#[test]
+fn attach_connection_close_detaches_only_its_application_once() {
+    let path = socket_path("application-lifetime");
+    let path_text = path.to_str().expect("socket path").to_owned();
+    let server = Arc::new(AppServer::bind(&path_text, 4).expect("bind app server"));
+    let (detached_tx, detached_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("serve runtime");
+        let _ = runtime.block_on(server.serve(
+            |_| true,
+            move |application| {
+                let _ = detached_tx.send(application);
+            },
+        ));
+    });
+
+    let first = ApplicationId::from_raw(41);
+    let second = ApplicationId::from_raw(42);
+    let first_client = AppClient::connect(&path_text, first).expect("attach first Application");
+    let second_client = AppClient::connect(&path_text, second).expect("attach second Application");
+
+    drop(first_client);
+    assert_eq!(
+        detached_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first Application detach"),
+        first
+    );
+    assert!(detached_rx.try_recv().is_err());
+
+    drop(second_client);
+    assert_eq!(
+        detached_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second Application detach"),
+        second
+    );
+    assert!(detached_rx.try_recv().is_err());
+    let _ = std::fs::remove_file(path);
 }

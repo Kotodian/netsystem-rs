@@ -142,6 +142,32 @@ _Avoid_: Engine pool containing only the main Engine, public plugin main, public
 The startup document dispatched by the Runtime Engine to the module that owns each declared section. Section schemas are owner-private; the daemon supplies the original document and does not assemble, retain, or depend on a public aggregate configuration object. Data Worker configuration contains only Data Worker policy, while app-process configuration belongs to the independent app plane.
 _Avoid_: public runtime config type family, retained parsed document, daemon-owned plugin schema, app session or app CPU fields under worker configuration, compatibility aliases for renamed fields
 
+**Binary API**:
+The Main Thread control interface used by an external process over a
+length-prefixed protobuf stream on a Tokio Unix socket. Each plugin declares
+typed protobuf request/reply methods through the component macro; its retained
+registration image carries only immutable method identity and the generated
+adapter. Binary API dispatch resolves the current `PluginMain` registration on
+the Main Thread and invokes the plugin without a handler registry lock. Local
+applications bypass protobuf and Unix I/O and call the same plugin-owned Main
+Thread operation through its ABI.
+_Avoid_: CLI IPC as Binary API, SVM FIFO as control API, handler mutex, Tokio worker dispatch, daemon-owned plugin message schema, protobuf in the data path
+
+**Binary API Layer Contract**:
+- `hammer-runtime` carries immutable cross-DSO method registrations and retains
+  their plugin images; it does not parse protobuf or own a Unix listener.
+- `hammer-service` owns protobuf envelope framing, frame limits, Unix listener
+  lifetime, Main Thread dispatch, and transport-level reply status.
+- A plugin owns each method's protobuf request/reply schema, validation, domain
+  error reply, and Main Thread operation. The generated adapter contains panic
+  at the DSO seam and never exposes plugin state to Service.
+- `hammer` only polls the Service-owned server in its current-thread Tokio main
+  loop. It does not inspect method names or payloads.
+- External App control uses Binary API; SVM FIFOs and Session Message Queues
+  remain data exchange after attachment. A Local App calls plugin ABI directly.
+- Verify with `cargo test -p hammer-service --test binary_api`,
+  `cargo check --workspace`, and `cargo test --workspace`.
+
 **Runtime Capability**:
 A typed main-thread authority or immutable handle produced during lifecycle initialization and requested by dependent registrations or Process Nodes. The Runtime Engine owns capability storage; consumers request the concrete domain capability and never receive a generic registry object.
 _Avoid_: public runtime registry, registry constructor parameter, service-locator handle passed through the system
@@ -247,9 +273,21 @@ _Avoid_: daemon-owned descriptor across process boundaries, one global readiness
 The app-side model has one concrete session abstraction, `AppSession<S>`, for both local and attached storage backends and at every level of an App Session Stack. `AppClient` and session configuration are construction/connection support; a second remote-session or TLS-session facade is not a domain concept.
 _Avoid_: parallel local/remote session objects, TLS-specific app session, wrapper-of-wrapper app facades, session lookup context presented as another session type
 
+**Application Listener**:
+An Application-owned accepted-connection destination. The Application fixes its App Session Policy when listening; Session Runtime uses the Application Listener identity to select the policy and final Local or SVM delivery, while the selected Transport retains only its own endpoint lookup and an opaque route back to that Application Listener.
+_Avoid_: TCP listener as Application identity, Transport-owned TLS mode, SVM segment key as listener semantics
+
+**App Session Policy**:
+The immutable Transport selection and ordered App Session protocol chain supplied by an Application when it listens or connects. Transport selection is independent from the protocol chain. Session Runtime resolves the registered Transport and protocols before constructing or publishing any session in the App Session Stack. A DSO registers its Transports and App Session protocols internally; the Application does not name or select the containing plugin.
+_Avoid_: TCP TLS option, mutable session mode, protocol selection inside AppSession, plugin-selected Application policy
+
 **App Session Stack**:
 An ordered protocol composition fixed when a connection is constructed. `session::ProtocolChain<P, L>` owns the App-facing App Session, one concrete protocol state, and the complete lower chain. Protocol state receives only the source and destination FIFO adjacent to its layer; it neither owns nor inspects the lower chain. Each App Session exchanges only the protocol data of its two adjacent layers, and the innermost App Session connects to transport. Session Runtime schedules the statically composed chain without interpreting or erasing concrete protocol state.
 _Avoid_: App Session driver binding, TLS mode in App Session, protocol-aware FIFO, mutable layer switch, transport-specific app interface
+
+**Transport Listener**:
+A Transport-owned endpoint lookup registration that accepts Transport Connections and retains Transport-specific capabilities. It routes an accepted connection to an opaque Application Listener identity but neither selects nor interprets the Application's App Session Policy.
+_Avoid_: Application policy in TCP config, TLS profile in Transport lookup, Transport listener reused as Application identity
 
 ## Session And Transport
 

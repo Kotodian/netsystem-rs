@@ -1,16 +1,15 @@
 //! External attached TCP echo app.
 //!
-//! Connects to a running Hammer daemon over the attach socket. Each connect
-//! blocks until the daemon accepts a TCP session and publishes its
-//! FIFO/event-queue descriptors. Each accepted session is echoed until it
-//! closes, then the app re-attaches for the next accept.
+//! Connects to a running Hammer daemon over the attach socket. Each accepted
+//! session is echoed until it closes, then the same Application waits for the
+//! next session.
 //!
 //! ```text
-//! cargo run -p hammer --example tun_tcp_echo -- /tmp/hammer-tcp-integration.attach.sock
+//! cargo run -p hammer --example tun_tcp_echo -- /tmp/hammer-tcp-integration.attach.sock 1
 //! ```
 
 use hammer_app::attach::{AppClient, AppClientError};
-use hammer_app::{AppSession, AppSessionError};
+use hammer_app::{AppSession, AppSessionError, ApplicationId};
 use hammer_runtime::app::SessionEvtType;
 
 const DEFAULT_ATTACH_SOCKET: &str = "/tmp/hammer-tcp-integration.attach.sock";
@@ -27,18 +26,33 @@ enum EchoError {
         #[source]
         source: std::io::Error,
     },
+    #[error("missing Application ID returned by application.attach")]
+    ApplicationIdMissing,
+    #[error("invalid Application ID")]
+    ApplicationIdInvalid {
+        #[source]
+        source: std::num::ParseIntError,
+    },
 }
 
 fn main() -> Result<(), EchoError> {
-    let socket_path = std::env::args()
-        .nth(1)
+    let mut arguments = std::env::args().skip(1);
+    let socket_path = arguments
+        .next()
         .unwrap_or_else(|| DEFAULT_ATTACH_SOCKET.to_owned());
+    let application = arguments
+        .next()
+        .ok_or(EchoError::ApplicationIdMissing)?
+        .parse()
+        .map(ApplicationId::from_raw)
+        .map_err(|source| EchoError::ApplicationIdInvalid { source })?;
     let tokio_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .build()
         .map_err(|source| EchoError::TokioRuntime { source })?;
+    let client = AppClient::connect(&socket_path, application)?;
     loop {
-        let session = AppClient::connect(&socket_path)?;
+        let session = client.accept()?;
         eprintln!(
             "accepted session handle {:?} via {socket_path}",
             session.session_handle()

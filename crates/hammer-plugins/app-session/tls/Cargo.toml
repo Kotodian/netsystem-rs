@@ -14,6 +14,7 @@ hammer-component-macros = { path = "../../../hammer-component-macros" }
 hammer-infra = { path = "../../../hammer-infra" }
 hammer-runtime = { path = "../../../hammer-runtime", default-features = false }
 hammer-service = { path = "../../../hammer-service", default-features = false }
+prost = { workspace = true }
 rustls = { workspace = true }
 thiserror = { workspace = true }
 

@@ -25,6 +25,9 @@ hammer_runtime::__declare_registration_image!(
     graph_nodes = [];
     node_functions = [];
     process_nodes = [];
+    session_transports = [];
+    app_session_protocols = [];
+    binary_api_methods = [];
 );
 
 const READY: usize = 0;

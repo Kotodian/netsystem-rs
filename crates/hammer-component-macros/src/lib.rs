@@ -1404,6 +1404,379 @@ pub fn graph_node(args: TokenStream, input: TokenStream) -> TokenStream {
         .into()
 }
 
+struct AppSessionProtocolArgs {
+    name: LitStr,
+    lower: LitStr,
+    upper: LitStr,
+}
+
+impl Parse for AppSessionProtocolArgs {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let mut name = None;
+        let mut lower = None;
+        let mut upper = None;
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            match key.to_string().as_str() {
+                "name" => {
+                    if name.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `name` argument"));
+                    }
+                    name = Some(input.parse()?);
+                }
+                "lower" => {
+                    if lower.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `lower` argument"));
+                    }
+                    lower = Some(input.parse()?);
+                }
+                "upper" => {
+                    if upper.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `upper` argument"));
+                    }
+                    upper = Some(input.parse()?);
+                }
+                other => {
+                    return Err(Error::new(
+                        key.span(),
+                        format!(
+                            "unknown `app_session_protocol` argument `{other}`; expected `name`, `lower`, or `upper`"
+                        ),
+                    ));
+                }
+            }
+            if input.parse::<Option<Token![,]>>()?.is_none() {
+                break;
+            }
+        }
+        Ok(Self {
+            name: name.ok_or_else(|| Error::new(Span::call_site(), "missing `name` argument"))?,
+            lower: lower
+                .ok_or_else(|| Error::new(Span::call_site(), "missing `lower` argument"))?,
+            upper: upper
+                .ok_or_else(|| Error::new(Span::call_site(), "missing `upper` argument"))?,
+        })
+    }
+}
+
+/// Registers a concrete App Session protocol in the current link image.
+#[proc_macro_attribute]
+pub fn app_session_protocol(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as AppSessionProtocolArgs);
+    let item = parse_macro_input!(input as Item);
+    let ident = match item {
+        Item::Struct(ref item) => item.ident.clone(),
+        _ => {
+            return Error::new(
+                item.span(),
+                "`app_session_protocol` can only be attached to a struct",
+            )
+            .to_compile_error()
+            .into();
+        }
+    };
+    let static_ident = format_ident!(
+        "__APP_SESSION_PROTOCOL_{}",
+        to_snake_case(&ident.to_string()).to_ascii_uppercase()
+    );
+    let connections_ident = format_ident!("{static_ident}_CONNECTIONS");
+    let create_ident = format_ident!("{static_ident}_CREATE");
+    let ingress_ident = format_ident!("{static_ident}_INGRESS");
+    let egress_ident = format_ident!("{static_ident}_EGRESS");
+    let destroy_ident = format_ident!("{static_ident}_DESTROY");
+    let name = args.name;
+    let lower = args.lower;
+    let upper = args.upper;
+    quote! {
+        #item
+
+        static #connections_ident: ::std::sync::OnceLock<
+            ::hammer_runtime::app::AppSessionProtocolConnections<#ident>
+        > = ::std::sync::OnceLock::new();
+
+        fn #create_ident(
+            __hammer_worker: ::hammer_runtime::DataWorkerId,
+            __hammer_worker_count: usize,
+            __hammer_application: ::std::option::Option<::hammer_runtime::app::ApplicationId>,
+            __hammer_role: ::hammer_runtime::app::AppSessionProtocolRole,
+            __hammer_protocol_id: ::std::option::Option<u64>,
+            __hammer_server_name: ::std::option::Option<&str>,
+        ) -> ::hammer_runtime::RuntimeResult<
+            ::hammer_runtime::app::AppSessionProtocolConnectionId
+        > {
+            let __hammer_protocol = <#ident as ::hammer_runtime::app::AppSessionProtocol>::create(
+                __hammer_application,
+                __hammer_role,
+                __hammer_protocol_id,
+                __hammer_server_name,
+            )?;
+            #connections_ident.get_or_init(|| {
+                ::hammer_runtime::app::AppSessionProtocolConnections::new(
+                    __hammer_worker_count,
+                    <#ident as ::hammer_runtime::app::AppSessionProtocol>::CONNECTION_CAPACITY,
+                )
+            }).insert(__hammer_worker, __hammer_worker_count, __hammer_protocol)
+        }
+
+        fn #ingress_ident(
+            __hammer_worker: ::hammer_runtime::DataWorkerId,
+            __hammer_connection: ::hammer_runtime::app::AppSessionProtocolConnectionId,
+            __hammer_lower_rx_fifo: &::hammer_infra::fifo::Fifo,
+            __hammer_upper_rx_fifo: &::hammer_infra::fifo::Fifo,
+        ) -> ::hammer_runtime::RuntimeResult<(usize, usize)> {
+            #connections_ident.get()
+                .expect("App Session protocol connection storage exists after construction")
+                .with_mut(__hammer_worker, __hammer_connection, |__hammer_protocol| {
+                    <#ident as ::hammer_runtime::app::AppSessionProtocol>::ingress(
+                        __hammer_protocol,
+                        __hammer_lower_rx_fifo,
+                        __hammer_upper_rx_fifo,
+                    )
+                })
+        }
+
+        fn #egress_ident(
+            __hammer_worker: ::hammer_runtime::DataWorkerId,
+            __hammer_connection: ::hammer_runtime::app::AppSessionProtocolConnectionId,
+            __hammer_upper_tx_fifo: &::hammer_infra::fifo::Fifo,
+            __hammer_lower_tx_fifo: &::hammer_infra::fifo::Fifo,
+        ) -> ::hammer_runtime::RuntimeResult<(usize, usize)> {
+            #connections_ident.get()
+                .expect("App Session protocol connection storage exists after construction")
+                .with_mut(__hammer_worker, __hammer_connection, |__hammer_protocol| {
+                    <#ident as ::hammer_runtime::app::AppSessionProtocol>::egress(
+                        __hammer_protocol,
+                        __hammer_upper_tx_fifo,
+                        __hammer_lower_tx_fifo,
+                    )
+                })
+        }
+
+        fn #destroy_ident(
+            __hammer_worker: ::hammer_runtime::DataWorkerId,
+            __hammer_connection: ::hammer_runtime::app::AppSessionProtocolConnectionId,
+        ) -> ::hammer_runtime::RuntimeResult<()> {
+            #connections_ident.get()
+                .expect("App Session protocol connection storage exists after construction")
+                .remove(__hammer_worker, __hammer_connection)
+        }
+
+        pub(crate) static #static_ident: ::hammer_runtime::app::AppSessionProtocolEntry =
+            ::hammer_runtime::app::AppSessionProtocolEntry::new(
+                #name,
+                #lower,
+                #upper,
+                #create_ident,
+                #ingress_ident,
+                #egress_ident,
+                #destroy_ident,
+            );
+    }
+    .into()
+}
+
+struct SessionTransportArgs {
+    name: LitStr,
+    upper: LitStr,
+}
+
+impl Parse for SessionTransportArgs {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let mut name = None;
+        let mut upper = None;
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            match key.to_string().as_str() {
+                "name" => name = Some(input.parse()?),
+                "upper" => upper = Some(input.parse()?),
+                other => {
+                    return Err(Error::new(
+                        key.span(),
+                        format!(
+                            "unknown `session_transport` argument `{other}`; expected `name` or `upper`"
+                        ),
+                    ));
+                }
+            }
+            if input.parse::<Option<Token![,]>>()?.is_none() {
+                break;
+            }
+        }
+        Ok(Self {
+            name: name.ok_or_else(|| Error::new(Span::call_site(), "missing `name` argument"))?,
+            upper: upper
+                .ok_or_else(|| Error::new(Span::call_site(), "missing `upper` argument"))?,
+        })
+    }
+}
+
+/// Registers one Session Transport's upper protocol semantics.
+#[proc_macro_attribute]
+pub fn session_transport(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as SessionTransportArgs);
+    let item = parse_macro_input!(input as Item);
+    let ident = match item {
+        Item::Struct(ref item) => item.ident.clone(),
+        _ => {
+            return Error::new(
+                item.span(),
+                "`session_transport` can only be attached to a struct",
+            )
+            .to_compile_error()
+            .into();
+        }
+    };
+    let static_ident = format_ident!(
+        "__SESSION_TRANSPORT_{}",
+        to_snake_case(&ident.to_string()).to_ascii_uppercase()
+    );
+    let name = args.name;
+    let upper = args.upper;
+    quote! {
+        #item
+
+        pub(crate) static #static_ident: ::hammer_runtime::app::SessionTransportRegistration =
+            ::hammer_runtime::app::SessionTransportRegistration::new(#name, #upper);
+    }
+    .into()
+}
+
+struct BinaryApiArgs {
+    name: LitStr,
+}
+
+impl Parse for BinaryApiArgs {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let key: Ident = input.parse()?;
+        if key != "name" {
+            return Err(Error::new(key.span(), "expected `name`"));
+        }
+        input.parse::<Token![=]>()?;
+        let name: LitStr = input.parse()?;
+        if name.value().trim().is_empty() {
+            return Err(Error::new(name.span(), "Binary API method name is empty"));
+        }
+        if input.parse::<Option<Token![,]>>()?.is_some() || !input.is_empty() {
+            return Err(Error::new(input.span(), "unexpected Binary API argument"));
+        }
+        Ok(Self { name })
+    }
+}
+
+/// Registers one protobuf request/reply handler in the current link image.
+#[proc_macro_attribute]
+pub fn binary_api(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as BinaryApiArgs);
+    let function = parse_macro_input!(input as ItemFn);
+    expand_binary_api(args, function)
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
+fn expand_binary_api(args: BinaryApiArgs, function: ItemFn) -> Result<TokenStream2> {
+    if function.sig.asyncness.is_some()
+        || function.sig.unsafety.is_some()
+        || function.sig.abi.is_some()
+        || function.sig.variadic.is_some()
+        || !function.sig.generics.params.is_empty()
+    {
+        return Err(Error::new_spanned(
+            &function.sig,
+            "Binary API handlers must be synchronous, safe, non-generic Rust functions",
+        ));
+    }
+    let inputs = function.sig.inputs.iter().collect::<Vec<_>>();
+    let Some(FnArg::Typed(request)) = inputs.first().copied() else {
+        return Err(Error::new_spanned(
+            &function.sig.inputs,
+            "Binary API handlers must accept a protobuf request by value",
+        ));
+    };
+    if inputs.len() > 2 || inputs.is_empty() {
+        return Err(Error::new_spanned(
+            &function.sig.inputs,
+            "Binary API handlers accept one request and an optional &mut BinaryApiContext",
+        ));
+    }
+    if !request.attrs.is_empty() {
+        return Err(Error::new_spanned(
+            &request.attrs[0],
+            "Binary API request parameters do not accept attributes",
+        ));
+    }
+    let function_name = &function.sig.ident;
+    let call = match inputs.as_slice() {
+        [_] => quote!(#function_name(__hammer_request)),
+        [_, FnArg::Typed(context)]
+            if matches!(context.ty.as_ref(), Type::Reference(reference)
+                if reference.mutability.is_some()
+                    && type_path_ends_with(&reference.elem, "BinaryApiContext")) =>
+        {
+            quote!(#function_name(__hammer_request, __hammer_context))
+        }
+        [_, second] => {
+            return Err(Error::new_spanned(
+                second,
+                "the second Binary API parameter must be &mut BinaryApiContext",
+            ));
+        }
+        _ => unreachable!("Binary API input count was validated"),
+    };
+    let ReturnType::Type(_, reply_ty) = &function.sig.output else {
+        return Err(Error::new_spanned(
+            &function.sig.output,
+            "Binary API handlers must return one protobuf reply",
+        ));
+    };
+    let request_ty = &request.ty;
+    let adapter_name = format_ident!("__hammer_binary_api_adapter_{}", function_name);
+    let static_name = format_ident!(
+        "__BINARY_API_{}",
+        to_snake_case(&function_name.to_string()).to_ascii_uppercase()
+    );
+    let name = args.name;
+    let conditional_attributes: Vec<_> = function
+        .attrs
+        .iter()
+        .filter(|attribute| {
+            attribute.path().is_ident("cfg") || attribute.path().is_ident("cfg_attr")
+        })
+        .cloned()
+        .collect();
+
+    Ok(quote! {
+        #function
+
+        #(#conditional_attributes)*
+        fn #adapter_name(
+            __hammer_request: ::hammer_runtime::__private::RSlice<'_, u8>,
+            __hammer_context: &mut ::hammer_runtime::__private::BinaryApiContext,
+        ) -> ::hammer_runtime::__private::BinaryApiMethodReply {
+            let __hammer_request = match <#request_ty as ::prost::Message>::decode(
+                __hammer_request.as_slice(),
+            ) {
+                Ok(request) => request,
+                Err(_) => {
+                    return ::hammer_runtime::__private::BinaryApiMethodReply::invalid_request();
+                }
+            };
+            match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                let __hammer_reply: #reply_ty = #call;
+                <#reply_ty as ::prost::Message>::encode_to_vec(&__hammer_reply)
+            })) {
+                Ok(payload) => ::hammer_runtime::__private::BinaryApiMethodReply::ok(payload),
+                Err(_) => ::hammer_runtime::__private::BinaryApiMethodReply::panicked(),
+            }
+        }
+
+        #(#conditional_attributes)*
+        pub(crate) static #static_name: ::hammer_runtime::__private::BinaryApiMethodEntry =
+            ::hammer_runtime::__private::BinaryApiMethodEntry::new(#name, #adapter_name);
+    })
+}
+
 fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<TokenStream2> {
     let graph_label = args
         .graph
@@ -2369,6 +2742,9 @@ struct PluginArgs {
     graph_nodes: Vec<Path>,
     node_functions: Vec<Path>,
     process_nodes: Vec<Path>,
+    session_transports: Vec<Path>,
+    app_session_protocols: Vec<Path>,
+    binary_api_methods: Vec<Path>,
 }
 
 impl Parse for PluginArgs {
@@ -2385,6 +2761,9 @@ impl Parse for PluginArgs {
         let mut graph_nodes = Vec::new();
         let mut node_functions = Vec::new();
         let mut process_nodes = Vec::new();
+        let mut session_transports = Vec::new();
+        let mut app_session_protocols = Vec::new();
+        let mut binary_api_methods = Vec::new();
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             input.parse::<Token![=]>()?;
@@ -2409,6 +2788,9 @@ impl Parse for PluginArgs {
                 "graph_nodes" => graph_nodes = parse_path_array(input)?,
                 "node_functions" => node_functions = parse_path_array(input)?,
                 "process_nodes" => process_nodes = parse_path_array(input)?,
+                "session_transports" => session_transports = parse_path_array(input)?,
+                "app_session_protocols" => app_session_protocols = parse_path_array(input)?,
+                "binary_api_methods" => binary_api_methods = parse_path_array(input)?,
                 "ip_output" => {
                     if ip_output.is_some() {
                         return Err(Error::new(key.span(), "duplicate `ip_output` argument"));
@@ -2441,6 +2823,9 @@ impl Parse for PluginArgs {
             graph_nodes,
             node_functions,
             process_nodes,
+            session_transports,
+            app_session_protocols,
+            binary_api_methods,
         })
     }
 }
@@ -2498,6 +2883,9 @@ fn plugin_registration_tokens(args: &PluginArgs) -> TokenStream2 {
     let graph_nodes = &args.graph_nodes;
     let node_functions = &args.node_functions;
     let process_nodes = &args.process_nodes;
+    let session_transports = &args.session_transports;
+    let app_session_protocols = &args.app_session_protocols;
+    let binary_api_methods = &args.binary_api_methods;
     let dependencies_ident = format_ident!(
         "__PLUGIN_LOAD_AFTER_{}",
         name.value().to_ascii_uppercase().replace('-', "_")
@@ -2521,6 +2909,9 @@ fn plugin_registration_tokens(args: &PluginArgs) -> TokenStream2 {
             graph_nodes = [#(#graph_nodes),*];
             node_functions = [#(#node_functions),*];
             process_nodes = [#(#process_nodes),*];
+            session_transports = [#(#session_transports),*];
+            app_session_protocols = [#(#app_session_protocols),*];
+            binary_api_methods = [#(#binary_api_methods),*];
         );
 
         // This is deliberately plain TOML data, not an executable entrypoint.
@@ -2589,391 +2980,6 @@ fn expand_plugin(args: PluginArgs, module: &mut ItemMod) -> Result<TokenStream2>
 
         #module
     })
-}
-
-#[derive(Clone, Copy)]
-enum CryptoFamily {
-    Aead,
-    Hash,
-    Mac,
-    Kdf,
-    Kx,
-    Cipher,
-    Sign,
-    Verify,
-}
-
-impl CryptoFamily {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Aead => "Aead",
-            Self::Hash => "Hash",
-            Self::Mac => "Mac",
-            Self::Kdf => "Kdf",
-            Self::Kx => "Kx",
-            Self::Cipher => "Cipher",
-            Self::Sign => "Sign",
-            Self::Verify => "Verify",
-        }
-    }
-}
-
-fn expand_crypto_family(
-    family: CryptoFamily,
-    args: TokenStream,
-    input: TokenStream,
-) -> TokenStream {
-    if !args.is_empty() {
-        return Error::new(
-            Span::call_site(),
-            "crypto family attributes accept no arguments",
-        )
-        .into_compile_error()
-        .into();
-    }
-    let item = parse_macro_input!(input as ItemStruct);
-    let expected = family.name();
-    if item.ident != expected {
-        return Error::new_spanned(
-            &item.ident,
-            format!("`#[{expected}]` must annotate `struct {expected};`"),
-        )
-        .into_compile_error()
-        .into();
-    }
-    if !item.generics.params.is_empty() || !matches!(item.fields, Fields::Unit) {
-        return Error::new_spanned(
-            &item,
-            format!("`#[{expected}]` requires a non-generic unit struct"),
-        )
-        .into_compile_error()
-        .into();
-    }
-    expand_crypto_family_item(family, item).into()
-}
-
-fn expand_crypto_family_item(family: CryptoFamily, item: ItemStruct) -> TokenStream2 {
-    let ident = &item.ident;
-    let implementation = match family {
-        CryptoFamily::Aead => quote! {
-            impl Family for Aead {
-                type Operation<'a> = AeadOperation<'a>;
-                type Prepared = AeadPrepared;
-                type Prepare = usize;
-                type Dispatch = for<'a> fn(
-                    &mut AeadPrepared,
-                    &mut [AeadOperation<'a>],
-                ) -> Result<(), ContextError>;
-
-                const KEY_FAMILY: u8 = 1;
-
-                fn registry(engine: &Engine) -> &FamilyRegistry<Self> { &engine.aeads }
-                fn registry_mut(engine: &mut Engine) -> &mut FamilyRegistry<Self> {
-                    &mut engine.aeads
-                }
-                fn prepare_unkeyed(
-                    _: Self::Prepare,
-                    _: &Engine,
-                    _: AlgorithmId<Self>,
-                ) -> Option<Self::Prepared> {
-                    None
-                }
-                fn key_operations() -> KeyOperations {
-                    KeyOperations::AEAD_SEAL | KeyOperations::AEAD_OPEN
-                }
-                fn prepare_keyed(
-                    required: Self::Prepare,
-                    _: &Engine,
-                    _: AlgorithmId<Self>,
-                    key: KeyHandle,
-                    material: &[u8],
-                    policy: &KeyPolicy,
-                ) -> Result<Self::Prepared, ContextError> {
-                    AeadPrepared::new(required, key, material, policy.operations)
-                }
-            }
-        },
-        CryptoFamily::Hash => quote! {
-            impl Family for Hash {
-                type Operation<'a> = HashOperation<'a>;
-                type Prepared = HashPrepared;
-                type Prepare = ();
-                type Dispatch = for<'a> fn(
-                    &mut HashPrepared,
-                    &mut [HashOperation<'a>],
-                ) -> Result<(), ContextError>;
-
-                const KEY_FAMILY: u8 = 2;
-
-                fn registry(engine: &Engine) -> &FamilyRegistry<Self> { &engine.hashes }
-                fn registry_mut(engine: &mut Engine) -> &mut FamilyRegistry<Self> {
-                    &mut engine.hashes
-                }
-                fn prepare_unkeyed(
-                    _: Self::Prepare,
-                    _: &Engine,
-                    _: AlgorithmId<Self>,
-                ) -> Option<Self::Prepared> {
-                    Some(HashPrepared)
-                }
-            }
-        },
-        CryptoFamily::Cipher => quote! {
-            impl Family for Cipher {
-                type Operation<'a> = ();
-                type Prepared = ();
-                type Prepare = ();
-                type Dispatch = for<'a> fn(&mut (), &mut [()]) -> Result<(), ContextError>;
-
-                const KEY_FAMILY: u8 = 3;
-
-                fn registry(engine: &Engine) -> &FamilyRegistry<Self> { &engine.ciphers }
-                fn registry_mut(engine: &mut Engine) -> &mut FamilyRegistry<Self> {
-                    &mut engine.ciphers
-                }
-                fn prepare_unkeyed(
-                    _: Self::Prepare,
-                    _: &Engine,
-                    _: AlgorithmId<Self>,
-                ) -> Option<Self::Prepared> {
-                    None
-                }
-            }
-        },
-        CryptoFamily::Mac => quote! {
-            impl Family for Mac {
-                type Operation<'a> = MacOperation<'a>;
-                type Prepared = MacPrepared;
-                type Prepare = ();
-                type Dispatch = for<'a> fn(
-                    &mut MacPrepared,
-                    &mut [MacOperation<'a>],
-                ) -> Result<(), ContextError>;
-
-                const KEY_FAMILY: u8 = 4;
-
-                fn registry(engine: &Engine) -> &FamilyRegistry<Self> { &engine.macs }
-                fn registry_mut(engine: &mut Engine) -> &mut FamilyRegistry<Self> {
-                    &mut engine.macs
-                }
-                fn prepare_unkeyed(
-                    _: Self::Prepare,
-                    _: &Engine,
-                    _: AlgorithmId<Self>,
-                ) -> Option<Self::Prepared> {
-                    None
-                }
-                fn key_operations() -> KeyOperations { KeyOperations::MAC_AUTHENTICATE }
-                fn prepare_keyed(
-                    _: Self::Prepare,
-                    _: &Engine,
-                    _: AlgorithmId<Self>,
-                    _: KeyHandle,
-                    material: &[u8],
-                    _: &KeyPolicy,
-                ) -> Result<Self::Prepared, ContextError> {
-                    Ok(MacPrepared {
-                        key: Zeroizing::new(material.to_vec()),
-                    })
-                }
-            }
-        },
-        CryptoFamily::Kdf => quote! {
-            impl Family for Kdf {
-                type Operation<'a> = KdfOperation<'a>;
-                type Prepared = KdfPrepared;
-                type Prepare = ();
-                type Dispatch = for<'a> fn(
-                    &mut KdfPrepared,
-                    &mut [KdfOperation<'a>],
-                ) -> Result<(), ContextError>;
-
-                const KEY_FAMILY: u8 = 5;
-
-                fn registry(engine: &Engine) -> &FamilyRegistry<Self> { &engine.kdfs }
-                fn registry_mut(engine: &mut Engine) -> &mut FamilyRegistry<Self> {
-                    &mut engine.kdfs
-                }
-                fn prepare_unkeyed(
-                    _: Self::Prepare,
-                    _: &Engine,
-                    _: AlgorithmId<Self>,
-                ) -> Option<Self::Prepared> {
-                    None
-                }
-                fn key_operations() -> KeyOperations { KeyOperations::DERIVE }
-                fn prepare_keyed(
-                    _: Self::Prepare,
-                    engine: &Engine,
-                    _: AlgorithmId<Self>,
-                    _: KeyHandle,
-                    material: &[u8],
-                    policy: &KeyPolicy,
-                ) -> Result<Self::Prepared, ContextError> {
-                    Ok(KdfPrepared {
-                        material: Zeroizing::new(material.to_vec()),
-                        policy: policy.clone(),
-                        keys: Rc::clone(&engine.keys),
-                    })
-                }
-            }
-        },
-        CryptoFamily::Kx => quote! {
-            impl Family for Kx {
-                type Operation<'a> = KxOperation<'a>;
-                type Prepared = KxPrepared;
-                type Prepare = ();
-                type Dispatch = for<'a> fn(
-                    &mut KxPrepared,
-                    &mut [KxOperation<'a>],
-                ) -> Result<(), ContextError>;
-
-                const KEY_FAMILY: u8 = 6;
-
-                fn registry(engine: &Engine) -> &FamilyRegistry<Self> {
-                    &engine.key_exchanges
-                }
-                fn registry_mut(engine: &mut Engine) -> &mut FamilyRegistry<Self> {
-                    &mut engine.key_exchanges
-                }
-                fn prepare_unkeyed(
-                    _: Self::Prepare,
-                    engine: &Engine,
-                    algorithm: AlgorithmId<Self>,
-                ) -> Option<Self::Prepared> {
-                    Some(KxPrepared {
-                        policy_algorithm: PolicyAlgorithm::new(algorithm),
-                        keys: Rc::clone(&engine.keys),
-                    })
-                }
-            }
-        },
-        CryptoFamily::Sign => quote! {
-            impl Family for Sign {
-                type Operation<'a> = SignOperation<'a>;
-                type Prepared = SignPrepared;
-                type Prepare = ();
-                type Dispatch = for<'a> fn(
-                    &mut SignPrepared,
-                    &mut [SignOperation<'a>],
-                ) -> Result<(), ContextError>;
-
-                const KEY_FAMILY: u8 = 7;
-
-                fn registry(engine: &Engine) -> &FamilyRegistry<Self> { &engine.signers }
-                fn registry_mut(engine: &mut Engine) -> &mut FamilyRegistry<Self> {
-                    &mut engine.signers
-                }
-                fn prepare_unkeyed(
-                    _: Self::Prepare,
-                    _: &Engine,
-                    _: AlgorithmId<Self>,
-                ) -> Option<Self::Prepared> {
-                    None
-                }
-                fn key_operations() -> KeyOperations { KeyOperations::SIGN }
-                fn prepare_keyed(
-                    _: Self::Prepare,
-                    _: &Engine,
-                    _: AlgorithmId<Self>,
-                    _: KeyHandle,
-                    material: &[u8],
-                    _: &KeyPolicy,
-                ) -> Result<Self::Prepared, ContextError> {
-                    Ok(SignPrepared {
-                        private_key: Zeroizing::new(material.to_vec()),
-                    })
-                }
-            }
-        },
-        CryptoFamily::Verify => quote! {
-            impl Family for Verify {
-                type Operation<'a> = VerifyOperation<'a>;
-                type Prepared = VerifyPrepared;
-                type Prepare = ();
-                type Dispatch = for<'a> fn(
-                    &mut VerifyPrepared,
-                    &mut [VerifyOperation<'a>],
-                ) -> Result<(), ContextError>;
-
-                const KEY_FAMILY: u8 = 8;
-
-                fn registry(engine: &Engine) -> &FamilyRegistry<Self> { &engine.verifiers }
-                fn registry_mut(engine: &mut Engine) -> &mut FamilyRegistry<Self> {
-                    &mut engine.verifiers
-                }
-                fn prepare_unkeyed(
-                    _: Self::Prepare,
-                    _: &Engine,
-                    _: AlgorithmId<Self>,
-                ) -> Option<Self::Prepared> {
-                    Some(VerifyPrepared)
-                }
-            }
-        },
-    };
-
-    quote! {
-        #item
-        impl private::Sealed for #ident {}
-        #implementation
-    }
-}
-
-/// Declares the authenticated-encryption operation family.
-#[allow(non_snake_case)]
-#[proc_macro_attribute]
-pub fn Aead(args: TokenStream, input: TokenStream) -> TokenStream {
-    expand_crypto_family(CryptoFamily::Aead, args, input)
-}
-
-/// Declares the digest operation family.
-#[allow(non_snake_case)]
-#[proc_macro_attribute]
-pub fn Hash(args: TokenStream, input: TokenStream) -> TokenStream {
-    expand_crypto_family(CryptoFamily::Hash, args, input)
-}
-
-/// Declares the message-authentication operation family.
-#[allow(non_snake_case)]
-#[proc_macro_attribute]
-pub fn Mac(args: TokenStream, input: TokenStream) -> TokenStream {
-    expand_crypto_family(CryptoFamily::Mac, args, input)
-}
-
-/// Declares the key-derivation operation family.
-#[allow(non_snake_case)]
-#[proc_macro_attribute]
-pub fn Kdf(args: TokenStream, input: TokenStream) -> TokenStream {
-    expand_crypto_family(CryptoFamily::Kdf, args, input)
-}
-
-/// Declares the key-establishment operation family.
-#[allow(non_snake_case)]
-#[proc_macro_attribute]
-pub fn Kx(args: TokenStream, input: TokenStream) -> TokenStream {
-    expand_crypto_family(CryptoFamily::Kx, args, input)
-}
-
-/// Declares the unauthenticated-cipher operation family.
-#[allow(non_snake_case)]
-#[proc_macro_attribute]
-pub fn Cipher(args: TokenStream, input: TokenStream) -> TokenStream {
-    expand_crypto_family(CryptoFamily::Cipher, args, input)
-}
-
-/// Declares the digital-signing operation family.
-#[allow(non_snake_case)]
-#[proc_macro_attribute]
-pub fn Sign(args: TokenStream, input: TokenStream) -> TokenStream {
-    expand_crypto_family(CryptoFamily::Sign, args, input)
-}
-
-/// Declares the signature-verification operation family.
-#[allow(non_snake_case)]
-#[proc_macro_attribute]
-pub fn Verify(args: TokenStream, input: TokenStream) -> TokenStream {
-    expand_crypto_family(CryptoFamily::Verify, args, input)
 }
 
 #[cfg(test)]

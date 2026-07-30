@@ -21,6 +21,7 @@ const DEFAULT_TCP_CONNECTION_CAPACITY: usize = 1024;
 const TCP_APP_RX_MIN_FREE: usize = 4 << 10;
 const TCP_APP_RX_MAX_FREE: usize = 128 << 10;
 
+#[hammer_component_macros::session_transport(name = "tcp", upper = "ordered-reliable-byte-stream")]
 pub struct TcpWorker {
     pub(crate) connections: Pool<TcpConnection>,
     pub(crate) lookup: TcpLookupState,

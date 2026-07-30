@@ -11,19 +11,21 @@ use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::segment::Segment;
 use hammer_infra::thread_owned::ThreadOwned;
 use hammer_runtime::app::{
-    AppSession, AppSessionConfig, AppSessionError, SessionEventQueue, SessionEvt, SessionEvtType,
-    SessionHandle, SessionMsgQueue,
+    AppSession, AppSessionConfig, AppSessionError, AppSessionProtocolRole, ApplicationConnectionId,
+    ApplicationId, Plaintext, SessionEventQueue, SessionEvt, SessionEvtType, SessionHandle,
+    SessionMsgQueue,
 };
 use hammer_runtime::attach::AppSessionPublisher;
 use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
 use hammer_runtime::{DataPlaneRuntime, DataWorkerId, Engine, File, FileFunctions};
 
 use crate::session::app::{AppWorkerAttach, AppWorkerError};
+use crate::session::application::{ApplicationMain, ApplicationProtocol};
 use crate::session::error::{SessionError, SessionQueueError};
+use crate::session::protocol_chain::{ProtocolChain, ProtocolChainIo};
+use crate::session::stack::{AppSessionLayer, AppSessionStack};
 use crate::session::state::SessionState;
-use crate::session::{
-    AppWorker, Plaintext, ProtocolChain, ProtocolChainIo, SessionId, SessionQueueNext,
-};
+use crate::session::{AppWorker, SessionId, SessionQueueNext};
 
 const DEFAULT_SESSION_POOL_CAPACITY: usize = 1024;
 const DEFAULT_SESSION_TX_EVENT_CAPACITY: usize = 2048;
@@ -95,16 +97,48 @@ pub struct SessionQueueStep {
 #[derive(Debug)]
 struct SessionEntry<Index> {
     transport: SessionTransportId,
+    application: Option<ApplicationId>,
     state: SessionState<Index>,
     schedule_pending: bool,
-    protocol_chain: Option<ProtocolChain<Plaintext, ProtocolChain<()>>>,
+    protocol_chain: Option<SessionProtocolChain>,
+}
+
+enum SessionProtocolChain {
+    Plaintext(ProtocolChain<Plaintext, ProtocolChain<()>>),
+    Registered(AppSessionStack),
+}
+
+impl SessionProtocolChain {
+    fn ingress(&mut self) -> RuntimeResult<()> {
+        match self {
+            Self::Plaintext(chain) => chain.ingress(),
+            Self::Registered(chain) => chain.ingress(),
+        }
+    }
+
+    fn egress(&mut self) -> RuntimeResult<()> {
+        match self {
+            Self::Plaintext(chain) => chain.egress(),
+            Self::Registered(chain) => chain.egress(),
+        }
+    }
+}
+
+impl std::fmt::Debug for SessionProtocolChain {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Plaintext(_) => formatter.write_str("Plaintext"),
+            Self::Registered(chain) => chain.fmt(formatter),
+        }
+    }
 }
 
 impl<Index: Copy + Eq> SessionEntry<Index> {
     #[inline]
-    const fn creating(transport: SessionTransportId) -> Self {
+    const fn creating(transport: SessionTransportId, application: Option<ApplicationId>) -> Self {
         Self {
             transport,
+            application,
             state: SessionState::creating(),
             schedule_pending: false,
             protocol_chain: None,
@@ -114,7 +148,9 @@ impl<Index: Copy + Eq> SessionEntry<Index> {
 
 pub struct SessionWorker<Index> {
     worker: DataWorkerId,
+    worker_count: usize,
     entries: Pool<SessionEntry<Index>>,
+    applications: Option<Arc<ApplicationMain>>,
     app: AppWorker,
     lower_tx_evt_q: Arc<SessionMsgQueue>,
     app_session_config: AppSessionConfig,
@@ -175,6 +211,42 @@ impl SessionMain {
                 source,
             })
         })?
+    }
+
+    pub(crate) fn application_detached(
+        self: &Arc<Self>,
+        engine: &Engine,
+        application: ApplicationId,
+    ) {
+        for worker_slot in 0..self.workers.len() {
+            let worker = DataWorkerId::new(worker_slot as u32);
+            loop {
+                let main = Arc::clone(self);
+                match engine.schedule_on_worker(worker, move || {
+                    main.worker(worker)
+                        .expect("scheduled Application detach targets an existing Session worker")
+                        .with_mut(|sessions| {
+                            sessions.application_detached(application);
+                            sessions.signal_queue();
+                        })
+                        .expect("scheduled Application detach runs on its Session worker");
+                }) {
+                    Ok(()) => break,
+                    Err(RuntimeError::WorkerControlQueueFull { .. }) => {
+                        std::thread::yield_now();
+                    }
+                    Err(
+                        RuntimeError::WorkerControlUnavailable { .. }
+                        | RuntimeError::WorkerControlClosed { .. },
+                    ) => break,
+                    Err(error) => {
+                        panic!(
+                            "Application detach could not notify Session worker {worker_slot}: {error}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -288,8 +360,178 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         index: Index,
         listener: u32,
     ) -> RuntimeResult<SessionId> {
-        let session_id = self.insert_creating_session(transport)?;
+        self.construct_plaintext_stream(transport, index, listener)
+    }
+
+    pub fn stream_connect(
+        &mut self,
+        transport: SessionTransportId,
+        transport_name: &'static str,
+        index: Index,
+        connection: ApplicationConnectionId,
+    ) -> RuntimeResult<SessionId> {
+        let applications = self
+            .applications
+            .as_ref()
+            .cloned()
+            .ok_or(SessionError::ApplicationMainMissingForConnection { connection })?;
+        let session_id = applications
+            .with_connection(connection, |policy| {
+                if policy.transport().name() != transport_name {
+                    return Err(SessionError::ConnectionTransportSelectionMismatch {
+                        connection,
+                        selected: policy.transport().name(),
+                        actual: transport_name,
+                    }
+                    .into());
+                }
+                self.construct_stream_stack(
+                    transport,
+                    index,
+                    connection.raw(),
+                    policy.application(),
+                    AppSessionProtocolRole::Client,
+                    policy.protocols(),
+                    policy.server_name(),
+                )
+            })
+            .map_err(|source| RuntimeError::subsystem("application", source))??;
+        if let Err(source) = applications.complete_connection(connection) {
+            self.remove_session_entry(session_id);
+            return Err(RuntimeError::subsystem("application", source));
+        }
+        Ok(session_id)
+    }
+
+    fn construct_plaintext_stream(
+        &mut self,
+        transport: SessionTransportId,
+        index: Index,
+        listener: u32,
+    ) -> RuntimeResult<SessionId> {
+        let session_id = self.insert_creating_session(transport, None)?;
         let handle = SessionHandle::new(session_id.pool_index().slot(), self.worker.slot() as u32);
+        let transport_session = match self.create_local_session(handle) {
+            Ok(session) => session,
+            Err(error) => {
+                self.remove_session_entry(session_id);
+                return Err(error);
+            }
+        };
+        let app_session = match self.app.create_app_session(
+            u64::from(listener),
+            None,
+            handle,
+            self.app_session_config,
+            Arc::clone(self.app.tx_evt_q()),
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                self.remove_session_entry(session_id);
+                return Err(error);
+            }
+        };
+        let chain = ProtocolChain::new(
+            Arc::clone(&app_session),
+            Plaintext,
+            ProtocolChain::transport(Arc::clone(&transport_session)),
+        );
+        self.app
+            .attach_session(session_id, Arc::clone(&transport_session), app_session);
+        if let Err(error) =
+            self.finish_session_creation(session_id, index, SessionProtocolChain::Plaintext(chain))
+        {
+            self.remove_session_entry(session_id);
+            return Err(error);
+        }
+        Ok(session_id)
+    }
+
+    fn construct_stream_stack(
+        &mut self,
+        transport: SessionTransportId,
+        index: Index,
+        listener: u64,
+        application: ApplicationId,
+        role: AppSessionProtocolRole,
+        protocols: &[ApplicationProtocol],
+        server_name: Option<&str>,
+    ) -> RuntimeResult<SessionId> {
+        assert!(
+            !protocols.is_empty(),
+            "validated App Session policy retains at least one protocol"
+        );
+        let session_id = self.insert_creating_session(transport, Some(application))?;
+        let handle = SessionHandle::new(session_id.pool_index().slot(), self.worker.slot() as u32);
+        let lower_session = match self.create_local_session(handle) {
+            Ok(session) => session,
+            Err(error) => {
+                self.remove_session_entry(session_id);
+                return Err(error);
+            }
+        };
+        let mut stack = AppSessionStack::new(self.worker, Arc::clone(&lower_session));
+        for (position, protocol) in protocols.iter().copied().enumerate() {
+            let is_uppermost = position + 1 == protocols.len();
+            let session = if is_uppermost {
+                let tx_evt_q = self.app.tx_evt_q().clone();
+                match self.app.create_app_session(
+                    listener,
+                    Some(application),
+                    handle,
+                    self.app_session_config,
+                    tx_evt_q,
+                ) {
+                    Ok(session) => session,
+                    Err(error) => {
+                        self.remove_session_entry(session_id);
+                        return Err(error);
+                    }
+                }
+            } else {
+                match self.create_local_session(handle) {
+                    Ok(session) => session,
+                    Err(error) => {
+                        self.remove_session_entry(session_id);
+                        return Err(error);
+                    }
+                }
+            };
+            let connection = match protocol.entry().create(
+                self.worker,
+                self.worker_count,
+                Some(application),
+                role,
+                protocol.id(),
+                server_name,
+            ) {
+                Ok(connection) => connection,
+                Err(error) => {
+                    if is_uppermost {
+                        self.app.discard_app_session(&session);
+                    }
+                    self.remove_session_entry(session_id);
+                    return Err(error);
+                }
+            };
+            stack.push(AppSessionLayer::new(session, protocol.entry(), connection));
+        }
+        let upper_session = Arc::clone(stack.app_session());
+        self.app.attach_session(
+            session_id,
+            Arc::clone(stack.transport_session()),
+            upper_session,
+        );
+        if let Err(error) =
+            self.finish_session_creation(session_id, index, SessionProtocolChain::Registered(stack))
+        {
+            self.remove_session_entry(session_id);
+            return Err(error);
+        }
+        Ok(session_id)
+    }
+
+    fn create_local_session(&self, handle: SessionHandle) -> RuntimeResult<Arc<AppSession>> {
         let fifo_bytes = align_up(
             Fifo::layout_bytes(self.app_session_config.fifo_capacity).map_err(|_| {
                 AppSessionError::RxFifoCapacityInvalid {
@@ -315,51 +557,23 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             .and_then(|bytes| bytes.checked_add(event_queue_bytes))
             .and_then(|bytes| bytes.checked_add(128))
             .ok_or(AppWorkerError::SessionSegmentSizeOverflow)?;
-        let lower_session = match AppSession::new_in_segment(
+        AppSession::new_in_segment(
             Segment::local(lower_segment_bytes),
             self.app_session_config,
             handle,
             Arc::clone(&self.lower_tx_evt_q),
-        ) {
-            Ok(session) => Arc::new(session),
-            Err(error) => {
-                self.remove_session_entry(session_id);
-                return Err(error.into());
-            }
-        };
-        let upper_tx_evt_q = self.app.tx_evt_q().clone();
-        let upper_session = match self.app.create_app_session(
-            listener,
-            handle,
-            self.app_session_config,
-            upper_tx_evt_q,
-        ) {
-            Ok(session) => session,
-            Err(error) => {
-                self.remove_session_entry(session_id);
-                return Err(error);
-            }
-        };
-        let protocol_chain = ProtocolChain::new(
-            Arc::clone(&upper_session),
-            Plaintext,
-            ProtocolChain::transport(Arc::clone(&lower_session)),
-        );
-        self.app
-            .attach_session(session_id, lower_session, upper_session);
-        if let Err(error) = self.finish_session_creation(session_id, index, protocol_chain) {
-            self.remove_session_entry(session_id);
-            return Err(error);
-        }
-        Ok(session_id)
+        )
+        .map(Arc::new)
+        .map_err(Into::into)
     }
 
     fn insert_creating_session(
         &mut self,
         transport: SessionTransportId,
+        application: Option<ApplicationId>,
     ) -> RuntimeResult<SessionId> {
         self.entries
-            .insert_with(|_| SessionEntry::creating(transport))
+            .insert_with(|_| SessionEntry::creating(transport, application))
             .map(SessionId::from)
             .ok_or_else(|| {
                 SessionError::CapacityExhausted {
@@ -373,7 +587,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         &mut self,
         session_id: SessionId,
         index: Index,
-        protocol_chain: ProtocolChain<Plaintext, ProtocolChain<()>>,
+        protocol_chain: SessionProtocolChain,
     ) -> RuntimeResult<()> {
         let entry = self
             .entries
@@ -434,6 +648,17 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         self.app.discard_all_tx_bytes_for_session(session_id);
         let _ = self.app.detach_session(session_id);
         self.entries.remove(session_id.pool_index()).is_some()
+    }
+
+    fn application_detached(&mut self, application: ApplicationId) {
+        let entries = &self.entries;
+        let control_events = &mut self.control_events;
+        for (pool_index, entry) in entries.iter() {
+            if entry.application == Some(application) {
+                control_events
+                    .push_back(SessionControlEvent::Disconnect(SessionId::from(pool_index)));
+            }
+        }
     }
 
     pub fn notify_transport_closed(
@@ -710,6 +935,18 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         worker: DataWorkerId,
         app_session_config: AppSessionConfig,
     ) -> RuntimeResult<Self> {
+        Self::with_worker_count_and_app_session_config(
+            worker,
+            worker.slot() + 1,
+            app_session_config,
+        )
+    }
+
+    pub(crate) fn with_worker_count_and_app_session_config(
+        worker: DataWorkerId,
+        worker_count: usize,
+        app_session_config: AppSessionConfig,
+    ) -> RuntimeResult<Self> {
         let cap = DEFAULT_SESSION_TX_EVENT_CAPACITY.next_power_of_two().max(2) as u32;
         let layout = SessionMsgQueue::layout_bytes(cap, cap.max(2))
             .map_err(|error| AppWorkerError::TxEventQueue { error })?;
@@ -732,7 +969,9 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         let app = AppWorker::new(DEFAULT_SESSION_POOL_CAPACITY, tx_evt_q, worker.slot());
         Ok(Self::from_app(
             worker,
+            worker_count,
             app_session_config,
+            None,
             app,
             lower_tx_evt_q,
         ))
@@ -740,7 +979,9 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
 
     pub(crate) fn with_app_session_attach(
         worker: DataWorkerId,
+        worker_count: usize,
         app_session_config: AppSessionConfig,
+        applications: Arc<ApplicationMain>,
         publisher: AppSessionPublisher,
     ) -> RuntimeResult<Self> {
         let cap = DEFAULT_SESSION_TX_EVENT_CAPACITY.next_power_of_two().max(2) as u32;
@@ -774,21 +1015,42 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         );
         Ok(Self::from_app(
             worker,
+            worker_count,
             app_session_config,
+            Some(applications),
             app,
             lower_tx_evt_q,
         ))
     }
 
+    pub(crate) fn with_application_main(
+        worker: DataWorkerId,
+        worker_count: usize,
+        app_session_config: AppSessionConfig,
+        applications: Arc<ApplicationMain>,
+    ) -> RuntimeResult<Self> {
+        let mut worker = Self::with_worker_count_and_app_session_config(
+            worker,
+            worker_count,
+            app_session_config,
+        )?;
+        worker.applications = Some(applications);
+        Ok(worker)
+    }
+
     fn from_app(
         worker: DataWorkerId,
+        worker_count: usize,
         app_session_config: AppSessionConfig,
+        applications: Option<Arc<ApplicationMain>>,
         app: AppWorker,
         lower_tx_evt_q: Arc<SessionMsgQueue>,
     ) -> Self {
         Self {
             worker,
+            worker_count,
             entries: Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
+            applications,
             app,
             lower_tx_evt_q,
             app_session_config,

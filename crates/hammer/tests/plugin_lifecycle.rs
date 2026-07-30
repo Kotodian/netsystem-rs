@@ -9,10 +9,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hammer_ipc::handler::{IpcRequest, IpcResponse, PluginCommandReply};
 use hammer_ipc::{read_frame, write_frame};
+use hammer_runtime::PluginMain;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const PROTOCOL_REGISTRATION_CHILD: &str = "HAMMER_PROTOCOL_REGISTRATION_CHILD";
 
 struct Daemon {
     child: Child,
@@ -162,6 +164,35 @@ main_heap_size = "256 MiB"
     daemon.load_plugins(&["tls"]);
     assert_eq!(daemon.plugin_names(), ["tls"]);
     daemon.shutdown();
+}
+
+#[test]
+fn tls_dso_registers_app_session_protocol() {
+    if std::env::var_os(PROTOCOL_REGISTRATION_CHILD).is_some() {
+        let mut plugins = PluginMain::default();
+        plugins
+            .load(env!("CARGO_PKG_VERSION"), &["tls".to_owned()])
+            .expect("load TLS DSO");
+        assert_eq!(
+            plugins
+                .app_session_protocol("tls")
+                .expect("resolve TLS protocol registration")
+                .registration()
+                .name(),
+            "tls"
+        );
+        return;
+    }
+
+    let status = Command::new(std::env::current_exe().expect("resolve test executable"))
+        .arg("--exact")
+        .arg("tls_dso_registers_app_session_protocol")
+        .arg("--nocapture")
+        .env(PROTOCOL_REGISTRATION_CHILD, "1")
+        .env("HAMMER_PLUGIN_DIR", daemon_binary_directory())
+        .status()
+        .expect("run isolated TLS DSO registration test");
+    assert!(status.success(), "TLS DSO registration child failed");
 }
 
 #[test]

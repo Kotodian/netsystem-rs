@@ -20,6 +20,7 @@ hammer-component-macros = { path = "../hammer-component-macros" }
 hammer-runtime = { path = "../hammer-runtime", default-features = false }
 ipnet = { workspace = true }
 nom = { workspace = true }
+prost = { workspace = true }
 etherparse = { workspace = true }
 tokio = { workspace = true, features = ["signal"] }
 tracing = { workspace = true }

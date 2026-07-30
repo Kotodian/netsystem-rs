@@ -1,11 +1,13 @@
+use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 use hammer_infra::segment::Segment;
-use hammer_runtime::app::{AppSession, SessionHandle, SessionOffsets};
+use hammer_runtime::app::{AppSession, ApplicationId, SessionHandle, SessionOffsets};
 use hammer_runtime::attach::{
-    ATTACH_DESCRIPTOR_COUNT, ATTACH_METADATA_BYTES, ATTACH_METADATA_WORDS, ATTACH_PROTOCOL_VERSION,
+    ATTACH_APPLICATION_ACCEPTED, ATTACH_APPLICATION_BYTES, ATTACH_DESCRIPTOR_COUNT,
+    ATTACH_METADATA_BYTES, ATTACH_METADATA_WORDS, ATTACH_PROTOCOL_VERSION,
 };
 use thiserror::Error;
 
@@ -17,6 +19,13 @@ pub enum AppClientError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to register Application on the attach connection")]
+    Registration {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("attach server rejected Application {application:?}")]
+    ApplicationRejected { application: ApplicationId },
     #[error("failed to receive attach descriptors")]
     Receive {
         #[source]
@@ -60,14 +69,33 @@ pub enum AppClientError {
     },
 }
 
-pub struct AppClient;
+pub struct AppClient {
+    stream: UnixStream,
+}
 
 impl AppClient {
-    pub fn connect(path: &str) -> Result<AppSession, AppClientError> {
-        let stream = UnixStream::connect(path).map_err(|source| AppClientError::Connect {
+    pub fn connect(path: &str, application: ApplicationId) -> Result<Self, AppClientError> {
+        let mut stream = UnixStream::connect(path).map_err(|source| AppClientError::Connect {
             path: path.into(),
             source,
         })?;
+        let mut registration = [0_u8; ATTACH_APPLICATION_BYTES];
+        registration[..size_of::<u64>()].copy_from_slice(&ATTACH_PROTOCOL_VERSION.to_le_bytes());
+        registration[size_of::<u64>()..].copy_from_slice(&application.raw().to_le_bytes());
+        stream
+            .write_all(&registration)
+            .map_err(|source| AppClientError::Registration { source })?;
+        let mut status = [0_u8; 1];
+        stream
+            .read_exact(&mut status)
+            .map_err(|source| AppClientError::Registration { source })?;
+        if status[0] != ATTACH_APPLICATION_ACCEPTED {
+            return Err(AppClientError::ApplicationRejected { application });
+        }
+        Ok(Self { stream })
+    }
+
+    pub fn accept(&self) -> Result<AppSession, AppClientError> {
         let mut metadata = [0_u8; ATTACH_METADATA_BYTES];
         let mut control = [0_u8; 128];
         let mut iov = libc::iovec {
@@ -80,7 +108,7 @@ impl AppClient {
         message.msg_control = control.as_mut_ptr().cast::<libc::c_void>();
         message.msg_controllen = control.len() as _;
 
-        let received_bytes = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut message, 0) };
+        let received_bytes = unsafe { libc::recvmsg(self.stream.as_raw_fd(), &mut message, 0) };
         if received_bytes < 0 {
             return Err(AppClientError::Receive {
                 source: std::io::Error::last_os_error(),
