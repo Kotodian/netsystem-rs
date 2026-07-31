@@ -46,6 +46,7 @@ pub struct AppWorker {
     /// Cold accept/detach-only metadata; never read on the packet path.
     attach_slots: Vec<AttachSlot>,
     tx_evt_q: Arc<SessionMsgQueue>,
+    blocked_tx_event: Option<SessionEvt>,
     worker_index: usize,
     segments_by_owner: HashMap<u64, SegmentManager>,
     publisher: Option<AppSessionPublisher>,
@@ -288,6 +289,7 @@ impl AppWorker {
             session_slots: vec![None; session_capacity],
             attach_slots: vec![AttachSlot::default(); session_capacity],
             tx_evt_q,
+            blocked_tx_event: None,
             worker_index,
             segments_by_owner: HashMap::new(),
             publisher: None,
@@ -410,32 +412,39 @@ impl AppWorker {
         Ok(())
     }
 
-    pub(crate) fn drain_tx_events_to(&self, mut dispatch_event: impl FnMut(SessionEvt)) -> usize {
+    pub(crate) fn drain_tx_events_to(
+        &mut self,
+        mut dispatch_event: impl FnMut(SessionEvt) -> Result<(), SessionMsgQueueError>,
+    ) -> Result<usize, SessionMsgQueueError> {
         let mut dispatched = 0usize;
-        let mut batch = [SessionEvt::io(0, SessionEvtType::Connect); 64];
         let worker_index = self.worker_index as u32;
-        loop {
-            self.tx_evt_q.drain();
-            let count = self.tx_evt_q.dequeue_batch(&mut batch);
-            if count == 0 {
-                break;
-            }
-            for evt in batch[..count].iter() {
-                if matches!(
-                    evt.evt_type,
-                    SessionEvtType::Close | SessionEvtType::HalfClose
-                ) && evt.worker_index() != worker_index
-                {
-                    continue;
+        if let Some(event) = self.blocked_tx_event.take() {
+            match dispatch_event(event) {
+                Ok(()) => dispatched += 1,
+                Err(error) => {
+                    self.blocked_tx_event = Some(event);
+                    return Err(error);
                 }
-                dispatch_event(*evt);
-                dispatched += 1;
-            }
-            if count < batch.len() {
-                break;
             }
         }
-        dispatched
+        self.tx_evt_q.drain();
+        while let Some(event) = self.tx_evt_q.dequeue() {
+            if matches!(
+                event.evt_type,
+                SessionEvtType::Close | SessionEvtType::HalfClose
+            ) && event.worker_index() != worker_index
+            {
+                continue;
+            }
+            match dispatch_event(event) {
+                Ok(()) => dispatched += 1,
+                Err(error) => {
+                    self.blocked_tx_event = Some(event);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(dispatched)
     }
 }
 
@@ -455,93 +464,124 @@ mod tests {
     use super::*;
     use hammer_infra::pool::Index as PoolIndex;
     use hammer_runtime::app::{AppSessionConfig, SessionEvt, SessionEvtType, SessionHandle};
-    use std::sync::Mutex;
+
+    fn event_queue_error(error: SessionMsgQueueError) -> RuntimeError {
+        AppWorkerError::SessionEventQueue { error }.into()
+    }
 
     #[test]
-    fn drain_forwards_events_without_a_root_session_lookup() {
-        let app = AppWorker::default_local().expect("app worker");
+    fn drain_forwards_events_without_a_root_session_lookup() -> Result<(), RuntimeError> {
+        let mut app = AppWorker::default_local()?;
         app.tx_evt_q()
             .enqueue_ctrl(SessionEvt::ctrl(3, 0, SessionEvtType::Close))
-            .expect("enqueue close");
+            .map_err(event_queue_error)?;
         app.tx_evt_q()
             .enqueue_io(SessionEvt::io(3, SessionEvtType::TxEnq))
-            .expect("enqueue tx enqueue");
+            .map_err(event_queue_error)?;
 
-        let dispatched = Mutex::new(Vec::new());
-        let dispatched_count = app.drain_tx_events_to(|evt| {
-            dispatched
-                .lock()
-                .expect("dispatched")
-                .push((evt.session_index(), evt.evt_type));
-        });
+        let mut dispatched = Vec::new();
+        let dispatched_count = app
+            .drain_tx_events_to(|evt| {
+                dispatched.push((evt.session_index(), evt.evt_type));
+                Ok(())
+            })
+            .map_err(event_queue_error)?;
 
         assert_eq!(dispatched_count, 2);
         assert_eq!(
-            *dispatched.lock().expect("dispatched"),
+            dispatched,
             vec![(3, SessionEvtType::Close), (3, SessionEvtType::TxEnq)]
         );
+        Ok(())
     }
 
     #[test]
-    fn drain_drops_close_when_worker_index_mismatches() {
-        let mut app = AppWorker::default_local().expect("app worker");
+    fn drain_drops_close_when_worker_index_mismatches() -> Result<(), RuntimeError> {
+        let mut app = AppWorker::default_local()?;
         let session_id = SessionId::from(PoolIndex::new(5, 1));
-        let session = Arc::new(
-            AppSession::new_in_segment(
-                Segment::default(),
-                AppSessionConfig::new(64, 4),
-                SessionHandle::new(5, 0),
-                app.tx_evt_q().clone(),
-            )
-            .expect("app session"),
-        );
+        let session = Arc::new(AppSession::new_in_segment(
+            Segment::default(),
+            AppSessionConfig::new(64, 4),
+            SessionHandle::new(5, 0),
+            app.tx_evt_q().clone(),
+        )?);
         app.attach_session(session_id, session);
         app.tx_evt_q()
             .enqueue_ctrl(SessionEvt::ctrl(5, 9, SessionEvtType::Close))
-            .expect("enqueue close for wrong worker");
+            .map_err(event_queue_error)?;
 
-        let dispatched = Mutex::new(Vec::new());
-        let dispatched_count = app.drain_tx_events_to(|evt| {
-            dispatched
-                .lock()
-                .expect("dispatched")
-                .push((evt.session_index(), evt.evt_type));
-        });
+        let mut dispatched = Vec::new();
+        let dispatched_count = app
+            .drain_tx_events_to(|evt| {
+                dispatched.push((evt.session_index(), evt.evt_type));
+                Ok(())
+            })
+            .map_err(event_queue_error)?;
 
         assert_eq!(dispatched_count, 0);
-        assert!(dispatched.lock().expect("dispatched").is_empty());
+        assert!(dispatched.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn drain_dispatches_close_with_matching_session_handle() {
-        let mut app = AppWorker::default_local().expect("app worker");
-        let session_id = SessionId::from(PoolIndex::new(5, 1));
-        let session = Arc::new(
-            AppSession::new_in_segment(
-                Segment::default(),
-                AppSessionConfig::new(64, 4),
-                SessionHandle::new(5, 0),
-                app.tx_evt_q().clone(),
-            )
-            .expect("app session"),
+    fn drain_retains_failed_tx_event_for_retry() -> Result<(), RuntimeError> {
+        let mut app = AppWorker::default_local()?;
+        let blocked = SessionEvt::io(5, SessionEvtType::TxEnq);
+        let following = SessionEvt::io(6, SessionEvtType::TxEnq);
+        app.tx_evt_q()
+            .enqueue_io(blocked)
+            .map_err(event_queue_error)?;
+        app.tx_evt_q()
+            .enqueue_io(following)
+            .map_err(event_queue_error)?;
+
+        let mut dispatched = Vec::new();
+        let error = match app.drain_tx_events_to(|evt| {
+            if evt == blocked {
+                return Err(SessionMsgQueueError::Full(evt));
+            }
+            dispatched.push(evt.session_index());
+            Ok(())
+        }) {
+            Ok(_) => panic!("full destination must retain blocked event"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, SessionMsgQueueError::Full(blocked));
+        assert_eq!(app.blocked_tx_event, Some(blocked));
+        assert!(dispatched.is_empty());
+        assert_eq!(
+            app.tx_evt_q().dequeue(),
+            Some(following),
+            "events after the blocked event stay in the source queue"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn drain_dispatches_close_with_matching_session_handle() -> Result<(), RuntimeError> {
+        let mut app = AppWorker::default_local()?;
+        let session_id = SessionId::from(PoolIndex::new(5, 1));
+        let session = Arc::new(AppSession::new_in_segment(
+            Segment::default(),
+            AppSessionConfig::new(64, 4),
+            SessionHandle::new(5, 0),
+            app.tx_evt_q().clone(),
+        )?);
         app.attach_session(session_id, session);
         app.tx_evt_q()
             .enqueue_ctrl(SessionEvt::ctrl(5, 0, SessionEvtType::Close))
-            .expect("enqueue close");
+            .map_err(event_queue_error)?;
 
-        let dispatched = Mutex::new(Vec::new());
+        let mut dispatched = Vec::new();
         app.drain_tx_events_to(|evt| {
-            dispatched
-                .lock()
-                .expect("dispatched")
-                .push((evt.session_index(), evt.evt_type));
-        });
+            dispatched.push((evt.session_index(), evt.evt_type));
+            Ok(())
+        })
+        .map_err(event_queue_error)?;
 
-        assert_eq!(
-            *dispatched.lock().expect("dispatched"),
-            vec![(5, SessionEvtType::Close)]
-        );
+        assert_eq!(dispatched, vec![(5, SessionEvtType::Close)]);
+        Ok(())
     }
 
     #[test]

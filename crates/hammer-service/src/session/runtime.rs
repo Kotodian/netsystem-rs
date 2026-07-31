@@ -17,7 +17,7 @@ use hammer_runtime::app::{
     AppSession, AppSessionConfig, AppSessionError, AppSessionProtocolConnectionId,
     AppSessionProtocolEntry, AppSessionProtocolRole, ApplicationConnectionId, ApplicationId,
     ApplicationListenerId, SessionEventQueue, SessionEvt, SessionEvtFlags, SessionEvtType,
-    SessionHandle, SessionMsgQueue,
+    SessionHandle, SessionMsgQueue, SessionMsgQueueError,
 };
 use hammer_runtime::attach::AppSessionPublisher;
 use hammer_runtime::{
@@ -190,11 +190,63 @@ pub struct SessionWorker<Index> {
 struct AppRxMqEntry {
     application: ApplicationId,
     queue: Arc<SessionMsgQueue>,
+    blocked_event: Option<SessionEvt>,
     file: Option<PoolIndex>,
     appsl_input_node: hammer_core::data_plane::NodeId,
     pending_queue: usize,
     pending: bool,
     postponed: bool,
+}
+
+impl AppRxMqEntry {
+    fn drain_snapshot_to(
+        &mut self,
+        dispatch_event: &mut impl FnMut(SessionEvt) -> Result<(), SessionMsgQueueError>,
+    ) -> (usize, Option<SessionMsgQueueError>) {
+        let was_postponed = self.postponed;
+        if !was_postponed {
+            self.queue.drain();
+        }
+        self.postponed = false;
+
+        let mut dispatched = 0usize;
+        let mut dispatch_error = None;
+        if let Some(event) = self.blocked_event.take() {
+            match dispatch_event(event) {
+                Ok(()) => dispatched += 1,
+                Err(error) => {
+                    self.blocked_event = Some(event);
+                    dispatch_error = Some(error);
+                }
+            }
+        }
+
+        if self.blocked_event.is_none() {
+            let snapshot = self.queue.len();
+            for _ in 0..snapshot {
+                let Some(event) = self.queue.dequeue() else {
+                    break;
+                };
+                match dispatch_event(event) {
+                    Ok(()) => dispatched += 1,
+                    Err(error) => {
+                        self.blocked_event = Some(event);
+                        dispatch_error = Some(error);
+                        break;
+                    }
+                }
+            }
+        }
+
+        let mut has_work = self.blocked_event.is_some() || !self.queue.is_empty();
+        if was_postponed && !has_work {
+            self.queue.drain();
+            has_work = !self.queue.is_empty();
+        }
+        self.pending = has_work;
+        self.postponed = has_work;
+        (dispatched, dispatch_error)
+    }
 }
 
 pub struct SessionMain {
@@ -495,6 +547,25 @@ impl SessionMain {
         engine: &Engine,
         application: ApplicationId,
     ) -> RuntimeResult<()> {
+        for worker_slot in 0..self.workers.len() {
+            let worker = DataWorkerId::new(worker_slot as u32);
+            let main = Arc::clone(self);
+            schedule_worker_task(engine, worker, move || {
+                Engine::with_current(|_| {
+                    main.worker(worker)?
+                        .with_mut(|sessions| {
+                            sessions.drain_app_mq(application)?;
+                            Ok(())
+                        })
+                        .map_err(|source| SessionQueueError::WorkerAccess {
+                            worker: worker.slot(),
+                            source,
+                        })?
+                })
+                .ok_or(RuntimeError::WorkerControlRequiresMainEngine)?
+            })?;
+        }
+
         let mut first_error = None;
         for worker_slot in 0..self.workers.len() {
             let worker = DataWorkerId::new(worker_slot as u32);
@@ -503,10 +574,7 @@ impl SessionMain {
                 Engine::with_current(|engine| {
                     let runtime = &mut engine.runtime;
                     main.worker(worker)?
-                        .with_mut(|sessions| {
-                            sessions.drain_app_mq(application)?;
-                            sessions.remove_app_mq(application, runtime)
-                        })
+                        .with_mut(|sessions| sessions.remove_app_mq(application, runtime))
                         .map_err(|source| SessionQueueError::WorkerAccess {
                             worker: worker.slot(),
                             source,
@@ -671,6 +739,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         let entry = Box::new(AppRxMqEntry {
             application,
             queue,
+            blocked_event: None,
             file: None,
             appsl_input_node: app_session_input,
             pending_queue: &mut self.app_rx_mq_pending as *mut VecDeque<ApplicationId> as usize,
@@ -725,10 +794,8 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         }) else {
             return Ok(());
         };
-        if entry.pending {
-            self.app_rx_mq_pending
-                .retain(|candidate| *candidate != application);
-        }
+        self.app_rx_mq_pending
+            .retain(|candidate| *candidate != application);
         if let Some(file) = entry.file {
             if let Err(error) = runtime.file_main_mut().delete(file) {
                 if entry.pending {
@@ -768,9 +835,12 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         !self.app_rx_mq_pending.is_empty()
     }
 
-    fn drain_app_mq_events_to(&mut self, mut dispatch_event: impl FnMut(SessionEvt)) -> usize {
+    fn drain_app_mq_events_to(
+        &mut self,
+        mut dispatch_event: impl FnMut(SessionEvt) -> Result<(), SessionMsgQueueError>,
+    ) -> Result<usize, SessionMsgQueueError> {
         let mut dispatched = 0usize;
-        let mut batch = [SessionEvt::io(0, SessionEvtType::Connect); 64];
+        let mut dispatch_error = None;
         let pending_snapshot_len = self.app_rx_mq_pending.len();
         for _ in 0..pending_snapshot_len {
             let Some(application) = self.app_rx_mq_pending.pop_front() else {
@@ -783,103 +853,52 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             if entry.application != application || !entry.pending {
                 continue;
             }
-            let was_postponed = entry.postponed;
-            if !was_postponed {
-                entry.queue.drain();
+            let (entry_dispatched, entry_error) = entry.drain_snapshot_to(&mut dispatch_event);
+            dispatched = dispatched.saturating_add(entry_dispatched);
+            if let Some(error) = entry_error
+                && !matches!(&error, SessionMsgQueueError::Full(_))
+                && dispatch_error.is_none()
+            {
+                dispatch_error = Some(error);
             }
-            let snapshot = entry.queue.len();
-            let mut remaining = snapshot;
-            entry.postponed = false;
-            while remaining > 0 {
-                let batch_len = remaining.min(batch.len());
-                let count = entry.queue.dequeue_batch(&mut batch[..batch_len]);
-                if count == 0 {
-                    break;
-                }
-                for evt in batch[..count].iter() {
-                    dispatch_event(*evt);
-                }
-                dispatched += count;
-                remaining -= count;
-            }
-            entry.postponed = !entry.queue.is_empty();
-            if snapshot == 0 {
-                entry.pending = false;
-                continue;
-            }
-            if entry.postponed {
+            if entry.pending {
                 self.app_rx_mq_pending.push_back(application);
-            } else {
-                entry.pending = false;
             }
         }
-        dispatched
+        dispatch_error.map_or(Ok(dispatched), Err)
     }
 
     pub(crate) fn drain_app_mq(&mut self, application: ApplicationId) -> RuntimeResult<usize> {
         let session_evt_q = Arc::clone(&self.session_evt_q);
-        let mut queue_error = None;
-        let handled = self.drain_one_app_mq_to(application, |evt| {
-            if queue_error.is_some() {
-                return;
-            }
-            let result = match evt.evt_type {
-                SessionEvtType::Connect | SessionEvtType::Close | SessionEvtType::HalfClose => {
-                    session_evt_q.enqueue_ctrl(evt)
-                }
-                SessionEvtType::RxEnq
-                | SessionEvtType::RxDeq
-                | SessionEvtType::TxEnq
-                | SessionEvtType::TxDeq => session_evt_q.enqueue_io(evt),
-                SessionEvtType::ProtocolOutput
-                | SessionEvtType::Disconnected
-                | SessionEvtType::Reset
-                | SessionEvtType::TransportClosed => return,
-            };
-            if let Err(error) = result {
-                queue_error = Some(error);
-            }
-        });
-        if let Some(error) = queue_error {
-            return Err(AppWorkerError::SessionEventQueue { error }.into());
-        }
-        Ok(handled)
+        self.drain_one_app_mq_to(application, |event| {
+            enqueue_app_event(&session_evt_q, event)
+        })
+        .map_err(|error| AppWorkerError::SessionEventQueue { error }.into())
     }
 
     fn drain_one_app_mq_to(
         &mut self,
         application: ApplicationId,
-        mut dispatch_event: impl FnMut(SessionEvt),
-    ) -> usize {
+        mut dispatch_event: impl FnMut(SessionEvt) -> Result<(), SessionMsgQueueError>,
+    ) -> Result<usize, SessionMsgQueueError> {
+        self.app_rx_mq_pending
+            .retain(|candidate| *candidate != application);
         let slot = application.slot() as usize;
         let Some(Some(entry)) = self.app_rx_mqs.get_mut(slot) else {
-            return 0;
+            return Ok(0);
         };
         if entry.application != application {
-            return 0;
+            return Ok(0);
         }
-        let mut dispatched = 0usize;
-        let mut batch = [SessionEvt::io(0, SessionEvtType::Connect); 64];
-        entry.queue.drain();
-        let snapshot = entry.queue.len();
-        let mut remaining = snapshot;
-        entry.pending = false;
-        entry.postponed = false;
-        while remaining > 0 {
-            let batch_len = remaining.min(batch.len());
-            let count = entry.queue.dequeue_batch(&mut batch[..batch_len]);
-            if count == 0 {
-                break;
-            }
-            entry.pending = true;
-            for evt in batch[..count].iter() {
-                dispatch_event(*evt);
-            }
-            dispatched += count;
-            remaining -= count;
+
+        let (dispatched, dispatch_error) = entry.drain_snapshot_to(&mut dispatch_event);
+        if entry.pending {
+            self.app_rx_mq_pending.push_back(application);
         }
-        entry.postponed = !entry.queue.is_empty();
-        dispatched
+        if let Some(error) = dispatch_error {
+            return Err(error);
+        }
+        Ok(dispatched)
     }
 
     #[inline]
@@ -1442,36 +1461,29 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
 
     pub fn poll_app(&mut self) -> RuntimeResult<usize> {
         let session_evt_q = Arc::clone(&self.session_evt_q);
-        let mut queue_error = None;
-        let mut dispatch_event = |evt: SessionEvt| {
-            if queue_error.is_some() {
-                return;
-            }
-            let result = match evt.evt_type {
-                SessionEvtType::Connect | SessionEvtType::Close | SessionEvtType::HalfClose => {
-                    session_evt_q.enqueue_ctrl(evt)
-                }
-                SessionEvtType::RxEnq
-                | SessionEvtType::RxDeq
-                | SessionEvtType::TxEnq
-                | SessionEvtType::TxDeq => session_evt_q.enqueue_io(evt),
-                SessionEvtType::ProtocolOutput
-                | SessionEvtType::Disconnected
-                | SessionEvtType::Reset
-                | SessionEvtType::TransportClosed => return,
-            };
-            if let Err(error) = result {
-                queue_error = Some(error);
+        let mut first_error = None;
+        let handled = match self
+            .app
+            .drain_tx_events_to(|event| enqueue_app_event(&session_evt_q, event))
+        {
+            Ok(handled) => handled,
+            Err(error) => {
+                first_error.get_or_insert(error);
+                0
             }
         };
-        let handled = self
-            .app
-            .drain_tx_events_to(&mut dispatch_event)
-            .saturating_add(self.drain_app_mq_events_to(&mut dispatch_event));
-        if let Some(error) = queue_error {
+        let app_mq_handled =
+            match self.drain_app_mq_events_to(|event| enqueue_app_event(&session_evt_q, event)) {
+                Ok(handled) => handled,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    0
+                }
+            };
+        if let Some(error) = first_error {
             return Err(AppWorkerError::SessionEventQueue { error }.into());
         }
-        Ok(handled)
+        Ok(handled.saturating_add(app_mq_handled))
     }
 
     pub(crate) fn poll_session_events(&mut self) -> RuntimeResult<usize> {
@@ -2743,21 +2755,38 @@ mod tests {
     use hammer_core::data_plane::BufferFrame;
     use hammer_infra::pool::Index;
     use hammer_runtime::app::{
-        AppSessionConfig, AppSessionProtocolRole, SessionEvt, SessionEvtType,
+        AppSessionConfig, AppSessionProtocolRole, SessionEvt, SessionEvtType, SessionMsgQueueError,
     };
     use hammer_runtime::attach::AppServer;
     use hammer_runtime::{
-        AttachError, DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, NodeRuntimeData,
-        RuntimeError, RuntimeResult,
+        AttachError, DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, Engine,
+        NodeRuntimeData, RuntimeError, RuntimeRegistry, RuntimeResult,
     };
 
     use super::{
         DEFAULT_SESSION_POOL_CAPACITY, SessionMain, SessionQueueNext, SessionTransportId,
-        SessionWorker,
+        SessionWorker, queue_for_worker,
     };
     use crate::session::ApplicationMain;
-    use crate::session::application::ApplicationMqResources;
-    use crate::session::node::{SessionQueueNode, SessionQueueOutput};
+    use crate::session::application::{ApplicationError, ApplicationMqResources};
+    use crate::session::node::{
+        SessionQueueNode, SessionQueueOutput, register_app_session_input_node,
+        register_session_queue_node,
+    };
+
+    #[derive(Debug, thiserror::Error)]
+    enum SessionTestFailure {
+        #[error(transparent)]
+        Application(#[from] ApplicationError),
+        #[error(transparent)]
+        Runtime(#[from] RuntimeError),
+        #[error(transparent)]
+        EventQueue(#[from] SessionMsgQueueError),
+        #[error(transparent)]
+        SessionQueue(#[from] crate::session::SessionQueueError),
+        #[error(transparent)]
+        Conversion(#[from] std::num::TryFromIntError),
+    }
 
     fn test_dispatch(
         _: &DataPlaneRuntime,
@@ -3202,52 +3231,304 @@ mod tests {
     }
 
     #[test]
-    fn app_mq_drain_uses_snapshot_and_readds_postponed_work() {
+    fn file_readiness_dispatches_postponed_application_events_through_session_queue()
+    -> Result<(), SessionTestFailure> {
+        let main_engine = Engine::new(
+            DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()),
+            RuntimeRegistry::new(),
+        );
+        let session_queue = register_session_queue_node(&main_engine.runtime)?;
+        let app_session_input = register_app_session_input_node(&main_engine.runtime)?;
+        let mut engine = main_engine.spawn(1)?;
         let applications = ApplicationMain::new(1);
-        let application = applications.attach().expect("attach local Application");
-        let queue = ApplicationMqResources::create_local(application, 1, 128)
-            .expect("Application MQ resources")
-            .queue(DataWorkerId::new(0))
-            .expect("per-Application MQ")
-            .clone();
-        let mut runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default())
-            .for_worker(1, 0)
-            .expect("worker runtime");
+        let application = applications.attach()?;
+        let queue = queue_for_worker(
+            &ApplicationMqResources::create_local(application, 1, 4096)?,
+            application,
+        )?;
+        let main = Arc::new(SessionMain::new(1, applications));
+        let mut sessions = SessionWorker::<Index>::new(DataWorkerId::new(0))?;
+        let target = sessions.insert_session_for_test(SessionTransportId::new(1), Index::new(7, 1));
+        super::install_session_worker(
+            &main,
+            &mut engine,
+            app_session_input,
+            session_queue,
+            sessions,
+        )?;
+        main.worker(DataWorkerId::new(0))?
+            .with_mut(|sessions| {
+                sessions.install_app_mq(
+                    application,
+                    queue.clone(),
+                    app_session_input,
+                    &mut engine.runtime,
+                )
+            })
+            .map_err(|source| super::SessionQueueError::WorkerAccess { worker: 0, source })??;
+        engine
+            .runtime
+            .nodes()
+            .set_node_state(session_queue, hammer_core::data_plane::NodeState::Interrupt)?;
+
+        queue.enqueue_io(SessionEvt::io(
+            target.pool_index().slot(),
+            SessionEvtType::TxEnq,
+        ))?;
+        for _ in 0..super::DEFAULT_SESSION_TX_EVENT_CAPACITY {
+            queue.enqueue_io(SessionEvt::io(u32::MAX, SessionEvtType::TxEnq))?;
+        }
+
+        let graph = engine.runtime.nodes().clone();
+        assert_eq!(engine.file_main_mut().poll(&graph)?, 1);
+        let _ = engine.file_main_mut().poll(&graph)?;
+        assert_eq!(
+            main.with_worker_mut(&engine.runtime, |sessions| {
+                Ok(sessions
+                    .app_rx_mq_pending
+                    .iter()
+                    .filter(|candidate| **candidate == application)
+                    .count())
+            })?,
+            1
+        );
+
+        engine.runtime.schedule_empty_frame(app_session_input)?;
+        engine.runtime.run_ready_nodes()?;
+        main.with_worker_mut(&engine.runtime, |sessions| {
+            assert!(!sessions.has_pending_app_mqs());
+            assert!(sessions.session_work.contains(&target));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn app_mq_drain_uses_snapshot_and_readds_postponed_work() -> Result<(), SessionTestFailure> {
+        let applications = ApplicationMain::new(1);
+        let application = applications.attach()?;
+        let queue = queue_for_worker(
+            &ApplicationMqResources::create_local(application, 1, 128)?,
+            application,
+        )?;
+        let mut runtime =
+            DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()).for_worker(1, 0)?;
         let mut sessions = SessionWorker::<Index>::with_application_main(
             DataWorkerId::new(0),
             1,
             AppSessionConfig::default(),
             DEFAULT_SESSION_POOL_CAPACITY,
             applications.clone(),
-        )
-        .expect("Session worker");
-        sessions
-            .install_app_mq(
-                application,
-                queue.clone(),
-                hammer_core::data_plane::NodeId::new(0),
-                &mut runtime,
-            )
-            .expect("install per-Application MQ");
-        queue
-            .enqueue_io(SessionEvt::io(1, SessionEvtType::TxEnq))
-            .expect("enqueue first event");
+        )?;
+        sessions.install_app_mq(
+            application,
+            queue.clone(),
+            hammer_core::data_plane::NodeId::new(0),
+            &mut runtime,
+        )?;
+        queue.enqueue_io(SessionEvt::io(1, SessionEvtType::TxEnq))?;
         assert!(sessions.mark_app_mq_pending(application));
 
         let mut dispatched = 0usize;
         let handled = sessions.drain_app_mq_events_to(|_| {
             dispatched += 1;
             if dispatched == 1 {
-                queue
-                    .enqueue_io(SessionEvt::io(1, SessionEvtType::TxDeq))
-                    .expect("enqueue second event during snapshot drain");
+                queue.enqueue_io(SessionEvt::io(1, SessionEvtType::TxDeq))?;
             }
-        });
+            Ok(())
+        })?;
 
         assert_eq!(handled, 1);
         assert_eq!(dispatched, 1);
         assert!(sessions.app_rx_mq_pending.contains(&application));
         assert!(sessions.has_pending_app_mqs());
+        Ok(())
+    }
+
+    #[test]
+    fn application_detach_drain_retries_event_after_session_queue_backpressure()
+    -> Result<(), SessionTestFailure> {
+        let applications = ApplicationMain::new(1);
+        let application = applications.attach()?;
+        let queue = queue_for_worker(
+            &ApplicationMqResources::create_local(application, 1, 128)?,
+            application,
+        )?;
+        let mut runtime =
+            DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()).for_worker(1, 0)?;
+        let mut sessions = SessionWorker::<Index>::new(DataWorkerId::new(0))?;
+        sessions.install_app_mq(
+            application,
+            queue.clone(),
+            hammer_core::data_plane::NodeId::new(0),
+            &mut runtime,
+        )?;
+
+        for session_index in 0..super::DEFAULT_SESSION_TX_EVENT_CAPACITY {
+            sessions.session_evt_q.enqueue_io(SessionEvt::io(
+                u32::try_from(session_index + 1)?,
+                SessionEvtType::TxEnq,
+            ))?;
+        }
+        let detached_event = SessionEvt::io(77, SessionEvtType::TxEnq);
+        queue.enqueue_io(detached_event)?;
+        assert!(sessions.mark_app_mq_pending(application));
+
+        let error = match sessions.drain_app_mq(application) {
+            Ok(_) => panic!("full Session Message Queue must postpone detach drain"),
+            Err(error) => error,
+        };
+        match error {
+            RuntimeError::Subsystem { subsystem, source } => {
+                assert_eq!(subsystem, "session app");
+                assert!(matches!(
+                    source.downcast_ref::<super::AppWorkerError>(),
+                    Some(super::AppWorkerError::SessionEventQueue {
+                        error: super::SessionMsgQueueError::Full(event),
+                    }) if *event == detached_event
+                ));
+            }
+            error => panic!("unexpected detach drain error: {error:?}"),
+        }
+        assert!(sessions.app_mq_worker(application).is_some());
+        assert!(sessions.has_pending_app_mqs());
+
+        while sessions.session_evt_q.dequeue().is_some() {}
+
+        assert_eq!(sessions.drain_app_mq(application)?, 1);
+        assert_eq!(sessions.session_evt_q.dequeue(), Some(detached_event));
+        assert!(!sessions.has_pending_app_mqs());
+        Ok(())
+    }
+
+    #[test]
+    fn poll_app_retries_shared_tx_event_after_session_queue_backpressure()
+    -> Result<(), SessionTestFailure> {
+        let mut sessions = SessionWorker::<Index>::new(DataWorkerId::new(0))?;
+        for session_index in 0..super::DEFAULT_SESSION_TX_EVENT_CAPACITY {
+            sessions.session_evt_q.enqueue_io(SessionEvt::io(
+                u32::try_from(session_index + 1)?,
+                SessionEvtType::TxEnq,
+            ))?;
+        }
+        let blocked_event = SessionEvt::io(77, SessionEvtType::TxEnq);
+        sessions.app.tx_evt_q().enqueue_io(blocked_event)?;
+
+        let error = match sessions.poll_app() {
+            Ok(_) => panic!("full Session Message Queue must postpone shared TX event"),
+            Err(error) => error,
+        };
+        match error {
+            RuntimeError::Subsystem { subsystem, source } => {
+                assert_eq!(subsystem, "session app");
+                assert!(matches!(
+                    source.downcast_ref::<super::AppWorkerError>(),
+                    Some(super::AppWorkerError::SessionEventQueue {
+                        error: super::SessionMsgQueueError::Full(event),
+                    }) if *event == blocked_event
+                ));
+            }
+            error => panic!("unexpected shared TX drain error: {error:?}"),
+        }
+        assert_eq!(sessions.app.tx_evt_q().len(), 0);
+
+        while sessions.session_evt_q.dequeue().is_some() {}
+
+        assert_eq!(sessions.poll_app()?, 1);
+        assert_eq!(sessions.session_evt_q.dequeue(), Some(blocked_event));
+        Ok(())
+    }
+
+    #[test]
+    fn full_application_mq_does_not_drop_another_applications_event()
+    -> Result<(), SessionTestFailure> {
+        let applications = ApplicationMain::new(2);
+        let full_application = applications.attach()?;
+        let ready_application = applications.attach()?;
+        let full_queue = queue_for_worker(
+            &ApplicationMqResources::create_local(
+                full_application,
+                1,
+                super::DEFAULT_SESSION_TX_EVENT_CAPACITY,
+            )?,
+            full_application,
+        )?;
+        let ready_queue = queue_for_worker(
+            &ApplicationMqResources::create_local(ready_application, 1, 128)?,
+            ready_application,
+        )?;
+        let mut runtime =
+            DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()).for_worker(1, 0)?;
+        let mut sessions = SessionWorker::<Index>::new(DataWorkerId::new(0))?;
+        let target = sessions.insert_session_for_test(SessionTransportId::new(1), Index::new(7, 1));
+
+        for session_index in 0..super::DEFAULT_SESSION_TX_EVENT_CAPACITY {
+            full_queue.enqueue_io(SessionEvt::io(
+                u32::try_from(session_index + 1)?,
+                SessionEvtType::TxEnq,
+            ))?;
+        }
+        ready_queue.enqueue_io(SessionEvt::io(
+            target.pool_index().slot(),
+            SessionEvtType::TxEnq,
+        ))?;
+        sessions.install_app_mq(
+            full_application,
+            full_queue,
+            hammer_core::data_plane::NodeId::new(0),
+            &mut runtime,
+        )?;
+        sessions.install_app_mq(
+            ready_application,
+            ready_queue,
+            hammer_core::data_plane::NodeId::new(0),
+            &mut runtime,
+        )?;
+        assert!(sessions.mark_app_mq_pending(full_application));
+        assert!(sessions.mark_app_mq_pending(ready_application));
+
+        assert_eq!(
+            sessions.poll_app()?,
+            super::DEFAULT_SESSION_TX_EVENT_CAPACITY
+        );
+        assert!(sessions.has_pending_app_mqs());
+
+        while sessions.session_evt_q.len() != 0 {
+            assert_ne!(sessions.poll_session_events()?, 0);
+        }
+
+        assert_eq!(sessions.poll_app()?, 1);
+        assert!(!sessions.has_pending_app_mqs());
+        assert_eq!(sessions.poll_session_events()?, 1);
+        assert!(sessions.session_work.contains(&target));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn queue_for_worker(
+    resources: &ApplicationMqResources,
+    application: ApplicationId,
+) -> RuntimeResult<Arc<SessionMsgQueue>> {
+    resources
+        .queue(DataWorkerId::new(0))
+        .cloned()
+        .ok_or_else(|| SessionQueueError::ApplicationMqMissing { application }.into())
+}
+
+fn enqueue_app_event(
+    queue: &SessionMsgQueue,
+    event: SessionEvt,
+) -> Result<(), SessionMsgQueueError> {
+    match event.evt_type {
+        SessionEvtType::Connect | SessionEvtType::Close | SessionEvtType::HalfClose => {
+            queue.enqueue_ctrl(event)
+        }
+        SessionEvtType::RxEnq
+        | SessionEvtType::RxDeq
+        | SessionEvtType::TxEnq
+        | SessionEvtType::TxDeq => queue.enqueue_io(event),
+        _ => Ok(()),
     }
 }
 

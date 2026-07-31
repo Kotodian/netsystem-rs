@@ -158,6 +158,49 @@ fn svm_session_msg_queue_pipe_signal_wakes_consumer() {
 }
 
 #[test]
+fn svm_session_msg_queue_signals_only_on_empty_to_non_empty_transition()
+-> Result<(), SessionMsgQueueError> {
+    use hammer_infra::segment::Segment;
+    use hammer_runtime::app::SessionEventQueue;
+
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    for fd in &fds {
+        let flags = unsafe { libc::fcntl(*fd, libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(*fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+    }
+
+    let seg = Segment::shared_default();
+    let bytes = SessionMsgQueue::layout_bytes(8, 4)?;
+    let off = seg
+        .alloc(bytes, 64)
+        .ok_or(SessionMsgQueueError::InvalidConfig)?;
+    unsafe { SessionMsgQueue::init_at(seg.clone(), off, 8, 4) }?;
+
+    let producer = unsafe { SessionMsgQueue::from_shared(seg.clone(), off, None, Some(fds[1])) };
+    let consumer = unsafe { SessionMsgQueue::from_shared(seg, off, Some(fds[0]), None) };
+
+    producer.enqueue_io(SessionEvt::io(1, SessionEvtType::TxEnq))?;
+    assert!(consumer.read_signal());
+    producer.enqueue_io(SessionEvt::io(2, SessionEvtType::TxEnq))?;
+
+    assert!(!consumer.read_signal());
+    assert_eq!(
+        consumer.dequeue().map(|event| event.session_index()),
+        Some(1)
+    );
+    assert_eq!(
+        consumer.dequeue().map(|event| event.session_index()),
+        Some(2)
+    );
+    Ok(())
+}
+
+#[test]
 fn svm_session_msg_queue_owns_attached_signal_descriptors() {
     use hammer_infra::segment::Segment;
 
