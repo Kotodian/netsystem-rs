@@ -211,7 +211,10 @@ fn send_fds(stream: &UnixStream, fds: &[RawFd], metadata: &[u64]) {
             fds.len(),
         );
         message.msg_controllen = (*header).cmsg_len;
-        assert_eq!(libc::sendmsg(stream.as_raw_fd(), &message, 0), 64);
+        assert_eq!(
+            libc::sendmsg(stream.as_raw_fd(), &message, 0),
+            bytes.len() as isize
+        );
     }
 }
 

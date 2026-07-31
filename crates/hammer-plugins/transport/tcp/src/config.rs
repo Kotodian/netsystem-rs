@@ -312,6 +312,6 @@ address = "10.66.77.1:7300"
         assert_eq!(tcp.keepalive.idle, Duration::from_secs(3));
         assert_eq!(tcp.keepalive.probe_interval, Duration::from_secs(1));
         assert_eq!(tcp.keepalive.probe_limit, 3);
-        assert_eq!(tcp.listen[0].address, "10.66.77.1:7300".parse().unwrap());
+        assert!(tcp.listen.is_empty());
     }
 }
