@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::thread;
-use std::time::Instant;
 
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
@@ -63,8 +62,6 @@ pub fn engine_main_loop(
         }
     };
 
-    let mut last_poll_drivers_at = Instant::now();
-
     loop {
         let mut progress = false;
 
@@ -86,6 +83,15 @@ pub fn engine_main_loop(
             }
         }
         with_data_plane_runtime(|rt| {
+            if let Ok(scheduled) = rt.schedule_polling_pre_input_nodes() {
+                progress |= scheduled != 0;
+            }
+            if let Ok(scheduled) = rt.schedule_interrupt_pre_input_nodes() {
+                progress |= scheduled != 0;
+            }
+            if let Ok(scheduled) = rt.schedule_polling_driver_nodes() {
+                progress |= scheduled != 0;
+            }
             if let Ok(scheduled) = rt.schedule_interrupt_driver_nodes() {
                 progress |= scheduled != 0;
             }
@@ -127,28 +133,19 @@ pub fn engine_main_loop(
             });
         }
 
-        // Step 5: Schedule polling driver nodes periodically
-        let now = Instant::now();
-        if now >= last_poll_drivers_at {
-            last_poll_drivers_at = now + idle_slice;
-            with_data_plane_runtime(|rt| {
-                let _ = rt.schedule_polling_driver_nodes();
-            });
-        }
-
-        // Step 6: Run any newly-scheduled frames (interrupt + polling)
+        // Step 5: Run any newly-scheduled frames (pre-input + input)
         with_data_plane_runtime(|rt| {
             let _ = rt.run_ready_nodes();
         });
 
-        // Step 7: Dispatch timer nodes (no data-plane timer wheel yet)
+        // Step 6: Dispatch timer nodes (no data-plane timer wheel yet)
 
-        // Step 8: Advance timers — deferred (no data-plane timer wheel yet).
+        // Step 7: Advance timers — deferred (no data-plane timer wheel yet).
         // VPP dispatches timer-wheel-expired sched nodes here.
         // Increment loop count.
         engine.main_loop_count.fetch_add(1, Ordering::Relaxed);
 
-        // Step 9: Exit check
+        // Step 8: Exit check
         if let Some(status) = requested_exit_status(engine) {
             return status;
         }

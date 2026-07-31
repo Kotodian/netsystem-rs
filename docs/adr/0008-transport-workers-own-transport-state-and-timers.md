@@ -4,6 +4,8 @@ Session Worker and transport workers are separate worker-local owners. Each tran
 
 SessionQueueNode samples one absolute time per dispatch and passes it to each registered transport time subscriber before session control and I/O work. Each transport worker converts that time to its own ticks and applies its own expiry budget; SessionQueueNode does not define a shared timer resolution or compute transport ticks.
 
+The worker graph schedules PreInput nodes before Input/Driver nodes for both polling and interrupt dispatch. SessionQueueNode remains an Input/Driver node and is not reclassified as PreInput.
+
 A session entry stores the protocol dispatch key and is generic over an opaque transport-provided, generation-safe index. The indexed TCP connection, QUIC connection context, or QUIC stream context stores the reverse SessionId. Session Worker owns app/session FIFOs and scheduling, while TcpWorker and future QuicWorker remain separate; there is no TcpQueue wrapper and no transport-specific state in Session Runtime.
 
 Rust transport integration uses a generic `SessionTransport<Index>` trait and a compile-time transport set rather than copying VPP's C function table. The concrete set, such as TCP plus QUIC, is statically dispatched and monomorphized; the protocol id selects a member without `dyn Trait` or protocol-specific enum variants in Session Runtime. This preserves VPP's session worker, protocol dispatch, connection index, and per-transport worker ownership semantics while using Rust's type system for dispatch.

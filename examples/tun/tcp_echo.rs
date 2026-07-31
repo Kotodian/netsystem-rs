@@ -100,7 +100,11 @@ async fn run_echo(session: &AppSession) -> Result<(), EchoError> {
                 session.send_all(&buffer[..read]).await?;
                 session.consume_rx(read);
             },
-            SessionEvtType::Close => return Ok(()),
+            SessionEvtType::Close
+            | SessionEvtType::HalfClose
+            | SessionEvtType::Reset
+            | SessionEvtType::Disconnected
+            | SessionEvtType::TransportClosed => return Ok(()),
         }
     }
 }

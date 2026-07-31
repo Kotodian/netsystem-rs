@@ -2207,7 +2207,6 @@ where
 {
     let now = Instant::now();
     sessions.poll_app()?;
-    sessions.poll_session_events()?;
     let mut staging =
         BufferFrame::with_capacity(hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY);
     let mut output = crate::session::node::SessionQueueOutput::default();
@@ -2238,41 +2237,33 @@ where
     Index: Copy + Eq,
 {
     transport.update_time(sessions, runtime, output_next, frame, output, now)?;
+    sessions.poll_session_events()?;
+    dispatch_session_queue_events(
+        runtime,
+        sessions,
+        transport,
+        output_next,
+        frame,
+        output,
+        now,
+    )
+}
+
+pub fn dispatch_session_queue_events<T, Index>(
+    runtime: &DataPlaneRuntime,
+    sessions: &mut SessionWorker<Index>,
+    transport: &mut T,
+    output_next: SessionQueueNext,
+    frame: &mut BufferFrame,
+    output: &mut crate::session::node::SessionQueueOutput,
+    now: Instant,
+) -> RuntimeResult<SessionQueueStep>
+where
+    T: SessionTransport<Index>,
+    Index: Copy + Eq,
+{
     let work = sessions.take_scheduled_work();
     let scheduled_sessions = work.len();
-
-    let app_rx_event_count = sessions.app_rx_events.len();
-    for _ in 0..app_rx_event_count {
-        if output.remaining_io_budget() == 0 {
-            break;
-        }
-        let Some(&session_id) = sessions.app_rx_events.front() else {
-            break;
-        };
-        let Some((transport_id, index)) = sessions.session_transport(session_id) else {
-            let _ = sessions.app_rx_events.pop_front();
-            continue;
-        };
-        if transport_id != T::ID {
-            let _ = sessions.app_rx_events.pop_front();
-            continue;
-        }
-        let rx_available = sessions.rx_available_len(session_id).unwrap_or(0);
-        let rx_capacity = sessions.app_session_config.fifo_capacity;
-        let request_notification = transport.app_rx_evt(
-            index,
-            rx_available,
-            rx_capacity,
-            runtime,
-            output_next,
-            frame,
-            output,
-        )?;
-        let _ = sessions.app_rx_events.pop_front();
-        if request_notification {
-            sessions.request_rx_dequeue_notification(session_id);
-        }
-    }
 
     let control_count = sessions.control_events.len();
     for _ in 0..control_count {
@@ -2354,6 +2345,39 @@ where
             SessionControlEvent::Propagate { session_id, event } => {
                 sessions.notify_application_event(session_id, event)?;
             }
+        }
+    }
+
+    let app_rx_event_count = sessions.app_rx_events.len();
+    for _ in 0..app_rx_event_count {
+        if output.remaining_io_budget() == 0 {
+            break;
+        }
+        let Some(&session_id) = sessions.app_rx_events.front() else {
+            break;
+        };
+        let Some((transport_id, index)) = sessions.session_transport(session_id) else {
+            let _ = sessions.app_rx_events.pop_front();
+            continue;
+        };
+        if transport_id != T::ID {
+            let _ = sessions.app_rx_events.pop_front();
+            continue;
+        }
+        let rx_available = sessions.rx_available_len(session_id).unwrap_or(0);
+        let rx_capacity = sessions.app_session_config.fifo_capacity;
+        let request_notification = transport.app_rx_evt(
+            index,
+            rx_available,
+            rx_capacity,
+            runtime,
+            output_next,
+            frame,
+            output,
+        )?;
+        let _ = sessions.app_rx_events.pop_front();
+        if request_notification {
+            sessions.request_rx_dequeue_notification(session_id);
         }
     }
 
@@ -2565,6 +2589,7 @@ mod tests {
             data_a,
             SessionQueueNext::from_slot(0),
             test_dispatch,
+            test_dispatch,
         )
         .expect("install dispatch A");
         SessionQueueNode::install_worker_attachment(
@@ -2572,12 +2597,14 @@ mod tests {
             data_a,
             SessionQueueNext::from_slot(1),
             test_dispatch,
+            test_dispatch,
         )
         .expect("install second dispatch A");
         SessionQueueNode::install_worker_attachment(
             &runtime_b,
             data_b,
             SessionQueueNext::from_slot(2),
+            test_dispatch,
             test_dispatch,
         )
         .expect("install dispatch B");
@@ -2617,6 +2644,7 @@ mod tests {
             &runtime,
             data,
             SessionQueueNext::from_slot(0),
+            test_dispatch,
             test_dispatch,
         )
         .expect("install dispatch");

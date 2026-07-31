@@ -213,7 +213,7 @@ pub enum RuntimeError {
     },
     #[error("graph node index {slot} does not fit u32")]
     NodeIdOverflow { slot: usize },
-    #[error("graph node {node:?} is not a driver node")]
+    #[error("graph node {node:?} is not a driver or pre-input node")]
     NodeNotDriver {
         node: hammer_core::data_plane::NodeId,
     },

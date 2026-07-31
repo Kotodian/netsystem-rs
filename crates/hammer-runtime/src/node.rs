@@ -406,6 +406,7 @@ pub(crate) struct NodeRuntimeInner {
     nodes: Vec<NodeRuntimeSlot>,
     node_states: Vec<NodeState>,
     interrupt_pending: Vec<bool>,
+    input_main_loops_per_call: Vec<u32>,
     error_counters: Vec<NodeErrorCounters>,
     error_ids: HashMap<u64, u16>,
     error_slots: Vec<BufferNodeError>,
@@ -428,6 +429,7 @@ impl Clone for NodeRuntimeInner {
             nodes: self.nodes.clone(),
             node_states: self.node_states.clone(),
             interrupt_pending: vec![false; node_count],
+            input_main_loops_per_call: self.input_main_loops_per_call.clone(),
             error_counters: vec![NodeErrorCounters::default(); node_count],
             error_ids: self.error_ids.clone(),
             error_slots: self.error_slots.clone(),
@@ -637,6 +639,7 @@ impl NodeRuntimeInner {
             // worker retains only state owned by its established node instance.
             self.nodes[slot].runtime_data = current.nodes[slot].runtime_data;
             self.node_states[slot] = current.node_states[slot];
+            self.input_main_loops_per_call[slot] = current.input_main_loops_per_call[slot];
             self.error_counters[slot] = current.error_counters[slot].clone();
             self.runtime_stats[slot] = current.runtime_stats[slot];
         }
@@ -653,6 +656,7 @@ impl NodeRuntimeInner {
         self.nodes.push(slot);
         self.node_states.push(NodeState::Polling);
         self.interrupt_pending.push(false);
+        self.input_main_loops_per_call.push(0);
         self.error_counters.push(NodeErrorCounters::default());
         self.runtime_stats.push(NodeRuntimeStats::default());
         self.node_names.push(None);
@@ -989,6 +993,7 @@ mod local_next_slot_tests {
             ],
             node_states: vec![NodeState::Polling; 3],
             interrupt_pending: vec![false; 3],
+            input_main_loops_per_call: vec![0; 3],
             error_counters: vec![NodeErrorCounters::default(); 3],
             error_ids: HashMap::new(),
             error_slots: Vec::new(),
@@ -1092,6 +1097,7 @@ impl Default for NodeRuntime {
                 nodes: Vec::new(),
                 node_states: Vec::new(),
                 interrupt_pending: Vec::new(),
+                input_main_loops_per_call: Vec::new(),
                 error_counters: Vec::new(),
                 error_ids: HashMap::new(),
                 error_slots: Vec::new(),
@@ -1400,6 +1406,7 @@ impl NodeRuntime {
             nodes: Vec::new(),
             node_states: Vec::new(),
             interrupt_pending: Vec::new(),
+            input_main_loops_per_call: Vec::new(),
             error_counters: Vec::new(),
             error_ids: HashMap::new(),
             error_slots: Vec::new(),
@@ -1478,6 +1485,34 @@ impl NodeRuntime {
                 node.node_trace_formatter(),
             ),
         )
+    }
+
+    /// Registers a node that runs before all input nodes in the main loop.
+    ///
+    /// The registration role reuses `DriverNode` metadata; the node kind is
+    /// authoritative for VPP-style `PRE_INPUT` ordering.
+    pub fn try_register_pre_input<N>(&self, node: N) -> RuntimeResult<NodeId>
+    where
+        N: DriverNode + Node,
+    {
+        self.register_descriptor(
+            NodeKind::PreInput,
+            NodeDescriptor::new(
+                node.node_process(),
+                node.node_runtime_data()?,
+                DriverNode::node_registration(&node),
+                DriverNode::node_initial_nexts(&node),
+                node.node_trace_formatter(),
+            ),
+        )
+    }
+
+    pub fn register_pre_input<N>(&self, node: N) -> NodeId
+    where
+        N: DriverNode + Node,
+    {
+        self.try_register_pre_input(node)
+            .expect("register pre-input node descriptor")
     }
 
     pub fn register_internal<N>(&self, node: N) -> NodeId
@@ -1656,6 +1691,29 @@ impl NodeRuntime {
         )
     }
 
+    /// Register a pre-input node whose next edges are resolved by name.
+    pub fn try_register_pre_input_with_next_names<N>(
+        &self,
+        node: N,
+        next_names: &[&'static str],
+    ) -> RuntimeResult<NodeId>
+    where
+        N: DriverNode + Node,
+    {
+        self.ensure_topology_owner()?;
+        let mut inner = self.inner.borrow_mut();
+        inner.register_function_declared(
+            NodeKind::PreInput,
+            node.node_process(),
+            node.node_runtime_data()?,
+            DriverNode::node_registration(&node),
+            &[],
+            node.node_trace_formatter(),
+            None,
+            Some(next_names),
+        )
+    }
+
     /// Resolve pending next-node names into `NodeId`s after all graph nodes
     /// are registered (VPP `vlib_node_main_init` name-resolution pass).
     pub fn resolve_named_next_nodes(&self) -> RuntimeResult<()> {
@@ -1722,12 +1780,20 @@ impl NodeRuntime {
     }
 
     pub fn polling_driver_nodes(&self) -> RuntimeResult<Vec<NodeId>> {
+        self.polling_nodes(NodeKind::Driver)
+    }
+
+    pub fn polling_pre_input_nodes(&self) -> RuntimeResult<Vec<NodeId>> {
+        self.polling_nodes(NodeKind::PreInput)
+    }
+
+    fn polling_nodes(&self, kind: NodeKind) -> RuntimeResult<Vec<NodeId>> {
         let inner = self.inner.borrow();
         let mut nodes = Vec::new();
         let mut slot = 0usize;
         while slot < inner.nodes.len() {
             let node = &inner.nodes[slot];
-            if node.kind == NodeKind::Driver && inner.node_states[slot] == NodeState::Polling {
+            if node.kind == kind && inner.node_states[slot] == NodeState::Polling {
                 let id = u32::try_from(slot)
                     .map(NodeId::new)
                     .map_err(|_| RuntimeError::NodeIdOverflow { slot })?;
@@ -1736,6 +1802,34 @@ impl NodeRuntime {
             slot += 1;
         }
         Ok(nodes)
+    }
+
+    pub(crate) fn polling_nodes_to_schedule(&self, kind: NodeKind) -> RuntimeResult<Vec<NodeId>> {
+        let mut inner = self.inner.borrow_mut();
+        let mut nodes = Vec::new();
+        let mut slot = 0usize;
+        while slot < inner.nodes.len() {
+            if inner.nodes[slot].kind == kind && inner.node_states[slot] == NodeState::Polling {
+                let loops = &mut inner.input_main_loops_per_call[slot];
+                if *loops > 0 {
+                    *loops -= 1;
+                } else {
+                    let id = u32::try_from(slot)
+                        .map(NodeId::new)
+                        .map_err(|_| RuntimeError::NodeIdOverflow { slot })?;
+                    nodes.push(id);
+                }
+            }
+            slot += 1;
+        }
+        Ok(nodes)
+    }
+
+    pub fn set_input_main_loops_per_call(&self, node: NodeId, count: u32) -> RuntimeResult<()> {
+        let mut inner = self.inner.borrow_mut();
+        inner.validate_node(node)?;
+        inner.input_main_loops_per_call[node.slot() as usize] = count;
+        Ok(())
     }
 
     #[inline]
@@ -1762,7 +1856,10 @@ impl NodeRuntime {
         let mut inner = self.inner.borrow_mut();
         inner.validate_node(node)?;
         let slot = node.slot() as usize;
-        if inner.nodes[slot].kind != NodeKind::Driver {
+        if !matches!(
+            inner.nodes[slot].kind,
+            NodeKind::Driver | NodeKind::PreInput
+        ) {
             return Err(RuntimeError::NodeNotDriver { node });
         }
         match inner.node_states[slot] {
@@ -1778,14 +1875,20 @@ impl NodeRuntime {
         }
     }
 
-    pub(crate) fn next_interrupt_pending(&self, start: usize) -> Option<NodeId> {
-        self.inner
-            .borrow()
-            .interrupt_pending
-            .iter()
-            .enumerate()
-            .skip(start)
-            .find_map(|(slot, pending)| pending.then_some(NodeId::new(slot as u32)))
+    pub(crate) fn next_interrupt_pending_for_kind(
+        &self,
+        start: usize,
+        kind: NodeKind,
+    ) -> Option<NodeId> {
+        let inner = self.inner.borrow();
+        let mut slot = start;
+        while slot < inner.interrupt_pending.len() {
+            if inner.interrupt_pending[slot] && inner.nodes[slot].kind == kind {
+                return Some(NodeId::new(slot as u32));
+            }
+            slot += 1;
+        }
+        None
     }
 
     pub(crate) fn clear_interrupt_pending(&self, node: NodeId) -> RuntimeResult<()> {

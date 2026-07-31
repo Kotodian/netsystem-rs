@@ -1,3 +1,4 @@
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use hammer_core::data_plane::{
@@ -10,6 +11,7 @@ use hammer_runtime::{
 };
 
 static NODE_CALLS_BY_WORD: [AtomicU64; 128] = [const { AtomicU64::new(0) }; 128];
+static NODE_CALL_ORDER: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
 fn reset_calls(word: u64) {
     NODE_CALLS_BY_WORD[word as usize].store(0, Ordering::SeqCst);
@@ -17,6 +19,19 @@ fn reset_calls(word: u64) {
 
 fn calls_for(word: u64) -> u64 {
     NODE_CALLS_BY_WORD[word as usize].load(Ordering::SeqCst)
+}
+
+fn reset_call_order() {
+    NODE_CALL_ORDER.lock().expect("call order lock").clear();
+}
+
+fn call_order() -> Vec<u64> {
+    NODE_CALL_ORDER
+        .lock()
+        .expect("call order lock")
+        .iter()
+        .copied()
+        .collect()
 }
 
 fn test_runtime(
@@ -249,6 +264,19 @@ fn count_process(_: &DataPlaneRuntime, data: NodeRuntimeData, _: &mut BufferFram
     NodeResult::drop()
 }
 
+fn order_process(_: &DataPlaneRuntime, data: NodeRuntimeData, _: &mut BufferFrame) -> NodeResult {
+    let word = match data.usize_word(0) {
+        Ok(w) => w,
+        Err(_) => return NodeResult::drop(),
+    };
+    NODE_CALL_ORDER
+        .lock()
+        .expect("call order lock")
+        .push(word as u64);
+    NODE_CALLS_BY_WORD[word].fetch_add(1, Ordering::SeqCst);
+    NodeResult::drop()
+}
+
 fn forward_default_process(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
@@ -395,6 +423,112 @@ fn schedule_polling_driver_nodes_schedules_only_polling_drivers() {
         runtime.nodes().node_state(polling_driver).unwrap(),
         NodeState::Polling
     );
+}
+
+#[test]
+fn pre_input_polling_is_scheduled_before_driver() {
+    reset_calls(51);
+    reset_calls(52);
+    reset_call_order();
+
+    let runtime = test_runtime(64, 8, 8);
+    let pre_input = runtime
+        .nodes()
+        .try_register_pre_input(DescriptorNode::plain(
+            order_process,
+            NodeRuntimeData::from_words([51, 0, 0, 0]),
+        ))
+        .expect("register pre-input node");
+    let driver = runtime.nodes().register_driver(DescriptorNode::plain(
+        order_process,
+        NodeRuntimeData::from_words([52, 0, 0, 0]),
+    ));
+    assert_eq!(
+        runtime.nodes().node_kind(driver).expect("driver kind"),
+        NodeKind::Driver
+    );
+
+    assert_eq!(
+        runtime
+            .nodes()
+            .node_kind(pre_input)
+            .expect("pre-input kind"),
+        NodeKind::PreInput
+    );
+    assert_eq!(
+        runtime
+            .schedule_polling_pre_input_nodes()
+            .expect("schedule polling pre-input"),
+        1
+    );
+    assert_eq!(
+        runtime
+            .schedule_polling_driver_nodes()
+            .expect("schedule polling drivers"),
+        1
+    );
+    assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 2);
+    assert_eq!(call_order(), vec![51, 52]);
+}
+
+#[test]
+fn pre_input_interrupt_pending_dispatches_empty_frame() {
+    reset_calls(53);
+    let runtime = test_runtime(64, 4, 4);
+    let pre_input = runtime
+        .nodes()
+        .try_register_pre_input(DescriptorNode::plain(
+            count_process,
+            NodeRuntimeData::from_words([53, 0, 0, 0]),
+        ))
+        .expect("register pre-input node");
+    runtime
+        .nodes()
+        .set_node_state(pre_input, NodeState::Interrupt)
+        .expect("set pre-input interrupt state");
+
+    assert!(
+        runtime
+            .set_node_interrupt_pending(pre_input)
+            .expect("pre-input interrupt schedules")
+    );
+    assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 1);
+    assert_eq!(calls_for(53), 1);
+}
+
+#[test]
+fn polling_node_input_main_loops_per_call_skips_scheduled_turns() {
+    reset_calls(54);
+    let runtime = test_runtime(64, 4, 4);
+    let pre_input = runtime
+        .nodes()
+        .try_register_pre_input(DescriptorNode::plain(
+            count_process,
+            NodeRuntimeData::from_words([54, 0, 0, 0]),
+        ))
+        .expect("register pre-input node");
+    runtime
+        .nodes()
+        .set_input_main_loops_per_call(pre_input, 1)
+        .expect("set input main loops per call");
+
+    assert_eq!(
+        runtime
+            .schedule_polling_pre_input_nodes()
+            .expect("skip one polling turn"),
+        0
+    );
+    assert_eq!(runtime.run_ready_nodes().expect("no ready nodes"), 0);
+    assert_eq!(calls_for(54), 0);
+
+    assert_eq!(
+        runtime
+            .schedule_polling_pre_input_nodes()
+            .expect("schedule after skip"),
+        1
+    );
+    assert_eq!(runtime.run_ready_nodes().expect("run ready node"), 1);
+    assert_eq!(calls_for(54), 1);
 }
 
 #[test]

@@ -41,6 +41,7 @@ impl NodeHandle {
 pub enum NodeKind {
     Plain,
     Driver,
+    PreInput,
     Internal,
 }
 

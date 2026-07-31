@@ -110,6 +110,15 @@ pub type SessionQueueDispatchFn = fn(
     &mut SessionQueueOutput,
 ) -> RuntimeResult<()>;
 
+pub type SessionQueueUpdateTimeFn = fn(
+    &DataPlaneRuntime,
+    NodeRuntimeData,
+    SessionQueueNext,
+    Instant,
+    &mut BufferFrame,
+    &mut SessionQueueOutput,
+) -> RuntimeResult<()>;
+
 /// Accumulates Session Queue TX indexes on the driver Frame and records one
 /// local next per entry. Graph Fanout runs once at [`Self::flush`].
 pub struct SessionQueueOutput {
@@ -179,6 +188,7 @@ impl SessionQueueOutput {
 #[derive(Clone, Copy)]
 pub(crate) struct SessionQueueTransportDispatch {
     output_next: SessionQueueNext,
+    update_time: SessionQueueUpdateTimeFn,
     function: SessionQueueDispatchFn,
 }
 
@@ -270,6 +280,7 @@ impl SessionQueueNode {
         runtime: &DataPlaneRuntime,
         runtime_data: NodeRuntimeData,
         output_next: SessionQueueNext,
+        update_time: SessionQueueUpdateTimeFn,
         function: SessionQueueDispatchFn,
     ) -> RuntimeResult<()> {
         let ptr = runtime_data.word(0) as usize as *const SessionMain;
@@ -286,6 +297,7 @@ impl SessionQueueNode {
                 .transport_dispatches
                 .push(SessionQueueTransportDispatch {
                     output_next,
+                    update_time,
                     function,
                 });
             Ok(())
@@ -335,6 +347,9 @@ fn session_queue_node_process(
     // the SessionMain Arc remains alive in that worker's SessionMain.
     let main = unsafe { &*ptr };
     let result = main.with_worker_mut(runtime, |sessions| {
+        for dispatch in &sessions.transport_dispatches {
+            (dispatch.update_time)(runtime, data, dispatch.output_next, now, frame, &mut output)?;
+        }
         sessions.poll_session_events()?;
         for dispatch in &sessions.transport_dispatches {
             if (dispatch.function)(runtime, data, dispatch.output_next, now, frame, &mut output)

@@ -155,7 +155,7 @@ fn session_queue_updates_transport_before_control_and_io_and_without_events() {
     assert_eq!(step.scheduled_sessions, 1);
     assert_eq!(
         *events.lock().expect("events"),
-        vec!["transport_time", "app_rx", "control", "io"]
+        vec!["transport_time", "control", "app_rx", "io"]
     );
     let times = sampled_times.lock().expect("times");
     assert_eq!(times.len(), 1);
