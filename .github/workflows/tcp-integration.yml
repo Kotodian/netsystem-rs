@@ -548,7 +548,11 @@ jobs:
         run: |
           set -euo pipefail
           for _ in {1..90}; do
-            if ! sudo -n kill -0 "$ECHO_PID" 2>/dev/null; then
+            echo_process_state=""
+            if [[ -r "/proc/$ECHO_PID/stat" ]]; then
+              echo_process_state="$(awk '{ print $3 }' "/proc/$ECHO_PID/stat")"
+            fi
+            if ! sudo -n kill -0 "$ECHO_PID" 2>/dev/null || [[ "$echo_process_state" == "Z" ]]; then
               grep -F "registered TLS server configuration" \
                 "$TCP_TEST_DIAGNOSTICS/echo.log"
               grep -F "removed TLS server configuration" \
