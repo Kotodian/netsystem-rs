@@ -40,7 +40,10 @@ fn configure_session(config: config::NetworkSessionConfig) -> RuntimeResult<Arc<
     Ok(Arc::new(session))
 }
 
-#[hammer_component_macros::init_function(name = "session_init")]
+#[hammer_component_macros::init_function(
+    name = "session_init",
+    runs_after = ["application_init"]
+)]
 fn init_session(
     engine: &mut Engine,
     applications: Arc<ApplicationMain>,
@@ -114,4 +117,23 @@ fn configure_attach_server(
     };
     let server = Arc::new(AppServer::bind(path, session.app_session_capacity)?);
     Ok(Some(server))
+}
+
+#[cfg(test)]
+mod tests {
+    use hammer_runtime::init::topological_order;
+
+    use super::{__INIT_FN_APPLICATION_INIT, __INIT_FN_SESSION_INIT};
+
+    #[test]
+    fn application_initializes_before_session() {
+        let functions = [__INIT_FN_APPLICATION_INIT, __INIT_FN_SESSION_INIT];
+        let order = topological_order(&functions).expect("session init order");
+        let names = order
+            .into_iter()
+            .map(|index| functions[index].name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, ["application_init", "session_init"]);
+    }
 }
