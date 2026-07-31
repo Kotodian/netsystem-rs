@@ -1515,17 +1515,28 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     }
 
     pub fn connected(&mut self, session_id: SessionId) -> RuntimeResult<()> {
+        let next_state = {
+            let entry = self
+                .entries
+                .get(session_id.pool_index())
+                .ok_or(SessionError::SessionMissing { session_id })?;
+            let Some(SessionType::Transport { state, .. }) = entry.session_type else {
+                return Err(SessionError::SessionMissing { session_id }.into());
+            };
+            state
+                .on_connected()
+                .ok_or(SessionError::NotPublished { session_id })?
+        };
+        self.dispatch_application(session_id, SessionEvtType::Connect)?;
         let entry = self
             .entries
             .get_mut(session_id.pool_index())
-            .ok_or(SessionError::SessionMissing { session_id })?;
+            .expect("validated transport Session remains installed during App publication");
         let Some(SessionType::Transport { state, .. }) = entry.session_type.as_mut() else {
-            return Err(SessionError::SessionMissing { session_id }.into());
+            panic!("validated transport Session retains its type during App publication");
         };
-        *state = state
-            .on_connected()
-            .ok_or(SessionError::NotPublished { session_id })?;
-        self.dispatch_application(session_id, SessionEvtType::Connect)
+        *state = next_state;
+        Ok(())
     }
 
     pub fn copy_tx_to_buffer(
@@ -2226,6 +2237,132 @@ where
     }
     sessions.keep_work_scratch(work);
     Ok(SessionQueueStep { scheduled_sessions })
+}
+
+#[cfg(test)]
+mod tests {
+    use hammer_infra::pool::Index;
+    use hammer_runtime::app::AppSessionProtocolRole;
+    use hammer_runtime::attach::AppServer;
+    use hammer_runtime::{AttachError, DataWorkerId, RuntimeError};
+
+    use super::{SessionTransportId, SessionWorker};
+    use crate::session::ApplicationMain;
+
+    #[test]
+    fn app_publication_queue_full_keeps_session_rollback_eligible() {
+        let socket_path =
+            std::path::PathBuf::from(format!("/tmp/hammer-sp-f-{}.sock", std::process::id()));
+        let socket_path = socket_path.to_str().expect("socket path");
+        let server = AppServer::bind(socket_path, 1).expect("bind App server");
+        let applications = ApplicationMain::new(2);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::with_app_session_attach(
+            DataWorkerId::new(1),
+            2,
+            hammer_runtime::app::AppSessionConfig::default(),
+            applications,
+            server.publisher(),
+        )
+        .expect("Session worker with external App publication");
+
+        let first = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                AppSessionProtocolRole::Server,
+                &[],
+                None,
+            )
+            .expect("first accepted Session");
+        sessions
+            .connection_published(first)
+            .expect("publish first connection");
+        sessions.connected(first).expect("fill publication queue");
+
+        let second_index = Index::new(2, 1);
+        let second = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                second_index,
+                2,
+                application,
+                AppSessionProtocolRole::Server,
+                &[],
+                None,
+            )
+            .expect("second accepted Session");
+        sessions
+            .connection_published(second)
+            .expect("publish second connection");
+        let error = sessions
+            .connected(second)
+            .expect_err("full publication queue rejects connection establishment");
+        assert!(matches!(
+            error,
+            RuntimeError::Attach(AttachError::PublicationQueueFull)
+        ));
+
+        assert_eq!(
+            sessions
+                .rollback_session_creation(second)
+                .expect("publication failure remains rollback eligible"),
+            Some(second_index)
+        );
+        assert!(!sessions.has_session(second));
+    }
+
+    #[test]
+    fn closed_app_publication_queue_keeps_session_rollback_eligible() {
+        let socket_path =
+            std::path::PathBuf::from(format!("/tmp/hammer-sp-c-{}.sock", std::process::id()));
+        let socket_path = socket_path.to_str().expect("socket path");
+        let server = AppServer::bind(socket_path, 1).expect("bind App server");
+        let publisher = server.publisher();
+        drop(server);
+        let applications = ApplicationMain::new(1);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::with_app_session_attach(
+            DataWorkerId::new(2),
+            3,
+            hammer_runtime::app::AppSessionConfig::default(),
+            applications,
+            publisher,
+        )
+        .expect("Session worker with closed external App publication");
+        let connection_index = Index::new(3, 1);
+        let session_id = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                connection_index,
+                3,
+                application,
+                AppSessionProtocolRole::Server,
+                &[],
+                None,
+            )
+            .expect("accepted Session");
+        sessions
+            .connection_published(session_id)
+            .expect("publish connection");
+
+        let error = sessions
+            .connected(session_id)
+            .expect_err("closed publication queue rejects connection establishment");
+        assert!(matches!(
+            error,
+            RuntimeError::Attach(AttachError::PublicationQueueClosed)
+        ));
+        assert_eq!(
+            sessions
+                .rollback_session_creation(session_id)
+                .expect("publication failure remains rollback eligible"),
+            Some(connection_index)
+        );
+        assert!(!sessions.has_session(session_id));
+    }
 }
 
 fn schedule_app_session_input(

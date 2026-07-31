@@ -135,7 +135,7 @@ fn tcp_rcv_process_index(
         let (_, connection_index) = sessions
             .session_transport(session_id)
             .ok_or(TcpNodeError::RcvProcessSessionMissing)?;
-        let (control, ack_advanced, acked_tx_len, established, established_with_payload) = {
+        let (control, ack_advanced, acked_tx_len, established_with_payload) = {
             let crate::worker::TcpWorker {
                 connections,
                 timers,
@@ -159,7 +159,6 @@ fn tcp_rcv_process_index(
                 control,
                 connection.snd_una() != previous_snd_una,
                 connection.take_acked_tx_len(previous_snd_una),
-                established,
                 previous_state == crate::TcpState::SynRcvd
                     && established
                     && packet.payload_len != 0,
@@ -183,9 +182,6 @@ fn tcp_rcv_process_index(
             }
         }
         publish_tcp_connection(sessions, tcp, session_id)?;
-        if established {
-            sessions.connected(session_id)?;
-        }
         Ok(control)
     })?;
     if let Some(segment) = control {

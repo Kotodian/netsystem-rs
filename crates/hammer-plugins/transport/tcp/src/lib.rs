@@ -120,23 +120,74 @@ pub(crate) fn publish_tcp_connection(
     let (_, index) = sessions
         .session_transport(session_id)
         .ok_or(TcpNodeError::SessionMissing)?;
-    let close = {
+    let (close, half_open) = {
         let TcpWorker {
             connections,
             lookup,
             ..
         } = tcp;
         let connection = connections.get(index).ok_or(TcpNodeError::SessionMissing)?;
-        lookup.publish_connection(session_id, connection)
+        (
+            lookup.publish_connection(session_id, connection),
+            connection.state() == TcpState::SynSent,
+        )
     };
-    let initial = sessions.connection_published(session_id)?;
+    if half_open {
+        return Ok(());
+    }
+    let rollback = |sessions: &mut SessionWorker<PoolIndex>, tcp: &mut TcpWorker| {
+        tcp.lookup.forget_session(session_id);
+        tcp.lookup.forget_pending_open(session_id);
+        let session_cleanup = sessions.rollback_session_creation(session_id);
+        let connection_cleanup = tcp.remove_connection(index);
+        match session_cleanup {
+            Err(error) => Err(error),
+            Ok(Some(rollback_index)) if rollback_index != index => {
+                Err(TcpNodeError::SessionMissing.into())
+            }
+            Ok(_) if connection_cleanup.is_none() => Err(TcpNodeError::SessionMissing.into()),
+            Ok(_) => Ok(()),
+        }
+    };
+    let initial = match sessions.connection_published(session_id) {
+        Ok(initial) => initial,
+        Err(error) => {
+            if let Err(cleanup_error) = rollback(sessions, tcp) {
+                tracing::error!(
+                    ?session_id,
+                    %cleanup_error,
+                    "TCP connection publication rollback failed"
+                );
+            }
+            return Err(error);
+        }
+    };
     if close {
         if initial {
-            return Err(TcpError::ConnectionClosed.into());
+            let error = TcpError::ConnectionClosed.into();
+            if let Err(cleanup_error) = rollback(sessions, tcp) {
+                tracing::error!(
+                    ?session_id,
+                    %cleanup_error,
+                    "closed TCP connection publication rollback failed"
+                );
+            }
+            return Err(error);
         }
         sessions.notify_transport_closed(session_id, index)?;
         let _ = tcp.remove_connection(index);
         sessions.notify_transport_deleted(session_id, index)?;
+    } else if initial {
+        if let Err(error) = sessions.connected(session_id) {
+            if let Err(cleanup_error) = rollback(sessions, tcp) {
+                tracing::error!(
+                    ?session_id,
+                    %cleanup_error,
+                    "App publication rollback failed"
+                );
+            }
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -985,9 +1036,6 @@ pub(crate) fn closing_session_for_test() -> (
         .attach_session(session_id)
         .expect("attach stream session");
     publish_tcp_connection(&mut sessions, &mut tcp, session_id).expect("publish TCP connection");
-    sessions
-        .connected(session_id)
-        .expect("notify accepted session");
     (sessions, tcp, session_id, local, remote)
 }
 

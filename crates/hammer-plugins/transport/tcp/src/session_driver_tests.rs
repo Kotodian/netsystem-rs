@@ -2,10 +2,14 @@
 
 use std::time::{Duration, Instant};
 
-use crate::{TcpCapabilities, TcpPacket, TcpSegmentFlags, TcpState};
+use crate::{TcpCapabilities, TcpPacket, TcpSegmentFlags, TcpState, publish_tcp_connection};
 use hammer_core::data_plane::{BufferFrame, NodeId};
 use hammer_infra::pool::Index;
-use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId};
+use hammer_runtime::app::{
+    AppSessionError, AppSessionProtocol, AppSessionProtocolEntry, AppSessionProtocolRole,
+    AppSessionProtocolSelection, ApplicationId, SessionEvtType,
+};
+use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, RuntimeError};
 
 use hammer_service::data_plane::DropNode;
 use hammer_service::session::SessionId;
@@ -17,6 +21,74 @@ use hammer_service::session::runtime::{
 use crate::timers::{TcpTimerKind, TcpTimers};
 use crate::{TcpConnection, TcpWorker};
 
+#[hammer_component_macros::app_session_protocol(name = "tls")]
+struct TlsProtocol;
+
+impl AppSessionProtocol for TlsProtocol {
+    fn create(
+        _: Option<ApplicationId>,
+        _: AppSessionProtocolRole,
+        _: Option<u64>,
+        _: Option<&str>,
+    ) -> hammer_runtime::RuntimeResult<Self> {
+        Ok(Self)
+    }
+
+    fn ingress(
+        &mut self,
+        _: &hammer_infra::fifo::Fifo,
+        _: &hammer_infra::fifo::Fifo,
+    ) -> hammer_runtime::RuntimeResult<(usize, usize)> {
+        Ok((0, 0))
+    }
+
+    fn egress(
+        &mut self,
+        _: &hammer_infra::fifo::Fifo,
+        _: &hammer_infra::fifo::Fifo,
+    ) -> hammer_runtime::RuntimeResult<(usize, usize)> {
+        Err(AppSessionError::EventQueueFull {
+            session: 0,
+            event: SessionEvtType::Connect,
+        }
+        .into())
+    }
+}
+
+#[hammer_component_macros::app_session_protocol(name = "http")]
+struct HttpProtocol;
+
+impl AppSessionProtocol for HttpProtocol {
+    fn create(
+        _: Option<ApplicationId>,
+        _: AppSessionProtocolRole,
+        _: Option<u64>,
+        _: Option<&str>,
+    ) -> hammer_runtime::RuntimeResult<Self> {
+        Ok(Self)
+    }
+
+    fn ingress(
+        &mut self,
+        _: &hammer_infra::fifo::Fifo,
+        _: &hammer_infra::fifo::Fifo,
+    ) -> hammer_runtime::RuntimeResult<(usize, usize)> {
+        Ok((0, 0))
+    }
+
+    fn egress(
+        &mut self,
+        _: &hammer_infra::fifo::Fifo,
+        _: &hammer_infra::fifo::Fifo,
+    ) -> hammer_runtime::RuntimeResult<(usize, usize)> {
+        Err(AppSessionError::EventQueueFull {
+            session: 0,
+            event: SessionEvtType::Connect,
+        }
+        .into())
+    }
+}
+
 fn tcp_session<'a>(
     sessions: &SessionWorker<Index>,
     tcp: &'a TcpWorker,
@@ -27,8 +99,8 @@ fn tcp_session<'a>(
 }
 
 fn established_connection() -> TcpConnection {
-    let local = "192.0.2.10:443".parse().expect("local address");
-    let remote = "198.51.100.20:50001".parse().expect("remote address");
+    let local: std::net::SocketAddr = "192.0.2.10:443".parse().expect("local address");
+    let remote: std::net::SocketAddr = "198.51.100.20:50001".parse().expect("remote address");
     TcpConnection::established_with_sack_for_test(
         None,
         DataWorkerId::new(0),
@@ -44,6 +116,54 @@ fn worker_state() -> (SessionWorker<Index>, TcpWorker) {
         hammer_service::session::SessionWorker::new(worker).expect("session worker for test"),
         TcpWorker::new(worker),
     )
+}
+
+fn attach_protocol_session(
+    sessions: &mut SessionWorker<Index>,
+    tcp: &mut TcpWorker,
+    connection_index: Index,
+    protocol: AppSessionProtocolEntry,
+) -> SessionId {
+    let applications = hammer_service::session::ApplicationMain::with_protocols(1, [protocol]);
+    let application = applications.attach().expect("attach test Application");
+    let policy = hammer_runtime::app::AppSessionPolicy::new(
+        hammer_runtime::app::APP_SESSION_POLICY_VERSION,
+        [AppSessionProtocolSelection::new(
+            protocol.registration().name(),
+        )],
+    )
+    .expect("App Session protocol policy is valid");
+    let application_listener = applications
+        .register_listener(application, &policy)
+        .expect("register protocol Application listener");
+    let session_main = std::sync::Arc::new(hammer_service::session::runtime::SessionMain::new(
+        1,
+        applications,
+    ));
+    sessions.set_listener_main(std::sync::Arc::clone(&session_main));
+    let listener = session_main
+        .listen(
+            application_listener,
+            hammer_runtime::SessionTransportRegistration::new(
+                "test-session",
+                Some(|_, _| Ok(())),
+                Some(|_| Ok(())),
+                None,
+            ),
+            hammer_runtime::SessionListenEndpoint::new(
+                "127.0.0.1:0".parse().expect("test endpoint"),
+                sessions.worker(),
+            ),
+        )
+        .expect("register protocol Session listener");
+    let session_id = sessions
+        .stream_accept(TcpWorker::ID, connection_index, listener)
+        .expect("construct protocol Session");
+    tcp.connection_mut(connection_index)
+        .expect("TCP connection")
+        .attach_session(session_id)
+        .expect("attach protocol Session");
+    session_id
 }
 
 fn session_queue(runtime: &DataPlaneRuntime) -> (NodeId, SessionQueueNext) {
@@ -267,6 +387,157 @@ fn rollback_discards_unpublished_session_without_close_notification() {
     assert!(!sessions.has_session(session_id));
     assert!(removed.is_some());
     assert!(tcp.connection(connection_index).is_none());
+}
+
+#[test]
+fn active_open_commits_session_after_full_connection_publication() {
+    let (mut sessions, mut tcp) = worker_state();
+    let worker = DataWorkerId::new(0);
+    let local: std::net::SocketAddr = "192.0.2.10:443".parse().expect("local address");
+    let remote: std::net::SocketAddr = "198.51.100.20:50001".parse().expect("remote address");
+    let mut connection = TcpConnection::new(None, worker, local.port(), Some(local), remote);
+    connection.connect_state(100);
+    let connection_index = tcp
+        .insert_connection(connection)
+        .expect("insert active-open TCP connection");
+    let applications = hammer_service::session::ApplicationMain::new(1);
+    let application = applications.attach().expect("attach test Application");
+    let policy = hammer_runtime::app::AppSessionPolicy::new(
+        hammer_runtime::app::APP_SESSION_POLICY_VERSION,
+        [],
+    )
+    .expect("direct App Session policy is valid");
+    let application_listener = applications
+        .register_listener(application, &policy)
+        .expect("register test Application listener");
+    let session_main = std::sync::Arc::new(hammer_service::session::runtime::SessionMain::new(
+        1,
+        applications,
+    ));
+    sessions.set_listener_main(std::sync::Arc::clone(&session_main));
+    let listener = session_main
+        .listen(
+            application_listener,
+            hammer_runtime::SessionTransportRegistration::new(
+                "test-session",
+                Some(|_, _| Ok(())),
+                Some(|_| Ok(())),
+                None,
+            ),
+            hammer_runtime::SessionListenEndpoint::new(
+                "127.0.0.1:0".parse().expect("test endpoint"),
+                worker,
+            ),
+        )
+        .expect("register test Session listener");
+    let session_id = sessions
+        .stream_accept(TcpWorker::ID, connection_index, listener)
+        .expect("construct active-open Session");
+    tcp.connection_mut(connection_index)
+        .expect("active-open TCP connection")
+        .attach_session(session_id)
+        .expect("attach active-open Session");
+
+    publish_tcp_connection(&mut sessions, &mut tcp, session_id)
+        .expect("publish active half-open lookup");
+    assert_eq!(
+        tcp.lookup
+            .pending_route_by_tuple(local, remote)
+            .map(|route| route.0),
+        Some(session_id)
+    );
+
+    let mut established = established_connection();
+    established
+        .attach_session(session_id)
+        .expect("attach established Session");
+    *tcp.connection_mut(connection_index)
+        .expect("active-open TCP connection remains installed") = established;
+    publish_tcp_connection(&mut sessions, &mut tcp, session_id)
+        .expect("publish established TCP connection and notify App");
+
+    assert!(tcp.lookup.pending_route_by_tuple(local, remote).is_none());
+    assert_eq!(
+        tcp.lookup
+            .session_route_by_tuple(local, remote)
+            .map(|route| route.0),
+        Some(session_id)
+    );
+    assert!(sessions.rollback_session_creation(session_id).is_err());
+}
+
+#[test]
+fn passive_open_app_notification_failure_rolls_back_all_owner_state() {
+    let (mut sessions, mut tcp) = worker_state();
+    let connection = established_connection();
+    let local = connection.local().expect("local address");
+    let remote = connection.remote();
+    let connection_index = tcp
+        .insert_connection(connection)
+        .expect("insert passive-open TCP connection");
+    let session_id = attach_protocol_session(
+        &mut sessions,
+        &mut tcp,
+        connection_index,
+        __APP_SESSION_PROTOCOL_TLS_PROTOCOL,
+    );
+
+    let error = publish_tcp_connection(&mut sessions, &mut tcp, session_id)
+        .expect_err("full App event queue rejects passive-open notification");
+
+    assert!(matches!(
+        error,
+        RuntimeError::AppSession(AppSessionError::EventQueueFull {
+            event: SessionEvtType::Connect,
+            ..
+        })
+    ));
+    assert!(tcp.lookup.session_route_by_tuple(local, remote).is_none());
+    assert!(tcp.lookup.pending_route_by_tuple(local, remote).is_none());
+    assert!(tcp.connection(connection_index).is_none());
+    assert!(!sessions.has_session(session_id));
+}
+
+#[test]
+fn active_open_app_notification_failure_rolls_back_all_owner_state() {
+    let (mut sessions, mut tcp) = worker_state();
+    let worker = DataWorkerId::new(0);
+    let local: std::net::SocketAddr = "192.0.2.10:443".parse().expect("local address");
+    let remote: std::net::SocketAddr = "198.51.100.20:50001".parse().expect("remote address");
+    let mut connection = TcpConnection::new(None, worker, local.port(), Some(local), remote);
+    connection.connect_state(100);
+    let connection_index = tcp
+        .insert_connection(connection)
+        .expect("insert active-open TCP connection");
+    let session_id = attach_protocol_session(
+        &mut sessions,
+        &mut tcp,
+        connection_index,
+        __APP_SESSION_PROTOCOL_HTTP_PROTOCOL,
+    );
+    publish_tcp_connection(&mut sessions, &mut tcp, session_id)
+        .expect("publish active half-open lookup");
+
+    let mut established = established_connection();
+    established
+        .attach_session(session_id)
+        .expect("attach established Session");
+    *tcp.connection_mut(connection_index)
+        .expect("active-open TCP connection remains installed") = established;
+    let error = publish_tcp_connection(&mut sessions, &mut tcp, session_id)
+        .expect_err("full App event queue rejects active-open notification");
+
+    assert!(matches!(
+        error,
+        RuntimeError::AppSession(AppSessionError::EventQueueFull {
+            event: SessionEvtType::Connect,
+            ..
+        })
+    ));
+    assert!(tcp.lookup.session_route_by_tuple(local, remote).is_none());
+    assert!(tcp.lookup.pending_route_by_tuple(local, remote).is_none());
+    assert!(tcp.connection(connection_index).is_none());
+    assert!(!sessions.has_session(session_id));
 }
 
 #[test]
