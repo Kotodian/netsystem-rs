@@ -94,6 +94,11 @@ fn app_session_input_node_process(
             );
             let _ = runtime.set_node_interrupt_pending(session_queue)?;
         }
+        if SessionQueueNode::has_pending_app_mqs(runtime, data)? {
+            if let Some(node) = runtime.current_node() {
+                let _ = runtime.set_node_interrupt_pending(node)?;
+            }
+        }
         Ok::<(), RuntimeError>(())
     })();
     if result.is_err() {
@@ -246,6 +251,22 @@ impl SessionQueueNode {
         // and the SessionMain Arc remains alive in that worker's SessionMain.
         let main = unsafe { &*ptr };
         main.with_worker_mut(runtime, |sessions| sessions.poll_app())
+    }
+
+    fn has_pending_app_mqs(
+        runtime: &DataPlaneRuntime,
+        runtime_data: NodeRuntimeData,
+    ) -> RuntimeResult<bool> {
+        let ptr = runtime_data.word(0) as usize as *const SessionMain;
+        if ptr.is_null() {
+            return Err(RuntimeError::RuntimeCapabilityMissing {
+                type_name: std::any::type_name::<SessionMain>(),
+            });
+        }
+        // SAFETY: worker NodeRuntimeData is installed by the owning Data Worker
+        // and the SessionMain Arc remains alive in that worker's SessionMain.
+        let main = unsafe { &*ptr };
+        main.with_worker_mut(runtime, |sessions| Ok(sessions.has_pending_app_mqs()))
     }
 
     /// Compiles the session queue's output edge in the main graph.

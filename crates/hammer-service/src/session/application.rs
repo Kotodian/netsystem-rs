@@ -130,7 +130,7 @@ impl ApplicationMqResources {
             .map_err(|source| ApplicationError::MqLayout { source })?;
         let segment_bytes = queue_bytes
             .checked_mul(worker_count)
-            .and_then(|bytes| bytes.checked_add(128))
+            .and_then(|bytes| bytes.checked_add(APP_MQ_SEGMENT_HEADROOM))
             .ok_or(ApplicationError::MqLayoutOverflow)?;
         let segment = if shared {
             let name = format!(
@@ -199,6 +199,7 @@ pub struct ApplicationMain {
 }
 
 const APP_MQ_CAPACITY_MIN: usize = 128;
+const APP_MQ_SEGMENT_HEADROOM: usize = 1 << 20;
 
 // SAFETY: every state access verifies the creating Main Thread before
 // dereferencing `state`; ApplicationRegistration is !Send and Binary API calls
@@ -330,21 +331,11 @@ impl ApplicationMain {
         });
         match install_result {
             Some(Ok(())) => {
-                let store_result = self.store_mq_resources(application, resources);
-                if let Err(error) = store_result {
-                    self.rollback_attach(application);
-                    return Err(error);
-                }
+                self.store_mq_resources(application, resources)?;
                 Ok(application)
             }
-            Some(Err(error)) => {
-                self.rollback_attach(application);
-                Err(error)
-            }
-            None => {
-                self.rollback_attach(application);
-                Err(ApplicationError::SessionMainMissing)
-            }
+            Some(Err(error)) => Err(error),
+            None => Err(ApplicationError::SessionMainMissing),
         }
     }
 
@@ -384,12 +375,6 @@ impl ApplicationMain {
         Some((queue, Some(resources.segment().clone()), offset))
     }
 
-    fn rollback_attach(&self, application: ApplicationId) {
-        if let Err(error) = self.detach(application) {
-            tracing::error!(%error, ?application, "per-Application MQ attach cleanup failed");
-        }
-    }
-
     pub fn contains(&self, application: ApplicationId) -> Result<bool, ApplicationError> {
         Ok(self
             .state()?
@@ -406,6 +391,23 @@ impl ApplicationMain {
                 .applications
                 .get(index)
                 .ok_or(ApplicationError::Missing { application })?;
+            Ok(())
+        })??;
+
+        match Engine::with_current(|engine| -> Result<(), ApplicationError> {
+            let sessions = engine
+                .registry
+                .get::<super::runtime::SessionMain>()
+                .ok_or(ApplicationError::SessionMainMissing)?;
+            sessions
+                .application_detached(engine, application)
+                .map_err(|source| ApplicationError::MqDetachFailed { source })
+        }) {
+            Some(result) => result,
+            None => Ok(()),
+        }?;
+
+        self.with_state_mut(|state| {
             if let Some(slot) = state.mq_resources.get_mut(application.slot() as usize)
                 && slot
                     .as_ref()
@@ -446,7 +448,6 @@ impl ApplicationMain {
             Ok(())
         })??;
 
-        notify_session_runtime(application);
         Ok(())
     }
 
@@ -706,15 +707,6 @@ impl ApplicationMain {
     }
 }
 
-fn notify_session_runtime(application: ApplicationId) {
-    Engine::with_current(|engine| {
-        let Some(sessions) = engine.registry.get::<super::runtime::SessionMain>() else {
-            return;
-        };
-        sessions.application_detached(engine, application);
-    });
-}
-
 /// Local Application capability. Dropping it detaches the Application.
 pub struct ApplicationRegistration {
     main: Arc<ApplicationMain>,
@@ -784,6 +776,11 @@ pub enum ApplicationError {
     SessionMainMissing,
     #[error("per-Application MQ worker installation failed")]
     MqInstall {
+        #[source]
+        source: RuntimeError,
+    },
+    #[error("per-Application MQ worker detach cleanup failed")]
+    MqDetachFailed {
         #[source]
         source: RuntimeError,
     },
@@ -895,7 +892,7 @@ mod tests {
         let main = ApplicationMain::new(2);
         let application = main.attach().expect("attach Application");
         let resources =
-            ApplicationMqResources::create_local(application, 2, 128).expect("MQ resources");
+            ApplicationMqResources::create_local(application, 2, 2048).expect("MQ resources");
 
         assert_eq!(resources.worker_count(), 2);
         for worker in [DataWorkerId::new(0), DataWorkerId::new(1)] {
@@ -906,7 +903,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_local_without_runtime_rolls_back_identity_and_mq_resources() {
+    fn attach_local_without_runtime_does_not_publish_mq_resources() {
         let main = ApplicationMain::new(1);
         let error = main
             .attach_local(1, 128)
@@ -914,7 +911,6 @@ mod tests {
 
         assert!(matches!(error, ApplicationError::SessionMainMissing));
         let state = main.state().expect("read Application state");
-        assert!(state.applications.is_empty());
         assert!(state.mq_resources.iter().all(Option::is_none));
     }
 
