@@ -5,11 +5,23 @@ use std::sync::{Arc, Weak};
 
 use crossbeam_queue::ArrayQueue;
 use hammer_infra::segment::Segment;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 
+use crate::app::SessionMsgQueue;
 use crate::app::{AppSession, ApplicationId, SessionEventQueue, SessionOffsets};
 use crate::{AttachError, RuntimeResult};
+
+mod application;
+mod descriptor;
+
+use application::{ApplicationAttachment, AttachedApplication};
+
+pub use application::{
+    DESCRIPTOR_COUNT as APPLICATION_MQ_DESCRIPTOR_COUNT,
+    METADATA_BYTES as APPLICATION_MQ_METADATA_BYTES,
+    METADATA_WORDS as APPLICATION_MQ_METADATA_WORDS,
+};
 
 pub const ATTACH_PROTOCOL_VERSION: u64 = 1;
 pub const ATTACH_REQUEST_BYTES: usize = size_of::<u64>();
@@ -119,13 +131,15 @@ impl AppServer {
         }
     }
 
-    pub async fn serve<Attach, Detached, ApplicationError>(
+    pub async fn serve<Attach, Control, Detached, ApplicationError>(
         self: Arc<Self>,
         attach_application: Attach,
+        application_session_control: Control,
         application_detached: Detached,
     ) -> RuntimeResult<()>
     where
         Attach: Fn() -> Result<ApplicationId, ApplicationError>,
+        Control: Fn(ApplicationId, &SessionMsgQueue, &SessionMsgQueue) -> RuntimeResult<()>,
         Detached: Fn(ApplicationId),
         ApplicationError: std::fmt::Display,
     {
@@ -138,13 +152,17 @@ impl AppServer {
         let (registration_tx, mut registration_rx) =
             tokio::sync::mpsc::channel::<RuntimeResult<tokio::net::UnixStream>>(self.capacity);
         let (detached_tx, mut detached_rx) = tokio::sync::mpsc::channel(self.capacity);
-        let mut clients = HashMap::<ApplicationId, Arc<tokio::net::UnixStream>>::new();
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(self.capacity);
+        let mut clients = HashMap::<ApplicationId, AttachedApplication>::new();
         let mut publications = HashMap::<ApplicationId, VecDeque<AppSessionPublication>>::new();
 
         loop {
             while let Some(publication) = self.publications.entries.pop() {
                 let application = publication.application;
-                match clients.get(&application).cloned() {
+                match clients
+                    .get(&application)
+                    .map(|client| Arc::clone(&client.stream))
+                {
                     Some(client) => {
                         if let Err(error) = send_publication(&client, &publication).await {
                             tracing::warn!(%error, ?application, "failed to publish App Session");
@@ -221,6 +239,36 @@ impl AppServer {
                         !clients.contains_key(&application),
                         "Application attach allocated an identity already held by a live client"
                     );
+                    let attachment = match ApplicationAttachment::create(application) {
+                        Ok(attachment) => attachment,
+                        Err(error) => {
+                            tracing::error!(%error, ?application, "failed to create Application Session MQ resources");
+                            if let Err(error) = send_attach_reply(
+                                &mut client,
+                                ATTACH_STATUS_REJECTED,
+                                None,
+                            ).await {
+                                tracing::warn!(%error, "failed to reject Application attach");
+                            }
+                            application_detached(application);
+                            continue;
+                        }
+                    };
+                    let signal = match attachment.request_signal() {
+                        Ok(signal) => signal,
+                        Err(error) => {
+                            tracing::error!(%error, ?application, "failed to observe Application Session MQ");
+                            if let Err(error) = send_attach_reply(
+                                &mut client,
+                                ATTACH_STATUS_REJECTED,
+                                None,
+                            ).await {
+                                tracing::warn!(%error, "failed to reject Application attach");
+                            }
+                            application_detached(application);
+                            continue;
+                        }
+                    };
                     if let Err(error) = send_attach_reply(
                         &mut client,
                         ATTACH_STATUS_ACCEPTED,
@@ -230,8 +278,30 @@ impl AppServer {
                         application_detached(application);
                         continue;
                     }
+                    if let Err(error) = attachment.publish(&client).await {
+                        tracing::error!(%error, ?application, "failed to publish Application Session MQ resources");
+                        application_detached(application);
+                        continue;
+                    }
                     let client = Arc::new(client);
-                    clients.insert(application, Arc::clone(&client));
+                    clients.insert(
+                        application,
+                        AttachedApplication {
+                            stream: Arc::clone(&client),
+                            requests: attachment.requests,
+                            replies: attachment.replies,
+                        },
+                    );
+                    let control_ready = control_tx.clone();
+                    let control_detached = detached_tx.clone();
+                    tokio::spawn(async move {
+                        if application::monitor(application, signal, control_ready)
+                            .await
+                            .is_err()
+                        {
+                            let _ = control_detached.send(application).await;
+                        }
+                    });
                     let detached_tx = detached_tx.clone();
                     let monitor = Arc::clone(&client);
                     tokio::spawn(async move {
@@ -257,6 +327,22 @@ impl AppServer {
                                 }
                                 break;
                             }
+                        }
+                    }
+                }
+                Some(application) = control_rx.recv() => {
+                    let Some(client) = clients.get(&application) else {
+                        continue;
+                    };
+                    if let Err(error) = application_session_control(
+                        application,
+                        &client.requests,
+                        &client.replies,
+                    ) {
+                        tracing::error!(%error, ?application, "Application Session MQ dispatch failed");
+                        if clients.remove(&application).is_some() {
+                            publications.remove(&application);
+                            application_detached(application);
                         }
                     }
                 }
@@ -331,63 +417,5 @@ async fn send_publication(
         chunk.copy_from_slice(&word.to_le_bytes());
     }
 
-    loop {
-        client
-            .writable()
-            .await
-            .map_err(|source| AttachError::Send { source })?;
-        let sent = client.try_io(Interest::WRITABLE, || {
-            let iov = libc::iovec {
-                iov_base: metadata.as_ptr().cast_mut().cast::<libc::c_void>(),
-                iov_len: metadata.len(),
-            };
-            let mut control = [0_u8; 128];
-            let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-            message.msg_iov = std::ptr::from_ref(&iov).cast_mut();
-            message.msg_iovlen = 1;
-            message.msg_control = control.as_mut_ptr().cast::<libc::c_void>();
-            message.msg_controllen = control.len() as _;
-
-            unsafe {
-                let header = libc::CMSG_FIRSTHDR(&message);
-                if header.is_null() {
-                    return Err(io::Error::other("attach control header is missing"));
-                }
-                (*header).cmsg_level = libc::SOL_SOCKET;
-                (*header).cmsg_type = libc::SCM_RIGHTS;
-                (*header).cmsg_len =
-                    libc::CMSG_LEN(std::mem::size_of_val(&descriptors) as u32) as _;
-                std::ptr::copy_nonoverlapping(
-                    descriptors.as_ptr(),
-                    libc::CMSG_DATA(header).cast::<RawFd>(),
-                    descriptors.len(),
-                );
-                message.msg_controllen = (*header).cmsg_len;
-            }
-
-            let sent = unsafe { libc::sendmsg(client.as_raw_fd(), &message, 0) };
-            if sent < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(sent as usize)
-            }
-        });
-        match sent {
-            Ok(sent) if sent == metadata.len() => return Ok(()),
-            Ok(sent) => {
-                return Err(AttachError::Send {
-                    source: io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        format!(
-                            "attach metadata write was partial: expected {}, sent {sent}",
-                            metadata.len()
-                        ),
-                    ),
-                }
-                .into());
-            }
-            Err(source) if source.kind() == io::ErrorKind::WouldBlock => {}
-            Err(source) => return Err(AttachError::Send { source }.into()),
-        }
-    }
+    descriptor::send(client, &metadata, &descriptors).await
 }

@@ -1,3 +1,4 @@
+mod control;
 mod handle;
 mod layout;
 mod policy;
@@ -5,6 +6,12 @@ mod protocol;
 mod session;
 pub mod session_msg_queue;
 
+pub use control::{
+    APPLICATION_SESSION_CONTROL_BYTES, ApplicationSessionMqError, ApplicationSessionReply,
+    ApplicationSessionRequest, ApplicationSessionStatus, dequeue_application_session_reply,
+    dequeue_application_session_request, enqueue_application_session_reply,
+    enqueue_application_session_request,
+};
 pub use handle::SessionHandle;
 pub use layout::SessionOffsets;
 pub use policy::{
@@ -14,7 +21,6 @@ pub use policy::{
 pub use protocol::{
     AppSessionProtocol, AppSessionProtocolConnectionId, AppSessionProtocolConnections,
     AppSessionProtocolEntry, AppSessionProtocolRegistration, AppSessionProtocolRole,
-    AppSessionSemantics, ORDERED_RELIABLE_BYTE_STREAM,
 };
 pub use session::{AppSession, AppSessionConfig, AppSessionError};
 pub use session_msg_queue::{

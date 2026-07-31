@@ -12,6 +12,10 @@ path = "src/main.rs"
 name = "tun_tcp_echo"
 path = "../../examples/tun/tcp_echo.rs"
 
+[[example]]
+name = "tun_tls_echo"
+path = "../../examples/tun/tls_echo.rs"
+
 [dependencies]
 hammer-runtime = { path = "../hammer-runtime" }
 hammer-infra = { path = "../hammer-infra" }
@@ -42,3 +46,4 @@ hammer-plugin-tun = { path = "../hammer-plugins/device/tun" }
 hammer-plugin-tls = { path = "../hammer-plugins/app-session/tls" }
 libc = { workspace = true }
 ipnet = { workspace = true }
+prost = { workspace = true }

@@ -20,8 +20,8 @@ use hammer_runtime::app::{
 };
 use hammer_runtime::attach::AppSessionPublisher;
 use hammer_runtime::{
-    AttachError, RuntimeError, RuntimeResult, SessionListenEndpoint, SessionListenerId,
-    SessionTransportRegistration,
+    AttachError, RuntimeError, RuntimeResult, SessionConnectEndpoint, SessionConnectionId,
+    SessionListenEndpoint, SessionListenerId, SessionTransportRegistration,
 };
 use hammer_runtime::{DataPlaneRuntime, DataWorkerId, Engine, File, FileFunctions, Node};
 
@@ -184,7 +184,7 @@ pub struct SessionMain {
     applications: Arc<ApplicationMain>,
 }
 
-struct SessionListener {
+pub(super) struct SessionListener {
     application: ApplicationId,
     application_listener: ApplicationListenerId,
     transport: SessionTransportRegistration,
@@ -192,11 +192,11 @@ struct SessionListener {
 
 impl SessionListener {
     #[inline]
-    const fn application(&self) -> ApplicationId {
+    pub(super) const fn application(&self) -> ApplicationId {
         self.application
     }
 
-    const fn application_listener(&self) -> ApplicationListenerId {
+    pub(super) const fn application_listener(&self) -> ApplicationListenerId {
         self.application_listener
     }
 }
@@ -223,6 +223,10 @@ fn session_listener_index(listener: SessionListenerId) -> PoolIndex {
 }
 
 impl SessionMain {
+    pub(super) fn applications(&self) -> &ApplicationMain {
+        &self.applications
+    }
+
     pub fn new(worker_count: usize, applications: Arc<ApplicationMain>) -> Self {
         let workers = (0..worker_count)
             .map(|_| CacheLine::new(ThreadOwned::new()))
@@ -298,7 +302,24 @@ impl SessionMain {
         Ok(())
     }
 
-    fn with_listener<R>(
+    pub fn connect(
+        &self,
+        connection: ApplicationConnectionId,
+        transport: SessionTransportRegistration,
+        endpoint: SessionConnectEndpoint,
+    ) -> RuntimeResult<SessionConnectionId> {
+        let Some(connect) = transport.connect() else {
+            return Err(SessionError::TransportConnectUnsupported {
+                transport: transport.name(),
+            }
+            .into());
+        };
+        let session_connection = SessionConnectionId::from_raw(connection.raw());
+        connect(session_connection, endpoint)?;
+        Ok(session_connection)
+    }
+
+    pub(super) fn with_listener<R>(
         &self,
         listener: SessionListenerId,
         operation: impl FnOnce(&SessionListener) -> R,
@@ -572,19 +593,20 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         &mut self,
         transport: SessionTransportId,
         index: Index,
-        connection: ApplicationConnectionId,
+        connection: SessionConnectionId,
     ) -> RuntimeResult<SessionId> {
+        let application_connection = ApplicationConnectionId::from_raw(connection.raw());
         let applications = self
             .applications
             .as_ref()
             .cloned()
             .ok_or(SessionError::ApplicationMainMissingForConnection { connection })?;
         let session_id = applications
-            .with_connection(connection, |policy| {
+            .with_connection(application_connection, |policy| {
                 self.construct_stream_sessions(
                     transport,
                     index,
-                    connection.raw(),
+                    application_connection.raw(),
                     policy.application(),
                     AppSessionProtocolRole::Client,
                     policy.protocols(),
@@ -592,7 +614,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
                 )
             })
             .map_err(|source| RuntimeError::subsystem("application", source))??;
-        if let Err(source) = applications.complete_connection(connection) {
+        if let Err(source) = applications.complete_connection(application_connection) {
             self.remove_session(session_id)?;
             return Err(RuntimeError::subsystem("application", source));
         }
@@ -853,11 +875,11 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         let listener = main
             .listen(
                 application_listener,
-                SessionTransportRegistration::with_listener_operations(
+                SessionTransportRegistration::new(
                     "test-session",
-                    hammer_runtime::app::ORDERED_RELIABLE_BYTE_STREAM,
-                    |_, _| Ok(()),
-                    |_| Ok(()),
+                    Some(|_, _| Ok(())),
+                    Some(|_| Ok(())),
+                    None,
                 ),
                 SessionListenEndpoint::new(
                     "127.0.0.1:0".parse().expect("test endpoint"),

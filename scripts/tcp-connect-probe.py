@@ -14,6 +14,7 @@ bytes at the deadline, unexpected trailing data, and close during idle.
 import argparse
 import select
 import socket
+import ssl
 import time
 from pathlib import Path
 
@@ -45,6 +46,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ready-file")
     parser.add_argument("--continue-file")
     parser.add_argument("--continue-timeout", type=float, default=30.0)
+    parser.add_argument("--tls-ca")
+    parser.add_argument("--tls-server-name")
     return parser.parse_args()
 
 
@@ -76,6 +79,19 @@ def connect(args: argparse.Namespace) -> socket.socket:
             connection.connect((args.host, args.port))
             connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             print(f"TCP connection succeeded on attempt {attempt}", flush=True)
+            if args.tls_ca:
+                context = ssl.create_default_context(cafile=args.tls_ca)
+                context.minimum_version = ssl.TLSVersion.TLSv1_3
+                context.maximum_version = ssl.TLSVersion.TLSv1_3
+                connection = context.wrap_socket(
+                    connection,
+                    server_hostname=args.tls_server_name,
+                )
+                print(
+                    f"TLS connection succeeded: version={connection.version()} "
+                    f"cipher={connection.cipher()[0]}",
+                    flush=True,
+                )
             return connection
         except (OSError, TimeoutError) as error:
             connection.close()
@@ -102,7 +118,12 @@ def run_echo(connection: socket.socket, args: argparse.Namespace) -> None:
             [connection], [connection] if want_write else [], [], 0.5
         )
         if readable:
-            data = connection.recv(RECV_CHUNK_BYTES)
+            try:
+                data = connection.recv(RECV_CHUNK_BYTES)
+            except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                data = None
+            if data is None:
+                continue
             if data == b"":
                 raise SystemExit(
                     f"peer closed before echo completed: sent {sent}, received {received}"
@@ -124,7 +145,10 @@ def run_echo(connection: socket.socket, args: argparse.Namespace) -> None:
         if writable:
             budget = min(args.chunk_bytes, total - sent, args.window_bytes - (sent - received))
             if budget > 0:
-                sent += connection.send(payload_slice(sent, budget))
+                try:
+                    sent += connection.send(payload_slice(sent, budget))
+                except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                    pass
     print(f"echo verified: {received} bytes matched exactly", flush=True)
 
 
@@ -137,7 +161,10 @@ def run_idle(connection: socket.socket, idle_seconds: float) -> None:
         readable, _, _ = select.select([connection], [], [], min(remaining, 0.5))
         if not readable:
             continue
-        data = connection.recv(RECV_CHUNK_BYTES)
+        try:
+            data = connection.recv(RECV_CHUNK_BYTES)
+        except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+            continue
         if data == b"":
             raise SystemExit("peer closed the connection during the idle window")
         raise SystemExit(f"unexpected trailing data during idle: {len(data)} bytes")
@@ -153,6 +180,8 @@ def main() -> None:
         raise SystemExit(
             "--echo-bytes must be >= 0; --chunk-bytes/--window-bytes must be > 0"
         )
+    if bool(args.tls_ca) != bool(args.tls_server_name):
+        raise SystemExit("--tls-ca and --tls-server-name must be supplied together")
     connection = connect(args)
     with connection:
         if args.ready_file:

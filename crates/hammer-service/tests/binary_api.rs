@@ -7,7 +7,8 @@ use hammer_runtime::{
     PluginMain, RuntimeRegistry,
 };
 use hammer_service::binary_api::{
-    BinaryApiMain, BinaryApiReply, BinaryApiRequest, BinaryApiStatus,
+    BinaryApiClient, BinaryApiError, BinaryApiMain, BinaryApiReply, BinaryApiRequest,
+    BinaryApiStatus,
 };
 use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -188,6 +189,53 @@ async fn protobuf_methods_dispatch_on_the_main_thread_over_unix_socket() {
     assert_eq!(panicked.status, BinaryApiStatus::MethodPanicked as i32);
 
     drop(stream);
+
+    server.abort();
+    server.await.expect_err("server task aborted");
+    drop(main);
+    drop(current);
+    drop(engine);
+    assert!(!path.exists(), "Binary API socket must be removed on drop");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn blocking_client_preserves_method_payload_context_and_status() {
+    let mut engine = engine();
+    engine.install_current();
+    let current = CurrentEngine;
+    let path = socket_path();
+    let main = Arc::new(BinaryApiMain::bind(&path, 64 * 1024).expect("bind Binary API"));
+    let server = tokio::spawn(Arc::clone(&main).serve());
+    let client_path = path.clone();
+    let expected_thread = format!("{:?}", std::thread::current().id());
+
+    let (echo, missing) = tokio::task::spawn_blocking(move || {
+        let mut client = BinaryApiClient::connect(client_path).expect("connect blocking client");
+        let payload = client
+            .call(
+                "test.echo",
+                &EchoRequest {
+                    text: "hammer".to_owned(),
+                }
+                .encode_to_vec(),
+            )
+            .expect("call echo through blocking client");
+        let echo = EchoReply::decode(payload.as_slice()).expect("decode echo payload");
+        let missing = client
+            .call("test.missing", &[])
+            .expect_err("missing Binary API method is rejected");
+        (echo, missing)
+    })
+    .await
+    .expect("join blocking Binary API client");
+
+    assert_eq!(echo.text, "hammer");
+    assert_eq!(echo.thread, expected_thread);
+    assert!(matches!(
+        missing,
+        BinaryApiError::ClientRejected { method, status }
+            if method == "test.missing" && status == BinaryApiStatus::MethodMissing
+    ));
 
     server.abort();
     server.await.expect_err("server task aborted");

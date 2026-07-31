@@ -7,11 +7,6 @@ use crate::{DataWorkerId, RuntimeError, RuntimeResult};
 
 use super::{ApplicationId, SessionHandle};
 
-/// Session semantics supplied or produced at one protocol boundary.
-pub type AppSessionSemantics = &'static str;
-
-pub const ORDERED_RELIABLE_BYTE_STREAM: AppSessionSemantics = "ordered-reliable-byte-stream";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppSessionProtocolRole {
     Client,
@@ -306,33 +301,17 @@ fn protocol_worker_access(worker: DataWorkerId, source: ThreadOwnedError) -> Run
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppSessionProtocolRegistration {
     name: &'static str,
-    lower: AppSessionSemantics,
-    upper: AppSessionSemantics,
 }
 
 impl AppSessionProtocolRegistration {
     #[inline]
-    pub const fn new(
-        name: &'static str,
-        lower: AppSessionSemantics,
-        upper: AppSessionSemantics,
-    ) -> Self {
-        Self { name, lower, upper }
+    pub const fn new(name: &'static str) -> Self {
+        Self { name }
     }
 
     #[inline]
     pub const fn name(self) -> &'static str {
         self.name
-    }
-
-    #[inline]
-    pub const fn lower(self) -> AppSessionSemantics {
-        self.lower
-    }
-
-    #[inline]
-    pub const fn upper(self) -> AppSessionSemantics {
-        self.upper
     }
 }
 
@@ -375,8 +354,6 @@ impl AppSessionProtocolEntry {
     #[allow(clippy::too_many_arguments)]
     pub const fn new(
         name: &'static str,
-        lower: AppSessionSemantics,
-        upper: AppSessionSemantics,
         create: fn(
             DataWorkerId,
             usize,
@@ -407,7 +384,7 @@ impl AppSessionProtocolEntry {
         destroy: fn(DataWorkerId, AppSessionProtocolConnectionId),
     ) -> Self {
         Self {
-            registration: AppSessionProtocolRegistration::new(name, lower, upper),
+            registration: AppSessionProtocolRegistration::new(name),
             create,
             ingress,
             egress,

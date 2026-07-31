@@ -15,7 +15,8 @@ use hammer_app::attach::{AppClient, AppClientError};
 use hammer_infra::fifo::Fifo;
 use hammer_infra::segment::Segment;
 use hammer_runtime::app::{
-    AppSession, ApplicationId, SessionEvtType, SessionHandle, SessionMsgQueue, SessionOffsets,
+    AppSession, ApplicationId, SessionEventQueue, SessionEvtType, SessionHandle, SessionMsgQueue,
+    SessionOffsets,
 };
 use hammer_runtime::attach::{
     ATTACH_PROTOCOL_VERSION, ATTACH_REPLY_BYTES, ATTACH_REQUEST_BYTES, ATTACH_STATUS_ACCEPTED,
@@ -170,14 +171,18 @@ fn spawn_serve(server: Arc<AppServer>, first_application: ApplicationId) {
                     attach_sequence.fetch_add(1, Ordering::Relaxed),
                 ))
             },
+            |_, _, _| Ok(()),
             |_| {},
         ));
     });
 }
 
-fn send_fds(stream: &UnixStream, fds: &[RawFd], metadata: [u64; 8]) {
-    let mut bytes = [0_u8; 64];
-    for (chunk, word) in bytes.chunks_exact_mut(size_of::<u64>()).zip(metadata) {
+fn send_fds(stream: &UnixStream, fds: &[RawFd], metadata: &[u64]) {
+    let mut bytes = vec![0_u8; metadata.len() * size_of::<u64>()];
+    for (chunk, word) in bytes
+        .chunks_exact_mut(size_of::<u64>())
+        .zip(metadata.iter().copied())
+    {
         chunk.copy_from_slice(&word.to_le_bytes());
     }
     let iov = libc::iovec {
@@ -225,6 +230,37 @@ fn accept_application(stream: &mut UnixStream, application: ApplicationId) {
         chunk.copy_from_slice(&word.to_le_bytes());
     }
     stream.write_all(&reply).expect("accept Application attach");
+
+    let counter = NAME_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let segment = Segment::shared(&format!("hc{}-{counter}", std::process::id()), 1024 * 1024)
+        .expect("Application control segment");
+    let queue_bytes = SessionMsgQueue::layout_bytes(16, 8).expect("control queue layout");
+    let request_offset = segment
+        .alloc(queue_bytes, 64)
+        .expect("request queue offset");
+    let reply_offset = segment.alloc(queue_bytes, 64).expect("reply queue offset");
+    let requests = unsafe {
+        SessionMsgQueue::init_at_with_signal(segment.clone(), request_offset, 16, 8)
+            .expect("request queue")
+    };
+    let replies = unsafe {
+        SessionMsgQueue::init_at_with_signal(segment.clone(), reply_offset, 16, 8)
+            .expect("reply queue")
+    };
+    send_fds(
+        stream,
+        &[
+            segment.shared_fd().expect("control segment descriptor"),
+            requests.write_fd().expect("request signal"),
+            replies.read_fd().expect("reply signal"),
+        ],
+        &[
+            ATTACH_PROTOCOL_VERSION,
+            segment.size() as u64,
+            request_offset,
+            reply_offset,
+        ],
+    );
 }
 
 fn assert_publish_then_connect_round_trips_handle_and_descriptors() {
@@ -247,7 +283,7 @@ fn assert_publish_then_connect_round_trips_handle_and_descriptors() {
     let identity = descriptor_identity(segment_fd).expect("segment identity");
     let baseline = count_open_identity(identity);
 
-    let client = AppClient::connect(&path_text).expect("attach client");
+    let client = AppClient::attach(&path_text).expect("attach client");
     assert_eq!(client.application(), application);
     let client_session = client.accept().expect("accept App Session");
     assert_eq!(client_session.session_handle(), handle);
@@ -291,7 +327,7 @@ fn assert_connect_before_publish_completes_after_publication() {
 
     let client_path = path_text.clone();
     let client_thread = std::thread::spawn(move || {
-        let client = AppClient::connect(&client_path)?;
+        let client = AppClient::attach(&client_path)?;
         assert_eq!(client.application(), application);
         client.accept()
     });
@@ -331,7 +367,7 @@ fn assert_failed_attach_requeues_publication_for_next_client() {
         .try_publish(&published.publication)
         .expect("publish after doomed client");
 
-    let client = AppClient::connect(&path_text).expect("attach surviving client");
+    let client = AppClient::attach(&path_text).expect("attach surviving client");
     assert_eq!(client.application(), application);
     let client_session = client.accept().expect("accept surviving App Session");
     assert_eq!(client_session.session_handle(), handle);
@@ -369,8 +405,8 @@ fn assert_publication_queue_reports_full_and_closed() {
 
 fn assert_missing_attach_server_returns_client_error() {
     let path = socket_path("missing-server");
-    let result = AppClient::connect(path.to_str().expect("socket path"));
-    assert!(matches!(result, Err(AppClientError::Connect { .. })));
+    let result = AppClient::attach(path.to_str().expect("socket path"));
+    assert!(matches!(result, Err(AppClientError::Attach { .. })));
 }
 
 fn assert_malformed_attach_closes_received_descriptor_before_returning_error() {
@@ -380,13 +416,13 @@ fn assert_malformed_attach_closes_received_descriptor_before_returning_error() {
         let (mut stream, _) = listener.accept().expect("accept malformed client");
         accept_application(&mut stream, ApplicationId::from_raw(6));
         let (sent, peer) = UnixStream::pair().expect("descriptor pair");
-        send_fds(&stream, &[sent.as_raw_fd()], [0; 8]);
+        send_fds(&stream, &[sent.as_raw_fd()], &[0; 8]);
         drop(sent);
         peer
     });
 
     let result =
-        AppClient::connect(path.to_str().expect("socket path")).and_then(|client| client.accept());
+        AppClient::attach(path.to_str().expect("socket path")).and_then(|client| client.accept());
     assert!(matches!(
         result,
         Err(AppClientError::DescriptorCount {
@@ -411,12 +447,12 @@ fn assert_offset_overflow_closes_every_received_descriptor() {
         let identity = descriptor_identity(sent.as_raw_fd()).expect("descriptor identity");
         let baseline = count_open_identity(identity);
         let fds = [sent.as_raw_fd(); 4];
-        send_fds(&stream, &fds, [1, 0, 4096, 4096, 4096, 0, 0, 0]);
+        send_fds(&stream, &fds, &[1, 0, 4096, 4096, 4096, 0, 0, 0]);
         (sent, peer, identity, baseline)
     });
 
     let result =
-        AppClient::connect(path.to_str().expect("socket path")).and_then(|client| client.accept());
+        AppClient::attach(path.to_str().expect("socket path")).and_then(|client| client.accept());
     assert!(matches!(result, Err(AppClientError::OffsetOverflow)));
     let (sent, peer, identity, baseline) = server_thread.join().expect("join offset server");
     assert_identity_count(identity, baseline);
@@ -435,12 +471,12 @@ fn assert_mapping_failure_closes_every_received_descriptor() {
         let identity = descriptor_identity(sent.as_raw_fd()).expect("descriptor identity");
         let baseline = count_open_identity(identity);
         let fds = [sent.as_raw_fd(); 4];
-        send_fds(&stream, &fds, [1, 0, 4096, 4096, 0, 0, 0, 0]);
+        send_fds(&stream, &fds, &[1, 0, 4096, 4096, 0, 0, 0, 0]);
         (sent, peer, identity, baseline)
     });
 
     let result =
-        AppClient::connect(path.to_str().expect("socket path")).and_then(|client| client.accept());
+        AppClient::attach(path.to_str().expect("socket path")).and_then(|client| client.accept());
     assert!(matches!(
         result,
         Err(AppClientError::SessionSegmentMap { .. })
@@ -483,6 +519,7 @@ fn attach_connection_close_detaches_only_its_application_once() {
                     attach_sequence.fetch_add(1, Ordering::Relaxed),
                 ))
             },
+            |_, _, _| Ok(()),
             move |application| {
                 let _ = detached_tx.send(application);
             },
@@ -491,8 +528,8 @@ fn attach_connection_close_detaches_only_its_application_once() {
 
     let first = ApplicationId::from_raw(41);
     let second = ApplicationId::from_raw(42);
-    let first_client = AppClient::connect(&path_text).expect("attach first Application");
-    let second_client = AppClient::connect(&path_text).expect("attach second Application");
+    let first_client = AppClient::attach(&path_text).expect("attach first Application");
+    let second_client = AppClient::attach(&path_text).expect("attach second Application");
     assert_eq!(first_client.application(), first);
     assert_eq!(second_client.application(), second);
 

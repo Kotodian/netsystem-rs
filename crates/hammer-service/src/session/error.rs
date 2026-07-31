@@ -1,8 +1,7 @@
 use hammer_core::data_plane::NodeId;
 use hammer_infra::fifo::FifoError;
 use hammer_runtime::RuntimeError;
-use hammer_runtime::SessionListenerId;
-use hammer_runtime::app::ApplicationConnectionId;
+use hammer_runtime::{SessionConnectionId, SessionListenerId};
 use thiserror::Error;
 
 use super::SessionId;
@@ -110,7 +109,7 @@ pub(crate) enum SessionError {
     #[error(
         "Application connection {connection:?} requires an Application Main on this Data Worker"
     )]
-    ApplicationMainMissingForConnection { connection: ApplicationConnectionId },
+    ApplicationMainMissingForConnection { connection: SessionConnectionId },
     #[error("Session listener state is unavailable on this Data Worker")]
     ListenerMainMissing,
     #[error("Session listener {listener:?} is not registered")]
@@ -121,6 +120,8 @@ pub(crate) enum SessionError {
     ListenerControlWrongThread,
     #[error("Session transport `{transport}` does not register listener operations")]
     TransportListenUnsupported { transport: &'static str },
+    #[error("Session transport `{transport}` does not register active-open")]
+    TransportConnectUnsupported { transport: &'static str },
 }
 
 impl From<SessionError> for RuntimeError {

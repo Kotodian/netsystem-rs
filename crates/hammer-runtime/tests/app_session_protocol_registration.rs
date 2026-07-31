@@ -1,15 +1,11 @@
 use hammer_infra::fifo::Fifo;
-use hammer_runtime::app::{AppSessionProtocol, ORDERED_RELIABLE_BYTE_STREAM};
+use hammer_runtime::app::AppSessionProtocol;
 use hammer_runtime::{PluginError, PluginMain, RuntimeResult};
 
-#[hammer_component_macros::session_transport(name = "tcp", upper = "ordered-reliable-byte-stream")]
+#[hammer_component_macros::session_transport(name = "tcp")]
 struct TcpTransport;
 
-#[hammer_component_macros::app_session_protocol(
-    name = "test-protocol",
-    lower = "ordered-reliable-byte-stream",
-    upper = "ordered-reliable-byte-stream"
-)]
+#[hammer_component_macros::app_session_protocol(name = "test-protocol")]
 struct TestProtocol;
 
 impl AppSessionProtocol for TestProtocol {
@@ -55,8 +51,6 @@ fn component_protocol_registration_is_collected_by_plugin_main() {
         .expect("resolve registered protocol")
         .registration();
     assert_eq!(registration.name(), "test-protocol");
-    assert_eq!(registration.lower(), ORDERED_RELIABLE_BYTE_STREAM);
-    assert_eq!(registration.upper(), ORDERED_RELIABLE_BYTE_STREAM);
 }
 
 #[test]
@@ -68,7 +62,6 @@ fn component_transport_registration_is_collected_by_plugin_main() {
         .session_transport("tcp")
         .expect("resolve registered Transport");
     assert_eq!(transport.name(), "tcp");
-    assert_eq!(transport.upper(), ORDERED_RELIABLE_BYTE_STREAM);
 }
 
 #[test]

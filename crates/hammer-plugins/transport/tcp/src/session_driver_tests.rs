@@ -235,11 +235,11 @@ fn rollback_discards_unpublished_session_without_close_notification() {
     let listener = session_main
         .listen(
             application_listener,
-            hammer_runtime::SessionTransportRegistration::with_listener_operations(
+            hammer_runtime::SessionTransportRegistration::new(
                 "test-session",
-                hammer_runtime::app::ORDERED_RELIABLE_BYTE_STREAM,
-                |_, _| Ok(()),
-                |_| Ok(()),
+                Some(|_, _| Ok(())),
+                Some(|_| Ok(())),
+                None,
             ),
             hammer_runtime::SessionListenEndpoint::new(
                 "127.0.0.1:0".parse().expect("test endpoint"),

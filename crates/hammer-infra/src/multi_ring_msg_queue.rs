@@ -265,6 +265,13 @@ impl MultiRingMsgQueue {
         let hdr = unsafe { &*self.hdr };
         hdr.q_head.load(Ordering::Acquire) == hdr.q_tail.load(Ordering::Acquire)
     }
+
+    #[inline]
+    pub fn ring_element_size(&self, ring: u32) -> Option<usize> {
+        self.rings
+            .get(ring as usize)
+            .map(|ring| unsafe { (*ring.hdr).elsize as usize })
+    }
 }
 
 fn validate_cfg(cfg: &MultiRingMsgQueueCfg<'_>) -> Result<(), MultiRingMsgQueueError> {

@@ -199,6 +199,7 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
     let attach_server = registry.get::<AppServer>();
     let binary_api = registry.get::<hammer_service::binary_api::BinaryApiMain>();
     let applications = registry.get::<hammer_service::session::ApplicationMain>();
+    let sessions = registry.get::<hammer_service::session::runtime::SessionMain>();
 
     tracing::info!("hammer started");
 
@@ -210,10 +211,21 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
                     .cloned()
                     .expect("Application Main is initialized with attach server");
                 let detach_applications = Arc::clone(&attach_applications);
+                let control_sessions = sessions
+                    .as_ref()
+                    .cloned()
+                    .expect("Session Main is initialized with attach server");
                 tokio::select! {
                     () = ipc_loop::clnt_loop(listener) => {}
                     result = attach.serve(
                         move || attach_applications.attach(),
+                        move |application, requests, replies| {
+                            control_sessions.dispatch_application_session_mq(
+                                application,
+                                requests,
+                                replies,
+                            )
+                        },
                         move |application| {
                             if detach_applications.contains(application).unwrap_or(false)
                                 && let Err(error) = detach_applications.detach(application)
@@ -239,10 +251,21 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
                     .cloned()
                     .expect("Application Main is initialized with attach server");
                 let detach_applications = Arc::clone(&attach_applications);
+                let control_sessions = sessions
+                    .as_ref()
+                    .cloned()
+                    .expect("Session Main is initialized with attach server");
                 tokio::select! {
                     () = ipc_loop::clnt_loop(listener) => {}
                     result = attach.serve(
                         move || attach_applications.attach(),
+                        move |application, requests, replies| {
+                            control_sessions.dispatch_application_session_mq(
+                                application,
+                                requests,
+                                replies,
+                            )
+                        },
                         move |application| {
                             if detach_applications.contains(application).unwrap_or(false)
                                 && let Err(error) = detach_applications.detach(application)

@@ -53,11 +53,7 @@ enum Error {
 }
 
 /// A TLS connection owned and advanced by one Data Worker.
-#[hammer_component_macros::app_session_protocol(
-    name = "tls",
-    lower = "ordered-reliable-byte-stream",
-    upper = "ordered-reliable-byte-stream"
-)]
+#[hammer_component_macros::app_session_protocol(name = "tls")]
 #[derive(Debug)]
 pub struct Connection {
     connection: rustls::Connection,

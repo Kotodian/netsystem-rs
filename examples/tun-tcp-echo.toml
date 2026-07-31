@@ -6,7 +6,11 @@ plugins = [
   "ip",
   "tcp",
   "udp",
+  "tls",
 ]
+
+[binary_api]
+socket_path = "/tmp/hammer-tcp-integration.binary-api.sock"
 
 [log]
 level = "debug"
@@ -61,9 +65,6 @@ max = "3s"
 idle = "3s"
 probe_interval = "1s"
 probe_limit = 3
-
-[[plugin.tcp.listen]]
-address = "10.66.77.1:7300"
 
 [plugin.tun]
 

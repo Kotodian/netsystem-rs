@@ -1406,15 +1406,11 @@ pub fn graph_node(args: TokenStream, input: TokenStream) -> TokenStream {
 
 struct AppSessionProtocolArgs {
     name: LitStr,
-    lower: LitStr,
-    upper: LitStr,
 }
 
 impl Parse for AppSessionProtocolArgs {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let mut name = None;
-        let mut lower = None;
-        let mut upper = None;
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             input.parse::<Token![=]>()?;
@@ -1425,23 +1421,11 @@ impl Parse for AppSessionProtocolArgs {
                     }
                     name = Some(input.parse()?);
                 }
-                "lower" => {
-                    if lower.is_some() {
-                        return Err(Error::new(key.span(), "duplicate `lower` argument"));
-                    }
-                    lower = Some(input.parse()?);
-                }
-                "upper" => {
-                    if upper.is_some() {
-                        return Err(Error::new(key.span(), "duplicate `upper` argument"));
-                    }
-                    upper = Some(input.parse()?);
-                }
                 other => {
                     return Err(Error::new(
                         key.span(),
                         format!(
-                            "unknown `app_session_protocol` argument `{other}`; expected `name`, `lower`, or `upper`"
+                            "unknown `app_session_protocol` argument `{other}`; expected `name`"
                         ),
                     ));
                 }
@@ -1452,10 +1436,6 @@ impl Parse for AppSessionProtocolArgs {
         }
         Ok(Self {
             name: name.ok_or_else(|| Error::new(Span::call_site(), "missing `name` argument"))?,
-            lower: lower
-                .ok_or_else(|| Error::new(Span::call_site(), "missing `lower` argument"))?,
-            upper: upper
-                .ok_or_else(|| Error::new(Span::call_site(), "missing `upper` argument"))?,
         })
     }
 }
@@ -1488,8 +1468,6 @@ pub fn app_session_protocol(args: TokenStream, input: TokenStream) -> TokenStrea
     let sessions_ident = format_ident!("{static_ident}_SESSIONS");
     let destroy_ident = format_ident!("{static_ident}_DESTROY");
     let name = args.name;
-    let lower = args.lower;
-    let upper = args.upper;
     quote! {
         #item
 
@@ -1596,8 +1574,6 @@ pub fn app_session_protocol(args: TokenStream, input: TokenStream) -> TokenStrea
         pub(crate) static #static_ident: ::hammer_runtime::app::AppSessionProtocolEntry =
             ::hammer_runtime::app::AppSessionProtocolEntry::new(
                 #name,
-                #lower,
-                #upper,
                 #create_ident,
                 #ingress_ident,
                 #egress_ident,
@@ -1611,30 +1587,30 @@ pub fn app_session_protocol(args: TokenStream, input: TokenStream) -> TokenStrea
 
 struct SessionTransportArgs {
     name: LitStr,
-    upper: LitStr,
     start_listen: Option<Path>,
     stop_listen: Option<Path>,
+    connect: Option<Path>,
 }
 
 impl Parse for SessionTransportArgs {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let mut name = None;
-        let mut upper = None;
         let mut start_listen = None;
         let mut stop_listen = None;
+        let mut connect = None;
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             input.parse::<Token![=]>()?;
             match key.to_string().as_str() {
                 "name" => name = Some(input.parse()?),
-                "upper" => upper = Some(input.parse()?),
                 "start_listen" => start_listen = Some(input.parse()?),
                 "stop_listen" => stop_listen = Some(input.parse()?),
+                "connect" => connect = Some(input.parse()?),
                 other => {
                     return Err(Error::new(
                         key.span(),
                         format!(
-                            "unknown `session_transport` argument `{other}`; expected `name`, `upper`, `start_listen`, or `stop_listen`"
+                            "unknown `session_transport` argument `{other}`; expected `name`, `start_listen`, `stop_listen`, or `connect`"
                         ),
                     ));
                 }
@@ -1645,15 +1621,14 @@ impl Parse for SessionTransportArgs {
         }
         Ok(Self {
             name: name.ok_or_else(|| Error::new(Span::call_site(), "missing `name` argument"))?,
-            upper: upper
-                .ok_or_else(|| Error::new(Span::call_site(), "missing `upper` argument"))?,
             start_listen,
             stop_listen,
+            connect,
         })
     }
 }
 
-/// Registers one Session Transport's upper protocol semantics.
+/// Registers one Session Transport's control operations.
 #[proc_macro_attribute]
 pub fn session_transport(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as SessionTransportArgs);
@@ -1674,19 +1649,15 @@ pub fn session_transport(args: TokenStream, input: TokenStream) -> TokenStream {
         to_snake_case(&ident.to_string()).to_ascii_uppercase()
     );
     let name = args.name;
-    let upper = args.upper;
-    let registration = match (args.start_listen, args.stop_listen) {
-        (Some(start_listen), Some(stop_listen)) => quote! {
-            ::hammer_runtime::SessionTransportRegistration::with_listener_operations(
-                #name,
-                #upper,
-                #start_listen,
-                #stop_listen,
-            )
-        },
-        (None, None) => quote! {
-            ::hammer_runtime::SessionTransportRegistration::new(#name, #upper)
-        },
+    let (start_listen, stop_listen) = match (args.start_listen, args.stop_listen) {
+        (Some(start_listen), Some(stop_listen)) => (
+            quote!(::core::option::Option::Some(#start_listen)),
+            quote!(::core::option::Option::Some(#stop_listen)),
+        ),
+        (None, None) => (
+            quote!(::core::option::Option::None),
+            quote!(::core::option::Option::None),
+        ),
         _ => {
             return Error::new(
                 ident.span(),
@@ -1695,6 +1666,18 @@ pub fn session_transport(args: TokenStream, input: TokenStream) -> TokenStream {
             .to_compile_error()
             .into();
         }
+    };
+    let connect = match args.connect {
+        Some(connect) => quote!(::core::option::Option::Some(#connect)),
+        None => quote!(::core::option::Option::None),
+    };
+    let registration = quote! {
+        ::hammer_runtime::SessionTransportRegistration::new(
+            #name,
+            #start_listen,
+            #stop_listen,
+            #connect,
+        )
     };
     quote! {
         #item

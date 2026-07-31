@@ -5,6 +5,7 @@
 
 pub mod attach;
 pub mod echo;
+mod session;
 pub mod tcp;
 pub mod udp;
 
@@ -13,3 +14,4 @@ pub use hammer_runtime::app::{
     AppSessionPolicyError, AppSessionProtocolSelection, ApplicationId, ApplicationListenerId,
     SessionHandle,
 };
+pub use hammer_runtime::{DataWorkerId, SessionListenEndpoint, SessionListenerId};

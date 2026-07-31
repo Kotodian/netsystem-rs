@@ -44,8 +44,11 @@ jobs:
             -p hammer-plugin-tun \
             -p hammer-plugin-ip \
             -p hammer-plugin-tcp \
-            -p hammer-plugin-udp
-          cargo build --locked -p hammer --example tun_tcp_echo
+            -p hammer-plugin-udp \
+            -p hammer-plugin-tls
+          cargo build --locked -p hammer \
+            --example tun_tcp_echo \
+            --example tun_tls_echo
       - name: Package TCP lab binaries [${{ matrix.platform }}]
         run: |
           set -euo pipefail
@@ -53,6 +56,7 @@ jobs:
           mkdir -p "$package/bin" "$package/plugins" "$package/rustlib"
           cp target/debug/hammer target/debug/hammerctl "$package/bin/"
           cp target/debug/examples/tun_tcp_echo "$package/bin/"
+          cp target/debug/examples/tun_tls_echo "$package/bin/"
           case "$RUNNER_OS" in
             Linux) plugin_extension=so ;;
             macOS) plugin_extension=dylib ;;
@@ -61,6 +65,7 @@ jobs:
           cp target/debug/libhammer_plugin_ip."$plugin_extension" "$package/plugins/"
           cp target/debug/libhammer_plugin_tcp."$plugin_extension" "$package/plugins/"
           cp target/debug/libhammer_plugin_udp."$plugin_extension" "$package/plugins/"
+          cp target/debug/libhammer_plugin_tls."$plugin_extension" "$package/plugins/"
           cp target/debug/libhammer_infra."$plugin_extension" "$package/rustlib/"
           cp target/debug/libhammer_core."$plugin_extension" "$package/rustlib/"
           cp target/debug/libhammer_runtime."$plugin_extension" "$package/rustlib/"
@@ -98,6 +103,7 @@ jobs:
             idle_seconds: "5"
             fault: none
             mss: "1000"
+            tls: false
           - scenario: attached-echo-keepalive
             platform: macOS
             id: keepalive-macos
@@ -110,6 +116,7 @@ jobs:
             # Darwin rejects a pre-connect TCP_MAXSEG above the unconnected
             # default (~536), so the macOS probe must not shape its MSS.
             mss: "0"
+            tls: false
           - scenario: congestion-bbr
             platform: Linux
             id: congestion-bbr
@@ -120,6 +127,7 @@ jobs:
             idle_seconds: "0"
             fault: none
             mss: "1000"
+            tls: false
           - scenario: congestion-cubic
             platform: Linux
             id: congestion-cubic
@@ -130,6 +138,7 @@ jobs:
             idle_seconds: "0"
             fault: none
             mss: "1000"
+            tls: false
           - scenario: receiver-sack
             platform: Linux
             id: receiver-sack
@@ -141,6 +150,7 @@ jobs:
             fault: client-ooo
             fault_offset: 4000
             mss: "1000"
+            tls: false
           - scenario: sender-rack
             platform: Linux
             id: sender-rack
@@ -152,6 +162,7 @@ jobs:
             fault: server-ingress
             fault_offset: 4000
             mss: "1000"
+            tls: false
           - scenario: sender-tlp
             platform: Linux
             id: sender-tlp
@@ -163,6 +174,18 @@ jobs:
             fault: server-ingress
             fault_offset: 5000
             mss: "1000"
+            tls: false
+          - scenario: tls-attached-echo
+            platform: Linux
+            id: tls-echo-linux
+            runner: ubuntu-24.04
+            congestion: bbr
+            rto: 50ms
+            echo_bytes: 200000
+            idle_seconds: "0"
+            fault: none
+            mss: "1000"
+            tls: true
     env:
       TCP_TEST_ADDRESS: 10.66.77.1
       TCP_TEST_HOST_ADDRESS: 10.66.77.2
@@ -170,6 +193,7 @@ jobs:
       TCP_TEST_PORT: "7300"
       TCP_TEST_ROUTE_PREFIX: 10.66.77.0/30
       TCP_TEST_ATTACH_SOCKET: /tmp/hammer-tcp-integration.attach.sock
+      TCP_TEST_BINARY_API_SOCKET: /tmp/hammer-tcp-integration.binary-api.sock
       TCP_TEST_IPC_ADDRESS: 127.0.0.1:7399
       TCP_TEST_MSS: ${{ matrix.mss }}
     steps:
@@ -206,6 +230,28 @@ jobs:
           rm -f "$config.bak"
           cp "$config" "$TCP_TEST_DIAGNOSTICS/"
           echo "TCP_TEST_CONFIG=$config" >> "$GITHUB_ENV"
+      - name: Generate synthetic TLS identity [${{ matrix.id }}]
+        if: matrix.tls
+        run: |
+          set -euo pipefail
+          certificate_pem="$TCP_TEST_DIAGNOSTICS/server-cert.pem"
+          certificate_der="$TCP_TEST_DIAGNOSTICS/server-cert.der"
+          private_key_pem="$TCP_TEST_DIAGNOSTICS/server-key.pem"
+          private_key_der="$TCP_TEST_DIAGNOSTICS/server-key.der"
+          openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 1 \
+            -subj "/CN=hammer.test" \
+            -addext "subjectAltName=DNS:hammer.test,IP:$TCP_TEST_ADDRESS" \
+            -keyout "$private_key_pem" \
+            -out "$certificate_pem"
+          openssl x509 -in "$certificate_pem" -outform DER \
+            -out "$certificate_der"
+          openssl pkcs8 -topk8 -nocrypt -in "$private_key_pem" \
+            -outform DER -out "$private_key_der"
+          {
+            echo "TLS_TEST_CERTIFICATE_DER=$certificate_der"
+            echo "TLS_TEST_PRIVATE_KEY_DER=$private_key_der"
+            echo "TLS_TEST_CA_PEM=$certificate_pem"
+          } >> "$GITHUB_ENV"
       - name: Disable host TCP timestamps
         # Keeps kernel client segments at exactly TCP_MAXSEG bytes so absolute
         # segment-boundary sequences derived from the ISN stay valid.
@@ -239,7 +285,9 @@ jobs:
             exit 1
           fi
           : > "$TCP_TEST_DIAGNOSTICS/daemon.log"
-          sudo -n rm -f "$TCP_TEST_ATTACH_SOCKET"
+          sudo -n rm -f \
+            "$TCP_TEST_ATTACH_SOCKET" \
+            "$TCP_TEST_BINARY_API_SOCKET"
           hammer_pid="$(
             sudo -n /bin/sh -c '
               log=$1
@@ -368,6 +416,7 @@ jobs:
             exit 1
           fi
       - name: Start attached echo app [${{ matrix.id }}]
+        if: matrix.tls == false
         env:
           ECHO_BINARY: ${{ runner.temp }}/tcp-lab-binaries/bin/tun_tcp_echo
           HAMMER_RUST_LIBDIR: ${{ runner.temp }}/tcp-lab-binaries/rustlib
@@ -401,6 +450,55 @@ jobs:
             exit 1
           fi
           echo "ECHO_PID=$echo_pid" >> "$GITHUB_ENV"
+      - name: Start attached TLS echo app [${{ matrix.id }}]
+        if: matrix.tls
+        env:
+          ECHO_BINARY: ${{ runner.temp }}/tcp-lab-binaries/bin/tun_tls_echo
+          HAMMER_RUST_LIBDIR: ${{ runner.temp }}/tcp-lab-binaries/rustlib
+        run: |
+          set -euo pipefail
+          if [[ ! -x "$ECHO_BINARY" ]]; then
+            echo "missing TLS echo binary: $ECHO_BINARY" >&2
+            exit 1
+          fi
+          : > "$TCP_TEST_DIAGNOSTICS/echo.log"
+          echo_pid="$(
+            sudo -n /bin/sh -c '
+              log=$1
+              binary=$2
+              attach_socket=$3
+              binary_api_socket=$4
+              listen=$5
+              certificate=$6
+              private_key=$7
+              rust_libdir=$8
+              nohup env \
+                LD_LIBRARY_PATH="$rust_libdir" \
+                DYLD_LIBRARY_PATH="$rust_libdir" \
+                "$binary" \
+                  --attach-socket "$attach_socket" \
+                  --binary-api-socket "$binary_api_socket" \
+                  --listen "$listen" \
+                  --certificate-der "$certificate" \
+                  --private-key-der "$private_key" \
+                  --connections 1 \
+                </dev/null >>"$log" 2>&1 &
+              echo $!
+            ' hammer-tls-echo \
+              "$TCP_TEST_DIAGNOSTICS/echo.log" \
+              "$ECHO_BINARY" \
+              "$TCP_TEST_ATTACH_SOCKET" \
+              "$TCP_TEST_BINARY_API_SOCKET" \
+              "$TCP_TEST_ADDRESS:$TCP_TEST_PORT" \
+              "$TLS_TEST_CERTIFICATE_DER" \
+              "$TLS_TEST_PRIVATE_KEY_DER" \
+              "$HAMMER_RUST_LIBDIR"
+          )"
+          if [[ ! "$echo_pid" =~ ^[0-9]+$ ]]; then
+            echo "invalid TLS echo PID: $echo_pid" >&2
+            exit 1
+          fi
+          echo "ECHO_PID=$echo_pid" >> "$GITHUB_ENV"
       - name: Capture state before probe [${{ matrix.id }}]
         run: |
           set +e
@@ -426,6 +524,13 @@ jobs:
         timeout-minutes: 5
         run: |
           set -euo pipefail
+          tls_args=()
+          if [[ "${{ matrix.tls }}" == "true" ]]; then
+            tls_args=(
+              --tls-ca "$TLS_TEST_CA_PEM"
+              --tls-server-name hammer.test
+            )
+          fi
           python3 scripts/tcp-connect-probe.py \
             --host "$TCP_TEST_ADDRESS" \
             --port "$TCP_TEST_PORT" \
@@ -435,7 +540,26 @@ jobs:
             --mss "$TCP_TEST_MSS" \
             --echo-bytes "${{ matrix.echo_bytes }}" \
             --idle-seconds "${{ matrix.idle_seconds }}" \
+            "${tls_args[@]}" \
             2>&1 | tee "$TCP_TEST_DIAGNOSTICS/probe.log"
+      - name: Verify TLS configuration removal [${{ matrix.id }}]
+        if: matrix.tls
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          for _ in {1..90}; do
+            if ! sudo -n kill -0 "$ECHO_PID" 2>/dev/null; then
+              grep -F "registered TLS server configuration" \
+                "$TCP_TEST_DIAGNOSTICS/echo.log"
+              grep -F "removed TLS server configuration" \
+                "$TCP_TEST_DIAGNOSTICS/echo.log"
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "$TCP_TEST_DIAGNOSTICS/echo.log" >&2
+          echo "TLS echo app did not exit after its configured connection" >&2
+          exit 1
       - name: Run fault-injected echo probe [${{ matrix.id }}]
         if: matrix.fault != 'none'
         timeout-minutes: 5
@@ -620,6 +744,9 @@ jobs:
               # together prove that the missing tail was recovered by TLP.
               extra_args=()
               ;;
+            tls-attached-echo)
+              extra_args=(--min-server-data-bytes "${{ matrix.echo_bytes }}")
+              ;;
           esac
           python3 scripts/tcp-pcap-assert.py \
             --input "$TCP_TEST_DIAGNOSTICS/traffic.pcap" \
@@ -713,7 +840,9 @@ jobs:
               sudo -n kill -KILL "$pid" 2>/dev/null || true
             fi
           done
-          sudo -n rm -f "$TCP_TEST_ATTACH_SOCKET"
+          sudo -n rm -f \
+            "$TCP_TEST_ATTACH_SOCKET" \
+            "$TCP_TEST_BINARY_API_SOCKET"
           sudo -n chmod -R a+rX "$TCP_TEST_DIAGNOSTICS" || true
       - name: Upload diagnostics [${{ matrix.id }}]
         if: always()

@@ -23,9 +23,9 @@ const TCP_APP_RX_MAX_FREE: usize = 128 << 10;
 
 #[hammer_component_macros::session_transport(
     name = "tcp",
-    upper = "ordered-reliable-byte-stream",
     start_listen = crate::start_listen,
-    stop_listen = crate::stop_listen
+    stop_listen = crate::stop_listen,
+    connect = crate::connect
 )]
 pub struct TcpWorker {
     pub(crate) connections: Pool<TcpConnection>,

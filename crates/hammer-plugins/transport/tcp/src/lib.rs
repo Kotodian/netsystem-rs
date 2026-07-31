@@ -30,13 +30,14 @@ hammer_component_macros::declare_plugin!(
 
 use std::mem::transmute;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 
 use arc_swap::ArcSwapOption;
 use hammer_core::data_plane::{BufferPacketCursor, NodeId, NodeState, SecondaryOpaque};
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, Engine, Node, NodeProcessFn, NodeRuntimeData, PluginError,
-    RuntimeError, RuntimeResult, SessionListenEndpoint, SessionListenerId,
+    RuntimeError, RuntimeResult, SessionConnectEndpoint, SessionConnectionId,
+    SessionListenEndpoint, SessionListenerId, with_data_plane_runtime,
 };
 use thiserror::Error;
 
@@ -44,10 +45,8 @@ use hammer_infra::align::CacheLine;
 use hammer_infra::pool::Index as PoolIndex;
 use hammer_infra::thread_owned::{ThreadOwned, ThreadOwnedError};
 use hammer_service::session::node::{SessionQueueNode, SessionQueueOutput};
-#[cfg(test)]
-use hammer_service::session::runtime::SessionTransport;
 use hammer_service::session::runtime::{
-    SessionMain, SessionWorker, dispatch_session_queue_pending,
+    SessionMain, SessionTransport, SessionWorker, dispatch_session_queue_pending,
 };
 use hammer_service::session::{SessionId, SessionQueueNext};
 
@@ -268,6 +267,71 @@ pub(crate) fn stop_listen(listener: SessionListenerId) -> RuntimeResult<()> {
         .load_full()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
     main.listeners.close_session_listener(listener)
+}
+
+pub(crate) fn connect(
+    connection: SessionConnectionId,
+    endpoint: SessionConnectEndpoint,
+) -> RuntimeResult<()> {
+    let local = endpoint.local().ok_or(TcpError::InvalidConnection)?;
+    if local.is_ipv4() != endpoint.remote().is_ipv4() || local.port() == 0 {
+        return Err(TcpError::InvalidConnection.into());
+    }
+    let main = TCP_MAIN
+        .load_full()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
+    let worker = endpoint.worker();
+    let worker_slot = worker.slot();
+    let (completion, completed) = mpsc::sync_channel(1);
+    Engine::with_current(|engine| {
+        engine.schedule_on_worker(worker, move || {
+            let result = with_data_plane_runtime(|runtime| {
+                main.with_worker(runtime, |sessions, tcp| {
+                    start_connect(sessions, tcp, connection, local, endpoint.remote())
+                })
+            });
+            if completion.send(result).is_err() {
+                return;
+            }
+        })
+    })
+    .ok_or(RuntimeError::WorkerControlRequiresMainEngine)??;
+    completed
+        .recv()
+        .map_err(|_| RuntimeError::DataWorkerCallCanceled {
+            worker: worker_slot,
+        })?
+}
+
+fn start_connect(
+    sessions: &mut SessionWorker<PoolIndex>,
+    tcp: &mut TcpWorker,
+    connection: SessionConnectionId,
+    local: SocketAddr,
+    remote: SocketAddr,
+) -> RuntimeResult<()> {
+    let initial_sequence = tcp.lookup.next_initial_sequence(local, remote);
+    let mut transport =
+        TcpConnection::new(None, sessions.worker(), local.port(), Some(local), remote);
+    transport.connect_state(initial_sequence);
+    let connection_index = tcp.insert_connection(transport)?;
+    let session_id = match sessions.stream_connect(TcpWorker::ID, connection_index, connection) {
+        Ok(session_id) => session_id,
+        Err(error) => {
+            tcp.remove_connection(connection_index).expect(
+                "new TCP connection remains installed until Session construction completes",
+            );
+            return Err(error);
+        }
+    };
+    tcp.connection_mut(connection_index)
+        .expect("new TCP connection remains installed until it binds its Session")
+        .attach_session(session_id)
+        .expect("active-open TCP connection has no Session before binding");
+    publish_tcp_connection(sessions, tcp, session_id)?;
+    sessions.mark_ready(session_id);
+    sessions.signal_queue();
+    Ok(())
 }
 
 #[hammer_component_macros::config_function(
@@ -904,11 +968,11 @@ pub(crate) fn closing_session_for_test() -> (
     let listener = session_main
         .listen(
             application_listener,
-            hammer_runtime::SessionTransportRegistration::with_listener_operations(
+            hammer_runtime::SessionTransportRegistration::new(
                 "test-session",
-                hammer_runtime::app::ORDERED_RELIABLE_BYTE_STREAM,
-                |_, _| Ok(()),
-                |_| Ok(()),
+                Some(|_, _| Ok(())),
+                Some(|_| Ok(())),
+                None,
             ),
             SessionListenEndpoint::new("127.0.0.1:0".parse().expect("test endpoint"), worker),
         )

@@ -1215,7 +1215,6 @@ pub struct TcpLookupStateCacheline0 {
     listeners: TcpLookupSnapshot,
     connections: TcpConnectionRouteIndex,
     pending: TcpPendingRouteIndex,
-    #[cfg(test)]
     next_iss: u32,
 }
 
@@ -1262,7 +1261,6 @@ impl TcpLookupState {
                 listeners: TcpLookupSnapshot::empty(),
                 connections: TcpConnectionRouteIndex::empty(),
                 pending: TcpPendingRouteIndex::empty(),
-                #[cfg(test)]
                 next_iss: 81_000,
             }),
             cacheline1: CachePadded::new(TcpLookupStateCacheline1 {
@@ -1441,7 +1439,6 @@ impl TcpLookupState {
         }
     }
 
-    #[cfg(test)]
     #[inline]
     pub(crate) fn next_initial_sequence(&mut self, local: SocketAddr, remote: SocketAddr) -> u32 {
         let mut value = self.next_iss;

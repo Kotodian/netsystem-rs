@@ -233,6 +233,42 @@ pub enum RuntimeError {
 
 #[derive(Debug, Error)]
 pub enum AttachError {
+    #[error("failed to create shared Application Session control segment")]
+    ControlSegmentCreate {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("Application Session control segment capacity is exhausted")]
+    ControlSegmentCapacity,
+    #[error("Application Session control queue layout is invalid")]
+    ControlQueueLayout {
+        #[source]
+        source: crate::app::SessionMsgQueueError,
+    },
+    #[error("failed to initialize Application Session control queue")]
+    ControlQueueInit {
+        #[source]
+        source: crate::app::SessionMsgQueueError,
+    },
+    #[error("Application Session control queue signal is missing")]
+    ControlSignalMissing,
+    #[error("failed to duplicate Application Session control queue signal")]
+    ControlSignalDuplicate {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to register Application Session control queue signal")]
+    ControlSignalRegistration {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to read Application Session control queue signal")]
+    ControlSignalRead {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("attach metadata write was partial: expected {expected}, sent {actual}")]
+    MetadataWriteIncomplete { expected: usize, actual: usize },
     #[error("failed to create attach signal pipe")]
     SignalPipeCreate {
         #[source]

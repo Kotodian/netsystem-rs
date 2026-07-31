@@ -153,14 +153,31 @@ pub enum SessionEvtType {
     ProtocolOutput = 6,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SessionMsgQueueError {
+    #[error("Session Message Queue configuration is invalid")]
     InvalidConfig,
+    #[error("Session Message Queue is full")]
     Full(SessionEvt),
+    #[error("Session Message Queue CTRL ring is full")]
+    ControlFull,
+    #[error("CTRL payload has {bytes} bytes but the ring permits {capacity}")]
+    ControlPayloadTooLarge { bytes: usize, capacity: usize },
+    #[error("CTRL payload length {bytes} exceeds its element capacity {capacity}")]
+    ControlPayloadCorrupt { bytes: usize, capacity: usize },
+    #[error("CTRL payload has {bytes} bytes but the destination permits {capacity}")]
+    ControlPayloadBufferTooSmall { bytes: usize, capacity: usize },
+    #[error("expected a CTRL ring message but dequeued ring {ring}")]
+    UnexpectedRing { ring: u32 },
+    #[error("failed to create Session Message Queue signal pipe")]
     SignalPipeCreate,
+    #[error("failed to read Session Message Queue signal status flags")]
     SignalStatusFlags,
+    #[error("failed to set Session Message Queue signal nonblocking status")]
     SignalNonblocking,
+    #[error("failed to read Session Message Queue signal descriptor flags")]
     SignalDescriptorFlags,
+    #[error("failed to set Session Message Queue signal close-on-exec")]
     SignalCloseOnExec,
 }
 
@@ -193,6 +210,19 @@ fn session_ring_cfg(q_nitems: u32, ring_nitems: u32) -> Result<[RingCfg; 2], Ses
             elsize: SESSION_EVT_BYTES,
         },
     ])
+}
+
+fn control_ring_cfg(
+    q_nitems: u32,
+    ring_nitems: u32,
+    control_element_size: usize,
+) -> Result<[RingCfg; 2], SessionMsgQueueError> {
+    if control_element_size < size_of::<u32>() {
+        return Err(SessionMsgQueueError::InvalidConfig);
+    }
+    let mut rings = session_ring_cfg(q_nitems, ring_nitems)?;
+    rings[SessionMqRing::Ctrl as usize].elsize = control_element_size;
+    Ok(rings)
 }
 
 /// Session Message Queue with IO + CTRL rings over the infra multi-ring primitive.
@@ -238,6 +268,18 @@ impl SessionMsgQueue {
         }))
     }
 
+    pub(crate) fn layout_bytes_with_ctrl_element(
+        q_nitems: u32,
+        ring_nitems: u32,
+        control_element_size: usize,
+    ) -> Result<usize, SessionMsgQueueError> {
+        let rings = control_ring_cfg(q_nitems, ring_nitems, control_element_size)?;
+        Ok(MultiRingMsgQueue::layout_bytes(&MultiRingMsgQueueCfg {
+            q_nitems,
+            rings: &rings,
+        }))
+    }
+
     /// Initialise a Session Message Queue at a pre-allocated segment offset.
     ///
     /// # Safety
@@ -249,15 +291,17 @@ impl SessionMsgQueue {
         ring_nitems: u32,
     ) -> Result<Self, SessionMsgQueueError> {
         let rings = session_ring_cfg(q_nitems, ring_nitems)?;
+        unsafe { Self::init_at_with_rings(seg, hdr_offset, q_nitems, &rings) }
+    }
+
+    unsafe fn init_at_with_rings(
+        seg: Segment,
+        hdr_offset: u64,
+        q_nitems: u32,
+        rings: &[RingCfg; 2],
+    ) -> Result<Self, SessionMsgQueueError> {
         let inner = unsafe {
-            MultiRingMsgQueue::init_at(
-                seg,
-                hdr_offset,
-                &MultiRingMsgQueueCfg {
-                    q_nitems,
-                    rings: &rings,
-                },
-            )
+            MultiRingMsgQueue::init_at(seg, hdr_offset, &MultiRingMsgQueueCfg { q_nitems, rings })
         }
         .map_err(|e| match e {
             MultiRingMsgQueueError::InvalidConfig => SessionMsgQueueError::InvalidConfig,
@@ -329,6 +373,99 @@ impl SessionMsgQueue {
     #[inline]
     pub fn dequeue(&self) -> Option<SessionEvt> {
         SessionEventQueue::dequeue(self)
+    }
+
+    pub(crate) fn enqueue_ctrl_payload(&self, payload: &[u8]) -> Result<(), SessionMsgQueueError> {
+        let element_size = self
+            .inner
+            .ring_element_size(SessionMqRing::Ctrl as u32)
+            .ok_or(SessionMsgQueueError::InvalidConfig)?;
+        let capacity = element_size - size_of::<u32>();
+        if payload.len() > capacity {
+            return Err(SessionMsgQueueError::ControlPayloadTooLarge {
+                bytes: payload.len(),
+                capacity,
+            });
+        }
+        let mut queue = self.inner.lock();
+        let mut message = queue
+            .alloc(SessionMqRing::Ctrl as u32)
+            .map_err(|error| match error {
+                MultiRingMsgQueueError::QueueFull | MultiRingMsgQueueError::RingFull => {
+                    SessionMsgQueueError::ControlFull
+                }
+                MultiRingMsgQueueError::InvalidConfig | MultiRingMsgQueueError::BadRing => {
+                    SessionMsgQueueError::InvalidConfig
+                }
+            })?;
+        let bytes = message.as_mut_slice();
+        bytes.fill(0);
+        bytes[..size_of::<u32>()].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes[size_of::<u32>()..size_of::<u32>() + payload.len()].copy_from_slice(payload);
+        queue.add(message);
+        self.fire();
+        Ok(())
+    }
+
+    pub(crate) fn dequeue_ctrl_payload(
+        &self,
+        payload: &mut [u8],
+    ) -> Result<Option<usize>, SessionMsgQueueError> {
+        let Some(message) = self.inner.sub() else {
+            return Ok(None);
+        };
+        if message.ring_index() != SessionMqRing::Ctrl as u32 {
+            return Err(SessionMsgQueueError::UnexpectedRing {
+                ring: message.ring_index(),
+            });
+        }
+        let bytes = message.as_slice();
+        let payload_len = u32::from_le_bytes(
+            bytes[..size_of::<u32>()]
+                .try_into()
+                .expect("CTRL element stores a complete payload length"),
+        ) as usize;
+        let capacity = bytes.len() - size_of::<u32>();
+        if payload_len > capacity {
+            return Err(SessionMsgQueueError::ControlPayloadCorrupt {
+                bytes: payload_len,
+                capacity,
+            });
+        }
+        if payload_len > payload.len() {
+            return Err(SessionMsgQueueError::ControlPayloadBufferTooSmall {
+                bytes: payload_len,
+                capacity: payload.len(),
+            });
+        }
+        payload[..payload_len]
+            .copy_from_slice(&bytes[size_of::<u32>()..size_of::<u32>() + payload_len]);
+        Ok(Some(payload_len))
+    }
+
+    pub fn wait(&self) -> std::io::Result<()> {
+        let descriptor = self.read_fd().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "Session Message Queue has no read signal",
+            )
+        })?;
+        loop {
+            let mut poll = libc::pollfd {
+                fd: descriptor,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(std::ptr::from_mut(&mut poll), 1, -1) };
+            if ready >= 0 {
+                self.drain();
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
     }
 
     fn enqueue_on(&self, ring: SessionMqRing, evt: SessionEvt) -> Result<(), SessionMsgQueueError> {
@@ -460,9 +597,30 @@ impl SessionMsgQueue {
         q_nitems: u32,
         ring_nitems: u32,
     ) -> Result<Self, SessionMsgQueueError> {
+        let rings = session_ring_cfg(q_nitems, ring_nitems)?;
+        unsafe { Self::init_at_with_signal_and_rings(seg, hdr_offset, q_nitems, &rings) }
+    }
+
+    pub(crate) unsafe fn init_at_with_signal_and_ctrl_element(
+        seg: Segment,
+        hdr_offset: u64,
+        q_nitems: u32,
+        ring_nitems: u32,
+        control_element_size: usize,
+    ) -> Result<Self, SessionMsgQueueError> {
+        let rings = control_ring_cfg(q_nitems, ring_nitems, control_element_size)?;
+        unsafe { Self::init_at_with_signal_and_rings(seg, hdr_offset, q_nitems, &rings) }
+    }
+
+    unsafe fn init_at_with_signal_and_rings(
+        seg: Segment,
+        hdr_offset: u64,
+        q_nitems: u32,
+        rings: &[RingCfg; 2],
+    ) -> Result<Self, SessionMsgQueueError> {
         // SAFETY: forwarded caller layout guarantee initializes the shared
         // queue before it is remapped with the signal endpoint ownership.
-        drop(unsafe { Self::init_at(seg.clone(), hdr_offset, q_nitems, ring_nitems) }?);
+        drop(unsafe { Self::init_at_with_rings(seg.clone(), hdr_offset, q_nitems, rings) }?);
         let mut fds = [-1; 2];
         // SAFETY: `fds` is writable for two descriptor values. On success each
         // descriptor is immediately transferred into exactly one OwnedFd.

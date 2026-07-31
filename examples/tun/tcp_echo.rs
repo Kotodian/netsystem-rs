@@ -9,10 +9,14 @@
 //! ```
 
 use hammer_app::attach::{AppClient, AppClientError};
-use hammer_app::{AppSession, AppSessionError};
+use hammer_app::{
+    APP_SESSION_POLICY_VERSION, AppSession, AppSessionError, AppSessionPolicy, DataWorkerId,
+    SessionListenEndpoint,
+};
 use hammer_runtime::app::SessionEvtType;
 
 const DEFAULT_ATTACH_SOCKET: &str = "/tmp/hammer-tcp-integration.attach.sock";
+const DEFAULT_LISTEN_ADDRESS: &str = "10.66.77.1:7300";
 const ECHO_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -21,6 +25,12 @@ enum EchoError {
     Attach(#[from] AppClientError),
     #[error(transparent)]
     Session(#[from] AppSessionError),
+    #[error("invalid TCP echo listen address `{address}`")]
+    ListenAddress {
+        address: String,
+        #[source]
+        source: std::net::AddrParseError,
+    },
     #[error("failed to build the echo Tokio runtime")]
     TokioRuntime {
         #[source]
@@ -33,14 +43,30 @@ fn main() -> Result<(), EchoError> {
     let socket_path = arguments
         .next()
         .unwrap_or_else(|| DEFAULT_ATTACH_SOCKET.to_owned());
+    let listen_address = arguments
+        .next()
+        .unwrap_or_else(|| DEFAULT_LISTEN_ADDRESS.to_owned());
+    let listen_address = listen_address
+        .parse()
+        .map_err(|source| EchoError::ListenAddress {
+            address: listen_address,
+            source,
+        })?;
     let tokio_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .build()
         .map_err(|source| EchoError::TokioRuntime { source })?;
-    let client = AppClient::connect(&socket_path)?;
+    let mut client = AppClient::attach(&socket_path)?;
+    let policy = AppSessionPolicy::new(APP_SESSION_POLICY_VERSION, [])
+        .expect("the built-in plaintext App Session policy is valid");
+    let listener = client.listen(
+        "tcp",
+        SessionListenEndpoint::new(listen_address, DataWorkerId::new(0)),
+        policy,
+    )?;
     eprintln!(
-        "attached Application {:?} via {socket_path}",
-        client.application()
+        "attached Application {:?} via {socket_path}; listening on {listen_address} as {listener:?}",
+        client.application(),
     );
     loop {
         let session = client.accept()?;
@@ -61,7 +87,11 @@ async fn run_echo(session: &AppSession) -> Result<(), EchoError> {
             continue;
         }
         match event.evt_type {
-            SessionEvtType::Connect | SessionEvtType::TxDeq | SessionEvtType::RxDeq => {}
+            SessionEvtType::Connect
+            | SessionEvtType::TxDeq
+            | SessionEvtType::RxDeq
+            | SessionEvtType::TxEnq
+            | SessionEvtType::ProtocolOutput => {}
             SessionEvtType::RxEnq => loop {
                 let read = session.recv_bytes(&mut buffer);
                 if read == 0 {

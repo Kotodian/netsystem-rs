@@ -9,7 +9,7 @@ use hammer_infra::pool::{Index, Pool};
 use hammer_runtime::Engine;
 use hammer_runtime::app::{
     AppSessionPolicy, AppSessionProtocolEntry, ApplicationConnectionId, ApplicationId,
-    ApplicationListenerId, ORDERED_RELIABLE_BYTE_STREAM,
+    ApplicationListenerId,
 };
 use thiserror::Error;
 
@@ -268,6 +268,31 @@ impl ApplicationMain {
         Ok(())
     }
 
+    pub(crate) fn remove_connection(
+        &self,
+        application: ApplicationId,
+        connection: ApplicationConnectionId,
+    ) -> Result<(), ApplicationError> {
+        self.ensure_active(application)?;
+        self.with_state_mut(|state| {
+            let entry = state
+                .connections
+                .get(application_connection_index(connection))
+                .ok_or(ApplicationError::ConnectionMissing { connection })?;
+            if entry.application != application {
+                return Err(ApplicationError::ConnectionNotOwned {
+                    application,
+                    connection,
+                });
+            }
+            state
+                .connections
+                .remove(application_connection_index(connection))
+                .expect("validated Application connection remains present until removal");
+            Ok(())
+        })?
+    }
+
     pub fn remove_listener(
         &self,
         application: ApplicationId,
@@ -336,25 +361,12 @@ impl ApplicationMain {
         policy: &AppSessionPolicy,
     ) -> Result<Box<[ApplicationProtocol]>, ApplicationError> {
         let mut protocols = Vec::with_capacity(policy.protocols().len());
-        let mut semantics = ORDERED_RELIABLE_BYTE_STREAM;
-        let mut lower_name = "session";
         for selection in policy.protocols() {
             let entry = unique_protocol(&self.protocols, selection.protocol())?;
-            let registration = entry.registration();
-            if semantics != registration.lower() {
-                return Err(ApplicationError::SemanticsMismatch {
-                    lower: lower_name,
-                    provides: semantics,
-                    upper: registration.name(),
-                    requires: registration.lower(),
-                });
-            }
             protocols.push(ApplicationProtocol {
                 entry,
                 id: selection.id(),
             });
-            semantics = registration.upper();
-            lower_name = registration.name();
         }
         Ok(protocols.into_boxed_slice())
     }
@@ -477,15 +489,6 @@ pub enum ApplicationError {
     ProtocolMissing { protocol: String },
     #[error("App Session protocol `{protocol}` is registered more than once")]
     ProtocolDuplicate { protocol: String },
-    #[error(
-        "`{lower}` provides `{provides}` App Session semantics but `{upper}` requires `{requires}`"
-    )]
-    SemanticsMismatch {
-        lower: &'static str,
-        provides: &'static str,
-        upper: &'static str,
-        requires: &'static str,
-    },
     #[error("Application listener capacity {capacity} is exhausted")]
     ListenerCapacityExhausted { capacity: usize },
     #[error("Application connection capacity {capacity} is exhausted")]

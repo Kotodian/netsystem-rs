@@ -1,10 +1,9 @@
 use std::net::SocketAddr;
 
-use crate::app::AppSessionSemantics;
 use crate::{DataWorkerId, RuntimeResult};
 
 /// Opaque Session-layer listener identity supplied to one selected transport.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 #[repr(transparent)]
 pub struct SessionListenerId(u64);
 
@@ -35,11 +34,67 @@ impl SessionListenerId {
     }
 }
 
+/// Opaque Session-layer identity for one active-open request.
+///
+/// A transport retains this identity only until it binds its worker-owned
+/// connection to the Session worker. Application policy remains Session-owned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct SessionConnectionId(u64);
+
+impl SessionConnectionId {
+    #[doc(hidden)]
+    #[inline]
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    #[doc(hidden)]
+    #[inline]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
 /// Endpoint selected by the Session control plane for one transport listener.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct SessionListenEndpoint {
     local: SocketAddr,
     worker: DataWorkerId,
+}
+
+/// Transport endpoint selected for one Session active-open request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionConnectEndpoint {
+    remote: SocketAddr,
+    local: Option<SocketAddr>,
+    worker: DataWorkerId,
+}
+
+impl SessionConnectEndpoint {
+    #[inline]
+    pub const fn new(remote: SocketAddr, local: Option<SocketAddr>, worker: DataWorkerId) -> Self {
+        Self {
+            remote,
+            local,
+            worker,
+        }
+    }
+
+    #[inline]
+    pub const fn remote(self) -> SocketAddr {
+        self.remote
+    }
+
+    #[inline]
+    pub const fn local(self) -> Option<SocketAddr> {
+        self.local
+    }
+
+    #[inline]
+    pub const fn worker(self) -> DataWorkerId {
+        self.worker
+    }
 }
 
 impl SessionListenEndpoint {
@@ -62,52 +117,38 @@ impl SessionListenEndpoint {
 pub type SessionTransportStartListen =
     fn(SessionListenerId, SessionListenEndpoint) -> RuntimeResult<()>;
 pub type SessionTransportStopListen = fn(SessionListenerId) -> RuntimeResult<()>;
+pub type SessionTransportConnect =
+    fn(SessionConnectionId, SessionConnectEndpoint) -> RuntimeResult<()>;
 
 /// Static operations registered by one transport plugin.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct SessionTransportRegistration {
     name: &'static str,
-    upper: AppSessionSemantics,
     start_listen: Option<SessionTransportStartListen>,
     stop_listen: Option<SessionTransportStopListen>,
+    connect: Option<SessionTransportConnect>,
 }
 
 impl SessionTransportRegistration {
     #[doc(hidden)]
     #[inline]
-    pub const fn new(name: &'static str, upper: AppSessionSemantics) -> Self {
-        Self {
-            name,
-            upper,
-            start_listen: None,
-            stop_listen: None,
-        }
-    }
-
-    #[doc(hidden)]
-    #[inline]
-    pub const fn with_listener_operations(
+    pub const fn new(
         name: &'static str,
-        upper: AppSessionSemantics,
-        start_listen: SessionTransportStartListen,
-        stop_listen: SessionTransportStopListen,
+        start_listen: Option<SessionTransportStartListen>,
+        stop_listen: Option<SessionTransportStopListen>,
+        connect: Option<SessionTransportConnect>,
     ) -> Self {
         Self {
             name,
-            upper,
-            start_listen: Some(start_listen),
-            stop_listen: Some(stop_listen),
+            start_listen,
+            stop_listen,
+            connect,
         }
     }
 
     #[inline]
     pub const fn name(self) -> &'static str {
         self.name
-    }
-
-    #[inline]
-    pub const fn upper(self) -> AppSessionSemantics {
-        self.upper
     }
 
     #[inline]
@@ -118,5 +159,10 @@ impl SessionTransportRegistration {
     #[inline]
     pub const fn stop_listen(self) -> Option<SessionTransportStopListen> {
         self.stop_listen
+    }
+
+    #[inline]
+    pub const fn connect(self) -> Option<SessionTransportConnect> {
+        self.connect
     }
 }

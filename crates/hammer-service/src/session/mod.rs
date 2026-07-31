@@ -11,6 +11,7 @@ use hammer_runtime::{Engine, RuntimeError, RuntimeResult};
 pub mod app;
 pub mod application;
 pub mod config;
+mod control;
 pub mod error;
 pub mod id;
 pub mod node;
