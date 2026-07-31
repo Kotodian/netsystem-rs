@@ -51,7 +51,7 @@ impl SessionTransportId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionControlEvent {
     Close(SessionId),
-    Disconnect(SessionId),
+    TransportClosed(SessionId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1013,7 +1013,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
                     return Ok(());
                 };
                 self.control_events
-                    .push_back(SessionControlEvent::Close(app_session));
+                    .push_back(SessionControlEvent::TransportClosed(app_session));
                 Ok(())
             }
             Some(SessionApplication::External(_)) => self.app.closed(session_id),
@@ -1036,7 +1036,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     #[inline]
     pub fn schedule_disconnect(&mut self, session_id: SessionId) {
         self.control_events
-            .push_back(SessionControlEvent::Disconnect(session_id));
+            .push_back(SessionControlEvent::Close(session_id));
     }
 
     pub fn poll_app(&mut self) -> RuntimeResult<usize> {
@@ -2187,7 +2187,10 @@ where
                 }
                 session_id
             }
-            SessionControlEvent::Disconnect(session_id) => session_id,
+            SessionControlEvent::TransportClosed(session_id) => {
+                sessions.notify_application_closed(session_id)?;
+                continue;
+            }
         };
         let session_transport = sessions.session_transport(session_id);
         if !sessions.close_transport_session(session_id)? {
