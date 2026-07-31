@@ -414,7 +414,11 @@ impl SessionMsgQueue {
         bytes[..size_of::<u32>()].copy_from_slice(&(payload.len() as u32).to_le_bytes());
         bytes[size_of::<u32>()..size_of::<u32>() + payload.len()].copy_from_slice(payload);
         queue.add(message);
-        self.fire();
+        let became_non_empty = self.inner.len() == 1;
+        drop(queue);
+        if became_non_empty {
+            self.fire();
+        }
         Ok(())
     }
 
@@ -493,7 +497,11 @@ impl SessionMsgQueue {
         };
         slot.as_mut_slice().copy_from_slice(&bytes);
         guard.add(slot);
-        self.fire();
+        let became_non_empty = self.inner.len() == 1;
+        drop(guard);
+        if became_non_empty {
+            self.fire();
+        }
         Ok(())
     }
 }
