@@ -6,17 +6,22 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread::{self, ThreadId};
 
 use hammer_infra::pool::{Index, Pool};
+use hammer_infra::segment::Segment;
 use hammer_runtime::Engine;
 use hammer_runtime::app::{
     AppSessionPolicy, AppSessionProtocolEntry, ApplicationConnectionId, ApplicationId,
-    ApplicationListenerId,
+    ApplicationListenerId, SessionMsgQueue, SessionMsgQueueError,
 };
+use hammer_runtime::{DataWorkerId, RuntimeError};
 use thiserror::Error;
+
+use super::config::Session;
 
 struct ApplicationState {
     applications: Pool<()>,
     listeners: Pool<ApplicationListener>,
     connections: Pool<ApplicationConnection>,
+    mq_resources: Vec<Option<ApplicationMqResources>>,
 }
 
 pub(crate) struct ApplicationListener {
@@ -78,6 +83,111 @@ impl ApplicationConnection {
     }
 }
 
+/// Per-Application message queues, one for every Data Worker.
+///
+/// The queues are owned by `ApplicationMain` and are published to Data
+/// Workers at attach time. The shared worker TX queue remains available as a
+/// fallback for callers that have not opted into per-Application MQs.
+pub struct ApplicationMqResources {
+    application: ApplicationId,
+    segment: Segment,
+    queues: Box<[Arc<SessionMsgQueue>]>,
+    offsets: Box<[u64]>,
+}
+
+impl ApplicationMqResources {
+    pub(crate) fn create_local(
+        application: ApplicationId,
+        worker_count: usize,
+        capacity: usize,
+    ) -> Result<Self, ApplicationError> {
+        Self::create(application, worker_count, capacity, false)
+    }
+
+    pub(crate) fn create_external(
+        application: ApplicationId,
+        worker_count: usize,
+        capacity: usize,
+    ) -> Result<Self, ApplicationError> {
+        Self::create(application, worker_count, capacity, true)
+    }
+
+    fn create(
+        application: ApplicationId,
+        worker_count: usize,
+        capacity: usize,
+        shared: bool,
+    ) -> Result<Self, ApplicationError> {
+        if capacity < APP_MQ_CAPACITY_MIN {
+            return Err(ApplicationError::MqCapacityInvalid { capacity });
+        }
+        if worker_count == 0 {
+            return Err(ApplicationError::MqWorkerCountZero);
+        }
+        let q_nitems = capacity.next_power_of_two().max(2) as u32;
+        let ring_nitems = capacity.max(1) as u32;
+        let queue_bytes = SessionMsgQueue::layout_bytes(q_nitems, ring_nitems)
+            .map_err(|source| ApplicationError::MqLayout { source })?;
+        let segment_bytes = queue_bytes
+            .checked_mul(worker_count)
+            .and_then(|bytes| bytes.checked_add(128))
+            .ok_or(ApplicationError::MqLayoutOverflow)?;
+        let segment = if shared {
+            let name = format!(
+                "hammer-app-rx-mq-{}-{}",
+                std::process::id(),
+                application.raw()
+            );
+            Segment::shared(&name, segment_bytes)
+                .map_err(|source| ApplicationError::MqSegmentCreate { source })?
+        } else {
+            Segment::local(segment_bytes)
+        };
+
+        let mut queues = Vec::with_capacity(worker_count);
+        let mut offsets = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let offset = segment
+                .alloc(queue_bytes, 64)
+                .ok_or(ApplicationError::MqSegmentExhausted)?;
+            // SAFETY: the segment has enough bytes at `offset` for the queue,
+            // and this is the only initializer for this offset.
+            let queue = unsafe {
+                SessionMsgQueue::init_at_with_signal(segment.clone(), offset, q_nitems, ring_nitems)
+            }
+            .map_err(|source| ApplicationError::MqInit { source })?;
+            queues.push(Arc::new(queue));
+            offsets.push(offset);
+        }
+        Ok(Self {
+            application,
+            segment,
+            queues: queues.into_boxed_slice(),
+            offsets: offsets.into_boxed_slice(),
+        })
+    }
+
+    #[inline]
+    pub fn worker_count(&self) -> usize {
+        self.queues.len()
+    }
+
+    #[inline]
+    pub(crate) fn queue(&self, worker: DataWorkerId) -> Option<&Arc<SessionMsgQueue>> {
+        self.queues.get(worker.slot())
+    }
+
+    #[inline]
+    pub(crate) fn segment(&self) -> &Segment {
+        &self.segment
+    }
+
+    #[inline]
+    pub(crate) fn offset(&self, worker: DataWorkerId) -> Option<u64> {
+        self.offsets.get(worker.slot()).copied()
+    }
+}
+
 const CONNECTION_PENDING: u8 = 0;
 const CONNECTION_COMPLETED: u8 = 1;
 
@@ -87,6 +197,8 @@ pub struct ApplicationMain {
     state: UnsafeCell<ApplicationState>,
     protocols: Box<[AppSessionProtocolEntry]>,
 }
+
+const APP_MQ_CAPACITY_MIN: usize = 128;
 
 // SAFETY: every state access verifies the creating Main Thread before
 // dereferencing `state`; ApplicationRegistration is !Send and Binary API calls
@@ -111,13 +223,17 @@ impl ApplicationMain {
                 applications: Pool::with_capacity(capacity),
                 listeners: Pool::with_capacity(capacity),
                 connections: Pool::with_capacity(capacity),
+                mq_resources: std::iter::repeat_with(|| None).take(capacity).collect(),
             }),
             protocols: protocols.into_iter().collect::<Vec<_>>().into_boxed_slice(),
         })
     }
 
     pub fn register_local(self: &Arc<Self>) -> Result<ApplicationRegistration, ApplicationError> {
-        let application = self.attach()?;
+        let application = match Engine::with_current(|engine| engine.registry.get::<Session>()) {
+            Some(Some(_)) => self.attach_local_with_runtime()?,
+            _ => self.attach()?,
+        };
         Ok(ApplicationRegistration {
             main: Arc::clone(self),
             application: Some(application),
@@ -133,6 +249,145 @@ impl ApplicationMain {
                 },
             )
         })?
+    }
+
+    /// Attaches an external Application and creates one private Session
+    /// Message Queue for every Data Worker.
+    pub fn attach_external(
+        &self,
+        worker_count: usize,
+        mq_capacity: usize,
+    ) -> Result<ApplicationId, ApplicationError> {
+        self.attach_with_mq(worker_count, mq_capacity, true)
+    }
+
+    /// Attaches a local Application and creates one private Session Message
+    /// Queue for every Data Worker.
+    pub fn attach_local(
+        &self,
+        worker_count: usize,
+        mq_capacity: usize,
+    ) -> Result<ApplicationId, ApplicationError> {
+        self.attach_with_mq(worker_count, mq_capacity, false)
+    }
+
+    /// Attaches an external Application using the current runtime Session
+    /// configuration.
+    pub fn attach_external_with_runtime(&self) -> Result<ApplicationId, ApplicationError> {
+        self.attach_with_runtime(true)
+    }
+
+    /// Attaches a local Application using the current runtime Session
+    /// configuration.
+    pub fn attach_local_with_runtime(&self) -> Result<ApplicationId, ApplicationError> {
+        self.attach_with_runtime(false)
+    }
+
+    fn attach_with_runtime(&self, shared: bool) -> Result<ApplicationId, ApplicationError> {
+        let (worker_count, mq_capacity) = Engine::with_current(|engine| {
+            let session = engine
+                .registry
+                .get::<Session>()
+                .ok_or(ApplicationError::SessionMainMissing)?;
+            Ok((engine.configured_worker_count(), session.app_mq_capacity))
+        })
+        .ok_or(ApplicationError::SessionMainMissing)??;
+        self.attach_with_mq(worker_count, mq_capacity, shared)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn attach_local_for_test(
+        &self,
+        worker_count: usize,
+        mq_capacity: usize,
+    ) -> Result<ApplicationId, ApplicationError> {
+        let application = self.attach()?;
+        let resources =
+            ApplicationMqResources::create_local(application, worker_count, mq_capacity)?;
+        self.store_mq_resources(application, resources)?;
+        Ok(application)
+    }
+
+    fn attach_with_mq(
+        &self,
+        worker_count: usize,
+        mq_capacity: usize,
+        shared: bool,
+    ) -> Result<ApplicationId, ApplicationError> {
+        let application = self.attach()?;
+        let resources = if shared {
+            ApplicationMqResources::create_external(application, worker_count, mq_capacity)
+        } else {
+            ApplicationMqResources::create_local(application, worker_count, mq_capacity)
+        }?;
+        let install_result = Engine::with_current(|engine| {
+            let main = engine
+                .registry
+                .get::<super::runtime::SessionMain>()
+                .ok_or(ApplicationError::SessionMainMissing)?;
+            main.install_application_mqs(engine, application, &resources)
+                .map_err(|source| ApplicationError::MqInstall { source })
+        });
+        match install_result {
+            Some(Ok(())) => {
+                let store_result = self.store_mq_resources(application, resources);
+                if let Err(error) = store_result {
+                    self.rollback_attach(application);
+                    return Err(error);
+                }
+                Ok(application)
+            }
+            Some(Err(error)) => {
+                self.rollback_attach(application);
+                Err(error)
+            }
+            None => {
+                self.rollback_attach(application);
+                Err(ApplicationError::SessionMainMissing)
+            }
+        }
+    }
+
+    fn store_mq_resources(
+        &self,
+        application: ApplicationId,
+        resources: ApplicationMqResources,
+    ) -> Result<(), ApplicationError> {
+        self.with_state_mut(|state| {
+            let slot = application.slot() as usize;
+            if slot >= state.mq_resources.len() {
+                state.mq_resources.resize_with(slot + 1, || None);
+            }
+            if state.mq_resources[slot].is_some() {
+                return Err(ApplicationError::MqAlreadyAttached { application });
+            }
+            state.mq_resources[slot] = Some(resources);
+            Ok(())
+        })?
+    }
+
+    pub(crate) fn mq_worker(
+        &self,
+        application: ApplicationId,
+        worker: DataWorkerId,
+    ) -> Option<(Arc<SessionMsgQueue>, Option<Segment>, u64)> {
+        // SAFETY: MQ resources are published under the worker barrier and are
+        // only read by Data Workers during session construction.
+        let state = unsafe { &*self.state.get() };
+        let resources = state
+            .mq_resources
+            .get(application.slot() as usize)?
+            .as_ref()
+            .filter(|resources| resources.application == application)?;
+        let queue = resources.queue(worker)?.clone();
+        let offset = resources.offset(worker)?;
+        Some((queue, Some(resources.segment().clone()), offset))
+    }
+
+    fn rollback_attach(&self, application: ApplicationId) {
+        if let Err(error) = self.detach(application) {
+            tracing::error!(%error, ?application, "per-Application MQ attach cleanup failed");
+        }
     }
 
     pub fn contains(&self, application: ApplicationId) -> Result<bool, ApplicationError> {
@@ -151,6 +406,13 @@ impl ApplicationMain {
                 .applications
                 .get(index)
                 .ok_or(ApplicationError::Missing { application })?;
+            if let Some(slot) = state.mq_resources.get_mut(application.slot() as usize)
+                && slot
+                    .as_ref()
+                    .is_some_and(|resources| resources.application == application)
+            {
+                *slot = None;
+            }
             let listener_indexes = state
                 .listeners
                 .iter()
@@ -495,6 +757,38 @@ pub enum ApplicationError {
     Missing { application: ApplicationId },
     #[error("Application state is owned by another thread")]
     WrongThread,
+    #[error("per-Application MQ capacity {capacity} is below the minimum 128")]
+    MqCapacityInvalid { capacity: usize },
+    #[error("per-Application MQ requires at least one Data Worker")]
+    MqWorkerCountZero,
+    #[error("per-Application MQ layout rejected: {source:?}")]
+    MqLayout {
+        #[source]
+        source: SessionMsgQueueError,
+    },
+    #[error("per-Application MQ layout exceeds addressable memory")]
+    MqLayoutOverflow,
+    #[error("failed to create per-Application MQ segment")]
+    MqSegmentCreate {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("per-Application MQ segment cannot hold the queue")]
+    MqSegmentExhausted,
+    #[error("per-Application MQ initialisation rejected: {source:?}")]
+    MqInit {
+        #[source]
+        source: SessionMsgQueueError,
+    },
+    #[error("Session Main is not ready for per-Application MQ attach")]
+    SessionMainMissing,
+    #[error("per-Application MQ worker installation failed")]
+    MqInstall {
+        #[source]
+        source: RuntimeError,
+    },
+    #[error("Application {application:?} already owns per-Application MQ resources")]
+    MqAlreadyAttached { application: ApplicationId },
     #[error("App Session protocol `{protocol}` is not registered")]
     ProtocolMissing { protocol: String },
     #[error("App Session protocol `{protocol}` is registered more than once")]
@@ -576,9 +870,13 @@ fn unique_protocol(
 
 #[cfg(test)]
 mod tests {
-    use hammer_runtime::app::{APP_SESSION_POLICY_VERSION, AppSessionPolicy};
+    use hammer_runtime::DataWorkerId;
+    use hammer_runtime::app::{APP_SESSION_POLICY_VERSION, AppSessionPolicy, SessionEventQueue};
 
-    use super::{ApplicationConnectionId, ApplicationError, ApplicationId, ApplicationMain};
+    use super::{
+        ApplicationConnectionId, ApplicationError, ApplicationId, ApplicationMain,
+        ApplicationMqResources,
+    };
 
     fn policy() -> AppSessionPolicy {
         AppSessionPolicy::new(APP_SESSION_POLICY_VERSION, []).expect("direct App Session policy")
@@ -590,6 +888,48 @@ mod tests {
     ) -> ApplicationConnectionId {
         main.register_connection(application, None, &policy())
             .expect("register Application connection")
+    }
+
+    #[test]
+    fn local_mq_resources_create_one_signal_queue_per_data_worker() {
+        let main = ApplicationMain::new(2);
+        let application = main.attach().expect("attach Application");
+        let resources =
+            ApplicationMqResources::create_local(application, 2, 128).expect("MQ resources");
+
+        assert_eq!(resources.worker_count(), 2);
+        for worker in [DataWorkerId::new(0), DataWorkerId::new(1)] {
+            let queue = resources.queue(worker).expect("worker MQ");
+            assert!(queue.read_fd().is_some());
+            assert!(queue.write_fd().is_some());
+        }
+    }
+
+    #[test]
+    fn attach_local_without_runtime_rolls_back_identity_and_mq_resources() {
+        let main = ApplicationMain::new(1);
+        let error = main
+            .attach_local(1, 128)
+            .expect_err("attach requires Session Main");
+
+        assert!(matches!(error, ApplicationError::SessionMainMissing));
+        let state = main.state().expect("read Application state");
+        assert!(state.applications.is_empty());
+        assert!(state.mq_resources.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn detach_releases_application_mq_resources() {
+        let main = ApplicationMain::new(1);
+        let application = main
+            .attach_local_for_test(1, 128)
+            .expect("attach local Application");
+
+        main.detach(application).expect("detach local Application");
+
+        let state = main.state().expect("read Application state");
+        assert!(state.applications.is_empty());
+        assert!(state.mq_resources.iter().all(Option::is_none));
     }
 
     #[test]

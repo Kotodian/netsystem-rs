@@ -193,5 +193,21 @@ fn application_status(error: ApplicationError) -> ApplicationSessionStatus {
         ApplicationError::ConnectionNotCompleted { .. } => {
             ApplicationSessionStatus::ConnectionNotCompleted
         }
+        ApplicationError::MqCapacityInvalid { .. } => {
+            ApplicationSessionStatus::ApplicationMqCapacityInvalid
+        }
+        ApplicationError::MqWorkerCountZero
+        | ApplicationError::MqLayout { .. }
+        | ApplicationError::MqLayoutOverflow
+        | ApplicationError::MqSegmentCreate { .. }
+        | ApplicationError::MqSegmentExhausted
+        | ApplicationError::MqInit { .. }
+        | ApplicationError::MqInstall { .. } => {
+            ApplicationSessionStatus::ApplicationMqResourceUnavailable
+        }
+        ApplicationError::SessionMainMissing => ApplicationSessionStatus::SessionMainUnavailable,
+        ApplicationError::MqAlreadyAttached { .. } => {
+            ApplicationSessionStatus::ApplicationMqAlreadyAttached
+        }
     }
 }

@@ -1,6 +1,7 @@
 use hammer_core::data_plane::NodeId;
 use hammer_infra::fifo::FifoError;
 use hammer_runtime::RuntimeError;
+use hammer_runtime::app::ApplicationId;
 use hammer_runtime::{SessionConnectionId, SessionListenerId};
 use thiserror::Error;
 
@@ -30,6 +31,10 @@ pub enum SessionQueueError {
         consumer: NodeId,
         output_node: NodeId,
     },
+    #[error("Application {application:?} already has a per-worker MQ registration")]
+    ApplicationMqAlreadyRegistered { application: ApplicationId },
+    #[error("Application {application:?} has no per-worker MQ registration")]
+    ApplicationMqMissing { application: ApplicationId },
 }
 
 impl SessionQueueError {
@@ -43,6 +48,8 @@ impl SessionQueueError {
             Self::WorkerAlreadyInstalled { .. } => 4,
             Self::WorkerAccess { .. } => 5,
             Self::OutputMissing { .. } => 6,
+            Self::ApplicationMqAlreadyRegistered { .. } => 7,
+            Self::ApplicationMqMissing { .. } => 8,
         }
     }
 }

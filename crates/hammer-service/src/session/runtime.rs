@@ -1,4 +1,5 @@
 use std::cell::UnsafeCell;
+use std::collections::VecDeque;
 use std::num::NonZeroU32;
 use std::os::fd::BorrowedFd;
 use std::sync::Arc;
@@ -26,7 +27,7 @@ use hammer_runtime::{
 use hammer_runtime::{DataPlaneRuntime, DataWorkerId, Engine, File, FileFunctions};
 
 use crate::session::app::{AppWorkerAttach, AppWorkerError};
-use crate::session::application::{ApplicationMain, ApplicationProtocol};
+use crate::session::application::{ApplicationMain, ApplicationMqResources, ApplicationProtocol};
 use crate::session::error::{SessionError, SessionQueueError};
 use crate::session::node::{
     AppSessionInputNode, SESSION_QUEUE_IO_BUDGET, SessionQueueTransportDispatch,
@@ -182,6 +183,18 @@ pub struct SessionWorker<Index> {
     app_rx_events: FifoQueue<SessionId>,
     control_events: FifoQueue<SessionControlEvent>,
     readiness_file: Option<PoolIndex>,
+    app_rx_mqs: Vec<Option<Box<AppRxMqEntry>>>,
+    app_rx_mq_pending: VecDeque<ApplicationId>,
+}
+
+struct AppRxMqEntry {
+    application: ApplicationId,
+    queue: Arc<SessionMsgQueue>,
+    file: Option<PoolIndex>,
+    appsl_input_node: hammer_core::data_plane::NodeId,
+    pending_queue: usize,
+    pending: bool,
+    postponed: bool,
 }
 
 pub struct SessionMain {
@@ -404,6 +417,9 @@ impl SessionMain {
         engine: &Engine,
         application: ApplicationId,
     ) {
+        if let Err(error) = self.remove_application_mqs(engine, application) {
+            tracing::error!(%error, ?application, "failed to remove per-Application MQ registrations");
+        }
         let listeners = {
             // SAFETY: this call runs on the Main Thread. Listener removal
             // below stops Data Workers through the same barrier as publish.
@@ -449,6 +465,125 @@ impl SessionMain {
             }
         }
     }
+
+    pub fn install_application_mqs(
+        self: &Arc<Self>,
+        engine: &Engine,
+        application: ApplicationId,
+        resources: &ApplicationMqResources,
+    ) -> RuntimeResult<()> {
+        if engine.thread_index != 0 {
+            return Err(RuntimeError::WorkerControlRequiresMainEngine);
+        }
+        let app_session_input = engine
+            .runtime
+            .nodes()
+            .node_by_name("appsl-rx-mqs-input")
+            .ok_or_else(|| session_worker_error(SessionQueueError::NodeMissing))?;
+        let mut installed = Vec::new();
+        for worker_slot in 0..resources.worker_count() {
+            let worker = DataWorkerId::new(worker_slot as u32);
+            let queue = resources
+                .queue(worker)
+                .ok_or_else(|| {
+                    session_worker_error(SessionQueueError::ApplicationMqMissing { application })
+                })?
+                .clone();
+            let main = Arc::clone(self);
+            match schedule_worker_task(engine, worker, move || {
+                Engine::with_current(|engine| {
+                    let runtime = &mut engine.runtime;
+                    main.worker(worker)?
+                        .with_mut(|sessions| {
+                            sessions.install_app_mq(application, queue, app_session_input, runtime)
+                        })
+                        .map_err(|source| {
+                            session_worker_error(SessionQueueError::WorkerAccess {
+                                worker: worker.slot(),
+                                source,
+                            })
+                        })?
+                })
+                .ok_or(RuntimeError::WorkerControlRequiresMainEngine)?
+            }) {
+                Ok(()) => installed.push(worker_slot),
+                Err(error) => {
+                    for installed_worker in installed.iter().rev().copied() {
+                        let worker = DataWorkerId::new(installed_worker as u32);
+                        let main = Arc::clone(self);
+                        if let Err(rollback_error) =
+                            schedule_worker_task(engine, worker, move || {
+                                Engine::with_current(|engine| {
+                                    let runtime = &mut engine.runtime;
+                                    main.worker(worker)?
+                                        .with_mut(|sessions| {
+                                            sessions.remove_app_mq(application, runtime)
+                                        })
+                                        .map_err(|source| {
+                                            session_worker_error(SessionQueueError::WorkerAccess {
+                                                worker: worker.slot(),
+                                                source,
+                                            })
+                                        })?
+                                })
+                                .ok_or(RuntimeError::WorkerControlRequiresMainEngine)?
+                            })
+                        {
+                            tracing::error!(
+                                %rollback_error,
+                                worker = installed_worker,
+                                "per-Application MQ attach rollback failed"
+                            );
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn remove_application_mqs(
+        self: &Arc<Self>,
+        engine: &Engine,
+        application: ApplicationId,
+    ) -> RuntimeResult<()> {
+        for worker_slot in 0..self.workers.len() {
+            let worker = DataWorkerId::new(worker_slot as u32);
+            let main = Arc::clone(self);
+            schedule_worker_task(engine, worker, move || {
+                Engine::with_current(|engine| {
+                    let runtime = &mut engine.runtime;
+                    main.worker(worker)?
+                        .with_mut(|sessions| {
+                            sessions.drain_app_mq(application)?;
+                            sessions.remove_app_mq(application, runtime)
+                        })
+                        .map_err(|source| {
+                            session_worker_error(SessionQueueError::WorkerAccess {
+                                worker: worker.slot(),
+                                source,
+                            })
+                        })?
+                })
+                .ok_or(RuntimeError::WorkerControlRequiresMainEngine)?
+            })?;
+        }
+        Ok(())
+    }
+}
+
+fn schedule_worker_task<R: Send + 'static>(
+    engine: &Engine,
+    worker: DataWorkerId,
+    task: impl FnOnce() -> RuntimeResult<R> + Send + 'static,
+) -> RuntimeResult<R> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    engine.schedule_on_worker(worker, move || {
+        let _ = tx.send(task());
+    })?;
+    rx.recv()
+        .map_err(|_| RuntimeError::WorkerControlClosed { worker })?
 }
 
 pub fn install_session_worker(
@@ -555,6 +690,236 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         let _ = engine.file_main_mut().delete(file)?;
         self.readiness_file = None;
         Ok(())
+    }
+
+    /// Registers one per-Application MQ with this Data Worker's FileMain.
+    pub(crate) fn install_app_mq(
+        &mut self,
+        application: ApplicationId,
+        queue: Arc<SessionMsgQueue>,
+        app_session_input: hammer_core::data_plane::NodeId,
+        runtime: &mut DataPlaneRuntime,
+    ) -> RuntimeResult<()> {
+        let slot = application.slot() as usize;
+        if slot >= self.app_rx_mqs.len() {
+            self.app_rx_mqs.resize_with(slot + 1, || None);
+        }
+        if self.app_rx_mqs[slot]
+            .as_ref()
+            .is_some_and(|entry| entry.application == application)
+        {
+            return Err(session_worker_error(
+                SessionQueueError::ApplicationMqAlreadyRegistered { application },
+            ));
+        }
+        let Some(signal_read_fd) = queue.read_fd() else {
+            return Err(AttachError::SessionSignalMissing.into());
+        };
+        // SAFETY: the queue retains its original read endpoint while FileMain
+        // owns this independent duplicated descriptor.
+        let signal_read = unsafe { BorrowedFd::borrow_raw(signal_read_fd) }
+            .try_clone_to_owned()
+            .map_err(|source| AttachError::SessionSignalDuplicate { source })?;
+        let entry = Box::new(AppRxMqEntry {
+            application,
+            queue,
+            file: None,
+            appsl_input_node: app_session_input,
+            pending_queue: &mut self.app_rx_mq_pending as *mut VecDeque<ApplicationId> as usize,
+            pending: false,
+            postponed: false,
+        });
+        let entry_ptr = Box::into_raw(entry);
+        let file = match runtime.file_main_mut().add(File::new(
+            signal_read,
+            format!("app rx mq {:?}", application.raw()),
+            entry_ptr as usize as u64,
+            FileFunctions {
+                read: Some(schedule_app_mq_pending),
+                ..FileFunctions::default()
+            },
+        )) {
+            Ok(file) => file,
+            Err(error) => {
+                // SAFETY: `entry_ptr` still owns the entry until FileMain add
+                // succeeds; reconstruct it here so the queue is dropped.
+                unsafe {
+                    drop(Box::from_raw(entry_ptr));
+                }
+                return Err(error);
+            }
+        };
+        // SAFETY: `entry_ptr` was produced by `Box::into_raw` and is still
+        // unaliased; reconstruct it for worker-local storage.
+        let mut entry = unsafe { Box::from_raw(entry_ptr) };
+        entry.file = Some(file);
+        self.app_rx_mqs[slot] = Some(entry);
+        Ok(())
+    }
+
+    /// Removes one per-Application MQ registration before the queue is
+    /// released by `ApplicationMain`.
+    pub(crate) fn remove_app_mq(
+        &mut self,
+        application: ApplicationId,
+        runtime: &mut DataPlaneRuntime,
+    ) -> RuntimeResult<()> {
+        let slot = application.slot() as usize;
+        let Some(entry) = self.app_rx_mqs.get_mut(slot).and_then(|entry| {
+            if entry
+                .as_ref()
+                .is_some_and(|entry| entry.application == application)
+            {
+                entry.take()
+            } else {
+                None
+            }
+        }) else {
+            return Ok(());
+        };
+        if entry.pending {
+            self.app_rx_mq_pending
+                .retain(|candidate| *candidate != application);
+        }
+        if let Some(file) = entry.file {
+            runtime.file_main_mut().delete(file)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_app_mq_pending(&mut self, application: ApplicationId) -> bool {
+        let slot = application.slot() as usize;
+        let Some(Some(entry)) = self.app_rx_mqs.get_mut(slot) else {
+            return false;
+        };
+        if entry.application != application || entry.pending || entry.queue.is_empty() {
+            return false;
+        }
+        entry.pending = true;
+        self.app_rx_mq_pending.push_back(application);
+        true
+    }
+
+    #[inline]
+    pub(crate) fn app_mq_worker(
+        &self,
+        application: ApplicationId,
+    ) -> Option<(Arc<SessionMsgQueue>, Option<Segment>, u64)> {
+        self.applications
+            .as_ref()
+            .and_then(|applications| applications.mq_worker(application, self.worker))
+    }
+
+    fn drain_app_mq_events_to(&mut self, mut dispatch_event: impl FnMut(SessionEvt)) -> usize {
+        let mut dispatched = 0usize;
+        let mut batch = [SessionEvt::io(0, SessionEvtType::Connect); 64];
+        let pending_snapshot_len = self.app_rx_mq_pending.len();
+        for _ in 0..pending_snapshot_len {
+            let Some(application) = self.app_rx_mq_pending.pop_front() else {
+                break;
+            };
+            let slot = application.slot() as usize;
+            let Some(Some(entry)) = self.app_rx_mqs.get_mut(slot) else {
+                continue;
+            };
+            if entry.application != application || !entry.pending {
+                continue;
+            }
+            entry.queue.drain();
+            let snapshot = entry.queue.len();
+            let mut remaining = snapshot;
+            entry.postponed = false;
+            while remaining > 0 {
+                let batch_len = remaining.min(batch.len());
+                let count = entry.queue.dequeue_batch(&mut batch[..batch_len]);
+                if count == 0 {
+                    break;
+                }
+                for evt in batch[..count].iter() {
+                    dispatch_event(*evt);
+                }
+                dispatched += count;
+                remaining -= count;
+            }
+            entry.postponed = !entry.queue.is_empty();
+            if snapshot == 0 {
+                entry.pending = false;
+                continue;
+            }
+            if entry.postponed {
+                self.app_rx_mq_pending.push_back(application);
+            } else {
+                entry.pending = false;
+            }
+        }
+        dispatched
+    }
+
+    pub(crate) fn drain_app_mq(&mut self, application: ApplicationId) -> RuntimeResult<usize> {
+        let session_evt_q = Arc::clone(&self.session_evt_q);
+        let mut queue_error = None;
+        let handled = self.drain_one_app_mq_to(application, |evt| {
+            if queue_error.is_some() {
+                return;
+            }
+            let result = match evt.evt_type {
+                SessionEvtType::Connect | SessionEvtType::Close | SessionEvtType::HalfClose => {
+                    session_evt_q.enqueue_ctrl(evt)
+                }
+                SessionEvtType::RxEnq
+                | SessionEvtType::RxDeq
+                | SessionEvtType::TxEnq
+                | SessionEvtType::TxDeq => session_evt_q.enqueue_io(evt),
+                SessionEvtType::ProtocolOutput
+                | SessionEvtType::Disconnected
+                | SessionEvtType::Reset
+                | SessionEvtType::TransportClosed => return,
+            };
+            if let Err(error) = result {
+                queue_error = Some(error);
+            }
+        });
+        if let Some(error) = queue_error {
+            return Err(AppWorkerError::SessionEventQueue { error }.into());
+        }
+        Ok(handled)
+    }
+
+    fn drain_one_app_mq_to(
+        &mut self,
+        application: ApplicationId,
+        mut dispatch_event: impl FnMut(SessionEvt),
+    ) -> usize {
+        let slot = application.slot() as usize;
+        let Some(Some(entry)) = self.app_rx_mqs.get_mut(slot) else {
+            return 0;
+        };
+        if entry.application != application {
+            return 0;
+        }
+        let mut dispatched = 0usize;
+        let mut batch = [SessionEvt::io(0, SessionEvtType::Connect); 64];
+        entry.queue.drain();
+        let snapshot = entry.queue.len();
+        let mut remaining = snapshot;
+        entry.pending = false;
+        entry.postponed = false;
+        while remaining > 0 {
+            let batch_len = remaining.min(batch.len());
+            let count = entry.queue.dequeue_batch(&mut batch[..batch_len]);
+            if count == 0 {
+                break;
+            }
+            entry.pending = true;
+            for evt in batch[..count].iter() {
+                dispatch_event(*evt);
+            }
+            dispatched += count;
+            remaining -= count;
+        }
+        entry.postponed = !entry.queue.is_empty();
+        dispatched
     }
 
     #[inline]
@@ -677,12 +1042,22 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         let application_session_id = *session_ids
             .last()
             .expect("validated App Session policy creates one external Session");
-        let application_session = match self.app.create_app_session(
+        let (tx_evt_q, tx_event_segment, tx_event_offset) =
+            self.app_mq_worker(application).unwrap_or_else(|| {
+                (
+                    Arc::clone(self.app.tx_evt_q()),
+                    self.app.tx_event_segment(),
+                    self.app.tx_event_offset(),
+                )
+            });
+        let application_session = match self.app.create_app_session_with_tx_event(
             allocation_owner,
             Some(application),
             self.session_handle(application_session_id),
             self.app_session_config,
-            Arc::clone(self.app.tx_evt_q()),
+            tx_evt_q,
+            tx_event_segment,
+            tx_event_offset,
         ) {
             Ok(session) => session,
             Err(error) => {
@@ -1108,7 +1483,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     pub fn poll_app(&mut self) -> RuntimeResult<usize> {
         let session_evt_q = Arc::clone(&self.session_evt_q);
         let mut queue_error = None;
-        let handled = self.app.drain_tx_events_to(|evt| {
+        let mut dispatch_event = |evt: SessionEvt| {
             if queue_error.is_some() {
                 return;
             }
@@ -1128,7 +1503,11 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             if let Err(error) = result {
                 queue_error = Some(error);
             }
-        });
+        };
+        let handled = self
+            .app
+            .drain_tx_events_to(&mut dispatch_event)
+            .saturating_add(self.drain_app_mq_events_to(&mut dispatch_event));
         if let Some(error) = queue_error {
             return Err(AppWorkerError::SessionEventQueue { error }.into());
         }
@@ -1945,6 +2324,8 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             app_rx_events: FifoQueue::with_capacity(pool_capacity),
             control_events: FifoQueue::with_capacity(pool_capacity),
             readiness_file: None,
+            app_rx_mqs: Vec::new(),
+            app_rx_mq_pending: VecDeque::new(),
         }
     }
 }
@@ -2410,7 +2791,9 @@ mod tests {
 
     use hammer_core::data_plane::BufferFrame;
     use hammer_infra::pool::Index;
-    use hammer_runtime::app::AppSessionProtocolRole;
+    use hammer_runtime::app::{
+        AppSessionConfig, AppSessionProtocolRole, SessionEvt, SessionEvtType,
+    };
     use hammer_runtime::attach::AppServer;
     use hammer_runtime::{
         AttachError, DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, NodeRuntimeData,
@@ -2678,6 +3061,140 @@ mod tests {
         assert_eq!(worker.session_work.capacity(), 7);
         assert_eq!(worker.session_work_scratch.capacity(), 7);
     }
+
+    #[test]
+    fn local_per_app_mq_event_is_drained_by_owning_worker() {
+        let applications = ApplicationMain::new(1);
+        let application = applications
+            .attach_local_for_test(1, 128)
+            .expect("attach local Application with MQs");
+        let mut runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default())
+            .for_worker(1, 0)
+            .expect("worker runtime");
+        let mut sessions = SessionWorker::<Index>::with_application_main(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications.clone(),
+        )
+        .expect("Session worker");
+        let queue = applications
+            .mq_worker(application, DataWorkerId::new(0))
+            .expect("per-Application MQ")
+            .0;
+        sessions
+            .install_app_mq(
+                application,
+                queue.clone(),
+                hammer_core::data_plane::NodeId::new(0),
+                &mut runtime,
+            )
+            .expect("install per-Application MQ");
+
+        queue
+            .enqueue_ctrl(SessionEvt::ctrl(1, 0, SessionEvtType::Close))
+            .expect("enqueue app-to-session event");
+        assert!(sessions.mark_app_mq_pending(application));
+
+        let handled = sessions.poll_app().expect("drain per-Application MQ");
+        assert_eq!(handled, 1);
+    }
+
+    #[test]
+    fn app_mq_pending_is_idempotent_and_requires_non_empty_queue() {
+        let applications = ApplicationMain::new(1);
+        let application = applications
+            .attach_local_for_test(1, 128)
+            .expect("attach local Application with MQs");
+        let mut runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default())
+            .for_worker(1, 0)
+            .expect("worker runtime");
+        let mut sessions = SessionWorker::<Index>::with_application_main(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications.clone(),
+        )
+        .expect("Session worker");
+        let queue = applications
+            .mq_worker(application, DataWorkerId::new(0))
+            .expect("per-Application MQ")
+            .0;
+        sessions
+            .install_app_mq(
+                application,
+                queue.clone(),
+                hammer_core::data_plane::NodeId::new(0),
+                &mut runtime,
+            )
+            .expect("install per-Application MQ");
+
+        assert!(!sessions.mark_app_mq_pending(application));
+        queue
+            .enqueue_io(SessionEvt::io(1, SessionEvtType::TxEnq))
+            .expect("enqueue app-to-session event");
+        assert!(sessions.mark_app_mq_pending(application));
+        assert!(!sessions.mark_app_mq_pending(application));
+
+        assert_eq!(
+            sessions
+                .drain_app_mq(application)
+                .expect("drain pending Application MQ"),
+            1
+        );
+        assert!(!sessions.mark_app_mq_pending(application));
+    }
+
+    #[test]
+    fn app_mq_drain_uses_snapshot_and_readds_postponed_work() {
+        let applications = ApplicationMain::new(1);
+        let application = applications
+            .attach_local_for_test(1, 128)
+            .expect("attach local Application with MQs");
+        let mut runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default())
+            .for_worker(1, 0)
+            .expect("worker runtime");
+        let mut sessions = SessionWorker::<Index>::with_application_main(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications.clone(),
+        )
+        .expect("Session worker");
+        let queue = applications
+            .mq_worker(application, DataWorkerId::new(0))
+            .expect("per-Application MQ")
+            .0;
+        sessions
+            .install_app_mq(
+                application,
+                queue.clone(),
+                hammer_core::data_plane::NodeId::new(0),
+                &mut runtime,
+            )
+            .expect("install per-Application MQ");
+        queue
+            .enqueue_io(SessionEvt::io(1, SessionEvtType::TxEnq))
+            .expect("enqueue first event");
+        assert!(sessions.mark_app_mq_pending(application));
+
+        let mut dispatched = 0usize;
+        let handled = sessions.drain_app_mq_events_to(|_| {
+            dispatched += 1;
+            if dispatched == 1 {
+                queue
+                    .enqueue_io(SessionEvt::io(1, SessionEvtType::TxDeq))
+                    .expect("enqueue second event during snapshot drain");
+            }
+        });
+
+        assert_eq!(handled, 1);
+        assert_eq!(dispatched, 1);
+        assert!(sessions.app_rx_mq_pending.contains(&application));
+    }
 }
 
 fn schedule_app_session_input(
@@ -2686,5 +3203,24 @@ fn schedule_app_session_input(
 ) -> RuntimeResult<()> {
     let node = hammer_core::data_plane::NodeId::new(file.private_data() as u32);
     let _ = graph.mark_interrupt_pending(node)?;
+    Ok(())
+}
+
+fn schedule_app_mq_pending(
+    graph: &hammer_runtime::NodeRuntime,
+    file: &mut File,
+) -> RuntimeResult<()> {
+    // SAFETY: the entry is boxed and owned by this worker's SessionWorker for
+    // the File lifetime; FileMain deletes this File before the box is dropped.
+    let entry = unsafe { &mut *(file.private_data() as usize as *mut AppRxMqEntry) };
+    if entry.pending || entry.queue.is_empty() {
+        return Ok(());
+    }
+    entry.pending = true;
+    // SAFETY: the pending queue belongs to the same worker that owns this
+    // File/entry, and FileMain deletes the File before the queue is dropped.
+    let pending_queue = unsafe { &mut *(entry.pending_queue as *mut VecDeque<ApplicationId>) };
+    pending_queue.push_back(entry.application);
+    let _ = graph.mark_interrupt_pending(entry.appsl_input_node)?;
     Ok(())
 }

@@ -261,6 +261,12 @@ impl SessionMsgQueue {
             signal_write: None,
         })
     }
+
+    /// Number of queued events, matching VPP `svm_msg_q_size`.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
 }
 
 impl SessionMsgQueue {

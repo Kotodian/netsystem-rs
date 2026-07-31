@@ -52,6 +52,7 @@ pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
 
                     let numa_node = worker_config.apply_current_thread_setup(worker.slot())?;
                     let mut engine = worker_seed.spawn_on_numa(thread_index, numa_node, handoff)?;
+                    engine.install_current();
                     spawn::set_data_plane_runtime(engine.runtime.clone());
                     spawn::apply_worker_idle_slice(worker_config.idle_slice);
                     crate::init::run_worker_init_functions(&mut engine)?;
