@@ -416,10 +416,8 @@ impl SessionMain {
         self: &Arc<Self>,
         engine: &Engine,
         application: ApplicationId,
-    ) {
-        if let Err(error) = self.remove_application_mqs(engine, application) {
-            tracing::error!(%error, ?application, "failed to remove per-Application MQ registrations");
-        }
+    ) -> RuntimeResult<()> {
+        self.remove_application_mqs(engine, application)?;
         let listeners = {
             // SAFETY: this call runs on the Main Thread. Listener removal
             // below stops Data Workers through the same barrier as publish.
@@ -432,8 +430,7 @@ impl SessionMain {
                 .collect::<Vec<_>>()
         };
         for listener in listeners {
-            self.unlisten(listener)
-                .expect("detached Application listener is removed before worker cleanup");
+            self.unlisten(listener)?;
         }
         for worker_slot in 0..self.workers.len() {
             let worker = DataWorkerId::new(worker_slot as u32);
@@ -455,15 +452,12 @@ impl SessionMain {
                     Err(
                         RuntimeError::WorkerControlUnavailable { .. }
                         | RuntimeError::WorkerControlClosed { .. },
-                    ) => break,
-                    Err(error) => {
-                        panic!(
-                            "Application detach could not notify Session worker {worker_slot}: {error}"
-                        );
-                    }
+                    ) => return Err(RuntimeError::WorkerControlClosed { worker }),
+                    Err(error) => return Err(error),
                 }
             }
         }
+        Ok(())
     }
 
     pub fn install_application_mqs(
@@ -529,11 +523,7 @@ impl SessionMain {
                                 .ok_or(RuntimeError::WorkerControlRequiresMainEngine)?
                             })
                         {
-                            tracing::error!(
-                                %rollback_error,
-                                worker = installed_worker,
-                                "per-Application MQ attach rollback failed"
-                            );
+                            return Err(rollback_error);
                         }
                     }
                     return Err(error);
@@ -548,10 +538,11 @@ impl SessionMain {
         engine: &Engine,
         application: ApplicationId,
     ) -> RuntimeResult<()> {
+        let mut first_error = None;
         for worker_slot in 0..self.workers.len() {
             let worker = DataWorkerId::new(worker_slot as u32);
             let main = Arc::clone(self);
-            schedule_worker_task(engine, worker, move || {
+            if let Err(error) = schedule_worker_task(engine, worker, move || {
                 Engine::with_current(|engine| {
                     let runtime = &mut engine.runtime;
                     main.worker(worker)?
@@ -567,7 +558,12 @@ impl SessionMain {
                         })?
                 })
                 .ok_or(RuntimeError::WorkerControlRequiresMainEngine)?
-            })?;
+            }) {
+                first_error.get_or_insert(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(())
     }
@@ -782,7 +778,13 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
                 .retain(|candidate| *candidate != application);
         }
         if let Some(file) = entry.file {
-            runtime.file_main_mut().delete(file)?;
+            if let Err(error) = runtime.file_main_mut().delete(file) {
+                if entry.pending {
+                    self.app_rx_mq_pending.push_back(application);
+                }
+                self.app_rx_mqs[slot] = Some(entry);
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -811,6 +813,10 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             .and_then(|applications| applications.mq_worker(application, self.worker))
     }
 
+    pub(crate) fn has_pending_app_mqs(&self) -> bool {
+        !self.app_rx_mq_pending.is_empty()
+    }
+
     fn drain_app_mq_events_to(&mut self, mut dispatch_event: impl FnMut(SessionEvt)) -> usize {
         let mut dispatched = 0usize;
         let mut batch = [SessionEvt::io(0, SessionEvtType::Connect); 64];
@@ -826,7 +832,10 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             if entry.application != application || !entry.pending {
                 continue;
             }
-            entry.queue.drain();
+            let was_postponed = entry.postponed;
+            if !was_postponed {
+                entry.queue.drain();
+            }
             let snapshot = entry.queue.len();
             let mut remaining = snapshot;
             entry.postponed = false;
@@ -3194,6 +3203,7 @@ mod tests {
         assert_eq!(handled, 1);
         assert_eq!(dispatched, 1);
         assert!(sessions.app_rx_mq_pending.contains(&application));
+        assert!(sessions.has_pending_app_mqs());
     }
 }
 
