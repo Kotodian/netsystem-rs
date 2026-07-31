@@ -161,6 +161,7 @@ pub(crate) fn publish_tcp_connection(
         }
     };
     if close {
+        let close_reason = tcp.connection(index).and_then(TcpConnection::close_reason);
         if initial {
             let error = TcpError::ConnectionClosed.into();
             if let Err(cleanup_error) = rollback(sessions, tcp) {
@@ -172,7 +173,11 @@ pub(crate) fn publish_tcp_connection(
             }
             return Err(error);
         }
-        sessions.notify_transport_closed(session_id, index)?;
+        if close_reason == Some(TcpCloseReason::RemoteReset) {
+            sessions.notify_transport_reset(session_id, index)?;
+        } else {
+            sessions.notify_transport_closed(session_id, index)?;
+        }
         let _ = tcp.remove_connection(index);
         sessions.notify_transport_deleted(session_id, index)?;
     } else if initial {

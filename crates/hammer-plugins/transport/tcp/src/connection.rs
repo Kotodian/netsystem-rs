@@ -1744,10 +1744,10 @@ impl TcpConnection {
         } else {
             self.observe_activity(index, timers, now)?;
         }
-        self.receive_fin_in_established(packet)
+        Ok(None)
     }
 
-    fn receive_fin_in_established(
+    pub(super) fn process_fin_after_payload(
         &mut self,
         packet: &TcpPacket,
     ) -> RuntimeResult<Option<TcpSegment>> {
@@ -2521,6 +2521,11 @@ impl TcpConnection {
                 fast_open: false,
             },
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_peer_window_for_test(&mut self, window: u32) {
+        self.snd_wnd = window;
     }
 
     #[cfg(test)]
@@ -4980,8 +4985,11 @@ mod tests {
         let now = Instant::now();
         let worker = tcp;
         let connection = worker.connections.get_mut(index).expect("connection");
-        let segment = connection
+        let _ = connection
             .receive_established_with_timers(index, &mut worker.timers, &packet, now)
+            .expect("process established segment");
+        let segment = connection
+            .process_fin_after_payload(&packet)
             .expect("receive peer fin");
         assert!(
             segment.is_some(),
@@ -5006,8 +5014,11 @@ mod tests {
         let now = Instant::now();
         let worker = &mut tcp;
         let connection = worker.connections.get_mut(index).expect("connection");
-        let segment = connection
+        let _ = connection
             .receive_established_with_timers(index, &mut worker.timers, &packet, now)
+            .expect("process established segment");
+        let segment = connection
+            .process_fin_after_payload(&packet)
             .expect("receive peer fin");
 
         let segment = segment.expect("ack segment");

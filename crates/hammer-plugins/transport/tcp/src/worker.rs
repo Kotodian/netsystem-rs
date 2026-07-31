@@ -99,8 +99,13 @@ impl TcpWorker {
         if connection.state() != TcpState::Closed {
             return Ok(());
         }
+        let close_reason = connection.close_reason();
         let session_id = connection.session_id();
-        sessions.notify_transport_closed(session_id, index)?;
+        if close_reason == Some(crate::TcpCloseReason::RemoteReset) {
+            sessions.notify_transport_reset(session_id, index)?;
+        } else {
+            sessions.notify_transport_closed(session_id, index)?;
+        }
         self.lookup.forget_session(session_id);
         self.lookup.forget_pending_open(session_id);
         let _ = self.connections.remove(index);
@@ -322,11 +327,16 @@ impl SessionPacketizedTransport<Index> for TcpWorker {
             .unwrap_or_default();
         let snd_space =
             connection.tx_payload_budget(pending_len.saturating_sub(tx_offset), now, capabilities);
+        let flags = if snd_space == 0 {
+            TransportSendFlags::DESCHED
+        } else {
+            TransportSendFlags::default()
+        };
         Ok(TransportSendParams {
             snd_space,
             tx_offset,
             send_goal_size: connection.send_goal_size(),
-            flags: TransportSendFlags::default(),
+            flags,
         })
     }
 

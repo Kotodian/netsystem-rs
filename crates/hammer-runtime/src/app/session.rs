@@ -248,12 +248,43 @@ impl AppSession {
     /// Used by session runtime on RX enqueue / connect / close.
     ///
     /// IO events (`RxEnq`, `TxDeq`, `TxEnq`) carry session index only. `RxDeq`
-    /// is app-to-session only and `ProtocolOutput` is Session-internal; both are
-    /// rejected here. Control events (`Connect` / `Close`) carry the full
-    /// Session Handle, matching VPP `session_event_t` identity rules.
+    /// is app-to-session only, `ProtocolOutput` is Session-internal, and
+    /// `Close`/`HalfClose` are app-to-session controls; these are rejected
+    /// here. Session-to-app control events (`Connect`, `Reset`, `Disconnected`,
+    /// `TransportClosed`) carry the full Session Handle, matching VPP
+    /// `session_event_t` identity rules.
     #[inline]
     pub fn push_event(&self, evt_type: SessionEvtType) -> Result<(), AppSessionError> {
         self.push_event_with_flags(evt_type, SessionEvtFlags::empty())
+    }
+
+    /// App-side control: close the write half of the session.
+    ///
+    /// The request is posted to the app-to-session control lane. It does not
+    /// close the RX side; the application may continue receiving until the
+    /// transport reports closure.
+    #[inline]
+    pub fn half_close(&self) -> Result<(), AppSessionError> {
+        self.enqueue_app_control(SessionEvtType::HalfClose)
+    }
+
+    /// App-side control: request full session closure.
+    #[inline]
+    pub fn close(&self) -> Result<(), AppSessionError> {
+        self.enqueue_app_control(SessionEvtType::Close)
+    }
+
+    fn enqueue_app_control(&self, evt_type: SessionEvtType) -> Result<(), AppSessionError> {
+        let evt = SessionEvt::ctrl(
+            self.handle.session_index(),
+            self.handle.worker_index(),
+            evt_type,
+        );
+        self.tx_evt_q
+            .enqueue_ctrl(evt)
+            .map_err(|_| AppSessionError::TxEventQueueFull {
+                session: self.handle.raw(),
+            })
     }
 
     #[inline]
@@ -272,13 +303,19 @@ impl AppSession {
                         event: evt_type,
                     })?;
             }
+            SessionEvtType::Close | SessionEvtType::HalfClose => {
+                panic!("Close and HalfClose are app-to-session control events")
+            }
             SessionEvtType::RxDeq => {
                 panic!("RxDeq is an app-to-session event")
             }
             SessionEvtType::ProtocolOutput => {
                 panic!("ProtocolOutput is a Session-internal event")
             }
-            SessionEvtType::Connect | SessionEvtType::Close => {
+            SessionEvtType::Connect
+            | SessionEvtType::Reset
+            | SessionEvtType::Disconnected
+            | SessionEvtType::TransportClosed => {
                 let evt = SessionEvt::ctrl(
                     self.handle.session_index(),
                     self.handle.worker_index(),
@@ -767,7 +804,29 @@ mod tests {
     }
 
     #[test]
-    fn app_session_close_event_carries_session_handle() {
+    fn app_session_half_close_posts_control_event_to_worker_queue() {
+        let session = new_session(AppSessionConfig::new(64, 4), 3);
+        session.half_close().expect("half close");
+
+        let event = session.tx_evt_q().dequeue().expect("half close event");
+        assert_eq!(event.evt_type, SessionEvtType::HalfClose);
+        assert_eq!(event.session_index(), 3);
+        assert_eq!(event.worker_index(), 0);
+    }
+
+    #[test]
+    fn app_session_close_posts_control_event_to_worker_queue() {
+        let session = new_session(AppSessionConfig::new(64, 4), 3);
+        session.close().expect("close");
+
+        let event = session.tx_evt_q().dequeue().expect("close event");
+        assert_eq!(event.evt_type, SessionEvtType::Close);
+        assert_eq!(event.session_index(), 3);
+        assert_eq!(event.worker_index(), 0);
+    }
+
+    #[test]
+    fn app_session_disconnected_event_carries_session_handle() {
         let handle = SessionHandle::new(11, 7);
         let tx_evt_q: Arc<SessionMsgQueue> =
             Arc::new(SessionMsgQueue::with_cfg(64, 64).expect("tx_evt_q"));
@@ -779,11 +838,11 @@ mod tests {
         )
         .expect("session");
         session
-            .push_event(SessionEvtType::Close)
-            .expect("push close");
+            .push_event(SessionEvtType::Disconnected)
+            .expect("push disconnected");
         let mut out = [SessionEvt::io(0, SessionEvtType::RxEnq)];
         assert_eq!(session.poll_events(&mut out), 1);
-        assert_eq!(out[0].evt_type, SessionEvtType::Close);
+        assert_eq!(out[0].evt_type, SessionEvtType::Disconnected);
         assert_eq!(out[0].session_index(), 11);
         assert_eq!(out[0].worker_index(), 7);
     }
@@ -826,8 +885,8 @@ mod tests {
         session.send_bytes(b"x").expect("send");
         session.enqueue_rx(b"y").expect("enqueue rx");
         session
-            .push_event(SessionEvtType::Close)
-            .expect("push close");
+            .push_event(SessionEvtType::Disconnected)
+            .expect("push disconnected");
         session.clear();
         assert!(session.rx_fifo().is_empty());
         assert!(session.tx_fifo().is_empty());
