@@ -213,7 +213,6 @@ impl ApplicationMain {
         policy: &AppSessionPolicy,
     ) -> Result<ApplicationConnectionId, ApplicationError> {
         self.ensure_active(application)?;
-        self.reap_connections()?;
         let protocols = self.resolve_policy(policy)?;
         let connection = ApplicationConnection {
             application,
@@ -289,6 +288,36 @@ impl ApplicationMain {
                 .connections
                 .remove(application_connection_index(connection))
                 .expect("validated Application connection remains present until removal");
+            Ok(())
+        })?
+    }
+
+    pub(crate) fn reclaim_connection(
+        &self,
+        application: ApplicationId,
+        connection: ApplicationConnectionId,
+    ) -> Result<(), ApplicationError> {
+        self.ensure_active(application)?;
+        self.with_state_mut(|state| {
+            let entry = state
+                .connections
+                .get(application_connection_index(connection))
+                .ok_or(ApplicationError::ConnectionMissing { connection })?;
+            if entry.application != application {
+                return Err(ApplicationError::ConnectionNotOwned {
+                    application,
+                    connection,
+                });
+            }
+            if entry.completion.load(Ordering::Acquire) != CONNECTION_COMPLETED {
+                return Err(ApplicationError::ConnectionNotCompleted { connection });
+            }
+            state
+                .connections
+                .remove(application_connection_index(connection))
+                .expect(
+                    "validated completed Application connection remains present until reclamation",
+                );
             Ok(())
         })?
     }
@@ -382,25 +411,6 @@ impl ApplicationMain {
         } else {
             Err(ApplicationError::Missing { application })
         }
-    }
-
-    fn reap_connections(&self) -> Result<(), ApplicationError> {
-        self.with_state_mut(|state| {
-            let completed = state
-                .connections
-                .iter()
-                .filter_map(|(index, connection)| {
-                    (connection.completion.load(Ordering::Acquire) == CONNECTION_COMPLETED)
-                        .then_some(index)
-                })
-                .collect::<Vec<_>>();
-            for index in completed {
-                state
-                    .connections
-                    .remove(index)
-                    .expect("completed Application connection remains present until reap");
-            }
-        })
     }
 
     fn state(&self) -> Result<&ApplicationState, ApplicationError> {
@@ -509,6 +519,8 @@ pub enum ApplicationError {
     },
     #[error("Application connection {connection:?} was already completed")]
     ConnectionAlreadyCompleted { connection: ApplicationConnectionId },
+    #[error("Application connection {connection:?} is not completed")]
+    ConnectionNotCompleted { connection: ApplicationConnectionId },
 }
 
 #[inline]
@@ -560,4 +572,131 @@ fn unique_protocol(
     found.ok_or_else(|| ApplicationError::ProtocolMissing {
         protocol: name.to_owned(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use hammer_runtime::app::{APP_SESSION_POLICY_VERSION, AppSessionPolicy};
+
+    use super::{ApplicationConnectionId, ApplicationError, ApplicationId, ApplicationMain};
+
+    fn policy() -> AppSessionPolicy {
+        AppSessionPolicy::new(APP_SESSION_POLICY_VERSION, []).expect("direct App Session policy")
+    }
+
+    fn register_connection(
+        main: &ApplicationMain,
+        application: ApplicationId,
+    ) -> ApplicationConnectionId {
+        main.register_connection(application, None, &policy())
+            .expect("register Application connection")
+    }
+
+    #[test]
+    fn completed_connection_reclaims_exact_identity_without_later_connect() {
+        let main = ApplicationMain::new(1);
+        let application = main.attach().expect("attach Application");
+        let connection = register_connection(&main, application);
+
+        main.complete_connection(connection)
+            .expect("complete Application connection");
+        main.reclaim_connection(application, connection)
+            .expect("reclaim completed Application connection");
+
+        assert_eq!(
+            main.state()
+                .expect("read Application state")
+                .connections
+                .len(),
+            0
+        );
+        let replacement = register_connection(&main, application);
+        assert_ne!(connection, replacement);
+    }
+
+    #[test]
+    fn reclamation_uses_exact_completion_identity_in_any_order() {
+        let main = ApplicationMain::new(4);
+        let application = main.attach().expect("attach Application");
+        let first = register_connection(&main, application);
+        let second = register_connection(&main, application);
+
+        main.complete_connection(second)
+            .expect("complete second Application connection");
+        main.complete_connection(first)
+            .expect("complete first Application connection");
+        main.reclaim_connection(application, second)
+            .expect("reclaim second Application connection");
+        main.reclaim_connection(application, first)
+            .expect("reclaim first Application connection");
+
+        assert_eq!(
+            main.state()
+                .expect("read Application state")
+                .connections
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn pending_connection_is_not_reclaimed() {
+        let main = ApplicationMain::new(1);
+        let application = main.attach().expect("attach Application");
+        let connection = register_connection(&main, application);
+
+        let error = main
+            .reclaim_connection(application, connection)
+            .expect_err("pending Application connection is not reclaimable");
+        assert!(matches!(
+            error,
+            ApplicationError::ConnectionNotCompleted { connection: rejected }
+                if rejected == connection
+        ));
+    }
+
+    #[test]
+    fn stale_connection_identity_cannot_reclaim_replacement() {
+        let main = ApplicationMain::new(1);
+        let application = main.attach().expect("attach Application");
+        let first = register_connection(&main, application);
+
+        main.complete_connection(first)
+            .expect("complete first Application connection");
+        main.reclaim_connection(application, first)
+            .expect("reclaim first Application connection");
+        let replacement = register_connection(&main, application);
+        assert_ne!(first, replacement);
+
+        let error = main
+            .reclaim_connection(application, first)
+            .expect_err("stale Application connection identity is rejected");
+        assert!(matches!(
+            error,
+            ApplicationError::ConnectionMissing { connection: rejected }
+                if rejected == first
+        ));
+    }
+
+    #[test]
+    fn detach_removes_pending_and_completed_connections() {
+        let main = ApplicationMain::new(2);
+        let application = main.attach().expect("attach Application");
+        let pending = register_connection(&main, application);
+        let completed = register_connection(&main, application);
+
+        main.complete_connection(completed)
+            .expect("complete Application connection");
+        main.detach(application)
+            .expect("detach Application with pending and completed connections");
+
+        let state = main.state().expect("read Application state");
+        assert!(state.applications.is_empty());
+        assert!(state.connections.is_empty());
+        assert!(matches!(
+            main.reclaim_connection(application, pending),
+            Err(ApplicationError::Missing { application: missing })
+                if missing == application
+        ));
+    }
 }

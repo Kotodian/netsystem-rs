@@ -60,6 +60,7 @@ pub enum ApplicationSessionStatus {
     ConnectionMissing,
     ConnectionNotOwned,
     ConnectionAlreadyCompleted,
+    ConnectionNotCompleted,
     TransportListenUnsupported,
     TransportListenFailed,
     TransportUnlistenFailed,

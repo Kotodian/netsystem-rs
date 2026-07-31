@@ -106,7 +106,12 @@ impl SessionMain {
             .register_connection(application, server_name, policy)
             .map_err(application_status)?;
         match self.connect(application_connection, transport, endpoint) {
-            Ok(_) => Ok(application_connection.raw()),
+            Ok(_) => {
+                self.applications()
+                    .reclaim_connection(application, application_connection)
+                    .expect("completed Session connect leaves its Application connection available for reclamation");
+                Ok(application_connection.raw())
+            }
             Err(_) => {
                 self.applications()
                     .remove_connection(application, application_connection)
@@ -184,6 +189,9 @@ fn application_status(error: ApplicationError) -> ApplicationSessionStatus {
         ApplicationError::ConnectionNotOwned { .. } => ApplicationSessionStatus::ConnectionNotOwned,
         ApplicationError::ConnectionAlreadyCompleted { .. } => {
             ApplicationSessionStatus::ConnectionAlreadyCompleted
+        }
+        ApplicationError::ConnectionNotCompleted { .. } => {
+            ApplicationSessionStatus::ConnectionNotCompleted
         }
     }
 }
