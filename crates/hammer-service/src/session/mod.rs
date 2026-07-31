@@ -20,7 +20,9 @@ pub mod runtime;
 pub mod state;
 
 pub use app::AppWorker;
-pub use application::{ApplicationError, ApplicationMain, ApplicationRegistration};
+pub use application::{
+    ApplicationError, ApplicationMain, ApplicationMqResources, ApplicationRegistration,
+};
 pub use config::Session;
 pub use error::SessionQueueError;
 pub use hammer_runtime::app::AppSessionProtocol;
@@ -49,6 +51,7 @@ fn init_session(
     applications: Arc<ApplicationMain>,
     session: Arc<Session>,
 ) -> RuntimeResult<Arc<runtime::SessionMain>> {
+    engine.registry.set(Arc::clone(&session));
     Ok(Arc::new(runtime::SessionMain::with_pool_capacity(
         engine.configured_worker_count(),
         applications,

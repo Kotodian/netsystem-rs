@@ -340,6 +340,18 @@ impl AppWorker {
         &self.tx_evt_q
     }
 
+    pub(crate) fn tx_event_segment(&self) -> Option<Segment> {
+        self.attach
+            .as_ref()
+            .map(|attach| attach.tx_event_segment.clone())
+    }
+
+    pub(crate) fn tx_event_offset(&self) -> u64 {
+        self.attach
+            .as_ref()
+            .map_or(0, |attach| attach.tx_event_offset)
+    }
+
     pub(crate) fn attach_session(&mut self, session_id: SessionId, app_session: Arc<AppSession>) {
         let slot = session_id.pool_index().slot() as usize;
         self.session_slots[slot] = Some(SessionSlot {
@@ -655,6 +667,7 @@ mod tests {
 }
 
 impl AppWorker {
+    #[cfg(test)]
     pub(crate) fn create_app_session(
         &mut self,
         allocation_owner: u64,
@@ -663,14 +676,32 @@ impl AppWorker {
         config: AppSessionConfig,
         tx_evt_q: Arc<SessionMsgQueue>,
     ) -> RuntimeResult<Arc<AppSession>> {
+        let attach = self.attach.as_ref();
+        self.create_app_session_with_tx_event(
+            allocation_owner,
+            application,
+            handle,
+            config,
+            tx_evt_q,
+            attach.map(|attach| attach.tx_event_segment.clone()),
+            attach.map_or(0, |attach| attach.tx_event_offset),
+        )
+    }
+
+    pub(crate) fn create_app_session_with_tx_event(
+        &mut self,
+        allocation_owner: u64,
+        application: Option<ApplicationId>,
+        handle: SessionHandle,
+        config: AppSessionConfig,
+        tx_evt_q: Arc<SessionMsgQueue>,
+        tx_event_segment: Option<Segment>,
+        tx_event_offset: u64,
+    ) -> RuntimeResult<Arc<AppSession>> {
         let shared_name_prefix = self
             .attach
             .as_ref()
             .map(|_| format!("hammer-session-w{}-o{allocation_owner}", self.worker_index));
-        let tx_event_offset = self
-            .attach
-            .as_ref()
-            .map_or(0, |attach| attach.tx_event_offset);
         let created = self
             .segments_by_owner
             .entry(allocation_owner)
@@ -681,11 +712,13 @@ impl AppWorker {
             self.attach_slots.resize_with(slot + 1, AttachSlot::default);
         }
         let publication = if let (Some(attach), Some(application)) = (&self.attach, application) {
+            let tx_event_segment =
+                tx_event_segment.unwrap_or_else(|| attach.tx_event_segment.clone());
             match AppSessionPublication::new(
                 Arc::clone(&created.session),
                 application,
                 created.segment,
-                attach.tx_event_segment.clone(),
+                tx_event_segment,
                 created.offsets,
             ) {
                 Ok(publication) => Some(publication),

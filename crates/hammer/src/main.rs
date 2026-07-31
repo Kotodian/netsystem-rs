@@ -218,7 +218,7 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
                 tokio::select! {
                     () = ipc_loop::clnt_loop(listener) => {}
                     result = attach.serve(
-                        move || attach_applications.attach(),
+                        move || attach_applications.attach_external_with_runtime(),
                         move |application, requests, replies| {
                             control_sessions.dispatch_application_session_mq(
                                 application,
@@ -258,7 +258,7 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
                 tokio::select! {
                     () = ipc_loop::clnt_loop(listener) => {}
                     result = attach.serve(
-                        move || attach_applications.attach(),
+                        move || attach_applications.attach_external_with_runtime(),
                         move |application, requests, replies| {
                             control_sessions.dispatch_application_session_mq(
                                 application,

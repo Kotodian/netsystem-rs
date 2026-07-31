@@ -4,6 +4,8 @@ use hammer_runtime::{RuntimeError, RuntimeResult};
 
 const SESSION_POOL_CAPACITY: usize = 1_024;
 const APP_SESSION_CAPACITY: usize = 1_024;
+const APP_MQ_CAPACITY: usize = 2_048;
+const APP_MQ_CAPACITY_MIN: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
@@ -13,6 +15,8 @@ pub struct Session {
     #[serde(alias = "preallocated_sessions")]
     pub pool_capacity: usize,
     pub app_session_capacity: usize,
+    #[serde(default)]
+    pub app_mq_capacity: usize,
 }
 
 impl Default for Session {
@@ -21,6 +25,7 @@ impl Default for Session {
             attach_socket_path: None,
             pool_capacity: SESSION_POOL_CAPACITY,
             app_session_capacity: APP_SESSION_CAPACITY,
+            app_mq_capacity: APP_MQ_CAPACITY,
         }
     }
 }
@@ -37,7 +42,47 @@ impl Session {
                 "network.session.app_session_capacity must be non-zero",
             ));
         }
+        if self.app_mq_capacity < APP_MQ_CAPACITY_MIN {
+            return Err(RuntimeError::config_validation(
+                "network.session.app_mq_capacity must be at least 128",
+            ));
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Session;
+
+    #[test]
+    fn app_mq_capacity_defaults_to_2048() {
+        let session = Session::default();
+        assert_eq!(session.app_mq_capacity, 2048);
+    }
+
+    #[test]
+    fn app_mq_capacity_parses_explicit_value() {
+        let session: Session = toml::from_str(
+            r#"
+                app_mq_capacity = 256
+            "#,
+        )
+        .expect("valid session config");
+        assert_eq!(session.app_mq_capacity, 256);
+    }
+
+    #[test]
+    fn app_mq_capacity_rejects_values_below_128() {
+        let session = Session {
+            app_mq_capacity: 64,
+            ..Session::default()
+        };
+        let error = session
+            .validate()
+            .expect_err("small MQ capacity is invalid");
+        let display = error.to_string();
+        assert!(display.contains("app_mq_capacity"));
     }
 }
 

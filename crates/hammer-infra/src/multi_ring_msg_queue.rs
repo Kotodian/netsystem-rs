@@ -266,6 +266,15 @@ impl MultiRingMsgQueue {
         hdr.q_head.load(Ordering::Acquire) == hdr.q_tail.load(Ordering::Acquire)
     }
 
+    /// Number of queued messages, matching VPP `svm_msg_q_size`.
+    #[inline]
+    pub fn len(&self) -> usize {
+        let hdr = unsafe { &*self.hdr };
+        hdr.q_tail
+            .load(Ordering::Acquire)
+            .wrapping_sub(hdr.q_head.load(Ordering::Acquire)) as usize
+    }
+
     #[inline]
     pub fn ring_element_size(&self, ring: u32) -> Option<usize> {
         self.rings

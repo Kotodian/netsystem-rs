@@ -12,6 +12,23 @@ use crate::session::runtime::SessionMain;
 /// Shared Session Queue IO allowance for normal and custom TX in one dispatch.
 pub const SESSION_QUEUE_IO_BUDGET: usize = 128;
 
+/// Per-node error counters for `appsl-rx-mqs-input`.
+///
+/// This mirrors VPP's `vlib_node_increment_counter` error table; node
+/// statistics expose the counter by `code`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum AppSessionInputError {
+    DispatchFailed = 0,
+}
+
+impl AppSessionInputError {
+    #[inline(always)]
+    pub const fn code(self) -> u16 {
+        self as u16
+    }
+}
+
 #[hammer_component_macros::graph_node(
     graph = session,
     init = crate::session::node::register_app_session_input_node,
@@ -80,7 +97,7 @@ fn app_session_input_node_process(
         Ok::<(), RuntimeError>(())
     })();
     if result.is_err() {
-        let _ = runtime.record_current_node_error(SessionQueueError::DispatchFailed.code());
+        let _ = runtime.record_current_node_error(AppSessionInputError::DispatchFailed.code());
     }
     NodeResult::drop()
 }
