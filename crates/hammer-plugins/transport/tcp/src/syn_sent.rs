@@ -146,7 +146,7 @@ fn tcp_syn_sent_index(
         let (_, connection_index) = sessions
             .session_transport(session_id)
             .ok_or(TcpNodeError::SynSentSessionMissing)?;
-        let (control, acked_tx_len, established, established_with_payload) = {
+        let (control, acked_tx_len, established_with_payload) = {
             let crate::worker::TcpWorker {
                 connections,
                 lookup,
@@ -173,7 +173,6 @@ fn tcp_syn_sent_index(
             (
                 control,
                 connection.take_acked_tx_len(previous_snd_una),
-                established,
                 previous_state == crate::TcpState::SynSent
                     && established
                     && packet.payload_len != 0,
@@ -203,9 +202,6 @@ fn tcp_syn_sent_index(
             keep_current = false;
         };
         publish_tcp_connection(sessions, tcp, session_id)?;
-        if established {
-            sessions.connected(session_id)?;
-        }
         Ok((keep_current, control))
     })?;
     if let Some(segment) = control_segment {

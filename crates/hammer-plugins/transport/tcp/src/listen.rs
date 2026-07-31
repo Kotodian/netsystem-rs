@@ -501,33 +501,51 @@ impl<'a> TcpListener<'a> {
             None => Err(TcpNodeError::SessionMissing.into()),
         };
         if let Err(error) = attached {
-            self.rollback_session(session_id)?;
+            if let Err(cleanup_error) = self.rollback_session(session_id, connection_index) {
+                tracing::error!(
+                    ?session_id,
+                    %cleanup_error,
+                    "TCP listener Session attachment rollback failed"
+                );
+            }
             self.finish_pending(packet);
             return Err(error);
         }
         self.finish_pending(packet);
-        let result = (|| {
-            let output = prepare(session_id, connection_index, self.sessions, self.tcp)?;
-            publish_tcp_connection(self.sessions, self.tcp, session_id)?;
-            self.sessions.connected(session_id)?;
-            Ok((output, session_id))
-        })();
-        match result {
-            Ok(accepted) => Ok(accepted),
+        let output = match prepare(session_id, connection_index, self.sessions, self.tcp) {
+            Ok(output) => output,
             Err(error) => {
-                self.rollback_session(session_id)?;
-                Err(error)
+                if let Err(cleanup_error) = self.rollback_session(session_id, connection_index) {
+                    tracing::error!(
+                        ?session_id,
+                        %cleanup_error,
+                        "TCP listener Session preparation rollback failed"
+                    );
+                }
+                return Err(error);
             }
-        }
+        };
+        publish_tcp_connection(self.sessions, self.tcp, session_id)?;
+        Ok((output, session_id))
     }
 
-    fn rollback_session(&mut self, session_id: SessionId) -> RuntimeResult<()> {
+    fn rollback_session(
+        &mut self,
+        session_id: SessionId,
+        connection_index: PoolIndex,
+    ) -> RuntimeResult<()> {
         self.tcp.lookup.forget_session(session_id);
         self.tcp.lookup.forget_pending_open(session_id);
-        if let Some(index) = self.sessions.rollback_session_creation(session_id)? {
-            let _ = self.tcp.remove_connection(index);
+        let session_cleanup = self.sessions.rollback_session_creation(session_id);
+        let connection_cleanup = self.tcp.remove_connection(connection_index);
+        match session_cleanup {
+            Err(error) => Err(error),
+            Ok(Some(index)) if index != connection_index => {
+                Err(TcpNodeError::SessionMissing.into())
+            }
+            Ok(_) if connection_cleanup.is_none() => Err(TcpNodeError::SessionMissing.into()),
+            Ok(_) => Ok(()),
         }
-        Ok(())
     }
 
     fn finish_pending(&mut self, packet: &TcpPacket) {
