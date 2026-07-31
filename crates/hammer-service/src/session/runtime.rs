@@ -26,7 +26,7 @@ use hammer_runtime::{
 };
 use hammer_runtime::{DataPlaneRuntime, DataWorkerId, Engine, File, FileFunctions};
 
-use crate::session::app::{AppWorkerAttach, AppWorkerError};
+use crate::session::app::AppWorkerError;
 use crate::session::application::{ApplicationMain, ApplicationMqResources, ApplicationProtocol};
 use crate::session::error::{SessionError, SessionQueueError};
 use crate::session::node::{
@@ -228,10 +228,6 @@ unsafe impl Send for SessionMain {}
 // worker barrier before a Data Worker may observe it.
 unsafe impl Sync for SessionMain {}
 
-fn session_worker_error(error: SessionQueueError) -> RuntimeError {
-    RuntimeError::subsystem("session", error)
-}
-
 #[inline]
 fn session_listener_id(index: PoolIndex) -> SessionListenerId {
     SessionListenerId::new(index.slot(), index.generation())
@@ -382,14 +378,11 @@ impl SessionMain {
         &self,
         worker: DataWorkerId,
     ) -> RuntimeResult<&ThreadOwned<SessionWorker<PoolIndex>>> {
-        self.workers
-            .get(worker.slot())
-            .map(|slot| &**slot)
-            .ok_or_else(|| {
-                session_worker_error(SessionQueueError::WorkerOutOfRange {
-                    worker: worker.slot(),
-                })
-            })
+        Ok(self.workers.get(worker.slot()).map(|slot| &**slot).ok_or(
+            SessionQueueError::WorkerOutOfRange {
+                worker: worker.slot(),
+            },
+        )?)
     }
 
     pub fn with_worker_mut<R>(
@@ -401,14 +394,12 @@ impl SessionMain {
         let worker = thread_index
             .checked_sub(1)
             .map(DataWorkerId::new)
-            .ok_or_else(|| {
-                session_worker_error(SessionQueueError::WorkerUnavailable { thread_index })
-            })?;
+            .ok_or(SessionQueueError::WorkerUnavailable { thread_index })?;
         self.worker(worker)?.with_mut(operation).map_err(|source| {
-            session_worker_error(SessionQueueError::WorkerAccess {
+            SessionQueueError::WorkerAccess {
                 worker: worker.slot(),
                 source,
-            })
+            }
         })?
     }
 
@@ -473,14 +464,12 @@ impl SessionMain {
             .runtime
             .nodes()
             .node_by_name("appsl-rx-mqs-input")
-            .ok_or_else(|| session_worker_error(SessionQueueError::NodeMissing))?;
+            .ok_or(SessionQueueError::NodeMissing)?;
         for worker_slot in 0..resources.worker_count() {
             let worker = DataWorkerId::new(worker_slot as u32);
             let queue = resources
                 .queue(worker)
-                .ok_or_else(|| {
-                    session_worker_error(SessionQueueError::ApplicationMqMissing { application })
-                })?
+                .ok_or(SessionQueueError::ApplicationMqMissing { application })?
                 .clone();
             let main = Arc::clone(self);
             schedule_worker_task(engine, worker, move || {
@@ -490,11 +479,9 @@ impl SessionMain {
                         .with_mut(|sessions| {
                             sessions.install_app_mq(application, queue, app_session_input, runtime)
                         })
-                        .map_err(|source| {
-                            session_worker_error(SessionQueueError::WorkerAccess {
-                                worker: worker.slot(),
-                                source,
-                            })
+                        .map_err(|source| SessionQueueError::WorkerAccess {
+                            worker: worker.slot(),
+                            source,
                         })?
                 })
                 .ok_or(RuntimeError::WorkerControlRequiresMainEngine)?
@@ -520,11 +507,9 @@ impl SessionMain {
                             sessions.drain_app_mq(application)?;
                             sessions.remove_app_mq(application, runtime)
                         })
-                        .map_err(|source| {
-                            session_worker_error(SessionQueueError::WorkerAccess {
-                                worker: worker.slot(),
-                                source,
-                            })
+                        .map_err(|source| SessionQueueError::WorkerAccess {
+                            worker: worker.slot(),
+                            source,
                         })?
                 })
                 .ok_or(RuntimeError::WorkerControlRequiresMainEngine)?
@@ -574,11 +559,10 @@ pub fn install_session_worker(
     let slot = main.worker(worker_id)?;
     if let Err(mut worker) = slot.install(worker) {
         worker.remove_queue_readiness(engine)?;
-        return Err(session_worker_error(
-            SessionQueueError::WorkerAlreadyInstalled {
-                worker: worker_id.slot(),
-            },
-        ));
+        return Err(SessionQueueError::WorkerAlreadyInstalled {
+            worker: worker_id.slot(),
+        }
+        .into());
     }
     Ok(())
 }
@@ -674,9 +658,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             .as_ref()
             .is_some_and(|entry| entry.application == application)
         {
-            return Err(session_worker_error(
-                SessionQueueError::ApplicationMqAlreadyRegistered { application },
-            ));
+            return Err(SessionQueueError::ApplicationMqAlreadyRegistered { application }.into());
         }
         let Some(signal_read_fd) = queue.read_fd() else {
             return Err(AttachError::SessionSignalMissing.into());
@@ -774,13 +756,12 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     }
 
     #[inline]
-    pub(crate) fn app_mq_worker(
-        &self,
-        application: ApplicationId,
-    ) -> Option<(Arc<SessionMsgQueue>, Option<Segment>, u64)> {
-        self.applications
+    pub(crate) fn app_mq_worker(&self, application: ApplicationId) -> Option<Arc<SessionMsgQueue>> {
+        self.app_rx_mqs
+            .get(application.slot() as usize)?
             .as_ref()
-            .and_then(|applications| applications.mq_worker(application, self.worker))
+            .filter(|entry| entry.application == application)
+            .map(|entry| Arc::clone(&entry.queue))
     }
 
     pub(crate) fn has_pending_app_mqs(&self) -> bool {
@@ -1021,22 +1002,22 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         let application_session_id = *session_ids
             .last()
             .expect("validated App Session policy creates one external Session");
-        let (tx_evt_q, tx_event_segment, tx_event_offset) =
-            self.app_mq_worker(application).unwrap_or_else(|| {
-                (
-                    Arc::clone(self.app.tx_evt_q()),
-                    self.app.tx_event_segment(),
-                    self.app.tx_event_offset(),
-                )
-            });
-        let application_session = match self.app.create_app_session_with_tx_event(
+        let tx_evt_q = match self.applications {
+            Some(_) => match self.app_mq_worker(application) {
+                Some(queue) => queue,
+                None => {
+                    self.rollback_stream_sessions(&session_ids, None);
+                    return Err(SessionQueueError::ApplicationMqMissing { application }.into());
+                }
+            },
+            None => Arc::clone(self.app.tx_evt_q()),
+        };
+        let application_session = match self.app.create_app_session(
             allocation_owner,
             Some(application),
             self.session_handle(application_session_id),
             self.app_session_config,
             tx_evt_q,
-            tx_event_segment,
-            tx_event_offset,
         ) {
             Ok(session) => session,
             Err(error) => {
@@ -2225,28 +2206,19 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         let cap = DEFAULT_SESSION_TX_EVENT_CAPACITY.next_power_of_two().max(2) as u32;
         let layout = SessionMsgQueue::layout_bytes(cap, cap.max(2))
             .map_err(|error| AppWorkerError::SessionEventQueue { error })?;
-        let segment = Segment::shared(
-            &format!("hammer-tx-event-w{}", worker.slot()),
+        let segment = Segment::local(
             layout
                 .checked_add(128)
                 .ok_or(AppWorkerError::TxEventQueueLayoutOverflow)?,
-        )
-        .map_err(|source| RuntimeError::subsystem("session", source))?;
+        );
         let offset = segment
             .alloc(layout, 64)
             .ok_or(AppWorkerError::TxEventQueueSegmentExhausted)?;
         let tx_evt_q = Arc::new(
-            unsafe {
-                SessionMsgQueue::init_at_with_signal(segment.clone(), offset, cap, cap.max(2))
-            }
-            .map_err(|error| AppWorkerError::SessionEventQueue { error })?,
+            unsafe { SessionMsgQueue::init_at_with_signal(segment, offset, cap, cap.max(2)) }
+                .map_err(|error| AppWorkerError::SessionEventQueue { error })?,
         );
-        let app = AppWorker::with_attach(
-            pool_capacity,
-            tx_evt_q,
-            worker.slot(),
-            AppWorkerAttach::new(publisher, segment, offset),
-        );
+        let app = AppWorker::with_attach(pool_capacity, tx_evt_q, worker.slot(), publisher);
         let session_evt_q = Arc::new(
             SessionMsgQueue::with_cfg(cap, cap.max(2))
                 .map_err(|error| AppWorkerError::SessionEventQueue { error })?,
@@ -2784,6 +2756,7 @@ mod tests {
         SessionWorker,
     };
     use crate::session::ApplicationMain;
+    use crate::session::application::ApplicationMqResources;
     use crate::session::node::{SessionQueueNode, SessionQueueOutput};
 
     fn test_dispatch(
@@ -2805,6 +2778,11 @@ mod tests {
         let server = AppServer::bind(socket_path, 1).expect("bind App server");
         let applications = ApplicationMain::new(2);
         let application = applications.attach().expect("attach Application");
+        let queue = ApplicationMqResources::create_local(application, 2, 128)
+            .expect("Application MQ resources")
+            .queue(DataWorkerId::new(1))
+            .expect("worker Application MQ")
+            .clone();
         let mut sessions = SessionWorker::<Index>::with_app_session_attach(
             DataWorkerId::new(1),
             2,
@@ -2814,6 +2792,17 @@ mod tests {
             server.publisher(),
         )
         .expect("Session worker with external App publication");
+        let mut runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default())
+            .for_worker(2, 1)
+            .expect("worker runtime");
+        sessions
+            .install_app_mq(
+                application,
+                queue,
+                hammer_core::data_plane::NodeId::new(0),
+                &mut runtime,
+            )
+            .expect("install worker Application MQ");
 
         let first = sessions
             .construct_stream_sessions(
@@ -2864,6 +2853,78 @@ mod tests {
     }
 
     #[test]
+    fn missing_worker_application_mq_rolls_back_session_creation() {
+        let socket_path = std::path::PathBuf::from(format!(
+            "/tmp/hammer-missing-app-mq-{}.sock",
+            std::process::id()
+        ));
+        let socket_path = socket_path.to_str().expect("socket path");
+        let server = AppServer::bind(socket_path, 1).expect("bind App server");
+        let applications = ApplicationMain::new(1);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::with_app_session_attach(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            1,
+            applications,
+            server.publisher(),
+        )
+        .expect("Session worker with external App publication");
+
+        let error = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                AppSessionProtocolRole::Server,
+                &[],
+                None,
+            )
+            .expect_err("missing worker Application MQ rejects Session creation");
+        assert!(matches!(
+            &error,
+            RuntimeError::Subsystem { source, .. }
+                if matches!(
+                    source.downcast_ref::<crate::session::SessionQueueError>(),
+                    Some(crate::session::SessionQueueError::ApplicationMqMissing {
+                        application: missing,
+                    }) if *missing == application
+                )
+        ));
+
+        let queue = ApplicationMqResources::create_local(application, 1, 128)
+            .expect("Application MQ resources")
+            .queue(DataWorkerId::new(0))
+            .expect("worker Application MQ")
+            .clone();
+        let mut runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default())
+            .for_worker(1, 0)
+            .expect("worker runtime");
+        sessions
+            .install_app_mq(
+                application,
+                queue,
+                hammer_core::data_plane::NodeId::new(0),
+                &mut runtime,
+            )
+            .expect("install worker Application MQ");
+
+        sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(2, 1),
+                2,
+                application,
+                AppSessionProtocolRole::Server,
+                &[],
+                None,
+            )
+            .expect("failed creation released Session capacity");
+    }
+
+    #[test]
     fn closed_app_publication_queue_keeps_session_rollback_eligible() {
         let socket_path =
             std::path::PathBuf::from(format!("/tmp/hammer-sp-c-{}.sock", std::process::id()));
@@ -2873,6 +2934,11 @@ mod tests {
         drop(server);
         let applications = ApplicationMain::new(1);
         let application = applications.attach().expect("attach Application");
+        let queue = ApplicationMqResources::create_local(application, 3, 128)
+            .expect("Application MQ resources")
+            .queue(DataWorkerId::new(2))
+            .expect("worker Application MQ")
+            .clone();
         let mut sessions = SessionWorker::<Index>::with_app_session_attach(
             DataWorkerId::new(2),
             3,
@@ -2882,6 +2948,17 @@ mod tests {
             publisher,
         )
         .expect("Session worker with closed external App publication");
+        let mut runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default())
+            .for_worker(3, 2)
+            .expect("worker runtime");
+        sessions
+            .install_app_mq(
+                application,
+                queue,
+                hammer_core::data_plane::NodeId::new(0),
+                &mut runtime,
+            )
+            .expect("install worker Application MQ");
         let connection_index = Index::new(3, 1);
         let session_id = sessions
             .construct_stream_sessions(
@@ -3044,9 +3121,12 @@ mod tests {
     #[test]
     fn local_per_app_mq_event_is_drained_by_owning_worker() {
         let applications = ApplicationMain::new(1);
-        let application = applications
-            .attach_local_for_test(1, 128)
-            .expect("attach local Application with MQs");
+        let application = applications.attach().expect("attach local Application");
+        let queue = ApplicationMqResources::create_local(application, 1, 128)
+            .expect("Application MQ resources")
+            .queue(DataWorkerId::new(0))
+            .expect("per-Application MQ")
+            .clone();
         let mut runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default())
             .for_worker(1, 0)
             .expect("worker runtime");
@@ -3058,10 +3138,6 @@ mod tests {
             applications.clone(),
         )
         .expect("Session worker");
-        let queue = applications
-            .mq_worker(application, DataWorkerId::new(0))
-            .expect("per-Application MQ")
-            .0;
         sessions
             .install_app_mq(
                 application,
@@ -3083,9 +3159,12 @@ mod tests {
     #[test]
     fn app_mq_pending_is_idempotent_and_requires_non_empty_queue() {
         let applications = ApplicationMain::new(1);
-        let application = applications
-            .attach_local_for_test(1, 128)
-            .expect("attach local Application with MQs");
+        let application = applications.attach().expect("attach local Application");
+        let queue = ApplicationMqResources::create_local(application, 1, 128)
+            .expect("Application MQ resources")
+            .queue(DataWorkerId::new(0))
+            .expect("per-Application MQ")
+            .clone();
         let mut runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default())
             .for_worker(1, 0)
             .expect("worker runtime");
@@ -3097,10 +3176,6 @@ mod tests {
             applications.clone(),
         )
         .expect("Session worker");
-        let queue = applications
-            .mq_worker(application, DataWorkerId::new(0))
-            .expect("per-Application MQ")
-            .0;
         sessions
             .install_app_mq(
                 application,
@@ -3129,9 +3204,12 @@ mod tests {
     #[test]
     fn app_mq_drain_uses_snapshot_and_readds_postponed_work() {
         let applications = ApplicationMain::new(1);
-        let application = applications
-            .attach_local_for_test(1, 128)
-            .expect("attach local Application with MQs");
+        let application = applications.attach().expect("attach local Application");
+        let queue = ApplicationMqResources::create_local(application, 1, 128)
+            .expect("Application MQ resources")
+            .queue(DataWorkerId::new(0))
+            .expect("per-Application MQ")
+            .clone();
         let mut runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default())
             .for_worker(1, 0)
             .expect("worker runtime");
@@ -3143,10 +3221,6 @@ mod tests {
             applications.clone(),
         )
         .expect("Session worker");
-        let queue = applications
-            .mq_worker(application, DataWorkerId::new(0))
-            .expect("per-Application MQ")
-            .0;
         sessions
             .install_app_mq(
                 application,

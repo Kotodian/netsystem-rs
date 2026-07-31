@@ -4,6 +4,7 @@ use hammer_runtime::app::{
     AppSession, AppSessionConfig, SessionEvt, SessionEvtType, SessionHandle, SessionMsgQueue,
     SessionOffsets,
 };
+use std::sync::Arc;
 
 fn session_queue_sizes(config: AppSessionConfig) -> (u32, u32) {
     let ring_nitems = config.evt_q_capacity.max(1) as u32;
@@ -16,12 +17,20 @@ unsafe fn init_svm_session_queues(
     offsets: &SessionOffsets,
     config: AppSessionConfig,
 ) {
-    Fifo::init_at(seg.clone(), offsets.rx_fifo_off, config.fifo_capacity).expect("init rx fifo");
-    Fifo::init_at(seg.clone(), offsets.tx_fifo_off, config.fifo_capacity).expect("init tx fifo");
+    // SAFETY: the caller allocated the segment with the matching layout and
+    // each offset is used by exactly one queue.
+    unsafe {
+        Fifo::init_at(seg.clone(), offsets.rx_fifo_off, config.fifo_capacity)
+            .expect("init rx fifo");
+        Fifo::init_at(seg.clone(), offsets.tx_fifo_off, config.fifo_capacity)
+            .expect("init tx fifo");
+    }
     let (q_nitems, ring_nitems) = session_queue_sizes(config);
-    SessionMsgQueue::init_at(seg.clone(), offsets.evt_q_off, q_nitems, ring_nitems)
-        .expect("init evt_q");
-    SessionMsgQueue::init_at(seg.clone(), offsets.tx_evt_q_off, 64, 64).expect("init tx_evt_q");
+    // SAFETY: the same allocation contract covers the event queue offset.
+    unsafe {
+        SessionMsgQueue::init_at(seg.clone(), offsets.evt_q_off, q_nitems, ring_nitems)
+            .expect("init evt_q");
+    }
 }
 
 #[test]
@@ -36,8 +45,8 @@ fn svm_session_create_and_fifo_round_trip() {
         init_svm_session_queues(&seg, &offsets, config);
     }
 
-    let session =
-        unsafe { AppSession::from_segment(handle, &seg, &offsets, None, None, None, None) };
+    let worker_queue = Arc::new(SessionMsgQueue::with_cfg(64, 64).expect("worker event queue"));
+    let session = unsafe { AppSession::from_segment(handle, &seg, &offsets, None, worker_queue) };
 
     let written = session.rx_fifo().enqueue(b"hello");
     assert_eq!(written, 5);
@@ -60,8 +69,8 @@ fn svm_session_multi_ring_evt_q_io_and_ctrl_round_trip() {
         init_svm_session_queues(&seg, &offsets, config);
     }
 
-    let session =
-        unsafe { AppSession::from_segment(handle, &seg, &offsets, None, None, None, None) };
+    let worker_queue = Arc::new(SessionMsgQueue::with_cfg(64, 64).expect("worker event queue"));
+    let session = unsafe { AppSession::from_segment(handle, &seg, &offsets, None, worker_queue) };
 
     session
         .push_event(SessionEvtType::Connect)
@@ -94,5 +103,5 @@ fn svm_segment_supports_multiple_sessions() {
         .expect("second session layout");
 
     assert_ne!(offsets1.rx_fifo_off, offsets2.rx_fifo_off);
-    assert!(offsets2.rx_fifo_off > offsets1.tx_evt_q_off);
+    assert!(offsets2.rx_fifo_off > offsets1.evt_q_off);
 }

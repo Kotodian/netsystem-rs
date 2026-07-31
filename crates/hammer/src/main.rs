@@ -210,6 +210,7 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
                     .as_ref()
                     .cloned()
                     .expect("Application Main is initialized with attach server");
+                let publish_applications = Arc::clone(&attach_applications);
                 let detach_applications = Arc::clone(&attach_applications);
                 let control_sessions = sessions
                     .as_ref()
@@ -219,6 +220,9 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
                     () = ipc_loop::clnt_loop(listener) => {}
                     result = attach.serve(
                         move || attach_applications.attach_external_with_runtime(),
+                        move |application| {
+                            publish_applications.application_mq_publication(application)
+                        },
                         move |application, requests, replies| {
                             control_sessions.dispatch_application_session_mq(
                                 application,
@@ -250,6 +254,7 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
                     .as_ref()
                     .cloned()
                     .expect("Application Main is initialized with attach server");
+                let publish_applications = Arc::clone(&attach_applications);
                 let detach_applications = Arc::clone(&attach_applications);
                 let control_sessions = sessions
                     .as_ref()
@@ -259,6 +264,9 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
                     () = ipc_loop::clnt_loop(listener) => {}
                     result = attach.serve(
                         move || attach_applications.attach_external_with_runtime(),
+                        move |application| {
+                            publish_applications.application_mq_publication(application)
+                        },
                         move |application, requests, replies| {
                             control_sessions.dispatch_application_session_mq(
                                 application,

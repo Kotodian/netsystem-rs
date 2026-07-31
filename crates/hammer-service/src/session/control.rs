@@ -208,6 +208,9 @@ fn application_status(error: ApplicationError) -> ApplicationSessionStatus {
         ApplicationError::MqDetachFailed { .. } => {
             ApplicationSessionStatus::ApplicationMqResourceUnavailable
         }
+        ApplicationError::MqPublication { .. } => {
+            ApplicationSessionStatus::ApplicationMqResourceUnavailable
+        }
         ApplicationError::SessionMainMissing => ApplicationSessionStatus::SessionMainUnavailable,
         ApplicationError::MqAlreadyAttached { .. } => {
             ApplicationSessionStatus::ApplicationMqAlreadyAttached

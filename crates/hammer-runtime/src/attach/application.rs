@@ -11,10 +11,10 @@ use crate::app::{
 };
 use crate::{AttachError, RuntimeResult};
 
-use super::{ATTACH_PROTOCOL_VERSION, descriptor};
+use super::{ATTACH_PROTOCOL_VERSION, MAX_ATTACH_DESCRIPTORS, descriptor};
 
-pub const DESCRIPTOR_COUNT: usize = 3;
-pub const METADATA_WORDS: usize = 4;
+pub const BASE_DESCRIPTOR_COUNT: usize = 4;
+pub const METADATA_WORDS: usize = 6;
 pub const METADATA_BYTES: usize = METADATA_WORDS * size_of::<u64>();
 
 const Q_NITEMS: u32 = 64;
@@ -22,6 +22,69 @@ const RING_NITEMS: u32 = 32;
 const SEGMENT_BYTES: usize = 1024 * 1024;
 
 static SEGMENT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Runtime-neutral view of the per-Application Rx MQ resources published by
+/// the daemon during attach.
+#[derive(Clone)]
+pub struct ApplicationMqPublication {
+    segment: Segment,
+    queues: Box<[Arc<SessionMsgQueue>]>,
+    offsets: Box<[u64]>,
+}
+
+impl ApplicationMqPublication {
+    pub fn new(
+        segment: Segment,
+        queues: Box<[Arc<SessionMsgQueue>]>,
+        offsets: Box<[u64]>,
+    ) -> Result<Self, AttachError> {
+        if segment.shared_fd().is_none() {
+            return Err(AttachError::ApplicationMqSegmentMissing);
+        }
+        if queues.is_empty() {
+            return Err(AttachError::ApplicationMqWorkerCountZero);
+        }
+        if queues.len() != offsets.len() {
+            return Err(AttachError::ApplicationMqQueueCountMismatch {
+                queues: queues.len(),
+                offsets: offsets.len(),
+            });
+        }
+        let worker_descriptor_count = queues
+            .len()
+            .checked_add(BASE_DESCRIPTOR_COUNT)
+            .ok_or(AttachError::ApplicationMqDescriptorCountOverflow)?;
+        if worker_descriptor_count > MAX_ATTACH_DESCRIPTORS {
+            return Err(AttachError::ApplicationMqDescriptorCountTooLarge {
+                actual: worker_descriptor_count,
+                max: MAX_ATTACH_DESCRIPTORS,
+            });
+        }
+        let segment_size = segment.size() as u64;
+        for (worker, (queue, offset)) in queues.iter().zip(&offsets).enumerate() {
+            if *offset >= segment_size {
+                return Err(AttachError::ApplicationMqOffsetOutOfRange {
+                    worker,
+                    offset: *offset,
+                    segment_size,
+                });
+            }
+            if queue.write_fd().is_none() {
+                return Err(AttachError::ApplicationMqWriteSignalMissing { worker });
+            }
+        }
+        Ok(Self {
+            segment,
+            queues,
+            offsets,
+        })
+    }
+
+    #[inline]
+    fn worker_count(&self) -> usize {
+        self.queues.len()
+    }
+}
 
 pub(super) struct AttachedApplication {
     pub(super) stream: Arc<tokio::net::UnixStream>,
@@ -35,10 +98,14 @@ pub(super) struct ApplicationAttachment {
     pub(super) requests: Arc<SessionMsgQueue>,
     reply_offset: u64,
     pub(super) replies: Arc<SessionMsgQueue>,
+    application_mqs: ApplicationMqPublication,
 }
 
 impl ApplicationAttachment {
-    pub(super) fn create(application: ApplicationId) -> RuntimeResult<Self> {
+    pub(super) fn create(
+        application: ApplicationId,
+        application_mqs: ApplicationMqPublication,
+    ) -> RuntimeResult<Self> {
         let sequence = SEGMENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let segment = Segment::shared(
             &format!(
@@ -91,10 +158,12 @@ impl ApplicationAttachment {
             requests,
             reply_offset,
             replies,
+            application_mqs,
         })
     }
 
     pub(super) async fn publish(&self, client: &tokio::net::UnixStream) -> RuntimeResult<()> {
+        let application_mqs = &self.application_mqs;
         let descriptors = [
             self.segment
                 .shared_fd()
@@ -105,18 +174,38 @@ impl ApplicationAttachment {
             self.replies
                 .read_fd()
                 .ok_or(AttachError::ControlSignalMissing)?,
+            application_mqs
+                .segment
+                .shared_fd()
+                .ok_or(AttachError::ApplicationMqSegmentMissing)?,
         ];
+        let mut payload =
+            Vec::with_capacity(METADATA_BYTES + application_mqs.worker_count() * size_of::<u64>());
         let words = [
             ATTACH_PROTOCOL_VERSION,
             self.segment.size() as u64,
             self.request_offset,
             self.reply_offset,
+            application_mqs.segment.size() as u64,
+            application_mqs.worker_count() as u64,
         ];
         let mut metadata = [0_u8; METADATA_BYTES];
         for (chunk, word) in metadata.chunks_exact_mut(size_of::<u64>()).zip(words) {
             chunk.copy_from_slice(&word.to_le_bytes());
         }
-        descriptor::send(client, &metadata, &descriptors).await
+        payload.extend_from_slice(&metadata);
+        for offset in &application_mqs.offsets {
+            payload.extend_from_slice(&offset.to_le_bytes());
+        }
+        let mut descriptors = descriptors.to_vec();
+        for (worker, queue) in application_mqs.queues.iter().enumerate() {
+            descriptors.push(
+                queue
+                    .write_fd()
+                    .ok_or(AttachError::ApplicationMqWriteSignalMissing { worker })?,
+            );
+        }
+        descriptor::send(client, &payload, &descriptors).await
     }
 
     pub(super) fn request_signal(&self) -> RuntimeResult<OwnedFd> {

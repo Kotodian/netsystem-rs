@@ -48,7 +48,7 @@ pub struct AppWorker {
     tx_evt_q: Arc<SessionMsgQueue>,
     worker_index: usize,
     segments_by_owner: HashMap<u64, SegmentManager>,
-    attach: Option<AppWorkerAttach>,
+    publisher: Option<AppSessionPublisher>,
 }
 
 #[derive(Clone)]
@@ -61,26 +61,6 @@ struct SessionSlot {
 struct AttachSlot {
     allocation_owner: Option<u64>,
     publication: Option<AppSessionPublication>,
-}
-
-pub(crate) struct AppWorkerAttach {
-    publisher: AppSessionPublisher,
-    tx_event_segment: Segment,
-    tx_event_offset: u64,
-}
-
-impl AppWorkerAttach {
-    pub(crate) fn new(
-        publisher: AppSessionPublisher,
-        tx_event_segment: Segment,
-        tx_event_offset: u64,
-    ) -> Self {
-        Self {
-            publisher,
-            tx_event_segment,
-            tx_event_offset,
-        }
-    }
 }
 
 struct SegmentManager {
@@ -120,7 +100,6 @@ impl SegmentManager {
         handle: SessionHandle,
         config: AppSessionConfig,
         tx_evt_q: Arc<SessionMsgQueue>,
-        tx_event_offset: u64,
     ) -> RuntimeResult<CreatedAppSession> {
         let mut index = 0;
         while index < self.retired.len() {
@@ -254,7 +233,6 @@ impl SegmentManager {
                 rx_fifo_off: offset,
                 tx_fifo_off: tx_fifo_offset,
                 evt_q_off: event_queue_offset,
-                tx_evt_q_off: tx_event_offset,
             },
         })
     }
@@ -312,7 +290,7 @@ impl AppWorker {
             tx_evt_q,
             worker_index,
             segments_by_owner: HashMap::new(),
-            attach: None,
+            publisher: None,
         }
     }
 
@@ -320,16 +298,11 @@ impl AppWorker {
         session_capacity: usize,
         tx_evt_q: Arc<SessionMsgQueue>,
         worker_index: usize,
-        attach: AppWorkerAttach,
+        publisher: AppSessionPublisher,
     ) -> Self {
-        Self {
-            session_slots: vec![None; session_capacity],
-            attach_slots: vec![AttachSlot::default(); session_capacity],
-            tx_evt_q,
-            worker_index,
-            segments_by_owner: HashMap::new(),
-            attach: Some(attach),
-        }
+        let mut worker = Self::new(session_capacity, tx_evt_q, worker_index);
+        worker.publisher = Some(publisher);
+        worker
     }
 
     /// Shared runtime-side TX event queue.  Every app session created via
@@ -338,18 +311,6 @@ impl AppWorker {
     #[inline]
     pub fn tx_evt_q(&self) -> &Arc<SessionMsgQueue> {
         &self.tx_evt_q
-    }
-
-    pub(crate) fn tx_event_segment(&self) -> Option<Segment> {
-        self.attach
-            .as_ref()
-            .map(|attach| attach.tx_event_segment.clone())
-    }
-
-    pub(crate) fn tx_event_offset(&self) -> u64 {
-        self.attach
-            .as_ref()
-            .map_or(0, |attach| attach.tx_event_offset)
     }
 
     pub(crate) fn attach_session(&mut self, session_id: SessionId, app_session: Arc<AppSession>) {
@@ -407,9 +368,10 @@ impl AppWorker {
             .map_err(RuntimeError::from)?;
         self.notify_evt(&session);
         let attach_slot = &mut self.attach_slots[session.session_handle().session_index() as usize];
-        if let (Some(publication), Some(attach)) = (attach_slot.publication.as_ref(), &self.attach)
+        if let (Some(publication), Some(publisher)) =
+            (attach_slot.publication.as_ref(), &self.publisher)
         {
-            attach.publisher.try_publish(publication)?;
+            publisher.try_publish(publication)?;
             attach_slot.publication = None;
         }
         Ok(())
@@ -649,10 +611,10 @@ mod tests {
         let segment_zero_handle = SessionHandle::new(0, 0);
         let growth_segment_handle = SessionHandle::new(1, 0);
         let segment_zero_session = manager
-            .create_session(segment_zero_handle, config, app.tx_evt_q().clone(), 0)
+            .create_session(segment_zero_handle, config, app.tx_evt_q().clone())
             .expect("session in segment zero");
         let growth_segment_session = manager
-            .create_session(growth_segment_handle, config, app.tx_evt_q().clone(), 0)
+            .create_session(growth_segment_handle, config, app.tx_evt_q().clone())
             .expect("session in growth segment");
 
         assert_eq!(manager.segments.len(), 2);
@@ -667,7 +629,6 @@ mod tests {
 }
 
 impl AppWorker {
-    #[cfg(test)]
     pub(crate) fn create_app_session(
         &mut self,
         allocation_owner: u64,
@@ -676,49 +637,24 @@ impl AppWorker {
         config: AppSessionConfig,
         tx_evt_q: Arc<SessionMsgQueue>,
     ) -> RuntimeResult<Arc<AppSession>> {
-        let attach = self.attach.as_ref();
-        self.create_app_session_with_tx_event(
-            allocation_owner,
-            application,
-            handle,
-            config,
-            tx_evt_q,
-            attach.map(|attach| attach.tx_event_segment.clone()),
-            attach.map_or(0, |attach| attach.tx_event_offset),
-        )
-    }
-
-    pub(crate) fn create_app_session_with_tx_event(
-        &mut self,
-        allocation_owner: u64,
-        application: Option<ApplicationId>,
-        handle: SessionHandle,
-        config: AppSessionConfig,
-        tx_evt_q: Arc<SessionMsgQueue>,
-        tx_event_segment: Option<Segment>,
-        tx_event_offset: u64,
-    ) -> RuntimeResult<Arc<AppSession>> {
         let shared_name_prefix = self
-            .attach
+            .publisher
             .as_ref()
             .map(|_| format!("hammer-session-w{}-o{allocation_owner}", self.worker_index));
         let created = self
             .segments_by_owner
             .entry(allocation_owner)
             .or_insert_with(|| SegmentManager::new(shared_name_prefix))
-            .create_session(handle, config, tx_evt_q, tx_event_offset)?;
+            .create_session(handle, config, tx_evt_q)?;
         let slot = handle.session_index() as usize;
         if self.attach_slots.len() <= slot {
             self.attach_slots.resize_with(slot + 1, AttachSlot::default);
         }
-        let publication = if let (Some(attach), Some(application)) = (&self.attach, application) {
-            let tx_event_segment =
-                tx_event_segment.unwrap_or_else(|| attach.tx_event_segment.clone());
+        let publication = if let (Some(_), Some(application)) = (&self.publisher, application) {
             match AppSessionPublication::new(
                 Arc::clone(&created.session),
                 application,
                 created.segment,
-                tx_event_segment,
                 created.offsets,
             ) {
                 Ok(publication) => Some(publication),
