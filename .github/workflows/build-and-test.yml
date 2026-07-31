@@ -2,8 +2,7 @@ name: Build and Test
 run-name: Build and test ${{ github.ref_name }} (${{ github.event_name }})
 
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read

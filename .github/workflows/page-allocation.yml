@@ -2,8 +2,7 @@ name: Page Allocation
 run-name: Verify page allocation for ${{ github.ref_name }} (${{ github.event_name }})
 
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
