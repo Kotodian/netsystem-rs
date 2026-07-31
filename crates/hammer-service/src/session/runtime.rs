@@ -474,7 +474,6 @@ impl SessionMain {
             .nodes()
             .node_by_name("appsl-rx-mqs-input")
             .ok_or_else(|| session_worker_error(SessionQueueError::NodeMissing))?;
-        let mut installed = Vec::new();
         for worker_slot in 0..resources.worker_count() {
             let worker = DataWorkerId::new(worker_slot as u32);
             let queue = resources
@@ -484,7 +483,7 @@ impl SessionMain {
                 })?
                 .clone();
             let main = Arc::clone(self);
-            match schedule_worker_task(engine, worker, move || {
+            schedule_worker_task(engine, worker, move || {
                 Engine::with_current(|engine| {
                     let runtime = &mut engine.runtime;
                     main.worker(worker)?
@@ -499,36 +498,7 @@ impl SessionMain {
                         })?
                 })
                 .ok_or(RuntimeError::WorkerControlRequiresMainEngine)?
-            }) {
-                Ok(()) => installed.push(worker_slot),
-                Err(error) => {
-                    for installed_worker in installed.iter().rev().copied() {
-                        let worker = DataWorkerId::new(installed_worker as u32);
-                        let main = Arc::clone(self);
-                        if let Err(rollback_error) =
-                            schedule_worker_task(engine, worker, move || {
-                                Engine::with_current(|engine| {
-                                    let runtime = &mut engine.runtime;
-                                    main.worker(worker)?
-                                        .with_mut(|sessions| {
-                                            sessions.remove_app_mq(application, runtime)
-                                        })
-                                        .map_err(|source| {
-                                            session_worker_error(SessionQueueError::WorkerAccess {
-                                                worker: worker.slot(),
-                                                source,
-                                            })
-                                        })?
-                                })
-                                .ok_or(RuntimeError::WorkerControlRequiresMainEngine)?
-                            })
-                        {
-                            return Err(rollback_error);
-                        }
-                    }
-                    return Err(error);
-                }
-            }
+            })?;
         }
         Ok(())
     }

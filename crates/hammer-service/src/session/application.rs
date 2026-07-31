@@ -331,27 +331,11 @@ impl ApplicationMain {
         });
         match install_result {
             Some(Ok(())) => {
-                if let Err(primary) = self.store_mq_resources(application, resources) {
-                    if let Err(cleanup) = self.rollback_attach(application) {
-                        return Err(cleanup);
-                    }
-                    return Err(primary);
-                }
+                self.store_mq_resources(application, resources)?;
                 Ok(application)
             }
-            Some(Err(primary)) => {
-                if let Err(cleanup) = self.rollback_attach(application) {
-                    return Err(cleanup);
-                }
-                Err(primary)
-            }
-            None => {
-                let primary = ApplicationError::SessionMainMissing;
-                if let Err(cleanup) = self.rollback_attach(application) {
-                    return Err(cleanup);
-                }
-                Err(primary)
-            }
+            Some(Err(error)) => Err(error),
+            None => Err(ApplicationError::SessionMainMissing),
         }
     }
 
@@ -389,10 +373,6 @@ impl ApplicationMain {
         let queue = resources.queue(worker)?.clone();
         let offset = resources.offset(worker)?;
         Some((queue, Some(resources.segment().clone()), offset))
-    }
-
-    fn rollback_attach(&self, application: ApplicationId) -> Result<(), ApplicationError> {
-        self.detach(application)
     }
 
     pub fn contains(&self, application: ApplicationId) -> Result<bool, ApplicationError> {
@@ -923,7 +903,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_local_without_runtime_rolls_back_identity_and_mq_resources() {
+    fn attach_local_without_runtime_does_not_publish_mq_resources() {
         let main = ApplicationMain::new(1);
         let error = main
             .attach_local(1, 128)
@@ -931,7 +911,6 @@ mod tests {
 
         assert!(matches!(error, ApplicationError::SessionMainMissing));
         let state = main.state().expect("read Application state");
-        assert!(state.applications.is_empty());
         assert!(state.mq_resources.iter().all(Option::is_none));
     }
 
