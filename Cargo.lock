@@ -813,7 +813,6 @@ dependencies = [
  "hammer-ipc",
  "hammer-plugin-ip",
  "hammer-plugin-tcp",
- "hammer-plugin-tls",
  "hammer-plugin-tun",
  "hammer-plugin-udp",
  "hammer-runtime",
