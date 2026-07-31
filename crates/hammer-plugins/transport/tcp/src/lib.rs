@@ -545,6 +545,7 @@ fn bind_worker_graph(engine: &mut Engine) -> RuntimeResult<()> {
     let session_queue_output =
         SessionQueueNode::existing_output_next(&engine.runtime, session_queue, tcp_output)?;
     SessionQueueNode::install_worker_attachment(
+        &engine.runtime,
         session_queue_data,
         session_queue_output,
         tcp_session_queue_dispatch,

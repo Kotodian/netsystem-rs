@@ -23,12 +23,14 @@ use hammer_runtime::{
     AttachError, RuntimeError, RuntimeResult, SessionConnectEndpoint, SessionConnectionId,
     SessionListenEndpoint, SessionListenerId, SessionTransportRegistration,
 };
-use hammer_runtime::{DataPlaneRuntime, DataWorkerId, Engine, File, FileFunctions, Node};
+use hammer_runtime::{DataPlaneRuntime, DataWorkerId, Engine, File, FileFunctions};
 
 use crate::session::app::{AppWorkerAttach, AppWorkerError};
 use crate::session::application::{ApplicationMain, ApplicationProtocol};
 use crate::session::error::{SessionError, SessionQueueError};
-use crate::session::node::{AppSessionInputNode, SESSION_QUEUE_IO_BUDGET, SessionQueueNode};
+use crate::session::node::{
+    AppSessionInputNode, SESSION_QUEUE_IO_BUDGET, SessionQueueTransportDispatch,
+};
 use crate::session::state::SessionState;
 use crate::session::{AppWorker, SessionId, SessionQueueNext};
 
@@ -170,6 +172,7 @@ pub struct SessionWorker<Index> {
     app: AppWorker,
     session_evt_q: Arc<SessionMsgQueue>,
     app_session_config: AppSessionConfig,
+    pub(crate) transport_dispatches: Vec<SessionQueueTransportDispatch>,
     session_work: Vec<SessionId>,
     session_work_scratch: Vec<SessionId>,
     app_rx_events: FifoQueue<SessionId>,
@@ -443,8 +446,9 @@ pub fn install_session_worker(
     session_queue: hammer_core::data_plane::NodeId,
     mut worker: SessionWorker<PoolIndex>,
 ) -> RuntimeResult<()> {
-    let session_queue_node = SessionQueueNode::new()?;
-    let session_queue_data = session_queue_node.node_runtime_data()?;
+    worker.set_listener_main(Arc::clone(main));
+    let session_queue_data =
+        hammer_runtime::NodeRuntimeData::from_usize(Arc::as_ptr(main) as usize)?;
     let input_data = AppSessionInputNode::worker_runtime_data(session_queue_data, session_queue);
     engine.set_worker_node_runtime_data(app_session_input, input_data)?;
     engine.set_worker_node_runtime_data(session_queue, session_queue_data)?;
@@ -463,7 +467,6 @@ pub fn install_session_worker(
             },
         ));
     }
-    SessionQueueNode::install_worker_session(session_queue_data, Arc::clone(main))?;
     Ok(())
 }
 
@@ -1840,6 +1843,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             app,
             session_evt_q,
             app_session_config,
+            transport_dispatches: Vec::new(),
             session_work: Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
             session_work_scratch: Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
             app_rx_events: FifoQueue::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
@@ -2241,13 +2245,32 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use hammer_core::data_plane::BufferFrame;
     use hammer_infra::pool::Index;
     use hammer_runtime::app::AppSessionProtocolRole;
     use hammer_runtime::attach::AppServer;
-    use hammer_runtime::{AttachError, DataWorkerId, RuntimeError};
+    use hammer_runtime::{
+        AttachError, DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, NodeRuntimeData,
+        RuntimeError, RuntimeResult,
+    };
 
-    use super::{SessionTransportId, SessionWorker};
+    use super::{SessionMain, SessionQueueNext, SessionTransportId, SessionWorker};
     use crate::session::ApplicationMain;
+    use crate::session::node::{SessionQueueNode, SessionQueueOutput};
+
+    fn test_dispatch(
+        _: &DataPlaneRuntime,
+        _: NodeRuntimeData,
+        _: SessionQueueNext,
+        _: Instant,
+        _: &mut BufferFrame,
+        _: &mut SessionQueueOutput,
+    ) -> RuntimeResult<()> {
+        Ok(())
+    }
 
     #[test]
     fn app_publication_queue_full_keeps_session_rollback_eligible() {
@@ -2362,6 +2385,113 @@ mod tests {
             Some(connection_index)
         );
         assert!(!sessions.has_session(session_id));
+    }
+
+    #[test]
+    fn session_queue_dispatches_are_isolated_per_runtime_on_same_thread() {
+        let worker = DataWorkerId::new(0);
+        let runtime_a = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default())
+            .for_worker(1, 0)
+            .expect("worker runtime A");
+        let runtime_b = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default())
+            .for_worker(1, 0)
+            .expect("worker runtime B");
+        let main_a = Arc::new(SessionMain::new(1, ApplicationMain::new(1)));
+        let main_b = Arc::new(SessionMain::new(1, ApplicationMain::new(1)));
+        assert!(
+            main_a
+                .worker(worker)
+                .expect("Session worker A slot")
+                .install(SessionWorker::<Index>::new(worker).expect("Session worker A"))
+                .is_ok(),
+            "install Session worker A"
+        );
+        assert!(
+            main_b
+                .worker(worker)
+                .expect("Session worker B slot")
+                .install(SessionWorker::<Index>::new(worker).expect("Session worker B"))
+                .is_ok(),
+            "install Session worker B"
+        );
+
+        let data_a = NodeRuntimeData::from_usize(Arc::as_ptr(&main_a) as usize)
+            .expect("Session Main A data");
+        let data_b = NodeRuntimeData::from_usize(Arc::as_ptr(&main_b) as usize)
+            .expect("Session Main B data");
+        SessionQueueNode::install_worker_attachment(
+            &runtime_a,
+            data_a,
+            SessionQueueNext::from_slot(0),
+            test_dispatch,
+        )
+        .expect("install dispatch A");
+        SessionQueueNode::install_worker_attachment(
+            &runtime_a,
+            data_a,
+            SessionQueueNext::from_slot(1),
+            test_dispatch,
+        )
+        .expect("install second dispatch A");
+        SessionQueueNode::install_worker_attachment(
+            &runtime_b,
+            data_b,
+            SessionQueueNext::from_slot(2),
+            test_dispatch,
+        )
+        .expect("install dispatch B");
+
+        let dispatches_a = main_a
+            .with_worker_mut(&runtime_a, |sessions| {
+                Ok(sessions.transport_dispatches.len())
+            })
+            .expect("read dispatches A");
+        let dispatches_b = main_b
+            .with_worker_mut(&runtime_b, |sessions| {
+                Ok(sessions.transport_dispatches.len())
+            })
+            .expect("read dispatches B");
+
+        assert_eq!(dispatches_a, 2);
+        assert_eq!(dispatches_b, 1);
+    }
+
+    #[test]
+    fn duplicate_worker_installation_preserves_existing_session_queue_dispatches() {
+        let worker = DataWorkerId::new(0);
+        let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default())
+            .for_worker(1, 0)
+            .expect("worker runtime");
+        let main = Arc::new(SessionMain::new(1, ApplicationMain::new(1)));
+        assert!(
+            main.worker(worker)
+                .expect("Session worker slot")
+                .install(SessionWorker::<Index>::new(worker).expect("Session worker"))
+                .is_ok(),
+            "install Session worker"
+        );
+        let data =
+            NodeRuntimeData::from_usize(Arc::as_ptr(&main) as usize).expect("Session Main data");
+        SessionQueueNode::install_worker_attachment(
+            &runtime,
+            data,
+            SessionQueueNext::from_slot(0),
+            test_dispatch,
+        )
+        .expect("install dispatch");
+
+        let duplicate = SessionWorker::<Index>::new(worker).expect("duplicate Session worker");
+        assert!(
+            main.worker(worker)
+                .expect("duplicate install slot")
+                .install(duplicate)
+                .is_err()
+        );
+
+        let dispatches = main
+            .with_worker_mut(&runtime, |sessions| Ok(sessions.transport_dispatches.len()))
+            .expect("read dispatches");
+        assert_eq!(dispatches, 1);
     }
 }
 
