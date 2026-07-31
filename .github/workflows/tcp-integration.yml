@@ -749,7 +749,7 @@ jobs:
               extra_args=()
               ;;
             tls-attached-echo)
-              extra_args=(--min-server-data-bytes "${{ matrix.echo_bytes }}")
+              extra_args=()
               ;;
           esac
           python3 scripts/tcp-pcap-assert.py \
