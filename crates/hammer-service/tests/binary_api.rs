@@ -2,16 +2,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use hammer_runtime::app::ApplicationId;
 use hammer_runtime::{
     DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, Engine, PluginError,
     PluginMain, RuntimeRegistry,
 };
 use hammer_service::binary_api::{
     BinaryApiMain, BinaryApiReply, BinaryApiRequest, BinaryApiStatus,
-};
-use hammer_service::session::{
-    ApplicationApiStatus, ApplicationMain, AttachApplicationReply, AttachApplicationRequest,
 };
 use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -89,7 +85,6 @@ fn engine() -> Engine {
     engine
         .plugin_main_mut()
         .register_builtin_image(hammer_service::registration_image());
-    engine.registry.set(ApplicationMain::new(4));
     engine
 }
 
@@ -192,42 +187,7 @@ async fn protobuf_methods_dispatch_on_the_main_thread_over_unix_socket() {
     assert_eq!(panicked.context, 44);
     assert_eq!(panicked.status, BinaryApiStatus::MethodPanicked as i32);
 
-    let attached = call(
-        &mut stream,
-        BinaryApiRequest {
-            context: 45,
-            method: "application.attach".to_owned(),
-            payload: AttachApplicationRequest {}.encode_to_vec(),
-        },
-    )
-    .await;
-    assert_eq!(attached.status, BinaryApiStatus::Ok as i32);
-    let attached = AttachApplicationReply::decode(attached.payload.as_slice())
-        .expect("decode Application attach reply");
-    assert_eq!(attached.status, ApplicationApiStatus::Ok as i32);
-    let application = ApplicationId::from_raw(attached.application_id);
-    let applications = engine
-        .registry
-        .require::<ApplicationMain>()
-        .expect("Application Main");
-    assert!(
-        applications
-            .contains(application)
-            .expect("resolve attached Application")
-    );
-
     drop(stream);
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
-    assert!(
-        applications
-            .contains(application)
-            .expect("Binary API connection loss does not detach Application")
-    );
-    applications
-        .detach(application)
-        .expect("test cleanup detaches Application explicitly");
 
     server.abort();
     server.await.expect_err("server task aborted");

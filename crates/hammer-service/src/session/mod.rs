@@ -19,11 +19,7 @@ pub mod runtime;
 pub mod state;
 
 pub use app::AppWorker;
-pub use application::{
-    ApplicationApiStatus, ApplicationError, ApplicationMain, ApplicationRegistration,
-    AttachApplicationReply, AttachApplicationRequest, DetachApplicationReply,
-    DetachApplicationRequest,
-};
+pub use application::{ApplicationError, ApplicationMain, ApplicationRegistration};
 pub use config::Session;
 pub use error::SessionQueueError;
 pub use hammer_runtime::app::AppSessionProtocol;

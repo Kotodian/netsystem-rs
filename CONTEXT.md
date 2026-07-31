@@ -163,8 +163,11 @@ _Avoid_: CLI IPC as Binary API, SVM FIFO as control API, handler mutex, Tokio wo
   at the DSO seam and never exposes plugin state to Service.
 - `hammer` only polls the Service-owned server in its current-thread Tokio main
   loop. It does not inspect method names or payloads.
-- External App control uses Binary API; SVM FIFOs and Session Message Queues
-  remain data exchange after attachment. A Local App calls plugin ABI directly.
+- External App plugin configuration uses Binary API. Application attachment uses
+  the Session Socket API, which allocates the Application identity and returns
+  its shared resources on the same connection. Listen, connect, and unlisten use
+  the Application Session Message Queue after attachment; SVM FIFOs carry only
+  session payload bytes. A Local App calls the corresponding owner API directly.
 - Verify with `cargo test -p hammer-service --test binary_api`,
   `cargo check --workspace`, and `cargo test --workspace`.
 

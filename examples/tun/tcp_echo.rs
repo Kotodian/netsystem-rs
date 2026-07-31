@@ -5,11 +5,11 @@
 //! next session.
 //!
 //! ```text
-//! cargo run -p hammer --example tun_tcp_echo -- /tmp/hammer-tcp-integration.attach.sock 1
+//! cargo run -p hammer --example tun_tcp_echo -- /tmp/hammer-tcp-integration.attach.sock
 //! ```
 
 use hammer_app::attach::{AppClient, AppClientError};
-use hammer_app::{AppSession, AppSessionError, ApplicationId};
+use hammer_app::{AppSession, AppSessionError};
 use hammer_runtime::app::SessionEvtType;
 
 const DEFAULT_ATTACH_SOCKET: &str = "/tmp/hammer-tcp-integration.attach.sock";
@@ -26,13 +26,6 @@ enum EchoError {
         #[source]
         source: std::io::Error,
     },
-    #[error("missing Application ID returned by application.attach")]
-    ApplicationIdMissing,
-    #[error("invalid Application ID")]
-    ApplicationIdInvalid {
-        #[source]
-        source: std::num::ParseIntError,
-    },
 }
 
 fn main() -> Result<(), EchoError> {
@@ -40,17 +33,15 @@ fn main() -> Result<(), EchoError> {
     let socket_path = arguments
         .next()
         .unwrap_or_else(|| DEFAULT_ATTACH_SOCKET.to_owned());
-    let application = arguments
-        .next()
-        .ok_or(EchoError::ApplicationIdMissing)?
-        .parse()
-        .map(ApplicationId::from_raw)
-        .map_err(|source| EchoError::ApplicationIdInvalid { source })?;
     let tokio_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .build()
         .map_err(|source| EchoError::TokioRuntime { source })?;
-    let client = AppClient::connect(&socket_path, application)?;
+    let client = AppClient::connect(&socket_path)?;
+    eprintln!(
+        "attached Application {:?} via {socket_path}",
+        client.application()
+    );
     loop {
         let session = client.accept()?;
         eprintln!(

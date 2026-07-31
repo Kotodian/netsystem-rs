@@ -1750,18 +1750,12 @@ fn expand_binary_api(args: BinaryApiArgs, function: ItemFn) -> Result<TokenStrea
         ));
     }
     let inputs = function.sig.inputs.iter().collect::<Vec<_>>();
-    let Some(FnArg::Typed(request)) = inputs.first().copied() else {
+    let [FnArg::Typed(request)] = inputs.as_slice() else {
         return Err(Error::new_spanned(
             &function.sig.inputs,
-            "Binary API handlers must accept a protobuf request by value",
+            "Binary API handlers must accept exactly one protobuf request by value",
         ));
     };
-    if inputs.len() > 2 || inputs.is_empty() {
-        return Err(Error::new_spanned(
-            &function.sig.inputs,
-            "Binary API handlers accept one request and an optional &mut BinaryApiContext",
-        ));
-    }
     if !request.attrs.is_empty() {
         return Err(Error::new_spanned(
             &request.attrs[0],
@@ -1769,23 +1763,6 @@ fn expand_binary_api(args: BinaryApiArgs, function: ItemFn) -> Result<TokenStrea
         ));
     }
     let function_name = &function.sig.ident;
-    let call = match inputs.as_slice() {
-        [_] => quote!(#function_name(__hammer_request)),
-        [_, FnArg::Typed(context)]
-            if matches!(context.ty.as_ref(), Type::Reference(reference)
-                if reference.mutability.is_some()
-                    && type_path_ends_with(&reference.elem, "BinaryApiContext")) =>
-        {
-            quote!(#function_name(__hammer_request, __hammer_context))
-        }
-        [_, second] => {
-            return Err(Error::new_spanned(
-                second,
-                "the second Binary API parameter must be &mut BinaryApiContext",
-            ));
-        }
-        _ => unreachable!("Binary API input count was validated"),
-    };
     let ReturnType::Type(_, reply_ty) = &function.sig.output else {
         return Err(Error::new_spanned(
             &function.sig.output,
@@ -1814,7 +1791,6 @@ fn expand_binary_api(args: BinaryApiArgs, function: ItemFn) -> Result<TokenStrea
         #(#conditional_attributes)*
         fn #adapter_name(
             __hammer_request: ::hammer_runtime::__private::RSlice<'_, u8>,
-            __hammer_context: &mut ::hammer_runtime::__private::BinaryApiContext,
         ) -> ::hammer_runtime::__private::BinaryApiMethodReply {
             let __hammer_request = match <#request_ty as ::prost::Message>::decode(
                 __hammer_request.as_slice(),
@@ -1825,7 +1801,7 @@ fn expand_binary_api(args: BinaryApiArgs, function: ItemFn) -> Result<TokenStrea
                 }
             };
             match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                let __hammer_reply: #reply_ty = #call;
+                let __hammer_reply: #reply_ty = #function_name(__hammer_request);
                 <#reply_ty as ::prost::Message>::encode_to_vec(&__hammer_reply)
             })) {
                 Ok(payload) => ::hammer_runtime::__private::BinaryApiMethodReply::ok(payload),

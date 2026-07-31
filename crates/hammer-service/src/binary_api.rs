@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::{self, ThreadId};
 
-use hammer_runtime::binary_api::{BinaryApiContext, BinaryApiMethodStatus};
+use hammer_runtime::binary_api::BinaryApiMethodStatus;
 use hammer_runtime::{Engine, PluginError, RuntimeError, RuntimeResult};
 use prost::Message;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -203,14 +203,13 @@ impl BinaryApiMain {
 impl BinaryApiConnection {
     async fn serve(&self, stream: tokio::net::UnixStream) -> Result<(), BinaryApiError> {
         self.ensure_main_thread()?;
-        let mut context = BinaryApiContext::default();
         let (mut reader, mut writer) = stream.into_split();
         loop {
             let Some(frame) = read_frame(&mut reader, self.max_frame_bytes).await? else {
                 return Ok(());
             };
             let reply = match BinaryApiRequest::decode(frame.as_slice()) {
-                Ok(request) => dispatch(request, &mut context),
+                Ok(request) => dispatch(request),
                 Err(_) => reply(0, BinaryApiStatus::InvalidRequest, Vec::new()),
             };
             write_frame(&mut writer, &reply.encode_to_vec(), self.max_frame_bytes).await?;
@@ -273,7 +272,7 @@ fn bind_listener(path: &Path) -> io::Result<StdUnixListener> {
     }
 }
 
-fn dispatch(request: BinaryApiRequest, binary_context: &mut BinaryApiContext) -> BinaryApiReply {
+fn dispatch(request: BinaryApiRequest) -> BinaryApiReply {
     let context = request.context;
     let resolved =
         Engine::with_current(|engine| engine.plugin_main().binary_api_method(&request.method));
@@ -290,7 +289,7 @@ fn dispatch(request: BinaryApiRequest, binary_context: &mut BinaryApiContext) ->
         Some(Err(_)) => return reply(context, BinaryApiStatus::Internal, Vec::new()),
         Some(Ok(method)) => method,
     };
-    let method_reply = method.call(&request.payload, binary_context);
+    let method_reply = method.call(&request.payload);
     let status = match method_reply.status() {
         BinaryApiMethodStatus::Ok => BinaryApiStatus::Ok,
         BinaryApiMethodStatus::InvalidRequest => BinaryApiStatus::InvalidRequest,

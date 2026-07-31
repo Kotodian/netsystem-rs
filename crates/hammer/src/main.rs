@@ -213,7 +213,7 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
                 tokio::select! {
                     () = ipc_loop::clnt_loop(listener) => {}
                     result = attach.serve(
-                        move |application| attach_applications.contains(application).unwrap_or(false),
+                        move || attach_applications.attach(),
                         move |application| {
                             if detach_applications.contains(application).unwrap_or(false)
                                 && let Err(error) = detach_applications.detach(application)
@@ -242,7 +242,7 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
                 tokio::select! {
                     () = ipc_loop::clnt_loop(listener) => {}
                     result = attach.serve(
-                        move |application| attach_applications.contains(application).unwrap_or(false),
+                        move || attach_applications.attach(),
                         move |application| {
                             if detach_applications.contains(application).unwrap_or(false)
                                 && let Err(error) = detach_applications.detach(application)

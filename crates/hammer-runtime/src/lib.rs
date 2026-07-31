@@ -4,7 +4,7 @@ mod registration;
 
 #[doc(hidden)]
 pub mod __private {
-    pub use crate::binary_api::{BinaryApiContext, BinaryApiMethodEntry, BinaryApiMethodReply};
+    pub use crate::binary_api::{BinaryApiMethodEntry, BinaryApiMethodReply};
     pub use crate::registration::RegistrationImage;
     pub use abi_stable::RRef;
     pub use abi_stable::export_root_module;

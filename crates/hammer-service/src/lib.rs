@@ -31,10 +31,7 @@ hammer_runtime::__declare_registration_image!(
     process_nodes = [];
     session_transports = [];
     app_session_protocols = [];
-    binary_api_methods = [
-        session::application::__BINARY_API_ATTACH_APPLICATION,
-        session::application::__BINARY_API_DETACH_APPLICATION,
-    ];
+    binary_api_methods = [];
 );
 
 #[doc(hidden)]

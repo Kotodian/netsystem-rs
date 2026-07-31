@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use hammer_infra::segment::Segment;
 use hammer_runtime::app::{AppSession, ApplicationId, SessionHandle, SessionOffsets};
 use hammer_runtime::attach::{
-    ATTACH_APPLICATION_ACCEPTED, ATTACH_APPLICATION_BYTES, ATTACH_DESCRIPTOR_COUNT,
-    ATTACH_METADATA_BYTES, ATTACH_METADATA_WORDS, ATTACH_PROTOCOL_VERSION,
+    ATTACH_DESCRIPTOR_COUNT, ATTACH_METADATA_BYTES, ATTACH_METADATA_WORDS, ATTACH_PROTOCOL_VERSION,
+    ATTACH_REPLY_BYTES, ATTACH_REPLY_WORDS, ATTACH_REQUEST_BYTES, ATTACH_STATUS_ACCEPTED,
 };
 use thiserror::Error;
 
@@ -24,8 +24,8 @@ pub enum AppClientError {
         #[source]
         source: std::io::Error,
     },
-    #[error("attach server rejected Application {application:?}")]
-    ApplicationRejected { application: ApplicationId },
+    #[error("attach server rejected the Application attach request")]
+    AttachRejected,
     #[error("failed to receive attach descriptors")]
     Receive {
         #[source]
@@ -71,28 +71,47 @@ pub enum AppClientError {
 
 pub struct AppClient {
     stream: UnixStream,
+    application: ApplicationId,
 }
 
 impl AppClient {
-    pub fn connect(path: &str, application: ApplicationId) -> Result<Self, AppClientError> {
+    pub fn connect(path: &str) -> Result<Self, AppClientError> {
         let mut stream = UnixStream::connect(path).map_err(|source| AppClientError::Connect {
             path: path.into(),
             source,
         })?;
-        let mut registration = [0_u8; ATTACH_APPLICATION_BYTES];
-        registration[..size_of::<u64>()].copy_from_slice(&ATTACH_PROTOCOL_VERSION.to_le_bytes());
-        registration[size_of::<u64>()..].copy_from_slice(&application.raw().to_le_bytes());
+        let request = ATTACH_PROTOCOL_VERSION.to_le_bytes();
+        debug_assert_eq!(request.len(), ATTACH_REQUEST_BYTES);
         stream
-            .write_all(&registration)
+            .write_all(&request)
             .map_err(|source| AppClientError::Registration { source })?;
-        let mut status = [0_u8; 1];
+        let mut reply = [0_u8; ATTACH_REPLY_BYTES];
         stream
-            .read_exact(&mut status)
+            .read_exact(&mut reply)
             .map_err(|source| AppClientError::Registration { source })?;
-        if status[0] != ATTACH_APPLICATION_ACCEPTED {
-            return Err(AppClientError::ApplicationRejected { application });
+        let mut words = [0_u64; ATTACH_REPLY_WORDS];
+        for (word, chunk) in words.iter_mut().zip(reply.chunks_exact(size_of::<u64>())) {
+            *word = u64::from_le_bytes(
+                chunk
+                    .try_into()
+                    .expect("attach reply word occupies one complete u64"),
+            );
         }
-        Ok(Self { stream })
+        if words[0] != ATTACH_PROTOCOL_VERSION {
+            return Err(AppClientError::ProtocolVersion { actual: words[0] });
+        }
+        if words[1] != ATTACH_STATUS_ACCEPTED {
+            return Err(AppClientError::AttachRejected);
+        }
+        Ok(Self {
+            stream,
+            application: ApplicationId::from_raw(words[2]),
+        })
+    }
+
+    #[inline]
+    pub const fn application(&self) -> ApplicationId {
+        self.application
     }
 
     pub fn accept(&self) -> Result<AppSession, AppClientError> {

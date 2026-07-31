@@ -4,7 +4,6 @@ use std::thread::{self, ThreadId};
 
 use hammer_infra::pool::{Index, Pool};
 use hammer_runtime::app::ApplicationId;
-use hammer_runtime::binary_api::BinaryApiContext;
 use hammer_runtime::{Engine, RuntimeError, RuntimeResult};
 use hammer_service::session::{ApplicationMain, ApplicationRegistration};
 use prost::Message;
@@ -465,25 +464,29 @@ fn config_entry(
 
 #[derive(Clone, PartialEq, Message)]
 pub struct RegisterServerConfigRequest {
-    #[prost(bytes = "vec", repeated, tag = "1")]
-    pub certificate_der: Vec<Vec<u8>>,
-    #[prost(bytes = "vec", tag = "2")]
-    pub private_key_der: Vec<u8>,
-    #[prost(bytes = "vec", repeated, tag = "3")]
-    pub client_trust_anchor_der: Vec<Vec<u8>>,
-    #[prost(bytes = "vec", repeated, tag = "4")]
-    pub alpn_protocols: Vec<Vec<u8>>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-pub struct RegisterClientConfigRequest {
-    #[prost(bytes = "vec", repeated, tag = "1")]
-    pub trust_anchor_der: Vec<Vec<u8>>,
+    #[prost(uint64, tag = "1")]
+    pub application_id: u64,
     #[prost(bytes = "vec", repeated, tag = "2")]
     pub certificate_der: Vec<Vec<u8>>,
     #[prost(bytes = "vec", tag = "3")]
     pub private_key_der: Vec<u8>,
     #[prost(bytes = "vec", repeated, tag = "4")]
+    pub client_trust_anchor_der: Vec<Vec<u8>>,
+    #[prost(bytes = "vec", repeated, tag = "5")]
+    pub alpn_protocols: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RegisterClientConfigRequest {
+    #[prost(uint64, tag = "1")]
+    pub application_id: u64,
+    #[prost(bytes = "vec", repeated, tag = "2")]
+    pub trust_anchor_der: Vec<Vec<u8>>,
+    #[prost(bytes = "vec", repeated, tag = "3")]
+    pub certificate_der: Vec<Vec<u8>>,
+    #[prost(bytes = "vec", tag = "4")]
+    pub private_key_der: Vec<u8>,
+    #[prost(bytes = "vec", repeated, tag = "5")]
     pub alpn_protocols: Vec<Vec<u8>>,
 }
 
@@ -506,6 +509,8 @@ pub struct RegisterClientConfigReply {
 #[derive(Clone, PartialEq, Message)]
 pub struct RemoveConfigRequest {
     #[prost(uint64, tag = "1")]
+    pub application_id: u64,
+    #[prost(uint64, tag = "2")]
     pub config_id: u64,
 }
 
@@ -519,29 +524,25 @@ pub struct RemoveConfigReply {
 #[repr(i32)]
 pub enum TlsApiStatus {
     Ok = 0,
-    ApplicationNotAttached = 1,
-    ApplicationMissing = 2,
-    MainThreadUnavailable = 3,
-    WrongThread = 4,
-    CapacityExhausted = 5,
-    ConfigMissing = 6,
-    ConfigNotOwned = 7,
-    ConfigRoleMismatch = 8,
-    CertificateChainEmpty = 9,
-    TrustAnchorsEmpty = 10,
-    PrivateKeyInvalid = 11,
-    ClientIdentityIncomplete = 12,
-    TrustAnchorInvalid = 13,
-    AlpnInvalid = 14,
-    ConfigurationInvalid = 15,
+    ApplicationMissing = 1,
+    MainThreadUnavailable = 2,
+    WrongThread = 3,
+    CapacityExhausted = 4,
+    ConfigMissing = 5,
+    ConfigNotOwned = 6,
+    ConfigRoleMismatch = 7,
+    CertificateChainEmpty = 8,
+    TrustAnchorsEmpty = 9,
+    PrivateKeyInvalid = 10,
+    ClientIdentityIncomplete = 11,
+    TrustAnchorInvalid = 12,
+    AlpnInvalid = 13,
+    ConfigurationInvalid = 14,
 }
 
 #[hammer_component_macros::binary_api(name = "tls.server-config.register")]
-fn register_server_config_api(
-    request: RegisterServerConfigRequest,
-    context: &mut BinaryApiContext,
-) -> RegisterServerConfigReply {
-    let application = match binary_application(context) {
+fn register_server_config_api(request: RegisterServerConfigRequest) -> RegisterServerConfigReply {
+    let application = match binary_application(request.application_id) {
         Ok(application) => application,
         Err(status) => return server_reply(status, 0),
     };
@@ -555,11 +556,8 @@ fn register_server_config_api(
 }
 
 #[hammer_component_macros::binary_api(name = "tls.client-config.register")]
-fn register_client_config_api(
-    request: RegisterClientConfigRequest,
-    context: &mut BinaryApiContext,
-) -> RegisterClientConfigReply {
-    let application = match binary_application(context) {
+fn register_client_config_api(request: RegisterClientConfigRequest) -> RegisterClientConfigReply {
+    let application = match binary_application(request.application_id) {
         Ok(application) => application,
         Err(status) => return client_reply(status, 0),
     };
@@ -575,11 +573,8 @@ fn register_client_config_api(
 }
 
 #[hammer_component_macros::binary_api(name = "tls.config.remove")]
-fn remove_config_api(
-    request: RemoveConfigRequest,
-    context: &mut BinaryApiContext,
-) -> RemoveConfigReply {
-    let application = match binary_application(context) {
+fn remove_config_api(request: RemoveConfigRequest) -> RemoveConfigReply {
+    let application = match binary_application(request.application_id) {
         Ok(application) => application,
         Err(status) => return remove_reply(status),
     };
@@ -591,10 +586,8 @@ fn remove_config_api(
     }
 }
 
-fn binary_application(context: &BinaryApiContext) -> Result<ApplicationId, TlsApiStatus> {
-    let application = context
-        .application()
-        .ok_or(TlsApiStatus::ApplicationNotAttached)?;
+fn binary_application(application: u64) -> Result<ApplicationId, TlsApiStatus> {
+    let application = ApplicationId::from_raw(application);
     let Some(attached) = Engine::with_current(|engine| {
         engine
             .registry

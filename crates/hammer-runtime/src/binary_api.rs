@@ -6,45 +6,10 @@
 
 use abi_stable::{
     StableAbi,
-    std_types::{ROption, RSlice, RVec},
+    std_types::{RSlice, RVec},
 };
 
-use crate::app::ApplicationId;
-
-pub type BinaryApiMethodFn =
-    for<'a> fn(RSlice<'a, u8>, &mut BinaryApiContext) -> BinaryApiMethodReply;
-
-/// Per-Unix-connection identity presented to Binary API methods.
-#[derive(Debug, Clone, Copy, Default, StableAbi)]
-#[repr(C)]
-pub struct BinaryApiContext {
-    application: ROption<u64>,
-}
-
-impl BinaryApiContext {
-    #[inline]
-    pub fn application(&self) -> Option<ApplicationId> {
-        self.application.into_option().map(ApplicationId::from_raw)
-    }
-
-    #[doc(hidden)]
-    #[inline]
-    pub fn attach_application(&mut self, application: ApplicationId) -> bool {
-        if self.application.is_some() {
-            return false;
-        }
-        self.application = ROption::RSome(application.raw());
-        true
-    }
-
-    #[doc(hidden)]
-    #[inline]
-    pub fn detach_application(&mut self) -> Option<ApplicationId> {
-        core::mem::replace(&mut self.application, ROption::RNone)
-            .into_option()
-            .map(ApplicationId::from_raw)
-    }
-}
+pub type BinaryApiMethodFn = for<'a> fn(RSlice<'a, u8>) -> BinaryApiMethodReply;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, StableAbi)]
 #[repr(u8)]
@@ -115,7 +80,7 @@ impl BinaryApiMethodEntry {
     }
 
     #[inline]
-    pub fn call(self, request: &[u8], context: &mut BinaryApiContext) -> BinaryApiMethodReply {
-        (self.call)(RSlice::from_slice(request), context)
+    pub fn call(self, request: &[u8]) -> BinaryApiMethodReply {
+        (self.call)(RSlice::from_slice(request))
     }
 }

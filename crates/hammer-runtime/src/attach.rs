@@ -5,17 +5,18 @@ use std::sync::{Arc, Weak};
 
 use crossbeam_queue::ArrayQueue;
 use hammer_infra::segment::Segment;
-use tokio::io::{AsyncReadExt, Interest};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
 use tokio::sync::Notify;
 
 use crate::app::{AppSession, ApplicationId, SessionEventQueue, SessionOffsets};
 use crate::{AttachError, RuntimeResult};
 
 pub const ATTACH_PROTOCOL_VERSION: u64 = 1;
-pub const ATTACH_APPLICATION_WORDS: usize = 2;
-pub const ATTACH_APPLICATION_BYTES: usize = ATTACH_APPLICATION_WORDS * size_of::<u64>();
-pub const ATTACH_APPLICATION_ACCEPTED: u8 = 0;
-pub const ATTACH_APPLICATION_REJECTED: u8 = 1;
+pub const ATTACH_REQUEST_BYTES: usize = size_of::<u64>();
+pub const ATTACH_REPLY_WORDS: usize = 3;
+pub const ATTACH_REPLY_BYTES: usize = ATTACH_REPLY_WORDS * size_of::<u64>();
+pub const ATTACH_STATUS_ACCEPTED: u64 = 0;
+pub const ATTACH_STATUS_REJECTED: u64 = 1;
 pub const ATTACH_DESCRIPTOR_COUNT: usize = 4;
 pub const ATTACH_METADATA_WORDS: usize = 8;
 pub const ATTACH_METADATA_BYTES: usize = ATTACH_METADATA_WORDS * size_of::<u64>();
@@ -118,14 +119,15 @@ impl AppServer {
         }
     }
 
-    pub async fn serve<Attached, Detached>(
+    pub async fn serve<Attach, Detached, ApplicationError>(
         self: Arc<Self>,
-        application_attached: Attached,
+        attach_application: Attach,
         application_detached: Detached,
     ) -> RuntimeResult<()>
     where
-        Attached: Fn(ApplicationId) -> bool,
+        Attach: Fn() -> Result<ApplicationId, ApplicationError>,
         Detached: Fn(ApplicationId),
+        ApplicationError: std::fmt::Display,
     {
         let listener = self
             .listener
@@ -133,9 +135,8 @@ impl AppServer {
             .map_err(|source| AttachError::ListenerRegistration { source })?;
         let listener = tokio::net::UnixListener::from_std(listener)
             .map_err(|source| AttachError::ListenerRegistration { source })?;
-        let (registration_tx, mut registration_rx) = tokio::sync::mpsc::channel::<
-            RuntimeResult<(ApplicationId, tokio::net::UnixStream)>,
-        >(self.capacity);
+        let (registration_tx, mut registration_rx) =
+            tokio::sync::mpsc::channel::<RuntimeResult<tokio::net::UnixStream>>(self.capacity);
         let (detached_tx, mut detached_rx) = tokio::sync::mpsc::channel(self.capacity);
         let mut clients = HashMap::<ApplicationId, Arc<tokio::net::UnixStream>>::new();
         let mut publications = HashMap::<ApplicationId, VecDeque<AppSessionPublication>>::new();
@@ -167,14 +168,10 @@ impl AppServer {
                     let (mut client, _) = accepted.map_err(|source| AttachError::Accept { source })?;
                     let registration_tx = registration_tx.clone();
                     tokio::spawn(async move {
-                        let mut registration = [0_u8; ATTACH_APPLICATION_BYTES];
-                        let result = match client.read_exact(&mut registration).await {
+                        let mut request = [0_u8; ATTACH_REQUEST_BYTES];
+                        let result = match client.read_exact(&mut request).await {
                             Ok(_) => {
-                                let version = u64::from_le_bytes(
-                                    registration[..size_of::<u64>()]
-                                        .try_into()
-                                        .expect("attach version occupies one word"),
-                                );
+                                let version = u64::from_le_bytes(request);
                                 if version != ATTACH_PROTOCOL_VERSION {
                                     Err(AttachError::Accept {
                                         source: io::Error::new(
@@ -184,12 +181,7 @@ impl AppServer {
                                     }
                                     .into())
                                 } else {
-                                    let application = u64::from_le_bytes(
-                                        registration[size_of::<u64>()..]
-                                            .try_into()
-                                            .expect("Application identity occupies one word"),
-                                    );
-                                    Ok((ApplicationId::from_raw(application), client))
+                                    Ok(client)
                                 }
                             }
                             Err(source) => Err(AttachError::Accept { source }.into()),
@@ -198,65 +190,72 @@ impl AppServer {
                     });
                 }
                 Some(registration) = registration_rx.recv() => {
-                    let Ok((application, client)) = registration else {
+                    let Ok(mut client) = registration else {
                         continue;
                     };
-                    let accepted = clients.len() < self.capacity
-                        && !clients.contains_key(&application)
-                        && application_attached(application);
-                    let status = if accepted {
-                        ATTACH_APPLICATION_ACCEPTED
-                    } else {
-                        ATTACH_APPLICATION_REJECTED
-                    };
-                    loop {
-                        client
-                            .writable()
-                            .await
-                            .map_err(|source| AttachError::Send { source })?;
-                        match client.try_write(&[status]) {
-                            Ok(1) => break,
-                            Ok(_) => {
-                                return Err(AttachError::Send {
-                                    source: io::Error::new(
-                                        io::ErrorKind::WriteZero,
-                                        "attach status write was empty",
-                                    ),
-                                }
-                                .into());
-                            }
-                            Err(source) if source.kind() == io::ErrorKind::WouldBlock => {}
-                            Err(source) => return Err(AttachError::Send { source }.into()),
+                    if clients.len() >= self.capacity {
+                        if let Err(error) = send_attach_reply(
+                            &mut client,
+                            ATTACH_STATUS_REJECTED,
+                            None,
+                        ).await {
+                            tracing::warn!(%error, "failed to reject Application attach");
                         }
+                        continue;
                     }
-                    if accepted {
-                        let client = Arc::new(client);
-                        clients.insert(application, Arc::clone(&client));
-                        let detached_tx = detached_tx.clone();
-                        let monitor = Arc::clone(&client);
-                        tokio::spawn(async move {
-                            let mut byte = [0_u8; 1];
-                            loop {
-                                if monitor.readable().await.is_err() {
-                                    break;
-                                }
-                                match monitor.try_read(&mut byte) {
-                                    Ok(0) | Ok(_) => break,
-                                    Err(source) if source.kind() == io::ErrorKind::WouldBlock => {}
-                                    Err(_) => break,
-                                }
+                    let application = match attach_application() {
+                        Ok(application) => application,
+                        Err(error) => {
+                            tracing::warn!(%error, "Application attach was rejected");
+                            if let Err(error) = send_attach_reply(
+                                &mut client,
+                                ATTACH_STATUS_REJECTED,
+                                None,
+                            ).await {
+                                tracing::warn!(%error, "failed to reject Application attach");
                             }
-                            let _ = detached_tx.send(application).await;
-                        });
-                        if let Some(mut pending) = publications.remove(&application) {
-                            while let Some(publication) = pending.pop_front() {
-                                if let Err(error) = send_publication(&client, &publication).await {
-                                    tracing::warn!(%error, ?application, "failed to publish App Session");
-                                    if clients.remove(&application).is_some() {
-                                        application_detached(application);
-                                    }
-                                    break;
+                            continue;
+                        }
+                    };
+                    assert!(
+                        !clients.contains_key(&application),
+                        "Application attach allocated an identity already held by a live client"
+                    );
+                    if let Err(error) = send_attach_reply(
+                        &mut client,
+                        ATTACH_STATUS_ACCEPTED,
+                        Some(application),
+                    ).await {
+                        tracing::warn!(%error, ?application, "failed to complete Application attach");
+                        application_detached(application);
+                        continue;
+                    }
+                    let client = Arc::new(client);
+                    clients.insert(application, Arc::clone(&client));
+                    let detached_tx = detached_tx.clone();
+                    let monitor = Arc::clone(&client);
+                    tokio::spawn(async move {
+                        let mut byte = [0_u8; 1];
+                        loop {
+                            if monitor.readable().await.is_err() {
+                                break;
+                            }
+                            match monitor.try_read(&mut byte) {
+                                Ok(0) | Ok(_) => break,
+                                Err(source) if source.kind() == io::ErrorKind::WouldBlock => {}
+                                Err(_) => break,
+                            }
+                        }
+                        let _ = detached_tx.send(application).await;
+                    });
+                    if let Some(mut pending) = publications.remove(&application) {
+                        while let Some(publication) = pending.pop_front() {
+                            if let Err(error) = send_publication(&client, &publication).await {
+                                tracing::warn!(%error, ?application, "failed to publish App Session");
+                                if clients.remove(&application).is_some() {
+                                    application_detached(application);
                                 }
+                                break;
                             }
                         }
                     }
@@ -271,6 +270,26 @@ impl AppServer {
             }
         }
     }
+}
+
+async fn send_attach_reply(
+    client: &mut tokio::net::UnixStream,
+    status: u64,
+    application: Option<ApplicationId>,
+) -> RuntimeResult<()> {
+    let words = [
+        ATTACH_PROTOCOL_VERSION,
+        status,
+        application.map_or(0, ApplicationId::raw),
+    ];
+    let mut reply = [0_u8; ATTACH_REPLY_BYTES];
+    for (chunk, word) in reply.chunks_exact_mut(size_of::<u64>()).zip(words) {
+        chunk.copy_from_slice(&word.to_le_bytes());
+    }
+    client
+        .write_all(&reply)
+        .await
+        .map_err(|source| AttachError::Send { source }.into())
 }
 
 async fn send_publication(
