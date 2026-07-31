@@ -20,7 +20,7 @@ use hammer_service::session::node::{
 };
 use hammer_service::session::runtime::{
     SessionMain, SessionTransport, SessionTransportId, SessionWorker, TransportInternalTransport,
-    TransportInternalTx, dispatch_session_queue_pending, install_session_worker,
+    TransportInternalTx, dispatch_session_queue_events, install_session_worker,
 };
 
 #[derive(Default)]
@@ -127,6 +127,26 @@ fn take_test_worker() -> TestWorker {
     TEST_WORKER.with(|slot| slot.borrow_mut().take().expect("test worker"))
 }
 
+fn update_test_worker(
+    runtime: &DataPlaneRuntime,
+    _: NodeRuntimeData,
+    output_next: SessionQueueNext,
+    now: Instant,
+    frame: &mut BufferFrame,
+    output: &mut SessionQueueOutput,
+) -> RuntimeResult<()> {
+    with_test_worker_mut(|worker| {
+        worker.transport.update_time(
+            &mut worker.sessions,
+            runtime,
+            output_next,
+            frame,
+            output,
+            now,
+        )
+    })
+}
+
 fn dispatch_test_worker(
     runtime: &DataPlaneRuntime,
     _: NodeRuntimeData,
@@ -136,7 +156,7 @@ fn dispatch_test_worker(
     output: &mut SessionQueueOutput,
 ) -> RuntimeResult<()> {
     with_test_worker_mut(|worker| {
-        dispatch_session_queue_pending(
+        dispatch_session_queue_events(
             runtime,
             &mut worker.sessions,
             &mut worker.transport,
@@ -216,6 +236,7 @@ fn svm_readiness_marks_session_queue_before_main_loop_dispatch() {
         &engine.runtime,
         node_data,
         output_next,
+        update_test_worker,
         dispatch_test_worker,
     )
     .expect("install session queue transport dispatch");

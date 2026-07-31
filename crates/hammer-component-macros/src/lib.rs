@@ -200,6 +200,7 @@ struct NodeArgs {
 enum NodeRole {
     Internal,
     Driver,
+    PreInput,
 }
 
 #[derive(Clone, Copy)]
@@ -809,7 +810,7 @@ fn expand_node(
                 }
             }
         }
-        Some(NodeRole::Driver) => {
+        Some(NodeRole::Driver) | Some(NodeRole::PreInput) => {
             let initial_nexts = if args.next.is_some() && store_initial_nexts {
                 quote! {
                     #[inline]
@@ -1132,12 +1133,12 @@ impl Parse for GraphNodeArgs {
                         "kind" => {
                             let kind: Ident = input.parse()?;
                             args.kind = Some(match kind.to_string().as_str() {
-                                "internal" | "driver" | "handoff" => kind,
+                                "internal" | "driver" | "pre_input" | "handoff" => kind,
                                 other => {
                                     return Err(Error::new(
                                         kind.span(),
                                         format!(
-                                            "unknown graph node kind `{other}`; expected `internal`, `driver`, or `handoff`"
+                                            "unknown graph node kind `{other}`; expected `internal`, `driver`, `pre_input`, or `handoff`"
                                         ),
                                     ));
                                 }
@@ -1153,11 +1154,12 @@ impl Parse for GraphNodeArgs {
                             args.role = Some(match role.to_string().as_str() {
                                 "internal" => NodeRole::Internal,
                                 "driver" => NodeRole::Driver,
+                                "pre_input" => NodeRole::PreInput,
                                 other => {
                                     return Err(Error::new(
                                         role.span(),
                                         format!(
-                                            "unknown node role `{other}`; expected `internal` or `driver`"
+                                            "unknown node role `{other}`; expected `internal`, `driver`, or `pre_input`"
                                         ),
                                     ));
                                 }
@@ -1217,7 +1219,7 @@ impl Parse for GraphNodeArgs {
         }
         if args.init.is_none() {
             match args.kind.as_ref().map(ToString::to_string).as_deref() {
-                Some("driver" | "internal") => {}
+                Some("driver" | "internal" | "pre_input") => {}
                 Some("handoff") => {
                     return Err(Error::new(
                         Span::call_site(),
@@ -1282,6 +1284,7 @@ fn graph_node_registration(
 fn graph_node_kind_expr(kind: Option<&Ident>) -> TokenStream2 {
     match kind.map(|k| k.to_string()).as_deref() {
         Some("driver") => quote!(::hammer_core::data_plane::NodeKind::Driver),
+        Some("pre_input") => quote!(::hammer_core::data_plane::NodeKind::PreInput),
         // `internal` and `handoff` are both `NodeKind::Internal`; handoff nodes
         // register with a handle inside their own init fn, the kind stays Internal.
         Some("internal") | Some("handoff") | None => {
@@ -1296,10 +1299,11 @@ fn graph_node_kind_expr(kind: Option<&Ident>) -> TokenStream2 {
 fn graph_node_role_from_kind(kind: Option<&Ident>) -> Result<NodeRole> {
     match kind.map(ToString::to_string).as_deref() {
         Some("driver") => Ok(NodeRole::Driver),
+        Some("pre_input") => Ok(NodeRole::PreInput),
         Some("internal") => Ok(NodeRole::Internal),
         _ => Err(Error::new(
             Span::call_site(),
-            "generated graph initialization requires `kind = driver|internal`",
+            "generated graph initialization requires `kind = driver|pre_input|internal`",
         )),
     }
 }
@@ -1350,6 +1354,14 @@ fn generated_graph_node_init(
         ),
         (NodeRole::Driver, None) => {
             quote!(runtime.nodes().try_register_driver(node)?)
+        }
+        (NodeRole::PreInput, Some(next)) => quote!(
+            runtime
+                .nodes()
+                .try_register_pre_input_with_next_names(node, &#next::NEXT_NAMES)?
+        ),
+        (NodeRole::PreInput, None) => {
+            quote!(runtime.nodes().try_register_pre_input(node)?)
         }
         (NodeRole::Internal, Some(next)) => quote!(
             runtime
@@ -3331,6 +3343,40 @@ mod tests {
         assert!(
             expanded.contains("static __SERVICE_GRAPH_NODE_INPUT_OWNER_NODE"),
             "missing explicit graph registration: {expanded}"
+        );
+    }
+
+    #[test]
+    fn graph_node_generates_zero_state_pre_input_init() {
+        let args = syn::parse_str::<GraphNodeArgs>(
+            r#"graph = service, name = "clean-tx", kind = pre_input, next = InputNext, state = disabled"#,
+        )
+        .expect("parse generated pre-input graph init");
+        let item = syn::parse_str::<Item>("pub struct CleanTxNode;")
+            .expect("parse generated pre-input node");
+        let ident = match &item {
+            Item::Struct(item) => item.ident.clone(),
+            _ => unreachable!(),
+        };
+        let expanded = expand_graph_node(args, &ident, item)
+            .expect("expand generated pre-input graph init")
+            .to_string();
+
+        assert!(
+            expanded.contains("DriverNode"),
+            "pre-input generated registration reuses driver metadata: {expanded}"
+        );
+        assert!(
+            expanded.contains("NodeKind :: PreInput"),
+            "missing pre-input kind: {expanded}"
+        );
+        assert!(
+            expanded.contains("try_register_pre_input_with_next_names"),
+            "missing generated pre-input named-next registration: {expanded}"
+        );
+        assert!(
+            expanded.contains("NodeState :: Disabled"),
+            "missing generated disabled state: {expanded}"
         );
     }
 

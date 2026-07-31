@@ -9,7 +9,7 @@ A worker-local directed graph of packet-processing graph nodes. Packets move thr
 _Avoid_: pipeline, middleware chain, callback stack, async task graph
 
 **Graph Node**:
-A packet graph module with one static Node contract, one declared kind, and one declared typed worker-local state that consumes a Pending Frame and may enqueue packet indexes to one or more Next Frames. Driver and Internal are kind values, not parallel trait families. A graph node owns packet classification or transformation for one graph step, not application I/O policy.
+A packet graph module with one static Node contract, one declared kind, and one declared typed worker-local state that consumes a Pending Frame and may enqueue packet indexes to one or more Next Frames. Driver, PreInput, and Internal are kind values, not parallel trait families. A graph node owns packet classification or transformation for one graph step, not application I/O policy.
 _Avoid_: service, handler, processor, callback, driver-node trait, internal-node trait, opaque runtime-data words
 
 **Graph Node State**:
@@ -19,6 +19,10 @@ _Avoid_: `NodeRuntimeData`, fixed word payload, global state vector plus slot, d
 **Driver Node**:
 A graph node that brings packets or external readiness into the data plane. Driver nodes are runtime roles, not protocol business roles.
 _Avoid_: protocol driver, socket task, app poller
+
+**Pre Input Node**:
+A graph node that runs before all Input/Driver nodes on the same data worker. It may be polled or interrupted and prepares worker-local state such as TX ring cleanup before input processing begins.
+_Avoid_: input poller, protocol driver, background worker, side task
 
 **Internal Node**:
 A graph node that performs data-plane work while packet ownership stays on the current data worker. Internal nodes transform metadata, split frames, or select next arcs.
@@ -49,7 +53,7 @@ TCP established, rcv-process, listen, and syn-sent drain the input Frame, select
 _Avoid_: state-node get_next_frame/put_next_frame by target NodeId, one-buffer control put before commit
 
 **Session Queue Fanout**:
-Session Queue accumulates generated indexes on the driver Frame with one local next per entry, then performs a single Graph Fanout flush at dispatch end. Existing pending output seeds the shared IO count; normal and custom IO share the remaining allowance up to 128; control processing is not charged; unserved IO remains scheduled. Transport commits before graph visibility.
+Session Queue samples one dispatch time, updates installed transports before Session Message Queue drain, processes control before IO, and accumulates generated indexes on the driver Frame with one local next per entry before a single Graph Fanout flush at dispatch end. Existing pending output seeds the shared IO count; normal and custom IO share the remaining allowance up to 128; control processing is not charged; unserved IO remains scheduled. Transport commits before graph visibility.
 _Avoid_: per-packet get/push/put from Session Queue, Fanout before transport commit, charging control to the IO budget
 
 **Process Frame Fanout**:
@@ -115,7 +119,7 @@ A worker that owns data-plane hot-path state for one execution lane. Data-plane 
 _Avoid_: tokio worker, control thread, generic thread
 
 **Main Loop Step**:
-One synchronous fixed-order pass through barrier handling, File readiness, Handoff, ready Graph Nodes, driver polling, timers, and exit checks. Step order is part of the runtime semantics. A Data Worker repeatedly executes Main Loop Steps; it does not host a general task executor or Future runtime.
+One synchronous fixed-order pass through barrier handling, File readiness, Handoff, ready Graph Nodes, PreInput and Driver polling, timers, and exit checks. PreInput polling and interrupts are dispatched before Driver polling and interrupts. Step order is part of the runtime semantics. A Data Worker repeatedly executes Main Loop Steps; it does not host a general task executor or Future runtime.
 _Avoid_: event loop tick, reactor pass, worker Future queue, async packet path, arbitrary scheduler iteration
 
 **Process Node**:

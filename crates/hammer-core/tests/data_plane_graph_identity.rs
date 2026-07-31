@@ -60,6 +60,7 @@ fn core_data_plane_graph_identity_items_have_expected_behavior() {
     );
 
     assert_eq!(NodeKind::Driver, NodeKind::Driver);
+    assert_eq!(NodeKind::PreInput, NodeKind::PreInput);
     assert_eq!(NodeKind::Internal, NodeKind::Internal);
     assert_eq!(NodeState::Disabled, NodeState::Disabled);
     assert_eq!(NodeState::default(), NodeState::Polling);

@@ -46,7 +46,7 @@ use hammer_infra::pool::Index as PoolIndex;
 use hammer_infra::thread_owned::{ThreadOwned, ThreadOwnedError};
 use hammer_service::session::node::{SessionQueueNode, SessionQueueOutput};
 use hammer_service::session::runtime::{
-    SessionMain, SessionTransport, SessionWorker, dispatch_session_queue_pending,
+    SessionMain, SessionTransport, SessionWorker, dispatch_session_queue_events,
 };
 use hammer_service::session::{SessionId, SessionQueueNext};
 
@@ -551,6 +551,7 @@ fn bind_worker_graph(engine: &mut Engine) -> RuntimeResult<()> {
         &engine.runtime,
         session_queue_data,
         session_queue_output,
+        tcp_session_queue_update_time,
         tcp_session_queue_dispatch,
     )?;
     let main_guard = TCP_MAIN.load();
@@ -608,6 +609,23 @@ fn init_tcp_worker(engine: &mut Engine) -> RuntimeResult<()> {
     bind_worker_graph(engine)
 }
 
+fn tcp_session_queue_update_time(
+    runtime: &DataPlaneRuntime,
+    _: NodeRuntimeData,
+    output_next: SessionQueueNext,
+    now: std::time::Instant,
+    frame: &mut hammer_core::data_plane::BufferFrame,
+    output: &mut SessionQueueOutput,
+) -> RuntimeResult<()> {
+    TCP_MAIN
+        .load_full()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?
+        .with_worker(runtime, |sessions, tcp| {
+            tcp.update_time(sessions, runtime, output_next, frame, output, now)?;
+            Ok(())
+        })
+}
+
 fn tcp_session_queue_dispatch(
     runtime: &DataPlaneRuntime,
     _: NodeRuntimeData,
@@ -620,7 +638,7 @@ fn tcp_session_queue_dispatch(
         .load_full()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?
         .with_worker(runtime, |sessions, tcp| {
-            dispatch_session_queue_pending(runtime, sessions, tcp, output_next, frame, output, now)
+            dispatch_session_queue_events(runtime, sessions, tcp, output_next, frame, output, now)
                 .map(|_| ())
         })
 }

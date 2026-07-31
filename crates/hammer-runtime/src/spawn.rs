@@ -1105,7 +1105,6 @@ fn run_data_worker_loop(
     DATA_LOCAL_DRIVER_WAKER.with(|slot| {
         *slot.borrow_mut() = Some(worker_waker.clone());
     });
-    let mut next_polling_driver_at = Instant::now();
 
     loop {
         match shutdown_rx.try_recv() {
@@ -1113,12 +1112,7 @@ fn run_data_worker_loop(
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
         }
 
-        let local_progress = poll_data_worker_once(
-            remote_local,
-            &worker_waker,
-            &mut next_polling_driver_at,
-            barrier,
-        );
+        let local_progress = poll_data_worker_once(remote_local, &worker_waker, barrier);
         drive_tokio_worker_once(runtime, local_progress);
 
         if !local_progress {
@@ -1131,7 +1125,6 @@ fn run_data_worker_loop(
 fn poll_data_worker_once(
     remote_local: &DataRemoteLocalQueue,
     worker_waker: &Waker,
-    next_polling_driver_at: &mut Instant,
     barrier: &crate::barrier::WorkerBarrier,
 ) -> bool {
     let mut cx = Context::from_waker(worker_waker);
@@ -1141,20 +1134,18 @@ fn poll_data_worker_once(
 
     barrier.check();
 
-    let now = Instant::now();
     let mut progressed = false;
-    if now >= *next_polling_driver_at {
-        let poll_interval = DATA_WORKER_IDLE_SLICE.with(|slot| slot.get());
-        *next_polling_driver_at = now + poll_interval;
-        progressed =
-            match with_data_plane_runtime(|runtime| runtime.schedule_polling_driver_nodes()) {
-                Ok(scheduled) => scheduled > 0,
-                Err(err) => {
-                    tracing::debug!("data plane polling driver scheduler failed: {err}");
-                    false
-                }
-            };
-    }
+    progressed |= match with_data_plane_runtime(|runtime| -> RuntimeResult<usize> {
+        let pre_input = runtime.schedule_polling_pre_input_nodes()?;
+        let drivers = runtime.schedule_polling_driver_nodes()?;
+        Ok(pre_input + drivers)
+    }) {
+        Ok(scheduled) => scheduled > 0,
+        Err(err) => {
+            tracing::debug!("data plane polling node scheduler failed: {err}");
+            false
+        }
+    };
     progressed |= poll_remote_local_tasks(remote_local);
     progressed |= poll_data_plane_nodes(&mut cx);
     progressed |= poll_data_local_tasks(&mut cx);

@@ -6,7 +6,7 @@ use crate::error::{RuntimeError, RuntimeResult};
 use hammer_core::data_plane::{
     BUFFER_CACHE_LINE_SIZE, BufferFrame, BufferNodeError, BufferPoolArena, BufferRef, BufferRefMut,
     DEFAULT_BUFFER_FRAME_POOL_SIZE, DataPlaneBuffers, Frame, FrameBatchWidth, Index, Next,
-    NodeHandle, NodeId, NodeNext, NodeRegistration, Pending,
+    NodeHandle, NodeId, NodeKind, NodeNext, NodeRegistration, Pending,
 };
 use hammer_core::error::{DataPlaneError, DataPlaneResult};
 use hammer_infra::PageSize;
@@ -620,7 +620,16 @@ impl DataPlaneRuntime {
 
     #[inline]
     pub fn schedule_polling_driver_nodes(&self) -> RuntimeResult<usize> {
-        let nodes = self.nodes.polling_driver_nodes()?;
+        self.schedule_polling_nodes(NodeKind::Driver)
+    }
+
+    #[inline]
+    pub fn schedule_polling_pre_input_nodes(&self) -> RuntimeResult<usize> {
+        self.schedule_polling_nodes(NodeKind::PreInput)
+    }
+
+    fn schedule_polling_nodes(&self, kind: NodeKind) -> RuntimeResult<usize> {
+        let nodes = self.nodes.polling_nodes_to_schedule(kind)?;
         let scheduled = nodes.len();
         for node in nodes {
             self.schedule_empty_frame(node)?;
@@ -629,9 +638,17 @@ impl DataPlaneRuntime {
     }
 
     pub(crate) fn schedule_interrupt_driver_nodes(&self) -> RuntimeResult<usize> {
+        self.schedule_interrupt_nodes(NodeKind::Driver)
+    }
+
+    pub(crate) fn schedule_interrupt_pre_input_nodes(&self) -> RuntimeResult<usize> {
+        self.schedule_interrupt_nodes(NodeKind::PreInput)
+    }
+
+    fn schedule_interrupt_nodes(&self, kind: NodeKind) -> RuntimeResult<usize> {
         let mut scheduled = 0;
         let mut start = 0;
-        while let Some(node) = self.nodes.next_interrupt_pending(start) {
+        while let Some(node) = self.nodes.next_interrupt_pending_for_kind(start, kind) {
             start = node.slot() as usize + 1;
             self.schedule_empty_frame(node)?;
             scheduled += 1;
