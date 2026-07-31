@@ -267,8 +267,28 @@ pub enum AttachError {
         #[source]
         source: std::io::Error,
     },
-    #[error("attach metadata write was partial: expected {expected}, sent {actual}")]
-    MetadataWriteIncomplete { expected: usize, actual: usize },
+    #[error("attach descriptor count {actual} exceeds protocol maximum {max}")]
+    DescriptorCountTooLarge { actual: usize, max: usize },
+    #[error("Application MQ segment has no backing descriptor")]
+    ApplicationMqSegmentMissing,
+    #[error("Application MQ publication requires at least one Data Worker")]
+    ApplicationMqWorkerCountZero,
+    #[error("Application MQ publication has {queues} queues but {offsets} offsets")]
+    ApplicationMqQueueCountMismatch { queues: usize, offsets: usize },
+    #[error("Application MQ descriptor count exceeds addressable range")]
+    ApplicationMqDescriptorCountOverflow,
+    #[error("Application MQ descriptor count {actual} exceeds protocol maximum {max}")]
+    ApplicationMqDescriptorCountTooLarge { actual: usize, max: usize },
+    #[error(
+        "Application MQ worker {worker} offset {offset} is outside segment size {segment_size}"
+    )]
+    ApplicationMqOffsetOutOfRange {
+        worker: usize,
+        offset: u64,
+        segment_size: u64,
+    },
+    #[error("Application MQ worker {worker} has no write signal descriptor")]
+    ApplicationMqWriteSignalMissing { worker: usize },
     #[error("failed to create attach signal pipe")]
     SignalPipeCreate {
         #[source]
@@ -332,12 +352,8 @@ pub enum AttachError {
     },
     #[error("attach RX FIFO configuration is invalid")]
     RxFifoInvalid,
-    #[error("attach TX FIFO configuration is invalid")]
-    TxFifoInvalid,
     #[error("attach event queue configuration is invalid")]
     EventQueueInvalid,
-    #[error("attach TX event queue configuration is invalid")]
-    TxEventQueueInvalid,
     #[error("failed to accept attach client")]
     Accept {
         #[source]
@@ -347,8 +363,6 @@ pub enum AttachError {
     SegmentDescriptorMissing,
     #[error("attach session event queue has no read signal descriptor")]
     SessionSignalMissing,
-    #[error("attach worker TX event queue has no write signal descriptor")]
-    TxEventSignalMissing,
     #[error("failed to duplicate remote app session signal descriptor")]
     SessionSignalDuplicate {
         #[source]

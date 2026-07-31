@@ -1,7 +1,8 @@
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, IntoRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use hammer_infra::segment::Segment;
 use hammer_runtime::app::{
@@ -9,9 +10,10 @@ use hammer_runtime::app::{
     SessionMsgQueue, SessionOffsets,
 };
 use hammer_runtime::attach::{
-    APPLICATION_MQ_DESCRIPTOR_COUNT, APPLICATION_MQ_METADATA_BYTES, APPLICATION_MQ_METADATA_WORDS,
-    ATTACH_DESCRIPTOR_COUNT, ATTACH_METADATA_BYTES, ATTACH_METADATA_WORDS, ATTACH_PROTOCOL_VERSION,
-    ATTACH_REPLY_BYTES, ATTACH_REPLY_WORDS, ATTACH_REQUEST_BYTES, ATTACH_STATUS_ACCEPTED,
+    APPLICATION_MQ_BASE_DESCRIPTOR_COUNT, APPLICATION_MQ_METADATA_BYTES,
+    APPLICATION_MQ_METADATA_WORDS, ATTACH_DESCRIPTOR_COUNT, ATTACH_METADATA_BYTES,
+    ATTACH_METADATA_WORDS, ATTACH_PROTOCOL_VERSION, ATTACH_REPLY_BYTES, ATTACH_REPLY_WORDS,
+    ATTACH_REQUEST_BYTES, ATTACH_STATUS_ACCEPTED, MAX_ATTACH_DESCRIPTORS,
 };
 use thiserror::Error;
 
@@ -51,6 +53,29 @@ pub enum AppClientError {
     InvalidDescriptorPayload,
     #[error("attach descriptor count mismatch: expected {expected}, got {actual}")]
     DescriptorCount { expected: usize, actual: usize },
+    #[error("attach descriptor count {actual} exceeds protocol maximum {max}")]
+    DescriptorCountTooLarge { actual: usize, max: usize },
+    #[error("Application MQ publication requires at least one Data Worker")]
+    ApplicationMqWorkerCountZero,
+    #[error("Application MQ worker count {count} cannot be represented")]
+    ApplicationMqWorkerCountInvalid { count: u64 },
+    #[error("Application MQ segment size {size} cannot be represented")]
+    ApplicationMqSegmentSize { size: u64 },
+    #[error("failed to map the attached Application MQ segment")]
+    ApplicationMqSegmentMap {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "Application MQ worker {worker} offset {offset} is outside segment size {segment_size}"
+    )]
+    ApplicationMqOffset {
+        worker: usize,
+        offset: u64,
+        segment_size: u64,
+    },
+    #[error("Application MQ worker {worker} is outside the mapped worker range {worker_count}")]
+    WorkerQueueMissing { worker: usize, worker_count: usize },
     #[error("failed to read received attach descriptor flags")]
     ReceivedDescriptorFlags {
         #[source]
@@ -65,11 +90,6 @@ pub enum AppClientError {
     OffsetOverflow,
     #[error("failed to map the attached session segment")]
     SessionSegmentMap {
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to map the attached worker event segment")]
-    WorkerSegmentMap {
         #[source]
         source: std::io::Error,
     },
@@ -101,6 +121,7 @@ pub struct AppClient {
     application: ApplicationId,
     pub(crate) session_requests: SessionMsgQueue,
     pub(crate) session_replies: SessionMsgQueue,
+    rx_mqs: Box<[Arc<SessionMsgQueue>]>,
     pub(crate) next_session_context: u64,
 }
 
@@ -134,41 +155,131 @@ impl AppClient {
             return Err(AppClientError::AttachRejected);
         }
         let application = ApplicationId::from_raw(words[2]);
-        let (metadata, [segment_fd, request_write_fd, reply_read_fd]) = descriptor::receive::<
-            APPLICATION_MQ_METADATA_BYTES,
-            APPLICATION_MQ_DESCRIPTOR_COUNT,
-        >(&stream)?;
-        let words = descriptor::words::<APPLICATION_MQ_METADATA_WORDS>(&metadata)?;
+        let (mut metadata, descriptors) =
+            descriptor::receive(&stream, APPLICATION_MQ_METADATA_BYTES)?;
+        let words = descriptor::words_prefix::<APPLICATION_MQ_METADATA_WORDS>(&metadata)?;
         if words[0] != ATTACH_PROTOCOL_VERSION {
             return Err(AppClientError::ProtocolVersion { actual: words[0] });
         }
-        let segment_size =
+        let control_segment_size =
             usize::try_from(words[1]).map_err(|_| AppClientError::SessionControlOffset)?;
-        if segment_size == 0
-            || segment_size > isize::MAX as usize
-            || words[2] >= segment_size as u64
-            || words[3] >= segment_size as u64
+        let rx_mqs_segment_size = usize::try_from(words[4])
+            .map_err(|_| AppClientError::ApplicationMqSegmentSize { size: words[4] })?;
+        let worker_count = usize::try_from(words[5])
+            .map_err(|_| AppClientError::ApplicationMqWorkerCountInvalid { count: words[5] })?;
+        if worker_count == 0 {
+            return Err(AppClientError::ApplicationMqWorkerCountZero);
+        }
+        let expected_descriptors = APPLICATION_MQ_BASE_DESCRIPTOR_COUNT
+            .checked_add(worker_count)
+            .ok_or(AppClientError::InvalidDescriptorPayload)?;
+        if expected_descriptors > MAX_ATTACH_DESCRIPTORS {
+            return Err(AppClientError::DescriptorCountTooLarge {
+                actual: expected_descriptors,
+                max: MAX_ATTACH_DESCRIPTORS,
+            });
+        }
+        if descriptors.len() != expected_descriptors {
+            return Err(AppClientError::DescriptorCount {
+                expected: expected_descriptors,
+                actual: descriptors.len(),
+            });
+        }
+        let expected_metadata_len = APPLICATION_MQ_METADATA_BYTES
+            .checked_add(
+                worker_count
+                    .checked_mul(size_of::<u64>())
+                    .ok_or(AppClientError::InvalidDescriptorPayload)?,
+            )
+            .ok_or(AppClientError::InvalidDescriptorPayload)?;
+        metadata.resize(expected_metadata_len, 0);
+        stream
+            .read_exact(&mut metadata[APPLICATION_MQ_METADATA_BYTES..])
+            .map_err(|source| AppClientError::Receive { source })?;
+        if control_segment_size == 0
+            || control_segment_size > isize::MAX as usize
+            || words[2] >= control_segment_size as u64
+            || words[3] >= control_segment_size as u64
+            || rx_mqs_segment_size == 0
+            || rx_mqs_segment_size > isize::MAX as usize
         {
             return Err(AppClientError::SessionControlOffset);
         }
-        let segment = Segment::from_fd(segment_fd.as_raw_fd(), segment_size)
-            .map_err(|source| AppClientError::SessionControlSegmentMap { source })?;
+        let mut descriptors = descriptors.into_iter();
+        let control_segment = Segment::from_fd(
+            descriptors
+                .next()
+                .expect("validated attach descriptor count")
+                .as_raw_fd(),
+            control_segment_size,
+        )
+        .map_err(|source| AppClientError::SessionControlSegmentMap { source })?;
         let session_requests = unsafe {
             SessionMsgQueue::from_shared(
-                segment.clone(),
+                control_segment.clone(),
                 words[2],
                 None,
-                Some(request_write_fd.into_raw_fd()),
+                Some(
+                    descriptors
+                        .next()
+                        .expect("validated attach descriptor count")
+                        .into_raw_fd(),
+                ),
             )
         };
         let session_replies = unsafe {
-            SessionMsgQueue::from_shared(segment, words[3], Some(reply_read_fd.into_raw_fd()), None)
+            SessionMsgQueue::from_shared(
+                control_segment,
+                words[3],
+                Some(
+                    descriptors
+                        .next()
+                        .expect("validated attach descriptor count")
+                        .into_raw_fd(),
+                ),
+                None,
+            )
         };
+        let rx_mqs_segment = Segment::from_fd(
+            descriptors
+                .next()
+                .expect("validated attach descriptor count")
+                .as_raw_fd(),
+            rx_mqs_segment_size,
+        )
+        .map_err(|source| AppClientError::ApplicationMqSegmentMap { source })?;
+        let rx_mq_offsets =
+            descriptor::words_slice(&metadata, APPLICATION_MQ_METADATA_WORDS, worker_count)?;
+        let mut rx_mqs = Vec::with_capacity(worker_count);
+        for worker in 0..worker_count {
+            let offset = rx_mq_offsets[worker];
+            if offset >= rx_mqs_segment.size() as u64 {
+                return Err(AppClientError::ApplicationMqOffset {
+                    worker,
+                    offset,
+                    segment_size: rx_mqs_segment.size() as u64,
+                });
+            }
+            rx_mqs.push(Arc::new(unsafe {
+                SessionMsgQueue::from_shared(
+                    rx_mqs_segment.clone(),
+                    offset,
+                    None,
+                    Some(
+                        descriptors
+                            .next()
+                            .expect("validated attach descriptor count")
+                            .into_raw_fd(),
+                    ),
+                )
+            }));
+        }
         Ok(Self {
             stream,
             application,
             session_requests,
             session_replies,
+            rx_mqs: rx_mqs.into_boxed_slice(),
             next_session_context: 1,
         })
     }
@@ -179,51 +290,65 @@ impl AppClient {
     }
 
     pub fn accept(&self) -> Result<AppSession, AppClientError> {
-        let (metadata, [session_fd, tx_event_fd, event_read_fd, tx_event_write_fd]) =
-            descriptor::receive::<ATTACH_METADATA_BYTES, ATTACH_DESCRIPTOR_COUNT>(&self.stream)?;
-        let words = descriptor::words::<ATTACH_METADATA_WORDS>(&metadata)?;
+        let (metadata, descriptors) = descriptor::receive(&self.stream, ATTACH_METADATA_BYTES)?;
+        let words = descriptor::words_prefix::<ATTACH_METADATA_WORDS>(&metadata)?;
         if words[0] != ATTACH_PROTOCOL_VERSION {
             return Err(AppClientError::ProtocolVersion { actual: words[0] });
         }
+        if descriptors.len() != ATTACH_DESCRIPTOR_COUNT {
+            return Err(AppClientError::DescriptorCount {
+                expected: ATTACH_DESCRIPTOR_COUNT,
+                actual: descriptors.len(),
+            });
+        }
+        let handle = SessionHandle::from(words[1]);
         let session_segment_size =
             usize::try_from(words[2]).map_err(|_| AppClientError::OffsetOverflow)?;
-        let tx_event_segment_size =
-            usize::try_from(words[3]).map_err(|_| AppClientError::OffsetOverflow)?;
-        if session_segment_size == 0
-            || session_segment_size > isize::MAX as usize
-            || tx_event_segment_size == 0
-            || tx_event_segment_size > isize::MAX as usize
-        {
+        if session_segment_size == 0 || session_segment_size > isize::MAX as usize {
             return Err(AppClientError::OffsetOverflow);
         }
         let offsets = SessionOffsets {
-            rx_fifo_off: words[4],
-            tx_fifo_off: words[5],
-            evt_q_off: words[6],
-            tx_evt_q_off: words[7],
+            rx_fifo_off: words[3],
+            tx_fifo_off: words[4],
+            evt_q_off: words[5],
         };
         if [offsets.rx_fifo_off, offsets.tx_fifo_off, offsets.evt_q_off]
             .into_iter()
             .any(|offset| offset >= session_segment_size as u64)
-            || offsets.tx_evt_q_off >= tx_event_segment_size as u64
         {
             return Err(AppClientError::OffsetOverflow);
         }
 
-        let session_segment = Segment::from_fd(session_fd.as_raw_fd(), session_segment_size)
-            .map_err(|source| AppClientError::SessionSegmentMap { source })?;
-        let tx_event_segment = Segment::from_fd(tx_event_fd.as_raw_fd(), tx_event_segment_size)
-            .map_err(|source| AppClientError::WorkerSegmentMap { source })?;
+        let mut descriptors = descriptors.into_iter();
+        let session_segment = Segment::from_fd(
+            descriptors
+                .next()
+                .expect("validated attach descriptor count")
+                .as_raw_fd(),
+            session_segment_size,
+        )
+        .map_err(|source| AppClientError::SessionSegmentMap { source })?;
+        let worker = handle.worker_index() as usize;
+        let worker_queue =
+            self.rx_mqs
+                .get(worker)
+                .cloned()
+                .ok_or(AppClientError::WorkerQueueMissing {
+                    worker,
+                    worker_count: self.rx_mqs.len(),
+                })?;
         Ok(unsafe {
-            AppSession::from_segments(
-                SessionHandle::from(words[1]),
+            AppSession::from_segment(
+                handle,
                 &session_segment,
-                &tx_event_segment,
                 &offsets,
-                Some(event_read_fd.into_raw_fd()),
-                None,
-                None,
-                Some(tx_event_write_fd.into_raw_fd()),
+                Some(
+                    descriptors
+                        .next()
+                        .expect("validated attach descriptor count")
+                        .into_raw_fd(),
+                ),
+                worker_queue,
             )
         })
     }

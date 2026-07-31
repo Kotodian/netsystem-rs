@@ -12,7 +12,8 @@ use hammer_runtime::app::{
     AppSessionPolicy, AppSessionProtocolEntry, ApplicationConnectionId, ApplicationId,
     ApplicationListenerId, SessionMsgQueue, SessionMsgQueueError,
 };
-use hammer_runtime::{DataWorkerId, RuntimeError};
+use hammer_runtime::attach::ApplicationMqPublication;
+use hammer_runtime::{AttachError, DataWorkerId, RuntimeError};
 use thiserror::Error;
 
 use super::config::Session;
@@ -177,14 +178,13 @@ impl ApplicationMqResources {
         self.queues.get(worker.slot())
     }
 
-    #[inline]
-    pub(crate) fn segment(&self) -> &Segment {
-        &self.segment
-    }
-
-    #[inline]
-    pub(crate) fn offset(&self, worker: DataWorkerId) -> Option<u64> {
-        self.offsets.get(worker.slot()).copied()
+    pub(crate) fn publication(&self) -> Result<ApplicationMqPublication, ApplicationError> {
+        ApplicationMqPublication::new(
+            self.segment.clone(),
+            self.queues.clone(),
+            self.offsets.clone(),
+        )
+        .map_err(|source| ApplicationError::MqPublication { source })
     }
 }
 
@@ -201,12 +201,13 @@ pub struct ApplicationMain {
 const APP_MQ_CAPACITY_MIN: usize = 128;
 const APP_MQ_SEGMENT_HEADROOM: usize = 1 << 20;
 
-// SAFETY: every state access verifies the creating Main Thread before
-// dereferencing `state`; ApplicationRegistration is !Send and Binary API calls
-// execute on that same thread.
+// SAFETY: mutable state access is restricted to the creating Main Thread.
+// Data Workers may read published listener and connection entries; their
+// mutation or removal occurs only while WorkerBarrier stops those readers.
+// ApplicationRegistration remains !Send.
 unsafe impl Send for ApplicationMain {}
-// SAFETY: shared references can be retained by RuntimeRegistry, but methods do
-// not touch state from any thread other than `owner`.
+// SAFETY: worker reads follow the publication contract above, and connection
+// completion changes only its dedicated atomic state.
 unsafe impl Sync for ApplicationMain {}
 
 impl ApplicationMain {
@@ -357,22 +358,19 @@ impl ApplicationMain {
         })?
     }
 
-    pub(crate) fn mq_worker(
+    /// Returns the runtime-neutral MQ publication used by the attach server.
+    pub fn application_mq_publication(
         &self,
         application: ApplicationId,
-        worker: DataWorkerId,
-    ) -> Option<(Arc<SessionMsgQueue>, Option<Segment>, u64)> {
-        // SAFETY: MQ resources are published under the worker barrier and are
-        // only read by Data Workers during session construction.
-        let state = unsafe { &*self.state.get() };
-        let resources = state
+    ) -> Result<ApplicationMqPublication, ApplicationError> {
+        let resources = self
+            .state()?
             .mq_resources
-            .get(application.slot() as usize)?
-            .as_ref()
-            .filter(|resources| resources.application == application)?;
-        let queue = resources.queue(worker)?.clone();
-        let offset = resources.offset(worker)?;
-        Some((queue, Some(resources.segment().clone()), offset))
+            .get(application.slot() as usize)
+            .and_then(Option::as_ref)
+            .filter(|resources| resources.application == application)
+            .ok_or(ApplicationError::Missing { application })?;
+        resources.publication()
     }
 
     pub fn contains(&self, application: ApplicationId) -> Result<bool, ApplicationError> {
@@ -783,6 +781,11 @@ pub enum ApplicationError {
     MqDetachFailed {
         #[source]
         source: RuntimeError,
+    },
+    #[error("per-Application MQ publication is invalid")]
+    MqPublication {
+        #[source]
+        source: AttachError,
     },
     #[error("Application {application:?} already owns per-Application MQ resources")]
     MqAlreadyAttached { application: ApplicationId },

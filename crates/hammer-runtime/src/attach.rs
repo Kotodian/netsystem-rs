@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::RawFd;
 use std::sync::{Arc, Weak};
 
 use crossbeam_queue::ArrayQueue;
@@ -18,27 +18,27 @@ mod descriptor;
 use application::{ApplicationAttachment, AttachedApplication};
 
 pub use application::{
-    DESCRIPTOR_COUNT as APPLICATION_MQ_DESCRIPTOR_COUNT,
+    ApplicationMqPublication, BASE_DESCRIPTOR_COUNT as APPLICATION_MQ_BASE_DESCRIPTOR_COUNT,
     METADATA_BYTES as APPLICATION_MQ_METADATA_BYTES,
     METADATA_WORDS as APPLICATION_MQ_METADATA_WORDS,
 };
 
-pub const ATTACH_PROTOCOL_VERSION: u64 = 1;
+pub const ATTACH_PROTOCOL_VERSION: u64 = 2;
 pub const ATTACH_REQUEST_BYTES: usize = size_of::<u64>();
 pub const ATTACH_REPLY_WORDS: usize = 3;
 pub const ATTACH_REPLY_BYTES: usize = ATTACH_REPLY_WORDS * size_of::<u64>();
 pub const ATTACH_STATUS_ACCEPTED: u64 = 0;
 pub const ATTACH_STATUS_REJECTED: u64 = 1;
-pub const ATTACH_DESCRIPTOR_COUNT: usize = 4;
-pub const ATTACH_METADATA_WORDS: usize = 8;
+pub const ATTACH_DESCRIPTOR_COUNT: usize = 2;
+pub const ATTACH_METADATA_WORDS: usize = 6;
 pub const ATTACH_METADATA_BYTES: usize = ATTACH_METADATA_WORDS * size_of::<u64>();
+pub const MAX_ATTACH_DESCRIPTORS: usize = 128;
 
 #[derive(Clone)]
 pub struct AppSessionPublication {
     session: Arc<AppSession>,
     application: ApplicationId,
     session_segment: Segment,
-    tx_event_segment: Segment,
     offsets: SessionOffsets,
 }
 
@@ -47,23 +47,18 @@ impl AppSessionPublication {
         session: Arc<AppSession>,
         application: ApplicationId,
         session_segment: Segment,
-        tx_event_segment: Segment,
         offsets: SessionOffsets,
     ) -> RuntimeResult<Self> {
-        if session_segment.shared_fd().is_none() || tx_event_segment.shared_fd().is_none() {
+        if session_segment.shared_fd().is_none() {
             return Err(AttachError::SegmentDescriptorMissing.into());
         }
         if session.evt_q().read_fd().is_none() {
             return Err(AttachError::SessionSignalMissing.into());
         }
-        if session.tx_evt_q().write_fd().is_none() {
-            return Err(AttachError::TxEventSignalMissing.into());
-        }
         Ok(Self {
             session,
             application,
             session_segment,
-            tx_event_segment,
             offsets,
         })
     }
@@ -131,14 +126,16 @@ impl AppServer {
         }
     }
 
-    pub async fn serve<Attach, Control, Detached, ApplicationError>(
+    pub async fn serve<Attach, Mq, Control, Detached, ApplicationError>(
         self: Arc<Self>,
         attach_application: Attach,
+        application_mq_publication: Mq,
         application_session_control: Control,
         application_detached: Detached,
     ) -> RuntimeResult<()>
     where
         Attach: Fn() -> Result<ApplicationId, ApplicationError>,
+        Mq: Fn(ApplicationId) -> Result<ApplicationMqPublication, ApplicationError>,
         Control: Fn(ApplicationId, &SessionMsgQueue, &SessionMsgQueue) -> RuntimeResult<()>,
         Detached: Fn(ApplicationId),
         ApplicationError: std::fmt::Display,
@@ -239,7 +236,22 @@ impl AppServer {
                         !clients.contains_key(&application),
                         "Application attach allocated an identity already held by a live client"
                     );
-                    let attachment = match ApplicationAttachment::create(application) {
+                    let application_mqs = match application_mq_publication(application) {
+                        Ok(application_mqs) => application_mqs,
+                        Err(error) => {
+                            tracing::warn!(%error, ?application, "Application MQ resources were not ready");
+                            if let Err(error) = send_attach_reply(
+                                &mut client,
+                                ATTACH_STATUS_REJECTED,
+                                None,
+                            ).await {
+                                tracing::warn!(%error, "failed to reject Application attach");
+                            }
+                            application_detached(application);
+                            continue;
+                        }
+                    };
+                    let attachment = match ApplicationAttachment::create(application, application_mqs) {
                         Ok(attachment) => attachment,
                         Err(error) => {
                             tracing::error!(%error, ?application, "failed to create Application Session MQ resources");
@@ -388,29 +400,18 @@ async fn send_publication(
             .shared_fd()
             .ok_or(AttachError::SegmentDescriptorMissing)?,
         current
-            .tx_event_segment
-            .shared_fd()
-            .ok_or(AttachError::SegmentDescriptorMissing)?,
-        current
             .session
             .evt_q()
             .read_fd()
             .ok_or(AttachError::SessionSignalMissing)?,
-        current
-            .session
-            .tx_evt_q()
-            .write_fd()
-            .ok_or(AttachError::TxEventSignalMissing)?,
     ];
     let words = [
         ATTACH_PROTOCOL_VERSION,
         current.session.session_handle().raw(),
         current.session_segment.size() as u64,
-        current.tx_event_segment.size() as u64,
         current.offsets.rx_fifo_off,
         current.offsets.tx_fifo_off,
         current.offsets.evt_q_off,
-        current.offsets.tx_evt_q_off,
     ];
     let mut metadata = [0_u8; ATTACH_METADATA_BYTES];
     for (chunk, word) in metadata.chunks_exact_mut(size_of::<u64>()).zip(words) {

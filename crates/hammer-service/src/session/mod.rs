@@ -6,7 +6,7 @@ use hammer_core::data_plane::NodeState;
 use hammer_infra::pool::Index as PoolIndex;
 use hammer_runtime::app::AppSessionConfig;
 use hammer_runtime::attach::AppServer;
-use hammer_runtime::{Engine, RuntimeError, RuntimeResult};
+use hammer_runtime::{Engine, RuntimeResult};
 
 pub mod app;
 pub mod application;
@@ -81,7 +81,7 @@ fn init_session_worker(
     let session_queue = engine
         .runtime
         .node_by_name("session-queue")
-        .ok_or_else(|| RuntimeError::subsystem("session", error::SessionQueueError::NodeMissing))?;
+        .ok_or(error::SessionQueueError::NodeMissing)?;
     engine
         .runtime
         .nodes()
@@ -89,7 +89,7 @@ fn init_session_worker(
     let app_session_input = engine
         .runtime
         .node_by_name("appsl-rx-mqs-input")
-        .ok_or_else(|| RuntimeError::subsystem("session", error::SessionQueueError::NodeMissing))?;
+        .ok_or(error::SessionQueueError::NodeMissing)?;
     engine
         .runtime
         .nodes()

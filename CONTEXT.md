@@ -272,6 +272,14 @@ _Avoid_: AppRing, SQE, CQE, submission queue, completion queue, TCP-owned payloa
 The VPP-shaped app/session signaling queue: a producer-locked multi-ring message queue (descriptor queue plus IO and CTRL rings) that carries Session Events, not payload bytes. Producers choose the ring via enqueue API (`enqueue_io` / `enqueue_ctrl`); Local and SVM backends share the same logical layout, with backend-specific wake signaling beside the shared header.
 _Avoid_: flat SessionEvt ring, payload channel, async stream, per-protocol event bus, matching `evt_type` inside a universal enqueue
 
+**Application Rx MQ**:
+The per-Application, per-Data-Worker message queue that carries app-to-session events from an Application to its owning Data Worker. `ApplicationMain` owns the MQ set; `AppClient` maps `worker_index` to the corresponding queue after attach.
+_Avoid_: shared per-worker TX queue, per-session app-to-session MQ, control requests/replies queue
+
+**Appsl Pending Rx MQ**:
+A worker-local pending list of Application Rx MQs whose signal fds are ready. Entries carry PENDING and POSTPONED flags; `appsl-rx-mqs-input` drains a snapshot from each MQ, re-adds non-empty MQs as POSTPONED, and self-wakes when work remains.
+_Avoid_: generic dedup queue, shared worker TX queue, per-session ready object
+
 **Process-Local Readiness Ownership**:
 Each process owns the readiness handle duplicates it creates for its own event loop. Daemon runtime ownership and app-process readiness ownership are independent; neither process borrows the other's descriptor lifecycle.
 _Avoid_: daemon-owned descriptor across process boundaries, one global readiness owner, session object silently closing another process's handle
@@ -305,6 +313,14 @@ _Avoid_: direct TCP app callback, io_uring app ring, socket-like stream hidden i
 **Session Runtime**:
 The worker-local module that owns session readiness, app/session FIFO access, and TX packet preparation. It schedules session work; registered transport dispatch coordinates transport worker updates without exposing transport connections, timers, or exact timer dispatch to Session Runtime.
 _Avoid_: TCP runtime, congestion-control scheduler, app polling loop
+
+**Session Event Lane**:
+A worker-local event list used by Session Runtime dispatch, shaped as VPP ctrl/new/old lanes. External app events enter the lanes from `appsl-rx-mqs-input`; internal Session Message Queue events are drained into the same lanes before control, new IO, and old IO dispatch.
+_Avoid_: `session_evt_q` as the only event staging point, per-protocol event list, scheduler-owned dedup queue
+
+**Session Worker State**:
+The worker-local polling/interrupt/idle state that controls whether `appsl-rx-mqs-input` wakes `session-queue` and what timerfd deadline the worker arms, matching VPP session worker state semantics.
+_Avoid_: graph node state as worker state, always-interrupt wake, fixed polling-only behavior
 
 **Transport Timer Policy**:
 The transport-owned rules that decide which timer kinds are active, when they should expire, and how exact Timer Token expiry changes transport state. The transport worker owns scheduling and dispatch; Session Runtime does not store, advance, interpret, or deliver transport timers.

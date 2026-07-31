@@ -476,68 +476,26 @@ impl AppSession {
 }
 
 impl AppSession {
-    /// Reconstruct an app session from a pre-allocated shared segment.
-    /// Called by AppClient (app process) after receiving offsets over
-    /// the Unix socket. The segment must already contain valid Fifo /
-    /// Session Message Queue headers at the given offsets; the signal fds
-    /// must be open for reading.
+    /// Reconstruct an app session from a shared session segment and the
+    /// per-Application Rx MQ selected by `handle.worker_index()`.
     ///
     /// # Safety
-    /// Caller must guarantee the segment is valid and the offsets point to
-    /// correctly initialised queue headers.
+    /// The session segment and all offsets must refer to initialized objects
+    /// with the layouts expected by `Fifo` and `SessionMsgQueue`. The worker
+    /// queue must refer to the Application's queue for this Data Worker.
     pub unsafe fn from_segment(
         handle: SessionHandle,
-        seg: &Segment,
-        offsets: &SessionOffsets,
-        evt_q_read: Option<RawFd>,
-        evt_q_write: Option<RawFd>,
-        tx_evt_q_read: Option<RawFd>,
-        tx_evt_q_write: Option<RawFd>,
-    ) -> Self {
-        unsafe {
-            Self::from_segments(
-                handle,
-                seg,
-                seg,
-                offsets,
-                evt_q_read,
-                evt_q_write,
-                tx_evt_q_read,
-                tx_evt_q_write,
-            )
-        }
-    }
-
-    /// Reconstruct an app session whose per-session queues and worker TX queue
-    /// live in separate shared segments.
-    ///
-    /// # Safety
-    /// Both segments and all offsets must refer to initialized objects with the
-    /// layouts expected by `Fifo` and `SessionMsgQueue`.
-    pub unsafe fn from_segments(
-        handle: SessionHandle,
         session_segment: &Segment,
-        tx_event_segment: &Segment,
         offsets: &SessionOffsets,
         evt_q_read: Option<RawFd>,
-        evt_q_write: Option<RawFd>,
-        tx_evt_q_read: Option<RawFd>,
-        tx_evt_q_write: Option<RawFd>,
+        worker_queue: Arc<SessionMsgQueue>,
     ) -> Self {
         let evt_q = Arc::new(unsafe {
             SessionMsgQueue::from_shared(
                 session_segment.clone(),
                 offsets.evt_q_off,
                 evt_q_read,
-                evt_q_write,
-            )
-        });
-        let tx_evt_q = Arc::new(unsafe {
-            SessionMsgQueue::from_shared(
-                tx_event_segment.clone(),
-                offsets.tx_evt_q_off,
-                tx_evt_q_read,
-                tx_evt_q_write,
+                None,
             )
         });
         Self {
@@ -548,7 +506,7 @@ impl AppSession {
                 Fifo::from_shared(session_segment.clone(), offsets.tx_fifo_off)
             }),
             evt_q,
-            tx_evt_q,
+            tx_evt_q: worker_queue,
             handle,
             async_fd: OnceCell::new(),
         }

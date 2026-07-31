@@ -1,6 +1,6 @@
-//! Attach-protocol integration tests: server publication pairing, client
-//! reconstruction from the four transferred descriptors, and descriptor
-//! lifetime on every failure path.
+//! Attach-protocol v2 integration tests: per-Application Rx MQ publication,
+//! AppClient worker mapping, session publication, and descriptor lifetime on
+//! every failure path.
 
 use std::convert::Infallible;
 use std::io::{Read, Write};
@@ -19,13 +19,15 @@ use hammer_runtime::app::{
     SessionOffsets,
 };
 use hammer_runtime::attach::{
+    APPLICATION_MQ_BASE_DESCRIPTOR_COUNT, APPLICATION_MQ_METADATA_WORDS, ATTACH_DESCRIPTOR_COUNT,
     ATTACH_PROTOCOL_VERSION, ATTACH_REPLY_BYTES, ATTACH_REQUEST_BYTES, ATTACH_STATUS_ACCEPTED,
+    AppServer, AppSessionPublication, ApplicationMqPublication,
 };
-use hammer_runtime::attach::{AppServer, AppSessionPublication};
 use hammer_runtime::{AttachError, RuntimeError};
 
 const FIFO_CAPACITY: usize = 4096;
 const EVT_Q_CAPACITY: usize = 16;
+const WORKER_COUNT: usize = 3;
 
 static NAME_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -71,37 +73,87 @@ struct PublishedSession {
     session: Arc<AppSession>,
     publication: AppSessionPublication,
     session_segment: Segment,
+    application_mqs: ApplicationMqs,
+    worker_queues: Vec<Arc<SessionMsgQueue>>,
 }
 
-/// Build a server-side session whose FIFOs and event queues live at known
-/// offsets in shared segments, matching the daemon's listener layout.
+#[derive(Clone)]
+struct ApplicationMqs {
+    publication: ApplicationMqPublication,
+    segment: Segment,
+    queues: Box<[Arc<SessionMsgQueue>]>,
+    offsets: Box<[u64]>,
+}
+
+fn queue_capacity_words() -> (u32, u32) {
+    let ring_nitems = EVT_Q_CAPACITY as u32;
+    let q_nitems = (EVT_Q_CAPACITY + 1).next_power_of_two() as u32;
+    (q_nitems, ring_nitems)
+}
+
+fn build_application_mqs() -> ApplicationMqs {
+    let counter = NAME_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let segment = Segment::shared(
+        &format!("hamr{}-{counter}", std::process::id()),
+        1024 * 1024,
+    )
+    .expect("rx MQ segment");
+    let (q_nitems, ring_nitems) = queue_capacity_words();
+    let queue_bytes = SessionMsgQueue::layout_bytes(q_nitems, ring_nitems).expect("queue layout");
+    let mut queues = Vec::with_capacity(WORKER_COUNT);
+    let mut offsets = Vec::with_capacity(WORKER_COUNT);
+    for _ in 0..WORKER_COUNT {
+        let offset = segment.alloc(queue_bytes, 64).expect("queue offset");
+        let queue = unsafe {
+            SessionMsgQueue::init_at_with_signal(segment.clone(), offset, q_nitems, ring_nitems)
+        }
+        .expect("Application MQ");
+        queues.push(Arc::new(queue));
+        offsets.push(offset);
+    }
+    let queues = queues.into_boxed_slice();
+    let offsets = offsets.into_boxed_slice();
+    let publication =
+        ApplicationMqPublication::new(segment.clone(), queues.clone(), offsets.clone())
+            .expect("Application MQ publication");
+    ApplicationMqs {
+        publication,
+        segment,
+        queues,
+        offsets,
+    }
+}
+
 fn build_publication(application: ApplicationId, handle: SessionHandle) -> PublishedSession {
+    let application_mqs = build_application_mqs();
+    build_publication_with_mqs(application, handle, application_mqs)
+}
+
+fn build_publication_with_mqs(
+    application: ApplicationId,
+    handle: SessionHandle,
+    application_mqs: ApplicationMqs,
+) -> PublishedSession {
+    build_publication_with_worker_queue(
+        application,
+        handle,
+        application_mqs,
+        handle.worker_index() as usize,
+    )
+}
+
+fn build_publication_with_worker_queue(
+    application: ApplicationId,
+    handle: SessionHandle,
+    application_mqs: ApplicationMqs,
+    queue_worker: usize,
+) -> PublishedSession {
     let counter = NAME_COUNTER.fetch_add(1, Ordering::Relaxed);
     let session_segment =
         Segment::shared(&format!("hs{}-{counter}", std::process::id()), 1024 * 1024)
             .expect("session segment");
-    let tx_event_segment =
-        Segment::shared(&format!("ht{}-{counter}", std::process::id()), 1024 * 1024)
-            .expect("tx event segment");
-
-    let ring_nitems = EVT_Q_CAPACITY as u32;
-    let q_nitems = (EVT_Q_CAPACITY + 1).next_power_of_two() as u32;
+    let (q_nitems, ring_nitems) = queue_capacity_words();
     let queue_bytes = SessionMsgQueue::layout_bytes(q_nitems, ring_nitems).expect("queue layout");
-    let tx_evt_q_off = tx_event_segment
-        .alloc(queue_bytes, 64)
-        .expect("tx queue offset");
-    // SAFETY: the offset was just allocated with the queue layout size.
-    let tx_evt_q = Arc::new(
-        unsafe {
-            SessionMsgQueue::init_at_with_signal(
-                tx_event_segment.clone(),
-                tx_evt_q_off,
-                q_nitems,
-                ring_nitems,
-            )
-        }
-        .expect("tx event queue"),
-    );
 
     let fifo_bytes = Fifo::layout_bytes(FIFO_CAPACITY).expect("fifo layout");
     let rx_fifo_off = session_segment.alloc(fifo_bytes, 64).expect("rx offset");
@@ -129,24 +181,24 @@ fn build_publication(application: ApplicationId, handle: SessionHandle) -> Publi
         .expect("event queue"),
     );
 
+    let worker_queue = application_mqs.queues[queue_worker].clone();
+    let worker_queues = application_mqs.queues.to_vec();
     let session = Arc::new(AppSession::from_parts(
         Arc::new(rx_fifo),
         Arc::new(tx_fifo),
         evt_q,
-        tx_evt_q,
+        worker_queue,
         handle,
     ));
     let offsets = SessionOffsets {
         rx_fifo_off,
         tx_fifo_off,
         evt_q_off,
-        tx_evt_q_off,
     };
     let publication = AppSessionPublication::new(
         Arc::clone(&session),
         application,
         session_segment.clone(),
-        tx_event_segment,
         offsets,
     )
     .expect("session publication");
@@ -154,10 +206,16 @@ fn build_publication(application: ApplicationId, handle: SessionHandle) -> Publi
         session,
         publication,
         session_segment,
+        application_mqs,
+        worker_queues,
     }
 }
 
-fn spawn_serve(server: Arc<AppServer>, first_application: ApplicationId) {
+fn spawn_serve(
+    server: Arc<AppServer>,
+    first_application: ApplicationId,
+    application_mqs: ApplicationMqs,
+) {
     let next_application = Arc::new(AtomicU64::new(first_application.raw()));
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -170,6 +228,9 @@ fn spawn_serve(server: Arc<AppServer>, first_application: ApplicationId) {
                 Ok::<ApplicationId, Infallible>(ApplicationId::from_raw(
                     attach_sequence.fetch_add(1, Ordering::Relaxed),
                 ))
+            },
+            move |_| {
+                Ok::<ApplicationMqPublication, Infallible>(application_mqs.publication.clone())
             },
             |_, _, _| Ok(()),
             |_| {},
@@ -189,13 +250,20 @@ fn send_fds(stream: &UnixStream, fds: &[RawFd], metadata: &[u64]) {
         iov_base: bytes.as_ptr().cast_mut().cast::<libc::c_void>(),
         iov_len: bytes.len(),
     };
-    let mut control = [0_u8; 128];
+    let control_bytes = unsafe { libc::CMSG_SPACE(std::mem::size_of_val(fds) as u32) as usize };
+    let control_elements = control_bytes.div_ceil(size_of::<libc::cmsghdr>());
+    let mut control = Vec::<libc::cmsghdr>::with_capacity(control_elements);
+    control.resize_with(control_elements, || {
+        // SAFETY: a cmsghdr contains only integer fields, for which zero is a
+        // valid initialized value.
+        unsafe { std::mem::zeroed() }
+    });
     // SAFETY: zero is a valid initial value for every msghdr field.
     let mut message = unsafe { std::mem::zeroed::<libc::msghdr>() };
     message.msg_iov = std::ptr::from_ref(&iov).cast_mut();
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast::<libc::c_void>();
-    message.msg_controllen = control.len() as _;
+    message.msg_controllen = control_bytes as _;
 
     // SAFETY: message owns a sufficiently large control buffer and the first
     // header is initialized before sendmsg reads it.
@@ -210,7 +278,6 @@ fn send_fds(stream: &UnixStream, fds: &[RawFd], metadata: &[u64]) {
             libc::CMSG_DATA(header).cast::<RawFd>(),
             fds.len(),
         );
-        message.msg_controllen = (*header).cmsg_len;
         assert_eq!(
             libc::sendmsg(stream.as_raw_fd(), &message, 0),
             bytes.len() as isize
@@ -218,21 +285,28 @@ fn send_fds(stream: &UnixStream, fds: &[RawFd], metadata: &[u64]) {
     }
 }
 
-fn accept_application(stream: &mut UnixStream, application: ApplicationId) {
-    let mut registration = [0_u8; ATTACH_REQUEST_BYTES];
-    stream
-        .read_exact(&mut registration)
-        .expect("read Application attach registration");
-    assert_eq!(u64::from_le_bytes(registration), ATTACH_PROTOCOL_VERSION);
-    let mut reply = [0_u8; ATTACH_REPLY_BYTES];
-    for (chunk, word) in reply.chunks_exact_mut(size_of::<u64>()).zip([
-        ATTACH_PROTOCOL_VERSION,
-        ATTACH_STATUS_ACCEPTED,
-        application.raw(),
-    ]) {
-        chunk.copy_from_slice(&word.to_le_bytes());
-    }
-    stream.write_all(&reply).expect("accept Application attach");
+fn accept_application(
+    stream: &mut UnixStream,
+    application: ApplicationId,
+    application_mqs: &ApplicationMqs,
+) {
+    accept_application_with(
+        stream,
+        application,
+        application_mqs,
+        |stream, fds, words| {
+            send_fds(stream, fds, words);
+        },
+    );
+}
+
+fn accept_application_with(
+    stream: &mut UnixStream,
+    application: ApplicationId,
+    application_mqs: &ApplicationMqs,
+    send: impl FnOnce(&mut UnixStream, &[RawFd], &[u64]),
+) {
+    accept_registration(stream, application);
 
     let counter = NAME_COUNTER.fetch_add(1, Ordering::Relaxed);
     let segment = Segment::shared(&format!("hc{}-{counter}", std::process::id()), 1024 * 1024)
@@ -250,20 +324,47 @@ fn accept_application(stream: &mut UnixStream, application: ApplicationId) {
         SessionMsgQueue::init_at_with_signal(segment.clone(), reply_offset, 16, 8)
             .expect("reply queue")
     };
-    send_fds(
-        stream,
-        &[
-            segment.shared_fd().expect("control segment descriptor"),
-            requests.write_fd().expect("request signal"),
-            replies.read_fd().expect("reply signal"),
-        ],
-        &[
-            ATTACH_PROTOCOL_VERSION,
-            segment.size() as u64,
-            request_offset,
-            reply_offset,
-        ],
-    );
+    let mut descriptors = vec![
+        segment.shared_fd().expect("control segment descriptor"),
+        requests.write_fd().expect("request signal"),
+        replies.read_fd().expect("reply signal"),
+        application_mqs
+            .segment
+            .shared_fd()
+            .expect("rx MQ segment descriptor"),
+    ];
+    for queue in &application_mqs.queues {
+        descriptors.push(queue.write_fd().expect("worker MQ write signal"));
+    }
+    let mut words = vec![
+        ATTACH_PROTOCOL_VERSION,
+        segment.size() as u64,
+        request_offset,
+        reply_offset,
+        application_mqs.segment.size() as u64,
+        application_mqs.queues.len() as u64,
+    ];
+    for offset in &application_mqs.offsets {
+        words.push(*offset);
+    }
+    send(stream, &descriptors, &words);
+}
+
+fn accept_registration(stream: &mut UnixStream, application: ApplicationId) {
+    let mut registration = [0_u8; ATTACH_REQUEST_BYTES];
+    stream
+        .read_exact(&mut registration)
+        .expect("read Application attach registration");
+    assert_eq!(u64::from_le_bytes(registration), ATTACH_PROTOCOL_VERSION);
+    let mut reply = [0_u8; ATTACH_REPLY_BYTES];
+    for (chunk, word) in reply.chunks_exact_mut(size_of::<u64>()).zip([
+        ATTACH_PROTOCOL_VERSION,
+        ATTACH_STATUS_ACCEPTED,
+        application.raw(),
+    ]) {
+        chunk.copy_from_slice(&word.to_le_bytes());
+    }
+    stream.write_all(&reply).expect("accept Application attach");
 }
 
 fn assert_publish_then_connect_round_trips_handle_and_descriptors() {
@@ -277,7 +378,11 @@ fn assert_publish_then_connect_round_trips_handle_and_descriptors() {
     publisher
         .try_publish(&published.publication)
         .expect("publish before client");
-    spawn_serve(Arc::clone(&server), application);
+    spawn_serve(
+        Arc::clone(&server),
+        application,
+        published.application_mqs.clone(),
+    );
 
     let segment_fd = published
         .session_segment
@@ -302,7 +407,8 @@ fn assert_publish_then_connect_round_trips_handle_and_descriptors() {
     assert_eq!(&buffer[..read], b"ping");
     assert_eq!(client_session.consume_rx(read), read);
 
-    // App -> dataplane across the tx fifo and worker tx event queue.
+    // App -> dataplane through the per-worker Application Rx MQ selected by
+    // the session handle, not through a per-session TX event MQ.
     assert_eq!(client_session.send_bytes(b"pong").expect("client send"), 4);
     let mut echoed = [0_u8; 16];
     let read = published
@@ -310,7 +416,9 @@ fn assert_publish_then_connect_round_trips_handle_and_descriptors() {
         .tx_fifo()
         .peek(0, echoed.len(), &mut echoed);
     assert_eq!(&echoed[..read], b"pong");
-    let event = published.session.tx_evt_q().dequeue().expect("tx event");
+    let event = published.worker_queues[handle.worker_index() as usize]
+        .dequeue()
+        .expect("per-worker MQ event");
     assert_eq!(event.session_index(), handle.session_index());
     assert_eq!(event.evt_type, SessionEvtType::TxEnq);
 
@@ -326,7 +434,12 @@ fn assert_connect_before_publish_completes_after_publication() {
     let server = Arc::new(AppServer::bind(&path_text, 4).expect("bind app server"));
     let publisher = server.publisher();
     let application = ApplicationId::from_raw(2);
-    spawn_serve(Arc::clone(&server), application);
+    let published = build_publication(application, SessionHandle::new(9, 0));
+    spawn_serve(
+        Arc::clone(&server),
+        application,
+        published.application_mqs.clone(),
+    );
 
     let client_path = path_text.clone();
     let client_thread = std::thread::spawn(move || {
@@ -336,8 +449,6 @@ fn assert_connect_before_publish_completes_after_publication() {
     });
     std::thread::sleep(Duration::from_millis(100));
 
-    let handle = SessionHandle::new(9, 0);
-    let published = build_publication(application, handle);
     publisher
         .try_publish(&published.publication)
         .expect("publish after client");
@@ -346,7 +457,7 @@ fn assert_connect_before_publish_completes_after_publication() {
         .join()
         .expect("join client thread")
         .expect("attach client");
-    assert_eq!(client.session_handle(), handle);
+    assert_eq!(client.session_handle(), SessionHandle::new(9, 0));
     let _ = std::fs::remove_file(path);
 }
 
@@ -356,7 +467,12 @@ fn assert_failed_attach_requeues_publication_for_next_client() {
     let server = Arc::new(AppServer::bind(&path_text, 4).expect("bind app server"));
     let publisher = server.publisher();
     let application = ApplicationId::from_raw(3);
-    spawn_serve(Arc::clone(&server), application);
+    let published = build_publication(application, SessionHandle::new(3, 1));
+    spawn_serve(
+        Arc::clone(&server),
+        application,
+        published.application_mqs.clone(),
+    );
 
     let dead = UnixStream::connect(&path).expect("connect doomed client");
     dead.shutdown(std::net::Shutdown::Both)
@@ -364,8 +480,6 @@ fn assert_failed_attach_requeues_publication_for_next_client() {
     drop(dead);
     std::thread::sleep(Duration::from_millis(100));
 
-    let handle = SessionHandle::new(3, 1);
-    let published = build_publication(application, handle);
     publisher
         .try_publish(&published.publication)
         .expect("publish after doomed client");
@@ -373,7 +487,7 @@ fn assert_failed_attach_requeues_publication_for_next_client() {
     let client = AppClient::attach(&path_text).expect("attach surviving client");
     assert_eq!(client.application(), application);
     let client_session = client.accept().expect("accept surviving App Session");
-    assert_eq!(client_session.session_handle(), handle);
+    assert_eq!(client_session.session_handle(), SessionHandle::new(3, 1));
     let _ = std::fs::remove_file(path);
 }
 
@@ -412,27 +526,230 @@ fn assert_missing_attach_server_returns_client_error() {
     assert!(matches!(result, Err(AppClientError::Attach { .. })));
 }
 
+#[test]
+fn attach_rejects_old_protocol_version() {
+    let path = socket_path("old-version");
+    let path_text = path.to_str().expect("socket path").to_owned();
+    let server = Arc::new(AppServer::bind(&path_text, 4).expect("bind app server"));
+    let application_mqs = build_application_mqs();
+    spawn_serve(
+        Arc::clone(&server),
+        ApplicationId::from_raw(99),
+        application_mqs,
+    );
+
+    let mut client = UnixStream::connect(path_text).expect("connect old attach client");
+    client
+        .write_all(&1_u64.to_le_bytes())
+        .expect("write old protocol version");
+    let mut reply = [0_u8; ATTACH_REPLY_BYTES];
+    let result = client.read_exact(&mut reply);
+    assert!(result.is_err(), "old protocol version must not be accepted");
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn attach_reads_fragmented_application_mq_metadata() {
+    let path = socket_path("fragmented-metadata");
+    let listener = UnixListener::bind(&path).expect("bind fragmented attach server");
+    let application = ApplicationId::from_raw(100);
+    let application_mqs = build_application_mqs();
+    let server_thread = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept fragmented attach client");
+        accept_application_with(
+            &mut stream,
+            application,
+            &application_mqs,
+            |stream, descriptors, words| {
+                send_fds(stream, descriptors, &words[..APPLICATION_MQ_METADATA_WORDS]);
+                std::thread::sleep(Duration::from_millis(100));
+                for offset in &words[APPLICATION_MQ_METADATA_WORDS..] {
+                    stream
+                        .write_all(&offset.to_le_bytes())
+                        .expect("write fragmented worker MQ offset");
+                }
+            },
+        );
+    });
+
+    let client = AppClient::attach(path.to_str().expect("socket path"))
+        .expect("attach with fragmented Application MQ metadata");
+    assert_eq!(client.application(), application);
+
+    server_thread.join().expect("join fragmented attach server");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn attach_rejects_application_mq_descriptor_mismatch_and_closes_received_fds() {
+    let path = socket_path("application-mq-descriptor-mismatch");
+    let listener = UnixListener::bind(&path).expect("bind malformed attach server");
+    let application = ApplicationId::from_raw(101);
+    let server_thread = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept malformed attach client");
+        accept_registration(&mut stream, application);
+        let (sent, peer) = UnixStream::pair().expect("descriptor pair");
+        let identity = descriptor_identity(sent.as_raw_fd()).expect("descriptor identity");
+        let baseline = count_open_identity(identity);
+        let expected = APPLICATION_MQ_BASE_DESCRIPTOR_COUNT + WORKER_COUNT;
+        let descriptors = vec![sent.as_raw_fd(); expected - 1];
+        send_fds(
+            &stream,
+            &descriptors,
+            &[
+                ATTACH_PROTOCOL_VERSION,
+                4096,
+                64,
+                128,
+                4096,
+                WORKER_COUNT as u64,
+                64,
+                128,
+                192,
+            ],
+        );
+        (sent, peer, identity, baseline)
+    });
+
+    let error = match AppClient::attach(path.to_str().expect("socket path")) {
+        Ok(_) => panic!("descriptor mismatch must reject Application attach"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(
+            &error,
+            AppClientError::DescriptorCount { expected, actual }
+                if *expected == APPLICATION_MQ_BASE_DESCRIPTOR_COUNT + WORKER_COUNT
+                    && *actual == *expected - 1
+        ),
+        "unexpected descriptor mismatch error: {error:?}"
+    );
+    let (sent, peer, identity, baseline) = server_thread.join().expect("join malformed server");
+    assert_identity_count(identity, baseline);
+    drop(sent);
+    drop(peer);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn accepted_session_rejects_excess_descriptors_and_closes_received_fds() {
+    let path = socket_path("session-excess-descriptors");
+    let listener = UnixListener::bind(&path).expect("bind malformed attach server");
+    let application = ApplicationId::from_raw(103);
+    let application_mqs = build_application_mqs();
+    let server_thread = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept truncated attach client");
+        accept_application(&mut stream, application, &application_mqs);
+
+        let pairs = (0..ATTACH_DESCRIPTOR_COUNT + 1)
+            .map(|_| UnixStream::pair().expect("descriptor pair"))
+            .collect::<Vec<_>>();
+        let descriptors = pairs
+            .iter()
+            .map(|(sent, _)| sent.as_raw_fd())
+            .collect::<Vec<_>>();
+        send_fds(
+            &stream,
+            &descriptors,
+            &[ATTACH_PROTOCOL_VERSION, 1, 4096, 64, 128, 192],
+        );
+        pairs.into_iter().map(|(_, peer)| peer).collect::<Vec<_>>()
+    });
+
+    let client = AppClient::attach(path.to_str().expect("socket path")).expect("attach client");
+    let result = client.accept();
+    assert!(
+        matches!(
+            result,
+            Err(AppClientError::DescriptorCount {
+                expected: ATTACH_DESCRIPTOR_COUNT,
+                actual
+            }) if actual == ATTACH_DESCRIPTOR_COUNT + 1
+        ),
+        "unexpected excess descriptor result: {result:?}"
+    );
+
+    for mut peer in server_thread.join().expect("join malformed server") {
+        peer.set_nonblocking(true).expect("set peer nonblocking");
+        let mut byte = [0_u8; 1];
+        assert_eq!(peer.read(&mut byte).expect("received descriptor closed"), 0);
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn accepted_session_rejects_worker_outside_exact_data_worker_count() {
+    let path = socket_path("worker-out-of-range");
+    let path_text = path.to_str().expect("socket path").to_owned();
+    let server = Arc::new(AppServer::bind(&path_text, 4).expect("bind app server"));
+    let publisher = server.publisher();
+    let application = ApplicationId::from_raw(102);
+    let application_mqs = build_application_mqs();
+    let published = build_publication_with_worker_queue(
+        application,
+        SessionHandle::new(33, WORKER_COUNT as u32),
+        application_mqs.clone(),
+        0,
+    );
+    publisher
+        .try_publish(&published.publication)
+        .expect("publish out-of-range worker session");
+    spawn_serve(Arc::clone(&server), application, application_mqs);
+
+    let segment_fd = published
+        .session_segment
+        .shared_fd()
+        .expect("session segment descriptor");
+    let identity = descriptor_identity(segment_fd).expect("segment identity");
+    let baseline = count_open_identity(identity);
+    let client = AppClient::attach(&path_text).expect("attach client");
+    let result = client.accept();
+    assert!(
+        matches!(
+            result,
+            Err(AppClientError::WorkerQueueMissing {
+                worker,
+                worker_count
+            }) if worker == WORKER_COUNT && worker_count == WORKER_COUNT
+        ),
+        "unexpected worker selection result: {result:?}"
+    );
+    assert_identity_count(identity, baseline);
+
+    drop(client);
+    let _ = std::fs::remove_file(path);
+}
+
 fn assert_malformed_attach_closes_received_descriptor_before_returning_error() {
     let path = socket_path("malformed");
     let listener = UnixListener::bind(&path).expect("bind malformed attach server");
+    let application_mqs = build_application_mqs();
     let server_thread = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept malformed client");
-        accept_application(&mut stream, ApplicationId::from_raw(6));
+        accept_application(&mut stream, ApplicationId::from_raw(6), &application_mqs);
         let (sent, peer) = UnixStream::pair().expect("descriptor pair");
-        send_fds(&stream, &[sent.as_raw_fd()], &[0; 8]);
+        send_fds(
+            &stream,
+            &[sent.as_raw_fd()],
+            &[ATTACH_PROTOCOL_VERSION, 0, 0, 0, 0, 0],
+        );
         drop(sent);
         peer
     });
 
     let result =
         AppClient::attach(path.to_str().expect("socket path")).and_then(|client| client.accept());
-    assert!(matches!(
-        result,
-        Err(AppClientError::DescriptorCount {
-            expected: 4,
-            actual: 1
-        })
-    ));
+    assert!(
+        matches!(
+            result,
+            Err(AppClientError::DescriptorCount {
+                expected: ATTACH_DESCRIPTOR_COUNT,
+                actual: 1
+            })
+        ),
+        "unexpected malformed attach result: {result:?}"
+    );
     let mut peer = server_thread.join().expect("join malformed server");
     peer.set_nonblocking(true).expect("set peer nonblocking");
     let mut byte = [0_u8; 1];
@@ -443,20 +760,28 @@ fn assert_malformed_attach_closes_received_descriptor_before_returning_error() {
 fn assert_offset_overflow_closes_every_received_descriptor() {
     let path = socket_path("offset-overflow");
     let listener = UnixListener::bind(&path).expect("bind offset overflow attach server");
+    let application_mqs = build_application_mqs();
     let server_thread = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept offset overflow client");
-        accept_application(&mut stream, ApplicationId::from_raw(7));
+        accept_application(&mut stream, ApplicationId::from_raw(7), &application_mqs);
         let (sent, peer) = UnixStream::pair().expect("descriptor pair");
         let identity = descriptor_identity(sent.as_raw_fd()).expect("descriptor identity");
         let baseline = count_open_identity(identity);
-        let fds = [sent.as_raw_fd(); 4];
-        send_fds(&stream, &fds, &[1, 0, 4096, 4096, 4096, 0, 0, 0]);
+        let fds = [sent.as_raw_fd(); ATTACH_DESCRIPTOR_COUNT];
+        send_fds(
+            &stream,
+            &fds,
+            &[ATTACH_PROTOCOL_VERSION, 0, 4096, 4096, 0, 0],
+        );
         (sent, peer, identity, baseline)
     });
 
     let result =
         AppClient::attach(path.to_str().expect("socket path")).and_then(|client| client.accept());
-    assert!(matches!(result, Err(AppClientError::OffsetOverflow)));
+    assert!(
+        matches!(result, Err(AppClientError::OffsetOverflow)),
+        "unexpected offset overflow result: {result:?}"
+    );
     let (sent, peer, identity, baseline) = server_thread.join().expect("join offset server");
     assert_identity_count(identity, baseline);
     drop(sent);
@@ -467,23 +792,24 @@ fn assert_offset_overflow_closes_every_received_descriptor() {
 fn assert_mapping_failure_closes_every_received_descriptor() {
     let path = socket_path("mapping-failure");
     let listener = UnixListener::bind(&path).expect("bind mapping failure attach server");
+    let application_mqs = build_application_mqs();
     let server_thread = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept mapping failure client");
-        accept_application(&mut stream, ApplicationId::from_raw(8));
+        accept_application(&mut stream, ApplicationId::from_raw(8), &application_mqs);
         let (sent, peer) = UnixStream::pair().expect("descriptor pair");
         let identity = descriptor_identity(sent.as_raw_fd()).expect("descriptor identity");
         let baseline = count_open_identity(identity);
-        let fds = [sent.as_raw_fd(); 4];
-        send_fds(&stream, &fds, &[1, 0, 4096, 4096, 0, 0, 0, 0]);
+        let fds = [sent.as_raw_fd(); ATTACH_DESCRIPTOR_COUNT];
+        send_fds(&stream, &fds, &[ATTACH_PROTOCOL_VERSION, 0, 4096, 0, 0, 0]);
         (sent, peer, identity, baseline)
     });
 
     let result =
         AppClient::attach(path.to_str().expect("socket path")).and_then(|client| client.accept());
-    assert!(matches!(
-        result,
-        Err(AppClientError::SessionSegmentMap { .. })
-    ));
+    assert!(
+        matches!(result, Err(AppClientError::SessionSegmentMap { .. })),
+        "unexpected mapping failure result: {result:?}"
+    );
     let (sent, peer, identity, baseline) = server_thread.join().expect("join mapping server");
     assert_identity_count(identity, baseline);
     drop(sent);
@@ -504,11 +830,61 @@ fn attach_protocol_round_trips_and_releases_descriptors() {
 }
 
 #[test]
+fn attach_maps_each_worker_to_its_application_rx_mq() {
+    let path = socket_path("worker-map");
+    let path_text = path.to_str().expect("socket path").to_owned();
+    let server = Arc::new(AppServer::bind(&path_text, 4).expect("bind app server"));
+    let publisher = server.publisher();
+    let application = ApplicationId::from_raw(50);
+    let published = build_publication(application, SessionHandle::new(1, 0));
+    spawn_serve(
+        Arc::clone(&server),
+        application,
+        published.application_mqs.clone(),
+    );
+
+    let client = AppClient::attach(&path_text).expect("attach client");
+    let first = build_publication_with_mqs(
+        application,
+        SessionHandle::new(11, 0),
+        published.application_mqs.clone(),
+    );
+    let second = build_publication_with_mqs(
+        application,
+        SessionHandle::new(22, 2),
+        published.application_mqs.clone(),
+    );
+    publisher
+        .try_publish(&first.publication)
+        .expect("publish worker 0 session");
+    publisher
+        .try_publish(&second.publication)
+        .expect("publish worker 2 session");
+
+    let first_session = client.accept().expect("accept worker 0 session");
+    assert_eq!(first_session.send_bytes(b"a").expect("send"), 1);
+    let first_event = published.worker_queues[0]
+        .dequeue()
+        .expect("worker 0 event");
+    assert_eq!(first_event.session_index(), 11);
+
+    let second_session = client.accept().expect("accept worker 2 session");
+    assert_eq!(second_session.send_bytes(b"b").expect("send"), 1);
+    let second_event = published.worker_queues[2]
+        .dequeue()
+        .expect("worker 2 event");
+    assert_eq!(second_event.session_index(), 22);
+    assert!(published.worker_queues[1].dequeue().is_none());
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn attach_connection_close_detaches_only_its_application_once() {
     let path = socket_path("application-lifetime");
     let path_text = path.to_str().expect("socket path").to_owned();
     let server = Arc::new(AppServer::bind(&path_text, 4).expect("bind app server"));
     let (detached_tx, detached_rx) = std::sync::mpsc::channel();
+    let application_mqs = build_application_mqs();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -521,6 +897,9 @@ fn attach_connection_close_detaches_only_its_application_once() {
                 Ok::<ApplicationId, Infallible>(ApplicationId::from_raw(
                     attach_sequence.fetch_add(1, Ordering::Relaxed),
                 ))
+            },
+            move |_| {
+                Ok::<ApplicationMqPublication, Infallible>(application_mqs.publication.clone())
             },
             |_, _, _| Ok(()),
             move |application| {
