@@ -47,10 +47,12 @@ fn configure_session(config: config::NetworkSessionConfig) -> RuntimeResult<Arc<
 fn init_session(
     engine: &mut Engine,
     applications: Arc<ApplicationMain>,
+    session: Arc<Session>,
 ) -> RuntimeResult<Arc<runtime::SessionMain>> {
-    Ok(Arc::new(runtime::SessionMain::new(
+    Ok(Arc::new(runtime::SessionMain::with_pool_capacity(
         engine.configured_worker_count(),
         applications,
+        session.pool_capacity,
     )))
 }
 
@@ -70,6 +72,7 @@ fn init_session_worker(
     engine: &mut Engine,
     main: Arc<runtime::SessionMain>,
     applications: Arc<ApplicationMain>,
+    session: Arc<Session>,
 ) -> RuntimeResult<()> {
     let worker = engine.data_worker_id()?;
     let session_queue = engine
@@ -93,6 +96,7 @@ fn init_session_worker(
             worker,
             engine.configured_worker_count(),
             AppSessionConfig::default(),
+            session.pool_capacity,
             Arc::clone(&applications),
             server.publisher(),
         )?
@@ -101,6 +105,7 @@ fn init_session_worker(
             worker,
             engine.configured_worker_count(),
             AppSessionConfig::default(),
+            session.pool_capacity,
             applications,
         )?
     };

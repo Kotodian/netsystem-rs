@@ -231,6 +231,14 @@ impl SessionMain {
     }
 
     pub fn new(worker_count: usize, applications: Arc<ApplicationMain>) -> Self {
+        Self::with_pool_capacity(worker_count, applications, DEFAULT_SESSION_POOL_CAPACITY)
+    }
+
+    pub fn with_pool_capacity(
+        worker_count: usize,
+        applications: Arc<ApplicationMain>,
+        pool_capacity: usize,
+    ) -> Self {
         let workers = (0..worker_count)
             .map(|_| CacheLine::new(ThreadOwned::new()))
             .collect::<Vec<_>>()
@@ -238,7 +246,7 @@ impl SessionMain {
         Self {
             workers,
             owner: thread::current().id(),
-            listeners: UnsafeCell::new(Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY)),
+            listeners: UnsafeCell::new(Pool::with_capacity(pool_capacity)),
             applications,
         }
     }
@@ -1735,6 +1743,20 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         worker_count: usize,
         app_session_config: AppSessionConfig,
     ) -> RuntimeResult<Self> {
+        Self::with_worker_count_app_session_config_and_pool_capacity(
+            worker,
+            worker_count,
+            app_session_config,
+            DEFAULT_SESSION_POOL_CAPACITY,
+        )
+    }
+
+    pub(crate) fn with_worker_count_app_session_config_and_pool_capacity(
+        worker: DataWorkerId,
+        worker_count: usize,
+        app_session_config: AppSessionConfig,
+        pool_capacity: usize,
+    ) -> RuntimeResult<Self> {
         let cap = DEFAULT_SESSION_TX_EVENT_CAPACITY.next_power_of_two().max(2) as u32;
         let layout = SessionMsgQueue::layout_bytes(cap, cap.max(2))
             .map_err(|error| AppWorkerError::SessionEventQueue { error })?;
@@ -1754,11 +1776,12 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             SessionMsgQueue::with_cfg(cap, cap.max(2))
                 .map_err(|error| AppWorkerError::SessionEventQueue { error })?,
         );
-        let app = AppWorker::new(DEFAULT_SESSION_POOL_CAPACITY, tx_evt_q, worker.slot());
+        let app = AppWorker::new(pool_capacity, tx_evt_q, worker.slot());
         Ok(Self::from_app(
             worker,
             worker_count,
             app_session_config,
+            pool_capacity,
             None,
             app,
             session_evt_q,
@@ -1769,6 +1792,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         worker: DataWorkerId,
         worker_count: usize,
         app_session_config: AppSessionConfig,
+        pool_capacity: usize,
         applications: Arc<ApplicationMain>,
         publisher: AppSessionPublisher,
     ) -> RuntimeResult<Self> {
@@ -1792,7 +1816,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             .map_err(|error| AppWorkerError::SessionEventQueue { error })?,
         );
         let app = AppWorker::with_attach(
-            DEFAULT_SESSION_POOL_CAPACITY,
+            pool_capacity,
             tx_evt_q,
             worker.slot(),
             AppWorkerAttach::new(publisher, segment, offset),
@@ -1805,6 +1829,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             worker,
             worker_count,
             app_session_config,
+            pool_capacity,
             Some(applications),
             app,
             session_evt_q,
@@ -1815,12 +1840,14 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         worker: DataWorkerId,
         worker_count: usize,
         app_session_config: AppSessionConfig,
+        pool_capacity: usize,
         applications: Arc<ApplicationMain>,
     ) -> RuntimeResult<Self> {
-        let mut worker = Self::with_worker_count_and_app_session_config(
+        let mut worker = Self::with_worker_count_app_session_config_and_pool_capacity(
             worker,
             worker_count,
             app_session_config,
+            pool_capacity,
         )?;
         worker.applications = Some(applications);
         Ok(worker)
@@ -1830,6 +1857,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         worker: DataWorkerId,
         worker_count: usize,
         app_session_config: AppSessionConfig,
+        pool_capacity: usize,
         applications: Option<Arc<ApplicationMain>>,
         app: AppWorker,
         session_evt_q: Arc<SessionMsgQueue>,
@@ -1837,17 +1865,17 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         Self {
             worker,
             worker_count,
-            entries: Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
+            entries: Pool::with_capacity(pool_capacity),
             listener_main: None,
             applications,
             app,
             session_evt_q,
             app_session_config,
             transport_dispatches: Vec::new(),
-            session_work: Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
-            session_work_scratch: Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
-            app_rx_events: FifoQueue::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
-            control_events: FifoQueue::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
+            session_work: Vec::with_capacity(pool_capacity),
+            session_work_scratch: Vec::with_capacity(pool_capacity),
+            app_rx_events: FifoQueue::with_capacity(pool_capacity),
+            control_events: FifoQueue::with_capacity(pool_capacity),
             readiness_file: None,
         }
     }
@@ -2257,7 +2285,10 @@ mod tests {
         RuntimeError, RuntimeResult,
     };
 
-    use super::{SessionMain, SessionQueueNext, SessionTransportId, SessionWorker};
+    use super::{
+        DEFAULT_SESSION_POOL_CAPACITY, SessionMain, SessionQueueNext, SessionTransportId,
+        SessionWorker,
+    };
     use crate::session::ApplicationMain;
     use crate::session::node::{SessionQueueNode, SessionQueueOutput};
 
@@ -2284,6 +2315,7 @@ mod tests {
             DataWorkerId::new(1),
             2,
             hammer_runtime::app::AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
             applications,
             server.publisher(),
         )
@@ -2351,6 +2383,7 @@ mod tests {
             DataWorkerId::new(2),
             3,
             hammer_runtime::app::AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
             applications,
             publisher,
         )
@@ -2492,6 +2525,22 @@ mod tests {
             .with_worker_mut(&runtime, |sessions| Ok(sessions.transport_dispatches.len()))
             .expect("read dispatches");
         assert_eq!(dispatches, 1);
+    }
+
+    #[test]
+    fn session_worker_uses_configured_pool_capacity() {
+        let worker =
+            SessionWorker::<Index>::with_worker_count_app_session_config_and_pool_capacity(
+                DataWorkerId::new(0),
+                1,
+                hammer_runtime::app::AppSessionConfig::default(),
+                7,
+            )
+            .expect("Session worker with configured capacity");
+
+        assert_eq!(worker.entries.capacity(), 7);
+        assert_eq!(worker.session_work.capacity(), 7);
+        assert_eq!(worker.session_work_scratch.capacity(), 7);
     }
 }
 
