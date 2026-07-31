@@ -14,6 +14,7 @@ pub mod fifo_queue;
 pub(crate) mod heap;
 pub(crate) mod heap_boxed;
 pub mod hint;
+pub mod linked_list;
 pub mod main_heap;
 pub mod map;
 pub mod mask_compare;
