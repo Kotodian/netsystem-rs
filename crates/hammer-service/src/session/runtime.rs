@@ -965,7 +965,10 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
                 };
                 let disconnect = matches!(
                     state,
-                    SessionState::Created(_) | SessionState::Published(_) | SessionState::Active(_)
+                    SessionState::Created(_)
+                        | SessionState::Published(_)
+                        | SessionState::Active(_)
+                        | SessionState::TransportClosed(_)
                 );
                 (state.on_app_close(), disconnect)
             })

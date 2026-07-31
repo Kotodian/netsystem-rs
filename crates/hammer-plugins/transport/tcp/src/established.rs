@@ -141,6 +141,7 @@ fn tcp_established_index(
             accept_payload,
             accepted_sequence,
             duplicate_payload,
+            peer_closed,
         ) = {
             let crate::worker::TcpWorker {
                 connections,
@@ -168,6 +169,7 @@ fn tcp_established_index(
                 accept_payload,
                 packet.sequence,
                 duplicate_payload,
+                connection.state() == crate::TcpState::CloseWait,
             )
         };
         if acked_tx_len != 0 {
@@ -175,6 +177,9 @@ fn tcp_established_index(
         }
         if ack_advanced && sessions.pending_send_len(session_id)?.is_some() {
             sessions.mark_ready(session_id);
+        }
+        if peer_closed {
+            sessions.notify_transport_closed(session_id, connection_index)?;
         }
         let mut immediate_ack = false;
         if let Some((trim, offset)) = accept_payload {
