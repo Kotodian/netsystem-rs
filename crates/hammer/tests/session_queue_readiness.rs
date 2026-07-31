@@ -13,12 +13,14 @@ use hammer_runtime::{
     NodeResult, NodeRuntimeData,
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
+use hammer_service::session::ApplicationMain;
 use hammer_service::session::node::{
-    SessionQueueNext, SessionQueueNode, SessionQueueOutput, register_session_queue_node,
+    SessionQueueNext, SessionQueueNode, SessionQueueOutput, register_app_session_input_node,
+    register_session_queue_node,
 };
 use hammer_service::session::runtime::{
-    SessionTransport, SessionTransportId, SessionWorker, TransportInternalTransport,
-    TransportInternalTx, dispatch_session_queue_pending,
+    SessionMain, SessionTransport, SessionTransportId, SessionWorker, TransportInternalTransport,
+    TransportInternalTx, dispatch_session_queue_pending, install_session_worker,
 };
 
 #[derive(Default)]
@@ -153,6 +155,8 @@ fn worker_engine() -> (Engine, NodeId, NodeRuntimeData, SessionQueueNext) {
         RuntimeRegistry::new(),
     );
     let session_queue = register_session_queue_node(&main.runtime).expect("register session queue");
+    let app_session_input =
+        register_app_session_input_node(&main.runtime).expect("register app session input");
     let sink = main.runtime.nodes().register_internal(BlackholeNode);
     SessionQueueNode::compile_output_next(&main.runtime, session_queue, sink)
         .expect("compile session queue transport edge");
@@ -162,13 +166,22 @@ fn worker_engine() -> (Engine, NodeId, NodeRuntimeData, SessionQueueNext) {
         .expect("disable main session queue");
 
     let mut worker = main.spawn(1).expect("spawn data worker");
-    let worker_node = SessionQueueNode::new().expect("worker session queue node");
-    let node_data = worker_node
-        .node_runtime_data()
+    let session_main = Arc::new(SessionMain::new(1, ApplicationMain::new(1)));
+    let worker_id = worker.data_worker_id().expect("data worker id");
+    let sessions = SessionWorker::<Index>::new(worker_id).expect("session worker for test");
+    install_session_worker(
+        &session_main,
+        &mut worker,
+        app_session_input,
+        session_queue,
+        sessions,
+    )
+    .expect("install Session worker");
+    let node_data = worker
+        .runtime
+        .nodes()
+        .node_runtime_data(session_queue)
         .expect("worker session queue data");
-    worker
-        .set_worker_node_runtime_data(session_queue, node_data)
-        .expect("install worker session queue data");
     let output_next = SessionQueueNode::existing_output_next(&worker.runtime, session_queue, sink)
         .expect("resolve worker session queue transport edge");
     (worker, session_queue, node_data, output_next)
@@ -199,8 +212,13 @@ fn svm_readiness_marks_session_queue_before_main_loop_dispatch() {
     let (mut engine, session_queue, node_data, output_next) = worker_engine();
     let worker = engine.data_worker_id().expect("data worker id");
     let events = Arc::new(Mutex::new(Vec::new()));
-    SessionQueueNode::install_worker_attachment(node_data, output_next, dispatch_test_worker)
-        .expect("install session queue transport dispatch");
+    SessionQueueNode::install_worker_attachment(
+        &engine.runtime,
+        node_data,
+        output_next,
+        dispatch_test_worker,
+    )
+    .expect("install session queue transport dispatch");
 
     let mut sessions =
         SessionWorker::<Index>::with_app_session_config(worker, AppSessionConfig::default())

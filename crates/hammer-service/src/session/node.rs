@@ -1,5 +1,3 @@
-use std::cell::RefCell;
-use std::sync::Arc;
 use std::time::Instant;
 
 use hammer_core::data_plane::{BufferFrame, Index, NodeId, NodeRegistration};
@@ -9,7 +7,7 @@ use hammer_runtime::{
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use crate::session::SessionQueueError;
-use crate::session::runtime::{SessionMain, SessionWorker};
+use crate::session::runtime::SessionMain;
 
 /// Shared Session Queue IO allowance for normal and custom TX in one dispatch.
 pub const SESSION_QUEUE_IO_BUDGET: usize = 128;
@@ -176,10 +174,12 @@ impl SessionQueueOutput {
     }
 }
 
+/// Worker-local transport dispatch, matching VPP's per-worker update-time and
+/// transport output tables.
 #[derive(Clone, Copy)]
-struct SessionQueueAttachment {
+pub(crate) struct SessionQueueTransportDispatch {
     output_next: SessionQueueNext,
-    dispatch: SessionQueueDispatchFn,
+    function: SessionQueueDispatchFn,
 }
 
 #[hammer_component_macros::graph_node(
@@ -193,11 +193,6 @@ pub struct SessionQueueNode {
     runtime_data: NodeRuntimeData,
 }
 
-thread_local! {
-    static SESSION_QUEUE_NODES: RefCell<Vec<(Option<Arc<SessionMain>>, Vec<SessionQueueAttachment>)>> =
-        const { RefCell::new(Vec::new()) };
-}
-
 pub fn register_session_queue_node(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     if let Some(node) = runtime.nodes().node_by_name("session-queue") {
         return Ok(node);
@@ -208,65 +203,22 @@ pub fn register_session_queue_node(runtime: &DataPlaneRuntime) -> RuntimeResult<
 
 impl SessionQueueNode {
     pub fn new() -> RuntimeResult<Self> {
-        SESSION_QUEUE_NODES.with(|nodes| {
-            let mut nodes = nodes.borrow_mut();
-            let slot = nodes.len();
-            let runtime_data = NodeRuntimeData::from_usize(slot)?;
-            nodes.push((None, Vec::new()));
-            Ok(Self { runtime_data })
-        })
-    }
-
-    pub fn install_worker_session(
-        runtime_data: NodeRuntimeData,
-        main: Arc<SessionMain>,
-    ) -> RuntimeResult<()> {
-        let slot = runtime_data.usize_word(0)?;
-        SESSION_QUEUE_NODES.with(|nodes| {
-            let mut nodes = nodes
-                .try_borrow_mut()
-                .map_err(|_| SessionQueueError::AttachmentRegistryBorrowed)?;
-            let (session, _) = nodes
-                .get_mut(slot)
-                .ok_or(SessionQueueError::AttachmentSlotMissing { slot })?;
-            *session = Some(main);
-            Ok(())
+        Ok(Self {
+            runtime_data: NodeRuntimeData::empty(),
         })
     }
 
     fn poll_app(runtime: &DataPlaneRuntime, runtime_data: NodeRuntimeData) -> RuntimeResult<usize> {
-        let slot = runtime_data.usize_word(0)?;
-        SESSION_QUEUE_NODES.with(|nodes| {
-            let nodes = nodes
-                .try_borrow()
-                .map_err(|_| SessionQueueError::AttachmentRegistryBorrowed)?;
-            let (session, _) = nodes
-                .get(slot)
-                .ok_or(SessionQueueError::AttachmentSlotMissing { slot })?;
-            let session = session
-                .as_ref()
-                .ok_or(SessionQueueError::AttachmentSlotMissing { slot })?;
-            session.with_worker_mut(runtime, SessionWorker::poll_app)
-        })
-    }
-
-    fn poll_session_events(
-        runtime: &DataPlaneRuntime,
-        runtime_data: NodeRuntimeData,
-    ) -> RuntimeResult<()> {
-        let slot = runtime_data.usize_word(0)?;
-        SESSION_QUEUE_NODES.with(|nodes| {
-            let nodes = nodes
-                .try_borrow()
-                .map_err(|_| SessionQueueError::AttachmentRegistryBorrowed)?;
-            let (session, _) = nodes
-                .get(slot)
-                .ok_or(SessionQueueError::AttachmentSlotMissing { slot })?;
-            let Some(session) = session.as_ref() else {
-                return Ok(());
-            };
-            session.with_worker_mut(runtime, |sessions| sessions.poll_session_events().map(drop))
-        })
+        let ptr = runtime_data.word(0) as usize as *const SessionMain;
+        if ptr.is_null() {
+            return Err(RuntimeError::RuntimeCapabilityMissing {
+                type_name: std::any::type_name::<SessionMain>(),
+            });
+        }
+        // SAFETY: worker NodeRuntimeData is installed by the owning Data Worker
+        // and the SessionMain Arc remains alive in that worker's SessionMain.
+        let main = unsafe { &*ptr };
+        main.with_worker_mut(runtime, |sessions| sessions.poll_app())
     }
 
     /// Compiles the session queue's output edge in the main graph.
@@ -315,25 +267,27 @@ impl SessionQueueNode {
     /// The graph edge is compiled by [`Self::compile_output_next`] on the main
     /// thread. This method owns only the worker's dispatch table.
     pub fn install_worker_attachment(
+        runtime: &DataPlaneRuntime,
         runtime_data: NodeRuntimeData,
         output_next: SessionQueueNext,
-        dispatch: SessionQueueDispatchFn,
+        function: SessionQueueDispatchFn,
     ) -> RuntimeResult<()> {
-        let attachment_slot = runtime_data.usize_word(0)?;
-        SESSION_QUEUE_NODES.with(|nodes| {
-            let mut nodes = nodes
-                .try_borrow_mut()
-                .map_err(|_| SessionQueueError::AttachmentRegistryBorrowed)?;
-            let (_, attachments) =
-                nodes
-                    .get_mut(attachment_slot)
-                    .ok_or(SessionQueueError::AttachmentSlotMissing {
-                        slot: attachment_slot,
-                    })?;
-            attachments.push(SessionQueueAttachment {
-                output_next,
-                dispatch,
+        let ptr = runtime_data.word(0) as usize as *const SessionMain;
+        if ptr.is_null() {
+            return Err(RuntimeError::RuntimeCapabilityMissing {
+                type_name: std::any::type_name::<SessionMain>(),
             });
+        }
+        // SAFETY: worker NodeRuntimeData is installed by the owning Data Worker
+        // and the SessionMain Arc remains alive in that worker's SessionMain.
+        let main = unsafe { &*ptr };
+        main.with_worker_mut(runtime, |sessions| {
+            sessions
+                .transport_dispatches
+                .push(SessionQueueTransportDispatch {
+                    output_next,
+                    function,
+                });
             Ok(())
         })
     }
@@ -370,43 +324,31 @@ fn session_queue_node_process(
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> NodeResult {
-    let slot = match data.usize_word(0) {
-        Ok(slot) => slot,
-        Err(_) => return NodeResult::drop(),
-    };
     let now = Instant::now();
     let mut output = SessionQueueOutput::default();
-    if SessionQueueNode::poll_session_events(runtime, data).is_err() {
+    let ptr = data.word(0) as usize as *const SessionMain;
+    if ptr.is_null() {
         let _ = runtime.record_current_node_error(SessionQueueError::DispatchFailed.code());
         return NodeResult::drop();
     }
-    let mut index = 0usize;
-    loop {
-        let attachment = SESSION_QUEUE_NODES.with(|nodes| {
-            let nodes = nodes.try_borrow().ok()?;
-            nodes.get(slot)?.1.get(index).copied()
-        });
-        let Some(attachment) = attachment else { break };
-        if (attachment.dispatch)(
-            runtime,
-            data,
-            attachment.output_next,
-            now,
-            frame,
-            &mut output,
-        )
-        .map_err(RuntimeError::from)
-        .map_err(|err| {
-            let _ = runtime.record_current_node_error(SessionQueueError::DispatchFailed.code());
-            err
-        })
-        .and_then(|_| Ok(()))
-        .is_err()
-        {
-            output.flush(runtime, frame);
-            return NodeResult::drop();
+    // SAFETY: worker NodeRuntimeData is installed by the owning Data Worker and
+    // the SessionMain Arc remains alive in that worker's SessionMain.
+    let main = unsafe { &*ptr };
+    let result = main.with_worker_mut(runtime, |sessions| {
+        sessions.poll_session_events()?;
+        for dispatch in &sessions.transport_dispatches {
+            if (dispatch.function)(runtime, data, dispatch.output_next, now, frame, &mut output)
+                .is_err()
+            {
+                return Err(SessionQueueError::DispatchFailed.into());
+            }
         }
-        index += 1;
+        Ok(())
+    });
+    if result.is_err() {
+        let _ = runtime.record_current_node_error(SessionQueueError::DispatchFailed.code());
+        output.flush(runtime, frame);
+        return NodeResult::drop();
     }
     output.flush(runtime, frame);
     NodeResult::drop()

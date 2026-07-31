@@ -30,10 +30,6 @@ pub enum SessionQueueError {
         consumer: NodeId,
         output_node: NodeId,
     },
-    #[error("session queue attachment slot {slot} is not registered")]
-    AttachmentSlotMissing { slot: usize },
-    #[error("session queue attachment registry is already borrowed")]
-    AttachmentRegistryBorrowed,
 }
 
 impl SessionQueueError {
@@ -47,8 +43,6 @@ impl SessionQueueError {
             Self::WorkerAlreadyInstalled { .. } => 4,
             Self::WorkerAccess { .. } => 5,
             Self::OutputMissing { .. } => 6,
-            Self::AttachmentSlotMissing { .. } => 7,
-            Self::AttachmentRegistryBorrowed => 8,
         }
     }
 }
