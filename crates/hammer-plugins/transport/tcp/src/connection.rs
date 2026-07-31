@@ -332,6 +332,7 @@ impl DerefMut for TcpConnection {
 }
 
 impl TcpConnection {
+    #[cfg(test)]
     #[inline]
     pub(super) fn timer_state(&self) -> &TcpTimerState {
         &self.timers
@@ -699,6 +700,10 @@ impl TcpConnection {
     #[inline]
     pub fn recovery(&self) -> &TcpRecoveryState {
         &self.recovery
+    }
+
+    pub(crate) fn reserve_payload_tx_samples(&mut self, additional: usize) -> bool {
+        self.recovery.ensure_sample_capacity(additional)
     }
 
     #[inline]

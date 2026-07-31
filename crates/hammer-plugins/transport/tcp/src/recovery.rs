@@ -388,7 +388,7 @@ impl TcpRecoveryState {
     /// like VPP's `tcp_bt.c` build-tracking pool, which grows without bound
     /// through `pool_get_zero`. Growth remaps every sample `PoolIndex`, so
     /// this must only run from entry points that hold no sample indices.
-    fn ensure_sample_capacity(&mut self, additional: usize) -> bool {
+    pub(crate) fn ensure_sample_capacity(&mut self, additional: usize) -> bool {
         let needed = self.sent_samples.len().saturating_add(additional);
         if needed <= self.sent_samples.capacity() {
             return true;

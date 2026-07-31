@@ -2,11 +2,11 @@ use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use crate::TcpPacket;
-use crate::{TcpSeq, TcpState};
+use crate::{TcpError, TcpSeq, TcpState};
 use hammer_core::data_plane::DataPlaneBuffers;
 use hammer_infra::pool::{Index, Pool};
-use hammer_runtime::RuntimeResult;
 use hammer_runtime::{DataPlaneRuntime, DataWorkerId};
+use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use super::connection::TcpTimerAction;
 use super::lookup::TcpLookupState;
@@ -339,25 +339,30 @@ impl SessionPacketizedTransport<Index> for TcpWorker {
     ) -> RuntimeResult<()> {
         let connection = self
             .connections
-            .get(index)
+            .get_mut(index)
             .ok_or(TcpNodeError::SessionMissing)?;
         let capabilities = self
             .lookup
             .pending_open_capabilities(connection.session_id())
             .unwrap_or_default();
-        let previous_timer_state = *connection.timer_state();
-        let mut candidate = connection.clone();
-        for entry in batch {
-            let segment = candidate.tx_segment(entry.payload_len, capabilities)?;
-            segment.write_to_buffer(buffers, entry.index)?;
-            candidate.commit_payload_tx(entry.payload_len, now)?;
+        if connection.state() == TcpState::SynSent {
+            if connection.local().is_none() {
+                return Err(TcpError::InvalidConnection.into());
+            }
+        } else {
+            connection.ensure_state(TcpState::Established)?;
         }
-        *candidate.timer_state_mut() = previous_timer_state;
-        candidate.sync_payload_tx_timers(index, &mut self.timers, now)?;
-        *self
-            .connections
-            .get_mut(index)
-            .ok_or(TcpNodeError::SessionMissing)? = candidate;
-        Ok(())
+        for entry in batch {
+            u32::try_from(entry.payload_len).map_err(|_| RuntimeError::from(TcpError::Dispatch))?;
+        }
+        if !connection.reserve_payload_tx_samples(batch.len()) {
+            return Err(RuntimeError::from(TcpError::Dispatch));
+        }
+        for entry in batch {
+            let segment = connection.tx_segment(entry.payload_len, capabilities)?;
+            segment.write_to_buffer(buffers, entry.index)?;
+            connection.commit_payload_tx(entry.payload_len, now)?;
+        }
+        connection.sync_payload_tx_timers(index, &mut self.timers, now)
     }
 }
