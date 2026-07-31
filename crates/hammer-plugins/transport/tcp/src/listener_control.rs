@@ -318,4 +318,105 @@ mod tests {
             "closed listener registration must be removed"
         );
     }
+
+    #[test]
+    fn duplicate_tcp_endpoint_is_rejected_without_replacing_existing_listener() {
+        let control = TcpInputControlPlane::new();
+        let handle = TcpListenerControlHandle::new(control);
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7301);
+        let listener = SessionListenerId::new(7, 3);
+        let lookup_id = handle
+            .bind(
+                bind,
+                DataWorkerId::new(0),
+                TcpCapabilities::default(),
+                Some(listener),
+            )
+            .expect("bind first tcp listener");
+
+        assert!(
+            handle
+                .bind(
+                    bind,
+                    DataWorkerId::new(1),
+                    TcpCapabilities::default(),
+                    Some(SessionListenerId::new(8, 4)),
+                )
+                .is_err(),
+            "duplicate endpoint must be rejected"
+        );
+
+        let snapshot = handle.snapshot_for_test();
+        assert_eq!(snapshot.tcp_listeners, vec![lookup_id]);
+        let entry = snapshot
+            .tcp_lookup
+            .lookup_listener::<TcpIpv4ListenerAddress>(TcpV4ListenerKey::new(
+                0,
+                Ipv4Addr::LOCALHOST,
+                7301,
+            ))
+            .expect("original listener remains published");
+        assert_eq!(entry.id, lookup_id);
+        assert_eq!(entry.session_listener, Some(listener));
+        assert_eq!(entry.owner_worker, DataWorkerId::new(0));
+    }
+
+    #[test]
+    fn close_missing_lookup_or_session_listener_is_rejected() {
+        let control = TcpInputControlPlane::new();
+        let handle = TcpListenerControlHandle::new(control);
+
+        assert!(handle.close(999).is_err(), "missing lookup id is rejected");
+        assert!(
+            handle
+                .close_session_listener(SessionListenerId::new(999, 1))
+                .is_err(),
+            "missing Session listener is rejected"
+        );
+    }
+
+    #[test]
+    fn close_session_listener_removes_published_lookup() {
+        let control = TcpInputControlPlane::new();
+        let handle = TcpListenerControlHandle::new(control);
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7302);
+        let listener = SessionListenerId::new(9, 2);
+        handle
+            .bind(
+                bind,
+                DataWorkerId::new(3),
+                TcpCapabilities::default(),
+                Some(listener),
+            )
+            .expect("bind Session-owned tcp listener");
+
+        let snapshot = handle.snapshot_for_test();
+        let entry = snapshot
+            .tcp_lookup
+            .lookup_listener::<TcpIpv4ListenerAddress>(TcpV4ListenerKey::new(
+                0,
+                Ipv4Addr::LOCALHOST,
+                7302,
+            ))
+            .expect("Session-owned listener is published");
+        assert_eq!(entry.owner_worker, DataWorkerId::new(3));
+        assert_eq!(entry.session_listener, Some(listener));
+
+        handle
+            .close_session_listener(listener)
+            .expect("close Session-owned listener");
+        let snapshot = handle.snapshot_for_test();
+        assert!(
+            snapshot
+                .tcp_lookup
+                .lookup_listener::<TcpIpv4ListenerAddress>(TcpV4ListenerKey::new(
+                    0,
+                    Ipv4Addr::LOCALHOST,
+                    7302,
+                ))
+                .is_none(),
+            "unlisten removes the production lookup entry"
+        );
+        assert!(snapshot.tcp_listeners.is_empty());
+    }
 }

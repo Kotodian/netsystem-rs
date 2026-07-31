@@ -53,7 +53,6 @@ use hammer_service::session::{SessionId, SessionQueueNext};
 pub mod config;
 pub mod congestion;
 pub mod connection;
-mod control_plane;
 pub mod established;
 pub mod input;
 pub mod listen;
@@ -77,7 +76,6 @@ pub use connection::{
     TCP_INITIAL_RETRANSMIT_TIMEOUT, TCP_MAX_RETRANSMIT_TIMEOUT, TCP_MIN_RETRANSMIT_TIMEOUT,
     TcpConnection, TcpRetransmitTimeoutState,
 };
-pub use control_plane::TcpControlPlane;
 pub use established::{TcpEstablishedNext, TcpEstablishedNode};
 pub use input::{TcpInputControlPlane, TcpInputNode, TcpInputTrace};
 pub use listen::{TcpListenNext, TcpListenNode};
