@@ -53,7 +53,11 @@ impl SessionTransportId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionControlEvent {
     Close(SessionId),
-    TransportClosed(SessionId),
+    HalfClose(SessionId),
+    Propagate {
+        session_id: SessionId,
+        event: SessionEvtType,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -568,6 +572,11 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     }
 
     #[inline]
+    pub fn app_session(&self, session_id: SessionId) -> Option<&Arc<AppSession>> {
+        self.app.app_session(session_id)
+    }
+
+    #[inline]
     pub fn prefetch_session(&self, session_id: SessionId) {
         self.entries.prefetch_slot(session_id.pool_index());
     }
@@ -930,6 +939,31 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         session_id: SessionId,
         index: Index,
     ) -> RuntimeResult<()> {
+        self.notify_transport_event(session_id, index, SessionEvtType::TransportClosed)
+    }
+
+    pub fn notify_transport_closing(
+        &mut self,
+        session_id: SessionId,
+        index: Index,
+    ) -> RuntimeResult<()> {
+        self.notify_transport_event(session_id, index, SessionEvtType::Disconnected)
+    }
+
+    pub fn notify_transport_reset(
+        &mut self,
+        session_id: SessionId,
+        index: Index,
+    ) -> RuntimeResult<()> {
+        self.notify_transport_event(session_id, index, SessionEvtType::Reset)
+    }
+
+    fn notify_transport_event(
+        &mut self,
+        session_id: SessionId,
+        index: Index,
+        event: SessionEvtType,
+    ) -> RuntimeResult<()> {
         let notify_application =
             self.entries
                 .get_mut(session_id.pool_index())
@@ -941,7 +975,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
                     state.on_transport_close(index)
                 });
         if notify_application {
-            self.notify_application_closed(session_id)?;
+            self.notify_application_event(session_id, event)?;
         }
         Ok(())
     }
@@ -1013,7 +1047,11 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         Ok(())
     }
 
-    fn notify_application_closed(&mut self, session_id: SessionId) -> RuntimeResult<()> {
+    fn notify_application_event(
+        &mut self,
+        session_id: SessionId,
+        event: SessionEvtType,
+    ) -> RuntimeResult<()> {
         let application = self
             .entries
             .get(session_id.pool_index())
@@ -1027,10 +1065,18 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
                     return Ok(());
                 };
                 self.control_events
-                    .push_back(SessionControlEvent::TransportClosed(app_session));
+                    .push_back(SessionControlEvent::Propagate {
+                        session_id: app_session,
+                        event,
+                    });
                 Ok(())
             }
-            Some(SessionApplication::External(_)) => self.app.closed(session_id),
+            Some(SessionApplication::External(_)) => match event {
+                SessionEvtType::Disconnected => self.app.disconnected(session_id),
+                SessionEvtType::Reset => self.app.reset(session_id),
+                SessionEvtType::TransportClosed => self.app.transport_closed(session_id),
+                _ => Ok(()),
+            },
             None => Ok(()),
         }
     }
@@ -1053,6 +1099,12 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             .push_back(SessionControlEvent::Close(session_id));
     }
 
+    #[inline]
+    pub fn schedule_half_close(&mut self, session_id: SessionId) {
+        self.control_events
+            .push_back(SessionControlEvent::HalfClose(session_id));
+    }
+
     pub fn poll_app(&mut self) -> RuntimeResult<usize> {
         let session_evt_q = Arc::clone(&self.session_evt_q);
         let mut queue_error = None;
@@ -1061,12 +1113,17 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
                 return;
             }
             let result = match evt.evt_type {
-                SessionEvtType::Connect | SessionEvtType::Close => session_evt_q.enqueue_ctrl(evt),
+                SessionEvtType::Connect | SessionEvtType::Close | SessionEvtType::HalfClose => {
+                    session_evt_q.enqueue_ctrl(evt)
+                }
                 SessionEvtType::RxEnq
                 | SessionEvtType::RxDeq
                 | SessionEvtType::TxEnq
                 | SessionEvtType::TxDeq => session_evt_q.enqueue_io(evt),
-                SessionEvtType::ProtocolOutput => return,
+                SessionEvtType::ProtocolOutput
+                | SessionEvtType::Disconnected
+                | SessionEvtType::Reset
+                | SessionEvtType::TransportClosed => return,
             };
             if let Err(error) = result {
                 queue_error = Some(error);
@@ -1116,6 +1173,14 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
                     .push_back(SessionControlEvent::Close(session_id));
                 Ok(())
             }
+            SessionEvtType::HalfClose => {
+                self.control_events
+                    .push_back(SessionControlEvent::HalfClose(session_id));
+                Ok(())
+            }
+            SessionEvtType::Reset
+            | SessionEvtType::Disconnected
+            | SessionEvtType::TransportClosed => Ok(()),
         }
     }
 
@@ -1417,9 +1482,12 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
 
     fn enqueue_session_event(&self, event: SessionEvt) -> RuntimeResult<()> {
         let result = match event.evt_type {
-            SessionEvtType::Connect | SessionEvtType::Close => {
-                self.session_evt_q.enqueue_ctrl(event)
-            }
+            SessionEvtType::Connect
+            | SessionEvtType::Close
+            | SessionEvtType::HalfClose
+            | SessionEvtType::Reset
+            | SessionEvtType::Disconnected
+            | SessionEvtType::TransportClosed => self.session_evt_q.enqueue_ctrl(event),
             SessionEvtType::RxEnq
             | SessionEvtType::RxDeq
             | SessionEvtType::TxEnq
@@ -2211,7 +2279,7 @@ where
         let Some(event) = sessions.control_events.pop_front() else {
             break;
         };
-        let session_id = match event {
+        match event {
             SessionControlEvent::Close(session_id) => {
                 let session_type = sessions
                     .entries
@@ -2231,21 +2299,61 @@ where
                         .push_back(SessionControlEvent::Close(session));
                     continue;
                 }
-                session_id
+                let session_transport = sessions.session_transport(session_id);
+                if !sessions.close_transport_session(session_id)? {
+                    continue;
+                }
+                if let Some((transport_id, index)) = session_transport
+                    && transport_id == T::ID
+                {
+                    transport.disconnect(
+                        sessions,
+                        index,
+                        runtime,
+                        output_next,
+                        frame,
+                        output,
+                        now,
+                    )?;
+                }
             }
-            SessionControlEvent::TransportClosed(session_id) => {
-                sessions.notify_application_closed(session_id)?;
-                continue;
+            SessionControlEvent::HalfClose(session_id) => {
+                let session_type = sessions
+                    .entries
+                    .get(session_id.pool_index())
+                    .and_then(|entry| entry.session_type);
+                if let Some(SessionType::AppSessionProtocol {
+                    protocol,
+                    connection,
+                }) = session_type
+                {
+                    let Some((session, _)) = sessions.protocol_sessions(protocol, connection)?
+                    else {
+                        continue;
+                    };
+                    sessions
+                        .control_events
+                        .push_back(SessionControlEvent::HalfClose(session));
+                    continue;
+                }
+                let session_transport = sessions.session_transport(session_id);
+                if let Some((transport_id, index)) = session_transport
+                    && transport_id == T::ID
+                {
+                    transport.disconnect(
+                        sessions,
+                        index,
+                        runtime,
+                        output_next,
+                        frame,
+                        output,
+                        now,
+                    )?;
+                }
             }
-        };
-        let session_transport = sessions.session_transport(session_id);
-        if !sessions.close_transport_session(session_id)? {
-            continue;
-        }
-        if let Some((transport_id, index)) = session_transport
-            && transport_id == T::ID
-        {
-            transport.disconnect(sessions, index, runtime, output_next, frame, output, now)?;
+            SessionControlEvent::Propagate { session_id, event } => {
+                sessions.notify_application_event(session_id, event)?;
+            }
         }
     }
 

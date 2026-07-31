@@ -17,6 +17,10 @@ fn existing_session_event_discriminants_remain_stable() {
     assert_eq!(SessionEvtType::RxDeq as u8, 4);
     assert_eq!(SessionEvtType::TxEnq as u8, 5);
     assert_eq!(SessionEvtType::ProtocolOutput as u8, 6);
+    assert_eq!(SessionEvtType::HalfClose as u8, 7);
+    assert_eq!(SessionEvtType::Reset as u8, 8);
+    assert_eq!(SessionEvtType::Disconnected as u8, 9);
+    assert_eq!(SessionEvtType::TransportClosed as u8, 10);
 }
 
 fn descriptor_identity(fd: RawFd) -> std::io::Result<(libc::dev_t, libc::ino_t)> {

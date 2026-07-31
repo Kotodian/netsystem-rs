@@ -451,7 +451,7 @@ fn internal_tx_dispatches_each_session_sharing_a_transport_connection_once() {
     for app in [first_app, second_app] {
         let mut events = [SessionEvt::io(0, SessionEvtType::Connect)];
         assert_eq!(app.poll_events(&mut events), 1);
-        assert_eq!(events[0].evt_type, SessionEvtType::Close);
+        assert_eq!(events[0].evt_type, SessionEvtType::TransportClosed);
     }
 }
 

@@ -403,12 +403,34 @@ impl AppWorker {
         Ok(())
     }
 
-    pub fn closed(&self, session_id: SessionId) -> RuntimeResult<()> {
+    pub fn disconnected(&self, session_id: SessionId) -> RuntimeResult<()> {
         let Some(session) = self.app_session(session_id) else {
             return Ok(());
         };
         session
-            .push_event(SessionEvtType::Close)
+            .push_event(SessionEvtType::Disconnected)
+            .map_err(RuntimeError::from)?;
+        self.notify_evt(&session);
+        Ok(())
+    }
+
+    pub fn reset(&self, session_id: SessionId) -> RuntimeResult<()> {
+        let Some(session) = self.app_session(session_id) else {
+            return Ok(());
+        };
+        session
+            .push_event(SessionEvtType::Reset)
+            .map_err(RuntimeError::from)?;
+        self.notify_evt(&session);
+        Ok(())
+    }
+
+    pub fn transport_closed(&self, session_id: SessionId) -> RuntimeResult<()> {
+        let Some(session) = self.app_session(session_id) else {
+            return Ok(());
+        };
+        session
+            .push_event(SessionEvtType::TransportClosed)
             .map_err(RuntimeError::from)?;
         self.notify_evt(&session);
         Ok(())
@@ -425,7 +447,11 @@ impl AppWorker {
                 break;
             }
             for evt in batch[..count].iter() {
-                if evt.evt_type == SessionEvtType::Close && evt.worker_index() != worker_index {
+                if matches!(
+                    evt.evt_type,
+                    SessionEvtType::Close | SessionEvtType::HalfClose
+                ) && evt.worker_index() != worker_index
+                {
                     continue;
                 }
                 dispatch_event(*evt);

@@ -141,7 +141,6 @@ fn tcp_established_index(
             accept_payload,
             accepted_sequence,
             duplicate_payload,
-            peer_closed,
         ) = {
             let crate::worker::TcpWorker {
                 connections,
@@ -169,7 +168,6 @@ fn tcp_established_index(
                 accept_payload,
                 packet.sequence,
                 duplicate_payload,
-                connection.state() == crate::TcpState::CloseWait,
             )
         };
         if acked_tx_len != 0 {
@@ -177,9 +175,6 @@ fn tcp_established_index(
         }
         if ack_advanced && sessions.pending_send_len(session_id)?.is_some() {
             sessions.mark_ready(session_id);
-        }
-        if peer_closed {
-            sessions.notify_transport_closed(session_id, connection_index)?;
         }
         let mut immediate_ack = false;
         if let Some((trim, offset)) = accept_payload {
@@ -265,6 +260,18 @@ fn tcp_established_index(
             immediate_ack = true;
         }
 
+        let fin_control = {
+            let connection = tcp.connection_mut(connection_index).ok_or_else(|| {
+                let _ = runtime
+                    .record_current_node_error(TcpNodeError::EstablishedSessionMissing.code());
+                TcpNodeError::EstablishedSessionMissing
+            })?;
+            connection.process_fin_after_payload(&packet)?
+        };
+        if fin_control.is_some() {
+            sessions.notify_transport_closing(session_id, connection_index)?;
+        }
+
         let tx_segment = if immediate_ack {
             let connection = tcp.connection_mut(connection_index).ok_or_else(|| {
                 let _ = runtime
@@ -281,6 +288,7 @@ fn tcp_established_index(
         } else {
             None
         }
+        .or(fin_control)
         .or(control);
         publish_tcp_connection(sessions, tcp, session_id)?;
         Ok(tx_segment)

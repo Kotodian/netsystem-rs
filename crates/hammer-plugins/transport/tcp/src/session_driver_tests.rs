@@ -2,12 +2,14 @@
 
 use std::time::{Duration, Instant};
 
-use crate::{TcpCapabilities, TcpPacket, TcpSegmentFlags, TcpState, publish_tcp_connection};
+use crate::{
+    TcpCapabilities, TcpPacket, TcpSegmentFlags, TcpSeq, TcpState, publish_tcp_connection,
+};
 use hammer_core::data_plane::{BufferFrame, NodeId};
 use hammer_infra::pool::Index;
 use hammer_runtime::app::{
     AppSessionError, AppSessionProtocol, AppSessionProtocolEntry, AppSessionProtocolRole,
-    AppSessionProtocolSelection, ApplicationId, SessionEvtType,
+    AppSessionProtocolSelection, ApplicationId, SessionEvt, SessionEvtType,
 };
 use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, RuntimeError};
 
@@ -15,7 +17,8 @@ use hammer_service::data_plane::DropNode;
 use hammer_service::session::SessionId;
 use hammer_service::session::node::{SessionQueueNext, SessionQueueNode, SessionQueueOutput};
 use hammer_service::session::runtime::{
-    SessionTransport, SessionWorker, dispatch_session_queue_once, dispatch_session_queue_pending,
+    SessionPacketizedTransport, SessionTransport, SessionWorker, TransportSendFlags,
+    dispatch_session_queue_once, dispatch_session_queue_pending,
 };
 
 use crate::timers::{TcpTimerKind, TcpTimers};
@@ -616,4 +619,236 @@ fn app_rx_event_refreshes_window_before_rearming_dequeue_notification() {
             .rcv_wnd(),
         1 << 10
     );
+}
+
+#[test]
+fn fin_with_payload_is_processed_after_rx_enqueue_and_notifies_app_once() {
+    let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
+    let (mut sessions, mut tcp) = worker_state();
+    let connection_index = tcp
+        .insert_connection(established_connection())
+        .expect("insert TCP connection");
+    let session_id = sessions
+        .insert_session_for_test(<TcpWorker as SessionTransport<Index>>::ID, connection_index);
+    tcp.connection_mut(connection_index)
+        .expect("TCP connection")
+        .attach_session(session_id)
+        .expect("attach stream session");
+    let app = sessions
+        .app_session(session_id)
+        .cloned()
+        .expect("application App Session");
+    let mut events = [SessionEvt::io(0, SessionEvtType::Connect)];
+    assert_eq!(app.poll_events(&mut events), 1);
+
+    let (local, remote, rcv_nxt, snd_nxt) = {
+        let connection = tcp.connection(connection_index).expect("TCP connection");
+        (
+            connection.local().expect("local address"),
+            connection.remote(),
+            connection.rcv_nxt(),
+            connection.snd_nxt(),
+        )
+    };
+    let packet = TcpPacket {
+        local,
+        remote,
+        sequence: TcpSeq::from(rcv_nxt),
+        acknowledgment: Some(TcpSeq::from(snd_nxt)),
+        advertised_window: u16::MAX,
+        flags: TcpSegmentFlags::FIN | TcpSegmentFlags::ACK,
+        capabilities: TcpCapabilities::default(),
+        sack_blocks: Vec::new(),
+        timestamp: None,
+        fast_open_cookie: None,
+        ip_ecn: None,
+        payload_offset: 0,
+        payload_len: 5,
+    };
+    let (_, index) = sessions
+        .session_transport(session_id)
+        .expect("session transport");
+    let now = Instant::now();
+    {
+        let TcpWorker {
+            connections,
+            timers,
+            ..
+        } = &mut tcp;
+        let connection = connections.get_mut(index).expect("TCP connection");
+        let _ = connection
+            .receive_established_with_timers(index, timers, &packet, now)
+            .expect("process established segment");
+        assert_eq!(connection.accept_payload(&packet), Some((0, 0)));
+        let ingress = runtime
+            .alloc_index_with_bytes(b"hello")
+            .expect("ingress buffer");
+        let delivery = sessions
+            .enqueue_rx(runtime.buffers(), session_id, ingress, 0, false)
+            .expect("enqueue payload");
+        connection.receive_payload(packet.sequence, 0, delivery);
+        let fin = connection
+            .process_fin_after_payload(&packet)
+            .expect("process FIN after payload");
+        assert!(fin.is_some(), "FIN+payload must emit an ACK");
+    }
+    sessions
+        .notify_transport_closing(session_id, index)
+        .expect("notify app close");
+
+    assert_eq!(
+        tcp.connection(index).expect("TCP connection").state(),
+        TcpState::CloseWait
+    );
+    assert_eq!(
+        tcp.connection(index).expect("TCP connection").rcv_nxt(),
+        rcv_nxt.wrapping_add(6)
+    );
+    let mut events = [SessionEvt::io(0, SessionEvtType::Connect); 8];
+    assert_eq!(app.poll_events(&mut events), 2);
+    assert_eq!(events[0].evt_type, SessionEvtType::RxEnq);
+    assert_eq!(events[1].evt_type, SessionEvtType::Disconnected);
+}
+
+#[test]
+fn app_half_close_sends_fin_without_closing_session_state() {
+    let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
+    let (mut sessions, mut tcp) = worker_state();
+    let connection_index = tcp
+        .insert_connection(established_connection())
+        .expect("insert TCP connection");
+    let session_id = sessions
+        .insert_session_for_test(<TcpWorker as SessionTransport<Index>>::ID, connection_index);
+    tcp.connection_mut(connection_index)
+        .expect("TCP connection")
+        .attach_session(session_id)
+        .expect("attach stream session");
+    let app = sessions
+        .app_session(session_id)
+        .cloned()
+        .expect("application App Session");
+    let mut events = [SessionEvt::io(0, SessionEvtType::Connect)];
+    assert_eq!(app.poll_events(&mut events), 1);
+
+    app.half_close().expect("request half close");
+    let (owner, output_next) = session_queue(&runtime);
+    dispatch_session_queue(&runtime, &mut sessions, &mut tcp, owner, output_next);
+
+    assert_eq!(
+        tcp.connection(connection_index)
+            .expect("TCP connection")
+            .state(),
+        TcpState::FinWait1
+    );
+    assert!(sessions.has_session(session_id));
+}
+
+#[test]
+fn app_full_close_sends_fin_and_keeps_session_until_transport_cleanup() {
+    let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
+    let (mut sessions, mut tcp) = worker_state();
+    let connection_index = tcp
+        .insert_connection(established_connection())
+        .expect("insert TCP connection");
+    let session_id = sessions
+        .insert_session_for_test(<TcpWorker as SessionTransport<Index>>::ID, connection_index);
+    tcp.connection_mut(connection_index)
+        .expect("TCP connection")
+        .attach_session(session_id)
+        .expect("attach stream session");
+    let app = sessions
+        .app_session(session_id)
+        .cloned()
+        .expect("application App Session");
+    let mut events = [SessionEvt::io(0, SessionEvtType::Connect)];
+    assert_eq!(app.poll_events(&mut events), 1);
+
+    app.close().expect("request full close");
+    let (owner, output_next) = session_queue(&runtime);
+    dispatch_session_queue(&runtime, &mut sessions, &mut tcp, owner, output_next);
+
+    assert_eq!(
+        tcp.connection(connection_index)
+            .expect("TCP connection")
+            .state(),
+        TcpState::FinWait1
+    );
+    assert!(sessions.has_session(session_id));
+}
+
+#[test]
+fn tcp_reset_delivers_distinct_reset_event_to_app() {
+    let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
+    let (mut sessions, mut tcp) = worker_state();
+    let connection_index = tcp
+        .insert_connection(established_connection())
+        .expect("insert TCP connection");
+    let session_id = sessions
+        .insert_session_for_test(<TcpWorker as SessionTransport<Index>>::ID, connection_index);
+    tcp.connection_mut(connection_index)
+        .expect("TCP connection")
+        .attach_session(session_id)
+        .expect("attach stream session");
+    let app = sessions
+        .app_session(session_id)
+        .cloned()
+        .expect("application App Session");
+    let mut events = [SessionEvt::io(0, SessionEvtType::Connect)];
+    assert_eq!(app.poll_events(&mut events), 1);
+
+    let reset = {
+        let connection = tcp.connection(connection_index).expect("TCP connection");
+        TcpPacket {
+            local: connection.remote(),
+            remote: connection.local().expect("local address"),
+            sequence: TcpSeq::from(connection.rcv_nxt()),
+            acknowledgment: None,
+            advertised_window: 0,
+            flags: TcpSegmentFlags::RST,
+            capabilities: TcpCapabilities::default(),
+            sack_blocks: Vec::new(),
+            timestamp: None,
+            fast_open_cookie: None,
+            ip_ecn: None,
+            payload_offset: 0,
+            payload_len: 0,
+        }
+    };
+    tcp.receive_close_side_for_test(connection_index, &reset)
+        .expect("receive reset");
+    sessions.mark_ready(session_id);
+    let (owner, output_next) = session_queue(&runtime);
+    dispatch_session_queue(&runtime, &mut sessions, &mut tcp, owner, output_next);
+
+    let mut events = [SessionEvt::io(0, SessionEvtType::Connect); 4];
+    assert_eq!(app.poll_events(&mut events), 1);
+    assert_eq!(events[0].evt_type, SessionEvtType::Reset);
+}
+
+#[test]
+fn tcp_send_params_deschedules_when_peer_window_is_zero() {
+    let (mut sessions, mut tcp) = worker_state();
+    let mut connection = established_connection();
+    connection.set_peer_window_for_test(0);
+    let connection_index = tcp
+        .insert_connection(connection)
+        .expect("insert TCP connection");
+    let session_id = sessions
+        .insert_session_for_test(<TcpWorker as SessionTransport<Index>>::ID, connection_index);
+    tcp.connection_mut(connection_index)
+        .expect("TCP connection")
+        .attach_session(session_id)
+        .expect("attach stream session");
+
+    let params = <TcpWorker as SessionPacketizedTransport<Index>>::send_params(
+        &mut tcp,
+        &mut sessions,
+        connection_index,
+        8,
+        Instant::now(),
+    )
+    .expect("send params");
+
+    assert_eq!(params.snd_space, 0);
+    assert!(params.flags.contains(TransportSendFlags::DESCHED));
 }
