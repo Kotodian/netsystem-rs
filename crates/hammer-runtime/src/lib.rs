@@ -36,7 +36,7 @@ pub mod error;
 pub use engine::{Engine, EnginePool};
 pub mod config;
 pub mod file;
-pub use file::{File, FileFunction, FileFunctions, FileMain};
+pub use file::{Deadline, DeadlineFunction, File, FileFunction, FileFunctions, FileMain};
 pub mod barrier;
 pub mod binary_api;
 pub mod init;

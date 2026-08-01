@@ -7,6 +7,7 @@
 use std::fmt;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::time::Duration;
 
 use crate::error::{RuntimeError, RuntimeResult};
 use hammer_infra::pool::{Index, Pool};
@@ -24,6 +25,9 @@ use linux::Poller;
 
 /// Worker-local callback invoked for one ready descriptor event.
 pub type FileFunction = fn(&NodeRuntime, &mut File) -> RuntimeResult<()>;
+
+/// Worker-local callback invoked when a registered deadline expires.
+pub type DeadlineFunction = fn(&NodeRuntime, &mut Deadline) -> RuntimeResult<()>;
 
 /// Functions dispatched for one File's read, write, and error readiness.
 #[derive(Clone, Copy, Debug, Default)]
@@ -150,6 +154,64 @@ impl File {
     }
 }
 
+/// A worker-local deadline registration owned by [`FileMain`].
+pub struct Deadline {
+    description: String,
+    private_data: u64,
+    function: DeadlineFunction,
+    duration: Option<Duration>,
+    expiry_events: u64,
+}
+
+impl Deadline {
+    /// Creates a disarmed deadline registration.
+    pub fn new(
+        description: impl Into<String>,
+        private_data: u64,
+        function: DeadlineFunction,
+    ) -> Self {
+        Self {
+            description: description.into(),
+            private_data,
+            function,
+            duration: None,
+            expiry_events: 0,
+        }
+    }
+
+    #[inline]
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    #[inline]
+    pub fn private_data(&self) -> u64 {
+        self.private_data
+    }
+
+    #[inline]
+    pub fn set_private_data(&mut self, private_data: u64) {
+        self.private_data = private_data;
+    }
+
+    #[inline]
+    pub fn expiry_events(&self) -> u64 {
+        self.expiry_events
+    }
+}
+
+impl fmt::Debug for Deadline {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Deadline")
+            .field("description", &self.description)
+            .field("private_data", &self.private_data)
+            .field("duration", &self.duration)
+            .field("expiry_events", &self.expiry_events)
+            .finish()
+    }
+}
+
 impl fmt::Debug for File {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -169,6 +231,7 @@ impl fmt::Debug for File {
 pub struct FileMain {
     poller: Poller,
     files: Pool<File>,
+    deadlines: Pool<Deadline>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,6 +252,7 @@ impl FileMain {
         Ok(Self {
             poller: Poller::new()?,
             files: Pool::with_capacity(FILE_POOL_CAPACITY),
+            deadlines: Pool::with_capacity(FILE_POOL_CAPACITY),
         })
     }
 
@@ -222,6 +286,66 @@ impl FileMain {
             return Err(error);
         }
         Ok(index)
+    }
+
+    /// Registers a disarmed worker deadline and returns its generation-safe
+    /// `hammer-infra` Pool Index.
+    pub fn add_deadline(&mut self, deadline: Deadline) -> RuntimeResult<Index> {
+        let index = self
+            .deadlines
+            .insert(deadline)
+            .ok_or(RuntimeError::DeadlinePoolFull)?;
+        if let Err(error) = self.poller.add_deadline(index) {
+            self.deadlines.remove(index);
+            return Err(error);
+        }
+        Ok(index)
+    }
+
+    /// Returns the currently armed duration, if the deadline is registered.
+    pub fn deadline(&self, index: Index) -> RuntimeResult<Option<Duration>> {
+        self.deadlines
+            .get(index)
+            .map(|deadline| deadline.duration)
+            .ok_or(RuntimeError::DeadlineIndexInvalid { index })
+    }
+
+    /// Arms or disarms a registered deadline.
+    pub fn set_deadline(&mut self, index: Index, duration: Option<Duration>) -> RuntimeResult<()> {
+        if self.deadlines.get(index).is_none() {
+            return Err(RuntimeError::DeadlineIndexInvalid { index });
+        }
+        let previous_duration = self
+            .deadlines
+            .get(index)
+            .map(|deadline| deadline.duration)
+            .expect("validated deadline remains registered");
+        if let Err(error) = self.poller.set_deadline(index, duration) {
+            if let Err(cleanup_error) = self.poller.set_deadline(index, previous_duration) {
+                tracing::error!(
+                    %cleanup_error,
+                    ?index,
+                    "failed to restore File deadline after update failed"
+                );
+            }
+            return Err(error);
+        }
+        let deadline = self
+            .deadlines
+            .get_mut(index)
+            .expect("validated deadline remains registered");
+        deadline.duration = duration;
+        Ok(())
+    }
+
+    /// Removes a deadline after canceling its platform registration.
+    pub fn delete_deadline(&mut self, index: Index) -> RuntimeResult<bool> {
+        if self.deadlines.get(index).is_none() {
+            return Ok(false);
+        }
+        self.poller.delete_deadline(index)?;
+        self.deadlines.remove(index);
+        Ok(true)
     }
 
     #[inline]
@@ -350,24 +474,43 @@ impl FileMain {
         let count = self.poller.poll(&mut events)?;
         let mut dispatched = 0;
         for event in &events[..count] {
-            let Some(index) = event.index else {
-                continue;
-            };
-            let Some(file) = self.files.get_mut(index) else {
-                continue;
-            };
-            if event.readiness.contains(Readiness::ERROR) && file.functions.error.is_none() {
-                self.delete(index)?;
-                continue;
-            }
-            dispatched += file.dispatch(graph, event.readiness)?;
-            if event.rearm {
-                let spec = self
-                    .files
-                    .get(index)
-                    .map(|file| file.poll_spec(index))
-                    .expect("callback dispatch cannot remove its File");
-                self.poller.add(spec)?;
+            match event.target {
+                Some(PollTarget::File(index)) => {
+                    let Some(file) = self.files.get_mut(index) else {
+                        continue;
+                    };
+                    if event.readiness.contains(Readiness::ERROR) && file.functions.error.is_none()
+                    {
+                        self.delete(index)?;
+                        continue;
+                    }
+                    dispatched += file.dispatch(graph, event.readiness)?;
+                    if event.rearm {
+                        let spec = self
+                            .files
+                            .get(index)
+                            .map(|file| file.poll_spec(index))
+                            .expect("callback dispatch cannot remove its File");
+                        self.poller.add(spec)?;
+                    }
+                }
+                Some(PollTarget::Deadline(index)) => {
+                    if self.deadlines.get(index).is_none() {
+                        continue;
+                    }
+                    self.poller.consume_deadline(index)?;
+                    let deadline = self
+                        .deadlines
+                        .get_mut(index)
+                        .expect("validated deadline remains registered");
+                    deadline.expiry_events += 1;
+                    (deadline.function)(graph, deadline)?;
+                    dispatched += 1;
+                    if event.rearm {
+                        self.poller.rearm_deadline(index)?;
+                    }
+                }
+                None => {}
             }
         }
         Ok(dispatched)
@@ -385,11 +528,27 @@ pub(super) struct PollSpec {
     pub(super) write: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
+pub(super) enum PollTarget {
+    File(Index),
+    Deadline(Index),
+}
+
+#[derive(Clone, Copy, Debug)]
 pub(super) struct PollEvent {
-    pub(super) index: Option<Index>,
+    pub(super) target: Option<PollTarget>,
     pub(super) readiness: Readiness,
     pub(super) rearm: bool,
+}
+
+impl Default for PollEvent {
+    fn default() -> Self {
+        Self {
+            target: None,
+            readiness: Readiness::default(),
+            rearm: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

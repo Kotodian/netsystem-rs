@@ -1,12 +1,13 @@
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::time::Duration;
 
 use crate::error::{RuntimeError, RuntimeResult};
 use hammer_infra::pool::Index;
 use hammer_infra::ring::LocalRing;
 use io_uring::{IoUring, Probe, cqueue, opcode, squeue, types};
 
-use super::{FILE_POOL_CAPACITY, POLL_BATCH_SIZE, PollEvent, PollSpec, Readiness};
+use super::{FILE_POOL_CAPACITY, POLL_BATCH_SIZE, PollEvent, PollSpec, PollTarget, Readiness};
 
 const CONTROL_TOKEN: u64 = 0;
 const PROBE_TOKEN: u64 = u64::MAX;
@@ -14,7 +15,8 @@ const SLOT_BITS: u32 = FILE_POOL_CAPACITY.trailing_zeros();
 const SLOT_MASK: u64 = (1 << SLOT_BITS) - 1;
 const INDEX_GENERATION_BITS: u32 = 32;
 const REQUEST_SEQUENCE_SHIFT: u32 = SLOT_BITS + INDEX_GENERATION_BITS;
-const REQUEST_SEQUENCE_MASK: u32 = (1 << (64 - REQUEST_SEQUENCE_SHIFT)) - 1;
+const REQUEST_SEQUENCE_MASK: u32 = (1 << (63 - REQUEST_SEQUENCE_SHIFT)) - 1;
+const DEADLINE_TOKEN_BIT: u64 = 1 << 63;
 
 #[derive(Clone, Copy)]
 struct Completion {
@@ -27,6 +29,9 @@ pub(super) struct Poller {
     ring: IoUring,
     pending: LocalRing<Completion>,
     current_tokens: [u64; FILE_POOL_CAPACITY],
+    deadline_tokens: [u64; FILE_POOL_CAPACITY],
+    deadline_fds: [Option<OwnedFd>; FILE_POOL_CAPACITY],
+    deadline_durations: [Option<Duration>; FILE_POOL_CAPACITY],
     request_sequence: u32,
     multishot: bool,
     wake: OwnedFd,
@@ -74,6 +79,9 @@ impl Poller {
             ring,
             pending: LocalRing::with_capacity(pending_capacity),
             current_tokens: [0; FILE_POOL_CAPACITY],
+            deadline_tokens: [0; FILE_POOL_CAPACITY],
+            deadline_fds: std::array::from_fn(|_| None),
+            deadline_durations: [None; FILE_POOL_CAPACITY],
             request_sequence: 0,
             multishot,
             wake,
@@ -100,14 +108,7 @@ impl Poller {
             return Ok(());
         }
 
-        let token = self.next_token(spec.index);
-        let entry = opcode::PollAdd::new(types::Fd(spec.fd), poll_flags(spec))
-            .multi(self.multishot)
-            .build()
-            .user_data(token);
-        self.submit(entry)?;
-        self.current_tokens[spec.index.slot() as usize] = token;
-        Ok(())
+        self.add_poll(spec.index, spec.fd, poll_flags(spec), false)
     }
 
     pub(super) fn modify(&mut self, before: PollSpec, after: PollSpec) -> RuntimeResult<()> {
@@ -119,6 +120,141 @@ impl Poller {
         self.cancel(spec.index)
     }
 
+    pub(super) fn add_deadline(&mut self, index: Index) -> RuntimeResult<()> {
+        let slot = index.slot() as usize;
+        // SAFETY: timerfd_create returns a fresh descriptor or -1 with errno.
+        let fd = unsafe {
+            libc::timerfd_create(
+                libc::CLOCK_MONOTONIC,
+                libc::TFD_CLOEXEC | libc::TFD_NONBLOCK,
+            )
+        };
+        if fd < 0 {
+            return Err(io_error(
+                "create File deadline timerfd",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: ownership of the fresh timerfd descriptor is transferred once.
+        self.deadline_fds[slot] = Some(unsafe { OwnedFd::from_raw_fd(fd) });
+        self.deadline_tokens[slot] = CONTROL_TOKEN;
+        self.deadline_durations[slot] = None;
+        Ok(())
+    }
+
+    pub(super) fn set_deadline(
+        &mut self,
+        index: Index,
+        duration: Option<Duration>,
+    ) -> RuntimeResult<()> {
+        let slot = index.slot() as usize;
+        let fd = self
+            .deadline_fds
+            .get(slot)
+            .and_then(Option::as_ref)
+            .ok_or(RuntimeError::DeadlineIndexInvalid { index })?;
+        match duration {
+            Some(duration) => {
+                set_timerfd(fd.as_raw_fd(), Some(duration))?;
+                if self.deadline_tokens[slot] == CONTROL_TOKEN {
+                    if let Err(error) = self.add_deadline_poll(index, fd.as_raw_fd()) {
+                        if let Err(cleanup_error) = set_timerfd(fd.as_raw_fd(), None) {
+                            tracing::error!(
+                                %cleanup_error,
+                                "failed to disarm File deadline after poll registration failed"
+                            );
+                        }
+                        return Err(error);
+                    }
+                }
+                self.deadline_durations[slot] = Some(duration);
+            }
+            None => {
+                self.cancel_deadline(index)?;
+                set_timerfd(fd.as_raw_fd(), None)?;
+                self.deadline_durations[slot] = None;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn delete_deadline(&mut self, index: Index) -> RuntimeResult<()> {
+        let slot = index.slot() as usize;
+        if self
+            .deadline_fds
+            .get(slot)
+            .and_then(Option::as_ref)
+            .is_none()
+        {
+            return Err(RuntimeError::DeadlineIndexInvalid { index });
+        }
+        self.cancel_deadline(index)?;
+        self.deadline_fds[slot] = None;
+        self.deadline_durations[slot] = None;
+        Ok(())
+    }
+
+    pub(super) fn consume_deadline(&mut self, index: Index) -> RuntimeResult<()> {
+        let fd = self
+            .deadline_fds
+            .get(index.slot() as usize)
+            .and_then(Option::as_ref)
+            .ok_or(RuntimeError::DeadlineIndexInvalid { index })?;
+        let mut expirations = 0_u64;
+        loop {
+            // SAFETY: `expirations` is writable for one timerfd counter and the
+            // deadline fd is owned by this worker's FileMain.
+            let result = unsafe {
+                libc::read(
+                    fd.as_raw_fd(),
+                    std::ptr::from_mut(&mut expirations).cast(),
+                    std::mem::size_of::<u64>(),
+                )
+            };
+            if result == std::mem::size_of::<u64>() as isize {
+                return Ok(());
+            }
+            if result < 0 {
+                let source = io::Error::last_os_error();
+                if source.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if source.kind() == io::ErrorKind::WouldBlock {
+                    return Ok(());
+                }
+                return Err(RuntimeError::FileRead { source });
+            }
+            return Err(io_error(
+                "consume File deadline timerfd",
+                io::Error::from_raw_os_error(libc::EIO),
+            ));
+        }
+    }
+
+    pub(super) fn rearm_deadline(&mut self, index: Index) -> RuntimeResult<()> {
+        let slot = index.slot() as usize;
+        let Some(duration) = self.deadline_durations[slot] else {
+            return Ok(());
+        };
+        let fd = self
+            .deadline_fds
+            .get(slot)
+            .and_then(Option::as_ref)
+            .ok_or(RuntimeError::DeadlineIndexInvalid { index })?;
+        self.deadline_tokens[slot] = CONTROL_TOKEN;
+        set_timerfd(fd.as_raw_fd(), Some(duration))?;
+        if let Err(error) = self.add_deadline_poll(index, fd.as_raw_fd()) {
+            if let Err(cleanup_error) = set_timerfd(fd.as_raw_fd(), None) {
+                tracing::error!(
+                    %cleanup_error,
+                    "failed to disarm File deadline after rearm registration failed"
+                );
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub(super) fn poll(
         &mut self,
         ready: &mut [PollEvent; POLL_BATCH_SIZE],
@@ -128,8 +264,12 @@ impl Poller {
             let Some(completion) = self.pending.pop() else {
                 break;
             };
-            if let Some(event) = completion_event(completion, &self.current_tokens, self.multishot)?
-            {
+            if let Some(event) = completion_event(
+                completion,
+                &self.current_tokens,
+                &self.deadline_tokens,
+                self.multishot,
+            )? {
                 ready[count] = event;
                 count += 1;
             }
@@ -137,6 +277,7 @@ impl Poller {
 
         let multishot = self.multishot;
         let current_tokens = &self.current_tokens;
+        let deadline_tokens = &self.deadline_tokens;
         let (ring, pending) = (&mut self.ring, &mut self.pending);
         let mut completions = ring.completion();
         for completion in &mut completions {
@@ -146,7 +287,9 @@ impl Poller {
                 flags: completion.flags(),
             };
             if count < ready.len() {
-                if let Some(event) = completion_event(completion, current_tokens, multishot)? {
+                if let Some(event) =
+                    completion_event(completion, current_tokens, deadline_tokens, multishot)?
+                {
                     ready[count] = event;
                     count += 1;
                 }
@@ -160,8 +303,20 @@ impl Poller {
     }
 
     fn cancel(&mut self, index: Index) -> RuntimeResult<()> {
+        self.cancel_token(index, false)
+    }
+
+    fn cancel_deadline(&mut self, index: Index) -> RuntimeResult<()> {
+        self.cancel_token(index, true)
+    }
+
+    fn cancel_token(&mut self, index: Index, deadline: bool) -> RuntimeResult<()> {
         let slot = index.slot() as usize;
-        let token = self.current_tokens[slot];
+        let token = if deadline {
+            self.deadline_tokens[slot]
+        } else {
+            self.current_tokens[slot]
+        };
         if token == CONTROL_TOKEN {
             return Ok(());
         }
@@ -194,17 +349,48 @@ impl Poller {
 
             if let Some(result) = result {
                 if result != 0 && result != -libc::ENOENT {
-                    return Err(completion_error("cancel File readiness", result));
+                    return Err(completion_error(
+                        if deadline {
+                            "cancel File deadline readiness"
+                        } else {
+                            "cancel File readiness"
+                        },
+                        result,
+                    ));
                 }
-                self.current_tokens[slot] = CONTROL_TOKEN;
+                if deadline {
+                    self.deadline_tokens[slot] = CONTROL_TOKEN;
+                } else {
+                    self.current_tokens[slot] = CONTROL_TOKEN;
+                }
                 return Ok(());
             }
         }
     }
 
-    fn next_token(&mut self, index: Index) -> u64 {
+    fn add_deadline_poll(&mut self, index: Index, fd: i32) -> RuntimeResult<()> {
+        self.add_poll(index, fd, libc::POLLIN as u32, true)
+    }
+
+    fn add_poll(&mut self, index: Index, fd: i32, flags: u32, deadline: bool) -> RuntimeResult<()> {
+        let token = self.next_token(index, deadline);
+        let entry = opcode::PollAdd::new(types::Fd(fd), flags)
+            .multi(!deadline && self.multishot)
+            .build()
+            .user_data(token);
+        self.submit(entry)?;
+        if deadline {
+            self.deadline_tokens[index.slot() as usize] = token;
+        } else {
+            self.current_tokens[index.slot() as usize] = token;
+        }
+        Ok(())
+    }
+
+    fn next_token(&mut self, index: Index, deadline: bool) -> u64 {
         self.request_sequence = self.request_sequence.wrapping_add(1) & REQUEST_SEQUENCE_MASK;
-        (u64::from(self.request_sequence) << REQUEST_SEQUENCE_SHIFT)
+        (if deadline { DEADLINE_TOKEN_BIT } else { 0 })
+            | (u64::from(self.request_sequence) << REQUEST_SEQUENCE_SHIFT)
             | (u64::from(index.generation()) << SLOT_BITS)
             | u64::from(index.slot())
     }
@@ -285,6 +471,7 @@ fn probe_multishot(ring: &mut IoUring) -> RuntimeResult<bool> {
 fn completion_event(
     completion: Completion,
     current_tokens: &[u64; FILE_POOL_CAPACITY],
+    deadline_tokens: &[u64; FILE_POOL_CAPACITY],
     multishot: bool,
 ) -> RuntimeResult<Option<PollEvent>> {
     if completion.user_data == CONTROL_TOKEN {
@@ -293,7 +480,13 @@ fn completion_event(
     let Some(index) = decode_poll_token(completion.user_data) else {
         return Ok(None);
     };
-    if current_tokens[index.slot() as usize] != completion.user_data {
+    let is_deadline = completion.user_data & DEADLINE_TOKEN_BIT != 0;
+    let tokens = if is_deadline {
+        deadline_tokens
+    } else {
+        current_tokens
+    };
+    if tokens[index.slot() as usize] != completion.user_data {
         return Ok(None);
     }
     if completion.result == -libc::ECANCELED || completion.result == -libc::ENOENT {
@@ -317,10 +510,15 @@ fn completion_event(
     if result & i32::from(libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
         readiness.insert(Readiness::ERROR);
     }
+    let target = if is_deadline {
+        PollTarget::Deadline(index)
+    } else {
+        PollTarget::File(index)
+    };
     Ok(Some(PollEvent {
-        index: Some(index),
+        target: Some(target),
         readiness,
-        rearm: !multishot || !cqueue::more(completion.flags),
+        rearm: is_deadline || !multishot || !cqueue::more(completion.flags),
     }))
 }
 
@@ -339,6 +537,41 @@ fn decode_poll_token(token: u64) -> Option<Index> {
     let slot = (token & SLOT_MASK) as u32;
     let generation = ((token >> SLOT_BITS) & u64::from(u32::MAX)) as u32;
     (generation != 0 && slot < FILE_POOL_CAPACITY as u32).then(|| Index::new(slot, generation))
+}
+
+fn set_timerfd(fd: i32, duration: Option<Duration>) -> RuntimeResult<()> {
+    let (seconds, nanoseconds) = duration
+        .map(|duration| {
+            let duration = duration.max(Duration::from_nanos(1));
+            (duration.as_secs(), i64::from(duration.subsec_nanos()))
+        })
+        .unwrap_or((0, 0));
+    let seconds = libc::time_t::try_from(seconds).map_err(|_| {
+        io_error(
+            "arm File deadline timerfd",
+            io::Error::from_raw_os_error(libc::EOVERFLOW),
+        )
+    })?;
+    let spec = libc::itimerspec {
+        it_interval: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+        it_value: libc::timespec {
+            tv_sec: seconds,
+            tv_nsec: nanoseconds,
+        },
+    };
+    // SAFETY: `spec` is initialized and the timerfd is owned by this worker.
+    let result = unsafe { libc::timerfd_settime(fd, 0, &spec, std::ptr::null_mut()) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io_error(
+            "arm File deadline timerfd",
+            io::Error::last_os_error(),
+        ))
+    }
 }
 
 fn push(ring: &mut IoUring, entry: squeue::Entry) -> RuntimeResult<()> {
