@@ -50,14 +50,12 @@ fn test_session_queue_next(
     (owner, SessionQueueNext::from_slot(slot))
 }
 
-#[derive(Clone)]
-struct RecordingState {
-    events: Arc<Mutex<Vec<&'static str>>>,
-    sampled_times: Arc<Mutex<Vec<Instant>>>,
+#[derive(Default)]
+struct RecordingTransport {
+    events: Vec<&'static str>,
+    sampled_times: Vec<Instant>,
+    tx_indexes: Vec<Index>,
 }
-
-#[derive(Clone)]
-struct RecordingTransport(RecordingState);
 
 impl SessionTransport<Index> for RecordingTransport {
     type Tx = TransportInternalTx;
@@ -74,7 +72,7 @@ impl SessionTransport<Index> for RecordingTransport {
         _: &mut BufferFrame,
         _: &mut super::SessionQueueOutput,
     ) -> RuntimeResult<bool> {
-        self.0.events.lock().expect("events").push("app_rx");
+        self.events.push("app_rx");
         Ok(false)
     }
 
@@ -87,8 +85,8 @@ impl SessionTransport<Index> for RecordingTransport {
         _: &mut super::SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()> {
-        self.0.events.lock().expect("events").push("transport_time");
-        self.0.sampled_times.lock().expect("times").push(now);
+        self.events.push("transport_time");
+        self.sampled_times.push(now);
         Ok(())
     }
 
@@ -102,7 +100,7 @@ impl SessionTransport<Index> for RecordingTransport {
         _: &mut super::SessionQueueOutput,
         _: Instant,
     ) -> RuntimeResult<()> {
-        self.0.events.lock().expect("events").push("control");
+        self.events.push("control");
         Ok(())
     }
 }
@@ -112,6 +110,44 @@ impl TransportInternalTransport<Index> for RecordingTransport {
         &mut self,
         _: &mut SessionWorker<Index>,
         _: crate::session::SessionId,
+        index: Index,
+        _: &DataPlaneRuntime,
+        _: SessionQueueNext,
+        _: &mut BufferFrame,
+        _: &mut super::SessionQueueOutput,
+        _: Instant,
+    ) -> RuntimeResult<()> {
+        self.events.push("io");
+        self.tx_indexes.push(index);
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct TcpTransport {
+    tx_actions: Vec<Index>,
+}
+
+impl SessionTransport<Index> for TcpTransport {
+    type Tx = SessionPacketizedTx;
+
+    const ID: SessionTransportId = SessionTransportId::new(10);
+
+    fn update_time(
+        &mut self,
+        _: &mut SessionWorker<Index>,
+        _: &DataPlaneRuntime,
+        _: SessionQueueNext,
+        _: &mut BufferFrame,
+        _: &mut super::SessionQueueOutput,
+        _: Instant,
+    ) -> RuntimeResult<()> {
+        Ok(())
+    }
+
+    fn disconnect(
+        &mut self,
+        _: &mut SessionWorker<Index>,
         _: Index,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
@@ -119,7 +155,47 @@ impl TransportInternalTransport<Index> for RecordingTransport {
         _: &mut super::SessionQueueOutput,
         _: Instant,
     ) -> RuntimeResult<()> {
-        self.0.events.lock().expect("events").push("io");
+        Ok(())
+    }
+}
+
+impl SessionPacketizedTransport<Index> for TcpTransport {
+    fn control_tx(
+        &mut self,
+        _: &mut SessionWorker<Index>,
+        _: Index,
+        _: &DataPlaneRuntime,
+        _: SessionQueueNext,
+        _: &mut BufferFrame,
+        _: &mut super::SessionQueueOutput,
+        _: Instant,
+    ) -> RuntimeResult<()> {
+        Ok(())
+    }
+
+    fn send_params(
+        &mut self,
+        _: &mut SessionWorker<Index>,
+        _: Index,
+        _: usize,
+        _: Instant,
+    ) -> RuntimeResult<TransportSendParams> {
+        Ok(TransportSendParams {
+            snd_space: 1,
+            tx_offset: 0,
+            send_goal_size: 1,
+            flags: TransportSendFlags::default(),
+        })
+    }
+
+    fn tx_action(
+        &mut self,
+        index: Index,
+        _: &[TxBatchBuffer],
+        _: &DataPlaneBuffers,
+        _: Instant,
+    ) -> RuntimeResult<()> {
+        self.tx_actions.push(index);
         Ok(())
     }
 }
@@ -128,13 +204,8 @@ impl TransportInternalTransport<Index> for RecordingTransport {
 fn session_queue_updates_transport_before_control_and_io_and_without_events() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let worker = DataWorkerId::new(0);
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let sampled_times = Arc::new(Mutex::new(Vec::new()));
     let mut sessions = SessionWorker::<Index>::new(worker).expect("session worker for test");
-    let mut transport = RecordingTransport(RecordingState {
-        events: Arc::clone(&events),
-        sampled_times: Arc::clone(&sampled_times),
-    });
+    let mut transport = RecordingTransport::default();
     let session_id = sessions.insert_session_for_test(RecordingTransport::ID, Index::new(9, 3));
     let app = attach_local_app_session(&mut sessions, session_id);
     let session_rx_fifo = Arc::clone(sessions.session_fifos(session_id).expect("Session FIFOs").0);
@@ -154,18 +225,54 @@ fn session_queue_updates_transport_before_control_and_io_and_without_events() {
 
     assert_eq!(step.scheduled_sessions, 1);
     assert_eq!(
-        *events.lock().expect("events"),
-        vec!["transport_time", "control", "app_rx", "io"]
+        transport.events,
+        vec!["transport_time", "control", "io", "app_rx"]
     );
-    let times = sampled_times.lock().expect("times");
-    assert_eq!(times.len(), 1);
-    drop(times);
+    assert_eq!(transport.sampled_times.len(), 1);
 
-    events.lock().expect("events").clear();
+    transport.events.clear();
     dispatch_session_queue_once(&runtime, owner, &mut sessions, &mut transport, next)
         .expect("dispatch empty queue");
-    assert_eq!(*events.lock().expect("events"), vec!["transport_time"]);
-    assert_eq!(sampled_times.lock().expect("times").len(), 2);
+    assert_eq!(transport.events, vec!["transport_time"]);
+    assert_eq!(transport.sampled_times.len(), 2);
+}
+
+#[test]
+fn session_queue_dispatches_new_io_before_old_io() {
+    let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
+    let mut sessions =
+        SessionWorker::<Index>::new(DataWorkerId::new(0)).expect("session worker for test");
+    let mut transport = TcpTransport::default();
+    let old_index = Index::new(1, 1);
+    let new_index = Index::new(2, 1);
+    let old_session = sessions.insert_session_for_test(TcpTransport::ID, old_index);
+    let new_session = sessions.insert_session_for_test(TcpTransport::ID, new_index);
+    let old_app = attach_local_app_session(&mut sessions, old_session);
+    let new_app = attach_local_app_session(&mut sessions, new_session);
+    let sink = runtime.nodes().register_internal(BlackholeNode);
+    let (owner, next) = test_session_queue_next(&runtime, sink);
+
+    old_app.send_bytes(b"old").expect("enqueue old TX bytes");
+    sessions.poll_app().expect("stage old TX event");
+    sessions.new_io_events.clear();
+    sessions.old_io_events.clear();
+    sessions.old_io_events.push_back(SessionEvt::io(
+        old_session.pool_index().slot(),
+        SessionEvtType::TxEnq,
+    ));
+    dispatch_session_queue_once(&runtime, owner, &mut sessions, &mut transport, next)
+        .expect("dispatch old IO once");
+    new_app.send_bytes(b"n").expect("enqueue new TX byte");
+    sessions.poll_app().expect("stage new TX event");
+    sessions.new_io_events.clear();
+    sessions.new_io_events.push_back(SessionEvt::io(
+        new_session.pool_index().slot(),
+        SessionEvtType::TxEnq,
+    ));
+    dispatch_session_queue_once(&runtime, owner, &mut sessions, &mut transport, next)
+        .expect("dispatch new before old IO");
+
+    assert_eq!(transport.tx_actions, vec![old_index, new_index, old_index]);
 }
 
 fn attach_local_app_session(
@@ -191,12 +298,7 @@ fn session_queue_connects_transport_session_directly_to_application() {
         hammer_runtime::app::AppSessionConfig::new(8, 16),
     )
     .expect("session worker");
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let sampled_times = Arc::new(Mutex::new(Vec::new()));
-    let mut transport = RecordingTransport(RecordingState {
-        events,
-        sampled_times,
-    });
+    let mut transport = RecordingTransport::default();
     let session_id = sessions.insert_session_for_test(RecordingTransport::ID, Index::new(10, 1));
     let application = attach_local_app_session(&mut sessions, session_id);
     let (session_rx_fifo, session_tx_fifo) = {
@@ -331,11 +433,17 @@ fn payload_capture_process(
         Arc::clone(packets)
     };
     let mut packets = packets.lock().expect("captured payloads");
-    for &index in frame.pending_indices() {
-        let Ok(buffer) = runtime.get_buffer(index) else {
-            return NodeResult::drop();
-        };
-        packets.push(buffer.current().to_vec());
+    if frame
+        .pending_indices()
+        .iter()
+        .try_for_each(|&index| {
+            let buffer = runtime.get_buffer(index).map_err(|_| ())?;
+            packets.push(buffer.current().to_vec());
+            Ok::<(), ()>(())
+        })
+        .is_err()
+    {
+        return NodeResult::drop();
     }
     NodeResult::drop()
 }
@@ -448,11 +556,11 @@ fn internal_tx_dispatches_each_session_sharing_a_transport_connection_once() {
         *captured_payloads.lock().expect("captured payloads"),
         vec![b"one".to_vec(), b"four".to_vec()]
     );
-    for app in [first_app, second_app] {
+    [first_app, second_app].into_iter().for_each(|app| {
         let mut events = [SessionEvt::io(0, SessionEvtType::Connect)];
         assert_eq!(app.poll_events(&mut events), 1);
         assert_eq!(events[0].evt_type, SessionEvtType::TransportClosed);
-    }
+    });
 }
 
 struct FailingPacketizedTransport;
@@ -852,14 +960,14 @@ fn session_queue_io_budget_caps_normal_and_custom_tx_at_128() {
     let mut frame = BufferFrame::with_capacity(SESSION_QUEUE_IO_BUDGET + 8);
     let next = SessionQueueNext::from_slot(0);
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    for _ in 0..SESSION_QUEUE_IO_BUDGET {
+    (0..SESSION_QUEUE_IO_BUDGET).for_each(|_| {
         let index = runtime.alloc_index().expect("alloc");
         assert!(
             output
                 .try_enqueue_io(&mut frame, next, index)
                 .expect("enqueue within budget")
         );
-    }
+    });
     assert_eq!(output.remaining_io_budget(), 0);
     assert_eq!(output.io_count(), SESSION_QUEUE_IO_BUDGET);
     let overflow = runtime.alloc_index().expect("overflow alloc");
