@@ -47,6 +47,7 @@ pub enum BinaryApiStatus {
     Internal = 6,
 }
 
+#[hammer_component_macros::runtime_error(subsystem = "binary api")]
 #[derive(Debug, thiserror::Error)]
 pub enum BinaryApiError {
     #[error("Binary API socket path is empty")]
@@ -491,9 +492,7 @@ async fn write_frame(
     early = true
 )]
 fn configure(config: Config) -> RuntimeResult<Arc<Config>> {
-    config
-        .validate()
-        .map_err(|source| RuntimeError::subsystem("binary api", source))?;
+    config.validate().map_err(RuntimeError::from)?;
     Ok(Arc::new(config))
 }
 
@@ -505,5 +504,5 @@ fn init(config: Arc<Config>) -> RuntimeResult<Option<Arc<BinaryApiMain>>> {
     BinaryApiMain::bind(path, config.max_frame_bytes)
         .map(Arc::new)
         .map(Some)
-        .map_err(|source| RuntimeError::subsystem("binary api", source))
+        .map_err(RuntimeError::from)
 }

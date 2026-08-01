@@ -1,12 +1,12 @@
 use hammer_core::data_plane::NodeId;
 use hammer_infra::fifo::FifoError;
-use hammer_runtime::RuntimeError;
 use hammer_runtime::app::ApplicationId;
 use hammer_runtime::{SessionConnectionId, SessionListenerId};
 use thiserror::Error;
 
 use super::SessionId;
 
+#[hammer_component_macros::runtime_error(subsystem = "session queue")]
 #[derive(Debug, Error)]
 #[repr(u16)]
 pub enum SessionQueueError {
@@ -54,12 +54,7 @@ impl SessionQueueError {
     }
 }
 
-impl From<SessionQueueError> for RuntimeError {
-    fn from(source: SessionQueueError) -> Self {
-        Self::subsystem("session queue", source)
-    }
-}
-
+#[hammer_component_macros::runtime_error(subsystem = "session")]
 #[derive(Debug, Error)]
 pub(crate) enum SessionError {
     #[error("session pool capacity {capacity} is exhausted")]
@@ -125,8 +120,41 @@ pub(crate) enum SessionError {
     TransportConnectUnsupported { transport: &'static str },
 }
 
-impl From<SessionError> for RuntimeError {
-    fn from(source: SessionError) -> Self {
-        Self::subsystem("session", source)
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use hammer_runtime::RuntimeError;
+
+    use super::{SessionError, SessionQueueError};
+
+    #[test]
+    fn runtime_conversion_preserves_session_queue_source() {
+        let error: RuntimeError = SessionQueueError::NodeMissing.into();
+        let RuntimeError::Subsystem { subsystem, source } = error else {
+            panic!("session queue conversion must use the runtime subsystem seam");
+        };
+
+        assert_eq!(subsystem, "session queue");
+        assert!(matches!(
+            source.downcast_ref::<SessionQueueError>(),
+            Some(SessionQueueError::NodeMissing)
+        ));
+        assert!(source.source().is_none());
+    }
+
+    #[test]
+    fn runtime_conversion_preserves_session_source() {
+        let error: RuntimeError = SessionError::ListenerMainMissing.into();
+        let RuntimeError::Subsystem { subsystem, source } = error else {
+            panic!("session conversion must use the runtime subsystem seam");
+        };
+
+        assert_eq!(subsystem, "session");
+        assert!(matches!(
+            source.downcast_ref::<SessionError>(),
+            Some(SessionError::ListenerMainMissing)
+        ));
+        assert!(source.source().is_none());
     }
 }
