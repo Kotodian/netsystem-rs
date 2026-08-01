@@ -39,6 +39,7 @@ buffers_per_numa = 2048
 attach_socket_path = "/tmp/hammer-tcp-integration.attach.sock"
 pool_capacity = 64
 app_session_capacity = 64
+app_mq_capacity = 128
 
 # Lab-shortened timers (plugin-owned schema)
 [plugin.tcp]
