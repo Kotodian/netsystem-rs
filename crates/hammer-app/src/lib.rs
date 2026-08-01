@@ -6,8 +6,6 @@
 pub mod attach;
 pub mod echo;
 mod session;
-pub mod tcp;
-pub mod udp;
 
 pub use hammer_runtime::app::{
     APP_SESSION_POLICY_VERSION, AppSession, AppSessionConfig, AppSessionError, AppSessionPolicy,
