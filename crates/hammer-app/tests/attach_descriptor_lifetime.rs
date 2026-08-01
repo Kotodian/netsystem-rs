@@ -31,12 +31,9 @@ const WORKER_COUNT: usize = 3;
 
 static NAME_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn socket_path(name: &str) -> PathBuf {
+fn socket_path() -> PathBuf {
     let counter = NAME_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "hammer-{name}-{}-{counter}.sock",
-        std::process::id()
-    ))
+    std::env::temp_dir().join(format!("hm-{:x}-{counter:x}.sock", std::process::id()))
 }
 
 fn descriptor_identity(fd: RawFd) -> std::io::Result<(libc::dev_t, libc::ino_t)> {
@@ -368,7 +365,7 @@ fn accept_registration(stream: &mut UnixStream, application: ApplicationId) {
 }
 
 fn assert_publish_then_connect_round_trips_handle_and_descriptors() {
-    let path = socket_path("publish-first");
+    let path = socket_path();
     let path_text = path.to_str().expect("socket path").to_owned();
     let server = Arc::new(AppServer::bind(&path_text, 4).expect("bind app server"));
     let publisher = server.publisher();
@@ -429,7 +426,7 @@ fn assert_publish_then_connect_round_trips_handle_and_descriptors() {
 }
 
 fn assert_connect_before_publish_completes_after_publication() {
-    let path = socket_path("client-first");
+    let path = socket_path();
     let path_text = path.to_str().expect("socket path").to_owned();
     let server = Arc::new(AppServer::bind(&path_text, 4).expect("bind app server"));
     let publisher = server.publisher();
@@ -462,7 +459,7 @@ fn assert_connect_before_publish_completes_after_publication() {
 }
 
 fn assert_failed_attach_requeues_publication_for_next_client() {
-    let path = socket_path("requeue");
+    let path = socket_path();
     let path_text = path.to_str().expect("socket path").to_owned();
     let server = Arc::new(AppServer::bind(&path_text, 4).expect("bind app server"));
     let publisher = server.publisher();
@@ -492,7 +489,7 @@ fn assert_failed_attach_requeues_publication_for_next_client() {
 }
 
 fn assert_publication_queue_reports_full_and_closed() {
-    let path = socket_path("queue-limits");
+    let path = socket_path();
     let path_text = path.to_str().expect("socket path").to_owned();
     let server = AppServer::bind(&path_text, 1).expect("bind app server");
     let publisher = server.publisher();
@@ -521,14 +518,14 @@ fn assert_publication_queue_reports_full_and_closed() {
 }
 
 fn assert_missing_attach_server_returns_client_error() {
-    let path = socket_path("missing-server");
+    let path = socket_path();
     let result = AppClient::attach(path.to_str().expect("socket path"));
     assert!(matches!(result, Err(AppClientError::Attach { .. })));
 }
 
 #[test]
 fn attach_rejects_old_protocol_version() {
-    let path = socket_path("old-version");
+    let path = socket_path();
     let path_text = path.to_str().expect("socket path").to_owned();
     let server = Arc::new(AppServer::bind(&path_text, 4).expect("bind app server"));
     let application_mqs = build_application_mqs();
@@ -551,7 +548,7 @@ fn attach_rejects_old_protocol_version() {
 
 #[test]
 fn attach_reads_fragmented_application_mq_metadata() {
-    let path = socket_path("fragmented-metadata");
+    let path = socket_path();
     let listener = UnixListener::bind(&path).expect("bind fragmented attach server");
     let application = ApplicationId::from_raw(100);
     let application_mqs = build_application_mqs();
@@ -583,7 +580,7 @@ fn attach_reads_fragmented_application_mq_metadata() {
 
 #[test]
 fn attach_rejects_application_mq_descriptor_mismatch_and_closes_received_fds() {
-    let path = socket_path("application-mq-descriptor-mismatch");
+    let path = socket_path();
     let listener = UnixListener::bind(&path).expect("bind malformed attach server");
     let application = ApplicationId::from_raw(101);
     let server_thread = std::thread::spawn(move || {
@@ -634,7 +631,7 @@ fn attach_rejects_application_mq_descriptor_mismatch_and_closes_received_fds() {
 
 #[test]
 fn accepted_session_rejects_excess_descriptors_and_closes_received_fds() {
-    let path = socket_path("session-excess-descriptors");
+    let path = socket_path();
     let listener = UnixListener::bind(&path).expect("bind malformed attach server");
     let application = ApplicationId::from_raw(103);
     let application_mqs = build_application_mqs();
@@ -680,7 +677,7 @@ fn accepted_session_rejects_excess_descriptors_and_closes_received_fds() {
 
 #[test]
 fn accepted_session_rejects_worker_outside_exact_data_worker_count() {
-    let path = socket_path("worker-out-of-range");
+    let path = socket_path();
     let path_text = path.to_str().expect("socket path").to_owned();
     let server = Arc::new(AppServer::bind(&path_text, 4).expect("bind app server"));
     let publisher = server.publisher();
@@ -722,7 +719,7 @@ fn accepted_session_rejects_worker_outside_exact_data_worker_count() {
 }
 
 fn assert_malformed_attach_closes_received_descriptor_before_returning_error() {
-    let path = socket_path("malformed");
+    let path = socket_path();
     let listener = UnixListener::bind(&path).expect("bind malformed attach server");
     let application_mqs = build_application_mqs();
     let server_thread = std::thread::spawn(move || {
@@ -758,7 +755,7 @@ fn assert_malformed_attach_closes_received_descriptor_before_returning_error() {
 }
 
 fn assert_offset_overflow_closes_every_received_descriptor() {
-    let path = socket_path("offset-overflow");
+    let path = socket_path();
     let listener = UnixListener::bind(&path).expect("bind offset overflow attach server");
     let application_mqs = build_application_mqs();
     let server_thread = std::thread::spawn(move || {
@@ -790,7 +787,7 @@ fn assert_offset_overflow_closes_every_received_descriptor() {
 }
 
 fn assert_mapping_failure_closes_every_received_descriptor() {
-    let path = socket_path("mapping-failure");
+    let path = socket_path();
     let listener = UnixListener::bind(&path).expect("bind mapping failure attach server");
     let application_mqs = build_application_mqs();
     let server_thread = std::thread::spawn(move || {
@@ -831,7 +828,7 @@ fn attach_protocol_round_trips_and_releases_descriptors() {
 
 #[test]
 fn attach_maps_each_worker_to_its_application_rx_mq() {
-    let path = socket_path("worker-map");
+    let path = socket_path();
     let path_text = path.to_str().expect("socket path").to_owned();
     let server = Arc::new(AppServer::bind(&path_text, 4).expect("bind app server"));
     let publisher = server.publisher();
@@ -880,7 +877,7 @@ fn attach_maps_each_worker_to_its_application_rx_mq() {
 
 #[test]
 fn attach_connection_close_detaches_only_its_application_once() {
-    let path = socket_path("application-lifetime");
+    let path = socket_path();
     let path_text = path.to_str().expect("socket path").to_owned();
     let server = Arc::new(AppServer::bind(&path_text, 4).expect("bind app server"));
     let (detached_tx, detached_rx) = std::sync::mpsc::channel();
