@@ -1506,10 +1506,25 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
 
     pub fn notify_transport_closing(
         &mut self,
+        runtime: &DataPlaneRuntime,
         session_id: SessionId,
         index: Index,
     ) -> RuntimeResult<()> {
-        self.notify_transport_event(session_id, index, SessionEvtType::Disconnected)
+        let notify_application =
+            self.entries
+                .get_mut(session_id.pool_index())
+                .is_some_and(|entry| {
+                    let Some(SessionType::Transport { state, .. }) = entry.session_type.as_mut()
+                    else {
+                        return false;
+                    };
+                    state.on_transport_close(index)
+                });
+        if notify_application {
+            self.notify_application_event(session_id, SessionEvtType::Disconnected)?;
+            self.wake_session_queue(runtime)?;
+        }
+        Ok(())
     }
 
     pub fn notify_transport_reset(
@@ -2911,7 +2926,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use hammer_core::data_plane::{BufferFrame, NodeId};
+    use hammer_core::data_plane::{BufferFrame, NodeId, NodeState};
     use hammer_infra::pool::Index;
     use hammer_runtime::app::{
         AppSessionConfig, AppSessionProtocolRole, SessionEvt, SessionEvtType, SessionMsgQueueError,
@@ -2993,6 +3008,58 @@ mod tests {
             .update_state(&runtime, 0)
             .expect("idle to interrupt");
         assert_eq!(sessions.state(), SessionWorkerState::Interrupt);
+    }
+
+    #[test]
+    fn transport_closing_wakes_session_queue_for_external_app() -> Result<(), SessionTestFailure> {
+        let mut runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
+        let session_queue = register_session_queue_node(&runtime)?;
+        runtime
+            .nodes()
+            .set_node_state(session_queue, NodeState::Interrupt)?;
+
+        let applications = ApplicationMain::new(1);
+        let application = applications.attach()?;
+        let queue = queue_for_worker(
+            &ApplicationMqResources::create_local(application, 1, 128)?,
+            application,
+        )?;
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            Arc::clone(&applications),
+            None,
+        )?;
+        sessions.install_app_mq(application, queue, NodeId::new(0), &mut runtime)?;
+        sessions.install_state_deadline(&runtime, session_queue)?;
+
+        let session_id = sessions.construct_stream_sessions(
+            SessionTransportId::new(1),
+            Index::new(7, 1),
+            7,
+            application,
+            AppSessionProtocolRole::Server,
+            &[],
+            None,
+        )?;
+        sessions.connection_published(session_id)?;
+        sessions.connected(session_id)?;
+        sessions.notify_transport_closing(&runtime, session_id, Index::new(7, 1))?;
+
+        assert!(!runtime.set_node_interrupt_pending(session_queue)?);
+        let app_session = sessions
+            .app_session(session_id)
+            .expect("external App Session remains published");
+        let mut events = [SessionEvt::io(0, SessionEvtType::Connect); 4];
+        let event_count = app_session.poll_events(&mut events);
+        assert!(
+            events[..event_count]
+                .iter()
+                .any(|event| event.evt_type == SessionEvtType::Disconnected)
+        );
+        Ok(())
     }
 
     #[test]

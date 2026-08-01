@@ -269,7 +269,7 @@ fn tcp_established_index(
             connection.process_fin_after_payload(&packet)?
         };
         if fin_control.is_some() {
-            sessions.notify_transport_closing(session_id, connection_index)?;
+            sessions.notify_transport_closing(runtime, session_id, connection_index)?;
         }
 
         let tx_segment = if immediate_ack {
