@@ -1,13 +1,14 @@
 use std::time::Instant;
 
 use hammer_core::data_plane::{BufferFrame, Index, NodeId, NodeRegistration};
+use hammer_infra::pool::Index as PoolIndex;
 use hammer_runtime::{
     DataPlaneRuntime, DriverNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use crate::session::SessionQueueError;
-use crate::session::runtime::SessionMain;
+use crate::session::runtime::{SessionMain, SessionWorker};
 
 /// Shared Session Queue IO allowance for normal and custom TX in one dispatch.
 pub const SESSION_QUEUE_IO_BUDGET: usize = 128;
@@ -125,6 +126,7 @@ impl SessionQueueNext {
 
 pub type SessionQueueDispatchFn = fn(
     &DataPlaneRuntime,
+    &mut SessionWorker<PoolIndex>,
     NodeRuntimeData,
     SessionQueueNext,
     Instant,
@@ -134,6 +136,7 @@ pub type SessionQueueDispatchFn = fn(
 
 pub type SessionQueueUpdateTimeFn = fn(
     &DataPlaneRuntime,
+    &mut SessionWorker<PoolIndex>,
     NodeRuntimeData,
     SessionQueueNext,
     Instant,
@@ -401,28 +404,34 @@ fn session_queue_node_process(
     // the SessionMain Arc remains alive in that worker's SessionMain.
     let main = unsafe { &*ptr };
     let result = main.with_worker_mut(runtime, |sessions| {
-        sessions
-            .transport_dispatches
-            .iter()
-            .try_for_each(|dispatch| {
-                (dispatch.update_time)(
-                    runtime,
-                    data,
-                    dispatch.output_next,
-                    now,
-                    frame,
-                    &mut output,
-                )?;
-                Ok::<(), RuntimeError>(())
-            })?;
+        let dispatch_count = sessions.transport_dispatches.len();
+        for dispatch_index in 0..dispatch_count {
+            let dispatch = sessions.transport_dispatches[dispatch_index];
+            (dispatch.update_time)(
+                runtime,
+                sessions,
+                data,
+                dispatch.output_next,
+                now,
+                frame,
+                &mut output,
+            )?;
+        }
         sessions.poll_session_events()?;
-        sessions
-            .transport_dispatches
-            .iter()
-            .try_for_each(|dispatch| -> RuntimeResult<()> {
-                (dispatch.function)(runtime, data, dispatch.output_next, now, frame, &mut output)
-                    .map_err(|_| SessionQueueError::DispatchFailed.into())
-            })?;
+        let dispatch_count = sessions.transport_dispatches.len();
+        for dispatch_index in 0..dispatch_count {
+            let dispatch = sessions.transport_dispatches[dispatch_index];
+            (dispatch.function)(
+                runtime,
+                sessions,
+                data,
+                dispatch.output_next,
+                now,
+                frame,
+                &mut output,
+            )
+            .map_err(|_| SessionQueueError::DispatchFailed)?;
+        }
         sessions.update_state(runtime, output.io_count())?;
         Ok(())
     });

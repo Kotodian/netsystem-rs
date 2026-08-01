@@ -1169,6 +1169,14 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         protocols: &[ApplicationProtocol],
         server_name: Option<&str>,
     ) -> RuntimeResult<SessionId> {
+        if protocols.is_empty() {
+            return self.construct_external_transport_session(
+                transport,
+                index,
+                allocation_owner,
+                application,
+            );
+        }
         let (rx_fifo, tx_fifo) = self.create_local_fifos()?;
         let session_id = self.insert_session_entry(SessionEntry::creating_transport(
             transport, rx_fifo, tx_fifo,
@@ -1262,6 +1270,51 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         self.finish_transport_creation(session_id, index);
         self.app
             .attach_session(application_session_id, application_session);
+        Ok(session_id)
+    }
+
+    fn construct_external_transport_session(
+        &mut self,
+        transport: SessionTransportId,
+        index: Index,
+        allocation_owner: u64,
+        application: ApplicationId,
+    ) -> RuntimeResult<SessionId> {
+        let (rx_fifo, tx_fifo) = self.create_local_fifos()?;
+        let session_id = self.insert_session_entry(SessionEntry::creating_transport(
+            transport, rx_fifo, tx_fifo,
+        ))?;
+        let app_rx_mq = match self.app_mq_worker(application) {
+            Some(queue) => queue,
+            None => {
+                self.rollback_stream_sessions(&[session_id], None);
+                return Err(SessionQueueError::ApplicationMqMissing { application }.into());
+            }
+        };
+        let application_session = match self.app.create_app_session(
+            allocation_owner,
+            Some(application),
+            self.session_handle(session_id),
+            self.app_session_config,
+            app_rx_mq,
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                self.rollback_stream_sessions(&[session_id], None);
+                return Err(error);
+            }
+        };
+        {
+            let entry = self
+                .entries
+                .get_mut(session_id.pool_index())
+                .expect("new external Transport Session remains installed during construction");
+            entry.rx_fifo = Arc::clone(application_session.rx_fifo());
+            entry.tx_fifo = Arc::clone(application_session.tx_fifo());
+            entry.application = Some(SessionApplication::External(application));
+        }
+        self.finish_transport_creation(session_id, index);
+        self.app.attach_session(session_id, application_session);
         Ok(session_id)
     }
 
@@ -2964,6 +3017,7 @@ mod tests {
 
     fn test_dispatch(
         _: &DataPlaneRuntime,
+        _: &mut SessionWorker<Index>,
         _: NodeRuntimeData,
         _: SessionQueueNext,
         _: Instant,
@@ -3059,6 +3113,64 @@ mod tests {
                 .iter()
                 .any(|event| event.evt_type == SessionEvtType::Disconnected)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn external_plain_transport_routes_bytes_through_one_app_session()
+    -> Result<(), SessionTestFailure> {
+        let applications = ApplicationMain::new(1);
+        let application = applications.attach()?;
+        let queue = queue_for_worker(
+            &ApplicationMqResources::create_local(application, 1, 128)?,
+            application,
+        )?;
+        let mut runtime =
+            DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()).for_worker(1, 0)?;
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::new(64, 16),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            Arc::clone(&applications),
+            None,
+        )?;
+        sessions.install_app_mq(application, queue, NodeId::new(0), &mut runtime)?;
+        let session_id = sessions.construct_stream_sessions(
+            SessionTransportId::new(1),
+            Index::new(7, 1),
+            7,
+            application,
+            AppSessionProtocolRole::Server,
+            &[],
+            None,
+        )?;
+        let app_session = sessions
+            .app_session(session_id)
+            .cloned()
+            .expect("plain transport owns the external App Session");
+        let (transport_rx, transport_tx) = {
+            let (rx_fifo, tx_fifo) = sessions
+                .session_fifos(session_id)
+                .expect("plain transport Session FIFOs");
+            (Arc::clone(rx_fifo), Arc::clone(tx_fifo))
+        };
+        assert!(Arc::ptr_eq(&transport_rx, app_session.rx_fifo()));
+        assert!(Arc::ptr_eq(&transport_tx, app_session.tx_fifo()));
+
+        let ingress = runtime
+            .alloc_index_with_bytes(b"request")
+            .expect("transport RX buffer");
+        sessions.enqueue_rx(&runtime.buffers(), session_id, ingress, 0, false)?;
+        let mut received = [0_u8; 7];
+        assert_eq!(app_session.recv_bytes(&mut received), received.len());
+        assert_eq!(&received, b"request");
+        assert_eq!(app_session.consume_rx(received.len()), received.len());
+
+        app_session.send_bytes(b"reply").expect("application TX");
+        let mut transmitted = [0_u8; 5];
+        assert_eq!(transport_tx.peek(0, transmitted.len(), &mut transmitted), 5);
+        assert_eq!(&transmitted, b"reply");
         Ok(())
     }
 
