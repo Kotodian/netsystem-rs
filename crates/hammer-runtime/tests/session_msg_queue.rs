@@ -4,7 +4,7 @@
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 
 use hammer_runtime::app::session_msg_queue::{
-    SessionEvt, SessionEvtType, SessionMsgQueue, SessionMsgQueueError,
+    SessionEvt, SessionEvtType, SessionMqRing, SessionMsgQueue, SessionMsgQueueError,
 };
 use hammer_runtime::{File, FileFunctions, FileMain};
 
@@ -91,18 +91,28 @@ fn io_then_ctrl_preserve_fifo_order_across_rings() {
 }
 
 #[test]
+fn dequeue_with_ring_preserves_queue_classification() {
+    let q = SessionMsgQueue::with_defaults().expect("queue");
+    let ctrl = SessionEvt::ctrl(2, 0, SessionEvtType::Connect);
+    let io = SessionEvt::io(1, SessionEvtType::TxEnq);
+    q.enqueue_ctrl(ctrl).expect("ctrl");
+    q.enqueue_io(io).expect("io");
+
+    assert_eq!(q.dequeue_with_ring(), Some((SessionMqRing::Ctrl, ctrl)));
+    assert_eq!(q.dequeue_with_ring(), Some((SessionMqRing::Io, io)));
+    assert!(q.dequeue_with_ring().is_none());
+}
+
+#[test]
 fn full_queue_returns_error_without_dropping_identity() {
     let q = SessionMsgQueue::with_cfg(2, 16).expect("tiny descriptor queue");
     q.enqueue_io(SessionEvt::io(1, SessionEvtType::TxDeq))
         .expect("first");
     // Fill until full.
-    let mut last = Ok(());
-    for i in 2..32 {
-        last = q.enqueue_io(SessionEvt::io(i, SessionEvtType::TxDeq));
-        if last.is_err() {
-            break;
-        }
-    }
+    let last = (2..32)
+        .map(|i| q.enqueue_io(SessionEvt::io(i, SessionEvtType::TxDeq)))
+        .find(Result::is_err)
+        .unwrap_or(Ok(()));
     match last {
         Err(SessionMsgQueueError::Full(evt)) => {
             assert_eq!(evt.evt_type, SessionEvtType::TxDeq);
@@ -131,12 +141,12 @@ fn svm_session_msg_queue_pipe_signal_wakes_consumer() {
     fn pipe_nonblock() -> (RawFd, RawFd) {
         let mut fds = [0i32; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        for fd in &fds {
+        fds.iter().for_each(|fd| {
             let flags = unsafe { libc::fcntl(*fd, libc::F_GETFL) };
             unsafe {
                 libc::fcntl(*fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
             }
-        }
+        });
         (fds[0], fds[1])
     }
 
@@ -165,14 +175,14 @@ fn svm_session_msg_queue_signals_only_on_empty_to_non_empty_transition()
 
     let mut fds = [0i32; 2];
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-    for fd in &fds {
+    fds.iter().for_each(|fd| {
         let flags = unsafe { libc::fcntl(*fd, libc::F_GETFL) };
         assert!(flags >= 0);
         assert_eq!(
             unsafe { libc::fcntl(*fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
             0
         );
-    }
+    });
 
     let seg = Segment::shared_default();
     let bytes = SessionMsgQueue::layout_bytes(8, 4)?;
@@ -218,12 +228,12 @@ fn svm_session_msg_queue_owns_attached_signal_descriptors() {
 
     drop(unsafe { SessionMsgQueue::from_shared(seg, off, Some(fds[0]), Some(fds[1])) });
 
-    for (fd, identity) in fds.into_iter().zip(identities) {
-        match descriptor_identity(fd) {
+    fds.into_iter()
+        .zip(identities)
+        .for_each(|(fd, identity)| match descriptor_identity(fd) {
             Err(error) => assert_eq!(error.raw_os_error(), Some(libc::EBADF)),
             Ok(reused) => assert_ne!(reused, identity, "signal descriptor remains open"),
-        }
-    }
+        });
 }
 
 #[test]

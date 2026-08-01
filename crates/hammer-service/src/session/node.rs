@@ -385,17 +385,28 @@ fn session_queue_node_process(
     // the SessionMain Arc remains alive in that worker's SessionMain.
     let main = unsafe { &*ptr };
     let result = main.with_worker_mut(runtime, |sessions| {
-        for dispatch in &sessions.transport_dispatches {
-            (dispatch.update_time)(runtime, data, dispatch.output_next, now, frame, &mut output)?;
-        }
+        sessions
+            .transport_dispatches
+            .iter()
+            .try_for_each(|dispatch| {
+                (dispatch.update_time)(
+                    runtime,
+                    data,
+                    dispatch.output_next,
+                    now,
+                    frame,
+                    &mut output,
+                )?;
+                Ok::<(), RuntimeError>(())
+            })?;
         sessions.poll_session_events()?;
-        for dispatch in &sessions.transport_dispatches {
-            if (dispatch.function)(runtime, data, dispatch.output_next, now, frame, &mut output)
-                .is_err()
-            {
-                return Err(SessionQueueError::DispatchFailed.into());
-            }
-        }
+        sessions
+            .transport_dispatches
+            .iter()
+            .try_for_each(|dispatch| -> RuntimeResult<()> {
+                (dispatch.function)(runtime, data, dispatch.output_next, now, frame, &mut output)
+                    .map_err(|_| SessionQueueError::DispatchFailed.into())
+            })?;
         Ok(())
     });
     if result.is_err() {

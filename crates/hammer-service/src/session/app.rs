@@ -7,7 +7,8 @@ use hammer_infra::fifo::Fifo;
 use hammer_infra::segment::Segment;
 use hammer_runtime::app::{
     AppSession, AppSessionConfig, AppSessionError, ApplicationId, SessionEventQueue, SessionEvt,
-    SessionEvtType, SessionHandle, SessionMsgQueue, SessionMsgQueueError, SessionOffsets,
+    SessionEvtType, SessionHandle, SessionMqRing, SessionMsgQueue, SessionMsgQueueError,
+    SessionOffsets,
 };
 use hammer_runtime::attach::{AppSessionPublication, AppSessionPublisher};
 use hammer_runtime::{RuntimeError, RuntimeResult};
@@ -46,7 +47,7 @@ pub struct AppWorker {
     /// Cold accept/detach-only metadata; never read on the packet path.
     attach_slots: Vec<AttachSlot>,
     tx_evt_q: Arc<SessionMsgQueue>,
-    blocked_tx_event: Option<SessionEvt>,
+    blocked_tx_event: Option<(SessionMqRing, SessionEvt)>,
     worker_index: usize,
     segments_by_owner: HashMap<u64, SegmentManager>,
     publisher: Option<AppSessionPublisher>,
@@ -366,7 +367,7 @@ impl AppWorker {
             return Ok(());
         };
         session
-            .push_event(SessionEvtType::Connect)
+            .push_control_event(SessionEvtType::Connect)
             .map_err(RuntimeError::from)?;
         self.notify_evt(&session);
         let attach_slot = &mut self.attach_slots[session.session_handle().session_index() as usize];
@@ -384,7 +385,7 @@ impl AppWorker {
             return Ok(());
         };
         session
-            .push_event(SessionEvtType::Disconnected)
+            .push_control_event(SessionEvtType::Disconnected)
             .map_err(RuntimeError::from)?;
         self.notify_evt(&session);
         Ok(())
@@ -395,7 +396,7 @@ impl AppWorker {
             return Ok(());
         };
         session
-            .push_event(SessionEvtType::Reset)
+            .push_control_event(SessionEvtType::Reset)
             .map_err(RuntimeError::from)?;
         self.notify_evt(&session);
         Ok(())
@@ -406,7 +407,7 @@ impl AppWorker {
             return Ok(());
         };
         session
-            .push_event(SessionEvtType::TransportClosed)
+            .push_control_event(SessionEvtType::TransportClosed)
             .map_err(RuntimeError::from)?;
         self.notify_evt(&session);
         Ok(())
@@ -414,37 +415,38 @@ impl AppWorker {
 
     pub(crate) fn drain_tx_events_to(
         &mut self,
-        mut dispatch_event: impl FnMut(SessionEvt) -> Result<(), SessionMsgQueueError>,
+        mut dispatch_event: impl FnMut(SessionMqRing, SessionEvt) -> Result<(), SessionMsgQueueError>,
     ) -> Result<usize, SessionMsgQueueError> {
         let mut dispatched = 0usize;
         let worker_index = self.worker_index as u32;
-        if let Some(event) = self.blocked_tx_event.take() {
-            match dispatch_event(event) {
+        if let Some((ring, event)) = self.blocked_tx_event.take() {
+            match dispatch_event(ring, event) {
                 Ok(()) => dispatched += 1,
                 Err(error) => {
-                    self.blocked_tx_event = Some(event);
+                    self.blocked_tx_event = Some((ring, event));
                     return Err(error);
                 }
             }
         }
         self.tx_evt_q.drain();
-        while let Some(event) = self.tx_evt_q.dequeue() {
-            if matches!(
-                event.evt_type,
-                SessionEvtType::Close | SessionEvtType::HalfClose
-            ) && event.worker_index() != worker_index
-            {
-                continue;
-            }
-            match dispatch_event(event) {
-                Ok(()) => dispatched += 1,
-                Err(error) => {
-                    self.blocked_tx_event = Some(event);
+        let snapshot = self.tx_evt_q.len();
+        let queued = (0..snapshot)
+            .map_while(|_| self.tx_evt_q.dequeue_with_ring())
+            .try_fold(0usize, |dispatched, (ring, event)| {
+                if matches!(
+                    event.evt_type,
+                    SessionEvtType::Close | SessionEvtType::HalfClose
+                ) && event.worker_index() != worker_index
+                {
+                    return Ok(dispatched);
+                }
+                if let Err(error) = dispatch_event(ring, event) {
+                    self.blocked_tx_event = Some((ring, event));
                     return Err(error);
                 }
-            }
-        }
-        Ok(dispatched)
+                Ok(dispatched + 1)
+            })?;
+        Ok(dispatched + queued)
     }
 }
 
@@ -481,7 +483,7 @@ mod tests {
 
         let mut dispatched = Vec::new();
         let dispatched_count = app
-            .drain_tx_events_to(|evt| {
+            .drain_tx_events_to(|_, evt| {
                 dispatched.push((evt.session_index(), evt.evt_type));
                 Ok(())
             })
@@ -512,7 +514,7 @@ mod tests {
 
         let mut dispatched = Vec::new();
         let dispatched_count = app
-            .drain_tx_events_to(|evt| {
+            .drain_tx_events_to(|_, evt| {
                 dispatched.push((evt.session_index(), evt.evt_type));
                 Ok(())
             })
@@ -536,7 +538,7 @@ mod tests {
             .map_err(event_queue_error)?;
 
         let mut dispatched = Vec::new();
-        let error = match app.drain_tx_events_to(|evt| {
+        let error = match app.drain_tx_events_to(|_, evt| {
             if evt == blocked {
                 return Err(SessionMsgQueueError::Full(evt));
             }
@@ -548,7 +550,7 @@ mod tests {
         };
 
         assert_eq!(error, SessionMsgQueueError::Full(blocked));
-        assert_eq!(app.blocked_tx_event, Some(blocked));
+        assert_eq!(app.blocked_tx_event, Some((SessionMqRing::Io, blocked)));
         assert!(dispatched.is_empty());
         assert_eq!(
             app.tx_evt_q().dequeue(),
@@ -574,7 +576,7 @@ mod tests {
             .map_err(event_queue_error)?;
 
         let mut dispatched = Vec::new();
-        app.drain_tx_events_to(|evt| {
+        app.drain_tx_events_to(|_, evt| {
             dispatched.push((evt.session_index(), evt.evt_type));
             Ok(())
         })
@@ -588,14 +590,14 @@ mod tests {
     fn listener_sessions_share_one_segment_manager() {
         let mut app = AppWorker::default_local().expect("app worker");
         let config = AppSessionConfig::new(64, 4);
-        for slot in 0..2 {
+        (0..2).for_each(|slot| {
             let session_id = SessionId::from(PoolIndex::new(slot, 1));
             let handle = SessionHandle::new(slot, 0);
             let session = app
                 .create_app_session(7, None, handle, config, app.tx_evt_q().clone())
                 .expect("listener session");
             app.attach_session(session_id, session);
-        }
+        });
 
         assert_eq!(app.segments_by_owner.len(), 1);
         assert_eq!(app.segments_by_owner[&7].segments.len(), 1);
@@ -605,14 +607,14 @@ mod tests {
     fn listeners_have_independent_segment_managers() {
         let mut app = AppWorker::default_local().expect("app worker");
         let config = AppSessionConfig::new(64, 4);
-        for (slot, listener) in [(0, 7), (1, 9)] {
+        [(0, 7), (1, 9)].into_iter().for_each(|(slot, listener)| {
             let session_id = SessionId::from(PoolIndex::new(slot, 1));
             let handle = SessionHandle::new(slot, 0);
             let session = app
                 .create_app_session(listener, None, handle, config, app.tx_evt_q().clone())
                 .expect("listener session");
             app.attach_session(session_id, session);
-        }
+        });
 
         assert_eq!(app.segments_by_owner.len(), 2);
         assert_eq!(app.segments_by_owner[&7].segments.len(), 1);

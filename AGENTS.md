@@ -337,6 +337,13 @@ implementation-detail prefixes.
 
 Recent commits use scoped messages such as `hammer-runtime(Feat): per-node error counters` and `hammer-infra(Feat): add SIMD primitives`. Follow `<scope>(<Type>): <imperative summary>`, with types like `Feat`, `Fix`, `Refactor`, `Debug`, `Test`, or `docs`.
 
+Issue work must link its commits to the tracked issue with `Refs #<number>` for
+ongoing work or `Fixes/Closes #<number>` when the commit completes the issue.
+When a change spans multiple crates, keep commits organized by owning module in
+dependency order (infrastructure/core, runtime, service, applications/plugins),
+then rebase the branch onto the latest `main` before pushing. Do not mix
+unrelated module changes into an issue commit.
+
 PRs should include a behavior summary, affected crates, test commands run, and any daemon, CLI, or protocol impact. Link related issues when available.
 
 ## Security & Configuration Tips

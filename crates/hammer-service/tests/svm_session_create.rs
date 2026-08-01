@@ -73,7 +73,7 @@ fn svm_session_multi_ring_evt_q_io_and_ctrl_round_trip() {
     let session = unsafe { AppSession::from_segment(handle, &seg, &offsets, None, worker_queue) };
 
     session
-        .push_event(SessionEvtType::Connect)
+        .push_control_event(SessionEvtType::Connect)
         .expect("push connect");
     assert_eq!(session.enqueue_rx(b"hi").expect("enqueue rx"), 2);
 

@@ -212,7 +212,7 @@ impl AppSession {
         }
         let urgent = flags.contains(SessionEvtFlags::URGENT);
         if self.rx_fifo.set_event() || urgent {
-            if let Err(error) = self.push_event_with_flags(SessionEvtType::RxEnq, flags) {
+            if let Err(error) = self.push_io_event_with_flags(SessionEvtType::RxEnq, flags) {
                 self.rx_fifo.unset_event();
                 return Err(error);
             }
@@ -234,7 +234,7 @@ impl AppSession {
     #[inline]
     pub fn publish_tx_dequeue(&self, consumed: usize) -> Result<(), AppSessionError> {
         if consumed > 0 && self.tx_fifo.needs_deq_notification(consumed) {
-            self.push_event(SessionEvtType::TxDeq)?;
+            self.push_io_event(SessionEvtType::TxDeq)?;
         }
         Ok(())
     }
@@ -244,18 +244,33 @@ impl AppSession {
         self.tx_fifo.unset_event();
     }
 
-    /// Transport-side convenience: post a session event to the app's queue.
-    /// Used by session runtime on RX enqueue / connect / close.
+    /// Transport-side convenience: post an IO event to the app's queue.
     ///
-    /// IO events (`RxEnq`, `TxDeq`, `TxEnq`) carry session index only. `RxDeq`
-    /// is app-to-session only, `ProtocolOutput` is Session-internal, and
-    /// `Close`/`HalfClose` are app-to-session controls; these are rejected
-    /// here. Session-to-app control events (`Connect`, `Reset`, `Disconnected`,
-    /// `TransportClosed`) carry the full Session Handle, matching VPP
-    /// `session_event_t` identity rules.
+    /// The caller selects this operation because it owns the event's lane.
+    /// Event type does not determine the MQ ring; this keeps the VPP-shaped
+    /// producer classification intact.
     #[inline]
-    pub fn push_event(&self, evt_type: SessionEvtType) -> Result<(), AppSessionError> {
-        self.push_event_with_flags(evt_type, SessionEvtFlags::empty())
+    pub fn push_io_event(&self, evt_type: SessionEvtType) -> Result<(), AppSessionError> {
+        self.push_io_event_with_flags(evt_type, SessionEvtFlags::empty())
+    }
+
+    /// Transport-side convenience: post a control event to the app's queue.
+    ///
+    /// The caller selects this operation because it owns the event's lane.
+    /// Control identity carries the full VPP-shaped Session Handle.
+    #[inline]
+    pub fn push_control_event(&self, evt_type: SessionEvtType) -> Result<(), AppSessionError> {
+        let event = SessionEvt::ctrl(
+            self.handle.session_index(),
+            self.handle.worker_index(),
+            evt_type,
+        );
+        self.evt_q
+            .enqueue_ctrl(event)
+            .map_err(|_| AppSessionError::EventQueueFull {
+                session: self.handle.raw(),
+                event: evt_type,
+            })
     }
 
     /// App-side control: close the write half of the session.
@@ -288,48 +303,18 @@ impl AppSession {
     }
 
     #[inline]
-    pub fn push_event_with_flags(
+    pub fn push_io_event_with_flags(
         &self,
         evt_type: SessionEvtType,
         flags: SessionEvtFlags,
     ) -> Result<(), AppSessionError> {
-        match evt_type {
-            SessionEvtType::RxEnq | SessionEvtType::TxDeq | SessionEvtType::TxEnq => {
-                let evt = SessionEvt::io_with_flags(self.handle.session_index(), evt_type, flags);
-                self.evt_q
-                    .enqueue_io(evt)
-                    .map_err(|_| AppSessionError::EventQueueFull {
-                        session: self.handle.raw(),
-                        event: evt_type,
-                    })?;
-            }
-            SessionEvtType::Close | SessionEvtType::HalfClose => {
-                panic!("Close and HalfClose are app-to-session control events")
-            }
-            SessionEvtType::RxDeq => {
-                panic!("RxDeq is an app-to-session event")
-            }
-            SessionEvtType::ProtocolOutput => {
-                panic!("ProtocolOutput is a Session-internal event")
-            }
-            SessionEvtType::Connect
-            | SessionEvtType::Reset
-            | SessionEvtType::Disconnected
-            | SessionEvtType::TransportClosed => {
-                let evt = SessionEvt::ctrl(
-                    self.handle.session_index(),
-                    self.handle.worker_index(),
-                    evt_type,
-                );
-                self.evt_q
-                    .enqueue_ctrl(evt)
-                    .map_err(|_| AppSessionError::EventQueueFull {
-                        session: self.handle.raw(),
-                        event: evt_type,
-                    })?;
-            }
-        }
-        Ok(())
+        let event = SessionEvt::io_with_flags(self.handle.session_index(), evt_type, flags);
+        self.evt_q
+            .enqueue_io(event)
+            .map_err(|_| AppSessionError::EventQueueFull {
+                session: self.handle.raw(),
+                event: evt_type,
+            })
     }
 
     /// Publishes a TX enqueue already committed directly to [`Self::tx_fifo`].
@@ -735,7 +720,9 @@ mod tests {
     #[test]
     fn app_session_enqueue_rx_clears_event_when_evt_q_full() {
         let session = new_session(AppSessionConfig::new(64, 4), 1);
-        while session.push_event(SessionEvtType::RxEnq).is_ok() {}
+        std::iter::repeat_with(|| session.push_io_event(SessionEvtType::RxEnq))
+            .take_while(Result::is_ok)
+            .for_each(std::mem::drop);
 
         let error = session
             .enqueue_rx(b"x")
@@ -749,10 +736,10 @@ mod tests {
     }
 
     #[test]
-    fn app_session_push_event_round_trips() {
+    fn app_session_push_control_event_round_trips() {
         let session = new_session(AppSessionConfig::new(64, 4), 1);
         session
-            .push_event(SessionEvtType::Connect)
+            .push_control_event(SessionEvtType::Connect)
             .expect("push connect");
         let mut out = [SessionEvt::io(0, SessionEvtType::RxEnq); 4];
         assert_eq!(session.poll_events(&mut out), 1);
@@ -796,7 +783,7 @@ mod tests {
         )
         .expect("session");
         session
-            .push_event(SessionEvtType::Disconnected)
+            .push_control_event(SessionEvtType::Disconnected)
             .expect("push disconnected");
         let mut out = [SessionEvt::io(0, SessionEvtType::RxEnq)];
         assert_eq!(session.poll_events(&mut out), 1);
@@ -843,7 +830,7 @@ mod tests {
         session.send_bytes(b"x").expect("send");
         session.enqueue_rx(b"y").expect("enqueue rx");
         session
-            .push_event(SessionEvtType::Disconnected)
+            .push_control_event(SessionEvtType::Disconnected)
             .expect("push disconnected");
         session.clear();
         assert!(session.rx_fifo().is_empty());
@@ -872,13 +859,11 @@ mod tests {
     #[test]
     fn app_session_evt_q_capacity_holds_requested_count() {
         let session = new_session(AppSessionConfig::new(64, 3), 1);
-        for _ in 0..3 {
-            session
-                .push_event(SessionEvtType::Connect)
-                .expect("push connect");
-        }
+        std::iter::repeat_with(|| session.push_control_event(SessionEvtType::Connect))
+            .take(3)
+            .for_each(|result| result.expect("push connect"));
         let error = session
-            .push_event(SessionEvtType::Connect)
+            .push_control_event(SessionEvtType::Connect)
             .expect_err("full event queue must reject event");
         assert!(matches!(
             error,
