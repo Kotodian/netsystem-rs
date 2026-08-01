@@ -736,10 +736,11 @@ jobs:
               extra_args=(--min-sack-acks 1)
               ;;
             sender-rack)
-              extra_args=(
-                --require-server-retransmit "$TCP_TEST_TARGET_SEQ"
-                --retransmit-within 1.5
-              )
+              # The nft input hook drops the target before libpcap can see
+              # the original. The capture therefore contains only the RACK
+              # retransmission; fault-rule and node-counter assertions below
+              # prove the loss and its recovery classification.
+              extra_args=()
               ;;
             sender-tlp)
               # The nft input hook may discard the original before libpcap
@@ -790,8 +791,20 @@ jobs:
                 echo "RackRetransmit counter did not increase" >&2
                 exit 1
               fi
+              if [[ "$tlp_delta" -ne 0 ]]; then
+                echo "TlpProbe fired during RACK recovery" >&2
+                exit 1
+              fi
+              if [[ "$rto_delta" -ne 0 ]]; then
+                echo "RTO retransmit fired during RACK recovery" >&2
+                exit 1
+              fi
               ;;
             sender-tlp)
+              if [[ "$rack_delta" -ne 0 ]]; then
+                echo "RackRetransmit fired during TLP recovery" >&2
+                exit 1
+              fi
               if [[ "$tlp_delta" -lt 1 ]]; then
                 echo "TlpProbe counter did not increase" >&2
                 exit 1
