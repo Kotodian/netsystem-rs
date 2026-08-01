@@ -160,6 +160,7 @@ fn register_tcp_input_runtime(snapshot: Arc<ArcSwap<TcpLookupSnapshot>>) -> Node
     })
 }
 
+#[hammer_component_macros::runtime_error(subsystem = "tcp")]
 #[derive(Debug, thiserror::Error)]
 #[error("TCP input runtime slot {slot} is not registered")]
 struct TcpInputSlotInvalid {
@@ -173,7 +174,7 @@ fn tcp_input_runtime(data: NodeRuntimeData) -> RuntimeResult<TcpInputRuntime> {
             .borrow()
             .get(slot)
             .cloned()
-            .ok_or_else(|| RuntimeError::subsystem("tcp", TcpInputSlotInvalid { slot }))
+            .ok_or_else(|| RuntimeError::from(TcpInputSlotInvalid { slot }))
     })
 }
 
@@ -187,7 +188,7 @@ fn sync_tcp_input_runtime(
         let mut runtimes = runtimes.borrow_mut();
         let runtime = runtimes
             .get_mut(slot)
-            .ok_or_else(|| RuntimeError::subsystem("tcp", TcpInputSlotInvalid { slot }))?;
+            .ok_or_else(|| RuntimeError::from(TcpInputSlotInvalid { slot }))?;
         runtime.handoff = handoff;
         runtime.handoff_worker = handoff_worker;
         Ok(())

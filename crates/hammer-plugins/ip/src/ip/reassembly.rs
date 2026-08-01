@@ -248,6 +248,7 @@ fn configure_ip_reassembly(
 }
 
 /// Recoverable IP reassembly failures surfaced to the node drop path.
+#[hammer_component_macros::runtime_error(subsystem = "ip")]
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum IpReassemblyError {
     #[error("IP reassembly context pool is exhausted")]
@@ -264,12 +265,6 @@ pub(crate) enum IpReassemblyError {
     FirstFragmentMissing,
     #[error("reassembled IP packet carries unsupported transport protocol {protocol}")]
     UnsupportedTransportProtocol { protocol: u8 },
-}
-
-impl From<IpReassemblyError> for RuntimeError {
-    fn from(error: IpReassemblyError) -> Self {
-        Self::subsystem("ip", error)
-    }
 }
 
 #[hammer_component_macros::init_function(

@@ -476,6 +476,7 @@ impl IpMain {
 }
 
 /// Recoverable IP FIB/lookup control-plane failures.
+#[hammer_component_macros::runtime_error(subsystem = "ip")]
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum IpLookupError {
     #[error("FIB prefix {prefix} received incompatible route semantics from one source")]
@@ -496,12 +497,6 @@ pub(crate) enum IpLookupError {
     },
     #[error("adjacency rewrite length {len} exceeds isize")]
     RewriteTooLong { len: usize },
-}
-
-impl From<IpLookupError> for RuntimeError {
-    fn from(error: IpLookupError) -> Self {
-        Self::subsystem("ip", error)
-    }
 }
 
 fn host_prefix(address: ipnet::IpNet) -> RuntimeResult<ipnet::IpNet> {

@@ -2,7 +2,6 @@ use std::cmp::Ordering;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use hammer_infra::bihash::BihashKey;
-use hammer_runtime::RuntimeError;
 use thiserror::Error;
 
 pub mod options;
@@ -75,6 +74,7 @@ impl From<TcpEcnCodepoint> for u8 {
     }
 }
 
+#[hammer_component_macros::runtime_error(subsystem = "tcp")]
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum TcpError {
@@ -102,15 +102,6 @@ pub enum TcpError {
     Paws,
     #[error("segment not in receive window")]
     RcvWnd,
-}
-
-// TCP is a plugin-owned domain. Graph and runtime callbacks still cross the
-// Core result boundary, so preserve the typed TCP source at that boundary.
-impl From<TcpError> for RuntimeError {
-    #[inline]
-    fn from(error: TcpError) -> Self {
-        Self::subsystem("tcp", error)
-    }
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]

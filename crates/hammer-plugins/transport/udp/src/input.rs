@@ -54,6 +54,7 @@ impl UdpInputError {
     }
 }
 
+#[hammer_component_macros::runtime_error(subsystem = "udp")]
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum UdpControlError {
     #[error("IP output is unavailable")]
@@ -70,12 +71,6 @@ pub(crate) enum UdpControlError {
     RuntimeSlotInvalid { slot: usize },
     #[error("UDP header at offset {offset} is truncated or out of range")]
     HeaderOutOfRange { offset: usize },
-}
-
-impl From<UdpControlError> for RuntimeError {
-    fn from(error: UdpControlError) -> Self {
-        Self::subsystem("udp", error)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]

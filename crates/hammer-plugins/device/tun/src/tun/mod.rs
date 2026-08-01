@@ -19,6 +19,7 @@ use hammer_service::device::{
 use hammer_service::interface::{InterfaceConfig, InterfaceControlPlane, configure_interfaces};
 use hammer_service::opaque::NetworkOpaque;
 
+#[hammer_component_macros::runtime_error(subsystem = "tun")]
 #[derive(Debug, thiserror::Error)]
 enum TunError {
     #[error("{operation}")]
@@ -363,7 +364,7 @@ fn configure_tun(
         }
         Ok(control)
     })()
-    .map_err(|source| RuntimeError::subsystem("tun", source))
+    .map_err(RuntimeError::from)
 }
 
 #[hammer_component_macros::worker_init_function(name = "tun_worker_init")]
@@ -394,7 +395,7 @@ fn configure_tun_worker(
         });
         Ok(())
     })()
-    .map_err(|source| RuntimeError::subsystem("tun", source))
+    .map_err(RuntimeError::from)
 }
 
 fn schedule_tun_input(graph: &hammer_runtime::NodeRuntime, file: &mut File) -> RuntimeResult<()> {
