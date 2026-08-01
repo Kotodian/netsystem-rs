@@ -113,6 +113,7 @@ impl ApplicationSessionReply {
     }
 }
 
+#[hammer_component_macros::runtime_error(subsystem = "application session MQ")]
 #[derive(Debug, Error)]
 pub enum ApplicationSessionMqError {
     #[error("failed to encode Application Session request")]

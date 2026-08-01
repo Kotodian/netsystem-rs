@@ -23,8 +23,19 @@ pub use config::{
     remove_config,
 };
 
+#[hammer_component_macros::runtime_error(subsystem = "tls")]
 #[derive(Debug, thiserror::Error)]
 enum Error {
+    #[error("create TLS client connection")]
+    ClientConnection {
+        #[source]
+        source: rustls::Error,
+    },
+    #[error("create TLS server connection")]
+    ServerConnection {
+        #[source]
+        source: rustls::Error,
+    },
     #[error("read TLS records from the lower App Session FIFO")]
     ReadRecords {
         #[source]
@@ -116,11 +127,13 @@ impl AppSessionProtocol for Connection {
                     config::main()?.client_config(application, config_id)?,
                     server_name,
                 )
-                .map_err(|source| RuntimeError::subsystem("tls", source))
+                .map_err(|source| Error::ClientConnection { source })
+                .map_err(RuntimeError::from)
             }
             AppSessionProtocolRole::Server => {
                 Self::server(config::main()?.server_config(application, config_id)?)
-                    .map_err(|source| RuntimeError::subsystem("tls", source))
+                    .map_err(|source| Error::ServerConnection { source })
+                    .map_err(RuntimeError::from)
             }
         }
     }
@@ -133,7 +146,7 @@ impl AppSessionProtocol for Connection {
         let state = self
             .connection
             .process_new_packets()
-            .map_err(|source| RuntimeError::subsystem("tls", Error::ProcessRecords { source }))?;
+            .map_err(|source| Error::ProcessRecords { source })?;
         self.peer_closed |= state.peer_has_closed();
 
         if upper_rx_fifo.max_enqueue() != 0 {
@@ -141,19 +154,16 @@ impl AppSessionProtocol for Connection {
             match plaintext.fill_buf() {
                 Ok(bytes) if !bytes.is_empty() => {
                     let mut destination = upper_rx_fifo;
-                    let produced = destination.write(bytes).map_err(|source| {
-                        RuntimeError::subsystem("tls", Error::ReadPlaintext { source })
-                    })?;
+                    let produced = destination
+                        .write(bytes)
+                        .map_err(|source| Error::ReadPlaintext { source })?;
                     plaintext.consume(produced);
                     return Ok((0, produced));
                 }
                 Ok(_) => {}
                 Err(source) if source.kind() == io::ErrorKind::WouldBlock => {}
                 Err(source) => {
-                    return Err(RuntimeError::subsystem(
-                        "tls",
-                        Error::ReadPlaintext { source },
-                    ));
+                    return Err(Error::ReadPlaintext { source }.into());
                 }
             }
         }
@@ -166,7 +176,7 @@ impl AppSessionProtocol for Connection {
         let consumed = self
             .connection
             .read_tls(&mut source)
-            .map_err(|source| RuntimeError::subsystem("tls", Error::ReadRecords { source }))?;
+            .map_err(|source| Error::ReadRecords { source })?;
         Ok((consumed, 0))
     }
 
@@ -183,7 +193,7 @@ impl AppSessionProtocol for Connection {
             let produced = self
                 .connection
                 .write_tls(&mut destination)
-                .map_err(|source| RuntimeError::subsystem("tls", Error::WriteRecords { source }))?;
+                .map_err(|source| Error::WriteRecords { source })?;
             return Ok((0, produced));
         }
 
@@ -194,12 +204,12 @@ impl AppSessionProtocol for Connection {
         let mut source = upper_tx_fifo;
         let plaintext = source
             .fill_buf()
-            .map_err(|source| RuntimeError::subsystem("tls", Error::WritePlaintext { source }))?;
+            .map_err(|source| Error::WritePlaintext { source })?;
         let consumed = self
             .connection
             .writer()
             .write(plaintext)
-            .map_err(|source| RuntimeError::subsystem("tls", Error::WritePlaintext { source }))?;
+            .map_err(|source| Error::WritePlaintext { source })?;
         source.consume(consumed);
         Ok((consumed, 0))
     }

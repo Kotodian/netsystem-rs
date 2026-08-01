@@ -326,7 +326,7 @@ impl SessionMain {
         let application = self
             .applications
             .with_listener(application_listener, |listener| listener.application())
-            .map_err(|source| RuntimeError::subsystem("application", source))?;
+            .map_err(RuntimeError::from)?;
         let listener = self.with_listeners_mut(|listeners| {
             listeners
                 .insert(SessionListener {
@@ -1128,7 +1128,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
                     None,
                 )
             })
-            .map_err(|source| RuntimeError::subsystem("application", source))?
+            .map_err(RuntimeError::from)?
     }
 
     pub fn stream_connect(
@@ -1151,10 +1151,10 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
                     policy.server_name(),
                 )
             })
-            .map_err(|source| RuntimeError::subsystem("application", source))??;
+            .map_err(RuntimeError::from)??;
         if let Err(source) = applications.complete_connection(application_connection) {
             self.remove_session(session_id)?;
-            return Err(RuntimeError::subsystem("application", source));
+            return Err(RuntimeError::from(source));
         }
         Ok(session_id)
     }

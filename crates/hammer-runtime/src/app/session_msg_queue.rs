@@ -158,6 +158,7 @@ pub enum SessionEvtType {
     TransportClosed = 10,
 }
 
+#[hammer_component_macros::runtime_error(subsystem = "application session MQ")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SessionMsgQueueError {
     #[error("Session Message Queue configuration is invalid")]

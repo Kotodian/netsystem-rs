@@ -68,6 +68,7 @@ pub trait AppSessionProtocol: Sized + Send + 'static {
     }
 }
 
+#[hammer_component_macros::runtime_error(subsystem = "app-session-protocol")]
 #[derive(Debug, Error)]
 enum AppSessionProtocolConnectionError {
     #[error("App Session protocol worker {worker} is outside worker count {worker_count}")]
@@ -281,12 +282,6 @@ impl From<ProtocolConnectionOperationError> for RuntimeError {
             ProtocolConnectionOperationError::Missing(error) => RuntimeError::from(error),
             ProtocolConnectionOperationError::Operation(error) => error,
         }
-    }
-}
-
-impl From<AppSessionProtocolConnectionError> for RuntimeError {
-    fn from(error: AppSessionProtocolConnectionError) -> Self {
-        RuntimeError::subsystem("app-session-protocol", error)
     }
 }
 

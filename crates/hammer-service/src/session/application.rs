@@ -739,6 +739,7 @@ impl Drop for ApplicationRegistration {
     }
 }
 
+#[hammer_component_macros::runtime_error(subsystem = "application")]
 #[derive(Debug, Error)]
 pub enum ApplicationError {
     #[error("Application capacity {capacity} is exhausted")]

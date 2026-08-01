@@ -33,6 +33,7 @@ pub enum IpInputTarget {
     Reassembly,
 }
 
+#[hammer_component_macros::runtime_error(subsystem = "ip")]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, thiserror::Error,
 )]
@@ -61,13 +62,6 @@ impl IpInputError {
     #[inline(always)]
     pub const fn code(self) -> u16 {
         self as u16
-    }
-}
-
-impl From<IpInputError> for hammer_runtime::RuntimeError {
-    #[inline]
-    fn from(error: IpInputError) -> Self {
-        Self::subsystem("ip", error)
     }
 }
 

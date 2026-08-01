@@ -15,12 +15,11 @@ impl SessionMain {
         requests: &SessionMsgQueue,
         replies: &SessionMsgQueue,
     ) -> RuntimeResult<()> {
-        while let Some(request) = dequeue_application_session_request(requests)
-            .map_err(|source| RuntimeError::subsystem("application session MQ", source))?
+        while let Some(request) =
+            dequeue_application_session_request(requests).map_err(RuntimeError::from)?
         {
             let reply = self.application_session_request(application, request);
-            enqueue_application_session_reply(replies, &reply)
-                .map_err(|source| RuntimeError::subsystem("application session MQ", source))?;
+            enqueue_application_session_reply(replies, &reply).map_err(RuntimeError::from)?;
         }
         Ok(())
     }

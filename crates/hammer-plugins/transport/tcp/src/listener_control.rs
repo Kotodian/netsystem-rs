@@ -9,7 +9,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use crate::TcpCapabilities;
-use hammer_runtime::{DataWorkerId, RuntimeError, RuntimeResult, SessionListenerId};
+use hammer_runtime::{DataWorkerId, RuntimeResult, SessionListenerId};
 
 use super::TcpInputControlPlane;
 use super::lookup::{
@@ -17,6 +17,7 @@ use super::lookup::{
     TcpLookupId, TcpLookupSnapshot, TcpLookupValue, TcpV4ListenerKey, TcpV6ListenerKey,
 };
 
+#[hammer_component_macros::runtime_error(subsystem = "tcp")]
 #[derive(Debug, thiserror::Error)]
 pub enum TcpListenerControlError {
     #[error("tcp listener {bind} is already registered")]
@@ -27,12 +28,6 @@ pub enum TcpListenerControlError {
     SessionListenerNotRegistered { listener: SessionListenerId },
     #[error("tcp lookup id space is exhausted")]
     LookupIdExhausted,
-}
-
-impl From<TcpListenerControlError> for RuntimeError {
-    fn from(error: TcpListenerControlError) -> Self {
-        Self::subsystem("tcp", error)
-    }
 }
 
 #[derive(Clone)]

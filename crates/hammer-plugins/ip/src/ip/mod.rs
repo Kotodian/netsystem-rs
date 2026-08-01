@@ -12,7 +12,6 @@ use crate::protocol::ip::{
 use crate::protocol::wire::read_header;
 use hammer_core::data_plane::BufferPacketCursor;
 use hammer_runtime::Network;
-use hammer_runtime::RuntimeError;
 
 /// Runtime registries owned by the IP plugin. Mirrors VPP's per-node error
 /// enumeration style: the registry identity is a typed discriminant, not a
@@ -62,6 +61,7 @@ impl std::fmt::Display for IpControlOperation {
 
 /// Recoverable control-plane failures shared by IP graph-node registration,
 /// worker sync, and per-node runtime registry access.
+#[hammer_component_macros::runtime_error(subsystem = "ip")]
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum IpControlError {
     #[error("{registry} runtime registry is poisoned")]
@@ -75,12 +75,6 @@ pub(crate) enum IpControlError {
     NodeRuntimeUnavailable { operation: IpControlOperation },
     #[error("ICMP type registration requires an attached input consumer")]
     ConsumerNotAttached,
-}
-
-impl From<IpControlError> for RuntimeError {
-    fn from(error: IpControlError) -> Self {
-        Self::subsystem("ip", error)
-    }
 }
 
 pub use icmp::{

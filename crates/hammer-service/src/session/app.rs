@@ -14,6 +14,7 @@ use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use crate::session::SessionId;
 
+#[hammer_component_macros::runtime_error(subsystem = "session app")]
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AppWorkerError {
     #[error("session message queue configuration rejected: {error:?}")]
@@ -27,12 +28,6 @@ pub(crate) enum AppWorkerError {
     SessionSegmentSizeOverflow,
     #[error("listener segment cannot hold the session layout")]
     SessionSegmentExhausted,
-}
-
-impl From<AppWorkerError> for RuntimeError {
-    fn from(error: AppWorkerError) -> Self {
-        RuntimeError::subsystem("session app", error)
-    }
 }
 
 pub struct AppWorker {

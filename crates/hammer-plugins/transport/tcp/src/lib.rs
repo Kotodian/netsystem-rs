@@ -92,6 +92,7 @@ pub use worker::TcpWorker;
 #[cfg(test)]
 mod session_driver_tests;
 
+#[hammer_component_macros::runtime_error(subsystem = "tcp")]
 #[derive(Debug, Error)]
 enum TcpWorkerError {
     #[error("required graph node `{name}` is not registered")]
@@ -238,14 +239,10 @@ impl TcpMain {
         self.workers
             .get(worker.slot())
             .map(|slot| &**slot)
-            .ok_or_else(|| {
-                RuntimeError::subsystem(
-                    "tcp",
-                    TcpWorkerError::WorkerOutOfRange {
-                        worker: worker.slot(),
-                    },
-                )
+            .ok_or_else(|| TcpWorkerError::WorkerOutOfRange {
+                worker: worker.slot(),
             })
+            .map_err(RuntimeError::from)
     }
 
     fn with_worker<R>(
@@ -267,18 +264,13 @@ impl TcpMain {
         let worker = thread_index
             .checked_sub(1)
             .map(DataWorkerId::new)
-            .ok_or_else(|| {
-                RuntimeError::subsystem("tcp", TcpWorkerError::WorkerUnavailable { thread_index })
-            })?;
-        self.worker(worker)?.with_mut(operation).map_err(|source| {
-            RuntimeError::subsystem(
-                "tcp",
-                TcpWorkerError::WorkerAccess {
-                    worker: worker.slot(),
-                    source,
-                },
-            )
-        })?
+            .ok_or(TcpWorkerError::WorkerUnavailable { thread_index })?;
+        self.worker(worker)?
+            .with_mut(operation)
+            .map_err(|source| TcpWorkerError::WorkerAccess {
+                worker: worker.slot(),
+                source,
+            })?
     }
 
     pub fn control(&self) -> &TcpInputControlPlane {
@@ -490,64 +482,48 @@ pub fn register_tcp_input(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
 fn bind_worker_graph(engine: &mut Engine) -> RuntimeResult<()> {
     let worker = engine.data_worker_id()?;
     let handoff = engine.runtime.handoff_node_handle()?;
-    let session_queue = engine
-        .runtime
-        .node_by_name("session-queue")
-        .ok_or_else(|| {
-            RuntimeError::subsystem(
-                "tcp",
-                TcpWorkerError::NodeMissing {
-                    name: "session-queue",
-                },
-            )
-        })?;
+    let session_queue =
+        engine
+            .runtime
+            .node_by_name("session-queue")
+            .ok_or(TcpWorkerError::NodeMissing {
+                name: "session-queue",
+            })?;
     let tcp_output = engine
         .runtime
         .node_by_name(TcpOutputNode::NODE_NAME)
-        .ok_or_else(|| {
-            RuntimeError::subsystem(
-                "tcp",
-                TcpWorkerError::NodeMissing {
-                    name: TcpOutputNode::NODE_NAME,
-                },
-            )
+        .ok_or(TcpWorkerError::NodeMissing {
+            name: TcpOutputNode::NODE_NAME,
         })?;
-    let tcp_input = engine.runtime.node_by_name("tcp-input").ok_or_else(|| {
-        RuntimeError::subsystem("tcp", TcpWorkerError::NodeMissing { name: "tcp-input" })
-    })?;
-    let tcp_listen = engine.runtime.node_by_name("tcp-listen").ok_or_else(|| {
-        RuntimeError::subsystem("tcp", TcpWorkerError::NodeMissing { name: "tcp-listen" })
-    })?;
-    let tcp_established = engine
+    let tcp_input = engine
         .runtime
-        .node_by_name("tcp-established")
-        .ok_or_else(|| {
-            RuntimeError::subsystem(
-                "tcp",
-                TcpWorkerError::NodeMissing {
-                    name: "tcp-established",
-                },
-            )
-        })?;
-    let tcp_rcv_process = engine
+        .node_by_name("tcp-input")
+        .ok_or_else(|| TcpWorkerError::NodeMissing { name: "tcp-input" })?;
+    let tcp_listen = engine
         .runtime
-        .node_by_name("tcp-rcv-process")
-        .ok_or_else(|| {
-            RuntimeError::subsystem(
-                "tcp",
-                TcpWorkerError::NodeMissing {
-                    name: "tcp-rcv-process",
-                },
-            )
-        })?;
-    let tcp_syn_sent = engine.runtime.node_by_name("tcp-syn-sent").ok_or_else(|| {
-        RuntimeError::subsystem(
-            "tcp",
-            TcpWorkerError::NodeMissing {
+        .node_by_name("tcp-listen")
+        .ok_or_else(|| TcpWorkerError::NodeMissing { name: "tcp-listen" })?;
+    let tcp_established =
+        engine
+            .runtime
+            .node_by_name("tcp-established")
+            .ok_or(TcpWorkerError::NodeMissing {
+                name: "tcp-established",
+            })?;
+    let tcp_rcv_process =
+        engine
+            .runtime
+            .node_by_name("tcp-rcv-process")
+            .ok_or(TcpWorkerError::NodeMissing {
+                name: "tcp-rcv-process",
+            })?;
+    let tcp_syn_sent =
+        engine
+            .runtime
+            .node_by_name("tcp-syn-sent")
+            .ok_or_else(|| TcpWorkerError::NodeMissing {
                 name: "tcp-syn-sent",
-            },
-        )
-    })?;
+            })?;
 
     let session_queue_data = engine.runtime.nodes().node_runtime_data(session_queue)?;
     let session_queue_output =
@@ -589,12 +565,10 @@ fn bind_worker_graph(engine: &mut Engine) -> RuntimeResult<()> {
         .install(TcpWorker::new(worker))
         .is_err()
     {
-        return Err(RuntimeError::subsystem(
-            "tcp",
-            TcpWorkerError::WorkerAlreadyInstalled {
-                worker: worker.slot(),
-            },
-        ));
+        return Err(TcpWorkerError::WorkerAlreadyInstalled {
+            worker: worker.slot(),
+        }
+        .into());
     }
     engine
         .runtime
@@ -745,6 +719,7 @@ impl From<TcpNodeError> for RuntimeError {
     }
 }
 
+#[hammer_component_macros::runtime_error(subsystem = "tcp")]
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum TcpOutputError {
@@ -766,13 +741,6 @@ impl TcpOutputError {
     #[inline(always)]
     pub const fn code(self) -> u16 {
         self as u16
-    }
-}
-
-impl From<TcpOutputError> for RuntimeError {
-    #[inline]
-    fn from(error: TcpOutputError) -> Self {
-        Self::subsystem("tcp", error)
     }
 }
 

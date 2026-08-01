@@ -4,7 +4,7 @@ use std::thread::{self, ThreadId};
 
 use hammer_infra::pool::{Index, Pool};
 use hammer_runtime::app::ApplicationId;
-use hammer_runtime::{Engine, RuntimeError, RuntimeResult};
+use hammer_runtime::{Engine, RuntimeResult};
 use hammer_service::session::{ApplicationMain, ApplicationRegistration};
 use prost::Message;
 use rustls::ServerConfig as RustlsServerConfig;
@@ -254,6 +254,7 @@ impl TlsMain {
     }
 }
 
+#[hammer_component_macros::runtime_error(subsystem = "tls")]
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("TLS Main is not initialized")]
@@ -310,12 +311,6 @@ pub enum ConfigError {
         #[source]
         source: rustls::server::VerifierBuilderError,
     },
-}
-
-impl From<ConfigError> for RuntimeError {
-    fn from(error: ConfigError) -> Self {
-        RuntimeError::subsystem("tls", error)
-    }
 }
 
 pub fn register_server_config(

@@ -1704,6 +1704,112 @@ struct BinaryApiArgs {
     name: LitStr,
 }
 
+struct RuntimeErrorArgs {
+    subsystem: LitStr,
+}
+
+impl Parse for RuntimeErrorArgs {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let mut subsystem: Option<LitStr> = None;
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            match key.to_string().as_str() {
+                "subsystem" => {
+                    if subsystem.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `subsystem` argument"));
+                    }
+                    subsystem = Some(input.parse()?);
+                }
+                other => {
+                    return Err(Error::new(
+                        key.span(),
+                        format!("unknown `runtime_error` argument `{other}`; expected `subsystem`"),
+                    ));
+                }
+            }
+            if input.is_empty() {
+                break;
+            }
+            input.parse::<Token![,]>()?;
+        }
+
+        let subsystem = subsystem
+            .ok_or_else(|| Error::new(Span::call_site(), "missing `subsystem` argument"))?;
+        if subsystem.value().trim().is_empty() {
+            return Err(Error::new(
+                subsystem.span(),
+                "`subsystem` must not be empty",
+            ));
+        }
+        Ok(Self { subsystem })
+    }
+}
+
+/// Generates the existing owner-to-runtime error conversion at the source type.
+///
+/// The annotated type remains the owner of its typed variants. The generated
+/// implementation only records the existing subsystem boundary and preserves
+/// the source error through `RuntimeError::source()`.
+#[proc_macro_attribute]
+pub fn runtime_error(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as RuntimeErrorArgs);
+    let item = parse_macro_input!(input as Item);
+    expand_runtime_error(args, item)
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
+fn expand_runtime_error(args: RuntimeErrorArgs, item: Item) -> Result<TokenStream2> {
+    let (ident, generics, attributes) = match &item {
+        Item::Enum(item) => (&item.ident, &item.generics, &item.attrs),
+        Item::Struct(item) => (&item.ident, &item.generics, &item.attrs),
+        _ => {
+            return Err(Error::new(
+                item.span(),
+                "`runtime_error` can only be attached to an enum or struct error type",
+            ));
+        }
+    };
+    let conditional_attributes = attributes
+        .iter()
+        .filter(|attribute| {
+            attribute.path().is_ident("cfg") || attribute.path().is_ident("cfg_attr")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let (_, source_ty_generics, _) = generics.split_for_impl();
+    let source_type: Type = parse_quote!(#ident #source_ty_generics);
+    let mut impl_generics = generics.clone();
+    if !generics.params.is_empty() {
+        impl_generics
+            .make_where_clause()
+            .predicates
+            .push(parse_quote!(
+                #source_type: ::core::error::Error
+                    + ::core::marker::Send
+                    + ::core::marker::Sync
+                    + 'static
+            ));
+    }
+    let (impl_generics, ty_generics, where_clause) = impl_generics.split_for_impl();
+    let subsystem = args.subsystem;
+
+    Ok(quote! {
+        #item
+
+        #(#conditional_attributes)*
+        impl #impl_generics ::core::convert::From<#ident #ty_generics>
+            for ::hammer_runtime::RuntimeError
+            #where_clause
+        {
+            fn from(source: #ident #ty_generics) -> Self {
+                ::hammer_runtime::RuntimeError::subsystem(#subsystem, source)
+            }
+        }
+    })
+}
+
 impl Parse for BinaryApiArgs {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let key: Ident = input.parse()?;
@@ -3038,6 +3144,44 @@ mod tests {
             error.to_string().contains("unknown argument `when`"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn runtime_error_requires_subsystem() {
+        let error = syn::parse_str::<RuntimeErrorArgs>("")
+            .expect_err("runtime_error must require a subsystem");
+
+        assert!(error.to_string().contains("missing `subsystem` argument"));
+    }
+
+    #[test]
+    fn runtime_error_rejects_unknown_arguments() {
+        let error = syn::parse_str::<RuntimeErrorArgs>(r#"name = "session""#)
+            .expect_err("runtime_error must reject unknown arguments");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unknown `runtime_error` argument `name`")
+        );
+    }
+
+    #[test]
+    fn runtime_error_expands_enum_conversion() {
+        let args = syn::parse_str::<RuntimeErrorArgs>(r#"subsystem = "session queue""#)
+            .expect("runtime_error arguments");
+        let item = syn::parse_str::<Item>("enum SessionQueueError { NodeMissing }")
+            .expect("runtime error item");
+        let expanded = expand_runtime_error(args, item)
+            .expect("runtime_error expansion")
+            .to_string();
+
+        assert!(expanded.contains(
+            "impl :: core :: convert :: From < SessionQueueError > for :: hammer_runtime :: RuntimeError"
+        ));
+        assert!(expanded.contains(
+            ":: hammer_runtime :: RuntimeError :: subsystem (\"session queue\" , source)"
+        ));
     }
 
     #[test]
