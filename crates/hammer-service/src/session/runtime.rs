@@ -3017,6 +3017,7 @@ mod tests {
 
     fn test_dispatch(
         _: &DataPlaneRuntime,
+        _: &mut SessionWorker<Index>,
         _: NodeRuntimeData,
         _: SessionQueueNext,
         _: Instant,

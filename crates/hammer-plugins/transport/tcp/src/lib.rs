@@ -253,6 +253,16 @@ impl TcpMain {
         runtime: &DataPlaneRuntime,
         operation: impl FnOnce(&mut SessionWorker<PoolIndex>, &mut TcpWorker) -> RuntimeResult<R>,
     ) -> RuntimeResult<R> {
+        self.sessions.with_worker_mut(runtime, |sessions| {
+            self.with_tcp_worker(runtime, |tcp| operation(sessions, tcp))
+        })
+    }
+
+    fn with_tcp_worker<R>(
+        &self,
+        runtime: &DataPlaneRuntime,
+        operation: impl FnOnce(&mut TcpWorker) -> RuntimeResult<R>,
+    ) -> RuntimeResult<R> {
         let thread_index = runtime.thread_index();
         let worker = thread_index
             .checked_sub(1)
@@ -260,19 +270,15 @@ impl TcpMain {
             .ok_or_else(|| {
                 RuntimeError::subsystem("tcp", TcpWorkerError::WorkerUnavailable { thread_index })
             })?;
-        self.sessions.with_worker_mut(runtime, |sessions| {
-            self.worker(worker)?
-                .with_mut(|tcp| operation(sessions, tcp))
-                .map_err(|source| {
-                    RuntimeError::subsystem(
-                        "tcp",
-                        TcpWorkerError::WorkerAccess {
-                            worker: worker.slot(),
-                            source,
-                        },
-                    )
-                })?
-        })
+        self.worker(worker)?.with_mut(operation).map_err(|source| {
+            RuntimeError::subsystem(
+                "tcp",
+                TcpWorkerError::WorkerAccess {
+                    worker: worker.slot(),
+                    source,
+                },
+            )
+        })?
     }
 
     pub fn control(&self) -> &TcpInputControlPlane {
@@ -610,6 +616,7 @@ fn init_tcp_worker(engine: &mut Engine) -> RuntimeResult<()> {
 
 fn tcp_session_queue_update_time(
     runtime: &DataPlaneRuntime,
+    sessions: &mut SessionWorker<PoolIndex>,
     _: NodeRuntimeData,
     output_next: SessionQueueNext,
     now: std::time::Instant,
@@ -619,7 +626,7 @@ fn tcp_session_queue_update_time(
     TCP_MAIN
         .load_full()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?
-        .with_worker(runtime, |sessions, tcp| {
+        .with_tcp_worker(runtime, |tcp| {
             tcp.update_time(sessions, runtime, output_next, frame, output, now)?;
             Ok(())
         })
@@ -627,6 +634,7 @@ fn tcp_session_queue_update_time(
 
 fn tcp_session_queue_dispatch(
     runtime: &DataPlaneRuntime,
+    sessions: &mut SessionWorker<PoolIndex>,
     _: NodeRuntimeData,
     output_next: SessionQueueNext,
     now: std::time::Instant,
@@ -636,7 +644,7 @@ fn tcp_session_queue_dispatch(
     TCP_MAIN
         .load_full()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?
-        .with_worker(runtime, |sessions, tcp| {
+        .with_tcp_worker(runtime, |tcp| {
             dispatch_session_queue_events(runtime, sessions, tcp, output_next, frame, output, now)
                 .map(|_| ())
         })
