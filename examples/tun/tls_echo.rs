@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use hammer_app::attach::{AppClient, AppClientError};
+use hammer_app::echo::run_echo_loop;
 use hammer_app::{
     APP_SESSION_POLICY_VERSION, AppSession, AppSessionError, AppSessionPolicy,
     AppSessionProtocolSelection, DataWorkerId, SessionListenEndpoint,
@@ -272,18 +273,12 @@ async fn run_echo(session: &AppSession) -> Result<(), EchoError> {
         }
         match event.evt_type {
             SessionEvtType::Connect
-            | SessionEvtType::TxDeq
             | SessionEvtType::RxDeq
             | SessionEvtType::TxEnq
             | SessionEvtType::ProtocolOutput => {}
-            SessionEvtType::RxEnq => loop {
-                let read = session.recv_bytes(&mut buffer);
-                if read == 0 {
-                    break;
-                }
-                session.send_all(&buffer[..read]).await?;
-                session.consume_rx(read);
-            },
+            SessionEvtType::RxEnq | SessionEvtType::TxDeq => {
+                run_echo_loop(session, &mut buffer, ECHO_BUFFER_BYTES)?;
+            }
             SessionEvtType::Close
             | SessionEvtType::HalfClose
             | SessionEvtType::Reset
