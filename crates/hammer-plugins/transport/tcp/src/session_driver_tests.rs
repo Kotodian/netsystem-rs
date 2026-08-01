@@ -143,6 +143,9 @@ fn attach_protocol_session(
     protocol: AppSessionProtocolEntry,
 ) -> SessionId {
     let application = applications.attach().expect("attach test Application");
+    sessions
+        .install_application_mq_for_test(application)
+        .expect("install test Application MQ");
     let policy = hammer_runtime::app::AppSessionPolicy::new(
         hammer_runtime::app::APP_SESSION_POLICY_VERSION,
         [AppSessionProtocolSelection::new(
@@ -350,12 +353,14 @@ fn tcp_closed_publication_notifies_app_once_before_cleanup() {
 
 #[test]
 fn rollback_discards_unpublished_session_without_close_notification() {
-    let (mut sessions, mut tcp, _) = worker_state();
+    let (mut sessions, mut tcp, applications) = worker_state();
     let connection_index = tcp
         .insert_connection(established_connection())
         .expect("insert TCP connection");
-    let applications = hammer_service::session::ApplicationMain::new(1);
     let application = applications.attach().expect("attach test Application");
+    sessions
+        .install_application_mq_for_test(application)
+        .expect("install test Application MQ");
     let policy = hammer_runtime::app::AppSessionPolicy::new(
         hammer_runtime::app::APP_SESSION_POLICY_VERSION,
         [],
@@ -366,7 +371,7 @@ fn rollback_discards_unpublished_session_without_close_notification() {
         .expect("register test Application listener");
     let session_main = std::sync::Arc::new(hammer_service::session::runtime::SessionMain::new(
         1,
-        applications,
+        std::sync::Arc::clone(&applications),
     ));
     sessions.set_listener_main(std::sync::Arc::clone(&session_main));
     let listener = session_main
@@ -408,7 +413,7 @@ fn rollback_discards_unpublished_session_without_close_notification() {
 
 #[test]
 fn active_open_commits_session_after_full_connection_publication() {
-    let (mut sessions, mut tcp, _) = worker_state();
+    let (mut sessions, mut tcp, applications) = worker_state();
     let worker = DataWorkerId::new(0);
     let local: std::net::SocketAddr = "192.0.2.10:443".parse().expect("local address");
     let remote: std::net::SocketAddr = "198.51.100.20:50001".parse().expect("remote address");
@@ -417,8 +422,10 @@ fn active_open_commits_session_after_full_connection_publication() {
     let connection_index = tcp
         .insert_connection(connection)
         .expect("insert active-open TCP connection");
-    let applications = hammer_service::session::ApplicationMain::new(1);
     let application = applications.attach().expect("attach test Application");
+    sessions
+        .install_application_mq_for_test(application)
+        .expect("install test Application MQ");
     let policy = hammer_runtime::app::AppSessionPolicy::new(
         hammer_runtime::app::APP_SESSION_POLICY_VERSION,
         [],
@@ -429,7 +436,7 @@ fn active_open_commits_session_after_full_connection_publication() {
         .expect("register test Application listener");
     let session_main = std::sync::Arc::new(hammer_service::session::runtime::SessionMain::new(
         1,
-        applications,
+        std::sync::Arc::clone(&applications),
     ));
     sessions.set_listener_main(std::sync::Arc::clone(&session_main));
     let listener = session_main

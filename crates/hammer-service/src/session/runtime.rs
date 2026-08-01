@@ -1402,27 +1402,11 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         index: Index,
     ) -> SessionId {
         let application = self.applications.attach().expect("attach test Application");
-        let app_rx_mq = Arc::new(
-            SessionMsgQueue::with_cfg(
-                DEFAULT_SESSION_EVENT_CAPACITY as u32,
-                DEFAULT_SESSION_EVENT_CAPACITY as u32,
-            )
-            .expect("Application Rx MQ"),
-        );
-        let application_slot = application.slot() as usize;
-        if application_slot >= self.app_rx_mqs.len() {
-            self.app_rx_mqs.resize_with(application_slot + 1, || None);
-        }
-        let pending_queue = &mut self.app_rx_mq_pending as *mut VecDeque<ApplicationId> as usize;
-        self.app_rx_mqs[application_slot] = Some(Box::new(AppRxMqEntry {
-            application,
-            queue: Arc::clone(&app_rx_mq),
-            file: None,
-            appsl_input_node: NodeId::new(0),
-            pending_queue,
-            pending: false,
-            postponed: false,
-        }));
+        self.install_application_mq_for_test(application)
+            .expect("install Application Rx MQ");
+        let app_rx_mq = self
+            .app_mq_worker(application)
+            .expect("test Application Rx MQ remains installed");
 
         let (rx_fifo, tx_fifo) = self.create_local_fifos().expect("test Session FIFOs");
         let session_id = self
@@ -1453,6 +1437,46 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             .expect("publish session connection");
         self.connected(session_id).expect("connect session");
         session_id
+    }
+
+    /// Installs a per-Application MQ for direct Session Worker tests.
+    ///
+    /// These workers have no FileMain, so the queue is staged by `poll_app`.
+    /// Runtime-attached applications use `install_app_mq`, which registers
+    /// the queue's signal descriptor with FileMain instead.
+    #[doc(hidden)]
+    pub fn install_application_mq_for_test(
+        &mut self,
+        application: ApplicationId,
+    ) -> RuntimeResult<()> {
+        let application_slot = application.slot() as usize;
+        if application_slot >= self.app_rx_mqs.len() {
+            self.app_rx_mqs.resize_with(application_slot + 1, || None);
+        }
+        if self.app_rx_mqs[application_slot]
+            .as_ref()
+            .is_some_and(|entry| entry.application == application)
+        {
+            return Err(SessionQueueError::ApplicationMqAlreadyRegistered { application }.into());
+        }
+        let app_rx_mq = Arc::new(
+            SessionMsgQueue::with_cfg(
+                DEFAULT_SESSION_EVENT_CAPACITY as u32,
+                DEFAULT_SESSION_EVENT_CAPACITY as u32,
+            )
+            .map_err(|error| AppWorkerError::SessionEventQueue { error })?,
+        );
+        let pending_queue = &mut self.app_rx_mq_pending as *mut VecDeque<ApplicationId> as usize;
+        self.app_rx_mqs[application_slot] = Some(Box::new(AppRxMqEntry {
+            application,
+            queue: app_rx_mq,
+            file: None,
+            appsl_input_node: NodeId::new(0),
+            pending_queue,
+            pending: false,
+            postponed: false,
+        }));
+        Ok(())
     }
 
     fn application_detached(&mut self, application: ApplicationId) {
@@ -1668,23 +1692,20 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     }
 
     pub fn poll_app(&mut self) -> RuntimeResult<usize> {
-        #[cfg(test)]
-        {
-            // Direct Session tests do not install FileMain, so stage local
-            // test MQs from their signal-free queue state before draining.
-            let pending_applications = self
-                .app_rx_mqs
-                .iter_mut()
-                .filter_map(|entry| {
-                    let entry = entry.as_mut()?;
-                    (entry.file.is_none() && !entry.pending && !entry.queue.is_empty()).then(|| {
-                        entry.pending = true;
-                        entry.application
-                    })
+        // Direct test registrations have no FileMain descriptor; production
+        // registrations always acquire one in `install_app_mq`.
+        let pending_applications = self
+            .app_rx_mqs
+            .iter_mut()
+            .filter_map(|entry| {
+                let entry = entry.as_mut()?;
+                (entry.file.is_none() && !entry.pending && !entry.queue.is_empty()).then(|| {
+                    entry.pending = true;
+                    entry.application
                 })
-                .collect::<Vec<_>>();
-            self.app_rx_mq_pending.extend(pending_applications);
-        }
+            })
+            .collect::<Vec<_>>();
+        self.app_rx_mq_pending.extend(pending_applications);
         let mut control_events = core::mem::take(&mut self.control_events);
         let mut new_io_events = core::mem::take(&mut self.new_io_events);
         let app_mq_handled = self.drain_app_mq_events_to(|ring, event| {

@@ -1035,6 +1035,9 @@ pub(crate) fn closing_session_for_test() -> (
         .insert_connection(connection)
         .expect("insert TCP connection");
     let application = applications.attach().expect("attach test Application");
+    sessions
+        .install_application_mq_for_test(application)
+        .expect("install test Application MQ");
     let policy = hammer_runtime::app::AppSessionPolicy::new(
         hammer_runtime::app::APP_SESSION_POLICY_VERSION,
         [],
