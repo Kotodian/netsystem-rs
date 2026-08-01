@@ -4,9 +4,11 @@ use std::num::NonZeroU32;
 use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 use std::thread::{self, ThreadId};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use hammer_core::data_plane::{BufferFrame, DataPlaneBuffers, Index as BufferIndex, NodeState};
+use hammer_core::data_plane::{
+    BufferFrame, DataPlaneBuffers, Index as BufferIndex, NodeId, NodeState,
+};
 use hammer_infra::align::{CacheLine, align_up};
 use hammer_infra::fifo::Fifo;
 use hammer_infra::linked_list::LinkedList;
@@ -24,7 +26,10 @@ use hammer_runtime::{
     AttachError, RuntimeError, RuntimeResult, SessionConnectEndpoint, SessionConnectionId,
     SessionListenEndpoint, SessionListenerId, SessionTransportRegistration,
 };
-use hammer_runtime::{DataPlaneRuntime, DataWorkerId, Engine, File, FileFunctions};
+use hammer_runtime::{
+    DataPlaneRuntime, DataWorkerId, Deadline, Engine, File, FileFunctions, NodeRuntime,
+    NodeRuntimeData,
+};
 
 use crate::session::app::AppWorkerError;
 use crate::session::application::{ApplicationMain, ApplicationMqResources, ApplicationProtocol};
@@ -37,6 +42,35 @@ const DEFAULT_SESSION_POOL_CAPACITY: usize = 1024;
 const DEFAULT_SESSION_TX_EVENT_CAPACITY: usize = 2048;
 const DEFAULT_TX_DISPATCH_BUDGET: usize = 64;
 const PROTOCOL_ADVANCE_BUDGET: usize = 64;
+const SESSION_WORKER_INTERRUPT_DEADLINE: Duration = Duration::from_millis(1);
+const SESSION_WORKER_IDLE_DEADLINE: Duration = Duration::from_millis(100);
+
+/// VPP's adaptive Session Worker execution state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionWorkerState {
+    Polling,
+    Interrupt,
+    Idle,
+}
+
+impl SessionWorkerState {
+    #[inline]
+    const fn deadline(self) -> Option<Duration> {
+        match self {
+            Self::Polling => None,
+            Self::Interrupt => Some(SESSION_WORKER_INTERRUPT_DEADLINE),
+            Self::Idle => Some(SESSION_WORKER_IDLE_DEADLINE),
+        }
+    }
+
+    #[inline]
+    const fn node_state(self) -> NodeState {
+        match self {
+            Self::Polling => NodeState::Polling,
+            Self::Interrupt | Self::Idle => NodeState::Interrupt,
+        }
+    }
+}
 
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -172,6 +206,9 @@ pub struct SessionWorker<Index> {
     readiness_file: Option<PoolIndex>,
     app_rx_mqs: Vec<Option<Box<AppRxMqEntry>>>,
     app_rx_mq_pending: VecDeque<ApplicationId>,
+    state: SessionWorkerState,
+    state_deadline_file: Option<PoolIndex>,
+    session_queue: Option<NodeId>,
 }
 
 struct AppRxMqEntry {
@@ -420,6 +457,15 @@ impl SessionMain {
         })?
     }
 
+    pub(crate) fn session_queue_is_interrupt(
+        &self,
+        runtime: &DataPlaneRuntime,
+    ) -> RuntimeResult<bool> {
+        self.with_worker_mut(runtime, |sessions| {
+            Ok(sessions.state == SessionWorkerState::Interrupt)
+        })
+    }
+
     pub(crate) fn application_detached(
         self: &Arc<Self>,
         engine: &Engine,
@@ -584,17 +630,55 @@ pub fn install_session_worker(
     let session_queue_data =
         hammer_runtime::NodeRuntimeData::from_usize(Arc::as_ptr(main) as usize)?;
     let input_data = AppSessionInputNode::worker_runtime_data(session_queue_data, session_queue);
-    engine.set_worker_node_runtime_data(app_session_input, input_data)?;
-    engine.set_worker_node_runtime_data(session_queue, session_queue_data)?;
-    engine
-        .runtime
-        .nodes()
-        .set_node_state(app_session_input, NodeState::Interrupt)?;
-    worker.install_queue_readiness(engine, app_session_input)?;
     let worker_id = worker.worker();
     let slot = main.worker(worker_id)?;
+    let previous_app_session_input_data = engine
+        .runtime
+        .nodes()
+        .node_runtime_data(app_session_input)?;
+    let previous_session_queue_data = engine.runtime.nodes().node_runtime_data(session_queue)?;
+    let previous_app_session_input_state = engine.runtime.nodes().node_state(app_session_input)?;
+    let previous_session_queue_state = engine.runtime.nodes().node_state(session_queue)?;
+
+    let setup = (|| -> RuntimeResult<()> {
+        engine.set_worker_node_runtime_data(app_session_input, input_data)?;
+        engine.set_worker_node_runtime_data(session_queue, session_queue_data)?;
+        engine
+            .runtime
+            .nodes()
+            .set_node_state(session_queue, NodeState::Polling)?;
+        engine
+            .runtime
+            .nodes()
+            .set_node_state(app_session_input, NodeState::Interrupt)?;
+        worker.install_state_deadline(&engine.runtime, session_queue)?;
+        worker.install_queue_readiness(engine, app_session_input)
+    })();
+    if let Err(error) = setup {
+        cleanup_session_worker_install(&mut worker, engine);
+        rollback_session_worker_graph(
+            engine,
+            app_session_input,
+            previous_app_session_input_data,
+            previous_app_session_input_state,
+            session_queue,
+            previous_session_queue_data,
+            previous_session_queue_state,
+        );
+        return Err(error);
+    }
+
     if let Err(mut worker) = slot.install(worker) {
-        worker.remove_queue_readiness(engine)?;
+        cleanup_session_worker_install(&mut worker, engine);
+        rollback_session_worker_graph(
+            engine,
+            app_session_input,
+            previous_app_session_input_data,
+            previous_app_session_input_state,
+            session_queue,
+            previous_session_queue_data,
+            previous_session_queue_state,
+        );
         return Err(SessionQueueError::WorkerAlreadyInstalled {
             worker: worker_id.slot(),
         }
@@ -603,10 +687,182 @@ pub fn install_session_worker(
     Ok(())
 }
 
+fn cleanup_session_worker_install(worker: &mut SessionWorker<PoolIndex>, engine: &mut Engine) {
+    if let Err(error) = worker.remove_queue_readiness(engine) {
+        tracing::error!(%error, "failed to remove Session Worker readiness during install rollback");
+    }
+    if let Err(error) = worker.remove_state_deadline(&engine.runtime) {
+        tracing::error!(%error, "failed to remove Session Worker deadline during install rollback");
+    }
+}
+
+fn rollback_session_worker_graph(
+    engine: &mut Engine,
+    app_session_input: hammer_core::data_plane::NodeId,
+    previous_app_session_input_data: NodeRuntimeData,
+    previous_app_session_input_state: NodeState,
+    session_queue: NodeId,
+    previous_session_queue_data: NodeRuntimeData,
+    previous_session_queue_state: NodeState,
+) {
+    if let Err(error) = engine
+        .runtime
+        .nodes()
+        .set_node_state(session_queue, previous_session_queue_state)
+    {
+        tracing::error!(
+            %error,
+            ?session_queue,
+            "failed to restore Session Queue state during install rollback"
+        );
+    }
+    if let Err(error) = engine
+        .runtime
+        .nodes()
+        .set_node_state(app_session_input, previous_app_session_input_state)
+    {
+        tracing::error!(
+            %error,
+            ?app_session_input,
+            "failed to restore appsl input state during install rollback"
+        );
+    }
+    if let Err(error) =
+        engine.set_worker_node_runtime_data(session_queue, previous_session_queue_data)
+    {
+        tracing::error!(
+            %error,
+            ?session_queue,
+            "failed to restore Session Queue runtime data during install rollback"
+        );
+    }
+    if let Err(error) =
+        engine.set_worker_node_runtime_data(app_session_input, previous_app_session_input_data)
+    {
+        tracing::error!(
+            %error,
+            ?app_session_input,
+            "failed to restore appsl input runtime data during install rollback"
+        );
+    }
+}
+
 impl<Index: Copy + Eq> SessionWorker<Index> {
     #[inline]
     pub const fn worker(&self) -> DataWorkerId {
         self.worker
+    }
+
+    #[inline]
+    pub const fn state(&self) -> SessionWorkerState {
+        self.state
+    }
+
+    #[inline]
+    pub const fn state_deadline(&self) -> Option<Duration> {
+        self.state.deadline()
+    }
+
+    /// Installs the worker's adaptive deadline after the Session Queue node is
+    /// known. The deadline callback only wakes that node; Session Worker state
+    /// remains owned by this worker and is updated after queue dispatch.
+    pub(crate) fn install_state_deadline(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        session_queue: NodeId,
+    ) -> RuntimeResult<()> {
+        if self.state_deadline_file.is_some() {
+            return Ok(());
+        }
+        let index = runtime.file_main_mut().add_deadline(Deadline::new(
+            "session queue adaptive deadline",
+            u64::from(session_queue.slot()),
+            schedule_session_queue_deadline,
+        ))?;
+        self.state_deadline_file = Some(index);
+        self.session_queue = Some(session_queue);
+        Ok(())
+    }
+
+    pub(crate) fn remove_state_deadline(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+    ) -> RuntimeResult<()> {
+        let Some(index) = self.state_deadline_file else {
+            return Ok(());
+        };
+        if !runtime.file_main_mut().delete_deadline(index)? {
+            return Err(RuntimeError::DeadlineIndexInvalid { index });
+        }
+        self.state_deadline_file = None;
+        self.session_queue = None;
+        Ok(())
+    }
+
+    /// Applies the VPP adaptive state transition after one Session Queue
+    /// dispatch. `last_vectors_per_loop` is the worker's graph-output proxy;
+    /// the state machine itself does not own transport timers.
+    pub fn update_state(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        last_vectors_per_loop: usize,
+    ) -> RuntimeResult<()> {
+        let pending_events = self.pending_event_count() != 0;
+        let next = match self.state {
+            SessionWorkerState::Polling if !pending_events && last_vectors_per_loop < 1 => {
+                SessionWorkerState::Interrupt
+            }
+            SessionWorkerState::Interrupt if pending_events || last_vectors_per_loop > 1 => {
+                SessionWorkerState::Polling
+            }
+            SessionWorkerState::Interrupt if self.entries.is_empty() => SessionWorkerState::Idle,
+            SessionWorkerState::Idle if pending_events => SessionWorkerState::Interrupt,
+            state => state,
+        };
+        self.apply_state(runtime, next)
+    }
+
+    #[inline]
+    fn pending_event_count(&self) -> usize {
+        self.session_evt_q
+            .len()
+            .saturating_add(self.control_events.len())
+            .saturating_add(self.new_io_events.len())
+            .saturating_add(self.old_io_events.len())
+            .saturating_add(self.app_rx_mq_pending.len())
+    }
+
+    fn apply_state(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        next: SessionWorkerState,
+    ) -> RuntimeResult<()> {
+        if self.state == next {
+            return Ok(());
+        }
+        let previous_node_state = self.state.node_state();
+        if let Some(session_queue) = self.session_queue {
+            runtime
+                .nodes()
+                .set_node_state(session_queue, next.node_state())?;
+        }
+        if let Some(index) = self.state_deadline_file
+            && let Err(error) = runtime.file_main_mut().set_deadline(index, next.deadline())
+        {
+            if let Some(session_queue) = self.session_queue
+                && let Err(cleanup_error) = runtime
+                    .nodes()
+                    .set_node_state(session_queue, previous_node_state)
+            {
+                tracing::error!(
+                    %cleanup_error,
+                    "failed to restore Session Queue state after deadline update failed"
+                );
+            }
+            return Err(error);
+        }
+        self.state = next;
+        Ok(())
     }
 
     #[inline]
@@ -673,7 +929,9 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         let Some(file) = self.readiness_file else {
             return Ok(());
         };
-        let _ = engine.file_main_mut().delete(file)?;
+        if !engine.file_main_mut().delete(file)? {
+            return Err(RuntimeError::FileIndexInvalid { index: file });
+        }
         self.readiness_file = None;
         Ok(())
     }
@@ -764,12 +1022,22 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         self.app_rx_mq_pending
             .retain(|candidate| *candidate != application);
         if let Some(file) = entry.file {
-            if let Err(error) = runtime.file_main_mut().delete(file) {
-                if entry.pending {
-                    self.app_rx_mq_pending.push_back(application);
+            match runtime.file_main_mut().delete(file) {
+                Ok(true) => {}
+                Ok(false) => {
+                    if entry.pending {
+                        self.app_rx_mq_pending.push_back(application);
+                    }
+                    self.app_rx_mqs[slot] = Some(entry);
+                    return Err(RuntimeError::FileIndexInvalid { index: file });
                 }
-                self.app_rx_mqs[slot] = Some(entry);
-                return Err(error);
+                Err(error) => {
+                    if entry.pending {
+                        self.app_rx_mq_pending.push_back(application);
+                    }
+                    self.app_rx_mqs[slot] = Some(entry);
+                    return Err(error);
+                }
             }
         }
         Ok(())
@@ -2187,6 +2455,9 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             readiness_file: None,
             app_rx_mqs: Vec::new(),
             app_rx_mq_pending: VecDeque::new(),
+            state: SessionWorkerState::Polling,
+            state_deadline_file: None,
+            session_queue: None,
         }
     }
 }
@@ -2480,7 +2751,7 @@ where
 {
     transport.update_time(sessions, runtime, output_next, frame, output, now)?;
     sessions.poll_session_events()?;
-    dispatch_session_queue_events(
+    let step = dispatch_session_queue_events(
         runtime,
         sessions,
         transport,
@@ -2488,7 +2759,9 @@ where
         frame,
         output,
         now,
-    )
+    )?;
+    sessions.update_state(runtime, output.io_count())?;
+    Ok(step)
 }
 
 pub fn dispatch_session_queue_events<T, Index>(
@@ -2763,9 +3036,9 @@ where
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
-    use hammer_core::data_plane::BufferFrame;
+    use hammer_core::data_plane::{BufferFrame, NodeId};
     use hammer_infra::pool::Index;
     use hammer_runtime::app::{
         AppSessionConfig, AppSessionProtocolRole, SessionEvt, SessionEvtType, SessionMsgQueueError,
@@ -2778,7 +3051,7 @@ mod tests {
 
     use super::{
         DEFAULT_SESSION_POOL_CAPACITY, SessionMain, SessionQueueNext, SessionTransportId,
-        SessionWorker, queue_for_worker,
+        SessionWorker, SessionWorkerState, queue_for_worker,
     };
     use crate::session::ApplicationMain;
     use crate::session::application::{ApplicationError, ApplicationMqResources};
@@ -2809,6 +3082,127 @@ mod tests {
         _: &mut BufferFrame,
         _: &mut SessionQueueOutput,
     ) -> RuntimeResult<()> {
+        Ok(())
+    }
+
+    #[test]
+    fn session_worker_state_transitions_match_vpp_deadlines() {
+        let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
+        let mut sessions =
+            SessionWorker::<Index>::new(DataWorkerId::new(0)).expect("session worker");
+
+        assert_eq!(sessions.state(), SessionWorkerState::Polling);
+        assert_eq!(sessions.state_deadline(), None);
+
+        sessions
+            .update_state(&runtime, 0)
+            .expect("polling to interrupt");
+        assert_eq!(sessions.state(), SessionWorkerState::Interrupt);
+        assert_eq!(sessions.state_deadline(), Some(Duration::from_millis(1)));
+
+        sessions
+            .update_state(&runtime, 0)
+            .expect("interrupt to idle");
+        assert_eq!(sessions.state(), SessionWorkerState::Idle);
+        assert_eq!(sessions.state_deadline(), Some(Duration::from_millis(100)));
+
+        sessions
+            .new_io_events
+            .push_back(SessionEvt::io(0, SessionEvtType::TxEnq));
+        sessions
+            .update_state(&runtime, 0)
+            .expect("idle to interrupt");
+        assert_eq!(sessions.state(), SessionWorkerState::Interrupt);
+    }
+
+    #[test]
+    fn session_worker_teardown_removes_deadline_before_runtime_drop() {
+        let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
+        let mut sessions =
+            SessionWorker::<Index>::new(DataWorkerId::new(0)).expect("session worker");
+        sessions
+            .install_state_deadline(&runtime, NodeId::new(0))
+            .expect("install adaptive deadline");
+        let deadline = sessions
+            .state_deadline_file
+            .expect("Session Worker owns its deadline index");
+        assert_eq!(
+            runtime
+                .file_main()
+                .deadline(deadline)
+                .expect("registered deadline"),
+            None
+        );
+
+        sessions
+            .remove_state_deadline(&runtime)
+            .expect("remove adaptive deadline before runtime teardown");
+        assert!(sessions.state_deadline_file.is_none());
+        assert!(runtime.file_main().deadline(deadline).is_err());
+    }
+
+    #[test]
+    fn appsl_rx_mq_wakes_session_queue_only_in_interrupt_state() -> Result<(), SessionTestFailure> {
+        fn run_case(interrupt: bool) -> Result<usize, SessionTestFailure> {
+            let main_engine = Engine::new(
+                DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()),
+                RuntimeRegistry::new(),
+            );
+            let session_queue = register_session_queue_node(&main_engine.runtime)?;
+            let app_session_input = register_app_session_input_node(&main_engine.runtime)?;
+            let mut engine = main_engine.spawn(1)?;
+            let applications = ApplicationMain::new(1);
+            let application = applications.attach()?;
+            let resources = ApplicationMqResources::create_local(application, 1, 4096)?;
+            let queue = queue_for_worker(&resources, application)?;
+            let main = Arc::new(SessionMain::new(1, applications));
+            let sessions = SessionWorker::<Index>::new(DataWorkerId::new(0))?;
+
+            super::install_session_worker(
+                &main,
+                &mut engine,
+                app_session_input,
+                session_queue,
+                sessions,
+            )?;
+            main.worker(DataWorkerId::new(0))?
+                .with_mut(|sessions| {
+                    sessions.install_app_mq(
+                        application,
+                        queue.clone(),
+                        app_session_input,
+                        &mut engine.runtime,
+                    )
+                })
+                .map_err(|source| super::SessionQueueError::WorkerAccess { worker: 0, source })??;
+
+            if interrupt {
+                main.worker(DataWorkerId::new(0))?
+                    .with_mut(|sessions| sessions.update_state(&engine.runtime, 0))
+                    .map_err(|source| super::SessionQueueError::WorkerAccess {
+                        worker: 0,
+                        source,
+                    })??;
+            }
+
+            queue.enqueue_io(SessionEvt::io(1, SessionEvtType::TxEnq))?;
+            let graph = engine.runtime.nodes().clone();
+            assert_eq!(engine.file_main_mut().poll(&graph)?, 1);
+            engine.runtime.schedule_empty_frame(app_session_input)?;
+            let processed = engine.runtime.run_ready_nodes()?;
+
+            main.worker(DataWorkerId::new(0))?
+                .with_mut(|sessions| {
+                    sessions.remove_queue_readiness(&mut engine)?;
+                    sessions.remove_app_mq(application, &mut engine.runtime)?;
+                    sessions.remove_state_deadline(&engine.runtime)
+                })
+                .map_err(|source| super::SessionQueueError::WorkerAccess { worker: 0, source })??;
+            Ok(processed)
+        }
+
+        assert_eq!(run_case(false)?, 1);
+        assert_eq!(run_case(true)?, 2);
         Ok(())
     }
 
@@ -3434,6 +3828,18 @@ fn schedule_app_session_input(
     file: &mut File,
 ) -> RuntimeResult<()> {
     let node = hammer_core::data_plane::NodeId::new(file.private_data() as u32);
+    let _ = graph.mark_interrupt_pending(node)?;
+    Ok(())
+}
+
+fn schedule_session_queue_deadline(
+    graph: &NodeRuntime,
+    deadline: &mut Deadline,
+) -> RuntimeResult<()> {
+    let node = NodeId::new(
+        u32::try_from(deadline.private_data())
+            .expect("Session Queue node identity is stored as a u32"),
+    );
     let _ = graph.mark_interrupt_pending(node)?;
     Ok(())
 }

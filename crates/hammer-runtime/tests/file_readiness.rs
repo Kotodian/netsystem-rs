@@ -5,9 +5,10 @@ use std::io::Write;
 use std::os::fd::FromRawFd;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::time::{Duration, Instant};
 
 use hammer_infra::pool::Index;
-use hammer_runtime::{File, FileFunctions, FileMain, NodeRuntime};
+use hammer_runtime::{Deadline, File, FileFunctions, FileMain, NodeRuntime, RuntimeError};
 
 struct RegisteredSocket {
     index: Index,
@@ -373,5 +374,83 @@ fn unhandled_error_deletes_file_and_closes_descriptor() {
     assert_eq!(
         std::io::Error::last_os_error().raw_os_error(),
         Some(libc::EBADF)
+    );
+}
+
+#[test]
+fn deadline_registration_tracks_state_derived_duration_without_sleeping() {
+    let mut files = FileMain::new().expect("create FileMain");
+    let index = files
+        .add_deadline(Deadline::new("session worker deadline", 0, |_, _| Ok(())))
+        .expect("register deadline");
+
+    assert_eq!(files.deadline(index).expect("registered deadline"), None);
+
+    let interrupt_deadline = Duration::from_millis(1);
+    files
+        .set_deadline(index, Some(interrupt_deadline))
+        .expect("arm interrupt deadline");
+    assert_eq!(
+        files.deadline(index).expect("registered deadline"),
+        Some(interrupt_deadline)
+    );
+
+    files.set_deadline(index, None).expect("disarm deadline");
+    assert_eq!(files.deadline(index).expect("registered deadline"), None);
+    assert!(files.delete_deadline(index).expect("delete deadline"));
+    assert!(files.deadline(index).is_err());
+}
+
+#[test]
+fn deleted_deadline_index_does_not_resolve_after_pool_slot_reuse() {
+    let mut files = FileMain::new().expect("create FileMain");
+    let stale = files
+        .add_deadline(Deadline::new("stale deadline", 0, |_, _| Ok(())))
+        .expect("register first deadline");
+
+    assert!(files.delete_deadline(stale).expect("delete first deadline"));
+    let current = files
+        .add_deadline(Deadline::new("current deadline", 0, |_, _| Ok(())))
+        .expect("register replacement deadline");
+
+    assert_eq!(current.slot(), stale.slot());
+    assert_ne!(current.generation(), stale.generation());
+    assert!(matches!(
+        files.deadline(stale),
+        Err(RuntimeError::DeadlineIndexInvalid { index }) if index == stale
+    ));
+    assert_eq!(files.deadline(current).expect("replacement deadline"), None);
+}
+
+#[test]
+fn armed_deadline_dispatches_and_can_be_disarmed_after_expiry() {
+    let mut files = FileMain::new().expect("create FileMain");
+    let index = files
+        .add_deadline(Deadline::new("one-shot deadline", 0, |_, _| Ok(())))
+        .expect("register deadline");
+    files
+        .set_deadline(index, Some(Duration::from_millis(1)))
+        .expect("arm deadline");
+
+    let timeout = Instant::now() + Duration::from_millis(250);
+    let dispatched = loop {
+        let dispatched = files.poll(&NodeRuntime::default()).expect("poll deadline");
+        if dispatched != 0 {
+            break dispatched;
+        }
+        assert!(Instant::now() < timeout, "deadline did not expire");
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(dispatched, 1);
+
+    files
+        .set_deadline(index, None)
+        .expect("disarm rearmed deadline");
+    std::thread::sleep(Duration::from_millis(2));
+    assert_eq!(
+        files
+            .poll(&NodeRuntime::default())
+            .expect("poll disarmed deadline"),
+        0
     );
 }

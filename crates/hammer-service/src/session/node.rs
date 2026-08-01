@@ -87,7 +87,7 @@ fn app_session_input_node_process(
 ) -> NodeResult {
     let result = (|| {
         let handled = SessionQueueNode::poll_app(runtime, data)?;
-        if handled != 0 {
+        if handled != 0 && SessionQueueNode::session_queue_is_interrupt(runtime, data)? {
             let session_queue = NodeId::new(
                 u32::try_from(data.word(1))
                     .expect("Session Queue node identity is stored as a u32"),
@@ -269,6 +269,22 @@ impl SessionQueueNode {
         main.with_worker_mut(runtime, |sessions| Ok(sessions.has_pending_app_mqs()))
     }
 
+    fn session_queue_is_interrupt(
+        runtime: &DataPlaneRuntime,
+        runtime_data: NodeRuntimeData,
+    ) -> RuntimeResult<bool> {
+        let ptr = runtime_data.word(0) as usize as *const SessionMain;
+        if ptr.is_null() {
+            return Err(RuntimeError::RuntimeCapabilityMissing {
+                type_name: std::any::type_name::<SessionMain>(),
+            });
+        }
+        // SAFETY: worker NodeRuntimeData is installed by the owning Data Worker
+        // and the SessionMain Arc remains alive in that worker's SessionMain.
+        let main = unsafe { &*ptr };
+        main.session_queue_is_interrupt(runtime)
+    }
+
     /// Compiles the session queue's output edge in the main graph.
     pub fn compile_output_next(
         runtime: &DataPlaneRuntime,
@@ -407,6 +423,7 @@ fn session_queue_node_process(
                 (dispatch.function)(runtime, data, dispatch.output_next, now, frame, &mut output)
                     .map_err(|_| SessionQueueError::DispatchFailed.into())
             })?;
+        sessions.update_state(runtime, output.io_count())?;
         Ok(())
     });
     if result.is_err() {
