@@ -250,10 +250,7 @@ impl SessionMsgQueue {
             q_nitems,
             rings: &rings,
         })
-        .map_err(|e| match e {
-            MultiRingMsgQueueError::InvalidConfig => SessionMsgQueueError::InvalidConfig,
-            other => panic!("unexpected multi-ring config error: {other:?}"),
-        })?;
+        .map_err(|_| SessionMsgQueueError::InvalidConfig)?;
         Ok(Self {
             inner,
             signal_atomic: AtomicBool::new(false),
@@ -314,10 +311,7 @@ impl SessionMsgQueue {
         let inner = unsafe {
             MultiRingMsgQueue::init_at(seg, hdr_offset, &MultiRingMsgQueueCfg { q_nitems, rings })
         }
-        .map_err(|e| match e {
-            MultiRingMsgQueueError::InvalidConfig => SessionMsgQueueError::InvalidConfig,
-            other => panic!("unexpected multi-ring init error: {other:?}"),
-        })?;
+        .map_err(|_| SessionMsgQueueError::InvalidConfig)?;
         Ok(Self {
             inner,
             signal_atomic: AtomicBool::new(false),
@@ -384,6 +378,25 @@ impl SessionMsgQueue {
     #[inline]
     pub fn dequeue(&self) -> Option<SessionEvt> {
         SessionEventQueue::dequeue(self)
+    }
+
+    /// Dequeues one event together with the MQ ring that classified it.
+    #[inline]
+    pub fn dequeue_with_ring(&self) -> Option<(SessionMqRing, SessionEvt)> {
+        let Some(message) = self.inner.sub() else {
+            return None;
+        };
+        // A SessionMsgQueue is always laid out as exactly [IO, CTRL]. The
+        // descriptor's ring is therefore already the classification fact;
+        // there is no third ring to recover from here.
+        let ring = if message.ring_index() == SessionMqRing::Ctrl as u32 {
+            SessionMqRing::Ctrl
+        } else {
+            SessionMqRing::Io
+        };
+        let event = SessionEvt::from_bytes(message.as_slice());
+        drop(message);
+        Some((ring, event))
     }
 
     pub(crate) fn enqueue_ctrl_payload(&self, payload: &[u8]) -> Result<(), SessionMsgQueueError> {
@@ -523,16 +536,10 @@ impl SessionEventQueue for SessionMsgQueue {
     }
 
     fn dequeue_batch(&self, out: &mut [SessionEvt]) -> usize {
-        let mut count = 0;
-        for slot in out.iter_mut() {
-            if let Some(evt) = SessionEventQueue::dequeue(self) {
-                *slot = evt;
-                count += 1;
-            } else {
-                break;
-            }
-        }
-        count
+        out.iter_mut()
+            .zip(std::iter::from_fn(|| SessionEventQueue::dequeue(self)))
+            .map(|(slot, event)| *slot = event)
+            .count()
     }
 
     fn fire(&self) {
@@ -576,7 +583,7 @@ impl SessionEventQueue for SessionMsgQueue {
     }
 
     fn clear(&self) {
-        while SessionEventQueue::dequeue(self).is_some() {}
+        std::iter::from_fn(|| SessionEventQueue::dequeue(self)).for_each(std::mem::drop);
         if let Some(signal_read) = &self.signal_read {
             let fd = signal_read.as_raw_fd();
             let mut buf = [0u8; 64];
@@ -651,41 +658,44 @@ impl SessionMsgQueue {
         let signal_read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
         // SAFETY: see the preceding ownership transfer for the write endpoint.
         let signal_write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-        for fd in [&signal_read, &signal_write] {
-            // SAFETY: `fd` remains owned by this function; fcntl only queries
-            // descriptor flags and does not take ownership.
-            let status_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
-            if status_flags < 0 {
-                return Err(SessionMsgQueueError::SignalStatusFlags);
-            }
-            // SAFETY: as above; queried flags are valid input for F_SETFL.
-            if unsafe {
-                libc::fcntl(
-                    fd.as_raw_fd(),
-                    libc::F_SETFL,
-                    status_flags | libc::O_NONBLOCK,
-                )
-            } < 0
-            {
-                return Err(SessionMsgQueueError::SignalNonblocking);
-            }
-            // SAFETY: as above; this only queries descriptor flags.
-            let descriptor_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
-            if descriptor_flags < 0 {
-                return Err(SessionMsgQueueError::SignalDescriptorFlags);
-            }
-            // SAFETY: as above; queried flags are valid input for F_SETFD.
-            if unsafe {
-                libc::fcntl(
-                    fd.as_raw_fd(),
-                    libc::F_SETFD,
-                    descriptor_flags | libc::FD_CLOEXEC,
-                )
-            } < 0
-            {
-                return Err(SessionMsgQueueError::SignalCloseOnExec);
-            }
-        }
+        [&signal_read, &signal_write].into_iter().try_for_each(
+            |fd| -> Result<(), SessionMsgQueueError> {
+                // SAFETY: `fd` remains owned by this function; fcntl only queries
+                // descriptor flags and does not take ownership.
+                let status_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+                if status_flags < 0 {
+                    return Err(SessionMsgQueueError::SignalStatusFlags);
+                }
+                // SAFETY: as above; queried flags are valid input for F_SETFL.
+                if unsafe {
+                    libc::fcntl(
+                        fd.as_raw_fd(),
+                        libc::F_SETFL,
+                        status_flags | libc::O_NONBLOCK,
+                    )
+                } < 0
+                {
+                    return Err(SessionMsgQueueError::SignalNonblocking);
+                }
+                // SAFETY: as above; this only queries descriptor flags.
+                let descriptor_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+                if descriptor_flags < 0 {
+                    return Err(SessionMsgQueueError::SignalDescriptorFlags);
+                }
+                // SAFETY: as above; queried flags are valid input for F_SETFD.
+                if unsafe {
+                    libc::fcntl(
+                        fd.as_raw_fd(),
+                        libc::F_SETFD,
+                        descriptor_flags | libc::FD_CLOEXEC,
+                    )
+                } < 0
+                {
+                    return Err(SessionMsgQueueError::SignalCloseOnExec);
+                }
+                Ok(())
+            },
+        )?;
         // SAFETY: the queue was initialized above and the fresh descriptors
         // transfer sole ownership into the returned queue.
         Ok(unsafe {
