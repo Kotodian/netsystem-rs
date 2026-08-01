@@ -3148,16 +3148,20 @@ mod tests {
 
     #[test]
     fn runtime_error_requires_subsystem() {
-        let error = syn::parse_str::<RuntimeErrorArgs>("")
-            .expect_err("runtime_error must require a subsystem");
+        let error = match syn::parse_str::<RuntimeErrorArgs>("") {
+            Ok(_) => panic!("runtime_error must require a subsystem"),
+            Err(error) => error,
+        };
 
         assert!(error.to_string().contains("missing `subsystem` argument"));
     }
 
     #[test]
     fn runtime_error_rejects_unknown_arguments() {
-        let error = syn::parse_str::<RuntimeErrorArgs>(r#"name = "session""#)
-            .expect_err("runtime_error must reject unknown arguments");
+        let error = match syn::parse_str::<RuntimeErrorArgs>(r#"name = "session""#) {
+            Ok(_) => panic!("runtime_error must reject unknown arguments"),
+            Err(error) => error,
+        };
 
         assert!(
             error
