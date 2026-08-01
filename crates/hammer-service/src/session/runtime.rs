@@ -1401,36 +1401,54 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         transport: SessionTransportId,
         index: Index,
     ) -> SessionId {
-        let applications = ApplicationMain::new(1);
-        let application = applications.attach().expect("attach test Application");
-        let policy = hammer_runtime::app::AppSessionPolicy::new(
-            hammer_runtime::app::APP_SESSION_POLICY_VERSION,
-            [],
-        )
-        .expect("direct App Session policy is valid");
-        let application_listener = applications
-            .register_listener(application, &policy)
-            .expect("register test Application listener");
-        let main = Arc::new(SessionMain::new(self.worker_count, applications));
-        self.set_listener_main(Arc::clone(&main));
-        let listener = main
-            .listen(
-                application_listener,
-                SessionTransportRegistration::new(
-                    "test-session",
-                    Some(|_, _| Ok(())),
-                    Some(|_| Ok(())),
-                    None,
-                ),
-                SessionListenEndpoint::new(
-                    "127.0.0.1:0".parse().expect("test endpoint"),
-                    self.worker,
-                ),
+        let application = self.applications.attach().expect("attach test Application");
+        let app_rx_mq = Arc::new(
+            SessionMsgQueue::with_cfg(
+                DEFAULT_SESSION_EVENT_CAPACITY as u32,
+                DEFAULT_SESSION_EVENT_CAPACITY as u32,
             )
-            .expect("register test Session listener");
+            .expect("Application Rx MQ"),
+        );
+        let application_slot = application.slot() as usize;
+        if application_slot >= self.app_rx_mqs.len() {
+            self.app_rx_mqs.resize_with(application_slot + 1, || None);
+        }
+        let pending_queue = &mut self.app_rx_mq_pending as *mut VecDeque<ApplicationId> as usize;
+        self.app_rx_mqs[application_slot] = Some(Box::new(AppRxMqEntry {
+            application,
+            queue: Arc::clone(&app_rx_mq),
+            file: None,
+            appsl_input_node: NodeId::new(0),
+            pending_queue,
+            pending: false,
+            postponed: false,
+        }));
+
+        let (rx_fifo, tx_fifo) = self.create_local_fifos().expect("test Session FIFOs");
         let session_id = self
-            .stream_accept(transport, index, listener)
-            .expect("accept test session");
+            .insert_session_entry(SessionEntry::creating_transport(
+                transport, rx_fifo, tx_fifo,
+            ))
+            .expect("insert test Session");
+        let session = self
+            .app
+            .create_app_session(
+                0,
+                None,
+                self.session_handle(session_id),
+                self.app_session_config,
+                app_rx_mq,
+            )
+            .expect("create test App Session");
+        let entry = self
+            .entries
+            .get_mut(session_id.pool_index())
+            .expect("test Session remains installed");
+        entry.rx_fifo = Arc::clone(session.rx_fifo());
+        entry.tx_fifo = Arc::clone(session.tx_fifo());
+        entry.application = Some(SessionApplication::External(application));
+        self.finish_transport_creation(session_id, index);
+        self.app.attach_session(session_id, session);
         self.connection_published(session_id)
             .expect("publish session connection");
         self.connected(session_id).expect("connect session");
@@ -1650,6 +1668,23 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     }
 
     pub fn poll_app(&mut self) -> RuntimeResult<usize> {
+        #[cfg(test)]
+        {
+            // Direct Session tests do not install FileMain, so stage local
+            // test MQs from their signal-free queue state before draining.
+            let pending_applications = self
+                .app_rx_mqs
+                .iter_mut()
+                .filter_map(|entry| {
+                    let entry = entry.as_mut()?;
+                    (entry.file.is_none() && !entry.pending && !entry.queue.is_empty()).then(|| {
+                        entry.pending = true;
+                        entry.application
+                    })
+                })
+                .collect::<Vec<_>>();
+            self.app_rx_mq_pending.extend(pending_applications);
+        }
         let mut control_events = core::mem::take(&mut self.control_events);
         let mut new_io_events = core::mem::take(&mut self.new_io_events);
         let app_mq_handled = self.drain_app_mq_events_to(|ring, event| {
@@ -3031,7 +3066,6 @@ mod tests {
 
             main.worker(DataWorkerId::new(0))?
                 .with_mut(|sessions| {
-                    sessions.remove_queue_readiness(&mut engine)?;
                     sessions.remove_app_mq(application, &mut engine.runtime)?;
                     sessions.remove_state_deadline(&engine.runtime)
                 })
@@ -3534,7 +3568,7 @@ mod tests {
             application,
         )?;
         let main = Arc::new(SessionMain::new(1, Arc::clone(&applications)));
-        let mut sessions = SessionWorker::<Index>::new(
+        let sessions = SessionWorker::<Index>::new(
             DataWorkerId::new(0),
             1,
             AppSessionConfig::default(),
@@ -3542,7 +3576,6 @@ mod tests {
             applications,
             None,
         )?;
-        let target = sessions.insert_session_for_test(SessionTransportId::new(1), Index::new(7, 1));
         super::install_session_worker(
             &main,
             &mut engine,
@@ -3560,6 +3593,20 @@ mod tests {
                 )
             })
             .map_err(|source| super::SessionQueueError::WorkerAccess { worker: 0, source })??;
+        let target = main.with_worker_mut(&engine.runtime, |sessions| {
+            let target = sessions.construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(7, 1),
+                7,
+                application,
+                AppSessionProtocolRole::Server,
+                &[],
+                None,
+            )?;
+            sessions.connection_published(target)?;
+            sessions.connected(target)?;
+            Ok(target)
+        })?;
         engine
             .runtime
             .nodes()
@@ -3663,7 +3710,23 @@ mod tests {
             Arc::clone(&applications),
             None,
         )?;
-        let target = sessions.insert_session_for_test(SessionTransportId::new(1), Index::new(7, 1));
+        sessions.install_app_mq(
+            application,
+            queue.clone(),
+            hammer_core::data_plane::NodeId::new(0),
+            &mut runtime,
+        )?;
+        let target = sessions.construct_stream_sessions(
+            SessionTransportId::new(1),
+            Index::new(7, 1),
+            7,
+            application,
+            AppSessionProtocolRole::Server,
+            &[],
+            None,
+        )?;
+        sessions.connection_published(target)?;
+        sessions.connected(target)?;
 
         (0..super::DEFAULT_SESSION_EVENT_CAPACITY).try_for_each(|session_index| {
             sessions.session_evt_q.enqueue_io(SessionEvt::io(
@@ -3673,12 +3736,6 @@ mod tests {
         })?;
         let event = SessionEvt::io(target.pool_index().slot(), SessionEvtType::TxEnq);
         queue.enqueue_io(event)?;
-        sessions.install_app_mq(
-            application,
-            queue,
-            hammer_core::data_plane::NodeId::new(0),
-            &mut runtime,
-        )?;
         assert!(sessions.mark_app_mq_pending(application));
 
         assert_eq!(sessions.poll_app()?, 1);
