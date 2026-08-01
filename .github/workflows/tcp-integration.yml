@@ -779,10 +779,10 @@ jobs:
           }
           before="$TCP_TEST_DIAGNOSTICS/status-before-fault.txt"
           after="$TCP_TEST_DIAGNOSTICS/status-after.txt"
-          # TcpNodeError codes: 14=RackRetransmit 15=TlpProbe 16=RTO retransmit
-          rack_delta=$(( $(counter_total "$after" 14) - $(counter_total "$before" 14) ))
-          tlp_delta=$(( $(counter_total "$after" 15) - $(counter_total "$before" 15) ))
-          rto_delta=$(( $(counter_total "$after" 16) - $(counter_total "$before" 16) ))
+          # TcpNodeError codes: 15=RackRetransmit 16=TlpProbe 17=RTO retransmit
+          rack_delta=$(( $(counter_total "$after" 15) - $(counter_total "$before" 15) ))
+          tlp_delta=$(( $(counter_total "$after" 16) - $(counter_total "$before" 16) ))
+          rto_delta=$(( $(counter_total "$after" 17) - $(counter_total "$before" 17) ))
           echo "rack_delta=$rack_delta tlp_delta=$tlp_delta rto_delta=$rto_delta"
           case "${{ matrix.scenario }}" in
             sender-rack)
