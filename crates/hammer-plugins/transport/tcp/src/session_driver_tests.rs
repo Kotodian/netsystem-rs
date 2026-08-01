@@ -1,5 +1,6 @@
 //! TCP/session lifecycle tests through the adjacent worker state.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::{
@@ -8,18 +9,18 @@ use crate::{
 use hammer_core::data_plane::{BufferFrame, NodeId};
 use hammer_infra::pool::Index;
 use hammer_runtime::app::{
-    AppSessionError, AppSessionProtocol, AppSessionProtocolEntry, AppSessionProtocolRole,
-    AppSessionProtocolSelection, ApplicationId, SessionEvt, SessionEvtType,
+    AppSessionConfig, AppSessionError, AppSessionProtocol, AppSessionProtocolEntry,
+    AppSessionProtocolRole, AppSessionProtocolSelection, ApplicationId, SessionEvt, SessionEvtType,
 };
 use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, RuntimeError};
 
 use hammer_service::data_plane::DropNode;
-use hammer_service::session::SessionId;
 use hammer_service::session::node::{SessionQueueNext, SessionQueueNode, SessionQueueOutput};
 use hammer_service::session::runtime::{
     SessionPacketizedTransport, SessionTransport, SessionWorker, TransportSendFlags,
     dispatch_session_queue_once, dispatch_session_queue_pending,
 };
+use hammer_service::session::{ApplicationMain, SessionId};
 
 use crate::timers::{TcpTimerKind, TcpTimers};
 use crate::{TcpConnection, TcpWorker};
@@ -113,22 +114,38 @@ fn established_connection() -> TcpConnection {
     )
 }
 
-fn worker_state() -> (SessionWorker<Index>, TcpWorker) {
+fn worker_state() -> (SessionWorker<Index>, TcpWorker, Arc<ApplicationMain>) {
     let worker = DataWorkerId::new(0);
-    (
-        hammer_service::session::SessionWorker::new(worker).expect("session worker for test"),
-        TcpWorker::new(worker),
+    let applications = ApplicationMain::with_protocols(
+        1024,
+        [
+            __APP_SESSION_PROTOCOL_TLS_PROTOCOL,
+            __APP_SESSION_PROTOCOL_HTTP_PROTOCOL,
+        ],
+    );
+    let sessions = hammer_service::session::SessionWorker::new(
+        worker,
+        1,
+        AppSessionConfig::default(),
+        1024,
+        Arc::clone(&applications),
+        None,
     )
+    .expect("session worker for test");
+    (sessions, TcpWorker::new(worker), applications)
 }
 
 fn attach_protocol_session(
     sessions: &mut SessionWorker<Index>,
+    applications: &Arc<ApplicationMain>,
     tcp: &mut TcpWorker,
     connection_index: Index,
     protocol: AppSessionProtocolEntry,
 ) -> SessionId {
-    let applications = hammer_service::session::ApplicationMain::with_protocols(1, [protocol]);
     let application = applications.attach().expect("attach test Application");
+    sessions
+        .install_application_mq_for_test(application)
+        .expect("install test Application MQ");
     let policy = hammer_runtime::app::AppSessionPolicy::new(
         hammer_runtime::app::APP_SESSION_POLICY_VERSION,
         [AppSessionProtocolSelection::new(
@@ -141,7 +158,7 @@ fn attach_protocol_session(
         .expect("register protocol Application listener");
     let session_main = std::sync::Arc::new(hammer_service::session::runtime::SessionMain::new(
         1,
-        applications,
+        Arc::clone(applications),
     ));
     sessions.set_listener_main(std::sync::Arc::clone(&session_main));
     let listener = session_main
@@ -197,7 +214,7 @@ fn dispatch_session_queue(
 #[test]
 fn session_queue_dispatch_advances_tcp_timers_without_session_events() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let (mut sessions, mut tcp) = worker_state();
+    let (mut sessions, mut tcp, _) = worker_state();
     let now = Instant::now();
     let resolution = Duration::from_millis(10);
     tcp.timers = TcpTimers::new(now, resolution);
@@ -254,7 +271,7 @@ fn session_queue_dispatch_advances_tcp_timers_without_session_events() {
 #[test]
 fn app_close_is_recorded_before_tcp_disconnect() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let (mut sessions, mut tcp) = worker_state();
+    let (mut sessions, mut tcp, _) = worker_state();
     let connection_index = tcp
         .insert_connection(established_connection())
         .expect("insert TCP connection");
@@ -281,7 +298,7 @@ fn app_close_is_recorded_before_tcp_disconnect() {
 #[test]
 fn tcp_closed_publication_notifies_app_once_before_cleanup() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let (mut sessions, mut tcp) = worker_state();
+    let (mut sessions, mut tcp, _) = worker_state();
     let connection_index = tcp
         .insert_connection(established_connection())
         .expect("insert TCP connection");
@@ -336,12 +353,14 @@ fn tcp_closed_publication_notifies_app_once_before_cleanup() {
 
 #[test]
 fn rollback_discards_unpublished_session_without_close_notification() {
-    let (mut sessions, mut tcp) = worker_state();
+    let (mut sessions, mut tcp, applications) = worker_state();
     let connection_index = tcp
         .insert_connection(established_connection())
         .expect("insert TCP connection");
-    let applications = hammer_service::session::ApplicationMain::new(1);
     let application = applications.attach().expect("attach test Application");
+    sessions
+        .install_application_mq_for_test(application)
+        .expect("install test Application MQ");
     let policy = hammer_runtime::app::AppSessionPolicy::new(
         hammer_runtime::app::APP_SESSION_POLICY_VERSION,
         [],
@@ -352,7 +371,7 @@ fn rollback_discards_unpublished_session_without_close_notification() {
         .expect("register test Application listener");
     let session_main = std::sync::Arc::new(hammer_service::session::runtime::SessionMain::new(
         1,
-        applications,
+        std::sync::Arc::clone(&applications),
     ));
     sessions.set_listener_main(std::sync::Arc::clone(&session_main));
     let listener = session_main
@@ -394,7 +413,7 @@ fn rollback_discards_unpublished_session_without_close_notification() {
 
 #[test]
 fn active_open_commits_session_after_full_connection_publication() {
-    let (mut sessions, mut tcp) = worker_state();
+    let (mut sessions, mut tcp, applications) = worker_state();
     let worker = DataWorkerId::new(0);
     let local: std::net::SocketAddr = "192.0.2.10:443".parse().expect("local address");
     let remote: std::net::SocketAddr = "198.51.100.20:50001".parse().expect("remote address");
@@ -403,8 +422,10 @@ fn active_open_commits_session_after_full_connection_publication() {
     let connection_index = tcp
         .insert_connection(connection)
         .expect("insert active-open TCP connection");
-    let applications = hammer_service::session::ApplicationMain::new(1);
     let application = applications.attach().expect("attach test Application");
+    sessions
+        .install_application_mq_for_test(application)
+        .expect("install test Application MQ");
     let policy = hammer_runtime::app::AppSessionPolicy::new(
         hammer_runtime::app::APP_SESSION_POLICY_VERSION,
         [],
@@ -415,7 +436,7 @@ fn active_open_commits_session_after_full_connection_publication() {
         .expect("register test Application listener");
     let session_main = std::sync::Arc::new(hammer_service::session::runtime::SessionMain::new(
         1,
-        applications,
+        std::sync::Arc::clone(&applications),
     ));
     sessions.set_listener_main(std::sync::Arc::clone(&session_main));
     let listener = session_main
@@ -471,7 +492,7 @@ fn active_open_commits_session_after_full_connection_publication() {
 
 #[test]
 fn passive_open_app_notification_failure_rolls_back_all_owner_state() {
-    let (mut sessions, mut tcp) = worker_state();
+    let (mut sessions, mut tcp, applications) = worker_state();
     let connection = established_connection();
     let local = connection.local().expect("local address");
     let remote = connection.remote();
@@ -480,6 +501,7 @@ fn passive_open_app_notification_failure_rolls_back_all_owner_state() {
         .expect("insert passive-open TCP connection");
     let session_id = attach_protocol_session(
         &mut sessions,
+        &applications,
         &mut tcp,
         connection_index,
         __APP_SESSION_PROTOCOL_TLS_PROTOCOL,
@@ -503,7 +525,7 @@ fn passive_open_app_notification_failure_rolls_back_all_owner_state() {
 
 #[test]
 fn active_open_app_notification_failure_rolls_back_all_owner_state() {
-    let (mut sessions, mut tcp) = worker_state();
+    let (mut sessions, mut tcp, applications) = worker_state();
     let worker = DataWorkerId::new(0);
     let local: std::net::SocketAddr = "192.0.2.10:443".parse().expect("local address");
     let remote: std::net::SocketAddr = "198.51.100.20:50001".parse().expect("remote address");
@@ -514,6 +536,7 @@ fn active_open_app_notification_failure_rolls_back_all_owner_state() {
         .expect("insert active-open TCP connection");
     let session_id = attach_protocol_session(
         &mut sessions,
+        &applications,
         &mut tcp,
         connection_index,
         __APP_SESSION_PROTOCOL_HTTP_PROTOCOL,
@@ -546,7 +569,7 @@ fn active_open_app_notification_failure_rolls_back_all_owner_state() {
 #[test]
 fn app_rx_event_refreshes_window_before_zero_window_is_advertised() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let (_, mut tcp) = worker_state();
+    let (_, mut tcp, _) = worker_state();
     let connection_index = tcp
         .insert_connection(established_connection())
         .expect("insert TCP connection");
@@ -580,7 +603,7 @@ fn app_rx_event_refreshes_window_before_zero_window_is_advertised() {
 #[test]
 fn app_rx_event_refreshes_window_before_rearming_dequeue_notification() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let (_, mut tcp) = worker_state();
+    let (_, mut tcp, _) = worker_state();
     let connection_index = tcp
         .insert_connection(established_connection())
         .expect("insert TCP connection");
@@ -624,7 +647,7 @@ fn app_rx_event_refreshes_window_before_rearming_dequeue_notification() {
 #[test]
 fn fin_with_payload_is_processed_after_rx_enqueue_and_notifies_app_once() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let (mut sessions, mut tcp) = worker_state();
+    let (mut sessions, mut tcp, _) = worker_state();
     let connection_index = tcp
         .insert_connection(established_connection())
         .expect("insert TCP connection");
@@ -713,7 +736,7 @@ fn fin_with_payload_is_processed_after_rx_enqueue_and_notifies_app_once() {
 #[test]
 fn app_half_close_sends_fin_without_closing_session_state() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let (mut sessions, mut tcp) = worker_state();
+    let (mut sessions, mut tcp, _) = worker_state();
     let connection_index = tcp
         .insert_connection(established_connection())
         .expect("insert TCP connection");
@@ -746,7 +769,7 @@ fn app_half_close_sends_fin_without_closing_session_state() {
 #[test]
 fn app_full_close_sends_fin_and_keeps_session_until_transport_cleanup() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let (mut sessions, mut tcp) = worker_state();
+    let (mut sessions, mut tcp, _) = worker_state();
     let connection_index = tcp
         .insert_connection(established_connection())
         .expect("insert TCP connection");
@@ -779,7 +802,7 @@ fn app_full_close_sends_fin_and_keeps_session_until_transport_cleanup() {
 #[test]
 fn tcp_reset_delivers_distinct_reset_event_to_app() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let (mut sessions, mut tcp) = worker_state();
+    let (mut sessions, mut tcp, _) = worker_state();
     let connection_index = tcp
         .insert_connection(established_connection())
         .expect("insert TCP connection");
@@ -827,7 +850,7 @@ fn tcp_reset_delivers_distinct_reset_event_to_app() {
 
 #[test]
 fn tcp_send_params_deschedules_when_peer_window_is_zero() {
-    let (mut sessions, mut tcp) = worker_state();
+    let (mut sessions, mut tcp, _) = worker_state();
     let mut connection = established_connection();
     connection.set_peer_window_for_test(0);
     let connection_index = tcp

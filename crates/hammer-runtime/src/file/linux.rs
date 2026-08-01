@@ -148,17 +148,18 @@ impl Poller {
         duration: Option<Duration>,
     ) -> RuntimeResult<()> {
         let slot = index.slot() as usize;
-        let fd = self
+        let deadline_fd = self
             .deadline_fds
             .get(slot)
             .and_then(Option::as_ref)
+            .map(|fd| fd.as_raw_fd())
             .ok_or(RuntimeError::DeadlineIndexInvalid { index })?;
         match duration {
             Some(duration) => {
-                set_timerfd(fd.as_raw_fd(), Some(duration))?;
+                set_timerfd(deadline_fd, Some(duration))?;
                 if self.deadline_tokens[slot] == CONTROL_TOKEN {
-                    if let Err(error) = self.add_deadline_poll(index, fd.as_raw_fd()) {
-                        if let Err(cleanup_error) = set_timerfd(fd.as_raw_fd(), None) {
+                    if let Err(error) = self.add_deadline_poll(index, deadline_fd) {
+                        if let Err(cleanup_error) = set_timerfd(deadline_fd, None) {
                             tracing::error!(
                                 %cleanup_error,
                                 "failed to disarm File deadline after poll registration failed"
@@ -171,7 +172,7 @@ impl Poller {
             }
             None => {
                 self.cancel_deadline(index)?;
-                set_timerfd(fd.as_raw_fd(), None)?;
+                set_timerfd(deadline_fd, None)?;
                 self.deadline_durations[slot] = None;
             }
         }
@@ -236,15 +237,16 @@ impl Poller {
         let Some(duration) = self.deadline_durations[slot] else {
             return Ok(());
         };
-        let fd = self
+        let deadline_fd = self
             .deadline_fds
             .get(slot)
             .and_then(Option::as_ref)
+            .map(|fd| fd.as_raw_fd())
             .ok_or(RuntimeError::DeadlineIndexInvalid { index })?;
         self.deadline_tokens[slot] = CONTROL_TOKEN;
-        set_timerfd(fd.as_raw_fd(), Some(duration))?;
-        if let Err(error) = self.add_deadline_poll(index, fd.as_raw_fd()) {
-            if let Err(cleanup_error) = set_timerfd(fd.as_raw_fd(), None) {
+        set_timerfd(deadline_fd, Some(duration))?;
+        if let Err(error) = self.add_deadline_poll(index, deadline_fd) {
+            if let Err(cleanup_error) = set_timerfd(deadline_fd, None) {
                 tracing::error!(
                     %cleanup_error,
                     "failed to disarm File deadline after rearm registration failed"

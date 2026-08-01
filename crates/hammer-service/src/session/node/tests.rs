@@ -10,6 +10,7 @@ use hammer_runtime::{
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use super::{SessionQueueNext, SessionQueueNode};
+use crate::session::ApplicationMain;
 use crate::session::error::SessionQueueError;
 use crate::session::runtime::{
     SessionPacketizedTransport, SessionPacketizedTx, SessionTransport, SessionTransportId,
@@ -103,6 +104,18 @@ impl SessionTransport<Index> for RecordingTransport {
         self.events.push("control");
         Ok(())
     }
+}
+
+fn session_worker_for_test() -> SessionWorker<Index> {
+    SessionWorker::new(
+        DataWorkerId::new(0),
+        1,
+        hammer_runtime::app::AppSessionConfig::default(),
+        1024,
+        ApplicationMain::new(1024),
+        None,
+    )
+    .expect("session worker for test")
 }
 
 impl TransportInternalTransport<Index> for RecordingTransport {
@@ -204,7 +217,7 @@ impl SessionPacketizedTransport<Index> for TcpTransport {
 fn session_queue_updates_transport_before_control_and_io_and_without_events() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let worker = DataWorkerId::new(0);
-    let mut sessions = SessionWorker::<Index>::new(worker).expect("session worker for test");
+    let mut sessions = session_worker_for_test();
     let mut transport = RecordingTransport::default();
     let session_id = sessions.insert_session_for_test(RecordingTransport::ID, Index::new(9, 3));
     let app = attach_local_app_session(&mut sessions, session_id);
@@ -212,7 +225,7 @@ fn session_queue_updates_transport_before_control_and_io_and_without_events() {
     assert_eq!(session_rx_fifo.enqueue(b"x"), 1);
     session_rx_fifo.want_deq_notification();
     assert_eq!(session_rx_fifo.dequeue_drop(1), 1);
-    app.tx_evt_q()
+    app.app_rx_mq()
         .enqueue_io(SessionEvt::io(app.session_index(), SessionEvtType::RxDeq))
         .expect("enqueue rx dequeue");
     sessions.schedule_disconnect(session_id);
@@ -240,8 +253,7 @@ fn session_queue_updates_transport_before_control_and_io_and_without_events() {
 #[test]
 fn session_queue_dispatches_new_io_before_old_io() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let mut sessions =
-        SessionWorker::<Index>::new(DataWorkerId::new(0)).expect("session worker for test");
+    let mut sessions = session_worker_for_test();
     let mut transport = TcpTransport::default();
     let old_index = Index::new(1, 1);
     let new_index = Index::new(2, 1);
@@ -293,9 +305,13 @@ fn attach_local_app_session(
 #[test]
 fn session_queue_connects_transport_session_directly_to_application() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let mut sessions = SessionWorker::<Index>::with_app_session_config(
+    let mut sessions = SessionWorker::<Index>::new(
         DataWorkerId::new(0),
+        1,
         hammer_runtime::app::AppSessionConfig::new(8, 16),
+        1024,
+        ApplicationMain::new(1024),
+        None,
     )
     .expect("session worker");
     let mut transport = RecordingTransport::default();
@@ -339,9 +355,13 @@ fn session_queue_connects_transport_session_directly_to_application() {
 
 #[test]
 fn direct_session_notifies_application_after_tx_space_opens() {
-    let mut sessions = SessionWorker::<Index>::with_app_session_config(
+    let mut sessions = SessionWorker::<Index>::new(
         DataWorkerId::new(0),
+        1,
         hammer_runtime::app::AppSessionConfig::new(8, 16),
+        1024,
+        ApplicationMain::new(1024),
+        None,
     )
     .expect("session worker");
     let session_id = sessions.insert_session_for_test(RecordingTransport::ID, Index::new(11, 1));
@@ -520,8 +540,7 @@ fn internal_tx_dispatches_each_session_sharing_a_transport_connection_once() {
         .nodes()
         .register_internal(PayloadCaptureNode::new(Arc::clone(&captured_payloads)));
     let transport_index = Index::new(12, 4);
-    let mut sessions =
-        SessionWorker::<Index>::new(DataWorkerId::new(0)).expect("session worker for test");
+    let mut sessions = session_worker_for_test();
     let mut transport = QuicShapedTransport {
         observed_fifo_lengths: Arc::clone(&observed_fifo_lengths),
     };
@@ -804,8 +823,7 @@ fn session_tx_dispatch_commits_batch_before_graph_visibility() {
         tx_action_calls: 0,
         batches: Vec::new(),
     };
-    let mut sessions =
-        SessionWorker::<Index>::new(DataWorkerId::new(0)).expect("session worker for test");
+    let mut sessions = session_worker_for_test();
     let mut transport = transport;
     let session_id =
         sessions.insert_session_for_test(RecordingPacketizedTransport::ID, Index::new(5, 1));
@@ -857,8 +875,7 @@ fn session_tx_deschedules_without_tx_action_when_send_space_is_zero() {
         tx_action_calls: 0,
         batches: Vec::new(),
     };
-    let mut sessions =
-        SessionWorker::<Index>::new(DataWorkerId::new(0)).expect("session worker for test");
+    let mut sessions = session_worker_for_test();
     let mut transport = transport;
     let session_id =
         sessions.insert_session_for_test(RecordingPacketizedTransport::ID, Index::new(6, 1));
@@ -887,8 +904,7 @@ fn session_tx_deschedules_without_tx_action_when_send_space_is_zero() {
 #[test]
 fn failed_session_packetized_tx_action_keeps_fifo_and_graph_unchanged() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let mut sessions =
-        SessionWorker::<Index>::new(DataWorkerId::new(0)).expect("session worker for test");
+    let mut sessions = session_worker_for_test();
     let mut transport = FailingPacketizedTransport;
     let session_id =
         sessions.insert_session_for_test(FailingPacketizedTransport::ID, Index::new(2, 1));
@@ -918,8 +934,7 @@ fn failed_session_packetized_tx_action_keeps_fifo_and_graph_unchanged() {
 fn transport_deleted_then_queued_app_close_releases_the_session_slot() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let transport_index = Index::new(3, 9);
-    let mut sessions =
-        SessionWorker::<Index>::new(DataWorkerId::new(0)).expect("session worker for test");
+    let mut sessions = session_worker_for_test();
     let mut transport = FailingPacketizedTransport;
     let session_id =
         sessions.insert_session_for_test(FailingPacketizedTransport::ID, transport_index);
@@ -927,7 +942,7 @@ fn transport_deleted_then_queued_app_close_releases_the_session_slot() {
     sessions
         .notify_transport_deleted(session_id, transport_index)
         .expect("delete transport Session");
-    app.tx_evt_q()
+    app.app_rx_mq()
         .enqueue_ctrl(SessionEvt::ctrl(
             app.session_index(),
             0,

@@ -384,7 +384,6 @@ fn start_connect(
         .expect("active-open TCP connection has no Session before binding");
     publish_tcp_connection(sessions, tcp, session_id)?;
     sessions.mark_ready(session_id);
-    sessions.signal_queue();
     Ok(())
 }
 
@@ -1014,7 +1013,16 @@ pub(crate) fn closing_session_for_test() -> (
     let local: std::net::SocketAddr = "192.0.2.10:443".parse().expect("local");
     let remote: std::net::SocketAddr = "198.51.100.20:50001".parse().expect("remote");
     let worker = DataWorkerId::new(0);
-    let mut sessions = SessionWorker::new(worker).expect("session worker for test");
+    let applications = hammer_service::session::ApplicationMain::new(1024);
+    let mut sessions = SessionWorker::new(
+        worker,
+        1,
+        hammer_runtime::app::AppSessionConfig::default(),
+        1024,
+        Arc::clone(&applications),
+        None,
+    )
+    .expect("session worker for test");
     let mut tcp = TcpWorker::new(worker);
     let connection = TcpConnection::established_for_time_wait_test(
         None,
@@ -1026,8 +1034,10 @@ pub(crate) fn closing_session_for_test() -> (
     let connection_index = tcp
         .insert_connection(connection)
         .expect("insert TCP connection");
-    let applications = hammer_service::session::ApplicationMain::new(1);
     let application = applications.attach().expect("attach test Application");
+    sessions
+        .install_application_mq_for_test(application)
+        .expect("install test Application MQ");
     let policy = hammer_runtime::app::AppSessionPolicy::new(
         hammer_runtime::app::APP_SESSION_POLICY_VERSION,
         [],

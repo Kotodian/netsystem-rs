@@ -25,7 +25,7 @@ pub struct AppSession {
     rx_fifo: Arc<Fifo>,
     tx_fifo: Arc<Fifo>,
     evt_q: Arc<SessionMsgQueue>,
-    tx_evt_q: Arc<SessionMsgQueue>,
+    app_rx_mq: Arc<SessionMsgQueue>,
     handle: SessionHandle,
     async_fd: OnceCell<AsyncFd<OwnedFd>>,
 }
@@ -39,8 +39,8 @@ pub enum AppSessionError {
     NotFound { app_worker: usize, session: u64 },
     #[error("app session {session} event queue is full for {event:?}")]
     EventQueueFull { session: u64, event: SessionEvtType },
-    #[error("app session {session} TX event queue is full")]
-    TxEventQueueFull { session: u64 },
+    #[error("app session {session} Application Rx MQ is full")]
+    ApplicationMqFull { session: u64 },
     #[error("app session RX FIFO capacity {capacity} is invalid")]
     RxFifoCapacityInvalid { capacity: usize },
     #[error("app session TX FIFO capacity {capacity} is invalid")]
@@ -68,14 +68,14 @@ impl AppSession {
         rx_fifo: Arc<Fifo>,
         tx_fifo: Arc<Fifo>,
         evt_q: Arc<SessionMsgQueue>,
-        tx_evt_q: Arc<SessionMsgQueue>,
+        app_rx_mq: Arc<SessionMsgQueue>,
         handle: SessionHandle,
     ) -> Self {
         Self {
             rx_fifo,
             tx_fifo,
             evt_q,
-            tx_evt_q,
+            app_rx_mq,
             handle,
             async_fd: OnceCell::new(),
         }
@@ -108,11 +108,10 @@ impl AppSession {
         &self.evt_q
     }
 
-    /// Accessor for the transport-side tx event queue consumer.
-    /// Used by the session-layer AppWorker to drain tx completion events.
+    /// Application-to-session message queue selected for this Data Worker.
     #[inline]
-    pub fn tx_evt_q(&self) -> &Arc<SessionMsgQueue> {
-        &self.tx_evt_q
+    pub fn app_rx_mq(&self) -> &Arc<SessionMsgQueue> {
+        &self.app_rx_mq
     }
 
     /// App-side convenience: enqueue bytes to send (app → transport). Returns
@@ -295,9 +294,9 @@ impl AppSession {
             self.handle.worker_index(),
             evt_type,
         );
-        self.tx_evt_q
+        self.app_rx_mq
             .enqueue_ctrl(evt)
-            .map_err(|_| AppSessionError::TxEventQueueFull {
+            .map_err(|_| AppSessionError::ApplicationMqFull {
                 session: self.handle.raw(),
             })
     }
@@ -325,7 +324,7 @@ impl AppSession {
             return Ok(());
         }
         if self
-            .tx_evt_q
+            .app_rx_mq
             .enqueue_io(SessionEvt::io(
                 self.handle.session_index(),
                 SessionEvtType::TxEnq,
@@ -333,7 +332,7 @@ impl AppSession {
             .is_err()
         {
             self.tx_fifo.unset_event();
-            return Err(AppSessionError::TxEventQueueFull {
+            return Err(AppSessionError::ApplicationMqFull {
                 session: self.handle.raw(),
             });
         }
@@ -349,11 +348,11 @@ impl AppSession {
         }
         let event = SessionEvt::io(self.handle.session_index(), SessionEvtType::RxDeq);
         loop {
-            match self.tx_evt_q.enqueue_io(event) {
+            match self.app_rx_mq.enqueue_io(event) {
                 Ok(()) => return,
                 Err(crate::app::SessionMsgQueueError::Full(_)) => std::thread::yield_now(),
                 Err(error) => {
-                    panic!("valid app session TX event queue rejected RX dequeue: {error:?}")
+                    panic!("valid Application Rx MQ rejected RX dequeue: {error:?}")
                 }
             }
         }
@@ -466,14 +465,14 @@ impl AppSession {
     ///
     /// # Safety
     /// The session segment and all offsets must refer to initialized objects
-    /// with the layouts expected by `Fifo` and `SessionMsgQueue`. The worker
-    /// queue must refer to the Application's queue for this Data Worker.
+    /// with the layouts expected by `Fifo` and `SessionMsgQueue`. The
+    /// Application Rx MQ must belong to this Application's Data Worker.
     pub unsafe fn from_segment(
         handle: SessionHandle,
         session_segment: &Segment,
         offsets: &SessionOffsets,
         evt_q_read: Option<RawFd>,
-        worker_queue: Arc<SessionMsgQueue>,
+        app_rx_mq: Arc<SessionMsgQueue>,
     ) -> Self {
         let evt_q = Arc::new(unsafe {
             SessionMsgQueue::from_shared(
@@ -491,7 +490,7 @@ impl AppSession {
                 Fifo::from_shared(session_segment.clone(), offsets.tx_fifo_off)
             }),
             evt_q,
-            tx_evt_q: worker_queue,
+            app_rx_mq,
             handle,
             async_fd: OnceCell::new(),
         }
@@ -504,7 +503,7 @@ impl AppSession {
         seg: Segment,
         config: AppSessionConfig,
         handle: SessionHandle,
-        tx_evt_q: Arc<SessionMsgQueue>,
+        app_rx_mq: Arc<SessionMsgQueue>,
     ) -> Result<Self, AppSessionError> {
         let mut rx_fifo = Fifo::new(seg.clone(), config.fifo_capacity).map_err(|_| {
             AppSessionError::RxFifoCapacityInvalid {
@@ -542,7 +541,7 @@ impl AppSession {
             rx_fifo,
             tx_fifo,
             evt_q,
-            tx_evt_q,
+            app_rx_mq,
             handle,
             async_fd: OnceCell::new(),
         })
@@ -596,23 +595,23 @@ mod tests {
 
     fn new_session(config: AppSessionConfig, session_index: u32) -> AppSession {
         let handle = SessionHandle::new(session_index, 0);
-        let tx_evt_q: Arc<SessionMsgQueue> =
-            Arc::new(SessionMsgQueue::with_cfg(64, 64).expect("tx_evt_q"));
-        AppSession::new_in_segment(Segment::default(), config, handle, tx_evt_q).expect("session")
+        let app_rx_mq: Arc<SessionMsgQueue> =
+            Arc::new(SessionMsgQueue::with_cfg(64, 64).expect("Application Rx MQ"));
+        AppSession::new_in_segment(Segment::default(), config, handle, app_rx_mq).expect("session")
     }
 
     #[test]
-    fn app_session_send_bytes_clears_tx_event_when_tx_evt_q_full() {
-        let tx_evt_q: Arc<SessionMsgQueue> =
-            Arc::new(SessionMsgQueue::with_cfg(2, 1).expect("tx_evt_q"));
-        tx_evt_q
+    fn app_session_send_bytes_clears_event_when_app_rx_mq_full() {
+        let app_rx_mq: Arc<SessionMsgQueue> =
+            Arc::new(SessionMsgQueue::with_cfg(2, 1).expect("Application Rx MQ"));
+        app_rx_mq
             .enqueue_io(SessionEvt::io(99, SessionEvtType::TxDeq))
             .expect("fill io ring");
         let session = AppSession::new_in_segment(
             Segment::default(),
             AppSessionConfig::new(64, 4),
             SessionHandle::new(1, 0),
-            Arc::clone(&tx_evt_q),
+            Arc::clone(&app_rx_mq),
         )
         .expect("session");
 
@@ -621,15 +620,15 @@ mod tests {
             .expect_err("full TX event queue must reject notification");
         assert!(matches!(
             error,
-            AppSessionError::TxEventQueueFull { session }
+            AppSessionError::ApplicationMqFull { session }
                 if session == SessionHandle::new(1, 0).raw()
         ));
         assert!(!session.tx_fifo().has_event());
 
-        assert!(tx_evt_q.dequeue().is_some());
+        assert!(app_rx_mq.dequeue().is_some());
         assert_eq!(session.send_bytes(b"y").expect("retry after drain"), 1);
         assert!(session.tx_fifo().has_event());
-        let evt = tx_evt_q.dequeue().expect("tx enqueue after retry");
+        let evt = app_rx_mq.dequeue().expect("tx enqueue after retry");
         assert_eq!(evt.evt_type, SessionEvtType::TxEnq);
         assert_eq!(evt.session_index(), 1);
     }
@@ -656,16 +655,16 @@ mod tests {
         assert_eq!(session.enqueue_rx(b"abcdef").expect("enqueue rx"), 6);
 
         assert_eq!(session.consume_rx(1), 1);
-        assert!(session.tx_evt_q().dequeue().is_none());
+        assert!(session.app_rx_mq().dequeue().is_none());
 
         session.rx_fifo().want_deq_notification();
         assert_eq!(session.consume_rx(2), 2);
-        let event = session.tx_evt_q().dequeue().expect("rx dequeue event");
+        let event = session.app_rx_mq().dequeue().expect("rx dequeue event");
         assert_eq!(event.evt_type, SessionEvtType::RxDeq);
         assert_eq!(event.session_index(), 7);
 
         assert_eq!(session.consume_rx(1), 1);
-        assert!(session.tx_evt_q().dequeue().is_none());
+        assert!(session.app_rx_mq().dequeue().is_none());
     }
 
     #[test]
@@ -753,7 +752,7 @@ mod tests {
         let session = new_session(AppSessionConfig::new(64, 4), 3);
         session.half_close().expect("half close");
 
-        let event = session.tx_evt_q().dequeue().expect("half close event");
+        let event = session.app_rx_mq().dequeue().expect("half close event");
         assert_eq!(event.evt_type, SessionEvtType::HalfClose);
         assert_eq!(event.session_index(), 3);
         assert_eq!(event.worker_index(), 0);
@@ -764,7 +763,7 @@ mod tests {
         let session = new_session(AppSessionConfig::new(64, 4), 3);
         session.close().expect("close");
 
-        let event = session.tx_evt_q().dequeue().expect("close event");
+        let event = session.app_rx_mq().dequeue().expect("close event");
         assert_eq!(event.evt_type, SessionEvtType::Close);
         assert_eq!(event.session_index(), 3);
         assert_eq!(event.worker_index(), 0);
@@ -773,13 +772,13 @@ mod tests {
     #[test]
     fn app_session_disconnected_event_carries_session_handle() {
         let handle = SessionHandle::new(11, 7);
-        let tx_evt_q: Arc<SessionMsgQueue> =
-            Arc::new(SessionMsgQueue::with_cfg(64, 64).expect("tx_evt_q"));
+        let app_rx_mq: Arc<SessionMsgQueue> =
+            Arc::new(SessionMsgQueue::with_cfg(64, 64).expect("Application Rx MQ"));
         let session = AppSession::new_in_segment(
             Segment::default(),
             AppSessionConfig::new(64, 4),
             handle,
-            tx_evt_q,
+            app_rx_mq,
         )
         .expect("session");
         session
@@ -841,13 +840,13 @@ mod tests {
 
     #[test]
     fn app_session_rejects_invalid_fifo_capacity() {
-        let tx_evt_q: Arc<SessionMsgQueue> =
-            Arc::new(SessionMsgQueue::with_cfg(64, 64).expect("tx_evt_q"));
+        let app_rx_mq: Arc<SessionMsgQueue> =
+            Arc::new(SessionMsgQueue::with_cfg(64, 64).expect("Application Rx MQ"));
         let error = AppSession::new_in_segment(
             Segment::default(),
             AppSessionConfig::new(3, 4),
             SessionHandle::new(0, 0),
-            tx_evt_q,
+            app_rx_mq,
         )
         .expect_err("invalid FIFO capacity must be rejected");
         assert!(matches!(

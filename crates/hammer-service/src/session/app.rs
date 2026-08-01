@@ -6,9 +6,8 @@ use hammer_infra::align::align_up;
 use hammer_infra::fifo::Fifo;
 use hammer_infra::segment::Segment;
 use hammer_runtime::app::{
-    AppSession, AppSessionConfig, AppSessionError, ApplicationId, SessionEventQueue, SessionEvt,
-    SessionEvtType, SessionHandle, SessionMqRing, SessionMsgQueue, SessionMsgQueueError,
-    SessionOffsets,
+    AppSession, AppSessionConfig, AppSessionError, ApplicationId, SessionEventQueue,
+    SessionEvtType, SessionHandle, SessionMsgQueue, SessionMsgQueueError, SessionOffsets,
 };
 use hammer_runtime::attach::{AppSessionPublication, AppSessionPublisher};
 use hammer_runtime::{RuntimeError, RuntimeResult};
@@ -19,10 +18,6 @@ use crate::session::SessionId;
 pub(crate) enum AppWorkerError {
     #[error("session message queue configuration rejected: {error:?}")]
     SessionEventQueue { error: SessionMsgQueueError },
-    #[error("session TX event queue layout exceeds addressable memory")]
-    TxEventQueueLayoutOverflow,
-    #[error("session TX event queue segment capacity exhausted")]
-    TxEventQueueSegmentExhausted,
     #[error("failed to create shared listener session segment")]
     SessionSegment {
         #[source]
@@ -46,8 +41,6 @@ pub struct AppWorker {
     session_slots: Vec<Option<SessionSlot>>,
     /// Cold accept/detach-only metadata; never read on the packet path.
     attach_slots: Vec<AttachSlot>,
-    tx_evt_q: Arc<SessionMsgQueue>,
-    blocked_tx_event: Option<(SessionMqRing, SessionEvt)>,
     worker_index: usize,
     segments_by_owner: HashMap<u64, SegmentManager>,
     publisher: Option<AppSessionPublisher>,
@@ -101,7 +94,7 @@ impl SegmentManager {
         &mut self,
         handle: SessionHandle,
         config: AppSessionConfig,
-        tx_evt_q: Arc<SessionMsgQueue>,
+        app_rx_mq: Arc<SessionMsgQueue>,
     ) -> RuntimeResult<CreatedAppSession> {
         let mut index = 0;
         while index < self.retired.len() {
@@ -208,7 +201,7 @@ impl SegmentManager {
                 Arc::new(rx_fifo),
                 Arc::new(tx_fifo),
                 Arc::new(event_queue),
-                tx_evt_q,
+                app_rx_mq,
                 handle,
             )))
         })();
@@ -283,37 +276,16 @@ impl AppWorker {
     #[inline]
     pub fn new(
         session_capacity: usize,
-        tx_evt_q: Arc<SessionMsgQueue>,
         worker_index: usize,
+        publisher: Option<AppSessionPublisher>,
     ) -> Self {
         Self {
             session_slots: vec![None; session_capacity],
             attach_slots: vec![AttachSlot::default(); session_capacity],
-            tx_evt_q,
-            blocked_tx_event: None,
             worker_index,
             segments_by_owner: HashMap::new(),
-            publisher: None,
+            publisher,
         }
-    }
-
-    pub(crate) fn with_attach(
-        session_capacity: usize,
-        tx_evt_q: Arc<SessionMsgQueue>,
-        worker_index: usize,
-        publisher: AppSessionPublisher,
-    ) -> Self {
-        let mut worker = Self::new(session_capacity, tx_evt_q, worker_index);
-        worker.publisher = Some(publisher);
-        worker
-    }
-
-    /// Shared runtime-side TX event queue.  Every app session created via
-    /// `attach_session_local_with_runtime_tx` shares this same queue, so the
-    /// dataplane side can drain all sessions' TX events from one ring.
-    #[inline]
-    pub fn tx_evt_q(&self) -> &Arc<SessionMsgQueue> {
-        &self.tx_evt_q
     }
 
     pub(crate) fn attach_session(&mut self, session_id: SessionId, app_session: Arc<AppSession>) {
@@ -412,189 +384,27 @@ impl AppWorker {
         self.notify_evt(&session);
         Ok(())
     }
-
-    pub(crate) fn drain_tx_events_to(
-        &mut self,
-        mut dispatch_event: impl FnMut(SessionMqRing, SessionEvt) -> Result<(), SessionMsgQueueError>,
-    ) -> Result<usize, SessionMsgQueueError> {
-        let mut dispatched = 0usize;
-        let worker_index = self.worker_index as u32;
-        if let Some((ring, event)) = self.blocked_tx_event.take() {
-            match dispatch_event(ring, event) {
-                Ok(()) => dispatched += 1,
-                Err(error) => {
-                    self.blocked_tx_event = Some((ring, event));
-                    return Err(error);
-                }
-            }
-        }
-        self.tx_evt_q.drain();
-        let snapshot = self.tx_evt_q.len();
-        let queued = (0..snapshot)
-            .map_while(|_| self.tx_evt_q.dequeue_with_ring())
-            .try_fold(0usize, |dispatched, (ring, event)| {
-                if matches!(
-                    event.evt_type,
-                    SessionEvtType::Close | SessionEvtType::HalfClose
-                ) && event.worker_index() != worker_index
-                {
-                    return Ok(dispatched);
-                }
-                if let Err(error) = dispatch_event(ring, event) {
-                    self.blocked_tx_event = Some((ring, event));
-                    return Err(error);
-                }
-                Ok(dispatched + 1)
-            })?;
-        Ok(dispatched + queued)
-    }
-}
-
-impl AppWorker {
-    #[inline]
-    pub fn default_local() -> RuntimeResult<Self> {
-        let tx_evt_q: Arc<SessionMsgQueue> = Arc::new(
-            SessionMsgQueue::with_cfg(2048, 1024)
-                .map_err(|error| AppWorkerError::SessionEventQueue { error })?,
-        );
-        Ok(Self::new(1024, tx_evt_q, 0))
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use hammer_infra::pool::Index as PoolIndex;
-    use hammer_runtime::app::{AppSessionConfig, SessionEvt, SessionEvtType, SessionHandle};
+    use hammer_runtime::app::{AppSessionConfig, SessionHandle, SessionMsgQueue};
 
-    fn event_queue_error(error: SessionMsgQueueError) -> RuntimeError {
-        AppWorkerError::SessionEventQueue { error }.into()
-    }
-
-    #[test]
-    fn drain_forwards_events_without_a_root_session_lookup() -> Result<(), RuntimeError> {
-        let mut app = AppWorker::default_local()?;
-        app.tx_evt_q()
-            .enqueue_ctrl(SessionEvt::ctrl(3, 0, SessionEvtType::Close))
-            .map_err(event_queue_error)?;
-        app.tx_evt_q()
-            .enqueue_io(SessionEvt::io(3, SessionEvtType::TxEnq))
-            .map_err(event_queue_error)?;
-
-        let mut dispatched = Vec::new();
-        let dispatched_count = app
-            .drain_tx_events_to(|_, evt| {
-                dispatched.push((evt.session_index(), evt.evt_type));
-                Ok(())
-            })
-            .map_err(event_queue_error)?;
-
-        assert_eq!(dispatched_count, 2);
-        assert_eq!(
-            dispatched,
-            vec![(3, SessionEvtType::Close), (3, SessionEvtType::TxEnq)]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn drain_drops_close_when_worker_index_mismatches() -> Result<(), RuntimeError> {
-        let mut app = AppWorker::default_local()?;
-        let session_id = SessionId::from(PoolIndex::new(5, 1));
-        let session = Arc::new(AppSession::new_in_segment(
-            Segment::default(),
-            AppSessionConfig::new(64, 4),
-            SessionHandle::new(5, 0),
-            app.tx_evt_q().clone(),
-        )?);
-        app.attach_session(session_id, session);
-        app.tx_evt_q()
-            .enqueue_ctrl(SessionEvt::ctrl(5, 9, SessionEvtType::Close))
-            .map_err(event_queue_error)?;
-
-        let mut dispatched = Vec::new();
-        let dispatched_count = app
-            .drain_tx_events_to(|_, evt| {
-                dispatched.push((evt.session_index(), evt.evt_type));
-                Ok(())
-            })
-            .map_err(event_queue_error)?;
-
-        assert_eq!(dispatched_count, 0);
-        assert!(dispatched.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn drain_retains_failed_tx_event_for_retry() -> Result<(), RuntimeError> {
-        let mut app = AppWorker::default_local()?;
-        let blocked = SessionEvt::io(5, SessionEvtType::TxEnq);
-        let following = SessionEvt::io(6, SessionEvtType::TxEnq);
-        app.tx_evt_q()
-            .enqueue_io(blocked)
-            .map_err(event_queue_error)?;
-        app.tx_evt_q()
-            .enqueue_io(following)
-            .map_err(event_queue_error)?;
-
-        let mut dispatched = Vec::new();
-        let error = match app.drain_tx_events_to(|_, evt| {
-            if evt == blocked {
-                return Err(SessionMsgQueueError::Full(evt));
-            }
-            dispatched.push(evt.session_index());
-            Ok(())
-        }) {
-            Ok(_) => panic!("full destination must retain blocked event"),
-            Err(error) => error,
-        };
-
-        assert_eq!(error, SessionMsgQueueError::Full(blocked));
-        assert_eq!(app.blocked_tx_event, Some((SessionMqRing::Io, blocked)));
-        assert!(dispatched.is_empty());
-        assert_eq!(
-            app.tx_evt_q().dequeue(),
-            Some(following),
-            "events after the blocked event stay in the source queue"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn drain_dispatches_close_with_matching_session_handle() -> Result<(), RuntimeError> {
-        let mut app = AppWorker::default_local()?;
-        let session_id = SessionId::from(PoolIndex::new(5, 1));
-        let session = Arc::new(AppSession::new_in_segment(
-            Segment::default(),
-            AppSessionConfig::new(64, 4),
-            SessionHandle::new(5, 0),
-            app.tx_evt_q().clone(),
-        )?);
-        app.attach_session(session_id, session);
-        app.tx_evt_q()
-            .enqueue_ctrl(SessionEvt::ctrl(5, 0, SessionEvtType::Close))
-            .map_err(event_queue_error)?;
-
-        let mut dispatched = Vec::new();
-        app.drain_tx_events_to(|_, evt| {
-            dispatched.push((evt.session_index(), evt.evt_type));
-            Ok(())
-        })
-        .map_err(event_queue_error)?;
-
-        assert_eq!(dispatched, vec![(5, SessionEvtType::Close)]);
-        Ok(())
+    fn app_rx_mq() -> Arc<SessionMsgQueue> {
+        Arc::new(SessionMsgQueue::with_cfg(64, 64).expect("Application Rx MQ"))
     }
 
     #[test]
     fn listener_sessions_share_one_segment_manager() {
-        let mut app = AppWorker::default_local().expect("app worker");
+        let mut app = AppWorker::new(1024, 0, None);
         let config = AppSessionConfig::new(64, 4);
         (0..2).for_each(|slot| {
             let session_id = SessionId::from(PoolIndex::new(slot, 1));
             let handle = SessionHandle::new(slot, 0);
             let session = app
-                .create_app_session(7, None, handle, config, app.tx_evt_q().clone())
+                .create_app_session(7, None, handle, config, app_rx_mq())
                 .expect("listener session");
             app.attach_session(session_id, session);
         });
@@ -605,13 +415,13 @@ mod tests {
 
     #[test]
     fn listeners_have_independent_segment_managers() {
-        let mut app = AppWorker::default_local().expect("app worker");
+        let mut app = AppWorker::new(1024, 0, None);
         let config = AppSessionConfig::new(64, 4);
         [(0, 7), (1, 9)].into_iter().for_each(|(slot, listener)| {
             let session_id = SessionId::from(PoolIndex::new(slot, 1));
             let handle = SessionHandle::new(slot, 0);
             let session = app
-                .create_app_session(listener, None, handle, config, app.tx_evt_q().clone())
+                .create_app_session(listener, None, handle, config, app_rx_mq())
                 .expect("listener session");
             app.attach_session(session_id, session);
         });
@@ -623,12 +433,12 @@ mod tests {
 
     #[test]
     fn detached_session_storage_waits_for_last_session_reference() {
-        let mut app = AppWorker::default_local().expect("app worker");
+        let mut app = AppWorker::new(1024, 0, None);
         let config = AppSessionConfig::new(64, 4);
         let session_id = SessionId::from(PoolIndex::new(0, 1));
         let handle = SessionHandle::new(0, 0);
         let session = app
-            .create_app_session(7, None, handle, config, app.tx_evt_q().clone())
+            .create_app_session(7, None, handle, config, app_rx_mq())
             .expect("listener session");
         app.attach_session(session_id, Arc::clone(&session));
 
@@ -638,7 +448,7 @@ mod tests {
         drop(session);
 
         let replacement = app
-            .create_app_session(7, None, handle, config, app.tx_evt_q().clone())
+            .create_app_session(7, None, handle, config, app_rx_mq())
             .expect("replacement session");
         assert!(app.segments_by_owner[&7].retired.is_empty());
         assert_eq!(app.segments_by_owner[&7].segments.len(), 1);
@@ -647,16 +457,16 @@ mod tests {
 
     #[test]
     fn listener_manager_keeps_segment_zero_and_releases_empty_growth_segment() {
-        let app = AppWorker::default_local().expect("app worker");
+        let app = AppWorker::new(1024, 0, None);
         let mut manager = SegmentManager::new(None);
         let config = AppSessionConfig::new(524_288, 4);
         let segment_zero_handle = SessionHandle::new(0, 0);
         let growth_segment_handle = SessionHandle::new(1, 0);
         let segment_zero_session = manager
-            .create_session(segment_zero_handle, config, app.tx_evt_q().clone())
+            .create_session(segment_zero_handle, config, app_rx_mq())
             .expect("session in segment zero");
         let growth_segment_session = manager
-            .create_session(growth_segment_handle, config, app.tx_evt_q().clone())
+            .create_session(growth_segment_handle, config, app_rx_mq())
             .expect("session in growth segment");
 
         assert_eq!(manager.segments.len(), 2);
@@ -677,7 +487,7 @@ impl AppWorker {
         application: Option<ApplicationId>,
         handle: SessionHandle,
         config: AppSessionConfig,
-        tx_evt_q: Arc<SessionMsgQueue>,
+        app_rx_mq: Arc<SessionMsgQueue>,
     ) -> RuntimeResult<Arc<AppSession>> {
         let shared_name_prefix = self
             .publisher
@@ -687,7 +497,7 @@ impl AppWorker {
             .segments_by_owner
             .entry(allocation_owner)
             .or_insert_with(|| SegmentManager::new(shared_name_prefix))
-            .create_session(handle, config, tx_evt_q)?;
+            .create_session(handle, config, app_rx_mq)?;
         let slot = handle.session_index() as usize;
         if self.attach_slots.len() <= slot {
             self.attach_slots.resize_with(slot + 1, AttachSlot::default);
