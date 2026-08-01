@@ -39,7 +39,7 @@ use crate::session::state::SessionState;
 use crate::session::{AppWorker, SessionId, SessionQueueNext};
 
 const DEFAULT_SESSION_POOL_CAPACITY: usize = 1024;
-const DEFAULT_SESSION_TX_EVENT_CAPACITY: usize = 2048;
+const DEFAULT_SESSION_EVENT_CAPACITY: usize = 2048;
 const DEFAULT_TX_DISPATCH_BUDGET: usize = 64;
 const PROTOCOL_ADVANCE_BUDGET: usize = 64;
 const SESSION_WORKER_INTERRUPT_DEADLINE: Duration = Duration::from_millis(1);
@@ -195,7 +195,7 @@ pub struct SessionWorker<Index> {
     worker_count: usize,
     entries: Pool<SessionEntry<Index>>,
     listener_main: Option<Arc<SessionMain>>,
-    applications: Option<Arc<ApplicationMain>>,
+    applications: Arc<ApplicationMain>,
     app: AppWorker,
     session_evt_q: Arc<SessionMsgQueue>,
     app_session_config: AppSessionConfig,
@@ -203,7 +203,6 @@ pub struct SessionWorker<Index> {
     pub(crate) control_events: LinkedList<SessionEvt>,
     pub(crate) new_io_events: LinkedList<SessionEvt>,
     pub(crate) old_io_events: LinkedList<SessionEvt>,
-    readiness_file: Option<PoolIndex>,
     app_rx_mqs: Vec<Option<Box<AppRxMqEntry>>>,
     app_rx_mq_pending: VecDeque<ApplicationId>,
     state: SessionWorkerState,
@@ -495,9 +494,14 @@ impl SessionMain {
                         .expect("scheduled Application detach targets an existing Session worker")
                         .with_mut(|sessions| {
                             sessions.application_detached(application);
-                            sessions.signal_queue();
+                            Engine::with_current(|engine| {
+                                sessions.wake_session_queue(&engine.runtime)
+                            })
+                            .ok_or(RuntimeError::WorkerControlRequiresMainEngine)??;
+                            Ok::<(), RuntimeError>(())
                         })
-                        .expect("scheduled Application detach runs on its Session worker");
+                        .expect("scheduled Application detach runs on its Session worker")
+                        .expect("Application detach operation failed on its Session worker");
                 }) {
                     Ok(()) => break,
                     Err(RuntimeError::WorkerControlQueueFull { .. }) => {
@@ -651,8 +655,7 @@ pub fn install_session_worker(
             .runtime
             .nodes()
             .set_node_state(app_session_input, NodeState::Interrupt)?;
-        worker.install_state_deadline(&engine.runtime, session_queue)?;
-        worker.install_queue_readiness(engine, app_session_input)
+        worker.install_state_deadline(&engine.runtime, session_queue)
     })();
     if let Err(error) = setup {
         cleanup_session_worker_install(&mut worker, engine);
@@ -688,9 +691,6 @@ pub fn install_session_worker(
 }
 
 fn cleanup_session_worker_install(worker: &mut SessionWorker<PoolIndex>, engine: &mut Engine) {
-    if let Err(error) = worker.remove_queue_readiness(engine) {
-        tracing::error!(%error, "failed to remove Session Worker readiness during install rollback");
-    }
     if let Err(error) = worker.remove_state_deadline(&engine.runtime) {
         tracing::error!(%error, "failed to remove Session Worker deadline during install rollback");
     }
@@ -865,19 +865,16 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         Ok(())
     }
 
+    pub(crate) fn wake_session_queue(&self, runtime: &DataPlaneRuntime) -> RuntimeResult<()> {
+        if let Some(session_queue) = self.session_queue {
+            let _ = runtime.set_node_interrupt_pending(session_queue)?;
+        }
+        Ok(())
+    }
+
     #[inline]
     pub fn app_session_config(&self) -> AppSessionConfig {
         self.app_session_config
-    }
-
-    #[inline]
-    pub fn queue_signal_descriptor(&self) -> Option<std::os::fd::RawFd> {
-        self.app.tx_evt_q().read_fd()
-    }
-
-    #[inline]
-    pub fn signal_queue(&self) {
-        self.app.tx_evt_q().fire();
     }
 
     #[cfg(test)]
@@ -890,50 +887,6 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         self.entries
             .get(session_id.pool_index())
             .map(|entry| (&entry.rx_fifo, &entry.tx_fifo))
-    }
-
-    /// Registers the external app message-queue signal with the worker FileMain.
-    ///
-    /// The queue retains its original endpoint. FileMain owns a duplicated
-    /// descriptor and must remove it before this worker is replaced.
-    pub fn install_queue_readiness(
-        &mut self,
-        engine: &mut Engine,
-        app_session_input: hammer_core::data_plane::NodeId,
-    ) -> RuntimeResult<()> {
-        self.remove_queue_readiness(engine)?;
-        let Some(signal_read_fd) = self.app.tx_evt_q().read_fd() else {
-            return Ok(());
-        };
-        // SAFETY: the queue retains its original read endpoint while FileMain
-        // owns this independent duplicated descriptor.
-        let signal_read = unsafe { BorrowedFd::borrow_raw(signal_read_fd) }
-            .try_clone_to_owned()
-            .map_err(|source| AttachError::SessionSignalDuplicate { source })?;
-        engine.data_worker_id()?;
-        let file = engine.file_main_mut().add(File::new(
-            signal_read,
-            "app-to-session queue signal".to_owned(),
-            u64::from(app_session_input.slot()),
-            FileFunctions {
-                read: Some(schedule_app_session_input),
-                ..FileFunctions::default()
-            },
-        ))?;
-        self.readiness_file = Some(file);
-        Ok(())
-    }
-
-    /// Cancels session queue readiness before the queue itself is released.
-    pub fn remove_queue_readiness(&mut self, engine: &mut Engine) -> RuntimeResult<()> {
-        let Some(file) = self.readiness_file else {
-            return Ok(());
-        };
-        if !engine.file_main_mut().delete(file)? {
-            return Err(RuntimeError::FileIndexInvalid { index: file });
-        }
-        self.readiness_file = None;
-        Ok(())
     }
 
     /// Registers one per-Application MQ with this Data Worker's FileMain.
@@ -1185,11 +1138,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         connection: SessionConnectionId,
     ) -> RuntimeResult<SessionId> {
         let application_connection = ApplicationConnectionId::from_raw(connection.raw());
-        let applications = self
-            .applications
-            .as_ref()
-            .cloned()
-            .ok_or(SessionError::ApplicationMainMissingForConnection { connection })?;
+        let applications = Arc::clone(&self.applications);
         let session_id = applications
             .with_connection(application_connection, |policy| {
                 self.construct_stream_sessions(
@@ -1239,22 +1188,19 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         let application_session_id = *session_ids
             .last()
             .expect("validated App Session policy creates one external Session");
-        let tx_evt_q = match self.applications {
-            Some(_) => match self.app_mq_worker(application) {
-                Some(queue) => queue,
-                None => {
-                    self.rollback_stream_sessions(&session_ids, None);
-                    return Err(SessionQueueError::ApplicationMqMissing { application }.into());
-                }
-            },
-            None => Arc::clone(self.app.tx_evt_q()),
+        let app_rx_mq = match self.app_mq_worker(application) {
+            Some(queue) => queue,
+            None => {
+                self.rollback_stream_sessions(&session_ids, None);
+                return Err(SessionQueueError::ApplicationMqMissing { application }.into());
+            }
         };
         let application_session = match self.app.create_app_session(
             allocation_owner,
             Some(application),
             self.session_handle(application_session_id),
             self.app_session_config,
-            tx_evt_q,
+            app_rx_mq,
         ) {
             Ok(session) => session,
             Err(error) => {
@@ -1704,18 +1650,6 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     }
 
     pub fn poll_app(&mut self) -> RuntimeResult<usize> {
-        let handled = self
-            .app
-            .drain_tx_events_to(|ring, event| {
-                enqueue_app_event(
-                    &mut self.control_events,
-                    &mut self.new_io_events,
-                    ring,
-                    event,
-                );
-                Ok(())
-            })
-            .map_err(|error| AppWorkerError::SessionEventQueue { error })?;
         let mut control_events = core::mem::take(&mut self.control_events);
         let mut new_io_events = core::mem::take(&mut self.new_io_events);
         let app_mq_handled = self.drain_app_mq_events_to(|ring, event| {
@@ -1723,7 +1657,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         });
         self.control_events = control_events;
         self.new_io_events = new_io_events;
-        Ok(handled.saturating_add(app_mq_handled))
+        Ok(app_mq_handled)
     }
 
     pub(crate) fn poll_session_events(&mut self) -> RuntimeResult<usize> {
@@ -2303,143 +2237,21 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
 }
 
 impl<Index: Copy + Eq> SessionWorker<Index> {
-    pub fn new(worker: DataWorkerId) -> RuntimeResult<Self> {
-        Self::with_app_session_config(worker, AppSessionConfig::default())
-    }
-
-    /// Associates this Data Worker with the Session Main that owns listener
-    /// routes before a transport may deliver accepted streams to it.
-    pub fn set_listener_main(&mut self, main: Arc<SessionMain>) {
-        self.listener_main = Some(main);
-    }
-
-    pub fn with_app_session_config(
-        worker: DataWorkerId,
-        app_session_config: AppSessionConfig,
-    ) -> RuntimeResult<Self> {
-        Self::with_worker_count_and_app_session_config(
-            worker,
-            worker.slot() + 1,
-            app_session_config,
-        )
-    }
-
-    pub(crate) fn with_worker_count_and_app_session_config(
-        worker: DataWorkerId,
-        worker_count: usize,
-        app_session_config: AppSessionConfig,
-    ) -> RuntimeResult<Self> {
-        Self::with_worker_count_app_session_config_and_pool_capacity(
-            worker,
-            worker_count,
-            app_session_config,
-            DEFAULT_SESSION_POOL_CAPACITY,
-        )
-    }
-
-    pub(crate) fn with_worker_count_app_session_config_and_pool_capacity(
-        worker: DataWorkerId,
-        worker_count: usize,
-        app_session_config: AppSessionConfig,
-        pool_capacity: usize,
-    ) -> RuntimeResult<Self> {
-        let cap = DEFAULT_SESSION_TX_EVENT_CAPACITY.next_power_of_two().max(2) as u32;
-        let layout = SessionMsgQueue::layout_bytes(cap, cap.max(2))
-            .map_err(|error| AppWorkerError::SessionEventQueue { error })?;
-        let segment = Segment::local(
-            layout
-                .checked_add(128)
-                .ok_or(AppWorkerError::TxEventQueueLayoutOverflow)?,
-        );
-        let offset = segment
-            .alloc(layout, 64)
-            .ok_or(AppWorkerError::TxEventQueueSegmentExhausted)?;
-        let tx_evt_q = Arc::new(
-            unsafe { SessionMsgQueue::init_at_with_signal(segment, offset, cap, cap.max(2)) }
-                .map_err(|error| AppWorkerError::SessionEventQueue { error })?,
-        );
-        let session_evt_q = Arc::new(
-            SessionMsgQueue::with_cfg(cap, cap.max(2))
-                .map_err(|error| AppWorkerError::SessionEventQueue { error })?,
-        );
-        let app = AppWorker::new(pool_capacity, tx_evt_q, worker.slot());
-        Ok(Self::from_app(
-            worker,
-            worker_count,
-            app_session_config,
-            pool_capacity,
-            None,
-            app,
-            session_evt_q,
-        ))
-    }
-
-    pub(crate) fn with_app_session_attach(
+    pub fn new(
         worker: DataWorkerId,
         worker_count: usize,
         app_session_config: AppSessionConfig,
         pool_capacity: usize,
         applications: Arc<ApplicationMain>,
-        publisher: AppSessionPublisher,
+        publisher: Option<AppSessionPublisher>,
     ) -> RuntimeResult<Self> {
-        let cap = DEFAULT_SESSION_TX_EVENT_CAPACITY.next_power_of_two().max(2) as u32;
-        let layout = SessionMsgQueue::layout_bytes(cap, cap.max(2))
-            .map_err(|error| AppWorkerError::SessionEventQueue { error })?;
-        let segment = Segment::local(
-            layout
-                .checked_add(128)
-                .ok_or(AppWorkerError::TxEventQueueLayoutOverflow)?,
-        );
-        let offset = segment
-            .alloc(layout, 64)
-            .ok_or(AppWorkerError::TxEventQueueSegmentExhausted)?;
-        let tx_evt_q = Arc::new(
-            unsafe { SessionMsgQueue::init_at_with_signal(segment, offset, cap, cap.max(2)) }
-                .map_err(|error| AppWorkerError::SessionEventQueue { error })?,
-        );
-        let app = AppWorker::with_attach(pool_capacity, tx_evt_q, worker.slot(), publisher);
+        let cap = DEFAULT_SESSION_EVENT_CAPACITY.next_power_of_two().max(2) as u32;
         let session_evt_q = Arc::new(
             SessionMsgQueue::with_cfg(cap, cap.max(2))
                 .map_err(|error| AppWorkerError::SessionEventQueue { error })?,
         );
-        Ok(Self::from_app(
-            worker,
-            worker_count,
-            app_session_config,
-            pool_capacity,
-            Some(applications),
-            app,
-            session_evt_q,
-        ))
-    }
-
-    pub(crate) fn with_application_main(
-        worker: DataWorkerId,
-        worker_count: usize,
-        app_session_config: AppSessionConfig,
-        pool_capacity: usize,
-        applications: Arc<ApplicationMain>,
-    ) -> RuntimeResult<Self> {
-        let mut worker = Self::with_worker_count_app_session_config_and_pool_capacity(
-            worker,
-            worker_count,
-            app_session_config,
-            pool_capacity,
-        )?;
-        worker.applications = Some(applications);
-        Ok(worker)
-    }
-
-    fn from_app(
-        worker: DataWorkerId,
-        worker_count: usize,
-        app_session_config: AppSessionConfig,
-        pool_capacity: usize,
-        applications: Option<Arc<ApplicationMain>>,
-        app: AppWorker,
-        session_evt_q: Arc<SessionMsgQueue>,
-    ) -> Self {
-        Self {
+        let app = AppWorker::new(pool_capacity, worker.slot(), publisher);
+        Ok(Self {
             worker,
             worker_count,
             entries: Pool::with_capacity(pool_capacity),
@@ -2452,13 +2264,18 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             control_events: LinkedList::new(),
             new_io_events: LinkedList::new(),
             old_io_events: LinkedList::new(),
-            readiness_file: None,
             app_rx_mqs: Vec::new(),
             app_rx_mq_pending: VecDeque::new(),
             state: SessionWorkerState::Polling,
             state_deadline_file: None,
             session_queue: None,
-        }
+        })
+    }
+
+    /// Associates this Data Worker with the Session Main that owns listener
+    /// routes before a transport may deliver accepted streams to it.
+    pub fn set_listener_main(&mut self, main: Arc<SessionMain>) {
+        self.listener_main = Some(main);
     }
 }
 
@@ -3088,8 +2905,15 @@ mod tests {
     #[test]
     fn session_worker_state_transitions_match_vpp_deadlines() {
         let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-        let mut sessions =
-            SessionWorker::<Index>::new(DataWorkerId::new(0)).expect("session worker");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            ApplicationMain::new(DEFAULT_SESSION_POOL_CAPACITY),
+            None,
+        )
+        .expect("session worker");
 
         assert_eq!(sessions.state(), SessionWorkerState::Polling);
         assert_eq!(sessions.state_deadline(), None);
@@ -3118,8 +2942,15 @@ mod tests {
     #[test]
     fn session_worker_teardown_removes_deadline_before_runtime_drop() {
         let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-        let mut sessions =
-            SessionWorker::<Index>::new(DataWorkerId::new(0)).expect("session worker");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            ApplicationMain::new(DEFAULT_SESSION_POOL_CAPACITY),
+            None,
+        )
+        .expect("session worker");
         sessions
             .install_state_deadline(&runtime, NodeId::new(0))
             .expect("install adaptive deadline");
@@ -3155,8 +2986,15 @@ mod tests {
             let application = applications.attach()?;
             let resources = ApplicationMqResources::create_local(application, 1, 4096)?;
             let queue = queue_for_worker(&resources, application)?;
-            let main = Arc::new(SessionMain::new(1, applications));
-            let sessions = SessionWorker::<Index>::new(DataWorkerId::new(0))?;
+            let main = Arc::new(SessionMain::new(1, Arc::clone(&applications)));
+            let sessions = SessionWorker::<Index>::new(
+                DataWorkerId::new(0),
+                1,
+                AppSessionConfig::default(),
+                DEFAULT_SESSION_POOL_CAPACITY,
+                applications,
+                None,
+            )?;
 
             super::install_session_worker(
                 &main,
@@ -3219,13 +3057,13 @@ mod tests {
             .queue(DataWorkerId::new(1))
             .expect("worker Application MQ")
             .clone();
-        let mut sessions = SessionWorker::<Index>::with_app_session_attach(
+        let mut sessions = SessionWorker::<Index>::new(
             DataWorkerId::new(1),
             2,
             hammer_runtime::app::AppSessionConfig::default(),
             DEFAULT_SESSION_POOL_CAPACITY,
             applications,
-            server.publisher(),
+            Some(server.publisher()),
         )
         .expect("Session worker with external App publication");
         let mut runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default())
@@ -3298,13 +3136,13 @@ mod tests {
         let server = AppServer::bind(socket_path, 1).expect("bind App server");
         let applications = ApplicationMain::new(1);
         let application = applications.attach().expect("attach Application");
-        let mut sessions = SessionWorker::<Index>::with_app_session_attach(
+        let mut sessions = SessionWorker::<Index>::new(
             DataWorkerId::new(0),
             1,
             AppSessionConfig::default(),
             1,
             applications,
-            server.publisher(),
+            Some(server.publisher()),
         )
         .expect("Session worker with external App publication");
 
@@ -3375,13 +3213,13 @@ mod tests {
             .queue(DataWorkerId::new(2))
             .expect("worker Application MQ")
             .clone();
-        let mut sessions = SessionWorker::<Index>::with_app_session_attach(
+        let mut sessions = SessionWorker::<Index>::new(
             DataWorkerId::new(2),
             3,
             hammer_runtime::app::AppSessionConfig::default(),
             DEFAULT_SESSION_POOL_CAPACITY,
             applications,
-            publisher,
+            Some(publisher),
         )
         .expect("Session worker with closed external App publication");
         let mut runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default())
@@ -3436,13 +3274,25 @@ mod tests {
         let runtime_b = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default())
             .for_worker(1, 0)
             .expect("worker runtime B");
-        let main_a = Arc::new(SessionMain::new(1, ApplicationMain::new(1)));
-        let main_b = Arc::new(SessionMain::new(1, ApplicationMain::new(1)));
+        let applications_a = ApplicationMain::new(1);
+        let applications_b = ApplicationMain::new(1);
+        let main_a = Arc::new(SessionMain::new(1, Arc::clone(&applications_a)));
+        let main_b = Arc::new(SessionMain::new(1, Arc::clone(&applications_b)));
         assert!(
             main_a
                 .worker(worker)
                 .expect("Session worker A slot")
-                .install(SessionWorker::<Index>::new(worker).expect("Session worker A"))
+                .install(
+                    SessionWorker::<Index>::new(
+                        worker,
+                        1,
+                        AppSessionConfig::default(),
+                        DEFAULT_SESSION_POOL_CAPACITY,
+                        applications_a,
+                        None,
+                    )
+                    .expect("Session worker A"),
+                )
                 .is_ok(),
             "install Session worker A"
         );
@@ -3450,7 +3300,17 @@ mod tests {
             main_b
                 .worker(worker)
                 .expect("Session worker B slot")
-                .install(SessionWorker::<Index>::new(worker).expect("Session worker B"))
+                .install(
+                    SessionWorker::<Index>::new(
+                        worker,
+                        1,
+                        AppSessionConfig::default(),
+                        DEFAULT_SESSION_POOL_CAPACITY,
+                        applications_b,
+                        None,
+                    )
+                    .expect("Session worker B"),
+                )
                 .is_ok(),
             "install Session worker B"
         );
@@ -3505,11 +3365,22 @@ mod tests {
         let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default())
             .for_worker(1, 0)
             .expect("worker runtime");
-        let main = Arc::new(SessionMain::new(1, ApplicationMain::new(1)));
+        let applications = ApplicationMain::new(1);
+        let main = Arc::new(SessionMain::new(1, Arc::clone(&applications)));
         assert!(
             main.worker(worker)
                 .expect("Session worker slot")
-                .install(SessionWorker::<Index>::new(worker).expect("Session worker"))
+                .install(
+                    SessionWorker::<Index>::new(
+                        worker,
+                        1,
+                        AppSessionConfig::default(),
+                        DEFAULT_SESSION_POOL_CAPACITY,
+                        Arc::clone(&applications),
+                        None,
+                    )
+                    .expect("Session worker"),
+                )
                 .is_ok(),
             "install Session worker"
         );
@@ -3524,7 +3395,15 @@ mod tests {
         )
         .expect("install dispatch");
 
-        let duplicate = SessionWorker::<Index>::new(worker).expect("duplicate Session worker");
+        let duplicate = SessionWorker::<Index>::new(
+            worker,
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("duplicate Session worker");
         assert!(
             main.worker(worker)
                 .expect("duplicate install slot")
@@ -3540,14 +3419,15 @@ mod tests {
 
     #[test]
     fn session_worker_uses_configured_pool_capacity() {
-        let worker =
-            SessionWorker::<Index>::with_worker_count_app_session_config_and_pool_capacity(
-                DataWorkerId::new(0),
-                1,
-                hammer_runtime::app::AppSessionConfig::default(),
-                7,
-            )
-            .expect("Session worker with configured capacity");
+        let worker = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            hammer_runtime::app::AppSessionConfig::default(),
+            7,
+            ApplicationMain::new(7),
+            None,
+        )
+        .expect("Session worker with configured capacity");
 
         assert_eq!(worker.entries.capacity(), 7);
     }
@@ -3564,12 +3444,13 @@ mod tests {
         let mut runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default())
             .for_worker(1, 0)
             .expect("worker runtime");
-        let mut sessions = SessionWorker::<Index>::with_application_main(
+        let mut sessions = SessionWorker::<Index>::new(
             DataWorkerId::new(0),
             1,
             AppSessionConfig::default(),
             DEFAULT_SESSION_POOL_CAPACITY,
             applications.clone(),
+            None,
         )
         .expect("Session worker");
         sessions
@@ -3602,12 +3483,13 @@ mod tests {
         let mut runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default())
             .for_worker(1, 0)
             .expect("worker runtime");
-        let mut sessions = SessionWorker::<Index>::with_application_main(
+        let mut sessions = SessionWorker::<Index>::new(
             DataWorkerId::new(0),
             1,
             AppSessionConfig::default(),
             DEFAULT_SESSION_POOL_CAPACITY,
             applications.clone(),
+            None,
         )
         .expect("Session worker");
         sessions
@@ -3651,8 +3533,15 @@ mod tests {
             &ApplicationMqResources::create_local(application, 1, 4096)?,
             application,
         )?;
-        let main = Arc::new(SessionMain::new(1, applications));
-        let mut sessions = SessionWorker::<Index>::new(DataWorkerId::new(0))?;
+        let main = Arc::new(SessionMain::new(1, Arc::clone(&applications)));
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )?;
         let target = sessions.insert_session_for_test(SessionTransportId::new(1), Index::new(7, 1));
         super::install_session_worker(
             &main,
@@ -3680,7 +3569,7 @@ mod tests {
             target.pool_index().slot(),
             SessionEvtType::TxEnq,
         ))?;
-        (0..super::DEFAULT_SESSION_TX_EVENT_CAPACITY)
+        (0..super::DEFAULT_SESSION_EVENT_CAPACITY)
             .try_for_each(|_| queue.enqueue_io(SessionEvt::io(u32::MAX, SessionEvtType::TxEnq)))?;
 
         let graph = engine.runtime.nodes().clone();
@@ -3722,12 +3611,13 @@ mod tests {
         )?;
         let mut runtime =
             DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()).for_worker(1, 0)?;
-        let mut sessions = SessionWorker::<Index>::with_application_main(
+        let mut sessions = SessionWorker::<Index>::new(
             DataWorkerId::new(0),
             1,
             AppSessionConfig::default(),
             DEFAULT_SESSION_POOL_CAPACITY,
             applications.clone(),
+            None,
         )?;
         sessions.install_app_mq(
             application,
@@ -3765,10 +3655,17 @@ mod tests {
         )?;
         let mut runtime =
             DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()).for_worker(1, 0)?;
-        let mut sessions = SessionWorker::<Index>::new(DataWorkerId::new(0))?;
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            Arc::clone(&applications),
+            None,
+        )?;
         let target = sessions.insert_session_for_test(SessionTransportId::new(1), Index::new(7, 1));
 
-        (0..super::DEFAULT_SESSION_TX_EVENT_CAPACITY).try_for_each(|session_index| {
+        (0..super::DEFAULT_SESSION_EVENT_CAPACITY).try_for_each(|session_index| {
             sessions.session_evt_q.enqueue_io(SessionEvt::io(
                 session_index as u32 + 1,
                 SessionEvtType::TxEnq,
@@ -3787,7 +3684,7 @@ mod tests {
         assert_eq!(sessions.poll_app()?, 1);
         assert_eq!(
             sessions.session_evt_q.len(),
-            super::DEFAULT_SESSION_TX_EVENT_CAPACITY
+            super::DEFAULT_SESSION_EVENT_CAPACITY
         );
         assert!(!sessions.has_pending_app_mqs());
         assert!(

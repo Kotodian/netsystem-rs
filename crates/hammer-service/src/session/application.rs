@@ -87,8 +87,8 @@ impl ApplicationConnection {
 /// Per-Application message queues, one for every Data Worker.
 ///
 /// The queues are owned by `ApplicationMain` and are published to Data
-/// Workers at attach time. The shared worker TX queue remains available as a
-/// fallback for callers that have not opted into per-Application MQs.
+/// Workers at attach time. Every app-to-session event uses the queue selected
+/// by its Application and Data Worker; there is no shared worker fallback.
 pub struct ApplicationMqResources {
     application: ApplicationId,
     segment: Segment,

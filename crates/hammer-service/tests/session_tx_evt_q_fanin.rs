@@ -1,54 +1,42 @@
-//! Seam 2: shared Local Session Message Queue concurrent producers + single drain.
-//! Behavioral only — no source greps.
+//! Application Rx MQ isolation at the Session Message Queue boundary.
 
-use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread;
 
 use hammer_runtime::app::{SessionEvt, SessionEvtType, SessionMsgQueue};
 
 #[test]
-fn shared_tx_evt_q_concurrent_enqueue_io_preserves_all_events() {
-    let q: Arc<SessionMsgQueue> = Arc::new(SessionMsgQueue::with_cfg(512, 256).expect("queue"));
-    let producers = 8usize;
-    let per = 50usize;
-    let total = producers * per;
-    let started = Arc::new(AtomicUsize::new(0));
+fn one_application_mq_full_does_not_block_another_application_mq() {
+    let first: Arc<SessionMsgQueue> = Arc::new(SessionMsgQueue::with_cfg(8, 2).expect("first MQ"));
+    let second: Arc<SessionMsgQueue> =
+        Arc::new(SessionMsgQueue::with_cfg(8, 2).expect("second MQ"));
 
-    let mut handles = Vec::new();
-    for p in 0..producers {
-        let q = Arc::clone(&q);
-        let started = Arc::clone(&started);
-        handles.push(thread::spawn(move || {
-            started.fetch_add(1, Ordering::SeqCst);
-            while started.load(Ordering::SeqCst) < producers {
-                thread::yield_now();
-            }
-            for i in 0..per {
-                let evt = SessionEvt::io(((p as u32) << 16) | i as u32, SessionEvtType::TxDeq);
-                loop {
-                    match q.enqueue_io(evt) {
-                        Ok(()) => break,
-                        Err(_) => thread::yield_now(),
-                    }
-                }
-            }
-        }));
-    }
+    first
+        .enqueue_io(SessionEvt::io(1, SessionEvtType::TxEnq))
+        .expect("first Application event");
+    first
+        .enqueue_io(SessionEvt::io(2, SessionEvtType::TxEnq))
+        .expect("second first-Application event");
+    assert!(
+        first
+            .enqueue_io(SessionEvt::io(3, SessionEvtType::TxEnq))
+            .is_err()
+    );
 
-    let mut seen = HashSet::with_capacity(total);
-    while seen.len() < total {
-        if let Some(evt) = q.dequeue() {
-            assert_eq!(evt.evt_type, SessionEvtType::TxDeq);
-            seen.insert(evt.session_index());
-        } else {
-            thread::yield_now();
-        }
-    }
-    for h in handles {
-        h.join().expect("join");
-    }
-    assert_eq!(seen.len(), total);
-    assert!(q.dequeue().is_none());
+    second
+        .enqueue_io(SessionEvt::io(9, SessionEvtType::TxEnq))
+        .expect("second Application remains writable");
+    assert_eq!(
+        second
+            .dequeue()
+            .expect("second Application event")
+            .session_index(),
+        9
+    );
+    assert_eq!(
+        first
+            .dequeue()
+            .expect("first Application event")
+            .session_index(),
+        1
+    );
 }

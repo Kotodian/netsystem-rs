@@ -45,8 +45,8 @@ fn svm_session_create_and_fifo_round_trip() {
         init_svm_session_queues(&seg, &offsets, config);
     }
 
-    let worker_queue = Arc::new(SessionMsgQueue::with_cfg(64, 64).expect("worker event queue"));
-    let session = unsafe { AppSession::from_segment(handle, &seg, &offsets, None, worker_queue) };
+    let app_rx_mq = Arc::new(SessionMsgQueue::with_cfg(64, 64).expect("Application Rx MQ"));
+    let session = unsafe { AppSession::from_segment(handle, &seg, &offsets, None, app_rx_mq) };
 
     let written = session.rx_fifo().enqueue(b"hello");
     assert_eq!(written, 5);
@@ -69,8 +69,8 @@ fn svm_session_multi_ring_evt_q_io_and_ctrl_round_trip() {
         init_svm_session_queues(&seg, &offsets, config);
     }
 
-    let worker_queue = Arc::new(SessionMsgQueue::with_cfg(64, 64).expect("worker event queue"));
-    let session = unsafe { AppSession::from_segment(handle, &seg, &offsets, None, worker_queue) };
+    let app_rx_mq = Arc::new(SessionMsgQueue::with_cfg(64, 64).expect("Application Rx MQ"));
+    let session = unsafe { AppSession::from_segment(handle, &seg, &offsets, None, app_rx_mq) };
 
     session
         .push_control_event(SessionEvtType::Connect)
@@ -87,7 +87,7 @@ fn svm_session_multi_ring_evt_q_io_and_ctrl_round_trip() {
     assert_eq!(out[1].worker_index(), 0);
 
     assert_eq!(session.send_bytes(b"x").expect("send"), 1);
-    let tx = session.tx_evt_q().dequeue().expect("tx enqueue");
+    let tx = session.app_rx_mq().dequeue().expect("tx enqueue");
     assert_eq!(tx.evt_type, SessionEvtType::TxEnq);
     assert_eq!(tx.session_index(), 3);
 }

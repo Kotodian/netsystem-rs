@@ -94,24 +94,18 @@ fn init_session_worker(
         .runtime
         .nodes()
         .set_node_state(app_session_input, NodeState::Disabled)?;
-    let mut sessions = if let Some(server) = engine.registry.get::<AppServer>() {
-        SessionWorker::<PoolIndex>::with_app_session_attach(
-            worker,
-            engine.configured_worker_count(),
-            AppSessionConfig::default(),
-            session.pool_capacity,
-            Arc::clone(&applications),
-            server.publisher(),
-        )?
-    } else {
-        SessionWorker::<PoolIndex>::with_application_main(
-            worker,
-            engine.configured_worker_count(),
-            AppSessionConfig::default(),
-            session.pool_capacity,
-            applications,
-        )?
-    };
+    let publisher = engine
+        .registry
+        .get::<AppServer>()
+        .map(|server| server.publisher());
+    let mut sessions = SessionWorker::<PoolIndex>::new(
+        worker,
+        engine.configured_worker_count(),
+        AppSessionConfig::default(),
+        session.pool_capacity,
+        applications,
+        publisher,
+    )?;
     sessions.set_listener_main(Arc::clone(&main));
     runtime::install_session_worker(&main, engine, app_session_input, session_queue, sessions)
 }
