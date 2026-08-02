@@ -1416,11 +1416,11 @@ pub fn graph_node(args: TokenStream, input: TokenStream) -> TokenStream {
         .into()
 }
 
-struct AppSessionProtocolArgs {
+struct SessionAppArgs {
     name: LitStr,
 }
 
-impl Parse for AppSessionProtocolArgs {
+impl Parse for SessionAppArgs {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let mut name = None;
         while !input.is_empty() {
@@ -1436,9 +1436,7 @@ impl Parse for AppSessionProtocolArgs {
                 other => {
                     return Err(Error::new(
                         key.span(),
-                        format!(
-                            "unknown `app_session_protocol` argument `{other}`; expected `name`"
-                        ),
+                        format!("unknown `session_app` argument `{other}`; expected `name`"),
                     ));
                 }
             }
@@ -1452,145 +1450,647 @@ impl Parse for AppSessionProtocolArgs {
     }
 }
 
-/// Registers a concrete App Session protocol in the current link image.
+/// Registers a concrete VPP-shaped Session App in the current link image.
 #[proc_macro_attribute]
-pub fn app_session_protocol(args: TokenStream, input: TokenStream) -> TokenStream {
-    let args = parse_macro_input!(args as AppSessionProtocolArgs);
+pub fn session_app(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as SessionAppArgs);
     let item = parse_macro_input!(input as Item);
     let ident = match item {
         Item::Struct(ref item) => item.ident.clone(),
         _ => {
             return Error::new(
                 item.span(),
-                "`app_session_protocol` can only be attached to a struct",
+                "`session_app` can only be attached to a struct",
             )
             .to_compile_error()
             .into();
         }
     };
-    let static_ident = format_ident!(
-        "__APP_SESSION_PROTOCOL_{}",
-        to_snake_case(&ident.to_string()).to_ascii_uppercase()
-    );
-    let connections_ident = format_ident!("{static_ident}_CONNECTIONS");
+    let suffix = to_snake_case(&ident.to_string()).to_ascii_uppercase();
+    let static_ident = format_ident!("__SESSION_APP_{suffix}");
+    let callbacks_ident = format_ident!("{static_ident}_CALLBACKS");
+    let contexts_ident = format_ident!("{static_ident}_CONTEXTS");
     let create_ident = format_ident!("{static_ident}_CREATE");
-    let ingress_ident = format_ident!("{static_ident}_INGRESS");
-    let egress_ident = format_ident!("{static_ident}_EGRESS");
-    let claim_ready_ident = format_ident!("{static_ident}_CLAIM_READY");
-    let sessions_ident = format_ident!("{static_ident}_SESSIONS");
     let destroy_ident = format_ident!("{static_ident}_DESTROY");
+    let install_ident = format_ident!("{static_ident}_INSTALL");
+    let add_segment_ident = format_ident!("{static_ident}_ADD_SEGMENT");
+    let del_segment_ident = format_ident!("{static_ident}_DEL_SEGMENT");
+    let accept_ident = format_ident!("{static_ident}_ACCEPT");
+    let connected_ident = format_ident!("{static_ident}_CONNECTED");
+    let disconnect_ident = format_ident!("{static_ident}_DISCONNECT");
+    let reset_ident = format_ident!("{static_ident}_RESET");
+    let transport_closed_ident = format_ident!("{static_ident}_TRANSPORT_CLOSED");
+    let cleanup_ident = format_ident!("{static_ident}_CLEANUP");
+    let half_open_cleanup_ident = format_ident!("{static_ident}_HALF_OPEN_CLEANUP");
+    let migrate_ident = format_ident!("{static_ident}_MIGRATE");
+    let listened_ident = format_ident!("{static_ident}_LISTENED");
+    let unlistened_ident = format_ident!("{static_ident}_UNLISTENED");
+    let builtin_rx_ident = format_ident!("{static_ident}_BUILTIN_RX");
+    let builtin_tx_ident = format_ident!("{static_ident}_BUILTIN_TX");
+    let fifo_tuning_ident = format_ident!("{static_ident}_FIFO_TUNING");
+    let proxy_alloc_fifos_ident = format_ident!("{static_ident}_PROXY_ALLOC_FIFOS");
+    let proxy_write_early_data_ident = format_ident!("{static_ident}_PROXY_WRITE_EARLY_DATA");
+    let app_evt_ident = format_ident!("{static_ident}_APP_EVT");
+    let crypto_async_ident = format_ident!("{static_ident}_CRYPTO_ASYNC");
     let name = args.name;
     quote! {
         #item
 
-        static #connections_ident: ::std::sync::OnceLock<
-            ::hammer_runtime::app::AppSessionProtocolConnections<#ident>
+        static #contexts_ident: ::std::sync::OnceLock<
+            ::hammer_runtime::app::SessionAppContexts<#ident>
         > = ::std::sync::OnceLock::new();
 
         fn #create_ident(
             __hammer_worker: ::hammer_runtime::DataWorkerId,
             __hammer_worker_count: usize,
             __hammer_application: ::std::option::Option<::hammer_runtime::app::ApplicationId>,
-            __hammer_role: ::hammer_runtime::app::AppSessionProtocolRole,
-            __hammer_protocol_id: ::std::option::Option<u64>,
+            __hammer_app: ::std::option::Option<::hammer_runtime::app::SessionAppId>,
+            __hammer_config: ::std::option::Option<u64>,
             __hammer_server_name: ::std::option::Option<&str>,
-            __hammer_session_handle: ::hammer_runtime::app::SessionHandle,
-            __hammer_app_session_handle: ::hammer_runtime::app::SessionHandle,
-        ) -> ::hammer_runtime::RuntimeResult<
-            ::hammer_runtime::app::AppSessionProtocolConnectionId
-        > {
-            let __hammer_protocol = <#ident as ::hammer_runtime::app::AppSessionProtocol>::create(
-                __hammer_application,
-                __hammer_role,
-                __hammer_protocol_id,
-                __hammer_server_name,
-            )?;
-            #connections_ident.get_or_init(|| {
-                ::hammer_runtime::app::AppSessionProtocolConnections::new(
+        ) -> ::hammer_runtime::RuntimeResult<::hammer_runtime::app::SessionAppContext> {
+            let __hammer_app_state =
+                <#ident as ::hammer_service::session::protocol::SessionApp>::create(
+                    __hammer_application,
+                    __hammer_app,
+                    __hammer_config,
+                    __hammer_server_name,
+                )?;
+            #contexts_ident
+                .get_or_init(|| {
+                    ::hammer_runtime::app::SessionAppContexts::new(
+                        __hammer_worker_count,
+                        <#ident as ::hammer_service::session::protocol::SessionApp>::CONTEXT_CAPACITY,
+                    )
+                })
+                .insert(
+                    __hammer_worker,
                     __hammer_worker_count,
-                    <#ident as ::hammer_runtime::app::AppSessionProtocol>::CONNECTION_CAPACITY,
+                    __hammer_app_state,
                 )
-            }).insert(
-                __hammer_worker,
-                __hammer_worker_count,
-                __hammer_protocol,
-                __hammer_session_handle,
-                __hammer_app_session_handle,
-            )
-        }
-
-        fn #ingress_ident(
-            __hammer_worker: ::hammer_runtime::DataWorkerId,
-            __hammer_connection: ::hammer_runtime::app::AppSessionProtocolConnectionId,
-            __hammer_lower_rx_fifo: &::hammer_infra::fifo::Fifo,
-            __hammer_upper_rx_fifo: &::hammer_infra::fifo::Fifo,
-        ) -> ::hammer_runtime::RuntimeResult<(usize, usize)> {
-            #connections_ident.get()
-                .expect("App Session protocol connection storage exists after construction")
-                .with_mut(__hammer_worker, __hammer_connection, |__hammer_protocol| {
-                    <#ident as ::hammer_runtime::app::AppSessionProtocol>::ingress(
-                        __hammer_protocol,
-                        __hammer_lower_rx_fifo,
-                        __hammer_upper_rx_fifo,
-                    )
-                })
-        }
-
-        fn #egress_ident(
-            __hammer_worker: ::hammer_runtime::DataWorkerId,
-            __hammer_connection: ::hammer_runtime::app::AppSessionProtocolConnectionId,
-            __hammer_upper_tx_fifo: &::hammer_infra::fifo::Fifo,
-            __hammer_lower_tx_fifo: &::hammer_infra::fifo::Fifo,
-        ) -> ::hammer_runtime::RuntimeResult<(usize, usize)> {
-            #connections_ident.get()
-                .expect("App Session protocol connection storage exists after construction")
-                .with_mut(__hammer_worker, __hammer_connection, |__hammer_protocol| {
-                    <#ident as ::hammer_runtime::app::AppSessionProtocol>::egress(
-                        __hammer_protocol,
-                        __hammer_upper_tx_fifo,
-                        __hammer_lower_tx_fifo,
-                    )
-                })
         }
 
         fn #destroy_ident(
             __hammer_worker: ::hammer_runtime::DataWorkerId,
-            __hammer_connection: ::hammer_runtime::app::AppSessionProtocolConnectionId,
+            __hammer_context: ::hammer_runtime::app::SessionAppContext,
         ) {
-            #connections_ident.get()
-                .expect("App Session protocol connection storage exists after construction")
-                .remove(__hammer_worker, __hammer_connection)
+            #contexts_ident
+                .get()
+                .expect("Session App context storage exists after construction")
+                .remove(__hammer_worker, __hammer_context)
         }
 
-        fn #claim_ready_ident(
-            __hammer_worker: ::hammer_runtime::DataWorkerId,
-            __hammer_connection: ::hammer_runtime::app::AppSessionProtocolConnectionId,
-        ) -> ::hammer_runtime::RuntimeResult<bool> {
-            #connections_ident.get()
-                .expect("App Session protocol connection storage exists after construction")
-                .claim_ready(__hammer_worker, __hammer_connection)
+        fn #add_segment_ident(
+            __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
+                ::hammer_infra::pool::Index,
+            >,
+            __hammer_segment_handle: u64,
+            __hammer_context: ::hammer_runtime::app::SessionAppContext,
+        ) -> ::hammer_runtime::RuntimeResult<()> {
+            #contexts_ident
+                .get()
+                .expect("Session App context storage exists after construction")
+                .with_mut(
+                    __hammer_worker.worker(),
+                    __hammer_context,
+                    |__hammer_app| {
+                        <#ident as ::hammer_service::session::protocol::SessionApp>::add_segment(
+                            __hammer_app,
+                            __hammer_worker,
+                            __hammer_segment_handle,
+                        )
+                    },
+                )
         }
 
-        fn #sessions_ident(
-            __hammer_worker: ::hammer_runtime::DataWorkerId,
-            __hammer_connection: ::hammer_runtime::app::AppSessionProtocolConnectionId,
-        ) -> ::hammer_runtime::RuntimeResult<(
-            ::hammer_runtime::app::SessionHandle,
-            ::hammer_runtime::app::SessionHandle,
-        )> {
-            #connections_ident.get()
-                .expect("App Session protocol connection storage exists after construction")
-                .sessions(__hammer_worker, __hammer_connection)
+        fn #del_segment_ident(
+            __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
+                ::hammer_infra::pool::Index,
+            >,
+            __hammer_segment_handle: u64,
+            __hammer_context: ::hammer_runtime::app::SessionAppContext,
+        ) -> ::hammer_runtime::RuntimeResult<()> {
+            #contexts_ident
+                .get()
+                .expect("Session App context storage exists after construction")
+                .with_mut(
+                    __hammer_worker.worker(),
+                    __hammer_context,
+                    |__hammer_app| {
+                        <#ident as ::hammer_service::session::protocol::SessionApp>::del_segment(
+                            __hammer_app,
+                            __hammer_worker,
+                            __hammer_segment_handle,
+                        )
+                    },
+                )
         }
 
-        pub(crate) static #static_ident: ::hammer_runtime::app::AppSessionProtocolEntry =
-            ::hammer_runtime::app::AppSessionProtocolEntry::new(
+        fn #accept_ident(
+            __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
+                ::hammer_infra::pool::Index,
+            >,
+            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_context: ::hammer_runtime::app::SessionAppContext,
+        ) -> ::hammer_runtime::RuntimeResult<()> {
+            let __hammer_context = if __hammer_context == 0 {
+                let (__hammer_application, __hammer_app, __hammer_config, __hammer_server_name) =
+                    __hammer_worker
+                        .session_app_facts(__hammer_session)
+                        .ok_or(::hammer_service::session::SessionQueueError::SessionAppContextCreateUnsupported)?;
+                let __hammer_app_state =
+                    <#ident as ::hammer_service::session::protocol::SessionApp>::create(
+                        ::std::option::Option::Some(__hammer_application),
+                        __hammer_app,
+                        __hammer_config,
+                        __hammer_server_name,
+                    )?;
+                let __hammer_context = #contexts_ident
+                    .get_or_init(|| {
+                        ::hammer_runtime::app::SessionAppContexts::new(
+                            __hammer_worker.worker_count(),
+                            <#ident as ::hammer_service::session::protocol::SessionApp>::CONTEXT_CAPACITY,
+                        )
+                    })
+                    .insert(
+                        __hammer_worker.worker(),
+                        __hammer_worker.worker_count(),
+                        __hammer_app_state,
+                    )?;
+                __hammer_worker.set_app_session(__hammer_session, __hammer_context)?;
+                __hammer_context
+            } else {
+                __hammer_context
+            };
+            #contexts_ident
+                .get()
+                .expect("Session App context storage exists after construction")
+                .with_mut(
+                    __hammer_worker.worker(),
+                    __hammer_context,
+                    |__hammer_app| {
+                        <#ident as ::hammer_service::session::protocol::SessionApp>::accept(
+                            __hammer_app,
+                            __hammer_worker,
+                            __hammer_session,
+                            __hammer_context,
+                        )
+                    },
+                )
+        }
+
+        fn #connected_ident(
+            __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
+                ::hammer_infra::pool::Index,
+            >,
+            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_context: ::hammer_runtime::app::SessionAppContext,
+        ) -> ::hammer_runtime::RuntimeResult<()> {
+            let __hammer_context = if __hammer_context == 0 {
+                let (__hammer_application, __hammer_app, __hammer_config, __hammer_server_name) =
+                    __hammer_worker
+                        .session_app_facts(__hammer_session)
+                        .ok_or(::hammer_service::session::SessionQueueError::SessionAppContextCreateUnsupported)?;
+                let __hammer_app_state =
+                    <#ident as ::hammer_service::session::protocol::SessionApp>::create(
+                        ::std::option::Option::Some(__hammer_application),
+                        __hammer_app,
+                        __hammer_config,
+                        __hammer_server_name,
+                    )?;
+                let __hammer_context = #contexts_ident
+                    .get_or_init(|| {
+                        ::hammer_runtime::app::SessionAppContexts::new(
+                            __hammer_worker.worker_count(),
+                            <#ident as ::hammer_service::session::protocol::SessionApp>::CONTEXT_CAPACITY,
+                        )
+                    })
+                    .insert(
+                        __hammer_worker.worker(),
+                        __hammer_worker.worker_count(),
+                        __hammer_app_state,
+                    )?;
+                __hammer_worker.set_app_session(__hammer_session, __hammer_context)?;
+                __hammer_context
+            } else {
+                __hammer_context
+            };
+            #contexts_ident
+                .get()
+                .expect("Session App context storage exists after construction")
+                .with_mut(
+                    __hammer_worker.worker(),
+                    __hammer_context,
+                    |__hammer_app| {
+                        <#ident as ::hammer_service::session::protocol::SessionApp>::connected(
+                            __hammer_app,
+                            __hammer_worker,
+                            __hammer_session,
+                            __hammer_context,
+                        )
+                    },
+                )
+        }
+
+        fn #disconnect_ident(
+            __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
+                ::hammer_infra::pool::Index,
+            >,
+            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_context: ::hammer_runtime::app::SessionAppContext,
+        ) -> ::hammer_runtime::RuntimeResult<()> {
+            #contexts_ident
+                .get()
+                .expect("Session App context storage exists after construction")
+                .with_mut(
+                    __hammer_worker.worker(),
+                    __hammer_context,
+                    |__hammer_app| {
+                        <#ident as ::hammer_service::session::protocol::SessionApp>::disconnect(
+                            __hammer_app,
+                            __hammer_worker,
+                            __hammer_session,
+                            __hammer_context,
+                        )
+                    },
+                )
+        }
+
+        fn #reset_ident(
+            __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
+                ::hammer_infra::pool::Index,
+            >,
+            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_context: ::hammer_runtime::app::SessionAppContext,
+        ) -> ::hammer_runtime::RuntimeResult<()> {
+            #contexts_ident
+                .get()
+                .expect("Session App context storage exists after construction")
+                .with_mut(
+                    __hammer_worker.worker(),
+                    __hammer_context,
+                    |__hammer_app| {
+                        <#ident as ::hammer_service::session::protocol::SessionApp>::reset(
+                            __hammer_app,
+                            __hammer_worker,
+                            __hammer_session,
+                            __hammer_context,
+                        )
+                    },
+                )
+        }
+
+        fn #transport_closed_ident(
+            __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
+                ::hammer_infra::pool::Index,
+            >,
+            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_context: ::hammer_runtime::app::SessionAppContext,
+        ) -> ::hammer_runtime::RuntimeResult<()> {
+            #contexts_ident
+                .get()
+                .expect("Session App context storage exists after construction")
+                .with_mut(
+                    __hammer_worker.worker(),
+                    __hammer_context,
+                    |__hammer_app| {
+                        <#ident as ::hammer_service::session::protocol::SessionApp>::transport_closed(
+                            __hammer_app,
+                            __hammer_worker,
+                            __hammer_session,
+                            __hammer_context,
+                        )
+                    },
+                )
+        }
+
+        fn #cleanup_ident(
+            __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
+                ::hammer_infra::pool::Index,
+            >,
+            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_context: ::hammer_runtime::app::SessionAppContext,
+        ) -> ::hammer_runtime::RuntimeResult<()> {
+            #contexts_ident
+                .get()
+                .expect("Session App context storage exists after construction")
+                .with_mut(
+                    __hammer_worker.worker(),
+                    __hammer_context,
+                    |__hammer_app| {
+                        <#ident as ::hammer_service::session::protocol::SessionApp>::cleanup(
+                            __hammer_app,
+                            __hammer_worker,
+                            __hammer_session,
+                            __hammer_context,
+                        )
+                    },
+                )
+        }
+
+        fn #half_open_cleanup_ident(
+            __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
+                ::hammer_infra::pool::Index,
+            >,
+            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_context: ::hammer_runtime::app::SessionAppContext,
+        ) -> ::hammer_runtime::RuntimeResult<()> {
+            #contexts_ident
+                .get()
+                .expect("Session App context storage exists after construction")
+                .with_mut(
+                    __hammer_worker.worker(),
+                    __hammer_context,
+                    |__hammer_app| {
+                        <#ident as ::hammer_service::session::protocol::SessionApp>::half_open_cleanup(
+                            __hammer_app,
+                            __hammer_worker,
+                            __hammer_session,
+                            __hammer_context,
+                        )
+                    },
+                )
+        }
+
+        fn #migrate_ident(
+            __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
+                ::hammer_infra::pool::Index,
+            >,
+            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_context: ::hammer_runtime::app::SessionAppContext,
+        ) -> ::hammer_runtime::RuntimeResult<()> {
+            #contexts_ident
+                .get()
+                .expect("Session App context storage exists after construction")
+                .with_mut(
+                    __hammer_worker.worker(),
+                    __hammer_context,
+                    |__hammer_app| {
+                        <#ident as ::hammer_service::session::protocol::SessionApp>::migrate(
+                            __hammer_app,
+                            __hammer_worker,
+                            __hammer_session,
+                            __hammer_context,
+                        )
+                    },
+                )
+        }
+
+        fn #listened_ident(
+            __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
+                ::hammer_infra::pool::Index,
+            >,
+            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_context: ::hammer_runtime::app::SessionAppContext,
+        ) -> ::hammer_runtime::RuntimeResult<()> {
+            #contexts_ident
+                .get()
+                .expect("Session App context storage exists after construction")
+                .with_mut(
+                    __hammer_worker.worker(),
+                    __hammer_context,
+                    |__hammer_app| {
+                        <#ident as ::hammer_service::session::protocol::SessionApp>::listened(
+                            __hammer_app,
+                            __hammer_worker,
+                            __hammer_session,
+                            __hammer_context,
+                        )
+                    },
+                )
+        }
+
+        fn #unlistened_ident(
+            __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
+                ::hammer_infra::pool::Index,
+            >,
+            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_context: ::hammer_runtime::app::SessionAppContext,
+        ) -> ::hammer_runtime::RuntimeResult<()> {
+            #contexts_ident
+                .get()
+                .expect("Session App context storage exists after construction")
+                .with_mut(
+                    __hammer_worker.worker(),
+                    __hammer_context,
+                    |__hammer_app| {
+                        <#ident as ::hammer_service::session::protocol::SessionApp>::unlistened(
+                            __hammer_app,
+                            __hammer_worker,
+                            __hammer_session,
+                            __hammer_context,
+                        )
+                    },
+                )
+        }
+
+        fn #builtin_rx_ident(
+            __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
+                ::hammer_infra::pool::Index,
+            >,
+            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_context: ::hammer_runtime::app::SessionAppContext,
+        ) -> ::hammer_runtime::RuntimeResult<()> {
+            #contexts_ident
+                .get()
+                .expect("Session App context storage exists after construction")
+                .with_mut(
+                    __hammer_worker.worker(),
+                    __hammer_context,
+                    |__hammer_app| {
+                        <#ident as ::hammer_service::session::protocol::SessionApp>::builtin_rx(
+                            __hammer_app,
+                            __hammer_worker,
+                            __hammer_session,
+                            __hammer_context,
+                        )
+                    },
+                )
+        }
+
+        fn #builtin_tx_ident(
+            __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
+                ::hammer_infra::pool::Index,
+            >,
+            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_context: ::hammer_runtime::app::SessionAppContext,
+        ) -> ::hammer_runtime::RuntimeResult<()> {
+            #contexts_ident
+                .get()
+                .expect("Session App context storage exists after construction")
+                .with_mut(
+                    __hammer_worker.worker(),
+                    __hammer_context,
+                    |__hammer_app| {
+                        <#ident as ::hammer_service::session::protocol::SessionApp>::builtin_tx(
+                            __hammer_app,
+                            __hammer_worker,
+                            __hammer_session,
+                            __hammer_context,
+                        )
+                    },
+                )
+        }
+
+        fn #fifo_tuning_ident(
+            __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
+                ::hammer_infra::pool::Index,
+            >,
+            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_context: ::hammer_runtime::app::SessionAppContext,
+        ) -> ::hammer_runtime::RuntimeResult<()> {
+            #contexts_ident
+                .get()
+                .expect("Session App context storage exists after construction")
+                .with_mut(
+                    __hammer_worker.worker(),
+                    __hammer_context,
+                    |__hammer_app| {
+                        <#ident as ::hammer_service::session::protocol::SessionApp>::fifo_tuning(
+                            __hammer_app,
+                            __hammer_worker,
+                            __hammer_session,
+                            __hammer_context,
+                        )
+                    },
+                )
+        }
+
+        fn #proxy_alloc_fifos_ident(
+            __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
+                ::hammer_infra::pool::Index,
+            >,
+            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_context: ::hammer_runtime::app::SessionAppContext,
+        ) -> ::hammer_runtime::RuntimeResult<()> {
+            #contexts_ident
+                .get()
+                .expect("Session App context storage exists after construction")
+                .with_mut(
+                    __hammer_worker.worker(),
+                    __hammer_context,
+                    |__hammer_app| {
+                        <#ident as ::hammer_service::session::protocol::SessionApp>::proxy_alloc_fifos(
+                            __hammer_app,
+                            __hammer_worker,
+                            __hammer_session,
+                            __hammer_context,
+                        )
+                    },
+                )
+        }
+
+        fn #proxy_write_early_data_ident(
+            __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
+                ::hammer_infra::pool::Index,
+            >,
+            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_context: ::hammer_runtime::app::SessionAppContext,
+        ) -> ::hammer_runtime::RuntimeResult<()> {
+            #contexts_ident
+                .get()
+                .expect("Session App context storage exists after construction")
+                .with_mut(
+                    __hammer_worker.worker(),
+                    __hammer_context,
+                    |__hammer_app| {
+                        <#ident as ::hammer_service::session::protocol::SessionApp>::proxy_write_early_data(
+                            __hammer_app,
+                            __hammer_worker,
+                            __hammer_session,
+                            __hammer_context,
+                        )
+                    },
+                )
+        }
+
+        fn #app_evt_ident(
+            __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
+                ::hammer_infra::pool::Index,
+            >,
+            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_context: ::hammer_runtime::app::SessionAppContext,
+        ) -> ::hammer_runtime::RuntimeResult<()> {
+            #contexts_ident
+                .get()
+                .expect("Session App context storage exists after construction")
+                .with_mut(
+                    __hammer_worker.worker(),
+                    __hammer_context,
+                    |__hammer_app| {
+                        <#ident as ::hammer_service::session::protocol::SessionApp>::app_evt(
+                            __hammer_app,
+                            __hammer_worker,
+                            __hammer_session,
+                            __hammer_context,
+                        )
+                    },
+                )
+        }
+
+        fn #crypto_async_ident(
+            __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
+                ::hammer_infra::pool::Index,
+            >,
+            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_context: ::hammer_runtime::app::SessionAppContext,
+        ) -> ::hammer_runtime::RuntimeResult<()> {
+            #contexts_ident
+                .get()
+                .expect("Session App context storage exists after construction")
+                .with_mut(
+                    __hammer_worker.worker(),
+                    __hammer_context,
+                    |__hammer_app| {
+                        <#ident as ::hammer_service::session::protocol::SessionApp>::crypto_async(
+                            __hammer_app,
+                            __hammer_worker,
+                            __hammer_session,
+                            __hammer_context,
+                        )
+                    },
+                )
+        }
+
+        fn #install_ident(
+            __hammer_engine: &mut ::hammer_runtime::Engine,
+        ) -> ::hammer_runtime::RuntimeResult<()> {
+            let __hammer_main = __hammer_engine
+                .registry
+                .require::<::hammer_service::session::runtime::SessionMain>()?;
+            __hammer_main.install_session_app(
+                &__hammer_engine.runtime,
                 #name,
-                #create_ident,
-                #ingress_ident,
-                #egress_ident,
-                #claim_ready_ident,
-                #sessions_ident,
+                &#callbacks_ident,
+            )
+        }
+
+        pub(crate) static #callbacks_ident: ::hammer_service::session::protocol::SessionAppCallbacks =
+            ::hammer_service::session::protocol::SessionAppCallbacks {
+                add_segment: ::core::option::Option::Some(#add_segment_ident),
+                del_segment: ::core::option::Option::Some(#del_segment_ident),
+                accept: ::core::option::Option::Some(#accept_ident),
+                connected: ::core::option::Option::Some(#connected_ident),
+                disconnect: ::core::option::Option::Some(#disconnect_ident),
+                reset: ::core::option::Option::Some(#reset_ident),
+                transport_closed: ::core::option::Option::Some(#transport_closed_ident),
+                cleanup: ::core::option::Option::Some(#cleanup_ident),
+                half_open_cleanup: ::core::option::Option::Some(#half_open_cleanup_ident),
+                migrate: ::core::option::Option::Some(#migrate_ident),
+                listened: ::core::option::Option::Some(#listened_ident),
+                unlistened: ::core::option::Option::Some(#unlistened_ident),
+                builtin_rx: ::core::option::Option::Some(#builtin_rx_ident),
+                builtin_tx: ::core::option::Option::Some(#builtin_tx_ident),
+                fifo_tuning: ::core::option::Option::Some(#fifo_tuning_ident),
+                proxy_alloc_fifos: ::core::option::Option::Some(#proxy_alloc_fifos_ident),
+                proxy_write_early_data: ::core::option::Option::Some(#proxy_write_early_data_ident),
+                app_evt: ::core::option::Option::Some(#app_evt_ident),
+                crypto_async: ::core::option::Option::Some(#crypto_async_ident),
+            };
+
+        pub(crate) static #static_ident: ::hammer_runtime::app::SessionAppRegistration =
+            ::hammer_runtime::app::SessionAppRegistration::new(
+                #name,
+                #install_ident,
                 #destroy_ident,
             );
     }
@@ -2881,7 +3381,7 @@ struct PluginArgs {
     node_functions: Vec<Path>,
     process_nodes: Vec<Path>,
     session_transports: Vec<Path>,
-    app_session_protocols: Vec<Path>,
+    session_apps: Vec<Path>,
     binary_api_methods: Vec<Path>,
 }
 
@@ -2899,7 +3399,7 @@ impl Parse for PluginArgs {
         let mut node_functions = Vec::new();
         let mut process_nodes = Vec::new();
         let mut session_transports = Vec::new();
-        let mut app_session_protocols = Vec::new();
+        let mut session_apps = Vec::new();
         let mut binary_api_methods = Vec::new();
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -2926,7 +3426,7 @@ impl Parse for PluginArgs {
                 "node_functions" => node_functions = parse_path_array(input)?,
                 "process_nodes" => process_nodes = parse_path_array(input)?,
                 "session_transports" => session_transports = parse_path_array(input)?,
-                "app_session_protocols" => app_session_protocols = parse_path_array(input)?,
+                "session_apps" => session_apps = parse_path_array(input)?,
                 "binary_api_methods" => binary_api_methods = parse_path_array(input)?,
                 other => {
                     return Err(Error::new(
@@ -2952,7 +3452,7 @@ impl Parse for PluginArgs {
             node_functions,
             process_nodes,
             session_transports,
-            app_session_protocols,
+            session_apps,
             binary_api_methods,
         })
     }
@@ -3012,7 +3512,7 @@ fn plugin_registration_tokens(args: &PluginArgs) -> TokenStream2 {
     let node_functions = &args.node_functions;
     let process_nodes = &args.process_nodes;
     let session_transports = &args.session_transports;
-    let app_session_protocols = &args.app_session_protocols;
+    let session_apps = &args.session_apps;
     let binary_api_methods = &args.binary_api_methods;
     let dependencies_ident = format_ident!(
         "__PLUGIN_LOAD_AFTER_{}",
@@ -3030,7 +3530,7 @@ fn plugin_registration_tokens(args: &PluginArgs) -> TokenStream2 {
             node_functions = [#(#node_functions),*];
             process_nodes = [#(#process_nodes),*];
             session_transports = [#(#session_transports),*];
-            app_session_protocols = [#(#app_session_protocols),*];
+            session_apps = [#(#session_apps),*];
             binary_api_methods = [#(#binary_api_methods),*];
         );
 

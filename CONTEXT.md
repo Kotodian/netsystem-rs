@@ -289,19 +289,31 @@ The app-side model has one concrete session abstraction, `AppSession<S>`, for bo
 _Avoid_: parallel local/remote session objects, TLS-specific app session, wrapper-of-wrapper app facades, session lookup context presented as another session type
 
 **Application Listener**:
-An Application-owned accepted-connection destination. The Application fixes its App Session Policy when listening; Session Runtime uses the Application Listener identity to select the policy and final Local or SVM delivery, while the selected Transport retains only its own endpoint lookup and an opaque route back to that Application Listener.
+An Application-owned accepted-connection destination. The Application fixes its Session App selection when listening; Session Runtime uses the Application Listener identity to select the Session App and final Local or SVM delivery, while the selected Transport retains only its own endpoint lookup and an opaque route back to that Application Listener.
 _Avoid_: TCP listener as Application identity, Transport-owned TLS mode, SVM segment key as listener semantics
 
-**App Session Policy**:
-The immutable ordered App Session protocol selection supplied by an Application when it listens or connects. Application Main resolves this policy once and retains it with the Application Listener or Application Connection. Transport selection is a separate listen/connect decision. A DSO registers its Transport and App Session protocol behavior internally; the Application does not name or select the containing plugin.
-_Avoid_: TCP TLS option, mutable session mode, protocol selection inside AppSession, plugin-selected Application policy
+**Session App**:
+A concrete plugin-registered Session callback provider selected by an Application endpoint. Session owns every Session, FIFO, event route, lifecycle transition, and publication; the plugin owns worker-local protocol state addressed by `app_session`. One Session App may aggregate multiple Sessions for HTTP/3 or operate one-to-one for TLS.
+_Avoid_: AppSessionProtocol, generic protocol relationship registry, ordered protocol-chain policy, Session-owned protocol state
 
-**App Session Protocol Connection**:
-A worker-owned concrete protocol state created while applying one Application policy selection. Its connection record owns the two Session Handles on which that behavior operates. Each of those Sessions independently owns RX/TX FIFOs and selects the behavior invoked by a Session Event. Application policy order is used only while constructing these Session relationships; Session Worker stores no protocol order, adjacency table, or Application reverse index. FIFO writes produce `RxEnq` or `TxEnq`, capacity release produces `RxDeq` or `TxDeq`, and protocol-state output produces the Session-internal `ProtocolOutput` event. One event resolves one Session pool slot and invokes only that Session's selected behavior.
-_Avoid_: ordered Session container, recursive protocol traversal, whole-Session scan, per-protocol work queue, TLS mode in App Session, protocol-aware FIFO, mutable protocol switch, transport-specific app interface
+**Session App Callbacks**:
+The VPP-shaped callback table through which Session dispatches exact Session events to a registered Session App. It covers accept, connected, disconnect, reset, transport closed, cleanup, builtin RX/TX, segment, listened/unlistened, FIFO tuning, proxy, app event, and crypto async callbacks. Unimplemented callbacks remain available as no-op defaults.
+_Avoid_: one generic `call` method, protocol response enum, callback wrapper that hides Session ownership
+
+**HTTP/3 Connection**:
+An HTTP/3 Session App connection that aggregates all HTTP/3 request, control, and QPACK streams carried by one QUIC Connection. Its SETTINGS, QPACK, GOAWAY, and stream-role state is connection-wide and worker-owned.
+_Avoid_: independent HTTP/3 parser per QUIC Stream, HTTP/3 state in QUIC Connection, shared cross-worker HTTP/3 state
+
+**HTTP/3 Request Stream**:
+A bidirectional HTTP/3 stream presented across the App/Session Seam as one AppSession. Its HTTP message framing is transformed between one QUIC Stream and that AppSession under the owning HTTP/3 Connection.
+_Avoid_: connection-wide AppSession, raw control stream, QUIC-owned HTTP request
+
+**HTTP/3 Internal Stream**:
+An HTTP/3 control, QPACK encoder, or QPACK decoder stream consumed and produced by the owning HTTP/3 Connection without publishing an AppSession.
+_Avoid_: application request stream, hidden AppSession, HTTP/3 stream owned by QUIC
 
 **Transport Listener**:
-A Transport-owned endpoint lookup registration that accepts Transport Connections and retains Transport-specific capabilities. It routes an accepted connection to an opaque Application Listener identity but neither selects nor interprets the Application's App Session Policy.
+An Transport-owned endpoint lookup registration that accepts Transport Connections and retains Transport-specific capabilities. It routes an accepted connection to an opaque Application Listener identity but neither selects nor interprets the Application's Session App.
 _Avoid_: Application policy in TCP config, TLS profile in Transport lookup, Transport listener reused as Application identity
 
 ## Session And Transport
@@ -383,12 +395,16 @@ A Session Lifecycle state in which the app-facing transport object no longer exi
 _Avoid_: stale connection index, TCP closed flag, tombstone connection
 
 **Transport Connection**:
-The transport-worker-owned protocol state associated with a session, such as TCP sequence, ACK, recovery, and timer facts. It does not own app/session FIFOs or Session Runtime scheduling.
+The transport-worker-owned state for one protocol connection. A TCP Connection is represented by one Session, while a QUIC Connection multiplexes multiple QUIC Streams and every stream is represented by one Session; no Transport Connection owns app/session FIFOs or Session Runtime scheduling.
 _Avoid_: app session, runtime session, socket object
 
 **Transport Index**:
-An opaque transport-provided index from a Session to its app-facing transport object. The object may be a TCP connection, QUIC connection, or QUIC stream; Session Runtime preserves and passes the index without interpreting the object's kind, pool representation, parent relationship, or state.
-_Avoid_: TCP connection in Session Runtime, QUIC stream id in Session Runtime, SessionId used as a transport index
+An opaque transport-provided index from a Session to its exact private transport state. TCP uses it for `TcpConnection` state and QUIC uses it for the stream state backing that Session; the QUIC stream state privately references its parent `QuicConnection`. Session Runtime preserves and passes the index without interpreting the transport's pool representation, parent relationship, or state.
+_Avoid_: TCP connection in Session Runtime, QUIC stream id in Session Runtime, shared QUIC connection index for multiple Sessions, SessionId passed into transport dispatch
+
+**Session Transport Driver**:
+The worker-local `SessionTransport` implementation through which Session Queue advances a transport, schedules TX, applies close operations, and maps an exact per-Session Transport Index to its owning transport connection index. TCP maps its connection state to itself, while QUIC maps private stream state to its parent `QuicConnection`. The VPP-aligned `app_rx_evt` operation is invoked only after Session Queue resolves an `RxDeq` event to the exact transport Session; despite its established name, it is not a direct App-to-transport callback. The driver receives only transport-owned indexes and transport-neutral Session facts, and never selects or invokes an App Session protocol.
+_Avoid_: transport Graph Node, QUIC-specific Session API, SessionId transport dispatch, direct App-to-transport callback, App Session protocol dispatch
 
 **TX Byte Retention**:
 The session-owned retention of transmitted application bytes until transport ACK cleanup releases them. Recovery retransmits from session-owned bytes and transport facts, not from private payload copies.
@@ -441,8 +457,12 @@ An application-selected secure datagram relationship that uses DTLS records over
 _Avoid_: UDP TLS connection, stream session, encrypted UDP helper
 
 **QUIC Connection**:
-A secure multiplexed transport over UDP packets that uses the TLS 1.3 handshake but owns QUIC packet protection, reliability, congestion control, and stream state. It does not use the TLS or DTLS record layer.
-_Avoid_: TLS record transport, UDP session, DTLS stream
+A Transport Connection over UDP packets that uses the TLS 1.3 handshake and owns QUIC packet protection, reliability, congestion control, connection identity, and its QUIC Streams. It occupies the same transport-layer role as a TCP Connection, but it does not use the TLS or DTLS record layer and is not itself a Session or AppSession.
+_Avoid_: TLS record transport, UDP session, DTLS stream, QUIC Session, QUIC AppSession
+
+**QUIC Stream**:
+A multiplexed reliable byte stream represented by exactly one Session. Its Transport Index addresses protocol-private stream state inside `transport/quic`, and that state references the owning QUIC Connection; it is not a second app-facing stream identity. With no selected upper protocol the Session is published directly as one AppSession; closing or resetting one stream does not close its siblings, while closing the owning connection closes every remaining stream.
+_Avoid_: QUIC Connection session, UDP datagram, shared multi-stream AppSession
 
 ## IP Reassembly
 

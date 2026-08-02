@@ -10,10 +10,7 @@
 
 use hammer_app::attach::{AppClient, AppClientError};
 use hammer_app::echo::run_echo_loop;
-use hammer_app::{
-    APP_SESSION_POLICY_VERSION, AppSession, AppSessionError, AppSessionPolicy, DataWorkerId,
-    SessionListenEndpoint,
-};
+use hammer_app::{AppSession, AppSessionError, DataWorkerId, SessionListenEndpoint};
 use hammer_runtime::app::SessionEvtType;
 
 const DEFAULT_ATTACH_SOCKET: &str = "/tmp/hammer-tcp-integration.attach.sock";
@@ -58,12 +55,11 @@ fn main() -> Result<(), EchoError> {
         .build()
         .map_err(|source| EchoError::TokioRuntime { source })?;
     let mut client = AppClient::attach(&socket_path)?;
-    let policy = AppSessionPolicy::new(APP_SESSION_POLICY_VERSION, [])
-        .expect("the built-in plaintext App Session policy is valid");
     let listener = client.listen(
         "tcp",
         SessionListenEndpoint::new(listen_address, DataWorkerId::new(0)),
-        policy,
+        None,
+        None,
     )?;
     eprintln!(
         "attached Application {:?} via {socket_path}; listening on {listen_address} as {listener:?}",

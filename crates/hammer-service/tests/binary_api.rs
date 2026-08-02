@@ -59,7 +59,7 @@ hammer_runtime::__declare_registration_image!(
     node_functions = [];
     process_nodes = [];
     session_transports = [];
-    app_session_protocols = [];
+    session_apps = [];
     binary_api_methods = [__BINARY_API_ECHO, __BINARY_API_PANIC_METHOD];
 );
 

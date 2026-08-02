@@ -24,7 +24,7 @@ hammer_runtime::__declare_registration_image!(
         __PROCESS_NODE_PROCESS_RUNTIME_TEST,
     ];
     session_transports = [];
-    app_session_protocols = [];
+    session_apps = [];
     binary_api_methods = [];
 );
 

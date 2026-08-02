@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
 use hammer_runtime::app::{
-    AppSessionPolicy, ApplicationConnectionId, ApplicationSessionRequest, ApplicationSessionStatus,
+    ApplicationConnectionId, ApplicationSessionRequest, ApplicationSessionStatus, SessionAppId,
     dequeue_application_session_reply, enqueue_application_session_request,
 };
 use hammer_runtime::{DataWorkerId, SessionListenEndpoint, SessionListenerId};
@@ -13,14 +13,16 @@ impl AppClient {
         &mut self,
         transport: impl Into<String>,
         endpoint: SessionListenEndpoint,
-        policy: AppSessionPolicy,
+        app: Option<SessionAppId>,
+        config: Option<u64>,
     ) -> Result<SessionListenerId, AppClientError> {
         let context = self.next_session_context();
         let reply = self.session_request(ApplicationSessionRequest::Listen {
             context,
             transport: transport.into(),
             endpoint,
-            policy,
+            app,
+            config,
         })?;
         Ok(reply.listener())
     }
@@ -32,7 +34,8 @@ impl AppClient {
         local: Option<SocketAddr>,
         worker: DataWorkerId,
         server_name: Option<String>,
-        policy: AppSessionPolicy,
+        app: Option<SessionAppId>,
+        config: Option<u64>,
     ) -> Result<ApplicationConnectionId, AppClientError> {
         let context = self.next_session_context();
         let reply = self.session_request(ApplicationSessionRequest::Connect {
@@ -42,7 +45,8 @@ impl AppClient {
             local,
             worker,
             server_name,
-            policy,
+            app,
+            config,
         })?;
         Ok(reply.connection())
     }

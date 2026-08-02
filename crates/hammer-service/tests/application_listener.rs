@@ -1,14 +1,12 @@
-use hammer_runtime::app::{APP_SESSION_POLICY_VERSION, AppSessionPolicy};
+use hammer_runtime::app::SessionAppId;
 use hammer_service::session::{ApplicationError, ApplicationMain};
 
 #[test]
-fn application_listener_owns_a_validated_immutable_session_policy() {
+fn application_listener_owns_a_validated_session_app_selection() {
     let applications = ApplicationMain::new(4);
-    let policy =
-        AppSessionPolicy::new(APP_SESSION_POLICY_VERSION, []).expect("direct App Session policy");
     let application = applications.attach().expect("attach Application");
     let listener = applications
-        .register_listener(application, &policy)
+        .register_listener(application, None::<SessionAppId>, None)
         .expect("register Application listener");
 
     applications
@@ -23,11 +21,9 @@ fn application_listener_owns_a_validated_immutable_session_policy() {
 #[test]
 fn application_listener_identity_is_owned_and_generation_checked() {
     let applications = ApplicationMain::new(4);
-    let policy =
-        AppSessionPolicy::new(APP_SESSION_POLICY_VERSION, []).expect("direct App Session policy");
     let first = applications.attach().expect("attach first Application");
     let listener = applications
-        .register_listener(first, &policy)
+        .register_listener(first, None::<SessionAppId>, None)
         .expect("register Application listener");
     let second_application = applications.attach().expect("attach second Application");
 
@@ -41,7 +37,7 @@ fn application_listener_identity_is_owned_and_generation_checked() {
         .remove_listener(first, listener)
         .expect("remove first listener");
     let replacement = applications
-        .register_listener(first, &policy)
+        .register_listener(first, None::<SessionAppId>, None)
         .expect("register replacement listener");
     assert_ne!(listener, replacement);
 }

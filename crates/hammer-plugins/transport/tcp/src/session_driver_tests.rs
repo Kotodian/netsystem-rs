@@ -9,13 +9,13 @@ use crate::{
 use hammer_core::data_plane::{BufferFrame, NodeId};
 use hammer_infra::pool::Index;
 use hammer_runtime::app::{
-    AppSessionConfig, AppSessionError, AppSessionProtocol, AppSessionProtocolEntry,
-    AppSessionProtocolRole, AppSessionProtocolSelection, ApplicationId, SessionEvt, SessionEvtType,
+    AppSessionConfig, AppSessionError, ApplicationId, SessionAppId, SessionEvt, SessionEvtType,
 };
 use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, RuntimeError};
 
 use hammer_service::data_plane::DropNode;
 use hammer_service::session::node::{SessionQueueNext, SessionQueueNode, SessionQueueOutput};
+use hammer_service::session::protocol::{SessionApp, SessionAppCallbacks};
 use hammer_service::session::runtime::{
     SessionPacketizedTransport, SessionTransport, SessionWorker, TransportSendFlags,
     dispatch_session_queue_once, dispatch_session_queue_pending,
@@ -24,74 +24,6 @@ use hammer_service::session::{ApplicationMain, SessionId};
 
 use crate::timers::{TcpTimerKind, TcpTimers};
 use crate::{TcpConnection, TcpWorker};
-
-#[hammer_component_macros::app_session_protocol(name = "tls")]
-struct TlsProtocol;
-
-impl AppSessionProtocol for TlsProtocol {
-    fn create(
-        _: Option<ApplicationId>,
-        _: AppSessionProtocolRole,
-        _: Option<u64>,
-        _: Option<&str>,
-    ) -> hammer_runtime::RuntimeResult<Self> {
-        Ok(Self)
-    }
-
-    fn ingress(
-        &mut self,
-        _: &hammer_infra::fifo::Fifo,
-        _: &hammer_infra::fifo::Fifo,
-    ) -> hammer_runtime::RuntimeResult<(usize, usize)> {
-        Ok((0, 0))
-    }
-
-    fn egress(
-        &mut self,
-        _: &hammer_infra::fifo::Fifo,
-        _: &hammer_infra::fifo::Fifo,
-    ) -> hammer_runtime::RuntimeResult<(usize, usize)> {
-        Err(AppSessionError::EventQueueFull {
-            session: 0,
-            event: SessionEvtType::Connect,
-        }
-        .into())
-    }
-}
-
-#[hammer_component_macros::app_session_protocol(name = "http")]
-struct HttpProtocol;
-
-impl AppSessionProtocol for HttpProtocol {
-    fn create(
-        _: Option<ApplicationId>,
-        _: AppSessionProtocolRole,
-        _: Option<u64>,
-        _: Option<&str>,
-    ) -> hammer_runtime::RuntimeResult<Self> {
-        Ok(Self)
-    }
-
-    fn ingress(
-        &mut self,
-        _: &hammer_infra::fifo::Fifo,
-        _: &hammer_infra::fifo::Fifo,
-    ) -> hammer_runtime::RuntimeResult<(usize, usize)> {
-        Ok((0, 0))
-    }
-
-    fn egress(
-        &mut self,
-        _: &hammer_infra::fifo::Fifo,
-        _: &hammer_infra::fifo::Fifo,
-    ) -> hammer_runtime::RuntimeResult<(usize, usize)> {
-        Err(AppSessionError::EventQueueFull {
-            session: 0,
-            event: SessionEvtType::Connect,
-        }
-        .into())
-    }
-}
 
 fn tcp_session<'a>(
     sessions: &SessionWorker<Index>,
@@ -116,12 +48,9 @@ fn established_connection() -> TcpConnection {
 
 fn worker_state() -> (SessionWorker<Index>, TcpWorker, Arc<ApplicationMain>) {
     let worker = DataWorkerId::new(0);
-    let applications = ApplicationMain::with_protocols(
+    let applications = ApplicationMain::with_session_apps(
         1024,
-        [
-            __APP_SESSION_PROTOCOL_TLS_PROTOCOL,
-            __APP_SESSION_PROTOCOL_HTTP_PROTOCOL,
-        ],
+        [__SESSION_APP_TLS_PROTOCOL, __SESSION_APP_HTTP_PROTOCOL],
     );
     let sessions = hammer_service::session::SessionWorker::new(
         worker,
@@ -140,22 +69,19 @@ fn attach_protocol_session(
     applications: &Arc<ApplicationMain>,
     tcp: &mut TcpWorker,
     connection_index: Index,
-    protocol: AppSessionProtocolEntry,
+    app: SessionAppId,
+    callbacks: SessionAppCallbacks,
 ) -> SessionId {
     let application = applications.attach().expect("attach test Application");
     sessions
         .install_application_mq_for_test(application)
         .expect("install test Application MQ");
-    let policy = hammer_runtime::app::AppSessionPolicy::new(
-        hammer_runtime::app::APP_SESSION_POLICY_VERSION,
-        [AppSessionProtocolSelection::new(
-            protocol.registration().name(),
-        )],
-    )
-    .expect("App Session protocol policy is valid");
+    sessions
+        .install_session_app(app, callbacks)
+        .expect("install test Session App callbacks");
     let application_listener = applications
-        .register_listener(application, &policy)
-        .expect("register protocol Application listener");
+        .register_listener(application, Some(app), None)
+        .expect("register Session App Application listener");
     let session_main = std::sync::Arc::new(hammer_service::session::runtime::SessionMain::new(
         1,
         Arc::clone(applications),
@@ -178,7 +104,7 @@ fn attach_protocol_session(
         .expect("register protocol Session listener");
     let session_id = sessions
         .stream_accept(TcpWorker::ID, connection_index, listener)
-        .expect("construct protocol Session");
+        .expect("construct direct Session");
     tcp.connection_mut(connection_index)
         .expect("TCP connection")
         .attach_session(session_id)
@@ -361,13 +287,8 @@ fn rollback_discards_unpublished_session_without_close_notification() {
     sessions
         .install_application_mq_for_test(application)
         .expect("install test Application MQ");
-    let policy = hammer_runtime::app::AppSessionPolicy::new(
-        hammer_runtime::app::APP_SESSION_POLICY_VERSION,
-        [],
-    )
-    .expect("direct App Session policy is valid");
     let application_listener = applications
-        .register_listener(application, &policy)
+        .register_listener(application, None, None)
         .expect("register test Application listener");
     let session_main = std::sync::Arc::new(hammer_service::session::runtime::SessionMain::new(
         1,
@@ -426,13 +347,8 @@ fn active_open_commits_session_after_full_connection_publication() {
     sessions
         .install_application_mq_for_test(application)
         .expect("install test Application MQ");
-    let policy = hammer_runtime::app::AppSessionPolicy::new(
-        hammer_runtime::app::APP_SESSION_POLICY_VERSION,
-        [],
-    )
-    .expect("direct App Session policy is valid");
     let application_listener = applications
-        .register_listener(application, &policy)
+        .register_listener(application, None, None)
         .expect("register test Application listener");
     let session_main = std::sync::Arc::new(hammer_service::session::runtime::SessionMain::new(
         1,
@@ -504,7 +420,8 @@ fn passive_open_app_notification_failure_rolls_back_all_owner_state() {
         &applications,
         &mut tcp,
         connection_index,
-        __APP_SESSION_PROTOCOL_TLS_PROTOCOL,
+        SessionAppId::new(0),
+        __SESSION_APP_TLS_PROTOCOL_CALLBACKS,
     );
 
     let error = publish_tcp_connection(&mut sessions, &mut tcp, session_id)
@@ -539,7 +456,8 @@ fn active_open_app_notification_failure_rolls_back_all_owner_state() {
         &applications,
         &mut tcp,
         connection_index,
-        __APP_SESSION_PROTOCOL_HTTP_PROTOCOL,
+        SessionAppId::new(1),
+        __SESSION_APP_HTTP_PROTOCOL_CALLBACKS,
     );
     publish_tcp_connection(&mut sessions, &mut tcp, session_id)
         .expect("publish active half-open lookup");
@@ -874,4 +792,83 @@ fn tcp_send_params_deschedules_when_peer_window_is_zero() {
 
     assert_eq!(params.snd_space, 0);
     assert!(params.flags.contains(TransportSendFlags::DESCHED));
+}
+#[hammer_component_macros::session_app(name = "tls")]
+struct TlsProtocol;
+
+impl SessionApp for TlsProtocol {
+    fn create(
+        _: Option<ApplicationId>,
+        _: Option<SessionAppId>,
+        _: Option<u64>,
+        _: Option<&str>,
+    ) -> hammer_runtime::RuntimeResult<Self> {
+        Ok(Self)
+    }
+
+    fn connected(
+        &mut self,
+        _: &mut hammer_service::session::runtime::SessionWorker<Index>,
+        _: SessionId,
+        _: u64,
+    ) -> hammer_runtime::RuntimeResult<()> {
+        Err(AppSessionError::EventQueueFull {
+            session: 0,
+            event: SessionEvtType::Connect,
+        }
+        .into())
+    }
+
+    fn accept(
+        &mut self,
+        _: &mut hammer_service::session::runtime::SessionWorker<Index>,
+        _: SessionId,
+        _: u64,
+    ) -> hammer_runtime::RuntimeResult<()> {
+        Err(AppSessionError::EventQueueFull {
+            session: 0,
+            event: SessionEvtType::Connect,
+        }
+        .into())
+    }
+}
+
+#[hammer_component_macros::session_app(name = "http")]
+struct HttpProtocol;
+
+impl SessionApp for HttpProtocol {
+    fn create(
+        _: Option<ApplicationId>,
+        _: Option<SessionAppId>,
+        _: Option<u64>,
+        _: Option<&str>,
+    ) -> hammer_runtime::RuntimeResult<Self> {
+        Ok(Self)
+    }
+
+    fn connected(
+        &mut self,
+        _: &mut hammer_service::session::runtime::SessionWorker<Index>,
+        _: SessionId,
+        _: u64,
+    ) -> hammer_runtime::RuntimeResult<()> {
+        Err(AppSessionError::EventQueueFull {
+            session: 0,
+            event: SessionEvtType::Connect,
+        }
+        .into())
+    }
+
+    fn accept(
+        &mut self,
+        _: &mut hammer_service::session::runtime::SessionWorker<Index>,
+        _: SessionId,
+        _: u64,
+    ) -> hammer_runtime::RuntimeResult<()> {
+        Err(AppSessionError::EventQueueFull {
+            session: 0,
+            event: SessionEvtType::Connect,
+        }
+        .into())
+    }
 }

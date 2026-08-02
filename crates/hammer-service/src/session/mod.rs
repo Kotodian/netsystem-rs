@@ -25,9 +25,11 @@ pub use application::{
 };
 pub use config::Session;
 pub use error::SessionQueueError;
-pub use hammer_runtime::app::AppSessionProtocol;
 pub use id::SessionId;
 pub use node::{AppSessionInputNode, SESSION_QUEUE_IO_BUDGET, SessionQueueNext, SessionQueueNode};
+pub use protocol::{
+    SessionApp, SessionAppCallback, SessionAppCallbacks, SessionAppSegmentCallback,
+};
 pub use runtime::SessionWorker;
 
 #[hammer_component_macros::config_function(
@@ -64,9 +66,9 @@ fn init_application(
     engine: &mut Engine,
     session: Arc<Session>,
 ) -> RuntimeResult<Arc<ApplicationMain>> {
-    Ok(ApplicationMain::with_protocols(
+    Ok(ApplicationMain::with_session_apps(
         session.app_session_capacity,
-        engine.plugin_main().app_session_protocols(),
+        engine.plugin_main().session_apps(),
     ))
 }
 
@@ -107,7 +109,11 @@ fn init_session_worker(
         publisher,
     )?;
     sessions.set_listener_main(Arc::clone(&main));
-    runtime::install_session_worker(&main, engine, app_session_input, session_queue, sessions)
+    runtime::install_session_worker(&main, engine, app_session_input, session_queue, sessions)?;
+    for registration in engine.plugin_main().session_apps() {
+        registration.install(engine)?;
+    }
+    Ok(())
 }
 
 #[hammer_component_macros::init_function(name = "session_attach_server")]

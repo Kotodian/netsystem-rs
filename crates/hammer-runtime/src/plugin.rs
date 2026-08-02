@@ -15,7 +15,7 @@ use object::{Object, ObjectSection};
 use semver::Version;
 use serde::Deserialize;
 
-use crate::app::AppSessionProtocolEntry;
+use crate::app::SessionAppRegistration;
 use crate::binary_api::BinaryApiMethodEntry;
 use crate::init::{ConfigFunction, InitFunction};
 use crate::node::{NodeEntry, NodeFunctionRegistration};
@@ -123,10 +123,10 @@ impl RootModule for PluginModuleRef {
 pub enum PluginError {
     #[error("plugin `{name}` is not loaded")]
     NotLoaded { name: String },
-    #[error("App Session protocol `{name}` is not registered")]
-    AppSessionProtocolMissing { name: String },
-    #[error("App Session protocol `{name}` is registered more than once")]
-    AppSessionProtocolDuplicate { name: String },
+    #[error("Session App `{name}` is not registered")]
+    SessionAppMissing { name: String },
+    #[error("Session App `{name}` is registered more than once")]
+    SessionAppDuplicate { name: String },
     #[error("Session Transport `{name}` is not registered")]
     SessionTransportMissing { name: String },
     #[error("Session Transport `{name}` is registered more than once")]
@@ -512,24 +512,24 @@ impl PluginMain {
         })
     }
 
-    pub fn app_session_protocols(&self) -> Vec<AppSessionProtocolEntry> {
-        self.collect_registrations(RegistrationImage::app_session_protocols)
+    pub fn session_apps(&self) -> Vec<SessionAppRegistration> {
+        self.collect_registrations(RegistrationImage::session_apps)
     }
 
-    pub fn app_session_protocol(&self, name: &str) -> Result<AppSessionProtocolEntry, PluginError> {
+    pub fn session_app(&self, name: &str) -> Result<SessionAppRegistration, PluginError> {
         let mut found = None;
-        for entry in self.app_session_protocols() {
-            if entry.registration().name() != name {
+        for entry in self.session_apps() {
+            if entry.name() != name {
                 continue;
             }
             if found.is_some() {
-                return Err(PluginError::AppSessionProtocolDuplicate {
+                return Err(PluginError::SessionAppDuplicate {
                     name: name.to_owned(),
                 });
             }
             found = Some(entry);
         }
-        found.ok_or_else(|| PluginError::AppSessionProtocolMissing {
+        found.ok_or_else(|| PluginError::SessionAppMissing {
             name: name.to_owned(),
         })
     }

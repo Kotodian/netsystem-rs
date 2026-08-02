@@ -167,7 +167,7 @@ main_heap_size = "256 MiB"
 }
 
 #[test]
-fn tls_dso_registers_app_session_protocol() {
+fn tls_dso_registers_session_app() {
     if std::env::var_os(PROTOCOL_REGISTRATION_CHILD).is_some() {
         let mut plugins = PluginMain::default();
         plugins
@@ -175,9 +175,8 @@ fn tls_dso_registers_app_session_protocol() {
             .expect("load TLS DSO");
         assert_eq!(
             plugins
-                .app_session_protocol("tls")
-                .expect("resolve TLS protocol registration")
-                .registration()
+                .session_app("tls")
+                .expect("resolve TLS Session App registration")
                 .name(),
             "tls"
         );
@@ -186,7 +185,7 @@ fn tls_dso_registers_app_session_protocol() {
 
     let status = Command::new(std::env::current_exe().expect("resolve test executable"))
         .arg("--exact")
-        .arg("tls_dso_registers_app_session_protocol")
+        .arg("tls_dso_registers_session_app")
         .arg("--nocapture")
         .env(PROTOCOL_REGISTRATION_CHILD, "1")
         .env("HAMMER_PLUGIN_DIR", daemon_binary_directory())

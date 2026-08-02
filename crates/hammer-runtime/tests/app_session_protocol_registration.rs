@@ -1,22 +1,15 @@
-use hammer_infra::fifo::Fifo;
-use hammer_runtime::app::AppSessionProtocol;
-use hammer_runtime::{PluginError, PluginMain, RuntimeResult};
+use hammer_runtime::app::SessionAppContext;
+use hammer_runtime::{DataWorkerId, Engine, PluginError, PluginMain, RuntimeResult};
 
-#[hammer_component_macros::session_transport(name = "tcp")]
-struct TcpTransport;
-
-#[hammer_component_macros::app_session_protocol(name = "test-protocol")]
-struct TestProtocol;
-
-impl AppSessionProtocol for TestProtocol {
-    fn ingress(&mut self, _: &Fifo, _: &Fifo) -> RuntimeResult<(usize, usize)> {
-        Ok((0, 0))
-    }
-
-    fn egress(&mut self, _: &Fifo, _: &Fifo) -> RuntimeResult<(usize, usize)> {
-        Ok((0, 0))
-    }
+#[allow(clippy::needless_pass_by_value)]
+fn install(_: &mut Engine) -> RuntimeResult<()> {
+    Ok(())
 }
+
+fn destroy(_: DataWorkerId, _: SessionAppContext) {}
+
+static __SESSION_APP_TEST_APP: hammer_runtime::app::SessionAppRegistration =
+    hammer_runtime::app::SessionAppRegistration::new("test-app", install, destroy);
 
 hammer_runtime::__declare_registration_image!(
     init_functions = [];
@@ -28,72 +21,38 @@ hammer_runtime::__declare_registration_image!(
     graph_nodes = [];
     node_functions = [];
     process_nodes = [];
-    session_transports = [__SESSION_TRANSPORT_TCP_TRANSPORT];
-    app_session_protocols = [__APP_SESSION_PROTOCOL_TEST_PROTOCOL];
+    session_transports = [];
+    session_apps = [__SESSION_APP_TEST_APP];
     binary_api_methods = [];
 );
 
 #[test]
-fn component_protocol_registration_is_collected_by_plugin_main() {
+fn component_session_app_registration_is_collected_by_plugin_main() {
     let mut plugins = PluginMain::default();
     plugins.register_builtin_image(&__HAMMER_REGISTRATION_IMAGE);
 
-    let registrations = plugins.app_session_protocols();
+    let registrations = plugins.session_apps();
+    assert!(registrations.iter().any(|entry| entry.name() == "test-app"));
 
-    let names = registrations
-        .iter()
-        .map(|entry| entry.registration().name())
-        .collect::<Vec<_>>();
-
-    assert!(names.contains(&"test-protocol"));
     let registration = plugins
-        .app_session_protocol("test-protocol")
-        .expect("resolve registered protocol")
-        .registration();
-    assert_eq!(registration.name(), "test-protocol");
+        .session_app("test-app")
+        .expect("resolve Session App");
+    assert_eq!(registration.name(), "test-app");
 }
 
 #[test]
-fn component_transport_registration_is_collected_by_plugin_main() {
-    let mut plugins = PluginMain::default();
-    plugins.register_builtin_image(&__HAMMER_REGISTRATION_IMAGE);
-
-    let transport = plugins
-        .session_transport("tcp")
-        .expect("resolve registered Transport");
-    assert_eq!(transport.name(), "tcp");
-}
-
-#[test]
-fn protocol_lookup_reports_missing_and_duplicate_names() {
+fn session_app_lookup_reports_missing_and_duplicate_names() {
     let mut plugins = PluginMain::default();
 
     assert!(matches!(
-        plugins.app_session_protocol("missing"),
-        Err(PluginError::AppSessionProtocolMissing { name }) if name == "missing"
+        plugins.session_app("missing"),
+        Err(PluginError::SessionAppMissing { name }) if name == "missing"
     ));
 
     plugins.register_builtin_image(&__HAMMER_REGISTRATION_IMAGE);
     plugins.register_builtin_image(&__HAMMER_REGISTRATION_IMAGE);
     assert!(matches!(
-        plugins.app_session_protocol("test-protocol"),
-        Err(PluginError::AppSessionProtocolDuplicate { name }) if name == "test-protocol"
-    ));
-}
-
-#[test]
-fn transport_lookup_reports_missing_and_duplicate_names() {
-    let mut plugins = PluginMain::default();
-
-    assert!(matches!(
-        plugins.session_transport("missing"),
-        Err(PluginError::SessionTransportMissing { name }) if name == "missing"
-    ));
-
-    plugins.register_builtin_image(&__HAMMER_REGISTRATION_IMAGE);
-    plugins.register_builtin_image(&__HAMMER_REGISTRATION_IMAGE);
-    assert!(matches!(
-        plugins.session_transport("tcp"),
-        Err(PluginError::SessionTransportDuplicate { name }) if name == "tcp"
+        plugins.session_app("test-app"),
+        Err(PluginError::SessionAppDuplicate { name }) if name == "test-app"
     ));
 }

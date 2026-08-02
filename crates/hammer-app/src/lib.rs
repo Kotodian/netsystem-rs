@@ -8,8 +8,7 @@ pub mod echo;
 mod session;
 
 pub use hammer_runtime::app::{
-    APP_SESSION_POLICY_VERSION, AppSession, AppSessionConfig, AppSessionError, AppSessionPolicy,
-    AppSessionPolicyError, AppSessionProtocolSelection, ApplicationId, ApplicationListenerId,
-    SessionHandle,
+    AppSession, AppSessionConfig, AppSessionError, ApplicationId, ApplicationListenerId,
+    SessionAppId, SessionHandle,
 };
 pub use hammer_runtime::{DataWorkerId, SessionListenEndpoint, SessionListenerId};
