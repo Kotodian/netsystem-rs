@@ -79,7 +79,7 @@ pub use node::{
 };
 pub use plugin::{
     IpOutput, IpOutput_CTO, PluginError, PluginMain, PluginMetadata, PluginModule, PluginModuleRef,
-    host_meets_plugin_requirement,
+    UdpIpVersion, UdpLocal, host_meets_plugin_requirement,
 };
 pub use process::{
     ProcessContext, ProcessEntry, ProcessEventBatch, ProcessFuture, ProcessHandle, ProcessWake,
