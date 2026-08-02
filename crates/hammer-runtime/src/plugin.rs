@@ -59,6 +59,36 @@ pub trait IpOutput: Send + Sync {
     fn register_protocol(&self, protocol: u8, node: NodeId) -> RResult<(), RBoxError>;
 }
 
+/// IP address family used by UDP destination-port registrations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, StableAbi, serde::Deserialize, serde::Serialize)]
+#[repr(u8)]
+pub enum UdpIpVersion {
+    V4 = 0,
+    V6 = 1,
+}
+
+/// UDP destination-port dispatch owned by the UDP plugin.
+///
+/// The implementation remains in UDP; this ABI only gives local consumers a
+/// typed seam for registering the graph next that receives validated datagrams.
+#[sabi_trait]
+pub trait UdpLocal: Send + Sync {
+    fn register_dst_port(
+        &self,
+        version: UdpIpVersion,
+        port: u16,
+        node: NodeId,
+    ) -> RResult<(), RBoxError>;
+
+    #[sabi(last_prefix_field)]
+    fn unregister_dst_port(
+        &self,
+        version: UdpIpVersion,
+        port: u16,
+        node: NodeId,
+    ) -> RResult<(), RBoxError>;
+}
+
 /// Metadata owned by one dynamically loaded plugin module.
 #[repr(C)]
 #[derive(Clone, Copy, StableAbi)]
@@ -111,17 +141,18 @@ impl PluginMetadata {
 
 /// The sole `abi_stable` root module exported by every Hammer plugin DSO.
 ///
-/// IP is currently the only plugin exposing a callable cross-plugin service.
-/// Its interface owns IPv4/IPv6 header construction and protocol dispatch;
-/// other plugins publish `ROption::RNone`.
+/// Plugins expose callable cross-plugin services through the optional
+/// capability fields. IP owns IPv4/IPv6 header construction and protocol
+/// dispatch; UDP owns destination-port dispatch.
 #[repr(C)]
 #[derive(StableAbi)]
 #[sabi(kind(Prefix(prefix_ref = PluginModuleRef)))]
 pub struct PluginModule {
     pub metadata: PluginMetadata,
     pub registration_image: RRef<'static, RegistrationImage>,
-    #[sabi(last_prefix_field)]
     pub ip_output: ROption<RRef<'static, IpOutput_CTO<'static, 'static>>>,
+    #[sabi(last_prefix_field)]
+    pub udp_local: ROption<RRef<'static, UdpLocal_CTO<'static, 'static>>>,
 }
 
 /// Declarative DSO metadata read before loading a plugin.
@@ -143,11 +174,13 @@ impl PluginModule {
         metadata: PluginMetadata,
         registration_image: RRef<'static, RegistrationImage>,
         ip_output: ROption<RRef<'static, IpOutput_CTO<'static, 'static>>>,
+        udp_local: ROption<RRef<'static, UdpLocal_CTO<'static, 'static>>>,
     ) -> Self {
         Self {
             metadata,
             registration_image,
             ip_output,
+            udp_local,
         }
     }
 }

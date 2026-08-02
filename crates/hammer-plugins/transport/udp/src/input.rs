@@ -7,10 +7,11 @@ use arc_swap::ArcSwap;
 use hammer_core::data_plane::{
     BufferFrame, BufferPacketCursor, DEFAULT_BUFFER_FRAME_CAPACITY, Index, NodeId, SecondaryOpaque,
 };
+use hammer_infra::bitmap::Bitmap;
 use hammer_infra::checksum::internet_checksum_parts;
 use hammer_runtime::{
-    DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, TraceFormatter,
-    add_packet_trace, format_packet_trace,
+    DataPlaneRuntime, Engine, Node, NodeProcessFn, NodeResult, NodeRuntimeData, TraceFormatter,
+    UdpIpVersion, add_packet_trace, format_packet_trace,
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
@@ -56,7 +57,7 @@ impl UdpInputError {
 
 #[hammer_component_macros::runtime_error(subsystem = "udp")]
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum UdpControlError {
+pub enum UdpControlError {
     #[error("IP output is unavailable")]
     IpOutputUnavailable,
     #[error("IP output is already initialized")]
@@ -71,6 +72,32 @@ pub(crate) enum UdpControlError {
     RuntimeSlotInvalid { slot: usize },
     #[error("UDP header at offset {offset} is truncated or out of range")]
     HeaderOutOfRange { offset: usize },
+    #[error(
+        "UDP destination port {port} for {version:?} is owned by node {owner:?}, not node {requested_owner:?}"
+    )]
+    PortConflict {
+        version: UdpIpVersion,
+        port: u16,
+        owner: NodeId,
+        requested_owner: NodeId,
+    },
+    #[error("UDP destination port {port} for {version:?} is not registered")]
+    PortNotRegistered { version: UdpIpVersion, port: u16 },
+    #[error(
+        "UDP destination port {port} for {version:?} is owned by node {owner:?}, not node {requested_owner:?}"
+    )]
+    PortOwnerMismatch {
+        version: UdpIpVersion,
+        port: u16,
+        owner: NodeId,
+        requested_owner: NodeId,
+    },
+    #[error("UDP destination port {port} for {version:?} reference count is exhausted")]
+    PortReferenceCountOverflow { version: UdpIpVersion, port: u16 },
+    #[error("UDP destination-port control is not initialized")]
+    PortControlNotInitialized,
+    #[error("UDP destination-port control is already initialized")]
+    PortControlAlreadyInitialized,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -81,12 +108,6 @@ pub struct UdpInputTrace {
     pub destination_port: Option<u16>,
     pub error: Option<u16>,
     pub next: u16,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub enum UdpIpVersion {
-    V4,
-    V6,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -129,19 +150,24 @@ impl UdpInputControlPlane {
     }
 
     #[inline]
-    pub fn register_port(&self, port: u16, node: NodeId) -> RuntimeResult<u16> {
+    pub fn register_dst_port(
+        &self,
+        version: UdpIpVersion,
+        port: u16,
+        node: NodeId,
+    ) -> RuntimeResult<u16> {
         let consumer = self.consumer.ok_or(UdpControlError::ConsumerNotAttached)?;
         let nodes = self
             .nodes
             .as_ref()
             .ok_or(UdpControlError::NodeRuntimeUnavailable)?;
-        let slot = nodes.add_node_next_slot(consumer, node)?;
-        self.inner.rcu(|current| {
-            let mut next = UdpInputSnapshot::clone(current);
-            next.register_port(port, slot);
-            next
-        });
-        Ok(slot)
+        self.register_dst_port_with_graph(version, port, node, nodes, consumer)
+    }
+
+    /// Compatibility entry point for the original IPv4-only control surface.
+    #[inline]
+    pub fn register_port(&self, port: u16, node: NodeId) -> RuntimeResult<u16> {
+        self.register_dst_port(UdpIpVersion::V4, port, node)
     }
 
     #[inline]
@@ -152,6 +178,74 @@ impl UdpInputControlPlane {
             next
         });
         Ok(())
+    }
+
+    #[inline]
+    pub fn unregister_dst_port(
+        &self,
+        version: UdpIpVersion,
+        port: u16,
+        node: NodeId,
+    ) -> RuntimeResult<()> {
+        let current = self.inner.load();
+        let registration = current
+            .registration(version, port)
+            .ok_or(UdpControlError::PortNotRegistered { version, port })?;
+        if registration.node != node {
+            return Err(UdpControlError::PortOwnerMismatch {
+                version,
+                port,
+                owner: registration.node,
+                requested_owner: node,
+            }
+            .into());
+        }
+        self.inner.rcu(|current| {
+            let mut next = UdpInputSnapshot::clone(current);
+            next.release_port(version, port, node);
+            next
+        });
+        Ok(())
+    }
+
+    fn register_dst_port_with_graph(
+        &self,
+        version: UdpIpVersion,
+        port: u16,
+        node: NodeId,
+        nodes: &hammer_runtime::node::NodeRuntime,
+        consumer: NodeId,
+    ) -> RuntimeResult<u16> {
+        let current = self.inner.load();
+        if let Some(registration) = current.registration(version, port) {
+            if registration.node != node {
+                return Err(UdpControlError::PortConflict {
+                    version,
+                    port,
+                    owner: registration.node,
+                    requested_owner: node,
+                }
+                .into());
+            }
+            if registration.references == u32::MAX {
+                return Err(UdpControlError::PortReferenceCountOverflow { version, port }.into());
+            }
+            let slot = registration.slot;
+            self.inner.rcu(|current| {
+                let mut next = UdpInputSnapshot::clone(current);
+                next.share_port(version, port, node);
+                next
+            });
+            return Ok(slot);
+        }
+
+        let slot = nodes.add_node_next_slot(consumer, node)?;
+        self.inner.rcu(|current| {
+            let mut next = UdpInputSnapshot::clone(current);
+            next.register_port(version, port, node, slot);
+            next
+        });
+        Ok(slot)
     }
 
     #[inline]
@@ -170,37 +264,247 @@ impl UdpInputControlPlane {
     }
 }
 
+/// Main-thread UDP capability state retained by the plugin ABI.
+///
+/// The caller owns the worker-barrier phase around these operations. UDP only
+/// retains the existing port table and the UDP input node identity; it does
+/// not retain a barrier or create another publication protocol.
+struct UdpLocalRegistration {
+    inner: Arc<ArcSwap<UdpInputSnapshot>>,
+    consumer: NodeId,
+}
+
+static UDP_LOCAL_REGISTRATION: OnceLock<UdpLocalRegistration> = OnceLock::new();
+
+pub(crate) fn register_dst_port(
+    version: UdpIpVersion,
+    port: u16,
+    node: NodeId,
+) -> RuntimeResult<()> {
+    let registration = UDP_LOCAL_REGISTRATION
+        .get()
+        .ok_or(UdpControlError::PortControlNotInitialized)?;
+    let result = Engine::with_current(|engine| {
+        let control = UdpInputControlPlane {
+            inner: Arc::clone(&registration.inner),
+            nodes: Some(engine.runtime.nodes().clone()),
+            consumer: Some(registration.consumer),
+        };
+        control.register_dst_port(version, port, node).map(|_| ())
+    });
+    result.ok_or(UdpControlError::PortControlNotInitialized)?
+}
+
+pub(crate) fn unregister_dst_port(
+    version: UdpIpVersion,
+    port: u16,
+    node: NodeId,
+) -> RuntimeResult<()> {
+    let registration = UDP_LOCAL_REGISTRATION
+        .get()
+        .ok_or(UdpControlError::PortControlNotInitialized)?;
+    let result = Engine::with_current(|_| {
+        let control = UdpInputControlPlane {
+            inner: Arc::clone(&registration.inner),
+            nodes: None,
+            consumer: None,
+        };
+        control.unregister_dst_port(version, port, node)
+    });
+    result.ok_or(UdpControlError::PortControlNotInitialized)?
+}
+
+#[cfg(test)]
+pub(super) fn install_registration_for_test(
+    control: &UdpInputControlPlane,
+    consumer: NodeId,
+) -> RuntimeResult<()> {
+    UDP_LOCAL_REGISTRATION
+        .set(UdpLocalRegistration {
+            inner: Arc::clone(&control.inner),
+            consumer,
+        })
+        .map_err(|_| UdpControlError::PortControlAlreadyInitialized.into())
+}
+
 #[derive(Clone)]
 struct UdpInputSnapshot {
-    ports: Box<[UdpPortAction]>,
+    v4: UdpPortTable,
+    v6: UdpPortTable,
 }
 
 impl UdpInputSnapshot {
     #[inline]
     fn new() -> Self {
         Self {
-            ports: vec![UdpPortAction::IcmpError; UDP_PORT_COUNT].into_boxed_slice(),
+            v4: UdpPortTable::new(),
+            v6: UdpPortTable::new(),
         }
     }
 
     #[inline(always)]
-    fn register_port(&mut self, port: u16, next: u16) {
-        self.ports[port as usize] = UdpPortAction::Dispatch(next);
+    fn table(&self, version: UdpIpVersion) -> &UdpPortTable {
+        match version {
+            UdpIpVersion::V4 => &self.v4,
+            UdpIpVersion::V6 => &self.v6,
+        }
+    }
+
+    #[inline(always)]
+    fn table_mut(&mut self, version: UdpIpVersion) -> &mut UdpPortTable {
+        match version {
+            UdpIpVersion::V4 => &mut self.v4,
+            UdpIpVersion::V6 => &mut self.v6,
+        }
+    }
+
+    #[inline(always)]
+    fn register_port(&mut self, version: UdpIpVersion, port: u16, node: NodeId, slot: u16) {
+        self.table_mut(version).register_port(port, node, slot);
+    }
+
+    #[inline(always)]
+    fn share_port(&mut self, version: UdpIpVersion, port: u16, node: NodeId) {
+        self.table_mut(version).share_port(port, node);
+    }
+
+    #[inline(always)]
+    fn release_port(&mut self, version: UdpIpVersion, port: u16, node: NodeId) {
+        self.table_mut(version).release_port(port, node);
     }
 
     #[inline(always)]
     fn register_punt_port(&mut self, port: u16) {
-        self.ports[port as usize] = UdpPortAction::Punt;
+        self.v4.register_punt_port(port);
+        self.v6.register_punt_port(port);
     }
 
     #[inline(always)]
     fn unregister_port(&mut self, port: u16) {
-        self.ports[port as usize] = UdpPortAction::IcmpError;
+        self.v4.unregister_port(port);
+        self.v6.unregister_port(port);
+    }
+
+    #[inline(always)]
+    fn action(&self, version: UdpIpVersion, port: u16) -> UdpPortAction {
+        self.table(version).action(port)
+    }
+
+    #[inline(always)]
+    fn registration(&self, version: UdpIpVersion, port: u16) -> Option<UdpPortRegistration> {
+        self.table(version).registration(port)
+    }
+}
+
+#[derive(Clone)]
+struct UdpPortTable {
+    dispatch: Bitmap<u16>,
+    punt: Bitmap<u16>,
+    next_slots: Box<[u16]>,
+    registrations: Vec<UdpPortRegistration>,
+}
+
+impl UdpPortTable {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            dispatch: Bitmap::with_capacity(UDP_PORT_COUNT),
+            punt: Bitmap::with_capacity(UDP_PORT_COUNT),
+            next_slots: vec![0; UDP_PORT_COUNT].into_boxed_slice(),
+            registrations: Vec::new(),
+        }
+    }
+
+    #[inline(always)]
+    fn register_port(&mut self, port: u16, node: NodeId, slot: u16) {
+        debug_assert!(self.registration(port).is_none());
+        self.punt.clear(port);
+        self.dispatch.set(port);
+        self.next_slots[port as usize] = slot;
+        let registration = UdpPortRegistration {
+            port,
+            node,
+            slot,
+            references: 1,
+        };
+        match self.registration_index(port) {
+            Ok(index) => self.registrations[index] = registration,
+            Err(index) => self.registrations.insert(index, registration),
+        }
+    }
+
+    #[inline(always)]
+    fn share_port(&mut self, port: u16, node: NodeId) {
+        let Some(index) = self.registration_index(port).ok() else {
+            debug_assert!(false, "validated UDP port must remain registered");
+            return;
+        };
+        let registration = &mut self.registrations[index];
+        debug_assert_eq!(registration.node, node);
+        registration.references = registration
+            .references
+            .checked_add(1)
+            .expect("validated UDP reference count must not overflow");
+    }
+
+    #[inline(always)]
+    fn release_port(&mut self, port: u16, node: NodeId) {
+        let Some(index) = self.registration_index(port).ok() else {
+            debug_assert!(false, "validated UDP port must remain registered");
+            return;
+        };
+        debug_assert_eq!(self.registrations[index].node, node);
+        if self.registrations[index].references > 1 {
+            self.registrations[index].references -= 1;
+            return;
+        }
+        self.registrations.remove(index);
+        self.dispatch.clear(port);
+    }
+
+    #[inline(always)]
+    fn register_punt_port(&mut self, port: u16) {
+        self.remove_registration(port);
+        self.dispatch.clear(port);
+        self.punt.set(port);
+    }
+
+    #[inline(always)]
+    fn unregister_port(&mut self, port: u16) {
+        self.remove_registration(port);
+        self.dispatch.clear(port);
+        self.punt.clear(port);
     }
 
     #[inline(always)]
     fn action(&self, port: u16) -> UdpPortAction {
-        self.ports[port as usize].clone()
+        if self.dispatch.is_set(port) {
+            UdpPortAction::Dispatch(self.next_slots[port as usize])
+        } else if self.punt.is_set(port) {
+            UdpPortAction::Punt
+        } else {
+            UdpPortAction::IcmpError
+        }
+    }
+
+    #[inline(always)]
+    fn registration(&self, port: u16) -> Option<UdpPortRegistration> {
+        self.registration_index(port)
+            .ok()
+            .map(|index| self.registrations[index])
+    }
+
+    #[inline(always)]
+    fn registration_index(&self, port: u16) -> Result<usize, usize> {
+        self.registrations
+            .binary_search_by_key(&port, |registration| registration.port)
+    }
+
+    #[inline(always)]
+    fn remove_registration(&mut self, port: u16) {
+        if let Ok(index) = self.registration_index(port) {
+            self.registrations.remove(index);
+        }
     }
 }
 
@@ -209,6 +513,14 @@ enum UdpPortAction {
     IcmpError,
     Punt,
     Dispatch(u16),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UdpPortRegistration {
+    port: u16,
+    node: NodeId,
+    slot: u16,
+    references: u32,
 }
 
 #[derive(Clone)]
@@ -296,6 +608,12 @@ fn register_udp_input(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
         .register_protocol(17, node)
         .into_result()
         .map_err(|error| RuntimeError::subsystem("udp", error))?;
+    UDP_LOCAL_REGISTRATION
+        .set(UdpLocalRegistration {
+            inner: Arc::clone(&control.inner),
+            consumer: node,
+        })
+        .map_err(|_| UdpControlError::PortControlAlreadyInitialized)?;
     Ok(node)
 }
 
@@ -490,7 +808,7 @@ fn next_slot_for_index(
 
     refresh_udp_cursor(runtime, index, cursor)?;
 
-    match snapshot.action(destination_port) {
+    match snapshot.action(version, destination_port) {
         UdpPortAction::Dispatch(slot) => {
             clear_success_metadata(runtime, index)?;
             add_packet_trace!(
@@ -704,4 +1022,125 @@ fn read_udp_header(packet: &[u8], offset: usize) -> RuntimeResult<UdpHeader> {
     // SAFETY: `bytes` has exactly the size of `UdpHeader`; unaligned reads are
     // valid because network headers may start at arbitrary buffer offsets.
     Ok(unsafe { bytes.as_ptr().cast::<UdpHeader>().read_unaligned() })
+}
+
+#[cfg(test)]
+mod control_tests {
+    use hammer_core::data_plane::BufferFrame;
+    use hammer_runtime::{DataPlaneRuntime, InternalNode, Node, NodeResult};
+
+    use super::*;
+
+    struct UdpConsumerNode;
+
+    impl Node for UdpConsumerNode {
+        fn process(&mut self, _runtime: &DataPlaneRuntime, _frame: &mut BufferFrame) -> NodeResult {
+            NodeResult::drop()
+        }
+    }
+
+    impl InternalNode for UdpConsumerNode {}
+
+    fn control() -> (UdpInputControlPlane, NodeId, NodeId) {
+        let runtime = DataPlaneRuntime::new(Default::default());
+        let consumer = runtime.nodes().register_internal(UdpConsumerNode);
+        let owner = runtime.nodes().register_internal(UdpConsumerNode);
+        let control = UdpInputControlPlane::new().with_nodes(runtime.nodes().clone());
+        let mut control = control;
+        control
+            .attach_consumer(consumer)
+            .expect("attach UDP input consumer");
+        (control, owner, consumer)
+    }
+
+    #[test]
+    fn unregister_rejects_a_different_owner_without_mutating_registration() {
+        let (control, owner, other) = control();
+        control
+            .register_dst_port(UdpIpVersion::V4, 443, owner)
+            .expect("register UDP port");
+
+        let error = control
+            .unregister_dst_port(UdpIpVersion::V4, 443, other)
+            .expect_err("owner mismatch must fail");
+        let RuntimeError::Subsystem { source, .. } = error else {
+            panic!("expected UDP subsystem error");
+        };
+        assert!(matches!(
+            source.downcast_ref::<UdpControlError>(),
+            Some(UdpControlError::PortOwnerMismatch {
+                version: UdpIpVersion::V4,
+                port: 443,
+                owner: registered,
+                requested_owner,
+            }) if *registered == owner && *requested_owner == other
+        ));
+        assert!(
+            control
+                .unregister_dst_port(UdpIpVersion::V4, 443, owner)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn unregister_reports_missing_registration() {
+        let (control, owner, _) = control();
+        let error = control
+            .unregister_dst_port(UdpIpVersion::V6, 443, owner)
+            .expect_err("missing UDP port must fail");
+        let RuntimeError::Subsystem { source, .. } = error else {
+            panic!("expected UDP subsystem error");
+        };
+        assert!(matches!(
+            source.downcast_ref::<UdpControlError>(),
+            Some(UdpControlError::PortNotRegistered {
+                version: UdpIpVersion::V6,
+                port: 443,
+            })
+        ));
+    }
+
+    #[test]
+    fn registration_rejects_reference_count_overflow() {
+        let (control, owner, _) = control();
+        control
+            .register_dst_port(UdpIpVersion::V4, 443, owner)
+            .expect("register UDP port");
+        control.inner.rcu(|current| {
+            let mut next = UdpInputSnapshot::clone(current);
+            let table = next.table_mut(UdpIpVersion::V4);
+            let index = table
+                .registration_index(443)
+                .expect("registered UDP port must retain registration metadata");
+            table.registrations[index].references = u32::MAX;
+            next
+        });
+
+        let error = control
+            .register_dst_port(UdpIpVersion::V4, 443, owner)
+            .expect_err("reference count overflow must fail");
+        let RuntimeError::Subsystem { source, .. } = error else {
+            panic!("expected UDP subsystem error");
+        };
+        assert!(matches!(
+            source.downcast_ref::<UdpControlError>(),
+            Some(UdpControlError::PortReferenceCountOverflow {
+                version: UdpIpVersion::V4,
+                port: 443,
+            })
+        ));
+    }
+
+    #[test]
+    fn final_release_clears_dispatch_without_reclaiming_graph_slot() {
+        let mut table = UdpPortTable::new();
+        let owner = NodeId::new(7);
+        table.register_port(443, owner, 19);
+
+        assert!(matches!(table.action(443), UdpPortAction::Dispatch(19)));
+        table.release_port(443, owner);
+
+        assert!(matches!(table.action(443), UdpPortAction::IcmpError));
+        assert_eq!(table.next_slots[443], 19);
+    }
 }

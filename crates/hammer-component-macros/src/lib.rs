@@ -2872,6 +2872,7 @@ struct PluginArgs {
     name: LitStr,
     load_after: Vec<LitStr>,
     ip_output: Option<Expr>,
+    udp_local: Option<Expr>,
     init_functions: Vec<Path>,
     config_functions: Vec<Path>,
     early_config_functions: Vec<Path>,
@@ -2891,6 +2892,7 @@ impl Parse for PluginArgs {
         let mut name = None;
         let mut load_after = Vec::new();
         let mut ip_output = None;
+        let mut udp_local = None;
         let mut init_functions = Vec::new();
         let mut config_functions = Vec::new();
         let mut early_config_functions = Vec::new();
@@ -2936,11 +2938,17 @@ impl Parse for PluginArgs {
                     }
                     ip_output = Some(input.parse()?);
                 }
+                "udp_local" => {
+                    if udp_local.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `udp_local` argument"));
+                    }
+                    udp_local = Some(input.parse()?);
+                }
                 other => {
                     return Err(Error::new(
                         key.span(),
                         format!(
-                            "unknown `plugin` argument `{other}`; expected `name`, `load_after`, or `ip_output`"
+                            "unknown `plugin` argument `{other}`; expected `name`, `load_after`, `ip_output`, or `udp_local`"
                         ),
                     ));
                 }
@@ -2953,6 +2961,7 @@ impl Parse for PluginArgs {
             name: name.ok_or_else(|| Error::new(Span::call_site(), "missing `name` argument"))?,
             load_after,
             ip_output,
+            udp_local,
             init_functions,
             config_functions,
             early_config_functions,
@@ -3037,6 +3046,14 @@ fn plugin_registration_tokens(args: &PluginArgs) -> TokenStream2 {
         },
         None => quote!(::hammer_runtime::__private::ROption::RNone),
     };
+    let udp_local = match &args.udp_local {
+        Some(local) => quote! {
+            ::hammer_runtime::__private::ROption::RSome(
+                ::hammer_runtime::__private::RRef::new(#local)
+            )
+        },
+        None => quote!(::hammer_runtime::__private::ROption::RNone),
+    };
     quote! {
         ::hammer_runtime::__declare_registration_image!(
             init_functions = [#(#init_functions),*];
@@ -3100,6 +3117,7 @@ fn plugin_registration_tokens(args: &PluginArgs) -> TokenStream2 {
                     metadata,
                     ::hammer_runtime::__private::RRef::new(&__HAMMER_REGISTRATION_IMAGE),
                     #ip_output,
+                    #udp_local,
                 )
             )
         }

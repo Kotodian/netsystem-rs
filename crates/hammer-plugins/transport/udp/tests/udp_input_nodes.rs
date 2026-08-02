@@ -3,13 +3,16 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use hammer_core::data_plane::{BufferFrame, BufferNodeError, BufferPacketCursor};
 use hammer_infra::checksum::internet_checksum_parts;
-use hammer_plugin_udp::{UdpInputControlPlane, UdpInputError, UdpInputNext, UdpInputTrace};
+use hammer_plugin_udp::{
+    UdpControlError, UdpInputControlPlane, UdpInputError, UdpInputNext, UdpInputTrace, UdpIpVersion,
+};
 use hammer_runtime::RuntimeRegistry;
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::graph::install_packet_graph;
 use hammer_runtime::{
     DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, Engine, InternalNode, Node,
-    NodeProcessFn, NodeResult, NodeRuntimeData, TraceControlPlane, TraceInputPolicy, TracePolicy,
+    NodeProcessFn, NodeResult, NodeRuntimeData, RuntimeError, TraceControlPlane, TraceInputPolicy,
+    TracePolicy,
 };
 use hammer_service::opaque::NetworkOpaque;
 
@@ -48,6 +51,13 @@ fn udp_graph_contribution_initializes_with_existing_drop_node() {
 
     assert!(engine.runtime.node_by_name("drop").is_some());
     assert!(engine.runtime.node_by_name("udp-input").is_some());
+}
+
+#[test]
+fn udp_plugin_exports_destination_port_capability() {
+    let module = hammer_plugin_udp::plugin_module();
+
+    assert!(module.udp_local().into_option().is_some());
 }
 
 #[derive(Default)]
@@ -325,6 +335,34 @@ fn udp_input_dispatches_valid_ipv4_checksum() {
 }
 
 #[test]
+fn udp_input_dispatches_registered_ipv6_port_by_local_slot() {
+    let runtime = test_runtime_configured(2048, 16, 8);
+    let (control, udp_input, drop_state, punt_state, icmp_state) = wire_udp_input(&runtime);
+    let echo_state = Arc::new(Mutex::new(CaptureState::default()));
+    let echo = runtime
+        .nodes()
+        .register_internal(CaptureNode::new(Arc::clone(&echo_state)));
+    control
+        .register_dst_port(UdpIpVersion::V6, 53, echo)
+        .expect("register IPv6 DNS port");
+
+    let mut packet = ipv6_udp_packet(12_345, 53, b"dns");
+    set_ipv6_udp_checksum(&mut packet);
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(udp_input)
+        .expect("alloc frame");
+    push_packet(&runtime, &mut frame, &packet);
+    runtime.put_next_frame(frame).expect("schedule");
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(echo_state.lock().unwrap().packets, vec![packet]);
+    assert!(drop_state.lock().unwrap().packets.is_empty());
+    assert!(punt_state.lock().unwrap().packets.is_empty());
+    assert!(icmp_state.lock().unwrap().packets.is_empty());
+}
+
+#[test]
 fn udp_input_rejects_missing_ipv6_checksum() {
     let runtime = test_runtime_configured(2048, 16, 8);
     let (_control, udp_input, drop_state, punt_state, icmp_state) = wire_udp_input(&runtime);
@@ -427,6 +465,54 @@ fn udp_input_registers_more_than_sixteen_port_nexts() {
     runtime.put_next_frame(frame).expect("schedule");
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert_eq!(last_state.lock().unwrap().packets, vec![packet]);
+}
+
+#[test]
+fn udp_port_registration_scopes_ownership_by_address_family() {
+    let runtime = test_runtime_configured(2048, 16, 8);
+    let (control, _udp_input, _, _, _) = wire_udp_input(&runtime);
+    let first = runtime
+        .nodes()
+        .register_internal(CaptureNode::new(Arc::new(Mutex::new(
+            CaptureState::default(),
+        ))));
+    let second = runtime
+        .nodes()
+        .register_internal(CaptureNode::new(Arc::new(Mutex::new(
+            CaptureState::default(),
+        ))));
+
+    let v4_slot = control
+        .register_dst_port(UdpIpVersion::V4, 443, first)
+        .expect("register IPv4 port");
+    let v4_shared_slot = control
+        .register_dst_port(UdpIpVersion::V4, 443, first)
+        .expect("share IPv4 port");
+    assert_eq!(v4_shared_slot, v4_slot);
+
+    let v6_slot = control
+        .register_dst_port(UdpIpVersion::V6, 443, second)
+        .expect("register IPv6 port");
+    assert_ne!(v6_slot, v4_slot);
+
+    let error = control
+        .register_dst_port(UdpIpVersion::V4, 443, second)
+        .expect_err("a different IPv4 owner must conflict");
+    let RuntimeError::Subsystem { source, .. } = error else {
+        panic!("expected UDP subsystem error");
+    };
+    let Some(error) = source.downcast_ref::<UdpControlError>() else {
+        panic!("expected typed UDP registration error");
+    };
+    assert!(matches!(
+        error,
+        UdpControlError::PortConflict {
+            version: UdpIpVersion::V4,
+            port: 443,
+            owner,
+            requested_owner,
+        } if *owner == first && *requested_owner == second
+    ));
 }
 
 fn push_packet(runtime: &DataPlaneRuntime, frame: &mut BufferFrame, packet: &[u8]) {
@@ -542,6 +628,19 @@ fn set_ipv4_udp_checksum(packet: &mut [u8]) {
         &ip[16..20],
         &[0, 17],
         &(udp.len() as u16).to_be_bytes(),
+        udp,
+    ]);
+    udp[6..8].copy_from_slice(&checksum.to_be_bytes());
+}
+
+fn set_ipv6_udp_checksum(packet: &mut [u8]) {
+    let (ip, udp) = packet.split_at_mut(40);
+    udp[6..8].fill(0);
+    let checksum = internet_checksum_parts(&[
+        &ip[8..24],
+        &ip[24..40],
+        &(udp.len() as u32).to_be_bytes(),
+        &[0, 0, 0, 17],
         udp,
     ]);
     udp[6..8].copy_from_slice(&checksum.to_be_bytes());
