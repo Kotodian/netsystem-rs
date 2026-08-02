@@ -982,6 +982,44 @@ mod tests {
     }
 
     #[test]
+    fn udp_disconnect_removes_connection_and_session_lookup() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (mut sessions, mut udp, applications, _main) = worker_state();
+        let application = applications.attach()?;
+        sessions.install_application_mq_for_test(application)?;
+        let application_connection =
+            applications.register_connection(application, None, None, None)?;
+        let (local, remote) = test_endpoints();
+        let connection_id =
+            hammer_runtime::SessionConnectionId::from_raw(application_connection.raw());
+        let session_id = udp.active_connect(&mut sessions, connection_id, local, remote)?;
+        let (transport_id, index) = sessions
+            .session_transport(session_id)
+            .expect("UDP Session transport");
+        assert_eq!(transport_id, UdpWorker::ID);
+
+        let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default())
+            .for_worker(1, 0)
+            .expect("worker runtime");
+        let mut frame = BufferFrame::with_capacity(8);
+        let mut output = SessionQueueOutput::default();
+        <UdpWorker as SessionTransport<PoolIndex>>::disconnect(
+            &mut udp,
+            &mut sessions,
+            index,
+            &runtime,
+            SessionQueueNext::from_slot(0),
+            &mut frame,
+            &mut output,
+            Instant::now(),
+        )?;
+
+        assert!(udp.connections.get(index).is_none());
+        assert!(udp.session_lookup.lookup(local, remote).is_none());
+        Ok(())
+    }
+
+    #[test]
     fn udp_tx_writes_datagram_buffer_without_consuming_untill_output_commit()
     -> Result<(), Box<dyn std::error::Error>> {
         let (mut sessions, mut udp, applications, main) = worker_state();
