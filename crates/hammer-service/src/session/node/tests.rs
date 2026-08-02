@@ -287,6 +287,19 @@ fn session_queue_dispatches_new_io_before_old_io() {
     assert_eq!(transport.tx_actions, vec![old_index, new_index, old_index]);
 }
 
+#[test]
+fn default_connection_index_returns_exact_transport_index() {
+    let index = Index::new(2, 9);
+    let transport = TcpTransport::default();
+
+    assert_eq!(
+        transport
+            .connection_index(index)
+            .expect("exact transport index"),
+        index
+    );
+}
+
 fn attach_local_app_session(
     sessions: &mut SessionWorker<Index>,
     session_id: crate::session::SessionId,
