@@ -27,6 +27,7 @@ pub mod rbtree;
 pub mod ring;
 pub mod segment;
 pub mod simd;
+pub mod sparse_vec;
 pub mod stack;
 pub mod svm_region;
 pub mod thread_owned;

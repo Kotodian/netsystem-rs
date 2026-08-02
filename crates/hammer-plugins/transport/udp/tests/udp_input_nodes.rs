@@ -1,5 +1,6 @@
+use std::cell::UnsafeCell;
 use std::mem::transmute;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 use hammer_core::data_plane::{BufferFrame, BufferNodeError, BufferPacketCursor};
 use hammer_infra::checksum::internet_checksum_parts;
@@ -30,6 +31,17 @@ fn test_runtime_configured(
         },
     };
     DataPlaneRuntime::new(config)
+}
+
+fn with_main_engine<R>(operation: impl FnOnce() -> R) -> R {
+    let mut engine = Engine::new(
+        DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()),
+        RuntimeRegistry::new(),
+    );
+    engine.install_current();
+    let result = operation();
+    Engine::uninstall_current();
+    result
 }
 
 #[test]
@@ -67,19 +79,42 @@ struct CaptureState {
     packet_cursors: Vec<BufferPacketCursor>,
 }
 
+struct CaptureCell {
+    state: UnsafeCell<CaptureState>,
+}
+
+// SAFETY: these graph capture tests run on one thread. The node writes state
+// during `run_ready_nodes`, then assertions read it after dispatch completes.
+unsafe impl Send for CaptureCell {}
+unsafe impl Sync for CaptureCell {}
+
+impl CaptureCell {
+    fn new(state: CaptureState) -> Arc<Self> {
+        Arc::new(Self {
+            state: UnsafeCell::new(state),
+        })
+    }
+
+    fn borrow(&self) -> &CaptureState {
+        unsafe { &*self.state.get() }
+    }
+
+    fn borrow_mut(&self) -> &mut CaptureState {
+        unsafe { &mut *self.state.get() }
+    }
+}
+
 struct CaptureNode {
     runtime_data: NodeRuntimeData,
+    _state: Arc<CaptureCell>,
 }
 
 impl CaptureNode {
-    fn new(state: Arc<Mutex<CaptureState>>) -> Self {
-        let mut states = capture_states()
-            .lock()
-            .expect("capture state registry poisoned");
-        let slot = states.len();
-        states.push(state);
+    fn new(state: Arc<CaptureCell>) -> Self {
         Self {
-            runtime_data: NodeRuntimeData::from_usize(slot).expect("capture state slot"),
+            runtime_data: NodeRuntimeData::from_usize(Arc::as_ptr(&state) as usize)
+                .expect("capture state pointer"),
+            _state: state,
         }
     }
 }
@@ -103,11 +138,6 @@ impl Node for CaptureNode {
 
 impl InternalNode for CaptureNode {}
 
-fn capture_states() -> &'static Mutex<Vec<Arc<Mutex<CaptureState>>>> {
-    static STATES: OnceLock<Mutex<Vec<Arc<Mutex<CaptureState>>>>> = OnceLock::new();
-    STATES.get_or_init(|| Mutex::new(Vec::new()))
-}
-
 fn chain_bytes(
     runtime: &DataPlaneRuntime,
     index: hammer_core::data_plane::Index,
@@ -124,17 +154,16 @@ fn capture_process(
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> NodeResult {
-    let slot = match data.usize_word(0) {
-        Ok(s) => s,
+    let pointer = match data.usize_word(0) {
+        Ok(pointer) => pointer as *const CaptureCell,
         Err(_) => return NodeResult::drop(),
     };
-    let state = match capture_states().lock() {
-        Ok(states) => match states.get(slot) {
-            Some(s) => Arc::clone(s),
-            None => return NodeResult::drop(),
-        },
-        Err(_) => return NodeResult::drop(),
-    };
+    if pointer.is_null() {
+        return NodeResult::drop();
+    }
+    // SAFETY: the CaptureNode owns `Arc<CaptureCell>` for the graph lifetime
+    // and graph dispatch is synchronous in these tests.
+    let state = unsafe { &*pointer };
     for index in frame.pending_indices().iter().copied() {
         let packet = match chain_bytes(runtime, index) {
             Ok(bytes) => bytes,
@@ -150,14 +179,10 @@ fn capture_process(
             }
             Err(_) => return NodeResult::drop(),
         };
-        match state.lock() {
-            Ok(mut guard) => {
-                guard.packets.push(packet.into_iter().collect());
-                guard.node_errors.push(node_error);
-                guard.packet_cursors.push(packet_cursor);
-            }
-            Err(_) => return NodeResult::drop(),
-        }
+        let guard = state.borrow_mut();
+        guard.packets.push(packet.into_iter().collect());
+        guard.node_errors.push(node_error);
+        guard.packet_cursors.push(packet_cursor);
     }
     NodeResult::drop()
 }
@@ -167,13 +192,13 @@ fn wire_udp_input(
 ) -> (
     UdpInputControlPlane,
     hammer_core::data_plane::NodeId,
-    Arc<Mutex<CaptureState>>,
-    Arc<Mutex<CaptureState>>,
-    Arc<Mutex<CaptureState>>,
+    Arc<CaptureCell>,
+    Arc<CaptureCell>,
+    Arc<CaptureCell>,
 ) {
-    let drop_state = Arc::new(Mutex::new(CaptureState::default()));
-    let punt_state = Arc::new(Mutex::new(CaptureState::default()));
-    let icmp_state = Arc::new(Mutex::new(CaptureState::default()));
+    let drop_state = CaptureCell::new(CaptureState::default());
+    let punt_state = CaptureCell::new(CaptureState::default());
+    let icmp_state = CaptureCell::new(CaptureState::default());
     let drop = runtime
         .nodes()
         .register_internal(CaptureNode::new(Arc::clone(&drop_state)));
@@ -207,11 +232,12 @@ fn wire_udp_input(
 fn udp_input_dispatches_registered_port_by_local_slot() {
     let runtime = test_runtime_configured(2048, 16, 8);
     let (control, udp_input, drop_state, punt_state, icmp_state) = wire_udp_input(&runtime);
-    let echo_state = Arc::new(Mutex::new(CaptureState::default()));
+    let echo_state = CaptureCell::new(CaptureState::default());
     let echo = runtime
         .nodes()
         .register_internal(CaptureNode::new(Arc::clone(&echo_state)));
-    let echo_slot = control.register_port(53, echo).expect("register dns port");
+    let echo_slot =
+        with_main_engine(|| control.register_port(53, echo).expect("register dns port"));
     assert!(echo_slot >= UdpInputNext::COUNT as u16);
 
     let trace_control = TraceControlPlane::new(4);
@@ -236,11 +262,11 @@ fn udp_input_dispatches_registered_port_by_local_slot() {
     runtime.put_next_frame(frame).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-    assert_eq!(echo_state.lock().unwrap().packets, vec![packet]);
-    assert!(echo_state.lock().unwrap().node_errors[0].is_none());
-    assert!(drop_state.lock().unwrap().packets.is_empty());
-    assert!(punt_state.lock().unwrap().packets.is_empty());
-    assert!(icmp_state.lock().unwrap().packets.is_empty());
+    assert_eq!(echo_state.borrow().packets, vec![packet]);
+    assert!(echo_state.borrow().node_errors[0].is_none());
+    assert!(drop_state.borrow().packets.is_empty());
+    assert!(punt_state.borrow().packets.is_empty());
+    assert!(icmp_state.borrow().packets.is_empty());
     assert_eq!(trace_control.drain_completed(), 1);
     let records = trace_control.take_records();
     let entry = &records[0].entries[0];
@@ -256,11 +282,11 @@ fn udp_input_dispatches_registered_port_by_local_slot() {
 fn udp_input_owns_udp_cursor_initialization() {
     let runtime = test_runtime_configured(2048, 16, 8);
     let (control, udp_input, drop_state, punt_state, icmp_state) = wire_udp_input(&runtime);
-    let echo_state = Arc::new(Mutex::new(CaptureState::default()));
+    let echo_state = CaptureCell::new(CaptureState::default());
     let echo = runtime
         .nodes()
         .register_internal(CaptureNode::new(Arc::clone(&echo_state)));
-    control.register_port(53, echo).expect("register dns port");
+    with_main_engine(|| control.register_port(53, echo).expect("register dns port"));
 
     let packet = ipv4_udp_packet(12_345, 53, b"dns");
     let mut frame = runtime
@@ -271,14 +297,14 @@ fn udp_input_owns_udp_cursor_initialization() {
     runtime.put_next_frame(frame).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-    let echo = echo_state.lock().expect("echo state");
+    let echo = echo_state.borrow();
     assert_eq!(echo.packets, vec![packet]);
     assert_eq!(echo.packet_cursors.len(), 1);
     assert_eq!(echo.packet_cursors[0].transport_header_len(), 8);
     assert_eq!(echo.packet_cursors[0].transport_payload_offset(), 28);
-    assert!(drop_state.lock().unwrap().packets.is_empty());
-    assert!(punt_state.lock().unwrap().packets.is_empty());
-    assert!(icmp_state.lock().unwrap().packets.is_empty());
+    assert!(drop_state.borrow().packets.is_empty());
+    assert!(punt_state.borrow().packets.is_empty());
+    assert!(icmp_state.borrow().packets.is_empty());
 }
 
 #[test]
@@ -296,27 +322,27 @@ fn udp_input_rejects_invalid_ipv4_checksum() {
     runtime.put_next_frame(frame).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-    assert_eq!(drop_state.lock().unwrap().packets, vec![packet]);
+    assert_eq!(drop_state.borrow().packets, vec![packet]);
     assert_eq!(
-        drop_state.lock().unwrap().node_errors,
+        drop_state.borrow().node_errors,
         vec![Some(BufferNodeError::new(
             udp_input,
             UdpInputError::BadChecksum.code()
         ))]
     );
-    assert!(punt_state.lock().unwrap().packets.is_empty());
-    assert!(icmp_state.lock().unwrap().packets.is_empty());
+    assert!(punt_state.borrow().packets.is_empty());
+    assert!(icmp_state.borrow().packets.is_empty());
 }
 
 #[test]
 fn udp_input_dispatches_valid_ipv4_checksum() {
     let runtime = test_runtime_configured(2048, 16, 8);
     let (control, udp_input, drop_state, punt_state, icmp_state) = wire_udp_input(&runtime);
-    let echo_state = Arc::new(Mutex::new(CaptureState::default()));
+    let echo_state = CaptureCell::new(CaptureState::default());
     let echo = runtime
         .nodes()
         .register_internal(CaptureNode::new(Arc::clone(&echo_state)));
-    control.register_port(53, echo).expect("register dns port");
+    with_main_engine(|| control.register_port(53, echo).expect("register dns port"));
 
     let mut packet = ipv4_udp_packet(12_345, 53, b"dns");
     set_ipv4_udp_checksum(&mut packet);
@@ -328,23 +354,25 @@ fn udp_input_dispatches_valid_ipv4_checksum() {
     runtime.put_next_frame(frame).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-    assert_eq!(echo_state.lock().unwrap().packets, vec![packet]);
-    assert!(drop_state.lock().unwrap().packets.is_empty());
-    assert!(punt_state.lock().unwrap().packets.is_empty());
-    assert!(icmp_state.lock().unwrap().packets.is_empty());
+    assert_eq!(echo_state.borrow().packets, vec![packet]);
+    assert!(drop_state.borrow().packets.is_empty());
+    assert!(punt_state.borrow().packets.is_empty());
+    assert!(icmp_state.borrow().packets.is_empty());
 }
 
 #[test]
 fn udp_input_dispatches_registered_ipv6_port_by_local_slot() {
     let runtime = test_runtime_configured(2048, 16, 8);
     let (control, udp_input, drop_state, punt_state, icmp_state) = wire_udp_input(&runtime);
-    let echo_state = Arc::new(Mutex::new(CaptureState::default()));
+    let echo_state = CaptureCell::new(CaptureState::default());
     let echo = runtime
         .nodes()
         .register_internal(CaptureNode::new(Arc::clone(&echo_state)));
-    control
-        .register_dst_port(UdpIpVersion::V6, 53, echo)
-        .expect("register IPv6 DNS port");
+    with_main_engine(|| {
+        control
+            .register_dst_port(UdpIpVersion::V6, 53, echo)
+            .expect("register IPv6 DNS port");
+    });
 
     let mut packet = ipv6_udp_packet(12_345, 53, b"dns");
     set_ipv6_udp_checksum(&mut packet);
@@ -356,10 +384,10 @@ fn udp_input_dispatches_registered_ipv6_port_by_local_slot() {
     runtime.put_next_frame(frame).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-    assert_eq!(echo_state.lock().unwrap().packets, vec![packet]);
-    assert!(drop_state.lock().unwrap().packets.is_empty());
-    assert!(punt_state.lock().unwrap().packets.is_empty());
-    assert!(icmp_state.lock().unwrap().packets.is_empty());
+    assert_eq!(echo_state.borrow().packets, vec![packet]);
+    assert!(drop_state.borrow().packets.is_empty());
+    assert!(punt_state.borrow().packets.is_empty());
+    assert!(icmp_state.borrow().packets.is_empty());
 }
 
 #[test]
@@ -375,16 +403,16 @@ fn udp_input_rejects_missing_ipv6_checksum() {
     runtime.put_next_frame(frame).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-    assert_eq!(drop_state.lock().unwrap().packets, vec![packet]);
+    assert_eq!(drop_state.borrow().packets, vec![packet]);
     assert_eq!(
-        drop_state.lock().unwrap().node_errors,
+        drop_state.borrow().node_errors,
         vec![Some(BufferNodeError::new(
             udp_input,
             UdpInputError::BadChecksum.code()
         ))]
     );
-    assert!(punt_state.lock().unwrap().packets.is_empty());
-    assert!(icmp_state.lock().unwrap().packets.is_empty());
+    assert!(punt_state.borrow().packets.is_empty());
+    assert!(icmp_state.borrow().packets.is_empty());
 }
 
 #[test]
@@ -400,11 +428,11 @@ fn udp_input_sends_unknown_port_to_icmp_error_next() {
     runtime.put_next_frame(frame).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-    assert!(drop_state.lock().unwrap().packets.is_empty());
-    assert!(punt_state.lock().unwrap().packets.is_empty());
-    assert_eq!(icmp_state.lock().unwrap().packets, vec![packet]);
+    assert!(drop_state.borrow().packets.is_empty());
+    assert!(punt_state.borrow().packets.is_empty());
+    assert_eq!(icmp_state.borrow().packets, vec![packet]);
     assert_eq!(
-        icmp_state.lock().unwrap().node_errors,
+        icmp_state.borrow().node_errors,
         vec![Some(BufferNodeError::new(
             udp_input,
             UdpInputError::UnknownPort.code()
@@ -416,9 +444,11 @@ fn udp_input_sends_unknown_port_to_icmp_error_next() {
 fn udp_input_sends_punt_port_to_punt_next() {
     let runtime = test_runtime_configured(2048, 16, 8);
     let (control, udp_input, drop_state, punt_state, icmp_state) = wire_udp_input(&runtime);
-    control
-        .register_punt_port(1234)
-        .expect("register punt port");
+    with_main_engine(|| {
+        control
+            .register_punt_port(1234)
+            .expect("register punt port");
+    });
     let packet = ipv4_udp_packet(1, 1234, b"punt");
     let mut frame = runtime
         .buffers()
@@ -428,10 +458,10 @@ fn udp_input_sends_punt_port_to_punt_next() {
     runtime.put_next_frame(frame).expect("schedule");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-    assert!(drop_state.lock().unwrap().packets.is_empty());
-    assert!(icmp_state.lock().unwrap().packets.is_empty());
-    assert_eq!(punt_state.lock().unwrap().packets, vec![packet]);
-    assert!(punt_state.lock().unwrap().node_errors[0].is_none());
+    assert!(drop_state.borrow().packets.is_empty());
+    assert!(icmp_state.borrow().packets.is_empty());
+    assert_eq!(punt_state.borrow().packets, vec![packet]);
+    assert!(punt_state.borrow().node_errors[0].is_none());
 }
 
 #[test]
@@ -439,21 +469,23 @@ fn udp_input_registers_more_than_sixteen_port_nexts() {
     let runtime = test_runtime_configured(2048, 64, 8);
     let (control, udp_input, _, _, _) = wire_udp_input(&runtime);
     let mut last_slot = UdpInputNext::COUNT as u16 - 1;
-    let mut last_state = Arc::new(Mutex::new(CaptureState::default()));
+    let mut last_state = CaptureCell::new(CaptureState::default());
     let mut last_port = 0u16;
-    for port in 1..=20u16 {
-        let state = Arc::new(Mutex::new(CaptureState::default()));
-        let target = runtime
-            .nodes()
-            .register_internal(CaptureNode::new(Arc::clone(&state)));
-        let slot = control
-            .register_port(port, target)
-            .expect("register port next");
-        assert_eq!(slot, last_slot + 1);
-        last_slot = slot;
-        last_state = state;
-        last_port = port;
-    }
+    with_main_engine(|| {
+        for port in 1..=20u16 {
+            let state = CaptureCell::new(CaptureState::default());
+            let target = runtime
+                .nodes()
+                .register_internal(CaptureNode::new(Arc::clone(&state)));
+            let slot = control
+                .register_port(port, target)
+                .expect("register port next");
+            assert_eq!(slot, last_slot + 1);
+            last_slot = slot;
+            last_state = state;
+            last_port = port;
+        }
+    });
     assert!(last_slot >= 16);
 
     let packet = ipv4_udp_packet(7, last_port, b"high-slot");
@@ -464,7 +496,7 @@ fn udp_input_registers_more_than_sixteen_port_nexts() {
     push_packet(&runtime, &mut frame, &packet);
     runtime.put_next_frame(frame).expect("schedule");
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-    assert_eq!(last_state.lock().unwrap().packets, vec![packet]);
+    assert_eq!(last_state.borrow().packets, vec![packet]);
 }
 
 #[test]
@@ -473,46 +505,44 @@ fn udp_port_registration_scopes_ownership_by_address_family() {
     let (control, _udp_input, _, _, _) = wire_udp_input(&runtime);
     let first = runtime
         .nodes()
-        .register_internal(CaptureNode::new(Arc::new(Mutex::new(
-            CaptureState::default(),
-        ))));
+        .register_internal(CaptureNode::new(CaptureCell::new(CaptureState::default())));
     let second = runtime
         .nodes()
-        .register_internal(CaptureNode::new(Arc::new(Mutex::new(
-            CaptureState::default(),
-        ))));
+        .register_internal(CaptureNode::new(CaptureCell::new(CaptureState::default())));
 
-    let v4_slot = control
-        .register_dst_port(UdpIpVersion::V4, 443, first)
-        .expect("register IPv4 port");
-    let v4_shared_slot = control
-        .register_dst_port(UdpIpVersion::V4, 443, first)
-        .expect("share IPv4 port");
-    assert_eq!(v4_shared_slot, v4_slot);
+    with_main_engine(|| {
+        let v4_slot = control
+            .register_dst_port(UdpIpVersion::V4, 443, first)
+            .expect("register IPv4 port");
+        let v4_shared_slot = control
+            .register_dst_port(UdpIpVersion::V4, 443, first)
+            .expect("share IPv4 port");
+        assert_eq!(v4_shared_slot, v4_slot);
 
-    let v6_slot = control
-        .register_dst_port(UdpIpVersion::V6, 443, second)
-        .expect("register IPv6 port");
-    assert_ne!(v6_slot, v4_slot);
+        let v6_slot = control
+            .register_dst_port(UdpIpVersion::V6, 443, second)
+            .expect("register IPv6 port");
+        assert_ne!(v6_slot, v4_slot);
 
-    let error = control
-        .register_dst_port(UdpIpVersion::V4, 443, second)
-        .expect_err("a different IPv4 owner must conflict");
-    let RuntimeError::Subsystem { source, .. } = error else {
-        panic!("expected UDP subsystem error");
-    };
-    let Some(error) = source.downcast_ref::<UdpControlError>() else {
-        panic!("expected typed UDP registration error");
-    };
-    assert!(matches!(
-        error,
-        UdpControlError::PortConflict {
-            version: UdpIpVersion::V4,
-            port: 443,
-            owner,
-            requested_owner,
-        } if *owner == first && *requested_owner == second
-    ));
+        let error = control
+            .register_dst_port(UdpIpVersion::V4, 443, second)
+            .expect_err("a different IPv4 owner must conflict");
+        let RuntimeError::Subsystem { source, .. } = error else {
+            panic!("expected UDP subsystem error");
+        };
+        let Some(error) = source.downcast_ref::<UdpControlError>() else {
+            panic!("expected typed UDP registration error");
+        };
+        assert!(matches!(
+            error,
+            UdpControlError::PortConflict {
+                version: UdpIpVersion::V4,
+                port: 443,
+                owner,
+                requested_owner,
+            } if *owner == first && *requested_owner == second
+        ));
+    });
 }
 
 fn push_packet(runtime: &DataPlaneRuntime, frame: &mut BufferFrame, packet: &[u8]) {

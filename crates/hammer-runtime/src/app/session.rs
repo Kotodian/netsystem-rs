@@ -1,8 +1,9 @@
 use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
-use hammer_infra::fifo::Fifo;
+use hammer_infra::fifo::{Fifo, FifoError};
 use hammer_infra::segment::Segment;
 use thiserror::Error;
 use tokio::io::unix::AsyncFd;
@@ -59,6 +60,179 @@ pub enum AppSessionError {
         #[source]
         source: std::io::Error,
     },
+    #[error("app session datagram length {payload_len} does not match header length {header_len}")]
+    DatagramLengthMismatch { payload_len: usize, header_len: u32 },
+    #[error("app session datagram FIFO reservation failed")]
+    DatagramFifo {
+        #[source]
+        source: FifoError,
+    },
+}
+
+/// VPP `session_dgram_hdr_t` carried in a datagram Session FIFO.
+///
+/// Lengths use the native representation because this record is consumed by
+/// the same Hammer process (and may be shared with another process on the same
+/// host). Ports are exposed in host order and encoded in network order only
+/// when the record is serialized, matching VPP's wire-facing fields.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionDgramHeader {
+    data_length: u32,
+    data_offset: u32,
+    remote_ip: [u8; 16],
+    local_ip: [u8; 16],
+    remote_port: u16,
+    local_port: u16,
+    is_ip4: u8,
+    gso_size: u16,
+}
+
+const _: () = assert!(std::mem::size_of::<SessionDgramHeader>() == 47);
+
+impl SessionDgramHeader {
+    pub const SIZE: usize = std::mem::size_of::<Self>();
+
+    #[inline]
+    pub fn new(local: SocketAddr, remote: SocketAddr, data_length: usize) -> Option<Self> {
+        let (local_ip, local_is_ip4) = encode_ip(local.ip());
+        let (remote_ip, remote_is_ip4) = encode_ip(remote.ip());
+        if local_is_ip4 != remote_is_ip4 {
+            return None;
+        }
+        Some(Self {
+            data_length: u32::try_from(data_length).ok()?,
+            data_offset: 0,
+            remote_ip,
+            local_ip,
+            remote_port: remote.port(),
+            local_port: local.port(),
+            is_ip4: u8::from(local_is_ip4),
+            gso_size: 0,
+        })
+    }
+
+    #[inline]
+    pub const fn from_raw(
+        data_length: u32,
+        data_offset: u32,
+        remote_ip: [u8; 16],
+        local_ip: [u8; 16],
+        remote_port: u16,
+        local_port: u16,
+        is_ip4: bool,
+        gso_size: u16,
+    ) -> Self {
+        Self {
+            data_length,
+            data_offset,
+            remote_ip,
+            local_ip,
+            remote_port,
+            local_port,
+            is_ip4: if is_ip4 { 1 } else { 0 },
+            gso_size,
+        }
+    }
+
+    #[inline]
+    pub const fn data_length(self) -> u32 {
+        self.data_length
+    }
+
+    #[inline]
+    pub const fn data_offset(self) -> u32 {
+        self.data_offset
+    }
+
+    #[inline]
+    pub const fn gso_size(self) -> u16 {
+        self.gso_size
+    }
+
+    #[inline]
+    pub const fn is_ip4(self) -> bool {
+        self.is_ip4 != 0
+    }
+
+    #[inline]
+    pub const fn local_port(self) -> u16 {
+        self.local_port
+    }
+
+    #[inline]
+    pub const fn remote_port(self) -> u16 {
+        self.remote_port
+    }
+
+    #[inline]
+    pub fn local(self) -> SocketAddr {
+        SocketAddr::new(decode_ip(self.local_ip, self.is_ip4()), self.local_port())
+    }
+
+    #[inline]
+    pub fn remote(self) -> SocketAddr {
+        SocketAddr::new(decode_ip(self.remote_ip, self.is_ip4()), self.remote_port())
+    }
+
+    #[inline]
+    pub const fn total_len(self) -> Option<usize> {
+        (self.data_length as usize).checked_add(Self::SIZE)
+    }
+
+    #[inline]
+    pub fn to_bytes(self) -> [u8; Self::SIZE] {
+        let mut bytes = [0u8; Self::SIZE];
+        bytes[..4].copy_from_slice(&self.data_length.to_ne_bytes());
+        bytes[4..8].copy_from_slice(&self.data_offset.to_ne_bytes());
+        bytes[8..24].copy_from_slice(&self.remote_ip);
+        bytes[24..40].copy_from_slice(&self.local_ip);
+        bytes[40..42].copy_from_slice(&self.remote_port.to_be_bytes());
+        bytes[42..44].copy_from_slice(&self.local_port.to_be_bytes());
+        bytes[44] = self.is_ip4;
+        bytes[45..47].copy_from_slice(&self.gso_size.to_be_bytes());
+        bytes
+    }
+
+    #[inline]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let bytes = bytes.get(..Self::SIZE)?;
+        let mut remote_ip = [0u8; 16];
+        remote_ip.copy_from_slice(&bytes[8..24]);
+        let mut local_ip = [0u8; 16];
+        local_ip.copy_from_slice(&bytes[24..40]);
+        Some(Self::from_raw(
+            u32::from_ne_bytes(bytes[..4].try_into().ok()?),
+            u32::from_ne_bytes(bytes[4..8].try_into().ok()?),
+            remote_ip,
+            local_ip,
+            u16::from_be_bytes(bytes[40..42].try_into().ok()?),
+            u16::from_be_bytes(bytes[42..44].try_into().ok()?),
+            bytes[44] != 0,
+            u16::from_be_bytes(bytes[45..47].try_into().ok()?),
+        ))
+    }
+}
+
+#[inline]
+fn encode_ip(ip: IpAddr) -> ([u8; 16], bool) {
+    match ip {
+        IpAddr::V4(ip) => {
+            let mut bytes = [0u8; 16];
+            bytes[..4].copy_from_slice(&ip.octets());
+            (bytes, true)
+        }
+        IpAddr::V6(ip) => (ip.octets(), false),
+    }
+}
+
+#[inline]
+fn decode_ip(bytes: [u8; 16], is_ip4: bool) -> IpAddr {
+    if is_ip4 {
+        IpAddr::V4(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]))
+    } else {
+        IpAddr::V6(Ipv6Addr::from(bytes))
+    }
 }
 
 impl AppSession {
@@ -124,6 +298,76 @@ impl AppSession {
         Ok(wrote)
     }
 
+    /// App-side datagram enqueue matching VPP `app_send_dgram`.
+    ///
+    /// A datagram is all-or-nothing: `Ok(0)` means the TX FIFO did not have
+    /// room for the header and payload, while a positive result is the number
+    /// of payload bytes made visible to the transport.
+    #[inline]
+    pub fn send_datagram(
+        &self,
+        header: SessionDgramHeader,
+        payload: &[u8],
+    ) -> Result<usize, AppSessionError> {
+        let header_len = header.data_length();
+        if header_len != u32::try_from(payload.len()).unwrap_or(u32::MAX) {
+            return Err(AppSessionError::DatagramLengthMismatch {
+                payload_len: payload.len(),
+                header_len,
+            });
+        }
+        let total = SessionDgramHeader::SIZE.checked_add(payload.len()).ok_or(
+            AppSessionError::DatagramFifo {
+                source: FifoError::ReservationTooLong {
+                    requested: usize::MAX,
+                    max_len: self.tx_fifo.max_enqueue(),
+                },
+            },
+        )?;
+        if self.tx_fifo.max_enqueue() < total {
+            return Ok(0);
+        }
+        let header_bytes = header.to_bytes();
+        let mut reservation = self
+            .tx_fifo
+            .reserve_write(total)
+            .map_err(|source| AppSessionError::DatagramFifo { source })?;
+        let copied = reservation
+            .copy_from_segments([header_bytes.as_slice(), payload])
+            .map_err(|source| AppSessionError::DatagramFifo { source })?;
+        if copied != total {
+            reservation.cancel();
+            return Err(AppSessionError::DatagramFifo {
+                source: FifoError::CommitExceedsReservation {
+                    initialized: copied,
+                    reserved: total,
+                },
+            });
+        }
+        reservation
+            .commit(copied)
+            .map_err(|source| AppSessionError::DatagramFifo { source })?;
+        self.publish_tx_enqueue(copied)?;
+        Ok(payload.len())
+    }
+
+    /// Convenience form for a connected or explicitly addressed datagram.
+    #[inline]
+    pub fn send_datagram_to(
+        &self,
+        local: SocketAddr,
+        remote: SocketAddr,
+        payload: &[u8],
+    ) -> Result<usize, AppSessionError> {
+        let header = SessionDgramHeader::new(local, remote, payload.len()).ok_or(
+            AppSessionError::DatagramLengthMismatch {
+                payload_len: payload.len(),
+                header_len: 0,
+            },
+        )?;
+        self.send_datagram(header, payload)
+    }
+
     /// App-side convenience: copy received bytes out (transport → app). Returns
     /// number of bytes copied into `out`; caller calls `consume_rx` after
     /// processing. On an empty fifo this clears the rx event flag and
@@ -143,6 +387,57 @@ impl AppSession {
             }
             self.rx_fifo.set_event();
         }
+    }
+
+    /// App-side datagram dequeue matching VPP `app_recv_dgram`.
+    ///
+    /// The header is returned with the payload copied into `out`; a datagram
+    /// larger than `out` is truncated for the caller but the complete record
+    /// is consumed from the FIFO, matching VPP's discard behavior.
+    #[inline]
+    pub fn recv_datagram(
+        &self,
+        out: &mut [u8],
+    ) -> Result<Option<(SessionDgramHeader, usize)>, AppSessionError> {
+        let mut header_bytes = [0u8; SessionDgramHeader::SIZE];
+        if self.peek_rx_header(&mut header_bytes).is_none() {
+            return Ok(None);
+        }
+        let Some(header) = SessionDgramHeader::from_bytes(&header_bytes) else {
+            return Ok(None);
+        };
+        let Some(total) = header.total_len() else {
+            return Ok(None);
+        };
+        if self.rx_fifo.max_dequeue() < total {
+            return Ok(None);
+        }
+        let data_length = header.data_length() as usize;
+        let data_offset = header.data_offset() as usize;
+        if data_offset > data_length {
+            return Err(AppSessionError::DatagramLengthMismatch {
+                payload_len: data_offset,
+                header_len: header.data_length(),
+            });
+        }
+        let payload_len = data_length - data_offset;
+        let offset = SessionDgramHeader::SIZE.checked_add(data_offset).ok_or(
+            AppSessionError::DatagramLengthMismatch {
+                payload_len,
+                header_len: header.data_length(),
+            },
+        )?;
+        let copied = self.rx_fifo.peek(offset, payload_len.min(out.len()), out);
+        self.rx_fifo.dequeue_drop(total);
+        self.publish_rx_dequeue(total);
+        Ok(Some((header, copied)))
+    }
+
+    #[inline]
+    fn peek_rx_header(&self, bytes: &mut [u8; SessionDgramHeader::SIZE]) -> Option<()> {
+        (self.rx_fifo.max_dequeue() >= SessionDgramHeader::SIZE
+            && self.rx_fifo.peek(0, SessionDgramHeader::SIZE, bytes) == SessionDgramHeader::SIZE)
+            .then_some(())
     }
 
     /// App-side convenience: drop `len` bytes from the head of `rx_fifo` after

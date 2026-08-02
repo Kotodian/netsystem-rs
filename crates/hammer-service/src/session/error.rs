@@ -111,6 +111,20 @@ pub(crate) enum SessionError {
     },
     #[error("session {session_id:?} RX accounting exceeds u32")]
     RxLengthOverflow { session_id: SessionId },
+    #[error(
+        "session {session_id:?} datagram payload length {payload_len} does not match header length {header_len}"
+    )]
+    DatagramLengthMismatch {
+        session_id: SessionId,
+        payload_len: usize,
+        header_len: u32,
+    },
+    #[error("session {session_id:?} datagram FIFO reservation failed")]
+    DatagramFifo {
+        session_id: SessionId,
+        #[source]
+        source: FifoError,
+    },
     #[error("session {session_id:?} accepted OOO delivery reported no retained span")]
     OooSpanMissing { session_id: SessionId },
     #[error("session {session_id:?} accepted OOO delivery reported an invalid span")]

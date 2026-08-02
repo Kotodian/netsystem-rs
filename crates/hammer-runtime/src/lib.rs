@@ -33,7 +33,7 @@ pub(crate) fn builtin_registration_image() -> &'static registration::Registratio
 
 pub mod engine;
 pub mod error;
-pub use engine::{Engine, EnginePool};
+pub use engine::{Engine, EnginePool, ensure_main_thread_with_barrier};
 pub mod config;
 pub mod file;
 pub use file::{Deadline, DeadlineFunction, File, FileFunction, FileFunctions, FileMain};

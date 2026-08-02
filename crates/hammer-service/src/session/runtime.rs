@@ -17,8 +17,8 @@ use hammer_infra::segment::Segment;
 use hammer_infra::thread_owned::ThreadOwned;
 use hammer_runtime::app::{
     AppSession, AppSessionConfig, AppSessionError, ApplicationConnectionId, ApplicationId,
-    ApplicationListenerId, SessionAppContext, SessionAppId, SessionEventQueue, SessionEvt,
-    SessionEvtFlags, SessionEvtType, SessionHandle, SessionMqRing, SessionMsgQueue,
+    ApplicationListenerId, SessionAppContext, SessionAppId, SessionDgramHeader, SessionEventQueue,
+    SessionEvt, SessionEvtFlags, SessionEvtType, SessionHandle, SessionMqRing, SessionMsgQueue,
 };
 use hammer_runtime::attach::AppSessionPublisher;
 use hammer_runtime::{
@@ -336,60 +336,77 @@ impl SessionMain {
         transport: SessionTransportRegistration,
         endpoint: SessionListenEndpoint,
     ) -> RuntimeResult<SessionListenerId> {
-        let application = self
-            .applications
-            .with_listener(application_listener, |listener| listener.application())
-            .map_err(RuntimeError::from)?;
-        let listener = self.with_listeners_mut(|listeners| {
-            listeners
-                .insert(SessionListener {
-                    application,
-                    application_listener,
-                    transport,
-                })
-                .map(session_listener_id)
-                .ok_or(SessionError::ListenerCapacityExhausted {
-                    capacity: listeners.capacity(),
-                })
-        })??;
-        let Some(start_listen) = transport.start_listen() else {
-            self.with_listeners_mut(|listeners| {
+        self.with_control_barrier(|| {
+            let application = self
+                .applications
+                .with_listener(application_listener, |listener| listener.application())
+                .map_err(RuntimeError::from)?;
+            let listener = self.with_listeners_mut(|listeners| {
                 listeners
-                    .remove(session_listener_index(listener))
-                    .expect("new Session listener remains present until rollback");
-            })?;
-            return Err(SessionError::TransportListenUnsupported {
-                transport: transport.name(),
+                    .insert(SessionListener {
+                        application,
+                        application_listener,
+                        transport,
+                    })
+                    .map(session_listener_id)
+                    .ok_or(SessionError::ListenerCapacityExhausted {
+                        capacity: listeners.capacity(),
+                    })
+            })??;
+            let Some(start_listen) = transport.start_listen() else {
+                self.with_listeners_mut(|listeners| {
+                    listeners
+                        .remove(session_listener_index(listener))
+                        .expect("new Session listener remains present until rollback");
+                })?;
+                return Err(SessionError::TransportListenUnsupported {
+                    transport: transport.name(),
+                }
+                .into());
+            };
+            if let Err(error) = start_listen(listener, endpoint) {
+                self.with_listeners_mut(|listeners| {
+                    listeners
+                        .remove(session_listener_index(listener))
+                        .expect("new Session listener remains present until rollback");
+                })?;
+                return Err(error);
             }
-            .into());
-        };
-        if let Err(error) = start_listen(listener, endpoint) {
-            self.with_listeners_mut(|listeners| {
-                listeners
-                    .remove(session_listener_index(listener))
-                    .expect("new Session listener remains present until rollback");
-            })?;
-            return Err(error);
-        }
-        Ok(listener)
+            Ok(listener)
+        })?
     }
 
     pub fn unlisten(&self, listener: SessionListenerId) -> RuntimeResult<()> {
-        let transport = self.with_listener(listener, |entry| entry.transport)?;
-        let Some(stop_listen) = transport.stop_listen() else {
-            return Err(SessionError::TransportListenUnsupported {
-                transport: transport.name(),
+        self.with_control_barrier(|| {
+            let transport = self.with_listener(listener, |entry| entry.transport)?;
+            let Some(stop_listen) = transport.stop_listen() else {
+                return Err(SessionError::TransportListenUnsupported {
+                    transport: transport.name(),
+                }
+                .into());
+            };
+            stop_listen(listener)?;
+            self.with_listeners_mut(|listeners| {
+                listeners
+                    .remove(session_listener_index(listener))
+                    .ok_or(SessionError::ListenerMissing { listener })
+                    .map(drop)
+            })??;
+            Ok(())
+        })?
+    }
+
+    fn with_control_barrier<R>(&self, operation: impl FnOnce() -> R) -> RuntimeResult<R> {
+        if thread::current().id() != self.owner {
+            return Err(SessionError::ListenerControlWrongThread.into());
+        }
+        match Engine::with_current(|engine| engine.worker_barrier()) {
+            Some(barrier) => {
+                let mut control = ();
+                Ok(barrier.sync(&mut control, |_| operation()))
             }
-            .into());
-        };
-        stop_listen(listener)?;
-        self.with_listeners_mut(|listeners| {
-            listeners
-                .remove(session_listener_index(listener))
-                .ok_or(SessionError::ListenerMissing { listener })
-                .map(drop)
-        })??;
-        Ok(())
+            None => Ok(operation()),
+        }
     }
 
     pub fn connect(
@@ -954,6 +971,221 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     pub fn fifo_pair(&self, session_id: SessionId) -> Option<(&Fifo, &Fifo)> {
         let entry = self.entries.get(session_id.pool_index())?;
         Some((entry.rx_fifo.as_ref(), entry.tx_fifo.as_ref()))
+    }
+
+    /// Enqueue one complete VPP-shaped datagram into a Session RX FIFO.
+    ///
+    /// The header and every source buffer segment are copied into one FIFO
+    /// reservation. The reservation is committed only after all segments have
+    /// been copied, so a short FIFO or a segment allocation failure cannot
+    /// publish a partial datagram.
+    pub fn enqueue_datagram_rx_from_buffer(
+        &self,
+        buffers: &DataPlaneBuffers,
+        session_id: SessionId,
+        index: BufferIndex,
+        header: SessionDgramHeader,
+        urgent: bool,
+    ) -> RuntimeResult<usize> {
+        self.enqueue_datagram_rx_from_buffer_at(buffers, session_id, index, 0, header, urgent)
+    }
+
+    /// Variant of [`Self::enqueue_datagram_rx_from_buffer`] for a packet
+    /// buffer whose current window still contains network and UDP headers.
+    /// Only `payload_offset..payload_offset + header.data_length` is copied.
+    pub fn enqueue_datagram_rx_from_buffer_at(
+        &self,
+        buffers: &DataPlaneBuffers,
+        session_id: SessionId,
+        index: BufferIndex,
+        payload_offset: usize,
+        header: SessionDgramHeader,
+        urgent: bool,
+    ) -> RuntimeResult<usize> {
+        let Some(entry) = self.entries.get(session_id.pool_index()) else {
+            return Ok(0);
+        };
+        let payload_len = header.data_length() as usize;
+        let payload_end = payload_offset.checked_add(payload_len).ok_or(
+            SessionError::DatagramLengthMismatch {
+                session_id,
+                payload_len,
+                header_len: header.data_length(),
+            },
+        )?;
+        let mut source_len = 0usize;
+        for buffer in buffers.chain(index) {
+            source_len = source_len
+                .checked_add(buffer?.current_len())
+                .ok_or(SessionError::RxLengthOverflow { session_id })?;
+        }
+        if payload_end > source_len {
+            return Err(SessionError::DatagramLengthMismatch {
+                session_id,
+                payload_len: source_len.saturating_sub(payload_offset),
+                header_len: header.data_length(),
+            }
+            .into());
+        }
+        let total = SessionDgramHeader::SIZE.checked_add(payload_len).ok_or(
+            SessionError::DatagramLengthMismatch {
+                session_id,
+                payload_len,
+                header_len: header.data_length(),
+            },
+        )?;
+        if entry.rx_fifo.max_enqueue() < total {
+            entry.rx_fifo.want_deq_notification();
+            return Ok(0);
+        }
+
+        let mut reservation = match entry.rx_fifo.reserve_write(total) {
+            Ok(reservation) => reservation,
+            Err(hammer_infra::fifo::FifoError::InsufficientCapacity { .. }) => {
+                entry.rx_fifo.want_deq_notification();
+                return Ok(0);
+            }
+            Err(source) => {
+                return Err(SessionError::DatagramFifo { session_id, source }.into());
+            }
+        };
+        let header_bytes = header.to_bytes();
+        let copied_header = reservation
+            .copy_from_segments([header_bytes.as_slice()])
+            .map_err(|source| SessionError::DatagramFifo { session_id, source })?;
+        if copied_header != SessionDgramHeader::SIZE {
+            reservation.cancel();
+            return Err(SessionError::DatagramLengthMismatch {
+                session_id,
+                payload_len: copied_header,
+                header_len: SessionDgramHeader::SIZE as u32,
+            }
+            .into());
+        }
+        let mut skip = payload_offset;
+        let mut remaining = payload_len;
+        for buffer in buffers.chain(index) {
+            let buffer = buffer?;
+            if skip >= buffer.current_len() {
+                skip -= buffer.current_len();
+                continue;
+            }
+            let start = skip;
+            let take = (buffer.current_len() - start).min(remaining);
+            reservation
+                .copy_from_segments([&buffer.current()[start..start + take]])
+                .map_err(|source| SessionError::DatagramFifo { session_id, source })?;
+            remaining -= take;
+            skip = 0;
+            if remaining == 0 {
+                break;
+            }
+        }
+        if remaining != 0 {
+            reservation.cancel();
+            return Err(SessionError::DatagramLengthMismatch {
+                session_id,
+                payload_len: payload_len - remaining,
+                header_len: header.data_length(),
+            }
+            .into());
+        }
+        reservation
+            .commit(total)
+            .map_err(|source| SessionError::DatagramFifo { session_id, source })?;
+        self.publish_rx_enqueue_with_flags(
+            session_id,
+            total,
+            if urgent {
+                SessionEvtFlags::URGENT
+            } else {
+                SessionEvtFlags::empty()
+            },
+        )?;
+        Ok(payload_len)
+    }
+
+    /// Peek the next complete TX datagram header without consuming it.
+    pub fn peek_tx_datagram(
+        &self,
+        session_id: SessionId,
+    ) -> RuntimeResult<Option<SessionDgramHeader>> {
+        let Some(entry) = self.entries.get(session_id.pool_index()) else {
+            return Ok(None);
+        };
+        if entry.tx_fifo.max_dequeue() < SessionDgramHeader::SIZE {
+            return Ok(None);
+        }
+        let mut bytes = [0u8; SessionDgramHeader::SIZE];
+        if entry.tx_fifo.peek(0, bytes.len(), &mut bytes) != bytes.len() {
+            return Ok(None);
+        }
+        let Some(header) = SessionDgramHeader::from_bytes(&bytes) else {
+            return Ok(None);
+        };
+        let Some(total) = header.total_len() else {
+            return Ok(None);
+        };
+        if header.data_offset() > header.data_length() || entry.tx_fifo.max_dequeue() < total {
+            return Ok(None);
+        }
+        Ok(Some(header))
+    }
+
+    /// Copy a complete TX datagram payload into an already allocated buffer.
+    /// The FIFO header remains at the head until [`Self::dequeue_tx_datagram`]
+    /// is called after output header construction succeeds.
+    pub fn copy_tx_datagram_to_buffer(
+        &self,
+        buffers: &DataPlaneBuffers,
+        session_id: SessionId,
+        header: SessionDgramHeader,
+        index: BufferIndex,
+    ) -> RuntimeResult<usize> {
+        let data_offset = header.data_offset() as usize;
+        let data_length = header.data_length() as usize;
+        if data_offset > data_length {
+            return Err(SessionError::DatagramLengthMismatch {
+                session_id,
+                payload_len: data_offset,
+                header_len: header.data_length(),
+            }
+            .into());
+        }
+        let payload_len = data_length - data_offset;
+        let fifo_offset = SessionDgramHeader::SIZE.checked_add(data_offset).ok_or(
+            SessionError::DatagramLengthMismatch {
+                session_id,
+                payload_len,
+                header_len: header.data_length(),
+            },
+        )?;
+        self.copy_tx_to_buffer(buffers, session_id, fifo_offset, payload_len, index)?;
+        Ok(payload_len)
+    }
+
+    /// Consume one complete TX datagram after its data-plane buffer is ready.
+    pub fn dequeue_tx_datagram(
+        &self,
+        session_id: SessionId,
+        header: SessionDgramHeader,
+    ) -> RuntimeResult<usize> {
+        let total = header
+            .total_len()
+            .ok_or(SessionError::DatagramLengthMismatch {
+                session_id,
+                payload_len: header.data_offset() as usize,
+                header_len: header.data_length(),
+            })?;
+        let Some(entry) = self.entries.get(session_id.pool_index()) else {
+            return Ok(0);
+        };
+        if entry.tx_fifo.max_dequeue() < total {
+            return Ok(0);
+        }
+        let dropped = entry.tx_fifo.dequeue_drop(total);
+        self.publish_tx_dequeue(session_id, dropped)?;
+        Ok(dropped)
     }
 
     #[inline]
@@ -2982,7 +3214,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     use hammer_core::data_plane::{BufferFrame, NodeId, NodeState};
@@ -3008,6 +3240,27 @@ mod tests {
     use crate::session::protocol::SessionAppCallbacks;
 
     static SESSION_APP_RECORDED: AtomicU64 = AtomicU64::new(0);
+    static SESSION_LISTEN_BARRIER_SEEN: AtomicBool = AtomicBool::new(false);
+    static SESSION_UNLISTEN_BARRIER_SEEN: AtomicBool = AtomicBool::new(false);
+
+    fn record_listen_barrier(
+        _: hammer_runtime::SessionListenerId,
+        _: hammer_runtime::SessionListenEndpoint,
+    ) -> RuntimeResult<()> {
+        SESSION_LISTEN_BARRIER_SEEN.store(
+            Engine::with_current(|engine| engine.worker_barrier().is_pending()).unwrap_or(false),
+            Ordering::SeqCst,
+        );
+        Ok(())
+    }
+
+    fn record_unlisten_barrier(_: hammer_runtime::SessionListenerId) -> RuntimeResult<()> {
+        SESSION_UNLISTEN_BARRIER_SEEN.store(
+            Engine::with_current(|engine| engine.worker_barrier().is_pending()).unwrap_or(false),
+            Ordering::SeqCst,
+        );
+        Ok(())
+    }
 
     fn record_session_app_rx(
         _: &mut SessionWorker<Index>,
@@ -3056,6 +3309,43 @@ mod tests {
         _: &mut BufferFrame,
         _: &mut SessionQueueOutput,
     ) -> RuntimeResult<()> {
+        Ok(())
+    }
+
+    #[test]
+    fn session_listen_and_unlisten_hold_worker_barrier_around_transport_calls()
+    -> Result<(), SessionTestFailure> {
+        let mut engine = Engine::new(
+            DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()),
+            RuntimeRegistry::new(),
+        );
+        engine.install_current();
+        let applications = ApplicationMain::new(1);
+        let application = applications.attach()?;
+        let application_listener = applications.register_listener(application, None, None)?;
+        let main = Arc::new(SessionMain::new(1, Arc::clone(&applications)));
+
+        SESSION_LISTEN_BARRIER_SEEN.store(false, Ordering::SeqCst);
+        let listener = main.listen(
+            application_listener,
+            hammer_runtime::SessionTransportRegistration::new(
+                "barrier-udp",
+                Some(record_listen_barrier),
+                Some(record_unlisten_barrier),
+                None,
+            ),
+            hammer_runtime::SessionListenEndpoint::new(
+                "127.0.0.1:0".parse().expect("test listen endpoint"),
+                DataWorkerId::new(0),
+            ),
+        )?;
+        assert!(SESSION_LISTEN_BARRIER_SEEN.load(Ordering::SeqCst));
+
+        SESSION_UNLISTEN_BARRIER_SEEN.store(false, Ordering::SeqCst);
+        main.unlisten(listener)?;
+        assert!(SESSION_UNLISTEN_BARRIER_SEEN.load(Ordering::SeqCst));
+
+        Engine::uninstall_current();
         Ok(())
     }
 
