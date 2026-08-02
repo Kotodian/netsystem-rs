@@ -988,13 +988,8 @@ pub(crate) fn closing_session_for_test() -> (
     sessions
         .install_application_mq_for_test(application)
         .expect("install test Application MQ");
-    let policy = hammer_runtime::app::AppSessionPolicy::new(
-        hammer_runtime::app::APP_SESSION_POLICY_VERSION,
-        [],
-    )
-    .expect("direct App Session policy is valid");
     let application_listener = applications
-        .register_listener(application, &policy)
+        .register_listener(application, None, None)
         .expect("register test Application listener");
     let session_main = Arc::new(SessionMain::new(1, applications));
     sessions.set_listener_main(Arc::clone(&session_main));

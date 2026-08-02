@@ -4,7 +4,7 @@
 //! collects its registrations after dependency-ordered loading. No DSO load
 //! constructor, destructor, global registry, or synchronization is involved.
 
-use crate::app::AppSessionProtocolEntry;
+use crate::app::SessionAppRegistration;
 use crate::binary_api::BinaryApiMethodEntry;
 use crate::init::{ConfigFunction, InitFunction};
 use crate::node::{NodeEntry, NodeFunctionRegistration};
@@ -31,7 +31,7 @@ pub struct RegistrationImage {
     node_functions: &'static [NodeFunctionRegistration],
     process_nodes: &'static [ProcessEntry],
     session_transports: &'static [SessionTransportRegistration],
-    app_session_protocols: &'static [AppSessionProtocolEntry],
+    session_apps: &'static [SessionAppRegistration],
     binary_api_methods: &'static [BinaryApiMethodEntry],
 }
 
@@ -49,7 +49,7 @@ impl RegistrationImage {
         node_functions: &'static [NodeFunctionRegistration],
         process_nodes: &'static [ProcessEntry],
         session_transports: &'static [SessionTransportRegistration],
-        app_session_protocols: &'static [AppSessionProtocolEntry],
+        session_apps: &'static [SessionAppRegistration],
         binary_api_methods: &'static [BinaryApiMethodEntry],
     ) -> Self {
         Self {
@@ -63,7 +63,7 @@ impl RegistrationImage {
             node_functions,
             process_nodes,
             session_transports,
-            app_session_protocols,
+            session_apps,
             binary_api_methods,
         }
     }
@@ -118,8 +118,8 @@ impl RegistrationImage {
     }
 
     #[inline]
-    pub(crate) fn app_session_protocols(&self) -> &'static [AppSessionProtocolEntry] {
-        self.app_session_protocols
+    pub(crate) fn session_apps(&self) -> &'static [SessionAppRegistration] {
+        self.session_apps
     }
 
     #[inline]
@@ -143,7 +143,7 @@ macro_rules! __declare_registration_image {
             node_functions = [];
             process_nodes = [];
             session_transports = [];
-            app_session_protocols = [];
+            session_apps = [];
             binary_api_methods = [];
         );
     };
@@ -158,7 +158,7 @@ macro_rules! __declare_registration_image {
         node_functions = [$($node_function:path),* $(,)?];
         process_nodes = [$($process_node:path),* $(,)?];
         session_transports = [$($session_transport:path),* $(,)?];
-        app_session_protocols = [$($app_session_protocol:path),* $(,)?];
+        session_apps = [$($session_app:path),* $(,)?];
         binary_api_methods = [$($binary_api_method:path),* $(,)?];
     ) => {
         static __HAMMER_REGISTRATION_IMAGE: $crate::__private::RegistrationImage =
@@ -173,7 +173,7 @@ macro_rules! __declare_registration_image {
                 &[$($node_function),*],
                 &[$($process_node),*],
                 &[$($session_transport),*],
-                &[$($app_session_protocol),*],
+                &[$($session_app),*],
                 &[$($binary_api_method),*],
             );
     };

@@ -1,9 +1,7 @@
 use std::sync::Arc;
 
 use hammer_infra::segment::Segment;
-use hammer_runtime::app::{
-    AppSession, AppSessionConfig, AppSessionProtocol, SessionHandle, SessionMsgQueue,
-};
+use hammer_runtime::app::{AppSession, AppSessionConfig, SessionHandle, SessionMsgQueue};
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 

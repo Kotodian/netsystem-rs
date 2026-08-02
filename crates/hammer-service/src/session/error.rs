@@ -35,6 +35,16 @@ pub enum SessionQueueError {
     ApplicationMqAlreadyRegistered { application: ApplicationId },
     #[error("Application {application:?} has no per-worker MQ registration")]
     ApplicationMqMissing { application: ApplicationId },
+    #[error("Session App does not provide registered context construction")]
+    SessionAppContextCreateUnsupported,
+    #[error("Session App {app:?} is already installed on this worker")]
+    SessionAppAlreadyInstalled {
+        app: hammer_runtime::app::SessionAppId,
+    },
+    #[error("Session App {app:?} is not installed on this worker")]
+    SessionAppNotInstalled {
+        app: hammer_runtime::app::SessionAppId,
+    },
 }
 
 impl SessionQueueError {
@@ -50,6 +60,9 @@ impl SessionQueueError {
             Self::OutputMissing { .. } => 6,
             Self::ApplicationMqAlreadyRegistered { .. } => 7,
             Self::ApplicationMqMissing { .. } => 8,
+            Self::SessionAppContextCreateUnsupported => 9,
+            Self::SessionAppAlreadyInstalled { .. } => 10,
+            Self::SessionAppNotInstalled { .. } => 11,
         }
     }
 }

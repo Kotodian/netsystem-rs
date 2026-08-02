@@ -16,10 +16,9 @@ use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::segment::Segment;
 use hammer_infra::thread_owned::ThreadOwned;
 use hammer_runtime::app::{
-    AppSession, AppSessionConfig, AppSessionError, AppSessionProtocolConnectionId,
-    AppSessionProtocolEntry, AppSessionProtocolRole, ApplicationConnectionId, ApplicationId,
-    ApplicationListenerId, SessionEventQueue, SessionEvt, SessionEvtFlags, SessionEvtType,
-    SessionHandle, SessionMqRing, SessionMsgQueue,
+    AppSession, AppSessionConfig, AppSessionError, ApplicationConnectionId, ApplicationId,
+    ApplicationListenerId, SessionAppContext, SessionAppId, SessionEventQueue, SessionEvt,
+    SessionEvtFlags, SessionEvtType, SessionHandle, SessionMqRing, SessionMsgQueue,
 };
 use hammer_runtime::attach::AppSessionPublisher;
 use hammer_runtime::{
@@ -32,16 +31,16 @@ use hammer_runtime::{
 };
 
 use crate::session::app::AppWorkerError;
-use crate::session::application::{ApplicationMain, ApplicationMqResources, ApplicationProtocol};
+use crate::session::application::{ApplicationMain, ApplicationMqResources};
 use crate::session::error::{SessionError, SessionQueueError};
 use crate::session::node::{AppSessionInputNode, SessionQueueTransportDispatch};
+use crate::session::protocol::SessionAppCallbacks;
 use crate::session::state::SessionState;
 use crate::session::{AppWorker, SessionId, SessionQueueNext};
 
 const DEFAULT_SESSION_POOL_CAPACITY: usize = 1024;
 const DEFAULT_SESSION_EVENT_CAPACITY: usize = 2048;
 const DEFAULT_TX_DISPATCH_BUDGET: usize = 64;
-const PROTOCOL_ADVANCE_BUDGET: usize = 64;
 const SESSION_WORKER_INTERRUPT_DEADLINE: Duration = Duration::from_millis(1);
 const SESSION_WORKER_IDLE_DEADLINE: Duration = Duration::from_millis(100);
 
@@ -136,24 +135,23 @@ enum SessionType<Index> {
         transport: SessionTransportId,
         state: SessionState<Index>,
     },
-    AppSessionProtocol {
-        protocol: AppSessionProtocolEntry,
-        connection: AppSessionProtocolConnectionId,
-    },
 }
 
 #[derive(Clone, Copy)]
 enum SessionApplication {
-    AppSessionProtocol {
-        protocol: AppSessionProtocolEntry,
-        connection: AppSessionProtocolConnectionId,
-    },
     External(ApplicationId),
 }
 
 struct SessionEntry<Index> {
     session_type: Option<SessionType<Index>>,
     application: Option<SessionApplication>,
+    owner_application: Option<ApplicationId>,
+    app: Option<SessionAppId>,
+    app_session: SessionAppContext,
+    app_config: Option<u64>,
+    server_name: Option<String>,
+    accepted: bool,
+    lower_session: Option<SessionId>,
     rx_fifo: Arc<Fifo>,
     tx_fifo: Arc<Fifo>,
     schedule_pending: bool,
@@ -172,6 +170,13 @@ impl<Index: Copy + Eq> SessionEntry<Index> {
                 state: SessionState::creating(),
             }),
             application: None,
+            owner_application: None,
+            app: None,
+            app_session: 0,
+            app_config: None,
+            server_name: None,
+            accepted: false,
+            lower_session: None,
             rx_fifo,
             tx_fifo,
             schedule_pending: false,
@@ -183,6 +188,13 @@ impl<Index: Copy + Eq> SessionEntry<Index> {
         Self {
             session_type: None,
             application: None,
+            owner_application: None,
+            app: None,
+            app_session: 0,
+            app_config: None,
+            server_name: None,
+            accepted: false,
+            lower_session: None,
             rx_fifo,
             tx_fifo,
             schedule_pending: false,
@@ -199,6 +211,7 @@ pub struct SessionWorker<Index> {
     app: AppWorker,
     session_evt_q: Arc<SessionMsgQueue>,
     app_session_config: AppSessionConfig,
+    session_app_callbacks: Vec<Option<SessionAppCallbacks<Index>>>,
     pub(crate) transport_dispatches: Vec<SessionQueueTransportDispatch>,
     pub(crate) control_events: LinkedList<SessionEvt>,
     pub(crate) new_io_events: LinkedList<SessionEvt>,
@@ -394,6 +407,22 @@ impl SessionMain {
         let session_connection = SessionConnectionId::from_raw(connection.raw());
         connect(session_connection, endpoint)?;
         Ok(session_connection)
+    }
+
+    /// Installs one worker-local Session App callback table by registered name.
+    pub fn install_session_app(
+        &self,
+        runtime: &DataPlaneRuntime,
+        name: &str,
+        callbacks: &SessionAppCallbacks,
+    ) -> RuntimeResult<()> {
+        let app = self
+            .applications
+            .session_app_id(name)
+            .map_err(RuntimeError::from)?;
+        self.with_worker_mut(runtime, |sessions| {
+            sessions.install_session_app(app, *callbacks)
+        })
     }
 
     pub(super) fn with_listener<R>(
@@ -754,6 +783,25 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     }
 
     #[inline]
+    pub const fn worker_count(&self) -> usize {
+        self.worker_count
+    }
+
+    /// Updates the opaque Session App context selected by a callback.
+    pub fn set_app_session(
+        &mut self,
+        session_id: SessionId,
+        context: SessionAppContext,
+    ) -> RuntimeResult<()> {
+        let entry = self
+            .entries
+            .get_mut(session_id.pool_index())
+            .ok_or(SessionError::SessionMissing { session_id })?;
+        entry.app_session = context;
+        Ok(())
+    }
+
+    #[inline]
     pub const fn state(&self) -> SessionWorkerState {
         self.state
     }
@@ -875,6 +923,106 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     #[inline]
     pub fn app_session_config(&self) -> AppSessionConfig {
         self.app_session_config
+    }
+
+    /// Installs one concrete Session App callback table for this worker.
+    pub fn install_session_app(
+        &mut self,
+        app: SessionAppId,
+        callbacks: SessionAppCallbacks<Index>,
+    ) -> RuntimeResult<()> {
+        let index = app.raw() as usize;
+        if self.session_app_callbacks.len() <= index {
+            self.session_app_callbacks.resize_with(index + 1, || None);
+        }
+        if self.session_app_callbacks[index].is_some() {
+            return Err(SessionQueueError::SessionAppAlreadyInstalled { app }.into());
+        }
+        self.session_app_callbacks[index] = Some(callbacks);
+        Ok(())
+    }
+
+    #[inline]
+    pub fn session_app_callbacks(&self, app: SessionAppId) -> Option<SessionAppCallbacks<Index>> {
+        self.session_app_callbacks
+            .get(app.raw() as usize)
+            .copied()
+            .flatten()
+    }
+
+    #[inline]
+    pub fn fifo_pair(&self, session_id: SessionId) -> Option<(&Fifo, &Fifo)> {
+        let entry = self.entries.get(session_id.pool_index())?;
+        Some((entry.rx_fifo.as_ref(), entry.tx_fifo.as_ref()))
+    }
+
+    #[inline]
+    pub fn session_app_facts(
+        &self,
+        session_id: SessionId,
+    ) -> Option<(
+        ApplicationId,
+        Option<SessionAppId>,
+        Option<u64>,
+        Option<&str>,
+    )> {
+        let entry = self.entries.get(session_id.pool_index())?;
+        Some((
+            entry.owner_application?,
+            entry.app,
+            entry.app_config,
+            entry.server_name.as_deref(),
+        ))
+    }
+
+    /// Publishes a Session-owned upper App Session from a Session App callback.
+    pub fn create_upper_session(
+        &mut self,
+        lower: SessionId,
+        context: SessionAppContext,
+    ) -> RuntimeResult<SessionId> {
+        let (application, app, _config, _server_name) = self
+            .session_app_facts(lower)
+            .ok_or(SessionError::SessionMissing { session_id: lower })?;
+        let Some(app) = app else {
+            return Err(SessionError::SessionMissing { session_id: lower }.into());
+        };
+        let app_rx_mq = self
+            .app_mq_worker(application)
+            .ok_or(SessionQueueError::ApplicationMqMissing { application })?;
+        let (rx_fifo, tx_fifo) = self.create_local_fifos()?;
+        let upper = self.insert_session_entry(SessionEntry::unbound(rx_fifo, tx_fifo))?;
+        let app_session = self
+            .app
+            .create_app_session(
+                lower.get(),
+                Some(application),
+                self.session_handle(upper),
+                self.app_session_config,
+                app_rx_mq,
+            )
+            .map_err(|error| {
+                let _ = self.entries.remove(upper.pool_index());
+                error
+            })?;
+        let entry = self
+            .entries
+            .get_mut(upper.pool_index())
+            .expect("new upper Session remains installed during publication");
+        entry.rx_fifo = Arc::clone(app_session.rx_fifo());
+        entry.tx_fifo = Arc::clone(app_session.tx_fifo());
+        entry.application = Some(SessionApplication::External(application));
+        entry.owner_application = Some(application);
+        entry.app = Some(app);
+        entry.app_session = context;
+        entry.lower_session = Some(lower);
+        self.app.attach_session(upper, app_session);
+        if let Err(error) = self.app.connected(upper) {
+            let _ = self.entries.remove(upper.pool_index());
+            self.app.detach_session(upper);
+            return Err(error);
+        }
+        Ok(upper)
     }
 
     #[cfg(test)]
@@ -1082,7 +1230,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     #[inline]
     pub fn session_transport(&self, session_id: SessionId) -> Option<(SessionTransportId, Index)> {
         let entry = self.entries.get(session_id.pool_index())?;
-        let SessionType::Transport { transport, state } = entry.session_type? else {
+        let Some(SessionType::Transport { transport, state }) = entry.session_type else {
             return None;
         };
         Some((transport, state.transport_index()?))
@@ -1117,15 +1265,16 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         let application_listener =
             main.with_listener(listener, SessionListener::application_listener)?;
         main.applications
-            .with_listener(application_listener, |policy| {
+            .with_listener(application_listener, |listener| {
                 self.construct_stream_sessions(
                     transport,
                     index,
-                    listener.raw(),
-                    policy.application(),
-                    AppSessionProtocolRole::Server,
-                    policy.protocols(),
+                    application_listener.raw(),
+                    listener.application(),
+                    listener.app(),
+                    listener.config(),
                     None,
+                    true,
                 )
             })
             .map_err(RuntimeError::from)?
@@ -1140,15 +1289,16 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         let application_connection = ApplicationConnectionId::from_raw(connection.raw());
         let applications = Arc::clone(&self.applications);
         let session_id = applications
-            .with_connection(application_connection, |policy| {
+            .with_connection(application_connection, |connection| {
                 self.construct_stream_sessions(
                     transport,
                     index,
                     application_connection.raw(),
-                    policy.application(),
-                    AppSessionProtocolRole::Client,
-                    policy.protocols(),
-                    policy.server_name(),
+                    connection.application(),
+                    connection.app(),
+                    connection.config(),
+                    connection.server_name(),
+                    false,
                 )
             })
             .map_err(RuntimeError::from)??;
@@ -1165,111 +1315,54 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         index: Index,
         allocation_owner: u64,
         application: ApplicationId,
-        role: AppSessionProtocolRole,
-        protocols: &[ApplicationProtocol],
+        app: Option<SessionAppId>,
+        config: Option<u64>,
         server_name: Option<&str>,
+        accepted: bool,
     ) -> RuntimeResult<SessionId> {
-        if protocols.is_empty() {
+        let Some(app) = app else {
             return self.construct_external_transport_session(
                 transport,
                 index,
                 allocation_owner,
                 application,
             );
-        }
+        };
+        self.construct_app_transport_session(
+            transport,
+            index,
+            application,
+            app,
+            config,
+            server_name,
+            accepted,
+        )
+    }
+
+    fn construct_app_transport_session(
+        &mut self,
+        transport: SessionTransportId,
+        index: Index,
+        application: ApplicationId,
+        app: SessionAppId,
+        config: Option<u64>,
+        server_name: Option<&str>,
+        accepted: bool,
+    ) -> RuntimeResult<SessionId> {
         let (rx_fifo, tx_fifo) = self.create_local_fifos()?;
         let session_id = self.insert_session_entry(SessionEntry::creating_transport(
             transport, rx_fifo, tx_fifo,
         ))?;
-        let mut session_ids = Vec::with_capacity(protocols.len() + 1);
-        session_ids.push(session_id);
-        let session_allocation = protocols.iter().try_for_each(|_| {
-            let (rx_fifo, tx_fifo) = self.create_local_fifos()?;
-            let session = self.insert_session_entry(SessionEntry::unbound(rx_fifo, tx_fifo))?;
-            session_ids.push(session);
-            Ok::<(), RuntimeError>(())
-        });
-        if let Err(error) = session_allocation {
-            self.rollback_stream_sessions(&session_ids, None);
-            return Err(error);
-        }
-        let application_session_id = *session_ids
-            .last()
-            .expect("validated App Session policy creates one external Session");
-        let app_rx_mq = match self.app_mq_worker(application) {
-            Some(queue) => queue,
-            None => {
-                self.rollback_stream_sessions(&session_ids, None);
-                return Err(SessionQueueError::ApplicationMqMissing { application }.into());
-            }
-        };
-        let application_session = match self.app.create_app_session(
-            allocation_owner,
-            Some(application),
-            self.session_handle(application_session_id),
-            self.app_session_config,
-            app_rx_mq,
-        ) {
-            Ok(session) => session,
-            Err(error) => {
-                self.rollback_stream_sessions(&session_ids, None);
-                return Err(error);
-            }
-        };
-        {
-            let entry = self
-                .entries
-                .get_mut(application_session_id.pool_index())
-                .expect("new external Session remains installed during construction");
-            entry.rx_fifo = Arc::clone(application_session.rx_fifo());
-            entry.tx_fifo = Arc::clone(application_session.tx_fifo());
-        }
-        let protocol_setup = protocols
-            .iter()
-            .copied()
-            .zip(session_ids.windows(2))
-            .try_for_each(|(protocol, sessions)| -> RuntimeResult<()> {
-                let session = sessions[0];
-                let app_session = sessions[1];
-                let connection = protocol.entry().create(
-                    self.worker,
-                    self.worker_count,
-                    Some(application),
-                    role,
-                    protocol.id(),
-                    server_name,
-                    self.session_handle(session),
-                    self.session_handle(app_session),
-                )?;
-                let entry = self
-                    .entries
-                    .get_mut(session.pool_index())
-                    .expect("new Session remains installed during construction");
-                entry.application = Some(SessionApplication::AppSessionProtocol {
-                    protocol: protocol.entry(),
-                    connection,
-                });
-                let entry = self
-                    .entries
-                    .get_mut(app_session.pool_index())
-                    .expect("new App Session remains installed during construction");
-                entry.session_type = Some(SessionType::AppSessionProtocol {
-                    protocol: protocol.entry(),
-                    connection,
-                });
-                Ok(())
-            });
-        if let Err(error) = protocol_setup {
-            self.rollback_stream_sessions(&session_ids, Some(application_session.as_ref()));
-            return Err(error);
-        }
-        self.entries
-            .get_mut(application_session_id.pool_index())
-            .expect("new external Session remains installed during construction")
-            .application = Some(SessionApplication::External(application));
+        let entry = self
+            .entries
+            .get_mut(session_id.pool_index())
+            .expect("new Session App transport Session remains installed during construction");
+        entry.owner_application = Some(application);
+        entry.app = Some(app);
+        entry.app_config = config;
+        entry.server_name = server_name.map(str::to_owned);
+        entry.accepted = accepted;
         self.finish_transport_creation(session_id, index);
-        self.app
-            .attach_session(application_session_id, application_session);
         Ok(session_id)
     }
 
@@ -1312,6 +1405,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             entry.rx_fifo = Arc::clone(application_session.rx_fifo());
             entry.tx_fifo = Arc::clone(application_session.tx_fifo());
             entry.application = Some(SessionApplication::External(application));
+            entry.owner_application = Some(application);
         }
         self.finish_transport_creation(session_id, index);
         self.app.attach_session(session_id, application_session);
@@ -1354,16 +1448,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             self.app.discard_app_session(session);
         }
         session_ids.iter().rev().copied().for_each(|session_id| {
-            let Some(entry) = self.entries.remove(session_id.pool_index()) else {
-                return;
-            };
-            if let Some(SessionType::AppSessionProtocol {
-                protocol,
-                connection,
-            }) = entry.session_type
-            {
-                protocol.destroy(self.worker, connection);
-            }
+            let _ = self.entries.remove(session_id.pool_index());
         });
     }
 
@@ -1382,25 +1467,6 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     #[inline]
     fn session_handle(&self, session_id: SessionId) -> SessionHandle {
         SessionHandle::new(session_id.pool_index().slot(), self.worker.slot() as u32)
-    }
-
-    #[inline]
-    fn session_from_handle(&self, handle: SessionHandle) -> Option<SessionId> {
-        (handle.worker_index() == self.worker.slot() as u32)
-            .then(|| self.entries.index_at_slot(handle.session_index()))
-            .flatten()
-            .map(SessionId::from)
-    }
-
-    fn protocol_sessions(
-        &self,
-        protocol: AppSessionProtocolEntry,
-        connection: AppSessionProtocolConnectionId,
-    ) -> RuntimeResult<Option<(SessionId, SessionId)>> {
-        let (session_handle, app_session_handle) = protocol.sessions(self.worker, connection)?;
-        Ok(self
-            .session_from_handle(session_handle)
-            .zip(self.session_from_handle(app_session_handle)))
     }
 
     fn finish_transport_creation(&mut self, session_id: SessionId, index: Index) {
@@ -1655,24 +1721,42 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     }
 
     fn remove_session(&mut self, session_id: SessionId) -> RuntimeResult<()> {
+        let (app, context, lower_session) = self
+            .entries
+            .get(session_id.pool_index())
+            .map(|entry| (entry.app, entry.app_session, entry.lower_session))
+            .unwrap_or((None, 0, None));
+        if let Some(app) = app
+            && context != 0
+            && let Some(callbacks) = self.session_app_callbacks(app)
+            && let Some(cleanup) = callbacks.cleanup
+        {
+            cleanup(self, session_id, context)?;
+        }
+        if let Some(app) = app
+            && context != 0
+            && lower_session.is_none()
+            && let Some(registration) = self.applications.session_app_registration(app)
+        {
+            registration.destroy(self.worker, context);
+        }
         let Some(entry) = self.entries.remove(session_id.pool_index()) else {
             return Ok(());
         };
         if matches!(entry.application, Some(SessionApplication::External(_))) {
             drop(self.app.detach_session(session_id));
         }
-        let Some(SessionApplication::AppSessionProtocol {
-            protocol,
-            connection,
-        }) = entry.application
-        else {
-            return Ok(());
-        };
-        let (_, app_session_handle) = protocol.sessions(self.worker, connection)?;
-        let app_session = self.session_from_handle(app_session_handle);
-        protocol.destroy(self.worker, connection);
-        if let Some(app_session) = app_session {
-            self.remove_session(app_session)?;
+        if app.is_some() && lower_session.is_none() {
+            let upper_sessions = self
+                .entries
+                .iter()
+                .filter_map(|(index, entry)| {
+                    (entry.lower_session == Some(session_id)).then_some(SessionId::from(index))
+                })
+                .collect::<Vec<_>>();
+            for upper in upper_sessions {
+                self.remove_session(upper)?;
+            }
         }
         Ok(())
     }
@@ -1682,25 +1766,18 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         session_id: SessionId,
         event: SessionEvtType,
     ) -> RuntimeResult<()> {
+        let app = self
+            .entries
+            .get(session_id.pool_index())
+            .and_then(|entry| entry.app);
+        if let Some(app) = app {
+            return self.dispatch_app_lifecycle(session_id, app, event);
+        }
         let application = self
             .entries
             .get(session_id.pool_index())
             .and_then(|entry| entry.application);
         match application {
-            Some(SessionApplication::AppSessionProtocol {
-                protocol,
-                connection,
-            }) => {
-                let Some((_, app_session)) = self.protocol_sessions(protocol, connection)? else {
-                    return Ok(());
-                };
-                self.control_events.push_back(SessionEvt::ctrl(
-                    app_session.pool_index().slot(),
-                    self.worker.slot() as u32,
-                    event,
-                ));
-                Ok(())
-            }
             Some(SessionApplication::External(_)) => match event {
                 SessionEvtType::Disconnected => self.app.disconnected(session_id),
                 SessionEvtType::Reset => self.app.reset(session_id),
@@ -1805,21 +1882,18 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         session_id: SessionId,
         event: SessionEvtType,
     ) -> RuntimeResult<()> {
+        let app = self
+            .entries
+            .get(session_id.pool_index())
+            .and_then(|entry| entry.app);
+        if let Some(app) = app {
+            return self.dispatch_app_event(session_id, app, event);
+        }
         let application = self
             .entries
             .get(session_id.pool_index())
             .and_then(|entry| entry.application);
         match application {
-            Some(SessionApplication::AppSessionProtocol {
-                protocol,
-                connection,
-            }) => match event {
-                SessionEvtType::RxEnq => self.process_protocol_ingress(protocol, connection),
-                SessionEvtType::TxDeq | SessionEvtType::Connect => {
-                    self.process_protocol_egress(protocol, connection)
-                }
-                _ => Ok(()),
-            },
             Some(SessionApplication::External(_)) => match event {
                 SessionEvtType::RxEnq | SessionEvtType::TxDeq => {
                     let Some(session) = self.app.app_session(session_id) else {
@@ -1839,139 +1913,82 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         session_id: SessionId,
         event: SessionEvtType,
     ) -> RuntimeResult<()> {
-        let session_type = self
+        let app = self
             .entries
             .get(session_id.pool_index())
-            .and_then(|entry| entry.session_type);
-        match session_type {
-            Some(SessionType::Transport { .. }) => Ok(()),
-            Some(SessionType::AppSessionProtocol {
-                protocol,
-                connection,
-            }) => match event {
-                SessionEvtType::RxDeq => self.process_protocol_ingress(protocol, connection),
-                SessionEvtType::TxEnq | SessionEvtType::ProtocolOutput => {
-                    self.process_protocol_egress(protocol, connection)
+            .and_then(|entry| entry.app);
+        let Some(app) = app else {
+            return Ok(());
+        };
+        self.dispatch_app_event(session_id, app, event)
+    }
+
+    fn dispatch_app_event(
+        &mut self,
+        session_id: SessionId,
+        app: SessionAppId,
+        event: SessionEvtType,
+    ) -> RuntimeResult<()> {
+        let context = self
+            .entries
+            .get(session_id.pool_index())
+            .map(|entry| entry.app_session)
+            .unwrap_or(0);
+        let callbacks = self
+            .session_app_callbacks(app)
+            .ok_or(SessionQueueError::SessionAppNotInstalled { app })?;
+        let callback = match event {
+            SessionEvtType::RxEnq | SessionEvtType::RxDeq => callbacks.builtin_rx,
+            SessionEvtType::TxEnq | SessionEvtType::TxDeq | SessionEvtType::ProtocolOutput => {
+                callbacks.builtin_tx
+            }
+            SessionEvtType::Connect => {
+                let accepted = self
+                    .entries
+                    .get(session_id.pool_index())
+                    .map(|entry| entry.accepted)
+                    .unwrap_or(false);
+                if accepted {
+                    callbacks.accept
+                } else {
+                    callbacks.connected
                 }
-                _ => Ok(()),
-            },
-            None => Ok(()),
-        }
-    }
-
-    fn process_protocol_ingress(
-        &mut self,
-        protocol: AppSessionProtocolEntry,
-        connection: AppSessionProtocolConnectionId,
-    ) -> RuntimeResult<()> {
-        let Some((session_id, app_session_id)) = self.protocol_sessions(protocol, connection)?
-        else {
-            return Ok(());
-        };
-        let mut progressed = false;
-        let mut exhausted = true;
-        for _ in 0..PROTOCOL_ADVANCE_BUDGET {
-            let (consumed, produced) = {
-                let Some(session) = self.entries.get(session_id.pool_index()) else {
-                    return Ok(());
-                };
-                let Some(app_session) = self.entries.get(app_session_id.pool_index()) else {
-                    return Ok(());
-                };
-                protocol.ingress(
-                    self.worker,
-                    connection,
-                    session.rx_fifo.as_ref(),
-                    app_session.rx_fifo.as_ref(),
-                )?
-            };
-            self.publish_rx_dequeue(session_id, consumed)?;
-            self.publish_rx_enqueue(app_session_id, produced)?;
-            if consumed == 0 && produced == 0 {
-                exhausted = false;
-                break;
             }
-            progressed = true;
-        }
-        if let Some(session) = self.entries.get(session_id.pool_index())
-            && session.rx_fifo.max_dequeue() == 0
-        {
-            session.rx_fifo.unset_event();
-        }
-        if progressed {
-            self.enqueue_session_event(SessionEvt::io(
-                app_session_id.pool_index().slot(),
-                SessionEvtType::ProtocolOutput,
-            ))?;
-        }
-        if exhausted {
-            self.enqueue_session_event(SessionEvt::io(
-                session_id.pool_index().slot(),
-                SessionEvtType::RxEnq,
-            ))?;
-        }
-        self.publish_protocol_ready(protocol, connection, app_session_id)
-    }
-
-    fn process_protocol_egress(
-        &mut self,
-        protocol: AppSessionProtocolEntry,
-        connection: AppSessionProtocolConnectionId,
-    ) -> RuntimeResult<()> {
-        let Some((session_id, app_session_id)) = self.protocol_sessions(protocol, connection)?
-        else {
-            return Ok(());
+            _ => return Ok(()),
         };
-        let mut exhausted = true;
-        for _ in 0..PROTOCOL_ADVANCE_BUDGET {
-            let (consumed, produced) = {
-                let Some(session) = self.entries.get(session_id.pool_index()) else {
-                    return Ok(());
-                };
-                let Some(app_session) = self.entries.get(app_session_id.pool_index()) else {
-                    return Ok(());
-                };
-                protocol.egress(
-                    self.worker,
-                    connection,
-                    app_session.tx_fifo.as_ref(),
-                    session.tx_fifo.as_ref(),
-                )?
-            };
-            self.publish_tx_dequeue(app_session_id, consumed)?;
-            self.publish_tx_enqueue(session_id, produced)?;
-            if consumed == 0 && produced == 0 {
-                exhausted = false;
-                break;
-            }
+        if let Some(callback) = callback {
+            callback(self, session_id, context)?;
         }
-        if let Some(app_session) = self.entries.get(app_session_id.pool_index())
-            && app_session.tx_fifo.max_dequeue() == 0
-        {
-            app_session.tx_fifo.unset_event();
-        }
-        if exhausted {
-            self.enqueue_session_event(SessionEvt::io(
-                app_session_id.pool_index().slot(),
-                SessionEvtType::ProtocolOutput,
-            ))?;
-        }
-        self.publish_protocol_ready(protocol, connection, app_session_id)
+        Ok(())
     }
 
-    fn publish_protocol_ready(
+    fn dispatch_app_lifecycle(
         &mut self,
-        protocol: AppSessionProtocolEntry,
-        connection: AppSessionProtocolConnectionId,
-        app_session_id: SessionId,
+        session_id: SessionId,
+        app: SessionAppId,
+        event: SessionEvtType,
     ) -> RuntimeResult<()> {
-        if !protocol.claim_ready(self.worker, connection)? {
-            return Ok(());
+        let context = self
+            .entries
+            .get(session_id.pool_index())
+            .map(|entry| entry.app_session)
+            .unwrap_or(0);
+        let callbacks = self
+            .session_app_callbacks(app)
+            .ok_or(SessionQueueError::SessionAppNotInstalled { app })?;
+        let callback = match event {
+            SessionEvtType::Disconnected => callbacks.disconnect,
+            SessionEvtType::Reset => callbacks.reset,
+            SessionEvtType::TransportClosed => callbacks.transport_closed,
+            _ => None,
+        };
+        if let Some(callback) = callback {
+            callback(self, session_id, context)?;
         }
-        self.dispatch_application(app_session_id, SessionEvtType::Connect)
+        Ok(())
     }
 
-    fn publish_rx_enqueue(&self, session_id: SessionId, produced: usize) -> RuntimeResult<()> {
+    pub fn publish_rx_enqueue(&self, session_id: SessionId, produced: usize) -> RuntimeResult<()> {
         self.publish_rx_enqueue_with_flags(session_id, produced, SessionEvtFlags::empty())
     }
 
@@ -2019,7 +2036,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         Ok(())
     }
 
-    fn publish_rx_dequeue(&self, session_id: SessionId, consumed: usize) -> RuntimeResult<()> {
+    pub fn publish_rx_dequeue(&self, session_id: SessionId, consumed: usize) -> RuntimeResult<()> {
         let notify = self
             .entries
             .get(session_id.pool_index())
@@ -2033,7 +2050,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         Ok(())
     }
 
-    fn publish_tx_enqueue(&self, session_id: SessionId, produced: usize) -> RuntimeResult<()> {
+    pub fn publish_tx_enqueue(&self, session_id: SessionId, produced: usize) -> RuntimeResult<()> {
         if produced == 0 {
             return Ok(());
         }
@@ -2055,7 +2072,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         Ok(())
     }
 
-    fn publish_tx_dequeue(&self, session_id: SessionId, consumed: usize) -> RuntimeResult<()> {
+    pub fn publish_tx_dequeue(&self, session_id: SessionId, consumed: usize) -> RuntimeResult<()> {
         let external = self
             .entries
             .get(session_id.pool_index())
@@ -2384,6 +2401,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             app,
             session_evt_q,
             app_session_config,
+            session_app_callbacks: Vec::new(),
             transport_dispatches: Vec::new(),
             control_events: LinkedList::new(),
             new_io_events: LinkedList::new(),
@@ -2740,21 +2758,12 @@ where
             let session_id = SessionId::from(index);
             match event.evt_type {
                 SessionEvtType::Close => {
-                    let session_type = sessions
+                    let lower_session = sessions
                         .entries
                         .get(session_id.pool_index())
-                        .and_then(|entry| entry.session_type);
-                    if let Some(SessionType::AppSessionProtocol {
-                        protocol,
-                        connection,
-                    }) = session_type
-                    {
-                        let Some((session, _)) =
-                            sessions.protocol_sessions(protocol, connection)?
-                        else {
-                            return Ok(());
-                        };
-                        sessions.schedule_disconnect(session);
+                        .and_then(|entry| entry.lower_session);
+                    if let Some(lower) = lower_session {
+                        sessions.schedule_disconnect(lower);
                         return Ok(());
                     }
                     let session_transport = sessions.session_transport(session_id);
@@ -2780,21 +2789,12 @@ where
                     }
                 }
                 SessionEvtType::HalfClose => {
-                    let session_type = sessions
+                    let lower_session = sessions
                         .entries
                         .get(session_id.pool_index())
-                        .and_then(|entry| entry.session_type);
-                    if let Some(SessionType::AppSessionProtocol {
-                        protocol,
-                        connection,
-                    }) = session_type
-                    {
-                        let Some((session, _)) =
-                            sessions.protocol_sessions(protocol, connection)?
-                        else {
-                            return Ok(());
-                        };
-                        sessions.schedule_half_close(session);
+                        .and_then(|entry| entry.lower_session);
+                    if let Some(lower) = lower_session {
+                        sessions.schedule_half_close(lower);
                         return Ok(());
                     }
                     let session_transport = sessions.session_transport(session_id);
@@ -2942,10 +2942,9 @@ where
                         sessions.request_rx_dequeue_notification(session_id);
                     }
                 }
-                Some(SessionType::AppSessionProtocol { .. }) => {
+                None => {
                     sessions.dispatch_session_type(session_id, event.evt_type)?;
                 }
-                None => {}
             }
         }
         SessionEvtType::TxEnq | SessionEvtType::ProtocolOutput => {
@@ -2983,13 +2982,12 @@ where
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     use hammer_core::data_plane::{BufferFrame, NodeId, NodeState};
     use hammer_infra::pool::Index;
-    use hammer_runtime::app::{
-        AppSessionConfig, AppSessionProtocolRole, SessionEvt, SessionEvtType, SessionMsgQueueError,
-    };
+    use hammer_runtime::app::{AppSessionConfig, SessionEvt, SessionEvtType, SessionMsgQueueError};
     use hammer_runtime::attach::AppServer;
     use hammer_runtime::{
         AttachError, DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, Engine,
@@ -3001,11 +2999,39 @@ mod tests {
         SessionWorker, SessionWorkerState, queue_for_worker,
     };
     use crate::session::ApplicationMain;
+    use crate::session::SessionId;
     use crate::session::application::{ApplicationError, ApplicationMqResources};
     use crate::session::node::{
         SessionQueueNode, SessionQueueOutput, register_app_session_input_node,
         register_session_queue_node,
     };
+    use crate::session::protocol::SessionAppCallbacks;
+
+    static SESSION_APP_RECORDED: AtomicU64 = AtomicU64::new(0);
+
+    fn record_session_app_rx(
+        _: &mut SessionWorker<Index>,
+        session: SessionId,
+        context: u64,
+    ) -> RuntimeResult<()> {
+        SESSION_APP_RECORDED.store(
+            (u64::from(session.pool_index().slot()) << 32) | (context & 0xffff_ffff),
+            Ordering::SeqCst,
+        );
+        Ok(())
+    }
+
+    fn record_session_app_connected(
+        _: &mut SessionWorker<Index>,
+        session: SessionId,
+        context: u64,
+    ) -> RuntimeResult<()> {
+        SESSION_APP_RECORDED.store(
+            (u64::from(session.pool_index().slot()) << 32) | (context & 0xffff_ffff),
+            Ordering::SeqCst,
+        );
+        Ok(())
+    }
 
     #[derive(Debug, thiserror::Error)]
     enum SessionTestFailure {
@@ -3100,9 +3126,10 @@ mod tests {
             Index::new(7, 1),
             7,
             application,
-            AppSessionProtocolRole::Server,
-            &[],
             None,
+            None,
+            None,
+            true,
         )?;
         sessions.connection_published(session_id)?;
         sessions.connected(session_id)?;
@@ -3147,9 +3174,10 @@ mod tests {
             Index::new(7, 1),
             7,
             application,
-            AppSessionProtocolRole::Server,
-            &[],
             None,
+            None,
+            None,
+            true,
         )?;
         let app_session = sessions
             .app_session(session_id)
@@ -3324,9 +3352,10 @@ mod tests {
                 Index::new(1, 1),
                 1,
                 application,
-                AppSessionProtocolRole::Server,
-                &[],
                 None,
+                None,
+                None,
+                true,
             )
             .expect("first accepted Session");
         sessions
@@ -3341,9 +3370,10 @@ mod tests {
                 second_index,
                 2,
                 application,
-                AppSessionProtocolRole::Server,
-                &[],
                 None,
+                None,
+                None,
+                true,
             )
             .expect("second accepted Session");
         sessions
@@ -3392,9 +3422,10 @@ mod tests {
                 Index::new(1, 1),
                 1,
                 application,
-                AppSessionProtocolRole::Server,
-                &[],
                 None,
+                None,
+                None,
+                true,
             )
             .expect_err("missing worker Application MQ rejects Session creation");
         assert!(matches!(
@@ -3431,9 +3462,10 @@ mod tests {
                 Index::new(2, 1),
                 2,
                 application,
-                AppSessionProtocolRole::Server,
-                &[],
                 None,
+                None,
+                None,
+                true,
             )
             .expect("failed creation released Session capacity");
     }
@@ -3480,9 +3512,10 @@ mod tests {
                 connection_index,
                 3,
                 application,
-                AppSessionProtocolRole::Server,
-                &[],
                 None,
+                None,
+                None,
+                true,
             )
             .expect("accepted Session");
         sessions
@@ -3805,9 +3838,10 @@ mod tests {
                 Index::new(7, 1),
                 7,
                 application,
-                AppSessionProtocolRole::Server,
-                &[],
                 None,
+                None,
+                None,
+                true,
             )?;
             sessions.connection_published(target)?;
             sessions.connected(target)?;
@@ -3927,9 +3961,10 @@ mod tests {
             Index::new(7, 1),
             7,
             application,
-            AppSessionProtocolRole::Server,
-            &[],
             None,
+            None,
+            None,
+            true,
         )?;
         sessions.connection_published(target)?;
         sessions.connected(target)?;
@@ -3957,6 +3992,155 @@ mod tests {
                 .any(|candidate| *candidate == event)
         );
         Ok(())
+    }
+
+    #[test]
+    fn session_app_rx_dispatches_exact_session_and_opaque_context() {
+        SESSION_APP_RECORDED.store(0, Ordering::SeqCst);
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            Arc::clone(&applications),
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        let session_id = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(9, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                Some(99),
+                None,
+                false,
+            )
+            .expect("construct Session App session");
+        sessions
+            .set_app_session(session_id, 0xABCD)
+            .expect("set opaque context");
+        sessions
+            .install_session_app(
+                hammer_runtime::app::SessionAppId::new(0),
+                SessionAppCallbacks {
+                    builtin_rx: Some(record_session_app_rx),
+                    ..Default::default()
+                },
+            )
+            .expect("install Session App callbacks");
+
+        sessions
+            .dispatch_application(session_id, SessionEvtType::RxEnq)
+            .expect("dispatch exact Session App RX event");
+        assert_eq!(
+            SESSION_APP_RECORDED.load(Ordering::SeqCst),
+            (u64::from(session_id.pool_index().slot()) << 32) | 0xABCD
+        );
+    }
+
+    #[test]
+    fn session_app_connected_dispatches_exact_opaque_context() {
+        SESSION_APP_RECORDED.store(0, Ordering::SeqCst);
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        let session_id = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(11, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct Session App session");
+        sessions
+            .set_app_session(session_id, 0x1234)
+            .expect("set opaque context");
+        sessions
+            .install_session_app(
+                hammer_runtime::app::SessionAppId::new(0),
+                SessionAppCallbacks {
+                    connected: Some(record_session_app_connected),
+                    ..Default::default()
+                },
+            )
+            .expect("install Session App callbacks");
+
+        sessions
+            .dispatch_application(session_id, SessionEvtType::Connect)
+            .expect("dispatch exact Session App connected event");
+        assert_eq!(
+            SESSION_APP_RECORDED.load(Ordering::SeqCst),
+            (u64::from(session_id.pool_index().slot()) << 32) | 0x1234
+        );
+    }
+
+    #[test]
+    fn session_app_callback_publishes_upper_app_session_and_lower_teardown_removes_it() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct Session App session");
+
+        let upper = sessions
+            .create_upper_session(lower, 0x55)
+            .expect("publish upper Session from callback");
+        assert!(sessions.app_session(upper).is_some());
+        assert_eq!(
+            sessions
+                .entries
+                .get(upper.pool_index())
+                .and_then(|entry| entry.lower_session),
+            Some(lower)
+        );
+
+        sessions
+            .remove_session(lower)
+            .expect("remove lower Session");
+        assert!(!sessions.has_session(upper));
     }
 }
 

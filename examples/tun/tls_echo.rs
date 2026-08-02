@@ -12,10 +12,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use hammer_app::attach::{AppClient, AppClientError};
 use hammer_app::echo::run_echo_loop;
-use hammer_app::{
-    APP_SESSION_POLICY_VERSION, AppSession, AppSessionError, AppSessionPolicy,
-    AppSessionProtocolSelection, DataWorkerId, SessionListenEndpoint,
-};
+use hammer_app::{AppSession, AppSessionError, DataWorkerId, SessionAppId, SessionListenEndpoint};
 use hammer_runtime::app::SessionEvtType;
 use hammer_service::binary_api::{BinaryApiClient, BinaryApiError};
 use prost::Message;
@@ -169,15 +166,11 @@ fn main() -> Result<(), EchoError> {
     )?;
     eprintln!("registered TLS server configuration {config}");
 
-    let policy = AppSessionPolicy::new(
-        APP_SESSION_POLICY_VERSION,
-        [AppSessionProtocolSelection::with_id("tls", config)],
-    )
-    .expect("TLS App Session policy uses the supported version and a non-empty protocol name");
     let listener = application.listen(
         "tcp",
         SessionListenEndpoint::new(arguments.listen, DataWorkerId::new(0)),
-        policy,
+        Some(SessionAppId::new(0)),
+        Some(config),
     )?;
     eprintln!(
         "attached Application {:?}; listening for TLS on {} as {listener:?}",

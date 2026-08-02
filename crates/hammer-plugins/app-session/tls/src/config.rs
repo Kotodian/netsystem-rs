@@ -660,8 +660,7 @@ mod tests {
     #[test]
     fn application_explicitly_removes_generation_checked_tls_configurations() {
         let tls = init().expect("initialize TLS Main");
-        let applications =
-            ApplicationMain::with_protocols(2, [crate::__APP_SESSION_PROTOCOL_CONNECTION]);
+        let applications = ApplicationMain::with_session_apps(2, [crate::__SESSION_APP_CONNECTION]);
         let first = applications
             .register_local()
             .expect("register first Application");

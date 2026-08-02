@@ -9,8 +9,8 @@ use hammer_infra::pool::{Index, Pool};
 use hammer_infra::segment::Segment;
 use hammer_runtime::Engine;
 use hammer_runtime::app::{
-    AppSessionPolicy, AppSessionProtocolEntry, ApplicationConnectionId, ApplicationId,
-    ApplicationListenerId, SessionMsgQueue, SessionMsgQueueError,
+    ApplicationConnectionId, ApplicationId, ApplicationListenerId, SessionAppId,
+    SessionAppRegistration, SessionMsgQueue, SessionMsgQueueError,
 };
 use hammer_runtime::attach::ApplicationMqPublication;
 use hammer_runtime::{AttachError, DataWorkerId, RuntimeError};
@@ -27,20 +27,16 @@ struct ApplicationState {
 
 pub(crate) struct ApplicationListener {
     application: ApplicationId,
-    protocols: Box<[ApplicationProtocol]>,
+    app: Option<SessionAppId>,
+    config: Option<u64>,
 }
 
 pub(crate) struct ApplicationConnection {
     application: ApplicationId,
-    protocols: Box<[ApplicationProtocol]>,
+    app: Option<SessionAppId>,
+    config: Option<u64>,
     server_name: Option<String>,
     completion: AtomicU8,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct ApplicationProtocol {
-    entry: AppSessionProtocolEntry,
-    id: Option<u64>,
 }
 
 impl ApplicationListener {
@@ -50,20 +46,13 @@ impl ApplicationListener {
     }
 
     #[inline]
-    pub(crate) fn protocols(&self) -> &[ApplicationProtocol] {
-        &self.protocols
-    }
-}
-
-impl ApplicationProtocol {
-    #[inline]
-    pub(crate) const fn entry(self) -> AppSessionProtocolEntry {
-        self.entry
+    pub(crate) const fn app(&self) -> Option<SessionAppId> {
+        self.app
     }
 
     #[inline]
-    pub(crate) const fn id(self) -> Option<u64> {
-        self.id
+    pub(crate) const fn config(&self) -> Option<u64> {
+        self.config
     }
 }
 
@@ -74,8 +63,13 @@ impl ApplicationConnection {
     }
 
     #[inline]
-    pub(crate) fn protocols(&self) -> &[ApplicationProtocol] {
-        &self.protocols
+    pub(crate) const fn app(&self) -> Option<SessionAppId> {
+        self.app
+    }
+
+    #[inline]
+    pub(crate) const fn config(&self) -> Option<u64> {
+        self.config
     }
 
     #[inline]
@@ -195,7 +189,7 @@ const CONNECTION_COMPLETED: u8 = 1;
 pub struct ApplicationMain {
     owner: ThreadId,
     state: UnsafeCell<ApplicationState>,
-    protocols: Box<[AppSessionProtocolEntry]>,
+    session_apps: Box<[SessionAppRegistration]>,
 }
 
 const APP_MQ_CAPACITY_MIN: usize = 128;
@@ -212,12 +206,12 @@ unsafe impl Sync for ApplicationMain {}
 
 impl ApplicationMain {
     pub fn new(capacity: usize) -> Arc<Self> {
-        Self::with_protocols(capacity, [])
+        Self::with_session_apps(capacity, [])
     }
 
-    pub fn with_protocols(
+    pub fn with_session_apps(
         capacity: usize,
-        protocols: impl IntoIterator<Item = AppSessionProtocolEntry>,
+        session_apps: impl IntoIterator<Item = SessionAppRegistration>,
     ) -> Arc<Self> {
         Arc::new(Self {
             owner: thread::current().id(),
@@ -227,7 +221,10 @@ impl ApplicationMain {
                 connections: Pool::with_capacity(capacity),
                 mq_resources: std::iter::repeat_with(|| None).take(capacity).collect(),
             }),
-            protocols: protocols.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+            session_apps: session_apps
+                .into_iter()
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
         })
     }
 
@@ -452,10 +449,16 @@ impl ApplicationMain {
     pub fn register_listener(
         &self,
         application: ApplicationId,
-        policy: &AppSessionPolicy,
+        app: Option<SessionAppId>,
+        config: Option<u64>,
     ) -> Result<ApplicationListenerId, ApplicationError> {
         self.ensure_active(application)?;
-        let listener = self.resolve_listener(application, policy)?;
+        self.validate_session_app(app)?;
+        let listener = ApplicationListener {
+            application,
+            app,
+            config,
+        };
         self.with_state_mut(|state| {
             state
                 .listeners
@@ -471,13 +474,15 @@ impl ApplicationMain {
         &self,
         application: ApplicationId,
         server_name: Option<String>,
-        policy: &AppSessionPolicy,
+        app: Option<SessionAppId>,
+        config: Option<u64>,
     ) -> Result<ApplicationConnectionId, ApplicationError> {
         self.ensure_active(application)?;
-        let protocols = self.resolve_policy(policy)?;
+        self.validate_session_app(app)?;
         let connection = ApplicationConnection {
             application,
-            protocols,
+            app,
+            config,
             server_name,
             completion: AtomicU8::new(CONNECTION_PENDING),
         };
@@ -634,31 +639,53 @@ impl ApplicationMain {
             .ok_or(ApplicationError::ListenerMissing { listener })
     }
 
-    fn resolve_listener(
+    pub(crate) fn session_app(
         &self,
-        application: ApplicationId,
-        policy: &AppSessionPolicy,
-    ) -> Result<ApplicationListener, ApplicationError> {
-        let protocols = self.resolve_policy(policy)?;
-        Ok(ApplicationListener {
-            application,
-            protocols,
+        name: &str,
+    ) -> Result<SessionAppRegistration, ApplicationError> {
+        let mut found = None;
+        for entry in self.session_apps.iter().copied() {
+            if entry.name() != name {
+                continue;
+            }
+            if found.is_some() {
+                return Err(ApplicationError::SessionAppDuplicate {
+                    name: name.to_owned(),
+                });
+            }
+            found = Some(entry);
+        }
+        found.ok_or_else(|| ApplicationError::SessionAppMissing {
+            name: name.to_owned(),
         })
     }
 
-    fn resolve_policy(
+    pub(crate) fn session_app_id(&self, name: &str) -> Result<SessionAppId, ApplicationError> {
+        self.session_app(name).map(|_| {
+            self.session_apps
+                .iter()
+                .position(|entry| entry.name() == name)
+                .map(|index| SessionAppId::new(index as u32))
+                .expect("resolved Session App remains in the registration list")
+        })
+    }
+
+    pub(crate) fn session_app_registration(
         &self,
-        policy: &AppSessionPolicy,
-    ) -> Result<Box<[ApplicationProtocol]>, ApplicationError> {
-        let mut protocols = Vec::with_capacity(policy.protocols().len());
-        for selection in policy.protocols() {
-            let entry = unique_protocol(&self.protocols, selection.protocol())?;
-            protocols.push(ApplicationProtocol {
-                entry,
-                id: selection.id(),
-            });
+        app: SessionAppId,
+    ) -> Option<SessionAppRegistration> {
+        self.session_apps.get(app.raw() as usize).copied()
+    }
+
+    fn validate_session_app(&self, app: Option<SessionAppId>) -> Result<(), ApplicationError> {
+        let Some(app) = app else {
+            return Ok(());
+        };
+        if (app.raw() as usize) < self.session_apps.len() {
+            Ok(())
+        } else {
+            Err(ApplicationError::SessionAppUnregistered { app })
         }
-        Ok(protocols.into_boxed_slice())
     }
 
     fn ensure_active(&self, application: ApplicationId) -> Result<(), ApplicationError> {
@@ -790,10 +817,12 @@ pub enum ApplicationError {
     },
     #[error("Application {application:?} already owns per-Application MQ resources")]
     MqAlreadyAttached { application: ApplicationId },
-    #[error("App Session protocol `{protocol}` is not registered")]
-    ProtocolMissing { protocol: String },
-    #[error("App Session protocol `{protocol}` is registered more than once")]
-    ProtocolDuplicate { protocol: String },
+    #[error("Session App `{name}` is not registered")]
+    SessionAppMissing { name: String },
+    #[error("Session App `{name}` is registered more than once")]
+    SessionAppDuplicate { name: String },
+    #[error("Session App id {app:?} is not registered")]
+    SessionAppUnregistered { app: SessionAppId },
     #[error("Application listener capacity {capacity} is exhausted")]
     ListenerCapacityExhausted { capacity: usize },
     #[error("Application connection capacity {capacity} is exhausted")]
@@ -848,46 +877,21 @@ fn application_connection_index(connection: ApplicationConnectionId) -> Index {
     Index::new(connection.slot(), connection.generation())
 }
 
-fn unique_protocol(
-    protocols: &[AppSessionProtocolEntry],
-    name: &str,
-) -> Result<AppSessionProtocolEntry, ApplicationError> {
-    let mut found = None;
-    for protocol in protocols.iter().copied() {
-        if protocol.registration().name() != name {
-            continue;
-        }
-        if found.is_some() {
-            return Err(ApplicationError::ProtocolDuplicate {
-                protocol: name.to_owned(),
-            });
-        }
-        found = Some(protocol);
-    }
-    found.ok_or_else(|| ApplicationError::ProtocolMissing {
-        protocol: name.to_owned(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use hammer_runtime::DataWorkerId;
-    use hammer_runtime::app::{APP_SESSION_POLICY_VERSION, AppSessionPolicy, SessionEventQueue};
+    use hammer_runtime::app::SessionEventQueue;
 
     use super::{
         ApplicationConnectionId, ApplicationError, ApplicationId, ApplicationMain,
         ApplicationMqResources,
     };
 
-    fn policy() -> AppSessionPolicy {
-        AppSessionPolicy::new(APP_SESSION_POLICY_VERSION, []).expect("direct App Session policy")
-    }
-
     fn register_connection(
         main: &ApplicationMain,
         application: ApplicationId,
     ) -> ApplicationConnectionId {
-        main.register_connection(application, None, &policy())
+        main.register_connection(application, None, None, None)
             .expect("register Application connection")
     }
 

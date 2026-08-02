@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use crate::{DataWorkerId, SessionListenEndpoint, SessionListenerId};
 
-use super::{AppSessionPolicy, ApplicationConnectionId, SessionMsgQueue, SessionMsgQueueError};
+use super::{ApplicationConnectionId, SessionAppId, SessionMsgQueue, SessionMsgQueueError};
 
 pub const APPLICATION_SESSION_CONTROL_BYTES: usize = 2048;
 
@@ -15,7 +15,8 @@ pub enum ApplicationSessionRequest {
         context: u64,
         transport: String,
         endpoint: SessionListenEndpoint,
-        policy: AppSessionPolicy,
+        app: Option<SessionAppId>,
+        config: Option<u64>,
     },
     Connect {
         context: u64,
@@ -24,7 +25,8 @@ pub enum ApplicationSessionRequest {
         local: Option<SocketAddr>,
         worker: DataWorkerId,
         server_name: Option<String>,
-        policy: AppSessionPolicy,
+        app: Option<SessionAppId>,
+        config: Option<u64>,
     },
     Unlisten {
         context: u64,
@@ -50,8 +52,8 @@ pub enum ApplicationSessionStatus {
     ApplicationControlWrongThread,
     TransportMissing,
     TransportDuplicate,
-    ProtocolMissing,
-    ProtocolDuplicate,
+    SessionAppMissing,
+    SessionAppDuplicate,
     ListenerCapacityExhausted,
     ListenerMissing,
     ListenerNotOwned,
