@@ -1,17 +1,11 @@
 //! Dynamic `ip` plugin (`libhammer_plugin_ip`).
 
-use abi_stable::{
-    sabi_trait::TD_Opaque,
-    std_types::{RBoxError, RErr, ROk, RResult, RSlice, RSliceMut},
-};
 use hammer_core::data_plane::NodeId;
-use hammer_runtime::IpOutput;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use hammer_runtime::RuntimeResult;
 
 hammer_component_macros::declare_plugin!(
     name = "ip",
     load_after = [],
-    ip_output = &IP_OUTPUT,
     init_functions = [
         ip::reassembly::__INIT_FN_IP_REASSEMBLY_INIT,
         lookup::__INIT_FN_IP_INIT,
@@ -46,67 +40,9 @@ pub mod ip;
 mod lookup;
 pub mod protocol;
 
-struct IpOutputService;
-
-impl IpOutput for IpOutputService {
-    fn register_protocol(&self, protocol: u8, node: NodeId) -> RResult<(), RBoxError> {
-        match ip::local::register_protocol(protocol, node) {
-            Ok(()) => ROk(()),
-            Err(error) => RErr(RBoxError::new(error)),
-        }
-    }
-
-    fn write_ipv4_header(
-        &self,
-        mut output: RSliceMut<'_, u8>,
-        source: RSlice<'_, u8>,
-        destination: RSlice<'_, u8>,
-        protocol: u8,
-        total_len: u16,
-    ) -> bool {
-        let Ok(source) = <[u8; 4]>::try_from(source.as_slice()) else {
-            return false;
-        };
-        let Ok(destination) = <[u8; 4]>::try_from(destination.as_slice()) else {
-            return false;
-        };
-        protocol::ip::write_ipv4_push_header(
-            output.as_mut_slice(),
-            Ipv4Addr::from(source),
-            Ipv4Addr::from(destination),
-            protocol,
-            total_len,
-        )
-        .is_ok()
-    }
-
-    fn write_ipv6_header(
-        &self,
-        mut output: RSliceMut<'_, u8>,
-        source: RSlice<'_, u8>,
-        destination: RSlice<'_, u8>,
-        next_header: u8,
-        payload_len: u16,
-    ) -> bool {
-        let Ok(source) = <[u8; 16]>::try_from(source.as_slice()) else {
-            return false;
-        };
-        let Ok(destination) = <[u8; 16]>::try_from(destination.as_slice()) else {
-            return false;
-        };
-        protocol::ip::write_ipv6_push_header(
-            output.as_mut_slice(),
-            Ipv6Addr::from(source),
-            Ipv6Addr::from(destination),
-            next_header,
-            payload_len,
-        )
-        .is_ok()
-    }
+pub fn register_protocol(protocol: u8, node: NodeId) -> RuntimeResult<()> {
+    ip::local::register_protocol(protocol, node)
 }
-
-static IP_OUTPUT: hammer_runtime::IpOutput_CTO<'static, 'static> =
-    hammer_runtime::IpOutput_CTO::from_const(&IpOutputService, TD_Opaque);
 
 pub use ip::{
     IcmpEchoRequestNext, IcmpEchoRequestNode, IcmpEchoRequestTrace, IcmpErrorNext, IcmpErrorNode,
@@ -122,6 +58,7 @@ pub use lookup::{
     AdjacencyRewriteNext, AdjacencyRewriteNode, AdjacencyRewriteNodeError, AdjacencyRewriteTrace,
     IpLookupControlPlane, IpLookupNext, IpLookupNode, IpLookupTrace,
 };
+pub use protocol::ip::{write_ipv4_push_header, write_ipv6_push_header};
 pub fn reset_ip_main_for_test() {
     lookup::reset_for_test();
     hammer_service::net::pmtu::reset_path_mtu_cache_for_test();

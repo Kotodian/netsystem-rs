@@ -9,85 +9,20 @@ use std::path::{Path, PathBuf};
 use abi_stable::{
     RRef, StableAbi,
     library::RootModule,
-    sabi_trait,
-    std_types::{RBoxError, ROption, RResult, RSlice, RSliceMut, RStr},
+    std_types::{RSlice, RStr},
 };
-use hammer_core::data_plane::NodeId;
 use object::{Object, ObjectSection};
 use semver::Version;
 use serde::Deserialize;
 
 use crate::app::AppSessionProtocolEntry;
 use crate::binary_api::BinaryApiMethodEntry;
-use crate::error::RuntimeError;
 use crate::init::{ConfigFunction, InitFunction};
 use crate::node::{NodeEntry, NodeFunctionRegistration};
 use crate::plugin_loader::{PluginLibrary, read_plugin_module};
 use crate::process::ProcessEntry;
 use crate::registration::RegistrationImage;
 use crate::session::SessionTransportRegistration;
-
-/// IP protocol dispatch and header writers exposed to transport plugins.
-///
-/// The implementation belongs to the IP plugin. This interface is part of
-/// Runtime's single dynamic-plugin root contract so `PluginMain` can retain it
-/// without knowing the IP implementation image.
-#[sabi_trait]
-pub trait IpOutput: Send + Sync {
-    fn write_ipv4_header(
-        &self,
-        output: RSliceMut<'_, u8>,
-        source: RSlice<'_, u8>,
-        destination: RSlice<'_, u8>,
-        protocol: u8,
-        total_len: u16,
-    ) -> bool;
-
-    fn write_ipv6_header(
-        &self,
-        output: RSliceMut<'_, u8>,
-        source: RSlice<'_, u8>,
-        destination: RSlice<'_, u8>,
-        next_header: u8,
-        payload_len: u16,
-    ) -> bool;
-
-    /// Connects IP local delivery to `node` while the main thread owns graph
-    /// topology. IP owns the resulting next slot; the transport observes only
-    /// success or the source-preserving cross-DSO error.
-    #[sabi(last_prefix_field)]
-    fn register_protocol(&self, protocol: u8, node: NodeId) -> RResult<(), RBoxError>;
-}
-
-/// IP address family used by UDP destination-port registrations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, StableAbi, serde::Deserialize, serde::Serialize)]
-#[repr(u8)]
-pub enum UdpIpVersion {
-    V4 = 0,
-    V6 = 1,
-}
-
-/// UDP destination-port dispatch owned by the UDP plugin.
-///
-/// The implementation remains in UDP; this ABI only gives local consumers a
-/// typed seam for registering the graph next that receives validated datagrams.
-#[sabi_trait]
-pub trait UdpLocal: Send + Sync {
-    fn register_dst_port(
-        &self,
-        version: UdpIpVersion,
-        port: u16,
-        node: NodeId,
-    ) -> RResult<(), RBoxError>;
-
-    #[sabi(last_prefix_field)]
-    fn unregister_dst_port(
-        &self,
-        version: UdpIpVersion,
-        port: u16,
-        node: NodeId,
-    ) -> RResult<(), RBoxError>;
-}
 
 /// Metadata owned by one dynamically loaded plugin module.
 #[repr(C)]
@@ -140,19 +75,13 @@ impl PluginMetadata {
 }
 
 /// The sole `abi_stable` root module exported by every Hammer plugin DSO.
-///
-/// Plugins expose callable cross-plugin services through the optional
-/// capability fields. IP owns IPv4/IPv6 header construction and protocol
-/// dispatch; UDP owns destination-port dispatch.
 #[repr(C)]
 #[derive(StableAbi)]
 #[sabi(kind(Prefix(prefix_ref = PluginModuleRef)))]
 pub struct PluginModule {
     pub metadata: PluginMetadata,
-    pub registration_image: RRef<'static, RegistrationImage>,
-    pub ip_output: ROption<RRef<'static, IpOutput_CTO<'static, 'static>>>,
     #[sabi(last_prefix_field)]
-    pub udp_local: ROption<RRef<'static, UdpLocal_CTO<'static, 'static>>>,
+    pub registration_image: RRef<'static, RegistrationImage>,
 }
 
 /// Declarative DSO metadata read before loading a plugin.
@@ -173,14 +102,10 @@ impl PluginModule {
     pub const fn new(
         metadata: PluginMetadata,
         registration_image: RRef<'static, RegistrationImage>,
-        ip_output: ROption<RRef<'static, IpOutput_CTO<'static, 'static>>>,
-        udp_local: ROption<RRef<'static, UdpLocal_CTO<'static, 'static>>>,
     ) -> Self {
         Self {
             metadata,
             registration_image,
-            ip_output,
-            udp_local,
         }
     }
 }
@@ -198,11 +123,6 @@ impl RootModule for PluginModuleRef {
 pub enum PluginError {
     #[error("plugin `{name}` is not loaded")]
     NotLoaded { name: String },
-    #[error("plugin `{plugin}` does not export `{capability}`")]
-    CapabilityMissing {
-        plugin: &'static str,
-        capability: &'static str,
-    },
     #[error("App Session protocol `{name}` is not registered")]
     AppSessionProtocolMissing { name: String },
     #[error("App Session protocol `{name}` is registered more than once")]
@@ -215,13 +135,6 @@ pub enum PluginError {
     BinaryApiMethodMissing { name: String },
     #[error("Binary API method `{name}` is registered more than once")]
     BinaryApiMethodDuplicate { name: String },
-    #[error("plugin `{plugin}` capability `{capability}` failed")]
-    CapabilityCall {
-        plugin: &'static str,
-        capability: &'static str,
-        #[source]
-        source: RBoxError,
-    },
     #[error("duplicate plugin roots at indexes {first} and {duplicate}")]
     DuplicateRoot { first: usize, duplicate: usize },
     #[error("plugin load_after cycle while loading `{path}`")]
@@ -641,17 +554,6 @@ impl PluginMain {
         found.ok_or_else(|| PluginError::BinaryApiMethodMissing {
             name: name.to_owned(),
         })
-    }
-
-    /// Resolves one activated plugin module retained by this `PluginMain`.
-    pub fn plugin(&self, name: &str) -> Result<PluginModuleRef, RuntimeError> {
-        self.modules_by_plugin
-            .get(name)
-            .copied()
-            .ok_or_else(|| PluginError::NotLoaded {
-                name: name.to_owned(),
-            })
-            .map_err(RuntimeError::from)
     }
 }
 

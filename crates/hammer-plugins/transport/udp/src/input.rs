@@ -9,14 +9,16 @@ use hammer_core::data_plane::{
 };
 use hammer_infra::bitmap::Bitmap;
 use hammer_infra::checksum::internet_checksum_parts;
+use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
     DataPlaneRuntime, Engine, Node, NodeProcessFn, NodeResult, NodeRuntimeData, TraceFormatter,
-    UdpIpVersion, add_packet_trace, format_packet_trace,
+    add_packet_trace, format_packet_trace,
 };
-use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use hammer_service::data_plane::set_index_node_error_code;
 use hammer_service::opaque::NetworkOpaque;
+
+use crate::UdpIpVersion;
 
 const UDP_HEADER_LEN: usize = 8;
 const UDP_PORT_COUNT: usize = u16::MAX as usize + 1;
@@ -58,10 +60,6 @@ impl UdpInputError {
 #[hammer_component_macros::runtime_error(subsystem = "udp")]
 #[derive(Debug, thiserror::Error)]
 pub enum UdpControlError {
-    #[error("IP output is unavailable")]
-    IpOutputUnavailable,
-    #[error("IP output is already initialized")]
-    IpOutputAlreadyInitialized,
     #[error("UDP input consumer is not attached")]
     ConsumerNotAttached,
     #[error("UDP input node runtime is unavailable")]
@@ -600,14 +598,7 @@ fn register_udp_input(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     let node = runtime
         .nodes()
         .try_register_internal_with_next_names(control.node(), &UdpInputNext::NEXT_NAMES)?;
-    let output = super::IP_OUTPUT
-        .get()
-        .ok_or(UdpControlError::IpOutputUnavailable)?;
-    output
-        .get()
-        .register_protocol(17, node)
-        .into_result()
-        .map_err(|error| RuntimeError::subsystem("udp", error))?;
+    hammer_plugin_ip::register_protocol(17, node)?;
     UDP_LOCAL_REGISTRATION
         .set(UdpLocalRegistration {
             inner: Arc::clone(&control.inner),
@@ -1063,7 +1054,7 @@ mod control_tests {
         let error = control
             .unregister_dst_port(UdpIpVersion::V4, 443, other)
             .expect_err("owner mismatch must fail");
-        let RuntimeError::Subsystem { source, .. } = error else {
+        let hammer_runtime::RuntimeError::Subsystem { source, .. } = error else {
             panic!("expected UDP subsystem error");
         };
         assert!(matches!(
@@ -1088,7 +1079,7 @@ mod control_tests {
         let error = control
             .unregister_dst_port(UdpIpVersion::V6, 443, owner)
             .expect_err("missing UDP port must fail");
-        let RuntimeError::Subsystem { source, .. } = error else {
+        let hammer_runtime::RuntimeError::Subsystem { source, .. } = error else {
             panic!("expected UDP subsystem error");
         };
         assert!(matches!(
@@ -1119,7 +1110,7 @@ mod control_tests {
         let error = control
             .register_dst_port(UdpIpVersion::V4, 443, owner)
             .expect_err("reference count overflow must fail");
-        let RuntimeError::Subsystem { source, .. } = error else {
+        let hammer_runtime::RuntimeError::Subsystem { source, .. } = error else {
             panic!("expected UDP subsystem error");
         };
         assert!(matches!(

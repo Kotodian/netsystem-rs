@@ -54,10 +54,10 @@ fn udp_graph_contribution_initializes_with_existing_drop_node() {
 }
 
 #[test]
-fn udp_plugin_exports_destination_port_capability() {
+fn udp_plugin_exports_generic_root_metadata() {
     let module = hammer_plugin_udp::plugin_module();
 
-    assert!(module.udp_local().into_option().is_some());
+    assert_eq!(module.metadata().name(), "udp");
 }
 
 #[derive(Default)]

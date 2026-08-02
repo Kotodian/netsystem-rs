@@ -35,9 +35,9 @@ use std::sync::{Arc, mpsc};
 use arc_swap::ArcSwapOption;
 use hammer_core::data_plane::{BufferPacketCursor, NodeId, NodeState, SecondaryOpaque};
 use hammer_runtime::{
-    DataPlaneRuntime, DataWorkerId, Engine, Node, NodeProcessFn, NodeRuntimeData, PluginError,
-    RuntimeError, RuntimeResult, SessionConnectEndpoint, SessionConnectionId,
-    SessionListenEndpoint, SessionListenerId, with_data_plane_runtime,
+    DataPlaneRuntime, DataWorkerId, Engine, Node, NodeProcessFn, NodeRuntimeData, RuntimeError,
+    RuntimeResult, SessionConnectEndpoint, SessionConnectionId, SessionListenEndpoint,
+    SessionListenerId, with_data_plane_runtime,
 };
 use thiserror::Error;
 
@@ -199,7 +199,6 @@ pub(crate) fn publish_tcp_connection(
 pub struct TcpMain {
     control: TcpInputControlPlane,
     listeners: listener_control::TcpListenerControlHandle,
-    ip_output: output::IpOutputFunctions,
     input_process: NodeProcessFn,
     listen_process: NodeProcessFn,
     established_process: NodeProcessFn,
@@ -210,11 +209,7 @@ pub struct TcpMain {
 }
 
 impl TcpMain {
-    fn new(
-        worker_count: usize,
-        sessions: Arc<SessionMain>,
-        ip_output: output::IpOutputFunctions,
-    ) -> Self {
+    fn new(worker_count: usize, sessions: Arc<SessionMain>) -> Self {
         let control = TcpInputControlPlane::new();
         let listeners = listener_control::TcpListenerControlHandle::new(control.clone());
         let workers = (0..worker_count)
@@ -224,7 +219,6 @@ impl TcpMain {
         Self {
             control,
             listeners,
-            ip_output,
             input_process: input::tcp_input_process,
             listen_process: listen::tcp_listen_process,
             established_process: established::tcp_established_process,
@@ -275,10 +269,6 @@ impl TcpMain {
 
     pub fn control(&self) -> &TcpInputControlPlane {
         &self.control
-    }
-
-    pub(crate) const fn ip_output(&self) -> output::IpOutputFunctions {
-        self.ip_output
     }
 
     fn bind_tcp_listener(
@@ -412,7 +402,6 @@ fn init_tcp(
         config.as_ref(),
         engine.configured_worker_count(),
         sessions,
-        output::plugin_functions(engine.plugin_main())?,
     )?);
     TCP_MAIN.store(Some(Arc::clone(&main)));
     Ok(())
@@ -422,10 +411,9 @@ fn configured_tcp_main(
     tcp: &crate::config::TcpPluginConfig,
     worker_count: usize,
     sessions: Arc<SessionMain>,
-    ip_output: output::IpOutputFunctions,
 ) -> RuntimeResult<TcpMain> {
     publish_tcp_policy(TcpPolicy::from_plugin_config(tcp));
-    let main = TcpMain::new(worker_count, sessions, ip_output);
+    let main = TcpMain::new(worker_count, sessions);
     // VPP `tcp_make_syn_options` always offers MSS, window scale, timestamps,
     // and SACK; `tcp_window_compute_scale` picks the smallest scale that fits
     // the configured receive window in the 16-bit window field.
@@ -465,17 +453,7 @@ pub fn register_tcp_input(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
             &TcpInputNext::NEXT_NAMES,
         )?
     };
-    main.ip_output()
-        .get()
-        .register_protocol(6, node)
-        .into_result()
-        .map_err(|source| {
-            RuntimeError::from(PluginError::CapabilityCall {
-                plugin: "ip",
-                capability: "register protocol",
-                source,
-            })
-        })?;
+    hammer_plugin_ip::register_protocol(6, node)?;
     Ok(node)
 }
 
@@ -729,12 +707,8 @@ pub enum TcpOutputError {
     MissingEgressEndpoints,
     #[error("unsupported TCP egress address family")]
     UnsupportedEgress,
-    #[error("IP output service is unavailable")]
-    IpOutputUnavailable,
     #[error("TCP segment is too long for its IP packet")]
     SegmentTooLong,
-    #[error("IP output rejected the prepended IP header")]
-    IpHeaderRejected,
 }
 
 impl TcpOutputError {
@@ -1068,50 +1042,10 @@ pub enum TcpInputNext {
 mod init_tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    use abi_stable::{
-        RRef,
-        sabi_trait::TD_Opaque,
-        std_types::{RBoxError, ROk, RResult, RSlice, RSliceMut},
-    };
-    use hammer_core::data_plane::NodeId;
-    use hammer_runtime::IpOutput;
     use hammer_runtime::RuntimeRegistry;
     use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, Engine};
 
     use super::*;
-
-    struct TestIpOutput;
-
-    impl IpOutput for TestIpOutput {
-        fn register_protocol(&self, _: u8, _: NodeId) -> RResult<(), RBoxError> {
-            ROk(())
-        }
-
-        fn write_ipv4_header(
-            &self,
-            _: RSliceMut<'_, u8>,
-            _: RSlice<'_, u8>,
-            _: RSlice<'_, u8>,
-            _: u8,
-            _: u16,
-        ) -> bool {
-            false
-        }
-
-        fn write_ipv6_header(
-            &self,
-            _: RSliceMut<'_, u8>,
-            _: RSlice<'_, u8>,
-            _: RSlice<'_, u8>,
-            _: u8,
-            _: u16,
-        ) -> bool {
-            false
-        }
-    }
-
-    static TEST_IP_OUTPUT: hammer_runtime::IpOutput_CTO<'static, 'static> =
-        hammer_runtime::IpOutput_CTO::from_const(&TestIpOutput, TD_Opaque);
 
     fn test_engine() -> Engine {
         let mut engine = Engine::new(
@@ -1151,7 +1085,6 @@ address = "10.0.0.1:7"
                 1,
                 hammer_service::session::ApplicationMain::new(1),
             )),
-            RRef::new(&TEST_IP_OUTPUT),
         )
         .expect("build configured TCP main");
         let entry = main

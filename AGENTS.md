@@ -93,6 +93,14 @@ Use Rust 2024 conventions and rustfmt defaults: 4-space indentation, `snake_case
   primitives: `&T`, `&mut T`, slices, iterators, and guards. Do not introduce a
   wrapper type merely to observe, borrow, or re-expose another value, or to
   cache pointers and offsets into storage owned elsewhere.
+- Plugin-specific types, traits, function tables, references, capabilities, and
+  state must be defined and stored only in the plugin that owns them. They must
+  not appear in `hammer-runtime`, `hammer-service`, `PluginMain`,
+  `PluginModule`, or any other non-owning crate or generic plugin structure.
+  A dependent plugin must use an explicit dependency on the owning plugin and
+  call its owner-defined API directly. Do not introduce a type alias, newtype,
+  wrapper, erased registry entry, or generic capability carrier merely to hold
+  or re-expose a plugin-owned reference.
 - Do not introduce `dyn` trait objects or dynamic dispatch in production code.
   Cross-plugin cryptographic exchanges must retain concrete, monomorphized
   protocol state and use registration functions with explicit ownership; they

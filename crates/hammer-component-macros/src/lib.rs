@@ -2871,8 +2871,6 @@ pub fn worker_init_function(args: TokenStream, input: TokenStream) -> TokenStrea
 struct PluginArgs {
     name: LitStr,
     load_after: Vec<LitStr>,
-    ip_output: Option<Expr>,
-    udp_local: Option<Expr>,
     init_functions: Vec<Path>,
     config_functions: Vec<Path>,
     early_config_functions: Vec<Path>,
@@ -2891,8 +2889,6 @@ impl Parse for PluginArgs {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let mut name = None;
         let mut load_after = Vec::new();
-        let mut ip_output = None;
-        let mut udp_local = None;
         let mut init_functions = Vec::new();
         let mut config_functions = Vec::new();
         let mut early_config_functions = Vec::new();
@@ -2932,24 +2928,10 @@ impl Parse for PluginArgs {
                 "session_transports" => session_transports = parse_path_array(input)?,
                 "app_session_protocols" => app_session_protocols = parse_path_array(input)?,
                 "binary_api_methods" => binary_api_methods = parse_path_array(input)?,
-                "ip_output" => {
-                    if ip_output.is_some() {
-                        return Err(Error::new(key.span(), "duplicate `ip_output` argument"));
-                    }
-                    ip_output = Some(input.parse()?);
-                }
-                "udp_local" => {
-                    if udp_local.is_some() {
-                        return Err(Error::new(key.span(), "duplicate `udp_local` argument"));
-                    }
-                    udp_local = Some(input.parse()?);
-                }
                 other => {
                     return Err(Error::new(
                         key.span(),
-                        format!(
-                            "unknown `plugin` argument `{other}`; expected `name`, `load_after`, `ip_output`, or `udp_local`"
-                        ),
+                        format!("unknown `plugin` argument `{other}`"),
                     ));
                 }
             }
@@ -2960,8 +2942,6 @@ impl Parse for PluginArgs {
         Ok(Self {
             name: name.ok_or_else(|| Error::new(Span::call_site(), "missing `name` argument"))?,
             load_after,
-            ip_output,
-            udp_local,
             init_functions,
             config_functions,
             early_config_functions,
@@ -3038,22 +3018,6 @@ fn plugin_registration_tokens(args: &PluginArgs) -> TokenStream2 {
         "__PLUGIN_LOAD_AFTER_{}",
         name.value().to_ascii_uppercase().replace('-', "_")
     );
-    let ip_output = match &args.ip_output {
-        Some(output) => quote! {
-            ::hammer_runtime::__private::ROption::RSome(
-                ::hammer_runtime::__private::RRef::new(#output)
-            )
-        },
-        None => quote!(::hammer_runtime::__private::ROption::RNone),
-    };
-    let udp_local = match &args.udp_local {
-        Some(local) => quote! {
-            ::hammer_runtime::__private::ROption::RSome(
-                ::hammer_runtime::__private::RRef::new(#local)
-            )
-        },
-        None => quote!(::hammer_runtime::__private::ROption::RNone),
-    };
     quote! {
         ::hammer_runtime::__declare_registration_image!(
             init_functions = [#(#init_functions),*];
@@ -3116,8 +3080,6 @@ fn plugin_registration_tokens(args: &PluginArgs) -> TokenStream2 {
                 ::hammer_runtime::PluginModule::new(
                     metadata,
                     ::hammer_runtime::__private::RRef::new(&__HAMMER_REGISTRATION_IMAGE),
-                    #ip_output,
-                    #udp_local,
                 )
             )
         }

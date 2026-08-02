@@ -12,6 +12,7 @@ crate-type = ["dylib", "rlib"]
 abi_stable = { workspace = true }
 hammer-core = { path = "../../../hammer-core" }
 hammer-infra = { path = "../../../hammer-infra" }
+hammer-plugin-ip = { path = "../../ip" }
 hammer-runtime = { path = "../../../hammer-runtime", default-features = false }
 hammer-service = { path = "../../../hammer-service", default-features = false }
 hammer-component-macros = { path = "../../../hammer-component-macros" }
