@@ -2431,6 +2431,12 @@ pub trait SessionTransport<Index>: Sized {
 
     const ID: SessionTransportId;
 
+    /// Returns the transport connection that owns the given Session transport
+    /// object. One transport connection may own many Session transport objects.
+    fn connection_index(&self, index: Index) -> RuntimeResult<Index> {
+        Ok(index)
+    }
+
     /// Handles an application dequeue from the session-owned RX FIFO.
     ///
     /// Returning `true` asks Session Runtime to arm the next RX dequeue
