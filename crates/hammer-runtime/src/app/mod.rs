@@ -15,7 +15,7 @@ pub use control::{
 pub use handle::SessionHandle;
 pub use layout::SessionOffsets;
 pub use policy::{ApplicationConnectionId, ApplicationId, ApplicationListenerId};
-pub use session::{AppSession, AppSessionConfig, AppSessionError};
+pub use session::{AppSession, AppSessionConfig, AppSessionError, SessionDgramHeader};
 pub use session_app::{
     SessionAppContext, SessionAppContexts, SessionAppDestroy, SessionAppId, SessionAppInstall,
     SessionAppRegistration,

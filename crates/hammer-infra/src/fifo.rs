@@ -93,6 +93,7 @@ pub struct FifoWriteReservation<'a> {
     first: Option<ReservedChunk>,
     second: Option<ReservedChunk>,
     reserved_len: usize,
+    initialized: usize,
     complete: bool,
 }
 
@@ -165,6 +166,51 @@ impl<'a> FifoWriteReservation<'a> {
             };
             (first, second)
         }
+    }
+
+    /// Copies source segments into this reservation without publishing them.
+    ///
+    /// The caller still has to commit the returned byte count. If a source
+    /// segment would exceed the reservation, the reservation remains
+    /// uncommitted and its `Drop` implementation restores the FIFO tail.
+    pub fn copy_from_segments<I, S>(&mut self, segments: I) -> Result<usize, FifoError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<[u8]>,
+    {
+        let reserved = self.reserved_len;
+        let mut copied = self.initialized;
+        let (first, second) = self.segments_mut();
+        for segment in segments {
+            let source = segment.as_ref();
+            let end =
+                copied
+                    .checked_add(source.len())
+                    .ok_or(FifoError::CommitExceedsReservation {
+                        initialized: usize::MAX,
+                        reserved,
+                    })?;
+            if end > reserved {
+                return Err(FifoError::CommitExceedsReservation {
+                    initialized: end,
+                    reserved,
+                });
+            }
+            let first_remaining = first.len().saturating_sub(copied);
+            let first_len = source.len().min(first_remaining);
+            if first_len != 0 {
+                first[copied..copied + first_len].copy_from_slice(&source[..first_len]);
+            }
+            let second_len = source.len() - first_len;
+            if second_len != 0 {
+                let second_offset = copied.saturating_sub(first.len());
+                second[second_offset..second_offset + second_len]
+                    .copy_from_slice(&source[first_len..]);
+            }
+            copied = end;
+        }
+        self.initialized = copied;
+        Ok(copied)
     }
 
     pub fn commit(&mut self, initialized: usize) -> Result<usize, FifoError> {
@@ -890,6 +936,7 @@ impl Fifo {
                     first: None,
                     second: None,
                     reserved_len: 0,
+                    initialized: 0,
                     complete: false,
                 });
             }
@@ -935,6 +982,7 @@ impl Fifo {
             first: Some(first),
             second,
             reserved_len: len,
+            initialized: 0,
             complete: false,
         })
     }

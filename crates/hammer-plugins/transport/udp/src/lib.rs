@@ -25,20 +25,31 @@ pub fn unregister_dst_port(version: UdpIpVersion, port: u16, node: NodeId) -> Ru
 hammer_component_macros::declare_plugin!(
     name = "udp",
     load_after = ["ip"],
-    init_functions = [],
+    init_functions = [worker::__INIT_FN_UDP_INIT],
     config_functions = [],
     early_config_functions = [],
     main_loop_enter_functions = [],
     main_loop_exit_functions = [],
-    worker_init_functions = [],
-    graph_nodes = [input::__UDP_GRAPH_NODE_UDP_INPUT_NODE],
+    worker_init_functions = [worker::__INIT_FN_UDP_WORKER_INIT],
+    graph_nodes = [
+        input::__UDP_GRAPH_NODE_UDP_INPUT_NODE,
+        output::__UDP_WORKER_GRAPH_NODE_UDP_OUTPUT_NODE,
+    ],
     node_functions = [],
     process_nodes = [],
+    session_transports = [worker::__SESSION_TRANSPORT_UDP_WORKER],
 );
 
 pub use input::{
     UdpControlError, UdpInputControlPlane, UdpInputError, UdpInputNext, UdpInputNode, UdpInputTrace,
 };
+pub use output::{UdpOutputNext, UdpOutputNode};
+pub use worker::UdpWorker;
+
+mod connection;
+pub(crate) mod lookup;
+pub mod output;
+pub(crate) mod worker;
 
 #[cfg(test)]
 mod tests {
@@ -70,22 +81,27 @@ mod tests {
 
         let mut engine = Engine::new(runtime, RuntimeRegistry::new());
         engine.install_current();
+        let barrier = engine.worker_barrier();
+        let mut control = ();
+        barrier.sync(&mut control, |_| {
+            register_dst_port(UdpIpVersion::V4, 443, owner)
+                .expect("register destination port through plugin API");
+            register_dst_port(UdpIpVersion::V4, 443, owner)
+                .expect("share destination port through plugin API");
+            let error = register_dst_port(UdpIpVersion::V4, 443, other)
+                .expect_err("different owner must conflict");
+            let RuntimeError::Subsystem { source, .. } = error else {
+                panic!("expected UDP subsystem error");
+            };
+            assert!(source.downcast_ref::<UdpControlError>().is_some());
 
-        register_dst_port(UdpIpVersion::V4, 443, owner)
-            .expect("register destination port through plugin API");
-        register_dst_port(UdpIpVersion::V4, 443, owner)
-            .expect("share destination port through plugin API");
-        let error = register_dst_port(UdpIpVersion::V4, 443, other)
-            .expect_err("different owner must conflict");
-        let RuntimeError::Subsystem { source, .. } = error else {
-            panic!("expected UDP subsystem error");
-        };
-        assert!(source.downcast_ref::<UdpControlError>().is_some());
-
-        unregister_dst_port(UdpIpVersion::V4, 443, owner).expect("release shared destination port");
-        unregister_dst_port(UdpIpVersion::V4, 443, owner).expect("release final destination port");
-        unregister_dst_port(UdpIpVersion::V4, 443, owner)
-            .expect_err("final release removes destination mapping");
+            unregister_dst_port(UdpIpVersion::V4, 443, owner)
+                .expect("release shared destination port");
+            unregister_dst_port(UdpIpVersion::V4, 443, owner)
+                .expect("release final destination port");
+            unregister_dst_port(UdpIpVersion::V4, 443, owner)
+                .expect_err("final release removes destination mapping");
+        });
 
         Engine::uninstall_current();
     }

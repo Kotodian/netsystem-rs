@@ -196,6 +196,18 @@ impl Engine {
         self.barrier.clone()
     }
 
+    /// Verifies that the current Engine is the main/control thread and that
+    /// the worker barrier is held whenever Data Workers are running.
+    pub fn ensure_main_thread_with_barrier(&self) -> RuntimeResult<()> {
+        if self.thread_index != 0 {
+            return Err(RuntimeError::ControlRequiresMainThread);
+        }
+        if self.barrier.worker_count() != 0 && !self.barrier.is_pending() {
+            return Err(RuntimeError::ControlRequiresWorkerBarrier);
+        }
+        Ok(())
+    }
+
     /// Add plugin roots and materialize their newly published runtime state.
     ///
     /// This is the sole plugin-loading interface. The main thread owns DSO
@@ -655,6 +667,15 @@ impl Engine {
     }
 }
 
+/// Verifies the current thread is the main/control engine and is inside the
+/// worker-barrier phase when Data Workers are running.
+pub fn ensure_main_thread_with_barrier() -> RuntimeResult<()> {
+    match Engine::with_current(|engine| engine.ensure_main_thread_with_barrier()) {
+        Some(result) => result,
+        None => Err(RuntimeError::ControlRequiresMainThread),
+    }
+}
+
 impl EngineWorkerSeed {
     #[inline]
     pub(crate) fn spawn_on_numa(
@@ -944,6 +965,26 @@ mod tests {
         assert_eq!(pool.worker_count(), 0);
         assert!(pool.engine(0).is_some());
         assert!(pool.engine(1).is_none());
+    }
+
+    #[test]
+    fn ensure_main_thread_with_barrier_requires_held_barrier_when_workers_exist() {
+        let mut engine = test_engine();
+        engine.barrier = crate::barrier::WorkerBarrier::new(1);
+        engine.install_current();
+
+        assert!(matches!(
+            super::ensure_main_thread_with_barrier(),
+            Err(RuntimeError::ControlRequiresWorkerBarrier)
+        ));
+
+        let barrier = engine.worker_barrier();
+        barrier.arm();
+        super::ensure_main_thread_with_barrier()
+            .expect("control operation is inside the worker barrier");
+        barrier.release();
+
+        Engine::uninstall_current();
     }
 
     #[test]

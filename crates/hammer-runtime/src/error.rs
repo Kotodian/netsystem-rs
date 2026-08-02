@@ -68,6 +68,10 @@ pub enum RuntimeError {
     DataWorkerIdUnavailable { thread_index: u32 },
     #[error("only the main Runtime Engine can schedule worker control work")]
     WorkerControlRequiresMainEngine,
+    #[error("control operation must run on the main Runtime Engine")]
+    ControlRequiresMainThread,
+    #[error("control operation requires the worker barrier while Data Workers are running")]
+    ControlRequiresWorkerBarrier,
     #[error("worker configuration cannot change after runtime initialization")]
     WorkerConfigurationAlreadyInitialized,
     #[error("data workers are already started")]

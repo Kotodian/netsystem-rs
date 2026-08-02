@@ -91,13 +91,20 @@ impl WorkerBarrier {
         result
     }
 
+    /// Number of Data Workers this barrier coordinates.
     #[inline]
-    pub(crate) const fn worker_count(&self) -> u32 {
+    pub const fn worker_count(&self) -> u32 {
         self.worker_count
     }
 
     #[inline]
-    pub(crate) fn is_pending(&self) -> bool {
+    /// Returns true while a barrier sync or startup arm is active.
+    ///
+    /// Control code uses this to prove that workers are being held before
+    /// mutating worker-visible state. The main-thread caller must also verify
+    /// that it is running on the main/control engine; `is_pending` alone does
+    /// not identify the calling thread.
+    pub fn is_pending(&self) -> bool {
         self.state.wait.load(Ordering::Acquire) != 0
     }
 
