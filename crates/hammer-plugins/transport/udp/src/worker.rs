@@ -443,6 +443,8 @@ impl UdpWorker {
 
 pub(crate) fn start_listen(
     listener: SessionListenerId,
+    _: hammer_runtime::app::ApplicationId,
+    _: Option<u64>,
     endpoint: SessionListenEndpoint,
 ) -> RuntimeResult<()> {
     hammer_runtime::ensure_main_thread_with_barrier()?;
@@ -766,7 +768,12 @@ mod tests {
 
     use super::*;
 
-    fn noop_start_listen(_: SessionListenerId, _: SessionListenEndpoint) -> RuntimeResult<()> {
+    fn noop_start_listen(
+        _: SessionListenerId,
+        _: hammer_runtime::app::ApplicationId,
+        _: Option<u64>,
+        _: SessionListenEndpoint,
+    ) -> RuntimeResult<()> {
         Ok(())
     }
 
@@ -828,7 +835,7 @@ mod tests {
         let applications = ApplicationMain::new(1);
         let application = applications.attach().expect("attach test Application");
         let application_listener = applications
-            .register_listener(application, None, None)
+            .register_listener(application, None, Some(0xfeed))
             .expect("register test listener");
         let session_main = Arc::new(SessionMain::new(1, Arc::clone(&applications)));
         let udp_main = Arc::new(UdpMain::new(1, Arc::clone(&session_main)));
@@ -982,8 +989,8 @@ mod tests {
     }
 
     #[test]
-    fn udp_disconnect_removes_connection_and_session_lookup() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn udp_disconnect_removes_connection_and_session_lookup()
+    -> Result<(), Box<dyn std::error::Error>> {
         let (mut sessions, mut udp, applications, _main) = worker_state();
         let application = applications.attach()?;
         sessions.install_application_mq_for_test(application)?;
