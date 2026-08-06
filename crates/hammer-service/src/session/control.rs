@@ -73,23 +73,26 @@ impl SessionMain {
         app: Option<hammer_runtime::app::SessionAppId>,
         config: Option<u64>,
     ) -> Result<u64, ApplicationSessionStatus> {
-        let transport = session_transport(transport_name)?;
-        if transport.start_listen().is_none() {
-            return Err(ApplicationSessionStatus::TransportListenUnsupported);
-        }
-        let application_listener = self
-            .applications()
-            .register_listener(application, app, config)
-            .map_err(application_status)?;
-        match self.listen(application_listener, transport, endpoint) {
-            Ok(listener) => Ok(listener.raw()),
-            Err(_) => {
-                self.applications()
-                    .remove_listener(application, application_listener)
-                    .expect("failed Session listen leaves its Application listener available for rollback");
-                Err(ApplicationSessionStatus::TransportListenFailed)
+        self.with_control_barrier(|| {
+            let transport = session_transport(transport_name)?;
+            if transport.start_listen().is_none() {
+                return Err(ApplicationSessionStatus::TransportListenUnsupported);
             }
-        }
+            let application_listener = self
+                .applications()
+                .register_listener(application, app, config)
+                .map_err(application_status)?;
+            match self.listen(application_listener, transport, endpoint) {
+                Ok(listener) => Ok(listener.raw()),
+                Err(_) => {
+                    self.applications()
+                        .remove_listener(application, application_listener)
+                        .expect("failed Session listen leaves its Application listener available for rollback");
+                    Err(ApplicationSessionStatus::TransportListenFailed)
+                }
+            }
+        })
+        .map_err(|_| ApplicationSessionStatus::ApplicationControlWrongThread)?
     }
 
     fn application_connect(
@@ -130,28 +133,31 @@ impl SessionMain {
         application: ApplicationId,
         listener: hammer_runtime::SessionListenerId,
     ) -> Result<(), ApplicationSessionStatus> {
-        match self.applications().contains(application) {
-            Ok(true) => {}
-            Ok(false) => return Err(ApplicationSessionStatus::ApplicationMissing),
-            Err(error) => return Err(application_status(error)),
-        }
-        let (owner, application_listener) = self
-            .with_listener(listener, |listener| {
-                (listener.application(), listener.application_listener())
-            })
-            .map_err(|_| ApplicationSessionStatus::ListenerMissing)?;
-        if owner != application {
-            return Err(ApplicationSessionStatus::ListenerNotOwned);
-        }
-        self.applications()
-            .with_listener(application_listener, |listener| listener.application())
-            .map_err(application_status)?;
-        self.unlisten(listener)
-            .map_err(|_| ApplicationSessionStatus::TransportUnlistenFailed)?;
-        self.applications()
-            .remove_listener(application, application_listener)
-            .expect("validated Application listener remains present after transport unlisten");
-        Ok(())
+        self.with_control_barrier(|| {
+            match self.applications().contains(application) {
+                Ok(true) => {}
+                Ok(false) => return Err(ApplicationSessionStatus::ApplicationMissing),
+                Err(error) => return Err(application_status(error)),
+            }
+            let (owner, application_listener) = self
+                .with_listener(listener, |listener| {
+                    (listener.application(), listener.application_listener())
+                })
+                .map_err(|_| ApplicationSessionStatus::ListenerMissing)?;
+            if owner != application {
+                return Err(ApplicationSessionStatus::ListenerNotOwned);
+            }
+            self.applications()
+                .with_listener(application_listener, |listener| listener.application())
+                .map_err(application_status)?;
+            self.unlisten(listener)
+                .map_err(|_| ApplicationSessionStatus::TransportUnlistenFailed)?;
+            self.applications()
+                .remove_listener(application, application_listener)
+                .expect("validated Application listener remains present after transport unlisten");
+            Ok(())
+        })
+        .map_err(|_| ApplicationSessionStatus::ApplicationControlWrongThread)?
     }
 }
 

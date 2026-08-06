@@ -624,6 +624,33 @@ impl ApplicationMain {
         })?
     }
 
+    /// Publishes the opaque configuration fact carried by one Application
+    /// listener while the owning Main Thread holds the worker barrier.
+    pub fn update_listener_config(
+        &self,
+        application: ApplicationId,
+        listener_id: ApplicationListenerId,
+        config: Option<u64>,
+    ) -> Result<(), ApplicationError> {
+        self.ensure_active(application)?;
+        self.with_state_mut(|state| {
+            let listener = state
+                .listeners
+                .get_mut(application_listener_index(listener_id))
+                .ok_or(ApplicationError::ListenerMissing {
+                    listener: listener_id,
+                })?;
+            if listener.application != application {
+                return Err(ApplicationError::ListenerNotOwned {
+                    application,
+                    listener: listener_id,
+                });
+            }
+            listener.config = config;
+            Ok(())
+        })?
+    }
+
     pub(crate) fn with_listener<R>(
         &self,
         listener: ApplicationListenerId,
@@ -660,7 +687,7 @@ impl ApplicationMain {
         })
     }
 
-    pub(crate) fn session_app_id(&self, name: &str) -> Result<SessionAppId, ApplicationError> {
+    pub fn session_app_id(&self, name: &str) -> Result<SessionAppId, ApplicationError> {
         self.session_app(name).map(|_| {
             self.session_apps
                 .iter()
@@ -718,6 +745,7 @@ impl ApplicationMain {
         let state = unsafe { &mut *self.state.get() };
         let barrier = Engine::with_current(|engine| engine.worker_barrier());
         Ok(match barrier {
+            Some(barrier) if barrier.is_pending() => operation(state),
             Some(barrier) => barrier.sync(state, operation),
             None => operation(state),
         })

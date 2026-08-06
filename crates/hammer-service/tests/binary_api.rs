@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use hammer_runtime::{
     DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, Engine, PluginError,
@@ -14,6 +14,7 @@ use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 static SOCKET_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static ECHO_BARRIER_SEEN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, PartialEq, Message)]
 struct EchoRequest {
@@ -31,6 +32,10 @@ struct EchoReply {
 
 #[hammer_component_macros::binary_api(name = "test.echo")]
 fn echo(request: EchoRequest) -> EchoReply {
+    ECHO_BARRIER_SEEN.store(
+        Engine::with_current(|engine| engine.worker_barrier().is_pending()).unwrap_or(false),
+        Ordering::SeqCst,
+    );
     EchoReply {
         text: request.text,
         thread: format!("{:?}", std::thread::current().id()),
@@ -133,6 +138,7 @@ async fn protobuf_methods_dispatch_on_the_main_thread_over_unix_socket() {
         .await
         .expect("connect Binary API");
     let expected_thread = format!("{:?}", std::thread::current().id());
+    ECHO_BARRIER_SEEN.store(false, Ordering::SeqCst);
 
     let reply = call(
         &mut stream,
@@ -151,6 +157,7 @@ async fn protobuf_methods_dispatch_on_the_main_thread_over_unix_socket() {
     let echo = EchoReply::decode(reply.payload.as_slice()).expect("decode echo reply");
     assert_eq!(echo.text, "hammer");
     assert_eq!(echo.thread, expected_thread);
+    assert!(ECHO_BARRIER_SEEN.load(Ordering::SeqCst));
 
     let missing = call(
         &mut stream,

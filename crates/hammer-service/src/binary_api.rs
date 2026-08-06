@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::thread::{self, ThreadId};
 
 use hammer_runtime::binary_api::BinaryApiMethodStatus;
-use hammer_runtime::{Engine, PluginError, RuntimeError, RuntimeResult};
+use hammer_runtime::{Engine, PluginError, RuntimeError, RuntimeResult, WorkerBarrier};
 use prost::Message;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -274,6 +274,7 @@ impl BinaryApiClient {
 struct BinaryApiConnection {
     max_frame_bytes: usize,
     owner: ThreadId,
+    barrier: Option<WorkerBarrier>,
 }
 
 impl BinaryApiMain {
@@ -306,6 +307,7 @@ impl BinaryApiMain {
             connection: Arc::new(BinaryApiConnection {
                 max_frame_bytes,
                 owner: thread::current().id(),
+                barrier: Engine::with_current(|engine| engine.worker_barrier()),
             }),
         })
     }
@@ -342,7 +344,7 @@ impl BinaryApiConnection {
                 return Ok(());
             };
             let reply = match BinaryApiRequest::decode(frame.as_slice()) {
-                Ok(request) => dispatch(request),
+                Ok(request) => self.dispatch(request),
                 Err(_) => reply(0, BinaryApiStatus::InvalidRequest, Vec::new()),
             };
             write_frame(&mut writer, &reply.encode_to_vec(), self.max_frame_bytes).await?;
@@ -355,6 +357,17 @@ impl BinaryApiConnection {
         } else {
             Err(BinaryApiError::WrongThread)
         }
+    }
+
+    fn dispatch(&self, request: BinaryApiRequest) -> BinaryApiReply {
+        let Some(barrier) = &self.barrier else {
+            return dispatch_method(request);
+        };
+        if barrier.is_pending() {
+            return dispatch_method(request);
+        }
+        let mut control = ();
+        barrier.sync(&mut control, |_| dispatch_method(request))
     }
 }
 
@@ -405,7 +418,7 @@ fn bind_listener(path: &Path) -> io::Result<StdUnixListener> {
     }
 }
 
-fn dispatch(request: BinaryApiRequest) -> BinaryApiReply {
+fn dispatch_method(request: BinaryApiRequest) -> BinaryApiReply {
     let context = request.context;
     let resolved =
         Engine::with_current(|engine| engine.plugin_main().binary_api_method(&request.method));
