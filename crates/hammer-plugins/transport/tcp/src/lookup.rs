@@ -151,7 +151,7 @@ impl TcpPendingRouteEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpLookupValue {
     pub id: TcpLookupId,
-    pub session_listener: Option<SessionListenerId>,
+    pub session_listener: SessionListenerId,
     pub owner_worker: DataWorkerId,
     pub capabilities: TcpCapabilities,
 }
@@ -1287,10 +1287,11 @@ impl TcpLookupState {
         key: A::Key,
         id: TcpLookupId,
         capabilities: TcpCapabilities,
+        session_listener: SessionListenerId,
     ) where
         TcpLookupSnapshot: TcpListenerLookupAccess<A>,
     {
-        let value = self.value(id, capabilities);
+        let value = self.value(id, capabilities, session_listener);
         self.listeners.insert_listener::<A>(key, value);
     }
 
@@ -1834,10 +1835,15 @@ impl TcpLookupState {
 
     #[cfg(test)]
     #[inline]
-    fn value(&self, id: TcpLookupId, capabilities: TcpCapabilities) -> TcpLookupValue {
+    fn value(
+        &self,
+        id: TcpLookupId,
+        capabilities: TcpCapabilities,
+        session_listener: SessionListenerId,
+    ) -> TcpLookupValue {
         TcpLookupValue {
             id,
-            session_listener: None,
+            session_listener,
             owner_worker: self.owner_worker,
             capabilities,
         }
@@ -2042,7 +2048,7 @@ mod tests {
     use crate::{TcpCapabilities, TcpFastOpenCookie};
     use hammer_infra::bihash::Bihash;
     use hammer_infra::pool::Index as PoolIndex;
-    use hammer_runtime::DataWorkerId;
+    use hammer_runtime::{DataWorkerId, SessionListenerId};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     use hammer_service::session::SessionId;
@@ -2129,7 +2135,7 @@ mod tests {
         let key = TcpV4ListenerKey::new(0, Ipv4Addr::new(127, 0, 0, 1), 7300);
         let value = TcpLookupValue {
             id: 7,
-            session_listener: None,
+            session_listener: SessionListenerId::new(7, 3),
             owner_worker: DataWorkerId::new(2),
             capabilities: TcpCapabilities {
                 max_segment_size: Some(1200),

@@ -276,7 +276,7 @@ impl TcpMain {
         bind: SocketAddr,
         owner_worker: DataWorkerId,
         capabilities: TcpCapabilities,
-        session_listener: Option<SessionListenerId>,
+        session_listener: SessionListenerId,
     ) -> RuntimeResult<lookup::TcpLookupId> {
         self.listeners
             .bind(bind, owner_worker, capabilities, session_listener)
@@ -290,8 +290,11 @@ pub static TCP_MAIN: ArcSwapOption<TcpMain> = ArcSwapOption::const_empty();
 
 pub(crate) fn start_listen(
     listener: SessionListenerId,
+    _: hammer_runtime::app::ApplicationId,
+    _: Option<u64>,
     endpoint: SessionListenEndpoint,
 ) -> RuntimeResult<()> {
+    hammer_runtime::ensure_main_thread_with_barrier()?;
     let main = TCP_MAIN
         .load_full()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
@@ -299,12 +302,13 @@ pub(crate) fn start_listen(
         endpoint.local(),
         endpoint.worker(),
         listener_capabilities(),
-        Some(listener),
+        listener,
     )
     .map(drop)
 }
 
 pub(crate) fn stop_listen(listener: SessionListenerId) -> RuntimeResult<()> {
+    hammer_runtime::ensure_main_thread_with_barrier()?;
     let main = TCP_MAIN
         .load_full()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
@@ -413,15 +417,7 @@ fn configured_tcp_main(
     sessions: Arc<SessionMain>,
 ) -> RuntimeResult<TcpMain> {
     publish_tcp_policy(TcpPolicy::from_plugin_config(tcp));
-    let main = TcpMain::new(worker_count, sessions);
-    // VPP `tcp_make_syn_options` always offers MSS, window scale, timestamps,
-    // and SACK; `tcp_window_compute_scale` picks the smallest scale that fits
-    // the configured receive window in the 16-bit window field.
-    let capabilities = listener_capabilities();
-    for entry in &tcp.listen {
-        main.bind_tcp_listener(entry.address, DataWorkerId::new(0), capabilities, None)?;
-    }
-    Ok(main)
+    Ok(TcpMain::new(worker_count, sessions))
 }
 
 fn listener_capabilities() -> TcpCapabilities {
@@ -607,8 +603,6 @@ fn tcp_session_queue_dispatch(
 pub enum TcpNodeError {
     #[error("invalid connection")]
     SessionMissing,
-    #[error("TCP listener is not attached to a Session listener")]
-    SessionListenerMissing,
     #[error("invalid connection")]
     EstablishedSessionMissing,
     #[error("invalid connection")]
@@ -665,7 +659,6 @@ impl From<TcpNodeError> for TcpError {
     fn from(error: TcpNodeError) -> Self {
         match error {
             TcpNodeError::SessionMissing
-            | TcpNodeError::SessionListenerMissing
             | TcpNodeError::EstablishedSessionMissing
             | TcpNodeError::EstablishedSessionRouteMissing
             | TcpNodeError::RcvProcessSessionMissing
@@ -998,7 +991,7 @@ pub(crate) fn closing_session_for_test() -> (
             application_listener,
             hammer_runtime::SessionTransportRegistration::new(
                 "test-session",
-                Some(|_, _| Ok(())),
+                Some(|_, _, _, _| Ok(())),
                 Some(|_| Ok(())),
                 None,
             ),
@@ -1031,61 +1024,4 @@ pub enum TcpInputNext {
     Established,
     #[next("tcp-reset")]
     Reset,
-}
-
-#[cfg(test)]
-mod init_tests {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-    use hammer_runtime::RuntimeRegistry;
-    use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, Engine};
-
-    use super::*;
-
-    fn test_engine() -> Engine {
-        let mut engine = Engine::new(
-            DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()),
-            RuntimeRegistry::new(),
-        );
-        engine
-            .plugin_main_mut()
-            .register_builtin_image(hammer_service::registration_image());
-        let plugin = crate::plugin_module();
-        engine
-            .plugin_main_mut()
-            .register_builtin_image(plugin.registration_image().get());
-        engine
-    }
-
-    #[test]
-    fn tcp_config_binds_configured_listens() {
-        let mut engine = test_engine();
-        engine
-            .configure_early(
-                r#"
-[[plugin.tcp.listen]]
-address = "10.0.0.1:7"
-"#,
-            )
-            .expect("dispatch tcp config");
-
-        let config = engine
-            .registry
-            .require::<crate::config::TcpPluginConfig>()
-            .expect("published TCP config");
-        let main = configured_tcp_main(
-            config.as_ref(),
-            1,
-            Arc::new(SessionMain::new(
-                1,
-                hammer_service::session::ApplicationMain::new(1),
-            )),
-        )
-        .expect("build configured TCP main");
-        let entry = main
-            .control()
-            .lookup_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 7));
-        assert!(entry.is_some(), "configured listen must be in lookup");
-        assert_eq!(entry.unwrap().id, 1);
-    }
 }

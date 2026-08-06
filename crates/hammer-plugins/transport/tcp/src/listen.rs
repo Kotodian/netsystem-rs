@@ -11,8 +11,6 @@ use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRunt
 use super::connection::TcpConnection;
 use super::segment::{TcpSegment, tcp_packet};
 use super::{TcpInputNext, TcpNodeError, write_session_route_opaque};
-#[cfg(test)]
-use hammer_service::opaque::NetworkOpaque;
 use hammer_service::session::SessionId;
 use hammer_service::session::runtime::{RxDelivery, SessionTransport, SessionWorker};
 
@@ -194,7 +192,7 @@ struct TcpListener<'a> {
     sessions: &'a mut SessionWorker<PoolIndex>,
     tcp: &'a mut crate::TcpWorker,
     id: u32,
-    session_listener: Option<hammer_runtime::SessionListenerId>,
+    session_listener: hammer_runtime::SessionListenerId,
     capabilities: TcpCapabilities,
 }
 
@@ -203,7 +201,7 @@ impl<'a> TcpListener<'a> {
         sessions: &'a mut SessionWorker<PoolIndex>,
         tcp: &'a mut crate::TcpWorker,
         id: u32,
-        session_listener: Option<hammer_runtime::SessionListenerId>,
+        session_listener: hammer_runtime::SessionListenerId,
         capabilities: TcpCapabilities,
     ) -> Self {
         Self {
@@ -476,14 +474,7 @@ impl<'a> TcpListener<'a> {
                 return Err(error);
             }
         };
-        let listener = match self.session_listener {
-            Some(listener) => listener,
-            None => {
-                let _ = self.tcp.remove_connection(connection_index);
-                self.finish_pending(packet);
-                return Err(TcpNodeError::SessionListenerMissing.into());
-            }
-        };
+        let listener = self.session_listener;
         let session_id = match self.sessions.stream_accept(
             <crate::TcpWorker as SessionTransport<PoolIndex>>::ID,
             connection_index,
