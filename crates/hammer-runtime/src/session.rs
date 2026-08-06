@@ -114,8 +114,12 @@ impl SessionListenEndpoint {
     }
 }
 
-pub type SessionTransportStartListen =
-    fn(SessionListenerId, SessionListenEndpoint) -> RuntimeResult<()>;
+pub type SessionTransportStartListen = fn(
+    SessionListenerId,
+    crate::app::ApplicationId,
+    Option<u64>,
+    SessionListenEndpoint,
+) -> RuntimeResult<()>;
 pub type SessionTransportStopListen = fn(SessionListenerId) -> RuntimeResult<()>;
 pub type SessionTransportConnect =
     fn(SessionConnectionId, SessionConnectEndpoint) -> RuntimeResult<()>;
