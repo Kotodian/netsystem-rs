@@ -1530,4 +1530,22 @@ mod tests {
         worker.remove_context(context).expect("remove context");
         assert_eq!(worker.listener_context_id(context), None);
     }
+
+    #[test]
+    fn timers_dispatch_exact_context_and_kind() {
+        let mut timers = QuicTimers::new(Instant::now());
+        let context = ContextId::from(0xabcd_1234u64);
+        timers
+            .set(
+                context,
+                QuicTimerKind::Transmit,
+                Duration::from_millis(1),
+            )
+            .expect("arm timer");
+        timers.advance(Instant::now() + Duration::from_millis(1));
+        let token = timers.take_pending().expect("expired timer");
+        assert_eq!(token.context, context);
+        assert_eq!(token.kind, QuicTimerKind::Transmit);
+        assert!(timers.take_pending().is_none());
+    }
 }
