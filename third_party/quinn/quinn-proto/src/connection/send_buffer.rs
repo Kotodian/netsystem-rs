@@ -8,7 +8,7 @@ use crate::{range_set::RangeSet, VarInt};
 #[derive(Default, Debug)]
 pub(super) struct SendBuffer {
     /// Data queued by the application but not yet acknowledged. May or may not have been sent.
-    unacked_segments: VecDeque<Bytes>,
+    unacked_segments: Option<VecDeque<Bytes>>,
     /// Total size of `unacked_segments`
     unacked_len: usize,
     /// The first offset that hasn't been written by the application, i.e. the offset past the end of `unacked`
@@ -27,19 +27,32 @@ pub(super) struct SendBuffer {
 
 impl SendBuffer {
     /// Construct an empty buffer at the initial offset
-    pub(super) fn new() -> Self {
-        Self::default()
+    pub(super) fn new(session_fifo: bool) -> Self {
+        Self {
+            unacked_segments: if session_fifo {
+                None
+            } else {
+                Some(VecDeque::new())
+            },
+            ..Self::default()
+        }
     }
 
     /// Append application data to the end of the stream
     pub(super) fn write(&mut self, data: Bytes) {
         self.unacked_len += data.len();
         self.offset += data.len() as u64;
-        self.unacked_segments.push_back(data);
+        self.unacked_segments
+            .as_mut()
+            .expect("payload write requires in-memory send buffer")
+            .push_back(data);
     }
 
-    /// Discard a range of acknowledged stream data
-    pub(super) fn ack(&mut self, mut range: Range<u64>) {
+    /// Discard a range of acknowledged stream data.
+    ///
+    /// Returns the first offset retained after any newly contiguous prefix
+    /// was released, or `None` when no prefix advanced.
+    pub(super) fn ack(&mut self, mut range: Range<u64>) -> Option<u64> {
         // Clamp the range to data which is still tracked
         let base_offset = self.offset - self.unacked_len as u64;
         range.start = base_offset.max(range.start);
@@ -47,30 +60,40 @@ impl SendBuffer {
 
         self.acks.insert(range);
 
+        let mut released_prefix = None;
         while self.acks.min() == Some(self.offset - self.unacked_len as u64) {
             let prefix = self.acks.pop_min().unwrap();
             let mut to_advance = (prefix.end - prefix.start) as usize;
 
             self.unacked_len -= to_advance;
-            while to_advance > 0 {
-                let front = self
-                    .unacked_segments
-                    .front_mut()
-                    .expect("Expected buffered data");
+            if let Some(segments) = self.unacked_segments.as_mut() {
+                while to_advance > 0 {
+                    if let Some(front) = segments.front_mut() {
+                        if front.len() <= to_advance {
+                            to_advance -= front.len();
+                            segments.pop_front();
 
-                if front.len() <= to_advance {
-                    to_advance -= front.len();
-                    self.unacked_segments.pop_front();
-
-                    if self.unacked_segments.len() * 4 < self.unacked_segments.capacity() {
-                        self.unacked_segments.shrink_to_fit();
+                            if segments.len() * 4 < segments.capacity() {
+                                segments.shrink_to_fit();
+                            }
+                        } else {
+                            front.advance(to_advance);
+                            to_advance = 0;
+                        }
+                    } else {
+                        to_advance = 0;
                     }
-                } else {
-                    front.advance(to_advance);
-                    to_advance = 0;
                 }
             }
+            released_prefix = Some(self.offset - self.unacked_len as u64);
         }
+        released_prefix
+    }
+
+    /// Advance the stream offset without copying payload into Quinn.
+    pub(super) fn sync(&mut self, len: usize) {
+        self.unacked_len += len;
+        self.offset += len as u64;
     }
 
     /// Compute the next range to transmit on this stream and update state to account for that
@@ -137,10 +160,13 @@ impl SendBuffer {
     /// should call the function again with an incremented start offset to
     /// retrieve more data.
     pub(super) fn get(&self, offsets: Range<u64>) -> &[u8] {
+        let Some(segments) = self.unacked_segments.as_ref() else {
+            return &[];
+        };
         let base_offset = self.offset - self.unacked_len as u64;
 
         let mut segment_offset = base_offset;
-        for segment in self.unacked_segments.iter() {
+        for segment in segments {
             if offsets.start >= segment_offset
                 && offsets.start < segment_offset + segment.len() as u64
             {
@@ -196,7 +222,7 @@ mod tests {
 
     #[test]
     fn fragment_with_length() {
-        let mut buf = SendBuffer::new();
+        let mut buf = SendBuffer::new(false);
         const MSG: &[u8] = b"Hello, world!";
         buf.write(MSG.into());
         // 0 byte offset => 19 bytes left => 13 byte data isn't enough
@@ -214,7 +240,7 @@ mod tests {
 
     #[test]
     fn fragment_without_length() {
-        let mut buf = SendBuffer::new();
+        let mut buf = SendBuffer::new(false);
         const MSG: &[u8] = b"Hello, world with some extra data!";
         buf.write(MSG.into());
         // 0 byte offset => 19 bytes left => can be filled by 34 bytes payload
@@ -231,7 +257,7 @@ mod tests {
 
     #[test]
     fn reserves_encoded_offset() {
-        let mut buf = SendBuffer::new();
+        let mut buf = SendBuffer::new(false);
 
         // Pretend we have more than 1 GB of data in the buffer
         let chunk: Bytes = Bytes::from_static(&[0; 1024 * 1024]);
@@ -299,7 +325,7 @@ mod tests {
 
     #[test]
     fn multiple_segments() {
-        let mut buf = SendBuffer::new();
+        let mut buf = SendBuffer::new(false);
         const MSG: &[u8] = b"Hello, world!";
         const MSG_LEN: u64 = MSG.len() as u64;
 
@@ -344,7 +370,7 @@ mod tests {
 
     #[test]
     fn retransmit() {
-        let mut buf = SendBuffer::new();
+        let mut buf = SendBuffer::new(false);
         const MSG: &[u8] = b"Hello, world with extra data!";
         buf.write(MSG.into());
         // Transmit two frames
@@ -362,7 +388,7 @@ mod tests {
 
     #[test]
     fn ack() {
-        let mut buf = SendBuffer::new();
+        let mut buf = SendBuffer::new(false);
         const MSG: &[u8] = b"Hello, world!";
         buf.write(MSG.into());
         assert_eq!(buf.poll_transmit(16), (0..8, true));
@@ -372,7 +398,7 @@ mod tests {
 
     #[test]
     fn reordered_ack() {
-        let mut buf = SendBuffer::new();
+        let mut buf = SendBuffer::new(false);
         const MSG: &[u8] = b"Hello, world with extra data!";
         buf.write(MSG.into());
         assert_eq!(buf.poll_transmit(16), (0..16, false));
@@ -384,10 +410,22 @@ mod tests {
         assert!(buf.acks.is_empty());
     }
 
+    #[test]
+    fn session_fifo_mode_has_no_payload_queue() {
+        let mut buf = SendBuffer::new(true);
+        buf.sync(5);
+        assert!(buf.unacked_segments.is_none());
+        assert_eq!(buf.offset(), 5);
+        buf.ack(0..5);
+        assert!(buf.is_fully_acked());
+    }
+
     fn aggregate_unacked(buf: &SendBuffer) -> Vec<u8> {
         let mut result = Vec::new();
-        for segment in buf.unacked_segments.iter() {
-            result.extend_from_slice(&segment[..]);
+        if let Some(segments) = buf.unacked_segments.as_ref() {
+            for segment in segments {
+                result.extend_from_slice(&segment[..]);
+            }
         }
         result
     }

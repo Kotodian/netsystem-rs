@@ -250,10 +250,8 @@ fn copy_sack_blocks(sack_blocks: Option<&[TcpSackBlock]>) -> (Option<[TcpSackBlo
 
 #[cfg(test)]
 mod tests {
-    use crate::tcp_options_from_bytes;
-    use hammer_runtime::DataPlaneRuntime;
-
     use super::*;
+    use crate::tcp_options_from_bytes;
 
     #[test]
     fn transport_tcp_segment_write_to_buffer_prepends_sack_blocks() {

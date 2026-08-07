@@ -33,7 +33,7 @@ pub enum TcpListenerControlError {
 #[derive(Clone)]
 struct TcpListenerRegistration {
     lookup_id: TcpLookupId,
-    session_listener: Option<SessionListenerId>,
+    session_listener: SessionListenerId,
     owner_worker: DataWorkerId,
     bind: SocketAddr,
     capabilities: TcpCapabilities,
@@ -99,7 +99,7 @@ impl TcpListenerControlState {
         bind: SocketAddr,
         owner_worker: DataWorkerId,
         capabilities: TcpCapabilities,
-        session_listener: Option<SessionListenerId>,
+        session_listener: SessionListenerId,
     ) -> RuntimeResult<TcpLookupId> {
         if self
             .tcp_listeners
@@ -142,7 +142,7 @@ impl TcpListenerControlState {
             .tcp_listeners
             .iter()
             .find_map(|registration| {
-                (registration.session_listener == Some(listener)).then_some(registration.lookup_id)
+                (registration.session_listener == listener).then_some(registration.lookup_id)
             })
             .ok_or(TcpListenerControlError::SessionListenerNotRegistered { listener })?;
         self.close_tcp_listener(lookup_id)
@@ -226,15 +226,10 @@ impl TcpListenerControlHandle {
         bind: SocketAddr,
         owner_worker: DataWorkerId,
         capabilities: TcpCapabilities,
-        session_listener: Option<SessionListenerId>,
+        session_listener: SessionListenerId,
     ) -> RuntimeResult<TcpLookupId> {
         let state = unsafe { self.state.get_mut() };
         state.bind_tcp_listener(bind, owner_worker, capabilities, session_listener)
-    }
-
-    pub(super) fn close(&self, lookup_id: TcpLookupId) -> RuntimeResult<()> {
-        let state = unsafe { self.state.get_mut() };
-        state.close_tcp_listener(lookup_id)
     }
 
     pub(super) fn close_session_listener(&self, listener: SessionListenerId) -> RuntimeResult<()> {
@@ -273,7 +268,7 @@ mod tests {
                 bind,
                 DataWorkerId::new(0),
                 TcpCapabilities::default(),
-                Some(SessionListenerId::new(7, 3)),
+                SessionListenerId::new(7, 3),
             )
             .expect("bind tcp listener");
 
@@ -292,10 +287,12 @@ mod tests {
         assert_eq!(lookup_entry.unwrap().id, lookup_id);
         assert_eq!(
             lookup_entry.unwrap().session_listener,
-            Some(SessionListenerId::new(7, 3))
+            SessionListenerId::new(7, 3)
         );
 
-        handle.close(lookup_id).expect("close tcp listener");
+        handle
+            .close_session_listener(SessionListenerId::new(7, 3))
+            .expect("close tcp listener");
         let snapshot = handle.snapshot_for_test();
         assert!(
             snapshot
@@ -325,7 +322,7 @@ mod tests {
                 bind,
                 DataWorkerId::new(0),
                 TcpCapabilities::default(),
-                Some(listener),
+                listener,
             )
             .expect("bind first tcp listener");
 
@@ -335,7 +332,7 @@ mod tests {
                     bind,
                     DataWorkerId::new(1),
                     TcpCapabilities::default(),
-                    Some(SessionListenerId::new(8, 4)),
+                    SessionListenerId::new(8, 4),
                 )
                 .is_err(),
             "duplicate endpoint must be rejected"
@@ -352,16 +349,15 @@ mod tests {
             ))
             .expect("original listener remains published");
         assert_eq!(entry.id, lookup_id);
-        assert_eq!(entry.session_listener, Some(listener));
+        assert_eq!(entry.session_listener, listener);
         assert_eq!(entry.owner_worker, DataWorkerId::new(0));
     }
 
     #[test]
-    fn close_missing_lookup_or_session_listener_is_rejected() {
+    fn close_missing_session_listener_is_rejected() {
         let control = TcpInputControlPlane::new();
         let handle = TcpListenerControlHandle::new(control);
 
-        assert!(handle.close(999).is_err(), "missing lookup id is rejected");
         assert!(
             handle
                 .close_session_listener(SessionListenerId::new(999, 1))
@@ -381,7 +377,7 @@ mod tests {
                 bind,
                 DataWorkerId::new(3),
                 TcpCapabilities::default(),
-                Some(listener),
+                listener,
             )
             .expect("bind Session-owned tcp listener");
 
@@ -395,7 +391,7 @@ mod tests {
             ))
             .expect("Session-owned listener is published");
         assert_eq!(entry.owner_worker, DataWorkerId::new(3));
-        assert_eq!(entry.session_listener, Some(listener));
+        assert_eq!(entry.session_listener, listener);
 
         handle
             .close_session_listener(listener)

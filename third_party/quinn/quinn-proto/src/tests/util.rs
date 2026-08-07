@@ -361,7 +361,7 @@ impl TestEndpoint {
             }
         }
         let buffer_size = self.endpoint.config().get_max_udp_payload_size() as usize;
-        let mut buf = Vec::with_capacity(buffer_size);
+        let mut buf = BytesMut::with_capacity(buffer_size);
 
         while self.inbound.front().is_some_and(|x| x.0 <= now) {
             let (recv_time, ecn, packet) = self.inbound.pop_front().unwrap();
@@ -406,7 +406,7 @@ impl TestEndpoint {
 
     pub(super) fn drive_outgoing(&mut self, now: Instant) {
         let buffer_size = self.endpoint.config().get_max_udp_payload_size() as usize;
-        let mut buf = Vec::with_capacity(buffer_size);
+        let mut buf = BytesMut::with_capacity(buffer_size);
 
         loop {
             let mut endpoint_events: Vec<(ConnectionHandle, EndpointEvent)> = vec![];
@@ -470,7 +470,7 @@ impl TestEndpoint {
         incoming: Incoming,
         now: Instant,
     ) -> Result<ConnectionHandle, ConnectionError> {
-        let mut buf = Vec::new();
+        let mut buf = BytesMut::new();
         match self.endpoint.accept(incoming, now, &mut buf, None) {
             Ok((ch, conn)) => {
                 self.connections.insert(ch, conn);
@@ -489,14 +489,14 @@ impl TestEndpoint {
     }
 
     pub(super) fn retry(&mut self, incoming: Incoming) {
-        let mut buf = Vec::new();
+        let mut buf = BytesMut::new();
         let transmit = self.endpoint.retry(incoming, &mut buf).unwrap();
         let size = transmit.size;
         self.outbound.extend(split_transmit(transmit, &buf[..size]));
     }
 
     pub(super) fn reject(&mut self, incoming: Incoming) {
-        let mut buf = Vec::new();
+        let mut buf = BytesMut::new();
         let transmit = self.endpoint.refuse(incoming, &mut buf);
         let size = transmit.size;
         self.outbound.extend(split_transmit(transmit, &buf[..size]));

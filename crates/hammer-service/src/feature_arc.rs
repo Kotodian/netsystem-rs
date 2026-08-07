@@ -503,7 +503,7 @@ impl<A: FeatureArcSpec> FeatureArcControl<A> {
 
     #[inline]
     fn publish(&mut self) -> FeatureArcResult<()> {
-        let mut inner = Arc::clone(&self.inner);
+        let inner = Arc::clone(&self.inner);
         let mut state = self.state.clone();
         state.start_nodes = self.start_nodes.clone();
         state.default_end = self.default_end;
@@ -517,7 +517,7 @@ impl<A: FeatureArcSpec> FeatureArcControl<A> {
             .ok_or(FeatureArcError::BarrierUnavailable)?;
         state.rebuild(nodes)?;
         self.state = state.clone();
-        barrier.sync(&mut inner, |inner| inner.publish(state));
+        barrier.sync(|| inner.publish(state));
         Ok(())
     }
 }

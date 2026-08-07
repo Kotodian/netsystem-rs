@@ -397,8 +397,8 @@ impl InterfaceControlPlane {
     #[inline]
     fn publish(&self, state: InterfaceState) {
         if let Some(barrier) = &self.barrier {
-            let mut inner = Arc::clone(&self.inner);
-            barrier.sync(&mut inner, |inner| inner.publish(state));
+            let inner = Arc::clone(&self.inner);
+            barrier.sync(|| inner.publish(state));
         } else {
             self.inner.publish(state);
         }

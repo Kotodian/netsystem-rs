@@ -56,7 +56,7 @@ fn version_negotiate_server() {
         None,
     );
     let now = Instant::now();
-    let mut buf = Vec::with_capacity(server.config().get_max_udp_payload_size() as usize);
+    let mut buf = BytesMut::with_capacity(server.config().get_max_udp_payload_size() as usize);
     let event = server.handle(
         now,
         client_addr,
@@ -98,7 +98,7 @@ fn version_negotiate_client() {
         .connect(Instant::now(), client_config(), server_addr, "localhost")
         .unwrap();
     let now = Instant::now();
-    let mut buf = Vec::with_capacity(client.config().get_max_udp_payload_size() as usize);
+    let mut buf = BytesMut::with_capacity(client.config().get_max_udp_payload_size() as usize);
     let opt_event = client.handle(
         now,
         server_addr,
@@ -262,7 +262,7 @@ fn stateless_reset_limit() {
         None,
     );
     let time = Instant::now();
-    let mut buf = Vec::new();
+    let mut buf = BytesMut::new();
     let event = endpoint.handle(time, remote, None, None, [0u8; 1024][..].into(), &mut buf);
     assert!(matches!(event, Some(DatagramEvent::Response(_))));
     let event = endpoint.handle(time, remote, None, None, [0u8; 1024][..].into(), &mut buf);
@@ -2236,7 +2236,7 @@ fn malformed_token_len() {
         true,
         None,
     );
-    let mut buf = Vec::with_capacity(server.config().get_max_udp_payload_size() as usize);
+    let mut buf = BytesMut::with_capacity(server.config().get_max_udp_payload_size() as usize);
     server.handle(
         Instant::now(),
         client_addr,
@@ -2572,7 +2572,8 @@ fn single_ack_eliciting_packet_triggers_ack_after_delay() {
 
     // The ACK delay is properly calculated
     assert_eq!(pair.client.captured_packets.len(), 1);
-    let mut frames = frame::Iter::new(pair.client.captured_packets.remove(0).into())
+    let captured = pair.client.captured_packets.remove(0);
+    let mut frames = frame::Iter::new(&captured)
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
@@ -3031,7 +3032,7 @@ fn ack_frequency_update_max_delay() {
 }
 
 fn stream_chunks(mut recv: RecvStream) -> Vec<u8> {
-    let mut buf = Vec::new();
+    let mut buf = BytesMut::new();
 
     let mut chunks = recv.read(true).unwrap();
     while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
@@ -3040,7 +3041,7 @@ fn stream_chunks(mut recv: RecvStream) -> Vec<u8> {
 
     let _ = chunks.finalize();
 
-    buf
+    buf.to_vec()
 }
 
 /// Verify that an endpoint which receives but does not send ACK-eliciting data still receives ACKs
@@ -3353,7 +3354,7 @@ fn reject_short_idcid() {
         None,
     );
     let now = Instant::now();
-    let mut buf = Vec::with_capacity(server.config().get_max_udp_payload_size() as usize);
+    let mut buf = BytesMut::with_capacity(server.config().get_max_udp_payload_size() as usize);
     // Initial header that has an empty DCID but is otherwise well-formed
     let mut initial = BytesMut::from(hex!("c4 00000001 00 00 00 3f").as_ref());
     initial.resize(MIN_INITIAL_SIZE.into(), 0);

@@ -1,5 +1,5 @@
 use core::hint::spin_loop;
-use std::cell::{Ref, RefCell, RefMut};
+use std::cell::{Ref, RefCell, RefMut, UnsafeCell};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,10 +28,8 @@ pub(crate) struct EngineWorkerSeed {
     registry: Arc<RuntimeRegistry>,
     barrier: crate::barrier::WorkerBarrier,
     main_loop_exit_now: Arc<AtomicBool>,
-    worker_graph: Arc<crate::barrier::Barrier<Option<WorkerGraphUpdate>>>,
+    publication: Arc<WorkerPublication>,
     workers_updating_graph: Arc<AtomicU32>,
-    worker_graph_errors: Arc<[crate::barrier::Barrier<Option<RuntimeError>>]>,
-    worker_runtime_stats: Arc<[crate::barrier::Barrier<Option<WorkerRuntimeStats>>]>,
     worker_init_functions: Vec<InitFunction>,
     memory_initialized: bool,
     worker_config: Worker,
@@ -51,6 +49,121 @@ pub struct WorkerRuntimeStats {
     pub nodes: Vec<NodeRuntimeStatsRow>,
     pub files: Vec<FileRuntimeStatsRow>,
 }
+
+/// Runtime-owned slots exchanged across the worker barrier.
+///
+/// The main Engine publishes the graph while workers are stopped. Workers own
+/// their error and statistics slots: they write them before acknowledging a
+/// barrier, and the main Engine reads them only after the matching completion
+/// count or barrier acknowledgement has finished. This is deliberately an
+/// owner-specific publication record rather than a generic synchronization
+/// wrapper.
+struct WorkerPublication {
+    graph: UnsafeCell<Option<WorkerGraphUpdate>>,
+    graph_errors: Box<[UnsafeCell<Option<RuntimeError>>]>,
+    runtime_stats: Box<[UnsafeCell<Option<WorkerRuntimeStats>>]>,
+}
+
+impl WorkerPublication {
+    fn new(worker_count: usize) -> Self {
+        Self {
+            graph: UnsafeCell::new(None),
+            graph_errors: (0..worker_count)
+                .map(|_| UnsafeCell::new(None))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            runtime_stats: (0..worker_count)
+                .map(|_| UnsafeCell::new(None))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }
+    }
+
+    #[inline]
+    fn worker_count(&self) -> usize {
+        self.runtime_stats.len()
+    }
+
+    /// # Safety
+    /// The caller must hold the main-thread worker barrier before publishing
+    /// or replacing the graph.
+    unsafe fn set_graph(&self, graph: Option<WorkerGraphUpdate>) {
+        // SAFETY: guaranteed by the caller's worker-barrier phase.
+        unsafe { *self.graph.get() = graph };
+    }
+
+    /// # Safety
+    /// The caller must prove that the main thread has published the graph and
+    /// that no main-thread writer can run until the returned reference ends.
+    unsafe fn graph(&self) -> &Option<WorkerGraphUpdate> {
+        // SAFETY: guaranteed by the caller's publication lifetime proof.
+        unsafe { &*self.graph.get() }
+    }
+
+    /// # Safety
+    /// The caller must hold the main-thread worker barrier while clearing all
+    /// worker error slots.
+    unsafe fn clear_graph_errors(&self) {
+        for slot in &self.graph_errors {
+            // SAFETY: the enclosing worker-barrier phase excludes workers.
+            unsafe { *slot.get() = None };
+        }
+    }
+
+    /// # Safety
+    /// The caller must be the Data Worker that owns `worker`'s slot, during a
+    /// graph refork. The main thread must not read the slot until the refork
+    /// completion count reaches zero.
+    unsafe fn set_graph_error(&self, worker: usize, error: RuntimeError) {
+        let slot = self
+            .graph_errors
+            .get(worker)
+            .expect("worker graph error slot must exist");
+        // SAFETY: the owning worker has exclusive access to this slot during
+        // the refork completion phase.
+        unsafe { *slot.get() = Some(error) };
+    }
+
+    /// # Safety
+    /// The caller must have observed the graph refork completion count at zero.
+    unsafe fn take_graph_error(&self, worker: usize) -> Option<RuntimeError> {
+        let slot = self
+            .graph_errors
+            .get(worker)
+            .expect("worker graph error slot must exist");
+        // SAFETY: no worker can access the slot after the completion count is
+        // zero.
+        unsafe { (*slot.get()).take() }
+    }
+
+    /// # Safety
+    /// The caller must be the Data Worker that owns `worker`'s slot and must
+    /// write before acknowledging the worker barrier.
+    unsafe fn set_runtime_stats(&self, worker: usize, stats: WorkerRuntimeStats) {
+        let slot = self
+            .runtime_stats
+            .get(worker)
+            .expect("worker runtime statistics slot must exist");
+        // SAFETY: the worker owns its slot until it acknowledges the barrier.
+        unsafe { *slot.get() = Some(stats) };
+    }
+
+    /// # Safety
+    /// The caller must hold the worker barrier after every worker has published
+    /// its statistics slot.
+    unsafe fn runtime_stats(&self, worker: usize) -> Option<&WorkerRuntimeStats> {
+        let slot = self
+            .runtime_stats
+            .get(worker)
+            .expect("worker runtime statistics slot must exist");
+        // SAFETY: the enclosing barrier phase excludes all slot writers.
+        unsafe { (*slot.get()).as_ref() }
+    }
+}
+
+// SAFETY: all shared access to these UnsafeCell values follows the ownership
+// and completion contracts documented on WorkerPublication's methods.
+unsafe impl Sync for WorkerPublication {}
 
 #[repr(align(64))]
 pub struct Engine {
@@ -74,10 +187,8 @@ pub struct Engine {
     pub(crate) called_main_loop_exit_functions: HashSet<&'static str>,
     pub(crate) main_loop_entered: bool,
     materialized_registration_generation: u64,
-    pub(crate) worker_graph: Arc<crate::barrier::Barrier<Option<WorkerGraphUpdate>>>,
+    publication: Arc<WorkerPublication>,
     pub(crate) workers_updating_graph: Arc<AtomicU32>,
-    pub(crate) worker_graph_errors: Arc<[crate::barrier::Barrier<Option<RuntimeError>>]>,
-    worker_runtime_stats: Arc<[crate::barrier::Barrier<Option<WorkerRuntimeStats>>]>,
     main_loop_exit_functions_called: bool,
     worker_threads: Vec<JoinHandle<RuntimeResult<()>>>,
     worker_control_queues: Arc<[DataRemoteLocalQueue]>,
@@ -93,10 +204,8 @@ impl Engine {
         registry: Arc<RuntimeRegistry>,
         barrier: crate::barrier::WorkerBarrier,
         main_loop_exit_now: Arc<AtomicBool>,
-        worker_graph: Arc<crate::barrier::Barrier<Option<WorkerGraphUpdate>>>,
+        publication: Arc<WorkerPublication>,
         workers_updating_graph: Arc<AtomicU32>,
-        worker_graph_errors: Arc<[crate::barrier::Barrier<Option<RuntimeError>>]>,
-        worker_runtime_stats: Arc<[crate::barrier::Barrier<Option<WorkerRuntimeStats>>]>,
         worker_init_functions: Vec<InitFunction>,
         memory_initialized: bool,
         worker_config: Worker,
@@ -124,10 +233,8 @@ impl Engine {
             called_main_loop_exit_functions: HashSet::new(),
             main_loop_entered: false,
             materialized_registration_generation: 0,
-            worker_graph,
+            publication,
             workers_updating_graph,
-            worker_graph_errors,
-            worker_runtime_stats,
             main_loop_exit_functions_called: false,
             worker_threads: Vec::new(),
             worker_control_queues: Arc::from([]),
@@ -158,10 +265,8 @@ impl Engine {
             called_main_loop_exit_functions: HashSet::new(),
             main_loop_entered: false,
             materialized_registration_generation: 0,
-            worker_graph: Arc::new(crate::barrier::Barrier::new(None)),
+            publication: Arc::new(WorkerPublication::new(0)),
             workers_updating_graph: Arc::new(AtomicU32::new(0)),
-            worker_graph_errors: Arc::from([]),
-            worker_runtime_stats: Arc::from([]),
             main_loop_exit_functions_called: false,
             worker_threads: Vec::new(),
             worker_control_queues: Arc::from([]),
@@ -241,17 +346,16 @@ impl Engine {
             0
         };
         let barrier = self.barrier.clone();
-        barrier.sync(self, |engine| -> RuntimeResult<()> {
-            crate::init::run_config_functions(engine, true, config)?;
-            crate::init::run_init_functions(engine)?;
-            let entries = engine.plugin_main.graph_nodes();
-            let functions = engine.plugin_main.node_functions();
-            engine
-                .runtime
+        barrier.sync(|| -> RuntimeResult<()> {
+            crate::init::run_config_functions(self, true, config)?;
+            crate::init::run_init_functions(self)?;
+            let entries = self.plugin_main.graph_nodes();
+            let functions = self.plugin_main.node_functions();
+            self.runtime
                 .extend_graph_with_node_functions(&entries, &functions)?;
-            crate::init::run_config_functions(engine, false, config)?;
+            crate::init::run_config_functions(self, false, config)?;
             if worker_count != 0 {
-                engine.publish_worker_graph(worker_count)?;
+                self.publish_worker_graph(worker_count)?;
             }
             Ok(())
         })?;
@@ -280,11 +384,8 @@ impl Engine {
         // SAFETY: the main Engine calls this only while every worker is held at
         // `self.barrier`, before the refork completion count is published.
         unsafe {
-            self.worker_graph
-                .with_mut_unchecked(|graph| *graph = Some(update));
-            for error in self.worker_graph_errors.iter() {
-                error.with_mut_unchecked(|error| *error = None);
-            }
+            self.publication.set_graph(Some(update));
+            self.publication.clear_graph_errors();
         }
         self.workers_updating_graph
             .store(worker_count, Ordering::Release);
@@ -298,15 +399,15 @@ impl Engine {
 
         // SAFETY: every worker completed its refork before decrementing the
         // counter to zero, so none can still access the graph or error slots.
-        if unsafe { self.worker_graph.get_unchecked() }.is_none() {
+        if unsafe { self.publication.graph() }.is_none() {
             return Err(RuntimeError::WorkerGraphUpdateMissing);
         }
 
         let mut graph_update_error = None;
-        for (worker, slot) in self.worker_graph_errors.iter().enumerate() {
+        for worker in 0..self.publication.worker_count() {
             // SAFETY: the refork completion count is zero, so the worker that
             // owns this slot can no longer read or write it.
-            if let Some(error) = unsafe { slot.with_mut_unchecked(Option::take) } {
+            if let Some(error) = unsafe { self.publication.take_graph_error(worker) } {
                 if graph_update_error.is_none() {
                     graph_update_error = Some(error);
                 } else {
@@ -324,7 +425,7 @@ impl Engine {
 
         // SAFETY: the main Engine published this value before releasing the
         // barrier and retains it until every worker completes the refork.
-        let update = unsafe { self.worker_graph.get_unchecked() }
+        let update = unsafe { self.publication.graph() }
             .as_ref()
             .expect("published worker graph must be present")
             .clone();
@@ -342,15 +443,9 @@ impl Engine {
             let worker = self
                 .data_worker_id()
                 .expect("worker graph update runs only on a Data Worker");
-            let slot = self
-                .worker_graph_errors
-                .get(worker.slot())
-                .expect("worker graph error slot must exist");
             // SAFETY: each Data Worker owns exactly one error slot throughout
             // the refork; the main Engine reads it only after completion.
-            unsafe {
-                slot.with_mut_unchecked(|slot| *slot = Some(error));
-            }
+            unsafe { self.publication.set_graph_error(worker.slot(), error) };
         }
 
         let updating = self.workers_updating_graph.fetch_sub(1, Ordering::AcqRel);
@@ -371,10 +466,8 @@ impl Engine {
             Arc::clone(&self.registry),
             self.barrier.clone(),
             Arc::clone(&self.main_loop_exit_now),
-            Arc::clone(&self.worker_graph),
+            Arc::clone(&self.publication),
             Arc::clone(&self.workers_updating_graph),
-            Arc::clone(&self.worker_graph_errors),
-            Arc::clone(&self.worker_runtime_stats),
             self.plugin_main.worker_init_functions(),
             self.memory_initialized,
             self.worker_config.clone(),
@@ -496,10 +589,8 @@ impl Engine {
             registry: Arc::clone(&self.registry),
             barrier: self.barrier.clone(),
             main_loop_exit_now: Arc::clone(&self.main_loop_exit_now),
-            worker_graph: Arc::clone(&self.worker_graph),
+            publication: Arc::clone(&self.publication),
             workers_updating_graph: Arc::clone(&self.workers_updating_graph),
-            worker_graph_errors: Arc::clone(&self.worker_graph_errors),
-            worker_runtime_stats: Arc::clone(&self.worker_runtime_stats),
             worker_init_functions: self.plugin_main.worker_init_functions(),
             memory_initialized: self.memory_initialized,
             worker_config: self.worker_config.clone(),
@@ -507,22 +598,11 @@ impl Engine {
     }
 
     pub(crate) fn prepare_worker_runtime_stats(&mut self, worker_count: usize) {
-        self.worker_runtime_stats = (0..worker_count)
-            .map(|_| crate::barrier::Barrier::new(None))
-            .collect::<Vec<_>>()
-            .into();
-        self.worker_graph_errors = (0..worker_count)
-            .map(|_| crate::barrier::Barrier::new(None))
-            .collect::<Vec<_>>()
-            .into();
+        self.publication = Arc::new(WorkerPublication::new(worker_count));
     }
 
     pub(crate) fn publish_worker_runtime_stats(&self) {
-        let Some(slot) = self
-            .thread_index
-            .checked_sub(1)
-            .and_then(|index| self.worker_runtime_stats.get(index as usize))
-        else {
+        let Some(worker) = self.thread_index.checked_sub(1).map(|index| index as usize) else {
             return;
         };
         let snapshot = WorkerRuntimeStats {
@@ -532,12 +612,9 @@ impl Engine {
             nodes: self.runtime.nodes().node_runtime_stats_snapshot(),
             files: self.file_main().runtime_stats_snapshot(),
         };
-        // SAFETY: each worker owns exactly one slot and replaces it before
-        // acknowledging the barrier. The main Engine reads only after every
-        // worker has acknowledged.
-        unsafe {
-            slot.with_mut_unchecked(|slot| *slot = Some(snapshot));
-        }
+        // SAFETY: this worker owns its slot and publishes it before
+        // acknowledging the worker barrier.
+        unsafe { self.publication.set_runtime_stats(worker, snapshot) };
     }
 
     pub fn worker_runtime_stats_snapshot(&self) -> RuntimeResult<Vec<WorkerRuntimeStats>> {
@@ -547,25 +624,24 @@ impl Engine {
                 "only the main Runtime Engine can synchronize data workers",
             ));
         }
-        let worker_count = self.worker_runtime_stats.len();
+        let worker_count = self.publication.worker_count();
         if worker_count == 0 {
             return Ok(Vec::new());
         }
         debug_assert_eq!(self.barrier.worker_count() as usize, worker_count);
-        let mut stats = Arc::clone(&self.worker_runtime_stats);
-        self.barrier.sync(&mut stats, |stats| {
-            stats
-                .iter()
-                .enumerate()
-                .map(|(slot, snapshot)| {
+        self.barrier.sync(|| {
+            (0..worker_count)
+                .map(|slot| {
                     // SAFETY: the enclosing worker barrier is held, so no
                     // worker can replace its statistics slot.
-                    unsafe { snapshot.get_unchecked() }.clone().ok_or_else(|| {
-                        RuntimeError::lifecycle(
-                            "snapshot worker runtime statistics",
-                            format!("data worker {} did not publish its state", slot + 1),
-                        )
-                    })
+                    unsafe { self.publication.runtime_stats(slot) }
+                        .cloned()
+                        .ok_or_else(|| {
+                            RuntimeError::lifecycle(
+                                "snapshot worker runtime statistics",
+                                format!("data worker {} did not publish its state", slot + 1),
+                            )
+                        })
                 })
                 .collect()
         })
@@ -690,10 +766,8 @@ impl EngineWorkerSeed {
             registry,
             barrier,
             main_loop_exit_now,
-            worker_graph,
+            publication,
             workers_updating_graph,
-            worker_graph_errors,
-            worker_runtime_stats,
             worker_init_functions,
             memory_initialized,
             worker_config,
@@ -711,10 +785,8 @@ impl EngineWorkerSeed {
             registry,
             barrier,
             main_loop_exit_now,
-            worker_graph,
+            publication,
             workers_updating_graph,
-            worker_graph_errors,
-            worker_runtime_stats,
             worker_init_functions,
             memory_initialized,
             worker_config,

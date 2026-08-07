@@ -1,6 +1,5 @@
 //! TCP plugin config — owned schema under `[plugin.tcp]` (#95).
 
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use hammer_runtime::{RuntimeError, RuntimeResult};
@@ -44,8 +43,6 @@ pub struct TcpPluginConfig {
     pub retransmit: Retransmit,
     pub keepalive: Keepalive,
     pub pmtu: Pmtu,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub listen: Vec<TcpListen>,
 }
 
 impl Default for TcpPluginConfig {
@@ -60,7 +57,6 @@ impl Default for TcpPluginConfig {
             retransmit: Retransmit::default(),
             keepalive: Keepalive::default(),
             pmtu: Pmtu::default(),
-            listen: Vec::new(),
         }
     }
 }
@@ -89,9 +85,6 @@ impl TcpPluginConfig {
         }
         self.retransmit.validate()?;
         self.keepalive.validate()?;
-        for entry in &self.listen {
-            entry.validate()?;
-        }
         Ok(())
     }
 }
@@ -196,29 +189,6 @@ impl Default for Pmtu {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct TcpListen {
-    pub address: SocketAddr,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub md5_password: Option<String>,
-}
-
-impl Default for TcpListen {
-    fn default() -> Self {
-        Self {
-            address: "0.0.0.0:0".parse().expect("wildcard"),
-            md5_password: None,
-        }
-    }
-}
-
-impl TcpListen {
-    fn validate(&self) -> RuntimeResult<()> {
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -253,7 +223,7 @@ mod tests {
     }
 
     #[test]
-    fn tcp_plugin_owns_typed_policy_and_listener_schema() {
+    fn tcp_plugin_owns_typed_policy_schema() {
         let tcp = parse_tcp(
             r#"
 mss = 1200
@@ -275,9 +245,6 @@ max = "30s"
 idle = "60s"
 probe_interval = "30s"
 probe_limit = 4
-
-[[listen]]
-address = "10.66.77.1:7300"
 "#,
         );
 
@@ -290,7 +257,6 @@ address = "10.66.77.1:7300"
         assert_eq!(tcp.paws_idle, Duration::from_secs(12 * 3600));
         assert_eq!(tcp.retransmit.initial, Duration::from_millis(100));
         assert_eq!(tcp.keepalive.probe_limit, 4);
-        assert_eq!(tcp.listen.len(), 1);
     }
 
     #[test]
@@ -312,6 +278,5 @@ address = "10.66.77.1:7300"
         assert_eq!(tcp.keepalive.idle, Duration::from_secs(3));
         assert_eq!(tcp.keepalive.probe_interval, Duration::from_secs(1));
         assert_eq!(tcp.keepalive.probe_limit, 3);
-        assert!(tcp.listen.is_empty());
     }
 }

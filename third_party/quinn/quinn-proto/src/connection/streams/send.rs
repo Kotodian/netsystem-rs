@@ -1,7 +1,11 @@
 use bytes::Bytes;
 use thiserror::Error;
 
-use crate::{connection::send_buffer::SendBuffer, frame, VarInt};
+use crate::{
+    connection::send_buffer::SendBuffer,
+    connection::streams::{StreamDataError, StreamDataIo},
+    frame, VarInt,
+};
 
 #[derive(Debug)]
 pub(super) struct Send {
@@ -15,18 +19,20 @@ pub(super) struct Send {
     pub(super) connection_blocked: bool,
     /// The reason the peer wants us to stop, if `STOP_SENDING` was received
     pub(super) stop_reason: Option<VarInt>,
+    pub(super) io: Option<StreamDataIo>,
 }
 
 impl Send {
-    pub(super) fn new(max_data: VarInt) -> Box<Self> {
+    pub(super) fn new(max_data: VarInt, io: Option<StreamDataIo>) -> Box<Self> {
         Box::new(Self {
             max_data: max_data.into(),
             state: SendState::Ready,
-            pending: SendBuffer::new(),
+            pending: SendBuffer::new(io.is_some()),
             priority: 0,
             fin_pending: false,
             connection_blocked: false,
             stop_reason: None,
+            io,
         })
     }
 
@@ -83,6 +89,31 @@ impl Send {
         Ok(result)
     }
 
+    /// Synchronize the stream write offset with Session FIFO bytes.
+    ///
+    /// The caller owns the payload in its Session FIFO; this records only the
+    /// end offset and flow-control accounting, so no `Bytes` payload is copied
+    /// into Quinn.
+    pub(super) fn sync(&mut self, end_offset: u64) -> Result<u64, WriteError> {
+        if !self.is_writable() {
+            return Err(WriteError::ClosedStream);
+        }
+        if let Some(error_code) = self.stop_reason {
+            return Err(WriteError::Stopped(error_code));
+        }
+        let requested = end_offset.saturating_sub(self.pending.offset());
+        if requested == 0 {
+            return Ok(0);
+        }
+        let budget = self.max_data.saturating_sub(self.pending.offset());
+        let accepted = requested.min(budget);
+        if accepted == 0 {
+            return Err(WriteError::Blocked);
+        }
+        self.pending.sync(accepted as usize);
+        Ok(accepted)
+    }
+
     /// Update stream state due to a reset sent by the local application
     pub(super) fn reset(&mut self) {
         use SendState::*;
@@ -105,9 +136,12 @@ impl Send {
     }
 
     /// Returns whether the stream has been finished and all data has been acknowledged by the peer
-    pub(super) fn ack(&mut self, frame: frame::StreamMeta) -> bool {
-        self.pending.ack(frame.offsets);
-        match self.state {
+    pub(super) fn ack(&mut self, frame: frame::StreamMeta) -> Result<bool, StreamDataError> {
+        let released_prefix = self.pending.ack(frame.offsets);
+        if let (Some(io), Some(end)) = (self.io, released_prefix) {
+            unsafe { io.ack(frame.id, end)? };
+        }
+        Ok(match self.state {
             SendState::DataSent {
                 ref mut finish_acked,
             } => {
@@ -115,7 +149,7 @@ impl Send {
                 *finish_acked && self.pending.is_fully_acked()
             }
             _ => false,
-        }
+        })
     }
 
     /// Handle increase to stream-level flow control limit

@@ -22,8 +22,9 @@ pub(crate) struct DatagramConnectionEvent {
     pub(crate) now: Instant,
     pub(crate) remote: SocketAddr,
     pub(crate) ecn: Option<EcnCodepoint>,
+    pub(crate) data: BytesMut,
     pub(crate) first_decode: PartialDecode,
-    pub(crate) remaining: Option<BytesMut>,
+    pub(crate) remaining: Option<std::ops::Range<usize>>,
 }
 
 /// Events sent from a Connection to an Endpoint

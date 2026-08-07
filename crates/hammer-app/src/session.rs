@@ -14,7 +14,7 @@ impl AppClient {
         transport: impl Into<String>,
         endpoint: SessionListenEndpoint,
         app: Option<SessionAppId>,
-        config: Option<u64>,
+        opaque: Option<u64>,
     ) -> Result<SessionListenerId, AppClientError> {
         let context = self.next_session_context();
         let reply = self.session_request(ApplicationSessionRequest::Listen {
@@ -22,7 +22,7 @@ impl AppClient {
             transport: transport.into(),
             endpoint,
             app,
-            config,
+            opaque,
         })?;
         Ok(reply.listener())
     }
@@ -35,7 +35,7 @@ impl AppClient {
         worker: DataWorkerId,
         server_name: Option<String>,
         app: Option<SessionAppId>,
-        config: Option<u64>,
+        opaque: Option<u64>,
     ) -> Result<ApplicationConnectionId, AppClientError> {
         let context = self.next_session_context();
         let reply = self.session_request(ApplicationSessionRequest::Connect {
@@ -46,7 +46,7 @@ impl AppClient {
             worker,
             server_name,
             app,
-            config,
+            opaque,
         })?;
         Ok(reply.connection())
     }

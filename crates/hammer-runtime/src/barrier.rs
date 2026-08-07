@@ -5,7 +5,6 @@
 //! deadlock, not a recoverable runtime error.
 
 use core::hint::spin_loop;
-use std::cell::UnsafeCell;
 use std::panic::Location;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -16,47 +15,44 @@ pub(crate) const BARRIER_SYNC_TIMEOUT: Duration = Duration::from_millis(600_100)
 #[cfg(not(debug_assertions))]
 pub(crate) const BARRIER_SYNC_TIMEOUT: Duration = Duration::from_secs(1);
 
+#[repr(align(64))]
+struct BarrierCounter(AtomicU32);
+
+impl BarrierCounter {
+    #[inline]
+    const fn new(value: u32) -> Self {
+        Self(AtomicU32::new(value))
+    }
+
+    #[inline]
+    fn fetch_add(&self, value: u32, ordering: Ordering) -> u32 {
+        self.0.fetch_add(value, ordering)
+    }
+
+    #[inline]
+    fn fetch_sub(&self, value: u32, ordering: Ordering) -> u32 {
+        self.0.fetch_sub(value, ordering)
+    }
+
+    #[inline]
+    fn load(&self, ordering: Ordering) -> u32 {
+        self.0.load(ordering)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn store(&self, value: u32, ordering: Ordering) {
+        self.0.store(value, ordering);
+    }
+}
+
+#[repr(C)]
 struct State {
-    wait: AtomicU32,
-    workers: AtomicU32,
+    // VPP allocates these counters on separate cache lines. The aligned
+    // wrappers preserve that layout while keeping the state in one Arc.
+    wait: BarrierCounter,
+    workers: BarrierCounter,
 }
-
-/// Value whose access is ordered by an associated worker barrier.
-pub struct Barrier<T> {
-    value: UnsafeCell<T>,
-}
-
-impl<T> Barrier<T> {
-    #[inline]
-    pub const fn new(value: T) -> Self {
-        Self {
-            value: UnsafeCell::new(value),
-        }
-    }
-
-    /// # Safety
-    /// The caller must hold the worker barrier or otherwise prove that no
-    /// writer can access this value for the returned reference's lifetime.
-    #[inline]
-    pub(crate) unsafe fn get_unchecked(&self) -> &T {
-        // SAFETY: upheld by the caller's barrier-phase contract.
-        unsafe { &*self.value.get() }
-    }
-
-    /// # Safety
-    /// The caller must have exclusive barrier-phase ownership of this value
-    /// for the duration of `operation`.
-    #[inline]
-    pub unsafe fn with_mut_unchecked<R>(&self, operation: impl FnOnce(&mut T) -> R) -> R {
-        // SAFETY: upheld by the caller's barrier-phase contract.
-        operation(unsafe { &mut *self.value.get() })
-    }
-}
-
-// SAFETY: `Barrier<T>` exposes its `UnsafeCell` only through unsafe operations
-// whose callers must establish the worker-barrier or completion phase. Moving
-// or dropping the shared value remains valid when `T: Send`.
-unsafe impl<T: Send> Sync for Barrier<T> {}
 
 /// VPP-style synchronization shared by the main thread and Data Workers.
 #[derive(Clone)]
@@ -70,23 +66,23 @@ impl WorkerBarrier {
     pub(crate) fn new(worker_count: u32) -> Self {
         Self {
             state: Arc::new(State {
-                wait: AtomicU32::new(0),
-                workers: AtomicU32::new(0),
+                wait: BarrierCounter::new(0),
+                workers: BarrierCounter::new(0),
             }),
             worker_count,
         }
     }
 
-    /// Pauses every worker while `operation` has mutable access to `value`.
+    /// Pauses every worker while `operation` runs on the main/control thread.
     #[track_caller]
-    pub fn sync<T: ?Sized, R>(&self, value: &mut T, operation: impl FnOnce(&mut T) -> R) -> R {
+    pub fn sync<R>(&self, operation: impl FnOnce() -> R) -> R {
         let caller = Location::caller();
         self.pause(caller);
         let release = Release {
             barrier: self.clone(),
             caller,
         };
-        let result = operation(value);
+        let result = operation();
         drop(release);
         result
     }
@@ -181,7 +177,7 @@ impl Drop for Release {
 }
 
 fn wait_for_worker_count(
-    workers: &AtomicU32,
+    workers: &BarrierCounter,
     expected: u32,
     deadline: Instant,
     phase: &'static str,
@@ -227,6 +223,17 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    const CACHE_LINE_BYTES: usize = 64;
+
+    #[test]
+    fn barrier_counters_use_separate_cache_lines() {
+        assert_eq!(CACHE_LINE_BYTES, 64);
+        assert_eq!(std::mem::align_of::<BarrierCounter>(), CACHE_LINE_BYTES);
+        assert_eq!(std::mem::size_of::<BarrierCounter>(), CACHE_LINE_BYTES);
+        assert_eq!(std::mem::offset_of!(State, wait), 0);
+        assert_eq!(std::mem::offset_of!(State, workers), CACHE_LINE_BYTES);
+    }
+
     #[test]
     fn barrier_check_arms_worker() {
         let barrier = WorkerBarrier::new(1);
@@ -268,8 +275,7 @@ mod tests {
             worker_barrier.check();
         });
 
-        let mut value = ();
-        barrier.sync(&mut value, |_| {
+        barrier.sync(|| {
             assert_eq!(barrier.paused_workers(), 1);
         });
 
@@ -277,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_barrier_releases_after_protected_mutation() {
+    fn barrier_releases_after_protected_mutation() {
         let barrier = WorkerBarrier::new(1);
         let published = Arc::new(AtomicU32::new(1));
 
@@ -292,9 +298,9 @@ mod tests {
         });
 
         let mut next = 1_u32;
-        barrier.sync(&mut next, |next| {
-            *next = 2;
-            published.store(*next, Ordering::Release);
+        barrier.sync(|| {
+            next = 2;
+            published.store(next, Ordering::Release);
         });
 
         assert_eq!(worker.join().expect("worker"), 2);
@@ -336,7 +342,7 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
-        assert_eq!(counter.load(Ordering::Acquire), n as u32);
+        assert_eq!(counter.load(Ordering::Acquire), n);
     }
 
     #[test]
@@ -382,10 +388,8 @@ mod tests {
             worker_resumed.store(true, Ordering::Release);
         });
 
-        let mut outer_value = ();
-        let mut inner_value = ();
-        barrier.sync(&mut outer_value, |_| {
-            barrier.sync(&mut inner_value, |_| {});
+        barrier.sync(|| {
+            barrier.sync(|| {});
             assert!(!resumed.load(Ordering::Acquire));
             assert!(barrier.is_pending());
         });
@@ -398,7 +402,7 @@ mod tests {
         const CHILD_ENV: &str = "HAMMER_BARRIER_DEADLOCK_CHILD";
         if std::env::var_os(CHILD_ENV).is_some() {
             wait_for_worker_count(
-                &AtomicU32::new(0),
+                &BarrierCounter::new(0),
                 1,
                 Instant::now(),
                 "barrier sync",

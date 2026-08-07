@@ -443,6 +443,8 @@ impl UdpWorker {
 
 pub(crate) fn start_listen(
     listener: SessionListenerId,
+    _: hammer_runtime::app::ApplicationId,
+    _: Option<u64>,
     endpoint: SessionListenEndpoint,
 ) -> RuntimeResult<()> {
     hammer_runtime::ensure_main_thread_with_barrier()?;
@@ -504,27 +506,22 @@ pub(crate) fn stop_listen(listener: SessionListenerId) -> RuntimeResult<()> {
     Ok(())
 }
 
-pub(crate) fn connect(
-    connection: SessionConnectionId,
-    endpoint: SessionConnectEndpoint,
-) -> RuntimeResult<()> {
-    let local = endpoint
-        .local()
-        .ok_or(UdpTransportError::InvalidConnection)?;
-    if local.is_ipv4() != endpoint.remote().is_ipv4() || local.port() == 0 {
+pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
+    let local = endpoint.local.ok_or(UdpTransportError::InvalidConnection)?;
+    if local.is_ipv4() != endpoint.remote.is_ipv4() || local.port() == 0 {
         return Err(UdpTransportError::InvalidConnection.into());
     }
     let main = UDP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "udp" })?;
-    let worker = endpoint.worker();
+    let worker = endpoint.worker;
     let worker_slot = worker.slot();
     let (completion, completed) = mpsc::sync_channel(1);
     Engine::with_current(|engine| {
         engine.schedule_on_worker(worker, move || {
             let result = with_data_plane_runtime(|runtime| {
                 main.with_worker(runtime, |sessions, udp| {
-                    udp.active_connect(sessions, connection, local, endpoint.remote())
+                    udp.active_connect(sessions, endpoint.connection, local, endpoint.remote)
                 })
             });
             if completion.send(result).is_err() {
@@ -766,7 +763,12 @@ mod tests {
 
     use super::*;
 
-    fn noop_start_listen(_: SessionListenerId, _: SessionListenEndpoint) -> RuntimeResult<()> {
+    fn noop_start_listen(
+        _: SessionListenerId,
+        _: hammer_runtime::app::ApplicationId,
+        _: Option<u64>,
+        _: SessionListenEndpoint,
+    ) -> RuntimeResult<()> {
         Ok(())
     }
 
@@ -828,7 +830,7 @@ mod tests {
         let applications = ApplicationMain::new(1);
         let application = applications.attach().expect("attach test Application");
         let application_listener = applications
-            .register_listener(application, None, None)
+            .register_listener(application, None, Some(0xfeed))
             .expect("register test listener");
         let session_main = Arc::new(SessionMain::new(1, Arc::clone(&applications)));
         let udp_main = Arc::new(UdpMain::new(1, Arc::clone(&session_main)));
@@ -982,8 +984,8 @@ mod tests {
     }
 
     #[test]
-    fn udp_disconnect_removes_connection_and_session_lookup() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn udp_disconnect_removes_connection_and_session_lookup()
+    -> Result<(), Box<dyn std::error::Error>> {
         let (mut sessions, mut udp, applications, _main) = worker_state();
         let application = applications.attach()?;
         sessions.install_application_mq_for_test(application)?;

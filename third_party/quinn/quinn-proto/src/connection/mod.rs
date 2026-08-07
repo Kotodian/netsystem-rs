@@ -84,12 +84,14 @@ pub use streams::StreamsState;
 use streams::StreamsState;
 pub use streams::{
     Chunks, ClosedStream, FinishError, ReadError, ReadableError, RecvStream, SendStream,
-    ShouldTransmit, StreamEvent, Streams, WriteError, Written,
+    ShouldTransmit, StreamDataError, StreamDataIo, StreamEvent, Streams, WriteError, Written,
 };
 
 mod timer;
 use crate::congestion::Controller;
 use timer::{Timer, TimerTable};
+
+const MAX_RX_PACKET_DESCRIPTORS: usize = 64;
 
 /// Protocol state and logic for a single QUIC connection
 ///
@@ -226,6 +228,8 @@ pub struct Connection {
     /// Whether the last `poll_transmit` call yielded no data because there was
     /// no outgoing application data.
     app_limited: bool,
+    /// Last Session FIFO data-plane failure observed while generating a packet.
+    stream_data_error: Option<StreamDataError>,
 
     streams: StreamsState,
     /// Surplus remote CIDs for future use on new paths
@@ -338,6 +342,7 @@ impl Connection {
             pto_count: 0,
 
             app_limited: false,
+            stream_data_error: None,
             receiving_ecn: false,
             total_authed_packets: 0,
 
@@ -379,6 +384,14 @@ impl Connection {
         self.timers.next_timeout()
     }
 
+    /// Takes the last Session FIFO packet-path failure observed by transmit.
+    ///
+    /// `poll_transmit` returns `None` after recording this failure. The owning
+    /// Data Worker owns the corresponding typed packet-drop counter.
+    pub fn take_stream_data_error(&mut self) -> Option<StreamDataError> {
+        self.stream_data_error.take()
+    }
+
     /// Returns application-facing events
     ///
     /// Connections should be polled for events after:
@@ -414,6 +427,98 @@ impl Connection {
             state: &mut self.streams,
             conn_state: &self.state,
         }
+    }
+
+    /// Installs the Session FIFO payload I/O table for this connection.
+    ///
+    /// Must be set before stream payload flows. Existing stream state is
+    /// updated in place, so this can also be called once per connection
+    /// immediately after creation.
+    pub fn set_stream_data_io(&mut self, io: Option<StreamDataIo>) {
+        self.streams.set_stream_data_io(io);
+    }
+
+    /// Process one UDP datagram for this connected QUIC connection.
+    ///
+    /// This is the direct connected-session counterpart to
+    /// [`Endpoint::handle`](crate::Endpoint::handle). The caller owns the
+    /// datagram storage and must not mutate or drop it until this call
+    /// returns.
+    pub fn handle_datagram(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        ecn: Option<EcnCodepoint>,
+        data: BytesMut,
+    ) {
+        self.handle_datagram_with_stream_setup(now, remote, ecn, data, |_| Ok(()));
+    }
+
+    /// Process one connected datagram after synchronously preparing each
+    /// Session-backed remote stream before it receives payload bytes.
+    pub fn handle_datagram_with_stream_setup<F>(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        ecn: Option<EcnCodepoint>,
+        mut data: BytesMut,
+        mut prepare_stream: F,
+    ) where
+        F: FnMut(StreamId) -> Result<(), StreamDataError>,
+    {
+        let mut packet_descriptors = Vec::with_capacity(MAX_RX_PACKET_DESCRIPTORS);
+        self.handle_datagram_with_stream_setup_scratch(
+            now,
+            remote,
+            ecn,
+            &mut data,
+            &mut packet_descriptors,
+            &mut prepare_stream,
+        );
+    }
+
+    /// Process a connected datagram from caller-owned worker scratch.
+    pub fn handle_datagram_with_stream_setup_scratch<F>(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        ecn: Option<EcnCodepoint>,
+        data: &mut [u8],
+        packet_descriptors: &mut Vec<PartialDecode>,
+        prepare_stream: &mut F,
+    ) where
+        F: FnMut(StreamId) -> Result<(), StreamDataError>,
+    {
+        if data.is_empty() {
+            packet_descriptors.clear();
+            return;
+        }
+        packet_descriptors.clear();
+        let mut offset = 0;
+        while offset < data.len() {
+            let (partial_decode, remaining) = match PartialDecode::new(
+                &data[offset..],
+                offset,
+                &FixedLengthConnectionIdParser::new(self.local_cid_state.cid_len()),
+                &[self.version],
+                self.endpoint_config.grease_quic_bit,
+            ) {
+                Ok(decoded) => decoded,
+                Err(_) => {
+                    self.stats.udp_rx.on_packet_drop();
+                    packet_descriptors.clear();
+                    return;
+                }
+            };
+            if packet_descriptors.len() == packet_descriptors.capacity() {
+                self.stats.udp_rx.on_packet_drop();
+                packet_descriptors.clear();
+                return;
+            }
+            packet_descriptors.push(partial_decode);
+            offset = remaining.map_or(data.len(), |range| range.start);
+        }
+        self.handle_decoded_datagram(now, remote, ecn, packet_descriptors, data, prepare_stream);
     }
 
     /// Provide control over streams
@@ -453,7 +558,7 @@ impl Connection {
         &mut self,
         now: Instant,
         max_datagrams: usize,
-        buf: &mut Vec<u8>,
+        buf: &mut BytesMut,
     ) -> Option<Transmit> {
         assert!(max_datagrams != 0);
         let max_datagrams = match self.config.enable_segmentation_offload {
@@ -877,8 +982,19 @@ impl Connection {
                 }
             }
 
-            let sent =
-                self.populate_packet(now, space_id, buf, builder.max_size, builder.exact_number);
+            let sent = match self.populate_packet(
+                now,
+                space_id,
+                buf,
+                builder.max_size,
+                builder.exact_number,
+            ) {
+                Ok(sent) => sent,
+                Err(error) => {
+                    self.stream_data_error = Some(error);
+                    return None;
+                }
+            };
 
             // ACK-only packets should only be sent when explicitly allowed. If we write them due to
             // any other reason, there is a bug which leads to one component announcing write
@@ -1010,7 +1126,7 @@ impl Connection {
     }
 
     /// Send PATH_CHALLENGE for a previous path if necessary
-    fn send_path_challenge(&mut self, now: Instant, buf: &mut Vec<u8>) -> Option<Transmit> {
+    fn send_path_challenge(&mut self, now: Instant, buf: &mut BytesMut) -> Option<Transmit> {
         let (prev_cid, prev_path) = self.prev_path.as_mut()?;
         if !prev_path.challenge_pending {
             return None;
@@ -1098,46 +1214,17 @@ impl Connection {
                 ecn,
                 first_decode,
                 remaining,
+                mut data,
             }) => {
-                // If this packet could initiate a migration and we're a client or a server that
-                // forbids migration, drop the datagram. This could be relaxed to heuristically
-                // permit NAT-rebinding-like migration.
-                if remote != self.path.remote && !self.side.remote_may_migrate() {
-                    trace!("discarding packet from unrecognized peer {}", remote);
-                    return;
-                }
-
-                let was_anti_amplification_blocked = self.path.anti_amplification_blocked(1);
-
-                self.stats.udp_rx.datagrams += 1;
-                self.stats.udp_rx.bytes += first_decode.len() as u64;
-                let data_len = first_decode.len();
-
-                self.handle_decode(now, remote, ecn, first_decode);
-                // The current `path` might have changed inside `handle_decode`,
-                // since the packet could have triggered a migration. Make sure
-                // the data received is accounted for the most recent path by accessing
-                // `path` after `handle_decode`.
-                self.path.total_recvd = self.path.total_recvd.saturating_add(data_len as u64);
-
-                if let Some(data) = remaining {
-                    self.stats.udp_rx.bytes += data.len() as u64;
-                    self.handle_coalesced(now, remote, ecn, data);
-                }
-
-                self.config.qlog_sink.emit_recovery_metrics(
-                    self.pto_count,
-                    &mut self.path,
+                self.handle_datagram_decodes(
                     now,
-                    self.orig_rem_cid,
+                    remote,
+                    ecn,
+                    first_decode,
+                    remaining,
+                    &mut data,
+                    &mut |_| Ok(()),
                 );
-
-                if was_anti_amplification_blocked {
-                    // A prior attempt to set the loss detection timer may have failed due to
-                    // anti-amplification, so ensure it's set now. Prevents a handshake deadlock if
-                    // the server's first flight is lost.
-                    self.set_loss_detection_timer(now);
-                }
             }
             NewIdentifiers(ids, now) => {
                 self.local_cid_state.new_cids(&ids, now);
@@ -1629,7 +1716,10 @@ impl Connection {
         }
 
         for frame in info.stream_frames {
-            self.streams.received_ack_of(frame);
+            if let Err(error) = self.streams.received_ack_of(frame) {
+                self.stream_data_error = Some(error);
+                return false;
+            }
         }
         congestion_event_consumed
     }
@@ -2039,7 +2129,7 @@ impl Connection {
         remote: SocketAddr,
         ecn: Option<EcnCodepoint>,
         packet_number: u64,
-        packet: InitialPacket,
+        mut packet: InitialPacket,
         remaining: Option<BytesMut>,
     ) -> Result<(), ConnectionError> {
         let span = trace_span!("first recv");
@@ -2064,7 +2154,7 @@ impl Connection {
             false,
         );
 
-        self.process_decrypted_packet(now, remote, Some(packet_number), packet.into())?;
+        self.process_decrypted_packet(now, remote, Some(packet_number), Packet::from(&mut packet))?;
         if let Some(data) = remaining {
             self.handle_coalesced(now, remote, ecn, data);
         }
@@ -2248,6 +2338,107 @@ impl Connection {
         self.set_loss_detection_timer(now)
     }
 
+    fn handle_datagram_decodes<F>(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        ecn: Option<EcnCodepoint>,
+        first_decode: PartialDecode,
+        remaining: Option<std::ops::Range<usize>>,
+        scratch: &mut [u8],
+        prepare_stream: &mut F,
+    ) where
+        F: FnMut(StreamId) -> Result<(), StreamDataError>,
+    {
+        let mut packet_descriptors = Vec::with_capacity(1 + usize::from(remaining.is_some()));
+        packet_descriptors.push(first_decode);
+        if let Some(range) = remaining {
+            let mut offset = range.start;
+            while offset < scratch.len() {
+                match PartialDecode::new(
+                    &scratch[offset..],
+                    offset,
+                    &FixedLengthConnectionIdParser::new(self.local_cid_state.cid_len()),
+                    &[self.version],
+                    self.endpoint_config.grease_quic_bit,
+                ) {
+                    Ok((partial_decode, rest)) => {
+                        packet_descriptors.push(partial_decode);
+                        offset = rest.map_or(scratch.len(), |next| next.start);
+                    }
+                    Err(_) => {
+                        self.stats.udp_rx.on_packet_drop();
+                        return;
+                    }
+                }
+            }
+        }
+        self.handle_decoded_datagram(
+            now,
+            remote,
+            ecn,
+            &mut packet_descriptors,
+            scratch,
+            prepare_stream,
+        );
+    }
+
+    fn handle_decoded_datagram<F>(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        ecn: Option<EcnCodepoint>,
+        packet_descriptors: &mut Vec<PartialDecode>,
+        scratch: &mut [u8],
+        prepare_stream: &mut F,
+    ) where
+        F: FnMut(StreamId) -> Result<(), StreamDataError>,
+    {
+        // If this packet could initiate a migration and we're a client or a server that
+        // forbids migration, drop the datagram. This could be relaxed to heuristically
+        // permit NAT-rebinding-like migration.
+        if remote != self.path.remote && !self.side.remote_may_migrate() {
+            self.stats.udp_rx.on_packet_drop();
+            return;
+        }
+
+        let was_anti_amplification_blocked = self.path.anti_amplification_blocked(1);
+
+        self.stats.udp_rx.datagrams += 1;
+        self.stats.udp_rx.bytes += scratch.len() as u64;
+
+        for partial_decode in packet_descriptors.drain(..) {
+            let data_len = partial_decode.len();
+            self.handle_decode_with_stream_setup(
+                now,
+                remote,
+                ecn,
+                partial_decode,
+                scratch,
+                prepare_stream,
+            );
+            // The current `path` might have changed inside `handle_decode`,
+            // since the packet could have triggered a migration. Make sure
+            // the data received is accounted for the most recent path by accessing
+            // `path` after `handle_decode`.
+            self.path.total_recvd = self.path.total_recvd.saturating_add(data_len as u64);
+        }
+
+        self.config.qlog_sink.emit_recovery_metrics(
+            self.pto_count,
+            &mut self.path,
+            now,
+            self.orig_rem_cid,
+        );
+
+        if was_anti_amplification_blocked {
+            // A prior attempt to set the loss detection timer may have failed due to
+            // anti-amplification, so ensure it's set now. Prevents a handshake deadlock if
+            // the server's first flight is lost.
+            self.set_loss_detection_timer(now);
+        }
+    }
+
     fn handle_coalesced(
         &mut self,
         now: Instant,
@@ -2255,58 +2446,102 @@ impl Connection {
         ecn: Option<EcnCodepoint>,
         data: BytesMut,
     ) {
-        self.path.total_recvd = self.path.total_recvd.saturating_add(data.len() as u64);
-        let mut remaining = Some(data);
-        while let Some(data) = remaining {
+        let mut data = data;
+        self.handle_coalesced_with_stream_setup(now, remote, ecn, &mut data, 0, &mut |_| Ok(()));
+    }
+
+    fn handle_coalesced_with_stream_setup<F>(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        ecn: Option<EcnCodepoint>,
+        data: &mut [u8],
+        mut offset: usize,
+        prepare_stream: &mut F,
+    ) where
+        F: FnMut(StreamId) -> Result<(), StreamDataError>,
+    {
+        self.path.total_recvd = self
+            .path
+            .total_recvd
+            .saturating_add((data.len() - offset) as u64);
+        while offset < data.len() {
             match PartialDecode::new(
-                data,
+                &data[offset..],
+                offset,
                 &FixedLengthConnectionIdParser::new(self.local_cid_state.cid_len()),
                 &[self.version],
                 self.endpoint_config.grease_quic_bit,
             ) {
                 Ok((partial_decode, rest)) => {
-                    remaining = rest;
-                    self.handle_decode(now, remote, ecn, partial_decode);
+                    offset = rest.map_or(data.len(), |range| range.start);
+                    self.handle_decode_with_stream_setup(
+                        now,
+                        remote,
+                        ecn,
+                        partial_decode,
+                        data,
+                        prepare_stream,
+                    );
                 }
-                Err(e) => {
-                    trace!("malformed header: {}", e);
+                Err(_) => {
+                    self.stats.udp_rx.on_packet_drop();
                     return;
                 }
             }
         }
     }
 
-    fn handle_decode(
+    fn handle_decode_with_stream_setup<F>(
         &mut self,
         now: Instant,
         remote: SocketAddr,
         ecn: Option<EcnCodepoint>,
         partial_decode: PartialDecode,
-    ) {
-        if let Some(decoded) = packet_crypto::unprotect_header(
+        scratch: &mut [u8],
+        prepare_stream: &mut F,
+    ) where
+        F: FnMut(StreamId) -> Result<(), StreamDataError>,
+    {
+        let decoded = packet_crypto::unprotect_header(
             partial_decode,
+            scratch,
             &self.spaces,
             self.zero_rtt_crypto.as_ref(),
             self.peer_params.stateless_reset_token,
-        ) {
-            self.handle_packet(now, remote, ecn, decoded.packet, decoded.stateless_reset);
+        );
+        if decoded.is_none() {
+            self.stats.udp_rx.on_packet_drop();
+        }
+        if let Some(decoded) = decoded {
+            self.handle_packet_with_stream_setup(
+                now,
+                remote,
+                ecn,
+                decoded.packet,
+                decoded.stateless_reset,
+                prepare_stream,
+            );
         }
     }
 
-    fn handle_packet(
+    fn handle_packet_with_stream_setup<F>(
         &mut self,
         now: Instant,
         remote: SocketAddr,
         ecn: Option<EcnCodepoint>,
-        packet: Option<Packet>,
+        packet: Option<Packet<'_>>,
         stateless_reset: bool,
-    ) {
+        prepare_stream: &mut F,
+    ) where
+        F: FnMut(StreamId) -> Result<(), StreamDataError>,
+    {
         self.stats.udp_rx.ios += 1;
         if let Some(ref packet) = packet {
             trace!(
                 "got {:?} packet ({} bytes) from {} using id {}",
                 packet.header.space(),
-                packet.payload.len() + packet.header_data.len(),
+                packet.payload_len + packet.header_data.len(),
                 remote,
                 packet.header.dst_cid(),
             );
@@ -2336,7 +2571,7 @@ impl Connection {
                 Err(e.into())
             }
             Err(None) => {
-                debug!("failed to authenticate packet");
+                self.stats.udp_rx.on_packet_drop();
                 self.authentication_failures += 1;
                 let integrity_limit = self.spaces[self.highest_space]
                     .crypto
@@ -2364,7 +2599,7 @@ impl Connection {
                     return;
                 } else if self.state.is_handshake() && packet.header.is_short() {
                     // TODO: SHOULD buffer these to improve reordering tolerance.
-                    trace!("dropping short packet during handshake");
+                    self.stats.udp_rx.on_packet_drop();
                     return;
                 } else {
                     if let Header::Initial(InitialHeader { ref token, .. }) = packet.header {
@@ -2394,7 +2629,13 @@ impl Connection {
                         );
                     }
 
-                    self.process_decrypted_packet(now, remote, number, packet)
+                    self.process_decrypted_packet_with_stream_setup(
+                        now,
+                        remote,
+                        number,
+                        packet,
+                        prepare_stream,
+                    )
                 }
             }
         };
@@ -2451,21 +2692,47 @@ impl Connection {
         now: Instant,
         remote: SocketAddr,
         number: Option<u64>,
-        packet: Packet,
+        packet: Packet<'_>,
     ) -> Result<(), ConnectionError> {
+        self.process_decrypted_packet_with_stream_setup(
+            now,
+            remote,
+            number,
+            packet,
+            &mut |_| Ok(()),
+        )
+    }
+
+    fn process_decrypted_packet_with_stream_setup<F>(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        number: Option<u64>,
+        packet: Packet<'_>,
+        prepare_stream: &mut F,
+    ) -> Result<(), ConnectionError>
+    where
+        F: FnMut(StreamId) -> Result<(), StreamDataError>,
+    {
         let state = match self.state {
             State::Established => {
                 match packet.header.space() {
-                    SpaceId::Data => self.process_payload(now, remote, number.unwrap(), packet)?,
+                    SpaceId::Data => self.process_payload_with_stream_setup(
+                        now,
+                        remote,
+                        number.unwrap(),
+                        packet,
+                        prepare_stream,
+                    )?,
                     _ if packet.header.has_frames() => self.process_early_payload(now, packet)?,
                     _ => {
-                        trace!("discarding unexpected pre-handshake packet");
+                        self.stats.udp_rx.on_packet_drop();
                     }
                 }
                 return Ok(());
             }
             State::Closed(_) => {
-                for result in frame::Iter::new(packet.payload.freeze())? {
+                for result in frame::Iter::new(&packet.payload[..packet.payload_len])? {
                     let frame = match result {
                         Ok(frame) => frame,
                         Err(err) => {
@@ -2501,14 +2768,14 @@ impl Connection {
                 }
 
                 if self.total_authed_packets > 1
-                            || packet.payload.len() <= 16 // token + 16 byte tag
+                            || packet.payload_len <= 16 // token + 16 byte tag
                             || !self.crypto.is_valid_retry(
                                 &self.rem_cids.active(),
                                 &packet.header_data,
-                                &packet.payload,
+                                &packet.payload[..packet.payload_len],
                             )
                 {
-                    trace!("discarding invalid Retry");
+                    self.stats.udp_rx.on_packet_drop();
                     // - After the client has received and processed an Initial or Retry
                     //   packet from the server, it MUST discard any subsequent Retry
                     //   packets that it receives.
@@ -2553,11 +2820,11 @@ impl Connection {
                 }
                 self.streams.retransmit_all_for_0rtt();
 
-                let token_len = packet.payload.len() - 16;
+                let token_len = packet.payload_len - 16;
                 let ConnectionSide::Client { ref mut token, .. } = self.side else {
                     unreachable!("we already short-circuited if we're server");
                 };
-                *token = packet.payload.freeze().split_to(token_len);
+                *token = Bytes::copy_from_slice(&packet.payload[..token_len]);
                 self.state = State::Handshake(state::Handshake {
                     expected_token: Bytes::new(),
                     rem_cid_set: false,
@@ -2712,12 +2979,12 @@ impl Connection {
     fn process_early_payload(
         &mut self,
         now: Instant,
-        packet: Packet,
+        packet: Packet<'_>,
     ) -> Result<(), TransportError> {
         debug_assert_ne!(packet.header.space(), SpaceId::Data);
-        let payload_len = packet.payload.len();
+        let payload_len = packet.payload_len;
         let mut ack_eliciting = false;
-        for result in frame::Iter::new(packet.payload.freeze())? {
+        for result in frame::Iter::new(&packet.payload[..packet.payload_len])? {
             let frame = result?;
             let span = match frame {
                 Frame::Padding => continue,
@@ -2768,9 +3035,23 @@ impl Connection {
         now: Instant,
         remote: SocketAddr,
         number: u64,
-        packet: Packet,
+        packet: Packet<'_>,
     ) -> Result<(), TransportError> {
-        let payload = packet.payload.freeze();
+        self.process_payload_with_stream_setup(now, remote, number, packet, &mut |_| Ok(()))
+    }
+
+    fn process_payload_with_stream_setup<F>(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        number: u64,
+        packet: Packet<'_>,
+        prepare_stream: &mut F,
+    ) -> Result<(), TransportError>
+    where
+        F: FnMut(StreamId) -> Result<(), StreamDataError>,
+    {
+        let payload = &packet.payload[..packet.payload_len];
         let mut is_probing_packet = true;
         let mut close = None;
         let payload_len = payload.len();
@@ -2828,8 +3109,22 @@ impl Connection {
                     self.read_crypto(SpaceId::Data, &frame, payload_len)?;
                 }
                 Frame::Stream(frame) => {
-                    if self.streams.received(frame, payload_len)?.should_transmit() {
-                        self.spaces[SpaceId::Data].pending.max_data = true;
+                    match self.streams.received_with_stream_setup(
+                        frame,
+                        payload_len,
+                        prepare_stream,
+                    ) {
+                        Ok(should_transmit) if should_transmit.should_transmit() => {
+                            self.spaces[SpaceId::Data].pending.max_data = true;
+                        }
+                        Ok(_) => {}
+                        Err(crate::connection::streams::StreamReceiveError::Data(error)) => {
+                            self.stream_data_error = Some(error);
+                            return Ok(());
+                        }
+                        Err(crate::connection::streams::StreamReceiveError::Transport(error)) => {
+                            return Err(error);
+                        }
                     }
                 }
                 Frame::Ack(ack) => {
@@ -3189,10 +3484,10 @@ impl Connection {
         &mut self,
         now: Instant,
         space_id: SpaceId,
-        buf: &mut Vec<u8>,
+        buf: &mut BytesMut,
         max_size: usize,
         pn: u64,
-    ) -> SentFrames {
+    ) -> Result<SentFrames, StreamDataError> {
         let mut sent = SentFrames::default();
         let space = &mut self.spaces[space_id];
         let is_0rtt = space_id == SpaceId::Data && space.crypto.is_none();
@@ -3439,11 +3734,11 @@ impl Connection {
         if space_id == SpaceId::Data {
             sent.stream_frames =
                 self.streams
-                    .write_stream_frames(buf, max_size, self.config.send_fairness);
+                    .write_stream_frames(buf, max_size, self.config.send_fairness)?;
             self.stats.frame_tx.stream += sent.stream_frames.len() as u64;
         }
 
-        sent
+        Ok(sent)
     }
 
     /// Write pending ACKs into a buffer
@@ -3455,7 +3750,7 @@ impl Connection {
         receiving_ecn: bool,
         sent: &mut SentFrames,
         space: &mut PacketSpace,
-        buf: &mut Vec<u8>,
+        buf: &mut BytesMut,
         stats: &mut ConnectionStats,
     ) {
         debug_assert!(!space.pending_acks.ranges().is_empty());
@@ -3537,7 +3832,7 @@ impl Connection {
     fn decrypt_packet(
         &mut self,
         now: Instant,
-        packet: &mut Packet,
+        packet: &mut Packet<'_>,
     ) -> Result<Option<u64>, Option<TransportError>> {
         let result = packet_crypto::decrypt_packet_body(
             packet,
@@ -3627,8 +3922,13 @@ impl Connection {
             panic!("Packets should never be coalesced in tests");
         }
 
+        let mut scratch = match &event.0 {
+            ConnectionEventInner::Datagram(DatagramConnectionEvent { data, .. }) => data.clone(),
+            _ => return None,
+        };
         let decrypted_header = packet_crypto::unprotect_header(
             first_decode.clone(),
+            &mut scratch,
             &self.spaces,
             self.zero_rtt_crypto.as_ref(),
             self.peer_params.stateless_reset_token,
@@ -3645,7 +3945,7 @@ impl Connection {
         )
         .ok()?;
 
-        Some(packet.payload.to_vec())
+        Some(packet.payload[..packet.payload_len].to_vec())
     }
 
     /// The number of bytes of packets containing retransmittable frames that have not been

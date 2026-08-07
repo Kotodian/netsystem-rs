@@ -4,7 +4,7 @@ use std::{
     ops::{Range, RangeInclusive},
 };
 
-use bytes::{Buf, BufMut, Bytes};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tinyvec::TinyVec;
 
 use crate::{
@@ -140,7 +140,7 @@ const STREAM_TYS: RangeInclusive<u64> = RangeInclusive::new(0x08, 0x0f);
 const DATAGRAM_TYS: RangeInclusive<u64> = RangeInclusive::new(0x30, 0x31);
 
 #[derive(Debug)]
-pub(crate) enum Frame {
+pub(crate) enum Frame<'a> {
     Padding,
     Ping,
     Ack(Ack),
@@ -148,7 +148,7 @@ pub(crate) enum Frame {
     StopSending(StopSending),
     Crypto(Crypto),
     NewToken(NewToken),
-    Stream(Stream),
+    Stream(Stream<'a>),
     MaxData(VarInt),
     MaxStreamData { id: StreamId, offset: u64 },
     MaxStreams { dir: Dir, count: u64 },
@@ -166,7 +166,7 @@ pub(crate) enum Frame {
     HandshakeDone,
 }
 
-impl Frame {
+impl Frame<'_> {
     pub(crate) fn ty(&self) -> FrameType {
         use Frame::*;
         match *self {
@@ -452,14 +452,14 @@ impl EcnCounts {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Stream {
+pub(crate) struct Stream<'a> {
     pub(crate) id: StreamId,
     pub(crate) offset: u64,
     pub(crate) fin: bool,
-    pub(crate) data: Bytes,
+    pub(crate) data: &'a [u8],
 }
 
-impl FrameStruct for Stream {
+impl FrameStruct for Stream<'_> {
     const SIZE_BOUND: usize = 1 + 8 + 8 + 8;
 }
 
@@ -542,13 +542,13 @@ impl NewToken {
     }
 }
 
-pub(crate) struct Iter {
-    bytes: Bytes,
+pub(crate) struct Iter<'a> {
+    bytes: &'a [u8],
     last_ty: Option<FrameType>,
 }
 
-impl Iter {
-    pub(crate) fn new(payload: Bytes) -> Result<Self, TransportError> {
+impl<'a> Iter<'a> {
+    pub(crate) fn new(payload: &'a [u8]) -> Result<Self, TransportError> {
         if payload.is_empty() {
             // "An endpoint MUST treat receipt of a packet containing no frames as a
             // connection error of type PROTOCOL_VIOLATION."
@@ -564,119 +564,125 @@ impl Iter {
         })
     }
 
-    fn take_len(&mut self) -> Result<Bytes, UnexpectedEnd> {
-        let len = self.bytes.get_var()?;
-        if len > self.bytes.remaining() as u64 {
+    fn take_slice(&mut self, len: usize) -> Result<&'a [u8], UnexpectedEnd> {
+        if len > self.bytes.len() {
             return Err(UnexpectedEnd);
         }
-        Ok(self.bytes.split_to(len as usize))
+        let (head, tail) = self.bytes.split_at(len);
+        self.bytes = tail;
+        Ok(head)
     }
 
-    fn try_next(&mut self) -> Result<Frame, IterErr> {
-        let ty = self.bytes.get::<FrameType>()?;
+    fn take_len(&mut self) -> Result<&'a [u8], UnexpectedEnd> {
+        let len = BufExt::get_var(&mut self.bytes)?;
+        self.take_slice(len as usize)
+    }
+
+    fn try_next(&mut self) -> Result<Frame<'a>, IterErr> {
+        let ty = BufExt::get::<FrameType>(&mut self.bytes)?;
         self.last_ty = Some(ty);
         Ok(match ty {
             FrameType::PADDING => Frame::Padding,
             FrameType::RESET_STREAM => Frame::ResetStream(ResetStream {
-                id: self.bytes.get()?,
-                error_code: self.bytes.get()?,
-                final_offset: self.bytes.get()?,
+                id: BufExt::get(&mut self.bytes)?,
+                error_code: BufExt::get(&mut self.bytes)?,
+                final_offset: BufExt::get(&mut self.bytes)?,
             }),
             FrameType::CONNECTION_CLOSE => Frame::Close(Close::Connection(ConnectionClose {
-                error_code: self.bytes.get()?,
+                error_code: BufExt::get(&mut self.bytes)?,
                 frame_type: {
-                    let x = self.bytes.get_var()?;
+                    let x = BufExt::get_var(&mut self.bytes)?;
                     if x == 0 {
                         None
                     } else {
                         Some(FrameType(x))
                     }
                 },
-                reason: self.take_len()?,
+                reason: Bytes::copy_from_slice(self.take_len()?),
             })),
             FrameType::APPLICATION_CLOSE => Frame::Close(Close::Application(ApplicationClose {
-                error_code: self.bytes.get()?,
-                reason: self.take_len()?,
+                error_code: BufExt::get(&mut self.bytes)?,
+                reason: Bytes::copy_from_slice(self.take_len()?),
             })),
-            FrameType::MAX_DATA => Frame::MaxData(self.bytes.get()?),
+            FrameType::MAX_DATA => Frame::MaxData(BufExt::get(&mut self.bytes)?),
             FrameType::MAX_STREAM_DATA => Frame::MaxStreamData {
-                id: self.bytes.get()?,
-                offset: self.bytes.get_var()?,
+                id: BufExt::get(&mut self.bytes)?,
+                offset: BufExt::get_var(&mut self.bytes)?,
             },
             FrameType::MAX_STREAMS_BIDI => Frame::MaxStreams {
                 dir: Dir::Bi,
-                count: self.bytes.get_var()?,
+                count: BufExt::get_var(&mut self.bytes)?,
             },
             FrameType::MAX_STREAMS_UNI => Frame::MaxStreams {
                 dir: Dir::Uni,
-                count: self.bytes.get_var()?,
+                count: BufExt::get_var(&mut self.bytes)?,
             },
             FrameType::PING => Frame::Ping,
             FrameType::DATA_BLOCKED => Frame::DataBlocked {
-                offset: self.bytes.get_var()?,
+                offset: BufExt::get_var(&mut self.bytes)?,
             },
             FrameType::STREAM_DATA_BLOCKED => Frame::StreamDataBlocked {
-                id: self.bytes.get()?,
-                offset: self.bytes.get_var()?,
+                id: BufExt::get(&mut self.bytes)?,
+                offset: BufExt::get_var(&mut self.bytes)?,
             },
             FrameType::STREAMS_BLOCKED_BIDI => Frame::StreamsBlocked {
                 dir: Dir::Bi,
-                limit: self.bytes.get_var()?,
+                limit: BufExt::get_var(&mut self.bytes)?,
             },
             FrameType::STREAMS_BLOCKED_UNI => Frame::StreamsBlocked {
                 dir: Dir::Uni,
-                limit: self.bytes.get_var()?,
+                limit: BufExt::get_var(&mut self.bytes)?,
             },
             FrameType::STOP_SENDING => Frame::StopSending(StopSending {
-                id: self.bytes.get()?,
-                error_code: self.bytes.get()?,
+                id: BufExt::get(&mut self.bytes)?,
+                error_code: BufExt::get(&mut self.bytes)?,
             }),
             FrameType::RETIRE_CONNECTION_ID => Frame::RetireConnectionId {
-                sequence: self.bytes.get_var()?,
+                sequence: BufExt::get_var(&mut self.bytes)?,
             },
             FrameType::ACK | FrameType::ACK_ECN => {
-                let largest = self.bytes.get_var()?;
-                let delay = self.bytes.get_var()?;
-                let extra_blocks = self.bytes.get_var()? as usize;
+                let largest = BufExt::get_var(&mut self.bytes)?;
+                let delay = BufExt::get_var(&mut self.bytes)?;
+                let extra_blocks = BufExt::get_var(&mut self.bytes)? as usize;
                 let n = scan_ack_blocks(&self.bytes, largest, extra_blocks)?;
                 Frame::Ack(Ack {
                     delay,
                     largest,
-                    additional: self.bytes.split_to(n),
+                    additional: Bytes::copy_from_slice(self.take_slice(n)?),
                     ecn: if ty != FrameType::ACK_ECN {
                         None
                     } else {
                         Some(EcnCounts {
-                            ect0: self.bytes.get_var()?,
-                            ect1: self.bytes.get_var()?,
-                            ce: self.bytes.get_var()?,
+                            ect0: BufExt::get_var(&mut self.bytes)?,
+                            ect1: BufExt::get_var(&mut self.bytes)?,
+                            ce: BufExt::get_var(&mut self.bytes)?,
                         })
                     },
                 })
             }
-            FrameType::PATH_CHALLENGE => Frame::PathChallenge(self.bytes.get()?),
-            FrameType::PATH_RESPONSE => Frame::PathResponse(self.bytes.get()?),
+            FrameType::PATH_CHALLENGE => Frame::PathChallenge(BufExt::get(&mut self.bytes)?),
+            FrameType::PATH_RESPONSE => Frame::PathResponse(BufExt::get(&mut self.bytes)?),
             FrameType::NEW_CONNECTION_ID => {
-                let sequence = self.bytes.get_var()?;
-                let retire_prior_to = self.bytes.get_var()?;
+                let sequence = BufExt::get_var(&mut self.bytes)?;
+                let retire_prior_to = BufExt::get_var(&mut self.bytes)?;
                 if retire_prior_to > sequence {
                     return Err(IterErr::Malformed);
                 }
-                let length = self.bytes.get::<u8>()? as usize;
+                let length = BufExt::get::<u8>(&mut self.bytes)? as usize;
                 if length > MAX_CID_SIZE || length == 0 {
                     return Err(IterErr::Malformed);
                 }
-                if length > self.bytes.remaining() {
+                if length > Buf::remaining(&self.bytes) {
                     return Err(IterErr::UnexpectedEnd);
                 }
                 let mut stage = [0; MAX_CID_SIZE];
-                self.bytes.copy_to_slice(&mut stage[0..length]);
+                Buf::copy_to_slice(&mut self.bytes, &mut stage[0..length]);
                 let id = ConnectionId::new(&stage[..length]);
-                if self.bytes.remaining() < 16 {
+                if Buf::remaining(&self.bytes) < 16 {
                     return Err(IterErr::UnexpectedEnd);
                 }
                 let mut reset_token = [0; RESET_TOKEN_SIZE];
-                self.bytes.copy_to_slice(&mut reset_token);
+                Buf::copy_to_slice(&mut self.bytes, &mut reset_token);
                 Frame::NewConnectionId(NewConnectionId {
                     sequence,
                     retire_prior_to,
@@ -685,25 +691,29 @@ impl Iter {
                 })
             }
             FrameType::CRYPTO => Frame::Crypto(Crypto {
-                offset: self.bytes.get_var()?,
-                data: self.take_len()?,
+                offset: BufExt::get_var(&mut self.bytes)?,
+                data: Bytes::copy_from_slice(self.take_len()?),
             }),
             FrameType::NEW_TOKEN => Frame::NewToken(NewToken {
-                token: self.take_len()?,
+                token: Bytes::copy_from_slice(self.take_len()?),
             }),
             FrameType::HANDSHAKE_DONE => Frame::HandshakeDone,
             FrameType::ACK_FREQUENCY => Frame::AckFrequency(AckFrequency {
-                sequence: self.bytes.get()?,
-                ack_eliciting_threshold: self.bytes.get()?,
-                request_max_ack_delay: self.bytes.get()?,
-                reordering_threshold: self.bytes.get()?,
+                sequence: BufExt::get(&mut self.bytes)?,
+                ack_eliciting_threshold: BufExt::get(&mut self.bytes)?,
+                request_max_ack_delay: BufExt::get(&mut self.bytes)?,
+                reordering_threshold: BufExt::get(&mut self.bytes)?,
             }),
             FrameType::IMMEDIATE_ACK => Frame::ImmediateAck,
             _ => {
                 if let Some(s) = ty.stream() {
                     Frame::Stream(Stream {
-                        id: self.bytes.get()?,
-                        offset: if s.off() { self.bytes.get_var()? } else { 0 },
+                        id: BufExt::get(&mut self.bytes)?,
+                        offset: if s.off() {
+                            BufExt::get_var(&mut self.bytes)?
+                        } else {
+                            0
+                        },
                         fin: s.fin(),
                         data: if s.len() {
                             self.take_len()?
@@ -714,9 +724,9 @@ impl Iter {
                 } else if let Some(d) = ty.datagram() {
                     Frame::Datagram(Datagram {
                         data: if d.len() {
-                            self.take_len()?
+                            Bytes::copy_from_slice(self.take_len()?)
                         } else {
-                            self.take_remaining()
+                            Bytes::copy_from_slice(self.take_remaining())
                         },
                     })
                 } else {
@@ -726,22 +736,22 @@ impl Iter {
         })
     }
 
-    fn take_remaining(&mut self) -> Bytes {
-        mem::take(&mut self.bytes)
+    fn take_remaining(&mut self) -> &'a [u8] {
+        mem::replace(&mut self.bytes, &[])
     }
 }
 
-impl Iterator for Iter {
-    type Item = Result<Frame, InvalidFrame>;
+impl<'a> Iterator for Iter<'a> {
+    type Item = Result<Frame<'a>, InvalidFrame>;
     fn next(&mut self) -> Option<Self::Item> {
-        if !self.bytes.has_remaining() {
+        if !Buf::has_remaining(&self.bytes) {
             return None;
         }
         match self.try_next() {
             Ok(x) => Some(Ok(x)),
             Err(e) => {
                 // Corrupt frame, skip it and everything that follows
-                self.bytes.clear();
+                self.bytes = &[];
                 Some(Err(InvalidFrame {
                     ty: self.last_ty,
                     reason: e.reason(),
@@ -907,7 +917,7 @@ impl FrameStruct for Datagram {
 }
 
 impl Datagram {
-    pub(crate) fn encode(&self, length: bool, out: &mut Vec<u8>) {
+    pub(crate) fn encode(&self, length: bool, out: &mut BytesMut) {
         out.write(FrameType(*DATAGRAM_TYS.start() | u64::from(length))); // 1 byte
         if length {
             // Safe to unwrap because we check length sanity before queueing datagrams
@@ -949,8 +959,8 @@ mod test {
     use crate::coding::Codec;
     use assert_matches::assert_matches;
 
-    fn frames(buf: Vec<u8>) -> Vec<Frame> {
-        Iter::new(Bytes::from(buf))
+    fn frames(buf: &[u8]) -> Vec<Frame<'_>> {
+        Iter::new(buf)
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
@@ -970,7 +980,7 @@ mod test {
             ce: 12,
         };
         Ack::encode(42, &ranges, Some(&ECN), &mut buf);
-        let frames = frames(buf);
+        let frames = frames(&buf);
         assert_eq!(frames.len(), 1);
         match frames[0] {
             Frame::Ack(ref ack) => {
@@ -993,7 +1003,7 @@ mod test {
             reordering_threshold: VarInt(1),
         };
         original.encode(&mut buf);
-        let frames = frames(buf);
+        let frames = frames(&buf);
         assert_eq!(frames.len(), 1);
         match &frames[0] {
             Frame::AckFrequency(decoded) => assert_eq!(decoded, &original),
@@ -1005,7 +1015,7 @@ mod test {
     fn immediate_ack_coding() {
         let mut buf = Vec::new();
         FrameType::IMMEDIATE_ACK.encode(&mut buf);
-        let frames = frames(buf);
+        let frames = frames(&buf);
         assert_eq!(frames.len(), 1);
         assert_matches!(&frames[0], Frame::ImmediateAck);
     }

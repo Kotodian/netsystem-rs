@@ -2,7 +2,6 @@ use std::{any::Any, io, str, sync::Arc};
 
 #[cfg(all(feature = "aws-lc-rs", not(feature = "ring")))]
 use aws_lc_rs::aead;
-use bytes::BytesMut;
 #[cfg(feature = "ring")]
 use ring::aead;
 pub use rustls::Error;
@@ -625,14 +624,12 @@ impl crypto::PacketKey for Box<dyn PacketKey> {
         &self,
         packet: u64,
         header: &[u8],
-        payload: &mut BytesMut,
-    ) -> Result<(), CryptoError> {
+        payload: &mut [u8],
+    ) -> Result<usize, CryptoError> {
         let plain = self
-            .decrypt_in_place(packet, header, payload.as_mut())
+            .decrypt_in_place(packet, header, payload)
             .map_err(|_| CryptoError)?;
-        let plain_len = plain.len();
-        payload.truncate(plain_len);
-        Ok(())
+        Ok(plain.len())
     }
 
     fn tag_len(&self) -> usize {

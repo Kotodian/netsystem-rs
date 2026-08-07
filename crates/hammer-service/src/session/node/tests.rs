@@ -11,7 +11,7 @@ use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use super::{SessionQueueNext, SessionQueueNode};
 use crate::session::ApplicationMain;
-use crate::session::error::SessionQueueError;
+use crate::session::error::SessionError;
 use crate::session::runtime::{
     SessionPacketizedTransport, SessionPacketizedTx, SessionTransport, SessionTransportId,
     SessionWorker, TransportInternalTransport, TransportInternalTx, TransportSendFlags,
@@ -664,7 +664,12 @@ impl SessionPacketizedTransport<Index> for FailingPacketizedTransport {
         _: &DataPlaneBuffers,
         _: Instant,
     ) -> RuntimeResult<()> {
-        Err(SessionQueueError::DispatchFailed.into())
+        Err(SessionError::TxOffsetOutOfRange {
+            session_id: crate::session::SessionId::from(Index::new(2, 1)),
+            tx_offset: 1,
+            available: 0,
+        }
+        .into())
     }
 }
 
@@ -932,7 +937,7 @@ fn failed_session_packetized_tx_action_keeps_fifo_and_graph_unchanged() {
 
     assert!(matches!(
         &error,
-        RuntimeError::Subsystem { subsystem, .. } if *subsystem == "session queue"
+        RuntimeError::Subsystem { subsystem, .. } if *subsystem == "session"
     ));
     assert_eq!(
         sessions

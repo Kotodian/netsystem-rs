@@ -82,8 +82,7 @@ mod tests {
         let mut engine = Engine::new(runtime, RuntimeRegistry::new());
         engine.install_current();
         let barrier = engine.worker_barrier();
-        let mut control = ();
-        barrier.sync(&mut control, |_| {
+        barrier.sync(|| {
             register_dst_port(UdpIpVersion::V4, 443, owner)
                 .expect("register destination port through plugin API");
             register_dst_port(UdpIpVersion::V4, 443, owner)

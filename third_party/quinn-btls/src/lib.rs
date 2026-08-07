@@ -199,8 +199,8 @@ mod tests {
 
         let (header, payload_tag) = buf.split_at(4);
         let mut payload_tag = BytesMut::from(payload_tag);
-        packet.decrypt(PN, header, &mut payload_tag).unwrap();
-        let plain = payload_tag.as_ref();
+        let plain_len = packet.decrypt(PN, header, &mut payload_tag).unwrap();
+        let plain = &payload_tag[..plain_len];
         assert_eq!(plain, &PLAIN[4..]);
     }
 
@@ -291,11 +291,11 @@ mod tests {
         // Decrypt the payload.
         let mut header = packet;
         let mut packet = header.split_off(header_len);
-        server
+        let plain_len = server
             .packet
             .remote
             .decrypt(packet_number, &header, &mut packet)
             .unwrap();
-        assert_eq!(packet[..], [0; 16]);
+        assert_eq!(packet[..plain_len], [0; 16]);
     }
 }

@@ -4,13 +4,13 @@ use std::{
     mem,
 };
 
-use bytes::BufMut;
+use bytes::{BufMut, BytesMut};
 use rustc_hash::FxHashMap;
 use tracing::{debug, trace};
 
 use super::{
-    PendingStreamsQueue, Recv, Retransmits, Send, SendState, ShouldTransmit, StreamEvent,
-    StreamHalf, ThinRetransmits,
+    PendingStreamsQueue, Recv, Retransmits, Send, SendState, ShouldTransmit, StreamDataError,
+    StreamDataIo, StreamEvent, StreamHalf, ThinRetransmits,
 };
 use crate::{
     coding::BufMutExt,
@@ -137,6 +137,13 @@ pub struct StreamsState {
 
     /// The shrink to be applied to local_max_data when receive_window is shrunk
     receive_window_shrink_debt: u64,
+    /// Optional Session FIFO payload callbacks installed by Hammer.
+    pub(super) stream_data_io: Option<StreamDataIo>,
+}
+
+pub(crate) enum StreamReceiveError {
+    Transport(TransportError),
+    Data(StreamDataError),
 }
 
 impl StreamsState {
@@ -181,6 +188,7 @@ impl StreamsState {
             initial_max_stream_data_bidi_local: 0u32.into(),
             initial_max_stream_data_bidi_remote: 0u32.into(),
             receive_window_shrink_debt: 0,
+            stream_data_io: None,
         };
 
         for dir in Dir::iter() {
@@ -190,6 +198,20 @@ impl StreamsState {
         }
 
         this
+    }
+
+    pub(crate) fn set_stream_data_io(&mut self, io: Option<StreamDataIo>) {
+        self.stream_data_io = io;
+        for entry in self.send.values_mut() {
+            if let Some(stream) = entry.as_mut() {
+                stream.io = io;
+            }
+        }
+        for entry in self.recv.values_mut() {
+            if let Some(stream) = entry.as_mut() {
+                stream.as_open_recv_mut().map(|recv| recv.io = io);
+            }
+        }
     }
 
     pub(crate) fn set_params(&mut self, params: &TransportParameters) {
@@ -250,22 +272,46 @@ impl StreamsState {
     /// Process incoming stream frame
     ///
     /// If successful, returns whether a `MAX_DATA` frame needs to be transmitted
+    #[cfg(test)]
     pub(crate) fn received(
         &mut self,
-        frame: frame::Stream,
+        frame: frame::Stream<'_>,
         payload_len: usize,
     ) -> Result<ShouldTransmit, TransportError> {
+        let mut no_stream_setup = |_| Ok(());
+        match self.received_with_stream_setup(frame, payload_len, &mut no_stream_setup) {
+            Ok(should_transmit) => Ok(should_transmit),
+            Err(StreamReceiveError::Transport(error)) => Err(error),
+            Err(StreamReceiveError::Data(error)) => {
+                trace!(
+                    ?error,
+                    "dropping STREAM frame without advancing flow control"
+                );
+                Ok(ShouldTransmit(false))
+            }
+        }
+    }
+
+    pub(crate) fn received_with_stream_setup(
+        &mut self,
+        frame: frame::Stream<'_>,
+        payload_len: usize,
+        prepare_stream: &mut impl FnMut(StreamId) -> Result<(), StreamDataError>,
+    ) -> Result<ShouldTransmit, StreamReceiveError> {
         let id = frame.id;
         self.validate_receive_id(id).map_err(|e| {
             debug!("received illegal STREAM frame");
-            e
+            StreamReceiveError::Transport(e)
         })?;
 
-        let rs = match self
-            .recv
-            .get_mut(&id)
-            .map(get_or_insert_recv(self.stream_receive_window))
-        {
+        if self.stream_data_io.is_some() {
+            prepare_stream(id).map_err(StreamReceiveError::Data)?;
+        }
+
+        let rs = match self.recv.get_mut(&id).map(get_or_insert_recv(
+            self.stream_receive_window,
+            self.stream_data_io,
+        )) {
             Some(rs) => rs,
             None => {
                 trace!("dropping frame for closed stream");
@@ -279,7 +325,10 @@ impl StreamsState {
         }
 
         let (new_bytes, closed) =
-            rs.ingest(frame, payload_len, self.data_recvd, self.local_max_data)?;
+            match rs.ingest(frame, payload_len, self.data_recvd, self.local_max_data) {
+                Ok(result) => result,
+                Err(error) => return Err(StreamReceiveError::Data(error)),
+            };
         self.data_recvd = self.data_recvd.saturating_add(new_bytes);
 
         if !rs.stopped {
@@ -315,11 +364,10 @@ impl StreamsState {
             e
         })?;
 
-        let rs = match self
-            .recv
-            .get_mut(&id)
-            .map(get_or_insert_recv(self.stream_receive_window))
-        {
+        let rs = match self.recv.get_mut(&id).map(get_or_insert_recv(
+            self.stream_receive_window,
+            self.stream_data_io,
+        )) {
             Some(stream) => stream,
             None => {
                 trace!("received RESET_STREAM on closed stream");
@@ -337,7 +385,7 @@ impl StreamsState {
             // Redundant reset
             return Ok(ShouldTransmit(false));
         }
-        let bytes_read = rs.assembler.bytes_read();
+        let bytes_read = rs.bytes_read();
         let stopped = rs.stopped;
         let end = rs.end;
         if stopped {
@@ -366,7 +414,7 @@ impl StreamsState {
         let stream = match self
             .send
             .get_mut(&id)
-            .map(get_or_insert_send(max_send_data))
+            .map(get_or_insert_send(max_send_data, self.stream_data_io))
         {
             Some(ss) => ss,
             None => return,
@@ -413,7 +461,7 @@ impl StreamsState {
 
     pub(in crate::connection) fn write_control_frames(
         &mut self,
-        buf: &mut Vec<u8>,
+        buf: &mut BytesMut,
         pending: &mut Retransmits,
         retransmits: &mut ThinRetransmits,
         stats: &mut FrameStats,
@@ -544,10 +592,10 @@ impl StreamsState {
 
     pub(crate) fn write_stream_frames(
         &mut self,
-        buf: &mut Vec<u8>,
+        buf: &mut BytesMut,
         max_buf_size: usize,
         fair: bool,
-    ) -> StreamMetaVec {
+    ) -> Result<StreamMetaVec, StreamDataError> {
         let mut stream_frames = StreamMetaVec::new();
         while buf.len() + frame::Stream::SIZE_BOUND < max_buf_size {
             if max_buf_size
@@ -604,19 +652,23 @@ impl StreamsState {
             trace!(id = %meta.id, off = meta.offsets.start, len = meta.offsets.end - meta.offsets.start, fin = meta.fin, "STREAM");
             meta.encode(encode_length, buf);
 
-            // The range might not be retrievable in a single `get` if it is
-            // stored in noncontiguous fashion. Therefore this loop iterates
-            // until the range is fully copied into the frame.
-            let mut offsets = meta.offsets.clone();
-            while offsets.start != offsets.end {
-                let data = stream.pending.get(offsets.clone());
-                offsets.start += data.len() as u64;
-                buf.put_slice(data);
+            if let Some(io) = self.stream_data_io {
+                super::stream_data_io::append_io_bytes(buf, io, id, meta.offsets.clone())?;
+            } else {
+                // The range might not be retrievable in a single `get` if it is
+                // stored in noncontiguous fashion. Therefore this loop iterates
+                // until the range is fully copied into the frame.
+                let mut offsets = meta.offsets.clone();
+                while offsets.start != offsets.end {
+                    let data = stream.pending.get(offsets.clone());
+                    offsets.start += data.len() as u64;
+                    buf.put_slice(data);
+                }
             }
             stream_frames.push(meta);
         }
 
-        stream_frames
+        Ok(stream_frames)
     }
 
     /// Notify the application that new streams were opened or a stream became readable.
@@ -637,9 +689,12 @@ impl StreamsState {
         }
     }
 
-    pub(crate) fn received_ack_of(&mut self, frame: frame::StreamMeta) {
+    pub(crate) fn received_ack_of(
+        &mut self,
+        frame: frame::StreamMeta,
+    ) -> Result<(), StreamDataError> {
         let mut entry = match self.send.entry(frame.id) {
-            hash_map::Entry::Vacant(_) => return,
+            hash_map::Entry::Vacant(_) => return Ok(()),
             hash_map::Entry::Occupied(e) => e,
         };
 
@@ -650,24 +705,28 @@ impl StreamsState {
                 // this closure should be unreachable. If we did somehow screw that up,
                 // then we might hit an underflow below with unpredictable effects down
                 // the line. Best to short-circuit.
-                return;
+                return Ok(());
             }
         };
 
         if stream.is_reset() {
             // We account for outstanding data on reset streams at time of reset
-            return;
+            return Ok(());
         }
+        stream.io = self.stream_data_io;
         let id = frame.id;
-        self.unacked_data -= frame.offsets.end - frame.offsets.start;
-        if !stream.ack(frame) {
+        let offsets = frame.offsets.clone();
+        let finished = stream.ack(frame)?;
+        self.unacked_data -= offsets.end - offsets.start;
+        if !finished {
             // The stream is unfinished or may still need retransmits
-            return;
+            return Ok(());
         }
 
         entry.remove_entry();
         self.stream_freed(id, StreamHalf::Send);
         self.events.push_back(StreamEvent::Finished { id });
+        Ok(())
     }
 
     pub(crate) fn retransmit(&mut self, frame: frame::StreamMeta) {
@@ -746,7 +805,7 @@ impl StreamsState {
         if let Some(ss) = self
             .send
             .get_mut(&id)
-            .map(get_or_insert_send(max_send_data))
+            .map(get_or_insert_send(max_send_data, self.stream_data_io))
         {
             if ss.increase_max_data(offset) {
                 if write_limit > 0 {
@@ -965,20 +1024,22 @@ impl StreamsState {
 #[inline]
 pub(super) fn get_or_insert_send(
     max_data: VarInt,
+    io: Option<StreamDataIo>,
 ) -> impl Fn(&mut Option<Box<Send>>) -> &mut Box<Send> {
-    move |opt| opt.get_or_insert_with(|| Send::new(max_data))
+    move |opt| opt.get_or_insert_with(|| Send::new(max_data, io))
 }
 
 #[inline]
 pub(super) fn get_or_insert_recv(
     initial_max_data: u64,
+    io: Option<StreamDataIo>,
 ) -> impl FnMut(&mut Option<StreamRecv>) -> &mut Recv {
     move |opt| {
         *opt = opt.take().map(|s| match s {
             StreamRecv::Free(recv) => StreamRecv::Open(recv),
             s => s,
         });
-        opt.get_or_insert_with(|| StreamRecv::Open(Recv::new(initial_max_data)))
+        opt.get_or_insert_with(|| StreamRecv::Open(Recv::new(initial_max_data, io)))
             .as_open_recv_mut()
             .unwrap()
     }
@@ -991,8 +1052,6 @@ mod tests {
         connection::State as ConnState, connection::Streams, ReadableError, RecvStream, SendStream,
         TransportErrorCode, WriteError,
     };
-    use bytes::Bytes;
-
     fn make(side: Side) -> StreamsState {
         StreamsState::new(
             side,
@@ -1002,6 +1061,183 @@ mod tests {
             (1024 * 1024u32).into(),
             (1024 * 1024u32).into(),
         )
+    }
+
+    unsafe fn unreachable_transmit(
+        _: usize,
+        _: StreamId,
+        _: std::ops::Range<u64>,
+        _: &mut BytesMut,
+    ) -> Result<usize, StreamDataError> {
+        unreachable!("transmit is not used by receive error tests")
+    }
+
+    unsafe fn unreachable_ack(_: usize, _: StreamId, _: u64) -> Result<(), StreamDataError> {
+        unreachable!("ack is not used by receive error tests")
+    }
+
+    unsafe fn unreachable_receive(
+        _: usize,
+        _: StreamId,
+        _: u64,
+        _: &[u8],
+    ) -> Result<(), StreamDataError> {
+        unreachable!("receive is not used by send error tests")
+    }
+
+    unsafe fn failing_receive(
+        _: usize,
+        stream: StreamId,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), StreamDataError> {
+        Err(StreamDataError::RxCapacityExceeded {
+            stream,
+            offset,
+            len: data.len() as u64,
+        })
+    }
+
+    unsafe fn failing_ack(_: usize, stream: StreamId, _: u64) -> Result<(), StreamDataError> {
+        Err(StreamDataError::StreamMissing { stream })
+    }
+
+    unsafe fn failing_transmit(
+        _: usize,
+        stream: StreamId,
+        offsets: std::ops::Range<u64>,
+        _: &mut BytesMut,
+    ) -> Result<usize, StreamDataError> {
+        Err(StreamDataError::TxRangeUnavailable {
+            stream,
+            offset: offsets.start,
+            len: offsets.end - offsets.start,
+        })
+    }
+
+    #[test]
+    fn receive_fifo_failure_drops_stream_frame_without_advancing_flow_control() {
+        let mut client = make(Side::Client);
+        let io = StreamDataIo {
+            user_data: 0,
+            transmit: unreachable_transmit,
+            ack: unreachable_ack,
+            receive: failing_receive,
+        };
+        client.set_stream_data_io(Some(io));
+        let id = StreamId::new(Side::Server, Dir::Uni, 0);
+        let data_recvd_before = client.data_recvd;
+
+        let result = client.received(
+            frame::Stream {
+                id,
+                offset: 0,
+                fin: false,
+                data: b"payload",
+            },
+            "payload".len(),
+        );
+
+        assert_eq!(result, Ok(ShouldTransmit(false)));
+        assert_eq!(
+            client.data_recvd, data_recvd_before,
+            "dropped STREAM frame must not consume receive credit"
+        );
+    }
+
+    #[test]
+    fn ack_fifo_failure_leaves_unacked_data_unchanged() {
+        let mut server = make(Side::Server);
+        let io = StreamDataIo {
+            user_data: 0,
+            transmit: unreachable_transmit,
+            ack: failing_ack,
+            receive: unreachable_receive,
+        };
+        server.set_stream_data_io(Some(io));
+        server.set_params(&TransportParameters {
+            initial_max_streams_uni: 1u32.into(),
+            initial_max_data: 1024u32.into(),
+            initial_max_stream_data_uni: 1024u32.into(),
+            ..TransportParameters::default()
+        });
+
+        let (mut pending, state) = (Retransmits::default(), ConnState::Established);
+        let id = Streams {
+            state: &mut server,
+            conn_state: &state,
+        }
+        .open(Dir::Uni)
+        .expect("open send stream");
+        let mut stream = SendStream {
+            id,
+            state: &mut server,
+            pending: &mut pending,
+            conn_state: &state,
+        };
+        stream
+            .sync(b"payload".len() as u64)
+            .expect("sync stream payload");
+        let unacked_before = server.unacked_data;
+
+        let result = server.received_ack_of(frame::StreamMeta {
+            id,
+            offsets: 0..7,
+            fin: false,
+        });
+
+        assert!(matches!(
+            result,
+            Err(StreamDataError::StreamMissing { stream }) if stream == id
+        ));
+        assert_eq!(server.unacked_data, unacked_before);
+    }
+
+    #[test]
+    fn transmit_fifo_failure_returns_typed_stream_error() {
+        let mut server = make(Side::Server);
+        let io = StreamDataIo {
+            user_data: 0,
+            transmit: failing_transmit,
+            ack: unreachable_ack,
+            receive: unreachable_receive,
+        };
+        server.set_stream_data_io(Some(io));
+        server.set_params(&TransportParameters {
+            initial_max_streams_uni: 1u32.into(),
+            initial_max_data: 1024u32.into(),
+            initial_max_stream_data_uni: 1024u32.into(),
+            ..TransportParameters::default()
+        });
+
+        let (mut pending, state) = (Retransmits::default(), ConnState::Established);
+        let id = Streams {
+            state: &mut server,
+            conn_state: &state,
+        }
+        .open(Dir::Uni)
+        .expect("open send stream");
+        let mut stream = SendStream {
+            id,
+            state: &mut server,
+            pending: &mut pending,
+            conn_state: &state,
+        };
+        stream
+            .sync(b"payload".len() as u64)
+            .expect("sync stream payload");
+
+        let mut output = BytesMut::with_capacity(128);
+        let result = server.write_stream_frames(&mut output, 128, true);
+
+        assert!(matches!(
+            result,
+            Err(StreamDataError::TxRangeUnavailable {
+                stream: failed_stream,
+                offset: 0,
+                len: 7,
+            }) if failed_stream == id
+        ));
     }
 
     #[test]
@@ -1024,7 +1260,7 @@ mod tests {
                         id,
                         offset: 0,
                         fin: true,
-                        data: Bytes::from_static(&[0; MESSAGE_SIZE]),
+                        data: &[0; MESSAGE_SIZE],
                     },
                     2048
                 )
@@ -1065,7 +1301,7 @@ mod tests {
                         id,
                         offset: 0,
                         fin: false,
-                        data: Bytes::from_static(&[0; 2048]),
+                        data: &[0; 2048],
                     },
                     2048
                 )
@@ -1128,7 +1364,7 @@ mod tests {
                         id,
                         offset: 4096,
                         fin: false,
-                        data: Bytes::from_static(&[0; 0]),
+                        data: &[0; 0],
                     },
                     0
                 )
@@ -1191,7 +1427,7 @@ mod tests {
                         id,
                         offset: 0,
                         fin: false,
-                        data: Bytes::from_static(&[0; 32]),
+                        data: &[0; 32],
                     },
                     32
                 )
@@ -1223,7 +1459,7 @@ mod tests {
                         id,
                         offset: 32,
                         fin: true,
-                        data: Bytes::from_static(&[0; 16]),
+                        data: &[0; 16],
                     },
                     16
                 )
@@ -1246,7 +1482,7 @@ mod tests {
                         id,
                         offset: 0,
                         fin: false,
-                        data: Bytes::from_static(&[0; 32])
+                        data: &[0; 32]
                     },
                     32
                 )
@@ -1386,8 +1622,8 @@ mod tests {
         high.set_priority(1).unwrap();
         high.write(b"high").unwrap();
 
-        let mut buf = Vec::with_capacity(40);
-        let meta = server.write_stream_frames(&mut buf, 40, true);
+        let mut buf = BytesMut::with_capacity(40);
+        let meta = server.write_stream_frames(&mut buf, 40, true).unwrap();
         assert_eq!(meta[0].id, id_high);
         assert_eq!(meta[1].id, id_mid);
         assert_eq!(meta[2].id, id_low);
@@ -1445,8 +1681,8 @@ mod tests {
         };
         high.set_priority(-1).unwrap();
 
-        let mut buf = Vec::with_capacity(1000);
-        let meta = server.write_stream_frames(&mut buf, 40, true);
+        let mut buf = BytesMut::with_capacity(1000);
+        let meta = server.write_stream_frames(&mut buf, 40, true).unwrap();
         assert_eq!(meta.len(), 1);
         assert_eq!(meta[0].id, id_high);
 
@@ -1454,7 +1690,7 @@ mod tests {
         assert_eq!(server.pending.len(), 2);
 
         // Send the remaining data. The initial mid priority one should go first now
-        let meta = server.write_stream_frames(&mut buf, 1000, true);
+        let meta = server.write_stream_frames(&mut buf, 1000, true).unwrap();
         assert_eq!(meta.len(), 2);
         assert_eq!(meta[0].id, id_mid);
         assert_eq!(meta[1].id, id_high);
@@ -1510,12 +1746,14 @@ mod tests {
             stream_c.write(&[b'c'; 100]).unwrap();
 
             let mut metas = vec![];
-            let mut buf = Vec::with_capacity(1024);
+            let mut buf = BytesMut::with_capacity(1024);
 
             // loop until all the streams are written
             loop {
                 let buf_len = buf.len();
-                let meta = server.write_stream_frames(&mut buf, buf_len + 40, fair);
+                let meta = server
+                    .write_stream_frames(&mut buf, buf_len + 40, fair)
+                    .unwrap();
                 if meta.is_empty() {
                     break;
                 }
@@ -1582,11 +1820,13 @@ mod tests {
         stream_b.write(&[b'b'; 100]).unwrap();
 
         let mut metas = vec![];
-        let mut buf = Vec::with_capacity(1024);
+        let mut buf = BytesMut::with_capacity(1024);
 
         // Write the first chunk of stream_a
         let buf_len = buf.len();
-        let meta = server.write_stream_frames(&mut buf, buf_len + 40, false);
+        let meta = server
+            .write_stream_frames(&mut buf, buf_len + 40, false)
+            .unwrap();
         assert!(!meta.is_empty());
         metas.extend(meta);
 
@@ -1603,7 +1843,9 @@ mod tests {
         // loop until all the streams are written
         loop {
             let buf_len = buf.len();
-            let meta = server.write_stream_frames(&mut buf, buf_len + 40, false);
+            let meta = server
+                .write_stream_frames(&mut buf, buf_len + 40, false)
+                .unwrap();
             if meta.is_empty() {
                 break;
             }
@@ -1633,7 +1875,7 @@ mod tests {
                     id,
                     offset: 0,
                     fin: true,
-                    data: Bytes::from_static(&[0; 32]),
+                    data: &[0; 32],
                 },
                 32,
             )
@@ -1688,7 +1930,7 @@ mod tests {
                     id: StreamId::new(Side::Server, Dir::Uni, 127),
                     offset: 0,
                     fin: true,
-                    data: Bytes::from_static(&[]),
+                    data: &[],
                 },
                 0
             ),
@@ -1702,7 +1944,7 @@ mod tests {
                         id: StreamId::new(Side::Server, Dir::Uni, 128),
                         offset: 0,
                         fin: true,
-                        data: Bytes::from_static(&[]),
+                        data: &[],
                     },
                     0
                 )
@@ -1727,7 +1969,7 @@ mod tests {
                     id: StreamId::new(Side::Server, Dir::Uni, 128),
                     offset: 0,
                     fin: true,
-                    data: Bytes::from_static(&[]),
+                    data: &[],
                 },
                 0
             ),
@@ -1745,7 +1987,7 @@ mod tests {
                     id: StreamId::new(Side::Server, Dir::Uni, 127),
                     offset: 0,
                     fin: true,
-                    data: Bytes::from_static(&[]),
+                    data: &[],
                 },
                 0
             ),
@@ -1759,7 +2001,7 @@ mod tests {
                         id: StreamId::new(Side::Server, Dir::Uni, 128),
                         offset: 0,
                         fin: true,
-                        data: Bytes::from_static(&[]),
+                        data: &[],
                     },
                     0
                 )
@@ -1778,7 +2020,7 @@ mod tests {
                     id: StreamId::new(Side::Server, Dir::Uni, 128),
                     offset: 0,
                     fin: true,
-                    data: Bytes::from_static(&[]),
+                    data: &[],
                 },
                 0
             ),
@@ -1796,7 +2038,7 @@ mod tests {
                     id: StreamId::new(Side::Server, Dir::Uni, 127),
                     offset: 0,
                     fin: true,
-                    data: Bytes::from_static(&[]),
+                    data: &[],
                 },
                 0
             ),
@@ -1823,7 +2065,7 @@ mod tests {
                         id: StreamId::new(Side::Server, Dir::Uni, 128),
                         offset: 0,
                         fin: true,
-                        data: Bytes::from_static(&[]),
+                        data: &[],
                     },
                     0
                 )
@@ -1856,7 +2098,7 @@ mod tests {
                     id: StreamId::new(Side::Server, Dir::Uni, 128),
                     offset: 0,
                     fin: true,
-                    data: Bytes::from_static(&[]),
+                    data: &[],
                 },
                 0
             ),
@@ -2000,11 +2242,14 @@ mod tests {
         assert_eq!(stream.state.poll(), None);
 
         // Ack the data
-        stream.state.received_ack_of(frame::StreamMeta {
-            id: stream_id,
-            offsets: 0..larger_send_window,
-            fin: false,
-        });
+        stream
+            .state
+            .received_ack_of(frame::StreamMeta {
+                id: stream_id,
+                offsets: 0..larger_send_window,
+                fin: false,
+            })
+            .unwrap();
 
         assert_eq!(
             stream.state.poll(),
@@ -2072,20 +2317,26 @@ mod tests {
         assert_eq!(stream.write(&data), Err(WriteError::Blocked));
 
         // Ack some data, assert that writes are still not accepted due to outstanding sends
-        stream.state.received_ack_of(frame::StreamMeta {
-            id: stream_id,
-            offsets: 0..smaller_send_window,
-            fin: false,
-        });
+        stream
+            .state
+            .received_ack_of(frame::StreamMeta {
+                id: stream_id,
+                offsets: 0..smaller_send_window,
+                fin: false,
+            })
+            .unwrap();
 
         assert_eq!(stream.write(&data), Err(WriteError::Blocked));
 
         // Ack the rest of the data
-        stream.state.received_ack_of(frame::StreamMeta {
-            id: stream_id,
-            offsets: smaller_send_window..initial_send_window,
-            fin: false,
-        });
+        stream
+            .state
+            .received_ack_of(frame::StreamMeta {
+                id: stream_id,
+                offsets: smaller_send_window..initial_send_window,
+                fin: false,
+            })
+            .unwrap();
 
         // This should generate a `Writable` event
         assert_eq!(

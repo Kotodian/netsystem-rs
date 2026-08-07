@@ -10,8 +10,6 @@
 
 use std::{any::Any, str, sync::Arc};
 
-use bytes::BytesMut;
-
 use crate::{
     shared::ConnectionId, transport_parameters::TransportParameters, ConnectError, Side,
     TransportError,
@@ -149,12 +147,8 @@ pub trait PacketKey: Send + Sync {
     /// Encrypt the packet payload with the given packet number
     fn encrypt(&self, packet: u64, buf: &mut [u8], header_len: usize);
     /// Decrypt the packet payload with the given packet number
-    fn decrypt(
-        &self,
-        packet: u64,
-        header: &[u8],
-        payload: &mut BytesMut,
-    ) -> Result<(), CryptoError>;
+    fn decrypt(&self, packet: u64, header: &[u8], payload: &mut [u8])
+        -> Result<usize, CryptoError>;
     /// The length of the AEAD tag appended to packets on encryption
     fn tag_len(&self) -> usize;
     /// Maximum number of packets that may be sent using a single key

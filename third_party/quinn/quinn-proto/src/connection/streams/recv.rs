@@ -1,11 +1,15 @@
 use std::collections::hash_map::Entry;
 use std::mem;
 
+use bytes::Bytes;
 use thiserror::Error;
 use tracing::debug;
 
 use super::state::get_or_insert_recv;
-use super::{ClosedStream, Retransmits, ShouldTransmit, StreamId, StreamsState};
+use super::{
+    ClosedStream, Retransmits, ShouldTransmit, StreamDataError, StreamDataIo, StreamId,
+    StreamsState,
+};
 use crate::connection::assembler::{Assembler, Chunk, IllegalOrderedRead};
 use crate::connection::streams::state::StreamRecv;
 use crate::{frame, TransportError, VarInt};
@@ -14,30 +18,39 @@ use crate::{frame, TransportError, VarInt};
 pub(super) struct Recv {
     // NB: when adding or removing fields, remember to update `reinit`.
     state: RecvState,
-    pub(super) assembler: Assembler,
+    pub(super) assembler: Option<Assembler>,
     sent_max_stream_data: u64,
     pub(super) end: u64,
     pub(super) stopped: bool,
+    bytes_read: u64,
+    pub(super) io: Option<StreamDataIo>,
 }
 
 impl Recv {
-    pub(super) fn new(initial_max_data: u64) -> Box<Self> {
+    pub(super) fn new(initial_max_data: u64, io: Option<StreamDataIo>) -> Box<Self> {
         Box::new(Self {
             state: RecvState::default(),
-            assembler: Assembler::new(),
+            assembler: io.is_none().then(Assembler::new),
             sent_max_stream_data: initial_max_data,
             end: 0,
             stopped: false,
+            bytes_read: 0,
+            io,
         })
     }
 
     /// Reset to the initial state
     pub(super) fn reinit(&mut self, initial_max_data: u64) {
+        let io = self.io;
         self.state = RecvState::default();
-        self.assembler.reinit();
+        if let Some(assembler) = self.assembler.as_mut() {
+            assembler.reinit();
+        }
         self.sent_max_stream_data = initial_max_data;
         self.end = 0;
         self.stopped = false;
+        self.bytes_read = 0;
+        self.io = io;
     }
 
     /// Process a STREAM frame
@@ -45,26 +58,56 @@ impl Recv {
     /// Return value is `(number_of_new_bytes_ingested, stream_is_closed)`
     pub(super) fn ingest(
         &mut self,
-        frame: frame::Stream,
+        frame: frame::Stream<'_>,
         payload_len: usize,
         received: u64,
         max_data: u64,
-    ) -> Result<(u64, bool), TransportError> {
+    ) -> Result<(u64, bool), StreamDataError> {
         let end = frame.offset + frame.data.len() as u64;
         if end >= 2u64.pow(62) {
-            return Err(TransportError::FLOW_CONTROL_ERROR(
-                "maximum stream offset too large",
-            ));
+            return Err(StreamDataError::FlowControlViolation {
+                stream: frame.id,
+                offset: frame.offset,
+                len: frame.data.len() as u64,
+            });
         }
 
         if let Some(final_offset) = self.final_offset() {
             if end > final_offset || (frame.fin && end != final_offset) {
                 debug!(end, final_offset, "final size error");
-                return Err(TransportError::FINAL_SIZE_ERROR(""));
+                return Err(StreamDataError::ProtocolViolation {
+                    stream: frame.id,
+                    offset: frame.offset,
+                    len: frame.data.len() as u64,
+                });
             }
         }
 
-        let new_bytes = self.credit_consumed_by(end, received, max_data)?;
+        let new_bytes = self
+            .credit_consumed_by(end, received, max_data)
+            .map_err(|_| StreamDataError::FlowControlViolation {
+                stream: frame.id,
+                offset: frame.offset,
+                len: frame.data.len() as u64,
+            })?;
+
+        // Deliver directly to the Session FIFO before advancing Quinn receive
+        // state. A callback error leaves Quinn ranges and flow-control state
+        // unchanged, matching VPP's "drop, fifo full" path.
+        if !self.stopped {
+            if let Some(io) = self.io {
+                unsafe { io.receive(frame.id, frame.offset, frame.data)? };
+            } else {
+                self.assembler
+                    .as_mut()
+                    .expect("in-memory receive assembler")
+                    .insert(
+                        frame.offset,
+                        Bytes::copy_from_slice(frame.data),
+                        payload_len,
+                    );
+            }
+        }
 
         // Stopped streams don't need to wait for the actual data, they just need to know
         // how much there was.
@@ -75,13 +118,30 @@ impl Recv {
         }
 
         self.end = self.end.max(end);
-        // Don't bother storing data or releasing stream-level flow control credit if the stream's
-        // already stopped
-        if !self.stopped {
-            self.assembler.insert(frame.offset, frame.data, payload_len);
-        }
-
         Ok((new_bytes, frame.fin && self.stopped))
+    }
+
+    #[inline]
+    pub(super) fn bytes_read(&self) -> u64 {
+        if self.io.is_some() {
+            self.bytes_read
+        } else {
+            self.assembler
+                .as_ref()
+                .expect("in-memory receive assembler")
+                .bytes_read()
+        }
+    }
+
+    #[inline]
+    pub(super) fn set_bytes_read(&mut self, bytes_read: u64) {
+        assert!(
+            bytes_read <= self.end,
+            "QUIC stream consumed offset {} exceeds receive end {}",
+            bytes_read,
+            self.end
+        );
+        self.bytes_read = self.bytes_read.max(bytes_read);
     }
 
     pub(super) fn stop(&mut self) -> Result<(u64, ShouldTransmit), ClosedStream> {
@@ -90,9 +150,11 @@ impl Recv {
         }
 
         self.stopped = true;
-        self.assembler.clear();
+        if let Some(assembler) = self.assembler.as_mut() {
+            assembler.clear();
+        }
         // Issue flow control credit for unread data
-        let read_credits = self.end - self.assembler.bytes_read();
+        let read_credits = self.end - self.bytes_read();
         // This may send a spurious STOP_SENDING if we've already received all data, but it's a bit
         // fiddly to distinguish that from the case where we've received a FIN but are missing some
         // data that the peer might still be trying to retransmit, in which case a STOP_SENDING is
@@ -108,7 +170,7 @@ impl Recv {
     /// `false` the new window should only be transmitted if a previous transmission
     /// had failed.
     pub(super) fn max_stream_data(&mut self, stream_receive_window: u64) -> (u64, ShouldTransmit) {
-        let max_stream_data = self.assembler.bytes_read() + stream_receive_window;
+        let max_stream_data = self.bytes_read() + stream_receive_window;
 
         // Only announce a window update if it's significant enough
         // to make it worthwhile sending a MAX_STREAM_DATA frame.
@@ -194,7 +256,9 @@ impl Recv {
         // issue flow control credit redundant to that already issued. We could instead special-case
         // reset streams during read, but it's unclear if there's any benefit to retaining data for
         // reset streams.
-        self.assembler.clear();
+        if let Some(assembler) = self.assembler.as_mut() {
+            assembler.clear();
+        }
         Ok(true)
     }
 
@@ -263,13 +327,20 @@ impl<'a> Chunks<'a> {
             Entry::Vacant(_) => return Err(ReadableError::ClosedStream),
         };
 
-        let mut recv =
-            match get_or_insert_recv(streams.stream_receive_window)(entry.get_mut()).stopped {
-                true => return Err(ReadableError::ClosedStream),
-                false => entry.remove().unwrap().into_inner(), // this can't fail due to the previous get_or_insert_with
-            };
+        let mut recv = match get_or_insert_recv(
+            streams.stream_receive_window,
+            streams.stream_data_io,
+        )(entry.get_mut())
+        .stopped
+        {
+            true => return Err(ReadableError::ClosedStream),
+            false => entry.remove().unwrap().into_inner(), // this can't fail due to the previous get_or_insert_with
+        };
 
-        recv.assembler.ensure_ordering(ordered)?;
+        recv.assembler
+            .as_mut()
+            .ok_or(ReadableError::IllegalOrderedRead)?
+            .ensure_ordering(ordered)?;
         Ok(Self {
             id,
             ordered,
@@ -295,9 +366,11 @@ impl<'a> Chunks<'a> {
             ChunksState::Finalized => panic!("must not call next() after finalize()"),
         };
 
-        if let Some(chunk) = rs.assembler.read(max_length, self.ordered) {
-            self.read += chunk.bytes.len() as u64;
-            return Ok(Some(chunk));
+        if let Some(assembler) = rs.assembler.as_mut() {
+            if let Some(chunk) = assembler.read(max_length, self.ordered) {
+                self.read += chunk.bytes.len() as u64;
+                return Ok(Some(chunk));
+            }
         }
 
         match rs.state {
@@ -313,7 +386,7 @@ impl<'a> Chunks<'a> {
                 Err(ReadError::Reset(error_code))
             }
             RecvState::Recv { size } => {
-                if size == Some(rs.end) && rs.assembler.bytes_read() == rs.end {
+                if size == Some(rs.end) && rs.bytes_read() == rs.end {
                     let state = mem::replace(&mut self.state, ChunksState::Finished);
                     // At this point if we have `rs` self.state must be `ChunksState::Readable`
                     let recv = match state {
@@ -442,18 +515,44 @@ impl Default for RecvState {
 
 #[cfg(test)]
 mod tests {
-    use bytes::Bytes;
+    use bytes::BytesMut;
 
     use crate::{Dir, Side};
 
     use super::*;
+
+    unsafe fn unreachable_transmit(
+        _: usize,
+        _: StreamId,
+        _: std::ops::Range<u64>,
+        _: &mut BytesMut,
+    ) -> Result<usize, StreamDataError> {
+        unreachable!("transmit is not used by receive tests")
+    }
+
+    unsafe fn unreachable_ack(_: usize, _: StreamId, _: u64) -> Result<(), StreamDataError> {
+        unreachable!("ack is not used by receive tests")
+    }
+
+    unsafe fn failing_receive(
+        _: usize,
+        stream: StreamId,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), StreamDataError> {
+        Err(StreamDataError::RxCapacityExceeded {
+            stream,
+            offset,
+            len: data.len() as u64,
+        })
+    }
 
     #[test]
     fn reordered_frames_while_stopped() {
         const INITIAL_BYTES: u64 = 3;
         const INITIAL_OFFSET: u64 = 3;
         const RECV_WINDOW: u64 = 8;
-        let mut s = Recv::new(RECV_WINDOW);
+        let mut s = Recv::new(RECV_WINDOW, None);
         let mut data_recvd = 0;
         // Receive bytes 3..6
         let (new_bytes, is_closed) = s
@@ -462,7 +561,7 @@ mod tests {
                     id: StreamId::new(Side::Client, Dir::Uni, 0),
                     offset: INITIAL_OFFSET,
                     fin: false,
-                    data: Bytes::from_static(&[0; INITIAL_BYTES as usize]),
+                    data: &[0; INITIAL_BYTES as usize],
                 },
                 123,
                 data_recvd,
@@ -495,7 +594,7 @@ mod tests {
                     id: StreamId::new(Side::Client, Dir::Uni, 0),
                     offset: RECV_WINDOW - 1,
                     fin: false,
-                    data: Bytes::from_static(&[0; 1]),
+                    data: &[0; 1],
                 },
                 123,
                 data_recvd,
@@ -520,7 +619,7 @@ mod tests {
                     id: StreamId::new(Side::Client, Dir::Uni, 0),
                     offset: 0,
                     fin: false,
-                    data: Bytes::from_static(&[0; INITIAL_OFFSET as usize]),
+                    data: &[0; INITIAL_OFFSET as usize],
                 },
                 123,
                 data_recvd,
@@ -539,5 +638,53 @@ mod tests {
             max_stream_data, RECV_WINDOW,
             "stream flow control credit isn't issued after stop"
         );
+    }
+
+    #[test]
+    fn session_fifo_mode_does_not_own_receive_assembler() {
+        const RECV_WINDOW: u64 = 8;
+        let io = StreamDataIo {
+            user_data: 0,
+            transmit: unreachable_transmit,
+            ack: unreachable_ack,
+            receive: failing_receive,
+        };
+        let recv = Recv::new(RECV_WINDOW, Some(io));
+        assert!(recv.assembler.is_none());
+    }
+
+    #[test]
+    fn receive_callback_failure_leaves_recv_state_unchanged() {
+        const RECV_WINDOW: u64 = 8;
+        let io = StreamDataIo {
+            user_data: 0,
+            transmit: unreachable_transmit,
+            ack: unreachable_ack,
+            receive: failing_receive,
+        };
+        let mut recv = Recv::new(RECV_WINDOW, Some(io));
+        let stream = StreamId::new(Side::Client, Dir::Uni, 0);
+        let result = recv.ingest(
+            frame::Stream {
+                id: stream,
+                offset: 0,
+                fin: false,
+                data: b"payload",
+            },
+            "payload".len(),
+            0,
+            RECV_WINDOW,
+        );
+
+        assert!(matches!(
+            result,
+            Err(StreamDataError::RxCapacityExceeded {
+                stream: failed_stream,
+                offset: 0,
+                len: 7,
+            }) if failed_stream == stream
+        ));
+        assert_eq!(recv.end, 0);
+        assert_eq!(recv.bytes_read(), 0);
     }
 }

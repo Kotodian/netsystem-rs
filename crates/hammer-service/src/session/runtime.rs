@@ -148,7 +148,7 @@ struct SessionEntry<Index> {
     owner_application: Option<ApplicationId>,
     app: Option<SessionAppId>,
     app_session: SessionAppContext,
-    app_config: Option<u64>,
+    app_opaque: Option<u64>,
     server_name: Option<String>,
     accepted: bool,
     lower_session: Option<SessionId>,
@@ -173,7 +173,7 @@ impl<Index: Copy + Eq> SessionEntry<Index> {
             owner_application: None,
             app: None,
             app_session: 0,
-            app_config: None,
+            app_opaque: None,
             server_name: None,
             accepted: false,
             lower_session: None,
@@ -191,7 +191,7 @@ impl<Index: Copy + Eq> SessionEntry<Index> {
             owner_application: None,
             app: None,
             app_session: 0,
-            app_config: None,
+            app_opaque: None,
             server_name: None,
             accepted: false,
             lower_session: None,
@@ -305,7 +305,7 @@ fn session_listener_index(listener: SessionListenerId) -> PoolIndex {
 }
 
 impl SessionMain {
-    pub(super) fn applications(&self) -> &ApplicationMain {
+    pub fn applications(&self) -> &ApplicationMain {
         &self.applications
     }
 
@@ -337,9 +337,11 @@ impl SessionMain {
         endpoint: SessionListenEndpoint,
     ) -> RuntimeResult<SessionListenerId> {
         self.with_control_barrier(|| {
-            let application = self
+            let (application, opaque) = self
                 .applications
-                .with_listener(application_listener, |listener| listener.application())
+                .with_listener(application_listener, |listener| {
+                    (listener.application(), listener.opaque())
+                })
                 .map_err(RuntimeError::from)?;
             let listener = self.with_listeners_mut(|listeners| {
                 listeners
@@ -364,7 +366,7 @@ impl SessionMain {
                 }
                 .into());
             };
-            if let Err(error) = start_listen(listener, endpoint) {
+            if let Err(error) = start_listen(listener, application, opaque, endpoint) {
                 self.with_listeners_mut(|listeners| {
                     listeners
                         .remove(session_listener_index(listener))
@@ -396,22 +398,22 @@ impl SessionMain {
         })?
     }
 
-    fn with_control_barrier<R>(&self, operation: impl FnOnce() -> R) -> RuntimeResult<R> {
+    pub(super) fn with_control_barrier<R>(
+        &self,
+        operation: impl FnOnce() -> R,
+    ) -> RuntimeResult<R> {
         if thread::current().id() != self.owner {
             return Err(SessionError::ListenerControlWrongThread.into());
         }
         match Engine::with_current(|engine| engine.worker_barrier()) {
-            Some(barrier) => {
-                let mut control = ();
-                Ok(barrier.sync(&mut control, |_| operation()))
-            }
+            Some(barrier) if barrier.is_pending() => Ok(operation()),
+            Some(barrier) => Ok(barrier.sync(operation)),
             None => Ok(operation()),
         }
     }
 
     pub fn connect(
         &self,
-        connection: ApplicationConnectionId,
         transport: SessionTransportRegistration,
         endpoint: SessionConnectEndpoint,
     ) -> RuntimeResult<SessionConnectionId> {
@@ -421,9 +423,9 @@ impl SessionMain {
             }
             .into());
         };
-        let session_connection = SessionConnectionId::from_raw(connection.raw());
-        connect(session_connection, endpoint)?;
-        Ok(session_connection)
+        let connection = endpoint.connection;
+        connect(endpoint)?;
+        Ok(connection)
     }
 
     /// Installs one worker-local Session App callback table by registered name.
@@ -468,7 +470,8 @@ impl SessionMain {
         let listeners = unsafe { &mut *self.listeners.get() };
         let barrier = Engine::with_current(|engine| engine.worker_barrier());
         Ok(match barrier {
-            Some(barrier) => barrier.sync(listeners, operation),
+            Some(barrier) if barrier.is_pending() => operation(listeners),
+            Some(barrier) => barrier.sync(|| operation(listeners)),
             None => operation(listeners),
         })
     }
@@ -1189,7 +1192,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     }
 
     #[inline]
-    pub fn session_app_facts(
+    pub fn session_app_endpoint(
         &self,
         session_id: SessionId,
     ) -> Option<(
@@ -1202,7 +1205,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         Some((
             entry.owner_application?,
             entry.app,
-            entry.app_config,
+            entry.app_opaque,
             entry.server_name.as_deref(),
         ))
     }
@@ -1213,8 +1216,8 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         lower: SessionId,
         context: SessionAppContext,
     ) -> RuntimeResult<SessionId> {
-        let (application, app, _config, _server_name) = self
-            .session_app_facts(lower)
+        let (application, app, _opaque, _server_name) = self
+            .session_app_endpoint(lower)
             .ok_or(SessionError::SessionMissing { session_id: lower })?;
         let Some(app) = app else {
             return Err(SessionError::SessionMissing { session_id: lower }.into());
@@ -1504,12 +1507,42 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
                     application_listener.raw(),
                     listener.application(),
                     listener.app(),
-                    listener.config(),
+                    listener.opaque(),
                     None,
                     true,
                 )
             })
             .map_err(RuntimeError::from)?
+    }
+
+    /// Constructs one transport Session with explicit Session-owned
+    /// Application facts.
+    ///
+    /// This is the generic creation seam used by protocols that publish a
+    /// child Session under a connection or listener without exposing their
+    /// private parent relation to Session Runtime. The transport remains the
+    /// sole owner of the relationship encoded in `index`.
+    pub fn construct_transport_session(
+        &mut self,
+        transport: SessionTransportId,
+        index: Index,
+        allocation_owner: u64,
+        application: ApplicationId,
+        app: Option<SessionAppId>,
+        opaque: Option<u64>,
+        server_name: Option<&str>,
+        accepted: bool,
+    ) -> RuntimeResult<SessionId> {
+        self.construct_stream_sessions(
+            transport,
+            index,
+            allocation_owner,
+            application,
+            app,
+            opaque,
+            server_name,
+            accepted,
+        )
     }
 
     pub fn stream_connect(
@@ -1528,7 +1561,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
                     application_connection.raw(),
                     connection.application(),
                     connection.app(),
-                    connection.config(),
+                    connection.opaque(),
                     connection.server_name(),
                     false,
                 )
@@ -1548,7 +1581,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         allocation_owner: u64,
         application: ApplicationId,
         app: Option<SessionAppId>,
-        config: Option<u64>,
+        opaque: Option<u64>,
         server_name: Option<&str>,
         accepted: bool,
     ) -> RuntimeResult<SessionId> {
@@ -1565,7 +1598,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             index,
             application,
             app,
-            config,
+            opaque,
             server_name,
             accepted,
         )
@@ -1577,7 +1610,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         index: Index,
         application: ApplicationId,
         app: SessionAppId,
-        config: Option<u64>,
+        opaque: Option<u64>,
         server_name: Option<&str>,
         accepted: bool,
     ) -> RuntimeResult<SessionId> {
@@ -1591,7 +1624,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             .expect("new Session App transport Session remains installed during construction");
         entry.owner_application = Some(application);
         entry.app = Some(app);
-        entry.app_config = config;
+        entry.app_opaque = opaque;
         entry.server_name = server_name.map(str::to_owned);
         entry.accepted = accepted;
         self.finish_transport_creation(session_id, index);
@@ -3242,15 +3275,22 @@ mod tests {
     static SESSION_APP_RECORDED: AtomicU64 = AtomicU64::new(0);
     static SESSION_LISTEN_BARRIER_SEEN: AtomicBool = AtomicBool::new(false);
     static SESSION_UNLISTEN_BARRIER_SEEN: AtomicBool = AtomicBool::new(false);
+    static SESSION_LISTEN_APPLICATION: AtomicU64 = AtomicU64::new(0);
+    static SESSION_LISTEN_OPAQUE: AtomicU64 = AtomicU64::new(0);
+    static SESSION_LISTEN_ATTEMPTED: AtomicU64 = AtomicU64::new(0);
 
     fn record_listen_barrier(
         _: hammer_runtime::SessionListenerId,
+        application: hammer_runtime::app::ApplicationId,
+        opaque: Option<u64>,
         _: hammer_runtime::SessionListenEndpoint,
     ) -> RuntimeResult<()> {
         SESSION_LISTEN_BARRIER_SEEN.store(
             Engine::with_current(|engine| engine.worker_barrier().is_pending()).unwrap_or(false),
             Ordering::SeqCst,
         );
+        SESSION_LISTEN_APPLICATION.store(application.raw(), Ordering::SeqCst);
+        SESSION_LISTEN_OPAQUE.store(opaque.unwrap_or_default(), Ordering::SeqCst);
         Ok(())
     }
 
@@ -3260,6 +3300,24 @@ mod tests {
             Ordering::SeqCst,
         );
         Ok(())
+    }
+
+    fn fail_listen(
+        listener: hammer_runtime::SessionListenerId,
+        _: hammer_runtime::app::ApplicationId,
+        _: Option<u64>,
+        _: hammer_runtime::SessionListenEndpoint,
+    ) -> RuntimeResult<()> {
+        SESSION_LISTEN_ATTEMPTED.store(listener.raw(), Ordering::SeqCst);
+        Err(RuntimeError::config_validation(
+            "test transport listen failure",
+        ))
+    }
+
+    fn fail_unlisten(_: hammer_runtime::SessionListenerId) -> RuntimeResult<()> {
+        Err(RuntimeError::config_validation(
+            "test transport unlisten failure",
+        ))
     }
 
     fn record_session_app_rx(
@@ -3322,10 +3380,13 @@ mod tests {
         engine.install_current();
         let applications = ApplicationMain::new(1);
         let application = applications.attach()?;
-        let application_listener = applications.register_listener(application, None, None)?;
+        let application_listener = applications.register_listener(application, None, Some(0x55))?;
+        applications.update_listener_opaque(application, application_listener, Some(0x66))?;
         let main = Arc::new(SessionMain::new(1, Arc::clone(&applications)));
 
         SESSION_LISTEN_BARRIER_SEEN.store(false, Ordering::SeqCst);
+        SESSION_LISTEN_APPLICATION.store(0, Ordering::SeqCst);
+        SESSION_LISTEN_OPAQUE.store(0, Ordering::SeqCst);
         let listener = main.listen(
             application_listener,
             hammer_runtime::SessionTransportRegistration::new(
@@ -3340,10 +3401,110 @@ mod tests {
             ),
         )?;
         assert!(SESSION_LISTEN_BARRIER_SEEN.load(Ordering::SeqCst));
+        assert_eq!(
+            SESSION_LISTEN_APPLICATION.load(Ordering::SeqCst),
+            application.raw()
+        );
+        assert_eq!(SESSION_LISTEN_OPAQUE.load(Ordering::SeqCst), 0x66);
 
         SESSION_UNLISTEN_BARRIER_SEEN.store(false, Ordering::SeqCst);
         main.unlisten(listener)?;
         assert!(SESSION_UNLISTEN_BARRIER_SEEN.load(Ordering::SeqCst));
+        assert!(main.with_listener(listener, |_| ()).is_err());
+        assert!(
+            applications
+                .with_listener(application_listener, |entry| entry.opaque())
+                .is_ok()
+        );
+
+        applications.remove_listener(application, application_listener)?;
+        assert!(
+            applications
+                .with_listener(application_listener, |_| ())
+                .is_err()
+        );
+
+        Engine::uninstall_current();
+        Ok(())
+    }
+
+    #[test]
+    fn session_listen_failure_removes_only_session_listener() -> Result<(), SessionTestFailure> {
+        let mut engine = Engine::new(
+            DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()),
+            RuntimeRegistry::new(),
+        );
+        engine.install_current();
+        let applications = ApplicationMain::new(1);
+        let application = applications.attach()?;
+        let application_listener = applications.register_listener(application, None, Some(0x77))?;
+        let main = Arc::new(SessionMain::new(1, Arc::clone(&applications)));
+
+        SESSION_LISTEN_ATTEMPTED.store(0, Ordering::SeqCst);
+        assert!(
+            main.listen(
+                application_listener,
+                hammer_runtime::SessionTransportRegistration::new(
+                    "listen-failure",
+                    Some(fail_listen),
+                    None,
+                    None,
+                ),
+                hammer_runtime::SessionListenEndpoint::new(
+                    "127.0.0.1:0".parse().expect("test listen endpoint"),
+                    DataWorkerId::new(0),
+                ),
+            )
+            .is_err()
+        );
+
+        let attempted = hammer_runtime::SessionListenerId::from_raw(
+            SESSION_LISTEN_ATTEMPTED.load(Ordering::SeqCst),
+        );
+        assert_ne!(attempted.raw(), 0);
+        assert!(main.with_listener(attempted, |_| ()).is_err());
+        assert_eq!(
+            applications.with_listener(application_listener, |entry| entry.opaque())?,
+            Some(0x77)
+        );
+
+        applications.remove_listener(application, application_listener)?;
+        Engine::uninstall_current();
+        Ok(())
+    }
+
+    #[test]
+    fn session_unlisten_failure_keeps_session_and_application_listeners()
+    -> Result<(), SessionTestFailure> {
+        let mut engine = Engine::new(
+            DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()),
+            RuntimeRegistry::new(),
+        );
+        engine.install_current();
+        let applications = ApplicationMain::new(1);
+        let application = applications.attach()?;
+        let application_listener = applications.register_listener(application, None, Some(0x88))?;
+        let main = Arc::new(SessionMain::new(1, Arc::clone(&applications)));
+        let listener = main.listen(
+            application_listener,
+            hammer_runtime::SessionTransportRegistration::new(
+                "unlisten-failure",
+                Some(record_listen_barrier),
+                Some(fail_unlisten),
+                None,
+            ),
+            hammer_runtime::SessionListenEndpoint::new(
+                "127.0.0.1:0".parse().expect("test listen endpoint"),
+                DataWorkerId::new(0),
+            ),
+        )?;
+
+        assert!(main.unlisten(listener).is_err());
+        assert!(main.with_listener(listener, |_| ()).is_ok());
+        assert_eq!(
+            applications.with_listener(application_listener, |entry| entry.opaque())?,
+            Some(0x88)
+        );
 
         Engine::uninstall_current();
         Ok(())

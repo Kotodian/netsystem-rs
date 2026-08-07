@@ -92,7 +92,7 @@ fn attach_protocol_session(
             application_listener,
             hammer_runtime::SessionTransportRegistration::new(
                 "test-session",
-                Some(|_, _| Ok(())),
+                Some(|_, _, _, _| Ok(())),
                 Some(|_| Ok(())),
                 None,
             ),
@@ -300,7 +300,7 @@ fn rollback_discards_unpublished_session_without_close_notification() {
             application_listener,
             hammer_runtime::SessionTransportRegistration::new(
                 "test-session",
-                Some(|_, _| Ok(())),
+                Some(|_, _, _, _| Ok(())),
                 Some(|_| Ok(())),
                 None,
             ),
@@ -360,7 +360,7 @@ fn active_open_commits_session_after_full_connection_publication() {
             application_listener,
             hammer_runtime::SessionTransportRegistration::new(
                 "test-session",
-                Some(|_, _| Ok(())),
+                Some(|_, _, _, _| Ok(())),
                 Some(|_| Ok(())),
                 None,
             ),

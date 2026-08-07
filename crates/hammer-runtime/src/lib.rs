@@ -87,8 +87,7 @@ pub use process::{
 pub use registry::RuntimeRegistry;
 pub use session::{
     SessionConnectEndpoint, SessionConnectionId, SessionListenEndpoint, SessionListenerId,
-    SessionTransportConnect, SessionTransportRegistration, SessionTransportStartListen,
-    SessionTransportStopListen,
+    SessionTransportRegistration, SessionTransportStartListen, SessionTransportStopListen,
 };
 pub use trace::{
     PacketTrace, TraceControlHandle, TraceControlPlane, TraceEntry, TraceFormatter,
@@ -101,6 +100,6 @@ pub mod spawn;
 pub mod start_workers;
 mod worker_thread;
 
-pub use barrier::{Barrier, WorkerBarrier};
+pub use barrier::WorkerBarrier;
 pub use control_thread::{ControlThread, ControlThreadHandle, ControlTimerHandle};
 pub use spawn::with_data_plane_runtime;

@@ -28,13 +28,13 @@ struct ApplicationState {
 pub(crate) struct ApplicationListener {
     application: ApplicationId,
     app: Option<SessionAppId>,
-    config: Option<u64>,
+    opaque: Option<u64>,
 }
 
 pub(crate) struct ApplicationConnection {
     application: ApplicationId,
     app: Option<SessionAppId>,
-    config: Option<u64>,
+    opaque: Option<u64>,
     server_name: Option<String>,
     completion: AtomicU8,
 }
@@ -51,8 +51,8 @@ impl ApplicationListener {
     }
 
     #[inline]
-    pub(crate) const fn config(&self) -> Option<u64> {
-        self.config
+    pub(crate) const fn opaque(&self) -> Option<u64> {
+        self.opaque
     }
 }
 
@@ -68,8 +68,8 @@ impl ApplicationConnection {
     }
 
     #[inline]
-    pub(crate) const fn config(&self) -> Option<u64> {
-        self.config
+    pub(crate) const fn opaque(&self) -> Option<u64> {
+        self.opaque
     }
 
     #[inline]
@@ -450,14 +450,14 @@ impl ApplicationMain {
         &self,
         application: ApplicationId,
         app: Option<SessionAppId>,
-        config: Option<u64>,
+        opaque: Option<u64>,
     ) -> Result<ApplicationListenerId, ApplicationError> {
         self.ensure_active(application)?;
         self.validate_session_app(app)?;
         let listener = ApplicationListener {
             application,
             app,
-            config,
+            opaque,
         };
         self.with_state_mut(|state| {
             state
@@ -475,14 +475,14 @@ impl ApplicationMain {
         application: ApplicationId,
         server_name: Option<String>,
         app: Option<SessionAppId>,
-        config: Option<u64>,
+        opaque: Option<u64>,
     ) -> Result<ApplicationConnectionId, ApplicationError> {
         self.ensure_active(application)?;
         self.validate_session_app(app)?;
         let connection = ApplicationConnection {
             application,
             app,
-            config,
+            opaque,
             server_name,
             completion: AtomicU8::new(CONNECTION_PENDING),
         };
@@ -533,7 +533,7 @@ impl ApplicationMain {
         Ok(())
     }
 
-    pub(crate) fn remove_connection(
+    pub fn remove_connection(
         &self,
         application: ApplicationId,
         connection: ApplicationConnectionId,
@@ -558,7 +558,7 @@ impl ApplicationMain {
         })?
     }
 
-    pub(crate) fn reclaim_connection(
+    pub fn reclaim_connection(
         &self,
         application: ApplicationId,
         connection: ApplicationConnectionId,
@@ -624,6 +624,33 @@ impl ApplicationMain {
         })?
     }
 
+    /// Publishes the opaque fact carried by one Application listener while the
+    /// owning Main Thread holds the worker barrier.
+    pub fn update_listener_opaque(
+        &self,
+        application: ApplicationId,
+        listener_id: ApplicationListenerId,
+        opaque: Option<u64>,
+    ) -> Result<(), ApplicationError> {
+        self.ensure_active(application)?;
+        self.with_state_mut(|state| {
+            let listener = state
+                .listeners
+                .get_mut(application_listener_index(listener_id))
+                .ok_or(ApplicationError::ListenerMissing {
+                    listener: listener_id,
+                })?;
+            if listener.application != application {
+                return Err(ApplicationError::ListenerNotOwned {
+                    application,
+                    listener: listener_id,
+                });
+            }
+            listener.opaque = opaque;
+            Ok(())
+        })?
+    }
+
     pub(crate) fn with_listener<R>(
         &self,
         listener: ApplicationListenerId,
@@ -660,7 +687,7 @@ impl ApplicationMain {
         })
     }
 
-    pub(crate) fn session_app_id(&self, name: &str) -> Result<SessionAppId, ApplicationError> {
+    pub fn session_app_id(&self, name: &str) -> Result<SessionAppId, ApplicationError> {
         self.session_app(name).map(|_| {
             self.session_apps
                 .iter()
@@ -718,7 +745,8 @@ impl ApplicationMain {
         let state = unsafe { &mut *self.state.get() };
         let barrier = Engine::with_current(|engine| engine.worker_barrier());
         Ok(match barrier {
-            Some(barrier) => barrier.sync(state, operation),
+            Some(barrier) if barrier.is_pending() => operation(state),
+            Some(barrier) => barrier.sync(|| operation(state)),
             None => operation(state),
         })
     }
