@@ -1519,6 +1519,36 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             .map_err(RuntimeError::from)?
     }
 
+    /// Constructs one transport Session with explicit Session-owned
+    /// Application facts.
+    ///
+    /// This is the generic creation seam used by protocols that publish a
+    /// child Session under a connection or listener without exposing their
+    /// private parent relation to Session Runtime. The transport remains the
+    /// sole owner of the relationship encoded in `index`.
+    pub fn construct_transport_session(
+        &mut self,
+        transport: SessionTransportId,
+        index: Index,
+        allocation_owner: u64,
+        application: ApplicationId,
+        app: Option<SessionAppId>,
+        opaque: Option<u64>,
+        server_name: Option<&str>,
+        accepted: bool,
+    ) -> RuntimeResult<SessionId> {
+        self.construct_stream_sessions(
+            transport,
+            index,
+            allocation_owner,
+            application,
+            app,
+            opaque,
+            server_name,
+            accepted,
+        )
+    }
+
     pub fn stream_connect(
         &mut self,
         transport: SessionTransportId,
