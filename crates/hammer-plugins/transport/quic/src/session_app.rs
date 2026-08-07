@@ -1,119 +1,54 @@
-use std::sync::OnceLock;
-
 use hammer_infra::pool::Index;
-use hammer_runtime::app::{
-    ApplicationId, SessionAppContext, SessionAppContexts, SessionAppId, SessionAppRegistration,
-};
-use hammer_runtime::{Engine, RuntimeResult};
-use hammer_service::session::protocol::{SessionApp, SessionAppCallbacks};
+use hammer_runtime::app::{SessionAppContext, SessionAppRegistration};
+use hammer_runtime::{DataWorkerId, Engine, RuntimeError, RuntimeResult};
+use hammer_service::session::SessionId;
+use hammer_service::session::protocol::SessionAppCallbacks;
 use hammer_service::session::runtime::SessionWorker;
-use hammer_service::session::{SessionId, SessionQueueError};
+
+use crate::listener::QUIC_MAIN;
+use crate::worker::ContextId;
 
 pub(crate) const NAME: &str = "quic";
 
 #[hammer_component_macros::runtime_error(subsystem = "quic")]
 #[derive(Debug, thiserror::Error)]
-#[error("QUIC Session App has no owning Application for Session {session:?}")]
-struct QuicSessionApplicationMissing {
-    session: SessionId,
-}
-
-/// Initial QUIC Session App state. The sans-I/O engine and stream ownership
-/// fields are added here in the next skeleton slice; the identity/config facts
-/// already prove the callback boundary without exposing QUIC to service.
-#[derive(Debug)]
-struct QuicSessionState {
-    application: ApplicationId,
-    configuration: Option<u64>,
-    session: Option<SessionId>,
-}
-
-impl SessionApp for QuicSessionState {
-    const CONTEXT_CAPACITY: usize = 1_024;
-
-    fn create(
-        application: Option<ApplicationId>,
-        _: Option<SessionAppId>,
-        config: Option<u64>,
-        _: Option<&str>,
-    ) -> RuntimeResult<Self> {
-        Ok(Self {
-            application: application.ok_or(QuicSessionApplicationMissing {
-                session: SessionId::from_raw(0),
-            })?,
-            configuration: config,
-            session: None,
-        })
-    }
-
-    fn accept(
-        &mut self,
-        _: &mut SessionWorker<Index>,
+enum QuicSessionError {
+    #[error("QUIC Session App context {context:?} does not own Session {session:?}")]
+    ContextSessionMismatch {
+        context: ContextId,
         session: SessionId,
-        _: SessionAppContext,
-    ) -> RuntimeResult<()> {
-        self.session = Some(session);
-        Ok(())
-    }
-
-    fn connected(
-        &mut self,
-        _: &mut SessionWorker<Index>,
-        session: SessionId,
-        _: SessionAppContext,
-    ) -> RuntimeResult<()> {
-        self.session = Some(session);
-        Ok(())
-    }
+    },
+    #[error("QUIC Session App context is missing for Session {session:?}")]
+    ContextMissing { session: SessionId },
 }
 
-static CONTEXTS: OnceLock<SessionAppContexts<QuicSessionState>> = OnceLock::new();
+fn with_quic_worker<R>(
+    worker: &mut SessionWorker<Index>,
+    operation: impl FnOnce(&mut crate::worker::QuicWorker) -> RuntimeResult<R>,
+) -> RuntimeResult<R> {
+    QUIC_MAIN
+        .get()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: NAME })?
+        .with_worker(worker.worker(), operation)
+}
 
-fn create_context(
+fn publish_context(
     worker: &mut SessionWorker<Index>,
     session: SessionId,
-) -> RuntimeResult<SessionAppContext> {
-    let (application, app, config, server_name) = worker
-        .session_app_facts(session)
-        .ok_or(SessionQueueError::SessionAppContextCreateUnsupported)?;
-    let state = QuicSessionState::create(Some(application), app, config, server_name)?;
-    let context = CONTEXTS
-        .get_or_init(|| {
-            SessionAppContexts::new(worker.worker_count(), QuicSessionState::CONTEXT_CAPACITY)
-        })
-        .insert(worker.worker(), worker.worker_count(), state)?;
-    if let Err(error) = worker.set_app_session(session, context) {
-        CONTEXTS
-            .get()
-            .expect("QUIC Session App contexts exist after insertion")
-            .remove(worker.worker(), context);
+    context: ContextId,
+) -> RuntimeResult<()> {
+    if let Err(error) = worker.set_app_session(session, context.into()) {
+        if let Err(cleanup_error) = with_quic_worker(worker, |quic| quic.remove_context(context)) {
+            tracing::error!(
+                ?session,
+                ?context,
+                %cleanup_error,
+                "QUIC Session App context rollback failed"
+            );
+        }
         return Err(error);
     }
-    Ok(context)
-}
-
-fn with_context(
-    worker: &mut SessionWorker<Index>,
-    session: SessionId,
-    context: SessionAppContext,
-    operation: impl FnOnce(
-        &mut QuicSessionState,
-        &mut SessionWorker<Index>,
-        SessionId,
-        SessionAppContext,
-    ) -> RuntimeResult<()>,
-) -> RuntimeResult<()> {
-    let context = if context == 0 {
-        create_context(worker, session)?
-    } else {
-        context
-    };
-    CONTEXTS
-        .get()
-        .ok_or(SessionQueueError::SessionAppContextCreateUnsupported)?
-        .with_mut(worker.worker(), context, |state| {
-            operation(state, worker, session, context)
-        })
+    Ok(())
 }
 
 fn accept(
@@ -121,25 +56,18 @@ fn accept(
     session: SessionId,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
-    with_context(
-        worker,
-        session,
-        context,
-        |state, worker, session, context| state.accept(worker, session, context),
-    )
+    let listener = ContextId::from(context);
+    let connection = with_quic_worker(worker, |quic| quic.accept_connection(session, listener))?;
+    publish_context(worker, session, connection)
 }
 
 fn connected(
     worker: &mut SessionWorker<Index>,
     session: SessionId,
-    context: SessionAppContext,
+    _: SessionAppContext,
 ) -> RuntimeResult<()> {
-    with_context(
-        worker,
-        session,
-        context,
-        |state, worker, session, context| state.connected(worker, session, context),
-    )
+    let connection = with_quic_worker(worker, |quic| quic.connect_connection(session))?;
+    publish_context(worker, session, connection)
 }
 
 fn lifecycle(
@@ -147,8 +75,15 @@ fn lifecycle(
     session: SessionId,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
-    with_context(worker, session, context, |state, _, _, _| {
-        let _ = (state.application, state.configuration);
+    if context == 0 {
+        return Err(QuicSessionError::ContextMissing { session }.into());
+    }
+    let context = ContextId::from(context);
+    with_quic_worker(worker, |quic| {
+        let owner = quic.context_session(context)?;
+        if owner != session {
+            return Err(QuicSessionError::ContextSessionMismatch { context, session }.into());
+        }
         Ok(())
     })
 }
@@ -160,11 +95,16 @@ fn install(engine: &mut Engine) -> RuntimeResult<()> {
     main.install_session_app(&engine.runtime, NAME, &CALLBACKS)
 }
 
-fn destroy(worker: hammer_runtime::DataWorkerId, context: SessionAppContext) {
-    CONTEXTS
+fn destroy(worker: DataWorkerId, context: SessionAppContext) {
+    if context == 0 {
+        return;
+    }
+    let context = ContextId::from(context);
+    QUIC_MAIN
         .get()
-        .expect("QUIC Session App contexts exist during destruction")
-        .remove(worker, context);
+        .expect("QUIC Main exists during Session App destruction")
+        .with_worker(worker, |quic| quic.remove_context(context))
+        .expect("QUIC Session App context is removed exactly once");
 }
 
 pub(crate) static CALLBACKS: SessionAppCallbacks = SessionAppCallbacks {

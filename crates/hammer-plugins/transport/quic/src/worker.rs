@@ -1,9 +1,16 @@
 //! QUIC's worker-local transport state and registration.
 
+use hammer_core::data_plane::BufferFrame;
 use hammer_infra::pool::{Index, Pool};
 use hammer_infra::thread_owned::ThreadOwnedError;
-use hammer_runtime::{DataWorkerId, RuntimeResult, SessionListenerId};
+use hammer_runtime::{DataPlaneRuntime, DataWorkerId, RuntimeResult, SessionListenerId};
 use hammer_service::session::SessionId;
+use hammer_service::session::node::{SessionQueueNext, SessionQueueOutput};
+use hammer_service::session::runtime::{
+    SessionTransport, SessionTransportId, SessionWorker, TransportInternalTransport,
+    TransportInternalTx,
+};
+use std::time::Instant;
 
 use crate::config::ConfigId;
 
@@ -144,6 +151,22 @@ impl Context {
             ContextRole::Listener(_) | ContextRole::Stream(_) => None,
         }
     }
+
+    pub(super) fn session(&self) -> Option<SessionId> {
+        match &self.role {
+            ContextRole::Connection(connection) => Some(connection.lower_session),
+            ContextRole::Stream(stream) => Some(stream.session),
+            ContextRole::Listener(_) => None,
+        }
+    }
+
+    pub(super) fn connection_index(&self, index: Index) -> Option<Index> {
+        match &self.role {
+            ContextRole::Connection(_) => Some(index),
+            ContextRole::Stream(stream) => Some(stream.parent),
+            ContextRole::Listener(_) => None,
+        }
+    }
 }
 
 const _: () = {
@@ -216,6 +239,25 @@ impl QuicWorker {
             .ok_or_else(|| QuicWorkerError::ContextMissing { context }.into())
     }
 
+    pub(super) fn context_session(&self, context: ContextId) -> RuntimeResult<SessionId> {
+        self.contexts
+            .get(context.into())
+            .and_then(Context::session)
+            .ok_or_else(|| QuicWorkerError::ContextMissing { context }.into())
+    }
+
+    pub(super) fn connection_index(&self, index: Index) -> RuntimeResult<Index> {
+        self.contexts
+            .get(index)
+            .and_then(|context| context.connection_index(index))
+            .ok_or_else(|| {
+                QuicWorkerError::ContextMissing {
+                    context: ContextId::from(index),
+                }
+                .into()
+            })
+    }
+
     pub(super) fn remove_context(&mut self, context: ContextId) -> RuntimeResult<()> {
         self.contexts
             .remove(context.into())
@@ -226,6 +268,64 @@ impl QuicWorker {
     #[cfg(test)]
     pub(super) fn context_count(&self) -> usize {
         self.contexts.len()
+    }
+}
+
+impl SessionTransport<Index> for QuicWorker {
+    type Tx = TransportInternalTx;
+
+    const ID: SessionTransportId = SessionTransportId::new(3);
+
+    fn connection_index(&self, index: Index) -> RuntimeResult<Index> {
+        self.connection_index(index)
+    }
+
+    fn update_time(
+        &mut self,
+        _: &mut SessionWorker<Index>,
+        _: &DataPlaneRuntime,
+        _: SessionQueueNext,
+        _: &mut BufferFrame,
+        _: &mut SessionQueueOutput,
+        _: Instant,
+    ) -> RuntimeResult<()> {
+        Ok(())
+    }
+
+    fn disconnect(
+        &mut self,
+        sessions: &mut SessionWorker<Index>,
+        index: Index,
+        _: &DataPlaneRuntime,
+        _: SessionQueueNext,
+        _: &mut BufferFrame,
+        _: &mut SessionQueueOutput,
+        _: Instant,
+    ) -> RuntimeResult<()> {
+        let context = ContextId::from(index);
+        let session = self.context_session(context)?;
+        self.remove_context(context)?;
+        if sessions.has_session(session) {
+            sessions.set_app_session(session, 0)?;
+            sessions.notify_transport_deleted(session, index)?;
+        }
+        Ok(())
+    }
+}
+
+impl TransportInternalTransport<Index> for QuicWorker {
+    fn internal_tx(
+        &mut self,
+        _: &mut SessionWorker<Index>,
+        _: SessionId,
+        _: Index,
+        _: &DataPlaneRuntime,
+        _: SessionQueueNext,
+        _: &mut BufferFrame,
+        _: &mut SessionQueueOutput,
+        _: Instant,
+    ) -> RuntimeResult<()> {
+        Ok(())
     }
 }
 

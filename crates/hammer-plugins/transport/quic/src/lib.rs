@@ -18,7 +18,7 @@ hammer_component_macros::declare_plugin!(
     early_config_functions = [],
     main_loop_enter_functions = [],
     main_loop_exit_functions = [],
-    worker_init_functions = [],
+    worker_init_functions = [listener::__INIT_FN_QUIC_WORKER_INIT],
     graph_nodes = [],
     node_functions = [],
     process_nodes = [],

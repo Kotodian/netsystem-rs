@@ -291,6 +291,18 @@ fn init_quic(engine: &mut Engine, sessions: Arc<SessionMain>) -> RuntimeResult<A
     Ok(main)
 }
 
+#[hammer_component_macros::worker_init_function(
+    name = "quic_worker_init",
+    runs_after = ["session_worker_init", "udp_worker_init"]
+)]
+fn init_quic_worker(engine: &mut Engine) -> RuntimeResult<()> {
+    let worker = engine.data_worker_id()?;
+    QUIC_MAIN
+        .get()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "quic" })?
+        .install_worker(worker)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

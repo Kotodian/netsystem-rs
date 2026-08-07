@@ -1121,6 +1121,7 @@ version = "0.1.0"
 dependencies = [
  "abi_stable",
  "hammer-component-macros",
+ "hammer-core",
  "hammer-infra",
  "hammer-runtime",
  "hammer-service",
@@ -1129,6 +1130,7 @@ dependencies = [
  "quinn-proto",
  "rcgen",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
