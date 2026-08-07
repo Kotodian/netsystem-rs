@@ -84,7 +84,7 @@ pub use streams::StreamsState;
 use streams::StreamsState;
 pub use streams::{
     Chunks, ClosedStream, FinishError, ReadError, ReadableError, RecvStream, SendStream,
-    ShouldTransmit, StreamEvent, Streams, WriteError, Written,
+    ShouldTransmit, StreamDataError, StreamDataIo, StreamEvent, Streams, WriteError, Written,
 };
 
 mod timer;
@@ -226,6 +226,8 @@ pub struct Connection {
     /// Whether the last `poll_transmit` call yielded no data because there was
     /// no outgoing application data.
     app_limited: bool,
+    /// Last Session FIFO data-plane failure observed while generating a packet.
+    stream_data_error: Option<StreamDataError>,
 
     streams: StreamsState,
     /// Surplus remote CIDs for future use on new paths
@@ -338,6 +340,7 @@ impl Connection {
             pto_count: 0,
 
             app_limited: false,
+            stream_data_error: None,
             receiving_ecn: false,
             total_authed_packets: 0,
 
@@ -379,6 +382,14 @@ impl Connection {
         self.timers.next_timeout()
     }
 
+    /// Takes the last Session FIFO packet-path failure observed by transmit.
+    ///
+    /// `poll_transmit` returns `None` after recording this failure. The owning
+    /// Data Worker owns the corresponding typed packet-drop counter.
+    pub fn take_stream_data_error(&mut self) -> Option<StreamDataError> {
+        self.stream_data_error.take()
+    }
+
     /// Returns application-facing events
     ///
     /// Connections should be polled for events after:
@@ -414,6 +425,51 @@ impl Connection {
             state: &mut self.streams,
             conn_state: &self.state,
         }
+    }
+
+    /// Installs the Session FIFO payload I/O table for this connection.
+    ///
+    /// Must be set before stream payload flows. Existing stream state is
+    /// updated in place, so this can also be called once per connection
+    /// immediately after creation.
+    pub fn set_stream_data_io(&mut self, io: Option<StreamDataIo>) {
+        self.streams.set_stream_data_io(io);
+    }
+
+    /// Process one UDP datagram for this connected QUIC connection.
+    ///
+    /// This is the direct connected-session counterpart to
+    /// [`Endpoint::handle`](crate::Endpoint::handle). The caller owns the
+    /// datagram storage and must not mutate or drop it until this call
+    /// returns.
+    pub fn handle_datagram(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        ecn: Option<EcnCodepoint>,
+        data: BytesMut,
+    ) {
+        let (first_decode, remaining) = match PartialDecode::new(
+            data,
+            &FixedLengthConnectionIdParser::new(self.local_cid_state.cid_len()),
+            &[self.version],
+            self.endpoint_config.grease_quic_bit,
+        ) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                trace!("malformed QUIC datagram: {}", error);
+                return;
+            }
+        };
+        self.handle_event(ConnectionEvent(ConnectionEventInner::Datagram(
+            DatagramConnectionEvent {
+                now,
+                remote,
+                ecn,
+                first_decode,
+                remaining,
+            },
+        )));
     }
 
     /// Provide control over streams
@@ -877,8 +933,19 @@ impl Connection {
                 }
             }
 
-            let sent =
-                self.populate_packet(now, space_id, buf, builder.max_size, builder.exact_number);
+            let sent = match self.populate_packet(
+                now,
+                space_id,
+                buf,
+                builder.max_size,
+                builder.exact_number,
+            ) {
+                Ok(sent) => sent,
+                Err(error) => {
+                    self.stream_data_error = Some(error);
+                    return None;
+                }
+            };
 
             // ACK-only packets should only be sent when explicitly allowed. If we write them due to
             // any other reason, there is a bug which leads to one component announcing write
@@ -1629,7 +1696,10 @@ impl Connection {
         }
 
         for frame in info.stream_frames {
-            self.streams.received_ack_of(frame);
+            if let Err(error) = self.streams.received_ack_of(frame) {
+                self.stream_data_error = Some(error);
+                return false;
+            }
         }
         congestion_event_consumed
     }
@@ -3192,7 +3262,7 @@ impl Connection {
         buf: &mut Vec<u8>,
         max_size: usize,
         pn: u64,
-    ) -> SentFrames {
+    ) -> Result<SentFrames, StreamDataError> {
         let mut sent = SentFrames::default();
         let space = &mut self.spaces[space_id];
         let is_0rtt = space_id == SpaceId::Data && space.crypto.is_none();
@@ -3439,11 +3509,11 @@ impl Connection {
         if space_id == SpaceId::Data {
             sent.stream_frames =
                 self.streams
-                    .write_stream_frames(buf, max_size, self.config.send_fairness);
+                    .write_stream_frames(buf, max_size, self.config.send_fairness)?;
             self.stats.frame_tx.stream += sent.stream_frames.len() as u64;
         }
 
-        sent
+        Ok(sent)
     }
 
     /// Write pending ACKs into a buffer

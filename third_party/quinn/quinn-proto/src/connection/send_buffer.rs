@@ -38,8 +38,11 @@ impl SendBuffer {
         self.unacked_segments.push_back(data);
     }
 
-    /// Discard a range of acknowledged stream data
-    pub(super) fn ack(&mut self, mut range: Range<u64>) {
+    /// Discard a range of acknowledged stream data.
+    ///
+    /// Returns the first offset retained after any newly contiguous prefix
+    /// was released, or `None` when no prefix advanced.
+    pub(super) fn ack(&mut self, mut range: Range<u64>) -> Option<u64> {
         // Clamp the range to data which is still tracked
         let base_offset = self.offset - self.unacked_len as u64;
         range.start = base_offset.max(range.start);
@@ -47,30 +50,38 @@ impl SendBuffer {
 
         self.acks.insert(range);
 
+        let mut released_prefix = None;
         while self.acks.min() == Some(self.offset - self.unacked_len as u64) {
             let prefix = self.acks.pop_min().unwrap();
             let mut to_advance = (prefix.end - prefix.start) as usize;
 
             self.unacked_len -= to_advance;
             while to_advance > 0 {
-                let front = self
-                    .unacked_segments
-                    .front_mut()
-                    .expect("Expected buffered data");
+                if let Some(front) = self.unacked_segments.front_mut() {
+                    if front.len() <= to_advance {
+                        to_advance -= front.len();
+                        self.unacked_segments.pop_front();
 
-                if front.len() <= to_advance {
-                    to_advance -= front.len();
-                    self.unacked_segments.pop_front();
-
-                    if self.unacked_segments.len() * 4 < self.unacked_segments.capacity() {
-                        self.unacked_segments.shrink_to_fit();
+                        if self.unacked_segments.len() * 4 < self.unacked_segments.capacity() {
+                            self.unacked_segments.shrink_to_fit();
+                        }
+                    } else {
+                        front.advance(to_advance);
+                        to_advance = 0;
                     }
                 } else {
-                    front.advance(to_advance);
                     to_advance = 0;
                 }
             }
+            released_prefix = Some(self.offset - self.unacked_len as u64);
         }
+        released_prefix
+    }
+
+    /// Advance the stream offset without copying payload into Quinn.
+    pub(super) fn sync(&mut self, len: usize) {
+        self.unacked_len += len;
+        self.offset += len as u64;
     }
 
     /// Compute the next range to transmit on this stream and update state to account for that

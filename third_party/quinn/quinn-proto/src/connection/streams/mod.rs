@@ -9,7 +9,7 @@ use tracing::trace;
 
 use super::spaces::{Retransmits, ThinRetransmits};
 use crate::{
-    connection::streams::state::{get_or_insert_recv, get_or_insert_send},
+    connection::streams::state::{get_or_insert_recv, get_or_insert_send, StreamRecv},
     frame, Dir, StreamId, VarInt,
 };
 
@@ -25,6 +25,9 @@ pub use send::{FinishError, WriteError, Written};
 mod state;
 #[allow(unreachable_pub)] // fuzzing only
 pub use state::StreamsState;
+
+mod stream_data_io;
+pub use stream_data_io::{StreamDataError, StreamDataIo};
 
 /// Access to streams
 pub struct Streams<'a> {
@@ -128,6 +131,64 @@ impl RecvStream<'_> {
         Chunks::new(self.id, ordered, self.state, self.pending)
     }
 
+    /// Record application consumption of Session RX FIFO bytes.
+    ///
+    /// Hammer's Session FIFO is the receive payload owner. The application
+    /// dequeues from that FIFO, and this method advances Quinn's consumed
+    /// offset, stream-level receive credit, and connection-level credit.
+    pub fn credit_read(&mut self, consumed: u64) -> Result<ShouldTransmit, ClosedStream> {
+        let previous = match self.state.recv.get_mut(&self.id) {
+            Some(stream) => {
+                let recv = get_or_insert_recv(
+                    self.state.stream_receive_window,
+                    self.state.stream_data_io,
+                )(stream);
+                if recv.stopped {
+                    return Err(ClosedStream { _private: () });
+                }
+                recv.bytes_read()
+            }
+            None => return Err(ClosedStream { _private: () }),
+        };
+        if consumed < previous {
+            return Ok(ShouldTransmit(false));
+        }
+        if consumed
+            > self
+                .state
+                .recv
+                .get(&self.id)
+                .and_then(|stream| stream.as_ref())
+                .and_then(|stream| stream.as_open_recv())
+                .map_or(u64::MAX, |recv| recv.end)
+        {
+            return Err(ClosedStream { _private: () });
+        }
+        let mut recv = match self.state.recv.remove(&self.id).expect("validated recv") {
+            Some(StreamRecv::Open(recv)) => recv,
+            Some(StreamRecv::Free(_)) => return Err(ClosedStream { _private: () }),
+            None => return Err(ClosedStream { _private: () }),
+        };
+        let read = consumed - previous;
+        recv.set_bytes_read(consumed);
+
+        let mut should_transmit = self.state.queue_max_stream_id(self.pending);
+        if recv.can_send_flow_control() {
+            let (_, max_stream_data) = recv.max_stream_data(self.state.stream_receive_window);
+            if max_stream_data.should_transmit() {
+                self.pending.max_stream_data.insert(self.id);
+            }
+            should_transmit |= max_stream_data.should_transmit();
+        }
+        let max_data = self.state.add_read_credits(read);
+        self.pending.max_data |= max_data.should_transmit();
+        should_transmit |= max_data.should_transmit();
+        self.state
+            .recv
+            .insert(self.id, Some(StreamRecv::Open(recv)));
+        Ok(ShouldTransmit(should_transmit))
+    }
+
     /// Stop accepting data on the given receive stream
     ///
     /// Discards unread data and notifies the peer to stop transmitting. Once stopped, further
@@ -137,7 +198,10 @@ impl RecvStream<'_> {
             hash_map::Entry::Occupied(s) => s,
             hash_map::Entry::Vacant(_) => return Err(ClosedStream { _private: () }),
         };
-        let stream = get_or_insert_recv(self.state.stream_receive_window)(entry.get_mut());
+        let stream = get_or_insert_recv(
+            self.state.stream_receive_window,
+            self.state.stream_data_io,
+        )(entry.get_mut());
 
         let (read_credits, stop_sending) = stream.stop()?;
         if stop_sending.should_transmit() {
@@ -233,6 +297,48 @@ impl<'a> SendStream<'a> {
         self.write_source(&mut BytesArray::from_chunks(data))
     }
 
+    /// Advance the stream send offset to match Session FIFO bytes.
+    ///
+    /// This records the Session FIFO end offset without copying payload into
+    /// Quinn. Returns the number of bytes newly synchronized.
+    pub fn sync(&mut self, end_offset: u64) -> Result<u64, WriteError> {
+        if self.conn_state.is_closed() {
+            trace!(%self.id, "sync blocked; connection draining");
+            return Err(WriteError::Blocked);
+        }
+
+        let limit = self.state.write_limit();
+        let max_send_data = self.state.max_send_data(self.id);
+        let stream = self
+            .state
+            .send
+            .get_mut(&self.id)
+            .map(get_or_insert_send(max_send_data, self.state.stream_data_io))
+            .ok_or(WriteError::ClosedStream)?;
+
+        if limit == 0 {
+            trace!(
+                stream = %self.id, max_data = self.state.max_data, data_sent = self.state.data_sent,
+                "sync blocked by connection-level flow control or send window"
+            );
+            if !stream.connection_blocked {
+                stream.connection_blocked = true;
+                self.state.connection_blocked.push(self.id);
+            }
+            return Err(WriteError::Blocked);
+        }
+
+        let was_pending = stream.is_pending();
+        let written = stream.sync(end_offset.min(self.state.data_sent + limit))?;
+        self.state.data_sent += written;
+        self.state.unacked_data += written;
+        trace!(stream = %self.id, "synced {} bytes", written);
+        if !was_pending {
+            self.state.pending.push_pending(self.id, stream.priority);
+        }
+        Ok(written)
+    }
+
     fn write_source<B: BytesSource>(&mut self, source: &mut B) -> Result<Written, WriteError> {
         if self.conn_state.is_closed() {
             trace!(%self.id, "write blocked; connection draining");
@@ -247,7 +353,7 @@ impl<'a> SendStream<'a> {
             .state
             .send
             .get_mut(&self.id)
-            .map(get_or_insert_send(max_send_data))
+            .map(get_or_insert_send(max_send_data, self.state.stream_data_io))
             .ok_or(WriteError::ClosedStream)?;
 
         if limit == 0 {
@@ -293,7 +399,7 @@ impl<'a> SendStream<'a> {
             .state
             .send
             .get_mut(&self.id)
-            .map(get_or_insert_send(max_send_data))
+            .map(get_or_insert_send(max_send_data, self.state.stream_data_io))
             .ok_or(FinishError::ClosedStream)?;
 
         let was_pending = stream.is_pending();
@@ -315,7 +421,7 @@ impl<'a> SendStream<'a> {
             .state
             .send
             .get_mut(&self.id)
-            .map(get_or_insert_send(max_send_data))
+            .map(get_or_insert_send(max_send_data, self.state.stream_data_io))
             .ok_or(ClosedStream { _private: () })?;
 
         if matches!(stream.state, SendState::ResetSent) {
@@ -344,7 +450,7 @@ impl<'a> SendStream<'a> {
             .state
             .send
             .get_mut(&self.id)
-            .map(get_or_insert_send(max_send_data))
+            .map(get_or_insert_send(max_send_data, self.state.stream_data_io))
             .ok_or(ClosedStream { _private: () })?;
 
         stream.priority = priority;
