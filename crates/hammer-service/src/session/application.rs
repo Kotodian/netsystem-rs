@@ -746,7 +746,7 @@ impl ApplicationMain {
         let barrier = Engine::with_current(|engine| engine.worker_barrier());
         Ok(match barrier {
             Some(barrier) if barrier.is_pending() => operation(state),
-            Some(barrier) => barrier.sync(state, operation),
+            Some(barrier) => barrier.sync(|| operation(state)),
             None => operation(state),
         })
     }

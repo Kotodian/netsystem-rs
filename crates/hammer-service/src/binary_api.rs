@@ -366,8 +366,7 @@ impl BinaryApiConnection {
         if barrier.is_pending() {
             return dispatch_method(request);
         }
-        let mut control = ();
-        barrier.sync(&mut control, |_| dispatch_method(request))
+        barrier.sync(|| dispatch_method(request))
     }
 }
 

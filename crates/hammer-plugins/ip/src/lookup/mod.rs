@@ -113,10 +113,7 @@ impl IpLookupControlPlane {
         let barrier = self.barrier.clone();
         let publish = move || {
             if let Some(barrier) = barrier {
-                let mut table_handle = table_handle;
-                barrier.sync(&mut table_handle, |table_handle| {
-                    table_handle.publish(table);
-                });
+                barrier.sync(|| table_handle.publish(table));
             } else {
                 table_handle.publish(table);
             }

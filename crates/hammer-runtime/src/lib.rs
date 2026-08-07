@@ -101,6 +101,6 @@ pub mod spawn;
 pub mod start_workers;
 mod worker_thread;
 
-pub use barrier::{Barrier, WorkerBarrier};
+pub use barrier::WorkerBarrier;
 pub use control_thread::{ControlThread, ControlThreadHandle, ControlTimerHandle};
 pub use spawn::with_data_plane_runtime;

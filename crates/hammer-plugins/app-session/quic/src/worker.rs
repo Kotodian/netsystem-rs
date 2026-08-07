@@ -1534,13 +1534,9 @@ mod tests {
     #[test]
     fn timers_dispatch_exact_context_and_kind() {
         let mut timers = QuicTimers::new(Instant::now());
-        let context = ContextId::from(0xabcd_1234u64);
+        let context = ContextId::from(Index::new(7, 11));
         timers
-            .set(
-                context,
-                QuicTimerKind::Transmit,
-                Duration::from_millis(1),
-            )
+            .set(context, QuicTimerKind::Transmit, Duration::from_millis(1))
             .expect("arm timer");
         timers.advance(Instant::now() + Duration::from_millis(1));
         let token = timers.take_pending().expect("expired timer");

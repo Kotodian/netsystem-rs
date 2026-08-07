@@ -58,9 +58,9 @@ fn worker_spawn_barrier_sync() {
         DataRuntime::new(2, "barrier-worker", 2 * 1024 * 1024, 1).expect("spawn data runtime");
     let barrier = runtime.barrier();
     let mut value = 1;
-    barrier.sync(&mut value, |value| {
+    barrier.sync(|| {
         // All workers are parked at the barrier while the guard is held.
-        *value = 2;
+        value = 2;
     });
     assert_eq!(value, 2);
     runtime.shutdown_timeout(Duration::from_secs(1));

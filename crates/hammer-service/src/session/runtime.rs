@@ -407,10 +407,7 @@ impl SessionMain {
         }
         match Engine::with_current(|engine| engine.worker_barrier()) {
             Some(barrier) if barrier.is_pending() => Ok(operation()),
-            Some(barrier) => {
-                let mut control = ();
-                Ok(barrier.sync(&mut control, |_| operation()))
-            }
+            Some(barrier) => Ok(barrier.sync(operation)),
             None => Ok(operation()),
         }
     }
@@ -475,7 +472,7 @@ impl SessionMain {
         let barrier = Engine::with_current(|engine| engine.worker_barrier());
         Ok(match barrier {
             Some(barrier) if barrier.is_pending() => operation(listeners),
-            Some(barrier) => barrier.sync(listeners, operation),
+            Some(barrier) => barrier.sync(|| operation(listeners)),
             None => operation(listeners),
         })
     }

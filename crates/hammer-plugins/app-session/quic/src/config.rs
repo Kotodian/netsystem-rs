@@ -1,9 +1,10 @@
+use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::thread::{self, ThreadId};
 
 use hammer_infra::pool::{Index, Pool};
+use hammer_runtime::Engine;
 use hammer_runtime::app::ApplicationId;
-use hammer_runtime::{Barrier, Engine};
 use prost::Message;
 use quinn_proto::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use quinn_proto::rustls::server::WebPkiClientVerifier;
@@ -175,14 +176,20 @@ struct ConfigEntry {
 
 pub(crate) struct QuicConfigRegistry {
     owner: ThreadId,
-    state: Barrier<Pool<ConfigEntry>>,
+    state: UnsafeCell<Pool<ConfigEntry>>,
 }
+
+// SAFETY: every state access first verifies the owning Main Thread. When Data
+// Workers exist, the Main Thread performs the access while WorkerBarrier holds
+// them stopped; worker protocol state retains only immutable Arc configurations
+// after this registry lookup.
+unsafe impl Sync for QuicConfigRegistry {}
 
 impl QuicConfigRegistry {
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
             owner: thread::current().id(),
-            state: Barrier::new(Pool::with_capacity(capacity)),
+            state: UnsafeCell::new(Pool::with_capacity(capacity)),
         }
     }
 
@@ -288,7 +295,7 @@ impl QuicConfigRegistry {
             // SAFETY: `with_control_barrier` confines access to the owning
             // Main Thread and either holds WorkerBarrier or runs before Data
             // Workers exist.
-            unsafe { self.state.with_mut_unchecked(|state| operation(state)) }
+            unsafe { operation(&*self.state.get()) }
         })?
     }
 
@@ -300,7 +307,7 @@ impl QuicConfigRegistry {
             // SAFETY: `with_control_barrier` confines access to the owning
             // Main Thread and either holds WorkerBarrier or runs before Data
             // Workers exist.
-            unsafe { self.state.with_mut_unchecked(operation) }
+            unsafe { operation(&mut *self.state.get()) }
         })
     }
 
@@ -311,10 +318,7 @@ impl QuicConfigRegistry {
         let barrier = Engine::with_current(|engine| engine.worker_barrier());
         Ok(match barrier {
             Some(barrier) if barrier.is_pending() => operation(),
-            Some(barrier) => {
-                let mut control = ();
-                barrier.sync(&mut control, |_| operation())
-            }
+            Some(barrier) => barrier.sync(operation),
             None => operation(),
         })
     }

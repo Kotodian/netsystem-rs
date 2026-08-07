@@ -70,11 +70,12 @@ Application listener while the barrier is held. `session_app_id` resolves the
 plugin's registered name to the service-owned compact identity; no QUIC type,
 callback table, or plugin state crosses into runtime or service.
 
-QUIC's listener and configuration pools use the existing
-`hammer_runtime::Barrier<T>` primitive, not plugin-local `UnsafeCell` state or
-manual `Send`/`Sync` implementations. The creator Main Thread owns both pools;
-the Session listener callback proves the worker barrier before accessing the
-listener pool. A configuration operation either runs under the Binary API
+QUIC's listener and configuration pools remain plugin-owned. The creator Main
+Thread owns both pools; the configuration registry uses its own owner-local
+`UnsafeCell` because its Main Thread check and WorkerBarrier phase are the
+synchronization contract rather than a generic runtime wrapper. The Session
+listener callback proves the worker barrier before accessing the listener pool.
+A configuration operation either runs under the Binary API
 barrier or enters that barrier itself. No Data Worker reads the registry in
 this skeleton; future connection setup must retain immutable configuration in
 the worker-owned connection context rather than borrow the registry.
@@ -124,12 +125,41 @@ Lower UDP FIFO to Quinn sans-I/O RX/TX, worker-owned connection/stream context
 creation, Session fan-out, exact timer-token delivery, and FIFO-only stream
 payload ownership remain required before QUIC is a usable transport.
 
+## Barrier follow-up
+
+The generic `hammer_runtime::Barrier<T>` has been removed. Runtime graph,
+graph-error, and worker-statistics publication now use the runtime-owned
+`WorkerPublication` slots with explicit ownership phases; QUIC configuration
+storage uses its plugin-owned `UnsafeCell` and the existing Main Thread plus
+`WorkerBarrier` contract. No generic value wrapper, lock, or atomic pointer was
+added in its place.
+
+The runtime `WorkerBarrier` now keeps `wait_at_barrier` and
+`workers_at_barrier` in separate 64-byte cache lines, matching VPP's aligned
+allocations at `third_party/vpp/src/vlib/threads.c:605-608`. Its worker
+acknowledgement and release sequence follows
+`third_party/vpp/src/vlib/threads.h:297-361` and
+`third_party/vpp/src/vlib/threads.c:1396-1408,1479-1488`: the main thread
+publishes under the barrier, workers acknowledge with a release operation, and
+the main thread observes completion with acquire loads before reading slots.
+Its `sync` adapter accepts only the operation closure; it does not borrow or
+store a generic value. Callers capture or borrow state from the owner that
+actually owns the publication, matching VPP's separate barrier and state
+responsibilities.
+
+### Barrier verdict
+
+**Aligned.** The generic synchronization type is gone, the remaining barrier
+owns only synchronization state, and each transferred value has an explicit
+owner and completion event. The separate completion counter remains only for
+VPP-style graph refork work that continues after barrier release.
+
 ## Verdict
 
-**Aligned for the shared listener seam and QUIC listener skeleton.** The shared
-contract follows VPP's ownership and ordering without moving QUIC-specific
-state below the plugin boundary. This is not a claim that the QUIC transport is
-feature complete.
+**Aligned for the shared listener seam, QUIC listener skeleton, and barrier
+publication change.** The shared contract follows VPP's ownership and ordering
+without moving QUIC-specific state below the plugin boundary. This is not a
+claim that the QUIC transport is feature complete.
 
 ## Commands run
 
@@ -141,9 +171,18 @@ feature complete.
 - `cargo test -p hammer-plugin-tcp --all-targets`
 - `cargo test -p hammer-plugin-udp --all-targets`
 - `cargo clippy -p hammer-plugin-quic --lib --tests --message-format=short`
+- `cargo test -p hammer-runtime --lib`
+- `cargo test -p hammer-runtime barrier::tests --lib`
+- `cargo check -p hammer-runtime -p hammer-plugin-quic`
+- `cargo check --workspace`
+- `cargo test --workspace`
 - `cargo clippy -p hammer-service --test binary_api --message-format=short`
-- `cargo fmt -p hammer-runtime -p hammer-service -p hammer-plugin-tcp -p hammer-plugin-udp -p hammer-plugin-quic -- --check`
+- `cargo clippy --workspace --all-targets`
+- `cargo fmt --all -- --check`
 - `git diff --check`
 
-Verification deliberately remains package- and target-focused; no workspace-wide
-check, test, or clippy command was run for this change.
+Workspace checking and the full workspace test pass, including the runtime
+barrier tests and all QUIC tests. Workspace-wide clippy still reports existing
+`mut_from_ref` errors at `quic/src/listener.rs:66`,
+`udp/src/input.rs:555`, and `udp/src/worker.rs:92`; none of those files are part
+of this barrier change.
