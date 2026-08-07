@@ -7,6 +7,7 @@ use hammer_infra::heap::Heap;
 pub mod align;
 pub mod bihash;
 pub mod bitmap;
+pub mod bytes;
 pub mod checksum;
 pub mod descriptor;
 pub mod fifo;
