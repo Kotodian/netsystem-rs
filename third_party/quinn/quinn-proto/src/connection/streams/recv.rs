@@ -7,7 +7,7 @@ use tracing::debug;
 
 use super::state::get_or_insert_recv;
 use super::{
-    ClosedStream, Retransmits, ShouldTransmit, StreamDataError, StreamDataIo, StreamId,
+    ApplicationRetransmits, ClosedStream, ShouldTransmit, StreamDataError, StreamDataIo, StreamId,
     StreamsState,
 };
 use crate::connection::assembler::{Assembler, Chunk, IllegalOrderedRead};
@@ -310,7 +310,7 @@ pub struct Chunks<'a> {
     id: StreamId,
     ordered: bool,
     streams: &'a mut StreamsState,
-    pending: &'a mut Retransmits,
+    pending: &'a mut ApplicationRetransmits,
     state: ChunksState,
     read: u64,
 }
@@ -320,7 +320,7 @@ impl<'a> Chunks<'a> {
         id: StreamId,
         ordered: bool,
         streams: &'a mut StreamsState,
-        pending: &'a mut Retransmits,
+        pending: &'a mut ApplicationRetransmits,
     ) -> Result<Self, ReadableError> {
         let mut entry = match streams.recv.entry(id) {
             Entry::Occupied(entry) => entry,

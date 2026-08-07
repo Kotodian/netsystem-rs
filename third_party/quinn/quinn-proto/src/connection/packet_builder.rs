@@ -1,6 +1,8 @@
+use std::mem;
+
 use bytes::{Bytes, BytesMut};
 use rand::Rng;
-use tracing::{debug, trace, trace_span};
+use tracing::trace_span;
 
 use super::{spaces::SentPacket, Connection, SentFrames};
 use crate::{
@@ -17,21 +19,13 @@ pub(super) struct PacketBuilder {
     pub(super) ack_eliciting: bool,
     pub(super) exact_number: u64,
     pub(super) short_header: bool,
-    /// Smallest absolute position in the associated buffer that must be occupied by this packet's
-    /// frames
     pub(super) min_size: usize,
-    /// Largest absolute position in the associated buffer that may be occupied by this packet's
-    /// frames
     pub(super) max_size: usize,
     pub(super) tag_len: usize,
     pub(super) _span: tracing::span::EnteredSpan,
 }
 
 impl PacketBuilder {
-    /// Write a new packet header to `buffer` and determine the packet's properties
-    ///
-    /// Marks the connection drained and returns `None` if the confidentiality limit would be
-    /// violated.
     pub(super) fn new(
         now: Instant,
         space_id: SpaceId,
@@ -43,68 +37,143 @@ impl PacketBuilder {
         conn: &mut Connection,
     ) -> Option<Self> {
         let version = conn.version;
-        // Initiate key update if we're approaching the confidentiality limit
-        let sent_with_keys = conn.spaces[space_id].sent_with_keys;
-        if space_id == SpaceId::Data {
-            if sent_with_keys >= conn.key_phase_size {
-                debug!("routine key update due to phase exhaustion");
-                conn.force_key_update();
+
+        match space_id {
+            SpaceId::Data => {
+                let space = conn
+                    .application
+                    .as_ref()
+                    .expect("application packet space present");
+                if space.sent_with_keys >= space.key_phase_size {
+                    conn.force_key_update();
+                }
             }
-        } else {
-            let confidentiality_limit = conn.spaces[space_id]
-                .crypto
-                .as_ref()
-                .map_or_else(
-                    || &conn.zero_rtt_crypto.as_ref().unwrap().packet,
-                    |keys| &keys.packet.local,
-                )
-                .confidentiality_limit();
-            if sent_with_keys.saturating_add(1) == confidentiality_limit {
-                // We still have time to attempt a graceful close
-                conn.close_inner(
-                    now,
-                    Close::Connection(frame::ConnectionClose {
-                        error_code: TransportErrorCode::AEAD_LIMIT_REACHED,
-                        frame_type: None,
-                        reason: Bytes::from_static(b"confidentiality limit reached"),
-                    }),
-                )
-            } else if sent_with_keys > confidentiality_limit {
-                // Confidentiality limited violated and there's nothing we can do
-                conn.kill(
-                    TransportError::AEAD_LIMIT_REACHED("confidentiality limit reached").into(),
-                );
-                return None;
+            SpaceId::Initial | SpaceId::Handshake => {
+                let (keys, sent_with_keys) = match space_id {
+                    SpaceId::Initial => {
+                        let space = conn.initial.as_ref().expect("initial packet space present");
+                        (&space.crypto, space.sent_with_keys)
+                    }
+                    SpaceId::Handshake => {
+                        let space = conn
+                            .handshake
+                            .as_ref()
+                            .expect("handshake packet space present");
+                        (&space.crypto, space.sent_with_keys)
+                    }
+                    SpaceId::Data => unreachable!(),
+                };
+                let confidentiality_limit = keys.packet.local.confidentiality_limit();
+                if sent_with_keys.saturating_add(1) == confidentiality_limit {
+                    conn.close_inner(
+                        now,
+                        Close::Connection(frame::ConnectionClose {
+                            error_code: TransportErrorCode::AEAD_LIMIT_REACHED,
+                            frame_type: None,
+                            reason: Bytes::from_static(b"confidentiality limit reached"),
+                        }),
+                    );
+                } else if sent_with_keys > confidentiality_limit {
+                    conn.kill(
+                        TransportError::AEAD_LIMIT_REACHED("confidentiality limit reached").into(),
+                    );
+                    return None;
+                }
             }
         }
 
-        let space = &mut conn.spaces[space_id];
         let exact_number = match space_id {
-            SpaceId::Data => conn.packet_number_filter.allocate(&mut conn.rng, space),
-            _ => space.get_tx_number(),
+            SpaceId::Initial => conn
+                .initial
+                .as_mut()
+                .expect("initial packet space present")
+                .get_tx_number(),
+            SpaceId::Handshake => conn
+                .handshake
+                .as_mut()
+                .expect("handshake packet space present")
+                .get_tx_number(),
+            SpaceId::Data => {
+                let space = conn
+                    .application
+                    .as_mut()
+                    .expect("application packet space present");
+                space.packet_number_filter.allocate(
+                    &mut conn.rng,
+                    &mut space.packets,
+                    &mut space.sent_with_keys,
+                )
+            }
         };
 
         let span = trace_span!("send", space = ?space_id, pn = exact_number).entered();
+        let (number, largest_acked) = match space_id {
+            SpaceId::Initial => {
+                let space = conn.initial.as_ref().expect("initial packet space present");
+                (
+                    PacketNumber::new(
+                        exact_number,
+                        space.packets.loss.largest_acked_packet.unwrap_or(0),
+                    ),
+                    space.packets.loss.largest_acked_packet.unwrap_or(0),
+                )
+            }
+            SpaceId::Handshake => {
+                let space = conn
+                    .handshake
+                    .as_ref()
+                    .expect("handshake packet space present");
+                (
+                    PacketNumber::new(
+                        exact_number,
+                        space.packets.loss.largest_acked_packet.unwrap_or(0),
+                    ),
+                    space.packets.loss.largest_acked_packet.unwrap_or(0),
+                )
+            }
+            SpaceId::Data => {
+                let space = conn
+                    .application
+                    .as_ref()
+                    .expect("application packet space present");
+                (
+                    PacketNumber::new(
+                        exact_number,
+                        space.packets.loss.largest_acked_packet.unwrap_or(0),
+                    ),
+                    space.packets.loss.largest_acked_packet.unwrap_or(0),
+                )
+            }
+        };
+        let _ = largest_acked;
 
-        let number = PacketNumber::new(exact_number, space.largest_acked_packet.unwrap_or(0));
         let header = match space_id {
-            SpaceId::Data if space.crypto.is_some() => Header::Short {
-                dst_cid,
-                number,
-                spin: if conn.spin_enabled {
-                    conn.spin
+            SpaceId::Data => {
+                let space = conn
+                    .application
+                    .as_ref()
+                    .expect("application packet space present");
+                if space.crypto.is_some() {
+                    Header::Short {
+                        dst_cid,
+                        number,
+                        spin: if conn.spin_enabled {
+                            conn.spin
+                        } else {
+                            conn.rng.random()
+                        },
+                        key_phase: space.key_phase,
+                    }
                 } else {
-                    conn.rng.random()
-                },
-                key_phase: conn.key_phase,
-            },
-            SpaceId::Data => Header::Long {
-                ty: LongType::ZeroRtt,
-                src_cid: conn.handshake_cid,
-                dst_cid,
-                number,
-                version,
-            },
+                    Header::Long {
+                        ty: LongType::ZeroRtt,
+                        src_cid: conn.handshake_cid,
+                        dst_cid,
+                        number,
+                        version,
+                    }
+                }
+            }
             SpaceId::Handshake => Header::Long {
                 ty: LongType::Handshake,
                 src_cid: conn.handshake_cid,
@@ -128,26 +197,44 @@ impl PacketBuilder {
             buffer[partial_encode.start] ^= FIXED_BIT;
         }
 
-        let (sample_size, tag_len) = if let Some(ref crypto) = space.crypto {
-            (
-                crypto.header.local.sample_size(),
-                crypto.packet.local.tag_len(),
-            )
-        } else if space_id == SpaceId::Data {
-            let zero_rtt = conn.zero_rtt_crypto.as_ref().unwrap();
-            (zero_rtt.header.sample_size(), zero_rtt.packet.tag_len())
-        } else {
-            unreachable!();
+        let (sample_size, tag_len) = match space_id {
+            SpaceId::Initial => {
+                let space = conn.initial.as_ref().expect("initial packet space present");
+                (
+                    space.crypto.header.local.sample_size(),
+                    space.crypto.packet.local.tag_len(),
+                )
+            }
+            SpaceId::Handshake => {
+                let space = conn
+                    .handshake
+                    .as_ref()
+                    .expect("handshake packet space present");
+                (
+                    space.crypto.header.local.sample_size(),
+                    space.crypto.packet.local.tag_len(),
+                )
+            }
+            SpaceId::Data => {
+                let space = conn
+                    .application
+                    .as_ref()
+                    .expect("application packet space present");
+                if let Some(ref crypto) = space.crypto {
+                    (
+                        crypto.header.local.sample_size(),
+                        crypto.packet.local.tag_len(),
+                    )
+                } else {
+                    let zero_rtt = space
+                        .zero_rtt_crypto
+                        .as_ref()
+                        .expect("0-RTT packet requires 0-RTT keys");
+                    (zero_rtt.header.sample_size(), zero_rtt.packet.tag_len())
+                }
+            }
         };
 
-        // Each packet must be large enough for header protection sampling, i.e. the combined
-        // lengths of the encoded packet number and protected payload must be at least 4 bytes
-        // longer than the sample required for header protection. Further, each packet should be at
-        // least tag_len + 6 bytes larger than the destination CID on incoming packets so that the
-        // peer may send stateless resets that are indistinguishable from regular traffic.
-
-        // pn_len + payload_len + tag_len >= sample_size + 4
-        // payload_len >= sample_size + 4 - pn_len - tag_len
         let min_size = Ord::max(
             buffer.len() + (sample_size + 4).saturating_sub(number.len() + tag_len),
             partial_encode.start + dst_cid.len() + 6,
@@ -169,12 +256,7 @@ impl PacketBuilder {
         })
     }
 
-    /// Append the minimum amount of padding to the packet such that, after encryption, the
-    /// enclosing datagram will occupy at least `min_size` bytes
     pub(super) fn pad_to(&mut self, min_size: u16) {
-        // The datagram might already have a larger minimum size than the caller is requesting, if
-        // e.g. we're coalescing packets and have populated more than `min_size` bytes with packets
-        // already.
         self.min_size = Ord::max(
             self.min_size,
             self.datagram_start + (min_size as usize) - self.tag_len,
@@ -202,34 +284,103 @@ impl PacketBuilder {
             false => 0,
         };
 
-        let packet = SentPacket {
-            path_generation: conn.path.generation(),
-            largest_acked: sent.largest_acked,
-            time_sent: now,
-            size,
-            ack_eliciting,
-            retransmits: sent.retransmits,
-            stream_frames: sent.stream_frames,
-        };
+        match space_id {
+            SpaceId::Data => {
+                let packet = SentPacket {
+                    path_generation: conn.path.generation(),
+                    largest_acked: sent.largest_acked,
+                    time_sent: now,
+                    size,
+                    ack_eliciting,
+                    frames: sent.retransmits,
+                };
+                conn.path.sent(
+                    exact_number,
+                    packet,
+                    &mut conn
+                        .application
+                        .as_mut()
+                        .expect("application packet space present")
+                        .packets,
+                );
+            }
+            SpaceId::Initial | SpaceId::Handshake => {
+                let frames = sent
+                    .retransmits
+                    .retransmits
+                    .map(|mut retransmits| Box::new(mem::take(&mut retransmits.crypto)));
+                let packet = SentPacket {
+                    path_generation: conn.path.generation(),
+                    largest_acked: sent.largest_acked,
+                    time_sent: now,
+                    size,
+                    ack_eliciting,
+                    frames,
+                };
+                match space_id {
+                    SpaceId::Initial => conn.path.sent(
+                        exact_number,
+                        packet,
+                        &mut conn
+                            .initial
+                            .as_mut()
+                            .expect("initial packet space present")
+                            .packets,
+                    ),
+                    SpaceId::Handshake => conn.path.sent(
+                        exact_number,
+                        packet,
+                        &mut conn
+                            .handshake
+                            .as_mut()
+                            .expect("handshake packet space present")
+                            .packets,
+                    ),
+                    SpaceId::Data => unreachable!(),
+                }
+            }
+        }
 
-        conn.path
-            .sent(exact_number, packet, &mut conn.spaces[space_id]);
         conn.stats.path.sent_packets += 1;
         conn.reset_keep_alive(now);
-        if size != 0 {
-            if ack_eliciting {
-                conn.spaces[space_id].time_of_last_ack_eliciting_packet = Some(now);
-                if conn.permit_idle_reset {
-                    conn.reset_idle_timeout(now, space_id);
+        if size != 0 && ack_eliciting {
+            match space_id {
+                SpaceId::Initial => {
+                    conn.initial
+                        .as_mut()
+                        .expect("initial packet space present")
+                        .packets
+                        .loss
+                        .time_of_last_ack_eliciting_packet = Some(now)
                 }
-                conn.permit_idle_reset = false;
+                SpaceId::Handshake => {
+                    conn.handshake
+                        .as_mut()
+                        .expect("handshake packet space present")
+                        .packets
+                        .loss
+                        .time_of_last_ack_eliciting_packet = Some(now)
+                }
+                SpaceId::Data => {
+                    conn.application
+                        .as_mut()
+                        .expect("application packet space present")
+                        .packets
+                        .loss
+                        .time_of_last_ack_eliciting_packet = Some(now)
+                }
             }
+            if conn.permit_idle_reset {
+                conn.reset_idle_timeout(now, space_id);
+            }
+            conn.permit_idle_reset = false;
+        }
+        if size != 0 {
             conn.set_loss_detection_timer(now);
             conn.path.pacing.on_transmit(size);
         }
     }
 
-    /// Encrypt packet, returning the length of the packet and whether padding was added
     pub(super) fn finish(
         self,
         conn: &mut Connection,
@@ -238,18 +389,36 @@ impl PacketBuilder {
     ) -> (usize, bool) {
         let pad = buffer.len() < self.min_size;
         if pad {
-            trace!("PADDING * {}", self.min_size - buffer.len());
             buffer.resize(self.min_size, 0);
         }
 
-        let space = &conn.spaces[self.space];
-        let (header_crypto, packet_crypto) = if let Some(ref crypto) = space.crypto {
-            (&*crypto.header.local, &*crypto.packet.local)
-        } else if self.space == SpaceId::Data {
-            let zero_rtt = conn.zero_rtt_crypto.as_ref().unwrap();
-            (&*zero_rtt.header, &*zero_rtt.packet)
-        } else {
-            unreachable!("tried to send {:?} packet without keys", self.space);
+        let (header_crypto, packet_crypto) = match self.space {
+            SpaceId::Initial => {
+                let space = conn.initial.as_ref().expect("initial packet space present");
+                (&*space.crypto.header.local, &*space.crypto.packet.local)
+            }
+            SpaceId::Handshake => {
+                let space = conn
+                    .handshake
+                    .as_ref()
+                    .expect("handshake packet space present");
+                (&*space.crypto.header.local, &*space.crypto.packet.local)
+            }
+            SpaceId::Data => {
+                let space = conn
+                    .application
+                    .as_ref()
+                    .expect("application packet space present");
+                if let Some(ref crypto) = space.crypto {
+                    (&*crypto.header.local, &*crypto.packet.local)
+                } else {
+                    let zero_rtt = space
+                        .zero_rtt_crypto
+                        .as_ref()
+                        .expect("0-RTT packet requires 0-RTT keys");
+                    (&*zero_rtt.header, &*zero_rtt.packet)
+                }
+            }
         };
 
         debug_assert_eq!(
@@ -268,11 +437,16 @@ impl PacketBuilder {
         );
 
         let len = buffer.len() - encode_start;
+        let is_0rtt = self.space == SpaceId::Data
+            && conn
+                .application
+                .as_ref()
+                .is_some_and(|space| space.crypto.is_none());
         conn.config.qlog_sink.emit_packet_sent(
             self.exact_number,
             len,
             self.space,
-            self.space == SpaceId::Data && conn.spaces[SpaceId::Data].crypto.is_none(),
+            is_0rtt,
             now,
             conn.orig_rem_cid,
         );

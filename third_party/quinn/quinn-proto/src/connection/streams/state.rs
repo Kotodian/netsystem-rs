@@ -9,8 +9,8 @@ use rustc_hash::FxHashMap;
 use tracing::{debug, trace};
 
 use super::{
-    PendingStreamsQueue, Recv, Retransmits, Send, SendState, ShouldTransmit, StreamDataError,
-    StreamDataIo, StreamEvent, StreamHalf, ThinRetransmits,
+    ApplicationRetransmits, ApplicationSentFrames, PendingStreamsQueue, Recv, Send, SendState,
+    ShouldTransmit, StreamDataError, StreamDataIo, StreamEvent, StreamHalf,
 };
 use crate::{
     coding::BufMutExt,
@@ -462,8 +462,8 @@ impl StreamsState {
     pub(in crate::connection) fn write_control_frames(
         &mut self,
         buf: &mut BytesMut,
-        pending: &mut Retransmits,
-        retransmits: &mut ThinRetransmits,
+        pending: &mut ApplicationRetransmits,
+        retransmits: &mut ApplicationSentFrames,
         stats: &mut FrameStats,
         max_size: usize,
     ) {
@@ -867,7 +867,7 @@ impl StreamsState {
     /// Queues MAX_STREAM_ID frames in `pending` if needed
     ///
     /// Returns whether any frames were queued.
-    pub(crate) fn queue_max_stream_id(&mut self, pending: &mut Retransmits) -> bool {
+    pub(crate) fn queue_max_stream_id(&mut self, pending: &mut ApplicationRetransmits) -> bool {
         let mut queued = false;
         for dir in Dir::iter() {
             let diff = self.max_remote[dir as usize] - self.sent_max_remote[dir as usize];
@@ -1162,7 +1162,7 @@ mod tests {
             ..TransportParameters::default()
         });
 
-        let (mut pending, state) = (Retransmits::default(), ConnState::Established);
+        let (mut pending, state) = (ApplicationRetransmits::default(), ConnState::Established);
         let id = Streams {
             state: &mut server,
             conn_state: &state,
@@ -1210,7 +1210,7 @@ mod tests {
             ..TransportParameters::default()
         });
 
-        let (mut pending, state) = (Retransmits::default(), ConnState::Established);
+        let (mut pending, state) = (ApplicationRetransmits::default(), ConnState::Established);
         let id = Streams {
             state: &mut server,
             conn_state: &state,
@@ -1270,7 +1270,7 @@ mod tests {
         assert_eq!(client.data_recvd, 2048);
         assert_eq!(client.local_max_data - initial_max, 0);
 
-        let mut pending = Retransmits::default();
+        let mut pending = ApplicationRetransmits::default();
         let mut recv = RecvStream {
             id,
             state: &mut client,
@@ -1311,7 +1311,7 @@ mod tests {
         assert_eq!(client.data_recvd, 2048);
         assert_eq!(client.local_max_data - initial_max, 0);
 
-        let mut pending = Retransmits::default();
+        let mut pending = ApplicationRetransmits::default();
         let mut recv = RecvStream {
             id,
             state: &mut client,
@@ -1436,7 +1436,7 @@ mod tests {
         );
         assert_eq!(client.local_max_data, initial_max);
 
-        let mut pending = Retransmits::default();
+        let mut pending = ApplicationRetransmits::default();
         let mut recv = RecvStream {
             id,
             state: &mut client,
@@ -1490,7 +1490,7 @@ mod tests {
             ShouldTransmit(false)
         );
 
-        let mut pending = Retransmits::default();
+        let mut pending = ApplicationRetransmits::default();
         let mut recv = RecvStream {
             id,
             state: &mut client,
@@ -1527,7 +1527,7 @@ mod tests {
             ..TransportParameters::default()
         });
 
-        let (mut pending, state) = (Retransmits::default(), ConnState::Established);
+        let (mut pending, state) = (ApplicationRetransmits::default(), ConnState::Established);
         let id = Streams {
             state: &mut server,
             conn_state: &state,
@@ -1586,7 +1586,7 @@ mod tests {
             ..TransportParameters::default()
         });
 
-        let (mut pending, state) = (Retransmits::default(), ConnState::Established);
+        let (mut pending, state) = (ApplicationRetransmits::default(), ConnState::Established);
         let mut streams = Streams {
             state: &mut server,
             conn_state: &state,
@@ -1642,7 +1642,7 @@ mod tests {
             ..TransportParameters::default()
         });
 
-        let (mut pending, state) = (Retransmits::default(), ConnState::Established);
+        let (mut pending, state) = (ApplicationRetransmits::default(), ConnState::Established);
         let mut streams = Streams {
             state: &mut server,
             conn_state: &state,
@@ -1710,7 +1710,7 @@ mod tests {
                 ..TransportParameters::default()
             });
 
-            let (mut pending, state) = (Retransmits::default(), ConnState::Established);
+            let (mut pending, state) = (ApplicationRetransmits::default(), ConnState::Established);
             let mut streams = Streams {
                 state: &mut server,
                 conn_state: &state,
@@ -1792,7 +1792,7 @@ mod tests {
             ..TransportParameters::default()
         });
 
-        let (mut pending, state) = (Retransmits::default(), ConnState::Established);
+        let (mut pending, state) = (ApplicationRetransmits::default(), ConnState::Established);
         let mut streams = Streams {
             state: &mut server,
             conn_state: &state,
@@ -1880,7 +1880,7 @@ mod tests {
                 32,
             )
             .unwrap();
-        let mut pending = Retransmits::default();
+        let mut pending = ApplicationRetransmits::default();
         let mut stream = RecvStream {
             id,
             state: &mut client,
@@ -1900,7 +1900,7 @@ mod tests {
             initial_max_stream_data_uni: 42u32.into(),
             ..TransportParameters::default()
         });
-        let (mut pending, state) = (Retransmits::default(), ConnState::Established);
+        let (mut pending, state) = (ApplicationRetransmits::default(), ConnState::Established);
         let mut streams = Streams {
             state: &mut server,
             conn_state: &state,
@@ -1954,7 +1954,7 @@ mod tests {
         );
 
         // Free stream 127
-        let mut pending = Retransmits::default();
+        let mut pending = ApplicationRetransmits::default();
         let mut stream = RecvStream {
             id: StreamId::new(Side::Server, Dir::Uni, 127),
             state: &mut client,
@@ -2049,7 +2049,7 @@ mod tests {
         client.set_max_concurrent(Dir::Uni, 127u32.into());
 
         // Free stream 127
-        let mut pending = Retransmits::default();
+        let mut pending = ApplicationRetransmits::default();
         let mut stream = RecvStream {
             id: StreamId::new(Side::Server, Dir::Uni, 127),
             state: &mut client,
@@ -2083,7 +2083,7 @@ mod tests {
             }),
             Ok(ShouldTransmit(false))
         );
-        let mut pending = Retransmits::default();
+        let mut pending = ApplicationRetransmits::default();
         let mut stream = RecvStream {
             id: StreamId::new(Side::Server, Dir::Uni, 126),
             state: &mut client,
@@ -2202,7 +2202,7 @@ mod tests {
         assert_eq!(server.write_limit(), initial_send_window);
         assert_eq!(server.poll(), None);
 
-        let mut retransmits = Retransmits::default();
+        let mut retransmits = ApplicationRetransmits::default();
         let conn_state = ConnState::Established;
 
         let stream_id = Streams {
@@ -2280,7 +2280,7 @@ mod tests {
         assert_eq!(server.write_limit(), initial_send_window);
         assert_eq!(server.poll(), None);
 
-        let mut retransmits = Retransmits::default();
+        let mut retransmits = ApplicationRetransmits::default();
         let conn_state = ConnState::Established;
 
         let stream_id = Streams {

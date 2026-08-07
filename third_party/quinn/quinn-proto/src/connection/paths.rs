@@ -5,7 +5,7 @@ use tracing::trace;
 use super::{
     mtud::MtuDiscovery,
     pacing::Pacer,
-    spaces::{PacketSpace, SentPacket},
+    spaces::{PacketNumberSpace, SentPacket},
 };
 use crate::{congestion, packet::SpaceId, Duration, Instant, TransportConfig, TIMER_GRANULARITY};
 
@@ -160,7 +160,12 @@ impl PathData {
     }
 
     /// Account for transmission of `packet` with number `pn` in `space`
-    pub(super) fn sent(&mut self, pn: u64, packet: SentPacket, space: &mut PacketSpace) {
+    pub(super) fn sent<S>(
+        &mut self,
+        pn: u64,
+        packet: SentPacket<S>,
+        space: &mut PacketNumberSpace<S>,
+    ) {
         self.in_flight.insert(&packet);
         if self.first_packet.is_none() {
             self.first_packet = Some(pn);
@@ -172,7 +177,7 @@ impl PathData {
 
     /// Remove `packet` with number `pn` from this path's congestion control counters, or return
     /// `false` if `pn` was sent before this path was established.
-    pub(super) fn remove_in_flight(&mut self, packet: &SentPacket) -> bool {
+    pub(super) fn remove_in_flight<S>(&mut self, packet: &SentPacket<S>) -> bool {
         if packet.path_generation != self.generation {
             return false;
         }
@@ -443,13 +448,13 @@ impl InFlight {
         }
     }
 
-    fn insert(&mut self, packet: &SentPacket) {
+    fn insert<S>(&mut self, packet: &SentPacket<S>) {
         self.bytes += u64::from(packet.size);
         self.ack_eliciting += u64::from(packet.ack_eliciting);
     }
 
     /// Update counters to account for a packet becoming acknowledged, lost, or abandoned
-    fn remove(&mut self, packet: &SentPacket) {
+    fn remove<S>(&mut self, packet: &SentPacket<S>) {
         self.bytes -= u64::from(packet.size);
         self.ack_eliciting -= u64::from(packet.ack_eliciting);
     }
