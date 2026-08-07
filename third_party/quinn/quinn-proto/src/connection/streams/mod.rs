@@ -7,7 +7,7 @@ use bytes::Bytes;
 use thiserror::Error;
 use tracing::trace;
 
-use super::spaces::{Retransmits, ThinRetransmits};
+use super::spaces::{ApplicationRetransmits, ApplicationSentFrames};
 use crate::{
     connection::streams::state::{get_or_insert_recv, get_or_insert_send, StreamRecv},
     frame, Dir, StreamId, VarInt,
@@ -108,7 +108,7 @@ impl<'a> Streams<'a> {
 pub struct RecvStream<'a> {
     pub(super) id: StreamId,
     pub(super) state: &'a mut StreamsState,
-    pub(super) pending: &'a mut Retransmits,
+    pub(super) pending: &'a mut ApplicationRetransmits,
 }
 
 impl RecvStream<'_> {
@@ -260,7 +260,7 @@ impl RecvStream<'_> {
 pub struct SendStream<'a> {
     pub(super) id: StreamId,
     pub(super) state: &'a mut StreamsState,
-    pub(super) pending: &'a mut Retransmits,
+    pub(super) pending: &'a mut ApplicationRetransmits,
     pub(super) conn_state: &'a super::State,
 }
 
@@ -270,7 +270,7 @@ impl<'a> SendStream<'a> {
     pub fn new(
         id: StreamId,
         state: &'a mut StreamsState,
-        pending: &'a mut Retransmits,
+        pending: &'a mut ApplicationRetransmits,
         conn_state: &'a super::State,
     ) -> Self {
         Self {

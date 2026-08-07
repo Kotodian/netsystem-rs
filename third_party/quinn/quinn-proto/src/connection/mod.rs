@@ -8,18 +8,17 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
-use frame::StreamMetaVec;
 
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use thiserror::Error;
-use tracing::{debug, error, trace, trace_span, warn};
+use tracing::{debug, trace, trace_span, warn};
 
 use crate::{
     cid_generator::ConnectionIdGenerator,
     cid_queue::CidQueue,
     coding::BufMutExt,
     config::{ServerConfig, TransportConfig},
-    crypto::{self, KeyPair, Keys, PacketKey},
+    crypto::{self, Keys},
     frame::{self, Close, Datagram, FrameStruct, NewConnectionId, NewToken},
     packet::{
         FixedLengthConnectionIdParser, Header, InitialHeader, InitialPacket, LongType, Packet,
@@ -69,10 +68,15 @@ mod send_buffer;
 
 mod spaces;
 #[cfg(fuzzing)]
-pub use spaces::Retransmits;
+pub use spaces::ApplicationRetransmits;
 #[cfg(not(fuzzing))]
-use spaces::Retransmits;
-use spaces::{PacketNumberFilter, PacketSpace, SendableFrames, SentPacket, ThinRetransmits};
+use spaces::ApplicationRetransmits;
+#[cfg(test)]
+use spaces::PacketNumberFilter;
+use spaces::{
+    ApplicationSentFrames, ApplicationSpace, HandshakeSpace, PacketNumberSpace, SendableFrames,
+    SentPacket,
+};
 
 mod stats;
 pub use stats::{ConnectionStats, FrameStats, PathStats, UdpStats};
@@ -156,11 +160,6 @@ pub struct Connection {
     side: ConnectionSide,
     /// Whether or not 0-RTT was enabled during the handshake. Does not imply acceptance.
     zero_rtt_enabled: bool,
-    /// Set if 0-RTT is supported, then cleared when no longer needed.
-    zero_rtt_crypto: Option<ZeroRttCrypto>,
-    key_phase: bool,
-    /// How many packets are in the current key phase. Used only for `Data` space.
-    key_phase_size: u64,
     /// Transport parameters set by the peer
     peer_params: TransportParameters,
     /// Source ConnectionId of the first packet received from the peer
@@ -176,17 +175,14 @@ pub struct Connection {
     spin_enabled: bool,
     /// Outgoing spin bit state
     spin: bool,
-    /// Packet number spaces: initial, handshake, 1-RTT
-    spaces: [PacketSpace; 3],
+    /// Initial packet space. Dropped when Initial keys are discarded.
+    initial: Option<Box<HandshakeSpace>>,
+    /// Handshake packet space. Dropped when Handshake keys are discarded.
+    handshake: Option<Box<HandshakeSpace>>,
+    /// Application packet space. Allocated lazily for 0-RTT or 1-RTT keys.
+    application: Option<Box<ApplicationSpace>>,
     /// Highest usable packet number space
     highest_space: SpaceId,
-    /// 1-RTT keys used prior to a key update
-    prev_crypto: Option<PrevCrypto>,
-    /// 1-RTT keys to be used for the next key update
-    ///
-    /// These are generated in advance to prevent timing attacks and/or DoS by third-party attackers
-    /// spoofing key updates.
-    next_crypto: Option<KeyPair<Box<dyn PacketKey>>>,
     accepted_0rtt: bool,
     /// Whether the idle timer should be reset the next time an ack-eliciting packet is transmitted.
     permit_idle_reset: bool,
@@ -197,8 +193,6 @@ pub struct Connection {
     authentication_failures: u64,
     /// Why the connection was lost, if it has been
     error: Option<ConnectionError>,
-    /// Identifies Data-space packet numbers to skip. Not used in earlier spaces.
-    packet_number_filter: PacketNumberFilter,
 
     //
     // Queued non-retransmittable 1-RTT data
@@ -265,10 +259,7 @@ impl Connection {
         let path_validated = side_args.path_validated();
         let connection_side = ConnectionSide::from(side_args);
         let side = connection_side.side();
-        let initial_space = PacketSpace {
-            crypto: Some(crypto.initial_keys(&init_cid, side)),
-            ..PacketSpace::new(now)
-        };
+        let initial_space = Box::new(HandshakeSpace::new(crypto.initial_keys(&init_cid, side)));
         let state = State::Handshake(state::Handshake {
             rem_cid_set: side.is_server(),
             expected_token: Bytes::new(),
@@ -294,15 +285,6 @@ impl Connection {
             state,
             side: connection_side,
             zero_rtt_enabled: false,
-            zero_rtt_crypto: None,
-            key_phase: false,
-            // A small initial key phase size ensures peers that don't handle key updates correctly
-            // fail sooner rather than later. It's okay for both peers to do this, as the first one
-            // to perform an update will reset the other's key phase size in `update_keys`, and a
-            // simultaneous key update by both is just like a regular key update with a really fast
-            // response. Inspired by quic-go's similar behavior of performing the first key update
-            // at the 100th short-header packet.
-            key_phase_size: rng.random_range(10..1000),
             peer_params: TransportParameters::default(),
             orig_rem_cid: rem_cid,
             initial_dst_cid: init_cid,
@@ -311,10 +293,10 @@ impl Connection {
             endpoint_events: VecDeque::new(),
             spin_enabled: config.allow_spin && rng.random_ratio(7, 8),
             spin: false,
-            spaces: [initial_space, PacketSpace::new(now), PacketSpace::new(now)],
+            initial: Some(initial_space),
+            handshake: None,
+            application: None,
             highest_space: SpaceId::Initial,
-            prev_crypto: None,
-            next_crypto: None,
             accepted_0rtt: false,
             permit_idle_reset: true,
             idle_timeout: match config.max_idle_timeout {
@@ -324,14 +306,6 @@ impl Connection {
             timers: TimerTable::default(),
             authentication_failures: 0,
             error: None,
-            #[cfg(test)]
-            packet_number_filter: match config.deterministic_packet_numbers {
-                false => PacketNumberFilter::new(&mut rng),
-                true => PacketNumberFilter::disabled(),
-            },
-            #[cfg(not(test))]
-            packet_number_filter: PacketNumberFilter::new(&mut rng),
-
             path_responses: PathResponses::default(),
             close: false,
 
@@ -528,7 +502,11 @@ impl Connection {
         RecvStream {
             id,
             state: &mut self.streams,
-            pending: &mut self.spaces[SpaceId::Data].pending,
+            pending: &mut self
+                .application
+                .as_mut()
+                .expect("application packet space present")
+                .retransmits,
         }
     }
 
@@ -539,7 +517,11 @@ impl Connection {
         SendStream {
             id,
             state: &mut self.streams,
-            pending: &mut self.spaces[SpaceId::Data].pending,
+            pending: &mut self
+                .application
+                .as_mut()
+                .expect("application packet space present")
+                .retransmits,
             conn_state: &self.state,
         }
     }
@@ -580,7 +562,23 @@ impl Connection {
         for space in SpaceId::iter() {
             let request_immediate_ack =
                 space == SpaceId::Data && self.peer_supports_ack_frequency();
-            self.spaces[space].maybe_queue_probe(request_immediate_ack, &self.streams);
+            match space {
+                SpaceId::Initial => {
+                    if let Some(space) = self.initial.as_mut() {
+                        space.maybe_queue_probe();
+                    }
+                }
+                SpaceId::Handshake => {
+                    if let Some(space) = self.handshake.as_mut() {
+                        space.maybe_queue_probe();
+                    }
+                }
+                SpaceId::Data => {
+                    if let Some(space) = self.application.as_mut() {
+                        space.maybe_queue_probe(request_immediate_ack, &self.streams);
+                    }
+                }
+            }
         }
 
         // Check whether we need to send a close message
@@ -603,11 +601,15 @@ impl Connection {
 
         // Check whether we need to send an ACK_FREQUENCY frame
         if let Some(config) = &self.config.ack_frequency_config {
-            self.spaces[SpaceId::Data].pending.ack_frequency = self
-                .ack_frequency
-                .should_send_ack_frequency(self.path.rtt.get(), config, &self.peer_params)
-                && self.highest_space == SpaceId::Data
+            let send_ack_frequency = self.ack_frequency.should_send_ack_frequency(
+                self.path.rtt.get(),
+                config,
+                &self.peer_params,
+            ) && self.highest_space == SpaceId::Data
                 && self.peer_supports_ack_frequency();
+            if let Some(space) = self.application.as_mut() {
+                space.retransmits.ack_frequency = send_ack_frequency;
+            }
         }
 
         // Reserving capacity can provide more capacity than we asked for. However, we are not
@@ -635,20 +637,57 @@ impl Connection {
             // handle large fixed-size frames, which only exist in 1-RTT (application datagrams). We
             // don't account for coalesced packets potentially occupying space because frames can
             // always spill into the next datagram.
-            let pn = self.packet_number_filter.peek(&self.spaces[SpaceId::Data]);
+            let pn = self
+                .application
+                .as_ref()
+                .map(|space| space.packet_number_filter.peek(space))
+                .unwrap_or(0);
             let frame_space_1rtt =
                 segment_size.saturating_sub(self.predict_1rtt_overhead(Some(pn)));
 
             // Is there data or a close message to send in this space?
             let can_send = self.space_can_send(space_id, frame_space_1rtt);
-            if can_send.is_empty() && (!close || self.spaces[space_id].crypto.is_none()) {
+            let space_has_crypto = match space_id {
+                SpaceId::Initial => self.initial.is_some(),
+                SpaceId::Handshake => self.handshake.is_some(),
+                SpaceId::Data => self
+                    .application
+                    .as_ref()
+                    .is_some_and(|space| space.crypto.is_some()),
+            };
+            if can_send.is_empty() && (!close || !space_has_crypto) {
                 space_idx += 1;
                 continue;
             }
 
-            let mut ack_eliciting = !self.spaces[space_id].pending.is_empty(&self.streams)
-                || self.spaces[space_id].ping_pending
-                || self.spaces[space_id].immediate_ack_pending;
+            let (retransmits_pending, ping_pending, immediate_ack_pending) = match space_id {
+                SpaceId::Initial | SpaceId::Handshake => {
+                    let space = if space_id == SpaceId::Initial {
+                        self.initial.as_ref().expect("initial packet space present")
+                    } else {
+                        self.handshake
+                            .as_ref()
+                            .expect("handshake packet space present")
+                    };
+                    (
+                        !space.crypto_retransmits.is_empty(),
+                        space.packets.ping_pending,
+                        false,
+                    )
+                }
+                SpaceId::Data => {
+                    let space = self
+                        .application
+                        .as_ref()
+                        .expect("application packet space present");
+                    (
+                        !space.retransmits.is_empty(&self.streams),
+                        space.packets.ping_pending,
+                        space.immediate_ack_pending,
+                    )
+                }
+            };
+            let mut ack_eliciting = retransmits_pending || ping_pending || immediate_ack_pending;
             if space_id == SpaceId::Data {
                 ack_eliciting |= self.can_send_1rtt(frame_space_1rtt);
             }
@@ -664,14 +703,35 @@ impl Connection {
                 buf.len()
             };
 
-            let tag_len = if let Some(ref crypto) = self.spaces[space_id].crypto {
-                crypto.packet.local.tag_len()
-            } else if space_id == SpaceId::Data {
-                self.zero_rtt_crypto.as_ref().expect(
-                    "sending packets in the application data space requires known 0-RTT or 1-RTT keys",
-                ).packet.tag_len()
-            } else {
-                unreachable!("tried to send {:?} packet without keys", space_id)
+            let tag_len = match space_id {
+                SpaceId::Initial | SpaceId::Handshake => {
+                    let space = if space_id == SpaceId::Initial {
+                        self.initial.as_ref().expect("initial packet space present")
+                    } else {
+                        self.handshake
+                            .as_ref()
+                            .expect("handshake packet space present")
+                    };
+                    space.crypto.packet.local.tag_len()
+                }
+                SpaceId::Data => {
+                    let space = self
+                        .application
+                        .as_ref()
+                        .expect("application packet space present");
+                    if let Some(ref crypto) = space.crypto {
+                        crypto.packet.local.tag_len()
+                    } else {
+                        space
+                            .zero_rtt_crypto
+                            .as_ref()
+                            .expect(
+                                "sending packets in the application data space requires known 0-RTT or 1-RTT keys",
+                            )
+                            .packet
+                            .tag_len()
+                    }
+                }
             };
             if !coalesce || buf_capacity - buf_end < MIN_PACKET_SPACE + tag_len {
                 // We need to send 1 more datagram and extend the buffer for that.
@@ -698,7 +758,33 @@ impl Connection {
 
                 // Congestion control and pacing checks
                 // Tail loss probes must not be blocked by congestion, or a deadlock could arise
-                if ack_eliciting && self.spaces[space_id].loss_probes == 0 {
+                let loss_probes = match space_id {
+                    SpaceId::Initial => {
+                        self.initial
+                            .as_ref()
+                            .expect("initial packet space present")
+                            .packets
+                            .loss
+                            .loss_probes
+                    }
+                    SpaceId::Handshake => {
+                        self.handshake
+                            .as_ref()
+                            .expect("handshake packet space present")
+                            .packets
+                            .loss
+                            .loss_probes
+                    }
+                    SpaceId::Data => {
+                        self.application
+                            .as_ref()
+                            .expect("application packet space present")
+                            .packets
+                            .loss
+                            .loss_probes
+                    }
+                };
+                if ack_eliciting && loss_probes == 0 {
                     // Assume the current packet will get padded to fill the segment
                     let untracked_bytes = if let Some(builder) = &builder_storage {
                         buf_capacity - builder.partial_encode.start
@@ -806,14 +892,39 @@ impl Connection {
                 }
 
                 // Allocate space for another datagram
-                let next_datagram_size_limit = match self.spaces[space_id].loss_probes {
-                    0 => segment_size,
-                    _ => {
-                        self.spaces[space_id].loss_probes -= 1;
-                        // Clamp the datagram to at most the minimum MTU to ensure that loss probes
-                        // can get through and enable recovery even if the path MTU has shrank
-                        // unexpectedly.
-                        std::cmp::min(segment_size, usize::from(INITIAL_MTU))
+                let next_datagram_size_limit = match space_id {
+                    SpaceId::Initial => {
+                        let space = self.initial.as_mut().expect("initial packet space present");
+                        if space.packets.loss.loss_probes == 0 {
+                            segment_size
+                        } else {
+                            space.packets.loss.loss_probes -= 1;
+                            std::cmp::min(segment_size, usize::from(INITIAL_MTU))
+                        }
+                    }
+                    SpaceId::Handshake => {
+                        let space = self
+                            .handshake
+                            .as_mut()
+                            .expect("handshake packet space present");
+                        if space.packets.loss.loss_probes == 0 {
+                            segment_size
+                        } else {
+                            space.packets.loss.loss_probes -= 1;
+                            std::cmp::min(segment_size, usize::from(INITIAL_MTU))
+                        }
+                    }
+                    SpaceId::Data => {
+                        let space = self
+                            .application
+                            .as_mut()
+                            .expect("application packet space present");
+                        if space.packets.loss.loss_probes == 0 {
+                            segment_size
+                        } else {
+                            space.packets.loss.loss_probes -= 1;
+                            std::cmp::min(segment_size, usize::from(INITIAL_MTU))
+                        }
                     }
                 };
                 buf_capacity += next_datagram_size_limit;
@@ -853,16 +964,15 @@ impl Connection {
             // From here on, we've determined that a packet will definitely be sent.
             //
 
-            if self.spaces[SpaceId::Initial].crypto.is_some()
-                && space_id == SpaceId::Handshake
-                && self.side.is_client()
-            {
+            if self.initial.is_some() && space_id == SpaceId::Handshake && self.side.is_client() {
                 // A client stops both sending and processing Initial packets when it
                 // sends its first Handshake packet.
                 self.discard_space(now, SpaceId::Initial);
             }
-            if let Some(ref mut prev) = self.prev_crypto {
-                prev.update_unacked = false;
+            if let Some(space) = self.application.as_mut() {
+                if let Some(ref mut prev) = space.prev_crypto {
+                    prev.update_unacked = false;
+                }
             }
 
             debug_assert!(
@@ -892,15 +1002,49 @@ impl Connection {
                 // a better approximate on what data has been processed. This is
                 // especially important with ack delay, since the peer might not
                 // have gotten any other ACK for the data earlier on.
-                if !self.spaces[space_id].pending_acks.ranges().is_empty() {
-                    Self::populate_acks(
-                        now,
-                        self.receiving_ecn,
-                        &mut SentFrames::default(),
-                        &mut self.spaces[space_id],
-                        buf,
-                        &mut self.stats,
-                    );
+                match space_id {
+                    SpaceId::Initial => {
+                        if let Some(space) = self.initial.as_mut() {
+                            if !space.packets.pending_acks.ranges().is_empty() {
+                                Self::populate_acks(
+                                    now,
+                                    self.receiving_ecn,
+                                    &mut SentFrames::default(),
+                                    &mut space.packets,
+                                    buf,
+                                    &mut self.stats,
+                                );
+                            }
+                        }
+                    }
+                    SpaceId::Handshake => {
+                        if let Some(space) = self.handshake.as_mut() {
+                            if !space.packets.pending_acks.ranges().is_empty() {
+                                Self::populate_acks(
+                                    now,
+                                    self.receiving_ecn,
+                                    &mut SentFrames::default(),
+                                    &mut space.packets,
+                                    buf,
+                                    &mut self.stats,
+                                );
+                            }
+                        }
+                    }
+                    SpaceId::Data => {
+                        if let Some(space) = self.application.as_mut() {
+                            if !space.packets.pending_acks.ranges().is_empty() {
+                                Self::populate_acks(
+                                    now,
+                                    self.receiving_ecn,
+                                    &mut SentFrames::default(),
+                                    &mut space.packets,
+                                    buf,
+                                    &mut self.stats,
+                                );
+                            }
+                        }
+                    }
                 }
 
                 // Since there only 64 ACK frames there will always be enough space
@@ -1013,7 +1157,29 @@ impl Connection {
             pad_datagram |= sent.requires_padding;
 
             if sent.largest_acked.is_some() {
-                self.spaces[space_id].pending_acks.acks_sent();
+                match space_id {
+                    SpaceId::Initial => self
+                        .initial
+                        .as_mut()
+                        .expect("initial packet space present")
+                        .packets
+                        .pending_acks
+                        .acks_sent(),
+                    SpaceId::Handshake => self
+                        .handshake
+                        .as_mut()
+                        .expect("handshake packet space present")
+                        .packets
+                        .pending_acks
+                        .acks_sent(),
+                    SpaceId::Data => self
+                        .application
+                        .as_mut()
+                        .expect("application packet space present")
+                        .packets
+                        .pending_acks
+                        .acks_sent(),
+                }
                 self.timers.stop(Timer::MaxAckDelay);
             }
 
@@ -1058,10 +1224,18 @@ impl Connection {
         // Send MTU probe if necessary
         if buf.is_empty() && self.state.is_established() {
             let space_id = SpaceId::Data;
-            let probe_size = self
-                .path
-                .mtud
-                .poll_transmit(now, self.packet_number_filter.peek(&self.spaces[space_id]))?;
+            let probe_size = self.path.mtud.poll_transmit(
+                now,
+                self.application
+                    .as_ref()
+                    .expect("application packet space present")
+                    .packet_number_filter
+                    .peek(
+                        self.application
+                            .as_ref()
+                            .expect("application packet space present"),
+                    ),
+            )?;
 
             let buf_capacity = probe_size as usize;
             buf.reserve(buf_capacity);
@@ -1185,15 +1359,22 @@ impl Connection {
 
     /// Indicate what types of frames are ready to send for the given space
     fn space_can_send(&self, space_id: SpaceId, frame_space_1rtt: usize) -> SendableFrames {
-        if self.spaces[space_id].crypto.is_none()
-            && (space_id != SpaceId::Data
-                || self.zero_rtt_crypto.is_none()
-                || self.side.is_server())
-        {
-            // No keys available for this space
-            return SendableFrames::empty();
-        }
-        let mut can_send = self.spaces[space_id].can_send(&self.streams);
+        let mut can_send = match space_id {
+            SpaceId::Initial => match self.initial.as_ref() {
+                Some(space) => space.can_send(),
+                None => return SendableFrames::empty(),
+            },
+            SpaceId::Handshake => match self.handshake.as_ref() {
+                Some(space) => space.can_send(),
+                None => return SendableFrames::empty(),
+            },
+            SpaceId::Data => match self.application.as_ref() {
+                Some(space) if space.crypto.is_some() || space.zero_rtt_crypto.is_some() => {
+                    space.can_send(&self.streams)
+                }
+                _ => return SendableFrames::empty(),
+            },
+        };
         if space_id == SpaceId::Data {
             can_send.other |= self.can_send_1rtt(frame_space_1rtt);
         }
@@ -1229,7 +1410,12 @@ impl Connection {
             NewIdentifiers(ids, now) => {
                 self.local_cid_state.new_cids(&ids, now);
                 ids.into_iter().rev().for_each(|frame| {
-                    self.spaces[SpaceId::Data].pending.new_cids.push(frame);
+                    self.application
+                        .as_mut()
+                        .expect("application packet space present")
+                        .retransmits
+                        .new_cids
+                        .push(frame);
                 });
                 // Update Timer::PushNewCid
                 if self
@@ -1282,8 +1468,10 @@ impl Connection {
                     );
                 }
                 Timer::KeyDiscard => {
-                    self.zero_rtt_crypto = None;
-                    self.prev_crypto = None;
+                    if let Some(space) = self.application.as_mut() {
+                        space.zero_rtt_crypto = None;
+                        space.prev_crypto = None;
+                    }
                 }
                 Timer::PathValidation => {
                     debug!("path validation failed");
@@ -1307,11 +1495,10 @@ impl Connection {
                     }
                 }
                 Timer::MaxAckDelay => {
-                    trace!("max ack delay reached");
                     // This timer is only armed in the Data space
-                    self.spaces[SpaceId::Data]
-                        .pending_acks
-                        .on_max_ack_delay_timeout()
+                    if let Some(space) = self.application.as_mut() {
+                        space.packets.pending_acks.on_max_ack_delay_timeout();
+                    }
                 }
             }
         }
@@ -1364,7 +1551,29 @@ impl Connection {
     ///
     /// Causes an ACK-eliciting packet to be transmitted.
     pub fn ping(&mut self) {
-        self.spaces[self.highest_space].ping_pending = true;
+        match self.highest_space {
+            SpaceId::Initial => {
+                self.initial
+                    .as_mut()
+                    .expect("initial packet space present")
+                    .packets
+                    .ping_pending = true
+            }
+            SpaceId::Handshake => {
+                self.handshake
+                    .as_mut()
+                    .expect("handshake packet space present")
+                    .packets
+                    .ping_pending = true
+            }
+            SpaceId::Data => {
+                self.application
+                    .as_mut()
+                    .expect("application packet space present")
+                    .packets
+                    .ping_pending = true
+            }
+        }
     }
 
     /// Update traffic keys spontaneously
@@ -1372,13 +1581,15 @@ impl Connection {
     /// This can be useful for testing key updates, as they otherwise only happen infrequently.
     pub fn force_key_update(&mut self) {
         if !self.state.is_established() {
-            debug!("ignoring forced key update in illegal state");
             return;
         }
-        if self.prev_crypto.is_some() {
+        if self
+            .application
+            .as_ref()
+            .is_some_and(|space| space.prev_crypto.is_some())
+        {
             // We already just updated, or are currently updating, the keys. Concurrent key updates
             // are illegal.
-            debug!("ignoring redundant forced key update");
             return;
         }
         self.update_keys(None, false);
@@ -1437,7 +1648,9 @@ impl Connection {
 
     /// Whether there are any pending retransmits
     pub fn has_pending_retransmits(&self) -> bool {
-        !self.spaces[SpaceId::Data].pending.is_empty(&self.streams)
+        self.application
+            .as_ref()
+            .is_some_and(|space| !space.retransmits.is_empty(&self.streams))
     }
 
     /// Look up whether we're the client or server of this Connection
@@ -1495,7 +1708,11 @@ impl Connection {
         self.streams.set_max_concurrent(dir, count);
         // If the limit was reduced, then a flow control update previously deemed insignificant may
         // now be significant.
-        let pending = &mut self.spaces[SpaceId::Data].pending;
+        let pending = &mut self
+            .application
+            .as_mut()
+            .expect("application packet space present")
+            .retransmits;
         self.streams.queue_max_stream_id(pending);
     }
 
@@ -1516,7 +1733,11 @@ impl Connection {
     /// See [`TransportConfig::receive_window()`]
     pub fn set_receive_window(&mut self, receive_window: VarInt) {
         if self.streams.set_receive_window(receive_window) {
-            self.spaces[SpaceId::Data].pending.max_data = true;
+            self.application
+                .as_mut()
+                .expect("application packet space present")
+                .retransmits
+                .max_data = true;
         }
     }
 
@@ -1526,34 +1747,116 @@ impl Connection {
         space: SpaceId,
         ack: frame::Ack,
     ) -> Result<(), TransportError> {
-        if ack.largest >= self.spaces[space].next_packet_number {
-            return Err(TransportError::PROTOCOL_VIOLATION("unsent packet acked"));
-        }
-        let new_largest = {
-            let space = &mut self.spaces[space];
-            if space
-                .largest_acked_packet
-                .map_or(true, |pn| ack.largest > pn)
-            {
-                space.largest_acked_packet = Some(ack.largest);
-                if let Some(info) = space.sent_packets.get(&ack.largest) {
-                    // This should always succeed, but a misbehaving peer might ACK a packet we
-                    // haven't sent. At worst, that will result in us spuriously reducing the
-                    // congestion window.
-                    space.largest_acked_packet_sent = info.time_sent;
-                }
-                true
-            } else {
-                false
+        let next_packet_number = match space {
+            SpaceId::Initial => {
+                self.initial
+                    .as_ref()
+                    .expect("initial packet space present")
+                    .packets
+                    .next_packet_number
+            }
+            SpaceId::Handshake => {
+                self.handshake
+                    .as_ref()
+                    .expect("handshake packet space present")
+                    .packets
+                    .next_packet_number
+            }
+            SpaceId::Data => {
+                self.application
+                    .as_ref()
+                    .expect("application packet space present")
+                    .packets
+                    .next_packet_number
             }
         };
+        if ack.largest >= next_packet_number {
+            return Err(TransportError::PROTOCOL_VIOLATION("unsent packet acked"));
+        }
+
+        let mut new_largest = false;
+        let mut largest_newly_acked = None;
+        match space {
+            SpaceId::Initial => {
+                if let Some(packet_space) = self.initial.as_mut() {
+                    let loss = &mut packet_space.packets.loss;
+                    if loss
+                        .largest_acked_packet
+                        .map_or(true, |pn| ack.largest > pn)
+                    {
+                        loss.largest_acked_packet = Some(ack.largest);
+                        largest_newly_acked = loss
+                            .sent_packets
+                            .get(&ack.largest)
+                            .map(|info| info.time_sent);
+                        new_largest = true;
+                    }
+                }
+            }
+            SpaceId::Handshake => {
+                if let Some(packet_space) = self.handshake.as_mut() {
+                    let loss = &mut packet_space.packets.loss;
+                    if loss
+                        .largest_acked_packet
+                        .map_or(true, |pn| ack.largest > pn)
+                    {
+                        loss.largest_acked_packet = Some(ack.largest);
+                        largest_newly_acked = loss
+                            .sent_packets
+                            .get(&ack.largest)
+                            .map(|info| info.time_sent);
+                        new_largest = true;
+                    }
+                }
+            }
+            SpaceId::Data => {
+                if let Some(packet_space) = self.application.as_mut() {
+                    let loss = &mut packet_space.packets.loss;
+                    if loss
+                        .largest_acked_packet
+                        .map_or(true, |pn| ack.largest > pn)
+                    {
+                        loss.largest_acked_packet = Some(ack.largest);
+                        largest_newly_acked = loss
+                            .sent_packets
+                            .get(&ack.largest)
+                            .map(|info| info.time_sent);
+                        new_largest = true;
+                    }
+                }
+            }
+        }
 
         // Avoid DoS from unreasonably huge ack ranges by filtering out just the new acks.
         let mut newly_acked = ArrayRangeSet::new();
         for range in ack.iter() {
-            self.packet_number_filter.check_ack(space, range.clone())?;
-            for (&pn, _) in self.spaces[space].sent_packets.range(range) {
-                newly_acked.insert_one(pn);
+            match space {
+                SpaceId::Initial => {
+                    if let Some(packet_space) = self.initial.as_ref() {
+                        for (&pn, _) in packet_space.packets.loss.sent_packets.range(range) {
+                            newly_acked.insert_one(pn);
+                        }
+                    }
+                }
+                SpaceId::Handshake => {
+                    if let Some(packet_space) = self.handshake.as_ref() {
+                        for (&pn, _) in packet_space.packets.loss.sent_packets.range(range) {
+                            newly_acked.insert_one(pn);
+                        }
+                    }
+                }
+                SpaceId::Data => {
+                    let packet_space = self
+                        .application
+                        .as_ref()
+                        .expect("application packet space present");
+                    packet_space
+                        .packet_number_filter
+                        .check_ack(space, range.clone())?;
+                    for (&pn, _) in packet_space.packets.loss.sent_packets.range(range) {
+                        newly_acked.insert_one(pn);
+                    }
+                }
             }
         }
 
@@ -1564,38 +1867,103 @@ impl Connection {
         let mut ack_eliciting_acked = false;
         let mut packet_congestion_event_consumed = false;
         for packet in newly_acked.elts() {
-            if let Some(info) = self.spaces[space].take(packet) {
-                if let Some(acked) = info.largest_acked {
-                    // Assume ACKs for all packets below the largest acknowledged in `packet` have
-                    // been received. This can cause the peer to spuriously retransmit if some of
-                    // our earlier ACKs were lost, but allows for simpler state tracking. See
-                    // discussion at
-                    // https://www.rfc-editor.org/rfc/rfc9000.html#name-limiting-ranges-by-tracking
-                    self.spaces[space].pending_acks.subtract_below(acked);
+            match space {
+                SpaceId::Initial => {
+                    if let Some(info) = self
+                        .initial
+                        .as_mut()
+                        .expect("initial packet space present")
+                        .packets
+                        .take(packet)
+                    {
+                        ack_eliciting_acked |= info.ack_eliciting;
+                        let mtu_updated = self.path.mtud.on_acked(space, packet, info.size);
+                        if mtu_updated {
+                            self.path
+                                .congestion
+                                .on_mtu_update(self.path.mtud.current_mtu());
+                        }
+                        self.ack_frequency.on_acked(packet);
+                        packet_congestion_event_consumed |=
+                            self.on_packet_acked_handshake(now, packet, info);
+                    }
                 }
-                ack_eliciting_acked |= info.ack_eliciting;
-
-                // Notify MTU discovery that a packet was acked, because it might be an MTU probe
-                let mtu_updated = self.path.mtud.on_acked(space, packet, info.size);
-                if mtu_updated {
-                    self.path
-                        .congestion
-                        .on_mtu_update(self.path.mtud.current_mtu());
+                SpaceId::Handshake => {
+                    if let Some(info) = self
+                        .handshake
+                        .as_mut()
+                        .expect("handshake packet space present")
+                        .packets
+                        .take(packet)
+                    {
+                        ack_eliciting_acked |= info.ack_eliciting;
+                        let mtu_updated = self.path.mtud.on_acked(space, packet, info.size);
+                        if mtu_updated {
+                            self.path
+                                .congestion
+                                .on_mtu_update(self.path.mtud.current_mtu());
+                        }
+                        self.ack_frequency.on_acked(packet);
+                        packet_congestion_event_consumed |=
+                            self.on_packet_acked_handshake(now, packet, info);
+                    }
                 }
-
-                // Notify ack frequency that a packet was acked, because it might contain an ACK_FREQUENCY frame
-                self.ack_frequency.on_acked(packet);
-
-                packet_congestion_event_consumed |= self.on_packet_acked(now, packet, info);
+                SpaceId::Data => {
+                    let packet_space = self
+                        .application
+                        .as_mut()
+                        .expect("application packet space present");
+                    let info = packet_space.packets.take(packet);
+                    if let Some(acked) = info.as_ref().and_then(|info| info.largest_acked) {
+                        packet_space.packets.pending_acks.subtract_below(acked);
+                    }
+                    if let Some(info) = info {
+                        ack_eliciting_acked |= info.ack_eliciting;
+                        let mtu_updated = self.path.mtud.on_acked(space, packet, info.size);
+                        if mtu_updated {
+                            self.path
+                                .congestion
+                                .on_mtu_update(self.path.mtud.current_mtu());
+                        }
+                        self.ack_frequency.on_acked(packet);
+                        packet_congestion_event_consumed |= self.on_packet_acked(now, packet, info);
+                    }
+                }
             }
         }
 
+        let largest_acked_packet = match space {
+            SpaceId::Initial => {
+                self.initial
+                    .as_ref()
+                    .expect("initial packet space present")
+                    .packets
+                    .loss
+                    .largest_acked_packet
+            }
+            SpaceId::Handshake => {
+                self.handshake
+                    .as_ref()
+                    .expect("handshake packet space present")
+                    .packets
+                    .loss
+                    .largest_acked_packet
+            }
+            SpaceId::Data => {
+                self.application
+                    .as_ref()
+                    .expect("application packet space present")
+                    .packets
+                    .loss
+                    .largest_acked_packet
+            }
+        };
         if !packet_congestion_event_consumed {
             self.path.congestion.on_end_acks(
                 now,
                 self.path.in_flight.bytes,
                 self.app_limited,
-                self.spaces[space].largest_acked_packet,
+                largest_acked_packet,
             );
         }
 
@@ -1608,11 +1976,13 @@ impl Connection {
                     Duration::from_micros(ack.delay << self.peer_params.ack_delay_exponent.0),
                 )
             };
-            let rtt = instant_saturating_sub(now, self.spaces[space].largest_acked_packet_sent);
+            let rtt = instant_saturating_sub(
+                now,
+                largest_newly_acked.expect("new largest acked packet must have a send timestamp"),
+            );
             self.path.rtt.update(ack_delay, rtt);
             if self.path.first_packet_after_rtt_sample.is_none() {
-                self.path.first_packet_after_rtt_sample =
-                    Some((space, self.spaces[space].next_packet_number));
+                self.path.first_packet_after_rtt_sample = Some((space, next_packet_number));
             }
         }
 
@@ -1631,12 +2001,11 @@ impl Connection {
                 // of newly acked packets that remains well-defined in the presence of arbitrary packet
                 // reordering.
                 if new_largest {
-                    let sent = self.spaces[space].largest_acked_packet_sent;
+                    let sent = largest_newly_acked
+                        .expect("new largest acked packet must have a send timestamp");
                     self.process_ecn(now, space, newly_acked.len() as u64, ecn, sent);
                 }
             } else {
-                // We always start out sending ECN, so any ack that doesn't acknowledge it disables it.
-                debug!("ECN not acknowledged by peer");
                 self.path.sending_ecn = false;
             }
         }
@@ -1654,13 +2023,57 @@ impl Connection {
         ecn: frame::EcnCounts,
         largest_sent_time: Instant,
     ) {
-        match self.spaces[space].detect_ecn(newly_acked, ecn) {
-            Err(e) => {
-                debug!("halting ECN due to verification failure: {}", e);
+        let result = match space {
+            SpaceId::Initial => self
+                .initial
+                .as_mut()
+                .expect("initial packet space present")
+                .packets
+                .detect_ecn(newly_acked, ecn),
+            SpaceId::Handshake => self
+                .handshake
+                .as_mut()
+                .expect("handshake packet space present")
+                .packets
+                .detect_ecn(newly_acked, ecn),
+            SpaceId::Data => self
+                .application
+                .as_mut()
+                .expect("application packet space present")
+                .packets
+                .detect_ecn(newly_acked, ecn),
+        };
+        match result {
+            Err(_) => {
                 self.path.sending_ecn = false;
                 // Wipe out the existing value because it might be garbage and could interfere with
                 // future attempts to use ECN on new paths.
-                self.spaces[space].ecn_feedback = frame::EcnCounts::ZERO;
+                match space {
+                    SpaceId::Initial => {
+                        self.initial
+                            .as_mut()
+                            .expect("initial packet space present")
+                            .packets
+                            .loss
+                            .ecn_feedback = frame::EcnCounts::ZERO
+                    }
+                    SpaceId::Handshake => {
+                        self.handshake
+                            .as_mut()
+                            .expect("handshake packet space present")
+                            .packets
+                            .loss
+                            .ecn_feedback = frame::EcnCounts::ZERO
+                    }
+                    SpaceId::Data => {
+                        self.application
+                            .as_mut()
+                            .expect("application packet space present")
+                            .packets
+                            .loss
+                            .ecn_feedback = frame::EcnCounts::ZERO
+                    }
+                }
             }
             Ok(false) => {}
             Ok(true) => {
@@ -1674,10 +2087,47 @@ impl Connection {
 
     // Not timing-aware, so it's safe to call this for inferred acks, such as arise from
     // high-latency handshakes
-    fn on_packet_acked(&mut self, now: Instant, packet_number: u64, info: SentPacket) -> bool {
+    fn on_packet_acked(
+        &mut self,
+        now: Instant,
+        packet_number: u64,
+        info: SentPacket<ApplicationSentFrames>,
+    ) -> bool {
+        let congestion_event_consumed = self.on_packet_acked_common(now, packet_number, &info);
+
+        if let Some(retransmits) = info.frames.retransmits.as_deref() {
+            for (id, _) in retransmits.reset_stream.iter() {
+                self.streams.reset_acked(*id);
+            }
+        }
+
+        for frame in info.frames.stream_frames {
+            if let Err(error) = self.streams.received_ack_of(frame) {
+                self.stream_data_error = Some(error);
+                return false;
+            }
+        }
+        congestion_event_consumed
+    }
+
+    fn on_packet_acked_handshake(
+        &mut self,
+        now: Instant,
+        packet_number: u64,
+        info: SentPacket<Option<Box<VecDeque<frame::Crypto>>>>,
+    ) -> bool {
+        self.on_packet_acked_common(now, packet_number, &info)
+    }
+
+    fn on_packet_acked_common<S>(
+        &mut self,
+        now: Instant,
+        packet_number: u64,
+        info: &SentPacket<S>,
+    ) -> bool {
         let prior_in_flight = self.path.in_flight.bytes;
         let mut congestion_event_consumed = false;
-        self.remove_in_flight(&info);
+        self.remove_in_flight(info);
         if info.ack_eliciting && self.path.challenge.is_none() {
             // Only pass ACKs to the congestion controller if we are not validating the current
             // path, so as to ignore any ACKs from older paths still coming in.
@@ -1707,28 +2157,19 @@ impl Connection {
                 );
             }
         }
-
-        // Update state for confirmed delivery of frames
-        if let Some(retransmits) = info.retransmits.get() {
-            for (id, _) in retransmits.reset_stream.iter() {
-                self.streams.reset_acked(*id);
-            }
-        }
-
-        for frame in info.stream_frames {
-            if let Err(error) = self.streams.received_ack_of(frame) {
-                self.stream_data_error = Some(error);
-                return false;
-            }
-        }
         congestion_event_consumed
     }
 
     fn set_key_discard_timer(&mut self, now: Instant, space: SpaceId) {
-        let start = if self.zero_rtt_crypto.is_some() {
+        let application = self
+            .application
+            .as_ref()
+            .expect("application packet space present");
+        let start = if application.zero_rtt_crypto.is_some() {
             now
         } else {
-            self.prev_crypto
+            application
+                .prev_crypto
                 .as_ref()
                 .expect("no previous keys")
                 .end_packet
@@ -1750,10 +2191,7 @@ impl Connection {
 
         let (_, space) = match self.pto_time_and_space(now) {
             Some(x) => x,
-            None => {
-                error!("PTO expired while unset");
-                return;
-            }
+            None => panic!("PTO timer expired without a scheduled packet-number space"),
         };
         trace!(
             in_flight = self.path.in_flight.bytes,
@@ -1772,122 +2210,260 @@ impl Connection {
             // Conventional loss probe
             _ => 2,
         };
-        self.spaces[space].loss_probes = self.spaces[space].loss_probes.saturating_add(count);
+        match space {
+            SpaceId::Initial => {
+                let space = self.initial.as_mut().expect("initial packet space present");
+                space.packets.loss.loss_probes =
+                    space.packets.loss.loss_probes.saturating_add(count);
+            }
+            SpaceId::Handshake => {
+                let space = self
+                    .handshake
+                    .as_mut()
+                    .expect("handshake packet space present");
+                space.packets.loss.loss_probes =
+                    space.packets.loss.loss_probes.saturating_add(count);
+            }
+            SpaceId::Data => {
+                let space = self
+                    .application
+                    .as_mut()
+                    .expect("application packet space present");
+                space.packets.loss.loss_probes =
+                    space.packets.loss.loss_probes.saturating_add(count);
+            }
+        }
         self.pto_count = self.pto_count.saturating_add(1);
         self.set_loss_detection_timer(now);
     }
 
     fn detect_lost_packets(&mut self, now: Instant, pn_space: SpaceId, due_to_ack: bool) {
-        let mut lost_packets = Vec::<u64>::new();
-        let mut lost_mtu_probe = None;
         let in_flight_mtu_probe = self.path.mtud.in_flight_mtu_probe();
         let rtt = self.path.rtt.conservative();
         let loss_delay = cmp::max(rtt.mul_f32(self.config.time_threshold), TIMER_GRANULARITY);
-
-        // Packets sent before this time are deemed lost.
         let lost_send_time = now.checked_sub(loss_delay).unwrap();
-        let largest_acked_packet = self.spaces[pn_space].largest_acked_packet.unwrap();
         let packet_threshold = self.config.packet_threshold as u64;
-        let mut size_of_lost_packets = 0u64;
-
-        // InPersistentCongestion: Determine if all packets in the time period before the newest
-        // lost packet, including the edges, are marked lost. PTO computation must always
-        // include max ACK delay, i.e. operate as if in Data space (see RFC9001 §7.6.1).
         let congestion_period =
             self.pto(SpaceId::Data) * self.config.persistent_congestion_threshold;
-        let mut persistent_congestion_start: Option<Instant> = None;
-        let mut prev_packet = None;
-        let mut in_persistent_congestion = false;
-
-        let space = &mut self.spaces[pn_space];
-        space.loss_time = None;
-
-        for (&packet, info) in space.sent_packets.range(0..largest_acked_packet) {
-            if prev_packet != Some(packet.wrapping_sub(1)) {
-                // An intervening packet was acknowledged
-                persistent_congestion_start = None;
-            }
-
-            if info.time_sent <= lost_send_time || largest_acked_packet >= packet + packet_threshold
-            {
-                if Some(packet) == in_flight_mtu_probe {
-                    // Lost MTU probes are not included in `lost_packets`, because they should not
-                    // trigger a congestion control response
-                    lost_mtu_probe = in_flight_mtu_probe;
-                } else {
-                    lost_packets.push(packet);
-                    size_of_lost_packets += info.size as u64;
-                    if info.ack_eliciting && due_to_ack {
-                        match persistent_congestion_start {
-                            // Two ACK-eliciting packets lost more than congestion_period apart, with no
-                            // ACKed packets in between
-                            Some(start) if info.time_sent - start > congestion_period => {
-                                in_persistent_congestion = true;
-                            }
-                            // Persistent congestion must start after the first RTT sample
-                            None if self
-                                .path
-                                .first_packet_after_rtt_sample
-                                .is_some_and(|x| x < (pn_space, packet)) =>
-                            {
-                                persistent_congestion_start = Some(info.time_sent);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            } else {
-                let next_loss_time = info.time_sent + loss_delay;
-                space.loss_time = Some(
-                    space
-                        .loss_time
-                        .map_or(next_loss_time, |x| cmp::min(x, next_loss_time)),
-                );
-                persistent_congestion_start = None;
-            }
-
-            prev_packet = Some(packet);
-        }
+        let first_packet_after_rtt_sample = self.path.first_packet_after_rtt_sample;
+        let (lost_packets, lost_mtu_probe, size_of_lost_packets, in_persistent_congestion) =
+            match pn_space {
+                SpaceId::Initial => self
+                    .initial
+                    .as_mut()
+                    .expect("initial packet space present")
+                    .packets
+                    .collect_lost_packets(
+                        now,
+                        due_to_ack,
+                        loss_delay,
+                        packet_threshold,
+                        in_flight_mtu_probe,
+                        congestion_period,
+                        first_packet_after_rtt_sample,
+                        pn_space,
+                    ),
+                SpaceId::Handshake => self
+                    .handshake
+                    .as_mut()
+                    .expect("handshake packet space present")
+                    .packets
+                    .collect_lost_packets(
+                        now,
+                        due_to_ack,
+                        loss_delay,
+                        packet_threshold,
+                        in_flight_mtu_probe,
+                        congestion_period,
+                        first_packet_after_rtt_sample,
+                        pn_space,
+                    ),
+                SpaceId::Data => self
+                    .application
+                    .as_mut()
+                    .expect("application packet space present")
+                    .packets
+                    .collect_lost_packets(
+                        now,
+                        due_to_ack,
+                        loss_delay,
+                        packet_threshold,
+                        in_flight_mtu_probe,
+                        congestion_period,
+                        first_packet_after_rtt_sample,
+                        pn_space,
+                    ),
+            };
 
         // OnPacketsLost
         if let Some(largest_lost) = lost_packets.last().cloned() {
             let old_bytes_in_flight = self.path.in_flight.bytes;
-            let largest_lost_sent = self.spaces[pn_space].sent_packets[&largest_lost].time_sent;
-            let lost_packet_infos: Vec<_> = lost_packets
-                .iter()
-                .filter_map(|packet| {
-                    let info = self.spaces[pn_space].sent_packets.get(packet)?;
-                    Some(crate::congestion::LostPacketInfo {
-                        packet_number: *packet,
+            let largest_lost_sent = match pn_space {
+                SpaceId::Initial => {
+                    self.initial
+                        .as_ref()
+                        .expect("initial packet space present")
+                        .packets
+                        .loss
+                        .sent_packets[&largest_lost]
+                        .time_sent
+                }
+                SpaceId::Handshake => {
+                    self.handshake
+                        .as_ref()
+                        .expect("handshake packet space present")
+                        .packets
+                        .loss
+                        .sent_packets[&largest_lost]
+                        .time_sent
+                }
+                SpaceId::Data => {
+                    self.application
+                        .as_ref()
+                        .expect("application packet space present")
+                        .packets
+                        .loss
+                        .sent_packets[&largest_lost]
+                        .time_sent
+                }
+            };
+            let lost_packet_infos: Vec<_> = match pn_space {
+                SpaceId::Initial => self
+                    .initial
+                    .as_ref()
+                    .expect("initial packet space present")
+                    .packets
+                    .loss
+                    .sent_packets
+                    .iter()
+                    .filter(|(&pn, _)| lost_packets.contains(&pn))
+                    .map(|(&packet_number, info)| crate::congestion::LostPacketInfo {
+                        packet_number,
                         bytes: info.size.into(),
                         sent: info.time_sent,
                     })
-                })
-                .collect();
+                    .collect(),
+                SpaceId::Handshake => self
+                    .handshake
+                    .as_ref()
+                    .expect("handshake packet space present")
+                    .packets
+                    .loss
+                    .sent_packets
+                    .iter()
+                    .filter(|(&pn, _)| lost_packets.contains(&pn))
+                    .map(|(&packet_number, info)| crate::congestion::LostPacketInfo {
+                        packet_number,
+                        bytes: info.size.into(),
+                        sent: info.time_sent,
+                    })
+                    .collect(),
+                SpaceId::Data => self
+                    .application
+                    .as_ref()
+                    .expect("application packet space present")
+                    .packets
+                    .loss
+                    .sent_packets
+                    .iter()
+                    .filter(|(&pn, _)| lost_packets.contains(&pn))
+                    .map(|(&packet_number, info)| crate::congestion::LostPacketInfo {
+                        packet_number,
+                        bytes: info.size.into(),
+                        sent: info.time_sent,
+                    })
+                    .collect(),
+            };
             self.stats.path.lost_packets += lost_packets.len() as u64;
             self.stats.path.lost_bytes += size_of_lost_packets;
-            trace!(
-                "packets lost: {:?}, bytes lost: {}",
-                lost_packets,
-                size_of_lost_packets
-            );
 
             for &packet in &lost_packets {
-                let info = self.spaces[pn_space].take(packet).unwrap(); // safe: lost_packets is populated just above
-                self.config.qlog_sink.emit_packet_lost(
-                    packet,
-                    &info,
-                    lost_send_time,
-                    pn_space,
-                    now,
-                    self.orig_rem_cid,
-                );
-                self.remove_in_flight(&info);
-                for frame in info.stream_frames {
-                    self.streams.retransmit(frame);
+                match pn_space {
+                    SpaceId::Initial => {
+                        let info = self
+                            .initial
+                            .as_mut()
+                            .expect("initial packet space present")
+                            .packets
+                            .take(packet)
+                            .unwrap();
+                        self.config.qlog_sink.emit_packet_lost(
+                            packet,
+                            &info,
+                            lost_send_time,
+                            pn_space,
+                            now,
+                            self.orig_rem_cid,
+                        );
+                        self.remove_in_flight(&info);
+                        if let Some(mut frames) = info.frames {
+                            if !frames.is_empty() {
+                                self.initial
+                                    .as_mut()
+                                    .expect("initial packet space present")
+                                    .crypto_retransmits
+                                    .append(&mut frames);
+                            }
+                        }
+                        self.path.mtud.on_non_probe_lost(packet, info.size);
+                    }
+                    SpaceId::Handshake => {
+                        let info = self
+                            .handshake
+                            .as_mut()
+                            .expect("handshake packet space present")
+                            .packets
+                            .take(packet)
+                            .unwrap();
+                        self.config.qlog_sink.emit_packet_lost(
+                            packet,
+                            &info,
+                            lost_send_time,
+                            pn_space,
+                            now,
+                            self.orig_rem_cid,
+                        );
+                        self.remove_in_flight(&info);
+                        if let Some(mut frames) = info.frames {
+                            if !frames.is_empty() {
+                                self.handshake
+                                    .as_mut()
+                                    .expect("handshake packet space present")
+                                    .crypto_retransmits
+                                    .append(&mut frames);
+                            }
+                        }
+                        self.path.mtud.on_non_probe_lost(packet, info.size);
+                    }
+                    SpaceId::Data => {
+                        let info = self
+                            .application
+                            .as_mut()
+                            .expect("application packet space present")
+                            .packets
+                            .take(packet)
+                            .unwrap();
+                        self.config.qlog_sink.emit_packet_lost(
+                            packet,
+                            &info,
+                            lost_send_time,
+                            pn_space,
+                            now,
+                            self.orig_rem_cid,
+                        );
+                        self.remove_in_flight(&info);
+                        if let Some(retransmits) = info.frames.retransmits {
+                            self.application
+                                .as_mut()
+                                .expect("application packet space present")
+                                .retransmits |= *retransmits;
+                        }
+                        for frame in info.frames.stream_frames {
+                            self.streams.retransmit(frame);
+                        }
+                        self.path.mtud.on_non_probe_lost(packet, info.size);
+                    }
                 }
-                self.spaces[pn_space].pending |= info.retransmits;
-                self.path.mtud.on_non_probe_lost(packet, info.size);
             }
 
             if self.path.mtud.black_hole_detected(now) {
@@ -1928,7 +2504,13 @@ impl Connection {
 
         // Handle a lost MTU probe
         if let Some(packet) = lost_mtu_probe {
-            let info = self.spaces[SpaceId::Data].take(packet).unwrap(); // safe: lost_mtu_probe is omitted from lost_packets, and therefore must not have been removed yet
+            let info = self
+                .application
+                .as_mut()
+                .expect("application packet space present")
+                .packets
+                .take(packet)
+                .unwrap();
             self.remove_in_flight(&info);
             self.path.mtud.on_probe_lost();
             self.stats.path.lost_plpmtud_probes += 1;
@@ -1936,8 +2518,29 @@ impl Connection {
     }
 
     fn loss_time_and_space(&self) -> Option<(Instant, SpaceId)> {
-        SpaceId::iter()
-            .filter_map(|id| Some((self.spaces[id].loss_time?, id)))
+        let candidates = [
+            (
+                SpaceId::Initial,
+                self.initial
+                    .as_ref()
+                    .and_then(|space| space.packets.loss.loss_time),
+            ),
+            (
+                SpaceId::Handshake,
+                self.handshake
+                    .as_ref()
+                    .and_then(|space| space.packets.loss.loss_time),
+            ),
+            (
+                SpaceId::Data,
+                self.application
+                    .as_ref()
+                    .and_then(|space| space.packets.loss.loss_time),
+            ),
+        ];
+        candidates
+            .into_iter()
+            .filter_map(|(space, time)| Some((time?, space)))
             .min_by_key(|&(time, _)| time)
     }
 
@@ -1955,8 +2558,36 @@ impl Connection {
         }
 
         let mut result = None;
-        for space in SpaceId::iter() {
-            if !self.spaces[space].has_in_flight() {
+        for (space, has_in_flight, last_ack_eliciting) in [
+            (
+                SpaceId::Initial,
+                self.initial
+                    .as_ref()
+                    .is_some_and(|space| space.packets.has_in_flight()),
+                self.initial
+                    .as_ref()
+                    .and_then(|space| space.packets.loss.time_of_last_ack_eliciting_packet),
+            ),
+            (
+                SpaceId::Handshake,
+                self.handshake
+                    .as_ref()
+                    .is_some_and(|space| space.packets.has_in_flight()),
+                self.handshake
+                    .as_ref()
+                    .and_then(|space| space.packets.loss.time_of_last_ack_eliciting_packet),
+            ),
+            (
+                SpaceId::Data,
+                self.application
+                    .as_ref()
+                    .is_some_and(|space| space.packets.has_in_flight()),
+                self.application
+                    .as_ref()
+                    .and_then(|space| space.packets.loss.time_of_last_ack_eliciting_packet),
+            ),
+        ] {
+            if !has_in_flight {
                 continue;
             }
             if space == SpaceId::Data {
@@ -1967,7 +2598,7 @@ impl Connection {
                 // Include max_ack_delay and backoff for ApplicationData.
                 duration += self.ack_frequency.max_ack_delay_for_pto() * backoff;
             }
-            let last_ack_eliciting = match self.spaces[space].time_of_last_ack_eliciting_packet {
+            let last_ack_eliciting = match last_ack_eliciting {
                 Some(time) => time,
                 None => continue,
             };
@@ -1985,12 +2616,18 @@ impl Connection {
         }
         // The server is guaranteed to have validated our address if any of our handshake or 1-RTT
         // packets are acknowledged or we've seen HANDSHAKE_DONE and discarded handshake keys.
-        self.spaces[SpaceId::Handshake]
-            .largest_acked_packet
-            .is_some()
-            || self.spaces[SpaceId::Data].largest_acked_packet.is_some()
-            || (self.spaces[SpaceId::Data].crypto.is_some()
-                && self.spaces[SpaceId::Handshake].crypto.is_none())
+        self.handshake
+            .as_ref()
+            .is_some_and(|space| space.packets.loss.largest_acked_packet.is_some())
+            || self
+                .application
+                .as_ref()
+                .is_some_and(|space| space.packets.loss.largest_acked_packet.is_some())
+            || (self
+                .application
+                .as_ref()
+                .is_some_and(|space| space.crypto.is_some())
+                && self.handshake.is_none())
     }
 
     fn set_loss_detection_timer(&mut self, now: Instant) {
@@ -2053,11 +2690,34 @@ impl Connection {
         self.permit_idle_reset = true;
         self.receiving_ecn |= ecn.is_some();
         if let Some(x) = ecn {
-            let space = &mut self.spaces[space_id];
-            space.ecn_counters += x;
-
-            if x.is_ce() {
-                space.pending_acks.set_immediate_ack_required();
+            match space_id {
+                SpaceId::Initial => {
+                    let space = self.initial.as_mut().expect("initial packet space present");
+                    space.packets.ecn_counters += x;
+                    if x.is_ce() {
+                        space.packets.pending_acks.set_immediate_ack_required();
+                    }
+                }
+                SpaceId::Handshake => {
+                    let space = self
+                        .handshake
+                        .as_mut()
+                        .expect("handshake packet space present");
+                    space.packets.ecn_counters += x;
+                    if x.is_ce() {
+                        space.packets.pending_acks.set_immediate_ack_required();
+                    }
+                }
+                SpaceId::Data => {
+                    let space = self
+                        .application
+                        .as_mut()
+                        .expect("application packet space present");
+                    space.packets.ecn_counters += x;
+                    if x.is_ce() {
+                        space.packets.pending_acks.set_immediate_ack_required();
+                    }
+                }
             }
         }
 
@@ -2066,21 +2726,51 @@ impl Connection {
             None => return,
         };
         if self.side.is_server() {
-            if self.spaces[SpaceId::Initial].crypto.is_some() && space_id == SpaceId::Handshake {
+            if self.initial.is_some() && space_id == SpaceId::Handshake {
                 // A server stops sending and processing Initial packets when it receives its first Handshake packet.
                 self.discard_space(now, SpaceId::Initial);
             }
-            if self.zero_rtt_crypto.is_some() && is_1rtt {
+            if self
+                .application
+                .as_ref()
+                .is_some_and(|space| space.zero_rtt_crypto.is_some())
+                && is_1rtt
+            {
                 // Discard 0-RTT keys soon after receiving a 1-RTT packet
                 self.set_key_discard_timer(now, space_id)
             }
         }
-        let space = &mut self.spaces[space_id];
-        space.pending_acks.insert_one(packet, now);
-        if packet >= space.rx_packet {
-            space.rx_packet = packet;
-            // Update outgoing spin bit, inverting iff we're the client
-            self.spin = self.side.is_client() ^ spin;
+        match space_id {
+            SpaceId::Initial => {
+                let space = self.initial.as_mut().expect("initial packet space present");
+                space.packets.pending_acks.insert_one(packet, now);
+                if packet >= space.packets.rx_packet {
+                    space.packets.rx_packet = packet;
+                    self.spin = self.side.is_client() ^ spin;
+                }
+            }
+            SpaceId::Handshake => {
+                let space = self
+                    .handshake
+                    .as_mut()
+                    .expect("handshake packet space present");
+                space.packets.pending_acks.insert_one(packet, now);
+                if packet >= space.packets.rx_packet {
+                    space.packets.rx_packet = packet;
+                    self.spin = self.side.is_client() ^ spin;
+                }
+            }
+            SpaceId::Data => {
+                let space = self
+                    .application
+                    .as_mut()
+                    .expect("application packet space present");
+                space.packets.pending_acks.insert_one(packet, now);
+                if packet >= space.packets.rx_packet {
+                    space.packets.rx_packet = packet;
+                    self.spin = self.side.is_client() ^ spin;
+                }
+            }
         }
 
         self.config.qlog_sink.emit_packet_received(
@@ -2193,15 +2883,27 @@ impl Connection {
                     };
                     self.set_peer_params(params);
                 }
-                Err(e) => {
-                    error!("session ticket has malformed transport parameters: {}", e);
-                    return;
-                }
+                Err(_) => return,
             }
         }
-        trace!("0-RTT enabled");
         self.zero_rtt_enabled = true;
-        self.zero_rtt_crypto = Some(ZeroRttCrypto { header, packet });
+        let application = if self.application.is_none() {
+            let application = Box::new(ApplicationSpace::new(&mut self.rng));
+            #[cfg(test)]
+            let application = if self.config.deterministic_packet_numbers {
+                let mut application = application;
+                application.packet_number_filter = PacketNumberFilter::disabled();
+                application
+            } else {
+                application
+            };
+            self.application.insert(application)
+        } else {
+            self.application
+                .as_mut()
+                .expect("application packet space present")
+        };
+        application.zero_rtt_crypto = Some(ZeroRttCrypto { header, packet });
     }
 
     fn read_crypto(
@@ -2225,29 +2927,83 @@ impl Connection {
         debug_assert!(space <= expected, "received out-of-order CRYPTO data");
 
         let end = crypto.offset + crypto.data.len() as u64;
-        if space < expected && end > self.spaces[space].crypto_stream.bytes_read() {
-            warn!(
-                "received new {:?} CRYPTO data when expecting {:?}",
-                space, expected
-            );
+        let bytes_read = match space {
+            SpaceId::Initial => self
+                .initial
+                .as_ref()
+                .expect("initial packet space present")
+                .crypto_stream
+                .bytes_read(),
+            SpaceId::Handshake => self
+                .handshake
+                .as_ref()
+                .expect("handshake packet space present")
+                .crypto_stream
+                .bytes_read(),
+            SpaceId::Data => self
+                .application
+                .as_ref()
+                .expect("application packet space present")
+                .crypto_stream
+                .bytes_read(),
+        };
+        if space < expected && end > bytes_read {
             return Err(TransportError::PROTOCOL_VIOLATION(
                 "new data at unexpected encryption level",
             ));
         }
 
-        let space = &mut self.spaces[space];
-        let max = end.saturating_sub(space.crypto_stream.bytes_read());
-        if max > self.config.crypto_buffer_size as u64 {
-            return Err(TransportError::CRYPTO_BUFFER_EXCEEDED(""));
-        }
-
-        space
-            .crypto_stream
-            .insert(crypto.offset, crypto.data.clone(), payload_len);
-        while let Some(chunk) = space.crypto_stream.read(usize::MAX, true) {
-            trace!("consumed {} CRYPTO bytes", chunk.bytes.len());
-            if self.crypto.read_handshake(&chunk.bytes)? {
-                self.events.push_back(Event::HandshakeDataReady);
+        match space {
+            SpaceId::Initial => {
+                let space = self.initial.as_mut().expect("initial packet space present");
+                let max = end.saturating_sub(space.crypto_stream.bytes_read());
+                if max > self.config.crypto_buffer_size as u64 {
+                    return Err(TransportError::CRYPTO_BUFFER_EXCEEDED(""));
+                }
+                space
+                    .crypto_stream
+                    .insert(crypto.offset, crypto.data.clone(), payload_len);
+                while let Some(chunk) = space.crypto_stream.read(usize::MAX, true) {
+                    if self.crypto.read_handshake(&chunk.bytes)? {
+                        self.events.push_back(Event::HandshakeDataReady);
+                    }
+                }
+            }
+            SpaceId::Handshake => {
+                let space = self
+                    .handshake
+                    .as_mut()
+                    .expect("handshake packet space present");
+                let max = end.saturating_sub(space.crypto_stream.bytes_read());
+                if max > self.config.crypto_buffer_size as u64 {
+                    return Err(TransportError::CRYPTO_BUFFER_EXCEEDED(""));
+                }
+                space
+                    .crypto_stream
+                    .insert(crypto.offset, crypto.data.clone(), payload_len);
+                while let Some(chunk) = space.crypto_stream.read(usize::MAX, true) {
+                    if self.crypto.read_handshake(&chunk.bytes)? {
+                        self.events.push_back(Event::HandshakeDataReady);
+                    }
+                }
+            }
+            SpaceId::Data => {
+                let space = self
+                    .application
+                    .as_mut()
+                    .expect("application packet space present");
+                let max = end.saturating_sub(space.crypto_stream.bytes_read());
+                if max > self.config.crypto_buffer_size as u64 {
+                    return Err(TransportError::CRYPTO_BUFFER_EXCEEDED(""));
+                }
+                space
+                    .crypto_stream
+                    .insert(crypto.offset, crypto.data.clone(), payload_len);
+                while let Some(chunk) = space.crypto_stream.read(usize::MAX, true) {
+                    if self.crypto.read_handshake(&chunk.bytes)? {
+                        self.events.push_back(Event::HandshakeDataReady);
+                    }
+                }
             }
         }
 
@@ -2277,63 +3033,138 @@ impl Connection {
                     continue;
                 }
             }
-            let offset = self.spaces[space].crypto_offset;
+            let offset = match space {
+                SpaceId::Initial => {
+                    self.initial
+                        .as_ref()
+                        .expect("initial packet space present")
+                        .crypto_offset
+                }
+                SpaceId::Handshake => {
+                    self.handshake
+                        .as_ref()
+                        .expect("handshake packet space present")
+                        .crypto_offset
+                }
+                SpaceId::Data => {
+                    self.application
+                        .as_ref()
+                        .expect("application packet space present")
+                        .crypto_offset
+                }
+            };
             let outgoing = Bytes::from(outgoing);
             if let State::Handshake(ref mut state) = self.state {
                 if space == SpaceId::Initial && offset == 0 && self.side.is_client() {
                     state.client_hello = Some(outgoing.clone());
                 }
             }
-            self.spaces[space].crypto_offset += outgoing.len() as u64;
-            trace!("wrote {} {:?} CRYPTO bytes", outgoing.len(), space);
-            self.spaces[space].pending.crypto.push_back(frame::Crypto {
-                offset,
-                data: outgoing,
-            });
+            match space {
+                SpaceId::Initial => {
+                    let space = self.initial.as_mut().expect("initial packet space present");
+                    space.crypto_offset += outgoing.len() as u64;
+                    space.crypto_retransmits.push_back(frame::Crypto {
+                        offset,
+                        data: outgoing,
+                    });
+                }
+                SpaceId::Handshake => {
+                    let space = self
+                        .handshake
+                        .as_mut()
+                        .expect("handshake packet space present");
+                    space.crypto_offset += outgoing.len() as u64;
+                    space.crypto_retransmits.push_back(frame::Crypto {
+                        offset,
+                        data: outgoing,
+                    });
+                }
+                SpaceId::Data => {
+                    let space = self
+                        .application
+                        .as_mut()
+                        .expect("application packet space present");
+                    space.crypto_offset += outgoing.len() as u64;
+                    space.retransmits.crypto.push_back(frame::Crypto {
+                        offset,
+                        data: outgoing,
+                    });
+                }
+            }
         }
     }
 
     /// Switch to stronger cryptography during handshake
     fn upgrade_crypto(&mut self, space: SpaceId, crypto: Keys) {
         debug_assert!(
-            self.spaces[space].crypto.is_none(),
+            match space {
+                SpaceId::Initial => false,
+                SpaceId::Handshake => self.handshake.is_none(),
+                SpaceId::Data => self
+                    .application
+                    .as_ref()
+                    .is_none_or(|space| space.crypto.is_none()),
+            },
             "already reached packet space {space:?}"
         );
-        trace!("{:?} keys ready", space);
         if space == SpaceId::Data {
-            // Precompute the first key update
-            self.next_crypto = Some(
+            let application = if self.application.is_none() {
+                let application = Box::new(ApplicationSpace::new(&mut self.rng));
+                #[cfg(test)]
+                let application = if self.config.deterministic_packet_numbers {
+                    let mut application = application;
+                    application.packet_number_filter = PacketNumberFilter::disabled();
+                    application
+                } else {
+                    application
+                };
+                self.application.insert(application)
+            } else {
+                self.application
+                    .as_mut()
+                    .expect("application packet space present")
+            };
+            application.crypto = Some(crypto);
+            application.next_crypto = Some(
                 self.crypto
                     .next_1rtt_keys()
                     .expect("handshake should be complete"),
             );
+            if self.side.is_client() {
+                application.zero_rtt_crypto = None;
+            }
+        } else {
+            let packet_space = Box::new(HandshakeSpace::new(crypto));
+            match space {
+                SpaceId::Initial => self.initial = Some(packet_space),
+                SpaceId::Handshake => self.handshake = Some(packet_space),
+                SpaceId::Data => unreachable!("handled above"),
+            }
         }
-
-        self.spaces[space].crypto = Some(crypto);
         debug_assert!(space as usize > self.highest_space as usize);
         self.highest_space = space;
-        if space == SpaceId::Data && self.side.is_client() {
-            // Discard 0-RTT keys because 1-RTT keys are available.
-            self.zero_rtt_crypto = None;
-        }
     }
 
     fn discard_space(&mut self, now: Instant, space_id: SpaceId) {
         debug_assert!(space_id != SpaceId::Data);
-        trace!("discarding {:?} keys", space_id);
         if space_id == SpaceId::Initial {
             // No longer needed
             if let ConnectionSide::Client { token, .. } = &mut self.side {
                 *token = Bytes::new();
             }
-        }
-        let space = &mut self.spaces[space_id];
-        space.crypto = None;
-        space.time_of_last_ack_eliciting_packet = None;
-        space.loss_time = None;
-        let sent_packets = mem::take(&mut space.sent_packets);
-        for packet in sent_packets.into_values() {
-            self.remove_in_flight(&packet);
+            if let Some(mut packet_space) = self.initial.take() {
+                let sent_packets = mem::take(&mut packet_space.packets.loss.sent_packets);
+                for packet in sent_packets.into_values() {
+                    self.remove_in_flight(&packet);
+                }
+            }
+        } else {
+            if let Some(mut packet_space) = self.handshake.take() {
+                let sent_packets = mem::take(&mut packet_space.packets.loss.sent_packets);
+                for packet in sent_packets.into_values() {
+                    self.remove_in_flight(&packet);
+                }
+            }
         }
         self.set_loss_detection_timer(now)
     }
@@ -2506,8 +3337,9 @@ impl Connection {
         let decoded = packet_crypto::unprotect_header(
             partial_decode,
             scratch,
-            &self.spaces,
-            self.zero_rtt_crypto.as_ref(),
+            self.initial.as_deref(),
+            self.handshake.as_deref(),
+            self.application.as_deref(),
             self.peer_params.stateless_reset_token,
         );
         if decoded.is_none() {
@@ -2562,24 +3394,39 @@ impl Connection {
                 .map(move |number| (packet, number)),
         };
         let result = match decrypted {
-            _ if stateless_reset => {
-                debug!("got stateless reset");
-                Err(ConnectionError::Reset)
-            }
-            Err(Some(e)) => {
-                warn!("illegal packet: {}", e);
-                Err(e.into())
-            }
+            _ if stateless_reset => Err(ConnectionError::Reset),
+            Err(Some(e)) => Err(e.into()),
             Err(None) => {
                 self.stats.udp_rx.on_packet_drop();
                 self.authentication_failures += 1;
-                let integrity_limit = self.spaces[self.highest_space]
-                    .crypto
-                    .as_ref()
-                    .unwrap()
-                    .packet
-                    .local
-                    .integrity_limit();
+                let integrity_limit = match self.highest_space {
+                    SpaceId::Initial => self
+                        .initial
+                        .as_ref()
+                        .expect("initial packet space present")
+                        .crypto
+                        .packet
+                        .local
+                        .integrity_limit(),
+                    SpaceId::Handshake => self
+                        .handshake
+                        .as_ref()
+                        .expect("handshake packet space present")
+                        .crypto
+                        .packet
+                        .local
+                        .integrity_limit(),
+                    SpaceId::Data => self
+                        .application
+                        .as_ref()
+                        .expect("application packet space present")
+                        .crypto
+                        .as_ref()
+                        .unwrap()
+                        .packet
+                        .local
+                        .integrity_limit(),
+                };
                 if self.authentication_failures > integrity_limit {
                     Err(TransportError::AEAD_LIMIT_REACHED("integrity limit violated").into())
                 } else {
@@ -2593,9 +3440,31 @@ impl Connection {
                 };
                 let _guard = span.enter();
 
-                let is_duplicate = |n| self.spaces[packet.header.space()].dedup.insert(n);
+                let is_duplicate = |n| match packet.header.space() {
+                    SpaceId::Initial => self
+                        .initial
+                        .as_mut()
+                        .expect("initial packet space present")
+                        .packets
+                        .dedup
+                        .insert(n),
+                    SpaceId::Handshake => self
+                        .handshake
+                        .as_mut()
+                        .expect("handshake packet space present")
+                        .packets
+                        .dedup
+                        .insert(n),
+                    SpaceId::Data => self
+                        .application
+                        .as_mut()
+                        .expect("application packet space present")
+                        .packets
+                        .dedup
+                        .insert(n),
+                };
                 if number.is_some_and(is_duplicate) {
-                    debug!("discarding possible duplicate packet");
+                    self.stats.udp_rx.on_packet_drop();
                     return;
                 } else if self.state.is_handshake() && packet.header.is_short() {
                     // TODO: SHOULD buffer these to improve reordering tolerance.
@@ -2786,37 +3655,54 @@ impl Connection {
                     return Ok(());
                 }
 
-                trace!("retrying with CID {}", rem_cid);
                 let client_hello = state.client_hello.take().unwrap();
                 self.retry_src_cid = Some(rem_cid);
                 self.rem_cids.update_initial_cid(rem_cid);
                 self.rem_handshake_cid = rem_cid;
 
-                let space = &mut self.spaces[SpaceId::Initial];
-                if let Some(info) = space.take(0) {
-                    self.on_packet_acked(now, 0, info);
-                };
+                let next_packet_number = self
+                    .initial
+                    .as_ref()
+                    .expect("initial packet space present")
+                    .packets
+                    .next_packet_number;
+                if let Some(info) = self
+                    .initial
+                    .as_mut()
+                    .expect("initial packet space present")
+                    .packets
+                    .take(0)
+                {
+                    self.on_packet_acked_handshake(now, 0, info);
+                }
 
                 self.discard_space(now, SpaceId::Initial); // Make sure we clean up after any retransmitted Initials
-                self.spaces[SpaceId::Initial] = PacketSpace {
-                    crypto: Some(self.crypto.initial_keys(&rem_cid, self.side.side())),
-                    next_packet_number: self.spaces[SpaceId::Initial].next_packet_number,
-                    crypto_offset: client_hello.len() as u64,
-                    ..PacketSpace::new(now)
-                };
-                self.spaces[SpaceId::Initial]
-                    .pending
-                    .crypto
-                    .push_back(frame::Crypto {
-                        offset: 0,
-                        data: client_hello,
-                    });
+                let mut replacement = Box::new(HandshakeSpace::new(
+                    self.crypto.initial_keys(&rem_cid, self.side.side()),
+                ));
+                replacement.packets.next_packet_number = next_packet_number;
+                replacement.crypto_offset = client_hello.len() as u64;
+                replacement.crypto_retransmits.push_back(frame::Crypto {
+                    offset: 0,
+                    data: client_hello,
+                });
+                self.initial = Some(replacement);
 
                 // Retransmit all 0-RTT data
-                let zero_rtt = mem::take(&mut self.spaces[SpaceId::Data].sent_packets);
-                for info in zero_rtt.into_values() {
-                    self.remove_in_flight(&info);
-                    self.spaces[SpaceId::Data].pending |= info.retransmits;
+                let zero_rtt = self
+                    .application
+                    .as_mut()
+                    .map(|space| mem::take(&mut space.packets.loss.sent_packets));
+                if let Some(zero_rtt) = zero_rtt {
+                    for info in zero_rtt.into_values() {
+                        self.remove_in_flight(&info);
+                        if let Some(retransmits) = info.frames.retransmits {
+                            self.application
+                                .as_mut()
+                                .expect("application packet space present")
+                                .retransmits |= *retransmits;
+                        }
+                    }
                 }
                 self.streams.retransmit_all_for_0rtt();
 
@@ -2852,7 +3738,6 @@ impl Connection {
                 }
 
                 if self.crypto.is_handshaking() {
-                    trace!("handshake ongoing");
                     return Ok(());
                 }
 
@@ -2870,16 +3755,25 @@ impl Connection {
                     if self.has_0rtt() {
                         if !self.crypto.early_data_accepted().unwrap() {
                             debug_assert!(self.side.is_client());
-                            debug!("0-RTT rejected");
                             self.accepted_0rtt = false;
                             self.streams.zero_rtt_rejected();
 
                             // Discard already-queued frames
-                            self.spaces[SpaceId::Data].pending = Retransmits::default();
+                            self.application
+                                .as_mut()
+                                .expect("application packet space present")
+                                .retransmits = ApplicationRetransmits::default();
 
                             // Discard 0-RTT packets
-                            let sent_packets =
-                                mem::take(&mut self.spaces[SpaceId::Data].sent_packets);
+                            let sent_packets = mem::take(
+                                &mut self
+                                    .application
+                                    .as_mut()
+                                    .expect("application packet space present")
+                                    .packets
+                                    .loss
+                                    .sent_packets,
+                            );
                             for packet in sent_packets.into_values() {
                                 self.remove_in_flight(&packet);
                             }
@@ -2896,7 +3790,11 @@ impl Connection {
                     self.issue_first_cids(now);
                 } else {
                     // Server-only
-                    self.spaces[SpaceId::Data].pending.handshake_done = true;
+                    self.application
+                        .as_mut()
+                        .expect("application packet space present")
+                        .retransmits
+                        .handshake_done = true;
                     self.discard_space(now, SpaceId::Handshake);
                 }
 
@@ -3021,9 +3919,23 @@ impl Connection {
 
         if ack_eliciting {
             // In the initial and handshake spaces, ACKs must be sent immediately
-            self.spaces[packet.header.space()]
-                .pending_acks
-                .set_immediate_ack_required();
+            match packet.header.space() {
+                SpaceId::Initial => self
+                    .initial
+                    .as_mut()
+                    .expect("initial packet space present")
+                    .packets
+                    .pending_acks
+                    .set_immediate_ack_required(),
+                SpaceId::Handshake => self
+                    .handshake
+                    .as_mut()
+                    .expect("handshake packet space present")
+                    .packets
+                    .pending_acks
+                    .set_immediate_ack_required(),
+                SpaceId::Data => unreachable!("process_early_payload handles handshake spaces"),
+            }
         }
 
         self.write_crypto();
@@ -3115,7 +4027,11 @@ impl Connection {
                         prepare_stream,
                     ) {
                         Ok(should_transmit) if should_transmit.should_transmit() => {
-                            self.spaces[SpaceId::Data].pending.max_data = true;
+                            self.application
+                                .as_mut()
+                                .expect("application packet space present")
+                                .retransmits
+                                .max_data = true;
                         }
                         Ok(_) => {}
                         Err(crate::connection::streams::StreamReceiveError::Data(error)) => {
@@ -3170,7 +4086,11 @@ impl Connection {
                 }
                 Frame::ResetStream(frame) => {
                     if self.streams.received_reset(frame)?.should_transmit() {
-                        self.spaces[SpaceId::Data].pending.max_data = true;
+                        self.application
+                            .as_mut()
+                            .expect("application packet space present")
+                            .retransmits
+                            .max_data = true;
                     }
                 }
                 Frame::DataBlocked { offset } => {
@@ -3246,8 +4166,12 @@ impl Connection {
                     match self.rem_cids.insert(frame) {
                         Ok(None) => {}
                         Ok(Some((retired, reset_token))) => {
-                            let pending_retired =
-                                &mut self.spaces[SpaceId::Data].pending.retire_cids;
+                            let pending_retired = &mut self
+                                .application
+                                .as_mut()
+                                .expect("application packet space present")
+                                .retransmits
+                                .retire_cids;
                             /// Ensure `pending_retired` cannot grow without bound. Limit is
                             /// somewhat arbitrary but very permissive.
                             const MAX_PENDING_RETIRED_CIDS: u64 = CidQueue::LEN as u64 * 10;
@@ -3268,12 +4192,13 @@ impl Connection {
                             return Err(TransportError::CONNECTION_ID_LIMIT_ERROR(""));
                         }
                         Err(InsertError::Retired) => {
-                            trace!("discarding already-retired");
                             // RETIRE_CONNECTION_ID might not have been previously sent if e.g. a
                             // range of connection IDs larger than the active connection ID limit
                             // was retired all at once via retire_prior_to.
-                            self.spaces[SpaceId::Data]
-                                .pending
+                            self.application
+                                .as_mut()
+                                .expect("application packet space present")
+                                .retransmits
                                 .retire_cids
                                 .push(frame.sequence);
                             continue;
@@ -3298,7 +4223,6 @@ impl Connection {
                     if token.is_empty() {
                         return Err(TransportError::FRAME_ENCODING_ERROR("empty token"));
                     }
-                    trace!("got new token");
                     token_store.insert(server_name, token);
                 }
                 Frame::Datagram(datagram) => {
@@ -3311,11 +4235,14 @@ impl Connection {
                 }
                 Frame::AckFrequency(ack_frequency) => {
                     // This frame can only be sent in the Data space
-                    let space = &mut self.spaces[SpaceId::Data];
+                    let space = self
+                        .application
+                        .as_mut()
+                        .expect("application packet space present");
 
                     if !self
                         .ack_frequency
-                        .ack_frequency_received(&ack_frequency, &mut space.pending_acks)?
+                        .ack_frequency_received(&ack_frequency, &mut space.packets.pending_acks)?
                     {
                         // The AckFrequency frame is stale (we have already received a more recent one)
                         continue;
@@ -3324,6 +4251,7 @@ impl Connection {
                     // Our `max_ack_delay` has been updated, so we may need to adjust its associated
                     // timeout
                     if let Some(timeout) = space
+                        .packets
                         .pending_acks
                         .max_ack_delay_timeout(self.ack_frequency.max_ack_delay)
                     {
@@ -3332,7 +4260,10 @@ impl Connection {
                 }
                 Frame::ImmediateAck => {
                     // This frame can only be sent in the Data space
-                    self.spaces[SpaceId::Data]
+                    self.application
+                        .as_mut()
+                        .expect("application packet space present")
+                        .packets
                         .pending_acks
                         .set_immediate_ack_required();
                 }
@@ -3342,28 +4273,29 @@ impl Connection {
                             "client sent HANDSHAKE_DONE",
                         ));
                     }
-                    if self.spaces[SpaceId::Handshake].crypto.is_some() {
+                    if self.handshake.is_some() {
                         self.discard_space(now, SpaceId::Handshake);
                     }
                 }
             }
         }
 
-        let space = &mut self.spaces[SpaceId::Data];
-        if space
-            .pending_acks
-            .packet_received(now, number, ack_eliciting, &space.dedup)
         {
-            self.timers
-                .set(Timer::MaxAckDelay, now + self.ack_frequency.max_ack_delay);
+            let space = self
+                .application
+                .as_mut()
+                .expect("application packet space present");
+            if space.packets.pending_acks.packet_received(
+                now,
+                number,
+                ack_eliciting,
+                &space.packets.dedup,
+            ) {
+                self.timers
+                    .set(Timer::MaxAckDelay, now + self.ack_frequency.max_ack_delay);
+            }
+            self.streams.queue_max_stream_id(&mut space.retransmits);
         }
-
-        // Issue stream ID credit due to ACKs of outgoing finish/resets and incoming finish/resets
-        // on stopped streams. Incoming finishes/resets on open streams are not handled here as they
-        // are only freed, and hence only issue credit, once the application has been notified
-        // during a read on the stream.
-        let pending = &mut self.spaces[SpaceId::Data].pending;
-        self.streams.queue_max_stream_id(pending);
 
         if let Some(reason) = close {
             self.error = Some(reason.into());
@@ -3373,7 +4305,13 @@ impl Connection {
 
         if remote != self.path.remote
             && !is_probing_packet
-            && number == self.spaces[SpaceId::Data].rx_packet
+            && number
+                == self
+                    .application
+                    .as_mut()
+                    .expect("application packet space present")
+                    .packets
+                    .rx_packet
         {
             let ConnectionSide::Server { ref server_config } = self.side else {
                 panic!("packets from unknown remote should be dropped by clients");
@@ -3446,8 +4384,10 @@ impl Connection {
         };
 
         // Retire the current remote CID and any CIDs we had to skip.
-        self.spaces[SpaceId::Data]
-            .pending
+        self.application
+            .as_mut()
+            .expect("application packet space present")
+            .retransmits
             .retire_cids
             .extend(retired);
         self.set_reset_token(reset_token);
@@ -3489,21 +4429,77 @@ impl Connection {
         pn: u64,
     ) -> Result<SentFrames, StreamDataError> {
         let mut sent = SentFrames::default();
-        let space = &mut self.spaces[space_id];
-        let is_0rtt = space_id == SpaceId::Data && space.crypto.is_none();
-        space.pending_acks.maybe_ack_non_eliciting();
+        let is_0rtt = space_id == SpaceId::Data
+            && self
+                .application
+                .as_ref()
+                .is_some_and(|space| space.crypto.is_none());
+        match space_id {
+            SpaceId::Initial => self
+                .initial
+                .as_mut()
+                .expect("initial packet space present")
+                .packets
+                .pending_acks
+                .maybe_ack_non_eliciting(),
+            SpaceId::Handshake => self
+                .handshake
+                .as_mut()
+                .expect("handshake packet space present")
+                .packets
+                .pending_acks
+                .maybe_ack_non_eliciting(),
+            SpaceId::Data => self
+                .application
+                .as_mut()
+                .expect("application packet space present")
+                .packets
+                .pending_acks
+                .maybe_ack_non_eliciting(),
+        }
 
         // HANDSHAKE_DONE
-        if !is_0rtt && mem::replace(&mut space.pending.handshake_done, false) {
-            buf.write(frame::FrameType::HANDSHAKE_DONE);
-            sent.retransmits.get_or_create().handshake_done = true;
-            // This is just a u8 counter and the frame is typically just sent once
-            self.stats.frame_tx.handshake_done =
-                self.stats.frame_tx.handshake_done.saturating_add(1);
+        if space_id == SpaceId::Data && !is_0rtt {
+            let space = self
+                .application
+                .as_mut()
+                .expect("application packet space present");
+            if mem::replace(&mut space.retransmits.handshake_done, false) {
+                buf.write(frame::FrameType::HANDSHAKE_DONE);
+                sent.retransmits.get_or_create().handshake_done = true;
+                self.stats.frame_tx.handshake_done =
+                    self.stats.frame_tx.handshake_done.saturating_add(1);
+            }
         }
 
         // PING
-        if mem::replace(&mut space.ping_pending, false) {
+        let ping_pending = match space_id {
+            SpaceId::Initial => {
+                &mut self
+                    .initial
+                    .as_mut()
+                    .expect("initial packet space present")
+                    .packets
+                    .ping_pending
+            }
+            SpaceId::Handshake => {
+                &mut self
+                    .handshake
+                    .as_mut()
+                    .expect("handshake packet space present")
+                    .packets
+                    .ping_pending
+            }
+            SpaceId::Data => {
+                &mut self
+                    .application
+                    .as_mut()
+                    .expect("application packet space present")
+                    .packets
+                    .ping_pending
+            }
+        };
+        if mem::replace(ping_pending, false) {
             trace!("PING");
             buf.write(frame::FrameType::PING);
             sent.non_retransmits = true;
@@ -3511,7 +4507,16 @@ impl Connection {
         }
 
         // IMMEDIATE_ACK
-        if mem::replace(&mut space.immediate_ack_pending, false) {
+        if space_id == SpaceId::Data
+            && mem::replace(
+                &mut self
+                    .application
+                    .as_mut()
+                    .expect("application packet space present")
+                    .immediate_ack_pending,
+                false,
+            )
+        {
             trace!("IMMEDIATE_ACK");
             buf.write(frame::FrameType::IMMEDIATE_ACK);
             sent.non_retransmits = true;
@@ -3519,19 +4524,66 @@ impl Connection {
         }
 
         // ACK
-        if space.pending_acks.can_send() {
-            Self::populate_acks(
-                now,
-                self.receiving_ecn,
-                &mut sent,
-                space,
-                buf,
-                &mut self.stats,
-            );
+        match space_id {
+            SpaceId::Initial => {
+                let space = self.initial.as_mut().expect("initial packet space present");
+                if space.packets.pending_acks.can_send() {
+                    Self::populate_acks(
+                        now,
+                        self.receiving_ecn,
+                        &mut sent,
+                        &mut space.packets,
+                        buf,
+                        &mut self.stats,
+                    );
+                }
+            }
+            SpaceId::Handshake => {
+                let space = self
+                    .handshake
+                    .as_mut()
+                    .expect("handshake packet space present");
+                if space.packets.pending_acks.can_send() {
+                    Self::populate_acks(
+                        now,
+                        self.receiving_ecn,
+                        &mut sent,
+                        &mut space.packets,
+                        buf,
+                        &mut self.stats,
+                    );
+                }
+            }
+            SpaceId::Data => {
+                let space = self
+                    .application
+                    .as_mut()
+                    .expect("application packet space present");
+                if space.packets.pending_acks.can_send() {
+                    Self::populate_acks(
+                        now,
+                        self.receiving_ecn,
+                        &mut sent,
+                        &mut space.packets,
+                        buf,
+                        &mut self.stats,
+                    );
+                }
+            }
         }
 
         // ACK_FREQUENCY
-        if mem::replace(&mut space.pending.ack_frequency, false) {
+        if space_id == SpaceId::Data
+            && mem::replace(
+                &mut self
+                    .application
+                    .as_mut()
+                    .expect("application packet space present")
+                    .retransmits
+                    .ack_frequency,
+                false,
+            )
+        {
             let sequence_number = self.ack_frequency.next_sequence_number();
 
             // Safe to unwrap because this is always provided when ACK frequency is enabled
@@ -3589,7 +4641,28 @@ impl Connection {
 
         // CRYPTO
         while buf.len() + frame::Crypto::SIZE_BOUND < max_size && !is_0rtt {
-            let mut frame = match space.pending.crypto.pop_front() {
+            let frame = match space_id {
+                SpaceId::Initial => self
+                    .initial
+                    .as_mut()
+                    .expect("initial packet space present")
+                    .crypto_retransmits
+                    .pop_front(),
+                SpaceId::Handshake => self
+                    .handshake
+                    .as_mut()
+                    .expect("handshake packet space present")
+                    .crypto_retransmits
+                    .pop_front(),
+                SpaceId::Data => self
+                    .application
+                    .as_mut()
+                    .expect("application packet space present")
+                    .retransmits
+                    .crypto
+                    .pop_front(),
+            };
+            let mut frame = match frame {
                 Some(x) => x,
                 None => break,
             };
@@ -3625,14 +4698,38 @@ impl Connection {
             sent.retransmits.get_or_create().crypto.push_back(truncated);
             if !frame.data.is_empty() {
                 frame.offset += len as u64;
-                space.pending.crypto.push_front(frame);
+                match space_id {
+                    SpaceId::Initial => self
+                        .initial
+                        .as_mut()
+                        .expect("initial packet space present")
+                        .crypto_retransmits
+                        .push_front(frame),
+                    SpaceId::Handshake => self
+                        .handshake
+                        .as_mut()
+                        .expect("handshake packet space present")
+                        .crypto_retransmits
+                        .push_front(frame),
+                    SpaceId::Data => self
+                        .application
+                        .as_mut()
+                        .expect("application packet space present")
+                        .retransmits
+                        .crypto
+                        .push_front(frame),
+                }
             }
         }
 
         if space_id == SpaceId::Data {
             self.streams.write_control_frames(
                 buf,
-                &mut space.pending,
+                &mut self
+                    .application
+                    .as_mut()
+                    .expect("application packet space present")
+                    .retransmits,
                 &mut sent.retransmits,
                 &mut self.stats.frame_tx,
                 max_size,
@@ -3640,16 +4737,18 @@ impl Connection {
         }
 
         // NEW_CONNECTION_ID
-        while buf.len() + NewConnectionId::SIZE_BOUND < max_size {
-            let issued = match space.pending.new_cids.pop() {
+        while space_id == SpaceId::Data && buf.len() + NewConnectionId::SIZE_BOUND < max_size {
+            let issued = match self
+                .application
+                .as_mut()
+                .expect("application packet space present")
+                .retransmits
+                .new_cids
+                .pop()
+            {
                 Some(x) => x,
                 None => break,
             };
-            trace!(
-                sequence = issued.sequence,
-                id = %issued.id,
-                "NEW_CONNECTION_ID"
-            );
             frame::NewConnectionId {
                 sequence: issued.sequence,
                 retire_prior_to: self.local_cid_state.retire_prior_to(),
@@ -3662,12 +4761,20 @@ impl Connection {
         }
 
         // RETIRE_CONNECTION_ID
-        while buf.len() + frame::RETIRE_CONNECTION_ID_SIZE_BOUND < max_size {
-            let seq = match space.pending.retire_cids.pop() {
+        while space_id == SpaceId::Data
+            && buf.len() + frame::RETIRE_CONNECTION_ID_SIZE_BOUND < max_size
+        {
+            let seq = match self
+                .application
+                .as_mut()
+                .expect("application packet space present")
+                .retransmits
+                .retire_cids
+                .pop()
+            {
                 Some(x) => x,
                 None => break,
             };
-            trace!(sequence = seq, "RETIRE_CONNECTION_ID");
             buf.write(frame::FrameType::RETIRE_CONNECTION_ID);
             buf.write_var(seq);
             sent.retransmits.get_or_create().retire_cids.push(seq);
@@ -3692,50 +4799,62 @@ impl Connection {
         }
 
         // NEW_TOKEN
-        while let Some(remote_addr) = space.pending.new_tokens.pop() {
-            debug_assert_eq!(space_id, SpaceId::Data);
-            let ConnectionSide::Server { server_config } = &self.side else {
-                panic!("NEW_TOKEN frames should not be enqueued by clients");
-            };
+        if space_id == SpaceId::Data {
+            loop {
+                let Some(remote_addr) = self
+                    .application
+                    .as_mut()
+                    .expect("application packet space present")
+                    .retransmits
+                    .new_tokens
+                    .pop()
+                else {
+                    break;
+                };
+                let ConnectionSide::Server { server_config } = &self.side else {
+                    panic!("NEW_TOKEN frames should not be enqueued by clients");
+                };
 
-            if remote_addr != self.path.remote {
-                // NEW_TOKEN frames contain tokens bound to a client's IP address, and are only
-                // useful if used from the same IP address.  Thus, we abandon enqueued NEW_TOKEN
-                // frames upon an path change. Instead, when the new path becomes validated,
-                // NEW_TOKEN frames may be enqueued for the new path instead.
-                continue;
+                if remote_addr != self.path.remote {
+                    continue;
+                }
+
+                let token = Token::new(
+                    TokenPayload::Validation {
+                        ip: remote_addr.ip(),
+                        issued: server_config.time_source.now(),
+                    },
+                    &mut self.rng,
+                );
+                let new_token = NewToken {
+                    token: token.encode(&*server_config.token_key).into(),
+                };
+
+                if buf.len() + new_token.size() >= max_size {
+                    self.application
+                        .as_mut()
+                        .expect("application packet space present")
+                        .retransmits
+                        .new_tokens
+                        .push(remote_addr);
+                    break;
+                }
+
+                new_token.encode(buf);
+                sent.retransmits
+                    .get_or_create()
+                    .new_tokens
+                    .push(remote_addr);
+                self.stats.frame_tx.new_token += 1;
             }
-
-            let token = Token::new(
-                TokenPayload::Validation {
-                    ip: remote_addr.ip(),
-                    issued: server_config.time_source.now(),
-                },
-                &mut self.rng,
-            );
-            let new_token = NewToken {
-                token: token.encode(&*server_config.token_key).into(),
-            };
-
-            if buf.len() + new_token.size() >= max_size {
-                space.pending.new_tokens.push(remote_addr);
-                break;
-            }
-
-            new_token.encode(buf);
-            sent.retransmits
-                .get_or_create()
-                .new_tokens
-                .push(remote_addr);
-            self.stats.frame_tx.new_token += 1;
         }
 
         // STREAM
         if space_id == SpaceId::Data {
-            sent.stream_frames =
+            sent.retransmits.stream_frames =
                 self.streams
                     .write_stream_frames(buf, max_size, self.config.send_fairness)?;
-            self.stats.frame_tx.stream += sent.stream_frames.len() as u64;
+            self.stats.frame_tx.stream += sent.retransmits.stream_frames.len() as u64;
         }
 
         Ok(sent)
@@ -3745,18 +4864,15 @@ impl Connection {
     ///
     /// This method assumes ACKs are pending, and should only be called if
     /// `!PendingAcks::ranges().is_empty()` returns `true`.
-    fn populate_acks(
+    fn populate_acks<S>(
         now: Instant,
         receiving_ecn: bool,
         sent: &mut SentFrames,
-        space: &mut PacketSpace,
+        space: &mut PacketNumberSpace<S>,
         buf: &mut BytesMut,
         stats: &mut ConnectionStats,
     ) {
         debug_assert!(!space.pending_acks.ranges().is_empty());
-
-        // 0-RTT packets must never carry acks (which would have to be of handshake packets)
-        debug_assert!(space.crypto.is_some(), "tried to send ACK in 0-RTT");
         let ecn = if receiving_ecn {
             Some(&space.ecn_counters)
         } else {
@@ -3836,11 +4952,9 @@ impl Connection {
     ) -> Result<Option<u64>, Option<TransportError>> {
         let result = packet_crypto::decrypt_packet_body(
             packet,
-            &self.spaces,
-            self.zero_rtt_crypto.as_ref(),
-            self.key_phase,
-            self.prev_crypto.as_ref(),
-            self.next_crypto.as_ref(),
+            self.initial.as_deref(),
+            self.handshake.as_deref(),
+            self.application.as_deref(),
         )?;
 
         let result = match result {
@@ -3849,14 +4963,15 @@ impl Connection {
         };
 
         if result.outgoing_key_update_acked {
-            if let Some(prev) = self.prev_crypto.as_mut() {
-                prev.end_packet = Some((result.number, now));
-                self.set_key_discard_timer(now, packet.header.space());
+            if let Some(space) = self.application.as_mut() {
+                if let Some(prev) = space.prev_crypto.as_mut() {
+                    prev.end_packet = Some((result.number, now));
+                    self.set_key_discard_timer(now, packet.header.space());
+                }
             }
         }
 
         if result.incoming_key_update {
-            trace!("key update authenticated");
             self.update_keys(Some((result.number, now)), true);
             self.set_key_discard_timer(now, packet.header.space());
         }
@@ -3865,7 +4980,6 @@ impl Connection {
     }
 
     fn update_keys(&mut self, end_packet: Option<(u64, Instant)>, remote: bool) {
-        trace!("executing key update");
         // Generate keys for the key phase after the one we're switching to, store them in
         // `next_crypto`, make the contents of `next_crypto` current, and move the current keys into
         // `prev_crypto`.
@@ -3873,25 +4987,29 @@ impl Connection {
             .crypto
             .next_1rtt_keys()
             .expect("only called for `Data` packets");
-        self.key_phase_size = new
+        let space = self
+            .application
+            .as_mut()
+            .expect("application packet space present");
+        space.key_phase_size = new
             .local
             .confidentiality_limit()
             .saturating_sub(KEY_UPDATE_MARGIN);
         let old = mem::replace(
-            &mut self.spaces[SpaceId::Data]
+            &mut space
                 .crypto
                 .as_mut()
                 .unwrap() // safe because update_keys() can only be triggered by short packets
                 .packet,
-            mem::replace(self.next_crypto.as_mut().unwrap(), new),
+            mem::replace(space.next_crypto.as_mut().unwrap(), new),
         );
-        self.spaces[SpaceId::Data].sent_with_keys = 0;
-        self.prev_crypto = Some(PrevCrypto {
+        space.sent_with_keys = 0;
+        space.prev_crypto = Some(PrevCrypto {
             crypto: old,
             end_packet,
             update_unacked: remote,
         });
-        self.key_phase = !self.key_phase;
+        space.key_phase = !space.key_phase;
     }
 
     fn peer_supports_ack_frequency(&self) -> bool {
@@ -3903,7 +5021,10 @@ impl Connection {
     /// According to the spec, this will result in an error if the remote endpoint does not support
     /// the Acknowledgement Frequency extension
     pub(crate) fn immediate_ack(&mut self) {
-        self.spaces[self.highest_space].immediate_ack_pending = true;
+        self.application
+            .as_mut()
+            .expect("application packet space present")
+            .immediate_ack_pending = true;
     }
 
     /// Decodes a packet, returning its decrypted payload, so it can be inspected in tests
@@ -3929,19 +5050,18 @@ impl Connection {
         let decrypted_header = packet_crypto::unprotect_header(
             first_decode.clone(),
             &mut scratch,
-            &self.spaces,
-            self.zero_rtt_crypto.as_ref(),
+            self.initial.as_deref(),
+            self.handshake.as_deref(),
+            self.application.as_deref(),
             self.peer_params.stateless_reset_token,
         )?;
 
         let mut packet = decrypted_header.packet?;
         packet_crypto::decrypt_packet_body(
             &mut packet,
-            &self.spaces,
-            self.zero_rtt_crypto.as_ref(),
-            self.key_phase,
-            self.prev_crypto.as_ref(),
-            self.next_crypto.as_ref(),
+            self.initial.as_deref(),
+            self.handshake.as_deref(),
+            self.application.as_deref(),
         )
         .ok()?;
 
@@ -4032,7 +5152,7 @@ impl Connection {
     }
 
     /// Update counters to account for a packet becoming acknowledged, lost, or abandoned
-    fn remove_in_flight(&mut self, packet: &SentPacket) {
+    fn remove_in_flight<S>(&mut self, packet: &SentPacket<S>) {
         // Visit known paths from newest to oldest to find the one `packet` was sent on
         for path in [&mut self.path]
             .into_iter()
@@ -4069,7 +5189,10 @@ impl Connection {
         let pn_len = match pn {
             Some(pn) => PacketNumber::new(
                 pn,
-                self.spaces[SpaceId::Data].largest_acked_packet.unwrap_or(0),
+                self.application
+                    .as_ref()
+                    .map(|space| space.packets.loss.largest_acked_packet.unwrap_or(0))
+                    .unwrap_or(0),
             )
             .len(),
             // Upper bound
@@ -4081,9 +5204,12 @@ impl Connection {
     }
 
     fn tag_len_1rtt(&self) -> usize {
-        let key = match self.spaces[SpaceId::Data].crypto.as_ref() {
+        let Some(application) = self.application.as_ref() else {
+            return 16;
+        };
+        let key = match application.crypto.as_ref() {
             Some(crypto) => Some(&*crypto.packet.local),
-            None => self.zero_rtt_crypto.as_ref().map(|x| &*x.packet),
+            None => application.zero_rtt_crypto.as_ref().map(|x| &*x.packet),
         };
         // If neither Data nor 0-RTT keys are available, make a reasonable tag length guess. As of
         // this writing, all QUIC cipher suites use 16-byte tags. We could return `None` instead,
@@ -4097,7 +5223,23 @@ impl Connection {
         let ConnectionSide::Server { server_config } = &self.side else {
             return;
         };
-        let new_tokens = &mut self.spaces[SpaceId::Data as usize].pending.new_tokens;
+        let application = if self.application.is_none() {
+            let application = Box::new(ApplicationSpace::new(&mut self.rng));
+            #[cfg(test)]
+            let application = if self.config.deterministic_packet_numbers {
+                let mut application = application;
+                application.packet_number_filter = PacketNumberFilter::disabled();
+                application
+            } else {
+                application
+            };
+            self.application.insert(application)
+        } else {
+            self.application
+                .as_mut()
+                .expect("application packet space present")
+        };
+        let new_tokens = &mut application.retransmits.new_tokens;
         new_tokens.clear();
         for _ in 0..server_config.validation_token.sent {
             new_tokens.push(self.path.remote);
@@ -4389,9 +5531,8 @@ const KEY_UPDATE_MARGIN: u64 = 10_000;
 
 #[derive(Default)]
 struct SentFrames {
-    retransmits: ThinRetransmits,
+    retransmits: ApplicationSentFrames,
     largest_acked: Option<u64>,
-    stream_frames: StreamMetaVec,
     /// Whether the packet contains non-retransmittable frames (like datagrams)
     non_retransmits: bool,
     requires_padding: bool,
@@ -4400,10 +5541,7 @@ struct SentFrames {
 impl SentFrames {
     /// Returns whether the packet contains only ACKs
     fn is_ack_only(&self, streams: &StreamsState) -> bool {
-        self.largest_acked.is_some()
-            && !self.non_retransmits
-            && self.stream_frames.is_empty()
-            && self.retransmits.is_empty(streams)
+        self.largest_acked.is_some() && !self.non_retransmits && self.retransmits.is_empty(streams)
     }
 }
 
@@ -4426,6 +5564,32 @@ fn negotiate_max_idle_timeout(x: Option<VarInt>, y: Option<VarInt>) -> Option<Du
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
+    use crate::tests::util::Pair;
+
+    #[test]
+    fn owned_space_layout_is_out_of_line() {
+        assert_eq!(size_of::<Option<Box<HandshakeSpace>>>(), 8);
+        assert_eq!(size_of::<Option<Box<ApplicationSpace>>>(), 8);
+        assert!(size_of::<Connection>() < 6000);
+    }
+
+    #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
+    #[test]
+    fn established_connection_releases_handshake_spaces() {
+        let mut pair = Pair::default();
+        let (client_ch, server_ch) = pair.connect();
+
+        let client = pair.client_conn_mut(client_ch);
+        assert!(client.initial.is_none());
+        assert!(client.handshake.is_none());
+        assert!(client.application.is_some());
+
+        let server = pair.server_conn_mut(server_ch);
+        assert!(server.initial.is_none());
+        assert!(server.handshake.is_none());
+        assert!(server.application.is_some());
+    }
 
     #[test]
     fn negotiate_max_idle_timeout_commutative() {

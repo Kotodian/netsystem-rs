@@ -32,7 +32,7 @@ use crate::{
     transport_parameters::TransportParameters,
     Duration, Instant,
 };
-mod util;
+pub(super) mod util;
 use util::*;
 
 mod token;

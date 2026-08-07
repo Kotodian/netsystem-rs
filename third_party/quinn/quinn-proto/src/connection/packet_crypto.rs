@@ -1,42 +1,37 @@
-use tracing::debug;
-
-use crate::connection::spaces::PacketSpace;
+use crate::connection::spaces::{ApplicationSpace, HandshakeSpace};
 use crate::crypto::{HeaderKey, KeyPair, PacketKey};
 use crate::packet::{Packet, PartialDecode, SpaceId};
 use crate::token::ResetToken;
 use crate::Instant;
 use crate::{TransportError, RESET_TOKEN_SIZE};
 
-/// Removes header protection of a packet, or returns `None` if the packet was dropped
+/// Removes header protection of a packet, or returns `None` if the packet was dropped.
 pub(super) fn unprotect_header<'a>(
     partial_decode: PartialDecode,
     scratch: &'a mut [u8],
-    spaces: &[PacketSpace; 3],
-    zero_rtt_crypto: Option<&ZeroRttCrypto>,
+    initial: Option<&HandshakeSpace>,
+    handshake: Option<&HandshakeSpace>,
+    application: Option<&ApplicationSpace>,
     stateless_reset_token: Option<ResetToken>,
 ) -> Option<UnprotectHeaderResult<'a>> {
     let header_crypto = if partial_decode.is_0rtt() {
-        if let Some(crypto) = zero_rtt_crypto {
-            Some(&*crypto.header)
-        } else {
-            debug!("dropping unexpected 0-RTT packet");
-            return None;
-        }
+        application
+            .and_then(|space| space.zero_rtt_crypto.as_ref())
+            .map(|crypto| &*crypto.header)
     } else if let Some(space) = partial_decode.space() {
-        if let Some(ref crypto) = spaces[space].crypto {
-            Some(&*crypto.header.remote)
-        } else {
-            debug!(
-                "discarding unexpected {:?} packet ({} bytes)",
-                space,
-                partial_decode.len(),
-            );
-            return None;
+        match space {
+            SpaceId::Initial => initial.map(|space| space.crypto.header.remote.as_ref()),
+            SpaceId::Handshake => handshake.map(|space| space.crypto.header.remote.as_ref()),
+            SpaceId::Data => application
+                .and_then(|space| space.crypto.as_ref())
+                .map(|crypto| crypto.header.remote.as_ref()),
         }
     } else {
-        // Unprotected packet
         None
     };
+    if partial_decode.space().is_some() && header_crypto.is_none() {
+        return None;
+    }
 
     let packet = partial_decode.data(scratch);
     let stateless_reset = packet.len() >= RESET_TOKEN_SIZE + 5
@@ -56,55 +51,61 @@ pub(super) fn unprotect_header<'a>(
 }
 
 pub(super) struct UnprotectHeaderResult<'a> {
-    /// The packet with the now unprotected header (`None` in the case of stateless reset packets
-    /// that fail to be decoded)
     pub(super) packet: Option<Packet<'a>>,
-    /// Whether the packet was a stateless reset packet
     pub(super) stateless_reset: bool,
 }
 
-/// Decrypts a packet's body in-place
+/// Decrypts a packet's body in-place.
 pub(super) fn decrypt_packet_body(
     packet: &mut Packet<'_>,
-    spaces: &[PacketSpace; 3],
-    zero_rtt_crypto: Option<&ZeroRttCrypto>,
-    conn_key_phase: bool,
-    prev_crypto: Option<&PrevCrypto>,
-    next_crypto: Option<&KeyPair<Box<dyn PacketKey>>>,
+    initial: Option<&HandshakeSpace>,
+    handshake: Option<&HandshakeSpace>,
+    application: Option<&ApplicationSpace>,
 ) -> Result<Option<DecryptPacketResult>, Option<TransportError>> {
     if !packet.header.is_protected() {
-        // Unprotected packets also don't have packet numbers
         return Ok(None);
     }
+
     let space = packet.header.space();
-    let rx_packet = spaces[space].rx_packet;
+    let rx_packet = match space {
+        SpaceId::Initial => initial.map(|space| space.packets.rx_packet),
+        SpaceId::Handshake => handshake.map(|space| space.packets.rx_packet),
+        SpaceId::Data => application.map(|space| space.packets.rx_packet),
+    }
+    .ok_or(None)?;
     let number = packet.header.number().ok_or(None)?.expand(rx_packet + 1);
     let packet_key_phase = packet.header.key_phase();
 
     let mut crypto_update = false;
     let crypto = if packet.header.is_0rtt() {
-        &zero_rtt_crypto.unwrap().packet
-    } else if packet_key_phase == conn_key_phase || space != SpaceId::Data {
-        &spaces[space].crypto.as_ref().unwrap().packet.remote
-    } else if let Some(prev) = prev_crypto.and_then(|crypto| {
-        // If this packet comes prior to acknowledgment of the key update by the peer,
-        if crypto.end_packet.map_or(true, |(pn, _)| number < pn) {
-            // use the previous keys.
-            Some(crypto)
-        } else {
-            // Otherwise, this must be a remotely-initiated key update, so fall through to the
-            // final case.
-            None
+        &application
+            .and_then(|space| space.zero_rtt_crypto.as_ref())
+            .ok_or(None)?
+            .packet
+    } else if space != SpaceId::Data {
+        let crypto = match space {
+            SpaceId::Initial => initial.map(|space| &space.crypto),
+            SpaceId::Handshake => handshake.map(|space| &space.crypto),
+            SpaceId::Data => None,
         }
-    }) {
-        &prev.crypto.remote
+        .ok_or(None)?;
+        &crypto.packet.remote
     } else {
-        // We're in the Data space with a key phase mismatch and either there is no locally
-        // initiated key update or the locally initiated key update was acknowledged by a
-        // lower-numbered packet. The key phase mismatch must therefore represent a new
-        // remotely-initiated key update.
-        crypto_update = true;
-        &next_crypto.unwrap().remote
+        let space = application.ok_or(None)?;
+        if packet_key_phase == space.key_phase {
+            &space.crypto.as_ref().ok_or(None)?.packet.remote
+        } else if let Some(prev) = space.prev_crypto.as_ref().and_then(|crypto| {
+            if crypto.end_packet.map_or(true, |(pn, _)| number < pn) {
+                Some(crypto)
+            } else {
+                None
+            }
+        }) {
+            &prev.crypto.remote
+        } else {
+            crypto_update = true;
+            &space.next_crypto.as_ref().ok_or(None)?.remote
+        }
     };
 
     let payload_len = crypto
@@ -119,15 +120,20 @@ pub(super) fn decrypt_packet_body(
     }
 
     let mut outgoing_key_update_acked = false;
-    if let Some(prev) = prev_crypto {
-        if prev.end_packet.is_none() && packet_key_phase == conn_key_phase {
-            outgoing_key_update_acked = true;
+    if let Some(space) = application {
+        if let Some(prev) = &space.prev_crypto {
+            if prev.end_packet.is_none() && packet_key_phase == space.key_phase {
+                outgoing_key_update_acked = true;
+            }
         }
     }
 
     if crypto_update {
-        // Validate incoming key update
-        if number <= rx_packet || prev_crypto.is_some_and(|x| x.update_unacked) {
+        if number <= rx_packet
+            || application
+                .and_then(|space| space.prev_crypto.as_ref())
+                .is_some_and(|crypto| crypto.update_unacked)
+        {
             return Err(Some(TransportError::KEY_UPDATE_ERROR("")));
         }
     }
@@ -140,26 +146,14 @@ pub(super) fn decrypt_packet_body(
 }
 
 pub(super) struct DecryptPacketResult {
-    /// The packet number
     pub(super) number: u64,
-    /// Whether a locally initiated key update has been acknowledged by the peer
     pub(super) outgoing_key_update_acked: bool,
-    /// Whether the peer has initiated a key update
     pub(super) incoming_key_update: bool,
 }
 
 pub(super) struct PrevCrypto {
-    /// The keys used for the previous key phase, temporarily retained to decrypt packets sent by
-    /// the peer prior to its own key update.
     pub(super) crypto: KeyPair<Box<dyn PacketKey>>,
-    /// The incoming packet that ends the interval for which these keys are applicable, and the time
-    /// of its receipt.
-    ///
-    /// Incoming packets should be decrypted using these keys iff this is `None` or their packet
-    /// number is lower. `None` indicates that we have not yet received a packet using newer keys,
-    /// which implies that the update was locally initiated.
     pub(super) end_packet: Option<(u64, Instant)>,
-    /// Whether the following key phase is from a remotely initiated update that we haven't acked
     pub(super) update_unacked: bool,
 }
 

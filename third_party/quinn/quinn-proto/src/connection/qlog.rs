@@ -82,10 +82,10 @@ impl QlogSink {
         }
     }
 
-    pub(super) fn emit_packet_lost(
+    pub(super) fn emit_packet_lost<S>(
         &self,
         pn: u64,
-        info: &SentPacket,
+        info: &SentPacket<S>,
         lost_send_time: Instant,
         space: SpaceId,
         now: Instant,
