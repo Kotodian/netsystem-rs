@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use hammer_infra::pool::Index;
 use hammer_runtime::app::{SessionAppContext, SessionAppRegistration};
 use hammer_runtime::{DataWorkerId, Engine, RuntimeError, RuntimeResult};
@@ -64,8 +66,15 @@ fn accept(
     } else {
         context
     };
-    let listener = ContextId::from(listener);
-    let connection = with_quic_worker(worker, |quic| quic.accept_connection(session, listener))?;
+    let listener_id = ContextId::from(listener);
+    let listener = QUIC_MAIN
+        .get()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: NAME })?
+        .listener_context(listener_id)
+        .ok_or_else(|| QuicSessionError::ContextMissing { session })?;
+    let connection = with_quic_worker(worker, |quic| {
+        quic.accept_connection(session, listener_id, &listener)
+    })?;
     publish_context(worker, session, connection)
 }
 
@@ -74,8 +83,59 @@ fn connected(
     session: SessionId,
     _: SessionAppContext,
 ) -> RuntimeResult<()> {
-    let connection = with_quic_worker(worker, |quic| quic.connect_connection(session))?;
+    let (application, app, opaque, _) = worker
+        .session_app_endpoint(session)
+        .ok_or_else(|| QuicSessionError::ContextMissing { session })?;
+    let connection = with_quic_worker(worker, |quic| {
+        quic.connect_connection(session, application, app, opaque)
+    })?;
     publish_context(worker, session, connection)
+}
+
+fn builtin_rx(
+    worker: &mut SessionWorker<Index>,
+    session: SessionId,
+    context: SessionAppContext,
+) -> RuntimeResult<()> {
+    if context == 0 {
+        return Err(QuicSessionError::ContextMissing { session }.into());
+    }
+    let context = ContextId::from(context);
+    let main = QUIC_MAIN
+        .get()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: NAME })?;
+    let listener =
+        main.with_worker_and_sessions(worker, |_, quic| Ok(quic.listener_context_id(context)))?;
+    if let Some(listener) = listener
+        && main.listener_context(listener).is_none()
+    {
+        main.with_worker_and_sessions(worker, |sessions, quic| {
+            quic.remove_context(context)?;
+            sessions.set_app_session(session, 0)?;
+            Ok(())
+        })?;
+        return Ok(());
+    }
+    main.with_worker_and_sessions(worker, |sessions, quic| {
+        quic.process_udp_rx(sessions, session, context, Instant::now())
+    })
+}
+
+fn builtin_tx(
+    worker: &mut SessionWorker<Index>,
+    session: SessionId,
+    context: SessionAppContext,
+) -> RuntimeResult<()> {
+    if context == 0 {
+        return Err(QuicSessionError::ContextMissing { session }.into());
+    }
+    let context = ContextId::from(context);
+    QUIC_MAIN
+        .get()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: NAME })?
+        .with_worker_and_sessions(worker, |sessions, quic| {
+            quic.send_packets(sessions, context, Instant::now())
+        })
 }
 
 fn lifecycle(
@@ -122,8 +182,8 @@ pub(crate) static CALLBACKS: SessionAppCallbacks = SessionAppCallbacks {
     reset: Some(lifecycle),
     transport_closed: Some(lifecycle),
     cleanup: Some(lifecycle),
-    builtin_rx: Some(lifecycle),
-    builtin_tx: Some(lifecycle),
+    builtin_rx: Some(builtin_rx),
+    builtin_tx: Some(builtin_tx),
     ..SessionAppCallbacks::all_none()
 };
 

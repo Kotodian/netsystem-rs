@@ -8,6 +8,7 @@
 mod config;
 mod listener;
 mod session_app;
+mod stream_io;
 mod worker;
 
 hammer_component_macros::declare_plugin!(

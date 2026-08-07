@@ -1,18 +1,19 @@
+use std::cell::UnsafeCell;
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, ThreadId};
 
 use hammer_infra::align::CacheLine;
+use hammer_infra::pool::Index;
 use hammer_infra::pool::Pool;
 use hammer_infra::thread_owned::ThreadOwned;
 use hammer_runtime::app::{ApplicationId, SessionAppId};
 use hammer_runtime::{
-    Barrier, DataWorkerId, Engine, RuntimeError, RuntimeResult, SessionListenEndpoint,
-    SessionListenerId, SessionTransportRegistration,
+    DataWorkerId, Engine, RuntimeError, RuntimeResult, SessionListenEndpoint, SessionListenerId,
+    SessionTransportRegistration,
 };
-use hammer_service::session::runtime::SessionMain;
+use hammer_service::session::runtime::{SessionMain, SessionWorker};
 
 use crate::config::{ConfigId, QUIC_CONFIG_CAPACITY, QuicConfigRegistry};
-#[cfg(test)]
 use crate::worker::ListenerContext;
 use crate::worker::{Context, ContextId, QUIC_CONTEXT_CAPACITY, QuicWorker, QuicWorkerError};
 
@@ -38,9 +39,42 @@ pub struct QuicMain {
     session_app: SessionAppId,
     udp_transport: SessionTransportRegistration,
     pub(crate) configs: QuicConfigRegistry,
-    contexts: Barrier<Pool<Context>>,
+    contexts: Arc<QuicListenerContexts>,
     workers: Box<[CacheLine<ThreadOwned<QuicWorker>>]>,
 }
+
+struct QuicListenerContexts {
+    value: UnsafeCell<Pool<Context>>,
+}
+
+impl QuicListenerContexts {
+    fn new(capacity: usize) -> Self {
+        Self {
+            value: UnsafeCell::new(Pool::with_capacity(capacity)),
+        }
+    }
+
+    #[inline]
+    fn get(&self) -> &Pool<Context> {
+        // SAFETY: Main Thread mutates this pool only while the worker barrier
+        // is held. Data Workers read it only after that publication barrier
+        // and never while a writer can access it.
+        unsafe { &*self.value.get() }
+    }
+
+    #[inline]
+    fn get_mut(&self) -> &mut Pool<Context> {
+        // SAFETY: callers must be the Main Thread and hold the worker barrier
+        // (or run before Data Workers exist), which is enforced by
+        // `QuicMain::with_contexts`.
+        unsafe { &mut *self.value.get() }
+    }
+}
+
+// SAFETY: access to the listener pool is ordered by the Session worker
+// barrier; reads from Data Workers observe only barrier-published state.
+unsafe impl Send for QuicListenerContexts {}
+unsafe impl Sync for QuicListenerContexts {}
 
 impl QuicMain {
     pub(crate) fn new(
@@ -57,7 +91,7 @@ impl QuicMain {
             session_app,
             udp_transport,
             configs: QuicConfigRegistry::new(QUIC_CONFIG_CAPACITY),
-            contexts: Barrier::new(Pool::with_capacity(QUIC_CONTEXT_CAPACITY)),
+            contexts: Arc::new(QuicListenerContexts::new(QUIC_CONTEXT_CAPACITY)),
             workers: (0..worker_count)
                 .map(|_| CacheLine::new(ThreadOwned::new()))
                 .collect::<Vec<_>>()
@@ -82,13 +116,11 @@ impl QuicMain {
             .into());
         }
 
-        let server_config = outer_config
+        let config = outer_config
             .map(ConfigId::from_raw)
             .ok_or(crate::config::ConfigError::ConfigurationRequired)?;
-        self.configs
-            .server_config(outer_application, server_config)?;
-        self.configs
-            .transport_config(outer_application, server_config)?;
+        let server_config = self.configs.server_config(outer_application, config)?;
+        self.configs.transport_config(outer_application, config)?;
 
         let applications = self.sessions.applications();
         let inner_application_listener = applications
@@ -114,9 +146,11 @@ impl QuicMain {
             contexts
                 .insert(Context::listener(
                     outer_listener,
+                    outer_application,
                     inner_application_listener,
                     inner_session_listener,
-                    server_config,
+                    config,
+                    Some(server_config),
                 ))
                 .map(ContextId::from)
                 .expect("QUIC listener pool capacity remains after preflight")
@@ -140,7 +174,7 @@ impl QuicMain {
         let (index, listener) = self
             .with_contexts(|contexts| {
                 contexts.iter().find_map(|(index, context)| {
-                    context.listener_facts().and_then(|listener| {
+                    context.listener_context().and_then(|listener| {
                         (listener.outer_listener == outer_listener).then_some((index, listener))
                     })
                 })
@@ -170,9 +204,14 @@ impl QuicMain {
             return Err(RuntimeError::ControlRequiresMainThread);
         }
         hammer_runtime::ensure_main_thread_with_barrier()?;
-        // SAFETY: this Main Thread owns the listener pool. Its caller either
-        // holds SessionMain's WorkerBarrier or runs before Data Workers exist.
-        Ok(unsafe { self.contexts.with_mut_unchecked(operation) })
+        Ok(operation(self.contexts.get_mut()))
+    }
+
+    pub(crate) fn listener_context(&self, context: ContextId) -> Option<ListenerContext> {
+        self.contexts
+            .get()
+            .get(context.into())
+            .and_then(Context::listener_context)
     }
 
     pub(crate) fn install_worker(&self, worker: DataWorkerId) -> RuntimeResult<()> {
@@ -207,6 +246,26 @@ impl QuicMain {
         })?
     }
 
+    pub(crate) fn with_worker_and_sessions<R>(
+        &self,
+        sessions: &mut SessionWorker<Index>,
+        operation: impl FnOnce(&mut SessionWorker<Index>, &mut QuicWorker) -> RuntimeResult<R>,
+    ) -> RuntimeResult<R> {
+        let worker = sessions.worker();
+        let slot = self.workers.get(worker.slot()).ok_or_else(|| {
+            RuntimeError::from(QuicWorkerError::WorkerOutOfRange {
+                worker: worker.slot(),
+            })
+        })?;
+        slot.with_mut(|quic| operation(sessions, quic))
+            .map_err(|source| {
+                RuntimeError::from(QuicWorkerError::WorkerAccess {
+                    worker: worker.slot(),
+                    source,
+                })
+            })?
+    }
+
     pub(crate) fn application_is_attached(
         &self,
         application: ApplicationId,
@@ -224,7 +283,7 @@ impl QuicMain {
     fn listener(&self, outer_listener: SessionListenerId) -> Option<ListenerContext> {
         self.with_contexts(|contexts| {
             contexts.iter().find_map(|(_, context)| {
-                context.listener_facts().and_then(|listener| {
+                context.listener_context().and_then(|listener| {
                     (listener.outer_listener == outer_listener).then_some(listener)
                 })
             })

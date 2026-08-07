@@ -42,7 +42,7 @@ crates/hammer-service/src/
 
 `session/` 是 L5，不是 L4 transport。它管理“app flow 如何在 worker 本地被 polling、ready、timer-driven”，但不理解 TCP 序号、QUIC packet number、TLS secret、拥塞算法细节或 IP/port lookup。
 
-QUIC 的工程落点可以在后续单独讨论。无论 QUIC 代码放在 `transport/quic` 还是独立协议目录，L5 `session/` 的边界都不变：它只提供 session 原语，QUIC 自己负责 connection id、stream、datagram、crypto、packet number space 和 transport output。
+QUIC 的工程落点可以在后续单独讨论。无论 QUIC 代码放在 `app-session/quic` 还是独立协议目录，L5 `session/` 的边界都不变：它只提供 session 原语，QUIC 自己负责 connection id、stream、datagram、crypto、packet number space 和 transport output。
 
 ## 3. VPP 与 io_uring 对标
 
@@ -242,7 +242,7 @@ Timer token 只作为协议私有值保存。TCP 可以把 token 编码为 retra
 
 ## 8. SessionQueueNode 运行模型
 
-`SessionQueueNode` 是 L5 独立 input/DriverNode，对标 VPP `session-queue`。它不属于 `transport/tcp`，也不属于 `transport/quic`。
+`SessionQueueNode` 是 L5 独立 input/DriverNode，对标 VPP `session-queue`。它不属于 `transport/tcp`，也不属于 `app-session/quic`。
 
 每次被 empty-frame poll 时，它按固定顺序推进：
 

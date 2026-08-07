@@ -475,7 +475,7 @@ An immutable Application-owned client or server policy registered with the QUIC 
 _Avoid_: TLS configuration identity reused for QUIC, UDP-owned QUIC policy, worker-mutated configuration, unbarriered configuration publication, public engine-tuning bag
 
 **QUIC Stream**:
-A multiplexed reliable byte stream represented by exactly one child Session beneath a QUIC Connection Session. Its payload is retained only in that Stream Session's FIFOs; QUIC retains protocol offsets and ranges rather than another payload copy. Its Transport Index addresses protocol-private stream state inside `transport/quic`, and that state references the owning QUIC Connection; with no selected upper protocol the Stream Session is published directly as one AppSession. Closing or resetting one stream does not close its siblings, while closing the parent connection closes every remaining stream.
+A multiplexed reliable byte stream represented by exactly one child Session beneath a QUIC Connection Session. Its payload is retained only in that Stream Session's FIFOs; QUIC retains protocol offsets and ranges rather than another payload copy. Its Transport Index addresses protocol-private stream state inside `app-session/quic`, and that state references the owning QUIC Connection; with no selected upper protocol the Stream Session is published directly as one AppSession. Closing or resetting one stream does not close its siblings, while closing the parent connection closes every remaining stream.
 _Avoid_: UDP datagram, shared multi-stream AppSession, stream without a parent Connection Session, Quinn-owned stream payload
 
 ## IP Reassembly
